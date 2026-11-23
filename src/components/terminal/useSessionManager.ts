@@ -10,7 +10,7 @@
  * Provides search, filter, sort, grouping, and actions.
  */
 
-import { useState, useCallback, useEffect, useMemo, useRef } from "react";
+import { useState, useCallback, useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { instanceStorage } from "@/lib/instance-storage";
 import { resolvePort } from "@/lib/runner-api";
@@ -23,6 +23,7 @@ import {
   extractAccountLabel,
   extractProjectLabel,
   mergeLiveRows,
+  reuseUnchangedRows,
   tabLiveStatus,
 } from "./sessionManagerLiveRows";
 import { useLiveClaudeSessionNames } from "./useLiveClaudeSessionNames";
@@ -1049,10 +1050,21 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
   // Every live tab gets a row (plan 2026-10-11-runner-terminal-tmux-work-mode,
   // D5): its transcript row when it has one, else a tab-sourced row. In tmux
   // mode the panel is the only way to reach an off-screen session.
-  const allSessions = useMemo(
-    (): UnifiedSession[] => mergeLiveRows(transcriptRows, { tabs, sessionStates, registryNames }),
-    [transcriptRows, tabs, sessionStates, registryNames],
-  );
+  //
+  // Rows whose fields did not change keep their previous object, so
+  // `memo(SessionCard)` holds for them — see `reuseUnchangedRows` for why that
+  // matters (a terminal title tick rebuilds every row). The cache is a ref read
+  // and written only inside this memo; the result depends only on its inputs
+  // and the previous result, so a re-run (StrictMode) is harmless.
+  const rowCacheRef = useRef<ReadonlyMap<string, UnifiedSession>>(new Map());
+  const allSessions = useMemo((): UnifiedSession[] => {
+    const merged = mergeLiveRows(transcriptRows, { tabs, sessionStates, registryNames });
+    // eslint-disable-next-line react-hooks/refs -- render-time memo cache, see above
+    const stable = reuseUnchangedRows(rowCacheRef.current, merged);
+    // eslint-disable-next-line react-hooks/refs -- render-time memo cache, see above
+    rowCacheRef.current = new Map(stable.map((row) => [row.sessionId, row]));
+    return stable;
+  }, [transcriptRows, tabs, sessionStates, registryNames]);
 
   // ── Filter and sort ────────────────────────────────────────────────────────
 
@@ -1224,48 +1236,72 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
 
   // ── Actions ────────────────────────────────────────────────────────────────
 
+  // Every action handed to EACH `SessionCard` must keep its identity across
+  // renders, or `memo(SessionCard)` never holds. Their inputs do not:
+  // `TerminalSessionContext` passes `onSelectSession` / `onFocusSessionTab` as
+  // inline arrows, and `tabs` changes on every terminal title tick, so callbacks
+  // that listed them as deps were new on every provider render — and with many
+  // working sessions that re-rendered every card continuously, starving the
+  // runner window's main thread (coord finding 8719a700). The actions below
+  // therefore read the LATEST inputs from this ref when they run and are
+  // created once. The ref is updated in a layout effect, i.e. after every
+  // commit and before any event can reach a card. CONTRACT: call these from an
+  // event handler or a passive effect only — never during render or from a
+  // child's layout effect, where the ref is still one commit behind (that is
+  // why `closableTabId`, which the panel calls during render, is not one).
+  const latest = useRef({
+    tabs,
+    onRefreshSessions,
+    onResumeSession,
+    onSelectSession,
+    onFocusSessionTab,
+    onCloseSessionTab,
+  });
+  useLayoutEffect(() => {
+    latest.current = {
+      tabs,
+      onRefreshSessions,
+      onResumeSession,
+      onSelectSession,
+      onFocusSessionTab,
+      onCloseSessionTab,
+    };
+  });
+
   const refresh = useCallback(() => {
-    onRefreshSessions();
+    latest.current.onRefreshSessions();
     fetchDigests();
-  }, [onRefreshSessions, fetchDigests]);
+  }, [fetchDigests]);
 
-  const resumeSession = useCallback(
-    (session: UnifiedSession) => {
-      // A tab-sourced row has no transcript to resume — it IS the live tab.
-      if (session.source !== "transcript") return;
-      // F1 inertness: a debug-injected fake has no real transcript on disk —
-      // resuming it would spawn a stray `claude --resume <fake-id>` against a
-      // session id that doesn't exist. No-op it.
-      if (isInjectedSession(session)) {
-        console.warn(
-          `[test-fixtures] ignoring resume on synthetic tab ${session.zoneTabId ?? session.sessionId}`,
-        );
-        return;
-      }
-      onResumeSession(session._transcript);
-    },
-    [onResumeSession],
-  );
+  const resumeSession = useCallback((session: UnifiedSession) => {
+    // A tab-sourced row has no transcript to resume — it IS the live tab.
+    if (session.source !== "transcript") return;
+    // F1 inertness: a debug-injected fake has no real transcript on disk —
+    // resuming it would spawn a stray `claude --resume <fake-id>` against a
+    // session id that doesn't exist. No-op it.
+    if (isInjectedSession(session)) {
+      console.warn(
+        `[test-fixtures] ignoring resume on synthetic tab ${session.zoneTabId ?? session.sessionId}`,
+      );
+      return;
+    }
+    latest.current.onResumeSession(session._transcript);
+  }, []);
 
-  const viewTranscript = useCallback(
-    (session: UnifiedSession) => {
-      if (session.source !== "transcript") return;
-      onSelectSession(session.sessionId);
-    },
-    [onSelectSession],
-  );
+  const viewTranscript = useCallback((session: UnifiedSession) => {
+    if (session.source !== "transcript") return;
+    latest.current.onSelectSession(session.sessionId);
+  }, []);
 
-  const openSession = useCallback(
-    (session: UnifiedSession) => {
-      const route = routeOpenSession(session, tabs);
-      if (route.kind === "focus-tab") {
-        onFocusSessionTab(session.sessionId, route.tabId, session.source);
-      } else if (route.kind === "transcript") {
-        onSelectSession(session.sessionId);
-      }
-    },
-    [tabs, onSelectSession, onFocusSessionTab],
-  );
+  const openSession = useCallback((session: UnifiedSession) => {
+    const { tabs: currentTabs, onFocusSessionTab: focus, onSelectSession: select } = latest.current;
+    const route = routeOpenSession(session, currentTabs);
+    if (route.kind === "focus-tab") {
+      focus(session.sessionId, route.tabId, session.source);
+    } else if (route.kind === "transcript") {
+      select(session.sessionId);
+    }
+  }, []);
 
   const copySessionId = useCallback((session: UnifiedSession) => {
     // A tab-sourced row's key is a tab id, not a session id.
@@ -1273,18 +1309,19 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
     navigator.clipboard.writeText(session.sessionId).catch(() => {});
   }, []);
 
+  // `closableTabId` is called DURING render (the panel decides from it whether a
+  // card gets `onClose` at all), so it keeps reading the render's own `tabs` —
+  // the ref would lag a render behind. It is never handed to a card.
   const closableTabId = useCallback(
     (session: UnifiedSession) => (onCloseSessionTab ? liveTabIdForSession(session, tabs) : null),
     [tabs, onCloseSessionTab],
   );
 
-  const closeSession = useCallback(
-    (session: UnifiedSession) => {
-      const tabId = closableTabId(session);
-      if (tabId) onCloseSessionTab?.(tabId);
-    },
-    [closableTabId, onCloseSessionTab],
-  );
+  const closeSession = useCallback((session: UnifiedSession) => {
+    const { tabs: currentTabs, onCloseSessionTab: close } = latest.current;
+    const tabId = close ? liveTabIdForSession(session, currentTabs) : null;
+    if (tabId) close?.(tabId);
+  }, []);
 
   // ── Multi-select & bulk actions ──────────────────────────────────────────
 

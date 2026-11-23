@@ -75,11 +75,19 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::process_capture::process_tree::ProcessSnapshot;
+use crate::session::claude_activity::{read_provider_rows, ProviderRowValidity};
 use crate::session::session_lifecycle_store::{
     SessionLifecycleStore, TerminalSessionRecord, DEFAULT_PROVIDER, ORIGIN_AUTHORITATIVE,
     ORIGIN_OBSERVED, ORIGIN_RECONCILED, UNZONED_ZONE_INDEX,
 };
+use crate::terminal::graceful_exit::PaneLook;
+use qontinui_runner_lib::session_archive::discovery::config_dir_compare_key;
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
+
+/// The per-tick repair that writes a record's `config_dir` from its own pane's
+/// provider row (D2 of plan
+/// `2026-11-16-boot-reconcile-reverts-a-migrated-sessions-config-dir-so-the-next-migration-carries-a-stale-transcript`).
+pub mod config_dir_repair;
 
 /// One live PTY the reconcile considers, projected from
 /// [`crate::terminal::manager::TerminalManager::list`].
@@ -165,8 +173,9 @@ pub enum ReconcileAction {
     /// under `session_id` with `origin`. `confirmed` = the identity is proven (a
     /// transcript exists for it), so the record is written CONFIRMED. An
     /// unconfirmed Bind (a typed `--session-id` whose transcript hasn't appeared
-    /// yet) is written provisional. Carries the chosen transcript's `config_dir`
-    /// (empty when not yet known).
+    /// yet) is written provisional. Carries the transcript's `config_dir` only
+    /// when exactly one root holds it — empty when no transcript exists yet or
+    /// when several roots hold one (see `sole_candidate_root`).
     Bind {
         terminal_id: String,
         session_id: String,
@@ -200,7 +209,9 @@ const START_ANCHOR_SKEW_SECS: i64 = 5;
 /// - **Rung 2 (cmdline):** `cmdline_session_id = Some(id)` ⇒ the anchor process
 ///   typed its own `--session-id`, so that IS the identity — `Bind`
 ///   `Authoritative`, `confirmed` iff a transcript for `id` already exists (else
-///   provisional). No guessing.
+///   provisional). No guessing. EXCEPT when `id`'s open record already sits on
+///   ANOTHER terminal that is live in this pass (`cmdline_id_live_owner`) ⇒
+///   `LeaveAlone`: see the rung-2 body.
 /// - **Rung 3 (observed):** else correlate to `candidates` that are BOTH
 ///   post-start (`started + skew >= anchor_start_unix`) AND not already
 ///   `claimed_ids`. UNIQUENESS gate: exactly one passes ⇒ `Bind` `confirmed`;
@@ -215,7 +226,11 @@ const START_ANCHOR_SKEW_SECS: i64 = 5;
 /// `anchor_start_unix` is the claude anchor's creation time (epoch seconds);
 /// `claimed_ids` are session ids already bound to OTHER live terminals — removing
 /// them lets two same-second launches converge across ticks (each terminal claims
-/// one, disambiguating the other).
+/// one, disambiguating the other). `cmdline_id_live_owner` is the terminal of the
+/// OPEN record for `cmdline_session_id`, when that terminal is live in this pass
+/// AND still hosts a claude anchor (a pane whose claude exited does not count)
+/// whose own argv does not name a DIFFERENT session (a pane reused for another
+/// session does not count either).
 pub fn decide_bind_for_live_pty(
     pty: &LivePty,
     existing: Option<&TerminalSessionRecord>,
@@ -223,6 +238,7 @@ pub fn decide_bind_for_live_pty(
     cmdline_session_id: Option<&str>,
     candidates: &[TranscriptCandidate],
     claimed_ids: &HashSet<String>,
+    cmdline_id_live_owner: Option<&str>,
 ) -> ReconcileAction {
     // A confirmed record (the hook fired / a prior bind confirmed it) is owned
     // by the deterministic path — never re-bind it.
@@ -240,14 +256,26 @@ pub fn decide_bind_for_live_pty(
     // bind it authoritative. It's confirmed only if a real transcript for that
     // exact id is already on disk; otherwise it's provisional (the transcript
     // will appear a tick or two later and a hook / the next tick confirms it).
+    //
+    // One session cannot run in two panes, so when its open record already sits
+    // on ANOTHER pane that is live in this pass, the argv is not a reason to move
+    // it. That is an account migration's settle window: the old pane still runs
+    // `claude --resume <id>` after the row has moved to the new pane, and
+    // re-pointing the row back is the cross-pane re-point of coord finding
+    // f0a0c310. This is the decision-level half of qontinui-runner#2919's
+    // `RowOnLivePane` refusal at the write.
     if let Some(id) = cmdline_session_id {
-        let matching = candidates.iter().find(|c| c.session_id == id);
+        if cmdline_id_live_owner.is_some_and(|owner| owner != pty.terminal_id) {
+            return ReconcileAction::LeaveAlone {
+                terminal_id: pty.terminal_id.clone(),
+            };
+        }
         return ReconcileAction::Bind {
             terminal_id: pty.terminal_id.clone(),
             session_id: id.to_string(),
-            config_dir: matching.map(|c| c.config_dir.clone()).unwrap_or_default(),
+            config_dir: sole_candidate_root(candidates, id),
             origin: BindOrigin::Authoritative,
-            confirmed: matching.is_some(),
+            confirmed: candidates.iter().any(|c| c.session_id == id),
         };
     }
 
@@ -255,18 +283,27 @@ pub fn decide_bind_for_live_pty(
     // filter rejects a foreign long-running session whose transcript merely got
     // appended to in this window (its first event predates the anchor) — the
     // exact failure the mtime race makes. The uniqueness gate is the safety:
-    // bind ONLY when exactly one survives.
-    let passing: Vec<&TranscriptCandidate> = candidates
-        .iter()
-        .filter(|cand| {
-            let post_start = anchor_start_unix <= 0
-                || cand
-                    .started_at_unix
-                    .map(|s| s + START_ANCHOR_SKEW_SECS >= anchor_start_unix)
-                    .unwrap_or(false);
-            post_start && !claimed_ids.contains(&cand.session_id)
-        })
-        .collect();
+    // bind ONLY when exactly one SESSION survives.
+    //
+    // The gate counts sessions, not files: a migrated session leaves a copy of
+    // its transcript under every root it ran in (the carry never deletes its
+    // source), so one session can arrive here as several candidates with the
+    // same id. Those are deduplicated by id, so a migrated session is still a
+    // single candidate, and its config dir is settled by `sole_candidate_root`.
+    let mut passing: Vec<&TranscriptCandidate> = Vec::new();
+    for cand in candidates {
+        let post_start = anchor_start_unix <= 0
+            || cand
+                .started_at_unix
+                .map(|s| s + START_ANCHOR_SKEW_SECS >= anchor_start_unix)
+                .unwrap_or(false);
+        if post_start
+            && !claimed_ids.contains(&cand.session_id)
+            && !passing.iter().any(|p| p.session_id == cand.session_id)
+        {
+            passing.push(cand);
+        }
+    }
 
     // The grade follows the EVIDENCE, not the uniqueness gate. With a live
     // anchor the bind is start-filtered and earns `observed` (auto-resume). With
@@ -283,7 +320,7 @@ pub fn decide_bind_for_live_pty(
         [cand] => ReconcileAction::Bind {
             terminal_id: pty.terminal_id.clone(),
             session_id: cand.session_id.clone(),
-            config_dir: cand.config_dir.clone(),
+            config_dir: sole_candidate_root(candidates, &cand.session_id),
             origin: correlated_origin,
             confirmed: true,
         },
@@ -293,6 +330,43 @@ pub fn decide_bind_for_live_pty(
         _ => ReconcileAction::SkipAmbiguous {
             terminal_id: pty.terminal_id.clone(),
         },
+    }
+}
+
+/// The config dir a [`ReconcileAction::Bind`] for `session_id` may carry: the
+/// root of the transcript candidates holding that id when exactly ONE distinct
+/// root does, else the empty string.
+///
+/// The empty string means "no config-dir evidence": `record_open` normalizes it
+/// to `None`, and its sticky `config_dir` rule then keeps whatever the record
+/// already holds. A guess can therefore never overwrite a known value.
+///
+/// The bind used to take the FIRST candidate holding the id. Candidates arrive
+/// in `find_claude_config_dirs()` order, and the transcript carry never deletes
+/// its source, so after an account migration both roots hold the transcript and
+/// the first one in the roster won: on device 4b426e2b (2026-11-15) a boot
+/// reconcile re-wrote a session migrated to `.claude-erik` back to `~/.claude`
+/// (roster index 0), and the next migration carried that root's stale copy.
+/// Which root a live session runs under is pid-exact evidence, the pane's
+/// provider row, which [`config_dir_repair`] applies from the next tick on (a
+/// record this tick wrote is past that tick's pre-evidence snapshot).
+///
+/// Spellings of one root (separators, a trailing slash, Windows case) are one
+/// root: [`config_dir_compare_key`] is the comparison.
+fn sole_candidate_root(candidates: &[TranscriptCandidate], session_id: &str) -> String {
+    let mut roots = candidates
+        .iter()
+        .filter(|c| c.session_id == session_id)
+        .map(|c| c.config_dir.as_str())
+        .filter(|root| !root.trim().is_empty());
+    let Some(first) = roots.next() else {
+        return String::new();
+    };
+    let first_key = config_dir_compare_key(first);
+    if roots.all(|root| config_dir_compare_key(root) == first_key) {
+        first.to_string()
+    } else {
+        String::new()
     }
 }
 
@@ -396,6 +470,8 @@ fn bind_record(
         wind_down_arm: None,
         finish_reason: None,
         finish_synced: false,
+        finish_coord_session_id: None,
+        finish_coord_readdressed: false,
         spawn_device_default: None,
         adopted_from: None,
         last_session_start_at: None,
@@ -438,6 +514,22 @@ pub fn run_reconcile<I: TranscriptIndex>(
     cmdline_ids: &HashMap<u32, String>,
 ) -> Vec<ReconcileAction> {
     let live_terminal_ids: HashSet<String> = live.iter().map(|p| p.terminal_id.clone()).collect();
+    // Live panes that still host a claude anchor this pass. Only such a pane
+    // can be the live OWNER the rung-2 guard defers to: a pane whose claude
+    // exited (its shell lives on) no longer runs the session, so a real
+    // `--resume` elsewhere must still be able to take the row.
+    //
+    // Keyed to the anchor pid so the guard can also read the owner's OWN argv:
+    // a live, anchored owner whose claude now names a DIFFERENT session (the
+    // pane was reused for another `claude --resume`) no longer runs this one,
+    // and must not hold its row hostage. An owner whose argv names nothing
+    // (no typed id, or the cmdline query missed it) still counts as live —
+    // absence of evidence is not evidence of a switch, and the f0a0c310
+    // re-point is the costlier error.
+    let anchored_terminal_pids: HashMap<&str, u32> = live
+        .iter()
+        .filter_map(|p| p.ai_pid.map(|pid| (p.terminal_id.as_str(), pid)))
+        .collect();
     // Session ids already owned by a CONFIRMED open row can't be re-bound to a
     // different live terminal — seed the claim set so the uniqueness gate sees
     // them, and grow it as this pass binds more (two same-second launches then
@@ -496,6 +588,21 @@ pub fn run_reconcile<I: TranscriptIndex>(
             .and_then(|pid| cmdline_ids.get(&pid))
             .map(|s| s.as_str());
         let candidates = index.candidates_for(&pty.working_dir);
+        // Read per terminal, not once per pass: a bind earlier in this pass may
+        // already have moved the row.
+        let cmdline_id_live_owner: Option<String> = cmdline_sid
+            .and_then(|sid| store.get(sid))
+            .filter(|r| {
+                r.state == "open"
+                    && anchored_terminal_pids
+                        .get(r.terminal_id.as_str())
+                        .is_some_and(|owner_pid| {
+                            cmdline_ids
+                                .get(owner_pid)
+                                .is_none_or(|owner_sid| Some(owner_sid.as_str()) == cmdline_sid)
+                        })
+            })
+            .map(|r| r.terminal_id);
         let action = decide_bind_for_live_pty(
             pty,
             existing.as_ref(),
@@ -503,6 +610,7 @@ pub fn run_reconcile<I: TranscriptIndex>(
             cmdline_sid,
             &candidates,
             &claimed_ids,
+            cmdline_id_live_owner.as_deref(),
         );
         match &action {
             ReconcileAction::Bind {
@@ -928,8 +1036,8 @@ pub trait ProviderSessionIndex {
 ///
 /// The provider instead maintains this small JSON file per live session —
 /// `{pid, sessionId, cwd, startedAt, name, status, …}` — whose `name` IS the
-/// in-TUI name and whose `pid` is the claude image the binder already anchors on
-/// ([`claude_anchor_in_subtree`](crate::process_capture::process_tree::claude_anchor_in_subtree)).
+/// in-TUI name and whose `pid` is the `claude` the binder already anchors on
+/// ([`PaneLook::claude_anchor`](crate::terminal::graceful_exit::PaneLook::claude_anchor)).
 /// It is read-only to us and best-effort: an absent/unparseable file, or a
 /// provider version that stops writing it, degrades to "no refresh this tick"
 /// and the title simply stays as it is.
@@ -968,7 +1076,11 @@ impl ProviderSessionIndex for DiskProviderSessionIndex {
             let Ok(parsed) = serde_json::from_str::<ProviderSessionFile>(&raw) else {
                 continue;
             };
-            let session_id = parsed.session_id.filter(|s| !s.trim().is_empty())?;
+            // An empty id in THIS dir's file must not end the search of the
+            // remaining dirs (a stale file would mask the live one).
+            let Some(session_id) = parsed.session_id.filter(|s| !s.trim().is_empty()) else {
+                continue;
+            };
             return Some(ProviderSessionMeta {
                 session_id,
                 name: parsed.name.filter(|n| !n.trim().is_empty()),
@@ -996,6 +1108,7 @@ pub fn decide_title_refresh(
 ) -> Option<String> {
     let meta = meta?;
     if meta.session_id != rec.claude_session_id {
+        note_title_refresh_mismatch(&rec.terminal_id, &meta.session_id, &rec.claude_session_id);
         return None;
     }
     let name = meta.name.as_deref()?.trim();
@@ -1003,6 +1116,29 @@ pub fn decide_title_refresh(
         return None;
     }
     Some(name.to_string())
+}
+
+/// Log, at `info!` and ONCE per (terminal, provider id), that the provider's
+/// live file names a different session than the lifecycle record. It was a
+/// silent drop; it is the observation that the pane's claude now runs another
+/// id, which the coord re-key (`provider_registry`) acts on.
+fn note_title_refresh_mismatch(terminal_id: &str, provider_id: &str, record_id: &str) {
+    static SEEN: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<(String, String)>>,
+    > = std::sync::OnceLock::new();
+    let seen = SEEN.get_or_init(Default::default);
+    let first = seen
+        .lock()
+        .map(|mut set| set.insert((terminal_id.to_string(), provider_id.to_string())))
+        .unwrap_or(false);
+    if first {
+        tracing::info!(
+            terminal_id = %terminal_id,
+            provider_session = %provider_id,
+            record_session = %record_id,
+            "session reconcile: the provider's live session id differs from the lifecycle record's — title not refreshed"
+        );
+    }
 }
 
 /// One title the pass refreshed — returned for logging/tests.
@@ -1075,10 +1211,137 @@ pub fn refresh_titles<N: ProviderSessionIndex>(
 pub fn refresh_titles_pass(
     store: &SessionLifecycleStore,
     live: &[LivePty],
-    snapshot: &ProcessSnapshot,
+    look: &PaneLook,
 ) -> Vec<TitleRefresh> {
-    let live = anchor_live_ptys(live, snapshot);
+    let live = anchor_live_ptys(live, look);
     refresh_titles(store, &live, &DiskProviderSessionIndex::discover())
+}
+
+/// The valid provider-registry rows of ONE tick, keyed by terminal id: the
+/// STRICT [`provider_row_validity`](crate::session::claude_activity::provider_row_validity)
+/// verdict for each live PTY's claude anchor pid. Computed once per tick (off
+/// the async executor) and handed to the bind pass's rung-2 pre-emption, to
+/// the coord re-key and to [`config_dir_repair`], so all three read the same
+/// answer.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ProviderRows {
+    by_terminal: HashMap<String, ProviderEntry>,
+}
+
+/// One terminal's verdict with the anchor it was read for (pid + creation
+/// time), so a caller can tell "the same process, read again" from "a new one".
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderEntry {
+    anchor: (u32, Option<i64>),
+    verdict: ProviderRowValidity,
+}
+
+impl ProviderRows {
+    /// Rows with no anchor information (pid 0, creation unknown).
+    #[cfg(test)]
+    pub fn from_pairs(pairs: impl IntoIterator<Item = (String, ProviderRowValidity)>) -> Self {
+        Self::from_entries(pairs.into_iter().map(|(t, v)| (t, (0, None), v)))
+    }
+
+    pub fn from_entries(
+        entries: impl IntoIterator<Item = (String, (u32, Option<i64>), ProviderRowValidity)>,
+    ) -> Self {
+        Self {
+            by_terminal: entries
+                .into_iter()
+                .map(|(t, anchor, verdict)| (t, ProviderEntry { anchor, verdict }))
+                .collect(),
+        }
+    }
+
+    /// The session id this terminal's anchor provably runs, if any.
+    #[cfg(test)]
+    pub fn valid_id(&self, terminal_id: &str) -> Option<&str> {
+        match &self.by_terminal.get(terminal_id)?.verdict {
+            ProviderRowValidity::Valid { session_id, .. } => Some(session_id),
+            _ => None,
+        }
+    }
+
+    /// Every `(terminal id, valid session id, config dir the row was read
+    /// from)`, in no particular order.
+    pub fn valid(&self) -> impl Iterator<Item = (&str, &str, &Path)> {
+        self.by_terminal
+            .iter()
+            .filter_map(|(t, e)| match &e.verdict {
+                ProviderRowValidity::Valid {
+                    session_id,
+                    config_dir,
+                } => Some((t.as_str(), session_id.as_str(), config_dir.as_path())),
+                _ => None,
+            })
+    }
+
+    /// The anchor (pid + creation time) this tick read this terminal's
+    /// provider files for, whatever the verdict. `None` when this tick read
+    /// none for it.
+    pub fn anchor(&self, terminal_id: &str) -> Option<(u32, Option<i64>)> {
+        self.by_terminal.get(terminal_id).map(|e| e.anchor)
+    }
+
+    /// Every `(terminal id, anchor, verdict)` read this tick.
+    pub fn entries(
+        &self,
+    ) -> impl Iterator<Item = (&str, (u32, Option<i64>), &ProviderRowValidity)> {
+        self.by_terminal
+            .iter()
+            .map(|(t, e)| (t.as_str(), e.anchor, &e.verdict))
+    }
+}
+
+/// Blocking: resolve anchors from `look` and read every config dir's file
+/// for each anchor pid. An unknown snapshot anchors nothing. `config_dirs` is
+/// only called when at least one anchor exists, so a tick with no claude pane
+/// does no directory discovery.
+pub fn compute_provider_rows_blocking(
+    live: &[LivePty],
+    look: &PaneLook,
+    config_dirs: impl FnOnce() -> Vec<PathBuf>,
+) -> ProviderRows {
+    let snapshot = look.snapshot();
+    let anchored = anchor_live_ptys(live, look);
+    let pids: Vec<(u32, Option<i64>)> = anchored
+        .iter()
+        .filter_map(|p| {
+            let pid = p.ai_pid?;
+            Some((pid, snapshot.creation_times.get(&pid).copied()))
+        })
+        .collect();
+    if pids.is_empty() {
+        return ProviderRows::default();
+    }
+    let verdicts = read_provider_rows(&config_dirs(), &pids);
+    ProviderRows::from_entries(anchored.iter().filter_map(|p| {
+        let pid = p.ai_pid?;
+        let verdict = verdicts.get(&pid)?.clone();
+        let creation = snapshot
+            .creation_times
+            .get(&pid)
+            .copied()
+            .filter(|&s| s > 0);
+        Some((p.terminal_id.clone(), (pid, creation), verdict))
+    }))
+}
+
+/// [`compute_provider_rows_blocking`] on the blocking pool. A join failure
+/// reads as "no valid rows": rung 2 stays the fallback and nothing is re-keyed
+/// from the registry.
+pub async fn compute_provider_rows(live: &[LivePty], look: &PaneLook) -> ProviderRows {
+    let (live, look) = (live.to_vec(), look.clone());
+    spawn_blocking_tracked(move || {
+        compute_provider_rows_blocking(
+            &live,
+            &look,
+            crate::terminal::transcript::find_claude_config_dirs,
+        )
+    })
+    .await
+    .unwrap_or_default()
 }
 
 /// Parse an ISO-8601 timestamp into Unix epoch seconds (best-effort).
@@ -1088,23 +1351,35 @@ fn parse_iso_to_unix_secs(s: &str) -> Option<i64> {
         .map(|dt| dt.timestamp())
 }
 
-/// Resolve each live PTY's CLAUDE anchor — the claude-image descendant pid + its
-/// process start — from an ALREADY-TAKEN snapshot (no extra sweep). The
+/// Resolve each live PTY's CLAUDE anchor — the oldest live `claude` in its
+/// subtree ([`PaneLook::claude_anchor`]: an image-proven `claude`, or a pid
+/// Claude Code's session registry names, so an npm-installed one anchors too)
+/// + its process start — from an ALREADY-TAKEN look (no extra sweep). The
 /// correlation must anchor on when CLAUDE started, not on when its shell did (a
 /// foreign same-cwd session started after the shell but before claude would
 /// otherwise qualify); the shell pid's start is only a fallback for a found
 /// claude whose own start is unknown. A PTY whose subtree hosts no claude image
-/// keeps `ai_pid: None`, and [`run_reconcile`] never binds it.
-fn anchor_live_ptys(live: &[LivePty], snapshot: &ProcessSnapshot) -> Vec<LivePty> {
+/// keeps `ai_pid: None`, and [`run_reconcile`] never binds it. So does one
+/// whose anchor is UNDECIDED (a `node`/`bun` the registry could not settle may
+/// be the older `claude`): an unresolved anchor binds nothing.
+///
+/// An UNKNOWN snapshot ([`ProcessSnapshot::is_unknown`]: a failed read, or the
+/// last good table served `stale`) anchors NOTHING: its processes may have
+/// exited minutes ago, and an anchor resolved from one could bind a pane to a
+/// session it no longer hosts — whose `--resume` the next restore would type.
+/// Every unresolved `ai_pid` stays `None`, so no pane is bound this pass;
+/// pruning and the rest of the pass still run.
+fn anchor_live_ptys(live: &[LivePty], look: &PaneLook) -> Vec<LivePty> {
     let mut out = live.to_vec();
+    if look.snapshot().is_unknown() {
+        return out;
+    }
     for pty in out.iter_mut() {
         if pty.ai_pid.is_some() {
             continue; // the caller already resolved it
         }
         let Some(root) = pty.pid else { continue };
-        if let Some((ai_pid, ai_start)) =
-            crate::process_capture::process_tree::claude_anchor_in_subtree(root, snapshot)
-        {
+        if let Ok(Some((ai_pid, ai_start))) = look.claude_anchor(root) {
             pty.ai_pid = Some(ai_pid);
             // An unknown (0) creation time is NOT an anchor — leave it None so
             // the shell-start fallback applies.
@@ -1141,10 +1416,11 @@ fn anchor_live_ptys(live: &[LivePty], snapshot: &ProcessSnapshot) -> Vec<LivePty
 pub async fn run_reconcile_pass(
     store: &SessionLifecycleStore,
     live: &[LivePty],
-    snapshot: &ProcessSnapshot,
+    look: &PaneLook,
     context: &str,
 ) -> Vec<ReconcileAction> {
-    let live = anchor_live_ptys(live, snapshot);
+    let snapshot = look.snapshot();
+    let live = anchor_live_ptys(live, look);
 
     // Rung 2 — ONE targeted cmdline query, for exactly the anchor pids of the
     // terminals that still need binding. Never a table-wide fetch; an empty list
@@ -1167,8 +1443,14 @@ pub async fn run_reconcile_pass(
     let cmdline_ids: HashMap<u32, String> = if anchor_pids.is_empty() {
         HashMap::new()
     } else {
+        // An UNKNOWN read (`None`) is treated as an empty map here, and only
+        // here because it is safe: rung 2 is positive evidence only, so no
+        // cmdline id just sends every terminal to the rung-3 transcript anchor,
+        // exactly as a read that found no ids does. Nothing is bound BECAUSE an
+        // id is absent.
         crate::process_capture::process_tree::command_lines_for_pids(&anchor_pids)
             .await
+            .unwrap_or_default()
             .iter()
             .filter_map(|(pid, cl)| {
                 crate::process_capture::process_tree::parse_session_id_from_cmdline(cl)
@@ -1265,8 +1547,9 @@ pub async fn run_at_boot(
     if live.is_empty() && store.open_records().is_empty() {
         return Vec::new(); // nothing to do
     }
-    let snapshot = crate::process_capture::process_tree::snapshot_process_table_public().await;
-    run_reconcile_pass(store, &live, &snapshot, "boot").await
+    let roots: Vec<u32> = live.iter().filter_map(|pty| pty.pid).collect();
+    let look = PaneLook::take(&roots).await;
+    run_reconcile_pass(store, &live, &look, "boot").await
 }
 
 /// Wire payload for the `session-bound` Tauri event — the binder→frontend
@@ -1288,7 +1571,8 @@ pub struct SessionBoundPayload {
     pub terminal_id: String,
     pub session_id: String,
     /// Empty string when the bind didn't resolve a config dir (rung-2 cmdline
-    /// bind whose transcript hasn't appeared yet) — the frontend treats empty
+    /// bind whose transcript hasn't appeared yet, or a migrated session whose
+    /// transcript sits under more than one root) — the frontend treats empty
     /// as "unknown", never as a path.
     pub config_dir: String,
     /// The evidence grade (`authoritative` / `observed` / `reconciled`) — the
@@ -1616,6 +1900,8 @@ mod tests {
             wind_down_arm: None,
             finish_reason: None,
             finish_synced: false,
+            finish_coord_session_id: None,
+            finish_coord_readdressed: false,
             spawn_device_default: None,
             adopted_from: None,
             last_session_start_at: None,
@@ -1687,6 +1973,91 @@ mod tests {
             decide_title_refresh(&rec, Some(&meta("sess-1", Some("qontinui")))),
             None
         );
+    }
+
+    /// The provider file carrying the new keys (`pid`, `procStart`,
+    /// `pidDomain`) still feeds the title refresh: the name is adopted.
+    #[test]
+    fn title_refresh_still_adopts_a_name_from_a_file_with_the_new_keys() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sessions")).unwrap();
+        std::fs::write(
+            dir.path().join("sessions").join("4242.json"),
+            r#"{"pid":"4242","sessionId":"sess-1","name":"renamed","procStart":134372341332109841,"pidDomain":"win32:134372341332109841","status":"idle"}"#,
+        )
+        .unwrap();
+        // An empty-id file in an EARLIER dir must not end the search.
+        let early = tempdir().unwrap();
+        std::fs::create_dir_all(early.path().join("sessions")).unwrap();
+        std::fs::write(
+            early.path().join("sessions").join("4242.json"),
+            r#"{"pid":4242,"sessionId":""}"#,
+        )
+        .unwrap();
+        let store_dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(store_dir.path().join("s.json")).unwrap();
+        store.record_open(title_rec("sess-1", "term-1", Some("qontinui")));
+        let index = DiskProviderSessionIndex {
+            config_dirs: vec![early.path().to_path_buf(), dir.path().to_path_buf()],
+        };
+        let refreshed = refresh_titles(
+            &store,
+            &[pty_anchored("term-1", 4242, 1_000, "C:/repo")],
+            &index,
+        );
+        assert_eq!(refreshed.len(), 1, "{refreshed:?}");
+        assert_eq!(refreshed[0].title, "renamed");
+    }
+
+    fn rows_fixture(created: i64, file_created: i64) -> (tempfile::TempDir, ProviderRows) {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sessions")).unwrap();
+        let ft = ((file_created + 11_644_473_600) as u64) * 10_000_000;
+        std::fs::write(
+            dir.path().join("sessions").join("31524.json"),
+            format!(
+                r#"{{"pid":31524,"sessionId":"44348633-0000-4000-8000-000000000002","procStart":"{ft}","pidDomain":"win32:{ft}","status":"idle"}}"#
+            ),
+        )
+        .unwrap();
+        let snap = ProcessSnapshot {
+            stale: false,
+            parent_map: HashMap::from([(1, vec![31524])]),
+            creation_times: HashMap::from([(31524, created)]),
+            ..Default::default()
+        };
+        let rows = compute_provider_rows_blocking(
+            &[pty_anchored("term-1", 31524, created, "C:/repo")],
+            &crate::terminal::graceful_exit::PaneLook::image_only(&snap),
+            || vec![dir.path().to_path_buf()],
+        );
+        (dir, rows)
+    }
+
+    /// The disk read: a win32 row matching the anchor's creation time is valid;
+    /// the same file read against a pid reused after it is not.
+    #[test]
+    fn provider_rows_are_read_per_anchor_and_a_reused_pid_is_rejected() {
+        let (d, rows) = rows_fixture(1_790_000_000, 1_790_000_000);
+        assert_eq!(
+            rows.valid_id("term-1"),
+            Some("44348633-0000-4000-8000-000000000002")
+        );
+        // The config dir the valid row was read from rides along with it.
+        let valid: Vec<_> = rows.valid().collect();
+        assert_eq!(
+            valid,
+            vec![("term-1", "44348633-0000-4000-8000-000000000002", d.path())]
+        );
+        // The anchor the row was read for is looked up by terminal.
+        assert_eq!(rows.anchor("term-1"), Some((31524, Some(1_790_000_000))));
+        assert_eq!(rows.anchor("term-absent"), None);
+        let (_d, rows) = rows_fixture(1_790_000_000, 1_790_000_000 - 7200);
+        assert_eq!(rows.valid_id("term-1"), None);
+        assert_eq!(rows.valid().count(), 0);
+        // A non-Valid verdict still carries its anchor: the suppression memory
+        // is keyed on it.
+        assert_eq!(rows.anchor("term-1"), Some((31524, Some(1_790_000_000))));
     }
 
     /// B6 end-to-end over the store: `refresh_titles` routes the provider name
@@ -1784,8 +2155,15 @@ mod tests {
         let p = pty("term-1", Some(100), "C:/repo");
         // Transcript present for the typed id → confirmed, config carried over.
         let candidates = vec![cand("typed-id", "C:/cfg", Some(1_500))];
-        let action =
-            decide_bind_for_live_pty(&p, None, 1_000, Some("typed-id"), &candidates, &no_claims());
+        let action = decide_bind_for_live_pty(
+            &p,
+            None,
+            1_000,
+            Some("typed-id"),
+            &candidates,
+            &no_claims(),
+            None,
+        );
         assert_eq!(
             action,
             ReconcileAction::Bind {
@@ -1798,7 +2176,7 @@ mod tests {
         );
         // No transcript yet → provisional (unconfirmed, empty config).
         let action2 =
-            decide_bind_for_live_pty(&p, None, 1_000, Some("typed-id"), &[], &no_claims());
+            decide_bind_for_live_pty(&p, None, 1_000, Some("typed-id"), &[], &no_claims(), None);
         assert_eq!(
             action2,
             ReconcileAction::Bind {
@@ -1823,7 +2201,8 @@ mod tests {
             // Ours: started just after the anchor — the unique survivor.
             cand("ours", "C:/cfg", Some(1_010)),
         ];
-        let action = decide_bind_for_live_pty(&p, None, 1_000, None, &candidates, &no_claims());
+        let action =
+            decide_bind_for_live_pty(&p, None, 1_000, None, &candidates, &no_claims(), None);
         assert_eq!(
             action,
             ReconcileAction::Bind {
@@ -1844,7 +2223,8 @@ mod tests {
             cand("a", "C:/cfg", Some(1_010)),
             cand("b", "C:/cfg", Some(2_000)),
         ];
-        let action = decide_bind_for_live_pty(&p, None, 1_000, None, &candidates, &no_claims());
+        let action =
+            decide_bind_for_live_pty(&p, None, 1_000, None, &candidates, &no_claims(), None);
         assert_eq!(
             action,
             ReconcileAction::SkipAmbiguous {
@@ -1864,7 +2244,7 @@ mod tests {
             cand("b", "C:/cfg", Some(2_000)),
         ];
         let claimed: HashSet<String> = ["a".to_string()].into_iter().collect();
-        let action = decide_bind_for_live_pty(&p, None, 1_000, None, &candidates, &claimed);
+        let action = decide_bind_for_live_pty(&p, None, 1_000, None, &candidates, &claimed, None);
         assert_eq!(
             action,
             ReconcileAction::Bind {
@@ -1883,7 +2263,8 @@ mod tests {
     fn decide_leaves_alone_when_only_pre_start_candidates() {
         let p = pty("term-1", Some(100), "C:/repo");
         let candidates = vec![cand("foreign", "C:/cfg", Some(500))];
-        let action = decide_bind_for_live_pty(&p, None, 1_000, None, &candidates, &no_claims());
+        let action =
+            decide_bind_for_live_pty(&p, None, 1_000, None, &candidates, &no_claims(), None);
         assert_eq!(
             action,
             ReconcileAction::LeaveAlone {
@@ -1914,6 +2295,7 @@ mod tests {
             Some("typed-id"),
             &candidates,
             &no_claims(),
+            None,
         );
         assert_eq!(
             action,
@@ -1936,7 +2318,7 @@ mod tests {
         // Grading it `observed` here would auto-resume a possibly-foreign
         // session on the weakest evidence in the ladder.
         let one = vec![cand("a", "C:/cfg", Some(500))];
-        let action = decide_bind_for_live_pty(&p, None, 0, None, &one, &no_claims());
+        let action = decide_bind_for_live_pty(&p, None, 0, None, &one, &no_claims(), None);
         assert_eq!(
             action,
             ReconcileAction::Bind {
@@ -1952,7 +2334,7 @@ mod tests {
             cand("a", "C:/cfg", Some(500)),
             cand("b", "C:/cfg", Some(900)),
         ];
-        let action2 = decide_bind_for_live_pty(&p, None, 0, None, &two, &no_claims());
+        let action2 = decide_bind_for_live_pty(&p, None, 0, None, &two, &no_claims(), None);
         assert_eq!(
             action2,
             ReconcileAction::SkipAmbiguous {
@@ -2039,6 +2421,8 @@ mod tests {
             wind_down_arm: None,
             finish_reason: None,
             finish_synced: false,
+            finish_coord_session_id: None,
+            finish_coord_readdressed: false,
             spawn_device_default: None,
             adopted_from: None,
             last_session_start_at: None,
@@ -2213,6 +2597,8 @@ mod tests {
             wind_down_arm: None,
             finish_reason: None,
             finish_synced: false,
+            finish_coord_session_id: None,
+            finish_coord_readdressed: false,
             spawn_device_default: None,
             adopted_from: None,
             last_session_start_at: None,
@@ -2307,6 +2693,8 @@ mod tests {
             wind_down_arm: None,
             finish_reason: None,
             finish_synced: false,
+            finish_coord_session_id: None,
+            finish_coord_readdressed: false,
             spawn_device_default: None,
             adopted_from: None,
             last_session_start_at: None,
@@ -2432,6 +2820,74 @@ mod tests {
         );
     }
 
+    /// B1: a STALE table that still has rows anchors nothing, so nothing is
+    /// bound from it. The same table read fresh anchors the claude under the
+    /// pane and binds — the refusal is the `stale` flag, not the data.
+    #[test]
+    fn reconcile_a_stale_table_anchors_nothing_and_binds_nothing() {
+        // Shell 4242 -> claude 5151 (started 1_000); one same-cwd transcript
+        // that started after claude did.
+        let table = |stale: bool| {
+            let mut s = ProcessSnapshot::default();
+            s.parent_map.insert(4242, vec![5151]);
+            s.creation_times.insert(4242, 900);
+            s.creation_times.insert(5151, 1_000);
+            s.names.insert(4242, "bash".to_string());
+            s.names.insert(5151, "claude".to_string());
+            s.stale = stale;
+            s
+        };
+        let index = || {
+            let mut by_wd = HashMap::new();
+            by_wd.insert(
+                "C:/repo".to_string(),
+                vec![cand("real-sess", "C:/cfg", Some(1_500))],
+            );
+            FakeIndex {
+                by_wd,
+                existing_ids: ["real-sess".to_string()].into_iter().collect(),
+            }
+        };
+        let live = vec![pty("claude-term", Some(4242), "C:/repo")];
+
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        let stale = table(true);
+        let anchored = anchor_live_ptys(
+            &live,
+            &crate::terminal::graceful_exit::PaneLook::image_only(&stale),
+        );
+        assert_eq!(anchored[0].ai_pid, None, "a stale table anchors nothing");
+        let actions = run_reconcile(&store, &anchored, &stale, &index(), &no_cmdlines());
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, ReconcileAction::Bind { .. })),
+            "no bind from a stale table, got {actions:?}"
+        );
+        assert!(store.get("real-sess").is_none(), "no row written");
+
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        let fresh = table(false);
+        let anchored = anchor_live_ptys(
+            &live,
+            &crate::terminal::graceful_exit::PaneLook::image_only(&fresh),
+        );
+        assert_eq!(
+            anchored[0].ai_pid,
+            Some(5151),
+            "a fresh table anchors claude"
+        );
+        let actions = run_reconcile(&store, &anchored, &fresh, &index(), &no_cmdlines());
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, ReconcileAction::Bind { session_id, .. } if session_id == "real-sess")),
+            "the fresh table binds, got {actions:?}"
+        );
+    }
+
     /// The KEPT fallback: a claude image WAS found (`ai_pid: Some`) but its own
     /// start time is unknown (`ai_start_unix: None`). The shell pid's creation
     /// time then anchors the correlation, so a unique same-cwd transcript that
@@ -2480,6 +2936,483 @@ mod tests {
                 .origin
                 .as_deref(),
             Some(ORIGIN_OBSERVED)
+        );
+    }
+
+    /// Shell 5 → `node` 50 (an npm-installed `claude`, `node … cli.js`).
+    fn npm_pane_table() -> crate::process_capture::process_tree::ProcessSnapshot {
+        let mut snap = crate::process_capture::process_tree::ProcessSnapshot {
+            stale: false,
+            ..Default::default()
+        };
+        snap.parent_map.insert(1, vec![5]);
+        snap.parent_map.insert(5, vec![50]);
+        for (pid, name, started) in [(5, "bash", 1_000), (50, "node", 1_050)] {
+            snap.names.insert(pid, name.to_string());
+            snap.creation_times.insert(pid, started);
+        }
+        snap
+    }
+
+    fn npm_look(
+        witness: crate::terminal::graceful_exit::RegistryWitness,
+    ) -> crate::terminal::graceful_exit::PaneLook {
+        crate::terminal::graceful_exit::PaneLook::over_whole_table(npm_pane_table(), witness)
+    }
+
+    /// The reconcile anchor: an npm `claude` the registry names anchors the
+    /// pane. Partner: drop the witness and nothing anchors (the pane is never
+    /// bound). Unsettled, the anchor is unresolved: no bind.
+    #[test]
+    fn an_npm_claude_anchors_the_pane_and_an_unsettled_one_binds_nothing() {
+        use crate::terminal::graceful_exit::RegistryWitness;
+        let live = vec![pty("npm-term", Some(5), "/repo")];
+        let anchor = |w| {
+            let p = &anchor_live_ptys(&live, &npm_look(w))[0];
+            (p.ai_pid, p.ai_start_unix)
+        };
+        assert_eq!(
+            anchor(RegistryWitness::naming(&[50])),
+            (Some(50), Some(1_050))
+        );
+        assert_eq!(anchor(RegistryWitness::naming(&[])), (None, None));
+        assert_eq!(anchor(RegistryWitness::unreadable("test")), (None, None));
+    }
+
+    // ── A bind never writes a roster-order config dir (plan
+    //    2026-11-16-boot-reconcile-reverts-…, D1 rules 2-3) ──────────────
+
+    /// Two account roots in `find_claude_config_dirs()` order, with the default
+    /// home first. That order is device-specific: `discover_account_homes` puts
+    /// `~/.claude` LAST unless `CLAUDE_CONFIG_DIR` or the settings roster names
+    /// it, and on device 4b426e2b the roster listed it at index 0.
+    const ROOT_A: &str = "/home/u/.claude";
+    const ROOT_B: &str = "/home/u/.claude-erik";
+
+    /// A migrated session: the carry never deletes its source, so the
+    /// transcript sits under both roots, in roster order.
+    fn two_root_index(sid: &str) -> FakeIndex {
+        FakeIndex {
+            by_wd: HashMap::from([(
+                "/repo".to_string(),
+                vec![
+                    cand(sid, ROOT_A, Some(1_500)),
+                    cand(sid, ROOT_B, Some(1_500)),
+                ],
+            )]),
+            existing_ids: [sid.to_string()].into_iter().collect(),
+        }
+    }
+
+    /// An open record for `sid` on `terminal`, under `dir`.
+    fn rec_under(sid: &str, terminal: &str, dir: &str, confirmed: bool) -> TerminalSessionRecord {
+        TerminalSessionRecord {
+            config_dir: Some(dir.to_string()),
+            working_dir: Some("/repo".to_string()),
+            confirmed_at: confirmed.then_some(1),
+            ..title_rec(sid, terminal, Some("T"))
+        }
+    }
+
+    /// (a) The bind shape of the 16:56:39Z periodic pass: fresh rung-2
+    /// evidence from the session's own pane, the transcript under [A, B]. On
+    /// device 4b426e2b the record already read `~/.claude` by then (the BOOT
+    /// pass wrote it at 16:56:08Z); this fixture's record still holds the
+    /// migrated B, so the assertion is the rule itself: the bind must not
+    /// write A because A sorts first. It carries no config dir and the record
+    /// keeps B.
+    #[test]
+    fn a_rung2_bind_of_a_session_under_two_roots_keeps_the_migrated_config_dir() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        store.record_open(rec_under("d1-a", "term-new", ROOT_B, false));
+        let cmdlines: HashMap<u32, String> = HashMap::from([(777, "d1-a".to_string())]);
+
+        let actions = run_reconcile(
+            &store,
+            &[pty_anchored("term-new", 777, 1_000, "/repo")],
+            &ProcessSnapshot::default(),
+            &two_root_index("d1-a"),
+            &cmdlines,
+        );
+
+        assert_eq!(
+            actions,
+            vec![ReconcileAction::Bind {
+                terminal_id: "term-new".to_string(),
+                session_id: "d1-a".to_string(),
+                config_dir: String::new(),
+                origin: BindOrigin::Authoritative,
+                confirmed: true,
+            }]
+        );
+        let rec = store.get("d1-a").unwrap();
+        assert_eq!(rec.config_dir.as_deref(), Some(ROOT_B));
+        assert!(
+            rec.confirmed_at.is_some(),
+            "a transcript exists ⇒ confirmed"
+        );
+    }
+
+    /// (a, rung 3) The uniqueness gate counts SESSIONS: one migrated session
+    /// under two roots is one candidate, not an ambiguity. It binds, with no
+    /// config dir, and the record keeps B.
+    #[test]
+    fn a_rung3_bind_counts_one_session_under_two_roots_as_one_candidate() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        store.record_open(rec_under("d1-a3", "term-new", ROOT_B, false));
+
+        let actions = run_reconcile(
+            &store,
+            &[pty_anchored("term-new", 777, 1_000, "/repo")],
+            &ProcessSnapshot::default(),
+            &two_root_index("d1-a3"),
+            &no_cmdlines(),
+        );
+
+        assert_eq!(
+            actions,
+            vec![ReconcileAction::Bind {
+                terminal_id: "term-new".to_string(),
+                session_id: "d1-a3".to_string(),
+                config_dir: String::new(),
+                origin: BindOrigin::Observed,
+                confirmed: true,
+            }]
+        );
+        assert_eq!(
+            store.get("d1-a3").unwrap().config_dir.as_deref(),
+            Some(ROOT_B)
+        );
+    }
+
+    /// (b) A session held under ONE root still binds that root, on both rungs,
+    /// so a shim-bypassed first bind does not regress to an unknown account.
+    #[test]
+    fn a_bind_of_a_session_under_one_root_still_writes_that_root() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        let index = FakeIndex {
+            by_wd: HashMap::from([
+                (
+                    "/repo".to_string(),
+                    vec![cand("d1-b-typed", ROOT_B, Some(1_500))],
+                ),
+                (
+                    "/repo2".to_string(),
+                    vec![cand("d1-b-observed", ROOT_B, Some(1_500))],
+                ),
+            ]),
+            existing_ids: ["d1-b-typed".to_string(), "d1-b-observed".to_string()]
+                .into_iter()
+                .collect(),
+        };
+        let cmdlines: HashMap<u32, String> = HashMap::from([(777, "d1-b-typed".to_string())]);
+
+        run_reconcile(
+            &store,
+            &[
+                pty_anchored("term-typed", 777, 1_000, "/repo"),
+                pty_anchored("term-observed", 888, 1_000, "/repo2"),
+            ],
+            &ProcessSnapshot::default(),
+            &index,
+            &cmdlines,
+        );
+
+        for sid in ["d1-b-typed", "d1-b-observed"] {
+            assert_eq!(
+                store.get(sid).unwrap().config_dir.as_deref(),
+                Some(ROOT_B),
+                "{sid}"
+            );
+        }
+    }
+
+    /// (c) The migration settle window: the row is open (and confirmed) on the
+    /// live NEW pane, and the live OLD pane still runs `claude --resume <sid>`
+    /// under A, while the new pane's provider row is not valid yet. The old
+    /// pane's rung-2 evidence is left alone: the row stays on the new pane with
+    /// B, and neither this tick's repair nor the next one writes A.
+    #[test]
+    fn a_settle_window_bind_from_the_old_pane_leaves_the_row_and_its_config_dir() {
+        use super::config_dir_repair::{repair_config_dirs, AnchorArgvIds, PreEvidenceSnapshot};
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        store.record_open(rec_under("d1-c", "term-new", ROOT_B, true));
+        let cmdlines: HashMap<u32, String> =
+            HashMap::from([(111, "d1-c".to_string()), (222, "d1-c".to_string())]);
+        // Only the old pane's claude has a valid provider row so far.
+        let rows = ProviderRows::from_pairs([(
+            "term-old".to_string(),
+            ProviderRowValidity::Valid {
+                session_id: "d1-c".to_string(),
+                config_dir: PathBuf::from(ROOT_A),
+            },
+        )]);
+
+        let snapshot = PreEvidenceSnapshot::take(&store);
+        let actions = run_reconcile(
+            &store,
+            &[
+                pty_anchored("term-new", 222, 1_000, "/repo"),
+                pty_anchored("term-old", 111, 1_000, "/repo"),
+            ],
+            &ProcessSnapshot::default(),
+            &two_root_index("d1-c"),
+            &cmdlines,
+        );
+        assert_eq!(
+            actions,
+            vec![
+                ReconcileAction::LeaveAlone {
+                    terminal_id: "term-new".to_string()
+                },
+                ReconcileAction::LeaveAlone {
+                    terminal_id: "term-old".to_string()
+                },
+            ]
+        );
+        assert!(repair_config_dirs(&store, &snapshot, &rows, &AnchorArgvIds::none()).is_empty());
+        // The next tick's repair, from a fresh snapshot.
+        assert!(repair_config_dirs(
+            &store,
+            &PreEvidenceSnapshot::take(&store),
+            &rows,
+            &AnchorArgvIds::none()
+        )
+        .is_empty());
+
+        let rec = store.get("d1-c").unwrap();
+        assert_eq!(
+            (rec.terminal_id.as_str(), rec.config_dir.as_deref()),
+            ("term-new", Some(ROOT_B))
+        );
+    }
+
+    /// A row left open on a pane whose claude exited (its shell lives on, so
+    /// the PTY is live but has no claude anchor) does not block a real
+    /// `claude --resume <sid>` in another pane: the owner is not counted as
+    /// live, so the rung-2 bind moves the row to the resuming pane.
+    #[test]
+    fn a_row_on_a_pane_whose_claude_exited_does_not_block_a_resume_elsewhere() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        store.record_open(rec_under("d1-x", "term-shell", ROOT_B, false));
+        let cmdlines: HashMap<u32, String> = HashMap::from([(333, "d1-x".to_string())]);
+
+        run_reconcile(
+            &store,
+            &[
+                pty("term-shell", Some(1), "/repo"),
+                pty_anchored("term-resume", 333, 1_000, "/repo"),
+            ],
+            &ProcessSnapshot::default(),
+            &two_root_index("d1-x"),
+            &cmdlines,
+        );
+
+        assert_eq!(store.get("d1-x").unwrap().terminal_id, "term-resume");
+    }
+
+    /// A row left open on a live, anchored pane whose claude now runs a
+    /// DIFFERENT session (its argv names another id) does not block a real
+    /// `claude --resume <sid>` in another pane: that owner no longer runs
+    /// `sid`, so the rung-2 bind moves the row to the resuming pane.
+    #[test]
+    fn a_row_on_a_pane_now_running_another_session_does_not_block_a_resume_elsewhere() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        store.record_open(rec_under("d1-y", "term-reused", ROOT_B, false));
+        let cmdlines: HashMap<u32, String> =
+            HashMap::from([(444, "d1-other".to_string()), (555, "d1-y".to_string())]);
+
+        run_reconcile(
+            &store,
+            // The resuming pane first: in the other order the reused pane's own
+            // rung-2 bind of `d1-other` supersedes the unconfirmed `d1-y` row
+            // before the guard is ever consulted, and the test would not reach
+            // the owner-argv check.
+            &[
+                pty_anchored("term-resume", 555, 1_000, "/repo"),
+                pty_anchored("term-reused", 444, 1_000, "/repo"),
+            ],
+            &ProcessSnapshot::default(),
+            &two_root_index("d1-y"),
+            &cmdlines,
+        );
+
+        assert_eq!(store.get("d1-y").unwrap().terminal_id, "term-resume");
+    }
+
+    /// An anchored owner whose argv names NO id (a bare `claude`, or a cmdline
+    /// the query missed) still counts as live: absence is not a switch, so a
+    /// rung-2 bind elsewhere leaves the row where it is. (The owner pane is
+    /// processed first and re-binds `d1-z` at rung 3 in the same pass; the
+    /// guard is what then refuses `term-other`, and the test fails if the guard
+    /// treats a missing owner argv as a switch.)
+    #[test]
+    fn an_anchored_owner_with_no_argv_id_still_holds_its_row() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        store.record_open(rec_under("d1-z", "term-owner", ROOT_B, false));
+        let cmdlines: HashMap<u32, String> = HashMap::from([(777, "d1-z".to_string())]);
+
+        let actions = run_reconcile(
+            &store,
+            &[
+                pty_anchored("term-owner", 666, 1_000, "/repo"),
+                pty_anchored("term-other", 777, 1_000, "/repo"),
+            ],
+            &ProcessSnapshot::default(),
+            &two_root_index("d1-z"),
+            &cmdlines,
+        );
+
+        assert!(
+            actions.contains(&ReconcileAction::LeaveAlone {
+                terminal_id: "term-other".to_string()
+            }),
+            "{actions:?}"
+        );
+        assert_eq!(store.get("d1-z").unwrap().terminal_id, "term-owner");
+    }
+
+    /// The boot replay up to the repair: the boot driver's snapshot holds
+    /// `pre` for the session on its old pane, and it lists only the old pane
+    /// (the new one did not exist yet). The migration then moves the row to
+    /// the new pane under B. The boot bind from the old pane's argv moves the
+    /// row back (its owner is not live in this pass), carrying no config dir,
+    /// so B is kept. Returns the snapshot.
+    fn boot_replay(
+        store: &SessionLifecycleStore,
+        sid: &str,
+        pre: TerminalSessionRecord,
+    ) -> super::config_dir_repair::PreEvidenceSnapshot {
+        store.record_open(pre);
+        let snapshot = super::config_dir_repair::PreEvidenceSnapshot::take(store);
+
+        // The migration, after the snapshot: the row moves to the new pane.
+        store.record_open(rec_under(sid, "term-new", ROOT_B, true));
+
+        let cmdlines: HashMap<u32, String> = HashMap::from([(111, sid.to_string())]);
+        let actions = run_reconcile(
+            store,
+            &[pty_anchored("term-old", 111, 1_000, "/repo")],
+            &ProcessSnapshot::default(),
+            &two_root_index(sid),
+            &cmdlines,
+        );
+        assert!(
+            matches!(&actions[..], [ReconcileAction::Bind { terminal_id, .. }] if terminal_id == "term-old"),
+            "{actions:?}"
+        );
+        let rec = store.get(sid).unwrap();
+        assert_eq!(
+            (rec.terminal_id.as_str(), rec.config_dir.as_deref()),
+            ("term-old", Some(ROOT_B)),
+            "the bind re-terminals the row and carries no config dir"
+        );
+        snapshot
+    }
+
+    /// The old pane's valid provider row, under A.
+    fn old_pane_row_a(sid: &str) -> (String, ProviderRowValidity) {
+        (
+            "term-old".to_string(),
+            ProviderRowValidity::Valid {
+                session_id: sid.to_string(),
+                config_dir: PathBuf::from(ROOT_A),
+            },
+        )
+    }
+
+    /// The boot replay where ONLY the compare-and-set stands between the
+    /// repair and the old account. The snapshot's record sat on the old pane
+    /// with no config dir (a rung-2 bind writes none), so the old pane's row,
+    /// A, disagrees with the snapshot and no-op-on-agreement does not skip it;
+    /// the record now holds B, so the compare-and-set does.
+    #[test]
+    fn a_boot_bind_that_moves_a_migrated_row_does_not_let_the_repair_write_the_old_account() {
+        use super::config_dir_repair::{repair_config_dirs, AnchorArgvIds};
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        let pre = TerminalSessionRecord {
+            config_dir: None,
+            ..rec_under("d1-boot", "term-old", ROOT_A, true)
+        };
+        let snapshot = boot_replay(&store, "d1-boot", pre);
+
+        let rows = ProviderRows::from_pairs([old_pane_row_a("d1-boot")]);
+        assert!(repair_config_dirs(&store, &snapshot, &rows, &AnchorArgvIds::none()).is_empty());
+        assert_eq!(
+            store.get("d1-boot").unwrap().config_dir.as_deref(),
+            Some(ROOT_B)
+        );
+    }
+
+    /// The boot replay, then the NEXT periodic tick. Its snapshot reads
+    /// (term-old, B), which the record still holds, so the compare-and-set
+    /// passes. The old pane's valid row reads A, and the new pane's row is not
+    /// valid yet, so the overlap guard is silent. Only the new pane's argv
+    /// (`claude --resume <sid>`) says the session has moved, and the argv
+    /// guard keeps B.
+    #[test]
+    fn the_tick_after_a_boot_replay_does_not_write_the_old_account() {
+        use super::config_dir_repair::{repair_config_dirs, AnchorArgvIds, PreEvidenceSnapshot};
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        let boot_snapshot = boot_replay(
+            &store,
+            "d1-tick",
+            rec_under("d1-tick", "term-old", ROOT_A, true),
+        );
+        let boot_rows = ProviderRows::from_pairs([old_pane_row_a("d1-tick")]);
+        let boot_argv = AnchorArgvIds::from_pairs([("term-old", "d1-tick")]);
+        assert!(repair_config_dirs(&store, &boot_snapshot, &boot_rows, &boot_argv).is_empty());
+
+        // The next tick: both panes are live and anchored.
+        let rows = ProviderRows::from_pairs([
+            old_pane_row_a("d1-tick"),
+            ("term-new".to_string(), ProviderRowValidity::Unknown),
+        ]);
+        let argv = AnchorArgvIds::from_pairs([("term-old", "d1-tick"), ("term-new", "d1-tick")]);
+        let snapshot = PreEvidenceSnapshot::take(&store);
+        assert!(repair_config_dirs(&store, &snapshot, &rows, &argv).is_empty());
+        assert_eq!(
+            store.get("d1-tick").unwrap().config_dir.as_deref(),
+            Some(ROOT_B)
+        );
+    }
+
+    /// Spellings of one root are one root: a session whose candidates name the
+    /// same root with and without a trailing slash still binds that root.
+    #[test]
+    fn a_session_under_two_spellings_of_one_root_binds_that_root() {
+        let p = pty("term-1", Some(100), "/repo");
+        let candidates = vec![
+            cand("d1-spell", "/home/u/.claude-erik/", Some(1_500)),
+            cand("d1-spell", ROOT_B, Some(1_500)),
+        ];
+        let action = decide_bind_for_live_pty(
+            &p,
+            None,
+            1_000,
+            Some("d1-spell"),
+            &candidates,
+            &no_claims(),
+            None,
+        );
+        assert_eq!(
+            action,
+            ReconcileAction::Bind {
+                terminal_id: "term-1".to_string(),
+                session_id: "d1-spell".to_string(),
+                config_dir: "/home/u/.claude-erik/".to_string(),
+                origin: BindOrigin::Authoritative,
+                confirmed: true,
+            }
         );
     }
 }

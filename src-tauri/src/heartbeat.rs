@@ -76,6 +76,10 @@ struct HeartbeatRecentCrash {
     panic_message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     thread: Option<String>,
+    /// Pid of the process that crashed (from the dump's `Pid:` header).
+    /// Omitted — never guessed — for a dump predating that header.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pid: Option<u32>,
 }
 
 impl From<crate::crash_dumps::RecentCrash> for HeartbeatRecentCrash {
@@ -86,6 +90,7 @@ impl From<crate::crash_dumps::RecentCrash> for HeartbeatRecentCrash {
             panic_location: c.panic_location,
             panic_message: c.panic_message,
             thread: c.thread,
+            pid: c.pid,
         }
     }
 }
@@ -1242,6 +1247,37 @@ mod tests {
         assert_ne!(
             flapping.consecutive_quick_disconnects, steady.consecutive_quick_disconnects,
             "the streak is the only field that separates flapping from steady"
+        );
+    }
+
+    fn recent_crash_with_pid(pid: Option<u32>) -> crate::crash_dumps::RecentCrash {
+        crate::crash_dumps::RecentCrash {
+            file_path: "/tmp/crash_1.txt".to_string(),
+            reported_at: chrono::DateTime::parse_from_rfc3339("2026-11-07T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            panic_location: None,
+            panic_message: None,
+            thread: None,
+            pid,
+        }
+    }
+
+    /// The heartbeat projection carries the crashed process's pid (coord
+    /// finding 9215a649) and omits the key when the dump had none.
+    #[test]
+    fn heartbeat_recent_crash_serialises_pid_and_omits_it_when_absent() {
+        let with = serde_json::to_value(HeartbeatRecentCrash::from(recent_crash_with_pid(Some(
+            4242,
+        ))))
+        .unwrap();
+        assert_eq!(with["pid"], serde_json::json!(4242));
+
+        let without =
+            serde_json::to_value(HeartbeatRecentCrash::from(recent_crash_with_pid(None))).unwrap();
+        assert!(
+            without.as_object().unwrap().get("pid").is_none(),
+            "pid key must be omitted, not null: {without}"
         );
     }
 }

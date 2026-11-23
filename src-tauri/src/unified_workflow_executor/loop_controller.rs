@@ -5,7 +5,12 @@
 //! or max iterations is reached.
 //!
 //! Key design principles:
-//! 1. The loop ONLY exits when verification passes or max_iterations is hit
+//! 1. The loop exits only on a verdict or a bound, never on the AI's word.
+//!    The exits are: verification passed; nothing was checked (no required
+//!    verification step, which is not a pass); a critical failure; the AI
+//!    declaring the errors unfixable; the iteration, session, fix-attempt or
+//!    phase-timeout bound; or a stop or approval abort. `CompletionReason` is
+//!    the authoritative list.
 //! 2. The AI CANNOT bypass verification by claiming [TASK_COMPLETE]
 //! 3. Completion phase ONLY runs if verification passed
 //! 4. All decisions are logged clearly for debugging
@@ -56,6 +61,17 @@ pub struct LoopController {
     pub(super) reflection_fix_ctx: Option<crate::mcp::shared::ReflectionFixContext>,
     pub(super) step_injection_ctx: Option<crate::step_injection::types::StepInjectionContext>,
     pub(super) canvas_manager: tokio::sync::Mutex<CanvasPanelManager>,
+    /// Whether a stage of this run ended `NoVerificationSteps`, meaning its
+    /// verification checked nothing. Once set, it holds for the rest of the run:
+    /// a stage that checked nothing keeps the workflow from reporting passed,
+    /// whatever the other stages did (`workflow_passed`).
+    ///
+    /// It lives on the run, not in a local of `run_multi_stage`, because it
+    /// must be durable. `persist_workflow_state`, the one writer of the state
+    /// row, stamps it on every row it writes. A resume reads it back
+    /// (`ResumeManager::prior_stages_checked_nothing`), so a crash after such a
+    /// stage cannot let a later passing stage report the workflow passed.
+    pub(super) stages_checked_nothing: bool,
 }
 
 impl LoopController {
@@ -105,6 +121,7 @@ impl LoopController {
             doctor_handle,
             reflection_fix_ctx: None,
             step_injection_ctx: None,
+            stages_checked_nothing: false,
         }
     }
 
@@ -517,6 +534,19 @@ impl LoopController {
 
         info!("Resume point: {}", resume_point.description());
 
+        // A stage before the resume point that checked nothing keeps the
+        // workflow from reporting passed. Read it from the same state row the
+        // resume point came from, and do it before anything is persisted: the
+        // next write overwrites that row. A fresh start re-runs every stage, so
+        // it inherits nothing.
+        self.stages_checked_nothing = !resume_point.is_fresh_start()
+            && resume_manager.prior_stages_checked_nothing(&config.execution_id);
+        if self.stages_checked_nothing {
+            warn!(
+                "Resuming a run in which a stage checked nothing (no required verification step), or whose stage record could not be read: the workflow cannot report passed"
+            );
+        }
+
         // Stage transition tracking for recap timeline
         // Load existing transitions when resuming to preserve prior phase history
         let (transitions, current_stage) = if !matches!(resume_point, ResumePoint::FromStart) {
@@ -787,6 +817,11 @@ impl LoopController {
         // have called success — and `overall_passed` also gates the completion
         // sweep and both error-resolution sweeps below.
         let mut any_stage_passed = prior_stages_passed_for(resume_point);
+        // The first stage of THIS process that checked nothing, with its loop
+        // result: the failure reason and the outcome alert name it. A stage
+        // before a resume is known only by the latch
+        // (`self.stages_checked_nothing`, seeded by `run_inner`).
+        let mut first_checked_nothing: Option<(usize, LoopResult)> = None;
         let mut last_loop_result: Option<LoopResult> = None;
         let mut total_stage_failures: u32 = 0;
         let mut total_iterations_across_stages: u32 = 0;
@@ -1632,6 +1667,14 @@ impl LoopController {
                 if loop_result.verification_passed {
                     any_stage_passed = true;
                 }
+                if loop_result.no_verification_steps {
+                    // Latched for the rest of the run, and stamped on every
+                    // state row from here on, so a resume keeps it.
+                    self.stages_checked_nothing = true;
+                    if first_checked_nothing.is_none() {
+                        first_checked_nothing = Some((stage_num, loop_result.clone()));
+                    }
+                }
 
                 // Check if completion has critical artifact steps that must always run
                 let has_artifact_save = stage
@@ -1701,24 +1744,22 @@ impl LoopController {
                 }
 
                 if !loop_result.verification_passed && config.stop_on_failure {
-                    warn!(
-                        "Stage {} verification failed and stop_on_failure=true",
-                        stage_num
-                    );
+                    // Name the cause from `summary()`, not "verification failed":
+                    // a stage that checked nothing did not fail a check, and the
+                    // other non-pass exits say which bound or verdict ended them.
+                    let stage_cause = format!("Stage {}: {}", stage_num, loop_result.summary());
+                    warn!("{} (stop_on_failure=true)", stage_cause);
                     self.persist_workflow_state(
                         &config.execution_id,
                         &UnifiedWorkflowState::failed_in_phase(
-                            format!("Stage {} verification failed", stage_num),
+                            stage_cause.clone(),
                             "verification",
                             Some(loop_result.iterations_run),
                         ),
                     );
                     self.mark_task_failed(
                         &config.execution_id,
-                        &format!(
-                            "Stage {} verification failed after {} iterations",
-                            stage_num, loop_result.iterations_run
-                        ),
+                        &stage_cause,
                         Some(&config.workflow_id),
                     )
                     .await;
@@ -1767,7 +1808,7 @@ impl LoopController {
         }
 
         // ─── Workflow-level Completion ───
-        let overall_passed = any_stage_passed;
+        let overall_passed = workflow_passed(any_stage_passed, self.stages_checked_nothing);
         let total_iterations = last_loop_result
             .as_ref()
             .map(|r| r.iterations_run)
@@ -1939,7 +1980,15 @@ impl LoopController {
 
             info!("=== WORKFLOW COMPLETED SUCCESSFULLY ===");
         } else {
-            let fail_reason = if let Some(ref lr) = last_loop_result {
+            let fail_reason = if self.stages_checked_nothing {
+                // A stage that checked nothing keeps the workflow from
+                // reporting passed whatever the other stages did, so it is the
+                // cause to name, even when a later stage passed.
+                match &first_checked_nothing {
+                    Some((stage, lr)) => format!("Stage {}: {}", stage, lr.summary()),
+                    None => "A stage before this resume checked nothing (no required verification step ran), or its record could not be read, so the workflow is not verified".to_string(),
+                }
+            } else if let Some(ref lr) = last_loop_result {
                 if lr.max_iterations_reached {
                     format!(
                         "Verification failed after {} iterations (max_iterations={} exhausted)",
@@ -2007,8 +2056,23 @@ impl LoopController {
             )
             .await;
 
-            // Emit canvas outcome panel for failed completion
-            if let Some(ref lr) = last_loop_result {
+            // Emit canvas outcome panel for failed completion. When a stage
+            // checked nothing, the alert comes from THAT stage's result: the
+            // last stage may well have passed, and its verdict is not the
+            // workflow's.
+            let alert_result = first_checked_nothing
+                .as_ref()
+                .map(|(_, lr)| lr)
+                .or(last_loop_result.as_ref());
+            if self.stages_checked_nothing && first_checked_nothing.is_none() {
+                // Latched before this resume: no result of that stage is held
+                // in this process, so the alert carries the reason.
+                self.canvas_manager
+                    .lock()
+                    .await
+                    .on_workflow_failed(&fail_reason)
+                    .await;
+            } else if let Some(lr) = alert_result {
                 let cm = &self.canvas_manager;
                 let sessions = cm.lock().await.get_sessions_count().await;
                 cm.lock()
@@ -3081,26 +3145,40 @@ impl LoopController {
                 )
                 .await;
 
-            let group_passed = targeted_result.all_passed;
-            if group_passed {
+            // A targeted run that selected no required step checked nothing:
+            // no credit as fixed, whatever its `all_passed` says.
+            let group_passed =
+                super::loop_handlers_decisions::targeted_group_fixed(&targeted_result);
+            let group_checked_nothing =
+                super::loop_handlers_decisions::required_step_count(&targeted_result.step_results)
+                    == 0;
+            let group_verdict = if group_passed {
                 info!(
                     "MULTI-AGENT: Group '{}' — targeted verification PASSED",
                     group.id
                 );
                 fixed_groups.push(group.id.clone());
+                "PASSED"
+            } else if group_checked_nothing {
+                info!(
+                    "MULTI-AGENT: Group '{}' — targeted verification CHECKED NOTHING (no required step selected), not credited as fixed",
+                    group.id
+                );
+                "NOT CHECKED"
             } else {
                 info!(
                     "MULTI-AGENT: Group '{}' — targeted verification FAILED ({}/{} passed)",
                     group.id, targeted_result.passed_steps, targeted_result.total_steps
                 );
-            }
+                "FAILED"
+            };
 
             all_outputs.push(format!(
                 "## Fix Agent: {} ({})\nSuccess: {}\nVerification: {}\n\n{}",
                 group.id,
                 group.failure_type,
                 success,
-                if group_passed { "PASSED" } else { "FAILED" },
+                group_verdict,
                 truncate_str(&output, 2000),
             ));
         }
@@ -3513,6 +3591,19 @@ enum StageEntry {
     At(usize),
     /// The stage loop already finished; go straight to workflow-level completion.
     AllComplete,
+}
+
+/// The workflow's verdict over its stages.
+///
+/// Stage outcomes fold failed > unknown > passed for the absence class. A
+/// stage that ended `NoVerificationSteps` checked nothing, and it keeps the
+/// workflow from reporting passed whatever the other stages did, a passing
+/// stage included. A failed stage beside a passing one is still hidden by the
+/// any-fold. That half is outside the absence class and is left alone (plan
+/// 2026-11-06-a-product-workflow-verification-with-nothing-to-check-never-reports-passed,
+/// Phase 1).
+fn workflow_passed(any_stage_passed: bool, any_stage_checked_nothing: bool) -> bool {
+    any_stage_passed && !any_stage_checked_nothing
 }
 
 /// The accumulated `any_stage_passed` of the stages this resume point skips.
@@ -3955,5 +4046,26 @@ mod resume_derivation_tests {
             ),
             (0, false)
         );
+    }
+}
+
+#[cfg(test)]
+mod workflow_verdict_tests {
+    use super::workflow_passed;
+
+    /// A stage that checked nothing keeps the workflow from reporting passed,
+    /// even beside a stage that passed: stage outcomes fold unknown > passed.
+    #[test]
+    fn a_stage_that_checked_nothing_keeps_the_workflow_from_passing() {
+        assert!(!workflow_passed(true, true));
+        assert!(!workflow_passed(false, true));
+    }
+
+    /// Without such a stage the verdict is the any-fold, unchanged: one passing
+    /// stage passes the workflow, and no passing stage does not.
+    #[test]
+    fn without_a_stage_that_checked_nothing_the_any_fold_stands() {
+        assert!(workflow_passed(true, false));
+        assert!(!workflow_passed(false, false));
     }
 }

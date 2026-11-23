@@ -20,6 +20,9 @@ import { beforeAll, describe, expect, it, vi } from "vitest";
 import { getAll, getById } from "./registry";
 import type { CommandAction, CommandResult } from "./types";
 
+/** Every `zoneLayout.setLayoutId` call, arguments and all. */
+const layoutRequests = vi.hoisted(() => [] as unknown[][]);
+
 vi.mock("@tauri-apps/api/core", () => ({ invoke: async () => ({}) }));
 vi.mock("@/lib/instance-storage", () => ({
   instanceStorage: {
@@ -62,7 +65,9 @@ vi.mock("../contexts", () => ({
       focusNextNeedsInput: () => true,
       setFocusedZone: () => {},
       toggleMaximize: () => {},
-      setLayoutId: () => {},
+      setLayoutId: (...args: unknown[]) => {
+        layoutRequests.push(args);
+      },
       assignTabToZone: () => {},
       workMode: "grid",
       enterTmuxMode: () => {},
@@ -284,5 +289,32 @@ describe("registered actions — /auto-approve names its missing argument", () =
     expect(err(await run("terminal.auto-approve", { action: "add", pattern: "" }))).toBe(
       "invalid-args: pattern required for add",
     );
+  });
+});
+
+describe("registered actions — /layout is an operator's choice", () => {
+  /**
+   * The request's `source` decides the layout's origin (`zoneAutoTrim.ts`):
+   * an `operator` layout is never auto-trimmed when tabs close. `/layout` and
+   * the UI Bridge `select-layout` both go through this handler, so a source
+   * other than `operator` here would let the runner shrink a grid the
+   * operator just picked.
+   */
+  it("passes source operator", async () => {
+    layoutRequests.length = 0;
+    expect((await run("terminal.layout", { preset: "split" })).ok).toBe(true);
+    expect(layoutRequests).toStrictEqual([["split", { source: "operator" }]]);
+  });
+
+  /**
+   * The one exception, and only on request: the UI Bridge `select-layout`
+   * forwards `origin: "auto"` here, and it must reach the hook as
+   * `source: "auto"` or the page `/triage-sessions` just trimmed and handed to
+   * the runner is recorded as the operator's and never trims again.
+   */
+  it("passes source auto when the caller sends origin auto", async () => {
+    layoutRequests.length = 0;
+    expect((await run("terminal.layout", { preset: "split", origin: "auto" })).ok).toBe(true);
+    expect(layoutRequests).toStrictEqual([["split", { source: "auto" }]]);
   });
 });

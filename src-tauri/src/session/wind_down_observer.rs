@@ -65,6 +65,43 @@ use qontinui_runner_lib::wind_down::{
     Sideband, SidebandState, WindDownView, WorkStatus,
 };
 
+/// The cause recorded when the terminal-session plane cannot be counted
+/// because `tracking_health::compute` saw an UNKNOWN process table. Shared
+/// with the restart-readiness tests so the two cannot drift.
+pub(crate) const TERMINAL_PLANE_TABLE_UNKNOWN: &str = "the terminal-session plane could not be determined: the process table is unreadable (the fresh process-table read failed or served only the stale last-good table, ProcessSnapshot::is_unknown), so live `claude` processes cannot be enumerated";
+
+/// The census's undecided population, logged by its one reader: every
+/// `/restart-readiness` request and every wind-down pass come through
+/// [`fresh_pass`], so this is the only place it is observed, and one line
+/// names both consequences (see [`undecided_unknown`]).
+static CENSUS_UNDECIDED_LOG: crate::session::tracking_health::UndecidedLog =
+    crate::session::tracking_health::UndecidedLog::new(
+        "live-claude census",
+        "a restart is refused (safe_to_restart: false) AND the wind-down executor closes \
+         nothing (neither its drain arm nor finished_close) while it lasts",
+    );
+
+/// The `unknowns` entry for a pass whose census holds processes Claude Code's
+/// session registry could not settle
+/// ([`crate::session::tracking_health::TrackingHealthReport::undecided`]): a
+/// possible npm-installed `claude` is never read as absent, so the pass is not
+/// safe to act on. `None` when every process was decided.
+pub(crate) fn undecided_unknown(
+    report: &crate::session::tracking_health::TrackingHealthReport,
+) -> Option<String> {
+    let n = report.undecided.len();
+    (n > 0).then(|| {
+        let pids: Vec<String> = report.undecided.iter().map(|u| u.pid.to_string()).collect();
+        format!(
+            "{n} process{} (pid {}) may be a live npm-installed `claude` that Claude Code's \
+             session registry could not settle ({}), so the live-`claude` census is UNDECIDED",
+            if n == 1 { "" } else { "es" },
+            pids.join(", "),
+            report.undecided[0].reason,
+        )
+    })
+}
+
 /// What one [`observe_and_apply`] pass looked at, kept so a caller that ACTS on
 /// a verdict (the Phase 4 wind-down executor) can log the inputs the verdict
 /// was reached on, and resolve a process's pane and kind. Readiness ignores it.
@@ -179,7 +216,10 @@ pub fn observe_and_apply(
 /// census" the plan forbids).
 pub struct FreshPass {
     /// `None` when the terminal plane could not be determined at all; the
-    /// reason is then in `unknowns`.
+    /// reason is then in `unknowns`. A pass that IS here can still be
+    /// incomplete — a census with undecided processes ([`undecided_unknown`]) —
+    /// and then `unknowns` names why: a caller that ACTS on the pass must act
+    /// on nothing while `unknowns` is non-empty.
     pub pass: Option<TrackingHealthPass>,
     pub status_fetch: StatusFetch,
     pub observed: ObservedInputs,
@@ -258,12 +298,16 @@ pub async fn fresh_pass(app: &tauri::AppHandle, grace: Duration) -> FreshPass {
         )
         .await
         {
-            Some(pass) => Some(pass),
+            Some(pass) => {
+                // UNDECIDED reads as not-safe: the pass is kept (its counts
+                // are reported), but it is incomplete, and a caller that acts
+                // on a pass acts on none with an `unknowns` entry.
+                let _ = CENSUS_UNDECIDED_LOG.observe(&pass.report.undecided);
+                unknowns.extend(undecided_unknown(&pass.report));
+                Some(pass)
+            }
             None => {
-                unknowns.push(
-                    "the terminal-session plane could not be determined: the process table is unreadable (snapshot_process_table_public returned an empty parent_map), so live `claude` processes cannot be enumerated"
-                        .to_string(),
-                );
+                unknowns.push(TERMINAL_PLANE_TABLE_UNKNOWN.to_string());
                 None
             }
         }
@@ -317,7 +361,8 @@ pub async fn recheck(
     terminal_id: &str,
 ) -> Option<WindDownView> {
     let fresh = fresh_pass(app, grace).await;
-    if !fresh.observed.looping_registry_resolved {
+    // An incomplete pass (see [`FreshPass::pass`]) re-derives no verdict.
+    if !fresh.observed.looping_registry_resolved || !fresh.unknowns.is_empty() {
         return None;
     }
     // The pane must still host this session: a terminal id that has been
@@ -437,6 +482,8 @@ pub fn wind_down_for_process(
         .copied()
         .unwrap_or(TerminalObservation::UNOBSERVABLE);
     let work_status = work_status_for(process);
+    // coord's finish stamp — carried on the view so the close guard's revival
+    // arm judges against the stamp of the SAME fresh pass as its eligibility.
     let finished_at_ms = match work_status {
         WorkStatus::Finished => process
             .session_id
@@ -459,10 +506,9 @@ pub fn wind_down_for_process(
         finished_at_ms,
         grace,
     };
-    Some(WindDownView::from_verdict(
-        &wind_down::eligibility(&inputs, now_ms),
-        kind,
-    ))
+    let mut view = WindDownView::from_verdict(&wind_down::eligibility(&inputs, now_ms), kind);
+    view.finished_at_ms = finished_at_ms;
+    Some(view)
 }
 
 /// Attach [`wind_down_for_process`] to every process in `processes`.
@@ -541,12 +587,201 @@ pub const CUSTODY_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// once per arm pass and shared by every candidate in it.
 pub type OwnershipRead = Result<CoordOwnership, String>;
 
-/// Read coord's attributed-worktree index for every live session —
-/// `custody::coord::fetch_live_ownership`, which is complete or `Err`, never
-/// a silently short page (its docs say why the plain survey read is not) —
-/// with the liveness of `claude_session_ids`' coord rows read after it.
+/// Read coord's attributed-worktree index for exactly `claude_session_ids` —
+/// `custody::coord::fetch_live_ownership`, coord's keyed read (one snapshot
+/// per chunk), which is `Err` only when it could not be read at all and
+/// otherwise records every id it did not answer (including every id of a
+/// chunk that failed) as UNKNOWN.
 pub async fn fetch_ownership(claude_session_ids: &[String]) -> OwnershipRead {
     custody::coord::fetch_live_ownership(claude_session_ids).await
+}
+
+/// Per-request deadline for coord's obligations read. Coord bounds its own
+/// inline verdicts at 25 s (`VERDICT_DEADLINE` in `overlord_proof.rs`) and
+/// serves the answer after that with the stragglers marked `unknown`, so the
+/// client waits past it; shorter would turn a slow-but-answering coord into a
+/// transport failure and lose the typed `unknown` items it would have served.
+pub const OBLIGATIONS_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// `{base}/coord/overlord/session-obligations/{id}` — the HTTP twin of the
+/// `coord_session_obligations` MCP tool (qontinui-coord#2913), each over one
+/// shared core in coord, so this is the same derivation `/next-move` and
+/// `session-closeable.sh` read.
+pub fn obligations_url(base: &str, claude_session_id: &str) -> String {
+    format!(
+        "{}/coord/overlord/session-obligations/{}",
+        base.trim_end_matches('/'),
+        urlencoding::encode(claude_session_id.trim())
+    )
+}
+
+/// GET `req` with `timeout` and decode a 2xx body as JSON. Every failure is
+/// `Err` with its cause chain — the caller feeds it to
+/// [`wind_down::obligations_gate`], where `Err` is UNKNOWN and never "nothing
+/// owed". Split from [`fetch_obligations`] so a test can drive it over a
+/// loopback socket without a device bearer.
+pub async fn read_obligations(
+    req: reqwest::RequestBuilder,
+    url: &str,
+    timeout: Duration,
+) -> Result<serde_json::Value, String> {
+    let what = |e: &(dyn std::error::Error + 'static)| {
+        format!("{url}: {}", crate::util::error_chain::error_chain(e))
+    };
+    let resp = req
+        .timeout(timeout)
+        .send()
+        .await
+        .map_err(|e| format!("GET {}", what(&e)))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        let excerpt: String = body.chars().take(200).collect();
+        return Err(format!("coord returned {status} for GET {url}: {excerpt}"));
+    }
+    resp.json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("decode GET {}", what(&e)))
+}
+
+/// Read coord's obligations for one session — the REMOTE half of `closeable`
+/// (plan `2026-10-18-a-finished-session-is-safe-to-close-when-nothing-lives-only-in-it-and-coord-owns-whether-its-watchers-work`,
+/// Phase 6). `Err` when no coord base is configured, the shared client could
+/// not be built, or the read failed in any way; the gate reads every `Err` as
+/// UNKNOWN. Like [`fetch_ownership`] it presents the device's default
+/// credential, and relies on the answer's `session_proven_in_tenant` to refuse
+/// a session that credential cannot place.
+pub async fn fetch_obligations(claude_session_id: &str) -> Result<serde_json::Value, String> {
+    let Some(base) = qontinui_runner_lib::profiles::connected_coord_base() else {
+        return Err(
+            "no coord base is configured, so the session's obligations cannot be read".to_string(),
+        );
+    };
+    let Some(client) = crate::coord_http::coord_client() else {
+        return Err(
+            "the shared coord HTTP client could not be built, so the session's obligations \
+             cannot be read"
+                .to_string(),
+        );
+    };
+    let url = obligations_url(&base, claude_session_id);
+    read_obligations(
+        crate::coord_http::coord_get(client, &url),
+        &url,
+        OBLIGATIONS_REQUEST_TIMEOUT,
+    )
+    .await
+}
+
+/// The first worktree in coord's obligations answer (`worktrees.items[]`)
+/// that the custody gate did NOT cover — the rule that keeps the remote half
+/// of `closeable` from vouching for a tree the local half never looked at
+/// (#2981 review concern 3, coord finding `9f265810`).
+///
+/// coord's obligations read and the custody gate's keyed ownership read both
+/// derive from `coord.agent_worktrees`, but through different keys and at
+/// different moments, so they can disagree: a row allocated between the two
+/// reads, or one keyed to the session one way and not the other. Each item's
+/// `worktree_path` must match a path in `covered` (the gather's
+/// [`wind_down::CustodyInputs::covered`]) by [`custody::worktree_path_matches`]
+/// — exact after normalization, or the covered absolute path ending in coord's
+/// relative ledger path. An item with no `worktree_path` cannot be matched and
+/// is returned as `<absent>`. A body with no `worktrees` block, or one whose
+/// `items` is not a list, returns `None`: the obligations gate judges that
+/// block's coverage itself.
+///
+/// `Some` makes a `watched` obligations verdict UNKNOWN
+/// (`ObligationsUnknown::WorktreeNotProbed`), never the reverse: it only ever
+/// withholds a close.
+pub fn first_uncovered_coord_worktree(
+    doc: &serde_json::Value,
+    covered: &[String],
+) -> Option<String> {
+    let items = doc.get("worktrees")?.get("items")?.as_array()?;
+    items.iter().find_map(|item| {
+        match item
+            .get("worktree_path")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some(path) if !path.trim().is_empty() => (!covered
+                .iter()
+                .any(|c| custody::worktree_path_matches(c, path)))
+            .then(|| path.to_string()),
+            _ => Some("<absent>".to_string()),
+        }
+    })
+}
+
+/// Per-request deadline for coord's pending-message read (the close guard's
+/// "no undelivered message" input) — the delivery poller's own bound.
+pub const PENDING_MESSAGES_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// coord's undelivered, unacked, unexpired messages for this device — `GET
+/// /coord/session-messages/pending`, the door the delivery poller pulls — as
+/// `(message_id, to_session)` pairs. `?live=` names the session when its id is
+/// a UUID, which ranks its oldest row onto the page (coord's round-robin puts
+/// a `live` recipient's first row ahead of every other recipient's). `Err`
+/// when there is no coord base, no shared client, no device credential (coord
+/// refuses an anonymous read), the read fails, or the body is not the shape
+/// coord serves: the close guard reads every `Err` as UNKNOWN.
+pub async fn fetch_pending_messages(
+    claude_session_id: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let Some(base) = qontinui_runner_lib::profiles::connected_coord_base() else {
+        return Err("no coord base is configured, so pending messages cannot be read".to_string());
+    };
+    let Some(client) = crate::coord_http::coord_client() else {
+        return Err("the shared coord HTTP client could not be built".to_string());
+    };
+    if !crate::coord_http::have_device_token() {
+        return Err(
+            "no device credential: coord's pending-message read refuses an anonymous caller"
+                .to_string(),
+        );
+    }
+    let mut url = format!(
+        "{}/coord/session-messages/pending",
+        base.trim_end_matches('/')
+    );
+    if let Ok(uuid) = claude_session_id.trim().parse::<uuid::Uuid>() {
+        url.push_str(&format!("?live={uuid}"));
+    }
+    let body = read_obligations(
+        crate::coord_http::coord_get(client, &url),
+        &url,
+        PENDING_MESSAGES_TIMEOUT,
+    )
+    .await?;
+    pending_message_rows(&body)
+}
+
+/// The `(message_id, to_session)` rows of a pending-message body. A body with
+/// no `messages` list, or a row missing either id, is `Err`: a row that cannot
+/// be attributed must not vanish. The error names such a row by its
+/// `message_id` alone and never quotes it: a row carries the message body, and
+/// this text reaches the close-guard log line and `/restart-readiness`.
+pub fn pending_message_rows(body: &serde_json::Value) -> Result<Vec<(String, String)>, String> {
+    let rows = body
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "the pending-message body carries no `messages` list".to_string())?;
+    rows.iter()
+        .map(|row| {
+            let field = |key: &str| {
+                row.get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        let id = row
+                            .get("message_id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("<no message_id>");
+                        format!("pending message {id} has no `{key}`")
+                    })
+            };
+            Ok((field("message_id")?, field("to_session")?))
+        })
+        .collect()
 }
 
 /// What the runner knows about one candidate before any probe runs.
@@ -555,9 +790,6 @@ pub struct SessionCustodyContext {
     /// The lifecycle record's `working_dir`, else the process cwd (which is
     /// `None` on Windows — `tracking_health` reads it from `/proc`).
     pub session_dir: Option<PathBuf>,
-    /// The `coord.sessions.id` the pane registered under — the key
-    /// `/coord/sessions/worktrees` lists allocations by.
-    pub coord_session_id: Option<String>,
     /// The parked isolated-edit context's materialized worktrees; `Err` when
     /// the context's slot could not be read (a poisoned lock), which must not
     /// read as "no isolated worktrees".
@@ -591,10 +823,6 @@ pub fn custody_context(
         .and_then(|m| m.get(terminal_id));
     SessionCustodyContext {
         session_dir,
-        coord_session_id: pane
-            .as_ref()
-            .and_then(|s| s.coord_session_id())
-            .map(|id| id.to_string()),
         // A pane that is gone parks no context at all.
         isolated_worktrees: pane.map_or(Ok(Vec::new()), |s| s.isolated_edit_worktree_paths()),
     }
@@ -628,50 +856,34 @@ pub struct AttributedWorktree {
 /// PURE: the worktrees coord attributes to the session, as absolute paths.
 ///
 /// `Err` — which the gate reads as `Unknown` — when the index could not be
-/// read, when no coord session is known for the Claude session (neither the
-/// work-status reads nor the pane name one — its allocations cannot be looked
-/// up at all), when that session is not POSITIVELY known live (a
-/// session coord closed, or one that moved between states while the pages
-/// were read, is on no live page although its rows may exist — so its absence
-/// is not "no worktrees"; see `custody::coord::fetch_live_ownership`), or
-/// when a ledger path is relative
-/// and no workspace root resolves to anchor it.
+/// read, when coord's keyed read did not answer `claude_session_id` (it was
+/// `unknown`, `invalid`, cut by `inputTruncated`, or had no entry of its
+/// own), or when a ledger path is relative and no workspace root resolves to
+/// anchor it.
 ///
-/// The coord session is the one coord's own work-status reads agreed answers
-/// for `claude_session_id` — the row the route attributes that Claude
-/// session's ledger rows to. The pane's own coord id is only a fallback: a
-/// plain terminal the runner never bound carries none, yet coord can still
-/// hold a row (and worktrees) for its Claude session.
+/// The Claude session resolves ONLY through its own keyed entry
+/// (`claudeCodeSessionId → sessionId`). There is deliberately no fallback to
+/// the pane's own coord id: a pane id that differs from the row coord files
+/// the Claude session's worktrees under would look up a row holding none of
+/// them and read `[]` — a false Clean.
 pub fn attributed_worktrees(
     ownership: &OwnershipRead,
     claude_session_id: &str,
-    pane_coord_session_id: Option<&str>,
     workspace_root: Option<&Path>,
 ) -> Result<Vec<AttributedWorktree>, String> {
     let index = ownership.as_ref().map_err(String::clone)?;
-    // The agreed row owns the Claude session's ledger rows; but when it is
-    // not known live and the pane's own row is, the pane's row is the one a
-    // live page listed them under, so prefer it rather than read Unknown.
-    let agreed = index.coord_session_for_claude(claude_session_id);
-    let resolved = match (agreed, pane_coord_session_id) {
-        (Some(agreed), Some(pane)) if !index.is_known_live(agreed) && index.is_known_live(pane) => {
-            Some(pane)
-        }
-        (agreed, pane) => agreed.or(pane),
-    };
-    let Some(session_id) = resolved else {
-        return Err(
-            "no coord session is known for this Claude session (coord's work-status reads did not \
-             agree on one and the pane carries none), so its worktree allocations cannot be looked up"
-                .to_string(),
-        );
-    };
-    if !index.is_known_live(session_id) {
+    if let Some(why) = index.unanswered_reason(claude_session_id) {
         return Err(format!(
-            "coord session {session_id} not on any live page (closed or unknown), so the \
-             worktrees allocated to it cannot be read"
+            "coord's keyed worktree read did not answer Claude session {claude_session_id} \
+             ({why}), so its worktree allocations cannot be read"
         ));
     }
+    let Some(session_id) = index.coord_session_for_claude(claude_session_id) else {
+        return Err(format!(
+            "coord's keyed worktree read carries no entry for Claude session \
+             {claude_session_id}, so its worktree allocations cannot be read"
+        ));
+    };
     index
         .worktrees_for_session(session_id)
         .into_iter()
@@ -751,10 +963,20 @@ pub async fn gather_custody<P: CustodyProbe + ?Sized>(
             session_dir,
             ownership,
             members: Vec::new(),
+            covered: Vec::new(),
         };
     };
 
     let mut members: Vec<CustodyMember> = Vec::new();
+    // Every path this gather looked at — what the obligations cross-check
+    // holds coord's `worktrees` block against. An attributed path is covered
+    // whatever its probe found (a failed probe is already this gate's own
+    // Unknown, and a reaped one was positively seen gone).
+    let mut covered: Vec<String> = attributed
+        .iter()
+        .map(|w| w.path.display().to_string())
+        .chain(isolated.iter().map(|p| p.display().to_string()))
+        .collect();
     let mut named: Vec<(&Path, bool)> = vec![(dir.as_path(), true)];
     for worktree in &attributed {
         if worktree.retired {
@@ -802,6 +1024,7 @@ pub async fn gather_custody<P: CustodyProbe + ?Sized>(
             }),
         }
     }
+    covered.extend(roots.iter().map(|r| r.display().to_string()));
     for root in roots {
         let state = probe.member_state(&root).await;
         let slot_wip_state = probe.slot_wip_state(&root, claude_session_id).await;
@@ -815,6 +1038,7 @@ pub async fn gather_custody<P: CustodyProbe + ?Sized>(
         session_dir,
         ownership,
         members,
+        covered,
     }
 }
 
@@ -1050,6 +1274,7 @@ mod tests {
             session_status_since: None,
             blocks_restart: status != Some("finished"),
             wind_down: None,
+            stray_wait_shells: 0,
         }
     }
 
@@ -1228,7 +1453,6 @@ mod tests {
     fn context(dir: Option<&str>, isolated: &[&str]) -> SessionCustodyContext {
         SessionCustodyContext {
             session_dir: dir.map(PathBuf::from),
-            coord_session_id: Some("c-1".to_string()),
             isolated_worktrees: Ok(isolated.iter().map(PathBuf::from).collect()),
         }
     }
@@ -1452,25 +1676,43 @@ mod tests {
         assert_eq!(session_dir_from(None, None), None);
     }
 
-    /// An index read from `json`, with `live` marked positively live.
-    fn ownership(json: &str, live: &[&str]) -> OwnershipRead {
-        let mut index = CoordOwnership::from_response(serde_json::from_str(json).unwrap());
-        index.mark_live(live.iter().copied());
-        Ok(index)
+    /// coord's keyed answer for `asked`: `sessions` is the raw `sessions[]`
+    /// JSON array, every asked id is echoed, and `unknown` lists the ids coord
+    /// resolved to no session row.
+    fn keyed_ownership(asked: &[&str], sessions: &str, unknown: &[&str]) -> OwnershipRead {
+        let echo: Vec<String> = asked.iter().map(|s| format!("\"{s}\"")).collect();
+        let unknown: Vec<String> = unknown
+            .iter()
+            .map(|s| format!(r#"{{"claudeCodeSessionId":"{s}","worktrees":[]}}"#))
+            .collect();
+        let json = format!(
+            r#"{{"sessionBridgeColumnPresent":true,"inputTruncated":false,"invalid":[],
+                "claudeCodeSessionIds":[{}],"unknown":[{}],"sessions":{sessions}}}"#,
+            echo.join(","),
+            unknown.join(",")
+        );
+        custody::coord::ownership_from_keyed(vec![(
+            asked.iter().map(|s| s.to_string()).collect(),
+            Ok(serde_json::from_str(&json).unwrap()),
+        )])
     }
 
     #[test]
     fn attributed_worktrees_are_anchored_on_the_workspace_root() {
-        let own = ownership(
-            r#"{"sessions":[{"sessionId":"c-1","ownerSessionState":"active","worktrees":[
+        let own = keyed_ownership(
+            &["claude-x", "claude-empty"],
+            r#"[{"sessionId":"c-1","claudeCodeSessionId":"claude-x","ownerSessionState":"active",
+                "worktrees":[
                 {"worktreePath":"agent-worktrees/a/repo","repo":"repo","ledgerStatus":"active"},
                 {"worktreePath":"/abs/wt","repo":"repo2","ledgerStatus":"merged"},
                 {"worktreePath":"/abs/old","repo":"repo3","ledgerStatus":"abandoned"},
-                {"worktreePath":"/abs/new","repo":"repo4"}]}]}"#,
-            &["c-1", "c-other"],
+                {"worktreePath":"/abs/new","repo":"repo4"}]},
+               {"sessionId":"c-other","claudeCodeSessionId":"claude-empty",
+                "ownerSessionState":"closed","worktrees":[]}]"#,
+            &[],
         );
         assert_eq!(
-            attributed_worktrees(&own, "claude-x", Some("c-1"), Some(Path::new("/ws"))).unwrap(),
+            attributed_worktrees(&own, "claude-x", Some(Path::new("/ws"))).unwrap(),
             vec![
                 live("/ws/agent-worktrees/a/repo"),
                 AttributedWorktree {
@@ -1485,109 +1727,88 @@ mod tests {
                 live("/abs/new"),
             ]
         );
+        let err = attributed_worktrees(&own, "claude-x", None).unwrap_err();
         assert!(
-            attributed_worktrees(&own, "claude-x", Some("c-1"), None).is_err(),
-            "a relative ledger path with no root to anchor it is not guessed"
+            err.contains("is relative") && err.contains("workspace root"),
+            "a relative ledger path with no root to anchor it is not guessed: {err}"
         );
         assert_eq!(
-            attributed_worktrees(&own, "claude-x", Some("c-other"), None).unwrap(),
+            attributed_worktrees(&own, "CLAUDE-X", Some(Path::new("/ws")))
+                .unwrap()
+                .len(),
+            4,
+            "the Claude session id matches case-insensitively"
+        );
+        assert_eq!(
+            attributed_worktrees(&own, "claude-empty", None).unwrap(),
             Vec::<AttributedWorktree>::new(),
-            "a session positively known live that holds no rows has nothing attributed"
+            "an entry of its own with `worktrees: []` is positively empty, whatever its state"
         );
     }
 
-    /// Round-2 CRITICAL 1: a pane whose coord session is on NO validated live
-    /// page and not otherwise known live — coord auto-closed it — is Unknown,
-    /// never "nothing attributed". Its rows (a dirty sibling, say) may exist.
+    /// The pane-id fallback is gone: coord's keyed read answers the Claude
+    /// session `unknown` while the pane's own (differing) coord id names a
+    /// row holding nothing. Under the old fallback that read `[]` — a false
+    /// Clean. Now it is Unknown, end to end.
     #[tokio::test]
-    async fn a_coord_session_absent_from_every_live_page_is_unknown() {
-        let own = ownership(
-            r#"{"sessions":[{"sessionId":"c-live","worktrees":[{"worktreePath":"/abs/a"}]}]}"#,
-            &["c-live"],
+    async fn a_differing_pane_coord_id_never_reads_clean() {
+        let own = keyed_ownership(
+            &["claude-x", "claude-y"],
+            r#"[{"sessionId":"c-pane","claudeCodeSessionId":"claude-y","worktrees":[]}]"#,
+            &["claude-x"],
         );
-        let err = attributed_worktrees(
-            &own,
-            "claude-x",
-            Some("c-autoclosed"),
-            Some(Path::new("/ws")),
-        )
-        .unwrap_err();
-        assert!(err.contains("not on any live page"), "{err}");
+        let err = attributed_worktrees(&own, "claude-x", Some(Path::new("/ws"))).unwrap_err();
+        assert!(err.contains("`unknown`"), "{err}");
         let inputs = gather_custody(
             &FakeProbe::default().root("/ws/wt/a", "/ws/wt/a"),
             &context(Some("/ws/wt/a"), &[]),
-            attributed_worktrees(
-                &own,
-                "claude-x",
-                Some("c-autoclosed"),
-                Some(Path::new("/ws")),
-            ),
+            attributed_worktrees(&own, "claude-x", Some(Path::new("/ws"))),
             "s",
         )
         .await;
         assert_eq!(custody_gate(&inputs).reason(), Some("ownership_unreadable"));
     }
 
-    /// Phase 2 (temp runner, 2026-10-04): a plain runner terminal running
-    /// `claude` carries no coord id on its pane, yet coord holds a row for its
-    /// Claude session. The work-status reads' agreed row is the lookup key, and
-    /// it wins over a pane id that names a different (older) row.
-    #[test]
-    fn the_coord_row_work_status_agreed_on_is_used_when_the_pane_has_none() {
-        let mut index = CoordOwnership::from_response(
-            serde_json::from_str(
-                r#"{"sessions":[{"sessionId":"c-row","worktrees":[{"worktreePath":"/abs/sib"}]}]}"#,
-            )
-            .unwrap(),
+    /// The positive mirror: the Claude session's OWN entry (`c-real`, holding
+    /// a dirty worktree) answers it, never another entry that holds nothing
+    /// (`c-pane`, the id a pane might carry). Custody reads the dirt.
+    #[tokio::test]
+    async fn a_session_resolves_through_its_own_entry_not_an_empty_one() {
+        let own = keyed_ownership(
+            &["claude-x", "claude-y"],
+            r#"[{"sessionId":"c-real","claudeCodeSessionId":"claude-x",
+                 "worktrees":[{"worktreePath":"/ws/wt/dirty","repo":"r"}]},
+                {"sessionId":"c-pane","claudeCodeSessionId":"claude-y","worktrees":[]}]"#,
+            &[],
         );
-        index.mark_live(["c-row"]);
-        index.record_coord_rows([("CLAUDE-X".to_string(), "c-row".to_string())]);
-        let own: OwnershipRead = Ok(index);
-        assert_eq!(
-            attributed_worktrees(&own, "claude-x", None, Some(Path::new("/ws"))).unwrap(),
-            vec![live("/abs/sib")],
-            "the pane has no coord id, but coord's agreed row still finds the sibling"
-        );
-        assert_eq!(
-            attributed_worktrees(&own, "claude-x", Some("c-older"), Some(Path::new("/ws")))
-                .unwrap(),
-            vec![live("/abs/sib")],
-            "the agreed row, not the pane's older one, owns the Claude session's rows"
-        );
-        assert!(
-            attributed_worktrees(&own, "claude-other", None, Some(Path::new("/ws"))).is_err(),
-            "no agreed row and no pane id stays Unknown"
-        );
-
-        // The agreed (newest) row is closed while the pane's own row is live
-        // and holds the rows: the pane's row is used.
-        let mut index = CoordOwnership::from_response(
-            serde_json::from_str(
-                r#"{"sessions":[{"sessionId":"c-pane","worktrees":[{"worktreePath":"/abs/p"}]}]}"#,
-            )
-            .unwrap(),
-        );
-        index.mark_live(["c-pane"]);
-        index.record_coord_rows([("claude-y".to_string(), "c-closed".to_string())]);
-        let own: OwnershipRead = Ok(index);
-        assert_eq!(
-            attributed_worktrees(&own, "claude-y", Some("c-pane"), Some(Path::new("/ws"))).unwrap(),
-            vec![live("/abs/p")],
-            "a live pane row wins over a closed agreed row"
-        );
-        assert!(
-            attributed_worktrees(&own, "claude-y", None, Some(Path::new("/ws"))).is_err(),
-            "a closed agreed row with no live pane row stays Unknown"
-        );
+        let attributed = attributed_worktrees(&own, "claude-x", Some(Path::new("/ws")));
+        assert_eq!(attributed, Ok(vec![live("/ws/wt/dirty")]));
+        let probe = FakeProbe::default()
+            .root("/ws/wt/a", "/ws/wt/a")
+            .root("/ws/wt/dirty", "/ws/wt/dirty")
+            .state(
+                "/ws/wt/dirty",
+                MemberState::Probed {
+                    dirty: true,
+                    ahead: 0,
+                },
+            );
+        let inputs = gather_custody(&probe, &context(Some("/ws/wt/a"), &[]), attributed, "s").await;
+        assert_eq!(custody_gate(&inputs).as_str(), "dirty");
     }
 
     #[test]
-    fn attributed_worktrees_fail_closed_without_a_read_or_a_coord_id() {
-        let own = ownership(r#"{"sessions":[]}"#, &["c-1"]);
-        assert!(attributed_worktrees(&own, "claude-x", None, Some(Path::new("/ws"))).is_err());
+    fn attributed_worktrees_fail_closed_without_a_read_or_an_entry() {
+        let own = keyed_ownership(&[], "[]", &[]);
+        let err = attributed_worktrees(&own, "claude-x", Some(Path::new("/ws"))).unwrap_err();
+        assert!(err.contains("no entry"), "{err}");
+        assert!(
+            attributed_worktrees(&Ok(CoordOwnership::default()), "claude-x", None).is_err(),
+            "an index that answered nothing answers nothing"
+        );
         let failed: OwnershipRead = Err("coord returned 503".to_string());
         assert_eq!(
-            attributed_worktrees(&failed, "claude-x", Some("c-1"), Some(Path::new("/ws"))),
+            attributed_worktrees(&failed, "claude-x", Some(Path::new("/ws"))),
             Err("coord returned 503".to_string())
         );
     }
@@ -1792,5 +2013,141 @@ mod tests {
         // And outside any repository there is no root at all.
         let outside = tempfile::tempdir().unwrap();
         assert_eq!(probe.worktree_root(outside.path()).await.unwrap(), None);
+    }
+
+    #[test]
+    fn pending_message_rows_keep_every_row_and_refuse_a_malformed_one() {
+        let body = serde_json::json!({"messages": [
+            {"message_id": "m1", "to_session": "s1", "kind": "ci_rework", "priority": "blocking"},
+            {"message_id": "m2", "to_session": "0192aaaa-0000-7000-8000-000000000001"},
+        ]});
+        assert_eq!(
+            pending_message_rows(&body).unwrap(),
+            vec![
+                ("m1".to_string(), "s1".to_string()),
+                (
+                    "m2".to_string(),
+                    "0192aaaa-0000-7000-8000-000000000001".to_string()
+                ),
+            ]
+        );
+        assert!(pending_message_rows(&serde_json::json!({"messages": []}))
+            .unwrap()
+            .is_empty());
+        assert!(pending_message_rows(&serde_json::json!({"error": "x"})).is_err());
+        assert!(
+            pending_message_rows(&serde_json::json!({"messages": [{"message_id": "m"}]})).is_err(),
+            "a row with no recipient cannot be ruled out as this session's"
+        );
+        // The refusal names the row by id and never quotes it.
+        let err = pending_message_rows(&serde_json::json!({"messages": [
+            {"message_id": "m9", "body": "private words", "to_session": null},
+        ]}))
+        .unwrap_err();
+        assert!(err.contains("m9") && err.contains("to_session"), "{err}");
+        assert!(!err.contains("private words"), "{err}");
+    }
+
+    // ── Obligations read (finished_close, remote half of `closeable`) ────
+
+    #[test]
+    fn the_obligations_url_is_the_http_twin_with_the_id_encoded() {
+        assert_eq!(
+            obligations_url(
+                "https://coord.example/",
+                "0a1b2c3d-0000-4000-8000-000000000001"
+            ),
+            "https://coord.example/coord/overlord/session-obligations/0a1b2c3d-0000-4000-8000-000000000001"
+        );
+        assert_eq!(
+            obligations_url("http://h", " a/b "),
+            "http://h/coord/overlord/session-obligations/a%2Fb"
+        );
+    }
+
+    fn plain_client() -> reqwest::Client {
+        reqwest::Client::builder().no_proxy().build().unwrap()
+    }
+
+    /// Serve one canned HTTP response on a loopback port; return its URL.
+    async fn serve_once(response: String) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://127.0.0.1:{}/coord/overlord/session-obligations/s",
+            listener.local_addr().unwrap().port()
+        );
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock.write_all(response.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        });
+        url
+    }
+
+    fn http_ok(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// The whole remote half over a real socket: the transport and the gate,
+    /// for an answer that is clean, one that is unwatched, and the three ways a
+    /// read fails (timeout, non-2xx, undecodable body) — none of which may
+    /// read as "watched".
+    #[tokio::test]
+    async fn the_read_and_the_gate_together_never_read_a_failed_read_as_watched() {
+        let watched = r#"{"all_tracked_sources_read":true,"session_proven_in_tenant":true,
+            "prs":{"coverage":"read","items":[]},
+            "gates":{"coverage":"read","items":[{"item":{"gate_id":"g"},"verdict":"watched"}]}}"#;
+        let url = serve_once(http_ok(watched)).await;
+        let read = read_obligations(plain_client().get(&url), &url, Duration::from_secs(5)).await;
+        assert_eq!(
+            wind_down::obligations_gate(&read),
+            wind_down::ObligationsVerdict::Watched { judged: 1 }
+        );
+
+        let owed = watched.replace("\"watched\"}]", "\"not_watched\"}]");
+        let url = serve_once(http_ok(&owed)).await;
+        let read = read_obligations(plain_client().get(&url), &url, Duration::from_secs(5)).await;
+        assert_eq!(wind_down::obligations_gate(&read).as_str(), "unwatched");
+
+        let url = serve_once(
+            "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 4\r\nconnection: close\r\n\r\nbusy"
+                .to_string(),
+        )
+        .await;
+        let read = read_obligations(plain_client().get(&url), &url, Duration::from_secs(5)).await;
+        let err = read.as_ref().unwrap_err();
+        assert!(err.contains("503") && err.contains("busy"), "{err}");
+        let verdict = wind_down::obligations_gate(&read);
+        assert_eq!(verdict.reason(), Some("obligations_unreadable"));
+        assert!(!verdict.is_watched());
+
+        let url = serve_once(http_ok("not-json")).await;
+        let read = read_obligations(plain_client().get(&url), &url, Duration::from_secs(5)).await;
+        assert!(
+            read.as_ref().unwrap_err().starts_with("decode GET"),
+            "{read:?}"
+        );
+        assert!(!wind_down::obligations_gate(&read).is_watched());
+
+        // Bound and never answered: the request times out.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://127.0.0.1:{}/x",
+            listener.local_addr().unwrap().port()
+        );
+        let read =
+            read_obligations(plain_client().get(&url), &url, Duration::from_millis(200)).await;
+        let err = read.as_ref().unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+        let verdict = wind_down::obligations_gate(&read);
+        assert_eq!(verdict.as_str(), "unknown");
+        assert!(!verdict.is_watched());
+        drop(listener);
     }
 }

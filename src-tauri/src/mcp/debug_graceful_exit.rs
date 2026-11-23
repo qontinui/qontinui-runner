@@ -91,7 +91,12 @@ pub(crate) async fn graceful_exit_door(
     deadline_s: Option<u64>,
 ) -> Result<Json<ApiResponse<GracefulExitOutcome>>, HandlerError> {
     let outcome = manager
-        .graceful_exit(id, resolve_deadline(deadline_s), None)
+        .graceful_exit(
+            id,
+            resolve_deadline(deadline_s),
+            None,
+            crate::terminal::graceful_exit::ChildExemptions::none(),
+        )
         .await
         .map_err(|e| (StatusCode::NOT_FOUND, Json(api_error(e))))?;
     Ok(Json(ApiResponse::success(outcome)))

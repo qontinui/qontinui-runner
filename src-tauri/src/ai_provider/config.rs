@@ -326,6 +326,37 @@ pub fn mark_account_rate_limited_with_duration(config_dir: &str, cooldown: Durat
     }
 }
 
+/// Cool an account for AT LEAST `cooldown`: when it already carries a longer
+/// remaining cooldown (a weekly reset recorded earlier, say), that one stands.
+/// Returns the cooldown now in force. One lock acquisition, so the comparison
+/// and the write cannot interleave with another marker.
+pub fn mark_account_rate_limited_at_least(config_dir: &str, cooldown: Duration) -> Duration {
+    let Ok(mut cooldowns) = ACCOUNT_COOLDOWNS.lock() else {
+        return cooldown;
+    };
+    let map = cooldowns.get_or_insert_with(HashMap::new);
+    let existing = map
+        .get(config_dir)
+        .map(|(marked_at, d)| d.saturating_sub(marked_at.elapsed()))
+        .unwrap_or(Duration::ZERO);
+    if existing >= cooldown {
+        info!(
+            "Account '{}' already rate-limited for {}s more; keeping that over {}s",
+            short_label(config_dir),
+            existing.as_secs(),
+            cooldown.as_secs()
+        );
+        return existing;
+    }
+    info!(
+        "Marking account '{}' as rate-limited for {}s",
+        short_label(config_dir),
+        cooldown.as_secs()
+    );
+    map.insert(config_dir.to_string(), (Instant::now(), cooldown));
+    cooldown
+}
+
 /// Check if an account is currently in cooldown.
 pub(super) fn is_account_cooled_down(config_dir: &str) -> bool {
     if let Ok(cooldowns) = ACCOUNT_COOLDOWNS.lock() {

@@ -7,6 +7,7 @@ import { FeatureDisclosureProvider } from "./contexts/FeatureDisclosureContext";
 import App from "./App";
 import ErrorBoundary from "./ErrorBoundary";
 import { setScriptEmitter, TauriScriptEmitter } from "./lib/step-output-handlers/script-emitter";
+import { installNativeClipboardShim } from "./lib/clipboard";
 import "./index.css";
 
 // Set development mode for navigation (shows hidden items with badge)
@@ -33,6 +34,8 @@ if (
 ) {
   setScriptEmitter(new TauriScriptEmitter());
 }
+
+installNativeClipboardShim();
 
 // Create a client for react-query
 const queryClient = new QueryClient({

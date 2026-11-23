@@ -546,9 +546,39 @@ pub(crate) fn discover_all_elements_payload() -> serde_json::Value {
             // …and content/text elements, NOT only the interactive ones. The
             // SDK's default here is `true`; leaving it unstated is what made
             // `elementCount` under-report on every page.
-            "interactiveOnly": false
+            "interactiveOnly": false,
+            // …and the image rows, stated rather than left to the SDK's
+            // default: an image covering text is an occlusion. Page-health
+            // takes them back out (`page_health_elements`).
+            "includeMedia": true
         }
     })
+}
+
+/// The rows page-health judges: what `discover` returned under `elements`, less
+/// the `category: "media"` rows. The ratios describe a page's content and
+/// controls, and an image row in them would move every one of those ratios.
+fn page_health_elements(discover_data: &serde_json::Value) -> Vec<serde_json::Value> {
+    discover_data
+        .get("elements")
+        .and_then(|v| v.as_array())
+        .map(|rows| {
+            rows.iter()
+                .filter(|el| el.get("category").and_then(|c| c.as_str()) != Some("media"))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Every row `discover` returned under `elements`, media rows included: the
+/// count page-health REPORTS as `element_count`, so it matches the
+/// `elementCount` `/control/visibility` reports for the same page.
+fn discovered_row_count(discover_data: &serde_json::Value) -> usize {
+    discover_data
+        .get("elements")
+        .and_then(|v| v.as_array())
+        .map_or(0, Vec::len)
 }
 
 /// Optional request body for page-health endpoint.
@@ -582,14 +612,14 @@ pub async fn ui_bridge_page_health_handler(
             }
         };
 
-    // Elements live under "elements" key returned by discover.
-    let elements = discover_data
-        .get("elements")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
+    let elements = page_health_elements(&discover_data);
 
-    let element_count = elements.len();
+    // `element_count` (reported) counts every row discover returned, the same
+    // set `/control/visibility` counts as `elementCount`, so the two routes
+    // still agree. The checks below judge only `judged_count` rows, and
+    // `media_rows_excluded` states the difference rather than hiding it.
+    let element_count = discovered_row_count(&discover_data);
+    let judged_count = elements.len();
 
     // Visible elements: state.visible == true and state.normalizedRect present.
     let visible: Vec<&serde_json::Value> = elements
@@ -736,7 +766,7 @@ pub async fn ui_bridge_page_health_handler(
         *type_counts.entry(t.to_string()).or_insert(0) += 1;
     }
 
-    let all_nav = element_count > 5 && type_counts.keys().all(|k| nav_types.contains(&k.as_str()));
+    let all_nav = judged_count > 5 && type_counts.keys().all(|k| nav_types.contains(&k.as_str()));
 
     let diversity_severity = if all_nav { "WARNING" } else { "OK" };
 
@@ -746,7 +776,7 @@ pub async fn ui_bridge_page_health_handler(
         "detail": format!(
             "{} type(s) across {} elements{}",
             type_counts.len(),
-            element_count,
+            judged_count,
             if all_nav { " (navigation-only)" } else { "" }
         ),
         "data": {
@@ -979,6 +1009,7 @@ pub async fn ui_bridge_page_health_handler(
         "findings": findings,
         "heatmap": heatmap,
         "element_count": element_count,
+        "media_rows_excluded": element_count.saturating_sub(judged_count),
         "visible_count": visible_count
     });
 
@@ -1407,6 +1438,56 @@ pub(crate) fn build_visibility_report(
     })
 }
 
+/// What `data.occlusionText` says about the occlusion entries' fields that
+/// name or quote the webview (`element`, `occludedBy`, `label`, `text`):
+/// `"included"` for a local read, `"withheld"` for a relayed one.
+pub(crate) const OCCLUSION_TEXT_INCLUDED: &str = "included";
+/// See [`OCCLUSION_TEXT_INCLUDED`].
+pub(crate) const OCCLUSION_TEXT_WITHHELD: &str = "withheld";
+/// The occlusion-entry fields a relayed report drops
+/// ([`disclose_occlusion_text`]).
+const OCCLUSION_WEBVIEW_FIELDS: &[&str] = &["element", "occludedBy", "label", "text"];
+
+/// Narrow a visibility report for a REMOTE caller: drop every field of each
+/// occlusion entry that names or quotes the webview, keep the rest, and say
+/// so in `occlusionText`.
+///
+/// Four fields go: `label` and `text` quote the covered element, and
+/// `element` and `occludedBy` are ids, which the webview SDK commonly builds
+/// by slugifying an element's accessible label or heading text (e.g.
+/// `heading-3-<slug of the heading>`), or a `tag#domid` descriptor. What
+/// remains per entry is `ratio`, `hidesText`, `isExpectedOverlay` and
+/// `source`; the report's verdict, `occlusionDataObserved` and counts stand.
+/// The relay's only client, the console's UI Bridge dashboard, reads exactly
+/// those (the verdict, the observed flag, the entry count and `hidesText`).
+///
+/// This is defence in depth, not the gate: the response still takes the
+/// snapshot's egress refusal (`backend_relay::http_request_egress_refusal`).
+/// A local read keeps every field and says `included`, so the disclosure is
+/// never absent from a reply.
+pub(crate) fn disclose_occlusion_text(report: &mut serde_json::Value, relayed: bool) {
+    let Some(obj) = report.as_object_mut() else {
+        return;
+    };
+    if relayed {
+        if let Some(entries) = obj.get_mut("occlusions").and_then(|v| v.as_array_mut()) {
+            for entry in entries.iter_mut().filter_map(|e| e.as_object_mut()) {
+                for field in OCCLUSION_WEBVIEW_FIELDS {
+                    entry.remove(*field);
+                }
+            }
+        }
+    }
+    obj.insert(
+        "occlusionText".to_string(),
+        serde_json::json!(if relayed {
+            OCCLUSION_TEXT_WITHHELD
+        } else {
+            OCCLUSION_TEXT_INCLUDED
+        }),
+    );
+}
+
 /// `POST /control/visibility` - WHAT IS COVERING WHAT, page-wide.
 ///
 /// The SDK has declared this route since ui-bridge `4284cd2` (2026-08-26) and
@@ -1439,8 +1520,12 @@ pub(crate) fn build_visibility_report(
 /// hand-written `use*Events` hooks, not through the SDK's own handler table.
 pub async fn ui_bridge_visibility_handler(
     State(state): State<Arc<ApiState>>,
+    headers: axum::http::HeaderMap,
     body: Option<Json<VisibilityRequest>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // Read once, up front: a relayed sweep answers without the fields that
+    // name or quote the webview (`disclose_occlusion_text`).
+    let relayed = crate::mcp::relay_path_policy::is_relayed_request(&headers);
     let req = body.map(|b| b.0).unwrap_or_default();
     let min_ratio = req.min_ratio.unwrap_or(0.02);
     // Gate BEFORE the sweep, not after: an out-of-range threshold must not be
@@ -1460,7 +1545,8 @@ pub async fn ui_bridge_visibility_handler(
         min_ratio, include_expected
     );
 
-    // BOTH filters stated. `includeHidden` alone is only half the ask: the SDK
+    // EVERY filter stated (`includeHidden`, `interactiveOnly`, `includeMedia`).
+    // `includeHidden` alone is only part of the ask: the SDK
     // defaults `interactiveOnly` to `true`, so a payload that leaves it unstated
     // silently drops every heading, paragraph and badge before the sweep ever
     // sees the page — i.e. exactly the elements a reader looks at, and exactly
@@ -1477,7 +1563,7 @@ pub async fn ui_bridge_visibility_handler(
     // `discover_all_elements_payload()` and its guard test accepts either form
     // for exactly this reason. Any sweep added here must ask the same question.
     let discover_payload = serde_json::json!({
-        "options": { "includeHidden": true, "interactiveOnly": false }
+        "options": { "includeHidden": true, "interactiveOnly": false, "includeMedia": true }
     });
     // Concurrent, as `state-summary` does: the wall time is the slower of the
     // two, not their sum.
@@ -1524,12 +1610,10 @@ pub async fn ui_bridge_visibility_handler(
         .cloned()
         .unwrap_or_default();
 
-    Ok(Json(ApiResponse::success(build_visibility_report(
-        &elements,
-        min_ratio,
-        include_expected,
-        modal_ids.as_ref(),
-    ))))
+    let mut report =
+        build_visibility_report(&elements, min_ratio, include_expected, modal_ids.as_ref());
+    disclose_occlusion_text(&mut report, relayed);
+    Ok(Json(ApiResponse::success(report)))
 }
 
 // ============================================================================
@@ -1631,15 +1715,16 @@ mod visibility_sweep_payload_tests {
     //! Scanned from source rather than exercised through the handler because
     //! the payload is built inline at the IPC call and never returned: there is
     //! no value to assert on without a live webview. The property being pinned
-    //! is nonetheless exact — BOTH filters stated, in the request this handler
-    //! actually issues.
+    //! is nonetheless exact — EVERY filter stated (`includeHidden`,
+    //! `interactiveOnly`, `includeMedia`; one test each below), in the request
+    //! this handler actually issues.
 
     /// The body of `ui_bridge_visibility_handler`, production source only.
     #[expect(
         clippy::string_slice,
         reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
     )]
-    fn visibility_handler_body() -> &'static str {
+    pub(super) fn visibility_handler_body() -> &'static str {
         let source = include_str!("screenshots.rs");
         let start = source
             .find("pub async fn ui_bridge_visibility_handler")
@@ -1665,6 +1750,16 @@ mod visibility_sweep_payload_tests {
         assert!(
             visibility_handler_body().contains("\"interactiveOnly\": false"),
             "MUST be stated explicitly: the SDK's default is `true`, so leaving              it unstated filtered every heading, paragraph and badge out of the              occlusion sweep and made `elementCount` report 281 where every              sibling route reported 296. `includeHidden` does not compensate -              hidden and non-interactive are INDEPENDENT filters."
+        );
+    }
+
+    #[test]
+    fn visibility_discover_asks_for_media_elements() {
+        assert!(
+            visibility_handler_body().contains("\"includeMedia\": true"),
+            "the occlusion sweep keeps media rows, because an image covering text \
+             is an occlusion; without includeMedia the SDK leaves them out and the \
+             sweep cannot see one (image plan Phase 8)"
         );
     }
 }
@@ -1932,6 +2027,95 @@ mod visibility_tests {
     fn the_route_is_declared_in_the_manifest() {
         assert!(super::route_entries().contains(&("POST", "/ui-bridge/control/visibility")));
     }
+
+    // ── The relayed sweep withholds the covered elements' text ─────
+
+    /// One occluded element whose label and text are both webview text.
+    fn occluded_report() -> serde_json::Value {
+        let elements = vec![el(
+            "heading-3-fix-billing",
+            "Session label",
+            json!({ "occludedBy": "div.toast", "occludedPct": 60.0, "textContent": "secret pane text" }),
+        )];
+        build_visibility_report(&elements, 0.02, false, None)
+    }
+
+    /// Relayed: no entry keeps `element`, `occludedBy`, `label` or `text`
+    /// (ids are commonly slugs of the element's text), the rest of the entry
+    /// and of the report stand, and the reply says `withheld`. Fails if the
+    /// relayed arm stops stripping any of the four.
+    #[test]
+    fn a_relayed_sweep_carries_no_webview_text() {
+        let mut report = occluded_report();
+        super::disclose_occlusion_text(&mut report, true);
+        assert_eq!(report["occlusionText"], json!("withheld"));
+        let entry = &report["occlusions"][0];
+        for field in ["element", "occludedBy", "label", "text"] {
+            assert!(entry.get(field).is_none(), "{field} survived: {entry}");
+        }
+        assert_eq!(entry["hidesText"], json!(true));
+        assert_eq!(entry["ratio"], json!(0.6));
+        assert_eq!(report["verdict"], json!("occlusions_found"));
+        assert_eq!(report["occlusionDataObserved"], json!(true));
+        assert_eq!(report["elementCount"], json!(1));
+        let wire = report.to_string();
+        for quoted in [
+            "secret pane text",
+            "Session label",
+            "heading-3-fix-billing",
+            "div.toast",
+        ] {
+            assert!(!wire.contains(quoted), "{quoted} reached the wire: {wire}");
+        }
+    }
+
+    /// Local: the entry keeps both fields and the reply says `included`, so
+    /// the disclosure is present on every reply. Fails if the local arm
+    /// starts stripping too.
+    #[test]
+    fn a_local_sweep_keeps_the_text_and_says_so() {
+        let mut report = occluded_report();
+        super::disclose_occlusion_text(&mut report, false);
+        assert_eq!(report["occlusionText"], json!("included"));
+        assert_eq!(report["occlusions"][0]["text"], json!("secret pane text"));
+        assert_eq!(report["occlusions"][0]["label"], json!("Session label"));
+        assert_eq!(
+            report["occlusions"][0]["element"],
+            json!("heading-3-fix-billing")
+        );
+        assert_eq!(report["occlusions"][0]["occludedBy"], json!("div.toast"));
+    }
+
+    /// The handler reads the relay marker once and hands it, unchanged, to
+    /// the disclosure, so the pure tests above are the handler's behaviour.
+    /// Source-scanned: the handler cannot run without a webview.
+    #[test]
+    fn the_handler_discloses_by_the_relay_marker() {
+        let body = super::visibility_sweep_payload_tests::visibility_handler_body();
+        assert_eq!(
+            body.matches(
+                "let relayed = crate::mcp::relay_path_policy::is_relayed_request(&headers);"
+            )
+            .count(),
+            1,
+            "the marker is read exactly once, from the request headers: {body}"
+        );
+        assert_eq!(
+            body.matches("relayed =").count(),
+            1,
+            "`relayed` is never reassigned after it is read: {body}"
+        );
+        assert_eq!(
+            body.matches("disclose_occlusion_text(&mut report, relayed);")
+                .count(),
+            1,
+            "{body}"
+        );
+        assert!(
+            body.contains("Ok(Json(ApiResponse::success(report)))"),
+            "the disclosed report is the one returned: {body}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2104,11 +2288,13 @@ mod sweep_discover_tests {
 
     use super::*;
 
-    /// The payload itself. `interactiveOnly: false` is the half that was
-    /// missing: the SDK defaults it to `true`, so every heading, badge and
-    /// paragraph was filtered out before the sweep ever saw the page.
+    /// The payload itself states all three filters. `interactiveOnly: false`
+    /// was once missing: the SDK defaults it to `true`, so every heading,
+    /// badge and paragraph was filtered out before the sweep ever saw the
+    /// page. `includeMedia: true` brings the image rows the L0 image
+    /// assertions judge.
     #[test]
-    fn discover_payload_asks_for_hidden_and_non_interactive_elements() {
+    fn discover_payload_states_every_filter() {
         let payload = discover_all_elements_payload();
         let options = payload
             .get("options")
@@ -2124,6 +2310,68 @@ mod sweep_discover_tests {
             "MUST be stated explicitly: the SDK's default is `true`, and leaving \
              it unstated is what made elementCount under-report on every page"
         );
+        assert_eq!(
+            options.get("includeMedia").and_then(|v| v.as_bool()),
+            Some(true),
+            "the image assertions need the image rows, and an image covering text is \
+             an occlusion"
+        );
+    }
+
+    #[test]
+    fn page_health_leaves_out_the_media_rows_discover_returns() {
+        let discover = serde_json::json!({"elements": [
+            {"id": "h1", "category": "content"},
+            {"id": "buy", "category": "interactive"},
+            {"id": "hero", "category": "media"},
+            {"id": "plain"},
+        ]});
+        let kept: Vec<_> = page_health_elements(&discover)
+            .iter()
+            .filter_map(|el| el.get("id").and_then(|v| v.as_str()).map(str::to_owned))
+            .collect();
+        assert_eq!(kept, ["h1", "buy", "plain"]);
+    }
+
+    /// The reported `element_count` keeps the media rows, so page-health and
+    /// `/control/visibility` count the same set for the same page. Only the
+    /// ratios leave them out (`media_rows_excluded` is the difference).
+    #[test]
+    fn page_health_reports_every_discovered_row_as_its_element_count() {
+        let discover = serde_json::json!({"elements": [
+            {"id": "h1", "category": "content"},
+            {"id": "hero", "category": "media"},
+            {"id": "logo", "category": "media"},
+        ]});
+        assert_eq!(discovered_row_count(&discover), 3);
+        assert_eq!(page_health_elements(&discover).len(), 1);
+        assert_eq!(discovered_row_count(&serde_json::json!({})), 0);
+    }
+
+    /// The handler reports the discovered count, not the judged one. Scanned
+    /// from source, because the report is built inline in the handler.
+    #[test]
+    fn page_health_report_states_the_media_rows_it_left_out() {
+        let source = include_str!("screenshots.rs");
+        // `split_once`, not byte slicing: the crate denies `string_slice`.
+        let (_, rest) = source
+            .split_once("pub async fn ui_bridge_page_health_handler")
+            .expect("the page-health handler is in this file");
+        // The handler ends at the first column-0 closing brace after it.
+        let (body, _) = rest.split_once("\n}\n").expect("the handler body closes");
+        assert!(
+            body.contains("\"media_rows_excluded\": element_count.saturating_sub(judged_count)"),
+            "the report must say how many media rows the ratios left out"
+        );
+        assert!(
+            body.contains("let element_count = discovered_row_count(&discover_data);"),
+            "element_count must count every discovered row, as visibility does"
+        );
+    }
+
+    #[test]
+    fn page_health_reads_no_rows_from_a_reply_without_elements() {
+        assert!(page_health_elements(&serde_json::json!({})).is_empty());
     }
 
     /// DIVERGENCE GUARD.
@@ -2137,10 +2385,11 @@ mod sweep_discover_tests {
     /// ## The rule this pins, and why it is SEMANTIC rather than syntactic
     ///
     /// Every `discover` request issued from this file must ask for the SAME
-    /// element set: `includeHidden: true` AND `interactiveOnly: false`. A site
+    /// element set: `includeHidden: true`, `interactiveOnly: false` AND
+    /// `includeMedia: true`. A site
     /// satisfies that either by calling `discover_all_elements_payload()` —
     /// still the preferred form, since a helper cannot drift — **or** by
-    /// stating both filters in its own literal. Both spellings ask the identical
+    /// stating every filter in its own literal. Both spellings ask the identical
     /// question, and the question is the property worth defending; requiring one
     /// SPELLING of it was an over-reach this guard has now been narrowed out of.
     ///
@@ -2185,9 +2434,10 @@ mod sweep_discover_tests {
                 site_asks_for_every_element(production, at),
                 "a `discover` request site in screenshots.rs does not ask for the \
                  full element set. Every page-wide sweep must ask the SAME \
-                 question — `includeHidden: true` AND `interactiveOnly: false` — \
-                 either by calling discover_all_elements_payload() or by stating \
-                 BOTH filters in its own literal. Stating only `includeHidden` \
+                 question — `includeHidden: true`, `interactiveOnly: false` AND \
+                 `includeMedia: true` — either by calling \
+                 discover_all_elements_payload() or by stating EVERY filter in its \
+                 own literal. Stating only `includeHidden` \
                  leaves the SDK's `interactiveOnly: true` default in force, which \
                  silently drops every heading, paragraph and badge; that is how \
                  the sweeps diverged. Offending site at byte {at}."
@@ -2200,8 +2450,8 @@ mod sweep_discover_tests {
         );
     }
 
-    /// Does the `discover` request at `at` ask for hidden AND non-interactive
-    /// elements?
+    /// Does the `discover` request at `at` ask for hidden, non-interactive AND
+    /// media elements?
     ///
     /// Resolves the payload ARGUMENT rather than eyeballing a fixed window,
     /// because the two accepted spellings sit on opposite sides of the call: a
@@ -2218,7 +2468,7 @@ mod sweep_discover_tests {
             return true;
         }
         // An inline literal — check the argument text itself…
-        if states_both_filters(arg) {
+        if states_every_filter(arg) {
             return true;
         }
         // …otherwise the argument is a binding; read the `let` that made it.
@@ -2227,7 +2477,7 @@ mod sweep_discover_tests {
             return false;
         }
         match production[..at].rfind(&format!("let {ident} ")) {
-            Some(binding) => states_both_filters(&production[binding..at]),
+            Some(binding) => states_every_filter(&production[binding..at]),
             None => false,
         }
     }
@@ -2252,11 +2502,13 @@ mod sweep_discover_tests {
         rest
     }
 
-    /// Both filters stated, whitespace-insensitively — a `json!` body is macro
+    /// Every filter stated, whitespace-insensitively — a `json!` body is macro
     /// input, which rustfmt does not normalize, so its spacing is whatever the
     /// author typed.
-    fn states_both_filters(text: &str) -> bool {
+    fn states_every_filter(text: &str) -> bool {
         let dense: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-        dense.contains("\"includeHidden\":true") && dense.contains("\"interactiveOnly\":false")
+        dense.contains("\"includeHidden\":true")
+            && dense.contains("\"interactiveOnly\":false")
+            && dense.contains("\"includeMedia\":true")
     }
 }

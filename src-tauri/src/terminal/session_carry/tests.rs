@@ -403,8 +403,11 @@ fn copy_transcript_keeps_the_destination_sidecar_when_the_destination_ran_last()
     )
     .unwrap();
 
-    // The respawn's mode (`ExtendPrefix`): a migration (`LiveSourceWins`)
-    // would instead move this larger destination aside — the live source wins.
+    // The respawn's mode (`ExtendPrefix`). A migration keeps this larger
+    // destination too: `copy_transcript` ranks the copies first, finds the
+    // source a strict byte prefix of the destination, and keeps the
+    // destination in place (`newest::keep_destination`) rather than running
+    // `LiveSourceWins` over it.
     let carried = carry_session(
         src_cfg.to_str().unwrap(),
         dst_cfg.to_str().unwrap(),
@@ -976,16 +979,21 @@ fn diverged_backups(cfg: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// W1 — on a MIGRATION the source is the live conversation and is what
-/// resumes. A destination `<sid>.jsonl` that diverged from it is moved aside
-/// (its bytes survive at `<sid>.jsonl.diverged-<ms>`), and the destination
-/// then holds the source's bytes. A diverged SUBAGENT transcript is treated
-/// the same way (W2): its fork survives as `<file>.diverged-<ms>` beside it,
-/// the destination ends up equal to the source, and the delta sync then tops
-/// it up like any carried file. The main transcript is not counted in the
-/// `<sid>/` tally.
+/// W1 — on a MIGRATION that carries from the source, a destination
+/// `<sid>.jsonl` that diverged from it is moved aside (its bytes survive at
+/// `<sid>.jsonl.diverged-<ms>`), and the destination then holds the source's
+/// bytes. A diverged SUBAGENT transcript is treated the same way (W2): its
+/// fork survives as `<file>.diverged-<ms>` beside it, the destination ends up
+/// equal to the source, and the delta sync then tops it up like any carried
+/// file. The main transcript is not counted in the `<sid>/` tally.
+///
+/// Its fixtures carry no timestamped turn, so the ranking across roots
+/// ([`super::newest`]) is UNKNOWN and the carry reads the source, as every
+/// migration did before that ranking existed. A timestamped diverged
+/// destination (larger than the source) that the source outranks is
+/// `newest::tests::a_source_that_holds_the_newest_copy_carries_exactly_as_before`.
 #[test]
-fn a_migration_moves_a_diverged_main_transcript_aside_and_copies_the_live_one() {
+fn an_unranked_migration_moves_a_diverged_main_transcript_aside_and_copies_the_source() {
     let tmp = scratch("diverged");
     let (src, dst) = (tmp.join(".claude-a"), tmp.join(".claude-b"));
     let src_side = seed_forked(&src, &dst);
@@ -1396,13 +1404,20 @@ fn extend_prefix_keeps_a_diverged_main_transcript() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
-/// On a migration the live source wins WHATEVER the sizes: a destination
-/// LARGER than the source whose bytes are not the source's (a stale fork that
-/// grew past the live one) is moved aside, and the destination then holds the
-/// source's bytes — previously it read as current, was resumed, and the live
-/// conversation was dropped. The live side's in-place sidecar follows.
+/// On a migration that carries from the source, the source wins WHATEVER the
+/// sizes: a destination LARGER than the source whose bytes are not the
+/// source's (a stale fork that grew past the live one) is moved aside, and
+/// the destination then holds the source's bytes — previously it read as
+/// current, was resumed, and the live conversation was dropped. The source
+/// side's in-place sidecar follows.
+///
+/// Its fixtures carry no timestamped turn, so the ranking across roots
+/// ([`super::newest`]) is UNKNOWN and the carry reads the source, as every
+/// migration did before that ranking existed. A timestamped diverged
+/// destination (larger than the source) that the source outranks is
+/// `newest::tests::a_source_that_holds_the_newest_copy_carries_exactly_as_before`.
 #[test]
-fn a_migration_moves_a_larger_diverged_main_transcript_aside() {
+fn an_unranked_migration_moves_a_larger_diverged_main_transcript_aside() {
     let tmp = scratch("diverged-larger");
     let (src, dst) = (tmp.join(".claude-a"), tmp.join(".claude-b"));
     seed_forked(&src, &dst);
@@ -1433,8 +1448,14 @@ fn a_migration_moves_a_larger_diverged_main_transcript_aside() {
 
 /// A destination the SAME size as the source but with other bytes is a fork
 /// too: a size check alone would call it current.
+///
+/// Its fixtures carry no timestamped turn, so the ranking across roots
+/// ([`super::newest`]) is UNKNOWN and the carry reads the source, as every
+/// migration did before that ranking existed. A timestamped diverged
+/// destination (larger than the source) that the source outranks is
+/// `newest::tests::a_source_that_holds_the_newest_copy_carries_exactly_as_before`.
 #[test]
-fn a_migration_moves_a_same_size_different_bytes_main_transcript_aside() {
+fn an_unranked_migration_moves_a_same_size_different_bytes_main_transcript_aside() {
     let tmp = scratch("diverged-same-size");
     let (src, dst) = (tmp.join(".claude-a"), tmp.join(".claude-b"));
     seed_forked(&src, &dst);
@@ -2600,6 +2621,7 @@ fn a_compare_failure_keeps_the_forks_meta_through_the_carry_and_the_sync() {
                 session_dir: tally,
                 files,
                 subagents: Vec::new(),
+                carried_from: src.clone(),
             };
             let synced = sync(&since);
             assert_eq!(synced.copied, 0, "{case}: {synced:?}");
@@ -3062,6 +3084,7 @@ fn a_destination_stat_error_is_never_read_as_absent() {
             session_dir: tally,
             files,
             subagents: Vec::new(),
+            carried_from: src.clone(),
         };
         let synced = sync(&since);
         assert_eq!(synced.copied, 0, "{case}: {synced:?}");
@@ -3143,6 +3166,7 @@ fn a_meta_whose_transcript_has_no_carry_record_stays_with_the_destination() {
                 session_dir: tally,
                 files,
                 subagents: Vec::new(),
+                carried_from: src.clone(),
             };
             let synced = sync(&since);
             assert_eq!(synced.copied, 0, "{case}: {synced:?}");

@@ -229,6 +229,15 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             "/ui-bridge/control/component/{id}/action/{action_id}/predict",
             post(ui_bridge_predict_component_action_handler),
         )
+        // `effects/recent` carries the app's element changes, so while a
+        // condition-check session holds a secret no response here carries it
+        // (`crate::condition_secrets`, plan
+        // 2026-11-06-a-regression-test-run-is-judged-by-what-it-covered-and-a-silent-run-reads-unknown
+        // Phase 13). LAST, because `Router::layer` wraps only the routes
+        // registered before it.
+        .layer(axum::middleware::from_fn(
+            crate::condition_secrets::scrub_sdk_responses,
+        ))
 }
 
 pub fn route_entries() -> &'static [(&'static str, &'static str)] {

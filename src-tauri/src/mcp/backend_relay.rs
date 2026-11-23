@@ -2594,19 +2594,6 @@ async fn sleep_with_kick(
     }
 }
 
-/// Handle an inbound command from the backend.
-///
-/// Recognized message types:
-///
-/// - `dispatch` — start a workflow run. Replies with `dispatch_ack`.
-/// - `command`, `chat`, `terminal` — currently routed to the legacy
-///   chat/terminal handlers below for back-compat. Phase 4 will rename
-///   the inbound types but the routing stays the same.
-/// - `chat_*` — legacy chat session commands (kept for mobile relay).
-/// - `terminal_*` — legacy terminal commands (kept for mobile relay).
-/// - `heartbeat` — server pong; reply with `heartbeat_ack`.
-/// - `devenv_enroll` — server-pushed devenv enrollment; reply with
-///   `devenv_enroll_ack`.
 /// Message types a frame carrying a `remote` block may be, by ROLE.
 ///
 /// This is a POSITIVE allowlist because the alternative — each handler opting
@@ -2630,7 +2617,8 @@ async fn sleep_with_kick(
 /// halves of the original defect are closed in different places, deliberately:
 /// this predicate stops an attach grant reaching the handler at all, and the
 /// handler's own gate stops a create grant choosing where the PTY lands. See
-/// [`remote_frame_admitted`] for the kind arm.
+/// [`remote_frame_admitted`] for the kind arm. `terminal_end` is the other entry
+/// a create grant reaches, for the one terminal it spawned.
 const REMOTE_TARGET_ADMITTED: &[&str] = &[
     "terminal_input",
     "terminal_resize",
@@ -2704,6 +2692,15 @@ const REMOTE_SOURCE_ADMITTED: &[&str] = &[
 /// the envelope level rather than inside `payload`.
 const REMOTE_ENVELOPE_TYPES: &[&str] = &["command", "chat", "terminal"];
 
+/// Does this frame's `remote` block claim a create grant? The one reading both
+/// the admission predicate and `handle_terminal_end`'s branch use. A malformed
+/// block parses as `Err` and answers `false`, the narrower kind, so it can never
+/// reach a create arm.
+fn carries_create_grant(data: &Value) -> bool {
+    use crate::mcp::remote_terminal::{parse_remote_block, RemoteGrantKind};
+    matches!(parse_remote_block(data), Some(Ok(block)) if block.kind == RemoteGrantKind::Create)
+}
+
 /// May a frame of `msg_type` carry the `remote` block it is carrying?
 ///
 /// Pure so the enforcement point is testable without an `ApiState`. A frame
@@ -2714,13 +2711,10 @@ const REMOTE_ENVELOPE_TYPES: &[&str] = &["command", "chat", "terminal"];
 /// web control path. A malformed block is still a block, and is refused here
 /// unless its type is admitted, then refused again by the handler's own gate.
 fn remote_frame_admitted(msg_type: &str, data: &Value) -> bool {
-    use crate::mcp::remote_terminal::RemoteGrantKind;
-    let Some(parsed) = crate::mcp::remote_terminal::parse_remote_block(data) else {
+    if crate::mcp::remote_terminal::parse_remote_block(data).is_none() {
         return true;
-    };
-    // A malformed block parses as `Err` and is `Attach` for this predicate —
-    // the narrower kind — so it can never reach `terminal_create`.
-    let create_grant = matches!(&parsed, Ok(block) if block.kind == RemoteGrantKind::Create);
+    }
+    let create_grant = carries_create_grant(data);
 
     // `terminal_create` SPAWNS a PTY: admitted under a create grant and under
     // nothing else. An attach grant naming it is refused here, before the
@@ -2729,10 +2723,11 @@ fn remote_frame_admitted(msg_type: &str, data: &Value) -> bool {
         return create_grant;
     }
     // And the converse, which is the same rule read the other way: a create
-    // grant is not an attach grant, so it may not drive an existing PTY. It
-    // buys exactly one frame type, the one above.
+    // grant is not an attach grant, so it may not drive an existing PTY. It buys
+    // the spawn above and one close of what it spawned; `terminal_end`'s create
+    // arm (`admit_create_grant_end`) holds it to that terminal, unattached.
     if create_grant && REMOTE_TARGET_ADMITTED.contains(&msg_type) {
-        return false;
+        return msg_type == "terminal_end";
     }
 
     REMOTE_TARGET_ADMITTED.contains(&msg_type)
@@ -2954,6 +2949,19 @@ fn outbound_egress_permitted(channel: &str, event: &Value) -> bool {
     }
 }
 
+/// Handle an inbound command from the backend.
+///
+/// Recognized message types:
+///
+/// - `dispatch` — start a workflow run. Replies with `dispatch_ack`.
+/// - `command`, `chat`, `terminal` — currently routed to the legacy
+///   chat/terminal handlers below for back-compat. Phase 4 will rename
+///   the inbound types but the routing stays the same.
+/// - `chat_*` — legacy chat session commands (kept for mobile relay).
+/// - `terminal_*` — legacy terminal commands (kept for mobile relay).
+/// - `heartbeat` — server pong; reply with `heartbeat_ack`.
+/// - `devenv_enroll` — server-pushed devenv enrollment; reply with
+///   `devenv_enroll_ack`.
 async fn handle_relay_command(
     api_state: &Arc<ApiState>,
     msg_type: &str,
@@ -3548,18 +3556,28 @@ where
 /// refuse it (plan `2026-09-17-runner-loopback-api-accepts-any-origin`, F4).
 /// The self-call is a NonBrowser request and must look like one.
 ///
-/// `cookie` and `authorization` are the END USER's ambient credentials to the
-/// web backend — the browser's session cookie (carrying `access_token`, a
-/// Cognito bearer) and the user's bearer. The runner trusts its own relay
-/// channel, never the end user's credentials, and neither it nor anything on
-/// its box that reads its logs may receive a replayable web credential. The web
-/// backend already drops them (qontinui-web `device_bridge_ws.py`
-/// `_AMBIENT_CREDENTIAL_REQUEST_HEADERS`); this is defense in depth against an
-/// older backend still forwarding them. No runner handler reads either header
-/// from a relayed caller: the routes that read `Authorization` want a session
-/// proxy nonce and none of them is on `RELAY_ALLOWED`, and no route reads a
-/// cookie at all (plan `2026-09-17-retire-the-runner-origin-guard-dev-grace`,
-/// F5 / Phase 5).
+/// The remaining seven are the END USER's ambient credentials, and they are
+/// exactly qontinui-web `device_bridge_ws.py`
+/// `_AMBIENT_CREDENTIAL_REQUEST_HEADERS` — keep the two sets equal. `cookie`
+/// and `authorization` are the browser's session cookie (carrying
+/// `access_token`, a Cognito bearer) and the user's bearer; `proxy-authorization`
+/// and `x-csrf-token` are their siblings; `x-machine-key`,
+/// `x-device-machine-key` and `x-coord-admin-secret` are fleet secrets a
+/// caller of the web backend may present to IT. The runner trusts its own
+/// relay channel, never the end user's credentials, and neither it nor
+/// anything on its box that reads its logs may receive a replayable one. The
+/// web backend already drops them; this is defense in depth against an older
+/// backend still forwarding them.
+///
+/// No runner handler reads any of the seven from a relayed caller. The routes
+/// that read an inbound `Authorization` all want a session proxy nonce —
+/// `/coord-mcp`, `/coord-mcp/doctor`, `nonce_gated_coord_get`,
+/// `coord_write_proxy_handler`, `/vcs/pull-requests`,
+/// `/sessions/transcript-bind` and the plan-library write door — and none of
+/// them is on `RELAY_ALLOWED`. The runner only ever SENDS the three fleet
+/// secrets outbound (env-agent, device-JWT refresh, claims), and no route reads
+/// a cookie, `proxy-authorization` or `x-csrf-token` at all (plan
+/// `2026-09-17-retire-the-runner-origin-guard-dev-grace`, F5 / Phase 5).
 const RELAY_SKIP_REQUEST_HEADERS: &[&str] = &[
     "host",
     "connection",
@@ -3569,6 +3587,11 @@ const RELAY_SKIP_REQUEST_HEADERS: &[&str] = &[
     "sec-fetch-site",
     "cookie",
     "authorization",
+    "proxy-authorization",
+    "x-csrf-token",
+    "x-machine-key",
+    "x-device-machine-key",
+    "x-coord-admin-secret",
 ];
 
 /// Hop-by-hop / framing response headers that must NOT be echoed back over
@@ -3624,6 +3647,7 @@ fn http_relay_error(request_id: &Value, status: u16, message: &str) -> Value {
 /// | `GET /ui-bridge/control/snapshot` | terminal stream, strictest, refuse — the runner UI shows session panes |
 /// | `GET /ui-bridge/control/components` | none — relayed, it carries the runner's own registry only: `ui_bridge::elements::ComponentSources` withholds every WebSocket-registered app's reply from a request bearing `relay_path_policy::RELAYED_REQUEST_HEADER`. What remains is `serializeComponent` metadata (ids, names, descriptions, actions with declared effects) and no component state; some names embed a saved project's name, or a registered app's self-declared name while the runner's UI Bridge integration page lists that app |
 /// | `POST /ui-bridge/control/page-health` | terminal stream, strictest, refuse — its text findings quote the same webview as the snapshot |
+/// | `POST /ui-bridge/control/visibility` | terminal stream, strictest, refuse — relayed, its report drops every occlusion entry's `element`, `occludedBy`, `label` and `text` (`ui_bridge::screenshots::disclose_occlusion_text`) and says `occlusionText: "withheld"`; the verdict, counts, `occlusionDataObserved`, the request echo (`minRatio`, `includeExpected`), the overlay-classifier status `expectedOverlayDetection` and per-entry `ratio` / `hidesText` / `isExpectedOverlay` / `source` remain, and those still describe the same webview |
 /// | `POST /prompt-home/plan` | none — plans the caller's own prompt |
 /// | `GET /task-runs`, `/task-runs/running`, `/task-runs/{id}` | terminal stream, per run, redact |
 /// | `GET /task-runs/{id}/events`, `/output`, `/session-state`, `/workflow-state`, `/screenshots` | terminal stream, that run's tenant, refuse |
@@ -3684,12 +3708,16 @@ fn http_request_egress_refusal(request_id: &Value, raw_path: &str) -> Option<Val
         }
         // Matched as whole route strings: they are the runner's own HTTP
         // routes, not the `ui-bridge` sibling repo the workspace-assumption
-        // scan looks for. Both read the runner's own webview, which shows
-        // session panes: the snapshot carries every element's text, and page
-        // health quotes the text of each element its findings flag.
+        // scan looks for. All three read the runner's own webview, which
+        // shows session panes: the snapshot carries every element's text, page
+        // health quotes the text of each element its findings flag, and the
+        // occlusion sweep names the webview's elements and occluders (a
+        // relayed sweep drops those ids along with their label and text).
         _ if matches!(
             segments.join("/").as_str(),
-            "ui-bridge/control/snapshot" | "ui-bridge/control/page-health"
+            "ui-bridge/control/snapshot"
+                | "ui-bridge/control/page-health"
+                | "ui-bridge/control/visibility"
         ) =>
         {
             (Flow::TerminalStream, SessionScope::Unresolved)
@@ -5590,6 +5618,24 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
             "request_id": data.get("request_id"),
         }));
     }
+    // The resource guard's CRITICAL verdict, judged before `acquire_for_terminal`
+    // below runs a `git worktree add` a refusal would leave on disk — and, like
+    // the drain gate, before the grant gate, so a refusal spends no create
+    // grant. `false`: the relay never overrides the floor (see its create
+    // call). Answered with the failed-create arm's own typed frame.
+    //
+    // Accepted consequence: because this runs before the grant gate, a frame
+    // that would NOT have been admitted (an unknown or foreign grant) now sees
+    // the CRITICAL refusal text — box headroom and floor — instead of the grant
+    // refusal. The drain gate above already answers unadmitted frames the same
+    // way; it is deliberate here so a refusal never spends a create grant.
+    if let Err(frame) = crate::terminal::spawn_refusal::relay_precheck(
+        || crate::resource_guard::precheck_spawn("terminal session", false),
+        data,
+    ) {
+        warn!("relay create: refused by the resource-guard precheck");
+        return Some(frame);
+    }
     // D2 — the TARGET chooses. A frame with no `remote` block is the
     // operator-web / mobile path and keeps its caller-chosen `working_dir`;
     // one carrying a block is a REMOTE create, and `admitted` holds the
@@ -5871,6 +5917,7 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
         let registration_dir = working_dir.clone();
         let registration_repo = effective_intent_repo.clone();
 
+        // door-scan: spawn — the door's real spawn; the context is in hand until here.
         match tm.create(
             title,
             working_dir,
@@ -5893,6 +5940,8 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
             crate::terminal::TrustArm::AccountChosenLater,
             // No spawn tenant — see the allocate above.
             None,
+            // A relay create names no reason — the same origin its drain gate uses.
+            crate::coord_drain_state::SpawnOrigin::Unknown,
         ) {
             Ok(info) => {
                 if let Some(ctx) = isolated_ctx {
@@ -5933,6 +5982,20 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
                         refusal["remote"] = crate::mcp::remote_terminal::remote_echo(data);
                         return Some(refusal);
                     }
+                    // The tombstone and the reaper both learn the terminal before
+                    // the reply below is built, so no source can present this id
+                    // to `admit_create_grant_end` ahead of either. A failed bind
+                    // leaves the close refused; the reaper is the backstop.
+                    if !crate::mcp::remote_terminal::create_grants()
+                        .bind_spent_terminal(&create.block.grant_jti, &info.id)
+                    {
+                        warn!(
+                            grant_jti = %create.block.grant_jti,
+                            terminal_id = %info.id,
+                            "remote create: no tombstone took this terminal, so its source \
+                             cannot close it if the attach fails"
+                        );
+                    }
                     // Reap it if no source ever attaches (a reply lost at relay
                     // teardown). Plan 2026-09-23-remote-create-residuals-…, Phase 1.
                     crate::mcp::remote_create_reaper::arm_remote_created(
@@ -5972,15 +6035,22 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
                 Some(frame)
             }
             Err(e) => {
-                let mut frame = serde_json::json!({
-                    "type": "error",
-                    "message": format!("Failed to create terminal: {}", e),
-                    "request_id": data.get("request_id"),
-                });
-                if admitted.is_some() {
-                    frame["remote"] = crate::mcp::remote_terminal::remote_echo(data);
+                // The allocation (if this call made one) has its fresh tree
+                // removed when no child started and it holds nothing, and is
+                // reported spawn-failed, as on every `acquire_for_terminal`
+                // door; the context's Drop then releases its claims.
+                if let Some(ctx) = isolated_ctx {
+                    ctx.remove_unspawned(
+                        "backend_relay terminal_create",
+                        e.child_started,
+                        &e.message,
+                    );
                 }
-                Some(frame)
+                Some(crate::terminal::spawn_refusal::relay_spawn_failed_frame(
+                    &e.message,
+                    data,
+                    admitted.is_some(),
+                ))
             }
         }
     } else {
@@ -6037,17 +6107,190 @@ fn refuse_remote_frame(data: &Value, terminal_id: &str) -> Option<Value> {
     )
 }
 
-/// Resolve a coord session id to the local terminal hosting it: the coord
-/// mirror id `terminal_create` wired after `register_external`, or the
-/// identity seam's pinned harness id the coord row was registered under.
+/// Resolve a coord session id to the local terminal hosting it — the one
+/// resolver `handle_terminal_attach` and `handle_terminal_end` hand their
+/// admission seams. A pane can carry TWO coord rows: the `terminal_shell` row
+/// `terminal_create` mirrors onto it, and the `terminal_claude` row the
+/// registrar holds for the Claude session running inside it, which is the row
+/// a user sees in the Fleet list. Both resolve; see
+/// [`resolve_coord_terminal_id`] for the order.
+///
+/// `registrar` and `store` are the managed `AiCoordRegistrar` and
+/// `SessionLifecycleStore`; either one absent only removes the arms that read
+/// it (the shell mirror id still resolves).
 fn resolve_local_terminal(
     tm: &crate::terminal::TerminalManager,
+    registrar: Option<&crate::claude_session::coord_register::AiCoordRegistrar>,
+    store: Option<&crate::session::session_lifecycle_store::SessionLifecycleStore>,
     session_id: Uuid,
 ) -> Option<(String, Arc<crate::terminal::session::TerminalSession>)> {
-    let wanted = session_id.to_string();
-    tm.sessions_snapshot().into_iter().find(|(_, session)| {
-        session.coord_session_id() == Some(session_id) || session.pinned_session_id() == wanted
-    })
+    let snapshot = tm.sessions_snapshot();
+    let terminal_id = resolve_coord_terminal_id(
+        snapshot
+            .iter()
+            .map(|(id, s)| (id.as_str(), s.pinned_session_id(), s.coord_session_id())),
+        |coord| registrar.and_then(|r| r.task_run_id_for(coord)),
+        || store.map(|s| s.open_records()).unwrap_or_default(),
+        |id| store.and_then(|s| s.get(id)).and_then(|r| r.adopted_from),
+        session_id,
+    )?;
+    snapshot.into_iter().find(|(id, _)| *id == terminal_id)
+}
+
+/// The managed maps [`resolve_local_terminal`] reads past the shell mirror
+/// id: the registrar's R4 index and the durable lifecycle store. Either is
+/// `None` when not managed (early boot, tests).
+fn relay_session_maps(
+    api_state: &ApiState,
+) -> (
+    Option<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>,
+    Option<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>,
+) {
+    let app = &api_state.app_handle;
+    (
+        app.try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>()
+            .map(|s| s.inner().clone()),
+        app.try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
+            .map(|s| s.inner().clone()),
+    )
+}
+
+/// The rule behind [`resolve_local_terminal`], over `(terminal id, pinned
+/// harness id, shell mirror coord id)` for every live terminal — pure, so it
+/// is unit-tested without a PTY or an `AppHandle`. Composes existing maps and
+/// adds no registry of its own. In order:
+///
+/// 1. the live terminal whose shell mirror id (`coord_session_id()`) is
+///    `coord_session_id`;
+/// 2. `coord_session_id` → its Claude session id through the registrar's R4
+///    index (`claude_session_for`, i.e. `AiCoordRegistrar::task_run_id_for`),
+///    then the terminal hosting that Claude session:
+///    a. its own `open` lifecycle record — where the session runs now. When
+///       one exists it alone decides: the answer is the live terminal it binds
+///       ([`crate::mcp::session_message_poller::bound_open_terminal_id`]); if
+///       it binds none, the single pinned live pane when every own record
+///       names that pane (an unconfirmed or hookless record agreeing with the
+///       pin); else `None`;
+///    b. else (no own open record) the live terminal PINNED to it (the
+///       spawn-time pin, in-process), which can be stale once the session was
+///       resumed elsewhere;
+///    c. else a record whose `adopted_from` chain reaches it (a `/clear`
+///       successor; walked with
+///       [`crate::claude_session::coord_register::resolve_adoption_chain`])
+///       naming a live terminal.
+///
+///    Each arm must name exactly one live terminal; two candidates resolve to
+///    `None` rather than a pick, because a remote end closes what it resolves.
+///
+/// There is deliberately no arm matching a pinned id against the coord id:
+/// the pinned id is the PROVIDER's session id and every `coord.sessions.id`
+/// the runner holds is a minted UUIDv7 (or a coord-adopted row id), two
+/// disjoint id spaces (see `GET /terminals/{id}/coord-session` in
+/// `mcp/terminals.rs`). The registrar's R4 index is in-process only, so after
+/// a runner restart a `terminal_claude` row resolves again once its session is
+/// re-registered (the resume sniff or transcript autobind); until then it is
+/// `None` — `session_not_local` — never a guess.
+pub(crate) fn resolve_coord_terminal_id<'a>(
+    terminals: impl Iterator<Item = (&'a str, &'a str, Option<Uuid>)>,
+    claude_session_for: impl FnOnce(&Uuid) -> Option<String>,
+    open_records: impl FnOnce() -> Vec<crate::session::session_lifecycle_store::TerminalSessionRecord>,
+    mut predecessor_of: impl FnMut(&str) -> Option<String>,
+    coord_session_id: Uuid,
+) -> Option<String> {
+    let terminals: Vec<(&str, &str, Option<Uuid>)> = terminals.collect();
+    // Every arm must name exactly ONE live terminal: a remote end closes what
+    // it resolves, so two candidates are refused, never picked between.
+    let only = |mut tids: Vec<String>| -> Result<Option<String>, ()> {
+        tids.sort();
+        tids.dedup();
+        match tids.len() {
+            0 => Ok(None),
+            1 => Ok(tids.pop()),
+            _ => Err(()),
+        }
+    };
+    // (1) The shell mirror id.
+    match only(
+        terminals
+            .iter()
+            .filter(|(_, _, coord)| *coord == Some(coord_session_id))
+            .map(|(id, _, _)| (*id).to_string())
+            .collect(),
+    ) {
+        Ok(Some(tid)) => return Some(tid),
+        Err(()) => return None,
+        Ok(None) => {}
+    }
+    // (2) coord id → Claude session id. An empty id names nothing (unpinned
+    // panes carry the empty pin).
+    let claude_session_id = claude_session_for(&coord_session_id)?;
+    if claude_session_id.is_empty() {
+        return None;
+    }
+    let is_live = |tid: &str| terminals.iter().any(|(id, _, _)| *id == tid);
+    let records = open_records();
+    let bound_live = |rec: &crate::session::session_lifecycle_store::TerminalSessionRecord| {
+        crate::mcp::session_message_poller::bound_open_terminal_id(rec)
+            .filter(|tid| is_live(tid))
+            .map(str::to_string)
+    };
+    // (2a) Its own open lifecycle record — where the session RUNS now. This
+    // outranks the pin: the pin is fixed at spawn, so a pane whose Claude
+    // exited (shell still live) keeps a pin to a session that has since been
+    // resumed in another pane. ANY own open record decides the question, even
+    // one naming a pane that is gone or a binding that may not be acted on:
+    // it is positive evidence the session is not (only) where the pin says,
+    // so the pin is consulted only when no own open record exists at all.
+    let own: Vec<_> = records
+        .iter()
+        .filter(|rec| rec.claude_session_id == claude_session_id)
+        .collect();
+    let pinned: Vec<String> = terminals
+        .iter()
+        .filter(|(_, pinned, _)| *pinned == claude_session_id)
+        .map(|(id, _, _)| (*id).to_string())
+        .collect();
+    if !own.is_empty() {
+        match only(own.iter().copied().filter_map(bound_live).collect()) {
+            Ok(Some(tid)) => return Some(tid),
+            Err(()) => return None,
+            Ok(None) => {}
+        }
+        // None of them binds a live pane. They still agree with the pin when
+        // every one names the single pinned live pane (a record whose hook
+        // has not confirmed it yet, or a hookless session): that pane, and
+        // only then.
+        return match only(pinned) {
+            Ok(Some(pane)) if own.iter().all(|rec| rec.terminal_id == pane) => Some(pane),
+            _ => None,
+        };
+    }
+    // (2b) No own open record: the live terminal pinned to it.
+    match only(pinned) {
+        Ok(Some(tid)) => return Some(tid),
+        Err(()) => return None,
+        Ok(None) => {}
+    }
+    // (2c) A `/clear` successor's record — bound, naming a live terminal, and
+    // the only such terminal.
+    only(
+        records
+            .iter()
+            .filter(|rec| rec.claude_session_id != claude_session_id)
+            .filter(|rec| {
+                crate::claude_session::coord_register::resolve_adoption_chain(
+                    &rec.claude_session_id,
+                    rec.adopted_from.as_deref(),
+                    |link| (link == claude_session_id).then_some(()),
+                    &mut predecessor_of,
+                )
+                .is_some()
+            })
+            .filter_map(bound_live)
+            .collect(),
+    )
+    .ok()
+    .flatten()
 }
 
 /// TARGET role: a SOURCE device presents a coord-minted grant for one of our
@@ -6071,15 +6314,27 @@ async fn handle_terminal_attach(api_state: &Arc<ApiState>, data: &Value) -> Opti
         }));
     };
 
+    let (registrar, store) = relay_session_maps(api_state);
     // Parse → lookup (source device cross-checked) → resolve → bind, all in
-    // the pure seam so each refusal is unit-tested; `Err` is the frame.
+    // the pure seam so each refusal is unit-tested; `Err` is the frame. The
+    // bind runs under the remote-create reaper's lock and marks the terminal
+    // attached there, atomically against a create grant's close admission.
+    let reaper = crate::mcp::remote_create_reaper::reaper();
     let gate = || {
         admit_terminal_attach(
             grants(),
+            &reaper,
             crate::settings::get_remote_attach_preference,
             data,
             now_epoch_secs(),
-            |session_id| resolve_local_terminal(tm.as_ref(), session_id),
+            |session_id| {
+                resolve_local_terminal(
+                    tm.as_ref(),
+                    registrar.as_deref(),
+                    store.as_deref(),
+                    session_id,
+                )
+            },
         )
     };
     let (block, grant, terminal_id, session) = match gate() {
@@ -6159,8 +6414,8 @@ async fn handle_terminal_attach(api_state: &Arc<ApiState>, data: &Value) -> Opti
         }
     };
 
-    // Bound: this terminal is owned, so the attach-deadline reaper spares it.
-    crate::mcp::remote_create_reaper::mark_attached(&terminal_id);
+    // Bound, and already marked ever-attached by the bind above: the
+    // attach-deadline reaper spares it and its create grant can no longer close it.
 
     // A fresh binding starts with an open gate: a stale pause from an earlier
     // attachment under the same grant must not silence the new one. (Phase 5.)
@@ -6226,9 +6481,35 @@ async fn handle_terminal_attach(api_state: &Arc<ApiState>, data: &Value) -> Opti
     }))
 }
 
+/// TARGET role: admit a `terminal_end` frame against this runner's live
+/// panes — `admit_terminal_end` with the relay's own resolver
+/// ([`resolve_local_terminal`] over the registrar and lifecycle store). This is
+/// the whole admission half of [`handle_terminal_end`], split out so it can be
+/// exercised without an `AppHandle`.
+fn admit_relay_terminal_end<P>(
+    grants: &crate::mcp::remote_terminal::RemoteAttachGrants,
+    preference: P,
+    data: &Value,
+    now: u64,
+    tm: &crate::terminal::TerminalManager,
+    registrar: Option<&crate::claude_session::coord_register::AiCoordRegistrar>,
+    store: Option<&crate::session::session_lifecycle_store::SessionLifecycleStore>,
+) -> Result<
+    crate::mcp::remote_terminal::AdmittedEnd<Arc<crate::terminal::session::TerminalSession>>,
+    Value,
+>
+where
+    P: FnOnce() -> crate::settings::AcceptRemoteAttach,
+{
+    crate::mcp::remote_terminal::admit_terminal_end(grants, preference, data, now, |session_id| {
+        resolve_local_terminal(tm, registrar, store, session_id)
+    })
+}
+
 /// TARGET role: a SOURCE device asks to END one of our sessions under its
 /// attach grant (plan `2026-09-30-close-remote-sessions-from-the-local-runner`,
-/// Phase 1). Runs in its own task (`runs_off_read_loop`).
+/// Phase 1), or to close the terminal its create grant just spawned
+/// ([`end_under_create_grant`]). Runs in its own task (`runs_off_read_loop`).
 ///
 /// Admission is `admit_terminal_end`: the terminal comes from the grant ROW's
 /// session, a named terminal is only compared, a missing `remote` block is
@@ -6243,8 +6524,7 @@ async fn handle_terminal_attach(api_state: &Arc<ApiState>, data: &Value) -> Opti
 /// `remote_terminal_exit`), and that this handler does not duplicate.
 async fn handle_terminal_end(api_state: &Arc<ApiState>, data: &Value) -> Option<Value> {
     use crate::mcp::remote_terminal::{
-        admit_terminal_end, grants, now_epoch_secs, terminal_ended_frame, AdmittedEnd, EndOutcome,
-        EndVerdict,
+        grants, now_epoch_secs, terminal_ended_frame, AdmittedEnd, EndOutcome, EndVerdict,
     };
     let Some(tm) = api_state
         .app_handle
@@ -6259,14 +6539,23 @@ async fn handle_terminal_end(api_state: &Arc<ApiState>, data: &Value) -> Option<
         }));
     };
     let force = data.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+    let (registrar, store) = relay_session_maps(api_state);
+
+    // Before the attach gate, which must never see a create block: it would
+    // refuse it `grant_unknown` and spend a coord re-read of the attach feed.
+    if carries_create_grant(data) {
+        return Some(end_under_create_grant(tm, data, force).await);
+    }
 
     let gate = || {
-        admit_terminal_end(
+        admit_relay_terminal_end(
             grants(),
             crate::settings::get_remote_attach_preference,
             data,
             now_epoch_secs(),
-            |session_id| resolve_local_terminal(tm.as_ref(), session_id),
+            tm.as_ref(),
+            registrar.as_deref(),
+            store.as_deref(),
         )
     };
     let admitted = match gate() {
@@ -6358,6 +6647,73 @@ async fn handle_terminal_end(api_state: &Arc<ApiState>, data: &Value) -> Option<
     ))
 }
 
+/// The create-grant arm of `terminal_end`: the source closes the terminal its
+/// spent grant spawned (plan
+/// `2026-09-23-remote-create-residuals-after-coord-registration-confirm`,
+/// Phase 2). The tombstone is local, so a refusal has no coord list to re-read.
+async fn end_under_create_grant(
+    tm: Arc<crate::terminal::TerminalManager>,
+    data: &Value,
+    force: bool,
+) -> Value {
+    use crate::mcp::remote_terminal::{
+        admit_create_grant_end, create_grants, grants, now_epoch_secs, terminal_ended_frame,
+        EndOutcome, EndVerdict,
+    };
+    // Admission COUNTS this close in under the reaper's lock, so from here no
+    // attach can bind the terminal before the close below (review finding 1).
+    // The claim is dropped on every way out of this fn — a refusal, any
+    // outcome, a panic or a cancelled task — so it can never strand the
+    // terminal unattachable (re-review finding 1a).
+    let reaper = crate::mcp::remote_create_reaper::reaper();
+    let (block, claim) = match admit_create_grant_end(
+        grants(),
+        create_grants(),
+        &reaper,
+        crate::settings::get_remote_create_preference,
+        qontinui_runner_lib::pair::read_paired_user_id_from_disk,
+        data,
+        now_epoch_secs(),
+    ) {
+        Ok(admitted) => admitted,
+        Err(frame) => return frame,
+    };
+    let terminal_id = claim.terminal_id().to_string();
+    if tm.get(&terminal_id).is_none() {
+        claim.settle(true);
+        let verdict = EndVerdict {
+            outcome: EndOutcome::NotFound,
+            via: None,
+            reason: Some("terminal_gone: the terminal this grant created is already gone".into()),
+        };
+        return terminal_ended_frame(data, None, Some(&terminal_id), &verdict);
+    }
+    info!(
+        grant_jti = %block.grant_jti,
+        source_device = ?block.source_device_id,
+        terminal_id = %terminal_id,
+        force,
+        "remote end: admitted under a create grant — closing the terminal it spawned"
+    );
+    // `ended` / `not_found` make the terminal unattachable for good; any other
+    // outcome — `end_already_running` included — only ends this claim, and the
+    // terminal stays unattachable exactly while another admitted close is in
+    // flight (re-review findings 1a/1b).
+    let verdict = crate::mcp::remote_create_reaper::run_create_close(claim, || {
+        end_admitted_terminal(tm, &terminal_id, force)
+    })
+    .await;
+    info!(
+        grant_jti = %block.grant_jti,
+        terminal_id = %terminal_id,
+        outcome = verdict.outcome.as_str(),
+        via = ?verdict.via,
+        reason = ?verdict.reason,
+        "remote end: answered"
+    );
+    terminal_ended_frame(data, None, Some(&terminal_id), &verdict)
+}
+
 /// TARGET role: end one ADMITTED remote end's terminal on `tm`. This is
 /// everything [`handle_terminal_end`] does after the grant admitted the frame.
 ///
@@ -6393,6 +6749,7 @@ pub(crate) async fn end_admitted_terminal(
                         &graceful_id,
                         crate::terminal::graceful_exit::DEFAULT_DEADLINE,
                         None,
+                        crate::terminal::graceful_exit::ChildExemptions::none(),
                     )
                     .await
             },
@@ -7388,48 +7745,65 @@ mod tests {
 
     /// Plan `2026-09-17-retire-the-runner-origin-guard-dev-grace` Phase 5
     /// acceptance test 3: a relayed frame carrying the browser's ambient
-    /// credentials (`cookie`, `authorization`) must reach the loopback
-    /// self-call with neither, while an ordinary header still passes — so the
-    /// test cannot go green by stripping every header.
+    /// credentials must reach the loopback self-call with none of them, while
+    /// an ordinary header still passes — so the test cannot go green by
+    /// stripping every header. Covers the whole web-side
+    /// `_AMBIENT_CREDENTIAL_REQUEST_HEADERS` set, sent mixed-case.
     #[tokio::test]
     async fn relay_strips_ambient_cookie_and_authorization() {
+        const AMBIENT: &[(&str, &str)] = &[
+            ("Cookie", "access_token=x"),
+            ("Authorization", "Bearer y"),
+            ("Proxy-Authorization", "Basic z"),
+            ("X-CSRF-Token", "csrf"),
+            ("X-Machine-Key", "mk"),
+            ("X-Device-Machine-Key", "dmk"),
+            ("X-Coord-Admin-Secret", "admin"),
+        ];
         async fn handler(headers: HeaderMap) -> impl axum::response::IntoResponse {
-            let body = json!({
-                "cookie": headers.get("cookie").and_then(|v| v.to_str().ok()),
-                "authorization": headers.get("authorization").and_then(|v| v.to_str().ok()),
-                "x_test": headers.get("x-test").and_then(|v| v.to_str().ok()),
-            })
-            .to_string();
-            (AxumStatus::OK, [("content-type", "application/json")], body)
+            let mut body = serde_json::Map::new();
+            for (name, _) in AMBIENT {
+                let lk = name.to_ascii_lowercase();
+                let v = headers.get(lk.as_str()).and_then(|v| v.to_str().ok());
+                body.insert(lk, json!(v));
+            }
+            body.insert(
+                "x_test".into(),
+                json!(headers.get("x-test").and_then(|v| v.to_str().ok())),
+            );
+            (
+                AxumStatus::OK,
+                [("content-type", "application/json")],
+                Value::Object(body).to_string(),
+            )
         }
         // `/status` is RELAY_ALLOWED (see the GET round trip above).
         let base = spawn_test_server(Router::new().route("/status", get(handler))).await;
+        let mut headers = serde_json::Map::new();
+        for (name, value) in AMBIENT {
+            headers.insert((*name).into(), json!(value));
+        }
+        headers.insert("x-test".into(), json!("kept"));
         let env = json!({
             "type": "http_request",
             "request_id": "req-ambient-cred",
             "method": "GET",
             "path": "/status",
-            "headers": {
-                "Cookie": "access_token=x",
-                "Authorization": "Bearer y",
-                "x-test": "kept"
-            },
+            "headers": Value::Object(headers),
             "body_b64": ""
         });
         let reply = relay_http_to_base(&base, &env).await;
         assert_eq!(reply["status"], 200);
         let body = String::from_utf8(b64_decode(reply["body_b64"].as_str().unwrap())).unwrap();
         let parsed: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(
-            parsed["cookie"],
-            Value::Null,
-            "cookie must not reach the loopback call"
-        );
-        assert_eq!(
-            parsed["authorization"],
-            Value::Null,
-            "authorization must not reach the loopback call"
-        );
+        for (name, _) in AMBIENT {
+            let lk = name.to_ascii_lowercase();
+            assert_eq!(
+                parsed[lk.as_str()],
+                Value::Null,
+                "{lk} must not reach the loopback call"
+            );
+        }
         assert_eq!(parsed["x_test"], "kept", "ordinary headers still forwarded");
     }
 
@@ -7719,10 +8093,11 @@ mod tests {
             ("GET", "/files"),
             ("POST", "/files/read"),
             ("DELETE", "/task-runs/abc"),
-            // Beside the UI Bridge dashboard's two reads: the other method on
-            // each, and the action invocation the component read advertises.
+            // Beside the UI Bridge dashboard's three reads: the other method
+            // on each, and the action invocation the component read advertises.
             ("POST", "/ui-bridge/control/components"),
             ("GET", "/ui-bridge/control/page-health"),
+            ("GET", "/ui-bridge/control/visibility"),
             ("POST", "/ui-bridge/control/component/x1/action/delete"),
         ] {
             let env = json!({
@@ -8789,7 +9164,7 @@ mod remote_admission_tests {
     //! calls — not the constants. A test that only reads the lists would pass
     //! on a build where the `if` in `handle_relay_command` had been deleted.
 
-    use super::remote_frame_admitted;
+    use super::{carries_create_grant, remote_frame_admitted, REMOTE_TARGET_ADMITTED};
     use serde_json::json;
 
     fn with_grant(v: serde_json::Value) -> serde_json::Value {
@@ -8889,11 +9264,21 @@ mod remote_admission_tests {
         );
     }
 
-    /// …and buys nothing else on this device. A create grant is not an attach
-    /// grant: it may not type into, resize, close, read or attach a PTY, and
-    /// it may not enumerate them either.
+    /// …and buys nothing else on this device but the one close (`terminal_end`,
+    /// held to its own terminal by `admit_create_grant_end`). A create grant is
+    /// not an attach grant: it may not type into, resize, read or attach a PTY,
+    /// and it may not enumerate them either. `terminal_close` stays refused: it
+    /// is the attach grant's door, and the relay forwards none from a source.
     #[test]
     fn a_create_grant_drives_no_existing_terminal() {
+        for t in REMOTE_TARGET_ADMITTED {
+            let admitted = remote_frame_admitted(t, &with_create_grant(json!({ "type": t })));
+            assert_eq!(
+                admitted,
+                matches!(*t, "terminal_create" | "terminal_end"),
+                "`{t}` under a CREATE grant"
+            );
+        }
         for t in [
             "terminal_input",
             "terminal_resize",
@@ -9072,6 +9457,127 @@ mod remote_admission_tests {
         assert!(!remote_frame_admitted("terminal_create", &malformed));
         let not_an_object = json!({ "type": "terminal_create", "remote": 7 });
         assert!(!remote_frame_admitted("terminal_create", &not_an_object));
+    }
+
+    /// A malformed block on `terminal_end` passes this predicate (its own gate
+    /// refuses it), so what matters is that it reads as no create grant and
+    /// takes the ATTACH arm, whichever way it spells `kind`.
+    #[test]
+    fn a_malformed_block_never_reaches_the_create_arm() {
+        for remote in [
+            json!({ "grant_jti": "", "kind": "create" }),
+            json!({ "kind": "create" }),
+            json!(7),
+            json!({ "grant_jti": "j", "kind": "Create" }),
+        ] {
+            let frame = json!({ "type": "terminal_end", "remote": remote });
+            assert!(!carries_create_grant(&frame), "{frame}");
+        }
+        assert!(!carries_create_grant(&json!({ "type": "terminal_end" })));
+        assert!(carries_create_grant(&with_create_grant(
+            json!({ "type": "terminal_end" })
+        )));
+    }
+
+    /// `handle_terminal_end` cannot run without an `ApiState`, so its wiring is
+    /// pinned by shape: the create branch exists, comes before the attach gate,
+    /// and admits through `admit_create_grant_end` with the reaper's read. Both
+    /// arms then share the one driver.
+    #[test]
+    fn terminal_end_branches_to_the_create_arm_before_the_attach_gate() {
+        const SRC: &str = include_str!("backend_relay.rs");
+        let body = |sig: &str| {
+            let start = SRC.find(sig).unwrap_or_else(|| panic!("`{sig}` not found"));
+            let rest = SRC.get(start + sig.len()..).expect("char boundary");
+            rest.get(..rest.find("\nasync fn ").unwrap_or(rest.len()))
+                .expect("char boundary")
+        };
+        let end = body("async fn handle_terminal_end(");
+        let branch = end
+            .find("if carries_create_grant(data) {")
+            .expect("handle_terminal_end must branch on the block kind");
+        let arm = end
+            .find("end_under_create_grant(tm, data, force)")
+            .expect("the create branch must run the create arm");
+        // The attach gate is entered through `admit_relay_terminal_end`, the
+        // seam that resolves a coord id (shell or terminal_claude) to its pane
+        // and then runs `admit_terminal_end`.
+        let attach_gate = end
+            .find("admit_relay_terminal_end(")
+            .expect("the attach gate");
+        assert!(branch < arm && arm < attach_gate, "create branch first");
+        let seam = SRC
+            .find("fn admit_relay_terminal_end<")
+            .and_then(|start| SRC.get(start..))
+            .and_then(|rest| rest.get(..rest.find("\n}\n").unwrap_or(rest.len())))
+            .expect("admit_relay_terminal_end is defined");
+        assert!(
+            seam.contains("admit_terminal_end("),
+            "the seam must still run the attach gate"
+        );
+        assert!(
+            end.contains("end_admitted_terminal("),
+            "attach arm's driver"
+        );
+
+        let create = body("async fn end_under_create_grant(");
+        let admit = create
+            .find("admit_create_grant_end(")
+            .expect("the create arm must admit through admit_create_grant_end");
+        // Retention guard: dropping the reaper turns the refusal and the
+        // closing mark off. Read with whitespace removed, so a reformat cannot
+        // break it, and `&reaper` must sit INSIDE the admission call's arguments.
+        let compact =
+            |text: &str| -> String { text.chars().filter(|c| !c.is_whitespace()).collect() };
+        let call = create
+            .get(admit..)
+            .and_then(|rest| rest.find(") {").and_then(|end| rest.get(..end)))
+            .expect("the admission call's argument span");
+        assert!(
+            compact(create).contains("letreaper=crate::mcp::remote_create_reaper::reaper();")
+                && compact(call).contains(",&reaper,"),
+            "the ever-attached refusal must claim through the reaper"
+        );
+        // The claim is settled by the driver's verdict, never left behind.
+        let run = create
+            .find("remote_create_reaper::run_create_close(claim,")
+            .expect("the close runs under its claim");
+        assert!(admit < run, "admission before the claimed close");
+        let driver = create
+            .find("end_admitted_terminal(")
+            .expect("the one driver");
+        assert!(admit < driver, "admission before the driver");
+        assert!(
+            !create.contains("catch_up_now_within("),
+            "no feed re-read fires for a close under a create grant"
+        );
+        let shared = body("pub(crate) async fn end_admitted_terminal(");
+        assert!(shared.contains("single_flight_end(") && shared.contains("execute_terminal_end("));
+    }
+
+    /// Retention guard: without the bind every close is refused `grant_unknown`
+    /// and the feature silently degrades to the reaper. It must also precede the
+    /// reply, or the source could learn an id the tombstone does not hold.
+    #[test]
+    fn a_remote_create_binds_its_tombstone_before_the_reply() {
+        const SRC: &str = include_str!("backend_relay.rs");
+        let start = SRC
+            .find("async fn handle_terminal_create(")
+            .expect("handle_terminal_create");
+        let create = SRC.get(start..).expect("char boundary");
+        let settle = create
+            .find("settle_remote_registration(")
+            .expect("registration settle");
+        let bind = create
+            .find("bind_spent_terminal(&create.block.grant_jti, &info.id)")
+            .expect("handle_terminal_create must bind the spent grant to its terminal");
+        let reply = create
+            .find("\"type\": \"terminal_created\",")
+            .expect("created reply");
+        assert!(
+            settle < bind && bind < reply,
+            "bind after settle, before the reply"
+        );
     }
 }
 
@@ -9342,20 +9848,17 @@ mod relay_routing_tests {
         assert_eq!(data, frame);
     }
 
-    /// `terminal_end` ends a session: admitted under an ATTACH grant (D3 — its
-    /// holder can already type `/exit`), never under a CREATE grant, which
-    /// buys exactly one spawn.
+    /// `terminal_end` is admitted under an ATTACH grant (D3 — its holder can
+    /// already type `/exit`) and under a CREATE grant, whose handler arm holds it
+    /// to the one unattached terminal it spawned.
     #[test]
-    fn terminal_end_is_admitted_under_an_attach_grant_only() {
+    fn terminal_end_is_admitted_under_either_grant() {
         let mut attach = json!({ "type": "terminal_end", "force": false });
         attach["remote"] = attach_block();
         assert!(super::remote_frame_admitted("terminal_end", &attach));
         let mut create = json!({ "type": "terminal_end", "force": true });
         create["remote"] = create_block();
-        assert!(
-            !super::remote_frame_admitted("terminal_end", &create),
-            "a create grant must not end a session"
-        );
+        assert!(super::remote_frame_admitted("terminal_end", &create));
     }
 
     /// A graceful end waits up to 60 s for `claude` to leave — longer than the
@@ -9636,7 +10139,7 @@ mod relay_writer_tests {
             // Drain everything.
             gate.release(RELAY_BULK_LANE_CAPACITY + 1);
             assert!(
-                settle(|| gate.written_len() >= RELAY_BULK_LANE_CAPACITY + 1).await,
+                settle(|| gate.written_len() > RELAY_BULK_LANE_CAPACITY).await,
                 "round {round}: writer should drain every queued frame once the \
                  sink unblocks"
             );
@@ -9697,7 +10200,7 @@ mod relay_writer_tests {
                 .count()
         };
         assert!(
-            settle(|| bulk_count() >= OUT + 1).await,
+            settle(|| bulk_count() > OUT).await,
             "expected {} bulk frames, saw {}",
             OUT + 1,
             bulk_count()
@@ -9877,7 +10380,7 @@ mod relay_writer_tests {
         writer.try_send_reply(text("terminal_attached")).unwrap();
 
         gate.release(RELAY_BULK_LANE_CAPACITY + 1);
-        assert!(settle(|| gate.written_len() >= RELAY_BULK_LANE_CAPACITY + 1).await);
+        assert!(settle(|| gate.written_len() > RELAY_BULK_LANE_CAPACITY).await);
 
         let written = gate.written();
         let reply_at = written
@@ -10224,7 +10727,16 @@ mod relay_create_drain_message_tests {
             unknown.starts_with("coord drain state unknown (coord drain state not read yet) — "),
             "{unknown}"
         );
-        for message in [&drained, &unknown] {
+        let role = match crate::coord_drain_state::role_gate(
+            Some(crate::coord_drain_state::DispatchRole::CiNode),
+            SpawnOrigin::Unknown,
+        ) {
+            DrainGate::Defer { reason, .. } => relay_create_drain_message(&reason),
+            DrainGate::Allow => panic!("ci_node should defer a relay create"),
+        };
+        assert!(role.contains("ci_node"), "{role}");
+        assert!(!role.contains("runs only if"), "{role}");
+        for message in [&drained, &unknown, &role] {
             assert!(message.contains("refused, not queued"), "{message}");
             assert!(message.contains("nothing was spawned"), "{message}");
             assert!(!message.contains("runs once"), "{message}");
@@ -10656,6 +11168,61 @@ mod egress_tests {
         let reply = relay_http_to_base(
             &counter.http_base(),
             &dashboard_frame("POST", "/ui-bridge/control/page-health"),
+        )
+        .await;
+        assert_eq!(
+            reply["status"], 503,
+            "the loopback stub's own answer: {reply}"
+        );
+        assert!(counter.wait_for(1, Duration::from_secs(5)) >= 1);
+    }
+
+    /// The occlusion sweep is refused with the terminal-stream verdict while
+    /// a bound tenant refuses that flow, in every spelling the allow-list
+    /// admits, and the loopback API is never called. Fails if the sweep drops
+    /// out of the egress match, or if the match stops normalising the path
+    /// the way the allow-list does.
+    #[tokio::test]
+    async fn the_occlusion_sweep_is_refused_while_a_bound_tenant_refuses_terminal_streaming() {
+        use crate::egress::test_support::{fake_bound_tenants, pin_for};
+        let tenant = uuid::Uuid::from_u128(DASHBOARD_TENANT);
+        let _on = pin(Flow::TerminalStream, Level::On);
+        let _bound = fake_bound_tenants(vec![tenant]);
+        let _off = pin_for(Flow::TerminalStream, tenant, Level::Off);
+        let counter = crate::egress::test_support::ConnCounter::start();
+
+        for path in crate::mcp::relay_path_policy::tests::VISIBILITY_SPELLINGS {
+            let reply =
+                relay_http_to_base(&counter.http_base(), &dashboard_frame("POST", path)).await;
+            assert_eq!(
+                status_and_flow(&reply),
+                (409, Some("terminal_stream".into())),
+                "{path}: {reply}"
+            );
+        }
+        assert_eq!(
+            counter.count(),
+            0,
+            "a refused read never reaches the loopback API"
+        );
+    }
+
+    /// The occlusion sweep reaches the loopback API once every bound tenant
+    /// permits terminal streaming: the refusal test's setup with the pin
+    /// flipped on. Fails if the sweep is refused whatever the tenants say,
+    /// or is off `RELAY_ALLOWED` (a 403).
+    #[tokio::test]
+    async fn the_occlusion_sweep_reaches_the_loopback_api_once_every_bound_tenant_permits() {
+        use crate::egress::test_support::{fake_bound_tenants, pin_for};
+        let tenant = uuid::Uuid::from_u128(DASHBOARD_TENANT);
+        let _on = pin(Flow::TerminalStream, Level::On);
+        let _bound = fake_bound_tenants(vec![tenant]);
+        let _permit = pin_for(Flow::TerminalStream, tenant, Level::On);
+        let counter = crate::egress::test_support::ConnCounter::start();
+
+        let reply = relay_http_to_base(
+            &counter.http_base(),
+            &dashboard_frame("POST", "/ui-bridge/control/visibility"),
         )
         .await;
         assert_eq!(
@@ -11290,6 +11857,28 @@ mod remote_end_close_authority_tests {
             .is_some_and(|r| r.starts_with("no_close_authority")));
     }
 
+    /// R0c-2 at the relay: its graceful end answers `NoLiveClaude` with an
+    /// ordinary kill-close, so a pane running an npm-installed `claude` — a
+    /// `node` process only its Claude Code registry record names — was KILLED
+    /// as a bare shell. It is now refused `no_close_authority` like any live
+    /// `claude`: nothing typed, nothing killed, the pane still registered.
+    #[tokio::test(start_paused = true)]
+    async fn a_graceful_remote_end_never_closes_an_npm_installed_claude_as_a_bare_shell() {
+        let pane = crate::terminal::session::tests::npm_claude_pane();
+        let tm = Arc::new(TerminalManager::new());
+        let id = "relay-end-r0c2-npm";
+        tm.insert_for_test(id, pane.session.clone());
+
+        let verdict = end_admitted_terminal(tm.clone(), id, false).await;
+
+        assert_eq!(verdict.outcome, EndOutcome::Refused, "{verdict:?}");
+        let reason = verdict.reason.clone().unwrap_or_default();
+        assert!(reason.starts_with("no_close_authority"), "{reason}");
+        assert!(pane.typed().is_empty(), "typed into a live claude");
+        assert_eq!(pane.kills(), 0, "an npm-installed claude was killed");
+        assert!(tm.get(id).is_some(), "the live claude's pane was closed");
+    }
+
     /// The other half of R0a's placement: a pane with NO live `claude` needs
     /// no authority. The relay still answers `NoLiveClaude` by closing the bare
     /// shell, exactly as before.
@@ -11309,5 +11898,346 @@ mod remote_end_close_authority_tests {
             "typing into a bare shell is not a no-op"
         );
         assert!(tm.get(id).is_none(), "the bare shell was closed");
+    }
+}
+
+#[cfg(test)]
+mod resolve_local_terminal_tests {
+    //! Plan `2026-11-05-remote-session-end-reaches-the-target-but-cannot-end-a-real-session`
+    //! Phase 2: the target resolves EVERY coord row bound to a terminal — the
+    //! pane's `terminal_shell` mirror id and the `terminal_claude` row the
+    //! registrar holds for the Claude session inside it.
+    use super::{admit_relay_terminal_end, resolve_coord_terminal_id};
+    use crate::claude_session::coord_register::AiCoordRegistrar;
+    use crate::mcp::remote_terminal::{AdmittedEnd, AttachGrant, RemoteAttachGrants};
+    use crate::session::local_store::OutboxWriter;
+    use crate::session::session_lifecycle_store::{
+        test_open_record, SessionLifecycleStore, TerminalSessionRecord, ORIGIN_AUTHORITATIVE,
+        ORIGIN_RECONCILED,
+    };
+    use crate::settings::AcceptRemoteAttach;
+    use crate::terminal::TerminalManager;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    const SHELL_ROW: Uuid = Uuid::from_u128(0x01a1aa98_04d2_7000_8000_000000000001);
+    const CLAUDE_ROW: Uuid = Uuid::from_u128(0xd1cb9500_0000_7000_8000_000000000002);
+    const UNKNOWN_ROW: Uuid = Uuid::from_u128(0xdead_0000_7000_8000_000000000003);
+
+    /// An open record for `csid` on `terminal`, bound the way a real Claude
+    /// session's record is (authoritative origin, confirmed by its hook).
+    fn bound(csid: &str, terminal: &str) -> TerminalSessionRecord {
+        TerminalSessionRecord {
+            terminal_id: terminal.to_string(),
+            origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
+            confirmed_at: Some(1),
+            ..test_open_record(csid)
+        }
+    }
+
+    /// The pure seam over one pane `pane` (pinned `P`, shell row
+    /// [`SHELL_ROW`]), the registrar index `index`, and `records`.
+    fn resolve(
+        index: &HashMap<Uuid, String>,
+        records: &[TerminalSessionRecord],
+        coord: Uuid,
+    ) -> Option<String> {
+        let by_id: HashMap<String, TerminalSessionRecord> = records
+            .iter()
+            .map(|r| (r.claude_session_id.clone(), r.clone()))
+            .collect();
+        resolve_coord_terminal_id(
+            [("pane", "P", Some(SHELL_ROW))].into_iter(),
+            |c| index.get(c).cloned(),
+            || {
+                records
+                    .iter()
+                    .filter(|r| r.state == "open")
+                    .cloned()
+                    .collect()
+            },
+            |id| by_id.get(id).and_then(|r| r.adopted_from.clone()),
+            coord,
+        )
+    }
+
+    /// A pane carrying a shell row and a claude row resolves under BOTH ids,
+    /// and an id it does not carry resolves nothing (`session_not_local`).
+    #[test]
+    fn a_pane_with_a_shell_row_and_a_claude_row_resolves_under_both_ids() {
+        // A bare `claude` typed into the pane: its own harness id `C`, its
+        // record bound to the pane.
+        let index = HashMap::from([(CLAUDE_ROW, "C".to_string())]);
+        let records = [bound("C", "pane")];
+        assert_eq!(
+            resolve(&index, &records, SHELL_ROW).as_deref(),
+            Some("pane")
+        );
+        assert_eq!(
+            resolve(&index, &records, CLAUDE_ROW).as_deref(),
+            Some("pane")
+        );
+        assert_eq!(resolve(&index, &records, UNKNOWN_ROW), None);
+    }
+
+    /// The Claude session running under the pane's own spawn-time pin
+    /// resolves through the pin, with no record needed.
+    #[test]
+    fn a_claude_row_for_the_panes_pinned_session_resolves_through_the_pin() {
+        let index = HashMap::from([(CLAUDE_ROW, "P".to_string())]);
+        assert_eq!(resolve(&index, &[], CLAUDE_ROW).as_deref(), Some("pane"));
+    }
+
+    /// Two live panes and the registrar index `index`, over `records`: pane
+    /// `A` pinned `C` (Claude exited there, the shell lives on) and pane `B`
+    /// with no pin.
+    fn resolve_two_panes(
+        index: &HashMap<Uuid, String>,
+        records: &[TerminalSessionRecord],
+        coord: Uuid,
+    ) -> Option<String> {
+        resolve_coord_terminal_id(
+            [("A", "C", None), ("B", "", None)].into_iter(),
+            |c| index.get(c).cloned(),
+            || records.to_vec(),
+            |_| None,
+            coord,
+        )
+    }
+
+    /// `C` was resumed in pane `B` while `A` still carries the spawn-time pin
+    /// to `C`: the open record — where the session runs now — wins, so a
+    /// remote end never closes the stale pane.
+    #[test]
+    fn an_open_record_outranks_a_stale_pin_on_another_pane() {
+        let index = HashMap::from([(CLAUDE_ROW, "C".to_string())]);
+        assert_eq!(
+            resolve_two_panes(&index, &[bound("C", "B")], CLAUDE_ROW).as_deref(),
+            Some("B")
+        );
+        // An own open record naming a pane that is gone still outranks the
+        // pin: it says the session is not in `A`.
+        assert_eq!(
+            resolve_two_panes(&index, &[bound("C", "gone")], CLAUDE_ROW),
+            None
+        );
+        // An own record not confirmed yet, on the pinned pane, agrees with the
+        // pin; the same record on another pane still vetoes it.
+        let mut unconfirmed = bound("C", "A");
+        unconfirmed.confirmed_at = None;
+        assert_eq!(
+            resolve_two_panes(&index, &[unconfirmed.clone()], CLAUDE_ROW).as_deref(),
+            Some("A")
+        );
+        unconfirmed.terminal_id = "B".to_string();
+        assert_eq!(resolve_two_panes(&index, &[unconfirmed], CLAUDE_ROW), None);
+        // With no record, the pin is still the answer.
+        assert_eq!(
+            resolve_two_panes(&index, &[], CLAUDE_ROW).as_deref(),
+            Some("A")
+        );
+    }
+
+    /// Two live panes claimed by one session's records (its own, or two
+    /// `/clear` successors) are refused rather than picked between.
+    #[test]
+    fn two_live_candidates_resolve_nothing() {
+        let index = HashMap::from([(CLAUDE_ROW, "C".to_string())]);
+        assert_eq!(
+            resolve_two_panes(&index, &[bound("C", "A"), bound("C", "B")], CLAUDE_ROW),
+            None
+        );
+        // Successors only: the index maps to `X`, which no record or pin
+        // names directly, so only the `adopted_from` arm is reached.
+        let index_x = HashMap::from([(CLAUDE_ROW, "X".to_string())]);
+        let successor = |csid: &str, pane: &str| {
+            let mut rec = bound(csid, pane);
+            rec.adopted_from = Some("X".to_string());
+            rec
+        };
+        assert_eq!(
+            resolve_two_panes(&index_x, &[successor("D", "A")], CLAUDE_ROW).as_deref(),
+            Some("A")
+        );
+        assert_eq!(
+            resolve_two_panes(
+                &index_x,
+                &[successor("D", "A"), successor("E", "B")],
+                CLAUDE_ROW
+            ),
+            None
+        );
+    }
+
+    /// Two live panes sharing one shell mirror row (two same-titled tabs in one
+    /// cwd resume one pane-store row) resolve nothing, rather than whichever
+    /// pane the snapshot lists first.
+    #[test]
+    fn a_shell_row_shared_by_two_live_panes_resolves_nothing() {
+        let shared = resolve_coord_terminal_id(
+            [("A", "", Some(SHELL_ROW)), ("B", "", Some(SHELL_ROW))].into_iter(),
+            |_| None,
+            Vec::new,
+            |_| None,
+            SHELL_ROW,
+        );
+        assert_eq!(shared, None);
+    }
+
+    /// An empty Claude id from the registrar names no pane — not every
+    /// unpinned one.
+    #[test]
+    fn an_empty_claude_id_resolves_nothing() {
+        let index = HashMap::from([(CLAUDE_ROW, String::new())]);
+        let resolved = resolve_coord_terminal_id(
+            [("B", "", None)].into_iter(),
+            |c| index.get(c).cloned(),
+            Vec::new,
+            |_| None,
+            CLAUDE_ROW,
+        );
+        assert_eq!(resolved, None);
+    }
+
+    /// After `/clear` the pane runs a successor `D` adopted from `C`; `C`'s
+    /// claude row still resolves to the pane through `adopted_from`, across
+    /// more than one hop.
+    #[test]
+    fn a_claude_row_resolves_through_its_clear_successor() {
+        let index = HashMap::from([(CLAUDE_ROW, "C".to_string())]);
+        let mut c = bound("C", "pane");
+        c.state = "closed".to_string();
+        let mut d = bound("D", "pane");
+        d.adopted_from = Some("C".to_string());
+        d.state = "closed".to_string();
+        let mut e = bound("E", "pane");
+        e.adopted_from = Some("D".to_string());
+        assert_eq!(
+            resolve(&index, &[c, d, e], CLAUDE_ROW).as_deref(),
+            Some("pane")
+        );
+    }
+
+    /// A record that may not be acted on by its own binding resolves
+    /// nothing: closed, an mtime-guessed (`reconciled`) binding, an
+    /// unconfirmed one, or one naming a terminal that is not live here.
+    #[test]
+    fn an_unbound_closed_or_dead_record_does_not_resolve_a_claude_row() {
+        let index = HashMap::from([(CLAUDE_ROW, "C".to_string())]);
+        let mut closed = bound("C", "pane");
+        closed.state = "closed".to_string();
+        let mut guessed = bound("C", "pane");
+        guessed.origin = Some(ORIGIN_RECONCILED.to_string());
+        let mut provisional = bound("C", "pane");
+        provisional.confirmed_at = None;
+        let elsewhere = bound("C", "gone-pane");
+        for rec in [closed, guessed, provisional, elsewhere] {
+            assert_eq!(
+                resolve(&index, std::slice::from_ref(&rec), CLAUDE_ROW),
+                None,
+                "{rec:?}"
+            );
+        }
+    }
+
+    /// The deleted arm: a coord id is never compared with a pinned id. A
+    /// pane whose pin happens to spell the coord id's text does not resolve
+    /// it — the two are different id spaces.
+    #[test]
+    fn a_pinned_id_is_not_matched_against_a_coord_id() {
+        let pin = CLAUDE_ROW.to_string();
+        assert_eq!(
+            resolve_coord_terminal_id(
+                [("pane", pin.as_str(), None)].into_iter(),
+                |_| None,
+                Vec::new,
+                |_| None,
+                CLAUDE_ROW,
+            ),
+            None
+        );
+    }
+
+    /// ARMING — production wiring, entered where `handle_terminal_end` enters:
+    /// `admit_terminal_end` with `resolve_local_terminal` over a real
+    /// `TerminalManager`, `AiCoordRegistrar` and `SessionLifecycleStore`. A
+    /// grant for the pane's `terminal_claude` row is admitted onto that pane;
+    /// before Phase 2 it answered `NotLocal` (`session_not_local`).
+    #[test]
+    fn a_terminal_claude_coord_id_resolves_to_its_pane_on_the_target() {
+        let _env = crate::test_env::env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let dir = tempfile::tempdir().unwrap();
+
+        let pane = crate::terminal::session::tests::bare_shell_pane();
+        pane.session.set_coord_session_id(SHELL_ROW);
+        let tm = TerminalManager::new();
+        tm.insert_for_test("pane-b4dd", pane.session.clone());
+
+        let outbox = Arc::new(OutboxWriter::open(dir.path().join("outbox.jsonl")).unwrap());
+        let registrar = AiCoordRegistrar::with_tenant_resolver(outbox, Uuid::new_v4(), || None);
+        let csid = Uuid::new_v4().to_string();
+        let claude_row = registrar
+            .register_sniffed_session(&csid, "typed claude", None)
+            .expect("registered a terminal_claude row");
+        assert_ne!(claude_row, SHELL_ROW);
+
+        let store = SessionLifecycleStore::open(dir.path().join("lifecycle.json")).unwrap();
+        store.record_open(bound(&csid, "pane-b4dd"));
+
+        // Enter where `handle_terminal_end` enters: its admission half, with
+        // the relay's production resolver over the real registrar and store.
+        const NOW: u64 = 1_700_000_000;
+        let grants = RemoteAttachGrants::new();
+        for (jti, row) in [
+            ("j-shell", SHELL_ROW),
+            ("j-claude", claude_row),
+            ("j-unknown", UNKNOWN_ROW),
+        ] {
+            grants.insert(
+                AttachGrant {
+                    grant_jti: jti.to_string(),
+                    source_device_id: "src-device".to_string(),
+                    session_id: row,
+                    terminal_id: None,
+                    expires_at: NOW + 600,
+                },
+                NOW,
+            );
+        }
+        let end = |jti: &str| {
+            admit_relay_terminal_end(
+                &grants,
+                || AcceptRemoteAttach::Tenant,
+                &serde_json::json!({
+                    "type": "terminal_end",
+                    "request_id": "end-1",
+                    "force": false,
+                    "remote": {"grant_jti": jti, "source_device_id": "src-device"},
+                }),
+                NOW,
+                &tm,
+                Some(&registrar),
+                Some(&store),
+            )
+        };
+        for (jti, what) in [
+            ("j-shell", "terminal_shell"),
+            ("j-claude", "terminal_claude"),
+        ] {
+            match end(jti).expect("admitted") {
+                AdmittedEnd::Terminal { terminal_id, .. } => {
+                    assert_eq!(terminal_id, "pane-b4dd", "{what}")
+                }
+                AdmittedEnd::NotLocal { .. } => {
+                    panic!("{what} row answered session_not_local")
+                }
+            }
+        }
+        assert!(matches!(
+            end("j-unknown").expect("admitted"),
+            AdmittedEnd::NotLocal { .. }
+        ));
     }
 }

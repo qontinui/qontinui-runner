@@ -18,6 +18,8 @@ use crate::terminal::visibility::VisibilityTier;
 use crate::terminal::{strip_ansi, TerminalManager};
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
+pub(crate) mod coord_wiring;
+
 /// The `(share_output, redact_secrets)` a terminal session declares to coord,
 /// from `settings.performance` (many-sessions plan Phase 8).
 ///
@@ -57,6 +59,55 @@ pub(crate) fn admit_spawn_tenant(raw: Option<&str>) -> Result<Option<uuid::Uuid>
     let tenant = parse_spawn_tenant(raw)?;
     crate::coord_mcp::precheck_spawn_tenant(tenant)?;
     Ok(tenant)
+}
+
+/// Settle `terminal_create`'s blocking spawn, handing an unspawned allocation
+/// to `remove` only where that is known to be safe.
+///
+/// - A **create error** is `TerminalManager::create`'s own typed `Err`: the
+///   allocation (if this call made one) is taken out of `isolated_ctx` and
+///   handed to `remove` with the failure, whose `child_started` decides
+///   whether its tree may be removed, as on every `acquire_for_terminal` door.
+///   Not every create error is pre-child: `create`'s "Sessions lock poisoned"
+///   comes AFTER a successful spawn (the child is running and a `LocalPty` has
+///   no kill on drop), so it is typed `child_started = true` and the tree is
+///   kept and only reported — the same as a reader/writer failure in
+///   `spawn_with_io`.
+/// - A **join error** is a panic inside `create`, which may come after
+///   `sessions.insert` — a live session may hold the tree — so it is logged,
+///   the context is left in place, and nothing is removed or reported (plan
+///   `2026-11-08-a-spawn-refused-after-its-worktree-allocation-leaves-the-tree-on-disk`,
+///   Why #5).
+///
+/// `remove` is the seam the tests drive; the command passes
+/// [`crate::agent_worktree::isolated_edit::IsolatedEditContext::remove_unspawned`].
+pub(crate) fn settle_terminal_spawn<T>(
+    joined: Result<Result<T, crate::terminal::spawn_refusal::SpawnFailure>, tokio::task::JoinError>,
+    isolated_ctx: &mut Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
+    remove: impl FnOnce(
+        crate::agent_worktree::isolated_edit::IsolatedEditContext,
+        &crate::terminal::spawn_refusal::SpawnFailure,
+    ),
+) -> Result<T, String> {
+    match joined {
+        Ok(Ok(info)) => Ok(info),
+        Ok(Err(e)) => {
+            if let Some(ctx) = isolated_ctx.take() {
+                remove(ctx, &e);
+            }
+            Err(e.message)
+        }
+        Err(join) => {
+            if let Some(ctx) = isolated_ctx.as_ref() {
+                warn!(
+                    "terminal_create: the spawn task failed ({join}) after allocation {}; a \
+                     session may already hold it, so it is not reported abandoned",
+                    ctx.agent_id
+                );
+            }
+            Err(format!("terminal spawn task failed: {join}"))
+        }
+    }
 }
 
 /// Create a new terminal session.
@@ -126,9 +177,10 @@ pub async fn terminal_create(
     // command gets there it has already run `acquire_for_terminal`, which under
     // `QONTINUI_AGENT_WORKTREE_MODE` does a `git worktree add`, takes a coord
     // claim, starts a heartbeat task and shells out to `git config`. A CRITICAL
-    // refusal would throw all of that away, and `IsolatedEditContext::Drop`
-    // releases the claim but does NOT remove the materialized worktree — so each
-    // refusal would leak a directory and the "Start anyway" retry would
+    // refusal would throw all of that away: `IsolatedEditContext::Drop` releases
+    // the claim, and `remove_unspawned` on the create-error arm below can take
+    // the fresh tree back off disk only after a `git worktree add` and a
+    // `git worktree remove` both ran — and the "Start anyway" retry would
     // materialize a second one. The most allocation-heavy step in the spawn must
     // not be the one that runs unguarded. Costs one `GlobalMemoryStatusEx` call;
     // returns the same typed refusal the seam would, so the frontend's dialog
@@ -150,6 +202,10 @@ pub async fn terminal_create(
     // before `page_id` is moved into `terminal_manager.create`. Used to
     // look up / persist this pane's coord session id so a restart RESUMES
     // the prior coord row instead of orphaning it.
+    // An OPERATOR-opened terminal: the webview sends the `default` page as
+    // `null`, so `None` here is the default page, never "place automatically"
+    // (see `page_placement::operator_page`).
+    let page_id = Some(crate::terminal::page_placement::operator_page(page_id));
     let pane_key = PaneKey::from_create_in_window(
         page_id.as_deref().unwrap_or("default"),
         title.as_deref().unwrap_or(""),
@@ -205,19 +261,20 @@ pub async fn terminal_create(
         edit_siblings.as_deref().unwrap_or_default(),
     )
     .map_err(|refusal| refusal.to_string())?;
-    let (working_dir, isolated_ctx) = crate::agent_worktree::isolated_edit::acquire_for_terminal(
-        effective_intent_repo.as_deref(),
-        title.as_deref().unwrap_or("Terminal edit session"),
-        working_dir,
-        None,
-        spawn_tenant_id,
-        &edit_siblings,
-    )
-    .await;
+    let (working_dir, mut isolated_ctx) =
+        crate::agent_worktree::isolated_edit::acquire_for_terminal(
+            effective_intent_repo.as_deref(),
+            title.as_deref().unwrap_or("Terminal edit session"),
+            working_dir,
+            None,
+            spawn_tenant_id,
+            &edit_siblings,
+        )
+        .await;
 
-    let repo_detect_handle = app_handle.clone();
-    let repo_detect_dir = working_dir.clone();
-    let cred_helper_dir = working_dir.clone();
+    // `create` consumes `app_handle`; the post-create wiring's repo detection
+    // emits through this clone.
+    let post_create_handle = app_handle.clone();
     // The shared session-env contribution (`QONTINUI_SESSION_WORKTREES` +
     // the configured plan directories). Derived from the live isolated edit
     // context before it is parked on the session; each var is omitted when it
@@ -246,8 +303,9 @@ pub async fn terminal_create(
     // so a CRITICAL refusal has somewhere to go — the frontend re-invokes with
     // `resource_override: true` once they pick "Start anyway".
     let create_resource_override = resource_override.unwrap_or(false);
-    let info = spawn_blocking_tracked(move || {
+    let joined = spawn_blocking_tracked(move || {
         let _create_span = tracing::debug_span!("terminal_spawn.manager_create").entered();
+        // door-scan: spawn — the door's real spawn; the context is in hand until here.
         create_manager.create(
             create_title,
             create_working_dir,
@@ -262,212 +320,53 @@ pub async fn terminal_create(
             // the account is chosen after this point.
             crate::terminal::TrustArm::AccountChosenLater,
             spawn_tenant_id,
+            // The runner UI's own "new terminal": always surfaces.
+            crate::coord_drain_state::SpawnOrigin::OperatorTerminal,
         )
     })
-    .await
-    .map_err(|e| format!("terminal spawn task failed: {e}"))??;
-
-    // Park the isolated edit context on the terminal session so its
-    // heartbeat + claim live as long as the PTY. Cleared in `close()`.
-    if let Some(ctx) = isolated_ctx {
-        if let Some(session) = terminal_manager.get(&info.id) {
-            session.set_isolated_edit_ctx(ctx);
-        }
-    }
+    .await;
+    let info = settle_terminal_spawn(joined, &mut isolated_ctx, |ctx, e| {
+        ctx.remove_unspawned("terminal_create command", e.child_started, &e.message)
+    })?;
 
     // The D1 durable tenant stamp is written inside `create` (the chokepoint
     // every tenant-offering door shares); `Intent.tenant_id` below carries the
     // same tenant to coord.
-
-    // Unconditional coord registration — every terminal session is
-    // mirrored into the coordinator's session plane so the dashboard
-    // renders it from `coord.sessions`. This is NOT gated by dual-write;
-    // registration is always-on. Errors are logged and swallowed so a
-    // coord hiccup never blocks the operator's terminal.
-    let purpose = title
-        .filter(|t| t.trim().len() >= 3)
-        .unwrap_or_else(|| "Terminal shell session".to_string());
-    let (share_output, redact_secrets) = intent_sharing_from_settings();
-    let intent = Intent {
-        kind: SessionKind::TerminalShell,
-        purpose,
-        repo: effective_intent_repo,
-        branch: None,
-        work_unit_slug,
-        // Accept-only on `Intent`; the runner never emits the legacy key.
-        plan_slug: None,
-        correlation_topic,
-        // Deliberately None on the interactive create path — a PRESENT
-        // `page_id` is the coord-side "this is a gate continuation" marker.
-        page_id: None,
-        declared_paths: working_dir
-            .map(std::path::PathBuf::from)
-            .into_iter()
-            .collect(),
-        share_output,
-        redact_secrets,
-        // The tenant the spawn picker (F2) / `--tenant` flag (F3) chose for
-        // this tab. `None` → the registry stamps the device default
-        // (default-for-new-sessions), which is the pre-F2 behavior.
-        tenant_id: spawn_tenant_id,
-    };
-    // R2 — RESUME the pane's prior coord session if one is persisted,
-    // otherwise register fresh. Resuming PATCHes the EXISTING coord row
-    // (state=active + heartbeat) so a runner restart no longer orphans the
-    // old row + mints a duplicate. On a persisted-but-GC'd row the resume
-    // falls back to a fresh register (new id), which we persist over the
-    // stale one. Either way the pane ends with a live coord session id.
     //
-    // DELIBERATELY STILL ON THE CRITICAL PATH (Phase 6, §4 Q2 — do not "optimize"
-    // these into a `tokio::spawn` without re-reading that resolution):
-    //   * the coord CLAIM above (`acquire_for_terminal`) returns the value that
-    //     BECOMES `working_dir`, a spawn input — it can never move after spawn;
-    //   * `attach_output_pipe` below subscribes to a live broadcast of PTY
-    //     output, so deferring it drops the session's first bytes;
-    //   * `set_coord_session_id` + the `set_on_exit` close hook must move
-    //     together WITH registration or a PTY that exits first leaves a coord
-    //     ghost;
-    //   * `credential_helper::setup_credential_helper` hard-requires coord to
-    //     already know the session (it is already `tokio::spawn`ed below).
-    // What Phase 6 actually removed from this path is the network: the OAuth
-    // refresh is now a background refresher (`ai_provider::oauth_refresh`), and
-    // pinned-session verification was already off-path
-    // (`poll_and_verify_pinned_session`).
-    let registry = session_registry.inner().clone();
-    let persisted = pane_store.get(&pane_key);
-    // Key the row by the harness session id the identity seam pinned this PTY
-    // child to (inside `create` above — the seam runs before this block on
-    // every spawn path). Without it the registry falls back to the RUNNER's
-    // own ambient id, which no child ever runs under, so coord's scoped
-    // `coord_report_status` could never resolve the row
-    // (`session_not_owned_by_caller`) and sessions fell through to the
-    // unscoped call that writes a PEER's row. Both arms pass it: a fresh row is
-    // registered under it, and a RESUMED row is re-keyed to it (plan
-    // 2026-10-23-a-hookless-resume-in-a-runner-pane-leaves-the-session-with-no-active-coord-row,
-    // Phase 2) instead of keeping the first-ever pin it was registered under.
-    // `None` only when the terminal vanished between spawn and here.
-    let pinned_session_id = terminal_manager
-        .get(&info.id)
-        .map(|session| session.pinned_session_id().to_string());
-    // Phase 0 instrumentation: the coord-registration segment of spawn
-    // latency. `register_external` is synchronous and does no HTTP (it queues
-    // an outbox row, contending on the process-global outbox `write_lock` +
-    // fsync); `resume_external` additionally does a live `PATCH /sessions/:id`
-    // probe. The span separates the two in the log.
-    let registration: Result<uuid::Uuid, crate::session::SessionError> = match persisted {
-        Some(prior_id) => {
-            use tracing::Instrument;
-            registry
-                .resume_external(prior_id, intent, pinned_session_id)
-                .instrument(tracing::debug_span!(
-                    "terminal_spawn.coord_register",
-                    terminal_id = %info.id,
-                    resume = true
-                ))
-                .await
-        }
-        None => {
-            let _span = tracing::debug_span!(
-                "terminal_spawn.coord_register",
-                terminal_id = %info.id,
-                resume = false
-            )
-            .entered();
-            registry.register_external_with_lineage(intent, None, pinned_session_id)
-        }
-    };
-
-    let mut coord_session_id: Option<uuid::Uuid> = None;
-    match registration {
-        Ok(coord_id) => {
-            coord_session_id = Some(coord_id);
-            // Persist (or refresh) the pane → coord-id mapping so the NEXT
-            // restart resumes this same row. On the fallback path `coord_id`
-            // is a fresh id replacing the stale GC'd one.
-            pane_store.put(&pane_key, coord_id);
-
-            // Store the coord session id on the terminal so close can clean up.
-            if let Some(session) = terminal_manager.get(&info.id) {
-                terminal_manager.bind_coord_session(&session, coord_id);
-
-                // R1 — install the on-exit hook so the PTY waiter thread
-                // closes the coord session mirror the instant the process
-                // exits, instead of leaving a ghost until coord's own
-                // stale→closed watcher reaps it (the runner no longer
-                // self-closes abandoned sessions; see coord_sync plan A3).
-                // Shares the idempotent `close_by_id` path with the frontend
-                // `terminal_close` command, so a double-close (exit +
-                // explicit close) is a no-op.
-                let close_registry = registry.clone();
-                // Fixed at spawn (`TerminalSession::pinned_session_id` doc) —
-                // safe to capture as an owned String for the on-exit hook,
-                // which fires once the session's identity is long past
-                // changing.
-                let exit_pinned_session_id = session.pinned_session_id().to_string();
-                // A boot-restored gate continuation is re-registered in the
-                // continuation registry against THIS terminal (plan 2026-10-03
-                // D3), so its death must reach the same producer a backend
-                // spawn's does. A no-op for a terminal the registry does not
-                // hold — every ordinary operator tab.
-                let exited_terminal_id = info.id.clone();
-                // tauri's handle rather than `Handle::try_current()`: it is always
-                // available here, and the waiter thread that fires the hook has none.
-                let exit_rt_handle = tauri::async_runtime::handle().inner().clone();
-                session.set_on_exit(Box::new(move |coord_id, exit| {
-                    if let Err(e) = close_registry.close_by_id(coord_id) {
-                        warn!(
-                            coord_session = %coord_id,
-                            error = %e,
-                            "terminal exit hook: coord session close failed"
-                        );
-                    }
-                    crate::agent_runtime::notify_continuation_terminal_exit(
-                        &exited_terminal_id,
-                        Some(&exit_rt_handle),
-                        Some(exit),
-                    );
-                    // Trigger 4 (session_exit) — plan
-                    // 2026-08-27-operator-touch-observation-runner-emitter,
-                    // Phase B2 §2b/§2c.
-                    crate::session::operator_touch::emit_session_exit_if_nonzero(
-                        &close_registry,
-                        coord_id,
-                        Some(&exit_pinned_session_id),
-                        exit.agent_exit_code(),
-                    );
-                }));
-
-                // Attach the output pipe so PTY output streams to coord.
-                let rx = session.subscribe_output();
-                registry.attach_output_pipe(coord_id, rx, true);
-            }
-            info!(
-                terminal_id = %info.id,
-                coord_session = %coord_id,
-                resumed = persisted.is_some(),
-                "terminal_create: coord session ready"
-            );
-        }
-        Err(e) => {
-            warn!(
-                terminal_id = %info.id,
-                error = %e,
-                "terminal_create: coord session registration failed — terminal unaffected"
-            );
-        }
-    }
-
-    tokio::spawn(async move {
-        crate::repo_detection::check_and_emit_unregistered(repo_detect_handle, repo_detect_dir)
-            .await;
-    });
-
-    if let (Some(dir), Some(sid)) = (cred_helper_dir, coord_session_id) {
-        let session_id_str = sid.to_string();
-        tokio::spawn(async move {
-            crate::credential_helper::setup_credential_helper(&dir, &session_id_str).await;
-        });
-    }
+    // Unconditional coord registration — every terminal session is mirrored
+    // into the coordinator's session plane so the dashboard renders it from
+    // `coord.sessions`, and so a remote end can address it. Shared with every
+    // other create door (`coord_wiring`); this door alone owns a pane key, so it
+    // RESUMES the pane's prior coord row across a runner restart (R2).
+    //
+    // DELIBERATELY STILL ON THE CRITICAL PATH (Phase 6, §4 Q2): the coord CLAIM
+    // above (`acquire_for_terminal`) returns the value that BECOMES
+    // `working_dir`, a spawn input, and the wiring's own reasons are on
+    // `coord_wiring::wire_coord_session`.
+    let intent = coord_wiring::terminal_shell_intent(
+        title.as_deref(),
+        "Terminal shell session",
+        effective_intent_repo,
+        work_unit_slug,
+        correlation_topic,
+        working_dir.as_deref(),
+        spawn_tenant_id,
+    );
+    coord_wiring::finish_terminal_create(
+        terminal_manager.inner(),
+        Some(session_registry.inner()),
+        Some(&post_create_handle),
+        &info.id,
+        isolated_ctx,
+        intent,
+        coord_wiring::CoordRegistration::PaneKeyed {
+            pane_store: pane_store.inner().clone(),
+            pane_key,
+        },
+        working_dir,
+        "tauri_terminal_create",
+    )
+    .await;
 
     Ok(CommandResponse {
         success: true,
@@ -805,8 +704,13 @@ pub async fn terminal_probe_claude(
             let session_ids: Vec<String> = if pids.is_empty() {
                 Vec::new()
             } else {
+                // An UNKNOWN command-line read (`None`) reports no session ids,
+                // as a read that found none does: this probe is a report, the
+                // pane's liveness comes from `claudePids` above, and nothing is
+                // decided here from an id being absent.
                 crate::process_capture::process_tree::command_lines_for_pids(&pids)
                     .await
+                    .unwrap_or_default()
                     .values()
                     .filter_map(|cl| {
                         crate::process_capture::process_tree::parse_session_id_from_cmdline(cl)
@@ -830,6 +734,81 @@ pub async fn terminal_probe_claude(
         success: true,
         message: None,
         data: Some(data),
+    })
+}
+
+/// Which panes host an AI agent CLI of ANY provider — `claude`, `pi`
+/// (DeepSeek), `codex`, `gemini`, … — read from each pane's process subtree
+/// (`process_capture::agent_cli`).
+///
+/// WHY. The "Keep AI" button closes every pane it cannot prove hosts an AI
+/// session, and its tab-level signals are Claude-only: a `pi` session the
+/// operator started by hand in a shell carried none and was closed as a plain
+/// shell. The process table knows what is running regardless of provider.
+///
+/// `terminalIds` narrows the probe (default: every local pane). `fresh` takes
+/// a table read that began after the call — the button passes it on the click
+/// that closes, since it closes because an agent is ABSENT.
+///
+/// Returns `{ panes: { <id>: "<kind>" | "absent" | "unknown" | "none" } }`.
+/// `none` is an id with no terminal process at all (a plan-viewer tab, or a
+/// pane already gone) — nothing runs there to lose. A pane with no local pid
+/// (remote) reads `unknown`; so does every pane when the table or a needed
+/// command line could not be read. `unknown` must never be treated as
+/// `absent`.
+#[tauri::command]
+pub async fn terminal_agent_panes(
+    terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
+    terminal_ids: Option<Vec<String>>,
+    fresh: Option<bool>,
+) -> Result<CommandResponse, String> {
+    use crate::process_capture::agent_cli::{classify_panes, PaneAgent};
+    use crate::process_capture::process_tree as pt;
+
+    let ids: Vec<String> = match terminal_ids {
+        Some(ids) => ids,
+        None => terminal_manager
+            .list()
+            .into_iter()
+            .map(|i| i.id.to_string())
+            .collect(),
+    };
+    let mut panes: Vec<(String, u32)> = Vec::new();
+    let mut result = serde_json::Map::new();
+    for id in ids {
+        match terminal_manager.get(&id).map(|s| s.child_pid()) {
+            Some(Some(pid)) => panes.push((id, pid)),
+            Some(None) => {
+                result.insert(id, serde_json::Value::from("unknown"));
+            }
+            None => {
+                result.insert(id, serde_json::Value::from("none"));
+            }
+        }
+    }
+    if !panes.is_empty() {
+        let snapshot = if fresh.unwrap_or(false) {
+            pt::snapshot_process_table_fresh().await
+        } else {
+            pt::snapshot_process_table_public().await
+        };
+        let verdicts = classify_panes(&panes, &snapshot, |pids| async move {
+            pt::command_lines_for_pids(&pids).await
+        })
+        .await;
+        for (id, v) in verdicts {
+            let s = match v {
+                PaneAgent::Present(kind) => kind,
+                PaneAgent::Absent => "absent",
+                PaneAgent::Unknown => "unknown",
+            };
+            result.insert(id, serde_json::Value::from(s));
+        }
+    }
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: Some(serde_json::json!({ "panes": serde_json::Value::Object(result) })),
     })
 }
 
@@ -1377,6 +1356,8 @@ pub fn terminal_session_record_open(
         wind_down_arm: None,
         finish_reason: None,
         finish_synced: false,
+        finish_coord_session_id: None,
+        finish_coord_readdressed: false,
         spawn_device_default: None,
         adopted_from: None,
         last_session_start_at: None,
@@ -1501,13 +1482,39 @@ fn record_open_confirmation_report(
 #[tauri::command]
 pub fn terminal_session_rebind_terminal(
     store: tauri::State<'_, Arc<SessionLifecycleStore>>,
+    terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
     claude_session_id: String,
     terminal_id: String,
     zone_index: i32,
 ) -> Result<CommandResponse, String> {
-    store.rebind_terminal(&claude_session_id, &terminal_id, zone_index);
-    store.mark_restored_from_boot(
+    rebind_and_sync_page(
+        &store,
+        &terminal_manager,
         &claude_session_id,
+        &terminal_id,
+        zone_index,
+    )
+}
+
+/// The body of [`terminal_session_rebind_terminal`] over plain references, so
+/// tests drive the command's own wiring rather than a copy of it.
+pub(crate) fn rebind_and_sync_page(
+    store: &SessionLifecycleStore,
+    terminal_manager: &TerminalManager,
+    claude_session_id: &str,
+    terminal_id: &str,
+    zone_index: i32,
+) -> Result<CommandResponse, String> {
+    store.rebind_terminal(claude_session_id, terminal_id, zone_index);
+    // The page follows the pane: `rebind_terminal` moves only terminal + zone,
+    // so otherwise `/sessions/history` names a page `/terminals` does not place
+    // the session on. An unheld or dead pane names no page; the record keeps
+    // the one it had.
+    if let Some(live_page) = terminal_manager.live_page_of(terminal_id) {
+        store.update_page_by_terminal(terminal_id, &live_page);
+    }
+    store.mark_restored_from_boot(
+        claude_session_id,
         crate::session::session_lifecycle_store::RESTORE_TIER_TERMINAL_ONLY,
     );
     Ok(CommandResponse {
@@ -1603,6 +1610,11 @@ fn mark_awaiting_account_unless_live(
 /// directory cannot be resolved. A resume under it must type NO
 /// `CLAUDE_CONFIG_DIR` (see `discovery::is_default_config_home`), so every
 /// frontend resume normalises against THIS path rather than guessing `$HOME`.
+///
+/// Its second caller is the graceful-exit probe's registry read
+/// (`terminal::graceful_exit`'s `default_config_home`), which reads this home's
+/// `sessions/` dir even before discovery counts it (no `projects/` yet), so a
+/// first npm-installed session there is seen.
 #[tauri::command]
 pub fn claude_default_config_home() -> Option<String> {
     dirs::home_dir().and_then(|h| h.join(".claude").to_str().map(|p| p.replace('\\', "/")))
@@ -1644,12 +1656,47 @@ pub fn terminal_session_clear_restore_pending(
 #[tauri::command]
 pub fn terminal_session_record_close(
     store: tauri::State<'_, Arc<SessionLifecycleStore>>,
+    terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
     claude_session_id: String,
     terminal_id: Option<String>,
     reason: String,
 ) -> Result<CommandResponse, String> {
-    let outcome = store.record_close_checked(&claude_session_id, terminal_id.as_deref(), &reason);
+    let outcome = record_close_for(
+        &terminal_manager,
+        &store,
+        &claude_session_id,
+        terminal_id.as_deref(),
+        &reason,
+    );
     Ok(close_outcome_response(&outcome))
+}
+
+/// The body of [`terminal_session_record_close`]: the close behind THIS
+/// manager's shutdown latch, so a `pty-exit` that arrives after
+/// [`TerminalManager::close_all`] began leaves its row as it was (plan
+/// `2026-10-28-force-exited-runner-restore-set-follow-ups`, Phase 6).
+///
+/// The named terminal's spawn time goes along for the `launch-failed` close
+/// rule (plan `2026-11-10-migration-holds-for-missing-claude-cli`, D3), read
+/// from an EXACT terminal-id match only. A terminal this manager no longer
+/// holds reads `None`, which keeps the reason as sent.
+pub(crate) fn record_close_for(
+    terminal_manager: &TerminalManager,
+    store: &SessionLifecycleStore,
+    claude_session_id: &str,
+    terminal_id: Option<&str>,
+    reason: &str,
+) -> CloseOutcome {
+    let terminal_created_at_ms = terminal_id
+        .and_then(|t| terminal_manager.get(t))
+        .and_then(|session| i64::try_from(session.info().created_at).ok());
+    store.record_close_gated(
+        terminal_manager.is_shutting_down(),
+        claude_session_id,
+        terminal_id,
+        reason,
+        terminal_created_at_ms,
+    )
 }
 
 /// Mark a session FINISHED (or unmark it) — the WORK axis.
@@ -1793,7 +1840,7 @@ pub fn terminal_session_list_open(
     // set is withheld and the response says so. Nothing is closed or consumed;
     // the frontend re-runs the restore on `coord-drain-state-changed` once
     // autonomous spawns may run again.
-    if let crate::coord_drain_state::DrainGate::Defer { reason, .. } =
+    if let crate::coord_drain_state::DrainGate::Defer { reason, class } =
         crate::coord_drain_state::drain_gate_for_work(
             crate::coord_drain_state::SpawnOrigin::BootResume,
             "boot_resume:terminal_tabs",
@@ -1818,6 +1865,9 @@ pub fn terminal_session_list_open(
                 "sessions": [],
                 "deferredByDrain": {
                     "state": crate::coord_drain_state::current().label(),
+                    // `drained` | `unknown` | `role_closed`: what deferred it. A
+                    // dispatch role defers with the drain itself `clear`.
+                    "class": class.label(),
                     "reason": reason,
                 },
             })),
@@ -1827,14 +1877,16 @@ pub fn terminal_session_list_open(
     // captured ONCE at boot (main.rs setup, before this command can run) —
     // the on-disk marker itself already says `clean:false` for the NOW-
     // running process and must never be re-read for restore decisions.
-    let boot = crate::session::shutdown_marker::boot_classification();
-    let prior_marker_at = boot.and_then(|c| c.prior_marker_at);
+    //
     // On a crash (unclean) boot the marker is the crashed process's own boot
     // instant — a boot artifact, not session liveness — so it must NOT feed
     // the cohort anchor (its stray-later `at` is exactly what pulled the
     // 2026-07-19 anchor ~1h46m past the crash band and stranded 81 sessions).
     // Only a CLEAN shutdown marker is an honest last-moment-of-life signal.
-    let boot_was_clean = boot.map(|c| !c.crash_recovery).unwrap_or(false);
+    // The page picker reads the restorable set through the same helper
+    // (`terminal::page_placement::page_loads`), so the two agree on it.
+    let (prior_marker_at, boot_was_clean) =
+        crate::session::shutdown_marker::restore_admission_inputs();
     // Rows stamped BEFORE this process booted are judged against the prior
     // boot's own last moment of life (the store's boot line — see
     // `restorable_records`), so a restore that ran hours late (a coord drain
@@ -2172,6 +2224,18 @@ pub fn terminal_report_bridge_registration_failure(
 /// Returns one row per live PROCESS. Several live processes may report the
 /// same `sessionId` (22 of 80 did), each with its own name; collapsing that is
 /// the caller's decision.
+///
+/// `data` is `{ sessions, unlistable, unreadableRecords }`. The two trailing
+/// lists name what the read could NOT see: `sessions/` dirs that exist and
+/// cannot be listed, and unreadable or unparseable records named for live pids
+/// whose image could host Claude Code. While either is non-empty, a session
+/// MISSING from `sessions` may still be live. The read still succeeds then,
+/// because its two kinds of caller need different things from it: the
+/// unattended restore paths treat an incomplete read as indeterminate
+/// (`fetchLiveClaudeSessionIds` returns `null`, and nothing is respawned),
+/// while an operator's click refuses a session the partial read DOES show
+/// live, and the window-name hook keeps updating. Failing the whole read would
+/// hand the click paths `null`, which they read as "go ahead".
 #[tauri::command]
 pub async fn terminal_claude_session_list_live() -> Result<CommandResponse, String> {
     let config_dirs = crate::terminal::transcript::find_claude_config_dirs();
@@ -2184,14 +2248,36 @@ pub async fn terminal_claude_session_list_live() -> Result<CommandResponse, Stri
     // (`fetchLiveClaudeSessionIds`) → skip-unknown; returning success + `[]`
     // instead would read as "definitively no live sessions" and let the
     // restore path respawn — fork — every session.
-    let snapshot = crate::process_capture::process_tree::snapshot_process_table_public().await;
+    // A read begun now (never the memo): a session absent here is respawned.
+    let snapshot = crate::process_capture::process_tree::snapshot_process_table_fresh().await;
     let live_pids = crate::session::claude_session_registry::live_pids_from_snapshot(&snapshot)?;
-    let sessions =
-        crate::session::claude_session_registry::read_live_sessions(&config_dirs, &live_pids);
+    let read = crate::session::claude_session_registry::read_live_sessions(
+        &config_dirs,
+        &live_pids,
+        &crate::session::claude_session_registry::may_host_claude(&snapshot),
+    );
     Ok(CommandResponse {
         success: true,
         message: None,
-        data: Some(serde_json::json!({ "sessions": sessions })),
+        data: Some(live_sessions_payload(read)),
+    })
+}
+
+/// The `data` of [`terminal_claude_session_list_live`]: the rows, plus what
+/// the read could not see (see that command's docs for why both travel).
+fn live_sessions_payload(
+    read: crate::session::claude_session_registry::LiveSessions,
+) -> serde_json::Value {
+    let unlistable: Vec<String> = read.unlistable.iter().map(ToString::to_string).collect();
+    let unreadable_records: Vec<String> = read
+        .unreadable_records
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    serde_json::json!({
+        "sessions": read.sessions,
+        "unlistable": unlistable,
+        "unreadableRecords": unreadable_records,
     })
 }
 
@@ -2207,6 +2293,24 @@ pub async fn terminal_claude_session_list_live() -> Result<CommandResponse, Stri
 /// handoff strategy (`ai_provider::pick_migration_target`), excluding the
 /// session's current account; an explicit target is recorded as a handoff
 /// too.
+///
+/// **This call can take minutes to resolve, and it reports no progress
+/// meanwhile.** It resolves only once the resumed CLI is PROVEN alive or the
+/// respawn has given up (`respawn_liveness::confirm_respawn`). Worst case, per
+/// attempt: up to 45 s for a launchable `claude` to reappear on PATH
+/// (`claude_cli_spawn::RESUME_RESOLVE_DELAYS`), plus up to 180 s for the pane
+/// to paint (`respawn_liveness::RESUME_LIVENESS_DEADLINE`). With
+/// `respawn_liveness::MAX_RESPAWN_ATTEMPTS` (3) attempts and the 1 s and 3 s
+/// pauses between them, that comes to about 11 minutes (3 × 225 s + 4 s =
+/// 679 s), plus the transcript carry before the first spawn. While a
+/// runner-owned CLI install is running, each attempt first waits it out, for
+/// up to `claude_cli_spawn::CLI_UPDATE_WAIT` (120 s) more. Only an install
+/// running at the start of each of the three attempts reaches the full
+/// 3 × 345 s + 4 s = 1039 s, about 17 minutes. A caller with a
+/// UI should show the migration as pending for that long, and must not read a
+/// slow answer as a hang. Returning at the first spawn and reporting the
+/// verdict by event would take a new event contract with the webview. That is
+/// deliberately not done here.
 #[tauri::command]
 pub async fn terminal_migrate_session_account(
     app: tauri::AppHandle,
@@ -2243,17 +2347,29 @@ pub async fn terminal_migrate_session_account(
         crate::ai_provider::record_handoff(&dst);
     }
 
-    let outcome =
-        crate::terminal::account_migration::migrate_session_off_runtime(&app, &record, &src, &dst)
-            .await
-            .map_err(|e| {
-                // The session never reached `dst`: it must not count as a handoff.
-                crate::ai_provider::unrecord_handoff(&dst);
-                // A refusal (already migrating / already moved / closed /
-                // gone) reads as its own sentence, exactly as before the typed
-                // error.
-                e.to_string()
-            })?;
+    // Resolves only once the resumed CLI is proven alive; a respawn that died
+    // (rolled back) or never painted is an error naming which. A pane that
+    // never painted is rolled back onto the old pane while that pane still runs
+    // (the new pane closed), unless the old pane is read to host no CLI — then
+    // the new pane keeps the session.
+    let outcome = crate::terminal::account_migration::migrate_session_off_runtime(
+        &app,
+        &record,
+        &src,
+        &dst,
+        crate::coord_drain_state::SpawnOrigin::OperatorTerminal,
+    )
+    .await
+    .map_err(|e| {
+        // A session that never reached `dst` must not count as a handoff.
+        if !e.reached_destination() {
+            crate::ai_provider::unrecord_handoff(&dst);
+        }
+        // A refusal (already migrating / already moved / closed /
+        // gone) reads as its own sentence, exactly as before the typed
+        // error.
+        e.to_string()
+    })?;
     Ok(CommandResponse {
         success: true,
         message: Some(format!(
@@ -2355,6 +2471,12 @@ pub(crate) struct SessionCaptureHint {
     /// from the runner's own environment cannot vouch for a delivery this child
     /// never received.
     pub policy_delivery: Option<crate::session::spawn_prompt::PolicyDelivery>,
+    /// Why this backend spawn happens. Decides whether its tab is selected on
+    /// `terminal-created` (unattended origins are coalesced to at most one
+    /// view-switching surface plus one tab-only surface per minute,
+    /// [`crate::terminal::focus_coalescer`]); no default, so every caller
+    /// states it.
+    pub spawn_origin: crate::coord_drain_state::SpawnOrigin,
 }
 
 /// Env var carrying the `coord.gates` row id a continuation session must report
@@ -2364,6 +2486,35 @@ pub(crate) struct SessionCaptureHint {
 /// environment: a session's env carries plaintext passwords, and the habitual
 /// `JWT|KEY|TOKEN|SECRET` redaction filter matches none of them.
 pub(crate) const GATE_ID_ENV: &str = "QONTINUI_GATE_ID";
+
+/// The env a GATE continuation's PTY carries beyond the base child env: the
+/// gate it reports to ([`GATE_ID_ENV`] / [`GATE_DEVICE_ID_ENV`]) and the
+/// Stop-hook mode it runs under.
+///
+/// The mode is forwarded because `claude_stop_hook.sh` short-circuits on
+/// `QONTINUI_STOP_HOOK_CONTINUATION` before asking the runner, and the base
+/// child env sets that variable to the RUNNER's mode — `off` when unset. A gate
+/// continuation reads an unset flag as armed
+/// ([`crate::mcp::continuation_verdict::FlagReading::mode_for`]); without this
+/// override its Stop hook would be registered and then exit before ever
+/// reaching the verdict. Applied through `extra_env`, which runs after the base
+/// env, so it wins. Pure over its inputs (the unit-test surface).
+pub(crate) fn gate_identity_env(
+    gate: GateIdentity,
+    reading: crate::mcp::continuation_verdict::FlagReading,
+) -> Vec<(String, String)> {
+    vec![
+        (GATE_ID_ENV.to_string(), gate.gate_id.to_string()),
+        (
+            GATE_DEVICE_ID_ENV.to_string(),
+            gate.consuming_device_id.to_string(),
+        ),
+        (
+            crate::mcp::continuation_verdict::FLAG_ENV.to_string(),
+            reading.mode_for(true).as_str().to_string(),
+        ),
+    ]
+}
 
 /// Env var carrying the CONSUMING device id for [`GATE_ID_ENV`]'s gate.
 ///
@@ -2467,6 +2618,42 @@ fn warn_untracked_backend_spawn(
     );
 }
 
+/// A failed backend create ([`create_terminal_session_backend`]): the typed
+/// failure, plus the isolated edit context the caller handed in, returned
+/// UNPARKED — a failed create parks it on no session, and a caller that
+/// allocated it is the only party that knows whether the tree may be removed
+/// (`IsolatedEditContext::remove_unspawned_unreported`). A caller that passed
+/// `None`, or does not care, takes the message through `String::from`.
+pub(crate) struct BackendSpawnFailure {
+    pub(crate) failure: crate::terminal::spawn_refusal::SpawnFailure,
+    /// Boxed: the context is large and rides only the failure arm.
+    pub(crate) isolated_ctx: Option<Box<crate::agent_worktree::isolated_edit::IsolatedEditContext>>,
+}
+
+impl std::fmt::Debug for BackendSpawnFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackendSpawnFailure")
+            .field("failure", &self.failure)
+            .field(
+                "isolated_ctx",
+                &self.isolated_ctx.as_ref().map(|c| c.agent_id.as_str()),
+            )
+            .finish()
+    }
+}
+
+impl std::fmt::Display for BackendSpawnFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.failure.message)
+    }
+}
+
+impl From<BackendSpawnFailure> for String {
+    fn from(failure: BackendSpawnFailure) -> Self {
+        failure.failure.message
+    }
+}
+
 /// Tracked variant of [`create_terminal_session_backend`] where the capture
 /// hint is NON-OPTIONAL — the compiler, not a log line, guarantees a backend
 /// spawn is durably recorded. All backend/headless callers (gate
@@ -2489,7 +2676,7 @@ pub(crate) fn create_tracked_terminal_session_backend(
     capture_hint: SessionCaptureHint,
     page_id: Option<String>,
     resource_override: bool,
-) -> Result<(String, Option<uuid::Uuid>), String> {
+) -> Result<(String, Option<uuid::Uuid>), BackendSpawnFailure> {
     create_terminal_session_backend(
         terminal_manager,
         session_registry,
@@ -2547,7 +2734,7 @@ pub(crate) fn create_terminal_session_backend(
     // while an account-migration respawn is the continuation of a session that
     // already existed a moment ago. See each call site.
     resource_override: bool,
-) -> Result<(String, Option<uuid::Uuid>), String> {
+) -> Result<(String, Option<uuid::Uuid>), BackendSpawnFailure> {
     warn_untracked_backend_spawn(&capture_hint, &title, &working_dir);
     // The shared session-env contribution (`QONTINUI_SESSION_WORKTREES` from
     // the pre-acquired context + the configured plan directories), derived
@@ -2592,10 +2779,9 @@ pub(crate) fn create_terminal_session_backend(
     // to report to" — the correct signal, and the reason this is not a
     // sentinel value.
     if let Some(gate) = capture_hint.as_ref().and_then(|h| h.gate_identity) {
-        env_pairs.push((GATE_ID_ENV.to_string(), gate.gate_id.to_string()));
-        env_pairs.push((
-            GATE_DEVICE_ID_ENV.to_string(),
-            gate.consuming_device_id.to_string(),
+        env_pairs.extend(gate_identity_env(
+            gate,
+            crate::mcp::continuation_verdict::FlagReading::from_env(),
         ));
     }
     // The spawn-time policy delivery marker pair — set, or BLANKED, on every
@@ -2632,7 +2818,29 @@ pub(crate) fn create_terminal_session_backend(
         crate::terminal::TrustArm::Pinned(capture_hint.as_ref().and_then(|h| h.config_dir.clone())),
         // A gate continuation is coord-spawned: no picker chose a tenant.
         None,
-    )?;
+        // Every tracked caller states its origin on the hint; a hint-less
+        // spawn cannot, and is coalesced as unattended (fail closed).
+        capture_hint
+            .as_ref()
+            .map_or(crate::coord_drain_state::SpawnOrigin::Unknown, |h| {
+                h.spawn_origin
+            }),
+    );
+    // A failed create hands the caller's context BACK, unparked, with the typed
+    // failure: the gate continuation decides from `child_started` whether the
+    // fresh tree it allocated may be removed (plan
+    // `2026-11-08-a-spawn-refused-after-its-worktree-allocation-leaves-the-tree-on-disk`,
+    // Phase 3). Dropping it here instead would release the claims and leave
+    // the tree on disk with nobody holding the fact that no child ran in it.
+    let info = match info {
+        Ok(info) => info,
+        Err(failure) => {
+            return Err(BackendSpawnFailure {
+                failure,
+                isolated_ctx: isolated_ctx.map(Box::new),
+            })
+        }
+    };
 
     // Spawn name: park it on the session (so `terminal_list` and a reconnecting
     // webview can read it), record the commit `Session-Name` trailer file for the
@@ -2708,47 +2916,16 @@ pub(crate) fn create_terminal_session_backend(
     ) {
         Ok(coord_id) => {
             coord_session_id = Some(coord_id);
-            if let Some(session) = terminal_manager.get(&info.id) {
-                terminal_manager.bind_coord_session(&session, coord_id);
-                let close_registry = session_registry.clone();
-                // Capacity-freed re-poll: capture this terminal's id so the exit
-                // hook can tell `agent_runtime` a continuation slot just freed and
-                // a load-deferred continuation can be re-polled promptly. The
-                // notify is a no-op unless this terminal is a registered
-                // continuation session, so an ordinary operator tab never
-                // triggers a poll. The PTY waiter that fires this hook is a
-                // bare OS thread with no tokio runtime, so capture the current
-                // runtime handle HERE (this fn runs under tokio) for the poll to
-                // spawn on.
-                let exited_terminal_id = info.id.clone();
-                let exit_rt_handle = tokio::runtime::Handle::try_current().ok();
-                let exit_pinned_session_id = session.pinned_session_id().to_string();
-                session.set_on_exit(Box::new(move |coord_id, exit| {
-                    if let Err(e) = close_registry.close_by_id(coord_id) {
-                        warn!(
-                            coord_session = %coord_id,
-                            error = %e,
-                            "gate-continuation terminal exit hook: coord session close failed"
-                        );
-                    }
-                    crate::agent_runtime::notify_continuation_terminal_exit(
-                        &exited_terminal_id,
-                        exit_rt_handle.as_ref(),
-                        Some(exit),
-                    );
-                    // Trigger 4 (session_exit) — plan
-                    // 2026-08-27-operator-touch-observation-runner-emitter,
-                    // Phase B2 §2b/§2c.
-                    crate::session::operator_touch::emit_session_exit_if_nonzero(
-                        &close_registry,
-                        coord_id,
-                        Some(&exit_pinned_session_id),
-                        exit.agent_exit_code(),
-                    );
-                }));
-                let rx = session.subscribe_output();
-                session_registry.attach_output_pipe(coord_id, rx, true);
-            }
+            // The bind + on-exit close hook + output pipe every create door
+            // shares (`coord_wiring`). This fn runs under tokio, so the exit
+            // hook's captured runtime handle is present.
+            coord_wiring::bind_registered_coord_session(
+                terminal_manager,
+                session_registry,
+                &info.id,
+                coord_id,
+                "create_terminal_session_backend",
+            );
             info!(
                 terminal_id = %info.id,
                 coord_session = %coord_id,
@@ -2794,10 +2971,14 @@ pub(crate) fn create_terminal_session_backend(
                 coord_lineage: _,
                 // Consumed earlier (env injection at spawn); not needed here.
                 policy_delivery: _,
+                // Consumed earlier (the `terminal-created` surface decision).
+                spawn_origin: _,
             } = hint;
             // Single source of truth for the recorded page: the hint's page_id
-            // (set by the caller to the picked page), defaulting to "default".
-            let record_page_id = hint_page_id.unwrap_or_else(|| "default".to_string());
+            // (set by the caller to the picked page), else the page `create`
+            // actually put the pane on (its unpaged arm picks one), so the
+            // record and the live pane never disagree.
+            let record_page_id = hint_page_id.unwrap_or_else(|| info.page_id.clone());
             let record_zone_index = hint_zone_index.unwrap_or(0);
             if let Some(pinned) = pinned_session_id {
                 // Pre-pinned id: record synchronously, then verify async that
@@ -2975,6 +3156,8 @@ async fn poll_and_record_session<F>(
                 wind_down_arm: None,
                 finish_reason: None,
                 finish_synced: false,
+                finish_coord_session_id: None,
+                finish_coord_readdressed: false,
                 spawn_device_default: None,
                 adopted_from: None,
                 last_session_start_at: None,
@@ -3076,6 +3259,8 @@ pub(crate) fn record_pinned_session_open(
         wind_down_arm: None,
         finish_reason: None,
         finish_synced: false,
+        finish_coord_session_id: None,
+        finish_coord_readdressed: false,
         spawn_device_default: None,
         adopted_from: None,
         last_session_start_at: None,
@@ -3242,6 +3427,154 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
+    /// The live-session payload carries what the read could not see beside
+    /// the rows — the keys `fetchLiveClaudeSessionRead`
+    /// (`src/components/terminal/liveClaudeSessions.ts`) reads to tell a
+    /// partial read from a complete one.
+    #[test]
+    fn the_live_session_payload_names_what_the_read_could_not_see() {
+        use crate::session::claude_activity::UnlistableSessionsDir;
+        use crate::session::claude_session_registry::{LiveSessions, UnreadableRecord};
+
+        let complete = live_sessions_payload(LiveSessions::default());
+        assert_eq!(
+            complete,
+            serde_json::json!({ "sessions": [], "unlistable": [], "unreadableRecords": [] })
+        );
+
+        let partial = live_sessions_payload(LiveSessions {
+            sessions: Vec::new(),
+            unlistable: vec![UnlistableSessionsDir {
+                sessions_dir: std::path::PathBuf::from("/h/.claude-a/sessions"),
+                error: "Permission denied".to_string(),
+            }],
+            unreadable_records: vec![UnreadableRecord {
+                path: std::path::PathBuf::from("/h/.claude/sessions/7.json"),
+                error: "does not parse".to_string(),
+            }],
+        });
+        assert_eq!(
+            partial["unlistable"],
+            serde_json::json!(["/h/.claude-a/sessions (Permission denied)"])
+        );
+        assert_eq!(
+            partial["unreadableRecords"],
+            serde_json::json!(["/h/.claude/sessions/7.json (does not parse)"])
+        );
+    }
+
+    /// Plan `2026-11-08-…-leaves-the-tree-on-disk` Phases 0 and 2, Why #5: a
+    /// create error hands the allocation to `remove` once, with the typed
+    /// `child_started`; a join error — a panic inside `create` that may come
+    /// after `sessions.insert` — hands over nothing and leaves the context in
+    /// place.
+    #[tokio::test]
+    async fn only_a_create_error_hands_the_allocation_to_remove_unspawned() {
+        use crate::agent_worktree::isolated_edit::IsolatedEditContext;
+        use crate::terminal::spawn_refusal::SpawnFailure;
+        let id = "6f1c2a7e-0000-4000-8000-00000000c0de";
+        let new_ctx = || {
+            Some(IsolatedEditContext::for_test_with_agent_id(
+                id.to_string(),
+                Vec::new(),
+                Vec::new(),
+            ))
+        };
+        let handed = std::sync::Mutex::new(Vec::<(String, bool, String)>::new());
+        let remove = |ctx: IsolatedEditContext, e: &SpawnFailure| {
+            handed
+                .lock()
+                .unwrap()
+                .push((ctx.agent_id.clone(), e.child_started, e.message.clone()));
+        };
+
+        for failure in [
+            SpawnFailure::before_child("Failed to open PTY: out of ptys"),
+            SpawnFailure::after_child("Sessions lock poisoned: x"),
+        ] {
+            let mut ctx = new_ctx();
+            let created: Result<Result<(), SpawnFailure>, tokio::task::JoinError> =
+                Ok(Err(failure.clone()));
+            assert_eq!(
+                settle_terminal_spawn(created, &mut ctx, remove),
+                Err(failure.message.clone())
+            );
+            assert!(ctx.is_none(), "the context is handed over, not kept");
+        }
+        assert_eq!(
+            *handed.lock().unwrap(),
+            vec![
+                (
+                    id.to_string(),
+                    false,
+                    "Failed to open PTY: out of ptys".to_string()
+                ),
+                (
+                    id.to_string(),
+                    true,
+                    "Sessions lock poisoned: x".to_string()
+                ),
+            ],
+            "each create error hands the allocation over once, child_started typed"
+        );
+
+        let join = tokio::spawn(async { panic!("create panicked after insert") })
+            .await
+            .expect_err("a panicking task is a join error");
+        let mut ctx = new_ctx();
+        let settled = settle_terminal_spawn::<()>(Err(join), &mut ctx, remove);
+        assert!(
+            settled
+                .as_ref()
+                .is_err_and(|e| e.starts_with("terminal spawn task failed:")),
+            "{settled:?}"
+        );
+        assert!(ctx.is_some(), "a join error leaves the context in place");
+        assert_eq!(
+            handed.lock().unwrap().len(),
+            2,
+            "a join error hands over nothing"
+        );
+
+        let mut ctx = new_ctx();
+        assert_eq!(
+            settle_terminal_spawn::<u8>(Ok(Ok(7)), &mut ctx, remove),
+            Ok(7)
+        );
+        assert!(ctx.is_some());
+        assert_eq!(
+            handed.lock().unwrap().len(),
+            2,
+            "a spawned session hands over nothing"
+        );
+    }
+
+    /// A gate continuation's PTY carries the gate pair AND an armed Stop-hook
+    /// mode when the flag is unset — the script short-circuits on that
+    /// variable, so without it the registered hook never reaches the verdict.
+    /// An explicit `off` is forwarded as `off`.
+    #[test]
+    fn gate_identity_env_arms_the_stop_hook_unless_the_flag_is_off() {
+        use crate::mcp::continuation_verdict::{FlagReading, Mode, FLAG_ENV};
+        let gate = GateIdentity {
+            gate_id: uuid::Uuid::new_v4(),
+            consuming_device_id: uuid::Uuid::new_v4(),
+        };
+        let get = |env: &[(String, String)], k: &str| {
+            env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone())
+        };
+        let env = gate_identity_env(gate, FlagReading::Unset);
+        assert_eq!(get(&env, GATE_ID_ENV), Some(gate.gate_id.to_string()));
+        assert_eq!(
+            get(&env, GATE_DEVICE_ID_ENV),
+            Some(gate.consuming_device_id.to_string())
+        );
+        assert_eq!(get(&env, FLAG_ENV).as_deref(), Some("on"));
+
+        let env = gate_identity_env(gate, FlagReading::Explicit(Mode::Off));
+        assert_eq!(get(&env, FLAG_ENV).as_deref(), Some("off"));
+    }
+
     /// The close envelope carries the outcome as a TYPED value in `data`, never
     /// as prose in `message` — `message` is for humans, `data` is for callers.
     /// A typed fact flattened into a success-envelope string is exactly the
@@ -3295,14 +3628,21 @@ mod tests {
             CloseOutcome::AlreadyClosed {
                 claude_session_id: "s".to_string(),
             },
+            CloseOutcome::IgnoredDuringShutdown {
+                claude_session_id: "s".to_string(),
+            },
             CloseOutcome::TerminalSuperseded {
                 requested: "s".to_string(),
                 terminal_id: "t-old".to_string(),
             },
+            CloseOutcome::HeldInFlight {
+                requested: "s".to_string(),
+                terminal_id: "t-new".to_string(),
+            },
         ] {
             assert!(
                 close_outcome_response(&resolved).success,
-                "{resolved:?} resolved to a real record — it is a success"
+                "{resolved:?} is not a failure (it resolved, or was deliberately not consulted)"
             );
         }
     }
@@ -3353,6 +3693,72 @@ mod tests {
         assert!(gone.awaiting_account_since.is_some());
     }
 
+    /// Phase 6 of plan `2026-10-28-force-exited-runner-restore-set-follow-ups`,
+    /// at the command layer: the close reads the REAL manager's latch. A
+    /// `pty-exit` before `close_all` closes its row; once `close_all` has run, a
+    /// `pty-exit` leaves its row `open`, while `explicit` still closes.
+    #[test]
+    fn record_close_for_reads_the_managers_shutdown_latch() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        for id in ["before", "after", "user"] {
+            let mut r = restore_candidate_record(id);
+            r.terminal_id = format!("term-{id}");
+            store.record_open(r);
+        }
+        let tm = TerminalManager::new();
+
+        let before = record_close_for(&tm, &store, "before", Some("term-before"), "pty-exit");
+        assert!(matches!(before, CloseOutcome::Closed { .. }), "{before:?}");
+        assert_eq!(store.get("before").unwrap().state, "closed");
+
+        let _ = tm.close_all(std::time::Instant::now());
+
+        let after = record_close_for(&tm, &store, "after", Some("term-after"), "pty-exit");
+        assert!(
+            matches!(after, CloseOutcome::IgnoredDuringShutdown { .. }),
+            "{after:?}"
+        );
+        assert_eq!(store.get("after").unwrap().state, "open");
+
+        let user = record_close_for(&tm, &store, "user", Some("term-user"), "explicit");
+        assert!(matches!(user, CloseOutcome::Closed { .. }), "{user:?}");
+    }
+
+    /// A `pty-exit` close of a terminal this manager no longer holds has no
+    /// spawn time to read, so D3 condition 2 ("no CLI started in this pane")
+    /// cannot be read either: even a pane whose shim reported a resume-shaped
+    /// launch failure keeps `pty-exit`, because a cause is never asserted on
+    /// weaker evidence than its rule names.
+    #[test]
+    fn record_close_for_keeps_pty_exit_when_the_terminal_is_gone() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        let tag = uuid::Uuid::new_v4();
+        let (id, term) = (format!("sess-gone-{tag}"), format!("term-gone-{tag}"));
+        let mut r = restore_candidate_record(&id);
+        r.terminal_id = term.clone();
+        // Hook-stamped long before any pane this manager could hold.
+        r.last_session_start_at = Some(1);
+        store.record_open(r);
+        crate::terminal::launch_failure::registry().record_beacon(
+            Some(term.as_str()),
+            "resolve-failed",
+            "waited=10 stub=false settings=true user_session_id=true",
+            chrono::Utc::now().timestamp_millis() - 5_000,
+        );
+        let tm = TerminalManager::new();
+        assert!(tm.get(&term).is_none(), "the pane is gone from the manager");
+
+        let out = record_close_for(&tm, &store, &id, Some(term.as_str()), "pty-exit");
+        assert!(matches!(out, CloseOutcome::Closed { .. }), "{out:?}");
+        assert_eq!(
+            store.get(&id).unwrap().close_reason.as_deref(),
+            Some("pty-exit")
+        );
+    }
+
     fn restore_candidate_record(id: &str) -> TerminalSessionRecord {
         TerminalSessionRecord {
             claude_session_id: id.to_string(),
@@ -3388,6 +3794,8 @@ mod tests {
             wind_down_arm: None,
             finish_reason: None,
             finish_synced: false,
+            finish_coord_session_id: None,
+            finish_coord_readdressed: false,
             spawn_device_default: None,
             adopted_from: None,
             last_session_start_at: None,
@@ -3641,6 +4049,7 @@ mod tests {
             gate_identity: None,
             coord_lineage,
             policy_delivery: None,
+            spawn_origin: crate::coord_drain_state::SpawnOrigin::GateContinuation,
         };
 
         let pinned = hint(Some(CoordSessionLineage::for_pinned_session("pinned-1")));
@@ -3688,6 +4097,7 @@ mod tests {
             gate_identity: None,
             coord_lineage: None,
             policy_delivery: None,
+            spawn_origin: crate::coord_drain_state::SpawnOrigin::GateContinuation,
         });
         warn_untracked_backend_spawn(&hint, "Hinted", "/work/dir");
         assert_eq!(
@@ -4167,5 +4577,103 @@ mod tests {
             None,
             "a whitespace config_dir must normalize to None, not persist as a blank"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Rebind: the record's page follows the pane it is bound to (plan
+    // 2026-11-07-triage-sessions-ten-gaps-from-an-every-page-act-run, N10)
+    // ---------------------------------------------------------------------
+
+    /// A live pane on `page` under `terminal_id`, marked dead again before it
+    /// drops (a live fixture's `Drop` would otherwise close it), even on panic.
+    struct LivePaneOn {
+        tm: TerminalManager,
+        session: Arc<crate::terminal::session::TerminalSession>,
+    }
+    impl Drop for LivePaneOn {
+        fn drop(&mut self) {
+            self.session.set_alive_for_test(false);
+        }
+    }
+    fn live_pane_on(terminal_id: &str, page: &str) -> LivePaneOn {
+        let tm = TerminalManager::new();
+        let session = Arc::new(crate::terminal::session::tests::make_test_session(
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+        ));
+        session.set_alive_for_test(true);
+        session.set_page(page.to_string());
+        tm.insert_for_test(terminal_id, session.clone());
+        LivePaneOn { tm, session }
+    }
+
+    /// N10: a boot-restore rebind onto a pane on page P leaves the record on
+    /// P. `rebind_terminal` alone keeps the record's old page — the defect.
+    #[test]
+    fn rebind_onto_a_pane_on_page_p_leaves_the_record_on_p() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        store.record_open(restore_candidate_record("sess-moved"));
+        let pane = live_pane_on("term-new", "page-P");
+
+        store.rebind_terminal("sess-moved", "term-new", 1);
+        assert_eq!(
+            store.get("sess-moved").unwrap().page_id,
+            "default",
+            "the store's re-point alone does not move the page"
+        );
+
+        rebind_and_sync_page(&store, &pane.tm, "sess-moved", "term-new", 1).unwrap();
+        let rec = store.get("sess-moved").unwrap();
+        assert_eq!(rec.terminal_id, "term-new");
+        assert_eq!(rec.zone_index, 1);
+        assert_eq!(rec.page_id, "page-P", "the record follows the live pane");
+    }
+
+    /// N10, read side: after the rebind, the `/sessions/history` row
+    /// (`build_past_sessions`, the builder `list_history` serves) names the
+    /// live pane's page, in the `pageId` the route serializes.
+    #[test]
+    fn history_row_page_id_equals_the_live_panes_page_after_rebind() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        store.record_open(restore_candidate_record("sess-hist"));
+        let pane = live_pane_on("term-hist", "page-P");
+
+        rebind_and_sync_page(&store, &pane.tm, "sess-hist", "term-hist", 0).unwrap();
+
+        let opts = crate::session::past_sessions::PastSessionsOpts {
+            include_shells: true,
+            ..Default::default()
+        };
+        let rows = crate::session::past_sessions::build_past_sessions(
+            &store,
+            &dir.path().join("no-snapshot-history.jsonl"),
+            &opts,
+        );
+        let row = rows
+            .iter()
+            .find(|r| r.claude_session_id == "sess-hist")
+            .expect("history row");
+        let wire = serde_json::to_value(row).unwrap();
+        assert_eq!(wire["pageId"], "page-P");
+        assert_eq!(
+            Some(wire["pageId"].as_str().unwrap().to_string()),
+            pane.tm.live_page_of("term-hist")
+        );
+    }
+
+    /// A rebind onto a pane the manager does not hold (or a dead one) keeps
+    /// the record's page rather than inventing one.
+    #[test]
+    fn rebind_onto_an_unheld_pane_keeps_the_records_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        let mut rec = restore_candidate_record("sess-keep");
+        rec.page_id = "page-K".to_string();
+        store.record_open(rec);
+        let tm = TerminalManager::new();
+
+        rebind_and_sync_page(&store, &tm, "sess-keep", "term-unheld", 0).unwrap();
+        assert_eq!(store.get("sess-keep").unwrap().page_id, "page-K");
     }
 }

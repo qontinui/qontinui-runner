@@ -78,6 +78,7 @@ mcp/backend_relay.rs | end_admitted_terminal | helper | end_admitted_terminal(
 mcp/backend_relay.rs | handle_terminal_end | relay | TARGET `terminal_end` from a source device under an attach grant (no user-session stamp): graceful → refused `no_close_authority` on a live claude, `NoLiveClaude` → the bare shell's close; `force` → `tm.close`
 
 # ── the relay's other closes
+mcp/backend_relay.rs | end_under_create_grant | relay | TARGET `terminal_end` from a source device under the CREATE grant that spawned the pane (plan 2026-09-23-remote-create-residuals Phase 2), admitted by `admit_create_grant_end` only for the tombstone's own terminal while no attach grant has ever bound it; graceful → refused `no_close_authority` on a live claude, `force` → `tm.close`
 mcp/backend_relay.rs | handle_terminal_close | relay | TARGET `terminal_close` from the relay — qontinui-web's user-session terminal path, which carries no `origin: user_session` stamp before P6f-1
 mcp/backend_relay.rs | handle_inbound | exempt | a terminal never handed to a session: a remote create whose `terminal_created` reply could not be delivered (`deliver_create_reply`), closed before any source learned its id
 mcp/backend_relay.rs | handle_terminal_create | exempt | a terminal never handed to a session: a remote create whose coord registration failed (`settle_remote_registration`), closed and the create refused before any reply
@@ -92,6 +93,7 @@ mcp/backend_relay.rs | terminal_gone_after_confirm | exempt | closes the coord r
 mcp/remote_terminal.rs | end | helper | client().end(
 commands/remote_end.rs | end_remote_session | helper | end_remote_session(
 commands/remote_end.rs | remote_session_end | webview | the plain `remote_session_end` Tauri command (the single-session end flow and the bulk "Close all finished"); its end arrives at the target as a `relay` end (`handle_terminal_end`), where a graceful end is refused `no_close_authority` on a live claude
+commands/remote_create.rs | terminal_create_remote | webview | the plain `terminal_create_remote` Tauri command: on an attach-stage failure it sends one forced `remote_terminal_end` under the create grant it just spent (`EndGrant::Create`), closing the orphan it spawned; it arrives at the target as a `relay` end (`end_under_create_grant`), refused unless the tombstone binds that terminal and nothing ever attached
 mcp/tauri_proxy.rs | dispatch | agent | POST /ui-bridge/tauri/invoke, which any local process reaches: its `terminal_close` arm (`tm.close`) and its `remote_session_end` arm (`end_remote_session`, force passed through)
 
 # ── local closes
@@ -101,7 +103,15 @@ mcp/terminals.rs | close_terminal_handler | agent | DELETE /terminals/{id} — a
 mcp/steward.rs | reap_emptied_panes | exempt | no live claude in the pane: a steward pane already emptied of its claude (`steward_pane_is_emptied` over the process table), reaped before its kind restarts
 mcp/steward.rs | start_steward | exempt | a terminal never handed to a session: the steward pane just created, closed when its metadata could not be recorded, before the detached launch task types `claude`
 looping_agent_supervisor.rs | supervise_one | product | the looping-agent supervisor's Relaunch kills a live idle claude at a cycle boundary with no probe, and its loop continues in the fresh instance it spawns (state in the journal); the same fn also closes a tab whose process already EXITED (no live claude). NOT in architecture §3.8's inventory, so its door class is an open question for R0b-1 (Phase 15) to settle before doors are recorded at runtime
-terminal/account_migration.rs | migrate_session | exempt | the Migrator's close of a migrated session's OLD instance once its replacement is up — the session lives on in the new instance (§4.6)
+# ── the respawn liveness proof (plan 2026-10-20-account-migration-respawn-dies-during-cli-reinstall-churn):
+#    the account migration, the resume door and the respawn receiver all close through
+#    `PaneOps::close`, whose real impl is `ManagerPanes::close` → `TerminalManager::close`
+terminal/respawn_liveness.rs | close | helper | panes.close(
+terminal/respawn_liveness.rs | hand_off | exempt | the Migrator's close of a migrated session's OLD instance once its replacement is PROVEN alive (child running AND painting Busy or a debounced Ready prompt, `await_resumed_cli`) — the session lives on in the new instance (§4.6); never reached on an Unknown or Died verdict
+terminal/respawn_liveness.rs | retire | exempt | a pane superseded by the pane that now owns the session row: a dead retry's pane once the next one is spawned, or — on a rollback — the pane under proof once the pre-migration record is restored EXACTLY onto the still-running old pane (`restore_record_exact`, `OldPane::Running`); the session lives on in the pane it was handed to (§4.6)
+terminal/respawn_liveness.rs | end_failed | exempt | the end of a respawn that did NOT prove alive: with the old pane running it rolls back (`retire`); otherwise it closes a pane whose resumed CLI was judged `Died` (its child exited, or its exit-close is already held — `judged`), or one the USER closed while under proof, whose close it applies to the row; no live claude is ended on the respawn's own say-so
+terminal/respawn_liveness.rs | abort_for_closed_old | product | the USER closed the OLD pane mid-migration: the migration is abandoned and the pane under proof (which may host the resumed claude) is closed, so the session ends as the user asked rather than living on unseen in a pane they never chose; the respawn's own lifecycle close, not a door
+terminal/respawn_liveness.rs | drop | product | a CANCELLED respawn's close hold: with the old pane running, the session is restored EXACTLY onto it and the pane under proof is closed (a second `claude --resume` on one session id otherwise runs on untracked); with the old pane closed by the USER, the pane under proof is closed and the session ends as they asked; the respawn's own lifecycle close, not a door
 
 # ── the session transports' teardown, and the registry close that drives it
 session/transport/pty.rs | close | helper | transport.close(
@@ -109,8 +119,7 @@ session/transport/claude_cli.rs | close | helper | transport.close(
 session/mod.rs | close_by_id | helper | close_by_id(
 agent_runtime.rs | run_continuation_terminal | exempt | a never-started gate-continuation pane: closes its coord registry row after the start verdict saw no session start; an External row (terminal panes register external), so it reaches no terminal
 agent_runtime.rs | run_condition_check_terminal | exempt | a never-started condition-check pane: closes its coord registry row after the start verdict saw no session start; External row — reaches no terminal
-commands/terminal.rs | terminal_create | exempt | the operator tab's on-exit hook closes its coord registry row once the PTY has exited; External row — reaches no terminal
-commands/terminal.rs | create_terminal_session_backend | exempt | a backend-created pane's on-exit hook closes its coord registry row once the PTY has exited; External row — reaches no terminal
+commands/terminal/coord_wiring.rs | bind_registered_coord_session | exempt | the on-exit hook every terminal create door installs (Tauri command, invoke proxy, POST /terminals, steward start, backend spawn) closes the pane's coord registry row once the PTY has exited; External row — reaches no terminal
 
 # ── runner exit
 mcp/ai_session.rs | run_teardown | runner_exit | `TerminalManager::close_all` at shutdown, under the teardown budget (NC5-7)

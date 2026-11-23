@@ -188,7 +188,7 @@ pub(crate) fn invalid_utf8_message(rejection_text: &str) -> Option<String> {
 }
 
 /// Build a 400 envelope for a body that is not UTF-8 (see [`invalid_utf8_message`]).
-fn envelope_400_invalid_utf8(msg: String) -> (StatusCode, Json<ApiResponse<()>>) {
+pub(crate) fn envelope_400_invalid_utf8(msg: String) -> (StatusCode, Json<ApiResponse<()>>) {
     (
         StatusCode::BAD_REQUEST,
         Json(ApiResponse::<()>::error_with_code(msg, CODE_INVALID_UTF8)),

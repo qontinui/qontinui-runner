@@ -35,6 +35,11 @@
 //!   install tools) before the fail-open fall-through, which then names the
 //!   tool and the `PATH` searched on stderr. A resolved tool never waits; see
 //!   [`resolve_real_waiting`].
+//! - **Settle wait (identity only).** An identity launch also waits, inside the
+//!   SAME bound, for a resolved `claude`/`gemini` whose target changed under
+//!   [`SETTLE_MIN_AGE`] ago — an install may still be writing it — and launches
+//!   it anyway at the bound, after one stderr line. A long-settled tool pays
+//!   one `stat` and no wait; see [`resolve_real_settled_waiting`].
 //!
 //! Registry creds: like the rest of interception, the stub injects NO registry
 //! secrets — the agent's shell already carries the operator's registry config.
@@ -59,11 +64,13 @@ use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use qontinui_runner_lib::intercept_core::classify::{self, Classification, ShimTool};
 use qontinui_runner_lib::intercept_core::gate::{should_block, InterceptMode};
 use qontinui_runner_lib::intercept_core::npm_placeholder::is_npm_placeholder;
+use qontinui_runner_lib::intercept_core::settled::{settle_of, Settle, SETTLE_MIN_AGE};
+use qontinui_runner_lib::intercept_core::shim_dir::is_qontinui_shim_dir;
 use qontinui_runner_lib::intercept_core::types::PackageSpecInput;
 
 const GUARD_ENV: &str = "QONTINUI_INSTALL_INTERCEPT_GUARD";
@@ -379,6 +386,23 @@ pub fn identity_mcp_config_args(tool: IdentityTool, mcp_config_path: Option<&str
     }
 }
 
+/// The value to re-export as [`MCP_CONFIG_ENV`] after a self-provisioned mint,
+/// or `None` to leave the inherited value untouched. Only a mint that
+/// [`identity_mcp_config_args`] would actually pass to `claude` (claude, an
+/// existing file, a UTF-8 path) is exported, so every consumer of the variable
+/// in the child tree reads the config `claude` was given. `qontinui-pr` takes
+/// the variable as authoritative and refuses a set-but-missing file rather than
+/// walking up to an ancestor `.mcp.json`; without this export a self-provisioned
+/// session would have a working coord-mcp while its `qontinui-pr` refused (or
+/// read a stale value). A failed mint changes nothing.
+fn minted_mcp_config_export(tool: IdentityTool, minted: Option<&Path>) -> Option<String> {
+    let path = minted?.to_str()?;
+    if identity_mcp_config_args(tool, Some(path)).is_empty() {
+        return None;
+    }
+    Some(path.to_string())
+}
+
 /// Does the per-machine opt-in marker (`~/.qontinui/allow-session-coord-identity`)
 /// exist? This is the SAME file the runner-side mint route's gate requires. The
 /// runner-side gate (`coord_mcp::session_identity_gate`) lives in the runner BIN
@@ -581,12 +605,17 @@ pub fn identity_argv(
 /// The identity straddle, fail-open at every step. Returns the exit code to
 /// propagate. Mirrors `identity_shim.cmd`:
 /// resolve real → guard passthrough → settings/user-chose scan → best-effort
-/// confirmation POST → exec real with the composed argv.
+/// confirmation POST → exec real with the composed argv. A give-up — nothing
+/// launchable resolved, or the resolved tool would not start — is reported to
+/// the runner as a launch failure, as the bash shim does (see
+/// [`post_launch_failure`]).
 fn run_identity(tool: IdentityTool, args: &[String]) -> Option<i32> {
     let own_dirs = own_shim_dirs();
-    let real = resolve_real_waiting(tool.program(), &own_dirs, IDENTITY_RESOLVE_WAIT);
+    let real = resolve_real_settled_waiting(tool.program(), &own_dirs, IDENTITY_RESOLVE_WAIT);
 
     // Recursion guard: a nested invocation never re-pins — pure passthrough.
+    // Nor does it report a launch failure: a nested `claude` must never mark
+    // its parent's pane, which may be running fine.
     if env::var(GUARD_ENV).ok().as_deref() == Some("1") {
         return exec_real(&real, tool.program(), args);
     }
@@ -619,6 +648,9 @@ fn run_identity(tool: IdentityTool, args: &[String]) -> Option<i32> {
     };
     if let Some(path) = minted_config.as_ref() {
         mcp_config = identity_mcp_config_args(tool, path.to_str());
+    }
+    if let Some(export) = minted_mcp_config_export(tool, minted_config.as_deref()) {
+        env::set_var(MCP_CONFIG_ENV, export);
     }
 
     // Fire-and-forget DIAGNOSTIC beacon on EVERY (non-nested) invocation —
@@ -667,6 +699,22 @@ fn run_identity(tool: IdentityTool, args: &[String]) -> Option<i32> {
         }
     }
 
+    // Nothing launchable resolved within the wait: report the launch failure
+    // BEFORE the by-name fall-through below, as the bash shim does.
+    if real.is_none() {
+        let waited = resolve_wait_from(
+            env::var(RESOLVE_WAIT_ENV).ok().as_deref(),
+            IDENTITY_RESOLVE_WAIT,
+        );
+        let path_var = env::var_os("PATH").unwrap_or_default();
+        let stub = scan_path_in(tool.program(), &own_dirs, &path_var, Want::Placeholder).is_some();
+        post_launch_failure(
+            tool.program(),
+            EVENT_RESOLVE_FAILED,
+            &resolve_failed_detail(waited.as_secs(), stub, !settings.is_empty(), user_chose),
+        );
+    }
+
     let final_args = identity_argv(args, &settings, &mcp_config, pinned.as_deref(), user_chose);
     let delivered_file = std::env::var(POLICY_DELIVERED_FILE_ENV).ok();
     let env_remove: &[&str] = if keeps_policy_delivered_sha(tool, args, delivered_file.as_deref()) {
@@ -674,12 +722,105 @@ fn run_identity(tool: IdentityTool, args: &[String]) -> Option<i32> {
     } else {
         &[POLICY_DELIVERED_SHA_ENV, POLICY_DELIVERED_FILE_ENV]
     };
-    let code = exec_real_child_env(&real, tool.program(), &final_args, env_remove);
+    let code = match run_real_child_env(&real, tool.program(), &final_args, env_remove) {
+        Ok(code) => code,
+        Err(error) => {
+            // The RESOLVED tool could not be started at all (removed under us,
+            // not executable, ETXTBSY). A by-name dispatch that fails was
+            // already reported as `resolve-failed` above.
+            if real.is_some() {
+                post_launch_failure(
+                    tool.program(),
+                    EVENT_EXEC_FAILED,
+                    &exec_failed_detail(127, &error, !settings.is_empty(), user_chose),
+                );
+            }
+            Some(127) // command-not-found surrogate; never panic
+        }
+    };
     // Explicit, not incidental: the minted config holds a live device credential
     // and is deleted HERE — after the child that read it has exited. Dropping it
     // any earlier would delete the file before `claude` reads it at launch.
     drop(minted_config);
     code
+}
+
+/// The identity shim's launch-failure beacon events — the same `event` values
+/// the bash shim posts (plan `2026-11-10-migration-holds-for-missing-claude-cli`,
+/// Phase 2): no launchable real tool resolved within the wait, or the resolved
+/// one could not be started. The runner records them per terminal so a pane
+/// whose CLI never launched closes `launch-failed` rather than as a death.
+const EVENT_RESOLVE_FAILED: &str = "resolve-failed";
+const EVENT_EXEC_FAILED: &str = "exec-failed";
+
+/// Read/write bound for a launch-failure POST. Longer than the `invoked`
+/// beacon's [`BEACON_TIMEOUT`]: the launch has already failed, so there is no
+/// exec left to delay, and the runner must hold the record before this process
+/// exits. Still bounded, so a wedged loopback cannot hang the pane.
+const LAUNCH_FAILURE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// POST one launch-failure event to the runner's `/control/shim-beacon`.
+/// Fail-open: no port, a refused connection or a timeout are all swallowed,
+/// and the session row then keeps its old close reason — UNKNOWN, never a
+/// guess.
+fn post_launch_failure(provider: &str, event: &str, detail: &str) {
+    let Some(port) = env::var(PORT_ENV)
+        .ok()
+        .and_then(|p| p.trim().parse::<u16>().ok())
+    else {
+        return;
+    };
+    let terminal_id = env::var(TERMINAL_ID_ENV).unwrap_or_default();
+    let _ = http_post_with_timeouts(
+        port,
+        "/control/shim-beacon",
+        &launch_failure_beacon_body(&terminal_id, provider, event, detail),
+        &[],
+        CONNECT_TIMEOUT,
+        LAUNCH_FAILURE_TIMEOUT,
+    );
+}
+
+/// JSON body for a launch-failure `/control/shim-beacon` POST: the bash shim's
+/// `terminal_id` / `tool` / `event` / `detail` shape, plus `"surface":"exe"` as
+/// on [`shim_beacon_body`]. Pure — every input is a parameter — so the literal
+/// body is unit-testable.
+fn launch_failure_beacon_body(
+    terminal_id: &str,
+    provider: &str,
+    event: &str,
+    detail: &str,
+) -> String {
+    format!(
+        "{{\"terminal_id\":\"{}\",\"tool\":\"{}\",\"event\":\"{}\",\"surface\":\"exe\",\"detail\":\"{}\"}}",
+        json_escape(terminal_id),
+        json_escape(provider),
+        json_escape(event),
+        json_escape(detail)
+    )
+}
+
+/// The `resolve-failed` detail, in the bash shim's key=value shape. The
+/// runner's `launch-failed` decider reads `settings` (this stub delivers the
+/// SessionStart hook) and `user_session_id` (the argv chose its own session).
+fn resolve_failed_detail(waited_secs: u64, stub: bool, settings: bool, user_chose: bool) -> String {
+    format!("waited={waited_secs} stub={stub} settings={settings} user_session_id={user_chose}")
+}
+
+/// The `exec-failed` detail. Unlike bash's `exec`, this stub spawns the real
+/// tool once with no retry (`waited=0`) and has no exec status of its own:
+/// `status` is the exit code it reports in place of one, and `error` names the
+/// spawn error's kind.
+fn exec_failed_detail(
+    status: i32,
+    error: &std::io::Error,
+    settings: bool,
+    user_chose: bool,
+) -> String {
+    format!(
+        "status={status} waited=0 error={:?} settings={settings} user_session_id={user_chose}",
+        error.kind()
+    )
 }
 
 /// JSON body for the `/control/shim-beacon` diagnostic POST. Same fields the
@@ -1090,10 +1231,8 @@ fn resolve_real_waiting(
                 announced = true;
                 let _ = writeln!(
                     std::io::stderr(),
-                    "qontinui-shim: {name} not found on PATH (excluding the shim dirs); waiting up \
-                     to {}s for it to reappear (a package-manager reinstall briefly removes it, or \
-                     leaves the npm placeholder stub in its place)",
-                    wait.as_secs()
+                    "{}",
+                    wait_line(name, &WaitNote::Missing, wait)
                 );
             }
             std::thread::sleep(d);
@@ -1108,6 +1247,182 @@ fn resolve_real_waiting(
         );
     }
     found
+}
+
+/// [`resolve_real_waiting`] for the IDENTITY path, which also waits for the
+/// resolved tool to SETTLE (plan
+/// `2026-11-10-shim-settle-wait-and-in-memory-launch-liveness` Phase 3, D3).
+///
+/// npm writes the 340 MB native `claude` behind a `bin/claude` it has already
+/// re-linked, so the first hit can be an executable, non-stub image that is
+/// still being written (finding `18ee5471`). A candidate whose target changed
+/// under [`SETTLE_MIN_AGE`] ago is re-probed inside the SAME bound as a miss;
+/// at the bound it is launched anyway, after one stderr line, because something
+/// launchable did resolve (FAIL-OPEN) — an exec that then fails is still
+/// reported as `exec-failed`. An unreadable change time counts as settled. A
+/// final miss prints the same give-up line as [`resolve_real_waiting`] and
+/// returns `None`, so the caller's `resolve-failed` beacon is unchanged.
+fn resolve_real_settled_waiting(
+    name: &str,
+    own_dirs: &[PathBuf],
+    default_wait: Duration,
+) -> Option<PathBuf> {
+    let wait = resolve_wait_from(env::var(RESOLVE_WAIT_ENV).ok().as_deref(), default_wait);
+    let resolved = resolve_settled_with_wait(
+        || settle_probe(resolve_real(name, own_dirs), SystemTime::now()),
+        wait,
+        RESOLVE_POLL,
+        std::thread::sleep,
+        |note| {
+            let _ = writeln!(std::io::stderr(), "{}", wait_line(name, &note, wait));
+        },
+    );
+    match resolved {
+        Resolved::Settled(path) => Some(path),
+        Resolved::Unsettled(path) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "qontinui-shim: {} has not settled after {}s; launching it anyway",
+                path.display(),
+                wait.as_secs()
+            );
+            Some(path)
+        }
+        Resolved::Missed => {
+            let path_var = env::var_os("PATH").unwrap_or_default();
+            let _ = writeln!(
+                std::io::stderr(),
+                "{}",
+                unresolved_message(name, own_dirs, wait, &path_var)
+            );
+            None
+        }
+    }
+}
+
+/// One probe of [`resolve_real_settled_waiting`]: the resolved candidate, if
+/// any, judged by the shared predicate at `now`.
+///
+/// A candidate whose change time could not be read AND that no longer exists
+/// is a MISS (`None`), not [`Settle::Unknown`]: npm's reify renames
+/// `bin/claude` aside between the scan and the read, which is the window this
+/// wait exists for, and an unknown would launch the vanished path at once.
+/// `Unknown` stays for a path that exists with no readable change time.
+///
+/// On Windows the candidate is npm's wrapper, not the image, and the time is a
+/// stand-in that can read a long write's start, so coverage there is
+/// incidental (`intercept_core::settled`, "Windows limits").
+fn settle_probe(found: Option<PathBuf>, now: SystemTime) -> Option<(PathBuf, Settle)> {
+    let path = found?;
+    let settle = settle_of(&path, now);
+    if settle == Settle::Unknown && !path.exists() {
+        return None;
+    }
+    Some((path, settle))
+}
+
+/// The one stderr line each kind of wait announces, once.
+fn wait_line(name: &str, note: &WaitNote, wait: Duration) -> String {
+    match note {
+        WaitNote::Missing => format!(
+            "qontinui-shim: {name} not found on PATH (excluding the shim dirs); waiting up to \
+             {}s for it to reappear (a package-manager reinstall briefly removes it, or leaves \
+             the npm placeholder stub in its place)",
+            wait.as_secs()
+        ),
+        WaitNote::Changing { path, age } => format!(
+            "qontinui-shim: {} changed {}s ago (an install may still be writing it); waiting up \
+             to {}s for it to settle",
+            path.display(),
+            age.as_secs(),
+            wait.as_secs()
+        ),
+    }
+}
+
+/// What [`resolve_settled_with_wait`] concluded.
+#[derive(Debug, PartialEq, Eq)]
+enum Resolved {
+    /// A candidate that is settled, or whose settledness is unknown — launch it.
+    Settled(PathBuf),
+    /// The last candidate seen was still changing when the bound ran out —
+    /// launch it anyway (fail-open), after saying so.
+    Unsettled(PathBuf),
+    /// Nothing launchable resolved within the bound.
+    Missed,
+}
+
+/// Why [`resolve_settled_with_wait`] is waiting; each is announced at most once.
+#[derive(Debug, PartialEq, Eq)]
+enum WaitNote {
+    /// No candidate on `PATH` (or only npm's placeholder stub).
+    Missing,
+    /// A candidate whose target changed `age` ago, under the minimum.
+    Changing { path: PathBuf, age: Duration },
+}
+
+/// The pure core of [`resolve_real_settled_waiting`]: one bound over both
+/// waits. `probe` returns the current candidate and its [`Settle`]; a
+/// `Settled` or `Unknown` candidate is taken at once, a miss or a `Changing`
+/// candidate is re-probed every `poll` until `wait` worth of polls are spent.
+/// At the bound, the last probe's `Changing` candidate is
+/// [`Resolved::Unsettled`]; a last probe that missed is [`Resolved::Missed`].
+/// A zero `wait` disables both waits: the first candidate is taken as found.
+/// Bounded by attempt COUNT like [`resolve_with_wait`], so tests drive it with
+/// a recording `sleep` and no real time passes.
+fn resolve_settled_with_wait<P, S, A>(
+    mut probe: P,
+    wait: Duration,
+    poll: Duration,
+    mut sleep: S,
+    mut announce: A,
+) -> Resolved
+where
+    P: FnMut() -> Option<(PathBuf, Settle)>,
+    S: FnMut(Duration),
+    A: FnMut(WaitNote),
+{
+    let first = probe();
+    if wait.is_zero() {
+        return first.map_or(Resolved::Missed, |(path, _)| Resolved::Settled(path));
+    }
+    let (mut said_missing, mut said_changing) = (false, false);
+    let mut last: Option<PathBuf> = None;
+    let mut observe = |seen: Option<(PathBuf, Settle)>, last: &mut Option<PathBuf>| {
+        match seen {
+            Some((path, Settle::Settled | Settle::Unknown)) => return Some(path),
+            Some((path, Settle::Changing { age })) => {
+                if !said_changing {
+                    said_changing = true;
+                    announce(WaitNote::Changing {
+                        path: path.clone(),
+                        age,
+                    });
+                }
+                *last = Some(path);
+            }
+            None => {
+                if !said_missing {
+                    said_missing = true;
+                    announce(WaitNote::Missing);
+                }
+                *last = None;
+            }
+        }
+        None
+    };
+    if let Some(path) = observe(first, &mut last) {
+        return Resolved::Settled(path);
+    }
+    let poll_ms = poll.as_millis().max(1);
+    let retries = wait.as_millis().div_ceil(poll_ms);
+    for _ in 0..retries {
+        sleep(poll);
+        if let Some(path) = observe(probe(), &mut last) {
+            return Resolved::Settled(path);
+        }
+    }
+    last.map_or(Resolved::Missed, Resolved::Unsettled)
 }
 
 /// The give-up line [`resolve_real_waiting`] prints. When what IS on `PATH` is
@@ -1198,15 +1513,21 @@ enum Want {
     Placeholder,
 }
 
-/// First candidate of kind `want` on `path_var`, skipping `own_dirs`.
+/// First candidate of kind `want` on `path_var`, skipping `own_dirs` and
+/// every qontinui shim dir ([`is_qontinui_shim_dir`]) — a foreign shim dir
+/// inherited from another runner session holds an identically named stub, and
+/// resolving it as the "real" tool made two shims dispatch to each other for
+/// ever (plan
+/// `2026-11-04-identity-shim-foreign-shim-ping-pong-and-secondary-runner-pty-socket-overflow`,
+/// Phase 1).
 fn scan_path_in(name: &str, own_dirs: &[PathBuf], path_var: &OsStr, want: Want) -> Option<PathBuf> {
     let own: Vec<PathBuf> = own_dirs.iter().map(|d| normalize_dir(d)).collect();
     for dir in env::split_paths(path_var) {
         if dir.as_os_str().is_empty() {
             continue;
         }
-        if own.contains(&normalize_dir(&dir)) {
-            continue; // skip our own dir(s) — never recurse
+        if own.contains(&normalize_dir(&dir)) || is_qontinui_shim_dir(&dir) {
+            continue; // skip our own dir(s) and any other qontinui shim — never recurse
         }
         // Windows real tools: cargo/pip = .exe; npm-family = .cmd. Prefer .exe.
         for cand_name in candidate_names(name) {
@@ -1275,6 +1596,19 @@ fn exec_real_child_env(
     args: &[String],
     env_remove: &[&str],
 ) -> Option<i32> {
+    // A spawn failure fails open to the command-not-found surrogate.
+    run_real_child_env(real, name, args, env_remove).unwrap_or(Some(127))
+}
+
+/// [`exec_real_child_env`] that reports a SPAWN failure as `Err` instead of
+/// folding it into the surrogate code, so the identity straddle can tell "the
+/// real tool could not be started" from "it ran and exited 127".
+fn run_real_child_env(
+    real: &Option<PathBuf>,
+    name: &str,
+    args: &[String],
+    env_remove: &[&str],
+) -> std::io::Result<Option<i32>> {
     let mut cmd = match real {
         Some(p) => Command::new(p),
         // No resolved real tool: dispatch by name and let the OS PATH find it.
@@ -1284,7 +1618,7 @@ fn exec_real_child_env(
         // Already a nested invocation (the guard is set) and still nothing
         // outside our dirs: dispatching by name could only find a shim of ours
         // again — a chain of re-entries. Command-not-found, loudly, instead.
-        None if env::var(GUARD_ENV).ok().as_deref() == Some("1") => return Some(127),
+        None if env::var(GUARD_ENV).ok().as_deref() == Some("1") => return Ok(Some(127)),
         None => {
             let mut c = Command::new(name);
             c.env(RESOLVE_WAIT_ENV, "0");
@@ -1299,10 +1633,7 @@ fn exec_real_child_env(
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    match cmd.status() {
-        Ok(st) => st.code(),
-        Err(_) => Some(127), // command-not-found surrogate; never panic
-    }
+    cmd.status().map(|st| st.code())
 }
 
 // ===========================================================================
@@ -1605,6 +1936,269 @@ mod tests {
         assert_eq!(calls, 1);
     }
 
+    /// A scripted probe for [`resolve_settled_with_wait`]: each call returns the
+    /// next step, and the last step repeats.
+    fn scripted(steps: Vec<Option<Settle>>) -> impl FnMut() -> Option<(PathBuf, Settle)> {
+        let mut i = 0;
+        move || {
+            let step = steps[i.min(steps.len() - 1)];
+            i += 1;
+            step.map(|settle| (PathBuf::from("/real/claude"), settle))
+        }
+    }
+
+    fn changing(ms: u64) -> Option<Settle> {
+        Some(Settle::Changing {
+            age: Duration::from_millis(ms),
+        })
+    }
+
+    #[test]
+    fn resolve_settled_with_wait_takes_a_settled_hit_without_sleeping() {
+        for first in [Settle::Settled, Settle::Unknown] {
+            let (mut sleeps, mut notes) = (0, Vec::new());
+            let got = resolve_settled_with_wait(
+                scripted(vec![Some(first)]),
+                Duration::from_secs(10),
+                Duration::from_millis(250),
+                |_| sleeps += 1,
+                |n| notes.push(n),
+            );
+            assert_eq!(
+                got,
+                Resolved::Settled(PathBuf::from("/real/claude")),
+                "{first:?}"
+            );
+            assert_eq!(sleeps, 0, "{first:?}: a settled hit never waits");
+            assert!(notes.is_empty(), "{first:?}: and announces nothing");
+        }
+    }
+
+    #[test]
+    fn resolve_settled_with_wait_announces_a_changing_tool_once_then_takes_it_settled() {
+        let (mut sleeps, mut notes) = (0, Vec::new());
+        let got = resolve_settled_with_wait(
+            scripted(vec![
+                changing(100),
+                changing(350),
+                changing(600),
+                Some(Settle::Settled),
+            ]),
+            Duration::from_secs(10),
+            Duration::from_millis(250),
+            |_| sleeps += 1,
+            |n| notes.push(n),
+        );
+        assert_eq!(got, Resolved::Settled(PathBuf::from("/real/claude")));
+        assert_eq!(sleeps, 3);
+        assert_eq!(
+            notes,
+            [WaitNote::Changing {
+                path: PathBuf::from("/real/claude"),
+                age: Duration::from_millis(100),
+            }],
+            "one announcement, for the first changing probe"
+        );
+    }
+
+    #[test]
+    fn resolve_settled_with_wait_launches_a_still_changing_tool_at_the_bound() {
+        let mut calls = 0;
+        let got = resolve_settled_with_wait(
+            || {
+                calls += 1;
+                Some((
+                    PathBuf::from("/real/claude"),
+                    Settle::Changing {
+                        age: Duration::ZERO,
+                    },
+                ))
+            },
+            Duration::from_secs(1),
+            Duration::from_millis(250),
+            |_| {},
+            |_| {},
+        );
+        assert_eq!(got, Resolved::Unsettled(PathBuf::from("/real/claude")));
+        assert_eq!(calls, 5, "1 initial probe + 1s / 250ms re-probes, no more");
+    }
+
+    #[test]
+    fn resolve_settled_with_wait_shares_one_bound_across_a_miss_and_a_change() {
+        let (mut sleeps, mut notes) = (0, Vec::new());
+        let got = resolve_settled_with_wait(
+            scripted(vec![
+                None,
+                None,
+                changing(0),
+                changing(250),
+                Some(Settle::Settled),
+            ]),
+            Duration::from_secs(2),
+            Duration::from_millis(250),
+            |_| sleeps += 1,
+            |n| notes.push(n),
+        );
+        assert_eq!(got, Resolved::Settled(PathBuf::from("/real/claude")));
+        assert_eq!(sleeps, 4);
+        assert_eq!(
+            notes,
+            [
+                WaitNote::Missing,
+                WaitNote::Changing {
+                    path: PathBuf::from("/real/claude"),
+                    age: Duration::ZERO,
+                },
+            ]
+        );
+
+        // The same shape with a bound too short to see it settle: still one
+        // bound, so the changing candidate goes out unsettled at it.
+        let got = resolve_settled_with_wait(
+            scripted(vec![None, None, changing(0)]),
+            Duration::from_millis(500),
+            Duration::from_millis(250),
+            |_| {},
+            |_| {},
+        );
+        assert_eq!(got, Resolved::Unsettled(PathBuf::from("/real/claude")));
+
+        // A candidate that vanishes on the last probe is a miss, not a launch
+        // of a path that is no longer there.
+        let got = resolve_settled_with_wait(
+            scripted(vec![changing(0), None]),
+            Duration::from_millis(500),
+            Duration::from_millis(250),
+            |_| {},
+            |_| {},
+        );
+        assert_eq!(got, Resolved::Missed);
+    }
+
+    #[test]
+    fn resolve_settled_with_wait_zero_takes_the_first_candidate_without_sleeping() {
+        for first in [changing(0), Some(Settle::Settled), None] {
+            let got = resolve_settled_with_wait(
+                scripted(vec![first]),
+                Duration::ZERO,
+                Duration::from_millis(250),
+                |_| panic!("a zero wait must never sleep"),
+                |_| panic!("a zero wait must never announce"),
+            );
+            let want = match first {
+                Some(_) => Resolved::Settled(PathBuf::from("/real/claude")),
+                None => Resolved::Missed,
+            };
+            assert_eq!(got, want, "{first:?}");
+        }
+    }
+
+    /// The file's own change time, as `intercept_core::settled` reads it, so
+    /// the probe is judged against the file rather than a wall clock a
+    /// saturated box could run ahead of.
+    fn own_change_time(path: &Path) -> SystemTime {
+        let meta = std::fs::metadata(path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            SystemTime::UNIX_EPOCH
+                + Duration::new(
+                    u64::try_from(meta.ctime()).unwrap(),
+                    u32::try_from(meta.ctime_nsec()).unwrap(),
+                )
+        }
+        #[cfg(not(unix))]
+        {
+            match (meta.created().ok(), meta.modified().ok()) {
+                (Some(c), Some(m)) => c.max(m),
+                (one, other) => one.or(other).unwrap(),
+            }
+        }
+    }
+
+    /// The probe the identity path runs judges the candidate with the shared
+    /// predicate: a file written just now is changing, and settled once its
+    /// own change time is 3 s old. A probe that stopped calling `settle_of`
+    /// would read every candidate as unknown, and launch it at once.
+    #[test]
+    fn settle_probe_judges_the_resolved_candidate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("claude");
+        std::fs::write(&file, b"image").unwrap();
+        let changed = own_change_time(&file);
+
+        let (path, settle) =
+            settle_probe(Some(file.clone()), changed + Duration::from_millis(500)).unwrap();
+        assert_eq!(path, file);
+        assert_eq!(
+            settle,
+            Settle::Changing {
+                age: Duration::from_millis(500)
+            }
+        );
+        assert_eq!(
+            settle_probe(Some(file.clone()), changed + Duration::from_secs(3)),
+            Some((file, Settle::Settled))
+        );
+        assert_eq!(settle_probe(None, changed), None, "a miss stays a miss");
+    }
+
+    /// A candidate the scan resolved that is gone by the time its change time
+    /// is read (npm's reify renamed it aside) is a miss, not an unknown.
+    #[test]
+    fn settle_probe_reads_a_candidate_that_vanished_as_a_miss() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gone = tmp.path().join("claude");
+        assert_eq!(settle_probe(Some(gone), SystemTime::now()), None);
+    }
+
+    /// Scripted: a candidate that vanishes mid-wait (the probe now reads it as
+    /// a miss) and comes back settled is waited out within one bound, never
+    /// launched while gone.
+    #[test]
+    fn resolve_settled_with_wait_waits_out_a_candidate_that_vanishes() {
+        let (mut sleeps, mut notes) = (0, Vec::new());
+        let got = resolve_settled_with_wait(
+            scripted(vec![changing(0), None, Some(Settle::Settled)]),
+            Duration::from_secs(10),
+            Duration::from_millis(250),
+            |_| sleeps += 1,
+            |n| notes.push(n),
+        );
+        assert_eq!(got, Resolved::Settled(PathBuf::from("/real/claude")));
+        assert_eq!(sleeps, 2);
+        assert_eq!(
+            notes,
+            [
+                WaitNote::Changing {
+                    path: PathBuf::from("/real/claude"),
+                    age: Duration::ZERO,
+                },
+                WaitNote::Missing,
+            ]
+        );
+    }
+
+    #[test]
+    fn the_settle_wait_line_names_the_path_age_and_bound() {
+        assert_eq!(
+            wait_line(
+                "claude",
+                &WaitNote::Changing {
+                    path: PathBuf::from("/npm/bin/claude"),
+                    age: Duration::from_millis(1_400),
+                },
+                Duration::from_secs(10),
+            ),
+            "qontinui-shim: /npm/bin/claude changed 1s ago (an install may still be writing \
+             it); waiting up to 10s for it to settle"
+        );
+        assert!(
+            wait_line("claude", &WaitNote::Missing, Duration::from_secs(10))
+                .starts_with("qontinui-shim: claude not found on PATH")
+        );
+    }
+
     #[test]
     fn resolve_wait_env_parses_seconds_and_fails_open_to_the_default() {
         let d = Duration::from_secs(10);
@@ -1638,6 +2232,43 @@ mod tests {
             normalize_dir(got.parent().unwrap()),
             normalize_dir(&realbin),
             "must resolve the real tool OUTSIDE the shim dir"
+        );
+    }
+
+    /// Plan 2026-11-04-identity-shim-foreign-shim-ping-pong-… Phase 1: a
+    /// FOREIGN qontinui shim dir (another runner session's, inherited on PATH
+    /// and absent from `own_dirs`) is skipped too — by name for either family,
+    /// and by the identity marker for a dir named otherwise.
+    #[test]
+    fn resolve_real_skips_a_foreign_qontinui_shim_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let own = tmp.path().join("qontinui-identity-own");
+        let foreign_identity = tmp.path().join("qontinui-identity-foreign");
+        let foreign_install = tmp.path().join("qontinui-shim-foreign");
+        let marked = tmp.path().join("renamed");
+        let realbin = tmp.path().join("realbin");
+        let exe = if cfg!(windows) {
+            "claude.exe"
+        } else {
+            "claude"
+        };
+        for d in [&own, &foreign_identity, &foreign_install, &marked, &realbin] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join(exe), b"\x7fELF stub").unwrap();
+        }
+        std::fs::write(marked.join(".qontinui-identity-build"), b"tag").unwrap();
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        let path = [&own, &foreign_identity, &foreign_install, &marked, &realbin]
+            .iter()
+            .map(|d| d.display().to_string())
+            .collect::<Vec<_>>()
+            .join(sep);
+        let got = resolve_real_in("claude", std::slice::from_ref(&own), OsStr::new(&path))
+            .expect("must resolve the REAL claude");
+        assert_eq!(
+            normalize_dir(got.parent().unwrap()),
+            normalize_dir(&realbin),
+            "a foreign qontinui shim dir must never be taken for the real tool"
         );
     }
 
@@ -1999,6 +2630,30 @@ mod tests {
         assert!(identity_mcp_config_args(IdentityTool::Claude, None).is_empty());
     }
 
+    /// The self-provisioned config is re-exported only when `claude` is given
+    /// it; a failed mint (no path, a missing file) or gemini leaves the
+    /// inherited variable alone.
+    #[test]
+    fn minted_mcp_config_export_only_for_a_config_claude_is_given() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("minted.json");
+        std::fs::write(&file, b"{}").unwrap();
+        assert_eq!(
+            minted_mcp_config_export(IdentityTool::Claude, Some(&file)),
+            Some(file.to_string_lossy().into_owned())
+        );
+        assert_eq!(minted_mcp_config_export(IdentityTool::Claude, None), None);
+        let missing = tmp.path().join("gone.json");
+        assert_eq!(
+            minted_mcp_config_export(IdentityTool::Claude, Some(&missing)),
+            None
+        );
+        assert_eq!(
+            minted_mcp_config_export(IdentityTool::Gemini, Some(&file)),
+            None
+        );
+    }
+
     /// §5 fail-open: gemini has no `--mcp-config` flag, so the fallback must
     /// never fire for it — the check is BEFORE any runner discovery, so this
     /// also proves gemini pays zero cost (no breadcrumb read, no HTTP).
@@ -2324,6 +2979,51 @@ mod tests {
         assert!(body2.contains(
             "\"detail\":\"user_session_id=true settings=false mcp_config=false pinned=false\""
         ));
+    }
+
+    /// The launch-failure POST bodies (plan
+    /// `2026-11-10-migration-holds-for-missing-claude-cli`, Phase 2): the bash
+    /// shim's literal shape plus `"surface":"exe"`, with the two flags the
+    /// runner's `launch-failed` decider reads, every value escaped.
+    #[test]
+    fn launch_failure_beacon_body_is_the_bash_shape_plus_surface() {
+        assert_eq!(
+            launch_failure_beacon_body(
+                "term-1",
+                "claude",
+                EVENT_RESOLVE_FAILED,
+                &resolve_failed_detail(10, false, true, true),
+            ),
+            r#"{"terminal_id":"term-1","tool":"claude","event":"resolve-failed","surface":"exe","detail":"waited=10 stub=false settings=true user_session_id=true"}"#
+        );
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            launch_failure_beacon_body(
+                "term-1",
+                "claude",
+                EVENT_EXEC_FAILED,
+                &exec_failed_detail(127, &denied, false, true),
+            ),
+            r#"{"terminal_id":"term-1","tool":"claude","event":"exec-failed","surface":"exe","detail":"status=127 waited=0 error=PermissionDenied settings=false user_session_id=true"}"#
+        );
+        assert_eq!(
+            launch_failure_beacon_body("t\"1", "claude", EVENT_RESOLVE_FAILED, "a\\b"),
+            r#"{"terminal_id":"t\"1","tool":"claude","event":"resolve-failed","surface":"exe","detail":"a\\b"}"#
+        );
+    }
+
+    /// `exec-failed` is reported only for a tool that could not be STARTED, so
+    /// the spawn must surface as `Err` rather than as the surrogate 127 a child
+    /// can also exit with. The surrogate is still what the stub returns.
+    #[test]
+    fn launch_failure_of_the_real_tool_is_a_spawn_error_not_an_exit_code() {
+        let gone = Some(PathBuf::from("/definitely/not/a/dir/qzx/claude"));
+        let spawned = run_real_child_env(&gone, "claude", &[], &[]);
+        assert!(
+            spawned.is_err(),
+            "a missing binary must not read as an exit: {spawned:?}"
+        );
+        assert_eq!(exec_real_child_env(&gone, "claude", &[], &[]), Some(127));
     }
 
     #[test]

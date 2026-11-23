@@ -318,8 +318,6 @@ pub struct ApiState {
     /// `RelayState` extracted from this state). Plan
     /// `2026-09-17-ui-bridge-relay-registration-is-unauthenticated`.
     pub relay_binding: Arc<crate::mcp::relay_binding::RelayBinding>,
-    /// Pairing manager for LAN and Cloud device authentication
-    pub pairing_manager: Arc<crate::mcp::transport::pairing::PairingManager>,
     /// Rathole tunnel client (Plan 1B). Singleton — only one tunnel active.
     pub tunnel_client: Arc<crate::tunnel::RatholeClient>,
     /// iOS transport sidecar (Plan 2). Started lazily on first iOS request.
@@ -408,10 +406,13 @@ pub struct ApiResponse<T: Serialize> {
     /// suggestions or workaround guidance to callers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<serde_json::Value>,
-    /// Canonical SCREAMING_SNAKE_CASE error code for transport-layer and
-    /// handler-level rejections (e.g. `INVALID_JSON`, `INVALID_REQUEST`,
-    /// `UNSUPPORTED_MEDIA_TYPE`, `PAYLOAD_TOO_LARGE`). Absent on success
-    /// responses and on legacy error paths that predate the envelope plan.
+    /// Machine-readable error code. Transport-layer and handler-level
+    /// rejections use SCREAMING_SNAKE_CASE (e.g. `INVALID_JSON`,
+    /// `INVALID_REQUEST`, `UNSUPPORTED_MEDIA_TYPE`, `PAYLOAD_TOO_LARGE`); a
+    /// shared refusal from `qontinui_types::refusal` carries its snake_case
+    /// wire form (`RefusalCode::as_str`, e.g. `workspace_root_unresolved`).
+    /// Absent on success responses and on legacy error paths that predate the
+    /// envelope plan.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
     /// Optional human-readable recovery suggestions surfaced to callers
@@ -472,6 +473,32 @@ impl<T: Serialize> ApiResponse<T> {
             error_detail: None,
             hint: None,
             code: Some(code.into()),
+            suggestions: None,
+        }
+    }
+
+    /// The error envelope for a surface that needed the workspace root and got
+    /// the typed [`WorkspaceRootUnresolved`](qontinui_types::paths::WorkspaceRootUnresolved)
+    /// instead — the same `error`/`code` as `/api-surface/scan`; `hint` carries
+    /// the full Refusal envelope. `error` is the error's one operator sentence
+    /// (never a re-wording), `code` is `workspace_root_unresolved`, and `hint`
+    /// is the shared refusal envelope (discriminator, next action, the
+    /// probe-order detail) for a reader that renders refusals itself — where
+    /// `/api-surface/scan` puts a plain string. Pair it with `422`.
+    pub fn workspace_root_unresolved(
+        unresolved: &qontinui_types::paths::WorkspaceRootUnresolved,
+    ) -> Self {
+        let refusal = unresolved.refusal(
+            qontinui_types::refusal::RefusalSource::Runner,
+            chrono::Utc::now().to_rfc3339(),
+        );
+        Self {
+            success: false,
+            data: None,
+            error: Some(unresolved.to_string()),
+            error_detail: None,
+            hint: serde_json::to_value(&refusal).ok(),
+            code: Some(refusal.code.as_str().to_string()),
             suggestions: None,
         }
     }

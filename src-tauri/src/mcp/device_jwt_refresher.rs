@@ -1442,11 +1442,17 @@ pub(crate) async fn attempt_pair_mint(
     //
     // D3: gated on the SPECIFIC bail reasons this fallback answers — NOT a
     // blanket "anything but Healthy". `BailTenantMismatch` is deliberately
-    // excluded: coord already minted for the wrong tenant once this tick, and
-    // a dmk exchange mints from the SAME `coord.devices.tenant_id` column that
-    // wrong mint may have just overwritten, so falling through here would
-    // repeat the incident rather than recover from it. `BailNeedsSignIn` is
-    // included: the exchange needs no user, which is exactly the case it is.
+    // excluded as a caution: coord already minted for the wrong tenant once
+    // this tick. The two mints take their tenant from different places — the
+    // pair-cli mint from the request or the operator's home tenant, the dmk
+    // exchange from `coord.devices.tenant_id` — so the exchange is not certain
+    // to repeat the mistake, but a tick that just saw one wrong-tenant mint
+    // stops rather than try a second door. The exchange would refuse a
+    // mismatched mint anyway (`expected_tenant`, see
+    // [`try_device_machine_key_exchange`]). Before qontinui-coord#3457 the
+    // wrong pair-cli mint could also overwrite that column; it no longer moves
+    // an already-paired device's home. `BailNeedsSignIn` is included: the
+    // exchange needs no user, which is exactly the case it is.
     let mut dmk_jwt = None;
     if matches!(
         progress,
@@ -2919,19 +2925,24 @@ pub(crate) fn binding_gaps() -> BindingGapReport {
 //
 // Phase 4 as first written had an "Arm A": when a stored Cognito refresh
 // token was in window, run `pair-cli` headlessly with the GAP's tenant id.
-// It was removed before it shipped, because coord's pairing write
-// (`record_pairing`, shared by `pair-cli` and `pair-complete`) does two
-// things no refresher may do on its own:
+// It was removed before it shipped. Coord's pairing write (`record_pairing`,
+// shared by `pair-cli` and `pair-complete`) UPSERTS `coord.tenant_devices`, so
+// a coord-side unbind would be silently reversed by the next pass that still
+// believed the binding. No refresher may do that on its own, so this module
+// never runs it for a NON-default bound tenant's slot. Its one pre-existing
+// `pair-cli` call is the default tenant's own refresh in [`try_refresh_once`],
+// which re-binds that tenant in the same way; the per-tenant seed is kept off
+// that path.
 //
-// 1. it rewrites `coord.devices.tenant_id` to the requested tenant — the
-//    device's HOME pointer, which `machine-credential/exchange` mints for —
-//    so seeding non-default tenant B would make the default tenant's own
-//    recovery mint B and be refused as `TenantMismatch`;
-// 2. it UPSERTS `coord.tenant_devices`, so a coord-side unbind would be
-//    silently reversed by the next pass that still believed the binding.
+// When the arm was removed the write also rewrote `coord.devices.tenant_id`,
+// the device's HOME pointer, which `machine-credential/exchange` mints for.
+// qontinui-coord#3457 stopped that for a device that is already paired: the
+// home moves only when the caller names one, or on a never-paired row. That
+// half of the reason no longer holds; the UPSERT alone keeps this rule for
+// the non-default slots.
 //
 // The safe headless seed is a coord door that mints for an EXISTING binding
-// without touching either (the plan's Phase 6), consumed here by Phase 7.
+// without creating one (the plan's Phase 6), consumed here by Phase 7.
 // Phase 7 consumes that door ([`seed_tenant_slot`]): ONCE per tenant per
 // lapse, attempt recorded BEFORE the call, falling back to ONE durable ask
 // per tenant per lapse when it does not put a slot there (and to NO ask when
@@ -2966,19 +2977,40 @@ pub(crate) fn binding_gaps() -> BindingGapReport {
 pub const AUTONOMY_BINDING_GAP_EVENT: &str = "autonomy-binding-gap";
 
 /// Why the operator is asked rather than the runner seeding the slot itself.
-/// Stored on the record and shown verbatim.
+/// Shown verbatim, with the seed attempt's outcome appended by
+/// [`binding_gap_ask_reason`].
 pub(crate) const BINDING_GAP_ASK_REASON: &str = "this tenant's credential was not seeded \
-     automatically, and the runner never runs coord's pairing door (pair-cli) unattended: it \
-     also re-points this device's home tenant and re-creates the binding";
+     automatically, and the runner never runs coord's pairing door (pair-cli) unattended: a \
+     pairing re-creates the binding even if an operator removed it";
 
-/// What the heal command also does, stated on every ask. Pairing goes
-/// through coord's `record_pairing`, which makes the paired tenant this
-/// device's home (`coord.devices.tenant_id`), and qontinui-web rotates the
-/// device's single machine key to it.
-pub(crate) const BINDING_GAP_PAIR_CAVEAT: &str = "pairing also makes this tenant the \
-     device's home tenant in coord and rotates its machine key to it — that is how \
-     pairing works; coord's per-binding seed door (tried first, once per lapse) is the \
-     path that does neither, and it did not put a credential in this slot";
+/// What the heal command does and does not move, stated on every ask so nobody
+/// declines the heal for a side effect it no longer has. Since
+/// qontinui-coord#3457 a pairing leaves an already-paired device's home
+/// (`coord.devices.tenant_id`) alone unless the caller names one, and the
+/// `qontinui_profile device pair --tenant-id` command the ask offers names
+/// none. That command, with no `--auth-token`, pairs through the browser flow
+/// (web's `pair-confirm`), which mints no machine key at all; with
+/// `--auth-token` it goes through web's `pair-cli`, whose auto-mint keeps a key
+/// that is usable for more than `SELF_MINT_RENEWAL_WINDOW` (7 days).
+pub(crate) const BINDING_GAP_PAIR_CAVEAT: &str = "pairing binds this tenant to this device; \
+     for a device that is already paired it leaves the home tenant alone and keeps a \
+     machine key with more than a week left. Coord's per-binding seed door is the \
+     automatic path, and this slot still has no credential from it";
+
+/// The ask's operator-facing reason: today's [`BINDING_GAP_ASK_REASON`],
+/// plus what this lapse's seed attempt came to when there was one. Built each
+/// time the ask is shown rather than stored, so correcting the text corrects
+/// asks that are already open.
+pub(crate) fn binding_gap_ask_reason(seed_outcome: &str) -> String {
+    if seed_outcome.is_empty() {
+        BINDING_GAP_ASK_REASON.to_string()
+    } else {
+        format!(
+            "{BINDING_GAP_ASK_REASON}; automatic seed through coord's per-binding \
+             door: {seed_outcome}"
+        )
+    }
+}
 
 /// One tenant's state within the CURRENT lapse — the record that makes
 /// "exactly once" survive a restart, and the ask the UI reads back.
@@ -2987,8 +3019,10 @@ pub(crate) const BINDING_GAP_PAIR_CAVEAT: &str = "pairing also makes this tenant
 /// opens when a MEASURED, act-grade report first names the tenant and closes
 /// when a MEASURED report stops naming it. An `Unknown` report closes nothing.
 ///
-/// Unknown fields are ignored on read, so a record written by the pre-review
-/// build (which also carried `mint_attempted`) still loads.
+/// Unknown fields are ignored on read, so a record written by an older build
+/// (which also carried `mint_attempted`, or a stored `reason`) still loads.
+/// The reason is not stored: [`binding_gap_ask_reason`] builds it when the
+/// ask is shown, so an ask opened by an older build shows today's text.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct GapAskRecord {
     /// True once the ask for this tenant in this lapse has been RECORDED —
@@ -2998,17 +3032,13 @@ pub(crate) struct GapAskRecord {
     /// Unix seconds when this lapse was first observed.
     #[serde(default)]
     pub first_seen: i64,
-    /// The operator-facing reason, stored so the pull path can render the
-    /// ask without re-deriving it.
-    #[serde(default)]
-    pub reason: String,
     /// True once the Phase 7 seed attempt for this tenant in this lapse has
     /// been RECORDED — written BEFORE the network call, so a crash mid-call
     /// or a refusal can never produce a second attempt in the same lapse.
     #[serde(default)]
     pub seed_attempted: bool,
     /// What the seed attempt came to, in operator words; empty until the
-    /// attempt concludes. Folded into the ask's `reason` when it falls back.
+    /// attempt concludes. [`binding_gap_ask_reason`] folds it into the ask.
     #[serde(default)]
     pub seed_outcome: String,
     /// True when coord's seed door answered `403 not_bound`: coord says this
@@ -3049,7 +3079,6 @@ impl GapAskState {
             .or_insert(GapAskRecord {
                 notified: false,
                 first_seen: now,
-                reason: String::new(),
                 seed_attempted: false,
                 seed_outcome: String::new(),
                 seed_not_bound: false,
@@ -3174,7 +3203,9 @@ pub(crate) fn binding_gap_ask_payload(
         "command": format!("qontinui_profile device pair --tenant-id {tenant}"),
         // Said, not hidden: the heal is the SAME coord pairing write the
         // runner refuses to run unattended, so a human running it should know
-        // what it moves. The plan's Phase 6 door removes this caveat.
+        // what it moves and what it leaves alone. Phase 7's seed door is tried
+        // first when this runner can present a credential for it; this ask is
+        // the fallback when no credential reached the slot that way.
         "caveat": BINDING_GAP_PAIR_CAVEAT,
         "first_seen": first_seen,
     })
@@ -3220,16 +3251,149 @@ pub(crate) fn open_binding_gap_asks(
             .filter(|(_, r)| r.notified)
             .filter_map(|(k, r)| {
                 let tenant = uuid::Uuid::parse_str(k).ok()?;
-                let reason = if r.reason.is_empty() {
-                    BINDING_GAP_ASK_REASON
-                } else {
-                    r.reason.as_str()
-                };
-                (bound.contains(&tenant) && !slots.contains(&tenant))
-                    .then(|| binding_gap_ask_payload(&tenant, reason, r.first_seen))
+                (bound.contains(&tenant) && !slots.contains(&tenant)).then(|| {
+                    let reason = binding_gap_ask_reason(&r.seed_outcome);
+                    binding_gap_ask_payload(&tenant, &reason, r.first_seen)
+                })
             })
             .collect(),
     )
+}
+
+const NO_ACCOUNT_REASON: &str = "no signed-in, paired account to scope the lapse record to";
+
+/// The per-tenant lapse records — Phase 7's seed attempt and the Phase 4 ask —
+/// for the `/coord-mcp/doctor` report, so an agent can see WHY a bound tenant
+/// still has no slot without the desktop UI.
+///
+/// The UI's [`open_binding_gap_asks`] serves only OPENED asks, which leaves two
+/// states visible nowhere but a log line: a seed attempt still awaiting its
+/// fallback pass, and a `403 not_bound` answer, which deliberately opens no
+/// ask for the rest of the lapse. This read covers both.
+///
+/// Unlike [`load_gap_ask_state`], it does not fail soft. An unresolvable path,
+/// an unreadable file or a malformed record is `{"unknown": "<why>"}`, never an
+/// empty list. An ABSENT file is a real empty list, because no lapse has ever
+/// been recorded. A record written for another account is withheld as
+/// `{"unknown": ...}`: asks never cross an account switch, and neither do their
+/// diagnostics.
+pub(crate) fn binding_gap_lapses_report(
+    path: Option<&std::path::Path>,
+    account: Option<&str>,
+) -> serde_json::Value {
+    lapses_report_scoped(path, Ok(account))
+}
+
+/// [`binding_gap_lapses_report`] with an account that may itself be UNKNOWN.
+/// `Err(why)` is used only where the account matters, at the scoping step. A
+/// missing path, an absent file and a bad file still answer exactly as they do
+/// with a known account.
+fn lapses_report_scoped(
+    path: Option<&std::path::Path>,
+    account: Result<Option<&str>, &str>,
+) -> serde_json::Value {
+    let account = match account {
+        Ok(a) => a,
+        Err(why) => {
+            // Defer: validate the file first, then report `why` instead of
+            // a scope decision this read cannot make.
+            return match lapses_report_scoped(path, Ok(None)) {
+                v if v.get("unknown").is_some_and(|u| u == NO_ACCOUNT_REASON) => {
+                    serde_json::json!({ "unknown": why })
+                }
+                v => v,
+            };
+        }
+    };
+    let Some(path) = path else {
+        return serde_json::json!({"unknown": "the lapse record's path does not resolve"});
+    };
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return serde_json::json!({"lapses": []});
+        }
+        Err(e) => {
+            return serde_json::json!({"unknown": format!("lapse record unreadable: {e}")});
+        }
+    };
+    let state: GapAskState = match serde_json::from_slice(&bytes) {
+        Ok(s) => s,
+        Err(e) => {
+            return serde_json::json!({"unknown": format!("lapse record malformed: {e}")});
+        }
+    };
+    // Scope BEFORE reading the tenants, so even an empty answer is only ever
+    // given to the account the record belongs to.
+    match (account, state.account.as_deref()) {
+        (Some(current), Some(owner)) if current == owner => {}
+        (None, _) => {
+            return serde_json::json!({ "unknown": NO_ACCOUNT_REASON });
+        }
+        (Some(_), None) if state.tenants.is_empty() => {
+            return serde_json::json!({"lapses": []});
+        }
+        (Some(_), None) => {
+            return serde_json::json!({
+                "unknown": "the lapse record names no owning account"
+            });
+        }
+        _ => {
+            return serde_json::json!({
+                "unknown": "the lapse record belongs to another account"
+            });
+        }
+    }
+    let lapses: Vec<serde_json::Value> = state
+        .tenants
+        .iter()
+        .map(|(tenant, r)| {
+            serde_json::json!({
+                "tenant_id": tenant,
+                "first_seen": r.first_seen,
+                "seed_attempted": r.seed_attempted,
+                "seed_outcome": (!r.seed_outcome.is_empty()).then(|| r.seed_outcome.clone()),
+                "seed_not_bound": r.seed_not_bound,
+                "asked": r.notified,
+            })
+        })
+        .collect();
+    serde_json::json!({"lapses": lapses})
+}
+
+/// The doctor's door onto [`binding_gap_lapses_report`]: resolve the account
+/// exactly as `get_binding_gap_asks` does, but keep an UNREADABLE tenant slot
+/// store distinct from a signed-out box.
+///
+/// [`binding_gap_ask_account`] takes the slot list as an `Option`, so a store
+/// that failed to enumerate looks the same as "no slots". With no legacy slot
+/// either, the account then resolves to `None`, and the report would say
+/// nobody is signed in. That is a false reason, because the box may hold
+/// per-tenant slots that this read could not see. That case is reported here
+/// as the store failure it is, and only at the step where the account is
+/// needed. An absent record is still a real `[]`, and a missing path or a bad
+/// record still gives its own reason, since none of those depend on who is
+/// signed in.
+pub(crate) fn binding_gap_lapses_for_doctor(
+    path: Option<&std::path::Path>,
+    legacy_slot_present: bool,
+    tenant_slots: Result<&[uuid::Uuid], String>,
+    paired_user: Option<String>,
+) -> serde_json::Value {
+    let slots = match tenant_slots {
+        Ok(s) => Some(s),
+        Err(e) if !legacy_slot_present => {
+            let why = format!(
+                "the tenant slot store is unreadable, so whether an account is signed in is UNKNOWN: {e}"
+            );
+            return lapses_report_scoped(path, Err(&why));
+        }
+        // A legacy slot alone signs the box in, so the store failure cannot
+        // change which account the record is scoped to.
+        Err(_) => None,
+    };
+    let account = binding_gap_ask_account(legacy_slot_present, slots, paired_user);
+    binding_gap_lapses_report(path, account.as_deref())
 }
 
 /// Forget the evidence behind every ask — for a full sign-out or a
@@ -3424,16 +3588,7 @@ pub(crate) fn plan_gap_actions_at(
         let (first_seen, reason) = {
             let rec = state.entry(&tenant, now);
             rec.notified = true;
-            rec.reason = if rec.seed_outcome.is_empty() {
-                BINDING_GAP_ASK_REASON.to_string()
-            } else {
-                format!(
-                    "{BINDING_GAP_ASK_REASON}; automatic seed through coord's per-binding \
-                     door: {}",
-                    rec.seed_outcome
-                )
-            };
-            (rec.first_seen, rec.reason.clone())
+            (rec.first_seen, binding_gap_ask_reason(&rec.seed_outcome))
         };
         warn!(
             "device_jwt_refresher: asking the operator ONCE to pair bound tenant {tenant} \
@@ -4578,11 +4733,14 @@ pub struct CoordCredentialStatus {
     pub pinned_tenant: bool,
     /// The state-specific WHY the sentence ([`Self::composed_reason`] or the
     /// posture's fixed [`CoordCredentialPosture::message`]) cannot carry, or
-    /// `None`. Set in two shapes: on `Dark(NoDefaultBinding)`, the heal's
+    /// `None`. Set in four shapes: on `Dark(NoDefaultBinding)`, the heal's
     /// refusal reason, which names the guard that refused — so a state that
-    /// outlives one tick says which guard, as the plan asks; and on an
+    /// outlives one tick says which guard, as the plan asks; on an
     /// ANSWERING posture, the note that no default binding exists while the
-    /// legacy slot still serves unpinned sessions (review finding 3).
+    /// legacy slot still serves unpinned sessions (review finding 3); and,
+    /// when no arm set one, [`recovery_detail`]'s text — the missing
+    /// recoveries on `unrefreshable`, and on an answering posture the warning
+    /// that no automatic recovery is left.
     pub detail: Option<String>,
 }
 
@@ -4992,7 +5150,13 @@ pub(crate) fn derive_and_publish_posture(
     pins: PosturePinInputs,
     now: i64,
 ) -> Option<PostureTransition> {
-    derive_and_publish_posture_with(observations, pins, &default_binding_verdict(), now)
+    derive_and_publish_posture_core(
+        observations,
+        pins,
+        &default_binding_verdict(),
+        &recovery_inventory(),
+        now,
+    )
 }
 
 /// [`derive_and_publish_posture`] with the default-binding verdict supplied
@@ -5001,6 +5165,24 @@ pub(crate) fn derive_and_publish_posture_with(
     observations: &[SlotObservation],
     pins: PosturePinInputs,
     default_binding: &DefaultBindingVerdict,
+    now: i64,
+) -> Option<PostureTransition> {
+    derive_and_publish_posture_core(
+        observations,
+        pins,
+        default_binding,
+        &RecoveryInventory::UNKNOWN,
+        now,
+    )
+}
+
+/// [`derive_and_publish_posture_with`] with the [`RecoveryInventory`] supplied
+/// too: the inventory fills `detail` when no arm set one ([`recovery_detail`]).
+pub(crate) fn derive_and_publish_posture_core(
+    observations: &[SlotObservation],
+    pins: PosturePinInputs,
+    default_binding: &DefaultBindingVerdict,
+    inventory: &RecoveryInventory,
     now: i64,
 ) -> Option<PostureTransition> {
     /// One entry in the `worst` fold, carrying everything the publish needs.
@@ -5111,6 +5293,11 @@ pub(crate) fn derive_and_publish_posture_with(
             // cause.
             if c.detail.is_none() && c.posture.can_answer() {
                 c.detail = binding_note.clone();
+            }
+            // What recovery is missing (P2.1 on `unrefreshable`; P2.3 as a
+            // warning on an answering posture), when nothing above said more.
+            if c.detail.is_none() {
+                c.detail = recovery_detail(c.posture, inventory);
             }
             c
         });
@@ -5256,7 +5443,12 @@ fn derive_and_publish_legacy_posture(
     pins: PosturePinInputs,
     app: Option<&tauri::AppHandle>,
 ) {
-    let obs = legacy_slot_observation(auth_manager.probe_access_token());
+    let read = auth_manager.probe_access_token();
+    // A runner holding no credential at all (never paired, a guest tier) has
+    // nothing an outage can take away, so it is not warned about one.
+    let holds_credential = matches!(read, crate::secure_storage::StoredTokenRead::Present(_));
+    record_recovery_inventory(RecoveryInventory::read(auth_manager), holds_credential);
+    let obs = legacy_slot_observation(read);
     if let Some(transition) =
         derive_and_publish_posture(&[obs], pins, chrono::Utc::now().timestamp())
     {
@@ -5461,6 +5653,10 @@ pub(crate) async fn refresh_tenant_slots(
     if tenants.is_empty() {
         return outcomes;
     }
+    // Before either posture publish below reads it, so the boot publish
+    // already carries a missing-recovery warning (P2.3).
+    // Tenant slots exist, so this runner holds (or held) a credential.
+    record_recovery_inventory(RecoveryInventory::read(auth_manager), true);
     let mut health: Vec<TenantSlotHealthRow> = Vec::with_capacity(tenants.len());
     // Phase 1 of the coord-credential-posture plan: what each slot HELD when
     // this pass looked at it — `(tenant, exp, present, unknown)`, pushed
@@ -6152,6 +6348,168 @@ pub(crate) fn unpaired_bail_progress(verdict: &DefaultBindingVerdict) -> PairPro
 static DEFAULT_BINDING_VERDICT: std::sync::Mutex<Option<DefaultBindingVerdict>> =
     std::sync::Mutex::new(None);
 
+// ============================================================================
+// Recovery inventory — which no-human recoveries this runner holds.
+// ============================================================================
+
+/// `/health` `coordCredential.detail` token: no Cognito session is stored, so
+/// the refresher cannot re-mint a device JWT through `pair-cli`.
+pub(crate) const MISSING_COGNITO_SESSION: &str = "no_cognito_session";
+/// `/health` `coordCredential.detail` token: no device machine key (`dmk_`) is
+/// stored, so the cold-start exchange cannot run.
+pub(crate) const MISSING_DEVICE_MACHINE_KEY: &str = "no_device_machine_key";
+/// Which automatic (no-human) recoveries this runner holds, read from secure
+/// storage at the start of each slot pass. `None` on a field is UNKNOWN: the
+/// store could not be read. An UNKNOWN never produces a token.
+///
+/// Whether a browser can be opened is deliberately NOT probed here: a launcher
+/// on PATH does not prove a browser will open (on a display with no registered
+/// browser it fails anyway), so the signal is the launch result itself, which
+/// the pending sign-in records (`cognito::pending_sign_in`).
+///
+/// Plan 2026-11-15-headless-runner-recovers-its-coord-credential-without-a-human,
+/// P2.1 (the tokens on `unrefreshable`) and P2.3 (the warning while the
+/// credential still answers).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct RecoveryInventory {
+    pub cognito_session: Option<bool>,
+    pub device_machine_key: Option<bool>,
+}
+
+impl RecoveryInventory {
+    /// Nothing known: what a process that has not run a slot pass reports.
+    pub(crate) const UNKNOWN: RecoveryInventory = RecoveryInventory {
+        cognito_session: None,
+        device_machine_key: None,
+    };
+
+    /// Read the inventory from `auth_manager`'s store.
+    pub(crate) fn read(auth_manager: &crate::auth::AuthManager) -> Self {
+        // One store load: an unreadable store is UNKNOWN for both, never absent.
+        match auth_manager.recovery_holdings() {
+            Ok((cognito_session, device_machine_key)) => Self {
+                cognito_session: Some(cognito_session),
+                device_machine_key: Some(device_machine_key),
+            },
+            Err(_) => Self::UNKNOWN,
+        }
+    }
+
+    /// The tokens naming each recovery this runner is KNOWN to lack, in a
+    /// fixed order. Empty when nothing is known to be missing.
+    pub(crate) fn missing(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.cognito_session == Some(false) {
+            out.push(MISSING_COGNITO_SESSION);
+        }
+        if self.device_machine_key == Some(false) {
+            out.push(MISSING_DEVICE_MACHINE_KEY);
+        }
+        out
+    }
+
+    /// `true` when BOTH automatic recoveries are known to be absent: once the
+    /// device JWT expires, only a human sign-in brings the credential back.
+    pub(crate) fn needs_a_human_after_expiry(&self) -> bool {
+        self.cognito_session == Some(false) && self.device_machine_key == Some(false)
+    }
+}
+
+/// The `detail` for a posture, from the recovery inventory, when no arm set
+/// one. On `unrefreshable` it names every recovery known to be missing (P2.1);
+/// on an ANSWERING posture it warns only when both automatic recoveries are
+/// absent, so the operator hears it before the outage rather than during it
+/// (P2.3). Every other posture, and an inventory with nothing known missing,
+/// gets `None`.
+pub(crate) fn recovery_detail(
+    posture: CoordCredentialPosture,
+    inventory: &RecoveryInventory,
+) -> Option<String> {
+    let missing = inventory.missing();
+    if missing.is_empty() {
+        return None;
+    }
+    let tokens = missing.join(", ");
+    if posture == CoordCredentialPosture::Unrefreshable {
+        return Some(format!("missing recoveries: {tokens}"));
+    }
+    if posture.can_answer() && inventory.needs_a_human_after_expiry() {
+        return Some(format!(
+            "missing recoveries: {tokens} — the next outage longer than the device-JWT \
+             lifetime (~4 h) needs a human sign-in"
+        ));
+    }
+    None
+}
+
+/// The recorded inventory. Process-wide in a build; per THREAD under test, so
+/// one test's pass cannot colour another test's posture. The cost of that
+/// split: a `multi_thread` tokio test that records on one worker and publishes
+/// from another reads UNKNOWN where production would read the recorded value,
+/// so a test of the recorded path must stay on one thread (`#[tokio::test]`'s
+/// default current-thread runtime) or call `derive_and_publish_posture_core`.
+#[cfg(not(test))]
+static RECOVERY_INVENTORY: std::sync::Mutex<Option<(RecoveryInventory, bool)>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+thread_local! {
+    static RECOVERY_INVENTORY: std::cell::Cell<Option<(RecoveryInventory, bool)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Swap the recorded `(inventory, holds_credential)`, returning the previous pair.
+fn replace_recovery_inventory(
+    inventory: (RecoveryInventory, bool),
+) -> Option<(RecoveryInventory, bool)> {
+    #[cfg(not(test))]
+    {
+        RECOVERY_INVENTORY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(inventory)
+    }
+    #[cfg(test)]
+    {
+        RECOVERY_INVENTORY.with(|cell| cell.replace(Some(inventory)))
+    }
+}
+
+/// The inventory the latest slot pass recorded, or
+/// [`RecoveryInventory::UNKNOWN`] before the first.
+pub(crate) fn recovery_inventory() -> RecoveryInventory {
+    #[cfg(not(test))]
+    let recorded = *RECOVERY_INVENTORY.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(test)]
+    let recorded = RECOVERY_INVENTORY.with(std::cell::Cell::get);
+    recorded.map_or(RecoveryInventory::UNKNOWN, |(inventory, _)| inventory)
+}
+
+/// Record `inventory`, logging a warning when a runner that holds a credential
+/// first shows, or newly shows, that no automatic recovery is left (P2.3: a
+/// boot-time warning, not only an outage-time error). The dedupe is on the
+/// PAIR, so a runner first seen unpaired that then pairs with no recovery is
+/// still warned. Returns whether it warned.
+pub(crate) fn record_recovery_inventory(
+    inventory: RecoveryInventory,
+    holds_credential: bool,
+) -> bool {
+    let previous = replace_recovery_inventory((inventory, holds_credential));
+    if previous == Some((inventory, holds_credential)) {
+        return false;
+    }
+    let warn_now = holds_credential && inventory.needs_a_human_after_expiry();
+    if warn_now {
+        warn!(
+            "device_jwt_refresher: this runner holds neither a Cognito session nor a device \
+             machine key ({}); the next outage longer than the device-JWT lifetime (~4 h) \
+             needs a human sign-in",
+            inventory.missing().join(", ")
+        );
+    }
+    warn_now
+}
+
 /// The most recent MEASURED verdict, or `Unknown` before any tick measured one.
 /// Read by [`derive_and_publish_posture`].
 pub(crate) fn default_binding_verdict() -> DefaultBindingVerdict {
@@ -6196,6 +6554,9 @@ pub(crate) fn publish_default_binding_verdict(verdict: DefaultBindingVerdict) {
 async fn heal_vanished_binding_store() {
     let verdict = match spawn_blocking_tracked(|| {
         let heal = qontinui_runner_lib::pair::heal_vanished_paired_user();
+        if heal.wrote() {
+            crate::commands::web_integration::notify_tenant_bindings_changed();
+        }
         let census = matches!(heal, qontinui_runner_lib::pair::PairedUserHeal::Refused(_))
             .then(qontinui_runner_lib::pair::held_credential_census);
         classify_default_binding(&heal, census.as_ref())
@@ -6327,9 +6688,10 @@ async fn refresher_loop(
         // pass's answer.
         let gap_report = binding_gaps_from(&sweep_inputs);
         publish_binding_gaps(gap_report.clone());
-        // D3 (Phase 4, as revised by the route-around review): act on that
-        // report by ASKING the operator once per tenant per lapse — never by
-        // minting. The ask is driven by the act-grade twin of the report (a
+        // D3 (Phase 4, as revised by the route-around review, plus Phase 7):
+        // act on that report by seeding once per tenant per lapse through
+        // coord's per-binding door (`run_due_seeds` below — never pair-cli),
+        // then, if no slot appeared, ASKING the operator once. The ask is driven by the act-grade twin of the report (a
         // sidecar inside BINDING_GAP_ASK_MAX_AGE_SECS), is persisted, and is
         // read back by the UI through `get_binding_gap_asks`; the event below
         // is only a nudge. A lapse that closes because a slot now exists
@@ -12658,9 +13020,9 @@ mod tenant_slot_refresh_tests {
 
     /// REVIEW MAJOR 1 (and the headless half of MAJOR 2) — the runner never
     /// runs `pair-cli` to seed a bound tenant's slot. Coord's pairing write
-    /// re-points `coord.devices.tenant_id` and upserts `coord.tenant_devices`,
-    /// so a headless per-tenant pair would move this device's home tenant and
-    /// silently undo a coord-side unbind. The only `pair-cli` call in this
+    /// upserts `coord.tenant_devices`, so a headless per-tenant pair would
+    /// silently undo a coord-side unbind (it also re-pointed
+    /// `coord.devices.tenant_id` until qontinui-coord#3457). The only `pair-cli` call in this
     /// module is the pre-existing default-tenant refresh in
     /// [`try_refresh_once`]; a second one is the removed Arm A coming back.
     /// Reverse only through the coord door the plan's Phase 6 specifies —
@@ -12684,8 +13046,8 @@ mod tenant_slot_refresh_tests {
             1,
             "{calls:?}: exactly one pair-cli call site (try_refresh_once, the default \
              tenant) — a second one re-introduces the headless per-tenant seed the \
-             route-around review removed (it re-points coord.devices.tenant_id and \
-             re-creates bindings)"
+             route-around review removed (it re-creates bindings an operator \
+             removed)"
         );
         assert!(
             calls[0].starts_with(concat!(
@@ -12708,7 +13070,7 @@ mod tenant_slot_refresh_tests {
                 !src.lines()
                     .map(str::trim_start)
                     .any(|l| !l.starts_with("//") && l.contains(other)),
-                "the refresher must not call {other} — it re-points coord.devices.tenant_id"
+                "the refresher must not call {other} — it re-creates removed bindings"
             );
         }
         // Nor a hand-rolled request to the route: production code (everything
@@ -12741,7 +13103,7 @@ mod tenant_slot_refresh_tests {
             notified(&actions)[0]["reason"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("re-points this device's home tenant"),
+                .contains("re-creates the binding"),
             "the ask says WHY a human is needed"
         );
     }
@@ -13125,10 +13487,7 @@ mod tenant_slot_refresh_tests {
         let on_disk = load_gap_ask_state(&path);
         for t in [a, b] {
             let rec = on_disk.tenants.get(&t.to_string()).expect("record on disk");
-            assert!(
-                rec.notified && rec.first_seen > 0 && !rec.reason.is_empty(),
-                "{rec:?}"
-            );
+            assert!(rec.notified && rec.first_seen > 0, "{rec:?}");
         }
         assert_eq!(
             notified(&all)[0]["cta"],
@@ -13212,8 +13571,9 @@ mod tenant_slot_refresh_tests {
     }
 
     /// The lapse record round-trips, a corrupt one fails SOFT toward "nobody
-    /// asked yet", and a record written by the pre-review build (which also
-    /// carried `mint_attempted` and no `reason`) still loads and still serves.
+    /// asked yet", and a record written by an older build (one that carried
+    /// `mint_attempted`, or a stored `reason` with since-corrected text) still
+    /// loads and serves TODAY's reason.
     #[test]
     fn a_corrupt_or_legacy_lapse_record_fails_soft() {
         let path = gap_state_path("corrupt");
@@ -13225,7 +13585,7 @@ mod tenant_slot_refresh_tests {
             GapAskRecord {
                 notified: true,
                 first_seen: 1_800_000_000,
-                reason: "r".into(),
+                seed_outcome: "o".into(),
                 ..Default::default()
             },
         );
@@ -13244,6 +13604,19 @@ mod tenant_slot_refresh_tests {
             .expect("known");
         assert_eq!(open.len(), 1, "{open:?}");
         assert_eq!(open[0]["reason"], serde_json::json!(BINDING_GAP_ASK_REASON));
+
+        let stale = format!(
+            r#"{{"account":"acct-a","tenants":{{"{}":{{"notified":true,"first_seen":7,"reason":"it also re-points this device's home tenant","seed_outcome":"refused"}}}}}}"#,
+            tenant(3)
+        );
+        std::fs::write(&path, stale).expect("stale reason");
+        let open = open_binding_gap_asks(&path, &known(&[tenant(3)]), Some(&[]), Some(ACCT))
+            .expect("known");
+        assert_eq!(
+            open[0]["reason"],
+            serde_json::json!(binding_gap_ask_reason("refused")),
+            "an open ask shows today's reason, not the text stored by the build that opened it"
+        );
     }
 
     /// [`measured_gaps`] is the single UNKNOWN gate for the whole phase.
@@ -15166,8 +15539,8 @@ mod tenant_seed_arm_tests {
         assert_eq!(seed_refusal_code(r#"{"error":"forced"}"#), "forced");
     }
 
-    /// The arm must never reach for `pair-cli` (it re-points the device's home
-    /// tenant and re-creates bindings): its only request is to the seed door.
+    /// The arm must never reach for `pair-cli` (it re-creates bindings an
+    /// operator removed): its only request is to the seed door.
     #[test]
     fn the_seed_arm_calls_only_the_per_binding_door() {
         let src = include_str!("device_jwt_refresher.rs");
@@ -15186,5 +15559,251 @@ mod tenant_seed_arm_tests {
         ] {
             assert!(!body.contains(forbidden), "seed arm names {forbidden}");
         }
+    }
+
+    #[test]
+    fn doctor_names_an_unreadable_slot_store_not_a_signed_out_box() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("binding_gap_asks.json");
+        let unreadable = || Err::<&[uuid::Uuid], String>("decrypt failed".into());
+        let acct = || Some("acct-a".to_string());
+        // No record yet: a real empty list, whoever is signed in.
+        assert_eq!(
+            binding_gap_lapses_for_doctor(Some(&path), false, unreadable(), acct()),
+            serde_json::json!({"lapses": []})
+        );
+        // An unresolvable path keeps its own reason.
+        let v = binding_gap_lapses_for_doctor(None, false, unreadable(), acct());
+        assert!(v["unknown"].as_str().unwrap().contains("does not resolve"));
+
+        write_state(
+            &path,
+            "acct-a",
+            &[(uuid::Uuid::new_v4(), lapse(true, "", false, false))],
+        );
+        // Store unreadable, no legacy slot: the reason names the store.
+        let v = binding_gap_lapses_for_doctor(Some(&path), false, unreadable(), acct());
+        let why = v["unknown"].as_str().expect("unknown, never a list");
+        assert!(why.contains("slot store is unreadable"), "{why}");
+        assert!(why.contains("decrypt failed"), "{why}");
+        // A legacy slot signs the box in on its own, so the record is served.
+        let v = binding_gap_lapses_for_doctor(Some(&path), true, unreadable(), acct());
+        assert_eq!(v["lapses"].as_array().map(Vec::len), Some(1), "{v}");
+        // A readable, empty store with no legacy slot really is signed out.
+        let v = binding_gap_lapses_for_doctor(Some(&path), false, Ok(&[]), acct());
+        assert_eq!(v["unknown"], NO_ACCOUNT_REASON);
+        // A malformed record keeps its own reason too.
+        std::fs::write(&path, b"{not json").unwrap();
+        let v = binding_gap_lapses_for_doctor(Some(&path), false, unreadable(), acct());
+        assert!(v["unknown"].as_str().unwrap().contains("malformed"), "{v}");
+    }
+
+    // ---- the doctor's read of the lapse record (`binding_gap_lapses_report`) ----
+
+    fn lapse(seed_attempted: bool, outcome: &str, not_bound: bool, asked: bool) -> GapAskRecord {
+        GapAskRecord {
+            notified: asked,
+            first_seen: 1_700_000_000,
+            seed_attempted,
+            seed_outcome: outcome.to_string(),
+            seed_not_bound: not_bound,
+        }
+    }
+
+    fn write_state(path: &std::path::Path, account: &str, recs: &[(uuid::Uuid, GapAskRecord)]) {
+        let state = GapAskState {
+            account: Some(account.to_string()),
+            tenants: recs
+                .iter()
+                .map(|(t, r)| (t.to_string(), r.clone()))
+                .collect(),
+        };
+        assert!(save_gap_ask_state(path, &state), "fixture write");
+    }
+
+    /// The two states no UI ask shows — a seed awaiting its fallback pass, and
+    /// a `not_bound` answer that opens no ask at all — are both on the report.
+    #[test]
+    fn lapses_report_serves_the_seed_states_no_ask_shows() {
+        let path = gap_state_path("lapses_report");
+        let pending = tenant(1);
+        let not_bound = tenant(2);
+        let refused = SeedOutcome::Refused {
+            status: 403,
+            code: "not_bound".into(),
+        };
+        write_state(
+            &path,
+            ACCT,
+            &[
+                (pending, lapse(true, "", false, false)),
+                (not_bound, lapse(true, &refused.describe(), true, false)),
+            ],
+        );
+        let report = binding_gap_lapses_report(Some(&path), Some(ACCT));
+        let lapses = report["lapses"].as_array().expect("known");
+        assert_eq!(lapses.len(), 2);
+        let by = |t: uuid::Uuid| {
+            lapses
+                .iter()
+                .find(|l| l["tenant_id"] == t.to_string())
+                .expect("tenant present")
+                .clone()
+        };
+        let p = by(pending);
+        assert_eq!(p["seed_attempted"], true);
+        assert!(
+            p["seed_outcome"].is_null(),
+            "no outcome yet is null, not \"\""
+        );
+        assert_eq!(p["asked"], false);
+        let nb = by(not_bound);
+        assert_eq!(nb["seed_not_bound"], true);
+        assert_eq!(nb["asked"], false);
+        assert!(nb["seed_outcome"].as_str().unwrap().contains("not_bound"));
+    }
+
+    /// Absent is a real empty list; every way of not knowing is `unknown`.
+    #[test]
+    fn lapses_report_never_renders_unknown_as_empty() {
+        let absent = gap_state_path("lapses_absent");
+        assert_eq!(
+            binding_gap_lapses_report(Some(&absent), Some(ACCT)),
+            serde_json::json!({"lapses": []})
+        );
+        assert!(binding_gap_lapses_report(None, Some(ACCT))["unknown"].is_string());
+
+        let malformed = gap_state_path("lapses_malformed");
+        std::fs::write(&malformed, b"{not json").expect("write");
+        assert!(binding_gap_lapses_report(Some(&malformed), Some(ACCT))["unknown"].is_string());
+
+        let other = gap_state_path("lapses_other_account");
+        write_state(
+            &other,
+            "someone-else",
+            &[(tenant(3), lapse(true, "x", false, true))],
+        );
+        let r = binding_gap_lapses_report(Some(&other), Some(ACCT));
+        assert!(
+            r["unknown"].is_string(),
+            "another account's record is withheld: {r}"
+        );
+        assert!(r.get("lapses").is_none());
+        let r = binding_gap_lapses_report(Some(&other), None);
+        assert!(r["unknown"].is_string(), "signed-out is withheld: {r}");
+    }
+}
+
+#[cfg(test)]
+mod recovery_inventory_tests {
+    //! Plan 2026-11-15-headless-runner-recovers-its-coord-credential-without-a-human,
+    //! P2.1 (`detail` names the missing recoveries on `unrefreshable`) and P2.3
+    //! (a warning while the credential still answers).
+    use super::*;
+
+    const NONE_HELD: RecoveryInventory = RecoveryInventory {
+        cognito_session: Some(false),
+        device_machine_key: Some(false),
+    };
+
+    fn unrefreshable_slot(tenant: &str) -> SlotObservation {
+        SlotObservation {
+            tenant_id: Some(tenant.to_string()),
+            exp: None,
+            present: false,
+            unknown: false,
+            outcome: Some(TenantSlotOutcome::Cleared {
+                cause: SlotClearCause::DecodedExpiry,
+                rederived: false,
+            }),
+            recovery: None,
+        }
+    }
+
+    #[test]
+    fn missing_names_only_what_is_known_absent() {
+        assert!(RecoveryInventory::UNKNOWN.missing().is_empty());
+        assert_eq!(
+            NONE_HELD.missing(),
+            vec![MISSING_COGNITO_SESSION, MISSING_DEVICE_MACHINE_KEY]
+        );
+        let key_only = RecoveryInventory {
+            cognito_session: Some(false),
+            device_machine_key: Some(true),
+        };
+        assert_eq!(key_only.missing(), vec![MISSING_COGNITO_SESSION]);
+        assert!(!key_only.needs_a_human_after_expiry());
+        assert!(NONE_HELD.needs_a_human_after_expiry());
+    }
+
+    #[test]
+    fn unrefreshable_detail_names_every_missing_recovery() {
+        let d =
+            recovery_detail(CoordCredentialPosture::Unrefreshable, &NONE_HELD).expect("a detail");
+        assert!(d.contains(MISSING_COGNITO_SESSION), "{d}");
+        assert!(d.contains(MISSING_DEVICE_MACHINE_KEY), "{d}");
+        assert_eq!(
+            recovery_detail(
+                CoordCredentialPosture::Unrefreshable,
+                &RecoveryInventory::UNKNOWN
+            ),
+            None,
+            "an UNKNOWN inventory names nothing"
+        );
+    }
+
+    #[test]
+    fn an_answering_posture_warns_only_when_no_automatic_recovery_is_left() {
+        let warn = recovery_detail(CoordCredentialPosture::Live, &NONE_HELD).expect("a warning");
+        assert!(warn.contains("needs a human sign-in"), "{warn}");
+        let key_held = RecoveryInventory {
+            device_machine_key: Some(true),
+            ..NONE_HELD
+        };
+        assert_eq!(
+            recovery_detail(CoordCredentialPosture::Live, &key_held),
+            None
+        );
+        // A non-answering posture other than `unrefreshable` keeps its own cause.
+        assert_eq!(
+            recovery_detail(CoordCredentialPosture::Absent, &NONE_HELD),
+            None
+        );
+    }
+
+    #[test]
+    fn a_runner_that_pairs_with_no_recovery_is_warned_even_if_first_seen_unpaired() {
+        // Thread-local under test, so this sequence is this test's alone.
+        assert!(
+            !record_recovery_inventory(NONE_HELD, false),
+            "unpaired: no warning"
+        );
+        assert!(record_recovery_inventory(NONE_HELD, true), "paired: warned");
+        assert!(!record_recovery_inventory(NONE_HELD, true), "warned once");
+        assert_eq!(recovery_inventory(), NONE_HELD);
+    }
+
+    #[test]
+    fn the_published_unrefreshable_posture_carries_the_missing_recoveries() {
+        let _serialised = posture_test_lock();
+        reset_coord_credential_posture_for_test();
+        let now = chrono::Utc::now().timestamp();
+        derive_and_publish_posture_core(
+            &[unrefreshable_slot("c231d9da-0ca8-4fe4-bd81-0e3d6c20339a")],
+            PosturePinInputs::UNPINNED,
+            &DefaultBindingVerdict::NoCredential,
+            &NONE_HELD,
+            now,
+        );
+        let status = coord_credential_posture().expect("a published posture");
+        assert_eq!(status.posture, CoordCredentialPosture::Unrefreshable);
+        let json = status.to_json();
+        let detail = json["detail"].as_str().expect("detail is no longer null");
+        assert!(detail.contains(MISSING_DEVICE_MACHINE_KEY), "{json}");
+        assert!(json["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(MISSING_COGNITO_SESSION));
+        reset_coord_credential_posture_for_test();
     }
 }

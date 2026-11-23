@@ -1216,17 +1216,28 @@ describe("fetchRestoreSet — coord device drain", () => {
 
 describe("mayClaimRecordedZone — drain re-run merges with existing tabs", () => {
   it("lets a first restore claim any recorded zone", () => {
-    expect(mayClaimRecordedZone(false, 2, "t-new", { 2: "t-operator" })).toBe(true);
+    expect(mayClaimRecordedZone(false, 2, "t-new", { 2: "t-operator" }, 4)).toBe(true);
   });
 
   it("never lets a drain re-run take a zone an operator tab holds", () => {
-    expect(mayClaimRecordedZone(true, 2, "t-new", { 2: "t-operator" })).toBe(false);
-    expect(mayClaimRecordedZone(true, 2, "t-new", {})).toBe(true);
-    expect(mayClaimRecordedZone(true, 2, "t-same", { 2: "t-same" })).toBe(true);
+    expect(mayClaimRecordedZone(true, 2, "t-new", { 2: "t-operator" }, 4)).toBe(false);
+    expect(mayClaimRecordedZone(true, 2, "t-new", {}, 4)).toBe(true);
+    expect(mayClaimRecordedZone(true, 2, "t-same", { 2: "t-same" }, 4)).toBe(true);
+  });
+
+  it("never lets a drain re-run place a tab past the grid it finds", () => {
+    expect(mayClaimRecordedZone(true, 5, "t-new", {}, 4)).toBe(false);
+    expect(mayClaimRecordedZone(true, 4, "t-new", {}, 4)).toBe(false);
+    expect(mayClaimRecordedZone(true, 3, "t-new", {}, 4)).toBe(true);
+    expect(mayClaimRecordedZone(true, 12, "t-new", {}, Number.POSITIVE_INFINITY)).toBe(true);
+  });
+
+  it("lets a first restore claim past the zone count: the saved layout may yet grow", () => {
+    expect(mayClaimRecordedZone(false, 5, "t-new", {}, 4)).toBe(true);
   });
 
   it("never claims an unzoned record", () => {
-    expect(mayClaimRecordedZone(false, -1, "t", {})).toBe(false);
+    expect(mayClaimRecordedZone(false, -1, "t", {}, 4)).toBe(false);
   });
 });
 
@@ -1274,6 +1285,18 @@ describe("waitForHolderSweep — PTY-holder boot sweep before the restore", () =
   });
 });
 
+/** A registry read that could not see everything: one dir was unlistable. */
+const partialLiveRead = {
+  success: true,
+  message: null,
+  data: {
+    sessions: [{ sessionId: "visible-live", pid: 7 }],
+    unlistable: ["/home/u/.claude-x/sessions (Permission denied)"],
+    unreadableRecords: [],
+  },
+};
+const settledSweep = { success: true, message: null, data: { settled: true } };
+
 describe("recheckRefusedAfterSweep — sessions refused as live before the sweep settled", () => {
   beforeEach(() => {
     mockInvoke.mockReset();
@@ -1290,6 +1313,17 @@ describe("recheckRefusedAfterSweep — sessions refused as live before the sweep
     ).resolves.toEqual(["reaped-by-sweep"]);
     expect(mockInvoke).toHaveBeenCalledTimes(2);
     expect(live).toHaveBeenCalledTimes(1);
+  });
+
+  it("by default resumes nothing a PARTIAL registry read does not show", async () => {
+    // Pins the DEFAULT: a caller that omits `liveIds` gets the STRICT
+    // oracle, because "hidden" may be live in the dir that could not be
+    // listed — resuming it would fork it.
+    mockInvoke.mockImplementation(async (cmd: unknown) =>
+      cmd === "terminal_claude_session_list_live" ? partialLiveRead : settledSweep,
+    );
+    await expect(recheckRefusedAfterSweep(["hidden"])).resolves.toEqual([]);
+    expect(mockInvoke).toHaveBeenCalledWith("terminal_claude_session_list_live");
   });
 
   it("resumes nothing when the sweep never settles", async () => {
@@ -1399,6 +1433,21 @@ describe("onHolderSessionReleased — a deferred holder died before adoption", (
     const live = vi.fn().mockResolvedValue(new Set<string>());
     await onHolderSessionReleased({ ...payload, pageId: null }, schedule, live);
     expect(schedule).toHaveBeenCalledWith("default", ["sess-1"]);
+  });
+
+  it("by default schedules nothing on a PARTIAL registry read that does not show the session", async () => {
+    // The production caller passes no `liveIds`, so the STRICT oracle must be
+    // the default: a session missing from a partial read may sit in the dir
+    // that could not be listed, and re-running its restore would fork it.
+    mockInvoke.mockImplementation(async (cmd: unknown) =>
+      cmd === "terminal_claude_session_list_live" ? partialLiveRead : settledSweep,
+    );
+    const schedule = vi.fn();
+    await expect(onHolderSessionReleased(payload, schedule)).resolves.toBe(false);
+    expect(schedule).not.toHaveBeenCalled();
+    // The registry WAS read: the refusal came from the strict oracle seeing a
+    // partial read, not from a read that never happened.
+    expect(mockInvoke).toHaveBeenCalledWith("terminal_claude_session_list_live");
   });
 });
 

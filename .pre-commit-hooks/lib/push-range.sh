@@ -87,6 +87,48 @@ push_base_ref() {
     return 1
 }
 
+# Resolve the ref "what the default branch already has" is measured against,
+# for the repo at $1. The cascade runs in the OPPOSITE order to
+# `push_base_ref`: the remote's published default branch, then `origin/main`,
+# and the branch's own upstream only when neither resolves. It prints a FULL
+# refname (`refs/remotes/origin/main`), never a short one. A short
+# `origin/main` resolves `refs/heads/origin/main` before the remote-tracking
+# ref, so a local branch with that name would silently stand in for it.
+# $2 — the commit the base must be an ancestry-relation of; defaults to HEAD.
+# Prints the ref and returns 0, or prints nothing and returns 1.
+#
+# Why the default branch and not the upstream: this is the question the
+# codegen drift attribution asks, "does this branch's change, relative to what
+# main already has, move the bindings?". After a rebase the upstream is the
+# PRE-rebase head. Its merge-base is the OLD fork point, and every main commit
+# the rebase pulled in then reads as the push's own (coord findings 8d16b76e,
+# 79415d3d). The cargo gate keeps `push_base_ref`. It asks a different
+# question, "what does this push add", and fails open.
+push_default_base_ref() {
+    local repo="$1" tip="${2:-HEAD}" ref
+    for ref in \
+        "$(git -C "$repo" symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null || true)" \
+        "refs/remotes/origin/main" \
+        "$(git -C "$repo" rev-parse --symbolic-full-name '@{upstream}' 2>/dev/null || true)"
+    do
+        case "$ref" in refs/*) ;; *) continue ;; esac
+        git -C "$repo" rev-parse --verify --quiet "${ref}^{commit}" >/dev/null 2>&1 || continue
+        git -C "$repo" merge-base "$tip" "$ref" >/dev/null 2>&1 || continue
+        printf '%s\n' "$ref"
+        return 0
+    done
+    return 1
+}
+
+# The display form of a full refname: `refs/remotes/origin/main` reads
+# `origin/main`, and `refs/heads/x` reads `x`.
+push_ref_short() {
+    local ref="$1"
+    ref="${ref#refs/remotes/}"
+    ref="${ref#refs/heads/}"
+    printf '%s\n' "$ref"
+}
+
 # True when $1 is git's all-zero sha (ref does not exist on the remote yet, or
 # is being deleted). Both object formats: 40 hex for sha1, 64 for sha256.
 push_range_is_zero_sha() {

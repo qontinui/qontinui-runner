@@ -338,6 +338,7 @@ function CompactZoneCardInner({
         <TenantBadge
           tenantId={tab.tenantId}
           claudeSessionId={tab.claudeSessionId}
+          zoneIndex={zoneIndex}
           className="rounded-full py-0.5"
         />
         <RemoteTabControls tab={tab} compact />

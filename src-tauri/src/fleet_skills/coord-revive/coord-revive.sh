@@ -862,6 +862,25 @@ classify() {
   # exactly the undifferentiated mask this script exists to replace. Normalize
   # first so the pre-transfer failures reach the same named causes.
   [ -n "$code" ] || code="000"
+  # THE DOOR ANSWERED AND THIS BOX LOST THE ANSWER. Decided BEFORE any body
+  # match and before the no-status UNREACHABLE arm, because both of those read a
+  # carried request as one that never arrived (plan
+  # 2026-11-08-coord-revive-call-misreports-carried-requests-and-copies-body-text-into-its-verdict,
+  # Phase 1; coord finding 02ff5a17). Two shapes, both measured with a full or
+  # nearly full $TMPDIR:
+  #   * curl exit 23 - curl could not WRITE data it had RECEIVED. curl opens
+  #     `-o` lazily on the first body byte, so a 23 means the request went out
+  #     and the door answered; whatever $code reads, the answer is gone.
+  #   * curl exit 0 with no three-digit status - a successful HTTP transfer
+  #     always has one, so a `000`, an empty or a short `-w` read means the
+  #     STATUS write was lost, not that nothing answered. Without this arm the
+  #     non-2xx guard below would substring-match its markers anywhere in a
+  #     served 200 body (a finding title, a gate reason) and print a refusal.
+  # Either way the call MAY have been applied: never a "not carried" verdict.
+  case "$ce:$code" in
+    23:*|0:000|0:[!0-9]*|0:?|0:??|0:?[!0-9]*|0:??[!0-9]*|0:????*)
+      echo "CARRIED_ANSWER_UNREAD (curl exit $ce, status read '$code' - the request was SENT and the door ANSWERED, but this box could not store the answer: a LOCAL write failure, typically a full or nearly full TMPDIR. The call MAY have been applied - verify by read, and do NOT blindly re-issue a non-idempotent write)"; return ;;
+  esac
   if [ "$ce" = "7" ]; then echo "CONNECT_REFUSED (dead port - no listener)"; return; fi
   # THE PROXY DID NOT ANSWER. Nothing came back inside the budget, so whether the
   # proxy ever answered is UNKNOWN — this box abandoned the request. Deliberately
@@ -941,6 +960,9 @@ classify() {
           # so it gets the class verdict with the posture named UNSTATED rather
           # than silently falling through to the nonce arm.
           [ -n "$rc_posture" ] || rc_posture="unstated"
+          # The posture becomes part of the verdict WORD, so body text must not
+          # shape it: one [a-z_] token, else `invalid` (same rule as `cause`).
+          case "$rc_posture" in *[!a-z_]*) rc_posture="invalid" ;; esac
           echo "RUNNER_CREDENTIAL_$(printf '%s' "$rc_posture" | tr '[:lower:]' '[:upper:]') (HTTP 401 from the RUNNER, not from coord and NOT about your nonce: the forwarder refused to carry this call because its own coord credential is $rc_posture since ${rc_since:-unstated}. The key in this .mcp.json is FINE - do NOT rotate it and do NOT re-provision, which mints a new nonce for a credential that stays dead and evicts whatever holds this workdir's slot. L4/L5 carry their own credentials and DO answer. remedy=${rc_remedy:-unstated})"; return ;;
         *COORD_MCP_PROXY_UNAUTHORIZED*)
           echo "$unauth"; return ;;
@@ -975,10 +997,26 @@ x=e.get("data") if isinstance(e,dict) else None  # envelope-ok: same typed read 
 v=x.get(sys.argv[1]) if isinstance(x,dict) else None
 print(v if isinstance(v,str) else "")' remedy 2>/dev/null | tr -d '\r\n')
           fi
+          # NO BODY TEXT SHAPES THIS LINE (plan
+          # 2026-11-08-coord-revive-call-misreports-carried-requests-and-copies-body-text-into-its-verdict,
+          # Phase 3). `cause` is a closed token vocabulary, so anything that is
+          # not one token prints `invalid`: a cause carrying a line break plus a
+          # whole forged verdict line, or `drift remedy=x`, must not reach the
+          # line a caller branches on. `status=` sits right after that token, so
+          # it cannot be forged either, and a caller can require the runner's
+          # own 403 rather than any non-2xx that happens to carry the marker.
+          # `remedy` is free prose and is last; it is stripped of line breaks.
+          # `cause` keeps any EMBEDDED line feed (only the reader's trailing one
+          # is lost to the command substitution), so a broken-up token prints
+          # `invalid` rather than being glued back into a valid one.
+          case "$mna_cause" in
+            '') ;;
+            *[!a-z_]*) mna_cause="invalid" ;;
+          esac
           if [ -n "$mna_cause" ]; then
-            echo "METHOD_NOT_ALLOWED (cause=$mna_cause remedy=${mna_remedy:-unstated})"
+            echo "METHOD_NOT_ALLOWED (cause=$mna_cause status=$code remedy=${mna_remedy:-unstated})"
           else
-            echo "METHOD_NOT_ALLOWED (cause=unstated (runner build predates the discriminator - read GET /coord-mcp/tool-policy and buildDrift))"
+            echo "METHOD_NOT_ALLOWED (cause=unstated status=$code (runner build predates the discriminator - read GET /coord-mcp/tool-policy and buildDrift))"
           fi
           return ;;
       esac ;;
@@ -1021,7 +1059,7 @@ print(v if isinstance(v,str) else "")' remedy 2>/dev/null | tr -d '\r\n')
     503) echo "CREDENTIAL_REFRESHING (retry-safe - HTTP 503)"; return ;;
   esac
   local snippet
-  snippet=$(printf '%s' "$body" | tr -d '\n' | head -c 120)
+  snippet=$(printf '%s' "$body" | tr -d '\r\n' | head -c 120)
   echo "HTTP_$code (unclassified: ${snippet:-<empty body>})"
 }
 
@@ -1413,6 +1451,8 @@ verdict_plane() {
     # 401 out of its own state machine), exactly as a nonce 401 is. Leaving it
     # to the `none` arm would hide one half of a wedge from record_plane.
     RUNNER_CREDENTIAL_*)                                echo http ;;
+    # The door ANSWERED; only this box failed to store it.
+    CARRIED_ANSWER_UNREAD*)                             echo http ;;
     *)                                                  echo none ;;
   esac
 }
@@ -2048,6 +2088,7 @@ print("end")' < "$1" 2>/dev/null)
 }
 
 read_cfg() {
+  CFG_UNREADABLE=""
   parse_mcp_cfg "$1"
   CFG_URL="$_MC_URL"; CFG_KEY="$_MC_KEY"
   CFG_KEY_HEADER="X-Coord-Mcp-Proxy-Key"
@@ -2063,10 +2104,23 @@ read_cfg() {
   # twin carry the same key into probe_door AND into seen_endpoint's (url, key)
   # dedup. An unset no-default reference is refused with its typed reason in
   # $CFG_ENVREF_ERR - cfg_shape reports it - and nothing is sent.
-  # The URL gate lives in the helper (mcp_expand_env_ref_for_url): only a
-  # strictly-loopback CFG_URL reads the environment; any other URL resolves on
-  # the reference's DEFAULT arm, so no environment value is sent off-box.
+  # The URL gate lives in the helper (mcp_expand_env_ref_for_url): only the
+  # HOSTING runner's door (127.0.0.1 on $QONTINUI_RUNNER_API_PORT) reads the
+  # environment; any other URL - off-box, or a walked-up / sibling file naming
+  # another loopback door (finding e4c596d6) - resolves on the reference's
+  # DEFAULT arm, so this session's nonce reaches no door but its own runner.
   CFG_ENVREF_ERR=""
+  # The scratch file the expansion reports into must be writable BEFORE it is
+  # named in a redirection: a redirection bash cannot open skips the command and
+  # returns 1, which used to read as "no door here" and walk on to a FURTHER
+  # .mcp.json - a different config, or NO_PROXY_CONFIG on a box that has a door
+  # (coord finding ff263b4b, which records the 4-free-inode measurement).
+  # CFG_UNREADABLE tells
+  # find_own_cfg to stop instead.
+  if ! { : > "$TMPD/envref.err"; } 2>/dev/null; then
+    CFG_UNREADABLE="its coord-mcp entry could not be read: no scratch file could be written under $TMPD (a LOCAL resource fault - a full TMPDIR or no free inode)"
+    return 1
+  fi
   if ! mcp_expand_env_ref_for_url CFG_KEY "$CFG_URL" "$CFG_KEY" 2>"$TMPD/envref.err"; then
     CFG_ENVREF_ERR="$(head -n 1 "$TMPD/envref.err" 2>/dev/null)"
     CFG_ENVREF_FILE="$1"
@@ -2670,13 +2724,29 @@ EOF
 # Never on anything else - a JSON-RPC answer or error, any other HTTP status,
 # a timeout (exit 28 cannot tell connect from read) - since the call may have
 # reached a handler and a retry could double a write.
+# not_started <what> -> prints NOT_STARTED_LOCAL_RESOURCE and exits 7. For a
+# request that never left this box because the verb could not stage its own
+# files (plan 2026-11-08-coord-revive-call-misreports-carried-requests-and-copies-body-text-into-its-verdict,
+# Phase 1). Distinct from NO_PROXY_CONFIG (there IS a door) and from every
+# classify() verdict (none of them can be reached without a request).
+not_started() {
+  echo "coord-revive: $VERB -> NOT_STARTED_LOCAL_RESOURCE ($1 - a LOCAL resource fault, typically a full TMPDIR or no free inode; NOTHING was sent, so re-issuing once the box has room is safe)" >&2
+  exit 7
+}
+
 find_own_cfg() {
   local d="$PWD" f p
-  OWN_CFG_PATH=""; OWN_CFG_KIND=""; CFG_TRIED=""
+  OWN_CFG_PATH=""; OWN_CFG_KIND=""; CFG_TRIED=""; CFG_UNREADABLE_PATH=""; CFG_UNREADABLE=""
   PX_URL=""; PX_KEY=""; PX_KEY_HEADER=""; PX_PATH=""
   while [ -n "$d" ]; do
     f="$d/.mcp.json"
-    if [ -r "$f" ]; then
+    # A PRESENT config this run cannot read STOPS the walk (exit 2): reading
+    # past it would answer for a different file. When a nearer stdio entry was
+    # already found, it stays the door and only the proxy-fallback search ends.
+    if [ -e "$f" ] && [ ! -r "$f" ]; then
+      CFG_UNREADABLE="the file is present but not readable by this process"
+    fi
+    if [ -z "$CFG_UNREADABLE" ] && [ -r "$f" ]; then
       if read_cfg "$f"; then
         if [ "$OWN_CFG_KIND" = stdio ]; then
           PX_URL="$CFG_URL"; PX_KEY="$CFG_KEY"; PX_KEY_HEADER="$CFG_KEY_HEADER"; PX_PATH="$f"
@@ -2684,12 +2754,19 @@ find_own_cfg() {
         fi
         OWN_CFG_PATH="$f"; OWN_CFG_KIND=proxy; CFG_CRED_PATH=""; CFG_ENTRY_SHIM=""; return 0
       fi
+      # A CFG_UNREADABLE read_cfg (a proxy entry whose key could not be read)
+      # is no stdio entry either; the check after this block stops the walk.
       if [ -z "$OWN_CFG_KIND" ] && read_stdio_cfg "$f"; then
         OWN_CFG_PATH="$f"; OWN_CFG_KIND=stdio
       elif [ -z "$OWN_CFG_KIND" ]; then
         CFG_TRIED="$CFG_TRIED
   $f: $(cfg_shape "$f")"
       fi
+    fi
+    if [ -n "$CFG_UNREADABLE" ]; then
+      [ -n "$OWN_CFG_KIND" ] && { CFG_UNREADABLE=""; return 0; }
+      CFG_UNREADABLE_PATH="$f"
+      return 2
     fi
     p="$(dirname "$d")"
     [ "$p" = "$d" ] && break
@@ -2788,6 +2865,14 @@ stdio_door() {
       continue
     fi
     rm -f "$out"
+    # A redirection bash cannot open would read as a shim that failed to RUN;
+    # with no room under $TMPD nothing can be sent at all. RETURN 7, never
+    # exit: `observe` shares this function and must count the observation
+    # locally (exit 2) rather than leave on an exit it does not document.
+    if ! { : > "$TMPD/vdoorurl" && : > "$TMPD/vdoorerr"; } 2>/dev/null; then
+      echo "coord-revive: $VERB -> NOT_STARTED_LOCAL_RESOURCE (could not create the shim's output files under $TMPD - a LOCAL resource fault, typically a full TMPDIR or no free inode; NOTHING was sent)" >&2
+      return 7
+    fi
     "$DOOR_PY" "$(curl_path "$shim")" --credential "$(curl_path "$CFG_CRED_PATH")" --print-door "$(curl_path "$out")" \
       > "$TMPD/vdoorurl" 2> "$TMPD/vdoorerr" < /dev/null
     rc=$?
@@ -2990,7 +3075,9 @@ if [ "${1:-}" = "observe" ]; then
     fi
     exit 2
   }
-  find_own_cfg || o_unreported "no_proxy_config"
+  find_own_cfg; O_FOC=$?
+  [ "$O_FOC" -eq 2 ] && o_unreported "config_unreadable"
+  [ "$O_FOC" -eq 0 ] || o_unreported "no_proxy_config"
   # A STDIO shim entry carries no url and no nonce: the shim names the door and
   # stages the credential's headers, exactly as the call/tools verbs do. A
   # proxy entry above it is the fallback; neither is counted locally.
@@ -3003,7 +3090,10 @@ if [ "${1:-}" = "observe" ]; then
   O_POST_ATTEMPT=$((O_POST_ATTEMPT + 1))
   : > "$TMPD/odoorhdr"
   if [ "$OWN_CFG_KIND" = stdio ]; then
-    if ! stdio_door "$TMPD/odoorhdr"; then
+    stdio_door "$TMPD/odoorhdr"; O_SD=$?
+    if [ "$O_SD" -eq 7 ]; then
+      o_unreported "local_resource"
+    elif [ "$O_SD" -ne 0 ]; then
       if [ -n "$PX_PATH" ]; then
         CFG_URL="$PX_URL"; CFG_KEY="$PX_KEY"; CFG_KEY_HEADER="$PX_KEY_HEADER"
         OWN_CFG_PATH="$PX_PATH"; OWN_CFG_KIND=proxy; CFG_CRED_PATH=""
@@ -3097,12 +3187,29 @@ if [ $# -gt 0 ]; then
     V_METHOD="tools/list"
   fi
 
-  if ! build_rpc "$V_METHOD" "$V_TOOL" "$V_ARGS" > "$TMPD/rpc" 2>"$TMPD/rpcerr"; then
-    echo "coord-revive: $VERB -> BAD_ARGUMENTS ($(one_line 300 < "$TMPD/rpcerr")). Local, before any request was sent." >&2
+  # The request is built in memory first and only then staged, so a staging
+  # file this box cannot write (a full TMPDIR, no free inode) reads as
+  # NOT_STARTED_LOCAL_RESOURCE rather than as BAD_ARGUMENTS about valid JSON
+  # (plan 2026-11-08-coord-revive-call-misreports-carried-requests-and-copies-body-text-into-its-verdict,
+  # Phase 1). A command substitution is a pipe, not a file, so the build itself
+  # needs no disk.
+  if ! V_RPC="$(build_rpc "$V_METHOD" "$V_TOOL" "$V_ARGS" 2>/dev/null)"; then
+    echo "coord-revive: $VERB -> BAD_ARGUMENTS ($(build_rpc "$V_METHOD" "$V_TOOL" "$V_ARGS" 2>&1 >/dev/null | one_line 300)). Local, before any request was sent." >&2
     exit 4
   fi
+  # Compared byte for byte: a disk that fills mid-write leaves a non-empty,
+  # truncated file, and sending that would read as a coord refusal.
+  if ! { printf '%s\n' "$V_RPC" > "$TMPD/rpc"; } 2>/dev/null \
+     || ! printf '%s\n' "$V_RPC" | cmp -s - "$TMPD/rpc"; then
+    not_started "could not stage the request body under $TMPD"
+  fi
 
-  if ! find_own_cfg; then
+  find_own_cfg; V_FOC=$?
+  if [ "$V_FOC" -eq 2 ]; then
+    echo "coord-revive: $VERB -> CONFIG_UNREADABLE ($CFG_UNREADABLE_PATH: $CFG_UNREADABLE). The walk up from $PWD STOPPED there rather than reading a further .mcp.json, which would describe a different config. NOTHING was sent - a LOCAL fault, not a coord verdict." >&2
+    exit 7
+  fi
+  if [ "$V_FOC" -ne 0 ]; then
     echo "coord-revive: $VERB -> NO_PROXY_CONFIG (no proxy-shaped coord-mcp .mcp.json with a key, and no stdio coord-mcp-shim entry naming --credential, on the walk up from $PWD).${CFG_TRIED}" >&2
     echo "  This session has no provisioned nonce to ride - a LOCAL fact, not a coord verdict. This verb does not mint one (that would evict a live peer's workdir slot): use a session the runner provisioned, /gate for a gate write, or the PowerShell coord-read.ps1 read verbs." >&2
     exit 1
@@ -3112,7 +3219,11 @@ if [ $# -gt 0 ]; then
   # file and names the door; the block below appends the caller session to it.
   V_DOOR_HDRS=""
   if [ "$OWN_CFG_KIND" = stdio ]; then
-    if stdio_door "$TMPD/vdoorhdr"; then
+    stdio_door "$TMPD/vdoorhdr"; V_SD=$?
+    # 7: this box could not stage the shim's files, so no fallback can stage
+    # its own either; the typed line is already on stderr.
+    [ "$V_SD" -eq 7 ] && exit 7
+    if [ "$V_SD" -eq 0 ]; then
       V_DOOR_HDRS="$TMPD/vdoorhdr"
       CFG_KEY_HEADER="the shim's allowlisted credential headers"
     elif [ -n "$PX_PATH" ]; then
@@ -3170,10 +3281,18 @@ if [ $# -gt 0 ]; then
   # previous `{ printf ... > file; } 2>/dev/null` nesting gave for free.
   } 2>/dev/null > "$TMPD/vhdr"
   if [ ! -s "$TMPD/vhdr" ]; then
-    echo "coord-revive: $VERB -> AUTH_HEADER_STAGING_FAILED (could not write the header file under $TMPD - LOCAL fault, says nothing about coord)" >&2
-    exit 1
+    # Exit 7, the NOT_STARTED class: nothing left this box (the verdict word is
+    # kept, since callers grep it).
+    echo "coord-revive: $VERB -> AUTH_HEADER_STAGING_FAILED (could not write the header file under $TMPD - LOCAL fault, says nothing about coord; NOTHING was sent)" >&2
+    exit 7
   fi
-  : > "$TMPD/vbody"; : > "$TMPD/verr"
+  # Each file curl's redirections name must exist BEFORE curl runs: a
+  # redirection bash cannot open stops the command before it starts, and that
+  # used to surface as `UNREACHABLE (curl exit 1 ...)` - true, but it lost the
+  # fact that no request left this box (measured at 6-8 free inodes by session
+  # 86b12955, evidence/r12-inode-curl-starts.log, cited in the plan above).
+  { : > "$TMPD/vbody" && : > "$TMPD/verr" && : > "$TMPD/vcode"; } 2>/dev/null \
+    || not_started "could not create the response, status or error file under $TMPD"
   # TIMING SEAM (plan 2026-10-21-account-migration-strands-subagent-transcripts-
   # and-forks-live-sessions, Phase 6a): when the caller names a file, append one
   # `rpc_send_ms <epoch ms>` line per POST attempt, stamped just before the POST,
@@ -3197,7 +3316,7 @@ if [ $# -gt 0 ]; then
   # $CR_CHILD so the request cannot outlive the INTERRUPTED line. The http code
   # goes through a file read with the builtin `read`: the same fork count as the
   # `$( )` this replaced.
-  : > "$TMPD/vcode"; VCODE=""; VCE=""
+  VCODE=""; VCE=""
   CR_RPC_BUDGET="$CALL_TIMEOUT"
   cr_phase rpc
   # `command curl`: see the observe POST above.
@@ -3255,6 +3374,14 @@ if [ $# -gt 0 ]; then
         3) echo "coord-revive: $VERB -> RPC_ERROR (the tool answered with a JSON-RPC error - printed above; that is ITS answer, the door carried the call)" >&2; exit 3 ;;
         *) echo "coord-revive: $VERB -> HTTP_200_NOT_MCP (200 without a JSON-RPC result or error - treat the door as dead: $(printf '%s' "$VBODY" | one_line 200))" >&2; exit 1 ;;
       esac ;;
+    23:*)
+      # The answer was received and could not be stored, whatever status line
+      # came with it: never read a body this box does not hold. classify()
+      # names it; the exit is the CARRIED class, never the not-carried one.
+      VV="$(classify "$VCE" "$VCODE" "$VBODY" "$PROBE_CONNECT_TIMEOUT" "$CALL_TIMEOUT" "$VCURLERR")"
+      [ -n "$VCURLERR" ] && VV="$VV [curl: $VCURLERR]"
+      echo "coord-revive: $VERB -> $VV (door $CFG_URL from ${CFG_CRED_PATH:-$OWN_CFG_PATH}; the call MAY have been carried - read the state it would have written before re-issuing it)" >&2
+      exit 6 ;;
     *:401)
       # TWO different 401s arrive here and they have OPPOSITE recoveries, so the
       # body decides before the wording does. `runner_credential_*` is the
@@ -3267,6 +3394,7 @@ if [ $# -gt 0 ]; then
           [ -n "$VRC_POSTURE" ] || VRC_POSTURE="$(runner_credential_code_textual "$VBODY")"
           VRC_POSTURE="${VRC_POSTURE#runner_credential_}"
           [ -n "$VRC_POSTURE" ] || VRC_POSTURE="unstated"
+          case "$VRC_POSTURE" in *[!a-z_]*) VRC_POSTURE="invalid" ;; esac
           VRC_SINCE="$(runner_credential_field "$VBODY" since)"
           VRC_REMEDY="$(runner_credential_field "$VBODY" remedy)"
           echo "coord-revive: $VERB -> RUNNER_CREDENTIAL_$(printf '%s' "$VRC_POSTURE" | tr '[:lower:]' '[:upper:]') (the forwarder at $CFG_URL answered 401 ITSELF; HTTP 401 with code=runner_credential_$VRC_POSTURE since ${VRC_SINCE:-unstated}). The nonce in ${CFG_CRED_PATH:-$OWN_CFG_PATH} is FINE and the TRANSPORT is healthy - what is dead is THIS RUNNER's own coord credential." >&2
@@ -3283,6 +3411,11 @@ if [ $# -gt 0 ]; then
     *)
       VV="$(classify "$VCE" "$VCODE" "$VBODY" "$PROBE_CONNECT_TIMEOUT" "$CALL_TIMEOUT" "$VCURLERR")"
       [ -n "$VCURLERR" ] && VV="$VV [curl: $VCURLERR]"
+      case "$VV" in
+        CARRIED_ANSWER_UNREAD*)
+          echo "coord-revive: $VERB -> $VV (door $CFG_URL from ${CFG_CRED_PATH:-$OWN_CFG_PATH}; the call MAY have been carried - read the state it would have written before re-issuing it)" >&2
+          exit 6 ;;
+      esac
       echo "coord-revive: $VERB -> $VV (door $CFG_URL from ${CFG_CRED_PATH:-$OWN_CFG_PATH}; the call was NOT carried - a write here is presumed LOST, re-issue and verify by read)" >&2
       exit 1 ;;
   esac

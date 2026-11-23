@@ -28,61 +28,22 @@
 //!
 //! # Handler registration
 //!
-//! Modules are transitioning to Tauri plugin self-registration. Two patterns
-//! coexist:
+//! Every in-app command is registered at APP level, not as a Tauri plugin —
+//! the one exception is `ui_bridge_plugin`, whose handlers are non-`pub` and
+//! which the frontend reaches as `plugin:ui-bridge|<cmd>`. A module that
+//! declares its commands with
+//! [`ipc_group!`](crate::ipc_group) is routed by `ipc_registry`; the rest are
+//! listed in `main.rs`'s central `tauri::generate_handler![...]` until plan
+//! `2026-10-02-split-run-app-invoke-handler` moves them too. The comment at
+//! `run_app`'s `.invoke_handler` call says why: a Tauri 2 plugin command is
+//! reachable only as `plugin:<name>|<cmd>`, the frontend invokes bare names,
+//! and so the per-module `plugin()` split compiled clean and broke runtime IPC
+//! (rolled back at `1f1d807f6`).
 //!
-//! **Plugin pattern (preferred)** — module exposes `pub fn plugin<R: Runtime>()
-//! -> TauriPlugin<R>` holding its own `tauri::generate_handler![...]`. main.rs
-//! adds one `.plugin(commands::foo::plugin())` call. Adding a command to a
-//! migrated module is a single-file edit.
-//!
-//! **Central pattern (legacy)** — handlers listed in main.rs's central
-//! `tauri::generate_handler![...]`. Requires editing main.rs for every new
-//! command; tracked for migration.
-//!
-//! Migrated modules: clipboard, debug, dev_findings, file_browser,
-//! window_manager, checks, checkpoints, comparison, container_settings,
-//! dag_workflows, database, dataset, discoveries, event_search, findings,
-//! hooks, issues, known_issues, playwright_settings, self_healing_settings,
-//! execution_variables, mobile_settings, otel_settings, security_settings,
-//! ai_settings, accessibility, web_integration, activity_timeline,
-//! agentic_metrics, ai_data, cost_dashboard, learning, performance_metrics,
-//! recap, terminal_analysis, token_analytics, transcript, adaptive_learning,
-//! ai_generation, ai_session, backup, checkpoint_browser, config, context,
-//! library_sync, logging, meta_optimizer, rag, auth, state_machine,
-//! websocket, video, interaction, storage, extraction, screenshot,
-//! screenshots, script_emitter, verification, project_logs,
-//! global_log_sources, execution_reporting, workflow_events,
-//! state_machine_configs, spec_drift, ui_bridge_baselines, state_explorer,
-//! tiered_info, task_sync, step_outputs, testing, shell_commands, mcp,
-//! mobile, setup_wizard, saved_projects, test_orchestrator,
-//! orchestration_loop_configs, scripted_output_settings, watchers,
-//! durable_execution, flow, ui_bridge, terminal, instances, execution
-//! (as of this commit).
-//!
-//! All `commands/*` modules are now migrated to the plugin pattern. So are
-//! the subsystem command modules living outside `commands/`: `error_monitor`,
-//! `doctor`, `mcp::backend_relay`, `process_capture`, `orchestration_loop`,
-//! `spec_experimentation`, plus the module-level handlers in `ui_error.rs`
-//! and `crash_dumps.rs`. main.rs no longer holds a central
-//! `tauri::generate_handler![...]` — every command self-registers through
-//! its owning module's `plugin()` fn.
-//!
-//! Note: ai_session, meta_optimizer, rag, flow, ui_bridge, terminal, and
-//! execution use a non-generic `plugin() -> TauriPlugin<tauri::Wry>` because
-//! they accept concrete `tauri::AppHandle` parameters in some commands.
-//! Modules without `AppHandle` parameters use the generic
-//! `plugin<R: Runtime>() -> TauriPlugin<R>` form.
-//!
-//! To migrate a module `foo.rs`:
-//! 1. Add `use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};` and
-//!    `use tauri::Runtime;` at the top.
-//! 2. Add `pub fn plugin<R: Runtime>() -> TauriPlugin<R>` at the bottom that
-//!    returns `PluginBuilder::new("qontinui_foo").invoke_handler(...).build()`.
-//! 3. In `main.rs`, remove the module's entries from the central
-//!    `generate_handler!` list and add `.plugin(commands::foo::plugin())`
-//!    right after the existing per-module plugin block.
-//! 4. Plugin name convention: `qontinui_<module_name>` (lowercase snake_case).
+//! A per-module `pub fn plugin()` is therefore dead code, and a command listed
+//! only there ships as a command that does not exist. The ones that remain are
+//! deleted as their modules move. Register a new command in its module's
+//! `ipc_group!`, or in the central list — never in a `plugin()`.
 //!
 //! # Migrating a module to a compartment (Workstream C)
 //!
@@ -635,6 +596,78 @@ impl AppState {
             &crate::settings::load_settings().web_integration,
         )
         .await
+    }
+}
+
+#[cfg(test)]
+impl AppState {
+    /// An in-memory `AppState` for tests that need a real `StepExecutor`
+    /// (whose constructors take an `Arc<AppState>`). Hermetic: nothing here
+    /// touches the disk, the network or a process-global — the database is
+    /// `PgDb::new_noop_for_test` (every query errors), `LocalStorage` is built
+    /// without `LocalStorage::new` (which creates directories), and no global
+    /// (`PgDb::set_global`, `WorkingRepresentationCache::set_global`) is set.
+    pub(crate) fn new_for_test() -> Arc<Self> {
+        let unused_dir = std::env::temp_dir().join("qontinui-app-state-for-test-unused");
+        Arc::new(Self {
+            bridge_manager: TokioMutex::new(None),
+            extraction_executor: Mutex::new(None),
+            sdk_connection: Arc::new(TokioMutex::new(
+                crate::mcp::sdk_client::SdkConnectionManager::new(),
+            )),
+            exploration_cancel: Arc::new(TokioMutex::new(None)),
+            current_config: Mutex::new(None),
+            display_processor: Arc::new(TokioMutex::new(DisplayProcessor::new())),
+            local_storage: Arc::new(Mutex::new(LocalStorage {
+                config: crate::storage::StorageConfig {
+                    screenshot_path: unused_dir.join("screenshots"),
+                    video_path: unused_dir.join("videos"),
+                    max_screenshot_mb: 0,
+                    max_video_mb: 0,
+                    auto_cleanup: false,
+                },
+            })),
+            video_recorder: Arc::new(Mutex::new(VideoRecordingService::new())),
+            event_broadcast: broadcast::channel(16).0,
+            pg_db: PgDb::new_noop_for_test(),
+            run_recording_handler: Arc::new(RunRecordingHandler::new()),
+            mcp_client_manager: TokioMutex::new(McpClientManager::new()),
+            error_monitor_handle: TokioMutex::new(None),
+            doctor_handle: TokioMutex::new(None),
+            url_lock_manager: Arc::new(UrlLockManager::new()),
+            file_registry_manager: Arc::new(FileRegistryManager::new()),
+            file_lock_manager: Arc::new(FileLockManager::new()),
+            touch_events_tx: broadcast::channel(16).0,
+            ui_bridge_failure_tracker: UiBridgeFailureTracker::new(),
+            process_capture_manager: TokioMutex::new(None),
+            api_ready: AtomicBool::new(false),
+            frontend_ready: AtomicBool::new(false),
+            ui_bridge_last_pong: Arc::new(AtomicU64::new(0)),
+            api_port: AtomicU16::new(0),
+            api_lan_bound: AtomicBool::new(false),
+            ai_pid_tracker: Arc::new(Mutex::new(Vec::new())),
+            canvas_state: Arc::new(tokio::sync::RwLock::new(
+                crate::mcp::canvas::CanvasState::new(),
+            )),
+            orchestration_loops: Arc::new(TokioMutex::new(
+                crate::orchestration_loop::loop_engine::MultiLoopManager::new(),
+            )),
+            container_executor: TokioMutex::new(None),
+            run_cost_trackers: TokioMutex::new(HashMap::new()),
+            working_representation_cache: Arc::new(
+                crate::memory::working_representation::WorkingRepresentationCache::new(),
+            ),
+            server_mode: Arc::new(tokio::sync::RwLock::new(None)),
+            ui_error: Arc::new(crate::ui_error::UiErrorState::new()),
+            crash_dumps: Arc::new(crate::crash_dumps::CrashDumpState::new()),
+            usb_transport: Arc::new(tokio::sync::OnceCell::new()),
+            app_registry: Arc::new(tokio::sync::OnceCell::new()),
+            app_dispatcher: Arc::new(tokio::sync::OnceCell::new()),
+            wrapper_state: Arc::new(tokio::sync::OnceCell::new()),
+            prehydration_cache: Arc::new(
+                crate::unified_workflow_executor::prehydration::PrehydrationCache::new(),
+            ),
+        })
     }
 }
 

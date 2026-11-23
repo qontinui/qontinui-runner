@@ -47,7 +47,9 @@ pub use qontinui_pty_holder::spec::ChildSpec;
 pub const HOLDER_BIN_NAME: &str = "qontinui-pty-holder";
 
 /// The directory, under a runner instance's scoped data dir, that holds its
-/// panes' lock files, sockets, specs and logs.
+/// panes' lock files, specs and logs. (Not their Unix sockets: those live in
+/// the per-user `qontinui_pty_holder::pane::socket_root`, so their paths fit
+/// `sun_path` however deep this dir is.)
 pub const PANE_DIR_NAME: &str = "pty-panes";
 
 /// `<scoped runner dir>/pty-panes`.

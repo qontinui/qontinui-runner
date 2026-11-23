@@ -1,395 +1,736 @@
-//! Host-derived parallelism sizing for one CI dispatch.
+//! Host-derived parallelism sizing for one CI dispatch — re-exported from
+//! [`qontinui_types::host_sizing`] — and, since plan
+//! `2026-11-05-one-free-resource-model-places-sessions-builds-and-ci`
+//! Phase 7, the CI node's concurrency read from coord's capacity model.
 //!
-//! **Why this is derived and not a constant.** The CI-node lane runs on a
-//! machine the manifest author has never seen. A static `cargo_build_jobs = 1`
-//! is safe on a laptop and wastes a 128 GiB workstation; a static `= 8` OOMs
-//! the laptop. The GitHub Actions lane hit the second half of that in
-//! production and answered it by deriving both caps from the host's own
-//! `MemTotal` (`qontinui-coord/.github/actions/cap-cargo-jobs/action.yml`).
-//! This module is that rule, ported.
+//! The sizing rule (3 GiB per cargo build token, 1 GiB per test process, the
+//! 8 GiB small-host floor, the per-slot suggestion and the 1/N `share`) used to
+//! live here. It moved to `qontinui-schemas/rust` so the runner, the supervisor
+//! and the bash build wrappers (through a golden table pinned there) all size
+//! cargo from ONE formula. Its rationale and its unit tests live with it; this
+//! module keeps only the CI lane's import path. Plan
+//! `2026-10-02-cargo-jobs-supervisor-build-pool-and-physical-disk-floors-follow-the-machine`,
+//! design decision D2.
 //!
-//! **The two budgets are sized SEPARATELY and deliberately differ.** The
-//! incident behind the Actions rule killed the agent TWICE on the same job:
-//! attempt 1 during `Compiling qontinui-coord`, attempt 2 during the TEST
-//! phase — with `6543 tests run: 6543 passed` logged moments before the agent
-//! died. Bounding only the build leaves half that failure mode open, which is
-//! exactly the hole coord's `.qontinui/ci.toml` papers over today by smuggling
-//! `--test-threads 4` through argv.
+//! `probe` comes from the `host-probe` feature, which the runner enables on
+//! its `qontinui-types` dependency.
 //!
-//! - **3 GiB per cargo build token.** A token is mostly an LLVM codegen
-//!   thread, which is much cheaper than a whole rustc process, so this is
-//!   deliberately generous. It is a sizing judgement, not a measurement — the
-//!   Actions action says so in the same words, and no peak-RSS profile of the
-//!   ~577k-LOC coord crate was ever taken.
-//! - **1 GiB per test process**, a looser and independent budget: test
-//!   processes exec'ing the same binary SHARE its text/rodata through the page
-//!   cache, so only anon memory is per-process.
-//! - **A hard floor of 1 build job at or below 8 GiB**, overriding the ratio's
-//!   answer of 2. That is a measurement, not a judgement: the qontinui-runner
-//!   workspace was observed still OOM-killing the agent at `JOBS=2` on a 7 GB
-//!   host even with a 12 GB swapfile.
+//! ## The model arm (plan 2026-11-05 Phase 7)
 //!
-//! The decision is a pure function of [`HostCapacity`] so it is testable
-//! everywhere; only [`probe`] touches the host.
+//! An unset `ci_node.max_concurrent_builds` used to resolve to the static
+//! [`suggested_concurrent_builds`] — `max(1, min(cpus/4, mem/12 GiB))`, blind to
+//! what else the box is doing. It now resolves to the capacity model's answer
+//! for THIS device ([`suggested_concurrent_builds_now`]), read from the cached
+//! row [`crate::fleet_capacity`] keeps and the D9 dial the fleet-policy poller
+//! keeps (`mcp::fleet_policy_poller::capacity_model_dial`):
+//!
+//! ```text
+//! concurrency = clamp(Lane B dispatches already running when coord's sample was taken
+//!                     + the row's served slots.C1,
+//!                     1, the static partition)
+//! ```
+//!
+//! * **C1, not C1 + C2.** Lane B builds coord's merge candidates and nothing
+//!   else (coord `ci_dispatch`, rule R3), which coord's CI vocabulary classes
+//!   C1. The served `slots.C1` and `slots.C2` are two readings of the SAME free
+//!   capacity (each "how many units of this class fit in what is free"), so
+//!   their sum would count the free box twice.
+//! * **Plus what was running at the SAMPLE, and only that.** A slot count is
+//!   FREE capacity, net of every build the sample saw; the concurrency is a
+//!   TOTAL the executor compares the running count with (`admission`) and coord
+//!   compares active dispatches with (the advertised `max_concurrent_ci_jobs`).
+//!   So the dispatches the sample had already SEEN are added back. One admitted
+//!   after it is not in it: its capacity is still inside `slots.C1`, and
+//!   counting it again would admit it twice. The sample's instant is the read's
+//!   `fetched_at` less coord's `cache_age_secs` and the row's `sample_age_s`
+//!   ([`model_inputs`]; coord stamps a sample when it arrives). And a sample
+//!   sees a build only gradually — its CPU figure is a ~30 s average and a
+//!   build's memory ramps for minutes — so a dispatch counts as seen only once
+//!   it had run [`SAMPLE_RAMP`] before the sample; a younger one's cost is
+//!   treated as still inside `slots.C1`. The count is taken against the node's
+//!   own start times (`admission::running_started_by`), so it only falls as
+//!   those builds finish — a burst after the sample cannot raise it. Every error
+//!   left is on the safe side (a build that finished, or ramped, since the
+//!   sample is under-counted) and lasts until the next read.
+//! * **Never above the static partition, never below 1.** The executor sizes
+//!   each dispatch as one of N equal host shares, N the static suggestion
+//!   (`CiNodeSettings::dispatch_share_for`). A model total above N would
+//!   oversubscribe the host through those shares, so the model LOWERS the
+//!   partition on a loaded box and never raises it. The floor of 1 is the one
+//!   admission and coord's `ci_dispatch` already apply, so the number the node
+//!   advertises is the number it admits.
+//! * **The labelled UNKNOWN fallback is the static formula**, used — and named
+//!   ([`ConcurrencySource::Static`]) — whenever the model does not answer: no
+//!   read yet, capacity data older than [`MODEL_STALE_AFTER`] (the read's own
+//!   age plus coord's cache age plus the sample's), an UNKNOWN row or
+//!   `slots.C1`, a row or an answer that does not say how old it is, a dial
+//!   never read in this process, or a dial that does not permit consumer
+//!   [`CONSUMER`] (D9).
+//! * **A failed refetch keeps the last KNOWN row** while it is younger than
+//!   [`MODEL_STALE_AFTER`] ([`read_to_size_from`]): one coord hiccup does not
+//!   drop the node to the static partition and back.
+//! * **Logged when it changes.** Each change of the answer — the model's count
+//!   beside the static one, or the reason the model did not answer (its numbers
+//!   aside, so a stale read's growing age is one answer) — is logged once: D9's
+//!   per-decision record, for a consumer whose decision is a count.
+//!
+//! An explicit `ci_node.max_concurrent_builds` still always wins
+//! (`CiNodeSettings`).
 
-/// What the host reports about itself. `mem_bytes` is `None` when memory could
-/// not be read at all — a real case on locked-down hosts, and the one where
-/// guessing is worst.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct HostCapacity {
-    pub mem_bytes: Option<u64>,
-    /// Usable parallelism. Always at least 1.
-    pub cpus: u32,
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+use chrono::{DateTime, Utc};
+use tracing::info;
+
+pub(crate) use qontinui_types::host_sizing::{
+    derive, probe, share, suggested_concurrent_builds, suggestion_with_limit, HostCapacity,
+    HostSizing,
+};
+
+use crate::fleet_capacity::CapacityRead;
+
+/// The D9 consumer this sizing is: coord's `CapacityConsumer::CiPlacement`
+/// ("CI and background builds are placed and sized by free capacity").
+pub(crate) const CONSUMER: &str = "ci_placement";
+
+/// Capacity data older than this sizes nothing. The age is the read's own
+/// (the budget republisher refreshes it every [`crate::fleet_capacity::CACHE_TTL`])
+/// plus coord's cache age plus the age of the sample coord computed the row
+/// from, which coord itself serves UNKNOWN past its own staleness bound.
+pub(crate) const MODEL_STALE_AFTER: Duration = Duration::from_secs(180);
+
+/// How long a dispatch must have run before a capacity sample counts as having
+/// seen it: the sample's CPU figure is a ~30 s average and a build's memory
+/// ramps for minutes, so a younger dispatch's cost is treated as still inside
+/// the served `slots.C1` (the safe side: it is not added back).
+pub(crate) const SAMPLE_RAMP: Duration = Duration::from_secs(120);
+
+/// Where a CI-node concurrency came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ConcurrencySource {
+    /// The capacity model: the Lane B dispatches coord's sample had seen (run
+    /// [`SAMPLE_RAMP`] before it), plus the C1 slots it served, clamped to
+    /// `[1, static_partition]`.
+    Model {
+        running_at_sample: u32,
+        slots_c1: u32,
+        static_partition: u32,
+    },
+    /// The static host formula — the labelled UNKNOWN fallback — and why the
+    /// model did not answer.
+    Static { reason: String },
 }
 
-/// The derived caps for one dispatch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct HostSizing {
-    pub cargo_build_jobs: u32,
-    pub test_threads: u32,
+impl ConcurrencySource {
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            ConcurrencySource::Model { .. } => "model",
+            ConcurrencySource::Static { .. } => "static",
+        }
+    }
 }
 
-/// Bytes of headroom assumed per concurrent cargo build token (3 GiB).
-const BYTES_PER_BUILD_TOKEN: u64 = 3 * 1024 * 1024 * 1024;
-/// Bytes of anon footprint assumed per test process (1 GiB).
-const BYTES_PER_TEST_PROCESS: u64 = 1024 * 1024 * 1024;
-/// At or below this total memory the build cap is pinned to 1 regardless of
-/// the ratio (measured: `JOBS=2` still OOM-killed a 7 GB host).
-const SMALL_HOST_BYTES: u64 = 8 * 1024 * 1024 * 1024;
-/// Floor when memory is unreadable. Conservative on purpose: an unknown host
-/// is treated as a small one, because the failure mode of guessing high is an
-/// OOM-killed dispatch and the failure mode of guessing low is a slow one.
-const UNKNOWN_HOST_BUILD_JOBS: u32 = 1;
-const UNKNOWN_HOST_TEST_THREADS: u32 = 2;
+/// Why the D9 dial keeps [`CONSUMER`] on its legacy reader, or `None` when it
+/// permits the model. `dial` is the `capacity_model` block coord served (the
+/// poller keeps the last one a 2xx carried); `None` = never read in this
+/// process, which D9 never resolves to `enforce`. PURE.
+pub(crate) fn dial_refusal(dial: Option<&serde_json::Value>) -> Option<String> {
+    let Some(dial) = dial else {
+        return Some(
+            "the capacity-model dial has not been read in this process; D9 keeps the legacy \
+             reader until it is"
+                .to_string(),
+        );
+    };
+    let permitted = dial
+        .get("permitted_consumers")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|list| list.iter().any(|c| c.as_str() == Some(CONSUMER)));
+    (!permitted).then(|| {
+        format!(
+            "the capacity-model dial does not permit {CONSUMER} (mode {})",
+            dial.get("mode")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unstated")
+        )
+    })
+}
 
-/// Derive both caps. Pure — this is the whole sizing rule, and it mirrors
-/// `cap-cargo-jobs`' arithmetic operation-for-operation, including the order
-/// in which the floors and the cpu cap are applied (the small-host build floor
-/// is applied LAST so it overrides the cpu cap too).
-pub(crate) fn derive(cap: HostCapacity) -> HostSizing {
-    let cpus = cap.cpus.max(1);
-    let Some(mem) = cap.mem_bytes.filter(|m| *m > 0) else {
-        return HostSizing {
-            cargo_build_jobs: UNKNOWN_HOST_BUILD_JOBS,
-            test_threads: UNKNOWN_HOST_TEST_THREADS.min(cpus),
+/// What one capacity read gives the CI node's sizing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ModelInputs {
+    /// When coord's sample behind the row was taken.
+    pub(crate) sample_at: DateTime<Utc>,
+    /// The C1 slots the row served.
+    pub(crate) slots_c1: u32,
+}
+
+/// A served age in seconds, when it is one.
+fn served_age(value: &serde_json::Value) -> Option<f64> {
+    value.as_f64().filter(|age| age.is_finite() && *age >= 0.0)
+}
+
+/// The model's inputs from one capacity read and the dial, or why the model
+/// does not answer. PURE.
+pub(crate) fn model_inputs(
+    read: &CapacityRead,
+    dial: Option<&serde_json::Value>,
+) -> Result<ModelInputs, String> {
+    if let Some(why) = dial_refusal(dial) {
+        return Err(why);
+    }
+    let Some(row) = read.known_row() else {
+        return Err(format!(
+            "the capacity row is UNKNOWN: {}",
+            read.reason.as_deref().unwrap_or("no reason served")
+        ));
+    };
+    let sample_age = served_age(&row["sample_age_s"])
+        .ok_or_else(|| "the capacity row does not say how old its sample is".to_string())?;
+    let coord_age = read
+        .coord
+        .as_ref()
+        .and_then(|answer| served_age(&answer["cache_age_secs"]))
+        .ok_or_else(|| "coord's answer does not say how old its cache is".to_string())?;
+    let age = read.cache_age_secs + coord_age + sample_age;
+    // A NaN read age is stale too.
+    if age.is_nan() || age > MODEL_STALE_AFTER.as_secs_f64() {
+        return Err(format!(
+            "the capacity data is stale: {age:.0}s old (the read {:.0}s, coord's cache \
+             {coord_age:.0}s, the sample {sample_age:.0}s; stale after {}s)",
+            read.cache_age_secs,
+            MODEL_STALE_AFTER.as_secs()
+        ));
+    }
+    let fetched_at = DateTime::parse_from_rfc3339(&read.fetched_at)
+        .map_err(|e| format!("the read's fetched_at does not parse: {e}"))?
+        .with_timezone(&Utc);
+    // Bounded by MODEL_STALE_AFTER above, so the millisecond count cannot overflow.
+    let before_fetch = chrono::Duration::milliseconds(((coord_age + sample_age) * 1000.0) as i64);
+    let c1 = &row["slots"]["C1"];
+    let slots_c1 = match c1["state"].as_str() {
+        Some("known") => c1["value"]
+            .as_u64()
+            .and_then(|v| u32::try_from(v).ok())
+            .ok_or_else(|| "slots.C1 is known but carries no count".to_string())?,
+        Some("unknown") => {
+            return Err(format!(
+                "slots.C1 is UNKNOWN: {}",
+                c1["reason"].as_str().unwrap_or("no reason served")
+            ))
+        }
+        _ => return Err("the capacity row serves no slots.C1".to_string()),
+    };
+    Ok(ModelInputs {
+        sample_at: fetched_at - before_fetch,
+        slots_c1,
+    })
+}
+
+/// Lane B's concurrency: the dispatches running at the sample plus the free C1
+/// slots, never above the static partition and never below 1. PURE.
+pub(crate) fn lane_b_total(running_at_sample: u32, slots_c1: u32, static_partition: u32) -> u32 {
+    running_at_sample
+        .saturating_add(slots_c1)
+        .min(static_partition)
+        .max(1)
+}
+
+/// The suggestion from its inputs: the model's Lane B total when it answers,
+/// else the static formula with the reason it did not. `running_started_by`
+/// counts the dispatches running now that had started by an instant (asked for
+/// [`SAMPLE_RAMP`] before the sample), and only when the model answers. PURE
+/// over its arguments.
+fn answer_from(
+    read: Option<&CapacityRead>,
+    dial: Option<&serde_json::Value>,
+    dial_coord_base: Option<&str>,
+    running_started_by: impl FnOnce(DateTime<Utc>) -> usize,
+    host: HostCapacity,
+) -> (u32, ConcurrencySource) {
+    let static_partition = suggested_concurrent_builds(host);
+    let inputs = read
+        .ok_or_else(|| "no capacity read in this process yet".to_string())
+        .and_then(|read| {
+            let inputs = model_inputs(read, dial)?;
+            // The row and the dial join only when they came from one coord:
+            // a dial kept from a coord this runner has left must not permit
+            // sizing from another coord's row.
+            let read_base = read.coord_base.as_deref();
+            match crate::fleet_capacity::same_coord_base(read_base, dial_coord_base) {
+                Some(true) => Ok(inputs),
+                _ => Err(format!(
+                    "the capacity row and the capacity_model dial are not from one coord \
+                     (row from {}, dial from {}), so they are not joined",
+                    read_base.unwrap_or("no coord"),
+                    dial_coord_base.unwrap_or("no coord")
+                )),
+            }
+        });
+    match inputs {
+        Ok(inputs) => {
+            let seen_by = inputs.sample_at
+                - chrono::Duration::from_std(SAMPLE_RAMP)
+                    .unwrap_or_else(|_| chrono::Duration::zero());
+            let running_at_sample = u32::try_from(running_started_by(seen_by)).unwrap_or(u32::MAX);
+            (
+                lane_b_total(running_at_sample, inputs.slots_c1, static_partition),
+                ConcurrencySource::Model {
+                    running_at_sample,
+                    slots_c1: inputs.slots_c1,
+                    static_partition,
+                },
+            )
+        }
+        Err(reason) => (static_partition, ConcurrencySource::Static { reason }),
+    }
+}
+
+/// The read to size from: `current` when its row is KNOWN, else `kept` — the
+/// last read whose row was, aged by how long it has been kept — while that is
+/// still no older than [`MODEL_STALE_AFTER`]; past it, `current`, so the
+/// reason given is today's. PURE.
+fn read_to_size_from(
+    current: Option<CapacityRead>,
+    kept: Option<(&CapacityRead, Duration)>,
+) -> Option<CapacityRead> {
+    if current
+        .as_ref()
+        .is_some_and(|read| read.known_row().is_some())
+    {
+        return current;
+    }
+    match kept {
+        Some((read, kept_for)) => {
+            let mut aged = read.clone();
+            aged.cache_age_secs += kept_for.as_secs_f64();
+            if aged.cache_age_secs <= MODEL_STALE_AFTER.as_secs_f64() {
+                Some(aged)
+            } else {
+                current
+            }
+        }
+        None => current,
+    }
+}
+
+/// [`crate::fleet_capacity::cached`], through [`read_to_size_from`] and the
+/// last read whose row was KNOWN.
+fn usable_read() -> Option<CapacityRead> {
+    static LAST_KNOWN: Mutex<Option<(Instant, CapacityRead)>> = Mutex::new(None);
+    let current = crate::fleet_capacity::cached();
+    let Ok(mut last) = LAST_KNOWN.lock() else {
+        return current;
+    };
+    if let Some(read) = current.as_ref().filter(|read| read.known_row().is_some()) {
+        *last = Some((Instant::now(), read.clone()));
+        return current;
+    }
+    read_to_size_from(
+        current,
+        last.as_ref().map(|(at, read)| (read, at.elapsed())),
+    )
+}
+
+/// The CI node's suggested concurrency for an unset
+/// `ci_node.max_concurrent_builds`: the capacity model's Lane B total when it
+/// answers, else the static [`suggested_concurrent_builds`] — labelled either
+/// way. Synchronous: it reads the cached row and dial and never waits on
+/// coord. NOT pure, and it takes `ci_state`'s lock (through
+/// `admission::running_started_by`), so no caller may hold that lock.
+pub(crate) fn suggested_concurrent_builds_now(host: HostCapacity) -> (u32, ConcurrencySource) {
+    let read = usable_read();
+    let dial = crate::mcp::fleet_policy_poller::capacity_model_dial();
+    let answer = answer_from(
+        read.as_ref(),
+        dial.as_ref().map(|d| &d.dial),
+        dial.as_ref().map(|d| d.coord_base.as_str()),
+        super::admission::running_started_by,
+        host,
+    );
+    log_on_change(&answer, suggested_concurrent_builds(host));
+    answer
+}
+
+/// A reason with every run of digits (and the points between them) collapsed
+/// to `#`: a stale read's growing age is one logged answer, while a different
+/// reason — another UNKNOWN cause — is another. PURE.
+fn reason_kind(reason: &str) -> String {
+    let mut out = String::with_capacity(reason.len());
+    let mut in_number = false;
+    for c in reason.chars() {
+        if c.is_ascii_digit() || (in_number && c == '.') {
+            if !in_number {
+                out.push('#');
+                in_number = true;
+            }
+        } else {
+            in_number = false;
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The key a logged answer is compared by. PURE.
+fn answer_key(answer: &(u32, ConcurrencySource)) -> String {
+    match &answer.1 {
+        ConcurrencySource::Model {
+            running_at_sample,
+            slots_c1,
+            static_partition,
+        } => format!(
+            "model {} = {running_at_sample} + {slots_c1} | {static_partition}",
+            answer.0
+        ),
+        ConcurrencySource::Static { reason } => {
+            format!("static {} | {}", answer.0, reason_kind(reason))
+        }
+    }
+}
+
+/// D9's record for a sizing consumer: each change of the answer is logged
+/// once, the model's count beside the static formula's.
+fn log_on_change(answer: &(u32, ConcurrencySource), static_count: u32) {
+    static LAST: Mutex<Option<String>> = Mutex::new(None);
+    let key = answer_key(answer);
+    {
+        let Ok(mut last) = LAST.lock() else {
+            return;
         };
-    };
-
-    let mut build_jobs = (mem / BYTES_PER_BUILD_TOKEN).clamp(1, u32::MAX as u64) as u32;
-    build_jobs = build_jobs.max(1).min(cpus);
-    if mem <= SMALL_HOST_BYTES {
-        build_jobs = 1;
+        if last.as_deref() == Some(key.as_str()) {
+            return;
+        }
+        *last = Some(key);
     }
-
-    let mut test_threads = (mem / BYTES_PER_TEST_PROCESS).clamp(1, u32::MAX as u64) as u32;
-    // Floor of 2 so the suite never goes fully serial, then capped by cpus —
-    // so a genuine 1-cpu host still gets 1.
-    test_threads = test_threads.max(2).min(cpus);
-
-    HostSizing {
-        cargo_build_jobs: build_jobs,
-        test_threads,
-    }
-}
-
-/// Cargo build tokens that make up ONE concurrent CI dispatch slot, in this
-/// module's own units ([`BYTES_PER_BUILD_TOKEN`] each). A slot is therefore
-/// 4 × 3 GiB = 12 GiB of build-token headroom.
-const BUILD_TOKENS_PER_SLOT: u64 = 4;
-/// Usable cpus that make up ONE concurrent CI dispatch slot. Paired with
-/// [`BUILD_TOKENS_PER_SLOT`] so a slot carries one build token per core — the
-/// same token↔core pairing [`derive`] applies when it caps `build_jobs` at
-/// `cpus`.
-const CPUS_PER_SLOT: u32 = 4;
-/// What a host with an unreadable memory probe is offered: a single slot, for
-/// the same reason [`UNKNOWN_HOST_BUILD_JOBS`] is 1.
-const UNKNOWN_HOST_SUGGESTED_SLOTS: u32 = 1;
-
-/// Which host term bounds [`suggested_concurrent_builds`]. Surfaced so the
-/// settings panel can name WHY a value above the suggestion is risky.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum LimitingTerm {
-    Cores,
-    Memory,
-}
-
-/// How many CI dispatches this host can run side by side — a SUGGESTION for
-/// `ci_node.max_concurrent_builds` when the operator has not set one.
-///
-/// `derive` answers parallelism *within* one dispatch; this answers how many
-/// dispatches, in the same units: one slot is [`BUILD_TOKENS_PER_SLOT`] build
-/// tokens and [`CPUS_PER_SLOT`] cores, and the host gets as many slots as BOTH
-/// terms allow, never fewer than 1. Unreadable memory yields 1 — guessing high
-/// on an unknown host is the OOM, guessing low is merely slow.
-///
-/// Pure. Pair it with [`share`] at dispatch time: admitting N dispatches is only
-/// safe if each one then sizes itself against a 1/N share of the host.
-pub(crate) fn suggested_concurrent_builds(cap: HostCapacity) -> u32 {
-    suggestion_with_limit(cap).0
-}
-
-/// [`suggested_concurrent_builds`] plus the term that bound it (`None` when
-/// memory is unreadable and the answer is the conservative fallback).
-pub(crate) fn suggestion_with_limit(cap: HostCapacity) -> (u32, Option<LimitingTerm>) {
-    let Some(mem) = cap.mem_bytes.filter(|m| *m > 0) else {
-        return (UNKNOWN_HOST_SUGGESTED_SLOTS, None);
-    };
-    let by_cores = cap.cpus.max(1) / CPUS_PER_SLOT;
-    let by_mem =
-        (mem / (BUILD_TOKENS_PER_SLOT * BYTES_PER_BUILD_TOKEN)).min(u32::MAX as u64) as u32;
-    let limit = if by_cores <= by_mem {
-        LimitingTerm::Cores
-    } else {
-        LimitingTerm::Memory
-    };
-    (by_cores.min(by_mem).max(1), Some(limit))
-}
-
-/// One dispatch's share of the host when `n` dispatches run concurrently.
-///
-/// **Why this exists.** [`derive`] sizes one dispatch against whatever capacity
-/// it is handed. Handed the WHOLE host while `n` dispatches run side by side,
-/// each takes all of it and the node oversubscribes `n`-fold — `n × cpus` cargo
-/// jobs and `n ×` the build-token memory, which is the OOM class this module
-/// exists to prevent. So the executor derives from `share(probe(), n)`, where
-/// `n` is the capacity the node admits against. `n` is clamped to at least 1,
-/// and a share never drops below 1 cpu; `derive`'s own floors then keep a thin
-/// share at 1 build job. Unreadable memory stays unreadable.
-pub(crate) fn share(cap: HostCapacity, n: u32) -> HostCapacity {
-    let n = n.max(1);
-    HostCapacity {
-        mem_bytes: cap.mem_bytes.map(|m| m / n as u64),
-        cpus: (cap.cpus / n).max(1),
+    match &answer.1 {
+        ConcurrencySource::Model {
+            running_at_sample,
+            slots_c1,
+            static_partition,
+        } => info!(
+            consumer = CONSUMER,
+            model_count = answer.0,
+            static_count,
+            running_at_sample,
+            slots_c1,
+            static_partition,
+            "ci_node: concurrency from the capacity model, beside the static formula's (D9)"
+        ),
+        ConcurrencySource::Static { reason } => info!(
+            consumer = CONSUMER,
+            static_count,
+            reason = %reason,
+            "ci_node: concurrency from the static formula; the capacity model did not answer"
+        ),
     }
 }
 
-/// Read the host's capacity. Blocking (a sysinfo memory refresh), so callers
-/// run it once per dispatch rather than per step.
-///
-/// `available_parallelism` rather than a raw core count: it honours cgroup
-/// quotas and processor affinity, which is what actually bounds a build in a
-/// container or on a pinned WSL VM.
-pub(crate) fn probe() -> HostCapacity {
-    let cpus = std::thread::available_parallelism()
-        .map(|n| n.get().min(u32::MAX as usize) as u32)
-        .unwrap_or(1);
-    let mut sys = sysinfo::System::new();
-    sys.refresh_memory();
-    let total = sys.total_memory();
-    HostCapacity {
-        mem_bytes: (total > 0).then_some(total),
-        cpus,
-    }
+/// Keep the cached row warm for the CI node's sizing. Called from the budget
+/// republisher's loop, the one periodic publisher
+/// (`fleet::spawn_budget_republisher`); it asks coord only when the kept read
+/// is stale ([`crate::fleet_capacity::current`]).
+pub(crate) async fn refresh_model() {
+    let _ = crate::fleet_capacity::current().await;
 }
 
 #[cfg(test)]
 mod tests {
+    use serde_json::{json, Value};
+
     use super::*;
 
-    const GIB: u64 = 1024 * 1024 * 1024;
+    const FETCHED_AT: &str = "2026-11-13T04:00:00.000Z";
 
-    fn sizing(gib: u64, cpus: u32) -> HostSizing {
-        derive(HostCapacity {
-            mem_bytes: Some(gib * GIB),
-            cpus,
-        })
-    }
-
-    /// The failure mode this rule exists to prevent: a small host must not be
-    /// handed its cpu count. 7 GiB / 8 vCPU is the shape that OOM-killed the
-    /// Actions agent at JOBS=2.
-    #[test]
-    fn small_host_is_pinned_to_one_build_job() {
-        for gib in [1, 2, 4, 7, 8] {
-            let s = sizing(gib, 8);
-            assert_eq!(s.cargo_build_jobs, 1, "{gib} GiB must get 1 build job");
+    fn read_with(row: Option<Value>, age_secs: f64, coord: Option<Value>) -> CapacityRead {
+        let known = row.is_some();
+        CapacityRead {
+            state: if known { "known" } else { "unknown" },
+            device_id: Some("6f1d2c3b-0a9e-4d8c-b7a6-5f4e3d2c1b0a".into()),
+            coord_base: Some("https://coord.qontinui.io".into()),
+            row,
+            coord,
+            reason: (!known).then(|| "no coord".to_string()),
+            fetched_at: FETCHED_AT.into(),
+            cache_age_secs: age_secs,
+            cache_ttl_secs: 60,
         }
     }
 
-    /// The other side of the constraint: a large host must not be wasted.
-    #[test]
-    fn large_host_gets_real_parallelism() {
-        // 23 GiB / 32 vCPU — the measured spaceship-wsl shape from the
-        // incident. 23/3 = 7 build tokens, 23/1 = 23 test processes.
-        let s = sizing(23, 32);
-        assert_eq!(s.cargo_build_jobs, 7);
-        assert_eq!(s.test_threads, 23);
-
-        // 128 GiB / 32 vCPU — memory is no longer the binding constraint, so
-        // both caps land on the cpu count rather than the ratio's 42/128.
-        let s = sizing(128, 32);
-        assert_eq!(s.cargo_build_jobs, 32);
-        assert_eq!(s.test_threads, 32);
+    /// A read whose coord answer was cached 5 s.
+    fn read(row: Option<Value>, age_secs: f64) -> CapacityRead {
+        read_with(
+            row,
+            age_secs,
+            Some(json!({"state": "known", "cache_age_secs": 5.0})),
+        )
     }
 
-    /// The cpu cap binds before the memory ratio on a RAM-heavy, core-poor
-    /// host; more jobs than cores buys nothing.
-    #[test]
-    fn cpu_count_caps_both_budgets() {
-        let s = sizing(64, 2);
-        assert_eq!(s.cargo_build_jobs, 2);
-        assert_eq!(s.test_threads, 2);
+    /// A row computed from a sample 25 s old.
+    fn row(c1: Value) -> Option<Value> {
+        Some(json!({
+            "device_id": "6f1d2c3b-0a9e-4d8c-b7a6-5f4e3d2c1b0a",
+            "sample_age_s": 25.0,
+            "slots": {"S": {"state": "known", "value": 9}, "C1": c1},
+        }))
     }
 
-    /// The small-host build floor is applied AFTER the cpu cap, so it wins.
-    #[test]
-    fn small_host_floor_overrides_the_cpu_cap() {
-        let s = sizing(8, 64);
-        assert_eq!(s.cargo_build_jobs, 1);
-        // Tests keep their own, looser budget: 8 GiB buys 8 processes.
-        assert_eq!(s.test_threads, 8);
+    fn dial(permitted: &[&str]) -> Value {
+        json!({"mode": "enforce", "permitted_consumers": permitted})
     }
 
-    /// A single-cpu host gets 1 test thread — the floor of 2 must not beat
-    /// the cpu cap.
+    const FRESH: f64 = 20.0;
+
+    /// The model reads the served C1 slots and dates the sample: the read's
+    /// fetch less coord's cache age (5 s) less the sample's age (25 s).
     #[test]
-    fn one_cpu_host_gets_one_of_each() {
-        let s = sizing(64, 1);
-        assert_eq!(s.cargo_build_jobs, 1);
-        assert_eq!(s.test_threads, 1);
+    fn the_inputs_are_the_served_c1_slots_and_the_samples_instant() {
+        let on = dial(&["agent_placement", CONSUMER]);
+        let inputs = model_inputs(
+            &read(row(json!({"state": "known", "value": 3})), FRESH),
+            Some(&on),
+        )
+        .expect("the model answers");
+        assert_eq!(inputs.slots_c1, 3);
+        let fetched = DateTime::parse_from_rfc3339(FETCHED_AT)
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(fetched - inputs.sample_at, chrono::Duration::seconds(30));
     }
 
-    /// Unreadable memory is treated as a small host, never as an unbounded
-    /// one.
+    /// The total: what ran at the sample plus the free C1 slots — never above
+    /// the static partition (the executor's N), never below 1.
     #[test]
-    fn unknown_memory_falls_back_conservatively() {
-        let s = derive(HostCapacity {
-            mem_bytes: None,
-            cpus: 64,
-        });
-        assert_eq!(s.cargo_build_jobs, 1);
-        assert_eq!(s.test_threads, 2);
-
-        // A zero reading is "unreadable", not "zero memory".
-        let s = derive(HostCapacity {
-            mem_bytes: Some(0),
-            cpus: 64,
-        });
-        assert_eq!(s.cargo_build_jobs, 1);
-        assert_eq!(s.test_threads, 2);
+    fn the_total_is_running_at_the_sample_plus_c1_slots_clamped_to_the_partition() {
+        // 2 running at the sample and 3 free C1 slots run 5.
+        assert_eq!(lane_b_total(2, 3, 12), 5);
+        // A full box: nothing beyond what ran (0 slots).
+        assert_eq!(lane_b_total(4, 0, 12), 4);
+        // An idle, full-looking box still admits one, as admission and coord do.
+        assert_eq!(lane_b_total(0, 0, 12), 1);
+        // The model lowers the static partition; it never raises it.
+        assert_eq!(lane_b_total(10, 30, 12), 12);
+        assert_eq!(lane_b_total(u32::MAX, u32::MAX, 12), 12);
     }
 
-    /// A degenerate cpu report never yields a zero cap (which would export
-    /// `CARGO_BUILD_JOBS=0` and wedge cargo).
+    /// Every way the model does not answer is an Err naming why — the caller
+    /// then uses the static formula, labelled. None of them is a zero.
     #[test]
-    fn zero_cpus_is_clamped_to_one() {
-        let s = derive(HostCapacity {
-            mem_bytes: Some(64 * GIB),
-            cpus: 0,
-        });
-        assert_eq!(s.cargo_build_jobs, 1);
-        assert_eq!(s.test_threads, 1);
-    }
-
-    fn cap(gib: u64, cpus: u32) -> HostCapacity {
-        HostCapacity {
-            mem_bytes: Some(gib * GIB),
-            cpus,
+    fn every_unanswered_case_names_why_and_is_never_zero() {
+        let on = dial(&[CONSUMER]);
+        let ok_row = || row(json!({"state": "known", "value": 3}));
+        let old_sample = || {
+            let mut r = ok_row().unwrap();
+            r["sample_age_s"] = json!(170.0);
+            Some(r)
+        };
+        let ageless = || {
+            let mut r = ok_row().unwrap();
+            r.as_object_mut().unwrap().remove("sample_age_s");
+            Some(r)
+        };
+        let cases: Vec<(CapacityRead, Option<Value>, &str)> = vec![
+            (
+                read(
+                    row(json!({"state": "unknown", "reason": "stale sample"})),
+                    FRESH,
+                ),
+                Some(on.clone()),
+                "stale sample",
+            ),
+            (read(None, FRESH), Some(on.clone()), "no coord"),
+            (
+                read(Some(json!({"device_id": "d", "sample_age_s": 1.0})), FRESH),
+                Some(on.clone()),
+                "serves no slots.C1",
+            ),
+            (read(ok_row(), 181.0), Some(on.clone()), "stale"),
+            // The read is fresh; the sample behind it is not.
+            (read(old_sample(), FRESH), Some(on.clone()), "stale"),
+            (
+                read(ageless(), FRESH),
+                Some(on.clone()),
+                "how old its sample is",
+            ),
+            (
+                read_with(ok_row(), FRESH, Some(json!({"state": "known"}))),
+                Some(on.clone()),
+                "how old its cache is",
+            ),
+            (
+                read(ok_row(), FRESH),
+                Some(dial(&["agent_placement"])),
+                "does not permit ci_placement",
+            ),
+            (
+                read(ok_row(), FRESH),
+                Some(json!({"mode": "off", "permitted_consumers": []})),
+                "mode off",
+            ),
+            (read(ok_row(), FRESH), None, "has not been read"),
+        ];
+        for (r, d, why) in cases {
+            match model_inputs(&r, d.as_ref()) {
+                Err(reason) => assert!(reason.contains(why), "{reason} vs {why}"),
+                Ok(v) => panic!("{why}: the model must not answer, got {v:?}"),
+            }
         }
     }
 
-    /// The five devices measured on 2026-09-22 (`GET /coord/fleet`), GB read
-    /// as GiB. Plan `2026-09-22-ci-capacity-is-hand-typed-...`, Phase 2.
-    #[test]
-    fn suggestion_matches_the_measured_fleet() {
-        for (cpus, gib, want, name) in [
-            (48, 368, 12, "merytshost"),
-            (32, 125, 8, "spaceship"),
-            (16, 31, 2, "MSI"),
-            (8, 31, 2, "monster"),
-            (8, 15, 1, "nomad"),
-        ] {
-            assert_eq!(
-                suggested_concurrent_builds(cap(gib, cpus)),
-                want,
-                "{name}: {cpus}c/{gib}GiB"
-            );
-        }
-    }
+    const HOST: HostCapacity = HostCapacity {
+        mem_bytes: Some(368 * 1024 * 1024 * 1024),
+        cpus: 48,
+    };
 
-    /// The suggestion never drops to 0 — a tiny or unreadable host gets 1.
+    /// The composition, with its inputs injected: the running count is asked
+    /// for at the SAMPLE's instant, and the static formula answers — labelled —
+    /// when there is no read or the dial keeps the legacy reader.
     #[test]
-    fn suggestion_is_never_zero() {
-        assert_eq!(suggested_concurrent_builds(cap(1, 1)), 1);
-        assert_eq!(suggested_concurrent_builds(cap(1, 0)), 1);
-        for mem_bytes in [None, Some(0)] {
-            assert_eq!(
-                suggested_concurrent_builds(HostCapacity {
-                    mem_bytes,
-                    cpus: 64
-                }),
-                1
-            );
-        }
-    }
-
-    /// The limiting term names the binding constraint.
-    #[test]
-    fn suggestion_names_its_limiting_term() {
-        assert_eq!(
-            suggestion_with_limit(cap(368, 48)),
-            (12, Some(LimitingTerm::Cores))
-        );
-        assert_eq!(
-            suggestion_with_limit(cap(31, 16)),
-            (2, Some(LimitingTerm::Memory))
-        );
-        assert_eq!(
-            suggestion_with_limit(HostCapacity {
-                mem_bytes: None,
-                cpus: 8
-            }),
-            (1, None)
-        );
-    }
-
-    /// Per-dispatch partitioning: 12 dispatches on merytshost each size
-    /// against a 1/12 share, not the whole host.
-    #[test]
-    fn a_share_sizes_one_of_n_dispatches() {
-        let host = cap(368, 48);
-        let s = derive(share(host, 12));
-        // share = 30.67 GiB / 4 cpus → build min(10, 4) = 4, tests min(30, 4) = 4.
-        assert_eq!(s.cargo_build_jobs, 4);
-        assert_eq!(s.test_threads, 4);
-        // Unpartitioned, the same host hands EACH dispatch 48 of each.
-        assert_eq!(derive(host).cargo_build_jobs, 48);
-    }
-
-    /// N = 1 (and a degenerate N = 0) is exactly the old whole-host derive.
-    #[test]
-    fn a_share_of_one_is_the_whole_host() {
-        for host in [
-            cap(368, 48),
-            cap(7, 8),
-            HostCapacity {
-                mem_bytes: None,
-                cpus: 4,
+    fn the_answer_counts_running_at_the_sample_and_falls_back_labelled() {
+        let on = dial(&[CONSUMER]);
+        let r = read(row(json!({"state": "known", "value": 3})), FRESH);
+        let fetched = DateTime::parse_from_rfc3339(FETCHED_AT)
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut asked = None;
+        let (n, source) = answer_from(
+            Some(&r),
+            Some(&on),
+            Some("https://coord.qontinui.io/"),
+            |at| {
+                asked = Some(at);
+                2
             },
+            HOST,
+        );
+        assert_eq!(n, 5);
+        assert_eq!(
+            source,
+            ConcurrencySource::Model {
+                running_at_sample: 2,
+                slots_c1: 3,
+                static_partition: suggested_concurrent_builds(HOST),
+            }
+        );
+        // The sample (30 s before the fetch) has seen what ran SAMPLE_RAMP before it.
+        assert_eq!(
+            asked,
+            Some(fetched - chrono::Duration::seconds(30) - chrono::Duration::seconds(120))
+        );
+        assert_eq!(SAMPLE_RAMP, Duration::from_secs(120));
+
+        for (no_read, no_dial, why) in [
+            (None, Some(&on), "no capacity read"),
+            (Some(&r), None, "has not been read"),
         ] {
-            assert_eq!(share(host, 1), host);
-            assert_eq!(share(host, 0), host);
-            assert_eq!(derive(share(host, 1)), derive(host));
+            let (n, source) = answer_from(
+                no_read,
+                no_dial,
+                Some("https://coord.qontinui.io"),
+                |_| panic!("not asked"),
+                HOST,
+            );
+            assert_eq!(n, suggested_concurrent_builds(HOST));
+            assert!(
+                matches!(&source, ConcurrencySource::Static { reason } if reason.contains(why)),
+                "{source:?}"
+            );
         }
     }
 
-    /// A share never reports zero cpus, even when N exceeds the core count.
+    /// A dial kept from another coord (or one whose coord is unknown) does
+    /// not permit sizing from this coord's row: the static formula answers,
+    /// labelled with both coords, and the running count is never asked for.
     #[test]
-    fn a_share_keeps_at_least_one_cpu() {
-        let s = share(cap(64, 4), 12);
-        assert_eq!(s.cpus, 1);
-        let d = derive(s);
-        assert_eq!(d.cargo_build_jobs, 1);
-        assert_eq!(d.test_threads, 1);
+    fn a_dial_from_another_coord_is_not_joined_with_the_row() {
+        let on = dial(&[CONSUMER]);
+        let r = read(row(json!({"state": "known", "value": 3})), FRESH);
+        for dial_base in [Some("https://coord.other.example"), None] {
+            let (n, source) = answer_from(
+                Some(&r),
+                Some(&on),
+                dial_base,
+                |_| panic!("not asked"),
+                HOST,
+            );
+            assert_eq!(n, suggested_concurrent_builds(HOST));
+            assert!(
+                matches!(&source, ConcurrencySource::Static { reason }
+                    if reason.contains("not from one coord")
+                        && reason.contains("https://coord.qontinui.io")),
+                "{source:?}"
+            );
+        }
     }
 
-    /// The probe is IO, so this only asserts the invariant every caller
-    /// depends on: the derived caps are never zero.
+    /// A stale read logs once, not once a call: its reason's changing age is
+    /// not part of the key.
     #[test]
-    fn probe_yields_usable_caps_on_this_host() {
-        let s = derive(probe());
-        assert!(s.cargo_build_jobs >= 1);
-        assert!(s.test_threads >= 1);
+    fn a_stale_reasons_changing_age_is_one_logged_answer() {
+        let at = |age: &str| {
+            answer_key(&(
+                12,
+                ConcurrencySource::Static {
+                    reason: format!("the capacity data is stale: {age}s old (the read 1s)"),
+                },
+            ))
+        };
+        assert_eq!(at("181"), at("240"));
+        let model = |running| {
+            answer_key(&(
+                5,
+                ConcurrencySource::Model {
+                    running_at_sample: running,
+                    slots_c1: 3,
+                    static_partition: 12,
+                },
+            ))
+        };
+        assert_ne!(model(2), model(1));
+        assert_ne!(model(2), at("181"));
+        // A different reason the row is UNKNOWN is a different answer.
+        let unknown = |why: &str| {
+            answer_key(&(
+                12,
+                ConcurrencySource::Static {
+                    reason: format!("the capacity row is UNKNOWN: {why}"),
+                },
+            ))
+        };
+        assert_ne!(unknown("coord unreachable"), unknown("no_plan_yet"));
+    }
+
+    /// A failed refetch keeps sizing from the last KNOWN read while that is
+    /// still fresh enough, aged by how long it was kept; past that, today's
+    /// read (and its reason) answers.
+    #[test]
+    fn a_failed_refetch_keeps_the_last_known_read_while_it_is_fresh() {
+        let known = read(row(json!({"state": "known", "value": 3})), FRESH);
+        let failed = read(None, 0.0);
+        let kept = read_to_size_from(
+            Some(failed.clone()),
+            Some((&known, Duration::from_secs(30))),
+        )
+        .expect("a read");
+        assert!(kept.known_row().is_some());
+        assert_eq!(kept.cache_age_secs, FRESH + 30.0);
+        let too_old = read_to_size_from(
+            Some(failed.clone()),
+            Some((&known, Duration::from_secs(170))),
+        )
+        .expect("a read");
+        assert!(
+            too_old.known_row().is_none(),
+            "past MODEL_STALE_AFTER: today's read"
+        );
+        // A KNOWN current read is used as it is; nothing kept, the current one.
+        let fresh = read(row(json!({"state": "known", "value": 1})), 1.0);
+        assert_eq!(
+            read_to_size_from(Some(fresh.clone()), Some((&known, Duration::ZERO))),
+            Some(fresh)
+        );
+        assert_eq!(read_to_size_from(Some(failed.clone()), None), Some(failed));
+        assert_eq!(read_to_size_from(None, None), None);
     }
 }

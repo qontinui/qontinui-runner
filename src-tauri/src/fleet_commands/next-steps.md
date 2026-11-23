@@ -55,6 +55,7 @@ gate; just list it.
   slug.
 - **Register:** prefer MCP `coord_register_gate` (kinds: `pr_merged`,
   `deploy_healthy`, `claim_terminal`, `operator_approval`, `ci_green`, `pr_ci_green`,
+  `pr_ci_red`, `pr_conflicting`,
   `release_in_sync`, `branch_reapable`,
   `ref_exists`, `metric_threshold`, `time_elapsed`, `unit_ready`,
   `migration_at_head`, `infra_drift_clear`, `file_exists`, `sql_count`,
@@ -110,11 +111,13 @@ gate; just list it.
   treat it as best-effort and read the gate's `continuation_consumed_outcome`
   (a **null** outcome means never claimed, which is worse than a recorded
   `spawn_failed`). (Canonical: `_gate-registration` → "Continuation policy".)
-- **If you attach one, populate `hint` — it is the spawned agent's ONLY
-  context.** coord flattens the continuation to `run /<skill> <args>` and appends
-  `\n\n<hint>` only if a hint is present; nothing else in the frame carries the
-  plan, the PR, prior findings or the predicate. Six labelled lines, **references
-  before bodies**, **≤2000 characters**: `Plan: <plan-stem>` /
+- **If you attach one, populate `hint` — it is the only field that can carry
+  *why*.** coord flattens the continuation to `run /<skill> <args>` and appends
+  `\n\n<hint>` only if a hint is present; coord's own dispatch-time `brief`
+  carries only the references coord can resolve (the work unit's slug, the PR the
+  predicate names, its block reason, finding ids) and a fixed end-of-session
+  step, never what this session tried or why it stopped. Six labelled lines,
+  **references before bodies**, **≤2000 characters**: `Plan: <plan-stem>` /
   `Why: <≤2 sentences>` / `PR: <owner/repo#N>` /
   `Blocked: <block_reason_code>[ ×N since <ISO8601>]` /
   `Resource-keys: <keys a peer's coord_recent_findings would match>` /

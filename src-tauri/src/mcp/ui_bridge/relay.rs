@@ -1043,9 +1043,17 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             post(ui_bridge_relay_heartbeat_handler),
         )
         .route("/ui-bridge/tabs", get(ui_bridge_relay_tabs_handler))
+        // A relay tab's answer is app content, so while a condition-check
+        // session holds a secret this ONE route's response is scrubbed
+        // (`crate::condition_secrets`, plan
+        // 2026-11-06-a-regression-test-run-is-judged-by-what-it-covered-and-a-silent-run-reads-unknown
+        // Phase 13). Never the router: `/ui-bridge/commands/stream` above carries
+        // commands TO the tabs, a `type` action's substituted value among them.
         .route(
             "/ui-bridge/relay/dispatch",
-            post(ui_bridge_relay_dispatch_handler),
+            post(ui_bridge_relay_dispatch_handler).layer(axum::middleware::from_fn(
+                crate::condition_secrets::scrub_sdk_responses,
+            )),
         )
 }
 

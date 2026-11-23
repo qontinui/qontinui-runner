@@ -243,8 +243,12 @@ envelope_collection() {
 # what `coord-revive.sh call` prints. A full JSON-RPC envelope descends into
 # `result` (an `error` is UNKNOWN); `isError: true` is UNKNOWN naming the
 # tool's error text; `content[0].text` must be a string holding JSON; an object
-# with no `content` falls through unchanged. Same contract as the rest: the
-# body JSON on stdout, or NOTHING + exit 3 + `UNKNOWN:` on stderr.
+# with no `content` falls through unchanged. More than one content item is
+# UNKNOWN, except a second item that is the runner coord-mcp proxy's
+# `TENANT UNVERIFIED:` notice, which is dropped; a `TENANT MISMATCH:` notice is
+# UNKNOWN naming it (envelope.py `unwrap_mcp_text` says why).
+# Same contract as the rest: the body JSON on stdout, or NOTHING + exit 3 +
+# `UNKNOWN:` on stderr.
 envelope_mcp_body() {
   local door="$1" file="${2:--}"
   case "$ENVELOPE_READER" in
@@ -256,12 +260,20 @@ envelope_mcp_body() {
             elif has("result") then .result
             else fail("key `result` absent; present: [" + (keys | join(", ")) + "]") end)
          else . end)
+        | (if type == "object" and (.content | type) == "array" and (.content | length) == 2
+              and (.content[1] | type) == "object" and (.content[1].text | type) == "string"
+              and (.content[1].text | startswith("TENANT UNVERIFIED:"))
+           then .content = [.content[0]] else . end)
         | if type != "object" then .
           elif has("isError") and (.isError as $e | [false, null, 0, "", "false", "False"] | any(. == $e) | not) then
             fail("key `isError` is true; present: [" + (keys | join(", ")) + "]; the tool answered an error, not a body: "
                  + ((if (.content | type) == "array" and (.content | length) > 0 and (.content[0] | type) == "object"
                      then (.content[0].text // "") else "" end) | tostring | .[0:300]))
           elif has("content") | not then .
+          elif (.content | type) == "array" and (.content | length) == 2
+               and (.content[1] | type) == "object" and (.content[1].text | type) == "string"
+               and (.content[1].text | startswith("TENANT MISMATCH:")) then
+            fail("key `content.1.text` is a TENANT MISMATCH notice; the runner'"'"'s tenant check names this answer another project'"'"'s data: \(.content[1].text | .[0:300] | tojson)")
           elif (.content | type) == "array" and (.content | length) > 1 then
             fail("key `content` holds more than one item; present: [" + (keys | join(", ")) + "]; an MCP result carrying \(.content | length) content items; exactly one is read")
           elif (.content | type) == "array" and (.content | length) > 0 and (.content[0] | type) == "object"

@@ -38,14 +38,93 @@ import { useTenant } from "@/contexts/TenantContext";
 
 import {
   coordRowSourceText,
+  tenantBoundMembership,
   useSessionInfo,
   type SessionTenancy,
   type TenancyRepoExpected,
+  type TenantBoundMembership,
+  type TenantDisplay,
 } from "./useSessionInfo";
 
 /** The chip's discriminating stem: uuids share a long tail. */
 function stem(tenantId: string): string {
   return tenantId.length > 8 ? tenantId.slice(0, 8) : tenantId;
+}
+
+function sameTenant(a: string | null | undefined, b: string | null | undefined): boolean {
+  return !!a?.trim() && !!b?.trim() && a.trim().toLowerCase() === b.trim().toLowerCase();
+}
+
+/** `N tenant(s)`, so a single binding does not read as a plural. */
+function tenantCount(n: number): string {
+  return `${n} tenant${n === 1 ? "" : "s"}`;
+}
+
+/**
+ * The bound-set half of `tenancy.display`, for the badge's title: the same
+ * fact the session-info Tenant row states in its suffix (`boundSuffix`,
+ * `useSessionInfo.ts`), switched on the same `tenantBoundMembership` so the
+ * two surfaces cannot disagree. `named` is the tenant the badge names; membership is said
+ * only when it is the display's own tenant, since `actingInBoundSet` is about
+ * that one. Every arm is stated, including a measured "in", so that no badge
+ * reads the set by silence. `null` only when the runner sent no display, in
+ * which case the badge reads nothing of the set at all. Pure; exported for the
+ * unit test.
+ */
+export function badgeBoundSetText(
+  display: TenantDisplay | null | undefined,
+  named: string | null | undefined,
+): string | null {
+  if (!display) return null;
+  const membership = tenantBoundMembership(display);
+  if (membership === "set-unread") {
+    return `The tenants this runner is bound to could not be read (${display.bound.reason ?? "no reason given"}).`;
+  }
+  // An absent binding store, which is per runner instance: it holds nothing,
+  // whatever membership claims.
+  if (membership === "no-bound-tenants") return "This runner has no bound tenants.";
+  const n = display.bound.tenantIds.length;
+  // Membership is the display tenant's: any other named tenant gets the size.
+  if (membership === null || !sameTenant(named, display.tenantId)) {
+    return `This runner is bound to ${tenantCount(n)}.`;
+  }
+  const id = stem((named as string).trim());
+  const who = `Tenant ${id}`;
+  // "the one tenant" on a single binding, "the N tenants" otherwise.
+  const set = n === 1 ? "the one tenant" : `the ${tenantCount(n)}`;
+  if (membership === "out") {
+    return n === 1
+      ? `${who} is NOT ${set} this runner is bound to.`
+      : `${who} is NOT among ${set} this runner is bound to.`;
+  }
+  if (membership === "unknown") {
+    return n === 1
+      ? `Whether tenant ${id} is ${set} this runner is bound to is unknown.`
+      : `Whether tenant ${id} is among ${set} this runner is bound to is unknown.`;
+  }
+  return n === 1
+    ? `${who} is ${set} this runner is bound to.`
+    : `${who} is 1 of ${set} this runner is bound to.`;
+}
+
+/** The named tenant was MEASURED outside a non-empty bound set — the row's
+ * `not among N bound`. An unknown set or membership is not this. */
+function measuredOutsideBoundSet(
+  display: TenantDisplay | null | undefined,
+  named: string | null | undefined,
+): boolean {
+  return (
+    !!display && tenantBoundMembership(display) === "out" && sameTenant(named, display.tenantId)
+  );
+}
+
+/** ` <sentence>` for a title, or "" when the runner sent no display. */
+function boundSetClause(
+  display: TenantDisplay | null | undefined,
+  named: string | null | undefined,
+): string {
+  const text = badgeBoundSetText(display, named);
+  return text ? ` ${text}` : "";
 }
 
 /**
@@ -110,6 +189,10 @@ export interface TenantBadgeLabel {
   diverged: boolean;
   /** The credential tenant could not be established. */
   credentialUnknown: boolean;
+  /** The named tenant was measured OUTSIDE the runner's (non-empty) bound
+   * set — the session-info row's `not among N bound`. Rendered in the same
+   * attention tone as an unknown credential, never as a plain label. */
+  outsideBoundSet: boolean;
 }
 
 /**
@@ -183,7 +266,17 @@ export function tenantBadgeLabel(
       `Repo in the working directory belongs to: ${repoExpectedText(tenancy.repoExpected)}`,
       `Coord session row: ${coordRowText(tenancy)}`,
     ];
-    return { text, title: lines.join("\n"), diverged: true, credentialUnknown };
+    // Membership is the display's acting tenant's, so the line says which leg.
+    const boundText = badgeBoundSetText(display, display?.tenantId);
+    if (boundText)
+      lines.push(`Bound set${display?.tenantId ? " (acting tenant)" : ""}: ${boundText}`);
+    return {
+      text,
+      title: lines.join("\n"),
+      diverged: true,
+      credentialUnknown,
+      outsideBoundSet: measuredOutsideBoundSet(display, display?.tenantId),
+    };
   }
 
   // No stamp, but the runner resolved the tenant the session ACTS as.
@@ -210,23 +303,29 @@ export function tenantBadgeLabel(
       text: credentialUnknown ? `${stem(resolvedActing)}?` : stem(resolvedActing),
       title: `This session acts as tenant ${resolvedActing}${
         display.tenantSlug ? ` (${display.tenantSlug})` : ""
-      } ${how}. Its spawn chose no tenant (device default).${unknownCredential}${unconfirmed} ${fixed}`,
+      } ${how}. Its spawn chose no tenant (device default).${boundSetClause(
+        display,
+        resolvedActing,
+      )}${unknownCredential}${unconfirmed} ${fixed}`,
       diverged: false,
       credentialUnknown,
+      outsideBoundSet: measuredOutsideBoundSet(display, resolvedActing),
     };
   }
 
   // `stamped` is non-null here: every null case returned above.
   const acting = stamped as string;
+  const outsideBoundSet = measuredOutsideBoundSet(display, acting);
   if (credentialUnknown && tenancy) {
     return {
       text: `${stem(acting)}?`,
       title:
         `This session was spawned for tenant ${acting}, but the tenant its ` +
-        `coord-mcp writes go to is UNKNOWN (${tenancy.credential.reason ?? "no reason given"}). ` +
-        fixed,
+        `coord-mcp writes go to is UNKNOWN (${tenancy.credential.reason ?? "no reason given"}).` +
+        `${boundSetClause(display, acting)} ${fixed}`,
       diverged: false,
       credentialUnknown: true,
+      outsideBoundSet,
     };
   }
   // `diverged: false` alone is not agreement: a comparison with an unknown
@@ -240,9 +339,85 @@ export function tenantBadgeLabel(
     : "";
   return {
     text: stem(acting),
-    title: `This session is acting as tenant ${acting}.${unconfirmed}${repoLine} ${fixed}`,
+    title: `This session is acting as tenant ${acting}.${unconfirmed}${repoLine}${boundSetClause(
+      display,
+      acting,
+    )} ${fixed}`,
     diverged: false,
     credentialUnknown: false,
+    outsideBoundSet,
+  };
+}
+
+/**
+ * The badge's UI Bridge id for one zone (plan
+ * `2026-11-08-tenant-badge-parity-and-oracle-fixtures` D1). Per-zone, like
+ * `terminal-zone-header-<n>` and `terminal-session-info-<field>-<n>`: the
+ * runner's DOM scanner registers one element per id, so a shared id made every
+ * zone's badge one ambiguous control. Pure; the single source for both
+ * `data-ui-bridge-id` and `data-testid`.
+ */
+export function tenantBadgeElementId(zoneIndex: number): string {
+  return `terminal-tenant-badge-${zoneIndex}`;
+}
+
+/**
+ * Whether the badge can render for a tab that has NO Claude session (plan
+ * `2026-11-08-tenant-badge-parity-and-oracle-fixtures` D2): with no session
+ * there is no tenancy block to read, so only a spawn stamp names a tenant, and
+ * only a multi-bound device (`showSwitcher`) shows tenant UI at all. The
+ * single-zone strip uses it so a stamped plain shell gets the badge on a
+ * one-terminal page exactly as `ZoneLabel` shows it in a multi-zone header.
+ * Pure; mirrors the stamp arm of `tenantBadgeLabel`.
+ */
+export function tenantBadgeRendersWithoutSession(
+  showSwitcher: boolean,
+  tenantId: string | undefined | null,
+): boolean {
+  return showSwitcher && !!tenantId?.trim();
+}
+
+/**
+ * The runner's derived answer, as attributes a UI Bridge read can compare.
+ * `data-tenant-id` is the tab's copy of the spawn stamp, so it is absent on a
+ * no-stamp chip that names the acting tenant, and `data-tenant-credential` is
+ * one leg rather than the answer.
+ *
+ * `data-tenant-acting` is withheld whenever the display's tenant came from the
+ * spawn stamp (`source: row_stamp`, under `stamp_only` and under a `mismatch`
+ * alike): that is a record of what the spawn chose, never an observation of
+ * what the session acts as. An absent attribute is therefore "nothing to state
+ * here", not "no display": `data-tenant-display-status` alone says which.
+ *
+ * `data-tenant-bound-membership` is the display's own tenant
+ * (`tenancy.display.tenantId`) against the runner's bound set — the value of
+ * `tenantBoundMembership`, the classification the session-info row's suffix
+ * (`boundSuffix`) switches on: `in`, `out` (the row's `not among
+ * N bound`), `unknown`, `no-bound-tenants` (a measured empty set, whatever
+ * membership claims) or `set-unread`. Its subject is the ROW's, which is not
+ * always the tenant the chip names: a tab stamped for another tenant can read
+ * `out` here while its chip keeps the plain tone, because the attention tone
+ * is set only when the named tenant is the display's own (`outsideBoundSet`).
+ * It is absent only when there is no display, or a NON-EMPTY measured set with
+ * no display tenant to place in it.
+ * Pure, so its arms are tested without rendering; `TenantBadge.render.test.tsx`
+ * pins the spread onto the real element.
+ */
+export function tenantBadgeDisplayAttrs(tenancy: SessionTenancy | null): {
+  "data-tenant-acting": string | undefined;
+  "data-tenant-display-status": string | undefined;
+  "data-tenant-display-source": string | undefined;
+  "data-tenant-bound-membership": TenantBoundMembership | undefined;
+} {
+  const display = tenancy?.display ?? null;
+  return {
+    "data-tenant-acting":
+      display?.source === "row_stamp" ? undefined : (display?.tenantId ?? undefined),
+    "data-tenant-display-status": display?.status ?? undefined,
+    "data-tenant-display-source": display?.source ?? undefined,
+    "data-tenant-bound-membership": display
+      ? (tenantBoundMembership(display) ?? undefined)
+      : undefined,
   };
 }
 
@@ -251,11 +426,17 @@ interface TenantBadgeProps {
   tenantId?: string;
   /** The session to read the tenancy block for (`TerminalTab.claudeSessionId`). */
   claudeSessionId?: string;
+  /**
+   * The zone this badge sits in — the same index the mount site passes its
+   * `SessionInfoDropdown`. Required so no mount site can omit it and silently
+   * re-create a shared id.
+   */
+  zoneIndex: number;
   /** Extra classes for per-surface sizing (the compact card uses pills). */
   className?: string;
 }
 
-export function TenantBadge({ tenantId, claudeSessionId, className }: TenantBadgeProps) {
+export function TenantBadge({ tenantId, claudeSessionId, zoneIndex, className }: TenantBadgeProps) {
   const { showSwitcher } = useTenant();
   // Read only where the badge can render at all (D12).
   const info = useSessionInfo(showSwitcher ? claudeSessionId : undefined);
@@ -264,33 +445,38 @@ export function TenantBadge({ tenantId, claudeSessionId, className }: TenantBadg
 
   const tone = label.diverged
     ? "text-[#f7768e] bg-[#f7768e]/15"
-    : label.credentialUnknown
+    : label.credentialUnknown || label.outsideBoundSet
       ? "text-[#e0af68] bg-[#e0af68]/15"
       : "text-[#7aa2f7] bg-[#7aa2f7]/15";
 
   return (
     <span
-      // UI-Bridge-discoverable identity. `data-ui-bridge-id` is the runner's
-      // DOM-scan discovery attribute (same mechanism the sibling
-      // `SpawnTenantPicker` <select> uses, `terminal.spawn-tenant-picker`), so
-      // a snapshot / find-by-text sees this badge when it renders — it is a
-      // non-interactive <span> and would otherwise be invisible to the bridge.
-      // `data-testid` mirrors the neighbouring display badges (`ai-status-badge`).
-      data-ui-bridge-id="terminal.tenant-badge"
-      data-testid="tenant-badge"
+      // UI-Bridge-discoverable identity, one per zone. `data-ui-bridge-id` is
+      // the runner's DOM-scan discovery attribute, so a snapshot sees this
+      // non-interactive <span> when it renders. The id carries the zone index
+      // (`terminal-tenant-badge-<n>`, the per-zone family of
+      // `terminal-session-info-<field>-<n>`): one id shared by every zone
+      // registered a single ambiguous element. `data-testid` is the same value,
+      // as on the session-info dropdown rows.
+      data-ui-bridge-id={tenantBadgeElementId(zoneIndex)}
+      data-testid={tenantBadgeElementId(zoneIndex)}
       data-tenant-id={tenantId}
       data-tenant-diverged={label.diverged ? "true" : "false"}
       data-tenant-credential={info.body?.tenancy?.credential.tenantId ?? undefined}
       data-tenant-repo-expected={info.body?.tenancy?.repoExpected?.status ?? undefined}
       data-tenant-repo-verdict={info.body?.tenancy?.repoExpected?.verdict ?? undefined}
-      className={`flex items-center gap-0.5 shrink-0 text-[8px] px-1 py-0 rounded font-mono ${tone} ${
+      {...tenantBadgeDisplayAttrs(info.body?.tenancy ?? null)}
+      className={`flex items-center gap-0.5 min-w-[18px] overflow-hidden text-[8px] px-1 py-0 rounded font-mono ${tone} ${
         className ?? ""
       }`}
       title={label.title}
       aria-label={label.title}
     >
-      <Building2 className="w-2.5 h-2.5" aria-hidden />
-      {label.text}
+      {/* Truncates in a narrow zone header, keeping its icon; `title` and
+          `aria-label` carry the full text. Budgeted in
+          `HEADER_TRUNCATING_FLOORS_PX`. */}
+      <Building2 className="w-2.5 h-2.5 shrink-0" aria-hidden />
+      <span className="truncate">{label.text}</span>
     </span>
   );
 }

@@ -134,6 +134,7 @@ pub const QONTINUI_HOME_ENV: &str = "QONTINUI_HOME";
 /// hand; the scan cannot see them. Sorted, unique — a test pins both so an
 /// addition has one obvious place.
 pub const AMBIENT_ENV_KEYS: &[&str] = &[
+    "CLAUDE_CODE_OAUTH_TOKEN",
     "CLAUDE_CONFIG_DIR",
     "COORD_ADMIN_SECRET",
     "COORD_BUDGET_REPUBLISH_SECS",
@@ -175,6 +176,9 @@ pub const AMBIENT_ENV_KEYS: &[&str] = &[
     "QONTINUI_CENSUS_CHUNK_ROWS",
     "QONTINUI_CENSUS_CHUNK_SECS",
     "QONTINUI_CENSUS_POST_TIMEOUT_SECS",
+    // Read through `ci_node::cgroup::CGROUP_ROOT_ENV`, by `ci_node` and by the
+    // slice telemetry's CPU attribution (`fleet::slice_telemetry::cpu`).
+    "QONTINUI_CI_CGROUP_ROOT",
     "QONTINUI_CLAUDE_BIN",
     "QONTINUI_CLAUDE_HOOK_SETTINGS",
     "QONTINUI_CODE_GRAPH_ROOTS",
@@ -228,6 +232,7 @@ pub const AMBIENT_ENV_KEYS: &[&str] = &[
     "QONTINUI_LOOPING_AGENT_TICK_MS",
     "QONTINUI_MACHINE_ID",
     "QONTINUI_MAINTENANCE_INTERVAL_SECS",
+    "QONTINUI_MALLOC_TRIM",
     "QONTINUI_MCP_CONFIG",
     "QONTINUI_MCP_SPILL_MAX_BYTES",
     "QONTINUI_MCP_SPILL_THRESHOLD_BYTES",
@@ -776,6 +781,9 @@ pub mod test_support {
     /// configured developer box exports and a clean CI runner does not.
     pub const KEYS_REMOVED: &[&str] = &[
         "CLAUDE_CONFIG_DIR",
+        // A long-lived Claude token an operator shell exports would make a
+        // fixture read as a logged-in account (`claude_oauth_token::ambient`).
+        "CLAUDE_CODE_OAUTH_TOKEN",
         // A subject runner's root: a test that inherited one would run as a
         // secondary with the keychain gated off.
         "QONTINUI_INSTANCE_ROOT",
@@ -2388,14 +2396,23 @@ mod tests {
              only, not runner state",
         ),
         (
+            "claude_oauth_token.rs",
+            1,
+            "`ambient`: the default Claude account home's `~/.claude/settings.json`, read for \
+             a long-lived `CLAUDE_CODE_OAUTH_TOKEN` only — Claude Code's own file, not runner state",
+        ),
+        (
             "ai_provider/oauth_refresh.rs",
             1,
             "Claude Code's own `~/.claude/.credentials.json` (the user's Claude login)",
         ),
         (
             "commands/ai_settings.rs",
-            1,
-            "Claude Code's own `~/.claude/.credentials.json` (the user's Claude login)",
+            3,
+            "`default_claude_config_dir`: Claude Code's own `~/.claude` (the user's Claude login), \
+             plus the two `probe_account_usage` reads of the account identity in \
+             `~/.claude.json` (`account_hash_for`) — Claude Code's own file, reported, never \
+             runner state",
         ),
         (
             "claude_session/workspace_trust.rs",
@@ -2407,6 +2424,12 @@ mod tests {
             "claude_session/spawn_preconditions.rs",
             1,
             "the ambient Claude config (`~/.claude.json`) a child with no account reads",
+        ),
+        (
+            "claude_cli_update.rs",
+            1,
+            "Claude Code's own `~/.claude/settings.json`, read only for the user's \
+             `autoUpdatesChannel` — not runner state",
         ),
         (
             "claude_session/trust_gate.rs",
@@ -2424,8 +2447,9 @@ mod tests {
             "commands/terminal.rs",
             1,
             "`claude_default_config_home`: the default Claude account home (`~/.claude`), read \
-             only so a resume never types it as `CLAUDE_CONFIG_DIR` — Claude Code's, not runner \
-             state",
+             so a resume never types it as `CLAUDE_CONFIG_DIR`, and so the graceful-exit probe's \
+             registry read can find a first session's record in its `sessions/` — Claude \
+             Code's, not runner state",
         ),
         (
             "wrappers/clients.rs",
