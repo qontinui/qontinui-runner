@@ -1617,7 +1617,16 @@ fn mark_awaiting_account_unless_live(
 /// first npm-installed session there is seen.
 #[tauri::command]
 pub fn claude_default_config_home() -> Option<String> {
-    dirs::home_dir().and_then(|h| h.join(".claude").to_str().map(|p| p.replace('\\', "/")))
+    dirs::home_dir().and_then(|h| {
+        let dir = h.join(".claude");
+        // A default home that does not exist is a retired account: answering
+        // `null` stops a stale record naming it from being "resumed" with no
+        // `CLAUDE_CONFIG_DIR`, which lands on the shell's ambient account.
+        if !dir.is_dir() {
+            return None;
+        }
+        dir.to_str().map(|p| p.replace('\\', "/"))
+    })
 }
 
 /// Clear a session's restore-pending marker: the restore drain verified the
