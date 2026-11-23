@@ -43,7 +43,7 @@ use std::time::Duration;
 
 use qontinui_runner_lib::wedge_diagnostics::{spawn_blocking_tracked, tracked_blocking_by_thread};
 use serde::Serialize;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Default sample cadence in seconds.
 ///
@@ -338,17 +338,16 @@ pub(crate) struct ResourceSample {
     /// box is this gap, not a regression; `/health` `threadCeilings` names the
     /// enforced pair and where each number came from.
     ///
-    /// Publishing the effective ceilings beside the reading is the fix, and it
-    /// is deliberately NOT done here yet, because it would be inert and noisy:
-    /// `coord.device_resource_samples` has no ceiling columns (alembic in
-    /// qontinui-web is the sole author of `coord.*` schema, and no such
-    /// revision exists), so coord's ingest would route both keys into
-    /// `ResourceSampleItem::unknown_fields` — which it DROPS after emitting a
-    /// `tracing::warn!` naming them, on the log surface reserved for publisher
-    /// typos. At a 30 s tick that is ~2,880 warn lines per runner per day
-    /// buying a consumer nothing. The migration lands first; the publisher
-    /// follows it. Until then, grade this number knowing you may be grading it
-    /// against a ceiling the runner does not use.
+    /// The fix is published beside this field: the host lane carries
+    /// [`Self::launch_headroom`], [`Self::launch_verdict`], the GRADED reading
+    /// and the enforced warn / critical ceilings, so coord admits against the
+    /// device's own answer (plan
+    /// `2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling`
+    /// Phase 2). That plan orders the rollout: coord's ingest of those keys
+    /// (and qontinui-web's columns) deploys BEFORE a runner publishing them
+    /// merges, because a key coord does not know lands in
+    /// `ResourceSampleItem::unknown_fields` with a `tracing::warn!` — ~2,880
+    /// lines per runner per day at a 30 s tick.
     ///
     /// This doc used to say coord "grades this warn at 256 / critical at 400,
     /// the same two numbers as this runner's shipped
@@ -389,6 +388,40 @@ pub(crate) struct ResourceSample {
     /// documents.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) active_terminal_sessions: Option<i32>,
+    /// Further unattended launches this runner's own admission would take
+    /// right now before refusing one (`0` = the next launch is refused) —
+    /// [`crate::launch_capacity::launch_headroom`], the same projection
+    /// `admit_launch` decides on, capped at
+    /// [`crate::launch_capacity::LAUNCH_HEADROOM_CAP`]. coord admits a spawn on
+    /// this device only against it (plan
+    /// `2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling`).
+    ///
+    /// **Host lane only**, for [`Self::thread_count`]'s placement reason: it is
+    /// the runner PROCESS's admission. `None` when the session guard is
+    /// disabled (`launch_verdict = guard_disabled`) — UNKNOWN, never `0`, which
+    /// would read as "full". `i32` for the `INTEGER` counter-group reason
+    /// [`Self::thread_count`] gives.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) launch_headroom: Option<i32>,
+    /// `proceed` / `warn` / `critical` / `guard_disabled` / `unreadable` —
+    /// [`crate::launch_capacity::LaunchVerdict::as_str`], the vocabulary coord's
+    /// CHECK constraint carries. Host lane only; always `Some` there.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) launch_verdict: Option<String>,
+    /// The GRADED thread reading (raw minus the idle blocking pool) the
+    /// thread lane judges — the number the two ceilings below apply to, NOT
+    /// [`Self::thread_count`]. `None` when the guard is disabled or the thread
+    /// table was unreadable. Host lane only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) thread_graded: Option<i32>,
+    /// The per-machine thread ceilings the runner ENFORCES
+    /// ([`crate::resource_guard::merge_thread_ceilings`]). A launch is refused
+    /// above the warn one. `None` only when the guard is disabled. Host lane
+    /// only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) thread_warn_ceiling: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) thread_critical_ceiling: Option<i32>,
     /// Per-lane breakdown of THIS runner process's in-flight tracked blocking
     /// bodies — [`qontinui_runner_lib::wedge_diagnostics::tracked_blocking_by_thread`],
     /// keyed by the thread that spawned each body. Bounded to
@@ -652,6 +685,18 @@ impl Saturation {
 }
 
 impl ResourceSample {
+    /// Write the launch capacity onto this sample — the only way its five
+    /// fields are set. Counts saturate into `i32` (a pathological count must
+    /// not wrap to a negative, which reads as room against every line).
+    fn set_launch_capacity(&mut self, capacity: &crate::launch_capacity::LaunchCapacity) {
+        let narrow = |n: usize| i32::try_from(n).unwrap_or(i32::MAX);
+        self.launch_headroom = capacity.headroom.map(narrow);
+        self.launch_verdict = Some(capacity.verdict.as_str().to_string());
+        self.thread_graded = capacity.graded.map(narrow);
+        self.thread_warn_ceiling = capacity.warn.map(narrow);
+        self.thread_critical_ceiling = capacity.critical.map(narrow);
+    }
+
     fn empty(lane: Lane, lane_instance: Option<String>) -> Self {
         Self {
             lane: lane.as_str().to_string(),
@@ -692,6 +737,11 @@ impl ResourceSample {
             ci_jobs_running: None,
             thread_count: None,
             active_terminal_sessions: None,
+            launch_headroom: None,
+            launch_verdict: None,
+            thread_graded: None,
+            thread_warn_ceiling: None,
+            thread_critical_ceiling: None,
             blocking_lanes: None,
             threads_max: None,
             threads_used: None,
@@ -1216,7 +1266,8 @@ fn collect_host_lane() -> ResourceSample {
     // already returned, and the spawn gate and the fleet dashboard are now
     // literally the same reading rather than two probes of the same quantity —
     // `spawn_gate_reading` calls this identical function.
-    if let Some(m) = memory_status() {
+    let memory = memory_status();
+    if let Some(m) = memory {
         if m.phys_total > 0 {
             s.mem_total_bytes = Some(m.phys_total);
             s.mem_available_bytes = Some(m.phys_available);
@@ -1253,7 +1304,10 @@ fn collect_host_lane() -> ResourceSample {
 
     // The runner's build lane IS its `ci_node` executor, so slots and CI jobs
     // are the same occupancy read two ways. The supervisor publishes the
-    // Windows build pool's slots under `source='supervisor'`.
+    // Windows build pool's slots under `source='supervisor'`. The total is what
+    // admission admits against: with the capacity model (plan 2026-11-05
+    // Phase 7) an unset capacity follows the box's load, so busy can briefly
+    // read above total after the model lowers it.
     let ci = crate::settings::get_ci_node_settings();
     let (running, queued) = crate::ci_node::admission::occupancy();
     if ci.enabled {
@@ -1300,6 +1354,20 @@ fn collect_host_lane() -> ResourceSample {
         s.active_terminal_sessions
             .and_then(|n| usize::try_from(n).ok()),
     );
+
+    // The launch capacity coord admits against (plan
+    // `2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling`
+    // Phase 2): judged against the SAME memory reading this sample publishes
+    // (the `memory` taken above), plus the live thread reading — this function
+    // already runs inside `spawn_blocking_tracked`, so the synchronous
+    // thread-table read never lands on an async worker. Host lane only, for the
+    // spawn-pressure pair's placement reason: it is this runner PROCESS's
+    // admission, which no other lane owns.
+    s.set_launch_capacity(&crate::launch_capacity::live_with_memory((
+        Lane::Host.as_str(),
+        memory.map(|m| m.commit_available),
+        memory.map(|m| m.phys_available),
+    )));
 
     s.blocking_lanes = Some(
         tracked_blocking_by_thread()
@@ -2044,21 +2112,104 @@ pub(crate) async fn publish_once() {
         .await
     {
         Ok(resp) if resp.status().is_success() => {
-            debug!(
-                "fleet::resource_sample: published {} lane(s)",
-                body.samples.len()
-            );
             // A 200 is not "stored": coord drops invalid items and unknown
             // fields INSIDE a 200 and says so only in the body.
-            if let Some(problems) = resp.text().await.ok().and_then(|t| sample_ack_problems(&t)) {
-                log_ack_problems(problems);
-            }
+            let text = resp.text().await.ok();
+            log_sample_ack(sample_ack(text.as_deref(), body.samples.len()));
         }
         Ok(resp) => {
             let status = resp.status();
-            warn_once(format!("POST {url} -> HTTP {status}"));
+            warn_once(
+                &http_failure_class(status.as_u16()),
+                format!("POST {url} -> HTTP {status}"),
+            );
         }
-        Err(e) => warn_once(format!("POST {url} failed: {e}")),
+        Err(e) => warn_once(
+            transport_failure_class(e.is_connect(), e.is_timeout()),
+            format!("POST {url} failed: {e}"),
+        ),
+    }
+}
+
+/// The one line logged for a 2xx body that is not coord's documented outcome.
+const ACK_UNKNOWN_LINE: &str =
+    "coord's 2xx body is not the documented outcome; whether the samples were stored is UNKNOWN";
+
+/// What a 2xx from `POST /coord/devices/{id}/resource-sample` established.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SampleAck {
+    /// The documented outcome naming no loss: coord stored `persisted` of the
+    /// `sent` lanes, and `persisted` is not fewer than `sent`.
+    Stored { persisted: u64, sent: usize },
+    /// The documented outcome naming what coord did NOT store.
+    Problems(Vec<String>),
+    /// The body could not be read, is not the documented outcome, or names no
+    /// `persisted` count: whether anything was stored is UNKNOWN — never read
+    /// as success.
+    Unknown,
+}
+
+/// Classify a 2xx body (`None` = it could not be read) for `sent` lanes. A
+/// clean body that persisted fewer lanes than were sent is a loss, not a
+/// store. PURE.
+pub(crate) fn sample_ack(body: Option<&str>, sent: usize) -> SampleAck {
+    let Some(body) = body else {
+        return SampleAck::Unknown;
+    };
+    match sample_ack_problems(body) {
+        None => SampleAck::Unknown,
+        Some(problems) if !problems.is_empty() => SampleAck::Problems(problems),
+        Some(_) => serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v.get("persisted")?.as_u64())
+            .map_or(SampleAck::Unknown, |persisted| {
+                if persisted < sent as u64 {
+                    SampleAck::Problems(vec![format!(
+                        "coord persisted {persisted} of {sent} sent sample(s)"
+                    )])
+                } else {
+                    SampleAck::Stored { persisted, sent }
+                }
+            }),
+    }
+}
+
+/// The line a [`SampleAck`] logs, or `None` for [`SampleAck::Problems`], whose
+/// lines are [`log_ack_problems`]'s. PURE.
+pub(crate) fn sample_ack_line(ack: &SampleAck) -> Option<String> {
+    match ack {
+        SampleAck::Stored { persisted, sent } => {
+            Some(format!("coord stored {persisted}/{sent} lane(s)"))
+        }
+        SampleAck::Problems(_) => None,
+        SampleAck::Unknown => Some(ACK_UNKNOWN_LINE.to_string()),
+    }
+}
+
+/// Log one 2xx outcome: a clean store at debug (and the recovery line when an
+/// earlier loss cleared), a loss through [`log_ack_problems`], and an UNKNOWN
+/// outcome at info ONCE per process.
+fn log_sample_ack(ack: SampleAck) {
+    let line = sample_ack_line(&ack);
+    match ack {
+        SampleAck::Stored { .. } => {
+            log_ack_problems(Vec::new());
+            if let Some(line) = line {
+                debug!("fleet::resource_sample: {line}");
+            }
+        }
+        SampleAck::Problems(problems) => log_ack_problems(problems),
+        SampleAck::Unknown => {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if let Some(line) = line {
+                if !LOGGED.swap(true, Ordering::Relaxed) {
+                    info!("fleet::resource_sample: {line}");
+                } else {
+                    debug!("fleet::resource_sample: {line}");
+                }
+            }
+        }
     }
 }
 
@@ -2188,15 +2339,82 @@ fn log_ack_problems(problems: Vec<String>) {
     *last = key;
 }
 
-/// Log a publish failure loudly the first few times, then quietly.
+/// WARNs each publish-failure class gets per process before it drops to debug.
+const WARNS_PER_FAILURE_CLASS: u32 = 3;
+
+/// The failure class of a non-2xx answer: `http:<status>`. PURE.
+pub(crate) fn http_failure_class(status: u16) -> String {
+    format!("http:{status}")
+}
+
+/// The failure class of a request that got no answer, from
+/// `reqwest::Error::is_connect` / `is_timeout`. PURE.
+pub(crate) fn transport_failure_class(is_connect: bool, is_timeout: bool) -> &'static str {
+    if is_connect {
+        "transport:connect"
+    } else if is_timeout {
+        "transport:timeout"
+    } else {
+        "transport:other"
+    }
+}
+
+/// A failure arriving after this long with NO failure at all starts a new
+/// outage, and every class gets its full WARN budget back. A delivered POST
+/// alone does not: a coord answering 2xx and 503 by turns would otherwise
+/// refill the budget between every pair and WARN every failure.
+const FAILURE_QUIET_SECS: u64 = 600;
+
+/// The per-class WARN budget, refilled by a quiet period ([`FAILURE_QUIET_SECS`]).
+#[derive(Debug, Default)]
+pub(crate) struct FailureWarns {
+    spent: BTreeMap<String, u32>,
+    last_failure: Option<std::time::Instant>,
+}
+
+impl FailureWarns {
+    pub(crate) const fn new() -> Self {
+        Self {
+            spent: BTreeMap::new(),
+            last_failure: None,
+        }
+    }
+
+    /// Record one failure of `class` at `now`: `true` = WARN it, while the
+    /// class has budget left. PURE.
+    pub(crate) fn admit(&mut self, class: &str, now: std::time::Instant) -> bool {
+        let quiet = std::time::Duration::from_secs(FAILURE_QUIET_SECS);
+        if self
+            .last_failure
+            .is_some_and(|t| now.saturating_duration_since(t) >= quiet)
+        {
+            self.spent.clear();
+        }
+        self.last_failure = Some(now);
+        let spent = self.spent.entry(class.to_string()).or_default();
+        *spent = spent.saturating_add(1);
+        *spent <= WARNS_PER_FAILURE_CLASS
+    }
+}
+
+/// The per-process budget [`warn_once`] spends.
+static FAILURE_WARNS: std::sync::Mutex<FailureWarns> = std::sync::Mutex::new(FailureWarns::new());
+
+/// Log a publish failure loudly the first few times PER CLASS, then quietly.
 ///
 /// A 30s sampler against a coord that is down for an hour would otherwise emit
 /// 120 identical WARNs and bury whatever the operator is actually reading. The
-/// first ones are the diagnosis; the rest are noise.
-fn warn_once(msg: String) {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static SEEN: AtomicU32 = AtomicU32::new(0);
-    if SEEN.fetch_add(1, Ordering::Relaxed) < 3 {
+/// first ones are the diagnosis; the rest are noise. The budget is per failure
+/// class, so a NEW kind of failure (a 422 after three 503s, a refused connect
+/// after three 5xx) is WARNed rather than lost under the first kind's budget,
+/// and it refills after [`FAILURE_QUIET_SECS`] without a failure, so the next
+/// outage is diagnosable too.
+fn warn_once(class: &str, msg: String) {
+    let loud = FAILURE_WARNS
+        .lock()
+        .map(|mut b| b.admit(class, std::time::Instant::now()))
+        .unwrap_or(true);
+    if loud {
         warn!("fleet::resource_sample: {msg} (best-effort — sample dropped)");
     } else {
         debug!("fleet::resource_sample: {msg} (best-effort — sample dropped)");
@@ -2206,6 +2424,129 @@ fn warn_once(msg: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Plan `2026-11-13-computer-services-cap-and-sample-outcome` Phase 2: a
+    /// 2xx whose body is unreadable or undocumented reads UNKNOWN, never
+    /// "stored"; a clean body names how many lanes coord stored.
+    #[test]
+    fn an_unread_2xx_is_unknown_and_a_clean_one_names_what_was_stored() {
+        for unknown in [
+            None,
+            Some(""),
+            Some("not json"),
+            Some("{}"),
+            Some(r#"{"rejected":[]}"#),
+        ] {
+            let ack = sample_ack(unknown, 2);
+            assert_eq!(ack, SampleAck::Unknown, "{unknown:?}");
+            let line = sample_ack_line(&ack).unwrap();
+            assert_eq!(
+                line,
+                "coord's 2xx body is not the documented outcome; whether the samples were stored is UNKNOWN"
+            );
+            assert!(
+                !line.starts_with("coord stored"),
+                "no stored line for {unknown:?}"
+            );
+        }
+
+        let clean = r#"{"received":2,"accepted":2,"persisted":2,"rejected":[],"schema_pending":false,"computer_axes_stored":true,"unknown_fields":[]}"#;
+        let ack = sample_ack(Some(clean), 2);
+        assert_eq!(
+            ack,
+            SampleAck::Stored {
+                persisted: 2,
+                sent: 2
+            }
+        );
+        assert_eq!(
+            sample_ack_line(&ack).as_deref(),
+            Some("coord stored 2/2 lane(s)")
+        );
+
+        // Review A2: a body naming no loss of its own but persisting fewer
+        // lanes than were sent is a loss, never a debug "stored" line — and
+        // its key masks the numbers, so a steady shortfall is logged once.
+        let short = sample_ack(Some(r#"{"persisted":1}"#), 2);
+        assert_eq!(
+            short,
+            SampleAck::Problems(vec!["coord persisted 1 of 2 sent sample(s)".to_string()])
+        );
+        assert_eq!(sample_ack_line(&short), None);
+        assert_eq!(
+            ack_problems_key(&["coord persisted 1 of 2 sent sample(s)".to_string()]),
+            ack_problems_key(&["coord persisted 3 of 4 sent sample(s)".to_string()])
+        );
+
+        let lossy = r#"{"received":2,"accepted":2,"persisted":1}"#;
+        let ack = sample_ack(Some(lossy), 2);
+        assert!(
+            matches!(&ack, SampleAck::Problems(p) if p.len() == 1),
+            "{ack:?}"
+        );
+        assert_eq!(sample_ack_line(&ack), None);
+    }
+
+    /// Review round 3, A3: a coord answering 2xx and 503 by turns does not
+    /// refill the budget — the 503s stop WARNing after three — and a quiet
+    /// period of ten minutes without a failure does, so the next outage is
+    /// WARNed again.
+    #[test]
+    fn only_a_quiet_period_refills_the_warn_budget() {
+        let t0 = std::time::Instant::now();
+        let at = |secs: u64| t0 + std::time::Duration::from_secs(secs);
+        let mut warns = FailureWarns::new();
+        // A 503 every other 30 s tick (a 2xx between each) for 40 minutes.
+        let loud = (0..40)
+            .filter(|i| warns.admit("http:503", at(i * 60)))
+            .count();
+        assert_eq!(
+            loud, 3,
+            "alternating 2xx/503 WARNs three 503s, not every one"
+        );
+        // Ten minutes of 2xx since the last failure: a new outage.
+        assert!(warns.admit("http:503", at(39 * 60 + 600)));
+        // Just under ten minutes is not quiet enough.
+        let mut warns = FailureWarns::new();
+        for i in 0..3 {
+            assert!(warns.admit("http:503", at(i)));
+        }
+        assert!(!warns.admit("http:503", at(2 + 599)));
+    }
+
+    /// Phase 2: each failure class has its own budget of three WARNs.
+    #[test]
+    fn a_new_failure_class_is_warned_after_three_of_another() {
+        let now = std::time::Instant::now();
+        let mut warns = FailureWarns::new();
+        for _ in 0..3 {
+            assert!(warns.admit(&http_failure_class(503), now));
+        }
+        assert!(
+            !warns.admit(&http_failure_class(503), now),
+            "a fourth 503 is quiet"
+        );
+        assert_eq!(http_failure_class(422), "http:422");
+        assert!(
+            warns.admit(&http_failure_class(422), now),
+            "a 422 after three 503s is WARNed"
+        );
+
+        let mut warns = FailureWarns::new();
+        for status in [500, 502, 503] {
+            for _ in 0..3 {
+                assert!(warns.admit(&http_failure_class(status), now));
+            }
+        }
+        let connect = transport_failure_class(true, false);
+        assert_eq!(connect, "transport:connect");
+        assert!(
+            warns.admit(connect, now),
+            "a refused connect after the 5xx is WARNed"
+        );
+        assert_eq!(transport_failure_class(false, true), "transport:timeout");
+        assert_eq!(transport_failure_class(false, false), "transport:other");
+    }
 
     #[test]
     fn a_200_ack_names_what_coord_did_not_store() {
@@ -3380,6 +3721,103 @@ MemAvailable:   15335424 kB
         );
     }
 
+    /// The launch capacity coord admits against is the runner PROCESS's own
+    /// admission, so only the host lane carries it, and it carries it on every
+    /// tick (plan `2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling`
+    /// Phase 2 step 4).
+    ///
+    /// Mutation: drop the `set_launch_capacity` call from `collect_host_lane`
+    /// (the host asserts fail), or call it from `parse_meminfo` (the WSL ones do).
+    #[test]
+    fn the_host_lane_publishes_the_launch_fields_and_wsl_does_not() {
+        let wsl = parse_meminfo("MemTotal: 1024 kB\n", "Ubuntu-24.04".to_string()).expect("parses");
+        assert_eq!(wsl.lane, "wsl");
+        assert_eq!(wsl.launch_headroom, None);
+        assert_eq!(wsl.launch_verdict, None);
+        assert_eq!(wsl.thread_graded, None);
+        assert_eq!(wsl.thread_warn_ceiling, None);
+        assert_eq!(wsl.thread_critical_ceiling, None);
+        let wsl_json = serde_json::to_value(&wsl).expect("serializes");
+        for key in [
+            "launch_headroom",
+            "launch_verdict",
+            "thread_graded",
+            "thread_warn_ceiling",
+            "thread_critical_ceiling",
+        ] {
+            assert!(
+                wsl_json.get(key).is_none(),
+                "the wsl lane must not carry {key}"
+            );
+        }
+
+        let host = collect_host_lane();
+        let verdict = host
+            .launch_verdict
+            .clone()
+            .expect("the host lane must publish a launch verdict on every tick");
+        assert!(
+            [
+                "proceed",
+                "warn",
+                "critical",
+                "guard_disabled",
+                "unreadable"
+            ]
+            .contains(&verdict.as_str()),
+            "{verdict}"
+        );
+        if verdict == "guard_disabled" {
+            // A disabled guard enforces nothing: no number, never a 0.
+            assert_eq!(host.launch_headroom, None);
+            assert_eq!(host.thread_warn_ceiling, None);
+        } else {
+            let headroom = host
+                .launch_headroom
+                .expect("an enabled guard publishes headroom");
+            let cap = i32::try_from(crate::launch_capacity::LAUNCH_HEADROOM_CAP).expect("small");
+            assert!((0..=cap).contains(&headroom), "{headroom}");
+            let (warn, critical) = (
+                host.thread_warn_ceiling.expect("warn ceiling"),
+                host.thread_critical_ceiling.expect("critical ceiling"),
+            );
+            assert!(warn > 0 && critical >= warn, "{warn} / {critical}");
+        }
+        // The wire names coord's ingest DTO keys on.
+        let host_json = serde_json::to_value(&host).expect("serializes");
+        assert_eq!(host_json["launch_verdict"], verdict.as_str());
+
+        // The setter maps every field, and a disabled guard serializes no number.
+        let mut probe = ResourceSample::empty(Lane::Host, None);
+        probe.set_launch_capacity(&crate::launch_capacity::LaunchCapacity {
+            verdict: crate::launch_capacity::LaunchVerdict::Warn,
+            headroom: Some(0),
+            graded: Some(380),
+            warn: Some(376),
+            critical: Some(usize::MAX),
+        });
+        let v = serde_json::to_value(&probe).expect("serializes");
+        assert_eq!(v["launch_headroom"], 0);
+        assert_eq!(v["launch_verdict"], "warn");
+        assert_eq!(v["thread_graded"], 380);
+        assert_eq!(v["thread_warn_ceiling"], 376);
+        assert_eq!(
+            v["thread_critical_ceiling"],
+            i32::MAX,
+            "saturates, never wraps"
+        );
+        probe.set_launch_capacity(&crate::launch_capacity::LaunchCapacity {
+            verdict: crate::launch_capacity::LaunchVerdict::GuardDisabled,
+            headroom: None,
+            graded: None,
+            warn: None,
+            critical: None,
+        });
+        let v = serde_json::to_value(&probe).expect("serializes");
+        assert!(v.get("launch_headroom").is_none());
+        assert_eq!(v["launch_verdict"], "guard_disabled");
+    }
+
     /// The host lane's `blocking_lanes` breakdown must actually reflect
     /// [`tracked_blocking_by_thread`] — an always-`None` or always-empty field
     /// would pass a shape check while publishing nothing useful during an
@@ -3703,6 +4141,45 @@ MemAvailable:   15335424 kB
             "every `as i32` in the host lane must be preceded by its clamp — a \
              bare narrowing is how a count becomes a negative, and a negative \
              reads `ok` against every ceiling this sample can carry"
+        );
+    }
+
+    /// The launch capacity on a host sample is judged against the SAME memory
+    /// reading the sample publishes: `collect_host_lane` takes exactly one
+    /// `memory_status()` and never reaches for a second, independent reading
+    /// through `lane_verdicts()` or an `AdmissionReading::live()` /
+    /// `launch_capacity::live()`-style call. A lexical guard.
+    ///
+    /// Mutation: call `crate::launch_capacity::live()` (or
+    /// `resource_guard::lane_verdicts()`) from `collect_host_lane`, or take a
+    /// second `memory_status()`.
+    #[test]
+    fn the_host_lane_judges_launch_capacity_on_the_memory_reading_it_publishes() {
+        let body = collect_host_lane_src();
+        assert_eq!(
+            body.matches("memory_status()").count(),
+            1,
+            "collect_host_lane must take exactly ONE memory reading"
+        );
+        for second_reading in [
+            "lane_verdicts()",
+            "spawn_gate_reading()",
+            "available_commit_bytes()",
+            "available_phys_bytes()",
+            "exhaustion_memory_reading(",
+        ] {
+            assert!(
+                !body.contains(second_reading),
+                "collect_host_lane must not take a second memory reading through {second_reading}"
+            );
+        }
+        assert!(
+            !body.contains("::live()"),
+            "collect_host_lane must not take a second reading through a ::live() constructor"
+        );
+        assert!(
+            body.contains("launch_capacity::live_with_memory("),
+            "the launch capacity must be built from the passed-in reading"
         );
     }
 

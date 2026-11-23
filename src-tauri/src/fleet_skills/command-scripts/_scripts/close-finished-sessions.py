@@ -15,7 +15,11 @@ runner serves none), is reported and never closed. A finish is read by
 finish_state, the one rule nudge-stopped-sessions.py reads too: any turn after
 it reopens it (REVIVED), and a finish its own final message contradicts is
 CONTRADICTED. A finished session whose directory is not a linked worktree is
-CUSTODY (finished-criteria condition 3), never closed.
+CUSTODY (finished-criteria condition 3), never closed. So is one whose runner serves a `windDown.custody`
+or `windDown.obligations` view that is not clean / not watched: those are the two halves of `closeable`
+the runner's finished_close arm judges (plan 2026-10-18-a-finished-session-is-safe-to-close-when-nothing-
+lives-only-in-it-and-coord-owns-whether-its-watchers-work, Phase 6), and this script reads them rather than
+re-deriving either. An absent view means the arm did not judge the session, which adds nothing.
 Read-only unless --close. Stdlib only. The command /close-finished-sessions
 documents every verdict and the evidence it rests on.
 
@@ -75,11 +79,21 @@ READ_ERRORS = (urllib.error.URLError, OSError, ValueError, EnvelopeUnknown)
 #
 # "Safe to close": /unattended Step 4.9 prints `SAFE TO CLOSE - <n> trees
 # checked, nothing only on disk; hand-off declared for <k>` (or `NOT SAFE TO
-# CLOSE - <k> trees`). Accepted: the phrase opening its line (after a bullet or
-# one allowlisted label), then nothing, or a separator and one of the report
-# clauses below, with no hedge anywhere in that sentence. Every other mention of
-# the phrase vetoes the whole message.
+# CLOSE - <k> trees`), under its `Closeout verdict` heading; a failed hand-off
+# declaration is its own `  hand-off not declared: <tree> (<reason>)` line under
+# the headline, never appended to it. Accepted: the phrase opening its line
+# (after a bullet or one allowlisted label), then nothing, or a separator and one
+# of the report clauses below, with no hedge anywhere in that sentence. A
+# negated, conditional, hedged or questioned mention vetoes the whole message,
+# as do work left only on disk in its sentence and a bare headline taken back by
+# the line after it (safe_to_close's docstring); any other mention is neither.
 SAFE_RE = re.compile(r"safe[ _-]to[ _-]close", re.I)
+# A dated plan stem names a document, not a verdict - e.g.
+# `2026-10-18-a-finished-session-is-safe-to-close-when-...`, cited by
+# /finish-session. safe_to_close masks every stem before reading, so neither
+# the phrase inside one nor its words ("when", "only") read as a mention or a
+# hedge: echoing the citation neither vetoes nor closes.
+PLAN_STEM = re.compile(r"(?<![\w-])\d{4}-\d{2}-\d{2}(?:-[a-z0-9]+)+(?![\w-])")
 SAFE_LINE_START = re.compile(
     r"(?:^|\n)[ \t>*-]*(?:(?:hand-off safety|step 4\.9(?: verdict)?|verdict|safe-to-close verdict)[ \t]*:[ \t]*)?$",
     re.I)
@@ -375,6 +389,7 @@ def safe_to_close(text):
     an unusual wording must not override a runner finished marker. Any NO vetoes
     the whole message."""
     yes = no = False
+    text = PLAN_STEM.sub(lambda s: "x" * len(s.group()), text)  # same length: offsets hold
     quoted = safe_quotes(text)
     for m in SAFE_RE.finditer(text):
         span = next(((a, b) for a, b in quoted if a <= m.start() < b), None)
@@ -633,23 +648,121 @@ PROMISE_WORDS = [
 ]
 # Read per SENTENCE (split after . ! ? ; : and newlines, which stay in the sentence). The end-or-continuation
 # anchor after "now" is what keeps "Running the suite now passes 284/284." and "it is now reverted" quiet.
-_SENT_PREFIX = r"^[ \t]*(?:(?:[#>*+-]+|\[[ xX]\]|\d+[.)])[ \t]*)*"
+_SENT_PREFIX = r"^[ \t]*(?:(?:[#>*+(-]+|\[[ xX]\]|\d+[.)]|(?:ok|okay|alright|sure)\b,?)[ \t]*)*"
 _DOING = (r"(?:doing|re-?running|running|starting|kicking off|kicked off|working on|deploying|handling"
-          r"|rebuilding|fixing|pushing|merging|on it)")
-_END = r"[ \t]*(?:[.!;:]|\.\.\.|\u2026)?[ \t]*$"
-# Three shapes. (1) verb + an OBJECT + now, then the sentence ends (any terminator, ; and : included, since
-# the split keeps them) or continues (`,` `(` a dash, `and`): "Running it now; results shortly.", "Doing it
-# now, then marking finished." (2) a BARE verb + now ending the sentence on . or ! only: "Running now." --
-# a bare "Running now:" / "Starting now, the hook ..." is a status label or an adverb, not a promise.
-# (3) "now <verb>". Plus "<subject> is running now." whose subject is not nothing/none/no ...
+          r"|rebuilding|building|fixing|pushing|merging|landing|rebasing|retrying|testing|checking|on it)")
+# A gerund used as the SUBJECT of a report is not a promise: "Testing is complete now.", "Checking showed ...".
+_NOT_AN_OBJECT = r"(?!(?:now|is|are|was|were|shows?|showed|passe[sd]|works?|worked|fixed)\b)"
+_END = r"[ \t]*(?:[.!;:]+|\u2026)?\)?[ \t]*$"
+_CONTINUES = r"[ \t]*[,(\u2014\u2013-]|[ \t]+and\b"
+_BUSY = r"(?:running|deploying|rebuilding|building|merging|pushing)"
+# A report verb in its finite use ("Landing #12 fixed it", "the gate shows it is closed") ends the object; the
+# same word as an adjective or in a relative clause does not ("Merging the fixed branch now.").
+_REPORTS = r"\b(?:shows?|showed|passe[sd]|fixed|works?)[ \t]+(?:it|that|this|everything|all|main|now)\b"
+# The object before "now": up to 40 characters with no finite report in it, or up to 80 with no finite verb at
+# all, because past 40 the words are more often a report ("Running the whole suite against main shows
+# everything is green now."). After a comma the object takes no copula at all, since there the gerund is as
+# often the subject of a report ("As of #12, building on Windows works now.").
+_OBJECT = (r"(?:(?:(?!" + _REPORTS + r")[^\n]){0,39}?"
+           r"|(?:(?!\b(?:is|are|was|were|shows?|showed|passe[sd]|fixed|reads?|looks?)\b)[^\n]){40,79}?)")
+_OBJECT_AFTER_COMMA = r"(?:(?!\b(?:is|are|was|were|works?)\b|" + _REPORTS + r")[^\n]){0,79}?"
+
+
+def _promise_arms(obj):
+    """The three promise shapes, with `obj` as the first one's object."""
+    return (r"(?:" + _DOING + r"[ \t]+" + _NOT_AN_OBJECT + r"\S" + obj + r"[ \t]+now\b"
+            r"(?:" + _END + r"|" + _CONTINUES + r")"
+            r"|" + _DOING + r"[ \t]+now[ \t]*(?:[.!;]+|\u2026)?\)?[ \t]*$"
+            r"|now " + _DOING + r"\b(?![ \t]+(?:is|are|was|were)\b))")
+
+
+# Three shapes, each opening the sentence or a clause after a comma ("Merged #12, rebuilding the index
+# now."). (1) verb + an OBJECT + now, then the sentence ends (any terminator, ; and : included, since the
+# split keeps them) or continues (`,` `(` a dash, `and`): "Running it now; results shortly.", "Doing it now,
+# then marking finished." (2) a BARE verb + now ending the sentence on . ! or ;: "Running now." -- a bare
+# "Running now:" / "Starting now, the hook ..." is a status label or an adverb, not a promise. (3) "now
+# <verb>", unless the verb is the subject of a copula ("now merging is unblocked").
 STARTS_NOW = re.compile(
-    _SENT_PREFIX + r"(?:" + _DOING + r"[ \t]+(?!now\b)\S[^\n]{0,39}?[ \t]+now\b"
-    r"(?:" + _END + r"|[ \t]*[,(\u2014\u2013-]|[ \t]+and\b)"
-    r"|" + _DOING + r"[ \t]+now[ \t]*(?:[.!]|\.\.\.|\u2026)?[ \t]*$"
-    r"|now " + _DOING + r"\b)", re.I)
-IS_RUNNING_NOW = re.compile(
-    r"^(?![^\n]*\b(?:nothing|none|no)\b)[^\n]*\b(?:is|are)[ \t]+(?:still[ \t]+)?"
-    r"(?:running|deploying|rebuilding|building|merging|pushing)[ \t]+now" + _END, re.I)
+    r"(?:" + _SENT_PREFIX + _promise_arms(_OBJECT) + r"|,[ \t]+" + _promise_arms(_OBJECT_AFTER_COMMA) + r")", re.I)
+# A sentence whose opening gerund is the subject of a copula is a report, not a promise ("Checking out main
+# is safe now.", "Fixing it is unnecessary now."), unless a relative or complement word comes first
+# ("Fixing the tests that are failing now.", "Checking whether main is green now."). Only the text up to the
+# promise's own "now" is read, and a progressive copula is the object's ("Fixing the bug main is hitting now.").
+GERUND_SUBJECT = re.compile(
+    _SENT_PREFIX + _DOING + r"\b(?:(?!\b(?:that|which|what|whether|who|where|when|if|while|until)\b)[^\n])*?"
+    r"\b(?:is|are|was|were)\b(?![ \t]+\w+ing\b)", re.I)
+
+
+def starts_now(sent):
+    """True when `sent` opens a promise (STARTS_NOW) that is not a gerund-subject report."""
+    for m in STARTS_NOW.finditer(sent):
+        if sent[m.start()] == "," or not GERUND_SUBJECT.match(sent[:m.end()]):
+            return True
+    return False
+
+
+# Two subject shapes, read by busy_now: "<subject> is (still) running (right) now." / "<subject> is now running
+# (in the background).", ending or continuing; and "<subject> running now." with no "is", ending on . or !
+# only, since "Jobs running now: 0" is a status label. The bare shape leaves "is"/"are" to the first.
+IS_BUSY_NOW = re.compile(
+    r"\b(?:is|are)[ \t]+(?:(?:still[ \t]+)?" + _BUSY + r"[ \t]+(?:right[ \t]+)?now|now[ \t]+" + _BUSY + r")"
+    r"(?:[ \t]+in[ \t]+the[ \t]+background)?(?:" + _END + r"|" + _CONTINUES + r")", re.I)
+BARE_BUSY_NOW = re.compile(
+    r"(?:^|[ \t])(?!(?:is|are)[ \t])\S+[ \t]+(" + _BUSY + r")[ \t]+(?:right[ \t]+)?now(?:[ \t]+in[ \t]+the[ \t]+background)?"
+    r"[ \t]*(?:[.!]+|\u2026)?\)?[ \t]*$", re.I)
+# The negation is read in the SUBJECT'S OWN CLAUSE only: the text before the verb, after the last comma,
+# parenthesis, dash, or so/and/but/then. A "no" elsewhere in the sentence negates something else ("The
+# rebuild is running now, no action needed.", "There was no fix, so the rebuild is now running."), and even
+# inside that clause a negating word counts only where it HEADS the subject ("There are 0 jobs", "- Zero
+# builds", "nothing else", "Not one job"), never as a modifier or inside a name ("With nothing blocking it
+# the deploy", "Phase 0", "v2.0", "zero-downtime"). A bare "what"/"which" opening the SENTENCE is a status
+# label when the sentence ends in ":" ("What is now running: nothing."); "Which is running now." is not, and
+# after a comma it is a relative pronoun ("..., which is running
+# now."). And not/never/n't negates only the bare shape's verb ("The build isn't running now.").
+_CLAUSE_CUT = re.compile(r"[,(\u2014\u2013]|[ \t]-[ \t]|\b(?:so|and|but|then)\b", re.I)
+_CLAUSE_LEAD = re.compile(r"^[ \t]*(?:(?:[#>*+-]+|\[[ xX]\])[ \t]*)*")
+_LABEL_HEAD = re.compile(r"^[ \t]*(?:what|which)(?:'s)?[ \t]*$", re.I)
+# The negating word must head the subject: at the clause's start, or after there's / are / currently ...
+_NEG_HEAD = re.compile(r"(?:^|\b(?:are|is|were|was|currently|there'?s|moment|today|now)[ \t]+)"
+                       r"(?:(?:no|0|zero)[ \t]+[a-z]|(?:nothing|none|nobody|neither|no[ \t]+one"
+                       r"|not[ \t]+(?:one|a[ \t]+single))\b)", re.I)
+# ... or end the head right before the verb ("Still nothing is running now."), unless a preposition makes it
+# an object ("The rebuild waiting on nothing else is running now.").
+_NEG_TAIL = re.compile(r"(?:^|\b(?:here|now|then)[ \t]+on[ \t]+"
+                       r"|\b(?!(?:on|by|for|from|with|of|about|at|to|toward|towards|into|onto|against)\b)\w+[ \t]+)"
+                       r"(?:nothing|none|nobody)(?:[ \t]+else)?[ \t]*$", re.I)
+# The head is what precedes a relative clause: "The fix that was zero risk is deploying now." heads on "The fix".
+_RELATIVE = re.compile(r"\b(?:that|which|who)\b", re.I)
+_NEG_VERB = re.compile(r"(?:\b(?:not|never)|n't)[ \t]*$", re.I)
+
+
+def _subject_clause(sent, verb_at):
+    """The clause the verb at `verb_at` belongs to, from its last clause boundary, leading bullets stripped."""
+    head = sent[:verb_at]
+    cuts = list(_CLAUSE_CUT.finditer(head))
+    return _CLAUSE_LEAD.sub("", head[cuts[-1].end():] if cuts else head)
+
+
+def _negated_head(clause):
+    """Whether the subject's head (the clause before any relative clause) is negated."""
+    head = _RELATIVE.split(clause, 1)[0]
+    return bool(_NEG_HEAD.search(head) or _NEG_TAIL.search(head))
+
+
+def busy_now(sent):
+    """True when `sent` says its subject is busy right now, and that subject's own clause does not negate it."""
+    for m in IS_BUSY_NOW.finditer(sent):
+        label = _LABEL_HEAD.match(sent[:m.start()]) and sent.rstrip().endswith(":")
+        if not (_negated_head(_subject_clause(sent, m.start())) or label):
+            return True
+    m = BARE_BUSY_NOW.search(sent)
+    if m:
+        clause = _subject_clause(sent, m.start(1))
+        if not (_negated_head(clause) or _NEG_VERB.search(clause)):
+            return True
+    return False
+
+
 SENTENCE_SPLIT = re.compile(r"(?<=[.!?;:\u2026])[ \t]+|\n")
 # A fenced block only when BOTH fences open a line; an unpaired ``` hides nothing after it.
 CODE_SPANS = re.compile(r"^[ \t]*```[^\n]*\n.*?^[ \t]*```[ \t]*$|`[^`\n]*`", re.S | re.M)
@@ -665,7 +778,7 @@ def promise_hits(text):
     """The pronoun-free promise labels in `text` (already code-free and normalized); quoted spans skipped."""
     text = QUOTED_SPANS.sub(" ", text)
     hits = [label for label, p in PROMISE_WORDS if p.search(text)]
-    if any(STARTS_NOW.search(sent) or IS_RUNNING_NOW.search(sent) for sent in SENTENCE_SPLIT.split(text)):
+    if any(starts_now(sent) or busy_now(sent) for sent in SENTENCE_SPLIT.split(text)):
         hits.append("starts work now")
     return hits
 # A gate, finding or plan that NAMES something "as the next step" is a durable record of who owes it, not
@@ -943,6 +1056,28 @@ PHRASE_CASES = [
     ("SAFE TO CLOSE: no worktrees allocated or edited, nothing exists only on disk.", True),
     ("**Safe to close:** nothing exists only on disk, and no worktree hand-off was needed.", True),
     ("I left no worktrees and no stray processes; the one local ref I created was deleted. Safe to close.", False),
+    # The 2026-11-05 grammar (#2377): a failed hand-off declaration is its own line under the headline and
+    # must not read as a veto. The old appended form still vetoes, and so does an echo of the old Step 4.9
+    # heading, a question - why #2377 renamed it "Closeout verdict".
+    ("SAFE TO CLOSE \u2014 2 trees checked, nothing only on disk; hand-off declared for 1\n"
+     "  hand-off not declared: app-repo (exit 5 / coord unreachable)", True),
+    ("## Step 4.9 \u2014 Closeout verdict\n\nSAFE TO CLOSE \u2014 1 tree checked, nothing only on disk; "
+     "hand-off declared for 1", True),
+    ("SAFE TO CLOSE \u2014 1 tree checked, nothing only on disk; hand-off declared for 0\n"
+     "  hand-off not declared: notes-repo (exit 6)\n\nPOLICY_COMPLIANCE: ok\n\n"
+     "SAFE TO CLOSE \u2014 1 tree checked, nothing only on disk; hand-off declared for 0", True),
+    ("## Step 4.9 \u2014 Safe to close?\n\nSAFE TO CLOSE \u2014 1 tree checked, nothing only on disk; "
+     "hand-off declared for 1\n\n- Landed: #12.\n\n- Gated: none.\n\nPOLICY_COMPLIANCE: ok", "veto"),
+    # A dated plan stem containing the phrase names a document (/finish-session cites one): echoing it,
+    # in its own paragraph or in the headline's sentence, neither vetoes the headline nor stands in for
+    # one. A phrase outside a stem still vetoes.
+    ("Per plan `2026-10-18-a-finished-session-is-safe-to-close-when-nothing-lives-only-in-it-and-coord-owns-whether-its-watchers-work` the runner closes it.\n\n"
+     "SAFE TO CLOSE \u2014 1 tree checked, nothing only on disk; hand-off declared for 1", True),
+    ("Plan 2026-10-18-x governs. It is not safe-to-close yet.", "veto"),
+    ("SAFE TO CLOSE \u2014 1 tree checked, nothing only on disk; hand-off declared for 1 "
+     "(per 2026-10-18-a-finished-session-is-safe-to-close-when-nothing-lives-only-in-it-and-coord-owns-whether-its-watchers-work)", True),
+    ("SAFE TO CLOSE \u2014 1 tree checked, nothing only on disk; hand-off declared for 0; NOT declared for "
+     "app-repo: exit 5", "veto"),
     ("**Safe to close: yes.** I checked two working trees.", True),
     ("**Hand-off safety:** safe to close \u2014 1 tree checked, nothing only on disk.", True),
     ("- **Session finished.** The runner marked it locally.", True),
@@ -1039,6 +1174,55 @@ _PROMISES_R2 = [
     "Kicked off the rebuild now.", "The rebuild is running now.",
 ]
 PHRASE_CASES += [(t, "veto") for t in _PROMISES_R2] + [("Session marked finished.\n" + t, "veto") for t in _PROMISES_R2]
+# The limits #2052 recorded: repeated punctuation, the word order "is now running", a subject with no "is",
+# a verb outside the first list, and an object past 40 characters.
+_PROMISES_R3 = [
+    "Running it now!!", "Doing it now...", "The rebuild is now running.", "The rebuild is still running now.",
+    "Rebuild running now.", "Tests running now!", "Building it now.", "Landing #12 now.", "Rebasing the branch now.",
+    "Retrying the job now.", "Testing the fix now.", "Checking the gate now.",
+    "Running the full suite on the rebased branch against main now.",
+    # Review of the first attempt: a copula in a short object, and a negation or number elsewhere in the sentence.
+    "Re-running the tests that were flaky now.", "Fixing the tests that are failing now.", "Fixing what is red now.",
+    "Fixing the stale reads now.", "Checking whether main is green now.",
+    "The fix did not hold, so the rebuild is running now.", "Phase 0 is running now.", "v2.0 is deploying now.",
+    "The zero-downtime deploy is running now.", "It never landed, so a merge running now.",
+    "CI isn't green, so a retry build running now.",
+    # A continuation after "now", and an opening word or parenthesis before the verb.
+    "The rebuild is running now, results shortly.", "The rebuild is now running, results shortly.",
+    "OK, running it now.", "(Running it now.)",
+    # Review of the clause-local negation: a "no" or a count outside the subject's own clause.
+    "The rebuild is running now, no action needed.", "The rebuild is now running, nothing else is pending.",
+    "There was no fix, so the rebuild is now running.", "No fix held, so the rebuild is now running.",
+    "The rebuild is running now - nothing else to do.", "No worries, the rebuild is running now.",
+    "No blocker, so the deploy is running now.", "The rebuild with no cache is running now.",
+    # A clause after a comma, a bare interjection, a closing parenthesis, and "right now" / "in the background".
+    "Got it, running it now.", "Thanks, doing it now.", "Sure thing, running it now.", "OK running it now.",
+    "Merged #12, rebuilding the index now.", "All four PRs landed, running the final check now.",
+    "No problem, rebuilding now.", "(Tests running now.)", "The rebuild is running right now.",
+    "The rebuild is now running in the background.", "Rebuild running now in the background.",
+    "Deploying now; back in 5.",
+    # Review round 2: a report word used as an adjective or inside a relative clause, and a what/which that
+    # is not the sentence's whole subject.
+    "Merging the fixed branch now.", "Pushing the fixed commit now.", "Deploying the fixed build now.",
+    "Landing the fixed PR now.", "Re-running the tests that passed locally now.",
+    "Fixing the tests that showed red now.", "Checking the fix that passed CI now.",
+    "Rebuilding the index CI showed stale now.", "Which is why the rebuild is running now.",
+    "Which means the deploy is running now.", "What I started is running now.",
+    "Which leaves the deploy, which is running now.", "With nothing blocking it the deploy is running now.",
+    # Review round 3: a copula after the promise's "now", inside its object, or in the subject's relative clause.
+    "Re-running CI now, main is red.", "Fixing the lint now, CI is red.", "Running Phase 5 now, it is the last one.",
+    "Running it now, results are due in 10 min.", "Merging #12 now and the rest is queued.",
+    "Pushing the branch now - the PR is #45.", "Fixing the lint now (the hook is strict).",
+    "Doing it now, the gate is still open.", "Rebuilding the index now -- it is stale.",
+    "Fixing the bug main is hitting now.", "Fixing the test CI is failing on now.",
+    "The fix that was zero risk is deploying now.", "The deploy that is no longer blocked is running now.",
+    # Review round 4: a what/which subject on a sentence that is not a ":" label, and a negating word that a
+    # preposition makes an object.
+    "Which is running now.", "What is running now.", "The rebuild. Which is running now.",
+    "The rebuild waiting on nothing else is running now.", "The deploy blocked by nobody is running now.",
+    "The deploy aimed at nobody is running now.", "The job pointing to nothing is running now.",
+]
+PHRASE_CASES += [(t, "veto") for t in _PROMISES_R3] + [("Session marked finished.\n" + t, "veto") for t in _PROMISES_R3]
 
 # Plan 2026-11-08-finished-sessions-held-open-by-idle-chrome-and-hedge-words, Phase 2: a negated hedge, a note
 # explaining a zero hand-off, an emphasised label and "no files of mine ... only on disk" read as the reports they
@@ -1301,6 +1485,15 @@ PHRASE_CASES += [
 # Real closeouts from finished sessions in wordings the grammar does not list.
 # They need not read as a yes, but they must NOT veto a runner finished marker.
 NO_VETO_CASES = [
+    # A bare plan stem containing the phrase is a citation, not a veto.
+    "Plan 2026-10-18-a-finished-session-is-safe-to-close-when-nothing-lives-only-in-it-and-coord-owns-whether-its-watchers-work governs the close.",
+    # ...and a stem in the headline's own sentence does not veto it (a headline that is not at its line's
+    # start is not a yes, by the grammar, but it must not read as a no).
+    "Closed per 2026-10-18-a-finished-session-is-safe-to-close-when-nothing-lives-only-in-it-and-coord-owns-whether-its-watchers-work. SAFE TO CLOSE \u2014 1 tree checked, nothing only on disk; hand-off declared for 1",
+    # /finish-session step 0.6 (#2377): an UNKNOWN-closeable finish reports the axis and ends at "finished".
+    "closeable: UNKNOWN (custody slot missing for app-repo) \u2014 finished",
+    "UNKNOWN \u2014 1 trees could not be checked; hand-off declared for 0\n  app-repo: coord unreachable\n"
+    "  hand-off not declared: app-repo (exit 6)",
     "SAFE TO CLOSE \u2014 1 tree checked, nothing left only on disk; hand-off declared for 1. The worktree is "
     "clean, nothing is unpushed.",
     "SAFE TO CLOSE \u2014 0 trees allocated or edited by this session, nothing only on disk; hand-off declared for 0.",
@@ -1326,6 +1519,39 @@ NO_VETO_CASES = [
     "SAFE TO CLOSE. Running the suite now shows 284 green.",
     "Starting now, the hook blocks raw cargo.",
     "No jobs are running now.",
+    "0 jobs running now.",
+    "Zero builds running now.",
+    "The runner is not running now.",
+    "The build isn't running now.",
+    "Nothing running now.",
+    "Jobs running now: 0",
+    "Building now: nothing.",
+    "Running the whole suite against main shows everything is green now.",
+    "SAFE TO CLOSE \u2014 1 tree checked, nothing only on disk. Nothing is now running.",
+    # Review of the clause-local negation: a negated subject, wherever the sentence starts.
+    "There are no jobs running now.", "There are 0 jobs running now.", "Currently zero builds running now.",
+    "- 0 jobs running now.", "- No jobs running now.", "- Zero builds running now.",
+    "Final state:\n- 3 PRs landed.\n- 0 jobs running now.",
+    "SAFE TO CLOSE \u2014 1 tree checked, nothing only on disk, no jobs running now.",
+    "The deploy stopped, nothing else running now.", "All done, nothing's running now.",
+    "- Nothing's running now.", "Neither build is running now.", "Nobody is running now.",
+    "What is now running: nothing.",
+    # A gerund that is the subject of a report, not the verb of a promise.
+    "Testing is complete now.", "SAFE TO CLOSE. Testing is complete now.", "Building is fixed now.",
+    "Rebasing is unnecessary now.", "Merging is unblocked now.", "Checking showed main is green now.",
+    "Checking the gate shows it is closed now.", "Landing #12 fixed it, all green now.",
+    # Review round 2: a count after "there's" or an adverbial, a gerund with an object as the subject of a
+    # copula, and a gerund-subject report after an introductory comma.
+    "There's no build running now.", "There's 0 jobs running now.", "At the moment no jobs are running now.",
+    "Checking out main is safe now.", "Rebasing onto main is clean now.", "Fixing it is unnecessary now.",
+    "Running it is safe now.", "As of #12, building on Windows works now.",
+    "After #12, testing on Windows is green now.", "Since the fix, running the suite is clean now.",
+    "In short, testing everything is done now.", "#12 landed, now merging is unblocked for #13.",
+    "Testing on main passes now.", "Building on Windows works now.", "Not one job is running now.",
+    "Not a single build is running now.", "Currently nothing is running now.",
+    "Absolutely nothing is running now.", "Still nothing is running now.", "So far nothing is running now.",
+    "Nothing that I started is running now.", "From here on nothing is running now.",
+    "From now on nothing is running now.",
 ] + NO_VETO_CASES_PHASE2 + N3_LINES + [
     "- Safe to close? SAFE TO CLOSE — 2 trees reviewed, nothing only on disk."]
 
@@ -1359,6 +1585,9 @@ FT = "Review found nothing to follow up.\n\n**POLICY_COMPLIANCE**\n"
 # The custody probe's stand-in for the selftests (git_rev_parse_dirs, finished-criteria
 # condition 3): git's answer per directory. A directory no case set up fails loudly.
 LINKED_CWD = "/w/agent-worktrees/a1/repo"
+# A `windDown` block whose two closeable halves both pass, as the runner serves them (selftest stand-in).
+WD_PASS = {"eligibility": "eligible", "custody": {"verdict": "clean"},
+           "obligations": {"verdict": "watched", "itemsJudged": 2}}
 GIT_ANSWERS = {
     LINKED_CWD: (0, "/w/repo/.git/worktrees/a1\n/w/repo/.git\n", ""),  # a linked worktree
     "/w/repo": (0, ".git\n.git\n", ""),  # a primary checkout, at its top (git answers relative paths)
@@ -1445,6 +1674,24 @@ def limit_menu_full_width(cols):
             "   2. Wait here, then continue automatically at Nov 18, 9pm", "   3. Switch to usage credits", "",
             "   Enter to confirm \u00b7 Esc to cancel")
     return "".join(r.ljust(cols) for r in rows) + "\u2594" * cols
+
+
+# The bare-"Stop" variant of the menu (plan 2026-11-14-a-rate-limit-menu-whose-first-option-is-a-bare-stop-is-
+# never-read-as-a-usage-limit, Phase 2). EVERY fixture below is SYNTHETIC: the real layout of that variant has
+# not been measured, so options 2 and 3 are invented placeholders, and the match must not depend on their words.
+def limit_menu_stop_rows(question="   What do you want to do?", opt1="   \u276f 1. Stop",
+                         rest=("   2. Placeholder second option", "   3. Placeholder third option"), hint=True):
+    """The rows of a SYNTHETIC bare-Stop menu."""
+    return (question, "", opt1) + tuple(rest) + (("", "   Enter to confirm \u00b7 Esc to cancel") if hint else ())
+
+
+def limit_menu_stop_screen(width=None, **kw):
+    """A SYNTHETIC bare-Stop menu screen: rows joined by CR, or, with `width`, each row padded to that many
+    columns with no line break (a ConPTY pane), then the drawn border."""
+    rows = limit_menu_stop_rows(**kw)
+    if width:
+        return "".join(r.ljust(width) for r in rows) + "\u2594" * width
+    return "\r".join(rows) + "\r" + "\u2594" * 75
 
 
 FOOTER_CASES = [
@@ -1580,6 +1827,12 @@ def selftest():
     if sorted(subtree({1: (2, []), 2: (1, [])}, 1)) != [1, 2]:
         bad.append("subtree does not terminate on a parent cycle")
     empty, prompt_cases = EMPTY_PROMPT_SCREEN, 0
+    # The box-less walk back's shapes (the input row is row 18, its marker at column 1): `n` markers on OTHER rows
+    # (rows 2 to n + 1, each with text after it), and the row's own marker re-emitted alone.
+    reemit = "\x1b[18;1H\u276f\xa0"
+
+    def other_rows(n):
+        return "".join(f"\x1b[{r};1H\u276f old" for r in range(2, n + 2))
     for raw, want in [(empty, "empty"),
                       ("\x1b[26;1H\r\x1b[2B\x1b[39m\u276f\xa0\x1b[2mrun /vet-imp on the plan\r\x1b[47C\x1b[22m"
                        "\x1b[K\x1b[30;1H\x1b[28;3H\x1b[?25h", "empty"),
@@ -1603,6 +1856,20 @@ def selftest():
                       # the sticky header repeats the last prompt on a grey background after the input row
                       (empty + "\x1b[?25l\x1b[H\x1b[48;5;237m\x1b[38;5;239m\u276f run /babysit-prs #1\x1b[39m"
                        "\x1b[49m\x1b[20;1H\x1b[18;3H\x1b[?25h", "empty"),
+                      # controls: the row's own marker re-emitted with nothing typed is still empty, however often it
+                      # was redrawn (16 older draws of its cell is the last the walk back steps through) and however
+                      # many other rows' markers stand between (8 is the last it steps past); the first one past
+                      # each bound reads unknown, or text where the replay it reached shows some, below
+                      (empty + "\x1b[?25l" + reemit + "\x1b[18;3H\x1b[?25h", "empty"),
+                      (empty + "\x1b[?25l" + reemit * 8 + "\x1b[18;3H\x1b[?25h", "empty"),
+                      (empty + "\x1b[?25l" + reemit * 16 + "\x1b[18;3H\x1b[?25h", "empty"),
+                      (empty + other_rows(1) + "\x1b[?25l" + reemit + "\x1b[18;3H\x1b[?25h", "empty"),
+                      (empty + other_rows(8) + "\x1b[?25l" + reemit + "\x1b[18;3H\x1b[?25h", "empty"),
+                      # a marker drawn right of the row's own and then erased is no typed marker to adopt
+                      ("\x1b[18;9H\u276f \x1b[18;9H\x1b[K\x1b[?25l" + reemit + "\x1b[18;3H\x1b[?25h", "empty"),
+                      # ...and eight of them, drawn and erased on the input row, are the last the walk back steps past
+                      (empty + "\x1b[?25l" + ("\x1b[18;9H\u276f\x1b[18;9H\x1b[K") * 8 + reemit + "\x1b[18;3H\x1b[?25h",
+                       "empty"),
                       (empty + "\x1b[?25l", "unknown"), ("no prompt here", "unknown")]:
         prompt_cases += 1
         if prompt_state(raw, cols=None)[0] != want:
@@ -1666,35 +1933,94 @@ def selftest():
         (idle_c + f"\x1b[?25l\x1b[3;3Hsee {mk} \x1b[3;9H\x1b[?25h", w),  # the same, typed after the frame
         # no box on the screen: the leftmost marker on the row is the row's own
         (empty + f"\x1b[?25l\x1b[18;3Hsee {mk} \x1b[18;9H\x1b[?25h", None),
+        # ...found by walking back past a marker on ANOTHER row (the walk back used to stop at it, and the typed
+        # marker was then read as the row's own: nothing right of it, the caret two columns on). Seven such rows
+        # make the row's own marker the eighth step, the last one the walk back may take.
+        (empty + other_rows(1) + f"\x1b[?25l\x1b[18;3Hsee {mk} \x1b[18;9H\x1b[?25h", None),
+        (empty + other_rows(7) + f"\x1b[?25l\x1b[18;3Hsee {mk} \x1b[18;9H\x1b[?25h", None),
+        # ...and back over older draws at the same row and column: the row's own marker re-emitted alone after a
+        # draft, the caret sent Home and two columns on, leaves the draft before the replay's start (once, 3, 8
+        # and 16 times, the last the walk back steps through)
+        (empty + "\x1b[?25l\x1b[18;3Hhello world" + reemit + "\x1b[18;3H\x1b[?25h", None),
+        (empty + "\x1b[?25l\x1b[18;3Hhello world" + reemit * 3 + "\x1b[18;3H\x1b[?25h", None),
+        (empty + "\x1b[?25l\x1b[18;3Hhello world" + reemit * 8 + "\x1b[18;3H\x1b[?25h", None),
+        (empty + "\x1b[?25l\x1b[18;3Hhello world" + reemit * 16 + "\x1b[18;3H\x1b[?25h", None),
+        # both at once: a draft ending in a typed marker, another row's marker, the row's own marker re-emitted
+        (empty + f"\x1b[?25l\x1b[18;3Hsee {mk} " + other_rows(1) + reemit + "\x1b[18;3H\x1b[?25h", None),
+        # eight markers typed into the row: with the row's own, the eighth step and the last one allowed
+        (empty + "\x1b[?25l\x1b[18;3H" + f"{mk} " * 8 + "\x1b[18;19H\x1b[?25h", None),
+        # a bound stops the walk where it is, but the read goes on from the marker reached, so a draft that replay
+        # shows is still text: typed after 17 redraws of the row's own marker (the 17th older draw is the bound),
+        # or after 9 other rows' markers (the 9th is), and 9 or 10 markers typed into the row (the row's own is
+        # then the 9th step, and the bound)
+        (empty + "\x1b[?25l" + reemit * 17 + "\x1b[18;3Hhello world\x1b[?25h", None),
+        (empty + other_rows(9) + "\x1b[?25l" + reemit + "\x1b[18;3Hhello world\x1b[?25h", None),
+        (empty + "\x1b[?25l\x1b[18;3H" + f"{mk} " * 9 + "\x1b[18;21H\x1b[?25h", None),
+        (empty + "\x1b[?25l\x1b[18;3H" + f"{mk} " * 10 + "\x1b[18;23H\x1b[?25h", None),
         # a second input row that starts with a typed marker, caret after it: only a marker directly
         # under a rule line is the box's
         (scrolled.replace(box_input, box_input + f"\r\n{mk} \x1b[K", 1).replace("\x1b[4;3H", "\x1b[5;3H"), w)]
+    d_redrawn, d_rows, d_typed = ("prompt marker redrawn too often to rule a draft out",
+                                  "prompt markers other than the row's own",
+                                  "prompt markers typed into the input row")
     for raw, cols in drafts:
         prompt_cases += 1
-        if prompt_state(raw, cols=cols)[0] != "text":
-            bad.append(f"a draft read {prompt_state(raw, cols=cols)}, want text: cols={cols} {raw[-90:]!r}")
-    # Ten markers typed into the row of a screen with no box: the walk back to the row's own marker
-    # stops after BOX_SEARCH_MARKS steps and reads text.
-    prompt_cases += 1
-    got = prompt_state(empty + "\x1b[?25l\x1b[18;3H" + f"{mk} " * 10 + "\x1b[18;23H\x1b[?25h", cols=None)
-    if got != ("text", "prompt markers typed into the input row"):
-        bad.append(f"ten typed markers read {got}, want text: prompt markers typed into the input row")
+        got = prompt_state(raw, cols=cols)
+        # a draft is read off the screen: a bound's own detail never stands in for one (the typed-marker cap
+        # returned text with its detail, whatever the replay it reached showed)
+        if got[0] != "text" or got[1] in (d_redrawn, d_rows, d_typed):
+            bad.append(f"a draft read {got}, want text from the screen: cols={cols} {raw[-90:]!r}")
+    # Past a bound the read goes on from the marker the walk reached, and a replay that shows no text may start
+    # after a draft: it reads unknown, not empty (it read empty before), with the bound as its detail. Each of
+    # these is the first case past the last one allowed above: nine other rows' markers before the row's own
+    # re-emitted one (its 9th step), 17 draws of its cell, 8 other rows' markers before a typed marker (the row's
+    # own is then the 9th step, a typed one) and 9 of them, a draft re-emitted over 17 times, and nine markers
+    # drawn and erased right of the row's own (they are on the input row, not on another one).
+    for raw, want in [(empty + other_rows(9) + "\x1b[?25l" + reemit + "\x1b[18;3H\x1b[?25h", d_rows),
+                      (empty + "\x1b[?25l" + reemit * 17 + "\x1b[18;3H\x1b[?25h", d_redrawn),
+                      (empty + other_rows(8) + f"\x1b[?25l\x1b[18;3Hsee {mk} \x1b[18;9H\x1b[?25h", d_typed),
+                      (empty + other_rows(9) + f"\x1b[?25l\x1b[18;3Hsee {mk} \x1b[18;9H\x1b[?25h", d_rows),
+                      (empty + "\x1b[?25l\x1b[18;3Hhello world" + reemit * 17 + "\x1b[18;3H\x1b[?25h", d_redrawn),
+                      (empty + "\x1b[?25l" + ("\x1b[18;9H" + mk + "\x1b[18;9H\x1b[K") * 9 + reemit
+                       + "\x1b[18;3H\x1b[?25h", d_rows)]:
+        prompt_cases += 1
+        got = prompt_state(raw, cols=None)
+        if got != ("unknown", want):
+            bad.append(f"a bound read {got}, want unknown: {want}: {raw[-90:]!r}")
+
+    def placements(raw, cols):
+        """(prompt_state's read of `raw`, how many markers it had _place_mark place)."""
+        asked, real_place = [], _place_mark
+        globals()["_place_mark"] = lambda raw, i, cols, anchors: asked.append(i) or real_place(raw, i, cols, anchors)
+        try:
+            return prompt_state(raw, cols=cols), len(asked)
+        finally:
+            globals()["_place_mark"] = real_place
     # The box search replays at most BOX_SEARCH_MARKS (8) markers, however often a dialog is
-    # redrawn (each older marker costs a replay of the rest of the window), then reads as before:
-    # 10 placements in all, with the fallback's own and its one look at the marker before it.
-    # Literal numbers, so raising the bound fails here too.
-    redrawn = ("\x1b[?25l\x1b[16;1H" + "\u2500" * w + "\x1b[17;1HDo you want to proceed?\x1b[K\x1b[18;1H"
-               "\u276f 1. Yes\x1b[K\x1b[19;1H   2. No\x1b[K\x1b[18;3H\x1b[?25h") * 40
+    # redrawn (each older marker costs a replay of the rest of the window), then the walk back goes on:
+    # 26 placements in all, the box search's 8, the fallback's own, up to SAME_CELL_DRAWS (16) older draws
+    # of that same cell stepped back through (counted apart from the other steps), and the one past that
+    # bound, which stops the walk. The replay it reached still shows the dialog's selection line, so the
+    # read stays text, as it was at 10 placements while the walk back stopped at the first marker that was
+    # not a typed one. 17 draws are the last case with no bound (16 older ones); 18 and 40 are past it.
+    # Literal numbers, so raising either bound fails here too.
+    dialog = ("\x1b[?25l\x1b[16;1H" + "\u2500" * w + "\x1b[17;1HDo you want to proceed?\x1b[K\x1b[18;1H"
+              "\u276f 1. Yes\x1b[K\x1b[19;1H   2. No\x1b[K\x1b[18;3H\x1b[?25h")
+    for n_draws in (17, 18, 40):
+        prompt_cases += 1
+        got, n_placed = placements(dialog * n_draws, w)
+        if got != ("text", "1.Yes") or n_placed > 26 or BOX_SEARCH_MARKS != 8 or SAME_CELL_DRAWS != 16:
+            bad.append(f"a dialog redrawn {n_draws} times read {got} after {n_placed} placements with "
+                       f"BOX_SEARCH_MARKS {BOX_SEARCH_MARKS} and SAME_CELL_DRAWS {SAME_CELL_DRAWS}, want text "
+                       "'1.Yes' after at most 26, with 8 and 16")
+    # A window that starts mid-screen holds markers before any absolute cursor position, which cannot be placed.
+    # None older than the first of them can either, so the walk back stops there: 10 placements in all (the box
+    # search's 8, the fallback's own, and that first one), not one more per marker left in the window.
     prompt_cases += 1
-    placed, real_place = [], _place_mark
-    globals()["_place_mark"] = lambda raw, i, cols, anchors: placed.append(i) or real_place(raw, i, cols, anchors)
-    try:
-        got = prompt_state(redrawn, cols=w)
-    finally:
-        globals()["_place_mark"] = real_place
-    if got[0] != "text" or len(placed) > 10 or BOX_SEARCH_MARKS != 8:
-        bad.append(f"a dialog redrawn 40 times read {got} after {len(placed)} placements with BOX_SEARCH_MARKS "
-                   f"{BOX_SEARCH_MARKS}, want text after at most 10, with 8")
+    got, n_placed = placements("\u276f " * 12 + "\x1b[?25l" + reemit + "\x1b[18;3H\x1b[?25h", None)
+    if got != ("empty", "") or n_placed > 10:
+        bad.append(f"12 markers before any cursor position read {got} after {n_placed} placements, want empty "
+                   "after at most 10")
     # The width is required, by keyword: a caller that omits it fails, never misreads (D3).
     for args in ((empty,), (empty, None), (empty, w)):
         prompt_cases += 1
@@ -1762,6 +2088,7 @@ def selftest():
     opener_n = opener_cases(bad)
     compaction_n = compaction_cases(bad)
     menu_n = limit_menu_cases(bad)
+    fit_n = report_fit_cases(bad)
     stray_cases = stray_selftest(bad, empty) + end_strays_selftest(bad) + zombie_live_selftest(bad)
     for row, want in [({"account": {"label": "paktis"}, "configDir": "/h/.claude-x"}, "paktis"),
                       ({"account": {"label": "unknown"}, "configDir": "/h/.claude-lukas"}, "lukas"),
@@ -1805,7 +2132,7 @@ def selftest():
           f"cases, {prompt_cases} prompt cases, {sgr_cases} SGR cases, {condition_one_cases} condition-1 cases, "
           f"{roster_checks} verdict-roster checks, {stranded_n} finish_stranded cases, {opener_n} opener-class cases, {compaction_n} compaction cases, "
           f"{menu_n} limit-menu cases, "
-          f"{stray_cases} stray-shell cases, {len(bad)} failure(s)")
+          f"{stray_cases} stray-shell cases, {fit_n} report-fit cases, {len(bad)} failure(s)")
     return 1 if bad else 0
 
 
@@ -1832,6 +2159,12 @@ def stranded_cases(bad):
         # a finish its final message contradicts, on both arms
         (marker, {"sessionStatus": "finished"}, remains, "CONTRADICTED", "finish_stranded.phrase_veto"),
         ({}, cf, remains, "CONTRADICTED", "finish_stranded.phrase_veto"),
+        # ...and on coord's finish with no usable time: the veto reads the message, not the time
+        ({}, {"sessionStatus": "finished"}, remains, "CONTRADICTED", "finish_stranded.phrase_veto"),
+        ({"finished": True, "finishedAt": None}, {"sessionStatus": "finished"}, remains, "CONTRADICTED",
+         "finish_stranded.phrase_veto"),
+        (marker, {"sessionStatus": "finished"}, dict(remains, last_asst=now - 30 * m, last_activity=now - 30 * m),
+         "CONTRADICTED", "finish_stranded.phrase_veto"),
         # a runner mark coord's readable status does not confirm
         (marker, {"sessionStatus": "waiting_human"}, base, "CONTRADICTED", "finish_stranded.coord_status"),
         (marker, {"sessionStatus": "working"}, base, "CONTRADICTED", "finish_stranded.coord_status"),
@@ -1842,7 +2175,8 @@ def stranded_cases(bad):
         (marker, {"sessionStatus": "finished"}, worked, "REVIVED", None),
         # a turn inside coord's 1 s stamp band: close keeps it, nudge holds it
         ({}, dict(cf, sessionStatusSince=lp + 500), base, "REVIVED", "finish_stranded.in_band"),
-        # no code: no finish signal, a revival by a prompt, a closable row, coord's finish with no time
+        # no code: no finish signal, a revival by a prompt, a closable row, coord's finish with no time (and a
+        # reply that does not say work remains: one that does is the veto above)
         ({}, {"sessionStatus": "working"}, remains, "ACTIVE", None),
         ({}, dict(cf, sessionStatusSince=lp - 5000), base, "REVIVED", None),
         ({"finished": True, "finishedAt": lp - 5000}, {"sessionStatus": "finished"}, base, "REVIVED", None),
@@ -1872,6 +2206,12 @@ def stranded_cases(bad):
             got, why = classify(term, dict(row, claudeSessionId="s1"), {10: (1, ["bash"])}, 15, "", {"s1": rp})
             n += 1
             lines = [w for w in why if w.startswith("finish_stranded.")]
+            # A phrase_veto row opens with the contradiction itself: evidence that rides along (the kept-working
+            # line of a finish only work reopened) follows it and never leads it. Keyed on the code the row
+            # carries, so a row the check below already fails is not reported twice.
+            if (stranded_code(why) == "finish_stranded.phrase_veto"
+                    and "but the final message says work remains" not in why[0]):
+                bad.append(f"stranded: first reason of a phrase_veto row must state the contradiction: {why}")
             if got != want or stranded_code(why) != code or len(lines) != (1 if code else 0):
                 bad.append(f"stranded: classify(row={row}, readiness={rp}, final={tx['final_text'][:24]!r}) = "
                            f"{got} code {stranded_code(why)!r} {why}; want {want} code {code!r}")
@@ -1922,6 +2262,9 @@ def stranded_cases(bad):
     if out.getvalue() != "\n== FINISHED, HELD BY A SCREEN RULE (not closed): 0\n":
         bad.append(f"stranded: an uncoded screen must print a read zero: {out.getvalue()!r}")
     return n
+
+
+T0_CELLS = 1_790_000_000_000  # the t0 of finish_time_cases, stop_hook_transcript and opener_cases
 
 
 def finish_time_cases(bad):
@@ -2039,6 +2382,37 @@ def finish_time_cases(bad):
         # a finish whose own final message says work remains is contradicted (plan Phase 6), never closed
         ({}, at(after), dict(base, final_text="The deploy is still running; I'll check it in an hour."),
          "CONTRADICTED", ("coord session_status=finished (", "but the final message says work remains")),
+        # ...and so is a finish with no usable time: the time only dates a REOPENING, which is another question, so a
+        # reply that says work remains needs none. These shapes read ACTIVE here, and /nudge-stopped-sessions held
+        # them (an unconfirmed finish), so nothing owned them: coord-only, coord-only beside a stamp that is no time
+        # (a float), a mark with no usable time beside it, and a timed mark that only work past it reopened (its
+        # reasons keep the kept-working line).
+        ({}, cf, dict(base, final_text="The deploy is still running; I'll check it in an hour."), "CONTRADICTED",
+         ("coord session_status=finished (no finish time", "but the final message says work remains",
+          "finish_stranded.phrase_veto")),
+        ({}, cf, dict(base, final_text=no), "CONTRADICTED", ("no finish time", "says work remains (not safe to close)")),
+        ({}, dict(cf, sessionStatusSince=float(after)), dict(base, final_text=no), "CONTRADICTED",
+         ("no finish time", "says work remains (not safe to close)")),  # a float stamp is no usable time
+        ({"finished": True, "finishedAt": None}, cf, dict(base, final_text=no), "CONTRADICTED",
+         ("no finish time", "says work remains (not safe to close)", "!no usable time either")),
+        ({"finished": True, "finishedAt": after}, cf, dict(base, final_text="Still running; I'll check it later.",
+                                                           last_asst=now - 30 * m, last_activity=now - 30 * m),
+         "CONTRADICTED", ("no finish time", "says work remains", "kept working", "!then prompted")),
+        # ...but a TIMED mark that nothing reopened keeps its marker-dated contradiction: the undated arm falls
+        # through to the dated test, so the reason names the mark's time and never a missing finish time. This pin
+        # fails if the undated verdict is returned ahead of that test (the verdict is the same either way, the
+        # reason text is not).
+        (mark, cf, dict(base, final_text="The deploy is still running; I'll check it in an hour."), "CONTRADICTED",
+         ("runner finished marker (", "says work remains", "!no finish time")),
+        # ...and a reopening a time CAN date outranks the contradiction: a prompt or a turn opener after a timed
+        # runner mark beside coord's untimed finish is a revival (a reopened finish is no contradiction), so such a
+        # reply reads ACTIVE as it did (controls: the same at the base)
+        (marker, cf, dict(base, final_text=no), "ACTIVE", ("final message says work remains", "!contradicts")),
+        (marker, cf, dict(base, final_text=no, last_turn_open=now - 30 * m, last_turn_open_text=wake,
+                          last_prompt=before - m), "ACTIVE", ("final message says work remains", "!contradicts")),
+        # a trusted /unattended report keeps its relaxed wording: no veto, so no contradiction either (control)
+        (ua, cf, dict(hedgy, final_text="PR #3 landed.\n\nSAFE TO CLOSE \u2014 1 tree checked, nothing only on disk; "
+                                        "hand-off declared for 1."), "FINISHED", ("runner finished marker (", "!remains")),
         ({}, at(now - 40 * m), dict(base, last_prompt=now - 50 * m), "ACTIVE", "has no reply"),
         # a turn 30m after coord's stamp with no prompt and no closeout keeps it open (finished-criteria cond. 4)
         ({}, at(after), dict(base, last_asst=now - 30 * m, last_activity=now - 30 * m), "REVIVED",
@@ -2241,9 +2615,12 @@ def finish_time_cases(bad):
         (dict(ua, finishedAt=before), {}, hedgy, "ACTIVE", "says work remains"),
         (ua, at(before), hedgy, "ACTIVE", "says work remains"),  # coord's stamp predates the prompt
         (ua, cf, dict(hedgy, last_turn_open=now - 40 * m, last_turn_open_text=wake), "ACTIVE", "says work remains"),
-        # kept working 30m past the mark: never trusted, closeout phrase or not
+        # kept working 30m past the mark: never trusted, closeout phrase or not. With no closeout in the reply only
+        # that work reopened it, and coord's finish has no usable time, so a reply that says work remains
+        # contradicts the finish, and the reasons keep the kept-working line (it read ACTIVE while the undated arm
+        # returned unconfirmed first)
         (ua, cf, dict(hedgy, final_text="PR #3 is pushed; its checks are still running.", last_asst=now - 30 * m,
-                      last_activity=now - 30 * m), "ACTIVE", "says work remains"),
+                      last_activity=now - 30 * m), "CONTRADICTED", ("says work remains", "kept working")),
         (ua, cf, dict(hedgy, last_asst=now - 30 * m, last_activity=now - 30 * m), "CONTRADICTED", "says work remains"),
         (ua, {"sessionStatus": "working", "sessionStatusSince": now - 30 * m}, hedgy, "CONTRADICTED", "says work remains"),
         (dict(ua, finishedAt=None), {}, hedgy, "ACTIVE", "says work remains"),
@@ -2283,6 +2660,33 @@ def finish_time_cases(bad):
         ({}, at(after), dict(base, cwd="/w/slow"), "CUSTODY", "custody UNKNOWN: git did not answer"),
         ({}, at(after), dict(base, cwd="/w/broken"), "CUSTODY", "custody UNKNOWN: git rev-parse exited 128"),
         ({}, cf, dict(shut, cwd="/w/repo"), "CUSTODY", ("closeout phrase", "is a primary checkout")),
+        # Phase 6 of the closeable plan: the runner's two halves, read and never re-derived. A linked worktree
+        # the runner judged clean, with every obligation watched, still closes...
+        ({}, dict(at(after), windDown=WD_PASS), base, "FINISHED", "coord session_status=finished ("),
+        # ...no view at all (an older runner, or the arm has not judged it) adds nothing...
+        ({}, dict(at(after), windDown={"eligibility": "eligible"}), base, "FINISHED", "coord session_status=finished ("),
+        # ...and each half that is present and not passing withholds the close, alone or together.
+        ({}, dict(at(after), windDown=dict(WD_PASS, custody={"verdict": "dirty", "reason": "uncommitted",
+                                                              "detail": "/w/a has uncommitted changes"})),
+         base, "CUSTODY", ("runner's custody verdict is dirty (uncommitted)", "/w/a has uncommitted changes")),
+        ({}, dict(at(after), windDown=dict(WD_PASS, custody={"verdict": "unknown", "reason": "probe_failed"})),
+         base, "CUSTODY", "runner's custody verdict is unknown (probe_failed)"),
+        ({}, dict(at(after), windDown=dict(WD_PASS, obligations={"verdict": "unwatched", "reason": "not_watched",
+                                                                  "detail": "gates item g-1 reads `not_watched`"})),
+         base, "CUSTODY", ("runner's obligations verdict is unwatched (not_watched)", "g-1")),
+        ({}, dict(at(after), windDown=dict(WD_PASS, obligations={"verdict": "unknown",
+                                                                  "reason": "obligations_unreadable"})),
+         base, "CUSTODY", "runner's obligations verdict is unknown (obligations_unreadable)"),
+        ({}, dict(at(after), windDown=dict(WD_PASS, obligations=None)), base, "CUSTODY",
+         "runner's obligations view is unreadable"),
+        ({}, dict(at(after), windDown=dict(WD_PASS, custody={"reason": "x"})), base, "CUSTODY",
+         "runner's custody view is unreadable"),
+        ({}, dict(at(after), windDown=dict(WD_PASS, custody={"verdict": "dirty"},
+                                           obligations={"verdict": "unknown"})),
+         base, "CUSTODY", ("runner's custody verdict is dirty", "runner's obligations verdict is unknown")),
+        # the script's own check still speaks beside the runner's
+        ({}, dict(at(after), windDown=dict(WD_PASS, custody={"verdict": "dirty"})), dict(base, cwd="/w/repo"),
+         "CUSTODY", ("is a primary checkout", "runner's custody verdict is dirty")),
     ]
     # Served finished-criteria condition 1 (plan Phase 2): a live row coord does not read finished is never
     # closable, whatever finish signal it carries - a closeout phrase, a nothing-owed footer, a runner mark, or
@@ -2374,7 +2778,7 @@ def finish_time_cases(bad):
         g.update(saved)
     # last_turn_open on written transcripts: (records, want offset from t0 in s, want text prefix,
     # want last_prompt offset or None). A wake never moves last_prompt.
-    t0 = 1_790_000_000_000
+    t0 = T0_CELLS
 
     def rec(kind, sec, content, **kw):
         stamp = dt.datetime.fromtimestamp((t0 + sec * 1000) / 1000, dt.timezone.utc).isoformat()
@@ -2464,7 +2868,118 @@ def finish_time_cases(bad):
         if got["last_activity"] != t0 + 90 * 1000:
             bad.append(f"a mid-turn compaction left last_activity at {got['last_activity']}, "
                        f"want {t0 + 90 * 1000} (the turn's reply after it)")
+        checks += stop_hook_cells(bad, d, rec, said, tool, result, wake, term)
     return len(cases) + 1 + len(turn_cases) + 2 + checks, len(condition_one)
+
+
+def stop_hook_transcript(rec, said, tool, result, wake, cell):
+    """The records of one Stop-hook continuation cell (plan
+    2026-11-20-triage-sessions-stop-hook-continuation-reads-as-a-revival,
+    Phase 1), SYNTHETIC and shaped on that plan's 2026-11-20 measurement: the
+    finishing turn ends with an end_turn reply, a Stop hook blocks the stop,
+    and Claude Code appends a META user record starting STOP_HOOK_FEEDBACK
+    that carries the turn opener's promptId, before the turn's one
+    system/turn_duration record. `cwd` is set on each user record by the
+    caller. Returns the record list."""
+    def sysrec(sec, subtype):  # a `system` record: no `message` dict
+        stamp = dt.datetime.fromtimestamp((T0_CELLS + sec * 1000) / 1000, dt.timezone.utc).isoformat()
+        return {"type": "system", "subtype": subtype, "timestamp": stamp}
+    fb = "Stop hook feedback:\nYou did not emit the closing footer."
+    head = [rec("user", 0, "fix the bug", promptId="p1"), said(5), sysrec(6, "stop_hook_summary")]
+    one = head + [rec("user", 40, fb, isMeta=True, promptId="p1"), said(45), sysrec(46, "turn_duration")]
+    return {
+        1: one,
+        2: head + [rec("user", 40, fb, isMeta=True, promptId="p1"), said(45), sysrec(46, "stop_hook_summary"),
+                   rec("user", 50, fb, isMeta=True, promptId="p1"), said(55), sysrec(56, "turn_duration")],
+        3: one + [rec("user", 120, SCHEDULED_WAKE, isMeta=True, promptId="p2"), said(125)],
+        4: one + [rec("user", 120, wake, promptId="p3"), said(125)],
+        5: head + [rec("user", 40, fb, isMeta=True), said(45), sysrec(46, "turn_duration")],
+        6: head + [rec("user", 40, fb, isMeta=True, promptId="p9"), said(45), sysrec(46, "turn_duration")],
+        7: [rec("user", 0, "fix the bug", promptId="p1"), said(5), sysrec(6, "turn_duration"),
+            rec("user", 40, fb, isMeta=True, promptId="p1"), said(45), sysrec(46, "turn_duration")],
+        # the continuation works on: a tool call, then a reply 11 minutes past the 30 s finish, no closeout
+        8: head + [rec("user", 40, fb, isMeta=True, promptId="p1"), rec("assistant", 41, tool, stop="tool_use"),
+                   rec("user", 42, result, promptId="p1"), said(30 + 11 * 60), sysrec(30 + 11 * 60 + 1, "turn_duration")],
+        # an EARLIER turn closed by its own turn_duration: the finishing turn's opener resets the tie
+        9: [rec("user", 0, "first task", promptId="p0"), said(1), sysrec(2, "turn_duration"),
+            rec("user", 3, "fix the bug", promptId="p1"), said(5), sysrec(6, "stop_hook_summary"),
+            rec("user", 40, fb, isMeta=True, promptId="p1"), said(45), sysrec(46, "turn_duration")],
+        # neither the opener nor the feedback carries a promptId: None never ties to None
+        10: [rec("user", 0, "fix the bug"), said(5), sysrec(6, "stop_hook_summary"),
+             rec("user", 40, fb, isMeta=True), said(45), sysrec(46, "turn_duration")],
+        # the prefix on a record that is NOT meta, and a meta record without the prefix: neither ties
+        11: head + [rec("user", 40, fb, promptId="p1"), said(45), sysrec(46, "turn_duration")],
+        12: head + [rec("user", 40, SCHEDULED_WAKE, isMeta=True, promptId="p1"), said(45), sysrec(46, "turn_duration")],
+    }[cell]
+
+
+def stop_hook_cells(bad, d, rec, said, tool, result, wake, term):
+    """Plan 2026-11-20-triage-sessions-stop-hook-continuation-reads-as-a-revival
+    Phase 1: a meta `Stop hook feedback:` continuation of the finishing turn
+    (the same promptId as the turn's opener, before its turn_duration) opens no
+    turn, so a session finished at 30 s reads FINISHED (a linked worktree) or
+    CUSTODY (no repository) on coord's arm and is never REVIVED on either arm;
+    a genuine wake or task notification after it still revives (condition 4);
+    an untied, mismatched or post-turn_duration feedback keeps the opener
+    reading; and continuation work long past the finish reopens it as
+    kept_working, not as a turn. Writes into `d`; the stubs are
+    opener_cases'. Appends failures; returns the check count."""
+    g = globals()
+    stubs = {"proc_facts": lambda table, pid, windows=WINDOWS: ([11], [], []),
+             "live_session_ids": lambda claudes: {"s1"}, "raw_tail": lambda tid, chars=30000: "screen",
+             "running_turn": lambda text: False, "prompt_state": lambda raw, *, cols: ("empty", ""),
+             "wrap_cols": lambda term, windows=None: None, "git_rev_parse_dirs": fake_git_dirs}
+    stamp = T0_CELLS + 30 * 1000
+    revived = ("REVIVED", "a turn opened")
+    # (cell, want last_turn_open offset in s, want last_activity offset or None,
+    #  {cwd: want coord-arm verdict and reason fragment}; None: same for both cwds)
+    cells = [(1, 0, 45, {LINKED_CWD: ("FINISHED", ""), "/w/no-repo": ("CUSTODY", "")}),
+             (2, 0, 55, {LINKED_CWD: ("FINISHED", ""), "/w/no-repo": ("CUSTODY", "")}),
+             (3, 120, None, None), (4, 120, None, None), (5, 40, None, None), (6, 40, None, None),
+             (7, 40, None, None),
+             (9, 3, 45, {LINKED_CWD: ("FINISHED", ""), "/w/no-repo": ("CUSTODY", "")}),
+             (10, 40, None, None),
+             # a non-meta record is a prompt, so it revives as one
+             (11, 40, None, {LINKED_CWD: ("REVIVED", "then prompted"), "/w/no-repo": ("REVIVED", "then prompted")}),
+             (12, 40, None, None),
+             (8, 0, None, {LINKED_CWD: ("REVIVED", "finish_stranded.kept_working"),
+                           "/w/no-repo": ("REVIVED", "finish_stranded.kept_working")})]
+    n = 0
+    for cell, want_open, want_act, wants in cells:
+        for cwd in (LINKED_CWD, "/w/no-repo"):
+            want_v, frag = (wants or {}).get(cwd, revived)
+            recs = [dict(r, cwd=cwd) if r.get("type") == "user" else r
+                    for r in stop_hook_transcript(rec, said, tool, result, wake, cell)]
+            with open(os.path.join(d, "projects", "x", "s.jsonl"), "w", encoding="utf-8") as fh:
+                fh.write("".join(json.dumps(r) + "\n" for r in recs))
+            got = transcript_facts({"configDir": d, "claudeSessionId": "s"})
+            n += 1
+            if got["last_turn_open"] != T0_CELLS + want_open * 1000:
+                bad.append(f"stop-hook cell {cell} ({cwd}): last_turn_open={got['last_turn_open']} "
+                           f"({got['last_turn_open_text'][:30]!r}), want offset {want_open}")
+            if want_act is not None and got["last_activity"] != T0_CELLS + want_act * 1000:
+                bad.append(f"stop-hook cell {cell}: last_activity={got['last_activity']}, want offset {want_act} "
+                           "(a system record is no activity)")
+            for arm, row, rp in (("coord", {}, {"sessionStatus": "finished", "sessionStatusSince": stamp}),
+                                 ("marker", {"finished": True, "finishedAt": stamp}, {})):
+                saved = {k_: g[k_] for k_ in list(stubs) + ["transcript_facts"]}
+                try:
+                    g.update(stubs, transcript_facts=lambda r, got=got: dict(got))
+                    v, why = classify(term, dict(row, claudeSessionId="s1"), {10: (1, ["bash"])}, 15, "", {"s1": rp})
+                finally:
+                    g.update(saved)
+                said_ = "; ".join(why)
+                n += 1
+                if want_v == "REVIVED":
+                    ok = v == "REVIVED" and frag in said_ and (frag == "a turn opened" or "a turn opened" not in said_)
+                elif arm == "coord":
+                    ok = v == want_v
+                else:  # the runner mark alone is no FINISHED (condition 1), and never a revival here
+                    ok = v != "REVIVED"
+                if not ok:
+                    bad.append(f"stop-hook cell {cell} ({cwd}) on the {arm} arm = {v} {why}; want "
+                               f"{want_v if arm == 'coord' or want_v == 'REVIVED' else 'not REVIVED'} {frag!r}")
+    return n
 
 
 def opener_cases(bad):
@@ -2497,7 +3012,7 @@ def opener_cases(bad):
         n += 1
         if opener_class(flags, text) != want:
             bad.append(f"opener_class({flags}, {text[:40]!r}) = {opener_class(flags, text)}, want {want}")
-    t0 = 1_790_000_000_000
+    t0 = T0_CELLS
 
     def rec(kind, sec, content, **kw):
         stamp = dt.datetime.fromtimestamp((t0 + sec * 1000) / 1000, dt.timezone.utc).isoformat()
@@ -2567,6 +3082,36 @@ def opener_cases(bad):
                 if v != "REVIVED" or "finish_stranded" in said_ or not all(
                         (f[1:] not in said_) if f.startswith("!") else (f in said_) for f in frags):
                     bad.append(f"opener case {k} on the {arm} arm = {v} {why}; want REVIVED with {frags}")
+        # Plan 2026-11-20-triage-sessions-stop-hook-continuation-reads-as-a-revival Phase 1: a meta
+        # `Stop hook feedback:` continuation of the running turn (the opener's promptId, no turn_duration
+        # between) opens no turn, so it has no class: the prompt's class stands. SYNTHETIC records.
+        with open(os.path.join(d, "projects", "x", "s.jsonl"), "w", encoding="utf-8") as fh:
+            fh.write("".join(json.dumps(r) + "\n" for r in [
+                rec("user", 0, "fix the bug", promptId="p1"), said(5),
+                rec("user", 40, "Stop hook feedback:\nYou did not emit the closing footer.", isMeta=True,
+                    promptId="p1"), said(45)]))
+        got = transcript_facts({"configDir": d, "claudeSessionId": "s"})
+        n += 1
+        if (got["last_turn_open_class"], got["last_turn_open"]) != ("prompt", t0):
+            bad.append(f"a Stop-hook continuation left last_turn_open_class={got['last_turn_open_class']} at "
+                       f"{got['last_turn_open']}; want prompt at {t0} (it opens no turn)")
+        # The local-command rollback restores the opener's promptId: a /model command and its stdout between
+        # the end_turn and the feedback leave the feedback tied to p1, so it opens no turn. And a turn_duration
+        # read between the command and its stdout survives the rollback, so the feedback then opens one; and so
+        # does a turn_duration read BEFORE the command (the restored turn was already closed).
+        closed = [{"type": "system", "subtype": "turn_duration"}]
+        for k, (before_cmd, between, want_at) in enumerate((([], [], 0), ([], closed, 40), (closed, [], 40))):
+            with open(os.path.join(d, "projects", "x", "s.jsonl"), "w", encoding="utf-8") as fh:
+                fh.write("".join(json.dumps(r) + "\n" for r in [
+                    rec("user", 0, "fix the bug", promptId="p1"), said(5), *before_cmd,
+                    rec("user", 10, "<command-name>/model</command-name>", promptId="p2"), *between,
+                    rec("user", 11, "<local-command-stdout>ok"),
+                    rec("user", 40, "Stop hook feedback:\nYou did not emit the closing footer.", isMeta=True,
+                        promptId="p1"), said(45)]))
+            got = transcript_facts({"configDir": d, "claudeSessionId": "s"})
+            n += 1
+            if got["last_turn_open"] != t0 + want_at * 1000:
+                bad.append(f"rollback case {k}: last_turn_open={got['last_turn_open']}, want {t0 + want_at * 1000}")
     return n
 
 
@@ -2615,7 +3160,10 @@ def limit_menu_cases(bad):
     no cursor-show, so they reach only its no-cursor branch; LIMIT_MENU_RAW,
     its cursor shown beside the option mark, reaches its input-row reading and
     must not read empty. LIMIT_MENU_RAW_DIM does read empty there, so both raw
-    screens must read as an open menu, which ready_to_type refuses by itself.
+    screens must read as an open menu, which ready_to_type refuses by itself. Four
+    more cells run the same classify() over screens whose prompt read reaches a
+    bound: two whose replay shows no text are BUSY on "input prompt not read" with
+    the bound's detail, and two whose replay shows text are BUSY on that text.
     Appends failures; returns the count."""
     now = time.time() * 1000
     m = 60000
@@ -2641,18 +3189,77 @@ def limit_menu_cases(bad):
     # A limit option above the screen's last key hint, with no hint of its own, about 658 collapsed characters
     # away: a fixed distance just past MENU_SPAN (600), so raising the bound reads it open.
     far = ("   \u276f 1. Stop and wait for limit to reset\r" + ("x" * 40 + "\r") * 16 + hint + border)
+    # SYNTHETIC bare-"Stop" fixtures (layout unmeasured; see limit_menu_stop_screen).
+    stop_hint = "   Enter to confirm \u00b7 Esc to cancel"
+    stop_only = limit_menu_stop_screen()
+    # A dropped character the question arm tolerates ("wan"), and damage past what it tolerates ("What d you").
+    stop_damaged_tol = limit_menu_stop_screen(question="   What do you wan to do?")
+    stop_damaged = limit_menu_stop_screen(question="   What d you want to do?")
+    stop_no_question = limit_menu_stop_screen(question="   Something else entirely")
+    stop_hook = limit_menu_stop_screen(opt1="   \u276f 1. Stop hook")
+    stop_hook_nq = limit_menu_stop_screen(question="   Something else entirely", opt1="   \u276f 1. Stop hook")
+    # Question intact, "Stop" the only option row: the hint follows it directly (question arm only).
+    stop_alone = limit_menu_stop_screen(rest=())
+    # Neither anchor: another question, "Stop" the only row.
+    stop_alone_nq = limit_menu_stop_screen(question="   Something else entirely", rest=())
+    # "Stop" and then a description row, then option 2: neither terminator follows "Stop" (a recorded miss).
+    stop_described = limit_menu_stop_screen(opt1="   \u276f 1. Stop\r      stops this session")
+    # A real menu of other options under the same question, and a "Stop" not at number 1.
+    other_opts = limit_menu_stop_screen(opt1="   \u276f 1. Yes", rest=("   2. No",))
+    stop_second = limit_menu_stop_screen(opt1="   \u276f 1. Yes", rest=("   2. Stop",))
+    stop_eleven = limit_menu_stop_screen(question="   Something else entirely", opt1="   \u276f 11. Stop")
+    stop_eleven_q = limit_menu_stop_screen(opt1="   \u276f 11. Stop")  # question intact
+    # ACCEPTED READ, recorded not endorsed: another dialog numbering "1. Stop" above "2." that ends on the
+    # same key hint is indistinguishable from the menu by its skeleton, so it reads open (costs one Esc/probe).
+    stop_other_dialog = limit_menu_stop_screen(question="   Stop what, exactly?", rest=("   2. Keep going",))
+    # A bare-Stop option above the screen's last key hint, past MENU_SPAN, with no hint of its own.
+    stop_far = ("   What do you want to do?\r   \u276f 1. Stop\r   2. Placeholder\r" + ("x" * 40 + "\r") * 16
+                + hint + border)
+    stop_later = (stop_only + "\r   Do you want to make this edit?\r   \u276f 1. Yes\r   2. No\r\r" + hint + border)
+    stop_spaceless = (stop_only.replace("Enter to confirm \u00b7 Esc to cancel", "Entertoconfirm\u00b7Esctocancel")
+                      .replace("1. Stop", "1.Stop"))
     cases = [  # (case, screen, windDown, transcript, tool shells, want verdict, fragments)
+        ("SYNTHETIC bare-Stop menu", stop_only, None, base, [], "LIMITED", (said,)),
+        ("SYNTHETIC bare-Stop menu, question lightly damaged (the question arm)", stop_damaged_tol, None, base, [],
+         "LIMITED", (said,)),
+        ("SYNTHETIC bare-Stop menu, question damaged past tolerance (the 2. arm)", stop_damaged, None, base, [], "LIMITED", (said,)),
+        ("SYNTHETIC bare-Stop menu, question absent (the 2. arm)", stop_no_question, None, base, [], "LIMITED",
+         (said,)),
+        ("SYNTHETIC bare-Stop alone before the hint, question intact (the question arm)", stop_alone, None, base, [],
+         "LIMITED", (said,)),
+        ("SYNTHETIC bare-Stop menu with its spaces dropped", stop_spaceless, None, base, [], "LIMITED", (said,)),
+        ("SYNTHETIC bare-Stop menu over a live tool shell", stop_only, None, base, [12], "BUSY",
+         ("tool shell(s) running", "!" + said)),
+        ("SYNTHETIC 1. Stop hook under the question", stop_hook, None, base, [], "BUSY", ("!" + said,)),
+        ("SYNTHETIC 1. Stop hook, question absent", stop_hook_nq, None, base, [], "BUSY", ("!" + said,)),
+        ("SYNTHETIC bare Stop alone, no anchor", stop_alone_nq, None, base, [], "BUSY", ("!" + said,)),
+        ("SYNTHETIC bare Stop with a description row (recorded miss)", stop_described, None, base, [], "BUSY",
+         ("!" + said,)),
+        ("SYNTHETIC other options under the question", other_opts, None, base, [], "BUSY", ("!" + said,)),
+        ("SYNTHETIC Stop as option 2", stop_second, None, base, [], "BUSY", ("!" + said,)),
+        ("SYNTHETIC 11. Stop", stop_eleven, None, base, [], "BUSY", ("!" + said,)),
+        ("SYNTHETIC 11. Stop, question intact", stop_eleven_q, None, base, [], "BUSY", ("!" + said,)),
+        ("SYNTHETIC ACCEPTED READ: another dialog's 1. Stop then 2. on the same key hint reads open",
+         stop_other_dialog, None, base, [], "LIMITED", (said,)),
+        ("SYNTHETIC bare-Stop menu left in scrollback", stop_only + "\r\u276f ", None, base, [], "BUSY",
+         ("!" + said,)),
+        ("SYNTHETIC bare-Stop menu followed by a reply", stop_only.replace("\u2594", "") + "\n\u25cf Resumed.", None,
+         base, [], "BUSY", ("!" + said,)),
+        ("SYNTHETIC bare-Stop menu above a later dialog on the same key hint", stop_later, None, base, [], "BUSY",
+         ("!" + said,)),
+        ("SYNTHETIC bare-Stop option further than MENU_SPAN above the key hint", stop_far, None, base, [], "BUSY",
+         ("!" + said,)),
         ("the measured menu", LIMIT_MENU_SCREEN, None, base, [], "LIMITED",
          (said, "the final reply carries no limit message")),
         ("the menu with no border drawn", unbordered, None, base, [], "LIMITED", (said,)),
         ("the menu over a live tool shell", LIMIT_MENU_SCREEN, None, base, [12], "BUSY",
          ("tool shell(s) running", "!" + said)),
         ("the waiting spinner with no menu", spinner + "\r" + note, None, base, [], "BUSY",
-         ("input prompt not found", "!" + said)),
+         ("input prompt not read", "!" + said)),
         ("the waiting spinner while a turn runs", spinner + "\u2026 (esc to interrupt)", None, base, [], "BUSY",
          ("running turn", "!" + said)),
         ("a menu left in scrollback", LIMIT_MENU_SCREEN + "\r\u276f ", None, base, [], "BUSY",
-         ("input prompt not found", "!" + said)),
+         ("input prompt not read", "!" + said)),
         ("a menu followed by a reply", unbordered + "\n\u25cf Resumed.", None, base, [], "BUSY", ("!" + said,)),
         ("a spinner frame above the menu", "\u2722 Forging\u2026 (esc to interrupt)\r" + LIMIT_MENU_SCREEN, None, base,
          [], "LIMITED", (said, "!running turn")),
@@ -2674,17 +3281,43 @@ def limit_menu_cases(bad):
          dict(base, final_text="You've hit your weekly limit \u00b7 resets Nov 18, 9pm"), [], "LIMITED",
          ("usage limit mid-work", said)),
         ("an older menu above a later dialog on the same key hint", later_dialog, None, base, [], "BUSY",
-         ("input prompt not found", "!" + said)),
+         ("input prompt not read", "!" + said)),
         ("the menu with its spaces dropped", spaceless, None, base, [], "LIMITED", (said,)),
         ("a border 1000 cells wide", LIMIT_MENU_SCREEN + "\u2594" * 925, None, base, [], "LIMITED", (said,)),
         ("a limit option further than MENU_SPAN above the key hint", far, None, base, [], "BUSY",
-         ("input prompt not found", "!" + said)),
+         ("input prompt not read", "!" + said)),
     ]
+    # A walk back that reaches a bound goes on to read the replay it reached. One that shows no text may start after
+    # a draft, so its row is BUSY because the prompt was not read, with the bound's own detail (Phase 3 of the plan
+    # that added the bounds audits by it), not because there was "text at the input prompt". One that shows text is
+    # BUSY on that text, as it was before the bounds. The screens are prompt_state's bound cases, through the same
+    # classify().
+    mk, reemit = PROMPT_MARK, "\x1b[18;1H" + PROMPT_MARK + "\xa0"
+    seen_text = "text at the input prompt (unsent draft or a dialog): 'cursor at row 18"
+    cases += [(case, EMPTY_PROMPT_SCREEN + body, None, base, [], "BUSY", frags + ("!" + said,))
+              for case, body, frags in (
+                  ("a marker redrawn 17 times, nothing typed", "\x1b[?25l" + reemit * 17 + "\x1b[18;3H\x1b[?25h",
+                   ("input prompt not read: prompt marker redrawn too often to rule a draft out",
+                    "!text at the input prompt")),
+                  ("nine other rows' markers before the row's own, nothing typed",
+                   "".join(f"\x1b[{r};1H{mk} old" for r in range(2, 11)) + "\x1b[?25l" + reemit + "\x1b[18;3H\x1b[?25h",
+                   ("input prompt not read: prompt markers other than the row's own", "!text at the input prompt")),
+                  ("ten markers typed into the row", "\x1b[?25l\x1b[18;3H" + f"{mk} " * 10 + "\x1b[18;23H\x1b[?25h",
+                   (seen_text, "!input prompt not read")),
+                  ("a draft typed after 17 redraws of the row's own marker",
+                   "\x1b[?25l" + reemit * 17 + "\x1b[18;3Hhello world\x1b[?25h",
+                   (seen_text, "!input prompt not read")))]
     # The span from the option to the hint grows with the width before HSPACE_RUN is
     # read as one space (1163 characters at 300 columns, 1203 at 310), and not after.
     cases += [(f"a {cols}-column pane, every row written full-width", limit_menu_full_width(cols), None, base, [],
                "LIMITED",
                (said,)) for cols in (300, 310, 400, 1000)]
+    cases += [(f"SYNTHETIC bare-Stop menu, a {cols}-column pane, every row written full-width",
+               limit_menu_stop_screen(width=cols), None, base, [], "LIMITED", (said,))
+              for cols in (80, 300, 310, 400, 1000)]
+    cases += [(f"SYNTHETIC bare-Stop menu with a question damaged past tolerance, a {cols}-column pane",
+               limit_menu_stop_screen(width=cols, question="   What d you want to do?"), None, base, [], "LIMITED",
+               (said,)) for cols in (300, 1000)]
     # Every veto word but the two whose definitions cover a modal still vetoes under the
     # menu. The table itself is walked, so a word added to it is tried too. The two are
     # named here, not read from MENU_VETOES, so a word added there reads red.
@@ -2931,6 +3564,41 @@ def end_strays_selftest(bad):
         shutil.rmtree(d, ignore_errors=True)
         for sig, old in handlers.items():
             signal.signal(sig, old)
+    return n
+
+
+def busy_has(got, text):
+    """Whether a classify() result's reasons carry `text`, bare or as the first reason of a finished row."""
+    return text in got[1] or "marked finished, but " + text in got[1]
+
+
+def report_fit_cases(bad):
+    """fit_reasons and the report row it feeds. Returns the number of cases run."""
+    n = 0
+    a = ["marked finished, but 1 tool shell(s) running under claude (Bash/Monitor/background task)",
+         "last assistant turn has a tool call with no result", "8 stray wait loop(s) " + "x" * 60,
+         "last turn activity 1m ago (< 15m idle floor)"]
+    got = fit_reasons(a)
+    n += 1
+    if len(got) > 200 or not got.endswith(" (+2 more)") or not got.startswith("; ".join(a[:2])) or \
+            "8 stray" in got:
+        bad.append(f"fit_reasons over >200 chars: {got!r}")
+    one = "word " * 60
+    got = fit_reasons([one])
+    n += 1
+    if len(got) > 200 or not got.endswith("\u2026") or one[:len(got) - 1].rstrip() != got[:-1] or \
+            one[len(got) - 1] != " ":
+        bad.append(f"fit_reasons over one 300-char reason: {got!r}")
+    n += 1
+    if fit_reasons(["a", "b"]) != "a; b" or fit_reasons([]) != "":
+        bad.append("fit_reasons changed a short row")
+    n += 1
+    row = {"terminalId": "t0000001", "tab": "t", "account": "a", "name": "n", "verdict": "BUSY", "reasons": a}
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        print_report([row], [])
+    if json.loads(json.dumps(row))["reasons"] != a or "(+2 more)" not in out.getvalue():
+        bad.append(f"report row or --json reasons wrong: {out.getvalue()!r}")
     return n
 
 
@@ -3224,9 +3892,19 @@ def stray_selftest(bad, empty_prompt=EMPTY_PROMPT_SCREEN):
                                    f"zero shells -> {zero}, want {want}")
                 got = verdict(mix, marked, {})
                 shell_reason = "1 tool shell(s) running under claude (Bash/Monitor/background task)"
-                if got[0] != "BUSY" or got[1][:2] != ["marked finished, but", shell_reason] or \
+                if got[0] != "BUSY" or got[1][0] != "marked finished, but " + shell_reason or \
                         got[1][-1] != "8 stray wait loop(s)":
                     bad.append(f"stray + cargo test on a finished row -> {got}")
+                # A finished row held by the idle floor: the lead-in joins the first reason, never stands alone.
+                n += 1
+                tx["last_activity"] = now_ms - 60e3
+                try:
+                    got = verdict(base, marked, {})
+                finally:
+                    tx["last_activity"] = now_ms - 31 * 3600e3
+                if got[0] != "BUSY" or not got[1][0].startswith("marked finished, but last turn activity") or \
+                        "but;" in "; ".join(got[1]):
+                    bad.append(f"finished row held by the idle floor -> {got}")
                 got = verdict(live, marked, {})
                 if got[0] != "BUSY" or "waits on live pid 800 (self-matching loop: will never exit on its own)" \
                         not in got[1]:
@@ -3240,7 +3918,7 @@ def stray_selftest(bad, empty_prompt=EMPTY_PROMPT_SCREEN):
                     bad.append(f"record_shell with only strays under claude must not hold the row: {got}")
                 for label, table in (("work beside the strays", mix), ("no shell seen", base)):
                     got = verdict(table, marked, shell_veto)
-                    if got[0] != "BUSY" or veto_text not in got[1]:
+                    if got[0] != "BUSY" or not busy_has(got, veto_text):
                         bad.append(f"record_shell with {label} must still veto: {got}")
                 # A job that exec'd away the snapshot argv is a shell to the record, not to proc_facts.
                 tick = os.sysconf("SC_CLK_TCK")
@@ -3248,7 +3926,7 @@ def stray_selftest(bad, empty_prompt=EMPTY_PROMPT_SCREEN):
                 job = dict(d2)
                 job[900] = (21033, ["python3", "long_job.py"])
                 got = verdict(job, marked, shell_veto, tasks={900: "bjob"}, start=boot)
-                if got[0] != "BUSY" or veto_text not in got[1]:
+                if got[0] != "BUSY" or not busy_has(got, veto_text):
                     bad.append(f"record_shell with an exec'd job beside the strays must still veto: {got}")
                 got = verdict(job, marked, shell_veto, start=boot)  # the same process, no task file: an MCP server
                 if got[0] != "FINISHED":
@@ -3257,13 +3935,13 @@ def stray_selftest(bad, empty_prompt=EMPTY_PROMPT_SCREEN):
                 for label, start in (("started late", {21033: 1000, 900: 1000 + (SESSION_START_CHILD_S + 1) * tick}),
                                      ("with an unreadable start", {21033: 1000})):
                     got = verdict(job, marked, shell_veto, start=start)
-                    if got[0] != "BUSY" or veto_text not in got[1]:
+                    if got[0] != "BUSY" or not busy_has(got, veto_text):
                         bad.append(f"record_shell with a child {label} beside the strays must still veto: {got}")
                 for argv in (["bash", "-l"], ["claude", "-p", "go"]):  # exec'd into what proc_facts files elsewhere
                     held = dict(d2)
                     held[901] = (21033, argv)
                     got = verdict(held, marked, shell_veto, tasks={901: "bjob"}, start=boot)
-                    if got[0] != "BUSY" or veto_text not in got[1]:
+                    if got[0] != "BUSY" or not busy_has(got, veto_text):
                         bad.append(f"record_shell with an exec'd {argv[0]} beside the strays must still veto: {got}")
                 def link(target=None, exc=None):
                     def readlink(path):
@@ -3280,13 +3958,13 @@ def stray_selftest(bad, empty_prompt=EMPTY_PROMPT_SCREEN):
                 tx["last_activity"] = None
                 got = verdict(d2, marked, shell_veto)
                 tx["last_activity"] = now_ms - 31 * 3600e3
-                if got[0] != "BUSY" or veto_text not in got[1]:
+                if got[0] != "BUSY" or not busy_has(got, veto_text):
                     bad.append(f"record_shell with no readable message time must still veto: {got}")
                 got = verdict(d2, marked, shell_veto, tasks={445647: "bloop"})  # a loop's own sleep inherits fd 1
                 if got[0] != "FINISHED":
                     bad.append(f"a stray's own sleep must not read as an unseen task: {got}")
                 got = verdict(d2, marked, {"s": {"windDown": {"reason": "record_busy"}}})
-                if got[0] != "BUSY" or WIND_DOWN_VETO["record_busy"] not in got[1]:
+                if got[0] != "BUSY" or not busy_has(got, WIND_DOWN_VETO["record_busy"]):
                     bad.append(f"only record_shell gives way to strays, not record_busy: {got}")
                 # The report names each stray: what a --close of that row would end.
                 saved_screen = {k: globals()[k] for k in ("terminals", "open_rows", "page_names", "proc_table",
@@ -3610,8 +4288,23 @@ RULE_CHARS = "\u2500\u2501"  # the cells of the input box's two rule lines
 # How many markers not drawn on a background the input-box search replays,
 # newest first. Every frame redraws the box's marker, so it is among the newest
 # few; past them the box is not on screen, and each older marker costs a replay
-# of the rest of the window, which a dialog redrawn many times makes slow.
+# of the rest of the window, which a dialog redrawn many times makes slow. The
+# fallback's walk back to the row's own marker counts against the same cap each
+# marker it steps past or onto that is not an older draw of one cell: a marker on
+# another row or further right on the row (stepped past), or one typed into the
+# input row (stepped onto).
 BOX_SEARCH_MARKS = 8
+# How many older draws of the SAME cell (row and column) the fallback walk back
+# steps back through, counted apart from the markers above. The row's own marker
+# is re-emitted alone after a draft with the caret sent Home, so the draft lies
+# before the replay's start, and only an older draw of that cell starts the replay
+# early enough. Each costs one anchor-to-marker replay, not a window replay. Past
+# the bound the read goes on from the marker reached: text it shows is still text,
+# and an empty replay, which may start after a draft, reads unknown. The plan that
+# set it (2026-11-18-triage-sessions-untimed-contradicted-finish-and-hidden-prompt-draft)
+# reports a longest run of 7 draws of one cell on 84 live panes (2026-11-10), so it
+# is 16, twice BOX_SEARCH_MARKS.
+SAME_CELL_DRAWS = 2 * BOX_SEARCH_MARKS
 
 
 def on_background(raw, i):
@@ -3668,7 +4361,15 @@ def prompt_state(raw, *, cols):
     a bare screen, a box drawn before the window), the last `\u276f` not drawn on
     a background is read instead, as before the box was looked for. Either way a
     `\u276f` with another `\u276f` left of it on its row is text typed into that row,
-    not the row's own marker: the leftmost is read.
+    not the row's own marker, so the row's own is the leftmost one on its row. The
+    box-less walk back finds that one rather than assuming it: it steps past a
+    `\u276f` on another row (counted toward BOX_SEARCH_MARKS, as is each typed one it
+    steps onto) and back over older draws of the `\u276f` at the same row and column
+    (up to SAME_CELL_DRAWS, counted apart), so a draft typed after another row's
+    `\u276f`, or before the row's own `\u276f` was re-emitted alone with the cursor sent
+    Home, stays inside the replay. Past either bound the read goes on from the
+    `\u276f` the walk has reached: text it shows is still "text", and an empty replay,
+    which may start after a draft, reads "unknown", never "empty".
 
     The prompt is empty only when BOTH hold on that `\u276f`:
     1. the visible cursor sits on its row, two columns right of it (an empty
@@ -3709,19 +4410,41 @@ def prompt_state(raw, *, cols):
     if placed is None:
         return "unknown", "no absolute cursor position before the prompt"
     # A marker typed into the input row is drawn right of the row's own: an older
-    # marker on the same row, further left. The leftmost one is read.
-    for steps, i in enumerate(marks_before(last)):
+    # marker on the same row, further left. The leftmost one is read. The walk back
+    # steps onto that one, steps past a marker on another row (or further right on
+    # the row), and steps back to an older draw at the same row and column. The
+    # first two count toward BOX_SEARCH_MARKS; the draws of one cell are counted
+    # apart, up to SAME_CELL_DRAWS, so a draft the row's own marker was re-emitted
+    # after stays inside the replay. A bound stops the walk where it is, and the read
+    # goes on from the marker reached: text it shows is still text, but an empty
+    # replay may start after a draft, so it reads unknown, never empty.
+    steps = draws = 0
+    bound = None  # what stopped the walk short of the row's own marker, if a bound did
+    for i in marks_before(last):
         older = _place_mark(raw, i, cols, anchors)
-        if older is None or older[1] != placed[1] or older[2] >= placed[2]:
+        if older is None:
+            break  # no absolute position before it, so none before it has one either
+        if older[1:] == placed[1:]:
+            draws += 1
+            if draws > SAME_CELL_DRAWS:
+                bound = "prompt marker redrawn too often to rule a draft out"
+                break
+            last, placed = i, older
+            continue
+        steps += 1
+        typed = older[1] == placed[1] and older[2] < placed[2]
+        if steps > BOX_SEARCH_MARKS:
+            bound = ("prompt markers typed into the input row" if typed
+                     else "prompt markers other than the row's own")
             break
-        if steps == BOX_SEARCH_MARKS:
-            return "text", "prompt markers typed into the input row"
-        last, placed = i, older
+        if typed:
+            last, placed = i, older
     cur, mrow, mcol = placed
     cur.feed(raw[last:show])
     low = _lower_rule(_rule_rows(cur), mrow)
     # With no rule below, the rows under the marker are status lines, not input.
-    return _read_input(cur, mrow, mcol, range(mrow, low) if low is not None else (mrow,))
+    state, seen = _read_input(cur, mrow, mcol, range(mrow, low) if low is not None else (mrow,))
+    return ("unknown", bound) if bound and state == "empty" else (state, seen)
 
 
 def _place_mark(raw, i, cols, anchors):
@@ -3815,6 +4538,19 @@ def running_turn(text):
 # with any whitespace, or none, between them. The option matched is the first,
 # which a narrow pane always draws.
 LIMIT_MENU = re.compile(r"Stop\s*and\s*wait\s*for\s*limit\s*to\s*reset")
+# The same menu's first option drawn as a bare "Stop": reported, not observed here, for usage-billed
+# accounts and for a credits_required rejection (plan
+# 2026-11-14-a-rate-limit-menu-whose-first-option-is-a-bare-stop-is-never-read-as-a-usage-limit, Phase 2).
+# That layout is UNMEASURED, so this reads only the menu's skeleton and never the words of options 2 or 3:
+# `1. Stop` as a WHOLE option (only whitespace, then a numbered row `2.` or the key hint, so "1. Stop hook"
+# is not it), anchored by EITHER the question before it (tolerant of dropped characters, "What do you wan
+# to do?") OR a directly following numbered second row. The row must not continue a number ("11. Stop"): the
+# question arm cannot skip a leading digit, so only the `2.` arm needs the lookbehind.
+# Known misses and accepted reads: an option drawn with a description row under "Stop" is not read; a
+# screen of some other dialog that numbers "1. Stop" above "2." and ends on the same key hint is read open.
+LIMIT_MENU_STOP = re.compile(
+    r"(?:Wh?a?t\s*do\s*you\s*wa?n?t?\s*to\s*do[\s?]*[\u276f>]?\s*1\.\s*Stop\s*(?=2\.|Enter\s*to\s*confirm)"
+    r"|(?<![\w.])1\.\s*Stop\s*(?=2\.))")
 MENU_HINT = re.compile(r"Enter\s*to\s*confirm\s*\u00b7\s*Esc\s*to\s*cancel")
 # A run of spaces or tabs. A Windows pane's ConPTY can pad each row with spaces to
 # the pane's full width, with no line break (the CONPTY_FIXTURE_COLS fixtures), so
@@ -3835,14 +4571,17 @@ MENU_WINDOW = 3000
 # drawn border (U+2594, inside the box-drawing and block range U+2500-U+259F) to the
 # end of the text. One left in scrollback is followed by other text, and an older
 # menu above a later dialog that ends on the same key hint has its own hint between.
-MENU_OPEN = re.compile(LIMIT_MENU.pattern + r"(?:(?!Enter\s*to\s*confirm).){0,%d}?" % MENU_SPAN
+MENU_OPEN = re.compile(r"(?:" + LIMIT_MENU.pattern + "|" + LIMIT_MENU_STOP.pattern + ")"
+                       + r"(?:(?!Enter\s*to\s*confirm).){0,%d}?" % MENU_SPAN
                        + MENU_HINT.pattern + r"[\s\u2500-\u259f]*$", re.S)
 
 # The reason line classify_row gives a LIMITED row whose screen ends on an open
 # usage-limit menu, whichever arm read the limit: the menu arm's first line, or a
 # line after the transcript's limit message. It is a contract: /nudge-stopped-sessions
 # keeps a row carrying it LIMITED whatever its reset says, so the menu reaches
-# triage's limit step, whose Esc dismisses it, and nothing types into it.
+# triage's limit step, which chooses its "Wait here, then continue automatically"
+# option by its text (or, with no such row, dismisses it with Esc), and nothing
+# types into it.
 MENU_OPEN_LINE = "an open usage-limit menu ends the screen"
 
 def limit_menu_open(text):
@@ -3851,8 +4590,8 @@ def limit_menu_open(text):
     last MENU_WINDOW characters once each run of spaces or tabs reads as one.
     Pass the whole stripped tail: a slice taken first can cut off the option of
     a menu drawn full-width. classify_row reads such a pane LIMITED, and
-    triage-sessions.py dismisses the menu with Esc, and refuses to type into
-    it, through this same helper."""
+    triage-sessions.py chooses the menu's wait option or dismisses it with Esc,
+    and refuses to type into it, through this same helper."""
     return bool(text) and bool(MENU_OPEN.search(HSPACE_RUN.sub(" ", text)[-MENU_WINDOW:]))
 
 
@@ -5606,8 +6345,17 @@ def subagent_work(path, segments):
 # User records that open no turn even outside one: a local command's caveat and
 # output, an interrupt, and a META system reminder (a /rename writes one). A
 # non-meta <system-reminder> record is a delivery that does open one: coord's
-# Session Bus `ci_rework` / `stuck_pr_nudge` messages arrive that way.
+# Session Bus `ci_rework` / `escalate_evidence` / `pr_blocked` / `stuck_pr_nudge`
+# messages arrive that way.
 NOT_A_TURN = ("<local-command", "Caveat:", "<system-reminder>", "[Request interrupted")
+# Claude Code's continuation of the running turn when a Stop hook blocks its end: a
+# META user record starting with this text, carrying the same promptId as the
+# record that opened the turn, written before that turn's one system/turn_duration
+# record (plan 2026-11-20-triage-sessions-stop-hook-continuation-reads-as-a-revival,
+# measured 2026-11-20). Tied that way, it opens no turn (turn_open); untied (no
+# promptId on it or on the opener, another promptId, or a turn_duration since the
+# opener) it keeps the opener reading, the close screen's conservative side.
+STOP_HOOK_FEEDBACK = "Stop hook feedback:"
 # The three classes of turn opener (plan
 # 2026-11-07-triage-sessions-ten-gaps-from-an-every-page-act-run, Phase 3). A
 # *prompt* is what `last_prompt` counts (a non-meta record whose text starts
@@ -5655,18 +6403,32 @@ def turn_open(f, turn, e, content, text, at):
     opener_class: its class into `last_turn_open_class`, and the newest prompt
     or delivery into `last_revive_open` (with its `_text` and `_class`), so a
     delivery is still named when a later wake opened the newest turn.
-    `turn` is {"in": a turn is running, "before": the OPEN_KEYS to restore}."""
+    A Stop-hook continuation of the running turn opens none either: a meta
+    record starting STOP_HOOK_FEEDBACK whose promptId equals the turn opener's,
+    with no turn_duration read since that opener. It is the rest of that turn,
+    so work it does long past a finish is judged as kept_working (finish_state).
+    `turn` is {"in": a turn is running, "before": the OPEN_KEYS (and "pid",
+    "closed") to restore, "pid": the turn opener's promptId, "closed": a
+    turn_duration was read since that opener}."""
     t = text.lstrip()
     if t.startswith(LOCAL_OUTPUT):
         if turn["before"] is not None and f["last_turn_open_text"].startswith("<command-name>"):
-            f.update(turn["before"])
+            before = dict(turn["before"])
+            # The command opener is rolled back, so its promptId goes too; but a turn_duration read since
+            # it still closed the restored turn, so `closed` is OR'd, never cleared (the conservative side:
+            # a later feedback record then opens a turn rather than tying to a turn that already ended).
+            turn["pid"], turn["closed"] = before.pop("pid"), before.pop("closed") or turn["closed"]
+            f.update(before)
         turn["before"] = None
     elif t.startswith("[Request interrupted"):
         turn["in"] = False  # the interrupted turn ended without an end_turn record
     elif not (turn["in"] or not t or e.get("isCompactSummary") or (
             t.startswith(NOT_A_TURN) and (e.get("isMeta") or not t.startswith("<system-reminder>"))) or (
-            isinstance(content, list) and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content))):
-        turn["before"] = {k: f[k] for k in OPEN_KEYS}
+            isinstance(content, list) and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content))
+            or (e.get("isMeta") and t.startswith(STOP_HOOK_FEEDBACK) and e.get("promptId")
+                and e.get("promptId") == turn["pid"] and not turn["closed"])):
+        turn["before"] = dict({k: f[k] for k in OPEN_KEYS}, pid=turn["pid"], closed=turn["closed"])
+        turn["pid"], turn["closed"] = e.get("promptId"), False
         cls = opener_class(e, text)
         f["last_turn_open"], f["last_turn_open_text"], f["last_turn_open_class"] = at, t, cls
         if cls != "self":
@@ -5711,18 +6473,23 @@ def transcript_facts(row):
     # `last_turn_open` is the newest record that opened a turn of any kind
     # (turn_open), so a wake that `last_prompt` ignores can still be read;
     # `last_turn_open_class` and `last_revive_open` name its class (opener_class).
+    # A Stop-hook continuation of the running turn (STOP_HOOK_FEEDBACK) opens no
+    # turn; the one `system` record read is turn_duration, which closes the turn
+    # for that test and changes no other fact.
     f = {"path": path, "last_activity": None, "last_prompt": None, "last_prompt_text": "",
          "last_asst": None, "final_text": "", "final_text_at": None, "pending_tool": False,
          "task_prompts": 0, "work_tools_since_nudge": 0, "nudge_streak": 0, "nudge_replied": False, "cwd": None,
          "last_turn_open": None, "last_turn_open_text": "", "last_turn_open_class": None,
          "last_revive_open": None, "last_revive_open_text": "", "last_revive_open_class": None}
     open_tools = set()
-    turn = {"in": False, "before": None}
+    turn = {"in": False, "before": None, "pid": None, "closed": False}
     segments = []
     before = None  # (last_prompt, last_prompt_text) as they stood before the newest prompt
     for line in open(path, encoding="utf-8", errors="replace"):  # never the locale codepage (cp1252 on Windows)
         try:
             e = json.loads(line)
+            if isinstance(e, dict) and e.get("type") == "system" and e.get("subtype") == "turn_duration":
+                turn["closed"] = True  # the running turn ended: no later feedback continues it (timestamp unread)
             ts = e.get("timestamp")
             if not ts or not isinstance(e.get("message"), dict):
                 continue
@@ -5959,7 +6726,8 @@ def finish_hits(row, rp, tx, now_ms=None):
 BAND_MS = 1000  # a turn-opening record within 1 s of coord's stamp is the stamp's own band
 KEPT_WORKING_MS = 10 * 60000  # assistant work this far past a finish, with no closeout, reopened it
 # finish_state's answer: `state` one of FINISH_STATES, `at` the finish time judged against (unix ms; None when
-# unconfirmed), `by` whose time that is ("coord" or "marker"; None when unconfirmed), `why` the reasons.
+# unconfirmed, or contradicted by a reply with no finish time to judge it against), `by` whose time that is
+# ("coord" or "marker"; None in the same two cases), `why` the reasons.
 # `rule`, when set, names the screen rule that holds a finish the row's structured signal states (STRANDED_CODES),
 # or is `untimed_mark` on an `unconfirmed` finish neither coord nor the runner mark can date (not a stranded code).
 Finish = collections.namedtuple("Finish", "state at by why rule", defaults=(None,))
@@ -6029,24 +6797,37 @@ def finish_state(row, rp, tx, now_ms, hits=None):
 
       unconfirmed   coord says finished with no usable time, and no runner mark
                     settles it: there is none, its finishedAt is unusable, or
-                    only work past it reopened it. Nothing says that finish is
-                    wrong, and nothing dates it. (A prompt or turn opener after a
-                    TIMED mark is `revived` instead, by="marker": condition 4
-                    cannot be ruled out against an untimed coord finish.)
+                    only work past it reopened it. Its final message does not
+                    say work remains (one that does is `contradicted`, below),
+                    so nothing says that finish is wrong, and nothing dates it.
+                    (A prompt or turn opener after a TIMED mark is `revived`
+                    instead, by="marker": condition 4 cannot be ruled out
+                    against an untimed coord finish.)
       revived       after the finish time a real prompt arrived, or any record
                     that opens a turn (last_turn_open: a Session Bus delivery, a
                     /loop or ScheduleWakeup wake, a task notification), or
                     assistant work ran more than 10 minutes past it with no
-                    closeout. More than 1 s after the stamp, for coord's time and
-                    the runner mark alike (served finished-criteria condition 4).
+                    closeout. A Stop-hook continuation of the finishing turn
+                    (STOP_HOOK_FEEDBACK, tied to that turn's opener) opens no
+                    turn, so only its work, by that 10-minute rule, revives.
+                    More than 1 s after the stamp, for coord's time and the
+                    runner mark alike (served finished-criteria condition 4).
       in_band       a prompt or turn-opening record within 1 s either side of
                     coord's stamp (the runner mark's band is one-sided). close
                     keeps the tab (REVIVED); nudge holds it (HELD).
       contradicted  none of those, but the final message carries a well-formed
                     No or a work-remains phrase (phrase_hits' negatives), or
                     coord's readable session_status is not finished while the
-                    runner mark says finished. close never closes it; nudge sends
-                    /next-move, which reconciles the two signals.
+                    runner mark says finished. The message needs no finish time
+                    to contradict a finish, so it does so dated or not: coord's
+                    finished with no usable time (no runner mark, a mark with no
+                    usable finishedAt, or one only work past it reopened) beside
+                    such a message is contradicted too, with at and by None (and
+                    the kept-working line in its reasons when work reopened it).
+                    A prompt or turn opener after a TIMED mark is still
+                    `revived` (a reopened finish is no contradiction). close
+                    never closes it; nudge sends /next-move, which reconciles
+                    the two signals.
       finished      none of the above.
 
     `rule` names the screen rule that holds a finish its structured signal
@@ -6056,9 +6837,12 @@ def finish_state(row, rp, tx, now_ms, hits=None):
     has none: the session was reopened, not held. classify_row adds it to the
     row only when the finish signal was positively read (stranded_line).
     `untimed_mark` tags an unconfirmed finish where coord serves no usable
-    time and the runner mark has no usable finishedAt either; classify_row
-    reads it UNKNOWN. It is not a stranded code: a missing time is an unknown
-    input, not a detector hit."""
+    time and the runner mark has no usable finishedAt either, and whose final
+    message does not say work remains (one that does is contradicted, rule
+    phrase_veto, first); classify_row reads it UNKNOWN. It is not a stranded
+    code: a missing time is an unknown input, not a detector hit. The
+    contradicted finish with no time does carry phrase_veto, though: the
+    message was read even though the time was not."""
     row, rp, tx = row or {}, rp or {}, tx or {}
     status = rp.get("sessionStatus")
     marked = bool(row.get("finished"))
@@ -6081,14 +6865,24 @@ def finish_state(row, rp, tx, now_ms, hits=None):
     if status == "finished" and since is None:
         untimed = "coord session_status=finished (no finish time to compare a revival against)"
         mat = marker_at(row) if marked else None
+        # A reply that says work remains contradicts a finish whether or not the finish is dated
+        # (plan 2026-11-18-triage-sessions-untimed-contradicted-finish-and-hidden-prompt-draft
+        # Phase 2): the time only dates a REOPENING, which is another question. `remains` stands
+        # in for each unconfirmed return below and for nothing else. A prompt or turn opener after
+        # a TIMED mark is still the revival (a reopened finish is no contradiction), and a timed
+        # mark nothing reopened falls through to the dated contradiction, whose reason names the
+        # mark's time. /next-move reconciles it.
+        remains = Finish("contradicted", None, None,
+                         [f"{untimed}, but the final message says work remains ({neg[0]})"], "phrase_veto") if neg else None
         if marked and mat is None:
             # A runner mark with no usable finishedAt beside coord's untimed finish: no
             # time on either side dates any turn, so a reopening can be neither claimed
             # nor ruled out. Unconfirmed, tagged untimed_mark: close reads it UNKNOWN
-            # (never closed), nudge holds it.
-            return Finish("unconfirmed", None, None,
-                          [untimed, "its runner finish mark has no usable time either, so no turn can be dated "
-                                    "against either finish"], "untimed_mark")
+            # (never closed), nudge holds it. Unless the reply says work remains: that
+            # needs no time, so `remains` is returned instead.
+            return remains or Finish("unconfirmed", None, None,
+                                     [untimed, "its runner finish mark has no usable time either, so no turn can be "
+                                               "dated against either finish"], "untimed_mark")
         reopened = _reopened(tx, mat, "marker", pos) if marked else None
         if reopened and reopened[0] in ("prompt", "turn"):
             # A prompt or turn opener after the runner mark, and coord's finish carries no
@@ -6100,6 +6894,10 @@ def finish_state(row, rp, tx, now_ms, hits=None):
                           [f"coord session_status=finished with no finish time, and the session was reopened after "
                            f"its runner finish mark: {reopened[1]}"])
         if not marked or reopened:
+            if remains:
+                # A reopening by work alone (a prompt or turn opener returned above) rides along in the
+                # reasons, as it does on the unconfirmed return below: the reply decides the verdict.
+                return remains._replace(why=remains.why + ([reopened[1]] if reopened else []))
             return Finish("unconfirmed", None, None, [untimed] + ([reopened[1]] if reopened else []))
     reopened = _reopened(tx, at, by, pos)
     if reopened:
@@ -6138,7 +6936,11 @@ def finish_state(row, rp, tx, now_ms, hits=None):
 # fires no code: an unreadable transcript or screen never reaches a coded arm
 # (UNKNOWN / BUSY first), a mark with no usable time and coord's finish with no
 # time (unconfirmed) code nothing, and screen_all drops every code when the
-# readiness read failed (coded_row).
+# readiness read failed (coded_row). One undated finish does carry a code (plan
+# 2026-11-18-triage-sessions-untimed-contradicted-finish-and-hidden-prompt-draft
+# Phase 2): coord's finished with no usable time whose final message says work
+# remains is contradicted, and phrase_veto codes it, because the message was
+# read even though the time was not.
 STRANDED_CODES = ("phrase_veto", "kept_working", "coord_status", "in_band")
 STRANDED_HOLDS = {
     "phrase_veto": "a finish its own final message contradicts (work remains): never closed",
@@ -6229,6 +7031,41 @@ def custody_refusal(cwd):
     if git_dir == common:
         return f"custody: not a linked worktree {rule}: {cwd} is a primary checkout"
     return None
+
+
+# The two halves of `closeable` the runner's finished_close arm judges and serves on a readiness row's
+# `windDown` block (qontinui-runner wind_down.rs CustodyView / ObligationsView): the LOCAL half (every worktree
+# the session touched is clean and pushed) and the REMOTE half (every item coord's coord_session_obligations
+# attributes to it is watched). Only the arm's own word counts here, and only as a veto: an absent view means
+# the arm has not judged this session (it reads obligations only for a custody-clean one, and an older runner
+# serves neither), which is no information; a present view that is not the clean word, whatever else it says,
+# is a refusal. A view that is not an object, or carries no string verdict, is unreadable and refuses.
+RUNNER_HALVES = (("custody", "clean", "the worktrees it touched are not all clean and pushed"),
+                 ("obligations", "watched", "not every obligation coord attributes to it is watched"))
+
+
+def runner_halves_refusal(rp):
+    """None when the runner serves no view or only passing ones; else why the close is withheld. Pure."""
+    wd = rp.get("windDown") if isinstance(rp, dict) else None
+    if not isinstance(wd, dict):
+        return None
+    why = []
+    for key, passing, meaning in RUNNER_HALVES:
+        if key not in wd:
+            continue
+        view = wd[key]
+        verdict = view.get("verdict") if isinstance(view, dict) else None
+        if verdict == passing:
+            continue
+        if not isinstance(verdict, str):
+            why.append(f"runner's {key} view is unreadable ({type(view).__name__} without a string verdict)")
+            continue
+        reason = view.get("reason")
+        detail = view.get("detail")
+        why.append(f"runner's {key} verdict is {verdict}"
+                   + (f" ({reason})" if isinstance(reason, str) else "")
+                   + f": {meaning}" + (f" - {detail[:160]}" if isinstance(detail, str) and detail else ""))
+    return "; ".join(why) or None
 
 
 def classify(term, row, table, idle_min, own_tid, ready, strays=None):
@@ -6323,16 +7160,18 @@ def classify_row(term, row, table, idle_min, own_tid, ready, strays):
         if state == "text":
             busy.append(f"text at the input prompt (unsent draft or a dialog): {typed[:50]!r}")
         elif state == "unknown":
-            busy.append("input prompt not found on screen")
+            # The detail says which: no prompt or cursor on the screen, or a walk-back bound past which an
+            # empty replay left a draft unruled out (a bound whose replay shows text reads as text, above).
+            busy.append(f"input prompt not read: {typed}")
     coord_finished = rp.get("sessionStatus") == "finished"
     if busy:
         if finished or coord_finished:
-            busy.insert(0, "marked finished, but")
+            busy[0] = "marked finished, but " + busy[0]
         return "BUSY", busy
 
     if LIMIT_RE.search(tx["final_text"][-300:]):
         # An open menu is named beside the message (MENU_OPEN_LINE), so a consumer
-        # routes the row to the step that dismisses the menu and never types into it.
+        # routes the row to the step that answers the menu and never types into it.
         return "LIMITED", (["stopped by an account usage limit mid-work: " + tx["final_text"].strip()[-80:]]
                            + ([MENU_OPEN_LINE] if menu else []))
     # Read after the transcript's limit, so a row that has one keeps the reason
@@ -6402,8 +7241,9 @@ def classify_row(term, row, table, idle_min, own_tid, ready, strays):
     else:
         finish = fs.why
     custody = custody_refusal(tx.get("cwd"))
-    if custody:
-        return "CUSTODY", finish + note + [custody] + binding
+    halves = runner_halves_refusal(rp)
+    if custody or halves:
+        return "CUSTODY", finish + note + [x for x in (custody, halves) if x] + binding
     return "FINISHED", finish + note + binding
 
 
@@ -6464,6 +7304,37 @@ ORDER = ["FINISHED", "EXITED-FINISHED", "CUSTODY", "CLOSEOUT", "FOOTER-FINISHED"
          "FOOTER-ONLY", "BUSY", "LIMITED", "ACTIVE", "EXITED", "UNKNOWN", "SHELL", "SELF"]
 
 
+def fit_reasons(reasons, width=200):
+    """The reasons joined with "; " for a one-line report row, never cut mid-reason. Whole reasons are
+    kept while they fit; when later ones are dropped the line ends " (+N more)" inside `width`. A first
+    reason alone longer than `width` is cut at the last space and ends with "…". Display only: --json
+    keeps every reason."""
+    reasons = [str(r) for r in reasons]
+    full = "; ".join(reasons)
+    if len(full) <= width:
+        return full
+    kept = []
+    for i, r in enumerate(reasons):
+        tail = f" (+{len(reasons) - i - 1} more)" if i < len(reasons) - 1 else ""
+        # the line this prefix would print if it were the last one kept
+        cand = "; ".join(kept + [r])
+        left = len(reasons) - len(kept) - 1
+        if len(cand) + (len(f" (+{left} more)") if left else 0) > width:
+            break
+        kept.append(r)
+    if not kept:
+        first, mark = reasons[0], "\u2026"
+        if len(reasons) > 1:
+            mark = "\u2026" + f" (+{len(reasons) - 1} more)"
+        room = max(width - len(mark), 1)
+        cut = first[:room]
+        if len(first) > room:
+            sp = cut.rfind(" ")
+            cut = cut[:sp] if sp > 0 else cut
+        return cut.rstrip() + mark
+    return "; ".join(kept) + f" (+{len(reasons) - len(kept)} more)"
+
+
 def print_report(res, warnings):
     for w in warnings:
         print("WARNING: " + w)
@@ -6476,7 +7347,7 @@ def print_report(res, warnings):
             cur = r["verdict"]
             print(f"\n== {cur}")
         print(f"  {r['terminalId'][:8]}  {r['tab']:<14.14}  {r['account']:<13.13}  {r['name'][:60]}")
-        print(f"            - {'; '.join(r['reasons'])[:200]}")
+        print(f"            - {fit_reasons(r['reasons'])}")
         for s in r.get("strays") or []:  # what a --close of this row would end if it outlives the pane
             print(f"            - stray pid {s['pid']} ({s['class']}): {s['why'][:160]}")
     print_stranded(res)

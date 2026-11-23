@@ -184,11 +184,18 @@ curl -s -X POST $BASE/control/element/<id>/action -H "Content-Type: application/
 # Type text (with optional clear-first and keystroke delay)
 curl -s -X POST $BASE/control/element/<id>/action -H "Content-Type: application/json" -d '{"action": "type", "params": {"text": "value", "clear": true}}'
 
-# Clear / Focus / Blur / Hover
+# Clear / Focus / Blur
 curl -s -X POST $BASE/control/element/<id>/action -H "Content-Type: application/json" -d '{"action": "clear"}'
 curl -s -X POST $BASE/control/element/<id>/action -H "Content-Type: application/json" -d '{"action": "focus"}'
 curl -s -X POST $BASE/control/element/<id>/action -H "Content-Type: application/json" -d '{"action": "blur"}'
+
+# Hover: forces the real CSS :hover state (group-hover / hover: rules apply) and HOLDS it
+# until unhover, the next hover/hoverClick, a dispatched write-class action, or the TTL
+# (params.holdMs, default 30000, ceiling 300000).
 curl -s -X POST $BASE/control/element/<id>/action -H "Content-Type: application/json" -d '{"action": "hover"}'
+curl -s -X POST $BASE/control/element/<id>/action -H "Content-Type: application/json" -d '{"action": "hover", "params": {"holdMs": 5000}}'
+# Unhover: releases the page's one forced hover, whichever element it names (a no-op success when none is held)
+curl -s -X POST $BASE/control/element/<id>/action -H "Content-Type: application/json" -d '{"action": "unhover"}'
 
 # Select dropdown option
 curl -s -X POST $BASE/control/element/<id>/action -H "Content-Type: application/json" -d '{"action": "select", "params": {"value": "option1"}}'
@@ -211,6 +218,24 @@ curl -s -X POST $BASE/control/element/<id>/action -H "Content-Type: application/
 # Send keyboard events (works with xterm.js terminals, canvas elements, etc.)
 curl -s -X POST $BASE/control/element/<id>/action -H "Content-Type: application/json" -d '{"action": "sendKeys", "params": {"keys": [{"key": "a"}, {"key": "Enter"}, {"key": "v", "modifiers": {"ctrl": true}}]}}'
 ```
+
+**Reading a hover.** `hover`, `hoverClick` and `unhover` (`@qontinui/ui-bridge`
+0.38.0 and later) answer with a `forcedHover` report. `forcedHover.applied`
+says what the hover forced. `revealed` lists the registered elements whose
+`opacity`, `visibility`, `display` or `pointer-events` changed, before and
+after, so it tells you which controls the hover uncovered. `settled` is `true`,
+`false` (the settle timed out) or `"frame-only"`. When `unreadableSheets` is
+above 0, or `complete` is `false`, some `:hover` rules could not be forced, so
+the reveal is UNKNOWN-complete, not clean. `forcedHover.released` says what a
+release did. Its `restore` is `verified` when every revealed element reads its
+before-hover values again and no rewritten selector was changed. It is
+`restored_with_drift` when one does not (see `drift`) or the app changed a
+rewritten selector during the hold (see `selectorDrift`), and `nothing_held`
+for an `unhover` with nothing to release. A held hover
+lets a `click` on a revealed control pass the pointer-events check, and that
+click then releases the hover. Read-only actions (`scroll`, `scrollIntoView`,
+`focus`, `blur`) keep it held. App JavaScript that reads `el.matches(':hover')`
+still sees `false`.
 
 ### JavaScript Evaluation
 
@@ -358,7 +383,7 @@ Each element in the snapshot contains:
 | `id` | Element identifier (used in `/element/<id>/action`) |
 | `element_type` | button, input, link, select, checkbox, etc. |
 | `label` | Human-readable label |
-| `actions` | Available actions: click, type, focus, clear, hover |
+| `actions` | Available actions, e.g. click, type, focus, clear, hover, unhover |
 | `state.visible` | Whether element is visible |
 | `state.enabled` | Whether element is enabled/interactive |
 | `state.value` | Current input value |
@@ -447,7 +472,7 @@ Prefer a `?next=<urlencoded-path>` `--url` so the authed landing is **determinis
   INJECT="npx -y -p @qontinui/ui-bridge-wrapper -p @qontinui/ui-bridge -p @qontinui/ui-bridge-headless -p playwright ui-bridge-inject"
   $INJECT --url https://qontinui.io/digital-twin --storage-state "$AUTH" --exec 'getControlSnapshot {}'
   ```
-  To read or act on ONE element in an `--exec` run: `executeElementAction {"id":"<id>","request":{"action":"<action>"}}` is the canonical action shape on every released runtime, and `getElementState {"id":"<id>"}` reads one element's state (enabled, visible, focused, ariaPressed, …). The `@qontinui/ui-bridge` release from plan `2026-11-08-ui-bridge-inject-exec-mode-is-a-second-class-driver` adds `getElement {"id":"<id>"}` (identity, state, box and actions — one `getControlSnapshot` element) and a typed `INVALID_REQUEST` naming the canonical shape for a mis-shaped action payload; an older injected runtime answers `getElement` with `Unknown command action`, and does not check the action payload's shape: a missing or flat `request` throws a `TypeError`, an `elementId` spelling returns `ELEMENT_NOT_FOUND` ("Element undefined not found"), and a field beside `request` is silently dropped (a `type` then succeeds having typed nothing). Send only the canonical shape there.
+  To read or act on ONE element in an `--exec` run: `executeElementAction {"id":"<id>","request":{"action":"<action>"}}` is the canonical action shape on every released runtime, and `getElementState {"id":"<id>"}` reads one element's state (enabled, visible, focused, ariaPressed, …). `@qontinui/ui-bridge` ≥ **0.47.0** (the release from plan `2026-11-08-ui-bridge-inject-exec-mode-is-a-second-class-driver`; 0.46.0 does not carry it) adds `getElement {"id":"<id>"}` (identity, state, box and actions — one `getControlSnapshot` element) and a typed `INVALID_REQUEST` naming the canonical shape for a mis-shaped action payload; an older injected runtime (below 0.47.0) answers `getElement` with `Unknown command action`, and does not check the action payload's shape: a missing or flat `request` throws a `TypeError`, an `elementId` spelling returns `ELEMENT_NOT_FOUND` ("Element undefined not found"), and a field beside `request` is silently dropped (a `type` then succeeds having typed nothing). Send only the canonical shape there.
   > **⚠️ VERSION FLOOR — replay needs a higher floor than capture, on TWO packages.** A storage state historically carried `__uiBridge_tabId` in sessionStorage, so replaying it re-registered the injected tab under the **operator's live tab id**. Floor **both** `@qontinui/ui-bridge-wrapper` ≥ **0.7.0** (the capture-side strip; the first *released* carrier — 0.6.1 was never published) **and** `@qontinui/ui-bridge-headless` ≥ **0.4.0** (the restore-side scrub, which is where the defense for artifacts *already captured* lives). The wrapper's peer range on headless was `>=0.3.0 <1` when this floor was set (wrapper 0.7.x), so it did **not** force 0.4.0. Read the range of the wrapper you actually resolve (`npm view @qontinui/ui-bridge-wrapper@<the version npx resolved> peerDependencies`) rather than from here. `npx` prints no version, so read `version` from the wrapper's `package.json` in the npx cache directory it ran from. The same `npx -y -p …` list followed by `node -p process.env.PATH` prints that directory's `node_modules/.bin` first. The `npx -p` line above names headless as its own top-level package with no version, so it resolves headless `latest`, which is above the floor — a version pin, a lockfile or a warm npx cache is what can hold it at 0.3.0, which replays `--storage-state` without scrubbing. Below either floor, pass an explicit `--tab-id` or strip the key from the JSON by hand. Full derivation: `knowledge-base/qontinui-specific/ui-bridge.md` → "Tab-identity safety on storage-state replay".
   Only when neither flags nor the artifact fit should you write a small custom driver against the injected transport's `ctx.page` (Playwright) — model it on `src/login-web-cli.ts`'s `drive` step.
 

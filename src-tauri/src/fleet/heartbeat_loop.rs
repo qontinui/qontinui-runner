@@ -484,7 +484,7 @@ mod tests {
     fn clear() -> HeartbeatOutcome {
         HeartbeatOutcome::Registered {
             drain: DrainObservation::Clear,
-            dispatch_role: None,
+            dispatch_role: crate::coord_drain_state::ServedRole::NotServed,
         }
     }
 
@@ -721,7 +721,7 @@ mod tests {
                 until: None,
                 reason: None,
             },
-            dispatch_role: None,
+            dispatch_role: crate::coord_drain_state::ServedRole::NotServed,
         };
         assert_eq!(outcome_status(&drained), "registered/DRAINED");
         assert_eq!(outcome_status(&clear()), "registered/clear");

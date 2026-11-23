@@ -182,6 +182,31 @@ describe("rename", () => {
     expect(persisted().map((p) => p.name)).toEqual(["Page 1", "resumes"]);
   });
 
+  it("opening the editor on an auto page and clicking away keeps it auto", () => {
+    seed(roster);
+    const { hook } = mount();
+    expect(hook().allPages.find((p) => p.id === "b")?.origin).toBe("auto");
+    const tab = [...container.querySelectorAll<HTMLButtonElement>('[role="tab"]')].find(
+      (b) => b.textContent === "Page 2",
+    )!;
+    act(() => {
+      tab.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+    });
+    const input = container.querySelector<HTMLInputElement>('input[aria-label="Page name"]')!;
+    expect(input.value).toBe("Page 2");
+    // The tab bar commits on blur: with the name unchanged that is not a rename.
+    act(() => {
+      input.dispatchEvent(new FocusEvent("focusout", { bubbles: true }));
+    });
+
+    expect(container.querySelector('input[aria-label="Page name"]')).toBeNull();
+    expect(hook().allPages.find((p) => p.id === "b")).toMatchObject({
+      name: "Page 2",
+      origin: "auto",
+    });
+    expect(persisted()).toEqual(roster);
+  });
+
   it("stores the trimmed name it checked", () => {
     seed([
       { id: "a", name: "tmux", createdAt: 1 },

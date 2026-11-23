@@ -1008,7 +1008,7 @@ struct Row {
 /// judge it, so its recorded parent link is kept, exactly as the WMI path
 /// always kept it. Every consumer of creation times already reads `0` as
 /// unknown — a PID-reuse check against it fails closed (`orphan_state`), and a
-/// liveness check does not treat it as reuse (`claude_present_in_inclusive_subtree`).
+/// liveness check does not treat it as reuse (`PaneLook::claude_present`).
 fn build_snapshot(rows: &[Row], walk_began: u64) -> ProcessSnapshot {
     use qontinui_runner_win32::process_tree::admits_descendant;
 

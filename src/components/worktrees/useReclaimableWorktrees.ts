@@ -137,19 +137,6 @@ interface ApiEnvelope<T> {
   error?: string;
 }
 
-/** Human-readable byte size. */
-export function formatBytes(bytes: number): string {
-  if (!bytes) return "0 B";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let v = bytes;
-  let i = 0;
-  while (v >= 1024 && i < units.length - 1) {
-    v /= 1024;
-    i += 1;
-  }
-  return `${v >= 100 || i === 0 ? Math.round(v) : v.toFixed(1)} ${units[i]}`;
-}
-
 /** `95` → `"1m ago"`. The "as of" label — honest about snapshot age. */
 export function formatAge(secs: number | null): string {
   if (secs === null || secs < 0) return "unknown";

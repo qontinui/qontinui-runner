@@ -17,9 +17,10 @@ its final reply states, which coord has not recorded) are nudged too, so
 /next-move reconciles or records them. That screen leans to "not finished" when
 unsure, which is the safe side for a close and the unsafe side for a nudge, so
 this script adds its own holds: a finish no later turn reopened (finished, a
-turn inside coord's 1 s stamp band, or a coord finish with no time), coord
-session_status waiting_human, and a last prompt that was a /next-move that
-changed nothing.
+turn inside coord's 1 s stamp band, or a coord finish with no time whose final
+message does not say work remains; one that does is CONTRADICTED, nudged
+above), coord session_status waiting_human, and a last prompt that was a
+/next-move that changed nothing.
 
 A row whose last prompt is /next-move is held by what changed, not by a
 clock. A /next-move followed by a work-class tool call (an edit, a commit, a
@@ -264,6 +265,19 @@ def progress_since_nudge(tx):
     return False if tx.get("nudge_replied") else None
 
 
+def nudge_measured_at(tx, progress):
+    """Epoch ms of the /next-move that progress_since_nudge measured: the
+    transcript's last prompt. None when nothing was measured. coord credits a
+    measurement to a nudge only when this is at or after the nudge's row, so a
+    nudge typed that never landed is not credited with the one before it."""
+    if progress is None or not tx:
+        return None
+    at = tx.get("last_prompt")  # cfs.ms(): a float of epoch ms
+    if isinstance(at, bool) or not isinstance(at, (int, float)) or not 0 < at < float("inf"):
+        return None
+    return int(at)
+
+
 def progress_tx(row):
     """The transcript facts of a row judge() does not read: None when unreadable,
     which is a row with no measurement, never a failed pass."""
@@ -342,10 +356,10 @@ def judge(verdict, reasons, facts, tx, now_ms, cooldown_h, include_complete=Fals
         # A screen that ends on an open usage-limit menu (cfs.MENU_OPEN_LINE, from
         # either of the close screen's LIMITED arms) stays LIMITED whatever the
         # reset says: /next-move typed into it would choose an option, and
-        # triage's limit step is the one that dismisses it with Esc and waits for
-        # the runner's hand-off.
+        # triage's limit step is the one that answers it: Esc and the runner's
+        # hand-off, or the menu's wait option chosen by its text.
         if cfs.MENU_OPEN_LINE in reasons:
-            return "LIMITED", reasons + ["left to triage's limit step, which dismisses the menu, whatever the reset"]
+            return "LIMITED", reasons + ["left to triage's limit step, which answers the menu, whatever the reset"]
         if tx is None:
             return "LIMITED", reasons + ["transcript unreadable at re-check"]
         reset = limit_reset_ms(tx["final_text"], tx["last_asst"])
@@ -671,7 +685,9 @@ def screen(idle_min, only, cooldown_h, include_complete, use_coord=True, use_gh=
         # Measured on every row, not just the stopped ones judge() reads: a
         # session a nudge put to work reads BUSY, and a rate over only the
         # sessions that stopped again reads low. 260 transcripts took 6 s.
-        r["progress_since_nudge"] = progress_since_nudge(tx if tx is not None else progress_tx(row))
+        ptx = tx if tx is not None else progress_tx(row)
+        r["progress_since_nudge"] = progress_since_nudge(ptx)
+        r["nudge_measured_at"] = nudge_measured_at(ptx, r["progress_since_nudge"])
         r["verdict"], r["reasons"] = judge(r["verdict"], r["reasons"], facts, tx, now, cooldown_h,
                                            include_complete, ext)
     return res, warnings, ready_err
@@ -697,7 +713,7 @@ def print_report(res, warnings):
             print(f"\n== {cur}")
         screen_v = f"[{r['screen']}] " if r["screen"] != r["verdict"] else ""
         print(f"  {r['terminalId'][:8]}  {r['tab']:<14.14}  {r['account']:<13.13}  {r['name'][:60]}")
-        print(f"            - {screen_v}{'; '.join(r['reasons'])[:200]}")
+        print(f"            - {screen_v}{cfs.fit_reasons(r['reasons'], 200 - len(screen_v))}")
 
 
 def offset_of(path):
@@ -868,7 +884,7 @@ def selftest_prepare():
         server.shutdown()
         server.server_close()
     verdicts = [
-        ({"safe_to_restart": True}, "clear"),            # a build that predates the prepare
+        ({"safe_to_restart": True}, "clear"),            # no restart_prep field: every build from main until runner#2796
         ({"restart_prep": None}, "clear"),
         ({"restart_prep": {"state": "done"}}, "clear"),
         ({"restart_prep": {"state": "cancelled"}}, "clear"),
@@ -1058,7 +1074,106 @@ def cross_screen_selftest():
             or not held2 or held2[0] != "HELD":
         bad.append(f"cross-screen, untimed mark: close reads {verdict2} {why2}, finish_state {fs2}, nudge hold "
                    f"{held2}; want UNKNOWN (no usable time), unconfirmed/untimed_mark, HELD")
-    return bad, 4
+    # A reply that says work remains contradicts a finish whatever time the finish carries, so neither untimed
+    # shape above may sit between the screens when the message is that reply: finish_state returns
+    # contradicted/phrase_veto, the close screen reads CONTRADICTED (the owner /next-move takes), and this screen
+    # nudges it with no hold. Before the change the close screen read ACTIVE and this one held it.
+    tx3 = dict(tx, final_text="The deploy is still running; I'll check it in an hour.")
+    stubs3 = dict(stubs, transcript_facts=lambda row: dict(tx3))
+    for label, regx in (("coord-only finish", {"claudeSessionId": "s1"}),
+                        ("untimed runner mark", {"claudeSessionId": "s1", "finished": True, "finishedAt": None})):
+        saved = {k: getattr(cfs, k) for k in stubs3}
+        try:
+            for k, v in stubs3.items():
+                setattr(cfs, k, v)
+            verdict3, why3 = cfs.classify({"id": "t1", "isAlive": True, "pid": 10}, regx, {10: (1, ["bash"])}, 15, "",
+                                          ready)
+        finally:
+            for k, v in saved.items():
+                setattr(cfs, k, v)
+        facts3 = row_facts(regx, ready)
+        fs3 = cfs.finish_state(facts3, facts3, tx3, now, cfs.finish_hits(facts3, facts3, tx3, now))
+        judged3, reasons3 = judge(verdict3, why3, facts3, tx3, now, None)
+        if (verdict3 != "CONTRADICTED" or verdict3 in cfs.CLOSABLE or "says work remains" not in "; ".join(why3)
+                or fs3 is None or (fs3.state, fs3.rule) != ("contradicted", "phrase_veto")
+                or judged3 != "STOPPED" or status_hold(facts3, tx3, now, BACKSTOP_H) is not None):
+            bad.append(f"cross-screen, {label} beside a reply that says work remains: close reads {verdict3} {why3}, "
+                       f"finish_state {fs3}, nudge {judged3} {reasons3}; want CONTRADICTED, contradicted/phrase_veto, "
+                       "STOPPED with no hold")
+    return bad, 6
+
+
+def stop_hook_selftest():
+    """Plan 2026-11-20-triage-sessions-stop-hook-continuation-reads-as-a-revival
+    Phase 1: a session coord finished at 30 s whose only later record is its
+    finishing turn's meta `Stop hook feedback:` continuation (close-screen cell
+    1, cfs.stop_hook_transcript) is never STOPPED. (a) end to end: the close
+    screen's own verdict through judge reads FINISHED (a linked worktree) or
+    CUSTODY (no repository), which judge passes through. (b) a stale ACTIVE
+    close verdict for the same facts is HELD, `no prompt since`. A genuine
+    wake after the continuation (cell 3) still reads STOPPED. Every runner read
+    but the transcript is stubbed. Returns (failures, checks, judge-hold pins)."""
+    import tempfile
+    bad, checks, pins = [], 0, 0
+    t0 = cfs.T0_CELLS
+
+    def rec(kind, sec, content, **kw):
+        stamp = dt.datetime.fromtimestamp((t0 + sec * 1000) / 1000, dt.timezone.utc).isoformat()
+        msg = {"role": kind, "content": content}
+        if "stop" in kw:
+            msg["stop_reason"] = kw.pop("stop")
+        return dict({"type": kind, "timestamp": stamp, "message": msg}, **kw)
+
+    def said(sec, stop="end_turn"):
+        return rec("assistant", sec, [{"type": "text", "text": "ok"}], stop=stop)
+    tool = [{"type": "tool_use", "id": "u1", "name": "Bash", "input": {"command": "ls"}}]
+    result = [{"type": "tool_result", "tool_use_id": "u1", "content": "x"}]
+    wake = "<task-notification><task-id>b1</task-id> background build finished"
+    reg = {"claudeSessionId": "s1"}
+    ready = {"s1": {"sessionStatus": "finished", "sessionStatusSince": t0 + 30 * 1000}}
+    facts = row_facts(reg, ready)
+    now = time.time() * 1000
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "projects", "x"))
+        for cell, cwd, want_close, want_nudge in ((1, cfs.LINKED_CWD, "FINISHED", "FINISHED"),
+                                                 (1, "/w/no-repo", "CUSTODY", "CUSTODY"),
+                                                 (3, cfs.LINKED_CWD, "REVIVED", "STOPPED")):
+            recs = [dict(r, cwd=cwd) if r.get("type") == "user" else r
+                    for r in cfs.stop_hook_transcript(rec, said, tool, result, wake, cell)]
+            with open(os.path.join(d, "projects", "x", "s.jsonl"), "w", encoding="utf-8") as fh:
+                fh.write("".join(json.dumps(r) + "\n" for r in recs))
+            tx = cfs.transcript_facts({"configDir": d, "claudeSessionId": "s"})
+            stubs = {"proc_facts": lambda table, pid, windows=None: ([11], [], []),
+                     "live_session_ids": lambda claudes: {"s1"}, "raw_tail": lambda tid, chars=30000: "screen",
+                     "running_turn": lambda text: False, "prompt_state": lambda raw, *, cols: ("empty", ""),
+                     "wrap_cols": lambda term, windows=None: None, "transcript_facts": lambda row, tx=tx: dict(tx),
+                     "git_rev_parse_dirs": cfs.fake_git_dirs}
+            saved = {k: getattr(cfs, k) for k in stubs}
+            try:
+                for k, v in stubs.items():
+                    setattr(cfs, k, v)
+                verdict, why = cfs.classify({"id": "t1", "isAlive": True, "pid": 10}, reg, {10: (1, ["bash"])}, 15,
+                                            "", ready)
+            finally:
+                for k, v in saved.items():
+                    setattr(cfs, k, v)
+            judged, reasons = judge(verdict, why, facts, tx, now, None)
+            checks += 1
+            if (verdict, judged) != (want_close, want_nudge):
+                bad.append(f"stop-hook cell {cell} ({cwd}): close reads {verdict} {why}, nudge {judged} {reasons}; "
+                           f"want {want_close}, then {want_nudge}")
+            if cell == 1:
+                # (b) a close verdict read before the finish (ACTIVE) is held by the finish rule. It pins judge's
+                # existing hold, not the reader, so its facts are the case 1 facts as the reader should state
+                # them (the newest turn opener is the prompt), and it passes before the reader fix and after it.
+                tx_b = dict(tx, last_turn_open=tx["last_prompt"], last_turn_open_text=tx["last_prompt_text"],
+                            last_turn_open_class="prompt")
+                judged_b, reasons_b = judge("ACTIVE", [], facts, tx_b, now, None)
+                pins += 1
+                if judged_b != "HELD" or "no prompt since" not in "; ".join(reasons_b):
+                    bad.append(f"stop-hook cell 1 ({cwd}) from a stale ACTIVE verdict: nudge {judged_b} "
+                               f"{reasons_b}; want HELD, no prompt since")
+    return bad, checks, pins
 
 
 def trusted_finish_selftest():
@@ -1098,6 +1213,26 @@ def trusted_finish_selftest():
             or cfs.finish_since({"sessionStatusSince": ahead}, True) is not None):
         bad.append("finish_since must judge coord's stamp against the caller's now_ms")
     return bad, 7
+
+
+def report_fit_selftest():
+    """print_report fits a row's reasons whole, the screen prefix counted in the width. Returns (bad, checks)."""
+    import contextlib
+    import io
+    bad = []
+    reasons = ["marked finished, but 1 tool shell(s) running under claude (Bash/Monitor/background task)",
+               "last assistant turn has a tool call with no result", "8 stray wait loop(s) " + "x" * 60,
+               "last turn activity 1m ago (< 15m idle floor)"]
+    row = {"terminalId": "t0000001", "tab": "t", "account": "a", "name": "n", "verdict": "BUSY",
+           "screen": "FOOTER-FINISHED", "reasons": reasons}
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        print_report([row], [])
+    line = next((l for l in out.getvalue().splitlines() if l.startswith("            - ")), "")
+    if len(line) - len("            - ") > 200 or not line.endswith(" (+2 more)") or \
+            "[FOOTER-FINISHED] marked finished, but 1 tool shell" not in line:
+        bad.append(f"nudge print_report did not fit the reasons whole: {line!r}")
+    return bad, 1
 
 
 def menu_limit_selftest():
@@ -1410,12 +1545,15 @@ def selftest():
             bad.append(f"is_work_tool({block['name']} {block['input']}) != {want}")
     # A finished signal with a finish time beside a "work remains" message is
     # contradicted, and nudged so /next-move reconciles it (Phase 6; it was
-    # CONTRADICTED, for the operator); a coord finish with no time to weigh it against is only HELD.
+    # CONTRADICTED, for the operator); so is a coord finish with no time to weigh it against, because a reply
+    # that says work remains needs no finish time to contradict the finish (the time only dates a revival).
     still = dict(work, final_text="The deploy is still running; I'll check it in an hour.")
     for facts, t, want, frag in [
         ({"finished": True, "finishedAt": now - 42 * h}, dict(still, last_prompt=now - 43 * h, last_asst=now - 43 * h),
          "STOPPED", ("contradicts", "runner finished marker (", "the final message says work remains")),
-        ({"sessionStatus": "finished"}, still, "HELD", "no finish time"),
+        ({"sessionStatus": "finished"}, still, "STOPPED",
+         ("contradicts", "no finish time", "the final message says work remains")),
+        # ...while a coord finish with no time beside a plain landed message stays a hold: nothing contradicts it
         ({"sessionStatus": "finished"}, dict(work, final_text="PR #3 landed. SAFE TO CLOSE."), "HELD", "no finish time"),
         ({"finished": True, "finishedAt": now - 1800000}, work, "HELD", "runner finished marker ("),
     ]:
@@ -1448,11 +1586,11 @@ def selftest():
         # coord's finish beside a "work remains" message is contradicted: nudged, both signals named
         ("ACTIVE", dict(cf, sessionStatusSince=sn - 1800000), ss, "STOPPED",
          ("contradicts", "coord session_status=finished (", "work remains")),
-        ("ACTIVE", cf, ss, "HELD", no_time),
+        ("ACTIVE", cf, ss, "STOPPED", ("contradicts", no_time, "work remains")),  # no time to date it: still contradicted
         ("REVIVED", cf, sw, "HELD", no_time),
         ("REVIVED", dict(cf, sessionStatusSince=None), sw, "HELD", no_time),
         ("REVIVED", dict(cf, sessionStatusSince=str(sn - 2 * h)), sw, "HELD", no_time),
-        ("REVIVED", dict(cf, sessionStatusSince=float(sn - 2 * h)), ss, "HELD", no_time),
+        ("REVIVED", dict(cf, sessionStatusSince=float(sn - 2 * h)), ss, "STOPPED", ("contradicts", no_time, "work remains")),
         ("REVIVED", dict(cf, sessionStatusSince=True), sw, "HELD", no_time),
         ("REVIVED", dict(cf, sessionStatusSince=0), sw, "HELD", no_time),
         ("REVIVED", dict(cf, sessionStatusSince=-1), sw, "HELD", no_time),
@@ -1460,6 +1598,14 @@ def selftest():
         ("REVIVED", dict(cf, sessionStatusSince=sn + 10 * 60000), sw, "HELD", no_time),  # in the future
         # a stamp ahead of this clock is no usable time for either screen (the close screen's guard)
         ("REVIVED", dict(cf, sessionStatusSince=sn + 2 * 60000), sw, "HELD", no_time),
+        # ...and beside a message that says work remains each of those unusable stamps is contradicted, not held
+    ] + [("REVIVED", dict(cf, sessionStatusSince=stamp), ss, "STOPPED", ("contradicts", no_time, "work remains"))
+         for stamp in (None, str(sn - 2 * h), True, 0, -1, 1_000_000_000, sn + 10 * 60000, sn + 2 * 60000)] + [
+        # ...but a TIMED runner mark that nothing reopened keeps its marker-dated contradiction, not the no-time one:
+        # the undated arm falls through to the dated test, so the reason names the mark and never a missing finish
+        # time. This pin fails if the undated verdict is returned ahead of that test.
+        ("ACTIVE", dict(cf, finished=True, finishedAt=sn - 1800000), ss, "STOPPED",
+         ("contradicts", "runner finished marker (", "the final message says work remains", "!no finish time")),
         # the runner marker and coord's time disagree: coord's usable stamp decides, either way round
         ("REVIVED", dict(cf, finished=True, finishedAt=sn - 2 * h, sessionStatusSince=sn - 1800000), sw,
          "HELD", by_time),  # a re-finish after the revival
@@ -1997,6 +2143,11 @@ def selftest():
         got = screen(15, None, 48, False, use_coord=False, use_gh=False)[0][0]
         if got.get("progress_since_nudge") is not True:
             bad.append(f"screen() dropped progress_since_nudge: {got.get('progress_since_nudge')!r}")
+        # ...and names the /next-move it measured, so coord can tell a nudge that
+        # never landed from the earlier one whose effect this row shows.
+        if got.get("nudge_measured_at") != int(real_now - 3600000):
+            bad.append(f"screen() nudge_measured_at = {got.get('nudge_measured_at')!r}, "
+                       f"want the measured prompt's time {int(real_now - 3600000)}")
         # A session the nudge put to work is measured too, whatever it reads now,
         # and an unreadable transcript there is no measurement, not a failed pass.
         for v in ("BUSY", "FINISHED", "EXITED-FINISHED"):
@@ -2011,6 +2162,8 @@ def selftest():
         got = screen(15, None, 48, False, use_coord=False, use_gh=False)[0][0]
         if got.get("progress_since_nudge") is not None:
             bad.append(f"screen() on an unreadable transcript: {got.get('progress_since_nudge')!r}")
+        if got.get("nudge_measured_at") is not None:
+            bad.append(f"screen() measured no nudge but named one: {got.get('nudge_measured_at')!r}")
     finally:
         for k, v in saved.items():
             setattr(cfs, k, v)
@@ -2021,8 +2174,12 @@ def selftest():
     bad += trusted_bad
     cross_bad, cross_checks = cross_screen_selftest()
     bad += cross_bad
+    stop_hook_bad, stop_hook_checks, stop_hook_pins = stop_hook_selftest()
+    bad += stop_hook_bad
     menu_bad, menu_checks = menu_limit_selftest()
     bad += menu_bad
+    fit_bad, fit_checks = report_fit_selftest()
+    bad += fit_bad
     for b in bad:
         print("FAIL: " + b)
     print(f"selftest: {len(cases)} reset cases, 7 prompt cases, {len(judge_cases)} judge cases, "
@@ -2030,8 +2187,8 @@ def selftest():
           f"{len(phase6_cases)} finish-rule cases, "
           f"{len(complete_cases)} completion cases, {len(transcript_cases) + 11} transcript cases, "
           f"2 send cases, {roster_checks} verdict-roster checks, {trusted_checks} trusted-finish checks, "
-          f"{cross_checks} cross-screen checks, "
-          f"{menu_checks} open-menu checks, "
+          f"{cross_checks} cross-screen checks, {stop_hook_checks} stop-hook checks + {stop_hook_pins} judge-hold pins, "
+          f"{menu_checks} open-menu checks, {fit_checks} report-fit checks, "
           f"{len(bad)} failure(s)")
     return 1 if bad else 0
 

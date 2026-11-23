@@ -4,7 +4,9 @@
 
 use super::*;
 use crate::journey::read::{OlderEdgeGroup, TimedEdge};
-use crate::journey::test_fixtures::{edge, frontier, key, timeline, writing};
+use crate::journey::test_fixtures::{
+    assert_same_conclusions, edge, frontier, key, status, timeline, writing,
+};
 use chrono::TimeZone;
 use qontinui_types::journey::{FrontierEntry, JourneyEdgeObservation, LedgerState};
 use serde_json::json;
@@ -20,10 +22,6 @@ fn ctx(query: &'static str) -> AnswerCtx<'static> {
         gaps: ReadGaps::default(),
         evaluated_at: at(),
     }
-}
-
-fn status(v: &Value) -> &str {
-    v["status"].as_str().expect("status is always present")
 }
 
 fn code(v: &Value) -> &str {
@@ -956,41 +954,6 @@ fn both_reads(
     (every_row, read)
 }
 
-/// What an answer concludes: everything but the size of the counts.
-fn verdict(v: &Value) -> Value {
-    let result = if status(v) == "measured" {
-        &v["value"]
-    } else {
-        &v["provenance"]["source"]["result"]
-    };
-    let keys = |field: &str| -> Vec<Value> {
-        result[field]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .map(|n| json!([n["nodeKey"], n["backOnly"]]))
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    let dimensions: Vec<Value> = v["provenance"]["coverage"]["unmeasured"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|d| json!([d["dimension"], d["code"]]))
-        .collect();
-    json!({
-        "status": v["status"],
-        "code": v["unknown"]["code"],
-        "deadEnds": keys("deadEnds"),
-        "unexplored": keys("unexplored"),
-        "settled": keys("nodes"),
-        "unsettled": keys("unsettled"),
-        "dimensions": dimensions,
-        "unknownDestinations": result["unknownDestinationArrivals"].as_u64().unwrap_or(0) > 0,
-    })
-}
-
 /// The `nodeKey`s an answer lists under `field`, compared whole: a substring
 /// test would read `"end#s"` as listing `"d#s"`.
 fn listed(v: &Value, field: &str) -> Vec<String> {
@@ -1022,54 +985,30 @@ fn trusted_templates_with_known_destinations() -> Vec<(JourneyEdgeObservation, b
         .collect()
 }
 
-/// Every graph answer agrees between the two reads.
-fn assert_same_conclusions(templates: Vec<(JourneyEdgeObservation, bool)>) {
+/// Every graph answer agrees between the two reads of `templates`
+/// ([`both_reads`]).
+fn templates_conclude_the_same(templates: Vec<(JourneyEdgeObservation, bool)>) {
     let (every_row, read) = both_reads(templates, 5);
     let filter = since_cutoff();
-    let whole = build_graph(&every_row, &[], &writing(), &filter);
-    let grouped = read.build_graph(&writing(), &filter);
-    let c = ctx("q");
-    let pairs = [
-        (
-            "graph",
-            answer_graph(&c, &whole),
-            answer_graph(&c, &grouped),
-        ),
-        (
-            "dead-ends",
-            answer_dead_ends(&c, &whole),
-            answer_dead_ends(&c, &grouped),
-        ),
-        (
-            "prior-knowledge",
-            answer_prior_knowledge(&c, &whole),
-            answer_prior_knowledge(&c, &grouped),
-        ),
-        (
-            "reachable",
-            answer_reachable(&c, &whole, &key("a")),
-            answer_reachable(&c, &grouped, &key("a")),
-        ),
-        (
-            "steps",
-            answer_steps(&c, &whole, &key("b"), &key("c")),
-            answer_steps(&c, &grouped, &key("b"), &key("c")),
-        ),
-    ];
-    for (name, a, b) in pairs {
-        assert_eq!(verdict(&a), verdict(&b), "{name}\nrows {a:#}\ngroups {b:#}");
-    }
+    assert_same_conclusions(
+        "fixture ledger",
+        &build_graph(&every_row, &[], &writing(), &filter),
+        &read.build_graph(&writing(), &filter),
+        &key("a"),
+        &key("b"),
+        &key("c"),
+    );
 }
 
 /// The whole point of grouping: summarized rows change no conclusion. Only the
 /// size of the counts differs, so a dropped or misjudged group shows here.
 #[test]
 fn older_groups_conclude_exactly_what_their_rows_would() {
-    assert_same_conclusions(trusted_templates());
-    assert_same_conclusions(trusted_templates_with_known_destinations());
+    templates_conclude_the_same(trusted_templates());
+    templates_conclude_the_same(trusted_templates_with_known_destinations());
     let mut with_untrusted = trusted_templates();
     with_untrusted.extend(untrusted_templates());
-    assert_same_conclusions(with_untrusted);
+    templates_conclude_the_same(with_untrusted);
 }
 
 /// The contract's core scenario over a grouped read, with nothing else

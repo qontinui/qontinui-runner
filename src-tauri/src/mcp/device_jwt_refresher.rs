@@ -4733,11 +4733,14 @@ pub struct CoordCredentialStatus {
     pub pinned_tenant: bool,
     /// The state-specific WHY the sentence ([`Self::composed_reason`] or the
     /// posture's fixed [`CoordCredentialPosture::message`]) cannot carry, or
-    /// `None`. Set in two shapes: on `Dark(NoDefaultBinding)`, the heal's
+    /// `None`. Set in four shapes: on `Dark(NoDefaultBinding)`, the heal's
     /// refusal reason, which names the guard that refused — so a state that
-    /// outlives one tick says which guard, as the plan asks; and on an
+    /// outlives one tick says which guard, as the plan asks; on an
     /// ANSWERING posture, the note that no default binding exists while the
-    /// legacy slot still serves unpinned sessions (review finding 3).
+    /// legacy slot still serves unpinned sessions (review finding 3); and,
+    /// when no arm set one, [`recovery_detail`]'s text — the missing
+    /// recoveries on `unrefreshable`, and on an answering posture the warning
+    /// that no automatic recovery is left.
     pub detail: Option<String>,
 }
 
@@ -5147,7 +5150,13 @@ pub(crate) fn derive_and_publish_posture(
     pins: PosturePinInputs,
     now: i64,
 ) -> Option<PostureTransition> {
-    derive_and_publish_posture_with(observations, pins, &default_binding_verdict(), now)
+    derive_and_publish_posture_core(
+        observations,
+        pins,
+        &default_binding_verdict(),
+        &recovery_inventory(),
+        now,
+    )
 }
 
 /// [`derive_and_publish_posture`] with the default-binding verdict supplied
@@ -5156,6 +5165,24 @@ pub(crate) fn derive_and_publish_posture_with(
     observations: &[SlotObservation],
     pins: PosturePinInputs,
     default_binding: &DefaultBindingVerdict,
+    now: i64,
+) -> Option<PostureTransition> {
+    derive_and_publish_posture_core(
+        observations,
+        pins,
+        default_binding,
+        &RecoveryInventory::UNKNOWN,
+        now,
+    )
+}
+
+/// [`derive_and_publish_posture_with`] with the [`RecoveryInventory`] supplied
+/// too: the inventory fills `detail` when no arm set one ([`recovery_detail`]).
+pub(crate) fn derive_and_publish_posture_core(
+    observations: &[SlotObservation],
+    pins: PosturePinInputs,
+    default_binding: &DefaultBindingVerdict,
+    inventory: &RecoveryInventory,
     now: i64,
 ) -> Option<PostureTransition> {
     /// One entry in the `worst` fold, carrying everything the publish needs.
@@ -5266,6 +5293,11 @@ pub(crate) fn derive_and_publish_posture_with(
             // cause.
             if c.detail.is_none() && c.posture.can_answer() {
                 c.detail = binding_note.clone();
+            }
+            // What recovery is missing (P2.1 on `unrefreshable`; P2.3 as a
+            // warning on an answering posture), when nothing above said more.
+            if c.detail.is_none() {
+                c.detail = recovery_detail(c.posture, inventory);
             }
             c
         });
@@ -5411,7 +5443,12 @@ fn derive_and_publish_legacy_posture(
     pins: PosturePinInputs,
     app: Option<&tauri::AppHandle>,
 ) {
-    let obs = legacy_slot_observation(auth_manager.probe_access_token());
+    let read = auth_manager.probe_access_token();
+    // A runner holding no credential at all (never paired, a guest tier) has
+    // nothing an outage can take away, so it is not warned about one.
+    let holds_credential = matches!(read, crate::secure_storage::StoredTokenRead::Present(_));
+    record_recovery_inventory(RecoveryInventory::read(auth_manager), holds_credential);
+    let obs = legacy_slot_observation(read);
     if let Some(transition) =
         derive_and_publish_posture(&[obs], pins, chrono::Utc::now().timestamp())
     {
@@ -5616,6 +5653,10 @@ pub(crate) async fn refresh_tenant_slots(
     if tenants.is_empty() {
         return outcomes;
     }
+    // Before either posture publish below reads it, so the boot publish
+    // already carries a missing-recovery warning (P2.3).
+    // Tenant slots exist, so this runner holds (or held) a credential.
+    record_recovery_inventory(RecoveryInventory::read(auth_manager), true);
     let mut health: Vec<TenantSlotHealthRow> = Vec::with_capacity(tenants.len());
     // Phase 1 of the coord-credential-posture plan: what each slot HELD when
     // this pass looked at it — `(tenant, exp, present, unknown)`, pushed
@@ -6307,6 +6348,168 @@ pub(crate) fn unpaired_bail_progress(verdict: &DefaultBindingVerdict) -> PairPro
 static DEFAULT_BINDING_VERDICT: std::sync::Mutex<Option<DefaultBindingVerdict>> =
     std::sync::Mutex::new(None);
 
+// ============================================================================
+// Recovery inventory — which no-human recoveries this runner holds.
+// ============================================================================
+
+/// `/health` `coordCredential.detail` token: no Cognito session is stored, so
+/// the refresher cannot re-mint a device JWT through `pair-cli`.
+pub(crate) const MISSING_COGNITO_SESSION: &str = "no_cognito_session";
+/// `/health` `coordCredential.detail` token: no device machine key (`dmk_`) is
+/// stored, so the cold-start exchange cannot run.
+pub(crate) const MISSING_DEVICE_MACHINE_KEY: &str = "no_device_machine_key";
+/// Which automatic (no-human) recoveries this runner holds, read from secure
+/// storage at the start of each slot pass. `None` on a field is UNKNOWN: the
+/// store could not be read. An UNKNOWN never produces a token.
+///
+/// Whether a browser can be opened is deliberately NOT probed here: a launcher
+/// on PATH does not prove a browser will open (on a display with no registered
+/// browser it fails anyway), so the signal is the launch result itself, which
+/// the pending sign-in records (`cognito::pending_sign_in`).
+///
+/// Plan 2026-11-15-headless-runner-recovers-its-coord-credential-without-a-human,
+/// P2.1 (the tokens on `unrefreshable`) and P2.3 (the warning while the
+/// credential still answers).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct RecoveryInventory {
+    pub cognito_session: Option<bool>,
+    pub device_machine_key: Option<bool>,
+}
+
+impl RecoveryInventory {
+    /// Nothing known: what a process that has not run a slot pass reports.
+    pub(crate) const UNKNOWN: RecoveryInventory = RecoveryInventory {
+        cognito_session: None,
+        device_machine_key: None,
+    };
+
+    /// Read the inventory from `auth_manager`'s store.
+    pub(crate) fn read(auth_manager: &crate::auth::AuthManager) -> Self {
+        // One store load: an unreadable store is UNKNOWN for both, never absent.
+        match auth_manager.recovery_holdings() {
+            Ok((cognito_session, device_machine_key)) => Self {
+                cognito_session: Some(cognito_session),
+                device_machine_key: Some(device_machine_key),
+            },
+            Err(_) => Self::UNKNOWN,
+        }
+    }
+
+    /// The tokens naming each recovery this runner is KNOWN to lack, in a
+    /// fixed order. Empty when nothing is known to be missing.
+    pub(crate) fn missing(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.cognito_session == Some(false) {
+            out.push(MISSING_COGNITO_SESSION);
+        }
+        if self.device_machine_key == Some(false) {
+            out.push(MISSING_DEVICE_MACHINE_KEY);
+        }
+        out
+    }
+
+    /// `true` when BOTH automatic recoveries are known to be absent: once the
+    /// device JWT expires, only a human sign-in brings the credential back.
+    pub(crate) fn needs_a_human_after_expiry(&self) -> bool {
+        self.cognito_session == Some(false) && self.device_machine_key == Some(false)
+    }
+}
+
+/// The `detail` for a posture, from the recovery inventory, when no arm set
+/// one. On `unrefreshable` it names every recovery known to be missing (P2.1);
+/// on an ANSWERING posture it warns only when both automatic recoveries are
+/// absent, so the operator hears it before the outage rather than during it
+/// (P2.3). Every other posture, and an inventory with nothing known missing,
+/// gets `None`.
+pub(crate) fn recovery_detail(
+    posture: CoordCredentialPosture,
+    inventory: &RecoveryInventory,
+) -> Option<String> {
+    let missing = inventory.missing();
+    if missing.is_empty() {
+        return None;
+    }
+    let tokens = missing.join(", ");
+    if posture == CoordCredentialPosture::Unrefreshable {
+        return Some(format!("missing recoveries: {tokens}"));
+    }
+    if posture.can_answer() && inventory.needs_a_human_after_expiry() {
+        return Some(format!(
+            "missing recoveries: {tokens} — the next outage longer than the device-JWT \
+             lifetime (~4 h) needs a human sign-in"
+        ));
+    }
+    None
+}
+
+/// The recorded inventory. Process-wide in a build; per THREAD under test, so
+/// one test's pass cannot colour another test's posture. The cost of that
+/// split: a `multi_thread` tokio test that records on one worker and publishes
+/// from another reads UNKNOWN where production would read the recorded value,
+/// so a test of the recorded path must stay on one thread (`#[tokio::test]`'s
+/// default current-thread runtime) or call `derive_and_publish_posture_core`.
+#[cfg(not(test))]
+static RECOVERY_INVENTORY: std::sync::Mutex<Option<(RecoveryInventory, bool)>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+thread_local! {
+    static RECOVERY_INVENTORY: std::cell::Cell<Option<(RecoveryInventory, bool)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Swap the recorded `(inventory, holds_credential)`, returning the previous pair.
+fn replace_recovery_inventory(
+    inventory: (RecoveryInventory, bool),
+) -> Option<(RecoveryInventory, bool)> {
+    #[cfg(not(test))]
+    {
+        RECOVERY_INVENTORY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(inventory)
+    }
+    #[cfg(test)]
+    {
+        RECOVERY_INVENTORY.with(|cell| cell.replace(Some(inventory)))
+    }
+}
+
+/// The inventory the latest slot pass recorded, or
+/// [`RecoveryInventory::UNKNOWN`] before the first.
+pub(crate) fn recovery_inventory() -> RecoveryInventory {
+    #[cfg(not(test))]
+    let recorded = *RECOVERY_INVENTORY.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(test)]
+    let recorded = RECOVERY_INVENTORY.with(std::cell::Cell::get);
+    recorded.map_or(RecoveryInventory::UNKNOWN, |(inventory, _)| inventory)
+}
+
+/// Record `inventory`, logging a warning when a runner that holds a credential
+/// first shows, or newly shows, that no automatic recovery is left (P2.3: a
+/// boot-time warning, not only an outage-time error). The dedupe is on the
+/// PAIR, so a runner first seen unpaired that then pairs with no recovery is
+/// still warned. Returns whether it warned.
+pub(crate) fn record_recovery_inventory(
+    inventory: RecoveryInventory,
+    holds_credential: bool,
+) -> bool {
+    let previous = replace_recovery_inventory((inventory, holds_credential));
+    if previous == Some((inventory, holds_credential)) {
+        return false;
+    }
+    let warn_now = holds_credential && inventory.needs_a_human_after_expiry();
+    if warn_now {
+        warn!(
+            "device_jwt_refresher: this runner holds neither a Cognito session nor a device \
+             machine key ({}); the next outage longer than the device-JWT lifetime (~4 h) \
+             needs a human sign-in",
+            inventory.missing().join(", ")
+        );
+    }
+    warn_now
+}
+
 /// The most recent MEASURED verdict, or `Unknown` before any tick measured one.
 /// Read by [`derive_and_publish_posture`].
 pub(crate) fn default_binding_verdict() -> DefaultBindingVerdict {
@@ -6351,6 +6554,9 @@ pub(crate) fn publish_default_binding_verdict(verdict: DefaultBindingVerdict) {
 async fn heal_vanished_binding_store() {
     let verdict = match spawn_blocking_tracked(|| {
         let heal = qontinui_runner_lib::pair::heal_vanished_paired_user();
+        if heal.wrote() {
+            crate::commands::web_integration::notify_tenant_bindings_changed();
+        }
         let census = matches!(heal, qontinui_runner_lib::pair::PairedUserHeal::Refused(_))
             .then(qontinui_runner_lib::pair::held_credential_census);
         classify_default_binding(&heal, census.as_ref())
@@ -15485,5 +15691,119 @@ mod tenant_seed_arm_tests {
         assert!(r.get("lapses").is_none());
         let r = binding_gap_lapses_report(Some(&other), None);
         assert!(r["unknown"].is_string(), "signed-out is withheld: {r}");
+    }
+}
+
+#[cfg(test)]
+mod recovery_inventory_tests {
+    //! Plan 2026-11-15-headless-runner-recovers-its-coord-credential-without-a-human,
+    //! P2.1 (`detail` names the missing recoveries on `unrefreshable`) and P2.3
+    //! (a warning while the credential still answers).
+    use super::*;
+
+    const NONE_HELD: RecoveryInventory = RecoveryInventory {
+        cognito_session: Some(false),
+        device_machine_key: Some(false),
+    };
+
+    fn unrefreshable_slot(tenant: &str) -> SlotObservation {
+        SlotObservation {
+            tenant_id: Some(tenant.to_string()),
+            exp: None,
+            present: false,
+            unknown: false,
+            outcome: Some(TenantSlotOutcome::Cleared {
+                cause: SlotClearCause::DecodedExpiry,
+                rederived: false,
+            }),
+            recovery: None,
+        }
+    }
+
+    #[test]
+    fn missing_names_only_what_is_known_absent() {
+        assert!(RecoveryInventory::UNKNOWN.missing().is_empty());
+        assert_eq!(
+            NONE_HELD.missing(),
+            vec![MISSING_COGNITO_SESSION, MISSING_DEVICE_MACHINE_KEY]
+        );
+        let key_only = RecoveryInventory {
+            cognito_session: Some(false),
+            device_machine_key: Some(true),
+        };
+        assert_eq!(key_only.missing(), vec![MISSING_COGNITO_SESSION]);
+        assert!(!key_only.needs_a_human_after_expiry());
+        assert!(NONE_HELD.needs_a_human_after_expiry());
+    }
+
+    #[test]
+    fn unrefreshable_detail_names_every_missing_recovery() {
+        let d =
+            recovery_detail(CoordCredentialPosture::Unrefreshable, &NONE_HELD).expect("a detail");
+        assert!(d.contains(MISSING_COGNITO_SESSION), "{d}");
+        assert!(d.contains(MISSING_DEVICE_MACHINE_KEY), "{d}");
+        assert_eq!(
+            recovery_detail(
+                CoordCredentialPosture::Unrefreshable,
+                &RecoveryInventory::UNKNOWN
+            ),
+            None,
+            "an UNKNOWN inventory names nothing"
+        );
+    }
+
+    #[test]
+    fn an_answering_posture_warns_only_when_no_automatic_recovery_is_left() {
+        let warn = recovery_detail(CoordCredentialPosture::Live, &NONE_HELD).expect("a warning");
+        assert!(warn.contains("needs a human sign-in"), "{warn}");
+        let key_held = RecoveryInventory {
+            device_machine_key: Some(true),
+            ..NONE_HELD
+        };
+        assert_eq!(
+            recovery_detail(CoordCredentialPosture::Live, &key_held),
+            None
+        );
+        // A non-answering posture other than `unrefreshable` keeps its own cause.
+        assert_eq!(
+            recovery_detail(CoordCredentialPosture::Absent, &NONE_HELD),
+            None
+        );
+    }
+
+    #[test]
+    fn a_runner_that_pairs_with_no_recovery_is_warned_even_if_first_seen_unpaired() {
+        // Thread-local under test, so this sequence is this test's alone.
+        assert!(
+            !record_recovery_inventory(NONE_HELD, false),
+            "unpaired: no warning"
+        );
+        assert!(record_recovery_inventory(NONE_HELD, true), "paired: warned");
+        assert!(!record_recovery_inventory(NONE_HELD, true), "warned once");
+        assert_eq!(recovery_inventory(), NONE_HELD);
+    }
+
+    #[test]
+    fn the_published_unrefreshable_posture_carries_the_missing_recoveries() {
+        let _serialised = posture_test_lock();
+        reset_coord_credential_posture_for_test();
+        let now = chrono::Utc::now().timestamp();
+        derive_and_publish_posture_core(
+            &[unrefreshable_slot("c231d9da-0ca8-4fe4-bd81-0e3d6c20339a")],
+            PosturePinInputs::UNPINNED,
+            &DefaultBindingVerdict::NoCredential,
+            &NONE_HELD,
+            now,
+        );
+        let status = coord_credential_posture().expect("a published posture");
+        assert_eq!(status.posture, CoordCredentialPosture::Unrefreshable);
+        let json = status.to_json();
+        let detail = json["detail"].as_str().expect("detail is no longer null");
+        assert!(detail.contains(MISSING_DEVICE_MACHINE_KEY), "{json}");
+        assert!(json["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(MISSING_COGNITO_SESSION));
+        reset_coord_credential_posture_for_test();
     }
 }

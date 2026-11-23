@@ -51,6 +51,12 @@
 //! written or read, and the spawn falls back to the inline briefing; there is
 //! deliberately no unscoped fallback name.
 //!
+//! WHICH tenant's file a spawn reads is the SESSION's tenant, resolved by the
+//! spawning seam and passed in — never the device default's by implication.
+//! The route writes the file of the tenant whose credential actually fetched
+//! the body, which is the session's own (plan
+//! `2026-11-13-runner-policy-injection-uses-the-device-default-tenant-not-the-sessions`).
+//!
 //! ## The delivered-SHA marker (the honesty half)
 //!
 //! A spawn that used the file carrier exports [`POLICY_DELIVERED_SHA_ENV`] on
@@ -462,15 +468,25 @@ pub fn policy_delivery_env(delivery: Option<&PolicyDelivery>) -> [(String, Strin
     ]
 }
 
-/// Resolve the carrier for a spawn from the live state: the tenant's cached
-/// body (via [`crate::mcp::policy_context::spawn_policy_body`], which applies
-/// the injection flag and the tenant scoping) and the real
-/// [`claude_hook::session_restore_dir`].
+/// Resolve the carrier for a spawn from the live state: `policy_tenant`'s
+/// cached body (via [`crate::mcp::policy_tenant::spawn_policy_body`], which
+/// applies the injection flag) and the real [`claude_hook::session_restore_dir`].
+///
+/// `policy_tenant` is the tenant the SPAWNING SEAM resolved for this session
+/// (plan `2026-11-13-runner-policy-injection-uses-the-device-default-tenant-not-the-sessions`
+/// Design §6) — never the device default by implication: a direct-exec seam
+/// passes [`crate::mcp::policy_tenant::new_session_policy_tenant`]'s answer, a
+/// shell pane [`crate::mcp::policy_tenant::resolve_shell_pane_policy_tenant`]'s.
+/// `None` composes no body, so the spawn keeps the inline briefing and the
+/// SessionStart route delivers the full body or the UNKNOWN notice.
 ///
 /// Local file I/O only — never a coord call. `None` means "no system-prompt
 /// flag at all" (no briefing AND no body).
-pub fn resolve_system_prompt_carrier(briefing: Option<String>) -> Option<SystemPromptCarrier> {
-    let body = crate::mcp::policy_context::spawn_policy_body();
+pub fn resolve_system_prompt_carrier(
+    briefing: Option<String>,
+    policy_tenant: Option<uuid::Uuid>,
+) -> Option<SystemPromptCarrier> {
+    let body = crate::mcp::policy_tenant::spawn_policy_body(policy_tenant);
     resolve_system_prompt_carrier_in(
         &claude_hook::session_restore_dir(),
         briefing,
@@ -522,8 +538,19 @@ pub fn resolve_system_prompt_carrier_in(
 /// environment can never vouch for a delivery that did not happen.
 /// `QONTINUI_RUNNER_CONTEXT` is set by the caller as before — it is the
 /// wrapper's fall-back and `/whereami`'s source.
-pub fn shell_pane_prompt_env(briefing: &str) -> [(&'static str, Option<String>); 3] {
-    shell_pane_prompt_env_from(resolve_system_prompt_carrier(Some(briefing.to_string())))
+///
+/// `policy_tenant` is the pane session's tenant as
+/// [`crate::mcp::policy_tenant::resolve_shell_pane_policy_tenant`] resolved it
+/// from the nonce the identity seam just provisioned — see
+/// [`resolve_system_prompt_carrier`].
+pub fn shell_pane_prompt_env(
+    briefing: &str,
+    policy_tenant: Option<uuid::Uuid>,
+) -> [(&'static str, Option<String>); 3] {
+    shell_pane_prompt_env_from(resolve_system_prompt_carrier(
+        Some(briefing.to_string()),
+        policy_tenant,
+    ))
 }
 
 /// [`shell_pane_prompt_env`] over an already-resolved carrier (pure).
@@ -961,19 +988,15 @@ mod script_tests {
     /// whole process tree and returns an error.
     const SCRIPT_BUDGET: Duration = Duration::from_secs(30);
 
-    /// Serialises "write an executable, then spawn". `Command` forks, and a
-    /// forked child inherits every fd open at that moment — including another
-    /// thread's still-open write handle on the script IT is about to run,
-    /// which then fails to start with ETXTBSY. Cheap: these are sub-second
-    /// shell runs.
-    static EXE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Take [`EXE_LOCK`], surviving a poisoned mutex so one failing test
-    /// reports its own assertion instead of cascading into the rest.
-    // test-lock: standalone — module-private; its holders take no other test lock and never take `env_lock` or any other test lock
-    fn exe_guard() -> std::sync::MutexGuard<'static, ()> {
-        EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
+    // Serialises "write an executable, then spawn". `Command` forks, and a
+    // forked child inherits every fd open at that moment — including another
+    // thread's still-open write handle on the script IT is about to run,
+    // which then fails to start with ETXTBSY. Cheap: these are sub-second
+    // shell runs. It is the bash-shim harness's one lock
+    // (`shim_test_support::exe_guard`): these tests write and run
+    // identity-shim scripts too, and two locks would not serialize against
+    // each other.
+    use crate::install_effects_producer::intercept::shim_test_support::exe_guard;
 
     const BASH_INTEGRATION: &str = include_str!("../../resources/shell-integration.bash");
     const ZSH_INTEGRATION: &str = include_str!("../../resources/shell-integration.zsh");
@@ -1370,6 +1393,11 @@ mod script_tests {
         std::fs::create_dir_all(&shim_dir).unwrap();
         std::fs::create_dir_all(&real_dir).unwrap();
         let out = fake_claude(&real_dir);
+        // The freshly written fake `claude` must read as settled, or the shim
+        // waits out its settle check on every run.
+        crate::install_effects_producer::intercept::shim_test_support::install_settled_stat(
+            &real_dir,
+        );
         let rendered = IDENTITY_SHIM_BASH
             .replace("@@TOOL@@", "claude")
             .replace("@@SHIM_DIR@@", &shim_dir.to_string_lossy());

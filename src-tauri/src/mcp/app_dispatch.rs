@@ -148,8 +148,16 @@ pub enum DispatchError {
 /// the message, and the wrapper's object shape `{code, message, retryable}`
 /// gives its message, code and retry verdict. A top-level `code` (else
 /// `errorCode`) wins over the object's, and a top-level boolean `retryable`
-/// wins over the object's.
-fn app_answered_failure(url: &str, status: u16, json: &serde_json::Value) -> Option<DispatchError> {
+/// wins over the object's. A top-level code is read only as a non-blank
+/// STRING, per key ([`top_level_code`]): `{"code":"","errorCode":"X"}` reads
+/// `X`, a numeric top-level `code` is skipped, and a blank or non-string
+/// top-level code never shadows the object's own. (`from_wire` is broader
+/// inside an object `error`: it also reads a numeric code there.)
+pub(crate) fn app_answered_failure(
+    url: &str,
+    status: u16,
+    json: &serde_json::Value,
+) -> Option<DispatchError> {
     if json.get("success").and_then(|v| v.as_bool()) != Some(false) {
         return None;
     }
@@ -157,10 +165,7 @@ fn app_answered_failure(url: &str, status: u16, json: &serde_json::Value) -> Opt
         .get("error")
         .cloned()
         .and_then(WrapperFailure::from_wire);
-    let top_code = ["code", "errorCode"]
-        .into_iter()
-        .find_map(|k| json.get(k).and_then(|v| v.as_str()))
-        .map(String::from);
+    let top_code = top_level_code(json);
     let (error, code, retryable) = match failure {
         Some(failure) => (
             failure.message,
@@ -179,6 +184,22 @@ fn app_answered_failure(url: &str, status: u16, json: &serde_json::Value) -> Opt
             .and_then(serde_json::Value::as_bool)
             .or(retryable),
     })
+}
+
+/// A body's top-level machine-readable code: `code`, else `errorCode`, each
+/// read ONLY as a non-blank string. A blank string, a number (e.g. a proxy
+/// echoing its HTTP status) or any other value is skipped per key — never a
+/// code of `""`, and never a status mistaken for an app code. The one
+/// top-level reader [`app_answered_failure`] and the vision device arm share.
+pub(crate) fn top_level_code(json: &serde_json::Value) -> Option<String> {
+    ["code", "errorCode"]
+        .into_iter()
+        .find_map(|k| {
+            json.get(k)
+                .and_then(|v| v.as_str())
+                .filter(|c| !c.trim().is_empty())
+        })
+        .map(String::from)
 }
 
 impl DispatchError {
@@ -430,7 +451,7 @@ impl AppDispatcher {
         app_id: &str,
         app_url: &str,
         base_path: &str,
-        http_client: &reqwest::Client,
+        http_client: &crate::mcp::sdk_http::SdkHttpClient,
         http_method: Method,
         http_path: &str,
         payload: serde_json::Value,
@@ -450,7 +471,9 @@ impl AppDispatcher {
         // Refresh stale cache entries.
         if cached.1 >= RESPONSIVENESS_CACHE_MS {
             let health_url = format!("{}{}/health", app_url, base_path);
+            // Health is open on a phone: probe it unsigned (see `without_signer`).
             let responsive = match http_client
+                .without_signer()
                 .get(&health_url)
                 .timeout(Duration::from_secs(2))
                 .send()
@@ -684,7 +707,7 @@ pub(crate) mod test_support {
             app_url: url.to_string(),
             base_path: base_path.to_string(),
             app_info: info,
-            client: reqwest::Client::new(),
+            client: crate::mcp::sdk_http::SdkHttpClient::unsigned(reqwest::Client::new()),
             connected_at: 0,
             transport_kind: None,
             physical_device_id: None,
@@ -1178,6 +1201,44 @@ mod tests {
         // `code` wins when both are present.
         let both = answered(json!({"success": false, "error": "x", "code": "A", "errorCode": "B"}));
         assert_eq!(both.and_then(|(_, c)| c), Some("A".to_string()));
+    }
+
+    /// A blank code is no code, per key: a blank `code` falls through to
+    /// `errorCode`, and a blank top-level code does not shadow the object's.
+    #[test]
+    fn app_answered_failure_skips_a_blank_code_per_key() {
+        assert_eq!(
+            answered(json!({"success": false, "error": "x", "code": "", "errorCode": "X"}))
+                .and_then(|(_, c)| c),
+            Some("X".to_string())
+        );
+        assert_eq!(
+            answered(json!({"success": false, "code": "  ",
+                            "error": {"code": "INNER", "message": "m"}}))
+            .and_then(|(_, c)| c),
+            Some("INNER".to_string())
+        );
+        assert_eq!(
+            answered(json!({"success": false, "error": "x", "code": ""})).and_then(|(_, c)| c),
+            None
+        );
+    }
+
+    /// A top-level code is read only as a non-blank STRING: a numeric
+    /// `code` (a proxy echoing its status) is skipped per key, so a string
+    /// `errorCode` beside it is the code.
+    #[test]
+    fn app_answered_failure_skips_a_numeric_top_level_code() {
+        assert_eq!(
+            answered(json!({"success": false, "code": 0, "errorCode": "PAIRING_UNAVAILABLE"}))
+                .and_then(|(_, c)| c),
+            Some("PAIRING_UNAVAILABLE".to_string())
+        );
+        assert_eq!(
+            answered(json!({"success": false, "error": "bad gateway", "code": 502}))
+                .and_then(|(_, c)| c),
+            None
+        );
     }
 
     #[test]

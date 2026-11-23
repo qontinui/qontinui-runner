@@ -9,6 +9,7 @@
  * that file is testable.
  */
 
+import { readClipboard } from "@/lib/clipboard";
 import { describeThrown } from "@/lib/utils";
 
 /** Machine-readable failure code: the PTY behind this pane is gone. */
@@ -167,7 +168,7 @@ export function buildClipboardReadFailure(cause: unknown): Error & {
  * `read` is injectable for tests; production callers pass nothing.
  */
 export async function readClipboardForPaste(
-  read: () => Promise<string> = () => navigator.clipboard.readText(),
+  read: () => Promise<string> = readClipboard,
 ): Promise<string> {
   try {
     return await read();

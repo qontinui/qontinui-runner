@@ -36,9 +36,6 @@ pub struct PhysicalDeviceInfo {
     pub ui_bridge_version: Option<String>,
     /// Unix timestamp (ms) when the device was first seen.
     pub first_seen_at: i64,
-    /// Opaque token used to authenticate LAN/Cloud transports.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pairing_token: Option<String>,
 }
 
 /// A single established transport to a device.
@@ -85,6 +82,21 @@ impl PhysicalDevice {
         self.transports
             .get(self.active_transport_idx)
             .map(|t| t.proxy_url.as_str())
+    }
+
+    /// Every transport, the active one first and the rest in priority order.
+    pub fn transports_by_preference(&self) -> Vec<&ActiveTransport> {
+        let active = self.transports.get(self.active_transport_idx);
+        active
+            .into_iter()
+            .chain(
+                self.transports
+                    .iter()
+                    .enumerate()
+                    .filter(|(idx, _)| *idx != self.active_transport_idx)
+                    .map(|(_, t)| t),
+            )
+            .collect()
     }
 }
 
@@ -174,24 +186,21 @@ impl PhysicalDeviceRegistry {
         map.values().cloned().collect()
     }
 
-    /// Add or replace a transport of the given kind, then re-sort and reset
-    /// the active index to 0 (best transport).
-    pub async fn promote_transport(&self, id: &str, kind: TransportKind, proxy_url: String) {
+    /// Make the device's transport of `kind` its active one, keeping the rest.
+    /// `false` when the device has no transport of that kind. A later
+    /// [`Self::register`] or failover resets it to the best transport.
+    pub async fn prefer_transport(&self, id: &str, kind: TransportKind) -> bool {
         let mut map = self.devices.write().await;
-        if let Some(device) = map.get_mut(id) {
-            device.transports.retain(|t| t.kind != kind);
-            let now = chrono::Utc::now().timestamp_millis();
-            device.transports.push(ActiveTransport {
-                kind,
-                proxy_url,
-                established_at: now,
-                last_healthy_at: now,
-                fail_count: 0,
-            });
-            sort_transports(&mut device.transports);
-            device.active_transport_idx = 0;
-            device.health_state = HealthState::Healthy;
-            debug!(id, %kind, "Transport promoted");
+        let Some(device) = map.get_mut(id) else {
+            return false;
+        };
+        match device.transports.iter().position(|t| t.kind == kind) {
+            Some(idx) => {
+                device.active_transport_idx = idx;
+                debug!(id, %kind, "Transport preferred");
+                true
+            }
+            None => false,
         }
     }
 
@@ -341,7 +350,6 @@ mod tests {
             app_id: None,
             ui_bridge_version: None,
             first_seen_at: 1_000,
-            pairing_token: None,
         }
     }
 
@@ -469,5 +477,54 @@ mod tests {
         assert_eq!(device.transports.len(), 1);
         assert_eq!(device.transports[0].proxy_url, "http://127.0.0.1:62001");
         assert_eq!(device.transports[0].fail_count, 0);
+    }
+
+    fn transport(kind: TransportKind, port: u16) -> ActiveTransport {
+        ActiveTransport {
+            kind,
+            ..usb_transport(port)
+        }
+    }
+
+    /// A preferred transport is the active one until a register resets it, and
+    /// the others still follow it in priority order.
+    #[tokio::test]
+    async fn a_preferred_transport_is_active_and_the_rest_follow_in_priority_order() {
+        let registry = PhysicalDeviceRegistry::new();
+        let id = "phone";
+        registry
+            .register(sample_info(id), transport(TransportKind::Cloud, 3))
+            .await;
+        registry
+            .register(sample_info(id), transport(TransportKind::Lan, 2))
+            .await;
+        registry
+            .register(sample_info(id), transport(TransportKind::Usb, 1))
+            .await;
+        let kinds = |device: &PhysicalDevice| {
+            device
+                .transports_by_preference()
+                .iter()
+                .map(|t| t.kind)
+                .collect::<Vec<_>>()
+        };
+        let device = registry.get_device(id).await.unwrap();
+        assert_eq!(
+            kinds(&device),
+            vec![TransportKind::Usb, TransportKind::Lan, TransportKind::Cloud]
+        );
+
+        assert!(registry.prefer_transport(id, TransportKind::Cloud).await);
+        let device = registry.get_device(id).await.unwrap();
+        assert_eq!(device.active_proxy_url(), Some("http://127.0.0.1:3"));
+        assert_eq!(
+            kinds(&device),
+            vec![TransportKind::Cloud, TransportKind::Usb, TransportKind::Lan]
+        );
+
+        assert!(registry.prefer_transport(id, TransportKind::Usb).await);
+        assert!(!registry.prefer_transport("ghost", TransportKind::Usb).await);
+        registry.remove_transport(id, TransportKind::Lan).await;
+        assert!(!registry.prefer_transport(id, TransportKind::Lan).await);
     }
 }

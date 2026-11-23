@@ -145,6 +145,20 @@
 #   HOOK_PY3_CACHE_ONLY=1   never probe: answer from the fast path or the cache,
 #                           else return 1 at once. For a caller whose time is
 #                           already spent (the hook dispatcher holding a deny).
+#   GUARD_DEADLINE          a value of bash's $SECONDS in THIS shell: the
+#                           aggregate deadline of an in-process guard (set by
+#                           the hook dispatcher's in-process guard kit), and
+#                           read ONLY under HOOK_GUARD_MODE=module, so a value a
+#                           standalone hook inherits changes nothing. When read,
+#                           no probe starts once it has passed and each probe's
+#                           bound is cut to what is left of it, so a candidate
+#                           list can never sum past it. A probe the deadline
+#                           stopped (never started, or cut short and timed out)
+#                           records NO verdict and writes NO cache: a lack of
+#                           time says nothing about whether a Python exists.
+#                           With no `timeout` binary the probe is still bounded
+#                           by it (a builtin read under what is left, then a
+#                           kill), never run unbounded in the dispatcher's shell.
 #   HOOK_PY3_CACHE_TTL      s, default 86400
 #   HOOK_PY3_NEG_TTL        s, default 3600: a DEFINITE "no working Python"
 #   HOOK_PY3_TIMEOUT_TTL    s, default 300: a verdict that rests on a probe that
@@ -239,7 +253,8 @@ _hp3_timeout() {
 # _hp3_probe <require-code> <exe> [arg]: the candidate runs <require-code> and
 # prints "3". Judged by STDOUT, not exit status: a stub resolves, prints nothing
 # and may exit anything. Returns 0 pass, 1 fail, 2 timed out, 3 not executed (an
-# alias with no `timeout` to bound it).
+# alias with no `timeout` to bound it), 4 stopped by the in-process guard
+# deadline (not started, or cut short by it and timed out).
 _hp3_probe() {
   local req="$1" exe="$2" arg="${3:-}" out code rc bound
   local -a cmd=("$exe")
@@ -247,14 +262,43 @@ _hp3_probe() {
   code="import sys
 $req
 sys.stdout.write(str(sys.version_info[0]))"
+  # The in-process guard kit's aggregate deadline (see the tunables above):
+  # passed, nothing starts; otherwise the bound is cut to what is left of it.
+  local left="" cut=0
+  if [ "${HOOK_GUARD_MODE:-}" = module ]; then
+    case "${GUARD_DEADLINE:-}" in
+      '' | *[!0-9]*) ;;
+      *) left=$(( GUARD_DEADLINE - SECONDS )); [ "$left" -le 0 ] && return 4 ;;
+    esac
+  fi
   _hp3_timeout
   if [ -n "$_HP3_TO" ]; then
     if _hp3_is_alias "$exe"; then bound="$_HP3_HOOK_PY3_ALIAS_TIMEOUT"; else bound="$_HP3_HOOK_PY3_PROBE_TIMEOUT"; fi
+    [ -n "$left" ] && [ "$left" -lt "$bound" ] && { bound="$left"; cut=1; }
     out="$("$_HP3_TO" -k 2 "$bound" "${cmd[@]}" -c "$code" 2>/dev/null </dev/null)"
     rc=$?
-    case "$rc" in 124|137) return 2 ;; esac
+    case "$rc" in 124|137) [ "$cut" = 1 ] && return 4; return 2 ;; esac
   elif _hp3_is_alias "$exe"; then
     return 3
+  elif [ -n "$left" ]; then
+    # No `timeout` binary, under the in-process guard deadline: nothing can
+    # kill the dispatcher's shell, so an unbounded probe of a hanging
+    # interpreter would run past the harness timeout and drop every verdict,
+    # an accumulated deny included (review finding N7). Bound it with
+    # builtins: the probe runs in a process substitution, read under what is
+    # left of the deadline, and killed when the read times out -- which is the
+    # deadline stopping it (4: no verdict, no cache).
+    local _hp3_fd _hp3_pid _hp3_rr
+    exec {_hp3_fd}< <("${cmd[@]}" -c "$code" 2>/dev/null </dev/null)
+    _hp3_pid=$!
+    out=""
+    IFS= read -r -d '' -t "$left" out <&"$_hp3_fd"
+    _hp3_rr=$?
+    exec {_hp3_fd}<&-
+    if [ "$_hp3_rr" -gt 128 ]; then
+      kill "$_hp3_pid" 2>/dev/null
+      return 4
+    fi
   else
     out="$("${cmd[@]}" -c "$code" 2>/dev/null </dev/null)"
   fi
@@ -522,18 +566,29 @@ hook_shim_python3() {
   fi
 
   verdict=NONE; exe=""; arg=""
+  local deadline_stop=0
   for cand in "${_HP3_C[@]}"; do
     kind="${cand##*$'\t'}"; cand="${cand%$'\t'*}"
+    # The in-process guard deadline has passed: stop, and record nothing.
+    if [ "${HOOK_GUARD_MODE:-}" = module ] && [[ ${GUARD_DEADLINE:-} =~ ^[0-9]+$ ]] \
+       && [ "$SECONDS" -ge "$GUARD_DEADLINE" ]; then
+      deadline_stop=1; break
+    fi
     if [ "$kind" = alias ]; then
       # One hung alias predicts the rest (the Install Manager installs python3,
       # python and py together), and the harness may kill this hook mid-probe:
       # record TIMEOUT first, so a killed probe still leaves a verdict behind.
       [ "$alias_timed_out" = 1 ] && continue
-      if [ -n "$f" ] && [ "$provisional" = 0 ] && [ "$real_timed_out" = 0 ]; then
+      # Not under the in-process guard deadline: there the probe cannot outlive
+      # its bound (no kill to survive), and one the deadline stops must leave
+      # no verdict behind.
+      if [ -n "$f" ] && [ "$provisional" = 0 ] && [ "$real_timed_out" = 0 ] \
+         && ! { [ "${HOOK_GUARD_MODE:-}" = module ] && [[ ${GUARD_DEADLINE:-} =~ ^[0-9]+$ ]]; }; then
         _hp3_cache_write "$f" TIMEOUT "" "" "$now"; provisional=1
       fi
     fi
     _hp3_probe "$req" "${cand%%$'\t'*}" "${cand#*$'\t'}"; prc=$?
+    [ "$prc" = 4 ] && { deadline_stop=1; break; }
     if [ "$prc" = 0 ]; then
       verdict=OK; exe="${cand%%$'\t'*}"; arg="${cand#*$'\t'}"
       break
@@ -546,7 +601,11 @@ hook_shim_python3() {
   # A REAL interpreter that timed out (a cold start on a loaded box) is not
   # evidence that no Python exists: that NONE is kept for this shell only. A
   # NONE that rests on an ALIAS timing out is cached, but as TIMEOUT, whose TTL
-  # is minutes rather than an hour.
+  # is minutes rather than an hour. A search the guard deadline STOPPED records
+  # no verdict at all -- no cache write, no in-shell negative memo.
+  if [ "$deadline_stop" = 1 ] && [ "$verdict" != OK ]; then
+    return 1
+  fi
   if [ -n "$f" ]; then
     if [ "$verdict" = OK ]; then
       _hp3_cache_write "$f" OK "$exe" "$arg" "$now"

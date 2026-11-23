@@ -34,7 +34,12 @@ page list for the runner on --port is UNKNOWN (exit 3). With --only as well, a t
           carries none; a row whose reset passed carries one), which can let
           Claude print that message. When the runner then moves
           it, the row reads HANDED; when its pane closes with the session
-          nowhere, GONE; nothing is typed either way (hand_off_limited).
+          nowhere, GONE; nothing is typed either way (hand_off_limited). A
+          pane the runner does not move, whose menu is still open, gets the
+          menu's "Wait here, then continue automatically" option instead of a
+          second Esc, so Claude resumes it at the reset (WAITING). When no
+          account has headroom (account_headroom), the open menu gets that
+          option at once, with no Esc and no wait for a hand-off.
   name    for each STOPPED session with no /rename title: type /name, which
           names the session itself (it queues /rename into its own pane), and
           read the title back from the transcript. When /name could not queue
@@ -66,10 +71,12 @@ nudge are held (typing_steps_held) and an unreadable restart_prep refuses --act.
 
 After typing into a pane (/name, /next-move) the script watches it. A prompt
 that reaches an exhausted account makes the runner move the session to another
-account: HANDED once a new pane holds the same session. Nothing on Claude's
-usage-limit menu is ever chosen, since what a number selects depends on the
-account (2 can be "Switch to usage credits"); a menu the runner leaves open is
-dismissed with Esc (FAILED). A session that answers "Unknown command:
+account: HANDED once a new pane holds the same session. A usage-limit menu
+the runner leaves open gets its "Wait here, then continue automatically"
+option, chosen by its text and never by its number (choose_wait): WAITING once
+Claude's limit-wait banner shows, SENT? when the menu closed and no banner can
+be read. A menu with no such row on screen is dismissed with Esc instead
+(FAILED). A session that answers "Unknown command:
 /next-move" is asked to run the command from qontinui-claude-config
 origin/main (REDIRECT).
 
@@ -181,6 +188,9 @@ def ready_to_type(tid, idle_min, cooldown_h, own, want="STOPPED"):
     # does not count text drawn dim (a suggestion is dim), so a menu whose option
     # label is dim reads as an empty prompt there: an open menu refuses the send
     # by itself, read from this same final look.
+    if raw is not None and wait_armed(cfs.ANSI_RE.sub("", raw)):
+        return False, ("Claude's auto-resume is armed on this pane just before the send (its limit-wait banner), so "
+                       "nothing is typed into it"), tx
     if raw is not None and limit_menu_open(cfs.ANSI_RE.sub("", raw)):
         return False, "Claude's usage-limit menu is open just before the send, so nothing is typed into it", tx
     state, typed = cfs.prompt_state(raw, cols=cfs.wrap_cols(t)) if raw is not None else ("unknown", "screen unreadable")
@@ -225,17 +235,34 @@ def submit(tid, message):
 
 # ---------------------------------------------------------------- aftercare
 # Claude Code's usage-limit menu, painted when a prompt reaches an exhausted
-# account, or when a background subagent hits the limit. Triage never chooses
-# an option on it: what a number selects depends on the account (with usage
-# credits enabled, 2 is "Switch to usage credits", which is paid usage and
-# opens a login dialog), and a narrow pane draws only the first option. The
-# handoff is the runner's: it reads the limit message Claude prints, resumes
-# the session in a new pane under another account, and closes this one.
+# account, or when a background subagent hits the limit. Triage chooses ONE
+# option on it, "Wait here, then continue automatically ...", which arms
+# Claude's own auto-resume at the reset (operator directive 2026-11-14: "part
+# of the overlord functionality is to press option 2 on sessions that have run
+# out of tokens"). It is chosen by its TEXT, never by its number: what a number
+# selects depends on the account (with usage credits enabled, 2 is "Switch to
+# usage credits", which is paid usage and opens a login dialog; a
+# credits-required account draws "Add funds to continue with usage credits"),
+# so wait_option_digit reads the digit off the one row carrying the wait text
+# on the live screen, re-read just before the key. A narrow pane draws only the
+# first option, and a screen with no single such row gets Esc instead
+# (choose_wait's "fallback"). The bare digit selects, with no Enter: one
+# measurement, 2026-11-14, Linux pane 6cbe5e90, recorded in the plan below; a
+# Windows (ConPTY) pane is unmeasured. Esc on an ARMED wait cancels it ("Automatic continue
+# cancelled"), so after the digit nothing else is typed into that pane in this
+# run. The hand-off is still the runner's: it reads the limit message Claude
+# prints (choosing the wait option prints it too, as Esc does), resumes the
+# session in a new pane under another account, and closes this one. So the
+# wait option goes first only when no account has headroom (account_headroom);
+# otherwise the menu gets Esc and the hand-off wait, and the wait option only
+# when the hand-off did not happen (plan
+# 2026-11-14-the-overlord-chooses-wait-here-on-an-open-usage-limit-menu-by-its-text).
 # The menu is matched by the screen verdict's own helpers, so the classifier
 # that reads such a pane LIMITED and the steps that dismiss its menu read one
 # screen alike (plan
 # 2026-11-12-a-limit-hit-by-a-background-subagent-shows-only-the-rate-limit-menu-so-the-pane-is-never-migrated, D2).
-LIMIT_MENU, MENU_OPEN, limit_menu_open = cfs.LIMIT_MENU, cfs.MENU_OPEN, cfs.limit_menu_open
+LIMIT_MENU, LIMIT_MENU_STOP, MENU_OPEN, limit_menu_open = (cfs.LIMIT_MENU, cfs.LIMIT_MENU_STOP, cfs.MENU_OPEN,
+                                                           cfs.limit_menu_open)
 UNKNOWN_NEXT_MOVE = "Unknown command: /next-move"
 SURVEY = "How is Claude doing this session?"
 # Typed into a session whose own command set has no /next-move.
@@ -274,6 +301,196 @@ def post_keys(tid, keys):
                                  data=json.dumps({"data": base64.b64encode(keys).decode()}).encode(),
                                  headers={"Content-Type": "application/json"})
     urllib.request.urlopen(req, timeout=20).read()
+
+
+# The menu's wait row, its words with any whitespace or none between them (the
+# renderer drops spaces: "2. Waithere,thencontinueautomaticallyatNov15,4pm").
+# Its digit is the row's own; group 1.
+WAIT_OPTION = re.compile(r"(?<![0-9])([1-9])\.\s*Wait\s*here,?\s*then\s*continue\s*automatically", re.I)
+# Claude Code's limit-wait banner once the wait option is armed (2.1.304 bundle,
+# its auto-resume copy object: waiting:"Continuing automatically {when} \xB7 esc
+# to cancel", started:"Usage limit reached \xB7 continuing automatically {when}
+# \xB7 esc to cancel"; never yet observed on a pane, since the one measured pane's
+# banner was covered by a dialog, so a row it misses reads SENT?). The menu's own row reads
+# "continue automatically", never "continuing", so the row cannot match it. A
+# goal-mode session draws its own: waiting:"Goal paused \xB7 usage limit reached
+# \xB7 continues automatically when it resets" (no esc hint), the second arm.
+WAIT_BANNER = re.compile(r"continuing\s*automatically.{0,200}?esc\s*to\s*cancel"
+                         r"|usage\s*limit\s*reached\s*\W{0,3}\s*continues\s*automatically", re.I | re.S)
+# The open menu's row when Claude's auto-resume is ALREADY armed (2.1.304 bundle:
+# {label:"Don't continue automatically", value:"cancel-auto-resume"} replaces the
+# wait row). Such a menu gets nothing: its wait row is gone, and an Esc or that
+# row would cancel the wait.
+ARMED_OPTION = re.compile(r"Don.?t\s*continue\s*automatically", re.I)
+# Claude Code's notice that an armed wait was cancelled; a banner before it no longer holds.
+WAIT_CANCELLED = re.compile(r"Automatic\s*continue\s*cancelled", re.I)
+# Turn output after a banner: an assistant or tool bullet (U+23FA), or a running turn.
+STALE_AFTER_BANNER = re.compile("\u23fa|esc\\s*to\\s*interrupt", re.I)
+# The runner's own exhaustion line for an account (isAccountExhausted in the
+# runner's src/components/settings/types.ts, probe_result_exhausted in
+# src-tauri/src/commands/ai_settings.rs; mirrored by spawn-independent-claude.py
+# _account_is_exhausted). Kept equal to those, so "headroom" here means "the
+# runner's hand-off has an account to move to".
+EXHAUSTION_UTILIZATION = 0.99
+# The HTTP status a runner probe error names when the usage API answered
+# ("API error (429): ..."); an error without one never reached the API.
+PROBE_HTTP_STATUS = re.compile(r"\(\s*[1-5]\d\d\s*\)")
+
+
+def wait_option_digit(text):
+    """The digit of the open usage-limit menu's "Wait here, then continue
+    automatically" row in `text` (the ANSI-stripped tail, as limit_menu_open
+    takes it), or None: no open menu, no such row (a narrow pane draws only
+    option 1), more than one, or a digit that labels more than one row in the
+    menu. Only the menu itself is read, from its first option to its key hint,
+    so a row left in scrollback never counts. Pure."""
+    menu = open_menu_text(text)
+    if not menu:
+        return None
+    rows = WAIT_OPTION.findall(menu)
+    if len(rows) != 1:
+        return None
+    digit = rows[0]
+    if len(re.findall(rf"(?<![0-9]){digit}\.", menu)) != 1:
+        return None
+    return digit
+
+
+def account_exhausted(entry):
+    """The runner's exhaustion predicate over one GET /analytics/account-usage
+    row (see EXHAUSTION_UTILIZATION): it will not serve a request right now.
+    Pure."""
+    if entry.get("error") is not None:
+        return True
+    if (entry.get("utilization") or 0) >= EXHAUSTION_UTILIZATION:
+        return True
+    session = entry.get("session_utilization")
+    if session is not None and session >= EXHAUSTION_UTILIZATION:
+        return True
+    status = (entry.get("status") or "").lower()
+    return any(w in status for w in ("reject", "block", "exceed"))
+
+
+def account_headroom():
+    """True when some account in the runner's GET /analytics/account-usage is
+    not exhausted (account_exhausted), so the runner's hand-off has an account
+    to move a session to; False when the read answered with accounts and every
+    one is exhausted; None (UNKNOWN) when the read failed, its "data" was
+    absent or not a list, it listed no account, or no account has headroom
+    while some account was UNMEASURED: its probe error carries no HTTP status
+    (the runner never reached the usage API for it). A probe error WITH a
+    status, such as an exhausted account's "API error (429)", is a measurement,
+    and counts as exhausted exactly as in the runner's predicate. None takes the
+    Esc-and-hand-off path, as True does: the wait option then follows only a
+    hand-off that did not happen. Read through cfs.read, so --port is honoured
+    and an absent key is an error, not an empty fleet. The route PROBES every
+    configured account (and refreshes the runner's selection snapshot), so it
+    is called once per limit step, never per pane."""
+    try:
+        rows = cfs.read("/analytics/account-usage", "data", 30)
+        if not isinstance(rows, list) or not rows or not all(isinstance(r, dict) for r in rows):
+            return None
+        if not all(account_exhausted(r) for r in rows):
+            return True
+        unmeasured = [r for r in rows if r.get("error") is not None and not PROBE_HTTP_STATUS.search(str(r["error"]))]
+        return None if unmeasured else False
+    except Exception:  # http.client's too, and a row the predicate cannot read: UNKNOWN
+        return None
+
+
+def open_menu_text(text):
+    """The open usage-limit menu in `text` (the ANSI-stripped tail), from its
+    first option to its key hint, with each run of spaces read as one; "" when
+    no menu is open. Pure."""
+    if not limit_menu_open(text):
+        return ""
+    window = cfs.HSPACE_RUN.sub(" ", text)[-cfs.MENU_WINDOW:]
+    m = cfs.MENU_OPEN.search(window)
+    return window[m.start():m.end()] if m else ""
+
+
+def wait_armed(text):
+    """True when `text` (the ANSI-stripped tail) shows Claude's auto-resume
+    already armed: an open menu whose wait row became "Don't continue
+    automatically", or, with no menu open, the limit-wait banner in the screen's
+    last MENU_WINDOW characters (each run of spaces read as one, so a pane padded
+    to full width reads the same) with no cancel notice after it. Such a pane is waiting
+    for its reset by itself, and nothing is typed into it: an Esc cancels the
+    wait. Pure."""
+    menu = open_menu_text(text)
+    if menu:
+        return bool(ARMED_OPTION.search(menu))
+    tail = cfs.HSPACE_RUN.sub(" ", text or "")[-cfs.MENU_WINDOW:]
+    banners = list(WAIT_BANNER.finditer(tail))
+    if not banners:
+        return False
+    after = tail[banners[-1].end():]
+    # A banner left in scrollback by an earlier wait is followed by what came
+    # after it: the cancel notice, the resumed turn's output or its spinner, or
+    # the next limit message. Any of those means it no longer holds.
+    return not (WAIT_CANCELLED.search(after) or STALE_AFTER_BANNER.search(after) or cfs.LIMIT_RE.search(after))
+
+
+def choose_wait(tid, where=None, settle_s=8):
+    """Choose the open usage-limit menu's "Wait here, then continue
+    automatically" option, by its text. Returns (state, message):
+    "closed"   the menu is no longer open; nothing typed.
+    "unread"   the screen could not be read; nothing typed.
+    "held"     a restart prepare is in force; nothing typed.
+    "armed"    the menu shows Claude's auto-resume already armed ("Don't
+               continue automatically"); nothing typed, and nothing may be.
+    "fallback" no single wait row on the screen read just before the key;
+               nothing typed, and the caller sends its Esc instead.
+    "waiting"  the digit went in, the menu closed, and Claude's limit-wait
+               banner shows after it.
+    "sent"     the digit went in and the menu closed, but no banner could be
+               read (a dialog queued behind the menu can take the screen:
+               measured 2026-11-14, a subagent's permission prompt).
+    "failed"   the digit went in and the menu is still open.
+    The prepare read comes first, so the screen read is the last read before
+    the key (ready_to_type's rule). One key at most, never a second: a second
+    digit lands in whatever dialog the menu uncovered. `where`, when given, has
+    its "step" set to name the key just before it is sent."""
+    prep, prep_text = cfs.prepare_status()
+    text = screen_text(tid, chars=None)
+    if text is None:
+        return "unread", "its screen could not be read, so nothing was typed"
+    if not limit_menu_open(text):
+        return "closed", "its usage-limit menu is no longer open"
+    if prep != "clear":
+        return "held", f"its usage-limit menu was left open because a restart prepare is in force ({prep_text})"
+    if wait_armed(text):
+        return "armed", ("its menu shows Claude's auto-resume already armed ('Don't continue automatically'); "
+                         "nothing typed, since an Esc would cancel it")
+    digit = wait_option_digit(text)
+    if digit is None:
+        return "fallback", ("no single 'Wait here, then continue automatically' row on its menu (a narrow pane draws "
+                            "only option 1)")
+    if where is not None:
+        where["step"] = f"the {digit} that chooses the wait option on its usage-limit menu"
+    write_keys(tid, digit.encode())
+    chose = f"chose option {digit}, 'Wait here, then continue automatically', by its text"
+    deadline, after = time.time() + settle_s, None
+    while True:
+        time.sleep(2)
+        try:
+            after = screen_text(tid, chars=None)
+        except Exception:  # http.client's too: the key went in, so the verdict is unverified, never a retry
+            after = None
+        if after is not None and not limit_menu_open(after):
+            # Anchored on the menu's own wait row in the whole screen: a banner
+            # before the key is never this key's. No row found, no anchor: SENT?.
+            flat = cfs.HSPACE_RUN.sub(" ", after)
+            rows = [m.end() for m in WAIT_OPTION.finditer(flat)]
+            if rows and WAIT_BANNER.search(flat, rows[-1]):
+                return "waiting", f"{chose}; Claude shows its limit-wait banner"
+        if time.time() >= deadline:
+            break
+    if after is None:
+        return "sent", f"{chose}; the screen could not be read back"
+    if limit_menu_open(after):
+        return "failed", f"{chose}; the menu is still open, and nothing more is typed"
+    return "sent", f"{chose}; the menu closed, but no limit-wait banner is on screen"
 
 
 def session_id(rows, tid):
@@ -323,36 +540,54 @@ def wait_for_handoffs(panes, wait_s=30, found=None):
 
 def dismiss_open_menu(tid, where=None):
     """The step after a wait the runner did not answer: if the pane's usage-limit
-    menu is still open, dismiss it with Esc (nothing on it is chosen). Returns
-    ("listed", message). The same rule as hand_off_limited and ready_to_type: the
-    prepare read comes first, so the menu look is the last read before the Esc,
-    and under a prepare the pane is left alone. `where`, when given, is a dict
-    whose "step" is set to name the Esc just before it is sent, so a caller that
-    catches a raise names the call that raised."""
-    prep = cfs.prepare_status()[0]
-    if limit_menu_open(screen_text(tid, chars=None) or ""):
-        if prep != "clear":
-            return "listed", "the runner did not move the session; its usage-limit menu was left open because a restart prepare is in force"
-        if where is not None:
-            where["step"] = "the second Esc on its usage-limit menu"
-        write_keys(tid, b"\x1b")
-        return "listed", "the runner did not move the session; its usage-limit menu was dismissed with Esc, no option chosen"
-    return "listed", "the runner did not move the session"
+    menu is still open, choose its "Wait here, then continue automatically"
+    option (choose_wait), and dismiss it with Esc only when no such row can be
+    read. Returns (state, message): "waiting" or "sent" when the wait option
+    went in (verified, or not), "chose" when it went in and the menu stayed
+    open, else "listed". After "waiting", "sent" or "chose" nothing more may be
+    typed into the pane: an Esc would cancel the armed wait. The same rule as
+    hand_off_limited and ready_to_type: the prepare read comes first, so the
+    menu look is the last read before the key, and under a prepare the pane is
+    left alone. `where`, when given, is a dict whose "step" is set to name the
+    key just before it is sent, so a caller that catches a raise names the call
+    that raised."""
+    state, why = choose_wait(tid, where)
+    if state == "closed":
+        return "listed", "the runner did not move the session"
+    if state == "unread":
+        return "listed", f"the runner did not move the session; {why}"
+    if state == "held":
+        return "listed", f"the runner did not move the session; {why}"
+    if state in ("waiting", "sent", "armed"):
+        return ("waiting" if state == "armed" else state), f"the runner did not move the session; {why}"
+    if state == "failed":
+        return "chose", f"the runner did not move the session; {why}"
+    if where is not None:
+        where["step"] = "the second Esc on its usage-limit menu"
+    write_keys(tid, b"\x1b")
+    return "listed", f"the runner did not move the session; its usage-limit menu was dismissed with Esc: {why}"
 
 
 def await_handoff(tid, sid, wait_s=30, where=None):
     """Wait for the runner to move a session that hit a usage limit. Returns
     (state, message). "handed": another pane holds the same Claude session.
     "gone": the pane closed and no other pane holds its session, or its session
-    id is unknown, so none could be looked for. "listed": the pane is still
-    listed after the wait; if its limit menu is still open, the menu is
-    dismissed with Esc, and nothing on it is chosen (dismiss_open_menu). A pane
+    id is unknown, so none could be looked for. Otherwise the pane is still
+    listed after the wait, and dismiss_open_menu's state is returned: "waiting",
+    "sent" or "chose" when the menu's wait option went in, "listed" when it did
+    not (the menu was closed, held, or dismissed with Esc). A pane
     that closes near the end of the wait also waits on successor's own read, so
     the whole wait can reach about twice `wait_s`. `where`: see
     dismiss_open_menu. The wait is wait_for_handoffs's, which hand_off_limited
     runs once for every pane it sent an Esc to."""
     got = wait_for_handoffs({tid: sid}, wait_s)
     return got[tid] if tid in got else dismiss_open_menu(tid, where)
+
+
+# {terminal id: {"limit_step", "why"}} for each limit-step row that ended on the
+# menu's wait option, so the pass ledger can tell a WAITING row from a HANDED one
+# (both are "done"); PASS.handed_off attaches it as the row's detail.
+LIMIT_DETAIL = {}
 
 
 def hand_off_limited(targets, a, own, outcomes=None):
@@ -365,8 +600,10 @@ def hand_off_limited(targets, a, own, outcomes=None):
     the runner's move is then waited for on all of those panes against one
     shared deadline (wait_for_handoffs). A moved pane reads HANDED, and one that
     closed with its session nowhere reads GONE, both with nothing typed. A
-    pane the runner did not move gets the second Esc if its menu is still open
-    (dismiss_open_menu), then the re-screen: when that reads the row STOPPED
+    pane the runner did not move, whose menu is still open, gets the menu's
+    wait option and ends there (WAITING / SENT? / FAILED), or the second Esc
+    when no wait row can be read (dismiss_open_menu); with no account headroom
+    pass 1 chooses the wait option at once. Then the re-screen: when that reads the row STOPPED
     after the Esc (its reset passed and the Esc unstuck it), the row is skipped,
     not failed, and nothing is typed (the nudge step works from the pre-act
     screen, where it read LIMITED, so a later pass picks it up); any
@@ -403,18 +640,68 @@ def hand_off_limited(targets, a, own, outcomes=None):
     # the pane shows, and this Esc alone can let the main session print the limit message
     # the runner moves the session on (plan
     # 2026-11-12-a-limit-hit-by-a-background-subagent-shows-only-the-rate-limit-menu-so-the-pane-is-never-migrated).
-    skipped = set()  # rows pass 1 already ended (a raise)
+    #
+    # When no account has headroom (account_headroom() is False) there is nowhere to
+    # hand the session to, so the open menu gets its "Wait here, then continue
+    # automatically" option instead (choose_wait) and the row ends here: WAITING, SENT?
+    # or FAILED, never typed into again. A menu with no such row gets the Esc as before.
+    skipped = set()  # rows pass 1 already ended (a raise, or the wait option chosen)
+    # Read once, at the first open menu, and only then: the route probes every account.
+    # The pane is looked at AGAIN after it, so its look stays the last read before its
+    # key (ready_to_type's rule). account_headroom never raises.
+    headroom = []
+
+    def end_wait_row(r, state, why):
+        """End a row the wait option went into: never typed into again. An Esc
+        cancels an armed wait; what a typed prompt does to one is unmeasured (the
+        bundle reads it as a takeover that re-arms), so nothing is typed either."""
+        nonlocal failures
+        tid = r["terminalId"]
+        label, outcome = {"waiting": ("WAITING", "done"), "sent": ("SENT?  ", "sent_unconfirmed")}.get(
+            state, ("FAILED ", "failed"))
+        failures += state != "waiting"
+        outcomes[tid] = outcome
+        LIMIT_DETAIL[tid] = {"limit_step": label.strip().lower(), "why": why[:300]}
+        print(f"  {label} {tid[:8]}  {r['name'][:50]} - {why}")
+
     for r in targets:
         tid, sid = r["terminalId"], r.get("claudeSessionId")
         touched, where = False, {"step": "the look for an open usage-limit menu"}
         state_of[tid] = [touched, where]
+        typed = KEYS_WRITTEN.get(tid, 0)
         try:
-            if cfs.prepare_status()[0] == "clear" and limit_menu_open(screen_text(tid, chars=None) or ""):
+            clear = cfs.prepare_status()[0] == "clear"
+            text = screen_text(tid, chars=None) or ""
+            if clear and limit_menu_open(text) and not wait_armed(text) and not headroom:
+                where["step"] = "the account-usage read"
+                headroom.append(account_headroom())
+                # The probe took time: the prepare, then the look, again, so both are
+                # current and the look is the last read before this pane's key.
+                where["step"] = "the look for an open usage-limit menu"
+                clear = cfs.prepare_status()[0] == "clear"
+                text = screen_text(tid, chars=None) or ""
+            if wait_armed(text):  # Claude waits for the reset by itself; an Esc would cancel that
+                end_wait_row(r, "waiting", "Claude's auto-resume is already armed on this pane (its limit-wait "
+                                           "banner, or a menu offering 'Don't continue automatically'); nothing typed")
+                skipped.add(tid)
+                continue
+            if clear and limit_menu_open(text):
+                if headroom[0] is False:
+                    where["step"] = "the look for its menu's wait option"
+                    state, why = choose_wait(tid, where)
+                    if state in ("waiting", "sent", "failed", "armed"):
+                        state_of[tid][0] = state != "armed"
+                        end_wait_row(r, "waiting" if state == "armed" else state,
+                                   "no account has headroom, so nothing can take the session over; " + why)
+                        skipped.add(tid)
+                        continue
+                    if state != "fallback":  # closed, unread or held since the look: pass 3 re-screens it
+                        continue
                 state_of[tid][0], where["step"] = True, "the Esc on its usage-limit menu"
                 esc_sent[tid] = sid
                 write_keys(tid, b"\x1b")
         except Exception as e:
-            raised(r, state_of[tid][0], where, e)
+            raised(r, state_of[tid][0] or KEYS_WRITTEN.get(tid, 0) > typed, where, e)
             skipped.add(tid)
     # Pass 2: one wait for the runner's move, for every pane an Esc went out to.
     found, wait_err = {}, None
@@ -448,6 +735,9 @@ def hand_off_limited(targets, a, own, outcomes=None):
                     failures += 1
                     outcomes[tid] = "failed" if sid else "unknown"
                     print(f"  GONE    {tid[:8]}  {r['name'][:50]} - {why}")
+                    continue
+                if state in ("waiting", "sent", "chose"):  # the wait option went in: never typed into again
+                    end_wait_row(r, "failed" if state == "chose" else state, why)
                     continue
             where["step"] = "the re-screen"
             ok, msg, _ = ready_to_type(tid, a.idle_min, a.cooldown_hours, own, want="LIMITED")
@@ -520,7 +810,9 @@ def aftercare(tids, a, own, wait_s=60, limited=False, outcomes=None, sids=None, 
     that closes with its session in a new pane was moved by the runner to
     another account (HANDED); one that closes with its session nowhere is GONE,
     whether a sweep finds it gone or it closes while its limit menu's hand-off
-    is awaited; one whose limit menu stays open was not moved, and the menu is
+    is awaited; one whose limit menu stays open was not moved, and the menu's
+    "Wait here, then continue automatically" option is chosen by its text
+    (WAITING, or SENT? when unverified), or, with no such row, the menu is
     dismissed with Esc (FAILED). An "Unknown command: /next-move" reply gets the command
     from origin/main (REDIRECT). A redirected pane stays watched, since the
     redirect is a prompt too and can open the limit menu. A pane drops out once
@@ -604,11 +896,17 @@ def aftercare(tids, a, own, wait_s=60, limited=False, outcomes=None, sids=None, 
                         seen(tid, "GONE", msg)
                         del pending[tid]
                         continue
-                    handed = state == "handed"
-                    failures += not handed
-                    outcomes[tid] = "done" if handed else "failed"
-                    print(f"  {'HANDED ' if handed else 'FAILED '} {tid[:8]}  - {msg}")
-                    seen(tid, "HANDED" if handed else "FAILED", msg)
+                    # HANDED: moved. WAITING: the menu's wait option went in and Claude shows
+                    # its limit-wait banner, so it resumes at the reset by itself. SENT?: the
+                    # option went in, unverified. FAILED: anything else. None is typed again.
+                    label = {"handed": "HANDED", "waiting": "WAITING", "sent": "SENT?"}.get(state, "FAILED")
+                    failures += label not in ("HANDED", "WAITING")
+                    outcomes[tid] = {"HANDED": "done", "WAITING": "done", "SENT?": "sent_unconfirmed"}.get(label,
+                                                                                                         "failed")
+                    if limited and state in ("waiting", "sent", "chose"):  # the wait option went in
+                        LIMIT_DETAIL[tid] = {"limit_step": label.lower(), "why": msg[:300]}
+                    print(f"  {label:<7} {tid[:8]}  - {msg}")
+                    seen(tid, label, msg)
                     del pending[tid]
                 elif tid not in redirected and answered_unknown(text):
                     if listed is None:
@@ -1024,11 +1322,15 @@ def name_sessions(targets, a, own, outcomes=None):
             read_err = e
             continue
         read_err = None
+        keys_before = dict(KEYS_WRITTEN)
         for tid, (at, path, r) in list(sent.items()):
             try:
                 result = poll_one(tid, at, path, r, ran, a, own, terms, rows)
             except Exception as e:  # http.client's too: reported SENT?, and the run goes on
-                result = ("SENT?  ", r["name"], f"/name was typed; a runner read failed before the title was read back: {e}")
+                keyed = KEYS_WRITTEN.get(tid, 0) > keys_before.get(tid, 0)
+                result = ("SENT?  ", r["name"], (f"/name was typed; a key went into its usage-limit menu and the "
+                                                 f"call then raised, so nothing more is typed: {e}") if keyed else
+                          f"/name was typed; a runner read failed before the title was read back: {e}")
             if result is None:
                 continue
             del sent[tid]
@@ -1053,10 +1355,12 @@ def poll_one(tid, at, path, r, ran, a, own, terms, rows):
     message[, outcome]), after typing the /rename when the reply suggested
     one; the fourth item is a pass-ledger outcome the poll settled itself. A
     usage-limit menu means the runner should move the session to another
-    account; that is waited for, never chosen: HANDED when it moves, GONE when
-    the pane closes with its session nowhere (failed, or unknown with no
-    session id, as the limit step and the watch record it), FAILED when it
-    does not move."""
+    account; that is waited for: HANDED when it moves, GONE when the pane
+    closes with its session nowhere (failed, or unknown with no session id, as
+    the limit step and the watch record it). When it does not move, the menu's
+    wait option is chosen by its text (dismiss_open_menu): WAITING once Claude
+    shows its limit-wait banner, SENT? when that cannot be read, FAILED
+    otherwise."""
     if tid not in terms:
         return "GONE   ", r["name"], "the pane closed while /name ran"
     if limit_menu_open(screen_text(tid, chars=None) or ""):
@@ -1065,7 +1369,7 @@ def poll_one(tid, at, path, r, ran, a, own, terms, rows):
         state, msg = await_handoff(tid, sid)
         if state == "gone":  # read as the limit step and the watch read it, and its outcome settled here
             return "GONE   ", r["name"], msg, "failed" if sid else "unknown"
-        return ("HANDED " if state == "handed" else "FAILED "), r["name"], msg
+        return {"handed": "HANDED ", "waiting": "WAITING", "sent": "SENT?  "}.get(state, "FAILED "), r["name"], msg
     if tid not in ran:
         row = rows.get(tid)
         tx = cfs.transcript_facts(row) if row else None
@@ -1362,6 +1666,148 @@ def selftest_name_outcomes():
     return 0
 
 
+# Usage-limit menu screens for the wait-option selftest, ANSI-stripped as screen_text returns them.
+# MEASURED, pane 6cbe5e90, 2026-11-14 (Linux, 114 columns): the stripper drops the cursor moves the
+# renderer draws between words, so the wait row reads "Waithere,thencontinue...".
+WAIT_MENU_JOINED = ("Waiting for 2 background agents to finish\rBackground task update waiting while this panel is "
+                    "open\r" + "▔" * 40 + "\rWhat do you want to do?\r❯1. Stop and wait for limit to reset\r"
+                    "2. Waithere,thencontinueautomaticallyatNov15,4pm\r3. Switchtousagecredits\r"
+                    "Enter to confirm · Esc to cancel")
+# MEASURED, pane 14446fc0, 2026-11-14: a credits-required account's third option.
+WAIT_MENU_FUNDS = ("▔" * 40 + "\r   What do you want to do?\r\r   ❯ 1. Stop and wait for limit to reset\r"
+                   "   2. Wait here, then continue automatically at Nov 18, 6pm\r"
+                   "3. Addfundstocontinuewithusagecredits\r\r   Enter to confirm · Esc to cancel\r\r\r\r\r")
+# MEASURED, pane 05cce5b3, 2026-11-14: a narrow pane draws only option 1.
+WAIT_MENU_NARROW = ("▔" * 40 + "\rWhat do you want to do?\r❯1. Stop and wait for limit to reset\r"
+                    "Enter to confirm · Esc to cancel")
+
+
+def selftest_wait_option():
+    """wait_option_digit, wait_armed, account_headroom and the pass ledger's
+    limit-step detail, over measured and SYNTHETIC screens; then choose_wait
+    over a stubbed pane. Returns (failures, cells)."""
+    bad = []
+    q, h = "What do you want to do?\r❯1. Stop and wait for limit to reset\r", "Enter to confirm · Esc to cancel"
+    cases = [
+        ("the measured background-subagent menu", cfs.LIMIT_MENU_SCREEN, "2", False),
+        ("the measured joined-words menu", WAIT_MENU_JOINED, "2", False),
+        ("the measured add-funds menu", WAIT_MENU_FUNDS, "2", False),
+        ("the measured narrow menu", WAIT_MENU_NARROW, None, False),
+        ("the raw menu, dim label", cfs.ANSI_RE.sub("", cfs.LIMIT_MENU_RAW_DIM), "2", False),
+        ("full width, 1000 columns", cfs.limit_menu_full_width(1000), "2", False),
+        # SYNTHETIC from here: the 2.1.304 bundle's other layouts.
+        ("credits as option 2, no wait row", q + "2. Switch to usage credits\r" + h, None, False),
+        ("credits first, wait row third", q + "2. Switch to usage credits\r3. Wait here, then continue "
+         "automatically at Nov 18, 9pm\r" + h, "3", False),
+        ("two wait rows", q + "2. Wait here, then continue automatically shortly\r3. Wait here, then continue "
+         "automatically at 9pm\r" + h, None, False),
+        ("a digit labelling two rows", q + "2. Wait here, then continue automatically shortly\r2. Switch to usage "
+         "credits\r" + h, None, False),
+        ("a non-matching wait label", q + "2. Resume when the limit resets\r" + h, None, False),
+        ("a narrow menu under an older menu's wait row", WAIT_MENU_JOINED + "\r⏺ x\r" + WAIT_MENU_NARROW, None,
+         False),
+        ("already armed", q + "2. Don’t continue automatically\r3. Switch to usage credits\r" + h, None, True),
+        ("a menu left in scrollback", cfs.LIMIT_MENU_SCREEN + "\r⏺ later output\r❯ ", None, False),
+        ("the armed banner, no menu", "✻ Waiting\rUsage limit reached · continuing automatically at Nov 18, "
+         "9pm · esc to cancel\r❯ ", None, True),
+        ("the banner, then cancelled", "Continuing automatically at 9pm · esc to cancel\rAutomatic continue "
+         "cancelled · /rate-limit-options to re-arm\r❯ ", None, False),
+        ("the banner, then the resumed turn's output", "Continuing automatically at 9pm · esc to cancel\r"
+         "⏺ Resumed and ran the tests.\r❯ ", None, False),
+        ("the goal-mode banner", "✻ Waiting\rGoal paused · usage limit reached · continues "
+         "automatically when it resets\r❯ ", None, True),  # SYNTHETIC: the 2.1.304 bundle's words
+        ("the banner, then a running turn", "Continuing automatically at 9pm · esc to cancel\r"
+         "✻ Working… (esc to interrupt)", None, False),
+        ("a banner older than the window", "Continuing automatically at 9pm · esc to cancel\r" + "x" * 3100,
+         None, False),
+        ("the banner, then a new limit message", "Continuing automatically at 9pm · esc to cancel\r"
+         "You've hit your weekly limit · resets 4pm (Europe/Berlin)\r❯ ", None, False),
+        ("the armed banner on a 1000-column pane", "".join(
+            r.ljust(1000) for r in ("✻ Waiting", "Usage limit reached · continuing automatically at Nov 18, "
+                                    "9pm · esc to cancel", "❯ ", "", "")), None, True),
+        ("no menu, no banner", "❯ ", None, False),
+    ]
+    for name, text, digit, armed in cases:
+        if wait_option_digit(text) != digit or wait_armed(text) != armed:
+            bad.append(f"{name}: wait_option_digit {wait_option_digit(text)!r}, wait_armed {wait_armed(text)}; "
+                       f"want {digit!r}, {armed}")
+    # account_headroom: the runner's exhaustion predicate, and UNKNOWN for every read that is no answer.
+    real_read = cfs.read
+    ok = {"status": "allowed", "utilization": 0.07, "session_utilization": None, "error": None}
+    warn = {"status": "allowed_warning", "utilization": 0.97, "session_utilization": None, "error": None}
+    out = {"status": "rejected", "utilization": 1.0, "session_utilization": None, "error": "API error (429)"}
+    unprobed = {"status": None, "utilization": 1.0}
+    session_out = {"status": "allowed", "utilization": 0.1, "session_utilization": 0.995, "error": None}
+
+    def raises(*_a, **_k):
+        raise OSError("connection refused")
+    reads = [("one account allowed", [out, ok], True), ("an allowed_warning account under 0.99", [out, warn], True),
+             ("every account exhausted", [out, unprobed, session_out], False), ("no accounts", [], None),
+             ("data not a list", {"x": 1}, None), ("a row not an object", [out, "x"], None), ("the read raises", raises, None),
+             ("a non-numeric utilization", [out, dict(ok, utilization="x")], None),
+             ("every probe errored with no HTTP status", [dict(ok, error="timeout"), dict(ok, error="connection refused")], None),
+             ("every account a 429", [out, dict(out, label="b")], False),
+             ("utilization exactly 0.99", [dict(ok, utilization=0.99)], False),
+             ("an exceeded status", [dict(ok, status="limit_exceeded")], False),
+             ("exhausted, beside one unmeasured", [out, dict(ok, error="timeout")], None)]
+    try:
+        for name, data, want in reads:
+            cfs.read = data if callable(data) else (lambda path, key, timeout=60, data=data: data)
+            if account_headroom() is not want:
+                bad.append(f"account_headroom, {name}: {account_headroom()!r}, want {want!r}")
+    finally:
+        cfs.read = real_read
+    # The pass ledger tells a WAITING limit row from a HANDED one by its detail.
+    rec = PassRecorder()
+    LIMIT_DETAIL["w0000001"] = {"limit_step": "waiting", "why": "x"}
+    try:
+        rec.handed_off([{"terminalId": "w0000001"}, {"terminalId": "h0000001"}],
+                       {"w0000001": "done", "h0000001": "done"})
+    finally:
+        LIMIT_DETAIL.pop("w0000001", None)
+    rows = rec.events[-1][2]
+    if rows != [{"terminal_id": "w0000001", "action": "limit_handoff", "action_outcome": "done",
+                 "detail": {"limit_step": "waiting", "why": "x"}},
+                {"terminal_id": "h0000001", "action": "limit_handoff", "action_outcome": "done"}]:
+        bad.append(f"the limit step's ledger rows: {rows}")
+    # choose_wait over a stubbed pane: the digit read off the live screen, one key at most, and the
+    # verdict read back. The screen after the key: the banner, nothing, a menu still open, a dialog.
+    g = globals()
+    saved = {k: g[k] for k in ("screen_text", "write_keys", "time")}
+    saved_prep = cfs.prepare_status
+    banner = "Usage limit reached · continuing automatically at Nov 15, 4pm · esc to cancel\r❯ "
+    dialog = "Do you want to proceed?\r❯1. Yes\r2. No\r\rEsc to cancel · Tab to amend"  # MEASURED, 6cbe5e90
+    runs = [("banner", WAIT_MENU_JOINED, WAIT_MENU_JOINED + "\r" + banner, ("clear", ""), "waiting", [b"2"]),
+            ("a dialog took the screen", WAIT_MENU_JOINED, dialog, ("clear", ""), "sent", [b"2"]),
+            ("still open", WAIT_MENU_FUNDS, WAIT_MENU_FUNDS, ("clear", ""), "failed", [b"2"]),
+            ("narrow", WAIT_MENU_NARROW, WAIT_MENU_NARROW, ("clear", ""), "fallback", []),
+            ("already armed", q + "2. Don't continue automatically\r" + h, banner, ("clear", ""), "armed", []),
+            ("held by a prepare", WAIT_MENU_JOINED, banner, ("preparing", "p"), "held", []),
+            ("menu gone", "❯ ", "❯ ", ("clear", ""), "closed", []),
+            ("screen unreadable", None, None, ("clear", ""), "unread", []),
+            ("an old banner before the answered menu", banner + "\r" + WAIT_MENU_JOINED,
+             banner + "\r" + WAIT_MENU_JOINED + "\r" + dialog, ("clear", ""), "sent", [b"2"]),
+            ("a banner with no wait row after the key", WAIT_MENU_JOINED, banner.replace("\r❯ ", "") + "\r" + dialog,
+             ("clear", ""), "sent", [b"2"])]
+    try:
+        for name, before, after, prep, want, keys in runs:
+            keyed = []
+            g["screen_text"] = lambda tid, chars=3000, keyed=keyed, before=before, after=after: after if keyed else before
+            g["write_keys"] = lambda tid, k, keyed=keyed: keyed.append(k)
+            g["time"] = FakeClock()
+            cfs.prepare_status = lambda prep=prep: prep
+            got = choose_wait("t", {})[0]
+            if got != want or keyed != keys:
+                bad.append(f"choose_wait, {name}: {got!r} with keys {keyed}; want {want!r} with {keys}")
+    finally:
+        for k, v in saved.items():
+            g[k] = v
+        cfs.prepare_status = saved_prep
+    for line in bad:
+        print(f"FAIL wait option: {line}")
+    return len(bad), len(cases) + len(reads) + 1 + len(runs)
+
+
 def selftest_redirect_menu():
     """ready_for_redirect's final look refuses an open usage-limit menu whose option
     label is dim (prompt_state reads that screen as an empty prompt), as ready_to_type
@@ -1527,6 +1973,8 @@ def selftest():
     failures += selftest_prepare_hold()
     failures += selftest_name_outcomes()
     failures += selftest_redirect_menu()
+    wait_failures, wait_cells = selftest_wait_option()
+    failures += wait_failures
     step_failures, steps = selftest_name_sessions()
     failures += step_failures
     close_failures, close_rows, close_argvs, listings = selftest_close_step()
@@ -1555,12 +2003,23 @@ def selftest():
     # by any other text is a menu left in scrollback.
     for text, want in ((menu, True), ("What do you want to do?\n 1. Yes\n 2. No", False),
                        (cfs.LIMIT_MENU_SCREEN, True), (cfs.LIMIT_MENU_SCREEN + "\r\u276f ", False),
-                       (menu + "\n\u25cf Resumed.", False)):
+                       (menu + "\n\u25cf Resumed.", False),
+                       # SYNTHETIC bare-"Stop" menus (layout unmeasured): see cfs.limit_menu_stop_screen.
+                       (cfs.limit_menu_stop_screen(), True),
+                       (cfs.limit_menu_stop_screen(question="   What do you wan to do?"), True),
+                       (cfs.limit_menu_stop_screen(question="   What d you want to do?"), True),
+                       (cfs.limit_menu_stop_screen(width=300), True),
+                       (cfs.limit_menu_stop_screen(opt1="   \u276f 1. Stop hook"), False),
+                       (cfs.limit_menu_stop_screen(question="Another question", rest=()), False),
+                       (cfs.limit_menu_stop_screen(opt1="   \u276f 11. Stop"), False),
+                       (cfs.limit_menu_stop_screen() + "\r\u276f ", False),
+                       (cfs.limit_menu_stop_screen().replace("\u2594", "") + "\n\u25cf Resumed.", False)):
         if limit_menu_open(text) != want:
             print(f"FAIL limit menu({text[-30:]!r}) != {want}")
             failures += 1
     # One reading of the menu: triage's helpers are the screen verdict's own (D2).
-    if not all(mine is theirs for mine, theirs in ((LIMIT_MENU, cfs.LIMIT_MENU), (MENU_OPEN, cfs.MENU_OPEN),
+    if not all(mine is theirs for mine, theirs in ((LIMIT_MENU, cfs.LIMIT_MENU), (LIMIT_MENU_STOP, cfs.LIMIT_MENU_STOP),
+                                                    (MENU_OPEN, cfs.MENU_OPEN),
                                                     (limit_menu_open, cfs.limit_menu_open))):
         print("FAIL the limit-menu helpers are not close-finished-sessions.py's own")
         failures += 1
@@ -1577,12 +2036,245 @@ def selftest():
         if got != want:
             print(f"FAIL tab_pages({names!r}) = {got!r}, want {want!r}")
             failures += 1
+    pin_failures, pin = selftest_doc_pin(command_doc_path("triage-sessions.md"))
+    failures += pin_failures
+    status_failures, status_cells = selftest_layout_status_words()
+    failures += status_failures
+    pin = f"{pin}, {status_cells} layout-status cells"
     print(f"selftest: {len(cases)} name cases, {len(modes)} mode cases, {len(holds)} hold cases, "
           f"{len(reads)} dial reads, {len(sessions) + 1} session holds, {steps} name-step runs, "
           f"{len(tabs)} tab cases, {close_rows} close-prediction rows, {close_argvs} close-argv parses, "
           f"{listings} listing checks (custody x2, held section, nudge x2), {watch_cells} watch cells, {reply_cells} reply/merge cells, {width_cells} prompt-width cells, "
-          f"{failures} failure(s)")
+          f"{wait_cells} wait-option cells, {pin}, {failures} failure(s)")
     return 1 if failures else 0
+
+
+# Every row word runner-layout.py prints for a page (plan
+# 2026-11-20-triage-sessions-stop-hook-continuation-reads-as-a-revival, Phase 2), as literals.
+LAYOUT_ROW_WORDS = ("SET", "SKIPPED", "DRY-RUN", "FAILED")
+
+
+def doc_bullet(doc, name):
+    """The text of the `- **<name>**:` bullet in a command doc's output section,
+    up to the next top-level bullet or blank line; "" when there is none."""
+    lines = doc.splitlines()
+    for i, line in enumerate(lines):
+        if line.startswith(f"- **{name}**:"):
+            out = [line]
+            for nxt in lines[i + 1:]:
+                if not nxt.strip() or nxt.startswith("- "):
+                    break
+                out.append(nxt)
+            return " ".join(x.strip() for x in out)
+    return ""
+
+
+def selftest_doc_pin(path, layout_path=None):
+    """(failures, count phrase): /triage-sessions' own doc names every row word
+    the layout step can print (LAYOUT_ROW_WORDS) in its layout bullet's row
+    list - the first parenthesised list of backticked words, `(`SET`, ...)`,
+    not merely somewhere in the bullet's prose - and `SELF` in its close and
+    nudge bullets; and LAYOUT_ROW_WORDS is every word runner-layout.py
+    (`layout_path`, default: beside this script) assigns. That comparison runs
+    first; a doc that cannot be found (a provisioned tree without commands)
+    leaves the doc checks UNKNOWN: no failure from them, and no pass."""
+    failures, checks = 0, 0
+    # The literals must be every row word runner-layout.py itself assigns, so a row word added there turns
+    # this pin red rather than going unlisted. A MISSING runner-layout.py is UNKNOWN for this one check
+    # only; one that is present but cannot be followed FAILs (below). It runs first, so a missing doc does
+    # not switch it off.
+    if layout_path is None:
+        layout_path = os.path.join(_here, "runner-layout.py")
+    printed, why = layout_status_words(layout_path)
+    unknown = ""
+    if printed is None and os.path.isfile(layout_path):
+        # runner-layout.py ships beside this script in both trees, so a file that is THERE but cannot be
+        # followed means its shape changed: a failure, never a comparison quietly switched off.
+        checks += 1
+        print(f"FAIL the layout row words could not be read from {why} - an unreadable file (fix its "
+              "permissions or encoding) or a form layout_status_words must be taught")
+        failures += 1
+    elif printed is None:
+        print(f"doc pin UNKNOWN: {why}")
+        unknown = f" (runner-layout.py comparison UNKNOWN: {why})"
+    else:
+        checks += 1
+        if printed != set(LAYOUT_ROW_WORDS):
+            print(f"FAIL LAYOUT_ROW_WORDS {sorted(LAYOUT_ROW_WORDS)} != the status words runner-layout.py assigns "
+                  f"{sorted(printed)}")
+            failures += 1
+    if path is None:
+        print("doc pin UNKNOWN: .claude/commands/triage-sessions.md not found beside this script")
+        return failures, f"{checks} doc-pin checks, doc UNKNOWN (no doc){unknown}"
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = fh.read()
+    except (OSError, ValueError) as exc:  # ValueError: a non-UTF-8 file
+        print(f"doc pin UNKNOWN: {path}: {exc}")
+        return failures, f"{checks} doc-pin checks, doc UNKNOWN (unreadable){unknown}"
+    rows = re.search(r"\((`[A-Z-]+`(?:, `[A-Z-]+`)*)\)", doc_bullet(doc, "layout"))
+    listed = set(re.findall(r"`([A-Z-]+)`", rows.group(1))) if rows else set()
+    for word in LAYOUT_ROW_WORDS:
+        checks += 1
+        if word not in listed:
+            print(f"FAIL triage-sessions.md's layout bullet row list never names `{word}`, a row runner-layout.py "
+                  "prints")
+            failures += 1
+    for step in ("close", "nudge"):
+        checks += 1
+        if "`SELF` (the terminal running this command)" not in doc_bullet(doc, step):
+            print(f"FAIL triage-sessions.md's {step} bullet never names `SELF` (the terminal running this command)")
+            failures += 1
+    return failures, f"{checks} doc-pin checks{unknown}"
+
+
+def layout_status_words(path):
+    """(words, why): every string literal runner-layout.py assigns to a row's
+    `status` - a `row["status"]` target (alone, annotated or in a tuple
+    assignment, its value a literal or a conditional of literals), a `"status"`
+    key in a dict literal, or a `status=` keyword (`dict(...)`,
+    `row.update(...)`); an augmented `row["status"] +=` is non-literal. Read
+    through `ast`, so a value on a continuation line counts. A status assigned
+    from anything but a literal, a `"status"` string used any other way (a
+    `setdefault("status", ...)` argument, a variable key), or a file that
+    cannot be read or parsed, is (None, why): UNKNOWN, never a set to compare."""
+    import ast
+    try:
+        with open(path, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read(), path)
+    except (OSError, SyntaxError, ValueError) as exc:  # ValueError: non-UTF-8, or a null byte
+        return None, f"{path}: {exc}"
+    words, opaque = set(), []
+
+    def take(value):
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            words.add(value.value)
+        elif isinstance(value, ast.IfExp):
+            take(value.body)
+            take(value.orelse)
+        else:
+            opaque.append(f"line {value.lineno}")
+
+    def is_status(t):
+        return (isinstance(t, ast.Subscript) and isinstance(t.slice, ast.Constant)
+                and t.slice.value == "status")
+
+    # Every "status" string is a subscript key (a write is read below, a read is harmless), a dict-literal
+    # key, or the key of a `.get(...)` read; any other use is a write this reader cannot follow.
+    accounted = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant):
+            accounted.add(id(node.slice))
+        elif isinstance(node, ast.Dict):
+            accounted.update(id(k) for k in node.keys if k is not None)
+        elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "get"
+              and node.args):
+            accounted.add(id(node.args[0]))  # row.get("status") is a read
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and node.value == "status" and id(node) not in accounted:
+            opaque.append(f"line {node.lineno}")
+    handled = set()  # the status-write targets the arms below read
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if is_status(target):
+                    handled.add(id(target))
+                    take(node.value)
+                elif (isinstance(target, ast.Tuple) and isinstance(node.value, ast.Tuple)
+                      and len(target.elts) == len(node.value.elts)
+                      and not any(isinstance(x, ast.Starred) for x in target.elts + node.value.elts)):
+                    # pairs by position only when nothing is starred and the lengths agree; any other
+                    # tuple shape is left to the unhandled-Store catch-all below (UNKNOWN)
+                    for t, v in zip(target.elts, node.value.elts):
+                        if is_status(t):
+                            handled.add(id(t))
+                            take(v)
+        elif isinstance(node, ast.AnnAssign) and is_status(node.target):
+            handled.add(id(node.target))
+            if node.value is not None:
+                take(node.value)
+        elif isinstance(node, ast.keyword) and node.arg == "status":  # dict(status=...), row.update(status=...)
+            take(node.value)
+        elif isinstance(node, ast.Dict):
+            for k, v in zip(node.keys, node.values):
+                if isinstance(k, ast.Constant) and k.value == "status":
+                    take(v)
+    # A status write in any other target shape (an augmented `+=`, a list target, a nested tuple, a for/with
+    # target) is one the arms above did not read: UNKNOWN, never a word silently left out.
+    opaque += [f"line {n.lineno}" for n in ast.walk(tree)
+               if is_status(n) and isinstance(n.ctx, ast.Store) and id(n) not in handled]
+    if opaque:
+        return None, f"{path}: a status used in a form this reader cannot follow ({', '.join(opaque)})"
+    return words, ""
+
+
+def selftest_layout_status_words():
+    """(failures, cells): layout_status_words on synthetic sources, one cell per
+    assignment form, so each UNKNOWN arm and each literal arm can fail."""
+    import tempfile
+    cells = [
+        ('r["status"] = "A"\n', {"A"}),
+        ('r["status"], r["why"] = ("B", x)\nr["status"] = "C" if c else "D"\n', {"B", "C", "D"}),
+        ('r["status"]: str = "W"\n', {"W"}),
+        ('r = dict(status="Q")\nr.update(status="R")\n', {"Q", "R"}),
+        ('r = {"status": "Z"}\nif r["status"] == "Z":\n    pass\n', {"Z"}),
+        ('r["status"] += "x"\n', None),
+        ('r["status"], y = f()\n', None),
+        ('r["status"] = g()\n', None),
+        ('r["status"] = "A" if c else s\n', None),
+        ('r.setdefault("status", "P")\n', None),
+        ('if r.get("status") == "A":\n    pass\nr["status"] = "A"\n', {"A"}),
+        ('k = "status"\nr[k] = "J"\n', None),
+        ('*a, r["status"] = "A", "B", "C"\n', None),
+        ('r["status"] = (\n', None),
+        ('[r["status"], y] = "A", x\n', None),
+        ('(r["status"], a), b = ("A", 1), 2\n', None),
+        ('for r["status"] in ("A",):\n    pass\n', None),
+    ]
+    failures = 0
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "layout.py")
+        for k, (src, want) in enumerate(cells):
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(src)
+            got, _why = layout_status_words(path)
+            if got != want:
+                print(f"FAIL layout_status_words cell {k} ({src.strip()[:40]!r}) = {got!r}, want {want!r}")
+                failures += 1
+        # A file that is not UTF-8 is UNKNOWN, never a crash out of the selftest.
+        with open(path, "wb") as fh:
+            fh.write(b'r["status"] = "\xff"\n')
+        cells.append(("non-UTF-8", None))
+        got, _why = layout_status_words(path)
+        if got is not None:
+            print(f"FAIL layout_status_words on a non-UTF-8 file = {got!r}, want None")
+            failures += 1
+        # The doc pin's two drift detectors, driven on a synthetic runner-layout.py beside the real doc: an
+        # extra row word, and a file that is present but cannot be followed, each fail the pin exactly once.
+        # A minimal conforming doc, so these cells test only the detectors: a defect in the real doc is the
+        # doc pin's own failure, never blamed on a drift cell.
+        doc = os.path.join(d, "triage-sessions.md")
+        with open(doc, "w", encoding="utf-8") as fh:
+            fh.write("- **close**: `SELF` (the terminal running this command)\n"
+                     "- **layout**: (`SET`, `SKIPPED`, `DRY-RUN`, `FAILED`)\n"
+                     "- **nudge**: `SELF` (the terminal running this command)\n")
+        drift = [('r["status"] = "SET"\nr["status"] = "SKIPPED"\nr["status"] = "DRY-RUN"\n'
+                  'r["status"] = "FAILED"\n', 0),
+                 ('r["status"] = "SET"\nr["status"] = "SKIPPED"\nr["status"] = "DRY-RUN"\n'
+                  'r["status"] = "FAILED"\nr["status"] = "PARKED"\n', 1),
+                 ('r["status"] = (\n', 1)]
+        import contextlib
+        import io
+        for k, (src, want) in enumerate(drift):
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(src)
+            with contextlib.redirect_stdout(io.StringIO()):
+                got, _phrase = selftest_doc_pin(doc, path)
+            cells.append((src, want))
+            if got != want:
+                print(f"FAIL selftest_doc_pin drift cell {k}: {got} failure(s), want {want}")
+                failures += 1
+    return failures, len(cells)
 
 
 def selftest_name_sessions():
@@ -1949,7 +2641,7 @@ class FakeClock:
         self.now += seconds
 
 
-WATCH_LABELS = ("HANDED", "GONE", "FAILED", "REDIRECT", "WORKING", "PENDING")
+WATCH_LABELS = ("HANDED", "WAITING", "SENT?", "GONE", "FAILED", "REDIRECT", "WORKING", "PENDING")
 
 
 def watch_rows(text):
@@ -1975,7 +2667,7 @@ def watch_selftest():
     bad = []
     real_aftercare = aftercare
     keys_g = ("PASS", "run_helper", "submit", "write_keys", "post_keys", "ready_to_type", "custom_title", "aftercare",
-              "time", "hold_line", "auto_accept_dial")
+              "time", "hold_line", "auto_accept_dial", "account_headroom")
     keys_cfs = ("API", "terminals", "open_rows", "raw_tail", "prepare_status", "readiness", "transcript_facts",
                 "output_moving", "prompt_state", "read", "page_names", "classify", "proc_table")
     saved_g = {k: g[k] for k in keys_g}
@@ -2089,6 +2781,8 @@ def watch_selftest():
         cfs.read = no_read
         g["ready_to_type"] = lambda tid, *_a, **_k: (True, "", None)
         g["time"] = clock
+        # The account-usage read: UNKNOWN unless a cell says otherwise, so an open menu takes the Esc path.
+        g["account_headroom"] = lambda: None
         # A slow registry: each read takes longer than the watch's wait split
         # over the batch. Every sent pane is still looked at and gets exactly one
         # row, the first one's turn showing only at its second look, so the wait
@@ -2245,7 +2939,25 @@ def watch_selftest():
         # that call, and the step goes on; a raise in the look before any Esc ends it SKIPPED. In every run
         # each Esc follows the menu look directly: the prepare read comes before the look, never between the
         # look and the key. The real write_keys counts each write; only its POST is stubbed.
-        open_cases = ("stays open", "second Esc raises", "held at the second look", "stays open, 1000 columns")
+        #
+        # Plan 2026-11-14-the-overlord-chooses-wait-here-on-an-open-usage-limit-menu-by-its-text: a menu still
+        # open after the hand-off wait gets its "Wait here, then continue automatically" option, chosen by its
+        # text, in place of the second Esc: WAITING (done) once Claude's limit-wait banner shows, FAILED when the
+        # menu stays open, and nothing typed after the key either way. A menu with no such row (a narrow pane
+        # draws only option 1; MEASURED, pane 05cce5b3 2026-11-14) gets the second Esc as before. With no
+        # account headroom the open menu gets the option at once, no Esc: WAITING, SENT? (the menu closed and no
+        # banner shows) or FAILED (still open); a narrow menu still gets the Esc and the hand-off.
+        open_cases = ("stays open", "second Esc raises", "held at the second look", "stays open, 1000 columns",
+                      "no headroom, wait key raises",
+                      "narrow, stays open", "wait key raises", "not moved, waits", "no headroom, banner",
+                      "no headroom, no banner", "no headroom, stays open")
+        narrow_cases = ("narrow, stays open", "second Esc raises", "no headroom, narrow")
+        armed_menu = ("What do you want to do?\r❯1. Stop and wait for limit to reset\r2. Don’t continue "
+                      "automatically\r3. Switch to usage credits\rEnter to confirm · Esc to cancel")  # SYNTHETIC
+        banner = ("✻ Waiting for 1 background agent to finish\r  Usage limit reached · continuing "
+                  "automatically at Nov 18, 9pm · esc to cancel\r❯ ")  # SYNTHETIC: the 2.1.304 bundle's words
+        narrow = ("What do you want to do?\r❯1. Stop and wait for limit to reset\r"
+                  "Enter to confirm · Esc to cancel")  # MEASURED: pane 05cce5b3, 2026-11-14, ANSI-stripped
         saved_judge = nss.judge
 
         def menu_cell(case, parked, heir):
@@ -2256,6 +2968,8 @@ def watch_selftest():
             after = {"moved": [heir], "gone": [], "gone, no session id": []}.get(case, [parked])
             menu = {"stays open": cfs.LIMIT_MENU_RAW_DIM,
                     "stays open, 1000 columns": cfs.limit_menu_full_width(1000)}.get(case, cfs.LIMIT_MENU_SCREEN)
+            menu = narrow if case in narrow_cases else menu
+            menu = {"armed banner": banner, "armed menu": armed_menu}.get(case, menu)
             draft = (cfs.EMPTY_PROMPT_SCREEN + "\x1b[?25l\x1b[H\r\x1b[2C\x1b[17Bhalf\x1b[8Gtyped\x1b[14Gdraft"
                      "\r\x1b[47C\x1b[20;1H\x1b[18;19H\x1b[?25h")  # the prompt cases' differential draft
 
@@ -2268,25 +2982,35 @@ def watch_selftest():
             def post(tid, keys):
                 posted.append((tid, keys))
                 events.append("esc")
-                if case == "Esc raises" or (case == "second Esc raises" and len(posted) == 2):
-                    raise http.client.IncompleteRead(b"{")  # the Esc reached the runner; its reply did not come back
+                if case == "Esc raises" or (case == "second Esc raises" and len(posted) == 2) \
+                        or (case == "no headroom, wait key raises" and keys != b"\x1b") \
+                        or (case == "wait key raises" and keys != b"\x1b"):
+                    raise http.client.IncompleteRead(b"{")  # the key reached the runner; its reply did not come back
 
             def tail(tid, chars=30000):
                 events.append("look")
                 if case == "the menu look raises" and not posted:
                     raise http.client.IncompleteRead(b"{")
+                if case == "armed during the probe" and flag.get("probed"):
+                    return armed_menu
                 if case == "re-screen raises" and posted:
                     flag["rescreen"] = True  # await_handoff's last look; the re-screen's first read raises
                     return idle
                 if case == "a draft at the prompt" and posted:
                     return draft
+                chose = any(k != b"\x1b" for _, k in posted)
+                if chose and case in ("not moved, waits", "no headroom, banner"):
+                    return menu + "\r" + banner  # the scrollback keeps the menu the banner follows
+                if chose and case == "no headroom, no banner":
+                    return idle
                 if case in open_cases or not posted:
                     return menu
                 return working if prompts else idle
 
             def prepare():
                 events.append("prepare")
-                return ("held", "held text") if case == "held at the second look" and posted else ("clear", "")
+                return ("held", "held text") if (case == "held at the second look" and posted) or (
+                    case == "held during the probe" and flag.get("probed")) else ("clear", "")
 
             def submit_stub(tid, message):
                 prompts.append((tid, message))
@@ -2302,12 +3026,16 @@ def watch_selftest():
                 cfs.classify = lambda *_a, **_k: ("STOPPED", [])
                 nss.judge = lambda *_a, **_k: ("STOPPED", ["its usage limit reset"])
             g["write_keys"], g["post_keys"] = saved_g["write_keys"], post
+            g["account_headroom"] = (lambda: events.append("headroom") or flag.update(probed=True) or False) \
+                if case.startswith("no headroom") else (lambda: events.append("headroom") or flag.update(probed=True))
             g["ready_to_type"] = saved_g["ready_to_type"] if case in (
                 "moved", "gone", "gone, no session id", "stays open", "re-screen raises", "a draft at the prompt",
-                "held at the second look", "stays open, 1000 columns", "the Esc unstuck it") else (
+                "held at the second look", "stays open, 1000 columns", "the Esc unstuck it",
+                "narrow, stays open", "held during the probe") else (
                 lambda tid, *_a, **_k: rescreened.append(tid) or (True, "", None))
             cfs.prompt_state = (saved_cfs["prompt_state"] if case in ("stays open", "a draft at the prompt",
-                                                                      "stays open, 1000 columns") else stub_prompt)
+                                                                      "stays open, 1000 columns",
+                                                                      "narrow, stays open") else stub_prompt)
             g["submit"] = submit_stub
             g["aftercare"] = real_aftercare
             out = io.StringIO()
@@ -2319,13 +3047,19 @@ def watch_selftest():
                     left = f"hand_off_limited raised {type(e).__name__}: {e}"
             cfs.prompt_state = stub_prompt
             nss.judge = saved_judge
+            g["account_headroom"] = lambda: None
             return left, out.getvalue().splitlines(), posted, prompts, rescreened, outcomes, events
-        heir, ready_stub, stub_prompt, esc = "h0000001-menu", g["ready_to_type"], cfs.prompt_state, b"\x1b"
+        heir, ready_stub, stub_prompt, esc, two = "h0000001-menu", g["ready_to_type"], cfs.prompt_state, b"\x1b", b"2"
+        chose2 = "chose option 2, 'Wait here, then continue automatically', by its text"
         refused_open = "Claude's usage-limit menu is open just before the send"
         for i, case in enumerate(("moved", "gone", "gone, no session id", "not moved", "stays open", "read raises",
                                   "Esc raises", "second Esc raises", "re-screen raises", "the menu look raises",
                                   "a draft at the prompt", "held at the second look", "stays open, 1000 columns",
-                                  "the /next-move POST raises", "the Esc unstuck it"), 1):
+                                  "the /next-move POST raises", "the Esc unstuck it", "narrow, stays open",
+                                  "wait key raises", "not moved, waits", "no headroom, banner",
+                                  "no headroom, no banner", "no headroom, stays open", "no headroom, narrow",
+                                  "armed banner", "armed menu", "held during the probe", "armed during the probe",
+                                  "no headroom, wait key raises"), 1):
             cells += 1
             parked = f"p{i:07d}-menu"
             left, lines, posted, prompts, rescreened, outcomes, events = menu_cell(case, parked, heir)
@@ -2339,7 +3073,8 @@ def watch_selftest():
                                                                        "session id is unknown"]),
                 "not moved": (0, "done", [(parked, "/next-move")], [parked], [esc],
                               [f"  SENT    {p}  parked - /next-move", f"  WORKING {p}  - "]),
-                "stays open": (1, "failed", [], [], [esc, esc], [f"  SKIPPED {p}  parked - {refused_open}"]),
+                "stays open": (1, "failed", [], [], [esc, two], [f"  FAILED  {p}  parked - the runner did not move "
+                                                                  f"the session; {chose2}; the menu is still open"]),
                 "read raises": (1, "failed", [], [], [esc], [f"  FAILED  {p}  parked - the hand-off read after its "
                                                                "Esc raised (IncompleteRead"]),
                 "Esc raises": (1, "failed", [], [], [esc], [f"  FAILED  {p}  parked - the Esc on its usage-limit "
@@ -2354,8 +3089,31 @@ def watch_selftest():
                                                                          "empty just before the send (text"]),
                 "held at the second look": (1, "failed", [], [], [esc], [f"  SKIPPED {p}  parked - re-screen: held "
                                                                            "text"]),
-                "stays open, 1000 columns": (1, "failed", [], [], [esc, esc], [f"  SKIPPED {p}  parked - "
-                                                                                f"{refused_open}"]),
+                "stays open, 1000 columns": (1, "failed", [], [], [esc, two], [f"  FAILED  {p}  parked - the runner "
+                                                                                f"did not move the session; {chose2}"]),
+                "narrow, stays open": (1, "failed", [], [], [esc, esc], [f"  SKIPPED {p}  parked - {refused_open}"]),
+                "wait key raises": (1, "failed", [], [], [esc, two], [f"  FAILED  {p}  parked - the 2 that chooses "
+                                                                       "the wait option on its usage-limit menu raised "
+                                                                       "(IncompleteRead"]),
+                "not moved, waits": (0, "done", [], [], [esc, two], [f"  WAITING {p}  parked - the runner did not "
+                                                                      f"move the session; {chose2}; Claude shows"]),
+                "no headroom, banner": (0, "done", [], [], [two], [f"  WAITING {p}  parked - no account has headroom"]),
+                "no headroom, no banner": (1, "sent_unconfirmed", [], [], [two],
+                                           [f"  SENT?   {p}  parked - no account has headroom", "no limit-wait banner"]),
+                "no headroom, stays open": (1, "failed", [], [], [two], [f"  FAILED  {p}  parked - no account has "
+                                                                          f"headroom, so nothing can take the session "
+                                                                          f"over; {chose2}; the menu is still open"]),
+                "armed banner": (0, "done", [], [], [], [f"  WAITING {p}  parked - Claude's auto-resume is already "
+                                                         "armed"]),
+                "armed menu": (0, "done", [], [], [], [f"  WAITING {p}  parked - Claude's auto-resume is already "
+                                                       "armed"]),
+                "held during the probe": (1, "skipped", [], [], [], [f"  SKIPPED {p}  parked - "]),
+                "no headroom, wait key raises": (1, "failed", [], [], [two], [f"  FAILED  {p}  parked - the 2 that "
+                                                                               "chooses the wait option"]),
+                "armed during the probe": (0, "done", [], [], [], [f"  WAITING {p}  parked - Claude's auto-resume is "
+                                                                   "already armed"]),
+                "no headroom, narrow": (0, "done", [(parked, "/next-move")], [parked], [esc],
+                                        [f"  SENT    {p}  parked - /next-move", f"  WORKING {p}  - "]),
                 "the /next-move POST raises": (1, "failed", [(parked, "/next-move")], [parked], [esc],
                                                [f"  FAILED  {p}  parked - the /next-move POST raised (IncompleteRead"]),
                 # the Esc unstuck it (the re-screen reads STOPPED): not a failure, nothing typed
@@ -2365,7 +3123,8 @@ def watch_selftest():
             }[case]
             if (left, outcomes.get(parked), prompts, rescreened) != want[:4] \
                     or posted != [(parked, k) for k in want[4]] \
-                    or not all(any(ln.startswith(w) for ln in lines) for w in want[5]) \
+                    or not all(any(ln.startswith(w) or (j and w in ln) for ln in lines)
+                               for j, w in enumerate(want[5])) \
                     or not all(i and events[i - 1] == "look" for i, ev in enumerate(events) if ev == "esc"):
                 bad.append(f"a pane parked on the limit menu, {case}: {left} not completed, outcomes {outcomes}, "
                            f"keys posted {posted}, prompts {prompts}, re-screened {rescreened}, events {events}; "
@@ -2378,16 +3137,20 @@ def watch_selftest():
         order, started = [], clock.now
         cfs.terminals = lambda: order.append("read") or [{"id": t} for t in pair]
         cfs.prepare_status = lambda: ("clear", "")
-        cfs.raw_tail = lambda tid, chars=30000: cfs.LIMIT_MENU_SCREEN
+        # The menus close once the Escs are in, so the shared wait is the only time spent.
+        cfs.raw_tail = lambda tid, chars=30000: cfs.LIMIT_MENU_SCREEN if "read" not in order else "❯ "
         g["post_keys"] = lambda tid, keys: order.append(("esc", tid))
         g["write_keys"] = saved_g["write_keys"]
         g["ready_to_type"] = lambda *_a, **_k: (False, "held", None)
-        pair_out = {}
+        pair_out, probes = {}, []
+        g["account_headroom"] = lambda: probes.append(1)
         with contextlib.redirect_stdout(io.StringIO()):
             hand_off_limited([{"terminalId": t, "name": "pair", "claudeSessionId": f"s-{t}"} for t in pair],
                              argparse.Namespace(idle_min=15, cooldown_hours=None), "", pair_out)
         first_read = order.index("read") if "read" in order else len(order)
-        if order[:2] != [("esc", pair[0]), ("esc", pair[1])] or first_read < 2 or clock.now - started > 45:
+        g["account_headroom"] = lambda: None
+        if order[:2] != [("esc", pair[0]), ("esc", pair[1])] or first_read < 2 or clock.now - started > 45 \
+                or len(probes) != 1:
             bad.append(f"two panes parked on the limit menu: order {order[:6]}, {clock.now - started:.0f}s elapsed; "
                        "want both Escs before the first /terminals read and one shared 30s wait")
         g["post_keys"], g["ready_to_type"] = saved_g["post_keys"], ready_stub
@@ -2419,14 +3182,34 @@ def watch_selftest():
             cfs.open_rows = lambda heir2=heir2: {heir2: {"claudeSessionId": "s-poll"}} if heir2 else {}
             polled.append(poll_one(poll, 0, "", {"name": "polled", "claudeSessionId": "s-poll"}, set(),
                                    argparse.Namespace(), "", {poll: {}}, {})[0])
-        if (left, outs2, keyed2, polled) != (2, {stay: "failed", gone2: "failed"}, [(stay, esc), (poll, esc)],
+        if (left, outs2, keyed2, polled) != (2, {stay: "failed", gone2: "failed"}, [(stay, two), (poll, two)],
                                               ["HANDED ", "GONE   ", "FAILED "]) \
                 or not any(ln.startswith(f"  FAILED  {stay[:8]}") for ln in lines2) \
                 or not any(ln.startswith(f"  GONE    {gone2[:8]}") and "no other pane holds its session" in ln
                            for ln in lines2):
             bad.append(f"await_handoff's state as aftercare and the poll read it: {left} not completed, outcomes "
-                       f"{outs2}, keys {keyed2}, poll labels {polled}; want 2, FAILED and GONE both failed, an Esc "
-                       f"each to the open menus, HANDED, GONE, FAILED: {lines2}")
+                       f"{outs2}, keys {keyed2}, poll labels {polled}; want 2, FAILED and GONE both failed, the "
+                       f"wait option's 2 to each open menu, HANDED, GONE, FAILED: {lines2}")
+        # The same two readers when the wait option takes: the menu closes and Claude's limit-wait
+        # banner shows, so aftercare reads WAITING (done, not a failure) and the poll WAITING too.
+        cells += 1
+        wt, keyed3, outs3 = "w0000001-menu", [], {}
+        cfs.terminals, cfs.open_rows = (lambda: [{"id": wt}, {"id": poll}]), (lambda: {})
+        cfs.raw_tail = lambda tid, chars=30000: wide + "\r" + banner if any(t == tid for t, _ in keyed3) else wide
+        g["write_keys"] = lambda tid, keys: keyed3.append((tid, keys))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            left3 = real_aftercare([wt], argparse.Namespace(), "", wait_s=60, limited=True, outcomes=outs3,
+                                   sids={wt: "s-w"})
+        polled3 = poll_one(poll, 0, "", {"name": "polled", "claudeSessionId": "s-poll"}, set(), argparse.Namespace(),
+                           "", {poll: {}}, {})[0]
+        detail3 = LIMIT_DETAIL.pop(wt, None)
+        if (left3, outs3, keyed3, polled3) != (0, {wt: "done"}, [(wt, two), (poll, two)], "WAITING") \
+                or (detail3 or {}).get("limit_step") != "waiting" \
+                or not any(ln.startswith(f"  WAITING {wt[:8]}  - the runner did not move the session; {chose2}")
+                           for ln in out.getvalue().splitlines()):
+            bad.append(f"the wait option as aftercare and the poll read it: {left3} not completed, outcomes {outs3}, "
+                       f"keys {keyed3}, poll label {polled3!r}; want 0, done, a 2 each, WAITING: {out.getvalue()}")
         # The sent panes come from the nudge helper's --rows-out rows, so a pane
         # this pass's screen never listed is watched too. That file's writer
         # warns and never raises: a sent pane with no row is matched by its
@@ -2880,7 +3663,7 @@ def main():
         for label, r in operator_rows(res):
             code = f"{r['reason_code']} " if label == "HELD" else ""
             print(f"  {label:<12} {r['terminalId'][:8]}  {r['tab']:<14.14}  {r['name'][:50]} - "
-                  f"{'nudged: ' if label == 'CONTRADICTED' else ''}{code}{'; '.join(r['reasons'])[:160]}")
+                  f"{'nudged: ' if label == 'CONTRADICTED' else ''}{code}{cfs.fit_reasons(r['reasons'], 160)}")
         if a.act:
             cap = ["--cooldown-hours", str(a.cooldown_hours)] if a.cooldown_hours is not None else []
             port = ["--port", a.port] if a.port else []
@@ -3009,7 +3792,11 @@ def pass_row(r, observed_at):
             since = int(fin)
     screen = r.get("screen")
     progress = r.get("progress_since_nudge")
-    return {
+    measured = r.get("nudge_measured_at")
+    measured = (rfc3339(dt.datetime.fromtimestamp(measured / 1000, dt.timezone.utc))
+                if isinstance(progress, bool) and isinstance(measured, (int, float))
+                and not isinstance(measured, bool) and 0 < measured < 4102444800000 else None)
+    row = {
         "terminal_id": r["terminalId"],
         "observed_at": observed_at,
         "claude_session_id": sid if isinstance(sid, str) and nss.UUID_RE.match(sid) else None,
@@ -3025,6 +3812,12 @@ def pass_row(r, observed_at):
         "action_outcome": None,
         "detail": {"reasons": [str(x)[:REASON_CHARS] for x in (r.get("reasons") or [])[:REASONS_MAX]]},
     }
+    # Sent only when known: absent and null mean the same UNKNOWN to coord, and
+    # a coord predating the field refuses the KEY, so an unmeasured row stays
+    # writable there.
+    if measured:
+        row["nudge_measured_at"] = measured
+    return row
 
 
 def apply_events(rows, events):
@@ -3093,15 +3886,20 @@ def blob_shas(paths):
     return dict(zip(paths, shas)) if len(shas) == len(paths) else {x: None for x in paths}
 
 
-def next_move_path():
-    """.claude/commands/next-move.md beside this script: the repository's
+def command_doc_path(name):
+    """.claude/commands/<name> beside this script: the repository's
     (scripts/ -> .claude/commands/) or the provisioned skills tree's
     (.claude/skills/command-scripts/_scripts/ -> .claude/commands/). None when neither exists."""
     for rel in ((os.pardir, ".claude", "commands"), (os.pardir, os.pardir, os.pardir, "commands")):
-        c = os.path.normpath(os.path.join(_here, *rel, "next-move.md"))
+        c = os.path.normpath(os.path.join(_here, *rel, name))
         if os.path.isfile(c):
             return c
     return None
+
+
+def next_move_path():
+    """.claude/commands/next-move.md beside this script (command_doc_path)."""
+    return command_doc_path("next-move.md")
 
 
 def overlord_versions(runner_sha):
@@ -3124,6 +3922,37 @@ def runner_build():
     except Exception:  # noqa: BLE001 - READ_ERRORS leaves out a response cut mid-read
         return None
     return sha if isinstance(sha, str) and sha else None
+
+
+# Two reads of ONE runner process derive starts that differ: now - uptimeSeconds
+# carries whole-second truncation plus the /health read's own latency, which
+# reaches seconds under load. Starts closer than this are one process. coord's
+# flow engine compares across passes with the same bound
+# (RUNNER_START_TOLERANCE_SECS in qontinui-coord overlord_passes.rs).
+# uptimeSeconds runs on the runner's MONOTONIC clock, so a suspend or an NTP step
+# also moves the derived start; that fails closed (the absences read unproven).
+RUNNER_START_TOLERANCE_S = 30
+
+
+def runner_started():
+    """When the runner PROCESS started, as an aware UTC datetime: now minus
+    /health uptimeSeconds. None when it cannot be read. Never raises."""
+    try:
+        up = cfs.read("/health", "data.uptimeSeconds", timeout=20)
+    except Exception:  # noqa: BLE001 - READ_ERRORS leaves out a response cut mid-read
+        return None
+    if isinstance(up, bool) or not isinstance(up, (int, float)) or up < 0:
+        return None
+    return dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=up)
+
+
+def same_runner_start(before, after):
+    """The start to record for a screen read between two derived starts: the
+    earlier read when both are known and within the tolerance, else None (a
+    restart during the screen, or a failed read: UNKNOWN)."""
+    if before is None or after is None:
+        return None
+    return before if abs((after - before).total_seconds()) <= RUNNER_START_TOLERANCE_S else None
 
 
 def runner_port():
@@ -3296,6 +4125,21 @@ def direct_call(tool, args, opener=None):
     return body
 
 
+# coord's own slack past ended_at for a row's timestamps (OBSERVED_AT_SLACK_SECS).
+MEASURED_SLACK_S = 300
+
+
+def parse_rfc3339(value):
+    """A timezone-aware datetime for an RFC 3339 string, else None."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        t = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return t if t.tzinfo else None
+
+
 def record_pass(doc, proxy=None, direct=None):
     """Write the pass, then read it back by pass_id over the door that wrote it.
     Returns the one line to print. `proxy` is the session's own door
@@ -3325,7 +4169,37 @@ def record_pass(doc, proxy=None, direct=None):
     if stored.get("row_count") != n:
         return (f"ledger UNKNOWN: pass {pid} was written, but its read-back holds row_count="
                 f"{stored.get('row_count')!r}, not {n}{via}")
+    sent = parse_rfc3339(doc.get("runner_started_at"))
+    if sent is not None and parse_rfc3339(stored.get("runner_started_at")) != sent:
+        return (f"ledger UNKNOWN: pass {pid} was written, but its read-back holds runner_started_at="
+                f"{stored.get('runner_started_at')!r}, not {doc['runner_started_at']}{via}")
+    # The same for each row's measured prompt: a coord that accepts the key but
+    # does not store it would otherwise read back as recorded.
+    lost = measured_not_stored(doc["rows"], stored.get("rows"))
+    if lost and not isinstance(stored.get("rows"), list):
+        return (f"ledger UNKNOWN: pass {pid} was written, but its read-back carries no rows list, "
+                f"so the nudge_measured_at of {len(lost)} row(s) is unconfirmed{via}")
+    if lost:
+        return (f"ledger UNKNOWN: pass {pid} was written, but its read-back holds no matching "
+                f"nudge_measured_at for {len(lost)} row(s) that sent one (first: {lost[0]}){via}")
     return f"ledger: recorded pass {pid} ({n} rows, read back){via}"
+
+
+def measured_not_stored(sent_rows, stored_rows):
+    """The terminal ids whose sent nudge_measured_at the read-back does not
+    hold. An unreadable row list counts every sent value as not stored."""
+    def key(r):  # coord stores text fields trimmed
+        tid = r.get("terminal_id")
+        return tid.strip() if isinstance(tid, str) else tid
+    want = {key(r): parse_rfc3339(r.get("nudge_measured_at")) for r in sent_rows}
+    want = {tid: at for tid, at in want.items() if at is not None}
+    if not want:
+        return []
+    got = {}
+    if isinstance(stored_rows, list):
+        got = {key(r): parse_rfc3339(r.get("nudge_measured_at"))
+               for r in stored_rows if isinstance(r, dict)}
+    return [str(tid) for tid, at in want.items() if got.get(tid) != at]
 
 
 class PassRecorder:
@@ -3336,6 +4210,7 @@ class PassRecorder:
         self.doc = None
         self.res = None
         self.build_before = self.screened_build = None
+        self.start_before = self.screened_start = None
         self.events = []  # ("rows", step, [acted rows]) or ("file", step, path), in the order the steps ran
         self.steps = {}
         self.lock = None
@@ -3375,6 +4250,7 @@ class PassRecorder:
     def screening(self):
         """Call before the screen: see screened()."""
         self.build_before = runner_build()
+        self.start_before = runner_started()
 
     def screened(self, res):
         """The flow metrics compare a pass's build across passes to tell a close
@@ -3384,6 +4260,9 @@ class PassRecorder:
         self.res = res
         after = runner_build()
         self.screened_build = after if after == self.build_before else None
+        # The same rule for the runner PROCESS: a restart that keeps the build
+        # is still a restart, and only a start read on both sides tells.
+        self.screened_start = same_runner_start(self.start_before, runner_started())
 
     def step(self, name, **facts):
         self.steps.setdefault(name, {}).update(facts)
@@ -3400,8 +4279,10 @@ class PassRecorder:
         """The limit step's rows, from the outcome hand_off_limited and its
         aftercare recorded per row; a row with none recorded is unknown."""
         self.events.append(("rows", "limit", [
-            {"terminal_id": r["terminalId"], "action": "limit_handoff",
-             "action_outcome": outcomes.get(r["terminalId"], "unknown")} for r in targets]))
+            dict({"terminal_id": r["terminalId"], "action": "limit_handoff",
+                  "action_outcome": outcomes.get(r["terminalId"], "unknown")},
+                 **({"detail": LIMIT_DETAIL[r["terminalId"]]} if r["terminalId"] in LIMIT_DETAIL else {}))
+            for r in targets]))
 
     def named(self, targets, named, typed, outcomes=None):
         """The name step's rows. `typed` is what submit() recorded during the
@@ -3419,9 +4300,9 @@ class PassRecorder:
             rows.append({"terminal_id": tid, "action": "name", "action_outcome": outcome})
         self.events.append(("rows", "name", rows))
 
-    def build(self, code, now=None, build=None, versions=None):
-        """The pass document for coord. `now`, `build` and `versions` are
-        injectable so the selftest builds without the clock, runner or git."""
+    def build(self, code, now=None, build=None, versions=None, started=None):
+        """The pass document for coord. `now`, `build`, `versions` and `started`
+        are injectable so the selftest builds without the clock, runner or git."""
         events, bad = [], 0
         for kind, _step, item in self.events:
             if kind == "file":
@@ -3440,8 +4321,20 @@ class PassRecorder:
         if dropped:
             counts["ledger"] = {"rows_dropped": dropped}
         build = self.screened_build if build is None else build
-        return dict(self.doc, runner_build=build,
-                    ended_at=rfc3339(now or dt.datetime.now(dt.timezone.utc)), exit_code=code,
+        started = self.screened_start if started is None else started
+        ended = now or dt.datetime.now(dt.timezone.utc)
+        # coord refuses the WHOLE pass when one row's nudge_measured_at is later
+        # than ended_at plus its 5-minute slack, so a future-dated transcript
+        # stamp (a clock step) drops only that row's value, never the pass.
+        limit = ended + dt.timedelta(seconds=MEASURED_SLACK_S)
+        for row in rows:
+            at = parse_rfc3339(row.get("nudge_measured_at"))
+            if at is not None and at > limit:
+                del row["nudge_measured_at"]
+        # Sent only when known, for the same reason as a row's nudge_measured_at.
+        known = {"runner_started_at": rfc3339(started)} if started else {}
+        return dict(self.doc, **known, runner_build=build,
+                    ended_at=rfc3339(ended), exit_code=code,
                     step_counts=counts, verdict_histogram=histogram,
                     overlord_versions=overlord_versions(build) if versions is None else versions, rows=rows)
 
@@ -3524,6 +4417,7 @@ def ledger_selftest():
     import contextlib
     import io
     globals()["runner_build"] = lambda: None  # the process exits after this selftest
+    globals()["runner_started"] = lambda: None
     bad = []
     sid = "0f2a1b3c-4d5e-4f60-8a7b-9c0d1e2f3a4b"
     res = [
@@ -3538,7 +4432,8 @@ def ledger_selftest():
     row = pass_row(res[0], "2026-10-24T00:00:00.000Z")
     want = {"terminal_id": "t-stop", "claude_session_id": sid, "session_name": "n" * TEXT_MAX, "tab": "infra",
             "account": "acct1", "screen_verdict": "ACTIVE", "verdict": "STOPPED", "reason_codes": [],
-            "state_since_ms": None, "progress_since_nudge": None, "action": "none", "action_outcome": None,
+            "state_since_ms": None, "progress_since_nudge": None,
+            "action": "none", "action_outcome": None,
             "detail": {"reasons": ["a", "b", "c"]}, "observed_at": "2026-10-24T00:00:00.000Z"}
     if row != want:
         bad.append(f"pass_row(STOPPED) = {row}")
@@ -3546,6 +4441,15 @@ def ledger_selftest():
         got = pass_row(dict(res[0], progress_since_nudge=given), "x")["progress_since_nudge"]
         if got is not want_progress:
             bad.append(f"pass_row(progress_since_nudge={given!r}) = {got!r}")
+    # The measured prompt rides only beside a measurement, as RFC 3339.
+    for given, at, want_at in [(True, 1761270000000, "2025-10-24T01:40:00.000Z"),
+                               (False, 1761270000000, "2025-10-24T01:40:00.000Z"),
+                               (None, 1761270000000, None), (True, None, None), (True, True, None),
+                               (True, 1761270000000.5, "2025-10-24T01:40:00.000Z"),
+                               (True, 0, None), (True, float("nan"), None), (True, "1761270000000", None)]:
+        got = pass_row(dict(res[0], progress_since_nudge=given, nudge_measured_at=at), "x").get("nudge_measured_at")
+        if got != want_at:
+            bad.append(f"pass_row(progress={given!r}, nudge_measured_at={at!r}) = {got!r}, want {want_at!r}")
     fin, held = pass_row(res[1], "x"), pass_row(res[2], "x")
     if (fin["claude_session_id"], fin["account"], fin["state_since_ms"]) != (None, None, 1761270000000):
         bad.append(f"pass_row(FINISHED) = {fin}")
@@ -3628,6 +4532,36 @@ def ledger_selftest():
                 checks.append((rec.build(1, now=when, versions={})["runner_build"], want_build))
         finally:
             globals()["runner_build"] = real_build
+        # The runner start follows the build's rule: read on both sides of the
+        # screen, kept within the tolerance, else unknown.
+        real_started = runner_started
+        t0 = dt.datetime(2026, 10, 24, 0, 0, 0, tzinfo=dt.timezone.utc)
+        near = t0 + dt.timedelta(seconds=RUNNER_START_TOLERANCE_S)
+        far = t0 + dt.timedelta(seconds=RUNNER_START_TOLERANCE_S + 1)
+        try:
+            for before, after, want in [(t0, t0, "2026-10-24T00:00:00.000Z"), (t0, near, "2026-10-24T00:00:00.000Z"),
+                                        (t0, far, None), (None, t0, None), (t0, None, None)]:
+                globals()["runner_started"] = lambda v=before: v
+                rec.screening()
+                globals()["runner_started"] = lambda v=after: v
+                rec.screened(res)
+                globals()["runner_started"] = lambda: far
+                checks.append((rec.build(1, now=when, versions={}).get("runner_started_at"), want))
+        finally:
+            globals()["runner_started"] = real_started
+        # A row's nudge_measured_at within ended_at + 5 min is sent; one past it
+        # is dropped from that row alone (coord would refuse the whole pass).
+        saved_res = rec.res
+        try:
+            end_ms = int(when.timestamp() * 1000)
+            rec.res = [dict(res[0], progress_since_nudge=True, nudge_measured_at=end_ms + 300_000),
+                       dict(res[0], terminalId="t-late", progress_since_nudge=True,
+                            nudge_measured_at=end_ms + 301_000)]
+            got = {r["terminal_id"]: r.get("nudge_measured_at")
+                   for r in rec.build(1, now=when, versions={})["rows"]}
+            checks.append((got, {res[0]["terminalId"]: "2026-10-24T01:07:03.000Z", "t-late": None}))
+        finally:
+            rec.res = saved_res
         for got, exp in checks:
             if got != exp:
                 bad.append(f"build(): {got!r}, want {exp!r}")
@@ -3777,6 +4711,41 @@ def ledger_selftest():
     line = record_pass(big, proxy=door("proxy", None, 1, log), direct=door("direct", None, 1, log))
     if log != [("direct", WRITE_TOOL), ("direct", READ_TOOL)] or "over coord's /mcp door" not in line:
         bad.append(f"record_pass(oversize) = {line!r} via {log}")
+
+    # The read-back observes runner_started_at, not only row_count.
+    start = "2026-11-14T10:00:00.000Z"
+    new_doc = {"pass_id": "p-3", "runner_started_at": start,
+               "rows": [{"terminal_id": "t-a", "nudge_measured_at": start}, {"terminal_id": "t-b"}]}
+    stored_ok = [{"terminal_id": "t-a", "nudge_measured_at": start}, {"terminal_id": "t-b", "nudge_measured_at": None}]
+
+    def new_coord(served, rows=stored_ok):
+        def call(tool, args):
+            if tool == WRITE_TOOL:
+                return {"ok": True, "pass_id": args["pass_id"]}
+            return {"ok": True, "pass": {"pass_id": "p-3", "row_count": 2, "runner_started_at": served,
+                                         "rows": rows}}
+        return call
+    for served, ok in ((start, True), ("2026-11-14T10:00:00+00:00", True), (None, False),
+                       ("2026-11-14T10:00:05Z", False)):
+        line = record_pass(dict(new_doc), proxy=new_coord(served))
+        if line.startswith("ledger: recorded") != ok:
+            bad.append(f"record_pass(read-back runner_started_at={served!r}) = {line!r}, want ok={ok}")
+    # ...and each row's nudge_measured_at: a row that sent one must hold it.
+    for rows, ok in ((stored_ok, True),
+                     ([{"terminal_id": "t-a", "nudge_measured_at": "2026-11-14T10:00:00+00:00"}, {"terminal_id": "t-b"}], True),
+                     ([{"terminal_id": "t-a", "nudge_measured_at": None}, {"terminal_id": "t-b"}], False),
+                     ([{"terminal_id": "t-a", "nudge_measured_at": "2026-11-14T10:00:01Z"}], False),
+                     ([{"terminal_id": "t-b"}], False), (None, False),
+                     ([{"terminal_id": " t-a ", "nudge_measured_at": start}], True)):
+        line = record_pass(dict(new_doc), proxy=new_coord(start, rows))
+        if line.startswith("ledger: recorded") != ok:
+            bad.append(f"record_pass(read-back rows={rows!r}) = {line!r}, want ok={ok}")
+    # A pass that sent no measured prompt needs none back, whatever the rows read.
+    line = record_pass(dict(new_doc, rows=[{"terminal_id": "t-b"}, {"terminal_id": "t-c"}]),
+                       proxy=new_coord(start, None))
+    if not line.startswith("ledger: recorded"):
+        bad.append(f"record_pass(no measured prompt, no rows read back) = {line!r}")
+
     bad += door_wording_selftest()
 
     # The device JWT: an expired source is skipped, never sent.

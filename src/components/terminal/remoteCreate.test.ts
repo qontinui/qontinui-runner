@@ -219,6 +219,21 @@ describe("describeRemoteCreateFailure", () => {
     expect(r.strandedTerminalId).toBeNull();
   });
 
+  /**
+   * A dispatch role closing the agent lane is neither the create dial nor a
+   * drain. The relay does not list the code by name yet, so it may arrive
+   * prefixed `target_said_`; both spellings name the role.
+   */
+  it("names a role-closed target under both relay spellings", () => {
+    for (const code of ["role_closes_agent_lane", "target_said_role_closes_agent_lane"]) {
+      const r = describeRemoteCreateFailure({ stage: "create", code, message: "refused" });
+      expect(r.headline, code).toMatch(/dispatch role closes the agent lane/);
+      const remedy = r.remedy.join("\n");
+      expect(remedy, code).toMatch(/Nothing was spawned/);
+      expect(remedy, code).toMatch(/not a drain/);
+    }
+  });
+
   it("keeps an unreadable drain state apart from a drained one", () => {
     const r = describeRemoteCreateFailure({
       stage: "create",

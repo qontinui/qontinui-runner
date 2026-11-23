@@ -11,9 +11,11 @@
 //!
 //! ## Two arms, one tick, one budget
 //!
-//! [`decide_tick`] picks exactly ONE action per tick, so the two arms never
-//! run in the same tick and together they never close more than
-//! [`MAX_CLOSES_PER_TICK`] sessions in one. They also share the
+//! [`decide_tick`] picks exactly ONE action per tick. A drained tick runs both
+//! close passes ([`tick_passes`]), the guarded `finished_close` pass first, and
+//! the drain arm gets only what that pass left of the ONE budget
+//! ([`drain_share_after`]), so together they never attempt more than
+//! [`MAX_CLOSES_PER_TICK`] closes in one tick. They also share the
 //! [`ClockJumpGuard`] quarantine and the one `graceful_exit` call below.
 //!
 //! * **The drain arm** ([`TickAction::WindDown`]) — while drained, described
@@ -156,19 +158,23 @@ use tracing::{debug, info, warn};
 
 use crate::coord_drain_state::CoordDrainState;
 use crate::session::finished_close::{self, PassPlan, SkipReason};
+use crate::session::finished_close_guard::{self, GuardInputs, GuardVerdict};
 use crate::session::session_lifecycle_store::{
     SessionLifecycleStore, WIND_DOWN_ARM_DRAIN, WIND_DOWN_ARM_FINISHED_CLOSE, WIND_DOWN_CLOSED,
     WIND_DOWN_CLOSE_REFUSED, WIND_DOWN_CLOSE_UNKNOWN, WIND_DOWN_EXIT_STUCK,
     WIND_DOWN_NOT_ATTEMPTED, WIND_DOWN_NO_CLOSE_AUTHORITY,
 };
 use crate::session::tracking_health::{LiveClaudeProcess, TrackingHealthPass};
+use crate::session::transcript_facts::TranscriptFacts;
 use crate::session::wind_down_observer::{
     self, CustodyProbe, GitCustodyProbe, OwnershipRead, SessionCustodyContext,
 };
 use crate::settings::FinishedSessionClose;
 use crate::terminal::graceful_exit::{ChildExemptions, GracefulExitOutcome};
 use crate::terminal::TerminalManager;
-use qontinui_runner_lib::wind_down::{self, CustodyVerdict, SessionKind};
+use qontinui_runner_lib::wind_down::{
+    self, CustodyVerdict, ObligationsUnknown, ObligationsVerdict, SessionKind,
+};
 
 /// How often the executor looks (plan Phase 4).
 pub const TICK: Duration = Duration::from_secs(30);
@@ -219,6 +225,87 @@ pub enum TickAction {
     Nothing,
 }
 
+/// Which passes one tick runs, from its [`TickAction`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TickPasses {
+    /// The guarded `finished_close` pass ([`finished_close_once`]), still
+    /// subject to its own switch and cadence ([`finished_close::plan_pass`]).
+    pub finished_close: bool,
+    /// The drain arm ([`wind_down_once`]).
+    pub drain: bool,
+    /// Restart what a drain stopped ([`undrain`]).
+    pub undrain: bool,
+}
+
+/// PURE: the passes a tick runs.
+///
+/// A DRAINED tick runs the guarded `finished_close` pass as well as the drain
+/// arm (plan
+/// `2026-11-16-finished-close-mints-its-close-authority-from-the-served-close-conditions`,
+/// Phase 3), so a drain is relieved through the same close guard: the drain
+/// arm itself still presents no close authority, and the guarded arm closes
+/// the qualifying finished terminal sessions. The `finished_close` pass runs
+/// FIRST on such a tick, so a qualifying session is judged by the guard before
+/// the drain arm reaches it. The two passes share ONE per-tick budget: the
+/// drain arm closes at most what the guarded batch left of
+/// [`MAX_CLOSES_PER_TICK`], and never a session that batch already judged this
+/// tick ([`drain_share_after`]). `Undrain` and `Nothing` (the `Unknown` drain
+/// state) run neither close pass.
+pub fn tick_passes(action: TickAction) -> TickPasses {
+    match action {
+        TickAction::WindDown => TickPasses {
+            finished_close: true,
+            drain: true,
+            undrain: false,
+        },
+        TickAction::FinishedClose => TickPasses {
+            finished_close: true,
+            ..TickPasses::default()
+        },
+        TickAction::Undrain => TickPasses {
+            undrain: true,
+            ..TickPasses::default()
+        },
+        TickAction::Nothing => TickPasses::default(),
+    }
+}
+
+/// What the drain arm may still do on a tick whose guarded `finished_close`
+/// pass already ran: the rest of the ONE per-tick budget, and the sessions it
+/// must skip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DrainShare {
+    /// Close attempts left for the drain arm this tick.
+    pub budget: usize,
+    /// `claude` session ids the guarded batch already judged this tick. The
+    /// drain arm does not re-attempt them: the guard's verdict (held, unknown,
+    /// or a close it made) stands for the tick.
+    pub skip: BTreeSet<String>,
+}
+
+/// A `Shadowed` outcome is charged too: under `shadow` the guarded batch
+/// still judged that session this tick, and the drain arm presents no close
+/// authority (plan D3), so leaving it to the drain would change nothing but
+/// the lifecycle record's `wind_down_arm`.
+///
+/// PURE: the drain arm's share of a tick after the guarded pass reported
+/// `guarded` (`None` when it did not run). Every candidate the guarded batch
+/// took, whatever its outcome, spent one slot of [`MAX_CLOSES_PER_TICK`].
+pub(crate) fn drain_share_after(guarded: Option<&FinishedCloseTick>) -> DrainShare {
+    match guarded {
+        Some(FinishedCloseTick::Ran {
+            batched, outcomes, ..
+        }) => DrainShare {
+            budget: MAX_CLOSES_PER_TICK.saturating_sub(outcomes.len()),
+            skip: batched.iter().cloned().collect(),
+        },
+        _ => DrainShare {
+            budget: MAX_CLOSES_PER_TICK,
+            skip: BTreeSet::new(),
+        },
+    }
+}
+
 /// PURE: decide one tick from the drain state and whether this runner still
 /// OWES an undrain — a drain it has seen (or, across a restart, one whose
 /// stopped-by-drain set it inherited) that has not yet been undone.
@@ -257,14 +344,15 @@ pub fn decide_tick(state: &CoordDrainState, owes_undrain: bool, now: DateTime<Ut
 /// is untouched), and the first tick after the role reopens the lane undrains.
 pub fn hold_undrain_for_role(
     action: TickAction,
-    role: Option<crate::coord_drain_state::DispatchRole>,
+    drain: &crate::coord_drain_state::CoordDrainState,
+    role: impl Into<crate::coord_drain_state::RoleReading>,
 ) -> TickAction {
+    // Held exactly when the gate would defer the steward restarts the undrain
+    // makes — a closing role, or an UNKNOWN one — and never while the state is
+    // not enrolled, where the gate ignores the role.
+    let blocked = !crate::coord_drain_state::autonomous_allowed(drain, role.into());
     match action {
-        TickAction::Undrain
-            if role.is_some_and(crate::coord_drain_state::DispatchRole::closes_agent_lane) =>
-        {
-            TickAction::Nothing
-        }
+        TickAction::Undrain if blocked => TickAction::Nothing,
         other => other,
     }
 }
@@ -544,7 +632,9 @@ async fn tick_once(state: &mut ExecutorState) {
     let Some(app) = crate::tauri_app_handle::current() else {
         return; // headless / unit-test context
     };
-    let drain = crate::coord_drain_state::current();
+    // Drain and role under ONE lock, so a fold between two reads cannot pair
+    // them into an answer neither reading gives.
+    let (drain, role) = crate::coord_drain_state::current_with_role();
     // `was_drained` is in-memory, so a runner RESTARTED mid-drain would forget
     // what it owes and the stewards the drain stopped would never come back.
     // The persisted set is the durable half of the same fact — consulted ONCE
@@ -590,30 +680,33 @@ async fn tick_once(state: &mut ExecutorState) {
 
     let action = hold_undrain_for_role(
         decide_tick(&drain, state.was_drained, Utc::now()),
-        crate::coord_drain_state::current_dispatch_role(),
+        &drain,
+        role,
     );
-    match action {
-        TickAction::Nothing => {}
-        TickAction::FinishedClose => {
-            finished_close_once(&app, grace, clock, &mut state.finished_close_last_census).await;
-        }
-        TickAction::Undrain => {
-            // `undrain` reports what it could not restart, so a kind the drain
-            // re-armed under is still owed and is retried on a later undrain.
-            state.was_drained = undrain(&app).await;
-        }
-        TickAction::WindDown => {
-            state.was_drained = true;
-            match clock {
-                ClockVerdict::Trustworthy => wind_down_once(&app, grace).await,
-                // Hazard 1. Fail closed: no close is attempted on an idle
-                // window measured across a clock step. Already logged at
-                // detection, above.
-                ClockVerdict::Jumped { .. } => {}
-                ClockVerdict::Quarantined => debug!(
-                    "wind_down_executor: still within the post-clock-jump quarantine — no closes"
-                ),
+    let passes = tick_passes(action);
+    let guarded = if passes.finished_close {
+        Some(finished_close_once(&app, grace, clock, &mut state.finished_close_last_census).await)
+    } else {
+        None
+    };
+    if passes.undrain {
+        // `undrain` reports what it could not restart, so a kind the drain
+        // re-armed under is still owed and is retried on a later undrain.
+        state.was_drained = undrain(&app).await;
+    }
+    if passes.drain {
+        state.was_drained = true;
+        match clock {
+            ClockVerdict::Trustworthy => {
+                wind_down_once(&app, grace, drain_share_after(guarded.as_ref())).await
             }
+            // Hazard 1. Fail closed: no close is attempted on an idle
+            // window measured across a clock step. Already logged at
+            // detection, above.
+            ClockVerdict::Jumped { .. } => {}
+            ClockVerdict::Quarantined => debug!(
+                "wind_down_executor: still within the post-clock-jump quarantine — no closes"
+            ),
         }
     }
 }
@@ -801,6 +894,19 @@ fn stray_exemptions(
     }
 }
 
+/// PURE: the child-gate policy `arm`'s close presents: `strays` (see
+/// [`stray_exemptions`]), and for the `finished_close` arm ALSO the
+/// [`ChildExemption::ShimOrPump`](crate::terminal::graceful_exit::ChildExemption::ShimOrPump)
+/// class — the session's own MCP shim, judged afresh by `classify_child` at the
+/// probe (plan `2026-11-04-runner-finished-close-closes-nothing-on-any-box`,
+/// Phase 2b). The drain arm presents nothing: every one of its children counts.
+fn arm_exemptions(arm: CloseArm, strays: ChildExemptions) -> ChildExemptions {
+    match arm {
+        CloseArm::FinishedClose => strays.with_shim_or_pump(),
+        CloseArm::Drain => strays,
+    }
+}
+
 /// Exit a pane, ending the stray wait loops it leaves behind.
 ///
 /// A stray background shell leads its own session and group, so no pane exit
@@ -919,8 +1025,15 @@ async fn save_stopped_by_drain(set: StoppedByDrain) {
 }
 
 /// One wind-down pass: observe, then close what is eligible.
-async fn wind_down_once(app: &tauri::AppHandle, grace: Duration) {
+async fn wind_down_once(app: &tauri::AppHandle, grace: Duration, share: DrainShare) {
     use tauri::Manager;
+
+    if share.budget == 0 {
+        debug!(
+            "wind_down_executor: the guarded finished_close batch spent this tick's close budget, so the drain arm waits for the next tick"
+        );
+        return;
+    }
 
     let fresh = wind_down_observer::fresh_pass(app, grace).await;
     let Some(pass) = fresh.pass.as_ref() else {
@@ -930,6 +1043,17 @@ async fn wind_down_once(app: &tauri::AppHandle, grace: Duration) {
         );
         return;
     };
+    // An incomplete census (a process the session registry could not settle
+    // may be a live `claude`) is not safe to act on: close nothing this tick.
+    // An undecided census was already logged once by `fresh_pass`
+    // (`CENSUS_UNDECIDED_LOG`, naming this arm's consequence too).
+    if !fresh.unknowns.is_empty() {
+        debug!(
+            unknowns = ?fresh.unknowns,
+            "wind_down_executor: census incomplete this tick — nothing closed"
+        );
+        return;
+    }
     let Some(manager) = app
         .try_state::<Arc<TerminalManager>>()
         .map(|s| s.inner().clone())
@@ -940,14 +1064,16 @@ async fn wind_down_once(app: &tauri::AppHandle, grace: Duration) {
         .try_state::<Arc<SessionLifecycleStore>>()
         .map(|s| s.inner().clone());
 
-    let candidates = select_candidates(&pass.report.terminal_hosted, &fresh.observed);
+    let mut candidates = select_candidates(&pass.report.terminal_hosted, &fresh.observed);
+    candidates.retain(|(session_id, _)| !share.skip.contains(session_id));
+    candidates.truncate(share.budget);
 
     if candidates.is_empty() {
         return;
     }
     info!(
         eligible = candidates.len(),
-        budget = MAX_CLOSES_PER_TICK,
+        budget = share.budget,
         "wind_down_executor: the device is drained — closing eligible sessions"
     );
 
@@ -965,6 +1091,27 @@ async fn wind_down_once(app: &tauri::AppHandle, grace: Duration) {
     close_batch(CloseArm::Drain, candidates, &effects).await;
 }
 
+/// What judging one candidate's custody established: the verdict, and every
+/// worktree path the gather covered ([`wind_down::CustodyInputs::covered`]) —
+/// the set [`judge_obligations`] holds coord's `worktrees` block against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CustodyJudged {
+    pub verdict: CustodyVerdict,
+    pub covered: Vec<String>,
+}
+
+impl From<CustodyVerdict> for CustodyJudged {
+    /// A verdict with nothing covered — what a test double answers. Its
+    /// obligations cross-check then admits only a body whose `worktrees`
+    /// block is empty.
+    fn from(verdict: CustodyVerdict) -> Self {
+        Self {
+            verdict,
+            covered: Vec::new(),
+        }
+    }
+}
+
 /// The custody verdict for one candidate of the `finished_close` arm: its
 /// attributed worktrees from `ownership`, every member probed fresh through
 /// `probe` (D2b, D2c). Shared by the pass and by the per-close re-check, so
@@ -975,7 +1122,7 @@ pub(crate) async fn judge_custody<P: CustodyProbe + ?Sized>(
     ownership: &OwnershipRead,
     workspace_root: Option<&Path>,
     session_id: &str,
-) -> CustodyVerdict {
+) -> CustodyJudged {
     let attributed =
         wind_down_observer::attributed_worktrees(ownership, session_id, workspace_root);
     let inputs = wind_down_observer::gather_custody(probe, context, attributed, session_id).await;
@@ -987,8 +1134,64 @@ pub(crate) async fn judge_custody<P: CustodyProbe + ?Sized>(
         custody = %finished_close::describe(&verdict),
         "wind_down_executor: finished_close custody judged"
     );
-    verdict
+    CustodyJudged {
+        verdict,
+        covered: inputs.covered,
+    }
 }
+
+/// coord's obligations answer for one candidate, as read — the raw body, or
+/// why the read failed. ONE read serves both the obligations gate and (from
+/// Phase 1 of plan
+/// `2026-11-16-finished-close-mints-its-close-authority-from-the-served-close-conditions`)
+/// the close guard's first-verdict hold, so the two can never judge two
+/// different answers.
+pub(crate) type ObligationsRead = Result<serde_json::Value, String>;
+
+/// The obligations verdict for one candidate of the `finished_close` arm,
+/// judged from coord's `coord_session_obligations` read for it. This is the
+/// REMOTE half of `closeable`; the local half is [`judge_custody`]. The ONE
+/// production judge: the pass and the per-close re-check both hand it the raw
+/// read their world/effects made, so a test double supplies a coord body and
+/// this function still runs. A read that fails in any way is UNKNOWN, which
+/// never closes (plan
+/// `2026-10-18-a-finished-session-is-safe-to-close-when-nothing-lives-only-in-it-and-coord-owns-whether-its-watchers-work`,
+/// Phase 6).
+///
+/// Two rules, in order:
+///
+/// 1. [`wind_down::obligations_gate`] over the body.
+/// 2. Only for a `Watched` answer: every worktree coord's `worktrees` block
+///    attributes to the session must be one the custody gate COVERED
+///    (`covered`, from [`CustodyJudged`]). One it did not is
+///    `Unknown(WorktreeNotProbed)` — coord saying the session owns a tree that
+///    no probe looked at is not evidence the tree is clean (#2981 review
+///    concern 3; [`wind_down_observer::first_uncovered_coord_worktree`]).
+pub(crate) fn judge_obligations(read: &ObligationsRead, covered: &[String]) -> ObligationsVerdict {
+    let verdict = wind_down::obligations_gate(read);
+    if !verdict.is_watched() {
+        return verdict;
+    }
+    match read
+        .as_ref()
+        .ok()
+        .and_then(|doc| wind_down_observer::first_uncovered_coord_worktree(doc, covered))
+    {
+        Some(worktree) => {
+            ObligationsVerdict::Unknown(ObligationsUnknown::WorktreeNotProbed { worktree })
+        }
+        None => verdict,
+    }
+}
+
+/// How many obligations READS one `finished_close` pass may make. Each read
+/// can wait out [`wind_down_observer::OBLIGATIONS_REQUEST_TIMEOUT`], and a
+/// custody-clean session whose obligations stay unwatched is re-read on every
+/// pass, so without a cap a box holding many such sessions would spend minutes
+/// of every pass on serial coord reads (#2981 review concern 4). Twice the
+/// batch budget leaves room for the unwatched ones ahead of a full batch; a
+/// candidate past the cap is `Unknown(Deferred)` this pass, never watched.
+pub const OBLIGATIONS_READS_PER_PASS: usize = MAX_CLOSES_PER_TICK * 2;
 
 /// Everything ONE `finished_close` tick reads from, or does to, the world —
 /// the seam that makes [`finished_close_tick`] testable end to end. The
@@ -1029,6 +1232,17 @@ pub(crate) trait FinishedCloseWorld: Sync {
     fn probe(&self) -> &dyn CustodyProbe;
     /// Publish this pass's custody verdicts for `/restart-readiness`.
     fn publish_custody(&self, verdicts: &[(String, CustodyVerdict)]);
+    /// Publish the close guard's verdicts for `/restart-readiness` — called
+    /// with an empty set on every pass that runs no close batch, so a verdict
+    /// never outlives the pass that reached it.
+    fn publish_close_guards(&self, views: &[(String, wind_down::CloseGuardView)]);
+    /// The REMOTE half of `closeable` for one candidate: coord's obligations
+    /// read, as read (judged by [`judge_obligations`]). Asked only for a
+    /// candidate whose custody was clean, and at most
+    /// [`OBLIGATIONS_READS_PER_PASS`] times per pass.
+    async fn obligations(&self, claude_session_id: &str) -> ObligationsRead;
+    /// Publish this pass's obligations verdicts for `/restart-readiness`.
+    fn publish_obligations(&self, verdicts: &[(String, ObligationsVerdict)]);
     /// Run [`close_batch`] for the `finished_close` arm over `clean`, through
     /// this world's [`CloseEffects`]. `ownership` is the pass's own read,
     /// made at `ownership_read_at`, which the per-close custody re-check may
@@ -1052,9 +1266,14 @@ pub(crate) enum FinishedCloseTick {
     /// A census was attempted and could not determine the terminal plane.
     NoCensus,
     /// The census ran. `judged` is every custody verdict reached, in order;
-    /// `outcomes` is the close batch over the clean ones.
+    /// `obligations` is every obligations verdict reached, which is only for
+    /// the candidates whose custody was clean; `outcomes` is the close batch
+    /// over the ones that were both. `batched` is the session ids handed to
+    /// that batch, in order (the drain arm's skip set on a drained tick).
     Ran {
         judged: Vec<(String, CustodyVerdict)>,
+        batched: Vec<String>,
+        obligations: Vec<(String, ObligationsVerdict)>,
         outcomes: Vec<CandidateOutcome>,
     },
 }
@@ -1072,11 +1291,21 @@ pub(crate) enum FinishedCloseTick {
 /// 2. The census's `Eligible` TERMINAL sessions are the candidates.
 /// 3. The ownership read is made once and shared; custody is judged per
 ///    candidate, in order, and probing STOPS once [`MAX_CLOSES_PER_TICK`]
-///    clean candidates are in hand — no batch can close more.
+///    candidates are in hand that are both custody-clean and obligations-watched
+///    — no batch can close more.
+///
+///    A candidate whose custody is clean is then judged on its OBLIGATIONS:
+///    every item coord's `coord_session_obligations` attributes to it must be
+///    watched, and a read that fails is UNKNOWN. That is the remote half of
+///    `closeable`; the two halves are one conjunction and neither stands in for
+///    the other. Once one read fails, the rest of the pass does not repeat it
+///    (each would wait out the same deadline): they are UNKNOWN too. And no
+///    pass makes more than [`OBLIGATIONS_READS_PER_PASS`] reads: past that,
+///    a candidate is UNKNOWN (`obligations_deferred`) until a later pass.
 /// 4. Every verdict reached is published (replacing the previous pass's),
-///    and ONLY the clean candidates go to the SAME [`close_batch`] the drain
-///    arm uses — which re-checks eligibility and custody again immediately
-///    before each close.
+///    and ONLY the candidates that are both go to the SAME [`close_batch`] the
+///    drain arm uses — which re-checks eligibility, custody and obligations
+///    again immediately before each close.
 pub(crate) async fn finished_close_tick<W: FinishedCloseWorld>(
     world: &W,
     clock: ClockVerdict,
@@ -1095,6 +1324,8 @@ pub(crate) async fn finished_close_tick<W: FinishedCloseWorld>(
         PassPlan::Census { shadow } => shadow,
         PassPlan::Skip(SkipReason::Off) => {
             world.publish_custody(&[]);
+            world.publish_obligations(&[]);
+            world.publish_close_guards(&[]);
             return FinishedCloseTick::Skipped(SkipReason::Off);
         }
         PassPlan::Skip(reason) => {
@@ -1108,6 +1339,9 @@ pub(crate) async fn finished_close_tick<W: FinishedCloseWorld>(
     *last_census = Some(now);
     let Some(pass) = world.census().await else {
         debug!("wind_down_executor: finished_close has no census this tick — nothing closed");
+        // Nothing was judged this tick, so no earlier batch's guard verdicts
+        // may stay published as current (review A6).
+        world.publish_close_guards(&[]);
         return FinishedCloseTick::NoCensus;
     };
     let candidates = {
@@ -1116,8 +1350,12 @@ pub(crate) async fn finished_close_tick<W: FinishedCloseWorld>(
     };
     if candidates.is_empty() {
         world.publish_custody(&[]);
+        world.publish_obligations(&[]);
+        world.publish_close_guards(&[]);
         return FinishedCloseTick::Ran {
             judged: Vec::new(),
+            batched: Vec::new(),
+            obligations: Vec::new(),
             outcomes: Vec::new(),
         };
     }
@@ -1127,13 +1365,18 @@ pub(crate) async fn finished_close_tick<W: FinishedCloseWorld>(
     let ownership_read_at = Instant::now();
     let workspace_root = world.workspace_root();
     let mut judged: Vec<(String, CustodyVerdict)> = Vec::new();
+    let mut obligations_judged: Vec<(String, ObligationsVerdict)> = Vec::new();
     let mut clean: Vec<(String, String)> = Vec::new();
+    // Set by the first obligations read of this pass that could not be made.
+    let mut obligations_down: Option<String> = None;
+    let mut obligations_reads = 0usize;
+    let mut cap_logged = false;
     for (session_id, terminal_id) in candidates {
         if clean.len() >= MAX_CLOSES_PER_TICK {
             break;
         }
         let context = world.custody_context(&pass, &session_id, &terminal_id);
-        let verdict = judge_custody(
+        let CustodyJudged { verdict, covered } = judge_custody(
             world.probe(),
             &context,
             &ownership,
@@ -1142,7 +1385,47 @@ pub(crate) async fn finished_close_tick<W: FinishedCloseWorld>(
         )
         .await;
         if verdict.is_clean() {
-            clean.push((session_id.clone(), terminal_id));
+            let obligations = if let Some(why) = &obligations_down {
+                ObligationsVerdict::unreadable(format!(
+                    "not re-read: an earlier read this pass failed ({why})"
+                ))
+            } else if obligations_reads >= OBLIGATIONS_READS_PER_PASS {
+                if !cap_logged {
+                    cap_logged = true;
+                    info!(
+                        cap = OBLIGATIONS_READS_PER_PASS,
+                        "wind_down_executor: finished_close spent its obligations-read budget \
+                         for this pass — the remaining custody-clean candidates are UNKNOWN \
+                         until a later pass"
+                    );
+                }
+                ObligationsVerdict::Unknown(ObligationsUnknown::Deferred {
+                    detail: format!(
+                        "this pass already made {OBLIGATIONS_READS_PER_PASS} obligations reads"
+                    ),
+                })
+            } else {
+                obligations_reads += 1;
+                let read = world.obligations(&session_id).await;
+                let judged = judge_obligations(&read, &covered);
+                if let ObligationsVerdict::Unknown(ObligationsUnknown::Unreadable { detail }) =
+                    &judged
+                {
+                    obligations_down = Some(detail.clone());
+                }
+                judged
+            };
+            if obligations.is_watched() {
+                clean.push((session_id.clone(), terminal_id));
+            } else {
+                info!(
+                    session_id = %session_id,
+                    terminal_id = %terminal_id,
+                    obligations = %finished_close::describe_obligations(&obligations),
+                    "wind_down_executor: finished, idle past grace and custody-clean, but its obligations are not all watched — not closed"
+                );
+            }
+            obligations_judged.push((session_id.clone(), obligations));
         } else {
             info!(
                 session_id = %session_id,
@@ -1154,10 +1437,14 @@ pub(crate) async fn finished_close_tick<W: FinishedCloseWorld>(
         judged.push((session_id, verdict));
     }
     world.publish_custody(&judged);
+    world.publish_obligations(&obligations_judged);
 
     if clean.is_empty() {
+        world.publish_close_guards(&[]);
         return FinishedCloseTick::Ran {
             judged,
+            batched: Vec::new(),
+            obligations: obligations_judged,
             outcomes: Vec::new(),
         };
     }
@@ -1165,13 +1452,31 @@ pub(crate) async fn finished_close_tick<W: FinishedCloseWorld>(
         clean = clean.len(),
         budget = MAX_CLOSES_PER_TICK,
         shadow,
-        "wind_down_executor: finished_close — closing finished, custody-clean sessions"
+        "wind_down_executor: finished_close — closing finished, custody-clean, obligations-watched sessions"
     );
-    let outcomes = world
+    let batched: Vec<String> = clean
+        .iter()
+        .take(MAX_CLOSES_PER_TICK)
+        .map(|(s, _)| s.clone())
+        .collect();
+    let outcomes = match world
         .close_clean(&pass, clean, workspace_root, &ownership, ownership_read_at)
         .await
-        .unwrap_or_default();
-    FinishedCloseTick::Ran { judged, outcomes }
+    {
+        Some(outcomes) => outcomes,
+        None => {
+            // No batch ran (the pane manager is gone): nothing was judged, so
+            // no earlier batch's verdicts may stay published (review A6).
+            world.publish_close_guards(&[]);
+            Vec::new()
+        }
+    };
+    FinishedCloseTick::Ran {
+        judged,
+        batched,
+        obligations: obligations_judged,
+        outcomes,
+    }
 }
 
 /// The `finished_close` arm's census, as the live world holds it.
@@ -1205,21 +1510,17 @@ impl FinishedCloseWorld for LiveFinishedCloseWorld<'_> {
 
     async fn census(&self) -> Option<LiveCensus> {
         let fresh = wind_down_observer::fresh_pass(self.app, self.grace).await;
-        if fresh.pass.is_none() {
+        // Incomplete — no table, or a process the session registry could not
+        // settle — is no census: the arm closes nothing on it.
+        if !fresh.unknowns.is_empty() {
             debug!(unknowns = ?fresh.unknowns, "wind_down_executor: finished_close census incomplete");
+            return None;
         }
         let observed = fresh.observed;
-        let census = fresh.pass.map(|pass| LiveCensus { pass, observed });
-        // SHADOW ONLY (plan 2026-11-04-runner-finished-close-closes-nothing-on-any-box,
-        // Phase 2a): log what `classify_child` would admit or refuse for every
-        // finished session, on a task of its own this census never waits on.
-        // It changes no candidate, verdict or close.
-        if let Some(census) = &census {
-            crate::session::classify_child_shadow::spawn_observe(
-                &census.pass.report.terminal_hosted,
-            );
-        }
-        census
+        // `classify_child` is judged inside the pass itself
+        // (`tracking_health::compute`), so the candidates below already read
+        // each finished session's children through it.
+        fresh.pass.map(|pass| LiveCensus { pass, observed })
     }
 
     fn census_view<'p>(
@@ -1255,6 +1556,18 @@ impl FinishedCloseWorld for LiveFinishedCloseWorld<'_> {
 
     fn publish_custody(&self, verdicts: &[(String, CustodyVerdict)]) {
         finished_close::publish_custody(verdicts, Utc::now().timestamp_millis());
+    }
+
+    async fn obligations(&self, claude_session_id: &str) -> ObligationsRead {
+        wind_down_observer::fetch_obligations(claude_session_id).await
+    }
+
+    fn publish_obligations(&self, verdicts: &[(String, ObligationsVerdict)]) {
+        finished_close::publish_obligations(verdicts, Utc::now().timestamp_millis());
+    }
+
+    fn publish_close_guards(&self, views: &[(String, wind_down::CloseGuardView)]) {
+        finished_close::publish_close_guards(views);
     }
 
     async fn close_clean(
@@ -1296,13 +1609,13 @@ async fn finished_close_once(
     grace: Duration,
     clock: ClockVerdict,
     last_census: &mut Option<Instant>,
-) {
+) -> FinishedCloseTick {
     let world = LiveFinishedCloseWorld {
         app,
         grace,
         probe: GitCustodyProbe::default(),
     };
-    finished_close_tick(&world, clock, last_census, Instant::now(), grace).await;
+    finished_close_tick(&world, clock, last_census, Instant::now(), grace).await
 }
 
 /// Which arm a [`close_batch`] runs for.
@@ -1367,6 +1680,15 @@ pub(crate) enum CandidateOutcome {
     /// `finished_close` only: the custody re-check no longer answered
     /// `Clean`. Nothing was typed at it.
     CustodyNotClean,
+    /// `finished_close` only: the obligations re-check no longer answered
+    /// `Watched` — an item is unwatched, or coord could not say. Nothing was
+    /// typed at it.
+    ObligationsNotWatched,
+    /// `finished_close` only: the close guard held the close on an input
+    /// beyond eligibility, custody and obligations — a PR head with no first
+    /// CI verdict, a revival after the finish, or an undelivered message — or
+    /// could not determine one. Nothing was typed at it.
+    GuardHeld,
     /// `finished_close` in `shadow`: every check passed and the close was
     /// logged, not made. Nothing was typed at it.
     Shadowed,
@@ -1395,7 +1717,28 @@ pub(crate) trait CloseEffects {
     async fn recheck(&self, session_id: &str, terminal_id: &str)
         -> Option<wind_down::WindDownView>;
     /// (c) `finished_close` only: re-judge ONE candidate's custody, fresh.
-    async fn recheck_custody(&self, session_id: &str, terminal_id: &str) -> CustodyVerdict;
+    async fn recheck_custody(&self, session_id: &str, terminal_id: &str) -> CustodyJudged;
+    /// (d) `finished_close` only: re-read ONE candidate's obligations from
+    /// coord, fresh, as read. The remote half of `closeable` — read FIRST,
+    /// because it is the slow one (up to 45 s), so the local re-checks sit
+    /// next to the close; [`close_batch`] judges it with [`judge_obligations`].
+    async fn recheck_obligations(&self, session_id: &str) -> ObligationsRead;
+    /// (e) `finished_close` only: coord's undelivered messages for this
+    /// device, each attributed to the session it is for where the runner can
+    /// tell — the close guard's condition-2 "no undelivered message" input.
+    async fn undelivered_messages(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<finished_close_guard::PendingMessage>, String>;
+    /// (f) `finished_close` only: the newest transcript copy's facts, read
+    /// deep enough to reach `finished_at_ms` — the guard's revival input.
+    async fn transcript_facts(
+        &self,
+        session_id: &str,
+        finished_at_ms: Option<i64>,
+    ) -> Result<TranscriptFacts, String>;
+    /// `finished_close` only: publish the batch's close-guard verdicts.
+    fn publish_close_guards(&self, views: &[(String, wind_down::CloseGuardView)]);
     /// `finished_close` in `shadow`: log that this candidate WOULD be closed,
     /// with the inputs it was judged on — `custody` is the verdict the
     /// re-check just reached, not the pass's.
@@ -1466,6 +1809,32 @@ pub(crate) trait CloseEffects {
 ///   so custody is re-judged fresh immediately before every close, the first
 ///   included. The drain arm never consults custody.
 ///
+/// * **OBLIGATIONS, for `finished_close`.** The remote half of `closeable`:
+///   coord's `coord_session_obligations` is read again before every close. A
+///   gate can be withdrawn, or a watcher can die, in the minutes a batch takes;
+///   an unreadable answer is UNKNOWN and never closes. The drain arm never
+///   consults it.
+///
+/// **The order, for `finished_close`** (#2981 review concern 2): the coord
+/// obligations read FIRST — it can take up to 45 s — and coord's undelivered
+/// messages, then the eligibility and custody re-checks and the transcript
+/// read, then the judgement of that read against what custody covered, then
+/// the close. So the freshest LOCAL reads (is the session still idle and
+/// finished, are its trees still clean, has it been revived) are the ones
+/// nearest the `/exit`, and no eligibility answer is 45 s stale by the time it
+/// is acted on.
+///
+/// **The close guard, for `finished_close`** (plan
+/// `2026-11-16-finished-close-mints-its-close-authority-from-the-served-close-conditions`,
+/// Phase 1): every input above is handed to
+/// [`finished_close_guard::judge`], which also judges the first-verdict hold,
+/// revival and undelivered messages. Its verdict is logged at INFO
+/// (`close guard: would mint | held <reason> | unknown <reason>`, with every
+/// input) and published as `windDown.closeGuard`, BEFORE the shadow branch, so
+/// a shadow-mode arm logs it too. Anything but `Close` makes no close attempt.
+/// A `Close` proceeds to today's [`CloseEffects::wind_down_one`], which still
+/// presents no close authority (Phase 2 mints).
+///
 /// In `shadow`, every one of those checks still runs, and the close is logged
 /// instead of made. `graceful_exit`'s own refusals (a child process, a nested
 /// `claude`, a screen not at an empty prompt) are not among them, so a logged
@@ -1476,52 +1845,78 @@ pub(crate) async fn close_batch<E: CloseEffects + Sync>(
     effects: &E,
 ) -> Vec<CandidateOutcome> {
     let mut outcomes = Vec::new();
+    let mut guard_views: Vec<(String, wind_down::CloseGuardView)> = Vec::new();
     for (index, (session_id, terminal_id)) in
         candidates.into_iter().take(MAX_CLOSES_PER_TICK).enumerate()
     {
-        let admission = effects.arm_still_admitted(arm);
+        let mut admission = effects.arm_still_admitted(arm);
         if admission == Admission::Withdrawn {
             info!(
                 arm = arm.word(),
                 "wind_down_executor: the arm no longer applies mid-batch — stopping this pass"
             );
             outcomes.push(CandidateOutcome::ArmWithdrawn);
+            if arm == CloseArm::FinishedClose {
+                effects.publish_close_guards(&guard_views);
+            }
             return outcomes;
         }
-        let rechecked = if recheck_is_owed(arm, index) {
-            effects.recheck(&session_id, &terminal_id).await
-        } else {
-            None
-        };
-        if !recheck_admits(arm, index, rechecked.as_ref()) {
-            info!(
-                session_id = %session_id,
-                terminal_id = %terminal_id,
-                verdict = rechecked.as_ref().map_or("gone", |v| v.eligibility),
-                reason = rechecked.as_ref().and_then(|v| v.reason).unwrap_or("-"),
-                "wind_down_executor: no longer eligible when its turn came — not closed"
-            );
-            outcomes.push(CandidateOutcome::NoLongerEligible);
-            continue;
-        }
-        // `finished_close` re-judges custody immediately before EVERY close
-        // (see `recheck_is_owed`); the drain arm never consults it.
         let custody = if arm == CloseArm::FinishedClose {
-            let custody = effects.recheck_custody(&session_id, &terminal_id).await;
-            if !custody.is_clean() {
+            // Every input read for THIS close, in the order above, then the
+            // guard. Nothing past this point can be closed without it.
+            let (verdict, arms, custody) =
+                guard_one_close(effects, index, &session_id, &terminal_id).await;
+            let judged_at_ms = Utc::now().timestamp_millis();
+            log_guard(&session_id, &terminal_id, &verdict, &arms);
+            guard_views.push((
+                session_id.clone(),
+                finished_close_guard::view(&verdict, &arms, judged_at_ms),
+            ));
+            match verdict {
+                // Phase 1 is shadow: the token is judged and dropped, and the
+                // close below still presents no close authority.
+                GuardVerdict::Close(_) => custody,
+                GuardVerdict::Held(r) | GuardVerdict::Unknown(r) => {
+                    outcomes.push(outcome_for_guard_arm(r.arm));
+                    continue;
+                }
+            }
+        } else {
+            let rechecked = if recheck_is_owed(arm, index) {
+                effects.recheck(&session_id, &terminal_id).await
+            } else {
+                None
+            };
+            if !recheck_admits(arm, index, rechecked.as_ref()) {
                 info!(
                     session_id = %session_id,
                     terminal_id = %terminal_id,
-                    custody = %finished_close::describe(&custody),
-                    "wind_down_executor: custody no longer clean when its turn came — not closed"
+                    verdict = rechecked.as_ref().map_or("gone", |v| v.eligibility),
+                    reason = rechecked.as_ref().and_then(|v| v.reason).unwrap_or("-"),
+                    "wind_down_executor: no longer eligible when its turn came — not closed"
                 );
-                outcomes.push(CandidateOutcome::CustodyNotClean);
+                outcomes.push(CandidateOutcome::NoLongerEligible);
                 continue;
             }
-            Some(custody)
-        } else {
             None
         };
+        if arm == CloseArm::FinishedClose {
+            // The guard's reads can take most of a minute (coord obligations,
+            // pending messages, custody probes, the transcript tail). Read the
+            // arm's admission AGAIN so a switch turned off, or a clock that
+            // left the window, during those reads still withdraws this close
+            // rather than acting on the admission read before them.
+            admission = effects.arm_still_admitted(arm);
+            if admission == Admission::Withdrawn {
+                info!(
+                    arm = arm.word(),
+                    "wind_down_executor: the arm no longer applies after the guard's reads — stopping this pass"
+                );
+                outcomes.push(CandidateOutcome::ArmWithdrawn);
+                effects.publish_close_guards(&guard_views);
+                return outcomes;
+            }
+        }
         if admission == Admission::Shadow {
             effects.would_close(&session_id, &terminal_id, custody.as_ref());
             outcomes.push(CandidateOutcome::Shadowed);
@@ -1569,7 +1964,108 @@ pub(crate) async fn close_batch<E: CloseEffects + Sync>(
         }
         outcomes.push(CandidateOutcome::Attempted);
     }
+    if arm == CloseArm::FinishedClose {
+        effects.publish_close_guards(&guard_views);
+    }
     outcomes
+}
+
+/// Read every close-guard input for ONE `finished_close` candidate, in the
+/// order [`close_batch`] documents, and judge it. Returns the verdict, every
+/// arm's answer, and the re-checked custody verdict (for the shadow log).
+///
+/// The custody probe and the transcript read are skipped once the fresh
+/// eligibility re-check does not admit the session: the guard's eligibility
+/// arm already decides then, and the custody probes are the expensive part.
+async fn guard_one_close<E: CloseEffects + Sync>(
+    effects: &E,
+    index: usize,
+    session_id: &str,
+    terminal_id: &str,
+) -> (
+    GuardVerdict,
+    Vec<(&'static str, finished_close_guard::ArmVerdict)>,
+    Option<CustodyVerdict>,
+) {
+    let obligations_read = effects.recheck_obligations(session_id).await;
+    let messages = effects.undelivered_messages(session_id).await;
+    let rechecked = effects.recheck(session_id, terminal_id).await;
+    let admitted = recheck_admits(CloseArm::FinishedClose, index, rechecked.as_ref());
+    let custody = if admitted {
+        Some(effects.recheck_custody(session_id, terminal_id).await)
+    } else {
+        None
+    };
+    let covered = custody.as_ref().map_or(&[][..], |c| c.covered.as_slice());
+    let obligations = judge_obligations(&obligations_read, covered);
+    let transcript = if admitted {
+        let stamp = rechecked.as_ref().and_then(|v| v.finished_at_ms);
+        Some(effects.transcript_facts(session_id, stamp).await)
+    } else {
+        None
+    };
+    let custody = custody.map(|c| c.verdict);
+    let inputs = GuardInputs {
+        session_id,
+        terminal_id,
+        eligibility: rechecked.as_ref(),
+        custody: custody.as_ref(),
+        obligations: &obligations,
+        obligations_body: obligations_read.as_ref().ok(),
+        transcript: transcript.as_ref(),
+        messages: &messages,
+        now_ms: Utc::now().timestamp_millis(),
+    };
+    let (verdict, arms) = finished_close_guard::judge_with_arms(&inputs);
+    (verdict, arms, custody)
+}
+
+/// The outcome a non-`Close` guard verdict is recorded as, by the arm that
+/// decided it — so the three pre-guard outcomes keep their meaning.
+fn outcome_for_guard_arm(arm: &str) -> CandidateOutcome {
+    match arm {
+        "eligibility" => CandidateOutcome::NoLongerEligible,
+        "custody" => CandidateOutcome::CustodyNotClean,
+        "obligations" => CandidateOutcome::ObligationsNotWatched,
+        _ => CandidateOutcome::GuardHeld,
+    }
+}
+
+/// The ONE INFO line per `finished_close` close attempt: the guard's verdict
+/// with every input's verdict beside it.
+fn log_guard(
+    session_id: &str,
+    terminal_id: &str,
+    verdict: &GuardVerdict,
+    arms: &[(&'static str, finished_close_guard::ArmVerdict)],
+) {
+    let inputs = finished_close_guard::describe_arms(arms);
+    match verdict {
+        GuardVerdict::Close(token) => info!(
+            session_id = %token.session_id(),
+            terminal_id = %token.terminal_id(),
+            inputs = %inputs,
+            "close guard: would mint"
+        ),
+        GuardVerdict::Held(r) => info!(
+            session_id = %session_id,
+            terminal_id = %terminal_id,
+            arm = r.arm,
+            detail = %r.detail,
+            inputs = %inputs,
+            "close guard: held {}",
+            r.reason
+        ),
+        GuardVerdict::Unknown(r) => info!(
+            session_id = %session_id,
+            terminal_id = %terminal_id,
+            arm = r.arm,
+            detail = %r.detail,
+            inputs = %inputs,
+            "close guard: unknown {}",
+            r.reason
+        ),
+    }
 }
 
 /// Does [`wind_down_exit`] present a close authority to the graceful exit?
@@ -1615,6 +2111,7 @@ pub const WIND_DOWN_PRESENTS_CLOSE_AUTHORITY: bool = false;
 /// past the missing authority above; the primitive checks that first.
 pub(crate) async fn wind_down_exit(
     manager: &Arc<TerminalManager>,
+    arm: CloseArm,
     session_id: &str,
     terminal_id: &str,
     kind: SessionKind,
@@ -1625,12 +2122,13 @@ pub(crate) async fn wind_down_exit(
         .await?;
     match &outcome {
         GracefulExitOutcome::Exited { .. } => {
-            info!(session_id = %session_id, terminal_id = %terminal_id, ?kind, "wind_down_executor: closed");
+            info!(session_id = %session_id, terminal_id = %terminal_id, ?kind, arm = arm.word(), "wind_down_executor: closed");
         }
         GracefulExitOutcome::NoCloseAuthority { claude_pids } => warn!(
             session_id = %session_id,
             terminal_id = %terminal_id,
             ?kind,
+            arm = arm.word(),
             pids = ?claude_pids,
             outcome = WIND_DOWN_NO_CLOSE_AUTHORITY,
             "wind_down_executor: refused no_close_authority — a live claude is in the pane and \
@@ -1638,7 +2136,7 @@ pub(crate) async fn wind_down_exit(
              typed, nothing closed, the session is still running"
         ),
         other => {
-            warn!(session_id = %session_id, terminal_id = %terminal_id, ?kind, outcome = ?other, "wind_down_executor: not closed");
+            warn!(session_id = %session_id, terminal_id = %terminal_id, ?kind, arm = arm.word(), outcome = ?other, "wind_down_executor: not closed");
         }
     }
     Ok(outcome)
@@ -1708,7 +2206,7 @@ impl CloseEffects for LiveCloseEffects<'_> {
         }
     }
 
-    async fn recheck_custody(&self, session_id: &str, terminal_id: &str) -> CustodyVerdict {
+    async fn recheck_custody(&self, session_id: &str, terminal_id: &str) -> CustodyJudged {
         let reused = self
             .pass_ownership
             .filter(|(_, read_at)| ownership_reusable(*read_at, Instant::now()))
@@ -1734,6 +2232,82 @@ impl CloseEffects for LiveCloseEffects<'_> {
         .await
     }
 
+    async fn recheck_obligations(&self, session_id: &str) -> ObligationsRead {
+        wind_down_observer::fetch_obligations(session_id).await
+    }
+
+    async fn undelivered_messages(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<finished_close_guard::PendingMessage>, String> {
+        use tauri::Manager;
+        let rows = wind_down_observer::fetch_pending_messages(session_id).await?;
+        // Attribution needs both resolvers. Without one, a row that IS for
+        // this session could read as nobody's, so the read is refused instead.
+        let Some(store) = self.store.as_ref() else {
+            return Err(
+                "the session lifecycle store is not available, so pending messages cannot be \
+                 attributed"
+                    .to_string(),
+            );
+        };
+        let Some(registrar) = self
+            .app
+            .try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>()
+            .map(|r| r.inner().clone())
+        else {
+            return Err(
+                "the coord session registrar is not available, so pending messages cannot be \
+                 attributed"
+                    .to_string(),
+            );
+        };
+        Ok(rows
+            .into_iter()
+            .map(|(message_id, to_session)| {
+                // The two resolutions by which the delivery poller reaches a
+                // terminal session: a lifecycle record keyed by the id, else
+                // coord's session UUID through the registrar's forward index.
+                // Its third, a direct SDK session keyed by its task-run id, is
+                // never a terminal pane, so a row only that arm would take
+                // reads as no session this arm could close (`owner` `None`).
+                let owner = store
+                    .get(&to_session)
+                    .map(|r| r.claude_session_id)
+                    .or_else(|| {
+                        let uuid = to_session.parse::<uuid::Uuid>().ok()?;
+                        registrar.task_run_id_for(&uuid)
+                    });
+                finished_close_guard::PendingMessage {
+                    message_id,
+                    to_session,
+                    owner,
+                }
+            })
+            .collect())
+    }
+
+    async fn transcript_facts(
+        &self,
+        session_id: &str,
+        finished_at_ms: Option<i64>,
+    ) -> Result<TranscriptFacts, String> {
+        let session_id = session_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            crate::session::transcript_facts::facts_for_session(
+                &session_id,
+                finished_at_ms,
+                finished_close_guard::BAND_MS,
+            )
+        })
+        .await
+        .map_err(|e| format!("the transcript read did not complete: {e}"))?
+    }
+
+    fn publish_close_guards(&self, views: &[(String, wind_down::CloseGuardView)]) {
+        finished_close::publish_close_guards(views);
+    }
+
     fn would_close(&self, session_id: &str, terminal_id: &str, custody: Option<&CustodyVerdict>) {
         let observation = self.observed.observation_for(terminal_id);
         let custody = custody.map_or_else(|| "-".to_string(), finished_close::describe);
@@ -1745,7 +2319,7 @@ impl CloseEffects for LiveCloseEffects<'_> {
             judged_at_ms = self.observed.now_ms,
             grace_s = self.grace.as_secs(),
             custody = %custody,
-            "wind_down_executor: SHADOW — would close {session_id} (finished, idle past grace, re-checked custody {custody}; graceful_exit's process and screen checks not run); closing nothing"
+            "wind_down_executor: SHADOW — would close {session_id} (finished, idle past grace, re-checked custody {custody} and obligations; graceful_exit's process and screen checks not run); closing nothing"
         );
     }
 
@@ -1799,10 +2373,11 @@ impl CloseEffects for LiveCloseEffects<'_> {
             |recorded: &Vec<crate::session::stray_wait::RecordedStray>| {
                 wind_down_exit(
                     manager,
+                    arm,
                     session_id,
                     terminal_id,
                     kind,
-                    stray_exemptions(presents_strays, recorded),
+                    arm_exemptions(arm, stray_exemptions(presents_strays, recorded)),
                 )
             },
             crate::session::stray_wait::end_strays,
@@ -1959,28 +2534,52 @@ mod tests {
     /// is held instead, and every other action passes through untouched.
     #[test]
     fn an_undrain_is_held_while_the_dispatch_role_closes_the_agent_lane() {
-        use crate::coord_drain_state::DispatchRole;
+        use crate::coord_drain_state::{CoordDrainState, DispatchRole};
+        let clear = CoordDrainState::Clear;
         for role in [DispatchRole::CiNode, DispatchRole::Bench] {
             assert_eq!(
-                hold_undrain_for_role(TickAction::Undrain, Some(role)),
+                hold_undrain_for_role(TickAction::Undrain, &clear, Some(role)),
                 TickAction::Nothing
             );
             // A role never stops a wind-down: that is the drain's alone.
             assert_eq!(
-                hold_undrain_for_role(TickAction::WindDown, Some(role)),
+                hold_undrain_for_role(TickAction::WindDown, &clear, Some(role)),
                 TickAction::WindDown
             );
         }
         for role in [None, Some(DispatchRole::Workhorse)] {
             assert_eq!(
-                hold_undrain_for_role(TickAction::Undrain, role),
+                hold_undrain_for_role(TickAction::Undrain, &clear, role),
                 TickAction::Undrain
             );
         }
         assert_eq!(
-            hold_undrain_for_role(TickAction::Nothing, Some(DispatchRole::CiNode)),
+            hold_undrain_for_role(TickAction::Nothing, &clear, Some(DispatchRole::CiNode)),
             TickAction::Nothing
         );
+        // An unknown role defers the steward restarts too, so it holds as well,
+        // and still never stops a wind-down.
+        use crate::coord_drain_state::RoleReading;
+        assert_eq!(
+            hold_undrain_for_role(TickAction::Undrain, &clear, RoleReading::Unknown),
+            TickAction::Nothing
+        );
+        assert_eq!(
+            hold_undrain_for_role(TickAction::WindDown, &clear, RoleReading::Unknown),
+            TickAction::WindDown
+        );
+        // Not enrolled: the gate ignores every reading, so the undrain runs.
+        let not_enrolled = CoordDrainState::NotEnrolled { why: "x" };
+        for role in [
+            RoleReading::Unknown,
+            RoleReading::Known(Some(DispatchRole::CiNode)),
+        ] {
+            assert_eq!(
+                hold_undrain_for_role(TickAction::Undrain, &not_enrolled, role),
+                TickAction::Undrain,
+                "{role:?}"
+            );
+        }
     }
 
     // ── Invariant 1: no kill path from this module ───────────────────────
@@ -2406,6 +3005,9 @@ mod tests {
                 reason: None,
                 kind: SessionKind::Terminal,
                 custody: None,
+                obligations: None,
+                close_guard: None,
+                finished_at_ms: None,
             }),
             stray_wait_shells: 0,
         }
@@ -2457,6 +3059,9 @@ mod tests {
             reason: None,
             kind: SessionKind::Terminal,
             custody: None,
+            obligations: None,
+            close_guard: None,
+            finished_at_ms: None,
         };
         let not_yet = wind_down::WindDownView {
             eligibility: "not_yet",
@@ -2465,6 +3070,9 @@ mod tests {
             reason: None,
             kind: SessionKind::Terminal,
             custody: None,
+            obligations: None,
+            close_guard: None,
+            finished_at_ms: None,
         };
 
         // Drain arm: index 0 owes nothing — its verdict is the pass that just ran.
@@ -2536,11 +3144,21 @@ mod tests {
         verdicts: HashMap<String, wind_down::WindDownView>,
         /// What `recheck_custody` answers, by terminal id. Absent = `Clean`.
         custody: HashMap<String, CustodyVerdict>,
+        /// What `recheck_obligations` answers, by terminal id. Absent = a
+        /// watched body ([`watched_read`]).
+        obligations: HashMap<String, ObligationsRead>,
         /// What `wind_down_one` answers, by terminal id. Absent = `Exited`
         /// with one pid — the ordinary case.
         outcomes: HashMap<String, Result<GracefulExitOutcome, String>>,
         /// Which terminals hold a steward, and of which kind.
         stewards: HashMap<String, String>,
+        /// What `undelivered_messages` answers, by terminal id. Absent = none.
+        messages: HashMap<String, Result<Vec<finished_close_guard::PendingMessage>, String>>,
+        /// What `transcript_facts` answers, by terminal id. Absent =
+        /// [`quiet_facts`], nothing after the finish.
+        transcripts: HashMap<String, Result<TranscriptFacts, String>>,
+        /// Every set of close-guard verdicts published, in order.
+        guards: std::sync::Mutex<Vec<Vec<(String, wind_down::CloseGuardView)>>>,
         calls: std::sync::Mutex<Vec<String>>,
         admission_calls: std::sync::atomic::AtomicUsize,
     }
@@ -2551,11 +3169,37 @@ mod tests {
                 admissions: vec![Admission::Close],
                 verdicts: HashMap::new(),
                 custody: HashMap::new(),
+                obligations: HashMap::new(),
                 outcomes: HashMap::new(),
                 stewards: HashMap::new(),
+                messages: HashMap::new(),
+                transcripts: HashMap::new(),
+                guards: std::sync::Mutex::new(Vec::new()),
                 calls: std::sync::Mutex::new(Vec::new()),
                 admission_calls: std::sync::atomic::AtomicUsize::new(0),
             }
+        }
+        fn messages(
+            mut self,
+            terminal_id: &str,
+            read: Result<Vec<finished_close_guard::PendingMessage>, String>,
+        ) -> Self {
+            self.messages.insert(terminal_id.to_string(), read);
+            self
+        }
+        fn transcript(mut self, terminal_id: &str, read: Result<TranscriptFacts, String>) -> Self {
+            self.transcripts.insert(terminal_id.to_string(), read);
+            self
+        }
+        /// The verdict words of every published guard set, flattened.
+        fn guard_words(&self) -> Vec<(String, &'static str, Option<&'static str>)> {
+            self.guards
+                .lock()
+                .unwrap()
+                .iter()
+                .flatten()
+                .map(|(s, v)| (s.clone(), v.verdict, v.reason))
+                .collect()
         }
         fn eligible(mut self, terminal_id: &str) -> Self {
             self.verdicts
@@ -2588,6 +3232,10 @@ mod tests {
             self.custody.insert(terminal_id.to_string(), verdict);
             self
         }
+        fn obligations(mut self, terminal_id: &str, read: ObligationsRead) -> Self {
+            self.obligations.insert(terminal_id.to_string(), read);
+            self
+        }
         fn steward(mut self, terminal_id: &str, kind: &str) -> Self {
             self.stewards
                 .insert(terminal_id.to_string(), kind.to_string());
@@ -2610,6 +3258,9 @@ mod tests {
         }
     }
 
+    /// coord's finish stamp in every double's re-check view.
+    const FINISHED_AT_MS: i64 = 1_000;
+
     fn view(eligibility: &'static str) -> wind_down::WindDownView {
         wind_down::WindDownView {
             eligibility,
@@ -2618,6 +3269,21 @@ mod tests {
             reason: None,
             kind: SessionKind::Terminal,
             custody: None,
+            obligations: None,
+            close_guard: None,
+            finished_at_ms: Some(FINISHED_AT_MS),
+        }
+    }
+
+    /// A transcript with nothing after [`FINISHED_AT_MS`]: prompted and its
+    /// turn opened at -60 000, answered at 500, the whole file read.
+    fn quiet_facts() -> TranscriptFacts {
+        TranscriptFacts {
+            last_prompt_ms: Some(-60_000),
+            last_turn_open_ms: Some(-60_000),
+            last_asst_ms: Some(500),
+            window_floor_ms: Some(-60_000),
+            whole_file: true,
         }
     }
 
@@ -2755,6 +3421,47 @@ mod tests {
         );
     }
 
+    /// Phase 2b: ONLY the `finished_close` arm's close asks the child gate to
+    /// leave out a proven shim, whatever strays it also presents; the drain arm
+    /// presents nothing, so every child counts for it.
+    #[test]
+    fn only_the_finished_close_arm_presents_the_shim_exemption() {
+        let drain = arm_exemptions(CloseArm::Drain, ChildExemptions::none());
+        assert!(drain.is_empty(), "the drain arm presents no exemption");
+        let finished = arm_exemptions(CloseArm::FinishedClose, ChildExemptions::none());
+        assert_eq!(finished, ChildExemptions::none().with_shim_or_pump());
+        assert!(!finished.is_empty());
+        // Beside strays, and never twice.
+        let stray = crate::session::stray_wait::RecordedStray {
+            pid: 7,
+            start: 1,
+            argv: vec!["bash".to_string()],
+            class: "a".to_string(),
+        };
+        let both = arm_exemptions(
+            CloseArm::FinishedClose,
+            ChildExemptions::from_strays(vec![stray.clone()]),
+        );
+        assert_eq!(
+            both,
+            ChildExemptions::from_strays(vec![stray.clone()]).with_shim_or_pump()
+        );
+        assert_eq!(both.clone().with_shim_or_pump(), both);
+        assert_eq!(
+            arm_exemptions(
+                CloseArm::Drain,
+                ChildExemptions::from_strays(vec![stray.clone()])
+            ),
+            ChildExemptions::from_strays(vec![stray])
+        );
+        // The live impl and the one graceful_exit call pass it through.
+        let executor = executable_lines(include_str!("wind_down_executor.rs"));
+        assert!(
+            executor.contains("arm_exemptions(arm, stray_exemptions(presents_strays, recorded))"),
+            "LiveCloseEffects::wind_down_one no longer builds its policy through arm_exemptions"
+        );
+    }
+
     /// D4's tripwire: the module's ONE `graceful_exit(` call presents an
     /// authority exactly when [`WIND_DOWN_PRESENTS_CLOSE_AUTHORITY`] says so.
     /// Handing `wind_down_exit` an authority without flipping the constant,
@@ -2820,12 +3527,54 @@ mod tests {
                 .get(n)
                 .unwrap_or(self.admissions.last().unwrap())
         }
-        async fn recheck_custody(&self, _session_id: &str, terminal_id: &str) -> CustodyVerdict {
+        async fn recheck_custody(&self, _session_id: &str, terminal_id: &str) -> CustodyJudged {
             self.log(format!("custody:{terminal_id}"));
             self.custody
                 .get(terminal_id)
                 .cloned()
                 .unwrap_or(CustodyVerdict::Clean)
+                .into()
+        }
+        async fn recheck_obligations(&self, session_id: &str) -> ObligationsRead {
+            // Keyed by terminal id in the script, and `s-<t>` is the session id
+            // of terminal `<t>` everywhere this double is used.
+            let terminal_id = session_id.strip_prefix("s-").unwrap_or(session_id);
+            self.log(format!("obligations:{terminal_id}"));
+            self.obligations
+                .get(terminal_id)
+                .cloned()
+                .unwrap_or_else(watched_read)
+        }
+        async fn undelivered_messages(
+            &self,
+            session_id: &str,
+        ) -> Result<Vec<finished_close_guard::PendingMessage>, String> {
+            let terminal_id = session_id.strip_prefix("s-").unwrap_or(session_id);
+            self.log(format!("messages:{terminal_id}"));
+            self.messages
+                .get(terminal_id)
+                .cloned()
+                .unwrap_or_else(|| Ok(Vec::new()))
+        }
+        async fn transcript_facts(
+            &self,
+            session_id: &str,
+            finished_at_ms: Option<i64>,
+        ) -> Result<TranscriptFacts, String> {
+            let terminal_id = session_id.strip_prefix("s-").unwrap_or(session_id);
+            assert_eq!(
+                finished_at_ms,
+                Some(FINISHED_AT_MS),
+                "the stamp is the per-close re-check's"
+            );
+            self.log(format!("transcript:{terminal_id}"));
+            self.transcripts
+                .get(terminal_id)
+                .cloned()
+                .unwrap_or_else(|| Ok(quiet_facts()))
+        }
+        fn publish_close_guards(&self, views: &[(String, wind_down::CloseGuardView)]) {
+            self.guards.lock().unwrap().push(views.to_vec());
         }
         fn would_close(
             &self,
@@ -3162,9 +3911,26 @@ mod tests {
         ) -> Option<wind_down::WindDownView> {
             Some(finished_and_idle())
         }
-        async fn recheck_custody(&self, _session_id: &str, _terminal_id: &str) -> CustodyVerdict {
-            CustodyVerdict::Clean
+        async fn recheck_custody(&self, _session_id: &str, _terminal_id: &str) -> CustodyJudged {
+            CustodyVerdict::Clean.into()
         }
+        async fn recheck_obligations(&self, _session_id: &str) -> ObligationsRead {
+            watched_read()
+        }
+        async fn undelivered_messages(
+            &self,
+            _session_id: &str,
+        ) -> Result<Vec<finished_close_guard::PendingMessage>, String> {
+            Ok(Vec::new())
+        }
+        async fn transcript_facts(
+            &self,
+            _session_id: &str,
+            _finished_at_ms: Option<i64>,
+        ) -> Result<TranscriptFacts, String> {
+            Ok(quiet_facts())
+        }
+        fn publish_close_guards(&self, _views: &[(String, wind_down::CloseGuardView)]) {}
         fn would_close(&self, _session_id: &str, terminal_id: &str, _: Option<&CustodyVerdict>) {
             panic!("admission is Close, never Shadow: would_close({terminal_id})");
         }
@@ -3176,10 +3942,11 @@ mod tests {
         ) -> Result<GracefulExitOutcome, String> {
             wind_down_exit(
                 &self.manager,
+                arm,
                 session_id,
                 terminal_id,
                 SessionKind::Terminal,
-                stray_exemptions(records_strays(arm), &[]),
+                arm_exemptions(arm, stray_exemptions(records_strays(arm), &[])),
             )
             .await
         }
@@ -3525,10 +4292,11 @@ mod tests {
                 wind_down_arm: None,
                 finish_reason: None,
                 finish_synced: false,
+                finish_coord_session_id: None,
+                finish_coord_readdressed: false,
                 spawn_device_default: None,
                 adopted_from: None,
                 last_session_start_at: None,
-                last_alive_at: None,
                 gate_id: None,
                 gate_consuming_device_id: None,
                 gate_bound_boot_ms: None,
@@ -3718,6 +4486,9 @@ mod tests {
             reason: None,
             kind: SessionKind::Looping,
             custody: None,
+            obligations: None,
+            close_guard: None,
+            finished_at_ms: None,
         };
         for index in 0..4 {
             assert!(!recheck_admits(
@@ -3996,8 +4767,10 @@ mod tests {
             Admission::Close
         );
 
+        // `finished_close` reads the admission twice per candidate: before the
+        // guard's reads and again after them.
         let effects = RecordingEffects::new()
-            .admissions(&[Admission::Close, Admission::Withdrawn])
+            .admissions(&[Admission::Close, Admission::Close, Admission::Withdrawn])
             .eligible("t1")
             .eligible("t2");
         let outcomes = close_batch(CloseArm::FinishedClose, batch(&["t1", "t2"]), &effects).await;
@@ -4008,20 +4781,35 @@ mod tests {
         assert!(!effects.calls().contains(&"exit:t2".to_string()));
     }
 
-    /// The two arms share ONE budget: a tick takes exactly one action, so it
-    /// runs at most one arm, and whichever arm it runs is capped at
-    /// `MAX_CLOSES_PER_TICK`.
+    /// Review A1: the guard's reads can take most of a minute, so an arm
+    /// switched off DURING them withdraws the close that was admitted before
+    /// them — the admission is re-read after the guard, not carried across it.
     #[tokio::test]
-    async fn the_budget_is_shared_between_the_two_arms() {
+    async fn an_arm_withdrawn_during_the_guards_reads_withdraws_that_close() {
+        let effects = RecordingEffects::new()
+            .admissions(&[Admission::Close, Admission::Withdrawn])
+            .eligible("t1")
+            .eligible("t2");
+        let outcomes = close_batch(CloseArm::FinishedClose, batch(&["t1", "t2"]), &effects).await;
+        assert_eq!(outcomes, vec![CandidateOutcome::ArmWithdrawn]);
+        assert!(!effects.calls().contains(&"exit:t1".to_string()));
+        assert!(!effects.calls().iter().any(|c| c.ends_with(":t2")));
+    }
+
+    /// Each arm's batch is capped at `MAX_CLOSES_PER_TICK`; a tick takes one
+    /// action, and only a drained one runs both close passes (Phase 3 of plan
+    /// `2026-11-16-…`), the guarded one first. The shared budget itself is
+    /// pinned by `a_drained_tick_spends_one_budget_and_skips_what_the_guard_judged`.
+    #[tokio::test]
+    async fn each_batch_is_capped_and_a_drain_never_runs_without_the_guard() {
         let now = Utc::now();
         for state in [drained(), CoordDrainState::Clear, unknown()] {
             for owes in [false, true] {
-                let action = decide_tick(&state, owes, now);
-                let arms = [TickAction::WindDown, TickAction::FinishedClose]
-                    .iter()
-                    .filter(|a| **a == action)
-                    .count();
-                assert!(arms <= 1, "{state:?}/{owes}: one tick, at most one arm");
+                let passes = tick_passes(decide_tick(&state, owes, now));
+                assert!(
+                    !passes.drain || passes.finished_close,
+                    "{state:?}/{owes}: a drain pass never runs without the guarded pass"
+                );
             }
         }
         let ids: Vec<String> = (0..12).map(|i| format!("t{i}")).collect();
@@ -4042,6 +4830,45 @@ mod tests {
                 "{arm:?}"
             );
         }
+    }
+
+    /// Review A2: on a drained tick the two passes spend ONE budget. The drain
+    /// arm gets what the guarded batch left, and skips every session that
+    /// batch judged; with no guarded batch it gets the whole budget.
+    #[test]
+    fn a_drained_tick_spends_one_budget_and_skips_what_the_guard_judged() {
+        let none = drain_share_after(None);
+        assert_eq!(none.budget, MAX_CLOSES_PER_TICK);
+        assert!(none.skip.is_empty());
+        assert_eq!(
+            drain_share_after(Some(&FinishedCloseTick::NoCensus)).budget,
+            MAX_CLOSES_PER_TICK
+        );
+
+        let ran = FinishedCloseTick::Ran {
+            judged: Vec::new(),
+            batched: vec!["s1".to_string(), "s2".to_string(), "s3".to_string()],
+            obligations: Vec::new(),
+            outcomes: vec![
+                CandidateOutcome::GuardHeld,
+                CandidateOutcome::Shadowed,
+                CandidateOutcome::Attempted,
+            ],
+        };
+        let share = drain_share_after(Some(&ran));
+        assert_eq!(share.budget, MAX_CLOSES_PER_TICK - 3);
+        assert_eq!(
+            share.skip,
+            ["s1", "s2", "s3"].iter().map(|s| s.to_string()).collect()
+        );
+
+        let full = FinishedCloseTick::Ran {
+            judged: Vec::new(),
+            batched: Vec::new(),
+            obligations: Vec::new(),
+            outcomes: vec![CandidateOutcome::GuardHeld; MAX_CLOSES_PER_TICK + 1],
+        };
+        assert_eq!(drain_share_after(Some(&full)).budget, 0);
     }
 
     /// A steward a `finished_close` batch somehow reached is NOT recorded as
@@ -4073,6 +4900,71 @@ mod tests {
                 TickAction::Nothing
             );
         }
+    }
+
+    /// Phase 3: a DRAINED tick runs both the drain arm and the guarded
+    /// `finished_close` pass; an `Unknown` drain state runs neither; a clear
+    /// tick runs only the guarded pass; an owed undrain runs no close pass.
+    #[test]
+    fn a_drained_tick_runs_both_passes_and_an_unknown_one_runs_neither() {
+        let now = Utc::now();
+        let drained_tick = tick_passes(decide_tick(&drained(), false, now));
+        assert_eq!(
+            drained_tick,
+            TickPasses {
+                finished_close: true,
+                drain: true,
+                undrain: false
+            }
+        );
+        for owes in [false, true] {
+            assert_eq!(
+                tick_passes(decide_tick(&unknown(), owes, now)),
+                TickPasses::default(),
+                "an unreadable drain state is evidence for no pass"
+            );
+        }
+        assert_eq!(
+            tick_passes(decide_tick(&CoordDrainState::Clear, false, now)),
+            TickPasses {
+                finished_close: true,
+                ..TickPasses::default()
+            }
+        );
+        assert_eq!(
+            tick_passes(decide_tick(&CoordDrainState::Clear, true, now)),
+            TickPasses {
+                undrain: true,
+                ..TickPasses::default()
+            }
+        );
+        // `tick_once` dispatches through `tick_passes`, and runs the guarded
+        // pass before the drain arm.
+        let executor = executable_lines(include_str!("wind_down_executor.rs"));
+        let dispatch = executor
+            .find("let passes = tick_passes(action);")
+            .expect("tick_once dispatches through tick_passes");
+        let after_dispatch = executor.get(dispatch..).expect("a char boundary");
+        let guarded = after_dispatch
+            .find("if passes.finished_close {")
+            .expect("the guarded pass");
+        let drain = after_dispatch
+            .find("if passes.drain {")
+            .expect("the drain pass");
+        assert!(guarded < drain, "the guarded pass runs first");
+        // Review A2, round 2: the drain arm is handed the guarded pass's
+        // result, and it applies both halves of its share.
+        assert!(
+            after_dispatch
+                .contains("wind_down_once(&app, grace, drain_share_after(guarded.as_ref()))"),
+            "tick_once hands the drain arm its share of the one budget"
+        );
+        assert!(
+            executor
+                .contains("candidates.retain(|(session_id, _)| !share.skip.contains(session_id));")
+                && executor.contains("candidates.truncate(share.budget);"),
+            "wind_down_once applies the skip set and the remaining budget"
+        );
     }
 
     /// Review item 2: index 0 is re-checked too for `finished_close` — both
@@ -4159,6 +5051,12 @@ mod tests {
         /// When set, the ownership read answers exactly this instead of
         /// marking every candidate's coord session live.
         ownership_override: Option<OwnershipRead>,
+        /// What the pass's obligations read answers, by SESSION id. Absent =
+        /// a watched body ([`watched_read`]).
+        obligations: HashMap<String, ObligationsRead>,
+        /// Every session the pass read obligations for, in order.
+        obligations_read: std::sync::Mutex<Vec<String>>,
+        published_obligations: std::sync::Mutex<Vec<Vec<(String, ObligationsVerdict)>>>,
     }
 
     impl FakeWorld {
@@ -4190,7 +5088,18 @@ mod tests {
                 published: std::sync::Mutex::new(Vec::new()),
                 effects,
                 ownership_override: None,
+                obligations: HashMap::new(),
+                obligations_read: std::sync::Mutex::new(Vec::new()),
+                published_obligations: std::sync::Mutex::new(Vec::new()),
             }
+        }
+        /// Script the pass's obligations answer for `session_id`.
+        fn obligations(mut self, session_id: &str, read: ObligationsRead) -> Self {
+            self.obligations.insert(session_id.to_string(), read);
+            self
+        }
+        fn obligations_read(&self) -> Vec<String> {
+            self.obligations_read.lock().unwrap().clone()
         }
         fn tree(mut self, session_id: &str, state: wind_down::MemberState) -> Self {
             self.probe
@@ -4268,6 +5177,25 @@ mod tests {
         fn publish_custody(&self, verdicts: &[(String, CustodyVerdict)]) {
             self.published.lock().unwrap().push(verdicts.to_vec());
         }
+        async fn obligations(&self, claude_session_id: &str) -> ObligationsRead {
+            self.obligations_read
+                .lock()
+                .unwrap()
+                .push(claude_session_id.to_string());
+            self.obligations
+                .get(claude_session_id)
+                .cloned()
+                .unwrap_or_else(watched_read)
+        }
+        fn publish_obligations(&self, verdicts: &[(String, ObligationsVerdict)]) {
+            self.published_obligations
+                .lock()
+                .unwrap()
+                .push(verdicts.to_vec());
+        }
+        fn publish_close_guards(&self, views: &[(String, wind_down::CloseGuardView)]) {
+            self.effects.publish_close_guards(views);
+        }
         async fn close_clean(
             &self,
             _pass: &Self::Pass,
@@ -4313,7 +5241,10 @@ mod tests {
         let report = tick(&world).await;
 
         assert_eq!(world.exits(), vec!["exit:t1".to_string()]);
-        let FinishedCloseTick::Ran { judged, outcomes } = report else {
+        let FinishedCloseTick::Ran {
+            judged, outcomes, ..
+        } = report
+        else {
             panic!("the census should have run: {report:?}");
         };
         assert_eq!(
@@ -4373,6 +5304,635 @@ mod tests {
         assert_eq!(off.published.lock().unwrap().clone(), vec![Vec::new()]);
     }
 
+    // ── The REMOTE half of `closeable`: coord's obligations ──────────────
+    //
+    // Plan `2026-10-18-a-finished-session-is-safe-to-close-when-nothing-lives-only-in-it-and-coord-owns-whether-its-watchers-work`,
+    // Phase 6. Each test enters through `finished_close_tick`, the function
+    // `tick_once` runs, so deleting the call that consults the obligations gate
+    // fails here and not only in the pure gate's own tests.
+
+    /// A coord obligations answer shaped like `session_obligations_core`'s:
+    /// every tracked source `read`, `spawned_followup` `not_tracked`.
+    fn obligations_body(
+        prs: serde_json::Value,
+        gates: serde_json::Value,
+        worktrees: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "claude_code_session_id": "11111111-1111-1111-1111-111111111111",
+            "all_tracked_sources_read": true,
+            "session_proven_in_tenant": true,
+            "prs": {"coverage": "read", "items": prs, "truncated": false},
+            "gates": {"coverage": "read", "items": gates, "truncated": false},
+            "worktrees": {"coverage": "read", "items": worktrees, "truncated": false},
+            "work_units": {"coverage": "read", "items": [], "truncated": false},
+            "findings": {"coverage": "read", "items": [], "truncated": false},
+            "spawned_followup": {"coverage": "not_tracked", "note": "n", "items": []},
+        })
+    }
+
+    fn gate_obligation(verdict: &str) -> serde_json::Value {
+        serde_json::json!({
+            "item": {"gate_id": "g-1"}, "verdict": verdict,
+            "reasons": ["the gate is muted"], "attribution": "proven",
+        })
+    }
+
+    /// A body whose `n` gates are all watched, and which names no worktree.
+    fn watched_n(n: usize) -> ObligationsRead {
+        let gates: Vec<serde_json::Value> = (0..n).map(|_| gate_obligation("watched")).collect();
+        Ok(obligations_body(
+            serde_json::json!([]),
+            serde_json::json!(gates),
+            serde_json::json!([]),
+        ))
+    }
+
+    /// The default the doubles answer: one watched gate, no worktree.
+    fn watched_read() -> ObligationsRead {
+        watched_n(1)
+    }
+
+    fn unwatched() -> ObligationsRead {
+        Ok(obligations_body(
+            serde_json::json!([]),
+            serde_json::json!([gate_obligation("not_watched")]),
+            serde_json::json!([]),
+        ))
+    }
+
+    /// (a) A finished, idle session whose custody is clean AND whose every
+    /// obligation is watched is closed.
+    #[tokio::test]
+    async fn a_finished_idle_session_with_watched_obligations_and_clean_custody_is_closed() {
+        let world = FakeWorld::with_sessions(&["t1"]).obligations("s-t1", watched_n(3));
+        let FinishedCloseTick::Ran {
+            judged,
+            obligations,
+            outcomes,
+            ..
+        } = tick(&world).await
+        else {
+            panic!("the census should have run");
+        };
+        assert_eq!(world.exits(), vec!["exit:t1".to_string()]);
+        assert_eq!(judged[0].1.as_str(), "clean");
+        assert_eq!(obligations[0].1.as_str(), "watched");
+        assert_eq!(outcomes, vec![CandidateOutcome::Attempted]);
+        assert_eq!(
+            world.published_obligations.lock().unwrap().clone(),
+            vec![obligations]
+        );
+    }
+
+    /// (b) An unwatched obligation keeps a custody-clean session open, and the
+    /// verdict is published for `/restart-readiness`.
+    #[tokio::test]
+    async fn an_unwatched_obligation_is_never_closed_over() {
+        let world = FakeWorld::with_sessions(&["t1", "t2"]).obligations("s-t1", unwatched());
+        let FinishedCloseTick::Ran {
+            judged,
+            obligations,
+            outcomes,
+            ..
+        } = tick(&world).await
+        else {
+            panic!("the census should have run");
+        };
+        // t1 never reaches the batch; t2, watched, does.
+        assert_eq!(world.exits(), vec!["exit:t2".to_string()]);
+        assert_eq!(outcomes, vec![CandidateOutcome::Attempted]);
+        assert_eq!(judged.len(), 2);
+        assert_eq!(
+            obligations
+                .iter()
+                .map(|(s, v)| (s.as_str(), v.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("s-t1", "unwatched"), ("s-t2", "watched")]
+        );
+        assert_eq!(obligations[0].1.reason(), Some("not_watched"));
+    }
+
+    /// (c) An obligations read that failed is UNKNOWN, and UNKNOWN never
+    /// closes — the session is not "closeable by default" because coord did
+    /// not answer.
+    #[tokio::test]
+    async fn an_unreadable_obligations_read_is_unknown_and_closes_nothing() {
+        let world = FakeWorld::with_sessions(&["t1"])
+            .obligations("s-t1", Err("GET …: operation timed out".to_string()));
+        let FinishedCloseTick::Ran {
+            obligations,
+            outcomes,
+            ..
+        } = tick(&world).await
+        else {
+            panic!("the census should have run");
+        };
+        assert!(world.exits().is_empty(), "{:?}", world.effects.calls());
+        assert!(outcomes.is_empty());
+        assert_eq!(obligations[0].1.as_str(), "unknown");
+        assert_eq!(obligations[0].1.reason(), Some("obligations_unreadable"));
+        // The batch was never entered, so no re-check ran either.
+        assert!(!world
+            .effects
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("obligations:")));
+    }
+
+    /// (d) A dirty custody is still not eligible — and it never costs a coord
+    /// read: the local half is asked first and gates the remote one.
+    #[tokio::test]
+    async fn dirty_custody_still_blocks_and_is_never_sent_to_coord() {
+        let world = FakeWorld::with_sessions(&["t1", "t2"])
+            .tree(
+                "s-t1",
+                wind_down::MemberState::Probed {
+                    dirty: true,
+                    ahead: 0,
+                },
+            )
+            // Even a fully watched answer cannot rescue it.
+            .obligations("s-t1", watched_n(9));
+        let FinishedCloseTick::Ran {
+            judged,
+            obligations,
+            ..
+        } = tick(&world).await
+        else {
+            panic!("the census should have run");
+        };
+        assert_eq!(world.exits(), vec!["exit:t2".to_string()]);
+        assert_eq!(judged[0].1.as_str(), "dirty");
+        assert_eq!(world.obligations_read(), vec!["s-t2".to_string()]);
+        assert_eq!(
+            obligations
+                .iter()
+                .map(|(s, _)| s.as_str())
+                .collect::<Vec<_>>(),
+            vec!["s-t2"],
+            "a dirty session carries no obligations verdict at all"
+        );
+    }
+
+    /// One unreadable read is the coord door being down: the rest of the pass
+    /// does not wait out the same deadline once per candidate. Each is UNKNOWN.
+    #[tokio::test]
+    async fn after_one_failed_obligations_read_the_pass_stops_asking() {
+        let world = FakeWorld::with_sessions(&["t1", "t2", "t3"])
+            .obligations("s-t1", Err("GET …: operation timed out".to_string()));
+        let FinishedCloseTick::Ran { obligations, .. } = tick(&world).await else {
+            panic!("the census should have run");
+        };
+        assert_eq!(world.obligations_read(), vec!["s-t1".to_string()]);
+        assert_eq!(obligations.len(), 3);
+        for (session, verdict) in &obligations {
+            assert_eq!(
+                verdict.reason(),
+                Some("obligations_unreadable"),
+                "{session}"
+            );
+        }
+        assert!(obligations[1].1.detail().unwrap().contains("earlier read"));
+        assert!(world.exits().is_empty());
+    }
+
+    /// The re-check at the batch: obligations that were watched when the pass
+    /// read them but are not when the candidate's turn comes are not closed.
+    #[tokio::test]
+    async fn obligations_are_re_read_immediately_before_every_close() {
+        let effects = RecordingEffects::new()
+            .eligible("t1")
+            .eligible("t2")
+            .obligations("t2", unwatched());
+        let outcomes = close_batch(CloseArm::FinishedClose, batch(&["t1", "t2"]), &effects).await;
+        assert_eq!(
+            outcomes,
+            vec![
+                CandidateOutcome::Attempted,
+                CandidateOutcome::ObligationsNotWatched
+            ]
+        );
+        let calls = effects.calls();
+        assert!(calls.contains(&"exit:t1".to_string()), "{calls:?}");
+        assert!(!calls.contains(&"exit:t2".to_string()), "{calls:?}");
+        // #2981 review concern 2: the slow coord read comes FIRST, and the
+        // local re-checks — eligibility, then custody — sit next to the close.
+        let at = |needle: &str| calls.iter().position(|c| c == needle).unwrap();
+        assert!(at("obligations:t1") < at("messages:t1"), "{calls:?}");
+        assert!(at("messages:t1") < at("recheck:t1"), "{calls:?}");
+        assert!(at("recheck:t1") < at("custody:t1"), "{calls:?}");
+        assert!(at("custody:t1") < at("transcript:t1"), "{calls:?}");
+        // Only the arm's local admission re-read (review A1) sits between the
+        // last guard input and the exit.
+        assert_eq!(
+            at("exit:t1"),
+            at("transcript:t1") + 2,
+            "only local reads sit between the custody re-check and the exit: {calls:?}"
+        );
+        assert_eq!(
+            calls[at("transcript:t1") + 1],
+            "admitted?:finished_close",
+            "{calls:?}"
+        );
+
+        // Unknown at the re-check is no better.
+        let unknown = RecordingEffects::new()
+            .eligible("t1")
+            .obligations("t1", Err("503".to_string()));
+        let outcomes = close_batch(CloseArm::FinishedClose, batch(&["t1"]), &unknown).await;
+        assert_eq!(outcomes, vec![CandidateOutcome::ObligationsNotWatched]);
+        assert!(!unknown.calls().contains(&"exit:t1".to_string()));
+    }
+
+    /// #2981 review concern 2: at the re-check the coord read is made FIRST,
+    /// so dirty custody still blocks — after it — and the drain arm never
+    /// consults obligations at all.
+    #[tokio::test]
+    async fn the_recheck_reads_obligations_first_and_never_for_the_drain() {
+        let dirty = RecordingEffects::new().eligible("t1").custody(
+            "t1",
+            CustodyVerdict::Dirty(wind_down::CustodyDirty::Uncommitted {
+                path: "/ws/a".to_string(),
+            }),
+        );
+        let outcomes = close_batch(CloseArm::FinishedClose, batch(&["t1"]), &dirty).await;
+        assert_eq!(outcomes, vec![CandidateOutcome::CustodyNotClean]);
+        let calls: Vec<String> = dirty
+            .calls()
+            .into_iter()
+            .filter(|c| !c.starts_with("admitted?:"))
+            .collect();
+        assert_eq!(
+            calls,
+            vec![
+                "obligations:t1",
+                "messages:t1",
+                "recheck:t1",
+                "custody:t1",
+                "transcript:t1"
+            ],
+            "the coord reads precede the local re-checks"
+        );
+
+        let drain = RecordingEffects::new()
+            .eligible("t1")
+            .eligible("t2")
+            .obligations("t1", unwatched());
+        let outcomes = close_batch(CloseArm::Drain, batch(&["t1", "t2"]), &drain).await;
+        assert_eq!(
+            outcomes,
+            vec![CandidateOutcome::Attempted, CandidateOutcome::Attempted]
+        );
+        assert!(!drain.calls().iter().any(|c| c.starts_with("obligations:")));
+    }
+
+    /// An off arm clears what it published, obligations included.
+    #[tokio::test]
+    async fn an_off_arm_clears_published_obligations() {
+        let mut off = FakeWorld::with_sessions(&["t1"]);
+        off.mode = FinishedSessionClose::Off;
+        let _ = tick(&off).await;
+        assert_eq!(
+            off.published_obligations.lock().unwrap().clone(),
+            vec![Vec::new()]
+        );
+    }
+
+    // ── #2981 review concerns 3, 4 and 5 ─────────────────────────────────
+
+    /// Concern 3: a worktree coord's obligations read attributes to the
+    /// session that the custody gate did not cover makes a watched answer
+    /// UNKNOWN; a covered one — exactly, or by coord's relative ledger path —
+    /// does not; and a row with no path is never matched.
+    #[test]
+    fn a_coord_worktree_custody_did_not_probe_makes_watched_obligations_unknown() {
+        let body = |path: serde_json::Value| -> ObligationsRead {
+            Ok(obligations_body(
+                serde_json::json!([]),
+                serde_json::json!([gate_obligation("watched")]),
+                serde_json::json!([{"agent_id": "a", "repo": "r", "branch": "b",
+                                    "worktree_path": path, "status": "active",
+                                    "attribution": "proven"}]),
+            ))
+        };
+        let covered = vec!["/ws/agent-worktrees/a1/qontinui-runner".to_string()];
+
+        let outside = judge_obligations(
+            &body(serde_json::json!("/ws/agent-worktrees/zz/qontinui-runner")),
+            &covered,
+        );
+        assert_eq!(outside.as_str(), "unknown");
+        assert_eq!(outside.reason(), Some("worktree_not_probed"));
+        assert!(outside.detail().unwrap().contains("zz"), "{outside:?}");
+
+        for matched in [
+            serde_json::json!("/ws/agent-worktrees/a1/qontinui-runner"),
+            serde_json::json!("agent-worktrees/a1/qontinui-runner"),
+            serde_json::json!("\\ws\\agent-worktrees\\a1\\qontinui-runner\\"),
+        ] {
+            assert!(
+                judge_obligations(&body(matched.clone()), &covered).is_watched(),
+                "{matched}"
+            );
+        }
+        for absent in [
+            serde_json::Value::Null,
+            serde_json::json!(""),
+            serde_json::json!(7),
+        ] {
+            assert_eq!(
+                judge_obligations(&body(absent.clone()), &covered).reason(),
+                Some("worktree_not_probed"),
+                "{absent}"
+            );
+        }
+        // Nothing covered at all (a double, or a gather that stopped early):
+        // only an empty `worktrees` block is admitted.
+        assert!(judge_obligations(&watched_read(), &[]).is_watched());
+        assert_eq!(
+            judge_obligations(
+                &body(serde_json::json!("/ws/agent-worktrees/a1/qontinui-runner")),
+                &[]
+            )
+            .reason(),
+            Some("worktree_not_probed")
+        );
+        // It only ever withholds: an unwatched or unreadable answer keeps its
+        // own, more specific verdict.
+        assert_eq!(judge_obligations(&unwatched(), &[]).as_str(), "unwatched");
+        assert_eq!(
+            judge_obligations(&Err("503".to_string()), &covered).reason(),
+            Some("obligations_unreadable")
+        );
+    }
+
+    /// Concern 3 end to end: a candidate whose coord answer names a tree its
+    /// custody gather never covered is not closed; one naming the tree custody
+    /// probed (`/ws/<session>` in [`FakeWorld`]) is.
+    #[tokio::test]
+    async fn finished_close_tick_never_closes_over_a_coord_worktree_custody_did_not_probe() {
+        let naming = |path: &str| -> ObligationsRead {
+            Ok(obligations_body(
+                serde_json::json!([]),
+                serde_json::json!([]),
+                serde_json::json!([{"worktree_path": path, "status": "active"}]),
+            ))
+        };
+        let world = FakeWorld::with_sessions(&["t1", "t2"])
+            .obligations("s-t1", naming("/ws/elsewhere"))
+            .obligations("s-t2", naming("/ws/s-t2"));
+        let FinishedCloseTick::Ran { obligations, .. } = tick(&world).await else {
+            panic!("the census should have run");
+        };
+        assert_eq!(obligations[0].1.reason(), Some("worktree_not_probed"));
+        assert!(obligations[1].1.is_watched(), "{obligations:?}");
+        assert_eq!(world.exits(), vec!["exit:t2".to_string()]);
+    }
+
+    /// Concern 4: a pass makes at most [`OBLIGATIONS_READS_PER_PASS`] coord
+    /// reads, however many custody-clean candidates stay unwatched; the rest
+    /// are UNKNOWN (`obligations_deferred`), never watched.
+    #[tokio::test]
+    async fn a_pass_makes_at_most_its_budget_of_obligations_reads() {
+        let ids: Vec<String> = (0..OBLIGATIONS_READS_PER_PASS + 3)
+            .map(|i| format!("t{i}"))
+            .collect();
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let mut world = FakeWorld::with_sessions(&refs);
+        for id in &ids {
+            world = world.obligations(&format!("s-{id}"), unwatched());
+        }
+        let FinishedCloseTick::Ran { obligations, .. } = tick(&world).await else {
+            panic!("the census should have run");
+        };
+        assert_eq!(world.obligations_read().len(), OBLIGATIONS_READS_PER_PASS);
+        assert_eq!(obligations.len(), ids.len());
+        assert!(obligations[..OBLIGATIONS_READS_PER_PASS]
+            .iter()
+            .all(|(_, v)| v.as_str() == "unwatched"));
+        for (session, verdict) in &obligations[OBLIGATIONS_READS_PER_PASS..] {
+            assert_eq!(verdict.reason(), Some("obligations_deferred"), "{session}");
+        }
+        assert!(world.exits().is_empty());
+    }
+
+    /// Concern 5: the PRODUCTION judge — the one the live pass and the live
+    /// re-check both run — over coord bodies shaped as `session_obligations_core`
+    /// serves them (recorded shapes: a PR card's `facts`, a gate's `reasons`,
+    /// `attribution`, `sources`). The doubles above supply a body, so this is
+    /// the same function [`close_batch`] and [`finished_close_tick`] call.
+    #[test]
+    fn the_production_obligations_judge_over_recorded_coord_bodies() {
+        let recorded = |prs: &str, gates: &str| -> serde_json::Value {
+            let text = format!(
+                r#"{{
+                  "claude_code_session_id": "d30f7c5f-0000-4000-8000-000000000001",
+                  "all_tracked_sources_read": true,
+                  "session_windows": [{{"device_id": "d", "started_at": "2026-11-15T10:00:00Z", "closed_at": null}}],
+                  "session_proven_in_tenant": true,
+                  "prs": {{"coverage": "read", "items": {prs}, "count": 0, "truncated": false}},
+                  "gates": {{"coverage": "read", "items": {gates}, "count": 0, "truncated": false}},
+                  "worktrees": {{"coverage": "read", "items": [], "count": 0, "truncated": false}},
+                  "work_units": {{"coverage": "read", "items": [], "count": 0, "truncated": false}},
+                  "findings": {{"coverage": "read", "items": [], "count": 0, "truncated": false}},
+                  "spawned_followup": {{"coverage": "not_tracked", "note": "coord records no spawned-follow-up edge", "items": []}},
+                  "note": "Each source's coverage is read only when every query behind it ran."
+                }}"#
+            );
+            serde_json::from_str(&text).expect("a recorded body parses")
+        };
+        // Phase 0's d30f7c5f shape: every gate retired, no PRs.
+        let retired = r#"[{"item": {"gate_id": "6a771def-e097-40e5-96f4-0bddefcd3c34"}, "verdict": "retired",
+                           "reasons": ["the gate cleared and its continuation reported work_completed"],
+                           "facts": {"state": "cleared"}, "attribution": "proven"}]"#;
+        let watched_pr = r#"[{"item": {"repo": "qontinui/qontinui-runner", "pr_number": 2981}, "verdict": "watched",
+                              "reasons": ["CI is running"], "attribution": "proven", "sources": ["authored"],
+                              "facts": {"repo": "qontinui/qontinui-runner", "pr_number": 2981, "pr_state": "open",
+                                        "head_sha": "e605bb893", "confidence": "fresh", "checks": []}}]"#;
+        let v = judge_obligations(&Ok(recorded(watched_pr, retired)), &[]);
+        assert_eq!(v, ObligationsVerdict::Watched { judged: 2 });
+
+        // Phase 0's 5472e347 shape: not_watched items whose attribution is
+        // uncertain — UNKNOWN, never a definite owed word, never watched.
+        let uncertain = r#"[{"item": {"gate_id": "7d2ddc08-11ec-4c8b-a019-44af6c128414"}, "verdict": "not_watched",
+                             "reasons": ["no continuation and no live owner"], "attribution": "uncertain"}]"#;
+        let v = judge_obligations(&Ok(recorded("[]", uncertain)), &[]);
+        assert_eq!(v.reason(), Some("item_unknown"));
+        assert!(
+            v.detail().unwrap().contains("attribution uncertain"),
+            "{v:?}"
+        );
+
+        // Phase 0's 9c869e35 shape: a proven not_watched item.
+        let proven = uncertain.replace("\"uncertain\"", "\"proven\"");
+        assert_eq!(
+            judge_obligations(&Ok(recorded("[]", &proven)), &[]).as_str(),
+            "unwatched"
+        );
+
+        // A degraded source: its list is not evidence of absence.
+        let mut degraded = recorded("[]", retired);
+        degraded["all_tracked_sources_read"] = serde_json::json!(false);
+        degraded["gates"]["coverage"] = serde_json::json!("degraded");
+        assert_eq!(
+            judge_obligations(&Ok(degraded), &[]).reason(),
+            Some("sources_not_read")
+        );
+
+        // The read ran as a tenant that cannot place the session: every list
+        // is empty, and that is the absence of a session, not of obligations.
+        let mut unproven = recorded("[]", "[]");
+        unproven["session_proven_in_tenant"] = serde_json::json!(false);
+        assert_eq!(
+            judge_obligations(&Ok(unproven), &[]).reason(),
+            Some("session_not_proven")
+        );
+    }
+
+    // ── The close guard at its call site (plan 2026-11-16-…, Phase 1) ────
+
+    fn pr_waiting_on_ci() -> ObligationsRead {
+        Ok(obligations_body(
+            serde_json::json!([{
+                "item": {"repo": "o/r", "pr_number": 7}, "verdict": "watched",
+                "attribution": "proven",
+                "facts": {"pr_state": "open", "head_sha": "abc", "confidence": "fresh",
+                          "checks": [{"name": "ci", "status": "in_progress",
+                                      "conclusion": null, "coord_gate": false}]},
+            }]),
+            serde_json::json!([]),
+            serde_json::json!([]),
+        ))
+    }
+
+    /// Every non-`Close` guard verdict — a pending first verdict, a revival,
+    /// an undelivered message, an unreadable transcript — stops the close
+    /// BEFORE `wind_down_one`, and each verdict is published; a `Close`
+    /// verdict reaches it.
+    #[tokio::test]
+    async fn a_non_close_guard_verdict_never_reaches_wind_down_one() {
+        let effects = RecordingEffects::new()
+            .eligible("t1")
+            .eligible("t2")
+            .eligible("t3")
+            .eligible("t4")
+            .obligations("t1", pr_waiting_on_ci())
+            .transcript(
+                "t2",
+                Ok(TranscriptFacts {
+                    last_prompt_ms: Some(FINISHED_AT_MS + 60_000),
+                    ..quiet_facts()
+                }),
+            )
+            .messages(
+                "t3",
+                Ok(vec![finished_close_guard::PendingMessage {
+                    message_id: "m1".to_string(),
+                    to_session: "s-t3".to_string(),
+                    owner: Some("s-t3".to_string()),
+                }]),
+            )
+            .transcript("t4", Err("no transcript".to_string()));
+        let outcomes = close_batch(
+            CloseArm::FinishedClose,
+            batch(&["t1", "t2", "t3", "t4"]),
+            &effects,
+        )
+        .await;
+        assert_eq!(outcomes, vec![CandidateOutcome::GuardHeld; 4]);
+        assert!(
+            !effects.calls().iter().any(|c| c.starts_with("exit:")),
+            "{:?}",
+            effects.calls()
+        );
+        assert_eq!(
+            effects.guard_words(),
+            vec![
+                ("s-t1".to_string(), "held", Some("first_verdict_pending")),
+                ("s-t2".to_string(), "held", Some("revived")),
+                ("s-t3".to_string(), "held", Some("undelivered_message")),
+                ("s-t4".to_string(), "unknown", Some("transcript_unreadable")),
+            ]
+        );
+
+        // Every input ok: the guard answers Close and the attempt proceeds.
+        let ok = RecordingEffects::new().eligible("t1");
+        let outcomes = close_batch(CloseArm::FinishedClose, batch(&["t1"]), &ok).await;
+        assert_eq!(outcomes, vec![CandidateOutcome::Attempted]);
+        assert!(ok.calls().contains(&"exit:t1".to_string()));
+        assert_eq!(
+            ok.guard_words(),
+            vec![("s-t1".to_string(), "would_mint", None)]
+        );
+    }
+
+    /// The guard runs BEFORE the shadow branch: a shadow arm logs and
+    /// publishes its verdict, and a held one is never "would close".
+    #[tokio::test]
+    async fn a_shadow_arm_still_judges_and_publishes_the_guard() {
+        let effects = RecordingEffects::new()
+            .admissions(&[Admission::Shadow])
+            .eligible("t1")
+            .eligible("t2")
+            .obligations("t2", pr_waiting_on_ci());
+        let outcomes = close_batch(CloseArm::FinishedClose, batch(&["t1", "t2"]), &effects).await;
+        assert_eq!(
+            outcomes,
+            vec![CandidateOutcome::Shadowed, CandidateOutcome::GuardHeld]
+        );
+        assert!(!effects
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("would_close:t2")));
+        assert_eq!(
+            effects.guard_words(),
+            vec![
+                ("s-t1".to_string(), "would_mint", None),
+                ("s-t2".to_string(), "held", Some("first_verdict_pending")),
+            ]
+        );
+    }
+
+    /// The drain arm never consults the guard, and publishes nothing.
+    #[tokio::test]
+    async fn the_drain_arm_never_runs_the_guard() {
+        let effects = RecordingEffects::new()
+            .eligible("t2")
+            .transcript("t1", Err("never read".to_string()));
+        let outcomes = close_batch(CloseArm::Drain, batch(&["t1", "t2"]), &effects).await;
+        assert_eq!(outcomes, vec![CandidateOutcome::Attempted; 2]);
+        assert!(!effects
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("transcript:") || c.starts_with("messages:")));
+        assert!(effects.guards.lock().unwrap().is_empty());
+    }
+
+    /// Each deciding arm keeps the outcome it had before the guard existed.
+    #[test]
+    fn a_guard_verdict_is_recorded_as_the_outcome_of_its_deciding_arm() {
+        assert_eq!(
+            outcome_for_guard_arm("eligibility"),
+            CandidateOutcome::NoLongerEligible
+        );
+        assert_eq!(
+            outcome_for_guard_arm("custody"),
+            CandidateOutcome::CustodyNotClean
+        );
+        assert_eq!(
+            outcome_for_guard_arm("obligations"),
+            CandidateOutcome::ObligationsNotWatched
+        );
+        for arm in ["first_verdict", "revival", "undelivered_messages"] {
+            assert_eq!(
+                outcome_for_guard_arm(arm),
+                CandidateOutcome::GuardHeld,
+                "{arm}"
+            );
+        }
+    }
+
     /// Round-2 suggestion 6: the pass's ownership read serves the re-checks
     /// while it is at most a minute old, and not after.
     #[test]
@@ -4393,7 +5953,10 @@ mod tests {
         // A valid read that answers no candidate: no entry of its own.
         let mut world = FakeWorld::with_sessions(&["t1"]);
         world.ownership_override = Some(Ok(CoordOwnership::default()));
-        let FinishedCloseTick::Ran { judged, outcomes } = tick(&world).await else {
+        let FinishedCloseTick::Ran {
+            judged, outcomes, ..
+        } = tick(&world).await
+        else {
             panic!("the census should have run");
         };
         assert_eq!(judged[0].1.reason(), Some("ownership_unreadable"));

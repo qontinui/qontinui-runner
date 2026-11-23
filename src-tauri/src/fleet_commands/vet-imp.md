@@ -23,10 +23,15 @@ this rule exists to prevent.
 commits and pushes an untracked plan file *before* `/vet-plan` is ever invoked,
 so this command has a write of its own ahead of both skills. Exclusion must
 precede mutation, so the **plan reserve** (Step 1.1) is taken here, by the
-orchestrator, on the same key the two skills use. Both then re-issue the same
-call and get a **renewal**, not a conflict, because the owner token is the same
-harness session — that is the mechanism that makes one reserve span the whole
-chain instead of three fighting over it.
+orchestrator, on the same key the two skills use. `/vet-plan` re-issues the
+same call and gets a **renewal**, not a conflict, because the owner token is the
+same harness session — so one reserve spans the push and the vet instead of two
+fighting over it. **It does not span the implement half once a vet→implement net
+is armed:** Step 3 hands it off — releases it, so `/implement-plan` Step 0.48's
+own acquire answers `granted` and that skill owns the reserve from there. A
+reserve the chain kept past its own net is what made the net's rescue session
+meet `held` and stand down (plan
+`2026-11-13-a-vet-imp-plan-reserve-outlives-its-chain-so-its-own-safety-net-implementer-cannot-start`).
 
 It also **labels the session** so the vet → implement run is easy to find in
 the session list: a provisional plan-slug label at the start (Step 1.5), then a
@@ -243,7 +248,7 @@ compare-and-swap").
 
 The helper is the one implementation of what this step used to spell out by
 hand: it fetches the default branch with an explicit refspec, builds the commit
-by plumbing on a separate index against a base resolved once (so the shared
+by plumbing (lib/plumbing-commit.sh) on a private index against a base resolved once (so the shared
 tree, index and worktree list are never touched), pushes without force with a
 non-fast-forward retry, and **reads the file back** — a content comparison of
 the file's hash against the default branch's blob at its path, with the
@@ -347,8 +352,9 @@ rather than re-deriving it.
    ```
 
    The two skills resolve the identical value from the identical env vars in the
-   same harness session, which is exactly why their re-reserves renew rather than
-   conflict. If both are empty (older Claude Code), omit the field; never send an
+   same harness session, which is exactly why a nested re-reserve renews rather
+   than conflicts — `/vet-plan`'s always, and `/implement-plan`'s whenever Step 3
+   did not hand the reserve off. If both are empty (older Claude Code), omit the field; never send an
    empty string.
 4. **Coord HTTP base** — `COORD_HTTP_URL`, else `https://coord.qontinui.io`.
 
@@ -412,7 +418,8 @@ also what makes the nested renewals below work at all: without an owner token,
 #### Branch on the result
 
 - **`granted` / `claimed`** — a fresh reservation. **This chain is the OWNER and
-  therefore the releaser** (Step 5). Proceed to Step 1's push, then Step 1.5.
+  therefore the releaser** — at Step 3's hand-off when a vet→implement net is
+  armed, otherwise at Step 5. Proceed to Step 1's push, then Step 1.5.
 - **`renewed`**, or a **`held` whose `current_holder_session` equals your own
   `$AGENT_SESSION_ID`** — this session already holds it. Proceed, and leave the
   release to whoever acquired it.
@@ -681,19 +688,27 @@ stale token after a successful `REFRESHED`.
 
 #### Release — the acquirer releases
 
-Fire this at Step 5, in the same try/finally so it also runs on every abort path
-(a `/vet-plan` abort at Step 3, an operator **Abort** above, a failed chain).
+Fire this at ONE of two points, never both. **Step 3's hand-off** fires it when
+`/vet-plan` armed a vet→implement net and Step 4 is next; that records
+`RESERVE_HANDED_OFF`, and from then on the reserve is `/implement-plan`'s to
+take, heartbeat and release. **Otherwise Step 5** fires it, in the same
+try/finally so it also runs on every abort path (a `/vet-plan` abort at Step 3,
+an operator **Abort** above, a failed chain, a VETTED-HELD or no-net chain).
 **Release through the one door, then `stop` the loop.** `plan-reserve-release.sh
 release` withdraws the plan's open implement→ship net (`/implement-plan` Step 0.5)
 FIRST, then `remove`s the heartbeat row, then POSTs `/claims/release`: a release
 with the net still open clears it and dispatches a duplicate session. Pass
-`--net-gate` when the implement half reported the net's `gate_id`. It finds the
+`--net-gate` when the implement half reported the net's `gate_id`, and `--repo
+"<owner/name>"` for the plan's repo, so the net is read and withdrawn under the
+tenant proven to own it (on a device bound to several tenants the session's
+default tenant may not see it at all). It finds the
 session's ledger itself (no `--ledger`) and runs at most about 90 s, inside the
 Bash tool's 120 s default (its RUNTIME header):
 
 ```bash
 bash <workspace-root>/qontinui-claude-config/scripts/plan-reserve-release.sh release \
-  --stem "<plan-stem>" --reason "<why>"
+  --stem "<plan-stem>" --repo "<owner/name>" --reason "<why>"
+# Only after reading its final line: NOT on exit 7, 2 or 64 (below).
 bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh stop --ledger "$CLAIM_LEDGER"
 ```
 
@@ -729,24 +744,31 @@ that outlived KILL will NOT end by itself, so name its pid as left behind.
 "`stop` reports only what it observes".
 
 The script prints a line per net it found, then ONE final verdict line: quote it
-in the Step 5 report. `RELEASED` (exit 0) is clean; `NET_UNRETIRED <id|unknown>`
-(3) means the net read or a withdraw failed, a `--net-gate` was not this plan's
-net, or the 60 s retire budget ran out, and the release ran anyway, so a
+in the Step 5 report. `RELEASED` (exit 0) is clean; `RELEASE_WITHHELD
+<id|unknown>` (7) means the net read or a withdraw failed, a `--net-gate` was not
+this plan's net, or the 60 s retire budget ran out, so NOTHING was released and
+the heartbeat row was kept: do not `stop` the loop, fix the cause and run it
+again (`/implement-plan` Step 0.48 has the remedies), passing
+`--release-with-unretired-net` only after a named remedy failed. Under that flag
+the same failure reads `NET_UNRETIRED <id|unknown>` (3): the release ran, so a
 redundant session is expected; `NET_FIRED <id>` (6) means the net `--net-gate`
 names had already dispatched one (a consumed net it does not name is read as a
 predecessor's, `NET_INERT`); `NOT_HELD` (4) is the lapse below, and `holder=other`
 on it means another owner holds the reserve now; `RELEASE_UNKNOWN` (5) got no
 readable answer. `UNKNOWN` (2) and a usage error (64) did nothing and released
 NOTHING: the reserve is still held, so fix the cause and run it again. A
-`NET_MUTED <id>` line, and a `NET_CANCELLED <id>` line saying the mute did not
-land, are nets that stay open: name each id in the report (the final line's `--`
-note lists them).
+`NET_CANCELLED <id>` line saying the withdraw was refused as not-the-registrant is
+a net whose continuation was cancelled (never muted): the release clears it
+inert. Name each id in the report (the final line's `--` note lists them).
 
 The release MUST carry the SAME `agent_session_id` used at acquire — the owner
 token is the match key, so omitting it returns `"not_held"` and leaves the
 reservation to TTL out (the script resolves the pair as the acquire above does;
 `--machine-id` / `--session-id` override it). **Skip the release entirely if this step returned
 `renewed`** — something outside this chain acquired the reserve and owns it.
+**Skip it at Step 5 when Step 3 recorded `RESERVE_HANDED_OFF`** — the reserve
+was released there, and whatever holds it now (normally this session's own
+`/implement-plan`, which releases it at its Step 6 item 5) is not this chain.
 
 ⚠️ **A `not_held` release is evidence the lock LAPSED. It is not a no-op.** The
 route is idempotent, so nothing downstream breaks — which is exactly why this
@@ -911,7 +933,9 @@ unless it took its §5.4 step 6 **hold-gate skip**, which registers neither, or
 its **delivery skip**, which registers neither and makes no `→ vetted` transition,
 or its step 6 **no-withdraw-door skip**, which registers no net because this
 session could never withdraw it). Do
-not short-circuit any of it.
+not short-circuit any of it. Its own step 0.2 reserve answers `renewed` against
+Step 1.1's hold, so it never releases; whether the net got armed is what decides
+Step 3's reserve hand-off.
 
 **Collect its report; do not emit it.** `/vet-plan` Step 6 produces a complete,
 standalone-looking report. Under this chain that report is an **intermediate
@@ -948,9 +972,10 @@ the vet report says `NO NET (no withdraw door: …)` so the gap is visible.
 
 > **The net's continuation carries a brief; `/vet-plan` §5.4 shows the shape in
 > step 5 and step 6 registers it.** The session coord dispatches has never read the plan and does
-> not know this chain existed: without a brief its whole context is
-> `run /implement-plan <path>`. This is the untagged `continuation_spawn` shape,
-> which has no `hint` field, so the brief is appended to `initial_prompt` after
+> not know this chain existed: without a brief it gets
+> `run /implement-plan <path>` and only what coord adds itself. This is the
+> untagged `continuation_spawn` shape, which has no `hint` field, so the brief
+> is appended to `initial_prompt` after
 > a blank line — byte-identical to what coord builds from a typed `hint`, less
 > the closing `/unattended` line coord adds only to a typed `run_skill`.
 > Canonical: `_gate-registration` → "The brief — a continuation with no `hint`
@@ -1286,8 +1311,8 @@ states that legitimately stop the lifecycle must stop it here too:
   > whose session left PRs (unless `/vet-plan` case 2b adopts it — the stamp
   > is gate-delegated and this run is that hold gate's continuation),
   > still stops at `/vet-plan`'s pre-edit capture; a
-  > complete plan still stamped `VETTED` or `DRAFT` (or `PARTIAL` / `NOT
-  > STARTED`) is re-vetted and re-implemented, and the only remaining MECHANICAL
+  > complete plan still stamped `VETTED` or `DRAFT` (or legacy `PARTIAL` /
+  > `NOT STARTED`) is re-vetted and re-implemented, and the only remaining MECHANICAL
   > guard is `/implement-plan` Step 0.45 check 2 — a `git log origin/main -20`
   > grep that misses anything older — though `/vet-plan` §2's claim verification
   > may also notice the plan's premises are already met. That cost
@@ -1447,6 +1472,108 @@ Step 4. A defect count > 0 in the
 VETTED summary is **not** a blocker — `/vet-plan` auto-fixes what it can and only
 surfaces genuine product/scope calls; those are reported, not gating.
 
+**Then hand the plan reserve to the implement half — when, and only when, a net
+is armed to rescue it.** Run this when all three hold:
+
+1. the stamp passed every arm above and Step 4 is next;
+2. `/vet-plan`'s step-8 read-back shows an armed `vet→implement safety net`
+   row with a `gate_id` — not the hold-gate, delivery or no-withdraw-door skip,
+   which arm no net;
+3. Step 1.1 returned `granted` / `claimed`, so this chain is the acquirer. On
+   `renewed` the reserve was never this chain's to hand.
+
+```bash
+bash <workspace-root>/qontinui-claude-config/scripts/plan-reserve-release.sh release \
+  --stem "<plan-stem>" --repo "<owner/name>" --reason "handed to implement half / vet→implement net armed"
+```
+
+**Exit 7 (`RELEASE_WITHHELD`) here has its own arm.** This release runs before
+any implement→ship net can exist, so a `RELEASE_WITHHELD unknown` (no named id:
+the gate read could not be made) is re-run AT ONCE with
+`--release-with-unretired-net`, and reported as such. Withholding here would keep
+the reserve and make the vet→implement net's rescue meet `held` again, the
+stall the hand-off exists to prevent. A `RELEASE_WITHHELD <id>` naming a net
+withholds as normal: some earlier run left an implement→ship net open, so name
+it and resolve it before the hand-off.
+
+Run the release ALONE, read its final line, and only then decide on the `stop`
+(below) — never put the two in one call, because on exit 2 or 64 the loop must
+keep running.
+
+Then record `RESERVE_HANDED_OFF`, and keep the release's final verdict line for
+the Step 5 report. Why: the net exists for a chain that stalls between here and
+`/implement-plan` Step 0.5. If this chain still holds the reserve when it fires,
+the `/implement-plan` it dispatches is a different session, so its Step 0.48
+answers `held` and stands down — the rescue loses to the very stall it was armed
+for (plan
+`2026-11-13-a-vet-imp-plan-reserve-outlives-its-chain-so-its-own-safety-net-implementer-cannot-start`;
+findings `edf9e0c2` and `22b15e55`). Released here, the reserve goes to whoever
+acquires next. Normally that is this session's own Step 4, whose Step 0.48
+answers `granted`. If the chain stalls, the net's rescue takes it instead. A
+peer `/vet-plan` or `/vet-imp-sweep` might also win; any later session then
+reads `held`, so there is still one implementer.
+
+`RELEASED` is the expected verdict. The door touches only `claim_terminal`
+`implement→ship safety net` rows, and none exists yet. It leaves this
+`time_elapsed` net armed (the release door's own test suite pins this, section 8), so
+no `NET_*` line is expected; name any that appears. Any other verdict: name it
+in the Step 5 report and branch on it per Step 1.1's release section.
+**Decide the hand-off on the final line's `release=` field, never on the
+verdict word, and let the implement half's Step 0.48 answer settle it.** The
+script's exit is the first of 7, 3, 6, 5, 4 that applies, so a `NET_UNRETIRED`
+(3) or `NET_FIRED` (6) line can sit on top of a release that never landed, and a
+`RELEASE_WITHHELD` (7) line reads `release=withheld` (handled by the arm above).
+
+- `release=released` or `release=not_held` (the lapse Step 1.1 describes; the
+  chain holds nothing either way): record `RESERVE_HANDED_OFF`, then run
+  `coord-claim-heartbeat.sh stop --ledger "$CLAIM_LEDGER"`.
+- `UNKNOWN` (2) or a usage error (64): nothing was released AND the heartbeat
+  row was not touched. Record nothing, skip the `stop`; Step 5 releases as
+  before.
+- Any other `release=` value (`unreachable`, `http_<code>`, `unreadable`): the
+  release may or may not have landed. The door runs `drop_ledger_row` before
+  `release_reserve`, so read the final line's `heartbeat=` field: normally
+  `removed` (the row is gone and nothing renews the reserve now), but
+  `no_ledger`, `no_heartbeat` or `rc_<n>` mean the row and loop may still be
+  there. Do NOT run `stop` on this arm. Record `RESERVE_HANDOFF_UNKNOWN` and
+  let Step 0.48 below decide; its `renewed` recovery is safe either way
+  (`add` is an upsert and `start` respects a running loop).
+
+**The implement half's Step 0.48 answer is the authority** on whether the
+hand-off landed, because it is coord's own read of the key:
+
+- `granted` / `claimed` — the reserve was free, so the hand-off landed.
+  Promote `RESERVE_HANDOFF_UNKNOWN` to `RESERVE_HANDED_OFF`;
+  `/implement-plan` now owns heartbeat and release.
+- `renewed` — this chain still holds the reserve, so the hand-off did NOT land
+  (whatever was recorded). `/implement-plan` skips its heartbeat and release on
+  `renewed`, and the door removed this chain's heartbeat row, so nothing renews
+  the key. Drop any hand-off record, re-`add` the row with `--ttl` set to that
+  0.48 answer's `ttl_seconds`, `start` the loop, re-read `status` and require
+  `LIVE` (Step 1.1's "Recover" bullet) BEFORE the implement half proceeds, and
+  let Step 5 release.
+- `held` by a DIFFERENT session — the reserve was free and someone else took
+  it: the hand-off landed. Promote `RESERVE_HANDOFF_UNKNOWN` to
+  `RESERVE_HANDED_OFF` and take Step 4's late-chain arm.
+
+Either way the run goes straight on to Step 4. The release adds
+no turn: release, then the Skill call, in this same turn, with no narration
+between them.
+
+The hand-off narrows the exposure, it does not close it: `/vet-plan` §5.4 arms
+the 30-minute net before Step 3 ends, so a chain that parks between that arming
+and this release still holds the reserve when the net fires, and that rescue
+still meets `held`. Run this release as the first action after the checks above,
+not after any further work. If a compaction or resume loses the recorded
+`RESERVE_HANDED_OFF`, re-derive it from this release's verdict line (its
+`release=` field). When that line cannot be found either, first establish
+whether a hand-off was even possible: Step 1.1 returned `granted` / `claimed`
+AND a `vet→implement safety net` row exists on the unit (`coord_gate_list`,
+`open_only: false`). If either is false, no hand-off ever ran — the ledger row is
+this chain's own Step 1.1 hold — and Step 5 releases it as usual. Only when both
+hold is the hand-off UNKNOWN: apply Step 5's read-before-release rule rather than
+releasing on a guess.
+
 **Confirming VETTED and invoking `/implement-plan` happen in the SAME assistant
 turn, with the Skill call last** — for every VETTED outcome except the
 VETTED-HELD arm above, which goes to Step 5 in that same turn instead. Do not confirm the gate in one turn and plan to
@@ -1470,6 +1597,32 @@ phase agents, manual testing, commit, and the SHIPPED stamp. Because
 Step 2 just stamped the plan VETTED in this same session, `/implement-plan`'s
 Step 0.5 will see a fresh VETTED block and start cleanly — it will NOT warn that
 the plan was never vetted.
+
+**Who owns the reserve in this half depends on Step 3.** When Step 3 recorded
+`RESERVE_HANDED_OFF`, `/implement-plan` Step 0.48's own acquire answers
+`granted`. That makes `/implement-plan` the owner: it starts the heartbeat, arms
+its implement→ship net on its own hold, and releases at its Step 6 item 5 or on
+its stop paths. Without a hand-off it reads `renewed` and leaves all of that to
+this chain, as before.
+
+**The late-chain arm — a hand-off this chain arrives too late for.** A chain
+that recorded `RESERVE_HANDED_OFF` and then parked past the net's 30 minutes
+(a rate limit, say) can return to find `/implement-plan` Step 0.48 answering
+`held` by a DIFFERENT session. That means the net's rescue, a sweep or a peer
+took the plan in the window the hand-off opened, which is what the hand-off is
+for. So stand down. Do NOT run Step 0.48's `AskUserQuestion` conflict flow and
+never offer **Steal**. Report `implementation taken over by session
+<current_holder_session>` (or the bare `holder` when no session is served), and
+leave the vet→implement net alone: read its row (`coord_gate_list` on the unit,
+`open_only: false`) and name it in the report. Consumed, or withdrawn by an
+implementing holder at its Step 0.5, it is done. Still open and armed (the
+holder is a peer `/vet-plan` or `/vet-imp-sweep`, or took the plan inside the
+30-minute window), it stays as the backstop: if the holder implements, the
+rescue meets its `held` and stands down; if the holder releases without
+implementing, the rescue is what picks the plan up. `/implement-plan` ends there as a stand-down that wrote nothing:
+it skips Steps 0.5–6.5, still runs its own Step 7 (`/unattended`), and then this
+chain goes to Step 5, which has nothing to release. This arm needs the
+recorded hand-off. A foreign `held` without one is still Step 0.48's STOP.
 
 **Once `/implement-plan` returns with its PRs open and their branches pushed,
 declare each PR worktree's hand-off** — `/unattended` Step 4.9's declaration
@@ -1535,7 +1688,10 @@ artifact the other half was required to produce is there.
 *(plan `2026-09-03-every-verification-signal-is-written-by-the-implementer`
 Phase 3)*. Presence proves the review gate ran; it cannot prove the commit it
 reviewed is the commit on the PR. coord's status card can, and it was written by
-no session. Run the same script `/implement-plan` Step 4.7 runs — it is one
+no session — or, when the card's head has moved past the reviewed one, it can
+prove the PR differs from the reviewed commit only by recorded clean base-sync
+steps (a merge of main pushed by coord's merge orchestrator, say), which is a
+different and weaker claim. Run the same script `/implement-plan` Step 4.7 runs — it is one
 implementation, invoked from two places, not a second copy of the check:
 
 ```bash
@@ -1547,24 +1703,36 @@ bash <workspace-root>/qontinui-claude-config/scripts/review-arm-corroborate.sh -
 Branch on its exit code, exactly as Step 4.7 documents it:
 
 - **`0` CORROBORATED** — every PR's coord `head_sha` equals the artifact's
-  `reviewed_head_sha`, the re-measured tree equals the artifact's
-  `reviewed_tree`, and the coverage read found no PR coord attributes to
-  this session that `prs[]` omits. Say so, per PR — **and quote the
+  `reviewed_head_sha` — or differs from it only by **proven base-sync steps**
+  (`head_relation: base_sync`: clean merges of the base branch, or empty
+  commits, after the reviewed head, each recorded in `head_relation_steps`;
+  counted by the verdict line's ` base_sync=K` token, which an all-equal-head
+  run does not print) — the re-measured tree equals the artifact's
+  `reviewed_tree` (or, on a `base_sync` row, advanced clean onto one of its
+  proven steps from a tree recorded clean at the reviewed head), and the
+  coverage read found no PR coord attributes to
+  this session that `prs[]` omits. Say so, per PR — naming a `base_sync` row as
+  such, never as "the reviewed commit is the commit on the PR" — **and quote the
   `coverage=` half of the verdict line as well.** The coverage read needs a
   session-scoped identity that a device-JWT session does not hold, so it
   routinely reads `coverage=UNKNOWN` on this fleet; that is reported beside the
   head verdict, never folded into it, and never written up as "coverage checked".
-- **`2` CONTRADICTION** — head drift (`contradiction_head_drift`), a **working
+  A `base_sync` corroboration does **not** satisfy coord's `require_review`
+  record: coord compares the `Coord-Reviewed-Head:` trailer with the PR's
+  current head by equality, and this script does not rewrite the trailer.
+- **`2` CONTRADICTION** — head drift (`contradiction_head_drift`, its
+  `head_relation` naming the measured fault: `new_commit`, `conflicted_merge`,
+  `evil_merge`, `foreign_merge` or `rewritten`), a **working
   tree that moved since the review measured it** (`contradiction_tree_moved` —
   the arm a commit-only identity is blind to, because an uncommitted edit moves
   no sha at all), or an uncovered PR. **The chain is
   INCOMPLETE**, the same verdict as a missing artifact, and for the same reason:
   a review whose subject is not the code on the PR is a review nobody can name.
-  Quote the `corroboration[]` / `coverage` row that failed. A head-drift
-  CONTRADICTION also
+  Quote the `corroboration[]` / `coverage` row that failed. A
+  `contradiction_head_drift` also
   means the PR body's `Coord-Reviewed-Head:` line is stale — coord's
   `require_review` gate reads that line, not the artifact — so the re-review
-  must edit the body (`gh api -X PATCH repos/<owner>/<repo>/pulls/<n> -F "body=@<file>"`,
+  must edit the body (`pr-body-publish.sh <owner>/<repo> <n> <file>`,
   `/implement-plan` Step 4.5 — never `gh pr edit`, which fails before writing) as well as re-record.
 - **`3` UNKNOWN** — the door did not answer (`unknown_door` — it refused;
   `unknown_door_timeout` — its curl gave up with exit 28, its connect bound or
@@ -1574,7 +1742,12 @@ Branch on its exit code, exactly as Step 4.7 documents it:
   row's detail names the budgets involved and the elapsed time), the card reads `confidence:
   unknown`, the artifact predates `reviewed_head_sha`
   (`unknown_no_reviewed_head`) or `reviewed_tree` (`unknown_no_reviewed_tree`),
-  or the tree could not be compared (`unknown_tree`; the row's detail names
+  a head that differs could not be classified (`unknown_head_relation`; the
+  detail names the read that failed — no `--tree-root` whose origin names the
+  repo, a shallow or partial-clone store, a commit absent after the bounded
+  fetch, a git too old for the read), coord's card is behind the review
+  (`unknown_card_behind_review` — its head is a strict ancestor of the reviewed
+  one), or the tree could not be compared (`unknown_tree`; the row's detail names
   which), for example: no `--tree-root` covers the row's repo (the `$PWD`
   default from a subdirectory, or from a directory not named like the
   reviewed checkout, leaves every row here);
@@ -1632,7 +1805,8 @@ copy of that step here is a second thing to diverge.
 **The refusal changes the REPORTED STATUS ONLY.** It is a verdict computed here,
 never an early return out of Step 5: everything below it still runs. It must not
 suppress the `/name` call above it — labeling is best-effort and non-gating by
-this file's own rule — and it must never skip the reserve release below. A
+this file's own rule — and it must never skip the reserve release below (the
+one skip is a release Step 3 already made, `RESERVE_HANDED_OFF`). A
 refusal that returned early would strand the Step 1.1 reserve for its full TTL
 and hand the operator "I cannot vet my own plan", a worse failure than the one
 it was reporting. **INCOMPLETE *and* released** is the correct end state.
@@ -1680,7 +1854,44 @@ it too; a reserve stranded until TTL is the first operator-visible symptom of
 getting this wrong ("I cannot vet my own plan"). **The release is the `finally`;
 the verdict above is the `try`** — an INCOMPLETE chain releases on exactly the
 same line a complete one does. There is no branch of Step 5 that reaches its end
-without this call having run.
+without this call having run — **except a chain that recorded
+`RESERVE_HANDED_OFF` at Step 3.** That chain already released the reserve
+before Step 4. Skip both the release and the `stop`, and quote the Step 3
+release's final verdict line in this report instead. Whatever holds the reserve
+now is not this chain: normally `/implement-plan`, whose report quotes its own
+release, or a session that took over (Step 4's late-chain arm). Releasing again
+here would drop a hold this chain does not own, and a same-session
+`/implement-plan` hold carries this chain's own owner token, so coord could not
+refuse it. **But read before skipping:** `/implement-plan` releases on every path
+it controls, so its report should quote its own release verdict line. When that
+line is absent (an interrupted or crashed implement half), run
+`coord-claim-heartbeat.sh status --ledger "$CLAIM_LEDGER"`. If the
+ledger still lists the row `semantic_resource` with the EXACT key
+`plan:<plan-stem>` (never a `:phase:<n>` row) in state `live` or `late`, the
+implement half left its hold behind
+and its heartbeat loop would keep renewing it for up to 24 h. First read the
+plan's gates (`coord_gate_list`, `open_only: false`) for an open, armed
+`claim_terminal` `implement→ship safety net` row, and in the same read the
+`vet→implement safety net` row. **No implement→ship net:** release through
+`plan-reserve-release.sh release` and `stop`, and name the unfinished work and
+the vet net's ACTUAL state in the report. If the vet net is still open and armed,
+it is the queued rescue and the release lets it acquire the plan. If it is
+consumed or withdrawn (it is `time_elapsed`, so it fires at 30 minutes whether
+or not anyone holds the reserve, and a phase-scoped or no-withdraw-door run
+withdrew it and armed no implement→ship net by design), say plainly that no
+automatic rescue remains for the unfinished work.
+**One exists, or the gate read cannot be made** (an unreadable read is never
+"none": the door's own read could then withdraw a live net): do NOT release it:
+the release door would withdraw that run's implement→ship net first, cancelling
+the only rescue for the unfinished work. Instead end the renewal —
+`coord-claim-heartbeat.sh remove --ledger "$CLAIM_LEDGER" --kind
+semantic_resource --key "plan:<plan-stem>"` (removing the last row ends the
+loop) — so the key expires at its TTL and the `claim_terminal` net clears and
+dispatches the rescue. Name the leftover hold, the unfinished work and the net's
+`gate_id` in this report. A row in a terminal state (`stolen`, `owner_gone`,
+`lapsed`, `max_runtime`) is renewed by nothing: report it and leave it — the net
+already clears on its own (and for `stolen` another owner holds the key). The same read applies
+when the hand-off itself is UNKNOWN (Step 3).
 
 **Before the release, confirm the implement→ship net is withdrawn.**
 `/implement-plan` Step 0.5 arms a `claim_terminal` net on this same
@@ -1694,6 +1905,9 @@ before it releases, and prints one line per `gate_id`. A net another device
 registered, or one the reserve's current holder owns when that is not this
 session, is skipped and named (`NET_INERT`), not withdrawn, unless `--net-gate`
 names it. Quote those lines, and its final line, in the report.
+`holder=unknown` on that final line means the holder read failed and the script
+fell back to device-wide selection, so a net of another holder on this same
+device may have been touched: check the per-net lines before you report.
 
 Two things wrap that release, both specified in Step 1.1:
 
@@ -1717,17 +1931,23 @@ the since-when read out of the ledger — not as a clean idempotent no-op.
   coord wiring and stamps. The exception is the Step 1.1 **plan reserve**: this
   command writes (Step 1's untracked-plan push) before either skill runs, and
   exclusion must precede mutation, so the reserve is taken here on the same key
-  both skills use. Their re-reserves renew under the same owner token. **That
+  both skills use. `/vet-plan`'s re-reserve renews under the same owner token.
+  Once `/vet-plan` has armed its vet→implement net, Step 3 releases the reserve
+  (`RESERVE_HANDED_OFF`). `/implement-plan` then acquires it fresh and owns it,
+  so a stalled chain never blocks its own net's rescue. Without a net, the chain
+  keeps the reserve and `/implement-plan` renews it. **That
   stays the only exception** — Step 5's pre-PR-review check is not a second one,
   because it implements nothing: it asks whether the artifact `/implement-plan`
   owes exists for this session's id and reports INCOMPLETE when it does not. A
   gate on the hand-off is thin; a copy of the arm logic would not be.
 - **Report the gate, do not enforce it by stopping.** The Step 5 refusal is a
   status, not a control-flow exit. It never suppresses the `/name` call and never
-  skips the reserve release — reporting a missing artifact by stranding a reserve
+  skips the reserve release (a `RESERVE_HANDED_OFF` chain made it at Step 3) — reporting a missing artifact by stranding a reserve
   would trade a disclosed gap for an undisclosed one.
-- **Reserve before the first write.** A `held` by a different owner is a STOP,
-  and a reserve coord could not answer is UNKNOWN — fail closed. The only branch
+- **Reserve before the first write.** A `held` by a different owner is a STOP —
+  except at the implement half after a recorded `RESERVE_HANDED_OFF`, where it is
+  a silent stand-down (Step 4's late-chain arm: no `AskUserQuestion`, no
+  **Steal**) — and a reserve coord could not answer is UNKNOWN — fail closed. The only branch
   that proceeds unreserved is a device with no machine UUID at all.
 - **Same path through both halves.** Resolve the plan path once in Step 1 and
   pass that identical path to both skills. The Step 1.5 session label is derived
