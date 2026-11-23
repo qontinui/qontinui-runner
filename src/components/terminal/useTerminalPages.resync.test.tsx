@@ -21,6 +21,9 @@ const { bus, windowLabel } = vi.hoisted(() => ({
     listeners: new Map<string, Listener[]>(),
     /** Every event emitted, in order. */
     emitted: [] as Array<{ event: string; payload: unknown }>,
+    /** While set, `listen` registrations of this event wait for `release`. */
+    deferEvent: null as string | null,
+    release: [] as Array<() => void>,
     /** While true, emits queue in `held` instead of dispatching. */
     hold: false,
     held: [] as Array<{ event: string; payload: unknown }>,
@@ -40,17 +43,18 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(() => Promise.reject(new Error("no backend in test"))),
 }));
 vi.mock("@tauri-apps/api/event", () => ({
-  listen: vi.fn((event: string, cb: Listener) => {
+  listen: vi.fn(async (event: string, cb: Listener) => {
+    if (bus.deferEvent === event) await new Promise<void>((r) => bus.release.push(r));
     const list = bus.listeners.get(event) ?? [];
     list.push(cb);
     bus.listeners.set(event, list);
-    return Promise.resolve(() => {
+    return () => {
       const cur = bus.listeners.get(event) ?? [];
       bus.listeners.set(
         event,
         cur.filter((c) => c !== cb),
       );
-    });
+    };
   }),
   emit: vi.fn((event: string, payload: unknown) => {
     bus.emitted.push({ event, payload });
@@ -165,6 +169,8 @@ beforeEach(() => {
   bus.emitted.length = 0;
   bus.held.length = 0;
   bus.hold = false;
+  bus.deferEvent = null;
+  bus.release.length = 0;
   windowLabel.current = "main";
   instanceStorage.setJSON(PAGES_STORAGE_KEY, ROSTER);
   instanceStorage.setItem("qontinui-terminal-active-page", "p1");
@@ -348,7 +354,8 @@ describe("the receiver's branches", () => {
     vi.useFakeTimers();
     // A foreign digest the store never reaches: main starts retrying.
     receiveFrom("term-2", rosterDigest([ROSTER[0]]));
-    // Main then saves; its own echo supersedes the pending read.
+    // Main then saves: the store then holds its own save, so the exhausted
+    // read is not warned about.
     act(() => void main.hook().renamePage("p2", "Own"));
     act(() => void vi.advanceTimersByTime(1_000));
     vi.useRealTimers();
@@ -417,6 +424,34 @@ describe("the receiver's branches", () => {
     mounted.splice(mounted.indexOf(main), 1);
     expect(vi.getTimerCount()).toBe(0);
     vi.useRealTimers();
+  });
+
+  it("a save made before this window's listener registered is caught up on", async () => {
+    // Main mounts and reads the roster, but its roster listener is not yet
+    // registered when another window saves, so no event reaches it.
+    bus.deferEvent = TERMINAL_PAGES_SAVED_EVENT;
+    const main = await mountWindow("main");
+    expect(names(main.hook().allPages)).toEqual(["Alpha", "Beta", "Gamma"]);
+    instanceStorage.setJSON(PAGES_STORAGE_KEY, [ROSTER[0], { ...ROSTER[1], name: "Early" }, ROSTER[2]]);
+
+    bus.deferEvent = null;
+    for (const release of bus.release.splice(0)) release();
+    await settle();
+
+    expect(names(main.hook().allPages)).toEqual(["Alpha", "Early", "Gamma"]);
+  });
+
+  it("a save built on an empty store's default page still matches the receiver's read at once", async () => {
+    localStorage.clear();
+    const main = await mountWindow("main");
+    const pop = await mountWindow("term-2");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    act(() => void pop.hook().addPage("New"));
+
+    // Applied on the first read, with no retry and no lag warning.
+    expect(names(main.hook().allPages)).toEqual(["Terminal", "New"]);
+    expect(warn).not.toHaveBeenCalled();
   });
 
   it("a null store leaves the receiver's roster unchanged", async () => {
