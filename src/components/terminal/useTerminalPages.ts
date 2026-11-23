@@ -8,6 +8,12 @@ import { getPerfCaps, getPerfCapsLoadState, loadPerfCaps } from "@/lib/perfCaps"
 import { DEFAULT_PAGE_NAME, nextAutoPageName, renameRefusal, uniquePageName } from "./pageNaming";
 import { MAIN_WINDOW_LABEL, readWindowLabel } from "@/lib/windowLabel";
 import {
+  broadcastRosterSaved,
+  listenRosterSaved,
+  rosterDigest,
+  rosterEqual,
+} from "./terminalPagesSync";
+import {
   PAGES_VERSION,
   PAGES_VERSION_KEY,
   PRUNE_UNDO_MS,
@@ -131,6 +137,14 @@ function readPersistedPages(): TerminalPageConfig[] | null {
   const stored = instanceStorage.getJSON<TerminalPageConfig[] | null>(STORAGE_KEY, null);
   return Array.isArray(stored) && stored.length > 0 ? withClassifiedOrigins(stored) : null;
 }
+
+/**
+ * How many times a window re-reads the store, {@link ROSTER_RESYNC_RETRY_MS}
+ * apart, for the roster another window announced (see the resync effect in
+ * `useTerminalPages`).
+ */
+const ROSTER_RESYNC_RETRIES = 5;
+const ROSTER_RESYNC_RETRY_MS = 50;
 
 /** Persist the active page id; a full store leaves the previous one (best effort). */
 function persistActivePage(id: string) {
@@ -612,6 +626,9 @@ export function useTerminalPages() {
   const [ownsRosterWrites] = useState<boolean>(
     () => pinnedPageId === null && readWindowLabel() === MAIN_WINDOW_LABEL,
   );
+  // This window's Tauri label, the `source` of its roster-saved broadcasts
+  // (so it can ignore its own echo). Labels are unique per process.
+  const [windowLabel] = useState<string>(readWindowLabel);
 
   const [allPages, setPages] = useState<TerminalPageConfig[]>(loadPages);
   // Only the main window registers tab labels with the backend. A page-pinned
@@ -644,6 +661,14 @@ export function useTerminalPages() {
   // Whether this window's last page-list save was refused (a full store).
   // While it was, this window's copy is NEWER than the store.
   const lastSaveRefusedRef = useRef(false);
+
+  // The digest of the roster this window last SAVED, while the roster-saved
+  // broadcast for it is still due; `null` when none is. Set by `updatePages`
+  // only on a save the store accepted, and sent (then cleared) by the
+  // post-commit effect below, never from inside the updater, which React may
+  // invoke twice or re-run. A refused save sets nothing, so no other window
+  // reloads a roster the store does not hold.
+  const broadcastDueRef = useRef<string | null>(null);
 
   /**
    * The ONE roster writer: `mutate` gets the roster to build on and returns
@@ -679,7 +704,11 @@ export function useTerminalPages() {
         }
         const next = mutate(read.base);
         if (next === read.base) return prev;
-        lastSaveRefusedRef.current = !savePages(next);
+        const saved = savePages(next);
+        lastSaveRefusedRef.current = !saved;
+        // The digest of what a reader of the store gets back
+        // (`readPersistedPages` classifies origins; idempotent on `next`).
+        if (saved) broadcastDueRef.current = rosterDigest(withClassifiedOrigins(next));
         return next;
       });
     },
@@ -742,6 +771,76 @@ export function useTerminalPages() {
       repairVersionDueRef.current = false;
     }
   }, [allPages]);
+
+  // Tell the other windows of this process that the roster was saved, once
+  // per committed save (see `broadcastDueRef`).
+  useEffect(() => {
+    const digest = broadcastDueRef.current;
+    if (digest === null) return;
+    broadcastDueRef.current = null;
+    broadcastRosterSaved(windowLabel, digest);
+  }, [allPages, windowLabel]);
+
+  // Reload the roster when ANOTHER window saved it, so every window shows the
+  // same tabs. Every window listens, a pinned pop-out included: it must show
+  // its page's new name after a rename elsewhere.
+  //
+  // The reload reads the store (the truth, last writer wins), never the
+  // event's content, and never saves or emits, so it cannot loop:
+  // `updatePages` stays the one writer. Skipped while this window's last save
+  // was refused (its copy is newer than the store). An empty or unreadable
+  // store keeps this window's copy: UNKNOWN is not "one default page".
+  //
+  // The store write can reach this webview after the event does, so the read
+  // is retried until the stored roster's digest is the one the sender saved;
+  // after the last retry the last non-null read is applied (a newer write that
+  // displaced the digest sends its own event).
+  useEffect(() => {
+    let disposed = false;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const apply = (stored: TerminalPageConfig[]) => {
+      if (!rosterEqual(allPagesRef.current, stored)) allPagesRef.current = stored;
+      setPages((prev) => (rosterEqual(prev, stored) ? prev : stored));
+    };
+
+    const unlisten = listenRosterSaved(({ source, digest }) => {
+      if (source === windowLabel || lastSaveRefusedRef.current) return;
+      // A newer event supersedes a read still waiting on an older digest.
+      if (retryTimer) clearTimeout(retryTimer);
+      retryTimer = null;
+      let retries = 0;
+      let lastRead: TerminalPageConfig[] | null = null;
+      const attempt = () => {
+        retryTimer = null;
+        if (disposed || lastSaveRefusedRef.current) return;
+        const stored = readPersistedPages();
+        if (stored) lastRead = stored;
+        if (stored && rosterDigest(stored) === digest) {
+          apply(stored);
+          return;
+        }
+        if (retries < ROSTER_RESYNC_RETRIES) {
+          retries++;
+          retryTimer = setTimeout(attempt, ROSTER_RESYNC_RETRY_MS);
+          return;
+        }
+        if (lastRead) {
+          console.warn(
+            `[terminal-pages] the stored roster never matched ${source}'s save; applying the store as read`,
+          );
+          apply(lastRead);
+        }
+      };
+      attempt();
+    });
+
+    return () => {
+      disposed = true;
+      if (retryTimer) clearTimeout(retryTimer);
+      unlisten();
+    };
+  }, [windowLabel]);
 
   const setActivePageId = useCallback(
     (id: string) => {
