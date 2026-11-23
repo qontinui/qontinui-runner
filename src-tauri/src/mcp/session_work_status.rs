@@ -1612,6 +1612,7 @@ mod tests {
     /// (which the verdict maps to an allow) without sending anything.
     #[tokio::test]
     async fn no_work_status_request_is_sent_for_a_tenant_with_no_usable_credential() {
+        let _store = crate::mcp::policy_tenant::test_support::isolated_store();
         let t = uuid::Uuid::new_v4();
         let refused = build_work_status_get(
             &reqwest::Client::new(),

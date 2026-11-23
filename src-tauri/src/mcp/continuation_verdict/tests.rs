@@ -472,6 +472,7 @@ fn the_rules_get_for_tenant_b_presents_bs_credential_not_the_defaults() {
 /// unauthenticated, never under the default credential.
 #[test]
 fn no_rules_request_is_built_for_a_tenant_with_no_usable_credential() {
+    let _store = crate::mcp::policy_tenant::test_support::isolated_store();
     let t = Uuid::new_v4();
     let target = PolicyTarget {
         scope: crate::auth::TenantScope::Owned(t),
@@ -595,8 +596,9 @@ fn the_stop_paths_worst_case_fits_the_hooks_curl_max_time() {
         + policy_tenant::CREDENTIAL_BUILD_TIMEOUT
         + RULES_FETCH_TIMEOUT;
     assert!(
-        worst < Duration::from_secs(max_time),
-        "worst case {worst:?} must stay under the hook's --max-time {max_time}s"
+        worst + Duration::from_millis(1500) <= Duration::from_secs(max_time),
+        "worst case {worst:?} must leave at least 1.5 s of the hook's --max-time {max_time}s \
+         for the route, the transcript read and the connection itself"
     );
     assert!(
         STATUS_READ_BUDGET >= crate::mcp::session_work_status::FETCH_TIMEOUT,

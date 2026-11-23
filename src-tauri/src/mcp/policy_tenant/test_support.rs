@@ -32,11 +32,20 @@ pub(crate) fn two_tenant_runner(
     a: Uuid,
     b: Uuid,
 ) -> qontinui_runner_lib::ambient::test_support::IsolatedAmbient {
-    let ambient = crate::test_env::isolated_ambient();
-    std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
+    let ambient = isolated_store();
     let am = crate::auth::AuthManager::new();
     am.store_tokens(&device_jwt(a), "").expect("store A");
     am.store_tenant_device_jwt(&b, &device_jwt(b))
         .expect("store B");
+    ambient
+}
+
+/// An EMPTY credential store inside an isolated ambient, with the OS keychain
+/// disabled — what a "no usable credential" test must run in, so it can never
+/// read (or be satisfied by) the real store. Hold the guard for the test's life;
+/// it also holds the process-wide env lock.
+pub(crate) fn isolated_store() -> qontinui_runner_lib::ambient::test_support::IsolatedAmbient {
+    let ambient = crate::test_env::isolated_ambient();
+    std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
     ambient
 }

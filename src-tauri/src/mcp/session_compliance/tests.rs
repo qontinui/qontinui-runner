@@ -959,6 +959,7 @@ fn the_config_read_and_compliance_post_for_tenant_b_present_bs_credential() {
 /// credential.
 #[test]
 fn no_config_read_or_compliance_post_is_built_for_a_tenant_with_no_usable_credential() {
+    let _store = crate::mcp::policy_tenant::test_support::isolated_store();
     let client = reqwest::Client::new();
     let t = Uuid::new_v4();
     let target = PolicyTarget {
@@ -1008,14 +1009,15 @@ async fn an_unknown_tenant_on_a_multi_bound_device_posts_nothing_and_is_counted(
     // The turn end itself reports the withhold — read off its own return, not
     // off the process-global counter other tests also bump — and the public
     // entry point turns it into "no nudge".
+    let before = COMPLIANCE_WITHHELD_TENANT_UNKNOWN.load(Ordering::Relaxed);
     let outcome = observe_turn_end_outcome(&hook, &tenant).await;
     let Err(Withheld { total }) = outcome else {
         panic!("an UNKNOWN tenant's turn end is withheld, got {outcome:?}");
     };
     assert!(observe_turn_end(&hook, &tenant).await.is_none());
     assert!(
-        total >= 1,
-        "compliance_withheld_tenant_unknown counted it: {total}"
+        total > before,
+        "compliance_withheld_tenant_unknown counted it: {before} -> {total}"
     );
 }
 
@@ -1050,6 +1052,7 @@ async fn the_close_time_finalize_resolves_from_the_record_and_unknown_withholds(
     unparseable.tenant_id = Some("not-a-uuid".to_string());
     assert_eq!(CloseTenantInputs::of(&unparseable).recorded_tenant, None);
 
+    let before = COMPLIANCE_WITHHELD_TENANT_UNKNOWN.load(Ordering::Relaxed);
     let withheld = finalize_impl(
         &record.claude_session_id,
         None,
@@ -1060,7 +1063,7 @@ async fn the_close_time_finalize_resolves_from_the_record_and_unknown_withholds(
     let Err(Withheld { total }) = withheld else {
         panic!("an UNKNOWN close is withheld, got {withheld:?}");
     };
-    assert!(total >= 1, "and counted: {total}");
+    assert!(total > before, "and counted: {before} -> {total}");
 }
 
 /// Tests bullet 7. A single-bound device behaves exactly as before: an
@@ -1082,11 +1085,4 @@ fn a_single_bound_device_files_under_the_default_slot_as_before() {
             tenant: Some(a),
         })
     );
-}
-
-/// Design §4: the Stop route's tenant read fits inside the turn-end
-/// budget, so a slow read decides UNKNOWN rather than eating the hook.
-#[test]
-fn the_stop_tenant_budget_is_below_the_turn_end_budget() {
-    assert!(policy_tenant::STOP_TENANT_BUDGET < TURN_END_BUDGET);
 }

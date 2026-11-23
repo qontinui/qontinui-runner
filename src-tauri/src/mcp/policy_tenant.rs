@@ -324,7 +324,12 @@ pub(crate) const CREDENTIAL_BUILD_TIMEOUT: Duration = Duration::from_secs(1);
 pub(crate) async fn build_off_runtime<T: Send + 'static>(
     build: impl FnOnce() -> Result<T, String> + Send + 'static,
 ) -> Result<T, String> {
-    match tokio::time::timeout(CREDENTIAL_BUILD_TIMEOUT, tokio::task::spawn_blocking(build)).await {
+    match tokio::time::timeout(
+        CREDENTIAL_BUILD_TIMEOUT,
+        qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(build),
+    )
+    .await
+    {
         Ok(Ok(built)) => built,
         Ok(Err(e)) => Err(format!("credential resolution failed ({e})")),
         Err(_) => Err(format!(
@@ -678,10 +683,16 @@ pub(crate) async fn closed_session_policy_target(
         recorded_tenant,
         |tenant| async move {
             qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
-                crate::auth::device_holds_usable_binding(&tenant)
+                recorded_tenant_admissible(
+                    tenant,
+                    crate::auth::default_binding_tenant(),
+                    crate::coord_mcp::device_is_multi_bound(),
+                )
+                .then(|| crate::auth::device_holds_usable_binding(&tenant))
             })
             .await
-            .unwrap_or(false)
+            .ok()
+            .flatten()
         },
     );
     decide_target_within(
@@ -697,26 +708,49 @@ pub(crate) async fn closed_session_policy_target(
 /// then the record's durable tenant when the live leg named none (or did not
 /// answer in time — a timed-out live leg is `Unnamed`). Bounding only the live
 /// leg is the point: a slow proxy or registry read must not hide the record's
-/// answer by eating the whole decision budget. `credential` says whether this
-/// runner holds a usable credential for the recorded tenant.
+/// answer by eating the whole decision budget.
+///
+/// `admit` vets the recorded tenant: `Some(credential)` admits it as a
+/// registry answer (with whether this runner holds a usable credential for
+/// it), `None` refuses it — the read then stays `Unnamed`, which is UNKNOWN on
+/// a multi-bound device ([`recorded_tenant_admissible`]).
 pub(crate) async fn live_read_then_recorded<C, F>(
     live_budget: Duration,
     live: impl Future<Output = PolicyTenantRead>,
     recorded: Option<Uuid>,
-    credential: C,
+    admit: C,
 ) -> PolicyTenantRead
 where
     C: FnOnce(Uuid) -> F,
-    F: Future<Output = bool>,
+    F: Future<Output = Option<bool>>,
 {
     let live = read_within(live_budget, live).await;
-    match recorded_fallback_tenant(&live, recorded) {
-        Some(tenant) => PolicyTenantRead::Registry {
-            tenant,
-            credential: credential(tenant).await,
-        },
+    let Some(tenant) = recorded_fallback_tenant(&live, recorded) else {
+        return live;
+    };
+    match admit(tenant).await {
+        Some(credential) => PolicyTenantRead::Registry { tenant, credential },
         None => live,
     }
+}
+
+/// May a closed record's stamped tenant stand in for an unnamed live read?
+/// Pure.
+///
+/// The stamp is not always a repo-settled answer: a spawn whose repo tenant
+/// had not settled is stamped from the machine rows, i.e. the device DEFAULT
+/// tenant. On a multi-bound device a stamp equal to the default binding is
+/// therefore indistinguishable from that fall-through, and promoting it would
+/// file the session's compliance under the default tenant — the defect this
+/// module exists to stop. Such a stamp is refused (UNKNOWN). Any other stamp
+/// names a tenant the spawn chose on purpose, and a single-bound device's
+/// default IS its sole tenant.
+pub(crate) fn recorded_tenant_admissible(
+    recorded: Uuid,
+    default_binding: Option<Uuid>,
+    multi_bound: bool,
+) -> bool {
+    !(multi_bound && default_binding == Some(recorded))
 }
 
 /// The lifecycle record's durable tenant, when the live read named none
