@@ -79,6 +79,12 @@ use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 use crate::capability_manifest::{self, ProvisionReport};
 
+/// The launch decision coord stamps on a spawn frame (`launch_model` /
+/// `launch_effort` / `launch_settings`) and how this runner applies it — plan
+/// `2026-11-15-operator-sets-spawn-model-and-effort-per-spawn-type` D6.
+mod launch_frame;
+use launch_frame::{AppliedLaunch, LaunchFrame, LaunchSeam};
+
 // =============================================================================
 // Wire shapes (mirror of qontinui-coord/src/agents_spawn.rs)
 // =============================================================================
@@ -158,6 +164,15 @@ pub struct LaunchPayload {
     /// is indistinguishable from one honoured.
     #[serde(default)]
     pub account: Option<String>,
+    /// The launch decision coord resolved for this spawn (`launch_model`,
+    /// `launch_effort`, `launch_settings`; plan
+    /// `2026-11-15-operator-sets-spawn-model-and-effort-per-spawn-type` V5).
+    /// Flattened so the three keys sit at the frame's top level, exactly where
+    /// coord's `LaunchDecision` puts them; every key defaults, so a coord that
+    /// stamps nothing parses unchanged. Read it through
+    /// [`LaunchFrame::resolve`], which drops any value outside the vocabularies.
+    #[serde(flatten)]
+    pub launch: LaunchFrame,
 }
 
 impl LaunchPayload {
@@ -349,6 +364,15 @@ pub struct GateContinuationPayload {
     /// and never fails the frame.
     #[serde(default, deserialize_with = "deserialize_lenient_allocation")]
     pub allocation: Option<ContinuationAllocation>,
+    /// The launch decision coord resolved for this spawn (`launch_model`,
+    /// `launch_effort`, `launch_settings`; plan
+    /// `2026-11-15-operator-sets-spawn-model-and-effort-per-spawn-type` V5).
+    /// Flattened so the three keys sit at the frame's top level, exactly where
+    /// coord's `LaunchDecision` puts them; every key defaults, so a coord that
+    /// stamps nothing parses unchanged. Read it through
+    /// [`LaunchFrame::resolve`], which drops any value outside the vocabularies.
+    #[serde(flatten)]
+    pub launch: LaunchFrame,
 }
 
 /// The typed half of coord's re-delivery annotation. See
@@ -791,13 +815,14 @@ pub struct ConditionCheckPayload {
     /// `POST /coord/condition-runs/{run_id}/report` — the ONLY credential that
     /// route accepts (it is public; a device JWT 403s there).
     ///
-    /// `Option` because coord does not put it in the frame today: it embeds the
-    /// token in [`Self::initial_prompt`] for the spawned agent to curl with. The
-    /// runner needs it too, so that a spawn which never happens can still report
-    /// the run terminal instead of leaving it `running` forever — see
-    /// [`report_condition_run_failed`]. Until coord promotes it to a field,
-    /// [`condition_report_token`] recovers it from the prompt; when coord does,
-    /// this field wins with no further change here.
+    /// Coord sends it as its own frame key since qontinui-coord#3856, and also
+    /// embeds it in [`Self::initial_prompt`] for the spawned agent to curl with.
+    /// The runner needs it too, so that a spawn which never happens can still
+    /// report the run terminal instead of leaving it `running` forever — see
+    /// [`report_condition_run_failed`]. `Option` because a coord build that
+    /// predates #3856 sends no such key: [`condition_report_token`] then
+    /// recovers the token from the prompt, and this field wins whenever it is
+    /// present.
     #[serde(default)]
     pub report_token: Option<String>,
     /// Human name of the condition being checked, when coord supplies one.
@@ -805,6 +830,22 @@ pub struct ConditionCheckPayload {
     /// label and no `--name`.
     #[serde(default)]
     pub condition_name: Option<String>,
+    /// The frame's `secrets` key: `ref -> value` for each `{{secret:<ref>}}`
+    /// placeholder coord rendered into [`Self::initial_prompt`] in place of a
+    /// credential. Held for this session and typed only by the SDK `type`
+    /// action ([`crate::condition_secrets`]); empty from a coord that renders
+    /// no placeholders.
+    #[serde(default)]
+    pub secrets: crate::condition_secrets::FrameSecrets,
+    /// The launch decision coord resolved for this spawn (`launch_model`,
+    /// `launch_effort`, `launch_settings`; plan
+    /// `2026-11-15-operator-sets-spawn-model-and-effort-per-spawn-type` V5).
+    /// Flattened so the three keys sit at the frame's top level, exactly where
+    /// coord's `LaunchDecision` puts them; every key defaults, so a coord that
+    /// stamps nothing parses unchanged. Read it through
+    /// [`LaunchFrame::resolve`], which drops any value outside the vocabularies.
+    #[serde(flatten)]
+    pub launch: LaunchFrame,
 }
 
 /// Redacting `Debug`, deliberately not derived.
@@ -815,7 +856,8 @@ pub struct ConditionCheckPayload {
 /// `auth_setup` recipe, i.e. whatever login secret the tenant stored for the
 /// target app. Nothing formats this struct today; a derive would make the next
 /// `{:?}` in a log line leak both without anyone noticing. `initial_prompt` is
-/// reported as a LENGTH so it stays diagnosable without being quotable.
+/// reported as a LENGTH so it stays diagnosable without being quotable, and
+/// `secrets` (the values coord moves OUT of the prompt) as counts only.
 impl std::fmt::Debug for ConditionCheckPayload {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConditionCheckPayload")
@@ -839,6 +881,8 @@ impl std::fmt::Debug for ConditionCheckPayload {
                     }
                 ),
             )
+            .field("secrets", &self.secrets)
+            .field("launch", &self.launch)
             .finish()
     }
 }
@@ -1191,16 +1235,43 @@ fn launchable_or_bare(resolved: String) -> String {
 /// head of each candidate — callers on an async task must run this via
 /// `spawn_blocking`.
 pub(crate) fn resolve_claude_bin() -> String {
+    try_resolve_claude_bin_in(std::env::var_os("PATH").as_deref()).unwrap_or_else(claude_bin_path)
+}
+
+/// [`resolve_claude_bin`] WITHOUT its bare-name fallback, and with
+/// [`launchable_or_bare`]'s execute-bit check folded in: `None` when no
+/// launchable `claude` resolves — nothing on PATH, only npm's placeholder stub,
+/// or a resolved file that is not executable. An explicit absolute
+/// `QONTINUI_CLAUDE_BIN` override is passed through unjudged.
+///
+/// For a caller that must never hand the PTY the bare name: a `--resume`
+/// respawn whose bare `claude` finds the identity shim first on the pane's
+/// PATH, misses again inside the shim's bounded wait during a CLI reinstall,
+/// and exits 127 — the lost-session shape of plan
+/// `2026-10-20-account-migration-respawn-dies-during-cli-reinstall-churn`
+/// (D3.1). [`crate::claude_cli_spawn::resolve_resume_claude_bin`] retries it.
+/// Blocking, like [`resolve_claude_bin`].
+pub(crate) fn try_resolve_launchable_claude_bin() -> Option<String> {
+    let bare = claude_bin_path();
+    let resolved = try_resolve_claude_bin_in(std::env::var_os("PATH").as_deref())?;
+    if std::path::Path::new(&bare).is_absolute() {
+        return Some(resolved);
+    }
+    // `launchable_or_bare` answers the bare name for a non-executable file.
+    let launchable = launchable_or_bare(resolved);
+    (launchable != bare).then_some(launchable)
+}
+
+/// The PATH walk behind [`resolve_claude_bin`], over an explicit `path` value
+/// (testable without replacing the process PATH). `None` on a miss.
+fn try_resolve_claude_bin_in(path: Option<&std::ffi::OsStr>) -> Option<String> {
     let bare = claude_bin_path();
     // An explicit `QONTINUI_CLAUDE_BIN` override (or any absolute path) is
     // launchable as-is — no PATH search, no shim shadowing.
     if std::path::Path::new(&bare).is_absolute() {
-        return bare;
+        return Some(bare);
     }
-    let path = match std::env::var_os("PATH") {
-        Some(p) => p,
-        None => return bare,
-    };
+    let path = path?;
     // Skip every qontinui shim/identity dir — ours or one inherited from
     // another session. They hold the extensionless script that triggers os
     // error 193 under a direct `CreateProcessW`, and a shim is never the real
@@ -1216,7 +1287,7 @@ pub(crate) fn resolve_claude_bin() -> String {
     // Only extensions CreateProcessW can natively launch — see doc comment.
     #[cfg(windows)]
     let exts: &[&str] = &[".exe", ".com"];
-    for dir in std::env::split_paths(&path) {
+    for dir in std::env::split_paths(path) {
         if is_qontinui_shim_dir(&dir) || is_persistent_identity_dir_in(&dir, persistent.as_deref())
         {
             continue;
@@ -1226,7 +1297,7 @@ pub(crate) fn resolve_claude_bin() -> String {
             for ext in exts {
                 let cand = dir.join(format!("{bare}{ext}"));
                 if cand.is_file() {
-                    return cand.to_string_lossy().into_owned();
+                    return Some(cand.to_string_lossy().into_owned());
                 }
             }
         }
@@ -1235,11 +1306,11 @@ pub(crate) fn resolve_claude_bin() -> String {
             use qontinui_runner_lib::intercept_core::npm_placeholder::is_npm_placeholder;
             let cand = dir.join(&bare);
             if cand.is_file() && !is_npm_placeholder(&cand) {
-                return cand.to_string_lossy().into_owned();
+                return Some(cand.to_string_lossy().into_owned());
             }
         }
     }
-    bare
+    None
 }
 
 // =============================================================================
@@ -1514,12 +1585,16 @@ async fn connect_and_pump(
     // (see [`KEEPALIVE_INTERVAL_SECS`]) would be running against this replay, and
     // not `ws.next()`, so live frames would wait behind it. A frame and a poll
     // racing for one gate is the ordinary case the in-process claim already
-    // arbitrates, and the capacity-kick re-poll spawns this same pair.
+    // arbitrates.
     //
-    // Coalesced across reconnects ([`start_connect_replay`]): a WS flap that
-    // reconnects while a replay is still running asks it for one more pass
+    // Coalesced with every other trigger ([`request_pending_replay`]): a WS flap
+    // that reconnects while a replay is still running asks it for one more pass
     // instead of stacking a second pull of the same list on one slow link.
-    start_connect_replay(device_id);
+    request_pending_replay(
+        device_id,
+        ReplayTrigger::Connect,
+        &tokio::runtime::Handle::current(),
+    );
 
     let mut keepalive = tokio::time::interval(Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
     keepalive.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -2353,7 +2428,8 @@ impl ContinuationConsumedBody {
 /// The runner's decision after POSTing the consume CLAIM, derived purely from
 /// the claim response (status + body). Factored out as a pure fn
 /// ([`decide_spawn`]) so the 200 / 409-cancelled / 409-superseded /
-/// 409-rerouted / error branches are unit-testable without a live coord.
+/// 409-rerouted / 409-wrong_device / error branches are unit-testable without
+/// a live coord.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SpawnDecision {
     /// Claim accepted (HTTP 200) → proceed to spawn.
@@ -2390,6 +2466,22 @@ enum SpawnDecision {
     SkipRerouted {
         target_device_id: Option<uuid::Uuid>,
     },
+    /// Claim refused (HTTP 409 `{"error":"wrong_device","target_device_id"}`)
+    /// → the continuation is `pin: "strict"` and this device is NOT its pin:
+    /// "this device or nothing", for work that is local to the pinned device
+    /// (its files, logs, scheduled tasks). SKIP the spawn, post NO outcome and
+    /// NO deferral, and RELEASE the local dispatch claim. Spawning here — what
+    /// the "any other 409" arm below does for a runner that predates this
+    /// variant — starts a session that can only report `work_misrouted`, a
+    /// RAM-holding process spawned to refuse. Coord wrote nothing and left the
+    /// row pending at its pin, so the pin's own poll still delivers it.
+    /// Carries the pin when the body names it as a UUID, for the INFO log only.
+    ///
+    /// Plan `2026-11-19-a-device-bound-continuation-holds-its-pin-and-a-misrouted-one-is-not-consumed`,
+    /// Phase 2a.
+    SkipWrongDevice {
+        target_device_id: Option<uuid::Uuid>,
+    },
     /// Network failure / timeout / any other non-2xx → PROCEED to spawn anyway
     /// (availability over consistency; the in-process dedupe still guards).
     /// Carries a human-readable cause for the WARN log.
@@ -2397,7 +2489,7 @@ enum SpawnDecision {
     /// A [`SpawnDecision::SpawnDespiteClaimError`] while autonomous spawns are
     /// paused by coord's device drain (drained, or drain state unknown): do NOT
     /// spawn; leave the row pending for the backstop poll, like a load deferral.
-    /// Produced only by [`apply_drain_to_claim`].
+    /// Produced only by [`apply_drain_to_claim_with_role`].
     DeferClaimErrorByDrain {
         cause: String,
         reason: String,
@@ -2408,17 +2500,35 @@ enum SpawnDecision {
 /// PURE: fold the device drain into a claim decision. Only the "spawn anyway"
 /// arm changes; a clean `Spawn` (coord accepted the claim while the drain was
 /// clear enough to reach it) and every coord refusal (`SkipCancelled`,
-/// `SkipSuperseded`, `SkipRerouted`) are left alone — a refusal spawns nothing,
+/// `SkipSuperseded`, `SkipRerouted`, `SkipWrongDevice`) are left alone — a refusal spawns nothing,
 /// so there is nothing for the drain to pause.
+#[cfg(test)]
 fn apply_drain_to_claim(
     decision: SpawnDecision,
     drain: &crate::coord_drain_state::CoordDrainState,
 ) -> SpawnDecision {
+    apply_drain_to_claim_with_role(
+        decision,
+        drain,
+        crate::coord_drain_state::RoleReading::Known(None),
+    )
+}
+
+/// PURE: the drain re-check of a claim decision, with the device's dispatch role, so the
+/// re-check after the claim's await also sees a role that closed the agent
+/// lane while it waited.
+fn apply_drain_to_claim_with_role(
+    decision: SpawnDecision,
+    drain: &crate::coord_drain_state::CoordDrainState,
+    role: impl Into<crate::coord_drain_state::RoleReading>,
+) -> SpawnDecision {
     match decision {
         SpawnDecision::SpawnDespiteClaimError { cause } => {
-            match crate::coord_drain_state::gate_for(
+            match crate::coord_drain_state::gate_with_role_at(
                 drain,
+                role,
                 crate::coord_drain_state::SpawnOrigin::GateContinuation,
+                chrono::Utc::now(),
             ) {
                 crate::coord_drain_state::DrainGate::Allow => {
                     SpawnDecision::SpawnDespiteClaimError { cause }
@@ -2480,6 +2590,10 @@ fn continuation_drain_admission_for(
 ///   [`SpawnDecision::SkipRerouted`] (new target from `target_device_id`, when
 ///   it parses as a UUID). Without this arm the rerouted refusal fell into the
 ///   "any other 409" spawn-anyway branch below and double-spawned.
+/// - 409 with a JSON body whose `error == "wrong_device"` →
+///   [`SpawnDecision::SkipWrongDevice`] (the pin from `target_device_id`, when
+///   it parses as a UUID): a strict-pinned continuation claimed from a device
+///   that is not its pin.
 /// - any other status (incl. a 409 that is NONE of those shapes) →
 ///   [`SpawnDecision::SpawnDespiteClaimError`] (availability over consistency).
 ///
@@ -2518,13 +2632,24 @@ fn decide_spawn(status: u16, body: &str) -> SpawnDecision {
                     .and_then(|s| uuid::Uuid::parse_str(s).ok());
                 return SpawnDecision::SkipRerouted { target_device_id };
             }
+            // The strict-pin shape: `{"error":"wrong_device",
+            // "target_device_id":<uuid>}` - this device is not the pin. Without
+            // this arm it fell into the spawn-anyway branch below.
+            if v.get("error").and_then(|e| e.as_str()) == Some("wrong_device") {
+                let target_device_id = v
+                    .get("target_device_id")
+                    .and_then(|t| t.as_str())
+                    .and_then(|s| uuid::Uuid::parse_str(s).ok());
+                return SpawnDecision::SkipWrongDevice { target_device_id };
+            }
         }
-        // A 409 that is none of the cancelled / superseded / rerouted contracts
+        // A 409 that is none of the cancelled / superseded / rerouted /
+        // wrong_device contracts
         // (e.g. some other conflict): proceed rather than silently drop the
         // continuation.
         return SpawnDecision::SpawnDespiteClaimError {
             cause: format!(
-                "claim returned 409 without a cancelled, superseded or rerouted body: {body}"
+                "claim returned 409 without a cancelled, superseded, rerouted or wrong_device body: {body}"
             ),
         };
     }
@@ -3045,6 +3170,10 @@ fn release_local_dispatch_claim(consume_target: ConsumeTarget) {
 ///   proceeds on a later claim if the winner is released (spawn_failed /
 ///   work_abandoned / work_unreported). Keeping the id claimed would strand it
 ///   for the process lifetime (see [`release_gate_dispatch_attempt`]).
+/// * [`SpawnDecision::SkipWrongDevice`] → **true**. coord wrote nothing and the
+///   row stays pending at its strict pin; the id is released so a frame that
+///   later names THIS device (the operator re-pinning, or a re-registration)
+///   is not dropped at the dedupe check for the process lifetime.
 /// * [`SpawnDecision::SkipRerouted`] → **true**, a deliberate choice. The row
 ///   IS still pending on coord, but targeted at another device — coord's
 ///   reroute is one OF RECORD (`REROUTE_OF_RECORD_SQL` rewrites the persisted
@@ -3067,7 +3196,9 @@ fn release_local_dispatch_claim(consume_target: ConsumeTarget) {
 fn skip_leaves_row_pending(decision: &SpawnDecision) -> bool {
     matches!(
         decision,
-        SpawnDecision::SkipSuperseded { .. } | SpawnDecision::SkipRerouted { .. }
+        SpawnDecision::SkipSuperseded { .. }
+            | SpawnDecision::SkipRerouted { .. }
+            | SpawnDecision::SkipWrongDevice { .. }
     )
 }
 
@@ -3121,7 +3252,8 @@ enum ClaimOutcome {
 /// the skip/spawn decision are one unit, and
 /// `superseded_skip_releases_local_dispatch_claim_so_relist_reclaims` asserts
 /// the [`ClaimOutcome`] **and** the resulting claim state for every
-/// [`SpawnDecision`] variant.
+/// [`SpawnDecision`] variant except `SkipWrongDevice`, which
+/// `a_wrong_device_refusal_skips_and_releases_the_claim` covers the same way.
 ///
 /// The residual, stated rather than overstated: the gap is NARROWED to one
 /// statement, not removed. Deleting the whole wiring line in
@@ -3221,6 +3353,22 @@ fn settle_claim_decision(
             // rather than incidental). No outcome and no deferred stamp: the
             // row now belongs to the new target, and a deferral from us would
             // write this device's pressure onto a row another device owns.
+            settle_skipped_claim(decision, consume_target);
+            ClaimOutcome::Skip
+        }
+        SpawnDecision::SkipWrongDevice { target_device_id } => {
+            info!(
+                "agent_runtime: continuation is strict-pinned to another device - skipping \
+                 spawn, coord left the row pending at its pin (gate_id={gate_id} \
+                 target_device_id={})",
+                target_device_id
+                    .as_ref()
+                    .map(|t| t.to_string())
+                    .unwrap_or_else(|| "(not named)".to_string())
+            );
+            // RELEASES (`skip_leaves_row_pending`). No outcome and no deferred
+            // stamp: coord wrote nothing, and a deferral from this device would
+            // put its pressure on a row only the pin may run.
             settle_skipped_claim(decision, consume_target);
             ClaimOutcome::Skip
         }
@@ -3634,6 +3782,32 @@ fn continuation_sessions() -> &'static std::sync::Mutex<ContinuationRegistry> {
     static SESSIONS: std::sync::OnceLock<std::sync::Mutex<ContinuationRegistry>> =
         std::sync::OnceLock::new();
     SESSIONS.get_or_init(|| std::sync::Mutex::new(ContinuationRegistry::default()))
+}
+
+/// The `coord.gates` row the LIVE continuation in `terminal_id` reports to, or
+/// `None` when the registry holds no entry for that terminal or holds one with
+/// no gate (a work-unit dispatch).
+///
+/// Read-only. It is how the Stop-hook verdict scopes its default-on arm to gate
+/// continuations ([`crate::mcp::continuation_verdict::mode_for_terminal`]) —
+/// by the runner's own record, never by a title or by the session's
+/// environment, which the runner cannot read.
+pub(crate) fn live_gate_continuation_gate_id(terminal_id: &str) -> Option<uuid::Uuid> {
+    lock_recover(continuation_sessions(), "continuation_sessions")
+        .live
+        .get(terminal_id)
+        .and_then(|s| s.gate_id)
+}
+
+/// `(terminal_id, gate_id)` for every LIVE continuation that has a gate row —
+/// a snapshot taken under the registry lock and returned with it released.
+/// The finish relay ([`crate::session::continuation_finish_relay`]) walks it.
+pub(crate) fn live_gate_continuations() -> Vec<(String, uuid::Uuid)> {
+    lock_recover(continuation_sessions(), "continuation_sessions")
+        .live
+        .iter()
+        .filter_map(|(tid, s)| s.gate_id.map(|g| (tid.clone(), g)))
+        .collect()
 }
 
 /// The `coord.gates` row this continuation may report a work outcome to, or
@@ -4110,12 +4284,32 @@ fn admit_launch(
     // RUNNING session twice (once in the readings, once here). Residual,
     // stated: a burst of LAUNCHES alone is bounded only by the readings.
     let pending = lock_recover(continuation_sessions(), "continuation_sessions").reserved_spawns;
-    let (projected, shadowed) = reading.projected(pending);
+    let (decision, shadowed) = launch_admission(&reading, pending);
     crate::resource_guard::note_admission_shadowed_lane(shadowed.as_ref());
-    match launch_deferral_reason(&projected) {
+    decision
+}
+
+/// PURE: [`admit_launch`]'s decision over one reading and its pending charge,
+/// with the shadowed lane beside it (logged by the caller, outside any lock).
+///
+/// The decision is [`crate::resource_guard::AdmissionReading::projected`] at
+/// `pending`, which is EXACTLY the projection
+/// [`crate::launch_capacity::launch_headroom`] counts from — so the headroom
+/// this device publishes is `0` precisely when this refuses (pinned by
+/// `launch_capacity`'s `launch_headroom_is_zero_exactly_when_admit_launch_refuses`,
+/// plan `2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling`
+/// Phase 2 step 2). Split out so that test can drive the real decision without
+/// the process-global continuation registry.
+pub(crate) fn launch_admission(
+    reading: &crate::resource_guard::AdmissionReading,
+    pending: usize,
+) -> (Result<(), String>, Option<crate::resource_guard::SpawnGate>) {
+    let (projected, shadowed) = reading.projected(pending);
+    let decision = match launch_deferral_reason(&projected) {
         Some(reason) => Err(reason),
         None => Ok(()),
-    }
+    };
+    (decision, shadowed)
 }
 
 /// [`evaluate_continuation_guard`] with the load reading taken LIVE through
@@ -4172,6 +4366,13 @@ pub(crate) fn spawn_admission_health_json() -> serde_json::Value {
     )
 }
 
+/// Admitted, not-yet-running continuations — the pending charge
+/// [`admit_launch`] applies — for the launch capacity the host-lane sample
+/// publishes ([`crate::launch_capacity::live_with_memory`]).
+pub(crate) fn reserved_spawns_now() -> usize {
+    lock_recover(continuation_sessions(), "continuation_sessions").reserved_spawns
+}
+
 /// The severity word of a lane verdict, `"proceed"` when nothing tripped.
 fn verdict_word(gate: &crate::resource_guard::SpawnGate) -> &'static str {
     gate.tripped()
@@ -4198,6 +4399,16 @@ fn spawn_admission_json(
     reserved_spawns: usize,
     cost: crate::resource_guard::ProjectedSpawnCost,
 ) -> serde_json::Value {
+    // The launch capacity this device publishes on its host-lane sample — the
+    // same function, so `/health` and coord read one number (plan
+    // `2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling`
+    // Phase 2 step 3).
+    let launch = crate::launch_capacity::launch_headroom(
+        lanes,
+        reserved_spawns,
+        cost,
+        crate::launch_capacity::LAUNCH_HEADROOM_CAP,
+    );
     let Some(lanes) = lanes else {
         return serde_json::json!({
             "enabled": false,
@@ -4208,6 +4419,8 @@ fn spawn_admission_json(
             "liveContinuations": live_continuations,
             "reservedSpawns": reserved_spawns,
             "countCap": "retired",
+            "launchHeadroom": launch.headroom,
+            "launchVerdict": launch.verdict.as_str(),
         });
     };
     let composed = crate::resource_guard::projected_verdict(Some(lanes), reserved_spawns, cost);
@@ -4246,6 +4459,11 @@ fn spawn_admission_json(
         // readings as projected cost (`verdict` above already includes them).
         "reservedSpawns": reserved_spawns,
         "countCap": "retired",
+        // Further projected launches admitted before one is refused (`0` =
+        // the next launch is refused), and the verdict behind it — what the
+        // host-lane sample publishes to coord.
+        "launchHeadroom": launch.headroom,
+        "launchVerdict": launch.verdict.as_str(),
     })
 }
 
@@ -4484,10 +4702,15 @@ impl Drop for AnchorReservation {
 /// exited by the time `spawned` was posted.
 ///
 /// Drops the exited terminal from the live continuation registry and — only if
-/// it WAS a registered continuation session — kicks an immediate
-/// [`poll_pending_continuations`] so a previously-deferred (load-pressure) continuation
-/// drains promptly into the freed slot instead of waiting for an unrelated WS
-/// reconnect.
+/// it WAS a registered continuation session — asks for an immediate
+/// pending-list replay ([`request_pending_replay`]) so a previously-deferred
+/// (load-pressure) continuation drains promptly into the freed slot instead of
+/// waiting for an unrelated WS reconnect. When a replay is already running,
+/// the request is one more pass after it, so the drain waits out the rest of
+/// that pass rather than racing it with a second pull of the same list. That
+/// is usually one pull (bounded at [`PENDING_LIST_FETCH_TIMEOUT`]) and its rows,
+/// but a pass that stamps a deferral on every row of a long refused backlog can
+/// run for minutes.
 ///
 /// **Ordinary operator tabs never trigger a poll.** An operator tab is not in
 /// the continuation registry, so the deregister below misses and this returns
@@ -4562,10 +4785,9 @@ pub(crate) fn notify_continuation_terminal_exit(
     let Some(device_id) = local_device_id else {
         return;
     };
-    handle.spawn(async move {
-        poll_pending_continuations(device_id).await;
-        poll_pending_unit_dispatches(device_id).await;
-    });
+    // Coalesced: a burst of exits asks a running replay for one more pass, which
+    // starts after this slot freed, instead of each pulling the whole list.
+    request_pending_replay(device_id, ReplayTrigger::CapacityFreed, handle);
 }
 
 /// Fire the runner-side work-outcome fallback for one ended continuation, if it
@@ -4893,7 +5115,7 @@ pub(crate) fn registered_continuation_gate(
 /// `work_completed` is always the bare marker (the fixed string is what lets
 /// coord's transition guard compare it exactly), while `work_abandoned` carries
 /// `": <first line, ≤200 chars>"` whenever a detail was sent.
-fn is_session_work_outcome(recorded: &str) -> bool {
+pub(crate) fn is_session_work_outcome(recorded: &str) -> bool {
     recorded == "work_completed" || marker_matches("work_abandoned", recorded)
 }
 
@@ -4982,12 +5204,14 @@ pub(crate) struct CarriedContinuation {
 /// exit between the lift and the re-pin* — is a **reviewer obligation, not a
 /// compiler-checked one**. `#[must_use]` does not cover it: the permit IS used
 /// (it is bound at the lift), so inserting a `?` or a `return Err(..)` between
-/// the lift and `match spawned` drops it on the way out, releases the anchor,
+/// the lift and the `carried_continuation.settle` call (the migration wraps
+/// the permit in `respawn_liveness::OwedSettle`, which turns such an exit into a
+/// `warn!` and a re-pin onto the old terminal) drops it on the way out, releases the anchor,
 /// and silently reopens this window with **no compiler warning, no clippy
-/// lint, and no failing test** — none of the tests calls `migrate_session`.
+/// lint, and no failing test** — none of the tests calls `confirm_migration`.
 /// A `let (carried, _) = …` or `let Some((c, _permit)) = …` is the same silent
 /// drop. Both ends of the window in
-/// [`crate::terminal::account_migration::migrate_session`] carry a `GUARD:`
+/// `crate::terminal::account_migration::confirm_migration` carry a `GUARD:`
 /// marker comment so the span is greppable; keep them there.
 pub(crate) fn take_continuation_registration(
     terminal_id: &str,
@@ -5151,17 +5375,40 @@ async fn continuation_backstop_poll_loop(device_id: uuid::Uuid) {
     let secs = continuation_backstop_poll_secs();
     let mut interval = tokio::time::interval(Duration::from_secs(secs));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // Skip the immediate first tick — the WS-connect catch-up poll
-    // (`poll_pending_continuations` on connect) covers startup.
+    // Skip the immediate first tick — the WS-connect replay covers startup.
     interval.tick().await;
+    let wedged_after = Duration::from_secs(secs).max(REPLAY_WEDGED_AFTER);
     loop {
         interval.tick().await;
         debug!(
             "agent_runtime: backstop poll firing (every {secs}s, always armed) \
              for device_id={device_id}"
         );
-        poll_pending_continuations(device_id).await;
-        poll_pending_unit_dispatches(device_id).await;
+        // Through the coalescer, then wait (bounded) for the replay to go idle,
+        // so a slow replay delays the next tick rather than stacking requests.
+        let progress_before = PENDING_REPLAY.progress();
+        request_pending_replay(
+            device_id,
+            ReplayTrigger::Backstop,
+            &tokio::runtime::Handle::current(),
+        );
+        let settled = tokio::time::timeout(wedged_after, PENDING_REPLAY.idle())
+            .await
+            .is_ok();
+        // The wedge arm. Every other trigger shares the coalescer's state, so a
+        // replay that never ends would silence them all; the backstop stays an
+        // independent safety net by running a pass itself when the replay has
+        // completed no step (no pull, no row, no pass) in the whole wait. A
+        // replay that is slow but stepping, e.g. one stamping a deferral on
+        // every row of a long refused list, is left alone.
+        if replay_wedged(settled, progress_before, PENDING_REPLAY.progress()) {
+            warn!(
+                "agent_runtime: the pending-list replay made no progress in {}s; the \
+                 backstop runs a pass itself for device_id={device_id}",
+                wedged_after.as_secs()
+            );
+            pending_list_pass(device_id).await;
+        }
     }
 }
 
@@ -5198,14 +5445,56 @@ struct TerminalFocusRequest<'a> {
     terminal_id: &'a str,
 }
 
-/// Emit a `terminal-focus-request` to the MAIN window only.
+/// The spawn origin of a delivered continuation: a work-unit dispatch when it
+/// carries a `dispatch_id`, otherwise a gate continuation — the same split
+/// [`continuation_drain_admission`] makes.
+fn continuation_spawn_origin(
+    payload: &GateContinuationPayload,
+) -> crate::coord_drain_state::SpawnOrigin {
+    if payload.dispatch_id.is_some() {
+        crate::coord_drain_state::SpawnOrigin::UnitContinuation
+    } else {
+        crate::coord_drain_state::SpawnOrigin::GateContinuation
+    }
+}
+
+/// A condition check is coord-dispatched (the origin its drain gate uses).
+const CONDITION_CHECK_SPAWN_ORIGIN: crate::coord_drain_state::SpawnOrigin =
+    crate::coord_drain_state::SpawnOrigin::CoordDispatch;
+
+/// Emit a `terminal-focus-request` to the MAIN window only — when the focus
+/// coalescer surfaces it.
+///
+/// `origin` is why the terminal was spawned. Continuations and condition checks
+/// are coalesced to at most one view-switch decision per minute across all of
+/// them, and a looping agent's first spawn is decided in the tab-only window. The
+/// decision is made at the create, so the requests that follow their start
+/// verdicts can land closer together than that
+/// ([`crate::terminal::focus_coalescer`], plan
+/// `2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap`
+/// D3); a terminal whose create-time `terminal-created` already carried the
+/// decision reuses it, so a tab that was not selected is never followed by a
+/// view switch to it. A suppressed request is a `debug!` and a `/health`
+/// `focusCoalescer.suppressedTotal` count, never silent.
 ///
 /// Uses `emit_to(get_main_window_label(), …)` — NOT the bare global `emit`
 /// (the `terminal-created` broadcast pattern) — so a pop-out webview is not
 /// yanked to this tab. The canonical main-window-label accessor
 /// (`qontinui_runner_lib::get_main_window_label()`, returns `"main"`) matches
 /// the #473 `ui-bridge:invoke-request` scoping.
-pub(crate) fn emit_terminal_focus_request(app: &tauri::AppHandle, terminal_id: &str) {
+pub(crate) fn emit_terminal_focus_request(
+    app: &tauri::AppHandle,
+    terminal_id: &str,
+    origin: crate::coord_drain_state::SpawnOrigin,
+) {
+    if crate::terminal::focus_coalescer::decide_for_focus(origin, terminal_id) {
+        emit_terminal_focus_event(app, terminal_id);
+    }
+}
+
+/// The raw `terminal-focus-request` emit, scoped to the MAIN window. Every
+/// caller decides through [`crate::terminal::focus_coalescer`] first.
+fn emit_terminal_focus_event(app: &tauri::AppHandle, terminal_id: &str) {
     use tauri::Emitter;
     let payload = TerminalFocusRequest { terminal_id };
     if let Err(e) = app.emit_to(
@@ -5228,11 +5517,20 @@ pub(crate) fn emit_terminal_focus_request(app: &tauri::AppHandle, terminal_id: &
 fn focus_existing_continuation(terminal_id: &str) {
     match crate::tauri_app_handle::current() {
         Some(app) => {
+            // A REFOCUS: it only peeks the live terminal's pending
+            // create-time decision, so it can never consume it and leave the
+            // original's own focus request a fresh decision.
+            let surface = crate::terminal::focus_coalescer::decide_for_refocus(
+                crate::coord_drain_state::SpawnOrigin::GateContinuation,
+                terminal_id,
+            );
             debug!(
                 "agent_runtime: duplicate continuation folded onto existing live \
-                 terminal_id={terminal_id} — emitting focus-request"
+                 terminal_id={terminal_id} — refocus decided surface={surface}"
             );
-            emit_terminal_focus_request(&app, terminal_id);
+            if surface {
+                emit_terminal_focus_event(&app, terminal_id);
+            }
         }
         None => {
             debug!(
@@ -5573,98 +5871,272 @@ enum DispatchOutcome {
 /// still only a missed poll, retried on the next tick.
 const PENDING_LIST_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Coalesces the on-connect replay across reconnects. A WS flap reconnects on a
-/// 2 s doubling backoff. Unguarded, each connect would start its own pull of the
+/// Coalesces every pull of the pending lists into one replay at a time. A WS
+/// flap reconnects on a 2 s doubling backoff, a burst of continuation exits
+/// kicks one re-poll each, and the backstop and runtime-ready catch-up tick on
+/// their own clocks. Unguarded, each of those would start its own pull of the
 /// same list: the pulls split one slow link, each is more likely to hit the
 /// bound, and the last to finish (possibly a `fetch_failed` one) overwrites
 /// coord's per-device poll report. A plain skip would be worse: a row coord
-/// dispatched while the WS was down is missing from the list a running replay
-/// already took, so a connect that arrives mid-replay asks for one more pass
-/// rather than none.
+/// dispatched (or a slot that freed) after a running replay took its list is
+/// missing from that list, so a request that arrives mid-replay asks for one
+/// more pass rather than none.
 ///
-/// Only the on-connect replay goes through it. The backstop loop, the
-/// capacity-kick re-poll and the runtime-ready catch-up still call the polls
-/// directly and can overlap a replay, as they always could.
+/// Every trigger goes through it ([`request_pending_replay`]), so the two polls
+/// never run concurrently with themselves. The one exception is the backstop's
+/// wedge arm ([`continuation_backstop_poll_loop`]), which runs a pass itself
+/// when the coalesced replay has made no progress for [`REPLAY_WEDGED_AFTER`].
+///
+/// One atomic state word, so every transition is a single atomic step:
+/// [`Self::IDLE`] (no replay), [`Self::RUNNING`] (a replay is running and owes
+/// no pass) and [`Self::OWED`] (a replay is running, or is being started, and
+/// owes a pass). The ordering is SeqCst throughout: a request that lands
+/// between the replay's last `take_pass` and its `release` is kept only because
+/// `release` sees it.
 struct ReplayCoalescer {
-    in_flight: std::sync::atomic::AtomicBool,
-    rerun: std::sync::atomic::AtomicBool,
+    state: std::sync::atomic::AtomicU8,
+    /// Woken when a replay ends (released or abandoned), for [`Self::idle`].
+    ended: tokio::sync::Notify,
+    /// Steps completed so far: each pull, each row, each pass. The backstop
+    /// reads it to tell a replay that is slow (still stepping) from one that is
+    /// wedged (no step in a whole wait).
+    progress: std::sync::atomic::AtomicU64,
 }
 
 impl ReplayCoalescer {
+    const IDLE: u8 = 0;
+    const RUNNING: u8 = 1;
+    const OWED: u8 = 2;
+
     const fn new() -> Self {
         Self {
-            in_flight: std::sync::atomic::AtomicBool::new(false),
-            rerun: std::sync::atomic::AtomicBool::new(false),
+            state: std::sync::atomic::AtomicU8::new(Self::IDLE),
+            ended: tokio::sync::Notify::const_new(),
+            progress: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
-    /// A connect asks for a replay. `true`: the caller starts one. `false`: one
-    /// is running, and it will make another pass for this request.
+    /// The running replay completed a step (a pull, a row, a pass).
+    fn note_progress(&self) {
+        self.progress.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// How many steps have completed, for comparing across a wait.
+    fn progress(&self) -> u64 {
+        self.progress.load(Ordering::SeqCst)
+    }
+
+    /// A trigger asks for a replay. `true`: none was running, and the caller
+    /// starts one (which owes this pass). `false`: one is running, and it will
+    /// make another pass for this request.
     fn request(&self) -> bool {
-        self.rerun.store(true, Ordering::SeqCst);
-        self.in_flight
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
+        self.state.swap(Self::OWED, Ordering::SeqCst) == Self::IDLE
     }
 
     /// The running replay asks whether a pass is owed (and consumes the request).
     fn take_pass(&self) -> bool {
-        self.rerun.swap(false, Ordering::SeqCst)
+        self.state
+            .compare_exchange(
+                Self::OWED,
+                Self::RUNNING,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
     }
 
-    /// The running replay found no pass owed. It releases the flag and then looks
-    /// once more: a request made after its last `take_pass` found the flag still
-    /// held and returned `false`, so it must not be dropped. `true`: the replay
-    /// took the flag back and keeps running.
+    /// The running replay found no pass owed and ends, unless a request landed
+    /// after its last `take_pass`: then the state is `OWED`, the replay keeps
+    /// running (`true`) and makes that pass.
     fn release(&self) -> bool {
-        self.in_flight.store(false, Ordering::SeqCst);
-        self.rerun.load(Ordering::SeqCst)
-            && self
-                .in_flight
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
+        match self.state.compare_exchange(
+            Self::RUNNING,
+            Self::IDLE,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => {
+                self.ended.notify_waiters();
+                false
+            }
+            Err(Self::OWED) => true,
+            // Only the running replay releases or abandons, so `IDLE` here is
+            // unreachable; ending is the safe reading of it.
+            Err(_) => {
+                self.ended.notify_waiters();
+                false
+            }
+        }
     }
 
-    /// A replay that panicked gives the flag up, so the next connect can start one.
-    fn abandon(&self) {
-        self.in_flight.store(false, Ordering::SeqCst);
+    /// A replay that panicked, or that the runtime dropped before or while it
+    /// ran, gives the state up so the next request can start one. A pass it
+    /// still owed is dropped with it and its waiters are released: the next
+    /// request, from any trigger, runs it. Returns whether a pass was owed.
+    fn abandon(&self) -> bool {
+        let owed = self.state.swap(Self::IDLE, Ordering::SeqCst) == Self::OWED;
+        self.ended.notify_waiters();
+        owed
+    }
+
+    /// Resolves once no replay is running and no pass is owed: at once when
+    /// that already holds, else when the running replay ends after every extra
+    /// pass a request asked it for. So a trigger that requested a pass and then
+    /// waits here resumes after a pass that started after its request has
+    /// completed, or after the replay was abandoned.
+    async fn idle(&self) {
+        loop {
+            // Registered before the state is read, so an end between the read
+            // and the await still wakes this waiter.
+            let ended = self.ended.notified();
+            let mut ended = std::pin::pin!(ended);
+            ended.as_mut().enable();
+            if self.state.load(Ordering::SeqCst) == Self::IDLE {
+                return;
+            }
+            ended.await;
+        }
     }
 }
 
-static CONNECT_REPLAY: ReplayCoalescer = ReplayCoalescer::new();
+/// The backstop's wedge decision: its bounded wait for the replay ran out
+/// (`settled` false) and the replay completed no step across the whole wait.
+/// A replay that is slow but stepping, or that went idle, is not wedged.
+fn replay_wedged(settled: bool, progress_before: u64, progress_after: u64) -> bool {
+    !settled && progress_before == progress_after
+}
 
-/// Replay what coord persisted while this runner was disconnected: the
-/// gate-continuation list, then the work-unit dispatches. SPAWNED, never
-/// awaited by the pump, and coalesced through [`CONNECT_REPLAY`].
-fn start_connect_replay(device_id: uuid::Uuid) {
-    if !CONNECT_REPLAY.request() {
-        debug!(
-            "agent_runtime: on-connect replay for device_id={device_id} coalesced into the \
-             one still running (it makes another pass)"
-        );
-        return;
+/// Run `pass` through `coalescer` on `handle`: start a replay task when none is
+/// running (`true`), else ask the running one for another pass (`false`). The
+/// replay loops until no pass is owed, counting each completed pass.
+///
+/// The abandon guard is built BEFORE the spawn and moved into the task, so it
+/// drops (and gives the flag up) however the task ends: a panicking pass, a
+/// task dropped at runtime shutdown, and a task the runtime drops without ever
+/// polling it because it was already shutting down. Built inside the task, that
+/// last case would leave the state running for the life of the process, and every
+/// later request would fold into a replay that does not exist.
+fn spawn_coalesced_replay<F, Fut>(
+    coalescer: &'static ReplayCoalescer,
+    handle: &tokio::runtime::Handle,
+    pass: F,
+) -> bool
+where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send,
+{
+    if !coalescer.request() {
+        return false;
     }
-    tokio::spawn(async move {
-        // Gives the flag up when the task unwinds (a poll panicked) or is dropped
-        // at runtime shutdown; a normal exit releases it below instead.
-        struct AbandonOnPanic;
-        impl Drop for AbandonOnPanic {
-            fn drop(&mut self) {
-                CONNECT_REPLAY.abandon();
+    struct AbandonOnDrop(&'static ReplayCoalescer);
+    impl Drop for AbandonOnDrop {
+        fn drop(&mut self) {
+            if self.0.abandon() {
+                warn!(
+                    "agent_runtime: a pending-list replay ended without making a pass it owed \
+                     (a pass panicked, or the runtime dropped the task); the next request runs it"
+                );
             }
         }
-        let on_panic = AbandonOnPanic;
+    }
+    let guard = AbandonOnDrop(coalescer);
+    handle.spawn(async move {
         loop {
-            while CONNECT_REPLAY.take_pass() {
-                poll_pending_continuations(device_id).await;
-                poll_pending_unit_dispatches(device_id).await;
+            while coalescer.take_pass() {
+                pass().await;
+                coalescer.note_progress();
             }
-            if !CONNECT_REPLAY.release() {
+            if !coalescer.release() {
                 break;
             }
         }
-        std::mem::forget(on_panic);
+        // A normal end released the flag above; nothing left to abandon.
+        std::mem::forget(guard);
     });
+    true
+}
+
+/// The one coalescer every pending-list trigger goes through.
+static PENDING_REPLAY: ReplayCoalescer = ReplayCoalescer::new();
+
+/// What asked for a pending-list replay, named in its log lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplayTrigger {
+    /// A fresh WS connect: what coord persisted while the WS was down.
+    Connect,
+    /// The periodic backstop tick ([`continuation_backstop_poll_loop`]).
+    Backstop,
+    /// A continuation terminal exited and freed a slot
+    /// ([`notify_continuation_terminal_exit`]).
+    CapacityFreed,
+    /// The presentation runtime became ready ([`spawn_runtime_ready_catch_up`]).
+    RuntimeReady,
+}
+
+impl ReplayTrigger {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Connect => "on-connect",
+            Self::Backstop => "backstop",
+            Self::CapacityFreed => "capacity-freed",
+            Self::RuntimeReady => "runtime-ready",
+        }
+    }
+}
+
+/// One pass over the pending lists: the gate-continuation list, then the
+/// work-unit dispatches. The only place either poll is called; every caller goes
+/// through [`request_pending_replay`], except the backstop's wedge arm.
+///
+/// Each poll, and each row inside one, notes a step on [`PENDING_REPLAY`], so
+/// the backstop's wedge decision reads a long pass that is still stepping as
+/// slow, not stuck.
+async fn pending_list_pass(device_id: uuid::Uuid) {
+    poll_pending_continuations(device_id).await;
+    PENDING_REPLAY.note_progress();
+    poll_pending_unit_dispatches(device_id).await;
+}
+
+/// How long a trigger waits for the pass it asked for, and how long the
+/// backstop waits before it treats a replay that has made NO progress as
+/// wedged. A pass can legitimately run for minutes: the first pass after boot,
+/// and the first each hour, stamps a deferral (a 5 s-bounded POST) on every row
+/// the registry or a drain refuses, and a backlog runs to hundreds of rows. But
+/// it steps at least once per pull (bounded at [`PENDING_LIST_FETCH_TIMEOUT`])
+/// and once per row, so a replay with no step in ten fetch bounds is stuck.
+const REPLAY_WEDGED_AFTER: Duration =
+    Duration::from_secs(10 * PENDING_LIST_FETCH_TIMEOUT.as_secs());
+
+/// Ask for a [`pending_list_pass`]. SPAWNED on `handle`, never awaited by the
+/// caller, and coalesced through [`PENDING_REPLAY`]: when a replay is already
+/// running this asks it for one more pass and returns, and that pass starts
+/// once the running one ends. A caller that needs the pass to have run awaits
+/// [`ReplayCoalescer::idle`] on [`PENDING_REPLAY`] afterwards, bounded by
+/// [`REPLAY_WEDGED_AFTER`].
+///
+/// `handle` rather than `tokio::spawn`: the capacity-freed trigger fires on the
+/// PTY waiter's bare OS thread, which has no runtime context.
+///
+/// A coalesced request is served under the running replay's `device_id`. Every
+/// trigger names this runner's one device: [`spawn_runtime`] reads
+/// `machine.json` once for the pump, the backstop and the catch-up, and the
+/// capacity-freed trigger reads the same file.
+fn request_pending_replay(
+    device_id: uuid::Uuid,
+    trigger: ReplayTrigger,
+    handle: &tokio::runtime::Handle,
+) {
+    let trigger = trigger.label();
+    if spawn_coalesced_replay(&PENDING_REPLAY, handle, move || {
+        pending_list_pass(device_id)
+    }) {
+        debug!("agent_runtime: {trigger} pending-list replay starting for device_id={device_id}");
+    } else {
+        debug!(
+            "agent_runtime: {trigger} pending-list replay for device_id={device_id} coalesced \
+             into the one still running (it makes another pass)"
+        );
+    }
 }
 
 /// Why a pending-list pull failed. A non-2xx status is kept as a status so a
@@ -5774,6 +6246,7 @@ async fn poll_pending_continuations(device_id: uuid::Uuid) {
     for row in body.pending {
         let (payload, delivery) = poll_row_delivery(row, listed_epoch);
         counts.record(dispatch_gate_continuation(payload, device_id, delivery).await);
+        PENDING_REPLAY.note_progress();
     }
     post_continuation_poll_report(device_id, counts).await;
 }
@@ -6048,6 +6521,7 @@ async fn poll_pending_unit_dispatches(device_id: uuid::Uuid) {
         // A unit dispatch has no gate-level re-delivery counter, so it is
         // keyed on its payload exactly like a WS frame.
         let _ = dispatch_gate_continuation(payload, device_id, ContinuationDelivery::Payload).await;
+        PENDING_REPLAY.note_progress();
     }
 }
 
@@ -6060,6 +6534,7 @@ async fn poll_pending_unit_dispatches(device_id: uuid::Uuid) {
 /// - 409 `{"error":"cancelled", cancel_reason}` → [`SpawnDecision::SkipCancelled`].
 /// - 409 `{"error":"superseded", winner_gate_id, …}` → [`SpawnDecision::SkipSuperseded`].
 /// - 409 `{"error":"rerouted", target_device_id, …}` → [`SpawnDecision::SkipRerouted`].
+/// - 409 `{"error":"wrong_device", target_device_id}` → [`SpawnDecision::SkipWrongDevice`].
 /// - 5s timeout / network failure / any other non-2xx →
 ///   [`SpawnDecision::SpawnDespiteClaimError`] (availability over consistency —
 ///   preserves the pre-restructure behavior; the in-process dedupe still guards).
@@ -6070,14 +6545,13 @@ async fn poll_pending_unit_dispatches(device_id: uuid::Uuid) {
 ///
 /// **Drain (plan `2026-09-13-drained-runner-never-reaches-idle`, Phase 3):**
 /// every error arm — no coord base, no client, a failed POST, an unexpected
-/// status — goes through [`apply_drain_to_claim`], so while the device is
+/// status — goes through [`apply_drain_to_claim_with_role`], so while the device is
 /// drained or its drain state is unknown the "spawn anyway" becomes
 /// [`SpawnDecision::DeferClaimErrorByDrain`], a leave-pending deferral.
 async fn post_continuation_claim(gate_id: uuid::Uuid, device_id: uuid::Uuid) -> SpawnDecision {
-    apply_drain_to_claim(
-        claim_before_spawn(gate_id, device_id).await,
-        &crate::coord_drain_state::current(),
-    )
+    let decision = claim_before_spawn(gate_id, device_id).await;
+    let (drain, role) = crate::coord_drain_state::current_with_role();
+    apply_drain_to_claim_with_role(decision, &drain, role)
 }
 
 /// The claim request itself, before the drain is applied.
@@ -6104,8 +6578,8 @@ async fn claim_before_spawn(gate_id: uuid::Uuid, device_id: uuid::Uuid) -> Spawn
     {
         Ok(resp) => {
             let status = resp.status().as_u16();
-            // Body is needed only to distinguish the 409 cancelled / superseded
-            // shapes; read it unconditionally (small) and tolerate a read error.
+            // Body is needed only to distinguish the 409 cancelled / superseded /
+            // rerouted / wrong_device shapes; read it unconditionally (small) and tolerate a read error.
             let text = resp.text().await.unwrap_or_default();
             decide_spawn(status, &text)
         }
@@ -6518,12 +6992,20 @@ fn spawn_runtime_ready_catch_up(device_id: uuid::Uuid) {
             // the first poll lands (that poll then skips it as already
             // dispatched), and a single GET can fail on a box still busy
             // booting. Unit dispatches are deferred by the same verdict.
+            //
+            // Each through the coalescer, waiting (bounded) for the pass it asked
+            // for before the spacing starts, so these stay several distinct
+            // passes even when the on-connect replay is running at the same time.
             for attempt in 0..RUNTIME_READY_CATCH_UP_POLLS {
                 if attempt > 0 {
                     tokio::time::sleep(RUNTIME_READY_CATCH_UP_SPACING).await;
                 }
-                poll_pending_continuations(device_id).await;
-                poll_pending_unit_dispatches(device_id).await;
+                request_pending_replay(
+                    device_id,
+                    ReplayTrigger::RuntimeReady,
+                    &tokio::runtime::Handle::current(),
+                );
+                let _ = tokio::time::timeout(REPLAY_WEDGED_AFTER, PENDING_REPLAY.idle()).await;
             }
         }
         std::future::pending::<()>().await;
@@ -7202,9 +7684,10 @@ async fn run_gate_continuation_inner(
                 &headless_prompt,
                 reservation,
                 pinned_session_id,
+                ctx,
+                &payload.launch,
             )
             .await;
-            drop(ctx);
             presentation_bindable_session(PresentationResult::Headless(res), pinned_session_id)
         }
     };
@@ -7386,6 +7869,14 @@ pub(crate) fn build_continuation_claude_command(
     // against a fixed vector instead of whatever is on the machine's disk.
     hook_settings_args: Vec<String>,
     launch_cfg: &crate::claude_session::launch_spec::LaunchConfig,
+    // The model family coord decided for this spawn (`launch_model`, validated
+    // by [`LaunchFrame::resolve`]). Bound into `LaunchSpec.model`, which
+    // renders exactly one `--model` and drops any template `--model`, in
+    // either the `--model <m>` or the attached `--model=<m>` spelling. `None`
+    // keeps the template / account default — today's argv. The effort half is
+    // `LaunchSpec::effort`, owned by qontinui-runner#2569 (plan
+    // `2026-11-15-operator-sets-spawn-model-and-effort-per-spawn-type` V8).
+    launch_model: Option<String>,
 ) -> Vec<String> {
     use crate::claude_session::launch_spec::{render_argv, LaunchSpec, PermissionMode};
 
@@ -7432,6 +7923,7 @@ pub(crate) fn build_continuation_claude_command(
         permission: PermissionMode::DangerouslySkip,
         session_id: Some(pinned_session_id.to_string()),
         name: session_name.map(str::to_string),
+        model: launch_model,
         extra_required,
         ..Default::default()
     };
@@ -7512,6 +8004,8 @@ async fn run_continuation_terminal(
             let reason = "no Tauri AppHandle (runner has no webview runtime) — \
                           cannot open a visible terminal";
             warn!("agent_runtime: gate-continuation terminal: {reason}");
+            // No create was attempted: no child ran in the tree.
+            remove_unspawned_continuation(ctx, false, reason).await;
             report_spawn_failed(agent_id, reason, None, 0, None).await;
             return Err(anyhow::anyhow!(reason));
         }
@@ -7523,6 +8017,7 @@ async fn run_continuation_terminal(
         None => {
             let reason = "TerminalManager state not managed — cannot create terminal session";
             warn!("agent_runtime: gate-continuation terminal: {reason}");
+            remove_unspawned_continuation(ctx, false, reason).await;
             report_spawn_failed(agent_id, reason, None, 0, None).await;
             return Err(anyhow::anyhow!(reason));
         }
@@ -7532,6 +8027,7 @@ async fn run_continuation_terminal(
         None => {
             let reason = "SessionRegistry state not managed — cannot register terminal session";
             warn!("agent_runtime: gate-continuation terminal: {reason}");
+            remove_unspawned_continuation(ctx, false, reason).await;
             report_spawn_failed(agent_id, reason, None, 0, None).await;
             return Err(anyhow::anyhow!(reason));
         }
@@ -7623,6 +8119,7 @@ async fn run_continuation_terminal(
             "no authenticated Claude account on this runner — run /login (instance={instance})"
         );
         warn!("agent_runtime: gate-continuation terminal aborted — {reason}");
+        remove_unspawned_continuation(ctx, false, &reason).await;
         report_spawn_failed(agent_id, &reason, None, 0, None).await;
         return Err(anyhow::anyhow!(reason));
     }
@@ -7643,6 +8140,14 @@ async fn run_continuation_terminal(
     // once.
     let mut ctx = ctx;
     let mut attempt: u32 = 1;
+    // coord's launch decision, validated and logged once for every attempt
+    // below. The model binds into `LaunchSpec.model`; the effort waits on
+    // `LaunchSpec::effort` (qontinui-runner#2569) and the line says so.
+    let launch = payload.launch.resolve();
+    launch.log(
+        LaunchSeam::Terminal,
+        &format!("gate continuation agent={agent_id}"),
+    );
     loop {
         // Pre-pin the Claude session id (#548 Phase 1): the registry records
         // synchronously at spawn instead of mtime-guessing from transcripts.
@@ -7702,6 +8207,7 @@ async fn run_continuation_terminal(
             ),
             // Settled below, from the SAME carrier the argv is built from.
             policy_delivery: None,
+            spawn_origin: continuation_spawn_origin(payload),
         };
 
         // Provision `.mcp.json` so this continuation can reach coord coordination
@@ -7740,9 +8246,15 @@ async fn run_continuation_terminal(
         // path. The briefing is then composed with the tenant's cached policy body
         // into one `--append-system-prompt-file` when that cache exists (plan
         // `2026-09-15-runner-policy-injection-off-sessionstart-hook-channel`), and
-        // stays inline otherwise.
-        let prompt_carrier = crate::session::spawn_prompt::resolve_system_prompt_carrier(Some(
-            compose_continuation_terminal_system_prompt(
+        // stays inline otherwise. WHOSE body: the tenant a new session in
+        // `workdir` resolves to (plan
+        // `2026-11-13-runner-policy-injection-uses-the-device-default-tenant-not-the-sessions`
+        // Design §6) — a stated tenant only; anything else composes no body.
+        let policy_tenant =
+            crate::mcp::policy_tenant::new_session_policy_tenant(std::path::Path::new(workdir))
+                .await;
+        let prompt_carrier = crate::session::spawn_prompt::resolve_system_prompt_carrier(
+            Some(compose_continuation_terminal_system_prompt(
                 crate::terminal::runner_context(
                     crate::terminal::spawn_seam_api_port(),
                     coord_mcp,
@@ -7752,8 +8264,9 @@ async fn run_continuation_terminal(
                 ctx.as_ref().map_or(&[][..], |c| c.sibling_notes.as_slice()),
                 workdir,
                 no_worktree_cause,
-            ),
-        ));
+            )),
+            policy_tenant,
+        );
         // The marker the policy hook's route trusts as proof of delivery — taken
         // from the very carrier the argv uses, never recomputed.
         let policy_delivery = prompt_carrier.as_ref().and_then(|c| c.policy_delivery());
@@ -7766,9 +8279,13 @@ async fn run_continuation_terminal(
             prompt_carrier,
             // Direct exec — no identity shim in the chain to append `--settings`,
             // so the hook carrier has to be spelled out here or this session runs
-            // with no SessionStart/PreCompact/Stop hook at all.
-            crate::session::claude_hook::direct_spawn_settings_args(),
+            // with no SessionStart/PreCompact/Stop hook at all. A GATE
+            // continuation gets the Stop-armed carrier unless the flag is
+            // explicitly `off`: it is the unattended population whose turn end
+            // must be checked (plan 2026-10-28-finished-gate-continuations-…).
+            crate::session::claude_hook::spawn_settings_args(reportable_gate.is_some()),
             &launch_cfg,
+            launch.spec_model(),
         );
         // ...unless an operator template put a replacement prompt in the final
         // argv (the uniform rule, `spawn_prompt::argv_carries_replacement_prompt`).
@@ -7782,6 +8299,12 @@ async fn run_continuation_terminal(
         // Same for the fleet SKILLS (.claude/skills/<name>/SKILL.md) — a device with
         // no qontinui-claude-config checkout has no skills dir at all.
         crate::fleet_skills::provision_fleet_skills_for_session(workdir);
+        // And the named-subagent defs (embedded floor + checkout overlay). Off
+        // the async worker: the ownership probe may run git per destination.
+        {
+            let wd = workdir.to_string();
+            let _ = spawn_blocking_tracked(move || provision_agent_definitions_recorded(&wd)).await;
+        }
 
         // The PTY seam derives workspace trust for the pinned account through the
         // trust gate's SYNC door, which can only read the dial cache. Warm it here,
@@ -7818,6 +8341,13 @@ async fn run_continuation_terminal(
         let (terminal_id, coord_session_id) = match result {
             Ok(created) => created,
             Err(e) => {
+                // The failed create hands the context back unparked. Its tree is
+                // removed before the report — once, under this continuation's
+                // own post, whose `agent_id` is the context's — when the
+                // typed failure says no child started AND this is the first
+                // attempt; see [`continuation_create_failure_handoff`].
+                let (ctx_back, child_started, message) =
+                    continuation_create_failure_handoff(e, attempt);
                 // The PTY seam returns text, so a trust-gate refusal arrives as the
                 // gate's own `spawn_blocked …` string rather than as the typed
                 // `SpawnBlocked` the headless funnel downcasts. Classify it by its
@@ -7826,9 +8356,10 @@ async fn run_continuation_terminal(
                 // child, instead of `exited`, and carries the refusal verbatim
                 // (it names the failing conjuncts) rather than wrapped as a create
                 // failure.
-                let (reason, phase) = classify_pty_spawn_error(&e);
+                let (reason, phase) = classify_pty_spawn_error(&message);
+                remove_unspawned_continuation(ctx_back, child_started, &reason).await;
                 report_spawn_failed_in_phase(agent_id, &reason, None, 0, None, phase).await;
-                return Err(anyhow::anyhow!(e));
+                return Err(anyhow::anyhow!(message));
             }
         };
 
@@ -7850,6 +8381,7 @@ async fn run_continuation_terminal(
                 let reason = "continuation pane was closed before the session started".to_string();
                 warn!("agent_runtime: gate-continuation terminal_id={terminal_id}: {reason}");
                 report_spawn_failed(agent_id, &reason, None, attempt.saturating_sub(1), None).await;
+                // door-scan: keep(post-child) the pane ran a child; its close already released the claim
                 return Err(anyhow::anyhow!(reason));
             }
             ContinuationStart::NeverStarted(evidence) => {
@@ -7888,6 +8420,7 @@ async fn run_continuation_terminal(
                     claude_bin = spawn_blocking_tracked(resolve_claude_bin)
                         .await
                         .unwrap_or_else(|_| claude_bin_path());
+                    // door-scan: keep(retry) the context, taken back off the dead pane, carries into the next attempt
                     continue;
                 }
                 let reason = format!("never started ({attempt} attempts): {detail}");
@@ -7901,6 +8434,7 @@ async fn run_continuation_terminal(
                 )
                 .await;
                 // `reservation` drops on this return and releases the anchor.
+                // door-scan: keep(post-child) never-started attempts ran a child in this tree; the context is parked on its pane
                 return Err(anyhow::anyhow!(reason));
             }
             ContinuationStart::Started { pty_alive } => {
@@ -7939,9 +8473,10 @@ async fn run_continuation_terminal(
                 // SCOPED to the MAIN window (`emit_to`, NOT bare `emit`) so a pop-out
                 // window is not yanked to this tab — `terminal-created` is a global
                 // broadcast, but a focus action must target only `main`.
-                emit_terminal_focus_request(&app, &terminal_id);
+                emit_terminal_focus_request(&app, &terminal_id, continuation_spawn_origin(payload));
                 report_spawn_complete(agent_id, None, Some("gate continuation (terminal)"), None)
                     .await;
+                // door-scan: keep(spawned) the started session holds the context
                 return Ok(TerminalStart {
                     session_id: attempt_session_id,
                     exited_terminal: exited.then_some(terminal_id),
@@ -7960,6 +8495,57 @@ fn continuation_attempt_session_id(attempt: u32, pinned: uuid::Uuid) -> uuid::Uu
     } else {
         uuid::Uuid::new_v4()
     }
+}
+
+/// The door name a gate continuation's removal logs under.
+const CONTINUATION_DOOR: &str = "gate continuation";
+
+/// Remove a gate continuation's fresh tree after a spawn that failed with
+/// `reason`, when no child ran in it (plan
+/// `2026-11-08-a-spawn-refused-after-its-worktree-allocation-leaves-the-tree-on-disk`,
+/// Phase 3). Awaited BEFORE the caller's own spawn-failed post, which is the
+/// allocation's one report — the context's `agent_id` is the continuation's —
+/// so this removes and never reports. `child_started == true` keeps every
+/// tree (logged). `None` (no worktree acquired) does nothing and returns
+/// `None`; otherwise the removal's report is returned, which a door may
+/// ignore — the removal has already logged every tree's outcome.
+async fn remove_unspawned_continuation(
+    ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
+    child_started: bool,
+    reason: &str,
+) -> Option<crate::agent_worktree::remove_unspawned::RemovalReport> {
+    match ctx {
+        Some(ctx) => Some(
+            ctx.remove_unspawned_unreported(CONTINUATION_DOOR, child_started, reason)
+                .await,
+        ),
+        None => None,
+    }
+}
+
+/// What a terminal continuation's failed create hands the remover: the
+/// context it handed in (returned unparked), whether a child may have run in
+/// the tree, and the failure text.
+///
+/// `child_started` is the typed failure's flag, OR'd with "this is not the
+/// first attempt": a retry runs only after a never-started attempt's PTY child
+/// ran in this same tree (its context was taken back off the dead pane), so
+/// the tree is no longer one no child ever ran in, whatever the retry's own
+/// create says.
+fn continuation_create_failure_handoff(
+    failure: crate::commands::terminal::BackendSpawnFailure,
+    attempt: u32,
+) -> (
+    Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
+    bool,
+    String,
+) {
+    let child_started = failure.failure.child_started || attempt > 1;
+    (
+        failure.isolated_ctx.map(|c| *c),
+        child_started,
+        failure.failure.message,
+    )
 }
 
 /// What a terminal continuation that STARTED reports back to its caller.
@@ -8200,6 +8786,24 @@ fn classify_pty_spawn_error(e: &str) -> (String, SpawnPhase) {
     }
 }
 
+/// A terminal door's report of a spawn that failed AFTER its worktree was
+/// allocated — every `acquire_for_terminal` door, through
+/// [`crate::agent_worktree::isolated_edit::IsolatedEditContext::remove_unspawned`],
+/// which first removes the fresh tree from disk when no child started and it
+/// holds nothing, and then posts this. Coord moves the allocation's rows from
+/// `allocated` to `abandoned`, so the allocation stops counting as live. That
+/// is a ledger fact: the disk half is the runner's removal, never coord's
+/// `abandoned` (plan
+/// `2026-11-08-a-spawn-refused-after-its-worktree-allocation-leaves-the-tree-on-disk`). Best-effort, like every caller of
+/// [`report_spawn_failed_in_phase`]: one attempt, and nothing is posted on a
+/// runner with no connected coord base. The failure is classified the way the
+/// condition-check path classifies a PTY-seam failure
+/// ([`classify_pty_spawn_error`]), so a trust-gate block posts as `blocked`.
+pub(crate) async fn report_terminal_spawn_failed(agent_id: uuid::Uuid, error: &str) {
+    let (reason, phase) = classify_pty_spawn_error(error);
+    report_spawn_failed_in_phase(agent_id, &reason, None, 0, None, phase).await;
+}
+
 /// Dispatch a condition-check spawn frame (coord `source: "condition_check"`).
 ///
 /// Parallel to [`dispatch_gate_continuation`] but deliberately simpler: a
@@ -8265,8 +8869,9 @@ const CONDITION_REPORT_BEARER_MARKER: &str = "Authorization: Bearer ";
 ///
 /// Two rungs, in order:
 ///
-/// 1. [`ConditionCheckPayload::report_token`] — the explicit wire field. Coord
-///    does not send it today; when it does, nothing else here changes.
+/// 1. [`ConditionCheckPayload::report_token`] — the explicit wire field, which
+///    coord sends since qontinui-coord#3856. A coord build that predates it
+///    sends none, and rung 2 answers.
 /// 2. The token coord embedded in `initial_prompt`. The prompt builder writes
 ///    it as `Authorization: Bearer <token>`, twice — once as a header
 ///    instruction, once inside the example curl.
@@ -8660,13 +9265,12 @@ async fn run_condition_check_terminal(
         .unwrap_or_else(|| format!("Condition check {run_id_short}"));
 
     // A condition check does not edit code, so no worktree isolation — run from
-    // QONTINUI_ROOT. We intentionally do NOT provision `.mcp.json`/fleet commands
+    // the workspace root. We intentionally do NOT provision `.mcp.json`/fleet commands
     // here (the gate path writes those into its per-continuation worktree; doing
     // so against the shared canonical root would clobber the operator's files).
-    let workdir = match qontinui_root_dir() {
-        Some(p) => p.to_string_lossy().to_string(),
-        None => {
-            let reason = "no QONTINUI_ROOT resolved — nowhere to run the check from";
+    let workdir = match crate::workspace_paths::require_workspace_root() {
+        Ok(p) => p.to_string_lossy().to_string(),
+        Err(reason) => {
             warn!("agent_runtime: condition-check: {reason}");
             report_condition_run_failed(&payload, format!("spawn_failed: {reason}")).await;
             return Err(anyhow::anyhow!("condition-check: {reason}"));
@@ -8697,25 +9301,43 @@ async fn run_condition_check_terminal(
     let launch_cfg = crate::claude_session::launch_spec::LaunchConfig::from_settings(
         selected_config_dir.as_deref(),
     );
-    let prompt_carrier = crate::session::spawn_prompt::resolve_system_prompt_carrier(Some(
-        // UNKNOWN, and honestly so: this function does NO coord-mcp
-        // provisioning of its own — it relies entirely on the downstream PTY
-        // identity seam, which decides the outcome long after this argv is
-        // built and cannot report back into it. The seam's own render of
-        // `QONTINUI_RUNNER_CONTEXT` for the same child DOES carry the settled
-        // verdict; this argv copy asserts no liveness rather than guessing one.
-        // NOT a brief seam, deliberately — see
-        // `compose_continuation_system_prompt`. This is
-        // `run_condition_check_terminal`, whose frame is a
-        // `ConditionCheckPayload`: a different `source` discriminator, published
-        // by a different coord path, carrying no `brief` key at all. The gate
-        // continuation's second spawn path is the HEADLESS arm below.
-        crate::terminal::runner_context(
-            crate::terminal::spawn_seam_api_port(),
-            crate::coord_mcp::CoordMcpDelivery::Unknown,
-            &crate::served_corpus::probe_async(workdir.as_str()).await,
+    // coord's launch decision for this check (`conditions/dispatch.rs`
+    // `spawn_frame` stamps the same `launch_*` keys): model via
+    // `LaunchSpec.model`; effort waits on qontinui-runner#2569.
+    let launch = payload.launch.resolve();
+    launch.log(
+        LaunchSeam::Terminal,
+        &format!("condition check run_id={:?}", payload.run_id),
+    );
+    // WHOSE policy body: the tenant a new session in `workdir` resolves to (plan
+    // `2026-11-13-runner-policy-injection-uses-the-device-default-tenant-not-the-sessions`
+    // Design §6). No nonce is provisioned here, so the workdir-keyed decision is
+    // the one this seam holds; a stated tenant only, anything else composes no
+    // body and the SessionStart route delivers it.
+    let policy_tenant =
+        crate::mcp::policy_tenant::new_session_policy_tenant(std::path::Path::new(&workdir)).await;
+    let prompt_carrier = crate::session::spawn_prompt::resolve_system_prompt_carrier(
+        Some(
+            // UNKNOWN, and honestly so: this function does NO coord-mcp
+            // provisioning of its own — it relies entirely on the downstream PTY
+            // identity seam, which decides the outcome long after this argv is
+            // built and cannot report back into it. The seam's own render of
+            // `QONTINUI_RUNNER_CONTEXT` for the same child DOES carry the settled
+            // verdict; this argv copy asserts no liveness rather than guessing one.
+            // NOT a brief seam, deliberately — see
+            // `compose_continuation_system_prompt`. This is
+            // `run_condition_check_terminal`, whose frame is a
+            // `ConditionCheckPayload`: a different `source` discriminator, published
+            // by a different coord path, carrying no `brief` key at all. The gate
+            // continuation's second spawn path is the HEADLESS arm below.
+            crate::terminal::runner_context(
+                crate::terminal::spawn_seam_api_port(),
+                crate::coord_mcp::CoordMcpDelivery::Unknown,
+                &crate::served_corpus::probe_async(workdir.as_str()).await,
+            ),
         ),
-    ));
+        policy_tenant,
+    );
     // Carried to the child env by the capture hint below; from the SAME
     // carrier the argv uses.
     let policy_delivery = prompt_carrier.as_ref().and_then(|c| c.policy_delivery());
@@ -8731,6 +9353,7 @@ async fn run_condition_check_terminal(
         // with no SessionStart/PreCompact/Stop hook at all.
         crate::session::claude_hook::direct_spawn_settings_args(),
         &launch_cfg,
+        launch.spec_model(),
     );
     // Withheld when an operator template adds a replacement prompt.
     let policy_delivery =
@@ -8778,11 +9401,21 @@ async fn run_condition_check_terminal(
         ),
         // From the SAME carrier the argv above was built from.
         policy_delivery,
+        spawn_origin: CONDITION_CHECK_SPAWN_ORIGIN,
     };
 
     // Same as the gate-continuation terminal: warm the dial so the PTY seam's
     // sync trust gate decides on the tenant's word, not a cold cache.
     crate::claude_session::trust_gate::warm_dial().await;
+
+    // The frame's secrets, held from before the PTY exists so the session's
+    // first `type` action can substitute. Every return below drops the
+    // registration and releases them; a started session hands it to the
+    // PTY-exit watcher (`crate::condition_secrets`, plan
+    // 2026-11-06-a-regression-test-run-is-judged-by-what-it-covered-and-a-silent-run-reads-unknown
+    // Phase 13).
+    let held_secrets =
+        crate::condition_secrets::register(&payload.run_id, &payload.target_url, &payload.secrets);
 
     let result = crate::commands::terminal::create_tracked_terminal_session_backend(
         &terminal_manager,
@@ -8815,7 +9448,7 @@ async fn run_condition_check_terminal(
             );
             // Surface it: switch the main view to the Terminal panel + select the
             // tab (scoped to the MAIN window, same as the gate path).
-            emit_terminal_focus_request(&app, &terminal_id);
+            emit_terminal_focus_request(&app, &terminal_id, CONDITION_CHECK_SPAWN_ORIGIN);
             // A CREATED pty is not a STARTED session (the 2026-10-01 incident the
             // gate path's start verdict exists for: `exec: claude: not found`,
             // pty gone in 73 ms). A condition check that never started has no
@@ -8826,7 +9459,14 @@ async fn run_condition_check_terminal(
             let started =
                 await_continuation_start(&terminal_manager, &terminal_id, &transcript_paths).await;
             match condition_check_never_started_reason(&started) {
-                None => Ok(()),
+                None => {
+                    crate::condition_secrets::release_at_pty_exit(
+                        held_secrets,
+                        &terminal_manager,
+                        &terminal_id,
+                    );
+                    Ok(())
+                }
                 Some(reason) => {
                     // A pane that died within ~100 ms can exit before its coord
                     // session id was set, so its exit hook never closed the
@@ -8844,6 +9484,9 @@ async fn run_condition_check_terminal(
                          {reason}",
                         payload.run_id
                     );
+                    // No session started, so nothing will type the secrets:
+                    // release them before the report's round trip.
+                    drop(held_secrets);
                     // Safe to spend the single-shot report token: no session
                     // started, so nothing is left that could have wanted it.
                     report_condition_run_failed(&payload, format!("spawn_failed: {reason}")).await;
@@ -8857,9 +9500,12 @@ async fn run_condition_check_terminal(
             // conjuncts); anything else is the ordinary create failure. The
             // condition-run report has no phase field, so the `spawn_failed:`
             // head stays as the wire contract and the classified reason follows.
-            let (reason, _phase) = classify_pty_spawn_error(&e);
+            let (reason, _phase) = classify_pty_spawn_error(&e.failure.message);
             let reason = format!("condition-check {reason}");
             warn!("agent_runtime: {reason}");
+            // The PTY was never created: release the secrets before the
+            // report's round trip.
+            drop(held_secrets);
             report_condition_run_failed(&payload, format!("spawn_failed: {reason}")).await;
             Err(anyhow::anyhow!(reason))
         }
@@ -8955,7 +9601,7 @@ async fn acquire_continuation_workdir(
         }
     }
 
-    // Fallback: the WORKSPACE ROOT, and only then a canonical checkout.
+    // Fallback: the WORKSPACE ROOT.
     //
     // Phase 3 of `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions`
     // flips this priority. It used to be "canonical checkout of the first repo,
@@ -8988,9 +9634,9 @@ async fn acquire_continuation_workdir(
     //
     // This is a DEFAULT, not a pin: the `acquire` arm above already wins
     // whenever worktree mode resolves one, and that is the explicit-cwd path.
-    // The canonical checkout stays as the last resort rather than being deleted,
-    // because on a box where the workspace root does not resolve it is still
-    // better than refusing the continuation outright.
+    // There is no canonical-checkout last resort: the canonical checkout is
+    // resolved from the same workspace root (see `continuation_fallback_workdir`),
+    // so it could never answer when the root did not.
     //
     // Extracted into a pure resolver for the reason `headless_continuation_bound_port`
     // right below states: a priority order expressed as a literal at a call site
@@ -9007,10 +9653,9 @@ async fn acquire_continuation_workdir(
     // anything — with the `workdir_not_a_checkout` detail the caller posts as
     // the gate's `spawn_failed` outcome.
     let workdir = continuation_fallback_workdir(
-        qontinui_root_dir(),
+        crate::workspace_paths::require_workspace_root().map_err(|e| e.to_string()),
         repos,
         crate::agent_worktree::canonical_paths::has_foreign_owner,
-        crate::agent_worktree::canonical_paths::default_canonical_path,
         crate::agent_worktree::canonical_paths::resolve_checkout,
         &no_worktree_because,
     )
@@ -9118,16 +9763,19 @@ use crate::agent_worktree::NO_ISOLATED_WORKTREE;
 /// Pure core of the continuation fallback cwd — reached only when no worktree
 /// was acquired.
 ///
-/// - no repos → the workspace root, else `Err`;
-/// - a `qontinui/*` or bare-slug repo → EXACTLY the pre-existing order: the
+/// - no repos → the workspace root, else `root`'s own error (the shared
+///   `WorkspaceRootUnresolved` sentence, which names the next action);
+/// - a `qontinui/*` or bare-slug repo → the
 ///   workspace root (Phase 3 of
 ///   `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions` — the trusted,
-///   non-shared cwd), else its canonical checkout, else `Err`. Unverified on
+///   non-shared cwd), else `root`'s error. Unverified on
 ///   purpose: a fork-origin clone or a box holding a subset of the repos must
 ///   keep working as it did;
 /// - a repo with any other owner whose VERIFIED checkout is under the root →
 ///   the root, as above;
-/// - one whose verified checkout is elsewhere → `Err` `no_isolated_worktree`.
+/// - one whose verified checkout is elsewhere, or which has no root to be
+///   under → `Err` `no_isolated_worktree` (carrying `root`'s error in the
+///   second case).
 ///   There is no safe cwd left: the checkout itself is a shared tree that may
 ///   hold a peer's WIP and is not in any managed repo's `.git/info/exclude`
 ///   roster (so the session's `.mcp.json` nonce and provisioned `.claude/`
@@ -9137,37 +9785,41 @@ use crate::agent_worktree::NO_ISOLATED_WORKTREE;
 /// - no verified checkout at all → `Err` with the resolver's
 ///   `workdir_not_a_checkout` detail.
 ///
+/// There is no canonical-checkout fallback for a missing root: the canonical
+/// checkout is resolved from the same root (`default_canonical_path` calls
+/// `require_workspace_root`), so it could never answer when the root did not.
+///
 /// Every resolver is INJECTED so the order is asserted against synthetic paths
 /// rather than against whatever this machine happens to have on disk.
 fn continuation_fallback_workdir<E: std::fmt::Display>(
-    root: Option<std::path::PathBuf>,
+    root: Result<std::path::PathBuf, String>,
     repos: &[String],
     foreign_owner: impl Fn(&str) -> bool,
-    canonical: impl Fn(&str) -> Result<std::path::PathBuf, String>,
     resolve_checkout: impl Fn(&str) -> Result<std::path::PathBuf, E>,
     no_worktree_because: &str,
 ) -> Result<String, String> {
     let lossy = |p: &std::path::Path| p.to_string_lossy().to_string();
     let Some(repo) = repos.first() else {
-        return root
-            .map(|p| lossy(&p))
-            .ok_or_else(|| "no QONTINUI_ROOT or canonical checkout resolved".to_string());
+        return root.map(|p| lossy(&p));
     };
     if !foreign_owner(repo) {
-        return root
-            .map(|p| lossy(&p))
-            .or_else(|| canonical(repo).ok().map(|p| lossy(&p)))
-            .ok_or_else(|| "no QONTINUI_ROOT or canonical checkout resolved".to_string());
+        return root.map(|p| lossy(&p));
     }
     let checkout = resolve_checkout(repo).map_err(|e| e.to_string())?;
     match root {
-        Some(root) if crate::agent_worktree::canonical_paths::path_is_within(&root, &checkout) => {
+        Ok(root) if crate::agent_worktree::canonical_paths::path_is_within(&root, &checkout) => {
             Ok(lossy(&root))
         }
-        _ => Err(format!(
+        Ok(_) => Err(format!(
             "{NO_ISOLATED_WORKTREE}: {repo} is checked out outside the workspace root at {}, \
              no worktree was acquired, and a session is not started in that shared \
              checkout; cause: {no_worktree_because}",
+            checkout.display()
+        )),
+        Err(unresolved) => Err(format!(
+            "{NO_ISOLATED_WORKTREE}: {repo} is checked out at {}, no worktree was acquired, \
+             and a session is not started in that shared checkout; cause: \
+             {no_worktree_because}. {unresolved}",
             checkout.display()
         )),
     }
@@ -9216,6 +9868,14 @@ async fn run_continuation_headless(
     // The Claude session id to pin (`--session-id`), minted by the caller
     // before the worktree allocate. See `run_gate_continuation_inner`.
     pinned_session_id: uuid::Uuid,
+    // The continuation's worktree context. Held until this fn returns (the
+    // subprocess exits), matching the agent-spawn path's heartbeat-then-release
+    // lifecycle; handed to the remover when the spawn fails before its child.
+    ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
+    // The frame's `launch_*` keys, resolved here (as every other launch seam
+    // resolves its own payload's) and rendered as `--model` / `--effort` by
+    // [`headless_agent_args`].
+    launch: &LaunchFrame,
 ) -> anyhow::Result<HeadlessExit> {
     let log_path = agent_log_path(agent_id);
     // Select the most-available account once before spawning (pins the resolved
@@ -9241,8 +9901,14 @@ async fn run_continuation_headless(
     let coord_mcp = crate::coord_mcp::provision_coord_mcp_for_session(workdir, bound_port, None);
     // No per-spawn pin here: a gate continuation carries no account field —
     // the `pick_best_account` call above is the whole selection.
+    let launch = launch.resolve();
+    launch.log(
+        LaunchSeam::Headless,
+        &format!("gate continuation agent={agent_id}"),
+    );
     let session_args = headless_agent_args(
         &crate::settings::get_claude_session_permission(),
+        &launch,
         pinned_session_args(pinned_session_id),
     );
     match spawn_claude_child(
@@ -9302,6 +9968,7 @@ async fn run_continuation_headless(
                 Err(e) => {
                     report_spawn_failed(agent_id, &format!("pump failure: {e}"), None, 0, None)
                         .await;
+                    // door-scan: keep(post-child) the child ran; its pump failed
                     Err(e)
                 }
             }
@@ -9310,6 +9977,13 @@ async fn run_continuation_headless(
             // A trust-gate refusal posts its own typed `spawn_blocked` with the
             // derivation, and hands back the typed reason for the lifecycle post.
             let (reason, phase) = classify_spawn_error(agent_id, &e).await;
+            // Every `spawn_claude_child` `Err` is pre-child: its refusals and
+            // checks run before the spawn, and `spawn_tokio_with_retry` errs
+            // only when no attempt produced a child (a spawned child is its
+            // `Ok`). So the fresh tree is removed before the one report.
+            let _removal = remove_unspawned_continuation(ctx, false, &reason).await;
+            #[cfg(test)]
+            headless_refusal_tests::observe_removal(_removal.as_ref());
             report_spawn_failed_in_phase(agent_id, &reason, None, 0, None, phase).await;
             Err(e)
         }
@@ -9991,11 +10665,20 @@ async fn run_agent_subprocess(
         }
     };
 
-    // Step 1: materialize worktrees.
-    if let Err(e) = materialize_worktrees(&payload).await {
+    // Step 1: materialize worktrees. `added_trees` collects exactly the rows
+    // THIS call ran `git worktree add` for — never an "already exists" row —
+    // so a launch whose every attempt fails before a child can take them back
+    // off disk (plan
+    // `2026-11-08-a-spawn-refused-after-its-worktree-allocation-leaves-the-tree-on-disk`,
+    // Phase 3). A failed materialize is pre-child too: the rows added before
+    // the failing one are removed before the one report.
+    let mut added_trees = Vec::new();
+    if let Err(e) = materialize_worktrees(&payload, &mut added_trees).await {
+        let reason = format!("worktree materialization failed: {e:#}");
+        remove_unspawned_launch_trees(payload.agent_id, added_trees, false, &reason).await;
         report_spawn_failed(
             payload.agent_id,
-            &format!("worktree materialization failed: {e:#}"),
+            &reason,
             None,
             0,
             primary_push_ref.as_deref(),
@@ -10007,6 +10690,7 @@ async fn run_agent_subprocess(
     let primary_wt = payload
         .worktrees
         .first()
+        // door-scan: keep(nothing-allocated) a payload with no worktrees materialized none
         .ok_or_else(|| anyhow::anyhow!("no worktrees allocated"))?
         .worktree_path
         .clone();
@@ -10094,13 +10778,20 @@ async fn run_agent_subprocess(
     // headless `claude` can resolve subagents the spawn prompt references
     // (merge-specialist, repo-auditor, ...). Fail-soft: a copy error here must
     // not abort an otherwise-launchable spawn — the agent just lacks subagents.
-    provision_agent_definitions_recorded(&primary_wt);
+    // Off the async worker: the ownership probe may run git per destination.
+    {
+        let wt = primary_wt.clone();
+        let _ = spawn_blocking_tracked(move || provision_agent_definitions_recorded(&wt)).await;
+    }
     // Bundle /vet-plan and /implement-plan into the spawned worktree cwd so they
     // resolve as project slash commands regardless of the device's ~/.claude.
     crate::fleet_commands::provision_fleet_commands_for_session(&primary_wt);
-    // Same for the fleet SKILLS. Note provision_agent_definitions above still
-    // COPIES .claude/agents from a claude-config checkout, so agents remain
-    // absent on a device without one; skills no longer do.
+    // Same for the fleet SKILLS. Unlike the skills, the agent defs above need a
+    // resolved workspace root even for their embedded floor. With nothing
+    // declared, no runner checkout above the executable and no
+    // `<home>/qontinui-root`, that root is the folder holding the main working
+    // tree of the checkout this cwd is the top level of (a linked worktree's
+    // main checkout, here); otherwise the defs stay absent.
     crate::fleet_skills::provision_fleet_skills_for_session(&primary_wt);
 
     let log_path = agent_log_path(payload.agent_id);
@@ -10122,6 +10813,10 @@ async fn run_agent_subprocess(
     // every arm that had a child; a trust-gate refusal never started one, and
     // saying `exited` there would tell coord a process ran and stopped.
     let mut final_phase = SpawnPhase::Exited;
+    // Whether ANY attempt produced a child. Only a launch where none did may
+    // hand its added trees to the remover: a child that ran, even one that
+    // exited at once, may have written in them.
+    let mut child_ever_started = false;
 
     // Select the most-available account once before the (re)spawn loop. On a
     // mid-run rate-limit the inference path rotates via
@@ -10136,11 +10831,20 @@ async fn run_agent_subprocess(
         let _ = spawn_blocking_tracked(crate::ai_provider::pick_best_account).await;
     }
 
+    // coord's launch decision for this spawn, validated once and logged once:
+    // every (re)spawn attempt below launches at the same model and effort.
+    let launch = payload.launch.resolve();
+    launch.log(
+        LaunchSeam::Headless,
+        &format!("coord agent spawn agent={}", payload.agent_id),
+    );
+
     loop {
         // Stop requested during a restart back-off (or before the first spawn):
         // bail without (re)spawning.
         if stop.is_cancelled() {
             final_reason = Some("stopped by operator before (re)spawn".to_string());
+            // door-scan: keep(loop-exit) the tail after the loop removes the added trees when no child ran
             break;
         }
         // Pin this attempt's Claude session id so coord can be told which
@@ -10148,6 +10852,7 @@ async fn run_agent_subprocess(
         // attempt: a restart is a new session, and the CLI refuses a reused id.
         let session_args = headless_agent_args(
             &crate::settings::get_claude_session_permission(),
+            &launch,
             session_pins.next_attempt(),
         );
         match spawn_claude_child(
@@ -10161,6 +10866,7 @@ async fn run_agent_subprocess(
         .await
         {
             Ok((mut child, preconditions)) => {
+                child_ever_started = true;
                 let pid = child.id().map(|p| p as i64);
                 // Exempt this headless child from the session-tracking health
                 // check for its lifetime — WS agent spawns legitimately have
@@ -10217,6 +10923,7 @@ async fn run_agent_subprocess(
                         }
                         final_reason =
                             Some("stopped by operator (events.agent.stop_requested)".to_string());
+                        // door-scan: keep(loop-exit) the tail after the loop removes the added trees when no child ran
                         break;
                     }
                 };
@@ -10230,6 +10937,7 @@ async fn run_agent_subprocess(
                             payload.agent_id
                         );
                         final_exit_code = Some(0);
+                        // door-scan: keep(loop-exit) the tail after the loop removes the added trees when no child ran
                         break;
                     }
                     Ok(code) => {
@@ -10264,6 +10972,7 @@ async fn run_agent_subprocess(
                     // apart, so retrying would only re-post the same refusal
                     // `MAX_RESTARTS` times. Break straight to the terminal
                     // lifecycle post.
+                    // door-scan: keep(loop-exit) the tail after the loop removes the added trees when no child ran
                     break;
                 }
             }
@@ -10271,6 +10980,7 @@ async fn run_agent_subprocess(
 
         restarts += 1;
         if restarts >= MAX_RESTARTS {
+            // door-scan: keep(loop-exit) the tail after the loop removes the added trees when no child ran
             break;
         }
         // Brief back-off between restarts.
@@ -10283,14 +10993,27 @@ async fn run_agent_subprocess(
         // Clean exit was already reported via spawn-complete; nothing
         // more to send. The runner can release the claim explicitly via
         // a follow-up POST if desired.
+        // door-scan: keep(post-child) a child ran and exited cleanly
         return Ok(());
     }
 
+    let final_reason = final_reason
+        .as_deref()
+        .unwrap_or("subprocess exited with no recorded reason");
+    // Before the one report, so the ledger agrees with the disk. Every
+    // `spawn_claude_child` `Err` is pre-child (see `run_continuation_headless`),
+    // so a launch none of whose attempts produced a child left its added trees
+    // holding nothing but the runner's provisioning.
+    remove_unspawned_launch_trees(
+        payload.agent_id,
+        launch_trees_to_remove(added_trees, child_ever_started),
+        false,
+        final_reason,
+    )
+    .await;
     report_spawn_failed_in_phase(
         payload.agent_id,
-        final_reason
-            .as_deref()
-            .unwrap_or("subprocess exited with no recorded reason"),
+        final_reason,
         final_exit_code,
         restarts,
         primary_push_ref.as_deref(),
@@ -10300,12 +11023,61 @@ async fn run_agent_subprocess(
     Ok(())
 }
 
+/// The trees a failed coord-dispatched launch hands to the remover: every row
+/// it added when no attempt produced a child, else none — a child that ran may
+/// have written in them, and the launch's report is then the whole answer.
+fn launch_trees_to_remove(
+    added: Vec<crate::agent_worktree::remove_unspawned::UnspawnedBase>,
+    child_ever_started: bool,
+) -> Vec<crate::agent_worktree::remove_unspawned::UnspawnedBase> {
+    if child_ever_started {
+        Vec::new()
+    } else {
+        added
+    }
+}
+
+/// Remove the trees a coord-dispatched launch added, after it failed with
+/// `reason` before any child ran — the context-less door of plan
+/// `2026-11-08-a-spawn-refused-after-its-worktree-allocation-leaves-the-tree-on-disk`
+/// (D2), through the free core. Reports nothing: the launch posts its own
+/// spawn-failed for `agent_id` right after. The agent's pusher and dirty
+/// poller are stopped first, so neither touches a tree being removed (the
+/// run's teardown stops them again, idempotently).
+async fn remove_unspawned_launch_trees(
+    agent_id: uuid::Uuid,
+    added: Vec<crate::agent_worktree::remove_unspawned::UnspawnedBase>,
+    child_started: bool,
+    reason: &str,
+) {
+    if added.is_empty() {
+        return;
+    }
+    crate::agent_daemons::stop_for_agent(agent_id);
+    crate::agent_worktree::remove_unspawned::remove_unspawned_trees(
+        &agent_id.to_string(),
+        added,
+        child_started,
+        &format!("coord agent launch: {reason}"),
+    )
+    .await;
+}
+
 /// `git worktree add` each allocated worktree from the primary checkout
 /// [`crate::agent_worktree::canonical_paths::worktree_source_checkout`] resolves
 /// for its repo — under `QONTINUI_ROOT` for a `qontinui/*` or bare slug, and
 /// wherever the operator keeps it for anyone else's. That resolver raises the
 /// unresolved-workspace-root error itself, so this no longer pre-checks it.
-async fn materialize_worktrees(payload: &LaunchPayload) -> anyhow::Result<()> {
+///
+/// Every row this call actually adds is pushed onto `added` as a
+/// [`TreeProvenance::FreshWorktree`](crate::agent_worktree::remove_unspawned::TreeProvenance)
+/// base, as it is added — so a failure on a later row still leaves the caller
+/// the earlier ones. A row whose path already exists is skipped and never
+/// pushed: that tree is not this call's.
+async fn materialize_worktrees(
+    payload: &LaunchPayload,
+    added: &mut Vec<crate::agent_worktree::remove_unspawned::UnspawnedBase>,
+) -> anyhow::Result<()> {
     // D3/D6 — the first act on a coord-delivered row is the `git worktree add`
     // below, so say here, once per row and before it, when coord did not
     // vouch for the sha. The sha is then used exactly as served (D6: no
@@ -10358,6 +11130,15 @@ async fn materialize_worktrees(payload: &LaunchPayload) -> anyhow::Result<()> {
     // dropped, the `primary_wt` its caller binds from `worktrees[0]` would be
     // a path nothing ever created, which is the spawned-into-nothing shape
     // this plan exists to close.
+    add_planned_worktrees(planned, added).await
+}
+
+/// The `git worktree add -b` half of [`materialize_worktrees`], over rows whose
+/// source checkout is already resolved. Pushes each added row onto `added`.
+async fn add_planned_worktrees(
+    planned: Vec<(&AllocatedWorktree, PathBuf)>,
+    added: &mut Vec<crate::agent_worktree::remove_unspawned::UnspawnedBase>,
+) -> anyhow::Result<()> {
     for (wt, repo_root) in planned {
         let wt_path = Path::new(&wt.worktree_path);
         if wt_path.exists() {
@@ -10396,6 +11177,13 @@ async fn materialize_worktrees(payload: &LaunchPayload) -> anyhow::Result<()> {
             "agent_runtime: materialized worktree {} at {}",
             wt.repo, wt.worktree_path
         );
+        added.push(crate::agent_worktree::remove_unspawned::UnspawnedBase {
+            worktree_path: wt_path.to_path_buf(),
+            parent_sha: wt.parent_sha.clone(),
+            provenance: crate::agent_worktree::remove_unspawned::TreeProvenance::FreshWorktree {
+                canonical: repo_root,
+            },
+        });
     }
     Ok(())
 }
@@ -10424,52 +11212,78 @@ async fn materialize_worktrees(payload: &LaunchPayload) -> anyhow::Result<()> {
 /// operator fleet.
 ///
 /// Returns a [`ProvisionReport`] for the CHECKOUT layer (`agent_definitions`).
-/// The no-root arm below used to be a bare `warn!` and an `Ok(())` — an
-/// unresolved checkout stated only in a log file — and is now a
-/// [`capability_manifest::Rung::Unresolved`] row naming what was skipped and
-/// why. The control flow is unchanged: it returns a report, never an error, and
-/// the spawn still proceeds.
-fn provision_agent_definitions(worktree_cwd: &str) -> ProvisionReport {
-    provision_agent_definitions_with_root(qontinui_root_dir().as_deref(), worktree_cwd)
-}
-
-/// [`provision_agent_definitions`] with the root it resolved passed in, so a
-/// test can drive the no-root arm without touching the process-wide resolver.
-fn provision_agent_definitions_with_root(
-    root: Option<&Path>,
+/// With no root resolved, the embedded floor (`fleet_agents`) and the retirement
+/// pass still run — only the checkout overlay needs a root — and the
+/// `agent_definitions` row is a [`capability_manifest::Rung::Unresolved`] whose
+/// detail renders the typed `WorkspaceRootUnresolved` followed by which copy the
+/// floor left serving. It returns a report, never an error, and the spawn still
+/// proceeds.
+///
+/// `resolved` is the root as this session sees it
+/// ([`crate::workspace_paths::session_workspace_root`]), so a session opened on
+/// a checkout reaches the embedded floor even when nothing is declared. Passed
+/// in so a test can drive either arm without touching the process-wide
+/// resolver or depending on where its binary sits.
+fn provision_agent_definitions(
+    resolved: qontinui_types::paths::WorkspaceRoot,
     worktree_cwd: &str,
 ) -> ProvisionReport {
-    let Some(root) = root else {
+    let rejected = resolved.rejected;
+    if let (Some(rejected), true) = (rejected, resolved.root.is_some()) {
         warn!(
-            "agent_runtime: no qontinui-root resolved; skipping .claude/agents \
-             provisioning for {worktree_cwd} (auto-spawned subagents will not resolve)"
+            "agent_runtime: {} — continuing with the next resolution rung",
+            rejected.describe()
         );
-        let mut report = ProvisionReport::unresolved(
-            "agent_definitions",
-            0,
-            Path::new(worktree_cwd)
-                .join(".claude")
-                .join("agents")
-                .display()
-                .to_string(),
-            "no qontinui-root resolved, so <root>/qontinui-claude-config/.claude/agents \
-             cannot be located — the normal state on a published install",
-        );
-        // An older binary's copy of a retired definition can sit in this workdir
-        // whether or not a root resolves now, so the retirement pass runs here too.
-        retire_agent_definitions(
-            worktree_cwd,
-            crate::fleet_agents::RETIRED_AGENTS,
-            &mut report,
-        );
-        return report;
+    }
+    info!(
+        "agent_runtime: agent-def provisioning for {worktree_cwd} resolved the workspace root \
+         as {}",
+        resolved.kind.wire()
+    );
+    let kind = resolved.kind;
+    let report = match resolved.require() {
+        Ok(root) => provision_agent_definitions_from_root(&root, worktree_cwd),
+        // No root: the embedded floor still runs (only the qontinui-claude-config
+        // overlay needs a root), so a published-install session outside any
+        // checkout gets the built-in subagents exactly as it gets the built-in
+        // commands and skills. The row's detail is the typed error's render.
+        Err(unresolved) => {
+            warn!(
+                "agent_runtime: {unresolved} Writing the embedded subagent definitions into \
+                 {worktree_cwd} without the qontinui-claude-config overlay ({})",
+                unresolved.detail()
+            );
+            provision_agent_definitions_layers(
+                Err(unresolved),
+                worktree_cwd,
+                crate::fleet_agents::RETIRED_AGENTS,
+            )
+        }
     };
-    provision_agent_definitions_from_root(root, worktree_cwd)
+    with_workspace_root_kind(report, kind)
 }
 
-/// The retirement pass on its own, for a spawn with no checkout root: the
-/// [`crate::provision_guard::KeepDecisions`] are decided over the retired names
-/// alone, since no layer writes in this workdir.
+/// Append which rung resolved the workspace root (`WorkspaceRootKind::wire`) to
+/// the `agent_definitions` row's detail, so a reader of the row — the provision
+/// probe's caller above all — can tell a `session_repo_parent` pass from a
+/// `declared` one without a second resolution.
+fn with_workspace_root_kind(
+    mut report: ProvisionReport,
+    kind: qontinui_types::paths::WorkspaceRootKind,
+) -> ProvisionReport {
+    let stamp = format!("workspace_root_kind: {}", kind.wire());
+    report.detail = Some(match report.detail.take() {
+        Some(detail) => format!("{detail}; {stamp}"),
+        None => stamp,
+    });
+    report
+}
+
+/// The retirement pass on its own, the [`crate::provision_guard::KeepDecisions`]
+/// decided over the retired names alone. Test-only: every production arm now
+/// runs the pass from [`provision_agent_definitions_layers`], after the floor;
+/// this isolates [`crate::fleet_agents::remove_retired_agents`]'s own behaviour.
+#[cfg(test)]
 fn retire_agent_definitions(worktree_cwd: &str, retired: &[&str], report: &mut ProvisionReport) {
     let workdir = Path::new(worktree_cwd);
     let dst_dir = workdir.join(".claude").join("agents");
@@ -10509,10 +11323,75 @@ fn retire_agent_definitions(worktree_cwd: &str, retired: &[&str], report: &mut P
 /// is observable on the next manifest read rather than in this value. The spawn
 /// path ignores the return entirely.
 pub(crate) fn provision_agent_definitions_recorded(workdir: &str) -> Vec<ProvisionReport> {
-    let report = provision_agent_definitions(workdir);
+    provision_agent_definitions_recorded_with(
+        workdir,
+        crate::workspace_paths::session_workspace_root,
+    )
+}
+
+/// [`provision_agent_definitions_recorded`] with the root resolver injected, so a
+/// test can show the workdir is what the resolver is asked about, and so the
+/// capability-manifest provision probe can resolve for a caller-named
+/// `session_repo` while writing into its own scratch directory.
+pub(crate) fn provision_agent_definitions_recorded_with(
+    workdir: &str,
+    resolve: impl FnOnce(&Path) -> qontinui_types::paths::WorkspaceRoot,
+) -> Vec<ProvisionReport> {
+    let report = provision_agent_definitions(resolve(Path::new(workdir)), workdir);
     let echo = report.clone();
     capability_manifest::record_provision(workdir, report);
     vec![echo]
+}
+
+/// The `agent_definitions` row's statement when the qontinui-claude-config
+/// overlay is absent: which copy, if any, the embedded floor left serving.
+///
+/// `SiblingCheckoutAbsent`'s two arms cover two of the four cases. A floor that
+/// only KEPT definitions the repository tracks left the repository's own copies
+/// serving, not the built-in one. A floor whose write failed left a fault local
+/// to this folder, not a capability this installation lacks. Each gets its own
+/// sentence under the same headline. "Unsupported" is left for a floor with
+/// nothing to write.
+fn overlay_absent_statement(
+    written: usize,
+    kept: usize,
+    write_failure: Option<&str>,
+    dst_dir: &Path,
+) -> String {
+    use qontinui_types::paths::{SiblingCheckoutAbsent, SiblingFallback};
+    const SIBLING: &str = "qontinui-claude-config";
+    let headline = format!(
+        "{} ({SIBLING}).",
+        qontinui_types::refusal::RefusalCode::SiblingCheckoutAbsent.headline()
+    );
+    let failure = write_failure
+        .map(|e| {
+            format!(
+                " Writing the built-in copy into {} failed: {e}.",
+                dst_dir.display()
+            )
+        })
+        .unwrap_or_default();
+    if written > 0 {
+        let absent = SiblingCheckoutAbsent::new(SIBLING, SiblingFallback::EmbeddedCopy);
+        format!(
+            "{absent} Embedded default(s) written: {written}; existing definition(s) kept: \
+             {kept}.{failure}"
+        )
+    } else if kept > 0 {
+        format!(
+            "{headline} The {kept} existing agent definition(s) on disk (tracked, or possibly \
+             tracked, by this repository, or not written by this runner) were kept, and \
+             serve the capability in place of the copy built into the application.{failure}"
+        )
+    } else if !failure.is_empty() {
+        format!(
+            "{headline} The application has a built-in copy of this capability, but it is \
+             not on disk here.{failure}"
+        )
+    } else {
+        SiblingCheckoutAbsent::new(SIBLING, SiblingFallback::Unsupported).to_string()
+    }
 }
 
 /// Core of [`provision_agent_definitions`] with the qontinui-root passed in
@@ -10536,10 +11415,23 @@ fn provision_agent_definitions_retiring(
     worktree_cwd: &str,
     retired: &[&str],
 ) -> ProvisionReport {
-    let src_dir = root
-        .join("qontinui-claude-config")
-        .join(".claude")
-        .join("agents");
+    provision_agent_definitions_layers(Ok(root), worktree_cwd, retired)
+}
+
+/// Both layers and the retirement pass. `overlay_root` is the workspace root the
+/// qontinui-claude-config overlay is read from, or the typed reason there is
+/// none — in which case the embedded floor and the retirement pass still run and
+/// the `agent_definitions` row's detail renders that reason.
+fn provision_agent_definitions_layers(
+    overlay_root: Result<&Path, qontinui_types::paths::WorkspaceRootUnresolved>,
+    worktree_cwd: &str,
+    retired: &[&str],
+) -> ProvisionReport {
+    let src_dir = overlay_root.map(|root| {
+        root.join("qontinui-claude-config")
+            .join(".claude")
+            .join("agents")
+    });
     let dst_dir = Path::new(worktree_cwd).join(".claude").join("agents");
 
     // TRACKED DESTINATIONS ARE KEPT, in both layers below. Decided ONCE, before
@@ -10550,13 +11442,17 @@ fn provision_agent_definitions_retiring(
     // (a different commit) over it, which left every such worktree dirty and fed
     // the wip-custody snapshots a stream of junk refs. Same guard, same probe, as
     // `fleet_commands` and `fleet_skills`.
-    let tracked = crate::provision_guard::TrackedPaths::probe(&dst_dir);
-    let mut candidates = crate::fleet_agents::embedded_agent_names();
-    // Retired names are candidates too, so a retired copy the repository tracks
-    // is kept by the retirement pass below exactly as the layers keep theirs.
-    candidates.extend(crate::fleet_agents::retired_agent_names(retired));
-    if let Ok(entries) = std::fs::read_dir(&src_dir) {
-        candidates.extend(
+    //
+    // The directory is created BEFORE the probe (the floor below creates it
+    // anyway): a probe of a missing directory answers "nothing tracked", so a
+    // checkout that versions `.claude/agents` but had the whole directory
+    // deleted would otherwise read as unversioned — the same order
+    // `fleet_commands` and `fleet_skills` use. Fail-soft: an error here leaves
+    // the probe's own fail-soft answer.
+    let _ = std::fs::create_dir_all(&dst_dir);
+    let mut written_names = crate::fleet_agents::embedded_agent_names();
+    if let Ok(Ok(entries)) = src_dir.as_deref().map(std::fs::read_dir) {
+        written_names.extend(
             entries
                 .filter_map(Result::ok)
                 .map(|e| e.path())
@@ -10564,11 +11460,77 @@ fn provision_agent_definitions_retiring(
                 .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())),
         );
     }
-    let keep = crate::provision_guard::KeepDecisions::decide(
+    // Versioned iff the repo tracks a definition a layer would WRITE (an
+    // embedded or overlay name), never merely "anything under .claude/agents":
+    // qontinui-forge and its siblings track a repo-local clone-implementer.md
+    // and must still receive code-reviewer and the rest (provision_guard).
+    // The roster is what a commit of the repo can add: the embedded names, and
+    // the overlay names the overlay's SOURCE checkout tracks. An untracked
+    // local `.md` in that checkout is a path no commit will deliver, so it is
+    // outside the roster and is written even in a versioned checkout. When the
+    // source probe cannot answer inside a repository, every overlay name stays
+    // in the roster: withholding is the safe side, since writing an
+    // upstream-added one is exactly the fast-forward wedge. The cost, stated:
+    // that wider roster also decides versioning, so a checkout tracking only a
+    // repo-local agent whose name collides with an untracked overlay file reads
+    // as versioned while the source probe is UNKNOWN, and withholds its absent
+    // embedded agents for that pass.
+    // With no overlay root there are no overlay names, so the roster is the
+    // embedded names alone.
+    let overlay_tracked = src_dir
+        .as_deref()
+        .ok()
+        .map(crate::provision_guard::TrackedPaths::probe);
+    let embedded_names = crate::fleet_agents::embedded_agent_names();
+    let tracked = crate::provision_guard::TrackedPaths::probe(&dst_dir).versioning(
+        written_names
+            .iter()
+            .filter(|n| {
+                embedded_names.contains(n)
+                    || overlay_tracked.as_ref().is_some_and(|t| {
+                        t.is_unknown_in_repo() || t.contains(Path::new(n.as_str()))
+                    })
+            })
+            .map(PathBuf::from),
+    );
+    let mut candidates = written_names;
+    // Retired names are candidates too, so a retired copy the repository tracks
+    // is kept by the retirement pass below exactly as the layers keep theirs.
+    candidates.extend(crate::fleet_agents::retired_agent_names(retired));
+    let mut keep = crate::provision_guard::KeepDecisions::decide(
         &tracked,
         &dst_dir,
         candidates.iter().map(String::as_str),
     );
+    // AN OPERATOR'S UNTRACKED FILE IS KEPT TOO, in both layers. The tracked-file
+    // guard keeps only what a repository tracks, so an operator-authored
+    // `~/.claude/agents/code-reviewer.md` (a terminal opened at `$HOME`) or a
+    // gitignored `.claude/agents/*.md` at a bundled or overlay name used to be
+    // replaced silently. Decided here, once, before either layer writes, so the
+    // floor's refresh cannot turn an overlay copy into "ours" or the reverse:
+    // an existing destination is written only when its bytes are a copy this
+    // runner ships or shipped (`fleet_agents::foreign_destination_reason`), and
+    // never through a symlink. Retired names are the retirement pass's to judge
+    // by blob, as before. When the overlay source IS the destination, matching
+    // it proves nothing, so the source arm is withheld there.
+    let retired_names = crate::fleet_agents::retired_agent_names(retired);
+    let overlay_src = src_dir
+        .as_deref()
+        .ok()
+        .filter(|src| src.is_dir() && !same_directory(src, &dst_dir));
+    for name in candidates.iter().filter(|n| !retired_names.contains(n)) {
+        if keep.reason(name).is_some() {
+            continue;
+        }
+        if let Some(reason) = crate::fleet_agents::foreign_destination_reason(
+            &dst_dir.join(name),
+            name,
+            overlay_src,
+            retired,
+        ) {
+            keep.keep_also(name, reason);
+        }
+    }
 
     // FLOOR FIRST: write the defs bundled into this binary, so a device with no
     // qontinui-claude-config checkout gets a working subagent set instead of
@@ -10599,6 +11561,26 @@ fn provision_agent_definitions_retiring(
         }
     };
     let embedded = embedded_report.written;
+    // What the floor left on disk, for the overlay-absent statement below.
+    let kept = embedded_report
+        .skipped
+        .iter()
+        .filter(|s| {
+            matches!(
+                s.reason,
+                capability_manifest::SkipReason::GitTracked
+                    | capability_manifest::SkipReason::ProbeUnknownInRepo
+                    | capability_manifest::SkipReason::OperatorAuthored(_)
+            )
+        })
+        .count();
+    let write_failure = embedded_report
+        .skipped
+        .iter()
+        .find_map(|s| match &s.reason {
+            capability_manifest::SkipReason::WriteFailed(e) => Some(e.clone()),
+            _ => None,
+        });
     capability_manifest::record_provision(worktree_cwd, embedded_report);
 
     // CHECKOUT WINS: the operator's live copies are overlaid on top, so editing
@@ -10606,24 +11588,50 @@ fn provision_agent_definitions_retiring(
     // retired definition is never overlaid.
     // An overlay that errored still gets the retirement pass below, so its
     // error becomes an errored report rather than an early return.
-    let mut report =
-        match overlay_checkout_agent_definitions(&src_dir, &dst_dir, &keep, embedded, retired) {
-            Ok(report) => report,
-            Err(e) => {
-                warn!("agent_runtime: agent-def checkout overlay errored (continuing): {e:#}");
-                let mut report = ProvisionReport::new(
-                    "agent_definitions",
-                    0,
-                    capability_manifest::Rung::Unresolved,
-                )
-                .with_destination(dst_dir.display().to_string());
-                report.skip(
-                    dst_dir.display().to_string(),
-                    capability_manifest::SkipReason::WriteFailed(format!("{e:#}")),
-                );
-                report
-            }
-        };
+    let floor = FloorOutcome {
+        written: embedded,
+        kept,
+        write_failure: write_failure.as_deref(),
+    };
+    let overlaid = match src_dir.as_deref() {
+        Ok(src_dir) => overlay_checkout_agent_definitions(
+            src_dir,
+            &dst_dir,
+            &keep,
+            &candidates,
+            floor,
+            retired,
+        ),
+        // No root: no overlay to read. The row states why (the typed error) and
+        // which copy the floor left serving.
+        Err(unresolved) => Ok(ProvisionReport::unresolved(
+            "agent_definitions",
+            0,
+            dst_dir.display().to_string(),
+            format!(
+                "{unresolved} {}",
+                overlay_absent_statement(floor.written, floor.kept, floor.write_failure, &dst_dir)
+            ),
+        )
+        .with_destination(dst_dir.display().to_string())),
+    };
+    let mut report = match overlaid {
+        Ok(report) => report,
+        Err(e) => {
+            warn!("agent_runtime: agent-def checkout overlay errored (continuing): {e:#}");
+            let mut report = ProvisionReport::new(
+                "agent_definitions",
+                0,
+                capability_manifest::Rung::Unresolved,
+            )
+            .with_destination(dst_dir.display().to_string());
+            report.skip(
+                dst_dir.display().to_string(),
+                capability_manifest::SkipReason::WriteFailed(format!("{e:#}")),
+            );
+            report
+        }
+    };
 
     // RETIRED LAST. A definition this binary retired stopped shipping when its
     // file left the bundle, but a copy an older binary or a checkout overlay
@@ -10633,7 +11641,7 @@ fn provision_agent_definitions_retiring(
     // were already on disk. It runs whether the checkout answered, was absent
     // or errored, because a device with no
     // checkout is exactly where an older binary's embedded copy sits (the
-    // no-root arm of `provision_agent_definitions` runs it as well). `keep`
+    // no-root arm reaches this same pass). `keep`
     // was decided before either layer wrote, so a tracked copy stays.
     crate::fleet_agents::remove_retired_agents(
         Path::new(worktree_cwd),
@@ -10644,21 +11652,42 @@ fn provision_agent_definitions_retiring(
     report
 }
 
+/// What the embedded floor left on disk, for the overlay-absent statement.
+#[derive(Clone, Copy)]
+struct FloorOutcome<'a> {
+    /// Definitions the floor wrote.
+    written: usize,
+    /// Definitions it kept as found on disk: the destination is, or may be,
+    /// tracked, or it is an operator's file (or a symlink) this runner did not
+    /// write.
+    kept: usize,
+    /// The first write failure it hit, if any.
+    write_failure: Option<&'a str>,
+}
+
 /// The checkout overlay of [`provision_agent_definitions_retiring`]: copy every
 /// `*.md` from `src_dir` (the operator's qontinui-claude-config agents) into
 /// `dst_dir` over the embedded floor, except the definitions `keep` keeps and
 /// every name `retired` lists: a checkout that still holds a retired definition
 /// (stale, or on a branch that edited it) must not hand it to a session, so it is
-/// skipped and named in the report's detail. `embedded` is how many defaults the
-/// floor wrote, for the log line and the report's detail. No checkout dir is the `unresolved` report naming the
-/// embedded defaults that stand in, not an error.
+/// skipped and named in the report's detail. `floor` is what the embedded floor
+/// left on disk. No checkout dir is not an error: it is the `unresolved` report
+/// whose statement ([`overlay_absent_statement`]) says what the floor left
+/// serving.
+///
+/// `decided` is the candidate list `keep` was computed over. The overlay walks
+/// `src_dir` again, so a definition that appeared there since has no decision;
+/// such a name gets the same [`crate::fleet_agents::foreign_destination_reason`]
+/// check here, before its copy, so no name reaches the write unchecked.
 fn overlay_checkout_agent_definitions(
     src_dir: &Path,
     dst_dir: &Path,
     keep: &crate::provision_guard::KeepDecisions,
-    embedded: usize,
+    decided: &[String],
+    floor: FloorOutcome<'_>,
     retired: &[&str],
 ) -> anyhow::Result<ProvisionReport> {
+    let embedded = floor.written;
     let retired_names = crate::fleet_agents::retired_agent_names(retired);
     let mut not_overlaid = Vec::new();
     if !src_dir.is_dir() {
@@ -10672,12 +11701,38 @@ fn overlay_checkout_agent_definitions(
             "agent_definitions",
             0,
             src_dir.display().to_string(),
-            format!(
-                "no claude-config agents dir on this device; the {embedded} embedded \
-                 default(s) stand in"
-            ),
+            overlay_absent_statement(embedded, floor.kept, floor.write_failure, dst_dir),
         )
         .with_destination(dst_dir.display().to_string()));
+    }
+    // NEVER OVERLAY A DIRECTORY ONTO ITSELF. When the session cwd IS the
+    // qontinui-claude-config checkout, or a workspace root whose `.claude` is a
+    // symlink into it, `src_dir` and `dst_dir` name one directory, and
+    // `std::fs::copy(a, a)` opens the destination with truncation before it
+    // reads the source — every overlaid definition would become a 0-byte file.
+    // The checkout's own files are already what the session resolves, so there
+    // is nothing to copy; the row says so instead of claiming writes.
+    if same_directory(src_dir, dst_dir) {
+        info!(
+            "agent_runtime: agent-def overlay skipped — source {} is the destination {} \
+             itself; the checkout's own definitions are served in place",
+            src_dir.display(),
+            dst_dir.display()
+        );
+        // The checkout DID answer: its definitions are what the session
+        // resolves, read where they stand. So the rung is the checkout's, with
+        // nothing to write and nothing expected, rather than `unresolved`.
+        return Ok(ProvisionReport::new(
+            "agent_definitions",
+            0,
+            capability_manifest::Rung::OperatorCheckout,
+        )
+        .with_destination(dst_dir.display().to_string())
+        .with_detail(format!(
+            "served in place: the destination is the overlay checkout itself ({}), so \
+             nothing was copied (a copy onto itself would truncate the definitions)",
+            src_dir.display()
+        )));
     }
     std::fs::create_dir_all(dst_dir).map_err(|e| {
         anyhow::anyhow!(
@@ -10694,6 +11749,7 @@ fn overlay_checkout_agent_definitions(
     )
     .with_destination(dst_dir.display().to_string());
     let mut copied = 0usize;
+    let mut served_in_place = 0usize;
     for entry in std::fs::read_dir(src_dir)
         .map_err(|e| anyhow::anyhow!("read agents dir {}: {e}", src_dir.display()))?
     {
@@ -10740,8 +11796,55 @@ fn overlay_checkout_agent_definitions(
             report.skip(unit, reason.clone());
             continue;
         }
-        // Idempotent: overwrite is fine (std::fs::copy truncates the target).
-        if let Err(e) = std::fs::copy(&path, &dst) {
+        // A name the keep decisions never saw (it appeared in the checkout
+        // after they were computed) is judged here, exactly as they would have.
+        if !decided.contains(&unit) {
+            if let Some(reason) =
+                crate::fleet_agents::foreign_destination_reason(&dst, &unit, Some(src_dir), retired)
+            {
+                info!(
+                    "agent_runtime: keeping {} as it is on disk — {}",
+                    dst.display(),
+                    reason.describe()
+                );
+                report.skip(unit, reason);
+                continue;
+            }
+        }
+        // Never copy THROUGH a symlink: `fs::copy` follows it and would replace
+        // whatever it points at (its own source included). `keep` already holds
+        // a symlink decided before the floor ran; this re-check is per write.
+        if crate::fleet_agents::is_symlink(&dst) {
+            let reason = crate::fleet_agents::symlink_destination_reason(&dst);
+            info!(
+                "agent_runtime: not overlaying onto {} — {}",
+                dst.display(),
+                reason.describe()
+            );
+            report.skip(unit, reason);
+            continue;
+        }
+        // Per file as well as per directory: a destination that is a hard link
+        // to its own source would be truncated by the copy too.
+        if same_file(&path, &dst) {
+            info!(
+                "agent_runtime: not overlaying {} onto {} — they are the same file",
+                path.display(),
+                dst.display()
+            );
+            report.skip(unit, capability_manifest::SkipReason::ServedInPlace);
+            served_in_place += 1;
+            continue;
+        }
+        // Idempotent and ATOMIC: the source's bytes go to a temporary file
+        // beside the destination, renamed over it, so a link that appeared
+        // since the checks above is replaced as an entry, never written
+        // through, and the destination is never seen half-written.
+        let copied_one = std::fs::read(&path).and_then(|bytes| {
+            let perms = std::fs::metadata(&path).ok().map(|m| m.permissions());
+            crate::fleet_agents::write_atomically(&dst, &bytes, perms)
+        });
+        if let Err(e) = copied_one {
             warn!(
                 "agent_runtime: failed to copy agent def {} -> {}: {e}",
                 path.display(),
@@ -10772,12 +11875,42 @@ fn overlay_checkout_agent_definitions(
         ));
     }
     report = report.with_detail(detail);
-    if report.written == 0 {
+    if report.written == 0 && served_in_place == 0 {
         // The checkout was present but supplied nothing usable — `unresolved`
-        // rather than `operator_checkout`, which would claim it answered.
+        // rather than `operator_checkout`, which would claim it answered. A
+        // unit served in place IS the checkout answering (the session reads
+        // its own source file), so it keeps the checkout rung.
         report.set_rung(capability_manifest::Rung::Unresolved);
     }
     Ok(report)
+}
+
+/// True when `a` and `b` name the same existing directory, through any
+/// symlink. See [`same_fs_object`]. A path that does not exist is never "the
+/// same" as one that does.
+fn same_directory(a: &Path, b: &Path) -> bool {
+    same_fs_object(a, b)
+}
+
+/// True when `a` and `b` resolve to the same existing file (symlink or hard
+/// link included). See [`same_fs_object`].
+fn same_file(a: &Path, b: &Path) -> bool {
+    same_fs_object(a, b)
+}
+
+/// One filesystem object behind both paths, on every platform: the `same-file`
+/// crate compares device + inode on unix and volume serial + file index on
+/// Windows (directories included), so a hard link, a bind mount or a path
+/// `canonicalize` spells differently still matches. The canonical-path compare
+/// is the fallback when either handle cannot be opened.
+fn same_fs_object(a: &Path, b: &Path) -> bool {
+    if let Ok(same) = same_file::is_same_file(a, b) {
+        return same;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => false,
+    }
 }
 
 /// The workspace root holding the runner's canonical checkouts.
@@ -10986,6 +12119,7 @@ pub(crate) fn finalize_headless_child_env(
     // this function was extracted: a posture nothing asserts is a posture that
     // silently regresses. See `credential_helper::non_interactive_git_env`.
     crate::credential_helper::apply_non_interactive_git_env_tokio(cmd);
+    crate::terminal::apply_python_utf8_default_tokio(cmd);
 
     crate::terminal::scrub_credential_env_tokio(cmd);
 }
@@ -11451,13 +12585,23 @@ fn pinned_session_args(session_id: uuid::Uuid) -> Vec<String> {
 /// The scheduler's RemoteAgent launch does NOT go through here: it passes its
 /// own bounded `-p --allowedTools` set to [`spawn_claude_child`].
 ///
+/// `launch` is coord's validated launch decision for this spawn
+/// ([`LaunchFrame::resolve`]): its `--model <family>` / `--effort <level>`
+/// follow the permission posture, each only when coord resolved it, so a
+/// frame with nothing decided renders exactly the argv it always did. A
+/// headless child has no launch template, so nothing else can carry either
+/// flag and neither is ever emitted twice (plan
+/// `2026-11-15-operator-sets-spawn-model-and-effort-per-spawn-type` V7).
+///
 /// [`PermissionMode::DangerouslySkip`]: crate::claude_session::launch_spec::PermissionMode::DangerouslySkip
 fn headless_agent_args(
     permission: &crate::claude_session::launch_spec::SessionPermissionSetting,
+    launch: &AppliedLaunch,
     session_args: Vec<String>,
 ) -> Vec<String> {
     use crate::claude_session::launch_spec::PermissionMode;
     let mut args = permission.apply(PermissionMode::DangerouslySkip).render();
+    args.extend(launch.headless_args());
     args.extend(session_args);
     args
 }
@@ -11817,6 +12961,11 @@ async fn report_spawn_failed(
 /// caller that had a child. A trust-gate refusal never started one, and
 /// reporting it as `exited` would tell coord a process ran and stopped — so that
 /// one call site says [`SpawnPhase::Blocked`] instead.
+///
+/// One live attempt; a report that does not reach coord is spooled to the
+/// session outbox for the `CoordSync` drain to replay (see
+/// [`settle_spawn_failed_report`]), so a transient outage no longer leaves
+/// coord counting the allocation in flight until its horizon.
 async fn report_spawn_failed_in_phase(
     agent_id: uuid::Uuid,
     reason: &str,
@@ -11825,13 +12974,15 @@ async fn report_spawn_failed_in_phase(
     push_ref: Option<&str>,
     spawn_phase: SpawnPhase,
 ) {
-    let _ = post_spawn_failed(
+    let body = spawn_failed_body(reason, exit_code, restarts_attempted, push_ref, spawn_phase);
+    let spool = crate::session::closeout_spool::global();
+    settle_spawn_failed_report(
         agent_id,
-        reason,
-        exit_code,
-        restarts_attempted,
-        push_ref,
-        spawn_phase,
+        &body,
+        1,
+        launch_deferral_retry_delay,
+        || post_spawn_failed(agent_id, &body),
+        spool.as_deref(),
     )
     .await;
 }
@@ -11849,34 +13000,39 @@ enum SpawnReportOutcome {
     Undelivered,
 }
 
-/// One `spawn-failed` POST. Every non-delivery is logged at warn, including the
-/// two arms that used to return silently (no coord base, no client).
-async fn post_spawn_failed(
-    agent_id: uuid::Uuid,
+/// The `spawn-failed` request body — built once per report, so every live
+/// attempt and the spooled replay send the same bytes.
+fn spawn_failed_body(
     reason: &str,
     exit_code: Option<i64>,
     restarts_attempted: u32,
     push_ref: Option<&str>,
     spawn_phase: SpawnPhase,
-) -> SpawnReportOutcome {
+) -> SpawnFailedBody {
+    let (phase, pr_context) = if spawn_outcome_enrichment_enabled() {
+        (Some(spawn_phase), SpawnPrContext::from_push_ref(push_ref))
+    } else {
+        (None, SpawnPrContext::default())
+    };
+    SpawnFailedBody {
+        reason: reason.to_string(),
+        exit_code,
+        restarts_attempted: Some(restarts_attempted),
+        phase,
+        pr_context,
+    }
+}
+
+/// One `spawn-failed` POST. Every non-delivery is logged at warn, including the
+/// two arms that used to return silently (no coord base, no client).
+async fn post_spawn_failed(agent_id: uuid::Uuid, body: &SpawnFailedBody) -> SpawnReportOutcome {
+    let reason = body.reason.as_str();
     let Some(base) = connected_coord_base() else {
         warn!(
             "agent_runtime: spawn-failed NOT posted agent_id={agent_id} — no connected coord \
              base; reason={reason}"
         );
         return SpawnReportOutcome::Undelivered;
-    };
-    let (phase, pr_context) = if spawn_outcome_enrichment_enabled() {
-        (Some(spawn_phase), SpawnPrContext::from_push_ref(push_ref))
-    } else {
-        (None, SpawnPrContext::default())
-    };
-    let body = SpawnFailedBody {
-        reason: reason.to_string(),
-        exit_code,
-        restarts_attempted: Some(restarts_attempted),
-        phase,
-        pr_context,
     };
     let url = format!("{base}/agents/{agent_id}/spawn-failed");
     let Some(client) = crate::coord_http::coord_client() else {
@@ -11897,7 +13053,7 @@ async fn post_spawn_failed(
     // agent) is classed Rejected below and not retried.
     match crate::auth::attach_device_auth(client.post(&url))
         .timeout(Duration::from_secs(5))
-        .json(&body)
+        .json(body)
         .send()
         .await
     {
@@ -11915,7 +13071,16 @@ async fn post_spawn_failed(
             }
         }
         Err(e) => {
-            warn!("agent_runtime: spawn-failed POST agent_id={agent_id} failed: {e:#}");
+            // The FULL source chain, tagged `[timeout]` / `[connect]`:
+            // reqwest's own Display is only "error sending request for url
+            // (…)", which on 2026-11-14 hid whether 296 failures on spaceship
+            // were timeouts (plan
+            // `2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling`
+            // Phase 6 step 1).
+            warn!(
+                "agent_runtime: spawn-failed POST agent_id={agent_id} failed: {}",
+                crate::session::coord_sync::transport_error(&e)
+            );
             SpawnReportOutcome::Undelivered
         }
     }
@@ -11938,23 +13103,118 @@ fn launch_deferral_should_retry(outcome: SpawnReportOutcome) -> bool {
     outcome == SpawnReportOutcome::Undelivered
 }
 
-/// Report a load-deferred launch to coord, with a bounded retry. Phase
-/// `blocked`: the launch was refused before any child existed.
+/// Report a load-deferred launch to coord, with a bounded retry, spooling it
+/// durably when every attempt is undelivered. Phase `blocked`: the launch was
+/// refused before any child existed.
 async fn report_launch_deferral(agent_id: uuid::Uuid, reason: &str) {
-    for attempt in 0..LAUNCH_DEFERRAL_REPORT_ATTEMPTS {
-        let outcome = post_spawn_failed(agent_id, reason, None, 0, None, SpawnPhase::Blocked).await;
+    let body = spawn_failed_body(reason, None, 0, None, SpawnPhase::Blocked);
+    let spool = crate::session::closeout_spool::global();
+    settle_spawn_failed_report(
+        agent_id,
+        &body,
+        LAUNCH_DEFERRAL_REPORT_ATTEMPTS,
+        launch_deferral_retry_delay,
+        || post_spawn_failed(agent_id, &body),
+        spool.as_deref(),
+    )
+    .await;
+}
+
+/// What finally became of one `spawn-failed` report.
+#[derive(Debug, Clone)]
+enum ReportSettlement {
+    /// coord took it (2xx).
+    Delivered,
+    /// coord refused it (4xx) — its verdict; never spooled.
+    Rejected,
+    /// Undelivered after every live attempt, and written to the session outbox
+    /// for the `CoordSync` drain to replay.
+    Spooled(crate::session::closeout_spool::Spooled),
+    /// Undelivered and NOT durably kept: no spool is installed (a headless
+    /// harness) or the outbox write failed. Logged at warn as lost.
+    Lost,
+}
+
+/// Post one report up to `attempts` times (retrying only the undelivered
+/// class, with `retry_delay` between attempts), then settle it: a report still
+/// UNDELIVERED is spooled to the session outbox ([`crate::session::spawn_report_spool`])
+/// so the `CoordSync` drain replays it under the device credential. A 4xx is
+/// coord's verdict and stays one — it is never spooled.
+///
+/// Plan `2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling`
+/// Phase 6 (D6): before this, a deferral undelivered after its 3 attempts was
+/// logged and dropped, and coord counted the allocation in flight for 7200 s.
+async fn settle_spawn_failed_report<P, Fut>(
+    agent_id: uuid::Uuid,
+    body: &SpawnFailedBody,
+    attempts: u32,
+    retry_delay: fn(u32) -> Duration,
+    mut post: P,
+    spool: Option<&crate::session::closeout_spool::CloseoutSpool>,
+) -> ReportSettlement
+where
+    P: FnMut() -> Fut,
+    Fut: std::future::Future<Output = SpawnReportOutcome>,
+{
+    let mut outcome = SpawnReportOutcome::Undelivered;
+    for attempt in 0..attempts {
+        outcome = post().await;
         if !launch_deferral_should_retry(outcome) {
-            return;
+            break;
         }
-        if attempt + 1 < LAUNCH_DEFERRAL_REPORT_ATTEMPTS {
-            tokio::time::sleep(launch_deferral_retry_delay(attempt)).await;
+        if attempt + 1 < attempts {
+            tokio::time::sleep(retry_delay(attempt)).await;
         }
     }
-    warn!(
-        "agent_runtime: launch deferral for agent_id={agent_id} NOT delivered after \
-         {LAUNCH_DEFERRAL_REPORT_ATTEMPTS} attempts — coord keeps counting the allocation \
-         in-flight until its own horizon; reason={reason}"
-    );
+    match outcome {
+        SpawnReportOutcome::Delivered => ReportSettlement::Delivered,
+        SpawnReportOutcome::Rejected => ReportSettlement::Rejected,
+        SpawnReportOutcome::Undelivered => {
+            spool_undelivered_report(agent_id, body, attempts, spool)
+        }
+    }
+}
+
+/// The undelivered arm of [`settle_spawn_failed_report`].
+fn spool_undelivered_report(
+    agent_id: uuid::Uuid,
+    body: &SpawnFailedBody,
+    attempts: u32,
+    spool: Option<&crate::session::closeout_spool::CloseoutSpool>,
+) -> ReportSettlement {
+    let reason = body.reason.as_str();
+    let Some(spool) = spool else {
+        warn!(
+            "agent_runtime: spawn-failed for agent_id={agent_id} NOT delivered after {attempts} \
+             attempt(s) and NO durable spool is installed — LOST; coord keeps counting the \
+             allocation in-flight until its own horizon; reason={reason}"
+        );
+        return ReportSettlement::Lost;
+    };
+    let written = serde_json::to_value(body)
+        .map_err(std::io::Error::other)
+        .and_then(|json| {
+            crate::session::spawn_report_spool::spool_spawn_failed(spool, agent_id, &json)
+        });
+    match written {
+        Ok(spooled) => {
+            warn!(
+                "agent_runtime: spawn-failed for agent_id={agent_id} NOT delivered after \
+                 {attempts} attempt(s) — spooled to the session outbox (lane {}, seq {}); the \
+                 coord drain replays it; reason={reason}",
+                spooled.session_id, spooled.seq
+            );
+            ReportSettlement::Spooled(spooled)
+        }
+        Err(e) => {
+            warn!(
+                "agent_runtime: spawn-failed for agent_id={agent_id} NOT delivered after \
+                 {attempts} attempt(s) and the outbox spool FAILED ({e}) — LOST; coord keeps \
+                 counting the allocation in-flight until its own horizon; reason={reason}"
+            );
+            ReportSettlement::Lost
+        }
+    }
 }
 
 // =============================================================================
@@ -12033,14 +13293,11 @@ mod tests {
     /// fetch bound against the ALB's ~60 s idle timer. A behavioural test would
     /// need a live WS peer, so this pins the wiring in the source, as
     /// `the_live_pre_checks_read_both_resource_lanes` does: the pump, up to its
-    /// `loop {`, starts the replay and awaits no poll, and the replay spawns both
-    /// polls inside its task, coalesced through `CONNECT_REPLAY`.
+    /// `loop {`, starts the replay and awaits no poll, and the replay spawns its
+    /// pass inside its task, coalesced through `PENDING_REPLAY`.
     #[test]
     fn the_pending_list_replay_on_connect_is_spawned_not_awaited() {
-        let source = include_str!("agent_runtime.rs");
-        let (prod, _) = source
-            .split_once("#[cfg(test)]\nmod tests")
-            .expect("the test module marker");
+        let prod = replay_prod_source();
         let (_, pump) = prod
             .split_once("async fn connect_and_pump(")
             .expect("connect_and_pump exists");
@@ -12048,35 +13305,57 @@ mod tests {
             .split_once("\n    loop {")
             .expect("the pump has its loop");
         assert!(
-            before_loop.contains("start_connect_replay(device_id);"),
+            before_loop.contains("request_pending_replay(")
+                && before_loop.contains("ReplayTrigger::Connect"),
             "the pump starts the replay: {before_loop}"
         );
         assert!(
-            !before_loop.contains("poll_pending_"),
+            !before_loop.contains("poll_pending_")
+                && !before_loop.contains("pending_list_pass(")
+                && !before_loop.contains(".idle()"),
             "a poll awaited by the pump holds it up: {before_loop}"
         );
-        let (_, starter) = prod
-            .split_once("fn start_connect_replay(")
-            .expect("start_connect_replay exists");
-        let (starter, _) = starter
-            .split_once("\n}\n")
-            .expect("the starter's body ends");
-        let (before_spawn, spawned) = starter
-            .split_once("tokio::spawn(async move {")
+        let starter = replay_prod_fn_body(prod, "fn request_pending_replay(");
+        assert!(
+            starter.contains("spawn_coalesced_replay(&PENDING_REPLAY")
+                && starter.contains("pending_list_pass(device_id)"),
+            "the replay is coalesced across triggers: {starter}"
+        );
+        let spawner = replay_prod_fn_body(prod, "fn spawn_coalesced_replay<");
+        let (before_spawn, spawned) = spawner
+            .split_once("handle.spawn(async move {")
             .expect("the replay is spawned");
         assert!(
-            before_spawn.contains("CONNECT_REPLAY.request()"),
-            "the replay is coalesced across reconnects: {before_spawn}"
-        );
-        assert!(!before_spawn.contains("poll_pending_"), "{before_spawn}");
-        assert!(
-            spawned.contains("poll_pending_continuations(device_id).await"),
-            "{spawned}"
+            before_spawn.contains("coalescer.request()"),
+            "the replay is coalesced: {before_spawn}"
         );
         assert!(
-            spawned.contains("poll_pending_unit_dispatches(device_id).await"),
-            "{spawned}"
+            before_spawn.contains("let guard = AbandonOnDrop(coalescer);"),
+            "the abandon guard is built before the spawn, so a task dropped unpolled \
+             still gives the flag up: {before_spawn}"
         );
+        assert!(!before_spawn.contains("pass()"), "{before_spawn}");
+        assert!(spawned.contains("pass().await"), "{spawned}");
+    }
+
+    /// The production half of this file, for the source pins below.
+    fn replay_prod_source() -> &'static str {
+        let source = include_str!("agent_runtime.rs");
+        source
+            .split_once("#[cfg(test)]\nmod tests")
+            .expect("the test module marker")
+            .0
+    }
+
+    /// The body of the first production fn whose text starts with `signature`,
+    /// up to its closing brace at column 0.
+    fn replay_prod_fn_body<'a>(prod: &'a str, signature: &str) -> &'a str {
+        let (_, rest) = prod
+            .split_once(signature)
+            .unwrap_or_else(|| panic!("{signature} exists"));
+        rest.split_once("\n}\n")
+            .unwrap_or_else(|| panic!("{signature}'s body ends"))
+            .0
     }
 
     /// A connect that arrives while a replay runs asks it for one more pass, and
@@ -12113,6 +13392,321 @@ mod tests {
         assert!(c.request());
         c.abandon();
         assert!(c.request(), "a panicked replay gives the flag up");
+    }
+
+    /// Every pull of the pending lists goes through the one coalescer. The two
+    /// polls are called in exactly one place, `pending_list_pass`. That pass is
+    /// called from the coalesced replay and from the backstop's wedge arm, and
+    /// nowhere else. Each trigger function asks for a replay under its own
+    /// trigger, and the two that wait for their pass wait (bounded) on `idle()`.
+    /// A trigger that called a poll directly again would put a second pull of the
+    /// same list on a slow link beside a running replay, which is what #2741's
+    /// coalescer exists to stop. Pinned in the source for the reason the test
+    /// above gives. The call counts match any `name(` call, whatever its
+    /// argument, less the `fn name(` definition; every doc comment here names
+    /// these fns in the bracket-link form, which has no `(`.
+    #[test]
+    fn every_pending_list_trigger_goes_through_the_coalescer() {
+        let prod = replay_prod_source();
+        let calls = |name: &str| {
+            prod.matches(&format!("{name}(")).count() - prod.matches(&format!("fn {name}(")).count()
+        };
+        let pass = replay_prod_fn_body(prod, "async fn pending_list_pass(");
+        for poll in ["poll_pending_continuations", "poll_pending_unit_dispatches"] {
+            assert_eq!(calls(poll), 1, "{poll} is called outside pending_list_pass");
+            assert!(
+                pass.contains(&format!("{poll}(device_id).await")),
+                "{poll} runs inside pending_list_pass"
+            );
+            // The wedge decision reads a slow pass as alive only because each
+            // row of each poll notes a step; without it a long refused backlog
+            // (one deferral stamp per row) reads as wedged and the backstop
+            // pulls the list a second time beside it.
+            let poll_body = replay_prod_fn_body(prod, &format!("async fn {poll}("));
+            // Cut at the loop's own closing brace (column 4), so a note moved
+            // to after the loop, one step per poll instead of per row, fails.
+            // The newline is appended because a loop that is the fn's last
+            // statement ends the extracted body with no newline after its `}`.
+            let (_, rows) = poll_body
+                .split_once("for row in body.pending {")
+                .unwrap_or_else(|| panic!("{poll} loops over its rows"));
+            let rows = format!("{rows}\n");
+            let (loop_body, _) = rows
+                .split_once("\n    }\n")
+                .unwrap_or_else(|| panic!("{poll}'s row loop ends"));
+            assert!(
+                loop_body.contains("PENDING_REPLAY.note_progress();"),
+                "{poll} notes a step per row: {loop_body}"
+            );
+        }
+        assert!(
+            pass.contains("PENDING_REPLAY.note_progress();"),
+            "pending_list_pass notes a step between its polls: {pass}"
+        );
+        assert_eq!(
+            calls("pending_list_pass"),
+            2,
+            "pending_list_pass runs only from the coalesced replay and the backstop's wedge arm"
+        );
+        assert!(
+            replay_prod_fn_body(prod, "fn request_pending_replay(")
+                .contains("pending_list_pass(device_id)"),
+            "the coalesced replay runs the pass"
+        );
+
+        let backstop = replay_prod_fn_body(prod, "async fn continuation_backstop_poll_loop(");
+        for wiring in [
+            "ReplayTrigger::Backstop",
+            "tokio::time::timeout(wedged_after, PENDING_REPLAY.idle())",
+            "replay_wedged(settled, progress_before, PENDING_REPLAY.progress())",
+            "pending_list_pass(device_id).await",
+        ] {
+            assert!(
+                backstop.contains(wiring),
+                "backstop lacks {wiring}: {backstop}"
+            );
+        }
+        let exit = replay_prod_fn_body(prod, "pub(crate) fn notify_continuation_terminal_exit(");
+        assert!(
+            exit.contains(
+                "request_pending_replay(device_id, ReplayTrigger::CapacityFreed, handle)"
+            ),
+            "the capacity-freed trigger asks for a replay: {exit}"
+        );
+        assert!(!exit.contains("pending_list_pass("), "{exit}");
+        let catch_up = replay_prod_fn_body(prod, "fn spawn_runtime_ready_catch_up(");
+        for wiring in [
+            "ReplayTrigger::RuntimeReady",
+            "tokio::time::timeout(REPLAY_WEDGED_AFTER, PENDING_REPLAY.idle())",
+        ] {
+            assert!(
+                catch_up.contains(wiring),
+                "catch-up lacks {wiring}: {catch_up}"
+            );
+        }
+        assert!(!catch_up.contains("pending_list_pass("), "{catch_up}");
+    }
+
+    /// A gate a test pass waits on, opened one pass at a time.
+    struct PassGate {
+        started: std::sync::atomic::AtomicUsize,
+        open: tokio::sync::Semaphore,
+    }
+
+    impl PassGate {
+        fn leak() -> &'static Self {
+            Box::leak(Box::new(Self {
+                started: std::sync::atomic::AtomicUsize::new(0),
+                open: tokio::sync::Semaphore::new(0),
+            }))
+        }
+
+        async fn pass(&'static self) {
+            self.started
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.open.acquire().await.expect("gate open").forget();
+        }
+
+        fn started(&self) -> usize {
+            self.started.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        async fn wait_started(&self, n: usize) {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while self.started() < n {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("pass {n} never started (started {})", self.started()));
+        }
+    }
+
+    fn leak_coalescer() -> &'static super::ReplayCoalescer {
+        Box::leak(Box::new(super::ReplayCoalescer::new()))
+    }
+
+    /// The real replay loop: requests made while a pass runs (a burst of exits,
+    /// a backstop tick) fold into ONE extra pass that starts after the running
+    /// one, never into a concurrent one, and a waiter on `idle()` resumes only
+    /// after that extra pass completes.
+    #[tokio::test]
+    async fn requests_during_a_pass_fold_into_one_later_pass_never_a_concurrent_one() {
+        let c = leak_coalescer();
+        let gate = PassGate::leak();
+        let handle = tokio::runtime::Handle::current();
+        let start = || super::spawn_coalesced_replay(c, &handle, move || gate.pass());
+
+        assert!(start(), "the first request starts the replay");
+        gate.wait_started(1).await;
+        assert!(!start(), "coalesced");
+        assert!(!start(), "coalesced");
+        let waiter = tokio::spawn(c.idle());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(gate.started(), 1, "no concurrent pass");
+
+        gate.open.add_permits(1);
+        gate.wait_started(2).await;
+        assert!(!waiter.is_finished(), "the owed pass is still running");
+        gate.open.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("idle once the owed pass completes")
+            .expect("the waiter task");
+        assert_eq!(gate.started(), 2, "two requests, one extra pass");
+        assert_eq!(c.progress(), 2, "one step per completed pass");
+    }
+
+    /// A replay task the runtime drops without ever polling it (spawned onto a
+    /// runtime already shut down) still gives the flag up, so the next request
+    /// starts a replay instead of folding into one that does not exist.
+    #[tokio::test]
+    async fn a_replay_dropped_before_it_ran_gives_the_flag_up() {
+        let c = leak_coalescer();
+        // Built and dropped on a plain thread: a runtime cannot be dropped from
+        // inside this test's async context.
+        let dead_handle = std::thread::spawn(|| {
+            let dead = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("a runtime");
+            let handle = dead.handle().clone();
+            drop(dead);
+            handle
+        })
+        .join()
+        .expect("the runtime thread");
+        assert!(super::spawn_coalesced_replay(c, &dead_handle, || async {}));
+        tokio::time::timeout(std::time::Duration::from_secs(5), c.idle())
+            .await
+            .expect("the dropped task gave the flag up");
+        assert!(
+            c.request(),
+            "the next request starts a replay, not a fold into a dead one"
+        );
+    }
+
+    /// A pass that panics gives the flag up and releases waiters, and a request
+    /// after it starts a fresh replay.
+    #[tokio::test]
+    async fn a_panicking_pass_gives_the_flag_up_and_releases_waiters() {
+        let c = leak_coalescer();
+        let handle = tokio::runtime::Handle::current();
+        assert!(super::spawn_coalesced_replay(c, &handle, || async {
+            panic!("a pass panicked (expected by this test)");
+        }));
+        tokio::time::timeout(std::time::Duration::from_secs(5), c.idle())
+            .await
+            .expect("the panicked replay gave the flag up");
+        let gate = PassGate::leak();
+        assert!(super::spawn_coalesced_replay(c, &handle, move || gate.pass()));
+        gate.wait_started(1).await;
+        gate.open.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(5), c.idle())
+            .await
+            .expect("the fresh replay ends");
+    }
+
+    /// A pass that is owed but not yet taken keeps `idle()` waiting, exactly as
+    /// one that is running does: a trigger that requested a pass resumes only
+    /// after the replay releases with nothing owed, including a pass a late
+    /// request asked for after the replay's last `take_pass`.
+    #[tokio::test]
+    async fn idle_waits_while_a_pass_is_owed_not_only_while_one_runs() {
+        let c = leak_coalescer();
+        let settle = std::time::Duration::from_millis(50);
+        assert!(c.request(), "a replay is being started and owes a pass");
+        let waiter = tokio::spawn(c.idle());
+        tokio::time::sleep(settle).await;
+        assert!(!waiter.is_finished(), "owed but not yet taken: not idle");
+        assert!(c.take_pass());
+        assert!(!c.take_pass(), "the replay's last take_pass finds nothing");
+        assert!(!c.request(), "a late request folds in");
+        assert!(c.release(), "the late request keeps the replay running");
+        tokio::time::sleep(settle).await;
+        assert!(
+            !waiter.is_finished(),
+            "resumed before the late request's pass had run"
+        );
+        assert!(c.take_pass());
+        assert!(!c.release());
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("resumes once the owed pass completed")
+            .expect("the waiter task");
+    }
+
+    /// The backstop runs a pass beside the coalesced replay only when its whole
+    /// bounded wait ran out with no step taken. A replay that is slow but still
+    /// stepping (a long refused backlog, one deferral stamp per row) or that
+    /// went idle is left alone. And the wait is long enough that a healthy pass
+    /// steps many times inside it: one pull bound is the longest gap between
+    /// steps.
+    #[test]
+    fn the_backstop_runs_its_own_pass_only_when_the_replay_made_no_progress() {
+        assert!(
+            super::replay_wedged(false, 7, 7),
+            "timed out, no step: wedged"
+        );
+        assert!(
+            !super::replay_wedged(false, 7, 9),
+            "timed out but stepping: slow, not wedged"
+        );
+        assert!(!super::replay_wedged(true, 7, 7), "went idle: not wedged");
+        assert!(!super::replay_wedged(true, 7, 9));
+        assert!(
+            super::REPLAY_WEDGED_AFTER >= 5 * super::PENDING_LIST_FETCH_TIMEOUT,
+            "the wedge bound must clear several pull bounds"
+        );
+    }
+
+    /// A trigger that waits for the pass it asked for (the backstop and the
+    /// runtime-ready catch-up) resumes when the replay ends, by release or by
+    /// panic, and not while it is still running, including when it keeps
+    /// running for a pass a later request asked for.
+    #[tokio::test]
+    async fn a_trigger_waiting_for_its_pass_resumes_when_the_replay_ends() {
+        use std::time::Duration;
+        let c: &'static super::ReplayCoalescer = Box::leak(Box::new(super::ReplayCoalescer::new()));
+        let settle = Duration::from_millis(50);
+        let bound = Duration::from_secs(5);
+
+        tokio::time::timeout(bound, c.idle())
+            .await
+            .expect("no replay running: idle at once");
+
+        assert!(c.request());
+        let waiter = tokio::spawn(c.idle());
+        tokio::time::sleep(settle).await;
+        assert!(!waiter.is_finished(), "a running replay is not idle");
+        assert!(c.take_pass());
+        assert!(!c.request(), "a request after the last take_pass");
+        assert!(c.release(), "the replay takes the flag back");
+        tokio::time::sleep(settle).await;
+        assert!(
+            !waiter.is_finished(),
+            "still running for the pass that request asked for"
+        );
+        assert!(c.take_pass());
+        assert!(!c.take_pass());
+        assert!(!c.release(), "nothing owed: the replay ends");
+        tokio::time::timeout(bound, waiter)
+            .await
+            .expect("woken when the replay ends")
+            .expect("the waiter task");
+
+        assert!(c.request());
+        let waiter = tokio::spawn(c.idle());
+        tokio::time::sleep(settle).await;
+        assert!(!waiter.is_finished());
+        assert!(
+            c.abandon(),
+            "the pass that request asked for was still owed"
+        );
+        tokio::time::timeout(bound, waiter)
+            .await
+            .expect("woken when a panicked replay gives the flag up")
+            .expect("the waiter task");
+        assert!(!c.abandon(), "abandon dropped the owed pass with it");
     }
 
     /// A complete body that does not decode is a contract break, and reads as
@@ -12507,6 +14101,8 @@ mod tests {
             source: CONDITION_CHECK_SOURCE.to_string(),
             report_token: report_token.map(|s| s.to_string()),
             condition_name: None,
+            secrets: Default::default(),
+            launch: LaunchFrame::default(),
         }
     }
 
@@ -12687,9 +14283,10 @@ mod tests {
     }
 
     /// The struct holds the credential in TWO fields — `report_token`, and
-    /// `initial_prompt`, which is where coord actually ships it today and which
-    /// also embeds the operator's `auth_setup` secret. A derived `Debug` would
-    /// put both in the next log line that formats a payload.
+    /// `initial_prompt`, where coord also ships it (and where a coord build
+    /// that predates qontinui-coord#3856 ships it alone), and which also embeds
+    /// the operator's `auth_setup` secret. A derived `Debug` would put both in
+    /// the next log line that formats a payload.
     #[test]
     fn condition_check_payload_debug_redacts_both_credential_carriers() {
         let token = "9f1c4b2ad0e34f7a8b6c5d4e3f2a1b09";
@@ -12751,10 +14348,10 @@ mod tests {
         );
     }
 
-    /// A condition-check frame from a coord that does not send `report_token`
-    /// must still deserialize (the field is `#[serde(default)]`), and the frame
-    /// coord sends today must land with `report_token: None` so the prompt rung
-    /// is the one that runs.
+    /// A condition-check frame from a coord build that predates
+    /// qontinui-coord#3856, which sends no `report_token` key, must still
+    /// deserialize (the field is `#[serde(default)]`) and land with
+    /// `report_token: None`, so the prompt rung is the one that runs.
     #[test]
     fn condition_check_payload_tolerates_a_coord_without_the_token_field() {
         let frame = serde_json::json!({
@@ -12770,6 +14367,45 @@ mod tests {
         assert_eq!(
             condition_report_token(&payload).as_deref(),
             Some("deadbeefdeadbeefdeadbeefdeadbeef")
+        );
+    }
+
+    /// The frame coord sends since qontinui-coord#3856 (its `spawn_frame`, in
+    /// `qontinui-coord/crates/coord/src/conditions/dispatch.rs`): eight keys
+    /// for a group with a name (coord omits `condition_name` for a blank one),
+    /// `report_token` among them. Coord's fanout carries the frame as a JSON
+    /// STRING in the envelope's `payload`; the object form is read too.
+    /// Through the production envelope parser the explicit field lands, and it
+    /// wins over the token the prompt also carries.
+    #[test]
+    fn condition_check_payload_reads_the_report_token_coord_sends_as_its_own_key() {
+        let field_token = uuid::Uuid::from_bytes([6; 16]).simple().to_string();
+        let prompt_token = uuid::Uuid::from_bytes([7; 16]).simple().to_string();
+        let frame = serde_json::json!({
+            "source": "condition_check",
+            "run_id": "018f0000-0000-7000-8000-000000000000",
+            "target_device_id": "018f0000-0000-7000-8000-000000000001",
+            "target_url": "http://localhost:3001",
+            "initial_prompt": format!("Authorization: Bearer {prompt_token}\n"),
+            "report_token": field_token,
+            "presentation": "terminal",
+            "condition_name": "login works",
+        });
+        for inner in [serde_json::Value::String(frame.to_string()), frame.clone()] {
+            let envelope = serde_json::json!({ "payload": inner });
+            let payload =
+                parse_condition_check_payload(&envelope).expect("coord's eight-key frame parses");
+            assert_eq!(payload.report_token.as_deref(), Some(field_token.as_str()));
+            assert_eq!(
+                condition_report_token(&payload).as_deref(),
+                Some(field_token.as_str()),
+                "the explicit field wins over the prompt's token"
+            );
+            assert_eq!(payload.condition_name.as_deref(), Some("login works"));
+        }
+        assert_ne!(
+            field_token, prompt_token,
+            "anti-vacuity: the two tokens differ"
         );
     }
 
@@ -12860,6 +14496,7 @@ mod tests {
             &cmd,
             "finalize_headless_child_env",
         );
+        crate::terminal::assert_python_utf8_default_tokio(&cmd, "finalize_headless_child_env");
     }
 
     /// The headless seam must stamp the ACTUALLY-BOUND port into both values a
@@ -13114,6 +14751,7 @@ mod tests {
                 None,
                 Vec::new(),
                 &crate::claude_session::launch_spec::LaunchConfig::default(),
+                None,
             )
         };
         let without = build(None);
@@ -13141,6 +14779,7 @@ mod tests {
             None,
             Vec::new(),
             &crate::claude_session::launch_spec::LaunchConfig::default(),
+            None,
         );
         assert_eq!(
             cmd.join("|"),
@@ -13168,6 +14807,7 @@ mod tests {
             None,
             Vec::new(),
             &crate::claude_session::launch_spec::LaunchConfig::default(),
+            None,
         );
         assert_eq!(
             cmd.last().map(String::as_str),
@@ -13198,6 +14838,7 @@ mod tests {
             None,
             Vec::new(),
             &crate::claude_session::launch_spec::LaunchConfig::default(),
+            None,
         );
         assert_eq!(
             cmd.join("|"),
@@ -13223,6 +14864,7 @@ mod tests {
             )),
             Vec::new(),
             &crate::claude_session::launch_spec::LaunchConfig::default(),
+            None,
         );
         // The prompt stays the trailing positional behind `--`.
         assert_eq!(cmd.last().map(String::as_str), Some("do the thing"));
@@ -13279,6 +14921,7 @@ mod tests {
             )),
             Vec::new(),
             &crate::claude_session::launch_spec::LaunchConfig::default(),
+            None,
         );
         let flag = cmd
             .iter()
@@ -13319,6 +14962,7 @@ mod tests {
                 "C:/hooks/claude_hook_settings.json".to_string(),
             ],
             &crate::claude_session::launch_spec::LaunchConfig::default(),
+            None,
         );
         assert_eq!(cmd.last().map(String::as_str), Some("do the thing"));
         assert_eq!(cmd.get(cmd.len() - 2).map(String::as_str), Some("--"));
@@ -13351,6 +14995,7 @@ mod tests {
             None,
             Vec::new(),
             &crate::claude_session::launch_spec::LaunchConfig::default(),
+            None,
         );
         assert_eq!(
             cmd.join("|"),
@@ -13376,6 +15021,7 @@ mod tests {
             )),
             vec!["--settings".to_string(), "C:/hooks/s.json".to_string()],
             &crate::claude_session::launch_spec::LaunchConfig::default(),
+            None,
         );
         assert_eq!(
             cmd.join("|"),
@@ -13407,6 +15053,7 @@ mod tests {
             Some(carrier),
             vec!["--settings".to_string(), "C:/hooks/s.json".to_string()],
             &crate::claude_session::launch_spec::LaunchConfig::default(),
+            None,
         );
         assert_eq!(
             cmd.join("|"),
@@ -13446,6 +15093,7 @@ mod tests {
                     account_command: None,
                     ..Default::default()
                 },
+                None,
             )
         };
         let with = build(Some("claude --system-prompt operator-prompt"));
@@ -13464,6 +15112,116 @@ mod tests {
             delivery_unless_replacement(carrier.policy_delivery(), &without),
             carrier.policy_delivery()
         );
+    }
+
+    /// Plan `2026-11-15-operator-sets-spawn-model-and-effort-per-spawn-type`
+    /// Phase 4, terminal seam: a frame carrying `launch_model: "sonnet"`
+    /// renders exactly ONE `--model sonnet`, beating an operator template's
+    /// `--model opus`; an invalid `launch_effort` beside it renders nothing,
+    /// and a frame with no launch keys keeps the template's model.
+    #[test]
+    fn continuation_command_binds_the_frames_launch_model_over_the_template() {
+        let build = |frame: serde_json::Value| {
+            let launch: LaunchFrame = serde_json::from_value(frame).unwrap();
+            build_continuation_claude_command(
+                "claude".to_string(),
+                "abc-123",
+                None,
+                vec![],
+                "do the thing".to_string(),
+                None,
+                vec![],
+                &crate::claude_session::launch_spec::LaunchConfig {
+                    default_template: Some("claude --model opus".to_string()),
+                    account_command: None,
+                    ..Default::default()
+                },
+                launch.resolve().spec_model(),
+            )
+        };
+        let model_values = |argv: &[String]| -> Vec<String> {
+            argv.iter()
+                .enumerate()
+                .filter(|(_, a)| a.as_str() == "--model")
+                .filter_map(|(i, _)| argv.get(i + 1).cloned())
+                .collect()
+        };
+
+        let argv = build(serde_json::json!({
+            "launch_model": "sonnet",
+            "launch_effort": "warp-speed",
+        }));
+        assert_eq!(model_values(&argv), vec!["sonnet".to_string()], "{argv:?}");
+        assert!(!argv.iter().any(|a| a == "--effort"), "{argv:?}");
+        assert!(!argv.iter().any(|a| a == "opus"), "{argv:?}");
+
+        let untouched = build(serde_json::json!({}));
+        assert_eq!(
+            model_values(&untouched),
+            vec!["opus".to_string()],
+            "{untouched:?}"
+        );
+    }
+
+    /// The three `launch_*` keys parse off every frame shape this runner
+    /// reads, and their absence leaves each shape parsing as before (V5).
+    #[test]
+    fn every_spawn_frame_shape_reads_the_launch_keys() {
+        let keys = serde_json::json!({
+            "launch_model": "haiku",
+            "launch_effort": "max",
+            "launch_settings": {"spawn_type": "condition_autodispatch", "effort_source": "operator_setting"}
+        });
+        let with = |mut base: serde_json::Value| {
+            base.as_object_mut()
+                .unwrap()
+                .extend(keys.as_object().unwrap().clone());
+            base
+        };
+        let gate = serde_json::json!({
+            "target_device_id": "11111111-1111-4111-8111-111111111111",
+            "initial_prompt": "p",
+            "source": "gate_continuation",
+        });
+        let cond = serde_json::json!({
+            "run_id": "r",
+            "target_url": "http://x",
+            "initial_prompt": "p",
+            "source": "condition_check",
+        });
+        let launch = serde_json::json!({
+            "agent_id": "11111111-1111-4111-8111-111111111111",
+            "target_device_id": "11111111-1111-4111-8111-111111111111",
+            "worktrees": [],
+            "initial_prompt": "p",
+            "claim_token": "t",
+            "plan_phase": 4,
+            "jwt_exp": 0,
+        });
+
+        let g: GateContinuationPayload = serde_json::from_value(with(gate.clone())).unwrap();
+        let c: ConditionCheckPayload = serde_json::from_value(with(cond.clone())).unwrap();
+        let l: LaunchPayload = serde_json::from_value(with(launch.clone())).unwrap();
+        for applied in [g.launch.resolve(), c.launch.resolve(), l.launch.resolve()] {
+            assert_eq!(applied.model, Some("haiku"));
+            assert_eq!(applied.effort, Some("max"));
+            assert_eq!(
+                applied.spawn_type.as_deref(),
+                Some("condition_autodispatch")
+            );
+        }
+        assert_eq!(
+            l.plan_phase,
+            Some(4),
+            "flatten must not disturb the numeric fields"
+        );
+
+        let g: GateContinuationPayload = serde_json::from_value(gate).unwrap();
+        let c: ConditionCheckPayload = serde_json::from_value(cond).unwrap();
+        let l: LaunchPayload = serde_json::from_value(launch).unwrap();
+        for applied in [g.launch.resolve(), c.launch.resolve(), l.launch.resolve()] {
+            assert_eq!(applied, AppliedLaunch::default());
+        }
     }
 
     /// Both carriers, one rule: at most ONE system-prompt flag, always ahead of
@@ -13488,6 +15246,7 @@ mod tests {
                 carrier.clone(),
                 vec!["--settings".to_string(), "/h/s.json".to_string()],
                 &crate::claude_session::launch_spec::LaunchConfig::default(),
+                None,
             );
             let flags: Vec<usize> = cmd
                 .iter()
@@ -13529,6 +15288,7 @@ mod tests {
             plan_phase: Some(4),
             correlation_topic: Some("my-coordination-topic".to_string()),
             account: None,
+            launch: LaunchFrame::default(),
         };
         let serialized = serde_json::to_value(serde_json::json!({
             "channel": format!("events.agent.spawn_requested.{}", payload.target_device_id),
@@ -14709,6 +16469,7 @@ mod tests {
             )),
             Vec::new(),
             &crate::claude_session::launch_spec::LaunchConfig::default(),
+            None,
         );
         let flag = cmd
             .iter()
@@ -14802,6 +16563,299 @@ mod tests {
         assert!(p.to_string_lossy().contains("qontinui-worktrees"));
     }
 
+    /// The cwd IS the overlay checkout: `src_dir` and `dst_dir` are one
+    /// directory, and copying a file onto itself truncates it. An untracked
+    /// overlay definition there keeps its bytes, and the row records the skip
+    /// rather than a write.
+    #[test]
+    fn provision_agent_defs_overlay_never_copies_a_file_onto_itself() {
+        let root = tempfile::tempdir().unwrap();
+        let checkout = root.path().join("qontinui-claude-config");
+        let agents = checkout.join(".claude").join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        let body = b"# a local, untracked overlay definition\n";
+        std::fs::write(agents.join("local-overlay-only.md"), body).unwrap();
+
+        let report =
+            provision_agent_definitions_from_root(root.path(), &checkout.to_string_lossy());
+
+        assert_eq!(
+            std::fs::read(agents.join("local-overlay-only.md")).unwrap(),
+            body,
+            "the overlay must never truncate its own source"
+        );
+        assert_eq!(report.written, 0, "nothing is claimed as written");
+        // The checkout answered: its definitions are served where they stand.
+        assert_eq!(
+            report.rung,
+            crate::capability_manifest::Rung::OperatorCheckout
+        );
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+        assert!(
+            report
+                .detail
+                .as_deref()
+                .is_some_and(|d| d
+                    .contains("served in place: the destination is the overlay checkout itself")),
+            "the detail names why: {:?}",
+            report.detail
+        );
+    }
+
+    /// The same hazard through a symlink: a workspace root whose `.claude` is a
+    /// symlink into the qontinui-claude-config checkout.
+    #[cfg(unix)]
+    #[test]
+    fn provision_agent_defs_overlay_never_copies_through_a_symlinked_claude_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let checkout_claude = root.path().join("qontinui-claude-config").join(".claude");
+        let agents = checkout_claude.join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        let body = b"# a local, untracked overlay definition\n";
+        std::fs::write(agents.join("local-overlay-only.md"), body).unwrap();
+        std::os::unix::fs::symlink(&checkout_claude, root.path().join(".claude")).unwrap();
+
+        let report =
+            provision_agent_definitions_from_root(root.path(), &root.path().to_string_lossy());
+
+        assert_eq!(
+            std::fs::read(agents.join("local-overlay-only.md")).unwrap(),
+            body,
+            "a symlinked .claude must not turn the overlay into a self-copy"
+        );
+        assert_eq!(report.written, 0);
+        assert_eq!(
+            report.rung,
+            crate::capability_manifest::Rung::OperatorCheckout
+        );
+    }
+
+    /// A1: an operator's own UNTRACKED `code-reviewer.md` in a cwd outside any
+    /// repository (a terminal opened at `$HOME`) is kept byte for byte, while
+    /// the absent bundled definitions beside it are still written.
+    #[test]
+    fn provision_agent_defs_keeps_an_operators_untracked_definition() {
+        let root = tempfile::tempdir().unwrap(); // no qontinui-claude-config
+        let home = tempfile::tempdir().unwrap();
+        crate::provision_guard::test_support::assert_not_in_any_repo(home.path());
+        let agents = home.path().join(".claude").join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        let custom = b"---\nname: code-reviewer\n---\nthe operator's own reviewer\n";
+        std::fs::write(agents.join("code-reviewer.md"), custom).unwrap();
+
+        let _ = provision_agent_definitions_from_root(root.path(), &home.path().to_string_lossy());
+
+        assert_eq!(
+            std::fs::read(agents.join("code-reviewer.md")).unwrap(),
+            custom,
+            "an operator-authored definition must never be overwritten"
+        );
+        for name in crate::fleet_agents::embedded_agent_names() {
+            assert!(agents.join(&name).is_file(), "{name} should be written");
+        }
+    }
+
+    /// A1: a destination whose bytes are a copy this runner shipped is still
+    /// refreshed. Here the stale copy is an older version of the overlay
+    /// checkout's definition (a blob its history holds at that definition's
+    /// path), and the overlay replaces it with the current one.
+    #[test]
+    fn provision_agent_defs_refreshes_a_copy_this_runner_shipped() {
+        let root = tempfile::tempdir().unwrap();
+        let checkout = root.path().join("qontinui-claude-config");
+        let src = checkout.join(".claude").join("agents");
+        std::fs::create_dir_all(&src).unwrap();
+        crate::provision_guard::test_support::git_init(&checkout);
+        let old = b"# local-agent, version 1\n";
+        std::fs::write(src.join("local-agent.md"), old).unwrap();
+        crate::provision_guard::test_support::git_add(
+            &checkout,
+            Path::new(".claude/agents/local-agent.md"),
+        );
+        crate::provision_guard::test_support::git_commit(&checkout, "version 1");
+        let new = b"# local-agent, version 2\n";
+        std::fs::write(src.join("local-agent.md"), new).unwrap();
+
+        let wt = tempfile::tempdir().unwrap();
+        let dst = wt.path().join(".claude").join("agents");
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(dst.join("local-agent.md"), old).unwrap();
+        // Beside it, a body this runner never shipped at a bundled name.
+        let reviewer = "code-reviewer.md";
+        std::fs::write(dst.join(reviewer), b"stale but unknown").unwrap();
+
+        let report =
+            provision_agent_definitions_from_root(root.path(), &wt.path().to_string_lossy());
+
+        assert_eq!(
+            std::fs::read(dst.join("local-agent.md")).unwrap(),
+            new,
+            "a shipped (older checkout) copy is refreshed"
+        );
+        assert_eq!(
+            std::fs::read(dst.join(reviewer)).unwrap(),
+            b"stale but unknown",
+            "an unknown body at a bundled name is kept"
+        );
+        assert_eq!(report.written, 1, "{:?}", report.skipped);
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    }
+
+    /// A5: a checkout definition the keep decisions never saw (it appeared
+    /// after they were computed) is still checked before its copy: an
+    /// operator's file at that name is kept, an absent one is written.
+    #[test]
+    fn the_overlay_checks_a_name_the_keep_decisions_never_saw() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(src.join("late.md"), b"# late arrival\n").unwrap();
+        std::fs::write(src.join("fresh.md"), b"# fresh\n").unwrap();
+        std::fs::write(dst.join("late.md"), b"# the operator's own\n").unwrap();
+        let floor = FloorOutcome {
+            written: 0,
+            kept: 0,
+            write_failure: None,
+        };
+
+        let report = overlay_checkout_agent_definitions(
+            &src,
+            &dst,
+            &crate::provision_guard::KeepDecisions::default(),
+            &[],
+            floor,
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(dst.join("late.md")).unwrap(),
+            b"# the operator's own\n"
+        );
+        assert_eq!(std::fs::read(dst.join("fresh.md")).unwrap(), b"# fresh\n");
+        assert!(
+            report.skipped.iter().any(|u| u.unit == "late.md"
+                && matches!(
+                    &u.reason,
+                    crate::capability_manifest::SkipReason::OperatorAuthored(_)
+                )),
+            "{:?}",
+            report.skipped
+        );
+        assert_eq!(report.written, 1);
+    }
+
+    /// A8: a destination that is a hard link to its own source is served in
+    /// place, and the skip says so rather than claiming a rung did not resolve.
+    #[cfg(unix)]
+    #[test]
+    fn overlay_records_a_destination_that_is_its_source_as_served_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(src.join("linked.md"), b"# linked\n").unwrap();
+        std::fs::hard_link(src.join("linked.md"), dst.join("linked.md")).unwrap();
+        let floor = FloorOutcome {
+            written: 0,
+            kept: 0,
+            write_failure: None,
+        };
+
+        let report = overlay_checkout_agent_definitions(
+            &src,
+            &dst,
+            &crate::provision_guard::KeepDecisions::default(),
+            &["linked.md".to_string()],
+            floor,
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(src.join("linked.md")).unwrap(), b"# linked\n");
+        assert!(
+            report.skipped.iter().any(|u| u.unit == "linked.md"
+                && matches!(
+                    &u.reason,
+                    crate::capability_manifest::SkipReason::ServedInPlace
+                )),
+            "{:?}",
+            report.skipped
+        );
+        assert!(
+            !report
+                .skipped
+                .iter()
+                .any(|u| u.reason.wire() == "operator_authored"),
+            "served in place is not an operator-authored keep: {:?}",
+            report.skipped
+        );
+        assert_eq!(
+            report.rung,
+            crate::capability_manifest::Rung::OperatorCheckout,
+            "a unit served in place is the checkout answering"
+        );
+    }
+
+    /// A4: a destination symlink at a bundled name is never written through:
+    /// the file it points at keeps its bytes.
+    #[cfg(unix)]
+    #[test]
+    fn provision_agent_defs_never_write_through_a_destination_symlink() {
+        let root = tempfile::tempdir().unwrap(); // no qontinui-claude-config
+        let wt = tempfile::tempdir().unwrap();
+        let target = wt.path().join("elsewhere.md");
+        std::fs::write(&target, b"SOURCE FILE").unwrap();
+        let dst = wt.path().join(".claude").join("agents");
+        std::fs::create_dir_all(&dst).unwrap();
+        std::os::unix::fs::symlink(&target, dst.join("code-reviewer.md")).unwrap();
+
+        let _ = provision_agent_definitions_from_root(root.path(), &wt.path().to_string_lossy());
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"SOURCE FILE");
+        assert!(std::fs::symlink_metadata(dst.join("code-reviewer.md"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    /// Per file: a destination that is a symlink to its own source is skipped
+    /// with a reason, while the other definitions are still overlaid.
+    #[cfg(unix)]
+    #[test]
+    fn provision_agent_defs_overlay_skips_a_destination_symlinked_to_its_source() {
+        let root = tempfile::tempdir().unwrap();
+        let src = root
+            .path()
+            .join("qontinui-claude-config")
+            .join(".claude")
+            .join("agents");
+        std::fs::create_dir_all(&src).unwrap();
+        let body = b"# linked\n";
+        std::fs::write(src.join("linked-overlay.md"), body).unwrap();
+        std::fs::write(src.join("plain-overlay.md"), b"# plain\n").unwrap();
+
+        let wt = tempfile::tempdir().unwrap();
+        let dst = wt.path().join(".claude").join("agents");
+        std::fs::create_dir_all(&dst).unwrap();
+        std::os::unix::fs::symlink(src.join("linked-overlay.md"), dst.join("linked-overlay.md"))
+            .unwrap();
+
+        let report =
+            provision_agent_definitions_from_root(root.path(), &wt.path().to_string_lossy());
+
+        assert_eq!(std::fs::read(src.join("linked-overlay.md")).unwrap(), body);
+        assert_eq!(
+            std::fs::read(dst.join("plain-overlay.md")).unwrap(),
+            b"# plain\n"
+        );
+        assert_eq!(report.written, 1);
+        assert!(report.skipped.iter().any(|u| u.unit == "linked-overlay.md"));
+    }
+
     #[test]
     fn provision_agent_defs_copies_md_files() {
         let root = tempfile::tempdir().unwrap();
@@ -14861,7 +16915,7 @@ mod tests {
     /// every spawn — by the embedded floor (this binary's render) and then by the
     /// PRIMARY checkout's copy, which sits at a different commit. A tracked,
     /// existing definition must be kept by BOTH layers and reported as such; an
-    /// untracked one is still refreshed from the checkout.
+    /// untracked copy the overlay shipped is still refreshed from the checkout.
     #[test]
     fn provision_agent_defs_keep_tracked_definitions_in_both_layers() {
         use crate::provision_guard::test_support::{git_add, git_init};
@@ -14875,6 +16929,14 @@ mod tests {
             .join("agents");
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("merge-specialist.md"), "# PRIMARY copy").unwrap();
+        // The checkout once committed loose.md as "# stale loose" (that path's
+        // history holds the blob), so a worktree copy with those bytes is one the overlay
+        // wrote, and is refreshed. An operator's own bytes would be kept.
+        let primary = root.path().join("qontinui-claude-config");
+        git_init(&primary);
+        std::fs::write(src.join("loose.md"), "# stale loose").unwrap();
+        git_add(&primary, Path::new(".claude/agents/loose.md"));
+        crate::provision_guard::test_support::git_commit(&primary, "stale loose");
         std::fs::write(src.join("loose.md"), "# PRIMARY loose").unwrap();
 
         // The session worktree: a repo tracking its own definitions.
@@ -14888,7 +16950,8 @@ mod tests {
         std::fs::write(&tracked_floor, "# WORKTREE's own reviewer").unwrap();
         git_add(wt.path(), &tracked_overlay);
         git_add(wt.path(), &tracked_floor);
-        // Present but untracked: still the checkout's to refresh.
+        // Present but untracked, and a copy the overlay shipped: still the
+        // checkout's to refresh.
         std::fs::write(dst.join("loose.md"), "# stale loose").unwrap();
         assert!(
             crate::fleet_agents::embedded_agent_names()
@@ -14913,7 +16976,7 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dst.join("loose.md")).unwrap(),
             "# PRIMARY loose",
-            "an untracked definition is still refreshed from the checkout"
+            "an untracked copy the overlay shipped is still refreshed from the checkout"
         );
         let kept: Vec<_> = report
             .skipped
@@ -14926,6 +16989,152 @@ mod tests {
             "the overlay reports exactly the tracked definition it kept"
         );
         assert_eq!(report.written, 1, "only loose.md is overlaid");
+    }
+
+    /// Plan `2026-11-09-a-provisioned-copy-of-an-upstream-added-file-wedges-the-served-checkout-fast-forward`
+    /// Phase 2, both agent layers: a checkout that tracks a BUNDLED definition
+    /// versions `.claude/agents`, so neither the embedded floor nor the checkout
+    /// overlay CREATES an absent definition there (an untracked copy at a path
+    /// upstream adds wedges that checkout's fast-forward), while a tracked
+    /// definition the user deleted is still written.
+    #[test]
+    fn provision_agent_defs_create_nothing_new_in_a_root_versioned_checkout() {
+        use crate::provision_guard::test_support::{git_add, git_init};
+
+        let root = tempfile::tempdir().unwrap();
+        let src = root
+            .path()
+            .join("qontinui-claude-config")
+            .join(".claude")
+            .join("agents");
+        std::fs::create_dir_all(&src).unwrap();
+        // The primary checkout TRACKS overlay-only.md (it reached it upstream),
+        // so the worktree's own history can add it: it is in the roster. It
+        // holds local-only.md untracked, which no commit will ever deliver.
+        let primary = root.path().join("qontinui-claude-config");
+        git_init(&primary);
+        std::fs::write(src.join("overlay-only.md"), "# PRIMARY overlay-only").unwrap();
+        git_add(&primary, &src.join("overlay-only.md"));
+        std::fs::write(src.join("local-only.md"), "# PRIMARY untracked").unwrap();
+
+        let embedded = crate::fleet_agents::embedded_agent_names();
+        assert!(
+            embedded.len() >= 2,
+            "fixture needs two embedded definitions"
+        );
+        let deleted = embedded[0].clone();
+        let upstream_added = embedded[1].clone();
+
+        let wt = tempfile::tempdir().unwrap();
+        git_init(wt.path());
+        let dst = wt.path().join(".claude").join("agents");
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(dst.join(&deleted), "# WORKTREE's own").unwrap();
+        git_add(wt.path(), &dst.join(&deleted));
+        std::fs::remove_file(dst.join(&deleted)).unwrap();
+
+        let wt_cwd = wt.path().to_string_lossy().into_owned();
+        let report = provision_agent_definitions_from_root(root.path(), &wt_cwd);
+
+        assert!(
+            !dst.join(&upstream_added).exists(),
+            "the floor must not create an untracked {upstream_added} in a checkout that versions the tree"
+        );
+        assert!(
+            !dst.join("overlay-only.md").exists(),
+            "the overlay must not create one either"
+        );
+        assert!(
+            dst.join("local-only.md").exists(),
+            "an overlay file its source does not track is outside the roster, so it is written"
+        );
+        assert!(
+            dst.join(&deleted).exists(),
+            "a tracked-but-deleted definition is still written"
+        );
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|s| s.unit == "overlay-only.md" && s.reason.wire() == "root_versioned"),
+            "the overlay records the skip as root_versioned, got {:?}",
+            report.skipped
+        );
+    }
+
+    /// When the probe of the overlay's SOURCE checkout cannot answer inside a
+    /// repository, every overlay name stays in the roster: in a versioned
+    /// checkout an overlay file is then withheld rather than written, since
+    /// writing an upstream-added one is the fast-forward wedge itself.
+    #[test]
+    fn provision_agent_defs_withhold_overlay_when_the_source_probe_is_unknown() {
+        use crate::provision_guard::test_support::{git_add, git_init};
+
+        let root = tempfile::tempdir().unwrap();
+        let primary = root.path().join("qontinui-claude-config");
+        let src = primary.join(".claude").join("agents");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            primary.join(".git"),
+            b"gitdir: /nonexistent/qontinui-agent-overlay-unknown-probe-test\n",
+        )
+        .unwrap();
+        std::fs::write(src.join("overlay-unknown.md"), "# PRIMARY overlay").unwrap();
+
+        let embedded = crate::fleet_agents::embedded_agent_names();
+        let wt = tempfile::tempdir().unwrap();
+        git_init(wt.path());
+        let dst = wt.path().join(".claude").join("agents");
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(dst.join(&embedded[0]), "# WORKTREE's own").unwrap();
+        git_add(wt.path(), &dst.join(&embedded[0]));
+
+        let wt_cwd = wt.path().to_string_lossy().into_owned();
+        let report = provision_agent_definitions_from_root(root.path(), &wt_cwd);
+
+        assert!(
+            !dst.join("overlay-unknown.md").exists(),
+            "an UNKNOWN source probe must not let the overlay create an untracked file"
+        );
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|s| s.unit == "overlay-unknown.md" && s.reason.wire() == "root_versioned"),
+            "got {:?}",
+            report.skipped
+        );
+    }
+
+    /// A repository that tracks only a definition of its OWN (qontinui-forge,
+    /// qontinui-cloud and qontinui-clone-factory each track a repo-local
+    /// `clone-implementer.md`) does not version the bundle, so it still receives
+    /// every embedded definition — `code-reviewer.md` above all.
+    #[test]
+    fn provision_agent_defs_still_floor_a_repo_tracking_only_its_own_agent() {
+        use crate::provision_guard::test_support::{git_add, git_init};
+
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        git_init(wt.path());
+        let dst = wt.path().join(".claude").join("agents");
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(dst.join("clone-implementer.md"), "# repo-local").unwrap();
+        git_add(wt.path(), &dst.join("clone-implementer.md"));
+
+        let wt_cwd = wt.path().to_string_lossy().into_owned();
+        let _ = provision_agent_definitions_from_root(root.path(), &wt_cwd);
+
+        for name in crate::fleet_agents::embedded_agent_names() {
+            assert!(
+                dst.join(&name).exists(),
+                "{name} must still be provisioned into a repo tracking only its own agent"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(dst.join("clone-implementer.md")).unwrap(),
+            "# repo-local"
+        );
     }
 
     /// The probe-UNKNOWN arm inside a repository: existing definitions are
@@ -15017,13 +17226,11 @@ mod tests {
         assert_eq!(report.written, 0);
         assert_eq!(report.skipped.len(), 1);
         assert_eq!(report.skipped[0].reason.wire(), "unresolved");
+        let why = report.skipped[0].reason.describe();
         assert!(
-            report.skipped[0]
-                .reason
-                .describe()
-                .contains("no claude-config agents dir"),
-            "the skip must NAME the missing rung, not merely count it: {:?}",
-            report.skipped[0].reason
+            why.contains("qontinui-claude-config")
+                && why.contains("served from the copy built into the application"),
+            "the skip must NAME the missing sibling and what stood in for it: {why}"
         );
 
         let dst = wt.path().join(".claude").join("agents");
@@ -15374,7 +17581,7 @@ mod tests {
         let (wt, dst) = workdir_with(&[("test-generator.md", edited)]);
 
         let wt_cwd = wt.path().to_string_lossy().into_owned();
-        let report = provision_agent_definitions_with_root(Some(root.path()), &wt_cwd);
+        let report = provision_agent_definitions(declared_root(root.path()), &wt_cwd);
 
         assert_eq!(
             std::fs::read_to_string(dst.join("test-generator.md")).unwrap(),
@@ -15629,7 +17836,10 @@ mod tests {
         let edited = "---\nname: test-generator\n---\n# edited in this workdir\n";
         let (wt, _dst) = workdir_with(&[("test-generator.md", edited)]);
 
-        let report = provision_agent_definitions_with_root(None, &wt.path().to_string_lossy());
+        let report = provision_agent_definitions(
+            qontinui_types::paths::resolve_workspace_root(None, None, None, None, None, None),
+            &wt.path().to_string_lossy(),
+        );
 
         assert_eq!(report.rung, crate::capability_manifest::Rung::Unresolved);
         assert_eq!(
@@ -15872,6 +18082,85 @@ mod tests {
         assert_eq!(missing, "claude");
     }
 
+    /// The strict resolver a `--resume` respawn uses answers `None` on a miss —
+    /// nothing on PATH, or only npm's placeholder stub — where
+    /// [`resolve_claude_bin`] hands back the bare name (plan
+    /// 2026-10-20-account-migration-respawn-dies-during-cli-reinstall-churn D3.1).
+    #[cfg(unix)]
+    #[test]
+    fn try_resolve_claude_bin_is_none_on_a_miss_never_the_bare_name() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env_lock = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_CLAUDE_BIN"]);
+        std::env::remove_var("QONTINUI_CLAUDE_BIN");
+        let tmp = tempfile::tempdir().unwrap();
+        let empty = tmp.path().join("empty");
+        let stub_dir = tmp.path().join("stub");
+        let real_dir = tmp.path().join("real");
+        for d in [&empty, &stub_dir, &real_dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let stub = stub_dir.join("claude");
+        std::fs::write(
+            &stub,
+            "echo \"Error: claude native binary not installed.\" >&2\nexit 1\n",
+        )
+        .unwrap();
+        let real = real_dir.join("claude");
+        std::fs::write(&real, "#!/bin/sh\n").unwrap();
+        for f in [&stub, &real] {
+            std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path_of = |dirs: &[&std::path::PathBuf]| std::env::join_paths(dirs).unwrap();
+        let (only_empty, stub_only, stub_then_real) = (
+            path_of(&[&empty]),
+            path_of(&[&empty, &stub_dir]),
+            path_of(&[&stub_dir, &real_dir]),
+        );
+        assert_eq!(try_resolve_claude_bin_in(None), None, "no PATH at all");
+        assert_eq!(
+            try_resolve_claude_bin_in(Some(only_empty.as_os_str())),
+            None
+        );
+        assert_eq!(
+            try_resolve_claude_bin_in(Some(stub_only.as_os_str())),
+            None,
+            "the placeholder stub alone is a miss"
+        );
+        assert_eq!(
+            try_resolve_claude_bin_in(Some(stub_then_real.as_os_str())).as_deref(),
+            Some(&*real.to_string_lossy())
+        );
+        std::env::set_var("QONTINUI_CLAUDE_BIN", "/an/absolute/override");
+        assert_eq!(
+            try_resolve_claude_bin_in(Some(only_empty.as_os_str())).as_deref(),
+            Some("/an/absolute/override"),
+            "an absolute override is passed through"
+        );
+    }
+
+    /// A resolved but NON-executable `claude` is a miss for the strict
+    /// resolver (where [`launchable_or_bare`] falls back to the bare name).
+    #[cfg(unix)]
+    #[test]
+    fn try_resolve_launchable_claude_bin_refuses_a_non_executable_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env_lock = env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let bin = bin_dir.join("claude");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let _env = ClaudeBinEnv::prepend(std::slice::from_ref(&bin_dir));
+        assert_eq!(try_resolve_launchable_claude_bin(), None);
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            try_resolve_launchable_claude_bin().as_deref(),
+            Some(&*bin.to_string_lossy())
+        );
+    }
+
     #[test]
     fn claude_bin_respects_env_override() {
         let _env_lock = env_lock();
@@ -15993,6 +18282,254 @@ mod tests {
         );
     }
 
+    /// Plan `2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists`,
+    /// B3: when nothing is declared and the workdir is a repository checkout, the
+    /// root resolves to its parent and the embedded subagents are written. A
+    /// folder that is not a checkout takes the no-root arm, which writes the same
+    /// embedded floor (B3 vet 2026-11-13 item 2) and states the unresolved root.
+    #[test]
+    fn a_session_opened_on_a_checkout_reaches_the_embedded_floor() {
+        let _amb = crate::test_env::isolated_ambient();
+        let parent = tempfile::tempdir().unwrap();
+        let repo = parent.path().join("their-repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let cwd = repo.to_string_lossy().into_owned();
+
+        let resolved = qontinui_types::paths::resolve_workspace_root(
+            None,
+            None,
+            None,
+            None,
+            Some(&repo),
+            None,
+        );
+        assert_eq!(
+            resolved.kind,
+            qontinui_types::paths::WorkspaceRootKind::SessionRepoParent
+        );
+        let report = provision_agent_definitions(resolved, &cwd);
+        let why = report.skipped[0].reason.describe();
+        assert!(why.contains("qontinui-claude-config"), "{why}");
+        let written = std::fs::read_dir(repo.join(".claude").join("agents"))
+            .expect("the embedded floor must create the agents dir")
+            .count();
+        assert_eq!(written, crate::fleet_agents::embedded_agent_count());
+
+        let plain = parent.path().join("plain-folder");
+        std::fs::create_dir_all(&plain).unwrap();
+        let cwd = plain.to_string_lossy().into_owned();
+        let resolved = qontinui_types::paths::resolve_workspace_root(
+            None,
+            None,
+            None,
+            None,
+            Some(&plain),
+            None,
+        );
+        let report = provision_agent_definitions(resolved, &cwd);
+        assert_eq!(report.rung, crate::capability_manifest::Rung::Unresolved);
+        let written = std::fs::read_dir(plain.join(".claude").join("agents"))
+            .expect("the no-root arm must still write the embedded floor")
+            .count();
+        assert_eq!(written, crate::fleet_agents::embedded_agent_count());
+    }
+
+    /// B3 vet 2026-11-13 item 2: with no root at all, the embedded floor is
+    /// written (only the overlay needs a root), and the `agent_definitions`
+    /// row's detail is the render of the
+    /// typed `WorkspaceRootUnresolved` plus the floor's statement — not a
+    /// sentence of this module's own.
+    #[test]
+    fn the_no_root_arm_writes_the_embedded_floor_and_renders_the_typed_error() {
+        let wt = tempfile::tempdir().unwrap();
+        let cwd = wt.path().to_string_lossy().into_owned();
+        let resolved =
+            qontinui_types::paths::resolve_workspace_root(None, None, None, None, None, None);
+        let unresolved = resolved
+            .clone()
+            .require()
+            .expect_err("nothing was supplied, so nothing resolves");
+
+        let report = provision_agent_definitions(resolved, &cwd);
+
+        let agents = wt.path().join(".claude").join("agents");
+        for name in crate::fleet_agents::embedded_agent_names() {
+            assert!(agents.join(&name).is_file(), "{name} must be written");
+        }
+        assert_eq!(report.capability, "agent_definitions");
+        assert_eq!(report.rung, crate::capability_manifest::Rung::Unresolved);
+        let why = report.skipped[0].reason.describe();
+        assert!(why.contains(&unresolved.to_string()), "{why}");
+        assert!(
+            why.contains("This capability is served from the copy built into"),
+            "{why}"
+        );
+        assert!(!why.contains("no qontinui-root resolved"), "{why}");
+    }
+
+    /// A workspace root a test declares, without the process-wide resolver.
+    fn declared_root(root: &Path) -> qontinui_types::paths::WorkspaceRoot {
+        qontinui_types::paths::WorkspaceRoot {
+            root: Some(root.to_path_buf()),
+            rejected: None,
+            kind: qontinui_types::paths::WorkspaceRootKind::Declared,
+        }
+    }
+
+    /// With no root, the row names the rejected input — through the typed
+    /// error's `Cause:` clause — only when an explicit input was at fault.
+    #[test]
+    fn the_no_root_row_names_the_input_at_fault() {
+        let wt = tempfile::tempdir().unwrap();
+        let cwd = wt.path().to_string_lossy().into_owned();
+        let blank = provision_agent_definitions(
+            qontinui_types::paths::resolve_workspace_root(
+                Some("   "),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            &cwd,
+        );
+        let why = blank.skipped[0].reason.describe();
+        assert!(why.contains("is blank"), "{why}");
+        assert!(why.contains("Cause:"), "{why}");
+        assert!(why.contains("Workspace root"), "{why}");
+
+        let nothing = provision_agent_definitions(
+            qontinui_types::paths::resolve_workspace_root(None, None, None, None, None, None),
+            &cwd,
+        );
+        let why = nothing.skipped[0].reason.describe();
+        assert!(why.contains("Workspace root"), "{why}");
+        assert!(!why.contains("Cause:"), "{why}");
+    }
+
+    /// The spawn path hands its root resolver its OWN workdir: that is what makes
+    /// the session rung reachable from a spawn at all. This pins the hand-off in
+    /// `_with`; which resolver the production wrapper passes is its one line.
+    #[test]
+    fn the_spawn_path_asks_the_resolver_about_its_own_workdir() {
+        let wt = tempfile::tempdir().unwrap();
+        let cwd = wt.path().to_string_lossy().into_owned();
+        let mut asked: Option<std::path::PathBuf> = None;
+        let _ = provision_agent_definitions_recorded_with(&cwd, |p| {
+            asked = Some(p.to_path_buf());
+            qontinui_types::paths::resolve_workspace_root(None, None, None, None, None, None)
+        });
+        assert_eq!(asked.as_deref(), Some(wt.path()));
+    }
+
+    /// B3 vet 2026-11-13 item 1: the provision probe resolves the root for a
+    /// caller-named `session_repo` checkout while writing into its OWN scratch
+    /// directory. A foreign checkout with nothing declared yields
+    /// `session_repo_parent`, the recorded row's detail says so, and nothing is
+    /// written into the checkout.
+    #[test]
+    fn a_session_repo_checkout_yields_session_repo_parent_and_stays_untouched() {
+        let parent = tempfile::tempdir().unwrap();
+        let repo = parent.path().join("foreign-repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let cwd = scratch.path().to_string_lossy().into_owned();
+
+        let mut kind = None;
+        let reports = provision_agent_definitions_recorded_with(&cwd, |_| {
+            let resolved = qontinui_types::paths::resolve_workspace_root(
+                None,
+                None,
+                None,
+                None,
+                Some(&repo),
+                None,
+            );
+            kind = Some(resolved.kind);
+            resolved
+        });
+
+        assert_eq!(
+            kind,
+            Some(qontinui_types::paths::WorkspaceRootKind::SessionRepoParent)
+        );
+        let detail = reports[0].detail.as_deref().unwrap_or_default();
+        assert!(
+            detail.contains("workspace_root_kind: session_repo_parent"),
+            "{detail}"
+        );
+        assert!(
+            scratch.path().join(".claude").join("agents").is_dir(),
+            "the embedded floor lands in the probe's own directory"
+        );
+        assert!(
+            !repo.join(".claude").exists(),
+            "the session repository is read, never written"
+        );
+    }
+
+    /// With no claude-config overlay, a floor that could not write anything names
+    /// the write failure. It never says the built-in copy serves the capability,
+    /// and never that this installation lacks it.
+    #[test]
+    fn a_floor_that_cannot_write_names_the_write_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        // `.claude/agents` is a FILE, so the floor cannot create its directory.
+        std::fs::create_dir_all(wt.path().join(".claude")).unwrap();
+        std::fs::write(wt.path().join(".claude").join("agents"), "not a dir").unwrap();
+        let report =
+            provision_agent_definitions_from_root(root.path(), &wt.path().to_string_lossy());
+        let why = report.skipped[0].reason.describe();
+        assert!(why.contains("is not on disk here"), "{why}");
+        assert!(why.contains("failed:"), "{why}");
+        assert!(!why.contains("not supported in this installation"), "{why}");
+        assert!(!why.contains("served from the copy built into"), "{why}");
+    }
+
+    /// A floor that wrote nothing because every definition is a tracked file it
+    /// KEPT says the repository's copies serve the capability, not the built-in
+    /// one.
+    #[test]
+    fn a_floor_that_kept_every_tracked_definition_names_the_repository_copies() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let agents = wt.path().join(".claude").join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        for name in crate::fleet_agents::embedded_agent_names() {
+            std::fs::write(agents.join(&name), "tracked copy").unwrap();
+        }
+        // Tracked = in the index; no commit, so no hook runs.
+        crate::provision_guard::test_support::git_init(wt.path());
+        crate::provision_guard::test_support::git_add(wt.path(), &agents);
+
+        let report =
+            provision_agent_definitions_from_root(root.path(), &wt.path().to_string_lossy());
+        let why = report.skipped[0].reason.describe();
+        // The sentence `overlay_absent_statement` renders for a floor that only
+        // KEPT definitions: the repository's copies, not the built-in one.
+        assert!(
+            why.contains("existing agent definition(s) on disk (tracked, or possibly tracked, by this repository"),
+            "{why}"
+        );
+        assert!(why.contains("were kept"), "{why}");
+        assert!(
+            !why.contains("This capability is served from the copy built into"),
+            "{why}"
+        );
+        for name in crate::fleet_agents::embedded_agent_names() {
+            assert_eq!(
+                std::fs::read_to_string(agents.join(&name)).unwrap(),
+                "tracked copy",
+                "a tracked definition must be kept, not rewritten"
+            );
+        }
+    }
+
+    /// The rendered `WorkspaceRootUnresolved` a `require_workspace_root` caller
+    /// passes in, standing in for the real sentence so the tests stay pure.
+    const UNRESOLVED: &str = "the workspace root sentence";
+
     /// Phase 3 of `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions`:
     /// a non-worktree `qontinui/*` continuation lands at the WORKSPACE ROOT, not
     /// at the canonical checkout of its first repo — and, since the resolver for
@@ -16002,47 +18539,33 @@ mod tests {
     fn a_qontinui_continuation_keeps_the_root_first_order_unverified() {
         let root = std::path::PathBuf::from("D:/qontinui-root");
         let repos = vec!["qontinui/qontinui-runner".to_string()];
-        let canonical = |r: &str| {
-            Ok(std::path::PathBuf::from(format!(
-                "D:/qontinui-root/{}",
-                r.rsplit('/').next().unwrap()
-            )))
-        };
         let refuse = |_: &str| Err::<std::path::PathBuf, _>("verification must not run");
         let foreign = crate::agent_worktree::canonical_paths::has_foreign_owner;
 
         assert_eq!(
-            continuation_fallback_workdir(
-                Some(root.clone()),
-                &repos,
-                foreign,
-                canonical,
-                refuse,
-                "off"
-            ),
+            continuation_fallback_workdir(Ok(root.clone()), &repos, foreign, refuse, "off"),
             Ok("D:/qontinui-root".to_string()),
             "the root wins, and a failing verifier is never consulted"
         );
         assert_eq!(
-            continuation_fallback_workdir(Some(root), &[], foreign, canonical, refuse, "off"),
+            continuation_fallback_workdir(Ok(root), &[], foreign, refuse, "off"),
             Ok("D:/qontinui-root".to_string())
         );
-        // No root: the canonical checkout survives as the last resort.
+        // No root: the refusal is the root's own sentence, verbatim, so it
+        // names the next action rather than a variable the operator never set.
         assert_eq!(
-            continuation_fallback_workdir(None, &repos, foreign, canonical, refuse, "off"),
-            Ok("D:/qontinui-root/qontinui-runner".to_string())
+            continuation_fallback_workdir(
+                Err(UNRESOLVED.to_string()),
+                &repos,
+                foreign,
+                refuse,
+                "off"
+            ),
+            Err(UNRESOLVED.to_string())
         );
-        assert!(continuation_fallback_workdir(
-            None,
-            &repos,
-            foreign,
-            |_: &str| Err("no root".to_string()),
-            refuse,
-            "off"
-        )
-        .is_err());
-        assert!(
-            continuation_fallback_workdir(None, &[], foreign, canonical, refuse, "off").is_err()
+        assert_eq!(
+            continuation_fallback_workdir(Err(UNRESOLVED.to_string()), &[], foreign, refuse, "off"),
+            Err(UNRESOLVED.to_string())
         );
     }
 
@@ -16058,14 +18581,12 @@ mod tests {
         let root = std::path::PathBuf::from("D:/qontinui-root");
         let repos = vec!["portofino-pizzeria/backend".to_string()];
         let foreign = crate::agent_worktree::canonical_paths::has_foreign_owner;
-        let canonical = |_: &str| Err("the layout rule must not be used".to_string());
         let resolve =
             |_: &str| Ok::<_, String>(std::path::PathBuf::from("D:/portofino-pizzeria/backend"));
         let err = continuation_fallback_workdir(
-            Some(root.clone()),
+            Ok(root.clone()),
             &repos,
             foreign,
-            canonical,
             resolve,
             "worktree acquire failed: claim already held",
         )
@@ -16075,31 +18596,29 @@ mod tests {
         assert!(err.contains("claim already held"), "{err}");
         assert_eq!(continuation_acquire_failure_detail(&err), err);
 
+        // With no root at all, the refusal still carries the root's own sentence.
+        let err = continuation_fallback_workdir(
+            Err(UNRESOLVED.to_string()),
+            &repos,
+            foreign,
+            resolve,
+            "off",
+        )
+        .unwrap_err();
+        assert!(err.starts_with("no_isolated_worktree: "), "{err}");
+        assert!(err.ends_with(UNRESOLVED), "{err}");
+        assert!(!err.contains("outside the workspace root"), "{err}");
+
         // A foreign repo whose verified checkout IS under the root → the root.
         let under = |_: &str| Ok::<_, String>(std::path::PathBuf::from("D:/qontinui-root/backend"));
         assert_eq!(
-            continuation_fallback_workdir(
-                Some(root.clone()),
-                &repos,
-                foreign,
-                canonical,
-                under,
-                "off"
-            ),
+            continuation_fallback_workdir(Ok(root.clone()), &repos, foreign, under, "off"),
             Ok("D:/qontinui-root".to_string())
         );
         // A sibling of the root sharing its prefix is NOT under it.
         let sibling =
             |_: &str| Ok::<_, String>(std::path::PathBuf::from("D:/qontinui-root-old/backend"));
-        assert!(continuation_fallback_workdir(
-            Some(root),
-            &repos,
-            foreign,
-            canonical,
-            sibling,
-            "off"
-        )
-        .is_err());
+        assert!(continuation_fallback_workdir(Ok(root), &repos, foreign, sibling, "off").is_err());
     }
 
     /// No verified checkout anywhere → refused, carrying the resolver's typed
@@ -16123,10 +18642,9 @@ mod tests {
             )
         };
         let err = continuation_fallback_workdir(
-            Some(std::path::PathBuf::from("D:/qontinui-root")),
+            Ok(std::path::PathBuf::from("D:/qontinui-root")),
             &repos,
             crate::agent_worktree::canonical_paths::has_foreign_owner,
-            |_: &str| Ok(std::path::PathBuf::from("D:/qontinui-root/mobile")),
             resolve,
             "off",
         )
@@ -16302,6 +18820,7 @@ mod tests {
         assert_eq!(
             headless_agent_args(
                 &SessionPermissionSetting::SiteDefault,
+                &AppliedLaunch::default(),
                 pinned_session_args(id)
             ),
             vec![
@@ -16321,7 +18840,8 @@ mod tests {
         let posture = SessionPermissionSetting::AllowList {
             tools: vec!["Read".to_string(), "Bash(git status)".to_string()],
         };
-        let args = headless_agent_args(&posture, pinned_session_args(id));
+        let args =
+            headless_agent_args(&posture, &AppliedLaunch::default(), pinned_session_args(id));
         assert_eq!(
             args,
             vec![
@@ -16335,6 +18855,58 @@ mod tests {
             ]
         );
         assert!(!args.iter().any(|a| a == "--dangerously-skip-permissions"));
+    }
+
+    /// Plan `2026-11-15-operator-sets-spawn-model-and-effort-per-spawn-type`
+    /// V7, headless seam: a coord frame's `launch_model` / `launch_effort`
+    /// reach the child as exactly one `--model` and one `--effort`, between
+    /// the permission posture and the session pin.
+    #[test]
+    fn headless_agent_args_carry_the_frames_launch_decision() {
+        use crate::claude_session::launch_spec::SessionPermissionSetting;
+        let id = uuid::Uuid::parse_str("99999999-9999-4999-8999-999999999999").unwrap();
+        let launch: LaunchFrame = serde_json::from_value(serde_json::json!({
+            "launch_model": "sonnet",
+            "launch_effort": "high",
+            "launch_settings": {"spawn_type": "pr_fix_red_ci", "model_source": "operator_setting"}
+        }))
+        .unwrap();
+        assert_eq!(
+            headless_agent_args(
+                &SessionPermissionSetting::SiteDefault,
+                &launch.resolve(),
+                pinned_session_args(id)
+            ),
+            vec![
+                "--dangerously-skip-permissions".to_string(),
+                "--model".to_string(),
+                "sonnet".to_string(),
+                "--effort".to_string(),
+                "high".to_string(),
+                "--session-id".to_string(),
+                "99999999-9999-4999-8999-999999999999".to_string(),
+            ]
+        );
+    }
+
+    /// An invalid `launch_effort` renders nothing — dropped, never guessed —
+    /// while a valid `launch_model` beside it still applies.
+    #[test]
+    fn headless_agent_args_drop_an_invalid_launch_effort() {
+        use crate::claude_session::launch_spec::SessionPermissionSetting;
+        let id = uuid::Uuid::parse_str("99999999-9999-4999-8999-999999999999").unwrap();
+        let launch: LaunchFrame = serde_json::from_value(serde_json::json!({
+            "launch_model": "opus",
+            "launch_effort": "turbo",
+        }))
+        .unwrap();
+        let args = headless_agent_args(
+            &SessionPermissionSetting::SiteDefault,
+            &launch.resolve(),
+            pinned_session_args(id),
+        );
+        assert!(!args.iter().any(|a| a == "--effort"));
+        assert_eq!(args.iter().filter(|a| *a == "--model").count(), 1);
     }
 
     /// Every spawn attempt runs under a FRESH session id, and the session
@@ -16403,6 +18975,7 @@ mod tests {
             brief: None,
             retry: None,
             allocation: None,
+            launch: LaunchFrame::default(),
         };
         let workdir = std::env::temp_dir().to_string_lossy().to_string();
         let res = run_continuation_terminal(
@@ -16541,6 +19114,8 @@ mod tests {
             "echo gate-continuation-proof",
             AnchorReservation::none(),
             pinned,
+            None,
+            &LaunchFrame::default(),
         )
         .await;
         assert!(
@@ -17708,7 +20283,8 @@ mod tests {
         // …and the WIRING: `settle_claim_decision` is the whole of step 2's
         // decision handling, so this drives the fn `run_gate_continuation_inner`
         // actually calls rather than a copy of a match arm. Outcome AND claim
-        // state, for all SIX variants — the superseded release is no longer a
+        // state, for six variants (`SkipWrongDevice` is covered by
+        // `a_wrong_device_refusal_skips_and_releases_the_claim`) — the superseded release is no longer a
         // deletable statement at an untested call site.
         let gate = uuid::Uuid::now_v7();
 
@@ -18078,6 +20654,27 @@ mod tests {
 
     const CAP_ENV_KEYS: &[&str] = &[RETIRED_CONTINUATION_SESSION_CAP_ENV];
 
+    /// The two read-only registry doors the Stop-hook verdict and the finish
+    /// relay use: only a LIVE entry carrying a gate is a gate continuation; a
+    /// gate-less entry (a work-unit dispatch) and an unknown terminal are not.
+    #[test]
+    fn live_gate_continuation_lookups_name_only_gated_live_entries() {
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        let gate = uuid::Uuid::new_v4();
+        register_continuation_session("t-gate".to_string(), None, Some(gate));
+        register_continuation_session("t-unit".to_string(), Some("unit:x:p".to_string()), None);
+
+        assert_eq!(live_gate_continuation_gate_id("t-gate"), Some(gate));
+        assert_eq!(live_gate_continuation_gate_id("t-unit"), None);
+        assert_eq!(live_gate_continuation_gate_id("t-nope"), None);
+        assert_eq!(
+            live_gate_continuations(),
+            vec![("t-gate".to_string(), gate)]
+        );
+        clear_continuation_registry();
+    }
+
     /// Phase 1c: a coord launch under thread pressure is REFUSED, not admitted,
     /// and its `spawn-failed` reason carries the re-offerable `deferred_load:`
     /// prefix followed by the same thread-pressure stamp continuations use.
@@ -18146,6 +20743,141 @@ mod tests {
             total <= Duration::from_secs(10),
             "total backoff stays small"
         );
+    }
+
+    fn report_spool_in(
+        dir: &std::path::Path,
+    ) -> (
+        crate::session::closeout_spool::CloseoutSpool,
+        std::sync::Arc<crate::session::local_store::OutboxWriter>,
+    ) {
+        let outbox = std::sync::Arc::new(
+            crate::session::local_store::OutboxWriter::open(dir.join("outbox.jsonl")).unwrap(),
+        );
+        (
+            crate::session::closeout_spool::CloseoutSpool::new(
+                outbox.clone(),
+                uuid::Uuid::new_v4(),
+            ),
+            outbox,
+        )
+    }
+
+    /// A launch deferral every live attempt failed to deliver is SPOOLED to
+    /// the session outbox — on the agent's lane, carrying the deferral reason
+    /// and phase — not logged and dropped (plan
+    /// `2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling`
+    /// Phase 6).
+    ///
+    /// Mutation: return `ReportSettlement::Lost` before the spool write in
+    /// `spool_undelivered_report` (the outbox stays empty).
+    #[tokio::test]
+    async fn an_undelivered_launch_deferral_is_spooled_not_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (spool, outbox) = report_spool_in(dir.path());
+        let agent_id = uuid::Uuid::new_v4();
+        let reason = "deferred_load:thread_pressure:warn:380_over_376";
+        let body = spawn_failed_body(reason, None, 0, None, SpawnPhase::Blocked);
+        let posts = std::cell::Cell::new(0_u32);
+        let settled = settle_spawn_failed_report(
+            agent_id,
+            &body,
+            LAUNCH_DEFERRAL_REPORT_ATTEMPTS,
+            |_| Duration::ZERO,
+            || {
+                posts.set(posts.get() + 1);
+                async { SpawnReportOutcome::Undelivered }
+            },
+            Some(&spool),
+        )
+        .await;
+        assert_eq!(
+            posts.get(),
+            LAUNCH_DEFERRAL_REPORT_ATTEMPTS,
+            "every attempt spent first"
+        );
+        assert!(
+            matches!(settled, ReportSettlement::Spooled(_)),
+            "{settled:?}"
+        );
+
+        let pending = outbox.pending().unwrap();
+        assert_eq!(pending.len(), 1, "exactly one durable row");
+        let row = &pending[0];
+        assert_eq!(row.event_kind, "spawn_failed_report");
+        assert_eq!(
+            row.session_id,
+            crate::session::spawn_report_spool::spawn_report_lane(agent_id)
+        );
+        let (replay_agent, replay_body) =
+            crate::session::spawn_report_spool::replay_target(&row.payload).expect("replayable");
+        assert_eq!(replay_agent, agent_id);
+        assert_eq!(replay_body["reason"], reason);
+        assert_eq!(
+            replay_body,
+            serde_json::to_value(&body).unwrap(),
+            "the live body, verbatim"
+        );
+        if spawn_outcome_enrichment_enabled() {
+            assert_eq!(replay_body["phase"], "blocked");
+        }
+
+        // No spool installed: the loss is reported as a loss, never as kept.
+        let lost = settle_spawn_failed_report(
+            agent_id,
+            &body,
+            1,
+            |_| Duration::ZERO,
+            || async { SpawnReportOutcome::Undelivered },
+            None,
+        )
+        .await;
+        assert!(matches!(lost, ReportSettlement::Lost), "{lost:?}");
+    }
+
+    /// A 4xx is coord's verdict on the report: not retried, not spooled.
+    /// A delivered report is not spooled either.
+    ///
+    /// Mutation: spool on `Rejected` too (the outbox gains a row), or retry it.
+    #[tokio::test]
+    async fn a_4xx_spawn_failed_is_not_spooled() {
+        let dir = tempfile::tempdir().unwrap();
+        let (spool, outbox) = report_spool_in(dir.path());
+        let body = spawn_failed_body("spawn failure: x", Some(1), 0, None, SpawnPhase::Exited);
+        let posts = std::cell::Cell::new(0_u32);
+        let settled = settle_spawn_failed_report(
+            uuid::Uuid::new_v4(),
+            &body,
+            LAUNCH_DEFERRAL_REPORT_ATTEMPTS,
+            |_| Duration::ZERO,
+            || {
+                posts.set(posts.get() + 1);
+                async { SpawnReportOutcome::Rejected }
+            },
+            Some(&spool),
+        )
+        .await;
+        assert!(matches!(settled, ReportSettlement::Rejected), "{settled:?}");
+        assert_eq!(posts.get(), 1, "a 4xx is not retried");
+        assert!(
+            outbox.pending().unwrap().is_empty(),
+            "a 4xx is never spooled"
+        );
+
+        let delivered = settle_spawn_failed_report(
+            uuid::Uuid::new_v4(),
+            &body,
+            1,
+            |_| Duration::ZERO,
+            || async { SpawnReportOutcome::Delivered },
+            Some(&spool),
+        )
+        .await;
+        assert!(
+            matches!(delivered, ReportSettlement::Delivered),
+            "{delivered:?}"
+        );
+        assert!(outbox.pending().unwrap().is_empty());
     }
 
     /// The fixed count cap is GONE (operator direction 2026-10-03): with
@@ -20188,6 +22920,7 @@ mod tests {
                 brief: None,
                 retry: None,
                 allocation: None,
+                launch: LaunchFrame::default(),
             }
         }
         let gate = uuid::Uuid::now_v7();
@@ -20318,6 +23051,73 @@ mod tests {
                 "{body}"
             );
         }
+    }
+
+    /// 409 with the strict-pin contract → SkipWrongDevice, carrying the pin
+    /// (plan `2026-11-19-a-device-bound-continuation-holds-its-pin-and-a-misrouted-one-is-not-consumed`,
+    /// Phase 2a). Before this arm the shape fell through to
+    /// `SpawnDespiteClaimError` and SPAWNED a session on the wrong device.
+    #[test]
+    fn decide_spawn_on_409_wrong_device_skips_with_the_pin() {
+        let pin = uuid::Uuid::now_v7();
+        let body = format!(r#"{{"error":"wrong_device","target_device_id":"{pin}"}}"#);
+        let decision = decide_spawn(409, &body);
+        assert_eq!(
+            decision,
+            SpawnDecision::SkipWrongDevice {
+                target_device_id: Some(pin)
+            }
+        );
+        assert!(
+            !matches!(decision, SpawnDecision::SpawnDespiteClaimError { .. }),
+            "a wrong_device refusal must never spawn"
+        );
+    }
+
+    /// A `wrong_device` body whose pin is absent or unparseable still skips (the
+    /// refusal is authoritative; the pin is only for the log), and a 5xx
+    /// carrying the same text does NOT: only a 409 is a refusal.
+    #[test]
+    fn decide_spawn_on_409_wrong_device_without_a_pin_still_skips() {
+        for body in [
+            r#"{"error":"wrong_device"}"#,
+            r#"{"error":"wrong_device","target_device_id":"not-a-uuid"}"#,
+            r#"{"error":"wrong_device","target_device_id":7}"#,
+        ] {
+            assert_eq!(
+                decide_spawn(409, body),
+                SpawnDecision::SkipWrongDevice {
+                    target_device_id: None
+                },
+                "{body}"
+            );
+        }
+        assert!(matches!(
+            decide_spawn(500, r#"{"error":"wrong_device"}"#),
+            SpawnDecision::SpawnDespiteClaimError { .. }
+        ));
+    }
+
+    /// The settle path: a wrong_device refusal SKIPS (no spawn, no deferral) and
+    /// RELEASES the local dispatch claim, because coord left the row pending at
+    /// its pin.
+    #[test]
+    fn a_wrong_device_refusal_skips_and_releases_the_claim() {
+        let decision = decide_spawn(409, r#"{"error":"wrong_device"}"#);
+        assert!(skip_leaves_row_pending(&decision));
+        let gate = uuid::Uuid::now_v7();
+        let funnel = uuid::Uuid::now_v7();
+        assert!(claim_gate_dispatch(funnel));
+        assert_eq!(
+            settle_claim_decision(&decision, ConsumeTarget::Gate(funnel, 0), gate),
+            ClaimOutcome::Skip,
+            "a wrong_device claim refusal must not spawn and must not defer"
+        );
+        assert!(
+            claim_gate_dispatch(funnel),
+            "the id must be claimable again after the funnel settles it"
+        );
+        release_gate_dispatch(funnel);
     }
 
     /// 409 cancelled with no `cancel_reason` → SkipCancelled with `None` reason
@@ -20884,6 +23684,9 @@ mod tests {
         assert_eq!(v["threads"]["gradedThreads"], 200);
         assert_eq!(v["threads"]["warnCeiling"], 256);
         assert_eq!(v["threads"]["criticalCeiling"], 400);
+        // The memory lane already warns, so the next launch is refused.
+        assert_eq!(v["launchHeadroom"], 0);
+        assert_eq!(v["launchVerdict"], "warn");
         assert_eq!(v["liveContinuations"], 7);
         assert_eq!(v["countCap"], "retired");
 
@@ -20930,6 +23733,9 @@ mod tests {
         assert_eq!(v["enabled"], false);
         assert_eq!(v["memory"], serde_json::Value::Null);
         assert_eq!(v["threads"], serde_json::Value::Null);
+        // No reading, no number: the headroom is UNKNOWN, never 0.
+        assert_eq!(v["launchHeadroom"], serde_json::Value::Null);
+        assert_eq!(v["launchVerdict"], "guard_disabled");
         assert_eq!(v["liveContinuations"], 3);
         assert_eq!(v["reservedSpawns"], 2);
     }
@@ -21240,6 +24046,14 @@ mod drain_claim_tests {
                     target_device_id: None
                 }
             );
+            // Same for a strict-pin wrong_device refusal: the row is held at
+            // its pin, and this device must neither spawn nor defer it.
+            assert_eq!(
+                apply_drain_to_claim(decide_spawn(409, r#"{"error":"wrong_device"}"#), &state),
+                SpawnDecision::SkipWrongDevice {
+                    target_device_id: None
+                }
+            );
         }
     }
 
@@ -21267,6 +24081,38 @@ mod drain_claim_tests {
                 "device_drain:unknown"
             };
             assert_eq!(drain_stamp_reason(class), expected);
+        }
+    }
+
+    /// The claim's "spawn anyway" re-check honours a dispatch role that closes
+    /// the agent lane, with the drain itself clear; an open or absent role
+    /// leaves it exactly as the drain alone decides.
+    #[test]
+    fn a_claim_error_spawn_is_deferred_by_a_closing_dispatch_role() {
+        use crate::coord_drain_state::{DeferClass, DispatchRole};
+        for role in [DispatchRole::CiNode, DispatchRole::Bench] {
+            match apply_drain_to_claim_with_role(
+                decide_spawn(503, ""),
+                &CoordDrainState::Clear,
+                Some(role),
+            ) {
+                SpawnDecision::DeferClaimErrorByDrain { class, .. } => {
+                    assert_eq!(class, DeferClass::RoleClosed, "{role:?}");
+                    assert_eq!(drain_stamp_reason(class), "device_drain:role_closed");
+                }
+                other => panic!("{role:?}: expected a deferral, got {other:?}"),
+            }
+        }
+        for role in [None, Some(DispatchRole::Workhorse)] {
+            assert_eq!(
+                apply_drain_to_claim_with_role(
+                    decide_spawn(503, ""),
+                    &CoordDrainState::Clear,
+                    role
+                ),
+                apply_drain_to_claim(decide_spawn(503, ""), &CoordDrainState::Clear),
+                "{role:?}"
+            );
         }
     }
 
@@ -21411,5 +24257,296 @@ mod gateway_spawn_refusal_tests {
             Ok(_) => panic!("an unresolved gateway must refuse the spawn"),
             Err(err) => assert!(format!("{err:#}").contains("model gateway"), "{err:#}"),
         }
+    }
+}
+
+/// Plan `2026-11-13-spawn-refused-tree-followups` Phase 2: the headless
+/// continuation's gateway refusal, driven end to end through the remover.
+#[cfg(test)]
+mod headless_refusal_tests;
+
+/// Plan `2026-11-08-a-spawn-refused-after-its-worktree-allocation-leaves-the-tree-on-disk`
+/// Phase 3: what the gate-continuation and coord-launch doors hand the remover.
+#[cfg(test)]
+mod unspawned_door_tests {
+    use super::*;
+    use crate::agent_worktree::isolated_edit::IsolatedEditContext;
+    use crate::agent_worktree::remove_unspawned::{TreeProvenance, UnspawnedBase};
+    use crate::commands::terminal::BackendSpawnFailure;
+    use crate::terminal::spawn_refusal::SpawnFailure;
+
+    const ID: &str = "6f1c2a7e-0000-4000-8000-0000000c0a7e";
+
+    fn failure(f: SpawnFailure) -> BackendSpawnFailure {
+        BackendSpawnFailure {
+            failure: f,
+            isolated_ctx: Some(Box::new(IsolatedEditContext::for_test_with_agent_id(
+                ID.to_string(),
+                Vec::new(),
+                Vec::new(),
+            ))),
+        }
+    }
+
+    /// The continuation's failed create hands back its context, unparked, with
+    /// `child_started` true for a post-child failure AND for any failure on a
+    /// retry (a never-started attempt's PTY child already ran in the tree).
+    #[test]
+    fn a_continuation_create_failure_hands_back_the_context_with_its_child_flag() {
+        let (ctx, started, msg) = continuation_create_failure_handoff(
+            failure(SpawnFailure::before_child("resource_guard:critical: low")),
+            1,
+        );
+        assert_eq!(ctx.map(|c| c.agent_id.clone()).as_deref(), Some(ID));
+        assert!(!started, "a pre-child refusal on attempt 1 may be removed");
+        assert_eq!(msg, "resource_guard:critical: low");
+
+        let (_, started, _) =
+            continuation_create_failure_handoff(failure(SpawnFailure::before_child("x")), 2);
+        assert!(started, "a retry's tree already hosted a child");
+
+        let (_, started, _) = continuation_create_failure_handoff(
+            failure(SpawnFailure::after_child("Sessions lock poisoned")),
+            1,
+        );
+        assert!(started, "a post-child failure is never removed");
+    }
+
+    fn base(p: &str) -> UnspawnedBase {
+        UnspawnedBase {
+            worktree_path: PathBuf::from(p),
+            parent_sha: "abc".to_string(),
+            provenance: TreeProvenance::Unrecorded,
+        }
+    }
+
+    /// Review A8a, behavioural: `run_continuation_terminal`'s first exit (no
+    /// Tauri AppHandle — every unit test's state) runs before any create, so it
+    /// takes the continuation's fresh tree back off disk through the REAL
+    /// remover and resolver, with the workspace root pointed at a temp dir.
+    /// The remaining early exits need a live Tauri app; each is held to its
+    /// own removal by `every_other_allocating_door_removes_an_unspawned_allocation`.
+    #[tokio::test]
+    async fn a_continuation_refused_before_its_create_removes_its_fresh_tree() {
+        let _amb = crate::test_env::isolated_ambient();
+        assert!(
+            crate::tauri_app_handle::current().is_none(),
+            "this exit is the no-AppHandle one"
+        );
+        let ws = crate::workspace_paths::runner_workspace_root()
+            .into_root()
+            .expect("the isolated ambient workspace root");
+        let canonical = ws.join("canon");
+        std::fs::create_dir_all(&canonical).unwrap();
+        git(&canonical, &["init", "-q", "-b", "main"]);
+        std::fs::write(canonical.join("README.md"), "hi\n").unwrap();
+        git(&canonical, &["add", "README.md"]);
+        git(&canonical, &["commit", "-q", "-m", "init"]);
+        let sha = git(&canonical, &["rev-parse", "HEAD"]);
+        let agent_id = uuid::Uuid::new_v4();
+        let tree = crate::agent_worktree::canonical_paths::agent_worktree_root(&canonical)
+            .join(agent_id.to_string())
+            .join("canon");
+        let branch = format!("agent/{agent_id}-canon");
+        git(
+            &canonical,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                &branch,
+                tree.to_str().unwrap(),
+                &sha,
+            ],
+        );
+        let mut ctx = IsolatedEditContext::for_test_with_agent_id(
+            agent_id.to_string(),
+            vec![crate::agent_worktree::MaterializedWorktree {
+                repo: "canon".to_string(),
+                branch,
+                parent_sha: sha,
+                worktree_path: tree.clone(),
+                push_ref: String::new(),
+                parent_sha_provenance: Default::default(),
+            }],
+            Vec::new(),
+        );
+        ctx.set_provenance_for_test(
+            &tree,
+            TreeProvenance::FreshWorktree {
+                canonical: canonical.clone(),
+            },
+        );
+        let payload: GateContinuationPayload = serde_json::from_value(serde_json::json!({
+            "target_device_id": "55555555-5555-5555-5555-555555555555",
+            "initial_prompt": "p",
+            "source": GATE_CONTINUATION_SOURCE,
+        }))
+        .expect("a minimal continuation frame");
+
+        let res = run_continuation_terminal(
+            agent_id,
+            &tree.to_string_lossy(),
+            &payload,
+            uuid::Uuid::new_v4(),
+            Some(ctx),
+            AnchorReservation::none(),
+            uuid::Uuid::new_v4(),
+            None,
+        )
+        .await;
+
+        assert!(res.is_err(), "no AppHandle refuses the continuation");
+        assert!(!tree.exists(), "the fresh, unspawned tree was removed");
+    }
+
+    /// A launch whose every attempt failed before a child hands every added
+    /// tree to the remover; one where any child ran hands over none.
+    #[test]
+    fn only_a_launch_no_child_ran_in_hands_its_trees_to_the_remover() {
+        let added = vec![base("/a"), base("/b")];
+        assert_eq!(launch_trees_to_remove(added.clone(), false).len(), 2);
+        assert!(launch_trees_to_remove(added, true).is_empty());
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.email=t@example.invalid",
+                "-c",
+                "user.name=t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?} failed: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Arms the planned-worktree seam through its real caller: a coord launch
+    /// payload is materialized under an isolated workspace root holding a real
+    /// repo, which the source-checkout resolver finds as `<root>/canon`. Of two
+    /// rows, the one whose path already exists is skipped; only the other is
+    /// added, on disk and in the returned bases, cut from that checkout.
+    #[tokio::test]
+    async fn materialize_worktrees_hands_back_only_the_launch_rows_it_added() {
+        let _amb = crate::test_env::isolated_ambient();
+        let ws = crate::workspace_paths::runner_workspace_root()
+            .into_root()
+            .expect("the isolated ambient workspace root");
+        let canonical = ws.join("canon");
+        std::fs::create_dir_all(&canonical).unwrap();
+        git(&canonical, &["init", "-q", "-b", "main"]);
+        std::fs::write(canonical.join("README.md"), "hi\n").unwrap();
+        git(&canonical, &["add", "README.md"]);
+        git(&canonical, &["commit", "-q", "-m", "init"]);
+        let sha = git(&canonical, &["rev-parse", "HEAD"]);
+        assert_eq!(
+            crate::agent_worktree::canonical_paths::worktree_source_checkout("canon").ok(),
+            Some(canonical.clone()),
+            "the resolver finds the repo placed under the isolated root"
+        );
+
+        let agent = uuid::Uuid::new_v4();
+        let base = ws.join("wt").join(agent.to_string());
+        let existing = base.join("existing");
+        std::fs::create_dir_all(&existing).unwrap();
+        let fresh = base.join("canon");
+        let row = |path: &Path, branch: &str| {
+            serde_json::json!({
+                "repo": "canon",
+                "branch": branch,
+                "parent_sha": sha,
+                "worktree_path": path.to_string_lossy(),
+                "status": "allocated",
+            })
+        };
+        let payload: LaunchPayload = serde_json::from_value(serde_json::json!({
+            "agent_id": agent,
+            "target_device_id": uuid::Uuid::new_v4(),
+            "worktrees": [row(&existing, "agent/existing"), row(&fresh, "agent/fresh")],
+            "initial_prompt": "p",
+            "claim_token": "t",
+        }))
+        .expect("a launch payload");
+
+        let mut added = Vec::new();
+        materialize_worktrees(&payload, &mut added)
+            .await
+            .expect("materialized");
+
+        assert_eq!(added.len(), 1, "{added:?}");
+        assert_eq!(added[0].worktree_path, fresh);
+        assert_eq!(added[0].parent_sha, sha);
+        // Structural, not a substring of the Debug render: on Windows `{:?}`
+        // escapes each `\` as `\\`, so a raw path never occurs in it.
+        assert_eq!(
+            added[0].provenance,
+            TreeProvenance::FreshWorktree {
+                canonical: canonical.clone()
+            }
+        );
+        assert!(fresh.join("README.md").exists(), "the added row is on disk");
+        assert!(
+            !existing.join("README.md").exists(),
+            "the existing row is untouched"
+        );
+    }
+
+    /// `materialize_worktrees`' add half records ONLY the rows it actually
+    /// added — an "already exists; skipping add" row is not this call's tree —
+    /// each as a fresh worktree cut from its resolved checkout.
+    #[tokio::test]
+    async fn only_the_rows_a_launch_added_become_removal_bases() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let canonical = tmp.path().join("canon");
+        std::fs::create_dir_all(&canonical).unwrap();
+        git(&canonical, &["init", "-q", "-b", "main"]);
+        std::fs::write(canonical.join("README.md"), "hi\n").unwrap();
+        git(&canonical, &["add", "README.md"]);
+        git(&canonical, &["commit", "-q", "-m", "init"]);
+        let sha = git(&canonical, &["rev-parse", "HEAD"]);
+
+        let existing = tmp.path().join("wt").join(ID).join("existing");
+        std::fs::create_dir_all(&existing).unwrap();
+        let fresh = tmp.path().join("wt").join(ID).join("canon");
+        let row = |path: &Path, branch: &str| AllocatedWorktree {
+            repo: "canon".to_string(),
+            branch: branch.to_string(),
+            parent_sha: sha.clone(),
+            worktree_path: path.to_string_lossy().into_owned(),
+            status: "allocated".to_string(),
+            push_ref: None,
+            parent_sha_provenance: Default::default(),
+        };
+        let skipped = row(&existing, "agent/existing");
+        let added_row = row(&fresh, "agent/fresh");
+        let mut added = Vec::new();
+        add_planned_worktrees(
+            vec![
+                (&skipped, canonical.clone()),
+                (&added_row, canonical.clone()),
+            ],
+            &mut added,
+        )
+        .await
+        .expect("materialized");
+
+        assert_eq!(added.len(), 1, "{added:?}");
+        assert_eq!(added[0].worktree_path, fresh);
+        assert_eq!(added[0].parent_sha, sha);
+        assert_eq!(
+            added[0].provenance,
+            TreeProvenance::FreshWorktree {
+                canonical: canonical.clone()
+            }
+        );
+        assert!(fresh.join("README.md").exists());
     }
 }

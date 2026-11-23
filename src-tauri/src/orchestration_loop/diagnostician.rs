@@ -42,10 +42,12 @@ pub async fn run_diagnostic(
     };
 
     // 3. Check if everything passed
+    // The page-health route answers `summary: OK|WARNING|CRITICAL`; it emits
+    // no `status` key (the error stub above does, as "error").
     let health_ok = page_health
-        .get("status")
+        .get("summary")
         .and_then(|v| v.as_str())
-        .map(|s| s == "healthy" || s == "ok")
+        .map(|s| s == "OK")
         .unwrap_or(false);
 
     let all_assertions_passed = assertion_results

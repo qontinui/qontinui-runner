@@ -221,9 +221,15 @@ export function ZoneLabel({
         </span>
       )}
 
-      {/* F1 — which tenant this session is acting as. Self-hides on
-          single-tenant devices and on tabs with no recorded tenant. */}
-      <TenantBadge tenantId={tab.tenantId} claudeSessionId={tab.claudeSessionId} />
+      {/* F1 — which tenant this session is acting as. Self-hides on a
+          single-tenant device, and when nothing names a tenant: no spawn
+          stamp, no divergence, no resolved acting tenant. Its id is per-zone
+          (`terminal-tenant-badge-<n>`), the same zone as the dropdown below. */}
+      <TenantBadge
+        tenantId={tab.tenantId}
+        claudeSessionId={tab.claudeSessionId}
+        zoneIndex={zoneIndex}
+      />
 
       {/* Remote tab (Phase 4/5): device badge, earlier-output and reattach.
           Renders nothing for a local tab. */}

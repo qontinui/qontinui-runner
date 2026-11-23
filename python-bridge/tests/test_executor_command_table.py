@@ -150,12 +150,14 @@ def test_command_table_matches_snapshot():
     )
 
 
-def test_snapshot_has_114_commands():
+def test_snapshot_has_113_commands():
     # 118 at the move; the two GUI element-capture commands were deleted after
-    # qontinui-runner#2242 removed the html2canvas capture they depended on, and
+    # qontinui-runner#2242 removed the html2canvas capture they depended on,
     # test_results_configure / test_results_status went with the QA-results handler
-    # they drove (see test_no_executor_file_touches_the_deleted_qa_results_handler).
-    assert len(SNAPSHOT.read_text(encoding="utf-8").splitlines()) == 114
+    # they drove (see test_no_executor_file_touches_the_deleted_qa_results_handler), and
+    # `testing_run_test_case` (no sender; it passed a test case with no assertion) by plan
+    # 2026-11-06-a-product-workflow-verification-with-nothing-to-check-never-reports-passed.
+    assert len(SNAPSHOT.read_text(encoding="utf-8").splitlines()) == 113
 
 
 # 2 ---------------------------------------------------------------------------
@@ -416,9 +418,10 @@ def test_build_command_table_rejects_a_mixin_that_is_not_a_base():
 # ``_host.py`` declares ``ExecutorHost`` under ``if TYPE_CHECKING`` only (``object`` at
 # run time), so its method stubs are not runtime definitions and are not counted.
 # 165 at the move, less the five GUI element-capture methods deleted after
-# qontinui-runner#2242 removed the html2canvas capture they depended on, and the two
-# ``_cmd_test_results_*`` handlers deleted with the QA-results handler.
-PRE_MOVE_METHOD_COUNT = 158
+# qontinui-runner#2242 removed the html2canvas capture they depended on, the two
+# ``_cmd_test_results_*`` handlers deleted with the QA-results handler, and
+# `_handle_testing_run_test_case` (see test_snapshot_has_113_commands).
+PRE_MOVE_METHOD_COUNT = 157
 QONTINUI_EXECUTOR_MAX_LINES = 1700
 MIXIN_MAX_LINES = 1000
 

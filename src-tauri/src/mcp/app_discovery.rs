@@ -587,6 +587,10 @@ pub struct ForwardDeviceResponse {
     pub local_port: u16,
     pub device_id: String,
     pub remote_port: u16,
+    /// Whether this runner fetched the phone's pairing token over the new forward,
+    /// which is what lets it reach the same phone over Wi-Fi later. Never the
+    /// token itself.
+    pub pairing: crate::mcp::transport::pairing::LocalPairing,
 }
 
 /// Set up persistent ADB port forwarding for a mobile device.
@@ -621,11 +625,16 @@ async fn forward_device(
         "Persistent port forward: device {} remote {} -> local {}",
         req.device_id, req.remote_port, local_port
     );
+    let pairing = crate::mcp::transport::pairing::pair_over_local_forward(&format!(
+        "http://127.0.0.1:{local_port}"
+    ))
+    .await;
 
     Ok(Json(ApiResponse::success(ForwardDeviceResponse {
         local_port,
         device_id: req.device_id,
         remote_port: req.remote_port,
+        pairing,
     })))
 }
 
@@ -647,11 +656,18 @@ async fn ios_forward(
         .forward_port(&req.udid, req.device_port)
         .await
     {
-        Ok(local_port) => Ok(Json(ApiResponse::success(ForwardDeviceResponse {
-            local_port,
-            device_id: req.udid,
-            remote_port: req.device_port,
-        }))),
+        Ok(local_port) => {
+            let pairing = crate::mcp::transport::pairing::pair_over_local_forward(&format!(
+                "http://127.0.0.1:{local_port}"
+            ))
+            .await;
+            Ok(Json(ApiResponse::success(ForwardDeviceResponse {
+                local_port,
+                device_id: req.udid,
+                remote_port: req.device_port,
+                pairing,
+            })))
+        }
         Err(e) => Ok(Json(ApiResponse::error(format!("iOS forward: {e}")))),
     }
 }
@@ -1287,6 +1303,24 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/ui-bridge/apps/forward-device", post(forward_device))
         .route("/ui-bridge/ios/forward", post(ios_forward))
         .route("/ui-bridge/control/wait-for-app", post(wait_for_app))
+        // `dispatch` answers with the app's own response, so while a
+        // condition-check session holds a secret no response here carries it
+        // (`crate::condition_secrets`, plan
+        // 2026-11-06-a-regression-test-run-is-judged-by-what-it-covered-and-a-silent-run-reads-unknown
+        // Phase 13). LAST, because `Router::layer` wraps only the routes
+        // registered before it.
+        .layer(axum::middleware::from_fn(
+            crate::condition_secrets::scrub_sdk_responses,
+        ))
+        // `dispatch` sends its `params` verbatim to the app and never
+        // substitutes, so while a condition-check session holds a secret a
+        // `{{secret:<ref>}}` placeholder in its request is refused before the
+        // handler runs rather than typed into the app as literal text. It
+        // also checks `control/wait-for-app` (a `/ui-bridge/control/*`
+        // route); every other sibling passes through untouched.
+        .layer(axum::middleware::from_fn(
+            crate::condition_secrets::refuse_unsubstituted_placeholders,
+        ))
 }
 
 // ============================================================================

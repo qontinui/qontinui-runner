@@ -289,11 +289,12 @@ mod tests {
                 capabilities: Vec::new(),
                 port: 0,
             },
-            client: reqwest::Client::new(),
+            client: crate::mcp::sdk_http::SdkHttpClient::unsigned(reqwest::Client::new()),
             connected_at: 0,
             transport_kind: None,
             physical_device_id: None,
             activated_by: None,
+            bearer: crate::mcp::sdk_client::ConnectionBearer::Absent,
         }
     }
 

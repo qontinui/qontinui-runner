@@ -235,6 +235,100 @@ impl PipelineShared {
 }
 
 // =============================================================================
+// Spec Analysis (deterministic) and the pipeline verdict
+// =============================================================================
+
+/// The verification steps a pipeline run will actually execute in this build:
+/// the verification phase's own steps (the shared verification fold keeps
+/// only `phase == "verification"`), less the `dev_mode_only` steps a build
+/// without debug assertions drops (`ExecutionStepConfig::runs_in_build`, the
+/// rule `VerificationExecutor::run_verification` applies). Callers pass
+/// `cfg!(debug_assertions)`.
+fn runnable_verification_steps(
+    steps: &[ExecutionStepConfig],
+    debug_assertions: bool,
+) -> Vec<ExecutionStepConfig> {
+    steps
+        .iter()
+        .filter(|step| {
+            step.phase.as_deref() == Some("verification") && step.runs_in_build(debug_assertions)
+        })
+        .cloned()
+        .collect()
+}
+
+/// The steps among `steps` whose outcome counts toward the verdict
+/// (`ExecutionStepConfig::counts_toward_verdict`: required, `required` absent
+/// counting as required, and checking something). An informational step never
+/// fails a verification, and a `gate` marker or a contentless AI review checks
+/// nothing, so no implementer can make one count and a level made only of them
+/// could never pass the shared fold — they are not acceptance criteria. They
+/// still run in the integration verification, whose fold ignores them.
+fn required_steps(steps: &[ExecutionStepConfig]) -> Vec<ExecutionStepConfig> {
+    steps
+        .iter()
+        .filter(|step| step.counts_toward_verdict())
+        .cloned()
+        .collect()
+}
+
+/// The Spec Analyst's deterministic half: one acceptance criterion per step,
+/// in order, so `criterion_{i}` names `criteria_steps[i]` (the subtree levels
+/// look their steps up by that index). No step, no criterion: "nothing to
+/// verify", which the pipeline never reports as a pass.
+fn derive_criteria(criteria_steps: &[ExecutionStepConfig]) -> Vec<PipelineAcceptanceCriterion> {
+    criteria_steps
+        .iter()
+        .enumerate()
+        .map(|(i, step)| {
+            let step_name = step.name.clone().unwrap_or_else(|| format!("step_{}", i));
+            PipelineAcceptanceCriterion {
+                id: format!("criterion_{}", i),
+                spec_assertion_id: step_name.clone(),
+                spec_group_id: step.id.clone().unwrap_or_default(),
+                description: step_name,
+                criterion_type: "deterministic".to_string(),
+                verification_method: step.step_type.clone(),
+                depends_on: vec![],
+                target_elements: vec![],
+                estimated_complexity: "simple".to_string(),
+                severity: "critical".to_string(),
+                enabled: true,
+            }
+        })
+        .collect()
+}
+
+/// True when at least one item was checked and every one passed. The pipeline's
+/// subtree and goal verdicts fold with this, never a bare `all()`, which is
+/// true over nothing and would read "nothing checked" as a pass.
+fn all_of_at_least_one(passes: impl IntoIterator<Item = bool>) -> bool {
+    let mut checked_any = false;
+    for passed in passes {
+        if !passed {
+            return false;
+        }
+        checked_any = true;
+    }
+    checked_any
+}
+
+/// The pipeline's verdict. With an integration verification it is that
+/// verification's own `all_passed` — the shared fold, under which a set with
+/// no required step is not a pass — never an `all()` recomputed over its step
+/// results, which an empty set would satisfy. Without one, every subtree must
+/// have passed, and at least one must exist: a pass needs something checked.
+fn pipeline_goal_achieved(
+    integration_all_passed: Option<bool>,
+    subtree_results: &[SubtreeResult],
+) -> bool {
+    match integration_all_passed {
+        Some(all_passed) => all_passed,
+        None => all_of_at_least_one(subtree_results.iter().map(|s| s.all_passed)),
+    }
+}
+
+// =============================================================================
 // DAG Construction
 // =============================================================================
 
@@ -695,26 +789,15 @@ impl LoopController {
         info!("MULTI-AGENT-PIPELINE: Phase 1 — Spec Analysis");
 
         let analyst_start = std::time::Instant::now();
-        let criteria: Vec<PipelineAcceptanceCriterion> = verification_steps
-            .iter()
-            .enumerate()
-            .map(|(i, step)| {
-                let step_name = step.name.clone().unwrap_or_else(|| format!("step_{}", i));
-                PipelineAcceptanceCriterion {
-                    id: format!("criterion_{}", i),
-                    spec_assertion_id: step_name.clone(),
-                    spec_group_id: step.id.clone().unwrap_or_default(),
-                    description: step_name,
-                    criterion_type: "deterministic".to_string(),
-                    verification_method: step.step_type.clone(),
-                    depends_on: vec![],
-                    target_elements: vec![],
-                    estimated_complexity: "simple".to_string(),
-                    severity: "critical".to_string(),
-                    enabled: true,
-                }
-            })
-            .collect();
+        // Criteria come from the steps the verification phase will actually
+        // run in this build, and only the required ones: the subtree levels
+        // and the integration verification below run these same lists, so
+        // "nothing to verify" can no longer hide behind criteria derived from
+        // steps that never execute.
+        let runnable_steps =
+            runnable_verification_steps(verification_steps, cfg!(debug_assertions));
+        let criteria_steps = required_steps(&runnable_steps);
+        let criteria = derive_criteria(&criteria_steps);
         let analyst_duration = analyst_start.elapsed().as_millis() as u64;
 
         // Contract validation for spec_analyst output
@@ -814,23 +897,35 @@ impl LoopController {
         pipeline_ctx.spec_results = criteria.clone();
 
         if criteria.is_empty() {
-            info!("MULTI-AGENT-PIPELINE: No criteria derived — nothing to do");
-            return LoopResult {
-                iterations_run: 0,
-                verification_passed: true,
-                max_iterations_reached: false,
-                critical_failure: false,
+            // Nothing to verify is not a pass: `to_loop_result` reads a result
+            // with no criteria as `no_verification_steps`, never
+            // `verification_passed` (served policy
+            // verification-and-evidence/silent-empty-is-unknown).
+            info!(
+                "MULTI-AGENT-PIPELINE: no_criteria_derived — {} verification step(s) given, {} runnable in this build, none required; nothing to verify, which is not a pass",
+                verification_steps.len(),
+                runnable_steps.len(),
+            );
+            return MultiAgentPipelineResult {
+                total_iterations: 0,
+                goal_achieved: false,
                 was_stopped: false,
-                unfixable_errors: false,
-                fix_attempts_exhausted: false,
-                iteration_results: vec![],
-                total_tokens: None,
-                total_cost_usd: None,
-                files_modified: Vec::new(),
-                fix_attempts: 0,
-                ci_auto_resumes: 0,
-                node_rollups: Vec::new(),
-            };
+                max_iterations_reached: false,
+                subtree_results: Vec::new(),
+                integration_result: None,
+                agent_traces,
+                dag: ExecutionDAG {
+                    nodes: HashMap::new(),
+                    roots: Vec::new(),
+                    levels: Vec::new(),
+                    subtrees: Vec::new(),
+                },
+                total_criteria: 0,
+                passed_criteria: 0,
+                total_tokens: 0,
+                total_cost_usd: 0.0,
+            }
+            .to_loop_result();
         }
 
         info!(
@@ -1350,7 +1445,8 @@ Only output the JSON array, nothing else."#,
                             &dag.levels,
                             &located_criteria,
                             &active_prompt_variants,
-                            verification_steps,
+                            // `criterion_{i}` indexes this list (`derive_criteria`).
+                            &criteria_steps,
                             has_agentic_steps,
                             agentic_steps,
                             logger,
@@ -1477,62 +1573,66 @@ Only output the JSON array, nothing else."#,
         }
 
         // ── Phase 6: Integration Verification ───────────────────────────
-        let integration_result = if pipeline_config.integration_verification {
-            info!("MULTI-AGENT-PIPELINE: Phase 6 — Integration Verification (full spec check)");
+        let (integration_result, integration_all_passed) =
+            if pipeline_config.integration_verification {
+                info!("MULTI-AGENT-PIPELINE: Phase 6 — Integration Verification (full spec check)");
 
-            let (int_verification_result, _int_step_results) = self
-                .verification_executor
-                .run_verification(
-                    verification_steps,
-                    &config.execution_id,
-                    total_iterations + 1, // integration is an extra verification pass
-                    &config.workflow_name,
-                    logger,
-                    config.stage_index,
-                )
-                .await;
+                let (int_verification_result, _int_step_results) = self
+                    .verification_executor
+                    .run_verification(
+                        &runnable_steps,
+                        &config.execution_id,
+                        total_iterations + 1, // integration is an extra verification pass
+                        &config.workflow_name,
+                        logger,
+                        config.stage_index,
+                    )
+                    .await;
 
-            let mut integration_criteria: Vec<PipelineCriterionResult> = Vec::new();
-            for step_result in &int_verification_result.step_results {
-                let details = step_result
-                    .verification_details
-                    .as_ref()
-                    .and_then(|vd| vd.stdout.as_ref())
-                    .or(step_result.error.as_ref())
-                    .map(|s| s.chars().take(500).collect::<String>())
-                    .unwrap_or_default();
+                let mut integration_criteria: Vec<PipelineCriterionResult> = Vec::new();
+                // One result per criterion: informational steps ran (their output
+                // is in the verification phase's own results) but are not criteria,
+                // and the verdict below ignores them too.
+                for step_result in int_verification_result
+                    .step_results
+                    .iter()
+                    .filter(|r| r.required != Some(false))
+                {
+                    let details = step_result
+                        .verification_details
+                        .as_ref()
+                        .and_then(|vd| vd.stdout.as_ref())
+                        .or(step_result.error.as_ref())
+                        .map(|s| s.chars().take(500).collect::<String>())
+                        .unwrap_or_default();
 
-                integration_criteria.push(PipelineCriterionResult {
-                    criterion_id: step_result.step_name.clone(),
-                    passed: step_result.success,
-                    method_used: step_result.step_type.clone(),
-                    confidence: if step_result.success { 1.0 } else { 0.0 },
-                    details,
-                    duration_ms: step_result.duration_ms,
-                });
-            }
+                    integration_criteria.push(PipelineCriterionResult {
+                        criterion_id: step_result.step_name.clone(),
+                        passed: step_result.success,
+                        method_used: step_result.step_type.clone(),
+                        confidence: if step_result.success { 1.0 } else { 0.0 },
+                        details,
+                        duration_ms: step_result.duration_ms,
+                    });
+                }
 
-            let int_passed = int_verification_result.all_passed;
-            let int_total = integration_criteria.len();
-            let int_ok = integration_criteria.iter().filter(|c| c.passed).count();
-            info!(
-                "MULTI-AGENT-PIPELINE: Integration verification — {}/{} passed ({})",
-                int_ok,
-                int_total,
-                if int_passed { "ALL PASS" } else { "FAILURES" },
-            );
+                let int_passed = int_verification_result.all_passed;
+                let int_total = integration_criteria.len();
+                let int_ok = integration_criteria.iter().filter(|c| c.passed).count();
+                info!(
+                    "MULTI-AGENT-PIPELINE: Integration verification — {}/{} passed ({})",
+                    int_ok,
+                    int_total,
+                    if int_passed { "ALL PASS" } else { "FAILURES" },
+                );
 
-            Some(integration_criteria)
-        } else {
-            None
-        };
+                (Some(integration_criteria), Some(int_passed))
+            } else {
+                (None, None)
+            };
 
         // ── Build final result ──────────────────────────────────────────
-        let mut goal_achieved = if let Some(ref int_results) = integration_result {
-            int_results.iter().all(|c| c.passed)
-        } else {
-            subtree_results.iter().all(|s| s.all_passed)
-        };
+        let mut goal_achieved = pipeline_goal_achieved(integration_all_passed, &subtree_results);
 
         let passed_criteria = if let Some(ref int_results) = integration_result {
             int_results.iter().filter(|c| c.passed).count() as u32
@@ -1850,7 +1950,6 @@ impl PipelineShared {
         );
 
         let mut subtree_level_results: Vec<SubtreeLevelResult> = Vec::new();
-        let mut subtree_all_passed = true;
         let mut retries_used: u32 = 0;
         let mut local_iterations: u32 = 0;
         let mut local_traces: Vec<PipelineAgentTrace> = Vec::new();
@@ -1885,7 +1984,6 @@ impl PipelineShared {
                         pipeline_config.max_total_iterations,
                         subtree.id
                     );
-                    subtree_all_passed = false;
                     break;
                 }
 
@@ -2345,7 +2443,6 @@ impl PipelineShared {
                         "MULTI-AGENT-PIPELINE: Level {} exhausted retries ({}/{})",
                         level_idx, retries_used, pipeline_config.max_retries_per_subtree
                     );
-                    subtree_all_passed = false;
                     break;
                 }
 
@@ -2386,10 +2483,6 @@ impl PipelineShared {
                     level_idx, retries_used, pipeline_config.max_retries_per_subtree
                 );
             } // end retry loop
-
-            if !level_passed {
-                subtree_all_passed = false;
-            }
 
             subtree_level_results.push(SubtreeLevelResult {
                 level: level_idx as u32,
@@ -2443,12 +2536,18 @@ impl PipelineShared {
             });
         }
 
+        // Every level this subtree verified passed, and it verified at least
+        // one: a subtree none of whose levels held its criteria (each skipped
+        // above) checked nothing, so it did not pass.
+        let all_passed =
+            all_of_at_least_one(subtree_level_results.iter().map(|level| level.passed));
+
         SubtreeOutput {
             result: SubtreeResult {
                 subtree_id: subtree.id.clone(),
                 level_results: subtree_level_results,
                 retries_used,
-                all_passed: subtree_all_passed,
+                all_passed,
                 regressions: vec![],
             },
             traces: local_traces,
@@ -2506,5 +2605,170 @@ pub(super) fn get_file_tree_l0(project_path: &str) -> String {
         _ => {
             format!("(Could not list files in {})", project_path)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn step(name: &str, phase: Option<&str>) -> ExecutionStepConfig {
+        ExecutionStepConfig {
+            step_type: "check".to_string(),
+            name: Some(name.to_string()),
+            phase: phase.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    fn names(steps: &[ExecutionStepConfig]) -> Vec<&str> {
+        steps.iter().filter_map(|s| s.name.as_deref()).collect()
+    }
+
+    fn subtree(id: &str, all_passed: bool) -> SubtreeResult {
+        SubtreeResult {
+            subtree_id: id.to_string(),
+            level_results: Vec::new(),
+            retries_used: 0,
+            all_passed,
+            regressions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn runnable_steps_are_the_verification_phase_steps_this_build_runs() {
+        let mut dev_only = step("dev-only", Some("verification"));
+        dev_only.dev_mode_only = Some(true);
+        let steps = [
+            step("build", Some("verification")),
+            dev_only,
+            step("seed", Some("setup")),
+            step("unphased", None),
+        ];
+
+        assert_eq!(
+            names(&runnable_verification_steps(&steps, false)),
+            vec!["build"]
+        );
+        assert_eq!(
+            names(&runnable_verification_steps(&steps, true)),
+            vec!["build", "dev-only"]
+        );
+        assert!(runnable_verification_steps(&[], true).is_empty());
+    }
+
+    /// The census row: a verification made only of `dev_mode_only` steps runs
+    /// nothing in a published build, so it derives no criteria there — the
+    /// pipeline takes its "nothing to verify" exit instead of an empty `all()`.
+    #[test]
+    fn an_all_dev_mode_only_verification_derives_no_criteria_in_a_published_build() {
+        let mut first = step("dev-a", Some("verification"));
+        first.dev_mode_only = Some(true);
+        let mut second = step("dev-b", Some("verification"));
+        second.dev_mode_only = Some(true);
+        let steps = [first, second];
+
+        let published = runnable_verification_steps(&steps, false);
+        assert!(derive_criteria(&required_steps(&published)).is_empty());
+
+        let dev_build = runnable_verification_steps(&steps, true);
+        assert_eq!(derive_criteria(&required_steps(&dev_build)).len(), 2);
+    }
+
+    #[test]
+    fn informational_steps_are_not_criteria() {
+        let mut lint = step("lint", Some("verification"));
+        lint.required = Some(false);
+        let mut format = step("format", Some("verification"));
+        format.required = Some(false);
+        assert!(required_steps(&[lint.clone(), format.clone()]).is_empty());
+
+        let mut build = step("build", Some("verification"));
+        build.required = Some(true);
+        let test = step("test", Some("verification")); // `required` absent: required
+        assert_eq!(
+            names(&required_steps(&[lint, build, format, test])),
+            vec!["build", "test"]
+        );
+    }
+
+    #[test]
+    fn gates_are_not_criteria() {
+        let mut gate = step("all green", Some("verification"));
+        gate.step_type = "gate".to_string();
+        assert!(required_steps(std::slice::from_ref(&gate)).is_empty());
+        let build = step("build", Some("verification"));
+        assert_eq!(names(&required_steps(&[gate, build])), vec!["build"]);
+    }
+
+    #[test]
+    fn contentless_prompts_are_not_criteria() {
+        let mut unset = step("review", Some("verification"));
+        unset.step_type = "prompt".to_string();
+        let mut empty = step("review again", Some("verification"));
+        empty.step_type = "prompt".to_string();
+        empty.prompt_content = Some(String::new());
+        assert!(required_steps(&[unset.clone(), empty.clone()]).is_empty());
+
+        let mut asked = step("asked", Some("verification"));
+        asked.step_type = "prompt".to_string();
+        asked.prompt_content = Some("Is the save button visible?".to_string());
+        assert_eq!(
+            names(&required_steps(&[unset, asked, empty])),
+            vec!["asked"]
+        );
+    }
+
+    #[test]
+    fn criterion_ids_index_the_steps_their_levels_verify() {
+        assert!(derive_criteria(&[]).is_empty());
+
+        let criteria = derive_criteria(&[
+            step("build", Some("verification")),
+            step("test", Some("verification")),
+        ]);
+        let ids: Vec<&str> = criteria.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["criterion_0", "criterion_1"]);
+        assert_eq!(criteria[0].description, "build");
+        assert_eq!(criteria[1].description, "test");
+    }
+
+    #[test]
+    fn the_integration_verdict_is_the_shared_folds_own() {
+        // An integration that checked nothing reports `all_passed: false`
+        // from the shared fold; the pipeline takes that, whatever the subtrees.
+        assert!(!pipeline_goal_achieved(Some(false), &[subtree("s0", true)]));
+        assert!(pipeline_goal_achieved(Some(true), &[subtree("s0", false)]));
+    }
+
+    /// Plan 2's census (coord finding 902409b1), its process_subtree row: a
+    /// subtree none of whose levels held its criteria
+    /// verified nothing, and the subtree fold read that as passed. The pipeline's
+    /// folds need at least one checked item, and every one passed.
+    #[test]
+    fn nothing_checked_is_not_all_passed() {
+        assert!(!all_of_at_least_one(Vec::<bool>::new()));
+        assert!(all_of_at_least_one([true]));
+        assert!(!all_of_at_least_one([false]));
+        assert!(all_of_at_least_one([true, true, true]));
+        assert!(!all_of_at_least_one([true, false, true]));
+    }
+
+    #[test]
+    fn without_integration_a_pass_needs_at_least_one_passing_subtree() {
+        assert!(!pipeline_goal_achieved(None, &[]));
+        assert!(pipeline_goal_achieved(None, &[subtree("s0", true)]));
+        assert!(pipeline_goal_achieved(
+            None,
+            &[
+                subtree("s0", true),
+                subtree("s1", true),
+                subtree("s2", true)
+            ]
+        ));
+        assert!(!pipeline_goal_achieved(
+            None,
+            &[subtree("s0", true), subtree("s1", false)]
+        ));
     }
 }

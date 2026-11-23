@@ -613,6 +613,18 @@ pub(super) fn extract_first_element_id(data: &serde_json::Value) -> Option<Strin
 
 /// Evaluate a JS expression, trying IPC first then direct WebView eval.
 /// Returns the raw string result from the evaluation.
+///
+/// The direct eval also runs when the frontend's evaluate gate REFUSES the
+/// expression, and that fallback is load-bearing. Every expression here is a
+/// script the runner built, and the gate pattern-matches source text, so a
+/// script that carries a caller's value as escaped string data trips it
+/// without containing any caller code: an exact `page/find-by-text` for
+/// "Connect WebSocket" matches `\bWebSocket\b`. Falling back on a refusal is
+/// safe only under one invariant, which every caller must keep: a caller
+/// value enters these runner-built scripts as escaped string data (`\` and
+/// `'` escaped inside a single-quoted literal) and is never spliced into the
+/// script raw. A raw splice would hand caller code to this unguarded eval,
+/// the path `page/evaluate` closes with `direct_eval_fallback` (page.rs).
 pub(super) async fn evaluate_js_expression(
     state: &Arc<ApiState>,
     expression: &str,

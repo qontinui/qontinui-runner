@@ -3,7 +3,7 @@
  *
  * Informational tutorial explaining the TuriX-CUA inspired visual AI
  * system: multimodal prompts, annotated screenshots, Brain/Actor
- * separation, playbook skills, and progressive memory compression.
+ * separation, project context files, and progressive memory compression.
  */
 
 import type { Tutorial } from "../../../types/tutorial";
@@ -12,7 +12,7 @@ export const multimodalVisionTutorial: Tutorial = {
   id: "multimodal-vision",
   title: "Multimodal Vision Pipeline",
   description:
-    "Understand how qontinui sends annotated screenshots to vision-capable LLMs for intelligent UI analysis. Covers the Brain/Actor two-phase pattern, screenshot annotation, normalized coordinates, domain playbooks, and progressive memory compression.",
+    "Understand how qontinui sends annotated screenshots to vision-capable LLMs for intelligent UI analysis. Covers the Brain/Actor two-phase pattern, screenshot annotation, normalized coordinates, project context files, and progressive memory compression.",
   duration: "12 minutes",
   difficulty: "advanced",
   mode: "contextual",
@@ -24,7 +24,7 @@ export const multimodalVisionTutorial: Tutorial = {
     "Understand how screenshots are annotated with numbered element markers for LLMs",
     "Know the difference between multimodal (API) and text-only (CLI) providers",
     "Understand the Brain/Actor two-phase LLM pattern and when to enable it",
-    "Know how domain playbooks inject contextual knowledge into AI prompts",
+    "Know how .qontinui/contexts/ files put project knowledge into AI prompts, and which prompts include them",
     "Understand progressive memory compression for long-running agentic loops",
   ],
   steps: [
@@ -186,45 +186,43 @@ The Brain/Actor orchestrator is defined in \`orchestrator/brain_actor.rs\`.`,
       estimatedDuration: 2,
     },
     {
-      id: "playbooks",
-      title: "Domain Knowledge Playbooks",
-      content: `**Playbooks** are human-editable markdown files that inject domain-specific knowledge into AI prompts. They answer: *"How do I navigate this specific application?"*
+      id: "project-contexts",
+      title: "Project Knowledge: Context Files",
+      content: `**Context files** are markdown files that put project-specific knowledge into AI prompts. They answer: *"What should the AI know about this project?"*
 
-Store playbooks in \`~/.qontinui/playbooks/\` as \`.md\` files:
+Store them in \`.qontinui/contexts/\` as \`.md\` files. YAML frontmatter is optional:
 
 \`\`\`markdown
 ---
-name: Salesforce Login Flow
-description: How to log into Salesforce
-triggers:
-  - type: url_pattern
-    value: "*.salesforce.com/*"
+category: domain-knowledge
+tags: [salesforce, authentication]
+autoInclude:
+  taskMentions: [salesforce, login]
 ---
 
-## Steps
+## Salesforce Login
 1. Username field has ID "username"
-2. Click "Log In" button after entering credentials
-3. MFA code input appears if required
+2. Click "Log In" after entering credentials
+3. An MFA code input appears if required
 \`\`\`
 
-When the automation target matches a trigger, the playbook content is automatically injected into the workflow generation prompt and the Brain's system prompt.`,
-      details: `### Playbook Trigger Types
+**Workflow generation** reads \`.qontinui/contexts/\` in the **runner's own working directory**, not in the target app's project, and includes **every** \`.md\` file it finds there, whatever its \`autoInclude\` says.`,
+      details: `### Which prompts include context files
 
-| Type | Match Logic | Example |
-|------|------------|---------|
-| \`app_name\` | Case-insensitive contains | \`"Salesforce"\` matches "Salesforce Lightning" |
-| \`url_pattern\` | Segment-based glob | \`"*.salesforce.com/*"\` matches any Salesforce URL |
-| \`tag\` | Exact match | \`"crm"\` matches workflows tagged "crm" |
+| Prompt | What it includes | \`autoInclude\` |
+|--------|------------------|---------------|
+| Workflow generation | Every \`.qontinui/contexts/*.md\`, plus the rule files it finds (\`CLAUDE.md\` and \`AGENTS.md\`, at the root and in subdirectories, \`.cursorrules\`, \`.cursor/rules/*.mdc\`), all from the runner's working directory | Not evaluated: every file is included |
+| Agentic verification (verifier and worker) | Context files whose \`autoInclude.taskMentions\` appear in the goal, plus the rule files above, narrowed by any \`filePatterns\` to the files touched so far. Read from the task's project path when one is set, else from the runner's working directory | Evaluated |
+| AI sessions | The contexts the session request names, plus, when it turns auto-include on, context files whose \`autoInclude.taskMentions\` appear in the prompt or whose \`actionTypes\` match an action type in the loaded configuration. Read from the runner's working directory | Evaluated only with auto-include on |
+| Brain (Brain/Actor mode) | No context files: only the goal, the element index, the UI state, recorded findings and, when one is captured, the annotated screenshot | — |
 
-Playbooks with no triggers are always included (universal domain knowledge).
+**Size cap:** all project and rule-file contexts together are capped at 80,000 characters. Content past the cap is truncated with a marker, never silently dropped.
 
-**Token Budget:** Playbook content is truncated to 2000 chars in workflow generation and 1500 chars in Brain prompts to prevent context bloat.
-
-**Storage:** Playbooks extend the existing SkillTemplate system with a \`Playbook\` variant. They appear on the Skills page alongside step-template skills.`,
+**Frontmatter:** \`name\` overrides the file-stem name; \`category\`, \`tags\` and \`autoInclude\` (\`taskMentions\`, \`actionTypes\`, \`errorPatterns\`, \`filePatterns\`) are all optional.`,
       tips: [
-        "Playbooks are loaded from ~/.qontinui/playbooks/ at prompt assembly time",
-        "Multiple playbooks can match simultaneously — all matched content is injected",
-        "The YAML frontmatter parser is in skills/playbook_parser.rs",
+        "Workflow generation reads the runner's working directory, so start the runner from your project to have its contexts included",
+        "A context with no autoInclude is still included in workflow generation, but never in agentic verification, which includes a context only when its taskMentions appear in the goal",
+        "Nothing reads the old ~/.qontinui/playbooks/ directory: move those files into .qontinui/contexts/",
       ],
       estimatedDuration: 1,
     },
@@ -308,7 +306,7 @@ CascadeDetector ────→ DetectedElement ──→ annotated screenshot
 - \`vision/annotator.rs\` — Screenshot annotation engine
 - \`vision/element_collector.rs\` — Element collection from UI Bridge / cascade
 - \`orchestrator/brain_actor.rs\` — Two-phase LLM orchestration
-- \`skills/playbook_parser.rs\` — Markdown playbook loading
+- \`context/project_contexts.rs\` — \`.qontinui/contexts/\` and rule-file loading
 - \`orchestrator/compression.rs\` — Progressive memory compression`,
       details: `### Backend File Map
 
@@ -326,7 +324,7 @@ CascadeDetector ────→ DetectedElement ──→ annotated screenshot
 | Compression | \`orchestrator/compression.rs\` | summarize_iterations_with_llm() |
 | Loop Integration | \`agentic_verification_loop.rs\` | Brain/Actor wiring in main loop |
 | Health Monitor | \`health_monitor.rs\` | VerifierUiContext + element extraction |
-| Playbooks | \`skills/playbook_parser.rs\` | parse_playbook(), playbooks_for_context() |
+| Project Contexts | \`context/project_contexts.rs\` | load_project_contexts_from_dir(), get_project_contexts() |
 | Click Overlay (UI Bridge) | \`ui-bridge/debug/click-highlight.ts\` | showClickHighlight() |
 | Click Overlay (Black-box) | \`click_overlay.rs\` | Tauri transparent overlay window |`,
       estimatedDuration: 2,
@@ -340,7 +338,7 @@ CascadeDetector ────→ DetectedElement ──→ annotated screenshot
 - Screenshots are annotated with numbered colored markers for LLM consumption
 - API providers (Claude API, Gemini API) support vision; CLI providers fall back to text
 - The Brain/Actor pattern splits expensive vision reasoning from cheap action execution
-- Domain playbooks inject application-specific knowledge via markdown files
+- \`.qontinui/contexts/\` files put project knowledge into workflow generation and agentic verification prompts
 - Progressive compression keeps iteration history under 4000 chars
 - Click highlights provide real-time visual feedback during automation
 

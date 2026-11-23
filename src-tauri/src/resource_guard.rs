@@ -2483,12 +2483,38 @@ pub(crate) fn lane_verdicts() -> Option<LaneVerdicts> {
     // behaviour-neutral BY CONSTRUCTION: the verdict below still consults the
     // commit figure and only the commit figure. Phase 2 is what gives the
     // physical reading a floor of its own; do not add one here.
-    let (lane, free_commit_bytes, free_phys_bytes) =
-        crate::fleet::resource_sample::spawn_gate_reading();
-    let floors = effective_session_floors(&local, lane);
+    Some(lane_verdicts_given(
+        &local,
+        crate::fleet::resource_sample::spawn_gate_reading(),
+    ))
+}
+
+/// [`lane_verdicts`] over a memory reading the caller ALREADY took — the
+/// `(lane, free commit, free physical)` triple
+/// [`crate::fleet::resource_sample::spawn_gate_reading`] returns. The host-lane
+/// sampler passes the one `memory_status()` it publishes, so the launch
+/// capacity on a sample is judged against the very memory figures that sample
+/// carries (plan `2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling`
+/// Phase 2). `None` when the session guard is disabled, as [`lane_verdicts`].
+pub(crate) fn lane_verdicts_with_memory(
+    memory: (&'static str, Option<u64>, Option<u64>),
+) -> Option<LaneVerdicts> {
+    let local = crate::settings::get_session_guard_settings();
+    if !local.enabled {
+        return None;
+    }
+    Some(lane_verdicts_given(&local, memory))
+}
+
+/// Both lanes over one memory reading and the live thread reading.
+fn lane_verdicts_given(
+    local: &SessionGuardSettings,
+    (lane, free_commit_bytes, free_phys_bytes): (&'static str, Option<u64>, Option<u64>),
+) -> LaneVerdicts {
+    let floors = effective_session_floors(local, lane);
     let memory = evaluate(lane, free_commit_bytes, &floors);
-    let threads = thread_lane_verdict(&local);
-    Some(LaneVerdicts {
+    let threads = thread_lane_verdict(local);
+    LaneVerdicts {
         memory_lane: lane,
         free_commit_bytes,
         free_phys_bytes,
@@ -2496,7 +2522,7 @@ pub(crate) fn lane_verdicts() -> Option<LaneVerdicts> {
         critical_free_commit_bytes: floors.critical_free_commit_bytes,
         memory,
         threads,
-    })
+    }
 }
 
 /// The composed (heavier-lane) verdict of a [`LaneVerdicts`], without the
@@ -2884,10 +2910,12 @@ pub(crate) fn admit_spawn(
 /// isolated git worktree first: under `QONTINUI_AGENT_WORKTREE_MODE`,
 /// `acquire_for_terminal` runs a `git worktree add`, takes a coord claim, starts
 /// a heartbeat task and shells out to `git config` for the credential helper. On
-/// a CRITICAL refusal all of that is thrown away, and `IsolatedEditContext::Drop`
-/// releases the claim but does NOT remove the materialized worktree — so every
-/// refusal leaks a directory, and the operator's "Start anyway" retry materializes
-/// a second one. Refusing before the acquisition costs one
+/// a CRITICAL refusal all of that is thrown away. `IsolatedEditContext::Drop`
+/// releases the claim but does not remove the materialized worktree; the door's
+/// `IsolatedEditContext::remove_unspawned` takes a pre-child refusal's fresh,
+/// empty tree back off disk, but only after a `git worktree add` and a removal
+/// both ran — and the operator's "Start anyway" retry materializes a second
+/// one. Refusing before the acquisition costs one
 /// `GlobalMemoryStatusEx` call plus — at most once per
 /// [`crate::health_monitor::THREAD_READING_TTL`], and in practice never here,
 /// because [`admit_spawn`] takes the same reading milliseconds later — one
@@ -3392,6 +3420,19 @@ where
         tracing::callsite::rebuild_interest_cache();
         f()
     })
+}
+
+/// Test-only: the exact refusal text [`precheck_spawn`] and [`admit_spawn`]
+/// return on a CRITICAL verdict, produced by the real [`evaluate`] →
+/// [`critical_refusal`] pair over the shipped defaults with no free commit at
+/// all. For the doors that type this refusal, so a reworded producer cannot
+/// drift away from their answer silently.
+#[cfg(test)]
+pub(crate) fn critical_refusal_fixture(what: &str) -> String {
+    match evaluate("host", Some(0), &SessionGuardSettings::default()) {
+        SpawnGate::Critical(observation) => critical_refusal(what, &observation),
+        other => panic!("zero free commit must be CRITICAL under the defaults, got {other:?}"),
+    }
 }
 
 /// Test-only: run `f` with a scoped `tracing` subscriber and return what it

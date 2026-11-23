@@ -619,22 +619,31 @@ pub(crate) fn read_paired_binding_tenant_ids_at(path: &std::path::Path) -> Vec<u
 ///
 /// No-op if the file doesn't exist (the JWT-claim path only fires
 /// when SOMETHING was paired previously, but we tolerate the race
-/// where pair-state was wiped between read and write). Returns
+/// where pair-state was wiped between read and write). `Ok(true)` means the
+/// file was rewritten, `Ok(false)` that nothing needed writing. Returns
 /// `Err(String)` on filesystem failures so the caller can log them
 /// at `debug!` — the outer flow proceeds either way.
 ///
 /// Scheduled for deletion in Phase 10 item 4 (with the echo-heal).
-pub fn backfill_paired_tenant_id(tenant_id: &uuid::Uuid) -> Result<(), String> {
+pub fn backfill_paired_tenant_id(tenant_id: &uuid::Uuid) -> Result<bool, String> {
     let path = paired_user_path().ok_or_else(|| "could not resolve data_local_dir".to_string())?;
+    backfill_paired_tenant_id_at(&path, tenant_id)
+}
+
+/// [`backfill_paired_tenant_id`] against an explicit `paired_user.json` path.
+fn backfill_paired_tenant_id_at(
+    path: &std::path::Path,
+    tenant_id: &uuid::Uuid,
+) -> Result<bool, String> {
     // The same lock every other `paired_user.json` writer holds, so this
     // read-modify-write cannot interleave with a pairing, a reconcile or a
     // heal and silently discard (or resurrect) its change.
-    let _lock = lock_binding_reconcile(&path, RECONCILE_LOCK_WAIT)?;
-    let bytes = match std::fs::read(&path) {
+    let _lock = lock_binding_reconcile(path, RECONCILE_LOCK_WAIT)?;
+    let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // No paired file → nothing to backfill. Quiet success.
-            return Ok(());
+            return Ok(false);
         }
         Err(e) => return Err(format!("read {}: {e}", path.display())),
     };
@@ -643,14 +652,14 @@ pub fn backfill_paired_tenant_id(tenant_id: &uuid::Uuid) -> Result<(), String> {
     if parsed.is_v2() {
         // v2 file: the binding set is reconciled against coord's
         // `tenant_ids` (Phase 8a); the single-value heal must not touch it.
-        return Ok(());
+        return Ok(false);
     }
     if parsed.tenant_id.as_deref() == Some(tenant_id.to_string().as_str()) {
         // Already up-to-date; avoid an unnecessary disk write.
-        return Ok(());
+        return Ok(false);
     }
     parsed.tenant_id = Some(tenant_id.to_string());
-    write_paired_user_file(&path, &parsed)
+    write_paired_user_file(path, &parsed).map(|()| true)
 }
 
 // ============================================================================
@@ -1684,6 +1693,19 @@ pub enum PairedUserHeal {
     /// thread or process held it past the wait. NOTHING was measured or
     /// written; the next tick retries. Never read as a refusal: no guard ran.
     Deferred(String),
+}
+
+impl PairedUserHeal {
+    /// The pass rewrote `paired_user.json`, so the binding set may have moved.
+    pub fn wrote(&self) -> bool {
+        // Exhaustive, so a new variant has to say whether it writes.
+        match self {
+            Self::Healed { .. } => true,
+            Self::NotNeeded | Self::NothingToHealFrom | Self::Refused(_) | Self::Deferred(_) => {
+                false
+            }
+        }
+    }
 }
 
 /// Why `paired_user.json` at `path` needs healing — `Ok(None)` when it does
@@ -3904,6 +3926,68 @@ pub(crate) fn persist_pairing_with(
 // ============================================================================
 // Tests
 // ============================================================================
+
+#[cfg(test)]
+mod backfill_reports_a_write_tests {
+    use super::*;
+
+    /// Callers announce a binding change on `wrote()`, so only a rebuild says so.
+    #[test]
+    fn only_a_rebuilt_file_counts_as_a_heal_write() {
+        let healed = PairedUserHeal::Healed {
+            cause: "absent",
+            tenants: vec![uuid::Uuid::from_u128(7)],
+            default_tenant: uuid::Uuid::from_u128(7),
+        };
+        assert!(healed.wrote());
+        for quiet in [
+            PairedUserHeal::NotNeeded,
+            PairedUserHeal::NothingToHealFrom,
+            PairedUserHeal::Refused("r".into()),
+            PairedUserHeal::Deferred("d".into()),
+        ] {
+            assert!(!quiet.wrote(), "{quiet:?}");
+        }
+    }
+
+    /// The heartbeat announces a binding change on `Ok(true)` alone, so the
+    /// backfill must say `true` exactly when it rewrote the file.
+    #[test]
+    fn the_legacy_backfill_reports_true_only_when_it_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("paired_user.json");
+        let tenant = uuid::Uuid::from_u128(7);
+        assert_eq!(
+            backfill_paired_tenant_id_at(&path, &tenant),
+            Ok(false),
+            "absent"
+        );
+
+        std::fs::write(&path, r#"{"user_id":"u","tenant_id":"other"}"#).unwrap();
+        assert_eq!(
+            backfill_paired_tenant_id_at(&path, &tenant),
+            Ok(true),
+            "legacy, stale"
+        );
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(written["tenant_id"], serde_json::json!(tenant.to_string()));
+        assert_eq!(
+            backfill_paired_tenant_id_at(&path, &tenant),
+            Ok(false),
+            "up to date"
+        );
+
+        let v2 = format!(r#"{{"user_id":"u","default_tenant_id":"{tenant}"}}"#);
+        std::fs::write(&path, v2).unwrap();
+        let other = uuid::Uuid::from_u128(8);
+        assert_eq!(
+            backfill_paired_tenant_id_at(&path, &other),
+            Ok(false),
+            "v2 untouched"
+        );
+    }
+}
 
 /// Regression cover for plan
 /// `2026-08-06-device-identity-is-per-profile-not-per-machine` Phase 2(a):
@@ -7111,8 +7195,11 @@ mod one_binding_store_tests {
 
         // Canonical = the LEGACY copy (an instance-scoped runner pointed at
         // `%APPDATA%`); the other computed path is the live v2 default.
-        let report =
-            converge_binding_store_with(&b.roaming_legacy, &[b.local.clone()], &credentialed);
+        let report = converge_binding_store_with(
+            &b.roaming_legacy,
+            std::slice::from_ref(&b.local),
+            &credentialed,
+        );
 
         assert!(report.wrote_canonical, "canonical must be rewritten");
         assert!(
@@ -7320,7 +7407,8 @@ mod one_binding_store_tests {
         );
         write(&other, "{ this is not json");
 
-        let report = converge_binding_store_with(&canonical, &[other.clone()], &credentialed);
+        let report =
+            converge_binding_store_with(&canonical, std::slice::from_ref(&other), &credentialed);
         assert_eq!(report.unreadable, vec![other.clone()]);
         assert!(report.retained.is_empty(), "an unread copy is not absorbed");
         assert!(other.exists(), "and it is left in place");
@@ -7340,7 +7428,8 @@ mod one_binding_store_tests {
         let other = tmp.path().join("other/paired_user.json");
         write(&other, &v2("2026-07-21T09:00:00Z", "2026-07-21T09:00:00Z"));
 
-        let report = converge_binding_store_with(&canonical, &[other.clone()], &credentialed);
+        let report =
+            converge_binding_store_with(&canonical, std::slice::from_ref(&other), &credentialed);
         assert_eq!(report, BindingStoreMergeReport::default());
         assert!(!canonical.exists());
         assert!(other.exists(), "and the other copy is left alone");
@@ -7433,7 +7522,7 @@ mod converge_retains_every_absorbed_copy_tests {
 
         let report = converge_binding_store_with(
             &instance,
-            &[primary.clone()],
+            std::slice::from_ref(&primary),
             &|_t: &uuid::Uuid, _d: bool| Some(true),
         );
 
@@ -7474,7 +7563,7 @@ mod converge_retains_every_absorbed_copy_tests {
 
         let report = converge_binding_store_with(
             &canonical,
-            &[canonical.clone()],
+            std::slice::from_ref(&canonical),
             &|_t: &uuid::Uuid, _d: bool| Some(true),
         );
 

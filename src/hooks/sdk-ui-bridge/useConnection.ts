@@ -7,9 +7,28 @@
 
 import { useState, useCallback, useEffect } from "react";
 import type { ConnectionStatus } from "./types";
-import type { SdkAppInfo } from "./types";
+import type { SdkAppInfo, SdkConnectionInfo } from "./types";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 import { describeThrown } from "@/lib/utils";
+
+/** The key every entry of the connections map is stored under. */
+export function normalizeUrl(url: string): string {
+  return url.replace(/\/+$/, "");
+}
+
+/**
+ * The connections map rebuilt from a runner listing. A connection whose client
+ * would send the operator's bearer off this machine is left out: the runner
+ * never dispatches through it, and drops it on a switch to its URL.
+ */
+export function switchableConnections(listed: SdkConnectionInfo[]): Map<string, SdkAppInfo> {
+  const map = new Map<string, SdkAppInfo>();
+  for (const conn of listed) {
+    if (conn.sendsBearerOffMachine) continue;
+    map.set(normalizeUrl(conn.url), conn.app);
+  }
+  return map;
+}
 
 export interface UseConnectionReturn {
   connectionStatus: ConnectionStatus;
@@ -71,7 +90,7 @@ export function useConnection(
         // Add to connections map
         setConnections((prev) => {
           const next = new Map(prev);
-          next.set(url.replace(/\/+$/, ""), data.app);
+          next.set(normalizeUrl(url), data.app);
           return next;
         });
 
@@ -112,7 +131,7 @@ export function useConnection(
         // Remove specific connection from map
         setConnections((prev) => {
           const next = new Map(prev);
-          next.delete(url.replace(/\/+$/, ""));
+          next.delete(normalizeUrl(url));
           return next;
         });
       } else {
@@ -136,13 +155,13 @@ export function useConnection(
         const statusResp = await tracedFetch(`${getApiBase()}/ui-bridge/sdk/status`);
         const statusJson = await statusResp.json();
         if (statusJson.success && statusJson.data) {
-          const data = statusJson.data;
+          const data = statusJson.data as {
+            connected: boolean;
+            app?: SdkAppInfo;
+            allConnections?: SdkConnectionInfo[];
+          };
           // Rebuild connections map from server
-          const newConnections = new Map<string, SdkAppInfo>();
-          for (const conn of data.allConnections || []) {
-            newConnections.set(conn.url, conn.app);
-          }
-          setConnections(newConnections);
+          setConnections(switchableConnections(data.allConnections ?? []));
 
           if (data.connected && data.app) {
             setConnectedApp(data.app);
@@ -215,12 +234,7 @@ export function useConnection(
           connected: boolean;
           app?: SdkAppInfo;
           url?: string;
-          allConnections?: Array<{
-            url: string;
-            app: SdkAppInfo;
-            connectedAt: number;
-            isActive: boolean;
-          }>;
+          allConnections?: SdkConnectionInfo[];
         };
 
         if (data.connected && data.app) {
@@ -229,13 +243,7 @@ export function useConnection(
 
           // Hydrate connections map
           if (data.allConnections) {
-            setConnections(() => {
-              const map = new Map<string, SdkAppInfo>();
-              for (const conn of data.allConnections!) {
-                map.set(conn.url.replace(/\/+$/, ""), conn.app);
-              }
-              return map;
-            });
+            setConnections(switchableConnections(data.allConnections));
           }
         }
       } catch {
@@ -274,7 +282,7 @@ export function useConnection(
           setConnections((prev) => {
             const next = new Map(prev);
             for (const url of data.staleRemoved) {
-              next.delete(url);
+              next.delete(normalizeUrl(url));
             }
             return next;
           });

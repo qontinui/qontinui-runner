@@ -149,9 +149,17 @@ vi.mock("../ZoneHoverActions", () => ({
     return null;
   },
 }));
+// Mirrors the product's null rule (`SessionInfoDropdown.tsx`: no Claude
+// session, no trigger), pinned at source level in the stand-in describe below,
+// so a strip rendered for a plain shell is seen to carry no dropdown.
 vi.mock("../SessionInfoDropdown", () => ({
-  SessionInfoDropdown: ({ zoneIndex }: { zoneIndex: number }) =>
-    createElement("span", { "data-session-info-zone": zoneIndex }),
+  SessionInfoDropdown: ({
+    zoneIndex,
+    claudeSessionId,
+  }: {
+    zoneIndex: number;
+    claudeSessionId?: string;
+  }) => (claudeSessionId ? createElement("span", { "data-session-info-zone": zoneIndex }) : null),
 }));
 vi.mock("../ZonePromptsPanel", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../ZonePromptsPanel")>()),
@@ -166,7 +174,13 @@ vi.mock("../useSessionReview", () => ({
   useSessionReview: () => ({ changes: null, review: null }),
 }));
 vi.mock("../sessionReviewView", () => ({ reviewBadgeState: () => null }));
-vi.mock("../TenantBadge", () => ({ TenantBadge: () => null }));
+// A zone marker in place of the badge; the real `tenantBadgeRendersWithoutSession`
+// stays, since `ZoneCell` computes its strip predicate with it.
+vi.mock("../TenantBadge", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../TenantBadge")>()),
+  TenantBadge: ({ zoneIndex }: { zoneIndex: number }) =>
+    createElement("span", { "data-tenant-badge-zone": zoneIndex }),
+}));
 vi.mock("../RemoteTabControls", () => ({ RemoteTabControls: () => null }));
 vi.mock("../useTerminalWindowActions", () => ({
   useTerminalWindowActions: () => ({ popOutTab: () => Promise.resolve() }),
@@ -207,6 +221,7 @@ function cellPropsFor(tabs: TerminalTab[], shown: string): ZoneCellSharedProps {
     onTitleChange: noop,
     onAssignTab: noop,
     showLabels: false,
+    tenantSwitcherShown: false,
     isMultiZone: false,
     autoCompact: false,
     forceCompact: false,
@@ -354,10 +369,15 @@ describe("tmux cells — keep-mounted swap", () => {
   });
 
   it("renders zone chrome only on the shown pane — every parked cell is zone 0 too", () => {
-    show(tabs, "a");
-    // One header's session-info trigger for the whole viewport: chrome on a
-    // parked cell would register a second `…-0` UI Bridge id.
+    // Sessions on every tab, so each cell WOULD render a trigger if it had chrome.
+    show(
+      tabs.map((t) => ({ ...t, claudeSessionId: `sess-${t.id}` })),
+      "a",
+    );
+    // One header's session-info trigger and tenant badge for the whole
+    // viewport: chrome on a parked cell would register a second `…-0` id.
     expect(container.querySelectorAll("[data-session-info-zone]")).toHaveLength(1);
+    expect(container.querySelectorAll("[data-tenant-badge-zone]")).toHaveLength(1);
     expect(container.querySelectorAll("[data-zone-index]")).toHaveLength(1);
   });
 
@@ -459,6 +479,68 @@ describe("grid cells — one mount per tab", () => {
   });
 });
 
+describe("grid cells — the single-zone strip carries the tenant badge (plan 2026-11-08-tenant-badge-parity-and-oracle-fixtures D2)", () => {
+  const TENANT = "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a";
+
+  /** A one-terminal page: one zone, no `ZoneLabel` (`showLabels` false). */
+  function renderSolo(tab: TerminalTab, tenantSwitcherShown: boolean) {
+    const tabs = [tab];
+    const assignments: ZoneAssignments = { 0: tab.id };
+    act(() => {
+      root.render(
+        createElement(
+          "div",
+          { "data-terminal-work-mode": "grid" },
+          buildZoneCells({
+            workMode: "grid",
+            zones: [{ col: "1", row: "1" }],
+            cellProps: {
+              ...cellPropsFor(tabs, tab.id),
+              assignments,
+              tabClassification: classifyTabs(tabs, assignments, false, new Set(), "grid"),
+              isMultiZone: false,
+              showLabels: false,
+              isSingleView: true,
+              tenantSwitcherShown,
+            },
+            shownTabId: null,
+            maximizedZone: null,
+            cosmeticZoneFor: (zoneIdx) => zoneIdx,
+            promptTabs: new Set<string>(),
+            reviewTabs: new Set<string>(),
+            dropTargetZone: null,
+          }),
+        ),
+      );
+    });
+  }
+
+  it("a one-zone grid with a session renders the badge, then the dropdown, in the strip", () => {
+    renderSolo({ ...pty("a"), claudeSessionId: "sess-a", tenantId: TENANT }, true);
+    // No ZoneLabel on a one-terminal page: this is the strip.
+    expect(container.querySelectorAll("[data-zone-index]")).toHaveLength(0);
+    const badges = container.querySelectorAll('[data-tenant-badge-zone="0"]');
+    const dropdowns = container.querySelectorAll('[data-session-info-zone="0"]');
+    expect(badges).toHaveLength(1);
+    expect(dropdowns).toHaveLength(1);
+    // Same row, in ZoneLabel's order: badge before dropdown.
+    expect(badges[0].parentElement).toBe(dropdowns[0].parentElement);
+    expect(badges[0].nextElementSibling).toBe(dropdowns[0]);
+  });
+
+  it("a stamped plain shell on a multi-bound device gets the strip for its badge, with no dropdown", () => {
+    renderSolo({ ...pty("a"), tenantId: TENANT }, true);
+    expect(container.querySelectorAll('[data-tenant-badge-zone="0"]')).toHaveLength(1);
+    expect(container.querySelectorAll("[data-session-info-zone]")).toHaveLength(0);
+  });
+
+  it("the same shell on a single-binding device renders no strip", () => {
+    renderSolo({ ...pty("a"), tenantId: TENANT }, false);
+    expect(container.querySelectorAll("[data-tenant-badge-zone]")).toHaveLength(0);
+    expect(container.querySelectorAll("[data-session-info-zone]")).toHaveLength(0);
+  });
+});
+
 describe("tmux cells — WebGL context cap", () => {
   // Two more PTY panes than the cap: mounting them evicts the two oldest
   // parked panes (t1, t2) to Canvas.
@@ -514,6 +596,11 @@ describe("the stand-in pane matches the code it stands in for", () => {
       /useEffect\(\(\) => \{\s*paneServiceRef\.current\?\.setVisible\(visible\);\s*setWebglSlotVisible\(terminalId, visible\);\s*\}, \[visible, terminalId\]\);/,
     );
     expect(instance).toContain("setWebglSlotVisible(terminalId, visibleRef.current);");
+  });
+
+  it("SessionInfoDropdown renders nothing for a tab with no Claude session, as the stand-in does", () => {
+    const dropdown = readFileSync(resolve(__dirname, "../SessionInfoDropdown.tsx"), "utf8");
+    expect(dropdown).toContain("if (!claudeSessionId) return null;");
   });
 
   it("XtermBackend claims its slot with an eviction AND a restore path", () => {
@@ -669,6 +756,48 @@ describe("grid cells — the maximized view", () => {
     expect(container.querySelector("[aria-label='Previous terminal']")).not.toBeNull();
     // No zone chrome: the maximized header carries the session's info trigger.
     expect(container.querySelectorAll("[data-zone-index]")).toHaveLength(0);
+  });
+
+  it("the maximized header carries the tenant badge under the maximized zone's index", () => {
+    const tabs = [pty("a"), pty("b"), { ...pty("c"), claudeSessionId: "sess-c" }];
+    const assignments: ZoneAssignments = { 0: "a", 1: "b", 2: "c" };
+    act(() => {
+      root.render(
+        createElement(
+          "div",
+          { "data-terminal-work-mode": "grid" },
+          buildZoneCells({
+            workMode: "grid",
+            zones: [...zones, { col: "3", row: "1" }],
+            cellProps: {
+              ...cellPropsFor(tabs, "unused"),
+              assignments,
+              tabClassification: classifyTabs(tabs, assignments, false, new Set(), "grid"),
+              isMultiZone: true,
+              showLabels: true,
+              isSingleView: true,
+            },
+            shownTabId: null,
+            maximizedZone: 2,
+            maximizedNav: {
+              prevZone: null,
+              nextZone: null,
+              onGoToZone: noop,
+              onDeleteAndForward: noop,
+            },
+            cosmeticZoneFor: (zoneIdx) => zoneIdx,
+            promptTabs: new Set<string>(),
+            reviewTabs: new Set<string>(),
+            dropTargetZone: null,
+          }),
+        ),
+      );
+    });
+    expect(container.textContent).toContain("Maximized");
+    // The parked zones hide their chrome, so the header's badge is the only one.
+    expect(container.querySelectorAll("[data-tenant-badge-zone]")).toHaveLength(1);
+    expect(container.querySelectorAll('[data-tenant-badge-zone="2"]')).toHaveLength(1);
+    expect(container.querySelectorAll('[data-session-info-zone="2"]')).toHaveLength(1);
   });
 
   it("an empty maximized zone shows its placeholder", () => {

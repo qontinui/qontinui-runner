@@ -39,6 +39,17 @@ This loop's PRIMARY stops are organic: clean run and no-progress stall (the two 
 
 Each iteration is a single round-trip through three subagent calls. Do NOT inline any of these in the main context.
 
+**Pass `effort` on every Agent call below** (served policy `production-and-cost`
+`spawn-effort-profiles`). Read
+`agent_playbook/spawn-effort-profiles` with
+`/policy get agent_playbook spawn-effort-profiles`; never take the level
+from this file or from memory. The test-and-plan subagent's deliverable is
+knowledge, so it passes the `research` profile's effort. The remediation and
+commit subagents' deliverable is a change meant to merge, so they pass the
+`implementation` profile's effort. If the playbook cannot be read, or the Agent tool has no `effort` parameter
+(it has none while `CLAUDE_CODE_EFFORT_LEVEL` is set), pass none and say so in
+the report. Never guess a level.
+
 #### 1. Test-and-plan subagent
 
 Launch one Agent (subagent_type: `general-purpose`) with this contract:

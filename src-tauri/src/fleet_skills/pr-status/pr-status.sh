@@ -11,8 +11,10 @@
 # Usage:
 #   pr-status.sh --mine
 #   pr-status.sh --repo qontinui/qontinui-runner --number 676
+#   pr-status.sh --repo qontinui/qontinui-runner --head-branch my-branch
 #
-# Emits the raw PrStatusCard JSON (one object, or an array for --mine) to
+# Emits the raw PrStatusCard JSON (one object, an array for --mine, or a
+# {cards, unservable, note} object for --head-branch) to
 # stdout; the caller renders it. Never fabricate a status — if every transport
 # fails, print the error and stop.
 #
@@ -31,12 +33,14 @@ set -euo pipefail
 MINE="false"
 REPO=""
 NUMBER=""
+HEAD_BRANCH=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --mine)   MINE="true"; shift ;;
     --repo)   REPO="${2:-}";   shift 2 ;;
     --number) NUMBER="${2:-}"; shift 2 ;;
+    --head-branch) HEAD_BRANCH="${2:-}"; shift 2 ;;
     -h|--help)
       grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "error: unknown arg: $1" >&2; exit 2 ;;
@@ -44,14 +48,26 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ----- build the MCP tools/call arguments -------------------------------------
+# The three shapes are mutually exclusive, exactly as coord_pr_status's own
+# schema declares them; refuse a mix locally rather than letting coord do it.
+if [[ "$MINE" == "true" && ( -n "$REPO" || -n "$NUMBER" || -n "$HEAD_BRANCH" ) ]] \
+   || [[ -n "$NUMBER" && -n "$HEAD_BRANCH" ]]; then
+  echo "error: --mine, --number and --head-branch are mutually exclusive" >&2
+  exit 2
+fi
+# --number is spliced into the JSON unquoted, so it must be a positive integer.
+if [[ -n "$NUMBER" && ! "$NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+  echo "error: --number must be a positive integer (got '$NUMBER'); for a branch name use --head-branch" >&2
+  exit 2
+fi
 if [[ "$MINE" == "true" ]]; then
   ARGS='{"mine":true}'
-elif [[ -n "$REPO" && -n "$NUMBER" ]]; then
+elif [[ -n "$REPO" && ( -n "$NUMBER" || -n "$HEAD_BRANCH" ) ]]; then
   # json_string is deferred until after the shared block defines $JSON_READER,
   # so build ARGS below rather than here.
   ARGS=""
 else
-  echo "error: pass --mine, or both --repo and --number" >&2
+  echo "error: pass --mine, or --repo with --number or --head-branch" >&2
   exit 2
 fi
 
@@ -586,6 +602,25 @@ classify() {
   # exactly the undifferentiated mask this script exists to replace. Normalize
   # first so the pre-transfer failures reach the same named causes.
   [ -n "$code" ] || code="000"
+  # THE DOOR ANSWERED AND THIS BOX LOST THE ANSWER. Decided BEFORE any body
+  # match and before the no-status UNREACHABLE arm, because both of those read a
+  # carried request as one that never arrived (plan
+  # 2026-11-08-coord-revive-call-misreports-carried-requests-and-copies-body-text-into-its-verdict,
+  # Phase 1; coord finding 02ff5a17). Two shapes, both measured with a full or
+  # nearly full $TMPDIR:
+  #   * curl exit 23 - curl could not WRITE data it had RECEIVED. curl opens
+  #     `-o` lazily on the first body byte, so a 23 means the request went out
+  #     and the door answered; whatever $code reads, the answer is gone.
+  #   * curl exit 0 with no three-digit status - a successful HTTP transfer
+  #     always has one, so a `000`, an empty or a short `-w` read means the
+  #     STATUS write was lost, not that nothing answered. Without this arm the
+  #     non-2xx guard below would substring-match its markers anywhere in a
+  #     served 200 body (a finding title, a gate reason) and print a refusal.
+  # Either way the call MAY have been applied: never a "not carried" verdict.
+  case "$ce:$code" in
+    23:*|0:000|0:[!0-9]*|0:?|0:??|0:?[!0-9]*|0:??[!0-9]*|0:????*)
+      echo "CARRIED_ANSWER_UNREAD (curl exit $ce, status read '$code' - the request was SENT and the door ANSWERED, but this box could not store the answer: a LOCAL write failure, typically a full or nearly full TMPDIR. The call MAY have been applied - verify by read, and do NOT blindly re-issue a non-idempotent write)"; return ;;
+  esac
   if [ "$ce" = "7" ]; then echo "CONNECT_REFUSED (dead port - no listener)"; return; fi
   # THE PROXY DID NOT ANSWER. Nothing came back inside the budget, so whether the
   # proxy ever answered is UNKNOWN — this box abandoned the request. Deliberately
@@ -665,6 +700,9 @@ classify() {
           # so it gets the class verdict with the posture named UNSTATED rather
           # than silently falling through to the nonce arm.
           [ -n "$rc_posture" ] || rc_posture="unstated"
+          # The posture becomes part of the verdict WORD, so body text must not
+          # shape it: one [a-z_] token, else `invalid` (same rule as `cause`).
+          case "$rc_posture" in *[!a-z_]*) rc_posture="invalid" ;; esac
           echo "RUNNER_CREDENTIAL_$(printf '%s' "$rc_posture" | tr '[:lower:]' '[:upper:]') (HTTP 401 from the RUNNER, not from coord and NOT about your nonce: the forwarder refused to carry this call because its own coord credential is $rc_posture since ${rc_since:-unstated}. The key in this .mcp.json is FINE - do NOT rotate it and do NOT re-provision, which mints a new nonce for a credential that stays dead and evicts whatever holds this workdir's slot. L4/L5 carry their own credentials and DO answer. remedy=${rc_remedy:-unstated})"; return ;;
         *COORD_MCP_PROXY_UNAUTHORIZED*)
           echo "$unauth"; return ;;
@@ -699,10 +737,26 @@ x=e.get("data") if isinstance(e,dict) else None  # envelope-ok: same typed read 
 v=x.get(sys.argv[1]) if isinstance(x,dict) else None
 print(v if isinstance(v,str) else "")' remedy 2>/dev/null | tr -d '\r\n')
           fi
+          # NO BODY TEXT SHAPES THIS LINE (plan
+          # 2026-11-08-coord-revive-call-misreports-carried-requests-and-copies-body-text-into-its-verdict,
+          # Phase 3). `cause` is a closed token vocabulary, so anything that is
+          # not one token prints `invalid`: a cause carrying a line break plus a
+          # whole forged verdict line, or `drift remedy=x`, must not reach the
+          # line a caller branches on. `status=` sits right after that token, so
+          # it cannot be forged either, and a caller can require the runner's
+          # own 403 rather than any non-2xx that happens to carry the marker.
+          # `remedy` is free prose and is last; it is stripped of line breaks.
+          # `cause` keeps any EMBEDDED line feed (only the reader's trailing one
+          # is lost to the command substitution), so a broken-up token prints
+          # `invalid` rather than being glued back into a valid one.
+          case "$mna_cause" in
+            '') ;;
+            *[!a-z_]*) mna_cause="invalid" ;;
+          esac
           if [ -n "$mna_cause" ]; then
-            echo "METHOD_NOT_ALLOWED (cause=$mna_cause remedy=${mna_remedy:-unstated})"
+            echo "METHOD_NOT_ALLOWED (cause=$mna_cause status=$code remedy=${mna_remedy:-unstated})"
           else
-            echo "METHOD_NOT_ALLOWED (cause=unstated (runner build predates the discriminator - read GET /coord-mcp/tool-policy and buildDrift))"
+            echo "METHOD_NOT_ALLOWED (cause=unstated status=$code (runner build predates the discriminator - read GET /coord-mcp/tool-policy and buildDrift))"
           fi
           return ;;
       esac ;;
@@ -745,7 +799,7 @@ print(v if isinstance(v,str) else "")' remedy 2>/dev/null | tr -d '\r\n')
     503) echo "CREDENTIAL_REFRESHING (retry-safe - HTTP 503)"; return ;;
   esac
   local snippet
-  snippet=$(printf '%s' "$body" | tr -d '\n' | head -c 120)
+  snippet=$(printf '%s' "$body" | tr -d '\r\n' | head -c 120)
   echo "HTTP_$code (unclassified: ${snippet:-<empty body>})"
 }
 
@@ -776,7 +830,16 @@ if [[ "$MINE" != "true" ]]; then
     echo "$DOOR_SCRIPT_NAME: ERROR: could not JSON-encode --repo with $JSON_READER (LOCAL fault, not a coord verdict)." >&2
     exit 127
   }
-  ARGS="$(printf '{"repo":%s,"number":%s}' "$REPO_JSON" "$NUMBER")"
+  if [[ -n "$HEAD_BRANCH" ]]; then
+    HEAD_JSON="$(printf '%s' "$HEAD_BRANCH" | json_string | tr -d '\r')"
+    [[ -n "$HEAD_JSON" ]] || {
+      echo "$DOOR_SCRIPT_NAME: ERROR: could not JSON-encode --head-branch with $JSON_READER (LOCAL fault, not a coord verdict)." >&2
+      exit 127
+    }
+    ARGS="$(printf '{"repo":%s,"head_branch":%s}' "$REPO_JSON" "$HEAD_JSON")"
+  else
+    ARGS="$(printf '{"repo":%s,"number":%s}' "$REPO_JSON" "$NUMBER")"
+  fi
   # REBUILD $RPC. It was assembled far above, from an $ARGS that is the EMPTY
   # STRING on this branch — the deferral is deliberate (json_string needs
   # $JSON_READER, which the shared block chooses) and the rebuild was simply

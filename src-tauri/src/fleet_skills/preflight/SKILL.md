@@ -414,7 +414,7 @@ bash <workspace-root>/qontinui-claude-config/scripts/recon-tenant.sh <owner/repo
 | Step 1's work-unit read | **yes** | `GET https://coord.qontinui.io/coord/agent-work-units/<plan-slug>` with `-H "@<path>"`: the handler takes the tenant from the bearer's `tenant_id` claim (step 1 says what to read in it). |
 | Step 3's `coord_conflict_check` | **yes** | tenant-scoped MCP read |
 | Step 4a's `coord_query_train_health` candidates | **yes** | tenant-scoped MCP read |
-| `coord_who_is_working_on` over the plan slug and globs, and any `coord_session_worktrees` / `coord_orient` read you add | **yes** | tenant-scoped MCP reads, and with step 3 the ONLY place a peer declared in ANOTHER tenant shows up |
+| `coord_who_is_working_on` over the plan slug and globs (with `session_id`, as in step 3), and any `coord_session_worktrees` / `coord_orient` read you add | **yes** | tenant-scoped MCP reads, and with step 3 the ONLY place a peer declared in ANOTHER tenant shows up |
 | Step 0's plan reserve (`coord_reserve_resource` / `POST /claims/acquire`) | **no** | Exempt, because a `held` there is FLEET-GLOBAL: coord keys the claim as `claim:<kind>:<resource_key>` with no tenant in it (`qontinui-coord` `crates/coord/src/claims.rs` `key()`, and `acquire` builds its key from it), while the optional `tenant_id` is only validated and stamped into the audit row. One reserve already collides across tenants, and acquiring it N times would be N writes. |
 | Step 5's `coord_declare_intent` | **no** | A WRITE. Declare ONCE, under the session's own door. Its `overlapping_peers` covers the session's tenant only; peers in the other bound tenants come from the `coord_who_is_working_on` and `coord_conflict_check` rows above. |
 
@@ -492,14 +492,27 @@ returned `[]` in the incident), so you supply them explicitly everywhere.
 ### 3. `coord_conflict_check` with those globset paths
 
 ```
-coord_conflict_check(paths=["<glob>", "<glob>", ...])
+coord_conflict_check(  # envelope-ok: an agent-issued MCP call whose answer the session reads by the signals the next paragraph names, not a script parsing a response
+    paths=["<glob>", "<glob>", ...],
+    session_id="<value of $CLAUDE_CODE_SESSION_ID>",   # MCP args are not shell-expanded; omit when unset
+)
 ```
+
+Pass the same `session_id` to `coord_who_is_working_on` (step 0d). On these
+two reads it only tells coord which intent rows are YOUR OWN, so it can skip
+them and count another session on this device as a peer. Neither read binds
+it or checks it against anything (the reply's `caller_self.provenance` reads
+`supplied` when coord took it from the argument), so never pass another
+session's id: coord would then hide that session's rows as yours. Each read
+refuses a malformed or nil id, and one that disagrees with the runner-injected
+caller-session header. That header alone proves you when it is present.
 
 Inspect every signal in the response:
 
 - `conflicting_branches` — unmerged branches touching the paths.
 - `claim_holders` — live claims on the paths.
-- `overlapping_peers` — peers with overlapping declared intent.
+- `overlapping_peers` — peers with overlapping declared intent, on this device
+  as well as others (step 5 says how to read a same-device row).
 - `staleness_warning` — if present, the branch index is stale (>10m old); treat
   the response as **advisory** and lean harder on step 4 — do **not** trust a
   stale `clear`.
@@ -545,8 +558,20 @@ Phase 4.)* `declare_intent` sees only sessions currently DECLARING, and its
 `prior_realizations_status != "ok"` — a prose `work_unit_id` returns
 `not_slug_shaped` and the lookup never runs. Neither sees an OPEN PR from a
 finished session. `coord_query_train_health` does: read its
-`candidates_in_flight[].branch` for each repo the work touches and scan the
-branch names against your intent. A branch such as
+`candidates_in_flight[].branch` AND its `queued_conflicting_head_details[].branch`
+for each repo the work touches and scan the branch names against your intent.
+Both lists, because a queued proposal whose PR GitHub reports conflicting at its
+own head is parked by the dequeue claim and is listed ONLY in the second one (plan
+`2026-10-31-conflicting-head-exclusion-is-invisible-to-the-reads-that-report-the-queue`);
+a parked PR is still open work by a peer. A coord build that serves no
+`queued_conflicting_head_details` key still lists parked rows in
+`candidates_in_flight`, so reading the one list there loses nothing. A key that
+is PRESENT but `null` is different: that build already dropped parked rows from
+`candidates_in_flight`, and the advisory read that lists them failed
+(`queued_conflicting_head_details_error` says why) — so the parked half of the
+scan is UNKNOWN, and an empty scan is not "no peer branch". The list is also
+bounded (50 rows): when `queued_conflicting_head` exceeds its length, a branch
+absent from it proves nothing. A branch such as
 `fix/untimed-subprocess-isolated-edit` beside an intent to fix that very
 function means the work is already in flight — stop and coordinate. On
 2026-09-02 a session wrote a duplicate fix to `claude_tree_is_repo_authored`
@@ -610,22 +635,28 @@ every task that starts here instead (a post-merge follow-up, a no-plan
 dispatch), which otherwise reaches its rebase with no baseline at all.
 
 - **Record whenever a task reaches a repo the session has not recorded yet;
-  a second `record` MERGES.** A repo already in the baseline keeps its sha (a
-  baseline never moves forward past what a peer landed in between), a repo
+  a second `record` MERGES, per repo and per ref.** A repo already in the
+  baseline under the same ref keeps its sha (a baseline never moves forward
+  past what a peer landed in between), a repo recorded under a different ref
+  has only its own entry replaced (`replaced <repo>: ref Y -> X`), a repo
   named for the first time is added at the sha just fetched, and the globs are
-  unioned — `kept <repo> <sha>` names each baseline left alone. Until
+  unioned — `kept <repo> <sha>` names each baseline left alone. A repo whose
+  default branch is not `main` (e.g. `master`) needs no `--ref`: each repo is
+  recorded at its own default branch. Until
   2026-09-19 this bullet said *"record ONCE per session — a second record
   overwrites"*, which left a session running a second plan in a second repo
   with no baseline it was allowed to take (measured on a `/vet-imp` session:
   round-1 runner globs, a round-3 coord plan, `check` INCOMPLETE).
 - `record` exits `0` when every glob's repo was fetched and pinned, `3`
-  (INCOMPLETE) when, e.g., a glob reached no checkout, a fetch failed or the file
-  could not be written — the baseline
+  (INCOMPLETE) when, e.g., a glob reached no checkout, a repo's default branch is
+  unresolvable, a fetch failed or the file could not be written — the baseline
   then covers less than you asked, which is UNKNOWN rather than clear — and `2`
   on usage errors, including **no session id**.
 - The matching `landed-since.sh check` (no globs: it reuses these) runs **before
   every rebase**: exit `1` names the commits, files and PR numbers that landed
-  into your paths; exit `3` is INCOMPLETE and never an all-clear.
+  into your paths; exit `3` is INCOMPLETE and never an all-clear. It reads each
+  repo at the ref it was recorded under; an explicit `--ref` overrides that for
+  every repo in the run, and must be `origin/<branch>` (anything else exits 2).
 - The baseline lives at `~/.qontinui/landed-since/<session-id>.json`, keyed on
   `$QONTINUI_AGENT_SESSION_ID`, else `$CLAUDE_CODE_SESSION_ID`. A `check` from a
   different session — or the same work under the other variable — reads no
@@ -656,8 +687,10 @@ whether to wait or take over.
 
 ```
 coord_declare_intent(
+    intent_text="<one line: what this run will change>",   # required
     work_unit_id="<plan-slug>",
     intent_globs=["<glob>", "<glob>", ...],   # the explicit list from step 2
+    session_id="<value of $CLAUDE_CODE_SESSION_ID>",   # MCP args are not shell-expanded; omit when unset
 )
 ```
 
@@ -670,7 +703,7 @@ this worktree's custody record names the plan it belongs to instead of the
 ```
 bash qontinui-claude-config/scripts/custody-intent-write.sh <this worktree> \
     plan_slug=<plan-slug> \
-    intent=<the intent_text, when one was given>
+    intent='<the same intent_text>'   # single quotes: a backtick or $ in it is not expanded; write ' as '\''
 ```
 
 - **Deliberately no `work_unit_id=` here.** This step performs no upsert and no
@@ -684,6 +717,84 @@ bash qontinui-claude-config/scripts/custody-intent-write.sh <this worktree> \
 
 - Use the plan **slug** as `work_unit_id` — the same canonical cross-agent dedup
   key `coord.plans` / `sessions.plan_slug` use.
+- Pass `session_id` (the VALUE of `$CLAUDE_CODE_SESSION_ID`, never the
+  literal text). Without it, coord still collects the `resource:` messages
+  parked against your globs but stamps each copy to its guess at this device's
+  most recently seen session, which may be a sibling, unless it can prove your
+  session from the runner's caller-session header (a coord flag and a device
+  check both gate that). coord checks `session_id` against your device before
+  it records your intent (an id coord has never seen is bound to your device on
+  first use), so a refused `session_id` declared nothing: send the call again
+  without it rather than leave your scope undeclared.
+- **Same-device sessions are peers in the three overlap reads**: this call's
+  own reply, step 3's `coord_conflict_check` and `coord_who_is_working_on`
+  (step 0d). coord excludes only YOUR OWN session's rows, so a sibling session
+  on this device can be a peer. Each reply's `caller_self` names the session
+  coord excluded and how it knew it. On the two reads `provenance` is `header`
+  (the runner proved it) or `supplied` (your unchecked `session_id`). On the
+  declare it is `header` or `explicit` (your `session_id`, checked against
+  this device). Read these reply fields:
+  - **`session_id_provenance` on each peer.** `declared` means the row
+    carries that session's own stamp. A same-device peer (`same_device: true`)
+    is reported only this way. `device_recent_guess` means coord filled in that
+    device's most recent session, which on a busy box may not be the declarer:
+    address it by `handle:` or confirm before you rely on a `session:` message.
+    A same-device peer carries no `stalled_session_count`, because its device
+    is yours; read `stalled_sessions` instead.
+  - **`matched_queried_globs` on each peer**: `[{glob, basis}]`. `basis` is
+    `explicit` (a path you passed) or `derived` (a glob coord derived from
+    `intent_text`). A peer matched only through a derived glob is often a broad
+    repo-wide match rather than a real overlap. The verdict still counts it as
+    an overlap.
+  - **`unattributed_same_device_rows`, with reason `same_device_unattributed`
+    in `overlap_completeness.reasons`.** These are rows on this device that
+    overlap your query, or recorded no scope, and that coord cannot attribute
+    to a session: legacy rows written without a stamp, or any row when coord
+    has no session for you. Such a row never yields `clear` and never fires
+    `collision` by itself: it makes the read incomplete, so a reply with no
+    other collision reads `unknown`. A `collision` from an attributed peer in
+    the same reply still stands. Each entry lists its `work_unit_id` and
+    `updated_at` (with `overlapping_intent_globs` when it recorded scope), so
+    you can recognise your own. When
+    coord had no session for you (no `caller_self.session_id`), re-run the
+    read with `session_id`. When it had one, the row carries no session stamp.
+    If the row is yours, re-declare that work unit with `session_id`. If it is
+    not yours, it belongs to an unattributed sibling: coordinate as for any
+    `unknown`. A same-device row that recorded scope and does not overlap
+    your globs changes nothing.
+
+  Limits that remain, each with its own end marker (plan
+  `2026-11-11-intent-overlap-excludes-the-callers-whole-device` Phases 4-6):
+  - *The `coord_push_to_branch` concurrent-editor check and `resource:`
+    routing's intent arm still exclude your whole device* until the plan's
+    Phase 4 is serving.
+  - *`coord_orient`'s `you` list is device-grain* until it returns a
+    `same_device_sessions` list: it shows every live intent row on this
+    device, a sibling's included, with no session attached.
+  - *Same plan slug, one row*: two sessions on one device that declare the
+    same plan slug (step 0c's concurrent phase-takers are the usual case)
+    share one row, and whichever declares last replaces the other's globs.
+    Under the plan-slug convention nothing keeps both rows until the plan's
+    Phase 6 (a phase-qualified `work_unit_id` spelled `<plan-slug>:phase:<n>`
+    would, at the cost of exact-match readers such as `coord_request_handoff`;
+    a hyphen join loses `prior_plan_realizations`); your step-6 `file_glob` claims
+    are separate keys and are not affected. coord now reports the takeover.
+    A declare that replaced a LIVE row another session held carries an
+    `intent_row_shared_with_sibling:` warning naming that session. That is a
+    collision: coordinate with the session it names before proceeding. A
+    declare that replaced a LIVE unstamped row that had recorded globs adds a
+    `same_device_unattributed` reason naming that row's work unit,
+    `updated_at` and globs: always when coord proved your session (`header`,
+    or your `session_id`), and otherwise only when the stored globs differ
+    from yours. That reason is an `unknown`, not a collision: compare the row
+    with your own earlier declaration before treating it as a sibling's. An
+    unproven re-declare with the SAME globs as the row it replaces is not
+    reported, which is one more reason this step passes `session_id`.
+
+  Also sees a same-device sibling: step 3's `claim_holders` (exact
+  keys only), `resource:` routing's exact-key claim arm (a session-scoped
+  holder only), the session-scoped
+  reserves of steps 0 and 0c, and step 4b's disk scan.
 - Pass **explicit** `intent_globs` — never rely on server-side derivation alone.
   An **empty** `intent_globs` in the response, or one that lost scope (the next
   bullet says exactly when), is an **error → re-declare once with paths**
@@ -803,7 +914,7 @@ coord_claim_acquire(kind="file_glob", resource_key="<glob>", ttl_seconds=900)   
   while the loop
   keeps renewing the others; when no renewable row is left the loop ends, and
   `status` reads `STOLEN` if any row was stolen, `MAX_RUNTIME` if its runtime
-  bound ended it, `OWNER_GONE` if owner death ended it, otherwise `DEAD`.
+  bound ended it, `OWNER_GONE` if the loop released its rows because the owner was gone (its pid died, its transcript went idle or missing, or coord closed or finished the session), otherwise `DEAD`.
   **Only `LIVE` means the claims are held.** The other seven mean the claim is
   **UNKNOWN** (`STALE` usually self-heals on the next beat; re-acquiring
   anyway is harmless — a held claim answers `renewed`), which is a re-acquire and a line in the report, never a shrug — a

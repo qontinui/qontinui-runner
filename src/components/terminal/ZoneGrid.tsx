@@ -34,7 +34,8 @@ import { useZoneVirtualization } from "./useZoneVirtualization";
 import {
   scrollCellIntoView,
   focusedTabIdFor,
-  newestAddedTabId,
+  newestSurfacedTabId,
+  surfacedTabIds,
   zoneForTab,
 } from "./flowScrollRouting";
 import { writeToTerminalById } from "./writeToTerminalById";
@@ -80,6 +81,14 @@ interface ZoneGridProps {
    * applies its own debounce + gating.
    */
   onUserInputLine?: (terminalId: string, input: string) => void;
+  /**
+   * `useTenant().showSwitcher` from `TerminalPage`'s existing subscription:
+   * the device has more than one tenant binding. Threaded beside `showLabels`
+   * into every cell (`ZoneCellSharedProps.tenantSwitcherShown`) so the memo'd
+   * cells stay context-free (D2 of
+   * `2026-11-08-tenant-badge-parity-and-oracle-fixtures`).
+   */
+  tenantSwitcherShown: boolean;
 }
 
 interface GridState {
@@ -153,8 +162,8 @@ function createInitialGridState(layout: LayoutPreset): GridState {
  * `React.memo` (plan `2026-07-28-runner-many-sessions-performance` Phase 1):
  * `TerminalPage` re-renders for plenty of reasons that have nothing to do with
  * the grid, and every one of those used to walk the whole zone tree. The five
- * props are stable `useCallback`s from `useZoneActions`, so the memo actually
- * holds. Hot per-tab data no longer flows through here at all — each
+ * callback props are stable `useCallback`s from `useZoneActions` and
+ * `tenantSwitcherShown` is a boolean, so the memo actually holds. Hot per-tab data no longer flows through here at all — each
  * `ZoneCell` subscribes to its own tab's slice of the terminal hot store.
  */
 function ZoneGridInner({
@@ -163,6 +172,7 @@ function ZoneGridInner({
   onExit,
   onExportZone,
   onUserInputLine,
+  tenantSwitcherShown,
 }: ZoneGridProps) {
   const resolveTitle = useDisplayTitleResolver();
   // Read all data from contexts
@@ -447,7 +457,9 @@ function ZoneGridInner({
   const prevTabIdsRef = useRef<Set<string> | null>(null);
   const pendingFocusTabIdRef = useRef<string | null>(null);
   useEffect(() => {
-    const currentIds = tabs.map((t) => t.id);
+    // The baseline is the SURFACED ids, so a tab whose verdict arrives late
+    // and says surface is routed when it flips, not lost as "already present".
+    const currentIds = surfacedTabIds(tabs);
     if (!isFlowMode) {
       // Keep the baseline current in preset mode so switching INTO flow mode
       // doesn't treat every already-open tab as newly added.
@@ -461,7 +473,7 @@ function ZoneGridInner({
       // First flow-mode pass — seed without focusing (restore/initial burst).
       return;
     }
-    const added = newestAddedTabId(prev, currentIds);
+    const added = newestSurfacedTabId(prev, tabs);
     if (added) pendingFocusTabIdRef.current = added;
     const pending = pendingFocusTabIdRef.current;
     if (!pending) return;
@@ -720,6 +732,7 @@ function ZoneGridInner({
     pendingRestarts,
     onCancelRestart,
     showLabels,
+    tenantSwitcherShown,
     isMultiZone: zoneLayout.isMultiZone,
     autoCompact,
     forceCompact,

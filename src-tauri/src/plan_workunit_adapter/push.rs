@@ -1462,6 +1462,8 @@ mod tests {
                 index: 1,
                 name: "Phase 1 — x".to_string(),
             }],
+            phase_labels: vec![],
+            phases_undeclared: vec![],
             repos: vec![],
             source_path: format!("plans/{slug}.md"),
             content: String::new(),

@@ -47,7 +47,8 @@ def judge(f, idle_min):
     `f` keys: claude (True / False / None = unreadable, with `unreadable` the
     reason), other (a non-shell process when claude is absent), exited (the
     detail for a pane with no claude), unbound (why the registry row is not the
-    running session, or ""), shells, screen_busy (None = unreadable), waiting
+    running session, or ""), shells (tool shells that may be work), strays
+    (proven-stray wait loops, cfs.split_strays), screen_busy (None = unreadable), waiting
     (why the prompt is not empty, or ""), status (declared status or None),
     note (a caveat about which registry row is shown, or ""), last_activity_ms,
     now_ms."""
@@ -66,6 +67,8 @@ def judge(f, idle_min):
     tail = [age]
     if f["shells"]:
         tail.append(f"{f['shells']} background tool shell(s)")
+    if f["strays"]:
+        tail.append(f"{f['strays']} stray wait loop(s)")
     if f["status"]:
         tail.append(f"status {f['status']}")
     if f["note"]:
@@ -151,14 +154,10 @@ def last_activity(row):
 
 
 def account(row):
-    """The account label the runner recorded. It labels the default config dir
-    (~/.claude) `unknown`; that one is named `default`. A row with no config
-    dir keeps the label it has."""
-    label = (row.get("account") or {}).get("label")
-    cd = row.get("configDir")
-    if label in (None, "", "unknown") and cd and os.path.normpath(cd) == os.path.expanduser("~/.claude"):
-        return "default"
-    return label or os.path.basename(cd or "") or "?"
+    """The account label the runner recorded, or - where it says `unknown` -
+    the config dir's suffix (`.claude-paktis` is `paktis`, `.claude` is
+    `default`). close-finished-sessions' account_of, so both reports agree."""
+    return cfs.account_of(row)
 
 
 def registry_rows():
@@ -190,15 +189,16 @@ def pick_row(rows, live):
     return (rows[0] if rows else None), ""
 
 
-def pane(term, rows, table, ready):
+def pane(term, rows, table, ready, idle_min):
     """(facts, row) for one terminal."""
-    f = {"claude": None, "unreadable": "", "other": "", "exited": "", "unbound": "", "shells": 0,
+    f = {"claude": None, "unreadable": "", "other": "", "exited": "", "unbound": "", "shells": 0, "strays": 0,
          "screen_busy": None, "waiting": "", "status": None, "note": "", "last_activity_ms": None,
          "now_ms": time.time() * 1000}
     live, claudes = set(), []
     if table is not None and term.get("pid") in table:
         claudes, shells, other = cfs.proc_facts(table, term["pid"])
-        f["claude"], f["shells"] = bool(claudes), len(shells)
+        work, strays, _ = cfs.split_strays(table, shells, idle_min)
+        f["claude"], f["shells"], f["strays"] = bool(claudes), len(work), len(strays)
         if not claudes and other:
             f["other"] = " ".join(table[other[0]][1])[:60]
         live = cfs.live_session_ids(claudes)
@@ -209,6 +209,12 @@ def pane(term, rows, table, ready):
     else:
         f["unreadable"] = f"the pane's pid {term.get('pid')} is not in the process table"
     row, note = pick_row(rows, live)
+    # The registry's config dir can be blank; the running claude's own
+    # CLAUDE_CONFIG_DIR is where it writes, and names its account. Only for a
+    # row that claude holds (or when its session id is unreadable): an older
+    # row picked after /clear may belong to another account.
+    if row and (not live or row.get("claudeSessionId") in live):
+        row = cfs.with_live_config_dir(row, table, term.get("pid"))
     if f["claude"] is False:
         had = row is not None
         f["exited"] = ("exited" if had else "shell (no Claude session registered)") + \
@@ -234,7 +240,7 @@ def pane(term, rows, table, ready):
         f["screen_busy"] = cfs.running_turn(cfs.ANSI_RE.sub("", raw[-4000:]))
         # Only a positive reading counts: a prompt the replay cannot locate is
         # the reader's limit, not a session waiting on anyone.
-        prompt = cfs.prompt_state(raw, cfs.wrap_cols(term))[0]
+        prompt = cfs.prompt_state(raw, cols=cfs.wrap_cols(term))[0]
     else:
         prompt = "unknown"
     f["waiting"] = waiting_reason(prompt, rp.get("sessionStatus"), (rp.get("windDown") or {}).get("reason"))
@@ -263,7 +269,7 @@ def collect(idle_min):
     order = {pid: i for i, pid in enumerate(pages)}
     groups = {}
     for t in terms:
-        f, row = pane(t, rows.get(t["id"], []), table, ready)
+        f, row = pane(t, rows.get(t["id"], []), table, ready, idle_min)
         state, detail = judge(f, idle_min)
         groups.setdefault(t.get("pageId"), []).append({
             "terminalId": t["id"], "state": state, "detail": detail,
@@ -300,7 +306,7 @@ def print_report(tabs, warnings):
 
 def selftest():
     now = 10_000_000.0
-    base = {"claude": True, "unreadable": "", "other": "", "exited": "exited", "unbound": "", "shells": 0,
+    base = {"claude": True, "unreadable": "", "other": "", "exited": "exited", "unbound": "", "shells": 0, "strays": 0,
             "screen_busy": False, "waiting": "", "status": None, "note": "", "last_activity_ms": now - 60 * 60000,
             "now_ms": now}
     cases = [
@@ -309,6 +315,7 @@ def selftest():
         ({"last_activity_ms": now - 2 * 60000}, ACTIVE),
         ({"shells": 3}, INACTIVE),                       # a watcher left running is not a turn
         ({"shells": 3, "screen_busy": True}, ACTIVE),
+        ({"strays": 2}, INACTIVE),                       # a loop that can never end is not a turn either
         ({"status": "working"}, INACTIVE),               # the work axis, not liveness
         ({"status": "finished"}, INACTIVE),
         ({"waiting": "a dialog"}, INACTIVE),
@@ -362,11 +369,88 @@ def selftest():
         got = waiting_reason(*args)
         if (want and want not in got) or (not want and got):
             bad.append(f"waiting_reason{args}: want {want!r}, got {got!r}")
+    for row, want in [({"account": {"label": "unknown"}, "configDir": "/h/.claude-lukas"}, "lukas"),
+                      ({"account": {"label": "unknown"}, "configDir": os.path.expanduser("~/.claude")}, "default"),
+                      ({"account": {"label": "paktis"}, "configDir": None}, "paktis")]:
+        if account(row) != want:
+            bad.append(f"account {row}: want {want!r}, got {account(row)!r}")
+    if "2 stray wait loop(s)" not in judge(dict(base, strays=2), 15)[1]:
+        bad.append("judge does not name stray wait loops in the reason")
+    if not cfs.WINDOWS:  # on Windows every shell is work by design
+        # pane() splits a pane's shells: a proven-stray loop is counted apart from real work.
+        loop = 'until ! pgrep -f "zz-no-such-target" >/dev/null; do sleep 15; done'
+        table = {1: (0, ["/sbin/init"]), 20: (1, ["pty-holder", "--", "claude"]), 21: (20, ["/usr/bin/claude"]),
+                 30: (21, cfs._tool_argv(loop)), 31: (21, cfs._tool_argv("cargo test"))}
+        saved = cfs.live_session_ids, cfs.raw_tail
+        cfs.live_session_ids, cfs.raw_tail = lambda claudes: set(), lambda tid: None
+        cfs._FACTS[:] = [table, cfs.ProcFacts(table, start={}, uids={}, files={}, self_pids=set(), now=now)]
+        try:
+            f = pane({"id": "t", "isAlive": True, "pid": 20}, [], table, {}, 15)[0]
+        finally:
+            cfs.live_session_ids, cfs.raw_tail = saved
+            cfs._FACTS[:] = [None, None]
+        if (f["shells"], f["strays"]) != (1, 1):
+            bad.append(f"pane() shells/strays: {f['shells']}/{f['strays']}, want 1/1")
+        # A file unchanged for 10 minutes is not yet frozen, whatever --idle-min this report runs at.
+        log = "/s/out.log"
+        table = {1: (0, ["/sbin/init"]), 20: (1, ["pty-holder", "--", "claude"]), 21: (20, ["/usr/bin/claude"]),
+                 30: (21, cfs._tool_argv(f"until grep -q DONE {log}; do sleep 5; done"))}
+        cfs.live_session_ids, cfs.raw_tail = lambda claudes: set(), lambda tid: None
+        cfs._FACTS[:] = [table, cfs.ProcFacts(table, start={}, uids={}, self_pids=set(), now=now,
+                                              files={log: (now - 600, set(), "x\n")})]
+        try:
+            f = pane({"id": "t", "isAlive": True, "pid": 20}, [], table, {}, 5)[0]
+        finally:
+            cfs.live_session_ids, cfs.raw_tail = saved
+            cfs._FACTS[:] = [None, None]
+        if (f["shells"], f["strays"]) != (1, 0):
+            bad.append(f"a low --idle-min must not lower the stray proof: {f['shells']}/{f['strays']}, want 1/0")
+    pane_bad, panes = pane_selftest()
+    bad += pane_bad
     for line in bad:
         print("SELFTEST FAIL: " + line)
-    print(f"selftest: {len(cases)} state cases + 6 row-pick cases + {len(waits)} waiting cases, "
-          f"{len(bad)} failure(s)")
+    print(f"selftest: {len(cases)} state cases + 6 row-pick cases + {len(waits)} waiting cases + 3 account cases "
+          f"+ {panes} pane cases, {len(bad)} failure(s)")
     return 1 if bad else 0
+
+
+def pane_selftest():
+    """pane() over stubbed process, registry and screen reads (nothing live is
+    read). Its prompt read replays the pane at its width, passed by keyword
+    (plan 2026-11-07-triage-sessions-every-page-run-defects-aftercare-veto-
+    reader-revival-and-concurrent-passes, Phase 7, D3): the SYNTHETIC idle
+    Windows pane cfs.IDLE_CONPTY_PROMPT_SCREEN is not waiting, and the same pane
+    holding a draft is, with wrap_cols held on its Windows arm whatever the
+    host. Returns (failure lines, case count)."""
+    g = globals()
+    term = {"id": "t1", "pid": 10, "isAlive": True, "cols": cfs.CONPTY_FIXTURE_COLS}
+    rows = [{"state": "open", "claudeSessionId": "s", "openedAt": 1}]
+    idle, real_wrap = cfs.IDLE_CONPTY_PROMPT_SCREEN, cfs.wrap_cols
+    cases = [(idle, ""), (idle.replace("\u276f\xa0", "\u276f\xa0draft", 1), "typed text")]
+    saved = {k: getattr(cfs, k) for k in ("proc_facts", "live_session_ids", "with_live_config_dir", "raw_tail",
+                                          "wrap_cols")}
+    saved_last = g["last_activity"]
+    bad = []
+    try:
+        cfs.proc_facts = lambda table, pid, windows=None: ([11], [], [])
+        cfs.live_session_ids = lambda claudes: {"s"}
+        cfs.with_live_config_dir = lambda row, table, pid, read=None: row
+        cfs.wrap_cols = lambda t, windows=None: real_wrap(t, windows=True)
+        g["last_activity"] = lambda row: None  # no transcript is read
+        for screen, want in cases:
+            cfs.raw_tail = lambda tid, chars=30000, screen=screen: screen
+            try:
+                waiting = pane(term, rows, {10: (1, ["claude"])}, {}, 15)[0]["waiting"]
+            except Exception as e:  # a width passed by position raises TypeError: a failure, never a crash
+                waiting = f"raised {type(e).__name__}: {e}"
+            if (want and want not in waiting) or (not want and waiting):
+                bad.append(f"pane() over {'a draft' if want else 'an empty prompt'} on a Windows pane: "
+                           f"waiting {waiting!r}, want {want or 'nothing'!r}")
+    finally:
+        for k, v in saved.items():
+            setattr(cfs, k, v)
+        g["last_activity"] = saved_last
+    return bad, len(cases)
 
 
 def main():

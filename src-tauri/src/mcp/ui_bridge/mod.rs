@@ -24,7 +24,10 @@ pub mod component_errors;
 pub mod design;
 pub mod design_eval;
 pub mod diagnostics;
+#[cfg(test)]
+mod doc_route_agreement;
 pub mod effects;
+pub mod element_kind;
 pub mod elements;
 pub mod errors;
 pub mod exploration;
@@ -488,6 +491,17 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         // so the control surface is reachable from the obvious path. See
         // `control_prefix_redirect` for why this is NOT in `route_manifest()`.
         .route("/control/{*path}", any(control_prefix_redirect))
+        // While a condition-check session holds a secret, a `{{secret:<ref>}}`
+        // placeholder sent to a `/ui-bridge/control/*` or `/ui-bridge/ai/*`
+        // route is refused: none of them substitutes, so it would be typed
+        // into the app as literal text (`crate::condition_secrets`, plan
+        // 2026-11-06-a-regression-test-run-is-judged-by-what-it-covered-and-a-silent-run-reads-unknown
+        // Phase 13). It reads requests only, never a response, so the relay's
+        // command stream merged above is untouched. LAST, because
+        // `Router::layer` wraps only the routes registered before it.
+        .layer(axum::middleware::from_fn(
+            crate::condition_secrets::refuse_unsubstituted_placeholders,
+        ))
 }
 
 #[cfg(test)]

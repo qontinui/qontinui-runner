@@ -895,8 +895,9 @@ pub fn seed_default_log_sources_if_empty() {
             category: LogSourceCategory::Runner,
             source_type: "file".to_string(),
             // The runner writes its tracing to `<dev_logs>/qontinui-runner.log.<date>`
-            // (see crate::logging). Point at the stable basename — read_single_source
-            // resolves the newest dated rotation. NOT `runner-tauri.log`, which is the
+            // (see crate::logging). Point at the stable basename —
+            // commands::project_logs::resolve_source_file resolves the newest
+            // dated rotation. NOT `runner-tauri.log`, which is the
             // supervisor's captured stdout, not the runner's own tracing.
             path: format!(
                 "{}/{}",

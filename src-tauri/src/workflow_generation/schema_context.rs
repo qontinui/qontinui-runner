@@ -11,7 +11,6 @@ use super::relevance_filter::filter_relevant_step_types;
 use super::rules;
 use super::step_type_knowledge;
 use super::step_type_metadata::{get_all_step_type_metadata, StepTypeMetadata};
-use crate::skills::playbook_parser;
 use crate::skills::SkillRegistry;
 
 /// Build the complete schema context prompt for AI workflow generation.

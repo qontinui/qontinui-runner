@@ -10895,6 +10895,8 @@ Body.
             initiative_item: None,
             initiative_item_rejected: None,
             phases: vec![],
+            phase_labels: vec![],
+            phases_undeclared: vec![],
             repos: vec![],
             source_path: format!("plans/{slug}.md"),
             content: String::new(),

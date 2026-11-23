@@ -160,6 +160,7 @@ use serde_json::json;
 use tokio::time::Instant;
 use uuid::Uuid;
 
+use super::coord_sync::drain_body;
 use super::intent::Intent;
 use super::provider_adapter::RestoreTier;
 use super::restore_record_emitter::{RESTORE_RECORD_EVENT, TIER_FULL, TIER_TERMINAL_ONLY};
@@ -635,6 +636,7 @@ pub async fn trigger_handoff(
             body.chars().take(500).collect(),
         ));
     }
+    drain_body(resp).await;
     Ok(())
 }
 
@@ -780,7 +782,8 @@ async fn connect_and_pump(
     // A row the drain deferred is not pushed a second time, so without this arm
     // it would wait for the next reconnect or tick.
     let mut drain_rx = crate::coord_drain_state::subscribe();
-    let mut autonomous_allowed = crate::coord_drain_state::current().allows_autonomous_spawns();
+    // Drain AND dispatch role: a role reopening the agent lane is a resume too.
+    let mut autonomous_allowed = crate::coord_drain_state::autonomous_spawns_allowed_now();
     let mut drain_rx_open = true;
 
     loop {
@@ -795,7 +798,8 @@ async fn connect_and_pump(
                     drain_rx_open = false;
                     continue;
                 }
-                let now_allowed = drain_rx.borrow_and_update().allows_autonomous_spawns();
+                drain_rx.borrow_and_update();
+                let now_allowed = crate::coord_drain_state::autonomous_spawns_allowed_now();
                 if resumed_after_drain(autonomous_allowed, now_allowed) {
                     tracing::info!(
                         "session handoff: autonomous spawns allowed again — replaying pending \
@@ -960,7 +964,10 @@ async fn run_all_catchups(
             // server-side materialized-child filter (keyed on the
             // `parent_session_id` the resume stamps), and the per-session
             // `MIGRATION_CAP` bounds any residue at 3 per 24 h rather than
-            // one per tick.
+            // one per tick. Each pending row is materialized on its own task
+            // (`respawn::spawn_tracked`, bounded, one per source at a time), so
+            // this returns once the GET is read: a respawn's minutes-long
+            // liveness proof never stalls this pump's Ping replies or frames.
             CatchupKind::Respawn => {
                 super::respawn::run_catchup(registry, lifecycle_store, http, coord_url, device_id)
                     .await
@@ -1663,9 +1670,12 @@ async fn fetch_latest_restore_record(
             session = %session_id,
             "session handoff: restore-record fetch rejected — proceeding without registry record"
         );
+        drain_body(resp).await;
         return None;
     }
 
+    // Deliberately NOT drained: the live-tail SSE never ends, so a drain would block to the
+    // deadline; dropping it resets the h2 stream instead.
     let mut resp = resp;
     let mut buf = String::new();
     let deadline = tokio::time::Instant::now() + RESTORE_RECORD_FETCH_DEADLINE;
@@ -1827,6 +1837,8 @@ fn registry_record_from_restore_payload(
         wind_down_arm: None,
         finish_reason: None,
         finish_synced: false,
+        finish_coord_session_id: None,
+        finish_coord_readdressed: false,
         spawn_device_default: None,
         adopted_from: None,
         last_session_start_at: None,
@@ -1985,6 +1997,7 @@ pub(super) async fn reacquire_claim(
             text.chars().take(200).collect(),
         ));
     }
+    drain_body(resp).await;
     Ok(())
 }
 
@@ -3806,5 +3819,77 @@ mod tests {
         assert!(!super::resumed_after_drain(true, true));
         assert!(!super::resumed_after_drain(true, false));
         assert!(!super::resumed_after_drain(false, false));
+    }
+}
+
+/// Every handoff response path on the shared coord client reads its body to
+/// the end (lifecycle plan Phase 85). `trigger_handoff` is the send for both
+/// `commands::session::session_handoff` and the context watcher.
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+    use crate::session::drain_probe::DrainProbe;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn trigger_handoff_2xx_reads_the_body() {
+        let _amb = crate::test_env::isolated_ambient();
+        let probe = DrainProbe::spawn(200).await;
+        let http = reqwest::Client::new();
+        trigger_handoff(
+            &http,
+            &probe.base,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            TenantScope::Unresolved,
+        )
+        .await
+        .unwrap();
+        probe.assert_all_drained().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reacquire_claim_2xx_reads_the_body() {
+        let _amb = crate::test_env::isolated_ambient();
+        let probe = DrainProbe::spawn(200).await;
+        let claim = HeldClaim {
+            kind: "file".into(),
+            resource_key: "k".into(),
+        };
+        reacquire_claim(
+            &reqwest::Client::new(),
+            &probe.base,
+            &claim,
+            Uuid::new_v4(),
+            TenantScope::Unresolved,
+        )
+        .await
+        .unwrap();
+        probe.assert_all_drained().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_source_2xx_reads_the_body() {
+        let _amb = crate::test_env::isolated_ambient();
+        let probe = DrainProbe::spawn(200).await;
+        // close_source reads the body itself (`.text()`) to classify coord's
+        // answer, so this pins that the read stays on every 2xx.
+        let _ = close_source(
+            &reqwest::Client::new(),
+            &probe.base,
+            Uuid::new_v4(),
+            TenantScope::Unresolved,
+        )
+        .await;
+        probe.assert_all_drained().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_record_fetch_rejection_reads_the_body() {
+        let _amb = crate::test_env::isolated_ambient();
+        let probe = DrainProbe::spawn(500).await;
+        let got =
+            fetch_latest_restore_record(&reqwest::Client::new(), &probe.base, Uuid::new_v4()).await;
+        assert!(got.is_none());
+        probe.assert_all_drained().await;
     }
 }

@@ -111,9 +111,16 @@ impl LoopController {
                 let wf_name = pg2.get_workflow_name_for_task_run(&exec_id2).await.ok();
                 if let Some(wf_name) = wf_name {
                     if let Ok(metrics) = pg2.compute_convergence_score(&wf_name, "workflow").await {
-                        let _ = pg2
+                        if let Err(e) = pg2
                             .store_convergence_snapshot(&wf_name, None, "workflow", &metrics)
-                            .await;
+                            .await
+                        {
+                            tracing::warn!(
+                                workflow_name = %wf_name,
+                                error = %e,
+                                "convergence snapshot not stored"
+                            );
+                        }
                     }
                 }
             });

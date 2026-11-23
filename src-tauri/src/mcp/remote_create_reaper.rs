@@ -1225,6 +1225,7 @@ mod tests {
             crate::terminal::graceful_exit::PaneProcesses {
                 subtree_claude: Vec::new(),
                 top_level_children: 0,
+                exempted_children: Vec::new(),
                 tracked_alive: Vec::new(),
             },
         )
@@ -1238,6 +1239,7 @@ mod tests {
                     started_at: 1_000,
                 }],
                 top_level_children: 0,
+                exempted_children: Vec::new(),
                 tracked_alive: Vec::new(),
             },
         )
@@ -1449,6 +1451,29 @@ mod tests {
                 claude_pids: pane.claude_pids.clone()
             }))
         );
+    }
+
+    /// R0c-2 on the REAL manager: a never-attached pane running an
+    /// npm-installed `claude` — a `node` process its Claude Code registry
+    /// record names — is HELD as a live `claude`, not reaped as a bare shell.
+    #[tokio::test]
+    async fn a_real_manager_holds_a_pane_running_an_npm_installed_claude() {
+        let pane = crate::terminal::session::tests::npm_claude_pane();
+        let tm = Arc::new(crate::terminal::TerminalManager::new());
+        tm.insert_for_test("term-npm", pane.session.clone());
+
+        assert_eq!(
+            close_through(tm.clone(), "term-npm".into()).await,
+            Ok(CloseOutcome::Held(HeldReason::LiveClaude {
+                claude_pids: vec![crate::terminal::session::tests::NPM_CLAUDE_PID]
+            }))
+        );
+        assert!(
+            tm.get("term-npm").is_some(),
+            "a live claude's pane was reaped"
+        );
+        assert_eq!(pane.kills(), 0);
+        assert!(pane.typed().is_empty());
     }
 
     /// m5-2's "unprovable" arm on the REAL manager: a pane the probe cannot

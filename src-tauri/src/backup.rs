@@ -248,6 +248,18 @@ pub fn restore_backup(data: &[u8]) -> Result<RestoreResult, String> {
         match archive.by_name(archive_name) {
             Ok(mut file) => match dest_path_opt {
                 Some(dest_path) => {
+                    // Every destination resolves from the process env, so a
+                    // test-binary thread holding no `env_lock` is refused
+                    // before anything is created
+                    // (`qontinui_runner_lib::env_write_gate`).
+                    if let Err(refused) = qontinui_runner_lib::env_write_gate::check(
+                        "backup::restore_backup",
+                        Some(&dest_path),
+                    ) {
+                        errors.push(refused);
+                        continue;
+                    }
+
                     // Validate the destination path stays within expected directories
                     let allowed_bases: Vec<PathBuf> = vec![
                         qontinui_runner_lib::instance_env::runner_config_base(),

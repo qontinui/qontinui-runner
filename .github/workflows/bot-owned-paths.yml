@@ -8,11 +8,18 @@ name: bot-owned-paths
 # Plan: qontinui-dev-notes plans/2026-11-04-runner-generated-and-ledger-files-are-
 # merge-neutral-and-land-behind-a-drain.md, Phase 0 and Design decision 4.
 #
-# ADVISORY FIRST. The job is named `bot-owned-paths (advisory)` and is NOT in
-# ruleset `main-merge-gates`' required checks. It reds a violating PR but holds
-# nothing for its first week. Promoting it to a required check is an operator
-# action the plan surfaces. When that happens, drop "(advisory)" from the job name
-# in the same change, because a required context is matched by name.
+# NOT REQUIRED BY GITHUB; COORD STILL HOLDS ON IT. The job is named
+# `bot-owned-paths (advisory)` and is NOT in ruleset `main-merge-gates`' required
+# checks, so its red never blocks a GitHub merge. Coord's merge train is another
+# matter. Any red check, required or not, makes coord's CI rollup red, so coord
+# will not land a violating PR. Its verdict is usually `ci-not-green`. The hold ends
+# when this check passes, because the bot-owned path left the PR or one of the
+# script's arms holds. It also ends if an operator attests coord's advisory-CI
+# override for the PR's current head (a new push cancels it), which coord honours
+# only while it can confirm every required check passes. Promoting it to a
+# required check is an operator action the plan surfaces. When that happens, drop
+# "(advisory)" from the job name in the same change, because a required context
+# is matched by name.
 #
 # THE VERDICT RUNS MAIN'S SCRIPT, IN A JOB THAT RUNS NO PR CODE. A `pull_request`
 # run checks out the PR's merge ref, so a PR could otherwise loosen the rule in its
@@ -24,7 +31,8 @@ name: bot-owned-paths
 #     PR's copy only while main has no script, which holds for the PR that adds
 #     it, and it says so in a ::warning.
 #   * `bot-owned-paths selftest` runs the PR's fixture suite, which is the change
-#     under test, on its own runner.
+#     under test, on its own runner. It lives in bot-owned-paths-selftest.yml,
+#     which does NOT trigger on `labeled` / `unlabeled` (see TRIGGERS).
 # Residual bound, stated plainly: a PR can still edit THIS workflow. That edit is
 # caught only by ci-integrity.yml's gate-change declaration, not here.
 #
@@ -36,11 +44,21 @@ name: bot-owned-paths
 # TRIGGERS.
 #   * `labeled` / `unlabeled`: two arms are labels, so adding the override or the
 #     schemas-pair label must re-decide without a push. Labels and their history
-#     are read live through the API, not from the event payload.
+#     are read live through the API, not from the event payload. These fire for
+#     EVERY label, and coord applies `coord:*` labels constantly, so this job is a
+#     real share of the org's hosted-runner queue. It is NOT narrowed with a
+#     job-level `if:` on `github.event.label.name`: an `if:`-skipped job still
+#     publishes a `skipped` check run, coord counts `skipped` as passing, and an
+#     unrelated label would flip a red verdict green (ci.yml and
+#     ci-rerun-on-declaration.yml state the same trap). A step-level no-op is no
+#     better: it reports `success` over the same red. Every run here must decide.
+#     The fixture suite reads no labels, so it was moved to its own workflow,
+#     which halves the jobs a label event costs; with no run there is no check
+#     row, so the previous selftest conclusion stands.
 #   * `edited`: covers a base re-target, which changes the diff.
-#   * `push`: the selftest runs, and the advisory job reports a no-op success. It
-#     covers main and the same merge-candidate globs ci.yml lists, so the context
-#     reports on every sha coord validates once it is required.
+#   * `push`: the selftest workflow runs, and the advisory job reports a no-op
+#     success. It covers main and the same merge-candidate globs ci.yml lists, so
+#     the context reports on every sha coord validates once it is required.
 #   * Closed PRs are skipped. Label churn after a land (e.g. `coord:landed`)
 #     would otherwise re-run it for nothing.
 
@@ -112,18 +130,3 @@ jobs:
             script=change/scripts/ci/bot-owned-paths.sh
           fi
           bash "$script" pr "$REPO" "$PR_NUMBER"
-
-  selftest:
-    name: bot-owned-paths selftest
-    if: github.event_name != 'pull_request' || github.event.pull_request.state != 'closed'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          persist-credentials: false
-          sparse-checkout: scripts/ci
-
-      - name: Fixture suite (no network)
-        shell: bash
-        run: bash scripts/ci/bot-owned-paths-test.sh

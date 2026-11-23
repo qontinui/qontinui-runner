@@ -822,10 +822,7 @@ run_fresh() {
     GIT_STUB_LOG="$work/git.log" \
     REGEN_STUB_SOURCE="$2" \
     SELF_HEAL="$1" \
-    CLORINDE_PG_CONTAINER="" \
-    CLORINDE_PG_HOST=localhost \
-    CLORINDE_PG_PORT=5433 \
-    PGPASSWORD=stub \
+    CLORINDE_PG_CONTAINER=stub-service-container \
     REGEN_SKIP_ATLAS=1 \
     RUNNER_TEMP="$runner_temp" \
     GITHUB_OUTPUT="$work/fresh.out" \

@@ -21,7 +21,7 @@ import { TerminalFindBar } from "./TerminalFindBar";
 import { paintGrid, type GridSnapshot } from "./paintGrid";
 import { getTerminalDebug, recordPaintGrid } from "./terminalDebug";
 import { instanceStorage } from "@/lib/instance-storage";
-import { writeClipboard } from "@/lib/clipboard";
+import { readClipboard, writeClipboard } from "@/lib/clipboard";
 import { consumeInputChunk } from "./consumeInputChunk";
 import { preparePasteData } from "./preparePaste";
 import { claimPasteChord } from "./pasteChord";
@@ -1065,8 +1065,7 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
           // listener would otherwise write the same text a second time (see
           // `pasteChord.ts`).
           if (claimPasteChord(event)) {
-            navigator.clipboard
-              .readText()
+            readClipboard()
               .then((text) => {
                 if (text) {
                   // Write directly to PTY. Run the clipboard text through the
@@ -1184,15 +1183,18 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
           }
           // No selection → paste, mirroring the Ctrl+V path (bracketed-paste +
           // newline normalization; see `preparePaste.ts`).
-          navigator.clipboard
-            .readText()
+          readClipboard()
             .then((text) => {
               if (!text) return;
               const prepared = preparePasteData(text, b.bracketedPasteMode);
               const bytes = encoder.encode(prepared);
               invoke("terminal_write", { terminalId, data: uint8ToBase64(bytes) }).catch(() => {});
             })
-            .catch(() => {});
+            .catch((err: unknown) => {
+              // contextmenu is preventDefaulted above, so no native paste
+              // follows: a rejected read is a paste that did not happen.
+              console.warn("[terminal] right-click clipboard read failed; nothing pasted", err);
+            });
         };
         container.addEventListener("contextmenu", contextMenuCopyPaste);
 

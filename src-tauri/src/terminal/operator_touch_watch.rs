@@ -49,9 +49,10 @@
 //! very metric this store exists to measure. So before a candidate fires,
 //! the scan proves a `claude` process lives in the pane's inclusive process
 //! subtree (`mcp::steward::pane_hosts_claude`, the probe the steward already
-//! uses). The process-table snapshot is taken at most once per tick and ONLY
-//! when some pane is about to fire, so the steady-state tick stays as cheap
-//! as before.
+//! uses) — a `claude` image, or a pid a Claude Code registry record names
+//! (an npm-installed `claude` runs as `node`). The process-table snapshot and
+//! that registry read are taken at most once per tick and ONLY when some pane
+//! is about to fire, so the steady-state tick stays as cheap as before.
 //!
 //! Three outcomes, see [`decide_candidate`]: proven `claude` → emit; proven
 //! no `claude` → the episode is settled without a touch (no re-probe until
@@ -230,10 +231,16 @@ pub fn scan_idle_touches_once() {
     {
         return;
     }
-    let snapshot = tauri::async_runtime::block_on(
-        crate::process_capture::process_tree::snapshot_process_table_public(),
-    );
-    if snapshot.is_unknown() {
+    // One look for every candidate: the process table, plus Claude Code's
+    // registry read for the candidates' subtrees — an npm-installed `claude`
+    // runs as `node`, and only its registry record says it is a `claude`.
+    let roots: Vec<u32> = candidates
+        .iter()
+        .filter_map(|(_, session, _, _)| session.child_pid())
+        .collect();
+    let look =
+        tauri::async_runtime::block_on(crate::terminal::graceful_exit::PaneLook::take(&roots));
+    if look.snapshot().is_unknown() {
         // Unreadable (or stale) table: nothing can be proven for any
         // candidate this tick.
         *PROBE_NOT_BEFORE_MS
@@ -246,9 +253,10 @@ pub fn scan_idle_touches_once() {
         return;
     }
 
+    let mut left_undecided = 0usize;
     for (tid, session, coord_session_id, since_ms) in candidates {
         match decide_candidate(crate::mcp::steward::pane_hosts_claude(
-            &snapshot,
+            &look,
             session.child_pid(),
         )) {
             CandidateDecision::Emit => {}
@@ -256,7 +264,10 @@ pub fn scan_idle_touches_once() {
                 settle_episode(tid, since_ms);
                 continue;
             }
-            CandidateDecision::Undecided => continue,
+            CandidateDecision::Undecided => {
+                left_undecided += 1;
+                continue;
+            }
         }
 
         // `&str`, not `Option` — a terminal with no identity-seam pin reports
@@ -284,6 +295,26 @@ pub fn scan_idle_touches_once() {
                     "operator_touch_watch: idle_at_prompt enqueue failed — will retry next tick"
                 );
             }
+        }
+    }
+
+    // A registry that could not be read leaves a candidate UNDECIDED only when
+    // its pane holds a process whose image could be a JS-runtime `claude`
+    // (`node`, `bun`); the candidates the image settles were handled above. An
+    // unreadable `sessions/` dir does not heal between ticks, so when it left
+    // any candidate open, further looks back off exactly as for an unreadable
+    // table. The condition itself is logged by the probe once per transition.
+    if left_undecided > 0 {
+        if let Some(why) = look.registry().incomplete_reason() {
+            *PROBE_NOT_BEFORE_MS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = now_ms + UNREADABLE_PROBE_BACKOFF_MS;
+            tracing::debug!(
+                left_undecided,
+                registry = %why,
+                "operator_touch_watch: Claude Code session registry unreadable — undecided \
+                 candidates retried after backoff"
+            );
         }
     }
 }
