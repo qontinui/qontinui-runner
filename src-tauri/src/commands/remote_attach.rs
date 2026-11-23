@@ -959,7 +959,12 @@ pub(crate) async fn open_remote_tab(
     if let Some(ctx) = report_ctx {
         pane.attach_report_context(ctx);
     }
-    // So a reattach that finds this grant expired can mint the next one.
+    // So a reattach that finds this grant expired can mint the next one, under
+    // the tenant this grant was minted in.
+    renewal_tenants()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(session_id.clone(), tenant.clone());
     client().set_grant_renewer(Arc::new(CoordGrantRenewer {
         app: app_handle.clone(),
     }));
@@ -1057,6 +1062,18 @@ struct CoordGrantRenewer {
     app: tauri::AppHandle,
 }
 
+/// The tenant each open remote tab's grant was minted under, by session id, so
+/// a renewal presents the SAME tenant's credential rather than the device
+/// default (a session in another tenant is `404 session_not_found`). One
+/// process-wide renewer serves every tab, so the tenant cannot live on it.
+fn renewal_tenants() -> &'static std::sync::Mutex<std::collections::HashMap<String, Option<String>>>
+{
+    static MAP: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, Option<String>>>,
+    > = std::sync::OnceLock::new();
+    MAP.get_or_init(Default::default)
+}
+
 impl GrantRenewer for CoordGrantRenewer {
     fn renew<'a>(
         &'a self,
@@ -1068,7 +1085,14 @@ impl GrantRenewer for CoordGrantRenewer {
         Box::pin(async move {
             let session = uuid::Uuid::parse_str(session_id)
                 .map_err(|e| format!("remote_attach:invalid_session_id: {session_id:?}: {e}"))?;
-            let minted = mint_attach_grant(&coord_base_for(&self.app), session).await?;
+            let tenant = renewal_tenants()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(session_id)
+                .cloned()
+                .flatten();
+            let scope = grant_scope(tenant).await?;
+            let minted = mint_attach_grant(&coord_base_for(&self.app), session, scope).await?;
             if let Some(refusal) = renewal_placement_refusal(
                 &session.to_string(),
                 target_device_id,
