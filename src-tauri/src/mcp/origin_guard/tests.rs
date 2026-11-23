@@ -70,6 +70,7 @@ const PROBES: &[(&str, &str, &str)] = &[
     ("GET", "/ui-bridge/control/elements", "elements"),
     ("POST", "/shell-commands/{id}/run", "shell_run"),
     ("POST", "/settings/ai/api-key", "ai_api_key"),
+    ("GET", "/terminal-layout", "terminal_layout"),
 ];
 
 fn harness_with(policy: &str, guard_env: Option<&str>, origins_env: Option<&str>) -> Harness {
@@ -1572,6 +1573,71 @@ fn the_edit_sibling_route_is_a_registered_door() {
         "POST".to_string(),
         "/agent-worktrees/edit-sibling".to_string()
     )));
+}
+
+/// `GET /terminal-layout` is a credential door (plan
+/// `2026-11-08-save-per-tab-runner-session-lists-on-sessions-page-kept-14-days`):
+/// it serves terminal titles, session ids, accounts and the device id, and no
+/// browser page needs any of it. Its one caller, qontinui-web's
+/// saved-session-lists capture, arrives over the backend relay shaped as
+/// below: loopback `Host`, the relay's marker header, and no `Origin` or
+/// `Sec-Fetch-*` (both relay hops strip them). That classifies NonBrowser and
+/// is admitted. Every browser origin is refused, the Trusted qontinui-web dev
+/// frontend included, and it is refused under the `off` route policy too: the
+/// door check comes before the policy. The handler counts zero calls for
+/// every refused request.
+#[tokio::test]
+async fn the_terminal_layout_door_admits_the_relayed_read_and_refuses_every_browser() {
+    assert!(is_credential_door("GET", "/terminal-layout"));
+    for policy in ["off", "enforce-doors", "enforce"] {
+        let h = harness(policy);
+        let relayed = req(
+            "GET",
+            "/terminal-layout",
+            &[
+                ("host", &host(&h)),
+                (
+                    crate::mcp::relay_path_policy::RELAYED_REQUEST_HEADER,
+                    crate::mcp::relay_path_policy::RELAYED_REQUEST_HEADER_VALUE,
+                ),
+            ],
+            "",
+        );
+        let (status, _, body) = send(&h, relayed).await;
+        assert_eq!(status, StatusCode::OK, "{policy}: the relayed read: {body}");
+        assert_eq!(h.calls.get("terminal_layout"), 1, "{policy}");
+
+        for origin in [WEB, EVIL, "chrome-extension://abcdefghijklmnop"] {
+            let (status, _, body) = send(
+                &h,
+                req(
+                    "GET",
+                    "/terminal-layout",
+                    &[("host", &host(&h)), ("origin", origin)],
+                    "",
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{policy} {origin}: {body}");
+        }
+        // A browser that sends no Origin but cross-site Fetch Metadata.
+        let (status, _, body) = send(
+            &h,
+            req(
+                "GET",
+                "/terminal-layout",
+                &[("host", &host(&h)), ("sec-fetch-site", "cross-site")],
+                "",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{policy} cross-site: {body}");
+        assert_eq!(
+            h.calls.get("terminal_layout"),
+            1,
+            "{policy}: no browser request reached the handler"
+        );
+    }
 }
 
 /// Grace tripwire: every graced route is a door and a registered route, and
