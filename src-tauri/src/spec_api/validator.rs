@@ -73,10 +73,12 @@ pub enum ValidatorError {
         /// so downstream emit sites (Plan 06 `FlywheelProposalDemoted`) can
         /// join against tracing spans / `workflow_verification_phase_results`.
         snapshot_id: String,
-        /// First failing assertion's `(state_id, assertion_id)`. None when
-        /// the red came from policy `Indeterminate` over a fully-passing
-        /// result set (e.g. empty in-scope assertions); the demote emit
-        /// substitutes an empty string in that case.
+        /// `(state_id, assertion_id)` of the first failing assertion, else of
+        /// the first unknown one (see `first_failing_assertion`), so an
+        /// `Indeterminate` red caused by an unknown still names its
+        /// assertion. None when no assertion failed or was unknown (e.g.
+        /// policy `Indeterminate` over empty in-scope assertions); the demote
+        /// emit substitutes an empty string in that case.
         failing_assertion: Option<(String, String)>,
     },
 }
