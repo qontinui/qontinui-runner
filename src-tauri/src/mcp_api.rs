@@ -23672,20 +23672,27 @@ mod supervised_workers_health_tests {
     /// loop moves its row from `DEFERRED` to `SUPERVISED` — an inline row's
     /// needle then becomes the `::spawn_<role>(` call that replaced the body.
     ///
-    /// Closure: every spawn site in the region (`::spawn(` / `.spawn(`) holds
-    /// exactly one `Site::Spawn` needle; every `::spawn_*(` / `::start_*(` /
-    /// `.spawn_*(` / `.start_*(` call is covered by as many rows as it has
+    /// Closure: every spawn site in the region (`::spawn(` / `.spawn(` / a
+    /// word-boundary bare `spawn(` — `tokio::spawn`, `std::thread::spawn`, a
+    /// runtime `Handle`'s spawn, or a `use`-imported one) holds exactly one
+    /// `Site::Spawn` needle; every `::spawn_*(` / `::start_*(` / `.spawn_*(` /
+    /// `.start_*(` / `.start(` / `::start(` call (and an unqualified
+    /// `spawn_*(` / `start_*(`) is covered by as many rows as it has
     /// occurrences; every needle is found exactly once (a moved or renamed
     /// region goes red instead of passing with nothing counted); registry names
     /// are unique.
     ///
     /// The census boundary — what this test does NOT see:
-    /// - a starter named some other way (not `spawn_*` / `start_*`, qualified
-    ///   or bare, and not a spawn written inline in the region);
+    /// - a starter named some other way (not `spawn` / `start` / `spawn_*` /
+    ///   `start_*`, qualified or bare, and not a spawn written inline in the
+    ///   region);
     /// - tasks a callee starts beneath a classified row:
     ///   `WrapperState::new_default`'s `spawn_health_loop` / `spawn_idle_reaper`
-    ///   (`wrappers/manager.rs`) and the trigger service's nested bridge loop
-    ///   (`trigger_system/service.rs`);
+    ///   (`wrappers/manager.rs`), the trigger service's nested bridge loop
+    ///   (`trigger_system/service.rs`), and the browse `std::thread` that
+    ///   `MdnsScanner::start` (`mcp/discovery/mdns_scanner.rs`) spawns — that
+    ///   call itself IS counted, as the DEFERRED `mdns_scanner.browse_thread`
+    ///   row;
     /// - the loops `main.rs` starts, classified by `worker_supervisor`'s own
     ///   `every_phase4_entry_point_is_classified` (its DEFERRED set).
     ///
@@ -23693,6 +23700,54 @@ mod supervised_workers_health_tests {
     /// `2026-10-04-runner-mcp-api-rs-holds-the-http-composition-root-health-and-five-proxies-in-one-file`
     /// Phase 7b moves the boot spawns into `router/boot_tasks.rs`, this census
     /// moves with them and reads `boot_tasks::spawn_all` instead.
+    /// A census spawn site: `::spawn(` / `.spawn(` (tokio, `std::thread`, a
+    /// runtime `Handle`) or a word-boundary bare `spawn(` (a `use`-imported
+    /// spawn). `spawn_blocking(` and other `spawn_*(` starters do not match.
+    fn is_spawn_site(line: &str) -> bool {
+        line.contains("::spawn(")
+            || line.contains(".spawn(")
+            || line.match_indices("spawn(").any(|(at, _)| {
+                !line
+                    .get(..at)
+                    .unwrap_or_default()
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':' || c == '.')
+            })
+    }
+
+    /// The body of the first `fn <name>(` item in `text`, at any indent (an
+    /// item in an inline module is indented): from its declaration line to
+    /// the first later line that is `}` at the declaration's indent. Comment
+    /// lines are dropped.
+    fn fn_item_body(text: &str, name: &str) -> Option<String> {
+        let lines: Vec<&str> = text.lines().collect();
+        let decl = format!("fn {name}(");
+        let start = lines.iter().position(|l| {
+            let t = l.trim_start();
+            let t = t
+                .strip_prefix("pub(crate) ")
+                .or(t.strip_prefix("pub "))
+                .unwrap_or(t);
+            let t = t.strip_prefix("async ").unwrap_or(t);
+            t.starts_with(&decl)
+        })?;
+        let indent: String = lines[start]
+            .chars()
+            .take_while(|c| c.is_whitespace())
+            .collect();
+        let close = format!("{indent}}}");
+        let len = lines[start..].iter().position(|l| *l == close)?;
+        Some(
+            lines[start..=start + len]
+                .iter()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .copied()
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    }
+
     #[test]
     fn every_create_router_boot_task_is_classified() {
         const PHASE1_2: &str = "migration target of plan \
@@ -23864,6 +23919,17 @@ mod supervised_workers_health_tests {
             ),
             (
                 Site::Call,
+                "scanner.start(event_tx)",
+                "mdns_scanner.browse_thread",
+                "MdnsScanner::start spawns a bare std::thread that drains the mdns-sd browse \
+                 receiver into event_tx for the life of the process; a panic in it ends LAN \
+                 discovery silently (event_tx drops with it, so the mdns_scanner.events task \
+                 then returns too). \
+                 worker_supervisor supervises tokio tasks, not threads, so this needs its own \
+                 design — not one-shot, not supervised",
+            ),
+            (
+                Site::Call,
                 "crate::util::egress_context::spawn_baseline_logger()",
                 "egress_context.baseline_logger",
                 PHASE1_2,
@@ -23942,12 +24008,14 @@ mod supervised_workers_health_tests {
             needle_line.push(lines.iter().position(|l| l.contains(needle)));
         }
 
-        // Spawn sites: a line holding `::spawn(` or `.spawn(`. Its body runs
-        // to the next line at the same indent that closes it (rustfmt shape);
-        // a site whose line ends in `;` is one line long.
+        // Spawn sites: a line holding `::spawn(` or `.spawn(` (tokio, a
+        // std::thread, a runtime `Handle`) or a word-boundary bare `spawn(` (a
+        // `use`-imported one). Its body runs to the next line at the same
+        // indent that closes it (rustfmt shape); a site whose line ends in `;`
+        // is one line long.
         let mut spans: Vec<(usize, usize)> = Vec::new();
         for (i, line) in lines.iter().enumerate() {
-            if !(line.contains("::spawn(") || line.contains(".spawn(")) {
+            if !is_spawn_site(line) {
                 continue;
             }
             let indent = line.len() - line.trim_start().len();
@@ -24008,18 +24076,27 @@ mod supervised_workers_health_tests {
             ));
         }
 
+        // A `start` with no suffix is a starter too: `MdnsScanner::start`
+        // spawns a std::thread. Counted like the suffixed tokens below.
+        let mut tokens: std::collections::BTreeMap<String, usize> = Default::default();
+        for token in [".start(", "::start("] {
+            let count = region_text.matches(token).count();
+            if count > 0 {
+                tokens.insert(token.to_string(), count);
+            }
+        }
+
         // Starter calls: each distinct `::spawn_x(` / `::start_x(` /
         // `.spawn_x(` / `.start_x(` token is covered by as many rows as it
         // occurs.
-        let mut tokens: std::collections::BTreeMap<String, usize> = Default::default();
         for prefix in ["::spawn_", "::start_", ".spawn_", ".start_"] {
             for (at, _) in region_text.match_indices(prefix) {
-                let rest = &region_text[at + prefix.len()..];
+                let rest = region_text.get(at + prefix.len()..).unwrap_or_default();
                 let ident_len = rest
                     .find(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'))
                     .unwrap_or(rest.len());
-                if ident_len > 0 && rest[ident_len..].starts_with('(') {
-                    let token = format!("{prefix}{}(", &rest[..ident_len]);
+                if ident_len > 0 && rest.get(ident_len..).is_some_and(|r| r.starts_with('(')) {
+                    let token = format!("{prefix}{}(", rest.get(..ident_len).unwrap_or_default());
                     *tokens.entry(token).or_default() += 1;
                 }
             }
@@ -24032,21 +24109,27 @@ mod supervised_workers_health_tests {
         let mut bare: std::collections::BTreeMap<String, usize> = Default::default();
         for prefix in ["spawn_", "start_"] {
             for (at, _) in region_text.match_indices(prefix) {
-                let before = region_text[..at].chars().next_back();
+                let before = region_text
+                    .get(..at)
+                    .unwrap_or_default()
+                    .chars()
+                    .next_back();
                 if before.is_some_and(|c| is_ident(c) || c == ':' || c == '.') {
                     continue;
                 }
-                let rest = &region_text[at + prefix.len()..];
+                let rest = region_text.get(at + prefix.len()..).unwrap_or_default();
                 let ident_len = rest.find(|c: char| !is_ident(c)).unwrap_or(rest.len());
-                if ident_len > 0 && rest[ident_len..].starts_with('(') {
-                    let token = format!("{prefix}{}(", &rest[..ident_len]);
+                if ident_len > 0 && rest.get(ident_len..).is_some_and(|r| r.starts_with('(')) {
+                    let token = format!("{prefix}{}(", rest.get(..ident_len).unwrap_or_default());
                     *bare.entry(token).or_default() += 1;
                 }
             }
         }
         let names_bare = |needle: &str, token: &str| {
             needle.match_indices(token).any(|(at, _)| {
-                !needle[..at]
+                !needle
+                    .get(..at)
+                    .unwrap_or_default()
                     .chars()
                     .next_back()
                     .is_some_and(|c| is_ident(c) || c == ':' || c == '.')
@@ -24072,7 +24155,11 @@ mod supervised_workers_health_tests {
         }
 
         // SUPERVISED: the entry fn goes through worker_supervisor under its
-        // registry name and holds no bare spawn.
+        // registry name and holds no bare spawn — by the same spawn-site
+        // predicate as the region scan, over every line of the entry fn
+        // (including a factory closure written inline in it). A factory or run
+        // body that lives in a SEPARATE fn the entry fn calls is outside this
+        // check.
         let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         for (_, needle, file, signature, name) in SUPERVISED {
             let fn_name = signature
@@ -24110,8 +24197,11 @@ mod supervised_workers_health_tests {
                     "{file} `{signature}` does not go through worker_supervisor::spawn_supervised*"
                 ));
             }
-            if entry.contains("tokio::spawn(") || entry.contains("tauri::async_runtime::spawn(") {
-                violations.push(format!("{file} `{signature}` holds a bare spawn"));
+            if let Some(site) = entry.lines().find(|l| is_spawn_site(l)) {
+                violations.push(format!(
+                    "{file} `{signature}` holds a bare spawn: `{}`",
+                    site.trim()
+                ));
             }
             // The name as a literal in the entry fn, or a `const X: &str =
             // "<name>";` in the file whose X the entry fn uses.
@@ -24135,27 +24225,66 @@ mod supervised_workers_health_tests {
             }
         }
 
-        // TASK_SUPERVISED: each auto_start_* callee's module still starts its
-        // worker through mcp::task_supervisor, so a row cannot go on claiming
-        // supervision after the module drops it.
-        for file in [
-            "mcp/backend_relay.rs",
-            "mcp/device_jwt_refresher.rs",
-            "mcp/fleet_policy_poller.rs",
-            "mcp/session_message_poller.rs",
-        ] {
+        // TASK_SUPERVISED: each row's `auto_start_*` fn (an indented item in
+        // the file's `commands` module) still calls its start fn, and that
+        // column-0 start fn still starts the worker through
+        // mcp::task_supervisor — read from the two extracted item bodies, not
+        // the whole file, so a row cannot go on claiming supervision after the
+        // path drops it while some other fn in the file keeps the call.
+        // (file, auto_start fn, start fn it calls).
+        const TASK_SUPERVISED_PATHS: &[(&str, &str, &str)] = &[
+            (
+                "mcp/backend_relay.rs",
+                "auto_start_cloud_relay",
+                "start_relay",
+            ),
+            (
+                "mcp/device_jwt_refresher.rs",
+                "auto_start_device_jwt_refresher",
+                "start_refresher",
+            ),
+            (
+                "mcp/fleet_policy_poller.rs",
+                "auto_start_fleet_policy_poller",
+                "start_poller",
+            ),
+            (
+                "mcp/session_message_poller.rs",
+                "auto_start_session_message_poller",
+                "start_poller",
+            ),
+        ];
+        for (_, needle, _) in TASK_SUPERVISED {
+            if !TASK_SUPERVISED_PATHS
+                .iter()
+                .any(|(_, auto_start, _)| needle.ends_with(&format!("::{auto_start}(")))
+            {
+                violations.push(format!(
+                    "TASK_SUPERVISED needle `{needle}` has no TASK_SUPERVISED_PATHS row"
+                ));
+            }
+        }
+        for (file, auto_start, start_fn) in TASK_SUPERVISED_PATHS {
             let path = src_root.join(file);
             let text = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-            let supervised = text.lines().any(|l| {
-                !l.trim_start().starts_with("//")
-                    && l.contains("task_supervisor::spawn_supervised(")
-            });
-            if !supervised {
+            let Some(auto_body) = fn_item_body(&text, auto_start) else {
+                violations.push(format!("{file}: no `fn {auto_start}(` item"));
+                continue;
+            };
+            if !auto_body.contains(&format!(" {start_fn}(")) {
                 violations.push(format!(
-                    "{file} no longer calls task_supervisor::spawn_supervised — its TASK_SUPERVISED \
+                    "{file} `{auto_start}` no longer calls `{start_fn}(` — its TASK_SUPERVISED \
                      row is stale; re-classify it"
                 ));
+            }
+            match fn_item_body(&text, start_fn) {
+                Some(start_body) if start_body.contains("task_supervisor::spawn_supervised(") => {}
+                Some(_) => violations.push(format!(
+                    "{file} `{start_fn}` no longer calls task_supervisor::spawn_supervised — the \
+                     TASK_SUPERVISED row for `{auto_start}` is stale; re-classify it"
+                )),
+                None => violations.push(format!("{file}: no `fn {start_fn}(` item")),
             }
         }
 
