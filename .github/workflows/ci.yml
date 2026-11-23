@@ -2452,7 +2452,10 @@ jobs:
           def rx(glob):
               out, i = "", 0
               while i < len(glob):
-                  if glob.startswith("**/", i):
+                  # Recursive only where globset reads it so: at the start
+                  # or after `/`. Elsewhere `**` is two plain stars, and a
+                  # wider match would make the mapped-file check below narrow.
+                  if glob.startswith("**/", i) and (i == 0 or glob[i - 1] == "/"):
                       out += "(?:.*/)?"; i += 3
                   elif glob[i] == "*":
                       out += ".*"; i += 1
