@@ -632,6 +632,12 @@ async fn resume_one(
         Ok(claim) => claim,
         Err(why) => return ResumeRow::skipped(&cand.id, why),
     };
+    // Wait out a runner-owned CLI install FIRST, before the live-holder and
+    // drain checks below: the `--resume` resolver waits on the same flag, and
+    // a wait taken after those checks would leave them up to
+    // `claude_cli_spawn::CLI_UPDATE_WAIT` stale by spawn time. Returns at once
+    // when no install is running.
+    crate::claude_cli_spawn::await_cli_update_quiescent().await;
     // Under a model gateway the resumed pane runs with the gateway's
     // CLAUDE_CONFIG_DIR (finalize_child_env pins it), where this session's
     // transcript does not exist, so `--resume` would find nothing. Refuse the

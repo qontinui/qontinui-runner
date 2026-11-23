@@ -22,6 +22,10 @@
 //! | [`Mover::Seam`] | the re-key seam confirms (row, id) | `bind_transcript_session` entries only |
 //! | [`Mover::Repair`] | a finish finds the entry off the live pane row | `bind_transcript_session` entries only |
 //!
+//! After a live-pane adoption or a seam move, a finish another row ACKed is
+//! re-offered to the pane row (plan D5, the sibling `finish_reoffer` module;
+//! the bind trigger cannot qualify — see there).
+//!
 //! **Known gap — transcript history is not replayed onto the new row.** Chunks
 //! emitted after a move address the new row; those emitted before it stay on
 //! the old one. The tailer's lane offset and unsent-prefix floor are keyed by
@@ -436,6 +440,11 @@ impl AiCoordRegistrar {
     ///    ([`Self::deliver_owed_finish`]), so an owed mark resolves to the new
     ///    row, never the dead one.
     ///
+    /// The bind does NOT re-offer a finish the old row ACKed (plan D5): the
+    /// pane's bind instant is stamped at this very bind, so the id's ownership
+    /// of the new row begins after any finish already ACKed, and the revival
+    /// guard would refuse every time. See the `finish_reoffer` module.
+    ///
     /// **The bind does NOT advance the row's owner** (plan D1: only the seam
     /// advances it; D4: the bind trigger checks the owner half only). A pin is
     /// the id the pane was SPAWNED with, not evidence of what it runs after a
@@ -520,6 +529,12 @@ impl AiCoordRegistrar {
     ///    not. A sniffed or pinned-plane entry is never moved, and an absent
     ///    entry is never bound: binding here would skip auto-bind's replay of
     ///    the transcript's backlog.
+    /// 3. After a `Moved`, and on every tick whose entry already names `row`
+    ///    (`Unchanged`), re-offers a finish another row ACKed to `row`
+    ///    ([`Self::reoffer_finish_to`], plan D5). The observer does not carry
+    ///    whether the seam answered `Queued` or `AlreadyCurrent`, so both
+    ///    re-offer; the re-offer's own conditions (finished, ACKed by another
+    ///    row, owned since before the finish) make that idempotent.
     ///
     /// Runs outside every registry lock (the seam fires after
     /// `confirm_claude_code_session_id` returns) and reads the terminal plane.
@@ -534,11 +549,17 @@ impl AiCoordRegistrar {
         if self.inner.pane_rows.sweep_due(now) {
             self.sweep_closed_pane_rows();
         }
+        // Only a row a live terminal holds may carry history or become an
+        // owner: a retried confirmation for a pane that has since closed must
+        // not displace the id's entry on the pane that runs it now.
+        let row_facts = self.pane_row_facts(row);
+        if row_facts.is_some() {
+            // EVERY source feeds the row's history (plan D5's revival guard):
+            // a `/clear` successor seen only through rung 2 or the R2 resume
+            // still marks the row as having run another id.
+            self.inner.pane_rows.observe(row, claude_session_id);
+        }
         if source.observes_running_id() {
-            // Only a row a live terminal holds may become an owner: a retried
-            // confirmation for a pane that has since closed must not displace
-            // the id's entry on the pane that runs it now.
-            let row_facts = self.pane_row_facts(row);
             let row_seq = row_facts.and_then(|f| f.bind_seq);
             // The same pin rule `live_terminal_row` applies: a pin whose row
             // another id owns (the pinned pane `/clear`ed) is not a later pane
@@ -561,7 +582,15 @@ impl AiCoordRegistrar {
         }
         match self.live_terminal_row(claude_session_id) {
             Some(live) if live.row == row => {
-                self.move_onto_pane_row(claude_session_id, row, Mover::Seam, live.tenant)
+                let moved =
+                    self.move_onto_pane_row(claude_session_id, row, Mover::Seam, live.tenant);
+                // Plan D5: after a move, and on every tick whose entry already
+                // names the row (a stale row's ACK that drained after the
+                // move), re-offer a finish another row ACKed.
+                if matches!(moved, MoveOutcome::Moved { .. } | MoveOutcome::Unchanged) {
+                    self.reoffer_finish_on(claude_session_id, row, Some(live));
+                }
+                moved
             }
             _ => MoveOutcome::NotLivePane,
         }
@@ -571,15 +600,14 @@ impl AiCoordRegistrar {
     /// on a row other than its live pane row, move it there ([`Mover::Repair`]:
     /// auto-bind entries only) and count it. Never binds: an unbound id's
     /// finish resolves through the owner-checked terminal arm.
-    pub(super) fn repair_onto_live_pane(&self, claude_session_id: &str) {
-        let Some(current) = self.session_id_for(claude_session_id) else {
-            return;
-        };
-        let Some(live) = self.live_terminal_row(claude_session_id) else {
-            return;
-        };
+    ///
+    /// Returns the pane row when it MOVED the entry there, so the forward can
+    /// record that row as the one the mark was sent to (plan D5).
+    pub(super) fn repair_onto_live_pane(&self, claude_session_id: &str) -> Option<Uuid> {
+        let current = self.session_id_for(claude_session_id)?;
+        let live = self.live_terminal_row(claude_session_id)?;
         if live.row == current {
-            return;
+            return None;
         }
         if let MoveOutcome::Moved { from } =
             self.move_onto_pane_row(claude_session_id, live.row, Mover::Repair, live.tenant)
@@ -590,6 +618,8 @@ impl AiCoordRegistrar {
                  — a mover missed this ordering",
                 claude_session_id, from, live.row
             );
+            return Some(live.row);
         }
+        None
     }
 }

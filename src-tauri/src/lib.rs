@@ -147,6 +147,9 @@ pub mod mcp_spill;
 // dependencies then, so the move was mechanical; it has gained three since:
 // `crate::instance_env` (its default data root) and, in its test harness,
 // `crate::process_helpers` and `crate::runner_breadcrumb`.
+// The one predicate for "this directory is a cargo target dir", shared by the
+// embedded-PG test harness here and the bin crate's orphan-target reaper.
+pub mod cargo_target_marker;
 pub mod embedded_pg;
 pub mod env_agent;
 

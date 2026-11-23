@@ -6,7 +6,10 @@
 //! excluded a second resume-door call but nothing else: a resume-door call
 //! naming a session that was mid-account-migration passed straight through.
 //! Three movers claim here — the account migration, the resume door and the
-//! cross-machine respawn receiver — and each refuses an id another holds.
+//! cross-machine respawn receiver — and each refuses an id another holds. A
+//! usage-limit reset-continue (`limit-reset-continue`, in
+//! `terminal::account_migration`) claims here too, for as long as it may type
+//! into the session's pane, so no mover starts under it.
 //!
 //! The lifecycle poll reads it too ([`hold_for_in_flight_respawn`]). While a
 //! respawn is proving its new pane alive (up to 3 minutes, with retries), the

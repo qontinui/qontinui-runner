@@ -19,6 +19,15 @@
 //!    (`refresh_account_usage_snapshot`) and require the *probe* to agree the
 //!    session's account is exhausted. Conversation text that merely quotes a
 //!    limit message never migrates anything.
+//!
+//!    The session's transcript is read too ([`super::limit_stop`]): a session
+//!    that STOPPED at a limit whose account has since reset is continued in
+//!    place rather than skipped as echoed text, and a stop that can neither
+//!    continue nor migrate yet is parked until its reset
+//!    ([`super::limit_reset::decide`], plan 2026-11-05 Phase 2). Only the
+//!    migration below is gated by `auto_migrate_on_token_exhaustion` and the
+//!    two-account check; the continue has its own switch,
+//!    `claude_cli.auto_continue_after_limit_reset`.
 //! 3. **Pick target** — a non-exhausted, credential-valid, non-cooled account,
 //!    chosen by the selection mode's handoff strategy (`pick_migration_target`;
 //!    `WeightedRandom`, the default, and `AlternatingHandoff` are described in
@@ -59,7 +68,7 @@
 //! receiver for the same session is refused too, and the lifecycle poll holds
 //! its row — and also refuses a session that already moved or is closed),
 //! settings kill-switch
-//! (`claude_cli.auto_migrate_on_token_exhaustion`), and a no-op with fewer
+//! (`claude_cli.auto_migrate_on_token_exhaustion`), and no migration with fewer
 //! than two configured accounts. A refusal by [`begin_migration`] is not a
 //! failure: the automatic path logs it, reports nothing to the UI and gives
 //! back the cap slot it took ([`settle_hint_migration`]). The manual Tauri
@@ -127,6 +136,27 @@ pub(crate) fn migration_cap_permits(claude_session_id: &str, now_ms: i64) -> boo
     }
     entry.push(now_ms);
     true
+}
+
+/// When each session last moved to another account in this process (unix
+/// millis), recorded once its replacement pane is up. Read by the usage-limit
+/// hint ([`super::limit_reset::HintInputs::migrated_at_ms`]).
+static LAST_MIGRATED: Mutex<Option<HashMap<String, i64>>> = Mutex::new(None);
+
+fn note_migrated(claude_session_id: &str, at_ms: i64) {
+    let mut last = LAST_MIGRATED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    last.get_or_insert_with(HashMap::new)
+        .insert(claude_session_id.to_string(), at_ms);
+}
+
+/// When `claude_session_id` last moved to another account in this process.
+fn last_migrated_at(claude_session_id: &str) -> Option<i64> {
+    let last = LAST_MIGRATED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    last.as_ref()?.get(claude_session_id).copied()
 }
 
 /// Give back one cap slot [`migration_cap_permits`] took at `stamp` for a
@@ -457,9 +487,10 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
         return;
     };
 
-    // A respawn is already moving this session (a migration proving its new
-    // pane alive — whose `--resume` repaint can re-render the old limit
-    // banner — the resume door, the respawn receiver). Stand down before the
+    // Another mover holds this session (a migration proving its new pane
+    // alive — whose `--resume` repaint can re-render the old limit banner —
+    // the resume door, the respawn receiver, or a reset-continue typing into
+    // the pane). Stand down before the
     // usage probe below marks an account rate-limited and the cap charges a
     // slot. This read is the cheap early exit only; the race-free decision is
     // the claim inside [`begin_migration`], whose refusal gives the slot back
@@ -468,7 +499,7 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
         info!(
             terminal_id,
             session = %record.claude_session_id,
-            "usage-limit hint on a session a respawn is already moving — ignoring"
+            "usage-limit hint on a session another mover (a respawn or a reset-continue) holds — ignoring"
         );
         return;
     }
@@ -489,32 +520,21 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
         return;
     };
 
-    let ai_settings = crate::settings::get_ai_settings();
-    if !ai_settings.claude_cli.auto_migrate_on_token_exhaustion {
-        info!(
-            session = %record.claude_session_id,
-            "usage-limit confirmed-candidate but auto-migration is disabled in settings"
-        );
-        return;
-    }
-    if crate::settings::get_claude_config_dirs().len() < 2 {
-        return; // nothing to migrate to
-    }
-
-    // CONFIRM: a usage-limit *message* is only a hint (conversation text can
-    // quote one; a resume repaint can re-render a historical one). Re-probe
-    // and require the account to actually be exhausted before acting.
-    let usage = crate::commands::ai_settings::refresh_account_usage_snapshot().await;
-    if !crate::ai_provider::account_known_exhausted(&src) {
-        info!(
-            terminal_id,
-            session = %record.claude_session_id,
-            account = %src,
-            matched_pattern,
-            "usage-limit message NOT confirmed by probe — skipping (likely echoed text)"
-        );
-        return;
-    }
+    // Transcript, probe, decision: skip, park or continue here; a migration
+    // comes back to run below (plan 2026-11-05 Phase 2).
+    let env = ProdHintEnv {
+        app: &app,
+        record: &record,
+        src: &src,
+        matched_pattern,
+    };
+    let (park_fallback, usage) = match super::limit_hint::run_hint(&env, &src).await {
+        super::limit_hint::HintFlow::Done => return,
+        super::limit_hint::HintFlow::Migrate {
+            park_fallback,
+            usage,
+        } => (park_fallback, usage),
+    };
 
     // Keep spawn-time selection off the dead account, and repoint the global
     // resolved dir so unrelated new sessions stop landing on it. When the
@@ -541,7 +561,13 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
             cap = MIGRATION_CAP,
             "migration cap reached for this session — not migrating again"
         );
-        emit_skipped(&app, &record, &src, "migration-cap-reached");
+        report_migration_refused(
+            &app,
+            &record,
+            &src,
+            park_fallback,
+            super::limit_reset::ParkReason::MigrationCapReached,
+        );
         return;
     }
 
@@ -551,7 +577,17 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
             from = %src,
             "no usable migration target (every other account exhausted/cooled/unauthenticated)"
         );
-        emit_skipped(&app, &record, &src, "no-usable-target");
+        // No migration ran, so the cap slot goes back: the parked stop
+        // re-enters within the hour, and three re-entries must not fill the
+        // cap for a session that never moved.
+        refund_migration_cap(&record.claude_session_id, cap_stamp);
+        report_migration_refused(
+            &app,
+            &record,
+            &src,
+            park_fallback,
+            super::limit_reset::ParkReason::NoUsableTarget,
+        );
         return;
     };
 
@@ -584,6 +620,384 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
         || crate::ai_provider::unrecord_handoff(&dst),
         |reason| emit_skipped(&app, &record, &src, reason),
     );
+}
+
+/// [`super::limit_hint::HintEnv`] over the runner's real settings, probes,
+/// transcript, park list and idle watcher, for one session.
+struct ProdHintEnv<'a> {
+    app: &'a tauri::AppHandle,
+    record: &'a TerminalSessionRecord,
+    src: &'a str,
+    matched_pattern: &'static str,
+}
+
+impl super::limit_hint::HintEnv for ProdHintEnv<'_> {
+    fn switches(&self) -> super::limit_hint::HintSwitches {
+        super::limit_hint::hint_switches(&crate::settings::get_ai_settings().claude_cli)
+    }
+
+    fn finished(&self) -> bool {
+        self.record.finished_at.is_some()
+    }
+
+    fn config_dir_count(&self) -> usize {
+        crate::settings::get_claude_config_dirs().len()
+    }
+
+    async fn read_stop(&self) -> super::limit_stop::LimitStopRead {
+        read_limit_stop(self.record, self.src).await
+    }
+
+    async fn roster_probe(&self) -> Vec<crate::commands::ai_settings::AccountUsageInfo> {
+        crate::commands::ai_settings::refresh_account_usage_snapshot().await
+    }
+
+    async fn own_probe(&self) -> crate::commands::ai_settings::AccountUsageInfo {
+        crate::commands::ai_settings::probe_account_usage(self.src.to_string()).await
+    }
+
+    fn known_exhausted(&self) -> bool {
+        crate::ai_provider::account_known_exhausted(self.src)
+    }
+
+    fn row_exhausted(&self, row: &crate::commands::ai_settings::AccountUsageInfo) -> bool {
+        crate::commands::ai_settings::probe_result_exhausted(row)
+    }
+
+    fn migrated_at(&self) -> Option<i64> {
+        last_migrated_at(&self.record.claude_session_id)
+    }
+
+    fn note_unknown_park(&self, entry_uuid: &str) -> u32 {
+        super::limit_reset::with_ledger(&super::limit_reset::LEDGER, |l| {
+            l.note_unknown_park(&self.record.claude_session_id, entry_uuid)
+        })
+    }
+
+    fn clear_unknown_parks(&self, entry_uuid: &str) {
+        super::limit_reset::with_ledger(&super::limit_reset::LEDGER, |l| {
+            l.clear_unknown_parks(&self.record.claude_session_id, entry_uuid)
+        });
+    }
+
+    fn now_ms(&self) -> i64 {
+        chrono::Utc::now().timestamp_millis()
+    }
+
+    fn skip(&self, why: super::limit_reset::SkipReason, read: &super::limit_stop::LimitStopRead) {
+        info!(
+            terminal_id = %self.record.terminal_id,
+            session = %self.record.claude_session_id,
+            account = %self.src,
+            matched_pattern = self.matched_pattern,
+            skip = ?why,
+            transcript = ?read,
+            "{}",
+            skip_message(why)
+        );
+    }
+
+    fn park(&self, due_at_ms: i64, reason: super::limit_reset::ParkReason) {
+        park_stop(self.app, self.record, self.src, due_at_ms, reason);
+    }
+
+    fn forget_park(&self) {
+        super::limit_stop::with_parks(|p| p.forget(&self.record.terminal_id));
+    }
+
+    async fn continue_stop(&self, stop: super::limit_stop::LimitStop) {
+        continue_after_reset(self.app, self.record, self.src, stop).await;
+    }
+}
+
+/// The session's transcript, classified ([`super::limit_stop`]), read off the
+/// async workers. A record with no working dir cannot be located: UNKNOWN.
+async fn read_limit_stop(
+    record: &TerminalSessionRecord,
+    src: &str,
+) -> super::limit_stop::LimitStopRead {
+    let Some(working_dir) = record.working_dir.clone() else {
+        return super::limit_stop::LimitStopRead::Unreadable(
+            "session record has no working_dir — cannot locate transcript".to_string(),
+        );
+    };
+    let path = super::transcript::session_transcript_path(
+        Path::new(src),
+        &working_dir,
+        &record.claude_session_id,
+    );
+    qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+        super::limit_stop::transcript_limit_stop(&path)
+    })
+    .await
+    .unwrap_or_else(|e| {
+        super::limit_stop::LimitStopRead::Unreadable(format!(
+            "transcript read task did not complete: {e}"
+        ))
+    })
+}
+
+/// The log line for a hint that does nothing.
+fn skip_message(why: super::limit_reset::SkipReason) -> &'static str {
+    use super::limit_reset::SkipReason;
+    match why {
+        SkipReason::Finished => {
+            "usage-limit hint on a session marked finished — never continuing it"
+        }
+        SkipReason::Echoed => {
+            "usage-limit message, but the transcript shows no limit stop and the account is not read as exhausted — skipping (likely echoed text)"
+        }
+        SkipReason::TranscriptUnreadable => {
+            "limit stop UNKNOWN — transcript unreadable; account not exhausted, so nothing is typed"
+        }
+        SkipReason::ContinueDisabled => {
+            "limit stop that only a reset-continue could resolve, and auto_continue_after_limit_reset is disabled in settings"
+        }
+        SkipReason::MigrateDisabled => {
+            "usage-limit confirmed-candidate but auto-migration is disabled in settings"
+        }
+        SkipReason::NoOtherAccount => "usage-limit hint but there is no other account to migrate to",
+        SkipReason::Disabled => {
+            "usage-limit hint but both auto-migration and the reset-continue are disabled in settings"
+        }
+        SkipReason::MigratedSinceStop => {
+            "limit stop predates this session's latest migration, onto an account that is not exhausted, and auto_continue_after_migration is off — not prompted"
+        }
+    }
+}
+
+/// Park a stopped session until `due_at_ms` and report it as a park — never
+/// as `session-account-migration-skipped`, whose toast reads "out of tokens …
+/// NOT migrated" (false for an account that has already reset).
+fn park_stop(
+    app: &tauri::AppHandle,
+    record: &TerminalSessionRecord,
+    src: &str,
+    due_at_ms: i64,
+    reason: super::limit_reset::ParkReason,
+) {
+    info!(
+        terminal_id = %record.terminal_id,
+        session = %record.claude_session_id,
+        account = %src,
+        due_at_ms,
+        reason = reason.as_str(),
+        "limit stop parked"
+    );
+    super::limit_reset::report_park(
+        &record.terminal_id,
+        &record.claude_session_id,
+        src,
+        due_at_ms,
+        reason,
+        super::limit_stop::park,
+        |event, payload| {
+            if let Err(e) = app.emit(event, payload) {
+                warn!(error = %e, "failed to emit {event}");
+            }
+        },
+    );
+}
+
+/// The cap or the target pick refused the migration: park a stop, report
+/// anything else as before.
+fn report_migration_refused(
+    app: &tauri::AppHandle,
+    record: &TerminalSessionRecord,
+    src: &str,
+    park_fallback: Option<i64>,
+    reason: super::limit_reset::ParkReason,
+) {
+    match super::limit_reset::migration_refused(
+        park_fallback,
+        reason,
+        chrono::Utc::now().timestamp_millis(),
+    ) {
+        super::limit_reset::RefusalReport::Park { due_at_ms, reason } => {
+            park_stop(app, record, src, due_at_ms, reason)
+        }
+        super::limit_reset::RefusalReport::Skipped(why) => emit_skipped(app, record, src, why),
+    }
+}
+
+/// Continue a stopped session in place, its account having reset: claim the
+/// stop, close the CLI's `/rate-limit-options` menu with its own one `Esc` if
+/// it is showing, then submit [`super::limit_reset::LIMIT_RESET_NUDGE`]
+/// through the idle watcher. No migration cap slot is spent.
+///
+/// The whole continue holds the session in the ONE in-flight registry
+/// ([`claim_for_continue`]), like every other mover: a migration, the resume
+/// door or the respawn receiver cannot start on this session while a prompt
+/// may still be typed into its pane, and a continue does not start while one
+/// of them is moving it (the stop is re-parked instead).
+async fn continue_after_reset(
+    app: &tauri::AppHandle,
+    record: &TerminalSessionRecord,
+    src: &str,
+    stop: super::limit_stop::LimitStop,
+) {
+    use super::limit_reset::{ContinueRun, ParkReason, Settled};
+    let terminal_id = record.terminal_id.clone();
+    let _in_flight = match claim_for_continue(&record.claude_session_id) {
+        Ok(claim) => claim,
+        Err(holder) => {
+            if !continue_refusal_reparks(holder) {
+                info!(
+                    terminal_id,
+                    session = %record.claude_session_id,
+                    "limit-reset-continue not started — another continue of this session is running and settles its stop"
+                );
+                return;
+            }
+            info!(
+                terminal_id,
+                session = %record.claude_session_id,
+                holder,
+                "limit-reset-continue not started — another mover holds this session; re-parked"
+            );
+            let due_at_ms =
+                chrono::Utc::now().timestamp_millis() + super::limit_reset::LIMIT_RESET_MARGIN_MS;
+            park_stop(app, record, src, due_at_ms, ParkReason::ContinueRetry);
+            return;
+        }
+    };
+    let run = super::limit_reset::run_continue(
+        &super::limit_reset::LEDGER,
+        &record.claude_session_id,
+        &stop.entry_uuid,
+        || close_rate_limit_menu(&terminal_id),
+        || {
+            prompt_when_idle_outcome(
+                &terminal_id,
+                super::limit_reset::LIMIT_RESET_NUDGE,
+                "limit-reset-continue",
+            )
+        },
+    )
+    .await;
+    match run {
+        ContinueRun::NotClaimed(claim) => info!(
+            terminal_id,
+            session = %record.claude_session_id,
+            entry_uuid = %stop.entry_uuid,
+            ?claim,
+            "limit-reset-continue not started — this stop's continue is in flight, done, or out of attempts"
+        ),
+        ContinueRun::Ran {
+            outcome: IdlePromptOutcome::Submitted,
+            ..
+        } => {
+            super::limit_stop::with_parks(|p| p.forget(&terminal_id));
+            info!(
+                terminal_id,
+                session = %record.claude_session_id,
+                entry_uuid = %stop.entry_uuid,
+                rate_limit_type = ?stop.rate_limit_type,
+                "limit-reset-continue submitted"
+            );
+            let (event, payload) = super::limit_reset::continued_event(
+                &record.claude_session_id,
+                src,
+                &terminal_id,
+                &stop.entry_uuid,
+            );
+            if let Err(e) = app.emit(event, payload) {
+                warn!(error = %e, "failed to emit {event}");
+            }
+        }
+        ContinueRun::Ran {
+            settled: Settled::Kept,
+            ..
+        } => {
+            super::limit_stop::with_parks(|p| p.forget(&terminal_id));
+            info!(
+            terminal_id,
+            session = %record.claude_session_id,
+            entry_uuid = %stop.entry_uuid,
+            "limit-reset-continue: the session was already working — nothing typed"
+            )
+        }
+        ContinueRun::Ran {
+            outcome,
+            settled: Settled::Released { attempts, retry },
+        } => {
+            warn!(
+                terminal_id,
+                session = %record.claude_session_id,
+                entry_uuid = %stop.entry_uuid,
+                ?outcome,
+                attempts,
+                retry,
+                "limit-reset-continue did not reach the pane"
+            );
+            if retry {
+                let due_at_ms = chrono::Utc::now().timestamp_millis()
+                    + super::limit_reset::LIMIT_RESET_MARGIN_MS;
+                park_stop(app, record, src, due_at_ms, ParkReason::ContinueRetry);
+            } else {
+                let (event, payload) = super::limit_reset::gave_up_event(
+                    &record.claude_session_id,
+                    src,
+                    &terminal_id,
+                    attempts,
+                );
+                if let Err(e) = app.emit(event, payload) {
+                    warn!(error = %e, "failed to emit {event}");
+                }
+            }
+        }
+    }
+}
+
+/// The in-flight registry holder a reset-continue claims under.
+const CONTINUE_IN_FLIGHT_HOLDER: &str = "limit-reset-continue";
+
+/// Claim `claude_session_id` in the session in-flight registry for a
+/// reset-continue; `Err(current holder)` when another mover holds it.
+fn claim_for_continue(
+    claude_session_id: &str,
+) -> Result<crate::session::in_flight::SessionInFlight, &'static str> {
+    crate::session::in_flight::SessionInFlight::claim(claude_session_id, CONTINUE_IN_FLIGHT_HOLDER)
+}
+
+/// Whether a continue refused the session claim re-parks its stop. Not when
+/// the holder is another reset-continue of the same session (a screen hint and
+/// a re-entry arriving together): that run settles the stop itself, and a park
+/// here would report "parked" for a session being continued right now.
+fn continue_refusal_reparks(holder: &str) -> bool {
+    holder != CONTINUE_IN_FLIGHT_HOLDER
+}
+
+/// Send ONE `Esc` when the pane shows the `/rate-limit-options` menu
+/// ([`super::limit_reset::shows_rate_limit_menu`]). Best-effort: a pane that
+/// is gone or a write that fails is left to the idle watcher, which then
+/// gives up and the attempt is counted.
+fn close_rate_limit_menu(terminal_id: &str) {
+    use tauri::Manager;
+    let Some(app) = crate::tauri_app_handle::current() else {
+        return;
+    };
+    let Some(tm) = app.try_state::<std::sync::Arc<crate::terminal::TerminalManager>>() else {
+        return;
+    };
+    let Some(session) = tm.get(terminal_id) else {
+        return;
+    };
+    if !super::limit_reset::shows_rate_limit_menu(&session.grid_screen()) {
+        return;
+    }
+    match session.write(
+        b"\x1b",
+        crate::terminal::session::PtyWriteCaller::AccountMigration,
+    ) {
+        Ok(()) => info!(
+            terminal_id,
+            "limit-reset-continue: closed the /rate-limit-options menu with one Esc"
+        ),
+        Err(e) => {
+            warn!(terminal_id, error = %e, "limit-reset-continue: the Esc could not be written")
+        }
+    }
 }
 
 /// The automatic path's answer to the migration's result.
@@ -1024,13 +1438,46 @@ where
 }
 
 /// The body of [`spawn_prompt_when_idle`]; its ~3 min bound starts when this
-/// future is first polled.
+/// future is first polled. The outcome is discarded: these callers act on no
+/// answer. [`prompt_when_idle_outcome`] is the same watcher with its answer.
 async fn prompt_when_idle(terminal_id: String, prompt: String, label: &'static str) {
+    prompt_when_idle_outcome(&terminal_id, &prompt, label).await;
+}
+
+/// How one [`prompt_when_idle_outcome`] run ended. The variant set is
+/// runner#2417's `IdlePromptOutcome`, so the two branches converge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IdlePromptOutcome {
+    /// The prompt was typed and submitted.
+    Submitted,
+    /// The session was already mid-turn: it picked itself up, nothing was
+    /// typed.
+    AlreadyBusy,
+    /// The terminal (or the app) went away, or its child exited before it
+    /// painted a prompt: nothing will ever be typed there.
+    TerminalGone,
+    /// The PTY write failed.
+    SubmitFailed(String),
+    /// The deadline passed with no submission; `last_refusal` is why the last
+    /// read was not ready.
+    GaveUp { last_refusal: String },
+}
+
+/// Wait (~3 min) for the CLI to paint its idle prompt
+/// ([`watch_for_idle_prompt`]), submit `prompt` once, and say how it ended —
+/// so a caller can tell submitted from gave-up (the usage-limit
+/// reset-continue's dedup, [`super::limit_reset`]). Stands down on a busy
+/// session.
+pub(crate) async fn prompt_when_idle_outcome(
+    terminal_id: &str,
+    prompt: &str,
+    label: &'static str,
+) -> IdlePromptOutcome {
     use tauri::Manager;
     let session_now = || {
         let app = crate::tauri_app_handle::current()?;
         let tm = app.try_state::<std::sync::Arc<crate::terminal::TerminalManager>>()?;
-        tm.get(&terminal_id)
+        tm.get(terminal_id)
     };
     let end = watch_for_idle_prompt(
         || {
@@ -1045,48 +1492,61 @@ async fn prompt_when_idle(terminal_id: String, prompt: String, label: &'static s
     )
     .await;
     match end {
-        IdleWatchEnd::Gone => info!(
-            terminal_id,
-            label, "prompt-when-idle: terminal gone — standing down"
-        ),
-        IdleWatchEnd::ChildExited(exit_code) => warn!(
-            terminal_id,
-            label,
-            ?exit_code,
-            "prompt-when-idle: the pane's child exited before painting its idle prompt — standing down"
-        ),
-        IdleWatchEnd::Busy => info!(
-            terminal_id,
-            label, "prompt-when-idle: session already working — no prompt needed"
-        ),
+        IdleWatchEnd::Gone => {
+            info!(
+                terminal_id,
+                label, "prompt-when-idle: terminal gone — standing down"
+            );
+            IdlePromptOutcome::TerminalGone
+        }
+        IdleWatchEnd::ChildExited(exit_code) => {
+            warn!(
+                terminal_id,
+                label,
+                ?exit_code,
+                "prompt-when-idle: the pane's child exited before painting its idle prompt — standing down"
+            );
+            IdlePromptOutcome::TerminalGone
+        }
+        IdleWatchEnd::Busy => {
+            info!(
+                terminal_id,
+                label, "prompt-when-idle: session already working — no prompt needed"
+            );
+            IdlePromptOutcome::AlreadyBusy
+        }
         IdleWatchEnd::Ready => {
             let Some(session) = session_now() else {
                 info!(
                     terminal_id,
                     label, "prompt-when-idle: terminal gone — standing down"
                 );
-                return;
+                return IdlePromptOutcome::TerminalGone;
             };
-            // Composes both sides of the 2026-08-29 rebase: OUR generalized
-            // `prompt`/`label` seam (one impl for the migration nudge and the
-            // respawn prompt), with MAIN's `Ok(_)` — `submit_prompt` stopped
-            // returning `()` in fee48d4c, which now reports the neutralized body.
+            // `submit_prompt` reports the neutralized body (fee48d4c).
             match session.submit_prompt(
-                &prompt,
+                prompt,
                 crate::terminal::session::PtyWriteCaller::AccountMigration,
             ) {
-                Ok(_) => info!(terminal_id, label, "prompt-when-idle submitted"),
+                Ok(_) => {
+                    info!(terminal_id, label, "prompt-when-idle submitted");
+                    IdlePromptOutcome::Submitted
+                }
                 Err(e) => {
-                    warn!(terminal_id, label, error = %e, "prompt-when-idle submit failed")
+                    warn!(terminal_id, label, error = %e, "prompt-when-idle submit failed");
+                    IdlePromptOutcome::SubmitFailed(e)
                 }
             }
         }
-        IdleWatchEnd::GaveUp(last_refusal) => warn!(
-            terminal_id,
-            label,
-            %last_refusal,
-            "prompt-when-idle: resumed CLI never painted its idle prompt within 3m — giving up"
-        ),
+        IdleWatchEnd::GaveUp(last_refusal) => {
+            warn!(
+                terminal_id,
+                label,
+                %last_refusal,
+                "prompt-when-idle: resumed CLI never painted its idle prompt within 3m — giving up"
+            );
+            IdlePromptOutcome::GaveUp { last_refusal }
+        }
     }
 }
 
@@ -1953,6 +2413,15 @@ async fn confirm_migration(
                 record.claude_session_id.clone(),
                 carried,
             );
+            // The session moved, so its carried stop is not a fresh one on
+            // `dst`: stamp the move, as the proven arm does below. No nudge is
+            // sent here, so the hint path waits out the migration-nudge window
+            // (`limit_reset::MIGRATION_NUDGE_WINDOW_MS`) before it continues
+            // the carried stop itself: a delay, accepted.
+            note_migrated(
+                &record.claude_session_id,
+                chrono::Utc::now().timestamp_millis(),
+            );
             let err = MigrateError::Unconfirmed {
                 new_terminal_id: terminal_id,
                 rolled_back: false,
@@ -1969,6 +2438,13 @@ async fn confirm_migration(
             return Err(err);
         }
     };
+    // The session now runs on `dst_config_dir`, and its carried transcript
+    // still ends at the stop that moved it: say when, so the usage-limit hint
+    // leaves that old stop to this migration's own continue nudge.
+    note_migrated(
+        &record.claude_session_id,
+        chrono::Utc::now().timestamp_millis(),
+    );
 
     // 4b. Top up `<sid>/` with whatever the old pane wrote between the carry
     // and its exit — detached, because `close` does not wait for the `claude`.
@@ -2479,6 +2955,126 @@ mod tests {
             argv.windows(2).any(|w| w == ["--settings", "hooks.json"]),
             "extra_required tail must survive: {argv:?}"
         );
+    }
+
+    #[test]
+    fn a_recorded_migration_is_read_back() {
+        let sid = "4d1c0000-0000-4000-8000-00000000abcd";
+        assert_eq!(last_migrated_at(sid), None);
+        note_migrated(sid, 1_800_000_000_000);
+        assert_eq!(last_migrated_at(sid), Some(1_800_000_000_000));
+        note_migrated(sid, 1_800_000_060_000);
+        assert_eq!(last_migrated_at(sid), Some(1_800_000_060_000));
+    }
+
+    /// The slice of this file's source from `start` to the next `end`.
+    fn source_between(start: &str, end: &str) -> &'static str {
+        const SRC: &str = include_str!("account_migration.rs");
+        let from = SRC.find(start).expect("start marker");
+        let rest = SRC.get(from..).expect("a char boundary");
+        rest.get(..rest.find(end).expect("end marker"))
+            .expect("a char boundary")
+    }
+
+    /// A reset-continue holds the session in the ONE in-flight registry: it
+    /// does not start while another mover holds the session, and while it
+    /// holds it no mover (a migration, the resume door) can start.
+    #[test]
+    fn a_reset_continue_and_a_mover_exclude_each_other() {
+        let sid = "test/account_migration/continue-vs-mover";
+        let door =
+            crate::session::in_flight::SessionInFlight::claim(sid, "resume-door").expect("free");
+        assert_eq!(claim_for_continue(sid).unwrap_err(), "resume-door");
+        drop(door);
+        let continuing = claim_for_continue(sid).expect("free again");
+        assert_eq!(
+            crate::session::in_flight::SessionInFlight::claim(sid, "account-migration")
+                .unwrap_err(),
+            CONTINUE_IN_FLIGHT_HOLDER
+        );
+        drop(continuing);
+        assert!(!crate::session::in_flight::is_in_flight(sid));
+    }
+
+    /// A continue refused by a real mover re-parks its stop; one refused by
+    /// another continue of the same session leaves the stop to that run.
+    #[test]
+    fn only_a_mover_not_a_sibling_continue_makes_a_refused_continue_repark() {
+        assert!(continue_refusal_reparks("resume-door"));
+        assert!(continue_refusal_reparks("account-migration"));
+        assert!(continue_refusal_reparks("respawn-receiver"));
+        assert!(!continue_refusal_reparks(CONTINUE_IN_FLIGHT_HOLDER));
+    }
+
+    /// The continue path holds that claim for the whole function, taken
+    /// before it touches the pane, and a refused claim re-parks and returns.
+    #[test]
+    fn the_continue_claims_the_session_before_it_touches_the_pane() {
+        let body = source_between(
+            "\nasync fn continue_after_reset(",
+            "\n/// The in-flight registry holder",
+        );
+        let claim = body
+            .find("let _in_flight = match claim_for_continue(")
+            .expect("the continue binds its claim for the whole function");
+        let menu = body.find("close_rate_limit_menu(").expect("the menu Esc");
+        assert!(claim < menu, "the claim comes before the first keystroke");
+        let (_, refused) = body.split_once("Err(holder)").expect("the refusal arm");
+        let refused = refused
+            .split_once("\n        }\n    };")
+            .map_or(refused, |(arm, _)| arm);
+        assert!(
+            refused.contains("park_stop("),
+            "a refused continue re-parks"
+        );
+        assert!(
+            refused.contains("return;"),
+            "a refused continue stops there"
+        );
+    }
+
+    /// Source pins on wiring no unit test reaches (plan 2026-11-05 Phase 2):
+    /// the migration records when it moved a session, and the usage-limit
+    /// handler leaves every gate to `limit_hint::run_hint` (which a fake env
+    /// tests) and parks a refused stop instead of reporting it as skipped.
+    #[test]
+    fn the_hint_handler_keeps_no_gate_of_its_own_and_the_migration_stamps_itself() {
+        let migrate = source_between("\nasync fn confirm_migration(\n", "\nfn emit_skipped(");
+        assert_eq!(
+            migrate.matches("note_migrated(").count(),
+            2,
+            "confirm_migration stamps on the proven arm and the Unconfirmed arm"
+        );
+        let handler = source_between(
+            "pub async fn handle_usage_limit_hint(",
+            "\nstruct ProdHintEnv",
+        );
+        let (before, after) = handler
+            .split_once("run_hint(")
+            .expect("the handler runs the hint path");
+        for gate in [
+            "get_claude_config_dirs",
+            "auto_migrate_on_token_exhaustion",
+            "auto_continue_after_limit_reset",
+            "finished_at",
+        ] {
+            assert!(!before.contains(gate), "{gate} read before run_hint");
+        }
+        assert_eq!(after.matches("report_migration_refused(").count(), 2);
+        assert!(!after.contains("emit_skipped(&app, &record, &src, \""));
+        // A no-target refusal gives its cap slot back.
+        let no_target = after
+            .split_once("pick_migration_target(")
+            .expect("the target pick")
+            .1;
+        let no_target = no_target
+            .split_once("NoUsableTarget")
+            .expect("the no-target refusal")
+            .0;
+        assert!(no_target.contains("refund_migration_cap("));
+        let env = source_between("for ProdHintEnv<'_> {", "\n}\n");
+        assert!(env.contains("self.record.finished_at.is_some()"));
+        assert!(env.contains("hint_switches(&crate::settings::get_ai_settings().claude_cli)"));
     }
 
     #[test]

@@ -625,7 +625,7 @@
 /layout "3 best"	literal	terminal.layout	[["preset","3 best"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 /layout "3 best" --tenant	literal	terminal.layout	[["preset","3 best --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 /layout --tenant	literal	terminal.layout	[["preset","--tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
-/layout 1	pattern	terminal.layout	[["preset",1]]	ok	ok /layout ✓ changed 1 layout — grew to split — 2 sessions do not fit single
+/layout 1	pattern	terminal.layout	[["preset",1]]	ok	ok /layout ✓ changed 1 layout — grew to split — 2 sessions do not fit single; runner-owned (auto-trims)
 /layout 1 --tenant	literal	terminal.layout	[["preset","1 --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 /layout 1 gmail fix the bug	literal	terminal.layout	[["preset","1 gmail fix the bug"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 /layout 1 gmail fix the bug --tenant	literal	terminal.layout	[["preset","1 gmail fix the bug --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
@@ -647,7 +647,7 @@
 /layout fullgrid --tenant	literal	terminal.layout	[["preset","fullgrid --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 /layout quad	pattern	terminal.layout	[["preset","quad"]]	ok	noop /layout · no layouts changed — already quad; re-applied
 /layout quad --tenant	literal	terminal.layout	[["preset","quad --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
-/layout single	pattern	terminal.layout	[["preset","single"]]	ok	ok /layout ✓ changed 1 layout — grew to split — 2 sessions do not fit single
+/layout single	pattern	terminal.layout	[["preset","single"]]	ok	ok /layout ✓ changed 1 layout — grew to split — 2 sessions do not fit single; runner-owned (auto-trims)
 /layout single --tenant	literal	terminal.layout	[["preset","single --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 /layout six-pack	pattern	terminal.layout	[["preset","six-pack"]]	ok	ok /layout ✓ changed 1 layout — six-pack
 /layout six-pack --tenant	literal	terminal.layout	[["preset","six-pack --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
@@ -1053,7 +1053,7 @@
 /shortcuts 1 gmail fix the bug --tenant	literal	terminal.show-shortcuts	[]	unbound	-
 /shortcuts 3 best	literal	terminal.show-shortcuts	[]	unbound	-
 /shortcuts 3 best --tenant	literal	terminal.show-shortcuts	[]	unbound	-
-/single layout	pattern	terminal.layout	[["preset","single"]]	ok	ok /layout ✓ changed 1 layout — grew to split — 2 sessions do not fit single
+/single layout	pattern	terminal.layout	[["preset","single"]]	ok	ok /layout ✓ changed 1 layout — grew to split — 2 sessions do not fit single; runner-owned (auto-trims)
 /single layout --tenant	none	-	null	none	-
 /six-pack layout	pattern	terminal.layout	[["preset","six-pack"]]	ok	ok /layout ✓ changed 1 layout — six-pack
 /six-pack layout --tenant	none	-	null	none	-
@@ -2055,7 +2055,7 @@ layout "1 gmail fix the bug" --tenant	literal	terminal.layout	[["preset","1 gmai
 layout "3 best"	literal	terminal.layout	[["preset","3 best"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 layout "3 best" --tenant	literal	terminal.layout	[["preset","3 best --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 layout --tenant	literal	terminal.layout	[["preset","--tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
-layout 1	pattern	terminal.layout	[["preset",1]]	ok	ok /layout ✓ changed 1 layout — grew to split — 2 sessions do not fit single
+layout 1	pattern	terminal.layout	[["preset",1]]	ok	ok /layout ✓ changed 1 layout — grew to split — 2 sessions do not fit single; runner-owned (auto-trims)
 layout 1 --tenant	literal	terminal.layout	[["preset","1 --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 layout 1 gmail fix the bug	literal	terminal.layout	[["preset","1 gmail fix the bug"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 layout 1 gmail fix the bug --tenant	literal	terminal.layout	[["preset","1 gmail fix the bug --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
@@ -2077,7 +2077,7 @@ layout fullgrid	pattern	terminal.layout	[["preset","fullgrid"]]	ok	ok /layout �
 layout fullgrid --tenant	literal	terminal.layout	[["preset","fullgrid --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 layout quad	pattern	terminal.layout	[["preset","quad"]]	ok	noop /layout · no layouts changed — already quad; re-applied
 layout quad --tenant	literal	terminal.layout	[["preset","quad --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
-layout single	pattern	terminal.layout	[["preset","single"]]	ok	ok /layout ✓ changed 1 layout — grew to split — 2 sessions do not fit single
+layout single	pattern	terminal.layout	[["preset","single"]]	ok	ok /layout ✓ changed 1 layout — grew to split — 2 sessions do not fit single; runner-owned (auto-trims)
 layout single --tenant	literal	terminal.layout	[["preset","single --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
 layout six-pack	pattern	terminal.layout	[["preset","six-pack"]]	ok	ok /layout ✓ changed 1 layout — six-pack
 layout six-pack --tenant	literal	terminal.layout	[["preset","six-pack --tenant"]]	error:invalid-preset	error /layout: preset must be one of: single, split, triptych, quad, 1-plus-4, six-pack, command-center, full-grid, flow-grid, or a window count of 1 or more
@@ -2483,7 +2483,7 @@ shortcuts 1 gmail fix the bug	literal	terminal.show-shortcuts	[]	unbound	-
 shortcuts 1 gmail fix the bug --tenant	literal	terminal.show-shortcuts	[]	unbound	-
 shortcuts 3 best	literal	terminal.show-shortcuts	[]	unbound	-
 shortcuts 3 best --tenant	literal	terminal.show-shortcuts	[]	unbound	-
-single layout	pattern	terminal.layout	[["preset","single"]]	ok	ok /layout ✓ changed 1 layout — grew to split — 2 sessions do not fit single
+single layout	pattern	terminal.layout	[["preset","single"]]	ok	ok /layout ✓ changed 1 layout — grew to split — 2 sessions do not fit single; runner-owned (auto-trims)
 single layout --tenant	none	-	null	none	-
 six-pack layout	pattern	terminal.layout	[["preset","six-pack"]]	ok	ok /layout ✓ changed 1 layout — six-pack
 six-pack layout --tenant	none	-	null	none	-

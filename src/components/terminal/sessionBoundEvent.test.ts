@@ -177,3 +177,28 @@ describe("applySessionBound", () => {
     expect(applySessionBound(tabs, payload({ terminalId: "" }))).toBeNull();
   });
 });
+
+describe("same-id config dir spelling variants", () => {
+  it("a respelling of the tab's own config dir does not re-stamp", () => {
+    const tabs = [
+      { id: "term-1", claudeSessionId: "sess-a", claudeConfigDir: "C:/claude/.claude-gmail" },
+    ];
+    for (const cd of ["C:\\claude\\.claude-gmail\\", "c:/claude/.claude-gmail/", " C:/claude/.claude-gmail "]) {
+      expect(
+        applySessionBound(tabs, payload({ terminalId: "term-1", sessionId: "sess-a", configDir: cd })),
+      ).toBeNull();
+    }
+  });
+
+  it("a genuinely different config dir still re-stamps", () => {
+    const tabs = [
+      { id: "term-1", claudeSessionId: "sess-a", claudeConfigDir: "C:/claude/.claude-gmail" },
+    ];
+    expect(
+      applySessionBound(
+        tabs,
+        payload({ terminalId: "term-1", sessionId: "sess-a", configDir: "C:/claude/.claude-paktis" }),
+      )?.claudeConfigDir,
+    ).toBe("C:/claude/.claude-paktis");
+  });
+});

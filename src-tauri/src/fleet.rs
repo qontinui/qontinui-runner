@@ -125,9 +125,12 @@ pub struct Resources {
 
 // Per-session cost model — a MIRROR of qontinui-coord `crates/coord/src/fleet.rs`
 // (plan `2026-11-04-worktree-cap-charges-4gb-per-allocation-so-a-503gb-box-caps-at-124`).
-// coord is the authority: its budget ingest replaces the `max_concurrent_agents`
-// this runner publishes with coord's own derivation from the same publish's
-// `memory_gb` / `cpu_cores`, so a drift here changes only this runner's own log
+// coord is the authority: its budget ingest replaces a non-zero
+// `max_concurrent_agents` this runner publishes with coord's own derivation
+// from the same publish's `memory_gb` / `cpu_cores` / `ci_reserved_gib`, keeps
+// the last stored value when `ci_reserved_gib` is omitted, and stores an
+// explicit `0` (the Build role's) verbatim, so a drift here changes only this
+// runner's own log
 // line and `last_budget.json`, never a cap. The worked-example test below is the
 // same table coord pins; keep the two in step.
 
@@ -758,7 +761,7 @@ fn last_budget_cache_path() -> Option<PathBuf> {
 /// | `role` | supervisor (publishes `build`) | **absent — see below** |
 /// | `max_concurrent_builds` | supervisor | **absent — see the capacity split below** |
 /// | `max_concurrent_ci_jobs` | runner | always sent |
-/// | `max_concurrent_agents` | runner | always sent |
+/// | `max_concurrent_agents` | **coord** (for a non-zero value it stores its own derivation from this payload's `memory_gb`/`cpu_cores`/`ci_reserved_gib`, or keeps the last stored value when `ci_reserved_gib` is absent; see the per-session cost-model note above `SESSION_COST_MEM_MIB`) | always sent: an advisory derived value for the Agent role, an explicit `0` (stored verbatim) for the Build role |
 /// | `cpu_cores`, `memory_gb`, `disk_*` | neither — they describe the BOX | always sent by both |
 ///
 /// Scoped to THIS payload. `ci_runner_labels` is also supervisor-owned but
