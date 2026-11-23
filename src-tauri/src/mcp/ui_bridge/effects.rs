@@ -125,8 +125,12 @@ pub async fn ui_bridge_predict_component_action_handler(
     Query(query): Query<ComponentActionQueryParams>,
     body: Bytes,
 ) -> Json<serde_json::Value> {
-    let ipc_payload =
-        predict_ipc_payload(&id, &action_id, parse_predict_body(&body), query.window_label);
+    let ipc_payload = predict_ipc_payload(
+        &id,
+        &action_id,
+        parse_predict_body(&body),
+        query.window_label,
+    );
 
     // As on the invocation route, the WS fast path reaches an EXTERNAL SDK
     // app, never a runner window, so it gets the payload without the target
@@ -440,7 +444,10 @@ mod tests {
             Some("term-query".into()),
         );
         assert_eq!(p["windowLabel"], "term-query");
-        assert_eq!(p["request"], serde_json::json!({"params": {"windowLabel": "main"}}));
+        assert_eq!(
+            p["request"],
+            serde_json::json!({"params": {"windowLabel": "main"}})
+        );
         let p = predict_ipc_payload("c", "a", serde_json::json!({}), Some(String::new()));
         assert!(p.get("windowLabel").is_none(), "{p}");
     }

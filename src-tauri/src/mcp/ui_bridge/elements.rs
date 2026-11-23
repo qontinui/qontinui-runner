@@ -7914,7 +7914,10 @@ mod component_action_window_tests {
             None,
         );
         assert!(p.get("windowLabel").is_none(), "{p}");
-        assert_eq!(p["params"], json!({"terminalId":"t1","windowLabel":"term-2"}));
+        assert_eq!(
+            p["params"],
+            json!({"terminalId":"t1","windowLabel":"term-2"})
+        );
     }
 
     #[test]
@@ -7971,6 +7974,9 @@ mod component_action_window_tests {
         );
         let (label, ws) = split_component_target_window(p);
         assert_eq!(label.as_deref(), Some("term-1"));
-        assert_eq!(ws, json!({"componentId":"c","actionId":"a","params":{"x":1}}));
+        assert_eq!(
+            ws,
+            json!({"componentId":"c","actionId":"a","params":{"x":1}})
+        );
     }
 }
