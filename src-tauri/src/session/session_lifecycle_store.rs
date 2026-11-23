@@ -499,18 +499,28 @@ fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|s| !s.trim().is_empty())
 }
 
-/// The `finished_at` a RESTAMP gets ([`SessionLifecycleStore::set_finished`]
-/// re-finishing an already-finished mark, or re-marking one whose unmark
-/// erased `prev`): `now`, unless that EQUALS the old stamp (two finishes
-/// inside one millisecond), in which case one past it.
+/// How far past `now` [`restamp_at`] will date a mark to keep it clear of
+/// the session's earlier stamps. A burst of finishes inside a few
+/// milliseconds stays inside it; a clock stepped back further than this is
+/// taken as is rather than dating the finish into the future.
+const RESTAMP_MAX_LEAD_MS: i64 = 100;
+
+/// The `finished_at` a mark gets ([`SessionLifecycleStore::set_finished`])
+/// when this session already carried a stamp in this process — a RESTAMP
+/// (re-finishing an already-finished mark) or a RE-MARK after an unmark.
+/// `high` is the largest stamp the session's marks have carried.
 ///
-/// The ACK matcher ([`SessionLifecycleStore::mark_finish_synced`]) needs the
-/// two stamps only to DIFFER, so a late ACK of the old row can never sync the
-/// new mark. Taking `now` otherwise — rather than `max(now, prev + 1)` — keeps
-/// a clock stepped backwards from dating the new finish in the future. Pure.
-fn restamp_at(prev: i64, now: i64) -> i64 {
-    if now == prev {
-        prev.saturating_add(1)
+/// `now`, unless that is not past `high` (finishes inside one millisecond,
+/// or a chain of them: mark, unmark, re-mark, unmark, re-mark), in which case
+/// one past `high` — so the new stamp differs from EVERY earlier one, not
+/// only the latest. The ACK matcher
+/// ([`SessionLifecycleStore::mark_finish_synced`]) needs exactly that: a
+/// late ACK of any older row can never sync the new mark. A `now` more than
+/// [`RESTAMP_MAX_LEAD_MS`] behind `high` (a clock stepped backwards) is
+/// taken as is, so the new finish is never dated far into the future. Pure.
+fn restamp_at(high: i64, now: i64) -> i64 {
+    if now <= high && high - now <= RESTAMP_MAX_LEAD_MS {
+        high.saturating_add(1)
     } else {
         now
     }
@@ -1363,12 +1373,14 @@ pub struct SessionLifecycleStore {
     /// this same lock, so a late delivery cannot land its `Finished` after a
     /// concurrent unmark's `working` either.
     ///
-    /// The one piece of data it holds: the `finished_at` each session's mark
-    /// carried when it was last UNMARKED, kept until that session is marked
-    /// again. A re-mark stamps against it with [`restamp_at`], so a
-    /// mark → unmark → re-mark inside one millisecond still gives the new mark
-    /// a DIFFERENT stamp — the unmark erases the record's own `finished_at`,
-    /// which is the only other place the old stamp lives. `finished_at` is the
+    /// The one piece of data it holds: per session, the largest `finished_at`
+    /// any of its marks has carried in this process. Every mark stamps against
+    /// it with [`restamp_at`], so a mark → unmark → re-mark (or a chain of
+    /// them) inside one millisecond still gives the new mark a stamp no
+    /// earlier mark carried — the unmark erases the record's own
+    /// `finished_at`, which is the only other place the old stamp lives.
+    /// One `i64` per session marked in this process; never pruned, since a
+    /// forgotten entry would reopen the collision. `finished_at` is the
     /// mark's identity for the ACK matcher ([`Self::mark_finish_synced`]) and
     /// the outbox probes, so two marks sharing one would let a late ACK of the
     /// first sync the second. Written only by [`Self::set_finished`]; every
@@ -3383,16 +3395,20 @@ impl SessionLifecycleStore {
         }
 
         if finished {
-            rec.finished_at = Some(match rec.finished_at {
-                // A fresh mark — or a RE-mark, which must still differ from
-                // the stamp its unmark erased (see `finish_forward`).
-                None => match forward.remove(claude_session_id) {
-                    Some(unmarked) => restamp_at(unmarked, now),
-                    None => now,
-                },
-                // A RESTAMP (a re-finish that carried a reason).
-                Some(prev) => restamp_at(prev, now),
-            });
+            // A fresh mark, a RE-mark after an unmark, or a RESTAMP (a
+            // re-finish that carried a reason): each must differ from every
+            // stamp this session's marks carried before (see `finish_forward`).
+            // The record's own stamp counts too — a mark loaded from disk has
+            // no in-process entry yet.
+            let high = forward
+                .get(claude_session_id)
+                .copied()
+                .into_iter()
+                .chain(rec.finished_at)
+                .max();
+            let at = high.map_or(now, |h| restamp_at(h, now));
+            forward.insert(claude_session_id.to_string(), at);
+            rec.finished_at = Some(at);
             // A fresh or restamped mark is unsynced by definition — the outbox
             // owes coord a write, and the boot reconcile must not revert it
             // meanwhile.
@@ -3404,8 +3420,11 @@ impl SessionLifecycleStore {
             // for ([`awaiting_account_hold`] also refuses a finished row).
             rec.awaiting_account_since = None;
         } else {
+            // A mark loaded from disk has no in-process entry: remember its
+            // stamp before the unmark erases it.
             if let Some(prev) = rec.finished_at {
-                forward.insert(claude_session_id.to_string(), prev);
+                let high = forward.entry(claude_session_id.to_string()).or_insert(prev);
+                *high = (*high).max(prev);
             }
             rec.finished_at = None;
             rec.finish_reason = None;
@@ -9503,6 +9522,11 @@ mod tests {
     fn a_restamp_always_differs_and_never_runs_ahead_of_the_clock() {
         assert_eq!(restamp_at(1_000, 1_000), 1_001, "equal-now still differs");
         assert_eq!(
+            restamp_at(1_001, 1_000),
+            1_002,
+            "a chain inside one millisecond clears every earlier stamp, not just the last"
+        );
+        assert_eq!(
             restamp_at(1_000, 5_000),
             5_000,
             "a later clock is taken as is"
@@ -9512,7 +9536,7 @@ mod tests {
             400,
             "a clock stepped back is not pushed into the future"
         );
-        for (prev, now) in [(1_000, 1_000), (1_000, 5_000), (1_000, 400)] {
+        for (prev, now) in [(1_000, 1_000), (1_001, 1_000), (1_000, 5_000), (1_000, 400)] {
             assert_ne!(restamp_at(prev, now), prev);
         }
     }
@@ -9521,15 +9545,17 @@ mod tests {
     /// even inside one millisecond — the unmark erases the record's own stamp,
     /// so the store remembers it (`finish_forward`) for the re-mark to differ
     /// from. Otherwise a late ACK of the first mark's write would sync the
-    /// second before its own write drained. Repeated so the same-millisecond
-    /// case is exercised on any machine fast enough to hit it; the property is
-    /// asserted on every round, whatever the clock did.
+    /// second before its own write drained. No stamp may ever repeat across
+    /// the whole chain. The same-millisecond rule itself is pinned
+    /// deterministically by `a_restamp_always_differs_and_never_runs_ahead_of_the_clock`;
+    /// this exercises it through the store whenever the clock collides.
     #[test]
     fn a_re_mark_after_an_unmark_never_reuses_the_unmarked_stamp() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("terminal-sessions.json");
         let store = SessionLifecycleStore::open(&path).unwrap();
         store.record_open(rec("s"));
+        let mut seen = HashSet::new();
         for _ in 0..200 {
             let old = store
                 .set_finished("s", true, None)
@@ -9545,6 +9571,8 @@ mod tests {
                 .finished_at
                 .unwrap();
             assert_ne!(new, old, "the re-mark reused the unmarked stamp");
+            assert!(seen.insert(old), "a mark reused an earlier stamp: {old}");
+            assert!(seen.insert(new), "a mark reused an earlier stamp: {new}");
             // The first mark's late ACK must not sync the second.
             store.mark_finish_synced("s", Some(old));
             assert!(!store.get("s").unwrap().finish_synced);
