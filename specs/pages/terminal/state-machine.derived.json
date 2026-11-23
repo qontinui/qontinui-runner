@@ -537,7 +537,7 @@
           "target": {
             "type": "search",
             "criteria": {
-              "accessibleName": "Close page"
+              "title": "Close page"
             },
             "label": "Required element for Multiple Terminal Pages"
           },

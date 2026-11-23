@@ -242,16 +242,16 @@ const MODIFIER_FIELD_ROSTER: Record<string, string> = {
   "components/terminal/FilePathLinkProvider.ts":
     "xterm link provider: Ctrl/Cmd must be held for a path to be clickable. Not a " +
     "chord — a hover/click modifier, with no key field read at all.",
+  "components/terminal/PageTab.tsx":
+    "Alt+←/→ reorders the FOCUSED page tab — the non-drag alternative WCAG 2.5.7 " +
+    "requires for drag-to-reorder. An ELEMENT-scoped `onKeyDown` on the tab button, " +
+    "inventoried in KNOWN_KEY_CLAIMS.",
   "components/terminal/TerminalFindBar.tsx":
     "F3 / Shift+F3 pick the find direction. Shift-only, and `matchesChord` cannot " +
     "express a shift-only chord — see keyClaimScan.ts::CONTROL_TAGS.",
   "components/terminal/TerminalInstance.tsx":
     "xterm `attachCustomKeyEventHandler` — clipboard + find, PTY-scoped (the paste " +
     "chord's test is delegated to pasteChord.ts). Inventoried in KNOWN_KEY_CLAIMS.",
-  "components/terminal/TerminalPageTabBar.tsx":
-    "Alt+←/→ reorders the FOCUSED page tab — the non-drag alternative WCAG 2.5.7 " +
-    "requires for drag-to-reorder. An ELEMENT-scoped `onKeyDown` on the tab button, " +
-    "inventoried in KNOWN_KEY_CLAIMS.",
   "components/terminal/WorkerSessionCell.tsx":
     "steering textarea: Enter sends, Shift+Enter newlines. The file landed on main " +
     "after this branch opened (`15cf2c860`, 2026-09-16); ELEMENT-scoped `onKeyDown` " +
@@ -708,7 +708,7 @@ const KNOWN_KEY_CLAIMS: Record<string, string[]> = {
   "components/terminal/pasteChord.ts": ["ctrl+v"],
   // Alt+←/→ reorders the focused page tab (WCAG 2.5.7 non-drag alternative).
   // Element-scoped: fires only while that tab button has focus.
-  "components/terminal/TerminalPageTabBar.tsx": ["alt+arrowleft", "alt+arrowright"],
+  "components/terminal/PageTab.tsx": ["alt+arrowleft", "alt+arrowright"],
   // VS Code-parity scrollback navigation, consumed by `TerminalInstance`'s
   // xterm handler. THE EIGHT CLAIMS THE OLD SCANNER COULD NOT SEE: the file
   // holds no listener of its own, so no selection rule reached it, and its
