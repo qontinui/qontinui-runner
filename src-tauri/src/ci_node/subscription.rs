@@ -494,9 +494,14 @@ mod tests {
     /// connect, against a fake coord that stores a directive only AFTER the
     /// runner's first read of its store and then confirms its subscription. The
     /// directive's live frame never arrives (its publish preceded PSUBSCRIBE),
-    /// so the only way it reaches `settings.json` is the fetch the runner makes
-    /// on coord's `_control`/`subscribed` frame. Bounded under the 5 s legacy
-    /// re-fetch, so that path cannot satisfy it.
+    /// so the only way it reaches `settings.json` is a fetch the runner makes
+    /// AFTER connecting: the one on coord's `_control`/`subscribed` frame, or
+    /// the legacy re-fetch 5 s after connect. Either is a real delivery path
+    /// for the population, so the bound is a generous 30 s with no timing
+    /// window to land in; which of the two fetches fired is pinned by the unit
+    /// tests in `directive_fetch` (`the_post_subscribed_fetch_...`,
+    /// `a_coord_without_the_subscribed_frame_...`) and the frame classifier
+    /// test below, not here.
     ///
     /// Written against what the pre-change runner already had
     /// (`connect_and_pump_ci`, `get_ci_node_settings`, the credential store),
@@ -600,7 +605,7 @@ mod tests {
         let mut connected_at = None;
         let started = Instant::now();
         let applied = async {
-            while started.elapsed() < Duration::from_millis(4500) {
+            while started.elapsed() < Duration::from_secs(30) {
                 let ci = crate::settings::get_ci_node_settings();
                 if ci.enabled && ci.repo_allowlist == vec!["offline/sent".to_string()] {
                     return true;
