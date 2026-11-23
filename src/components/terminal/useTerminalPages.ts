@@ -629,6 +629,9 @@ export function useTerminalPages() {
   // flag. The resync reads it to tell its own overwrite from a storage lag,
   // independent of when its own echo arrives.
   const lastOwnSavedDigestRef = useRef<string | null>(null);
+  // Counts this window's accepted saves, so "saved during a read" is exact even
+  // when a save restores an earlier digest.
+  const ownSaveCountRef = useRef(0);
 
   /**
    * The ONE roster writer: `mutate` gets the roster to build on and returns
@@ -678,6 +681,7 @@ export function useTerminalPages() {
         if (saved) {
           broadcastDueRef.current = rosterDigest(withClassifiedOrigins(next));
           lastOwnSavedDigestRef.current = broadcastDueRef.current;
+          ownSaveCountRef.current += 1;
         }
         return next;
       });
@@ -763,8 +767,8 @@ export function useTerminalPages() {
   //
   // The store write can reach this webview after the event does, so the read
   // is retried until the stored roster's digest is the one the sender saved;
-  // after the last retry the last non-null read is applied (a newer write that
-  // displaced the digest sends its own event). A write that becomes visible
+  // after the last retry, when any read returned a roster, the store is re-read
+  // and applied (a newer write that displaced the digest sends its own event). A write that becomes visible
   // only after the retry budget (5 x 50 ms) is not re-read: this window shows
   // the older roster, with a warning, until the next save anywhere.
   //
@@ -794,9 +798,11 @@ export function useTerminalPages() {
 
     // An own save never cancels a pending foreign read (nothing orders the two
     // writes: the foreign one may still be the store's last commit and must
-    // then be shown). But a read that never matches because the store holds
-    // this window's own save (`lastOwnSavedDigestRef`), in either order, is an
-    // ordinary overwrite, not a lag, so it is not warned about.
+    // then be shown). A read that never matches because this window saved
+    // DURING it, and the store holds that save, is an ordinary overwrite and is
+    // not warned about. A store still holding an own save made BEFORE the event
+    // is indistinguishable from a lag (the other window may have built on it),
+    // so that case IS warned about: honest about what this window cannot tell.
     const unlisten = listenRosterSaved(({ source, digest }) => {
       if (source === windowLabel) return;
       // A newer foreign event supersedes a read still waiting on an older digest.
@@ -804,6 +810,7 @@ export function useTerminalPages() {
       retryTimer = null;
       let retries = 0;
       let lastRead: TerminalPageConfig[] | null = null;
+      const ownSavesAtEvent = ownSaveCountRef.current;
       const attempt = () => {
         retryTimer = null;
         if (disposed) return;
@@ -819,9 +826,12 @@ export function useTerminalPages() {
           return;
         }
         if (lastRead) {
-          if (rosterDigest(lastRead) !== lastOwnSavedDigestRef.current) {
+          const ownSaveDuringRead =
+            ownSaveCountRef.current !== ownSavesAtEvent &&
+            rosterDigest(lastRead) === lastOwnSavedDigestRef.current;
+          if (!ownSaveDuringRead) {
             console.warn(
-              `[terminal-pages] the stored roster never matched ${source}'s save; applying the store as read`,
+              `[terminal-pages] the stored roster never matched ${source}'s save; applying the store as it now reads`,
             );
           }
           apply();

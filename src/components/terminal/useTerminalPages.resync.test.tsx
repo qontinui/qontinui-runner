@@ -469,6 +469,36 @@ describe("the receiver's branches", () => {
     expect(names(main.hook().allPages)).toEqual(["Alpha", "EchoLate", "Gamma"]);
   });
 
+  it("an own save during the read, then a store on a third roster, is warned about", async () => {
+    const main = await mountWindow("main");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.useFakeTimers();
+    receiveFrom("term-2", rosterDigest([ROSTER[0]]));
+    act(() => void main.hook().renamePage("p2", "Own"));
+    // The store then moves on to neither main's save nor the announced one.
+    instanceStorage.setJSON(PAGES_STORAGE_KEY, [ROSTER[0], { ...ROSTER[1], name: "Third" }, ROSTER[2]]);
+    act(() => void vi.advanceTimersByTime(1_000));
+    vi.useRealTimers();
+
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(names(main.hook().allPages)).toEqual(["Alpha", "Third", "Gamma"]);
+  });
+
+  it("an own save during the read that restores the earlier roster is still an own save", async () => {
+    const main = await mountWindow("main");
+    act(() => void main.hook().renamePage("p2", "X"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.useFakeTimers();
+    receiveFrom("term-2", rosterDigest([ROSTER[0]]));
+    // Renamed away and back during the read: the saved digest ends where it began.
+    act(() => void main.hook().renamePage("p2", "Y"));
+    act(() => void main.hook().renamePage("p2", "X"));
+    act(() => void vi.advanceTimersByTime(1_000));
+    vi.useRealTimers();
+
+    expect(warn).not.toHaveBeenCalled();
+  });
+
   it("a null store leaves the receiver's roster unchanged", async () => {
     const main = await mountWindow("main");
     const before = main.hook().allPages;
@@ -504,19 +534,36 @@ describe("the receiver's branches", () => {
     expect(warn).not.toHaveBeenCalled();
   });
 
-  it("an own save that lands before a foreign event is not warned about either", async () => {
+  it("a store still holding an own save made before a foreign event is warned about", async () => {
     const main = await mountWindow("main");
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     // Main saves first; the store holds its write.
     act(() => void main.hook().renamePage("p1", "MineFirst"));
     vi.useFakeTimers();
-    // A foreign event whose write the store will never show (main overwrote it).
+    // A foreign event whose write never shows here: the other window may have
+    // built on main's save while main's store lags, so this cannot be told
+    // from a lag and is reported.
     receiveFrom("term-2", rosterDigest([ROSTER[2]]));
     act(() => void vi.advanceTimersByTime(1_000));
     vi.useRealTimers();
 
-    expect(warn).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledTimes(1);
     expect(names(main.hook().allPages)).toEqual(["MineFirst", "Beta", "Gamma"]);
+  });
+
+  it("a read that never matches warns and applies the store as it now reads", async () => {
+    const main = await mountWindow("main");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.useFakeTimers();
+    // The event's digest never appears; the store moves to a third roster this
+    // window does not show yet.
+    receiveFrom("term-2", rosterDigest([ROSTER[0]]));
+    instanceStorage.setJSON(PAGES_STORAGE_KEY, [ROSTER[0], { ...ROSTER[1], name: "Third" }, ROSTER[2]]);
+    act(() => void vi.advanceTimersByTime(1_000));
+    vi.useRealTimers();
+
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(names(main.hook().allPages)).toEqual(["Alpha", "Third", "Gamma"]);
   });
 
   it("a store emptied between the read and the update keeps the receiver's copy", async () => {
