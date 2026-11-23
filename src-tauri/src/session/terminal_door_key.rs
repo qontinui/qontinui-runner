@@ -53,8 +53,8 @@
 //! in its own environment and sends it as `X-Qontinui-Terminal-Proof`. The
 //! variable name ([`NONCE_ENV`]), [`LABEL`] and the separator are therefore a
 //! cross-repo contract. This module's tests pin the vector below as a literal,
-//! and that client's suite pins the same vector in qontinui-claude-config PR
-//! #2399, not yet on its main:
+//! and that client's suite pins the same vector in qontinui-claude-config
+//! `scripts/worktree-handoff-test.sh` (landed by PR #2399):
 //! nonce `0123456789abcdef0123456789abcdef`, door `transcript-bind` →
 //! `300c88aed1868f359db36f35beb3b1cec8bd0a32494f57ad8cb28bf38f55b3f7`.
 //! A change to any of the three must land in both repos.
@@ -86,7 +86,11 @@ pub fn terminal_door_key_for(door: &str, nonce: &str) -> String {
 /// terminal: an adopted holder pane, a previous process's terminal), or
 /// forgotten (the terminal dropped). A proof is evidence only while the grant
 /// it was derived from is live in THIS process.
-pub fn terminal_door_key_matches(terminal_id: &str, door: &str, presented: Option<&str>) -> bool {
+pub fn terminal_door_key_matches(
+    terminal_id: &str,
+    door: &'static str,
+    presented: Option<&str>,
+) -> bool {
     let Some(presented) = presented else {
         return false;
     };
