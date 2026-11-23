@@ -632,6 +632,21 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    /// An absolute fixture path for this platform: `/ws/...` on Unix, and
+    /// `C:\ws\...` on Windows, where a rootless `/ws` is NOT absolute (a
+    /// transcript there records a drive-letter cwd, so the scan rightly reads
+    /// `/ws` as relative). Backslashes keep a path the scan joins comparable
+    /// as text. Leaked so every fixture call site can take a `&str`; a test
+    /// process leaks a few hundred bytes.
+    fn abs(p: &str) -> &'static str {
+        let native = if cfg!(windows) {
+            format!("C:{}", p.replace('/', "\\"))
+        } else {
+            p.to_string()
+        };
+        Box::leak(native.into_boxed_str())
+    }
+
     fn write(path: &Path, lines: &[String]) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let mut f = std::fs::File::create(path).unwrap();
@@ -702,39 +717,39 @@ mod tests {
     #[test]
     fn cwds_and_write_targets_are_collected_and_read_only_tools_prove_no_write() {
         let read_only = scan(&[
-            said("/ws", serde_json::json!("look around")),
+            said(abs("/ws"), serde_json::json!("look around")),
             call(
-                "/ws",
+                abs("/ws"),
                 "Read",
-                serde_json::json!({"file_path": "/ws/wt/a/src/x.rs"}),
+                serde_json::json!({"file_path": abs("/ws/wt/a/src/x.rs")}),
             ),
             said(
-                "/ws/wt/b",
+                abs("/ws/wt/b"),
                 serde_json::json!([{"type": "tool_result", "tool_use_id": "u1",
                                     "content": [{"type": "text", "text": "big"}]}]),
             ),
             "".to_string(),
         ]);
         // A Read target names no tree: only the records' cwds do.
-        assert_eq!(dirs(&read_only), vec!["/ws", "/ws/wt/b"]);
+        assert_eq!(dirs(&read_only), vec![abs("/ws"), abs("/ws/wt/b")]);
         assert_eq!(read_only.write_call, None);
         assert_eq!(read_only.incomplete, None);
         assert!(read_only.reached_end);
 
         let wrote = scan(&[
             call(
-                "/ws",
+                abs("/ws"),
                 "Edit",
-                serde_json::json!({"file_path": "/ws/wt/a/src/x.rs", "old_string": "a"}),
+                serde_json::json!({"file_path": abs("/ws/wt/a/src/x.rs"), "old_string": "a"}),
             ),
             call(
-                "/ws",
+                abs("/ws"),
                 "NotebookEdit",
-                serde_json::json!({"notebook_path": "/ws/wt/n/nb.ipynb"}),
+                serde_json::json!({"notebook_path": abs("/ws/wt/n/nb.ipynb")}),
             ),
             // A relative target is taken against the record's own cwd.
             call(
-                "/ws/wt/c",
+                abs("/ws/wt/c"),
                 "Write",
                 serde_json::json!({"file_path": "docs/y.md", "content": "z"}),
             ),
@@ -742,11 +757,11 @@ mod tests {
         assert_eq!(
             dirs(&wrote),
             vec![
-                "/ws",
-                "/ws/wt/a/src",
-                "/ws/wt/c",
-                "/ws/wt/c/docs",
-                "/ws/wt/n"
+                abs("/ws"),
+                abs("/ws/wt/a/src"),
+                abs("/ws/wt/c"),
+                abs("/ws/wt/c/docs"),
+                abs("/ws/wt/n")
             ]
         );
         assert_eq!(
@@ -758,7 +773,7 @@ mod tests {
     #[test]
     fn any_tool_off_the_allowlist_breaks_the_proof() {
         for tool in ["Bash", "Agent", "Task", "mcp__x__y", "SomeFutureTool", ""] {
-            let s = scan(&[call("/ws", tool, serde_json::json!({}))]);
+            let s = scan(&[call(abs("/ws"), tool, serde_json::json!({}))]);
             assert!(s.write_call.is_some(), "{tool:?}");
         }
     }
@@ -767,18 +782,19 @@ mod tests {
     fn a_line_that_is_not_a_record_is_incomplete_and_later_lines_still_count() {
         let s = scan(&[
             "{cut off".to_string(),
-            said("/ws/wt/a", serde_json::json!("go")),
+            said(abs("/ws/wt/a"), serde_json::json!("go")),
         ]);
         assert!(s.incomplete.as_deref().unwrap().contains("line 1"));
-        assert_eq!(dirs(&s), vec!["/ws/wt/a"]);
+        assert_eq!(dirs(&s), vec![abs("/ws/wt/a")]);
         // A content shape the scan does not know is not skipped in silence.
-        let odd = scan(&[serde_json::json!({"cwd": "/ws", "message": {"content": 7}}).to_string()]);
+        let odd =
+            scan(&[serde_json::json!({"cwd": abs("/ws"), "message": {"content": 7}}).to_string()]);
         assert!(odd.incomplete.is_some());
     }
 
     #[test]
     fn a_passed_deadline_is_incomplete() {
-        let line = said("/ws", serde_json::json!("go"));
+        let line = said(abs("/ws"), serde_json::json!("go"));
         let s = scan_records(line.as_bytes(), Instant::now(), "t.jsonl");
         assert!(s.incomplete.as_deref().unwrap().contains("ran out of time"));
         assert!(!s.reached_end);
@@ -790,10 +806,10 @@ mod tests {
         let sid = "8c0e5a52-0000-4000-8000-000000000001";
         let root = tmp.path().join(".claude-a");
         let main = main_path(&root, "p1", sid);
-        write(&main, &[said("/ws", serde_json::json!("go"))]);
+        write(&main, &[said(abs("/ws"), serde_json::json!("go"))]);
         let roots = vec![root.clone()];
         let clean = scan_session_in(&roots, sid, SCAN_MAX_BYTES, SCAN_DEADLINE);
-        assert_eq!(clean.dirs, vec![PathBuf::from("/ws")]);
+        assert_eq!(clean.dirs, vec![PathBuf::from(abs("/ws"))]);
         assert_eq!(clean.read.no_write_proof(), Ok(()));
 
         // A subagent's edit, and a workflow agent one level further down.
@@ -801,9 +817,9 @@ mod tests {
         write(
             &subagents.join("agent-a1.jsonl"),
             &[call(
-                "/ws",
+                abs("/ws"),
                 "Edit",
-                serde_json::json!({"file_path": "/ws/wt/a/x.rs"}),
+                serde_json::json!({"file_path": abs("/ws/wt/a/x.rs")}),
             )],
         );
         write(
@@ -811,15 +827,15 @@ mod tests {
                 .join("workflows")
                 .join("wf_1")
                 .join("agent-a2.jsonl"),
-            &[said("/ws/wt/b", serde_json::json!("go"))],
+            &[said(abs("/ws/wt/b"), serde_json::json!("go"))],
         );
         let both = scan_session_in(&roots, sid, SCAN_MAX_BYTES, SCAN_DEADLINE);
         assert_eq!(
             both.dirs,
             vec![
-                PathBuf::from("/ws"),
-                PathBuf::from("/ws/wt/a"),
-                PathBuf::from("/ws/wt/b")
+                PathBuf::from(abs("/ws")),
+                PathBuf::from(abs("/ws/wt/a")),
+                PathBuf::from(abs("/ws/wt/b"))
             ]
         );
         assert_eq!(both.read.incomplete, None);
@@ -837,7 +853,7 @@ mod tests {
 
         write(
             &main_path(&a, "p1", sid),
-            &[said("/ws/wt/a", serde_json::json!("go"))],
+            &[said(abs("/ws/wt/a"), serde_json::json!("go"))],
         );
         let cut = scan_session_in(&[a.clone()], sid, 4, SCAN_DEADLINE);
         assert!(cut.read.incomplete.unwrap().contains("byte bound"));
@@ -846,13 +862,16 @@ mod tests {
         // read, and the proof does not hold.
         write(
             &main_path(&b, "p2", sid),
-            &[serde_json::json!({"type": "permission-mode", "cwd": "/ws/wt/b"}).to_string()],
+            &[serde_json::json!({"type": "permission-mode", "cwd": abs("/ws/wt/b")}).to_string()],
         );
         let unranked = scan_session_in(&[a, b], sid, SCAN_MAX_BYTES, SCAN_DEADLINE);
         assert!(unranked.read.incomplete.is_some());
         assert_eq!(
             unranked.dirs,
-            vec![PathBuf::from("/ws/wt/a"), PathBuf::from("/ws/wt/b")]
+            vec![
+                PathBuf::from(abs("/ws/wt/a")),
+                PathBuf::from(abs("/ws/wt/b"))
+            ]
         );
     }
 
@@ -899,7 +918,7 @@ mod tests {
     fn scan_file_marks_a_file_restamped_during_the_read_incomplete() {
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path().join("r.jsonl");
-        write(&p, &[said("/ws", serde_json::json!("go"))]);
+        write(&p, &[said(abs("/ws"), serde_json::json!("go"))]);
         let moved = |_: &Path| {
             Some(FileStamp {
                 len: 1,
@@ -943,7 +962,7 @@ mod tests {
     #[test]
     fn an_unknown_block_kind_breaks_the_proof() {
         let line = |blocks: serde_json::Value| {
-            serde_json::json!({"type": "assistant", "cwd": "/ws",
+            serde_json::json!({"type": "assistant", "cwd": abs("/ws"),
                                "message": {"content": blocks}})
             .to_string()
         };
@@ -970,18 +989,18 @@ mod tests {
     #[test]
     fn only_a_write_tools_input_is_type_checked() {
         let odd = scan(&[
-            call("/ws", "mcp__x__y", serde_json::json!("not an object")),
-            call("/ws", "mcp__x__z", serde_json::json!({"file_path": 7})),
-            said("/ws/wt/a", serde_json::json!("go")),
+            call(abs("/ws"), "mcp__x__y", serde_json::json!("not an object")),
+            call(abs("/ws"), "mcp__x__z", serde_json::json!({"file_path": 7})),
+            said(abs("/ws/wt/a"), serde_json::json!("go")),
         ]);
         assert_eq!(odd.incomplete, None);
-        assert_eq!(dirs(&odd), vec!["/ws", "/ws/wt/a"]);
+        assert_eq!(dirs(&odd), vec![abs("/ws"), abs("/ws/wt/a")]);
         for input in [
             serde_json::json!(["x"]),
             serde_json::json!({"file_path": 7}),
             serde_json::json!({}),
         ] {
-            let s = scan(&[call("/ws", "Edit", input.clone())]);
+            let s = scan(&[call(abs("/ws"), "Edit", input.clone())]);
             assert!(s.incomplete.is_some(), "{input}");
         }
     }
@@ -995,11 +1014,13 @@ mod tests {
         let root = tmp.path().join(".claude-a");
         let main = main_path(&root, "p1", sid);
         let roots = vec![root];
-        let bash = call("/ws", "Bash", serde_json::json!({"command": "true"}));
-        let mut quiet = said("/ws", serde_json::json!("go"));
+        let bash = call(abs("/ws"), "Bash", serde_json::json!({"command": "true"}));
+        let mut quiet = said(abs("/ws"), serde_json::json!("go"));
         let pad = bash.len().checked_sub(quiet.len()).unwrap();
         quiet = said(
-            &format!("/ws/{}", "p".repeat(pad - 1)),
+            // Grow the cwd by exactly `pad` bytes with no separator: a Windows
+            // `\` is escaped to two bytes in the JSON record.
+            &format!("{}{}", abs("/ws"), "p".repeat(pad)),
             serde_json::json!("go"),
         );
         assert_eq!(quiet.len(), bash.len());
@@ -1030,7 +1051,7 @@ mod tests {
         let sid = "8c0e5a52-0000-4000-8000-000000000005";
         let root = tmp.path().join(".claude-a");
         let main = main_path(&root, "p1", sid);
-        write(&main, &[said("/ws", serde_json::json!("go"))]);
+        write(&main, &[said(abs("/ws"), serde_json::json!("go"))]);
         let subagents = main.with_extension("").join("subagents");
         let mut deep = subagents.clone();
         for level in 0..=SIDECHAIN_MAX_DEPTH {
@@ -1038,7 +1059,7 @@ mod tests {
         }
         write(
             &deep.join("agent-x.jsonl"),
-            &[said("/ws", serde_json::json!("go"))],
+            &[said(abs("/ws"), serde_json::json!("go"))],
         );
         let roots = vec![root];
         let too_deep = scan_session_in(&roots, sid, SCAN_MAX_BYTES, SCAN_DEADLINE);
@@ -1052,19 +1073,19 @@ mod tests {
         let sid = "8c0e5a52-0000-4000-8000-000000000007";
         let root = tmp.path().join(".claude-a");
         let main = main_path(&root, "p1", sid);
-        write(&main, &[said("/ws", serde_json::json!("go"))]);
+        write(&main, &[said(abs("/ws"), serde_json::json!("go"))]);
         let mut deep = main.with_extension("").join("subagents");
         for level in 0..SIDECHAIN_MAX_DEPTH {
             deep = deep.join(format!("d{level}"));
         }
         write(
             &deep.join("agent-x.jsonl"),
-            &[said("/ws/wt/deep", serde_json::json!("go"))],
+            &[said(abs("/ws/wt/deep"), serde_json::json!("go"))],
         );
         let s = scan_session_in(&[root], sid, SCAN_MAX_BYTES, SCAN_DEADLINE);
         assert_eq!(s.read.incomplete, None);
         assert!(
-            s.dirs.contains(&PathBuf::from("/ws/wt/deep")),
+            s.dirs.contains(&PathBuf::from(abs("/ws/wt/deep"))),
             "{:?}",
             s.dirs
         );
@@ -1079,12 +1100,12 @@ mod tests {
         let sid = "8c0e5a52-0000-4000-8000-000000000006";
         let root = tmp.path().join(".claude-a");
         let main = main_path(&root, "p1", sid);
-        write(&main, &[said("/ws", serde_json::json!("go"))]);
+        write(&main, &[said(abs("/ws"), serde_json::json!("go"))]);
         let subagents = main.with_extension("").join("subagents");
         std::fs::create_dir_all(&subagents).unwrap();
         let roots = vec![root];
         let elsewhere = tmp.path().join("elsewhere.jsonl");
-        write(&elsewhere, &[said("/ws", serde_json::json!("go"))]);
+        write(&elsewhere, &[said(abs("/ws"), serde_json::json!("go"))]);
         std::os::unix::fs::symlink(&elsewhere, subagents.join("agent-y.jsonl")).unwrap();
         let linked = scan_session_in(&roots, sid, SCAN_MAX_BYTES, SCAN_DEADLINE);
         assert!(linked.read.incomplete.unwrap().contains("symlink"));
@@ -1099,7 +1120,7 @@ mod tests {
         let root = tmp.path().join(".claude-a");
         let main = main_path(&root, "p1", sid);
         let roots = vec![root];
-        write(&main, &[said("/ws", serde_json::json!("go"))]);
+        write(&main, &[said(abs("/ws"), serde_json::json!("go"))]);
         assert_eq!(
             scan_session_in(&roots, sid, SCAN_MAX_BYTES, SCAN_DEADLINE)
                 .read
@@ -1109,8 +1130,8 @@ mod tests {
         write(
             &main,
             &[
-                said("/ws", serde_json::json!("go")),
-                call("/ws", "Bash", serde_json::json!({"command": "true"})),
+                said(abs("/ws"), serde_json::json!("go")),
+                call(abs("/ws"), "Bash", serde_json::json!({"command": "true"})),
             ],
         );
         assert!(scan_session_in(&roots, sid, SCAN_MAX_BYTES, SCAN_DEADLINE)

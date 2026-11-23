@@ -1908,6 +1908,16 @@ mod tests {
 
     const REAPED_TREE: &str = "/ws/agent-worktrees/gone/repo";
 
+    /// `p` as the custody code renders a path it rebuilt component by
+    /// component: unchanged on Unix, `\`-separated on Windows.
+    fn native(p: &str) -> String {
+        Path::new(p)
+            .components()
+            .collect::<PathBuf>()
+            .display()
+            .to_string()
+    }
+
     /// A workspace-root-repo box (`/ws` is a primary) whose session's
     /// transcript names two directories under the reaped allocation tree
     /// [`REAPED_TREE`], and what that tree's branch reads (`None` =
@@ -1951,14 +1961,14 @@ mod tests {
         }));
         let ctx = context(Some("/home/u/scratch"), &[]);
         let inputs = gather_custody(&landed, &ctx, Ok(vec![]), "s").await;
-        assert_eq!(inputs.covered, vec![REAPED_TREE]);
+        assert_eq!(inputs.covered, vec![native(REAPED_TREE)]);
         assert_eq!(
             inputs
                 .members
                 .iter()
                 .map(|m| m.path.as_str())
                 .collect::<Vec<_>>(),
-            vec![REAPED_TREE]
+            vec![native(REAPED_TREE)]
         );
         assert_eq!(custody_gate(&inputs), CustodyVerdict::Clean);
         let calls = landed.calls();
@@ -1988,7 +1998,7 @@ mod tests {
         assert_eq!(
             custody_gate(&inputs),
             CustodyVerdict::Dirty(CustodyDirty::Unpushed {
-                path: REAPED_TREE.to_string(),
+                path: native(REAPED_TREE),
                 ahead: 2
             })
         );
@@ -2003,15 +2013,15 @@ mod tests {
         let tree = |p: &str| allocation_tree(Path::new(p)).map(|t| t.display().to_string());
         assert_eq!(
             tree("/ws/agent-worktrees/01a1/qontinui-runner/src-tauri/src").as_deref(),
-            Some("/ws/agent-worktrees/01a1/qontinui-runner")
+            Some(native("/ws/agent-worktrees/01a1/qontinui-runner").as_str())
         );
         assert_eq!(
             tree("/ws/agent-worktrees/01a1").as_deref(),
-            Some("/ws/agent-worktrees/01a1")
+            Some(native("/ws/agent-worktrees/01a1").as_str())
         );
         assert_eq!(
             tree("/ws/qontinui-worktrees/01a1/qontinui-web/backend").as_deref(),
-            Some("/ws/qontinui-worktrees/01a1/qontinui-web")
+            Some(native("/ws/qontinui-worktrees/01a1/qontinui-web").as_str())
         );
         assert_eq!(tree("/ws/agent-worktrees/.siblings/schemas@abc/rust"), None);
         assert_eq!(tree("/ws/agent-worktrees"), None);
