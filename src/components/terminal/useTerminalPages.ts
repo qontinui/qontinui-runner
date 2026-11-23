@@ -777,23 +777,23 @@ export function useTerminalPages() {
       });
     };
 
-    // Set when this window saves while a foreign read is still retrying. The
-    // retries go on, because nothing orders the two writes: the foreign one
-    // may still be the store's last commit and must then be shown. But a read
-    // that never matches is then the ordinary result of this window's own
-    // overwrite, not a lag, so it is not warned about.
-    let ownSaveDuringRead = false;
+    // The digest of this window's own last save, from its echo. An own save
+    // never cancels a pending foreign read (nothing orders the two writes: the
+    // foreign one may still be the store's last commit and must then be
+    // shown). But a read that never matches because the store holds this
+    // window's own save, in either order, is an ordinary overwrite, not a lag,
+    // so it is not warned about.
+    let lastOwnDigest: string | null = null;
 
     const unlisten = listenRosterSaved(({ source, digest }) => {
       if (source === windowLabel) {
-        if (retryTimer) ownSaveDuringRead = true;
+        lastOwnDigest = digest;
         return;
       }
       if (lastSaveRefusedRef.current) return;
       // A newer foreign event supersedes a read still waiting on an older digest.
       if (retryTimer) clearTimeout(retryTimer);
       retryTimer = null;
-      ownSaveDuringRead = false;
       let retries = 0;
       let lastRead: TerminalPageConfig[] | null = null;
       const attempt = () => {
@@ -802,7 +802,6 @@ export function useTerminalPages() {
         const stored = readPersistedPages();
         if (stored) lastRead = stored;
         if (stored && rosterDigest(stored) === digest) {
-          ownSaveDuringRead = false;
           apply();
           return;
         }
@@ -812,12 +811,11 @@ export function useTerminalPages() {
           return;
         }
         if (lastRead) {
-          if (!ownSaveDuringRead) {
+          if (rosterDigest(lastRead) !== lastOwnDigest) {
             console.warn(
               `[terminal-pages] the stored roster never matched ${source}'s save; applying the store as read`,
             );
           }
-          ownSaveDuringRead = false;
           apply();
         }
       };
