@@ -7942,6 +7942,25 @@ mod component_action_window_tests {
         assert!(p.get("windowLabel").is_none(), "{p}");
     }
 
+    /// The HTTP entry seam: `?windowLabel=` (camelCase, via the serde rename)
+    /// must deserialize into `window_label`, or every pop-out-targeted call
+    /// would silently run in main with every builder test still green.
+    #[test]
+    fn the_window_label_query_param_deserializes() {
+        use super::ComponentActionQueryParams;
+        use axum::extract::Query;
+        let parse = |uri: &str| {
+            Query::<ComponentActionQueryParams>::try_from_uri(&uri.parse().unwrap())
+                .expect("query parses")
+                .0
+                .window_label
+        };
+        assert_eq!(parse("/x?windowLabel=term-2").as_deref(), Some("term-2"));
+        assert_eq!(parse("/x").as_deref(), None);
+        // The snake_case spelling is not the wire name.
+        assert_eq!(parse("/x?window_label=term-2").as_deref(), None);
+    }
+
     #[test]
     fn split_hands_the_ws_arm_the_payload_without_the_window() {
         let p = component_action_ipc_payload(
