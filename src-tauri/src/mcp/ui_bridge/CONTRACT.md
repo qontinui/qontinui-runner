@@ -445,6 +445,18 @@ Two thread-through styles, mirroring the `tabId` split:
   (`ActionQueryParams.window_label`, which also scopes its pre/post detector and
   disabled-state queries so the element id resolves in the right window's
   registry). Rust callers holding a label call `ui_bridge_request_sync_in_window`.
+- **Component actions** — `POST /control/component/{id}/action/{action_id}`
+  (`elements.rs`) and its sibling `…/{action_id}/predict` (`effects.rs`) take
+  `?windowLabel=` from the QUERY only (empty = absent), stamped by
+  `component_action_ipc_payload` / `predict_ipc_payload` via
+  `target_window_payload`. A body `windowLabel` is NOT a route: the flat body
+  keys are the action's params, and `move-terminal-to-window` declares
+  `windowLabel` as its own param, so it is left in `params` untouched. The WS fast path (`try_ws_dispatch_for_app`) stays
+  window-agnostic and receives the payload without the label: it reaches an
+  external SDK app registered under the component id, never a runner window.
+  This is how an agent reads or drives a pop-out's own component actions, e.g.
+  `terminal-page/action/get-roster-resync-stats?windowLabel=term-2`. (Plan
+  2026-11-23-runner-terminal-page-popout-ui-bridge-and-resync-lag, D2.)
 - **Read/convenience family** — `find-by-text`, `click-by-text`,
   `click-by-selector`, `read-value`, `type-into` (`elements.rs`) read an optional
   `windowLabel` **body** field and evaluate through
