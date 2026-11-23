@@ -232,11 +232,12 @@ pub(crate) const DISPATCH_LABEL: &str = "qontinui.ci.dispatch";
 /// that starts a throwaway database. It marks; it authorises nothing.
 pub(crate) const EPHEMERAL_LABEL: &str = "qontinui.ephemeral";
 /// Which harness owns an ephemeral container, and therefore whose liveness rule
-/// applies to it. Read first by the cleanup steward's owner resolver.
+/// applies to it. The cleanup steward's class-15 owner resolver (planned, not
+/// yet shipped) will read it first.
 pub(crate) const EPHEMERAL_OWNER_LABEL: &str = "qontinui.ephemeral.owner";
 /// The value this module writes under [`EPHEMERAL_OWNER_LABEL`].
 pub(crate) const EPHEMERAL_OWNER: &str = "runner-ci-node";
-/// The fleet-wide `<kind>:<name>` owner key — the resolver's fallback when
+/// The fleet-wide `<kind>:<name>` owner key — that planned resolver's fallback when
 /// [`EPHEMERAL_OWNER_LABEL`] is absent, shared with the network owner labels.
 pub(crate) const OWNER_LABEL: &str = "qontinui.owner";
 /// The value this module writes under [`OWNER_LABEL`].
