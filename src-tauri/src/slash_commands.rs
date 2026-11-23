@@ -15,7 +15,7 @@ use regex::Regex;
 use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
@@ -185,6 +185,15 @@ fn commands_directory_in(
     (Ok((workspace_root, commands_dir)), report)
 }
 
+/// A command file's path relative to the workspace root, with forward slashes —
+/// the key an imported workflow's `source_file_path` is stored under.
+fn relative_source_path(file_path: &Path, workspace_root: &Path) -> String {
+    file_path
+        .strip_prefix(workspace_root)
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| file_path.to_string_lossy().replace('\\', "/"))
+}
+
 /// Parse a single markdown file into a SlashCommandParsed.
 fn parse_command_file(
     file_path: &Path,
@@ -239,11 +248,7 @@ fn parse_command_file(
     // Check for $ARGUMENTS
     let has_arguments = content.contains("$ARGUMENTS");
 
-    // Compute relative path
-    let relative_path = file_path
-        .strip_prefix(workspace_root)
-        .map(|p| p.to_string_lossy().replace('\\', "/"))
-        .unwrap_or_else(|_| file_path.to_string_lossy().replace('\\', "/"));
+    let relative_path = relative_source_path(file_path, workspace_root);
 
     Ok(SlashCommandParsed {
         file_name,
@@ -362,6 +367,85 @@ fn build_workflow_request(parsed: &SlashCommandParsed) -> CreateUnifiedWorkflowR
     }
 }
 
+/// The previously imported slash-command workflows, as source path ->
+/// (`id`, `name`). Rows with no source path were not written by this import and
+/// are left out. A failed read is returned as an error — never as an empty map,
+/// which the caller would act on as "nothing was imported yet".
+fn existing_source_map(
+    listed: Result<Vec<(String, String, String)>, String>,
+) -> Result<HashMap<String, (String, String)>, String> {
+    let rows =
+        listed.map_err(|e| format!("Failed to list imported slash command workflows: {e}"))?;
+    Ok(rows
+        .into_iter()
+        .filter(|(_, _, source)| !source.is_empty())
+        .map(|(id, name, source)| (source, (id, name)))
+        .collect())
+}
+
+/// The imported workflows whose source file is no longer on disk, i.e. the ones
+/// to delete. An import whose file is present but `unreadable` is not stale.
+///
+/// Refuses (with the reason) to delete anything while imports exist and either
+/// the directory listing was incomplete (`listing_complete == false`, so a
+/// file may be missing from it) or the checkout yielded **no** command at all.
+/// An empty yield is far more likely a broken or half-written checkout than a
+/// deliberate removal of every command, and a deletion is not undoable: a
+/// command restored later comes back under a new id.
+fn stale_imports<'a>(
+    disk_commands: &HashMap<String, SlashCommandParsed>,
+    unreadable: &HashSet<String>,
+    listing_complete: bool,
+    existing: &'a HashMap<String, (String, String)>,
+) -> Result<Vec<(&'a String, &'a (String, String))>, String> {
+    if existing.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !listing_complete {
+        return Err(format!(
+            "Deletion withheld: the commands directory listing was incomplete, so none of \
+             the {} previously imported slash command workflow(s) were deleted",
+            existing.len()
+        ));
+    }
+    if disk_commands.is_empty() {
+        return Err(format!(
+            "Deletion withheld: the commands directory yielded no parseable command, so \
+             none of the {} previously imported slash command workflow(s) were deleted",
+            existing.len()
+        ));
+    }
+    Ok(existing
+        .iter()
+        .filter(|(rel_path, _)| {
+            !disk_commands.contains_key(*rel_path) && !unreadable.contains(*rel_path)
+        })
+        .collect())
+}
+
+/// Record a freshly created workflow's source path and content hash — what
+/// makes it findable by the next sync's list read.
+async fn track_source(
+    pg: &std::sync::Arc<crate::database::pg::PgDb>,
+    workflow_id: &str,
+    parsed: &SlashCommandParsed,
+) -> Result<(), String> {
+    let id = parse_workflow_id(workflow_id)?;
+    let conn = pg.pool().get().await.map_err(|e| format!("PG pool: {e}"))?;
+    let updated = conn
+        .execute(
+            "UPDATE unified_workflows SET source_file_path = $2, source_content_hash = $3 WHERE id = $1",
+            &[&id, &parsed.relative_path, &parsed.content_hash],
+        )
+        .await
+        .map_err(|e| format!("PG update: {e}"))?;
+    if updated == 1 {
+        Ok(())
+    } else {
+        Err(format!("updated {updated} rows, expected 1"))
+    }
+}
+
 /// Sync slash commands from disk to the database (PG-backed).
 ///
 /// Scans the commands directory, compares with existing DB entries,
@@ -388,10 +472,24 @@ pub async fn sync_slash_commands(
 
     // Parse all command files from disk
     let mut disk_commands: HashMap<String, SlashCommandParsed> = HashMap::new();
+    // Command files that are on disk but could not be read: their imports are
+    // kept, not treated as removed.
+    let mut unreadable: HashSet<String> = HashSet::new();
+    // False when a directory entry itself could not be read, so the listing
+    // may be missing files this sync cannot name.
+    let mut listing_complete = true;
     let entries = std::fs::read_dir(&commands_dir)
         .map_err(|e| SyncError::Failed(format!("Failed to read commands directory: {}", e)))?;
 
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                warn!("Unreadable entry in {:?}: {}", commands_dir, e);
+                listing_complete = false;
+                continue;
+            }
+        };
         let path = entry.path();
         if path.extension().is_some_and(|ext| ext == "md") {
             report.expected += 1;
@@ -402,6 +500,7 @@ pub async fn sync_slash_commands(
                 }
                 Err(e) => {
                     warn!("Failed to parse command file {:?}: {}", path, e);
+                    unreadable.insert(relative_source_path(&path, &workspace_root));
                     report.skip(
                         path.file_name()
                             .map(|n| n.to_string_lossy().into_owned())
@@ -419,18 +518,11 @@ pub async fn sync_slash_commands(
     }
     record_provision(&commands_dir.display().to_string(), report);
 
-    // Get existing slash command workflows from PG
-    let existing = pg.list_slash_command_sources().await.unwrap_or_default();
-    let existing_map: HashMap<String, (String, String)> = existing
-        .into_iter()
-        .filter_map(|(id, _name, source)| {
-            if source.is_empty() {
-                None
-            } else {
-                Some((source, (id, _name)))
-            }
-        })
-        .collect();
+    // Get existing slash command workflows from PG. A failed read is
+    // `SyncError::Failed` (the route's 500), never an empty list: read as empty, every command on
+    // disk would be re-created as a duplicate.
+    let existing_map =
+        existing_source_map(pg.list_slash_command_sources().await).map_err(SyncError::Failed)?;
 
     let mut result = SyncResult {
         created: 0,
@@ -511,19 +603,26 @@ pub async fn sync_slash_commands(
             // Create new workflow
             let req = build_workflow_request(parsed);
             match pg.create_unified_workflow(&req).await {
-                Ok(wf) => {
-                    // Set source tracking fields
-                    if let (Ok(conn), Ok(wf_id_uuid)) =
-                        (pg.pool().get().await, parse_workflow_id(&wf.id))
-                    {
-                        let _ = conn.execute(
-                            "UPDATE unified_workflows SET source_file_path = $2, source_content_hash = $3 WHERE id = $1",
-                            &[&wf_id_uuid, &parsed.relative_path, &parsed.content_hash],
-                        ).await;
+                Ok(wf) => match track_source(pg, &wf.id, parsed).await {
+                    Ok(()) => {
+                        result.created += 1;
+                        info!("Created slash command workflow: {}", parsed.title);
                     }
-                    result.created += 1;
-                    info!("Created slash command workflow: {}", parsed.title);
-                }
+                    Err(e) => {
+                        // A row with no source_file_path is invisible to the
+                        // next list read, which would create the command a
+                        // second time — so the untracked row is removed.
+                        let removed = match pg.delete_unified_workflow(&wf.id).await {
+                            Ok(true) => "it was removed".to_string(),
+                            Ok(false) => "it was already gone".to_string(),
+                            Err(del) => format!("removing it also failed: {del}"),
+                        };
+                        result.errors.push(format!(
+                            "Create {}: recording its source failed ({e}); {removed}",
+                            parsed.command_name
+                        ));
+                    }
+                },
                 Err(e) => result
                     .errors
                     .push(format!("Create {}: {}", parsed.command_name, e)),
@@ -531,22 +630,31 @@ pub async fn sync_slash_commands(
         }
     }
 
-    // Delete workflows for commands no longer on disk
-    for (rel_path, (existing_id, name)) in &existing_map {
-        if !disk_commands.contains_key(rel_path) {
-            match pg.delete_unified_workflow(existing_id).await {
-                Ok(true) => {
-                    result.deleted += 1;
-                    info!("Deleted slash command workflow: {} ({})", name, rel_path);
+    // Delete workflows for commands no longer on disk. An unreadable file's
+    // import is kept; a checkout that yielded no command, or whose listing was
+    // incomplete, deletes nothing and reports the withheld deletion in
+    // `errors`.
+    match stale_imports(&disk_commands, &unreadable, listing_complete, &existing_map) {
+        Ok(stale) => {
+            for (rel_path, (existing_id, name)) in stale {
+                match pg.delete_unified_workflow(existing_id).await {
+                    Ok(true) => {
+                        result.deleted += 1;
+                        info!("Deleted slash command workflow: {} ({})", name, rel_path);
+                    }
+                    Ok(false) => {
+                        warn!(
+                            "Slash command workflow {} not found for deletion",
+                            existing_id
+                        );
+                    }
+                    Err(e) => result.errors.push(format!("Delete {}: {}", name, e)),
                 }
-                Ok(false) => {
-                    warn!(
-                        "Slash command workflow {} not found for deletion",
-                        existing_id
-                    );
-                }
-                Err(e) => result.errors.push(format!("Delete {}: {}", name, e)),
             }
+        }
+        Err(withheld) => {
+            warn!("{}", withheld);
+            result.errors.push(withheld);
         }
     }
 
@@ -678,5 +786,173 @@ mod tests {
         hasher.update(content);
         let hash = format!("{:x}", hasher.finalize());
         assert_eq!(hash.len(), 64); // SHA-256 hex is 64 chars
+    }
+
+    fn parsed(rel: &str) -> SlashCommandParsed {
+        SlashCommandParsed {
+            file_name: rel.rsplit('/').next().unwrap_or(rel).to_string(),
+            command_name: "cmd".into(),
+            title: "Cmd".into(),
+            description: String::new(),
+            full_content: String::new(),
+            has_arguments: false,
+            content_hash: String::new(),
+            relative_path: rel.to_string(),
+        }
+    }
+
+    fn imported(paths: &[&str]) -> HashMap<String, (String, String)> {
+        paths
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.to_string(), (format!("id-{i}"), format!("name-{i}"))))
+            .collect()
+    }
+
+    /// A list-query failure must surface as an error (the route's 500), never
+    /// as an empty map that makes every command on disk a duplicate create.
+    #[test]
+    fn a_failed_import_list_is_an_error_not_an_empty_map() {
+        let err = existing_source_map(Err("PG pool error: timed out".into()))
+            .expect_err("a failed read must not read as no imports");
+        assert!(err.contains("PG pool error: timed out"), "{err}");
+        // ...and the error the sync returns for it is the route's 500.
+        let (status, _) = SyncError::Failed(err).into_response();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn the_import_list_keys_by_source_and_skips_unsourced_rows() {
+        let map = existing_source_map(Ok(vec![
+            ("1".into(), "fix".into(), "c/.claude/commands/fix.md".into()),
+            ("2".into(), "hand-made".into(), String::new()),
+        ]))
+        .expect("listed");
+        assert_eq!(map.len(), 1);
+        assert_eq!(
+            map.get("c/.claude/commands/fix.md"),
+            Some(&("1".to_string(), "fix".to_string()))
+        );
+    }
+
+    /// A checkout that yielded no parseable command must not delete the
+    /// previously imported workflows.
+    #[test]
+    fn a_checkout_with_no_parseable_command_deletes_nothing() {
+        let existing = imported(&["c/a.md", "c/b.md"]);
+        let why = stale_imports(&HashMap::new(), &HashSet::new(), true, &existing)
+            .expect_err("an empty yield must withhold deletion");
+        assert!(
+            why.contains("yielded no parseable command, so none of the 2 previously"),
+            "{why}"
+        );
+    }
+
+    /// An incomplete directory listing deletes nothing either: a file it
+    /// missed would read as removed.
+    #[test]
+    fn an_incomplete_listing_deletes_nothing() {
+        let existing = imported(&["c/a.md", "c/b.md"]);
+        let disk: HashMap<String, SlashCommandParsed> = [("c/a.md".to_string(), parsed("c/a.md"))]
+            .into_iter()
+            .collect();
+        let why = stale_imports(&disk, &HashSet::new(), false, &existing)
+            .expect_err("an incomplete listing must withhold deletion");
+        assert!(
+            why.contains("listing was incomplete, so none of the 2 previously"),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn only_imports_missing_from_a_nonempty_checkout_are_stale() {
+        let existing = imported(&["c/a.md", "c/b.md", "c/c.md"]);
+        let disk: HashMap<String, SlashCommandParsed> = [("c/a.md".to_string(), parsed("c/a.md"))]
+            .into_iter()
+            .collect();
+        // c/c.md is on disk but unreadable: kept, not stale.
+        let unreadable: HashSet<String> = ["c/c.md".to_string()].into_iter().collect();
+        let stale = stale_imports(&disk, &unreadable, true, &existing).expect("non-empty checkout");
+        let paths: Vec<&str> = stale.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(paths, vec!["c/b.md"]);
+
+        // Nothing imported is never a refusal, whatever the checkout yielded.
+        assert!(
+            stale_imports(&HashMap::new(), &HashSet::new(), false, &HashMap::new())
+                .expect("nothing to withhold")
+                .is_empty()
+        );
+    }
+
+    /// A commands checkout under the isolated workspace root, holding `files`
+    /// (name -> body).
+    fn commands_checkout(
+        amb: &crate::test_env::IsolatedAmbient,
+        files: &[(&str, &str)],
+    ) -> PathBuf {
+        let dir = amb
+            .root()
+            .join(COMMANDS_SIBLING)
+            .join(".claude")
+            .join("commands");
+        std::fs::create_dir_all(&dir).expect("mkdir commands");
+        for (name, body) in files {
+            std::fs::write(dir.join(name), body).expect("write command");
+        }
+        dir
+    }
+
+    /// Through the real sync: a list read that fails is the route's 500 and
+    /// writes nothing — it used to read as "nothing imported" and go on to
+    /// create every command again.
+    #[tokio::test]
+    async fn sync_fails_on_an_unreadable_import_list_instead_of_creating() {
+        let amb = crate::test_env::isolated_ambient();
+        commands_checkout(&amb, &[("fix.md", "# Fix\n\nFix things.\n")]);
+        let pg = crate::database::pg::PgDb::new_noop_for_test();
+        let err = sync_slash_commands(&pg)
+            .await
+            .expect_err("a failed list read must fail the sync");
+        let (status, _) = err.into_response();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// Through the real sync against a real database: an import whose file is
+    /// still present but unreadable, and then a checkout that yields nothing,
+    /// both keep the imported workflows.
+    #[tokio::test]
+    async fn sync_keeps_imports_when_the_checkout_cannot_be_read() {
+        let amb = crate::test_env::isolated_ambient();
+        let dir = commands_checkout(
+            &amb,
+            &[
+                ("alpha.md", "# Alpha\n\nFirst.\n"),
+                ("beta.md", "# Beta\n\nSecond.\n"),
+            ],
+        );
+        let pg = crate::database::pg::PgDb::new_for_test().await;
+        let first = sync_slash_commands(&pg).await.expect("first sync");
+        assert_eq!(first.created, 2, "{first:?}");
+
+        // beta.md becomes unreadable (a directory with the same name).
+        std::fs::remove_file(dir.join("beta.md")).expect("rm beta");
+        std::fs::create_dir(dir.join("beta.md")).expect("beta as dir");
+        let partial = sync_slash_commands(&pg).await.expect("partial sync");
+        assert_eq!(partial.deleted, 0, "{partial:?}");
+        assert_eq!(partial.unchanged, 1, "{partial:?}");
+
+        // Nothing parseable left at all.
+        std::fs::remove_file(dir.join("alpha.md")).expect("rm alpha");
+        let empty = sync_slash_commands(&pg).await.expect("empty sync");
+        assert_eq!(empty.deleted, 0, "{empty:?}");
+        assert!(
+            empty
+                .errors
+                .iter()
+                .any(|e| e.starts_with("Deletion withheld")),
+            "{empty:?}"
+        );
+        let sources = pg.list_slash_command_sources().await.expect("list");
+        assert_eq!(sources.len(), 2, "{sources:?}");
     }
 }
