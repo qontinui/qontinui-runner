@@ -3352,8 +3352,13 @@ lives there, once; do not copy it here. That step's own skip rule covers
 **Best-effort, never blocking.** A tool the serving build does not carry yet
 (the runner proxy's `METHOD_NOT_ALLOWED` until its allowlist names the
 subproject tools, then coord's `unknown tool` error until its build serves
-them), a `schema_migration_pending`, a `caller_session_unproven` or a dead
-transport records its code and moves on to Step 5. None of them changes the
+them), a `schema_migration_pending`, a `caller_session_unproven`, a
+`subproject_is_a_scheduler_bucket` (this session sits in a coord producer's
+standing `scheduled:<label>` bucket, whose note no member may write), an
+`origin_unknown` or a dead transport records its code and moves on to Step 5.
+On the bucket arm the paragraph is still owed to its work: put it in Step 2's
+durable stores (the plan's status block, or a gate with a continuation), as
+`/finish-session` Part A step 4's bucket arm says. None of them changes the
 classification, the work verdict, Step 4.9's verdict or Step 5's gate. Add one
 line to the Step 4 report, after the continuation outcome:
 
@@ -3376,8 +3381,9 @@ the current topics, confirm or add through `coord_subproject_update
 {"topics": [...]}` (ADD only, slugs from this session's `coord_declare_intent`
 `topic_suggestions` first), remove a wrong one through `coord_topic_member
 {"action": "remove", ...}`, record each kept topic's one-line contribution as
-its `note`, and read the membership back. The recipe and its outcome lines
-live there, once. The contribution line projects Step 1's classification
+its `note`, and read the membership back, and send none of it unless the note's
+origin check passed (a bucket or unknown origin skips the topics too). The
+recipe and its outcome lines live there, once. The contribution line projects Step 1's classification
 (what LANDED or is WATCHED for that topic), not a second judgement. The
 subagent rule above covers it: in a subagent, re-tag nothing. Best-effort and
 never blocking, like the note. Add that paragraph's `topics re-tag:` line to

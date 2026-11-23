@@ -530,6 +530,10 @@ and the body. Before writing your stamp:
    not started), include that in **one trailing line inside your
    new block**, prefixed `History:` or `Previously:`. Never as a
    sibling blockquote.
+4b. **Carry every route-around `History:` line verbatim** (`route-around owed`, the partial `route-around opened as …; owed for …`, or the finished `route-around opened as …`, the discharged `route-around discharged: …`, and any `prior art:` or `gates:` list the line carries), whatever
+   lifecycle word you write. It is the case-2c hand-off `/implement-plan`
+   Step 0.5's route-around check reads, so folding history is NOT optional
+   for it: dropping it strands the route-around.
 5. **Carry the `**Area:**`, `Initiative-Item:` and `Depends-On:`
    declarations.** If any block you are replacing (item 2 deletes every
    status-adjacent blockquote, not only the Status one) carries an
@@ -599,7 +603,7 @@ the subsection after it is this skill's own disposition.
 > arm table and its evaluation order: `/vet-plan`, "`IN PROGRESS` is
 > CONDITIONALLY overwritable".)* Before this command writes, replaces,
 > downgrades or re-dates a plan's lifecycle stamp, read the stamp already there
-> and apply these five rules.
+> and apply these six rules.
 >
 > 1. **An `IN PROGRESS` stamp is a conditional STOP, not a value to replace.**
 >    It protects a live peer's in-flight work. Read the whole HEADLINE, not only
@@ -610,14 +614,24 @@ the subsection after it is this skill's own disposition.
 > 2. **The discriminator is the SESSION MARKER, not the token.** A marker that
 >    IS your own current session id is a resume: refresh the date and keep the
 >    trail, never take over. A marker that is a different session id is a LIVE
->    PEER unless you can positively verify that session died with zero work
->    products — transcript tail shows death (a death read on THIS device also
+>    PEER unless you can positively verify that session died — transcript
+>    tail shows death (a death read on THIS device also
 >    needs `bash <workspace-root>/qontinui-claude-config/scripts/lib/claude-successor.sh <sid>`
 >    to answer 1, and a 0 or 2 is a STOP; across machines, `/vet-plan`'s "Case
->    2 across machines" decides), its worktrees clean and 0 ahead of
->    `origin/main`, and no PRs and no branches for the plan — **or that it
->    delegated the plan to a hold gate whose continuation you are (the arm
->    table's case 2b)**. Only then adopt it and append your own marker.
+>    2 across machines" decides) — and that either **case 2** holds (its
+>    worktrees clean and 0 ahead of `origin/main` — a worktree that is not
+>    is a STOP that names it and `/adopt-wip` — and no PRs and no branches
+>    for the plan) or **case 2c, adopt by route-around**, holds (PRs or
+>    pushed branches exist, and every case-2c conjunct in `/vet-plan`'s arm
+>    table holds, among them: every open PR and bare pushed branch among them
+>    is that session's, or another session's whose death reads by the same
+>    test (a phase subagent is no exemption; a closed PR is prior art,
+>    whoever wrote it), no `WIP` / `UNPUSHED`
+>    checkout of that session holds work only on disk, and no open gate with
+>    an armed continuation holds the plan beyond conjunct 3's named
+>    exceptions) — **or that it delegated the plan to a hold gate whose
+>    continuation you are (the arm table's case 2b)**. Only then adopt it and
+>    append your own marker.
 > 3. **No marker, or one you cannot positively attribute, is the UNIDENTIFIED
 >    DEFAULT: STOP.** Not an overwrite, and not an adoption. Adoption is the
 >    earned branch; stopping is the fallback.
@@ -630,6 +644,20 @@ the subsection after it is this skill's own disposition.
 >    non-2xx, unparseable or carrying `merged_degraded_reason` leaves the
 >    stamp's meaning unestablished. Fall through to STOP, never to overwrite,
 >    and say the read was inconclusive.
+> 6. **Owed route-around work blocks a terminal word.** While the block
+>    carries a `route-around owed` or `… owed for …` `History:` line, never
+>    write `SHIPPED`, `SUPERSEDED` or `OBSOLETE`: write the non-terminal word
+>    your own rules allow (for `/verify-plan-status`, its partial form), keep
+>    the line verbatim, and report it. Two exits, each on evidence, and each
+>    rewrites ONLY the owed token, keeping the line's `adopted from …`,
+>    `prior art:` and `gates:` parts: a predecessor that is MERGED, or CLOSED
+>    after a successor carrying its content merged, is discharged (the token
+>    becomes `route-around discharged: <evidence>` once none is left owed);
+>    one that is CLOSED with no merged successor is reclassified from
+>    `owed for` into `prior art: <owner/repo>#N (closed)` and removed from
+>    `work products:`. Once nothing is left owed, the owed token is replaced
+>    by `route-around discharged: <evidence>` if any predecessor was
+>    discharged, and otherwise deleted.
 <!-- status-guard:end -->
 
 `IN PROGRESS` is the only lifecycle token whose overwrite is **load-bearing in
@@ -673,10 +701,11 @@ The cases map onto this skill's verbs:
 |---|---|
 | 0 — the marker **is your own** current session id | **Reachable, and not rare** — the marker names a *session*, not a command, and one session routinely runs `/implement-plan` (which stamps it) and later `/verify-plan-status`, directly or through `/pvi` or `/vet-imp`. There is no peer to protect here: **write the verified state freely**, naming the prior stamp as your own in the `History:` line. Evaluate this row FIRST — it is a positively attributed marker, so it must never fall to the unidentified default, which is defined by the absence of exactly that attribution. |
 | 1 — the work has **landed** (delivery arm 1) | The plan is closed in substance. Write **`SHIPPED`** — a state this skill owns — when your own evidence scan agrees. If it does **not** agree, that disagreement IS the finding (coord's delivery read says landed and your evidence scan does not; on the operator door, a `delivery:` drift subclass): report it and leave the block alone. Never resolve it by writing `NOT STARTED` or `PARTIAL` over the marker. **Deliberate divergence, do not "restore consistency":** `/vet-plan` case 1 says *refuse and route to closeout* because `/vet-plan` writes only `VETTED`. Writing `SHIPPED` here IS that closeout — §5's own closeout paragraph assigns the plan-file terminal status to whoever can write it ("always yours to write"), and `SHIPPED` is this skill's state. Flipping this row to "refuse" would delete the only path by which a landed plan ever gets closed. |
-| 2 — the stamping session is **dead with zero work products** (its transcript tail shows death, **and**, for a death read on this device, no live successor carries its id — `/vet-plan`'s successor void rule: `claude-successor.sh <sid>` answers 1, and a 0 or 2 is case 3 — **and** its worktrees are clean and 0 ahead of `origin/main`, **and** no PRs and no branches exist for the plan) | Free to write the verified state. Name both the prior marker and the death evidence in the `History:` line. |
+| 2 — the stamping session is **dead with zero work products** (its transcript tail shows death, **and**, for a death read on this device, no live successor carries its id — `/vet-plan`'s successor void rule: `claude-successor.sh <sid>` answers 1, and a 0 or 2 is case 3 — **and** its worktrees are clean and 0 ahead of `origin/main` — one that is not is a STOP naming it and `/adopt-wip` — **and** no PRs and no branches exist for the plan) | Free to write the verified state. Name both the prior marker and the death evidence in the `History:` line. |
 | 2b — **gate-delegated**: you are the cleared continuation of the hold gate G that the block's last `Held behind gate <full gate_id> (<predicate>; anchor <work_unit_id>)` line names (every `/vet-plan` case-2b conjunct read; the `anchor` token is parsed from the right) | Free to write the verified state. Name G and the prior marker, REPLACING the `Held behind gate` line with `History: adopted from <prior session id> via consumed hold <G full id>` — never keep it. |
-| 3 — a **live peer** (marker ≠ yours and neither case 2's nor case 2b's checks hold) | **Do not overwrite.** Leave `IN PROGRESS` standing and report the plan as *in flight — not verifiable this pass*. |
-| — **unidentified default**: no marker at all, or one you cannot positively attribute | **Do not overwrite**, exactly as case 3. An absent marker cannot reach case 2, because case 2's probes are keyed on a session id and there is none to probe. |
+| 2c — the stamping session is **dead and left pushed work products**: `/vet-plan`'s case 2c holds in full — every conjunct its arm table lists, read there rather than from a summary here (case 2's death test, PRs or pushed branches, and conjuncts 2-5) | Free to write the verified state, whatever lifecycle word it carries, subject to status-guard rule 6 (no terminal word over an owed line), and its `History:` line in `/vet-plan`'s exact grammar: `History: adopted from <prior sid> (case 2c, <death evidence>); work products: <owner/repo>#N[, …]; route-around owed[; prior art: <owner/repo>#N (closed) | <repo>:<branch>@<sha>[, …]]` (open PRs only after `work products:`; a closed-unmerged PR or a bare branch only after `prior art:`; with no open PR, no `route-around owed`). The `route-around owed` token is what `/implement-plan` Step 0.5's route-around check reads, under any lifecycle word. This skill implements nothing: it does not open, park or close any PR, and does not run `/implement-plan`'s "Case 2c route-around duties". |
+| 3 — a **live peer** (marker ≠ yours and neither case 2's, 2b's nor 2c's checks hold) | **Do not overwrite.** Leave `IN PROGRESS` standing and report the plan as *in flight — not verifiable this pass*. |
+| — **unidentified default**: no marker at all, or one you cannot positively attribute | **Do not overwrite**, exactly as case 3. An absent marker cannot reach case 2 or 2c, because their probes are keyed on a session id and there is none to probe. |
 
 **Settling case 1.** Case 1 is settled by the delivery read §3 names,
 `coord_work_unit_list_citations(<stem>).delivery`, for every principal. Read
