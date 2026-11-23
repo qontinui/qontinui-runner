@@ -3849,10 +3849,24 @@ fn state_change_body(payload: &JsonValue) -> JsonValue {
     if let Some(ccsid) = payload.get("claude_code_session_id") {
         body.insert("claude_code_session_id".into(), ccsid.clone());
     }
+    // Unfinished-resume: an ADOPTED row's account / config dir (coord stamps
+    // them on PATCH under the caller's own tenant + device, with the create
+    // path's validation). Omitted when absent/null.
+    for key in ["account_label", "config_dir"] {
+        if let Some(v) = payload.get(key) {
+            if !v.is_null() {
+                body.insert(key.into(), v.clone());
+            }
+        }
+    }
     // Coord refreshes last_heartbeat_at on any PATCH — passing
     // heartbeat=true ensures the row gets a fresh stamp even when the
     // caller only changed metadata.
-    body.insert("heartbeat".into(), JsonValue::Bool(true));
+    // A resume-parameter-only PATCH (`no_heartbeat`) is metadata for a row
+    // that may be CLOSED: it must not stamp liveness on it.
+    if payload.get("no_heartbeat").and_then(JsonValue::as_bool) != Some(true) {
+        body.insert("heartbeat".into(), JsonValue::Bool(true));
+    }
     JsonValue::Object(body)
 }
 
@@ -9846,6 +9860,20 @@ mod tests {
             body.get("claude_code_session_id").is_none(),
             "a state change that did not confirm an id must not send the key at all"
         );
+    }
+
+    /// An adopted row's resume parameters ride a PATCH that stamps NO liveness.
+    #[test]
+    fn state_change_body_forwards_resume_params_without_a_heartbeat() {
+        let body = state_change_body(&json!({
+            "account_label": ".claude-gmail",
+            "config_dir": "/home/u/.claude-gmail",
+            "no_heartbeat": true,
+        }));
+        assert_eq!(body["account_label"], ".claude-gmail");
+        assert_eq!(body["config_dir"], "/home/u/.claude-gmail");
+        assert!(body.get("heartbeat").is_none());
+        assert!(body.get("no_heartbeat").is_none());
     }
 
     /// Phase 2b of plan
