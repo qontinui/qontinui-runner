@@ -7179,6 +7179,9 @@ mod tests {
             .collect();
         assert_eq!(finishes.len(), 1, "only the new mark's own: {rows:?}");
         assert_eq!(finishes[0].session_id, r);
+        // Holds even when the unmark and re-mark land in the mark's own
+        // millisecond: the store stamps a re-mark past the stamp its unmark
+        // erased (`SessionLifecycleStore::finish_forward`).
         assert_ne!(finishes[0].payload["finished_at"], json!(at));
     }
 

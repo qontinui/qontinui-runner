@@ -500,8 +500,9 @@ fn non_empty(value: Option<String>) -> Option<String> {
 }
 
 /// The `finished_at` a RESTAMP gets ([`SessionLifecycleStore::set_finished`]
-/// re-finishing an already-finished mark): `now`, unless that EQUALS the old
-/// stamp (two finishes inside one millisecond), in which case one past it.
+/// re-finishing an already-finished mark, or re-marking one whose unmark
+/// erased `prev`): `now`, unless that EQUALS the old stamp (two finishes
+/// inside one millisecond), in which case one past it.
 ///
 /// The ACK matcher ([`SessionLifecycleStore::mark_finish_synced`]) needs the
 /// two stamps only to DIFFER, so a late ACK of the old row can never sync the
@@ -1361,7 +1362,18 @@ pub struct SessionLifecycleStore {
     /// [`SessionLifecycleStore::with_unsynced_finished_records`], which holds
     /// this same lock, so a late delivery cannot land its `Finished` after a
     /// concurrent unmark's `working` either.
-    finish_forward: Mutex<()>,
+    ///
+    /// The one piece of data it holds: the `finished_at` each session's mark
+    /// carried when it was last UNMARKED, kept until that session is marked
+    /// again. A re-mark stamps against it with [`restamp_at`], so a
+    /// mark → unmark → re-mark inside one millisecond still gives the new mark
+    /// a DIFFERENT stamp — the unmark erases the record's own `finished_at`,
+    /// which is the only other place the old stamp lives. `finished_at` is the
+    /// mark's identity for the ACK matcher ([`Self::mark_finish_synced`]) and
+    /// the outbox probes, so two marks sharing one would let a late ACK of the
+    /// first sync the second. Written only by [`Self::set_finished`]; every
+    /// other taker holds it purely as the serializer.
+    finish_forward: Mutex<HashMap<String, i64>>,
 }
 
 /// What [`SessionLifecycleStore::redirect_finish`] did.
@@ -1585,7 +1597,7 @@ impl SessionLifecycleStore {
             close_observer: OnceLock::new(),
             finish_observer: OnceLock::new(),
             boot_ms: AtomicI64::new(default_boot_ms()),
-            finish_forward: Mutex::new(()),
+            finish_forward: Mutex::new(HashMap::new()),
         };
         if replay.applied > 0 || replay.damaged {
             info!(
@@ -3317,9 +3329,10 @@ impl SessionLifecycleStore {
         reason: Option<String>,
         only_if_unfinished: bool,
     ) -> Result<FinishOutcome, SetFinishedError> {
-        // Held to the end of this call: see `finish_forward`. It guards no
-        // data, so a poisoned guard is simply taken over.
-        let _forward = self
+        // Held to the end of this call: see `finish_forward`. Its only data is
+        // the unmarked-stamp memory, which a panic cannot leave inconsistent,
+        // so a poisoned guard is simply taken over.
+        let mut forward = self
             .finish_forward
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -3371,7 +3384,12 @@ impl SessionLifecycleStore {
 
         if finished {
             rec.finished_at = Some(match rec.finished_at {
-                None => now,
+                // A fresh mark — or a RE-mark, which must still differ from
+                // the stamp its unmark erased (see `finish_forward`).
+                None => match forward.remove(claude_session_id) {
+                    Some(unmarked) => restamp_at(unmarked, now),
+                    None => now,
+                },
                 // A RESTAMP (a re-finish that carried a reason).
                 Some(prev) => restamp_at(prev, now),
             });
@@ -3386,6 +3404,9 @@ impl SessionLifecycleStore {
             // for ([`awaiting_account_hold`] also refuses a finished row).
             rec.awaiting_account_since = None;
         } else {
+            if let Some(prev) = rec.finished_at {
+                forward.insert(claude_session_id.to_string(), prev);
+            }
             rec.finished_at = None;
             rec.finish_reason = None;
             rec.finish_synced = false;
@@ -9493,6 +9514,41 @@ mod tests {
         );
         for (prev, now) in [(1_000, 1_000), (1_000, 5_000), (1_000, 400)] {
             assert_ne!(restamp_at(prev, now), prev);
+        }
+    }
+
+    /// A mark → unmark → re-mark gives the new mark a DIFFERENT `finished_at`
+    /// even inside one millisecond — the unmark erases the record's own stamp,
+    /// so the store remembers it (`finish_forward`) for the re-mark to differ
+    /// from. Otherwise a late ACK of the first mark's write would sync the
+    /// second before its own write drained. Repeated so the same-millisecond
+    /// case is exercised on any machine fast enough to hit it; the property is
+    /// asserted on every round, whatever the clock did.
+    #[test]
+    fn a_re_mark_after_an_unmark_never_reuses_the_unmarked_stamp() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.record_open(rec("s"));
+        for _ in 0..200 {
+            let old = store
+                .set_finished("s", true, None)
+                .unwrap()
+                .record
+                .finished_at
+                .unwrap();
+            store.set_finished("s", false, None).unwrap();
+            let new = store
+                .set_finished("s", true, None)
+                .unwrap()
+                .record
+                .finished_at
+                .unwrap();
+            assert_ne!(new, old, "the re-mark reused the unmarked stamp");
+            // The first mark's late ACK must not sync the second.
+            store.mark_finish_synced("s", Some(old));
+            assert!(!store.get("s").unwrap().finish_synced);
+            store.set_finished("s", false, None).unwrap();
         }
     }
 
