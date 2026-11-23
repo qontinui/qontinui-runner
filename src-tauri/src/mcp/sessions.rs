@@ -1084,8 +1084,9 @@ pub(crate) struct TranscriptBindEnv {
 ///    is not the terminal's credential, or that comes without the terminal's
 ///    proof (or with another's); a terminal whose credential this process
 ///    cannot name (an adopted holder pane holds no recorded delivery and no
-///    grant); a session whose hosting cannot be read (no lifecycle store, or an
-///    unreadable one — UNKNOWN, never "unhosted"); an unhosted session whose
+///    grant); a session whose hosting cannot be read (no lifecycle store, a
+///    poisoned one, or one whose snapshot loaded degraded and does not hold
+///    the session — UNKNOWN, never "unhosted"); an unhosted session whose
 ///    `cwd` differs or is not recorded yet.
 ///    A nonce cannot bind another workdir's session, and a hosted session
 ///    cannot be bound by a peer sharing its directory's key.
@@ -1171,13 +1172,15 @@ fn transcript_bind_env(
         session_tenant: Box::new(|nonce| {
             crate::coord_mcp::session_tenant_or_refuse(Some(nonce)).map_err(|r| r.json_body())
         }),
-        // A runner with no lifecycle store, or one whose store cannot be read,
-        // does not know whether a terminal hosts the session: UNKNOWN, which
-        // refuses. Reading it as "not hosted" would hand every session to the
-        // cwd arm, the one arm a key shared by a whole directory satisfies.
-        // Only an OPEN record with a real terminal hosts a session. A blank
-        // workdir is no workdir: it must never resolve `.mcp.json` against the
-        // runner's own cwd.
+        // A runner with no lifecycle store, or one whose store cannot be read
+        // (a poisoned lock, or a snapshot loaded degraded that does not hold
+        // the session — `get_checked`), does not know whether a terminal hosts
+        // the session: UNKNOWN, which refuses. Reading it as "not hosted" would
+        // hand every session to the cwd arm, the one arm a key shared by a
+        // whole directory satisfies. Only an OPEN record with a real terminal
+        // hosts a session. A workdir that is blank or not absolute is no
+        // workdir: it must never resolve `.mcp.json` against the runner's own
+        // cwd.
         session_host: Box::new(move |csid| {
             let store = lifecycle.as_ref().ok_or("lifecycle_store_unavailable")?;
             Ok(store
@@ -1186,7 +1189,9 @@ fn transcript_bind_env(
                 .filter(|rec| rec.state == "open" && !rec.terminal_id.trim().is_empty())
                 .map(|rec| SessionHost {
                     terminal_id: rec.terminal_id,
-                    working_dir: rec.working_dir.filter(|wd| !wd.trim().is_empty()),
+                    working_dir: rec.working_dir.filter(|wd| {
+                        !wd.trim().is_empty() && std::path::Path::new(wd).is_absolute()
+                    }),
                     origin: rec.origin,
                     confirmed_at: rec.confirmed_at,
                 }))
@@ -3087,7 +3092,7 @@ mod tests {
         }
 
         /// What an `authoritative`, confirmed open record says about a session
-        /// hosted in `terminal`.
+        /// hosted in `terminal` — the one record shape arm 3 can admit.
         fn host(terminal: &str, working_dir: &str) -> SessionHost {
             SessionHost {
                 terminal_id: terminal.to_string(),
@@ -3729,6 +3734,72 @@ mod tests {
             production_wiring(&amb, CwdWriter::Agent, true).await;
         }
 
+        /// A hosting record whose `working_dir` is RELATIVE is no workdir: the
+        /// production host lookup drops it, so the terminal's declared
+        /// credential cannot be read (`no_session_nonce`) and the shared key is
+        /// refused, even with the terminal's own proof. Kept, the relative path
+        /// would resolve `.mcp.json` against the runner process's cwd. The path
+        /// here is built to reach the real workdir FROM that cwd, so keeping it
+        /// would bind.
+        #[tokio::test]
+        async fn t10_a_relative_hosting_workdir_is_no_workdir() {
+            use crate::session::session_lifecycle_store::{
+                test_open_record, SessionLifecycleStore, ORIGIN_AUTHORITATIVE,
+            };
+            use std::path::{Component, Path, PathBuf};
+            let amb = crate::test_env::isolated_ambient();
+            let _sync_on = route_machine(&amb);
+            let wd = fresh_workdir(amb.dir());
+            crate::coord_mcp::write_coord_mcp_proxy_config(&wd, PORT, None);
+            let key = cwd_key(&wd);
+            let a = terminal();
+            crate::coord_mcp::deliver_terminal_coord_mcp(&wd, &a, None, Some(PORT))
+                .expect("a tenant-less spawn into a declared cwd is admitted");
+            let granted_a = grant(&a);
+
+            // `wd`, spelled relative to the process cwd.
+            let cwd = std::env::current_dir().unwrap();
+            let mut rel = PathBuf::new();
+            for _ in cwd
+                .components()
+                .filter(|c| matches!(c, Component::Normal(_)))
+            {
+                rel.push("..");
+            }
+            for c in Path::new(&wd).components() {
+                if let Component::Normal(part) = c {
+                    rel.push(part);
+                }
+            }
+            assert!(!rel.is_absolute());
+            assert!(
+                rel.join(".mcp.json").is_file(),
+                "the relative spelling must reach the declared file, or this test proves nothing"
+            );
+            let rel = rel.to_string_lossy().into_owned();
+
+            let state_dir = amb
+                .dir()
+                .join(format!("state-{}", uuid::Uuid::new_v4().simple()));
+            let store = Arc::new(
+                SessionLifecycleStore::open(state_dir.join("terminal-sessions.json")).unwrap(),
+            );
+            let csid = uuid::Uuid::new_v4().to_string();
+            let mut rec = test_open_record(&csid);
+            rec.terminal_id = a.clone();
+            rec.working_dir = Some(rel.clone());
+            rec.origin = Some(ORIGIN_AUTHORITATIVE.to_string());
+            rec.confirmed_at = Some(1);
+            store.record_open(rec);
+            let watched = vec![config_with(&state_dir, &csid, &wd)];
+            let (t, outbox) = tailer(&state_dir);
+
+            let proof_a = with_proof(bearer(&key), &granted_a.secret);
+            let (status, v) = call_route(&t, Some(&store), &watched, &proof_a, &body(&csid)).await;
+            let detail = refused(status, &v, &outbox, &[wd.as_str(), rel.as_str()]);
+            assert!(detail.contains("no_session_nonce"), "{detail}");
+        }
+
         /// T12: a host lookup that cannot be read is UNKNOWN and refuses — even
         /// where the cwd arm WOULD admit (the session's JSONL `cwd` is the
         /// key's workdir) — for each reason the production lookup gives.
@@ -3757,10 +3828,11 @@ mod tests {
         }
 
         /// T12 through the production route: a runner with NO lifecycle store,
-        /// or one whose store lock is poisoned, refuses with the UNKNOWN detail
-        /// rather than reading every session as unhosted. The control: with a
-        /// store that holds no record for the session, the same request is the
-        /// cwd arm's and binds.
+        /// one whose store lock is poisoned, or one whose snapshot loaded
+        /// degraded, refuses with the UNKNOWN detail rather than reading every
+        /// session as unhosted. The control: with a store that loaded cleanly
+        /// and holds no record for the session, the same request is the cwd
+        /// arm's and binds.
         #[tokio::test]
         async fn t12_a_runner_with_no_lifecycle_store_refuses_through_the_route() {
             use crate::session::session_lifecycle_store::SessionLifecycleStore;
@@ -3791,6 +3863,18 @@ mod tests {
             poisoned.poison_for_test();
             let (status, v) =
                 call_route(&t, Some(&poisoned), &watched, &bearer(&key), &body(&csid)).await;
+            let detail = refused(status, &v, &outbox, &[wd.as_str(), bound.as_str()]);
+            assert!(detail.contains("lifecycle_store_unreadable"), "{detail}");
+            assert!(detail.contains("UNKNOWN"), "{detail}");
+
+            // So is a store whose snapshot loaded DEGRADED (here: a file that
+            // is not a JSON object, so it starts empty). Its silence about the
+            // session may be a record the load lost, so it is UNKNOWN too.
+            let degraded_path = state_dir.join("degraded-terminal-sessions.json");
+            std::fs::write(&degraded_path, b"[]").unwrap();
+            let degraded = Arc::new(SessionLifecycleStore::open(&degraded_path).unwrap());
+            let (status, v) =
+                call_route(&t, Some(&degraded), &watched, &bearer(&key), &body(&csid)).await;
             let detail = refused(status, &v, &outbox, &[wd.as_str(), bound.as_str()]);
             assert!(detail.contains("lifecycle_store_unreadable"), "{detail}");
             assert!(detail.contains("UNKNOWN"), "{detail}");

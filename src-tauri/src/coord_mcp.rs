@@ -6208,10 +6208,22 @@ pub(crate) fn workdir_for_nonce(nonce: &str) -> Option<String> {
 /// agent).
 ///
 /// A RESTORED binding is NOT terminal-less: the persisted store carries the
-/// terminal, so a key restored at boot names the terminal it was minted for —
-/// a PTY that died with the previous runner process. That `Some` is an
-/// eviction-key fact, not evidence that the terminal hosts anything in this
-/// process: matched against a live host it misses, never answers wrongly.
+/// terminal, so a key restored at boot names the terminal it was minted for.
+/// Two cases follow:
+///
+/// - The terminal was an in-process PTY. It died with the previous runner
+///   process, so no live host carries that id, and a match against a live host
+///   misses.
+/// - The terminal is a holder pane this process ADOPTED. `adopt_holder_pane`
+///   (`terminal/manager.rs`) rebuilds the session under the SAME terminal id,
+///   so the restored key names a live host and matches it.
+///   `POST /sessions/transcript-bind` therefore admits that pane's own restored
+///   key under its first arm (a key minted for the hosting terminal). That is
+///   correct: the key was delivered to the very `claude` process the holder kept
+///   alive.
+///
+/// Either way the `Some` names the terminal the key was minted for, and never
+/// any other terminal.
 ///
 /// This is the **deterministic** leg of session-fabric Phase 0 caller
 /// self-identification: `nonce → terminal_id → the OPEN lifecycle record with

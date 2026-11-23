@@ -51,7 +51,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::Utc;
@@ -1378,6 +1378,14 @@ pub struct SessionLifecycleStore {
     /// outlive a sub-millisecond window. Taken only while the `map` lock is
     /// held (lock order `map` then this).
     unmarked_stamps: Mutex<HashMap<String, i64>>,
+    /// Whether the snapshot this map was last loaded from could NOT be read
+    /// in full ([`load_map`]): the read failed, the file was not a
+    /// JSON object, or a malformed row was dropped. Each starts the map
+    /// without records the file held, so an id the map does not hold may
+    /// still be a live session. Only [`Self::get_checked`] reads it, and only
+    /// to answer such an id UNKNOWN instead of "no record". Set at
+    /// [`Self::open`] and re-set by [`Self::reload_from_disk`].
+    load_degraded: AtomicBool,
 }
 
 /// What [`SessionLifecycleStore::redirect_finish`] did.
@@ -1578,7 +1586,7 @@ impl SessionLifecycleStore {
             std::fs::create_dir_all(parent)?;
         }
         let wal_path = wal_path_for(&path);
-        let mut map = load_map(&path);
+        let (mut map, load_degraded) = load_map(&path);
         let replay = replay_wal(&wal_path, &mut map);
         // A held row is unbound by rule; a file written before the rule (or by
         // hand) may still carry its old terminal id.
@@ -1603,6 +1611,7 @@ impl SessionLifecycleStore {
             boot_ms: AtomicI64::new(default_boot_ms()),
             finish_forward: Mutex::new(()),
             unmarked_stamps: Mutex::new(HashMap::new()),
+            load_degraded: AtomicBool::new(load_degraded),
         };
         if replay.applied > 0 || replay.damaged {
             info!(
@@ -4509,17 +4518,31 @@ impl SessionLifecycleStore {
     }
 
     /// [`Self::get`] for a caller that must tell "no record" from "the store
-    /// could not be read": a poisoned lock is `Err(RegistryUnavailable)`, where
-    /// `get` answers `None` — the same contract as
-    /// [`Self::all_records_checked`]. An authorization decision reads this one
-    /// (`POST /sessions/transcript-bind`'s hosting check), so an unreadable
-    /// store refuses instead of reading as "no terminal hosts this session".
+    /// could not be read": `Err(RegistryUnavailable)` where `get` answers
+    /// `None` without knowing the record is absent. An authorization decision
+    /// reads this one (`POST /sessions/transcript-bind`'s hosting check), so an
+    /// unreadable store refuses instead of reading as "no terminal hosts this
+    /// session". Two shapes are unreadable:
+    ///
+    /// - the lock is poisoned — every id is `Err`, as in
+    ///   [`Self::all_records_checked`];
+    /// - the snapshot was loaded DEGRADED ([`load_map`]: a read
+    ///   error, a file that is not a JSON object, or a dropped malformed row) —
+    ///   an id the map does not hold is `Err`, because the record may be one
+    ///   the load lost, while an id it does hold is still `Ok(Some)`.
+    ///
+    /// Only this reader distinguishes a degraded load; every other reader
+    /// answers from the map as it stands.
     pub fn get_checked(
         &self,
         claude_session_id: &str,
     ) -> Result<Option<TerminalSessionRecord>, RegistryUnavailable> {
         match self.map.lock() {
-            Ok(m) => Ok(m.get(claude_session_id).cloned()),
+            Ok(m) => match m.get(claude_session_id) {
+                Some(rec) => Ok(Some(rec.clone())),
+                None if self.load_degraded.load(Ordering::Acquire) => Err(RegistryUnavailable),
+                None => Ok(None),
+            },
             Err(e) => {
                 warn!(error = %e, "session_lifecycle_store: lock poisoned on get_checked");
                 Err(RegistryUnavailable)
@@ -5146,7 +5169,8 @@ impl SessionLifecycleStore {
             .wal
             .lock()
             .map_err(|_| std::io::Error::other("session lifecycle WAL lock poisoned"))?;
-        let mut fresh = load_map(&self.path);
+        let (mut fresh, degraded) = load_map(&self.path);
+        self.load_degraded.store(degraded, Ordering::Release);
         let replay = replay_wal(&self.wal_path, &mut fresh);
         // Same rule as `open`: a held row is unbound. The rewrite below
         // persists it.
@@ -5938,15 +5962,20 @@ fn dedupe_open_by_terminal(records: Vec<TerminalSessionRecord>) -> Vec<TerminalS
         .collect()
 }
 
-fn load_map(path: &Path) -> HashMap<String, TerminalSessionRecord> {
+/// Load the JSON snapshot at `path`, and say whether the load was DEGRADED:
+/// `true` when the file exists but could not be read in full — the read
+/// failed, the file is not a JSON object, or at least one malformed row was
+/// dropped. Each of those returns a map missing records the file held. An
+/// absent file is a fresh install, not a degraded load.
+fn load_map(path: &Path) -> (HashMap<String, TerminalSessionRecord>, bool) {
     if !path.exists() {
-        return HashMap::new();
+        return (HashMap::new(), false);
     }
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => {
             warn!(error = %e, "session_lifecycle_store: read failed — starting empty");
-            return HashMap::new();
+            return (HashMap::new(), true);
         }
     };
     // Two-stage parse so ONE malformed record can't discard the whole store.
@@ -5966,7 +5995,7 @@ fn load_map(path: &Path) -> HashMap<String, TerminalSessionRecord> {
                 path = %path.display(),
                 "session_lifecycle_store: corrupt map file (not a JSON object) — starting empty"
             );
-            return HashMap::new();
+            return (HashMap::new(), true);
         }
     };
 
@@ -5994,6 +6023,7 @@ fn load_map(path: &Path) -> HashMap<String, TerminalSessionRecord> {
         }
     }
 
+    let degraded = !dropped.is_empty();
     if !dropped.is_empty() {
         warn!(
             dropped = dropped.len(),
@@ -6021,7 +6051,7 @@ fn load_map(path: &Path) -> HashMap<String, TerminalSessionRecord> {
         }
     }
 
-    map
+    (map, degraded)
 }
 
 fn write_map(path: &Path, map: &HashMap<String, TerminalSessionRecord>) -> std::io::Result<()> {
@@ -7116,6 +7146,75 @@ mod tests {
             store.get("present").is_none(),
             "get still collapses an unreadable store to None"
         );
+    }
+
+    /// A store whose snapshot was loaded DEGRADED cannot say an id it does not
+    /// hold is absent — the load may have lost that very record — so
+    /// `get_checked` answers it `Err`, for each of the three degraded shapes.
+    /// An id it does hold (loaded, or recorded since) is still `Ok(Some)`, and
+    /// every other reader is unchanged (`get` answers `None`).
+    #[test]
+    fn get_checked_answers_an_unheld_id_unknown_after_a_degraded_load() {
+        // A file that is not a JSON object.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        std::fs::write(&path, b"[]").unwrap();
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        assert_eq!(
+            store.get_checked("absent").unwrap_err(),
+            RegistryUnavailable
+        );
+        assert!(store.get("absent").is_none(), "get is unchanged");
+        store.record_open(rec("recorded-since"));
+        assert_eq!(
+            store
+                .get_checked("recorded-since")
+                .unwrap()
+                .map(|r| r.claude_session_id),
+            Some("recorded-since".to_string())
+        );
+        // A reload from a snapshot that reads in full is a clean load again.
+        std::fs::write(&path, b"{}").unwrap();
+        store.reload_from_disk().unwrap();
+        assert!(store.get_checked("absent").unwrap().is_none());
+
+        // A dropped malformed row: the good row is held, an unheld id is UNKNOWN.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let good = serde_json::to_value(rec("good")).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({ "good": good, "bad": 42 })).unwrap(),
+        )
+        .unwrap();
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        assert_eq!(
+            store
+                .get_checked("good")
+                .unwrap()
+                .map(|r| r.claude_session_id),
+            Some("good".to_string())
+        );
+        assert_eq!(store.get_checked("bad").unwrap_err(), RegistryUnavailable);
+        assert_eq!(
+            store.get_checked("absent").unwrap_err(),
+            RegistryUnavailable
+        );
+
+        // A read error: the snapshot path is a directory.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        std::fs::create_dir(&path).unwrap();
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        assert_eq!(
+            store.get_checked("absent").unwrap_err(),
+            RegistryUnavailable
+        );
+
+        // The control: an absent snapshot is a fresh install, not degraded.
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        assert!(store.get_checked("absent").unwrap().is_none());
     }
 
     // ── Write-ahead log (Phase 6, B1) ───────────────────────────────────────
@@ -13325,7 +13424,7 @@ mod tests {
         drop(store);
         // Read the RAW file, not a reopened store: a reopen detaches again at
         // load, so it could not tell a persisted detach from a re-derived one.
-        let on_disk = load_map(&path);
+        let (on_disk, _) = load_map(&path);
         assert_eq!(on_disk["held"].terminal_id, "", "the detach was persisted");
         assert_eq!(on_disk["expired"].terminal_id, "term-expired");
     }
