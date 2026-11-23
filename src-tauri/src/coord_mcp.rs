@@ -14629,36 +14629,81 @@ pub(crate) fn sweep_stale_breadcrumbs_once(bound_port: u16) -> usize {
     reprobed
 }
 
-/// Start the periodic stale-breadcrumb sweep (Phase 3b).
+/// The `worker_supervisor` registry name of the loop
+/// [`spawn_stale_breadcrumb_sweep`] starts, as `GET /health`
+/// `supervised_workers` lists it.
+pub const STALE_BREADCRUMB_SWEEP_WORKER: &str = "coord_mcp.stale_breadcrumb_sweep";
+
+/// Start the periodic stale-breadcrumb sweep (Phase 3b), one pass every
+/// `interval` ([`STALE_BREADCRUMB_SWEEP_INTERVAL`] in production).
 ///
 /// `fallback_port` is the port the caller bound, used only when
 /// [`resolve_bound_api_port`] cannot answer on a given tick (no managed
 /// AppState). A tick with no resolvable port at all is SKIPPED — probing a
 /// guessed port would manufacture exactly the false verdict this whole change
 /// exists to remove.
-pub(crate) fn start_stale_breadcrumb_sweep(fallback_port: u16) {
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(STALE_BREADCRUMB_SWEEP_INTERVAL);
-        // Burn the immediate first tick: the boot heal in
-        // `reconcile_session_configs` has just covered the same ground.
-        ticker.tick().await;
-        loop {
+///
+/// The loop runs under the panic supervisor, so a panic is logged, counted on
+/// `/health` and the loop rebuilt after a backoff; it ticks its heartbeat once
+/// per pass, skipped or not. A rebuilt run burns its first tick as the boot run
+/// does, so it sweeps one `interval` after the restart; the sweep holds no state
+/// between passes, so that is all a restart changes.
+pub(crate) fn spawn_stale_breadcrumb_sweep(
+    fallback_port: u16,
+    interval: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    crate::worker_supervisor::spawn_supervised_with_heartbeat(
+        STALE_BREADCRUMB_SWEEP_WORKER,
+        move |hb| async move {
+            let mut ticker = tokio::time::interval(interval);
+            // Burn the immediate first tick: the boot heal in
+            // `reconcile_session_configs` has just covered the same ground.
             ticker.tick().await;
-            let port = resolve_bound_api_port().unwrap_or(fallback_port);
-            if port == 0 {
-                continue;
+            loop {
+                ticker.tick().await;
+                hb.tick();
+                let port = resolve_bound_api_port().unwrap_or(fallback_port);
+                if port == 0 {
+                    continue;
+                }
+                let reprobed =
+                    tokio::task::spawn_blocking(move || sweep_stale_breadcrumbs_once(port))
+                        .await
+                        .unwrap_or(0);
+                if reprobed > 0 {
+                    info!(
+                        "coord_mcp: stale-breadcrumb sweep re-probed {reprobed} session workdir(s) \
+                         on port :{port} (clear on LIVE, re-date otherwise; never creates one)"
+                    );
+                }
             }
-            let reprobed = tokio::task::spawn_blocking(move || sweep_stale_breadcrumbs_once(port))
-                .await
-                .unwrap_or(0);
-            if reprobed > 0 {
-                info!(
-                    "coord_mcp: stale-breadcrumb sweep re-probed {reprobed} session workdir(s) \
-                     on port :{port} (clear on LIVE, re-date otherwise; never creates one)"
-                );
-            }
+        },
+    )
+}
+
+#[cfg(test)]
+mod stale_breadcrumb_sweep_door_tests {
+    use super::*;
+
+    /// The door `create_router` calls registers the sweep with the panic
+    /// supervisor under its `/health` name. The interval is long and the first
+    /// tick is burned, so no sweep runs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_stale_breadcrumb_sweep_registers_with_the_panic_supervisor() {
+        let handle = spawn_stale_breadcrumb_sweep(0, std::time::Duration::from_secs(3600));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !crate::worker_supervisor::snapshot()
+            .iter()
+            .any(|row| row.name == STALE_BREADCRUMB_SWEEP_WORKER)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "spawn_stale_breadcrumb_sweep never registered {STALE_BREADCRUMB_SWEEP_WORKER}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-    });
+        handle.abort();
+    }
 }
 
 /// How deep under the workspace root [`census_on_disk_mcp_configs`] walks.

@@ -28,6 +28,7 @@
 //! failing them would destroy in-flight work.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -45,7 +46,7 @@ use crate::doctor::strategies::is_process_alive;
 const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Delay before the first sweep, allowing startup resume to complete.
-const STARTUP_GRACE: Duration = Duration::from_secs(45);
+pub const STARTUP_GRACE: Duration = Duration::from_secs(45);
 
 /// How long a task must be orphaned before we notify the user.
 const ORPHAN_GRACE: Duration = Duration::from_secs(90);
@@ -61,7 +62,7 @@ const MAX_RUNTIME_AUTO_STOP: Duration = Duration::from_secs(60 * 60 * 24);
 
 /// Payload emitted to the frontend when a potentially stale task is detected.
 #[derive(Debug, Clone, Serialize)]
-struct StaleTaskDetectedPayload {
+pub struct StaleTaskDetectedPayload {
     task_run_id: String,
     task_name: String,
     message: String,
@@ -115,61 +116,156 @@ impl OrphanTracker {
     }
 }
 
+/// Delivers a `stale-task-detected` notice. [`frontend_notifier`] emits it to
+/// the Tauri frontend; the sweep reads nothing else from the app, so it takes
+/// this narrow handle rather than an `AppHandle` (which no test can build).
+pub type StaleTaskNotifier =
+    Arc<dyn Fn(&StaleTaskDetectedPayload) -> Result<(), String> + Send + Sync>;
+
+/// The production [`StaleTaskNotifier`]: emit `stale-task-detected` to the
+/// frontend through `app_handle`.
+pub fn frontend_notifier(app_handle: AppHandle) -> StaleTaskNotifier {
+    Arc::new(move |payload| {
+        app_handle
+            .emit("stale-task-detected", payload)
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// The `worker_supervisor` registry name of the loop [`spawn_zombie_sweep`]
+/// starts, as `GET /health` `supervised_workers` lists it.
+pub const ZOMBIE_SWEEP_WORKER: &str = "zombie_sweep.task_run_sweep";
+
 /// Start the stale task sweep background task.
 ///
 /// The sweep:
-/// 1. Claims any NULL-`runner_port` running rows for this runner once, so
+/// 1. Waits `startup_grace` ([`STARTUP_GRACE`] in production), then claims any
+///    NULL-`runner_port` running rows for this runner once, so
 ///    scheduler-launched orphans (which never had a runner_port assigned)
 ///    are covered by the normal sweep logic on subsequent ticks.
 /// 2. Every `SWEEP_INTERVAL` queries all running task_runs and cross-checks
 ///    them against the in-memory `SessionManager`. Any `running` row with no
 ///    live session or alive PID is considered orphaned and either notified
 ///    (soft) or auto-failed (hard) depending on the rules above.
-pub fn start_zombie_sweep(
+///
+/// The loop runs under the panic supervisor, so a panic — the Postgres
+/// `Row::get` class this sweep reads through — is logged, counted on `/health`
+/// and the loop rebuilt after a backoff; it ticks its heartbeat once per sweep.
+/// A rebuilt run is NOT a process restart: the grace and the claim are
+/// once-per-process ([`SweepRun::first_run`]), so it goes straight to sweeping,
+/// and the [`OrphanTracker`] is shared by every run, so an orphan already
+/// notified is not re-toasted and the zero-session auto-stop clock keeps
+/// running.
+pub fn spawn_zombie_sweep(
     pg_db: Arc<PgDb>,
     session_manager: Arc<SessionManager>,
-    app_handle: AppHandle,
+    notify: StaleTaskNotifier,
     my_port: u16,
-) {
-    tokio::spawn(async move {
-        // Defer the first sweep so startup_resume has time to re-register
-        // any sessions it reclaims.
-        tokio::time::sleep(STARTUP_GRACE).await;
+    startup_grace: Duration,
+) -> tokio::task::JoinHandle<()> {
+    let factory = sweep_factory(pg_db, session_manager, notify, my_port, startup_grace);
+    crate::worker_supervisor::spawn_supervised_with_heartbeat(ZOMBIE_SWEEP_WORKER, move |hb| {
+        factory(hb).run()
+    })
+}
 
-        // Step 1: claim NULL-port orphans left over from previous crashes /
-        // scheduler launches. Future sweeps then see them under this port.
-        match pg_db.claim_orphaned_task_runs(my_port).await {
-            Ok(claimed) if !claimed.is_empty() => {
-                info!(
-                    "Zombie sweep: claimed {} NULL-port running task_run(s) for runner port {}",
-                    claimed.len(),
-                    my_port
-                );
-            }
-            Ok(_) => {}
-            Err(e) => {
-                warn!("Zombie sweep: claim_orphaned_task_runs failed: {}", e);
+/// The supervisor's factory: each call builds one run around the SAME orphan
+/// tracker and the SAME once-only boot flag, both made here, once.
+fn sweep_factory(
+    pg_db: Arc<PgDb>,
+    session_manager: Arc<SessionManager>,
+    notify: StaleTaskNotifier,
+    my_port: u16,
+    startup_grace: Duration,
+) -> impl Fn(crate::worker_supervisor::Heartbeat) -> SweepRun + Send + 'static {
+    let tracker = Arc::new(tokio::sync::Mutex::new(OrphanTracker::new()));
+    let booted = Arc::new(AtomicBool::new(false));
+    move |hb| SweepRun {
+        pg_db: pg_db.clone(),
+        session_manager: session_manager.clone(),
+        notify: notify.clone(),
+        tracker: tracker.clone(),
+        booted: booted.clone(),
+        my_port,
+        startup_grace,
+        hb,
+    }
+}
+
+/// One run of the sweep loop.
+struct SweepRun {
+    pg_db: Arc<PgDb>,
+    session_manager: Arc<SessionManager>,
+    notify: StaleTaskNotifier,
+    /// Shared by every run: locked for one sweep at a time (a tokio mutex does
+    /// not poison, so a sweep that panics leaves it usable).
+    tracker: Arc<tokio::sync::Mutex<OrphanTracker>>,
+    /// Set by the first run, before its grace: see [`SweepRun::first_run`].
+    booted: Arc<AtomicBool>,
+    my_port: u16,
+    startup_grace: Duration,
+    hb: crate::worker_supervisor::Heartbeat,
+}
+
+impl SweepRun {
+    /// True for exactly one run per factory. Set BEFORE the grace and the
+    /// claim, not after: only a panic rebuilds a run (a cancelled run is never
+    /// rebuilt), a sleep cannot panic, and a claim that panicked would panic
+    /// again — so a rebuilt run must not repeat them.
+    fn first_run(&self) -> bool {
+        !self.booted.swap(true, Ordering::SeqCst)
+    }
+
+    async fn run(self) {
+        if self.first_run() {
+            // Defer the first sweep so startup_resume has time to re-register
+            // any sessions it reclaims.
+            tokio::time::sleep(self.startup_grace).await;
+
+            // Step 1: claim NULL-port orphans left over from previous crashes /
+            // scheduler launches. Future sweeps then see them under this port.
+            match self.pg_db.claim_orphaned_task_runs(self.my_port).await {
+                Ok(claimed) if !claimed.is_empty() => {
+                    info!(
+                        "Zombie sweep: claimed {} NULL-port running task_run(s) for runner port {}",
+                        claimed.len(),
+                        self.my_port
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!("Zombie sweep: claim_orphaned_task_runs failed: {}", e);
+                }
             }
         }
 
-        let mut tracker = OrphanTracker::new();
         let mut ticker = tokio::time::interval(SWEEP_INTERVAL);
-        // Skip the immediate tick — we already waited STARTUP_GRACE.
+        // Skip the immediate tick — the first run already waited the startup
+        // grace, and a rebuilt run follows a panic backoff.
         ticker.tick().await;
 
         loop {
             ticker.tick().await;
-            if let Err(e) = run_sweep(&pg_db, &session_manager, &app_handle, &mut tracker).await {
+            self.hb.tick();
+            let mut tracker = self.tracker.lock().await;
+            if let Err(e) = run_sweep(
+                &self.pg_db,
+                &self.session_manager,
+                &self.notify,
+                &mut tracker,
+            )
+            .await
+            {
                 warn!("Zombie sweep iteration failed: {}", e);
             }
         }
-    });
+    }
 }
 
 async fn run_sweep(
     pg_db: &PgDb,
     session_manager: &SessionManager,
-    app_handle: &AppHandle,
+    notify: &StaleTaskNotifier,
     tracker: &mut OrphanTracker,
 ) -> Result<(), String> {
     // Pull everything currently marked running (including NULL-port rows so
@@ -249,7 +345,7 @@ async fn run_sweep(
                     humanize(orphan_age)
                 ),
             };
-            if let Err(e) = app_handle.emit("stale-task-detected", &payload) {
+            if let Err(e) = notify(&payload) {
                 warn!("Failed to emit stale-task-detected for {}: {}", task.id, e);
             } else {
                 tracker.mark_notified(&task.id);
@@ -324,6 +420,92 @@ fn humanize(d: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_factory(
+        startup_grace: Duration,
+    ) -> impl Fn(crate::worker_supervisor::Heartbeat) -> SweepRun + Send + 'static {
+        let notify: StaleTaskNotifier = Arc::new(|_| Ok(()));
+        sweep_factory(
+            PgDb::new_noop_for_test(),
+            Arc::new(SessionManager::new()),
+            notify,
+            0,
+            startup_grace,
+        )
+    }
+
+    /// What a supervisor restart does: call the factory a second time. Both
+    /// runs hold the one tracker, so what the first run recorded (an orphan's
+    /// first sighting, a notification already sent) is still there for the
+    /// rebuilt run — it neither re-toasts nor restarts the auto-stop clock.
+    #[tokio::test]
+    async fn two_factory_runs_share_the_orphan_tracker() {
+        let factory = test_factory(STARTUP_GRACE);
+        let first = factory(crate::worker_supervisor::Heartbeat(ZOMBIE_SWEEP_WORKER));
+        let first_seen_age = {
+            let mut tracker = first.tracker.lock().await;
+            tracker.observe("task-1");
+            tracker.mark_notified("task-1");
+            tracker.observe("task-1")
+        };
+        drop(first);
+
+        let second = factory(crate::worker_supervisor::Heartbeat(ZOMBIE_SWEEP_WORKER));
+        let mut tracker = second.tracker.lock().await;
+        assert!(
+            tracker.was_notified("task-1"),
+            "the rebuilt run must know the orphan was already notified"
+        );
+        assert!(
+            tracker.observe("task-1") >= first_seen_age,
+            "the rebuilt run must keep the orphan's first sighting"
+        );
+    }
+
+    /// The startup grace and the NULL-port claim run once per factory: the
+    /// first run takes them, a rebuilt run goes straight to sweeping.
+    #[test]
+    fn only_the_first_factory_run_takes_the_startup_grace_and_the_claim() {
+        let factory = test_factory(STARTUP_GRACE);
+        let first = factory(crate::worker_supervisor::Heartbeat(ZOMBIE_SWEEP_WORKER));
+        assert!(
+            first.first_run(),
+            "the first run takes the grace and the claim"
+        );
+        let second = factory(crate::worker_supervisor::Heartbeat(ZOMBIE_SWEEP_WORKER));
+        assert!(Arc::ptr_eq(&first.booted, &second.booted));
+        assert!(
+            !second.first_run(),
+            "a rebuilt run must not re-wait the grace or re-run the claim"
+        );
+    }
+
+    /// The door `create_router` calls registers the sweep with the panic
+    /// supervisor under its `/health` name. The startup grace is long, so the
+    /// no-op database is never queried.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_zombie_sweep_registers_with_the_panic_supervisor() {
+        let notify: StaleTaskNotifier = Arc::new(|_| Ok(()));
+        let handle = spawn_zombie_sweep(
+            PgDb::new_noop_for_test(),
+            Arc::new(SessionManager::new()),
+            notify,
+            0,
+            Duration::from_secs(3600),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !crate::worker_supervisor::snapshot()
+            .iter()
+            .any(|row| row.name == ZOMBIE_SWEEP_WORKER)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "spawn_zombie_sweep never registered {ZOMBIE_SWEEP_WORKER}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        handle.abort();
+    }
 
     #[test]
     fn humanize_formats_durations() {

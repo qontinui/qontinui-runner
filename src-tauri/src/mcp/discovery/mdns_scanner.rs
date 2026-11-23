@@ -294,3 +294,392 @@ impl Drop for MdnsScanner {
         }
     }
 }
+
+// ============================================================================
+// The supervised event loop
+// ============================================================================
+
+/// The `worker_supervisor` registry name of the loop [`spawn_event_loop`]
+/// starts, as `GET /health` `supervised_workers` lists it. Absent from `/health`
+/// when LAN discovery is off: the gate sits before the spawn.
+pub const MDNS_EVENTS_WORKER: &str = "mdns_scanner.events";
+
+/// How long the event loop waits after boot before it drains its first event.
+pub const MDNS_EVENTS_START_DELAY: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// The receiver every run of the event loop drains. Shared, not moved into one
+/// run: a receiver moved into a run would die with it, and the browse thread's
+/// sender would then have no one left to talk to.
+type SharedEvents = std::sync::Arc<tokio::sync::Mutex<mpsc::Receiver<MdnsEvent>>>;
+
+/// The scanner a supervised event loop starts once and keeps alive: owned by
+/// the supervisor's factory (through an `Arc`), so it lives exactly as long as
+/// the loop does, whichever run is current.
+struct ScannerSlot<S, G> {
+    /// The scanner starter and the sender it is handed, until the first run
+    /// takes them. `Some` means "not started yet".
+    pending: std::sync::Mutex<Option<(S, mpsc::Sender<MdnsEvent>)>>,
+    /// What the starter returned (in production the `MdnsScanner`, whose `Drop`
+    /// shuts the mDNS daemon down), kept here for the life of the loop.
+    guard: std::sync::OnceLock<G>,
+}
+
+impl<S, G> ScannerSlot<S, G>
+where
+    S: FnOnce(mpsc::Sender<MdnsEvent>) -> G,
+{
+    fn new(start_scanner: S, event_tx: mpsc::Sender<MdnsEvent>) -> Self {
+        Self {
+            pending: std::sync::Mutex::new(Some((start_scanner, event_tx))),
+            guard: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn pending(&self) -> std::sync::MutexGuard<'_, Option<(S, mpsc::Sender<MdnsEvent>)>> {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Whether the scanner has not been started yet — true until the first run
+    /// starts it.
+    fn not_started(&self) -> bool {
+        self.pending().is_some()
+    }
+
+    /// Start the scanner if no run has yet, keeping what the starter returns.
+    fn start_once(&self) {
+        let taken = self.pending().take();
+        if let Some((start_scanner, event_tx)) = taken {
+            let _ = self.guard.set(start_scanner(event_tx));
+        }
+    }
+}
+
+/// Register every UI Bridge instance mDNS discovers as a LAN transport in
+/// `registry` — when `settings` enables LAN discovery. Returns `None`, building
+/// and starting nothing, when it does not.
+///
+/// `start_scanner` builds the scanner and starts its browse thread on the
+/// sender it is handed (in production, `MdnsScanner::new()` then
+/// `scanner.start(event_tx)`, written at the `create_router` call site, where
+/// the boot-task census counts that bare thread). The FIRST run calls it once,
+/// after `start_delay`, so `create_router` itself does no network setup; what
+/// it returns is kept in a slot the supervisor's factory owns, so the scanner
+/// lives as long as the loop and its `Drop` shuts the mDNS daemon down only
+/// when the loop ends.
+///
+/// The drain runs under the panic supervisor, so a panic is logged, counted on
+/// `/health` and the loop rebuilt after a backoff. A rebuilt run neither waits
+/// `start_delay` again nor restarts the scanner: it drains the SAME receiver at
+/// once, so the browse thread and its daemon are untouched by a panic in the
+/// drain. When the browse thread ends (its sender drops), the receiver closes
+/// and the run returns, which `/health` records as `exited`. Event-driven, so
+/// no heartbeat: an idle LAN is not a wedged loop.
+pub fn spawn_event_loop<S, G>(
+    registry: std::sync::Arc<crate::mcp::physical_device::PhysicalDeviceRegistry>,
+    settings: &crate::settings::MobileSettings,
+    start_delay: std::time::Duration,
+    start_scanner: S,
+) -> Option<tokio::task::JoinHandle<()>>
+where
+    S: FnOnce(mpsc::Sender<MdnsEvent>) -> G + Send + 'static,
+    G: Send + Sync + 'static,
+{
+    if !settings.lan_discovery_enabled {
+        debug!("LAN discovery disabled, skipping mDNS scanner");
+        return None;
+    }
+    let (event_tx, event_rx) = mpsc::channel::<MdnsEvent>(32);
+    let slot = std::sync::Arc::new(ScannerSlot::new(start_scanner, event_tx));
+    let events: SharedEvents = std::sync::Arc::new(tokio::sync::Mutex::new(event_rx));
+    Some(crate::worker_supervisor::spawn_supervised(
+        MDNS_EVENTS_WORKER,
+        move || events_run(slot.clone(), events.clone(), registry.clone(), start_delay),
+    ))
+}
+
+/// One run of the event loop. The first run waits `start_delay` and starts the
+/// scanner; every run then registers each discovered device until the browse
+/// thread's sender drops.
+async fn events_run<S, G>(
+    slot: std::sync::Arc<ScannerSlot<S, G>>,
+    events: SharedEvents,
+    registry: std::sync::Arc<crate::mcp::physical_device::PhysicalDeviceRegistry>,
+    start_delay: std::time::Duration,
+) where
+    S: FnOnce(mpsc::Sender<MdnsEvent>) -> G,
+{
+    if slot.not_started() {
+        tokio::time::sleep(start_delay).await;
+        slot.start_once();
+    }
+    // Only one run is ever live, so the lock is uncontended; a run that
+    // panicked released it on unwind (a tokio mutex does not poison).
+    let mut rx = events.lock().await;
+    while let Some(event) = rx.recv().await {
+        register_event(&registry, event).await;
+    }
+    debug!("mDNS event loop: the browse thread's sender is gone — exiting");
+}
+
+/// Apply one mDNS event to the physical device registry.
+async fn register_event(
+    registry: &crate::mcp::physical_device::PhysicalDeviceRegistry,
+    event: MdnsEvent,
+) {
+    match event {
+        MdnsEvent::Discovered(info) => {
+            let Some(&addr) = info.addresses.first() else {
+                return;
+            };
+            let socket_addr = std::net::SocketAddr::new(addr, info.port);
+            info!("mDNS device found: {} at {}", info.device_id, socket_addr);
+
+            // Register as a LAN transport in the physical device registry.
+            // We proxy directly to the device's IP/port; no local TCP proxy
+            // is needed for same-LAN connections.
+            let now = chrono::Utc::now().timestamp_millis();
+            // Determine OS from the "platform" TXT record if present
+            let os = match info
+                .txt_records
+                .get("platform")
+                .map(|s| s.to_lowercase())
+                .as_deref()
+            {
+                Some("ios") | Some("iphone") | Some("ipad") => crate::mcp::transport::DeviceOs::Ios,
+                _ => crate::mcp::transport::DeviceOs::Android,
+            };
+            let device_info = crate::mcp::physical_device::PhysicalDeviceInfo {
+                id: info.device_id.clone(),
+                os,
+                device_kind: "physical".to_string(),
+                model: info.txt_records.get("model").cloned(),
+                app_id: info.txt_records.get("app_id").cloned(),
+                ui_bridge_version: info.txt_records.get("version").cloned(),
+                first_seen_at: now,
+            };
+            let transport = crate::mcp::physical_device::ActiveTransport {
+                kind: crate::mcp::transport::TransportKind::Lan,
+                proxy_url: format!("http://{}", socket_addr),
+                established_at: now,
+                last_healthy_at: now,
+                fail_count: 0,
+            };
+            registry.register(device_info, transport).await;
+        }
+        MdnsEvent::Removed(name) => {
+            debug!("mDNS device removed: {}", name);
+            // The health monitor will evict the transport when health
+            // checks start failing; no immediate action needed here.
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mcp::physical_device::PhysicalDeviceRegistry;
+    use crate::settings::MobileSettings;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// A scanner guard that records its drop, standing in for the
+    /// `MdnsScanner` whose `Drop` shuts the daemon down.
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn lan(enabled: bool) -> MobileSettings {
+        MobileSettings {
+            lan_discovery_enabled: enabled,
+            ..MobileSettings::default()
+        }
+    }
+
+    fn discovered(device_id: &str) -> MdnsEvent {
+        MdnsEvent::Discovered(MdnsDeviceInfo {
+            device_id: device_id.to_string(),
+            addresses: vec![IpAddr::from([192, 0, 2, 7])],
+            port: 8087,
+            txt_records: HashMap::new(),
+        })
+    }
+
+    async fn eventually(what: &str, mut cond: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !cond() {
+            assert!(std::time::Instant::now() < deadline, "never: {what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn registered(registry: &PhysicalDeviceRegistry, id: &str) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if registry.get_device(id).await.is_some() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    /// The gate: LAN discovery off builds no scanner and starts nothing, so the
+    /// worker is absent from `/health` rather than `exited`.
+    #[tokio::test]
+    async fn spawn_event_loop_returns_none_when_lan_discovery_is_disabled() {
+        let started = Arc::new(AtomicBool::new(false));
+        let handle = spawn_event_loop(
+            Arc::new(PhysicalDeviceRegistry::new()),
+            &lan(false),
+            MDNS_EVENTS_START_DELAY,
+            {
+                let started = started.clone();
+                move |_| started.store(true, Ordering::SeqCst)
+            },
+        );
+        assert!(handle.is_none());
+        assert!(
+            !started.load(Ordering::SeqCst),
+            "a disabled gate must not build the scanner"
+        );
+    }
+
+    /// The door `create_router` calls, with LAN discovery on, registers the
+    /// loop with the panic supervisor under its `/health` name — and the
+    /// scanner it started stays alive while the worker runs, held by the
+    /// factory rather than by any one run, until the loop itself is ended.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_event_loop_registers_with_the_panic_supervisor_when_enabled() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        // Hold the sender, as the browse thread would, so the run does not
+        // return on a closed channel.
+        let sender: Arc<Mutex<Option<mpsc::Sender<MdnsEvent>>>> = Arc::new(Mutex::new(None));
+        let handle = spawn_event_loop(
+            Arc::new(PhysicalDeviceRegistry::new()),
+            &lan(true),
+            Duration::ZERO,
+            {
+                let dropped = dropped.clone();
+                let sender = sender.clone();
+                move |event_tx| {
+                    *sender.lock().unwrap() = Some(event_tx);
+                    DropFlag(dropped)
+                }
+            },
+        )
+        .expect("enabled LAN discovery starts the event loop");
+
+        eventually("the first run starts the scanner", || {
+            sender.lock().unwrap().is_some()
+        })
+        .await;
+        eventually("the worker is listed as running", || {
+            crate::worker_supervisor::snapshot().iter().any(|row| {
+                row.name == MDNS_EVENTS_WORKER
+                    && row.state == crate::worker_supervisor::WorkerState::Running
+            })
+        })
+        .await;
+        assert!(
+            !dropped.load(Ordering::SeqCst),
+            "the scanner must stay alive while the worker runs"
+        );
+
+        // Ending the loop drops the factory, and with it the scanner.
+        handle.abort();
+        eventually("the scanner is dropped once the loop ends", || {
+            dropped.load(Ordering::SeqCst)
+        })
+        .await;
+    }
+
+    /// What a supervisor restart does: run the loop a second time over the same
+    /// slot and receiver. The rebuilt run neither re-waits the start delay nor
+    /// restarts the scanner, and the browse thread's sender still reaches it —
+    /// a receiver moved into the first run would have died with it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rebuilt_run_drains_the_same_receiver_at_once() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let sender: Arc<Mutex<Option<mpsc::Sender<MdnsEvent>>>> = Arc::new(Mutex::new(None));
+        let (event_tx, event_rx) = mpsc::channel::<MdnsEvent>(32);
+        let slot = Arc::new(ScannerSlot::new(
+            {
+                let starts = starts.clone();
+                let sender = sender.clone();
+                move |tx| {
+                    starts.fetch_add(1, Ordering::SeqCst);
+                    *sender.lock().unwrap() = Some(tx);
+                }
+            },
+            event_tx,
+        ));
+        let events: SharedEvents = Arc::new(tokio::sync::Mutex::new(event_rx));
+        let registry = Arc::new(PhysicalDeviceRegistry::new());
+
+        let first = tokio::spawn(events_run(
+            slot.clone(),
+            events.clone(),
+            registry.clone(),
+            Duration::ZERO,
+        ));
+        eventually("the first run starts the scanner", || {
+            sender.lock().unwrap().is_some()
+        })
+        .await;
+        let tx = sender.lock().unwrap().clone().expect("started");
+        tx.send(discovered("first-device"))
+            .await
+            .expect("receiver alive");
+        assert!(
+            registered(&registry, "first-device").await,
+            "the first run never registered its device"
+        );
+        // A panic ends the run; aborting it is the same loss of the run.
+        first.abort();
+        let _ = first.await;
+
+        // A start delay the rebuilt run would never get past if it re-waited.
+        let second = tokio::spawn(events_run(
+            slot.clone(),
+            events.clone(),
+            registry.clone(),
+            Duration::from_secs(3600),
+        ));
+        tx.send(discovered("second-device"))
+            .await
+            .expect("the shared receiver outlives the first run");
+        assert!(
+            registered(&registry, "second-device").await,
+            "the rebuilt run never registered its device (did it re-wait the delay?)"
+        );
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            1,
+            "a rebuilt run must not start a second scanner"
+        );
+        second.abort();
+    }
+
+    /// The browse thread ending drops its sender: the run returns, which the
+    /// supervisor records as `exited` rather than restarting it.
+    #[tokio::test]
+    async fn a_run_returns_when_the_browse_thread_sender_drops() {
+        let (event_tx, event_rx) = mpsc::channel::<MdnsEvent>(32);
+        // A starter that drops the sender, as a browse thread that ended would.
+        let slot = Arc::new(ScannerSlot::new(drop::<mpsc::Sender<MdnsEvent>>, event_tx));
+        let run = events_run(
+            slot,
+            Arc::new(tokio::sync::Mutex::new(event_rx)),
+            Arc::new(PhysicalDeviceRegistry::new()),
+            Duration::ZERO,
+        );
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("the run must return once the sender is gone");
+    }
+}

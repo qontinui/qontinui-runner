@@ -50,7 +50,7 @@
 //! and object ids, and the blobs are read through `git cat-file --batch`, one
 //! spawn per [`BATCH_BYTES`] of content — not one spawn per file.
 //!
-//! It runs on a background timer ([`start_refresh_loop`], [`REFRESH_INTERVAL`]),
+//! It runs on a background timer ([`spawn_refresh_loop`], [`REFRESH_INTERVAL`]),
 //! never on a spawn. Registry resolution then reads the last published
 //! snapshot synchronously through [`latest`] — a lock and an `Arc` clone, no
 //! I/O — so the first spawn after boot may see no snapshot and fall to the
@@ -115,7 +115,7 @@ const LOCAL_TIMEOUT: Duration = Duration::from_secs(5);
 /// cap, which is why the reads are batched rather than issued as one.
 const BATCH_BYTES: u64 = (crate::process_helpers::MAX_CAPTURED_BYTES / 2) as u64;
 
-/// How often [`start_refresh_loop`] fetches.
+/// How often [`spawn_refresh_loop`] fetches.
 pub(crate) const REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 /// The next attempt after a tick skipped for contention while this process has
@@ -266,7 +266,7 @@ impl CanonicalCorpus {
 /// lock on [`WRITER_LOCK`], held from before the leftover-clearing through the
 /// last read of a load, and released on drop.
 ///
-/// One refresh loop per process ([`start_refresh_loop`]) does not make one
+/// One refresh loop per process ([`spawn_refresh_loop`]) does not make one
 /// writer per mirror: the mirror lives in the per-instance scope, and two
 /// processes can resolve the same scope — a bare-launched runner beside the
 /// primary. Without this lock each would read the other's in-flight
@@ -1127,31 +1127,48 @@ pub(crate) fn refresh() -> Option<CanonicalSnapshot> {
     refresh_into(&mirror, &LATEST, &bundled_command_names(), &skill_refs)
 }
 
-/// Whether [`start_refresh_loop`] has already started this process's loop.
+/// Whether [`spawn_refresh_loop`] has already started this process's loop.
 static LOOP_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Start the background refresher: a short boot grace, then a refresh every
-/// [`Published::next_delay`] — [`REFRESH_INTERVAL`], or [`CONTENDED_RETRY`]
-/// while a peer holds the mirror and nothing is published — each on the
-/// blocking pool. Hung beside the embedded
-/// defaults publisher in `mcp_api::create_router`, never on a spawn path. Once
-/// per process: a second call (a second router) is a no-op. That keeps one
-/// loop per PROCESS; one writer per MIRROR — what makes
+/// The `worker_supervisor` registry name of the loop [`spawn_refresh_loop`]
+/// starts, as `GET /health` `supervised_workers` lists it.
+pub const REFRESH_LOOP_WORKER: &str = "canonical_corpus.refresh_loop";
+
+/// The boot grace before the first refresh.
+pub(crate) const REFRESH_START_DELAY: Duration = Duration::from_secs(5);
+
+/// Start the background refresher: `start_delay` ([`REFRESH_START_DELAY`] in
+/// production), then a refresh every [`Published::next_delay`] —
+/// [`REFRESH_INTERVAL`], or [`CONTENDED_RETRY`] while a peer holds the mirror
+/// and nothing is published — each on the blocking pool. Hung beside the
+/// embedded defaults publisher in `mcp_api::create_router`, never on a spawn
+/// path. Once per process: a second call (a second router) is a no-op returning
+/// `None`. That keeps one loop per PROCESS; one writer per MIRROR — what makes
 /// [`Mirror::clear_interrupted_fetch`] safe — is the [`WriterLock`] each
 /// refresh takes, since two processes can share a mirror.
-pub(crate) fn start_refresh_loop() {
+///
+/// The loop runs under the panic supervisor, so a panic is logged, counted on
+/// `/health` and the loop rebuilt after a backoff; it ticks its heartbeat once
+/// per refresh. A rebuilt run waits `start_delay` again and then refreshes into
+/// the same process-wide [`LATEST`], exactly as the first run does: the loop
+/// itself holds no state.
+pub(crate) fn spawn_refresh_loop(start_delay: Duration) -> Option<tokio::task::JoinHandle<()>> {
     if LOOP_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        return;
+        return None;
     }
-    tokio::spawn(async {
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        loop {
-            if let Err(e) = tokio::task::spawn_blocking(refresh).await {
-                warn!("canonical_corpus: refresh task panicked ({e})");
+    Some(crate::worker_supervisor::spawn_supervised_with_heartbeat(
+        REFRESH_LOOP_WORKER,
+        move |hb| async move {
+            tokio::time::sleep(start_delay).await;
+            loop {
+                hb.tick();
+                if let Err(e) = tokio::task::spawn_blocking(refresh).await {
+                    warn!("canonical_corpus: refresh task panicked ({e})");
+                }
+                tokio::time::sleep(LATEST.next_delay()).await;
             }
-            tokio::time::sleep(LATEST.next_delay()).await;
-        }
-    });
+        },
+    ))
 }
 
 /// Test fixtures shared with the resolvers' tests.
@@ -1276,6 +1293,34 @@ mod tests {
 
     use super::test_support::{commit_files, git, mirror, remote_dir, remote_with};
     use super::*;
+
+    /// The door `create_router` calls registers the refresher with the panic
+    /// supervisor under its `/health` name. The start delay is long, so no
+    /// refresh leaves the process. The door is once per process, so a `None`
+    /// here means an earlier call in this test binary started it — the name
+    /// must be listed either way.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_refresh_loop_registers_with_the_panic_supervisor() {
+        let handle = spawn_refresh_loop(Duration::from_secs(3600));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !crate::worker_supervisor::snapshot()
+            .iter()
+            .any(|row| row.name == REFRESH_LOOP_WORKER)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "spawn_refresh_loop never registered {REFRESH_LOOP_WORKER}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            spawn_refresh_loop(Duration::from_secs(3600)).is_none(),
+            "a second call must not start a second refresh loop"
+        );
+        if let Some(handle) = handle {
+            handle.abort();
+        }
+    }
 
     /// Load `commands` (and no skills) at `snap`.
     fn commands_at(m: &Mirror, snap: &CanonicalSnapshot, commands: &[&str]) -> CanonicalCommands {
