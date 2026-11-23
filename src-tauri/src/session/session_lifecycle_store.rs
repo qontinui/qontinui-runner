@@ -58,12 +58,15 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+use crate::session::close_reason::CloseReason;
 use crate::session::observation_epoch::{ObservationEpoch, Observed};
 use crate::session::restore_record_emitter::RestoreRecordEmitter;
 use crate::session::snapshot_history::{SnapshotHistory, SnapshotSession, TranscriptProbe};
 
 mod identity_cas;
 pub use identity_cas::IdentityCas;
+mod inferred_bind;
+pub use inferred_bind::InferredBind;
 
 /// The runner's own app-data root, `~/.qontinui/runner`, keeping the existing
 /// "." fallback for a home-less environment. Base for the instance-scoped
@@ -218,12 +221,23 @@ pub const ORIGIN_OBSERVED: &str = "observed";
 ///
 /// It carries TWO meanings and the writer decides which: the frontend writes it
 /// to ASSERT that a tab was dragged out of every zone (past the 9-zone ceiling a
-/// live tab is genuinely unassigned), while a backstop that simply has no view
-/// of the grid means "unknown". Only the asserting writer may persist it —
-/// [`crate::session::reconcile`] carries the terminal's existing zone forward
-/// instead, because an unknown that overwrites a known value is not a default,
-/// it is data loss. Mirrors `UNZONED_INDEX` in `src/components/terminal/sessionRecordArgs.ts`.
+/// live tab is genuinely unassigned), while a writer that does not know the
+/// zone means "unknown". Spawns persist it in that second sense
+/// ([`recorded_zone_for`]): a pane's zone is assigned by the webview after the
+/// pane exists, so a recorded 0 is always a real zone, and a restore auto-fills
+/// a row carrying the sentinel into a free zone. A writer that would OVERWRITE
+/// a known zone with it must not — [`crate::session::reconcile`] carries the
+/// terminal's existing zone forward instead, because an unknown that
+/// overwrites a known value is not a default, it is data loss. Mirrors
+/// `UNZONED_INDEX` in `src/components/terminal/sessionRecordArgs.ts`.
 pub const UNZONED_ZONE_INDEX: i32 = -1;
+
+/// The zone a new row records for its pane: the caller's zone when it knows
+/// one, else [`UNZONED_ZONE_INDEX`] ("unknown"), never a placeholder 0 that
+/// would read as a real zone.
+pub fn recorded_zone_for(known: Option<i32>) -> i32 {
+    known.unwrap_or(UNZONED_ZONE_INDEX)
+}
 
 /// Normalize a possibly-legacy `origin` value to the current vocabulary. Maps
 /// the pre-migration `bind_origin` values (`"pinned"`→`"authoritative"`,
@@ -250,36 +264,40 @@ fn normalize_origin(origin: Option<String>) -> Option<String> {
 // code, a next action and glossary terms, and renders any other string as
 // `unknown` with the raw value — so a writer that records a new reason must
 // add it here AND there, or it surfaces as `unknown`, never as a guess.
+//
+// Each constant is the wire string of its [`CloseReason`] variant, so the
+// typed set every production close writes (`crate::session::close_reason`)
+// and this vocabulary cannot drift apart.
 // ---------------------------------------------------------------------------
 
 /// The operator closed the session's tab (frontend).
-pub const CLOSE_REASON_EXPLICIT: &str = "explicit";
+pub const CLOSE_REASON_EXPLICIT: &str = CloseReason::Explicit.as_str();
 /// The session's process exited while its tab was live (frontend).
-pub const CLOSE_REASON_PTY_EXIT: &str = "pty-exit";
+pub const CLOSE_REASON_PTY_EXIT: &str = CloseReason::PtyExit.as_str();
 /// The liveness poll found no agent in the terminal for the full debounce.
-pub const CLOSE_REASON_POLL_DEAD: &str = "poll-dead";
+pub const CLOSE_REASON_POLL_DEAD: &str = CloseReason::PollDead.as_str();
 /// A tile a restore brought back terminal-only idled out with no agent — see
 /// [`close_reason_for_dead_shell`].
-pub const CLOSE_REASON_TERMINAL_ONLY_IDLE: &str = "terminal-only-idle";
+pub const CLOSE_REASON_TERMINAL_ONLY_IDLE: &str = CloseReason::TerminalOnlyIdle.as_str();
 /// A provisional record whose provider never started (a bare shell).
-pub const CLOSE_REASON_NEVER_STARTED: &str = "never-started";
+pub const CLOSE_REASON_NEVER_STARTED: &str = CloseReason::NeverStarted.as_str();
 /// The record's terminal no longer exists (an orphan row).
-pub const CLOSE_REASON_NO_TERMINAL: &str = "no-terminal";
+pub const CLOSE_REASON_NO_TERMINAL: &str = CloseReason::NoTerminal.as_str();
 /// An UNCONFIRMED record evicted when a new session bound its terminal.
-pub const CLOSE_REASON_SUPERSEDED: &str = "superseded";
+pub const CLOSE_REASON_SUPERSEDED: &str = CloseReason::Superseded.as_str();
 /// A CONFIRMED record retired because its terminal now hosts a newer
 /// confirmed session.
-pub const CLOSE_REASON_SUPERSEDED_TERMINAL_REUSE: &str = "superseded-terminal-reuse";
+pub const CLOSE_REASON_SUPERSEDED_TERMINAL_REUSE: &str =
+    CloseReason::SupersededTerminalReuse.as_str();
 /// The orchestration loop could not bind its worker and tore it down
 /// (`orchestration_loop::ai_session_executor::teardown_unbound_worker`).
-pub const CLOSE_REASON_WORKER_BIND_FAILED: &str =
-    "orchestration dispatch could not bind the worker";
+pub const CLOSE_REASON_WORKER_BIND_FAILED: &str = CloseReason::WorkerNotBound.as_str();
 /// A death close (`poll-dead` / `pty-exit`) of a pane whose Claude CLI never
 /// launched, rewritten on positive evidence by
 /// `terminal::launch_failure::close_reason_for_launch` (plan
 /// `2026-11-10-migration-holds-for-missing-claude-cli`, D3). Restorable.
 /// `terminal::launch_failure::LAUNCH_FAILED` is this constant.
-pub const CLOSE_REASON_LAUNCH_FAILED: &str = "launch-failed";
+pub const CLOSE_REASON_LAUNCH_FAILED: &str = CloseReason::LaunchFailed.as_str();
 
 /// [`TerminalSessionRecord::wind_down_outcome`] — the graceful exit landed and
 /// the pane was closed.
@@ -412,6 +430,31 @@ pub fn describe_restore_status(
         (None, Some(_)) => "pending (not yet confirmed)".to_string(),
         (None, None) => "not-restored".to_string(),
     }
+}
+
+/// Did this row's BOOT restore land? Only then is its `restored_from_boot_at`
+/// evidence that the session came back after the restart.
+///
+/// [`SessionLifecycleStore::mark_restore_pending`]`(boot = true)` stamps
+/// `restored_from_boot_at` together with `restore_pending_at` and tier
+/// [`RESTORE_TIER_FAILED`] BEFORE the resume is typed, so a bare stamp records
+/// an ATTEMPT. [`SessionLifecycleStore::clear_restore_pending`] promotes a
+/// stamped `failed` to [`RESTORE_TIER_RESUMED`]; a close demotes an unconfirmed
+/// `failed` to [`RESTORE_TIER_TERMINAL_ONLY`] (`reap_restore_marker_on_close`),
+/// and a `resumed` survives the close. So the tier alone answers: `resumed` is
+/// a landed resume, every other tier is not one. A fresh boot restore resets
+/// the tier to `failed`, so a `resumed` left by an earlier boot cannot pass for
+/// this one's (callers still compare the stamp against the boot instant).
+///
+/// The promotion has three callers, so `resumed` is as good as they are: the
+/// webview's verified resume handshake, the liveness poll's `KeepAlive`
+/// self-heal (a live `claude` observed in the pane), and the drain-skip arm
+/// (`applyDrainSkip` in `useTerminalInitialization.ts`), which clears the
+/// marker for a skip-alive / skip-unknown row whose resume was never typed —
+/// after its rebind, which fails soft. A rebind failure there therefore
+/// promotes a restore that typed nothing; the webview documents that ordering.
+pub fn boot_restore_landed(rec: &TerminalSessionRecord) -> bool {
+    rec.restore_tier.as_deref() == Some(RESTORE_TIER_RESUMED)
 }
 
 /// Reap the restore-pending marker on a record that is about to become
@@ -1880,6 +1923,45 @@ impl SessionLifecycleStore {
     /// A brand-new record sets `opened_at == last_seen_at == now`. Atomic-
     /// writes after mutating.
     pub fn record_open(&self, rec: TerminalSessionRecord) {
+        let _ = self.record_open_guarded(rec, None);
+    }
+
+    /// The reconcile binder's write: [`Self::record_open`] behind a write-time
+    /// liveness guard ([`inferred_bind::refusal`]), asked under the same lock
+    /// acquisition as the merge, so no other writer can move the row between
+    /// the check and the write.
+    ///
+    /// A bind the binder INFERS rests on evidence read before this call: its
+    /// pass captures the live panes and their claude command lines, then waits
+    /// up to 30 s on a transcript prescan. So the bind is refused when the pane
+    /// it names is not live now, or when it would move an OPEN row off a pane
+    /// that is live now. A row on a pane that is gone still binds to the live
+    /// pane holding its id (the dead-to-live heal). A refusal writes nothing.
+    ///
+    /// The liveness is passed in, as [`Self::mark_awaiting_account`]'s is, so
+    /// the store stays free of the `TerminalManager`. Callers read the
+    /// manager's live set immediately BEFORE this call, never under this lock.
+    ///
+    /// Authoritative writers (the account migration's own spawn write, a
+    /// SessionStart hook) keep [`Self::record_open`]. They are `authoritative`
+    /// by origin, as the binder's rung-2 bind is, so the store could not tell
+    /// them apart by the record alone.
+    pub fn bind_inferred(
+        &self,
+        rec: TerminalSessionRecord,
+        terminal_is_live: &dyn Fn(&str) -> bool,
+    ) -> InferredBind {
+        self.record_open_guarded(rec, Some(terminal_is_live))
+    }
+
+    /// [`Self::record_open`]'s body. `terminal_is_live`, when given, is
+    /// [`Self::bind_inferred`]'s guard, asked under the lock before anything
+    /// is merged.
+    fn record_open_guarded(
+        &self,
+        rec: TerminalSessionRecord,
+        terminal_is_live: Option<&dyn Fn(&str) -> bool>,
+    ) -> InferredBind {
         // Normalize a stray empty/whitespace-only config_dir to None: it must
         // never become a bogus `CLAUDE_CONFIG_DIR=""` on resume, and the sticky
         // guard below must treat "no account reported" uniformly as None (so an
@@ -1918,9 +2000,18 @@ impl SessionLifecycleStore {
                 Ok(m) => m,
                 Err(e) => {
                     warn!(error = %e, "session_lifecycle_store: lock poisoned on record_open");
-                    return;
+                    return InferredBind::StoreUnavailable;
                 }
             };
+            if let Some(terminal_is_live) = terminal_is_live {
+                if let Some(refused) = inferred_bind::refusal(
+                    m.get(&rec.claude_session_id),
+                    &rec.terminal_id,
+                    terminal_is_live,
+                ) {
+                    return refused;
+                }
+            }
             // W-B: a BRAND-NEW record binding a terminal inherits the spawn-time
             // device default another open record on that terminal already
             // carries. The seam records a provisional row at spawn; an account
@@ -2126,7 +2217,7 @@ impl SessionLifecycleStore {
                     if other.confirmed_at.is_none() {
                         other.state = "closed".to_string();
                         other.closed_at = Some(now);
-                        other.close_reason = Some(CLOSE_REASON_SUPERSEDED.to_string());
+                        other.close_reason = Some(CloseReason::Superseded.as_str().to_string());
                         // A closed record's restore can never be retried — see
                         // `reap_restore_marker_on_close`.
                         reap_restore_marker_on_close(other);
@@ -2141,7 +2232,7 @@ impl SessionLifecycleStore {
                         other.state = "closed".to_string();
                         other.closed_at = Some(now);
                         other.close_reason =
-                            Some(CLOSE_REASON_SUPERSEDED_TERMINAL_REUSE.to_string());
+                            Some(CloseReason::SupersededTerminalReuse.as_str().to_string());
                         // A closed record's restore can never be retried — see
                         // `reap_restore_marker_on_close`.
                         reap_restore_marker_on_close(other);
@@ -2171,6 +2262,7 @@ impl SessionLifecycleStore {
         // Phase 4 cloud mirror — emit AFTER the durable local write, from
         // the MERGED record (origin/confirmation preservation applied).
         self.mirror_restore_record(&merged);
+        InferredBind::Bound
     }
 
     /// Mark an open session closed. No-op (no error) if the session is
@@ -2190,7 +2282,7 @@ impl SessionLifecycleStore {
     /// session's credential must not stay live. Skipped for account-migration
     /// closes (the session continues under a new record with the same workdir)
     /// and when a sibling open session still shares the workdir.
-    pub fn record_close(&self, claude_session_id: &str, reason: &str) {
+    pub fn record_close(&self, claude_session_id: &str, reason: CloseReason) {
         let _ = self.record_close_checked(claude_session_id, None, reason);
     }
 
@@ -2420,10 +2512,10 @@ impl SessionLifecycleStore {
         shutting_down: bool,
         claude_session_id: &str,
         terminal_id: Option<&str>,
-        reason: &str,
+        reason: CloseReason,
         terminal_created_at_ms: Option<i64>,
     ) -> CloseOutcome {
-        if shutting_down && reason == "pty-exit" {
+        if shutting_down && reason == CloseReason::PtyExit {
             return CloseOutcome::IgnoredDuringShutdown {
                 claude_session_id: claude_session_id.to_string(),
             };
@@ -2468,7 +2560,7 @@ impl SessionLifecycleStore {
         &self,
         claude_session_id: &str,
         expect: Option<&str>,
-        reason: &str,
+        reason: CloseReason,
     ) -> Option<CloseOutcome> {
         if self
             .held_sessions
@@ -2509,7 +2601,7 @@ impl SessionLifecycleStore {
         let incoming = HeldClose {
             claude_session_id: claude_session_id.to_string(),
             terminal_id: terminal.clone(),
-            reason: reason.to_string(),
+            reason,
         };
         match hold.arrivals.get(&terminal) {
             Some(prev) if prev.is_user_close() || !incoming.is_user_close() => {}
@@ -2582,7 +2674,7 @@ impl SessionLifecycleStore {
         &self,
         claude_session_id: &str,
         expect_terminal_id: Option<&str>,
-        reason: &str,
+        reason: CloseReason,
     ) -> CloseOutcome {
         let now = Utc::now().timestamp_millis();
         // An empty / whitespace terminal id is "no expectation": empty ids
@@ -2694,7 +2786,7 @@ impl SessionLifecycleStore {
                 Some(rec) if rec.state == "open" => {
                     rec.state = "closed".to_string();
                     rec.closed_at = Some(now);
-                    rec.close_reason = Some(reason.to_string());
+                    rec.close_reason = Some(reason.as_str().to_string());
                     // A closed record's restore can never be retried — see
                     // `reap_restore_marker_on_close`.
                     reap_restore_marker_on_close(rec);
@@ -4989,7 +5081,8 @@ impl SessionLifecycleStore {
                     if let Some(rec) = m.get_mut(id.as_str()) {
                         rec.state = "closed".to_string();
                         rec.closed_at = Some(now);
-                        rec.close_reason = Some(CLOSE_REASON_SUPERSEDED_TERMINAL_REUSE.to_string());
+                        rec.close_reason =
+                            Some(CloseReason::SupersededTerminalReuse.as_str().to_string());
                         // A closed record's restore can never be retried — see
                         // `reap_restore_marker_on_close`.
                         reap_restore_marker_on_close(rec);
@@ -5249,7 +5342,7 @@ pub struct HeldClose {
     /// The terminal it named (or, for a terminal-less close, the one the row
     /// was bound to). Empty when neither was known.
     pub terminal_id: String,
-    pub reason: String,
+    pub reason: CloseReason,
 }
 
 /// The close reason the frontend sends when the USER closes a tab
@@ -5260,7 +5353,7 @@ pub const USER_CLOSE_REASON: &str = CLOSE_REASON_EXPLICIT;
 impl HeldClose {
     /// The user closed the pane — not a child exit, not a poll.
     pub fn is_user_close(&self) -> bool {
-        self.reason == USER_CLOSE_REASON
+        self.reason == CloseReason::Explicit
     }
 }
 
@@ -6181,8 +6274,9 @@ pub fn boot_restore_phase() -> BootRestorePhase {
 
 /// Record that the boot restore was WITHHELD (drain-deferred). Only moves
 /// `NotYetRun → Withheld`: idempotent under the frontend's repeated asks, and
-/// a no-op once the restore has run.
-pub fn note_boot_restore_withheld() {
+/// a no-op once the restore has run. Returns whether THIS call moved the phase
+/// (exactly one call does, however many race).
+pub fn note_boot_restore_withheld() -> bool {
     let moved = BOOT_RESTORE_PHASE
         .compare_exchange(
             BOOT_RESTORE_NOT_YET_RUN,
@@ -6196,17 +6290,19 @@ pub fn note_boot_restore_withheld() {
             "session_lifecycle_store: boot restore WITHHELD by the coord drain — the lifecycle poll will hold prior-boot records open until it runs"
         );
     }
+    moved
 }
 
 /// Record that the boot restore has RUN (a restore set was returned).
-/// Terminal.
-pub fn note_boot_restore_ran() {
+/// Terminal. Returns whether THIS call moved the phase.
+pub fn note_boot_restore_ran() -> bool {
     let prior = BOOT_RESTORE_PHASE.swap(BOOT_RESTORE_RAN, std::sync::atomic::Ordering::AcqRel);
     if prior == BOOT_RESTORE_WITHHELD {
         info!(
             "session_lifecycle_store: withheld boot restore has now run — normal orphan handling resumes"
         );
     }
+    prior != BOOT_RESTORE_RAN
 }
 
 /// What one `terminal_session_list_open` call may do to [`BootRestorePhase`].
@@ -6237,10 +6333,12 @@ pub fn boot_restore_latch_event(is_boot_restore: bool, deferred: bool) -> BootRe
     }
 }
 
-/// Apply a [`BootRestoreLatchEvent`] to the process-global latch.
-pub fn apply_boot_restore_latch_event(event: BootRestoreLatchEvent) {
+/// Apply a [`BootRestoreLatchEvent`] to the process-global latch. Returns
+/// whether it moved the [`BootRestorePhase`]: the restore path logs its
+/// deferral at WARN only when it did.
+pub fn apply_boot_restore_latch_event(event: BootRestoreLatchEvent) -> bool {
     match event {
-        BootRestoreLatchEvent::Untouched => {}
+        BootRestoreLatchEvent::Untouched => false,
         BootRestoreLatchEvent::Withheld => note_boot_restore_withheld(),
         BootRestoreLatchEvent::Ran => note_boot_restore_ran(),
     }
@@ -6751,11 +6849,11 @@ pub fn poll_holds_unmatched_row(
 /// hands this function's `"poll-dead"` to the `launch-failed` rule
 /// ([`crate::terminal::launch_failure`]), which may rewrite it; it never
 /// rewrites `"terminal-only-idle"`.
-pub fn close_reason_for_dead_shell(restore_tier: Option<&str>) -> &'static str {
+pub fn close_reason_for_dead_shell(restore_tier: Option<&str>) -> CloseReason {
     if restore_tier == Some(RESTORE_TIER_TERMINAL_ONLY) {
-        CLOSE_REASON_TERMINAL_ONLY_IDLE
+        CloseReason::TerminalOnlyIdle
     } else {
-        CLOSE_REASON_POLL_DEAD
+        CloseReason::PollDead
     }
 }
 
@@ -8343,7 +8441,8 @@ mod tests {
             store.record_open(auth_on(id, &format!("term-{id}")));
         }
 
-        let before = store.record_close_gated(false, "a", Some("term-a"), "pty-exit", None);
+        let before =
+            store.record_close_gated(false, "a", Some("term-a"), CloseReason::PtyExit, None);
         assert_eq!(
             before,
             CloseOutcome::Closed {
@@ -8356,18 +8455,18 @@ mod tests {
             claude_session_id: "b".to_string(),
         };
         assert_eq!(
-            store.record_close_gated(true, "b", Some("term-b"), "pty-exit", None),
+            store.record_close_gated(true, "b", Some("term-b"), CloseReason::PtyExit, None),
             refused
         );
         assert_eq!(
-            store.record_close_gated(true, "b", Some("term-b"), "pty-exit", None),
+            store.record_close_gated(true, "b", Some("term-b"), CloseReason::PtyExit, None),
             refused
         );
         let b = store.get("b").unwrap();
         assert_eq!(b.state, "open");
         assert!(b.close_reason.is_none());
 
-        for (id, reason) in [("c", "explicit"), ("d", "poll-dead")] {
+        for (id, reason) in [("c", CloseReason::Explicit), ("d", CloseReason::PollDead)] {
             let out = store.record_close_gated(true, id, Some(&format!("term-{id}")), reason, None);
             assert_eq!(
                 out,
@@ -8375,10 +8474,13 @@ mod tests {
                     claude_session_id: id.to_string()
                 }
             );
-            assert_eq!(store.get(id).unwrap().close_reason.as_deref(), Some(reason));
+            assert_eq!(
+                store.get(id).unwrap().close_reason.as_deref(),
+                Some(reason.as_str())
+            );
         }
 
-        store.record_close_gated(false, "b", Some("term-b"), "pty-exit", None);
+        store.record_close_gated(false, "b", Some("term-b"), CloseReason::PtyExit, None);
         assert_eq!(store.get("b").unwrap().state, "closed");
     }
 
@@ -8561,7 +8663,7 @@ mod tests {
         // Edge: closed record no longer matches (only OPEN rows are keyed by
         // terminal — a fresh PTY may reuse nothing, but a stale closed row
         // must not swallow the rename).
-        store.record_close("sess-1", "pty-exit");
+        store.record_close("sess-1", CloseReason::PtyExit);
         store.update_title_by_terminal("term-abc", "should-not-land");
         assert_eq!(
             store.get("sess-1").unwrap().title.as_deref(),
@@ -8646,7 +8748,7 @@ mod tests {
         let path = dir.path().join("terminal-sessions.json");
         let store = SessionLifecycleStore::open(&path).unwrap();
         store.record_open(rec("sess-1"));
-        store.record_close("sess-1", "poll-dead");
+        store.record_close("sess-1", CloseReason::PollDead);
         assert!(store.open_records().is_empty());
 
         store.record_open(rec("sess-1"));
@@ -8665,14 +8767,14 @@ mod tests {
         let store = SessionLifecycleStore::open(&path).unwrap();
 
         // Absent → no-op, no panic.
-        store.record_close("ghost", "x");
+        store.record_close("ghost", CloseReason::Explicit);
 
         store.record_open(rec("sess-1"));
-        store.record_close("sess-1", "poll-dead");
+        store.record_close("sess-1", CloseReason::PollDead);
         assert!(store.open_records().is_empty());
 
         // Double close → no-op.
-        store.record_close("sess-1", "again");
+        store.record_close("sess-1", CloseReason::Explicit);
 
         // Reload and confirm the closed record persisted with its reason.
         let store = SessionLifecycleStore::open(&path).unwrap();
@@ -8689,7 +8791,7 @@ mod tests {
         store.record_open(auth_on("mine", "term-mine"));
         store.record_open(auth_on("neighbour", "term-neighbour"));
 
-        let outcome = store.record_close_checked("mine", Some("term-mine"), "explicit");
+        let outcome = store.record_close_checked("mine", Some("term-mine"), CloseReason::Explicit);
 
         assert_eq!(
             outcome,
@@ -8723,7 +8825,8 @@ mod tests {
         // The record the caller's terminal really owns.
         store.record_open(auth_on("live-real", "term-live"));
 
-        let outcome = store.record_close_checked("stale-foreign", Some("term-live"), "explicit");
+        let outcome =
+            store.record_close_checked("stale-foreign", Some("term-live"), CloseReason::Explicit);
 
         assert_eq!(
             outcome,
@@ -8805,7 +8908,7 @@ mod tests {
                 "a-tied"
             );
             // A closed row is not a candidate however recent its hook.
-            store.record_close("a-tied", "explicit");
+            store.record_close("a-tied", CloseReason::Explicit);
             assert_eq!(
                 store
                     .latest_open_on_terminal("term-t", "nobody")
@@ -8870,8 +8973,11 @@ mod tests {
             newer.origin = Some(ORIGIN_OBSERVED.to_string());
             store.record_open(newer);
 
-            let outcome =
-                store.record_close_checked("no-such-session", Some("term-dup"), "explicit");
+            let outcome = store.record_close_checked(
+                "no-such-session",
+                Some("term-dup"),
+                CloseReason::Explicit,
+            );
 
             match outcome {
                 CloseOutcome::RedirectedAmbiguous {
@@ -8919,7 +9025,8 @@ mod tests {
         }
         store.record_open(auth_on("bystander", "term-bystander"));
 
-        let outcome = store.record_close_checked("unknown-sess", Some("term-gone"), "explicit");
+        let outcome =
+            store.record_close_checked("unknown-sess", Some("term-gone"), CloseReason::Explicit);
 
         assert_eq!(
             outcome,
@@ -8963,7 +9070,7 @@ mod tests {
         assert_eq!(store.get("moving").unwrap().terminal_id, "term-new");
 
         store.mark_terminal_superseded("term-old", "term-new");
-        let outcome = store.record_close_checked("moving", Some("term-old"), "pty-exit");
+        let outcome = store.record_close_checked("moving", Some("term-old"), CloseReason::PtyExit);
 
         assert_eq!(
             outcome,
@@ -8984,7 +9091,7 @@ mod tests {
 
         // Consumed: the same close again is the ordinary mis-bound answer.
         assert_eq!(
-            store.record_close_checked("moving", Some("term-old"), "pty-exit"),
+            store.record_close_checked("moving", Some("term-old"), CloseReason::PtyExit),
             CloseOutcome::NotFound {
                 requested: "moving".to_string(),
                 terminal_id: Some("term-old".to_string()),
@@ -8992,7 +9099,7 @@ mod tests {
         );
         // And the new terminal's own close still works as a real close.
         assert_eq!(
-            store.record_close_checked("moving", Some("term-new"), "explicit"),
+            store.record_close_checked("moving", Some("term-new"), CloseReason::Explicit),
             CloseOutcome::Closed {
                 claude_session_id: "moving".to_string()
             }
@@ -9018,7 +9125,7 @@ mod tests {
         );
 
         assert_eq!(
-            store.record_close_checked("a", Some("term-a"), "explicit"),
+            store.record_close_checked("a", Some("term-a"), CloseReason::Explicit),
             CloseOutcome::Closed {
                 claude_session_id: "a".to_string()
             }
@@ -9048,7 +9155,7 @@ mod tests {
         // Closes despite naming no terminal, and despite the row living on a
         // terminal the caller never mentions.
         assert_eq!(
-            store.record_close_checked("sess", None, "poll-dead"),
+            store.record_close_checked("sess", None, CloseReason::PollDead),
             CloseOutcome::Closed {
                 claude_session_id: "sess".to_string()
             }
@@ -9060,7 +9167,7 @@ mod tests {
         );
         // Repeat / absent closes stay no-ops.
         assert_eq!(
-            store.record_close_checked("sess", None, "again"),
+            store.record_close_checked("sess", None, CloseReason::Explicit),
             CloseOutcome::AlreadyClosed {
                 claude_session_id: "sess".to_string()
             }
@@ -9071,7 +9178,7 @@ mod tests {
             "a repeat close does not re-stamp the reason"
         );
         assert_eq!(
-            store.record_close_checked("ghost", None, "x"),
+            store.record_close_checked("ghost", None, CloseReason::Explicit),
             CloseOutcome::NotFound {
                 requested: "ghost".to_string(),
                 terminal_id: None,
@@ -9090,9 +9197,10 @@ mod tests {
         let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
         store.record_open(auth_on("bare-shell", "term-shell"));
         store.record_open(auth_on("someone-else", "term-else"));
-        store.record_close("bare-shell", "never-started");
+        store.record_close("bare-shell", CloseReason::NeverStarted);
 
-        let outcome = store.record_close_checked("bare-shell", Some("term-shell"), "explicit");
+        let outcome =
+            store.record_close_checked("bare-shell", Some("term-shell"), CloseReason::Explicit);
 
         assert_eq!(
             outcome,
@@ -9127,7 +9235,7 @@ mod tests {
         store.record_open(auth_on("stale-foreign", "term-other"));
         store.record_open(auth_on("live-real", "term-live"));
 
-        store.record_close_checked("stale-foreign", Some("term-live"), "pty-exit");
+        store.record_close_checked("stale-foreign", Some("term-live"), CloseReason::PtyExit);
 
         assert_eq!(
             *seen.lock().unwrap(),
@@ -9158,22 +9266,22 @@ mod tests {
         }
 
         // Absent id → no fire.
-        store.record_close("ghost", "x");
+        store.record_close("ghost", CloseReason::Explicit);
         assert_eq!(fired.load(Ordering::SeqCst), 0);
 
         // Real transition → fires once with the csid.
         store.record_open(rec("sess-1"));
-        store.record_close("sess-1", "poll-dead");
+        store.record_close("sess-1", CloseReason::PollDead);
         assert_eq!(fired.load(Ordering::SeqCst), 1);
         assert_eq!(last.lock().unwrap().as_str(), "sess-1");
 
         // Repeat close → no refire.
-        store.record_close("sess-1", "again");
+        store.record_close("sess-1", CloseReason::Explicit);
         assert_eq!(fired.load(Ordering::SeqCst), 1);
 
         // Reopen + close again → a second REAL transition fires again.
         store.record_open(rec("sess-1"));
-        store.record_close("sess-1", "poll-dead");
+        store.record_close("sess-1", CloseReason::PollDead);
         assert_eq!(fired.load(Ordering::SeqCst), 2);
     }
 
@@ -9198,7 +9306,7 @@ mod tests {
             WIND_DOWN_ARM_FINISHED_CLOSE,
             2_000,
         );
-        store.record_close("sess-1", CLOSE_REASON_EXPLICIT);
+        store.record_close("sess-1", CloseReason::Explicit);
         store.record_open(rec("sess-1"));
         let r = store.get("sess-1").unwrap();
         assert_eq!(r.wind_down_outcome, None);
@@ -9216,13 +9324,13 @@ mod tests {
         store.record_open(rec("open-sess"));
         // A pty-exit close (graceful-restart case) — IS restorable while in grace.
         store.record_open(rec("pty-exit-sess"));
-        store.record_close("pty-exit-sess", "pty-exit");
+        store.record_close("pty-exit-sess", CloseReason::PtyExit);
         // An explicit/user close — is NOT restorable.
         store.record_open(rec("user-closed-sess"));
-        store.record_close("user-closed-sess", "explicit");
+        store.record_close("user-closed-sess", CloseReason::Explicit);
         // A pty-exit close aged beyond the grace window — is NOT restorable.
         store.record_open(rec("stale-pty-exit-sess"));
-        store.record_close("stale-pty-exit-sess", "pty-exit");
+        store.record_close("stale-pty-exit-sess", CloseReason::PtyExit);
 
         let now = Utc::now().timestamp_millis();
 
@@ -9269,7 +9377,7 @@ mod tests {
         store.record_open(rec("unfinished-open"));
         store.record_open(rec("finished-open"));
         store.record_open(rec("finished-pty-exit"));
-        store.record_close("finished-pty-exit", "pty-exit");
+        store.record_close("finished-pty-exit", CloseReason::PtyExit);
 
         let _ = store.set_finished("finished-open", true, Some("work landed".into()));
         let _ = store.set_finished("finished-pty-exit", true, None);
@@ -9317,7 +9425,7 @@ mod tests {
 
         // And the converse: closing a session says nothing about its work axis.
         store.record_open(rec("other"));
-        store.record_close("other", "pty-exit");
+        store.record_close("other", CloseReason::PtyExit);
         let closed = store
             .all_records()
             .into_iter()
@@ -9881,7 +9989,7 @@ mod tests {
         );
 
         // Close → a change snapshot with the alive-state fields.
-        store.record_close("sess-1", "poll-dead");
+        store.record_close("sess-1", CloseReason::PollDead);
         let recs = lines(&history_path);
         assert_eq!(recs.len(), 2, "record_close appends a change snapshot");
         let s = &recs[1]["sessions"][0];
@@ -9923,8 +10031,8 @@ mod tests {
         store.record_open(rec("stale-open"));
         store.record_open(rec("recent-closed"));
         store.record_open(rec("old-closed"));
-        store.record_close("recent-closed", "done");
-        store.record_close("old-closed", "done");
+        store.record_close("recent-closed", CloseReason::Explicit);
+        store.record_close("old-closed", CloseReason::Explicit);
 
         let now = Utc::now().timestamp_millis();
 
@@ -9980,9 +10088,9 @@ mod tests {
         store.record_open(closed_live_older);
         store.record_open(closed_gone);
         store.record_open(open_live);
-        store.record_close("closed-live-term", "pty-exit");
-        store.record_close("closed-live-term-older", "pty-exit");
-        store.record_close("closed-gone-term", "pty-exit");
+        store.record_close("closed-live-term", CloseReason::PtyExit);
+        store.record_close("closed-live-term-older", CloseReason::PtyExit);
+        store.record_close("closed-gone-term", CloseReason::PtyExit);
 
         let now = Utc::now().timestamp_millis();
         // Age both closed rows past retention and the open row past stale.
@@ -10519,18 +10627,18 @@ mod tests {
     #[test]
     fn close_reason_for_dead_shell_retires_terminal_only_tiles_non_restorably() {
         assert_eq!(
-            close_reason_for_dead_shell(Some(RESTORE_TIER_TERMINAL_ONLY)),
+            close_reason_for_dead_shell(Some(RESTORE_TIER_TERMINAL_ONLY)).as_str(),
             "terminal-only-idle",
         );
         // `restorable_records` only grants grace to "poll-dead" / "pty-exit" —
         // pin that this reason is neither, so the fix does not also require
         // touching that allowlist.
         assert_ne!(
-            close_reason_for_dead_shell(Some(RESTORE_TIER_TERMINAL_ONLY)),
+            close_reason_for_dead_shell(Some(RESTORE_TIER_TERMINAL_ONLY)).as_str(),
             "poll-dead"
         );
         assert_ne!(
-            close_reason_for_dead_shell(Some(RESTORE_TIER_TERMINAL_ONLY)),
+            close_reason_for_dead_shell(Some(RESTORE_TIER_TERMINAL_ONLY)).as_str(),
             "pty-exit"
         );
     }
@@ -10542,14 +10650,14 @@ mod tests {
     #[test]
     fn close_reason_for_dead_shell_leaves_other_tiers_as_poll_dead() {
         assert_eq!(
-            close_reason_for_dead_shell(Some(RESTORE_TIER_RESUMED)),
+            close_reason_for_dead_shell(Some(RESTORE_TIER_RESUMED)).as_str(),
             "poll-dead"
         );
         assert_eq!(
-            close_reason_for_dead_shell(Some(RESTORE_TIER_FAILED)),
+            close_reason_for_dead_shell(Some(RESTORE_TIER_FAILED)).as_str(),
             "poll-dead"
         );
-        assert_eq!(close_reason_for_dead_shell(None), "poll-dead");
+        assert_eq!(close_reason_for_dead_shell(None).as_str(), "poll-dead");
     }
 
     /// The regression that would have failed on runner#871.
@@ -10810,7 +10918,7 @@ mod tests {
         let path = dir.path().join("terminal-sessions.json");
         let store = SessionLifecycleStore::open(&path).unwrap();
         store.record_open(rec("bare-shell"));
-        store.record_close("bare-shell", "never-started");
+        store.record_close("bare-shell", CloseReason::NeverStarted);
 
         assert!(
             store.restorable_records(None, true).is_empty(),
@@ -10827,7 +10935,7 @@ mod tests {
         let path = dir.path().join("terminal-sessions.json");
         let store = SessionLifecycleStore::open(&path).unwrap();
         store.record_open(rec("orphan-sess"));
-        store.record_close("orphan-sess", "no-terminal");
+        store.record_close("orphan-sess", CloseReason::NoTerminal);
 
         assert!(
             store.restorable_records(None, true).is_empty(),
@@ -10951,7 +11059,7 @@ mod tests {
             "precondition: the pessimistic stamp is in place"
         );
 
-        store.record_close("sess-1", "pty-exit");
+        store.record_close("sess-1", CloseReason::PtyExit);
 
         let closed = store.get("sess-1").unwrap();
         assert_eq!(closed.state, "closed");
@@ -11004,7 +11112,7 @@ mod tests {
             Some(RESTORE_TIER_RESUMED),
             "precondition: the promotion landed"
         );
-        store.record_close("landed", "explicit");
+        store.record_close("landed", CloseReason::Explicit);
         assert_eq!(
             store.get("landed").unwrap().restore_tier.as_deref(),
             Some(RESTORE_TIER_RESUMED),
@@ -11016,7 +11124,7 @@ mod tests {
         ghost.terminal_id = "term-ghost".to_string();
         store.record_open(ghost);
         store.mark_restored_from_boot("ghost", RESTORE_TIER_TERMINAL_ONLY);
-        store.record_close("ghost", "pty-exit");
+        store.record_close("ghost", CloseReason::PtyExit);
         assert_eq!(
             store.get("ghost").unwrap().restore_tier.as_deref(),
             Some(RESTORE_TIER_TERMINAL_ONLY)
@@ -11026,7 +11134,7 @@ mod tests {
         let mut plain = rec("plain");
         plain.terminal_id = "term-plain".to_string();
         store.record_open(plain);
-        store.record_close("plain", "explicit");
+        store.record_close("plain", CloseReason::Explicit);
         let closed = store.get("plain").unwrap();
         assert_eq!(closed.restore_tier, None, "no restore was ever recorded");
         assert!(closed.restore_pending_at.is_none());
@@ -11705,7 +11813,7 @@ mod tests {
             .expect("a known session");
         assert!(!store.poll_hold_awaiting_account("finish-me", now));
         assert_eq!(store.get("finish-me").unwrap().awaiting_account_since, None);
-        store.record_close("close-me", "user-close");
+        store.record_close("close-me", CloseReason::Explicit);
         assert!(!store.poll_hold_awaiting_account("close-me", now));
         assert_eq!(store.get("close-me").unwrap().awaiting_account_since, None);
         store.record_open(fixture_rec("needs-account", "open", old, None, None));
@@ -12082,10 +12190,10 @@ mod tests {
         // shell was still alive when the poll fired, so an immediate restart
         // must bring it back rather than silently drop it.
         store.record_open(rec("poll-dead-fresh"));
-        store.record_close("poll-dead-fresh", "poll-dead");
+        store.record_close("poll-dead-fresh", CloseReason::PollDead);
         // A poll-dead close aged beyond the grace window is NOT restorable.
         store.record_open(rec("poll-dead-stale"));
-        store.record_close("poll-dead-stale", "poll-dead");
+        store.record_close("poll-dead-stale", CloseReason::PollDead);
 
         let now = Utc::now().timestamp_millis();
 
@@ -12899,7 +13007,7 @@ mod tests {
         assert!(store.get("ghost").is_none());
 
         store.record_open(rec("s2"));
-        store.record_close("s2", "user-closed");
+        store.record_close("s2", CloseReason::Explicit);
         store.rebind_terminal("s2", "term-fresh", 1);
 
         let after = store.get("s2").unwrap();
@@ -12987,7 +13095,7 @@ mod tests {
         let path = dir.path().join("terminal-sessions.json");
         let store = SessionLifecycleStore::open(&path).unwrap();
         store.record_open(rec("gone"));
-        store.record_close("gone", "user-close");
+        store.record_close("gone", CloseReason::Explicit);
         store.mark_restore_pending("gone", false);
         let got = store.get("gone").unwrap();
         assert_eq!(got.restore_pending_at, None);
@@ -13489,7 +13597,7 @@ mod tests {
                             .insert(rec.claude_session_id.clone(), prior_no_match + 1);
                     }
                     PollAction::CloseNoTerminal => {
-                        store.record_close(&rec.claude_session_id, "no-terminal");
+                        store.record_close(&rec.claude_session_id, CloseReason::NoTerminal);
                         consecutive_no_match.remove(&rec.claude_session_id);
                     }
                     PollAction::Skip => {}
@@ -14035,19 +14143,51 @@ mod tests {
 
     /// The latch is monotonic: a repeated deferral is idempotent, `Ran` is
     /// terminal, and a deferral after the restore ran does not re-arm the hold.
+    /// Each event reports whether it moved the phase, which is what limits the
+    /// restore path's deferral WARN to one per phase change.
     /// The only test that touches the process-global latch.
     #[test]
     fn boot_restore_phase_latch_is_monotonic() {
         reset_boot_restore_phase_for_test();
         assert_eq!(boot_restore_phase(), BootRestorePhase::NotYetRun);
-        note_boot_restore_withheld();
-        note_boot_restore_withheld();
+        assert!(
+            !apply_boot_restore_latch_event(BootRestoreLatchEvent::Untouched),
+            "a reader that only looks moves nothing"
+        );
+        assert!(
+            apply_boot_restore_latch_event(BootRestoreLatchEvent::Withheld),
+            "the first deferral moves NotYetRun → Withheld"
+        );
+        assert!(
+            !apply_boot_restore_latch_event(BootRestoreLatchEvent::Withheld),
+            "a repeated deferral moves nothing"
+        );
         assert_eq!(boot_restore_phase(), BootRestorePhase::Withheld);
-        note_boot_restore_ran();
+        assert!(
+            apply_boot_restore_latch_event(BootRestoreLatchEvent::Ran),
+            "Withheld → Ran"
+        );
         assert_eq!(boot_restore_phase(), BootRestorePhase::Ran);
-        note_boot_restore_withheld();
+        assert!(
+            !apply_boot_restore_latch_event(BootRestoreLatchEvent::Withheld),
+            "a deferral after the restore ran does not re-arm the hold"
+        );
+        assert!(
+            !apply_boot_restore_latch_event(BootRestoreLatchEvent::Ran),
+            "Ran is terminal"
+        );
         assert_eq!(boot_restore_phase(), BootRestorePhase::Ran);
         reset_boot_restore_phase_for_test();
+    }
+
+    /// A spawn that knows no zone records the sentinel, never a placeholder 0,
+    /// so a recorded 0 is a real zone; a known zone, 0 included, is kept.
+    /// Mutation: `recorded_zone_for` falling back to 0.
+    #[test]
+    fn a_new_row_records_the_sentinel_for_an_unknown_zone() {
+        assert_eq!(recorded_zone_for(None), UNZONED_ZONE_INDEX);
+        assert_eq!(recorded_zone_for(Some(0)), 0);
+        assert_eq!(recorded_zone_for(Some(4)), 4);
     }
 
     /// Clean boot: the shutdown marker (written before this boot) joins the
@@ -14345,8 +14485,8 @@ mod gate_continuation_tests {
         }
         s.record_open(gate_row(boot - 1));
         let csid = old_row().claude_session_id;
-        s.record_close(&csid, "no-terminal");
-        s.record_close(&csid, "no-terminal");
+        s.record_close(&csid, CloseReason::NoTerminal);
+        s.record_close(&csid, CloseReason::NoTerminal);
         assert_eq!(fired.lock().unwrap().len(), 1, "posted exactly once");
     }
 
@@ -14457,7 +14597,7 @@ mod gate_continuation_tests {
         s.mark_restore_pending("plain", true);
         assert_eq!(s.adopt_restored_gate("plain", 200), None);
         // Closed → nothing.
-        s.record_close(&csid, "no-terminal");
+        s.record_close(&csid, CloseReason::NoTerminal);
         assert_eq!(s.adopt_restored_gate(&csid, 300), None);
     }
 
@@ -14476,7 +14616,7 @@ mod gate_continuation_tests {
         // Open: a live continuation keeps its gate.
         assert!(!s.release_gate_identity(&csid, 200));
         // Closed non-restorably: D2 reported it, so it is released.
-        s.record_close(&csid, "no-terminal");
+        s.record_close(&csid, CloseReason::NoTerminal);
         assert!(runner_restart_unreported_report(&s.get(&csid).unwrap(), 200).is_some());
         assert!(s.release_gate_identity(&csid, 200));
         let after = s.get(&csid).unwrap();
@@ -14493,14 +14633,14 @@ mod gate_continuation_tests {
         assert_eq!(s.get(&csid).unwrap().state, "open");
         assert_eq!(s.get(&csid).unwrap().gate_id, None);
         // And its next non-restorable close reports nothing a second time.
-        s.record_close(&csid, "no-terminal");
+        s.record_close(&csid, CloseReason::NoTerminal);
         assert!(runner_restart_unreported_report(&s.get(&csid).unwrap(), 200).is_none());
 
         // A prior-generation `poll-dead` gate is UNREPORTED: kept.
         let mut pd = gate_row(100);
         pd.claude_session_id = "pd".to_string();
         s.record_open(pd);
-        s.record_close("pd", "poll-dead");
+        s.record_close("pd", CloseReason::PollDead);
         assert!(!s.release_gate_identity("pd", 200));
         assert_eq!(s.get("pd").unwrap().gate_id.as_deref(), Some(GATE));
         // ...and after the door's gate-less reopen, D2 still reports it on the
@@ -14509,7 +14649,7 @@ mod gate_continuation_tests {
         reopen.claude_session_id = "pd".to_string();
         s.record_open(reopen);
         assert_eq!(s.get("pd").unwrap().gate_id.as_deref(), Some(GATE));
-        s.record_close("pd", "no-terminal");
+        s.record_close("pd", CloseReason::NoTerminal);
         assert!(runner_restart_unreported_report(&s.get("pd").unwrap(), 200).is_some());
 
         // A gate bound by THIS process is owned by its exit hook: released
@@ -14517,7 +14657,7 @@ mod gate_continuation_tests {
         let mut own = gate_row(200);
         own.claude_session_id = "own".to_string();
         s.record_open(own);
-        s.record_close("own", "poll-dead");
+        s.record_close("own", CloseReason::PollDead);
         assert!(s.release_gate_identity("own", 200));
         assert_eq!(s.get("own").unwrap().gate_id, None);
 
@@ -14526,7 +14666,7 @@ mod gate_continuation_tests {
         unstamped.claude_session_id = "unstamped".to_string();
         unstamped.gate_bound_boot_ms = None;
         s.record_open(unstamped);
-        s.record_close("unstamped", "no-terminal");
+        s.record_close("unstamped", CloseReason::NoTerminal);
         assert!(!s.release_gate_identity("unstamped", 200));
     }
 
@@ -14542,7 +14682,7 @@ mod gate_continuation_tests {
         s.mark_restored_from_boot(&csid, RESTORE_TIER_TERMINAL_ONLY);
         assert_eq!(s.adopt_restored_gate(&csid, 200), None);
         assert_eq!(s.get(&csid).unwrap().gate_bound_boot_ms, Some(100));
-        s.record_close(&csid, "terminal-only-idle");
+        s.record_close(&csid, CloseReason::TerminalOnlyIdle);
         let rec = s.get(&csid).unwrap();
         assert!(runner_restart_unreported_report(&rec, 200).is_some());
     }
@@ -14573,11 +14713,8 @@ mod gate_continuation_tests {
         // Every reason the dead-shell mapping can produce that the restore
         // pass will NOT pick up must be reportable, or a prior-generation
         // continuation closed under it stays `spawned` forever.
-        assert!(
-            NON_RESTORABLE_CLOSE_REASONS.contains(&close_reason_for_dead_shell(Some(
-                RESTORE_TIER_TERMINAL_ONLY
-            )))
-        );
+        assert!(NON_RESTORABLE_CLOSE_REASONS
+            .contains(&close_reason_for_dead_shell(Some(RESTORE_TIER_TERMINAL_ONLY)).as_str()));
         assert!(!NON_RESTORABLE_CLOSE_REASONS.contains(&"poll-dead"));
         assert!(!NON_RESTORABLE_CLOSE_REASONS.contains(&"pty-exit"));
     }

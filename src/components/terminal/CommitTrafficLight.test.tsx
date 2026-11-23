@@ -34,9 +34,7 @@ import {
   type CommitState,
 } from "./CommitTrafficLight";
 
-const baseState = (
-  overrides: Partial<CommitState> & Pick<CommitState, "status">,
-): CommitState => ({
+const baseState = (overrides: Partial<CommitState> & Pick<CommitState, "status">): CommitState => ({
   touched_count: 3,
   dirty_count: 1,
   repo_roots: ["D:/repo"],
@@ -134,21 +132,19 @@ describe("commit-button click dispatch", () => {
     ]);
   });
 
-  it.each([
-    ["clean" as const],
-    ["empty" as const],
-    ["merging" as const],
-    ["unknown" as const],
-  ])("disabled status %s → no IPC, no terminal write", async (status) => {
-    const writeSpy = vi.fn();
-    await simulateClick({
-      state: baseState({ status }),
-      isPtyTab: true,
-      onWriteToTerminal: writeSpy,
-    });
-    expect(writeSpy).not.toHaveBeenCalled();
-    expect(mockInvoke).not.toHaveBeenCalled();
-  });
+  it.each([["clean" as const], ["empty" as const], ["merging" as const], ["unknown" as const]])(
+    "disabled status %s → no IPC, no terminal write",
+    async (status) => {
+      const writeSpy = vi.fn();
+      await simulateClick({
+        state: baseState({ status }),
+        isPtyTab: true,
+        onWriteToTerminal: writeSpy,
+      });
+      expect(writeSpy).not.toHaveBeenCalled();
+      expect(mockInvoke).not.toHaveBeenCalled();
+    },
+  );
 
   it("undefined state → no IPC, no terminal write", async () => {
     const writeSpy = vi.fn();

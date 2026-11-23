@@ -257,9 +257,7 @@ describe("resolvePort", () => {
 
 describe("buildProbeUrl", () => {
   it("targets the runner's local file-registry endpoint", () => {
-    expect(buildProbeUrl(9876)).toBe(
-      "http://127.0.0.1:9876/file-registry/probe-conflicts",
-    );
+    expect(buildProbeUrl(9876)).toBe("http://127.0.0.1:9876/file-registry/probe-conflicts");
   });
 });
 
@@ -288,9 +286,7 @@ describe("predicted-collisions data derivation", () => {
         {
           file_path: "src/lib.rs",
           worktree_id: null,
-          other_holders: [
-            { task_run_id: "T1", holder_name: "session-A", registered_at: 1 },
-          ],
+          other_holders: [{ task_run_id: "T1", holder_name: "session-A", registered_at: 1 }],
           confidence: 1.0,
         },
       ],
@@ -583,11 +579,7 @@ describe("predicted-collisions render with confidence", () => {
         confidence: 0.3,
       },
     ];
-    expect(rows.map((r) => confidenceTier(r.confidence))).toEqual([
-      "match",
-      "likely",
-      "maybe",
-    ]);
+    expect(rows.map((r) => confidenceTier(r.confidence))).toEqual(["match", "likely", "maybe"]);
   });
 
   it("defaults missing confidence to maybe (back-compat for older runners)", () => {

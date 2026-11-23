@@ -199,7 +199,7 @@ mod tests {
         ));
 
         // A closed record is never written.
-        store.record_close("cas-1", "exited");
+        store.record_close("cas-1", crate::session::close_reason::CloseReason::PtyExit);
         assert!(matches!(
             store.update_identity_if_unchanged("cas-1", "term-1", Some(DIR_B), &dir_update(DIR_A)),
             IdentityCas::Stale

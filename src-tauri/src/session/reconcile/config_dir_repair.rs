@@ -759,6 +759,7 @@ mod tests {
             &ProcessSnapshot::default(),
             &index,
             &cmdlines,
+            &crate::session::reconcile::every_listed_pty_is_live(&[live("term-1", 777)]),
         );
         assert!(repair_config_dirs(&store, &snapshot, &rows, &AnchorArgvIds::none()).is_empty());
         assert_eq!(

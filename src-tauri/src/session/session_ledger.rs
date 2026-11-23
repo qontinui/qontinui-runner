@@ -80,6 +80,9 @@ use std::sync::{Mutex, OnceLock};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+use crate::session::awaiting_restore::{OwedRestores, PagesRestored, RestoreView};
+use crate::session::close_reason::CloseReason;
+use crate::session::ledger_aftermath::{AftermathInputs, AftermathView, Close};
 use crate::session::session_lifecycle_store::{SessionLifecycleStore, NAME_SOURCE_DERIVED};
 use crate::session::shutdown_marker::BootClassification;
 use crate::session::snapshot_history::{is_restorable_identity, TranscriptProbe};
@@ -101,14 +104,35 @@ pub const REASON_PRE_REBUILD: &str = "pre-rebuild";
 /// `session_ledger_capture`).
 pub const REASON_OPERATOR: &str = "operator";
 
-/// Outcome classes of one prior session in the report: it came back, it did
-/// not (unfinished), it was marked finished and is not expected back, or the
-/// operator has since closed it on purpose (its row is closed `user-close`
-/// NOW) and it is not expected back either.
+/// Outcome classes of one prior session in the report: it came back (by any
+/// path this boot observed, and it stays back when its row closes later), it
+/// did not (unfinished), it was marked finished and is not expected back, or
+/// it was closed ON PURPOSE at or after the capture without coming back
+/// (`closed-since`) and is not expected back either.
 pub const OUTCOME_BACK: &str = "back";
 pub const OUTCOME_MISSING: &str = "missing";
 pub const OUTCOME_FINISHED: &str = "finished";
-pub const OUTCOME_CLOSED_BY_USER: &str = "closed-by-user";
+pub const OUTCOME_CLOSED_SINCE: &str = "closed-since";
+
+/// The missing reason for a session whose row closed: `closed:<reason>`, the
+/// stored close reason verbatim. A `closed-since` outcome carries its
+/// deliberate one the same way.
+pub const MISSING_CLOSED_PREFIX: &str = "closed:";
+/// The missing reason for a session neither the registry nor any aftermath
+/// record still has: whether it came back is UNKNOWN.
+pub const MISSING_RECORD_GONE: &str = "record-gone";
+
+/// Why a verdict reads `unknown`. Every one that applies is served
+/// ([`LedgerReport::unknown_reasons`]), so one cannot hide another.
+pub const UNKNOWN_NO_PRIOR_LEDGER: &str = "no_prior_ledger";
+pub const UNKNOWN_LIFECYCLE_STORE_UNAVAILABLE: &str = "lifecycle_store_unavailable";
+/// The restore census or the live-terminal list could not be read, so "back
+/// now" could not be fully checked.
+pub const UNKNOWN_RESTORE_STAMPS_UNAVAILABLE: &str = "restore_stamps_unavailable";
+/// The newest poll tick could not read which sessions a live `claude` holds.
+pub const UNKNOWN_PROCESS_CENSUS_UNAVAILABLE: &str = "process_census_unavailable";
+/// A miss is [`MISSING_RECORD_GONE`].
+pub const UNKNOWN_RECORD_GONE: &str = "record_gone";
 
 /// Verdicts — deliberately the same vocabulary as
 /// [`crate::session::restore_census`], so an operator never has to learn two.
@@ -716,6 +740,25 @@ fn this_boot_generation() -> Option<&'static Path> {
     THIS_BOOT_GENERATION.get().and_then(|o| o.as_deref())
 }
 
+/// The file name of the generation this boot retained its prior ledger into
+/// (`None` before [`load_prior_once`], or when nothing was retained) — the
+/// file this boot's aftermath record names
+/// ([`crate::session::ledger_aftermath`]).
+pub(crate) fn this_boot_generation_file_name() -> Option<String> {
+    this_boot_generation()
+        .and_then(Path::file_name)
+        .map(|n| n.to_string_lossy().into_owned())
+}
+
+/// The file names of every generation file in `dir`, readable or not: the
+/// generations an aftermath record may name and still be retained.
+pub(crate) fn generation_file_names_in(dir: &Path) -> HashSet<String> {
+    generation_files_in(dir)
+        .into_iter()
+        .filter_map(|(_, p)| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .collect()
+}
+
 /// Retire the live ledger at `live` into a generation file stamped
 /// `rotated_at_ms`, then prune to the newest `keep`.
 ///
@@ -855,17 +898,40 @@ pub struct LedgerOutcome {
     /// determined, never collapsed into `false`.
     pub restorable: Option<bool>,
     /// FINISHED as of NOW when the registry still holds the row (so a
-    /// Finish/Unfinish shows on every generation at once), else as captured.
+    /// Finish/Unfinish shows on every generation at once), else as the
+    /// aftermath record last saw it, else as captured.
     pub finished: bool,
-    /// [`OUTCOME_BACK`] | [`OUTCOME_MISSING`] | [`OUTCOME_FINISHED`].
+    /// [`OUTCOME_BACK`] | [`OUTCOME_MISSING`] | [`OUTCOME_FINISHED`] |
+    /// [`OUTCOME_CLOSED_SINCE`].
     pub outcome: String,
     /// For a missing session: WHY it is missing.
+    /// `closed:<reason>` — its row closed, with that stored reason, and it was
+    /// never seen back;
+    /// `record-gone` — neither the registry nor any aftermath record still has
+    /// it, so whether it came back is UNKNOWN (and the verdict says so);
     /// `not-restorable` — it was never identity-restorable, so restore could
     /// not have brought its conversation back;
     /// `restorability-unknown` — we could not tell (no working dir to probe
     /// against), so its absence is NOT evidence either way;
     /// `no-attempt` — nothing came back and nothing tried.
+    /// For a `closed-since` session: `closed:<its deliberate reason>`.
     pub reason: Option<String>,
+    /// For a `back` session whose row closed after it came back: when, why,
+    /// and whether that close was deliberate. `None` for every other outcome.
+    pub later_closed: Option<LaterClosed>,
+    /// For every outcome that is NOT back: is a restore in THIS process still
+    /// owed to it ([`crate::session::awaiting_restore`], plan
+    /// `2026-11-11-since-restart-roster-counts-closed-sessions-as-missing`, D3)?
+    /// `Some(true)` while the live store's restore set holds it unfinished and
+    /// unclosed since this boot AND its page's restore has not run yet (a
+    /// restore may still bring it back: "waiting"); `Some(false)` when no
+    /// restore in this process will (it closed since the boot, finished, left
+    /// the restore set, or its page's restore ran without bringing it back);
+    /// `None` when that cannot be read (no lifecycle store, a boot not yet
+    /// classified, or a restore that ran with no window saying which pages it
+    /// covered), never collapsed into either. Always `None` on a `back`
+    /// outcome: the question is not asked of a session that came back.
+    pub restore_owed: Option<bool>,
     /// The directory a resume opens in ([`resume_dir_of`]) — the same one the
     /// copy line `cd`s into and the one-click resume launches in.
     pub resume_dir: Option<String>,
@@ -875,6 +941,34 @@ pub struct LedgerOutcome {
     /// The account a TYPED resume runs under — what the UI's one-click resume
     /// sets as `CLAUDE_CONFIG_DIR` (see [`ResumeAccount`]).
     pub resume_account: ResumeAccount,
+}
+
+/// How a session that came back after the restart was closed later (plan
+/// `2026-11-11-since-restart-roster-counts-closed-sessions-as-missing`, D4).
+/// It stays `back`: it did come back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaterClosed {
+    /// Unix millis of the close; `None` only for a closed row that recorded
+    /// none.
+    pub at_ms: Option<i64>,
+    /// The stored close reason, verbatim.
+    pub reason: String,
+    /// `Some(true)` when the typed close-reason set ([`CloseReason`])
+    /// classifies the reason as deliberate; `None` otherwise — never `false`:
+    /// a `pty-exit` from `DELETE /terminals/{id}` and one from a crash are the
+    /// same string, so the reason cannot say it was NOT deliberate.
+    pub deliberate: Option<bool>,
+}
+
+impl LaterClosed {
+    fn of(close: &Close) -> Self {
+        Self {
+            at_ms: close.at_ms,
+            reason: close.reason.clone(),
+            deliberate: CloseReason::is_deliberate_wire(&close.reason).then_some(true),
+        }
+    }
 }
 
 /// The account a typed `--resume` runs under, shared by every surface that
@@ -921,8 +1015,10 @@ pub fn resume_account_for(resolved: Option<&str>) -> ResumeAccount {
 
 /// A retained prior generation, diffed on its own against what is back now.
 ///
-/// Per-generation, never a union: the ledger records no user-close, so a union
-/// would resurrect sessions the operator closed in a later generation.
+/// Per-generation, never a union: each generation is read against its own
+/// aftermath record (the boot that observed it,
+/// [`crate::session::ledger_aftermath`]), so a union would mix what came back,
+/// closed and finished after different restarts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LedgerGeneration {
@@ -944,10 +1040,13 @@ pub struct LedgerGeneration {
     pub clean_shutdown: Option<bool>,
     pub session_count: usize,
     pub verdict: String,
+    /// Every reason that applies when [`Self::verdict`] is `unknown`; empty
+    /// otherwise.
+    pub unknown_reasons: Vec<String>,
     pub returned: Vec<LedgerOutcome>,
     pub missing: Vec<LedgerOutcome>,
     pub finished: Vec<LedgerOutcome>,
-    pub closed_by_user: Vec<LedgerOutcome>,
+    pub closed_since: Vec<LedgerOutcome>,
 }
 
 /// `GET /control/sessions/ledger` and the Tauri `session_ledger_report`.
@@ -956,15 +1055,21 @@ pub struct LedgerGeneration {
 pub struct LedgerReport {
     /// `ok` | `unavailable`.
     pub status: String,
-    /// REQUIRED whenever `status != "ok"` or the verdict is `unknown`.
+    /// REQUIRED whenever `status != "ok"` or the verdict is `unknown`: the
+    /// first of [`Self::unknown_reasons`].
     pub reason: Option<String>,
+    /// Every reason that applies when the verdict is `unknown` (or the status
+    /// is not `ok`), so one cannot hide another; empty otherwise.
+    pub unknown_reasons: Vec<String>,
     pub generated_at: i64,
     /// Metadata of the ledger being compared against.
     pub prior_captured_at: Option<String>,
     pub prior_reason: Option<String>,
     /// The prior boot's roster — the N in "rebuild with N sessions open".
     pub expected: Vec<LedgerEntry>,
-    /// Of those, the ones open (or restored) again now.
+    /// Of those, the ones that came back after the restart, by any path this
+    /// boot observed — including those closed since (see
+    /// [`LedgerOutcome::later_closed`]).
     pub returned: Vec<LedgerOutcome>,
     /// Of those, the UNFINISHED ones that did NOT come back — each with a
     /// resume line.
@@ -972,10 +1077,10 @@ pub struct LedgerReport {
     /// Of those, the FINISHED ones that did not come back — not expected back,
     /// never counted as missing.
     pub finished: Vec<LedgerOutcome>,
-    /// Of those, the unfinished ones the operator has since CLOSED on purpose
-    /// (their row is closed `user-close` now) — not expected back, never
-    /// counted as missing.
-    pub closed_by_user: Vec<LedgerOutcome>,
+    /// Of those, the unfinished ones CLOSED on purpose (a deliberate reason of
+    /// the typed close-reason set) at or after the capture, without coming
+    /// back — not expected back, never counted as missing.
+    pub closed_since: Vec<LedgerOutcome>,
     /// [`VERDICT_MATCH`] | [`VERDICT_PARTIAL`] | [`VERDICT_MISMATCH`] |
     /// [`VERDICT_UNKNOWN`].
     pub verdict: String,
@@ -1143,6 +1248,8 @@ fn outcome_of(
         finished,
         outcome: outcome.to_string(),
         reason: reason.map(str::to_string),
+        later_closed: None,
+        restore_owed: None,
         resume_dir: resume_dir_of(entry.working_dir.as_deref(), entry.worktree_path.as_deref())
             .map(|d| d.trim().replace('\\', "/")),
         resume_command: ledger_resume_command(entry),
@@ -1150,37 +1257,77 @@ fn outcome_of(
     }
 }
 
-/// The registry's CURRENT state per session, keyed by lowercased id — the
-/// overlays [`diff`] applies over a generation's capture-time view.
+/// The registry's CURRENT state per session, keyed by lowercased id.
+///
+/// While the registry holds a row it is the authority on that row's close and
+/// finish; once the row is pruned, the aftermath record is
+/// ([`crate::session::ledger_aftermath`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RegistryNow {
-    /// Finished as of now — overrides the captured flag both ways, so a
-    /// Finish/Unfinish shows on every generation at once.
+    /// Finished as of now, for every row the registry holds — overrides the
+    /// recorded and captured flags both ways, so a Finish/Unfinish shows on
+    /// every generation at once.
     pub finished: HashMap<String, bool>,
-    /// Sessions whose row is closed `user-close` NOW: the operator closed them
-    /// on purpose after the capture, so a generation must not offer them back
-    /// as missing.
-    ///
-    /// LIMIT: the overlay lasts only as long as the closed row is RETAINED —
-    /// `SessionLifecycleStore::prune` drops a closed row 24 h after it closed
-    /// (while its terminal is gone). The ledger itself records no user-close,
-    /// so after that a retained generation (kept for five restarts, of any
-    /// age) shows the session as `missing` again: an older generation can
-    /// offer back a session the operator closed more than a day ago.
-    pub closed_by_user: HashSet<String>,
+    /// The close of every session whose row is CLOSED now (the latest, when
+    /// case variants of one id carry several rows; none while any is open).
+    pub closed: HashMap<String, Close>,
+    /// `true` when this was read from a store, so an id it does not hold has
+    /// NO row now (pruned, or never written). `false` — the default, and the
+    /// report whose store is unavailable — means nothing was read: an absent
+    /// id is UNKNOWN, never "gone".
+    pub read: bool,
+}
+
+impl RegistryNow {
+    /// The registry holds a row for `id` (lowercased).
+    fn holds(&self, id: &str) -> bool {
+        self.finished.contains_key(id)
+    }
+
+    /// The registry was read and holds no row for `id` (lowercased).
+    fn gone(&self, id: &str) -> bool {
+        self.read && !self.holds(id)
+    }
 }
 
 /// [`RegistryNow`] from every registry row (open and closed).
 pub fn registry_now(store: &SessionLifecycleStore) -> RegistryNow {
-    let mut now = RegistryNow::default();
+    let mut now = RegistryNow {
+        read: true,
+        ..RegistryNow::default()
+    };
+    let mut open: HashSet<String> = HashSet::new();
     for r in store.all_records() {
         let id = r.claude_session_id.to_ascii_lowercase();
-        if r.state == "closed" && r.close_reason.as_deref() == Some("user-close") {
-            now.closed_by_user.insert(id.clone());
+        match Close::of_record(&r) {
+            None => {
+                open.insert(id.clone());
+            }
+            Some(close) => {
+                if now
+                    .closed
+                    .get(&id)
+                    .is_none_or(|cur| close.at_ms > cur.at_ms)
+                {
+                    now.closed.insert(id.clone(), close);
+                }
+            }
         }
-        now.finished.insert(id, r.finished_at.is_some());
+        *now.finished.entry(id).or_insert(false) |= r.finished_at.is_some();
     }
+    now.closed.retain(|id, _| !open.contains(id));
     now
+}
+
+/// Everything the report reads about what happened AFTER the capture: the
+/// registry as it stands now, the aftermath record of what this boot (and the
+/// boots before it) observed, and which sessions this process's restore still
+/// owes. The default reads nothing, so every `restoreOwed` is `null`.
+#[derive(Debug, Clone, Default)]
+pub struct AfterRestart {
+    pub registry: RegistryNow,
+    pub aftermath: AftermathInputs,
+    pub restore_owed: OwedRestores,
 }
 
 /// One generation's buckets and verdict.
@@ -1188,60 +1335,135 @@ struct Classified {
     returned: Vec<LedgerOutcome>,
     missing: Vec<LedgerOutcome>,
     finished: Vec<LedgerOutcome>,
-    closed_by_user: Vec<LedgerOutcome>,
+    closed_since: Vec<LedgerOutcome>,
     verdict: &'static str,
+    /// Every reason that applies when `verdict` is unknown.
+    unknown_reasons: Vec<&'static str>,
 }
 
-/// PURE classification of one prior ledger against the ids back this boot.
+/// `closed:<reason>` — see [`MISSING_CLOSED_PREFIX`].
+fn closed_reason(close: &Close) -> String {
+    format!("{MISSING_CLOSED_PREFIX}{}", close.reason)
+}
+
+/// PURE classification of one prior ledger against what this boot observed.
 ///
-/// Back wins (it came back, finished or not); otherwise a FINISHED session —
-/// as of now when the registry knows it, else as captured — is its own class
-/// and never `missing`; so is one the operator has closed on purpose since
-/// (`closed-by-user`); everything else is `missing` with a reason.
+/// **Back** — it came back, finished or not — when it is back NOW
+/// ([`observed_back`]), when the aftermath record covering this roster saw it
+/// come back (on its own pane, by this boot's restore stamp, or held by a live
+/// `claude`), or when a live `claude` held its id at the newest poll tick. A
+/// back session whose row closed after it came back carries
+/// [`LedgerOutcome::later_closed`].
+///
+/// **Not back**, in order: FINISHED (the registry now, else as recorded, else
+/// as captured) is `finished`; closed with a DELIBERATE reason at or after the
+/// capture is `closed-since`; anything else is `missing`, with reason
+/// `closed:<reason>` when its row closed, `record-gone` when neither the
+/// registry nor any record still has it, and otherwise `no-attempt` /
+/// `not-restorable` / `restorability-unknown`.
+///
+/// Every outcome that is not back carries `restore_owed`, read from `owed`
+/// (this process's restore set over the live store).
 fn classify(
     prior: &SessionLedger,
     back: &[String],
     now: &RegistryNow,
+    aftermath: &AftermathView<'_>,
+    owed: &OwedRestores,
     restore_stamps_available: bool,
 ) -> Classified {
-    let back_lower: Vec<String> = back.iter().map(|s| s.to_ascii_lowercase()).collect();
+    let back_now: HashSet<String> = back.iter().map(|s| s.to_ascii_lowercase()).collect();
     let mut returned = Vec::new();
     let mut missing = Vec::new();
     let mut finished = Vec::new();
-    let mut closed_by_user = Vec::new();
+    let mut closed_since = Vec::new();
     for e in &prior.sessions {
         let id = e.claude_session_id.to_ascii_lowercase();
-        let is_finished = now.finished.get(&id).copied().unwrap_or(e.finished);
-        if back_lower.contains(&id) {
-            returned.push(outcome_of(e, OUTCOME_BACK, None, is_finished));
-        } else if is_finished {
-            finished.push(outcome_of(e, OUTCOME_FINISHED, None, true));
-        } else if now.closed_by_user.contains(&id) {
-            closed_by_user.push(outcome_of(e, OUTCOME_CLOSED_BY_USER, None, false));
+        let recorded = aftermath.session(&id);
+        // The registry is the authority while it holds the row; the record is
+        // what is left once it does not.
+        let is_finished = now
+            .finished
+            .get(&id)
+            .copied()
+            .or_else(|| recorded.as_ref().map(|r| r.finished_at.is_some()))
+            .unwrap_or(e.finished);
+        let close = if now.holds(&id) {
+            now.closed.get(&id).cloned()
         } else {
-            // Two honest reasons, and no third: a session that was never
-            // identity-restorable is not a restore defect, and everything else
-            // is simply "nothing brought it back".
-            let reason = match e.restorable {
-                Some(true) => "no-attempt",
-                Some(false) => "not-restorable",
-                // Never "not-restorable": that sentence tells the operator the
-                // conversation could not have come back, which we do not know.
-                None => "restorability-unknown",
+            recorded.as_ref().and_then(|r| r.close.clone())
+        };
+        let came_back_at = recorded.as_ref().and_then(|r| r.came_back_at);
+        if back_now.contains(&id) || came_back_at.is_some() || aftermath.held_now(&id) {
+            let mut outcome = outcome_of(e, OUTCOME_BACK, None, is_finished);
+            // A close that preceded the return is not a LATER close.
+            outcome.later_closed = close
+                .filter(|c| match (came_back_at, c.at_ms) {
+                    (Some(back_at), Some(closed_at)) => closed_at >= back_at,
+                    _ => true,
+                })
+                .map(|c| LaterClosed::of(&c));
+            returned.push(outcome);
+            continue;
+        }
+        let not_back = |outcome: &str, reason: Option<&str>, finished: bool| LedgerOutcome {
+            restore_owed: owed.of(&id),
+            ..outcome_of(e, outcome, reason, finished)
+        };
+        if is_finished {
+            finished.push(not_back(OUTCOME_FINISHED, None, true));
+        } else if let Some(c) = close
+            .as_ref()
+            .filter(|c| c.is_deliberate() && c.at_ms.is_some_and(|at| at >= prior.captured_at_ms))
+        {
+            closed_since.push(not_back(
+                OUTCOME_CLOSED_SINCE,
+                Some(&closed_reason(c)),
+                false,
+            ));
+        } else {
+            let reason = match &close {
+                Some(c) => closed_reason(c),
+                None if now.gone(&id) && recorded.is_none() => MISSING_RECORD_GONE.to_string(),
+                // Two honest reasons, and no third: a session that was never
+                // identity-restorable is not a restore defect, and everything
+                // else is simply "nothing brought it back".
+                None => match e.restorable {
+                    Some(true) => "no-attempt",
+                    Some(false) => "not-restorable",
+                    // Never "not-restorable": that sentence tells the operator
+                    // the conversation could not have come back, which we do
+                    // not know.
+                    None => "restorability-unknown",
+                }
+                .to_string(),
             };
-            missing.push(outcome_of(e, OUTCOME_MISSING, Some(reason), false));
+            missing.push(not_back(OUTCOME_MISSING, Some(&reason), false));
         }
     }
 
     // An input we could not read must not be laundered into a confident miss
-    // count. `observed_back` skips the sticky-restore-stamp arm when this boot
-    // never latched a census, so a session that came back and was then closed
-    // lands in `missing` — through no fault of the rebuild.
+    // count: each one that leaves a miss unverifiable is served, all of them.
     //
     // An empty prior (or one whose every session is finished) is a real
     // `match` — only stateable because a ledger EXISTS saying so, which is the
     // difference from the `no_prior_ledger` arm of [`diff`].
-    let verdict = if !restore_stamps_available && !missing.is_empty() {
+    let mut unknown_reasons = Vec::new();
+    if !missing.is_empty() {
+        if !restore_stamps_available {
+            unknown_reasons.push(UNKNOWN_RESTORE_STAMPS_UNAVAILABLE);
+        }
+        if aftermath.process_unknown() {
+            unknown_reasons.push(UNKNOWN_PROCESS_CENSUS_UNAVAILABLE);
+        }
+        if missing
+            .iter()
+            .any(|m| m.reason.as_deref() == Some(MISSING_RECORD_GONE))
+        {
+            unknown_reasons.push(UNKNOWN_RECORD_GONE);
+        }
+    }
+    let verdict = if !unknown_reasons.is_empty() {
         VERDICT_UNKNOWN
     } else if missing.is_empty() {
         VERDICT_MATCH
@@ -1254,20 +1476,43 @@ fn classify(
         returned,
         missing,
         finished,
-        closed_by_user,
+        closed_since,
         verdict,
+        unknown_reasons,
     }
 }
 
-/// PURE diff: the prior ledger vs the ids observed back this boot.
+/// The note's caveat for one unknown reason.
+fn unknown_caveat(reason: &str, record_gone: usize) -> String {
+    match reason {
+        UNKNOWN_RESTORE_STAMPS_UNAVAILABLE => " CAVEAT: this boot's restore census or its \
+            live-terminal list could not be read, so a session that came back by a path the \
+            aftermath record did not observe cannot be told from one that never returned. The \
+            miss count is an UPPER BOUND, which is why the verdict reads `unknown`."
+            .to_string(),
+        UNKNOWN_PROCESS_CENSUS_UNAVAILABLE => " CAVEAT: the newest liveness-poll tick could not \
+            read which sessions a live claude holds (the read failed, has not run yet this boot, \
+            or is more than two tick intervals old), so a session running outside its recorded \
+            pane cannot be told from one that never returned. The miss count is an UPPER BOUND."
+            .to_string(),
+        UNKNOWN_RECORD_GONE => format!(
+            " CAVEAT: {record_gone} of the misses have no registry row and no aftermath record \
+             left, so whether they came back is UNKNOWN. The miss count is an UPPER BOUND."
+        ),
+        _ => String::new(),
+    }
+}
+
+/// PURE diff: the prior ledger vs what this boot observed after it.
 ///
 /// Split from the route so the verdict and the resume lines are testable
 /// without a store, a disk or a rebuild. `generations` is left empty; the
-/// [`report`] builder fills it.
+/// [`report`] builder fills it. The prior is THIS boot's, so it is read
+/// against this boot's aftermath record.
 pub fn diff(
     prior: Option<&SessionLedger>,
     back: &[String],
-    now: &RegistryNow,
+    now: &AfterRestart,
     current: SessionLedger,
     restore_stamps_available: bool,
 ) -> LedgerReport {
@@ -1278,7 +1523,8 @@ pub fn diff(
         // `verification-and-evidence` `silent-empty-is-unknown`.
         return LedgerReport {
             status: "unavailable".to_string(),
-            reason: Some("no_prior_ledger".to_string()),
+            reason: Some(UNKNOWN_NO_PRIOR_LEDGER.to_string()),
+            unknown_reasons: vec![UNKNOWN_NO_PRIOR_LEDGER.to_string()],
             generated_at,
             prior_captured_at: None,
             prior_reason: None,
@@ -1286,7 +1532,7 @@ pub fn diff(
             returned: Vec::new(),
             missing: Vec::new(),
             finished: Vec::new(),
-            closed_by_user: Vec::new(),
+            closed_since: Vec::new(),
             verdict: VERDICT_UNKNOWN.to_string(),
             note: "No ledger from a previous boot is on disk, so this runner cannot state \
                    what was open before it started. That is UNKNOWN, not 'nothing was \
@@ -1304,9 +1550,17 @@ pub fn diff(
         returned,
         missing,
         finished,
-        closed_by_user,
+        closed_since,
         verdict,
-    } = classify(prior, back, now, restore_stamps_available);
+        unknown_reasons,
+    } = classify(
+        prior,
+        back,
+        &now.registry,
+        &now.aftermath.this_boot_view(),
+        &now.restore_owed,
+        restore_stamps_available,
+    );
 
     let unresumable = missing
         .iter()
@@ -1316,34 +1570,59 @@ pub fn diff(
         .iter()
         .filter(|m| m.wip_state.is_some() || m.worktree_path.is_some())
         .count();
+    let later_closed = returned.iter().filter(|o| o.later_closed.is_some()).count();
+    let record_gone = missing
+        .iter()
+        .filter(|m| m.reason.as_deref() == Some(MISSING_RECORD_GONE))
+        .count();
+    // Of the misses: how many a restore in THIS process still owes (D3), how
+    // many it will not restore, and how many could not be told. The three sum
+    // to the misses; an unreadable one is named rather than folded into
+    // either side.
+    let owed = missing
+        .iter()
+        .filter(|m| m.restore_owed == Some(true))
+        .count();
+    let lost = missing
+        .iter()
+        .filter(|m| m.restore_owed == Some(false))
+        .count();
+    let owed_unread = missing.len() - owed - lost;
+    let unread_clause = if owed_unread == 0 {
+        String::new()
+    } else {
+        format!(", and for {owed_unread} that could not be read")
+    };
     // The headline counts only the sessions EXPECTED back — the same "N of M"
     // the strip shows. Finished and closed-on-purpose sessions are not
     // expected, so they are named separately rather than inflating M.
     let mut note = format!(
-        "{} of {} sessions open before the last shutdown came back. {} did not; {} of those \
-         name a worktree that may hold uncommitted work, and {} could not be given a resume \
-         line because the account root they ran under is unknown (a --resume under the wrong \
-         CLAUDE_CONFIG_DIR fails as though the session never existed). {} more were marked \
-         finished and {} were closed by the operator since; neither is expected back.",
+        "{} of {} sessions open before the last shutdown came back ({} later closed); {} did \
+         not — {} still owed a restore by this boot, {} will not be restored by it{}; {} of \
+         those name a worktree that may hold uncommitted work, and {} could not be given a \
+         resume line because the account root they ran under is unknown (a --resume under the \
+         wrong CLAUDE_CONFIG_DIR fails as though the session never existed); {} finished and {} \
+         closed since the restart without coming back are not expected back.",
         returned.len(),
         returned.len() + missing.len(),
+        later_closed,
         missing.len(),
+        owed,
+        lost,
+        unread_clause,
         with_wip,
         unresumable,
         finished.len(),
-        closed_by_user.len()
+        closed_since.len()
     );
-    if !restore_stamps_available {
-        note.push_str(
-            " CAVEAT: this boot never latched a restore census, so a session that came back \
-             and was then CLOSED cannot be distinguished from one that never returned. The \
-             miss count is an UPPER BOUND, which is why the verdict reads `unknown`.",
-        );
+    for reason in &unknown_reasons {
+        note.push_str(&unknown_caveat(reason, record_gone));
     }
 
     LedgerReport {
         status: "ok".to_string(),
-        reason: (verdict == VERDICT_UNKNOWN).then(|| "restore_stamps_unavailable".to_string()),
+        reason: unknown_reasons.first().map(|r| r.to_string()),
+        unknown_reasons: unknown_reasons.iter().map(|r| r.to_string()).collect(),
         generated_at,
         prior_captured_at: Some(prior.captured_at.clone()),
         prior_reason: Some(prior.reason.clone()),
@@ -1351,7 +1630,7 @@ pub fn diff(
         returned,
         missing,
         finished,
-        closed_by_user,
+        closed_since,
         verdict: verdict.to_string(),
         note,
         current,
@@ -1374,7 +1653,7 @@ pub fn generation_reports(
     stored: &[StoredGeneration],
     this_boot: Option<&Path>,
     back: &[String],
-    now: &RegistryNow,
+    now: &AfterRestart,
     restore_stamps_available: bool,
 ) -> Vec<LedgerGeneration> {
     let is_this_boot = |g: &StoredGeneration| this_boot.is_some_and(|p| g.path == p);
@@ -1382,49 +1661,57 @@ pub fn generation_reports(
         .iter()
         .filter(|g| is_this_boot(g))
         .chain(stored.iter().filter(|g| !is_this_boot(g)))
-        .map(|g| {
-            let mut r = generation_report(g, back, now, restore_stamps_available);
-            r.this_boot = is_this_boot(g);
-            r
-        })
+        .map(|g| generation_report(g, is_this_boot(g), back, now, restore_stamps_available))
         .collect()
 }
 
-/// One retained generation's own diff (`this_boot` unset — see
-/// [`generation_reports`]).
+/// One retained generation's own diff, read against the aftermath record that
+/// covers it: this boot's record when it is the generation `this_boot` retained,
+/// otherwise the earlier boots' records naming its file.
 pub fn generation_report(
     generation: &StoredGeneration,
+    this_boot: bool,
     back: &[String],
-    now: &RegistryNow,
+    now: &AfterRestart,
     restore_stamps_available: bool,
 ) -> LedgerGeneration {
     let led = &generation.ledger;
+    let file = generation
+        .path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let Classified {
         returned,
         missing,
         finished,
-        closed_by_user,
+        closed_since,
         verdict,
-    } = classify(led, back, now, restore_stamps_available);
+        unknown_reasons,
+    } = classify(
+        led,
+        back,
+        &now.registry,
+        &now.aftermath.generation_view(&file, this_boot),
+        &now.restore_owed,
+        restore_stamps_available,
+    );
     LedgerGeneration {
-        file: generation
-            .path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default(),
+        file,
         rotated_at_ms: generation.rotated_at_ms,
         boot_at_ms: led.boot_at_ms,
-        this_boot: false,
+        this_boot,
         captured_at_ms: led.captured_at_ms,
         captured_at: led.captured_at.clone(),
         reason: led.reason.clone(),
         clean_shutdown: led.clean_shutdown,
         session_count: led.sessions.len(),
         verdict: verdict.to_string(),
+        unknown_reasons: unknown_reasons.iter().map(|r| r.to_string()).collect(),
         returned,
         missing,
         finished,
-        closed_by_user,
+        closed_since,
     }
 }
 
@@ -1440,6 +1727,11 @@ pub fn generation_report(
 /// [`observed_back`]). `None` when the terminal manager is not available: open
 /// rows then cannot be confirmed back, and the verdict says `unknown` rather
 /// than pretending.
+///
+/// What came back by any other path, and what closed and finished after it
+/// did, is read from this process's aftermath record
+/// ([`crate::session::ledger_aftermath::process`]); before that record is
+/// opened, its process evidence is UNKNOWN.
 ///
 /// Read-only apart from latching (and, on a process's first call, rotating)
 /// the prior ledger — see [`load_prior_once`].
@@ -1457,6 +1749,9 @@ pub fn report(
     // run.
     let prior = load_prior_once();
     let stored = generations();
+    let aftermath = crate::session::ledger_aftermath::process()
+        .map(|a| a.inputs(now))
+        .unwrap_or_default();
 
     let Some(store) = store else {
         warn!(
@@ -1473,37 +1768,57 @@ pub fn report(
             clean_shutdown: boot.map(|b| !b.crash_recovery),
             sessions: Vec::new(),
         };
-        let none = RegistryNow::default();
-        let mut report = diff(prior, &[], &none, empty, false);
+        // Nothing was read from the registry: an absent row is UNKNOWN here,
+        // never "gone". Nor from the restore set: every `restoreOwed` is null.
+        let unread = AfterRestart {
+            registry: RegistryNow::default(),
+            aftermath,
+            restore_owed: OwedRestores::read(
+                None,
+                &RestoreView::current(),
+                &PagesRestored::current(),
+            ),
+        };
+        let mut report = diff(prior, &[], &unread, empty, false);
         report.status = "unavailable".to_string();
-        report.reason = Some("lifecycle_store_unavailable".to_string());
+        report
+            .unknown_reasons
+            .insert(0, UNKNOWN_LIFECYCLE_STORE_UNAVAILABLE.to_string());
+        report.reason = Some(UNKNOWN_LIFECYCLE_STORE_UNAVAILABLE.to_string());
         report.verdict = VERDICT_UNKNOWN.to_string();
-        report.generations = generation_reports(&stored, this_boot_generation(), &[], &none, false);
+        report.generations =
+            generation_reports(&stored, this_boot_generation(), &[], &unread, false);
         return report;
     };
 
     let index = DiskTranscriptIndex::discover();
     let current = capture(store, &index, "read", now, boot);
-    // "Came back" = open now, UNION anything stamped restored by THIS boot —
-    // a session that returned and was then closed did in fact return.
-    // `None` when the boot census never latched — see `observed_back`: an
-    // absent boot instant SKIPS the sticky-restore-stamp arm rather than
-    // admitting it with a `0` floor, and that is reported (verdict `unknown`
-    // on any miss), not laundered into a miss count.
+    // "Came back" NOW = open on a live pane, UNION anything stamped restored by
+    // THIS boot. `None` when the boot census never latched — see
+    // `observed_back`: an absent boot instant SKIPS the sticky-restore-stamp
+    // arm rather than admitting it with a `0` floor, and that is reported
+    // (verdict `unknown` on any miss), not laundered into a miss count. What
+    // came back by any other path is the aftermath record's.
     let boot_at = crate::session::restore_census::latched().map(|c| c.boot_at_ms);
     let back = observed_back(store, boot_at, live_terminal_ids);
-    let now_state = registry_now(store);
+    let after = AfterRestart {
+        registry: registry_now(store),
+        aftermath,
+        // The same restore set, under the same boot classification, that
+        // `terminal_session_list_open` and page placement read (D3), less the
+        // rows whose page's restore has already run.
+        restore_owed: OwedRestores::read(
+            Some(store),
+            &RestoreView::current(),
+            &PagesRestored::current(),
+        ),
+    };
     // Both inputs `back` rests on must be readable for a miss count to be a
     // claim rather than an upper bound.
     let observable = boot_at.is_some() && live_terminal_ids.is_some();
-    let mut report = diff(prior, &back, &now_state, current, observable);
-    report.generations = generation_reports(
-        &stored,
-        this_boot_generation(),
-        &back,
-        &now_state,
-        observable,
-    );
+    let mut report = diff(prior, &back, &after, current, observable);
+    report.generations =
+        generation_reports(&stored, this_boot_generation(), &back, &after, observable);
     let saved = saved_by_this_process(&ledger_path(), process_boot_ms());
     report.saved_at_ms = saved.as_ref().map(|l| l.captured_at_ms);
     report.saved_matches_current = saved
@@ -1583,7 +1898,9 @@ pub fn capture_now(store: &SessionLifecycleStore, reason: &str) -> LedgerCapture
 
 /// Every session id observed BACK this boot: a row bound to a terminal that is
 /// ALIVE in this process now, plus anything carrying a restore stamp from this
-/// boot.
+/// boot. This is the "back now" arm; [`classify`] also counts what the
+/// aftermath record saw come back by any other path, after its row closed or
+/// was pruned ([`crate::session::ledger_aftermath`]).
 ///
 /// The stamp arm matters — a session that came back and was then closed by the
 /// operator DID come back, and counting only live rows would report a
@@ -1595,8 +1912,12 @@ pub fn capture_now(store: &SessionLifecycleStore, reason: &str) -> LedgerCapture
 /// previous process `open`, so "open" counted the whole cohort back and hid
 /// exactly the rows the boot restore did NOT bring back — a `needs-account`
 /// row waiting for its account, a skipped one, one on a page not opened yet.
-/// Only a live terminal binding (`live_terminal_ids`) or this boot's restore
-/// stamp is evidence that it returned.
+/// Only a live terminal binding (`live_terminal_ids`) or this boot's LANDED
+/// restore stamp is evidence that it returned. The stamp alone is written when
+/// the resume is ATTEMPTED, so it counts only once the restore landed
+/// ([`crate::session::session_lifecycle_store::boot_restore_landed`]) — the
+/// same rule the aftermath record latches by, so the two arms the
+/// classification unions never disagree about one session.
 pub fn observed_back(
     store: &SessionLifecycleStore,
     boot_at_ms: Option<i64>,
@@ -1614,8 +1935,9 @@ pub fn observed_back(
         .filter(|r| {
             let live_bound = r.state == "open"
                 && live_terminal_ids.is_some_and(|live| live.contains(&r.terminal_id));
-            let restored_this_boot =
-                boot_at_ms.is_some_and(|boot| r.restored_from_boot_at.is_some_and(|at| at >= boot));
+            let restored_this_boot = boot_at_ms
+                .is_some_and(|boot| r.restored_from_boot_at.is_some_and(|at| at >= boot))
+                && crate::session::session_lifecycle_store::boot_restore_landed(r);
             live_bound || restored_this_boot
         })
         .map(|r| r.claude_session_id)
@@ -1629,8 +1951,19 @@ pub fn observed_back(
 mod tests {
     use super::*;
 
-    fn none() -> RegistryNow {
-        RegistryNow::default()
+    /// Nothing observed after the restart: no registry read, no aftermath
+    /// record, and a poll tick that needed no process read — so a miss is a
+    /// claim, as the tests below assume unless they say otherwise. No restore
+    /// set was read either, so every `restoreOwed` is null.
+    fn none() -> AfterRestart {
+        AfterRestart {
+            registry: RegistryNow::default(),
+            aftermath: AftermathInputs {
+                process: crate::session::ledger_aftermath::ProcessEvidence::NotNeeded,
+                ..AftermathInputs::default()
+            },
+            restore_owed: OwedRestores::default(),
+        }
     }
 
     fn entry(id: &str, restorable: Option<bool>, config: Option<&str>) -> LedgerEntry {
@@ -1798,6 +2131,27 @@ mod tests {
         assert_eq!(report.returned.len(), 1);
         assert!(report.missing.is_empty());
         assert_eq!(report.verdict, VERDICT_MATCH);
+    }
+
+    /// With no restore set read (no lifecycle store: [`report`]'s unavailable
+    /// arm reads [`OwedRestores`] from `None`), a miss's `restoreOwed` is
+    /// `null`, and the note says it could not be read instead of counting it
+    /// owed or lost. Mutation: `OwedRestores::of` answering `false` for an
+    /// unread set.
+    #[test]
+    fn with_no_restore_set_read_a_miss_is_neither_owed_nor_lost() {
+        let prior = ledger(vec![entry("gone", Some(true), Some("C:/claude/.claude-x"))]);
+        let report = diff(Some(&prior), &[], &none(), ledger(Vec::new()), true);
+        assert_eq!(report.missing.len(), 1);
+        assert_eq!(report.missing[0].restore_owed, None);
+        assert!(
+            report.note.contains(
+                "1 did not — 0 still owed a restore by this boot, 0 will not be restored by it, \
+                 and for 1 that could not be read;"
+            ),
+            "{}",
+            report.note
+        );
     }
 
     /// An UNPROBEABLE record must not be told its conversation could not have
@@ -2076,7 +2430,9 @@ mod tests {
         assert_eq!(report.returned[0].outcome, OUTCOME_BACK);
         assert_eq!(report.verdict, VERDICT_MATCH);
         assert!(
-            report.note.contains("1 more were marked finished"),
+            report
+                .note
+                .contains("1 finished and 0 closed since the restart without coming back"),
             "{}",
             report.note
         );
@@ -2084,53 +2440,6 @@ mod tests {
         // "1 of 1", never "1 of 2".
         assert!(
             report.note.starts_with("1 of 1 sessions"),
-            "{}",
-            report.note
-        );
-    }
-
-    /// A session the operator CLOSED on purpose after the capture (its row is
-    /// `user-close` now) is its own class: not missing, not counted in the
-    /// headline, and a session that came back and was then closed is still
-    /// `back`.
-    #[test]
-    fn a_session_closed_by_the_user_since_is_not_reported_missing() {
-        let prior = ledger(vec![
-            entry("kept", Some(true), Some("C:/claude/.claude-x")),
-            entry("closed-on-purpose", Some(true), Some("C:/claude/.claude-x")),
-            entry("back-then-closed", Some(true), Some("C:/claude/.claude-x")),
-            entry("lost", Some(true), Some("C:/claude/.claude-x")),
-        ]);
-        let mut now = RegistryNow::default();
-        now.closed_by_user.insert("closed-on-purpose".to_string());
-        now.closed_by_user.insert("back-then-closed".to_string());
-        let report = diff(
-            Some(&prior),
-            &["kept".to_string(), "back-then-closed".to_string()],
-            &now,
-            ledger(Vec::new()),
-            true,
-        );
-        let ids = |v: &[LedgerOutcome]| -> Vec<String> {
-            v.iter().map(|o| o.claude_session_id.clone()).collect()
-        };
-        assert_eq!(
-            ids(&report.closed_by_user),
-            vec!["closed-on-purpose".to_string()]
-        );
-        assert_eq!(report.closed_by_user[0].outcome, OUTCOME_CLOSED_BY_USER);
-        assert_eq!(ids(&report.missing), vec!["lost".to_string()]);
-        assert_eq!(
-            ids(&report.returned),
-            vec!["kept".to_string(), "back-then-closed".to_string()]
-        );
-        assert!(
-            report.note.starts_with("2 of 3 sessions"),
-            "{}",
-            report.note
-        );
-        assert!(
-            report.note.contains("1 were closed by the operator"),
             "{}",
             report.note
         );
@@ -2174,9 +2483,9 @@ mod tests {
             entry("now-done", Some(true), Some("C:/claude/.claude-x")),
             was_done,
         ]);
-        let mut now = RegistryNow::default();
-        now.finished.insert("now-done".to_string(), true);
-        now.finished.insert("was-done".to_string(), false);
+        let mut now = none();
+        now.registry.finished.insert("now-done".to_string(), true);
+        now.registry.finished.insert("was-done".to_string(), false);
         let report = diff(Some(&prior), &[], &now, ledger(Vec::new()), true);
         let ids = |v: &[LedgerOutcome]| -> Vec<String> {
             v.iter().map(|o| o.claude_session_id.clone()).collect()
@@ -2185,6 +2494,156 @@ mod tests {
         assert_eq!(ids(&report.missing), vec!["was-done".to_string()]);
         assert_eq!(report.missing[0].outcome, OUTCOME_MISSING);
         assert!(!report.missing[0].finished);
+    }
+
+    // --- plan 2026-11-11-since-restart-roster-counts-closed-sessions-as-missing, Phase 3
+
+    fn ids_of(v: &[LedgerOutcome]) -> Vec<&str> {
+        v.iter().map(|o| o.claude_session_id.as_str()).collect()
+    }
+
+    /// A registry view in which every id in `rows` has a row, closed with
+    /// `reason` at the given instant when one is given.
+    fn registry_with(rows: &[(&str, Option<(i64, &str)>)]) -> AfterRestart {
+        let mut now = none();
+        now.registry.read = true;
+        for (id, close) in rows {
+            now.registry.finished.insert(id.to_string(), false);
+            if let Some((at, reason)) = close {
+                now.registry.closed.insert(
+                    id.to_string(),
+                    Close {
+                        at_ms: Some(*at),
+                        reason: reason.to_string(),
+                    },
+                );
+            }
+        }
+        now
+    }
+
+    /// `closed-since` is a deliberate close AT OR AFTER the capture (1 000
+    /// here); one before it is a miss that names its close. Mutation: the
+    /// capture-time comparison's `>=` made `>` (the boundary).
+    #[test]
+    fn a_deliberate_close_before_the_capture_is_not_closed_since() {
+        let prior = ledger(vec![
+            entry("before", Some(true), Some("C:/claude/.claude-x")),
+            entry("at", Some(true), Some("C:/claude/.claude-x")),
+            entry("after", Some(true), Some("C:/claude/.claude-x")),
+        ]);
+        let now = registry_with(&[
+            ("before", Some((999, "explicit"))),
+            ("at", Some((1_000, "explicit"))),
+            ("after", Some((1_001, "explicit"))),
+        ]);
+        let report = diff(Some(&prior), &[], &now, ledger(Vec::new()), true);
+        assert_eq!(ids_of(&report.closed_since), vec!["at", "after"]);
+        assert_eq!(ids_of(&report.missing), vec!["before"]);
+        assert_eq!(report.missing[0].reason.as_deref(), Some("closed:explicit"));
+        assert_eq!(
+            report.closed_since[0].reason.as_deref(),
+            Some("closed:explicit")
+        );
+    }
+
+    /// A session marked finished and also closed on purpose is `finished`:
+    /// finished outranks closed-since. Mutation: the finished arm skipped for a
+    /// closed row (so closed-since would outrank it).
+    #[test]
+    fn finished_outranks_closed_since() {
+        let prior = ledger(vec![
+            entry("done", Some(true), Some("C:/claude/.claude-x")),
+            entry("closed", Some(true), Some("C:/claude/.claude-x")),
+        ]);
+        let mut now = registry_with(&[
+            ("done", Some((2_000, "explicit"))),
+            ("closed", Some((2_000, "explicit"))),
+        ]);
+        now.registry.finished.insert("done".to_string(), true);
+        let report = diff(Some(&prior), &[], &now, ledger(Vec::new()), true);
+        assert_eq!(ids_of(&report.finished), vec!["done"]);
+        assert_eq!(ids_of(&report.closed_since), vec!["closed"]);
+        assert!(report.missing.is_empty());
+        assert_eq!(report.verdict, VERDICT_MATCH);
+    }
+
+    /// Each generation reads the aftermath record that covers it: this boot's
+    /// generation this boot's record ALONE (an earlier boot that named the
+    /// same file, an unchanged roster, observed another restart), an older
+    /// generation the earlier records naming its file; and the newest tick's
+    /// process evidence applies to every one. Mutation: `generation_view`
+    /// ignoring `this_boot`.
+    #[test]
+    fn each_generation_reads_the_aftermath_record_that_covers_it() {
+        use crate::session::ledger_aftermath::{
+            AftermathRecord, CameBackBy, ProcessEvidence, SessionAftermath, AFTERMATH_VERSION,
+        };
+        let record = |boot_ms: i64, file: &str, ids: &[&str]| AftermathRecord {
+            aftermath_version: AFTERMATH_VERSION,
+            boot_ms,
+            generation_file: Some(file.to_string()),
+            sessions: ids
+                .iter()
+                .map(|id| {
+                    (
+                        id.to_string(),
+                        SessionAftermath {
+                            came_back_at: Some(boot_ms + 1),
+                            came_back_by: Some(CameBackBy::Bound),
+                            ..SessionAftermath::default()
+                        },
+                    )
+                })
+                .collect(),
+        };
+        let generation = |file: &str, ids: &[&str]| StoredGeneration {
+            path: PathBuf::from(file),
+            rotated_at_ms: 1,
+            ledger: ledger(
+                ids.iter()
+                    .map(|id| entry(id, Some(true), Some("C:/claude/.claude-x")))
+                    .collect(),
+            ),
+        };
+        let now_file = "session-ledger.2.json";
+        let old_file = "session-ledger.1.json";
+        let mut now = registry_with(&[]);
+        now.aftermath = AftermathInputs {
+            this_boot: Some(record(300, now_file, &[])),
+            earlier: std::sync::Arc::new(vec![
+                record(200, now_file, &["s"]),
+                record(100, old_file, &["s"]),
+            ]),
+            process: ProcessEvidence::Held(["t".to_string()].into_iter().collect()),
+        };
+
+        let gens = generation_reports(
+            &[
+                generation(now_file, &["s", "t"]),
+                generation(old_file, &["s", "t"]),
+            ],
+            Some(Path::new(now_file)),
+            &[],
+            &now,
+            true,
+        );
+
+        assert!(gens[0].this_boot);
+        assert_eq!(ids_of(&gens[0].returned), vec!["t"], "held now");
+        assert_eq!(ids_of(&gens[0].missing), vec!["s"]);
+        assert_eq!(
+            gens[0].missing[0].reason.as_deref(),
+            Some(MISSING_RECORD_GONE),
+            "this boot's record does not have it, and the registry no longer does"
+        );
+        assert_eq!(
+            gens[0].unknown_reasons,
+            vec![UNKNOWN_RECORD_GONE.to_string()]
+        );
+        assert!(!gens[1].this_boot);
+        assert_eq!(ids_of(&gens[1].returned), vec!["s", "t"]);
+        assert_eq!(gens[1].verdict, VERDICT_MATCH);
     }
 
     /// Every outcome carries the account and naming fields the picker needs —
@@ -2448,7 +2907,7 @@ mod tests {
             rotated_at_ms: 2_000,
             ledger: older,
         };
-        let r = generation_report(&g, &["a".to_string()], &none(), true);
+        let r = generation_report(&g, false, &["a".to_string()], &none(), true);
         assert_eq!(r.file, "session-ledger.2000.json");
         assert_eq!(r.rotated_at_ms, 2_000);
         assert_eq!(r.boot_at_ms, Some(10));
@@ -2542,7 +3001,7 @@ mod tests {
             .set_finished("g3", true, None)
             .expect("a known session");
         for id in ["g1", "g2", "g3"] {
-            store.record_close(id, "pty-exit");
+            store.record_close(id, crate::session::close_reason::CloseReason::PtyExit);
         }
         assert!(store.open_records().is_empty());
 
@@ -2688,6 +3147,35 @@ mod tests {
         );
     }
 
+    /// A boot restore that was only ATTEMPTED is not back. The store's own
+    /// writers stamp the rows: `mark_restore_pending(boot = true)` stamps
+    /// `restored_from_boot_at` with tier `failed` before the resume is typed;
+    /// `clear_restore_pending` (the verified handshake) promotes it to
+    /// `resumed`; a close demotes an unconfirmed `failed`. Only the landed one
+    /// reads back — the same rule the aftermath record latches by, so the two
+    /// arms `classify` unions agree before and after the row is pruned.
+    ///
+    /// Mutation: `boot_restore_landed` dropped from the stamp arm (any stamp
+    /// from this boot reads back, the pre-review behaviour).
+    #[test]
+    fn a_boot_restore_stamp_reads_back_only_once_the_restore_landed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        let boot = chrono::Utc::now().timestamp_millis() - 60_000;
+        for id in ["landed", "in-flight", "died"] {
+            store.record_open(store_rec(id));
+            store.mark_restore_pending(id, true);
+        }
+        store.clear_restore_pending("landed");
+        store.record_close("died", crate::session::close_reason::CloseReason::PtyExit);
+
+        // No live view, so only the stamp arm can call a row back.
+        assert_eq!(
+            observed_back(&store, Some(boot), None),
+            vec!["landed".to_string()]
+        );
+    }
+
     /// Only a terminal whose PTY process is alive binds an `open` row as back:
     /// an exited PTY the manager still lists, or one whose pid is gone, is not.
     #[test]
@@ -2750,12 +3238,29 @@ mod tests {
         let prior = ledger(vec![
             entry("back", Some(true), Some("C:/claude/.claude-x")),
             entry("gone", Some(true), None),
+            entry("closed", Some(true), None),
             done,
         ]);
+        // `back` came back and was closed later (`laterClosed`); `closed` was
+        // closed on purpose without coming back (`closedSince`).
+        let mut now = none();
+        now.registry.read = true;
+        for id in ["back", "gone", "closed"] {
+            now.registry.finished.insert(id.to_string(), false);
+        }
+        for id in ["back", "closed"] {
+            now.registry.closed.insert(
+                id.to_string(),
+                Close {
+                    at_ms: Some(2_000),
+                    reason: "explicit".to_string(),
+                },
+            );
+        }
         let mut report = diff(
             Some(&prior),
             &["back".to_string()],
-            &none(),
+            &now,
             ledger(vec![entry("back", Some(true), None)]),
             true,
         );
@@ -2765,8 +3270,9 @@ mod tests {
                 rotated_at_ms: 1,
                 ledger: prior.clone(),
             },
+            true,
             &["back".to_string()],
-            &none(),
+            &now,
             true,
         )];
         let capture = LedgerCapture {
@@ -2784,6 +3290,8 @@ mod tests {
         );
         assert_eq!(keys(&r["finished"][0]), want("LedgerOutcome"));
         assert_eq!(keys(&r["returned"][0]), want("LedgerOutcome"));
+        assert_eq!(keys(&r["returned"][0]["laterClosed"]), want("LaterClosed"));
+        assert_eq!(keys(&r["closedSince"][0]), want("LedgerOutcome"));
         assert_eq!(keys(&r["generations"][0]), want("LedgerGeneration"));
         assert_eq!(keys(&r["current"]), want("SessionLedger"));
         assert_eq!(keys(&r["expected"][0]), want("LedgerEntry"));
@@ -2890,3 +3398,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+mod since_restart_tests;

@@ -5,6 +5,7 @@ import type { TerminalExitEvent, TerminalInfo } from "@qontinui/shared-types/tau
 import type { CommandResponse, TerminalSessionRecord } from "./types";
 import {
   buildSessionCloseArgs,
+  LIST_OPEN_PURPOSE,
   type FrontendSessionCloseReason,
   type SessionCloseArgs,
 } from "./sessionRecordArgs";
@@ -47,10 +48,7 @@ export function renameTabIn(tabs: TerminalTab[], id: string, title: string): Ter
  * name is immutable — and returns the SAME array when nothing changed so
  * callers do not churn renders.
  */
-export function applySpawnNames(
-  tabs: TerminalTab[],
-  names: Record<string, string>,
-): TerminalTab[] {
+export function applySpawnNames(tabs: TerminalTab[], names: Record<string, string>): TerminalTab[] {
   let changed = false;
   const next = tabs.map((t) => {
     if (t.spawnName) return t;
@@ -258,6 +256,57 @@ export function buildSessionCloseRecord(
     claudeSessionId: closing.claudeSessionId,
     terminalId: closing.id,
     reason,
+  });
+}
+
+/** What closing a tab needs from its caller, so the order is testable without React. */
+export interface TabCloseSteps {
+  /** The tab list as the handler sees it now (`tabsRef.current`). */
+  tabs: TerminalTab[];
+  /** A Conductor worker view: no close record (its worker keeps running). */
+  sessionBacked: boolean;
+  /** React's `setTabs`. Its updater may run LATER than this call. */
+  setTabs: (updater: (prev: TerminalTab[]) => TerminalTab[]) => void;
+  /** Called from inside the updater with the lists before and after the removal. */
+  onRemoved: (prev: TerminalTab[], next: TerminalTab[]) => void;
+  /** Sends the durable close (`terminal_session_record_close`). */
+  recordClose: (args: SessionCloseArgs) => void;
+}
+
+/**
+ * Close tab `id`: remove it from the list and record an `explicit` close for the
+ * Claude session it ran — exactly once.
+ *
+ * The record is built from `steps.tabs` BEFORE `setTabs` and sent at once.
+ * React runs an updater synchronously only when the component has no other
+ * update queued; otherwise it runs at the next render, after this handler has
+ * returned. The record used to be assigned inside the updater and read right
+ * after `setTabs`, so a close with any update pending (measured 2026-11-13 on
+ * a temp runner, a UI Bridge tab close) found it still `null` and recorded
+ * nothing: the session's row stayed open and the since-restart ledger could
+ * never see a deliberate close.
+ *
+ * The snapshot can lag the updates still queued: a session id backfilled in a
+ * pending update is absent from it. When the snapshot names no session, the
+ * updater FILLS the record from `prev`. It never sends a second record for a
+ * terminal the snapshot already recorded: the backend cross-checks the
+ * `(claudeSessionId, terminalId)` pair and closes the record the terminal
+ * actually owns, so a stale id in the snapshot is corrected there. The
+ * once-flag also absorbs StrictMode's double invocation of the updater.
+ */
+export function closeTabAndRecord(id: string, steps: TabCloseSteps): void {
+  let recorded = false;
+  const send = (record: SessionCloseArgs | null) => {
+    if (recorded || record === null || steps.sessionBacked) return;
+    recorded = true;
+    steps.recordClose(record);
+  };
+  send(buildSessionCloseRecord(steps.tabs, id));
+  steps.setTabs((prev) => {
+    send(buildSessionCloseRecord(prev, id));
+    const next = prev.filter((t) => t.id !== id);
+    steps.onRemoved(prev, next);
+    return next;
   });
 }
 
@@ -471,6 +520,20 @@ export function findWorkerRecord(
   return sessions.find(
     (rec) => rec.taskRunId === taskRunId && (rec.pageId || "default") === pageId,
   );
+}
+
+/**
+ * The worker-adoption probe's read of the durable records — `undefined` when
+ * the payload carries no `sessions` array. It names itself as the reader
+ * ({@link LIST_OPEN_PURPOSE}), so a read the coord drain defers is logged under
+ * that name rather than looking like the boot restore's own. A rejected
+ * `invoke` propagates: a failed read is not "no such worker".
+ */
+export async function readRecordsForWorkerAdoption(): Promise<TerminalSessionRecord[] | undefined> {
+  const resp = await invoke<CommandResponse>("terminal_session_list_open", {
+    purpose: LIST_OPEN_PURPOSE.workerAdoption,
+  });
+  return (resp?.data as { sessions?: TerminalSessionRecord[] } | undefined)?.sessions;
 }
 
 /**
@@ -954,8 +1017,7 @@ export function useTerminalManager(
       workerProbeRef.current.set(taskRunId, { at: now, misses: probe.misses });
       let sessions: TerminalSessionRecord[] | undefined;
       try {
-        const resp = await invoke<CommandResponse>("terminal_session_list_open");
-        sessions = (resp?.data as { sessions?: TerminalSessionRecord[] } | undefined)?.sessions;
+        sessions = await readRecordsForWorkerAdoption();
       } catch (err) {
         // A failed read is not "no such worker": retry on the base cadence.
         logger.warn(`worker adoption probe for ${taskRunId} failed (will retry): ${err}`);
@@ -1599,11 +1661,6 @@ export function useTerminalManager(
 
   const closeTerminal = useCallback(
     (id: string) => {
-      // Capture the closing tab's Claude session id (read-only) so we can record
-      // an EXPLICIT durable close after the state update. We read it out of the
-      // updater's `prev` without mutating inside the updater (StrictMode double-
-      // invokes updaters in dev).
-      let closeRecord: ReturnType<typeof buildSessionCloseRecord> = null;
       // A Conductor worker's tab is a VIEW: closing it hides the cell and
       // nothing more. The Conductor owns the worker's lifetime, and its durable
       // record must stay open so the next restore brings the cell back while
@@ -1625,26 +1682,26 @@ export function useTerminalManager(
           }),
         );
       }
-      // Update React state immediately so the UI is responsive.
-      // The Rust-side close (process kill + thread join) runs in the background.
-      setTabs((prev) => {
-        closeRecord = sessionBacked ? null : buildSessionCloseRecord(prev, id);
-        const next = prev.filter((t) => t.id !== id);
-        setActiveId((currentActive) => {
-          if (currentActive !== id) return currentActive;
-          const closedIndex = prev.findIndex((t) => t.id === id);
-          return next[Math.min(closedIndex, next.length - 1)]?.id ?? null;
-        });
-        return next;
+      // Update React state immediately so the UI is responsive, and record the
+      // durable session CLOSE for an explicit user close (only when the tab was
+      // running a Claude session; fire-and-forget). The Rust-side close
+      // (process kill + thread join) runs in the background below.
+      closeTabAndRecord(id, {
+        tabs: tabsRef.current,
+        sessionBacked,
+        setTabs,
+        onRemoved: (prev, next) =>
+          setActiveId((currentActive) => {
+            if (currentActive !== id) return currentActive;
+            const closedIndex = prev.findIndex((t) => t.id === id);
+            return next[Math.min(closedIndex, next.length - 1)]?.id ?? null;
+          }),
+        recordClose: (record) => {
+          invoke<CommandResponse>("terminal_session_record_close", record).catch(() => {
+            // Best-effort — the live close still proceeds below.
+          });
+        },
       });
-
-      // Record the durable session CLOSE for an explicit user close (only when
-      // the tab was running a Claude session). Fire-and-forget.
-      if (closeRecord) {
-        invoke<CommandResponse>("terminal_session_record_close", closeRecord).catch(() => {
-          // Best-effort — the live close still proceeds below.
-        });
-      }
 
       // Only invoke Rust close for terminal tabs (plan tabs and worker views
       // have no PTY)

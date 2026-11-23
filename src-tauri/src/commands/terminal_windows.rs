@@ -123,6 +123,9 @@ fn build_pop_out_webview(
     let api_port = crate::mcp::types::get_mcp_api_port();
     builder = builder.initialization_script(format!("window.__QONTINUI_PORT__ = {};", api_port));
 
+    // A label can be reused after its window closed (`next_popout_label`):
+    // accept the new window's restore-progress reports.
+    crate::session::awaiting_restore::reopen_page_restore_progress(label);
     let window = builder
         .build()
         .map_err(|e| format!("Failed to build pop-out window {}: {}", label, e))?;
@@ -370,6 +373,51 @@ pub fn restore_pop_out_windows(
     restored
 }
 
+/// What tearing a pop-out down did to its OS window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Teardown {
+    /// `destroy()` returned `Ok`.
+    Destroyed,
+    /// No live window held the label.
+    AlreadyGone,
+    /// `destroy()` failed: the window stays open.
+    DestroyFailed,
+}
+
+impl Teardown {
+    /// `destroy()` on the live window holding `label`, if any, logging a
+    /// failure under `context`.
+    fn of(app: &tauri::AppHandle, label: &str, context: &str) -> Self {
+        match app.get_webview_window(label) {
+            None => Self::AlreadyGone,
+            Some(win) => match win.destroy() {
+                Ok(()) => Self::Destroyed,
+                Err(e) => {
+                    tracing::warn!(window = %label, error = %e, "{context}: destroy failed");
+                    Self::DestroyFailed
+                }
+            },
+        }
+    }
+
+    /// Do the window's restore-progress reports stop counting? Only once it is
+    /// really going: a window whose destroy failed stays open and keeps
+    /// reporting, and forgetting it would tombstone its label.
+    fn forgets_restore_progress(self) -> bool {
+        match self {
+            Self::Destroyed | Self::AlreadyGone => true,
+            Self::DestroyFailed => false,
+        }
+    }
+
+    /// Forget `label`'s restore-progress report when this teardown says so.
+    fn settle_restore_progress(self, label: &str) {
+        if self.forgets_restore_progress() {
+            crate::session::awaiting_restore::forget_page_restore_progress(label);
+        }
+    }
+}
+
 /// P2 (orphan sweep) — close every OPEN pop-out (`term-N`) window that owns no
 /// assigned session, and prune any session-less pop-out records. Shared by the
 /// boot path's intent and the operator-initiated "close empty terminal windows"
@@ -426,7 +474,10 @@ pub fn sweep_empty_pop_out_windows(
         }
     }
 
-    // Pass 1 — LIVE but empty pop-outs.
+    // Pass 1 — LIVE but empty pop-outs. Each one's teardown decides whether
+    // its restore-progress report is forgotten (see `Teardown`).
+    let mut teardowns: std::collections::BTreeMap<String, Teardown> =
+        std::collections::BTreeMap::new();
     for record in assignments.pop_out_records() {
         let label = &record.label;
         if assignments.has_assigned_sessions(label) || record.bound_page.is_some() {
@@ -438,11 +489,10 @@ pub fn sweep_empty_pop_out_windows(
         // close() leaves WebView2 pop-outs visible; destroy() forces teardown.
         // The record is pruned below regardless, so a record with no live
         // window is still cleaned up.
-        if let Some(win) = app.get_webview_window(label) {
-            if let Err(e) = win.destroy() {
-                tracing::warn!(window = %label, error = %e, "sweep_empty_pop_out_windows: destroy failed");
-            }
-        }
+        teardowns.insert(
+            label.clone(),
+            Teardown::of(app, label, "sweep_empty_pop_out_windows"),
+        );
         swept.push(label.clone());
     }
     let pruned = assignments.prune_empty_pop_outs();
@@ -453,6 +503,16 @@ pub fn sweep_empty_pop_out_windows(
     // having been in pop_out_records by the time prune ran) — de-dup by set.
     let mut set: std::collections::BTreeSet<String> = swept.into_iter().collect();
     set.extend(pruned);
+    // `destroy()` fires no `CloseRequested`, so `handle_window_close` never
+    // runs for these: settle their restore-progress reports here. A label with
+    // no pass-1 teardown was pruned with no live window (pass 0 or the prune).
+    for label in &set {
+        teardowns
+            .get(label)
+            .copied()
+            .unwrap_or(Teardown::AlreadyGone)
+            .settle_restore_progress(label);
+    }
     set.into_iter().collect()
 }
 
@@ -540,11 +600,7 @@ pub fn auto_close_owner_window_if_empty(
     // still reported it `[vis]` after a successful close()). destroy() forces the
     // teardown; the central `CloseRequested` handler still fires (and emits
     // `window-closed`) before the window is gone.
-    if let Some(win) = app.get_webview_window(&owner) {
-        if let Err(e) = win.destroy() {
-            tracing::warn!(window = %owner, error = %e, "auto_close_owner_window_if_empty: destroy failed");
-        }
-    }
+    Teardown::of(app, &owner, "auto_close_owner_window_if_empty").settle_restore_progress(&owner);
     let pruned = assignments.prune_empty_pop_outs();
     tracing::info!(
         window = %owner,
@@ -799,7 +855,14 @@ pub fn handle_window_close(app: &tauri::AppHandle, label: &str) -> bool {
     }
     let assignments = match app.try_state::<Arc<WindowAssignments>>() {
         Some(s) => s,
-        None => return false,
+        None => {
+            // No teardown runs here; forget its restore progress only when no
+            // live window holds the label any more.
+            if app.get_webview_window(label).is_none() {
+                Teardown::AlreadyGone.settle_restore_progress(label);
+            }
+            return false;
+        }
     };
     let close = assignments.close_window(label);
 
@@ -846,16 +909,13 @@ pub fn handle_window_close(app: &tauri::AppHandle, label: &str) -> bool {
     // inside the runtime. Deliberately AFTER the app-quitting early return
     // above — during teardown the process is going away and the records are
     // being preserved for the next boot's restore.
-    if let Some(win) = app.get_webview_window(label) {
-        if let Err(e) = win.destroy() {
-            tracing::warn!(
-                window = %label,
-                error = %e,
-                "handle_window_close: destroy failed — the label stays held by a live webview; \
-                 the next pop-out open will skip past it"
-            );
-        }
-    }
+    //
+    // Its pages move to another window, which restores them: once the window is
+    // really going, keep the restores it ran and drop its deferrals. A failed
+    // destroy (the label stays held by a live webview; the next pop-out open
+    // skips past it) forgets nothing. Both the X button (`CloseRequested`) and
+    // `close_terminal_window` (`destroy()`) come through here.
+    Teardown::of(app, label, "handle_window_close").settle_restore_progress(label);
 
     // Treat any non-main window as a pop-out for the purpose of skipping the
     // app-quit cleanup, even if its record was already removed (e.g. closed
@@ -1271,5 +1331,42 @@ mod tests {
         assert_eq!(snapshot_geometry(false, false, (177, 177), (15, 37)), None);
         assert_eq!(snapshot_geometry(false, true, (0, 0), (160, 28)), None);
         assert!(snapshot_geometry(false, false, (100, 100), (200, 150)).is_some());
+    }
+
+    /// A pop-out label is reused after its window closed, and a closed label's
+    /// restore-progress reports are refused until it is reopened. So the one
+    /// pop-out builder must reopen the label BEFORE `build()`: after it, the new
+    /// window's first report could arrive while the label is still refused.
+    /// Mutations: the reopen call removed; moved after `.build()`.
+    #[test]
+    fn build_pop_out_webview_reopens_the_label_before_building() {
+        let src = include_str!("terminal_windows.rs");
+        let (_, from_fn) = src
+            .split_once(concat!("fn build_pop_out", "_webview("))
+            .expect("build_pop_out_webview is defined here");
+        let (body, _) = from_fn.split_once("\n}\n").expect("the fn ends");
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let reopen = code
+            .find(concat!("reopen_page_restore", "_progress(label)"))
+            .expect("build_pop_out_webview reopens the label");
+        let build = code
+            .find(".build()")
+            .expect("build_pop_out_webview builds the window");
+        assert!(reopen < build, "the label is reopened before .build()");
+    }
+
+    /// The one rule every pop-out teardown site settles restore progress by:
+    /// a destroyed or already-gone window's report is forgotten, a window whose
+    /// destroy failed keeps reporting. Mutations: `DestroyFailed` forgetting;
+    /// `AlreadyGone` keeping.
+    #[test]
+    fn only_a_window_that_is_really_going_forgets_its_restore_progress() {
+        assert!(Teardown::Destroyed.forgets_restore_progress());
+        assert!(Teardown::AlreadyGone.forgets_restore_progress());
+        assert!(!Teardown::DestroyFailed.forgets_restore_progress());
     }
 }

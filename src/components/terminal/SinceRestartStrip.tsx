@@ -1,17 +1,25 @@
 /**
  * The "Since restart" strip (plan `2026-10-04-runner-session-roster-restore-picker`,
- * Phase 4): once the boot restore has settled for every page holding a session
- * from before the restart, it says what came back.
+ * Phase 4; its counts per plan
+ * `2026-11-11-since-restart-roster-counts-closed-sessions-as-missing`): once
+ * the first page's boot restore has settled, it says what came back.
  *
- * - "N of M sessions from before the restart are back · K didn't come back —
- *   Review" when K > 0. The strip lives in the app-wide advisory column, so
- *   Review first brings the Terminal view up, then opens Previous Sessions
- *   with the roster section scrolled to the top.
- * - "All M sessions from before the restart are back" when K = 0, fading by
- *   itself — confirmation rather than silence is what makes the roster
- *   trustworthy.
+ * - "N of M sessions from before the restart came back · K didn't come back —
+ *   Review" when K > 0. K is "up to K" when the fate of one of them could not
+ *   be read. The strip lives in the app-wide advisory column, so Review first
+ *   brings the Terminal view up, then opens Previous Sessions with the roster
+ *   section scrolled to the top.
+ * - "· W waiting on pages not opened yet" for the sessions this runner's
+ *   restore still owes whose page has not restored. A session no restore owes
+ *   is never waiting: it is counted under K.
+ * - "· C later closed" when C of the sessions that came back were closed
+ *   after they did.
+ * - "All M sessions from before the restart came back" when K = 0 and W = 0,
+ *   fading by itself — confirmation rather than silence is what makes the
+ *   roster trustworthy.
  * - "Restore deferred by drain — N waiting" while the coord device drain
- *   holds the restore back.
+ *   holds back a restore some session is still owed; with none owed, the
+ *   ordinary forms above.
  *
  * Dismissible (remembered per restart). A sibling of `ResumeFailedBanner` in
  * the top-right advisory column; the model is pure (`stripModel`).

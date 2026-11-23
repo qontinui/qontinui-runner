@@ -8,7 +8,8 @@
  * The frontend records OPEN/CLOSE through three Tauri commands:
  *   - `terminal_session_record_open`  (args = {@link SessionOpenArgs})
  *   - `terminal_session_record_close` (args = {@link SessionCloseArgs})
- *   - `terminal_session_list_open`    (restore — see useTerminalInitialization)
+ *   - `terminal_session_list_open`    (restore, and readers naming themselves —
+ *                                       see {@link LIST_OPEN_PURPOSE})
  */
 
 /** A tab shape the open-record builder needs (subset of `TerminalTab`). */
@@ -237,12 +238,15 @@ export function buildSessionOpenArgs(params: {
 /**
  * Durable-close reasons a FRONTEND caller may record. Mirrors
  * `useTerminalManager`'s `FrontendCloseReason` — both arms have a live tab, so
- * a frontend writer can only ever be recording one of these two. The backend
- * additionally mints reasons no frontend can (the other `CLOSE_REASON_*`
- * constants in `src-tauri/src/session/session_lifecycle_store.rs`); they are
- * deliberately NOT in this union. A `pty-exit` sent here may itself
- * be RECORDED as `launch-failed`: the backend rewrites a death close whose
- * pane never launched the Claude CLI (`terminal::launch_failure`).
+ * a frontend writer can only ever be recording one of these two. Every close
+ * reason is one typed set in the backend (`session::close_reason::CloseReason`),
+ * which `terminal_session_record_close` parses this string into and refuses
+ * anything outside; the backend alone mints the rest (`poll-dead`,
+ * `no-terminal`, `never-started`, `terminal-only-idle`, `superseded`,
+ * `superseded-terminal-reuse`, `launch-failed`, the orchestration worker's
+ * teardown), so they are deliberately NOT in this union. A `pty-exit` sent
+ * here may itself be RECORDED as `launch-failed`: the backend rewrites a death
+ * close whose pane never launched the Claude CLI (`terminal::launch_failure`).
  */
 export type FrontendSessionCloseReason = "explicit" | "pty-exit";
 
@@ -394,3 +398,22 @@ export function describeRecordOpenOutcome(params: {
     `terminal_list will not surface it until ${door} confirms it`
   );
 }
+
+/**
+ * Who is reading `terminal_session_list_open`, sent as its `purpose`.
+ *
+ * Only `restore` (the boot restore's own read, `fetchRestoreSet`) may tell the
+ * backend that the boot restore was withheld or has run. Every other reader
+ * names itself, so that a read the coord drain defers is logged under its own
+ * name and at debug, while the boot restore's deferral is the one WARN (plan
+ * `2026-11-11-since-restart-roster-counts-closed-sessions-as-missing`,
+ * Phase 7). The backend acts on `restore` alone; the others are log labels.
+ */
+export const LIST_OPEN_PURPOSE = {
+  restore: "restore",
+  pageOccupancy: "page-occupancy",
+  workerAdoption: "worker-adoption",
+  treeResetReport: "tree-reset-report",
+} as const;
+
+export type ListOpenPurpose = (typeof LIST_OPEN_PURPOSE)[keyof typeof LIST_OPEN_PURPOSE];

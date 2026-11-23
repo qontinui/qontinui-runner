@@ -19,9 +19,18 @@ import type { TerminalTab } from "./useTerminalManager";
 import type { TerminalInstanceHandle } from "./TerminalInstance";
 import type { CommandResponse, TerminalSessionRecord } from "./types";
 import type { SaveSessionLayoutParams } from "./useSessionPersistence";
-import { noteRecordedZone, recordedZoneLedgerFor, type SessionOpenArgs } from "./sessionRecordArgs";
+import {
+  LIST_OPEN_PURPOSE,
+  noteRecordedZone,
+  recordedZoneLedgerFor,
+  type SessionOpenArgs,
+} from "./sessionRecordArgs";
 import { rememberSessionId } from "./lastKnownSessionIds";
-import { loadKnownPageIds, readPinnedPageId } from "./useTerminalPages";
+import {
+  loadKnownPageIds,
+  readPinnedPageId,
+  TERMINAL_PAGE_REMOVED_EVENT,
+} from "./useTerminalPages";
 import { getPageBindings, type PageBindings } from "@/lib/pageBindings";
 import { fetchLiveClaudeSessionIds } from "./liveClaudeSessions";
 import type { ResourceGuardSource } from "@/lib/resourceGuard";
@@ -480,7 +489,9 @@ export async function fetchRestoreSet(
     // may tell the backend's lifecycle poll that the restore was withheld or
     // has run (plan `2026-10-01-drain-deferred-restore-is-swept-as-orphans`).
     // The other readers of this command must not.
-    resp = await invoke<CommandResponse>("terminal_session_list_open", { purpose: "restore" });
+    resp = await invoke<CommandResponse>("terminal_session_list_open", {
+      purpose: LIST_OPEN_PURPOSE.restore,
+    });
   } catch (err) {
     console.warn("[TerminalPage] terminal_session_list_open failed:", err);
     return { records: [], deferredByDrain: null };
@@ -811,7 +822,9 @@ export async function reportTreeReset(params: {
     }
     let openRecordCount: number | undefined;
     try {
-      const resp = await invoke<CommandResponse>("terminal_session_list_open");
+      const resp = await invoke<CommandResponse>("terminal_session_list_open", {
+        purpose: LIST_OPEN_PURPOSE.treeResetReport,
+      });
       const data = resp?.data as { sessions?: unknown[]; deferredByDrain?: unknown } | undefined;
       // While coord's device drain withholds the restore set, `sessions` is
       // empty by deferral, not by count — report the count as unknown.
@@ -1641,6 +1654,42 @@ export function useTerminalInitialization({
   // re-runs the restore effect. Closing the hold at the start of every retry
   // turned that into a loop that lasted as long as the drain.
   const deferredRetryPages = useRef<Set<string>>(new Set());
+  // Pages whose restore the drain has deferred and no run has restored since:
+  // what is PUBLISHED as "deferred" to the since-restart strip and the backend's
+  // `restoreOwed`. Unlike `drainDeferredPages` (which also marks a merging
+  // re-run, and which a re-run clears the moment it starts), a page leaves this
+  // set only when a run gets a restore set the drain did not withhold. Any
+  // render of the page's scope re-runs a deferred restore, and publishing
+  // `drainDeferredPages` let every such retry report the page as neither
+  // deferred nor restored for as long as the retry ran, so the strip and its
+  // rows flapped between "deferred by drain" and "page not opened" (measured
+  // 2026-11-13 on a temp runner, two reads two seconds apart).
+  //
+  // A page is cleared ONLY when a run learned the drain no longer withholds it.
+  // A retry that aborts on an indeterminate reconnect, or throws, learned
+  // nothing about the drain, so the page stays held — the honest reading is
+  // still "the drain deferred it and nothing has restored it". A page removed
+  // from the layout IS pruned (`TERMINAL_PAGE_REMOVED_EVENT`, below):
+  // `removePage` closes only the page's LIVE terminals, and a drain-held page's
+  // owed sessions never got a pane, so nothing closes their rows. Kept, the page
+  // would be reported deferred — and its rows owed — for as long as the window
+  // lives, with no tab left to restore them into.
+  const drainHeldPages = useRef<Set<string>>(new Set());
+  // Pages removed from the layout while this hook lived. NOT permanent: an id
+  // can come back ("default" through `loadPages`/reconcile, an explicit id
+  // through `openPage`), so a run consults it only while the page is still
+  // absent from the persisted layout, and drops it once the page is back.
+  const removedPages = useRef<Set<string>>(new Set());
+  // Is `id` removed and still out of the layout? A removed id found back in
+  // the persisted layout is forgotten, so the page is tracked as any other.
+  const pageGone = useCallback((id: string): boolean => {
+    if (!removedPages.current.has(id)) return false;
+    if (loadKnownPageIds().includes(id)) {
+      removedPages.current.delete(id);
+      return false;
+    }
+    return true;
+  }, []);
   // Each page's newest restore run. A re-run can start before an earlier run's
   // drain timer fires, and that timer must not release the hold the newer run
   // still needs.
@@ -1660,8 +1709,50 @@ export function useTerminalInitialization({
   );
   const publishRestorePages = useCallback(() => {
     setPublishedCompletePages(new Set(restoreCompletePages.current));
-    setPublishedDeferredPages(new Set(drainDeferredPages.current));
+    setPublishedDeferredPages(new Set(drainHeldPages.current));
+    // The backend's since-restart ledger reads the same progress, so a row
+    // whose page already restored without it is not reported as still owed.
+    invoke("terminal_report_restore_progress", {
+      completePages: [...restoreCompletePages.current],
+      deferredPages: [...drainHeldPages.current],
+      knownPageIds: loadKnownPageIds(),
+    }).catch((err) => {
+      console.warn("[TerminalPage] terminal_report_restore_progress failed:", err);
+    });
   }, []);
+  // Prune a removed page from BOTH published sets and re-publish, so neither
+  // the strip nor the backend's `restoreOwed` keeps counting a page that is
+  // gone. Both, because a deferred page is in `complete` too (its restore gate
+  // opens): pruned from `deferred` alone, the backend's `has_run` would read it
+  // as restored. Pruned from both, its rows fall to the orphan arm, which reads
+  // "not run" until a non-deferred page has completed and "ran" once one has
+  // (that restore adopts orphans).
+  useEffect(() => {
+    const onRemoved = (e: Event) => {
+      const pageId = (e as CustomEvent<{ pageId?: string }>).detail?.pageId;
+      if (!pageId) return;
+      removedPages.current.add(pageId);
+      const held = drainHeldPages.current.delete(pageId);
+      const complete = restoreCompletePages.current.delete(pageId);
+      // A page can come back ("default" through reconcile, an explicit id
+      // through `openPage`). Release its once-per-page guard so it restores
+      // again when it is next shown — as a deferred page already does — or it
+      // would never re-enter `restoreCompletePages`, and its auto-save gate
+      // (which reads that set) would stay closed for the window's life. The run
+      // is a MERGING one (`drainDeferredPages`, like a drain re-run), so it
+      // never re-lays the page out, and it cannot double-restore a session that
+      // is already live: reconnected PTYs are reattached, not recreated
+      // (`reconnectToExistingSessions`), a record whose session a live tab
+      // already shows is skipped on a merging run (the `isDrainRerun &&
+      // liveTabsRef` check in the cold-restore loop), and a session another
+      // run is already creating a tab for is skipped by `coldResumeGuard`.
+      didInitPages.current.delete(pageId);
+      drainDeferredPages.current.add(pageId);
+      if (held || complete) publishRestorePages();
+    };
+    window.addEventListener(TERMINAL_PAGE_REMOVED_EVENT, onRemoved);
+    return () => window.removeEventListener(TERMINAL_PAGE_REMOVED_EVENT, onRemoved);
+  }, [publishRestorePages]);
   // Live tabs, for the re-run's "already open" check (the init effect does not
   // re-run on every tab change, so it cannot close over `tabs`).
   const liveTabsRef = useRef(tabs);
@@ -1762,7 +1853,7 @@ export function useTerminalInitialization({
     const thisRun = (newestRestoreRun.current.get(initPageId) ?? 0) + 1;
     newestRestoreRun.current.set(initPageId, thisRun);
     const openRestoreGate = () => {
-      restoreCompletePages.current.add(initPageId);
+      if (!pageGone(initPageId)) restoreCompletePages.current.add(initPageId);
       if (newestRestoreRun.current.get(initPageId) === thisRun) setRestoreSettled(true);
     };
     // What a merging run may place into: its own page's grid as it is now. The
@@ -1808,7 +1899,9 @@ export function useTerminalInitialization({
     }> = [];
 
     (async () => {
-      // A drain re-run moved this page out of both sets above.
+      // A drain re-run moved this page out of the complete set above. It stays
+      // in `drainHeldPages`, so the published view still says the drain holds
+      // it until this run learns otherwise.
       if (isDrainRerun) publishRestorePages();
       // True once a deferred resume/scrollback drain timer is scheduled. When
       // set, that timer owns flipping the per-page restore-complete gate (after
@@ -1887,6 +1980,8 @@ export function useTerminalInitialization({
           restoreDeferred = true;
           deferredRetryPages.current.add(initPageId);
           drainDeferredPages.current.add(initPageId);
+          // A run still in flight when its page was removed must not hold it again.
+          if (!pageGone(initPageId)) drainHeldPages.current.add(initPageId);
           didInitPages.current.delete(initPageId);
           if (adoptOrphans) didClaimOrphanAdoption.current = false;
           console.warn(
@@ -1897,6 +1992,7 @@ export function useTerminalInitialization({
           return;
         }
         // Not deferred after all, so this retry is a real restore: hold the trim.
+        drainHeldPages.current.delete(initPageId);
         setRestoreSettled(false);
         const openRecords = restoreSet.records;
         // The default Claude home, for the account rule (`resolveAccountDir`):
@@ -2470,6 +2566,7 @@ export function useTerminalInitialization({
     terminalRefs,
     noteNeedsAccount,
     publishRestorePages,
+    pageGone,
   ]);
 
   // Auto-save session layout for persistence across app restarts
