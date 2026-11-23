@@ -409,7 +409,13 @@ export function SinceRestartProvider({
     setFinishEpoch((n) => n + 1);
     refresh();
   }, [refresh]);
-  const { ops: finishOps, setFinished } = useFinishOps(onFinishSettled);
+  const { ops: finishOps, setFinished, reconcile: reconcileFinishOps } =
+    useFinishOps(onFinishSettled);
+  // A notice whose row changed state through another door is dropped.
+  useEffect(() => {
+    const byId = new Map(rows.map((r) => [r.outcome.claudeSessionId, r.outcome.finished]));
+    reconcileFinishOps((id) => byId.get(id));
+  }, [rows, reconcileFinishOps]);
 
   // ── Capture now ──────────────────────────────────────────────────────────
   const [capturing, setCapturing] = useState(false);

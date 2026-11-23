@@ -848,13 +848,13 @@ async fn settle_cleared(
         Ok(None) => out.unreadable(
             stem,
             Some(&id),
-            format!("the net already cleared; the cancel's read-back found no row after {why}"),
+            format!("the net already cleared; the cancel's read-back found no row (cancel: {why})"),
         ),
         Err(e) => out.unreadable(
             stem,
             Some(&id),
             format!(
-                "the net already cleared; the cancel's read-back could not be made ({e}) after {why}"
+                "the net already cleared; the cancel's read-back could not be made ({e}; cancel: {why})"
             ),
         ),
     }
@@ -1524,7 +1524,8 @@ pub(crate) mod tests {
         assert_eq!(outs[1].stems, vec!["p2".to_string()]);
         assert_eq!(outs[2].verdict(), NetsVerdict::None);
         // The fake serves one gate set for every plan: the first run to reach
-        // g1 withdraws it, the other then reads it back as already retired.
+        // g1 withdraws it, and the other then sees verdict=withdrawn in its
+        // gate list and records the net inert, with no read-back.
         let withdrawn: usize = outs.iter().map(|o| o.withdrawn.len()).sum();
         assert_eq!(withdrawn, 1);
         assert!(
@@ -1576,9 +1577,9 @@ pub(crate) mod tests {
         assert_eq!(out.verdict(), NetsVerdict::Unknown);
         let u = &out.unretired[0];
         assert!(u.unreadable);
-        assert!(u.why.contains("could not be made (HTTP 503)"), "{}", u.why);
+        assert!(u.why.contains("could not be made (HTTP 503;"), "{}", u.why);
         assert!(
-            u.why.contains("after the cancel was not answered"),
+            u.why.contains("cancel: the cancel was not answered"),
             "{}",
             u.why
         );

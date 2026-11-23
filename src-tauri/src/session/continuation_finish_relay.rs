@@ -854,7 +854,10 @@ mod tests {
                 .any(|id| self.store.get(id).is_some_and(|r| r.finished_at.is_some()));
             self.calls.lock().unwrap().push((ids.to_vec(), any_marked));
             ids.iter()
-                .map(|_| crate::session::finish_net_retire::NetsOutcome::default())
+                .map(|id| crate::session::finish_net_retire::NetsOutcome {
+                    stems: vec![format!("stem-{id}")],
+                    ..Default::default()
+                })
                 .collect()
         }
     }
@@ -910,6 +913,61 @@ mod tests {
             store.get("done").unwrap().finish_reason.as_deref(),
             Some("own")
         );
+    }
+
+    /// The batch's outcomes are put back in INPUT order around the skipped
+    /// (already-finished) sessions: a skip in the middle must not shift them.
+    #[tokio::test]
+    async fn batch_outcomes_keep_input_order_around_a_skip() {
+        use crate::session::finish_net_retire::{retire_before_conditional_finishes, NetsReport};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap(),
+        );
+        for id in ["a", "done", "b"] {
+            store.record_open(
+                serde_json::from_value(json!({
+                    "claudeSessionId": id,
+                    "pageId": "default",
+                    "zoneIndex": 0,
+                    "terminalId": format!("term-{id}"),
+                    "openedAt": 0,
+                    "lastSeenAt": 0,
+                    "state": "open",
+                }))
+                .unwrap(),
+            );
+        }
+        store
+            .set_finished("done", true, Some("own".to_string()))
+            .unwrap();
+        let probe = BatchProbe {
+            store: store.clone(),
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+        let ids: Vec<String> = ["a", "done", "b"].iter().map(|s| s.to_string()).collect();
+        let reports = retire_before_conditional_finishes(
+            &store,
+            &probe,
+            &ids,
+            "test",
+            crate::session::finish_net_retire::DOOR_BUDGET,
+        )
+        .await;
+        assert_eq!(reports.len(), 3);
+        match &reports[0] {
+            NetsReport::Ran(o) => assert_eq!(o.stems, vec!["stem-a".to_string()]),
+            other => panic!("reports[0] should be a's outcome, got {other:?}"),
+        }
+        assert!(
+            matches!(reports[1], NetsReport::Skipped(_)),
+            "{:?}",
+            reports[1]
+        );
+        match &reports[2] {
+            NetsReport::Ran(o) => assert_eq!(o.stems, vec!["stem-b".to_string()]),
+            other => panic!("reports[2] should be b's outcome, got {other:?}"),
+        }
     }
 
     /// A tick's retires run CONCURRENTLY, so one dark coord costs the tick one
