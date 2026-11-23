@@ -1610,6 +1610,18 @@ async fn tail_session(
                 bytes.len(),
                 t.transcript_sync_open(&session_id),
             );
+            // A subagent sidechain (`<sid>/subagents/<name>.jsonl`) is keyed
+            // by `<name>`, which nothing binds: its growth is liveness for the
+            // PARENT session, heartbeated under the parent's key and throttle
+            // slot, with no bytes emitted there (plan
+            // `2026-11-23-coord-closes-a-session-parked-on-background-subagents-and-the-heartbeat-d2-veto-fires-its-net`
+            // Phase 2).
+            if !bytes.is_empty() {
+                if let Some(owner) = crate::session::transcript_autobind::owning_session_key(&path)
+                {
+                    t.note_sidechain_activity(&owner, bytes.len());
+                }
+            }
             // Same two-step for a batch whose consent was withheld (Gate 1
             // off): a tracked session's mark moves past it, so no later gap
             // fill sends bytes written while sync was off.

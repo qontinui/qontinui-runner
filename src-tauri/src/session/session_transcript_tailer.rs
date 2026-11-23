@@ -43,6 +43,20 @@
 //! not govern it. An idle transcript does not grow, so an idle session still
 //! ages to `stale` as before.
 //!
+//! A subagent SIDECHAIN append is liveness for its PARENT. Claude Code writes a
+//! subagent's transcript to `<projects>/<cwd>/<sid>/subagents/<name>.jsonl`,
+//! which the watcher keys by its stem `<name>` — a key nothing binds — so while
+//! a session waits on background subagents its own `.jsonl` is quiet and, until
+//! this, its row was autoclosed at 30 min while the subagents kept writing
+//! (plan
+//! `2026-11-23-coord-closes-a-session-parked-on-background-subagents-and-the-heartbeat-d2-veto-fires-its-net`
+//! Phase 2). The watcher therefore also calls
+//! [`SessionTranscriptTailer::note_sidechain_activity`] with the parent's key
+//! ([`crate::session::transcript_autobind::owning_session_key`]): the same
+//! binding lookup and the same throttle slot as the parent's own appends, so
+//! a parent plus N sidechains still heartbeats at most once per interval, and
+//! no sidechain byte is emitted under the parent's key.
+//!
 //! ## Coverage is the thing to watch, not liveness
 //!
 //! That linkage is also the failure mode. The sniffer binds only the panes it
@@ -830,10 +844,7 @@ impl SessionTranscriptTailer {
         // a once-per-session debug line, which cannot answer "is every live
         // pane being tailed right now". Resolved BEFORE Gate 1 because the
         // liveness heartbeat does not depend on transcript consent.
-        let bound = self.registrar.session_id_for(session_key).is_some();
-        if bound && self.heartbeat_due(session_key, now) {
-            self.registrar.heartbeat_on_interaction(session_key);
-        }
+        let bound = self.heartbeat_if_bound(session_key, now);
 
         if !transcript_sync_permitted {
             let mut cov = self.lock_coverage();
@@ -858,6 +869,42 @@ impl SessionTranscriptTailer {
         } else {
             Admit::Drop
         }
+    }
+
+    /// A subagent SIDECHAIN of `owner_key` grew by `len` bytes: liveness for
+    /// the parent session (module header, "Transcript activity is liveness").
+    ///
+    /// The transcript watcher calls this for a
+    /// `<projects>/<cwd>/<sid>/subagents/<name>.jsonl` append, with `owner_key`
+    /// from [`crate::session::transcript_autobind::owning_session_key`],
+    /// BESIDE its usual [`Self::admit`] of the sidechain under its own key.
+    /// It shares `admit`'s binding lookup and heartbeat throttle, keyed by the
+    /// OWNER, so a parent plus any number of sidechains still sends at most one
+    /// heartbeat per [`TRANSCRIPT_HEARTBEAT_INTERVAL`]. It emits NO transcript
+    /// bytes: a sidechain's content never enters the parent's transcript lane,
+    /// and it touches no coverage counter. An unbound owner heartbeats nothing.
+    pub fn note_sidechain_activity(&self, owner_key: &str, len: usize) {
+        self.note_sidechain_activity_at(owner_key, len, Instant::now());
+    }
+
+    /// [`Self::note_sidechain_activity`] with the clock supplied.
+    pub(crate) fn note_sidechain_activity_at(&self, owner_key: &str, len: usize, now: Instant) {
+        if len == 0 {
+            return;
+        }
+        self.heartbeat_if_bound(owner_key, now);
+    }
+
+    /// The liveness half of an append, shared by [`Self::admit_at`] and
+    /// [`Self::note_sidechain_activity_at`]: when `session_key` is BOUND and
+    /// its throttle slot is due, heartbeat its coord row. Returns whether the
+    /// key is bound. An unbound key never claims the throttle slot.
+    fn heartbeat_if_bound(&self, session_key: &str, now: Instant) -> bool {
+        let bound = self.registrar.session_id_for(session_key).is_some();
+        if bound && self.heartbeat_due(session_key, now) {
+            self.registrar.heartbeat_on_interaction(session_key);
+        }
+        bound
     }
 
     /// Claim the heartbeat slot for `session_key` at `now`: `true` (and the
@@ -2015,6 +2062,147 @@ mod tests {
         let map = t.heartbeat_at.lock().unwrap();
         assert_eq!(map.len(), 1, "every expired key was pruned");
         assert!(map.contains_key("fresh"));
+    }
+
+    /// `<dir>/.claude/projects/-cwd/<parent>/subagents/<name>.jsonl` and the
+    /// key the watcher tails it under (its stem) — the shape of a subagent
+    /// sidechain, so the owner key comes from the real path parser.
+    fn sidechain(dir: &std::path::Path, parent: &str, name: &str) -> (String, String) {
+        let path = dir
+            .join(".claude/projects/-cwd")
+            .join(parent)
+            .join(format!("subagents/{name}.jsonl"));
+        let owner = crate::session::transcript_autobind::owning_session_key(&path)
+            .expect("a sidechain path names its parent");
+        (owner, name.to_string())
+    }
+
+    /// One sidechain append as the transcript watcher handles it: `admit`
+    /// under the sidechain's own key, then the owner's liveness note.
+    fn sidechain_append(t: &SessionTranscriptTailer, owner: &str, key: &str, at: Instant) -> Admit {
+        let verdict = t.admit_at(key, 8, true, at);
+        t.note_sidechain_activity_at(owner, 8, at);
+        verdict
+    }
+
+    /// Plan
+    /// `2026-11-23-coord-closes-a-session-parked-on-background-subagents-and-the-heartbeat-d2-veto-fires-its-net`
+    /// Phase 2: while a session waits on a background subagent its own
+    /// `.jsonl` is quiet and only `<sid>/subagents/<name>.jsonl` grows. That
+    /// growth heartbeats the BOUND parent's coord row, once per window.
+    #[test]
+    fn a_subagent_sidechain_append_heartbeats_the_bound_parent_once_per_window() {
+        let dir = tempdir().unwrap();
+        let (t, registrar, outbox) = tailer(dir.path());
+        let csid = Uuid::new_v4().to_string();
+        let coord = sniff_register(&registrar, &csid);
+        let (owner, key) = sidechain(dir.path(), &csid, "agent-a1b2c3");
+        assert_eq!(owner, csid);
+        let before = heartbeats_for(&outbox, coord);
+
+        let t0 = Instant::now();
+        for i in 0..10u64 {
+            let at = t0 + Duration::from_secs(i * 5);
+            assert_eq!(sidechain_append(&t, &owner, &key, at), Admit::Drop);
+        }
+        assert_eq!(
+            heartbeats_for(&outbox, coord) - before,
+            1,
+            "sidechain appends inside one window heartbeat the parent exactly once"
+        );
+
+        let later = t0 + TRANSCRIPT_HEARTBEAT_INTERVAL + Duration::from_secs(1);
+        sidechain_append(&t, &owner, &key, later);
+        assert_eq!(heartbeats_for(&outbox, coord) - before, 2);
+
+        // An empty sidechain append is not activity.
+        t.note_sidechain_activity_at(&owner, 0, later + TRANSCRIPT_HEARTBEAT_INTERVAL * 2);
+        assert_eq!(heartbeats_for(&outbox, coord) - before, 2);
+    }
+
+    /// A parent plus N sidechains share ONE throttle slot: interleaved appends
+    /// from all of them inside a window still send one heartbeat.
+    #[test]
+    fn parent_and_sidechain_share_one_throttle_slot() {
+        let dir = tempdir().unwrap();
+        let (t, registrar, outbox) = tailer(dir.path());
+        let csid = Uuid::new_v4().to_string();
+        let coord = sniff_register(&registrar, &csid);
+        let (owner, a) = sidechain(dir.path(), &csid, "agent-a");
+        let (_, b) = sidechain(dir.path(), &csid, "agent-b");
+        let before = heartbeats_for(&outbox, coord);
+
+        let t0 = Instant::now();
+        assert_eq!(t.admit_at(&csid, 8, true, t0), Admit::Emit);
+        sidechain_append(&t, &owner, &a, t0 + Duration::from_secs(1));
+        sidechain_append(&t, &owner, &b, t0 + Duration::from_secs(2));
+        t.admit_at(&csid, 8, true, t0 + Duration::from_secs(3));
+        assert_eq!(heartbeats_for(&outbox, coord) - before, 1);
+
+        // A sidechain that claims the slot first holds it for the parent too.
+        let w2 = t0 + TRANSCRIPT_HEARTBEAT_INTERVAL + Duration::from_secs(1);
+        sidechain_append(&t, &owner, &a, w2);
+        t.admit_at(&csid, 8, true, w2 + Duration::from_secs(1));
+        assert_eq!(heartbeats_for(&outbox, coord) - before, 2);
+    }
+
+    /// A sidechain whose parent has no binding heartbeats nothing — and does
+    /// not spend the parent's throttle slot before it is bound.
+    #[test]
+    fn a_sidechain_of_an_unbound_parent_heartbeats_nothing() {
+        let dir = tempdir().unwrap();
+        let (t, registrar, outbox) = tailer(dir.path());
+        let csid = Uuid::new_v4().to_string();
+        let (owner, key) = sidechain(dir.path(), &csid, "agent-x");
+        let t0 = Instant::now();
+        for i in 0..3u64 {
+            sidechain_append(&t, &owner, &key, t0 + Duration::from_secs(i));
+        }
+        assert_eq!(all_heartbeats(&outbox), 0);
+
+        let coord = sniff_register(&registrar, &csid);
+        let before = heartbeats_for(&outbox, coord);
+        sidechain_append(&t, &owner, &key, t0 + Duration::from_secs(5));
+        assert_eq!(
+            heartbeats_for(&outbox, coord) - before,
+            1,
+            "the unbound sidechain appends did not claim the parent's slot"
+        );
+    }
+
+    /// The liveness note carries no content: a sidechain append emits no
+    /// transcript chunk under the parent's coord session (nor anywhere, since
+    /// the sidechain's own key is unbound), and counts no parent coverage.
+    #[test]
+    fn a_sidechain_append_emits_no_transcript_bytes_under_the_parent_key() {
+        let dir = tempdir().unwrap();
+        let (t, registrar, outbox) = tailer(dir.path());
+        let csid = Uuid::new_v4().to_string();
+        let coord = sniff_register(&registrar, &csid);
+        let (owner, key) = sidechain(dir.path(), &csid, "agent-y");
+        let before = heartbeats_for(&outbox, coord);
+
+        let t0 = Instant::now();
+        for i in 0..4u64 {
+            sidechain_append(&t, &owner, &key, t0 + Duration::from_secs(i));
+        }
+        assert_eq!(
+            heartbeats_for(&outbox, coord) - before,
+            1,
+            "liveness did land"
+        );
+        assert!(
+            !transcript_chunks(&outbox).contains_key(&coord),
+            "no sidechain byte reached the parent's transcript lane"
+        );
+        assert!(transcript_offsets(&outbox).is_empty());
+        let cov = t.lock_coverage();
+        assert!(
+            !cov.tailed.contains(&csid),
+            "the parent was not counted as tailed"
+        );
+        assert_eq!(cov.appends_emitted, 0);
+        assert_eq!(cov.bytes_emitted, 0);
     }
 
     /// A bound pane's appends land as transcript chunks with the emitter's

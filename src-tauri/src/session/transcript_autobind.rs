@@ -104,6 +104,36 @@ pub fn identity_from_path(path: &Path) -> Option<TranscriptIdentity> {
     })
 }
 
+/// The session a SUBAGENT SIDECHAIN belongs to, read from its path alone.
+///
+/// Claude Code writes a subagent's transcript to
+/// `<config>/projects/<cwd>/<sid>/subagents/<name>.jsonl`, beside the parent's
+/// `<config>/projects/<cwd>/<sid>.jsonl`. The watcher keys every append by the
+/// file stem, so a sidechain arrives under `<name>` — a key no binding ever
+/// names — and its appends would heartbeat nothing while the parent session is
+/// working through that subagent (plan
+/// `2026-11-23-coord-closes-a-session-parked-on-background-subagents-and-the-heartbeat-d2-veto-fires-its-net`
+/// Phase 2).
+///
+/// Returns the parent's session key (its Claude Code session id) only when the
+/// path has exactly that shape AND the sibling parent path
+/// `<config>/projects/<cwd>/<sid>.jsonl` passes [`identity_from_path`] — the
+/// UUID and `projects`-depth checks are that parser's, not a second one.
+/// `None` otherwise, including for a top-level transcript.
+pub fn owning_session_key(path: &Path) -> Option<String> {
+    if path.extension()?.to_str()? != "jsonl" {
+        return None;
+    }
+    let subagents = path.parent()?;
+    if subagents.file_name()?.to_str()? != "subagents" {
+        return None;
+    }
+    let session_dir = subagents.parent()?;
+    let sid = session_dir.file_name()?.to_str()?;
+    let parent = session_dir.with_file_name(format!("{sid}.jsonl"));
+    identity_from_path(&parent).map(|id| id.claude_session_id)
+}
+
 /// What to do with a transcript given what coord said.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
@@ -709,6 +739,52 @@ mod tests {
         )))
         .unwrap();
         assert_eq!(id.account_label, ".claude");
+    }
+
+    #[test]
+    fn owning_session_key_names_the_parent_of_a_subagent_sidechain() {
+        let p = Path::new("/home/u/.claude-gmail/projects/-home-u-proj")
+            .join(CSID)
+            .join("subagents/agent-a1b2c3.jsonl");
+        assert_eq!(owning_session_key(&p).as_deref(), Some(CSID));
+    }
+
+    #[test]
+    fn owning_session_key_refuses_everything_that_is_not_a_sidechain() {
+        // A non-UUID grandparent.
+        assert!(owning_session_key(Path::new(
+            "/c/.claude/projects/p/not-a-uuid/subagents/agent-x.jsonl"
+        ))
+        .is_none());
+        // A top-level transcript is its own session, not a sidechain.
+        assert!(
+            owning_session_key(Path::new(&format!("/c/.claude/projects/p/{CSID}.jsonl"))).is_none()
+        );
+        // A `subagents` dir at the wrong depth (directly under projects/).
+        assert!(owning_session_key(Path::new(&format!(
+            "/c/.claude/projects/{CSID}/subagents/agent-x.jsonl"
+        )))
+        .is_none());
+        // ...or one level too deep.
+        assert!(owning_session_key(Path::new(&format!(
+            "/c/.claude/projects/p/q/{CSID}/subagents/agent-x.jsonl"
+        )))
+        .is_none());
+        // A `<uuid>/subagents/x.jsonl` outside `projects/<cwd>/`.
+        assert!(owning_session_key(Path::new(&format!(
+            "/c/.claude/other/p/{CSID}/subagents/agent-x.jsonl"
+        )))
+        .is_none());
+        // The directory is not named `subagents`.
+        assert!(owning_session_key(Path::new(&format!(
+            "/c/.claude/projects/p/{CSID}/tools/agent-x.jsonl"
+        )))
+        .is_none());
+        // Not a JSONL.
+        assert!(owning_session_key(Path::new(&format!(
+            "/c/.claude/projects/p/{CSID}/subagents/agent-x.txt"
+        )))
+        .is_none());
     }
 
     #[test]
