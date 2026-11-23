@@ -1812,6 +1812,12 @@ struct TickResult {
     /// `heartbeats_dropped_on_failure` split by failure kind (non-zero kinds
     /// only) — this tick's share of [`HEARTBEATS_DROPPED_ON_FAILURE_BY_KIND`].
     heartbeats_dropped_on_failure_by_kind: BTreeMap<&'static str, u64>,
+    /// `finished` rows this tick dropped UNSTAMPED at the unconfirmed-answer
+    /// bound, counted only once the ACK landed — this tick's share of
+    /// [`super::coord_sync_finish_ack::FINISHED_UNCONFIRMED_DROPPED`]. Per
+    /// call, so a test can assert its own drops without racing a sibling
+    /// test that bumps the same process-global counter.
+    finished_unconfirmed_dropped: u64,
 }
 
 impl TickResult {
@@ -1823,6 +1829,7 @@ impl TickResult {
             heartbeats_superseded: 0,
             heartbeats_dropped_on_failure: 0,
             heartbeats_dropped_on_failure_by_kind: BTreeMap::new(),
+            finished_unconfirmed_dropped: 0,
         }
     }
 }
@@ -2254,6 +2261,7 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
     let mut heartbeats_superseded = 0;
     let mut heartbeats_dropped_on_failure = 0;
     let mut heartbeats_dropped_on_failure_by_kind: BTreeMap<&'static str, u64> = BTreeMap::new();
+    let mut finished_unconfirmed_dropped_acked = 0;
     if !succeeded.is_empty() {
         match inner.outbox.ack(&succeeded) {
             Ok(()) => {
@@ -2261,6 +2269,7 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
                     state.in_sidecar.remove(key);
                 }
                 heartbeats_superseded = superseded_count;
+                finished_unconfirmed_dropped_acked = finished_unconfirmed_dropped;
                 if finished_unconfirmed_dropped > 0 {
                     super::coord_sync_finish_ack::FINISHED_UNCONFIRMED_DROPPED
                         .fetch_add(finished_unconfirmed_dropped, Ordering::Relaxed);
@@ -2338,6 +2347,7 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         heartbeats_superseded,
         heartbeats_dropped_on_failure,
         heartbeats_dropped_on_failure_by_kind,
+        finished_unconfirmed_dropped: finished_unconfirmed_dropped_acked,
     }
 }
 
