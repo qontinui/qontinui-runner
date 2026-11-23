@@ -1925,7 +1925,48 @@ fn host_capabilities() -> Vec<String> {
         host_mem_total_bytes(),
     );
     caps.extend(imagegen_probe::capability_tokens());
+    caps.extend(acp_agent_capabilities(
+        &crate::settings::get_ai_settings().acp_agents,
+        |program| crate::acp_session::resolve_program(program).is_some(),
+    ));
     caps
+}
+
+/// Prefix of the ACP-agent capability token: one `acp:<id>` per `acp_agents`
+/// entry this runner can actually launch.
+///
+/// The spelling is frozen like [`WEBVIEW_RUNTIME_CAPABILITY`]: coord derives
+/// `required_capabilities += ["acp:<id>"]` from a continuation's
+/// `harness: {"acp": "<id>"}` and places it only on a device advertising that
+/// token, so a respelling silently un-places every ACP continuation, with
+/// nothing red on either side.
+pub const ACP_AGENT_CAPABILITY_PREFIX: &str = "acp:";
+
+/// `acp:<id>` for every `acp_agents` entry whose program `launchable` accepts
+/// (plan `2026-11-13-acp-client-lane-for-acp-native-clis`, Design decision 3).
+///
+/// Pure over the settings map and the probe, like [`build_host_capabilities`];
+/// kept out of that function only because it takes the whole map and the probe,
+/// which would change twelve unrelated call sites. An id that cannot be spelled
+/// as a capability token (empty, or carrying whitespace, `:` or a comma) is
+/// never advertised — it could not be asked for either, since coord splits
+/// `key:value` — and an entry whose program does not resolve is not advertised:
+/// a device that cannot launch the agent must not be placed work for it.
+fn acp_agent_capabilities(
+    agents: &std::collections::BTreeMap<String, crate::settings::AcpAgentSettings>,
+    launchable: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    agents
+        .iter()
+        .filter(|(id, cfg)| {
+            !id.is_empty()
+                && !id
+                    .chars()
+                    .any(|c| c.is_whitespace() || c == ':' || c == ',' || c.is_control())
+                && launchable(&cfg.program)
+        })
+        .map(|(id, _)| format!("{ACP_AGENT_CAPABILITY_PREFIX}{id}"))
+        .collect()
 }
 
 /// [`host_capabilities`] minus the image probe, from the probes' results:
@@ -13336,5 +13377,63 @@ mod binding_set_resolution_tests {
             None,
             "the legacy slot is empty: Device would send the heartbeat anonymously"
         );
+    }
+}
+
+#[cfg(test)]
+mod acp_agent_capability_tests {
+    use super::*;
+    use crate::settings::AcpAgentSettings;
+    use std::collections::BTreeMap;
+
+    fn agent(program: &str) -> AcpAgentSettings {
+        AcpAgentSettings {
+            program: program.to_string(),
+            args: vec!["--acp".to_string()],
+            env_account_var: None,
+        }
+    }
+
+    #[test]
+    fn a_token_is_advertised_only_for_a_program_that_resolves() {
+        let agents = BTreeMap::from([
+            ("gemini".to_string(), agent("gemini")),
+            ("opencode".to_string(), agent("opencode-not-installed")),
+        ]);
+        let caps = acp_agent_capabilities(&agents, |p| p == "gemini");
+        assert_eq!(caps, vec!["acp:gemini".to_string()]);
+        // Anti-vacuity: with everything resolvable, both appear.
+        let all = acp_agent_capabilities(&agents, |_| true);
+        assert_eq!(
+            all,
+            vec!["acp:gemini".to_string(), "acp:opencode".to_string()]
+        );
+    }
+
+    #[test]
+    fn no_acp_agents_advertises_nothing() {
+        assert!(acp_agent_capabilities(&BTreeMap::new(), |_| true).is_empty());
+    }
+
+    #[test]
+    fn an_id_that_cannot_be_a_capability_token_is_never_advertised() {
+        let agents = BTreeMap::from([
+            ("has space".to_string(), agent("x")),
+            ("has:colon".to_string(), agent("x")),
+            ("a,b".to_string(), agent("x")),
+            (String::new(), agent("x")),
+            ("fine-1.0_x".to_string(), agent("x")),
+        ]);
+        assert_eq!(
+            acp_agent_capabilities(&agents, |_| true),
+            vec!["acp:fine-1.0_x".to_string()]
+        );
+    }
+
+    #[test]
+    fn the_prefix_spelling_is_frozen() {
+        // Coord derives `required_capabilities` from the continuation's
+        // `harness` using this exact prefix.
+        assert_eq!(ACP_AGENT_CAPABILITY_PREFIX, "acp:");
     }
 }

@@ -162,10 +162,15 @@ fn execute_json_stringify(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    // Keys sorted, as this step has always emitted them: serde_json's
+    // `preserve_order` is on for this build (see `util::json_canon`), and a
+    // workflow that hashes or compares this output must not see it change
+    // with the input's key order.
+    let input = crate::util::json_canon::sort_keys(input.clone());
     let output = if pretty {
-        serde_json::to_string_pretty(input)
+        serde_json::to_string_pretty(&input)
     } else {
-        serde_json::to_string(input)
+        serde_json::to_string(&input)
     };
 
     match output {
@@ -731,5 +736,23 @@ mod tests {
         let result =
             execute_builtin_tool("step1", "unknown_tool", &HashMap::new(), &HashMap::new()).await;
         assert!(result.is_none());
+    }
+
+    /// The output's keys are sorted whatever the input's key order.
+    #[tokio::test]
+    async fn test_json_stringify_sorts_keys() {
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "input".to_string(),
+            serde_json::from_str::<serde_json::Value>(r#"{"b":1,"a":{"d":2,"c":3}}"#).unwrap(),
+        );
+        let result = execute_builtin_tool("step1", "json_stringify", &inputs, &HashMap::new())
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert_eq!(
+            result.outputs.get("output"),
+            Some(&json!(r#"{"a":{"c":3,"d":2},"b":1}"#))
+        );
     }
 }

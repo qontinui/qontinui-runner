@@ -130,8 +130,12 @@ pub fn proxy_nonce_from_request(headers: &axum::http::HeaderMap) -> Option<Strin
 pub fn proxy_nonce_from_header_object(headers: &serde_json::Value) -> Option<String> {
     let obj = headers.as_object()?;
     let get = |name: &str| {
+        // `min_by` over the key, not `find`: with serde_json's
+        // `preserve_order` on, `find` would pick between two case-variants by
+        // file order rather than deterministically.
         obj.iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+            .min_by(|a, b| a.0.cmp(b.0))
             .and_then(|(_, v)| v.as_str())
     };
     if let Some(n) = get(PROXY_AUTHORIZATION_HEADER_JSON).and_then(proxy_nonce_from_authorization) {
@@ -637,5 +641,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(proxy_nonce_from_config_doc(&doc), None);
+    }
+
+    /// Two case-variants of the header name: the lexicographically smallest
+    /// key wins whatever the file order (serde_json `preserve_order` is on).
+    #[test]
+    fn case_variant_header_keys_resolve_by_key_order_not_file_order() {
+        let headers = serde_json::json!({
+            "x-coord-mcp-proxy-key": "lower",
+            "X-Coord-Mcp-Proxy-Key": "upper"
+        });
+        assert_eq!(
+            proxy_nonce_from_header_object(&headers).as_deref(),
+            Some("upper")
+        );
     }
 }

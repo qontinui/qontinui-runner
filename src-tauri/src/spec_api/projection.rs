@@ -17,31 +17,9 @@ use super::types::{
     LegacyStateMachine, LegacyStateMachineState, LegacyTransition,
 };
 
-/// Recursively sort object keys lexicographically. Arrays preserve input
-/// order. Mirrors the TS `sortKeys` pass in `projection.ts`.
-fn sort_keys(value: Value) -> Value {
-    match value {
-        Value::Object(map) => {
-            // BTreeMap iterates in lexicographic order; serde_json's `Map`
-            // does not, so we collect into a btree to enforce sort, then
-            // back into a `Map` (which preserves insertion order on
-            // serialization with the default `preserve_order` feature off
-            // — and even with it on, our sorted insertion is what counts).
-            let mut sorted: std::collections::BTreeMap<String, Value> =
-                std::collections::BTreeMap::new();
-            for (k, v) in map {
-                sorted.insert(k, sort_keys(v));
-            }
-            let mut out = Map::new();
-            for (k, v) in sorted {
-                out.insert(k, v);
-            }
-            Value::Object(out)
-        }
-        Value::Array(arr) => Value::Array(arr.into_iter().map(sort_keys).collect()),
-        other => other,
-    }
-}
+// Recursively sort object keys lexicographically. Arrays preserve input
+// order. Mirrors the TS `sortKeys` pass in `projection.ts`.
+use crate::util::json_canon::sort_keys;
 
 /// Convert IR criteria to legacy criteria. Mirrors `convertCriteria` in
 /// the TS projection.

@@ -57,7 +57,13 @@ schemars = "1"
 jsonschema = { version = "0.45", default-features = false }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["compat"] }
+# Agent Client Protocol client (the headless ACP lane, `acp_session/`). v1 only:
+# no `unstable_*` / v2-draft feature, and NOT `process` -- its `AcpAgent`
+# spawner can only ADD env to the child, never remove it, so the runner's
+# credential scrub (`finalize_headless_child_env`) could not apply. The child is
+# spawned by the runner itself and handed over as `ByteStreams`.
+agent-client-protocol = { version = "5", default-features = false }
 uuid = { version = "1.0", features = ["v4", "v5", "v7", "serde"] }
 thiserror = "2"
 anyhow = "1.0"

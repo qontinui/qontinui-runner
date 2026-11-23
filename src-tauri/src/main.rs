@@ -28,6 +28,10 @@ mod agent_daemons;
 // exact sibling of `agent_commands`. Named `agent_skills`, never `skills`:
 // `crate::skills` is the automation-template registry.
 mod agent_skills;
+// Plan `2026-11-13-acp-client-lane-for-acp-native-clis`: the headless ACP
+// client lane (Gemini CLI / OpenCode / Codex-via-codex-acp ...). Declared in the
+// bin only -- it spawns through `agent_runtime::finalize_headless_child_env`.
+mod acp_session;
 // One process-wide pooled `reqwest::Client` for the per-agent coord
 // daemons. Replaces per-request `Client::new()` on the tick paths, which
 // reuses no connection and burned the machine's whole ephemeral port

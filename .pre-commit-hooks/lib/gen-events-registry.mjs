@@ -413,8 +413,16 @@ function parseRegistry(src) {
   const mentions = count(body, new RegExp(`\\b${mapVar}\\b`, 'g'));
   const inserts = count(macroBody, new RegExp(`\\b${mapVar}\\s*\\.\\s*insert\\s*\\(`, 'g'));
   // Anchored on the left too: `crate::m::Object(map)` ends the same way.
+  //
+  // ONE wrapper is accepted, spelled exactly: `crate::util::json_canon::sort_keys(…)`.
+  // It recursively sorts object keys and cannot add, drop or rename a key, so
+  // the exported name set this reader computes stays the true one. It exists
+  // because `agent-client-protocol` turns serde_json's `preserve_order` on for
+  // the build, and without it property/`$defs` order would follow declaration
+  // order and rewrite every generated binding. Any other wrapper is refused.
   const returned = new RegExp(
-    `(?:^|[;}\\s])((?:serde_json\\s*::\\s*)?Value)\\s*::\\s*Object\\s*\\(\\s*${mapVar}\\s*\\)$`,
+    `(?:^|[;}\\s])(?:crate\\s*::\\s*util\\s*::\\s*json_canon\\s*::\\s*sort_keys\\s*\\(\\s*((?:serde_json\\s*::\\s*)?Value)\\s*::\\s*Object\\s*\\(\\s*${mapVar}\\s*\\)\\s*\\)` +
+      `|((?:serde_json\\s*::\\s*)?Value)\\s*::\\s*Object\\s*\\(\\s*${mapVar}\\s*\\))$`,
   ).exec(body.trim());
   const returns = returned !== null;
   if (shape[1] !== mapVar) violation(`the add! macro inserts into \`${shape[1]}\`, not the map \`${mapVar}\``);
@@ -493,7 +501,9 @@ function parseRegistry(src) {
   pinned('schemars', 'schemars', { optional: true });
   pinned('serde_json', 'serde_json', { optional: true });
   if (!/\bserde_json\b/.test(lets[0][0])) pinned('Map', 'serde_json::Map', {});
-  if (!/\bserde_json\b/.test(returned[1])) pinned('Value', 'serde_json::Value', {});
+  // Group 1 is the `Value` path inside the accepted sort wrapper, group 2 the
+  // bare return's.
+  if (!/\bserde_json\b/.test(returned[1] ?? returned[2])) pinned('Value', 'serde_json::Value', {});
 
   const lines = [];
   for (const name of [...names.keys()].sort()) {

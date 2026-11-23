@@ -10652,25 +10652,42 @@ fn proxy_config_json_for(
     agent_marked: bool,
 ) -> serde_json::Value {
     let http = http_proxy_config_json(bound_port, nonce, agent_marked);
+    stdio_shim_document(&http, nonce, identity).unwrap_or(http)
+}
+
+/// The stdio-shim form of the `.mcp.json` document whose http form is `http`,
+/// or `None` when the stdio arm cannot be taken (gate closed, kill switch,
+/// credential file unwritable — each fails OPEN to the http document, which is
+/// the caller's `unwrap_or`).
+///
+/// Writes the nonce's credential file BEFORE emitting a document that names it.
+/// Split out of [`proxy_config_json_for`] so the ACP lane renders the stdio
+/// entry for a nonce already on disk through THIS function rather than a second
+/// renderer ([`acp_mcp_entry`]).
+fn stdio_shim_document(
+    http: &serde_json::Value,
+    nonce: &str,
+    identity: ProxyConfigIdentity<'_>,
+) -> Option<serde_json::Value> {
     let (interpreter, shim) = match stdio_shim_gate() {
         StdioShimGate::Open { interpreter, shim } => (interpreter, shim),
-        StdioShimGate::TestDefault => return http,
+        StdioShimGate::TestDefault => return None,
         StdioShimGate::KillSwitch => {
             info!(
                 "coord_mcp: {COORD_MCP_STDIO_SHIM_ENV}=0 — emitting the http proxy document \
                  for {} (stdio shim disabled by preference, not by fault)",
                 identity.workdir
             );
-            return http;
+            return None;
         }
         StdioShimGate::Refused(reason) => {
             note_stdio_fall_open(identity.workdir, nonce, &reason);
-            return http;
+            return None;
         }
     };
     let entry = &http["mcpServers"]["coord-mcp"];
     match write_stdio_shim_credential(identity, &entry["url"], &entry["headers"]) {
-        Ok(credential) => serde_json::json!({
+        Ok(credential) => Some(serde_json::json!({
             "mcpServers": {
                 "coord-mcp": {
                     "type": "stdio",
@@ -10682,15 +10699,93 @@ fn proxy_config_json_for(
                     ],
                 }
             }
-        }),
+        })),
         Err(e) => {
             note_stdio_fall_open(
                 identity.workdir,
                 nonce,
                 &format!("credential file write failed: {e}"),
             );
-            http
+            None
         }
+    }
+}
+
+/// The coord-mcp server an ACP agent is handed on `session/new`, read back from
+/// the `<workdir>/.mcp.json` the provisioner wrote (or the workdir already
+/// declared — [`CoordMcpDelivery::WorkdirDeclared`]). There is ONE renderer: the
+/// document the Claude path reads is the document this converts, so the two
+/// lanes cannot drift.
+///
+/// ACP makes stdio mandatory and HTTP optional (`mcpCapabilities.http`). A
+/// stdio entry is handed over as is (the shim re-reads its credential file per
+/// call, so it survives nonce rotation). An http entry goes over HTTP only when
+/// the agent advertises it; otherwise it is re-rendered as the stdio shim for
+/// the SAME nonce through [`stdio_shim_document`], and `None` when that is not
+/// possible — the session then runs without coord-mcp, which the caller records.
+pub(crate) fn acp_mcp_entry(
+    workdir: &str,
+    agent_http: bool,
+    identity: ProxyConfigIdentity<'_>,
+) -> Option<crate::acp_session::McpEntry> {
+    let raw = std::fs::read_to_string(Path::new(workdir).join(".mcp.json")).ok()?;
+    let doc: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    acp_mcp_entry_from_doc(&doc, agent_http, identity)
+}
+
+/// Pure core of [`acp_mcp_entry`] over an already-read document.
+pub(crate) fn acp_mcp_entry_from_doc(
+    doc: &serde_json::Value,
+    agent_http: bool,
+    identity: ProxyConfigIdentity<'_>,
+) -> Option<crate::acp_session::McpEntry> {
+    use crate::acp_session::McpEntry;
+    const NAME: &str = "coord-mcp";
+    fn pairs(v: Option<&serde_json::Value>) -> Vec<(String, String)> {
+        v.and_then(serde_json::Value::as_object)
+            .map(|o| {
+                o.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    fn stdio(entry: &serde_json::Value) -> Option<McpEntry> {
+        Some(McpEntry::Stdio {
+            name: NAME.to_string(),
+            command: entry.get("command")?.as_str()?.into(),
+            args: entry
+                .get("args")
+                .and_then(serde_json::Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            env: pairs(entry.get("env")),
+        })
+    }
+    let entry = doc.pointer("/mcpServers/coord-mcp")?;
+    match entry.get("type").and_then(serde_json::Value::as_str) {
+        Some("stdio") => stdio(entry),
+        // `type` is optional for a url entry in the config dialects in the wild.
+        Some("http") | None => {
+            let url = entry.get("url")?.as_str()?.to_string();
+            if agent_http {
+                return Some(McpEntry::Http {
+                    name: NAME.to_string(),
+                    url,
+                    headers: pairs(entry.get("headers")),
+                });
+            }
+            let nonce =
+                crate::coord_mcp_config::proxy_nonce_from_header_object(entry.get("headers")?)?;
+            let rendered = stdio_shim_document(doc, &nonce, identity)?;
+            stdio(rendered.pointer("/mcpServers/coord-mcp")?)
+        }
+        Some(_) => None,
     }
 }
 
@@ -16584,6 +16679,101 @@ mod tests {
         let _restore = crate::test_env::EnvVarRestore::capture(&[COORD_MCP_STDIO_SHIM_ENV]);
         std::env::remove_var(COORD_MCP_STDIO_SHIM_ENV);
         assert_eq!(stdio_shim_gate(), StdioShimGate::TestDefault);
+    }
+
+    // ---- ACP lane: the one renderer, converted to an ACP `McpServer` --------
+
+    fn acp_http_doc(nonce: &str) -> serde_json::Value {
+        http_proxy_config_json(23999, nonce, false)
+    }
+
+    /// An http entry goes over HTTP, headers verbatim, only when the agent
+    /// advertises it.
+    #[test]
+    fn acp_mcp_entry_hands_an_advertising_agent_the_http_entry_verbatim() {
+        let doc = acp_http_doc("n-http");
+        let entry = acp_mcp_entry_from_doc(&doc, true, ProxyConfigIdentity::device("/w", None))
+            .expect("an http entry converts");
+        match entry {
+            crate::acp_session::McpEntry::Http { name, url, headers } => {
+                assert_eq!(name, "coord-mcp");
+                assert_eq!(url, "http://127.0.0.1:23999/coord-mcp");
+                assert!(
+                    headers.contains(&("Authorization".to_string(), "Bearer n-http".to_string())),
+                    "the nonce header must ride: {headers:?}"
+                );
+            }
+            other => panic!("expected http, got {other:?}"),
+        }
+    }
+
+    /// An http entry on an agent WITHOUT http MCP is re-rendered as the stdio
+    /// shim for the SAME nonce, through the one stdio renderer — and the
+    /// credential file it names carries that nonce.
+    #[test]
+    fn acp_mcp_entry_rerenders_http_as_the_stdio_shim_for_an_agent_without_http() {
+        let (_amb, _gate, interpreter, shim) = open_stdio_gate_for_test();
+        let tmp = tempfile::tempdir().unwrap();
+        let wd = tmp.path().to_string_lossy().to_string();
+        let doc = acp_http_doc("n-rerender");
+        let entry = acp_mcp_entry_from_doc(&doc, false, ProxyConfigIdentity::device(&wd, None))
+            .expect("stdio is mandatory in ACP, so an http-only agent still gets coord-mcp");
+        let crate::acp_session::McpEntry::Stdio { command, args, .. } = entry else {
+            panic!("expected stdio");
+        };
+        assert_eq!(command, interpreter);
+        assert_eq!(args[0], shim.to_string_lossy());
+        assert_eq!(args[1], COORD_MCP_STDIO_SHIM_CREDENTIAL_FLAG);
+        let cred: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&args[2]).unwrap()).unwrap();
+        assert_eq!(cred["headers"]["Authorization"], "Bearer n-rerender");
+    }
+
+    /// A stdio entry (what the provisioner writes when the shim is open) passes
+    /// through unchanged, whatever the agent advertises.
+    #[test]
+    fn acp_mcp_entry_passes_a_stdio_entry_through() {
+        let doc = serde_json::json!({"mcpServers": {"coord-mcp": {
+            "type": "stdio", "command": "/usr/bin/python3",
+            "args": ["/s/coord-mcp-shim.py", "--credential", "/c.json"]
+        }}});
+        for http in [false, true] {
+            let e = acp_mcp_entry_from_doc(&doc, http, ProxyConfigIdentity::device("/w", None))
+                .unwrap();
+            assert_eq!(
+                e,
+                crate::acp_session::McpEntry::Stdio {
+                    name: "coord-mcp".into(),
+                    command: "/usr/bin/python3".into(),
+                    args: vec![
+                        "/s/coord-mcp-shim.py".into(),
+                        "--credential".into(),
+                        "/c.json".into()
+                    ],
+                    env: vec![],
+                }
+            );
+        }
+    }
+
+    /// No coord-mcp entry, or an unreadable one, is `None`: the session runs
+    /// without coord-mcp and the caller records that it did.
+    #[test]
+    fn acp_mcp_entry_is_none_without_a_usable_entry() {
+        let id = ProxyConfigIdentity::device("/w", None);
+        assert!(acp_mcp_entry_from_doc(&serde_json::json!({}), true, id).is_none());
+        assert!(acp_mcp_entry_from_doc(
+            &serde_json::json!({"mcpServers": {"coord-mcp": {"type": "sse", "url": "x"}}}),
+            true,
+            id
+        )
+        .is_none());
+        // http without http support and with the stdio arm closed: none, never a
+        // silently-http entry.
+        let _lock = env_lock();
+        let _g =
+            StdioShimGateGuard::install(StdioShimGateOverride::Fixed(StdioShimGate::KillSwitch));
+        assert!(acp_mcp_entry_from_doc(&acp_http_doc("n"), false, id).is_none());
     }
 
     /// The DEVICE path under the stdio arm: the document names the interpreter,
