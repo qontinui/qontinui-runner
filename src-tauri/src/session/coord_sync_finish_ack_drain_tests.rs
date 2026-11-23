@@ -6,7 +6,7 @@
 
 use super::*;
 use crate::session::coord_sync_finish_ack::{
-    unconfirmed_message, FINISHED_UNCONFIRMED_DROPPED, FINISHED_UNCONFIRMED_KIND,
+    unconfirmed_message, FINISHED_UNCONFIRMED_KIND,
     FINISHED_UNCONFIRMED_MAX_ATTEMPTS, FINISHED_UNCONFIRMED_MIN_AGE,
 };
 
@@ -204,20 +204,23 @@ async fn five_unconfirmed_answers_drop_the_row_unstamped_and_count_it() {
     }
     let s = Uuid::new_v4();
     queue_finish(&outbox, s, "csid-bounded", 42);
-    let before = FINISHED_UNCONFIRMED_DROPPED.load(Ordering::Relaxed);
     let mut state = DrainState::default();
     for attempt in 1..FINISHED_UNCONFIRMED_MAX_ATTEMPTS {
-        drain_tick(&coord.inner, &mut state).await;
+        let tick = drain_tick(&coord.inner, &mut state).await;
         assert_eq!(
             pending_of(&outbox, s).len(),
             1,
             "still queued after unconfirmed answer {attempt}"
         );
+        assert_eq!(
+            tick.finished_unconfirmed_dropped, 0,
+            "nothing dropped before the bound (answer {attempt})"
+        );
         retry_now(&mut state, s);
     }
     // Both bounds: the age floor has passed too.
     age_unconfirmed(&mut state, s);
-    drain_tick(&coord.inner, &mut state).await;
+    let tick = drain_tick(&coord.inner, &mut state).await;
     assert_eq!(FINISHED_UNCONFIRMED_MAX_ATTEMPTS, 5);
     assert!(
         pending_of(&outbox, s).is_empty(),
@@ -235,10 +238,11 @@ async fn five_unconfirmed_answers_drop_the_row_unstamped_and_count_it() {
         "the bound fired, not the quarantine"
     );
     assert!(!state.retry.contains_key(&s));
-    // Process-global: only this test drives a finish to its bound.
+    // Counted per call: the process-global FINISHED_UNCONFIRMED_DROPPED is
+    // also bumped by sibling tests driving their own finishes to the bound.
     assert_eq!(
-        FINISHED_UNCONFIRMED_DROPPED.load(Ordering::Relaxed) - before,
-        1
+        tick.finished_unconfirmed_dropped, 1,
+        "the bounded tick reports the one row it dropped unconfirmed"
     );
     let health = render_session_outbox_health(&SessionOutboxHealth {
         observed_at: Some(Utc::now()),
@@ -313,11 +317,12 @@ async fn a_quarantined_sessions_unconfirmed_finish_still_reaches_the_bound() {
         retry_now(&mut state, s);
     }
     age_unconfirmed(&mut state, s);
-    drain_tick(&coord.inner, &mut state).await;
+    let tick = drain_tick(&coord.inner, &mut state).await;
     assert!(
         pending_of(&outbox, s).is_empty(),
         "the bound dropped the quarantined session's finish"
     );
+    assert_eq!(tick.finished_unconfirmed_dropped, 1, "counted per call");
     assert!(acks.lock().unwrap().is_empty(), "dropped UNSTAMPED");
     assert!(
         state.quarantined.contains(&s),
