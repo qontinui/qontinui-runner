@@ -18526,6 +18526,107 @@ mod tests {
         }
     }
 
+    /// `overlay_absent_statement` names one of four outcomes. The provisioning
+    /// tests above reach three of them on disk. The fourth, "unsupported", needs
+    /// a floor with nothing to write, which only an empty embedded bundle
+    /// produces, so no provisioning test can reach it. This test calls the pure
+    /// statement for each outcome, with and without a write failure where the
+    /// outcome can carry one, and at the `> 0` boundary of each count. It checks
+    /// that each arm keeps the shared headline, and that only the last arm says
+    /// this installation lacks the capability.
+    #[test]
+    fn overlay_absent_statement_names_each_of_its_four_outcomes() {
+        const SIBLING: &str = "qontinui-claude-config";
+        const SERVED: &str = "This capability is served from the copy built into the application";
+        const UNSUPPORTED: &str = "This capability is not supported in this installation";
+        let headline = format!(
+            "{} ({SIBLING}).",
+            qontinui_types::refusal::RefusalCode::SiblingCheckoutAbsent.headline()
+        );
+        let dst = std::path::PathBuf::from("wt")
+            .join(".claude")
+            .join("agents");
+
+        // 1. The floor wrote definitions: the built-in copy serves them.
+        let embedded = overlay_absent_statement(2, 1, None, &dst);
+        assert!(embedded.starts_with(&headline), "{embedded}");
+        assert!(embedded.contains(SERVED), "{embedded}");
+        assert!(
+            embedded.contains("Embedded default(s) written: 2; existing definition(s) kept: 1."),
+            "{embedded}"
+        );
+        assert!(!embedded.contains(UNSUPPORTED), "{embedded}");
+        assert!(!embedded.contains("failed:"), "{embedded}");
+        // A partial write still says the built-in copy serves, and names the failure.
+        let partial = overlay_absent_statement(1, 0, Some("disk full"), &dst);
+        assert!(partial.contains(SERVED), "{partial}");
+        assert!(
+            partial.ends_with(&format!(
+                " Writing the built-in copy into {} failed: disk full.",
+                dst.display()
+            )),
+            "{partial}"
+        );
+
+        // 2. It only kept definitions: the repository's own copies serve them.
+        let kept = overlay_absent_statement(0, 1, None, &dst);
+        assert!(kept.starts_with(&headline), "{kept}");
+        assert!(
+            kept.contains("The 1 existing agent definition(s) on disk"),
+            "{kept}"
+        );
+        assert!(!kept.contains(SERVED), "{kept}");
+        assert!(!kept.contains(UNSUPPORTED), "{kept}");
+        assert!(!kept.contains("failed:"), "{kept}");
+        // Kept definitions still serve when another write failed, and the
+        // failure is named. The outcome stays "kept", not "not on disk here".
+        let kept_failed = overlay_absent_statement(0, 2, Some("read-only"), &dst);
+        assert!(
+            kept_failed.contains("The 2 existing agent definition(s) on disk"),
+            "{kept_failed}"
+        );
+        assert!(kept_failed.contains("were kept"), "{kept_failed}");
+        assert!(
+            kept_failed.ends_with(&format!(
+                " Writing the built-in copy into {} failed: read-only.",
+                dst.display()
+            )),
+            "{kept_failed}"
+        );
+        assert!(
+            !kept_failed.contains("is not on disk here"),
+            "{kept_failed}"
+        );
+        assert!(!kept_failed.contains(UNSUPPORTED), "{kept_failed}");
+
+        // 3. It wrote nothing and its write failed: a local fault, not a missing
+        //    capability.
+        let failed = overlay_absent_statement(0, 0, Some("permission denied"), &dst);
+        assert!(failed.starts_with(&headline), "{failed}");
+        assert!(failed.contains("is not on disk here"), "{failed}");
+        assert!(
+            failed.ends_with(&format!(
+                " Writing the built-in copy into {} failed: permission denied.",
+                dst.display()
+            )),
+            "{failed}"
+        );
+        assert!(!failed.contains(SERVED), "{failed}");
+        assert!(!failed.contains(UNSUPPORTED), "{failed}");
+
+        // 4. It had nothing to write and nothing failed: the one arm that says the
+        //    capability is unsupported, rendered as the shared refusal.
+        //    Spelled out in full, so the expected value is not the same
+        //    expression the function returns.
+        let unsupported = overlay_absent_statement(0, 0, None, &dst);
+        assert_eq!(
+            unsupported,
+            format!("{headline} Nothing you can do will change this outcome. {UNSUPPORTED}.")
+        );
+        assert!(!unsupported.contains(SERVED), "{unsupported}");
+        assert!(!unsupported.contains("failed:"), "{unsupported}");
+    }
+
     /// The rendered `WorkspaceRootUnresolved` a `require_workspace_root` caller
     /// passes in, standing in for the real sentence so the tests stay pure.
     const UNRESOLVED: &str = "the workspace root sentence";
