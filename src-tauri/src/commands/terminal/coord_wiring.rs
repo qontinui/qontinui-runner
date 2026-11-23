@@ -47,6 +47,8 @@
 //! | `POST /terminals` | [`finish_terminal_create`], `FreshPinned` |
 //! | `POST /steward/{kind}/start` (`mcp/steward.rs`) | [`finish_terminal_create`], `FreshPinned` |
 //! | `create_terminal_session_backend` (gate continuations) | its own lineage register, then [`bind_registered_coord_session`] |
+//! | relay remote create (`mcp/backend_relay.rs`) | `register_external_confirmed`, then [`wire_registry_hook`] (liveness checked before the pipe) |
+//! | holder boot-sweep adoption (`commands::terminal::rebind_adopted_terminal`) | `resume_external` of the recorded binding, then [`bind_registered_coord_session`] |
 //!
 //! The steward create path is NOT exempt, and never was on purpose: a steward
 //! pane is a terminal-hosted agent session like any other, nothing in

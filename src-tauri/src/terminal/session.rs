@@ -6138,8 +6138,12 @@ pub(crate) mod tests {
         assert_eq!(on_exit_hook_code(None, false), None);
     }
 
+    /// The close-intent slot round-trips every value. (That a NATURAL exit —
+    /// no intent stored — is not read as runner-initiated is proven through the
+    /// waiter itself, in
+    /// `the_waiter_skips_every_exit_effect_on_a_handoff_and_runs_them_otherwise`.)
     #[test]
-    fn a_natural_exit_is_not_classified_as_runner_initiated() {
+    fn the_close_intent_slot_round_trips_every_value() {
         let intent = AtomicU8::new(CloseIntent::None as u8);
         assert_eq!(CloseIntent::load(&intent), CloseIntent::None);
         CloseIntent::RunnerKill.store(&intent);

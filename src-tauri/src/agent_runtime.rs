@@ -5042,8 +5042,9 @@ impl WorkExit {
     /// Classify the waiter's facts. A requested close wins over the code — a
     /// killed child exits non-zero, and reading that as a crash would re-deliver
     /// work its operator (or its runner's shutdown and durable restore) ended
-    /// on purpose. The close verdict is the waiter's own
-    /// (`mark_exited_was_runner_initiated`). `pane_io` reports the process's
+    /// on purpose. The close verdict is the waiter's own (the `CloseIntent`
+    /// a runner-initiated close records before its kill, read in
+    /// `terminal::session::Waiter::settled`). `pane_io` reports the process's
     /// real exit status (a signal death reads as 1 on unix, with no signal
     /// attribution), so exit 130 — the conventional interrupted-by-user status
     /// — is read as a deliberate end. A misread costs a retry, never a double.
