@@ -6221,18 +6221,33 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 ///
 /// `coord_publish_prompt_document` and `coord_adopt_upstream_prompt_document`
 /// (plan `2026-11-23-agents-can-publish-a-prompt-document-and-adopt-an-equal-upstream-copy`
-/// Phase 3) are the agent twins of the operator's publish and upstream-adopt
-/// doors (`POST /coord/agent-prompt-documents/:kind/:name/publish` and
-/// `.../upstream-adopt`), granted on coord's `DEVICE_DEFAULT_TOOLS` and listed
-/// on its `BOOTSTRAP_DENIED_TOOLS`. Both WRITE: the publish refuses every
-/// non-system tenant, a stale `expected_version`, a `deny` tier, a refusing
-/// `policy_write` dial, a `never` mode, a held document without the exact
-/// acknowledged token set, and a call without a `notification_ref`; the adopt
-/// takes only the latest publication into a byte-identical copy. The proxy's
-/// operation classifier defaults an unknown tool to WRITE, which both are.
-/// They are forwarded ahead of the coord half serving them, which is harmless
-/// (coord answers an unknown tool), so a box rebuilt from this sha forwards
-/// them the moment coord deploys.
+/// Phase 3) are the MCP halves of two AGENT doors on coord,
+/// `POST /coord/agent-prompt-documents/:kind/:name/publish` and
+/// `POST /coord/agent-prompt-documents/:kind/:name/upstream-adopt` — the agent
+/// twins of the operator's `POST /coord/prompt-documents/:kind/:name/publish`
+/// and `.../upstream-adopt`. The coord half is the same plan's Phases 1-2, a
+/// separate qontinui-coord change; as of coord `origin/main` `499c2440b` (read
+/// 2026-11-23) neither tool exists there, and until that change deploys coord
+/// answers both as unknown tools, so forwarding them early is harmless. As
+/// that change is written it grants both on coord's `DEVICE_DEFAULT_TOOLS` and
+/// lists both on its `BOOTSTRAP_DENIED_TOOLS`; re-verify against coord
+/// `origin/main` when editing this paragraph.
+///
+/// Both WRITE, and the proxy's operation classifier
+/// (`session::coord_transport_rung::operation_for_call`) already answers WRITE
+/// for an unlisted tool. What a leaked proxy nonce reaches through them is the
+/// grant of the principal the nonce is bound to (the device's credential, or a
+/// bound agent's own JWT), narrowed by coord. As that change is written, the
+/// publish answers only the system tenant and refuses, among others, a stale
+/// `expected_version`, a `deny` tier, a refusing `policy_write` dial, a `never`
+/// mode, a held body without the exact acknowledged token set, and any call
+/// without a `notification_ref`; a publish it accepts reaches every tenant
+/// through coord's fan-out. The adopt takes only the latest publication into a
+/// copy whose body is already byte-identical to it. Neither is undone by a
+/// withdraw: a publication is immutable (coord has deliberately no withdraw
+/// route) and is corrected by publishing again; an adopt is one version
+/// snapshot, restorable from the document's history. A box rebuilt from a sha
+/// containing these entries forwards both the moment coord deploys.
 ///
 /// **Landed is not delivered** (plan `2026-09-03-coord-mcp-403-names-its-own-cause`
 /// Phase 3). This list is compiled into the binary, so a PR that edits it is
@@ -17782,10 +17797,13 @@ mod coord_mcp_body_gate_tests {
     }
 
     /// Plan `2026-11-23-agents-can-publish-a-prompt-document-and-adopt-an-equal-upstream-copy`
-    /// Phase 3: coord grants the agent publish and upstream-adopt tools on its
-    /// device floor; without these entries every runner-proxied session gets
-    /// `-32601` for them. Both are writes, so the proxy must classify them as
-    /// such (the classifier's unknown-tool default).
+    /// Phase 3: the coord half of the same plan (not yet on coord main) grants
+    /// the agent publish and upstream-adopt tools on its device floor; without
+    /// these entries every runner-proxied session would get `-32601` for them.
+    /// Both are writes, and the proxy's classifier must say so (pinned below
+    /// through `operation_for_call`). Sorted ORDER is `allowlist_tables_are_sorted`'s
+    /// to pin: a `binary_search` over an unsorted slice is unspecified, so no
+    /// per-name assertion here can be relied on to catch a mis-sort.
     #[test]
     fn agent_publish_and_adopt_tools_are_allowed_and_parse_from_source() {
         let parsed = working_tree_tool_policy();
@@ -17793,10 +17811,17 @@ mod coord_mcp_body_gate_tests {
             "coord_publish_prompt_document",
             "coord_adopt_upstream_prompt_document",
         ] {
-            assert!(coord_mcp_tool_is_allowed(tool), "{tool} must be forwarded");
+            // Present at all (a linear scan, so a removed name is named as
+            // missing), then forwarded by the proxy's own membership check.
             assert!(
-                COORD_MCP_ALLOWED_TOOLS.binary_search(&tool).is_ok(),
-                "membership is a binary_search, so {tool} must sit in sorted position"
+                COORD_MCP_ALLOWED_TOOLS.contains(&tool),
+                "{tool} is missing from COORD_MCP_ALLOWED_TOOLS"
+            );
+            assert!(coord_mcp_tool_is_allowed(tool), "{tool} must be forwarded");
+            assert_eq!(
+                crate::session::coord_transport_rung::operation_for_call("tools/call", Some(tool)),
+                crate::session::coord_transport_rung::OPERATION_WRITE,
+                "{tool} is a write and the proxy must classify it as one"
             );
             assert_eq!(
                 parsed.allowed.iter().filter(|t| t.as_str() == tool).count(),
