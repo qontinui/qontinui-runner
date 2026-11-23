@@ -17,15 +17,27 @@
 //! - **Device-JWT-gated.** Unpaired ⇒ skip quietly.
 //! - **503-tolerant.** Coord maps un-migrated helper-task tables to 503 —
 //!   treated as "feature not available yet", debug-logged, never an error.
-//! - **Fail-open.** Any error is logged and the loop continues; spawned from
-//!   `mcp_api.rs` as a plain background task.
+//! - **Fail-open.** Any error is logged and the loop continues.
+//! - **Supervised.** Started from `mcp_api.rs` `create_router` through
+//!   [`spawn_poller`], under the panic supervisor: a panic is logged, counted on
+//!   `/health` and the loop rebuilt after a backoff. [`tick`] holds no static and
+//!   registers nothing — its state is the answer store (which dedups by answer
+//!   id) and the cursor on disk — so a rebuilt run behaves as a process restart.
 
 use std::time::Duration;
 
 use qontinui_types::helper_task::HelperAnswer;
 use tracing::{debug, info, warn};
 
-const POLL_INTERVAL: Duration = Duration::from_secs(60);
+/// How often the poller ticks.
+pub const POLL_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How long the poller waits after boot before its first tick.
+pub const POLL_START_DELAY: Duration = Duration::from_secs(5);
+
+/// The `worker_supervisor` registry name of the loop [`spawn_poller`] starts,
+/// as `GET /health` `supervised_workers` lists it.
+pub const POLLER_WORKER: &str = "helper_tasks.poller";
 
 /// Cursor file co-located with `settings.json` (honors the per-instance
 /// `QONTINUI_CONFIG_DIR` override, so temp runners don't share the primary's
@@ -40,19 +52,25 @@ const CURSOR_FILE: &str = "helper-answers-cursor.json";
 /// replaces on a strictly newer `created_at` (revision rule).
 const CURSOR_OVERLAP_SECS: i64 = 2;
 
-/// Run the poll loop forever. Spawned once at API boot; every failure mode is
-/// contained inside the tick.
-pub async fn run_forever() {
-    info!(
-        "helper_tasks poller started (interval={}s, active when settings.helper_tasks.emit_enabled OR the answer store is non-empty)",
-        POLL_INTERVAL.as_secs()
-    );
-    loop {
-        if let Err(e) = tick().await {
-            warn!("helper_tasks poller: tick failed (will retry): {e}");
+/// Start the poll loop: wait `start_delay` ([`POLL_START_DELAY`] in
+/// production), then tick every `interval` ([`POLL_INTERVAL`]) for the life of
+/// the process. Every failure mode of a tick is contained inside it; a panic is
+/// the supervisor's, and its heartbeat ticks once per pass.
+pub fn spawn_poller(start_delay: Duration, interval: Duration) -> tokio::task::JoinHandle<()> {
+    crate::worker_supervisor::spawn_supervised_with_heartbeat(POLLER_WORKER, move |hb| async move {
+        tokio::time::sleep(start_delay).await;
+        info!(
+            "helper_tasks poller started (interval={}s, active when settings.helper_tasks.emit_enabled OR the answer store is non-empty)",
+            interval.as_secs()
+        );
+        loop {
+            hb.tick();
+            if let Err(e) = tick().await {
+                warn!("helper_tasks poller: tick failed (will retry): {e}");
+            }
+            tokio::time::sleep(interval).await;
         }
-        tokio::time::sleep(POLL_INTERVAL).await;
-    }
+    })
 }
 
 async fn tick() -> Result<(), String> {
@@ -188,5 +206,30 @@ fn save_cursor(since: &str) {
     let body = serde_json::json!({ "since": since }).to_string();
     if let Err(e) = crate::fs_atomic::atomic_write(&path, body.as_bytes()) {
         warn!("helper_tasks poller: cursor persist failed (best-effort): {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The door `create_router` calls registers the poller with the panic
+    /// supervisor under its `/health` name. The start delay is long, so no tick
+    /// reads settings or leaves the process.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_poller_registers_with_the_panic_supervisor() {
+        let handle = spawn_poller(Duration::from_secs(3600), POLL_INTERVAL);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !crate::worker_supervisor::snapshot()
+            .iter()
+            .any(|row| row.name == POLLER_WORKER)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "spawn_poller never registered {POLLER_WORKER}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        handle.abort();
     }
 }

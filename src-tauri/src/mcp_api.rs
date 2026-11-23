@@ -12011,8 +12011,10 @@ pub fn create_router(
     crate::util::egress_context::init_process_start();
     // …and start the healthy-state baseline. A count captured mid-episode is a
     // number with nothing to compare it to unless a baseline was already being
-    // emitted BEFORE the episode.
-    crate::util::egress_context::spawn_baseline_logger();
+    // emitted BEFORE the episode. Supervised: a panic restarts it.
+    crate::util::egress_context::spawn_baseline_logger(
+        crate::util::egress_context::BASELINE_INTERVAL,
+    );
 
     // Get dev_logs path for session manager
     let dev_logs_path = get_workspace_paths_internal()
@@ -12210,7 +12212,11 @@ pub fn create_router(
     app_handle.manage(api_state.supervision_state.clone());
 
     // Spawn the background sweeper that drops rows whose reservation lapsed.
-    crate::mcp::app_registry::spawn_sweeper(api_state.app_registry.clone());
+    // Supervised: a panic restarts it.
+    crate::mcp::app_registry::spawn_sweeper(
+        api_state.app_registry.clone(),
+        crate::mcp::app_registry::SWEEP_INTERVAL,
+    );
 
     // Set up UI Bridge response listener
     // This listens for "ui-bridge-response" events from the React frontend
@@ -12817,13 +12823,12 @@ pub fn create_router(
     // runs when settings.helper_tasks.emit_enabled is on OR the store already
     // has tasks/answers (pausing emission must not pause collection), and is
     // device-JWT-gated — spawning unconditionally adds no always-on traffic
-    // for an opted-out runner with an empty store.
-    {
-        tokio::spawn(async move {
-            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-            crate::helper_tasks::poller::run_forever().await;
-        });
-    }
+    // for an opted-out runner with an empty store. Supervised: a panic
+    // restarts it.
+    crate::helper_tasks::poller::spawn_poller(
+        crate::helper_tasks::poller::POLL_START_DELAY,
+        crate::helper_tasks::poller::POLL_INTERVAL,
+    );
 
     // Restore persisted coord-mcp proxy nonces + reconcile session configs to
     // the current bound port (plan 2026-06-13 Phases 3b + 3c, plan 2026-07-07
@@ -13153,8 +13158,8 @@ pub fn create_router(
     // Keep the canonical-generation rung's mirror of qontinui-claude-config
     // fresh (plan 2026-09-03-served-corpus-provenance-at-spawn, Phase 6). A
     // background timer, never a spawn path: registry resolution only READS the
-    // last loaded snapshot.
-    crate::canonical_corpus::start_refresh_loop();
+    // last loaded snapshot. Supervised: a panic restarts it.
+    crate::canonical_corpus::spawn_refresh_loop(crate::canonical_corpus::REFRESH_START_DELAY);
 
     // Phase 3b — the stale-`.coord-mcp-status` sweep, beside the boot heal that
     // runs inside `reconcile_session_configs` above.
@@ -13171,10 +13176,14 @@ pub fn create_router(
             .app_state
             .api_port
             .load(std::sync::atomic::Ordering::Relaxed);
-        crate::coord_mcp::start_stale_breadcrumb_sweep(sweep_port);
+        crate::coord_mcp::spawn_stale_breadcrumb_sweep(
+            sweep_port,
+            crate::coord_mcp::STALE_BREADCRUMB_SWEEP_INTERVAL,
+        );
     }
 
-    // Start zombie task run sweep (detects and cleans up stale "running" tasks)
+    // Start zombie task run sweep (detects and cleans up stale "running" tasks).
+    // Supervised: a panic restarts it.
     {
         let sweep_handle = app_handle.clone();
         let sweep_sm: Arc<crate::claude_session::SessionManager> = app_handle
@@ -13186,22 +13195,23 @@ pub fn create_router(
             .app_state
             .api_port
             .load(std::sync::atomic::Ordering::Relaxed);
-        crate::zombie_sweep::start_zombie_sweep(sweep_pg, sweep_sm, sweep_handle, sweep_port);
+        crate::zombie_sweep::spawn_zombie_sweep(
+            sweep_pg,
+            sweep_sm,
+            crate::zombie_sweep::frontend_notifier(sweep_handle),
+            sweep_port,
+            crate::zombie_sweep::STARTUP_GRACE,
+        );
     }
 
-    // Periodic file registry cleanup (sweep stale entries every 60s)
-    {
-        let cleanup_registry = api_state.app_state.file_registry_manager.clone();
-        let cleanup_db = api_state.app_state.pg_db.clone();
-        tokio::spawn(async move {
-            // Wait for server to fully start
-            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-            loop {
-                cleanup_registry.cleanup_stale(&cleanup_db).await;
-                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-            }
-        });
-    }
+    // Periodic file registry cleanup (sweep stale entries every 60s, after the
+    // server has had 10s to start). Supervised: a panic restarts it.
+    crate::executor::file_registry::spawn_stale_sweep(
+        api_state.app_state.file_registry_manager.clone(),
+        api_state.app_state.pg_db.clone(),
+        crate::executor::file_registry::STALE_SWEEP_START_DELAY,
+        crate::executor::file_registry::STALE_SWEEP_INTERVAL,
+    );
 
     // One-time audit event cleanup based on audit_retention_days setting
     {
@@ -13293,85 +13303,20 @@ pub fn create_router(
     );
 
     // mDNS LAN discovery (if enabled)
-    // Discovers UI Bridge instances advertising themselves on the local network.
-    {
-        let state = api_state.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(6)).await;
-
-            let mobile_settings = crate::settings::get_mobile_settings();
-            if !mobile_settings.lan_discovery_enabled {
-                tracing::debug!("LAN discovery disabled, skipping mDNS scanner");
-                return;
-            }
-
-            let (event_tx, mut event_rx) =
-                tokio::sync::mpsc::channel::<crate::mcp::discovery::mdns_scanner::MdnsEvent>(32);
+    // Discovers UI Bridge instances advertising themselves on the local network
+    // and registers each as a LAN transport. The event drain is supervised (a
+    // panic restarts it, draining the same receiver); the browse thread
+    // `scanner.start` spawns is a bare std::thread.
+    crate::mcp::discovery::mdns_scanner::spawn_event_loop(
+        api_state.physical_device_registry.clone(),
+        &crate::settings::get_mobile_settings(),
+        crate::mcp::discovery::mdns_scanner::MDNS_EVENTS_START_DELAY,
+        |event_tx| {
             let scanner = crate::mcp::discovery::mdns_scanner::MdnsScanner::new();
             scanner.start(event_tx);
-
-            // Keep the scanner alive for the duration of the task
-            let _scanner = scanner;
-
-            // Process mDNS discovery events
-            while let Some(event) = event_rx.recv().await {
-                match event {
-                    crate::mcp::discovery::mdns_scanner::MdnsEvent::Discovered(info) => {
-                        if let Some(&addr) = info.addresses.first() {
-                            let socket_addr = std::net::SocketAddr::new(addr, info.port);
-                            tracing::info!(
-                                "mDNS device found: {} at {}",
-                                info.device_id,
-                                socket_addr
-                            );
-
-                            // Register as a LAN transport in the physical device registry.
-                            // We proxy directly to the device's IP/port; no local TCP proxy
-                            // is needed for same-LAN connections.
-                            let now = chrono::Utc::now().timestamp_millis();
-                            // Determine OS from the "platform" TXT record if present
-                            let os = match info
-                                .txt_records
-                                .get("platform")
-                                .map(|s| s.to_lowercase())
-                                .as_deref()
-                            {
-                                Some("ios") | Some("iphone") | Some("ipad") => {
-                                    crate::mcp::transport::DeviceOs::Ios
-                                }
-                                _ => crate::mcp::transport::DeviceOs::Android,
-                            };
-                            let device_info = crate::mcp::physical_device::PhysicalDeviceInfo {
-                                id: info.device_id.clone(),
-                                os,
-                                device_kind: "physical".to_string(),
-                                model: info.txt_records.get("model").cloned(),
-                                app_id: info.txt_records.get("app_id").cloned(),
-                                ui_bridge_version: info.txt_records.get("version").cloned(),
-                                first_seen_at: now,
-                            };
-                            let transport = crate::mcp::physical_device::ActiveTransport {
-                                kind: crate::mcp::transport::TransportKind::Lan,
-                                proxy_url: format!("http://{}", socket_addr),
-                                established_at: now,
-                                last_healthy_at: now,
-                                fail_count: 0,
-                            };
-                            state
-                                .physical_device_registry
-                                .register(device_info, transport)
-                                .await;
-                        }
-                    }
-                    crate::mcp::discovery::mdns_scanner::MdnsEvent::Removed(name) => {
-                        tracing::debug!("mDNS device removed: {}", name);
-                        // The health monitor will evict the transport when health
-                        // checks start failing; no immediate action needed here.
-                    }
-                }
-            }
-        });
-    }
+            scanner
+        },
+    );
 
     // Start cascade event buffer (collects cascade detection events for /cascade/events).
     // Supervised; each run subscribes to the broadcast channel afresh.
@@ -23410,9 +23355,6 @@ mod supervised_workers_health_tests {
     /// moves with them and reads `boot_tasks::spawn_all` instead.
     #[test]
     fn every_create_router_boot_task_is_classified() {
-        const PHASE2: &str = "migration target of plan \
-            2026-11-12-runner-create-router-starts-six-long-lived-loops-unsupervised Phase 2";
-
         // (site, needle in create_router, file under src/, entry fn signature
         // at column 0, worker_supervisor registry name).
         const SUPERVISED: &[(Site, &str, &str, &str, &str)] = &[
@@ -23450,6 +23392,62 @@ mod supervised_workers_health_tests {
                 "mcp/cascade.rs",
                 "pub fn spawn_buffer_task(",
                 "cascade.buffer",
+            ),
+            (
+                Site::Call,
+                "crate::helper_tasks::poller::spawn_poller(",
+                "helper_tasks/poller.rs",
+                "pub fn spawn_poller(",
+                "helper_tasks.poller",
+            ),
+            (
+                Site::Call,
+                "crate::executor::file_registry::spawn_stale_sweep(",
+                "executor/file_registry.rs",
+                "pub fn spawn_stale_sweep(",
+                "file_registry.stale_sweep",
+            ),
+            (
+                Site::Call,
+                "crate::mcp::discovery::mdns_scanner::spawn_event_loop(",
+                "mcp/discovery/mdns_scanner.rs",
+                "pub fn spawn_event_loop(",
+                "mdns_scanner.events",
+            ),
+            (
+                Site::Call,
+                "crate::util::egress_context::spawn_baseline_logger(",
+                "util/egress_context.rs",
+                "pub(crate) fn spawn_baseline_logger(",
+                "egress_context.baseline_logger",
+            ),
+            (
+                Site::Call,
+                "crate::mcp::app_registry::spawn_sweeper(",
+                "mcp/app_registry.rs",
+                "pub fn spawn_sweeper(",
+                "app_registry.sweeper",
+            ),
+            (
+                Site::Call,
+                "crate::canonical_corpus::spawn_refresh_loop(",
+                "canonical_corpus.rs",
+                "pub(crate) fn spawn_refresh_loop(",
+                "canonical_corpus.refresh_loop",
+            ),
+            (
+                Site::Call,
+                "crate::coord_mcp::spawn_stale_breadcrumb_sweep(",
+                "coord_mcp.rs",
+                "pub(crate) fn spawn_stale_breadcrumb_sweep(",
+                "coord_mcp.stale_breadcrumb_sweep",
+            ),
+            (
+                Site::Call,
+                "crate::zombie_sweep::spawn_zombie_sweep(",
+                "zombie_sweep.rs",
+                "pub fn spawn_zombie_sweep(",
+                "zombie_sweep.task_run_sweep",
             ),
         ];
         // (site, needle, reason).
@@ -23566,63 +23564,15 @@ mod supervised_workers_health_tests {
         // still on a bare spawn: a panic ends them silently.
         const DEFERRED: &[(Site, &str, &str, &str)] = &[
             (
-                Site::Spawn,
-                "crate::helper_tasks::poller::run_forever()",
-                "helper_tasks.poller",
-                PHASE2,
-            ),
-            (
-                Site::Spawn,
-                "cleanup_registry.cleanup_stale(&cleanup_db)",
-                "file_registry.stale_sweep",
-                PHASE2,
-            ),
-            (
-                Site::Spawn,
-                "crate::mcp::discovery::mdns_scanner::MdnsScanner::new()",
-                "mdns_scanner.events",
-                PHASE2,
-            ),
-            (
                 Site::Call,
                 "scanner.start(event_tx)",
                 "mdns_scanner.browse_thread",
                 "MdnsScanner::start spawns a bare std::thread that drains the mdns-sd browse \
                  receiver into event_tx for the life of the process; a panic in it ends LAN \
-                 discovery silently (event_tx drops with it, so the mdns_scanner.events task \
-                 then returns too). \
+                 discovery silently (event_tx drops with it, so the supervised \
+                 mdns_scanner.events run then returns and reads `exited`). \
                  worker_supervisor supervises tokio tasks, not threads, so this needs its own \
                  design — not one-shot, not supervised",
-            ),
-            (
-                Site::Call,
-                "crate::util::egress_context::spawn_baseline_logger()",
-                "egress_context.baseline_logger",
-                PHASE2,
-            ),
-            (
-                Site::Call,
-                "crate::mcp::app_registry::spawn_sweeper(",
-                "app_registry.sweeper",
-                PHASE2,
-            ),
-            (
-                Site::Call,
-                "crate::canonical_corpus::start_refresh_loop()",
-                "canonical_corpus.refresh_loop",
-                PHASE2,
-            ),
-            (
-                Site::Call,
-                "crate::coord_mcp::start_stale_breadcrumb_sweep(",
-                "coord_mcp.stale_breadcrumb_sweep",
-                PHASE2,
-            ),
-            (
-                Site::Call,
-                "crate::zombie_sweep::start_zombie_sweep(",
-                "zombie_sweep.task_run_sweep",
-                PHASE2,
             ),
             (
                 Site::Spawn,
@@ -23824,6 +23774,7 @@ mod supervised_workers_health_tests {
         for (_, needle, file, signature, name) in SUPERVISED {
             let fn_name = signature
                 .trim_start_matches("pub fn ")
+                .trim_start_matches("pub(crate) fn ")
                 .split('(')
                 .next()
                 .unwrap_or_default();

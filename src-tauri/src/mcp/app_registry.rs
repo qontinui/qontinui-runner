@@ -26,7 +26,8 @@ use super::relay_binding::{
 
 /// Entries older than this (in ms) are considered stale and evicted.
 pub const REGISTRATION_TTL_MS: i64 = 30_000;
-const SWEEP_INTERVAL_MS: u64 = 15_000;
+/// How often [`spawn_sweeper`] drops lapsed rows.
+pub const SWEEP_INTERVAL: Duration = Duration::from_millis(15_000);
 
 /// Transport an app uses to receive commands from the runner.
 ///
@@ -671,22 +672,40 @@ impl AppRegistry {
     }
 }
 
-/// Spawn a background sweeper. Call once from AppHandle setup.
-pub fn spawn_sweeper(registry: Arc<AppRegistry>) {
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_millis(SWEEP_INTERVAL_MS));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            ticker.tick().await;
-            let evicted = registry.sweep().await;
-            if evicted > 0 {
-                tracing::debug!(
-                    "[app-registry] dropped {} row(s) whose reservation lapsed",
-                    evicted
-                );
+/// The `worker_supervisor` registry name of the loop [`spawn_sweeper`] starts,
+/// as `GET /health` `supervised_workers` lists it.
+pub const SWEEPER_WORKER: &str = "app_registry.sweeper";
+
+/// Spawn the background sweeper that drops rows whose reservation lapsed, one
+/// pass every `interval` ([`SWEEP_INTERVAL`] in production). Call once from
+/// `create_router`.
+///
+/// The loop runs under the panic supervisor, so a panic is logged, counted on
+/// `/health` and the loop rebuilt after a backoff; it ticks its heartbeat once
+/// per pass. A rebuilt run holds the same registry and sweeps at once, as the
+/// first run does.
+pub fn spawn_sweeper(
+    registry: Arc<AppRegistry>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    crate::worker_supervisor::spawn_supervised_with_heartbeat(SWEEPER_WORKER, move |hb| {
+        let registry = registry.clone();
+        async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                hb.tick();
+                let evicted = registry.sweep().await;
+                if evicted > 0 {
+                    tracing::debug!(
+                        "[app-registry] dropped {} row(s) whose reservation lapsed",
+                        evicted
+                    );
+                }
             }
         }
-    });
+    })
 }
 
 // ============================================================================
@@ -696,6 +715,25 @@ pub fn spawn_sweeper(registry: Arc<AppRegistry>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The door `create_router` calls registers the sweeper with the panic
+    /// supervisor under its `/health` name.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_sweeper_registers_with_the_panic_supervisor() {
+        let handle = spawn_sweeper(AppRegistry::new(), SWEEP_INTERVAL);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !crate::worker_supervisor::snapshot()
+            .iter()
+            .any(|row| row.name == SWEEPER_WORKER)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "spawn_sweeper never registered {SWEEPER_WORKER}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        handle.abort();
+    }
     fn sample_app(app_id: &str) -> DiscoveredApp {
         DiscoveredApp {
             app_id: app_id.to_string(),

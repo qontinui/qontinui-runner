@@ -61,7 +61,7 @@ const FD_CLASSIFY_CEILING: usize = 4096;
 ///
 /// Sized so a multi-day process leaves a readable series without adding a
 /// meaningful line count: 96 lines a day.
-const BASELINE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+pub(crate) const BASELINE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 // ---------------------------------------------------------------------------
 // Named egress clients
@@ -591,33 +591,76 @@ pub(crate) fn log_baseline() {
     );
 }
 
-/// Spawn the periodic baseline emitter. Idempotent — a second call is a no-op,
-/// so a re-built router cannot end up with two tasks doubling the stream.
-pub(crate) fn spawn_baseline_logger() {
+/// The `worker_supervisor` registry name of the loop [`spawn_baseline_logger`]
+/// starts, as `GET /health` `supervised_workers` lists it.
+pub const BASELINE_LOGGER_WORKER: &str = "egress_context.baseline_logger";
+
+/// Spawn the periodic baseline emitter: one line at once, then one every
+/// `interval` ([`BASELINE_INTERVAL`] in production). Idempotent — a second call
+/// is a no-op returning `None`, so a re-built router cannot end up with two
+/// tasks doubling the stream.
+///
+/// The loop runs under the panic supervisor, so a panic is logged, counted on
+/// `/health` and the loop rebuilt after a backoff; it ticks its heartbeat once
+/// per line. A rebuilt run emits a line at once, as a process start would — the
+/// loop holds no state of its own.
+pub(crate) fn spawn_baseline_logger(
+    interval: std::time::Duration,
+) -> Option<tokio::task::JoinHandle<()>> {
     // No runtime (a unit test, a CLI bin building a router for inspection) ⇒
     // no baseline, rather than the panic `tokio::spawn` would raise. The claim
     // set stays honest either way: the baseline is a log stream, and its
     // absence is visible as an absence of lines.
     if tokio::runtime::Handle::try_current().is_err() {
-        return;
+        return None;
     }
     static SPAWNED: OnceLock<()> = OnceLock::new();
     if SPAWNED.set(()).is_err() {
-        return;
+        return None;
     }
-    tokio::spawn(async {
-        // One immediately, so a short-lived process still leaves a baseline.
-        log_baseline();
-        loop {
-            tokio::time::sleep(BASELINE_INTERVAL).await;
-            log_baseline();
-        }
-    });
+    Some(crate::worker_supervisor::spawn_supervised_with_heartbeat(
+        BASELINE_LOGGER_WORKER,
+        move |hb| async move {
+            // One immediately, so a short-lived process still leaves a baseline.
+            loop {
+                hb.tick();
+                log_baseline();
+                tokio::time::sleep(interval).await;
+            }
+        },
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The door `create_router` calls registers the baseline loop with the
+    /// panic supervisor under its `/health` name. The door is once per process,
+    /// so a `None` here means an earlier call in this test binary already
+    /// started it — the name must be listed either way.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_baseline_logger_registers_with_the_panic_supervisor() {
+        let handle = spawn_baseline_logger(std::time::Duration::from_secs(3600));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !crate::worker_supervisor::snapshot()
+            .iter()
+            .any(|row| row.name == BASELINE_LOGGER_WORKER)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "spawn_baseline_logger never registered {BASELINE_LOGGER_WORKER}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            spawn_baseline_logger(std::time::Duration::from_secs(3600)).is_none(),
+            "a second call must not start a second baseline loop"
+        );
+        if let Some(handle) = handle {
+            handle.abort();
+        }
+    }
 
     #[test]
     fn client_indices_are_dense_and_unique() {

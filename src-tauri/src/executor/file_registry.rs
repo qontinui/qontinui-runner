@@ -384,6 +384,46 @@ impl Default for FileRegistryManager {
     }
 }
 
+/// The `worker_supervisor` registry name of the loop [`spawn_stale_sweep`]
+/// starts, as `GET /health` `supervised_workers` lists it.
+pub const STALE_SWEEP_WORKER: &str = "file_registry.stale_sweep";
+
+/// How long [`spawn_stale_sweep`] waits for the server to start before its
+/// first sweep.
+pub const STALE_SWEEP_START_DELAY: Duration = Duration::from_secs(10);
+
+/// How long [`spawn_stale_sweep`] sleeps between sweeps.
+pub const STALE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Start the periodic sweep that drops file registrations whose holding task
+/// runs are no longer running: `start_delay` ([`STALE_SWEEP_START_DELAY`] in
+/// production), then [`FileRegistryManager::cleanup_stale`] every `interval`
+/// ([`STALE_SWEEP_INTERVAL`]).
+///
+/// The loop runs under the panic supervisor, so a panic — `cleanup_stale` reads
+/// Postgres — is logged, counted on `/health` and the loop rebuilt after a
+/// backoff; it ticks its heartbeat once per sweep. A rebuilt run holds the same
+/// registry and database handles and keeps no state of its own.
+pub fn spawn_stale_sweep(
+    registry: Arc<FileRegistryManager>,
+    db: Arc<crate::database::pg::PgDb>,
+    start_delay: Duration,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    crate::worker_supervisor::spawn_supervised_with_heartbeat(STALE_SWEEP_WORKER, move |hb| {
+        let registry = registry.clone();
+        let db = db.clone();
+        async move {
+            tokio::time::sleep(start_delay).await;
+            loop {
+                hb.tick();
+                registry.cleanup_stale(&db).await;
+                tokio::time::sleep(interval).await;
+            }
+        }
+    })
+}
+
 /// Information about a conflict on a specific file.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct FileConflict {
@@ -769,6 +809,31 @@ pub struct FileLockInfoWithWaiters {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The door `create_router` calls registers the sweep with the panic
+    /// supervisor under its `/health` name. The start delay is long, so the
+    /// no-op database is never queried.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_stale_sweep_registers_with_the_panic_supervisor() {
+        let handle = spawn_stale_sweep(
+            Arc::new(FileRegistryManager::new()),
+            crate::database::pg::PgDb::new_noop_for_test(),
+            Duration::from_secs(3600),
+            STALE_SWEEP_INTERVAL,
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !crate::worker_supervisor::snapshot()
+            .iter()
+            .any(|row| row.name == STALE_SWEEP_WORKER)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "spawn_stale_sweep never registered {STALE_SWEEP_WORKER}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        handle.abort();
+    }
 
     #[tokio::test]
     async fn test_register_and_info() {
