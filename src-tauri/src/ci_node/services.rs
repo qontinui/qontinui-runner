@@ -104,10 +104,11 @@
 //!   label contract — `qontinui.ephemeral=1`,
 //!   `qontinui.ephemeral.owner=runner-ci-node` and
 //!   `qontinui.owner=ci:runner-ci-node` — the one contract every fleet
-//!   test-container producer (`ephemeral-db.sh`, coord's CI) is converging on.
-//!   They mark the container as a TEST container
+//!   test-container producer is being moved onto (plan
+//!   `2026-11-23-cleanup-steward-class-15-leaked-test-containers-successor`
+//!   Phase 1b). They mark the container as a TEST container
 //!   and name this lane as its owner, so a fleet sweeper (the cleanup steward's
-//!   class 15) can delegate it to this module's own teardown instead of
+//!   class 15, that plan's Phase 3) will delegate it to this module's own teardown instead of
 //!   judging it by another harness's liveness rule. They authorise nothing.
 //! * A dispatch removes only containers whose names it minted from its OWN
 //!   dispatch id. Nothing else on the machine is ever touched — the developer's
