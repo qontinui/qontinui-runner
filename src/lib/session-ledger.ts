@@ -276,7 +276,7 @@ export function finishNetsNotice(
   if (!nets) return null;
   if (!finished) {
     return nets.rearm && earlierFinishWithdrew
-      ? `The implement→ship net the finish withdrew is ${nets.rearm}`
+      ? `The implement→ship net the finish withdrew or cancelled is ${nets.rearm}`
       : null;
   }
   const items = (nets.unretired ?? []).map(

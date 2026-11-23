@@ -728,20 +728,17 @@ async fn settle_cleared(
         );
     }
     let why = match budget
-        .call("the continuation cancel",
+        .call(
+            "the continuation cancel",
             io.write(GateWrite::CancelContinuation, &id, reason),
         )
         .await
     {
         Ok(WriteAnswer::Ok) => "cancelled".to_string(),
         Ok(WriteAnswer::NotRegistrant(t) | WriteAnswer::Consumed(t) | WriteAnswer::Refused(t)) => t,
-        Err(e) => {
-            return out.unretire(
-                stem,
-                Some(&id),
-                format!("the net already cleared and its continuation is still live; the cancel was not carried ({e})"),
-            )
-        }
+        // An unanswered cancel may still have landed: fall through to the
+        // read-back and decide from the row, as retire_one does.
+        Err(e) => format!("the cancel was not answered: {e}"),
     };
     match budget
         .call("the read-back", io.read_gate(&id))
@@ -1071,6 +1068,8 @@ pub(crate) mod tests {
         pub gate_read_fails: bool,
         pub read_back_fails: bool,
         pub withdraw_answer: Option<WriteAnswer>,
+        /// The cancel lands on coord but its answer is lost (a timeout).
+        pub cancel_lands_unanswered: bool,
         pub writes: Mutex<Vec<(GateWrite, String)>>,
     }
 
@@ -1124,6 +1123,9 @@ pub(crate) mod tests {
                         }
                     }
                 }
+            }
+            if verb == GateWrite::CancelContinuation && self.cancel_lands_unanswered {
+                return Err("timed out".to_string());
             }
             Ok(answer)
         }
@@ -1302,6 +1304,19 @@ pub(crate) mod tests {
             vec![(GateWrite::CancelContinuation, "g1".to_string())]
         );
         assert_eq!(out.cancelled, vec!["g1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_cancel_that_landed_is_read_back_as_cancelled() {
+        let io = FakeCoord {
+            reserves: page(vec![reserve("p1", TARGET)]),
+            gates: Mutex::new(vec![net("g1", "cleared", ME)]),
+            cancel_lands_unanswered: true,
+            ..Default::default()
+        };
+        let out = run(&io, &single()).await;
+        assert_eq!(out.cancelled, vec!["g1".to_string()]);
+        assert!(out.unretired.is_empty(), "{:?}", out.unretired);
     }
 
     #[tokio::test]

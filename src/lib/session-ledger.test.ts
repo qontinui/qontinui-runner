@@ -297,7 +297,7 @@ describe("invoke wrappers", () => {
       },
     });
     expect((await setSessionFinished("aaaa-1111", false, undefined, true)).notice).toBe(
-      "The implement→ship net the finish withdrew is not restored — /implement-plan Step 0.5 re-arms",
+      "The implement→ship net the finish withdrew or cancelled is not restored — /implement-plan Step 0.5 re-arms",
     );
     const quiet = await setSessionFinished("aaaa-1111", false);
     expect(quiet.notice).toBeNull();
