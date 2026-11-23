@@ -840,26 +840,52 @@ async fn finish_session(
             "session lifecycle store unavailable".to_string(),
         ))?;
 
-    let outcome = apply_finish_outcome(store.inner(), &id, req)?;
+    let registrar = state
+        .app_handle
+        .try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>();
+    let port = registrar
+        .as_ref()
+        .map(|r| r.inner().as_ref() as &dyn crate::session::finish_heal::HealPort);
+    let body = finish_door_body(
+        store.inner(),
+        &crate::session::finish_net_retire::CoordNetRetirer,
+        port,
+        &id,
+        req,
+    )
+    .await?;
+    Ok(Json(body))
+}
+
+/// Everything [`finish_session`] does once it holds the store: retire the
+/// session's implement→ship nets, write (or unmark) the mark, attach `nets`,
+/// and — on a read-back — observe coord and heal. Taking the retirer and the
+/// heal port as arguments is what lets the door test run the REAL handler
+/// path: bypassing the retire or dropping the `nets` attach fails it.
+async fn finish_door_body(
+    store: &crate::session::session_lifecycle_store::SessionLifecycleStore,
+    retirer: &dyn crate::session::finish_net_retire::FinishNetRetirer,
+    heal_port: Option<&dyn crate::session::finish_heal::HealPort>,
+    id: &str,
+    req: FinishSessionRequest,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let (outcome, nets) = apply_finish_with_nets(store, retirer, id, req).await?;
     let mut body = outcome.response_json();
+    nets.attach(&mut body);
     // The READ-BACK (a reason-less re-finish of a finished mark) observes
     // coord: `coord.observed` is coord's own work-status row for this session,
     // and a synced mark coord's own row contradicts is healed — its stamp
     // withdrawn and the finish re-sent (plan
     // 2026-11-05-finish-synced-is-stamped-on-a-2xx-that-did-not-move-session-
     // status, Phase 5). Bounded by the work-status read's own ≈4 s worst case.
+    // A read-back never runs the net retire (retire_before_finish skips it),
+    // so the two bounds never add up inside one call.
     if is_finish_read_back(&outcome) {
         use crate::session::finish_heal;
-        let registrar = state
-            .app_handle
-            .try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>();
-        let port = registrar
-            .as_ref()
-            .map(|r| r.inner().as_ref() as &dyn finish_heal::HealPort);
-        let rb = finish_heal::read_back(store.inner(), port, &id).await;
-        finish_heal::decorate_read_back(&mut body, &rb, store.get(&id).as_ref());
+        let rb = finish_heal::read_back(store, heal_port, id).await;
+        finish_heal::decorate_read_back(&mut body, &rb, store.get(id).as_ref());
     }
-    Ok(Json(body))
+    Ok(body)
 }
 
 /// Whether a finish outcome is the READ-BACK: a re-finish that wrote nothing
@@ -877,6 +903,38 @@ fn apply_finish(
     req: FinishSessionRequest,
 ) -> Result<serde_json::Value, (StatusCode, String)> {
     apply_finish_outcome(store, id, req).map(|o| o.response_json())
+}
+
+/// The finish route's door: retire the session's implement→ship nets FIRST
+/// ([`crate::session::finish_net_retire::retire_before_finish`] — only for a
+/// finish that writes the mark, never an unmark), THEN write the mark. A net
+/// that could not be retired never blocks the mark; the returned report says
+/// so under the body's `nets`.
+async fn apply_finish_with_nets(
+    store: &crate::session::session_lifecycle_store::SessionLifecycleStore,
+    retirer: &dyn crate::session::finish_net_retire::FinishNetRetirer,
+    id: &str,
+    req: FinishSessionRequest,
+) -> Result<
+    (
+        crate::session::session_lifecycle_store::FinishOutcome,
+        crate::session::finish_net_retire::NetsReport,
+    ),
+    (StatusCode, String),
+> {
+    let nets = crate::session::finish_net_retire::retire_before_finish(
+        store,
+        retirer,
+        id,
+        req.finished.unwrap_or(true),
+        req.reason.as_deref(),
+        false,
+        "POST /sessions/{id}/finish",
+        crate::session::finish_net_retire::DOOR_BUDGET,
+    )
+    .await;
+    let outcome = apply_finish_outcome(store, id, req)?;
+    Ok((outcome, nets))
 }
 
 /// [`apply_finish`], returning the outcome itself.
@@ -2046,6 +2104,31 @@ fn transcript_coverage_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The HTTP finish door retires the session's nets BEFORE the mark, and
+    /// never on an unmark (plan
+    /// 2026-11-23-an-operator-finish-from-the-runner-ui-still-fires-the-finished-sessions-implement-ship-net).
+    #[tokio::test]
+    async fn the_http_finish_door_retires_nets_before_the_mark() {
+        crate::session::finish_net_retire::tests::door_contract(
+            |store, retirer, id, finished| {
+                Box::pin(async move {
+                    let req = FinishSessionRequest {
+                        reason: None,
+                        finished: Some(finished),
+                    };
+                    Some(
+                        finish_door_body(&store, retirer.as_ref(), None, id, req)
+                            .await
+                            .expect("a known id answers"),
+                    )
+                })
+            },
+            true,
+            true,
+        )
+        .await;
+    }
 
     // =========================================================================
     // POST /sessions/{id}/finish — the response contract

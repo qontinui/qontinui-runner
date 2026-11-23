@@ -628,7 +628,9 @@ export class ResumeQueue {
 /** A Finish/Unfinish in flight for one row, or the last one that failed. */
 export type FinishOp =
   | { phase: "pending"; to: boolean }
-  | { phase: "failed"; to: boolean; message: string };
+  | { phase: "failed"; to: boolean; message: string }
+  /** Done, with a result the operator is owed (e.g. an unretired net). */
+  | { phase: "settled"; to: boolean; notice: string };
 
 export interface FinishButtonModel {
   label: string;
@@ -636,6 +638,8 @@ export interface FinishButtonModel {
   target: boolean;
   disabled: boolean;
   title: string;
+  /** The last op's result line to show beside the control, if any. */
+  notice: string | null;
 }
 
 /**
@@ -643,13 +647,21 @@ export interface FinishButtonModel {
  * roster. Pending shows the transition and disables the button; a failed op
  * keeps the roster's truth and says why, so a retry is the same click.
  */
-export function finishButtonModel(finished: boolean, op: FinishOp | undefined): FinishButtonModel {
+export function finishButtonModel(
+  finished: boolean,
+  rawOp: FinishOp | undefined,
+): FinishButtonModel {
+  // A settled notice speaks about the state ITS op set. Once the roster says
+  // the row is in the other state (changed through another door), the notice
+  // is stale: drop it.
+  const op = rawOp?.phase === "settled" && rawOp.to !== finished ? undefined : rawOp;
   if (op?.phase === "pending") {
     return {
       label: op.to ? "Finishing…" : "Unfinishing…",
       target: op.to,
       disabled: true,
       title: op.to ? "Marking finished…" : "Clearing the finished mark…",
+      notice: null,
     };
   }
   const target = !finished;
@@ -660,7 +672,13 @@ export function finishButtonModel(finished: boolean, op: FinishOp | undefined): 
     label: target ? "Finish" : "Unfinish",
     target,
     disabled: false,
-    title: op?.phase === "failed" ? `${base}. Last attempt failed: ${op.message}` : base,
+    title:
+      op?.phase === "failed"
+        ? `${base}. Last attempt failed: ${op.message}`
+        : op?.phase === "settled"
+          ? `${base}. ${op.notice}`
+          : base,
+    notice: op?.phase === "settled" ? op.notice : null,
   };
 }
 

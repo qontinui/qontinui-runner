@@ -1,5 +1,5 @@
 import { describeThrown } from "@/lib/utils";
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { setSessionFinished } from "@/lib/session-ledger";
 import type { FinishOp } from "./sinceRestart";
 
@@ -9,7 +9,8 @@ import type { FinishOp } from "./sinceRestart";
  * unfinished-resume`, gap 4, delivered by plan
  * `2026-10-04-runner-session-roster-restore-picker` Phase 4).
  *
- * Tracks each session's op (`pending`, or the last `failed` one) for
+ * Tracks each session's op (`pending`, the last `failed` one, or a `settled`
+ * one carrying the finish's nets notice — see `finishNetsNotice`) for
  * {@link finishButtonModel}. The roster's own `finished` flag stays the truth:
  * `onSettled` re-reads it after every attempt, which is also how a backend
  * no-op (already in that state, unknown id) shows as what it is.
@@ -19,14 +20,27 @@ export function useFinishOps(onSettled: () => void): {
   setFinished: (claudeSessionId: string, finished: boolean) => void;
 } {
   const [ops, setOps] = useState<Map<string, FinishOp>>(new Map());
+  // Per session: did its last Finish (through this view, this app run)
+  // withdraw an implement→ship net? Only then does an Unfinish owe the
+  // not-re-armed line (plan item 4). Unknown after a reload, so no line.
+  const withdrewRef = useRef<Map<string, boolean>>(new Map());
   const setFinished = useCallback(
     (id: string, finished: boolean) => {
       setOps((prev) => new Map(prev).set(id, { phase: "pending", to: finished }));
-      setSessionFinished(id, finished)
-        .then(() =>
+      const earlierFinishWithdrew = !finished && withdrewRef.current.get(id) === true;
+      setSessionFinished(id, finished, undefined, earlierFinishWithdrew)
+        .then(({ notice, withdrew }) => {
+          if (finished) withdrewRef.current.set(id, withdrew);
+          else withdrewRef.current.delete(id);
+          return notice;
+        })
+        .then((notice) =>
           setOps((prev) => {
             const next = new Map(prev);
-            next.delete(id);
+            // A result the operator is owed (an implement→ship net left
+            // armed, or not re-armed on Unfinish) stays beside the control.
+            if (notice) next.set(id, { phase: "settled", to: finished, notice });
+            else next.delete(id);
             return next;
           }),
         )

@@ -502,6 +502,11 @@ function PastSessionCard({
           {finishModel.label}
         </button>
       </div>
+      {finishModel.notice && (
+        <div role="status" className="mt-1 text-[10px] text-[#e0af68]">
+          {finishModel.notice}
+        </div>
+      )}
     </div>
   );
 }

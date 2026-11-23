@@ -12,6 +12,11 @@ use crate::session::coord_sync_finish_ack::{
 
 type Acks = Arc<std::sync::Mutex<Vec<(String, Option<i64>)>>>;
 
+/// The three tests that drive a finish past both bounds each add to the
+/// process-global `FINISHED_UNCONFIRMED_DROPPED`, so the one that counts the
+/// counter's delta must not run beside the other two.
+static DROP_BOUND_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// A drain wired to the fake coord, with the finished-ACK observer recording
 /// every stamp it is asked to make.
 async fn finish_rig(
@@ -193,6 +198,7 @@ async fn a_409_whose_body_reads_finished_stamps_the_mark() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn five_unconfirmed_answers_drop_the_row_unstamped_and_count_it() {
+    let _serial = DROP_BOUND_SERIAL.lock().await;
     let (_d, outbox, coord, rec, acks) =
         finish_rig(Some((200, r#"{"session_status":"working"}"#))).await;
     let sent: Arc<std::sync::Mutex<Vec<(String, Option<i64>, Uuid)>>> = Default::default();
@@ -235,7 +241,8 @@ async fn five_unconfirmed_answers_drop_the_row_unstamped_and_count_it() {
         "the bound fired, not the quarantine"
     );
     assert!(!state.retry.contains_key(&s));
-    // Process-global: only this test drives a finish to its bound.
+    // Process-global: the tests that also drive a finish to its bound are
+    // serialized with this one by DROP_BOUND_SERIAL.
     assert_eq!(
         FINISHED_UNCONFIRMED_DROPPED.load(Ordering::Relaxed) - before,
         1
@@ -254,6 +261,7 @@ async fn five_unconfirmed_answers_drop_the_row_unstamped_and_count_it() {
 /// [`FINISHED_UNCONFIRMED_MIN_AGE`] old.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unconfirmed_answers_inside_the_age_floor_never_drop_the_finish() {
+    let _serial = DROP_BOUND_SERIAL.lock().await;
     let (_d, outbox, coord, rec, acks) =
         finish_rig(Some((200, r#"{"session_status":"working"}"#))).await;
     let s = Uuid::new_v4();
@@ -287,6 +295,7 @@ async fn unconfirmed_answers_inside_the_age_floor_never_drop_the_finish() {
 /// the bound and is dropped unstamped — never retried forever.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_quarantined_sessions_unconfirmed_finish_still_reaches_the_bound() {
+    let _serial = DROP_BOUND_SERIAL.lock().await;
     let (_d, outbox, coord, _rec, acks) =
         finish_rig(Some((200, r#"{"session_status":"working"}"#))).await;
     let s = Uuid::new_v4();

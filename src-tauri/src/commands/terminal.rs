@@ -1722,19 +1722,60 @@ pub(crate) fn record_close_for(
 /// no-op nor a local-only mark can read as a coord write.
 ///
 /// [`FinishOutcome::response_json`]: crate::session::session_lifecycle_store::FinishOutcome::response_json
+///
+/// **Nets first.** A finish that writes the mark first retires the session's
+/// implement→ship safety nets
+/// ([`crate::session::finish_net_retire::retire_before_finish`]), and the body
+/// carries what that did under `nets`; an unmark never re-arms one
+/// (`nets.rearm`). Async, so the coord calls leave the main thread.
 #[tauri::command]
-pub fn terminal_session_set_finished(
+pub async fn terminal_session_set_finished(
     store: tauri::State<'_, Arc<SessionLifecycleStore>>,
     claude_session_id: String,
     finished: bool,
     reason: Option<String>,
 ) -> Result<CommandResponse, String> {
+    let store = store.inner().clone();
+    set_finished_command(
+        &store,
+        &crate::session::finish_net_retire::CoordNetRetirer,
+        &claude_session_id,
+        finished,
+        reason,
+    )
+    .await
+}
+
+/// [`terminal_session_set_finished`]'s body, over an injected retirer so the
+/// retire-before-mark order is testable without a Tauri app.
+pub(crate) async fn set_finished_command(
+    store: &SessionLifecycleStore,
+    retirer: &dyn crate::session::finish_net_retire::FinishNetRetirer,
+    claude_session_id: &str,
+    finished: bool,
+    reason: Option<String>,
+) -> Result<CommandResponse, String> {
     use crate::session::session_lifecycle_store::SetFinishedError;
-    match store.set_finished(&claude_session_id, finished, reason) {
+    let nets = crate::session::finish_net_retire::retire_before_finish(
+        store,
+        retirer,
+        claude_session_id,
+        finished,
+        reason.as_deref(),
+        false,
+        "the runner UI (terminal_session_set_finished)",
+        crate::session::finish_net_retire::DOOR_BUDGET,
+    )
+    .await;
+    match store.set_finished(claude_session_id, finished, reason) {
         Ok(outcome) => Ok(CommandResponse {
             success: true,
             message: None,
-            data: Some(outcome.response_json()),
+            data: Some({
+                let mut body = outcome.response_json();
+                nets.attach(&mut body);
+                body
+            }),
         }),
         Err(SetFinishedError::UnknownSession) => Ok(CommandResponse {
             success: false,
@@ -3424,6 +3465,27 @@ pub fn plugin() -> TauriPlugin<tauri::Wry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Tauri finish door retires the session's nets BEFORE the mark, and
+    /// never on an unmark (plan
+    /// 2026-11-23-an-operator-finish-from-the-runner-ui-still-fires-the-finished-sessions-implement-ship-net).
+    #[tokio::test]
+    async fn the_tauri_finish_door_retires_nets_before_the_mark() {
+        crate::session::finish_net_retire::tests::door_contract(
+            |store, retirer, id, finished| {
+                Box::pin(async move {
+                    let resp = set_finished_command(&store, retirer.as_ref(), id, finished, None)
+                        .await
+                        .expect("a known id answers");
+                    assert!(resp.success);
+                    resp.data
+                })
+            },
+            true,
+            true,
+        )
+        .await;
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
