@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import {
   RECOVERY_FAILED,
+  RECOVERY_NOT_DISPATCHED,
   RECOVERY_OUT_OF_SCOPE,
   RECOVERY_TARGET_MISSING,
   RECOVERY_UNSCOPED,
@@ -8,10 +9,14 @@ import {
   RecoveryRefusedError,
   assertRecoveryDispatchAllowed,
   isWriteAction,
+  newRecoveryDispatchRecord,
+  originalActionFacts,
   recoveryFailureData,
   recoveryVerdict,
   scopeRecoveryExecutor,
+  undispatchedRefusal,
 } from "./recoveryScope";
+import { NLActionExecutor } from "@qontinui/ui-bridge/ai";
 import writeActionsGenerated from "./writeActions.generated.json";
 
 describe("isWriteAction", () => {
@@ -181,5 +186,131 @@ describe("recoveryFailureData (item 4)", () => {
     for (const code of [RECOVERY_UNSCOPED, RECOVERY_TARGET_MISSING, RECOVERY_FAILED]) {
       expect(recoveryFailureData(code).attemptSucceeded).toBe(false);
     }
+  });
+});
+
+describe("originalActionFacts (plan 2026-11-18 Phase 3)", () => {
+  it("states nothing ran when the executor was never reached", () => {
+    expect(originalActionFacts(false, true, false)).toEqual({
+      originalActionAttempted: false,
+      originalActionPerformed: false,
+    });
+    expect(originalActionFacts(false, false, false)).toEqual({
+      originalActionAttempted: false,
+      originalActionPerformed: false,
+    });
+  });
+
+  it("states the original ran and was performed when the executor succeeded", () => {
+    expect(originalActionFacts(true, true, true)).toEqual({
+      originalActionAttempted: true,
+      originalActionPerformed: true,
+    });
+  });
+
+  it("states the original was ATTEMPTED, not performed, when it failed or threw", () => {
+    expect(originalActionFacts(true, true, false)).toEqual({
+      originalActionAttempted: true,
+      originalActionPerformed: false,
+    });
+  });
+
+  it("omits both (UNKNOWN) when no original instruction was named", () => {
+    const facts = originalActionFacts(true, false, true);
+    expect(facts).toEqual({});
+    expect("originalActionAttempted" in facts).toBe(false);
+    expect("originalActionPerformed" in facts).toBe(false);
+  });
+
+  it("rides a failure payload without touching its verdict", () => {
+    const data = recoveryFailureData(RECOVERY_FAILED, originalActionFacts(true, true, false));
+    expect(data).toEqual({
+      originalActionAttempted: true,
+      originalActionPerformed: false,
+      code: RECOVERY_FAILED,
+      attemptSucceeded: false,
+    });
+  });
+});
+
+describe("the dispatch record (review A1/A2: execute() never throws)", () => {
+  const makeBridge = () => ({
+    executeAction: vi.fn(async () => ({ success: true })),
+    executeComponentAction: vi.fn(async () => ({ success: true })),
+    fillForm: vi.fn(async () => ({ success: true })),
+  });
+
+  it("turns `dispatched` true only once a call passes the guard", async () => {
+    const bridge = makeBridge();
+    const record = newRecoveryDispatchRecord();
+    const scoped = scopeRecoveryExecutor(bridge, "btn-1", record);
+    await expect(scoped.executeAction("btn-1", { action: "type" })).rejects.toBeInstanceOf(
+      RecoveryRefusedError,
+    );
+    expect(record.dispatched).toBe(false);
+    expect(record.refusal?.code).toBe(RECOVERY_WRITE_REFUSED);
+    await expect(scoped.fillForm()).rejects.toBeInstanceOf(RecoveryRefusedError);
+    expect(record.refusal?.code).toBe(RECOVERY_OUT_OF_SCOPE);
+    await scoped.executeAction("btn-1", { action: "focus" });
+    expect(record.dispatched).toBe(true);
+  });
+
+  it("undispatchedRefusal: the guard's refusal, else NOT_DISPATCHED, else null", () => {
+    const record = newRecoveryDispatchRecord();
+    expect(undispatchedRefusal(record, "UB-ELEM-NOT-FOUND: no match")).toEqual({
+      code: RECOVERY_NOT_DISPATCHED,
+      error: `${RECOVERY_NOT_DISPATCHED}: UB-ELEM-NOT-FOUND: no match`,
+    });
+    record.refusal = new RecoveryRefusedError(RECOVERY_WRITE_REFUSED, "refused");
+    expect(undispatchedRefusal(record, null)?.code).toBe(RECOVERY_WRITE_REFUSED);
+    record.dispatched = true;
+    expect(undispatchedRefusal(record, null)).toBeNull();
+  });
+
+  // The REAL executor, so the wiring is tested rather than hand-picked flags:
+  // it RETURNS a failure for the guard's refusal and for a miss, and only a
+  // call that passed the guard reaches the bridge.
+  const element = {
+    id: "save-btn",
+    type: "button",
+    label: "Save",
+    tagName: "button",
+    accessibleName: "Save",
+    actions: ["click", "focus", "type"],
+    state: { visible: true, enabled: true, focused: false },
+  };
+  const run = async (instruction: string) => {
+    const bridge = makeBridge();
+    const record = newRecoveryDispatchRecord();
+    const executor = new NLActionExecutor();
+    executor.updateElements([element] as never);
+    executor.setActionExecutor(scopeRecoveryExecutor(bridge, "save-btn", record) as never);
+    const result = await executor.execute({ instruction });
+    return { bridge, record, result };
+  };
+
+  it("a write instruction is refused inside execute(): nothing dispatched", async () => {
+    const { bridge, record, result } = await run('type "hello" into the Save button');
+    expect(recoveryVerdict(result).attemptSucceeded).toBe(false);
+    expect(bridge.executeAction).not.toHaveBeenCalled();
+    expect(record.dispatched).toBe(false);
+    expect(record.refusal?.code).toBe(RECOVERY_WRITE_REFUSED);
+    expect(undispatchedRefusal(record, null)?.code).toBe(RECOVERY_WRITE_REFUSED);
+  });
+
+  it("an instruction that matches nothing dispatches nothing", async () => {
+    const { bridge, record, result } = await run("click the nonexistent purple elephant widget");
+    expect(recoveryVerdict(result).attemptSucceeded).toBe(false);
+    expect(bridge.executeAction).not.toHaveBeenCalled();
+    expect(undispatchedRefusal(record, recoveryVerdict(result).reason)?.code).toBe(
+      RECOVERY_NOT_DISPATCHED,
+    );
+  });
+
+  it("an in-scope click dispatches, so a failure would be RECOVERY_FAILED (no refusal)", async () => {
+    const { bridge, record } = await run("click the Save button");
+    expect(bridge.executeAction).toHaveBeenCalled();
+    expect(record.dispatched).toBe(true);
+    expect(undispatchedRefusal(record, null)).toBeNull();
   });
 });

@@ -12078,7 +12078,7 @@ CREATE TABLE project.journey_edge_observations (
     invalidated_by text,
     invalidation_token text,
     CONSTRAINT ck_journey_edge_observations_from_node_object CHECK ((jsonb_typeof(from_node) = 'object'::text)),
-    CONSTRAINT ck_journey_edge_observations_outcome CHECK ((outcome = ANY (ARRAY['changed'::text, 'no_change'::text, 'error'::text, 'settle_timeout'::text, 'to_node_unobserved'::text]))),
+    CONSTRAINT ck_journey_edge_observations_outcome CHECK ((outcome = ANY (ARRAY['changed'::text, 'no_change'::text, 'error'::text, 'settle_timeout'::text, 'to_node_unobserved'::text, 'verdict_unknown'::text]))),
     CONSTRAINT ck_journey_edge_observations_run_kind CHECK ((run_kind = ANY (ARRAY['agent_action'::text, 'explorer'::text, 'passive_session'::text]))),
     CONSTRAINT ck_journey_edge_observations_to_node_iff_observed CHECK (((to_node IS NULL) = (outcome = 'to_node_unobserved'::text))),
     CONSTRAINT ck_journey_edge_observations_to_node_object CHECK (((to_node IS NULL) OR (jsonb_typeof(to_node) = 'object'::text))),

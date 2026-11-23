@@ -325,6 +325,30 @@ impl ActionOutcome {
         matches!(self, ActionOutcome::Succeeded)
     }
 
+    /// Fold one more step's verdict into a batch's verdict: ONE definite
+    /// failure makes the batch a failure (its first failure is kept); else ONE
+    /// unstated step makes it [`ActionOutcome::Indeterminate`]; only a batch of
+    /// successes succeeded. A batch is one journey edge (plan
+    /// `2026-11-18-the-journey-ledger-never-records-an-unknown-action-verdict-as-a-success-or-a-failure`
+    /// D2), and an unknown step must not be reported as either answer.
+    pub(crate) fn and_then_step(self, step: ActionOutcome) -> ActionOutcome {
+        match (self, step) {
+            (failed @ ActionOutcome::Failed(_), _) => failed,
+            (_, failed @ ActionOutcome::Failed(_)) => failed,
+            (ActionOutcome::Indeterminate, _) | (_, ActionOutcome::Indeterminate) => {
+                ActionOutcome::Indeterminate
+            }
+            (ActionOutcome::Succeeded, ActionOutcome::Succeeded) => ActionOutcome::Succeeded,
+        }
+    }
+
+    /// [`ActionOutcome::and_then_step`] in place, for a verdict accumulated
+    /// across a loop.
+    pub(crate) fn absorb(&mut self, step: ActionOutcome) {
+        let so_far = std::mem::replace(self, ActionOutcome::Succeeded);
+        *self = so_far.and_then_step(step);
+    }
+
     /// The error to report for a non-success: the app's own error for
     /// `Failed`, [`INDETERMINATE_ACTION_ERROR`] for `Indeterminate`.
     pub(crate) fn error_message(&self) -> Option<String> {
@@ -2795,6 +2819,32 @@ mod action_outcome_tests {
 
         let outcome = action_outcome(&json!({ "success": false }));
         assert_eq!(outcome, ActionOutcome::Failed(None));
+    }
+
+    #[test]
+    fn a_batch_verdict_is_failed_then_indeterminate_then_succeeded() {
+        use ActionOutcome::*;
+        let fold = |steps: Vec<ActionOutcome>| {
+            steps
+                .into_iter()
+                .fold(Succeeded, ActionOutcome::and_then_step)
+        };
+        assert_eq!(fold(vec![]), Succeeded);
+        assert_eq!(fold(vec![Succeeded, Succeeded]), Succeeded);
+        assert_eq!(
+            fold(vec![Succeeded, Indeterminate, Succeeded]),
+            Indeterminate,
+            "one unstated step leaves the batch's verdict unknown"
+        );
+        assert_eq!(
+            fold(vec![
+                Indeterminate,
+                Failed(Some("first".into())),
+                Failed(Some("second".into()))
+            ]),
+            Failed(Some("first".into())),
+            "a definite failure wins, and the first one is kept"
+        );
     }
 
     #[test]

@@ -47,9 +47,10 @@ pub(crate) const FROM_NODE_KEY_SQL: &str = from_node_key_sql!();
 ///
 /// - `NOT EXISTS` skips an affordance already EXPLORED from this node: a live
 ///   (not invalidated) edge whose outcome is `changed` / `no_change` /
-///   `settle_timeout` (M4 — an `error` or `to_node_unobserved` edge explored
-///   nothing). The `= ANY($5)` pre-filter narrows the scan to this batch's
-///   fingerprints before the node-key expression is computed (m7);
+///   `settle_timeout` (M4 — an `error`, `to_node_unobserved` or
+///   `verdict_unknown` edge explored nothing it can vouch for). The
+///   `= ANY($5)` pre-filter narrows the scan to this batch's fingerprints
+///   before the node-key expression is computed (m7);
 /// - each row's `reason` follows plan D4 ([`d4_reason`]);
 /// - `ON CONFLICT` refreshes `last_seen_*` and the role / effect, and moves
 ///   the reason only between the four D4 OBSERVATION reasons:
