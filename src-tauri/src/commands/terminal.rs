@@ -9,7 +9,7 @@ use tracing::{debug, info, warn};
 
 use crate::commands::CommandResponse;
 use crate::error::AppError;
-use crate::session::pane_store::{PaneKey, PaneSessionStore};
+use crate::session::pane_store::{PaneKey, PaneSessionStore, TerminalCoordBinding};
 use crate::session::session_lifecycle_store::{
     CloseOutcome, SessionLifecycleStore, TerminalSessionRecord,
 };
@@ -32,6 +32,251 @@ pub(crate) mod coord_wiring;
 fn intent_sharing_from_settings() -> (bool, Option<bool>) {
     let perf = crate::settings::get_performance_settings();
     (perf.share_terminal_output, perf.redact_terminal_secrets)
+}
+
+/// The coord binding an ADOPTED holder pane should resume: the one recorded
+/// for this same terminal before the last runner let go of it.
+pub(crate) fn adoption_prior_binding(
+    pane_store: &PaneSessionStore,
+    terminal_id: &str,
+) -> Option<TerminalCoordBinding> {
+    pane_store.get_terminal(terminal_id)
+}
+
+/// The intent an adopted pane's coord row is resumed with: the recorded
+/// binding's tenant, repo, work unit and topic, plus what the adopted session
+/// itself knows (title, working dir) and the current sharing posture.
+pub(crate) fn adoption_intent(
+    binding: &TerminalCoordBinding,
+    title: &str,
+    working_dir: &str,
+    (share_output, redact_secrets): (bool, Option<bool>),
+) -> Intent {
+    Intent {
+        kind: SessionKind::TerminalShell,
+        purpose: Some(title.to_string())
+            .filter(|t| t.trim().len() >= 3)
+            .unwrap_or_else(|| "Terminal shell session".to_string()),
+        repo: binding.repo.clone(),
+        branch: None,
+        work_unit_slug: binding.work_unit_slug.clone(),
+        plan_slug: None,
+        correlation_topic: binding.correlation_topic.clone(),
+        page_id: None,
+        declared_paths: Some(working_dir.to_string())
+            .filter(|w| !w.is_empty())
+            .map(std::path::PathBuf::from)
+            .into_iter()
+            .collect(),
+        share_output,
+        redact_secrets,
+        tenant_id: binding.tenant_id,
+    }
+}
+
+/// Re-attach an adopted holder pane to its coord session (D8): resume the row
+/// the terminal's recorded binding names, with that binding's intent
+/// ([`adoption_intent`]), through `resume` (production:
+/// [`SessionRegistry::resume_external`]), then `wire` it (production:
+/// [`coord_wiring::bind_registered_coord_session`]) — so the row stays `active` across the restart, in
+/// its own tenant, and the pane's eventual real exit closes it. A pane with no
+/// binding (it was never registered, or predates it) is left unbound and
+/// logged. Returns the bound coord id.
+pub(crate) fn rebind_adopted_coord_session(
+    session: &crate::terminal::session::TerminalSession,
+    pane_store: &PaneSessionStore,
+    sharing: (bool, Option<bool>),
+    resume: impl FnOnce(uuid::Uuid, Intent) -> Result<uuid::Uuid, String>,
+    wire: impl FnOnce(uuid::Uuid, &coord_wiring::CoordBindingIntent),
+) -> Option<uuid::Uuid> {
+    let Some(prior) = adoption_prior_binding(pane_store, session.id()) else {
+        info!(
+            terminal_id = %session.id(),
+            "adoption: no coord session recorded for this terminal — the adopted pane is left \
+             without a coord row"
+        );
+        return None;
+    };
+    let intent = adoption_intent(&prior, &session.title(), session.working_dir(), sharing);
+    match resume(prior.coord_id, intent) {
+        Ok(coord_id) => {
+            wire(
+                coord_id,
+                &coord_wiring::CoordBindingIntent::from_binding(&prior),
+            );
+            info!(
+                terminal_id = %session.id(),
+                prior_coord_session = %prior.coord_id,
+                coord_session = %coord_id,
+                tenant = ?prior.tenant_id,
+                resumed = coord_id == prior.coord_id,
+                "adoption: coord session re-bound to the adopted pane"
+            );
+            Some(coord_id)
+        }
+        Err(e) => {
+            warn!(
+                terminal_id = %session.id(),
+                prior_coord_session = %prior.coord_id,
+                error = %e,
+                "adoption: coord session resume failed — the adopted pane is left without a \
+                 coord row"
+            );
+            None
+        }
+    }
+}
+
+/// How long [`rebind_adopted_terminal`] waits for `setup()` to manage the
+/// `SessionRegistry` before it gives the rebind up. The boot sweep starts in
+/// `setup()` well before the registry is managed, so a fast census can adopt a
+/// pane first; the wait is on the sweep's own OS thread.
+///
+/// Deliberately NOT a term of `holder_boot_sweep::RESTORE_WAIT`: it ends when
+/// `setup()` reaches `mark_runtime_ready` (right after the registry is
+/// managed), which nothing the sweep's own steps do can delay.
+const ADOPTION_REGISTRY_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Wait (bounded by `bound`, polling) until `ready` answers true. Returns
+/// whether it did.
+fn wait_until(bound: std::time::Duration, ready: impl Fn() -> bool) -> bool {
+    let end = std::time::Instant::now() + bound;
+    loop {
+        if ready() {
+            return true;
+        }
+        if std::time::Instant::now() >= end {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// [`rebind_adopted_coord_session`] wired to this app: the registry and pane
+/// store from managed state, `resume_external` blocked on from the boot
+/// sweep's plain OS thread. The sweep can adopt before `setup()` has managed
+/// the `SessionRegistry` ([`crate::tauri_app_handle::mark_runtime_ready`] marks
+/// that), so this waits for it, bounded by [`ADOPTION_REGISTRY_WAIT`]. A runner
+/// still missing either state skips the rebind, and says so.
+pub(crate) fn rebind_adopted_terminal(
+    app_handle: &tauri::AppHandle,
+    terminal_manager: &TerminalManager,
+    terminal_id: &str,
+) -> Option<uuid::Uuid> {
+    let session = terminal_manager.get(terminal_id)?;
+    if !wait_until(ADOPTION_REGISTRY_WAIT, || {
+        crate::tauri_app_handle::runtime_ready()
+            || app_handle.try_state::<Arc<SessionRegistry>>().is_some()
+    }) {
+        warn!(
+            terminal_id = %terminal_id,
+            waited = ?ADOPTION_REGISTRY_WAIT,
+            "adoption: the SessionRegistry was never managed — the adopted pane is left \
+             without a coord row"
+        );
+        return None;
+    }
+    let Some(registry) = app_handle
+        .try_state::<Arc<SessionRegistry>>()
+        .map(|s| s.inner().clone())
+    else {
+        warn!(
+            terminal_id = %terminal_id,
+            "adoption: no SessionRegistry in managed state — the adopted pane is left without \
+             a coord row"
+        );
+        return None;
+    };
+    let Some(pane_store) = app_handle
+        .try_state::<Arc<PaneSessionStore>>()
+        .map(|s| s.inner().clone())
+    else {
+        warn!(
+            terminal_id = %terminal_id,
+            "adoption: no PaneSessionStore in managed state — the adopted pane is left without \
+             a coord row"
+        );
+        return None;
+    };
+    // A row another live pane of this runner is bound to — or one another
+    // create is resuming right now — is not this pane's to resume: two panes
+    // on one coord row would each close it on exit (finding 77046422, the
+    // rule `coord_wiring::wire_coord_session` applies to every resume). The
+    // claim is held from that check until the adopted pane is bound.
+    let resume_claim: std::cell::RefCell<Option<crate::session::pane_store::ResumeClaim>> =
+        std::cell::RefCell::new(None);
+    let resume_registry = registry.clone();
+    let claim_store = pane_store.clone();
+    // Re-key the resumed row to the harness session id this pane's process was
+    // pinned to at spawn, exactly as `terminal_create`'s resume arm does (plan
+    // 2026-10-23-a-hookless-resume-in-a-runner-pane-leaves-the-session-with-no-active-coord-row,
+    // Phase 2): the adopted pane runs the very same process.
+    let pinned_session_id = Some(session.pinned_session_id().to_string());
+    // The boot sweep runs on its own OS thread, and the wiring needs a tokio
+    // runtime: the exit hook captures its handle, and the output pipe is a
+    // tokio task.
+    let rt = tauri::async_runtime::handle().inner().clone();
+    rebind_adopted_coord_session(
+        &session,
+        &pane_store,
+        intent_sharing_from_settings(),
+        |prior, intent| {
+            let Some(claim) = claim_store.claim_resume(prior) else {
+                return Err("another create is resuming this coord row right now".to_string());
+            };
+            match terminal_manager.coord_row_bound_at(prior) {
+                Some(None) => {}
+                Some(Some(_)) => {
+                    return Err("another live pane is bound to this coord row".to_string())
+                }
+                None => return Err("the terminal map is unreadable (UNKNOWN)".to_string()),
+            }
+            *resume_claim.borrow_mut() = Some(claim);
+            tauri::async_runtime::block_on(resume_registry.resume_external(
+                prior,
+                intent,
+                pinned_session_id,
+            ))
+            .map_err(|e| e.to_string())
+        },
+        // The resumed row's registry record carries the binding's tenant and
+        // intent, which `bind_registered_coord_session` reads back and
+        // re-records.
+        |coord_id, _binding| {
+            let _rt = rt.enter();
+            coord_wiring::bind_registered_coord_session(
+                terminal_manager,
+                &registry,
+                session.id(),
+                coord_id,
+                Some(pane_store.clone()),
+                "holder_adoption",
+            );
+            // Bound: the terminal map alone protects the row from here on.
+            drop(resume_claim.borrow_mut().take());
+            // The hook is installed FIRST and the exit checked AFTER (the
+            // relay's remote-create pattern): a pane that exited before the
+            // hook was in place — during the registry wait or the resume — ran
+            // its exit with no hook, so close the row it just resumed here.
+            // An exit after the install fires the hook; both is a no-op repeat.
+            // The REAL exit is the waiter's `exit_snapshot`, never `!is_alive()`:
+            // a handoff detach (a restart landing inside this window) also
+            // clears `alive`, and closing then would retire a live process's
+            // row and drop the binding the next runner adopts it by.
+            if session.exit_snapshot().is_some() {
+                if let Err(e) = registry.close_by_id(coord_id) {
+                    warn!(
+                        terminal_id = %session.id(),
+                        coord_session = %coord_id,
+                        error = %e,
+                        "adoption: the adopted pane exited before its hook was installed — \
+                         coord session close failed"
+                    );
+                }
+                pane_store.remove_terminal(session.id());
+            }
+        },
+    )
 }
 
 /// Parse a spawn surface's optional tenant argument.
@@ -2943,6 +3188,9 @@ pub(crate) fn create_terminal_session_backend(
                 session_registry,
                 &info.id,
                 coord_id,
+                app_handle_for_spawn_name
+                    .try_state::<Arc<PaneSessionStore>>()
+                    .map(|s| s.inner().clone()),
                 "create_terminal_session_backend",
             );
             info!(
@@ -3441,6 +3689,206 @@ pub fn plugin() -> TauriPlugin<tauri::Wry> {
 }
 
 #[cfg(test)]
+mod adoption_coord_tests {
+    //! D8 of plan
+    //! `2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them`:
+    //! an adopted holder pane keeps the coord session it had before the
+    //! handoff, and its eventual real exit closes that row exactly once.
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+    use crate::commands::terminal::coord_wiring::{
+        wire_coord_hook, CoordBindingIntent, CoordExitTarget,
+    };
+    use crate::terminal::session::tests::{
+        make_test_session, FakeHolderIo, RecordingWaiterEffects,
+    };
+
+    /// The adoption rebind's wait for the `SessionRegistry`: it returns as
+    /// soon as the state appears (the sweep adopted before `setup()` managed
+    /// it), and gives up at its bound when it never does.
+    #[test]
+    fn the_adoption_wait_returns_when_ready_and_gives_up_at_its_bound() {
+        let polls = std::sync::atomic::AtomicUsize::new(0);
+        assert!(wait_until(std::time::Duration::from_secs(5), || {
+            polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 2
+        }));
+        assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+        let start = std::time::Instant::now();
+        assert!(!wait_until(std::time::Duration::from_millis(120), || false));
+        assert!(start.elapsed() >= std::time::Duration::from_millis(120));
+    }
+
+    #[derive(Default)]
+    struct RecordingTarget {
+        closed: Mutex<Vec<uuid::Uuid>>,
+    }
+
+    impl CoordExitTarget for RecordingTarget {
+        fn close_session(&self, coord_id: uuid::Uuid, _door: &'static str) {
+            self.closed.lock().unwrap().push(coord_id);
+        }
+        fn session_exit(&self, _coord_id: uuid::Uuid, _pinned: &str, _code: Option<i32>) {}
+    }
+
+    fn pane(id: &str) -> crate::terminal::session::TerminalSession {
+        let mut s = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        s.set_id_for_test(id);
+        s.set_io_for_test(Arc::new(FakeHolderIo::holder()));
+        s
+    }
+
+    fn binding_in(tenant: uuid::Uuid) -> CoordBindingIntent {
+        CoordBindingIntent {
+            tenant_id: Some(tenant),
+            repo: Some("qontinui-runner".to_string()),
+            work_unit_slug: Some("2026-10-21-graceful-handoff".to_string()),
+            correlation_topic: Some("handoff".to_string()),
+        }
+    }
+
+    #[test]
+    fn an_adopted_pane_keeps_its_pre_handoff_coord_session_and_a_real_exit_closes_it_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(PaneSessionStore::open(dir.path().join("panes.json")).unwrap());
+        let tm = TerminalManager::new();
+        let target = Arc::new(RecordingTarget::default());
+        let effects = RecordingWaiterEffects::default();
+        let terminal_id = format!("adopt-{}", uuid::Uuid::new_v4());
+        let pre_handoff = uuid::Uuid::new_v4();
+        // A NON-default tenant: the resume must probe and keep the row there.
+        let tenant = uuid::Uuid::new_v4();
+
+        // The pane as the old runner wired it.
+        let old = pane(&terminal_id);
+        wire_coord_hook(
+            &tm,
+            &old,
+            target.clone(),
+            pre_handoff,
+            &binding_in(tenant),
+            Some(store.clone()),
+            "test",
+        );
+        assert_eq!(
+            adoption_prior_binding(&store, &terminal_id).map(|b| b.coord_id),
+            Some(pre_handoff)
+        );
+
+        // The handoff: detached, so the waiter runs no exit hook.
+        let sink = Option::<&crate::terminal::exit_notice::RecordingExitSink>::None;
+        old.close_for_handoff_with(None, sink);
+        assert!(old.settle_waiter_for_test(Ok(0), &effects));
+        assert!(
+            target.closed.lock().unwrap().is_empty(),
+            "a handoff closes no coord row"
+        );
+
+        // The next runner adopts the same terminal id and re-binds.
+        let adopted = pane(&terminal_id);
+        let mut resumed_with: Option<(uuid::Uuid, Intent)> = None;
+        let bound = rebind_adopted_coord_session(
+            &adopted,
+            &store,
+            (true, None),
+            |prior, intent| {
+                resumed_with = Some((prior, intent));
+                Ok(prior)
+            },
+            |coord_id, binding| {
+                wire_coord_hook(
+                    &tm,
+                    &adopted,
+                    target.clone(),
+                    coord_id,
+                    binding,
+                    Some(store.clone()),
+                    "test",
+                )
+            },
+        );
+        let (prior, intent) = resumed_with.expect("the resume ran");
+        assert_eq!(prior, pre_handoff, "the prior row is the one resumed");
+        assert_eq!(
+            intent.tenant_id,
+            Some(tenant),
+            "resumed in ITS OWN tenant, not the default"
+        );
+        assert_eq!(
+            intent.repo.as_deref(),
+            Some("qontinui-runner"),
+            "repo intact"
+        );
+        assert_eq!(
+            intent.work_unit_slug.as_deref(),
+            Some("2026-10-21-graceful-handoff")
+        );
+        assert_eq!(intent.correlation_topic.as_deref(), Some("handoff"));
+        assert_eq!(bound, Some(pre_handoff));
+        assert_eq!(adopted.coord_session_id(), Some(pre_handoff));
+        assert_eq!(
+            adoption_prior_binding(&store, &terminal_id).and_then(|b| b.tenant_id),
+            Some(tenant),
+            "the re-recorded binding keeps the tenant for a second restart"
+        );
+
+        // Its eventual REAL exit closes that row, once, and forgets the binding.
+        assert!(!adopted.settle_waiter_for_test(Ok(0), &effects));
+        assert_eq!(*target.closed.lock().unwrap(), vec![pre_handoff]);
+        assert_eq!(adoption_prior_binding(&store, &terminal_id), None);
+    }
+
+    /// Only a HOLDER-backed pane is recorded: an in-process pane cannot be
+    /// adopted, so a binding for it would only accumulate.
+    #[test]
+    fn an_in_process_pane_records_no_terminal_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(PaneSessionStore::open(dir.path().join("panes.json")).unwrap());
+        let tm = TerminalManager::new();
+        let mut local = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        let id = format!("local-{}", uuid::Uuid::new_v4());
+        local.set_id_for_test(&id);
+        local.set_io_for_test(Arc::new(FakeHolderIo::in_process()));
+        wire_coord_hook(
+            &tm,
+            &local,
+            Arc::new(RecordingTarget::default()),
+            uuid::Uuid::new_v4(),
+            &CoordBindingIntent::default(),
+            Some(store.clone()),
+            "test",
+        );
+        assert_eq!(adoption_prior_binding(&store, &id), None);
+        assert!(
+            local.coord_session_id().is_some(),
+            "still bound to its coord row"
+        );
+    }
+
+    #[test]
+    fn a_pane_with_no_recorded_coord_session_is_left_unbound() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PaneSessionStore::open(dir.path().join("panes.json")).unwrap();
+        let adopted = pane(&format!("adopt-none-{}", uuid::Uuid::new_v4()));
+        let mut resumed = false;
+        let bound = rebind_adopted_coord_session(
+            &adopted,
+            &store,
+            (true, None),
+            |p, _| {
+                resumed = true;
+                Ok(p)
+            },
+            |_, _| panic!("nothing to wire"),
+        );
+        assert_eq!(bound, None);
+        assert!(!resumed);
+        assert_eq!(adopted.coord_session_id(), None);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3731,7 +4179,7 @@ mod tests {
         assert!(matches!(before, CloseOutcome::Closed { .. }), "{before:?}");
         assert_eq!(store.get("before").unwrap().state, "closed");
 
-        let _ = tm.close_all(std::time::Instant::now());
+        let _ = tm.close_all(std::time::Instant::now(), crate::terminal::CloseMode::Kill);
 
         let after = record_close_for(&tm, &store, "after", Some("term-after"), "pty-exit");
         assert!(
