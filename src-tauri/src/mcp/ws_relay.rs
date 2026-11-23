@@ -1142,6 +1142,18 @@ mod tests {
         let m2 = m.clone();
         let pending =
             tokio::spawn(async move { m2.send_text_if_current("app", conn, "last".into()).await });
+        // Let the spawned send run BEFORE draining, so it meets a full channel
+        // and parks in the `TrySendError::Full` arm. On this single-threaded
+        // runtime, draining first would let it take the `try_send` Ok path and
+        // the arm this test is named after would never run.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !pending.is_finished(),
+            "the 17th send must wait on the full channel"
+        );
+        assert_eq!(rx.len(), 16, "the parked send must not have enqueued yet");
         for i in 0..16 {
             assert_eq!(rx.recv().await.unwrap(), format!("{i}"));
         }

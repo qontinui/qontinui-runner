@@ -24074,14 +24074,18 @@ mod provision_probe_tests {
     /// A home directory is not a git work tree, and `~/.claude/agents` holds the
     /// operator's own hand-authored definitions. The git guard cannot catch it.
     ///
-    /// Deterministic by construction (finding `70008d38`, plan
+    /// Hardened against env races (finding `70008d38`, plan
     /// `2026-11-22-vision-capture-websocket-follow-ups` Phase 3). The test and
-    /// the handler each call `dirs::home_dir()`, and it used to run outside the
-    /// env lock, so an env-mutating sibling fixture could repoint the home
-    /// directory between the test's read and the handler's. Now the whole body
-    /// holds `env_lock()` (through an `IsolatedAmbient`), so no fixture can move
-    /// it between the two reads, and the test resolves the home directory the
-    /// way the handler does, under that lock, and probes exactly that.
+    /// the handler each call `dirs::home_dir()`, and the test used to run
+    /// outside the env lock. On a target where `dirs` reads `HOME`, an
+    /// env-mutating sibling fixture could repoint it between the two reads.
+    /// Now the whole body holds `env_lock()` (through an `IsolatedAmbient`), so
+    /// no fixture can move it between them, and the test resolves the home
+    /// directory the way the handler does, under that lock, and probes exactly
+    /// that. This removes the one race the test itself could have. It is NOT a
+    /// confirmed cause of the recorded failure: that failure's panic named a
+    /// `qontinui-ambient-deflected` path, which is not a HOME value, and on
+    /// Windows `dirs` does not read the environment at all (below).
     ///
     /// Where `dirs::home_dir()` reads `HOME` (every non-Windows target), the
     /// fixture also makes it a known, empty temp dir, and the test asserts that
