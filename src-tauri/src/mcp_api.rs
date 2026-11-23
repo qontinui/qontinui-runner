@@ -23640,47 +23640,6 @@ mod supervised_workers_health_tests {
         Call,
     }
 
-    /// The census of every task `create_router` starts (plan
-    /// `2026-11-12-runner-create-router-starts-six-long-lived-loops-unsupervised`
-    /// Phase 0). Plan `2026-09-03-coord-row-get-panic-class-closed-by-lint-and-supervisor`
-    /// supervised the loops `main.rs` starts and never counted these, so a
-    /// panic ended them silently while `/health` read them as never started.
-    ///
-    /// Closed tables, every row a needle with a reason: `SUPERVISED` (under
-    /// `worker_supervisor`, listed on `/health`), `TASK_SUPERVISED` (under
-    /// `mcp::task_supervisor`), `ONE_SHOT`, `PER_EVENT` and `DEFERRED` (a
-    /// long-lived loop still on a bare spawn). A later phase that supervises a
-    /// loop moves its row from `DEFERRED` to `SUPERVISED` — an inline row's
-    /// needle then becomes the `::spawn_<role>(` call that replaced the body.
-    ///
-    /// Closure: every spawn site in the region (`::spawn(` / `.spawn(` / a
-    /// word-boundary bare `spawn(` — `tokio::spawn`, `std::thread::spawn`, a
-    /// runtime `Handle`'s spawn, or a `use`-imported one) holds exactly one
-    /// `Site::Spawn` needle; every `::spawn_*(` / `::start_*(` / `.spawn_*(` /
-    /// `.start_*(` / `.start(` / `::start(` call (and an unqualified
-    /// `spawn_*(` / `start_*(`) is covered by as many rows as it has
-    /// occurrences; every needle is found exactly once (a moved or renamed
-    /// region goes red instead of passing with nothing counted); registry names
-    /// are unique.
-    ///
-    /// The census boundary — what this test does NOT see:
-    /// - a starter named some other way (not `spawn` / `start` / `spawn_*` /
-    ///   `start_*`, qualified or bare, and not a spawn written inline in the
-    ///   region);
-    /// - tasks a callee starts beneath a classified row:
-    ///   `WrapperState::new_default`'s `spawn_health_loop` / `spawn_idle_reaper`
-    ///   (`wrappers/manager.rs`), the trigger service's nested bridge loop
-    ///   (`trigger_system/service.rs`), and the browse `std::thread` that
-    ///   `MdnsScanner::start` (`mcp/discovery/mdns_scanner.rs`) spawns — that
-    ///   call itself IS counted, as the DEFERRED `mdns_scanner.browse_thread`
-    ///   row;
-    /// - the loops `main.rs` starts, classified by `worker_supervisor`'s own
-    ///   `every_phase4_entry_point_is_classified` (its DEFERRED set).
-    ///
-    /// When plan
-    /// `2026-10-04-runner-mcp-api-rs-holds-the-http-composition-root-health-and-five-proxies-in-one-file`
-    /// Phase 7b moves the boot spawns into `router/boot_tasks.rs`, this census
-    /// moves with them and reads `boot_tasks::spawn_all` instead.
     /// A census spawn site: `::spawn(` / `.spawn(` (tokio, `std::thread`, a
     /// runtime `Handle`) or a word-boundary bare `spawn(` (a `use`-imported
     /// spawn). `spawn_blocking(` and other `spawn_*(` starters do not match.
@@ -23729,6 +23688,47 @@ mod supervised_workers_health_tests {
         )
     }
 
+    /// The census of every task `create_router` starts (plan
+    /// `2026-11-12-runner-create-router-starts-six-long-lived-loops-unsupervised`
+    /// Phase 0). Plan `2026-09-03-coord-row-get-panic-class-closed-by-lint-and-supervisor`
+    /// supervised the loops `main.rs` starts and never counted these, so a
+    /// panic ended them silently while `/health` read them as never started.
+    ///
+    /// Closed tables, every row a needle with a reason: `SUPERVISED` (under
+    /// `worker_supervisor`, listed on `/health`), `TASK_SUPERVISED` (under
+    /// `mcp::task_supervisor`), `ONE_SHOT`, `PER_EVENT` and `DEFERRED` (a
+    /// long-lived loop still on a bare spawn). A later phase that supervises a
+    /// loop moves its row from `DEFERRED` to `SUPERVISED` — an inline row's
+    /// needle then becomes the `::spawn_<role>(` call that replaced the body.
+    ///
+    /// Closure: every spawn site in the region (`::spawn(` / `.spawn(` / a
+    /// word-boundary bare `spawn(` — `tokio::spawn`, `std::thread::spawn`, a
+    /// runtime `Handle`'s spawn, or a `use`-imported one) holds exactly one
+    /// `Site::Spawn` needle; every `::spawn_*(` / `::start_*(` / `.spawn_*(` /
+    /// `.start_*(` / `.start(` / `::start(` call (and an unqualified
+    /// `spawn_*(` / `start_*(`) is covered by as many rows as it has
+    /// occurrences; every needle is found exactly once (a moved or renamed
+    /// region goes red instead of passing with nothing counted); registry names
+    /// are unique.
+    ///
+    /// The census boundary — what this test does NOT see:
+    /// - a starter named some other way (not `spawn` / `start` / `spawn_*` /
+    ///   `start_*`, qualified or bare, and not a spawn written inline in the
+    ///   region);
+    /// - tasks a callee starts beneath a classified row:
+    ///   `WrapperState::new_default`'s `spawn_health_loop` / `spawn_idle_reaper`
+    ///   (`wrappers/manager.rs`), the trigger service's nested bridge loop
+    ///   (`trigger_system/service.rs`), and the browse `std::thread` that
+    ///   `MdnsScanner::start` (`mcp/discovery/mdns_scanner.rs`) spawns — that
+    ///   call itself IS counted, as the DEFERRED `mdns_scanner.browse_thread`
+    ///   row;
+    /// - the loops `main.rs` starts, classified by `worker_supervisor`'s own
+    ///   `every_phase4_entry_point_is_classified` (its DEFERRED set).
+    ///
+    /// When plan
+    /// `2026-10-04-runner-mcp-api-rs-holds-the-http-composition-root-health-and-five-proxies-in-one-file`
+    /// Phase 7b moves the boot spawns into `router/boot_tasks.rs`, this census
+    /// moves with them and reads `boot_tasks::spawn_all` instead.
     #[test]
     fn every_create_router_boot_task_is_classified() {
         const PHASE1_2: &str = "migration target of plan \
