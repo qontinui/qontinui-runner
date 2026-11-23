@@ -232,8 +232,8 @@ fn pinned_send_error(app_id: &str, conn_id: u64, err: PinnedSendError) -> Comman
     match err {
         PinnedSendError::NotConnected => CommandRelayError::NotConnected(app_id.to_string()),
         PinnedSendError::Displaced { current } => CommandRelayError::Displaced(format!(
-            "app '{app_id}' connection {conn_id} was replaced by connection {current} \
-             before the command was sent"
+            "app '{app_id}' connection {conn_id} does not hold the app's routing slot \
+             (held by connection {current}); the command was not sent"
         )),
         PinnedSendError::Send => CommandRelayError::Disconnected,
     }

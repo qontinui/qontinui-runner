@@ -147,6 +147,10 @@ where
 /// A dispatch refused because the app's registration moved after it was
 /// read — to HTTP, or to another connection. Both are re-resolved from a
 /// fresh row rather than reported.
+///
+/// `Displaced` also covers a command that WAS sent and then lost its
+/// connection, so a retry may run `getScreenshot` twice. That is safe only
+/// because a capture is idempotent; do not reuse this for a mutating action.
 fn is_rerouted(err: &DispatchError) -> bool {
     matches!(
         err,

@@ -431,6 +431,12 @@ impl AppDispatcher {
     /// time of the send ([`CommandRelay::dispatch_to_conn`] checks and sends
     /// under one lock). The enqueue-time liveness refresh of
     /// [`Self::websocket_arm`] is kept, guarded on `conn_id`.
+    ///
+    /// `Displaced` does NOT always mean nothing was sent. A command already in
+    /// flight when its connection is replaced is also answered `Displaced`
+    /// (the relay rejects that connection's pending commands), and the wrapper
+    /// may have run it. A caller that retries on `Displaced` must therefore
+    /// only send idempotent actions.
     pub async fn dispatch_websocket_pinned(
         &self,
         app_id: &str,
