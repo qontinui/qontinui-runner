@@ -743,6 +743,11 @@ pub struct TerminalSessionRecord {
     /// Coord tenant this session was spawned under (`Intent.tenant_id`, stamped
     /// from `terminal_create`). Already carried on the frontend `TerminalTab`;
     /// durable here so a restart still knows it. Sticky.
+    ///
+    /// CALLER-CHOSEN ONLY: never write a resolved or default tenant here —
+    /// `policy_tenant::live_read_then_recorded` promotes it to `Owned` on a
+    /// multi-bound device. The device default sampled at spawn goes to
+    /// [`Self::spawn_device_default`] instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<String>,
     /// Orchestration task-run id — present only for WORKER sessions (the

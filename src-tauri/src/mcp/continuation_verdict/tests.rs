@@ -144,6 +144,42 @@ fn try_claim_takes_exactly_cap_slots_and_a_refusal_records_nothing() {
     assert!(reg.try_claim("tc", now + CAP_WINDOW + Duration::from_secs(1), 2));
 }
 
+/// Review round 5 A2. At cap − 1, two Stops that both decided `block` race
+/// for the last slot: the first keeps its block, the second is downgraded to
+/// the cap-exhausted allow (`would_block`), and nothing is double-counted.
+#[test]
+fn the_last_cap_slot_goes_to_one_block_and_the_other_is_downgraded() {
+    let reg = CapRegistry::new();
+    let now = Instant::now();
+    let cap = 3;
+    for _ in 0..cap - 1 {
+        assert!(reg.try_claim("race", now, cap));
+    }
+    let blocked = || decide(Mode::On, false, &reachable(None), false);
+    let exhausted = || decide(Mode::On, false, &reachable(None), true);
+    let first = claim_or_downgrade(&reg, "race", now, cap, blocked(), exhausted);
+    assert_eq!(first.decision, "block");
+    let second = claim_or_downgrade(&reg, "race", now, cap, blocked(), exhausted);
+    assert_eq!(second.decision, "allow");
+    assert!(second.would_block, "{}", second.reason);
+    // An allow claims nothing.
+    let reg = CapRegistry::new();
+    let allow = decide(Mode::On, false, &reachable(Some("finished")), false);
+    let _ = claim_or_downgrade(&reg, "quiet", now, 1, allow, exhausted);
+    assert!(!reg.would_exceed("quiet", now, 1));
+}
+
+/// Round 5 A3. A released claim gives its slot back.
+#[test]
+fn a_released_claim_frees_its_slot() {
+    let reg = CapRegistry::new();
+    let now = Instant::now();
+    assert!(reg.try_claim("rel", now, 1));
+    assert!(!reg.try_claim("rel", now, 1));
+    reg.release("rel", now);
+    assert!(reg.try_claim("rel", now, 1));
+}
+
 #[test]
 fn cap_registry_window_expires() {
     let reg = CapRegistry::new();
