@@ -350,6 +350,24 @@
     },
     {
       "class": "os_bound_tooling",
+      "file": "src/agent_worktree/cargo_locks.rs",
+      "symbol": "lock_file_held",
+      "excerpt": "cfg(windows)-only fn `lock_file_held` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "The Windows arm of the census cargo-lock probe (probe_current dispatches per OS): cargo holds .cargo-lock with a LockFileEx byte-range lock, so a plain open succeeds and only a non-blocking File::try_lock sees the holder. Linux keeps its /proc/locks reader (probe_workspace) in the same file; every other OS answers None (UNKNOWN), never an empty list."
+    },
+    {
+      "class": "os_bound_tooling",
+      "file": "src/agent_worktree/cargo_locks.rs",
+      "symbol": "probe_workspace_windows",
+      "excerpt": "cfg(windows)-only fn `probe_workspace_windows` has no cfg(not(windows)) sibling in this file",
+      "count": 1,
+      "disposition": "fallback_correct",
+      "note": "The Windows arm of the census cargo-lock probe (probe_current dispatches per OS): cargo holds .cargo-lock with a LockFileEx byte-range lock, so a plain open succeeds and only a non-blocking File::try_lock sees the holder. Linux keeps its /proc/locks reader (probe_workspace) in the same file; every other OS answers None (UNKNOWN), never an empty list."
+    },
+    {
+      "class": "os_bound_tooling",
       "file": "src/ai_provider/claude_cli.rs",
       "symbol": "run_claude_cli_with_file",
       "excerpt": "crate::process_helpers::no_window(\"powershell.exe\").args([",

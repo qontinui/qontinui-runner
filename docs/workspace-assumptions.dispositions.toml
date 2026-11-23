@@ -731,6 +731,26 @@ reviewed = [
     "cfg(windows)-only fn `port_owner_pid_powershell` has no cfg(not(windows)) sibling in this file",
 ]
 
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/agent_worktree/cargo_locks.rs"
+symbol = "probe_workspace_windows"
+disposition = "fallback_correct"
+note = "The Windows arm of the census cargo-lock probe (probe_current dispatches per OS): cargo holds .cargo-lock with a LockFileEx byte-range lock, so a plain open succeeds and only a non-blocking File::try_lock sees the holder. Linux keeps its /proc/locks reader (probe_workspace) in the same file; every other OS answers None (UNKNOWN), never an empty list."
+reviewed = [
+    "cfg(windows)-only fn `probe_workspace_windows` has no cfg(not(windows)) sibling in this file",
+]
+
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/agent_worktree/cargo_locks.rs"
+symbol = "lock_file_held"
+disposition = "fallback_correct"
+note = "The Windows arm of the census cargo-lock probe (probe_current dispatches per OS): cargo holds .cargo-lock with a LockFileEx byte-range lock, so a plain open succeeds and only a non-blocking File::try_lock sees the holder. Linux keeps its /proc/locks reader (probe_workspace) in the same file; every other OS answers None (UNKNOWN), never an empty list."
+reviewed = [
+    "cfg(windows)-only fn `lock_file_held` has no cfg(not(windows)) sibling in this file",
+]
+
 # qontinui-runner#2376 (plan 2026-10-23-runner-sessions-stop-at-permission-dialogs-so-accept-them-by-default-with-a-tenant-switch
 # Phase 2): the PermissionRequest hook carrier's shell-program list.
 [[disposition]]
