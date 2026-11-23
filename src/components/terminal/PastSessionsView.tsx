@@ -527,13 +527,7 @@ export function PastSessionsView({ onResumePastSession }: PastSessionsViewProps)
     refreshSessions();
     refreshRoster?.();
   }, [refreshSessions, refreshRoster]);
-  const { ops: finishOps, setFinished, reconcile: reconcileFinishOps } =
-    useFinishOps(onFinishSettled);
-  // A notice whose row changed state through another door is dropped.
-  useEffect(() => {
-    const byId = new Map(sessions.map((s) => [s.claudeSessionId, s.finished === true]));
-    reconcileFinishOps((id) => byId.get(id));
-  }, [sessions, reconcileFinishOps]);
+  const { ops: finishOps, setFinished } = useFinishOps(onFinishSettled);
   // …and a Finish/Unfinish made in the roster section re-reads this list.
   const finishEpoch = roster?.finishEpoch ?? 0;
   useEffect(() => {

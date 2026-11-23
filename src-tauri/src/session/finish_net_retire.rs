@@ -1025,6 +1025,11 @@ impl NetsCoord for HttpNetsCoord {
                 format!("/coord/gates/{gate_id}/agent/continuation-cancel")
             }
         };
+        // coord-auth-exempt(device-jwt-required): fails CLOSED -- `bearer()` refuses
+        // when no device JWT is held, and a gate write without the registrant's own
+        // device credential cannot withdraw the net. The JWT is the one
+        // `coord_client_parts` read for this retire, used only once this device is
+        // proven bound to a single tenant (the gate read uses the same token).
         let resp = self
             .client
             .post(format!("{}{path}", self.base))

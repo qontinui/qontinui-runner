@@ -954,6 +954,11 @@ mod tests {
             crate::session::finish_net_retire::DOOR_BUDGET,
         )
         .await;
+        assert_eq!(
+            *probe.calls.lock().unwrap(),
+            vec![(vec!["a".to_string(), "b".to_string()], false)],
+            "the skipped session is left out of the one batch"
+        );
         assert_eq!(reports.len(), 3);
         match &reports[0] {
             NetsReport::Ran(o) => assert_eq!(o.stems, vec!["stem-a".to_string()]),

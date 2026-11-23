@@ -18,13 +18,6 @@ import type { FinishOp } from "./sinceRestart";
 export function useFinishOps(onSettled: () => void): {
   ops: ReadonlyMap<string, FinishOp>;
   setFinished: (claudeSessionId: string, finished: boolean) => void;
-  /**
-   * Drop every `settled` op whose row's finished state no longer matches what
-   * that op set (changed through another door), so its notice cannot come
-   * back when the row later returns to that state. `finishedOf` answers
-   * `undefined` for a row it does not hold, which is left alone.
-   */
-  reconcile: (finishedOf: (claudeSessionId: string) => boolean | undefined) => void;
 } {
   const [ops, setOps] = useState<Map<string, FinishOp>>(new Map());
   // Per session: did its last Finish (through this view, this app run)
@@ -64,22 +57,5 @@ export function useFinishOps(onSettled: () => void): {
     },
     [onSettled],
   );
-  const reconcile = useCallback(
-    (finishedOf: (claudeSessionId: string) => boolean | undefined) => {
-      setOps((prev) => {
-        let next: Map<string, FinishOp> | null = null;
-        for (const [id, op] of prev) {
-          if (op.phase !== "settled") continue;
-          const f = finishedOf(id);
-          if (f === undefined || f === op.to) continue;
-          next ??= new Map(prev);
-          next.delete(id);
-          withdrewRef.current.delete(id);
-        }
-        return next ?? prev;
-      });
-    },
-    [],
-  );
-  return { ops, setFinished, reconcile };
+  return { ops, setFinished };
 }

@@ -248,6 +248,9 @@ const EXPECTED_EXEMPTIONS: &[(&str, &str, usize)] = &[
     // when there is none: coord's ingest 403s any other credential, so the
     // fail-soft defaulting helper (which would send anonymously) is wrong here.
     ("session/census.rs", "device-jwt-required", 1),
+    // finish_net_retire's gate withdraw/continuation-cancel POST (plan
+    // 2026-11-23-an-operator-finish-from-the-runner-ui-still-fires-the-finished-sessions-implement-ship-net).
+    ("session/finish_net_retire.rs", "device-jwt-required", 1),
     // The session-identity reporter's POST to coord's
     // /coord/session-identity/:device_id (plan
     // `2026-10-19-session-lookup-by-name-shows-claude-account-in-web` Phase 2).
