@@ -18,8 +18,13 @@
 //!   irreversible (and monotone in `upsert_session_pr`): never re-read, not on a
 //!   runner start, not on a nudge. Every other non-open row takes its
 //!   transitions from its repo's listings; a per-row `get_pr` survives only when
-//!   no fresh, complete listing governs the repo — every 30 min for 24 h from
-//!   this process's first observation of the row as closed, then every 6 h.
+//!   no fresh, complete listing governs the repo, or when one does but holds no
+//!   servable observation of this row (a failed re-read after a closed-listing
+//!   gap, or an open PR dropped from a complete open listing) — so a failed read
+//!   is retried on the row's own timer rather than skipped forever. That timer
+//!   is [`OPEN_REFRESH`] for an open row, and for a closed one every 30 min for
+//!   24 h from this process's first observation of the row as closed, then
+//!   every 6 h.
 //! - **D3 — discovery is per repo.** One conditional open listing plus a
 //!   closed-since-mark listing per repo, at most every [`DISCOVERY_INTERVAL`],
 //!   keyed by `head.label` (never `head.ref` alone: forks). The per-branch lookup
@@ -114,7 +119,10 @@ pub(super) enum RefreshDue {
 /// - `first_closed_seen` — this process's first observation of the row as
 ///   [`RowClass::ClosedMutable`].
 /// - `governed_by_listing` — a fresh, complete discovery of the row's repo
-///   carries its transitions ([`RepoDiscovery::governs`]).
+///   carries its transitions ([`RepoDiscovery::governs`]) AND holds a servable
+///   observation of this row; [`plan_row_refresh`] passes `false` when the
+///   listing governs the repo but has nothing to serve for the row, so the
+///   per-row timer paces it.
 /// - `nudge` — the on-demand path for this row's own session; exempts an OPEN
 ///   row from [`OPEN_REFRESH`], and nothing else.
 pub(super) fn status_refresh_due(

@@ -698,7 +698,38 @@ pub(crate) fn write_atomically(
             }
         }
     }
-    tmp.persist(dst).map(|_| ()).map_err(|e| e.error)
+    persist_with_retry(tmp, dst)
+}
+
+/// How many times a rename blocked by a transient Windows sharing violation is
+/// retried, and how long to wait between tries (total bounded at ~1 s).
+const PERSIST_RETRIES: u32 = 10;
+const PERSIST_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Whether `e` is the transient Windows error for a destination another
+/// process (an antivirus scan, an editor, a reader that opened without
+/// `FILE_SHARE_DELETE`) briefly holds open: `ERROR_ACCESS_DENIED` (5) or
+/// `ERROR_SHARING_VIOLATION` (32). Always false off Windows.
+fn is_transient_sharing_error(e: &std::io::Error) -> bool {
+    cfg!(windows) && matches!(e.raw_os_error(), Some(5) | Some(32))
+}
+
+/// `tmp.persist(dst)`, retried a bounded number of times while the failure is a
+/// Windows sharing violation. Any other error, or the last violation, is
+/// returned and the temporary file is dropped (deleted) with the error.
+fn persist_with_retry(mut tmp: tempfile::NamedTempFile, dst: &Path) -> std::io::Result<()> {
+    let mut attempt = 0;
+    loop {
+        match tmp.persist(dst) {
+            Ok(_) => return Ok(()),
+            Err(e) if attempt < PERSIST_RETRIES && is_transient_sharing_error(&e.error) => {
+                attempt += 1;
+                tmp = e.file;
+                std::thread::sleep(PERSIST_RETRY_DELAY);
+            }
+            Err(e) => return Err(e.error),
+        }
+    }
 }
 
 /// The blob in `shipped` that `bytes` is, as they are or with CRLF folded to

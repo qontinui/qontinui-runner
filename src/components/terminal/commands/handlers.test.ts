@@ -381,7 +381,9 @@ describe("handlers — the no-ops that used to render as effects", () => {
     it("predicts auto-grow from the named page's tabs", async () => {
       h.setOtherPages({ "page-2": { layoutId: "single", tabCount: 7 } });
       const o = await layout("/layout split --page page-2");
-      expect(reportOf(o.value).detail).toBe("grew to full-grid — 7 sessions do not fit split");
+      expect(reportOf(o.value).detail).toBe(
+        "grew to full-grid — 7 sessions do not fit split; runner-owned (auto-trims)",
+      );
     });
 
     it("compares against the named page's layout, not the one on screen", async () => {
@@ -476,6 +478,18 @@ describe("handlers — the no-ops that used to render as effects", () => {
       expect(reportOf(o.value).detail).toBe(
         "already quad; re-applied; origin operator (no longer auto-trims)",
       );
+      expect(reportOf(o.value).affected).toBe(1);
+    });
+
+    it("says an operator request auto-grow overrides leaves the page the runner's", async () => {
+      h.setOtherPages({
+        "page-2": { layoutId: "full-grid", tabCount: 8, layoutOrigin: "operator" },
+      });
+      const o = await layout("/layout quad --page page-2");
+      expect(reportOf(o.value).detail).toBe(
+        "grew to full-grid — 8 sessions do not fit quad; runner-owned (auto-trims)",
+      );
+      // The preset held, but the page changed hands: that is a change.
       expect(reportOf(o.value).affected).toBe(1);
     });
 

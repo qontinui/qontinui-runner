@@ -15,6 +15,7 @@ import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { LogIn, AlertCircle, Loader2, RotateCcw } from "lucide-react";
 import { createLogger } from "@/lib/logger";
+import { resolveSignInBackendUrl } from "@/lib/savedBackendUrl";
 import {
   NO_BROWSER_HINT,
   PendingSignInNotice,
@@ -22,9 +23,6 @@ import {
 } from "@/components/PendingSignInNotice";
 
 const log = createLogger("LoginScreen");
-
-/** Web backend the Cognito-bound device JWT is minted against. */
-const DEFAULT_BACKEND_URL = "https://api.qontinui.io";
 
 type CognitoSignInResponse = {
   userId: string;
@@ -75,8 +73,11 @@ export function LoginScreen({ storeUnreadable = false }: { storeUnreadable?: boo
     setError("");
 
     try {
+      // A saved custom remote backend, else production (see savedBackendUrl.ts):
+      // the command writes the URL it signed in against back into settings.
+      const backendUrl = await resolveSignInBackendUrl();
       await invoke<CognitoSignInResponse>("cognito_sign_in", {
-        backendUrl: DEFAULT_BACKEND_URL,
+        backendUrl,
         identityProvider: provider,
       });
       log.debug("Cognito sign-in completed — runner promoted to Tier 2");
@@ -101,10 +102,11 @@ export function LoginScreen({ storeUnreadable = false }: { storeUnreadable?: boo
     setError("");
 
     try {
+      const backendUrl = await resolveSignInBackendUrl();
       await invoke<CognitoSignInResponse>("cognito_sign_in_password", {
         email,
         password,
-        backendUrl: DEFAULT_BACKEND_URL,
+        backendUrl,
       });
       log.debug("Password sign-in completed — runner promoted to Tier 2");
       // Same as the hosted-UI path: the command already promoted to Tier 2,

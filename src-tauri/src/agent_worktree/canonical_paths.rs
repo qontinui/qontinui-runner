@@ -710,13 +710,6 @@ fn allocated_worktree_for_path_with(
         .collect::<Vec<_>>()
         .into_iter();
     let path_str = path.to_string_lossy().replace('\\', "/");
-    // Every segment must be NORMAL, not only `<agent_id>` and `<repo>`: the
-    // match is lexical, so `<root>/<id>/<repo>/../../../other` would otherwise
-    // "resolve" to the allocation while naming a path outside it, and
-    // `<root>/../<checkout>` to one outside the worktree root.
-    if path_str.split('/').any(|s| s == "." || s == "..") {
-        return None;
-    }
     let mut path_parts = path_str.split('/').filter(|s| !s.is_empty());
 
     for rp in root_parts.by_ref() {
@@ -725,6 +718,18 @@ fn allocated_worktree_for_path_with(
             return None;
         }
     }
+    // Every segment AFTER the worktree root must be NORMAL, not only
+    // `<agent_id>` and `<repo>`: the match is lexical, so
+    // `<root>/<id>/<repo>/../../../other` would otherwise "resolve" to the
+    // allocation while naming a path outside it, and `<root>/../<checkout>`
+    // to one outside the worktree root. The root's own segments are not
+    // checked: they matched the configured root verbatim above, so a root that
+    // itself spells `.` or `..` must not reject every path under it.
+    let rest: Vec<&str> = path_parts.collect();
+    if rest.iter().any(|s| *s == "." || *s == "..") {
+        return None;
+    }
+    let mut path_parts = rest.into_iter();
     // `path` must be the `<agent_id>/<repo_name>` dir or a descendant of it.
     let agent_id = path_parts.next()?;
     let repo_name = path_parts.next()?;
@@ -1240,6 +1245,32 @@ mod allocated_worktree_probe_tests {
                 "{p}"
             );
         }
+    }
+
+    /// The dot/dotdot rejection covers only the segments AFTER the worktree
+    /// root: a configured root that itself spells `..` (a relative-looking
+    /// workspace setting) still resolves paths beneath it, and a `..` after it
+    /// is still refused.
+    #[test]
+    fn dot_segments_inside_the_root_itself_do_not_reject_paths_under_it() {
+        let root = "D:/qontinui-root/../qontinui-worktrees";
+        let got = allocated_worktree_for_path_with(
+            Path::new(root),
+            Path::new("D:/qontinui-root/../qontinui-worktrees/019e-agent/qontinui-runner/src"),
+            live,
+        );
+        assert_eq!(
+            got,
+            Some(Path::new(root).join("019e-agent").join("qontinui-runner"))
+        );
+        assert_eq!(
+            allocated_worktree_for_path_with(
+                Path::new(root),
+                Path::new("D:/qontinui-root/../qontinui-worktrees/019e-agent/qontinui-runner/../x"),
+                live,
+            ),
+            None
+        );
     }
 
     /// A pane whose cwd is a SUBDIRECTORY of the allocation still resolves to

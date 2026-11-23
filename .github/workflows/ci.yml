@@ -2342,6 +2342,134 @@ jobs:
             --build-outcome "${{ steps.clippy.outcome }}" \
             --disk-path "$GITHUB_WORKSPACE"
 
+  # ── Does this change reach the holder crates? ───────────────────────────
+  #
+  # Picks `holder-crates`' matrix. WHY: `Holder crates (windows-latest)` sat
+  # queued 2-3 h for a GitHub-hosted Windows runner on PR and merge-candidate
+  # runs (coord finding c2fb777a, 2026-11-22: runner#3125 run 45047584066 and
+  # runner#2917's candidate run 45070729348) while `test (windows-latest)` and
+  # `Clippy (windows)` held the run's other hosted Windows slots. Coord waits
+  # on EVERY check of a candidate, not only the ruleset's required contexts,
+  # so that wait was added to every runner land. The job tests two small
+  # crates that most changes cannot reach.
+  #
+  # WHAT IT READS. The windows arm runs iff a changed file matches the
+  # `holder-crates` target's `observes` or the map's `global` list in
+  # .qontinui/ci-targets.toml: the crates themselves, vendor/**, and the
+  # workspace manifests, lockfile, toolchain, this workflow and
+  # .github/actions/** and .github/scripts/**. That map is
+  # the repo's declared dependency closure for this job (coord already reads
+  # it as one), so there is ONE list to keep right, not a second copy here.
+  # Its globs are matched with `**` crossing `/` and `*` NOT crossing it
+  # (globset's literal_separator=true reading; its default lets `*` cross).
+  # Every pattern in both lists today is a literal or ends in `/**`, where
+  # the two readings agree; a bare-`*` pattern added later should be checked.
+  #
+  # WHAT "CHANGED" MEANS, per event:
+  #   pull_request         the merge commit against its first parent (the
+  #                        base tip), i.e. exactly what the PR changes there
+  #   merge-candidate*/**  HEAD against its merge-base with origin/main (the
+  #                        candidate's own commits, single or batch)
+  #   main / develop push  github.event.before..HEAD
+  #   workflow_dispatch    always BOTH arms. coord's redispatcher dispatches
+  #                        this file on main after upstream lands, so main
+  #                        still gets a periodic full Windows run.
+  # Any other event, an unreadable base, a failed diff or an unreadable map
+  # also selects BOTH arms: this fails toward running, never toward skipping.
+  #
+  # An unselected windows arm produces NO check row (the matrix simply has
+  # one entry), rather than a `skipped` one. The context is not in the
+  # `main-merge-gates` ruleset, so nothing waits for it; and nothing
+  # is overwritten with `skipped` the way the job-level-`if:` trap above
+  # (`labeled`) would.
+  holder-changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      platforms: ${{ steps.select.outputs.platforms }}
+    steps:
+      # Full history, no blobs: the merge-base with main needs history, and
+      # `git diff --name-only --no-renames` reads trees only.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+
+      - name: Select holder-crates platforms
+        id: select
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -uo pipefail
+          both='["ubuntu-latest","windows-latest"]'
+          emit() {
+            echo "platforms=$1" >> "$GITHUB_OUTPUT"
+            echo "holder-crates platforms: $1 ($2)" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          }
+          base=""
+          case "$EVENT_NAME" in
+            pull_request)
+              base="$(git rev-parse --verify -q 'HEAD^1')" || emit "$both" "no first parent of the PR merge commit"
+              ;;
+            push)
+              case "$REF_NAME" in
+                merge-candidate/*|merge-candidate-spec/*|merge-candidate-batch/*)
+                  base="$(git merge-base HEAD refs/remotes/origin/main)" || emit "$both" "no merge-base with origin/main"
+                  ;;
+                *)
+                  if [[ -z "$BEFORE_SHA" || "$BEFORE_SHA" =~ ^0+$ ]]; then
+                    emit "$both" "push with no before sha"
+                  fi
+                  git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null || emit "$both" "before sha ${BEFORE_SHA} not in history"
+                  base="$BEFORE_SHA"
+                  ;;
+              esac
+              ;;
+            *)
+              emit "$both" "event ${EVENT_NAME} always runs both arms"
+              ;;
+          esac
+          changed="$(git -c core.quotePath=false diff --name-only --no-renames "$base" HEAD)" || emit "$both" "git diff ${base}..HEAD failed"
+          verdict="$(printf '%s\n' "$changed" | python3 -I -c '
+          import re, sys, tomllib
+          def rx(glob):
+              out, i = "", 0
+              while i < len(glob):
+                  if glob.startswith("**", i):
+                      out += ".*"; i += 2
+                  elif glob[i] == "*":
+                      out += "[^/]*"; i += 1
+                  elif glob[i] == "?":
+                      out += "[^/]"; i += 1
+                  else:
+                      out += re.escape(glob[i]); i += 1
+              return re.compile(out + r"\Z")
+          try:
+              with open(".qontinui/ci-targets.toml", "rb") as f:
+                  m = tomllib.load(f)
+              target = [t for t in m["targets"] if t["name"] == "holder-crates"]
+              globs = list(m["global"]) + list(target[0]["observes"])
+          except Exception as e:
+              print("both map unreadable: %s" % e); sys.exit(0)
+          pats = [rx(g) for g in globs]
+          for path in (l.strip() for l in sys.stdin):
+              if path and any(p.match(path) for p in pats):
+                  print("both %s reaches holder-crates" % path); sys.exit(0)
+          print("ubuntu no changed file reaches holder-crates")
+          ')" || emit "$both" "selector failed"
+          case "$verdict" in
+            ubuntu\ *) emit '["ubuntu-latest"]' "${verdict#ubuntu } (base ${base})" ;;
+            both\ *)   emit "$both" "${verdict#both } (base ${base})" ;;
+            *)          emit "$both" "unrecognised selector output: ${verdict}" ;;
+          esac
+
   # Tests + clippy for the standalone workspace crates that the `test` job
   # never reaches.
   #
@@ -2369,16 +2497,26 @@ jobs:
   # each crate's own [lints] table, where correctness/suspicious are `deny`.
   #
   # Not a required check (not registered in the ruleset by this change).
+  #
+  # The windows-latest arm runs only when `holder-changes` (below) says the
+  # change can reach these crates; the ubuntu-latest arm always runs. See
+  # `holder-changes` for why and for what it reads.
   holder-crates:
     name: Holder crates (${{ matrix.platform }})
     strategy:
       fail-fast: false
       matrix:
-        platform: [ubuntu-latest, windows-latest]
+        # From `holder-changes`: `["ubuntu-latest","windows-latest"]` or
+        # `["ubuntu-latest"]`. An EMPTY output (that job failed or was
+        # cancelled) falls back to both arms, so a broken selector costs a
+        # Windows slot, never coverage.
+        platform: ${{ fromJSON(needs['holder-changes'].outputs.platforms || '["ubuntu-latest","windows-latest"]') }}
     # Only the windows arm routes (like `test`'s windows leg, see
     # `route-windows`); ubuntu-latest stays hosted. `!cancelled()` keeps both
-    # arms from being SKIPPED on a pull_request, where route-windows is.
-    needs: route-windows
+    # arms from being SKIPPED on a pull_request, where route-windows is, and
+    # keeps this job running when `holder-changes` fails (the matrix then
+    # falls back to both arms, above).
+    needs: [route-windows, holder-changes]
     if: ${{ !cancelled() }}
     # coord-pools: [ubuntu-latest] | [self-hosted, Windows, X64, qontinui-runner-ci-windows, ram-40g] | [windows-latest]
     runs-on: ${{ fromJSON(matrix.platform == 'windows-latest' && ((github.run_attempt == 1 && github.event_name != 'pull_request' && vars.RUNNER_CI_WINDOWS_LANE == 'self-hosted' && '["self-hosted","Windows","X64","qontinui-runner-ci-windows","ram-40g"]') || (github.run_attempt == 1 && needs['route-windows'].outputs.labels) || '["windows-latest"]') || '["ubuntu-latest"]') }}
