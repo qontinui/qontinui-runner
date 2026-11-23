@@ -89,6 +89,13 @@ export interface WebIntegrationStatus {
     error: string;
     detectedAtUnix: number;
   } | null;
+  /**
+   * Runner verdicts on the saved `backendUrl` (see `@/lib/savedBackendUrl`).
+   * Type parity only: this tab's Connect button signs in to the typed form
+   * URL, not through the sign-in rule.
+   */
+  backendUrlMachineLocal?: boolean;
+  backendUrlRefused?: boolean;
 }
 
 /**
