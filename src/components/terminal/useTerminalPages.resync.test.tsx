@@ -1,0 +1,355 @@
+// @vitest-environment jsdom
+/**
+ * The page roster resyncs across the windows of one runner process (plan
+ * 2026-11-23-runner-terminal-page-roster-resyncs-across-windows, Phase 1).
+ * Each window mounts the hook in its own React root under its own Tauri
+ * label; the `emit` mock delivers every event to EVERY registered listener,
+ * the sender's included (Tauri v2 `emit` semantics), so the own-echo filter
+ * is actually exercised.
+ */
+
+import { act, createElement } from "react";
+import { createRoot } from "react-dom/client";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+type Listener = (event: { event: string; payload: unknown }) => void;
+
+const { bus, windowLabel } = vi.hoisted(() => ({
+  bus: {
+    /** A LIST of listeners per event: every window registers one. */
+    listeners: new Map<string, Listener[]>(),
+    /** Every event emitted, in order. */
+    emitted: [] as Array<{ event: string; payload: unknown }>,
+    /** While true, emits queue in `held` instead of dispatching. */
+    hold: false,
+    held: [] as Array<{ event: string; payload: unknown }>,
+  },
+  windowLabel: { current: "main" },
+}));
+
+function dispatch(event: string, payload: unknown) {
+  for (const cb of [...(bus.listeners.get(event) ?? [])]) cb({ event, payload });
+}
+
+vi.mock("@tauri-apps/api/window", () => ({
+  getCurrentWindow: () => ({ label: windowLabel.current }),
+}));
+vi.mock("@tauri-apps/api/core", () => ({
+  // Every backend read fails: reconcile is best-effort and adds nothing.
+  invoke: vi.fn(() => Promise.reject(new Error("no backend in test"))),
+}));
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn((event: string, cb: Listener) => {
+    const list = bus.listeners.get(event) ?? [];
+    list.push(cb);
+    bus.listeners.set(event, list);
+    return Promise.resolve(() => {
+      const cur = bus.listeners.get(event) ?? [];
+      bus.listeners.set(
+        event,
+        cur.filter((c) => c !== cb),
+      );
+    });
+  }),
+  emit: vi.fn((event: string, payload: unknown) => {
+    bus.emitted.push({ event, payload });
+    if (bus.hold) bus.held.push({ event, payload });
+    else dispatch(event, payload);
+    return Promise.resolve();
+  }),
+}));
+
+import { instanceStorage } from "@/lib/instance-storage";
+import { setPageBindings } from "@/lib/pageBindings";
+import { TERMINAL_PAGES_SAVED_EVENT, rosterDigest, rosterEqual } from "./terminalPagesSync";
+import { PAGES_STORAGE_KEY, useTerminalPages, type TerminalPageConfig } from "./useTerminalPages";
+
+type Hook = ReturnType<typeof useTerminalPages>;
+
+interface MountedWindow {
+  hook: () => Hook;
+  renders: () => number;
+  unmount: () => void;
+}
+
+const mounted: MountedWindow[] = [];
+
+const ROSTER: TerminalPageConfig[] = [
+  { id: "p1", name: "Alpha", createdAt: 1, origin: "operator" },
+  { id: "p2", name: "Beta", createdAt: 2, origin: "operator" },
+  { id: "p3", name: "Gamma", createdAt: 3, origin: "operator" },
+];
+
+const persisted = () => instanceStorage.getJSON<TerminalPageConfig[]>(PAGES_STORAGE_KEY, []);
+const names = (pages: TerminalPageConfig[]) => pages.map((p) => p.name);
+const ids = (pages: TerminalPageConfig[]) => pages.map((p) => p.id);
+const savedEvents = () => bus.emitted.filter((e) => e.event === TERMINAL_PAGES_SAVED_EVENT);
+
+/** Let every awaited promise in the mount (listen, reconcile) resolve. */
+async function settle() {
+  for (let i = 0; i < 5; i++) {
+    await act(() => new Promise((r) => setTimeout(r, 0)));
+  }
+}
+
+/**
+ * Mount the hook as the window `label`, in its own root (the `mountPopOut`
+ * pattern of `useTerminalPages.prune.test.tsx`, generalized to any label and
+ * to a page-pinned pop-out via `?page=<id>`).
+ */
+async function mountWindow(label: string, pinnedPage?: string): Promise<MountedWindow> {
+  const container = document.createElement("div");
+  document.body.appendChild(container);
+  const root = createRoot(container);
+  let latest: Hook | null = null;
+  let renders = 0;
+  function Win() {
+    renders++;
+    latest = useTerminalPages();
+    return null;
+  }
+  const prevUrl = window.location.href;
+  windowLabel.current = label;
+  if (pinnedPage) window.history.replaceState({}, "", `?page=${pinnedPage}`);
+  try {
+    await act(async () => root.render(createElement(Win)));
+    await settle();
+  } finally {
+    windowLabel.current = "main";
+    if (pinnedPage) window.history.replaceState({}, "", prevUrl);
+  }
+  const win: MountedWindow = {
+    hook: () => latest!,
+    renders: () => renders,
+    unmount: () => {
+      act(() => root.unmount());
+      container.remove();
+    },
+  };
+  mounted.push(win);
+  return win;
+}
+
+/** Make `localStorage.setItem` throw a full-storage error for instance key `key`. */
+function failWritesTo(key: string) {
+  const realSetItem = Storage.prototype.setItem;
+  vi.spyOn(Storage.prototype, "setItem").mockImplementation(function (
+    this: Storage,
+    raw: string,
+    value: string,
+  ) {
+    if (raw === key || raw.startsWith(`${key}:`)) {
+      throw new DOMException("storage is full", "QuotaExceededError");
+    }
+    realSetItem.call(this, raw, value);
+  });
+}
+
+/** Deliver an event that ANOTHER window (`source`) sent, as Tauri would. */
+function receiveFrom(source: string, digest: string) {
+  act(() => dispatch(TERMINAL_PAGES_SAVED_EVENT, { source, digest }));
+}
+
+beforeEach(() => {
+  (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+  localStorage.clear();
+  setPageBindings({});
+  bus.listeners.clear();
+  bus.emitted.length = 0;
+  bus.held.length = 0;
+  bus.hold = false;
+  windowLabel.current = "main";
+  instanceStorage.setJSON(PAGES_STORAGE_KEY, ROSTER);
+  instanceStorage.setItem("qontinui-terminal-active-page", "p1");
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+  for (const w of mounted.splice(0)) w.unmount();
+  localStorage.clear();
+  vi.restoreAllMocks();
+});
+
+describe("rosterDigest / rosterEqual", () => {
+  it("are insensitive to key order and sensitive to every field and to order", () => {
+    const a = [{ id: "p1", name: "A", createdAt: 1 }];
+    const reordered = [{ name: "A", createdAt: 1, id: "p1" }];
+    expect(rosterDigest(a)).toBe(rosterDigest(reordered));
+    expect(rosterEqual(a, reordered)).toBe(true);
+
+    expect(rosterEqual(a, [{ ...a[0], defaultWorkingDir: "/x" }])).toBe(false);
+    expect(rosterDigest(a)).not.toBe(rosterDigest([{ ...a[0], defaultWorkingDir: "/x" }]));
+    expect(rosterEqual(ROSTER, [ROSTER[1], ROSTER[0], ROSTER[2]])).toBe(false);
+    expect(rosterEqual(ROSTER, ROSTER.slice(0, 2))).toBe(false);
+    expect(
+      rosterEqual(
+        ROSTER,
+        ROSTER.map((p) => ({ ...p })),
+      ),
+    ).toBe(true);
+    expect(rosterEqual([], [])).toBe(true);
+  });
+});
+
+describe("a write in one window reaches the others", () => {
+  it("a rename in the pop-out shows in main without main writing", async () => {
+    const main = await mountWindow("main");
+    const pop = await mountWindow("term-2");
+    const mainSaves = () =>
+      savedEvents().filter((e) => (e.payload as { source: string }).source === "main");
+
+    act(() => void pop.hook().renamePage("p2", "Renamed"));
+
+    expect(names(persisted())).toEqual(["Alpha", "Renamed", "Gamma"]);
+    expect(names(main.hook().allPages)).toEqual(["Alpha", "Renamed", "Gamma"]);
+    expect(mainSaves()).toHaveLength(0);
+  });
+
+  it("a page main adds shows in the pop-out", async () => {
+    const main = await mountWindow("main");
+    const pop = await mountWindow("term-2");
+
+    let added = "";
+    act(() => {
+      added = main.hook().addPage("Delta");
+    });
+
+    expect(ids(pop.hook().allPages)).toEqual(["p1", "p2", "p3", added]);
+    expect(names(pop.hook().allPages)).toEqual(["Alpha", "Beta", "Gamma", "Delta"]);
+  });
+
+  it("a pinned pop-out shows its page's new name after main renames it", async () => {
+    const main = await mountWindow("main");
+    const pinned = await mountWindow("term-3", "p2");
+    expect(pinned.hook().isPinned).toBe(true);
+    expect(names(pinned.hook().pages)).toEqual(["Beta"]);
+
+    act(() => void main.hook().renamePage("p2", "Renamed"));
+
+    expect(names(pinned.hook().pages)).toEqual(["Renamed"]);
+  });
+
+  it("three windows: a write in one reaches both others", async () => {
+    const main = await mountWindow("main");
+    const popA = await mountWindow("term-2");
+    const popB = await mountWindow("term-3");
+
+    act(() => void popA.hook().renamePage("p3", "Third"));
+
+    expect(names(main.hook().allPages)).toEqual(["Alpha", "Beta", "Third"]);
+    expect(names(popB.hook().allPages)).toEqual(["Alpha", "Beta", "Third"]);
+  });
+
+  it("two saves in a row: the receiver ends on the second roster", async () => {
+    const main = await mountWindow("main");
+    const pop = await mountWindow("term-2");
+
+    act(() => void pop.hook().renamePage("p1", "First"));
+    act(() => void pop.hook().renamePage("p1", "Second"));
+
+    expect(names(main.hook().allPages)).toEqual(["Second", "Beta", "Gamma"]);
+    // The receiver's synchronous roster (the rename refusal reads it) follows too.
+    expect(main.hook().renamePage("p2", "Second")).toBe(false);
+  });
+
+  it("removing the receiver's active page elsewhere moves it to its first visible page", async () => {
+    instanceStorage.setItem("qontinui-terminal-active-page", "p2");
+    const main = await mountWindow("main");
+    expect(main.hook().activePageId).toBe("p2");
+    const pop = await mountWindow("term-2");
+
+    await act(async () => {
+      await pop.hook().removePage("p2");
+    });
+    await settle();
+
+    expect(ids(main.hook().allPages)).toEqual(["p1", "p3"]);
+    expect(main.hook().activePageId).toBe("p1");
+  });
+});
+
+describe("the receiver's branches", () => {
+  it("own echo: the saving window ignores its own event", async () => {
+    const pop = await mountWindow("term-2");
+    bus.hold = true;
+    act(() => void pop.hook().renamePage("p2", "Mine"));
+    expect(names(pop.hook().allPages)).toEqual(["Alpha", "Mine", "Gamma"]);
+    const rendersAfterWrite = pop.renders();
+    const echo = bus.held.splice(0);
+    expect(echo).toHaveLength(1);
+    expect((echo[0].payload as { source: string }).source).toBe("term-2");
+
+    // The store moves on behind the sender's back with no event of its own;
+    // a sender that read on its own echo would install it after the retries.
+    instanceStorage.setJSON(PAGES_STORAGE_KEY, [ROSTER[0]]);
+    vi.useFakeTimers();
+    act(() => dispatch(echo[0].event, echo[0].payload));
+    act(() => void vi.advanceTimersByTime(1_000));
+    vi.useRealTimers();
+
+    expect(names(pop.hook().allPages)).toEqual(["Alpha", "Mine", "Gamma"]);
+    expect(pop.renders()).toBe(rendersAfterWrite);
+  });
+
+  it("a refused save broadcasts nothing, and the other window keeps its copy", async () => {
+    const main = await mountWindow("main");
+    const pop = await mountWindow("term-2");
+    const before = main.hook().allPages;
+    failWritesTo(PAGES_STORAGE_KEY);
+
+    act(() => void pop.hook().renamePage("p2", "Unsaved"));
+
+    expect(names(pop.hook().allPages)).toEqual(["Alpha", "Unsaved", "Gamma"]);
+    expect(names(persisted())).toEqual(["Alpha", "Beta", "Gamma"]);
+    expect(savedEvents()).toHaveLength(0);
+    expect(main.hook().allPages).toBe(before);
+  });
+
+  it("a null store leaves the receiver's roster unchanged", async () => {
+    const main = await mountWindow("main");
+    const before = main.hook().allPages;
+    localStorage.clear();
+
+    vi.useFakeTimers();
+    receiveFrom("term-2", rosterDigest([ROSTER[0]]));
+    act(() => void vi.advanceTimersByTime(1_000));
+    vi.useRealTimers();
+
+    expect(main.hook().allPages).toBe(before);
+    expect(names(main.hook().allPages)).toEqual(["Alpha", "Beta", "Gamma"]);
+  });
+
+  it("an unchanged roster keeps the same allPages reference", async () => {
+    const main = await mountWindow("main");
+    const before = main.hook().allPages;
+
+    receiveFrom("term-2", rosterDigest(ROSTER));
+
+    expect(main.hook().allPages).toBe(before);
+  });
+
+  it("the store lagging the event: the receiver still ends on the new roster", async () => {
+    const main = await mountWindow("main");
+    const pop = await mountWindow("term-2");
+
+    bus.hold = true;
+    act(() => void pop.hook().renamePage("p2", "Late"));
+    const key = Object.keys(localStorage).find(
+      (k) => k === PAGES_STORAGE_KEY || k.startsWith(`${PAGES_STORAGE_KEY}:`),
+    )!;
+    const written = localStorage.getItem(key)!;
+    // The event reaches main while its view of the store still holds the old roster.
+    localStorage.setItem(key, JSON.stringify(ROSTER));
+    const [event] = bus.held.splice(0);
+
+    vi.useFakeTimers();
+    act(() => dispatch(event.event, event.payload));
+    expect(names(main.hook().allPages)).toEqual(["Alpha", "Beta", "Gamma"]);
+    // The write becomes visible before the first retry.
+    localStorage.setItem(key, written);
+    act(() => void vi.advanceTimersByTime(50));
+    vi.useRealTimers();
+
+    expect(names(main.hook().allPages)).toEqual(["Alpha", "Late", "Gamma"]);
+  });
+});
