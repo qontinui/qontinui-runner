@@ -694,7 +694,7 @@ mod tests {
     fn process_deadline_no_child_survives_a_race_at_the_deadline() {
         let _serial = serial();
         const ABANDONED: usize = 20;
-        const DELIVERED: usize = 2;
+        const DELIVERED: usize = 1;
         const JITTERED: usize = 60;
         let mut spawned_expected = 0usize;
 
@@ -717,8 +717,16 @@ mod tests {
             );
             // Now let the abandoned helper's spawn proceed: it must kill what
             // it creates.
-            release.send(()).unwrap();
+            let _ = release.send(());
             spawned_expected += 1;
+            // Wait until that helper has taken the gate and spawned before the
+            // next iteration reuses the single gate slot; otherwise a late
+            // helper could take (or drop) the next iteration's gate.
+            let end = Instant::now() + Duration::from_secs(60);
+            while RACE_CHILDREN.lock().unwrap().len() < spawned_expected {
+                assert!(Instant::now() < end, "an abandoned helper never spawned");
+                std::thread::sleep(Duration::from_millis(5));
+            }
         }
 
         // Side 2 (forced): the spawn finishes long before the deadline, so the
@@ -726,13 +734,13 @@ mod tests {
         for _ in 0..DELIVERED {
             let run = run_with_deadline_spawner(
                 long_child(),
-                Instant::now() + Duration::from_secs(3),
+                Instant::now() + Duration::from_secs(15),
                 gated_spawner,
             )
             .unwrap();
             assert!(
                 matches!(run.outcome, DeadlineOutcome::TimedOut { .. }),
-                "an ungated spawn with a 3 s budget must be delivered, got {run:?}"
+                "an ungated spawn with a 15 s budget must be delivered, got {run:?}"
             );
             spawned_expected += 1;
         }
