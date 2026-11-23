@@ -454,6 +454,21 @@ describe("the receiver's branches", () => {
     expect(warn).not.toHaveBeenCalled();
   });
 
+  it("an own save whose echo never arrives is still not warned about", async () => {
+    const main = await mountWindow("main");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.useFakeTimers();
+    receiveFrom("term-2", rosterDigest([ROSTER[0]]));
+    // Main saves, but its own echo is held back past the retry budget.
+    bus.hold = true;
+    act(() => void main.hook().renamePage("p2", "EchoLate"));
+    act(() => void vi.advanceTimersByTime(1_000));
+    vi.useRealTimers();
+
+    expect(warn).not.toHaveBeenCalled();
+    expect(names(main.hook().allPages)).toEqual(["Alpha", "EchoLate", "Gamma"]);
+  });
+
   it("a null store leaves the receiver's roster unchanged", async () => {
     const main = await mountWindow("main");
     const before = main.hook().allPages;
