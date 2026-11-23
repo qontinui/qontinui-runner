@@ -8,13 +8,19 @@
 //!   wired for spec-driven development with `@qontinui/ui-bridge` (runtime
 //!   `<State>`/`<TransitionTo>` annotations) and `@qontinui/ui-bridge-auto`
 //!   (the `uiBridgeIRPlugin` Vite plugin that compiles annotations into the
-//!   state-machine IR at build time).
+//!   state-machine IR at build time), and a design that is compiled rather
+//!   than prose: a `design/language.dtcg.json` source, the committed
+//!   `design-kit` outputs under `src/design/`, a state-complete component kit,
+//!   a specimen page and a generated component index in `CLAUDE.md`. Its file
+//!   constants live in [`design`].
 //!
 //! Files are parameterized on `{{name}}` (the project/repo name) and
 //! `{{app_id}}` (the derived slug used for the app registry and package
 //! name) via plain string replacement. Both values are validated upstream
 //! (`new_project.rs`) to safe character sets (`[A-Za-z0-9._-]` /
 //! `[a-z0-9-]`), so no JSON/HTML escaping is needed here.
+
+mod design;
 
 /// One file to write into the new project, path relative to the project root
 /// (always forward-slash separated; the writer converts to native paths).
@@ -30,7 +36,8 @@ pub const TEMPLATE_REACT_UI_BRIDGE: &str = "react-ui-bridge";
 
 /// Shared .gitignore for both templates. `src/state-machine.derived.json` is
 /// written by `vite build` (the `uiBridgeIRPlugin`), so it is a build output
-/// rather than a source file; the line is inert for the `empty` template.
+/// rather than a source file; `state-coverage.json` is the output of a manual
+/// `design-kit check-states` run. Both lines are inert for the `empty` template.
 const GITIGNORE: &str = "node_modules/
 dist/
 src/state-machine.derived.json
@@ -38,210 +45,11 @@ target/
 .env*
 __pycache__/
 .DS_Store
+state-coverage.json
 ";
 
 const EMPTY_README: &str = "# {{name}}
 ";
-
-const REACT_README: &str = r#"# {{name}}
-
-A React + UI Bridge app scaffolded by Qontinui.
-
-## Development
-
-```bash
-npm install
-npm run dev
-```
-
-## Spec-driven development
-
-Specs live in `specs/pages/<id>/`. Author states with `<State>` and
-transitions with `<TransitionTo>` from `@qontinui/ui-bridge`; the
-`uiBridgeIRPlugin` in `vite.config.ts` compiles those annotations into
-`src/state-machine.derived.json` on every build.
-"#;
-
-/// The lower bound of each UI Bridge dependency range is never below the
-/// lower bound the runner itself ships with (see the repo-root
-/// `package.json`): the template may be ahead of the runner (at a newer npm
-/// release), but a fresh scaffold is never older than it. Bump `@qontinui/ui-bridge` and
-/// `@qontinui/ui-bridge-auto` together, and check that the new
-/// `ui-bridge-auto` peer range accepts the new `ui-bridge`
-/// (`npm view @qontinui/ui-bridge-auto@<v> peerDependencies`) — no test reads
-/// npm metadata. `template_ui_bridge_pins_are_not_below_the_runners_own`
-/// keeps the floor.
-const REACT_PACKAGE_JSON: &str = r#"{
-  "name": "{{app_id}}",
-  "private": true,
-  "version": "0.1.0",
-  "type": "module",
-  "scripts": {
-    "dev": "vite",
-    "build": "tsc --noEmit && vite build",
-    "preview": "vite preview"
-  },
-  "dependencies": {
-    "@qontinui/ui-bridge": "^0.56.0",
-    "react": "^19.2.4",
-    "react-dom": "^19.2.4"
-  },
-  "devDependencies": {
-    "@qontinui/ui-bridge-auto": "^0.4.0",
-    "@types/react": "^19.2.14",
-    "@types/react-dom": "^19.2.3",
-    "@vitejs/plugin-react": "^6.0.0",
-    "typescript": "^6.0.2",
-    "vite": "^8.1.3"
-  }
-}
-"#;
-
-const REACT_VITE_CONFIG: &str = r#"import { defineConfig } from "vite";
-import react from "@vitejs/plugin-react";
-import { uiBridgeIRPlugin } from "@qontinui/ui-bridge-auto/ir-builder";
-
-export default defineConfig({
-  plugins: [
-    react(),
-    uiBridgeIRPlugin({
-      documentId: "{{app_id}}",
-      documentName: "{{name}} State Machine",
-    }),
-  ],
-});
-"#;
-
-const REACT_TSCONFIG: &str = r#"{
-  "compilerOptions": {
-    "target": "ES2022",
-    "useDefineForClassFields": true,
-    "lib": ["ES2022", "DOM", "DOM.Iterable"],
-    "module": "ESNext",
-    "moduleResolution": "bundler",
-    "jsx": "react-jsx",
-    "strict": true,
-    "skipLibCheck": true,
-    "noEmit": true,
-    "isolatedModules": true,
-    "resolveJsonModule": true
-  },
-  "include": ["src"]
-}
-"#;
-
-const REACT_INDEX_HTML: &str = r#"<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>{{name}}</title>
-  </head>
-  <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.tsx"></script>
-  </body>
-</html>
-"#;
-
-const REACT_MAIN_TSX: &str = r#"import { StrictMode } from "react";
-import { createRoot } from "react-dom/client";
-import { UIBridgeProvider } from "@qontinui/ui-bridge";
-
-import App from "./App";
-
-createRoot(document.getElementById("root")!).render(
-  <StrictMode>
-    <UIBridgeProvider features={{ control: true }}>
-      <App />
-    </UIBridgeProvider>
-  </StrictMode>,
-);
-"#;
-
-const REACT_APP_TSX: &str = r#"import { State } from "@qontinui/ui-bridge";
-
-export default function App() {
-  return (
-    <State
-      id="home"
-      name="Home"
-      metadata={{ description: "Starter home page for {{name}}" }}
-    >
-      <main>
-        <h1>{{name}}</h1>
-        <p>
-          This page is a UI Bridge state. Author more states with{" "}
-          <code>&lt;State&gt;</code> and connect them with{" "}
-          <code>&lt;TransitionTo&gt;</code> — the ui-bridge-auto Vite plugin
-          compiles them into the app&apos;s state-machine IR on every build.
-        </p>
-      </main>
-    </State>
-  );
-}
-"#;
-
-const REACT_CLAUDE_MD: &str = r#"# {{name}} — Claude Code Guidelines
-
-This project uses spec-driven development with the Qontinui UI Bridge.
-
-- Specs live in `specs/pages/<id>/`.
-- Author states with `<State>` and transitions with `<TransitionTo>` from
-  `@qontinui/ui-bridge`; the ui-bridge-auto Vite plugin (`uiBridgeIRPlugin`
-  in `vite.config.ts`) derives the state-machine IR at build time into
-  `src/state-machine.derived.json`.
-- Keep every page reachable through declared transitions so automated spec
-  checks can walk the whole app.
-"#;
-
-/// A real CI check for the scaffolded repo.
-///
-/// A repo with no workflow files at all is a repo where no check can ever be
-/// red: coord's merge predicate has an arm that admits a PR carrying zero
-/// check rows when the default branch is positively established to hold no
-/// workflows, so a freshly scaffolded owner repo would auto-merge every PR
-/// against nothing. Shipping this file closes that composition — once `main`
-/// carries a workflow, that arm declines and zero-check PRs block.
-///
-/// Four measured constraints, do not "improve" past them:
-/// - `npm install`, never `npm ci` — the template ships no `package-lock.json`
-///   and `npm ci` fails `EUSAGE` on a bare scaffold. For the same reason
-///   `setup-node` carries no `cache: npm`, which keys on a lockfile.
-/// - `npm run build` is the whole check: the template's `build` script is
-///   already `tsc --noEmit && vite build`, so it covers typecheck and build.
-/// - No tree-cleanliness step: `vite build` writes
-///   `src/state-machine.derived.json`, so one would fail by construction.
-/// - No warnings-as-errors: the build legitimately warns (a `crypto`
-///   browser-externalization notice, a direct-`eval` advisory inside
-///   ui-bridge's dist, a chunk over vite's 500 kB hint) and still exits 0.
-///
-/// Deliberately contains no `${{ ... }}` GitHub Actions expressions, keeping
-/// this file's `{{name}}`/`{{app_id}}` templating and Actions' own out of the
-/// same document.
-///
-/// `node-version: '24'` is the version the green run was actually measured on,
-/// and it is not arbitrary: `vite@8` and `@vitejs/plugin-react@6` both declare
-/// `engines.node = "^20.19.0 || >=22.12.0"`, so a bare `'20'` would put a
-/// scaffolded repo's CI on an end-of-life major sitting exactly on that floor —
-/// green today, red on the next drift. Raise this with the template's
-/// dependency floors; never lower it below `22.12`.
-const REACT_CI_WORKFLOW: &str = r#"name: CI
-on:
-  push:
-    branches: [main]
-  pull_request:
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '24'
-      - run: npm install
-      - run: npm run build
-"#;
 
 /// Substitute `{{name}}` / `{{app_id}}` placeholders in a template body.
 pub fn substitute(raw: &str, name: &str, app_id: &str) -> String {
@@ -270,27 +78,67 @@ pub fn template_files(
         TEMPLATE_REACT_UI_BRIDGE => Ok(vec![
             TemplateFile {
                 path: "package.json",
-                content: sub(REACT_PACKAGE_JSON),
+                content: sub(design::PACKAGE_JSON),
             },
             TemplateFile {
                 path: "vite.config.ts",
-                content: sub(REACT_VITE_CONFIG),
+                content: sub(design::VITE_CONFIG),
             },
             TemplateFile {
                 path: "tsconfig.json",
-                content: REACT_TSCONFIG.to_string(),
+                content: design::TSCONFIG.to_string(),
             },
             TemplateFile {
                 path: "index.html",
-                content: sub(REACT_INDEX_HTML),
+                content: sub(design::INDEX_HTML),
+            },
+            TemplateFile {
+                path: "specimen.html",
+                content: design::SPECIMEN_HTML.to_string(),
             },
             TemplateFile {
                 path: "src/main.tsx",
-                content: REACT_MAIN_TSX.to_string(),
+                content: design::MAIN_TSX.to_string(),
             },
             TemplateFile {
                 path: "src/App.tsx",
-                content: sub(REACT_APP_TSX),
+                content: sub(design::APP_TSX),
+            },
+            TemplateFile {
+                path: "src/index.css",
+                content: design::INDEX_CSS.to_string(),
+            },
+            TemplateFile {
+                path: "design/language.dtcg.json",
+                content: design::LANGUAGE_SOURCE.to_string(),
+            },
+            TemplateFile {
+                path: "src/design/tokens.css",
+                content: design::TOKENS_CSS.to_string(),
+            },
+            TemplateFile {
+                path: "src/design/tokens.ts",
+                content: design::TOKENS_TS.to_string(),
+            },
+            TemplateFile {
+                path: "src/design/theme.css",
+                content: design::THEME_CSS.to_string(),
+            },
+            TemplateFile {
+                path: "src/design/compile-report.json",
+                content: design::COMPILE_REPORT.to_string(),
+            },
+            TemplateFile {
+                path: "src/design/design-budgets.json",
+                content: design::DESIGN_BUDGETS.to_string(),
+            },
+            TemplateFile {
+                path: "src/design/visual-system.thresholds.json",
+                content: design::THRESHOLDS.to_string(),
+            },
+            TemplateFile {
+                path: "src/design/app.styleguide.uibridge.json",
+                content: design::STYLE_GUIDE.to_string(),
             },
             TemplateFile {
                 path: "specs/.gitkeep",
@@ -298,7 +146,7 @@ pub fn template_files(
             },
             TemplateFile {
                 path: "README.md",
-                content: sub(REACT_README),
+                content: sub(design::README),
             },
             TemplateFile {
                 path: ".gitignore",
@@ -306,11 +154,11 @@ pub fn template_files(
             },
             TemplateFile {
                 path: "CLAUDE.md",
-                content: sub(REACT_CLAUDE_MD),
+                content: sub(design::CLAUDE_MD),
             },
             TemplateFile {
                 path: ".github/workflows/ci.yml",
-                content: REACT_CI_WORKFLOW.to_string(),
+                content: design::CI_WORKFLOW.to_string(),
             },
         ]),
         other => Err(format!(
@@ -362,32 +210,226 @@ mod tests {
         assert!(files[1].content.contains("node_modules/"));
     }
 
+    /// The runner's own `package.json`: the floor for the template's
+    /// `@qontinui/ui-bridge` pin, so a fresh scaffold never starts on an older
+    /// UI Bridge contract than the runner that created it.
+    const RUNNER_PACKAGE_JSON: &str = include_str!("../../../package.json");
+
+    /// Every path the design-bearing template must write.
+    const REACT_PATHS: [&str; 21] = [
+        "package.json",
+        "vite.config.ts",
+        "tsconfig.json",
+        "index.html",
+        "specimen.html",
+        "src/main.tsx",
+        "src/App.tsx",
+        "src/index.css",
+        "design/language.dtcg.json",
+        "src/design/tokens.css",
+        "src/design/tokens.ts",
+        "src/design/theme.css",
+        "src/design/compile-report.json",
+        "src/design/design-budgets.json",
+        "src/design/visual-system.thresholds.json",
+        "src/design/app.styleguide.uibridge.json",
+        "specs/.gitkeep",
+        "README.md",
+        ".gitignore",
+        "CLAUDE.md",
+        ".github/workflows/ci.yml",
+    ];
+
+    const INDEX_START: &str = "<!-- design-kit-index:start -->";
+    const INDEX_END: &str = "<!-- design-kit-index:end -->";
+
+    /// `^1.2.3` / `~1.2.3` / `1.2.3` -> (1, 2, 3). `None` for anything else
+    /// (a git ref, a tag, a range with an upper bound).
+    fn version_floor(range: &str) -> Option<(u64, u64, u64)> {
+        let v = range.trim_start_matches(['^', '~', '=', ' ']);
+        let mut parts = v.split('.').map(|p| p.parse::<u64>().ok());
+        let floor = (parts.next()??, parts.next()??, parts.next()??);
+        parts.next().is_none().then_some(floor)
+    }
+
+    /// `github:<owner>/<repo>#v<major>.<minor>.<patch>` — a git dependency
+    /// pinned to a release tag (never a branch, a sha, or a registry range).
+    fn is_git_tag_ref(spec: &str) -> bool {
+        let Some(rest) = spec.strip_prefix("github:") else {
+            return false;
+        };
+        let Some((_repo, tag)) = rest.split_once('#') else {
+            return false;
+        };
+        tag.strip_prefix('v').and_then(version_floor).is_some() && !tag.contains(['^', '~'])
+    }
+
+    /// Every leaf (an object carrying `$extensions.qontinui.source`) under
+    /// `value`, as (dotted path, source).
+    fn source_leaves(value: &serde_json::Value, path: &str, out: &mut Vec<(String, String)>) {
+        let Some(obj) = value.as_object() else {
+            return;
+        };
+        if let Some(src) = obj
+            .get("$extensions")
+            .and_then(|e| e.get("qontinui"))
+            .and_then(|q| q.get("source"))
+            .and_then(|s| s.as_str())
+        {
+            out.push((path.to_string(), src.to_string()));
+        }
+        for (k, v) in obj {
+            if !k.starts_with('$') {
+                let child = if path.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{path}.{k}")
+                };
+                source_leaves(v, &child, out);
+            }
+        }
+    }
+
+    /// Everything the design-bearing template must satisfy, as named
+    /// violations. Empty means conforming. The seeded-violation test below
+    /// reddens each check, so none of them is vacuous.
+    fn design_violations(files: &[TemplateFile], runner_package_json: &str) -> Vec<String> {
+        let mut bad = Vec::new();
+        let get = |p: &str| {
+            files
+                .iter()
+                .find(|f| f.path == p)
+                .map(|f| f.content.as_str())
+        };
+        for p in REACT_PATHS {
+            if get(p).is_none() {
+                bad.push(format!("missing path {p}"));
+            }
+        }
+        for f in files {
+            if f.content.contains("{{name}}") || f.content.contains("{{app_id}}") {
+                bad.push(format!("placeholder left in {}", f.path));
+            }
+        }
+
+        let pkg: serde_json::Value = get("package.json")
+            .and_then(|c| serde_json::from_str(c).ok())
+            .unwrap_or(serde_json::Value::Null);
+        let build = pkg["scripts"]["build"].as_str().unwrap_or("");
+        for step in [
+            "design-kit compile --check",
+            "design-kit specimen --check",
+            "design-kit index --check",
+            "design-kit lint-classes src",
+            "tsc --noEmit",
+            "vite build",
+        ] {
+            if !build.contains(step) {
+                bad.push(format!("build script lacks `{step}`"));
+            }
+        }
+        let kit = pkg["dependencies"]["@qontinui/design-kit"]
+            .as_str()
+            .unwrap_or("");
+        if !is_git_tag_ref(kit) {
+            bad.push(format!(
+                "design-kit dependency `{kit}` is not a git ref in tag form"
+            ));
+        }
+        let runner: serde_json::Value =
+            serde_json::from_str(runner_package_json).unwrap_or(serde_json::Value::Null);
+        let floor = runner["dependencies"]["@qontinui/ui-bridge"]
+            .as_str()
+            .and_then(version_floor);
+        let pin = pkg["dependencies"]["@qontinui/ui-bridge"]
+            .as_str()
+            .and_then(version_floor);
+        match (pin, floor) {
+            (Some(p), Some(f)) if p >= f => {}
+            (p, f) => bad.push(format!("ui-bridge pin {p:?} is below the runner's {f:?}")),
+        }
+        let pin_spec = pkg["dependencies"]["@qontinui/ui-bridge"]
+            .as_str()
+            .unwrap_or("");
+        if !pin_spec.starts_with(|c: char| c.is_ascii_digit()) {
+            bad.push(format!(
+                "ui-bridge pin `{pin_spec}` is not an exact version"
+            ));
+        }
+        for dep in ["tailwindcss", "@tailwindcss/vite"] {
+            let spec = pkg["devDependencies"][dep].as_str().unwrap_or("");
+            if version_floor(spec).map(|v| v.0) != Some(4) {
+                bad.push(format!("{dep} `{spec}` is not Tailwind v4"));
+            }
+        }
+
+        let source: serde_json::Value = get("design/language.dtcg.json")
+            .and_then(|c| serde_json::from_str(c).ok())
+            .unwrap_or(serde_json::Value::Null);
+        let mut leaves = Vec::new();
+        source_leaves(&source, "", &mut leaves);
+        if leaves.is_empty() {
+            bad.push("language source declares no leaves".to_string());
+        }
+        for (path, src) in &leaves {
+            let identity = path.starts_with("color")
+                || path.starts_with("type.family")
+                || path.starts_with("imagery");
+            if identity && src.starts_with("authored") {
+                bad.push(format!("identity leaf {path} is agent-authored"));
+            }
+            if let Some(inner) = src.strip_prefix("authored(") {
+                if inner.trim_end_matches(')').is_empty() {
+                    bad.push(format!("authored leaf {path} carries no notification_ref"));
+                }
+            } else if src == "authored" {
+                bad.push(format!("authored leaf {path} carries no notification_ref"));
+            }
+        }
+
+        let claude = get("CLAUDE.md").unwrap_or("");
+        match (claude.find(INDEX_START), claude.find(INDEX_END)) {
+            (Some(s), Some(e)) if s < e => {}
+            _ => bad.push("CLAUDE.md lacks the index markers in order".to_string()),
+        }
+
+        let ci = get(".github/workflows/ci.yml").unwrap_or("");
+        for (needle, why) in [
+            ("- run: npm install", "must run npm install"),
+            ("- run: npm run build", "must run npm run build"),
+        ] {
+            if !ci.contains(needle) {
+                bad.push(format!("ci.yml {why}"));
+            }
+        }
+        for (needle, why) in [
+            ("npm ci", "npm ci fails on a scaffold with no lockfile"),
+            ("cache:", "a lockfile-keyed cache fails with no lockfile"),
+            ("git diff", "a tree-cleanliness step fails by construction"),
+            ("${{", "Actions expressions stay out of a templated file"),
+        ] {
+            if ci.contains(needle) {
+                bad.push(format!("ci.yml contains `{needle}`: {why}"));
+            }
+        }
+        bad
+    }
+
+    fn react_files() -> Vec<TemplateFile> {
+        template_files(TEMPLATE_REACT_UI_BRIDGE, "My-App", "my-app").unwrap()
+    }
+
     #[test]
     fn react_template_is_fully_parameterized() {
-        let files = template_files(TEMPLATE_REACT_UI_BRIDGE, "My-App", "my-app").unwrap();
+        let files = react_files();
         let paths: Vec<&str> = files.iter().map(|f| f.path).collect();
-        for expected in [
-            "package.json",
-            "vite.config.ts",
-            "tsconfig.json",
-            "index.html",
-            "src/main.tsx",
-            "src/App.tsx",
-            "specs/.gitkeep",
-            "README.md",
-            ".gitignore",
-            "CLAUDE.md",
-            ".github/workflows/ci.yml",
-        ] {
+        for expected in REACT_PATHS {
             assert!(paths.contains(&expected), "missing {}", expected);
         }
-        for f in &files {
-            assert!(
-                !f.content.contains("{{name}}") && !f.content.contains("{{app_id}}"),
-                "unsubstituted placeholder in {}",
-                f.path
-            );
-        }
+        assert_eq!(paths.len(), REACT_PATHS.len(), "unexpected extra paths");
+        let violations = design_violations(&files, RUNNER_PACKAGE_JSON);
+        assert!(violations.is_empty(), "{violations:#?}");
+
         let pkg = files.iter().find(|f| f.path == "package.json").unwrap();
         assert!(pkg.content.contains("\"name\": \"my-app\""));
         assert!(pkg.content.contains("@qontinui/ui-bridge"));
@@ -397,9 +439,25 @@ mod tests {
             .content
             .contains("import { uiBridgeIRPlugin } from \"@qontinui/ui-bridge-auto/ir-builder\""));
         assert!(vite.content.contains("documentId: \"my-app\""));
+        assert!(vite.content.contains("specimen.html"));
         let app = files.iter().find(|f| f.path == "src/App.tsx").unwrap();
         assert!(app.content.contains("<State"));
         assert!(app.content.contains("id=\"home\""));
+        // Every state of the page is handled: the four required props.
+        for prop in ["empty=", "loading=", "error=", "filteredEmpty="] {
+            assert!(app.content.contains(prop), "App.tsx lacks {prop}");
+        }
+        // The compiled theme is exclusive: it clears every default first.
+        let theme = files
+            .iter()
+            .find(|f| f.path == "src/design/theme.css")
+            .unwrap();
+        assert!(theme.content.contains("--*: initial;"));
+        // The undeclared identity says so on the specimen's every frame.
+        let specimen = files.iter().find(|f| f.path == "specimen.html").unwrap();
+        assert!(specimen
+            .content
+            .contains("data-design-identity=\"undeclared\""));
         // The CI workflow is what makes a scaffolded repo's PRs blockable at
         // all; its measured constraints are pinned here so a later "cleanup"
         // cannot quietly break a bare scaffold's build.
@@ -418,6 +476,212 @@ mod tests {
         assert!(!ci.content.contains("git diff"));
         // Keep Actions' expression syntax out of a file this module templates.
         assert!(!ci.content.contains("${{"));
+    }
+
+    /// Each seeded fixture breaks exactly one rule and must redden the check
+    /// that names it: a check that cannot fail proves nothing.
+    #[test]
+    fn design_checks_redden_on_each_seeded_violation() {
+        let mutate = |path: &str, f: &dyn Fn(&str) -> String| -> Vec<String> {
+            let mut files = react_files();
+            let file = files.iter_mut().find(|x| x.path == path).unwrap();
+            file.content = f(&file.content);
+            design_violations(&files, RUNNER_PACKAGE_JSON)
+        };
+        let reddens = |violations: Vec<String>, needle: &str| {
+            assert!(
+                violations.iter().any(|v| v.contains(needle)),
+                "expected a violation containing `{needle}`, got {violations:#?}"
+            );
+        };
+        assert!(design_violations(&react_files(), RUNNER_PACKAGE_JSON).is_empty());
+
+        let mut missing = react_files();
+        missing.retain(|f| f.path != "specimen.html");
+        reddens(
+            design_violations(&missing, RUNNER_PACKAGE_JSON),
+            "missing path specimen.html",
+        );
+
+        reddens(
+            mutate("src/App.tsx", &|c| format!("{c}\n{{{{name}}}}")),
+            "placeholder left in src/App.tsx",
+        );
+        reddens(
+            mutate("package.json", &|c| {
+                c.replace("design-kit compile --check", "design-kit compile")
+            }),
+            "lacks `design-kit compile --check`",
+        );
+        reddens(
+            mutate("package.json", &|c| {
+                c.replace("design-kit specimen --check && ", "")
+            }),
+            "lacks `design-kit specimen --check`",
+        );
+        reddens(
+            mutate("package.json", &|c| {
+                c.replace("design-kit lint-classes src && ", "")
+            }),
+            "lacks `design-kit lint-classes src`",
+        );
+        for bad in [
+            "github:qontinui/qontinui-design-kit#main",
+            "^0.1.0",
+            "github:qontinui/qontinui-design-kit",
+        ] {
+            reddens(
+                mutate("package.json", &|c| {
+                    c.replace("github:qontinui/qontinui-design-kit#v0.1.1", bad)
+                }),
+                "not a git ref in tag form",
+            );
+        }
+        reddens(
+            mutate("package.json", &|c| {
+                let pin = format!("\"@qontinui/ui-bridge\": \"{}\"", "^0.21.1");
+                let at = c.find("\"@qontinui/ui-bridge\": \"").unwrap();
+                let (head, rest) = c.split_at(at);
+                let (_, tail) = rest.split_at(rest.find(',').unwrap());
+                format!("{head}{pin}{tail}")
+            }),
+            "is below the runner's",
+        );
+        reddens(
+            mutate("package.json", &|c| {
+                c.replace("\"tailwindcss\": \"^4", "\"tailwindcss\": \"^3")
+            }),
+            "is not Tailwind v4",
+        );
+        reddens(
+            mutate("package.json", &|c| {
+                c.replace("\"@tailwindcss/vite\": \"^4", "\"@tailwindcss/vite\": \"^3")
+            }),
+            "@tailwindcss/vite `^3",
+        );
+        for step in ["design-kit index --check && ", "tsc --noEmit && "] {
+            reddens(
+                mutate("package.json", &|c| c.replace(step, "")),
+                &format!("lacks `{}`", step.trim_end_matches(" && ")),
+            );
+        }
+        reddens(
+            mutate("package.json", &|c| c.replace(" && vite build", "")),
+            "lacks `vite build`",
+        );
+        reddens(
+            // Version-agnostic: put a caret in front of whatever the pin is,
+            // so a ui-bridge bump cannot turn this seed into a no-op.
+            mutate("package.json", &|c| {
+                let key = "\"@qontinui/ui-bridge\": \"";
+                let at = c.find(key).unwrap() + key.len();
+                let (head, tail) = c.split_at(at);
+                format!("{head}^{tail}")
+            }),
+            "is not an exact version",
+        );
+        reddens(
+            mutate("design/language.dtcg.json", &|_| "{}".to_string()),
+            "language source declares no leaves",
+        );
+        // An agent-authored hue.
+        reddens(
+            mutate("design/language.dtcg.json", &|c| {
+                c.replacen(
+                    "\"source\": \"undeclared\"",
+                    "\"source\": \"authored(x)\"",
+                    1,
+                )
+            }),
+            "identity leaf color.role.surface is agent-authored",
+        );
+        // An agent-authored family (the second undeclared leaf is
+        // `type.family.sans`). The template carries no imagery leaf, so the
+        // `imagery` disjunct has no seed here.
+        reddens(
+            mutate("design/language.dtcg.json", &|c| {
+                let needle = "\"source\": \"undeclared\"";
+                let (at, _) = c.match_indices(needle).nth(1).unwrap();
+                let (head, rest) = c.split_at(at);
+                let tail = rest.strip_prefix(needle).unwrap();
+                format!("{head}\"source\": \"authored(x)\"{tail}")
+            }),
+            "identity leaf type.family.sans is agent-authored",
+        );
+        // A bare `authored` source, with no parenthesised reference at all.
+        reddens(
+            mutate("design/language.dtcg.json", &|c| {
+                c.replacen(
+                    "authored(a784185b-4f36-4ad1-b57a-30ef4fbfc9ee)",
+                    "authored",
+                    1,
+                )
+            }),
+            "carries no notification_ref",
+        );
+        // An authored leaf with no notification reference.
+        reddens(
+            mutate("design/language.dtcg.json", &|c| {
+                c.replacen(
+                    "authored(a784185b-4f36-4ad1-b57a-30ef4fbfc9ee)",
+                    "authored()",
+                    1,
+                )
+            }),
+            "carries no notification_ref",
+        );
+        reddens(
+            mutate("CLAUDE.md", &|c| c.replace(INDEX_END, "")),
+            "lacks the index markers",
+        );
+        reddens(
+            mutate("CLAUDE.md", &|c| {
+                c.replace(INDEX_START, "\0")
+                    .replace(INDEX_END, INDEX_START)
+                    .replace('\0', INDEX_END)
+            }),
+            "lacks the index markers",
+        );
+        // Each ci.yml mutation must redden the rule it seeds, named.
+        for (needle, replacement, expected) in [
+            (
+                "- run: npm install",
+                "- run: npm ci",
+                "ci.yml contains `npm ci`",
+            ),
+            (
+                "node-version: '24'",
+                "node-version: '24'\n          cache: npm",
+                "ci.yml contains `cache:`",
+            ),
+            (
+                "- run: npm run build",
+                "- run: npm run build\n      - run: git diff --exit-code",
+                "ci.yml contains `git diff`",
+            ),
+            (
+                "- run: npm run build",
+                "- run: npm run build\n      - run: echo ${{ github.sha }}",
+                "ci.yml contains `${{`",
+            ),
+            (
+                "- run: npm run build",
+                "- run: npm test",
+                "ci.yml must run npm run build",
+            ),
+            (
+                "- run: npm install",
+                "- run: npm i",
+                "ci.yml must run npm install",
+            ),
+        ] {
+            reddens(
+                mutate(".github/workflows/ci.yml", &|c| {
+                    c.replace(needle, replacement)
+                }),
+                expected,
+            );
+        }
     }
 
     /// Parse the lower bound of a `^X.Y.Z` / `~X.Y.Z` / `X.Y.Z` npm range.
@@ -469,6 +733,21 @@ mod tests {
                 "template pins {name} {template}, below the runner's own {runner}"
             );
         }
+    }
+
+    #[test]
+    fn version_helpers_read_the_forms_the_template_uses() {
+        assert_eq!(version_floor("^0.53.0"), Some((0, 53, 0)));
+        assert_eq!(version_floor("0.7.0"), Some((0, 7, 0)));
+        assert_eq!(version_floor("~1.2.3"), Some((1, 2, 3)));
+        assert_eq!(version_floor("github:a/b#v0.1.0"), None);
+        assert_eq!(version_floor("^1.2"), None);
+        assert!(is_git_tag_ref("github:qontinui/qontinui-design-kit#v0.1.0"));
+        assert!(!is_git_tag_ref("github:qontinui/qontinui-design-kit#main"));
+        assert!(!is_git_tag_ref(
+            "github:qontinui/qontinui-design-kit#abc1234"
+        ));
+        assert!(!is_git_tag_ref("^0.1.0"));
     }
 
     #[test]
