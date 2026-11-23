@@ -805,7 +805,7 @@ pub const CAPABILITY_SPECS: &[CapabilitySpec] = &[
                       this degrades on a published install, it is that it cannot run at \
                       all there.",
         expected_rungs: &[Rung::OperatorCheckout, Rung::Unresolved],
-        anchor: "slash_commands::{find_commands_directory_reported, sync_slash_commands}",
+        anchor: "slash_commands::{find_commands_directory_reported, commands_directory_in, COMMANDS_SIBLING, sync_slash_commands}",
     },
     CapabilitySpec {
         id: "session_cli",

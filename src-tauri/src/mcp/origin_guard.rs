@@ -388,6 +388,13 @@ pub const CREDENTIAL_DOORS: &[&str] = &[
     // 2026-11-05-one-free-resource-model-places-sessions-builds-and-ci,
     // Phase 6): its callers are local tools and agents, never a browser
     "GET /fleet/capacity",
+    // this install's model-gateway state (`mcp::model_gateway_read`): no
+    // secret, but under the default `EnforceDoors` a non-door route is only
+    // SHADOW-refused, so a visited web page could read whether this install
+    // routes model calls through a gateway. Its caller is qontinui-studio's
+    // local CLI (NonBrowser, admitted before this list is read); no browser
+    // origin needs it
+    "GET /model-gateway",
     // a browser origin must never be able to widen browser trust
     "/settings/api/allowed-origins",
     // re-points which tenant this device's new sessions, device-level surfaces

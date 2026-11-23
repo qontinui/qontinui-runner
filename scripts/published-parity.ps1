@@ -694,8 +694,18 @@ function Invoke-ParityProvisioningDrive {
         $code = $null
         if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
         # 503 is the honest answer on a box with no database: the route is
-        # DB-backed and QONTINUI_ALLOW_NO_DB degrades it. Typed, not swallowed.
-        $reason = $(if ($code -eq 503) { 'db_unavailable' } else { "http_$code" })
+        # DB-backed and QONTINUI_ALLOW_NO_DB degrades it. A 422 is the typed
+        # refusal of a device with no qontinui-claude-config checkout to import
+        # from (`sibling_checkout_absent` / `workspace_root_unresolved`, the
+        # normal state of an installed runner): its body's `code` names it.
+        # Typed, not swallowed.
+        $refusalCode = $null
+        if ($code -eq 422 -and $_.ErrorDetails -and $_.ErrorDetails.Message) {
+            try { $refusalCode = [string](($_.ErrorDetails.Message | ConvertFrom-Json).code) } catch { $refusalCode = $null }
+        }
+        $reason = $(if ($code -eq 503) { 'db_unavailable' }
+                    elseif ($refusalCode) { "refused_$refusalCode" }
+                    else { "http_$code" })
         $drive.slash_sync = "unknown($reason)"
         Write-Host "    provisioning drive: /slash-commands/sync -> $reason"
     }

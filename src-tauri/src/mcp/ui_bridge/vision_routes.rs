@@ -1031,11 +1031,8 @@ async fn do_capture(
 
     let provider = resolve_frame_provider(state, &req.target)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
-    let frame = provider
-        .frame(state)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+        .map_err(|e| e.to_json_err())?;
+    let frame = provider.frame(state).await.map_err(|e| e.to_json_err())?;
 
     let capture_backend = capture_backend_label(&frame);
 
@@ -1254,11 +1251,8 @@ async fn do_multi_capture(
     // against a clone of the same Frame.
     let provider = resolve_frame_provider(state, target)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
-    let frame = provider
-        .frame(state)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+        .map_err(|e| e.to_json_err())?;
+    let frame = provider.frame(state).await.map_err(|e| e.to_json_err())?;
     let frame_w = frame.width;
     let frame_h = frame.height;
     let capture_backend = capture_backend_label(&frame);
@@ -1502,11 +1496,8 @@ async fn produce_intermediate_frame(
 
     let provider = resolve_frame_provider(state, &req.target)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
-    let frame = provider
-        .frame(state)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+        .map_err(|e| e.to_json_err())?;
+    let frame = provider.frame(state).await.map_err(|e| e.to_json_err())?;
 
     let crop = resolve_crop_region(state, &req.region, &req.element, frame.width, frame.height)
         .await
@@ -1702,11 +1693,8 @@ async fn vision_raw_handler(
 
     let provider = resolve_frame_provider(&state, &req.target)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
-    let frame = provider
-        .frame(&state)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+        .map_err(|e| e.to_json_err())?;
+    let frame = provider.frame(&state).await.map_err(|e| e.to_json_err())?;
 
     let capture_backend = capture_backend_label(&frame);
 
@@ -1816,9 +1804,7 @@ async fn vision_extract_handler(
 
     // Miss → capture + encode + call OCR.
     let (png_bytes, capture_backend) =
-        capture_and_encode_png(&state, &req.region, &req.element, &req.target)
-            .await
-            .map_err(|(code, msg)| (code, Json(api_error(msg))))?;
+        capture_and_encode_png(&state, &req.region, &req.element, &req.target).await?;
     let (blocks, aggregate_text) = client
         .extract(&png_bytes, "image/png", min_conf)
         .await
@@ -1914,9 +1900,7 @@ async fn vision_describe_handler(
     // describe/ has no captureBackend field in its response; the backend label
     // is intentionally ignored here.
     let (png_bytes, _capture_backend) =
-        capture_and_encode_png(&state, &req.region, &req.element, &req.target)
-            .await
-            .map_err(|(code, msg)| (code, Json(api_error(msg))))?;
+        capture_and_encode_png(&state, &req.region, &req.element, &req.target).await?;
     let vlm = client
         .describe(&png_bytes, "image/png", req.prompt.as_deref(), max_tokens)
         .await
@@ -1958,17 +1942,15 @@ async fn capture_and_encode_png(
     region_req: &Option<RegionRequest>,
     element_id: &Option<String>,
     target: &Option<String>,
-) -> Result<(Vec<u8>, Option<String>), (StatusCode, String)> {
+) -> Result<(Vec<u8>, Option<String>), (StatusCode, Json<ApiResponse<()>>)> {
     let provider = resolve_frame_provider(state, target)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let frame = provider
-        .frame(state)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(|e| e.to_json_err())?;
+    let frame = provider.frame(state).await.map_err(|e| e.to_json_err())?;
     let capture_backend = capture_backend_label(&frame);
-    let crop =
-        resolve_crop_region(state, region_req, element_id, frame.width, frame.height).await?;
+    let crop = resolve_crop_region(state, region_req, element_id, frame.width, frame.height)
+        .await
+        .map_err(|(code, msg)| (code, Json(api_error(msg))))?;
     // PNG-only pipeline. No alpha policy here — we want lossless bytes to
     // feed the model; the model handles its own preprocessing.
     let mut pipeline = qontinui_vision_core::Pipeline::new();
@@ -1979,7 +1961,7 @@ async fn capture_and_encode_png(
     let bytes = pipeline.run(frame).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("pipeline: {}", e),
+            Json(api_error(format!("pipeline: {}", e))),
         )
     })?;
     Ok((bytes, capture_backend))
@@ -2516,7 +2498,9 @@ async fn capture_frames(
     let frame_result = match resolve_frame_provider(state, target).await {
         Ok(provider) => provider.frame(state).await,
         Err(e) => Err(e),
-    };
+    }
+    // Soft-fail, but keep the typed code: `CODE: message`.
+    .map_err(|e| e.to_frame_error());
     let (frame, frame_error) = match frame_result {
         Ok(f) => (Some(f), None),
         Err(e) => {
@@ -3851,11 +3835,8 @@ async fn vision_baseline_handler(
     // captured from a paired device rather than the runner window.
     let provider = resolve_frame_provider(&state, &req.target)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
-    let frame = provider
-        .frame(&state)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+        .map_err(|e| e.to_json_err())?;
+    let frame = provider.frame(&state).await.map_err(|e| e.to_json_err())?;
 
     // Encode for storage. Use PNG-strict so the baseline is lossless.
     let capture_req: CaptureRequest = match req.capture {
