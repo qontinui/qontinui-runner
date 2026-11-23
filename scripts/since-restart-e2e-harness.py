@@ -391,6 +391,9 @@ def teardown(r: Runner | None, owned: bool, log: Log, scratch: list[Path],
         if r is not None:
             s, v = http("POST", f"{SUPERVISOR}/runners/{r.id}/stop", {}, timeout=120)
             log.rec("teardown.stop", status=s, body=v, owned=owned)
+            # The stop was requested; until await_stopped answers, its outcome
+            # is UNKNOWN, never "no runner".
+            out["stop"] = "unknown"
             if not owned:
                 out["stop"] = "not_awaited"
                 log.rec("teardown.unverified_left_alone", runner_id=r.id, port=r.port,

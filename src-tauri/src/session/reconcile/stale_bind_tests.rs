@@ -144,8 +144,7 @@ fn a_stale_rung_two_bind_onto_an_exited_source_pane_is_refused_and_the_row_stays
 /// running one). Each pass, the pane without the row is unbound and rung 2
 /// names the session for it; moving the open row there would flip it between
 /// the panes on every pass. The row stays on the pane it is on: the rung-2
-/// owner check leaves the other pane alone, and the write-time guard would
-/// refuse the move if it got that far.
+/// owner check leaves the other pane alone, so the bind is never proposed.
 #[test]
 fn a_rung_two_bind_never_moves_an_open_row_off_its_live_pane() {
     let (_dir, store) = store();
