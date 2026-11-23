@@ -6,7 +6,7 @@
 
 use super::*;
 use crate::session::coord_sync_finish_ack::{
-    unconfirmed_message, FINISHED_UNCONFIRMED_KIND,
+    unconfirmed_message, FINISHED_UNCONFIRMED_DROPPED, FINISHED_UNCONFIRMED_KIND,
     FINISHED_UNCONFIRMED_MAX_ATTEMPTS, FINISHED_UNCONFIRMED_MIN_AGE,
 };
 
@@ -204,6 +204,7 @@ async fn five_unconfirmed_answers_drop_the_row_unstamped_and_count_it() {
     }
     let s = Uuid::new_v4();
     queue_finish(&outbox, s, "csid-bounded", 42);
+    let global_before = FINISHED_UNCONFIRMED_DROPPED.load(Ordering::Relaxed);
     let mut state = DrainState::default();
     for attempt in 1..FINISHED_UNCONFIRMED_MAX_ATTEMPTS {
         let tick = drain_tick(&coord.inner, &mut state).await;
@@ -239,10 +240,16 @@ async fn five_unconfirmed_answers_drop_the_row_unstamped_and_count_it() {
     );
     assert!(!state.retry.contains_key(&s));
     // Counted per call: the process-global FINISHED_UNCONFIRMED_DROPPED is
-    // also bumped by sibling tests driving their own finishes to the bound.
+    // also bumped by sibling tests driving their own finishes to the bound,
+    // so the exact count is the per-call field and the global (which
+    // `/health` serves) is held only to having moved — siblings can only add.
     assert_eq!(
         tick.finished_unconfirmed_dropped, 1,
         "the bounded tick reports the one row it dropped unconfirmed"
+    );
+    assert!(
+        FINISHED_UNCONFIRMED_DROPPED.load(Ordering::Relaxed) > global_before,
+        "the /health counter moved for the dropped row"
     );
     let health = render_session_outbox_health(&SessionOutboxHealth {
         observed_at: Some(Utc::now()),
@@ -265,11 +272,15 @@ async fn unconfirmed_answers_inside_the_age_floor_never_drop_the_finish() {
     let mut state = DrainState::default();
     let answers = FINISHED_UNCONFIRMED_MAX_ATTEMPTS + 3;
     for attempt in 1..=answers {
-        drain_tick(&coord.inner, &mut state).await;
+        let tick = drain_tick(&coord.inner, &mut state).await;
         assert_eq!(
             kinds(&pending_of(&outbox, s)),
             vec!["finished"],
             "still queued after unconfirmed answer {attempt}, inside the age floor"
+        );
+        assert_eq!(
+            tick.finished_unconfirmed_dropped, 0,
+            "attempts alone never count a drop (answer {attempt})"
         );
         retry_now(&mut state, s);
     }
@@ -278,10 +289,14 @@ async fn unconfirmed_answers_inside_the_age_floor_never_drop_the_finish() {
     assert_eq!(finished_patches(&*rec.lock().await, s), answers as usize);
 
     age_unconfirmed(&mut state, s);
-    drain_tick(&coord.inner, &mut state).await;
+    let tick = drain_tick(&coord.inner, &mut state).await;
     assert!(
         pending_of(&outbox, s).is_empty(),
         "dropped once both bounds hold"
+    );
+    assert_eq!(
+        tick.finished_unconfirmed_dropped, 1,
+        "the dropping tick counts the one row"
     );
     assert!(acks.lock().unwrap().is_empty(), "dropped UNSTAMPED");
 }
