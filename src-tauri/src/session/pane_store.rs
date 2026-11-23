@@ -191,7 +191,12 @@ impl Drop for ResumeClaim {
 /// resume needs more than the row id: the TENANT (a non-default tenant's row
 /// probed under the default credential 404s and is re-registered in the wrong
 /// tenant) and the intent fields the row was declared with. Removed when the
-/// terminal really exits, so it does not accumulate.
+/// terminal really exits (its coord exit hook), so a pane's binding lives as
+/// long as the pane. Two cases are NOT pruned and stay until overwritten by a
+/// later pane with the same terminal id: a holder that dies while no runner is
+/// up (the next boot sweep reaps it without adopting it, so no hook ever runs),
+/// and an adoption whose resume was refused or failed (left unbound, so no
+/// hook either — the binding is kept so a later restart can retry the resume).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TerminalCoordBinding {
     pub coord_id: Uuid,
