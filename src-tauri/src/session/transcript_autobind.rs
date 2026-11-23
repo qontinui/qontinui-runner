@@ -885,6 +885,19 @@ mod tests {
                 .any(|r| r.event_kind == SessionEventKind::Started.as_str()),
             "an adopted row already exists coord-side"
         );
+        // ...but its account / config dir (stamped only by coord's create) ride a
+        // heartbeat-free PATCH, addressed to the adopted row.
+        let patch: Vec<_> = outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.event_kind == SessionEventKind::StateChange.as_str())
+            .collect();
+        assert_eq!(patch.len(), 1, "{patch:?}");
+        assert_eq!(patch[0].session_id, row);
+        assert_eq!(patch[0].payload["account_label"], id.account_label.as_str());
+        assert_eq!(patch[0].payload["config_dir"], id.config_dir.as_str());
+        assert_eq!(patch[0].payload["no_heartbeat"], true);
         // A second pass never re-registers or double-counts.
         assert_eq!(
             apply_decision(&t, &id, &path, &Decision::Mint(Uuid::new_v4()), true),
