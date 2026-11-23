@@ -11724,6 +11724,44 @@ COMMENT ON COLUMN coord.subproject_members.via_detail IS 'What placed this membe
 
 
 --
+-- Name: subproject_note_events; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.subproject_note_events (
+    id bigint NOT NULL,
+    tenant_id uuid NOT NULL,
+    subproject_id uuid NOT NULL,
+    written_at timestamp with time zone DEFAULT now() NOT NULL,
+    written_by text NOT NULL,
+    note text,
+    prior_note text,
+    prior_note_by text,
+    prior_note_at timestamp with time zone
+);
+
+
+--
+-- Name: TABLE subproject_note_events; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON TABLE coord.subproject_note_events IS 'Append-only history of coord.subprojects.next_steps_note, one row per accepted note write (plan 2026-11-22-subproject-next-steps-note-refuses-scheduled-buckets-and-keeps-history). Written by coord only, in the transaction that updates the subproject, and alembic authors the DDL. note NULL records a clear. prior_note, prior_note_by and prior_note_at are the values this write replaced, so an overwritten note is recoverable.';
+
+
+--
+-- Name: subproject_note_events_id_seq; Type: SEQUENCE; Schema: coord; Owner: -
+--
+
+ALTER TABLE coord.subproject_note_events ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY (
+    SEQUENCE NAME coord.subproject_note_events_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+--
 -- Name: subproject_vectors; Type: TABLE; Schema: coord; Owner: -
 --
 
@@ -25830,6 +25868,14 @@ ALTER TABLE ONLY coord.subproject_members
 
 
 --
+-- Name: subproject_note_events subproject_note_events_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.subproject_note_events
+    ADD CONSTRAINT subproject_note_events_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: subproject_vectors subproject_vectors_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
 --
 
@@ -32925,6 +32971,13 @@ CREATE INDEX idx_subproject_members_live_subproject ON coord.subproject_members 
 --
 
 CREATE INDEX idx_subproject_members_subproject_history ON coord.subproject_members USING btree (tenant_id, subproject_id, removed_at);
+
+
+--
+-- Name: idx_subproject_note_events_tenant_subproject_written; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_subproject_note_events_tenant_subproject_written ON coord.subproject_note_events USING btree (tenant_id, subproject_id, written_at DESC);
 
 
 --
@@ -42282,6 +42335,14 @@ ALTER TABLE ONLY coord.spawn_request_events
 
 ALTER TABLE ONLY coord.subproject_members
     ADD CONSTRAINT fk_subproject_members_subproject FOREIGN KEY (subproject_id) REFERENCES coord.subprojects(id);
+
+
+--
+-- Name: subproject_note_events fk_subproject_note_events_subproject; Type: FK CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.subproject_note_events
+    ADD CONSTRAINT fk_subproject_note_events_subproject FOREIGN KEY (subproject_id) REFERENCES coord.subprojects(id);
 
 
 --
