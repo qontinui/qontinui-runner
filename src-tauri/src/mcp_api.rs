@@ -5406,7 +5406,7 @@ fn hand_off_transport_rung(
         emitter,
         lane,
         headers,
-        body,
+        operation,
         door,
         caller_session_id,
     )
@@ -5418,7 +5418,7 @@ fn hand_off_transport_rung_in(
     emitter: Arc<crate::session::coord_transport_rung::RungEmitter>,
     lane: uuid::Uuid,
     headers: &axum::http::HeaderMap,
-    body: &[u8],
+    operation: &'static str,
     door: &str,
     caller_session_id: Option<uuid::Uuid>,
 ) {
@@ -18056,7 +18056,7 @@ fn not_a_static() {}
             ),
             (
                 "fn hand_off_transport_rung(\n    emitter:",
-                "hand_off_transport_rung_in(&TRANSPORT_RUNG,emitter,lane,headers,body,door,caller_session_id,)",
+                "hand_off_transport_rung_in(&TRANSPORT_RUNG,emitter,lane,headers,operation,door,caller_session_id,)",
             ),
         ] {
             let (raw, body) = wrapper_body(prod, signature);
