@@ -4770,11 +4770,7 @@ impl Drop for AnchorReservation {
             }
             return;
         }
-        release_anchor_reservation(
-            self.held
-                .as_ref()
-                .map(|(slot, token)| (slot, *token)),
-        );
+        release_anchor_reservation(self.held.as_ref().map(|(slot, token)| (slot, *token)));
     }
 }
 
@@ -7481,8 +7477,7 @@ async fn run_gate_continuation_inner(
     // worktree failure, a presentation fn's early return — gives the anchor
     // back. The
     // two spawn successes disarm it explicitly inside the presentation fns.
-    let (guard_verdict, reservation) =
-        evaluate_continuation_guard_live(
+    let (guard_verdict, reservation) = evaluate_continuation_guard_live(
         payload.anchor_key.as_deref(),
         payload.work_identity.as_deref(),
         &live_terminal_predicate(),
@@ -21489,11 +21484,12 @@ mod tests {
     /// a multi-byte identity must not panic the deferral arm.
     #[test]
     fn stamp_truncation_survives_a_multibyte_work_identity() {
-        let reason = duplicate_anchor_stamp_reason(
-            &AnchorHolder::Reserved,
-            Some("ééééééééééééééééé"),
+        let reason =
+            duplicate_anchor_stamp_reason(&AnchorHolder::Reserved, Some("ééééééééééééééééé"));
+        assert_eq!(
+            reason,
+            "duplicate_anchor:reserved:work_identity=éééééééééééé"
         );
-        assert_eq!(reason, "duplicate_anchor:reserved:work_identity=éééééééééééé");
     }
 
     /// `work_identity` is an optional wire field: present parses, absent (an
@@ -21694,7 +21690,8 @@ mod tests {
         //    remove this entry anyway — see
         //    `stale_reservation_drop_cannot_steal_a_foreign_reservation`).
         let x1_dead = |id: &str| id != "term-x1";
-        let (verdict, later) = evaluate_continuation_guard(Some(anchor), None, &x1_dead, &calm_reading);
+        let (verdict, later) =
+            evaluate_continuation_guard(Some(anchor), None, &x1_dead, &calm_reading);
         assert_eq!(verdict, ContinuationGuard::Proceed);
         assert!(
             anchor_is_reserved(anchor),
@@ -22005,7 +22002,8 @@ mod tests {
         let live_all = |_id: &str| true;
         let anchor = "unit:u9:phase-1";
 
-        let (verdict, stale) = evaluate_continuation_guard(Some(anchor), None, &live_all, &calm_reading);
+        let (verdict, stale) =
+            evaluate_continuation_guard(Some(anchor), None, &live_all, &calm_reading);
         assert_eq!(verdict, ContinuationGuard::Proceed);
 
         // Force the state the token exists for: this anchor's entry now belongs
@@ -22061,7 +22059,8 @@ mod tests {
                 // registry is read with the permit still alive, which is exactly
                 // the state `run_gate_continuation_inner`'s load arm is in while
                 // it awaits `defer_continuation_unclaimed`'s network POST.
-                let (verdict, held) = evaluate_continuation_guard(Some(anchor), None, &live_all, loaded);
+                let (verdict, held) =
+                    evaluate_continuation_guard(Some(anchor), None, &live_all, loaded);
                 assert!(
                     matches!(verdict, ContinuationGuard::LoadPressure { .. }),
                     "a loaded machine must defer on every evaluation, got {verdict:?}"
@@ -22377,7 +22376,8 @@ mod tests {
         let mut deferred = 0;
         for i in 0..20 {
             let anchor = format!("burst-{i}");
-            let (verdict, permit) = evaluate_continuation_guard(Some(&anchor), None, &live_all, &reading);
+            let (verdict, permit) =
+                evaluate_continuation_guard(Some(&anchor), None, &live_all, &reading);
             match verdict {
                 ContinuationGuard::Proceed => held.push(permit),
                 ContinuationGuard::LoadPressure { observation, .. } => {
@@ -22484,7 +22484,8 @@ mod tests {
         let (v1, terminal) =
             evaluate_continuation_guard(Some("settle-a"), None, &live_all, &calm_reading);
         let (v2, headless) = evaluate_continuation_guard(None, None, &live_all, &calm_reading);
-        let (v3, dropped) = evaluate_continuation_guard(Some("settle-c"), None, &live_all, &calm_reading);
+        let (v3, dropped) =
+            evaluate_continuation_guard(Some("settle-c"), None, &live_all, &calm_reading);
         assert_eq!(
             (v1, v2, v3),
             (
@@ -22554,7 +22555,8 @@ mod tests {
         );
         let held: Vec<_> = (0..2)
             .map(|i| {
-                evaluate_continuation_guard(Some(&format!("launch-{i}")), None, &live_all, &reading).1
+                evaluate_continuation_guard(Some(&format!("launch-{i}")), None, &live_all, &reading)
+                    .1
             })
             .collect();
         assert_eq!(reserved_spawns_now(), 2);
@@ -23652,7 +23654,13 @@ mod tests {
         clear_continuation_registry();
         let gate = uuid::Uuid::now_v7();
         register_restored_continuation("term-restored-sh".into(), gate, None);
-        register_continuation_session_with_device("term-direct-sh".into(), None, None, Some(gate), None);
+        register_continuation_session_with_device(
+            "term-direct-sh".into(),
+            None,
+            None,
+            Some(gate),
+            None,
+        );
         let reg = lock_recover(continuation_sessions(), "continuation_sessions");
         assert!(
             reg.live
