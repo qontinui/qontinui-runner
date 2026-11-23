@@ -413,9 +413,21 @@ mod tests {
             1,
             "spawn_adb_scanner must hand the supervisor exactly one closure"
         );
+        // What follows `move |hb|`: `{ factory(hb).run() }`, or the bare call
+        // followed by the argument list's `)` or `,` — nothing else.
+        let closure = body
+            .split_once("move|hb|")
+            .map(|(_, rest)| rest)
+            .unwrap_or_default();
+        let only_factory = match closure.strip_prefix('{') {
+            Some(braced) => braced.starts_with("factory(hb).run()}"),
+            None => {
+                closure.starts_with("factory(hb).run())")
+                    || closure.starts_with("factory(hb).run(),")
+            }
+        };
         assert!(
-            body.contains("move|hb|{factory(hb).run()})")
-                || body.contains("move|hb|factory(hb).run())"),
+            only_factory,
             "spawn_adb_scanner's closure must be just `factory(hb).run()`; build shared state before \
              the spawn, in the door"
         );
