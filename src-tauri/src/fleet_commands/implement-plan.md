@@ -1806,20 +1806,23 @@ session marker carries, because the dispatched run matches the two.
 `target_device_id` = that id and `"pin": "strict"` beside it (canonical:
 `_gate-registration` → "Device-local continuations"). Adoption needs this box:
 the death evidence (transcript tail, ledger `.alert`), the successor scan that
-voids it, and the worktrees it must find clean and 0 ahead live here only. Once
-coord honours `strict` the net never leaves this box: if the box does not return
+voids it, and the worktrees it must find clean and 0 ahead live here only. Coord
+honours `strict` from qontinui-coord `75ead791c` (plan
+`2026-11-19-a-device-bound-continuation-holds-its-pin-and-a-misrouted-one-is-not-consumed`
+Phase 1), and from `688b410cd` it refuses a wrong-device claim with
+`409 wrong_device` and re-opens a `work_misrouted` row instead of consuming it.
+On such a coord the net never leaves this box: if the box does not return
 within 7 days the row expires undelivered, and the stall alert is then the only
-signal. The cross-machine
-death signals below apply to a net-dispatched run only while the pin is inert,
-and even then such a run can STOP and report but never adopt. ⚠️ **The
-pin is not yet protection.** Read 2026-11-06 at qontinui-coord `40ceb5975`: no
-coord code path honours `strict`, and the stall watcher's deferral re-route
-(`continuation_device_pin`) treats a registered `target_device_id` as no pin at
-all. So, until coord honours it, a load-deferred net can still be moved to
-another device. That happened to net `92e93ce3` on 2026-11-06: it was deferred
-on its owner's device (`thread_pressure`), moved, and the moved run stopped
-without work (coord finding `2a71433e`). Send the pin anyway: it costs nothing
-and takes effect when coord honours it.
+signal. Which build is serving is a per-deploy fact: `git merge-base
+--is-ancestor 688b410cd <build_sha>` against coord's `/health` `build_sha`
+after a fetch (exit 128 is UNKNOWN, never "older build"). On an older coord
+the pin is ignored and a load-deferred net can be moved to another device,
+which happened to net `92e93ce3` on 2026-11-06 (deferred on its owner's device
+for `thread_pressure`, moved, and the moved run stopped without work; coord
+finding `2a71433e`). The cross-machine death signals below apply to a
+net-dispatched run only where the pin did not hold (an older coord, or a runner
+predating qontinui-runner `6083ad62b`, which spawns on the unknown 409 anyway),
+and even then such a run can STOP and report `work_misrouted` but never adopt.
 
 Read the row back: `predicate_kind: claim_terminal`, `armed && will_dispatch`.
 Report the `gate_id` in full, or report **NO implement→ship net** with the reason.
@@ -5441,10 +5444,15 @@ time window, operator approval). (canonical spec: `_gate-registration` →
     never moves it: it holds a drained or offline pin (for up to 7 days), and
     refuses or notifies on an unbound or incapable one, or one whose binding
     cannot be confirmed. Strict without an
-    explicit `target_device_id` is refused. ⚠️ That is the contract, not yet
-    the behaviour: read 2026-11-06 at qontinui-coord `40ceb5975`, coord ignored
-    `pin` and recorded no pin disposition, so send it, and have the dispatched
-    work confirm its device. (Canonical:
+    explicit `target_device_id` is refused. Coord honours it from
+    qontinui-coord `75ead791c` and refuses a wrong-device claim with
+    `409 wrong_device` from `688b410cd`; an older coord ignores `pin` and
+    serves no `pin_disposition` (absent is UNKNOWN). Check the serving build
+    with `git merge-base --is-ancestor <commit> <build_sha>` against coord's
+    `/health` (exit 128 is UNKNOWN), read `pin_disposition` back, and have the
+    dispatched work confirm its device anyway: a runner predating
+    qontinui-runner `6083ad62b` spawns on the unknown 409, and the misrouted
+    run reports `work_misrouted`, never `work_abandoned`. (Canonical:
     `_gate-registration` → "Device-local continuations — `target_device_id`
     alone is a PREFERENCE".)
 - **`clearance_audience`:** set `agent` for agent-verifiable facts ("/vet-plan
@@ -5729,7 +5737,7 @@ instead of it.
     --repo <repo> --intent "<plan-stem>: <phase title>" --work-unit <plan-work-unit-uuid> [--build-required]
   ```
 
-  It POSTs the LITERAL `https://coord.qontinui.io/agents/allocate` — an ANONYMOUS route: no runner, no mint, no cached credential, no `$COORD_HTTP_URL` (unset is an absent override, not a missing door; never substitute `127.0.0.1:9876`, which has no allocate route). `device_id` is a claim it reads from `$QONTINUI_MACHINE_ID` first, then `~/.qontinui/machine.json`, then any device JWT's payload, expired or not. It materialises every `worktrees[]` row (declared siblings included) at the RELATIVE path under the workspace root on the reserved branch, and refuses a STALE allocation whose branch already exists on origin (exit 9 — re-run, **and hand the leaked row back with `--done --branch <the reserved branch> --abandon` first**, since every real call mints a `coord.agent_worktrees` row the caller has to hand back and a bare retry loop leaks one per attempt; file it against `dossier:coord-allocate-returns-a-stale-allocation`). It **never switches the primary checkout's branch, on any answer** — the narrow claim, not "never touches it": `git worktree add` necessarily writes a branch ref and `.git/worktrees/<name>/` metadata into the primary's git dir, it fetches there, and a linked `node_modules` (below) makes the primary the write target for anything the worktree later installs. Output is five line kinds, not one: `agent_id <uuid>`; `<repo> <abs path> <branch>` per worktree; `node_modules <link> -> <target>`, interleaved after a worktree that got one; then -- only when the config is actually written -- one `sibling_store <abs path>` per SHA-keyed store entry it uses (`agent-worktrees/.siblings/<repo>@<sha>/`); and a trailing `cargo_config <path>`. What it sends (plan `2026-09-03-worktree-allocation-is-one-command-and-the-reflex-is-the-script`):
+  It POSTs the LITERAL `https://coord.qontinui.io/agents/allocate` — an ANONYMOUS route: no runner, no mint, no cached credential, no `$COORD_HTTP_URL` (unset is an absent override, not a missing door; never substitute `127.0.0.1:9876`, which has no allocate route). `device_id` is a claim it reads from `$QONTINUI_MACHINE_ID` first, then `~/.qontinui/machine.json`, then any device JWT's payload, expired or not. It materialises every `worktrees[]` row (declared siblings included) at the RELATIVE path under the workspace root on the reserved branch, and refuses a STALE allocation whose branch already exists on origin (exit 9 — re-run, **and hand the leaked row back with `--done --branch <the reserved branch> --abandon` first**, since every real call mints a `coord.agent_worktrees` row the caller has to hand back and a bare retry loop leaks one per attempt; file it against `dossier:coord-allocate-returns-a-stale-allocation`). It **never switches the primary checkout's branch, on any answer** — the narrow claim, not "never touches it": `git worktree add` necessarily writes a branch ref and `.git/worktrees/<name>/` metadata into the primary's git dir, it fetches there, and a linked `node_modules` (below) makes the primary the write target for anything the worktree later installs. Output is five line kinds, not one: `agent_id <uuid>`; `<repo> <abs path> <branch>` per worktree; `node_modules <link> -> <target>`, interleaved after a worktree that got a link (or `node_modules <abs path> (own, pnpm)` after a pnpm worktree that got its OWN store-backed install instead -- off on Windows; plan `2026-10-06-a-junctioned-node-modules-install-is-refused-by-every-harness-and-noticed-at-boot` Phase 4b); then -- only when the config is actually written -- one `sibling_store <abs path>` per SHA-keyed store entry it uses (`agent-worktrees/.siblings/<repo>@<sha>/`); and a trailing `cargo_config <path>`. What it sends (plan `2026-09-03-worktree-allocation-is-one-command-and-the-reflex-is-the-script`):
 
   ```
   POST https://coord.qontinui.io/agents/allocate         // no Authorization header
