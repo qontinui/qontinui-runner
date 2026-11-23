@@ -12,13 +12,13 @@ use crate::session::coord_sync_finish_ack::{
 
 type Acks = Arc<std::sync::Mutex<Vec<(String, Option<i64>)>>>;
 
-/// A drain wired to the fake coord, with the finished-ACK observer recording
-/// every stamp it is asked to make.
 /// The three tests that drive a finish past both bounds each add to the
 /// process-global `FINISHED_UNCONFIRMED_DROPPED`, so the one that counts the
 /// counter's delta must not run beside the other two.
 static DROP_BOUND_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// A drain wired to the fake coord, with the finished-ACK observer recording
+/// every stamp it is asked to make.
 async fn finish_rig(
     answer: Option<(u16, &str)>,
 ) -> (
