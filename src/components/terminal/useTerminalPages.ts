@@ -812,9 +812,10 @@ export function useTerminalPages() {
   // The store write can reach this webview after the event does, so the read
   // is retried until the stored roster's digest is the one the sender saved;
   // after the last retry, when any read returned a roster, the store is re-read
-  // and applied (a newer write that displaced the digest sends its own event). A write that becomes visible
-  // only after the retry budget (5 x 50 ms) is not re-read: this window shows
-  // the older roster, with a warning, until the next save anywhere.
+  // and applied (a newer write that displaced the digest sends its own event).
+  // A write that becomes visible only after the retry budget (5 x 50 ms) is not
+  // re-read: this window shows the older roster, with a warning, until the
+  // next save anywhere.
   //
   // Once the listener is registered, the store is read once to catch up on a
   // save another window made between this window's mount and that moment.
@@ -875,7 +876,7 @@ export function useTerminalPages() {
             rosterDigest(lastRead) === lastOwnSavedDigestRef.current;
           if (!ownSaveDuringRead) {
             console.warn(
-              `[terminal-pages] the stored roster never matched ${source}'s save; applying the store as it now reads`,
+              `[terminal-pages] the stored roster never matched ${source}'s save; re-reading the store`,
             );
           }
           apply();
