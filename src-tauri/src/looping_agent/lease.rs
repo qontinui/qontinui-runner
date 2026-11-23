@@ -1205,7 +1205,7 @@ mod tests {
         ] {
             assert!(!LeaseTick::walked(w).unslotted, "{w:?}");
         }
-        assert!(!LeaseTick::NOT_HELD.unslotted && LeaseTick::LOST.unslotted);
+        const { assert!(!LeaseTick::NOT_HELD.unslotted && LeaseTick::LOST.unslotted) };
         assert!(retire_unslotted_on_closed_lane(
             &lane_obs(LaneObs::Closed, true),
             true
