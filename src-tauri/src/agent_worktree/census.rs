@@ -2344,12 +2344,14 @@ pub(crate) fn compute_canonical_branch(canonical: &Path) -> Option<String> {
 }
 
 /// Ξ_Worktree P7.3 — dirty bit of the canonical checkout
-/// (`git status --porcelain` non-empty). `Some(true)` when there are
+/// (`git status --porcelain --untracked-files=all` non-empty — an untracked
+/// file hidden by `status.showUntrackedFiles=no` still counts). `Some(true)` when there are
 /// uncommitted changes, `Some(false)` when clean, `None` on a git failure
 /// (fail-OPEN to `None` is fine: coord reads `None` as unsafe). This is the
 /// P1-clean precondition input for SharedBranch.
 pub(crate) fn compute_canonical_is_dirty(canonical: &Path) -> Option<bool> {
-    git_capture(canonical, &["status", "--porcelain"]).map(|s| !s.trim().is_empty())
+    git_capture(canonical, super::dirty::STATUS_PORCELAIN_ALL_UNTRACKED)
+        .map(|s| !s.trim().is_empty())
 }
 
 /// Ξ_Worktree P7.3 — advisory base-divergence summary for the canonical
@@ -6518,6 +6520,14 @@ mod tests {",
         let div = compute_canonical_base_divergence(path).expect("divergence Some");
         assert!(!div.is_empty(), "divergence string should be non-empty");
         assert!(div.starts_with("on:feature-x"), "got: {div}");
+    }
+
+    /// Edge 9171555e: the SharedBranch P1-clean input must see an untracked
+    /// file that `status.showUntrackedFiles=no` hides from plain porcelain.
+    #[test]
+    fn canonical_is_dirty_sees_an_untracked_file_hidden_by_show_untracked_no() {
+        let repo = super::super::dirty::repo_with_hidden_untracked_file();
+        assert_eq!(compute_canonical_is_dirty(repo.path()), Some(true));
     }
 
     /// End-to-end at the census layer: a worktree holding ONLY the runner's

@@ -108,6 +108,19 @@ impl RekeySource {
         }
     }
 
+    /// Whether this source reports the id the pane's process runs NOW — the
+    /// provider's registry file for the pid, or its SessionStart hook — as
+    /// opposed to the id the pane was SPAWNED with (rung 2's argv, the R2
+    /// pane resume's pin), which a `/clear` or an in-pane `/resume` leaves
+    /// behind. Only these may advance the registrar's pane-row owner (plan
+    /// `2026-11-12-transcript-autobind-adopts-a-previous-boot-row-that-a-live-pane-has-replaced`).
+    pub fn observes_running_id(self) -> bool {
+        match self {
+            RekeySource::Hook | RekeySource::ProviderRegistry => true,
+            RekeySource::Rung2 | RekeySource::R2Resume => false,
+        }
+    }
+
     /// Parse an outbox row's `rekey_source`. A row with NO label was queued by
     /// a build that predates this module, where the hook was the only writer —
     /// so an absent label is `Hook`. An unknown label is `None` (not counted).
@@ -719,6 +732,9 @@ fn confirm_inner(
                 source = source.as_str(),
                 "coord row re-keyed to the CONFIRMED harness session id (queued)"
             );
+            // Outside every registry lock: `confirm_claude_code_session_id`
+            // has returned and released its record-move guard.
+            registry.notify_rekey_confirmed(coord_session_id, claude_id, source);
             RekeyOutcome::Queued
         }
         Ok(false) => {
@@ -741,6 +757,10 @@ fn confirm_inner(
                     "coord identity: row already carries the confirmed harness session id"
                 );
             }
+            // The steady-state answer once the record carries the id: a
+            // repoint missed on the queuing tick (observer not attached yet at
+            // boot, or a binding made after the queue) is caught here.
+            registry.notify_rekey_confirmed(coord_session_id, claude_id, source);
             RekeyOutcome::AlreadyCurrent
         }
         Err(SessionError::NotFound(_)) => {
@@ -773,7 +793,7 @@ fn confirm_inner(
 /// THE seam, by terminal: `coord_row` is that terminal's
 /// `TerminalSession::coord_session_id()` (resolved by the caller, so this stays
 /// testable without a `TerminalManager`). Evidence for a terminal with no row
-/// yet is parked and retried by [`apply_reconcile_tick`] once it has one; newer
+/// yet is parked and retried by [`apply_reconcile_tick_with`] once it has one; newer
 /// evidence for the terminal replaces it.
 pub fn confirm_for_terminal(
     registry: &SessionRegistry,
@@ -814,14 +834,17 @@ pub fn confirm_for_terminal(
 /// Feed one reconcile pass's rung-2 binds through the seam (D5): only a
 /// `Bind` graded [`BindOrigin::Authoritative`] (the anchor's own argv) — never
 /// a rung-3 `Observed` or rung-4 `Reconciled` correlation. At most one seam
-/// call per terminal, and none for a terminal whose anchor has a valid
-/// provider row this tick (`has_valid_provider_row`; the provider-registry
-/// source is the stronger, current evidence, fed by [`rekey_provider_rows`]).
+/// call per terminal, and none for a terminal `rung2_suppressed` names: one
+/// whose anchor has a valid provider row this tick, or whose anchor reads
+/// Unknown this tick after a provider-registry id was queued or found current
+/// for that same anchor (the provider-registry source is the stronger, current
+/// evidence, fed by [`rekey_provider_rows`]; the suppression set is built by
+/// [`apply_reconcile_tick_with`]).
 pub fn rekey_rung2_binds(
     registry: &SessionRegistry,
     actions: &[ReconcileAction],
     coord_row_for: impl Fn(&str) -> Option<Uuid>,
-    has_valid_provider_row: impl Fn(&str) -> bool,
+    rung2_suppressed: impl Fn(&str) -> bool,
 ) -> Vec<(String, RekeyOutcome)> {
     let mut seen: HashSet<&str> = HashSet::new();
     let mut out = Vec::new();
@@ -835,7 +858,7 @@ pub fn rekey_rung2_binds(
         else {
             continue;
         };
-        if !seen.insert(terminal_id.as_str()) || has_valid_provider_row(terminal_id) {
+        if !seen.insert(terminal_id.as_str()) || rung2_suppressed(terminal_id) {
             continue;
         }
         let outcome = confirm_for_terminal(
@@ -911,11 +934,10 @@ pub fn confirm_for_terminal_in_app(
     ))
 }
 
-/// One reconcile tick's coord-identity work, in order: restore the declines the
-/// drain recorded since the last tick; feed the pass's rung-2 binds through the
-/// seam; then retry what no pass will re-supply, skipping a row this tick
-/// already moved. Pure over its inputs (the terminal → coord-row lookup is
-/// injected), so the whole tick composition is testable against a fake coord.
+/// Test-only: [`apply_reconcile_tick_with`] for a tick that read no provider
+/// rows. Production always passes the tick's rows
+/// ([`apply_reconcile_tick_in_app`]).
+#[cfg(test)]
 pub fn apply_reconcile_tick(
     registry: &SessionRegistry,
     actions: &[ReconcileAction],
@@ -936,7 +958,7 @@ pub fn rekey_provider_rows(
     coord_row_for: impl Fn(&str) -> Option<Uuid>,
 ) -> Vec<(String, RekeyOutcome)> {
     let mut out = Vec::new();
-    for (terminal_id, session_id) in rows.valid() {
+    for (terminal_id, session_id, config_dir) in rows.valid() {
         let Some(coord_row) = coord_row_for(terminal_id) else {
             continue;
         };
@@ -947,14 +969,32 @@ pub fn rekey_provider_rows(
             session_id,
             RekeySource::ProviderRegistry,
         );
+        if matches!(outcome, RekeyOutcome::Queued) {
+            // Which account's registry file supplied the id: on a multi-account
+            // box this is the only record of where the re-key's evidence came from.
+            tracing::info!(
+                terminal_id = %terminal_id,
+                coord_session_id = %coord_row,
+                claude_session_id = %session_id,
+                config_dir = %config_dir.display(),
+                "provider_registry re-key: evidence read from this config dir's sessions/<pid>.json"
+            );
+        }
         out.push((terminal_id.to_string(), outcome));
     }
     out
 }
 
-/// [`apply_reconcile_tick`] with this tick's provider rows. A valid provider
-/// row wins over the rung-2 argv id: rung 2 is skipped for a terminal that has
-/// one, so the seam is called at most once per terminal per tick.
+/// One reconcile tick's coord-identity work, in order: restore the declines the
+/// drain recorded since the last tick; feed the pass's rung-2 binds and this
+/// tick's valid provider rows through the seam; then retry what no pass will
+/// re-supply, skipping a row this tick already moved. Pure over its inputs (the
+/// terminal → coord-row lookup is injected), so the whole tick composition is
+/// testable against a fake coord.
+///
+/// A valid provider row wins over the rung-2 argv id: rung 2 is skipped for a
+/// terminal that has one, so the seam is called at most once per terminal per
+/// tick.
 ///
 /// The precedence is not stateless. Once a provider-registry id has been queued
 /// (or was already current) for an anchor, rung 2 stays suppressed for that
@@ -990,9 +1030,7 @@ pub fn apply_reconcile_tick_with(
     let provider_out = rekey_provider_rows(registry, rows, &coord_row_for);
     for (terminal_id, outcome) in &provider_out {
         if matches!(outcome, RekeyOutcome::Queued | RekeyOutcome::AlreadyCurrent) {
-            if let Some((_, anchor, _)) =
-                rows.entries().find(|(t, _, _)| *t == terminal_id.as_str())
-            {
+            if let Some(anchor) = rows.anchor(terminal_id) {
                 ledger.remember_provider_anchor(terminal_id, anchor);
             }
         }
@@ -1011,7 +1049,8 @@ pub fn prune_provider_memory(registry: &SessionRegistry, live: &HashSet<String>)
     registry.coord_sync().rekeys().retain_provider_anchors(live);
 }
 
-/// [`apply_reconcile_tick`] against the app's terminal manager + registry.
+/// [`apply_reconcile_tick_with`] against the app's terminal manager +
+/// registry, then [`prune_provider_memory`] over every live terminal.
 /// Fire-and-forget; a no-op when either is not in Tauri state.
 pub fn apply_reconcile_tick_in_app(
     app: &tauri::AppHandle,
@@ -1029,7 +1068,7 @@ pub fn apply_reconcile_tick_in_app(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::session::coord_sync::CoordSync;
     use crate::session::local_store::{OutboxRecord, OutboxWriter};
@@ -1061,7 +1100,7 @@ mod tests {
         }
     }
 
-    fn intent() -> Intent {
+    pub(crate) fn intent() -> Intent {
         Intent {
             kind: SessionKind::TerminalShell,
             purpose: "coord identity test".into(),
@@ -1080,7 +1119,7 @@ mod tests {
 
     /// A registry whose coord is unreachable — the seam's outbox side is all
     /// these tests observe.
-    fn registry(dir: &std::path::Path) -> (Arc<SessionRegistry>, Arc<OutboxWriter>) {
+    pub(crate) fn registry(dir: &std::path::Path) -> (Arc<SessionRegistry>, Arc<OutboxWriter>) {
         let outbox = Arc::new(OutboxWriter::open(dir.join("outbox.jsonl")).unwrap());
         let coord = CoordSync::new_for_test(
             outbox.clone(),
@@ -1571,6 +1610,116 @@ mod tests {
             reg.coord_sync().rekeys().counts(RekeySource::Hook).queued,
             0
         );
+    }
+
+    /// Plan `2026-11-12-transcript-autobind-adopts-a-previous-boot-row-that-a-live-pane-has-replaced`
+    /// D1: the pane-row owner is advanced by the seam and NEVER rolled back by
+    /// a coord decline. After a seam `Queued` for (R, X) and a decline that
+    /// restores the record to the pin P, the registrar still answers R for X
+    /// and nothing for P.
+    #[test]
+    fn a_rekey_decline_does_not_roll_the_pane_row_owner_back() {
+        use crate::claude_session::coord_register::AiCoordRegistrar;
+        use crate::claude_session::pane_row_owner::{tenant_from_scope, PaneRowFacts};
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let (reg, _outbox) = registry(dir.path());
+        let row = reg
+            .register_external_with_lineage(intent(), None, Some(PIN.into()))
+            .unwrap();
+        let registrar = Arc::new(AiCoordRegistrar::new(
+            Arc::new(OutboxWriter::open(dir.path().join("registrar-outbox.jsonl")).unwrap()),
+            Uuid::new_v4(),
+        ));
+        {
+            let r = Arc::downgrade(&registrar);
+            reg.attach_rekey_observer(move |row, csid, source| {
+                if let Some(r) = r.upgrade() {
+                    r.note_pane_row(row, csid, source);
+                }
+            });
+            let sreg = Arc::downgrade(&reg);
+            registrar.attach_pane_row_tenant(move |q| {
+                (q == row).then(|| PaneRowFacts {
+                    tenant: tenant_from_scope(sreg.upgrade().unwrap().tenant_scope_of(q)),
+                    bound_at_ms: Some(1),
+                    bind_seq: Some(1),
+                })
+            });
+            registrar.attach_terminal_coord_lookup(move |c| (c == PIN).then_some(row));
+        }
+        assert_eq!(registrar.live_terminal_row(PIN).map(|l| l.row), Some(row));
+
+        assert_eq!(
+            confirm_for_terminal(&reg, "t1", Some(row), LIVE, RekeySource::ProviderRegistry),
+            RekeyOutcome::Queued
+        );
+        // coord declines; the next tick restores the record to the pin.
+        let ledger = reg.coord_sync().rekeys();
+        ledger.note_refused(row, LIVE, Some(PIN.into()), RekeySource::ProviderRegistry);
+        assert!(settle_session_decline(&reg, row).is_some());
+        assert_eq!(
+            reg.describe_by_id(row)
+                .unwrap()
+                .claude_code_session_id
+                .as_deref(),
+            Some(PIN),
+            "precondition: the decline restored the record"
+        );
+
+        assert_eq!(
+            registrar.live_terminal_row(LIVE).map(|l| l.row),
+            Some(row),
+            "the decline does not flip the owner back"
+        );
+        assert_eq!(registrar.live_terminal_row(PIN), None);
+    }
+
+    /// Plan D2: the re-key observer fires with (row, id) on `Queued` and on
+    /// `AlreadyCurrent`, through `confirm_for_terminal` and through
+    /// `confirm_for_session` (the retry doors) — and on no other answer.
+    #[test]
+    fn the_rekey_observer_fires_on_queued_and_already_current_through_both_doors() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let (reg, _outbox) = registry(dir.path());
+        let seen: Arc<std::sync::Mutex<Vec<(Uuid, String)>>> = Default::default();
+        {
+            let seen = seen.clone();
+            reg.attach_rekey_observer(move |row, id, _source| {
+                seen.lock().unwrap().push((row, id.to_string()));
+            });
+        }
+        let row = reg
+            .register_external_with_lineage(intent(), None, Some(PIN.into()))
+            .unwrap();
+        let take = || std::mem::take(&mut *seen.lock().unwrap());
+
+        assert_eq!(
+            confirm_for_terminal(&reg, "t1", Some(row), LIVE, RekeySource::ProviderRegistry),
+            RekeyOutcome::Queued
+        );
+        assert_eq!(take(), vec![(row, LIVE.to_string())]);
+        assert_eq!(
+            confirm_for_session(&reg, row, LIVE, RekeySource::ProviderRegistry),
+            RekeyOutcome::AlreadyCurrent
+        );
+        assert_eq!(take(), vec![(row, LIVE.to_string())]);
+
+        // No other answer fires it.
+        assert_eq!(
+            confirm_for_terminal(&reg, "t2", None, LIVE, RekeySource::ProviderRegistry),
+            RekeyOutcome::NoCoordRow
+        );
+        assert_eq!(
+            confirm_for_session(&reg, row, "not-a-uuid", RekeySource::ProviderRegistry),
+            RekeyOutcome::Invalid
+        );
+        assert_eq!(
+            confirm_for_session(&reg, Uuid::new_v4(), LIVE, RekeySource::ProviderRegistry),
+            RekeyOutcome::NoCoordRow
+        );
+        assert!(take().is_empty());
     }
 
     /// A then B declined in one drain window: coord never held A, so a restore

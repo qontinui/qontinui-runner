@@ -24,6 +24,7 @@
 //!             └─ Existing dedup + SQLite storage
 //! ```
 
+pub mod agent_cli;
 pub mod build_errors;
 pub mod cleanup;
 pub mod commands;

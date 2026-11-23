@@ -53,7 +53,8 @@ pub struct SdkConnection {
     pub app_url: String,
     pub base_path: String,
     pub app_info: SdkAppInfo,
-    pub client: reqwest::Client,
+    /// Signs every request when the target is a phone that requires pairing.
+    pub client: crate::mcp::sdk_http::SdkHttpClient,
     pub connected_at: i64,
     /// Transport kind if connected via physical device registry
     pub transport_kind: Option<crate::mcp::transport::TransportKind>,
@@ -64,6 +65,84 @@ pub struct SdkConnection {
     /// Extension origins. A WS registration records its browser principal here
     /// so a later foreign registration can be compared against it.
     pub activated_by: Option<crate::mcp::relay_binding::Principal>,
+    /// What `client` does with the operator's bearer.
+    pub bearer: ConnectionBearer,
+}
+
+/// What a stored connection's client does with the operator's bearer. It is decided
+/// at the handshake and holds until the next one, or until
+/// [`recheck_stored_bearers`] settles a [`Self::WithheldListUnreadable`].
+///
+/// Listed per connection as `bearer` by `GET /ui-bridge/sdk/status` and
+/// `GET /ui-bridge/sdk/connections`, in snake_case (`sent`, `withheld_from_target`,
+/// `withheld_list_unreadable`, `absent`). It says why a device answers 401, or why
+/// a switch refuses a stored connection. It never carries the token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionBearer {
+    /// Sent on every request.
+    Sent,
+    /// Held back because of what the target was: a foreign host or a forwarder. A
+    /// later handshake may decide differently. Only a handshake may, because the port
+    /// reading local says nothing about what it reaches by the time it is next used.
+    WithheldFromTarget,
+    /// Held back only because the adb list could not be read, so nothing is known
+    /// against the target.
+    WithheldListUnreadable,
+    /// Never part of this connection: no usable one was stored, or it did not come
+    /// from a connect handshake.
+    Absent,
+    /// Never sent: the target is a phone that requires pairing, and `client` signs
+    /// every request with the token that phone issued instead. Nothing a forward
+    /// list says changes that, so it is never stale.
+    DeviceSigned,
+    /// Never sent: the target's health answered with a phone's pairing gate and it
+    /// admits this runner unsigned, and a phone's UI Bridge never needs the
+    /// operator's bearer. A local emulator lands here, as does a phone behind a
+    /// forward this runner cannot see (an `iproxy` or `ssh -L` run by hand). Nothing a
+    /// forward list says changes that, so it is never stale: a re-check never gives
+    /// such a connection the bearer.
+    WithheldFromDevice,
+}
+
+impl SdkConnection {
+    /// Whether `client` would send the operator's bearer to an off-machine
+    /// forwarder: a connection made while its port was a local relay keeps the
+    /// bearer after a forwarder is handed that port.
+    fn sends_bearer_off_machine(&self) -> bool {
+        self.bearer == ConnectionBearer::Sent
+            && classify_bearer_target(&self.app_url, Vec::new) == BearerTarget::OffMachineForwarder
+    }
+
+    /// Whether this connection holds the bearer back only for want of an adb list that
+    /// now reads, and names nothing against its port.
+    fn waits_only_on_the_list(&self) -> bool {
+        self.bearer == ConnectionBearer::WithheldListUnreadable
+            && classify_bearer_target(&self.app_url, Vec::new) == BearerTarget::Loopback
+    }
+
+    /// Whether this connection's handshake no longer holds, and only a new one can
+    /// put it right. `forward_list_known` is the verdict of the adb list read the
+    /// caller just ran.
+    /// - It sends the bearer to a port that is a forwarder, or to a loopback port
+    ///   that might be one because the list cannot be read.
+    /// - It held the bearer back from a port known to be a local relay, which would
+    ///   answer it with 401s.
+    fn bearer_decision_is_stale(&self, forward_list_known: bool) -> bool {
+        let target = classify_bearer_target(&self.app_url, Vec::new);
+        match self.bearer {
+            ConnectionBearer::Sent => {
+                target == BearerTarget::OffMachineForwarder
+                    || (target == BearerTarget::Loopback && !forward_list_known)
+            }
+            ConnectionBearer::WithheldFromTarget | ConnectionBearer::WithheldListUnreadable => {
+                target == BearerTarget::Loopback && forward_list_known
+            }
+            ConnectionBearer::Absent
+            | ConnectionBearer::DeviceSigned
+            | ConnectionBearer::WithheldFromDevice => false,
+        }
+    }
 }
 
 /// Manages multiple simultaneous SDK connections with one active connection
@@ -86,11 +165,88 @@ impl SdkConnectionManager {
         }
     }
 
-    /// Get the currently active connection
+    /// Get the currently active connection, unless using it would send the
+    /// operator's bearer off this machine.
     pub fn active_connection(&self) -> Option<&SdkConnection> {
         self.active_url
             .as_ref()
             .and_then(|url| self.connections.get(url))
+            .filter(|conn| !conn.sends_bearer_off_machine())
+    }
+
+    /// The URL of the connection a dispatch would use: `active_url`, unless
+    /// [`Self::active_connection`] refuses it. It agrees with `active_connection`, so
+    /// a surface that names the active URL from it never names one a dispatch passes
+    /// over.
+    pub fn active_url_in_use(&self) -> Option<&str> {
+        self.active_url
+            .as_deref()
+            .filter(|_| self.active_connection().is_some())
+    }
+
+    /// Whether the connection stored under `url` is the one a dispatch would use (see
+    /// [`Self::active_url_in_use`]).
+    pub fn is_active(&self, url: &str) -> bool {
+        self.active_url_in_use() == Some(url)
+    }
+
+    /// Make the stored connection to `url` active and describe it, with no
+    /// handshake. A connection whose handshake no longer holds gets `None` instead,
+    /// and is dropped if it would send the bearer off this machine. Any other stays
+    /// the target until a new handshake replaces it: with no stored connection a
+    /// dispatch falls back to the runner's own UI.
+    pub(crate) fn reuse_stored_connection(
+        &mut self,
+        url: &str,
+        forward_list_known: bool,
+    ) -> Option<ConnectResponse> {
+        let conn = self.connections.get(url)?;
+        if conn.bearer_decision_is_stale(forward_list_known) {
+            if conn.sends_bearer_off_machine() {
+                self.drop_connection_sending_bearer_off_machine(url);
+            }
+            return None;
+        }
+        let response = ConnectResponse {
+            app: conn.app_info.clone(),
+            url: conn.app_url.clone(),
+            base_path: conn.base_path.clone(),
+            // No handshake, so the bearer choice was not re-evaluated. `"none"`
+            // would falsely read as "unauthenticated".
+            auth_path: AUTH_PATH_REUSED.to_string(),
+        };
+        self.active_url = Some(url.to_string());
+        self.active_responsive = None;
+        self.active_responsive_checked_at = 0;
+        Some(response)
+    }
+
+    /// Drop every connection whose client would send the operator's bearer off this
+    /// machine, so the token leaves memory and every read of the connections agrees.
+    /// [`Self::active_connection`] already refuses such a client until this runs.
+    pub fn drop_connections_sending_bearer_off_machine(&mut self) {
+        let doomed: Vec<String> = self
+            .connections
+            .iter()
+            .filter(|(_, conn)| conn.sends_bearer_off_machine())
+            .map(|(url, _)| url.clone())
+            .collect();
+        for url in doomed {
+            self.drop_connection_sending_bearer_off_machine(&url);
+        }
+    }
+
+    fn drop_connection_sending_bearer_off_machine(&mut self, url: &str) {
+        warn!(
+            "SDK relay client: dropping the connection to {url}: its port now forwards off this \
+             machine"
+        );
+        self.connections.remove(url);
+        if self.active_url.as_deref() == Some(url) {
+            self.active_url = None;
+            self.active_responsive = None;
+            self.active_responsive_checked_at = 0;
+        }
     }
 }
 
@@ -182,11 +338,43 @@ pub(crate) struct ConnectionInfo {
     url: String,
     app: SdkAppInfo,
     connected_at: i64,
+    /// Whether a dispatch would use this connection: see
+    /// [`SdkConnectionManager::is_active`]. The active connection reads `false`
+    /// while its client would send the operator's bearer off this machine.
     is_active: bool,
     /// The origin the activating WS registration was verified at; `None` for
     /// operator trust and keyed/opaque principals.
     verified_origin: Option<String>,
     principal_class: &'static str,
+    /// What this connection's client does with the operator's bearer.
+    bearer: ConnectionBearer,
+    /// Whether this client would send the operator's bearer to a port that now
+    /// forwards off this machine. Such a connection is never used, active or not.
+    /// It is dropped at the next re-check, or by a connect or switch to its own URL.
+    /// This field is what tells it apart from an ordinary inactive connection that
+    /// sends the bearer.
+    sends_bearer_off_machine: bool,
+}
+
+/// One [`ConnectionInfo`] per stored connection, for the routes that list them.
+fn connection_infos(manager: &SdkConnectionManager) -> Vec<ConnectionInfo> {
+    manager
+        .connections
+        .iter()
+        .map(|(url, conn)| ConnectionInfo {
+            url: url.clone(),
+            app: conn.app_info.clone(),
+            connected_at: conn.connected_at,
+            is_active: manager.is_active(url),
+            verified_origin: conn.activated_by.as_ref().and_then(|p| p.verified_origin()),
+            principal_class: conn
+                .activated_by
+                .as_ref()
+                .map_or("operator_trust", |p| p.class_str()),
+            bearer: conn.bearer,
+            sends_bearer_off_machine: conn.sends_bearer_off_machine(),
+        })
+        .collect()
 }
 
 /// Request body for switching active connection
@@ -230,14 +418,36 @@ struct ConnectionHealthResult {
 ///   handshake ran, so the bearer choice was NOT re-evaluated (whatever was
 ///   attached at original connect time is still in effect).
 /// - `"withheld_foreign_host"` — the target is neither a Qontinui web origin
-///   the bearer is minted for nor a loopback relay, so NO bearer was sent and
-///   none was loaded (see [`choose_connect_bearer`]).
+///   the bearer is minted for nor a loopback relay on this machine (a loopback
+///   port that forwards to a device counts as foreign), so NO bearer was sent
+///   and none was loaded (see [`choose_connect_bearer`]).
+/// - `"withheld_forward_list_unreadable"` — the target is on loopback, but the adb
+///   server's forward list could not be read, so the port might reach a phone. NO
+///   bearer was sent; a connect, or the next 30s re-check, decides afresh once the
+///   list is readable again.
+/// - `"device-signed"` — the target is a phone that requires pairing
+///   (`@qontinui/ui-bridge-native` 0.11.0+, reached off the phone), and this runner
+///   holds the token it issued. NO bearer is sent; every request is signed with
+///   that token instead (see [`crate::mcp::transport::pairing`]).
+/// - `"pairing_required"` — only on a failed connect: the target is a phone that
+///   requires pairing and has issued this runner no token. Pair it with
+///   `POST /ui-bridge/devices/{id}/pair`.
+/// - `"withheld_from_device"` — the target was dialled as a local relay, which
+///   would carry the bearer, and answered its open health as a phone that admits
+///   this runner unsigned (a local emulator, or a phone behind a forward this
+///   runner did not make). A phone's UI Bridge never needs the bearer, so it is not
+///   sent at all: health is asked with no bearer before any request that would
+///   carry it.
 const AUTH_PATH_COGNITO: &str = "cognito";
 const AUTH_PATH_DEVICE_JWT: &str = "device-jwt";
 const AUTH_PATH_DEVICE_JWT_EXPIRED: &str = "device-jwt-expired-skipped";
 const AUTH_PATH_NONE: &str = "none";
 const AUTH_PATH_REUSED: &str = "reused";
 const AUTH_PATH_WITHHELD_FOREIGN_HOST: &str = "withheld_foreign_host";
+const AUTH_PATH_WITHHELD_FORWARD_LIST: &str = "withheld_forward_list_unreadable";
+pub(crate) const AUTH_PATH_DEVICE_SIGNED: &str = "device-signed";
+pub(crate) const AUTH_PATH_PAIRING_REQUIRED: &str = "pairing_required";
+const AUTH_PATH_WITHHELD_FROM_DEVICE: &str = "withheld_from_device";
 
 /// Connect response
 #[derive(Debug, Serialize)]
@@ -599,50 +809,27 @@ async fn handle_connect(
     let url = crate::mcp::types::canonical_loopback_url(req.url.trim_end_matches('/'));
     info!(url = %url, "Connecting to SDK app");
 
-    // Check if we're already connected to this URL
-    {
-        let mut manager = state.sdk_connection.lock().await;
-        if manager.connections.contains_key(&url) {
-            // Already connected — just make it active
-            manager.active_url = Some(url.clone());
-            manager.active_responsive = None;
-            manager.active_responsive_checked_at = 0;
-            let conn = manager.connections.get(&url).unwrap();
-            let response = ConnectResponse {
-                app: conn.app_info.clone(),
-                url: conn.app_url.clone(),
-                base_path: conn.base_path.clone(),
-                // No fresh handshake was performed — we reused an existing
-                // connection — so the bearer choice was not re-evaluated.
-                // `"none"` would falsely read as "unauthenticated".
-                auth_path: AUTH_PATH_REUSED.to_string(),
-            };
-            info!(
-                "Switched active connection to already-connected SDK app: {}",
-                response.app.app_name
-            );
-            return Json(ApiResponse::success(response));
-        }
-    }
-
-    // Delegate to the shared connect_sdk_app function
-    match connect_sdk_app(
+    match connect_or_reuse(
         &state.sdk_connection,
         &url,
-        req.port,
-        req.app_id,
-        req.app_name,
-        req.app_type,
-        req.framework,
+        ConnectHints {
+            port: req.port,
+            app_id: req.app_id,
+            app_name: req.app_name,
+            app_type: req.app_type,
+            framework: req.framework,
+        },
     )
     .await
     {
         Ok(response) => {
-            // Fire-and-forget: push element reliability data for CTR seeding
-            let state_clone = state.clone();
-            tokio::spawn(async move {
-                push_ctr_reliability_to_sdk(&state_clone).await;
-            });
+            if response.auth_path != AUTH_PATH_REUSED {
+                // Fire-and-forget: push element reliability data for CTR seeding
+                let state_clone = state.clone();
+                tokio::spawn(async move {
+                    push_ctr_reliability_to_sdk(&state_clone).await;
+                });
+            }
             Json(ApiResponse::success(response))
         }
         Err(e) => {
@@ -650,17 +837,137 @@ async fn handle_connect(
             // via the sibling `hint` field — callers can see which bearer the
             // failed handshake attached without it living in `error` prose.
             let mut resp = ApiResponse::<ConnectResponse>::error(e.message);
+            if e.auth_path == AUTH_PATH_PAIRING_REQUIRED {
+                resp.code = Some(crate::mcp::transport::pairing::PAIRING_REQUIRED.to_string());
+            }
             resp.hint = Some(serde_json::json!({ "authPath": e.auth_path }));
             Json(resp)
         }
     }
 }
 
-/// Connect to an SDK app by URL. Shared logic used by both `handle_connect`
-/// (user-initiated) and auto-connect (proxy creation).
+/// Read the adb server's list and settle every stored connection against it, for
+/// whatever changes between connects. A connection sending the bearer to a known
+/// forwarder is dropped. Once the list reads, a connection that held the bearer back
+/// only because it could not be read is decided from what it says: a listed port is
+/// now withheld for what it is, and any other loopback port gets a client with a fresh
+/// decision, in place, keeping its target. An unreadable list settles nothing else: a
+/// stored client keeps its last decision, since dropping it would turn the next
+/// dispatch onto the runner's own UI, and the next connect or switch refuses it.
+pub async fn recheck_stored_bearers(sdk_connection: &tokio::sync::Mutex<SdkConnectionManager>) {
+    let forward_list_known = crate::mcp::adb_helper::refresh_adb_listed_forwarders().await;
+    {
+        let mut manager = sdk_connection.lock().await;
+        manager.drop_connections_sending_bearer_off_machine();
+        if !forward_list_known {
+            return;
+        }
+        for conn in manager.connections.values_mut() {
+            if conn.bearer == ConnectionBearer::WithheldListUnreadable
+                && classify_bearer_target(&conn.app_url, Vec::new)
+                    == BearerTarget::OffMachineForwarder
+            {
+                conn.bearer = ConnectionBearer::WithheldFromTarget;
+            }
+        }
+        if !manager
+            .connections
+            .values()
+            .any(SdkConnection::waits_only_on_the_list)
+        {
+            return;
+        }
+    }
+
+    let choice = load_operator_bearer().await;
+    if choice.bearer.is_none() {
+        // Left withheld, so the next re-check decides again rather than a connection with
+        // no bearer reading as settled once the operator pairs.
+        return;
+    }
+    let mut manager = sdk_connection.lock().await;
+    for (url, conn) in manager
+        .connections
+        .iter_mut()
+        .filter(|(_, conn)| conn.waits_only_on_the_list())
+    {
+        let builder = connect_client_builder(BearerTarget::Loopback);
+        match connection_client(url, builder, choice.clone()) {
+            (Ok(client), bearer) => {
+                info!(
+                    "SDK relay client: decided the bearer for {url} afresh: the adb forward \
+                     list reads again and does not name its port ({})",
+                    choice.auth_path
+                );
+                conn.client = conn.client.with_http(client);
+                conn.bearer = bearer;
+            }
+            (Err(e), _) => warn!("SDK relay client: could not rebuild the client for {url}: {e}"),
+        }
+    }
+}
+
+/// How often the runner re-checks stored connections' bearers.
+pub const STORED_BEARER_RECHECK_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The `worker_supervisor` registry name of the loop [`spawn_stored_bearer_recheck`]
+/// starts, as `GET /health` `supervised_workers` lists it.
+pub const STORED_BEARER_RECHECK_WORKER: &str = "sdk_client.stored_bearer_recheck";
+
+/// Run [`recheck_stored_bearers`] every `period` for the life of the process.
 ///
-/// When called from auto-connect, the `app_*` / `framework` hints will be `None`
-/// and values are inferred from the health response.
+/// Nothing else re-reads the adb forward list and settles stored clients between
+/// connects, so the loop runs under the panic supervisor: a pass that panics is
+/// logged, counted on `/health`, and the loop is rebuilt after a backoff, where a
+/// bare spawn would end it for good. Rebuilding it is safe, because the loop keeps
+/// no state but its interval.
+pub fn spawn_stored_bearer_recheck(
+    sdk_connection: Arc<tokio::sync::Mutex<SdkConnectionManager>>,
+    period: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    crate::worker_supervisor::spawn_supervised(STORED_BEARER_RECHECK_WORKER, move || {
+        let sdk_connection = sdk_connection.clone();
+        async move {
+            let mut interval = tokio::time::interval(period);
+            loop {
+                interval.tick().await;
+                recheck_stored_bearers(&sdk_connection).await;
+            }
+        }
+    })
+}
+
+/// What `POST /ui-bridge/sdk/connect` does: make the stored connection to `url`
+/// active if its handshake still holds, and otherwise make a new handshake.
+pub(crate) async fn connect_or_reuse(
+    sdk_connection: &tokio::sync::Mutex<SdkConnectionManager>,
+    url: &str,
+    hints: ConnectHints,
+) -> Result<ConnectResponse, ConnectError> {
+    let forward_list_known = refresh_forward_list_for(url).await;
+
+    // Check if we're already connected to this URL
+    if let Some(response) = sdk_connection
+        .lock()
+        .await
+        .reuse_stored_connection(url, forward_list_known)
+    {
+        info!(
+            "Switched active connection to already-connected SDK app: {}",
+            response.app.app_name
+        );
+        return Ok(response);
+    }
+
+    connect_with_forward_list(sdk_connection, url, forward_list_known, hints).await
+}
+
+/// Connect to an SDK app by URL, with no stored connection reused. The
+/// physical-device connect uses it
+/// ([`crate::mcp::physical_device_api::connect_device_at`]).
+///
+/// An `app_*` or `framework` hint left `None` is inferred from the health
+/// response.
 ///
 /// The operator's bearer rides along only to an origin it is minted for — see
 /// [`choose_connect_bearer`].
@@ -673,11 +980,11 @@ pub async fn connect_sdk_app(
     app_type: Option<String>,
     framework: Option<String>,
 ) -> Result<ConnectResponse, ConnectError> {
-    let (target, bearer) =
-        choose_connect_bearer(url, qontinui_bearer_origins, load_operator_bearer).await;
-    connect_sdk_app_with(
+    let forward_list_known = refresh_forward_list_for(url).await;
+    connect_with_forward_list(
         sdk_connection,
         url,
+        forward_list_known,
         ConnectHints {
             port: port_hint,
             app_id,
@@ -685,9 +992,46 @@ pub async fn connect_sdk_app(
             app_type,
             framework,
         },
-        bearer,
-        connect_client_builder(target),
     )
+    .await
+}
+
+/// Re-read the adb server's forward list when `url` is on loopback, the only place
+/// the list can change the bearer decision. Returns whether the decision can rely on
+/// it, which is always so for any other host.
+async fn refresh_forward_list_for(url: &str) -> bool {
+    let on_loopback = url::Url::parse(url).is_ok_and(|url| is_loopback_relay_host(&url));
+    !on_loopback || crate::mcp::adb_helper::refresh_adb_listed_forwarders().await
+}
+
+/// The handshake with the production bearer sources, given the verdict of a
+/// [`refresh_forward_list_for`] the caller just ran. A loopback target whose port
+/// cannot be told from a forward to a phone gets no bearer.
+async fn connect_with_forward_list(
+    sdk_connection: &tokio::sync::Mutex<SdkConnectionManager>,
+    url: &str,
+    forward_list_known: bool,
+    hints: ConnectHints,
+) -> Result<ConnectResponse, ConnectError> {
+    let (target, bearer) = choose_connect_bearer(url, qontinui_bearer_origins, || async move {
+        if forward_list_known {
+            load_operator_bearer().await
+        } else {
+            info!(
+                "SDK relay client: withholding the operator bearer from {url} — the adb forward \
+                 list could not be read, so this port might reach a phone \
+                 ({AUTH_PATH_WITHHELD_FORWARD_LIST})"
+            );
+            BearerChoice {
+                bearer: None,
+                auth_path: AUTH_PATH_WITHHELD_FORWARD_LIST,
+            }
+        }
+    })
+    .await;
+    connect_sdk_app_with(sdk_connection, url, hints, bearer, || {
+        connect_client_builder(target)
+    })
     .await
 }
 
@@ -703,11 +1047,17 @@ pub async fn connect_sdk_app(
 /// admits all of `127.0.0.0/8` and the IPv4-mapped form, and a process that
 /// never ran that export has no bypass at all.
 ///
+/// An off-machine forwarder is on loopback too, so it is dialled direct as well:
+/// a proxy could not reach this machine's port, and the forwarder carries the
+/// request onward itself.
+///
 /// Every other target keeps the proxy: a foreign host is sent no bearer, and
 /// a Qontinui origin is the backend the operator configured.
 fn connect_client_builder(target: BearerTarget) -> reqwest::ClientBuilder {
     match target {
-        BearerTarget::Loopback => reqwest::Client::builder().no_proxy(),
+        BearerTarget::Loopback | BearerTarget::OffMachineForwarder => {
+            reqwest::Client::builder().no_proxy()
+        }
         BearerTarget::QontinuiOrigin | BearerTarget::Foreign => reqwest::Client::builder(),
     }
 }
@@ -715,7 +1065,7 @@ fn connect_client_builder(target: BearerTarget) -> reqwest::ClientBuilder {
 /// The caller's identity hints for a connect; every `None` is read from the
 /// app's `/health` answer instead.
 #[derive(Debug, Default)]
-struct ConnectHints {
+pub(crate) struct ConnectHints {
     port: Option<u16>,
     app_id: Option<String>,
     app_name: Option<String>,
@@ -725,18 +1075,33 @@ struct ConnectHints {
 
 /// What the connect handshake sends as `Authorization`, and the
 /// `AUTH_PATH_*` tag that says why — surfaced on the connect response.
+#[derive(Clone)]
 struct BearerChoice {
     /// `(token, human-readable kind)` to attach, or `None` to send no header.
     bearer: Option<(String, &'static str)>,
     auth_path: &'static str,
 }
 
+impl BearerChoice {
+    /// No bearer, for a target that answered as a phone.
+    fn withheld_from_device() -> Self {
+        Self {
+            bearer: None,
+            auth_path: AUTH_PATH_WITHHELD_FROM_DEVICE,
+        }
+    }
+}
+
 /// Where a connect target sits relative to the operator's bearer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BearerTarget {
     /// A relay on THIS machine's loopback (`127.0.0.0/8`, `::1`, `localhost`):
-    /// the dev web relay, a temp runner, an `adb forward`.
+    /// the dev web relay, a temp runner, a local emulator's `adb forward`.
     Loopback,
+    /// A loopback port known to carry traffic to another machine, whether or not
+    /// this runner opened it. Dialled like [`Self::Loopback`] and sent no bearer, like [`Self::Foreign`].
+    /// See [`crate::mcp::transport::mark_off_machine_forwarder`].
+    OffMachineForwarder,
     /// An origin the bearer is minted for — see [`qontinui_bearer_origins`].
     QontinuiOrigin,
     /// Anything else, including a URL that does not parse as `http(s)`.
@@ -757,14 +1122,18 @@ enum BearerTarget {
 /// the bearer across the network in the clear. Loopback is the one host class
 /// admitted on any scheme and port — see [`is_loopback_relay_host`].
 ///
-/// A LAN address is FOREIGN by design. A physical device found over mDNS is
-/// dialled at `http://<lan-ip>:<port>` (the LAN transport in `mcp_api.rs`,
-/// connected through `physical_device_api::connect_device`), and that connect
-/// now carries no bearer. The hop is plaintext over a shared network, and the
-/// address is whatever an mDNS answer announced. A LAN UI Bridge wrapper that
-/// relied on the operator's `Authorization` header therefore fails its auth
-/// after this change, and it has to authenticate another way (its pairing
-/// token) rather than on the operator's credential.
+/// A physical device gets no bearer, however it is reached. One found over mDNS
+/// is dialled at `http://<lan-ip>:<port>` (the LAN transport in `mcp_api.rs`) and
+/// is foreign. The others are dialled at a local port that forwards to the
+/// device: a TCP proxy for one registered by hand
+/// (`POST /ui-bridge/devices/register-lan`, which takes any `IP:port`), a tunnel
+/// for Cloud, `adb` for Android and the sidecar for iOS. Their URLs are loopback,
+/// and only [`crate::mcp::transport::is_off_machine_forwarder`] tells them apart.
+/// The far end is the device, not a host the bearer is minted for, and any app on
+/// it can hold the port. The `ui-bridge-native` server reads no `Authorization`
+/// header: a phone that requires pairing is sent a per-request signature instead,
+/// keyed by the token it issued this runner, which never crosses the network (see
+/// [`connect_sdk_app_with`] and [`crate::mcp::transport::pairing`]).
 fn classify_bearer_target(
     url: &str,
     qontinui_origins: impl FnOnce() -> Vec<url::Origin>,
@@ -774,7 +1143,14 @@ fn classify_bearer_target(
         _ => return BearerTarget::Foreign,
     };
     if is_loopback_relay_host(&parsed) {
-        return BearerTarget::Loopback;
+        let forwards_off_machine = parsed
+            .port_or_known_default()
+            .is_some_and(crate::mcp::transport::is_off_machine_forwarder);
+        return if forwards_off_machine {
+            BearerTarget::OffMachineForwarder
+        } else {
+            BearerTarget::Loopback
+        };
     }
     if qontinui_origins().contains(&parsed.origin()) {
         BearerTarget::QontinuiOrigin
@@ -863,10 +1239,11 @@ where
     let target = classify_bearer_target(url, qontinui_origins);
     let choice = match target {
         BearerTarget::Loopback | BearerTarget::QontinuiOrigin => load_bearer().await,
-        BearerTarget::Foreign => {
+        BearerTarget::OffMachineForwarder | BearerTarget::Foreign => {
             info!(
                 "SDK relay client: withholding the operator bearer from {url} — not a Qontinui \
-                 web origin or a loopback relay ({AUTH_PATH_WITHHELD_FOREIGN_HOST})"
+                 web origin or a loopback relay on this machine \
+                 ({AUTH_PATH_WITHHELD_FOREIGN_HOST})"
             );
             BearerChoice {
                 bearer: None,
@@ -983,25 +1360,15 @@ fn bearer_redirect_policy() -> reqwest::redirect::Policy {
     })
 }
 
-/// [`connect_sdk_app`] with the bearer already chosen and the client builder
-/// supplied — the seam the bearer tests drive with a builder that resolves
-/// their test host names to a local recorder.
-async fn connect_sdk_app_with(
-    sdk_connection: &tokio::sync::Mutex<SdkConnectionManager>,
+/// The client a connection talks through, given its bearer decision, and what that
+/// client does with the bearer.
+fn connection_client(
     url: &str,
-    hints: ConnectHints,
-    choice: BearerChoice,
     builder: reqwest::ClientBuilder,
-) -> Result<ConnectResponse, ConnectError> {
-    let ConnectHints {
-        port: port_hint,
-        app_id,
-        app_name,
-        app_type,
-        framework,
-    } = hints;
+    choice: BearerChoice,
+) -> (reqwest::Result<reqwest::Client>, ConnectionBearer) {
     let BearerChoice { bearer, auth_path } = choice;
-    // Create HTTP client with timeout
+    let mut connection_bearer = ConnectionBearer::Absent;
     // 30s request timeout matches the UI Bridge IPC timeout — the app's snapshot/elements
     // endpoints proxy through the IPC layer and can take >10s on cold pages.
     let mut builder = builder
@@ -1018,6 +1385,7 @@ async fn connect_sdk_app_with(
                     builder = builder
                         .default_headers(headers)
                         .redirect(bearer_redirect_policy());
+                    connection_bearer = ConnectionBearer::Sent;
                     info!("SDK relay client: attached {kind} bearer for {}", url);
                 }
                 Err(e) => warn!("SDK relay client: malformed bearer, connecting without auth: {e}"),
@@ -1027,30 +1395,106 @@ async fn connect_sdk_app_with(
             // Already logged at `warn!` by `load_operator_bearer`, with the
             // expiry delta.
         }
+        // Already logged where they were decided, and no bearer was even loaded.
         None if auth_path == AUTH_PATH_WITHHELD_FOREIGN_HOST => {
-            // Already logged by `choose_connect_bearer`: a foreign host never
-            // gets the operator's bearer, so none was even loaded.
+            connection_bearer = ConnectionBearer::WithheldFromTarget;
         }
+        None if auth_path == AUTH_PATH_WITHHELD_FORWARD_LIST => {
+            connection_bearer = ConnectionBearer::WithheldListUnreadable;
+        }
+        // Decided and logged by `device_client`.
+        None if auth_path == AUTH_PATH_WITHHELD_FROM_DEVICE => {}
         None => debug!(
             "SDK relay client: no Cognito session and no device-JWT (legacy/local install or \
              not paired); connecting without auth"
         ),
     }
-    let auth_path = auth_path.to_string();
+    (builder.build(), connection_bearer)
+}
 
-    let client = builder.build().map_err(|e| ConnectError {
+/// [`connect_sdk_app`] with the bearer already chosen and the client builder
+/// supplied — the seam the bearer tests drive with a builder that resolves
+/// their test host names to a local recorder. `make_builder` is called again
+/// when a phone answers a connection that carries the bearer, to rebuild the
+/// client without it.
+async fn connect_sdk_app_with(
+    sdk_connection: &tokio::sync::Mutex<SdkConnectionManager>,
+    url: &str,
+    hints: ConnectHints,
+    choice: BearerChoice,
+    make_builder: impl Fn() -> reqwest::ClientBuilder,
+) -> Result<ConnectResponse, ConnectError> {
+    let ConnectHints {
+        port: port_hint,
+        app_id,
+        app_name,
+        app_type,
+        framework,
+    } = hints;
+    let mut auth_path = choice.auth_path.to_string();
+    let (client, mut connection_bearer) = connection_client(url, make_builder(), choice);
+    let client = client.map_err(|e| ConnectError {
         message: format!("Failed to create HTTP client: {}", e),
         auth_path: auth_path.clone(),
     })?;
 
-    // Try to hit the health endpoint to validate the app
-    let (base_path, health_data) =
-        try_health_check(&client, url)
+    // Try to hit the health endpoint to validate the app. A client carrying the
+    // operator's bearer to a loopback relay first asks the phone health route with
+    // no bearer, since a phone's health is open: a phone found there is never sent
+    // the bearer at all. Only a loopback target can be a phone by accident (an
+    // emulator, a forward this runner did not make); a configured Qontinui origin
+    // is a phone only if someone made it one, and a hostile one would leave the
+    // pairing gate out of its answer anyway.
+    let dialled_as_a_local_relay = url::Url::parse(url).is_ok_and(|u| is_loopback_relay_host(&u));
+    let phone_health = if connection_bearer == ConnectionBearer::Sent && dialled_as_a_local_relay {
+        match connection_client(url, make_builder(), BearerChoice::withheld_from_device()).0 {
+            Ok(bare) => phone_health_without_bearer(&bare, url)
+                .await
+                .map_err(|message| ConnectError {
+                    message,
+                    auth_path: auth_path.clone(),
+                })?,
+            Err(e) => {
+                return Err(ConnectError {
+                    message: format!("Failed to create HTTP client: {e}"),
+                    auth_path: auth_path.clone(),
+                })
+            }
+        }
+    } else {
+        None
+    };
+    let (base_path, health_data) = match phone_health {
+        Some(health) => ("/ui-bridge".to_string(), health),
+        None => try_health_check(&client, url)
             .await
             .map_err(|message| ConnectError {
                 message,
                 auth_path: auth_path.clone(),
-            })?;
+            })?,
+    };
+
+    let client = match device_client(url, client, &health_data, connection_bearer, || {
+        connection_client(url, make_builder(), BearerChoice::withheld_from_device()).0
+    }) {
+        Ok(DeviceClient::Plain(client)) => client,
+        Ok(DeviceClient::Unsigned {
+            client,
+            bearer_dropped,
+        }) => {
+            if bearer_dropped {
+                auth_path = AUTH_PATH_WITHHELD_FROM_DEVICE.to_string();
+            }
+            connection_bearer = ConnectionBearer::WithheldFromDevice;
+            client
+        }
+        Ok(DeviceClient::Signed(client)) => {
+            auth_path = AUTH_PATH_DEVICE_SIGNED.to_string();
+            connection_bearer = ConnectionBearer::DeviceSigned;
+            client
+        }
+        Err(e) => return Err(e),
+    };
 
     // Extract app info from health response or from provided hints
     let ui_bridge_meta = health_data
@@ -1125,6 +1569,7 @@ async fn connect_sdk_app_with(
             transport_kind: None,
             physical_device_id: None,
             activated_by: None,
+            bearer: connection_bearer,
         },
     );
     manager.active_url = Some(url.to_string());
@@ -1133,6 +1578,140 @@ async fn connect_sdk_app_with(
 
     info!("Connected to SDK app: {}", response.app.app_name);
     Ok(response)
+}
+
+/// How a connection to a device sends its requests.
+enum DeviceClient {
+    /// Unchanged: not a phone with a pairing gate.
+    Plain(crate::mcp::sdk_http::SdkHttpClient),
+    /// Unsigned, and never sending the operator's bearer: a phone that admits this
+    /// runner as on the phone itself (an `adb forward` or a local emulator), or one
+    /// that trusts its whole network. `bearer_dropped` says the connection had
+    /// carried the bearer and was rebuilt without it.
+    Unsigned {
+        client: crate::mcp::sdk_http::SdkHttpClient,
+        bearer_dropped: bool,
+    },
+    /// Signed with the token the phone issued this runner, and never sending the
+    /// operator's bearer.
+    Signed(crate::mcp::sdk_http::SdkHttpClient),
+}
+
+/// The open health answer of a phone at `url`, read with `client`, which carries
+/// no bearer: `Ok(None)` when what answered there is not a phone with a pairing
+/// gate, so the bearer may be sent.
+///
+/// A phone's health is open, so any HTTP answer without a gate rules a phone out.
+/// No answer at all rules nothing out: a request that fails twice in a row is an
+/// `Err`, and the connect fails rather than send the bearer to whatever did not
+/// answer.
+async fn phone_health_without_bearer(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<Option<serde_json::Value>, String> {
+    let health_url = format!("{url}/ui-bridge/health");
+    let resp = match client.get(&health_url).send().await {
+        Ok(resp) => resp,
+        Err(first) => {
+            warn!("SDK relay client: {health_url} gave no answer ({first}); asking once more");
+            client.get(&health_url).send().await.map_err(|e| {
+                format!(
+                    "{health_url} gave no answer ({e}), so the runner cannot tell whether a phone \
+                     is there, and sends it no credential. Retry the connect."
+                )
+            })?
+        }
+    };
+    if !resp.status().is_success() {
+        return Ok(None);
+    }
+    // A body cut off mid-read is no answer, and fails the connect as one. A body
+    // that is not JSON is an answer, from something that is not a phone: a web
+    // dev server serves its HTML page on every path.
+    let body = resp.bytes().await.map_err(|e| {
+        format!(
+            "{health_url} answered but its body could not be read ({e}), so the runner \
+             cannot tell whether a phone is there, and sends it no credential. Retry the connect."
+        )
+    })?;
+    let Ok(health) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return Ok(None);
+    };
+    Ok(crate::mcp::transport::pairing::DeviceGate::from_health(&health).map(|_| health))
+}
+
+/// Decide how a connection to `url` sends, from the `health` it just answered.
+///
+/// - No pairing gate in the answer: a web app, the cloud relay (which the phone's
+///   gate does not cover), or a phone whose UI Bridge predates pairing. `client` is
+///   kept as it is.
+/// - Any pairing gate: a phone, which never needs the operator's bearer. A
+///   connection that carried it is rebuilt without it by `without_bearer`, and the
+///   connection is marked so no later re-check gives it back.
+/// - A gate that does not require this runner to sign: unsigned. When the phone
+///   admits this runner as on the phone itself on this machine's loopback, its
+///   token is fetched in the background, which needs no code over a cable
+///   (`pairing::spawn_token_fetch` checks it is one), so the same phone is
+///   reachable over Wi-Fi later. The phone's own claim to be local is not enough:
+///   anything this runner connects to can make it.
+/// - A gate that requires this runner to sign: signed when the phone issued this
+///   runner a token, and refused with [`AUTH_PATH_PAIRING_REQUIRED`] when it did
+///   not.
+fn device_client(
+    url: &str,
+    client: reqwest::Client,
+    health: &serde_json::Value,
+    bearer: ConnectionBearer,
+    without_bearer: impl FnOnce() -> reqwest::Result<reqwest::Client>,
+) -> Result<DeviceClient, ConnectError> {
+    use crate::mcp::sdk_http::SdkHttpClient;
+    use crate::mcp::transport::pairing;
+
+    let Some(gate) = pairing::DeviceGate::from_health(health) else {
+        return Ok(DeviceClient::Plain(SdkHttpClient::unsigned(client)));
+    };
+    let bearer_dropped = bearer == ConnectionBearer::Sent;
+    let client = if bearer_dropped {
+        info!("SDK relay client: {url} answered as a phone; dropping the operator's bearer");
+        without_bearer().map_err(|e| ConnectError {
+            message: format!("Failed to create HTTP client: {e}"),
+            auth_path: AUTH_PATH_WITHHELD_FROM_DEVICE.to_string(),
+        })?
+    } else {
+        client
+    };
+    if !gate.required {
+        if let (true, Some(device_id)) = (gate.admits_as_local(), gate.device_id.clone()) {
+            pairing::spawn_token_fetch(url.to_string(), device_id, false);
+        }
+        return Ok(DeviceClient::Unsigned {
+            client: SdkHttpClient::unsigned(client),
+            bearer_dropped,
+        });
+    }
+    let Some(device_id) = gate.device_id else {
+        return Err(ConnectError {
+            message: format!(
+                "{url} requires pairing but its health answer names no deviceId, so there is \
+                 no token to sign with"
+            ),
+            auth_path: AUTH_PATH_PAIRING_REQUIRED.to_string(),
+        });
+    };
+    let store = pairing::device_tokens();
+    if !store.has_token(&device_id) {
+        return Err(ConnectError {
+            message: pairing::pairing_required_message(Some(&device_id)),
+            auth_path: AUTH_PATH_PAIRING_REQUIRED.to_string(),
+        });
+    }
+    info!("SDK relay client: signing every request to {url} for paired device {device_id}");
+    let signer = Arc::new(pairing::DeviceSigner::new(
+        device_id,
+        store,
+        gate.server_time_ms,
+    ));
+    Ok(DeviceClient::Signed(SdkHttpClient::signed(client, signer)))
 }
 
 /// Push element reliability data to a connected SDK app for CTR confidence seeding.
@@ -1268,21 +1847,7 @@ async fn handle_disconnect(
 async fn handle_status(State(state): State<Arc<ApiState>>) -> Json<ApiResponse<SdkStatusResponse>> {
     let manager = state.sdk_connection.lock().await;
 
-    let all_connections: Vec<ConnectionInfo> = manager
-        .connections
-        .iter()
-        .map(|(url, conn)| ConnectionInfo {
-            url: url.clone(),
-            app: conn.app_info.clone(),
-            connected_at: conn.connected_at,
-            is_active: manager.active_url.as_deref() == Some(url.as_str()),
-            verified_origin: conn.activated_by.as_ref().and_then(|p| p.verified_origin()),
-            principal_class: conn
-                .activated_by
-                .as_ref()
-                .map_or("operator_trust", |p| p.class_str()),
-        })
-        .collect();
+    let all_connections = connection_infos(&manager);
 
     // Check health via the SDK app's /health endpoint (quick, non-blocking)
     let healthy = if let Some(conn) = manager.active_connection() {
@@ -1521,7 +2086,16 @@ async fn handle_elements(
     } else {
         "/control/elements".to_string()
     };
-    match sdk_request(&state, Method::GET, &path, None).await {
+    match state
+        .app_dispatcher
+        .dispatch_active_http(
+            &state.sdk_connection,
+            Method::GET,
+            &path,
+            serde_json::Value::Null,
+        )
+        .await
+    {
         Ok(mut data) => {
             // Normalize: if data.data is an object with an "elements" array, flatten it
             // so the response is { "success": true, "data": [...elements...] }.
@@ -1580,7 +2154,12 @@ async fn handle_elements(
 
             (StatusCode::OK, Json(data))
         }
-        Err(_sdk_err) => {
+        Err(sdk_err) => {
+            // An app WAS the target and failed, a phone refusing an unpaired runner
+            // among them: say so. The runner's own elements are not that app's.
+            if let Some(refusal) = ipc_fallback_refusal(&sdk_err, "elements") {
+                return (StatusCode::BAD_GATEWAY, Json(refusal));
+            }
             // No SDK app connected — fall back to the runner's own UI via IPC
             debug!("SDK elements unavailable, falling back to IPC control endpoint");
             match ui_bridge_request_sync(&state, "get_elements", serde_json::json!({})).await {
@@ -1627,7 +2206,7 @@ async fn handle_element(
     let id = id.trim().to_string();
     // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
     let path = format!("/control/element/{}", id);
-    match dispatch_app_request(
+    match dispatch_app_request_typed(
         &state,
         "getElement",
         serde_json::json!({ "id": id }),
@@ -1638,7 +2217,12 @@ async fn handle_element(
     .await
     {
         Ok(data) => Json(data),
-        Err(_) => {
+        Err(sdk_err) => {
+            // An app WAS the target and failed, a phone refusing an unpaired runner
+            // among them: say so. The runner's own UI is not that app's.
+            if let Some(refusal) = ipc_fallback_refusal(&sdk_err, "element") {
+                return Json(refusal);
+            }
             // Fall back to IPC
             match ui_bridge_request_sync(
                 &state,
@@ -2165,7 +2749,7 @@ async fn handle_snapshot(
     }
 
     let active_app = active_app_identity(&state).await;
-    match dispatch_app_request(
+    match dispatch_app_request_typed(
         &state,
         "getControlSnapshot",
         ws_payload,
@@ -2182,7 +2766,12 @@ async fn handle_snapshot(
             }
             (StatusCode::OK, Json(data)).into_response()
         }
-        Err(_sdk_err) => {
+        Err(sdk_err) => {
+            // An app WAS the target and failed, a phone refusing an unpaired runner
+            // among them: say so. The runner's own UI is not that app's snapshot.
+            if let Some(refusal) = ipc_fallback_refusal(&sdk_err, "snapshot") {
+                return (StatusCode::BAD_GATEWAY, Json(refusal)).into_response();
+            }
             // No SDK app connected — fall back to the runner's own UI via control endpoint
             debug!("SDK snapshot unavailable, falling back to control endpoint");
             match ui_bridge_request_sync(&state, "get_snapshot", serde_json::json!({})).await {
@@ -2216,7 +2805,7 @@ async fn handle_discover(
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
     // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
-    match dispatch_app_request(
+    match dispatch_app_request_typed(
         &state,
         "find",
         body.clone(),
@@ -2227,7 +2816,12 @@ async fn handle_discover(
     .await
     {
         Ok(data) => Json(data),
-        Err(_) => {
+        Err(sdk_err) => {
+            // An app WAS the target and failed, a phone refusing an unpaired runner
+            // among them: say so. The runner's own UI is not that app's.
+            if let Some(refusal) = ipc_fallback_refusal(&sdk_err, "discover") {
+                return Json(refusal);
+            }
             // Fall back to IPC — get all elements and return as discovery result
             match ui_bridge_request_sync(&state, "get_elements", serde_json::json!({})).await {
                 Ok(mut data) => {
@@ -2303,7 +2897,16 @@ async fn handle_components(
     } else {
         "/control/components".to_string()
     };
-    match sdk_request(&state, Method::GET, &path, None).await {
+    match state
+        .app_dispatcher
+        .dispatch_active_http(
+            &state.sdk_connection,
+            Method::GET,
+            &path,
+            serde_json::Value::Null,
+        )
+        .await
+    {
         Ok(data) => {
             // The SDK app now returns Direction B shape:
             // `{success: true, data: {components: [...]}}`. Older callers may
@@ -2344,7 +2947,12 @@ async fn handle_components(
             }
             Json(response)
         }
-        Err(_) => {
+        Err(sdk_err) => {
+            // An app WAS the target and failed, a phone refusing an unpaired runner
+            // among them: say so. The runner's own UI is not that app's.
+            if let Some(refusal) = ipc_fallback_refusal(&sdk_err, "components") {
+                return Json(refusal);
+            }
             // Fall back to IPC. The frontend `get_components` handler returns
             // `{components: [...], count: N}` (object) rather than a bare
             // array — unwrap so we don't double-nest as `data.components.components`.
@@ -2427,7 +3035,7 @@ async fn handle_console_errors(
     if !params.is_empty() {
         path = format!("{}?{}", path, params.join("&"));
     }
-    match dispatch_app_request(
+    match dispatch_app_request_typed(
         &state,
         "getConsoleErrors",
         query.clone(),
@@ -2438,7 +3046,12 @@ async fn handle_console_errors(
     .await
     {
         Ok(data) => Json(data),
-        Err(_) => {
+        Err(sdk_err) => {
+            // An app WAS the target and failed, a phone refusing an unpaired runner
+            // among them: say so. The runner's own UI is not that app's.
+            if let Some(refusal) = ipc_fallback_refusal(&sdk_err, "console-errors") {
+                return Json(refusal);
+            }
             // Fall back to IPC
             match ui_bridge_request_sync(&state, "get_console_errors", serde_json::json!({})).await
             {
@@ -2672,7 +3285,7 @@ async fn handle_clipboard_write(
 /// GET /ui-bridge/sdk/forms — Form state awareness
 async fn handle_forms(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
     // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
-    match dispatch_app_request(
+    match dispatch_app_request_typed(
         &state,
         "getForms",
         serde_json::json!({}),
@@ -2683,7 +3296,12 @@ async fn handle_forms(State(state): State<Arc<ApiState>>) -> Json<serde_json::Va
     .await
     {
         Ok(data) => Json(data),
-        Err(_) => {
+        Err(sdk_err) => {
+            // An app WAS the target and failed, a phone refusing an unpaired runner
+            // among them: say so. The runner's own UI is not that app's.
+            if let Some(refusal) = ipc_fallback_refusal(&sdk_err, "forms") {
+                return Json(refusal);
+            }
             // Fall back to IPC
             match ui_bridge_request_sync(&state, "get_forms", serde_json::json!({})).await {
                 Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
@@ -2825,7 +3443,7 @@ async fn handle_network_requests(
     if !params.is_empty() {
         path = format!("{}?{}", path, params.join("&"));
     }
-    match dispatch_app_request(
+    match dispatch_app_request_typed(
         &state,
         "getNetworkRequests",
         ws_payload,
@@ -2836,7 +3454,12 @@ async fn handle_network_requests(
     .await
     {
         Ok(data) => Json(data),
-        Err(_) => {
+        Err(sdk_err) => {
+            // An app WAS the target and failed, a phone refusing an unpaired runner
+            // among them: say so. The runner's own UI is not that app's.
+            if let Some(refusal) = ipc_fallback_refusal(&sdk_err, "network-requests") {
+                return Json(refusal);
+            }
             // Fall back to IPC
             match ui_bridge_request_sync(&state, "get_network_requests", serde_json::json!({}))
                 .await
@@ -3789,26 +4412,25 @@ pub(crate) async fn handle_switch(
     Json(req): Json<SwitchRequest>,
 ) -> Json<ApiResponse<ConnectResponse>> {
     let url = req.url.trim_end_matches('/').to_string();
+    let forward_list_known = refresh_forward_list_for(&url).await;
     let mut manager = state.sdk_connection.lock().await;
 
-    if let Some(conn) = manager.connections.get(&url) {
-        let response = ConnectResponse {
-            app: conn.app_info.clone(),
-            url: conn.app_url.clone(),
-            base_path: conn.base_path.clone(),
-            // Switching to an already-established connection — no handshake,
-            // so the bearer choice was not re-evaluated. `"none"` would
-            // falsely read as "unauthenticated".
-            auth_path: AUTH_PATH_REUSED.to_string(),
-        };
-        manager.active_url = Some(url.clone());
-        manager.active_responsive = None;
-        manager.active_responsive_checked_at = 0;
+    let stale = manager
+        .connections
+        .get(&url)
+        .is_some_and(|conn| conn.bearer_decision_is_stale(forward_list_known));
+    if let Some(response) = manager.reuse_stored_connection(&url, forward_list_known) {
         info!(
             "Switched active SDK connection to: {} ({})",
             response.app.app_name, url
         );
         Json(ApiResponse::success(response))
+    } else if stale {
+        Json(ApiResponse::error(format!(
+            "The stored connection to {url} was not reused: the bearer decision made at its \
+             handshake no longer holds, or the adb forward list cannot be read to confirm it. \
+             Connect to it again with POST /ui-bridge/sdk/connect."
+        )))
     } else {
         let available: Vec<&String> = manager.connections.keys().collect();
         Json(ApiResponse::error(format!(
@@ -3823,24 +4445,7 @@ pub(crate) async fn handle_connections(
     State(state): State<crate::mcp::relay_binding::RelayState>,
 ) -> Json<ApiResponse<Vec<ConnectionInfo>>> {
     let manager = state.sdk_connection.lock().await;
-
-    let connections: Vec<ConnectionInfo> = manager
-        .connections
-        .iter()
-        .map(|(url, conn)| ConnectionInfo {
-            url: url.clone(),
-            app: conn.app_info.clone(),
-            connected_at: conn.connected_at,
-            is_active: manager.active_url.as_deref() == Some(url.as_str()),
-            verified_origin: conn.activated_by.as_ref().and_then(|p| p.verified_origin()),
-            principal_class: conn
-                .activated_by
-                .as_ref()
-                .map_or("operator_trust", |p| p.class_str()),
-        })
-        .collect();
-
-    Json(ApiResponse::success(connections))
+    Json(ApiResponse::success(connection_infos(&manager)))
 }
 
 /// GET /ui-bridge/sdk/check-health — Check health of all connections, remove stale ones
@@ -3889,14 +4494,16 @@ async fn handle_check_health(State(state): State<Arc<ApiState>>) -> Json<serde_j
         }
     }
 
-    let active_healthy =
-        manager.active_url.is_some() && !stale_urls.contains(manager.active_url.as_ref().unwrap());
+    // A stale active connection was unset above. What is left is reported only if a
+    // dispatch would use it.
+    let active_url = manager.active_url_in_use().map(str::to_owned);
+    let active_healthy = active_url.is_some();
 
     Json(serde_json::json!({
         "success": true,
         "data": {
             "activeHealthy": active_healthy,
-            "activeUrl": manager.active_url,
+            "activeUrl": active_url,
             "results": results,
             "staleRemoved": stale_urls,
             "totalConnections": manager.connections.len(),
@@ -5183,7 +5790,7 @@ async fn handle_ct_get_change_buffer_size(
 /// GET /ui-bridge/sdk/undo-state — Get undo/redo state
 async fn handle_undo_state(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
     // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
-    match dispatch_app_request(
+    match dispatch_app_request_typed(
         &state,
         "getUndoState",
         serde_json::json!({}),
@@ -5194,7 +5801,12 @@ async fn handle_undo_state(State(state): State<Arc<ApiState>>) -> Json<serde_jso
     .await
     {
         Ok(data) => Json(data),
-        Err(_) => {
+        Err(sdk_err) => {
+            // An app WAS the target and failed, a phone refusing an unpaired runner
+            // among them: say so. The runner's own UI is not that app's.
+            if let Some(refusal) = ipc_fallback_refusal(&sdk_err, "undo-state") {
+                return Json(refusal);
+            }
             // Fall back to IPC
             match ui_bridge_request_sync(&state, "get_undo_state", serde_json::json!({})).await {
                 Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
@@ -5363,7 +5975,7 @@ async fn handle_element_state(
     let id = id.trim().to_string();
     // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
     let path = format!("/control/element/{}/state", id);
-    match dispatch_app_request(
+    match dispatch_app_request_typed(
         &state,
         "getElementReactState",
         serde_json::json!({ "id": id }),
@@ -5374,7 +5986,12 @@ async fn handle_element_state(
     .await
     {
         Ok(data) => Json(data),
-        Err(_) => {
+        Err(sdk_err) => {
+            // An app WAS the target and failed, a phone refusing an unpaired runner
+            // among them: say so. The runner's own UI is not that app's.
+            if let Some(refusal) = ipc_fallback_refusal(&sdk_err, "element state") {
+                return Json(refusal);
+            }
             // Fall back to IPC — get element details which include state
             match ui_bridge_request_sync(
                 &state,
@@ -7645,6 +8262,15 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .layer(axum::middleware::from_fn(
             crate::condition_secrets::scrub_sdk_responses,
         ))
+        // Every route here but the element action sends its body verbatim to
+        // the app and never substitutes, so while a condition-check session
+        // holds a secret a `{{secret:<ref>}}` placeholder in its request is
+        // refused before the handler runs rather than typed into the app as
+        // literal text (`crate::condition_secrets`). The element action
+        // passes through: its handler substitutes. LAST, like the scrub.
+        .layer(axum::middleware::from_fn(
+            crate::condition_secrets::refuse_unsubstituted_placeholders,
+        ))
 }
 
 // =============================================================================
@@ -8003,7 +8629,7 @@ async fn handle_find_by_text(
 /// GET /ui-bridge/sdk/diagnostics — SDK diagnostic information
 async fn handle_diagnostics(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
     // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
-    match dispatch_app_request(
+    match dispatch_app_request_typed(
         &state,
         "getDiagnostics",
         serde_json::json!({}),
@@ -8014,7 +8640,12 @@ async fn handle_diagnostics(State(state): State<Arc<ApiState>>) -> Json<serde_js
     .await
     {
         Ok(data) => Json(data),
-        Err(_) => {
+        Err(sdk_err) => {
+            // An app WAS the target and failed, a phone refusing an unpaired runner
+            // among them: say so. The runner's own UI is not that app's.
+            if let Some(refusal) = ipc_fallback_refusal(&sdk_err, "diagnostics") {
+                return Json(refusal);
+            }
             match ui_bridge_request_sync(&state, "get_diagnostics", serde_json::json!({})).await {
                 Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
                 Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
@@ -8026,7 +8657,7 @@ async fn handle_diagnostics(State(state): State<Arc<ApiState>>) -> Json<serde_js
 /// GET /ui-bridge/sdk/page/routes — List available routes
 async fn handle_page_routes(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
     // Phase 1 wrapper framework: WS-transport apps dispatch over their socket.
-    match dispatch_app_request(
+    match dispatch_app_request_typed(
         &state,
         "getRoutes",
         serde_json::json!({}),
@@ -8037,10 +8668,15 @@ async fn handle_page_routes(State(state): State<Arc<ApiState>>) -> Json<serde_js
     .await
     {
         Ok(data) => Json(data),
-        Err(_) => match ui_bridge_request_sync(&state, "get_routes", serde_json::json!({})).await {
-            Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
-            Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
-        },
+        Err(sdk_err) => {
+            if let Some(refusal) = ipc_fallback_refusal(&sdk_err, "page routes") {
+                return Json(refusal);
+            }
+            match ui_bridge_request_sync(&state, "get_routes", serde_json::json!({})).await {
+                Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
+                Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+            }
+        }
     }
 }
 
@@ -8750,6 +9386,16 @@ mod tests {
             "handle_ai_find",
             "handle_ai_snapshot",
             "handle_ai_summary",
+            "handle_snapshot",
+            "handle_element",
+            "handle_discover",
+            "handle_console_errors",
+            "handle_forms",
+            "handle_network_requests",
+            "handle_undo_state",
+            "handle_element_state",
+            "handle_diagnostics",
+            "handle_page_routes",
         ] {
             // A handler the journey ledger wraps keeps its original body in
             // `<handler>_dispatch`; the wrapper itself only records.
@@ -8790,35 +9436,15 @@ mod tests {
         }
     }
 
-    /// Read-only handlers that KNOWINGLY keep the ungated IPC fallback: they
-    /// only read (elements, snapshot, forms, routes, …), so a fallback cannot
-    /// re-execute an action on the wrong UI. It can still answer with the
-    /// runner's own data as if it were the app's, which is why the four
-    /// `/ai/*` reads were gated and left this list; gating the rest is a
-    /// separate follow-up. A handler that ACTS must never be added here; it
-    /// must ask `ipc_fallback_refusal`.
-    const UNGATED_READ_ONLY_FALLBACKS: [&str; 12] = [
-        "handle_elements",
-        "handle_element",
-        "handle_snapshot",
-        "handle_discover",
-        "handle_components",
-        "handle_console_errors",
-        "handle_forms",
-        "handle_network_requests",
-        "handle_undo_state",
-        "handle_element_state",
-        "handle_diagnostics",
-        "handle_page_routes",
-    ];
-
     /// Every production `async fn` that both dispatches to the app and falls
     /// back to the runner must ask `ipc_fallback_refusal` — whatever helper it
-    /// might otherwise use to decide — unless it is on the read-only exemption
-    /// list above. Scans the whole file, so a NEW action handler with an
-    /// ungated (or live-state-gated) fallback fails here without being listed.
+    /// might otherwise use to decide. Reads are no exception: a fallback after the
+    /// app failed answers with the runner's own UI as if it were the app's, and a
+    /// phone that refuses an unpaired runner must not read as the runner itself.
+    /// Scans the whole file, so a NEW handler with an ungated (or live-state-gated)
+    /// fallback fails here without being listed.
     #[test]
-    fn every_dispatching_fallback_is_gated_or_an_exempt_read() {
+    fn every_dispatching_fallback_is_gated() {
         let src = include_str!("sdk_client.rs");
         let production = src
             .split("\n#[cfg(test)]\nmod tests {")
@@ -8828,7 +9454,6 @@ mod tests {
         let production = production
             .replace("\npub(crate) async fn ", "\nasync fn ")
             .replace("\npub async fn ", "\nasync fn ");
-        let mut exempt_seen = Vec::new();
         for chunk in production.split("\nasync fn ").skip(1) {
             let name = chunk.split('(').next().unwrap_or_default();
             let dispatches = [
@@ -8848,25 +9473,10 @@ mod tests {
             if !(dispatches && falls_back) {
                 continue;
             }
-            let gated = chunk.contains("ipc_fallback_refusal(");
-            if UNGATED_READ_ONLY_FALLBACKS.contains(&name) {
-                assert!(
-                    !gated,
-                    "{name} is gated now — remove it from UNGATED_READ_ONLY_FALLBACKS"
-                );
-                exempt_seen.push(name);
-            } else {
-                assert!(
-                    gated,
-                    "{name} dispatches to the app and falls back to the runner's UI \
-                     without asking ipc_fallback_refusal"
-                );
-            }
-        }
-        for name in UNGATED_READ_ONLY_FALLBACKS {
             assert!(
-                exempt_seen.contains(&name),
-                "stale exemption: {name} no longer dispatches with a fallback"
+                chunk.contains("ipc_fallback_refusal("),
+                "{name} dispatches to the app and falls back to the runner's UI \
+                 without asking ipc_fallback_refusal"
             );
         }
     }
@@ -9210,6 +9820,218 @@ mod connect_bearer_scope_tests {
         }
     }
 
+    /// A loopback port marked as a forwarder is classified as one under every
+    /// loopback spelling, without reading settings. An unmarked port stays a
+    /// loopback relay. The port is held bound so no peer test can be handed it.
+    #[test]
+    fn a_marked_loopback_port_is_an_off_machine_forwarder_under_every_spelling() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a port to mark");
+        let port = held.local_addr().expect("local addr").port();
+        let unmarked_held = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let unmarked = unmarked_held.local_addr().expect("local addr").port();
+        crate::mcp::transport::mark_off_machine_forwarder(port);
+        let _forget = crate::mcp::transport::ForgetForwarder(port);
+
+        let no_settings = || -> Vec<url::Origin> {
+            panic!("a loopback target must not consult the configured origins")
+        };
+        for host in ["127.0.0.1", "localhost", "[::1]", "127.9.9.9"] {
+            let url = format!("http://{host}:{port}");
+            assert_eq!(
+                classify_bearer_target(&url, no_settings),
+                BearerTarget::OffMachineForwarder,
+                "{url}"
+            );
+        }
+        assert_eq!(
+            classify_bearer_target(&format!("http://127.0.0.1:{unmarked}"), no_settings),
+            BearerTarget::Loopback
+        );
+    }
+
+    /// Store a connection to a fresh recorder and make it active.
+    async fn stored_connection(
+        bearer: Option<(String, &'static str)>,
+    ) -> (u16, String, SdkConnectionManager) {
+        stored_connection_choosing(BearerChoice {
+            bearer,
+            auth_path: AUTH_PATH_COGNITO,
+        })
+        .await
+    }
+
+    /// [`stored_connection`] with the whole bearer decision given.
+    async fn stored_connection_choosing(
+        choice: BearerChoice,
+    ) -> (u16, String, SdkConnectionManager) {
+        let (port, _seen) = spawn_recorder().await;
+        let url = format!("http://127.0.0.1:{port}");
+        let manager = tokio::sync::Mutex::new(SdkConnectionManager::new());
+        connect_sdk_app_with(&manager, &url, ConnectHints::default(), choice, || {
+            connect_client_builder(BearerTarget::Loopback)
+        })
+        .await
+        .expect("connect to the recorder");
+        (port, url, manager.into_inner())
+    }
+
+    /// A client holding the bearer is used by nothing once a forwarder holds its
+    /// port: not as the active connection, and not by a reuse.
+    #[tokio::test]
+    async fn a_stored_bearer_client_is_not_used_once_its_port_is_a_forwarder() {
+        let bearer = Some(("test-operator-token".to_string(), "test"));
+        let (port, url, mut manager) = stored_connection(bearer).await;
+        assert!(manager.active_connection().is_some(), "a live local relay");
+        assert_eq!(
+            manager
+                .reuse_stored_connection(&url, true)
+                .map(|r| r.auth_path),
+            Some(AUTH_PATH_REUSED.to_string())
+        );
+
+        crate::mcp::transport::mark_off_machine_forwarder(port);
+        let _forget = crate::mcp::transport::ForgetForwarder(port);
+        assert!(manager.active_connection().is_none());
+        assert!(manager.reuse_stored_connection(&url, true).is_none());
+        assert!(!manager.connections.contains_key(&url));
+        assert_eq!(manager.active_url, None);
+    }
+
+    /// The listings' `is_active`, and `active_url_in_use` (which `check-health` and
+    /// GraphQL read), name a connection active only while a dispatch would use it. A stored bearer client
+    /// whose port turned into a forwarder is still `active_url` until the re-check
+    /// drops it. It is listed as inactive and as sending the bearer off this machine,
+    /// which is what tells it apart from an ordinary inactive bearer client.
+    #[tokio::test]
+    async fn a_listing_never_calls_active_a_connection_a_dispatch_refuses() {
+        let bearer = Some(("test-operator-token".to_string(), "test"));
+        let (port, url, manager) = stored_connection(bearer).await;
+        let listed = |manager: &SdkConnectionManager| {
+            let infos = connection_infos(manager);
+            assert_eq!(infos.len(), 1);
+            let json = serde_json::to_value(&infos[0]).expect("serialize");
+            (
+                json["isActive"].clone(),
+                json["bearer"].clone(),
+                json["sendsBearerOffMachine"].clone(),
+            )
+        };
+        assert_eq!(
+            listed(&manager),
+            (
+                serde_json::json!(true),
+                serde_json::json!("sent"),
+                serde_json::json!(false)
+            )
+        );
+        assert!(manager.is_active(&url));
+        assert_eq!(manager.active_url_in_use(), Some(url.as_str()));
+
+        crate::mcp::transport::mark_off_machine_forwarder(port);
+        let _forget = crate::mcp::transport::ForgetForwarder(port);
+        assert_eq!(manager.active_url.as_deref(), Some(url.as_str()));
+        assert!(manager.active_connection().is_none());
+        assert_eq!(
+            listed(&manager),
+            (
+                serde_json::json!(false),
+                serde_json::json!("sent"),
+                serde_json::json!(true)
+            )
+        );
+        assert!(!manager.is_active(&url));
+        assert_eq!(manager.active_url_in_use(), None);
+    }
+
+    /// Each bearer decision is listed under the name the connection routes document.
+    #[test]
+    fn a_bearer_decision_is_listed_in_snake_case() {
+        for (bearer, name) in [
+            (ConnectionBearer::Sent, "sent"),
+            (ConnectionBearer::WithheldFromTarget, "withheld_from_target"),
+            (
+                ConnectionBearer::WithheldListUnreadable,
+                "withheld_list_unreadable",
+            ),
+            (ConnectionBearer::Absent, "absent"),
+        ] {
+            assert_eq!(serde_json::to_value(bearer).expect("serialize"), name);
+        }
+    }
+
+    /// A device's own connection never held the bearer, so it stays in use.
+    #[tokio::test]
+    async fn a_bearerless_client_stays_usable_on_a_forwarder() {
+        let (port, url, mut manager) = stored_connection(None).await;
+        crate::mcp::transport::mark_off_machine_forwarder(port);
+        let _forget = crate::mcp::transport::ForgetForwarder(port);
+        assert!(manager.active_connection().is_some());
+        assert!(manager.reuse_stored_connection(&url, true).is_some());
+    }
+
+    /// A connection that held the bearer back stays in use while the reason holds,
+    /// and is decided again once its port is a plain local relay, which would
+    /// otherwise answer it with 401s for good.
+    #[tokio::test]
+    async fn a_withheld_connection_is_decided_again_once_its_port_is_local() {
+        let (port, url, mut manager) = stored_connection_choosing(BearerChoice {
+            bearer: None,
+            auth_path: AUTH_PATH_WITHHELD_FOREIGN_HOST,
+        })
+        .await;
+        crate::mcp::transport::mark_off_machine_forwarder(port);
+        assert!(manager.reuse_stored_connection(&url, true).is_some());
+        assert!(manager.active_connection().is_some());
+
+        crate::mcp::transport::unmark_off_machine_forwarder(port);
+        assert!(manager.reuse_stored_connection(&url, true).is_none());
+        assert!(
+            manager.connections.contains_key(&url),
+            "until a new handshake"
+        );
+    }
+
+    /// The re-check's sweep drops a client that would send the bearer off this machine,
+    /// and leaves no active connection pointing at it. It leaves a bearerless one.
+    #[tokio::test]
+    async fn the_sweep_drops_only_a_bearer_client_whose_port_is_a_forwarder() {
+        let bearer = Some(("test-operator-token".to_string(), "test"));
+        let (port, url, mut manager) = stored_connection(bearer).await;
+
+        manager.drop_connections_sending_bearer_off_machine();
+        assert!(manager.connections.contains_key(&url), "a live local relay");
+
+        crate::mcp::transport::mark_off_machine_forwarder(port);
+        let _forget = crate::mcp::transport::ForgetForwarder(port);
+        manager.drop_connections_sending_bearer_off_machine();
+        assert!(!manager.connections.contains_key(&url));
+        assert_eq!(manager.active_url, None);
+
+        let (other_port, other_url, mut other) = stored_connection(None).await;
+        crate::mcp::transport::mark_off_machine_forwarder(other_port);
+        let _forget_other = crate::mcp::transport::ForgetForwarder(other_port);
+        other.drop_connections_sending_bearer_off_machine();
+        assert!(other.connections.contains_key(&other_url));
+    }
+
+    /// An unreadable forward list makes any loopback port a possible forward to a
+    /// phone: a reuse refuses a client holding the bearer but keeps it as the target,
+    /// and does not count the list against a client holding none.
+    #[tokio::test]
+    async fn an_unknown_forward_list_refuses_only_a_client_sending_the_bearer() {
+        let bearer = Some(("test-operator-token".to_string(), "test"));
+        let (_, url, mut manager) = stored_connection(bearer).await;
+        assert!(manager.reuse_stored_connection(&url, false).is_none());
+        assert!(manager.active_connection().is_some(), "still the target");
+
+        let (_, url, mut manager) = stored_connection_choosing(BearerChoice {
+            bearer: None,
+            auth_path: AUTH_PATH_WITHHELD_FORWARD_LIST,
+        })
+        .await;
+        assert!(manager.reuse_stored_connection(&url, false).is_some());
+    }
+
     /// No configured origin admits nothing but loopback.
     #[test]
     fn with_no_configured_origin_every_remote_host_is_foreign() {
@@ -9299,6 +10121,21 @@ mod connect_bearer_scope_tests {
             .collect()
     }
 
+    /// A connect that sends the operator's bearer first asks the target's open
+    /// `/ui-bridge/health` with none (`phone_health_without_bearer`), so a phone
+    /// found there never gets it. Checks that request carried nothing, and returns
+    /// the requests after it, which carry the connect's decision.
+    fn after_the_bare_health_probe<'a>(
+        probes: &'a [Option<String>],
+        context: &str,
+    ) -> &'a [Option<String>] {
+        assert!(
+            matches!(probes.first(), Some(None)),
+            "{context}: the first request was not the bare health probe: {probes:?}"
+        );
+        &probes[1..]
+    }
+
     /// Over the wire: a connect to a foreign host sends NO `Authorization`
     /// header — on the `/health` probe and on every later call through the
     /// stored client — answers `withheld_foreign_host`, and never loads the
@@ -9352,8 +10189,10 @@ mod connect_bearer_scope_tests {
             // The loopback relay is dialled with the PRODUCTION builder. The
             // two test host names need a builder that resolves them to the
             // local recorder, so no real host is ever contacted.
-            let builder = match target {
-                BearerTarget::Loopback => connect_client_builder(target),
+            let builder = move || match target {
+                BearerTarget::Loopback | BearerTarget::OffMachineForwarder => {
+                    connect_client_builder(target)
+                }
                 BearerTarget::QontinuiOrigin | BearerTarget::Foreign => reqwest::Client::builder()
                     .no_proxy()
                     .resolve("qontinui-web.test", local)
@@ -9372,12 +10211,19 @@ mod connect_bearer_scope_tests {
                 "{url}: the credential is loaded only for an admitted origin"
             );
             let probes = requests_to(&seen, &host);
+            // Only the loopback relay is asked its health bare first; the
+            // configured origin gets the bearer on every request, as before.
+            let decided = if url == &loopback {
+                after_the_bare_health_probe(&probes, url)
+            } else {
+                &probes[..]
+            };
             assert!(
-                !probes.is_empty(),
+                !decided.is_empty(),
                 "{url}: the recorder never saw the probe"
             );
             assert!(
-                probes.iter().all(|auth| auth.as_deref() == want_auth),
+                decided.iter().all(|auth| auth.as_deref() == want_auth),
                 "{url}: Authorization on the probe: {probes:?}"
             );
 
@@ -9415,9 +10261,11 @@ mod connect_bearer_scope_tests {
             }
         })
         .await;
-        let builder = reqwest::Client::builder()
-            .no_proxy()
-            .resolve("foreign.example", local);
+        let builder = move || {
+            reqwest::Client::builder()
+                .no_proxy()
+                .resolve("foreign.example", local)
+        };
         connect_sdk_app_with(
             &manager,
             &loopback,
@@ -9584,10 +10432,12 @@ mod connect_bearer_scope_tests {
         // Test-only: trust the throwaway certificate and resolve the test
         // host to the fixture. The redirect policy is the production one,
         // installed by `connect_sdk_app_with` with the bearer.
-        let builder = reqwest::Client::builder()
-            .no_proxy()
-            .danger_accept_invalid_certs(true)
-            .resolve(HOST, SocketAddr::from(([127, 0, 0, 1], port)));
+        let builder = move || {
+            reqwest::Client::builder()
+                .no_proxy()
+                .danger_accept_invalid_certs(true)
+                .resolve(HOST, SocketAddr::from(([127, 0, 0, 1], port)))
+        };
         let manager = tokio::sync::Mutex::new(SdkConnectionManager::new());
         let _ =
             connect_sdk_app_with(&manager, &url, ConnectHints::default(), choice, builder).await;
@@ -9796,11 +10646,12 @@ mod text_visibility_dispatch_tests {
                     capabilities: vec![],
                     port: 0,
                 },
-                client: reqwest::Client::new(),
+                client: crate::mcp::sdk_http::SdkHttpClient::unsigned(reqwest::Client::new()),
                 connected_at: 0,
                 transport_kind: None,
                 physical_device_id: None,
                 activated_by: None,
+                bearer: super::ConnectionBearer::Absent,
             },
         );
         mgr.active_url = Some(url.to_string());
@@ -10448,11 +11299,12 @@ mod condition_secrets_dispatch_tests {
                 capabilities: vec![],
                 port: 0,
             },
-            client: reqwest::Client::new(),
+            client: crate::mcp::sdk_http::SdkHttpClient::unsigned(reqwest::Client::new()),
             connected_at: 0,
             transport_kind: None,
             physical_device_id: None,
             activated_by,
+            bearer: super::ConnectionBearer::Absent,
         }
     }
 

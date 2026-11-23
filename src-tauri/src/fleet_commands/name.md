@@ -98,15 +98,15 @@ python3 <absolute path to name-session.py> <pr-numbers> <descriptive words>
 ```
 
 It checks that the pane it would type into is this session's own, and checks
-the input prompt immediately before the send, typing nothing when it holds
-text. Never run it from a subagent: a subagent shares its parent's pane and
+the input prompt immediately before the send, replayed at the pane's width
+from its `/terminals` row, typing nothing when it holds text. Never run it from a subagent: a subagent shares its parent's pane and
 session id, so the check passes and the parent would be renamed. Read its first line and exit code:
 
 | Exit | Line | Meaning |
 |---|---|---|
 | 0 | `QUEUED: /rename <name>` | The runner typed it into this session's pane. Claude Code runs it when this turn ends. |
 | 2 | `NOT-IN-RUNNER` / `NOT-SET` | No runner pane (`$QONTINUI_TERMINAL_ID` unset), or the name is unusable. Nothing was sent. |
-| 3 | `UNKNOWN` | The runner could not be read, the pane could not be proven this session's own, or the submit was not confirmed. |
+| 3 | `UNKNOWN` | The runner could not be read, the pane could not be proven this session's own or is not in `/terminals` (so its width is unknown), or the submit was not confirmed. |
 | 4 | `HELD` | The input prompt holds text. Nothing was sent. |
 
 If the helper is not provisioned, or it exits non-zero, print the line for the

@@ -68,9 +68,7 @@ permissions:
 # interpolating only `github.event_name` / `github.ref` and collapsing every
 # other expression to "" (qontinui-coord ci_observer.rs resolve_group_template),
 # and run_is_reaper_at_risk never matches an empty group, so no push run here is
-# modelled as reapable by a land. (KNOWN coord gap: the budget-cancel candidate
-# scan in stuck_pr_watcher.rs compares groups with `=`, so every "" group
-# matches every other one and suppresses its auto re-run; fix belongs in coord.)
+# modelled as reapable by a land.
 # RESIDUAL: two pushes seconds apart can have
 # their runs CREATED out of order, so the older head's run cancels the newer
 # head's; the next push (or a close+reopen) heals it.
@@ -81,7 +79,8 @@ concurrency:
 
 jobs:
   detect:
-    runs-on: ${{ fromJSON(((vars.RUNNER_CI_LANE_SCHEMA_PG_SQL_FRESH || vars.RUNNER_CI_LIGHT_LANE) == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && '["self-hosted","Linux","X64","qontinui-host-nawa","qontinui"]' || '"ubuntu-latest"') }}
+    # coord-pools: [self-hosted, Linux, X64, qontinui-host-nawa, qontinui, ram-2g] | [ubuntu-latest]
+    runs-on: ${{ fromJSON(((vars.RUNNER_CI_LANE_SCHEMA_PG_SQL_FRESH || vars.RUNNER_CI_LIGHT_LANE) == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && '["self-hosted","Linux","X64","qontinui-host-nawa","qontinui","ram-2g"]' || '"ubuntu-latest"') }}
     outputs:
       schema_changed: ${{ steps.changes.outputs.schema_changed }}
     steps:
@@ -267,40 +266,51 @@ jobs:
         timeout-minutes: 10
         run: bash atlas/scripts/apply_to.sh postgresql://qontinui_user:qontinui_dev_password@localhost:5433/qontinui_db
 
-      # Bounded against a job-time apt hang — see the rationale on the
-      # `Install dependencies (Ubuntu)` step in .github/workflows/ci.yml.
-      # Sizing: 8 successful runs, p50 6s, max 9s, newest 2026-08-08 — no
-      # sample inside the 08-18..08-20 mirror event. Same 10-minute bound as
-      # schema-pg-sql-freshness-nightly.yml's identical postgresql-client-16
-      # install; a 9-second download sample cannot size a bound that must also
-      # cover `apt-get update`.
-      #
-      # This one matters more: `schema-fresh` is a REQUIRED status check on
-      # main (ruleset 16044811), so a bound tight enough to fire on a merely
-      # congested mirror reds an innocent PR and keeps it out of the train.
-      - name: Install Postgres client (for pg_dump)
-        timeout-minutes: 10
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y postgresql-client-16
-
       - name: Stash checked-in artifact
         working-directory: qontinui-runner/src-tauri
         run: cp schema.pg.sql.generated /tmp/schema.checked-in.sql
 
-      - name: Regenerate (native pg_dump, no docker)
+      # pg_dump runs INSIDE the postgres service container (`docker exec`), so
+      # the client is the server's own binary: the same major AND minor by
+      # construction. A host client is not one version pin away from that.
+      # pg_dump refuses a server of a newer major, and even a minor skew
+      # changes the dump. A 16.16 server stamps a `pg_attver` attribute option
+      # on every table column it creates, which 16.16's pg_dump strips and
+      # 16.15's does not. Measured locally on 2026-11-16, by loading the
+      # checked-in dump into this image and dumping it both ways: Ubuntu
+      # 24.04's apt pg_dump 16.15 emitted 7202 extra (one per table column)
+      # `ALTER TABLE ONLY ... ALTER COLUMN ... SET (pg_attver=...)` lines that
+      # the server's own 16.16 pg_dump omits, which the diff below would read
+      # as drift.
+      #
+      # This replaced a host `apt-get install -y postgresql-client-16`. On an
+      # Ubuntu 26.04 runner image, which ubuntu-latest has been moving to and
+      # which ships only postgresql-client-18, that step fails with `E: Unable
+      # to locate package postgresql-client-16` (coord finding
+      # 8a344609-11e9-467b-bb95-04923f20a7d3).
+      # Running the server's own binary also removes the network-dependent apt
+      # step from this REQUIRED check (ruleset 16044811), and with it the
+      # mirror-hang exposure its 10-minute bound existed for.
+      #
+      # A non-empty CLORINDE_PG_CONTAINER selects the regen script's
+      # docker-exec mode, the same mode a contributor runs locally against
+      # qontinui-canonical-postgres. It connects over the container's local
+      # socket, so no host, port or password is passed. An empty id would
+      # silently fall back to whatever host pg_dump the image ships, so that is
+      # refused, not tolerated.
+      - name: Regenerate (pg_dump inside the postgres service container)
         working-directory: qontinui-runner
         env:
-          # Empty CLORINDE_PG_CONTAINER triggers the script's native
-          # pg_dump path (no docker-exec). Postgres client was installed
-          # in the previous step.
-          CLORINDE_PG_CONTAINER: ""
-          CLORINDE_PG_HOST: localhost
-          CLORINDE_PG_PORT: "5433"
-          PGPASSWORD: qontinui_dev_password
+          CLORINDE_PG_CONTAINER: ${{ job.services.postgres.id }}
           # Atlas was applied by the step above; do not apply it twice.
           REGEN_SKIP_ATLAS: "1"
-        run: bash src-tauri/scripts/regenerate_schema_pg_sql.sh
+        run: |
+          if [ -z "$CLORINDE_PG_CONTAINER" ]; then
+            echo "::error::job.services.postgres.id is empty; refusing to fall back to a host pg_dump of unknown version."
+            exit 1
+          fi
+          docker exec "$CLORINDE_PG_CONTAINER" pg_dump --version
+          bash src-tauri/scripts/regenerate_schema_pg_sql.sh
 
       - name: Diff against checked-in
         id: diff_check
@@ -309,10 +319,10 @@ jobs:
           # Strip the `-- Dumped by pg_dump version ...` header comment
           # before comparison. That line records the OS vendor string of
           # whichever pg_dump produced the file (e.g. "Debian 16.13-1..."
-          # vs "Ubuntu 16.13-1..."), which differs between a contributor's
-          # local Docker setup and CI's apt-installed client. It's pure
-          # environmental noise — not real schema drift — and ratchets
-          # the artifact between regen environments if not filtered.
+          # vs "Ubuntu 16.13-1..."), which differs between regen
+          # environments (a container's Debian build, a distro's apt
+          # client). It's pure environmental noise — not real schema
+          # drift — and ratchets the artifact between them if not filtered.
           grep -v '^-- Dumped by pg_dump version' /tmp/schema.checked-in.sql > /tmp/schema.checked-in.normalized.sql
           grep -v '^-- Dumped by pg_dump version' schema.pg.sql.generated > /tmp/schema.generated.normalized.sql
           if ! diff -q /tmp/schema.checked-in.normalized.sql /tmp/schema.generated.normalized.sql; then
@@ -349,7 +359,8 @@ jobs:
   schema-fresh:
     needs: [detect, schema-fresh-verify]
     if: always()
-    runs-on: ${{ fromJSON(((vars.RUNNER_CI_LANE_SCHEMA_PG_SQL_FRESH || vars.RUNNER_CI_LIGHT_LANE) == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && '["self-hosted","Linux","X64","qontinui-host-nawa","qontinui"]' || '"ubuntu-latest"') }}
+    # coord-pools: [self-hosted, Linux, X64, qontinui-host-nawa, qontinui, ram-2g] | [ubuntu-latest]
+    runs-on: ${{ fromJSON(((vars.RUNNER_CI_LANE_SCHEMA_PG_SQL_FRESH || vars.RUNNER_CI_LIGHT_LANE) == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && '["self-hosted","Linux","X64","qontinui-host-nawa","qontinui","ram-2g"]' || '"ubuntu-latest"') }}
     steps:
       - name: Aggregate verification result
         shell: bash

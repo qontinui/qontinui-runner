@@ -579,8 +579,17 @@ pub(crate) fn provision_fleet_commands_into(
     registry: &AgentCommandRegistry,
 ) -> std::io::Result<ProvisionReport> {
     std::fs::create_dir_all(commands_dir)?;
-    let tracked = crate::provision_guard::TrackedPaths::probe(commands_dir);
     let resolved = registry.all();
+    // Versioned iff the repo tracks a BUILTIN command this binary would write,
+    // never merely "anything under .claude/commands" (provision_guard module
+    // doc). Builtins only: they are the roster the skip is confined to, and an
+    // account-only command is a path no commit of the repo will ever add.
+    let tracked = crate::provision_guard::TrackedPaths::probe(commands_dir).versioning(
+        resolved
+            .iter()
+            .filter(|c| registry.is_builtin(&c.name))
+            .map(|c| std::path::PathBuf::from(c.file_name())),
+    );
     // The BODIES are the embedded defaults unless an override replaced one; the
     // rung of the account layer itself is the separate `agent_commands_registry`
     // row, which `provision_fleet_commands_for_session` records.
@@ -591,6 +600,9 @@ pub(crate) fn provision_fleet_commands_into(
     )
     .with_destination(commands_dir.display().to_string());
     let mut edited = 0usize;
+    // What this pass actually wrote, relative to `commands_dir`, so exactly
+    // those paths (never a tracked one) are excluded from `git status` below.
+    let mut written: Vec<std::path::PathBuf> = Vec::new();
     for command in &resolved {
         let file_name = command.file_name();
         let dst = commands_dir.join(&file_name);
@@ -647,7 +659,17 @@ pub(crate) fn provision_fleet_commands_into(
             ),
         )?;
         out.record_written();
+        written.push(std::path::PathBuf::from(&file_name));
     }
+    // Keep what this pass wrote out of the checkout's `git status`, so a
+    // session cwd that is a git checkout does not read dirty (see
+    // `crate::provision_exclude`). Best-effort: never fails the pass.
+    crate::provision_exclude::exclude_written_paths(
+        "fleet_commands",
+        commands_dir,
+        &written,
+        &tracked,
+    );
     // Built after the loop rather than at construction so it can carry the
     // read-back count; a pass that clobbered nobody's edits reads as before.
     let mut detail = format!(
@@ -780,6 +802,161 @@ mod tests {
         assert_ne!(on_disk, default_body);
     }
 
+    /// A fresh checkout used as a session cwd must not read dirty after a
+    /// provisioning pass: every command written gets its own anchored line in
+    /// the repo's `info/exclude` (never a blanket `.claude/commands/`), and a
+    /// second pass leaves that file byte-identical.
+    #[test]
+    fn provisioned_commands_do_not_dirty_the_checkout() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let commands_dir = tmp.path().join(".claude").join("commands");
+        crate::provision_guard::test_support::git_init(tmp.path());
+
+        let registry = AgentCommandRegistry::new();
+        let out = provision_fleet_commands_into(&commands_dir, &registry).expect("provision");
+        assert_eq!(out.written, FLEET_COMMANDS.len());
+        let o = crate::process_helpers::no_window("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["status", "--porcelain", "--untracked-files=all"])
+            .output()
+            .expect("git status");
+        assert!(o.status.success());
+        assert_eq!(
+            String::from_utf8(o.stdout).unwrap(),
+            "",
+            "nothing reads untracked"
+        );
+
+        let exclude = tmp.path().join(".git").join("info").join("exclude");
+        let first = std::fs::read_to_string(&exclude).unwrap();
+        for (name, _) in FLEET_COMMANDS {
+            assert!(
+                first
+                    .lines()
+                    .any(|l| l == format!("/.claude/commands/{name}.md")),
+                "{name} has its own line"
+            );
+        }
+        assert!(!first.lines().any(|l| l.trim() == "/.claude/commands/"));
+        provision_fleet_commands_into(&commands_dir, &registry).expect("provision again");
+        assert_eq!(std::fs::read_to_string(&exclude).unwrap(), first);
+    }
+
+    /// A command excluded by one pass whose directory the repository then
+    /// starts versioning is HELD BACK (`RootVersioned`) by the next pass, and
+    /// that pass drops its stale exclude line — otherwise the line would hide a
+    /// file a person later creates at that path. A person's own line outside
+    /// the runner's marker block naming the same path is never touched.
+    #[test]
+    fn a_held_back_command_loses_its_exclude_line() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let commands_dir = tmp.path().join(".claude").join("commands");
+        crate::provision_guard::test_support::git_init(tmp.path());
+        let registry = AgentCommandRegistry::new();
+        provision_fleet_commands_into(&commands_dir, &registry).expect("first pass");
+
+        let (vendored, _) = FLEET_COMMANDS[0];
+        let (held, _) = FLEET_COMMANDS[1];
+        let held_line = format!("/.claude/commands/{held}.md");
+        let exclude = tmp.path().join(".git").join("info").join("exclude");
+        let first = std::fs::read_to_string(&exclude).unwrap();
+        assert!(first.lines().any(|l| l == held_line), "{first}");
+        // A person's own line naming the same path, ABOVE the runner's block.
+        std::fs::write(&exclude, format!("# mine\n{held_line}\n{first}")).unwrap();
+
+        // The repository starts versioning the commands dir: it stages one
+        // builtin, and `held` is not on disk (upstream has not delivered it).
+        let git = |args: &[&str]| {
+            let ok = crate::process_helpers::no_window("git")
+                .arg("-C")
+                .arg(tmp.path())
+                .args(args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("run git")
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["add", "-f", &format!(".claude/commands/{vendored}.md")]);
+        std::fs::remove_file(commands_dir.join(format!("{held}.md"))).unwrap();
+
+        let out = provision_fleet_commands_into(&commands_dir, &registry).expect("second pass");
+        let held_skip = out
+            .skipped
+            .iter()
+            .find(|s| s.unit == format!("{held}.md"))
+            .expect("the absent builtin is held back");
+        assert_eq!(
+            held_skip.reason,
+            capability_manifest::SkipReason::RootVersioned
+        );
+
+        let text = std::fs::read_to_string(&exclude).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        let held_positions: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| **l == held_line)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            held_positions,
+            vec![1],
+            "only the person's line survives: {text}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|l| *l == format!("/.claude/commands/{vendored}.md")),
+            "the now-tracked command's line is dropped too: {text}"
+        );
+        // Every command the second pass still wrote keeps its line, so the
+        // prune is not a wipe, and nothing but the staged builtin shows.
+        for (name, _) in &FLEET_COMMANDS[2..] {
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| *l == format!("/.claude/commands/{name}.md")),
+                "{name} keeps its line: {text}"
+            );
+        }
+        let porcelain = |dir: &std::path::Path| {
+            let o = crate::process_helpers::no_window("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["status", "--porcelain", "--untracked-files=all"])
+                .output()
+                .expect("git status");
+            String::from_utf8(o.stdout).unwrap()
+        };
+        assert_eq!(
+            porcelain(tmp.path()),
+            format!("A  .claude/commands/{vendored}.md\n"),
+            "only the staged builtin shows"
+        );
+        // Remove the person's line: a file they now create at the held path
+        // is visible to `git status`, because no runner line hides it.
+        std::fs::write(
+            &exclude,
+            text.replacen(&format!("# mine\n{held_line}\n"), "", 1),
+        )
+        .unwrap();
+        std::fs::write(commands_dir.join(format!("{held}.md")), b"mine\n").unwrap();
+        let o = crate::process_helpers::no_window("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["status", "--porcelain", "--untracked-files=all"])
+            .output()
+            .expect("git status");
+        let status = String::from_utf8(o.stdout).unwrap();
+        assert!(
+            status.contains(&format!("?? .claude/commands/{held}.md")),
+            "{status}"
+        );
+    }
+
     /// A destination that is TRACKED by the enclosing git repository must be
     /// left alone. `qontinui-claude-config` and `qontinui-dev-notes` both track
     /// exactly `.claude/commands/vet-plan.md` and `implement-plan.md`; spawning
@@ -801,20 +978,24 @@ mod tests {
         let registry = AgentCommandRegistry::new();
         let out = provision_fleet_commands_into(&commands_dir, &registry).expect("provision");
 
-        assert_eq!(out.skipped.len(), 1, "the tracked file should be skipped");
         // The REASON is the deliverable: a bare count is the same unreadable
         // signal the `warn!` this report replaces already was.
+        let tracked_skip = out
+            .skipped
+            .iter()
+            .find(|s| s.unit == format!("{tracked_name}.md"))
+            .expect("the tracked file is skipped");
         assert_eq!(
-            out.skipped[0].reason,
+            tracked_skip.reason,
             crate::capability_manifest::SkipReason::GitTracked
         );
-        assert_eq!(out.skipped[0].unit, format!("{tracked_name}.md"));
         assert!(out.is_degraded(), "a skipped unit means the pass degraded");
-        assert_eq!(
-            out.written,
-            FLEET_COMMANDS.len() - 1,
-            "every OTHER command should still be written"
-        );
+        // The repo now VERSIONS `.claude/commands`, so every OTHER command is
+        // absent and untracked there and is not created (plan
+        // 2026-11-09-a-provisioned-copy-of-an-upstream-added-file-wedges-the-served-checkout-fast-forward
+        // Phase 2) — see `an_upstream_added_command_is_not_created_in_a_root_versioned_checkout`.
+        assert_eq!(out.skipped.len(), FLEET_COMMANDS.len());
+        assert_eq!(out.written, 0);
         assert_eq!(
             std::fs::read_to_string(&tracked).unwrap(),
             "# the repo's own body\n",
@@ -865,6 +1046,134 @@ mod tests {
             FLEET_COMMANDS.len() - 1,
             "every absent command is still written"
         );
+    }
+
+    /// Plan `2026-11-09-a-provisioned-copy-of-an-upstream-added-file-wedges-the-served-checkout-fast-forward`
+    /// Phase 2, entering where a session spawn enters: a STALE claude-config
+    /// checkout tracks every bundled command but one, which upstream added
+    /// after this checkout's HEAD. Writing that one as an untracked file is what
+    /// wedged the checkout's `git merge --ff-only` (git refuses an untracked file
+    /// at an incoming path even when its bytes are identical), so it must not
+    /// be created; a command the checkout tracks but the user deleted is still
+    /// written, as before.
+    #[test]
+    fn an_upstream_added_command_is_not_created_in_a_root_versioned_checkout() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let commands_dir = tmp.path().join(".claude").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        crate::provision_guard::test_support::git_init(tmp.path());
+
+        assert!(FLEET_COMMANDS.len() >= 3, "fixture needs three commands");
+        let (added, _) = FLEET_COMMANDS[0];
+        let (deleted, deleted_body) = FLEET_COMMANDS[1];
+        for (name, _) in &FLEET_COMMANDS[1..] {
+            let dst = commands_dir.join(format!("{name}.md"));
+            std::fs::write(&dst, format!("# repo body for {name}\n")).unwrap();
+            crate::provision_guard::test_support::git_add(tmp.path(), &dst);
+        }
+        std::fs::remove_file(commands_dir.join(format!("{deleted}.md"))).unwrap();
+
+        let out = provision_fleet_commands_into(&commands_dir, &AgentCommandRegistry::new())
+            .expect("provision");
+
+        assert!(
+            !commands_dir.join(format!("{added}.md")).exists(),
+            "an upstream-added command must not be created in a checkout that versions the tree"
+        );
+        assert!(
+            out.skipped.iter().any(|s| s.unit == format!("{added}.md")
+                && s.reason == crate::capability_manifest::SkipReason::RootVersioned),
+            "the skip is recorded as root_versioned, got {:?}",
+            out.skipped
+        );
+        assert_eq!(
+            strip_provenance(
+                &std::fs::read_to_string(commands_dir.join(format!("{deleted}.md"))).unwrap()
+            )
+            .expect("provenance line")
+            .1,
+            deleted_body,
+            "a tracked-but-deleted command is still written"
+        );
+        assert_eq!(out.written, 1, "only the tracked-but-deleted one");
+    }
+
+    /// The root-versioned skip is confined to BUILTIN commands: an account
+    /// command with no embedded counterpart is a path no commit of the repo
+    /// will ever add, so it is still written in a checkout that versions the
+    /// tree — while an absent builtin there is not.
+    #[test]
+    fn an_account_only_command_is_still_written_in_a_root_versioned_checkout() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let commands_dir = tmp.path().join(".claude").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        crate::provision_guard::test_support::git_init(tmp.path());
+
+        let (tracked_name, _) = FLEET_COMMANDS[0];
+        let (absent_builtin, _) = FLEET_COMMANDS[1];
+        let dst = commands_dir.join(format!("{tracked_name}.md"));
+        std::fs::write(&dst, b"# the repo's own body\n").unwrap();
+        crate::provision_guard::test_support::git_add(tmp.path(), &dst);
+
+        let novel = "account-only-procedure";
+        assert!(FLEET_COMMANDS.iter().all(|(n, _)| *n != novel));
+        let mut registry = AgentCommandRegistry::new();
+        registry.set_overrides(
+            vec![qontinui_types::agent_commands::AgentCommand {
+                id: "id-1".to_string(),
+                organization_id: Some("org-1".to_string()),
+                created_by_user_id: None,
+                name: novel.to_string(),
+                body: "# my own procedure\n".to_string(),
+                checksum: None,
+                is_shared: false,
+                current_version: 1,
+                created_at: "2026-11-09T00:00:00Z".to_string(),
+                updated_at: "2026-11-09T00:00:00Z".to_string(),
+            }],
+            crate::agent_commands::CommandSource::Served,
+        );
+
+        let out = provision_fleet_commands_into(&commands_dir, &registry).expect("provision");
+
+        assert_eq!(
+            strip_provenance(
+                &std::fs::read_to_string(commands_dir.join(format!("{novel}.md")))
+                    .expect("the account-only command is written")
+            )
+            .expect("provenance line")
+            .1,
+            "# my own procedure\n"
+        );
+        assert!(
+            !commands_dir.join(format!("{absent_builtin}.md")).exists(),
+            "an absent builtin is still withheld in a versioned checkout"
+        );
+        assert!(
+            !out.skipped.iter().any(|s| s.unit == format!("{novel}.md")),
+            "the account-only command is not skipped, got {:?}",
+            out.skipped
+        );
+    }
+
+    /// A repository that tracks only a command of its OWN under
+    /// `.claude/commands` does not version the bundle: every bundled command is
+    /// still written.
+    #[test]
+    fn a_repo_tracking_only_its_own_command_still_gets_every_bundled_one() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let commands_dir = tmp.path().join(".claude").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        crate::provision_guard::test_support::git_init(tmp.path());
+        let own = commands_dir.join("repo-local-only-command.md");
+        std::fs::write(&own, b"# mine\n").unwrap();
+        crate::provision_guard::test_support::git_add(tmp.path(), &own);
+
+        let out = provision_fleet_commands_into(&commands_dir, &AgentCommandRegistry::new())
+            .expect("provision");
+
+        assert!(out.skipped.is_empty(), "got {:?}", out.skipped);
+        assert_eq!(out.written, FLEET_COMMANDS.len());
     }
 
     /// The blast radius the module doc names: a checkout that tracks EVERY
@@ -943,7 +1252,12 @@ mod tests {
 
         let out = provision_fleet_commands_into(&commands_dir, &registry).expect("provision");
 
-        assert_eq!(out.skipped.len(), 1);
+        assert!(
+            out.skipped.iter().any(|s| s.unit == format!("{name}.md")
+                && s.reason == crate::capability_manifest::SkipReason::GitTracked),
+            "the overridden command is skipped as tracked, got {:?}",
+            out.skipped
+        );
         assert_eq!(
             std::fs::read_to_string(&dst).unwrap(),
             "# the repo's own body\n",
@@ -2777,19 +3091,25 @@ mod tests {
         let roster = [
             SkipReason::GitTracked,
             SkipReason::ProbeUnknownInRepo,
+            SkipReason::RootVersioned,
             SkipReason::WriteFailed(String::new()),
             SkipReason::Unresolved(String::new()),
             SkipReason::Rejected(String::new()),
             SkipReason::RepoAuthored,
+            SkipReason::OperatorAuthored(String::new()),
+            SkipReason::ServedInPlace,
         ];
         for reason in &roster {
             match reason {
                 SkipReason::GitTracked
                 | SkipReason::ProbeUnknownInRepo
+                | SkipReason::RootVersioned
                 | SkipReason::WriteFailed(_)
                 | SkipReason::Unresolved(_)
                 | SkipReason::Rejected(_)
-                | SkipReason::RepoAuthored => {}
+                | SkipReason::RepoAuthored
+                | SkipReason::OperatorAuthored(_)
+                | SkipReason::ServedInPlace => {}
             }
             let spelled = format!("`{}`", reason.wire().replace('_', "-"));
             assert!(

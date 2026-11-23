@@ -37,6 +37,31 @@ use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 /// Frontend should re-fetch status when it sees this event.
 pub const WEB_INTEGRATION_CHANGED_EVENT: &str = "web-integration-changed";
 
+/// Name of the Tauri event emitted when the device's binding set
+/// (`paired_user.json`) changed under the UI: a sign-in or pair-code redeem
+/// persisted a binding, the heartbeat's reconcile dropped one, or a heal or
+/// store merge rewrote the file. The tenant list re-reads on it. It is its own
+/// event, not [`WEB_INTEGRATION_CHANGED_EVENT`], because that one's listeners
+/// treat it as a sign-in and reset their own state. It says nothing about a
+/// credential slot's freshness; the Fleet view re-reads that itself.
+pub const TENANT_BINDINGS_CHANGED_EVENT: &str = "tenant-bindings-changed";
+
+/// Emit [`TENANT_BINDINGS_CHANGED_EVENT`]. Every writer of the binding set in
+/// this process calls it once its write has landed and changed something, so
+/// the UI learns of the change whichever door made it (Settings, the UI Bridge,
+/// a heartbeat, a heal). A writer in another process (the `qontinui_profile`
+/// CLI, a peer runner sharing the store) is not announced: the tenant list sees
+/// its change on the next event or restart. Dropped silently when there is no
+/// UI to tell.
+pub fn notify_tenant_bindings_changed() {
+    let Some(app) = crate::tauri_app_handle::current() else {
+        return;
+    };
+    if let Err(e) = app.emit(TENANT_BINDINGS_CHANGED_EVENT, ()) {
+        warn!("failed to emit {TENANT_BINDINGS_CHANGED_EVENT} event: {e}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
@@ -897,6 +922,7 @@ pub async fn redeem_pair_code(
         .await
         .map_err(|e| format!("persist pairing task panicked: {e}"))?
         .map_err(|e| format!("persist pairing: {}", e))?;
+    notify_tenant_bindings_changed();
 
     // A NEW credential is in `tenant_id`'s slot (and in the legacy slot when that
     // tenant is the default), so every rejection coord recorded against the OLD
@@ -1301,5 +1327,198 @@ mod ipc_wire_contract_tests {
         .unwrap();
         assert_eq!(v["dmkStored"], serde_json::json!(true));
         assert_eq!(v["deviceId"], serde_json::json!("d"));
+    }
+}
+
+#[cfg(test)]
+mod tenant_bindings_event_tests {
+    /// The functions that write `paired_user.json`'s binding set.
+    const WRITERS: [&str; 6] = [
+        "persist_pairing(",
+        "reconcile_paired_bindings(",
+        "record_and_reconcile_coord_bound_tenants(",
+        "backfill_paired_tenant_id(",
+        "heal_vanished_paired_user(",
+        "converge_binding_store(",
+    ];
+    /// How far after a writer's call the announcement may sit (never past the
+    /// next writer call).
+    const WINDOW_LINES: usize = 25;
+
+    /// Every call of a binding writer in this process's sources announces the
+    /// change soon after it, so a binding added or rebuilt through any door
+    /// reaches the Fleet selector. The call sites are FOUND, not listed, so a
+    /// new writer call fails here until it announces. Out of scope: the writers'
+    /// own module (`pair.rs`), other binaries (`src/bin`), test modules, and the
+    /// `#[cfg(test)]` isolation harness, which pairs a fixture.
+    #[test]
+    fn every_binding_writer_call_announces_the_change() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        let mut dirs = vec![root.clone()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read src dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    if path != root.join("bin") {
+                        dirs.push(path);
+                    }
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    files.push(path);
+                }
+            }
+        }
+        let skipped = [
+            root.join("pair.rs"),
+            root.join("subject_isolation_harness.rs"),
+        ];
+        let mut calls = 0;
+        let mut silent = Vec::new();
+        for path in files.iter().filter(|p| !skipped.contains(p)) {
+            let text = std::fs::read_to_string(path).expect("read source");
+            let lines = production_lines(&text);
+            for (i, (line_no, line)) in lines.iter().enumerate() {
+                let Some(writer) = WRITERS.iter().find(|w| line.contains(**w)) else {
+                    continue;
+                };
+                if line.contains("fn ") {
+                    continue;
+                }
+                calls += 1;
+                // The window ends at the next writer call, so one writer cannot
+                // pass on its neighbour's announcement.
+                let announced = lines
+                    .iter()
+                    .skip(i + 1)
+                    .take(WINDOW_LINES)
+                    .take_while(|(_, l)| !WRITERS.iter().any(|w| l.contains(*w)))
+                    .any(|(_, l)| l.contains("notify_tenant_bindings_changed"));
+                if !announced {
+                    silent.push(format!("{}:{line_no} {writer}", path.display()));
+                }
+            }
+        }
+        // Seven today: two persists, the reconcile, the legacy backfill, two
+        // heals and the startup merge. Fewer means the scan lost some.
+        assert!(calls >= 7, "found only {calls} binding-writer calls");
+        assert!(
+            silent.is_empty(),
+            "binding writers that do not announce the change within \
+             {WINDOW_LINES} lines: {silent:#?}"
+        );
+    }
+
+    /// A file's production lines, numbered from 1, with every inline
+    /// `#[cfg(test)] mod name { ... }` dropped (to the `}` at the `mod` line's
+    /// indentation) and line comments cut, so a commented-out call counts as
+    /// neither a writer nor an announcement. A `#[cfg(test)] mod name;` line
+    /// declares a file the caller filters by path, so only the line is dropped.
+    fn production_lines(text: &str) -> Vec<(usize, &str)> {
+        let mut out = Vec::new();
+        let mut lines = text.lines().enumerate().peekable();
+        while let Some((i, line)) = lines.next() {
+            if line.trim() == "#[cfg(test)]" {
+                if let Some((_, next)) = lines.peek() {
+                    let item = next.trim_start();
+                    if item.starts_with("mod ") && item.trim_end().ends_with('{') {
+                        let close = format!("{}}}", next.strip_suffix(item).unwrap_or_default());
+                        for (_, skipped) in lines.by_ref() {
+                            if skipped.trim_end() == close {
+                                break;
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+            out.push((i + 1, line.split("//").next().unwrap_or_default()));
+        }
+        out
+    }
+
+    /// A file's production code as one string: test modules and line comments
+    /// dropped (see [`production_lines`]).
+    fn production_source(file: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(file);
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {file}: {e}"));
+        production_lines(&text)
+            .iter()
+            .map(|(_, l)| *l)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The three writers whose announcement depends on what they report: each
+    /// announces under its own condition, and these files announce nowhere
+    /// else (every refresher tick runs a heal, so an unconditional announcement
+    /// would fire each tick). Whitespace is collapsed on both sides.
+    #[test]
+    fn heal_and_merge_announce_only_what_they_wrote() {
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let announcements = |code: &str| code.matches("notify_tenant_bindings_changed();").count();
+        let main = squash(&production_source("src/main.rs"));
+        assert_eq!(
+            announcements(&main),
+            2,
+            "main.rs announces only the merge and the heal"
+        );
+        for needle in [
+            "if qontinui_runner_lib::pair::converge_binding_store().wrote_canonical { \
+             commands::web_integration::notify_tenant_bindings_changed(); }",
+            "if qontinui_runner_lib::pair::heal_vanished_paired_user().wrote() { \
+             commands::web_integration::notify_tenant_bindings_changed(); }",
+        ] {
+            assert!(main.contains(&squash(needle)), "main.rs: {needle}");
+        }
+        let refresher = squash(&production_source("src/mcp/device_jwt_refresher.rs"));
+        assert_eq!(
+            announcements(&refresher),
+            1,
+            "the refresher announces only the heal"
+        );
+        let needle = "if heal.wrote() { \
+                      crate::commands::web_integration::notify_tenant_bindings_changed(); }";
+        assert!(refresher.contains(&squash(needle)), "refresher: {needle}");
+    }
+
+    /// Each persist announces only AFTER the write lands: past the `?;` that
+    /// ends the persist's statement, so a failed persist announces nothing.
+    #[test]
+    fn a_pairing_door_announces_after_the_persist() {
+        for (file, item) in [
+            ("src/commands/auth.rs", "async fn finalize_signed_in("),
+            (
+                "src/commands/web_integration.rs",
+                "pub async fn redeem_pair_code(",
+            ),
+        ] {
+            // Production code only, so the item can never be found in this
+            // test's own text if the real function is renamed.
+            let text = production_source(file);
+            let start = text
+                .find(item)
+                .unwrap_or_else(|| panic!("{item} exists in {file}'s production code"));
+            // A top-level fn body ends at the first unindented closing brace.
+            let len = text
+                .get(start..)
+                .and_then(|rest| rest.find("\n}\n"))
+                .unwrap_or_else(|| panic!("{item} in {file} has a closing brace"));
+            let body = text.get(start..start + len).unwrap_or_default();
+            let persisted = body
+                .find("persist_pairing(")
+                .unwrap_or_else(|| panic!("{item} persists a pairing"));
+            let landed = body
+                .get(persisted..)
+                .and_then(|rest| rest.find("?;"))
+                .map(|i| persisted + i)
+                .unwrap_or_else(|| panic!("{item}: the persist's statement ends in `?;`"));
+            let notified = body
+                .find("notify_tenant_bindings_changed();")
+                .unwrap_or_else(|| panic!("{item} in {file} must announce the new binding"));
+            assert!(
+                notified > landed,
+                "{item}: announce the binding only after persist_pairing's `?`"
+            );
+        }
     }
 }

@@ -94,11 +94,12 @@ async fn install_ws_sdk_connection(
         app_url: synthetic_url.clone(),
         base_path: String::new(),
         app_info,
-        client: reqwest::Client::new(),
+        client: crate::mcp::sdk_http::SdkHttpClient::unsigned(reqwest::Client::new()),
         connected_at: chrono::Utc::now().timestamp_millis(),
         transport_kind: None,
         physical_device_id: None,
         activated_by: (!principal.is_operator_trust()).then(|| principal.clone()),
+        bearer: crate::mcp::sdk_client::ConnectionBearer::Absent,
     };
     // The liveness of the CURRENT active connection is read before the manager
     // lock is taken, so the two locks are never held together. A `ws-app://`

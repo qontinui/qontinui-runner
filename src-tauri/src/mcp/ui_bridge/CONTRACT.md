@@ -471,9 +471,10 @@ Two thread-through styles, mirroring the `tabId` split:
   produced, including `undefined` from a swallowed exception.
 
 > **Still open (deliberately, on this family):** a *resolved miss* —
-> `click-by-text` / `click-by-selector` finding no match, `read-value` matching
-> no selector — is still an HTTP 200 whose payload says `clicked: false` /
-> `found: false`. `type-into` alone reports a miss as HTTP 400. Aligning the
+> `click-by-text` / `click-by-selector` finding no match — is still an HTTP 200
+> whose payload says `clicked: false`. `type-into` and `read-value` report a
+> miss as HTTP 400 (`read-value` delegates to the SDK's `readValuePrimitive`,
+> whose `ELEMENT_NOT_FOUND` the IPC envelope maps to 400). Aligning the
 > other three is a breaking change to an automation surface with cross-repo
 > consumers (`@qontinui/ui-bridge`, `scripts/contract-smoke.ps1`,
 > `UI-BRIDGE-AUTOMATION.md`), so it needs its own change and a `contract-smoke`
@@ -609,8 +610,19 @@ there. To answer "did my panel render?":
   the whole page's `document.body.innerText`, trimmed and capped at 8000 chars
   (`page.rs::ui_bridge_page_summary_handler`) — alongside the structured
   headings/buttons/inputs/links digest. One call, no hand-rolled evaluate.
-- **`POST /ui-bridge/control/page/read-value`** (`elements.rs:3336`) reads one
-  selector's `textContent`/`value`.
+- **`POST /ui-bridge/control/page/read-value`** (`elements.rs`,
+  `ui_bridge_read_value_handler`) reads one selector's `textContent`/`value`
+  by dispatching the `read_value` IPC request to the SDK's `readValuePrimitive`
+  (`src/hooks/ui-bridge-events/readValueRequest.ts`), the same implementation
+  the relay `/sdk/page/read-value` serves. The SDK owns the §4.6 verdict: a
+  password input or anything inside `data-bridge-redact="true"` reads back
+  `[REDACTED]` (length 0), never the raw value. Redaction is judged on the
+  selected element and its ancestors: selecting a NON-redacted container whose
+  descendant sits inside a boundary still returns that descendant's text (an
+  SDK limit). The route no longer has the direct-WebView fallback: it needs the
+  live frontend IPC listener, like the relay door. Response shape is
+  `{value, length, totalMatches, values?}`; the older `found/tag/type/
+  placeholder/disabled/readOnly` fields are gone.
 - **`find-by-text`** (`elements.rs:3158`) locates elements by visible text.
 
 ### `page/evaluate` result envelope: ONE discriminated shape, always

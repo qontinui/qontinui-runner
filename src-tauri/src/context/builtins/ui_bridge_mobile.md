@@ -13,8 +13,9 @@ client = UIBridgeClient("http://localhost:8087")
 # iOS simulator
 client = UIBridgeClient("http://localhost:8087")
 
-# Physical device by LAN IP: works only while the app runs an SDK older than
-# @qontinui/ui-bridge-native 0.11.0 (see "Device pairing" below)
+# Physical device by LAN IP: works directly only while the app runs an SDK older
+# than @qontinui/ui-bridge-native 0.11.0. On a newer app, go through the runner
+# (see "Device pairing" below).
 client = UIBridgeClient("http://192.168.1.100:8087")
 ```
 
@@ -24,11 +25,39 @@ LAN), the on-device server refuses an unsigned off-device caller on every route
 except `GET /ui-bridge/health` and, with a code armed in the app,
 `POST /ui-bridge/pair`. Control routes answer `401 PAIRING_REQUIRED`, or
 `PAIRING_UNCONFIGURED` on an app with no pairing store, unless the app sets
-`allowUnauthenticatedNetwork`. The Python client cannot sign and the runner does
-not sign device requests yet, so on such an app use `adb forward`. It is
-admitted as on-device only when the app's server adapter passes the socket's
-`remoteAddress` (measured on an Android 11 emulator; physical phones
-unmeasured).
+`allowUnauthenticatedNetwork`. A caller on the phone itself, which is what
+`adb forward` delivers, needs no pairing. It is admitted as on-device only when
+the app's server adapter passes the socket's `remoteAddress` (measured on an
+Android 11 emulator; physical phones unmeasured).
+
+The Python client cannot sign. The runner does: it signs every request to a
+phone it has paired with, with a token the phone issued it that never crosses
+the network again. To drive a phone over Wi-Fi, go through the runner:
+
+1. `GET /ui-bridge/devices` for the phone's row `{id}`.
+2. `POST /ui-bridge/devices/{id}/pair`. Over a USB cable send `{}`; no code is
+   needed, and the runner also fetches the token by itself whenever it forwards
+   or connects to a phone over one. An `adb connect` over Wi-Fi is not a cable.
+   On Wi-Fi, tap Pair in the app's Settings and send the 6-digit code it shows,
+   as `{"code": "123456"}`, within about 2 minutes; a code-less pair off a cable
+   is refused. Prefer the cable. A Wi-Fi pairing is plain HTTP, so anyone on that
+   network can read the token in the phone's answer. They can also pose as the
+   phone, pass the code on to it, and get the same token, so nothing tells you
+   it happened. The runner never returns the token. A local emulator needs no pairing at all:
+   it admits the runner as on the phone itself.
+3. `POST /ui-bridge/devices/{id}/connect`, then drive the phone with the
+   runner's `/ui-bridge/sdk/*` routes. `authPath` reads `device-signed`.
+
+A connect to a phone that requires pairing the runner has not done fails with
+`code: PAIRING_REQUIRED` and `hint.authPath: pairing_required`, and moves on to
+the phone's cloud relay when it has one, which the pairing gate does not cover.
+
+After the app's Settings revoke this runner's pairing, the phone issues a new
+token, and the runner keeps it only from a pair over a USB cable or one sent with
+`"replace": true`. A different token from any other pair is refused with
+`PAIRING_TOKEN_HELD`, since it may come from another device answering as this one.
+That refused pair spent its code, so tap Pair in the app again and send the new
+code with `"replace": true`.
 
 **Note:** The server always runs in development builds (`__DEV__`); a release
 build runs it unless the in-app "Local UI Bridge server" setting turns it off.

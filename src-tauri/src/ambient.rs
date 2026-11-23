@@ -176,6 +176,9 @@ pub const AMBIENT_ENV_KEYS: &[&str] = &[
     "QONTINUI_CENSUS_CHUNK_ROWS",
     "QONTINUI_CENSUS_CHUNK_SECS",
     "QONTINUI_CENSUS_POST_TIMEOUT_SECS",
+    // Read through `ci_node::cgroup::CGROUP_ROOT_ENV`, by `ci_node` and by the
+    // slice telemetry's CPU attribution (`fleet::slice_telemetry::cpu`).
+    "QONTINUI_CI_CGROUP_ROOT",
     "QONTINUI_CLAUDE_BIN",
     "QONTINUI_CLAUDE_HOOK_SETTINGS",
     "QONTINUI_CODE_GRAPH_ROOTS",
@@ -229,6 +232,7 @@ pub const AMBIENT_ENV_KEYS: &[&str] = &[
     "QONTINUI_LOOPING_AGENT_TICK_MS",
     "QONTINUI_MACHINE_ID",
     "QONTINUI_MAINTENANCE_INTERVAL_SECS",
+    "QONTINUI_MALLOC_TRIM",
     "QONTINUI_MCP_CONFIG",
     "QONTINUI_MCP_SPILL_MAX_BYTES",
     "QONTINUI_MCP_SPILL_THRESHOLD_BYTES",
@@ -2404,8 +2408,11 @@ mod tests {
         ),
         (
             "commands/ai_settings.rs",
-            1,
-            "`default_claude_config_dir`: Claude Code's own `~/.claude` (the user's Claude login)",
+            3,
+            "`default_claude_config_dir`: Claude Code's own `~/.claude` (the user's Claude login), \
+             plus the two `probe_account_usage` reads of the account identity in \
+             `~/.claude.json` (`account_hash_for`) — Claude Code's own file, reported, never \
+             runner state",
         ),
         (
             "claude_session/workspace_trust.rs",
@@ -2417,6 +2424,12 @@ mod tests {
             "claude_session/spawn_preconditions.rs",
             1,
             "the ambient Claude config (`~/.claude.json`) a child with no account reads",
+        ),
+        (
+            "claude_cli_update.rs",
+            1,
+            "Claude Code's own `~/.claude/settings.json`, read only for the user's \
+             `autoUpdatesChannel` — not runner state",
         ),
         (
             "claude_session/trust_gate.rs",
@@ -2434,8 +2447,9 @@ mod tests {
             "commands/terminal.rs",
             1,
             "`claude_default_config_home`: the default Claude account home (`~/.claude`), read \
-             only so a resume never types it as `CLAUDE_CONFIG_DIR` — Claude Code's, not runner \
-             state",
+             so a resume never types it as `CLAUDE_CONFIG_DIR`, and so the graceful-exit probe's \
+             registry read can find a first session's record in its `sessions/` — Claude \
+             Code's, not runner state",
         ),
         (
             "wrappers/clients.rs",

@@ -148,13 +148,28 @@ struct TerminalCreateArgs {
     edit_siblings: Vec<String>,
 }
 
+/// The `terminal_create` proxy's resource-guard precheck, run before the
+/// allocation: a CRITICAL refusal after it would leave the `git worktree add`
+/// on disk, one more tree per retry. Answered through the SAME
+/// [`TauriInvokeResponse::spawn_failed`] the failed-create arm uses, so one
+/// refusal has one answer whichever gate gave it
+/// ([`crate::resource_guard::precheck_spawn`]'s contract).
+fn spawn_precheck_or_invoke_error(
+    check: impl FnOnce() -> Result<(), String>,
+) -> Result<(), TauriInvokeResponse> {
+    check().map_err(TauriInvokeResponse::spawn_failed)
+}
+
 /// The `terminal_create` proxy's spawn-tenant admission: the shared
-/// [`crate::commands::terminal::admit_spawn_tenant`], answered as the invoke
-/// error a refused `terminal_create` command would return.
+/// [`crate::commands::terminal::admit_spawn_tenant`], answered through the
+/// same typed path the failed-create arm uses
+/// ([`TauriInvokeResponse::spawn_failed`]) — so a `terminal:tenant_<kind>:`
+/// refusal carries `TERMINAL_TENANT_<KIND>` and its status whichever gate gave
+/// it, the precheck here or the identity seam inside the spawn.
 fn spawn_tenant_or_invoke_error(
     raw: Option<&str>,
 ) -> Result<Option<uuid::Uuid>, TauriInvokeResponse> {
-    crate::commands::terminal::admit_spawn_tenant(raw).map_err(TauriInvokeResponse::err)
+    crate::commands::terminal::admit_spawn_tenant(raw).map_err(TauriInvokeResponse::spawn_failed)
 }
 
 impl TauriInvokeResponse {
@@ -174,6 +189,25 @@ impl TauriInvokeResponse {
             error: Some(msg.into()),
             code: None,
             status: None,
+        }
+    }
+    /// The answer to a refused spawn — the resource-guard precheck before the
+    /// allocation and a failed `tm.create` after it. A recognised refusal
+    /// family carries its `code` and typed status, by the rule `POST /terminals`
+    /// and the backend relay share
+    /// ([`crate::terminal::spawn_refusal::spawn_refusal_code`]); the text stays
+    /// verbatim, so a caller matching the `resource_guard:critical:` prefix is
+    /// unaffected. Anything unrecognised keeps the untyped 200 error.
+    fn spawn_failed(error: String) -> Self {
+        match crate::terminal::spawn_refusal::spawn_refusal_code(&error) {
+            Some((status, code)) => Self {
+                success: false,
+                data: None,
+                error: Some(error),
+                code: Some(code),
+                status: Some(status),
+            },
+            None => Self::err(error),
         }
     }
     /// A refused `editSiblings` input: a typed 400 `invalid_edit_sibling`,
@@ -334,6 +368,15 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                     Err(refusal) => return TauriInvokeResponse::edit_sibling_refusal(refusal),
                 };
 
+            // The resource guard's CRITICAL verdict, judged before the
+            // allocation for the reason `POST /terminals` judges it there.
+            // `a.resource_override` is the caller's explicit "start it anyway".
+            if let Err(refusal) = spawn_precheck_or_invoke_error(|| {
+                crate::resource_guard::precheck_spawn("terminal session", a.resource_override)
+            }) {
+                return refusal;
+            }
+
             let (working_dir, isolated_ctx) =
                 crate::agent_worktree::isolated_edit::acquire_for_terminal(
                     effective_intent_repo.as_deref(),
@@ -355,7 +398,16 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                 isolated_ctx.as_ref(),
                 spawn_tenant_key.as_deref(),
             );
+            // What the post-create coord wiring needs, kept before the spawn
+            // consumes them.
+            let created = ProxyTerminalCreated {
+                title: a.title.clone(),
+                intent_repo: effective_intent_repo,
+                working_dir: working_dir.clone(),
+                spawn_tenant,
+            };
 
+            // door-scan: spawn — the door's real spawn; the context is in hand until here.
             match tm.create(
                 a.title,
                 working_dir,
@@ -383,14 +435,30 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                 crate::coord_drain_state::SpawnOrigin::Unknown,
             ) {
                 Ok(info) => {
-                    if let Some(ctx) = isolated_ctx {
-                        if let Some(session) = tm.get(&info.id) {
-                            session.set_isolated_edit_ctx(ctx);
-                        }
-                    }
-                    TauriInvokeResponse::ok(serde_json::to_value(&info).unwrap_or(Value::Null))
+                    let door = ProxyTerminalCreateDoor {
+                        terminal_manager: tm.clone(),
+                        session_registry: state
+                            .app_handle
+                            .try_state::<Arc<crate::session::SessionRegistry>>()
+                            .map(|r| r.inner().clone()),
+                        app_handle: Some(state.app_handle.clone()),
+                    };
+                    proxy_terminal_created(&door, info, isolated_ctx, created).await
                 }
-                Err(e) => TauriInvokeResponse::err(e),
+                Err(e) => {
+                    // The allocation (if this call made one) has its fresh tree
+                    // removed when no child started and it holds nothing, and is
+                    // reported spawn-failed, as on every `acquire_for_terminal`
+                    // door; the context's Drop then releases its claims.
+                    if let Some(ctx) = isolated_ctx {
+                        ctx.remove_unspawned(
+                            "tauri_proxy terminal_create",
+                            e.child_started,
+                            &e.message,
+                        );
+                    }
+                    TauriInvokeResponse::spawn_failed(e.message)
+                }
             }
         }
 
@@ -582,6 +650,74 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
     }
 }
 
+// ============================================================================
+// terminal_create — post-create coord wiring
+// ============================================================================
+
+/// What the `terminal_create` arm's post-create step needs beyond the
+/// arguments. Built from `ApiState.app_handle` in [`dispatch`]; a test builds
+/// it from bare managers (no `AppHandle`, no webview), which is what lets a
+/// unit test enter [`proxy_terminal_created`].
+pub(crate) struct ProxyTerminalCreateDoor {
+    pub terminal_manager: Arc<TerminalManager>,
+    /// `None` only if the registry is not in app state — a boot-ordering fault
+    /// [`crate::commands::terminal::coord_wiring::finish_terminal_create`]
+    /// logs; the pane is still created.
+    pub session_registry: Option<Arc<crate::session::SessionRegistry>>,
+    /// For the repo-detection emit. `None` in a unit test.
+    pub app_handle: Option<tauri::AppHandle>,
+}
+
+/// The arm's resolved inputs the coord wiring reads, taken before the spawn
+/// consumes them.
+pub(crate) struct ProxyTerminalCreated {
+    pub title: Option<String>,
+    pub intent_repo: Option<String>,
+    pub working_dir: Option<String>,
+    pub spawn_tenant: Option<uuid::Uuid>,
+}
+
+/// The invoke proxy's `terminal_create` arm after a successful spawn: the SAME
+/// post-create coord wiring the Tauri command runs
+/// ([`crate::commands::terminal::coord_wiring::finish_terminal_create`]) —
+/// parking the isolated edit context, registering and binding the pane's
+/// `terminal_shell` coord session — then the invoke answer.
+///
+/// Plan `2026-11-05-remote-session-end-reaches-the-target-but-cannot-end-a-real-session`
+/// Phase 4: this arm used to return straight after `create`, so an
+/// invoke-created pane had no `terminal_shell` coord row,
+/// `GET /terminals/{id}/coord-session` read `null`, and a remote end of it
+/// answered `not_found`.
+pub(crate) async fn proxy_terminal_created(
+    door: &ProxyTerminalCreateDoor,
+    info: crate::terminal::types::TerminalInfo,
+    isolated_ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
+    created: ProxyTerminalCreated,
+) -> TauriInvokeResponse {
+    let intent = crate::commands::terminal::coord_wiring::terminal_shell_intent(
+        created.title.as_deref(),
+        "Terminal shell session",
+        created.intent_repo,
+        None,
+        None,
+        created.working_dir.as_deref(),
+        created.spawn_tenant,
+    );
+    crate::commands::terminal::coord_wiring::finish_terminal_create(
+        &door.terminal_manager,
+        door.session_registry.as_ref(),
+        door.app_handle.as_ref(),
+        &info.id,
+        isolated_ctx,
+        intent,
+        crate::commands::terminal::coord_wiring::CoordRegistration::FreshPinned,
+        created.working_dir,
+        "tauri_proxy_terminal_create",
+    )
+    .await;
+    TauriInvokeResponse::ok(serde_json::to_value(&info).unwrap_or(Value::Null))
+}
+
 /// The `remote_interactivity_probe` trigger a headless proxy caller may run:
 /// absent/blank → `unspecified`, `manual` → `manual`, anything else (notably
 /// `fleet_view`, which would stamp the device into the scheduler's sweep set)
@@ -673,8 +809,17 @@ mod spawn_tenant_tests {
         let refusal =
             spawn_tenant_or_invoke_error(Some(&b.to_string())).expect_err("unpaired → refused");
         assert!(!refusal.success);
+        assert_eq!(refusal.code.as_deref(), Some("TERMINAL_TENANT_NOT_PAIRED"));
+        assert_eq!(refusal.status, Some(StatusCode::BAD_REQUEST));
         let error = refusal.error.unwrap_or_default();
         assert!(error.starts_with("terminal:tenant_not_paired:"), "{error}");
+        // The same text through the failed-create arm gives the same answer.
+        let via_create = TauriInvokeResponse::spawn_failed(error.clone());
+        assert_eq!(
+            via_create.code.as_deref(),
+            Some("TERMINAL_TENANT_NOT_PAIRED")
+        );
+        assert_eq!(via_create.status, Some(StatusCode::BAD_REQUEST));
         assert_eq!(
             spawn_tenant_or_invoke_error(Some(&a.to_string())).ok(),
             Some(Some(a))
@@ -700,5 +845,119 @@ mod spawn_tenant_tests {
             .is_err(),
             "two spellings at once is a duplicate field, never a silent pick"
         );
+    }
+}
+
+#[cfg(test)]
+mod spawn_refusal_tests {
+    use super::*;
+    use crate::terminal::spawn_refusal::{refusal_family_fixtures, UNRECOGNISED_SPAWN_FAILURES};
+
+    fn answer(r: &TauriInvokeResponse) -> (StatusCode, Value) {
+        (
+            r.status.unwrap_or(StatusCode::OK),
+            serde_json::to_value(r).unwrap(),
+        )
+    }
+
+    /// Plan `2026-11-08-…-leaves-the-tree-on-disk` Phase 0: one case per
+    /// refusal family, each text built by its real producer, answered with the
+    /// code and typed status `POST /terminals` gives it — and the text verbatim.
+    #[test]
+    fn a_refused_spawn_keeps_its_typed_answer_on_the_proxy() {
+        for (text, status, code) in refusal_family_fixtures() {
+            let (got, body) = answer(&TauriInvokeResponse::spawn_failed(text.clone()));
+            assert_eq!(got, status, "{text}");
+            assert_eq!(body["code"], code, "{text}");
+            assert_eq!(body["error"], text.as_str());
+            assert_eq!(body["success"], false);
+        }
+    }
+
+    /// The precheck's answer equals the failed-create arm's for the same text,
+    /// so a caller cannot tell which gate answered.
+    #[test]
+    fn the_proxy_precheck_answers_as_the_failed_create_arm_does() {
+        for (text, _, _) in refusal_family_fixtures() {
+            let t = text.clone();
+            let precheck = spawn_precheck_or_invoke_error(move || Err(t))
+                .expect_err("a refusal is an invoke error");
+            assert_eq!(
+                answer(&precheck),
+                answer(&TauriInvokeResponse::spawn_failed(text.clone())),
+                "{text}"
+            );
+        }
+        assert!(spawn_precheck_or_invoke_error(|| Ok(())).is_ok());
+    }
+
+    /// Anything unrecognised keeps today's untyped 200 invoke error.
+    #[test]
+    fn any_other_spawn_failure_stays_an_untyped_invoke_error() {
+        for text in UNRECOGNISED_SPAWN_FAILURES {
+            let (status, body) = answer(&TauriInvokeResponse::spawn_failed(text.to_string()));
+            assert_eq!(status, StatusCode::OK, "{text}");
+            assert!(body.get("code").is_none(), "{text}");
+            assert_eq!(body["error"], *text);
+        }
+    }
+}
+
+#[cfg(test)]
+mod terminal_create_coord_wiring_tests {
+    use super::*;
+    use crate::commands::terminal::coord_wiring::test_support;
+
+    /// ARMING TEST for plan
+    /// `2026-11-05-remote-session-end-reaches-the-target-but-cannot-end-a-real-session`
+    /// Phase 4: a pane created through the invoke proxy's `terminal_create`
+    /// arm carries a non-null `GET /terminals/{id}/coord-session`.
+    ///
+    /// Enters through [`proxy_terminal_created`], the arm's whole body after a
+    /// successful spawn — the spawn itself is a dead fixture pane, because
+    /// `TerminalManager::create` needs a live `AppHandle`. If the arm stops
+    /// running the shared post-create wiring, the pane is never bound and this
+    /// fails.
+    #[tokio::test]
+    async fn an_invoke_created_terminal_is_bound_to_a_coord_session() {
+        let fx = test_support::registry();
+        let tm = Arc::new(TerminalManager::new());
+        let door = ProxyTerminalCreateDoor {
+            terminal_manager: tm.clone(),
+            session_registry: Some(fx.registry.clone()),
+            app_handle: None,
+        };
+        let session = Arc::new(crate::terminal::session::tests::make_test_session(
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+        ));
+        let info = session.info();
+        tm.insert_for_test(&info.id, session);
+
+        let reply = proxy_terminal_created(
+            &door,
+            info,
+            None,
+            ProxyTerminalCreated {
+                title: Some("invoke-created pane".to_string()),
+                intent_repo: None,
+                working_dir: None,
+                spawn_tenant: None,
+            },
+        )
+        .await;
+        assert!(reply.success, "{:?}", reply.error);
+        let id = reply.data.as_ref().expect("terminal info")["id"]
+            .as_str()
+            .expect("id")
+            .to_string();
+
+        let Json(body) = crate::mcp::terminals::coord_session_for(&tm, &id)
+            .unwrap_or_else(|_| panic!("terminal {id} is registered"));
+        let body = serde_json::to_value(&body).expect("serializes");
+        let coord = body["data"]["coord_session_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("coord-session must be non-null: {body}"));
+        let coord = uuid::Uuid::parse_str(coord).expect("a uuid");
+        assert_eq!(tm.get(&id).unwrap().coord_session_id(), Some(coord));
     }
 }

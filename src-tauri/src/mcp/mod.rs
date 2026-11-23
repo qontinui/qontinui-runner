@@ -78,6 +78,7 @@ pub mod extraction;
 pub mod file_browser;
 pub mod file_registry;
 pub mod findings_api;
+pub mod fleet_capacity_api;
 pub mod fleet_policy_poller;
 pub mod generation_rules_api;
 pub mod generator_eval;
@@ -101,6 +102,7 @@ pub mod mcp_servers;
 pub mod memory_consolidation_api;
 pub mod meta_optimizer_api;
 pub mod misc;
+pub mod model_gateway_read;
 pub mod models;
 pub mod monitors;
 pub mod observations_api;
@@ -117,6 +119,7 @@ pub mod plan_library;
 pub mod playwright;
 pub mod playwright_collection;
 pub mod policy_context;
+pub mod policy_tenant; // whose policy a session is briefed under (plan 2026-11-13-runner-policy-injection-uses-the-device-default-tenant-not-the-sessions)
 pub mod prm_export;
 pub mod probe_executor;
 pub mod processes;
@@ -142,10 +145,15 @@ pub mod reviews;
 pub mod saved_api_requests;
 pub mod scheduler;
 pub mod sdk_client;
+pub mod sdk_http;
 // The connect handshake's door tests (coord finding c89c2766), in a file of
 // their own so a whole-file revert of sdk_client.rs keeps them.
 #[cfg(test)]
 mod sdk_connect_door_tests;
+// Device pairing at the same doors, with a stand-in phone that gates its routes as
+// ui-bridge-native's pairing does.
+#[cfg(test)]
+mod device_pairing_door_tests;
 pub mod sdk_terminal_buffer;
 pub mod security_audit;
 pub mod server;

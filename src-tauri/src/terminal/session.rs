@@ -23,11 +23,13 @@ use super::exit_notice::{ExitNoticeSink, TauriExitSink};
 use super::grid::{Grid, GridPerformer, GridSnapshot};
 use super::interceptor::OutputInterceptor;
 use super::pane_io::{LocalPty, PaneIo, ScrubbedCommand};
+use super::spawn_refusal::SpawnFailure;
 use super::types::{TerminalId, TerminalInfo};
 use super::visibility::{
     ActivityDigestState, BackgroundHold, TerminalActivityWire, VisibilityState, VisibilityTier,
     ACTIVITY_DIGEST_LINES, ACTIVITY_EVENT,
 };
+use super::PYTHONUTF8_ENV;
 
 /// Shell integration scripts embedded at compile time.
 #[cfg(target_os = "windows")]
@@ -1505,6 +1507,11 @@ impl PaneExitFacts {
     }
 }
 
+/// Process-wide bind order for [`TerminalSession::coord_binding`]: every
+/// coord bind takes the next value, so "bound later" is a total order even
+/// between binds in the same clock tick.
+static COORD_BIND_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// A single PTY-backed terminal session.
 pub struct TerminalSession {
     /// Unique identifier for this terminal.
@@ -1619,6 +1626,19 @@ pub struct TerminalSession {
     /// terminal into the coordinator's session plane. `None` until wired;
     /// read by `terminal_close` so it can close the coord mirror.
     coord_session_id: Arc<Mutex<Option<uuid::Uuid>>>,
+    /// When `coord_session_id` was last bound, as a process-wide monotonic
+    /// sequence ([`COORD_BIND_SEQ`]); `0` until bound. Lets
+    /// `TerminalManager::coord_session_id_for_pinned` pick the most recently
+    /// bound of several live panes pinned to one harness id (a respawn or
+    /// account migration whose old pane has not closed yet).
+    coord_bound_seq: AtomicU64,
+    /// The wall-clock instant `coord_session_id` was last bound, in unix
+    /// MILLISECONDS (the unit of a lifecycle record's `finished_at`); `0`
+    /// until bound. Stamped beside [`Self::coord_bound_seq`] — the sequence
+    /// orders binds, this dates them — so the registrar's pane-row owner can
+    /// say when a pin's ownership of the row began (plan
+    /// `2026-11-12-transcript-autobind-adopts-a-previous-boot-row-that-a-live-pane-has-replaced`).
+    coord_bound_at_ms: std::sync::atomic::AtomicI64,
     /// The `claude --name` this session was spawned with (runner-spawned
     /// continuations only). Immutable once set; surfaced to the webview as the
     /// tab's `spawnName` (shared `TerminalInfo` is schema-owned and carries no
@@ -1754,7 +1774,13 @@ impl TerminalSession {
         extra_env: Option<Vec<(String, String)>>,
         resource_override: bool,
         spawn_tenant: Option<uuid::Uuid>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, SpawnFailure> {
+        // Every failure is typed by whether the child process may already have
+        // started (`SpawnFailure::child_started`): a door may remove the
+        // worktree it allocated for this spawn only when none did. Everything
+        // up to and including the child spawn below is `before_child`; from
+        // `spawn_with_io` on it is `after_child`.
+        //
         // Spawn-time resource gate — BEFORE the PTY is opened, so a refusal
         // leaves no half-built session behind and nothing already running is
         // touched. Below the warn floor this emits a notice and returns
@@ -1765,7 +1791,8 @@ impl TerminalSession {
             "terminal session",
             resource_override,
             Some(&app_handle),
-        )?;
+        )
+        .map_err(SpawnFailure::before_child)?;
 
         // The pane's backend: in-process `LocalPty`, or — behind
         // `terminal.pty_holder`, default ON on Linux since Phase 5 — an out-of-process PTY holder
@@ -1786,7 +1813,7 @@ impl TerminalSession {
         );
         let opened = match backend {
             crate::terminal::daemon_pane_io::PaneBackend::LocalPty => {
-                Some(LocalPty::open(&id, cols, rows)?)
+                Some(LocalPty::open(&id, cols, rows).map_err(SpawnFailure::before_child)?)
             }
             crate::terminal::daemon_pane_io::PaneBackend::Holder => None,
         };
@@ -1915,7 +1942,8 @@ impl TerminalSession {
                 spawn_tenant,
                 served_probe,
             )
-        }?;
+        }
+        .map_err(SpawnFailure::before_child)?;
         let pinned_session_id = seam.pinned_session_id;
         let permission_request_hook = crate::session::claude_hook::permission_request_hook_for(
             Some(&spawn_argv),
@@ -1956,9 +1984,17 @@ impl TerminalSession {
         // body this pane never got. A direct exec is skipped: its argv carrier
         // and its marker were settled together by the caller (`extra_env`),
         // after the inherited pair was scrubbed above.
+        //
+        // WHOSE body: the tenant the coord-mcp proxy decides for the nonce the
+        // seam above just provisioned for this terminal — the tenant every coord
+        // call of this pane's session acts as (plan
+        // `2026-11-13-runner-policy-injection-uses-the-device-default-tenant-not-the-sessions`
+        // Design §6). Bounded wait; an unresolved tenant composes no body.
         if is_shell_pane {
+            let policy_tenant =
+                crate::mcp::policy_tenant::resolve_shell_pane_policy_tenant(&id, &cwd);
             for (name, value) in
-                crate::session::spawn_prompt::shell_pane_prompt_env(&runner_context)
+                crate::session::spawn_prompt::shell_pane_prompt_env(&runner_context, policy_tenant)
             {
                 match value {
                     Some(v) => cmd.env(name, v),
@@ -1994,10 +2030,15 @@ impl TerminalSession {
         // above already ran the same scrub as the production env tail.
         let sealed = ScrubbedCommand::seal(cmd);
         let io: Arc<dyn PaneIo> = match opened {
-            Some(opened) => Arc::new(opened.spawn(sealed)?),
+            // A local spawn that fails started no child.
+            Some(opened) => Arc::new(opened.spawn(sealed).map_err(SpawnFailure::before_child)?),
+            // A holder failure has already been through the holder AND its
+            // in-process fallback; a holder process may have started before
+            // its attach was refused, so it is not proven child-free.
             None => crate::terminal::daemon_pane_io::spawn_holder_pane_or_fallback(
                 &id, sealed, cols, rows,
-            )?,
+            )
+            .map_err(SpawnFailure::after_child)?,
         };
 
         let session = Self::spawn_with_io(
@@ -2011,7 +2052,10 @@ impl TerminalSession {
             interceptor,
             io,
             pinned_session_id,
-        )?;
+        )
+        // The child is running from here on: a failure to wire its reader or
+        // writer leaves it to `abandon_pane`, which this caller cannot verify.
+        .map_err(SpawnFailure::after_child)?;
         // Only THIS path records it: an adopted holder pane or a remote mirror
         // is built by `spawn_with_io` alone and reads `absent` — and holds no
         // grant, so the pad never answers its prompts.
@@ -2657,6 +2701,8 @@ impl TerminalSession {
             output_tx,
             grid,
             coord_session_id,
+            coord_bound_seq: AtomicU64::new(0),
+            coord_bound_at_ms: std::sync::atomic::AtomicI64::new(0),
             spawn_name: std::sync::OnceLock::new(),
             permission_request_hook: std::sync::OnceLock::new(),
             permission_request_nonce: std::sync::OnceLock::new(),
@@ -2675,8 +2721,9 @@ impl TerminalSession {
 
     /// The terminal-INVARIANT half of the PTY child's environment: the nested-
     /// session markers this seam strips, `TERM`, the runner-context markers and
-    /// port, the continuation-verdict forward, the runner briefing, and the
-    /// non-interactive git credential posture.
+    /// port, the continuation-verdict forward, the runner briefing, the
+    /// non-interactive git credential posture, and the Windows `PYTHONUTF8=1`
+    /// default.
     ///
     /// Runs FIRST, before the caller-supplied `extra_env`, so a caller can
     /// intentionally override any of it; the credential scrub in
@@ -2797,6 +2844,34 @@ impl TerminalSession {
         // `credential_helper::non_interactive_git_env` for the three layers,
         // the precedence rationale, and the named trade-off.
         crate::credential_helper::apply_non_interactive_git_env_pty(cmd);
+        Self::apply_python_utf8_default(cmd, cfg!(windows));
+    }
+
+    /// Python UTF-8 mode for the session's Python on Windows.
+    ///
+    /// Windows Python's text I/O defaults to the ANSI code page (e.g. cp1252),
+    /// so a session helper that prints a character outside it to a pipe
+    /// crashes. That has published corrupted input: an almost-empty PR body
+    /// that wiped coord's trailers (plan
+    /// `2026-11-08-plan-stamp-and-pr-body-publish-doors-trust-a-corrupted-input-file`,
+    /// Phase 3). `PYTHONUTF8=1` makes stdio and `open()` default to UTF-8.
+    /// It does NOT change newline translation: a text-mode write on Windows
+    /// still turns LF into CRLF, which the plan-stamp door's shape gate
+    /// (qontinui-claude-config `land-plan-stamp.sh`) refuses instead.
+    ///
+    /// Set only on Windows, and only when the variable is not already set
+    /// (inherited from the runner's own environment): an operator override,
+    /// including `PYTHONUTF8=0`, wins. It runs before the caller's
+    /// `extra_env`, so a caller can override it as well. This is the PTY seam;
+    /// the headless agent-session seams apply the same rule through
+    /// [`crate::terminal::apply_python_utf8_default_std`] /
+    /// [`crate::terminal::apply_python_utf8_default_tokio`]. The runner's own
+    /// Python subprocess is untouched.
+    /// `is_windows` is a parameter so the rule is testable on every host.
+    pub(crate) fn apply_python_utf8_default(cmd: &mut CommandBuilder, is_windows: bool) {
+        if is_windows && cmd.get_env(PYTHONUTF8_ENV).is_none() {
+            cmd.env(PYTHONUTF8_ENV, "1");
+        }
     }
 
     /// The `CLAUDE_CONFIG_DIR` a caller pinned onto this PTY through
@@ -4627,9 +4702,18 @@ impl TerminalSession {
 
     /// Set the coord-native session id after `register_external()` wires
     /// this terminal into the coordinator's session plane.
+    ///
+    /// Also stamps the bind order ([`Self::coord_binding`]), so the newest
+    /// bound pane wins among several pinned to one harness id.
     pub fn set_coord_session_id(&self, id: uuid::Uuid) {
         if let Ok(mut slot) = self.coord_session_id.lock() {
             *slot = Some(id);
+            self.coord_bound_seq.store(
+                COORD_BIND_SEQ.fetch_add(1, Ordering::Relaxed) + 1,
+                Ordering::Relaxed,
+            );
+            self.coord_bound_at_ms
+                .store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
         }
     }
 
@@ -4676,6 +4760,41 @@ impl TerminalSession {
     /// Read the coord-native session id, if one has been wired.
     pub fn coord_session_id(&self) -> Option<uuid::Uuid> {
         self.coord_session_id.lock().ok().and_then(|g| *g)
+    }
+
+    /// The coord-native session id together with its bind order (a
+    /// process-wide sequence; larger = bound later), if one has been wired.
+    /// Read under the slot lock, so the pair is never torn.
+    pub fn coord_binding(&self) -> Option<(uuid::Uuid, u64)> {
+        let slot = self.coord_session_id.lock().ok()?;
+        slot.map(|id| (id, self.coord_bound_seq.load(Ordering::Relaxed)))
+    }
+
+    /// The coord row, its bind instant (unix ms, the unit of a lifecycle
+    /// record's `finished_at`) and its bind sequence ([`Self::coord_binding`])
+    /// in one read under the slot lock: `Some(Some((row, at, seq)))` when
+    /// bound, `Some(None)` when not, and `None` when the slot's lock is
+    /// poisoned — UNKNOWN, never "not bound".
+    pub fn coord_row_with_bound_at(&self) -> Option<Option<(uuid::Uuid, i64, u64)>> {
+        let slot = self.coord_session_id.lock().ok()?;
+        Some(slot.map(|id| {
+            (
+                id,
+                self.coord_bound_at_ms.load(Ordering::Relaxed),
+                self.coord_bound_seq.load(Ordering::Relaxed),
+            )
+        }))
+    }
+
+    /// Test-only: poison this terminal's coord slot lock.
+    #[cfg(test)]
+    pub(crate) fn poison_coord_slot_for_test(&self) {
+        let slot = self.coord_session_id.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = slot.lock().unwrap();
+            panic!("poisoning the coord slot for a test");
+        })
+        .join();
     }
 
     /// This terminal's id (the [`super::manager::TerminalManager`] key, and
@@ -4831,6 +4950,7 @@ impl TerminalSession {
         let guard = grid.lock().unwrap_or_else(|e| e.into_inner());
         let snap = guard.text_snapshot();
         crate::terminal::graceful_exit::ScreenText {
+            cursor_row_dim: Some(guard.row_dim_mask(snap.cursor_row)),
             lines: snap.lines,
             cursor_row: snap.cursor_row,
             cursor_col: snap.cursor_col,
@@ -5622,6 +5742,59 @@ pub(crate) mod tests {
         );
     }
 
+    /// Plan 2026-11-08-plan-stamp-and-pr-body-publish-doors-trust-a-corrupted-input-file
+    /// Phase 3: a Windows PTY child gets `PYTHONUTF8=1` unless it already has a
+    /// value, and a non-Windows child is left alone.
+    #[test]
+    fn python_utf8_default_sets_on_windows_when_unset() {
+        let mut cmd = CommandBuilder::new("dummy");
+        cmd.env_remove(PYTHONUTF8_ENV);
+        TerminalSession::apply_python_utf8_default(&mut cmd, true);
+        assert_eq!(
+            cmd.get_env(PYTHONUTF8_ENV).and_then(|v| v.to_str()),
+            Some("1"),
+            "a Windows session must run Python in UTF-8 mode"
+        );
+    }
+
+    #[test]
+    fn python_utf8_default_keeps_an_operator_override() {
+        let mut cmd = CommandBuilder::new("dummy");
+        cmd.env(PYTHONUTF8_ENV, "0");
+        TerminalSession::apply_python_utf8_default(&mut cmd, true);
+        assert_eq!(
+            cmd.get_env(PYTHONUTF8_ENV).and_then(|v| v.to_str()),
+            Some("0"),
+            "an inherited PYTHONUTF8 must win"
+        );
+    }
+
+    #[test]
+    fn python_utf8_default_is_windows_only() {
+        let mut cmd = CommandBuilder::new("dummy");
+        cmd.env_remove(PYTHONUTF8_ENV);
+        TerminalSession::apply_python_utf8_default(&mut cmd, false);
+        assert!(
+            cmd.get_env(PYTHONUTF8_ENV).is_none(),
+            "a non-Windows session must not gain PYTHONUTF8"
+        );
+    }
+
+    /// The seam itself carries the default on this host's platform, so dropping
+    /// the call from `apply_base_child_env` reddens a test (on Windows CI).
+    #[test]
+    fn pty_apply_base_child_env_applies_python_utf8_default_per_platform() {
+        let mut cmd = CommandBuilder::new("dummy");
+        cmd.env_remove(PYTHONUTF8_ENV);
+        TerminalSession::apply_base_child_env(&mut cmd);
+        let got = cmd.get_env(PYTHONUTF8_ENV).and_then(|v| v.to_str());
+        if cfg!(windows) {
+            assert_eq!(got, Some("1"));
+        } else {
+            assert_eq!(got, None);
+        }
+    }
+
     /// The non-interactive git credential posture, asserted from the ONE shared
     /// list so this seam cannot drift from the other seven. Removing the
     /// `apply_non_interactive_git_env_*` call from the production function
@@ -5975,6 +6148,8 @@ pub(crate) mod tests {
             output_tx,
             grid: Arc::new(Mutex::new(Grid::new(80, 24))),
             coord_session_id: Arc::new(Mutex::new(None)),
+            coord_bound_seq: AtomicU64::new(0),
+            coord_bound_at_ms: std::sync::atomic::AtomicI64::new(0),
             spawn_name: std::sync::OnceLock::new(),
             permission_request_hook: std::sync::OnceLock::new(),
             permission_request_nonce: std::sync::OnceLock::new(),
@@ -6222,6 +6397,12 @@ pub(crate) mod tests {
     ///   refusal observable: nothing typed, nothing killed.
     /// * [`bare_shell_pane`] — no `claude` at all, which every caller must still
     ///   be able to handle exactly as before.
+    /// * [`npm_claude_pane`] — a shell running ONE `node` process that a Claude
+    ///   Code registry record names: an npm-installed `claude` (plan Phase 15 /
+    ///   R0c-2). Its image alone reads as a bare shell; the registry witness
+    ///   is what makes every caller see it as the live `claude` it is. Unlike
+    ///   the two above, its probe runs the PRODUCTION derivation (registry
+    ///   read included) over a scripted table.
     ///
     /// The probe is the production `probe_claude_under`, answering from the
     /// scripted table (`graceful_exit::fake_process_table`) under a root pid no
@@ -6234,6 +6415,8 @@ pub(crate) mod tests {
         io: Arc<KillCountingPaneIo>,
         typed: Arc<Mutex<Vec<u8>>>,
         _scripted: crate::terminal::graceful_exit::fake_process_table::FakePane,
+        /// The Claude Code config dir a scripted TABLE's registry is read from.
+        _registry: Option<tempfile::TempDir>,
     }
 
     impl ScriptedPane {
@@ -6278,6 +6461,77 @@ pub(crate) mod tests {
             io,
             typed,
             _scripted: scripted,
+            _registry: None,
+        }
+    }
+
+    /// The `node` pid of [`npm_claude_pane`]'s npm-installed `claude`.
+    pub(crate) const NPM_CLAUDE_PID: u32 = 7_001;
+
+    /// A shell running one `node` process with ZERO children, which a Claude
+    /// Code registry record (`<config-dir>/sessions/7001.json`) names as the
+    /// same process — an npm-installed `claude` — see [`ScriptedPane`].
+    pub(crate) fn npm_claude_pane() -> ScriptedPane {
+        npm_claude_pane_as("test")
+    }
+
+    /// [`npm_claude_pane`] whose session reports `id` as its own id.
+    ///
+    /// `TerminalManager::list` names each pane by its SESSION's id, not by the
+    /// key `insert_for_test` stored it under. Production registers a session
+    /// under its own id, so the two never differ there; a test that goes
+    /// through `list` (the steward roster does) needs them equal too.
+    pub(crate) fn npm_claude_pane_as(id: &str) -> ScriptedPane {
+        use crate::process_capture::process_tree::ProcessSnapshot;
+
+        fn no_kernel(_: u32) -> Option<String> {
+            None
+        }
+        let registry = tempfile::tempdir().unwrap();
+        let config_dir = registry.path().join(".claude-npm");
+        std::fs::create_dir_all(config_dir.join("sessions")).unwrap();
+        // The process began at 20 s; `startedAt` is one second later, inside
+        // the +0.9 s to +78 s lag `claude_activity::START_LEAD_MS` documents
+        // as measured, so the record's identity check accepts it.
+        std::fs::write(
+            config_dir
+                .join("sessions")
+                .join(format!("{NPM_CLAUDE_PID}.json")),
+            format!(
+                r#"{{"pid":{NPM_CLAUDE_PID},"sessionId":"npm-session","status":"idle","startedAt":21000}}"#
+            ),
+        )
+        .unwrap();
+        let scripted = crate::terminal::graceful_exit::fake_process_table::register_table(|root| {
+            // A live read: `Default` alone is a stale table, which the probe
+            // reads as UNKNOWN.
+            let mut snapshot = ProcessSnapshot {
+                stale: false,
+                ..ProcessSnapshot::default()
+            };
+            for (pid, ppid, name, started) in
+                [(root, 1, "bash", 10), (NPM_CLAUDE_PID, root, "node", 20)]
+            {
+                snapshot.parent_map.entry(ppid).or_default().push(pid);
+                snapshot.creation_times.insert(pid, started);
+                snapshot.names.insert(pid, name.to_string());
+            }
+            crate::terminal::graceful_exit::fake_process_table::ScriptedTable {
+                snapshot,
+                config_dirs: vec![config_dir],
+                proc_start: no_kernel,
+            }
+        });
+        let (mut session, io, typed) =
+            live_prompt_parts(EMPTY_PROMPT, true, Some(scripted.root_pid));
+        session.id = id.to_string();
+        ScriptedPane {
+            session: Arc::new(session),
+            claude_pids: vec![NPM_CLAUDE_PID],
+            io,
+            typed,
+            _scripted: scripted,
+            _registry: Some(registry),
         }
     }
 

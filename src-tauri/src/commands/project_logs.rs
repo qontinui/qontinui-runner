@@ -5,15 +5,15 @@
 //! and/or a global profile reference.
 
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use tracing::{error, info, warn};
 
 use crate::error::AppError;
 use crate::settings::{self, GlobalLogSource};
+use qontinui_runner_lib::file_tail;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 use super::CommandResponse;
 
@@ -41,18 +41,24 @@ pub struct ProjectLogConfig {
     pub updated_at: Option<String>,
 }
 
-/// Content read from a log source
+/// Content read from a log source: a bounded tail of its file, never the whole
+/// file ([`file_tail::tail_lines`], at most [`file_tail::LOG_TAIL_CAP`] bytes).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogSourceContent {
     /// Source ID
     pub source_id: String,
     /// Source name
     pub source_name: String,
-    /// Log lines
+    /// The file's last lines, oldest first — at most the source's `tail_lines`
     pub lines: Vec<String>,
-    /// Total line count
-    pub total_lines: u64,
-    /// File path that was read
+    /// The file's line count, `Some` ONLY when the read covered the whole file.
+    /// A tail of a larger file is not counted (counting reads every byte, and
+    /// a day log reaches 2.9 GB), so `None` is "not counted", never zero.
+    pub total_lines: Option<u64>,
+    /// The file's size in bytes when it was read; `None` when it was not read
+    pub file_bytes: Option<u64>,
+    /// The file actually read: the configured path, or the newest dated
+    /// rotation of it when that path is absent (see [`resolve_source_file`])
     pub file_path: String,
     /// Last modified time
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -370,28 +376,6 @@ fn save_project_config(config: &ProjectLogConfig) -> Result<(), String> {
     Ok(())
 }
 
-/// Tail the last N lines from a file
-fn tail_file(path: &PathBuf, num_lines: u32) -> Result<(Vec<String>, u64), String> {
-    let file = File::open(path).map_err(|e| {
-        String::from(AppError::IoError(std::io::Error::new(
-            e.kind(),
-            format!("Failed to open file {}: {}", path.display(), e),
-        )))
-    })?;
-
-    let reader = BufReader::new(&file);
-    let all_lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
-    let total_lines = all_lines.len() as u64;
-
-    let start = if all_lines.len() > num_lines as usize {
-        all_lines.len() - num_lines as usize
-    } else {
-        0
-    };
-
-    Ok((all_lines[start..].to_vec(), total_lines))
-}
-
 /// Get file modification time as ISO string
 fn get_file_modified_time(path: &PathBuf) -> Option<String> {
     fs::metadata(path)
@@ -403,44 +387,84 @@ fn get_file_modified_time(path: &PathBuf) -> Option<String> {
         })
 }
 
-/// Helper: read a single GlobalLogSource and return LogSourceContent
+/// The file a source's configured `path` names.
+///
+/// Rotation-aware: a daily-rolling sink (e.g. the runner's own
+/// `qontinui-runner.log`) never writes the undated basename — the live file is
+/// `<basename>.<YYYY-MM-DD>`. When the configured literal path is absent, this
+/// resolves the newest matching dated sibling, so a source pointed at the
+/// stable basename reads the current rotation instead of reporting "File does
+/// not exist". A literal path that exists always wins.
+///
+/// `pub(crate)` for the `/debug/app/errors` scan, which reads the same
+/// configured sources and must resolve them the same way.
+pub(crate) fn resolve_source_file(configured: impl AsRef<Path>) -> PathBuf {
+    let path = configured.as_ref().to_path_buf();
+    if !path.exists() {
+        if let (Some(dir), Some(prefix)) =
+            (path.parent(), path.file_name().and_then(|n| n.to_str()))
+        {
+            if let Some(newest) = crate::paths::resolve_newest_rolling_file(dir, prefix) {
+                return newest;
+            }
+        }
+    }
+    path
+}
+
+/// Read one global source: resolve its file ([`resolve_source_file`]), then
+/// take one bounded tail of it. Blocking file I/O — call it off the main
+/// thread and off the async executor.
 fn read_global_source(source: &GlobalLogSource) -> LogSourceContent {
-    let path = PathBuf::from(&source.path);
+    let path = resolve_source_file(&source.path);
+    let mut content = LogSourceContent {
+        source_id: source.id.clone(),
+        source_name: source.name.clone(),
+        lines: Vec::new(),
+        total_lines: None,
+        file_bytes: None,
+        // The file actually read (it may be the resolved dated rotation), not
+        // the configured basename, so a caller can `tail -f` the right file.
+        file_path: path.to_string_lossy().into_owned(),
+        last_modified: None,
+        error: None,
+    };
 
     if !path.exists() {
-        return LogSourceContent {
-            source_id: source.id.clone(),
-            source_name: source.name.clone(),
-            lines: Vec::new(),
-            total_lines: 0,
-            file_path: source.path.clone(),
-            last_modified: None,
-            error: Some("File does not exist".to_string()),
-        };
+        content.error = Some("File does not exist".to_string());
+        return content;
     }
+    content.last_modified = get_file_modified_time(&path);
 
-    let last_modified = get_file_modified_time(&path);
-
-    match tail_file(&path, source.tail_lines) {
-        Ok((lines, total_lines)) => LogSourceContent {
-            source_id: source.id.clone(),
-            source_name: source.name.clone(),
-            lines,
-            total_lines,
-            file_path: source.path.clone(),
-            last_modified,
-            error: None,
-        },
-        Err(e) => LogSourceContent {
-            source_id: source.id.clone(),
-            source_name: source.name.clone(),
-            lines: Vec::new(),
-            total_lines: 0,
-            file_path: source.path.clone(),
-            last_modified,
-            error: Some(e),
-        },
+    match file_tail::tail_lines(&path, source.tail_lines as usize, file_tail::LOG_TAIL_CAP) {
+        Ok(tail) => {
+            content.lines = tail.lines;
+            content.total_lines = tail.total_lines;
+            content.file_bytes = Some(tail.file_bytes);
+        }
+        Err(e) => {
+            content.error = Some(format!("Failed to read file {}: {}", path.display(), e));
+        }
     }
+    content
+}
+
+/// Run a log read on a blocking thread and await it. The read commands are
+/// `async` for this: as sync commands Tauri ran them on the main thread, where
+/// a slow or large read froze the window (plan
+/// `2026-11-11-runner-glibc-arena-retention-and-whole-log-tail` Phase 2). A
+/// read that panics answers as a failure rather than dropping the IPC call.
+async fn read_off_main_thread<F>(read: F) -> CommandResponse
+where
+    F: FnOnce() -> CommandResponse + Send + 'static,
+{
+    spawn_blocking_tracked(read)
+        .await
+        .unwrap_or_else(|e| CommandResponse {
+            success: false,
+            message: Some(format!("Log read failed: {e}")),
+            data: None,
+        })
 }
 
 // =============================================================================
@@ -590,9 +614,16 @@ pub fn delete_project_config(project_id: String) -> CommandResponse {
     }
 }
 
-/// Read content from a single log source by global source ID
+/// Read content from a single log source by global source ID.
+///
+/// `async`, with the body on a blocking thread ([`read_off_main_thread`]). The
+/// command name and its JS contract are unchanged.
 #[tauri::command]
-pub fn read_log_source(source_id: String) -> CommandResponse {
+pub async fn read_log_source(source_id: String) -> CommandResponse {
+    read_off_main_thread(move || read_log_source_blocking(&source_id)).await
+}
+
+fn read_log_source_blocking(source_id: &str) -> CommandResponse {
     let global_settings = settings::get_global_log_source_settings();
 
     let source = match global_settings.sources.iter().find(|s| s.id == source_id) {
@@ -615,10 +646,17 @@ pub fn read_log_source(source_id: String) -> CommandResponse {
     }
 }
 
-/// Read content from all resolved log sources for a project
+/// Read content from all resolved log sources for a project.
+///
+/// `async`, with the body on a blocking thread ([`read_off_main_thread`]). The
+/// command name and its JS contract are unchanged.
 #[tauri::command]
-pub fn read_project_logs(project_id: String) -> CommandResponse {
-    let config = match load_project_config(&project_id) {
+pub async fn read_project_logs(project_id: String) -> CommandResponse {
+    read_off_main_thread(move || read_project_logs_blocking(&project_id)).await
+}
+
+fn read_project_logs_blocking(project_id: &str) -> CommandResponse {
+    let config = match load_project_config(project_id) {
         Ok(Some(config)) => config,
         Ok(None) => {
             return CommandResponse {
@@ -740,18 +778,162 @@ pub fn append_project_log(
     }
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_project_logs")
-        .invoke_handler(tauri::generate_handler![
-            get_project_log_config,
-            save_project_log_config,
-            list_project_configs,
-            delete_project_config,
-            read_log_source,
-            read_project_logs,
-            get_project_directories,
-            append_project_log,
-        ])
-        .build()
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A source with every unset field at its serde default — the shape the
+    /// global settings file stores.
+    fn source(path: &Path, tail_lines: u32) -> GlobalLogSource {
+        serde_json::from_value(serde_json::json!({
+            "id": "source-test",
+            "name": "Test log",
+            "description": "",
+            "path": path.to_string_lossy(),
+            "tail_lines": tail_lines,
+        }))
+        .expect("a minimal source deserializes")
+    }
+
+    fn write_lines(path: &Path, prefix: &str, count: usize) {
+        let text: String = (0..count).map(|i| format!("{prefix} {i}\n")).collect();
+        std::fs::write(path, text).unwrap();
+    }
+
+    fn set_mtime(path: &Path, unix_secs: i64) {
+        filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(unix_secs, 0)).unwrap();
+    }
+
+    /// A rolling sink never writes its undated basename. A source pointed at
+    /// the basename reads the NEWEST dated rotation — the resolution this
+    /// module took over from the deleted `read_global_log_sources` — and
+    /// reports that file as the one read.
+    #[test]
+    fn a_rolling_basename_reads_its_newest_dated_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let older = dir.path().join("app.log.2026-11-10");
+        let newer = dir.path().join("app.log.2026-11-11");
+        write_lines(&older, "old", 3);
+        write_lines(&newer, "new", 3);
+        set_mtime(&older, 1_790_000_000);
+        set_mtime(&newer, 1_790_086_400);
+
+        let content = read_global_source(&source(&dir.path().join("app.log"), 2));
+        assert_eq!(content.error, None);
+        assert_eq!(content.lines, ["new 1", "new 2"]);
+        assert_eq!(content.total_lines, Some(3));
+        assert_eq!(content.file_path, newer.to_string_lossy());
+    }
+
+    /// A configured path that exists is read as configured, even beside a
+    /// newer rotation of it.
+    #[test]
+    fn a_literal_path_that_exists_wins_over_a_newer_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let literal = dir.path().join("app.log");
+        let rotation = dir.path().join("app.log.2026-11-11");
+        write_lines(&literal, "literal", 2);
+        write_lines(&rotation, "rotated", 2);
+        set_mtime(&literal, 1_790_000_000);
+        set_mtime(&rotation, 1_790_086_400);
+
+        let content = read_global_source(&source(&literal, 10));
+        assert_eq!(content.lines, ["literal 0", "literal 1"]);
+        assert_eq!(content.file_path, literal.to_string_lossy());
+    }
+
+    #[test]
+    fn a_missing_source_reports_that_it_does_not_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent.log");
+        let content = read_global_source(&source(&path, 10));
+        assert_eq!(content.error.as_deref(), Some("File does not exist"));
+        assert!(content.lines.is_empty());
+        assert_eq!(content.total_lines, None, "unread is not zero lines");
+        assert_eq!(content.file_bytes, None);
+        assert_eq!(content.file_path, path.to_string_lossy());
+    }
+
+    /// A log larger than the first window is tailed, not read whole: its size
+    /// is reported, its line count is not.
+    #[test]
+    fn a_log_larger_than_the_first_window_is_tailed_without_a_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.log");
+        write_lines(&path, "entry", 20_000);
+        let size = std::fs::metadata(&path).unwrap().len();
+        assert!(size > file_tail::TAIL_FIRST_WINDOW);
+
+        let content = read_global_source(&source(&path, 3));
+        assert_eq!(content.error, None);
+        assert_eq!(content.lines, ["entry 19997", "entry 19998", "entry 19999"]);
+        assert_eq!(content.total_lines, None);
+        assert_eq!(content.file_bytes, Some(size));
+    }
+
+    /// The wire shape the frontend's `RawLogContent` reads: `total_lines` and
+    /// `file_bytes` are always present, and `null` when unknown — never
+    /// omitted, never a 0 standing in for "unknown".
+    #[test]
+    fn unknown_sizes_serialize_as_null_not_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = read_global_source(&source(&dir.path().join("absent.log"), 10));
+        let value = serde_json::to_value(content).unwrap();
+        let object = value.as_object().unwrap();
+        assert_eq!(object.get("total_lines"), Some(&serde_json::Value::Null));
+        assert_eq!(object.get("file_bytes"), Some(&serde_json::Value::Null));
+    }
+
+    /// Both read commands run off the main thread: each is an `async fn` whose
+    /// future is `Send`, which Tauri spawns on its runtime instead of running
+    /// it on the main thread. Constructed and never polled — polling would read
+    /// the operator's settings.
+    #[test]
+    fn the_log_read_commands_are_async() {
+        fn assert_send_future<F: std::future::Future<Output = CommandResponse> + Send>(_: F) {}
+        assert_send_future(read_log_source(String::new()));
+        assert_send_future(read_project_logs(String::new()));
+    }
+
+    /// The CODE of the production fn whose signature starts `header`: only
+    /// the half above the test module is searched, so this test's own text
+    /// (which names the needle) can never match; comments are removed and
+    /// string and char literals emptied, so only call syntax can match.
+    fn prod_fn_body(header: &str) -> String {
+        let src = include_str!("project_logs.rs");
+        let (prod, _) = src.split_once("#[cfg(test)]").expect("a test module");
+        let (_, rest) = prod
+            .split_once(header)
+            .unwrap_or_else(|| panic!("`{header}` not found"));
+        let (body, _) = rest.split_once("\n}\n").expect("fn closed at column 0");
+        // Read through `process_helpers::code_lexer` (the lexer the lib's
+        // source guards and `ci_node::executor`'s pins use), so a removed hop
+        // cannot be satisfied by any comment or literal that still names it.
+        use crate::process_helpers::code_lexer::{code_only_from, Lex};
+        let mut lex = Lex::Code;
+        body.lines()
+            .map(|line| code_only_from(line, &mut lex))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Both read commands hand their body to `read_off_main_thread`, and that
+    /// helper hops to the blocking pool, so the read never runs on a tokio
+    /// worker or the main thread. `Send` alone (above) cannot see either hop
+    /// removed.
+    #[test]
+    fn the_log_read_commands_read_on_the_blocking_pool() {
+        for name in ["read_log_source", "read_project_logs"] {
+            let body = prod_fn_body(&format!("pub async fn {name}("));
+            assert!(
+                body.contains("read_off_main_thread("),
+                "{name} must read through read_off_main_thread"
+            );
+        }
+        let helper = prod_fn_body("async fn read_off_main_thread<F>(");
+        assert!(
+            helper.contains("spawn_blocking_tracked("),
+            "read_off_main_thread must hop to the blocking pool"
+        );
+    }
 }

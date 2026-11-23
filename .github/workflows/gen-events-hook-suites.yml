@@ -4,10 +4,12 @@ name: gen-events hook suites
 # in CI, so that a change to the hook or to the registry it reads is checked
 # even when the author's local hooks are not armed.
 #
-# The local wiring in `.pre-commit-config.yaml` (`gen-events-attribution-test`,
-# `gen-events-file-attribution-test`, `push-range-test`, `gen-events-drift-root`)
-# stays as it is. It gives the fast answer at commit time, and CONTRIBUTING.md
-# makes arming it opt-in. This workflow is the enforced copy of the same check.
+# The local wiring in `.pre-commit-config.yaml` stays as it is: hook ids
+# `gen-events-attribution-test` (which runs
+# `gen-events-drift-attribution-test.sh`), `gen-events-file-attribution-test`,
+# `gen-events-drift-root-test` and `push-range-test`. It gives the fast answer
+# at commit time, and CONTRIBUTING.md makes arming it opt-in. This workflow is
+# the enforced copy of the same check.
 # It matters most for `gen-events-file-attribution-test.sh`, which also checks
 # that THIS tree's `schema_export.rs`, `lib.rs` and `bin/export_schemas.rs`
 # still satisfy the registry reader's premises. A refactor that breaks one does

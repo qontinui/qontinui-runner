@@ -86,3 +86,21 @@ export function formatRelativeTime(timestamp: string | undefined | null): string
 
   return date.toLocaleDateString();
 }
+
+/**
+ * Human-readable byte size: `1536` → `"1.5 KB"`, `2_969_567_232` → `"2.8 GB"`.
+ *
+ * @param bytes - A size in bytes
+ * @returns The size in B, KB, MB, GB or TB (1024-based)
+ */
+export function formatBytes(bytes: number): string {
+  if (!bytes) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let v = bytes;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i += 1;
+  }
+  return `${v >= 100 || i === 0 ? Math.round(v) : v.toFixed(1)} ${units[i]}`;
+}

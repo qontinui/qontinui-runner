@@ -12,7 +12,7 @@
 //! delegation is needed. Each sample reads it for:
 //!
 //! * each watched slice ([`WATCHED_SLICES`]), from the directory its memory
-//!   entry was read from ([`read_slices`](super::read_slices)), else from its
+//!   entry was read from ([`read_slice_reads`](super::read_slice_reads)), else from its
 //!   first candidate that is a cgroup;
 //! * the runner's own unit cgroup, from the `0::` line of `/proc/self/cgroup`
 //!   (today `app.slice/qontinui-runner.service` under a user manager);
@@ -79,6 +79,12 @@
 //! not as the dispatch's: under docker's defaults (`system.slice`, or a
 //! `docker` cgroup under the root, by its cgroup driver) it is in the
 //! `system.slice` remainder or in `unattributed_usec`, not in the CI total.
+//! The same holds for anything a step moves out of its dispatch cgroup
+//! itself, `systemd-run --user --scope` the commonest way: such a scope is in
+//! the user manager it was started in, so its time is session work, or in the
+//! `user.slice` remainder, not CI. `cargo-guard`'s builds are the case in
+//! point: they land in `agent-builds.slice`, which is session work, so a CI
+//! step that builds through `cargo-guard` charges that build to sessions.
 //!
 //! A dispatch cgroup this read could not list is withheld like one no read
 //! listed (below). When `QONTINUI_CI_CGROUP_ROOT`, where `ci_node` makes every
@@ -214,16 +220,19 @@
 //! known, or one that could not be listed) are in the `user.slice` remainder
 //! and in `unattributed_usec`, which is where their time was spent.
 //! `cpu_attribution` names no slice and carries no memory field, so a reader
-//! grading slice memory sees an unmeasured entry.
+//! grading slice memory sees an unmeasured entry. The session class's memory
+//! is its own top-level key, `memory_attribution` ([`memory`]), which names no
+//! slice either.
 //!
 //! Every name is published only when its JSON form, quotes and escapes
 //! included, fits [`MAX_PUBLISHED_NAME_BYTES`], and at most
 //! [`MAX_CI_CHILDREN`] children are named. That bounds the whole
-//! `cgroup_slices` document at 4 top-level keys, about 11 KiB and depth 4 (a
-//! scalar counting 1, as coord counts), with no NUL (a cgroup name cannot hold
-//! one), inside the caps that coord#3567 gives the column (open, caps as of
-//! b461649cb: 16 keys, 16 KiB, depth 8) whatever the machine's cgroups are
-//! called.
+//! `cgroup_slices` document at 5 top-level keys (the 3 watched slices,
+//! `cpu_attribution`, and `memory_attribution` (whose few counts and byte
+//! totals add under 1 KiB)), about 12 KiB and depth 4 (a scalar counting 1, as
+//! coord counts), with no NUL (a cgroup name cannot hold one), inside the caps
+//! coord gives the column (`device_resource_slice_telemetry`: 16 keys,
+//! 16 KiB, depth 8) whatever the machine's cgroups are called.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -240,6 +249,10 @@ use super::{nested_parent, read, slice_bases, slice_dirs_in, SliceBases, WATCHED
 use crate::ci_node::cgroup::{
     candidate_parents, parse_unified_cgroup, DispatchCounts, CGROUP_ROOT_ENV, DISPATCH_DIR_PREFIX,
 };
+
+/// The memory half of the split (`memory_attribution`): the session class's
+/// `memory.current`, formed over this module's own placement and forest.
+pub(super) mod memory;
 
 /// The `cgroup_slices` key holding the class split.
 pub(super) const ATTRIBUTION_KEY: &str = "cpu_attribution";
@@ -740,11 +753,11 @@ struct Placement {
     /// `QONTINUI_CI_CGROUP_ROOT` set it makes them only there, so that
     /// directory must be [`followed`]; otherwise beside the runner's own
     /// cgroup, which must then be known. When not, a dispatch cgroup could be
-    /// anywhere ([`Withheld::find`]).
+    /// anywhere ([`Withheld::dispatch_reasons`]).
     dispatch_parents_unknown: Option<Why>,
     /// The CI dispatch cgroups ([`dispatch_cgroups`]). `None` when a directory
     /// they live in could not be listed, which withholds what one there would
-    /// be part of ([`Withheld::find`]): a dispatch cgroup is CI work inside
+    /// be part of ([`Withheld::dispatch_reasons`]): a dispatch cgroup is CI work inside
     /// the runner's unit.
     dispatches: Option<Vec<String>>,
     /// Each watched slice's directory ([`find_watched`]); its `cpu` object is
@@ -767,6 +780,40 @@ struct Placement {
     root_children: Option<Vec<String>>,
 }
 
+/// Where [`find_runner`] found the runner's cgroups: [`Placement`]'s
+/// `runner_unit`, `manager` and `holders`.
+struct RunnerPlacement {
+    unit: Option<String>,
+    manager: Option<String>,
+    holders: Option<Vec<String>>,
+}
+
+/// The runner's own unit, from `own_cgroup`, the body of `procfs`'s
+/// `self/cgroup` ([`parse_runner_unit`]), when that unit is a cgroup under
+/// `root`; the user manager the unit's path names ([`runner_manager`]: the
+/// `user@N.service` on it, else the one belonging to the `user-N.slice` on
+/// it), else the one of the user `procfs`'s `self/status` names
+/// ([`uid_manager`]); and the holder scopes under that manager
+/// ([`find_holders`]).
+fn find_runner(root: &Path, procfs: Option<&Path>, own_cgroup: Option<&str>) -> RunnerPlacement {
+    let unit = own_cgroup
+        .and_then(parse_runner_unit)
+        .filter(|rel| is_cgroup(&root.join(rel)));
+    let manager = unit.as_deref().and_then(runner_manager).or_else(|| {
+        procfs
+            .and_then(|p| read(&p.join("self").join("status")))
+            .and_then(|t| uid_manager(&t))
+    });
+    let holders = manager
+        .as_deref()
+        .and_then(|m| find_holders(root, m, unit.as_deref()));
+    RunnerPlacement {
+        unit,
+        manager,
+        holders,
+    }
+}
+
 /// The holder scopes under `manager`, relative to `root`, less the runner's own
 /// unit (a runner started from a pane runs in that pane's scope). `None` when a
 /// directory they live in could not be listed.
@@ -781,8 +828,80 @@ fn find_holders(root: &Path, manager: &str, runner_unit: Option<&str>) -> Option
     Some(rels)
 }
 
+/// Where [`find_dispatch`] found the CI dispatch cgroups: [`Placement`]'s
+/// `own`, `dispatch_parents`, `dispatch_parents_unknown` and `dispatches`.
+struct DispatchPlacement {
+    own: Option<String>,
+    parents: Vec<String>,
+    parents_unknown: Option<Why>,
+    cgroups: Option<Vec<String>>,
+}
+
+/// The runner's own cgroup, from `own_cgroup`, the body of `procfs`'s
+/// `self/cgroup` ([`parse_unified_cgroup`]), relative to the root: `None` when there is no
+/// body, it names none, or it names one through `.` or `..`. Then the
+/// directories `ci_node` makes CI dispatch cgroups in ([`dispatch_parents`]),
+/// why it could have made one in a directory they do not hold, and the
+/// dispatch cgroups in them ([`dispatch_cgroups`]). `ci_cgroup_root` is
+/// `QONTINUI_CI_CGROUP_ROOT`.
+fn find_dispatch(
+    root: &Path,
+    own_cgroup: Option<&str>,
+    ci_cgroup_root: Option<&Path>,
+) -> DispatchPlacement {
+    let own_path = own_cgroup.and_then(parse_unified_cgroup);
+    let parents = dispatch_parents(root, own_path.as_deref(), ci_cgroup_root);
+    let cgroups = dispatch_cgroups(root, &parents);
+    let own = own_path
+        .map(|o| o.trim_matches('/').to_string())
+        .filter(|rel| !has_dot_component(rel));
+    let parents_unknown = match ci_cgroup_root {
+        Some(dir) => followed(root, dir)
+            .is_none()
+            .then_some(Why::CiCgroupRootNotFollowed),
+        None => own.is_none().then_some(Why::OwnCgroupUnknown),
+    };
+    DispatchPlacement {
+        own,
+        parents,
+        parents_unknown,
+        cgroups,
+    }
+}
+
+/// Where [`find_slices`] found the slices: [`Placement`]'s `watched` and
+/// `users_unlisted`, and `ci.slice` with its children ([`find_ci`]).
+struct SlicePlacement {
+    watched: Vec<(&'static str, String)>,
+    users_unlisted: Vec<String>,
+    ci: CiPlacement,
+}
+
+/// The slices, under the bases [`slice_bases`] resolves: `ci.slice` with its
+/// children ([`find_ci`]), and each watched slice's directory
+/// ([`find_watched`]), the one `memory_dirs` names, else its first candidate
+/// under those bases that is a cgroup; and, relative to the root, the
+/// directories `slice_bases` could not list, each `user.slice` or a
+/// `user-N.slice` in it, with `user.slice` standing for one whose path is not
+/// UTF-8.
+fn find_slices(root: &Path, memory_dirs: &[(&'static str, PathBuf)]) -> SlicePlacement {
+    let SliceBases { bases, unlisted } = slice_bases(root);
+    // Each directory `slice_bases` could not list is `user.slice` or in it.
+    let users_unlisted = unlisted
+        .iter()
+        .map(|dir| rel_of(root, dir).unwrap_or_else(|| "user.slice".to_string()))
+        .collect();
+    let ci = find_ci(root, &bases);
+    let watched = find_watched(root, &bases, memory_dirs);
+    SlicePlacement {
+        watched,
+        users_unlisted,
+        ci,
+    }
+}
+
 /// Each watched slice's directory: the one its memory entry was read from
-/// (`memory_dirs`, from [`read_slices`](super::read_slices)), which is not
+/// (`memory_dirs`, from [`read_slice_reads`](super::read_slice_reads)), which is not
 /// looked for again, so its `cpu` object is of the same cgroup; for a slice
 /// with no memory entry, its first candidate under `bases` ([`slice_bases`])
 /// that is a cgroup.
@@ -805,8 +924,18 @@ fn find_watched(
         .collect()
 }
 
-/// `ci.slice`, its named children (name, path) and how many were not named.
-type CiPlacement = (Option<String>, Option<Vec<(String, String)>>, usize);
+/// Where [`find_ci`] found `ci.slice` and its `ci-*.slice` children.
+struct CiPlacement {
+    /// `ci.slice`'s path relative to the root; `None` when it is not here.
+    ci_slice: Option<String>,
+    /// Its named children, (name, path). `None` means `ci.slice` could not be
+    /// listed, so its children are UNKNOWN; `Some` of an empty list means they
+    /// are known to be none, which is also the answer when there is no
+    /// `ci.slice` at all.
+    children: Option<Vec<(String, String)>>,
+    /// How many `ci-*.slice` children were listed but not named.
+    omitted: usize,
+}
 
 /// `ci.slice` under `bases` ([`slice_bases`]), its `ci-*.slice` children by
 /// name, and how many of those were not named: at most [`MAX_CI_CHILDREN`]
@@ -818,11 +947,19 @@ fn find_ci(root: &Path, bases: &[PathBuf]) -> CiPlacement {
         .into_iter()
         .find(|d| is_cgroup(d))
     else {
-        return (None, Some(Vec::new()), 0);
+        return CiPlacement {
+            ci_slice: None,
+            children: Some(Vec::new()),
+            omitted: 0,
+        };
     };
     let ci_slice = rel_of(root, &dir);
     let Some(children) = child_dirs(&dir) else {
-        return (ci_slice, None, 0);
+        return CiPlacement {
+            ci_slice,
+            children: None,
+            omitted: 0,
+        };
     };
     let (mut named, mut omitted) = (Vec::new(), 0);
     for (name, child) in children {
@@ -839,7 +976,11 @@ fn find_ci(root: &Path, bases: &[PathBuf]) -> CiPlacement {
             _ => omitted += 1,
         }
     }
-    (ci_slice, Some(named), omitted)
+    CiPlacement {
+        ci_slice,
+        children: Some(named),
+        omitted,
+    }
 }
 
 /// The root's direct child cgroups; `None` when the root could not be listed.
@@ -856,7 +997,7 @@ fn find_root_children(root: &Path) -> Option<Vec<String>> {
 impl Placement {
     /// `procfs` names the runner's own cgroup and user, and `memory_dirs`
     /// where the watched slices' memory was read ([`measure`]);
-    /// `ci_cgroup_root` is `QONTINUI_CI_CGROUP_ROOT` ([`dispatch_cgroups`]).
+    /// `ci_cgroup_root` is `QONTINUI_CI_CGROUP_ROOT` ([`find_dispatch`]).
     fn find(
         root: &Path,
         procfs: Option<&Path>,
@@ -864,51 +1005,23 @@ impl Placement {
         memory_dirs: &[(&'static str, PathBuf)],
     ) -> Self {
         let own_cgroup = procfs.and_then(|p| read(&p.join("self").join("cgroup")));
-        let runner_unit = own_cgroup
-            .as_deref()
-            .and_then(parse_runner_unit)
-            .filter(|rel| is_cgroup(&root.join(rel)));
-        let manager = runner_unit.as_deref().and_then(runner_manager).or_else(|| {
-            procfs
-                .and_then(|p| read(&p.join("self").join("status")))
-                .and_then(|t| uid_manager(&t))
-        });
-        let holders = manager
-            .as_deref()
-            .and_then(|m| find_holders(root, m, runner_unit.as_deref()));
-        let own_path = own_cgroup.as_deref().and_then(parse_unified_cgroup);
-        let dispatch_parents = dispatch_parents(root, own_path.as_deref(), ci_cgroup_root);
-        let dispatches = dispatch_cgroups(root, &dispatch_parents);
-        let own = own_path
-            .map(|o| o.trim_matches('/').to_string())
-            .filter(|rel| !has_dot_component(rel));
-        let dispatch_parents_unknown = match ci_cgroup_root {
-            Some(dir) => followed(root, dir)
-                .is_none()
-                .then_some(Why::CiCgroupRootNotFollowed),
-            None => own.is_none().then_some(Why::OwnCgroupUnknown),
-        };
-        let SliceBases { bases, unlisted } = slice_bases(root);
-        // Each directory `slice_bases` could not list is `user.slice` or in it.
-        let users_unlisted = unlisted
-            .iter()
-            .map(|dir| rel_of(root, dir).unwrap_or_else(|| "user.slice".to_string()))
-            .collect();
-        let (ci_slice, ci_children, ci_children_omitted) = find_ci(root, &bases);
+        let runner = find_runner(root, procfs, own_cgroup.as_deref());
+        let dispatch = find_dispatch(root, own_cgroup.as_deref(), ci_cgroup_root);
+        let slices = find_slices(root, memory_dirs);
         let mut placement = Self {
-            runner_unit,
-            manager,
-            holders,
-            own,
-            dispatch_parents,
-            dispatch_parents_unknown,
-            dispatches,
-            watched: find_watched(root, &bases, memory_dirs),
-            users_unlisted,
+            runner_unit: runner.unit,
+            manager: runner.manager,
+            holders: runner.holders,
+            own: dispatch.own,
+            dispatch_parents: dispatch.parents,
+            dispatch_parents_unknown: dispatch.parents_unknown,
+            dispatches: dispatch.cgroups,
+            watched: slices.watched,
+            users_unlisted: slices.users_unlisted,
             session_slices: Vec::new(),
-            ci_slice,
-            ci_children,
-            ci_children_omitted,
+            ci_slice: slices.ci.ci_slice,
+            ci_children: slices.ci.children,
+            ci_children_omitted: slices.ci.omitted,
             root_children: find_root_children(root),
         };
         placement.session_slices = placement.find_session_slices(root);
@@ -966,8 +1079,8 @@ impl Placement {
     /// Could `rel` be a CI slice this read did not name because the user
     /// manager it is in could not be listed? That is when `rel` is `ci.slice`
     /// or a CI-class watched slice in one of [`Self::unlisted_ci_homes`].
-    /// [`Withheld::find`] withholds what one there is part of as unlisted, not
-    /// as gone. A dispatch cgroup is not a slice: one gone from the runner's
+    /// [`Withheld::unlisted_ci_slice`] withholds what one there is part of as
+    /// unlisted, not as gone. A dispatch cgroup is not a slice: one gone from the runner's
     /// unit is gone, whatever could be listed.
     fn unlisted_ci_slice_at(&self, rel: &str) -> bool {
         let name = rel.rsplit('/').next().unwrap_or(rel);
@@ -985,8 +1098,8 @@ impl Placement {
     /// Could `rel` be a dispatch cgroup this read did not list because it
     /// could not? That is when a directory dispatch cgroups are made in could
     /// not be listed and `rel` is a `dispatch-*` cgroup directly in one of
-    /// them. [`Withheld::find`] withholds what one there is part of as
-    /// unlisted, not as gone.
+    /// them. [`Withheld::dispatch_reasons`] withholds what one there is part
+    /// of as unlisted, not as gone.
     fn unlisted_dispatch_at(&self, rel: &str) -> bool {
         self.dispatches.is_none()
             && self.dispatch_parents.iter().any(|home| {
@@ -1123,6 +1236,16 @@ impl<'a> Forest<'a> {
     /// differently-classed runs directly inside it. `None` when a delta it needs
     /// is missing.
     fn class_totals(&self) -> BTreeMap<Class, Option<u64>> {
+        self.class_totals_by(exclusive)
+    }
+
+    /// [`Self::class_totals`] over whatever value the forest was built with,
+    /// `less_inner` taking a run's value less the runs inside it (the CPU
+    /// split's [`exclusive`], or the memory split's byte-sized twin).
+    fn class_totals_by(
+        &self,
+        less_inner: impl Fn(&str, u64, u64) -> Option<u64>,
+    ) -> BTreeMap<Class, Option<u64>> {
         let n = self.nodes.len();
         let mut out: BTreeMap<Class, Option<u64>> = BTreeMap::new();
         for h in (0..n).filter(|&i| self.run_head[i] == i) {
@@ -1135,7 +1258,7 @@ impl<'a> Forest<'a> {
             let (named, whole) = self.nodes[h];
             let own = whole
                 .zip(inner)
-                .and_then(|(w, s)| exclusive(&named.rel, w, s));
+                .and_then(|(w, s)| less_inner(&named.rel, w, s));
             let total = out.entry(named.class).or_insert(Some(0));
             *total = total.zip(own).map(|(t, o)| t.saturating_add(o));
         }
@@ -1175,17 +1298,13 @@ struct Withheld {
 }
 
 impl Withheld {
-    /// `after` is what `ci_node` had counted once this read's counters were
-    /// read, and the previous read kept what it had counted before it listed
-    /// the cgroups. A dispatch counted in between may have run where neither
-    /// listing saw it. An uncontained run alive then, or begun in between and
-    /// perhaps over already, ran in the runner's own cgroup in this interval,
-    /// or may have. A dispatch cgroup in a directory this read did not look in,
-    /// or could not list, was not listed either, however long it has run. One
-    /// the previous read listed is then missing from this read's for that
-    /// reason, whether or not it is gone, so it is withheld as unlisted
-    /// rather than reported gone. A CI slice in a user manager this read could
-    /// not list was not named at all ([`Placement::unlisted_ci_homes`]).
+    /// What this read withholds, and why. Three things leave a value
+    /// unmeasured: a named cgroup gone since the previous read
+    /// ([`Self::gone_cgroups`]), a CI slice in a user manager this read could
+    /// not list ([`Self::unlisted_ci_slice`]), and a dispatch whose time no
+    /// listed dispatch cgroup holds ([`Self::dispatch_reasons`],
+    /// [`Self::unlisted_dispatch`]). `after` is what `ci_node` had counted once
+    /// this read's counters were read.
     fn find(
         p: &Placement,
         prev: &Snapshot,
@@ -1194,6 +1313,47 @@ impl Withheld {
         forest: &Forest<'_>,
     ) -> Self {
         let mut w = Self::default();
+        if w.gone_cgroups(p, prev, named, forest) {
+            w.reasons.insert(Why::CgroupGone);
+        }
+        if w.unlisted_ci_slice(p, forest) {
+            w.reasons.insert(Why::UserSliceUnlisted);
+        }
+        let mut why = Self::dispatch_reasons(p, prev, after);
+        if !why.is_empty() && w.unlisted_dispatch(p, forest) {
+            // With the runner's own cgroup unknown, `unlisted_dispatch` could
+            // not tell where such a run was, and withheld everything.
+            if p.own.is_none() {
+                why.insert(Why::OwnCgroupUnknown);
+            }
+            w.reasons.extend(why);
+        }
+        w
+    }
+
+    /// The named cgroups of the previous read other than holder scopes
+    /// (`Snapshot`'s `strict`) that this read did not name, each taken as gone
+    /// since then ([`Self::lost`]). One this read did not look for is taken as
+    /// gone too, though it may still be there, such as the runner's unit once
+    /// `self/cgroup` could not be read, or a dispatch cgroup in a directory no
+    /// longer among the dispatch parents. Two kinds are left out, missing from
+    /// this read's listing because of what it could not list, whether or not
+    /// they are gone: while a directory dispatch cgroups are made in could not
+    /// be listed, a dispatch cgroup the previous read listed directly in any
+    /// of them ([`Placement::unlisted_dispatch_at`]), which is withheld as
+    /// unlisted ([`Self::dispatch_reasons`], [`Self::unlisted_dispatch`])
+    /// rather than reported gone; and a
+    /// CI slice the previous read named in a user manager this read could not
+    /// list ([`Placement::unlisted_ci_slice_at`], [`Self::unlisted_ci_slice`]).
+    /// True when that withholds anything.
+    fn gone_cgroups(
+        &mut self,
+        p: &Placement,
+        prev: &Snapshot,
+        named: &[Named],
+        forest: &Forest<'_>,
+    ) -> bool {
+        let mut any = false;
         for (rel, &class) in &prev.strict {
             if named.iter().any(|n| &n.rel == rel)
                 || p.unlisted_dispatch_at(rel)
@@ -1201,19 +1361,35 @@ impl Withheld {
             {
                 continue;
             }
-            if w.lost(rel, class, forest) {
-                w.reasons.insert(Why::CgroupGone);
-            }
+            any |= self.lost(rel, class, forest);
         }
-        let mut unlisted_ci = false;
+        any
+    }
+
+    /// A CI slice in a user manager this read could not list was not named at
+    /// all ([`Placement::unlisted_ci_homes`]): what one there would be part of
+    /// cannot be measured. True when that withholds anything.
+    fn unlisted_ci_slice(&mut self, p: &Placement, forest: &Forest<'_>) -> bool {
+        let mut any = false;
         for dir in p.unlisted_ci_homes() {
             // The slice would be in this directory, in no named cgroup:
             // `ci.slice` here stands for its place.
-            unlisted_ci |= w.lost(&child_rel(dir, "ci.slice"), Class::Ci, forest);
+            any |= self.lost(&child_rel(dir, "ci.slice"), Class::Ci, forest);
         }
-        if unlisted_ci {
-            w.reasons.insert(Why::UserSliceUnlisted);
-        }
+        any
+    }
+
+    /// Why a dispatch may have run since the previous read where no listed
+    /// dispatch cgroup holds its time, as far as `ci_node`'s counts and this
+    /// read's listing show; the module docs say what they cannot show. `after`
+    /// is what `ci_node` had counted once this read's counters were read, and
+    /// the previous read kept what it had counted before it listed the cgroups.
+    /// A dispatch counted in between may have run where neither listing saw it.
+    /// An uncontained run alive then, or begun in between and perhaps over
+    /// already, ran in the runner's own cgroup in this interval, or may have.
+    /// A dispatch cgroup in a directory this read did not look in, or could
+    /// not list, was not listed either, however long it has run.
+    fn dispatch_reasons(p: &Placement, prev: &Snapshot, after: DispatchCounts) -> BTreeSet<Why> {
         let mut why: BTreeSet<Why> = p.dispatch_parents_unknown.into_iter().collect();
         if p.dispatches.is_none() {
             why.insert(Why::DispatchDirUnlisted);
@@ -1226,15 +1402,7 @@ impl Withheld {
         {
             why.insert(Why::DispatchUncontained);
         }
-        if !why.is_empty() && w.unlisted_dispatch(p, forest) {
-            // With the runner's own cgroup unknown, `unlisted_dispatch` could
-            // not tell where such a run was, and withheld everything.
-            if p.own.is_none() {
-                why.insert(Why::OwnCgroupUnknown);
-            }
-            w.reasons.extend(why);
-        }
-        w
+        why
     }
 
     /// A cgroup of `class` at `rel` whose time this read cannot see. True when
@@ -1264,11 +1432,11 @@ impl Withheld {
     }
 
     /// A dispatch that may have run since the previous read where no listed
-    /// dispatch cgroup holds its time ([`Self::find`]): in a dispatch cgroup no
-    /// read listed, which is in a dispatch parent or the runner's own cgroup,
-    /// or in the runner's own cgroup itself. With that cgroup unknown, or a
-    /// `QONTINUI_CI_CGROUP_ROOT` that is not followed, it could be anywhere.
-    /// True when that withholds anything.
+    /// dispatch cgroup holds its time ([`Self::dispatch_reasons`]): in a
+    /// dispatch cgroup no read listed, which is in a dispatch parent or the
+    /// runner's own cgroup, or in the runner's own cgroup itself. With that
+    /// cgroup unknown, or a `QONTINUI_CI_CGROUP_ROOT` that is not followed, it
+    /// could be anywhere. True when that withholds anything.
     fn unlisted_dispatch(&mut self, p: &Placement, forest: &Forest<'_>) -> bool {
         let Some(own) = p
             .own
@@ -1494,13 +1662,13 @@ fn report(
 /// unit, holder scope or own cgroup, and so publishes no session total, and no
 /// CI total, remainder or `unattributed_usec` unless `ci_cgroup_root` is
 /// followed. `ci_cgroup_root` is `QONTINUI_CI_CGROUP_ROOT`. `memory_dirs` is
-/// the directory [`read_slices`](super::read_slices) read each watched slice's
+/// the directory [`read_slice_reads`](super::read_slice_reads) read each watched slice's
 /// memory from, which is where that slice's CPU is read ([`find_watched`]).
 /// `dispatches` says what `ci_node` has counted; it is called before the
 /// cgroups are listed and again after their counters are read
-/// ([`Withheld::find`]). `now` is called once the cgroups are placed and just
-/// before the counters are read, so listing the directories does not count in
-/// the interval.
+/// ([`Withheld::dispatch_reasons`]). `now` is called once the cgroups are
+/// placed and just before the counters are read, so listing the directories
+/// does not count in the interval.
 pub(super) fn measure(
     cgroup_root: &Path,
     procfs: Option<&Path>,

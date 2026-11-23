@@ -63,12 +63,14 @@ pub const REFRESH_BEFORE_EXPIRY_SECS: i64 = 4 * 60 * 60 / 3;
 /// COGNITO_ACCESS_TOKEN_TTL_SECS`: a threshold at or above the token's own
 /// lifetime makes [`AuthManager::cognito_token_needs_refresh`] permanently
 /// true, which turns every `check_auth_status` into a synchronous network
-/// round-trip. `cognito_threshold_is_below_token_ttl` pins it.
+/// round-trip. A `const _` assertion in this file's test module pins it, so a
+/// violation fails compilation of the test target (`check --all-targets`,
+/// `cargo test`).
 pub const COGNITO_REFRESH_BEFORE_EXPIRY_SECS: i64 = 60 * 60 / 3;
 
 /// The `expires_in` Cognito returns on both the code-for-token exchange and
 /// the refresh grant. Declared here so the threshold above can be pinned
-/// against it by a test rather than by a comment.
+/// against it by a compile-time assertion rather than by a comment.
 pub const COGNITO_ACCESS_TOKEN_TTL_SECS: i64 = 3_600;
 
 /// Minimal projection of a device-JWT payload — only the `exp` claim is
@@ -1411,6 +1413,12 @@ impl AuthManager {
     /// storage as every other credential.
     pub fn get_device_machine_key(&self) -> Result<Option<String>> {
         self.secure_storage.get_device_machine_key()
+    }
+
+    /// `(cognito_session, device_machine_key)` held, from one store load. See
+    /// [`SecureStorage::recovery_holdings`].
+    pub fn recovery_holdings(&self) -> Result<(bool, bool)> {
+        self.secure_storage.recovery_holdings()
     }
 
     /// `true` iff the Cognito access token is missing OR within
@@ -4019,14 +4027,15 @@ mod bearer_selection_tests {
                     if let Some(j) = legacy {
                         mgr.store_tokens(j, "").unwrap();
                     }
-                    let default_tenant = Some(if is_default { t } else { stranger });
+                    let default_id = if is_default { t } else { stranger };
+                    let default_tenant = Some(default_id);
                     // A device stating exactly ONE binding, the default one.
                     // Written per cell because `default_tenant` moves with it.
                     std::fs::write(
                         amb.dir().join("paired_user.json"),
                         serde_json::json!({
-                            "default_tenant_id": default_tenant.unwrap().to_string(),
-                            "bindings": [{"tenant_id": default_tenant.unwrap().to_string()}]
+                            "default_tenant_id": default_id.to_string(),
+                            "bindings": [{"tenant_id": default_id.to_string()}]
                         })
                         .to_string(),
                     )
@@ -5228,14 +5237,15 @@ mod bearer_selection_tests {
                     if let Some(j) = legacy {
                         mgr.store_tokens(j, "").unwrap();
                     }
-                    let default_tenant = Some(if is_default { t } else { stranger });
+                    let default_id = if is_default { t } else { stranger };
+                    let default_tenant = Some(default_id);
                     // A device stating exactly ONE binding, the default one.
                     // Written per cell because `default_tenant` moves with it.
                     std::fs::write(
                         amb.dir().join("paired_user.json"),
                         serde_json::json!({
-                            "default_tenant_id": default_tenant.unwrap().to_string(),
-                            "bindings": [{"tenant_id": default_tenant.unwrap().to_string()}]
+                            "default_tenant_id": default_id.to_string(),
+                            "bindings": [{"tenant_id": default_id.to_string()}]
                         })
                         .to_string(),
                     )
@@ -5936,20 +5946,23 @@ mod device_jwt_tests {
     /// token's own lifetime makes `cognito_token_needs_refresh` permanently
     /// true. The device-JWT constant (4_800s) violates it, which is exactly
     /// why Cognito may not borrow it.
-    #[test]
-    fn cognito_threshold_is_below_token_ttl() {
+    ///
+    /// Every operand is a constant, so this is a `const` item: a violation
+    /// fails `cargo check` / `clippy` of the test target, not a test run. (A
+    /// const panic message cannot interpolate; the constants are named in the
+    /// failing source line the compiler prints.)
+    const _: () = {
         assert!(
             COGNITO_REFRESH_BEFORE_EXPIRY_SECS < COGNITO_ACCESS_TOKEN_TTL_SECS,
             "a refresh threshold >= the token TTL makes every freshly-minted \
-             token instantly stale (threshold={COGNITO_REFRESH_BEFORE_EXPIRY_SECS}, \
-             ttl={COGNITO_ACCESS_TOKEN_TTL_SECS})"
+             token instantly stale"
         );
         assert!(
             REFRESH_BEFORE_EXPIRY_SECS >= COGNITO_ACCESS_TOKEN_TTL_SECS,
             "regression guard: the device-JWT threshold exceeds the Cognito \
              TTL, so reusing it for Cognito reintroduces the always-stale loop"
         );
-    }
+    };
 
     /// The reported symptom, at the unit level: store tokens exactly as
     /// `refresh_cognito_bearer` does after a successful grant

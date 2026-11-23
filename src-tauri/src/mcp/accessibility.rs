@@ -345,6 +345,14 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/a11y/focus", post(handle_focus))
         .route("/a11y/disconnect", post(handle_disconnect))
         .route("/a11y/ai_context", post(handle_ai_context))
+        // While a condition-check session holds a secret, a `{{secret:<ref>}}`
+        // placeholder sent here is refused before the handler runs: `type_text`, which types its `text` verbatim into a desktop app, never
+        // substitutes, so it would reach the app as literal text
+        // (`crate::condition_secrets`). LAST, because `Router::layer` wraps
+        // only the routes registered before it.
+        .layer(axum::middleware::from_fn(
+            crate::condition_secrets::refuse_unsubstituted_placeholders,
+        ))
 }
 
 // ============================================================================

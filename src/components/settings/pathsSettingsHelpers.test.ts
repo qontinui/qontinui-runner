@@ -33,6 +33,7 @@ import {
   tenantDraftsFrom,
   tenantIdsForField,
   tenantPathMap,
+  workspaceRootOrder,
   type PathSettings,
   type ScanDivergenceView,
 } from "./pathsSettingsHelpers";
@@ -97,6 +98,20 @@ describe("resolvedDiffers — configured vs. in effect", () => {
     expect(resolvedDiffers("/a/plans", "/b/plans")).toBe(true);
     // A parent is not its child.
     expect(resolvedDiffers("/a", "/a/plans")).toBe(true);
+  });
+});
+
+describe("workspaceRootOrder — the one resolution order", () => {
+  it("states every rung, the session repository's folder before the home default", () => {
+    expect(workspaceRootOrder({ runnerWide: false })).toBe(
+      "$QONTINUI_ROOT, then $QONTINUI_WORKSPACE_ROOT, then an ancestor walk from the runner executable, then the folder holding the repository a session was opened on (for that session), then <home>/qontinui-root",
+    );
+  });
+
+  it("leaves the per-session rung out of the runner-wide order", () => {
+    const order = workspaceRootOrder({ runnerWide: true });
+    expect(order).not.toContain("session");
+    expect(order.endsWith("then <home>/qontinui-root")).toBe(true);
   });
 });
 

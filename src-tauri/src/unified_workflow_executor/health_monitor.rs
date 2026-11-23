@@ -48,6 +48,28 @@ impl VerifierUiContext {
     }
 }
 
+/// Whether the verifier's UI summary lists an element of kind `el_type` as an
+/// interactive field. A classification by the element's own kind, so it
+/// names the precise kinds: `@qontinui/ui-bridge` 0.46 kinds an ARIA textbox
+/// or contenteditable `textbox` and a combobox / listbox `combobox` /
+/// `listbox` (the 0.38 registry said `input` / `custom` and `select`), which
+/// are as much a field to fill as the native ones.
+fn is_summarized_interactive_type(el_type: &str) -> bool {
+    matches!(
+        el_type,
+        "button"
+            | "input"
+            | "textbox"
+            | "select"
+            | "combobox"
+            | "listbox"
+            | "textarea"
+            | "link"
+            | "checkbox"
+            | "radio"
+    )
+}
+
 /// Fetch live UI Bridge data for the agentic verification loop's verifier.
 ///
 /// Concurrently fetches the UI snapshot, console errors, and app health status.
@@ -227,10 +249,8 @@ pub async fn fetch_verifier_ui_context(
             let interactive: Vec<_> = elements
                 .iter()
                 .filter(|el| {
-                    let el_type = el.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                    matches!(
-                        el_type,
-                        "button" | "input" | "select" | "textarea" | "link" | "checkbox" | "radio"
+                    is_summarized_interactive_type(
+                        el.get("type").and_then(|v| v.as_str()).unwrap_or(""),
                     )
                 })
                 .collect();
@@ -904,6 +924,19 @@ mod resume_context_tests {
     /// narration describes are disjoint, and together they cover every
     /// terminal row. A step can never be skipped as done AND narrated as
     /// outstanding.
+    #[test]
+    fn the_ui_summary_lists_the_kinds_0_46_moved() {
+        for kind in [
+            "input", "textbox", "select", "combobox", "listbox", "button",
+        ] {
+            assert!(is_summarized_interactive_type(kind), "{kind}");
+        }
+        // Negative controls: not fields.
+        for kind in ["generic", "option", "image", ""] {
+            assert!(!is_summarized_interactive_type(kind), "{kind}");
+        }
+    }
+
     #[test]
     fn replayed_and_narrated_checkpoints_are_disjoint() {
         let rows = vec![

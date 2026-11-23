@@ -190,8 +190,14 @@ repairing that, not replacing it.
 
 **And a push is not the publication — land the DRAFT with the helper.** Publish
 the committed plan with
-`bash <workspace-root>/qontinui-claude-config/scripts/land-plan-stamp.sh "<plans-repo-root>" "<repo-relative plan path>" "<local plan file>" "docs: add <plan-stem> (DRAFT)"`
-— the same helper §5 uses — rather than pushing a branch by hand. Whether the
+
+```bash
+bash <workspace-root>/qontinui-claude-config/scripts/land-plan-stamp.sh --based-on new \
+  "<plans-repo-root>" "<repo-relative plan path>" "<local plan file>" "docs: add <plan-stem> (DRAFT)"
+```
+
+— the same helper §5 uses (`--based-on new`: the file must not be on origin
+yet; exit 7 means it is, so vet the origin copy) — rather than pushing a branch by hand. Whether the
 plans repo needs a pull request is decided by the helper's ruleset probe of that
 repo's default branch, never by a sentence in a command: with no PR-requiring
 rule it lands the blob directly and prints `LANDED …`; with one, or when the
@@ -691,11 +697,21 @@ three ways relative to a whole-plan vet:
    status block.** Do not touch other phases' sections, and do not run the
    single-stamp-invariant full-block replace §5 describes for a whole-plan
    vet. Instead, splice that scoped entry into the existing status
-   blockquote using the same separate-index, pinned-`$BASE` push recipe
-   `CLAUDE.md` already documents for a shared checkout (`git hash-object -w`
-   → `GIT_INDEX_FILE=<tmp> git read-tree "$BASE"` → `update-index` →
-   `write-tree` → `commit-tree -p "$BASE"` → push), so a concurrent phase
-   session's own scoped edit is never clobbered by a full-block rewrite. The
+   blockquote and publish it with
+   `bash <workspace-root>/qontinui-claude-config/scripts/plumbing-push.sh --root <plans checkout> --branch main --put plans/<stem>.md=<edited file> --based-on plans/<stem>.md=<blob> --message "<subject>"`,
+   where `<blob>` is the `git rev-parse refs/remotes/origin/main:plans/<stem>.md`
+   you read (right after a fetch; the full ref, which a local branch named
+   `origin/main` cannot shadow) before splicing (its header carries the why: a
+   private index, a base pinned once, no empty sha ever pushed, the blob you
+   read compared with origin on every attempt, read-back), so a concurrent
+   phase session's own scoped edit is never clobbered by a full-block rewrite.
+   Exit 7 `CONFLICT` means origin no longer holds the blob you read — a peer
+   edited the plan after your read: re-read it, re-splice, re-run with the new
+   `--based-on`. Exit 5 `REFUSED` on `main` is a ruleset that requires a PR (push
+   a new branch with `--create` and open a PR) or a ruleset probe GitHub did not
+   answer — a rate limit or a transport failure (retry once the GitHub budget
+   resets or the network answers, or publish this single plan file through
+   `scripts/land-plan-stamp.sh`, which rides both). The
    scoped entry reads:
    ```
    Phase N: VETTED <date> (session <short-id>) — see § Phase N.
@@ -739,6 +755,23 @@ Two facts this run depends on are destroyed by its own later steps, so capture
 them **here**, while the plan on disk is still untouched and nothing has been
 written.
 
+**0. Read the plan from `origin`, and edit a scratch copy of THAT.** When the
+plans directory is inside a git repo, fetch
+(`git -C <plans-repo-root> fetch -q origin +refs/heads/main:refs/remotes/origin/main`,
+exit status read unpiped — a failed fetch is a STOP), record
+`BASED_ON=$(git -C <plans-repo-root> rev-parse -q --verify refs/remotes/origin/main:<repo-relative plan path>)`
+(the full ref, which a local branch named `origin/main` cannot shadow; empty:
+the plan is not on origin — publish it with `--based-on new` first, per
+the precondition above), and write `git -C <plans-repo-root> cat-file -p "$BASED_ON"`
+into a private scratch file (`mktemp -d`). **That scratch file is "the plan on
+disk" for every later step of this run** — the capture below, Step 1's `Read`,
+§4's `Edit`s and §5's stamp — and §5 publishes it with `--based-on "$BASED_ON"`.
+A shared checkout's copy may be far behind origin (a guard judging it never
+sees a peer's newer `IN PROGRESS`) and may hold a peer's uncommitted edit, so
+it is neither read nor written [policy: `git-operations`
+`shared-checkout-route-around`]. A plans directory that is a plain folder has
+no origin: there the local file is the plan.
+
 **1. The existing status block, verbatim** — its lifecycle token, its date, and
 any session marker, plus whether its HEADLINE carries `IN PROGRESS` after a
 non-terminal first token (guard rule 1 below — such a stamp is `IN PROGRESS`
@@ -772,7 +805,7 @@ conclusive ones). **Arm 6 is the DEFAULT**: anything not positively matched by
 | 4 | the error `no work-unit with that slug` (the MCP tool appends ` in your tenant`; the HTTP twin's 404 body deliberately does not, so it cannot leak whether the slug belongs to another tenant — match on the short form) — **and** `recon-tenant.sh` answered `MATCH`, or `MULTI` with every listed tenant folded `clear` (below the table) | The unit does not exist **in any tenant this device is bound to**. **The COMMONEST case** — a first-time vet of a `DRAFT` plan has no work unit, because §5.4 upserts it at the *end* of this run. | **Proceed to vet, and SAY the read was not-found.** An absent unit and an uncited-but-present unit are different facts; do not fold one into the other. |
 | 3 | a top-level `merged_degraded_reason` is present | **UNKNOWN, whatever `delivery` says.** The field sits BESIDE `delivery` and is present even when the verdict could not be derived at all; while it is set, every citation's `merged: false` is UNKNOWN rather than an observation. | Treat as arm 2. |
 | 2 | `evidence_complete: false` — **regardless of `shipped`** | **UNKNOWN — never "undelivered".** `evidence_gaps` names each gap. | Fall through to the stamp arms and **say the read was inconclusive**, per `verification-and-evidence` `unknown-must-not-render-as-a-default`. |
-| 1 | `shipped: true` ∧ `evidence_complete: true` ∧ the phase axis CORROBORATES it (the three extra conjuncts below the table — do not apply this arm without them) | The plan is closed **in substance**. | **Do NOT vet** (see "Act here" below). Route to closeout. |
+| 1 | `shipped: true` ∧ `evidence_complete: true` ∧ the phase axis CORROBORATES it — a non-empty `phases_declared_indices`, and **either** `phases_complete_scope` the literal `true` **or** every declared phase covered by `phases_delivered` or a resolved `phases_attested` entry, with at least one declared index in `phases_delivered` (the three extra conjuncts below the table — do not apply this arm without them) | The plan is closed **in substance**. | **Do NOT vet** (see "Act here" below). Route to closeout. |
 | 5 | `delivery` present ∧ no `merged_degraded_reason` ∧ `evidence_complete: true` ∧ `shipped: false` — **and** `recon-tenant.sh` answered `MATCH`, or `MULTI` with every listed tenant folded `clear` (below the table) | A clean, complete observation of *not delivered* **in every tenant this device is bound to** — including the zero-citation case. | Proceed to vet. |
 | 6 | **DEFAULT — anything not positively matched above.** Any error other than arm 4's, any unparseable or non-2xx body, a `citations_error` / `delivery_error` key, an absent `delivery`, or the tool masked / absent / on a dead transport (`"Command failed with no output"`) | **UNKNOWN.** Includes coord's `citation surface unavailable for work-unit …` (whose own text says it is NOT "this unit has no citations") and its generic `citation list failed: …`. | Treat as arm 2. On a dead transport run **`/coord-revive`** and re-issue over the live door before concluding anything. |
 
@@ -802,7 +835,7 @@ tenant's answer **by its RESPONSE SHAPE alone**, and fold with
 |---|---|
 | the error `no work-unit with that slug` (arm 4's body) | `clear` |
 | `delivery` present ∧ no `merged_degraded_reason` ∧ `evidence_complete: true` ∧ `shipped: false` (arm 5's body) | `clear` |
-| arm 1's body, all seven conjuncts — `shipped: true` ∧ `evidence_complete: true` ∧ no top-level `merged_degraded_reason` ∧ `phases_declared` not `null` ∧ `phases_remaining` the LITERAL `[]` ∧ that `[]` corroborated by the same response ∧ no `NO PHASE ATTRIBUTION` gap (the corroboration rule is arm 1's, below this table) | `found` |
+| arm 1's body, all seven conjuncts — `shipped: true` ∧ `evidence_complete: true` ∧ no top-level `merged_degraded_reason` ∧ `phases_declared` not `null` ∧ `phases_remaining` the LITERAL `[]` ∧ that `[]` corroborated by the same response (a non-empty `phases_declared_indices`, and either `phases_complete_scope` the literal `true` or every declared index in `phases_delivered` or in a resolved `phases_attested` entry, with at least one declared index in `phases_delivered`) ∧ no `NO PHASE ATTRIBUTION` gap (the corroboration rule is arm 1's, below this table) | `found` |
 | **any** body carrying a top-level `merged_degraded_reason`, whatever else it says (arm 3's rule, which shape-classification would otherwise bypass) | `unknown` |
 | anything else, or no answer at all | `unknown` |
 
@@ -879,27 +912,99 @@ arm 1 additionally requires all three of:
   never collapse the two when serialising the read (a `jq` `// []` default or a
   Python `or []` does exactly that);
 - **that `[]` corroborated by the same response**: `phases_declared_indices` is
-  non-empty and every index in it also appears in `phases_delivered`. When
-  `phases_declared_indices` is non-empty and `phases_delivered` does not cover
-  it, `[]` contradicts its own neighbours — coord is claiming nothing remains
-  while not having attributed every declared phase — so read it as UNKNOWN and
-  fall through. An
+  non-empty, and **either** `phases_complete_scope` is the literal `true`
+  **or** `phases_delivered` names at least one declared index and every declared index is
+  **covered** — it appears in `phases_delivered`, **or** it appears in
+  `phases_attested` **and** `phase_attestations` carries an entry with that
+  `phase_index` whose `resolution` is `"resolved"`. When `phases_complete_scope`
+  is not `true` and
+  `phases_declared_indices` is non-empty and that union does not cover it, `[]`
+  contradicts its own neighbours — coord is claiming nothing remains while
+  neither a landed attribution nor a live attestation covers every declared
+  phase — so read it as UNKNOWN and fall through. An
   EMPTY `phases_declared_indices` is not corroboration either, and neither is a
   `null` one — the spelling the nullable contract (plan
   `2026-09-18-coord-fabricates-a-phase-declaration-and-silences-its-own-gap`
   Phase 3) gives a declaration coord could not establish; and
 - no `NO PHASE ATTRIBUTION` entry in `evidence_gaps`.
 
+**A phase can be delivered by an ATTESTATION as well as a PR, and the
+corroboration counts both.** A phase whose correct output is not a PR — an
+evidence record, a measurement, a decision — is closed by
+`coord_work_unit_attest_phase`, pointing at the durable artifact that carries
+it. coord serves the result beside `phases_delivered`: `phases_attested` (the
+phases with a live, re-resolved attestation, never `null`) and
+`phase_attestations` (one row per attestation, `{phase_index, evidence_kind,
+evidence_ref, version, resolution}`, where only `resolution: "resolved"` rows
+reach `phases_attested`). coord unions that set into `phases_remaining` and
+`shipped` itself, so `phases_remaining: []` beside a `phases_delivered` short
+of the declaration, with the attested set covering the difference, is
+consistent, not a contradiction — and served policy `finished-criteria`
+`finished-is-per-element` says a phase is finished when its PRs merged *"or it
+is attested"*. Before this rule counted attestations, such a plan could never
+reach arm 1, `/verify-plan-status` §5 case 1 could never close it, and an
+`IN PROGRESS` stamp from a gone owner stayed forever (coord finding
+`426553fc`; read again 2026-10-31 with `coord_work_unit_list_citations` on unit
+`b9074f69`: declared `[0,1]`, `phases_delivered:
+[1]`, `phases_attested: [0]` with a resolved row, `phases_remaining: []`). What
+still holds, and why:
+
+- **Only a RESOLVED attestation covers.** An index in `phases_attested` with no
+  `phase_attestations` row for it whose `resolution` is `"resolved"` is not
+  counted. A `retracted`, `vanished` or `unreadable` row does not cover by
+  itself (one `resolved` row for that index suffices: a phase may carry one
+  attestation row per distinct `(evidence_kind, evidence_ref)`, so a retracted
+  or vanished row can sit beside a resolved one), and neither does an absent or
+  malformed `phase_attestations` or an attested index outside the declaration.
+  Each of those leaves the phase uncovered, which is UNKNOWN — never
+  permission.
+- **A coord that serves no `phases_attested`** (one predating plan
+  `2026-09-20-coord-delivery-has-no-verb-for-a-phase-that-ships-no-pr`
+  Phase 3) contributes nothing, and the test falls back to the PR-only reading.
+  That is the old, stricter answer, so an older build can only make arm 1
+  harder to reach, never easier.
+- **At least one DECLARED index must appear in `phases_delivered`** — at least
+  one declared phase PR-attributed, so a stop never rests on attestations
+  alone. "Non-empty" is not enough: coord does not clip `phases_delivered` to
+  the declaration (`delivery_view.rs`, *"Not clipped to the declaration"*), so a
+  landed PR scoped to an undeclared phase — an off-by-one between 0- and 1-based
+  numbering — leaves it non-empty while every declared phase is covered only by
+  attestation, and coord can then serve `shipped: true` with
+  `phases_remaining: []` and no `NO PHASE ATTRIBUTION` gap. Requiring a declared
+  index refuses that stop. A false negative here falls through to the stamp
+  arms, which still guard, while a false STOP has no guard after it.
+- **`phases_complete_scope: true` satisfies the coverage half by itself** (a
+  non-empty `phases_declared_indices` is still required). coord (on a coord carrying the `phases_complete_scope` change — the qontinui-coord PR is pending)
+  serves it `true` only when a LANDED, non-document citation's `Plan:`
+  marker declared `delivers: complete` — a landed PR attributed the whole plan,
+  so the stop still rests on a PR, not on attestations. Its residue — an author
+  over-declaring `complete` — is the same trust as a wrongly scoped `phases:`
+  marker, and "Corroboration is a bound, not a proof" below covers it. Only the
+  literal `true` counts: a coord that serves no `phases_complete_scope` (one
+  predating that field) keeps the stricter reading above, so an ABSENT field is
+  never read as `true`.
+- **`PHASE ATTESTED WITHOUT A PR` is a disclosure, not a blocker.** coord
+  appends it whenever an attested phase sits under `shipped: true`, after
+  `evidence_complete` is computed. Arm 1 keys on the `NO PHASE ATTRIBUTION`
+  entry alone, never on an empty gap list, so this gap does not stop it.
+
 A response failing any of those **is not arm 1**: it falls to arm 6, the
 DEFAULT, whose action is arm 2's — fall through to the stamp
 arms and say the read was inconclusive on the phase axis. **One sub-case is not
 inconclusive:** a NON-EMPTY `phases_remaining` beside `shipped: true` is a clean
 reading of PARTIAL delivery — report it as *"partially delivered, phases <list>
-remain — proceed"*; the action is the same. The corroboration test
-is deliberately **build-independent**: `phases_declared_indices` and
-`phases_delivered` are already served beside `phases_remaining` by the coord
-build running today, so it needs no deployment tell and returns the same verdict
-before and after the nullable contract lands. Note the field names are close
+remain — proceed"*; the action is the same. The PR-only half of the
+corroboration test is deliberately **build-independent**:
+`phases_declared_indices` and `phases_delivered` are served beside
+`phases_remaining` by every coord build this test meets, so it needs no
+deployment tell and returns the same verdict before and after the nullable
+contract lands. The attested half is **additive**: only builds carrying plan
+`2026-09-20-coord-delivery-has-no-verb-for-a-phase-that-ships-no-pr` Phase 3
+serve `phases_attested`, and on a build that serves none the union is just
+`phases_delivered` — the old, stricter answer — so the test still needs no
+deployment tell. The complete-scope branch is additive the same way: on a coord
+serving no `phases_complete_scope` it never fires, and the test reduces to its
+prior reading. Note the field names are close
 enough to mislead — `phases_declared` is a **count** (`Option<usize>`, `null`
 when coord never knew the plan's phase shape); the declared INDICES are the
 separate field used above.
@@ -926,10 +1031,11 @@ one contract read three times — the third reading is `/implement-plan`'s
 `IN PROGRESS` rule (Step 0.5), which defers to this arm's conjuncts.
 
 The cost is a **false negative**: a genuinely complete unit whose completeness
-was asserted some OTHER way falls through to the stamp arms. Two spellings, and the second is the larger population today. One: a citation
-declaring `complete`, which satisfies coord's coverage gate for a plan of any
-length while attributing no index at all. Two: landed citations carrying **no
-phase scope at all**, which leaves `phases_delivered` empty the same way — for
+was asserted some OTHER way falls through to the stamp arms. (A phase closed by
+a resolved attestation is no longer one of those ways — the corroboration above
+counts it — and nor is a landed citation declaring `complete`, which
+`phases_complete_scope` now carries.) One spelling remains: landed citations carrying **no
+phase scope at all**, which leaves `phases_delivered` empty — for
 a declaration of two or more phases that costs nothing new, because the
 `NO PHASE ATTRIBUTION` gap fires there and the third conjunct already blocked
 the arm; it bites on a **single-phase declaration**, where coord withholds that
@@ -944,7 +1050,7 @@ construction (see above). A `SHIPPED`, `SUPERSEDED` or `OBSOLETE` stamp, or a
 foreign `IN PROGRESS` whose session left PRs (unless it is case 2b's
 gate-delegated stamp and this run is that hold gate's continuation), still
 stops there; a complete plan
-still stamped `VETTED` or `DRAFT` (or `PARTIAL` / `NOT STARTED`) is re-vetted, and under `/vet-imp` the only
+still stamped `VETTED` or `DRAFT` (including the `— partial` / `— not started` forms, or a legacy `PARTIAL` / `NOT STARTED`) is re-vetted, and under `/vet-imp` the only
 remaining MECHANICAL guard is `/implement-plan` Step 0.45 check 2 — a `git log
 origin/main -20` grep that misses anything older — though §2's claim
 verification may also notice the plan's premises are already met. It is accepted because a false *"do NOT
@@ -963,7 +1069,10 @@ the declaration against the plan, so a declaration that is wrong *and* covered
 still corroborates. The same phantom `{1}` beside one landed citation whose
 marker carries `phases: 1` gives `phases_declared_indices: [1]` ⊆
 `phases_delivered: [1]`, `phases_remaining: []` and no gap — **corroborated, so
-arm 1 fires**, on a plan with phases outstanding. That residue is closed by no
+arm 1 fires**, on a plan with phases outstanding. An attestation widens the same
+residue: the attest door requires `phase_index` to be one of
+`phases_declared_indices`, so an attestation on a wrong-but-declared index
+corroborates exactly as a wrongly scoped citation does. That residue is closed by no
 single phase and not by this arm: plan
 `2026-09-18-coord-fabricates-a-phase-declaration-and-silences-its-own-gap`'s
 Phase 1 closes only the present-but-rejected-index arm of the positional
@@ -1001,7 +1110,9 @@ If, on the values captured above:
   positively attribute). **Run case 2's probes HERE to decide that** — they are
   the only thing separating "adopt" from "a peer is mid-flight", and every one of
   them is read-only: does the stamping session's transcript tail show it died;
-  are its worktrees clean and 0 ahead of `origin/main`; do any PRs or branches
+  for a death read on this device, does no live successor carry its id (§5's
+  void rule: `claude-successor.sh <sid>` must answer 1, and a 0 or 2 is a
+  STOP); are its worktrees clean and 0 ahead of `origin/main`; do any PRs or branches
   exist for the plan. If all of them hold this is case 2 (**adopt**) and you
   proceed — do not STOP. **Evaluate case 2b HERE too, before taking any STOP**:
   when `printenv QONTINUI_GATE_ID` names the gate in the captured block's last
@@ -1098,7 +1209,7 @@ continue — naming never blocks vetting.
 
 ### 1. Read the plan in full
 
-Use `Read` on the path. Don't skim — note every concrete claim:
+Use `Read` on the path — Step 0.25 item 0's scratch copy of the `origin` blob when the plans directory is a git repo. Don't skim — note every concrete claim:
 - File paths, function names, line numbers
 - "There is no X" / "we'll need to add Y" assertions
 - Architectural decisions presented as locked
@@ -1116,6 +1227,14 @@ Decision policy. It is the authority for that judgement; this session is not.
 The property is served policy `verification-and-evidence`
 `independence-is-context-not-credential` — read the clause live, do not restate
 it here [policy: never-pin-a-mutable-policy-value].
+
+**Pass `effort` on this Agent call** (served policy `production-and-cost`
+`spawn-effort-profiles`). Vetting a plan is research, so pass the effort of the `research` profile in
+`agent_playbook/spawn-effort-profiles`. Read it with
+`/policy get agent_playbook spawn-effort-profiles`; never take the level
+from this file or from memory. If the playbook cannot be read, or the Agent tool has no `effort` parameter
+(it has none while `CLAUDE_CODE_EFFORT_LEVEL` is set), pass none and say so in
+the report. Never guess a level.
 
 **Spawn unconditionally — including when this session did not author the
 plan.** A session cannot reliably tell whether its context carries authoring
@@ -1815,8 +1934,10 @@ use, so the lifecycle reads cleanly:
 > Vetted-by: subagent (fresh context: plan path + `origin/main` body + repos
 > + rubric only; no authoring context). Plan: <plans repo> `origin/main`
 > <short-sha>. Read: <repo>@<short-sha>, <repo>@<short-sha>, ….
-> Checks: <the verdict's one-line checks — never containing `Depends-On:`
-> or `**Area:`, which the plan adapter parses off any stamp line>. Served
+> Checks: <the verdict's one-line checks — never containing `Depends-On:`,
+> `**Area:` or `**Initiative-Item:`, nor a wrapped line starting with a plain
+> `Area:` or `Initiative-Item:`, which the plan adapter parses off any stamp
+> line>. Served
 > policy <names>@<versions>.
 > Independence: context — the reviewer did not hold the author's reasoning.
 ```
@@ -1889,23 +2010,50 @@ and the body. Before writing your stamp:
    declaration, it counts.
 2. Use `Edit` to **delete every existing status-adjacent blockquote** —
    even if it came from a different skill (`/verify-plan-status` writes
-   `NOT STARTED` / `PARTIAL`; `/implement-plan` writes `IN PROGRESS` /
+   `VETTED/DRAFT <date> — not started` / `— partial: …`, and older runs
+   left legacy `NOT STARTED` / `PARTIAL`; `/implement-plan` writes `IN PROGRESS` /
    `SHIPPED`; older `/vet-plan` runs may have left `Status: VETTED ...`).
    Yours replaces all of them.
 3. Then `Edit` again to insert your single new `> **Status: VETTED …`
    block.
 4. If folding in history is useful (e.g., the plan was previously
-   `NOT STARTED` per a verify pass, or had earlier verifier findings
+   not started per a verify pass, or had earlier verifier findings
    in a separate `> **Edit:` block), include the salient info in
    **one trailing line inside your new block**, prefixed `History:` or
    `Previously:`. Never as a sibling blockquote. A re-vet that lifts a hold
    keeps its trail here (§5.4 step 6, "And the converse").
+5. **Carry the `**Area:**`, `Initiative-Item:` and `Depends-On:`
+   declarations.** If any block you are replacing (item 2 deletes every
+   status-adjacent blockquote, not only the Status one) carries an
+   `Area:` declaration (`` > **Area:** `<area>` ``, or a line-leading plain
+   `Area:`), an `Initiative-Item:` line or a
+   `Depends-On:` declaration, carry each verbatim into your new block (a
+   `Depends-On:` stem this run corrected under the Depends-On verification
+   above is carried as corrected) —
+   `Depends-On:` as the suffix of your new `> **Status:` line, with its stems
+   on the same physical line as the key (the scanner reads only the rest of
+   that line, so a re-wrap that pushes them onto the next `>` line drops
+   them), and `**Area:**` / `Initiative-Item:` each as a `>` line
+   (conventionally directly under the Status line). Each must sit on or
+   below the `> **Status:` line inside that same blockquote, with no blank
+   line or non-`>` line in between — a `>` line above the Status line is not
+   read — and never in a sibling blockquote. The runner's plan scanner reads
+   all three only from this status blockquote, into `metadata.area`,
+   `metadata.initiative_item` and `metadata.depends_on`, and its next push
+   writes what it parsed (every active-directory push is a `metadata` merge
+   patch in which an undeclared `area` or `initiative_item` is sent as
+   `null`, a delete, and an undeclared `depends_on` as `[]`), so a stamp
+   that drops any of them erases it from the work unit's `metadata` on the
+   next scan. For `Depends-On:` that is worse than a clean erase: the runner
+   skips the dependency-edge write for an empty set, so edge rows written
+   earlier survive and coord goes on enforcing a dependency the plan no
+   longer shows.
 
 When `/vet-plan` and `/verify-plan-status` disagree on what the status
-should be (the plan is both VETTED *and* NOT STARTED — a vetted plan
+should be (the plan is both vetted *and* not started — a vetted plan
 that nobody has implemented yet), consolidate: write the lifecycle
-stage in the heading (`Status: VETTED <date> — implementation not
-started.`) and put the verifier's findings in the body. The two
+stage in the heading with the verdict appended (`Status: VETTED <date> —
+not started (verified <date>).`, `/verify-plan-status` §5's form) and put the verifier's findings in the body. The two
 skills do NOT both stamp side-by-side.
 
 #### Lifecycle states
@@ -1913,20 +2061,23 @@ skills do NOT both stamp side-by-side.
 | State | Owner skill | Means |
 |---|---|---|
 | DRAFT | author | plan written, not yet vetted |
-| VETTED | `/vet-plan` | claims audited; ready to implement |
+| VETTED | `/vet-plan` (also carried by `/verify-plan-status`) | claims audited; ready to implement |
 | IN PROGRESS | `/implement-plan` | implementation underway |
 | SHIPPED | `/implement-plan` or `/verify-plan-status` | all phases live in code |
 | SHIPPED — UNCONFIRMED (<claim ids>) | `/implement-plan` or `/verify-plan-status` | all phases live in code, and the `## Done when` claims named do NOT read `confirmed` (or the section is unparseable — `done-when-unparseable`) — landed, not yet shown to work. Normalises to `shipped` in coord (the qualifier is for the human reader) |
-| PARTIAL | `/verify-plan-status` | some phases live, some open |
-| NOT STARTED | `/verify-plan-status` | no implementation evidence |
+| VETTED/DRAFT — partial | `/verify-plan-status` (lead word carried from the replaced stamp — `VETTED` only when that stamp led with `VETTED`, else `DRAFT`; never upgraded) | some phases live, some open |
+| VETTED/DRAFT — not started | `/verify-plan-status` (lead word carried, as above) | no implementation evidence |
+| PARTIAL / NOT STARTED (legacy) | none — no writer emits them as lead words now | read as above; overwritable |
 | SUPERSEDED / OBSOLETE | any | terminal states |
 
 `/vet-plan` writes only `VETTED` (on the self path qualified as
 `VETTED (self)`, still `VETTED` first — §5). If the existing block is `SHIPPED`
 (qualified `UNCONFIRMED` or not), `SUPERSEDED`, or `OBSOLETE`, do NOT overwrite — surface to the user
 that they're vetting a closed plan and confirm they actually want this
-rewrite. (`PARTIAL` and `NOT STARTED` are fine to overwrite — your vet
-pass produces fresher information.)
+rewrite. (The partial / not-started forms — `VETTED/DRAFT <date> — partial: …`,
+`VETTED/DRAFT <date> — not started …` — and the legacy `PARTIAL` and
+`NOT STARTED` are fine to overwrite — your vet pass produces fresher
+information.)
 
 ##### `IN PROGRESS` is CONDITIONALLY overwritable — consumes Step 0.25
 
@@ -1965,7 +2116,10 @@ inline.
 >    IS your own current session id is a resume: refresh the date and keep the
 >    trail, never take over. A marker that is a different session id is a LIVE
 >    PEER unless you can positively verify that session died with zero work
->    products — transcript tail shows death, its worktrees clean and 0 ahead of
+>    products — transcript tail shows death (a death read on THIS device also
+>    needs `bash <workspace-root>/qontinui-claude-config/scripts/lib/claude-successor.sh <sid>`
+>    to answer 1, and a 0 or 2 is a STOP; across machines, `/vet-plan`'s "Case
+>    2 across machines" decides), its worktrees clean and 0 ahead of
 >    `origin/main`, and no PRs and no branches for the plan — **or that it
 >    delegated the plan to a hold gate whose continuation you are (the arm
 >    table's case 2b)**. Only then adopt it and append your own marker.
@@ -2002,7 +2156,8 @@ unidentified default below, that run should have stopped at its capture step
 without editing anything.
 
 **The arms below are scoped to a status block that reads `IN PROGRESS`.** A
-`DRAFT`, absent, `PARTIAL` or `NOT STARTED` block is governed by the paragraph
+`DRAFT`, absent, `VETTED/DRAFT — partial` / `— not started`, or legacy
+`PARTIAL` / `NOT STARTED` block is governed by the paragraph
 above this section, not by this table — do not read the "anything else" row as
 refusing a first-time vet.
 
@@ -2010,10 +2165,35 @@ refusing a first-time vet.
 |---|---|---|---|
 | 0 | The marker **IS** your own current session id | a resume, or a Step 0.5 re-run | **Refresh**, never take over: update the date and keep the trail. |
 | 1 | Work has **landed** | delivery **arm 1** | **Refuse.** Do not overwrite; route to closeout. |
-| 2 | The stamping session is **dead with zero work products** | the marker is a session id ≠ yours, AND its transcript tail shows death (or, on the same device, its claim ledger's `.alert` records `OWNER_GONE … pid_dead`; a cleared `implement→ship safety net` gate alone is a reason to probe, not evidence, since it also clears on a lapse — `/implement-plan` Step 0.5) — **or, when that transcript is not on this box, one of the three positive signals below the table** — AND its worktrees are clean and 0 ahead of `origin/main`, AND no PRs and no branches exist for the plan | **Adopt.** Keep the fresh `VETTED` and record the takeover as the `History:` line **inside that one block** (never a second blockquote — see the single-stamp invariant), naming both session ids and the evidence. |
+| 2 | The stamping session is **dead with zero work products** | the marker is a session id ≠ yours, AND its transcript tail shows death (or, on the same device, its claim ledger's `.alert` records `OWNER_GONE … pid_dead`; a cleared `implement→ship safety net` gate alone is a reason to probe, not evidence, since it also clears on a lapse — `/implement-plan` Step 0.5) — **or, when that transcript is not on this box, one of the three positive signals below the table** — AND, when that death was read on THIS device (the ledger `.alert`, a transcript on this box, or a coord row for a session that last ran here), no live successor carries its id (the void rule below the table; a cross-machine death is decided by "Case 2 across machines" alone) — AND its worktrees are clean and 0 ahead of `origin/main`, AND no PRs and no branches exist for the plan | **Adopt.** Keep the fresh `VETTED` and record the takeover as the `History:` line **inside that one block** (never a second blockquote — see the single-stamp invariant), naming both session ids and the evidence. |
 | 2b | The stamping session **handed the rest to a hold gate, and you are that gate's continuation** (gate-delegated adoption) | the marker is a session id ≠ yours, AND `printenv QONTINUI_GATE_ID` (by NAME, never an `env` dump) names gate G, AND the **last** `Held behind gate` line in the captured block is literally `Held behind gate <full gate_id> (<predicate>; anchor <work_unit_id>)` with G's **full** id (written only at the owner's closeout — `/implement-plan` Step 6.5), AND a FRESH `coord_gate_inspect {gate_id: G}` reads `verdict: cleared`, `continuation.consumed_by` equal to `$QONTINUI_GATE_DEVICE_ID` **and** to this device (`$QONTINUI_MACHINE_ID`, else `device_id` in `~/.qontinui/machine.json`), and an `anchor.work_unit_id` equal to this plan's unit or to the line's `anchor <work_unit_id>`. The `anchor <work_unit_id>` token is the last thing before the line's closing `)` — parse it from the RIGHT, so a predicate containing `;` or `)` cannot break the match. Case 2's zero-work-products checks do **not** apply: the predecessor's PRs are the expected state | **Adopt**, as case 2: keep the fresh write, and in place of the `Held behind gate` line (never keep it) write `History: adopted from <prior session id> via consumed hold <G full id>` **inside that one block** — a spelling that can never satisfy case 2b again. |
 | 3 | The stamping session is a **LIVE PEER** | the marker is a session id ≠ yours and neither case 2's nor case 2b's checks all hold | **STOP.** Do not vet and do not implement. |
 | — | **Anything else** — the stamp carries **no** session marker, or one you cannot positively attribute | no evidence of death, and no evidence it is yours | **STOP**, exactly as case 3. |
+
+**A live successor VOIDS every death signal on this device.** A live Claude
+process whose argv carries the stamping session's id is that session, resumed:
+an account migration restarts it as `claude --resume <sid>` under a new pid.
+It voids the ledger `.alert` `OWNER_GONE … pid_dead` / `pid_reused`, the tail
+of a transcript on this box, and a closed or finished coord row for a session
+that last ran here, and it forces STOP. A session that ran on another machine
+gets no scan here (its successor would run there): "Case 2 across machines"
+decides it. Probe it with
+
+```bash
+bash <workspace-root>/qontinui-claude-config/scripts/lib/claude-successor.sh <sid>
+```
+
+Exit 0 prints the live successor pid(s): LIVE, so STOP. Exit 1 means none, and
+the death signal stands. Exit 2 is UNKNOWN, which makes the death clause
+UNKNOWN: STOP. On Git Bash the probe answers 2 (UNAVAILABLE), so a same-box
+death clause there reads UNKNOWN and STOPs until a Windows successor source
+exists. A substring `pgrep -af <sid>` or `ps … | grep <sid>` is never
+this probe, because it matches the probing shell (measured on nilan:
+`pgrep -af <an unused uuid>` from Claude Code's Bash tool returns rc 0). On
+2026-11-16 two migrated sessions logged `OWNER_GONE pid_dead` while their
+`--resume` successors were alive, the second's coord row read closed, and a net
+dispatched a duplicate onto each (findings `2a648c75` and `dd69d0ed`, dossier
+`implement-ship-net-fires-on-a-live-session`, mechanism 4).
 
 **Case 2b reads coord, never the environment alone.** `QONTINUI_GATE_ID` is
 injected by the runner into a gate continuation (`_gate-registration` →
@@ -2038,7 +2218,10 @@ D3)*. When the stamping session's transcript is not on this box, the death probe
 is **UNKNOWN**, and with it case 2 does not hold — the row is **STOP** unless one
 of these says dead-or-done. A signal stands in for the transcript-tail check
 ONLY; case 2's other three checks (worktrees clean and 0 ahead, no PRs, no
-branches) must still all hold beside it.
+branches) must still all hold beside it. Across machines no process scan can
+run, so where signal 3 is the stand-in it holds only if EVERY row matching the
+`claudeCodeSessionId`, in every tenant, reads closed or finished — one open row
+means LIVE. Signals 1 and 2 are unchanged.
 
 **Stage the credentials ONCE, first, and use them for all three signals.**
 §0.25 has already deleted its own bearers, and signals 2 and 3 need one (the
@@ -2103,8 +2286,12 @@ directory).
    the signal holds only if every bearer's walk completed AND every matched
    row, under any bearer, reads `finished` / closed. Rows
    that disagree (closed under one tenant, active or `working` under another)
-   are UNKNOWN, never dead. Stopping at the first `closed` row would adopt a
-   live peer.
+   read LIVE, never dead: one open row is enough. Stopping at the first
+   `closed` row would adopt a live peer. **The residual:** a migrated successor
+   whose only coord row reads closed still reads dead here, because no process
+   scan reaches another box (f51a0efc's row read `closed_at` while its
+   successor ran). That is a binding-drift dossier follow-up (finding
+   `dd69d0ed`), not something this signal can see.
 
 **Silence on the bus is never adoptable**, and an empty `coord_orient`
 `session_activity` is UNKNOWN by that tool's own contract (it lists live sessions
@@ -2210,10 +2397,17 @@ stamp.** When the plans directory is inside a git repo, publish the stamped file
 with:
 
 ```bash
-bash <workspace-root>/qontinui-claude-config/scripts/land-plan-stamp.sh \
+bash <workspace-root>/qontinui-claude-config/scripts/land-plan-stamp.sh --based-on "<blob read at Step 0.25>" \
   "<plans-repo-root>" "<repo-relative plan path>" "<local plan file>" \
   "docs: stamp <plan-stem> VETTED"
 ```
+
+**`--based-on` is required** (`_status-writers.md` → "Publishing a stamp — the compare-and-swap"): `<blob read at Step 0.25>` is the `BASED_ON` Step 0.25
+item 0 recorded — the version the guard judged and the body Step 1.5 handed the
+reviewer — and `<local plan file>` is the scratch copy of it this run edited. Exit 7 (STALE BASE) means origin moved since
+then: re-read the plan off origin, re-run Step 0.25's capture and the
+`IN PROGRESS` guard against it (a peer's new marker is a STOP), then re-apply
+this vet's edits and land again with the new blob — or stop and report.
 
 It lands the one blob directly on the plans repo's default branch when that
 branch's ruleset requires no PR, and otherwise cuts a FRESH branch and opens a
@@ -2232,28 +2426,29 @@ this vet session as in-flight.
 
 **Then release the plan reserve — only if THIS run acquired it.** In the same
 try/finally (so it fires on every abort path too, including the step 0.2 conflict
-flow's **Abort**):
+flow's **Abort**), through the one release door, which withdraws an open
+implement→ship net an earlier `/implement-plan` run left on this plan before it
+releases (a release with that net open clears it and dispatches a duplicate). It
+runs at most about 90 s, inside the Bash tool's 120 s default:
 
 ```bash
-curl -fsS -X POST "$COORD_HTTP_URL/claims/release" \
-  -H "Content-Type: application/json" \
-  -d "$(cat <<EOF
-{
-  "kind": "semantic_resource",
-  "resource_key": "plan:<plan-stem>",
-  "machine_id": "<machine_id>",
-  "agent_session_id": "$AGENT_SESSION_ID"
-}
-EOF
-)"
+bash <workspace-root>/qontinui-claude-config/scripts/plan-reserve-release.sh release \
+  --stem "<plan-stem>" --repo "<owner/name>" --reason "<why>"
 ```
 
+Quote its final verdict line in the §6 report (`RELEASED` is exit 0; a
+`NET_UNRETIRED`, `NET_CANCELLED` or `NET_FIRED` line names a net id to report;
+`RELEASE_WITHHELD` (7), `UNKNOWN` (2) and usage (64) released NOTHING, so run it
+again once the cause is fixed, and do not stop the heartbeat loop after a 7 —
+`/implement-plan` Step 0.48 has the exit-7 remedies).
 The release MUST carry the SAME `agent_session_id` used at acquire — the owner
 token is the match key, so omitting it (or sending a different session) returns
-`"not_held"` and leaves the reservation to TTL out. **Skip the release entirely
+`"not_held"` and leaves the reservation to TTL out; the script resolves the pair
+as step 0.2 does. **Skip the release entirely
 if step 0.2 returned `renewed`**: under `/vet-imp` the orchestrator acquired the
 reserve and `/implement-plan` still has to run on it, so releasing here would
-unreserve the plan mid-lifecycle. `"not_held"` is otherwise fine and idempotent.
+unreserve the plan mid-lifecycle. `NOT_HELD` is evidence the reserve LAPSED, not a
+clean no-op: report it.
 
 ### 5.4. Register a `unit_ready` gate for the vetted plan (dispatchable-work queue)
 
@@ -2459,6 +2654,9 @@ decisions only — see the predicate guidance in `_gate-registration`).
 > it there, so the window is anchored to the moment of arming rather than to
 > evaluation. The split is deliberate — do not "fix" it back into a continuation
 > on `unit_ready`, and do not re-spell it `unit_status`.
+> Under `/vet-imp`, the chain releases the plan reserve once step 8 reads this
+> net's `gate_id` back (`/vet-imp` Step 3). `/vet-plan` itself never releases it,
+> because its own reserve reads `renewed`.
 >
 > *Why the two gates are separate.* One gate was answering two different
 > questions — *this plan is ready, dispatchable work* (a record, true the instant
@@ -2704,17 +2902,14 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
    REPLACES the stored one whole — every key you left out is dropped EXCEPT
    `attestations`, which coord carries forward from the stored row when the
    object you send omits that key (qontinui-coord#2574, `d9f525e92`, read as the
-   serving build 2026-10-09; once the row holds a ledger, the stored one also
-   wins over an `attestations` key you DO send, `null` included, by `metadata`
-   or `metadata_patch`, because `UPSERT_WORK_UNIT_SQL`'s graft runs after
-   `resolved_metadata_value` in qontinui-coord `work_unit_registry.rs`); `{}`
+   serving build 2026-10-09; an `attestations` key you DO send must equal the stored ledger: a clear, `null`, a patch-deleted key or an edit is REFUSED (HTTP 422 `attestations_not_writable`, MCP `ToolError`), as is a ledger sent for a row that has none, since qontinui-coord#3715; resending it unchanged is admitted. The ledger is appended only by the transition and phase-attestation doors); `{}`
    clears the rest — so add no defensive read-merge-write here.
    To set a key, send `metadata_patch` (an RFC 7396 merge) naming only that
    key, never a read-modify-write: a concurrent writer's key is lost between
    your read and your write. On a plan-backed unit (`metadata.source_path`
    set) the keys in qontinui-runner
    `src-tauri/src/plan_workunit_adapter/metadata.rs` `SCANNER_OWNED_KEYS`
-   belong to the plan file, which the runner's plan adapter re-asserts from the plan per each key's absent-rule in that roster (read 2026-11-01: `source_path`, `depends_on`, `area`, `archive_path`, `phases`; a scan that detects no phases leaves `phases` alone), so edit those in the plan itself, its `Area:`
+   belong to the plan file, which the runner's plan adapter re-asserts from the plan per each key's absent-rule in that roster (read 2026-11-04 at qontinui-runner `86ea6da7f`: `source_path`, `depends_on`, `area`, `initiative_item`, `archive_path`, `phases`; a scan that detects no phases leaves `phases` alone), so edit those in the plan itself, its `Area:`, `Initiative-Item:`
    and `Depends-On:` lines, not on the unit. Every other key persists across
    scans on runner builds containing qontinui-runner `f0cb511f1`; a build containing `3a8408558` but not `f0cb511f1` still erases it on a plan with detected phases, and an older one on every plan. A patch merges an
    object-valued key recursively, so to replace one whole (e.g.
@@ -2738,6 +2933,18 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
    work_unit_id=<uuid> plan_slug=<plan stem>`. It merges rather than replaces,
    so it will not erase the `plan_slug` / `intent` `/preflight` Step 5 wrote, and
    it exits 0 on every path.
+   **Then declare the plan's phases on the unit, best-effort:**
+   `bash <workspace-root>/qontinui-claude-config/scripts/declare-plan-phases.sh <plan stem> <plan file>`.
+   This upsert carries no `metadata`, and on a multi-bound device no scanner
+   writes `phases` either, so without it `coord_work_unit_attest_phase` refuses
+   every phase ("no established phase declaration"). The script skips a
+   plan-backed unit, patches only on a difference, refuses any declaration that
+   drops a phase coord has established (a narrowing is patched by hand), and
+   bounds its own run time; its header is the contract. Quote its one verdict
+   line in the vet report and continue whatever it says: it never blocks the vet.
+   Until the runner ships `qontinui-pr plan-phase-declaration` (that plan's
+   Phase 1), the verdict is `UNKNOWN` on every box: expected, not a fault.
+   `/implement-plan` Step 0.5 runs the same script.
 2. **Always: resolve the operator's `device_id` DYNAMICALLY** (never hardcode a
    UUID): env `QONTINUI_MACHINE_ID` first, else read `~/.qontinui/machine.json`
    and parse `"device_id"` (fall back to `"machine_id"` if present).
@@ -2806,7 +3013,9 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
    publish delivered work as ready) and report its `gate_id`; step 8 then
    asserts ZERO open rows. Write `delivery skip: landed mid-vet (<PR
    list>)` into the stamp's `Checks:` line and re-land it with §5's
-   `land-plan-stamp.sh`, message `docs: stamp <plan-stem> VETTED (delivery
+   `land-plan-stamp.sh` (`--based-on` the blob §5's own `LANDED` line
+   printed; when §5 answered `PROPOSED`, the `git hash-object --no-filters` of the file §5
+   proposed — exit 7 then means that PR has not landed yet), message `docs: stamp <plan-stem> VETTED (delivery
    skip)` (§5 already published the stamp), and report `NO NET (delivered: <PR
    list>) — closeout owed`. Any other arm, UNKNOWN included, is not the skip:
    continue to step 4. (`/vet-imp` Step 3's arm-1 STOP withdraws a net
@@ -2923,10 +3132,12 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
      **The trailing block after the blank line is the BRIEF, and it is not
      optional.** This is the untagged `continuation_spawn` shape, which has no
      `hint` field, so the brief goes into `initial_prompt` itself — coord would
-     have produced byte-identical text from a typed continuation's `hint`. Without
-     it the spawned session's entire brief is `run /implement-plan <path>`: it
-     opens on a plan it has never read, with no idea why it was dispatched
-     instead of the vetting session finishing the work. Six labelled lines
+     have produced the same text from a typed continuation's `hint`, plus a
+     closing `/unattended` line it never adds to a legacy prompt. Without
+     it the spawned session gets `run /implement-plan <path>` and only what
+     coord's dispatch-time brief adds: it opens on a plan it has never read,
+     with no idea why it was dispatched instead of the vetting session finishing
+     the work. Six labelled lines
      (`Plan`/`Why`/`PR`/`Blocked`/`Resource-keys`/`Tried`), **references before
      bodies**, **≤2000 characters** — nothing enforces that cap and nothing
      truncates for you, so cut prose rather than references and end a cut brief
@@ -3864,6 +4075,7 @@ leave it in the report.
   phase_name).
 - **Register:** prefer MCP `coord_register_gate` (kinds: `pr_merged`,
   `deploy_healthy`, `claim_terminal`, `operator_approval`, `ci_green`, `pr_ci_green`,
+  `pr_ci_red`, `pr_conflicting`,
   `release_in_sync`, `branch_reapable`,
   `ref_exists`, `metric_threshold`, `time_elapsed`, `unit_ready`,
   `migration_at_head`, `infra_drift_clear`, `file_exists`, `sql_count`,
@@ -4201,6 +4413,6 @@ instruction fired and `/vet-imp`'s Steps 3-5 were never reached.
 - **Cite the code.** Every claim added to the plan should reference a file:line. "Almost certainly exists" is not good enough.
 - **Verify memories before quoting them.** `MEMORY.md` entries are point-in-time observations; check the current code before treating a memory as fact.
 - **Don't add new phases or scope.** If you find work the plan missed, note it in the report — adding a new phase is a decision for the user.
-- **Parallelize research.** Use Glob, Grep, and Read in parallel; spawn `Explore` for broad surveys. When you spawn agents, never end a turn purely "awaiting notification" on their results — completion notifications are an optimization, never a guarantee (the wake-up channel is at-most-once); re-check for finished results on a bounded timer and proceed on evidence. On any nudge / system-reminder wake, FIRST re-check whether the awaited research already finished (evidence over memory), collect it, and continue — never re-spawn completed research.
+- **Parallelize research.** Use Glob, Grep, and Read in parallel; spawn `Explore` for broad surveys (passing the `research` profile's `effort`, under Step 1.5's rule; or, where the session has a Workflow tool, as Workflow agents passing `opts.effort`). When you spawn agents, never end a turn purely "awaiting notification" on their results — completion notifications are an optimization, never a guarantee (the wake-up channel is at-most-once); re-check for finished results on a bounded timer and proceed on evidence. On any nudge / system-reminder wake, FIRST re-check whether the awaited research already finished (evidence over memory), collect it, and continue — never re-spawn completed research.
 - **No new files.** The plan file is the only thing you should be writing to.
 - **Decide; don't escalate.** Engineering trade-offs surfaced during vetting must be resolved in the plan using the Decision policy. Effort and backward compatibility are not factors. Only kick a question up to the user when it is in the verdict's **surfaced for user** set (Step 1.5): an operator-resource need, a plan too large for orchestration, or a genuine product/scope call on the `escalation-closed-list`.

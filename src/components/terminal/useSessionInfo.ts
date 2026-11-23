@@ -781,16 +781,57 @@ export const TENANT_DISPLAY_ABSENT_TEXT = "unknown — runner predates tenancy.d
  * holds nothing whatever membership claims. Only a membership the runner
  * measured as true reads as in (`1 of N`, or the withheld marker on a single
  * binding); one it could not establish says so on any set size, because the
- * withheld marker would otherwise claim it. */
+ * withheld marker would otherwise claim it. Each arm is one value of
+ * `tenantBoundMembership`, the classification the zone badge reads too, and
+ * the compiler holds the switch exhaustive. */
 function boundSuffix(d: TenantDisplay): string {
-  if (d.bound.status !== "measured") {
-    return ` · bound set unknown — ${d.bound.reason ?? "no reason given"}`;
-  }
   const n = d.bound.tenantIds.length;
-  if (n === 0) return " · this runner has no bound tenants";
-  if (d.actingInBoundSet === false) return ` · not among ${n} bound`;
-  if (d.actingInBoundSet !== true) return ` · ${n} bound, membership unknown`;
-  return d.multiBound === true ? ` · 1 of ${n} bound` : "";
+  switch (tenantBoundMembership(d)) {
+    case "set-unread":
+      return ` · bound set unknown — ${d.bound.reason ?? "no reason given"}`;
+    case "no-bound-tenants":
+      return " · this runner has no bound tenants";
+    case "out":
+      return ` · not among ${n} bound`;
+    case "unknown":
+      return ` · ${n} bound, membership unknown`;
+    case "in":
+      return d.multiBound === true ? ` · 1 of ${n} bound` : "";
+    case null:
+      // No display tenant to place in a non-empty set. `tenantRow` stops
+      // before this, but the set is still stated rather than left silent: an
+      // empty suffix is the withheld marker, which on one binding means "in".
+      return ` · ${n} bound, membership unknown`;
+  }
+}
+
+/** Where the display's own tenant (`TenantDisplay.tenantId`) stands against
+ * the runner's bound set. */
+export type TenantBoundMembership = "in" | "out" | "unknown" | "no-bound-tenants" | "set-unread";
+
+/**
+ * The ONE classification of `tenancy.display`'s bound-set half. The
+ * session-info Tenant row's suffix (`boundSuffix`) and the zone `TenantBadge`
+ * (its title, its attention tone and `data-tenant-bound-membership`) all
+ * switch on it, so the row and the badge cannot state the set differently
+ * (plan `2026-10-17-session-info-tenant-row-renders-unknown-for-a-resolved-tenant`,
+ * design option C). The order is load-bearing:
+ * - `set-unread`: the set could not be read, so membership is never claimed.
+ * - `no-bound-tenants`: a measured EMPTY set. That is an absent binding store
+ *   (`auth::binding_set_in`), which is per runner instance, and it holds
+ *   nothing whatever `actingInBoundSet` claims.
+ * - `null`: a non-empty measured set with no display tenant to place in it.
+ * - `out` / `in`: the runner MEASURED the display tenant's membership.
+ * - `unknown`: a display tenant whose membership the runner could not establish.
+ * Pure.
+ */
+export function tenantBoundMembership(d: TenantDisplay): TenantBoundMembership | null {
+  if (d.bound.status !== "measured") return "set-unread";
+  if (d.bound.tenantIds.length === 0) return "no-bound-tenants";
+  if (!d.tenantId?.trim()) return null;
+  if (d.actingInBoundSet === false) return "out";
+  if (d.actingInBoundSet === true) return "in";
+  return "unknown";
 }
 
 /** How a `registered` coord row's tenant became known, in words. Pure. */
@@ -865,7 +906,8 @@ export function tenantRow(
     const acting = d.tenantId ? "" : ` — acting tenant unknown — ${d.reason ?? "no reason given"}`;
     return { value: d.tenantId, display: `MISMATCH ${text}${detail}${acting}`, title };
   }
-  if (d.status === "unknown" || !d.tenantId) {
+  // A blank id names no tenant, exactly as `tenantBoundMembership` reads it.
+  if (d.status === "unknown" || !d.tenantId?.trim()) {
     return { value: null, display: `unknown — ${d.reason ?? "no reason given"}`, title };
   }
   const id = shortId(d.tenantId);
@@ -1212,7 +1254,10 @@ export function normalizeTenantDisplay(raw: unknown): TenantDisplay | null {
     Array.isArray(x) ? x.filter((t): t is string => typeof t === "string") : [];
   return {
     status,
-    tenantId: str(r.tenantId),
+    // Trimmed once here, so a blank id is `null` to every reader: the row, the
+    // badge's chip, title and `data-tenant-acting`, and `tenantBoundMembership`
+    // alike. (The Rust producer already trims and drops an empty id.)
+    tenantId: str(typeof r.tenantId === "string" ? r.tenantId.trim() : r.tenantId),
     tenantSlug: str(r.tenantSlug),
     source: str(r.source),
     reason: str(r.reason),

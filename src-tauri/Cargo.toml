@@ -141,6 +141,9 @@ tower-http = { version = "0.6", features = ["cors", "limit", "trace", "catch-pan
 urlencoding = "2.1"
 zip = "9"
 sha2 = "0.10"
+# Claude Code CLI version ordering for the runner-owned updater (never
+# install a version older than the one on disk). Already in the lock graph.
+semver = "1"
 hmac = "0.12"
 rand = "0.9"
 aes-gcm = "0.10"
@@ -172,6 +175,10 @@ qontinui-runner-win32 = { path = "../crates/runner-win32" }
 # the frame protocol, the client, and the spawner the runner starts holders
 # with. The holder BINARY ships beside the runner as a Tauri externalBin.
 qontinui-pty-holder = { path = "../crates/pty-holder" }
+# The session-lifecycle kernel's first slice, `classify_child` (plan
+# 2026-11-04-runner-finished-close-closes-nothing-on-any-box, Phase 2a; the
+# crate is lifecycle Phase 37's). Pure: the runner reads, the crate decides.
+session-lifecycle = { path = "../crates/session-lifecycle" }
 # `host-probe`: `ci_node::host_sizing::probe` reads the live host (sysinfo).
 qontinui-types = { path = "../../qontinui-schemas/rust", features = ["host-probe"] }
 qontinui-code-graph = { path = "../../qontinui-schemas/code-graph" }
@@ -243,6 +250,7 @@ proc-macro2 = { version = "1.0", features = ["span-locations"] }
 # misplaced under [target.'cfg(windows)'.dependencies], which broke
 # Linux + macOS builds.
 walkdir = "2.5"
+same-file = "1.0"
 glob-match = "0.2"
 jsonpath-rust = "1"
 

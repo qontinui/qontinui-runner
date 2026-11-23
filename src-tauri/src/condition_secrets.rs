@@ -37,7 +37,18 @@
 //!    is not a string) is refused, so the literal `{{secret:<ref>}}` never
 //!    reaches an app as a password. The IPC fallback runs when no SDK app is
 //!    connected, so its target is the runner's webview: it never substitutes,
-//!    and [`ipc_refusal`] refuses any placeholder that would reach it.
+//!    and [`ipc_refusal`] refuses any placeholder that would reach it. The
+//!    `/ui-bridge/control/*`, `/ui-bridge/ai/*`, `/ui-bridge/relay/dispatch`
+//!    and `/ui-bridge/batch` routes the `/ui-bridge/*` composer serves never
+//!    substitute either, nor do `/ui-bridge/apps/{app_id}/dispatch` and
+//!    `/wrappers/{id}/dispatch`, which send their `params` verbatim to an app,
+//!    nor the `/a11y/*` routes, whose `type_text` types its `text` verbatim
+//!    into a desktop app, nor any `/ui-bridge/sdk/*` route but the element
+//!    action itself (`sdk/fill`, `sdk/page/type-into`, `page/send-keys`, a
+//!    batch, a component action, …), which proxy their body verbatim to the
+//!    connected app: while a secret is held,
+//!    [`refuse_unsubstituted_placeholders`] refuses any request to them that
+//!    carries a placeholder, before its handler runs.
 //! 4. **Never shown back.** While any map is held, [`scrub_sdk_responses`]
 //!    replaces each held value, and each truncated echo of one (a prefix of at
 //!    least [`MIN_ECHO_CHARS`] characters ending in `...` or `…`, the way
@@ -85,8 +96,17 @@
 //!   its registrant registered with, so one registered by a non-browser
 //!   process or by tab key never substitutes.
 //! - **Only the SDK element-action route substitutes.** The runner's own
-//!   `/ui-bridge/control/*` action routes do not, so a placeholder sent there
-//!   is typed as its literal text; no secret ever reaches them.
+//!   routes do not, and the composer's refuse a placeholder only while a
+//!   secret is held: with nothing held a placeholder there is ordinary text.
+//!   The app dispatch, wrapper dispatch, `/a11y/*` and `/ui-bridge/sdk/*`
+//!   routers carry the same layer themselves, and so does
+//!   `control/wait-for-app`, which shares the app router. The SDK router's
+//!   layer skips only its two element-action paths, whose handler refuses a
+//!   misplaced placeholder in its body itself. A placeholder in that route's
+//!   `{id}` segment or `tabId` query is neither checked nor substituted; it
+//!   reaches the app as an element id or tab key, never as typed text. Two `/ui-bridge/control/*` and `/ui-bridge/ai/*` routes
+//!   are mounted outside every layered router (`ai/wait-for`,
+//!   `control/sdk/spawn-headless`) and are not checked; neither types text. No secret ever reaches any of them.
 //! - **Loopback replay.** `POST /ui-bridge/sdk/element/{id}/action` is a
 //!   `TRUSTED_ROUTES` door (`mcp::origin_guard`), so a local process, or a
 //!   page on a Trusted origin, that knows a ref can have its value typed into
@@ -193,6 +213,10 @@ pub const WRONG_APP_CODE: &str = "CONDITION_SECRET_WRONG_APP";
 
 /// A response that could not be scrubbed while a secret was held.
 const SCRUB_FAILED_CODE: &str = "CONDITION_SECRET_SCRUB_FAILED";
+
+/// A request to a route that never substitutes, which could not be read to
+/// check it for a placeholder while a secret was held.
+const REQUEST_UNREADABLE_CODE: &str = "CONDITION_SECRET_REQUEST_UNREADABLE";
 
 fn is_ref_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':')
@@ -1293,6 +1317,208 @@ fn scrub_failed() -> Response {
 }
 
 // =============================================================================
+// Refusing placeholders on the routes that never substitute
+// =============================================================================
+
+/// Path prefixes of the runner's own UI Bridge action surface. None of its
+/// routes substitutes a placeholder (only the SDK element-action route does),
+/// so whatever text they carry to an app is typed or matched as it stands.
+///
+/// `/a11y/` is the accessibility surface (`mcp::accessibility`), whose
+/// `type_text` types its `text` verbatim into a desktop app and whose other
+/// routes match a caller's text as it stands, as `/ui-bridge/ai/*` does.
+const NON_SUBSTITUTING_PREFIXES: [&str; 3] = ["/ui-bridge/control/", "/ui-bridge/ai/", "/a11y/"];
+
+/// Routes outside those prefixes that also carry a caller's text to an app
+/// unsubstituted: the relay's dispatch, which forwards its `payload` verbatim
+/// to a relay tab, and the batch route, which runs `execute_action` and
+/// `fill_form` operations over the same path as `control/batch-actions`.
+const NON_SUBSTITUTING_PATHS: [&str; 2] = ["/ui-bridge/relay/dispatch", "/ui-bridge/batch"];
+
+/// Dispatch routes that send a caller's `params` verbatim to an app, each as
+/// a prefix before one `{id}` segment and [`DISPATCH_SUFFIX`] after it:
+/// `/ui-bridge/apps/{app_id}/dispatch` (`mcp::app_discovery`), to a
+/// registered app over either transport, and `/wrappers/{id}/dispatch`
+/// (`wrappers::dispatch`), to an installed wrapper or, on a secondary, to the
+/// primary that runs it.
+const DISPATCH_PREFIXES: [&str; 2] = ["/ui-bridge/apps/", "/wrappers/"];
+const DISPATCH_SUFFIX: &str = "/dispatch";
+
+/// The SDK proxy surface (`mcp::sdk_client::routes`). Every route there but
+/// the element action sends its body (or query) verbatim to the connected
+/// app (`fill`, `page/type-into`, `page/send-keys`, `control/batch`, a
+/// component action, `ai/execute`, …), so it never substitutes.
+const SDK_PREFIX: &str = "/ui-bridge/sdk/";
+
+/// The SDK element-action routes, each a prefix before one `{id}` segment
+/// and [`SDK_ELEMENT_ACTION_SUFFIX`] after it. They share
+/// `handle_element_action`, the one handler that substitutes a placeholder
+/// (in a `type` action's text) and refuses one anywhere else in its body.
+const SDK_ELEMENT_ACTION_PREFIXES: [&str; 2] =
+    ["/ui-bridge/sdk/element/", "/ui-bridge/sdk/control/element/"];
+const SDK_ELEMENT_ACTION_SUFFIX: &str = "/action";
+
+/// Whether `path` is a route that never substitutes and may carry a caller's
+/// text to an app (every `/ui-bridge/sdk/*` route but the element action is
+/// matched, including GETs that carry none: nothing is lost by checking them).
+fn never_substitutes(path: &str) -> bool {
+    NON_SUBSTITUTING_PREFIXES
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+        || NON_SUBSTITUTING_PATHS.contains(&path)
+        || is_dispatch(path)
+        || (path.starts_with(SDK_PREFIX) && !is_sdk_element_action(path))
+}
+
+/// Whether `path` is one of `prefixes`, one non-empty `{id}` segment and
+/// `suffix`, the only shape axum routes for a `{prefix}{id}{suffix}` route.
+fn is_one_id_segment(path: &str, prefixes: &[&str], suffix: &str) -> bool {
+    prefixes.iter().any(|prefix| {
+        path.strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix(suffix))
+            .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+    })
+}
+
+/// Whether `path` is one of [`DISPATCH_PREFIXES`], one `{id}` and
+/// [`DISPATCH_SUFFIX`].
+fn is_dispatch(path: &str) -> bool {
+    is_one_id_segment(path, &DISPATCH_PREFIXES, DISPATCH_SUFFIX)
+}
+
+/// Whether `path` is one of [`SDK_ELEMENT_ACTION_PREFIXES`], one `{id}` and
+/// [`SDK_ELEMENT_ACTION_SUFFIX`]: the substituting element action.
+fn is_sdk_element_action(path: &str) -> bool {
+    is_one_id_segment(
+        path,
+        &SDK_ELEMENT_ACTION_PREFIXES,
+        SDK_ELEMENT_ACTION_SUFFIX,
+    )
+}
+
+/// Why [`refuse_unsubstituted_placeholders`] refused, for the refusal body.
+const NON_SUBSTITUTING_DETAIL: &str = "the runner's /ui-bridge/control/*, /ui-bridge/ai/*, \
+     /ui-bridge/relay/dispatch, /ui-bridge/batch, /ui-bridge/apps/{app_id}/dispatch, /wrappers/{id}/dispatch, /a11y/* and \
+     /ui-bridge/sdk/* (but the element action) routes never substitute a secret placeholder, so it would reach the app as literal text; \
+     type it with a `type` action on POST /ui-bridge/sdk/element/{id}/action";
+
+/// Request layer for the `/ui-bridge/*` composer, and for the routers that
+/// serve the other non-substituting routes (`mcp::app_discovery::routes`,
+/// `wrappers::routes::router`, `mcp::accessibility::routes`,
+/// `mcp::sdk_client::routes`): while a condition session
+/// holds a secret, a request to a route that never substitutes
+/// ([`NON_SUBSTITUTING_PREFIXES`], [`NON_SUBSTITUTING_PATHS`],
+/// [`DISPATCH_PREFIXES`], [`SDK_PREFIX`] but its element action) that
+/// carries a `{{secret:<ref>}}` placeholder, in its query or anywhere in its
+/// body, is refused with `422` and [`UNKNOWN_REF_CODE`] (as [`ipc_refusal`]
+/// refuses the IPC fallback) before its handler runs. Without it those routes
+/// (`page/type-into`, `fill`, `key`, `batch-actions`, a component action, …)
+/// would type the literal placeholder into the app, say as a password.
+///
+/// Any other path, and every request while nothing is held, passes untouched
+/// and unbuffered. It reads only the request, never the response, so the
+/// relay's command stream that the same composer merges is unaffected. A body
+/// that cannot be read in full is refused rather than passed unchecked.
+pub async fn refuse_unsubstituted_placeholders(request: Request, next: Next) -> Response {
+    if !never_substitutes(request.uri().path()) || held().is_empty() {
+        return next.run(request).await;
+    }
+    let (parts, body) = request.into_parts();
+    let bytes = match axum::body::to_bytes(body, SCRUB_BUFFER_LIMIT).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            warn!(
+                "condition_secrets: a {} request could not be read to check for a secret \
+                 placeholder ({e}); refused",
+                parts.uri.path()
+            );
+            // Over the limit is 413; any other read failure (an aborted
+            // upload, a broken stream) is the request's own fault, so 400.
+            let too_large = parts
+                .headers
+                .get(header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .is_some_and(|length| length > SCRUB_BUFFER_LIMIT);
+            let status = if too_large {
+                StatusCode::PAYLOAD_TOO_LARGE
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            return (
+                status,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": format!(
+                        "{REQUEST_UNREADABLE_CODE}: a condition-check session holds a secret and \
+                         this request could not be read to check it for a placeholder, so it \
+                         was refused"
+                    ),
+                    "code": REQUEST_UNREADABLE_CODE,
+                    "failure_origin": crate::journey::capture::RUNNER_REJECTION_ORIGIN,
+                })),
+            )
+                .into_response();
+        }
+    };
+    if request_placeholder(parts.uri.query(), &bytes).is_some() {
+        info!(
+            "condition_secrets: refused a secret placeholder on {}, which never substitutes",
+            parts.uri.path()
+        );
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(non_substituting_refusal()),
+        )
+            .into_response();
+    }
+    next.run(Request::from_parts(parts, Body::from(bytes)))
+        .await
+}
+
+/// The refusal [`refuse_unsubstituted_placeholders`] answers. It carries the
+/// typed [`UNKNOWN_REF_CODE`] (the same code the IPC fallback answers with:
+/// nothing here will substitute the ref) but its own message, because
+/// [`SubstitutionError::refusal`]'s says no session holds the ref, which is
+/// false here while one does. It names no ref: the one sent may be held, and
+/// a held ref read back from a response could be replayed.
+fn non_substituting_refusal() -> Value {
+    serde_json::json!({
+        "success": false,
+        "error": format!(
+            "{UNKNOWN_REF_CODE}: this route carries a `{PLACEHOLDER_OPEN}<ref>{PLACEHOLDER_CLOSE}` \
+             placeholder it would send on as literal text; {NON_SUBSTITUTING_DETAIL}. \
+             Nothing was typed."
+        ),
+        "code": UNKNOWN_REF_CODE,
+        "failure_origin": crate::journey::capture::RUNNER_REJECTION_ORIGIN,
+        "detail": NON_SUBSTITUTING_DETAIL,
+        "retryable": false,
+    })
+}
+
+/// The ref named by the first placeholder in a request's query or body. The
+/// body is read both as text (so a non-JSON body, and what a JSON parse hides
+/// behind a duplicate key, are read) and as JSON (so a `\u`-escaped brace is).
+fn request_placeholder(query: Option<&str>, body: &[u8]) -> Option<String> {
+    let in_text = |text: String| first_placeholder(&Value::String(text));
+    query
+        .and_then(|query| {
+            // Lossy, as axum's `Query` decodes: one byte that is not UTF-8
+            // must not leave the rest of the query unread.
+            let decoded =
+                urlencoding::decode_binary(query.replace('+', " ").as_bytes()).into_owned();
+            in_text(String::from_utf8_lossy(&decoded).into_owned())
+        })
+        .or_else(|| in_text(String::from_utf8_lossy(body).into_owned()))
+        .or_else(|| {
+            serde_json::from_slice::<Value>(body)
+                .ok()
+                .and_then(|value| first_placeholder(&value))
+        })
+}
+
+// =============================================================================
 // Test support
 // =============================================================================
 
@@ -2049,6 +2275,290 @@ mod tests {
             fetch(&app, "/clean").await,
             "{\n  \"pretty\": true\n}",
             "a body carrying no held value is never re-serialized"
+        );
+    }
+
+    /// The request layer on the routes that never substitute: while a secret
+    /// is held, a placeholder in a `/ui-bridge/control/*` or `/ui-bridge/ai/*`
+    /// request's body or query is refused with the typed unknown-ref code
+    /// before the handler runs, and a clean request reaches it byte for byte.
+    /// A route outside those prefixes is never inspected.
+    #[tokio::test]
+    async fn a_route_that_never_substitutes_refuses_a_placeholder_while_a_secret_is_held() {
+        use axum::routing::post;
+        use std::sync::atomic::AtomicUsize;
+        use tower::ServiceExt;
+
+        let _held = hold("run-control-refusal", &[("cs-ctl-pw", "control-pw-Ct1")]);
+        static REACHED: AtomicUsize = AtomicUsize::new(0);
+        async fn echo(body: Bytes) -> Bytes {
+            REACHED.fetch_add(1, Ordering::SeqCst);
+            body
+        }
+        let app = axum::Router::new()
+            .route("/ui-bridge/control/page/type-into", post(echo))
+            .route("/ui-bridge/ai/find", post(echo))
+            .route("/ui-bridge/relay/dispatch", post(echo))
+            .route("/ui-bridge/batch", post(echo))
+            .route("/ui-bridge/apps/{app_id}/dispatch", post(echo))
+            .route("/ui-bridge/apps/register", post(echo))
+            .route("/wrappers/{id}/dispatch", post(echo))
+            .route("/a11y/type_text", post(echo))
+            .route("/ui-bridge/sdk/page/type-into", post(echo))
+            .route("/ui-bridge/sdk/fill", post(echo))
+            .route("/ui-bridge/sdk/element/{id}/action", post(echo))
+            .route("/ui-bridge/commands", post(echo))
+            .layer(axum::middleware::from_fn(refuse_unsubstituted_placeholders));
+        let send = |uri: &'static str, body: &'static str| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(
+                        axum::http::Request::post(uri)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(body))
+                            .expect("request"),
+                    )
+                    .await
+                    .expect("response");
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("body");
+                (status, String::from_utf8_lossy(&bytes).into_owned())
+            }
+        };
+
+        for (uri, body) in [
+            (
+                "/ui-bridge/control/page/type-into",
+                r#"{"label":"Password","text":"{{secret:cs-ctl-pw}}"}"#,
+            ),
+            (
+                "/ui-bridge/ai/find",
+                r#"{"query":"x \u007b{secret:cs-ctl-pw}}"}"#,
+            ),
+            (
+                "/ui-bridge/control/page/type-into?text=%7B%7Bsecret%3Acs-ctl-pw%7D%7D",
+                "{}",
+            ),
+            (
+                "/ui-bridge/relay/dispatch",
+                r#"{"action":"type","payload":{"text":"{{secret:cs-ctl-pw}}"}}"#,
+            ),
+            (
+                "/ui-bridge/batch",
+                r#"{"operations":[{"op":"fill_form","text":"{{secret:cs-ctl-pw}}"}]}"#,
+            ),
+            (
+                "/ui-bridge/apps/wrapper-1/dispatch",
+                r#"{"action":"type","params":{"text":"{{secret:cs-ctl-pw}}"}}"#,
+            ),
+            (
+                "/wrappers/w1/dispatch",
+                r#"{"action":"type","params":{"text":"{{secret:cs-ctl-pw}}"}}"#,
+            ),
+            (
+                "/a11y/type_text",
+                r##"{"selector":"#password","text":"{{secret:cs-ctl-pw}}"}"##,
+            ),
+            (
+                "/ui-bridge/sdk/page/type-into",
+                r##"{"selector":"#password","text":"{{secret:cs-ctl-pw}}"}"##,
+            ),
+            (
+                "/ui-bridge/sdk/fill",
+                r#"{"fields":[{"id":"password","value":"{{secret:cs-ctl-pw}}"}]}"#,
+            ),
+        ] {
+            let before = REACHED.load(Ordering::SeqCst);
+            let (status, answer) = send(uri, body).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{uri}: {answer}");
+            let answer: Value = serde_json::from_str(&answer).expect("a JSON refusal");
+            assert_eq!(answer["code"], UNKNOWN_REF_CODE, "{uri}: {answer}");
+            assert_eq!(
+                answer["failure_origin"],
+                crate::journey::capture::RUNNER_REJECTION_ORIGIN
+            );
+            assert!(
+                !answer.to_string().contains("control-pw-Ct1"),
+                "a refusal never carries a value: {answer}"
+            );
+            assert!(
+                !answer.to_string().contains("cs-ctl-pw"),
+                "a refusal never names the ref, which may be held: {answer}"
+            );
+            assert_eq!(
+                REACHED.load(Ordering::SeqCst),
+                before,
+                "{uri}: the handler must not run"
+            );
+        }
+
+        let clean = r#"{"label":"Email","text":"user@example.com"}"#;
+        assert_eq!(
+            send("/ui-bridge/control/page/type-into", clean).await,
+            (StatusCode::OK, clean.to_string()),
+            "a request carrying no placeholder reaches its handler unchanged"
+        );
+        let relayed = r#"{"commandId":"c1","result":{"text":"{{secret:cs-ctl-pw}}"}}"#;
+        assert_eq!(
+            send("/ui-bridge/commands", relayed).await,
+            (StatusCode::OK, relayed.to_string()),
+            "a route outside the non-substituting prefixes is never inspected"
+        );
+        let registration = r#"{"appId":"{{secret:cs-ctl-pw}}"}"#;
+        assert_eq!(
+            send("/ui-bridge/apps/register", registration).await,
+            (StatusCode::OK, registration.to_string()),
+            "the app router's registration, under no matched prefix, is not inspected"
+        );
+        let typed = r#"{"action":"type","params":{"text":"{{secret:cs-ctl-pw}}"}}"#;
+        assert_eq!(
+            send("/ui-bridge/sdk/element/password/action", typed).await,
+            (StatusCode::OK, typed.to_string()),
+            "the substituting SDK element action is left to its own handler"
+        );
+    }
+
+    /// A dispatch route (and the SDK element action exempted from the SDK
+    /// prefix) is its prefix, one non-empty `{id}` segment and its suffix; the
+    /// wrapper registry's other routes are not inspected, and every other SDK
+    /// path is.
+    #[test]
+    fn a_dispatch_or_sdk_element_action_path_is_one_id_segment() {
+        assert!(never_substitutes("/ui-bridge/apps/wrapper-1/dispatch"));
+        assert!(never_substitutes("/wrappers/w1/dispatch"));
+        assert!(never_substitutes("/a11y/type_text"));
+        assert!(never_substitutes("/ui-bridge/control/wait-for-app"));
+        for path in [
+            "/ui-bridge/apps//dispatch",
+            "/ui-bridge/apps/dispatch",
+            "/ui-bridge/apps/a/b/dispatch",
+            "/ui-bridge/apps/register",
+            "/ui-bridge/apps/wrapper-1/dispatch/more",
+            "/wrappers/dispatch",
+            "/wrappers/w1/credentials/token",
+            "/wrappers/install",
+            "/ui-bridge/sdk/element/password/action",
+            "/ui-bridge/sdk/control/element/password/action",
+        ] {
+            assert!(!never_substitutes(path), "{path}");
+        }
+        for path in [
+            "/ui-bridge/sdk/fill",
+            "/ui-bridge/sdk/control/fill",
+            "/ui-bridge/sdk/page/type-into",
+            "/ui-bridge/sdk/control/page/send-keys",
+            "/ui-bridge/sdk/component/c1/action/submit",
+            "/ui-bridge/sdk/element/password",
+            "/ui-bridge/sdk/element//action",
+            "/ui-bridge/sdk/element/a/b/action",
+            "/ui-bridge/sdk/control/element/password/action/more",
+        ] {
+            assert!(never_substitutes(path), "{path}");
+        }
+    }
+
+    /// Each router serving a non-substituting route outside the `/ui-bridge/*`
+    /// composer wraps it in the request refusal, so its layer must follow
+    /// every route it registers.
+    #[test]
+    fn every_other_non_substituting_router_refuses_placeholders_after_every_route() {
+        for (file, src, start) in [
+            (
+                "mcp/app_discovery.rs",
+                include_str!("mcp/app_discovery.rs"),
+                "\npub fn routes() -> ",
+            ),
+            (
+                "wrappers/routes.rs",
+                include_str!("wrappers/routes.rs"),
+                "\npub fn router() -> ",
+            ),
+            (
+                "mcp/accessibility.rs",
+                include_str!("mcp/accessibility.rs"),
+                "\npub fn routes() -> ",
+            ),
+            (
+                "mcp/sdk_client.rs",
+                include_str!("mcp/sdk_client.rs"),
+                "\npub fn routes() -> ",
+            ),
+        ] {
+            let routes = src
+                .split(start)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{file}: no router fn"))
+                .split("\n}\n")
+                .next()
+                .unwrap_or_default();
+            let last_route = routes
+                .rfind(".route(")
+                .unwrap_or_else(|| panic!("{file}: no route"));
+            let layer = routes
+                .rfind("crate::condition_secrets::refuse_unsubstituted_placeholders")
+                .unwrap_or_else(|| panic!("{file}: carries no request refusal layer"));
+            assert!(
+                layer > last_route,
+                "{file}: the refusal layer must follow every route"
+            );
+        }
+    }
+
+    /// The query and both readings of the body are searched.
+    #[test]
+    fn a_request_placeholder_is_found_in_its_query_its_text_and_its_json() {
+        assert_eq!(
+            request_placeholder(Some("text={{secret:cs-q}}"), b""),
+            Some("cs-q".to_string())
+        );
+        assert_eq!(
+            request_placeholder(Some("text=%7B%7Bsecret:cs-pct%7D%7D"), b""),
+            Some("cs-pct".to_string())
+        );
+        assert_eq!(
+            request_placeholder(Some("x=%FF&text=%7B%7Bsecret%3Acs-bad%7D%7D"), b""),
+            Some("cs-bad".to_string()),
+            "a byte that is not UTF-8 must not hide the rest of the query"
+        );
+        assert_eq!(
+            request_placeholder(None, b"plain {{secret:cs-raw}} text"),
+            Some("cs-raw".to_string())
+        );
+        assert_eq!(
+            request_placeholder(None, br#"{"t":"\u007b{secret:cs-esc}}"}"#),
+            Some("cs-esc".to_string())
+        );
+        assert_eq!(
+            request_placeholder(Some("text=hello"), br#"{"t":"{{not-a-secret}}"}"#),
+            None
+        );
+    }
+
+    /// The composer wraps every `/ui-bridge/*` route in the request refusal,
+    /// so its layer must follow every route it registers.
+    #[test]
+    fn the_ui_bridge_composer_refuses_placeholders_after_every_route() {
+        let src = include_str!("mcp/ui_bridge/mod.rs");
+        let routes = src
+            .split("\npub fn routes() -> ")
+            .nth(1)
+            .expect("mod.rs routes()")
+            .split("\n}\n")
+            .next()
+            .unwrap_or_default();
+        let last_route = routes
+            .rfind(".route(")
+            .max(routes.rfind(".merge("))
+            .expect("a route");
+        let layer = routes
+            .rfind("crate::condition_secrets::refuse_unsubstituted_placeholders")
+            .expect("routes() carries the request refusal layer");
+        assert!(
+            layer > last_route,
+            "the refusal layer must follow every route"
         );
     }
 

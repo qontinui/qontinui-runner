@@ -39,6 +39,21 @@ pub(crate) const RETRY_DELAYS: [Duration; 3] = [
     Duration::from_secs(6),
 ];
 
+/// Back-off before each RETRY of an account migration's
+/// [`resolve_resume_claude_bin`]: 7 attempts over 45 s. Longer than [`RETRY_DELAYS`] because a PATH miss here is not one
+/// spawn's ~2 s rename window: an npm reinstall of the CLI has been measured to
+/// leave no launchable `claude` for longer than the identity shim's 10 s wait
+/// (coord finding 00525a01, 2026-11-14), and a `--resume` respawn that gives up
+/// early loses the session rather than one tick of a task.
+pub(crate) const RESUME_RESOLVE_DELAYS: [Duration; 6] = [
+    Duration::from_secs(1),
+    Duration::from_secs(3),
+    Duration::from_secs(6),
+    Duration::from_secs(10),
+    Duration::from_secs(10),
+    Duration::from_secs(15),
+];
+
 /// The head every exhausted transient failure carries, followed by the kind
 /// token. It matches the token the pending pre-claim deferral
 /// (qontinui-runner#1925) uses, `claude_cli_unavailable:<kind>`, so the runner
@@ -229,6 +244,34 @@ pub(crate) fn transient_kind_for_spawn(
     Some(kind)
 }
 
+/// How long a CLI spawn waits out a runner-owned CLI install before spawning
+/// anyway. An install that outlives it is logged, and the spawn's own retry
+/// budget then applies as it would to any other transient failure.
+pub(crate) const CLI_UPDATE_WAIT: Duration = Duration::from_secs(120);
+
+/// Returns once no runner-owned CLI install is in progress
+/// ([`crate::claude_cli_update`]), or after [`CLI_UPDATE_WAIT`]. Headless
+/// spawns through [`spawn_tokio_with_retry`] and the `--resume` seam
+/// ([`resolve_resume_claude_bin`]) call this first, so an install the runner
+/// chose does not race them; fresh PTY panes do not wait yet (plan
+/// `2026-10-20-account-migration-respawn-dies-during-cli-reinstall-churn`,
+/// Phase 2 and its "resume seam waits on the in-progress flag" follow-up).
+pub(crate) async fn await_cli_update_quiescent() {
+    use crate::claude_cli_update::{wait_if_updating, UpdateWait};
+    match wait_if_updating(CLI_UPDATE_WAIT).await {
+        UpdateWait::NotUpdating => {}
+        UpdateWait::Finished(waited) => {
+            tracing::info!(?waited, "claude_cli_spawn: waited out a runner CLI install");
+        }
+        UpdateWait::TimedOut(waited) => {
+            warn!(
+                ?waited,
+                "claude_cli_spawn: a runner CLI install is still running — spawning anyway"
+            );
+        }
+    }
+}
+
 /// Spawn `cmd`, retrying a transient CLI launch failure per [`RETRY_DELAYS`].
 ///
 /// A `tokio::process::Command` can be spawned more than once, and each spawn
@@ -241,6 +284,7 @@ pub(crate) async fn spawn_tokio_with_retry(
     cmd: &mut tokio::process::Command,
     workdir: Option<&Path>,
 ) -> Result<tokio::process::Child, CliSpawnFailure> {
+    await_cli_update_quiescent().await;
     retry_transient_spawn(
         &RETRY_DELAYS,
         || cmd.spawn(),
@@ -248,6 +292,103 @@ pub(crate) async fn spawn_tokio_with_retry(
         tokio::time::sleep,
     )
     .await
+}
+
+/// The absolute, launchable `claude` for a PTY `--resume` respawn — NEVER the
+/// bare name.
+///
+/// Plan `2026-10-20-account-migration-respawn-dies-during-cli-reinstall-churn`
+/// D3.1. The resume seam (`terminal::account_migration::spawn_resumed_pane`)
+/// execs its argv head directly in a fresh PTY. When the PATH walk misses — the
+/// CLI's npm reinstall has `bin/claude` moved aside, or only its placeholder
+/// stub is in place — [`crate::agent_runtime::resolve_claude_bin`] falls back to
+/// the bare `claude`, which on the pane's own PATH finds the identity shim
+/// first; the shim's bounded wait misses too, and the resumed pane exits 127
+/// seconds after a spawn that "succeeded". Here a miss is a MISS
+/// ([`crate::agent_runtime::try_resolve_launchable_claude_bin`]): it is retried
+/// on the caller's `delays`, each attempt off the async worker (the resolver stats
+/// the filesystem), and a persistent miss is a typed
+/// `claude_cli_unavailable:not_found` error the callers already handle as a
+/// failed spawn.
+///
+/// Before the first resolve it waits out a runner-owned CLI install
+/// ([`await_cli_update_quiescent`], at most [`CLI_UPDATE_WAIT`]): during the
+/// install `bin/claude` is moved aside on purpose, so resolving mid-install
+/// would only spend the retry budget on a window the runner itself opened. It
+/// returns at once when no install is running, which is the common case.
+///
+/// `delays` is the caller's budget: [`RESUME_RESOLVE_DELAYS`] for an account
+/// migration, whose old pane is still alive and loses its session if the
+/// respawn gives up early; [`RETRY_DELAYS`] for the resume door and the respawn
+/// receiver, which walk many candidates in turn and whose session is already
+/// closed, so a missing CLI skips the candidate instead of stalling the batch.
+/// A batch does still wait out a RUNNING install: those callers wait on the
+/// flag before their own drain and duplicate-process checks, so this wait
+/// usually returns at once for them. When the install outlived that first
+/// wait, or a new one started meanwhile, it waits once more, up to
+/// [`CLI_UPDATE_WAIT`] per resolve. Every waiter is released when the install
+/// ends.
+pub(crate) async fn resolve_resume_claude_bin(delays: &[Duration]) -> Result<String, String> {
+    await_cli_update_quiescent().await;
+    resolve_with_retry(
+        delays,
+        || async {
+            qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(
+                crate::agent_runtime::try_resolve_launchable_claude_bin,
+            )
+            .await
+            .ok()
+            .flatten()
+        },
+        tokio::time::sleep,
+    )
+    .await
+}
+
+/// The loop behind [`resolve_resume_claude_bin`], its effects injected so it is
+/// testable without PATH or a clock: `resolve_once` (`None` = a miss), then
+/// `sleep(delays[i])` between attempts — `delays.len() + 1` attempts in all.
+pub(crate) async fn resolve_with_retry<R, RF, S, SF>(
+    delays: &[Duration],
+    mut resolve_once: R,
+    mut sleep: S,
+) -> Result<String, String>
+where
+    R: FnMut() -> RF,
+    RF: Future<Output = Option<String>>,
+    S: FnMut(Duration) -> SF,
+    SF: Future<Output = ()>,
+{
+    for attempt in 0..=delays.len() {
+        if let Some(delay) = attempt.checked_sub(1).and_then(|i| delays.get(i)) {
+            sleep(*delay).await;
+        }
+        if let Some(path) = resolve_once().await {
+            if attempt > 0 {
+                // Only a recovery after a retry is news: it is the direct
+                // evidence of a CLI reinstall window this respawn rode out
+                // (coord finding 00525a01; carries main's 9269613e9 logging).
+                tracing::info!(
+                    attempts = attempt + 1,
+                    "claude_cli_spawn: a launchable `claude` reappeared for a --resume respawn \
+                     after a retry — a reinstall window was ridden out"
+                );
+            }
+            return Ok(path);
+        }
+        if attempt < delays.len() {
+            tracing::info!(
+                attempt = attempt + 1,
+                "claude_cli_spawn: no launchable `claude` resolved for a --resume respawn — \
+                 retrying after the next delay"
+            );
+        }
+    }
+    Err(format!(
+        "{CLI_UNAVAILABLE_HEAD}not_found — no launchable `claude` on the runner's PATH \
+         after {} attempts; the resume is refused rather than launched through the bare name",
+        delays.len() + 1
+    ))
 }
 
 #[cfg(test)]
@@ -267,6 +408,61 @@ mod tests {
             log.borrow_mut().push(d);
             std::future::ready(())
         }
+    }
+
+    /// A `--resume` respawn's binary: a miss is retried on the budget and the
+    /// first hit is returned (plan
+    /// 2026-10-20-account-migration-respawn-dies-during-cli-reinstall-churn D3.1).
+    #[tokio::test]
+    async fn resume_bin_miss_miss_hit_returns_the_absolute_path() {
+        let calls = RefCell::new(0u32);
+        let slept = RefCell::new(Vec::new());
+        let got = resolve_with_retry(
+            &RESUME_RESOLVE_DELAYS,
+            || {
+                *calls.borrow_mut() += 1;
+                let n = *calls.borrow();
+                std::future::ready((n >= 3).then(|| "/opt/node/bin/claude".to_string()))
+            },
+            recorder(&slept),
+        )
+        .await;
+        assert_eq!(got.as_deref(), Ok("/opt/node/bin/claude"));
+        assert_eq!(*calls.borrow(), 3);
+        assert_eq!(*slept.borrow(), RESUME_RESOLVE_DELAYS[..2].to_vec());
+    }
+
+    /// A persistent miss is a typed `claude_cli_unavailable:not_found` error
+    /// after every attempt — never the bare name handed to the PTY.
+    #[tokio::test]
+    async fn resume_bin_persistent_miss_is_a_typed_error_not_the_bare_name() {
+        let calls = RefCell::new(0u32);
+        let slept = RefCell::new(Vec::new());
+        let err = resolve_with_retry(
+            &RESUME_RESOLVE_DELAYS,
+            || {
+                *calls.borrow_mut() += 1;
+                std::future::ready(None)
+            },
+            recorder(&slept),
+        )
+        .await
+        .expect_err("a persistent miss");
+        assert!(
+            err.starts_with(&format!("{CLI_UNAVAILABLE_HEAD}not_found")),
+            "{err}"
+        );
+        assert_eq!(*calls.borrow(), RESUME_RESOLVE_DELAYS.len() as u32 + 1);
+        assert_eq!(*slept.borrow(), RESUME_RESOLVE_DELAYS.to_vec());
+    }
+
+    /// The resume budget outlasts the reinstall window measured in finding
+    /// 00525a01 (longer than the identity shim's 10 s), and is at least the
+    /// 45 s that window motivated.
+    #[test]
+    fn resume_resolve_budget_covers_the_measured_reinstall_window() {
+        let total: Duration = RESUME_RESOLVE_DELAYS.iter().sum();
+        assert!(total >= Duration::from_secs(45), "{total:?}");
     }
 
     #[tokio::test]

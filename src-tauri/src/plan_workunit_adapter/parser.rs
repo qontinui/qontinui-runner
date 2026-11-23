@@ -22,6 +22,11 @@
 //! 2. **Richer projection.** We also extract [`ParsedWorkUnit::depends_on`]
 //!    (the canonical `Depends-On:` edges) and [`ParsedWorkUnit::phases`] (one
 //!    sub-unit per declared phase — see [`detect_phases`]), which coord discarded.
+//!    Lettered arm-A phases (`### Phase A:`, `### Phase C1 —`) are carried
+//!    separately as [`ParsedWorkUnit::phase_labels`], and a phase TITLE neither
+//!    grammar reads (`### Phase Two —`) as [`ParsedWorkUnit::phases_undeclared`]
+//!    (plan `2026-11-09-lettered-phase-headings-never-reach-coords-phase-declaration`,
+//!    D1 and D3).
 
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -79,6 +84,37 @@ pub struct ParsedPhase {
     pub name: String,
 }
 
+/// One LETTERED phase of a plan — `### Phase A:`, `**Phase C1 — x**` — read
+/// only at arm A of [`detect_phases`] (plan
+/// `2026-11-09-lettered-phase-headings-never-reach-coords-phase-declaration`, D1).
+///
+/// A label keeps its spelling (`A`, `C1`) and is never mapped to a number:
+/// mapping would invent a numbering the plan does not declare. It travels to
+/// coord in its own metadata key, `phase_labels`, never inside `phases` (D2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedLabelPhase {
+    /// The label as written: one capital letter, then optional digits.
+    pub label: String,
+    /// The phase's name, ranked exactly as a numeric arm-A name is.
+    pub name: String,
+}
+
+/// The cap on [`ParsedWorkUnit::phases_undeclared`]: enough to make the
+/// declaration read partial, without letting one odd plan grow the key.
+pub const PHASES_UNDECLARED_CAP: usize = 16;
+
+/// Everything [`detect_phases`] reads off a plan body.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DetectedPhases {
+    /// Numeric phases (arms A-D), deduped by index.
+    pub phases: Vec<ParsedPhase>,
+    /// Lettered phases (arm A only), deduped by label.
+    pub labels: Vec<ParsedLabelPhase>,
+    /// Phase-title tokens neither grammar reads (arm A only), deduped and
+    /// capped at [`PHASES_UNDECLARED_CAP`].
+    pub undeclared: Vec<String>,
+}
+
 /// The pure result of parsing a plan markdown file. No IO, no clock, no env.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedWorkUnit {
@@ -110,6 +146,16 @@ pub struct ParsedWorkUnit {
     pub initiative_item_rejected: Option<HeaderRejection>,
     /// Phase structure -> sub-units, in document order, deduped by index.
     pub phases: Vec<ParsedPhase>,
+    /// Lettered arm-A phases (`Phase A`, `Phase C1`), in document order,
+    /// deduped by label — pushed as work-unit `metadata.phase_labels`. Never
+    /// mapped onto `phases`; see [`ParsedLabelPhase`].
+    pub phase_labels: Vec<ParsedLabelPhase>,
+    /// Arm-A phase-title tokens that neither the numeric nor the label grammar
+    /// reads (`Phase Two —`, `Phase II:`), deduped, capped at
+    /// [`PHASES_UNDECLARED_CAP`] — pushed as work-unit
+    /// `metadata.phases_undeclared`, so coord reads the declaration as PARTIAL
+    /// rather than complete (plan D3).
+    pub phases_undeclared: Vec<String>,
     /// The repos the plan's `**Repo(s):**` line declares, bare names, deduped
     /// in first-seen order — pushed as work-unit `metadata.repos` when
     /// non-empty. Parsed by [`super::body_push::extract_repos`], the ONE
@@ -627,6 +673,14 @@ static PHASE_TITLE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"^Phase\s+(\d+)([a-z]?)(?:\s*$|\s*[—–:(\-]|\.\s|\.$)").expect("valid regex")
 });
 
+/// [`PHASE_TITLE`]'s twin for a LETTERED phase (`Phase A —`, `Phase C1:`):
+/// the same title tail after a [`phase_label_at`] label. Used only to RANK an
+/// arm-A label's name ([`heading_rank`]); arm B keeps the numeric
+/// [`PHASE_TITLE`] alone, so no list item ever declares a label.
+static LABEL_PHASE_TITLE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^Phase\s+[A-Z][0-9]*(?:\s*$|\s*[—–:(\-]|\.\s|\.$)").expect("valid regex")
+});
+
 /// `Phase` then a LETTERED number (`Phase 1e`, `Phase 2b`).
 static LETTERED_PHASE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"^Phase\s+\d+[A-Za-z]").expect("valid regex"));
@@ -700,6 +754,100 @@ fn phase_index_at(rest: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
+/// What an arm-A line's `Phase <token>` declares: a number or a label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PhaseKey {
+    /// `Phase 3`, `Phase 2b` — [`phase_index_at`], unchanged.
+    Index(u32),
+    /// `Phase A`, `Phase C1` — [`phase_label_at`].
+    Label(String),
+}
+
+/// The arm-A phase-key reader: the numeric reading first (so `Phase 2b` and
+/// `Phase 1B` keep declaring their integer, exactly as before), else a label.
+fn phase_key_at(rest: &str) -> Option<PhaseKey> {
+    match phase_index_at(rest) {
+        Some(index) => Some(PhaseKey::Index(index)),
+        None => phase_label_at(rest).map(PhaseKey::Label),
+    }
+}
+
+/// `rest` begins with `Phase`, a whitespace boundary, then a LABEL — one
+/// capital ASCII letter and optional ASCII digits (`A`, `C1`, `R2`) — followed
+/// by the end of the text or a character outside `[A-Za-z0-9_]` (plan
+/// `2026-11-09-lettered-phase-headings-never-reach-coords-phase-declaration`, D1).
+///
+/// A label followed by `.` and a digit is a dotted cross-reference to another
+/// plan's sub-phase (`Phase D.3`) and is not a label. `Phase AB`, `Phase Two`
+/// and `Phase A_x` are not labels either (the boundary rule); `Phase ordering`
+/// is not (lower case).
+fn phase_label_at(rest: &str) -> Option<String> {
+    let after = rest.strip_prefix("Phase")?;
+    if !after.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let mut chars = after.trim_start().chars();
+    let first = chars.next().filter(char::is_ascii_uppercase)?;
+    let digits: String = chars.clone().take_while(char::is_ascii_digit).collect();
+    // The digits are ASCII, so their char count is their length.
+    let mut tail = chars.skip(digits.len());
+    match tail.next() {
+        None => {}
+        Some(c) if c.is_ascii_alphanumeric() || c == '_' => return None,
+        Some('.') if tail.next().is_some_and(|c| c.is_ascii_digit()) => return None,
+        Some(_) => {}
+    }
+    Some(format!("{first}{digits}"))
+}
+
+/// A label-shaped token: one capital ASCII letter, then only ASCII digits.
+fn is_label_token(token: &str) -> bool {
+    let mut chars = token.chars();
+    chars.next().is_some_and(|c| c.is_ascii_uppercase()) && chars.all(|c| c.is_ascii_digit())
+}
+
+/// D3's undeclared-title detector, for an arm-A line's text (a heading's text
+/// after its enumerator, or a bold line's span).
+///
+/// The token is the maximal `[A-Za-z0-9]+` run after `Phase` and whitespace.
+/// It is reported when it starts with a capital, is not label-shaped
+/// ([`is_label_token`] — a label, or a `Phase D.3` cross-reference, is never
+/// reported), and is followed by a TITLE TAIL: the end of the text, `—`, `–`,
+/// `:`, `(` or `-` (each after optional whitespace), or a `.` that ends the
+/// text or precedes whitespace. So `Phase Two —`, `Phase II:` and `Phase AB`
+/// are reported; `Phase ordering` (lower case, a section word) and
+/// `Phase Two is next` (a sentence) are not.
+fn undeclared_phase_token(text: &str) -> Option<String> {
+    let after = text.strip_prefix("Phase")?;
+    if !after.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let from = after.trim_start();
+    let token: String = from
+        .chars()
+        .take_while(char::is_ascii_alphanumeric)
+        .collect();
+    if !token.starts_with(|c: char| c.is_ascii_uppercase()) || is_label_token(&token) {
+        return None;
+    }
+    // The token is ASCII, so its byte length is a char boundary.
+    let tail = from.get(token.len()..)?;
+    let spaced = tail.trim_start();
+    let title_tail = spaced.is_empty()
+        || spaced.starts_with(['—', '–', ':', '(', '-'])
+        || tail
+            .strip_prefix('.')
+            .is_some_and(|r| r.is_empty() || r.starts_with(char::is_whitespace));
+    title_tail.then_some(token)
+}
+
+/// Record an undeclared token, deduped, up to [`PHASES_UNDECLARED_CAP`].
+fn record_undeclared(out: &mut Vec<String>, token: String) {
+    if out.len() < PHASES_UNDECLARED_CAP && !out.contains(&token) {
+        out.push(token);
+    }
+}
+
 /// The content of a bold span, given the text just AFTER its opening `**`:
 /// everything up to the closing `**`, or the whole remainder when the span
 /// does not close on this line.
@@ -742,6 +890,28 @@ fn bold_phase_opens_a_sentence(rest: &str) -> bool {
     if !BARE_PHASE.is_match(span.trim()) {
         return false;
     }
+    bold_span_continues_as_a_sentence(after)
+}
+
+/// A bare bold LABEL span (`**Phase A**, near-verbatim.`, `**Phase C1** of
+/// the other plan`) continued as sentence prose: the citation shape of
+/// [`bold_phase_opens_a_sentence`], so it declares no label (plan
+/// `2026-11-09-lettered-phase-headings-never-reach-coords-phase-declaration`,
+/// Phase 2). Unlike the numeric case it is NOT made inert: before labels
+/// existed such a line was an ordinary column-0 bold line that ended the
+/// phase list, and it still does, so numeric output is unchanged.
+fn bold_phase_label_opens_a_sentence(rest: &str) -> bool {
+    static BARE_LABEL: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"^Phase\s+[A-Z][0-9]*$").expect("valid regex"));
+    rest.split_once("**").is_some_and(|(span, after)| {
+        BARE_LABEL.is_match(span.trim()) && bold_span_continues_as_a_sentence(after)
+    })
+}
+
+/// The text after a bare bold span's closing `**` continues the line as
+/// sentence prose: `,` `.` `;` right after it, or (after whitespace) a
+/// lowercase word.
+fn bold_span_continues_as_a_sentence(after: &str) -> bool {
     if after.starts_with([',', '.', ';']) {
         return true;
     }
@@ -904,9 +1074,49 @@ fn inferred_rank(in_section: bool) -> NameRank {
     }
 }
 
-/// The rank of an arm-A name.
+/// One declared LABEL phase and the rank of the name it carries. Labels come
+/// from arm A only, so there is no refusal to protect against.
+struct DeclaredLabel {
+    phase: ParsedLabelPhase,
+    rank: NameRank,
+}
+
+/// [`declare`] for a label: dedupe by label keeping the FIRST position, and let
+/// a later occurrence of a higher [`NameRank`] replace the name (title
+/// outranks sentence), exactly as a numeric arm-A entry is ranked.
+fn declare_label(out: &mut Vec<DeclaredLabel>, label: String, name: String, rank: NameRank) {
+    match out.iter_mut().find(|d| d.phase.label == label) {
+        Some(d) => {
+            if rank > d.rank {
+                d.phase.name = name;
+                d.rank = rank;
+            }
+        }
+        None => out.push(DeclaredLabel {
+            phase: ParsedLabelPhase { label, name },
+            rank,
+        }),
+    }
+}
+
+/// A bare bold span naming an undeclarable token (`**Phase Two**, cited.`)
+/// that the line continues as sentence prose: a citation, not a title, so
+/// D3 does not report it — the same shape [`bold_phase_opens_a_sentence`]
+/// makes inert for numbers and labels.
+fn bold_undeclared_mention_opens_a_sentence(rest: &str) -> bool {
+    static BARE_TOKEN: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"^Phase\s+[A-Za-z0-9]+$").expect("valid regex"));
+    rest.split_once("**").is_some_and(|(span, after)| {
+        BARE_TOKEN.is_match(span.trim()) && bold_span_continues_as_a_sentence(after)
+    })
+}
+
+/// The rank of an arm-A name. A label title (`Phase A — x`) ranks as a title
+/// exactly as a numeric one does; a numeric name can never match the label
+/// pattern (it needs a capital where the digits are), so numeric ranking is
+/// unchanged.
 fn heading_rank(name: &str) -> NameRank {
-    if PHASE_TITLE.is_match(name) {
+    if PHASE_TITLE.is_match(name) || LABEL_PHASE_TITLE.is_match(name) {
         NameRank::HeadingTitle
     } else {
         NameRank::HeadingSentence
@@ -927,7 +1137,13 @@ fn heading_rank(name: &str) -> NameRank {
 ///   `## 5. Phase 0 — x` counts, unless the number is lettered — `### A.
 ///   Phase 1e` is another plan's sub-phase) or a `**`-bold line: `Phase`,
 ///   whitespace, digits. The pre-existing arm; its titles name a phase ahead of
-///   every other arm ([`NameRank`]).
+///   every other arm ([`NameRank`]). The same positions also declare a
+///   LABEL (`Phase A`, `Phase C1` — [`phase_label_at`]) into
+///   [`DetectedPhases::labels`], and report an undeclarable phase TITLE
+///   (`Phase Two —` — [`undeclared_phase_token`]) into
+///   [`DetectedPhases::undeclared`]; both only at arm A (plan
+///   `2026-11-09-lettered-phase-headings-never-reach-coords-phase-declaration`,
+///   D1 and D3). Arms B-D stay numeric-only.
 /// - **B** — inside a phase list (below), a column-0 list item whose bold text
 ///   is a phase TITLE ([`PHASE_TITLE`]): `- **Phase 1 — schema**`, never
 ///   `- **Phase 3's check could ossify**`. Outside a phase-list section a
@@ -967,10 +1183,12 @@ fn heading_rank(name: &str) -> NameRank {
     clippy::string_slice,
     reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
 )]
-fn detect_phases(body: &str) -> Vec<ParsedPhase> {
+fn detect_phases(body: &str) -> DetectedPhases {
     let lines: Vec<&str> = body.lines().collect();
     let fenced = fenced_lines(&lines);
     let mut out: Vec<Declared> = Vec::new();
+    let mut labels: Vec<DeclaredLabel> = Vec::new();
+    let mut undeclared: Vec<String> = Vec::new();
     let mut refused: Vec<u32> = Vec::new();
     let mut refuse = |index: Option<u32>, lettered: bool| {
         if let (Some(index), false) = (index, lettered) {
@@ -1016,10 +1234,25 @@ fn detect_phases(body: &str) -> Vec<ParsedPhase> {
                 (rest.trim_start().to_string(), false)
             };
             let lettered = LETTERED_PHASE.is_match(&text);
-            if let (Some(index), false) = (phase_index_at(&text), enumerated && lettered) {
-                let name = text.trim_end_matches(['#', '*']).trim().to_string();
-                let rank = heading_rank(&name);
-                declare(&mut out, index, name, rank);
+            match phase_key_at(&text) {
+                Some(PhaseKey::Index(index)) if !(enumerated && lettered) => {
+                    let name = text.trim_end_matches(['#', '*']).trim().to_string();
+                    let rank = heading_rank(&name);
+                    declare(&mut out, index, name, rank);
+                }
+                // `### A. Phase 1e`: another plan's sub-phase (unchanged).
+                Some(PhaseKey::Index(_)) => {}
+                Some(PhaseKey::Label(label)) => {
+                    let name = text.trim_end_matches(['#', '*']).trim().to_string();
+                    let rank = heading_rank(&name);
+                    declare_label(&mut labels, label, name, rank);
+                }
+                None => {
+                    let name = text.trim_end_matches(['#', '*']).trim();
+                    if let Some(token) = undeclared_phase_token(name) {
+                        record_undeclared(&mut undeclared, token);
+                    }
+                }
             }
             continue;
         }
@@ -1039,8 +1272,8 @@ fn detect_phases(body: &str) -> Vec<ParsedPhase> {
             continue;
         }
         if let Some(rest) = t.strip_prefix("**") {
-            match phase_index_at(rest) {
-                Some(index) => {
+            match phase_key_at(rest) {
+                Some(PhaseKey::Index(index)) => {
                     let name = bold_span(rest);
                     let rank = heading_rank(&name);
                     if rank == NameRank::HeadingTitle {
@@ -1048,8 +1281,30 @@ fn detect_phases(body: &str) -> Vec<ParsedPhase> {
                     }
                     declare(&mut out, index, name, rank);
                 }
-                None if column0 => list = PhaseList::Off,
-                None => {}
+                // A label is declared wherever a number in the same position
+                // would be. Its effect on the phase-list state is exactly the
+                // pre-label one (any column-0 bold line that names no number
+                // ends the list), so arms B-D declare byte-identically.
+                Some(PhaseKey::Label(label)) => {
+                    if column0 {
+                        list = PhaseList::Off;
+                    }
+                    if !bold_phase_label_opens_a_sentence(rest) {
+                        let name = bold_span(rest);
+                        let rank = heading_rank(&name);
+                        declare_label(&mut labels, label, name, rank);
+                    }
+                }
+                None => {
+                    if !bold_undeclared_mention_opens_a_sentence(rest) {
+                        if let Some(token) = undeclared_phase_token(&bold_span(rest)) {
+                            record_undeclared(&mut undeclared, token);
+                        }
+                    }
+                    if column0 {
+                        list = PhaseList::Off;
+                    }
+                }
             }
             continue;
         }
@@ -1162,10 +1417,15 @@ fn detect_phases(body: &str) -> Vec<ParsedPhase> {
             }
         }
     }
-    out.into_iter()
-        .filter(|d| d.by_heading || !refused.contains(&d.phase.index))
-        .map(|d| d.phase)
-        .collect()
+    DetectedPhases {
+        phases: out
+            .into_iter()
+            .filter(|d| d.by_heading || !refused.contains(&d.phase.index))
+            .map(|d| d.phase)
+            .collect(),
+        labels: labels.into_iter().map(|d| d.phase).collect(),
+        undeclared,
+    }
 }
 
 /// Parse a plan markdown body into a [`ParsedWorkUnit`]. Pure — no IO. `slug`
@@ -1213,6 +1473,11 @@ pub fn parse_work_unit(
 
     let (area, area_rejected) = extract_area(body).into_parts();
     let (initiative_item, initiative_item_rejected) = extract_initiative_item(body).into_parts();
+    let DetectedPhases {
+        phases,
+        labels: phase_labels,
+        undeclared: phases_undeclared,
+    } = detect_phases(body);
 
     ParsedWorkUnit {
         slug: slug.to_string(),
@@ -1223,7 +1488,9 @@ pub fn parse_work_unit(
         area_rejected,
         initiative_item,
         initiative_item_rejected,
-        phases: detect_phases(body),
+        phases,
+        phase_labels,
+        phases_undeclared,
         repos: super::body_push::extract_repos(body),
         source_path: source_path.to_string(),
         content: body.to_string(),
@@ -1859,16 +2126,219 @@ mod tests {
         );
         let got: Vec<u32> = u.phases.iter().map(|p| p.index).collect();
         assert_eq!(got, vec![0, 2, 3, 4, 5], "phases: {:?}", u.phases);
+        assert!(u.phase_labels.is_empty(), "labels: {:?}", u.phase_labels);
+        assert!(u.phases_undeclared.is_empty(), "{:?}", u.phases_undeclared);
+    }
+
+    // --- lettered phases and undeclarable titles (plan
+    // `2026-11-09-lettered-phase-headings-never-reach-coords-phase-declaration`,
+    // Phase 2) ------------------------------------------------------------------
+
+    fn labels(body: &str) -> Vec<String> {
+        parse(body)
+            .phase_labels
+            .iter()
+            .map(|p| p.label.clone())
+            .collect()
+    }
+
+    /// The census unit's shape (`baed3c9e`): `### Phase 0 …` then `### Phase A:`
+    /// through `### Phase F:`. Before D1 the six lettered headings declared
+    /// nothing, so coord saw a one-phase plan. Now `phases` stays `[0]` and the
+    /// letters are declared as labels, each named by its heading.
+    #[test]
+    fn phases_census_shape_declares_index_0_and_labels_a_to_f() {
+        let body = "# T\n\n## 4. Phases\n\n### Phase 0 (implementation session, read-only, ≤ 1 h): re-verify before building\n\nx\n\n### Phase A: presence history\n\n### Phase B: split the census\n\n### Phase C: device-relative freshness\n\n### Phase D: the reader\n\n### Phase E: the detector\n\n### Phase F: close out\n";
+        let u = parse(body);
+        assert_eq!(indices(body), vec![0]);
+        assert_eq!(labels(body), vec!["A", "B", "C", "D", "E", "F"]);
+        assert_eq!(
+            u.phase_labels[0],
+            ParsedLabelPhase {
+                label: "A".to_string(),
+                name: "Phase A: presence history".to_string(),
+            }
+        );
+        assert_eq!(u.phase_labels[5].name, "Phase F: close out");
+        assert!(u.phases_undeclared.is_empty(), "{:?}", u.phases_undeclared);
+    }
+
+    /// A letter plus digits is one label (`C1`, `R2`), in heading and bold
+    /// form, enumerated or not. A digit-plus-letter sub-phase (`1B`) still
+    /// declares its integer and no label — unchanged by D1.
+    #[test]
+    fn phases_letter_digit_labels_declare_as_written() {
+        let body = "# T\n\n### Phase C1 — first half\n\n### Phase C2: second half\n\n**Phase R2 — the bold one**\n\n## 5. Phase T3 — enumerated\n\n### Phase 1B — numeric sub-phase\n";
+        assert_eq!(labels(body), vec!["C1", "C2", "R2", "T3"]);
+        assert_eq!(indices(body), vec![1]);
+    }
+
+    /// `Phase D.3` is a cross-reference to another plan's sub-phase (corpus:
+    /// `2026-05-31-rebase-restack-action-effect-signatures-plan` §6.7): it
+    /// declares no label, no index, and is not reported as undeclared.
+    #[test]
+    fn phases_dotted_label_cross_reference_declares_nothing() {
+        let body = "# T\n\n### 6.7 Phase D.3 (the other plan's sub-phase)\n";
+        let u = parse(body);
+        assert!(u.phase_labels.is_empty(), "{:?}", u.phase_labels);
+        assert!(u.phases.is_empty(), "{:?}", u.phases);
+        assert!(u.phases_undeclared.is_empty(), "{:?}", u.phases_undeclared);
+        // A label followed by a `.` that ends the title is still a label.
+        assert_eq!(labels("# T\n\n### Phase D. The reader\n"), vec!["D"]);
+    }
+
+    /// Edge shapes, each with its stated outcome:
+    /// - `Phase A/B testing` — label `A` (the `/` is a boundary), named by the
+    ///   heading at sentence rank;
+    /// - `Phase ordering` — nothing: a lower-case section word, never reported;
+    /// - `Phase Ordering` — no label (`O` runs into `rdering`), reported as
+    ///   undeclared `Ordering` (D3: a capitalised title token neither grammar
+    ///   reads);
+    /// - `Phase B's check` — label `B` (the apostrophe is a boundary), exactly
+    ///   as `### Phase 3's check` declares 3 at arm A.
+    #[test]
+    fn phases_label_edge_shapes_have_their_stated_outcomes() {
+        let cases: [(&str, &[&str], &[&str]); 4] = [
+            ("### Phase A/B testing", &["A"], &[]),
+            ("### Phase ordering", &[], &[]),
+            ("### Phase Ordering", &[], &["Ordering"]),
+            ("### Phase B's check", &["B"], &[]),
+        ];
+        for (line, want_labels, want_undeclared) in cases {
+            let body = format!("# T\n\n{line}\n");
+            let u = parse(&body);
+            assert_eq!(labels(&body), want_labels, "{line}");
+            assert_eq!(u.phases_undeclared, want_undeclared, "{line}");
+            assert!(u.phases.is_empty(), "{line}");
+        }
+        let u = parse("# T\n\n### Phase A/B testing\n");
+        assert_eq!(u.phase_labels[0].name, "Phase A/B testing");
+    }
+
+    /// A bare bold label span continued as sentence prose is a citation, as
+    /// `**Phase 6**, near-verbatim.` is (coord finding f4812a7f): no label and
+    /// no undeclared token. It still ends a phase list as any column-0 bold
+    /// line naming no number did before labels existed (see
+    /// `phases_a_lettered_bold_line_leaves_numeric_output_unchanged`).
+    #[test]
+    fn phases_bold_bare_label_followed_by_sentence_prose_declares_no_label() {
+        for line in [
+            "**Phase A**, near-verbatim.",
+            "**Phase C1** of the other plan covers this.",
+            "**Phase B**; see below.",
+        ] {
+            let body = format!("# T\n\n## Phase 1 — a\n\n{line}\n\n## Phase 2 — b\n");
+            let u = parse(&body);
+            assert!(u.phase_labels.is_empty(), "{line}: {:?}", u.phase_labels);
+            assert!(u.phases_undeclared.is_empty(), "{line}");
+            assert_eq!(indices(&body), vec![1, 2], "{line}");
+        }
+        // A bare bold label that IS a title still declares.
+        for (line, name) in [
+            ("**Phase A**", "Phase A"),
+            ("**Phase A — make X**", "Phase A — make X"),
+            ("**Phase A:** description", "Phase A:"),
+        ] {
+            let u = parse(&format!("# T\n\n{line}\n"));
+            assert_eq!(u.phase_labels.len(), 1, "{line}");
+            assert_eq!(u.phase_labels[0].name, name, "{line}");
+        }
+    }
+
+    /// Numeric output is byte-identical to the pre-label parser on a lettered
+    /// bold line: a column-0 `**Phase A …` line (a sentence, a bare citation,
+    /// or a title) ends the phase list exactly as it did when it named no
+    /// phase at all, so the numbered items after it are steps, not phases.
+    /// Fails if a label sentence or citation leaves the list armed.
+    #[test]
+    fn phases_a_lettered_bold_line_leaves_numeric_output_unchanged() {
+        for line in [
+            "**Phase A is a gate** before anything.",
+            "**Phase A**, near-verbatim.",
+            "**Phase A — the title**",
+        ] {
+            let body = format!("# T\n\n## Phases\n\n{line}\n\n1. schema\n2. wiring\n");
+            assert!(
+                indices(&body).is_empty(),
+                "{line}: {:?}",
+                parse(&body).phases
+            );
+        }
+        // An INDENTED lettered bold line changes nothing, as before.
+        let body = "# T\n\n## Phases\n\n1. schema\n  **Phase A is a gate**\n2. wiring\n";
+        assert_eq!(indices(body), vec![1, 2]);
+    }
+
+    /// D3: a capitalised title token that neither grammar reads is REPORTED,
+    /// deduped, in document order — never declared as a phase or a label. A
+    /// sentence (`Phase Two is …`), a lower-case word and a bold citation are
+    /// not reported.
+    #[test]
+    fn phases_an_undeclarable_title_is_reported_not_declared() {
+        let body = "# T\n\n## Phase 1 — a\n\n### Phase Two — the second\n\n## Phase II: roman\n\n**Phase AB — two letters**\n\n### Phase Two — again\n\n### Phase Two is a sentence\n\n### Phase ordering\n\n**Phase Three**, cited in prose.\n";
+        let u = parse(body);
+        assert_eq!(u.phases_undeclared, vec!["Two", "II", "AB"]);
+        assert!(u.phase_labels.is_empty(), "{:?}", u.phase_labels);
+        assert_eq!(indices(body), vec![1]);
+        // `Phase Two —` alone, the plan's own example.
+        assert_eq!(
+            parse("# T\n\n### Phase Two —\n").phases_undeclared,
+            vec!["Two"]
+        );
+    }
+
+    /// The undeclared list is capped, so one odd plan cannot grow the key.
+    #[test]
+    fn phases_undeclared_is_capped() {
+        let body: String = (0..PHASES_UNDECLARED_CAP + 4)
+            .map(|i| format!("### Phase Tok{i} — x\n\n"))
+            .collect();
+        let u = parse(&format!("# T\n\n{body}"));
+        assert_eq!(u.phases_undeclared.len(), PHASES_UNDECLARED_CAP);
+        assert_eq!(u.phases_undeclared[0], "Tok0");
+        assert_eq!(
+            u.phases_undeclared[PHASES_UNDECLARED_CAP - 1],
+            format!("Tok{}", PHASES_UNDECLARED_CAP - 1)
+        );
+    }
+
+    /// Labels are read at arm A only: list items and phase-table rows stay
+    /// numeric (D1), and fenced code and blockquotes declare and report
+    /// nothing, as for numbers.
+    #[test]
+    fn phases_labels_come_from_arm_a_only() {
+        let body = "# T\n\n## Phases\n\n- **Phase A — schema**\n- **Phase B — wiring**\n\n| Phase | Work |\n|---|---|\n| A | x |\n| Phase C | y |\n\n> **Phase D — status narration**\n\n```\n### Phase E — example\n### Phase Two — example\n```\n";
+        let u = parse(body);
+        assert!(u.phase_labels.is_empty(), "{:?}", u.phase_labels);
+        assert!(u.phases_undeclared.is_empty(), "{:?}", u.phases_undeclared);
+        assert!(u.phases.is_empty(), "{:?}", u.phases);
+    }
+
+    /// A label is deduped keeping its FIRST position, and a later title
+    /// outranks an earlier sentence for its name, exactly as for an index.
+    #[test]
+    fn phases_a_label_title_outranks_a_sentence_and_keeps_first_position() {
+        let body = "# T\n\n**Phase A gap, verified** in review.\n\n## Phase B — b\n\n## Phase A — tests\n\n### Phase A execution record\n";
+        let u = parse(body);
+        let got: Vec<(&str, &str)> = u
+            .phase_labels
+            .iter()
+            .map(|p| (p.label.as_str(), p.name.as_str()))
+            .collect();
+        assert_eq!(got, vec![("A", "Phase A — tests"), ("B", "Phase B — b")]);
     }
 
     /// A measuring tool, not a check: prints, per dated plan in a directory,
     /// what the REAL parser declares — one
-    /// `phase_census_row<TAB><file><TAB><i,j,...><TAB>[names]` line each — then a
-    /// summary line counting plans, and separately every entry it could not
+    /// `phase_census_row<TAB><file><TAB><i,j,...><TAB>[names]<TAB><labels><TAB><undeclared>`
+    /// line each — then a summary line counting plans (including lettered,
+    /// mixed and undeclared plans), and separately every entry it could not
     /// read (a directory-entry error, or a file that is unreadable or not
     /// UTF-8). To measure a grammar change for gained AND lost indices, run it
-    /// on both parsers (cherry-pick this test onto the old one) and diff the
-    /// row lines. Point `QONTINUI_PHASE_CENSUS_DIR` at a `plans/` directory and
+    /// on both parsers and diff only the first four tab-separated columns of
+    /// the row lines (file, indices, names). On a parser that predates
+    /// `DetectedPhases` (`detect_phases` returning `Vec<ParsedPhase>`), run the
+    /// pre-change body of this test: this one does not compile there. Point `QONTINUI_PHASE_CENSUS_DIR` at a `plans/` directory and
     /// run `cargo test -- phase_census --ignored --nocapture`.
     #[test]
     #[ignore = "measuring tool: reads QONTINUI_PHASE_CENSUS_DIR, prints and returns when it is unset"]
@@ -1894,6 +2364,13 @@ mod tests {
         }
         names.sort();
         let (mut plans, mut zero, mut one, mut many) = (0, 0, 0, 0);
+        // Label and undeclared counts (plan
+        // `2026-11-09-lettered-phase-headings-never-reach-coords-phase-declaration`,
+        // Phase 0 step 1): plans declaring any label, plans mixing numbers and
+        // labels, total labels declared, plans reporting an undeclared token,
+        // and total undeclared tokens.
+        let (mut lettered, mut mixed, mut label_total) = (0, 0, 0);
+        let (mut with_undeclared, mut undeclared_total) = (0, 0);
         for name in names {
             let Ok(body) = std::fs::read_to_string(std::path::Path::new(&dir).join(&name)) else {
                 skipped += 1;
@@ -1901,20 +2378,36 @@ mod tests {
             };
             plans += 1;
             let got = detect_phases(&body);
-            match got.len() {
+            match got.phases.len() {
                 0 => zero += 1,
                 1 => one += 1,
                 _ => many += 1,
             }
-            let indices: Vec<String> = got.iter().map(|p| p.index.to_string()).collect();
-            let phase_names: Vec<&str> = got.iter().map(|p| p.name.as_str()).collect();
+            if !got.labels.is_empty() {
+                lettered += 1;
+                if !got.phases.is_empty() {
+                    mixed += 1;
+                }
+            }
+            label_total += got.labels.len();
+            if !got.undeclared.is_empty() {
+                with_undeclared += 1;
+            }
+            undeclared_total += got.undeclared.len();
+            let indices: Vec<String> = got.phases.iter().map(|p| p.index.to_string()).collect();
+            let phase_names: Vec<&str> = got.phases.iter().map(|p| p.name.as_str()).collect();
+            let label_keys: Vec<&str> = got.labels.iter().map(|p| p.label.as_str()).collect();
             println!(
-                "phase_census_row\t{name}\t{}\t{phase_names:?}",
-                indices.join(",")
+                "phase_census_row\t{name}\t{}\t{phase_names:?}\t{}\t{}",
+                indices.join(","),
+                label_keys.join(","),
+                got.undeclared.join(",")
             );
         }
         println!(
-            "phase_census plans={plans} skipped={skipped} zero={zero} one={one} two_or_more={many}"
+            "phase_census plans={plans} skipped={skipped} zero={zero} one={one} two_or_more={many} \
+             lettered={lettered} mixed={mixed} labels={label_total} \
+             with_undeclared={with_undeclared} undeclared={undeclared_total}"
         );
     }
 

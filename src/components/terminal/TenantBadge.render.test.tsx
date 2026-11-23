@@ -17,11 +17,16 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const ACTING = "c231d9da-0ca8-4fe4-bd81-0e3d6c20339a";
+const OTHER = "6b1f4b0e-1111-4000-8000-000000000001";
+const ANOTHER = "91ffaa20-2222-4000-8000-000000000002";
 // Per-test switch for the device's multi-tenant flag (`useTenant().showSwitcher`).
 const tenantFlag = vi.hoisted(() => ({ showSwitcher: true }));
 // Per-test switch for whether the runner sent `tenancy.display` (an older
 // runner, or a read that has not projected one, sends none).
 const displayFlag = vi.hoisted(() => ({ sent: true }));
+// Per-test switch for the display's measured membership of the acting tenant
+// in the runner's two-tenant bound set (`actingInBoundSet`).
+const boundFlag = vi.hoisted(() => ({ actingInBoundSet: true as boolean | null }));
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(() => new Promise(() => {})) }));
 vi.mock("@/contexts/TenantContext", () => ({
@@ -42,8 +47,27 @@ vi.mock("./useSessionInfo", async (orig) => ({
               divergence: "agree",
               credential: { status: "resolved", tenantId: ACTING },
               dataPlane: { status: "resolved", tenantId: ACTING },
+              // The full shape `normalizeTenantDisplay` always produces.
               display: displayFlag.sent
-                ? { status: "resolved", tenantId: ACTING, source: "credential" }
+                ? {
+                    status: "resolved",
+                    tenantId: ACTING,
+                    tenantSlug: null,
+                    source: "credential",
+                    reason: null,
+                    conflicts: [],
+                    conflictDetail: null,
+                    // A list consistent with the flag, as the Rust producer
+                    // derives it: a tenant measured outside is not listed.
+                    bound: {
+                      status: "measured",
+                      tenantIds:
+                        boundFlag.actingInBoundSet === false ? [OTHER, ANOTHER] : [OTHER, ACTING],
+                      reason: null,
+                    },
+                    multiBound: true,
+                    actingInBoundSet: boundFlag.actingInBoundSet,
+                  }
                 : null,
             },
           },
@@ -58,6 +82,7 @@ let root: Root;
 beforeEach(() => {
   tenantFlag.showSwitcher = true;
   displayFlag.sent = true;
+  boundFlag.actingInBoundSet = true;
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   container = document.createElement("div");
   document.body.appendChild(container);
@@ -139,6 +164,51 @@ describe("TenantBadge display attributes on the rendered element", () => {
     expect(badge?.hasAttribute("data-tenant-display-status")).toBe(false);
     expect(badge?.hasAttribute("data-tenant-display-source")).toBe(false);
     expect(badge?.hasAttribute("data-tenant-acting")).toBe(false);
+    expect(badge?.hasAttribute("data-tenant-bound-membership")).toBe(false);
+  });
+});
+
+/**
+ * The bound-set half of the display reaches the rendered badge, as the
+ * session-info row's suffix does (`not among N bound`): an acting tenant
+ * MEASURED outside the runner's bound set is never the plain blue label.
+ */
+describe("TenantBadge bound-set membership on the rendered element", () => {
+  const BLUE = "text-[#7aa2f7]";
+  const AMBER = "text-[#e0af68]";
+
+  it("an acting tenant measured outside the bound set renders in the attention tone and says so", () => {
+    boundFlag.actingInBoundSet = false;
+    renderZones();
+    const badge = container.querySelector('[data-ui-bridge-id="terminal-tenant-badge-0"]');
+    expect(badge?.className).toContain(AMBER);
+    expect(badge?.className).not.toContain(BLUE);
+    expect(badge?.getAttribute("data-tenant-bound-membership")).toBe("out");
+    expect(badge?.getAttribute("title")).toContain(
+      "Tenant c231d9da is NOT among the 2 tenants this runner is bound to.",
+    );
+    expect(badge?.getAttribute("aria-label")).toBe(badge?.getAttribute("title"));
+  });
+
+  it("a measured member keeps the plain tone and states its membership", () => {
+    renderZones();
+    const badge = container.querySelector('[data-ui-bridge-id="terminal-tenant-badge-0"]');
+    expect(badge?.className).toContain(BLUE);
+    expect(badge?.getAttribute("data-tenant-bound-membership")).toBe("in");
+    expect(badge?.getAttribute("title")).toContain(
+      "Tenant c231d9da is 1 of the 2 tenants this runner is bound to.",
+    );
+  });
+
+  it("an unknown membership is said, and is not the attention tone of a measured outside", () => {
+    boundFlag.actingInBoundSet = null;
+    renderZones();
+    const badge = container.querySelector('[data-ui-bridge-id="terminal-tenant-badge-0"]');
+    expect(badge?.className).toContain(BLUE);
+    expect(badge?.getAttribute("data-tenant-bound-membership")).toBe("unknown");
+    expect(badge?.getAttribute("title")).toContain(
+      "Whether tenant c231d9da is among the 2 tenants this runner is bound to is unknown.",
+    );
   });
 });
 

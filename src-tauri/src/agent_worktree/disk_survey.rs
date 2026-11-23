@@ -1194,9 +1194,10 @@ pub async fn survey(query: DiskSurveyQuery) -> DiskSurvey {
         // Only report "unavailable" when the reason is structural. A resolvable
         // root with no snapshot yet is `pending`, not an error.
         census::qontinui_root().is_none().then(|| {
-            "the workspace root could not be resolved (set QONTINUI_ROOT, or the \
-             paths.workspace_root setting)"
-                .to_string()
+            format!(
+                "the workspace root could not be resolved (set the \"{}\" setting)",
+                qontinui_types::paths::WORKSPACE_ROOT_SETTING
+            )
         })
     };
 

@@ -22,6 +22,7 @@ mod config;
 mod gemini_api;
 mod gemini_cli;
 pub(crate) mod gemma_local_warm;
+pub mod limit_hit;
 pub mod middleware;
 pub mod multimodal;
 pub(crate) mod oauth_refresh;
@@ -43,11 +44,14 @@ pub use account_usage::{
     unrecord_handoff, AccountSelectError, ResolvedAccount,
 };
 pub use cache_aware_builder::StructuredPrompt;
+#[cfg(test)]
+pub(crate) use config::ResolvedConfigDirRestore;
 pub use config::{
     account_known_exhausted, get_account_statuses, get_effective_config_dir,
     get_effective_config_dir_with_override, get_resolved_config_dir,
-    mark_account_rate_limited_with_duration, record_account_usage, rotate_account_on_rate_limit,
-    set_resolved_config_dir, switch_to_account, ClaudeConfigDirSource,
+    mark_account_rate_limited_at_least, mark_account_rate_limited_with_duration,
+    record_account_usage, rotate_account_on_rate_limit, set_resolved_config_dir, switch_to_account,
+    time_until_cooled_down, ClaudeConfigDirSource,
 };
 pub use multimodal::{ContentBlock, ImageSource, MultimodalPrompt};
 pub use oneshot::{
