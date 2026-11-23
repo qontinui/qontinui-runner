@@ -166,14 +166,59 @@ fn a_rung_two_bind_never_moves_an_open_row_off_its_live_pane() {
             "pane-a",
             "pass {pass}: the row stays on the pane it is on, got {actions:?}"
         );
+        // Why: pane-a is a captured, anchored pane whose claude still names
+        // the session, so the rung-2 owner check leaves pane-b alone before
+        // any write is attempted.
         assert!(
-            !actions.iter().any(|a| matches!(
-                a,
-                ReconcileAction::Bind { terminal_id, .. } if terminal_id == "pane-b"
-            )),
-            "pass {pass}: pane-b must not take the row, got {actions:?}"
+            actions.contains(&ReconcileAction::LeaveAlone {
+                terminal_id: "pane-b".to_string()
+            }),
+            "pass {pass}: pane-b is left alone because pane-a owns the row, got {actions:?}"
         );
     }
+}
+
+/// The account migration's race, at the write-time guard: the pass captured
+/// only the source pane, whose claude still runs `--resume <sid>` until the
+/// migration's proof-then-close, and the migration's own spawn write has since
+/// put the confirmed row on the new pane, which the capture never saw. The
+/// rung-2 owner check sees no captured owner and proposes binding the source
+/// pane; the guard refuses it because the row's pane is live now and nothing
+/// the pass captured says it stopped running the session.
+#[test]
+fn a_row_on_a_pane_the_capture_never_saw_holds_against_a_stale_rung_two_bind() {
+    let (_dir, store) = store();
+    store.record_open(row(SESSION, "new-pane", 2, true));
+
+    let actions = run_reconcile(
+        &store,
+        &[pane("source-pane", 701)],
+        &ProcessSnapshot::default(),
+        &PrescannedTranscriptIndex::default(),
+        &resumes(&[701]),
+        &live_now(&["source-pane", "new-pane"]),
+    );
+
+    let rec = store.get(SESSION).unwrap();
+    assert_eq!(
+        rec.terminal_id, "new-pane",
+        "the row stays on the migration's new pane, got {actions:?}"
+    );
+    assert_eq!(rec.zone_index, 2);
+    assert!(
+        actions.contains(&ReconcileAction::BindNotWritten {
+            terminal_id: "source-pane".to_string(),
+            session_id: SESSION.to_string(),
+            reason: InferredBind::RowOnLivePane {
+                terminal_id: "new-pane".to_string()
+            },
+        }),
+        "the stale bind is refused because the row's pane is live, got {actions:?}"
+    );
+    assert!(
+        session_bound_payloads(&actions).is_empty(),
+        "a refused bind stamps no tab, got {actions:?}"
+    );
 }
 
 /// The dead-to-live heal is unchanged: a row left on a pane that is gone binds

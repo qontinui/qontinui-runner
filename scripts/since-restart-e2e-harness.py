@@ -369,7 +369,8 @@ def await_stopped(r: Runner, limit_s: float = 60) -> str:
     return verdict
 
 
-def teardown(r: Runner | None, owned: bool, log: Log, scratch: list[Path]) -> dict:
+def teardown(r: Runner | None, owned: bool, log: Log, scratch: list[Path],
+             out: dict | None = None) -> dict:
     """Stop the runner THIS process spawned. Holders are killed, and the
     instance root removed, only for a runner `require_own_temp_runner` verified
     (`owned`), and the root only once the stop is CONFIRMED. A runner that was
@@ -378,8 +379,14 @@ def teardown(r: Runner | None, owned: bool, log: Log, scratch: list[Path]) -> di
 
     Returns what it did, for the summary: `stop` ('stopped' | 'running' |
     'unknown', 'not_awaited' for a runner never verified, None with no
-    runner), and whether the root and the scratch were removed."""
-    out: dict = {"stop": None, "root_removed": False, "scratch_removed": False}
+    runner), and whether the root and the scratch were removed.
+
+    `out`, when given, is filled IN PLACE, so a caller holding it keeps every
+    verdict recorded before the runner half raised (the scratch verdict is
+    always recorded, from the `finally`)."""
+    if out is None:
+        out = {}
+    out.update({"stop": None, "root_removed": False, "scratch_removed": False})
     try:
         if r is not None:
             s, v = http("POST", f"{SUPERVISOR}/runners/{r.id}/stop", {}, timeout=120)
@@ -727,7 +734,10 @@ def run(args) -> int:
         if not args.keep:
             try:
                 # Records whether the stop was confirmed when the scratch went.
-                summary["teardown"] = teardown(r, owned, log, scratch)
+                # Filled in place, so a runner half that raises still leaves
+                # its verdict (and the scratch's) in the summary.
+                summary["teardown"] = {}
+                teardown(r, owned, log, scratch, summary["teardown"])
                 summary["torn_down"] = True
             except Exception as e:  # the summary below must still be written
                 summary["torn_down"] = False
