@@ -1069,10 +1069,11 @@ pub(crate) struct TranscriptBindEnv {
 ///      ([`crate::coord_mcp::terminal_session_credential`], so a fresh bind
 ///      registers under the session's own tenant); and the request carries
 ///      `X-Qontinui-Terminal-Proof` ([`TERMINAL_PROOF_HEADER`]), that
-///      terminal's door key ([`crate::session::terminal_door_key`]), which
-///      only a holder of the terminal's per-spawn secret can derive — a
-///      sibling sharing the key holds its own terminal's secret, never this
-///      one's;
+///      terminal's door key ([`crate::session::terminal_door_key`]), derived
+///      from the per-spawn secret in that terminal's environment — a sibling
+///      sharing the key holds its own terminal's secret, never this one's
+///      (a bookkeeping bound, like the permission pad's: a hostile same-uid
+///      process can read any pane's environment);
 ///    - **unhosted** — no open record hosts it, and its JSONL `cwd` is exactly
 ///      the nonce's workdir (so any UNHOSTED session of that workdir — not
 ///      strictly the calling one — can be bound by a nonce for it).
@@ -1259,8 +1260,10 @@ async fn confirm_adoption_with_coord(
 /// 2. The key IS T's session credential (compared in constant time), so the
 ///    tenant a fresh bind registers under is the session's own.
 /// 3. The request proves T: [`TERMINAL_PROOF_HEADER`] carries T's door key,
-///    derived from the per-spawn secret only T's environment holds — a
-///    sibling sharing the key holds its own terminal's secret, never T's.
+///    derived from the per-spawn secret in T's environment — a sibling
+///    sharing the key holds its own terminal's secret, never T's. This stops
+///    a peer pane's accident, not a hostile same-uid process, which can read
+///    any pane's environment.
 ///
 /// `Err` is the refusal's reason, naming the evidence that is missing. Every
 /// arm that cannot read its evidence refuses: an adopted holder pane, or a
@@ -3083,10 +3086,7 @@ mod tests {
         }
 
         /// What an `authoritative`, confirmed open record says about a session
-        /// hosted in `terminal` — the shape every open lifecycle record had on
-        /// nilan when plan
-        /// 2026-11-05-transcript-bind-refuses-a-hosted-session-whose-only-key-is-the-workdir-nonce
-        /// measured them on 2026-11-05.
+        /// hosted in `terminal`.
         fn host(terminal: &str, working_dir: &str) -> SessionHost {
             SessionHost {
                 terminal_id: terminal.to_string(),
@@ -3343,6 +3343,7 @@ mod tests {
                 "coord_mcp_delivery_unrecorded",
                 "no_session_nonce",
                 "no_runner_nonce_in_cwd_file",
+                "nonce_not_live",
             ] {
                 let e = hosted_env(
                     Some(t.clone()),
