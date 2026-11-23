@@ -396,6 +396,7 @@ describe("the receiver's branches", () => {
   it("a null store leaves the receiver's roster unchanged", async () => {
     const main = await mountWindow("main");
     const before = main.hook().allPages;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     localStorage.clear();
 
     vi.useFakeTimers();
@@ -405,6 +406,41 @@ describe("the receiver's branches", () => {
 
     expect(main.hook().allPages).toBe(before);
     expect(names(main.hook().allPages)).toEqual(["Alpha", "Beta", "Gamma"]);
+    // Nothing was ever read, so there is nothing to apply or warn about.
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("a newer foreign event supersedes a read still retrying on an older digest", async () => {
+    const main = await mountWindow("main");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.useFakeTimers();
+    // The older digest is never reached: main starts retrying on it.
+    receiveFrom("term-2", rosterDigest([ROSTER[0]]));
+    const newer = [ROSTER[0], { ...ROSTER[1], name: "Newer" }, ROSTER[2]];
+    instanceStorage.setJSON(PAGES_STORAGE_KEY, newer);
+    receiveFrom("term-3", rosterDigest(newer));
+    act(() => void vi.advanceTimersByTime(1_000));
+    expect(vi.getTimerCount()).toBe(0);
+    vi.useRealTimers();
+
+    expect(names(main.hook().allPages)).toEqual(["Alpha", "Newer", "Gamma"]);
+    // The superseded read is gone, so it never exhausts into a warning.
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("an own save that lands before a foreign event is not warned about either", async () => {
+    const main = await mountWindow("main");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    // Main saves first; the store holds its write.
+    act(() => void main.hook().renamePage("p1", "MineFirst"));
+    vi.useFakeTimers();
+    // A foreign event whose write the store will never show (main overwrote it).
+    receiveFrom("term-2", rosterDigest([ROSTER[2]]));
+    act(() => void vi.advanceTimersByTime(1_000));
+    vi.useRealTimers();
+
+    expect(warn).not.toHaveBeenCalled();
+    expect(names(main.hook().allPages)).toEqual(["MineFirst", "Beta", "Gamma"]);
   });
 
   it("a store emptied between the read and the update keeps the receiver's copy", async () => {
