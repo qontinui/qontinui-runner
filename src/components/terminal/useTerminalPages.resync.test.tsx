@@ -8,7 +8,8 @@
  * is actually exercised.
  */
 
-import { StrictMode, act, createElement } from "react";
+import { StrictMode, act, createElement, startTransition } from "react";
+import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -305,7 +306,43 @@ describe("the receiver's branches", () => {
     expect(names(main.hook().allPages)).toEqual(["Alpha", "Beta", "Strict"]);
   });
 
-  it("this window's own save cancels a pending read of an older foreign digest", async () => {
+  it("a foreign digest the store reaches after this window's own save is still applied", async () => {
+    const main = await mountWindow("main");
+    vi.useFakeTimers();
+    const foreign = [ROSTER[0], { ...ROSTER[1], name: "Theirs" }, ROSTER[2]];
+    // The foreign event arrives before its write is visible here: main retries.
+    receiveFrom("term-2", rosterDigest(foreign));
+    // Main saves meanwhile; its own echo must not cancel the pending read.
+    act(() => void main.hook().renamePage("p3", "Mine"));
+    // The other window's write turns out to be the store's last commit.
+    instanceStorage.setJSON(PAGES_STORAGE_KEY, foreign);
+    act(() => void vi.advanceTimersByTime(1_000));
+    vi.useRealTimers();
+
+    expect(names(main.hook().allPages)).toEqual(["Alpha", "Theirs", "Gamma"]);
+  });
+
+  it("an add that overtakes a pending transition write is applied once", async () => {
+    // React renders the add first, skipping the transition write, then re-runs
+    // the add after it -- on a base that already holds the add's own save.
+    const main = await mountWindow("main");
+    let added = "";
+    act(() => {
+      startTransition(() => {
+        main.hook().reorderPage("p3", "p1");
+      });
+      flushSync(() => {
+        added = main.hook().addPage("Once");
+      });
+    });
+    await settle();
+
+    expect(ids(persisted()).filter((id) => id === added)).toHaveLength(1);
+    expect(ids(main.hook().allPages).filter((id) => id === added)).toHaveLength(1);
+    expect(ids(persisted())[0]).toBe("p3");
+  });
+
+  it("this window's own save during a pending foreign read is not warned about", async () => {
     const main = await mountWindow("main");
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     vi.useFakeTimers();
@@ -368,6 +405,22 @@ describe("the receiver's branches", () => {
 
     expect(main.hook().allPages).toBe(before);
     expect(names(main.hook().allPages)).toEqual(["Alpha", "Beta", "Gamma"]);
+  });
+
+  it("a store emptied between the read and the update keeps the receiver's copy", async () => {
+    const main = await mountWindow("main");
+    const before = main.hook().allPages;
+    const foreign = [ROSTER[0]];
+    instanceStorage.setJSON(PAGES_STORAGE_KEY, foreign);
+
+    act(() => {
+      // The read matches at once and queues the reload...
+      dispatch(TERMINAL_PAGES_SAVED_EVENT, { source: "term-2", digest: rosterDigest(foreign) });
+      // ...but the store reads empty by the time the update runs.
+      localStorage.clear();
+    });
+
+    expect(main.hook().allPages).toBe(before);
   });
 
   it("an unchanged roster keeps the same allPages reference", async () => {
