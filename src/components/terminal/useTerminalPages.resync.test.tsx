@@ -122,7 +122,9 @@ async function mountWindow(
   if (pinnedPage) window.history.replaceState({}, "", `?page=${pinnedPage}`);
   try {
     await act(async () =>
-      root.render(strict ? createElement(StrictMode, null, createElement(Win)) : createElement(Win)),
+      root.render(
+        strict ? createElement(StrictMode, null, createElement(Win)) : createElement(Win),
+      ),
     );
     await settle();
   } finally {
@@ -432,7 +434,11 @@ describe("the receiver's branches", () => {
     bus.deferEvent = TERMINAL_PAGES_SAVED_EVENT;
     const main = await mountWindow("main");
     expect(names(main.hook().allPages)).toEqual(["Alpha", "Beta", "Gamma"]);
-    instanceStorage.setJSON(PAGES_STORAGE_KEY, [ROSTER[0], { ...ROSTER[1], name: "Early" }, ROSTER[2]]);
+    instanceStorage.setJSON(PAGES_STORAGE_KEY, [
+      ROSTER[0],
+      { ...ROSTER[1], name: "Early" },
+      ROSTER[2],
+    ]);
 
     bus.deferEvent = null;
     for (const release of bus.release.splice(0)) release();
@@ -476,7 +482,11 @@ describe("the receiver's branches", () => {
     receiveFrom("term-2", rosterDigest([ROSTER[0]]));
     act(() => void main.hook().renamePage("p2", "Own"));
     // The store then moves on to neither main's save nor the announced one.
-    instanceStorage.setJSON(PAGES_STORAGE_KEY, [ROSTER[0], { ...ROSTER[1], name: "Third" }, ROSTER[2]]);
+    instanceStorage.setJSON(PAGES_STORAGE_KEY, [
+      ROSTER[0],
+      { ...ROSTER[1], name: "Third" },
+      ROSTER[2],
+    ]);
     act(() => void vi.advanceTimersByTime(1_000));
     vi.useRealTimers();
 
@@ -497,6 +507,44 @@ describe("the receiver's branches", () => {
     vi.useRealTimers();
 
     expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("an exhausted read re-reads the store rather than applying an earlier read", async () => {
+    const main = await mountWindow("main");
+    const before = main.hook().allPages;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.useFakeTimers();
+    // An early read returns a roster that never matches the event...
+    instanceStorage.setJSON(PAGES_STORAGE_KEY, [
+      ROSTER[0],
+      { ...ROSTER[1], name: "Early" },
+      ROSTER[2],
+    ]);
+    receiveFrom("term-2", rosterDigest([ROSTER[0]]));
+    // ...then the store reads empty for the rest of the retries.
+    localStorage.clear();
+    act(() => void vi.advanceTimersByTime(1_000));
+    vi.useRealTimers();
+
+    // The empty store keeps this window's copy; the earlier read is not installed.
+    expect(main.hook().allPages).toBe(before);
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("a refused own save during the read is not an own save", async () => {
+    const main = await mountWindow("main");
+    act(() => void main.hook().renamePage("p1", "Accepted"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.useFakeTimers();
+    receiveFrom("term-2", rosterDigest([ROSTER[2]]));
+    // A save during the read that the store refuses: the store still holds the
+    // own save made BEFORE the event, which cannot be told from a lag.
+    failWritesTo(PAGES_STORAGE_KEY);
+    act(() => void main.hook().renamePage("p3", "Refused"));
+    act(() => void vi.advanceTimersByTime(1_000));
+    vi.useRealTimers();
+
+    expect(warn).toHaveBeenCalledTimes(1);
   });
 
   it("a null store leaves the receiver's roster unchanged", async () => {
@@ -558,7 +606,11 @@ describe("the receiver's branches", () => {
     // The event's digest never appears; the store moves to a third roster this
     // window does not show yet.
     receiveFrom("term-2", rosterDigest([ROSTER[0]]));
-    instanceStorage.setJSON(PAGES_STORAGE_KEY, [ROSTER[0], { ...ROSTER[1], name: "Third" }, ROSTER[2]]);
+    instanceStorage.setJSON(PAGES_STORAGE_KEY, [
+      ROSTER[0],
+      { ...ROSTER[1], name: "Third" },
+      ROSTER[2],
+    ]);
     act(() => void vi.advanceTimersByTime(1_000));
     vi.useRealTimers();
 
