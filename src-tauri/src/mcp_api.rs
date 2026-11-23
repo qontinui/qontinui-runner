@@ -24073,9 +24073,56 @@ mod provision_probe_tests {
 
     /// A home directory is not a git work tree, and `~/.claude/agents` holds the
     /// operator's own hand-authored definitions. The git guard cannot catch it.
+    ///
+    /// Deterministic by construction (finding `70008d38`, plan
+    /// `2026-11-22-vision-capture-websocket-follow-ups` Phase 3). The test and
+    /// the handler each call `dirs::home_dir()`, and it used to run outside the
+    /// env lock, so an env-mutating sibling fixture could repoint the home
+    /// directory between the test's read and the handler's. Now the whole body
+    /// holds `env_lock()` (through an `IsolatedAmbient`), so no fixture can move
+    /// it between the two reads, and the test resolves the home directory the
+    /// way the handler does, under that lock, and probes exactly that.
+    ///
+    /// Where `dirs::home_dir()` reads `HOME` (every non-Windows target), the
+    /// fixture also makes it a known, empty temp dir, and the test asserts that
+    /// as a precondition. On Windows it does NOT: `dirs` answers from the
+    /// `FOLDERID_Profile` known folder, which ignores the `USERPROFILE` the
+    /// fixture sets (measured 2026-11-23: it returned the real profile inside
+    /// the fixture). That answer does not come from the process environment, so
+    /// no sibling fixture can change it and it needs no lock.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_home_directory_is_refused() {
-        let Some(home) = dirs::home_dir() else { return };
+        let _lock = crate::test_env::env_lock();
+        // The fixture's home dir is a `tempfile::tempdir()`; the handler's git
+        // guard runs BEFORE its home guard, so that dir must sit outside every
+        // work tree or the refusal this test asserts is never reached.
+        let outside = tempdir_outside_any_work_tree();
+        let tmp_keys = crate::test_env::EnvVarRestore::capture(&["TMPDIR", "TMP", "TEMP"]);
+        for key in ["TMPDIR", "TMP", "TEMP"] {
+            std::env::set_var(key, outside.path());
+        }
+        let ambient = crate::test_env::IsolatedAmbient::new();
+        drop(tmp_keys);
+
+        // Resolved exactly as the handler resolves it, under the same lock.
+        let home = dirs::home_dir()
+            .and_then(|h| std::fs::canonicalize(h).ok())
+            .expect("a home directory resolves (the handler's guard needs one to run)");
+        #[cfg(not(windows))]
+        assert_eq!(
+            home,
+            std::fs::canonicalize(ambient.dir()).expect("the fixture's dir canonicalizes"),
+            "precondition: dirs::home_dir() must resolve to the fixture's HOME, or this \
+             test probes a home directory the fixture does not control"
+        );
+        #[cfg(windows)]
+        let _ = &ambient;
+        assert!(
+            enclosing_git_work_tree(&home).is_none(),
+            "precondition: the home directory {home:?} must sit outside any git work tree, \
+             or the handler's git guard answers before its home guard"
+        );
+
         let (status, body) = probe(&home.display().to_string()).await;
         assert_eq!(
             status,
