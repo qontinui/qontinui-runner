@@ -258,12 +258,21 @@ if [ "$RC" -eq 0 ] && [ ! -e "$W/stale.stderr" ]; then
   ok "rso_begin removes a stale stderr log"
 else bad "stale log" "rc=$RC"; fi
 
-# 5a-5i. rso_run_retrying: a stub `reviewdog` whose Nth attempt does what line
+# 5a-5s. rso_run_retrying: a stub `reviewdog` whose Nth attempt does what line
 #     N of its plan says. `post <id>` is the race of coord findings c58cd00f
 #     and 2f3d3b96: GitHub answers the PATCH of a check run reviewdog created a
 #     second earlier with 404, and reviewdog exits 1, the same status a diff
-#     finding exits with. Each attempt records how many bytes of the input it
-#     read; the retry sleep is injected and logged.
+#     finding exits with. `difffetch` and `diffparse` print, verbatim, the
+#     stderr line the pinned reviewdog v0.21.2 release binary (Windows x86_64,
+#     sha256-checked against the release's checksums.txt) printed on
+#     2026-11-22 under `-f=clippy -reporter=local` with one short-format clippy
+#     diagnostic on stdin: `-diff="false"` for the fetch, and a `-diff` printing
+#     the hunk header `@@ -x,y +z @@` for the parse. Each exited 1. Under
+#     `-reporter=github-pr-check` the text after the marker is the GitHub or
+#     git error instead; the marker is the same `reviewdog: <msg>: ` prefix
+#     (reviewdog.go Run, printed by cmd/reviewdog/main.go). Each attempt
+#     records how many bytes of the input it read; the retry sleep is injected
+#     and logged.
 cat >"$W/stub/rd-scripted" <<'STUB'
 #!/usr/bin/env bash
 n=$(( $(cat "$RD_STATE.n" 2>/dev/null || echo 0) + 1 ))
@@ -277,6 +286,19 @@ case "$what" in
   findings) echo "reviewdog: found at least one issue with severity greater than or equal to the given level: error" >&2; exit 1 ;;
   post\ *) echo "reviewdog: failed to post result: PATCH https://api.github.com/repos/o/r/check-runs/${what#post }: 404 Not Found []" >&2; exit 1 ;;
   create) echo "reviewdog: failed to create check: POST https://api.github.com/repos/o/r/check-runs: 502 Bad Gateway []" >&2; exit 1 ;;
+  difffetch) echo "reviewdog: fail to get diff: exit status 1" >&2; exit 1 ;;
+  diffparse) echo "reviewdog: fail to parse diff: invalid hunk range: @@ -x,y +z @@" >&2; exit 1 ;;
+  # Unreachable under -f=clippy in v0.21.2 (no errorformat parser returns it),
+  # so it has no class on purpose: a finding.
+  parseerr) echo "reviewdog: parse error: x" >&2; exit 1 ;;
+  # A findings exit whose wording is not the one above: still a finding.
+  reworded) echo "reviewdog: 3 problems found" >&2; exit 1 ;;
+  # A slog line QUOTING a diff-fetch marker, then a findings line: a finding.
+  slog) echo 'time=2026-11-22T00:00:00.000Z level=ERROR msg="reviewdog: fail to get diff: x"' >&2
+        echo "reviewdog: found at least one issue with severity greater than or equal to the given level: error" >&2; exit 1 ;;
+  # Every marker, on an attempt that exits 0: a success is never classified.
+  okmarked) echo "reviewdog: fail to get diff: x" >&2; echo "reviewdog: fail to parse diff: x" >&2
+            echo "reviewdog: failed to post result: check-runs/1: 404" >&2; exit 0 ;;
   hang) : >"$RD_MARK"; sleep 2; exit 0 ;;
   *) echo "rd-scripted: no plan line ${n}" >&2; exit 99 ;;
 esac
@@ -290,7 +312,7 @@ seq 1 400 >"$W/report.json"
 INPUT_BYTES="$(wc -c <"$W/report.json" | tr -d ' ')"
 
 # rstep <case> <plan line>...: run rso_run_retrying the way a step does; sets
-# OUT, RC, GHO, and ATTEMPTS / POST_FAILED from the shell variables it sets.
+# OUT, RC, GHO, and ATTEMPTS / NO_VERDICT from the shell variables it sets.
 rstep() {
   local name="$1"
   shift
@@ -302,11 +324,11 @@ rstep() {
   OUT="$(env PATH="$W/stub:$PATH" STUB_CURL=date STUB_STATE="$W/$name.curlstate" GITHUB_OUTPUT="$GHO" \
     RD_PLAN="$W/$name.plan" RD_STATE="$W/$name.rd" RD_MARK="$W/$name.mark" \
     RSO_RETRY_SLEEP="$W/stub/rso-sleep" RSO_SLEEP_LOG="$W/$name.sleeps" \
-    bash -eo pipefail -c 'source "$1"; rso_begin "$2"; rso_run_retrying "$3" rd-scripted -f=clippy; echo "attempts=$RSO_ATTEMPTS post_failed=$RSO_POST_FAILED"' \
+    bash -eo pipefail -c 'source "$1"; rso_begin "$2"; rso_run_retrying "$3" rd-scripted -f=clippy; echo "attempts=$RSO_ATTEMPTS no_verdict=$RSO_NO_VERDICT"' \
     _ "$SCRIPT" "$W/$name.stderr" "${RSTEP_INPUT:-$W/report.json}" 2>&1)"
   RC=$?
   ATTEMPTS="$(printf '%s\n' "$OUT" | sed -n 's/^attempts=\([0-9]*\) .*/\1/p')"
-  POST_FAILED="$(printf '%s\n' "$OUT" | sed -n 's/.* post_failed=\([0-9]*\)$/\1/p')"
+  NO_VERDICT="$(printf '%s\n' "$OUT" | sed -n 's/^attempts=[0-9]* no_verdict=\([a-z-]*\)$/\1/p')"
 }
 rsleeps() { tr '\n' ' ' <"$W/$1.sleeps" | sed 's/ $//'; }
 # every attempt read the whole input
@@ -320,41 +342,41 @@ read_whole() {
 # 5a. a failed post, then success: rc 0 from a retry of the same input; the
 #     window's start is marked once, before the first attempt; both attempts'
 #     stderr is in the log (the completion step reads the first's id there)
-#     and in the job log; nothing reports a failed post at the end.
+#     and in the job log; nothing reports a no-verdict class at the end.
 rstep retry-ok "post 111" ok
-if [ "$RC" -eq 0 ] && once && [ "$(val rc)" = 0 ] && [ "$ATTEMPTS" = 2 ] && [ "$POST_FAILED" = 0 ] \
+if [ "$RC" -eq 0 ] && once && [ "$(val rc)" = 0 ] && [ "$ATTEMPTS" = 2 ] && [ -z "$NO_VERDICT" ] \
   && [ "$(val started_at)" = "$T" ] && [ "$(grep -c -- '--max-time 10' "$W/retry-ok.curlstate.args")" -eq 1 ] \
   && [ "$(rsleeps retry-ok)" = 5 ] && read_whole retry-ok 2 \
   && grep -q 'check-runs/111: 404' "$W/retry-ok.stderr" && [ "$(grep -c 'level=WARN' "$W/retry-ok.stderr")" -eq 2 ] \
   && printf '%s\n' "$OUT" | grep -q 'check-runs/111: 404' \
-  && printf '%s\n' "$OUT" | grep -qF 'reviewdog attempt 1/3 exited 1 and reported that it did not finish its check run' \
-  && printf '%s\n' "$OUT" | grep -qxF '::notice title=reviewdog-step-outputs::retry outcome: reviewdog finished its check run on attempt 2/3 (exit 0), after 1 attempt(s) that did not'; then
+  && printf '%s\n' "$OUT" | grep -qF 'reviewdog attempt 1/3 exited 1 with no verdict, class post (it did not finish its check run' \
+  && printf '%s\n' "$OUT" | grep -qxF '::notice title=reviewdog-step-outputs::retry outcome: reviewdog reached a verdict on attempt 2/3 (exit 0), after 1 attempt(s) with no verdict (post)'; then
   ok "a failed post (404) then success: rc 0 after one retry, one start mark, every attempt's stderr kept, a retry-outcome notice"
 else bad "retry then ok" "rc=$RC attempts=$ATTEMPTS sleeps='$(rsleeps retry-ok)'"; fi
 
 # 5b. a findings exit (rc 1, no failed create or post in stderr) is the lint
 #     verdict: returned at once, never retried.
 rstep findings findings
-if [ "$RC" -eq 0 ] && once && [ "$(val rc)" = 1 ] && [ "$ATTEMPTS" = 1 ] && [ "$POST_FAILED" = 0 ] \
+if [ "$RC" -eq 0 ] && once && [ "$(val rc)" = 1 ] && [ "$ATTEMPTS" = 1 ] && [ -z "$NO_VERDICT" ] \
   && [ ! -s "$W/findings.sleeps" ] && ! printf '%s\n' "$OUT" | grep -qE 'retrying|retry outcome' \
   && grep -qF 'found at least one issue with severity' "$W/findings.stderr"; then
   ok "a findings exit (rc 1, clean stderr) is not retried and keeps rc 1"
 else bad "findings" "rc=$RC attempts=$ATTEMPTS"; fi
 
 # 5c. a failed post on every attempt: the retries are spent (default 5 10 s),
-#     rc is the last attempt's, RSO_POST_FAILED says so, and all three ids are
-#     in the log.
+#     rc is the last attempt's, RSO_NO_VERDICT=post says so, and all three ids
+#     are in the log.
 rstep persist "post 121" "post 122" "post 123"
-if [ "$RC" -eq 0 ] && once && [ "$(val rc)" = 1 ] && [ "$ATTEMPTS" = 3 ] && [ "$POST_FAILED" = 1 ] \
+if [ "$RC" -eq 0 ] && once && [ "$(val rc)" = 1 ] && [ "$ATTEMPTS" = 3 ] && [ "$NO_VERDICT" = post ] \
   && [ "$(rsleeps persist)" = "5 10" ] && read_whole persist 3 \
   && [ "$(grep -oE 'check-runs/[0-9]+' "$W/persist.stderr" | tr '\n' ' ')" = "check-runs/121 check-runs/122 check-runs/123 " ] \
-  && printf '%s\n' "$OUT" | grep -qxF '::notice title=reviewdog-step-outputs::retry outcome: reviewdog did not finish its check run on any of 3 attempt(s) (last exit 1)'; then
-  ok "a failed post on every attempt: 3 attempts at 5/10 s, rc 1, RSO_POST_FAILED=1, every id in the log"
-else bad "persistent post failure" "rc=$RC attempts=$ATTEMPTS post_failed=$POST_FAILED sleeps='$(rsleeps persist)'"; fi
+  && printf '%s\n' "$OUT" | grep -qxF '::notice title=reviewdog-step-outputs::retry outcome: reviewdog reached no verdict on any of 3 attempt(s) (post,post,post; last exit 1)'; then
+  ok "a failed post on every attempt: 3 attempts at 5/10 s, rc 1, RSO_NO_VERDICT=post, every id in the log"
+else bad "persistent post failure" "rc=$RC attempts=$ATTEMPTS no_verdict=$NO_VERDICT sleeps='$(rsleeps persist)'"; fi
 
 # 5d. a failed create (its line names no run), then success: retried.
 rstep create-ok create ok
-if [ "$RC" -eq 0 ] && [ "$(val rc)" = 0 ] && [ "$ATTEMPTS" = 2 ] && [ "$POST_FAILED" = 0 ] \
+if [ "$RC" -eq 0 ] && [ "$(val rc)" = 0 ] && [ "$ATTEMPTS" = 2 ] && [ -z "$NO_VERDICT" ] \
   && grep -q 'failed to create check' "$W/create-ok.stderr"; then
   ok "a failed create then success: retried, rc 0, the create failure kept in the log"
 else bad "create then ok" "rc=$RC attempts=$ATTEMPTS"; fi
@@ -362,14 +384,14 @@ else bad "create then ok" "rc=$RC attempts=$ATTEMPTS"; fi
 # 5e. a failed post, then a findings exit: the findings are the verdict (rc 1,
 #     not a failed post), and the first attempt's id stays in the log.
 rstep post-findings "post 131" findings
-if [ "$RC" -eq 0 ] && [ "$(val rc)" = 1 ] && [ "$ATTEMPTS" = 2 ] && [ "$POST_FAILED" = 0 ] \
+if [ "$RC" -eq 0 ] && [ "$(val rc)" = 1 ] && [ "$ATTEMPTS" = 2 ] && [ -z "$NO_VERDICT" ] \
   && grep -q 'check-runs/131' "$W/post-findings.stderr"; then
-  ok "a failed post then findings: rc 1 from the findings, RSO_POST_FAILED=0, the first id kept"
-else bad "post then findings" "rc=$RC attempts=$ATTEMPTS post_failed=$POST_FAILED"; fi
+  ok "a failed post then findings: rc 1 from the findings, RSO_NO_VERDICT empty, the first id kept"
+else bad "post then findings" "rc=$RC attempts=$ATTEMPTS no_verdict=$NO_VERDICT"; fi
 
 # 5f. RSO_RETRY_DELAYS empty: no retry at all.
 RSO_RETRY_DELAYS='' rstep noretry "post 141" ok
-if [ "$RC" -eq 0 ] && [ "$(val rc)" = 1 ] && [ "$ATTEMPTS" = 1 ] && [ "$POST_FAILED" = 1 ] && [ ! -s "$W/noretry.sleeps" ]; then
+if [ "$RC" -eq 0 ] && [ "$(val rc)" = 1 ] && [ "$ATTEMPTS" = 1 ] && [ "$NO_VERDICT" = post ] && [ ! -s "$W/noretry.sleeps" ]; then
   ok "RSO_RETRY_DELAYS empty: one attempt, no sleep"
 else bad "no retry" "rc=$RC attempts=$ATTEMPTS"; fi
 
@@ -473,6 +495,99 @@ if [ -n "$RE" ] && grep -qF -- "grep -qE '${RE}' \"\$REVIEWDOG_STDERR_LOG\"" "${
 else
   OUT="RSO_UNFINISHED_RUN_RE='${RE}'" GHO=/dev/null
   bad "pattern parity" "the completion script does not grep the stderr log with '${RE}'"
+fi
+
+# 5j-5s. the diff classes (plan 2026-11-22-reviewdog-diff-and-parse-infra-
+#     exits-read-as-lint-findings). A class is named only by a POSITIVE,
+#     line-anchored marker on an attempt that exited non-zero; diff-fetch is
+#     retried like a post, diff-parse never is, and anything else is a verdict.
+#     5p-5s pass on an unfixed helper by construction: they guard against a
+#     classifier that widens "no verdict" (an unanchored marker, an
+#     absence-of-findings rule, a classified success).
+
+# 5j. a failed diff fetch, then success: retried once, the verdict stands.
+rstep fetch-ok difffetch ok
+if [ "$RC" -eq 0 ] && once && [ "$(val rc)" = 0 ] && [ "$ATTEMPTS" = 2 ] && [ -z "$NO_VERDICT" ] \
+  && [ "$(rsleeps fetch-ok)" = 5 ] && read_whole fetch-ok 2 \
+  && grep -qxF 'reviewdog: fail to get diff: exit status 1' "$W/fetch-ok.stderr" \
+  && printf '%s\n' "$OUT" | grep -qF 'reviewdog attempt 1/3 exited 1 with no verdict, class diff-fetch (it could not fetch the PR diff' \
+  && printf '%s\n' "$OUT" | grep -qxF '::notice title=reviewdog-step-outputs::retry outcome: reviewdog reached a verdict on attempt 2/3 (exit 0), after 1 attempt(s) with no verdict (diff-fetch)'; then
+  ok "a failed diff fetch then success: one retry at 5 s, rc 0, RSO_NO_VERDICT empty, the notice names diff-fetch"
+else bad "diff-fetch then ok" "rc=$RC attempts=$ATTEMPTS no_verdict=$NO_VERDICT sleeps='$(rsleeps fetch-ok)'"; fi
+
+# 5k. a failed diff fetch on every attempt: the retries are spent.
+rstep fetch-persist difffetch difffetch difffetch
+if [ "$RC" -eq 0 ] && once && [ "$(val rc)" = 1 ] && [ "$ATTEMPTS" = 3 ] && [ "$NO_VERDICT" = diff-fetch ] \
+  && [ "$(rsleeps fetch-persist)" = "5 10" ] && read_whole fetch-persist 3 \
+  && printf '%s\n' "$OUT" | grep -qxF '::notice title=reviewdog-step-outputs::retry outcome: reviewdog reached no verdict on any of 3 attempt(s) (diff-fetch,diff-fetch,diff-fetch; last exit 1)'; then
+  ok "a failed diff fetch on every attempt: 3 attempts at 5/10 s, rc 1, RSO_NO_VERDICT=diff-fetch"
+else bad "persistent diff-fetch" "rc=$RC attempts=$ATTEMPTS no_verdict=$NO_VERDICT sleeps='$(rsleeps fetch-persist)'"; fi
+
+# 5l. a failed diff parse: no verdict, and never retried (the same bytes
+#     parse the same way again).
+rstep parse diffparse ok
+if [ "$RC" -eq 0 ] && once && [ "$(val rc)" = 1 ] && [ "$ATTEMPTS" = 1 ] && [ "$NO_VERDICT" = diff-parse ] \
+  && [ ! -s "$W/parse.sleeps" ] && ! printf '%s\n' "$OUT" | grep -qE 'retrying|retry outcome' \
+  && grep -qxF 'reviewdog: fail to parse diff: invalid hunk range: @@ -x,y +z @@' "$W/parse.stderr"; then
+  ok "a failed diff parse: one attempt, no sleep, rc 1, RSO_NO_VERDICT=diff-parse"
+else bad "diff-parse" "rc=$RC attempts=$ATTEMPTS no_verdict=$NO_VERDICT sleeps='$(rsleeps parse)'"; fi
+
+# 5m. a failed post, then a failed diff parse: the last attempt decides, and
+#     the first attempt's id stays in the log for the completion step.
+rstep post-parse "post 171" diffparse ok
+if [ "$RC" -eq 0 ] && [ "$(val rc)" = 1 ] && [ "$ATTEMPTS" = 2 ] && [ "$NO_VERDICT" = diff-parse ] \
+  && [ "$(rsleeps post-parse)" = 5 ] && grep -q 'check-runs/171' "$W/post-parse.stderr" \
+  && printf '%s\n' "$OUT" | grep -qxF '::notice title=reviewdog-step-outputs::retry outcome: reviewdog ended with no verdict (diff-parse, not retried) on attempt 2/3 (exit 1), after 1 attempt(s) with no verdict (post)'; then
+  ok "a failed post then a failed diff parse: 2 attempts, rc 1, RSO_NO_VERDICT=diff-parse, the first id kept"
+else bad "post then diff-parse" "rc=$RC attempts=$ATTEMPTS no_verdict=$NO_VERDICT"; fi
+
+# 5n. `reviewdog: parse error:` has no class (unreachable under -f=clippy): a
+#     finding, returned at once.
+rstep parseerr parseerr ok
+if [ "$RC" -eq 0 ] && [ "$(val rc)" = 1 ] && [ "$ATTEMPTS" = 1 ] && [ -z "$NO_VERDICT" ] && [ ! -s "$W/parseerr.sleeps" ]; then
+  ok "reviewdog: parse error: is unclassified by design: one attempt, rc 1, RSO_NO_VERDICT empty"
+else bad "parse error" "rc=$RC attempts=$ATTEMPTS no_verdict=$NO_VERDICT"; fi
+
+# 5o. a failed diff fetch, then a findings exit: the findings are the verdict.
+rstep fetch-findings difffetch findings
+if [ "$RC" -eq 0 ] && [ "$(val rc)" = 1 ] && [ "$ATTEMPTS" = 2 ] && [ -z "$NO_VERDICT" ]; then
+  ok "a failed diff fetch then findings: 2 attempts, rc 1 from the findings, RSO_NO_VERDICT empty"
+else bad "diff-fetch then findings" "rc=$RC attempts=$ATTEMPTS no_verdict=$NO_VERDICT"; fi
+
+# 5p. a findings exit in other words is still a finding: the classifier is
+#     positive, never "no findings line, so infra".
+rstep reworded reworded ok
+if [ "$RC" -eq 0 ] && [ "$(val rc)" = 1 ] && [ "$ATTEMPTS" = 1 ] && [ -z "$NO_VERDICT" ] \
+  && ! printf '%s\n' "$OUT" | grep -qE 'retrying|retry outcome'; then
+  ok "a reworded findings exit: one attempt, rc 1, RSO_NO_VERDICT empty, no annotation"
+else bad "reworded findings" "rc=$RC attempts=$ATTEMPTS no_verdict=$NO_VERDICT"; fi
+
+# 5q. a slog line quoting a diff marker mid-line does not classify: the
+#     markers are anchored at a line's start.
+rstep slog slog ok
+if [ "$RC" -eq 0 ] && [ "$(val rc)" = 1 ] && [ "$ATTEMPTS" = 1 ] && [ -z "$NO_VERDICT" ] \
+  && ! printf '%s\n' "$OUT" | grep -qE 'retrying|retry outcome'; then
+  ok "a slog line quoting 'reviewdog: fail to get diff:' plus findings: one attempt, rc 1, RSO_NO_VERDICT empty"
+else bad "slog line" "rc=$RC attempts=$ATTEMPTS no_verdict=$NO_VERDICT"; fi
+
+# 5r. every marker on an attempt that exits 0: a success is never classified.
+rstep okmarked okmarked ok
+if [ "$RC" -eq 0 ] && [ "$(val rc)" = 0 ] && [ "$ATTEMPTS" = 1 ] && [ -z "$NO_VERDICT" ] \
+  && ! printf '%s\n' "$OUT" | grep -qE 'retrying|retry outcome'; then
+  ok "markers on an exit-0 attempt: one attempt, rc 0, not classified"
+else bad "marked success" "rc=$RC attempts=$ATTEMPTS no_verdict=$NO_VERDICT"; fi
+
+# 5s. the diff markers are separate from the completion step's pattern: a
+#     diff failure leaves no check run, so the completer must not read one.
+# shellcheck disable=SC2016  # $1 expands in the child bash, not here
+CLS="$(bash -c 'source "$1"; printf "%s|%s|%s" "$RSO_DIFF_FETCH_RE" "$RSO_DIFF_PARSE_RE" "$RSO_RETRIED_CLASSES"' _ "$SCRIPT")"
+if [ "$CLS" = "^reviewdog: fail to get diff: |^reviewdog: fail to parse diff: |post diff-fetch" ] \
+  && ! grep -qF 'fail to get diff' "${HERE}/complete-orphaned-check-runs.sh" \
+  && ! grep -qF 'fail to parse diff' "${HERE}/complete-orphaned-check-runs.sh"; then
+  ok "the diff markers are anchored, only post and diff-fetch are retried, and the completer greps neither"
+else
+  OUT="classes='${CLS}'" GHO=/dev/null
+  bad "diff class table" "unexpected class table or a diff marker in the completer"
 fi
 
 # 6. wiring, both ways, in every workflow of this repo with a step that

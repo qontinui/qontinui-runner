@@ -2774,6 +2774,12 @@ async fn health(
         // For "is this runner out of date", use `buildDrift` below — it is
         // the only field here that can change while the window is open.
         "buildId": env!("RUNNER_BUILD_ID"),
+        // The vision frame sources this BINARY can acquire pixels from, from
+        // the one const beside the resolver. `websocket_relay` means
+        // `/ui-bridge/vision/*` captures a WebSocket-transport app over its
+        // socket; a build that predates that arm serves no field at all (plan
+        // 2026-11-21-vision-capture-cannot-frame-a-websocket-transport-app, D5).
+        "visionFrameSources": crate::mcp::ui_bridge::vision_frame_source::VISION_FRAME_SOURCES,
         // Which cargo profile DIRECTORY this binary was built into (`debug`,
         // `release-checked`, …), read from the build's own `OUT_DIR`; `null`
         // when unmeasured, never a defaulted `"debug"`. The opt-level and the
@@ -3007,6 +3013,8 @@ async fn health(
         // the response root without descending into `data`. Same provenance
         // semantics — and same non-semantics — as `data.buildId` above.
         "buildId": env!("RUNNER_BUILD_ID"),
+        // Top-level mirror of `data.visionFrameSources`, for the same consumers.
+        "visionFrameSources": crate::mcp::ui_bridge::vision_frame_source::VISION_FRAME_SOURCES,
         // Top-level mirror of `data.buildProfile`, for the same consumers.
         "buildProfile": qontinui_runner_lib::build_provenance::build_profile_json(),
         // Top-level mirror of `data.provenance`, for the same consumers.
@@ -21346,6 +21354,25 @@ mod coord_provision_session_gate_tests {
         assert_eq!(
             provenance["build"]["profile"],
             qontinui_runner_lib::build_provenance::build_profile_json()
+        );
+    }
+
+    /// Plan `2026-11-21-vision-capture-cannot-frame-a-websocket-transport-app`
+    /// Phase 1 (D5): `/health` carries `visionFrameSources` TWICE — under
+    /// `data` beside `buildId`, and at the root beside its mirror — both from
+    /// the frame-source module's one const, which names `websocket_relay`.
+    #[test]
+    fn the_health_handler_emits_vision_frame_sources_in_data_and_at_the_root() {
+        let region = crate::mcp_api::mcp_api_item_source("async fn health(")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let emit = "\"visionFrameSources\": crate::mcp::ui_bridge::vision_frame_source::VISION_FRAME_SOURCES";
+        assert_eq!(region.matches(emit).count(), 2, "{region}");
+        assert!(
+            crate::mcp::ui_bridge::vision_frame_source::VISION_FRAME_SOURCES
+                .contains(&"websocket_relay")
         );
     }
 

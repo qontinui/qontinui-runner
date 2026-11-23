@@ -1610,12 +1610,15 @@ Then:
    release it only once the same command with `--check` added prints
    `ADOPTED` naming YOUR new PR. `--check` takes no claim; `NOT_ADOPTED`
    means GitHub has not indexed your PR yet, so keep heartbeating and check
-   again. Exit 1: `ADOPTED` names an open or merged PR whose
-   `Adoption-Supersedes:` line already covers #N, so there is nothing to
-   adopt; `HELD` means another adopter holds it now, so do not start a second
+   again. Exit 1: `ADOPTED` names a PR that already adopted #N, so there is
+   nothing to adopt — an open or merged PR whose `Adoption-Supersedes:` line
+   covers #N or whose title declares `supersedes #N`, a CLOSED one whose own
+   coord card shows it landed (a coord ff-land is CLOSED on GitHub), or a
+   successor #N's card lists in `superseded_by` or `superseded_by_refused` as open, merged or landed; `HELD` means another adopter holds it now, so do not start a second
    adoption; `RENEWED` means your own session already holds it, which is
    yours only when your own earlier call for that key printed UNKNOWN. Exit 2
-   is UNKNOWN: do not adopt on it.
+   is UNKNOWN: do not adopt on it — including a CLOSED adopter whose coord card
+   could not be read, which the reason line names (read `coord_pr_status` on it).
    **The `adopt-wip:` reservation says who adopts the work; it does not keep
    coord's fixers off the original PR.** So before your first commit, ALSO take
    the original PR's reserved claim, as in Step 3:
