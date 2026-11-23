@@ -1757,8 +1757,9 @@ mod windows_thread_census {
 // Bounded capture: one long-lived worker thread, one deadline per step
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Default per-step budget. Short enough that both steps together stay far
-/// inside `health_monitor`'s 180s monitor-stall window (so a slow capture can
+/// Default per-step budget. Short enough that all three steps together (the
+/// child census, the thread census and the UI-thread read, so at most 9s)
+/// stay far inside `health_monitor`'s 180s monitor-stall window (so a slow capture can
 /// never present as a dead detector), long enough that a healthy enumeration of
 /// a few hundred processes finishes comfortably.
 pub const CAPTURE_STEP_DEADLINE_SECS: u64 = 3;
