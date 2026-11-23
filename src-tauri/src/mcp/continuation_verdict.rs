@@ -380,6 +380,23 @@ impl CapRegistry {
         stamps.len() >= cap
     }
 
+    /// Check the cap AND record one ENFORCED continuation under ONE lock:
+    /// `true` = this caller holds a slot. Two Stops racing for the last slot
+    /// cannot both get it, which a [`Self::would_exceed`] followed later by a
+    /// [`Self::record`] cannot promise. A poisoned lock claims nothing.
+    fn try_claim(&self, key: &str, now: Instant, cap: usize) -> bool {
+        let Ok(mut g) = self.inner.lock() else {
+            return false;
+        };
+        let stamps = g.entry(key.to_string()).or_default();
+        stamps.retain(|t| now.duration_since(*t) < CAP_WINDOW);
+        if stamps.len() >= cap {
+            return false;
+        }
+        stamps.push(now);
+        true
+    }
+
     /// Record one ENFORCED continuation. Best-effort (poisoned lock ⇒ no-op).
     fn record(&self, key: &str, now: Instant) {
         if let Ok(mut g) = self.inner.lock() {
@@ -765,10 +782,13 @@ fn build_rules_get(
     .map(|(request, _presented)| request)
 }
 
-/// The Stop path's bound on the work-status read as a whole — credential
-/// resolution (`session_work_status::CREDENTIAL_TIMEOUT`) and the GET
-/// (`session_work_status::FETCH_TIMEOUT`) together. A read that has not
-/// answered is UNKNOWN, which allows.
+/// The Stop path's bound on the work-status read as a whole. It is SHORTER
+/// than the read's own steps added up — credential resolution
+/// (`session_work_status::CREDENTIAL_TIMEOUT`, 2 s on a cold credential cache)
+/// plus the GET (`session_work_status::FETCH_TIMEOUT`, 2 s) — so on a cold
+/// cache a slow resolution can leave the GET less than its own timeout, or
+/// none, and this bound is what ends the read. A read that has not answered by
+/// then is UNKNOWN, which allows the stop.
 const STATUS_READ_BUDGET: Duration = Duration::from_secs(2);
 
 /// The Stop path's bound on the continuation-rules GET, tighter than the
@@ -1096,7 +1116,13 @@ pub async fn continuation_verdict(
     let cap = effective_cap();
     let cap_exhausted = cap_registry().would_exceed(session_key, now, cap);
 
-    let verdict = decide(mode, stop_hook_active, &status, cap_exhausted);
+    let mut verdict = decide(mode, stop_hook_active, &status, cap_exhausted);
+    // An enforced block takes its cap slot HERE, checked and recorded under one
+    // lock. A racing Stop that took the last slot since the read above turns
+    // this one into the cap-exhausted verdict.
+    if verdict.decision == "block" && !cap_registry().try_claim(session_key, now, cap) {
+        verdict = decide(mode, stop_hook_active, &status, true);
+    }
 
     // A continuation block already carries its own prompt — never stack a
     // second one onto the same turn. The compliance nudge is offered only
@@ -1115,8 +1141,6 @@ pub async fn continuation_verdict(
 
     let (prompt, rules_version) = if verdict.decision == "block" {
         let rules = fetch_continuation_rules(&tenant).await;
-        // Counted once the prompt is in hand, at the stamp the cap check read.
-        cap_registry().record(session_key, now);
         (Some(rules.text), rules.version)
     } else {
         (None, None)

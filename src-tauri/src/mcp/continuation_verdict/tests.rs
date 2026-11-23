@@ -127,6 +127,23 @@ fn cap_registry_trips_at_cap_and_is_per_session() {
     assert!(!reg.would_exceed("s2", now, cap));
 }
 
+/// Review round 4 A2. `try_claim` checks and records under one lock: the
+/// slot is taken exactly `cap` times, and a refused claim records nothing.
+#[test]
+fn try_claim_takes_exactly_cap_slots_and_a_refusal_records_nothing() {
+    let reg = CapRegistry::new();
+    let now = Instant::now();
+    assert!(reg.try_claim("tc", now, 2));
+    assert!(reg.try_claim("tc", now, 2));
+    assert!(!reg.try_claim("tc", now, 2), "the third claim is refused");
+    assert!(reg.would_exceed("tc", now, 2));
+    assert!(
+        !reg.would_exceed("tc", now, 3),
+        "the refused claim recorded no stamp"
+    );
+    assert!(reg.try_claim("tc", now + CAP_WINDOW + Duration::from_secs(1), 2));
+}
+
 #[test]
 fn cap_registry_window_expires() {
     let reg = CapRegistry::new();
@@ -602,7 +619,8 @@ fn the_stop_paths_worst_case_fits_the_hooks_curl_max_time() {
     );
     assert!(
         STATUS_READ_BUDGET >= crate::mcp::session_work_status::FETCH_TIMEOUT,
-        "the status bound leaves the GET its own timeout"
+        "the status bound is at least one GET timeout, so a warm-credential read gets \
+         its whole GET; a cold one shares the bound with credential resolution"
     );
 }
 
