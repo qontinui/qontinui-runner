@@ -1585,12 +1585,12 @@ mod tests {
             ),
             (
                 "session/session_lifecycle_store.rs",
-                "SessionLifecycleStore::record_open",
+                "SessionLifecycleStore::record_open_guarded",
                 "CloseReason::Superseded",
             ),
             (
                 "session/session_lifecycle_store.rs",
-                "SessionLifecycleStore::record_open",
+                "SessionLifecycleStore::record_open_guarded",
                 "CloseReason::SupersededTerminalReuse",
             ),
             (
@@ -1610,8 +1610,10 @@ mod tests {
         // - `SessionLifecycleStore::record_close` hands its `reason` parameter
         //   to `record_close_checked`, which stores it in the field; their
         //   callers are the other sites in this census;
-        // - `terminal_session_record_close` forwards the FRONTEND's `reason`
-        //   (`frontend_close_reasons_are_enumerated`) to `record_close_for`,
+        // - `record_close_request` (the body of `terminal_session_record_close`)
+        //   parses the FRONTEND's `reason` into the typed `CloseReason` set,
+        //   refusing anything outside it (`frontend_close_reasons_are_enumerated`),
+        //   and forwards it to `record_close_for`,
         //   which hands it to `SessionLifecycleStore::record_close_gated`;
         // - `record_close_gated` records either that `reason` unchanged or the
         //   launch-failure verdict on it (`verdict.reason`), and
@@ -1635,7 +1637,7 @@ mod tests {
             (
                 "session/session_lifecycle_store.rs",
                 "SessionLifecycleStore::record_close_checked",
-                "reason",
+                "reason.as_str()",
                 1,
             ),
             (
@@ -1650,12 +1652,7 @@ mod tests {
                 "verdict.reason",
                 1,
             ),
-            (
-                "commands/terminal.rs",
-                "terminal_session_record_close",
-                "reason",
-                1,
-            ),
+            ("commands/terminal.rs", "record_close_request", "reason", 1),
             ("commands/terminal.rs", "record_close_for", "reason", 1),
             (
                 "terminal/launch_failure.rs",
@@ -1704,6 +1701,15 @@ mod tests {
                 "session/past_sessions.rs",
                 "build_enriched",
                 "close_reason",
+                1,
+            ),
+            // The since-restart aftermath mirrors the reason the lifecycle
+            // row it read already carries (`Close::of_record`), so it mints
+            // nothing a census-pinned writer did not.
+            (
+                "session/ledger_aftermath.rs",
+                "LedgerAftermath::observe_registry",
+                "close.map(<expr>)",
                 1,
             ),
         ];

@@ -93,17 +93,20 @@ fn resumes(pids: &[u32]) -> HashMap<u32, String> {
     pids.iter().map(|pid| (*pid, SESSION.to_string())).collect()
 }
 
-/// Reading 2, end to end. The migration's own spawn write put the row on its
-/// new pane; the pass captured the source pane and its `--resume` command line
-/// before the source pane exited, and its prescan timed out (an empty index).
-/// The bind onto the source pane is refused, the row stays on its live pane,
+/// Reading 2, end to end. The pass captured the source pane and its
+/// `--resume` command line before the account migration spawned the new pane;
+/// the migration's own spawn write then put the row on the new pane and closed
+/// the source pane, and the pass's prescan timed out (an empty index). The
+/// rung-2 owner check, run against the captured panes, sees no live owner, so
+/// only the write-time guard stands between the stale evidence and the row:
+/// the bind onto the source pane is refused, the row stays on its live pane,
 /// and no tab is stamped for the refused bind.
 #[test]
 fn a_stale_rung_two_bind_onto_an_exited_source_pane_is_refused_and_the_row_stays_on_its_live_pane()
 {
     let (_dir, store) = store();
     store.record_open(row(SESSION, "new-pane", 2, true));
-    let captured = vec![pane("source-pane", 701), pane("new-pane", 702)];
+    let captured = vec![pane("source-pane", 701)];
 
     let actions = run_reconcile(
         &store,
@@ -140,7 +143,9 @@ fn a_stale_rung_two_bind_onto_an_exited_source_pane_is_refused_and_the_row_stays
 /// Two live panes run one session (a hand-typed `claude --resume` beside the
 /// running one). Each pass, the pane without the row is unbound and rung 2
 /// names the session for it; moving the open row there would flip it between
-/// the panes on every pass. The guard keeps it on the pane it is on.
+/// the panes on every pass. The row stays on the pane it is on: the rung-2
+/// owner check leaves the other pane alone, and the write-time guard would
+/// refuse the move if it got that far.
 #[test]
 fn a_rung_two_bind_never_moves_an_open_row_off_its_live_pane() {
     let (_dir, store) = store();
@@ -162,14 +167,11 @@ fn a_rung_two_bind_never_moves_an_open_row_off_its_live_pane() {
             "pass {pass}: the row stays on the pane it is on, got {actions:?}"
         );
         assert!(
-            actions.contains(&ReconcileAction::BindNotWritten {
-                terminal_id: "pane-b".to_string(),
-                session_id: SESSION.to_string(),
-                reason: InferredBind::RowOnLivePane {
-                    terminal_id: "pane-a".to_string()
-                },
-            }),
-            "pass {pass}: got {actions:?}"
+            !actions.iter().any(|a| matches!(
+                a,
+                ReconcileAction::Bind { terminal_id, .. } if terminal_id == "pane-b"
+            )),
+            "pass {pass}: pane-b must not take the row, got {actions:?}"
         );
     }
 }

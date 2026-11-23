@@ -4217,7 +4217,7 @@ mod tests {
     async fn the_global_force_and_release_reach_every_restore_reader() {
         let _g = GLOBAL_TEST_LOCK.lock().await;
         reset_global_role().await;
-        cache_role_from_me_drain(r#"{"state":"clear"}"#);
+        cache_role_from_me_drain(r#"{"state":"clear","dispatch_role":"workhorse"}"#);
         assert!(drain_gate(SpawnOrigin::BootResume).allows());
 
         let change = force_drained(Some("  "));
@@ -4237,7 +4237,7 @@ mod tests {
             drained_real(FORCED_DRAIN_DEFAULT_REASON)
         );
         // A heartbeat answering Clear does not lift it.
-        cache_role_from_me_drain(r#"{"state":"clear"}"#);
+        cache_role_from_me_drain(r#"{"state":"clear","dispatch_role":"workhorse"}"#);
         assert!(!drain_gate(SpawnOrigin::BootResume).allows());
 
         let change = release_forced_drain();
@@ -4246,7 +4246,9 @@ mod tests {
         assert!(drain_gate(SpawnOrigin::BootResume).allows());
 
         // Over a real coord drain, the release leaves it in force.
-        cache_role_from_me_drain(r#"{"state":"drained","reason":"operator"}"#);
+        cache_role_from_me_drain(
+            r#"{"state":"drained","reason":"operator","dispatch_role":"workhorse"}"#,
+        );
         force_drained(None);
         let change = release_forced_drain();
         assert!(matches!(change.state, CoordDrainState::Drained { .. }));

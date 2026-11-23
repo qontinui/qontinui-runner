@@ -686,7 +686,24 @@ pub fn run_reconcile<I: TranscriptIndex>(
                 // unconfirmed sibling on this terminal in the same write. The
                 // panes alive NOW, not at the pass's start, decide whether it is
                 // written at all.
+                //
+                // The guard reads a pane as live for two questions: is the
+                // TARGET a live PTY now, and does the row's CURRENT pane still
+                // hold it. The second needs more than a live PTY, by the same
+                // owner rule as the rung-2 check above: a pane whose claude
+                // exited (its shell lives on) or now runs another session no
+                // longer runs this one, so it does not hold the row against a
+                // real resume elsewhere. A pane that is no longer a live PTY
+                // holds nothing either way.
                 let live_now = terminals_live_now();
+                let target = pty.terminal_id.as_str();
+                let holds_session = |t: &str| {
+                    anchored_terminal_pids.get(t).is_some_and(|owner_pid| {
+                        cmdline_ids
+                            .get(owner_pid)
+                            .is_none_or(|owner_sid| *owner_sid == session_id)
+                    })
+                };
                 let written = store.bind_inferred(
                     bind_record(
                         pty,
@@ -696,7 +713,7 @@ pub fn run_reconcile<I: TranscriptIndex>(
                         confirmed,
                         zone_index,
                     ),
-                    &|t: &str| live_now.contains(t),
+                    &|t: &str| live_now.contains(t) && (t == target || holds_session(t)),
                 );
                 if written == InferredBind::Bound {
                     if confirmed {
