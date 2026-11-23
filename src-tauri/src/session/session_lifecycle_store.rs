@@ -9550,6 +9550,16 @@ mod tests {
     /// the whole chain. The same-millisecond rule itself is pinned
     /// deterministically by `a_restamp_always_differs_and_never_runs_ahead_of_the_clock`;
     /// this exercises it through the store whenever the clock collides.
+    ///
+    /// The chain is bounded to stay inside the uniqueness guarantee: each
+    /// iteration issues two stamps, and a loop that issues stamps faster than
+    /// the clock advances builds a lead (stamps issued minus milliseconds
+    /// elapsed). Once that lead exceeds [`RESTAMP_MAX_LEAD_MS`],
+    /// [`restamp_at`] deliberately falls back to `now` (its
+    /// clock-stepped-back arm) and so may repeat a stamp. Two stamps per
+    /// iteration over `RESTAMP_MAX_LEAD_MS / 2` iterations keeps the lead at
+    /// most `RESTAMP_MAX_LEAD_MS - 1` however fast the loop runs (barring a
+    /// wall-clock step back mid-test); 200 iterations repeated a stamp on CI.
     #[test]
     fn a_re_mark_after_an_unmark_never_reuses_the_unmarked_stamp() {
         let dir = tempdir().unwrap();
@@ -9557,7 +9567,7 @@ mod tests {
         let store = SessionLifecycleStore::open(&path).unwrap();
         store.record_open(rec("s"));
         let mut seen = HashSet::new();
-        for _ in 0..200 {
+        for _ in 0..(RESTAMP_MAX_LEAD_MS / 2) {
             let old = store
                 .set_finished("s", true, None)
                 .unwrap()
