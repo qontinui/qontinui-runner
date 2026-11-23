@@ -13,9 +13,9 @@ import { emit, listen } from "@tauri-apps/api/event";
  *
  * The signal is a Tauri event, not the `window` `storage` event: Tauri v2
  * `emit` reaches every webview of the process (the sender included), while
- * `storage` delivery between sibling webviews is unverified per platform.
- * Tauri events are
- * process-local, which matches the port-namespaced store's instance scoping.
+ * `storage` delivery between sibling webviews is unverified per platform. Tauri
+ * events are process-local, which matches the port-namespaced store's
+ * instance scoping.
  */
 
 /** Emitted after a window's roster save committed. */
