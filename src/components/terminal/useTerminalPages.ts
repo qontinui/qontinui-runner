@@ -799,16 +799,28 @@ export function useTerminalPages() {
     let disposed = false;
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
-    const apply = (stored: TerminalPageConfig[]) => {
-      if (!rosterEqual(allPagesRef.current, stored)) allPagesRef.current = stored;
-      setPages((prev) => (rosterEqual(prev, stored) ? prev : stored));
+    // The store is re-read INSIDE the updater: a local `updatePages` queued
+    // earlier in the same batch saves before this updater runs, so a roster
+    // captured when the event arrived would replace that window's own fresh
+    // write in its state while the store keeps it (and its own echo is
+    // filtered, so nothing would correct it). The ref follows on commit via
+    // the `allPagesRef` sync effect above.
+    const apply = (read: TerminalPageConfig[]) => {
+      setPages((prev) => {
+        if (lastSaveRefusedRef.current) return prev;
+        const target = readPersistedPages() ?? read;
+        return rosterEqual(prev, target) ? prev : target;
+      });
     };
 
     const unlisten = listenRosterSaved(({ source, digest }) => {
-      if (source === windowLabel || lastSaveRefusedRef.current) return;
-      // A newer event supersedes a read still waiting on an older digest.
+      // A newer event supersedes a read still waiting on an older digest, and
+      // so does this window's own save (its echo): either way the pending
+      // digest can no longer match, and the retries would only end in a
+      // misleading "never matched" warning.
       if (retryTimer) clearTimeout(retryTimer);
       retryTimer = null;
+      if (source === windowLabel || lastSaveRefusedRef.current) return;
       let retries = 0;
       let lastRead: TerminalPageConfig[] | null = null;
       const attempt = () => {
