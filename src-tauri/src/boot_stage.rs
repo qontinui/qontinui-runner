@@ -154,18 +154,12 @@ pub(crate) fn stamp(stage: BootStage) {
 }
 
 /// The furthest stage this boot has reached.
-// Read by the wedge detector's never-answered arm, which lands in a
-// follow-up PR (qontinui-runner#2563 decomposition); until then only tests read it.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn furthest() -> BootStage {
     BootStage::from_u8(FURTHEST.load(Ordering::SeqCst))
 }
 
 /// When `stage` was first reached, as an offset from process start; `None`
 /// when it has not been reached.
-// Read by the wedge detector's never-answered arm, which lands in a
-// follow-up PR (qontinui-runner#2563 decomposition); until then only tests read it.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn reached_at(stage: BootStage) -> Option<Duration> {
     match REACHED_AT_MS[stage as usize].load(Ordering::SeqCst) {
         0 => None,

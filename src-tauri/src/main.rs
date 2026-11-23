@@ -1692,6 +1692,51 @@ fn install_app_runtime() {
 static GLOBAL_ALLOCATOR: qontinui_runner_lib::alloc_breadcrumb::RunnerAlloc =
     qontinui_runner_lib::alloc_breadcrumb::RunnerAlloc::runner();
 
+/// `QONTINUI_TEST_PRE_BIND_DELAY_MS` — DEBUG-BUILD-ONLY fault injection that
+/// delays the MCP API listener's bind by the given milliseconds.
+///
+/// Exists so the wedge detector's never-answered arm (plan
+/// `2026-11-04-runner-wedge-detector-reads-a-boot-as-a-wedge-and-never-bound-is-silent`,
+/// Phase 2) can be driven on a temp runner: a boot that never binds is
+/// otherwise unreproducible on demand. Compiled out of release builds by
+/// `cfg!(debug_assertions)`, so a shipped runner cannot be told to stall its
+/// own boot, and honoured only on a secondary instance (`instance::is_secondary`),
+/// so a variable inherited into a dev-start primary cannot stall it. Logged
+/// loudly when honoured, because a runner that is slow to bind
+/// ON PURPOSE must never be mistaken for one that is slow by accident.
+fn test_pre_bind_delay() -> Option<std::time::Duration> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    let raw = std::env::var("QONTINUI_TEST_PRE_BIND_DELAY_MS").ok()?;
+    // Secondary / temp runners only. A dev-start primary is a debug build too,
+    // and an exported variable inherited into it must not stall the box's own
+    // runner.
+    if !instance::is_secondary() {
+        warn!(
+            "QONTINUI_TEST_PRE_BIND_DELAY_MS is set but this is the PRIMARY runner; ignored \
+             (honoured only on a named/secondary instance)"
+        );
+        return None;
+    }
+    let ms: u64 = match raw.trim().parse() {
+        Ok(ms) => ms,
+        Err(_) => {
+            warn!(
+                "QONTINUI_TEST_PRE_BIND_DELAY_MS={raw:?} is not a number of milliseconds; ignored"
+            );
+            return None;
+        }
+    };
+    warn!(
+        delay_ms = ms,
+        "QONTINUI_TEST_PRE_BIND_DELAY_MS is set (debug build): FAULT INJECTION — the MCP API \
+         listener will not bind for another {ms} ms. The wedge detector is expected to report \
+         never_bound if this exceeds its grace."
+    );
+    Some(std::time::Duration::from_millis(ms))
+}
+
 fn main() {
     // Cap glibc's malloc arenas FIRST, while this is surely the only thread:
     // once more than 8 arenas exist glibc fixes its limit, and a later
@@ -6103,7 +6148,19 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             let mcp_app_handle = app.handle().clone();
             let mcp_instance_manager = app.state::<Arc<instance_manager::InstanceManager>>().inner().clone();
             boot_stage::stamp(boot_stage::BootStage::ApiServerSpawn);
+            let pre_bind_delay = test_pre_bind_delay();
             tauri::async_runtime::spawn(async move {
+                // Debug-build fault injection: delay the BIND, not the
+                // monitor and not the UI thread — so the sleep is inside the
+                // server task, on the async runtime, never on `.setup`.
+                if let Some(delay) = pre_bind_delay {
+                    tokio::time::sleep(delay).await;
+                    warn!(
+                        delay_ms = delay.as_millis() as u64,
+                        "QONTINUI_TEST_PRE_BIND_DELAY_MS: pre-bind delay elapsed; starting the \
+                         MCP API server now"
+                    );
+                }
                 info!("MCP API server task starting...");
                 match mcp_api::start_server(mcp_app_state, mcp_rag_state, mcp_app_handle, api_port, mcp_instance_manager).await {
                     Ok(_) => info!("MCP API server stopped normally"),
