@@ -52,6 +52,10 @@ fn published_transport(cell: &OnceCell<UsbTransport>) -> UsbTransport {
 /// so this process's `adb forward` entries don't linger (graceful-only; a
 /// force-kill still leaks; plan adb-forwarder-port.md §1.6a). Every run of the
 /// supervised loop drives a clone of that same transport.
+///
+/// A rebuilt run starts from the top, so after the supervisor's backoff it
+/// waits `start_delay` again before its first scan: a restart costs the backoff
+/// plus the boot delay, not the backoff alone.
 pub fn spawn_adb_scanner(
     app_state: Arc<AppState>,
     registry: Arc<PhysicalDeviceRegistry>,
@@ -380,5 +384,50 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         handle.abort();
+    }
+
+    /// The door's closure must stay a bare factory call: the transport is built
+    /// ONCE, in the door, before the spawn. A `move |hb|` closure that built it
+    /// would rebuild it on every supervisor restart, which the factory-twice
+    /// test above cannot see because it calls the factory directly.
+    #[test]
+    fn the_door_closure_is_only_the_factory_call() {
+        let src = include_str!("usb_scanner.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| l.starts_with("pub fn spawn_adb_scanner("))
+            .expect("the door fn is a column-0 item");
+        let len = lines[start..]
+            .iter()
+            .position(|l| *l == "}")
+            .expect("the door fn closes at column 0");
+        let body: String = lines[start..=start + len]
+            .iter()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .flat_map(|l| l.chars())
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert_eq!(
+            body.matches("move|hb|").count(),
+            1,
+            "spawn_adb_scanner must hand the supervisor exactly one closure"
+        );
+        assert!(
+            body.contains("move|hb|{factory(hb).run()})")
+                || body.contains("move|hb|factory(hb).run())"),
+            "spawn_adb_scanner's closure must be just `factory(hb).run()`; build shared state before \
+             the spawn, in the door"
+        );
+        let built = body
+            .find("lettransport=published_transport(")
+            .expect("the door builds the transport");
+        let spawned = body
+            .find("spawn_supervised_with_heartbeat(")
+            .expect("the door spawns under the supervisor");
+        assert!(
+            built < spawned,
+            "the transport must be built before the spawn"
+        );
     }
 }

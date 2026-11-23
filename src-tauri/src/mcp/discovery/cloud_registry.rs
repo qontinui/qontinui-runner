@@ -186,6 +186,10 @@ pub fn registry_poller_config(
 /// dropping a handle closes its tunnel. A supervisor restart therefore rebuilds
 /// only the loop; the rebuilt run shares the transport, so the tunnels the
 /// registry points at stay open, and the run's Cloud-transport dedup stays true.
+///
+/// A rebuilt run starts from the top, so after the supervisor's backoff it
+/// waits `start_delay` again before its first poll: a restart costs the backoff
+/// plus the boot delay, not the backoff alone.
 pub fn spawn_registry_poller(
     registry: std::sync::Arc<crate::mcp::physical_device::PhysicalDeviceRegistry>,
     settings: &crate::settings::CloudRelaySettings,
@@ -429,5 +433,48 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         handle.abort();
+    }
+
+    /// The door's closure must stay a bare factory call: the transport is built
+    /// ONCE, in the door, before the spawn. A `move |hb|` closure that built it
+    /// would rebuild it on every supervisor restart, which the factory-twice
+    /// test above cannot see because it calls the factory directly.
+    #[test]
+    fn the_door_closure_is_only_the_factory_call() {
+        let src = include_str!("cloud_registry.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| l.starts_with("pub fn spawn_registry_poller("))
+            .expect("the door fn is a column-0 item");
+        let len = lines[start..]
+            .iter()
+            .position(|l| *l == "}")
+            .expect("the door fn closes at column 0");
+        let body: String = lines[start..=start + len]
+            .iter()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .flat_map(|l| l.chars())
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert_eq!(
+            body.matches("move|hb|").count(),
+            1,
+            "spawn_registry_poller must hand the supervisor exactly one closure"
+        );
+        assert!(
+            body.contains("move|hb|{factory(hb).run()})")
+                || body.contains("move|hb|factory(hb).run())"),
+            "spawn_registry_poller's closure must be just `factory(hb).run()`; build shared state before \
+             the spawn, in the door"
+        );
+        let built = body.find("lettransport=std::sync::Arc::new(crate::mcp::transport::cloud::CloudTransport::new(").expect("the door builds the transport");
+        let spawned = body
+            .find("spawn_supervised_with_heartbeat(")
+            .expect("the door spawns under the supervisor");
+        assert!(
+            built < spawned,
+            "the transport must be built before the spawn"
+        );
     }
 }
