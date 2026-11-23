@@ -93,16 +93,28 @@ fn lifecycle_line_from(profile_dir: &str, opt_level: &str, debug_assertions: boo
     )
 }
 
-fn provenance_from(
-    git_sha: &str,
-    git_dirty: &str,
-    tree_hash: &str,
-    rust_src_hash: &str,
-    frontend_src_hash: &str,
-    halves_agree: &str,
-    build_id: &str,
-    build: Value,
-) -> Value {
+/// The raw stamps behind a `/health` `provenance` block, named so the six
+/// same-typed strings cannot be passed in the wrong order.
+struct Stamps<'a> {
+    git_sha: &'a str,
+    git_dirty: &'a str,
+    tree_hash: &'a str,
+    rust_src_hash: &'a str,
+    frontend_src_hash: &'a str,
+    halves_agree: &'a str,
+    build_id: &'a str,
+}
+
+fn provenance_from(stamps: Stamps<'_>, build: Value) -> Value {
+    let Stamps {
+        git_sha,
+        git_dirty,
+        tree_hash,
+        rust_src_hash,
+        frontend_src_hash,
+        halves_agree,
+        build_id,
+    } = stamps;
     json!({
         "gitSha": git_sha,
         // gitDirty, treeHash and rustSrcHash are as of the LAST build-script
@@ -154,13 +166,15 @@ pub fn lifecycle_line() -> String {
 /// The `/health` `provenance` block for THIS binary.
 pub fn health_json() -> Value {
     provenance_from(
-        env!("QONTINUI_GIT_SHA"),
-        env!("QONTINUI_GIT_DIRTY"),
-        env!("QONTINUI_TREE_HASH"),
-        env!("QONTINUI_RUST_SRC_HASH"),
-        env!("QONTINUI_FRONTEND_SRC_HASH"),
-        env!("QONTINUI_HALVES_AGREE"),
-        env!("RUNNER_BUILD_ID"),
+        Stamps {
+            git_sha: env!("QONTINUI_GIT_SHA"),
+            git_dirty: env!("QONTINUI_GIT_DIRTY"),
+            tree_hash: env!("QONTINUI_TREE_HASH"),
+            rust_src_hash: env!("QONTINUI_RUST_SRC_HASH"),
+            frontend_src_hash: env!("QONTINUI_FRONTEND_SRC_HASH"),
+            halves_agree: env!("QONTINUI_HALVES_AGREE"),
+            build_id: env!("RUNNER_BUILD_ID"),
+        },
         build_json(),
     )
 }
@@ -172,13 +186,15 @@ mod tests {
     #[test]
     fn unknown_stamps_surface_as_null_never_as_agree_or_clean() {
         let p = provenance_from(
-            "abc",
-            "unknown",
-            "unknown",
-            "unknown",
-            "unknown",
-            "unknown",
-            "unstamped-abc",
+            Stamps {
+                git_sha: "abc",
+                git_dirty: "unknown",
+                tree_hash: "unknown",
+                rust_src_hash: "unknown",
+                frontend_src_hash: "unknown",
+                halves_agree: "unknown",
+                build_id: "unstamped-abc",
+            },
             build_from("unknown", "unknown", false),
         );
         assert_eq!(p["gitDirty"], Value::Null);
@@ -192,13 +208,15 @@ mod tests {
     #[test]
     fn measured_stamps_pass_through() {
         let p = provenance_from(
-            "abc",
-            "true",
-            "t1",
-            "r1",
-            "f1",
-            "false",
-            "abc-1",
+            Stamps {
+                git_sha: "abc",
+                git_dirty: "true",
+                tree_hash: "t1",
+                rust_src_hash: "r1",
+                frontend_src_hash: "f1",
+                halves_agree: "false",
+                build_id: "abc-1",
+            },
             build_from("debug", "0", true),
         );
         assert_eq!(p["build"]["profile"], "debug");

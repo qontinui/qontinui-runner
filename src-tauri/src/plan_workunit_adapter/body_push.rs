@@ -777,7 +777,7 @@ fn chunk_repos(chunk: &str, after_arrow: bool, out: &mut Vec<String>) {
         for end in (0..=phrase.len()).filter(|&i| i == phrase.len() || is_joiner(phrase[i])) {
             let sub = phrase.get(start..end).unwrap_or(&[]);
             let named = sub.first().is_some_and(|w| opens_with_name(w));
-            if !(needs_name && !named) {
+            if !needs_name || named {
                 if let Some(repo) = repo_from_chunk(sub) {
                     if !out.contains(&repo) {
                         out.push(repo);
