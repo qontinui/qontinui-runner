@@ -393,6 +393,32 @@ describe("the receiver's branches", () => {
     expect(main.hook().allPages).toBe(before);
   });
 
+  it("a window whose last save was refused does not reload over its newer copy", async () => {
+    const main = await mountWindow("main");
+    const pop = await mountWindow("term-2");
+    failWritesTo(PAGES_STORAGE_KEY);
+    act(() => void main.hook().renamePage("p2", "Unsaved"));
+    expect(names(persisted())).toEqual(["Alpha", "Beta", "Gamma"]);
+    // Writes are accepted again; another window then saves and broadcasts.
+    vi.mocked(Storage.prototype.setItem).mockRestore();
+
+    act(() => void pop.hook().renamePage("p3", "Theirs"));
+
+    expect(names(persisted())).toEqual(["Alpha", "Beta", "Theirs"]);
+    expect(names(main.hook().allPages)).toEqual(["Alpha", "Unsaved", "Gamma"]);
+  });
+
+  it("unmounting clears a read still retrying", async () => {
+    const main = await mountWindow("main");
+    vi.useFakeTimers();
+    receiveFrom("term-2", rosterDigest([ROSTER[0]]));
+    expect(vi.getTimerCount()).toBeGreaterThan(0);
+    main.unmount();
+    mounted.splice(mounted.indexOf(main), 1);
+    expect(vi.getTimerCount()).toBe(0);
+    vi.useRealTimers();
+  });
+
   it("a null store leaves the receiver's roster unchanged", async () => {
     const main = await mountWindow("main");
     const before = main.hook().allPages;
