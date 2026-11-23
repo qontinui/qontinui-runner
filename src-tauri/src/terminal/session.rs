@@ -29,6 +29,7 @@ use super::visibility::{
     ActivityDigestState, BackgroundHold, TerminalActivityWire, VisibilityState, VisibilityTier,
     ACTIVITY_DIGEST_LINES, ACTIVITY_EVENT,
 };
+use super::PYTHONUTF8_ENV;
 
 /// Shell integration scripts embedded at compile time.
 #[cfg(target_os = "windows")]
@@ -1731,10 +1732,6 @@ pub struct IdleQuiescence {
     pub lines: Vec<String>,
 }
 
-/// The variable that turns on Python UTF-8 mode; see
-/// [`TerminalSession::apply_python_utf8_default`].
-pub(crate) const PYTHONUTF8_ENV: &str = "PYTHONUTF8";
-
 impl TerminalSession {
     /// Spawn a new terminal session with a shell process.
     ///
@@ -2865,8 +2862,11 @@ impl TerminalSession {
     /// Set only on Windows, and only when the variable is not already set
     /// (inherited from the runner's own environment): an operator override,
     /// including `PYTHONUTF8=0`, wins. It runs before the caller's
-    /// `extra_env`, so a caller can override it as well. Scope is the PTY
-    /// child — the runner's own Python subprocess is untouched.
+    /// `extra_env`, so a caller can override it as well. This is the PTY seam;
+    /// the headless agent-session seams apply the same rule through
+    /// [`crate::terminal::apply_python_utf8_default_std`] /
+    /// [`crate::terminal::apply_python_utf8_default_tokio`]. The runner's own
+    /// Python subprocess is untouched.
     /// `is_windows` is a parameter so the rule is testable on every host.
     pub(crate) fn apply_python_utf8_default(cmd: &mut CommandBuilder, is_windows: bool) {
         if is_windows && cmd.get_env(PYTHONUTF8_ENV).is_none() {

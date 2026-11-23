@@ -101,7 +101,7 @@ The account-versioned override registry for the agent SKILLS: fetch `GET {base}/
 Import of `<workspace-root>/qontinui-claude-config/.claude/commands/*.md` as runner workflows. Purely a sibling-checkout scan with no embedded or bundled fallback of any kind, so on any device without that repo it returns `Err` and the workflows simply do not exist. The clearest instance of the class in the roster: it is not that this degrades on a published install, it is that it cannot run at all there.
 
 - Class: `session_provisioning`
-- Resolved by: `slash_commands::{find_commands_directory_reported, sync_slash_commands}`
+- Resolved by: `slash_commands::{find_commands_directory_reported, commands_directory_in, COMMANDS_SIBLING, sync_slash_commands}`
 - Expected rungs: operator_checkout, unresolved
 
 ### 11. `session_cli`

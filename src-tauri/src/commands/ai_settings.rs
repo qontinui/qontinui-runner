@@ -145,6 +145,7 @@ pub fn save_ai_settings(
     interactive_sessions_enabled: Option<bool>,
     auto_migrate_on_token_exhaustion: Option<bool>,
     auto_continue_after_migration: Option<bool>,
+    auto_continue_after_limit_reset: Option<bool>,
     account_selection_pinned: Option<bool>,
     runner_manages_cli_updates: Option<bool>,
 ) -> Result<CommandResponse, String> {
@@ -203,6 +204,8 @@ pub fn save_ai_settings(
                 ),
                 auto_continue_after_migration: auto_continue_after_migration
                     .unwrap_or(existing_settings.claude_cli.auto_continue_after_migration),
+                auto_continue_after_limit_reset: auto_continue_after_limit_reset
+                    .unwrap_or(existing_settings.claude_cli.auto_continue_after_limit_reset),
                 // `None` (an older frontend) preserves the configured value.
                 runner_manages_cli_updates: runner_manages_cli_updates
                     .unwrap_or(existing_settings.claude_cli.runner_manages_cli_updates),
@@ -1605,7 +1608,7 @@ pub(crate) const EXHAUSTION_UTILIZATION: f64 = 0.99;
 /// window; the header probe leaves it `None`). The session-window arm is what
 /// lets a "5-hour limit reached" migration hint confirm — the weekly number
 /// alone stays low when only the session window is exhausted.
-fn probe_result_exhausted(info: &AccountUsageInfo) -> bool {
+pub(crate) fn probe_result_exhausted(info: &AccountUsageInfo) -> bool {
     if info.error.is_some() || info.utilization >= EXHAUSTION_UTILIZATION {
         return true;
     }
@@ -1930,7 +1933,7 @@ async fn refresh_usage(caller: UsageRefreshCaller) -> Vec<AccountUsageInfo> {
 /// runner PR can land independently of the coord one.
 mod usage_twin_report {
     use serde::Serialize;
-    use tracing::{debug, warn};
+    use tracing::{debug, info, warn};
 
     /// Wire shape — SHARED CONTRACT with coord's
     /// `POST /coord/claude-accounts/usage` ingest. The row's display name is
@@ -2128,6 +2131,15 @@ mod usage_twin_report {
                         prepaid = prepaid.len(),
                         "account usage mirrored to coord twin"
                     );
+                    match roster_log_line(
+                        last_roster_reason(),
+                        body.roster_complete,
+                        &RosterAnswer::from_body(&bytes),
+                    ) {
+                        Some(RosterLine::Info(line)) => info!("{line}"),
+                        Some(RosterLine::Warn(line)) => warn!("{line}"),
+                        None => {}
+                    }
                 } else {
                     let body = String::from_utf8_lossy(&bytes);
                     let posture = crate::mcp::device_jwt_refresher::coord_credential_posture()
@@ -2141,6 +2153,93 @@ mod usage_twin_report {
                 warn!(error = %e, "coord account-usage report failed — skipped");
             }
         }
+    }
+
+    /// The roster half of coord's ingest answer (qontinui-coord
+    /// `claude_account_usage.rs` `add_roster_half`): `roster_reason`, plus
+    /// `roster_retired` / `roster_purged` only when the step ran. A coord that
+    /// predates the roster step sends none of the three.
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct RosterAnswer {
+        reason: Option<String>,
+        retired: Option<u64>,
+        purged: Option<u64>,
+    }
+
+    impl RosterAnswer {
+        fn from_body(bytes: &[u8]) -> Self {
+            let Ok(v) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+                return Self::default();
+            };
+            Self {
+                reason: v
+                    .get("roster_reason")
+                    .and_then(|r| r.as_str())
+                    .map(str::to_string),
+                retired: v.get("roster_retired").and_then(|n| n.as_u64()),
+                purged: v.get("roster_purged").and_then(|n| n.as_u64()),
+            }
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum RosterLine {
+        Info(String),
+        Warn(String),
+    }
+
+    /// The `roster_reason` last WARNed for a complete report, so an unchanged
+    /// degraded answer does not re-WARN every refresh. Cleared on `applied`.
+    fn last_roster_reason() -> &'static std::sync::Mutex<Option<String>> {
+        static LAST: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+        &LAST
+    }
+
+    /// What to log about coord's roster answer, or `None`.
+    ///
+    /// Without this line the runner discards the only on-box evidence that a
+    /// `roster_complete: true` report actually retired anything: coord's usage
+    /// reads are operator-tier, so a device cannot read its own rows back.
+    ///
+    /// - Any retire or purge is an event and is logged at INFO every time.
+    /// - A report sent `roster_complete: true` that coord did not answer
+    ///   `applied` is WARNed once per distinct reason (`column_missing`,
+    ///   `failed`, `pool_unavailable`, …, or no reason at all from a coord
+    ///   that predates the roster step).
+    /// - A partial report is answered `not_complete` by design; nothing logs.
+    fn roster_log_line(
+        last: &std::sync::Mutex<Option<String>>,
+        sent_complete: bool,
+        answer: &RosterAnswer,
+    ) -> Option<RosterLine> {
+        let retired = answer.retired.unwrap_or(0);
+        let purged = answer.purged.unwrap_or(0);
+        if answer.reason.as_deref() == Some("applied") {
+            *last.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+        if retired > 0 || purged > 0 {
+            return Some(RosterLine::Info(format!(
+                "coord retired {retired} and purged {purged} account-usage label(s) \
+                 absent from this device's complete roster report"
+            )));
+        }
+        if !sent_complete || answer.reason.as_deref() == Some("applied") {
+            return None;
+        }
+        let reason = answer.reason.clone().unwrap_or_else(|| {
+            "absent from coord's answer (coord predates roster retirement?)".to_string()
+        });
+        {
+            let mut guard = last.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.as_deref() == Some(reason.as_str()) {
+                return None;
+            }
+            *guard = Some(reason.clone());
+        }
+        Some(RosterLine::Warn(format!(
+            "coord did not apply this device's complete account roster \
+             (roster_reason: {reason}) — labels this device stopped reporting stay listed"
+        )))
     }
 
     /// The (status, refusal token, posture) of the last refusal WARNed. The report runs on
@@ -2226,6 +2325,72 @@ mod usage_twin_report {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        fn answer(json: &str) -> RosterAnswer {
+            RosterAnswer::from_body(json.as_bytes())
+        }
+
+        /// coord's roster answer: counts only when the step ran, and an
+        /// unparseable or pre-roster body reads as all-absent.
+        #[test]
+        fn roster_answer_reads_coords_keys() {
+            assert_eq!(
+                answer(r#"{"roster_reason":"applied","roster_retired":2,"roster_purged":1}"#),
+                RosterAnswer {
+                    reason: Some("applied".into()),
+                    retired: Some(2),
+                    purged: Some(1)
+                }
+            );
+            assert_eq!(
+                answer(r#"{"roster_reason":"column_missing"}"#),
+                RosterAnswer {
+                    reason: Some("column_missing".into()),
+                    ..Default::default()
+                }
+            );
+            assert_eq!(answer(r#"{"recorded":true}"#), RosterAnswer::default());
+            assert_eq!(answer("not json"), RosterAnswer::default());
+        }
+
+        #[test]
+        fn roster_log_line_reports_retires_and_degraded_complete_reports() {
+            let last = std::sync::Mutex::new(None);
+            // A retire is an event: logged every time.
+            let retired =
+                answer(r#"{"roster_reason":"applied","roster_retired":1,"roster_purged":0}"#);
+            for _ in 0..2 {
+                assert!(matches!(
+                    roster_log_line(&last, true, &retired),
+                    Some(RosterLine::Info(l)) if l.contains("retired 1")
+                ));
+            }
+            // A quiet `applied` and any partial report say nothing.
+            let quiet =
+                answer(r#"{"roster_reason":"applied","roster_retired":0,"roster_purged":0}"#);
+            assert_eq!(roster_log_line(&last, true, &quiet), None);
+            let partial =
+                answer(r#"{"roster_reason":"not_complete","roster_retired":0,"roster_purged":0}"#);
+            assert_eq!(roster_log_line(&last, false, &partial), None);
+            // A complete report coord could not apply WARNs once per reason.
+            let missing = answer(r#"{"roster_reason":"column_missing"}"#);
+            assert!(matches!(
+                roster_log_line(&last, true, &missing),
+                Some(RosterLine::Warn(l)) if l.contains("column_missing")
+            ));
+            assert_eq!(roster_log_line(&last, true, &missing), None);
+            let legacy = answer(r#"{"recorded":true}"#);
+            assert!(matches!(
+                roster_log_line(&last, true, &legacy),
+                Some(RosterLine::Warn(l)) if l.contains("predates")
+            ));
+            // `applied` re-arms the latch.
+            assert_eq!(roster_log_line(&last, true, &quiet), None);
+            assert!(matches!(
+                roster_log_line(&last, true, &missing),
+                Some(RosterLine::Warn(_))
+            ));
+        }
 
         /// The wire KEYS are the shared contract with coord's
         /// `claude_account_usage.rs`; a rename on either side is a silent

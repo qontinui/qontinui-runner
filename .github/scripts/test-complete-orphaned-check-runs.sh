@@ -141,6 +141,13 @@ summary_of() {
     "$STUB_DIR/body.$(keyof PATCH "$(run_path "$1")").1"
 }
 sleeps() { tr '\n' ' ' <"$STUB_DIR/sleeps.log" | sed 's/ $//'; }
+# before <call A> <call B>: call A was first made before call B was.
+before() {
+  local a b
+  a="$(grep -n -F -x "$1" "$STUB_DIR/calls.log" | head -n 1 | cut -d: -f1)"
+  b="$(grep -n -F -x "$2" "$STUB_DIR/calls.log" | head -n 1 | cut -d: -f1)"
+  [ -n "$a" ] && [ -n "$b" ] && [ "$a" -lt "$b" ]
+}
 warned() { printf '%s\n' "$OUT" | grep -qF "${WARN}${1:-}"; }
 ok() { echo "ok   - $1"; }
 bad() {
@@ -325,7 +332,7 @@ respond GET "$(list_path 1)" default 200 "$(page_body 1 102,in_progress)"
 orphan 102
 run STEP_RC=unknown REVIEWDOG_STDERR_LOG=
 if [ "$e_ok" -eq 1 ] && [ "$RC" -eq 0 ] && patched 102 \
-  && grep -qF -- "- The posting step (reviewdog): unknown (the step ended before reviewdog returned an exit status)" <<<"$(summary_of 102)"; then
+  && grep -qF -- "- The posting step's final reviewdog exit: unknown (the step ended before reviewdog returned an exit status)" <<<"$(summary_of 102)"; then
   ok "STEP_RC=unknown: an empty listing is waited on, then warns; the summary names the rc"
 else bad "STEP_RC=unknown" "rc=$RC empty_ok=$e_ok"; fi
 
@@ -651,7 +658,7 @@ respond GET "$(list_path 1)" default 200 "$(page_body 1 361,in_progress)"
 orphan 361
 run STEP_RC=143 REVIEWDOG_STDERR_LOG="$STUB_DIR/clean.err"
 if [ "$RC" -eq 0 ] && patched 361 && ! warned \
-  && grep -qF -- "- The posting step (reviewdog): exit 143 (killed by signal 15)" <<<"$(summary_of 361)"; then
+  && grep -qF -- "- The posting step's final reviewdog exit: exit 143 (killed by signal 15)" <<<"$(summary_of 361)"; then
   ok "rc 143 (signal-killed reviewdog) is looked for like unknown, and the summary names the signal"
 else bad "rc 143" "rc=$RC calls=$(wc -l <"$STUB_DIR/calls.log")"; fi
 
@@ -988,6 +995,104 @@ os.execvp("env", ["env"] + sys.argv[1:])' \
     else bad "SIGINT cleanup" "rc=$RC dirs before=$leftover_before after=$leftover_after"; fi
   fi
 fi
+
+# 62. a posting step that ran reviewdog more than once (rso_run_retrying in
+#     reviewdog-step-outputs.sh) appends every attempt's stderr to one log. An
+#     earlier attempt's failed post names run 601; the step was then cancelled
+#     mid-attempt (rc unknown after a start), and that LATER attempt's run 602
+#     is named by no line. Both are completed: the named id FIRST (before any
+#     listing, so the listing's wait cannot spend the sleep budget its re-read
+#     may need), then the listing as well, which exact-only mode never made.
+#     Each run's summary says how that run was found.
+fresh union-unknown
+printf '%s\n' "reviewdog: failed to post result: PATCH https://api.github.com/repos/o/r/check-runs/601: 404 Not Found []" \
+  >"$STUB_DIR/reviewdog.err"
+respond GET "$(list_path 1)" default 200 "$(page_body 2 601,in_progress 602,in_progress)"
+orphan 601
+orphan 602
+run STEP_RC=unknown REVIEWDOG_STDERR_LOG="$STUB_DIR/reviewdog.err"
+if [ "$RC" -eq 0 ] && patched 601 && patched 602 && [ "$(npatch)" -eq 2 ] \
+  && [ "$(calls "GET $(list_path 1)")" -eq 1 ] && [ ! -s "$STUB_DIR/sleeps.log" ] && ! warned \
+  && before "PATCH $(run_path 601)" "GET $(list_path 1)" \
+  && grep -qF "reviewdog's own error output names this run" <<<"$(summary_of 601)" \
+  && grep -qF "listing '${NAME}' runs on this head that started inside this job's reviewdog window" <<<"$(summary_of 602)" \
+  && grep -qF "because reviewdog started and did not return an exit status" <<<"$(summary_of 602)"; then
+  ok "a named id plus rc unknown: the listing runs too, and the run no line names is completed with the named one"
+else bad "union, rc unknown" "rc=$RC patches=$(npatch) lists=$(calls "GET $(list_path 1)")"; fi
+
+# 63. the same, where the later attempt's CREATE failed (its line names no run)
+#     after GitHub had made run 612 anyway, and the step then ended rc 1.
+fresh union-create
+printf '%s\n' "reviewdog: failed to post result: PATCH https://api.github.com/repos/o/r/check-runs/611: 404 Not Found []" \
+  "reviewdog: failed to create check: POST https://api.github.com/repos/o/r/check-runs: 502 Bad Gateway []" \
+  >"$STUB_DIR/reviewdog.err"
+respond GET "$(list_path 1)" default 200 "$(page_body 2 611,in_progress 612,in_progress)"
+orphan 611
+orphan 612
+run REVIEWDOG_STDERR_LOG="$STUB_DIR/reviewdog.err"
+if [ "$RC" -eq 0 ] && patched 611 && patched 612 && [ "$(npatch)" -eq 2 ] \
+  && [ "$(calls "GET $(list_path 1)")" -eq 1 ] \
+  && printf '%s\n' "$OUT" | grep -qF "completing those, and listing as well, because reviewdog's stderr also reports a failed check create"; then
+  ok "a named id plus a failed create: the listing runs too, and the unnamed run is completed"
+else bad "union, failed create" "rc=$RC patches=$(npatch) lists=$(calls "GET $(list_path 1)")"; fi
+
+# 64. a signal's rc (143) after a named id: the listing runs; the run it shows
+#     beside the named one that is already COMPLETED (the earlier attempt's
+#     successful run, say) is left alone.
+fresh union-signal
+printf '%s\n' "reviewdog: failed to post result: PATCH https://api.github.com/repos/o/r/check-runs/621: 404 Not Found []" \
+  >"$STUB_DIR/reviewdog.err"
+respond GET "$(list_path 1)" default 200 "$(page_body 3 621,in_progress 622,completed 623,in_progress)"
+orphan 621
+orphan 623
+run STEP_RC=143 REVIEWDOG_STDERR_LOG="$STUB_DIR/reviewdog.err"
+if [ "$RC" -eq 0 ] && patched 621 && patched 623 && ! patched 622 && [ "$(npatch)" -eq 2 ]; then
+  ok "a named id plus rc 143: the listing runs, its open run is completed and a completed one is not"
+else bad "union, rc 143" "rc=$RC patches=$(npatch)"; fi
+
+# 65. a named id plus rc unknown, and the listing shows only the named run:
+#     the wait for a run beyond it is spent on the shared budget, and then the
+#     named run is still completed (no give-up).
+fresh union-nothing-more
+printf '%s\n' "reviewdog: failed to post result: PATCH https://api.github.com/repos/o/r/check-runs/631: 404 Not Found []" \
+  >"$STUB_DIR/reviewdog.err"
+respond GET "$(list_path 1)" default 200 "$(page_body 1 631,in_progress)"
+orphan 631
+run STEP_RC=unknown REVIEWDOG_STDERR_LOG="$STUB_DIR/reviewdog.err"
+if [ "$RC" -eq 0 ] && patched 631 && [ "$(npatch)" -eq 1 ] && [ "$(sleeps)" = "2 5 10" ] \
+  && [ "$(calls "GET $(list_path 1)")" -eq 4 ] && ! warned \
+  && printf '%s\n' "$OUT" | grep -qF "no '${NAME}' run beyond the named one(s) (631) became visible" \
+  && ! printf '%s\n' "$OUT" | grep -qF 'are already completed and are left as they are'; then
+  ok "a named id plus rc unknown with nothing more listed: the wait is spent, then the named run is completed"
+else bad "union, nothing more" "rc=$RC sleeps='$(sleeps)' lists=$(calls "GET $(list_path 1)")"; fi
+
+# 66. a named id plus rc unknown, and the listing FAILS (a 422, not retried):
+#     a warning, and the named run is still completed.
+fresh union-listfail
+printf '%s\n' "reviewdog: failed to post result: PATCH https://api.github.com/repos/o/r/check-runs/641: 404 Not Found []" \
+  >"$STUB_DIR/reviewdog.err"
+respond GET "$(list_path 1)" default 422 '{"message":"Unprocessable"}'
+orphan 641
+run STEP_RC=unknown REVIEWDOG_STDERR_LOG="$STUB_DIR/reviewdog.err"
+if [ "$RC" -eq 0 ] && patched 641 && [ "$(npatch)" -eq 1 ] \
+  && warned "listing check runs '${NAME}' on ${SHA} failed at page 1" \
+  && printf '%s\n' "$OUT" | grep -qF "Only the run(s) reviewdog's stderr names (641) were handled, above."; then
+  ok "a named id plus rc unknown with a failing listing: a warning, and the named run is still completed"
+else bad "union, list fails" "rc=$RC patches=$(npatch)"; fi
+
+# 67. a named id plus rc unknown, and the listing shows the named run beside
+#     an UNNAMED run that is already completed: the wait counts that one run
+#     (not the named one) as completed and leaves it alone.
+fresh union-count
+printf '%s\n' "reviewdog: failed to post result: PATCH https://api.github.com/repos/o/r/check-runs/651: 404 Not Found []" \
+  >"$STUB_DIR/reviewdog.err"
+respond GET "$(list_path 1)" default 200 "$(page_body 2 651,in_progress 652,completed)"
+orphan 651
+run STEP_RC=unknown REVIEWDOG_STDERR_LOG="$STUB_DIR/reviewdog.err"
+if [ "$RC" -eq 0 ] && patched 651 && ! patched 652 && [ "$(npatch)" -eq 1 ] \
+  && printf '%s\n' "$OUT" | grep -qxF "1 '${NAME}' run(s) on ${SHA} are already completed and are left as they are"; then
+  ok "a named id plus an unnamed completed run: the count names that one run, and it is left alone"
+else bad "union, completed count" "rc=$RC patches=$(npatch)"; fi
 
 if [ "$fail" -ne 0 ]; then
   echo "complete-orphaned-check-runs tests: FAILED"

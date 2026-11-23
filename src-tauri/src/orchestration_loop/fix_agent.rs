@@ -83,6 +83,7 @@ pub(crate) fn build_fix_agent_command_with(
     // is an infinite silent hang. One shared list, eight seams; see
     // `credential_helper::non_interactive_git_env`.
     crate::credential_helper::apply_non_interactive_git_env_tokio(&mut cmd);
+    crate::terminal::apply_python_utf8_default_tokio(&mut cmd);
     crate::terminal::scrub_credential_env_tokio(&mut cmd);
 
     cmd
@@ -395,5 +396,6 @@ mod tests {
             &cmd,
             "build_fix_agent_command",
         );
+        crate::terminal::assert_python_utf8_default_tokio(&cmd, "build_fix_agent_command");
     }
 }

@@ -7163,6 +7163,18 @@ mod tests {
         let (stale, at) = rig.finished_on_stale(y);
         let r = Uuid::new_v4();
         rig.show_pane(y, r, 1_000);
+        // Belt and braces: the store already stamps a re-mark after an unmark
+        // past the cleared stamp (`restamp_at`). Waiting for the wall clock to
+        // pass `at` as well keeps this test about the re-offer race rather
+        // than about the store's stamping, which its own tests cover.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while chrono::Utc::now().timestamp_millis() <= at {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "wall clock did not pass the first mark's finished_at ({at}) within 5s"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         let store = rig.store.clone();
         race_after_decision(move || {
             store.set_finished(y, false, None).unwrap();

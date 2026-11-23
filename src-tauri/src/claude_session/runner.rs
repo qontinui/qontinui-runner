@@ -424,6 +424,7 @@ pub(crate) fn build_inline_child_command(
     // is an infinite silent hang. One shared list, eight seams; see
     // `credential_helper::non_interactive_git_env`.
     crate::credential_helper::apply_non_interactive_git_env_std(&mut cmd);
+    crate::terminal::apply_python_utf8_default_std(&mut cmd);
     crate::terminal::scrub_credential_env_std(&mut cmd);
 
     cmd
@@ -2936,6 +2937,7 @@ mod spawn_env_tests {
             &cmd,
             "build_inline_child_command",
         );
+        crate::terminal::assert_python_utf8_default_std(&cmd, "build_inline_child_command");
     }
 }
 

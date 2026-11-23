@@ -2241,6 +2241,7 @@ impl ClaudeSession {
         // is an infinite silent hang. One shared list, eight seams; see
         // `credential_helper::non_interactive_git_env`.
         crate::credential_helper::apply_non_interactive_git_env_std(cmd);
+        crate::terminal::apply_python_utf8_default_std(cmd);
         crate::terminal::scrub_credential_env_std(cmd);
     }
 
@@ -2376,6 +2377,7 @@ mod tests {
             &cmd,
             "ClaudeSession::finalize_child_env",
         );
+        crate::terminal::assert_python_utf8_default_std(&cmd, "ClaudeSession::finalize_child_env");
     }
 
     /// The `isolated_edit_ctx` slot on `ClaudeSession` is the worktree-isolation
