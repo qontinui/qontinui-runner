@@ -840,8 +840,15 @@ async fn finish_session(
             "session lifecycle store unavailable".to_string(),
         ))?;
 
-    let outcome = apply_finish_outcome(store.inner(), &id, req)?;
+    let (outcome, nets) = apply_finish_with_nets(
+        store.inner(),
+        &crate::session::finish_net_retire::CoordNetRetirer,
+        &id,
+        req,
+    )
+    .await?;
     let mut body = outcome.response_json();
+    nets.attach(&mut body);
     // The READ-BACK (a reason-less re-finish of a finished mark) observes
     // coord: `coord.observed` is coord's own work-status row for this session,
     // and a synced mark coord's own row contradicts is healed — its stamp
@@ -877,6 +884,37 @@ fn apply_finish(
     req: FinishSessionRequest,
 ) -> Result<serde_json::Value, (StatusCode, String)> {
     apply_finish_outcome(store, id, req).map(|o| o.response_json())
+}
+
+/// The finish route's door: retire the session's implement→ship nets FIRST
+/// ([`crate::session::finish_net_retire::retire_before_finish`] — only for a
+/// finish that writes the mark, never an unmark), THEN write the mark. A net
+/// that could not be retired never blocks the mark; the returned report says
+/// so under the body's `nets`.
+async fn apply_finish_with_nets(
+    store: &crate::session::session_lifecycle_store::SessionLifecycleStore,
+    retirer: &dyn crate::session::finish_net_retire::FinishNetRetirer,
+    id: &str,
+    req: FinishSessionRequest,
+) -> Result<
+    (
+        crate::session::session_lifecycle_store::FinishOutcome,
+        crate::session::finish_net_retire::NetsReport,
+    ),
+    (StatusCode, String),
+> {
+    let nets = crate::session::finish_net_retire::retire_before_finish(
+        store,
+        retirer,
+        id,
+        req.finished.unwrap_or(true),
+        req.reason.as_deref(),
+        false,
+        "POST /sessions/{id}/finish",
+    )
+    .await;
+    let outcome = apply_finish_outcome(store, id, req)?;
+    Ok((outcome, nets))
 }
 
 /// [`apply_finish`], returning the outcome itself.
@@ -2046,6 +2084,32 @@ fn transcript_coverage_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The HTTP finish door retires the session's nets BEFORE the mark, and
+    /// never on an unmark (plan
+    /// 2026-11-23-an-operator-finish-from-the-runner-ui-still-fires-the-finished-sessions-implement-ship-net).
+    #[tokio::test]
+    async fn the_http_finish_door_retires_nets_before_the_mark() {
+        crate::session::finish_net_retire::tests::door_contract(
+            |store, retirer, id, finished| {
+                Box::pin(async move {
+                    let req = FinishSessionRequest {
+                        reason: None,
+                        finished: Some(finished),
+                    };
+                    let (outcome, nets) = apply_finish_with_nets(&store, retirer.as_ref(), id, req)
+                        .await
+                        .expect("a known id answers");
+                    let mut body = outcome.response_json();
+                    nets.attach(&mut body);
+                    Some(body)
+                })
+            },
+            true,
+            true,
+        )
+        .await;
+    }
 
     // =========================================================================
     // POST /sessions/{id}/finish — the response contract

@@ -20,6 +20,7 @@ import {
   captureSessionLedger,
   displayNameOf,
   getSessionLedgerReport,
+  finishNetsNotice,
   setSessionFinished,
   type LedgerCapture,
   type LedgerEntry,
@@ -193,6 +194,7 @@ describe("invoke wrappers", () => {
     await expect(setSessionFinished("aaaa-1111", true)).resolves.toEqual({
       changed: true,
       message: null,
+      notice: null,
     });
     expect(invokeMock).toHaveBeenCalledWith("terminal_session_set_finished", {
       claudeSessionId: "aaaa-1111",
@@ -205,6 +207,7 @@ describe("invoke wrappers", () => {
     await expect(setSessionFinished("aaaa-1111", true)).resolves.toEqual({
       changed: false,
       message: null,
+      notice: null,
     });
     invokeMock.mockResolvedValue({
       success: false,
@@ -214,7 +217,61 @@ describe("invoke wrappers", () => {
     await expect(setSessionFinished("aaaa-1111", false, "oops")).resolves.toEqual({
       changed: false,
       message: "no such session in the lifecycle registry",
+      notice: null,
     });
+  });
+
+  it("setSessionFinished surfaces an unretired or UNKNOWN implement→ship net, and the rearm note on Unfinish", async () => {
+    invokeMock.mockResolvedValue({
+      success: true,
+      message: null,
+      data: {
+        changed: "marker",
+        nets: {
+          verdict: "NET_UNRETIRED",
+          withdrawn: [],
+          cancelled: [],
+          unretired: [
+            { stem: "2026-11-23-x", gate_id: "96e61cde-4092", why: "the withdraw did not land" },
+          ],
+          note: null,
+        },
+      },
+    });
+    const unretired = await setSessionFinished("aaaa-1111", true);
+    expect(unretired.changed).toBe(true);
+    expect(unretired.notice).toContain("NOT retired");
+    expect(unretired.notice).toContain("2026-11-23-x (gate 96e61cde): the withdraw did not land");
+
+    invokeMock.mockResolvedValue({
+      success: true,
+      message: null,
+      data: {
+        changed: "marker",
+        nets: { verdict: "UNKNOWN", unretired: [], note: "the claims list was unreadable" },
+      },
+    });
+    expect((await setSessionFinished("aaaa-1111", true)).notice).toContain(
+      "UNKNOWN — the claims list was unreadable",
+    );
+
+    // A retired net, or no reserve, owes no line.
+    expect(finishNetsNotice({ verdict: "RETIRED", withdrawn: ["g1"] }, true)).toBeNull();
+    expect(finishNetsNotice({ verdict: "NONE" }, true)).toBeNull();
+    // An older build answers no `nets` at all: no line, never a guess.
+    expect(finishNetsNotice(undefined, true)).toBeNull();
+
+    invokeMock.mockResolvedValue({
+      success: true,
+      message: null,
+      data: {
+        changed: "marker",
+        nets: { rearm: "not restored — /implement-plan Step 0.5 re-arms" },
+      },
+    });
+    expect((await setSessionFinished("aaaa-1111", false)).notice).toBe(
+      "Any implement→ship net the finish withdrew is not restored — /implement-plan Step 0.5 re-arms",
+    );
   });
 
   it("propagates a refusal rather than resolving an empty report", async () => {

@@ -603,14 +603,23 @@ async fn tick_once(state: &mut RelayState) {
                 debug!(terminal_id = %terminal_id, gate_id = %gate_id, reason = %why, "continuation_finish_relay: hold");
             }
             RelayDecision::Relay(token) => {
-                relay_one(&store, &terminal_id, gate_id, &claude_session_id, token);
+                relay_one(
+                    &store,
+                    &crate::session::finish_net_retire::CoordNetRetirer,
+                    &terminal_id,
+                    gate_id,
+                    &claude_session_id,
+                    token,
+                )
+                .await;
             }
         }
     }
 }
 
-fn relay_one(
+async fn relay_one(
     store: &SessionLifecycleStore,
+    retirer: &dyn crate::session::finish_net_retire::FinishNetRetirer,
     terminal_id: &str,
     gate_id: uuid::Uuid,
     claude_session_id: &str,
@@ -622,6 +631,26 @@ fn relay_one(
     // its finish_reason replaced), so the write is conditional, decided under
     // the store's own locks.
     let reason = format!("{REASON_PREFIX}{token}");
+    // Nets FIRST: the session's implement→ship safety nets are retired before
+    // the mark, outside every store lock. A net that could not be retired
+    // never blocks the relay; it is logged (plan
+    // 2026-11-23-an-operator-finish-from-the-runner-ui-still-fires-the-finished-sessions-implement-ship-net).
+    let nets = crate::session::finish_net_retire::retire_before_finish(
+        store,
+        retirer,
+        claude_session_id,
+        true,
+        Some(reason.as_str()),
+        true,
+        "the continuation finish relay",
+    )
+    .await;
+    debug!(
+        terminal_id,
+        claude_session_id,
+        nets = %nets.to_json(),
+        "continuation_finish_relay: nets before the relay's mark"
+    );
     match store.set_finished_if_unfinished(claude_session_id, reason.clone()) {
         Ok(outcome) if outcome.changed == FinishChange::None => debug!(
             terminal_id,
@@ -677,8 +706,44 @@ mod tests {
 
     /// A session that finished itself between the tick's candidate read and the
     /// relay's write keeps its own mark: no restamp, its reason unchanged.
-    #[test]
-    fn the_relay_never_restamps_a_session_that_finished_itself() {
+    /// The relay retires the session's nets BEFORE its conditional mark (plan
+    /// 2026-11-23-an-operator-finish-from-the-runner-ui-still-fires-the-finished-sessions-implement-ship-net).
+    /// The relay only ever finishes, so there is no unmark case.
+    #[tokio::test]
+    async fn the_relay_retires_nets_before_the_mark() {
+        crate::session::finish_net_retire::tests::door_contract(
+            |store, retirer, id, finished| {
+                Box::pin(async move {
+                    assert!(finished, "the relay only finishes");
+                    relay_one(
+                        &store,
+                        retirer.as_ref(),
+                        &format!("term-{id}"),
+                        uuid::Uuid::nil(),
+                        id,
+                        "work_completed",
+                    )
+                    .await;
+                    None
+                })
+            },
+            false,
+            false,
+        )
+        .await;
+    }
+
+    /// A retirer that finds no reserve.
+    struct NoNets;
+    #[async_trait::async_trait]
+    impl crate::session::finish_net_retire::FinishNetRetirer for NoNets {
+        async fn retire(&self, _: &str, _: &str) -> crate::session::finish_net_retire::NetsOutcome {
+            crate::session::finish_net_retire::NetsOutcome::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn the_relay_never_restamps_a_session_that_finished_itself() {
         let dir = tempfile::tempdir().unwrap();
         let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
         let open = |csid: &str| -> crate::session::session_lifecycle_store::TerminalSessionRecord {
@@ -701,11 +766,13 @@ mod tests {
 
         relay_one(
             &store,
+            &NoNets,
             "term-self-finished",
             uuid::Uuid::nil(),
             "self-finished",
             "work_completed",
-        );
+        )
+        .await;
         let after = store.get("self-finished").unwrap();
         assert_eq!(after.finish_reason.as_deref(), Some("own_reason"));
         assert_eq!(after.finished_at, before.finished_at);
@@ -714,11 +781,13 @@ mod tests {
         store.record_open(open("idle-cont"));
         relay_one(
             &store,
+            &NoNets,
             "term-idle-cont",
             uuid::Uuid::nil(),
             "idle-cont",
             "work_completed",
-        );
+        )
+        .await;
         let relayed = store.get("idle-cont").unwrap();
         assert!(relayed.finished_at.is_some());
         assert_eq!(

@@ -246,6 +246,51 @@ export function captureSessionLedger(): Promise<LedgerCapture> {
 }
 
 /**
+ * The finish doors' `nets` object: what the runner did about the finished
+ * session's implement→ship safety nets BEFORE writing the mark (plan
+ * `2026-11-23-an-operator-finish-from-the-runner-ui-still-fires-the-finished-sessions-implement-ship-net`).
+ * A finish carries `verdict`; an unmark carries `rearm`; a finish that wrote
+ * no mark carries `skipped`.
+ */
+export interface FinishNets {
+  verdict?: "RETIRED" | "NONE" | "NET_UNRETIRED" | "UNKNOWN" | null;
+  withdrawn?: string[];
+  cancelled?: string[];
+  unretired?: { stem: string; gate_id: string | null; why: string }[];
+  note?: string | null;
+  rearm?: string;
+  skipped?: string;
+}
+
+/**
+ * The operator-facing line a Finish/Unfinish result owes, or `null` when it
+ * owes none: an unretired or UNKNOWN net on a finish (it may still dispatch a
+ * duplicate /implement-plan), and the not-re-armed note on an unfinish.
+ */
+export function finishNetsNotice(
+  nets: FinishNets | null | undefined,
+  finished: boolean,
+): string | null {
+  if (!nets) return null;
+  if (!finished) {
+    return nets.rearm
+      ? `Any implement→ship net the finish withdrew is ${nets.rearm}`
+      : null;
+  }
+  const items = (nets.unretired ?? []).map(
+    (u) => `${u.stem}${u.gate_id ? ` (gate ${u.gate_id.slice(0, 8)})` : ""}: ${u.why}`,
+  );
+  if (nets.verdict === "NET_UNRETIRED") {
+    return `Finished, but an implement→ship net was NOT retired and may dispatch a duplicate /implement-plan — ${items.join("; ")}`;
+  }
+  if (nets.verdict === "UNKNOWN") {
+    const why = [nets.note, ...items].filter((x): x is string => !!x).join("; ");
+    return `Finished, but whether its implement→ship nets were retired is UNKNOWN${why ? ` — ${why}` : ""}`;
+  }
+  return null;
+}
+
+/**
  * Mark a session's WORK finished (or unfinish it) — Tauri
  * `terminal_session_set_finished`, the twin of `POST /sessions/{id}/finish`.
  * Metadata only: the process is never touched; a finished session is simply
@@ -255,22 +300,24 @@ export function captureSessionLedger(): Promise<LedgerCapture> {
  * (`success: false`), or the marker was already in that state (`success: true`
  * with `data.changed: "none"` — the backend answers the finish route's body,
  * `FinishOutcome::response_json`). It is NOT a failure to retry — re-read the
- * roster to see which.
+ * roster to see which. `notice` is {@link finishNetsNotice} of the body's
+ * `nets`.
  */
 export async function setSessionFinished(
   claudeSessionId: string,
   finished: boolean,
   reason?: string,
-): Promise<{ changed: boolean; message: string | null }> {
+): Promise<{ changed: boolean; message: string | null; notice: string | null }> {
   const res = await invoke<{
     success: boolean;
     message?: string | null;
-    data?: { changed?: string } | null;
+    data?: { changed?: string; nets?: FinishNets | null } | null;
   }>("terminal_session_set_finished", {
     claudeSessionId,
     finished,
     reason: reason ?? null,
   });
   const changed = res.success && res.data?.changed !== "none";
-  return { changed, message: res.message ?? null };
+  const notice = res.success ? finishNetsNotice(res.data?.nets, finished) : null;
+  return { changed, message: res.message ?? null, notice };
 }

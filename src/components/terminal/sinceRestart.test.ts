@@ -641,6 +641,15 @@ describe("Finish / Unfinish row state", () => {
     expect(m.label).toBe("Finish");
     expect(m.disabled).toBe(false);
     expect(m.title).toMatch(/Last attempt failed: store down/);
+    expect(m.notice).toBeNull();
+  });
+
+  it("after a settled op that owes a line, shows the nets notice beside the control", () => {
+    const m = finishButtonModel(true, { phase: "settled", to: true, notice: "net NOT retired" });
+    expect(m.label).toBe("Unfinish");
+    expect(m.disabled).toBe(false);
+    expect(m.notice).toBe("net NOT retired");
+    expect(m.title).toMatch(/net NOT retired/);
   });
 });
 

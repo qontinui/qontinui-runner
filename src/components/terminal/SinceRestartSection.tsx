@@ -133,16 +133,23 @@ function FinishButton({
 }) {
   const model = finishButtonModel(finished, roster.finishOps.get(id));
   return (
-    <button
-      type="button"
-      data-ui-bridge-id={controlId}
-      onClick={() => roster.setFinished(id, model.target)}
-      disabled={model.disabled}
-      title={model.title}
-      className="px-1.5 py-0.5 rounded text-[10px] font-medium transition-colors bg-[#414868]/30 text-[#a9b1d6] hover:bg-[#414868]/50 disabled:opacity-50"
-    >
-      {model.label}
-    </button>
+    <>
+      <button
+        type="button"
+        data-ui-bridge-id={controlId}
+        onClick={() => roster.setFinished(id, model.target)}
+        disabled={model.disabled}
+        title={model.title}
+        className="px-1.5 py-0.5 rounded text-[10px] font-medium transition-colors bg-[#414868]/30 text-[#a9b1d6] hover:bg-[#414868]/50 disabled:opacity-50"
+      >
+        {model.label}
+      </button>
+      {model.notice && (
+        <span role="status" className="text-[10px] text-[#e0af68]" title={model.notice}>
+          {model.notice}
+        </span>
+      )}
+    </>
   );
 }
 

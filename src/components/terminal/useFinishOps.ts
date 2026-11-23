@@ -9,7 +9,8 @@ import type { FinishOp } from "./sinceRestart";
  * unfinished-resume`, gap 4, delivered by plan
  * `2026-10-04-runner-session-roster-restore-picker` Phase 4).
  *
- * Tracks each session's op (`pending`, or the last `failed` one) for
+ * Tracks each session's op (`pending`, the last `failed` one, or a `settled`
+ * one carrying the finish's nets notice — see `finishNetsNotice`) for
  * {@link finishButtonModel}. The roster's own `finished` flag stays the truth:
  * `onSettled` re-reads it after every attempt, which is also how a backend
  * no-op (already in that state, unknown id) shows as what it is.
@@ -23,10 +24,13 @@ export function useFinishOps(onSettled: () => void): {
     (id: string, finished: boolean) => {
       setOps((prev) => new Map(prev).set(id, { phase: "pending", to: finished }));
       setSessionFinished(id, finished)
-        .then(() =>
+        .then(({ notice }) =>
           setOps((prev) => {
             const next = new Map(prev);
-            next.delete(id);
+            // A result the operator is owed (an implement→ship net left
+            // armed, or not re-armed on Unfinish) stays beside the control.
+            if (notice) next.set(id, { phase: "settled", to: finished, notice });
+            else next.delete(id);
             return next;
           }),
         )
