@@ -232,6 +232,7 @@ pub const AMBIENT_ENV_KEYS: &[&str] = &[
     "QONTINUI_LOOPING_AGENT_TICK_MS",
     "QONTINUI_MACHINE_ID",
     "QONTINUI_MAINTENANCE_INTERVAL_SECS",
+    "QONTINUI_MALLOC_TRIM",
     "QONTINUI_MCP_CONFIG",
     "QONTINUI_MCP_SPILL_MAX_BYTES",
     "QONTINUI_MCP_SPILL_THRESHOLD_BYTES",
@@ -2407,8 +2408,11 @@ mod tests {
         ),
         (
             "commands/ai_settings.rs",
-            1,
-            "`default_claude_config_dir`: Claude Code's own `~/.claude` (the user's Claude login)",
+            3,
+            "`default_claude_config_dir`: Claude Code's own `~/.claude` (the user's Claude login), \
+             plus the two `probe_account_usage` reads of the account identity in \
+             `~/.claude.json` (`account_hash_for`) — Claude Code's own file, reported, never \
+             runner state",
         ),
         (
             "claude_session/workspace_trust.rs",

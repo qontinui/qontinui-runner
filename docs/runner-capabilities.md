@@ -74,7 +74,7 @@ The named-subagent definitions written into a spawned session's `<cwd>/.claude/a
 
 ### 7. `agent_definitions`
 
-The CHECKOUT copy of the same subagent definitions, read from `<workspace-root>/qontinui-claude-config/.claude/agents/*.md` off the operator's disk. It outranks the embedded floor, so on a box that has that sibling repo this row — not `fleet_agents` — decides what a session actually gets. Two sources for one asset; qontinui-claude-config's hourly `fleet-agents-parity` gate (`agent-bundle-parity.sh`) checks that the two repositories' default branches agree, not this disk against this binary. When the root does not resolve the copy is a no-op that logs "no qontinui-root resolved; skipping .claude/agents" and continues.
+The CHECKOUT copy of the same subagent definitions, read from `<workspace-root>/qontinui-claude-config/.claude/agents/*.md` off the operator's disk. It outranks the embedded floor, so on a box that has that sibling repo this row — not `fleet_agents` — decides what a session actually gets. Two sources for one asset; qontinui-claude-config's hourly `fleet-agents-parity` gate (`agent-bundle-parity.sh`) checks that the two repositories' default branches agree, not this disk against this binary. When the root does not resolve, the checkout copy is skipped while the embedded floor is still written, and this row is `unresolved` with the workspace-root-unresolved refusal as its reason.
 
 - Class: `session_provisioning`
 - Resolved by: `agent_runtime::provision_agent_definitions_from_root`
@@ -101,7 +101,7 @@ The account-versioned override registry for the agent SKILLS: fetch `GET {base}/
 Import of `<workspace-root>/qontinui-claude-config/.claude/commands/*.md` as runner workflows. Purely a sibling-checkout scan with no embedded or bundled fallback of any kind, so on any device without that repo it returns `Err` and the workflows simply do not exist. The clearest instance of the class in the roster: it is not that this degrades on a published install, it is that it cannot run at all there.
 
 - Class: `session_provisioning`
-- Resolved by: `slash_commands::{find_commands_directory_reported, sync_slash_commands}`
+- Resolved by: `slash_commands::{find_commands_directory_reported, commands_directory_in, COMMANDS_SIBLING, sync_slash_commands}`
 - Expected rungs: operator_checkout, unresolved
 
 ### 11. `session_cli`

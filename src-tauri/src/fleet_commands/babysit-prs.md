@@ -1,7 +1,7 @@
 ---
 description: "Shepherd this session's PRs to landed — watch CI, fix red in-session, diagnose green-but-stuck PRs via coord's pr-merge events, merge a diagnosed coord defect directly through the one notifying door (scripts/agent-direct-merge.sh; served policy git-operations direct-merge-with-notification, operator decision 2026-10-16), then write a remediation plan and run /vet-imp on it so coord itself gets fixed."
 argument-hint: "[repo#123 ...] [--threshold=45m] [--no-merge] [--no-remediate] [--once]"
-allowed-tools: Read, Write, Edit, Bash, PowerShell, Grep, Glob, Monitor, Skill, ToolSearch, TaskCreate, TaskUpdate
+allowed-tools: Read, Write, Edit, Bash, PowerShell, Grep, Glob, Monitor, Skill, ToolSearch, TaskCreate, TaskUpdate, Agent
 ---
 
 # Babysit PRs — shepherd session PRs to landed
@@ -327,8 +327,10 @@ When a check fails on a PR this session authored, fix it here (do not spawn).
 **Classify from the failed job's STEPS before you read anything else** — the
 first bullet below is that test, and the log is the second one, not the first.
 Only once the classification says “real” do you read the failing run log
-(**coord first** — `coord_ci_job_log_tail {repo, job_id}`; `gh run view <id> --log-failed`
-is the labelled fallback, see "Coord doors for job and log reads" below), and then
+(**coord first** — `coord_ci_job_log_tail {repo, job_id}`;
+`gh api repos/<owner>/<repo>/actions/jobs/<job_id>/logs` is the labelled fallback,
+see "Coord doors for job and log reads" below — **never** `gh run view --log-failed`,
+which on some gh builds prints nothing, exit 0, for a job that failed), and then
 only for what it sends you to fix:
 
 - **Transient infra** (rate-limit fetching a tool version, runner eviction,
@@ -494,9 +496,13 @@ only for what it sends you to fix:
   costs a full download per job; the GitHub-hosted OOM emits the **identical**
   string; and it is **blind to one of the two death shapes outright** — when the
   runner vanishes before flushing, `GET /actions/jobs/<id>/logs` **404s** and the
-  frozen step is visible ONLY in the `steps` array. So `--log-failed` returning
-  nothing useful is not evidence of a real failure; it is the signature of the
-  shape you cannot see that way.
+  frozen step is visible ONLY in the `steps` array. So an empty log read
+  decides nothing in either direction. A 404 from the jobs endpoint is the
+  vanished-runner shape (infra), and on some gh builds `gh run view --log-failed`
+  prints nothing, exit 0, for every failed job it reads (gh 2.46.0, 2026-11-15:
+  empty for all 9 failed Frontend CI runs read, while the jobs endpoint above
+  served each failed Unit-test job's log it was asked for — finding `7f3d5ae8`). The `steps` array
+  decides; read the log through the jobs endpoint.
 
   **ANY failed step means a genuine failure of that step** — Tier 1 requires
   ZERO, so the count that separates the two causes is zero-vs-nonzero. **The
@@ -548,6 +554,41 @@ only for what it sends you to fix:
   migration-bearing PRs check `alembic heads` against PR ∪ main; a conflict
   here is a REAL failure to fix now (re-parent onto the new chain tip),
   because coord's speculative CI will hit it even though the PR looks green.
+
+**Claim the PR before the first commit of every fix round** — the
+`Transient infra` re-run above changes no head and needs no claim; a `Real
+failure` fix and a stale-green re-parent do. Authorship does not keep coord's
+own fixers off a head: coord's `pr_fix` dispatch, a Merge
+Shepherd on another machine and a peer running this command all read one
+exclusion, the reserved claim `coord_adopt_pr` writes (plan
+`2026-11-18-merge-shepherd-subagents-and-cross-machine-anti-overlap` D3.3). So,
+once Step 3 has decided to change the PR and before you commit:
+
+```
+coord_adopt_pr {repo: "<owner/repo>", pr_number: <N>, head_sha: "<current head, full sha>", action: "claim"}
+```
+
+- **`claimed`** — you hold the head. Fix, commit, push, then release:
+  `{..., head_sha: "<the head you claimed>", action: "release", pushed_head: "<the FULL 40-character sha you pushed>"}`.
+  With `pushed_head`, coord holds your pushed head with an observe marker while
+  its CI runs, so no other worker picks up a head whose fix is already in CI. An
+  abbreviated sha is refused, so read it with `git rev-parse HEAD`. If the
+  release is refused because `pushed_head` is an unknown argument (a coord that
+  predates it), release again without it.
+- **`held_by`** — another worker holds this head (a coord fixer agent, or a
+  session at `session:<uuid>`, which `coord_send_message` reaches). Do not push
+  to the branch. Wait and claim again in a later round. `held_by` at tier 14 is
+  someone's pushed head whose CI is still running.
+- **`head_not_current`** — re-read the head and claim once more.
+- **`capped`** — the PR's shared attempt budget is spent. Stop fixing it and
+  report it as `blocked-legitimate` with the answer quoted.
+- **`not_visible`**, an error, or no answer at all — if every door fails to
+  carry the call (`coord-revive.sh call coord_adopt_pr '<json>'` is the
+  fallback) — UNKNOWN.
+  Make no commit to the PR this round; say so in the exit report.
+
+Release every claim you still hold before you exit, whatever the outcome
+(`action: "release"`, no `pushed_head` when nothing was pushed).
 
 ## Step 4 — Green-or-no-CI past threshold → diagnose via coord
 
@@ -1569,12 +1610,24 @@ Then:
    release it only once the same command with `--check` added prints
    `ADOPTED` naming YOUR new PR. `--check` takes no claim; `NOT_ADOPTED`
    means GitHub has not indexed your PR yet, so keep heartbeating and check
-   again. Exit 1: `ADOPTED` names an open or merged PR whose
-   `Adoption-Supersedes:` line already covers #N, so there is nothing to
-   adopt; `HELD` means another adopter holds it now, so do not start a second
+   again. Exit 1: `ADOPTED` names a PR that already adopted #N, so there is
+   nothing to adopt — an open or merged PR whose `Adoption-Supersedes:` line
+   covers #N or whose title declares `supersedes #N`, a CLOSED one whose own
+   coord card shows it landed (a coord ff-land is CLOSED on GitHub), or a
+   successor #N's card lists in `superseded_by` or `superseded_by_refused` as open, merged or landed; `HELD` means another adopter holds it now, so do not start a second
    adoption; `RENEWED` means your own session already holds it, which is
    yours only when your own earlier call for that key printed UNKNOWN. Exit 2
-   is UNKNOWN: do not adopt on it.
+   is UNKNOWN: do not adopt on it — including a CLOSED adopter whose coord card
+   could not be read, which the reason line names (read `coord_pr_status` on it).
+   **The `adopt-wip:` reservation says who adopts the work; it does not keep
+   coord's fixers off the original PR.** So before your first commit, ALSO take
+   the original PR's reserved claim, as in Step 3:
+   `coord_adopt_pr {repo, pr_number: <N>, head_sha: <its current head>, action: "claim"}`.
+   Adopt only on `claimed`. `held_by` means another worker holds that head, so
+   release your `adopt-wip:` reservation and do not adopt. Release the
+   `coord_adopt_pr` claim (no `pushed_head`, since you never push to the
+   original) once your new PR reads back, together with the `adopt-wip:` release
+   above. The two locks answer different questions, and an adoption holds both.
    The clause's bound is the original branch: never rebase it, never
    force-push it, never push to it at all. Take its content onto a fresh
    branch off current `origin/main` (cherry-pick or re-apply in a worktree —
@@ -1678,7 +1731,8 @@ an admin-merge happened — produces a plan so the defect class dies:
   no missing gate [policy:
   session-finished-at-green-not-at-merged, tightened by operator decision
   2026-10-17: checks still running no longer hold it open]. Shepherding them to merge is coord's
-  merge train, plus its `ci_rework` / `stuck_pr_nudge` dispatch [policy:
+  merge train, plus its `ci_rework` / `escalate_evidence` / `pr_blocked` /
+  `stuck_pr_nudge` dispatch [policy:
   finishing-is-a-handoff-not-an-abandonment]. That splits this command into two
   uses, and they stop at different points:
   - **Closeout of the authoring session** — the session that authored the PRs
@@ -1695,7 +1749,10 @@ an admin-merge happened — produces a plan so the defect class dies:
     landed IS its goal: Steps 2 and 4–7 apply in full. Two adjustments:
     - Step 1's auto-detection finds only branches this session owns, so pass
       the PRs as explicit pr-refs (a gate continuation carries them in its
-      args). Otherwise Step 1 finds none and exits.
+      args). Otherwise Step 1 finds none and exits. A DRAFT among PRs a gate's
+      continuation names explicitly with an ownerless-stranded hint
+      (`/dev-ops-steward`'s hand-off) is NOT a hold signal: its owner is gone,
+      so adopt it by route-around like any other.
     - Step 3 fixes only a PR this session authored. A red on someone else's
       branch goes to `/handoff-stuck-pr` while its author is live. Once the
       author is gone, adopt it per Step 6 → "Adopting a foreign branch",
@@ -1739,6 +1796,93 @@ an admin-merge happened — produces a plan so the defect class dies:
   UNKNOWN is the expected failure here, so **say which check actually ran** in the
   exit report rather than recording the dedupe as passed.
 - **Don't race coord.** An in-flight queue proposal always wins; wait.
+- **Subagents are counted by coord, and fixers stay bounded.** Every subagent
+  this command starts (a fresh-context reviewer, or a fixer) first takes a child
+  slot: `coord_child_slot {action: "acquire"}`, and spawns on `granted`.
+  Any other answer (the tool missing, unknown, unreachable or silent) is
+  settled by this rule, and nothing else:
+
+  **Resolve `coord_child_slot` before relying on any answer that is not
+  `granted` or `refused`.** "Not deployed" needs POSITIVE proof from coord
+  itself, because a coord that serves the tool also produces every other
+  symptom (a deferred tool not loaded yet, a dead native transport, a `-32601`
+  from a stale runner-proxy allowlist):
+
+  1. **Load it.** If the tool is not in your tool list, load it with
+     `ToolSearch` (`select:` its name). A tool that loads is used: call it.
+  2. **Probe coord's own door** when it does not load, or its call is
+     rejected as an unknown tool or method. This is unauthenticated and goes
+     around both the MCP client and the runner proxy. Run it afresh before
+     EVERY uncounted spawn, in this cycle; never reuse an answer from the
+     journal, an earlier cycle or an earlier report:
+
+     ```bash
+     # envelope-ok: reads only the HTTP status and a fixed-token match on coord's unknown-route 404; no envelope key is read
+     out=$(curl -sS -m 10 -w '\n%{http_code}' -X POST https://coord.qontinui.io/coord/child-slots -H 'Content-Type: application/json' -d '{}') || true
+     code=${out##*$'\n'}
+     case "$out" in *'"error":"no_such_route"'*) err=no_such_route ;; *) err=other ;; esac
+     echo "code=$code error=$err at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+     ```
+
+     - `code=404` AND `error=no_such_route` (coord's own typed answer for a
+       path it does not register) — **child slots are not deployed**. Start
+       the child uncounted, as before child slots existed, within every other
+       rule here. There is no slot to heartbeat or release for it.
+     - `code=404` with any other body (a proxy, a load balancer, a captive
+       portal) — not coord's answer, so it proves nothing: a refusal.
+     - any other HTTP code (`401`, `403`, `405`, `422`, ...) — the route
+       exists, so admission IS deployed and the tool must work. Call it through
+       `coord-revive.sh call coord_child_slot '{"action":"acquire"}'` (the
+       coord-revive skill's resolver). If that fails too, it is a refusal.
+     - `000`, an empty code, or a timeout — UNKNOWN, which is a refusal.
+  3. **Transport down** — the call is unreachable, times out, or answers
+     "Command failed with no output" — is a refusal for this cycle: start no
+     child. A reviewer waits and retries (the bounded backoff below); it never
+     reviews inline.
+
+  Whenever a child runs uncounted, record the proof in the exit report: the
+  probe's `code`, its `error` value and its UTC time, from THIS cycle's
+  probe. Whenever a transport failure refused a child, record the door and
+  the exact error.
+
+  Run every child as a
+  BACKGROUND Agent call: a foreground child blocks you, and a blocked parent
+  cannot heartbeat. Wait for children with `Monitor` on a bounded until-loop
+  with a timeout of a few minutes (well inside the slot's 600 s lapse), never a
+  foreground sleep; on each wake heartbeat every slot you hold
+  (`{action: "heartbeat", n}`) and check every child. Never end a turn only
+  waiting on a child. Release each slot (`{action: "release", n}`) as soon as its
+  child returns. An explicit `refused`, or an error from a coord that serves the
+  tool, is a REFUSAL:
+  - a **fixer** is not spawned; do that work yourself, serially;
+  - a **reviewer** whose review a gate requires (a pre-PR review, the
+    independence review an expedite or an adoption needs) is never replaced by
+    an inline self-review: inline review is legitimate only under a recorded
+    `degrade` disposition (served `verification-and-evidence`
+    `code-review-invocation-path`). Release the slot of every child that has
+    already returned (a child still running stays counted), and retry the
+    acquire with a bounded backoff, 3 tries over about 10 minutes. Still
+    refused: open no PR and request no expedite for that change, and report the
+    PR as `blocked-legitimate` with
+    `pre-PR review owed; reviewer child slot refused (held_by=<key>)`. For a
+    pre-PR review, record it through `review-arm-record.sh`: the registry read in `reads[]` as it
+    came back, with `"blocked": "pre-PR review owed; reviewer child slot refused
+    (held_by=<key>)"` added to that read row; NO `reviews[]` row, because no
+    review ran; and no arm of your own invention. When the change is an
+    adoption's NEW branch, push that branch so the work survives the worktree's
+    reclaim; never push to an open PR's head on this stop, because that push
+    would be the unreviewed change.
+
+  Step 3 fixes in-session. A dedicated shepherding session that splits red PRs
+  across fixer subagents follows the served `agent_playbook/merge-shepherd` §4
+  rule: at most 3 fixers at once and only as many as coord granted; related PRs
+  in ONE repo whose changed files do not overlap (`coord_conflict_check`); each
+  PR claimed with `coord_adopt_pr` before its child starts and released with
+  `pushed_head` after the push; at the first refused slot, claim none of the
+  batch's remaining PRs. There are no nested subagents, no child started in the
+  background and killed later, and no fan-out against one shared cause.
+  Children pass no `effort`, so they inherit yours, and they never claim or take
+  slots themselves: this session is the single claimant.
 - **Report on exit**: per-PR final state (merged-by-coord / `expedited-landed (request <id>)` / `expedite-pending (request <id>)` / `expedite-refused (<code>[, request <id>])` / `expedite-unreached (<observed>)` / **handed-to-operator**
   / admin-merged [after request <id>] / fixed-and-waiting / blocked-legitimate / operator-escalated
   / `handed-to-train (gate <id>)` for a closeout exit (Step 2), with its check

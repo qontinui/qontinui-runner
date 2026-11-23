@@ -180,7 +180,10 @@ A plan declares its state with a status block at the top:
 > **Status: SHIPPED <YYYY-MM-DD>.** <summary + commit SHAs>.
 ```
 
-or `Status: PARTIAL` / `Status: SUPERSEDED by <other-plan>` / `Status: OBSOLETE`.
+or `Status: SUPERSEDED by <other-plan>` / `Status: OBSOLETE`, or a partial /
+not-started verdict appended to a lifecycle word (`Status: VETTED <date> —
+partial: …`, `Status: DRAFT <date> — not started …`; §5 has the templates).
+The lead word is always a lifecycle word — never `PARTIAL` or `NOT STARTED`.
 
 ## Instructions
 
@@ -265,7 +268,9 @@ chain](#plan-stem-resolution-chain) below. Capture each dep's status — the
 the lifecycle word of the dep file's first body stamp (a frontmatter
 `status:` only when there is none) read by hand — one of `DRAFT`, `VETTED`,
 `IN PROGRESS`, `SHIPPED`, `PARTIAL`, `NOT STARTED`, `SUPERSEDED`,
-`OBSOLETE`. If the dep file can't be found in either
+`OBSOLETE` (`PARTIAL` / `NOT STARTED` are legacy lead words — no writer emits
+them now, but other plan directories may still carry them; a dep stamped
+`VETTED <date> — partial: …` reads as `VETTED`). If the dep file can't be found in either
 directory, record the dep as `MISSING (no plan file)` and surface it as a
 drifted-status item in the final report.
 
@@ -385,6 +390,10 @@ Based on the verification, place each plan in one of:
   and `SHIPPED — UNCONFIRMED (<claim ids>)`.
 - **PARTIAL** — some claims verified, some missing. Note which.
 - **NOT STARTED** — zero claims verified. The plan is still aspirational.
+
+  `PARTIAL` and `NOT STARTED` are verdict *names* only — neither is ever
+  stamped as the lead word of a status block. §5 appends them to a lifecycle
+  word (`VETTED` or `DRAFT`, by the `<LW>` rule there).
 - **SUPERSEDED** — the plan's body says it's superseded by another plan, OR
   the work is in main but not via the path the plan describes (a different
   approach landed). Cite the superseding artifact.
@@ -412,18 +421,39 @@ the H1:
 <rest of plan body unchanged>
 ```
 
-For PARTIAL:
+For a PARTIAL verdict:
 ```markdown
-> **Status: PARTIAL <YYYY-MM-DD>.** Phases <X>, <Y> shipped (commits <sha>,
-> <sha>). Phase <Z> open: <one-sentence reason>. <Followup ptr if any.>
+> **Status: <LW> <YYYY-MM-DD> — partial: Phase <Z> open (<one-sentence reason>); Phases <X>, <Y> shipped (commits <sha>, <sha>) (verified <YYYY-MM-DD>).** <Followup ptr if any.>
 ```
 
-For NOT STARTED:
+For a NOT STARTED verdict:
 ```markdown
-> **Status: NOT STARTED (verified <YYYY-MM-DD>).** No source-code evidence
-> of any acceptance criterion. <Why it might still be worth doing OR why it's
-> stale — one sentence either way.>
+> **Status: <LW> <YYYY-MM-DD> — not started (verified <YYYY-MM-DD>).** No
+> source-code evidence of any acceptance criterion. <Why it might still be
+> worth doing OR why it's stale — one sentence either way.>
 ```
+
+**The verdict is appended to a lifecycle word, never used as one.** `PARTIAL`
+and `NOT STARTED` are not in `plan-discipline`'s vocabulary: the runner's plan
+adapter pushes the stamp's first token to coord, where both land as
+off-vocabulary statuses. The `<LW>` (lifecycle word) rule:
+
+- **`<LW>` is `VETTED` ONLY when the stamp being replaced led with `VETTED`;
+  otherwise it is `DRAFT`.** `vetted` is an Attested status in coord, and an
+  adapter push coord refuses with a 403 retires the slug for the whole runner
+  process. The legacy `PARTIAL` / `NOT STARTED` lead words were Free, so
+  writing `VETTED` over an `IN PROGRESS`, a `SHIPPED` over-claim, a `DRAFT`, a
+  legacy `PARTIAL` or an unstamped plan would add an attested push the old
+  spelling never made. Never upgrade the lifecycle word.
+- **When `<LW>` is `VETTED`, carry the replaced block's `> Vetted-by:` …
+  `> Independence:` lines verbatim** as the last lines of the new block, after
+  any `History:` line (where `/vet-plan` §5 and `/implement-plan` Step 0.5 put
+  them; Step 0.5 reads them).
+- **Never write "in progress" in the headline.** `/vet-imp-sweep` reads any
+  `IN PROGRESS` in the headline as ownership by a live session. Say "open" or
+  "remains" instead.
+- The `IN PROGRESS` guard below is unchanged: a guarded `IN PROGRESS` is never
+  overwritten by either form.
 
 For SUPERSEDED / OBSOLETE: cite the replacement or the reason.
 
@@ -451,7 +481,7 @@ from the served `claims[]` (`coord_get_prompt_document`):
 
 An existing `SHIPPED — UNCONFIRMED (…)` stamp is rewritten to bare `SHIPPED`
 only when every named claim now reads `confirmed`; the claims alone never move
-it to `PARTIAL` or `NOT STARTED` — the code landed. The runner normalises the
+it to a partial or not-started verdict — the code landed. The runner normalises the
 qualified stamp to `shipped`; the qualifier is for the human reader.
 
 #### Single-stamp invariant — read before stamping
@@ -472,7 +502,7 @@ and the body. Before writing your stamp:
    `git -C "$TOP" fetch -q origin +refs/heads/main:refs/remotes/origin/main`
    (exit status read unpiped — a failed fetch is a STOP for this plan), then
    record `BASED_ON=$(git -C "$TOP" rev-parse -q --verify
-   "origin/main:<repo-relative path>")` for this path and read the block from
+   "refs/remotes/origin/main:<repo-relative path>")` for this path and read the block from
    `git -C "$TOP" cat-file -p "$BASED_ON"`. `$QONTINUI_PLANS_DIR` usually names
    a shared checkout that can be thousands of commits behind, and a guard run
    against its copy never sees a peer's newer `IN PROGRESS`. Make your edits on
@@ -497,7 +527,7 @@ and the body. Before writing your stamp:
 3. Then `Edit` again to insert your single new `> **Status:` block.
 4. If folding in history is useful (e.g., the plan was previously
    stamped `VETTED` and your verify pass found it still
-   `NOT STARTED`), include that in **one trailing line inside your
+   not started), include that in **one trailing line inside your
    new block**, prefixed `History:` or `Previously:`. Never as a
    sibling blockquote.
 5. **Carry the `**Area:**`, `Initiative-Item:` and `Depends-On:`
@@ -527,10 +557,11 @@ and the body. Before writing your stamp:
 
 When `/verify-plan-status` finds existing stamps that disagree with
 what you'd verify (e.g. a plan stamped `VETTED` whose acceptance
-criteria still aren't shipped), consolidate: keep the more useful
-lifecycle indicator in the heading (`Status: VETTED — implementation
-not started.` or `Status: NOT STARTED.`) and put the orthogonal
-finding in the body. Don't leave both.
+criteria still aren't shipped), consolidate: keep the lifecycle word in the heading and append the
+verdict, using the §5 template and its `<LW>` rule (`Status: VETTED
+<date> — not started (verified <date>).` when the replaced stamp led with
+`VETTED`, else `Status: DRAFT <date> — not started …`), and put the
+orthogonal finding in the body. Don't leave both.
 
 #### Lifecycle states this skill writes
 
@@ -538,16 +569,20 @@ finding in the body. Don't leave both.
 |---|---|
 | SHIPPED | every claim verified live in code, and every `## Done when` claim reads `confirmed` (or the plan took the escape / predates the section) |
 | SHIPPED — UNCONFIRMED (<claim ids>) | every claim verified live in code, but the named `## Done when` claims do not read `confirmed` |
-| PARTIAL | some phases shipped, others open |
-| NOT STARTED | zero source evidence of any claim |
+| VETTED/DRAFT — partial | some phases shipped, others open (lead word by the `<LW>` rule in §5) |
+| VETTED/DRAFT — not started | zero source evidence of any claim (lead word by the `<LW>` rule in §5) |
+| DRAFT — brainstorm | too vague to verify (## Rules) |
 | SUPERSEDED | a different approach landed; cite the replacement |
 | OBSOLETE | the work no longer applies |
 
-This skill does NOT write `DRAFT`, `VETTED`, or `IN PROGRESS` — those
-are owned by `/vet-plan` and `/implement-plan`. If `/verify-plan-status`
-discovers a plan whose existing `VETTED` stamp disagrees with reality,
-write the more accurate state (`NOT STARTED`, `PARTIAL`, `SHIPPED`) and
-capture the prior state in the History line. **`IN PROGRESS` is the one
+This skill writes `VETTED` or `DRAFT` only as the carried lifecycle word
+of a partial / not-started verdict (and `DRAFT` for a brainstorm one; the `<LW>` rule in §5) — it never
+upgrades a plan to `VETTED`, which `/vet-plan` owns — and never writes
+`IN PROGRESS`, which `/implement-plan` owns. It never writes `PARTIAL` or
+`NOT STARTED` as a lead word. If `/verify-plan-status` discovers a plan
+whose existing `VETTED` stamp disagrees with reality, write the more
+accurate state (`VETTED <date> — not started …`, `VETTED <date> —
+partial: …`, `SHIPPED`) and capture the prior state in the History line. **`IN PROGRESS` is the one
 exception: that stamp is CONDITIONALLY overwritable, never freely, and the
 next subsection governs when.**
 
@@ -576,7 +611,10 @@ the subsection after it is this skill's own disposition.
 >    IS your own current session id is a resume: refresh the date and keep the
 >    trail, never take over. A marker that is a different session id is a LIVE
 >    PEER unless you can positively verify that session died with zero work
->    products — transcript tail shows death, its worktrees clean and 0 ahead of
+>    products — transcript tail shows death (a death read on THIS device also
+>    needs `bash <workspace-root>/qontinui-claude-config/scripts/lib/claude-successor.sh <sid>`
+>    to answer 1, and a 0 or 2 is a STOP; across machines, `/vet-plan`'s "Case
+>    2 across machines" decides), its worktrees clean and 0 ahead of
 >    `origin/main`, and no PRs and no branches for the plan — **or that it
 >    delegated the plan to a hold gate whose continuation you are (the arm
 >    table's case 2b)**. Only then adopt it and append your own marker.
@@ -599,9 +637,9 @@ another command**. `/vet-plan` §5 ("`IN PROGRESS` is CONDITIONALLY
 overwritable") and `/implement-plan` Step 0.5 both treat it as a conditional
 **STOP**: a stamp whose session marker is not positively attributable to the
 reading session is a live peer, or an unattributable stamp, and both stop the
-run. Those same two commands declare `PARTIAL` and `NOT STARTED` **freely**
-overwritable — `/vet-plan` §5: "`PARTIAL` and `NOT STARTED` are fine to
-overwrite"; `/implement-plan` Step 0.5: "replace it with the IN PROGRESS
+run. Those same two commands declare the partial / not-started stamps **freely**
+overwritable — `/vet-plan` §5: "the partial / not-started forms … and the
+legacy `PARTIAL` and `NOT STARTED` are fine to overwrite"; `/implement-plan` Step 0.5: "replace it with the IN PROGRESS
 block".
 
 So a verify pass that rewrites a peer's `IN PROGRESS` to `NOT STARTED` does not
@@ -635,7 +673,7 @@ The cases map onto this skill's verbs:
 |---|---|
 | 0 — the marker **is your own** current session id | **Reachable, and not rare** — the marker names a *session*, not a command, and one session routinely runs `/implement-plan` (which stamps it) and later `/verify-plan-status`, directly or through `/pvi` or `/vet-imp`. There is no peer to protect here: **write the verified state freely**, naming the prior stamp as your own in the `History:` line. Evaluate this row FIRST — it is a positively attributed marker, so it must never fall to the unidentified default, which is defined by the absence of exactly that attribution. |
 | 1 — the work has **landed** (delivery arm 1) | The plan is closed in substance. Write **`SHIPPED`** — a state this skill owns — when your own evidence scan agrees. If it does **not** agree, that disagreement IS the finding (coord's delivery read says landed and your evidence scan does not; on the operator door, a `delivery:` drift subclass): report it and leave the block alone. Never resolve it by writing `NOT STARTED` or `PARTIAL` over the marker. **Deliberate divergence, do not "restore consistency":** `/vet-plan` case 1 says *refuse and route to closeout* because `/vet-plan` writes only `VETTED`. Writing `SHIPPED` here IS that closeout — §5's own closeout paragraph assigns the plan-file terminal status to whoever can write it ("always yours to write"), and `SHIPPED` is this skill's state. Flipping this row to "refuse" would delete the only path by which a landed plan ever gets closed. |
-| 2 — the stamping session is **dead with zero work products** (its transcript tail shows death, **and** its worktrees are clean and 0 ahead of `origin/main`, **and** no PRs and no branches exist for the plan) | Free to write the verified state. Name both the prior marker and the death evidence in the `History:` line. |
+| 2 — the stamping session is **dead with zero work products** (its transcript tail shows death, **and**, for a death read on this device, no live successor carries its id — `/vet-plan`'s successor void rule: `claude-successor.sh <sid>` answers 1, and a 0 or 2 is case 3 — **and** its worktrees are clean and 0 ahead of `origin/main`, **and** no PRs and no branches exist for the plan) | Free to write the verified state. Name both the prior marker and the death evidence in the `History:` line. |
 | 2b — **gate-delegated**: you are the cleared continuation of the hold gate G that the block's last `Held behind gate <full gate_id> (<predicate>; anchor <work_unit_id>)` line names (every `/vet-plan` case-2b conjunct read; the `anchor` token is parsed from the right) | Free to write the verified state. Name G and the prior marker, REPLACING the `Held behind gate` line with `History: adopted from <prior session id> via consumed hold <G full id>` — never keep it. |
 | 3 — a **live peer** (marker ≠ yours and neither case 2's nor case 2b's checks hold) | **Do not overwrite.** Leave `IN PROGRESS` standing and report the plan as *in flight — not verifiable this pass*. |
 | — **unidentified default**: no marker at all, or one you cannot positively attribute | **Do not overwrite**, exactly as case 3. An absent marker cannot reach case 2, because case 2's probes are keyed on a session id and there is none to probe. |
@@ -717,7 +755,9 @@ unexitable-looking guard is exactly the condition under which
 [[feedback_plan_already_stamped_by_other_session_is_live_peer]] was talked
 past, at the cost of a full wasted implementation (PR #479 against PR #468).
 
-`DRAFT`, `VETTED`, `PARTIAL` and `NOT STARTED` get none of this treatment —
+`DRAFT`, `VETTED` (including the `VETTED/DRAFT <date> — partial` / `— not
+started` forms this skill writes) and the legacy `PARTIAL` / `NOT STARTED`
+lead words get none of this treatment —
 nothing downstream reads them as a peer-liveness signal. This subsection is
 scoped to `IN PROGRESS` alone.
 
@@ -879,9 +919,12 @@ status" item in the report so the user can correct it.
   **And never `mv`/`git mv` a plan file at all** — plans are stamped in place
   (§6); there is no in-progress → completed migration.
 - **Don't touch in-progress plans you can't verify.** If a plan's claims are
-  too vague to check (e.g. a brainstorm doc), stamp it `Status: BRAINSTORM
-  (verified <date>) — no concrete acceptance criteria; not actionable as-is`
-  and leave it where it is.
+  too vague to check (e.g. a brainstorm doc), stamp it `> **Status: DRAFT
+  <YYYY-MM-DD> — brainstorm (verified <YYYY-MM-DD>): no concrete acceptance
+  criteria; not actionable as-is.**` and leave it where it is. The lead word is
+  `DRAFT`, never `BRAINSTORM` (off-vocabulary, rejected by the plan-status
+  contract gate), and it is always `DRAFT` — a plan too vague to verify is not
+  carried as `VETTED`.
 
 ## Implementation Notes
 

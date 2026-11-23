@@ -259,15 +259,18 @@ pub async fn send_user_message(
     // loop) is what lets an idle session age to `stale` so the inject trigger
     // can fire (P0.2). Best-effort + no-op when the session isn't registered.
     ai_coord_registrar.heartbeat_on_interaction(&task_run_id);
-    // Session-progress reporting — the same operator-interaction boundary is the
-    // work-activity signal that advances `coord.sessions.last_progress_at` (the
-    // producer the session-stall watcher was starved of). Orthogonal to the
-    // liveness heartbeat above; same best-effort/no-op-when-unregistered posture.
-    ai_coord_registrar.progress_on_interaction(&task_run_id);
 
     let session = session_manager
         .get(&task_run_id)
         .ok_or_else(|| format!("No active session found for task_run_id: {}", task_run_id))?;
+    // Session-progress reporting — the same operator-interaction boundary is the
+    // work-activity signal that advances `coord.sessions.last_progress_at` (the
+    // producer the session-stall watcher was starved of). Orthogonal to the
+    // liveness heartbeat above; same best-effort/no-op-when-unregistered posture.
+    // After the lookup: an interaction revives a finished session (it clears
+    // the local finished mark before its `working` report), so it happens only
+    // for a message that actually reaches a live session.
+    ai_coord_registrar.progress_on_interaction(&task_run_id);
 
     // Emit the user's message as an ai-output event so it appears in the conversation.
     // We emit directly (not via emit_ai_output) so we can include task_run_id

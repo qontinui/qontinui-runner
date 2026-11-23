@@ -61,9 +61,10 @@
 //!
 //! While an install runs, the updater holds an in-process flag
 //! ([`wait_if_updating`]). Headless spawns through
-//! `claude_cli_spawn::spawn_tokio_with_retry` wait it out. PTY panes and the
-//! `--resume` respawn seam do not wait yet, and neither does a secondary runner
-//! on the same box (the flag is in-process).
+//! `claude_cli_spawn::spawn_tokio_with_retry` and the `--resume` respawn seam
+//! (`claude_cli_spawn::resolve_resume_claude_bin`: account migration, the resume
+//! door, the respawn receiver) wait it out. Fresh PTY panes do not wait yet, and
+//! neither does a secondary runner on the same box (the flag is in-process).
 //!
 //! # Scope
 //!
@@ -115,7 +116,7 @@ const NPM_VIEW_TIMEOUT: Duration = Duration::from_secs(60);
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 // =============================================================================
-// The in-progress flag (the public API for the resume seam)
+// The in-progress flag (the public API for the spawn paths)
 // =============================================================================
 
 /// An in-process "a CLI install is running" flag over a `tokio::sync::watch`.
@@ -133,6 +134,9 @@ impl UpdateFlag {
         }
     }
 
+    /// Test-only: production code waits on the flag ([`wait_if_updating`]),
+    /// it never polls it.
+    #[cfg(test)]
     fn is_updating(&self) -> bool {
         *self.tx.borrow()
     }
@@ -193,16 +197,6 @@ pub enum UpdateWait {
     /// An install was still running when the timeout ran out. The caller should
     /// go ahead and rely on its own retry budget.
     TimedOut(Duration),
-}
-
-/// `true` while the runner-owned updater is running `npm install`.
-pub fn update_in_progress() -> bool {
-    global_flag().is_updating()
-}
-
-/// A receiver for the in-progress flag. It reads `true` while an install runs.
-pub fn subscribe_update_in_progress() -> watch::Receiver<bool> {
-    global_flag().subscribe()
 }
 
 /// Wait, at most `timeout`, for a running CLI install to finish. Returns at once

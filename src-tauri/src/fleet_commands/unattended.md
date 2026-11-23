@@ -48,12 +48,70 @@ run. Each line gives a document's `current_version`. Then decide, per document:
   again returns the same text, so it adds nothing. There are two ways to hold a
   body:
   - an earlier fetch by this session (`coord_get_prompt_document`, `/policy
-    get`, or the HTTP door), at the same version the listing shows now;
+    get`, or the HTTP door), at the same version the listing shows now.
+
+    The fetch must also have been made for the same tenant as this run's
+    listing. Doors can act for different tenants. A sibling `.mcp.json` nonce
+    on the loopback rung, the bootstrap credential, or a hand HTTP fetch on
+    another JWT can each serve another tenant's document at the same version
+    number. So call `coord_query_identity` over the door, and with the
+    credential, that carried the fetch. Call it again over the door that
+    carried this run's listing. Either call may be made in the same turn as
+    the fetch or the listing, or now. Each answer's TOP-LEVEL `tenant_id`
+    counts, never an entry of `device_tenant_bindings.tenant_ids[]`. The fetch
+    establishes held only when the two uuids are equal, compared
+    case-insensitively. It cannot establish held when:
+    - either door cannot answer `coord_query_identity` with that same
+      credential (including a door that no longer answers), or answers it
+      with a null top-level `tenant_id`. This covers the hand-written HTTP
+      routes and the file mirrors: the mirrors carry no tenant at all;
+    - the two uuids differ (the body is ANOTHER tenant's document, whatever
+      its version says);
+    - either answer carries a `TENANT MISMATCH:` or `TENANT UNVERIFIED:`
+      notice. The runner's coord-mcp proxy adds these to `coord_query_identity`
+      answers when the answering tenant is not the tenant of the repo the
+      session was spawned in (or the tenant named at spawn), or when it could
+      not tell.
+
+    A notice refuses held; its absence proves nothing. Only a call that passed
+    through the runner's coord-mcp proxy can carry one, and many calls do not.
+    The generic remote `/mcp` door never does. A stdio `coord-mcp-shim.py`
+    entry can fall through to it per call, and says so only in `_meta`, which
+    the model does not see. A runner build without `coord_mcp_tenant.rs` emits
+    none at all. So when no notice appears, the uuid equality alone decides.
   - a body the runner injected at spawn or resume, under a header naming the
     document and version (the `===== policy/<name> (v<N>) =====` block). In
     practice this covers `session-protocol`. Compare the header's version with
     this run's listing: on resume the runner can re-send an older block, and a
     header that does not carry a `v<N>` version cannot establish held.
+
+    Compare the block's TENANT too. A runner carrying plan
+    `2026-11-13-runner-policy-injection-uses-the-device-default-tenant-not-the-sessions`
+    puts a `[tenant: <slug> <uuid>]` line directly under that header; the
+    word before the closing `]` is the uuid of the tenant the block was read
+    for (the slug may be the two words `slug unknown`). The block establishes
+    held only when this run's `/policy list` was carried by `/policy` Step 1
+    (this session's native coord-mcp tools) AND that uuid equals, compared
+    case-insensitively, the TOP-LEVEL `tenant_id` that `coord_query_identity`
+    returns over those same native tools (never an entry of
+    `device_tenant_bindings.tenant_ids[]`, which lists every tenant the
+    device is bound to). It cannot establish held when:
+    - this run's listing came over any other rung of `/policy`: those carry
+      another credential or file, or no tenant at all, so they do not show
+      which tenant this session's own coord-mcp reads;
+    - the acting tenant could not be read (no answer, or a null top-level
+      `tenant_id`);
+    - the tenant line has no uuid before its `]`, or names a different uuid
+      (the block is ANOTHER tenant's document, whatever its version says);
+    - the block has no tenant line at all. A runner without that plan fills
+      the block from its own credential's tenant, and this rule does not try
+      to reconstruct which tenant that was; fetch the body instead;
+    - that `coord_query_identity` answer carries a `TENANT MISMATCH:` or
+      `TENANT UNVERIFIED:` notice. Even when the uuids match, that notice means
+      the acting tenant is not the tenant of the repo the session was spawned
+      in (or the tenant named at spawn), or the proxy could not tell. As in
+      the earlier-fetch arm, the notice's absence proves nothing, and the uuid
+      comparison above still decides.
 
   A served version number is treated as naming fixed content: an edit to a
   document's body bumps its version. "Held" needs a pointer, which the Step 4
@@ -756,16 +814,46 @@ mechanically rather than by judgement:
 
 - **a subagent's live work is excluded**, because its parent is alive. Measured:
   the build above sits under a live shell, and the harness parents both
-  tool-call shells and `run_in_background` shells **directly to the long-lived
-  `claude`**, so a wanted background job stays a non-orphan for the life of the
-  session. The one shape that does reach `PPid: 1` while still wanted is a
-  process the session *deliberately* detached (`setsid`/`nohup` from a shell
-  that then exited) — which is what the staleness proof below is for.
+  tool-call shells and `run_in_background` shells to a process that lives as
+  long as the shell does — the long-lived `claude` on Linux, Git's native
+  `bash.exe` launcher on Windows — so a wanted background job stays a
+  non-orphan for the life of the session. On Linux, the one shape that does
+  reach `PPid: 1` while still wanted is a process the session *deliberately*
+  detached (`setsid`/`nohup` from a shell that then exited) — which is what the
+  staleness proof below is for. On MSYS every native-parented process reads
+  `PPid: 1`, wanted or not; the paragraph after this list covers that.
 - **this step's own pipeline is excluded.** A `tee` or `head` in the same
   pipeline is a *sibling* of the shell running the step, not an ancestor, so an
   ancestor-exclusion list does not cover it — and the step nominates `tee` as a
   staleness example, so it could otherwise kill the process capturing its own
-  output.
+  output. Ancestors are a different matter, and that list covers them: the
+  fence walks `PPid:` up from `$$` (at most 32 links) and skips every pid on
+  the chain, including the first that reads `PPid: 1`. On MSYS that link is the
+  tool-call wrapper, which a fence run as `bash <file>` would otherwise list as
+  a candidate; on Linux it is an ancestor above `claude`, such as the tmux
+  server or `systemd --user`.
+
+⚠️ **On Windows Git Bash (MSYS), `PPid: 1` means "no live MSYS parent", not
+"abandoned".** `/proc/<pid>/status` reports it for an MSYS process whose parent
+is a native Windows process and for one whose MSYS parent died; the two read
+identically. Every harness tool-call shell (native chain `claude.exe` → Git's
+`bin\bash.exe` launcher → `usr\bin\bash.exe`), hook-dispatch shell,
+claim-heartbeat loop and `python.exe`-started build wrapper is therefore a
+`PPid: 1` "orphan" while it is live. Measured 2026-11-13 on one box: of the
+`PPid: 1` MSYS processes, 22 had a live `bash.exe` launcher parent, 3 a live
+`python.exe` parent (one a `cargo-verify.sh test` wrapper) and 14 had no parent
+left; and this step's enumeration, run verbatim, listed the live shell running
+it as a `candidate`. Neither safety property above holds there on the `PPid:`
+gate alone. So when `/proc/$$/winpid` exists the fence takes ONE
+`Win32_Process` snapshot before its loop, and a `PPid: 1` process is an orphan
+only when the native parent of its `/proc/<pid>/winpid` is absent from that
+snapshot or was created after it (a recycled pid). A live native parent counts
+under `not_orphan`, and so does a present parent when Windows reports no
+creation time for either the parent or the child: an unknown age cannot prove
+a recycled pid. That native-parent gate is what restores the two properties on
+MSYS. A snapshot that cannot be taken or parsed ends the step
+`PROCESS REAP UNKNOWN`, signalling nothing, and the collateral line names the
+gate that ran (`orphan_gate=ppid` or `orphan_gate=native-parent`).
 
 An orphan is a **candidate**, not a target. It is reaped only on a positive
 staleness proof:
@@ -806,6 +894,12 @@ The first two are served policy `production-and-cost` `runner-lifecycle`.
 - **Never the Python side** — `python`, `python3`, `poetry`, `uvicorn`. The
   runner drives a Python subprocess, and 214 `python3` orphans were measured
   here in one pass.
+- **Never a claim-heartbeat loop** — `coord-claim-heartbeat.sh __loop` is
+  detached by design, so it passes the orphan gate once the shell that started
+  it exits (measured on MSYS), and it owns its own lifecycle (`stop`,
+  `OWNER_GONE`). Its image is `bash`, so the
+  fence matches it by command line. Measured 2026-11-13: a same-shell run of
+  this step listed the session's own live loop as a `candidate`.
 
 ⚠️ **Test BOTH `/proc/<pid>/exe` and `/proc/<pid>/comm`, matching if either
 hits.** Neither alone is sufficient. `comm` is the settable thread name (default
@@ -858,8 +952,9 @@ helpers twice during authoring.
 #### Enumerate
 
 ```bash
-# Helpers take their argument in PID_IN and answer in *_OUT. No positional
-# parameters: a dollar-digit in this fence is a harness argument (see above).
+# Helpers take their argument in PID_IN (WINPID_IN for the native snapshot)
+# and answer in *_OUT. No positional parameters: a dollar-digit in this fence
+# is a harness argument (see above).
 read_ppid()  { PPID_OUT=$(sed -n 's/^PPid:[[:space:]]*//p' "/proc/$PID_IN/status" 2>/dev/null); }
 read_start() { START_OUT=$(sed -e 's/^.*) //' "/proc/$PID_IN/stat" 2>/dev/null | cut -d' ' -f20)
                case $START_OUT in ''|*[!0-9]*) START_OUT="" ;; esac; }
@@ -868,6 +963,9 @@ read_img()   { IMG_EXE=$(readlink "/proc/$PID_IN/exe" 2>/dev/null); IMG_EXE=${IM
                IMG_COMM=$(cat "/proc/$PID_IN/comm" 2>/dev/null); }
 read_sid()   { SID_OUT=$( { tr '\0' '\n' <"/proc/$PID_IN/environ"; } 2>/dev/null \
                  | sed -n 's/^CLAUDE_CODE_SESSION_ID=//p' | head -1); }
+read_winpid() { WINPID_OUT=$(cat "/proc/$PID_IN/winpid" 2>/dev/null)
+                case $WINPID_OUT in ''|*[!0-9]*) WINPID_OUT="" ;; esac; }
+read_win()   { WIN_PPID_OUT=${WIN_PPID[$WINPID_IN]:-}; WIN_BORN_OUT=${WIN_BORN[$WINPID_IN]:-}; }
 
 SID="${CLAUDE_CODE_SESSION_ID:-${CLAUDE_SESSION_ID:-}}"
 [ -d /proc ] || { echo 'PROCESS REAP UNKNOWN - no /proc on this box'; return 2>/dev/null || exit 0; }
@@ -875,10 +973,52 @@ SID="${CLAUDE_CODE_SESSION_ID:-${CLAUDE_SESSION_ID:-}}"
 PID_IN=$$; read_start; MY_START=$START_OUT
 [ -n "$MY_START" ] || { echo 'PROCESS REAP UNKNOWN - could not read this shell starttime'; return 2>/dev/null || exit 0; }
 
+# This invocation's own ancestry: $$ and each parent up to and INCLUDING the
+# first whose PPid reads 1 -- on MSYS the tool-call wrapper a `bash <file>`
+# run would otherwise list, on Linux an ancestor above `claude` (tmux server,
+# `systemd --user`). Bounded, and it stops on an unreadable link.
+SELF_CHAIN=""; PID_IN=$$; walk=0
+while [ "$walk" -lt 32 ]; do
+  walk=$((walk+1)); SELF_CHAIN="$SELF_CHAIN $PID_IN"
+  read_ppid
+  case $PPID_OUT in ''|*[!0-9]*|0|1) break ;; esac
+  PID_IN=$PPID_OUT
+done
+
+# On MSYS `PPid: 1` means "no live MSYS parent", not "abandoned" (see above),
+# so the orphan gate needs the NATIVE parent: ONE Win32_Process snapshot of
+# pid, parent pid and UTC creation time (0 when Windows reports none), taken
+# before the loop. Bounded: a wedged WMI must not wedge the closeout, and a
+# timeout is UNKNOWN like any other failure.
+ORPHAN_GATE=ppid
+if [ -r "/proc/$$/winpid" ]; then
+  ORPHAN_GATE=native-parent
+  WIN_SNAP=$(timeout -k 5 60 powershell.exe -NoProfile -NonInteractive -Command 'Get-CimInstance -ClassName Win32_Process -Property ProcessId,ParentProcessId,CreationDate | ForEach-Object { $b = if ($_.CreationDate) { $_.CreationDate.ToUniversalTime().ToString("yyyyMMddHHmmssfff") } else { "0" }; "{0} {1} {2}" -f $_.ProcessId, $_.ParentProcessId, $b }' 2>/dev/null) \
+    || { echo 'PROCESS REAP UNKNOWN - orphan gate unresolvable on MSYS (snapshot failed)'; return 2>/dev/null || exit 0; }
+  unset WIN_PPID WIN_BORN; declare -A WIN_PPID WIN_BORN; n_bad=0
+  while read -r w_pid w_ppid w_born w_extra; do
+    w_pid=${w_pid%$'\r'}; w_ppid=${w_ppid%$'\r'}; w_born=${w_born%$'\r'}; w_extra=${w_extra%$'\r'}
+    [ -n "$w_pid$w_ppid$w_born$w_extra" ] || continue
+    case $w_pid in ''|*[!0-9]*) n_bad=$((n_bad+1)); continue ;; esac
+    case $w_ppid in ''|*[!0-9]*) n_bad=$((n_bad+1)); continue ;; esac
+    case $w_born in ''|*[!0-9]*) n_bad=$((n_bad+1)); continue ;; esac
+    [ -z "$w_extra" ] || { n_bad=$((n_bad+1)); continue; }
+    WIN_PPID[$w_pid]=$w_ppid; WIN_BORN[$w_pid]=$w_born
+  done <<< "$WIN_SNAP"
+  # A dropped row would make its children read "native parent gone", which
+  # fails toward a candidate: one unparseable row fails the whole snapshot.
+  [ "$n_bad" = 0 ] || { echo "PROCESS REAP UNKNOWN - orphan gate unresolvable on MSYS ($n_bad unparseable snapshot rows)"; return 2>/dev/null || exit 0; }
+  # This shell is alive, so a snapshot that does not hold it (empty, another
+  # box's table) cannot vouch for anyone's parent.
+  PID_IN=$$; read_winpid; WINPID_IN=$WINPID_OUT; WIN_PPID_OUT=""
+  [ -n "$WINPID_IN" ] && read_win
+  [ -n "$WIN_PPID_OUT" ] || { echo 'PROCESS REAP UNKNOWN - orphan gate unresolvable on MSYS (snapshot does not hold this shell)'; return 2>/dev/null || exit 0; }
+fi
+
 n_fence=0; n_unreadable=0; n_not_orphan=0; n_other_session=0; n_cand=0; n_unclaimed=0
 for d in /proc/[0-9]*; do
   pid=${d#/proc/}
-  [ "$pid" = "$$" ] && continue
+  case " $SELF_CHAIN " in *" $pid "*) continue ;; esac
   # Not readable by us. `-O` is euid-AND-dumpable, so it also excludes a
   # privilege-changing exec of ours; it over-excludes, which is the safe
   # direction, and such a process is counted here rather than claimed.
@@ -900,9 +1040,28 @@ for d in /proc/[0-9]*; do
     node*|claude*|pwsh*|powershell*|qontinui-*|cargo*|rustc*|tmux*|systemd*|python*|poetry*|uvicorn*)
       n_fence=$((n_fence+1)); continue ;;
   esac
+  # A claim-heartbeat loop is detached by design and owns its own lifecycle.
+  case $cl in *coord-claim-heartbeat.sh*) n_fence=$((n_fence+1)); continue ;; esac
   # ONLY an orphan is reapable. This is the gate, not a heuristic.
   PID_IN=$pid; read_ppid
   [ "$PPID_OUT" = 1 ] || { n_not_orphan=$((n_not_orphan+1)); continue; }
+  # On MSYS that says only "no live MSYS parent": an orphan is one whose
+  # NATIVE parent is gone, or was created after it (a recycled pid).
+  if [ "$ORPHAN_GATE" = native-parent ]; then
+    PID_IN=$pid; read_winpid; WINPID_IN=$WINPID_OUT
+    [ -n "$WINPID_IN" ] || { n_unreadable=$((n_unreadable+1)); continue; }
+    read_win
+    [ -n "$WIN_PPID_OUT" ] || { n_unreadable=$((n_unreadable+1)); continue; }   # not in the snapshot
+    CHILD_BORN=$WIN_BORN_OUT; WINPID_IN=$WIN_PPID_OUT; read_win
+    # A present native parent is live unless it is provably younger than the
+    # child (a recycled pid). An unknown age (0) proves nothing, so it counts
+    # as live: the safe direction.
+    if [ -n "$WIN_BORN_OUT" ]; then
+      if [ "$CHILD_BORN" = 0 ] || [ "$WIN_BORN_OUT" = 0 ] || [ "$WIN_BORN_OUT" -le "$CHILD_BORN" ]; then
+        n_not_orphan=$((n_not_orphan+1)); continue
+      fi
+    fi
+  fi
   PID_IN=$pid; read_start
   [ -n "$START_OUT" ] || { n_unreadable=$((n_unreadable+1)); continue; }
   # Started at or after this shell: it belongs to THIS invocation, not a past
@@ -917,8 +1076,8 @@ for d in /proc/[0-9]*; do
     n_other_session=$((n_other_session+1))
   fi
 done
-printf 'collateral\tfence=%s\tunreadable=%s\tnot_orphan=%s\tother_session=%s\tunclaimed=%s\tcandidates=%s\n' \
-  "$n_fence" "$n_unreadable" "$n_not_orphan" "$n_other_session" "$n_unclaimed" "$n_cand"
+printf 'collateral\tfence=%s\tunreadable=%s\tnot_orphan=%s\tother_session=%s\tunclaimed=%s\tcandidates=%s\torphan_gate=%s\n' \
+  "$n_fence" "$n_unreadable" "$n_not_orphan" "$n_other_session" "$n_unclaimed" "$n_cand" "$ORPHAN_GATE"
 ```
 
 An `unclaimed` row is an orphan this step could not attribute — reported, never
@@ -1014,8 +1173,9 @@ with the verdict token the fences printed. Report it under Step 4's
 **Process reap (Step 1c)** item:
 
 - `PROCESS REAP UNKNOWN — <reason>`, when the enumeration could not run (no
-  `/proc`, no session id, no readable starttime for this shell) or any kill
-  returned the `UNKNOWN` token;
+  `/proc`, no session id, no readable starttime for this shell, or on MSYS no
+  usable native process snapshot for the orphan gate) or any kill returned the
+  `UNKNOWN` token;
 - else `STALE PROCESSES LEFT — <present> of <proven_stale>`, when something
   proven stale was still `PRESENT` after its signal;
 - else `REAPED <killed> of <candidates> candidates — <retained> retained,
@@ -1026,9 +1186,14 @@ with the verdict token the fences printed. Report it under Step 4's
 
 Every headline carries the **collateral check** the enumeration prints:
 `fence`, `unreadable`, `not_orphan`, `other_session` and `unclaimed`, measured in
-this run. Note what `unreadable` is and is not — on these boxes **peer sessions
-run as the same Unix user**, so it counts processes this step could not read
+this run, plus `orphan_gate`, the orphan gate those counts were taken under
+(`ppid`, or `native-parent` on MSYS). Note what `unreadable` is and is not — on
+these boxes **peer sessions run as the same Unix user**, so it counts processes
+this step could not read
 (kernel threads, daemons, privilege-changing execs), *not* other tenants' work.
+Under `orphan_gate=native-parent` it also counts a `PPid: 1` process whose
+native parent could not be resolved: one with no readable `winpid`, or one
+absent from the snapshot because it started after the snapshot was taken.
 That is what makes the claim auditable rather than reassuring: a reap that
 reports only what it killed cannot be told from one that killed too much.
 Process populations on a shared box move by the minute, so a count carried over
@@ -2827,8 +2992,19 @@ verdict:
 Each `<s>` is one of the Step 0 states:
 
 - `<v> fetched`;
-- `<v> held (<where>)`, where `<where>` points to the earlier fetch (the tool
-  call and roughly when) or names `runner-injected`;
+- `<v> held (<where>)`, where `<where>` is one of two pointers:
+  - for an earlier fetch, the tool call and roughly when, then
+    `fetch tenant <uuid> over <door> = listing tenant <uuid> over <door>, no tenant notice`;
+  - for a runner-injected block,
+    `runner-injected (tenant <uuid> = acting tenant <uuid>, listing over /policy Step 1, no tenant notice)`.
+
+  `no tenant notice` records only what was seen: no `TENANT MISMATCH:` or
+  `TENANT UNVERIFIED:` block appeared in any identity answer the pointer rests
+  on. It is not a
+  claim that a proxy checked (Step 0 says why its absence proves nothing).
+  A pointer that is missing either the two EQUAL uuids or `no tenant notice`
+  is not held: write `NOT READ`. Neither is a `runner-injected` pointer that
+  does not show a listing over `/policy` Step 1;
 - `NOT READ`.
 
 `<v>` is always the `current_version` from this run's listing.
@@ -2919,7 +3095,11 @@ Then:
    indistinguishable in a background listing, which is the whole reason that
    step exists. For each process it killed, say whether a verdict was
    transferred out of the artifact first or whether the unit it carried went
-   back to the classification table as UNKNOWN.
+   back to the classification table as UNKNOWN. On MSYS (Windows Git Bash) a
+   collateral line without `orphan_gate=native-parent` came from a fence whose
+   orphan gate admits every native-parented MSYS process — each reads
+   `PPid: 1` there — so its candidate set is not an abandoned set; say so
+   rather than reporting those candidates as orphans.
 
 ### Honesty rules for the report
 
@@ -3190,6 +3370,31 @@ for wording that says work remains or asks the operator to act ("next step"
 among it, and either spelling in the policy footer), and a note is made of
 that wording on purpose.
 
+**Then re-tag the subproject's topics.** Follow `/finish-session` Part A step
+4's "Then re-tag the subproject's topics" paragraph over the same door: read
+the current topics, confirm or add through `coord_subproject_update
+{"topics": [...]}` (ADD only, slugs from this session's `coord_declare_intent`
+`topic_suggestions` first), remove a wrong one through `coord_topic_member
+{"action": "remove", ...}`, record each kept topic's one-line contribution as
+its `note`, and read the membership back. The recipe and its outcome lines
+live there, once. The contribution line projects Step 1's classification
+(what LANDED or is WATCHED for that topic), not a second judgement. The
+subagent rule above covers it: in a subagent, re-tag nothing. Best-effort and
+never blocking, like the note. Add that paragraph's `topics re-tag:` line to
+the Step 4 report, after the subproject note:
+
+> **Topics re-tag:** `<n>` confirmed/added, `<m>` removed — read back.
+
+or, when it did not land, `/finish-session`'s `UNKNOWN (<code>)` or
+`NOT written: <code>` form of that line. In a subagent, where nothing is
+written, render instead:
+
+> **Topics re-tag — OWED BY THE PARENT.** This `/unattended` ran in a
+> subagent context; the parent's own `/unattended` re-tags the topics.
+
+A subagent's skipped re-tag is neither `UNKNOWN` nor `NOT written`: nothing was
+attempted, and the row says who owes it.
+
 ---
 
 ## Step 5 — record the session as finished
@@ -3321,9 +3526,11 @@ never recorded as finished.
 > `2026-09-04-closeout-commands-have-no-subagent-arm-and-finish-their-parent`.
 
 A plan reserve this session still holds is released by the closeout that took
-it, through `scripts/plan-reserve-release.sh release`, which withdraws the plan's
-`implement→ship safety net` first (at most about 90 s); never by a hand-rolled
-`/claims/release`.
+it, through `scripts/plan-reserve-release.sh release --repo <owner/name>`, which
+withdraws the plan's `implement→ship safety net` first, under the tenant proven
+to own the repo (at most about 90 s); never by a hand-rolled `/claims/release`.
+Exit 7 `RELEASE_WITHHELD` released nothing: the net it names is still armed, so
+fix the cause and release again before finishing (`/implement-plan` Step 0.48).
 
 Run **`/finish-session`** with a reason naming the audit result, e.g.
 `--reason "unattended: 7 units, all landed"`, and enter it at **Part A** —

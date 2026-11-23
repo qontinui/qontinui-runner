@@ -46,12 +46,14 @@ pub(crate) mod access;
 pub(crate) mod events;
 pub(crate) mod identity;
 pub(crate) mod services;
+pub(crate) mod services_bound;
 pub(crate) mod wsl_guest;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 use serde::Serialize;
 use tracing::{debug, info, warn};
 
@@ -232,9 +234,17 @@ pub(crate) fn guest_observed(g: &wsl_guest::GuestProbe, parent: &str) -> Observe
             ServiceScan {
                 units: Some(units),
                 complete_kinds: if g.inventory_complete() && g.runner_active != Some(true) {
-                    vec![services::KIND_GH_ACTIONS_RUNNER]
+                    services::GUEST_COMPLETABLE_KINDS.to_vec()
                 } else {
                     Vec::new()
+                },
+                // While a runner reports from inside the guest, the host's
+                // probe is not the inventory's authority and can complete
+                // nothing: no kind may be held over waiting for it.
+                completable_kinds: if g.runner_active == Some(true) {
+                    &[]
+                } else {
+                    services::GUEST_COMPLETABLE_KINDS
                 },
             }
         } else {
@@ -526,10 +536,9 @@ fn too_long(v: &Option<String>) -> bool {
 /// lost rows leave `services_complete_kinds` — a truncated kind claimed
 /// complete would make coord delete the stored rows it omits, while a kind
 /// sent whole keeps its deletions. The cut rows are absent from `last_sent`,
-/// so the next delta carries them. Returns how many services the cap deferred. Timestamps are NOT
-/// checked here: coord is the authority on "now" and clamps a future
+/// so the next delta carries them. Timestamps are NOT checked here: coord is the authority on "now" and clamps a future
 /// timestamp itself (contract amendment A3). PURE.
-pub(crate) fn presanitize(c: &mut ComputerReport) -> usize {
+pub(crate) fn presanitize(c: &mut ComputerReport) {
     for f in [
         &mut c.hostname,
         &mut c.os,
@@ -542,31 +551,11 @@ pub(crate) fn presanitize(c: &mut ComputerReport) -> usize {
             *f = None;
         }
     }
-    let mut over_cap = 0;
     if let Some(rows) = c.services.as_mut() {
-        rows.retain(|r| r.unit.chars().count() <= MAX_UNIT_LEN);
-        if rows.len() > MAX_SERVICES_PER_COMPUTER {
-            over_cap = rows.len() - MAX_SERVICES_PER_COMPUTER;
-            let mut per_kind: BTreeMap<&'static str, usize> = BTreeMap::new();
-            for r in rows.iter() {
-                *per_kind
-                    .entry(services::classify_unit(&r.unit))
-                    .or_default() += 1;
-            }
-            // Largest kind last (ties: the later name), so the cut lands on it.
-            let largest = per_kind
-                .iter()
-                .max_by_key(|(k, n)| (**n, **k))
-                .map(|(k, _)| *k);
-            rows.sort_by_key(|r| Some(services::classify_unit(&r.unit)) == largest);
-            let cut: std::collections::BTreeSet<&'static str> = rows[MAX_SERVICES_PER_COMPUTER..]
-                .iter()
-                .map(|r| services::classify_unit(&r.unit))
-                .collect();
-            rows.truncate(MAX_SERVICES_PER_COMPUTER);
-            c.services_complete_kinds
-                .retain(|k| !cut.contains(k.as_str()));
-        }
+        rows.retain(services_bound::sendable);
+        let cut = services_bound::cut_to_bound(rows);
+        c.services_complete_kinds
+            .retain(|k| !cut.contains(k.as_str()));
         for r in rows.iter_mut() {
             for f in [
                 &mut r.active_state,
@@ -583,7 +572,6 @@ pub(crate) fn presanitize(c: &mut ComputerReport) -> usize {
             }
         }
     }
-    over_cap
 }
 
 /// The fallback after a 422 that named no event: the same report with the
@@ -691,6 +679,11 @@ pub(crate) fn expired_marker_for(
     })
 }
 
+/// The first 12 characters of an identity hash, for a log line. PURE.
+fn short_id(id: &str) -> &str {
+    id.get(..12).unwrap_or(id)
+}
+
 /// The per-process reporter, owned by the sampler loop's closure.
 pub(crate) struct Reporter {
     state: Option<ObserverState>,
@@ -721,8 +714,8 @@ pub(crate) struct Reporter {
     parent_unresolved_logged: bool,
     /// The last `unknown_fields` set logged — a CHANGED set is logged again.
     last_unknown_fields: Vec<String>,
-    /// Warned once that the service list exceeded coord's per-computer bound.
-    services_cap_logged: bool,
+    /// Per identity hash: the rate limit on its over-bound WARN.
+    over_bound_warns: BTreeMap<String, services_bound::WarnLimit>,
     dedupe_logged: bool,
     failures_logged: u32,
     no_identity_logged: bool,
@@ -757,7 +750,7 @@ impl Reporter {
             conflict_logged: false,
             parent_unresolved_logged: false,
             last_unknown_fields: Vec::new(),
-            services_cap_logged: false,
+            over_bound_warns: BTreeMap::new(),
             dedupe_logged: false,
             failures_logged: 0,
             no_identity_logged: false,
@@ -768,11 +761,28 @@ impl Reporter {
         }
     }
 
-    fn persist(&self) {
-        if let (Some(path), Some(state)) = (self.state_path.as_ref(), self.state.as_ref()) {
-            if let Err(e) = events::save(path, state) {
-                debug!("fleet::computer: could not persist observer state: {e}");
-            }
+    /// Write the observer state. `events::save` fsyncs, so it runs as a
+    /// tracked blocking body on a snapshot of the state — never on the
+    /// `fleet-heartbeat` thread's single async worker, which also carries the
+    /// coord liveness heartbeat. Awaited, so a caller's ordering (persist
+    /// before the POST) holds.
+    ///
+    /// A cancelled tick (a supervised run torn down mid-save) leaves its
+    /// blocking write to finish, and that write can land AFTER a rebuilt
+    /// reporter's newer save, leaving the older snapshot on disk. The impact
+    /// is bounded: each write is whole (its own temp file, fsync, rename), so
+    /// the file is one snapshot or the other, never torn; event ids are
+    /// content-derived, so an event re-queued from the older snapshot is a
+    /// duplicate coord drops, not a second event; and the next tick persists
+    /// the live state over it.
+    async fn persist(&self) {
+        let (Some(path), Some(state)) = (self.state_path.clone(), self.state.clone()) else {
+            return;
+        };
+        match spawn_blocking_tracked(move || events::save(&path, &state)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => debug!("fleet::computer: could not persist observer state: {e}"),
+            Err(e) => debug!("fleet::computer: the observer-state write did not finish: {e}"),
         }
     }
 
@@ -803,11 +813,9 @@ impl Reporter {
         let now = chrono::Utc::now();
         // procfs reads: off the async worker, like the sampler's own
         // `collect_host_lane`. A panicked read is an all-UNKNOWN reading.
-        let axes = qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(
-            crate::fleet::host_axes::collect,
-        )
-        .await
-        .unwrap_or_default();
+        let axes = spawn_blocking_tracked(crate::fleet::host_axes::collect)
+            .await
+            .unwrap_or_default();
         let Some(host_id) = identity::host_identity_hash() else {
             if !self.no_identity_logged {
                 self.no_identity_logged = true;
@@ -816,12 +824,14 @@ impl Reporter {
             return;
         };
         if self.state.is_none() {
-            self.state = Some(
-                self.state_path
-                    .as_deref()
-                    .map(events::load)
+            // A panicked load is a fresh state, as `events::load`'s own
+            // fallback for an unreadable file.
+            self.state = Some(match self.state_path.clone() {
+                Some(path) => spawn_blocking_tracked(move || events::load(&path))
+                    .await
                     .unwrap_or_default(),
-            );
+                None => ObserverState::default(),
+            });
         }
 
         // Loop starvation is a fact about THIS loop, independent of coord, so
@@ -843,15 +853,15 @@ impl Reporter {
         }
 
         let Some(device) = crate::fleet::load_device_file() else {
-            self.persist();
+            self.persist().await;
             return;
         };
         let Some(base) = qontinui_runner_lib::profiles::connected_coord_base() else {
-            self.persist();
+            self.persist().await;
             return;
         };
         let Some(bearer) = crate::coord_mcp::read_usable_device_jwt().await else {
-            self.persist();
+            self.persist().await;
             return;
         };
 
@@ -862,9 +872,7 @@ impl Reporter {
             .last_facts_at
             .is_none_or(|t| t.elapsed() >= Duration::from_secs(REPORT_FULL_SECS));
         if facts_due || self.facts.is_none() {
-            self.facts = tokio::task::spawn_blocking(identity::collect_static)
-                .await
-                .ok();
+            self.facts = spawn_blocking_tracked(identity::collect_static).await.ok();
             self.access = access::collect().await;
             self.last_facts_at = Some(tokio::time::Instant::now());
         }
@@ -908,34 +916,9 @@ impl Reporter {
             );
         }
 
-        // ---- derive events --------------------------------------------
-        let state = self.state.get_or_insert_with(ObserverState::default);
-        for o in &observed {
-            let id = &o.base.identity_hash;
-            let input = ObsInput {
-                boot_id: o.base.boot_id.as_deref(),
-                booted_at: o.base.booted_at.as_deref(),
-                oom_kill_total: o.oom_kill_total,
-                services: o.scan.units.as_deref(),
-                complete_kinds: &o.scan.complete_kinds,
-                // A guest's VM-wide counter moves between guests (see
-                // `wsl_guest::attribute_vm_oom_once`); a guest that is not the
-                // owner this tick must not keep a baseline it no longer tracks.
-                carry_oom_baseline: o.base.kind != "wsl_guest" || o.base.attach_device,
-            };
-            let (evs, mut next) = events::derive(state.computers.get(id), &input, now);
-            next.kind = Some(o.base.kind.clone());
-            state.computers.insert(id.clone(), next);
-            if !evs.is_empty() {
-                events::push_pending(state, id, evs);
-            }
-        }
-        let pruned = events::prune(state, &host_id, now);
-        if pruned > 0 {
-            debug!("fleet::computer: forgot {pruned} computer(s) unseen for a week");
-        }
+        self.derive_events(&observed, &host_id, now);
         // Persist BEFORE the POST: a crash mid-send must not lose events.
-        self.persist();
+        self.persist().await;
 
         if let Some(until) = self.route_absent_until {
             if tokio::time::Instant::now() < until {
@@ -943,34 +926,12 @@ impl Reporter {
             }
         }
 
-        // ---- plan the report -------------------------------------------
-        let state = self.state.clone().unwrap_or_default();
-        let computers: Vec<ComputerReport> = observed
-            .iter()
-            .filter_map(|o| {
-                let id = &o.base.identity_hash;
-                let pending = state.pending.get(id).map(Vec::as_slice).unwrap_or(&[]);
-                plan_computer(o, full, self.last_sent.get(id), pending)
-            })
-            .collect();
-        let mut computers = cap_report(computers);
-        if computers.is_empty() {
-            return;
-        }
-        let over_cap: usize = computers.iter_mut().map(presanitize).sum();
-        if over_cap > 0 && !self.services_cap_logged {
-            self.services_cap_logged = true;
-            warn!(
-                "fleet::computer: this computer watches more services than coord's bound of \
-                 {MAX_SERVICES_PER_COMPUTER}; {over_cap} are deferred to the next delta, and \
-                 removals of the overflowing kind are not applied while it stays over the bound"
-            );
-        }
         let strip = self
             .strip_until
             .is_some_and(|t| tokio::time::Instant::now() < t);
-        if strip {
-            computers = computers.iter().map(stripped).collect();
+        let computers = self.plan_report(&observed, full, strip);
+        if computers.is_empty() {
+            return;
         }
         let body = ComputerReportReq {
             device_id: device.device_id.clone(),
@@ -1013,7 +974,7 @@ impl Reporter {
                 self.route_absent_until = None;
                 self.server_errors = 0;
                 let outcomes = parse_outcomes(&text);
-                self.on_delivered(&body, full, outcomes.as_ref());
+                self.on_delivered(&body, full, outcomes.as_ref()).await;
             }
             404 | 405 | 503 => {
                 if !self.route_absent_logged {
@@ -1026,7 +987,7 @@ impl Reporter {
                 }
                 self.back_off();
             }
-            422 => self.on_rejected(&body, &text, now, strip),
+            422 => self.on_rejected(&body, &text, now, strip).await,
             401 | 403 => {
                 self.log_failure(format!("POST {url} -> HTTP {status} (credential refused)"));
                 self.back_off();
@@ -1046,6 +1007,143 @@ impl Reporter {
         }
     }
 
+    /// Derive this tick's events for every observed computer into the queue:
+    /// state transitions from [`events::derive`], and a `services_over_bound`
+    /// `telemetry_gap` from each computer's [`services_bound::OverBound`].
+    fn derive_events(
+        &mut self,
+        observed: &[Observed],
+        host_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) {
+        let state = self.state.get_or_insert_with(ObserverState::default);
+        for o in observed {
+            let id = &o.base.identity_hash;
+            let input = ObsInput {
+                boot_id: o.base.boot_id.as_deref(),
+                booted_at: o.base.booted_at.as_deref(),
+                oom_kill_total: o.oom_kill_total,
+                services: o.scan.units.as_deref(),
+                complete_kinds: &o.scan.complete_kinds,
+                // A guest's VM-wide counter moves between guests (see
+                // `wsl_guest::attribute_vm_oom_once`); a guest that is not the
+                // owner this tick must not keep a baseline it no longer tracks.
+                carry_oom_baseline: o.base.kind != "wsl_guest" || o.base.attach_device,
+            };
+            let (mut evs, mut next) = events::derive(state.computers.get(id), &input, now);
+            next.kind = Some(o.base.kind.clone());
+            state.computers.insert(id.clone(), next);
+
+            // Over the bound is decided from the OBSERVED scan — never from a
+            // delta's own list, which holds only the rows that changed.
+            let observed_rows: Option<Vec<ServiceRow>> = o
+                .scan
+                .units
+                .as_ref()
+                .map(|u| u.iter().map(|w| w.row.clone()).collect());
+            let cut = observed_rows.as_deref().map(services_bound::services_cut);
+            let counts = observed_rows
+                .as_deref()
+                .map(services_bound::kind_counts)
+                .unwrap_or_default();
+            let scan = cut.as_ref().map(|cut| services_bound::Scan {
+                cut,
+                counts: &counts,
+                complete_kinds: &o.scan.complete_kinds,
+                completable_kinds: o.scan.completable_kinds,
+            });
+            let previous = state.over_bound.get(id).cloned().unwrap_or_default();
+            let (next_bound, actions) = previous.step(scan, now);
+            let total: usize = counts.values().sum();
+            let scan_counts = observed_rows.is_some().then_some(&counts);
+            let limit = self.over_bound_warns.entry(id.clone()).or_default();
+            for action in actions {
+                match (action, &next_bound) {
+                    (services_bound::Action::Emit, services_bound::OverBound::Over(over)) => {
+                        evs.push(services_bound::over_bound_event(id, scan_counts, over, now));
+                    }
+                    (services_bound::Action::Warn, services_bound::OverBound::Over(over))
+                        if !limit.admit(&over.kinds, now) =>
+                    {
+                        debug!(
+                            "fleet::computer: computer {} is over coord's bound again with kind(s) \
+                             {:?} (warned within the last day; the event records it)",
+                            short_id(id),
+                            over.kinds,
+                        )
+                    }
+                    (services_bound::Action::Warn, services_bound::OverBound::Over(over)) => {
+                        warn!(
+                            "fleet::computer: computer {} is over coord's bound of \
+                             {MAX_SERVICES_PER_COMPUTER} services ({total} in this scan); full \
+                             reports cut kind(s) {:?} to fit, and coord does not apply removals \
+                             of those kinds while they stay over (a services_over_bound \
+                             telemetry_gap records it); held over because this scan did not see \
+                             them completely: {:?}, last vouched counts {:?}",
+                            short_id(id),
+                            over.kinds,
+                            over.held,
+                            over.last_counts,
+                        )
+                    }
+                    (services_bound::Action::Clear, _) => {
+                        evs.push(services_bound::cleared_event(id, &counts, now));
+                    }
+                    (services_bound::Action::Info, _) if limit.info_due() => info!(
+                        "fleet::computer: computer {} watches {total} services, back within \
+                         coord's bound of {MAX_SERVICES_PER_COMPUTER}",
+                        short_id(id),
+                    ),
+                    (services_bound::Action::Info, _) => debug!(
+                        "fleet::computer: computer {} is back within coord's bound again",
+                        short_id(id),
+                    ),
+                    // Emit and Warn come only with an Over state.
+                    (_, services_bound::OverBound::Within) => {}
+                }
+            }
+            state.over_bound.insert(id.clone(), next_bound);
+
+            if !evs.is_empty() {
+                events::push_pending(state, id, evs);
+            }
+        }
+        let pruned = events::prune(state, host_id, now);
+        if pruned > 0 {
+            debug!("fleet::computer: forgot {pruned} computer(s) unseen for a week");
+        }
+        // A forgotten computer's over-bound state goes with it.
+        let computers = &state.computers;
+        state.over_bound.retain(|id, _| computers.contains_key(id));
+        self.over_bound_warns
+            .retain(|id, _| computers.contains_key(id));
+    }
+
+    /// This tick's report, ready to send: each observed computer's full or
+    /// delta contribution with its queued events, capped at coord's report
+    /// bounds, presanitized, and [`stripped`] while `strip` holds. Empty =
+    /// nothing to send this tick.
+    fn plan_report(&self, observed: &[Observed], full: bool, strip: bool) -> Vec<ComputerReport> {
+        let empty = ObserverState::default();
+        let state = self.state.as_ref().unwrap_or(&empty);
+        let computers: Vec<ComputerReport> = observed
+            .iter()
+            .filter_map(|o| {
+                let id = &o.base.identity_hash;
+                let pending = state.pending.get(id).map(Vec::as_slice).unwrap_or(&[]);
+                plan_computer(o, full, self.last_sent.get(id), pending)
+            })
+            .collect();
+        let mut computers = cap_report(computers);
+        for c in &mut computers {
+            presanitize(c);
+        }
+        if strip {
+            computers = computers.iter().map(stripped).collect();
+        }
+        computers
+    }
+
     /// coord refused the report (422).
     ///
     /// 1. Events the problems name are quarantined (behind one folded
@@ -1055,7 +1153,7 @@ impl Reporter {
     ///    the next reports are sent [`stripped`] for one full cadence.
     /// 4. If a stripped report is ALSO refused, every queue in it is
     ///    quarantined and the reporter backs off — nothing can wedge it.
-    fn on_rejected(
+    async fn on_rejected(
         &mut self,
         body: &ComputerReportReq,
         text: &str,
@@ -1088,11 +1186,11 @@ impl Reporter {
             }
         }
         if q.events > 0 {
-            self.persist();
+            self.persist().await;
             return;
         }
         if q.markers > 0 {
-            self.persist();
+            self.persist().await;
             self.back_off();
             return;
         }
@@ -1107,7 +1205,7 @@ impl Reporter {
             }
         }
         self.strip_until = None;
-        self.persist();
+        self.persist().await;
         self.back_off();
     }
 
@@ -1115,7 +1213,7 @@ impl Reporter {
     /// now holds — except for a computer coord reported as an
     /// `identity_conflict`, whose services and events it did NOT store; those
     /// stay queued.
-    fn on_delivered(
+    async fn on_delivered(
         &mut self,
         body: &ComputerReportReq,
         full: bool,
@@ -1212,7 +1310,7 @@ impl Reporter {
             }
             self.last_unknown_fields = unknown_fields;
         }
-        self.persist();
+        self.persist().await;
     }
 
     fn log_failure(&mut self, msg: String) {
@@ -1274,6 +1372,7 @@ mod tests {
                         .collect(),
                 ),
                 complete_kinds: vec!["gh_actions_runner", "qontinui_runner"],
+                completable_kinds: services::LINUX_COMPLETABLE_KINDS,
             },
         }
     }
@@ -1641,8 +1740,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_service_list_over_coords_bound_cuts_the_overflowing_kind_and_defers_it() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_service_list_over_coords_bound_cuts_the_overflowing_kind_and_defers_it() {
         let mut obs = observed(svc::INCIDENT_SHOW);
         let template = obs.scan.units.as_ref().unwrap()[0].clone();
         let unit = |name: String| {
@@ -1666,7 +1765,7 @@ mod tests {
         ];
 
         let mut c = plan_computer(&obs, true, None, &[]).unwrap();
-        assert_eq!(presanitize(&mut c), 3);
+        presanitize(&mut c);
         let rows = c.services.as_ref().unwrap();
         assert_eq!(rows.len(), MAX_SERVICES_PER_COMPUTER);
         assert!(
@@ -1690,7 +1789,7 @@ mod tests {
             device_id: "d".into(),
             computers: vec![c],
         };
-        r.on_delivered(&body, true, None);
+        r.on_delivered(&body, true, None).await;
         let delta = plan_computer(&obs, false, r.last_sent.get(HOST_ID), &[]).unwrap();
         let mut deferred: Vec<&str> = delta
             .services
@@ -1711,8 +1810,322 @@ mod tests {
                 .map(|i| unit(format!("actions.runner.r{i}.service")).row)
                 .collect(),
         );
-        assert_eq!(presanitize(&mut ok), 0);
+        presanitize(&mut ok);
+        assert_eq!(
+            ok.services.as_ref().map(Vec::len),
+            Some(MAX_SERVICES_PER_COMPUTER)
+        );
         assert_eq!(ok.services_complete_kinds, kinds);
+    }
+
+    /// Phase 1 of `2026-11-13-computer-services-cap-and-sample-outcome`: a
+    /// scan over coord's bound queues ONE `services_over_bound` event, and it
+    /// rides the same report as the first truncated list. A later delta —
+    /// which lists only the deferred rows — does not read as "back within".
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_scan_over_the_bound_queues_one_event_on_the_first_truncated_report() {
+        let mut obs = observed(svc::HEALTHY_SHOW);
+        let template = obs.scan.units.as_ref().unwrap()[0].clone();
+        obs.scan.units = Some(
+            (0..300)
+                .map(|i| {
+                    let mut w = template.clone();
+                    w.row.unit = format!("actions.runner.r{i}.service");
+                    w.row.kind = services::KIND_GH_ACTIONS_RUNNER.to_string();
+                    w
+                })
+                .collect(),
+        );
+        let observed = std::slice::from_ref(&obs);
+        let over_bound_events = |events: &[ComputerEvent]| -> Vec<ComputerEvent> {
+            events
+                .iter()
+                .filter(|e| e.detail["reason"] == "services_over_bound")
+                .cloned()
+                .collect()
+        };
+        let mut r = Reporter {
+            state_path: None,
+            ..Reporter::new()
+        };
+        r.state = Some(ObserverState::default());
+
+        r.derive_events(observed, HOST_ID, at("2026-11-14T00:00:00Z"));
+        let report = r.plan_report(observed, true, false);
+        assert_eq!(report.len(), 1);
+        assert_eq!(report[0].services.as_ref().map(Vec::len), Some(256));
+        let gaps = over_bound_events(&report[0].events);
+        assert_eq!(gaps.len(), 1, "{:?}", report[0].events);
+        assert_eq!(gaps[0].kind, "telemetry_gap");
+        assert_eq!(gaps[0].detail["bound"], 256);
+        assert_eq!(gaps[0].detail["observed"]["gh_actions_runner"], 300);
+        assert_eq!(
+            gaps[0].detail["truncated_kinds"],
+            serde_json::json!(["gh_actions_runner"])
+        );
+
+        // The next tick, before delivery: still exactly one queued.
+        r.derive_events(observed, HOST_ID, at("2026-11-14T00:00:30Z"));
+        let queued = r.state.as_ref().unwrap().pending[HOST_ID].clone();
+        assert_eq!(over_bound_events(&queued).len(), 1);
+
+        // Delivered: the delta carries the 44 deferred rows and no new event,
+        // and the computer is still over the bound.
+        let body = ComputerReportReq {
+            device_id: "d".into(),
+            computers: report,
+        };
+        r.on_delivered(&body, true, None).await;
+        r.derive_events(observed, HOST_ID, at("2026-11-14T00:01:00Z"));
+        let delta = r.plan_report(observed, false, false);
+        assert_eq!(delta[0].services.as_ref().map(Vec::len), Some(44));
+        assert!(over_bound_events(&delta[0].events).is_empty());
+        assert!(
+            matches!(
+                r.state.as_ref().unwrap().over_bound.get(HOST_ID),
+                Some(services_bound::OverBound::Over(_))
+            ),
+            "a 44-row delta must not read as back within the bound"
+        );
+    }
+
+    /// Review round 3, A2: leaving the over-bound state queues exactly one
+    /// CLOSING `services_over_bound` event, so the newest event coord serves
+    /// says "within" instead of reading "over" until it ages out.
+    #[test]
+    fn leaving_the_bound_queues_exactly_one_closing_event() {
+        let units = |n: usize| -> Observed {
+            let mut obs = observed(svc::HEALTHY_SHOW);
+            let template = obs.scan.units.as_ref().unwrap()[0].clone();
+            obs.scan.units = Some(
+                (0..n)
+                    .map(|i| {
+                        let mut w = template.clone();
+                        w.row.unit = format!("actions.runner.r{i}.service");
+                        w.row.kind = services::KIND_GH_ACTIONS_RUNNER.to_string();
+                        w
+                    })
+                    .collect(),
+            );
+            obs
+        };
+        let gaps = |r: &Reporter, cleared: bool| -> usize {
+            r.state.as_ref().unwrap().pending[HOST_ID]
+                .iter()
+                .filter(|e| {
+                    e.detail["reason"] == "services_over_bound" && e.detail["cleared"] == cleared
+                })
+                .count()
+        };
+        let mut r = Reporter {
+            state_path: None,
+            ..Reporter::new()
+        };
+        r.state = Some(ObserverState::default());
+        let over = units(300);
+        r.derive_events(
+            std::slice::from_ref(&over),
+            HOST_ID,
+            at("2026-11-14T00:00:00Z"),
+        );
+        assert_eq!(gaps(&r, false), 1);
+
+        let within = units(10);
+        for (i, t) in [
+            "2026-11-14T00:00:30Z",
+            "2026-11-14T00:01:00Z",
+            "2026-11-14T00:01:30Z",
+            "2026-11-14T00:02:00Z",
+            "2026-11-14T00:02:30Z",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            r.derive_events(std::slice::from_ref(&within), HOST_ID, at(t));
+            assert_eq!(gaps(&r, true), usize::from(i >= 2), "scan {}", i + 1);
+        }
+        let closing = r.state.as_ref().unwrap().pending[HOST_ID]
+            .iter()
+            .find(|e| e.detail["cleared"] == true)
+            .unwrap()
+            .clone();
+        assert_eq!(closing.detail["truncated_kinds"], serde_json::json!([]));
+        assert_eq!(
+            r.state.as_ref().unwrap().over_bound.get(HOST_ID),
+            Some(&services_bound::OverBound::Within)
+        );
+    }
+
+    /// Review round 5, A1: while a runner reports from inside a WSL guest,
+    /// the host's probe of that guest can complete nothing, so a guest kind
+    /// over the bound is never HELD by it — the guest leaves the state on its
+    /// counts, with one closing event, instead of being re-emitted as over.
+    #[test]
+    fn a_guest_whose_runner_reports_is_never_held_over() {
+        let probe = |active: &str, n: usize| {
+            let units: String = (0..n)
+                .map(|i| format!("Id=actions.runner.r{i}.service\nActiveState=active\n\n"))
+                .collect();
+            wsl_guest::parse_guest_probe(&format!(
+                "MACHINE_ID\tfedcba9876543210fedcba9876543210\nPID1\tsystemd\nLIST_RC\t0\nRUNNER_ACTIVE\t{active}\nUNIT_COUNT\t{n}\nSHOW_BEGIN\n{units}SHOW_END\nSHOW_RC\t0\nPROBE_END\n"
+            ))
+            .unwrap()
+        };
+        let reporting = guest_observed(&probe("1", 10), HOST_ID);
+        assert!(reporting.scan.completable_kinds.is_empty());
+        assert_eq!(
+            guest_observed(&probe("0", 10), HOST_ID)
+                .scan
+                .completable_kinds,
+            services::GUEST_COMPLETABLE_KINDS
+        );
+
+        let mut r = Reporter {
+            state_path: None,
+            ..Reporter::new()
+        };
+        r.state = Some(ObserverState::default());
+        let over = guest_observed(&probe("0", 300), HOST_ID);
+        let guest = over.base.identity_hash.clone();
+        r.derive_events(
+            std::slice::from_ref(&over),
+            HOST_ID,
+            at("2026-11-14T00:00:00Z"),
+        );
+        assert!(matches!(
+            r.state.as_ref().unwrap().over_bound.get(&guest),
+            Some(services_bound::OverBound::Over(_))
+        ));
+        for t in [
+            "2026-11-14T00:00:30Z",
+            "2026-11-14T00:01:00Z",
+            "2026-11-14T00:01:30Z",
+        ] {
+            r.derive_events(std::slice::from_ref(&reporting), HOST_ID, at(t));
+        }
+        let state = r.state.as_ref().unwrap();
+        assert_eq!(
+            state.over_bound.get(&guest),
+            Some(&services_bound::OverBound::Within)
+        );
+        let closing = state.pending[&guest]
+            .iter()
+            .filter(|e| e.detail["cleared"] == true)
+            .count();
+        assert_eq!(closing, 1);
+    }
+
+    /// Review round 5, A2: the over-bound state is persisted with the
+    /// observer state, so a reporter rebuilt while a computer is over still
+    /// queues the closing event when it leaves.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_over_bound_state_survives_a_reporter_rebuild() {
+        let units = |n: usize| -> Observed {
+            let mut obs = observed(svc::HEALTHY_SHOW);
+            let template = obs.scan.units.as_ref().unwrap()[0].clone();
+            obs.scan.units = Some(
+                (0..n)
+                    .map(|i| {
+                        let mut w = template.clone();
+                        w.row.unit = format!("actions.runner.r{i}.service");
+                        w.row.kind = services::KIND_GH_ACTIONS_RUNNER.to_string();
+                        w
+                    })
+                    .collect(),
+            );
+            obs
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("computer-observer.json");
+        let mut first = Reporter {
+            state_path: Some(path.clone()),
+            ..Reporter::new()
+        };
+        first.state = Some(ObserverState::default());
+        first.derive_events(
+            std::slice::from_ref(&units(300)),
+            HOST_ID,
+            at("2026-11-14T00:00:00Z"),
+        );
+        first.persist().await;
+        drop(first);
+
+        let mut rebuilt = Reporter {
+            state_path: Some(path.clone()),
+            ..Reporter::new()
+        };
+        rebuilt.state = Some(events::load(&path));
+        assert!(matches!(
+            rebuilt.state.as_ref().unwrap().over_bound.get(HOST_ID),
+            Some(services_bound::OverBound::Over(_))
+        ));
+        let within = units(10);
+        for t in [
+            "2026-11-14T00:00:30Z",
+            "2026-11-14T00:01:00Z",
+            "2026-11-14T00:01:30Z",
+        ] {
+            rebuilt.derive_events(std::slice::from_ref(&within), HOST_ID, at(t));
+        }
+        let closing = rebuilt.state.as_ref().unwrap().pending[HOST_ID]
+            .iter()
+            .filter(|e| e.detail["cleared"] == true)
+            .count();
+        assert_eq!(closing, 1, "the rebuilt reporter closes the entry");
+    }
+
+    /// Review A3: when `events::prune` forgets a computer, its over-bound
+    /// state is forgotten with it rather than kept for the process lifetime.
+    /// The forgotten computer is one `events::prune` itself removes (unseen
+    /// for over a week), so the test fails if the over-bound state is
+    /// reconciled before the prune rather than after it.
+    #[test]
+    fn a_forgotten_computer_takes_its_over_bound_state_with_it() {
+        let gone = "c".repeat(64);
+        let mut state = ObserverState::default();
+        state.computers.insert(
+            gone.clone(),
+            events::ComputerObs {
+                last_seen_at: Some("2026-11-01T00:00:00Z".into()),
+                ..events::ComputerObs::default()
+            },
+        );
+        let mut r = Reporter {
+            state_path: None,
+            ..Reporter::new()
+        };
+        r.state = Some(state);
+        let over = services_bound::Over {
+            kinds: [services::KIND_GH_ACTIONS_RUNNER].into_iter().collect(),
+            held: Default::default(),
+            last_counts: Default::default(),
+            emitted_at: at("2026-11-01T00:00:00Z"),
+            proposed: None,
+        };
+        r.state
+            .as_mut()
+            .unwrap()
+            .over_bound
+            .insert(gone.clone(), services_bound::OverBound::Over(over));
+        let obs = observed(svc::HEALTHY_SHOW);
+        r.derive_events(
+            std::slice::from_ref(&obs),
+            HOST_ID,
+            at("2026-11-14T00:00:00Z"),
+        );
+        assert!(
+            !r.state.as_ref().unwrap().computers.contains_key(&gone),
+            "events::prune forgot the computer"
+        );
+        assert!(
+            !r.state.as_ref().unwrap().over_bound.contains_key(&gone),
+            "{:?}",
+            r.state.as_ref().unwrap().over_bound.keys()
+        );
+        assert_eq!(
+            r.state.as_ref().unwrap().over_bound.get(HOST_ID),
+            Some(&services_bound::OverBound::Within)
+        );
     }
 
     #[test]
@@ -1977,21 +2390,179 @@ mod tests {
         );
     }
 
+    /// Every source file of the reporter, read by the structural pins below.
+    const REPORTER_SOURCES: &[(&str, &str)] = &[
+        ("mod.rs", include_str!("mod.rs")),
+        ("services.rs", include_str!("services.rs")),
+        ("services_bound.rs", include_str!("services_bound.rs")),
+        ("events.rs", include_str!("events.rs")),
+        ("wsl_guest.rs", include_str!("wsl_guest.rs")),
+        ("access.rs", include_str!("access.rs")),
+        ("identity.rs", include_str!("identity.rs")),
+    ];
+
+    /// The production part of a source file: its test module split off.
+    fn prod_part(src: &str) -> &str {
+        src.split_once("\n#[cfg(test)]")
+            .map(|(a, _)| a)
+            .unwrap_or(src)
+    }
+
+    /// Plan `2026-11-13-computer-services-cap-and-sample-outcome` Phase 3: the
+    /// async `persist` writes a state the next reporter's load reads back
+    /// equal — on a current-thread runtime, the flavour the `fleet-heartbeat`
+    /// thread runs.
+    #[tokio::test(flavor = "current_thread")]
+    async fn persist_writes_a_state_that_load_reads_back_equal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("computer-observer.json");
+        let mut state = ObserverState {
+            last_tick_at: Some("2026-11-14T00:00:00Z".into()),
+            ..ObserverState::default()
+        };
+        events::push_pending(&mut state, HOST_ID, vec![ev("persisted-1")]);
+        let r = Reporter {
+            state: Some(state.clone()),
+            state_path: Some(path.clone()),
+            ..Reporter::new()
+        };
+        r.persist().await;
+        assert_eq!(events::load(&path), state);
+    }
+
+    /// The byte index just past the delimiter closing the one at `open`
+    /// (`open_ch` … `close_ch`, nesting counted), or `None` when unbalanced.
+    fn closing(src: &str, open: usize, open_ch: char, close_ch: char) -> Option<usize> {
+        let mut depth = 0i32;
+        for (i, ch) in src.get(open..)?.char_indices() {
+            if ch == open_ch {
+                depth += 1;
+            } else if ch == close_ch {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(open + i + ch.len_utf8());
+                }
+            }
+        }
+        None
+    }
+
+    /// The byte spans of every `spawn_blocking_tracked(…)` call in `src`,
+    /// found by paren matching from the call's opening paren.
+    fn tracked_spans(src: &str) -> Vec<std::ops::Range<usize>> {
+        const CALL: &str = "spawn_blocking_tracked(";
+        src.match_indices(CALL)
+            .filter_map(|(start, _)| {
+                closing(src, start + CALL.len() - 1, '(', ')').map(|end| start..end)
+            })
+            .collect()
+    }
+
+    /// `needle` occurs in `body`, and only inside tracked blocking bodies.
+    fn assert_only_tracked(name: &str, body: &str, needle: &str) {
+        let spans = tracked_spans(body);
+        let hits: Vec<usize> = body.match_indices(needle).map(|(i, _)| i).collect();
+        assert!(!hits.is_empty(), "{name}: `{needle}` not found");
+        for h in hits {
+            assert!(
+                spans.iter().any(|s| s.contains(&h)),
+                "{name}: `{needle}` at byte {h} runs inline, outside spawn_blocking_tracked"
+            );
+        }
+    }
+
+    /// The text of the function whose signature `sig` first follows `after`.
+    fn fn_text<'a>(src: &'a str, after: &str, sig: &str) -> &'a str {
+        let from = src
+            .find(after)
+            .unwrap_or_else(|| panic!("{after} not found"));
+        let start = src
+            .get(from..)
+            .and_then(|s| s.find(sig))
+            .map(|i| from + i)
+            .unwrap_or_else(|| panic!("{sig} not found"));
+        src.get(start..)
+            .and_then(|s| s.find('{'))
+            .and_then(|i| closing(src, start + i, '{', '}'))
+            .and_then(|end| src.get(start..end))
+            .unwrap_or_else(|| panic!("{sig} has no closing brace"))
+    }
+
+    fn reporter_prod(name: &str) -> &'static str {
+        REPORTER_SOURCES
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, src)| prod_part(src))
+            .unwrap_or_else(|| panic!("{name} is not a reporter source"))
+    }
+
+    /// Phase 3: the fsync'd state write and the state load run as tracked
+    /// blocking bodies, and `persist` is the only writer.
+    #[test]
+    fn observer_state_io_runs_in_tracked_blocking_bodies() {
+        let prod = reporter_prod("mod.rs");
+        assert!(prod.contains("spawn_blocking_tracked(move || events::save"));
+        assert_only_tracked("mod.rs", prod, "events::save(");
+        assert_only_tracked("mod.rs", prod, "events::load(");
+        assert_eq!(prod.matches("events::save(").count(), 1);
+        assert_only_tracked(
+            "persist",
+            fn_text(prod, "impl Reporter", "async fn persist("),
+            "events::save(",
+        );
+    }
+
+    /// Phase 3: no blocking body escapes the house wrapper's lane accounting.
+    /// The banned substring is the bare `spawn_blocking(`, which
+    /// `spawn_blocking_tracked(` does not contain, so neither the
+    /// `tokio::task::` spelling nor an imported `spawn_blocking(` passes.
+    #[test]
+    fn the_reporter_never_spawns_an_untracked_blocking_body() {
+        for (name, src) in REPORTER_SOURCES {
+            assert!(
+                !prod_part(src).contains("spawn_blocking("),
+                "{name} spawns an untracked blocking body"
+            );
+        }
+        assert_only_tracked(
+            "mod.rs",
+            reporter_prod("mod.rs"),
+            "identity::collect_static",
+        );
+    }
+
+    /// Phase 3: the procfs host axes are never read on the async worker.
+    #[test]
+    fn host_axes_are_never_collected_inline() {
+        let prod = reporter_prod("mod.rs");
+        assert!(!prod.contains("host_axes::collect()"));
+        assert_only_tracked("mod.rs", prod, "host_axes::collect");
+    }
+
+    /// Phase 3: each service scan's per-unit `.runner` / cgroup reads run in
+    /// a tracked blocking body.
+    #[test]
+    fn the_service_scans_read_unit_files_in_tracked_bodies() {
+        let services = reporter_prod("services.rs");
+        let linux = fn_text(
+            services,
+            "pub(crate) mod linux",
+            "pub(crate) async fn scan(",
+        );
+        assert_only_tracked("linux scan", linux, "watched_from_props(");
+        let windows = fn_text(
+            services,
+            "pub(crate) mod windows",
+            "pub(crate) async fn scan(",
+        );
+        assert_only_tracked("windows scan", windows, "read_runner_file(");
+    }
+
     /// No timer, task or thread of its own — a task would escape the gate.
     #[test]
     fn the_reporter_has_no_timer_of_its_own() {
-        for (name, src) in [
-            ("mod.rs", include_str!("mod.rs")),
-            ("services.rs", include_str!("services.rs")),
-            ("events.rs", include_str!("events.rs")),
-            ("wsl_guest.rs", include_str!("wsl_guest.rs")),
-            ("access.rs", include_str!("access.rs")),
-            ("identity.rs", include_str!("identity.rs")),
-        ] {
-            let prod = src
-                .split_once("\n#[cfg(test)]")
-                .map(|(a, _)| a)
-                .unwrap_or(src);
+        for (name, src) in REPORTER_SOURCES {
+            let prod = prod_part(src);
             for banned in [
                 "tokio::spawn(",
                 "tokio::time::interval",

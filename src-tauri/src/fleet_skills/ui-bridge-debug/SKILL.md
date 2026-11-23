@@ -89,7 +89,8 @@ accepts in its `actions` list (`GET $BASE/control/element/<id>`, or the
 element's entry in the snapshot) — use one of those rather than guessing.
 On the runner, when an enabled element advertises a list, a verb not on it is
 refused with a 400 naming that list (`hoverClick` also passes wherever `click`
-does; a malformed `type` request fails its own param check first):
+does, and `unhover` wherever `hover` does; a malformed `type` request fails its
+own param check first):
 `supportedActions` for an unknown verb (`INVALID_REQUEST`), `supported_actions`
 for a built-in verb this element does not advertise (`ACTION_NOT_SUPPORTED`).
 The context can add `didYouMean`, a near-miss the element accepts, and
@@ -97,10 +98,13 @@ The context can add `didYouMean`, a near-miss the element accepts, and
 on a text-entry element (one advertising `type`, or an ARIA textbox /
 contenteditable) and `click` on anything else, such as a button. Lists from
 `@qontinui/ui-bridge` 0.46 or later advertise `sendKeys` on every kind, so on
-those lists that outcome needs a runner carrying qontinui-runner#2858; an older
-runner suggests `sendKeys` on a button. Check that a hint names the verb and
-key you meant before copying it. An element advertising no list, or one the
-runner could not read, gets no such 400. A runner build older than qontinui-runner
+those lists that outcome needs a runner build containing qontinui-runner
+`2e72bfb37` (landed by #2872): `git merge-base --is-ancestor 2e72bfb37
+<gitSha>` with the runner's `/health` `gitSha`, where exit 128 is UNKNOWN, not
+older. An older runner suggests `sendKeys` on a button. Check that a hint names
+the verb and key you meant before copying it. An element advertising no list,
+or one the runner could not read, gets no such 400. A runner build older than
+qontinui-runner
 `6c88e5a37` instead answers an unknown verb with `Unknown action '<x>'.
 Supported actions: <list>`, where the list is the runner's GLOBAL verb list and
 there is no suggestion. Either way, the element's `actions` list is the answer.
@@ -251,13 +255,15 @@ Once you're on an authed/injected page, drive controls **by their stable `useUIE
 # $AUTH is the private artifact from the /ui-bridge "Authenticated Web Pages" capture (mktemp -d, consent `not-now`);
 # never an auth.json in the cwd, which can be a checkout. Delete it (and that recipe's $R) with its guarded teardown after the last run.
 ui-bridge-inject --url https://qontinui.io/digital-twin --storage-state "$AUTH" \
-  --exec 'act {"id":"digital-twin-cell-schema","request":{"action":"click"}}' \
+  --exec 'executeElementAction {"id":"digital-twin-cell-schema","request":{"action":"click"}}' \
   --exec 'waitForElementRegistered {"predicate":{"id":"digital-twin-show-raw"},"timeoutMs":12000}' \
-  --exec 'act {"id":"digital-twin-show-raw","request":{"action":"click"}}' \
+  --exec 'executeElementAction {"id":"digital-twin-show-raw","request":{"action":"click"}}' \
   --exec 'getControlSnapshot {}'
 ```
 
-**Wait for late-mounting controls with `waitForElementRegistered`, never a sleep loop.** A control that appears only after an async fetch (a drawer's verdict, a lazy panel) is racy. The action polls the registry for you: `waitForElementRegistered {"predicate":{...},"requirement":"registered","timeoutMs":...}` where `predicate` is `{id?, label?, testId?, selector?}` (`label` = case-insensitive substring; `selector` also falls back to `document.querySelector` for non-SDK elements). `requirement` may be `"registered"` (default), `"visible"`, or `"has-layout"`. `waitForElement` / `waitForElementByCondition` are the richer variants.
+**The `--exec` verb for an element action is `executeElementAction`, not `act`.** `act` is the method name on the transport context (`ctx.act(id, request)`, below); the in-page dispatcher has no `act` case and answers `Unknown command action: act` (measured 2026-11-17 against `@qontinui/ui-bridge` 0.53.0). Both take the same `{id, request}`. An element that portals out of the registry (a Radix `Select` item, for example) cannot be driven this way, and a bare `clickBySelector` on it does not commit the selection, because Radix selects on pointer events. Read the control's state back after acting rather than assuming the click took.
+
+**Wait for late-mounting controls with `waitForElementRegistered`, never a sleep loop.** A control that appears only after an async fetch (a drawer's verdict, a lazy panel) is racy. The action polls the registry for you: `waitForElementRegistered {"predicate":{...},"requirement":"registered","timeoutMs":...}` where `predicate` is `{id?, label?, testId?, selector?}` and must name at least one non-empty field — an empty or whitespace-only predicate is refused (`UB-VALIDATION-ERROR`, from qontinui/ui-bridge#407) rather than answered with whichever element registered first (`label` = case-insensitive substring; a `selector` given alone matches only a registered element whose own node matches it (qontinui/ui-bridge#406), and falls back to `document.querySelector` for non-SDK elements; beside `id`/`label`/`testId` it is only that fallback). ⚠️ In `@qontinui/ui-bridge` 0.53.0 and earlier, a **selector-only** predicate is ignored by the registry match, so the wait returns the first registered element at once, whatever it is (measured 2026-11-17). Until a release carrying the fix serves, wait on a selector with the CLI-side `waitForSelector {"selector":…,"state":"visible"}`, or use a `testId`/`id` predicate, and check the returned `element.id`. `requirement` may be `"registered"` (default), `"visible"`, or `"has-layout"`. `waitForElement` / `waitForElementByCondition` are the richer variants.
 
 **For logic beyond a flat `--exec` chain (branching, loops, reading values back), use the injected transport directly** — it's the same engine the CLI wraps, so you still don't touch Playwright:
 

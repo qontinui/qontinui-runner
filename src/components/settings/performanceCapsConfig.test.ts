@@ -46,6 +46,23 @@ describe("descriptors", () => {
   });
 });
 
+describe("the empty-page prune's description", () => {
+  const description = () =>
+    PERF_CAP_FIELDS.find((f) => f.key === "prune_empty_auto_pages")!.description;
+
+  it('does not promise that every page you made survives: an older "Page N" from "+" is pruned', () => {
+    // `classifyLegacyOrigin` reads a "Page N" persisted before `origin`
+    // existed as runner-made, whoever made it.
+    expect(description()).not.toContain("Pages you made or renamed are never removed");
+    expect(description()).toContain(
+      'A "Page N" page saved by an older version counts as created by the runner, even one you added with "+": rename it to keep it.',
+    );
+    expect(description()).toContain(
+      "Pages you rename, and pages you add from this version on, are never removed.",
+    );
+  });
+});
+
 describe("clampPerfField", () => {
   it("clamps to the declared bounds", () => {
     const scrollback = numberField("scrollback_capacity_bytes");

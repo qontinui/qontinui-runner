@@ -241,7 +241,8 @@ enum SafetyVerdict {
 
 /// Re-verify the safety floor on the runner's live disk (defense in depth —
 /// coord's DECIDE-time check may be stale). All three rules must pass:
-///   1. `git status --porcelain` EMPTY (clean).
+///   1. `git status --porcelain --untracked-files=all` EMPTY (clean — an
+///      untracked file hidden by `status.showUntrackedFiles=no` still counts).
 ///   2. `git rev-parse --abbrev-ref HEAD` == `current_branch`.
 ///   3. `git merge-base --is-ancestor <current_branch> origin/<default>`.
 ///
@@ -270,10 +271,14 @@ fn recheck_safety_with(
     }
 
     // (1) Dirty gate — any uncommitted/untracked change → refuse.
-    match git(repo_path, &["status", "--porcelain"], GIT_LOCAL_TIMEOUT) {
+    match git(
+        repo_path,
+        super::dirty::STATUS_PORCELAIN_ALL_UNTRACKED,
+        GIT_LOCAL_TIMEOUT,
+    ) {
         Ok((true, stdout, _)) if !stdout.trim().is_empty() => {
             return SafetyVerdict::Refuse(format!(
-                "{repo_path} is dirty (git status --porcelain non-empty) — refusing reset"
+                "{repo_path} is dirty (git status --porcelain --untracked-files=all non-empty) — refusing reset"
             ));
         }
         Ok((true, _, _)) => {} // clean — proceed to next check.
@@ -815,6 +820,21 @@ mod tests {
             elapsed < budget * 8,
             "run_git_capture blocked for {elapsed:?} against a {budget:?} budget"
         );
+    }
+
+    /// Edge 9171555e: the pre-reset dirty gate must see an untracked file that
+    /// `status.showUntrackedFiles=no` hides from plain porcelain.
+    #[test]
+    fn recheck_safety_refuses_an_untracked_file_hidden_by_show_untracked_no() {
+        let repo = super::super::dirty::repo_with_hidden_untracked_file();
+        let path = repo.path().to_string_lossy().to_string();
+        match recheck_safety(&path, "main", "main") {
+            SafetyVerdict::Refuse(reason) => assert!(
+                reason.contains("is dirty"),
+                "the refusal must be the dirty gate's, got {reason:?}"
+            ),
+            SafetyVerdict::Ok => panic!("a tree with untracked work must never be reset"),
+        }
     }
 
     #[test]

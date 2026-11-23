@@ -470,7 +470,7 @@ mod tests {
     }
 
     #[test]
-    fn dest_name_is_the_last_segment_of_the_PATH_never_the_host() {
+    fn dest_name_is_the_last_segment_of_the_path_never_the_host() {
         assert_eq!(
             dest_name("https://github.com/qontinui/qontinui-stack").as_deref(),
             Some("qontinui-stack")

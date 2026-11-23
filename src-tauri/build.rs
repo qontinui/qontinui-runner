@@ -1056,8 +1056,12 @@ const RUST_SRC_PATHSPECS: &[&str] = &[
 
 const PROVENANCE_UNKNOWN: &str = "unknown";
 
+/// One fold input: a repo-relative path and its git blob oid, `None` when the
+/// input is absent.
+type PathOid = (String, Option<String>);
+
 /// The fold text for `(path, oid)` entries; `None` is an absent input.
-fn fold_lines(entries: &[(String, Option<String>)]) -> String {
+fn fold_lines(entries: &[PathOid]) -> String {
     let mut rows: Vec<(String, &Option<String>)> = entries
         .iter()
         .map(|(p, o)| (p.replace('\\', "/"), o))
@@ -1141,10 +1145,7 @@ fn hash_text(root: &std::path::Path, text: &str) -> Result<String, String> {
 
 /// One `git hash-object --stdin-paths` over the paths that exist; a missing
 /// path is `None` (the `absent` marker).
-fn hash_paths(
-    root: &std::path::Path,
-    paths: &[String],
-) -> Result<Vec<(String, Option<String>)>, String> {
+fn hash_paths(root: &std::path::Path, paths: &[String]) -> Result<Vec<PathOid>, String> {
     // A directory (e.g. an untracked symlink to one, which `ls-files` lists as a
     // file) cannot be hash-object'ed: it is `absent`, the same rule the Node
     // side applies. `is_dir` follows symlinks, like Node's `statSync`.
@@ -1292,7 +1293,7 @@ impl HalvesAgree {
 }
 
 /// `(recorded frontendSrcHash, recorded inputs)` out of `provenance.json`.
-fn parse_provenance(json: &str) -> Result<(String, Vec<(String, Option<String>)>), String> {
+fn parse_provenance(json: &str) -> Result<(String, Vec<PathOid>), String> {
     let v: serde_json::Value =
         serde_json::from_str(json).map_err(|e| format!("dist/provenance.json unparseable: {e}"))?;
     let recorded = v
@@ -1318,11 +1319,7 @@ fn parse_provenance(json: &str) -> Result<(String, Vec<(String, Option<String>)>
     Ok((recorded, inputs))
 }
 
-fn check_halves(
-    root: &std::path::Path,
-    recorded: &str,
-    inputs: &[(String, Option<String>)],
-) -> HalvesAgree {
+fn check_halves(root: &std::path::Path, recorded: &str, inputs: &[PathOid]) -> HalvesAgree {
     if recorded == PROVENANCE_UNKNOWN {
         return HalvesAgree::Unknown("the frontend build could not measure its inputs".into());
     }
@@ -1569,13 +1566,13 @@ mod tests {
 /// `scripts/frontend-provenance.mjs`; the fixture pins both sides.
 #[cfg(test)]
 mod provenance_tests {
-    use super::{fold_lines, parse_provenance, porcelain_paths};
+    use super::{fold_lines, parse_provenance, porcelain_paths, PathOid};
 
     #[test]
     fn fold_matches_the_shared_fixture() {
         let fx: serde_json::Value =
             serde_json::from_str(include_str!("../scripts/fixtures/provenance-fold.json")).unwrap();
-        let entries: Vec<(String, Option<String>)> = fx["entries"]
+        let entries: Vec<PathOid> = fx["entries"]
             .as_array()
             .unwrap()
             .iter()

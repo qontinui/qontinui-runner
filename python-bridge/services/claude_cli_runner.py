@@ -8,31 +8,21 @@ All services should use these functions instead of calling subprocess directly.
 """
 
 import contextlib
+import logging
 import os
 import platform
 import subprocess
 import tempfile
 from typing import Any
 
+logger = logging.getLogger(__name__)
+
 
 def _debug_log(msg: str) -> None:
-    """Write debug message to log file and stderr."""
-    import datetime
+    """Log a debug message to the module logger and stderr."""
     import sys
 
-    # ~ expands from USERPROFILE on Windows and HOME elsewhere. The old literal
-    # fallback named one machine's Windows account, so on any other login it
-    # aimed the debug log at a profile that does not exist.
-    debug_log = os.path.join(
-        os.path.expanduser("~"), ".qontinui", "ai-shell-debug.log"
-    )
-    ts = datetime.datetime.now().isoformat()
-    line = f"[{ts}] [CLI_RUNNER] {msg}\n"
-    try:
-        with open(debug_log, "a", encoding="utf-8") as f:
-            f.write(line)
-    except Exception:
-        pass
+    logger.debug("[CLI_RUNNER] %s", msg)
     print(f"[DEBUG CLI_RUNNER] {msg}", file=sys.stderr, flush=True)
 
 

@@ -17,7 +17,9 @@
 //!   the whole system;
 //! * the CPU the slice used since the previous sample, from `cpu.stat`, and
 //!   the host's CPU split into session work, CI and the unattributed rest
-//!   (`cpu`, which documents what each class is made of).
+//!   (`cpu`, which documents what each class is made of);
+//! * the session class's memory, from the `memory.current` of the same
+//!   cgroups that split classes as session work (`cpu::memory`).
 //!
 //! # Not supported is not zero
 //!
@@ -35,14 +37,16 @@
 //! The memory keys mirror the `slice_tel_01` migration's column comments in
 //! qontinui-web, which describe `cgroup_slices` as keyed by slice. The CPU
 //! keys extend that contract: a `cpu` object inside each watched slice's
-//! entry, and `cpu_attribution`, the one top-level key that is not a slice:
+//! entry, and `cpu_attribution`, a top-level key that is not a slice; the
+//! session class's memory is the other, `memory_attribution`:
 //!
 //! ```text
 //! cgroup_slices = {"ci-runners.slice": {"memory_current": N,
 //!                  "memory_high": N | "max", "memory_max": N | "max",
 //!                  "events": {"high": N, "max": N, "oom_kill": N},
 //!                  "cpu": {"usage_delta_usec": N, "interval_usec": N}},
-//!                  "cpu_attribution": {"session_usec": N, "ci_usec": N, ...}}
+//!                  "cpu_attribution": {"session_usec": N, "ci_usec": N, ...},
+//!                  "memory_attribution": {"session_bytes": N, ...}}
 //! psi           = {"system": {"memory": {"some": {"avg10": f, "avg60": f},
 //!                                        "full": {...}}, "cpu": ..., "io": ...},
 //!                  "slices": {"ci-runners.slice": {"memory": ..., ...}}}
@@ -416,11 +420,13 @@ pub(crate) fn read_psi(proc_pressure: &Path) -> Map<String, Value> {
 /// Assemble the three fields from the two roots. `None` fields stay `None`
 /// (unmeasured); a slices map with no watched slice in it is a real answer:
 /// the unified hierarchy was read and none of the watched slices exists here.
-/// From the second call on, such a map can still hold `cpu_attribution`.
+/// From the first call on such a map can still hold `memory_attribution`, and
+/// from the second `cpu_attribution`.
 ///
 /// The CPU keys of `cgroup_slices` are deltas since the previous call for the
 /// same `cgroup_root`, which this keeps between calls, so a first call carries
-/// none. Each watched slice's CPU is read from the directory
+/// none; the session class's memory (`memory_attribution`) is a level, read
+/// whole on every call. Each watched slice's CPU is read from the directory
 /// [`read_slice_reads`] read its memory from. `proc_pressure` is `<procfs>/pressure`: the runner's
 /// own cgroup and user are read from `<procfs>/self/cgroup` and
 /// `<procfs>/self/status` beside it. What `ci_node` has counted of its
@@ -440,6 +446,13 @@ pub(crate) fn collect_from(cgroup_root: &Path, proc_pressure: &Path) -> SliceTel
         dirs,
     } = read_slice_reads(cgroup_root);
     cpu::attach(
+        cgroup_root,
+        proc_pressure,
+        &dirs,
+        crate::ci_node::cgroup::dispatch_counts,
+        &mut mem,
+    );
+    cpu::memory::attach(
         cgroup_root,
         proc_pressure,
         &dirs,
@@ -802,6 +815,70 @@ mod tests {
             json!({"ci-runners.slice": 20_000_000, "ci-winvm.slice": 10_000_000})
         );
         assert_eq!(split["pty_holder_scopes_seen"], json!(1));
+    }
+
+    /// The payload builder the 30 s publish reads carries the session class's
+    /// memory from its FIRST read (a level needs no previous one): the
+    /// runner's unit less the CI dispatch cgroup inside it, its pane and the
+    /// builds slice, with the CI slice left out — the sum coord divides by the
+    /// sample's active sessions.
+    #[test]
+    fn collect_from_carries_session_memory_from_its_first_read() {
+        // As above: `collect_from` reads `ci_node`'s counts and
+        // `QONTINUI_CI_CGROUP_ROOT`.
+        let _g = crate::test_env::env_lock();
+        let ci_root = crate::ci_node::cgroup::CGROUP_ROOT_ENV;
+        let _restore = crate::test_env::EnvVarRestore::capture(&[ci_root]);
+        std::env::remove_var(ci_root);
+        let d = tempfile::tempdir().unwrap();
+        let (root, procfs) = (d.path().join("cgroup"), d.path().join("proc"));
+        let mgr = "user.slice/user-1000.slice/user@1000.service";
+        let unit = format!("{mgr}/app.slice/qontinui-runner.service");
+        let pane = format!("{mgr}/app.slice/qontinui-pty-holder-p1-16f2c-18e4ca879535bc14.scope");
+        let builds = format!("{mgr}/agent.slice/agent-builds.slice");
+        // A CI dispatch cgroup inside the runner's unit: CI, not session work,
+        // so it is subtracted from the unit's reading.
+        let dispatch = format!(
+            "{unit}/{}job-3",
+            crate::ci_node::cgroup::DISPATCH_DIR_PREFIX
+        );
+        write(&root, "cgroup.controllers", "cpuset cpu io memory pids\n");
+        write(&procfs, "self/cgroup", &format!("0::/{unit}\n"));
+        for (rel, bytes) in [
+            (unit.as_str(), 3_000),
+            (dispatch.as_str(), 1_200),
+            (pane.as_str(), 500),
+            (builds.as_str(), 800),
+            ("ci.slice", 9_000),
+            ("ci.slice/ci-runners.slice", 9_000),
+        ] {
+            write(&root, &format!("{rel}/cpu.stat"), "usage_usec 1\n");
+            write(
+                &root,
+                &format!("{rel}/memory.current"),
+                &format!("{bytes}\n"),
+            );
+        }
+        let first = collect_from(&root, &procfs.join("pressure"))
+            .cgroup_slices
+            .unwrap();
+        assert!(
+            first.get("cpu_attribution").is_none(),
+            "no CPU on a first read"
+        );
+        let memory = &first["memory_attribution"];
+        assert_eq!(memory["session_bytes"], json!((3_000 - 1_200) + 500 + 800));
+        assert_eq!(
+            memory["runner_unit_bytes"],
+            json!(3_000),
+            "the unit's own reading, its dispatch cgroup included"
+        );
+        assert_eq!(memory["pty_holder_scopes_bytes"], json!(500));
+        assert_eq!(
+            first["ci-runners.slice"]["memory_current"],
+            json!(9_000),
+            "the slice entries are unchanged"
+        );
     }
 
     /// `collect_from` hands `cpu::attach` the directory each watched slice's

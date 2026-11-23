@@ -40,6 +40,11 @@ import { AlertCircle, X } from "lucide-react";
 
 import { useRunnerTier } from "@/hooks/useRunnerTier";
 import { useTenant } from "@/contexts/TenantContext";
+import {
+  NO_BROWSER_HINT,
+  PendingSignInNotice,
+  isSignInCancelled,
+} from "@/components/PendingSignInNotice";
 
 import {
   applyCredentialDarkSignal,
@@ -60,6 +65,7 @@ import {
   type AuthBannerStatus,
   type CredentialDarkSignal,
 } from "./web-integration-banner-logic";
+import { PRODUCTION_BACKEND_URL } from "@/lib/savedBackendUrl";
 
 // ---------------------------------------------------------------------------
 // Component
@@ -67,9 +73,6 @@ import {
 
 /** Session-storage key used for dismissal persistence across re-renders. */
 const DISMISS_STORAGE_KEY = "qontinui:web-integration-auth-banner:dismissed-signature";
-
-/** Fallback backend URL when status hasn't loaded yet. */
-const DEFAULT_BACKEND_URL = "https://api.qontinui.io";
 
 function readDismissedSignature(): string | null {
   try {
@@ -102,7 +105,7 @@ export function WebIntegrationAuthBanner() {
   // the same `get_web_integration_status` fetch that feeds the banner; falls
   // back to the production API host when the status hasn't loaded or carries no
   // backendUrl (the Rust command then derives the web origin itself).
-  const [backendUrl, setBackendUrl] = useState<string>(DEFAULT_BACKEND_URL);
+  const [backendUrl, setBackendUrl] = useState<string>(PRODUCTION_BACKEND_URL);
   const [dismissedSignature, setDismissedSignature] = useState<string | null>(() =>
     readDismissedSignature(),
   );
@@ -399,7 +402,8 @@ export function WebIntegrationAuthBanner() {
       setRetryRefresh(null);
       window.dispatchEvent(new CustomEvent("runner-tier-changed"));
     } catch (err) {
-      setAuthorizeError(String(err));
+      // The user's own Cancel (from the pending-sign-in notice) is not a failure.
+      if (!isSignInCancelled(err)) setAuthorizeError(String(err));
     } finally {
       setAuthorizing(false);
     }
@@ -539,6 +543,10 @@ export function WebIntegrationAuthBanner() {
                 <span style={{ color: "hsl(var(--destructive, 0 84% 60%))" }}>{ctaError}</span>
               </>
             ) : null}
+            <PendingSignInNotice
+              active={presentation.ctaAction === "cognito_sign_in" && authorizing}
+              noBrowserHint={NO_BROWSER_HINT.settings}
+            />
           </div>
           {presentation.showSwitchTenant && tenantSwitcherOpen ? (
             <div
@@ -755,6 +763,7 @@ export function WebIntegrationAuthBanner() {
               <span style={{ color: "hsl(var(--destructive, 0 84% 60%))" }}>{authorizeError}</span>
             </>
           ) : null}
+          <PendingSignInNotice active={authorizing} noBrowserHint={NO_BROWSER_HINT.settings} />
         </div>
       </div>
       <button

@@ -1751,6 +1751,8 @@ const REVIEWED_NOT_DOOR: &[(&str, &str)] = &[
     ("GET", "/agent-tokens/health"),
     ("GET", "/agent-worktrees/reclaimable"),
     ("GET", "/agent-worktrees/wip-orphans"),
+    // Test-only: the scripted coord stub in session/coord_sync.rs tests (spawn-failed spool replay).
+    ("POST", "/agents/{id}/spawn-failed"),
     ("GET", "/analytics/token-usage/by-model"),
     ("GET", "/analytics/token-usage/by-page"),
     ("GET", "/analytics/token-usage/by-phase"),
@@ -1835,6 +1837,10 @@ const REVIEWED_NOT_DOOR: &[(&str, &str)] = &[
     ("GET", "/ui-bridge/design/evaluate/contexts"),
     ("POST", "/ui-bridge/design/evaluate/diff"),
     ("GET", "/ui-bridge/diagnostics/readiness"),
+    // Not a runner route: a stand-in PHONE's pairing route in
+    // `device_pairing_door_tests`, which the runner calls and never serves. The
+    // runner's own pair route, `/ui-bridge/devices/{id}/pair`, is a credential door.
+    ("POST", "/ui-bridge/pair"),
     ("GET", "/ui-bridge/sdk/control/transition/{id}/can-execute"),
     ("POST", "/ui-bridge/sdk/design/evaluate"),
     ("POST", "/ui-bridge/sdk/design/evaluate/baseline"),
@@ -2166,5 +2172,81 @@ async fn no_browser_origin_can_upsert_a_managed_task() {
                 .status();
             assert_eq!(got, want, "policy {policy}, origin {origin:?}");
         }
+    }
+}
+
+/// Plan 2026-09-20-the-published-product-works-without-knowing-a-development-
+/// environment-exists C5: the session stop-reason read is a door, so every
+/// browser class is refused under EVERY route policy — not only the shadowed
+/// allowlist refusal a plain unlisted route gets under the default.
+#[test]
+fn session_stop_reason_is_a_credential_door() {
+    assert!(is_credential_door("GET", "/sessions/{id}/stop-reason"));
+    // Only the read is named; nothing else under the session is widened.
+    assert!(!is_credential_door("GET", "/sessions/{id}/policy-context"));
+}
+
+/// The same door, through the guard LAYER: under the default `enforce-doors`
+/// policy a request carrying a Foreign or a web origin to
+/// `/sessions/x/stop-reason` is refused before the handler runs, while an
+/// agent (no origin) reaches it.
+#[tokio::test]
+async fn a_foreign_origin_cannot_read_a_session_stop_reason() {
+    const ROUTE: &str = "/sessions/{id}/stop-reason";
+    async fn reached() -> StatusCode {
+        StatusCode::OK
+    }
+    let h = harness("enforce-doors");
+    let router = apply(Router::new().route(ROUTE, get(reached)), h.guard.clone());
+    let host = host(&h);
+    for (origin, want) in [
+        (Some(EVIL), StatusCode::FORBIDDEN),
+        (Some(WEB), StatusCode::FORBIDDEN),
+        (None, StatusCode::OK),
+    ] {
+        let mut headers = vec![("host", host.as_str())];
+        if let Some(o) = origin {
+            headers.push(("origin", o));
+        }
+        let got = router
+            .clone()
+            .oneshot(req("GET", "/sessions/x/stop-reason", &headers, ""))
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(got, want, "origin {origin:?}");
+    }
+}
+
+/// `GET /model-gateway` (`mcp::model_gateway_read`) is a door, through the
+/// guard LAYER: under the default `enforce-doors` policy a Foreign or a web
+/// origin is refused before the handler runs — not admitted as a shadow
+/// refusal with its origin echoed — while qontinui-studio's local CLI, which
+/// sends no `Origin`, reaches it.
+#[tokio::test]
+async fn a_browser_origin_cannot_read_the_model_gateway_state() {
+    const ROUTE: &str = "/model-gateway";
+    async fn reached() -> StatusCode {
+        StatusCode::OK
+    }
+    let h = harness("enforce-doors");
+    let router = apply(Router::new().route(ROUTE, get(reached)), h.guard.clone());
+    let host = host(&h);
+    for (origin, want) in [
+        (Some(EVIL), StatusCode::FORBIDDEN),
+        (Some(WEB), StatusCode::FORBIDDEN),
+        (None, StatusCode::OK),
+    ] {
+        let mut headers = vec![("host", host.as_str())];
+        if let Some(o) = origin {
+            headers.push(("origin", o));
+        }
+        let got = router
+            .clone()
+            .oneshot(req("GET", ROUTE, &headers, ""))
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(got, want, "origin {origin:?}");
     }
 }
