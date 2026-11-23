@@ -323,6 +323,10 @@ pub const HEALTH_MONITOR_PERIOD: std::time::Duration = std::time::Duration::from
 /// a backoff. Rebuilding is safe: the loop keeps no state of its own, and the
 /// failure counts it advances live in the shared registry, which a rebuilt run
 /// picks up where the last one left them.
+///
+/// A rebuilt run starts from the top, so after the supervisor's backoff it
+/// waits `start_delay` again before its first pass: a restart costs the backoff
+/// plus the boot delay, not the backoff alone.
 pub fn spawn_health_monitor(
     registry: Arc<PhysicalDeviceRegistry>,
     client: reqwest::Client,
