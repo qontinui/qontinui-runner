@@ -1,4 +1,4 @@
 288972dc160debeb35a9d330251ca26dbda2c83c3bcab62b4bc33aae1e8b8d4b  .github/scripts/complete-orphaned-check-runs.sh
 6511a884173bffae4546b105f17ee586d3e1a735165a8960500a28d480f5e81d  .github/scripts/test-complete-orphaned-check-runs.sh
-0acab65485205d88217884e0576b0c74bfd84b075a569340725c3f3dc785ade5  .github/scripts/reviewdog-step-outputs.sh
-67c1fb57194d61de6128d812458c3ac61694e4e051f978d2cf59ac6509815086  .github/scripts/test-reviewdog-step-outputs.sh
+e814c4a744393d694747577ce6555d97c6bb3d3047aed31401d154005f69915b  .github/scripts/reviewdog-step-outputs.sh
+39cef9b80dc2c9805fe791cee79e533f0ddb3dc754ee0bf588a425b5ab90cb42  .github/scripts/test-reviewdog-step-outputs.sh
