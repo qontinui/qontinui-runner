@@ -30,6 +30,7 @@ pub mod holder_census;
 mod idle_chrome_replay;
 pub mod interceptor;
 pub mod launch_failure; // The identity shim's launch-failure reports (plan 2026-11-10-migration-holds-for-missing-claude-cli)
+pub mod layout; // The terminal↔confirmed-session join + registered tab labels behind terminal_list, GET /terminal-pages and GET /terminal-layout
 pub(crate) mod limit_hint; // the usage-limit hint's decision path behind an injectable env (plan 2026-11-05-runner-terminal-pages-collide-crowd-and-overfill-and-limit-stalled-sessions-never-resume, Phase 2)
 pub(crate) mod limit_reset; // continue-in-place / park a session stopped at a usage limit (plan 2026-11-05-runner-terminal-pages-collide-crowd-and-overfill-and-limit-stalled-sessions-never-resume, Phase 2)
 pub(crate) mod limit_stop; // transcript-read usage-limit stop classifier and the park list (plan 2026-11-05-runner-terminal-pages-collide-crowd-and-overfill-and-limit-stalled-sessions-never-resume, Phases 1-2)
