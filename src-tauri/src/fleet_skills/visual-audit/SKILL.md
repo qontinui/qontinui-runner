@@ -12,7 +12,7 @@ that turn declarative visual questions into structured answers:
 | Endpoint | What it does |
 |---|---|
 | `POST /ui-bridge/vision/analyze` | Run one of the six analyzers (layout/typography/color/dynamic/elements/image). Returns `verdict` (READ THIS FIRST — see below), `analyzer` (echoed back), `findings: [{kind, severity, analyzer?, region?, detail, elements?, confidence}]`, `imageValues?` (the `image` analyzer's measurements — see below), and the provenance set: `coverage?`, `frame?`, `frameError?`, `evaluatedAt`, `snapshotAttribution`. |
-| `POST /ui-bridge/vision/assert` | Evaluate a list of declarative assertions over the caller-supplied snapshot (plus OCR blocks and the baseline registry). **Only the L1 image assertions read the frame** (see the DSL table) — every other assertion evaluates from the snapshot, and for those the captured frame is reported as provenance but consulted by no verdict. Returns `results: [{passed, outcome, detail?, assertion, confidence}]` — `outcome` is three-way, not pass/fail — plus `allPassed` and the same provenance set. |
+| `POST /ui-bridge/vision/assert` | Evaluate a list of declarative assertions over the caller-supplied snapshot (plus OCR blocks and the baseline registry). **Only the L1 image assertions read the frame** (see the DSL table), and the three timeline assertions read the interaction timeline named by `timelineRef` — every other assertion evaluates from the snapshot, and for those the captured frame is reported as provenance but consulted by no verdict. Returns `results: [{passed, outcome, detail?, assertion, confidence}]` — `outcome` is three-way, not pass/fail — plus `allPassed`, the same provenance set, and `timelineRef` (how the ref resolved) when one was sent. |
 | `POST /ui-bridge/vision/baseline` | Capture a baseline image + register the snapshot's element bboxes under `name`. |
 | `GET  /ui-bridge/vision/baselines` | List registered baselines. |
 
@@ -380,7 +380,8 @@ interaction timeline, not the snapshot or the frame. With none supplied they
 answer `outcome: "unknown"`, and the detail names where one comes from: the UI
 Bridge SDK's `POST /ai/execute-with-diff` records it
 (`ActionDiffResult.timeline`), and the runner's `POST /ui-bridge/vision/assert`
-takes it as `timeline_ref` (a journey edge-observation id).
+takes it as a top-level `timelineRef` (alias `timeline_ref`; a journey
+edge-observation id) — resolution below.
 
 The ten L0 rows above read `Element.media`, plus the box and `visibility_reason`
 to leave out what paints nothing. They need no frame. Ask for media, as the web
@@ -395,6 +396,18 @@ one still loading). For a
 per-image outcome send one assertion per media id, as the example below does.
 Named explicitly, an image the check cannot judge answers `unknown`, not a pass.
 They need a runner that serves these variants.
+
+The three timeline assertions evaluate against the stored timeline of one journey
+edge observation, named by the request's top-level `timelineRef` (its id). The ref
+resolves only within the app the request is about — `target` when one is sent,
+else the runner's own app — so a ref from another app, an unknown id, an
+observation with no stored timeline, a withdrawn or unparseable one, or a ledger
+that cannot be read leaves all three `unknown` with the resolution's own code,
+never a pass. Without a `timelineRef` they are `unknown`.
+The response's `timelineRef` block (`id`, `appId`, `loaded`, `unknown`) says
+which of those happened; its `unknown` field carries the resolution's code
+(`no_observations`, `input_missing`, `stale_input`, `producer_failed` or
+`ledger_schema_absent`).
 
 Every threshold on an image assertion is the CALLER's (a slot spec or the
 visual system); an omitted one answers `outcome: "unknown"`, never a pass.

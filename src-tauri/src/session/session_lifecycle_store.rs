@@ -499,16 +499,24 @@ fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|s| !s.trim().is_empty())
 }
 
-/// The `finished_at` a RESTAMP gets ([`SessionLifecycleStore::set_finished`]
-/// re-finishing an already-finished mark): `now`, unless that EQUALS the old
-/// stamp (two finishes inside one millisecond), in which case one past it.
+/// The `finished_at` a new mark gets when an earlier stamp of the same session
+/// exists — a RESTAMP ([`SessionLifecycleStore::set_finished`] re-finishing an
+/// already-finished mark) or a re-mark after an unmark. `prev` is the highest
+/// such stamp. The answer is `now`, unless `now` is at `prev` or less than one
+/// second behind it, in which case it is one past `prev`.
 ///
-/// The ACK matcher ([`SessionLifecycleStore::mark_finish_synced`]) needs the
-/// two stamps only to DIFFER, so a late ACK of the old row can never sync the
-/// new mark. Taking `now` otherwise — rather than `max(now, prev + 1)` — keeps
-/// a clock stepped backwards from dating the new finish in the future. Pure.
+/// The ACK matcher ([`SessionLifecycleStore::mark_finish_synced`]) compares
+/// stamps for equality, so a late ACK of an old mark must never match the
+/// new one. That needs every new stamp to clear EVERY earlier one, not only
+/// differ from the last: a rule that only avoided equality with `prev` let a
+/// burst inside one millisecond cycle t, t+1, t, so a late ACK of the first
+/// mark synced the third. The one-second bound keeps a clock stepped well
+/// backwards from dating the new finish in the future. The accepted cost: a
+/// stamp may run up to ~1 s ahead of the wall clock, which can put a pane bound
+/// inside that window on the wrong side of a `finished_at` comparison such as
+/// the re-offer's revival guard. Pure.
 fn restamp_at(prev: i64, now: i64) -> i64 {
-    if now == prev {
+    if now <= prev && prev - now < 1_000 {
         prev.saturating_add(1)
     } else {
         now
@@ -1362,6 +1370,14 @@ pub struct SessionLifecycleStore {
     /// this same lock, so a late delivery cannot land its `Finished` after a
     /// concurrent unmark's `working` either.
     finish_forward: Mutex<()>,
+    /// The highest `finished_at` an UNMARK cleared, per Claude session, so the
+    /// next mark of that session is stamped past it ([`restamp_at`]). Without
+    /// it an unmark and a re-mark inside one millisecond give the new mark the OLD stamp, and a late ACK of the old
+    /// mark (the ACK matcher compares `finished_at`) would sync the new one.
+    /// Consumed by the next mark. Process-local by design: it only needs to
+    /// outlive a sub-millisecond window. Taken only while the `map` lock is
+    /// held (lock order `map` then this).
+    unmarked_stamps: Mutex<HashMap<String, i64>>,
 }
 
 /// What [`SessionLifecycleStore::redirect_finish`] did.
@@ -1586,6 +1602,7 @@ impl SessionLifecycleStore {
             finish_observer: OnceLock::new(),
             boot_ms: AtomicI64::new(default_boot_ms()),
             finish_forward: Mutex::new(()),
+            unmarked_stamps: Mutex::new(HashMap::new()),
         };
         if replay.applied > 0 || replay.damaged {
             info!(
@@ -3370,10 +3387,20 @@ impl SessionLifecycleStore {
         }
 
         if finished {
-            rec.finished_at = Some(match rec.finished_at {
-                None => now,
+            // The stamp a preceding unmark cleared, if any: a re-mark after an
+            // unmark must differ from it just as a restamp must.
+            let unmarked = self
+                .unmarked_stamps
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(claude_session_id);
+            rec.finished_at = Some(match (rec.finished_at, unmarked) {
+                (None, None) => now,
                 // A RESTAMP (a re-finish that carried a reason).
-                Some(prev) => restamp_at(prev, now),
+                (Some(prev), hwm) => restamp_at(hwm.map_or(prev, |h| h.max(prev)), now),
+                // A re-mark after an unmark: past every stamp an unmark of
+                // this session has cleared in this window.
+                (None, Some(hwm)) => restamp_at(hwm, now),
             });
             // A fresh or restamped mark is unsynced by definition — the outbox
             // owes coord a write, and the boot reconcile must not revert it
@@ -3386,6 +3413,16 @@ impl SessionLifecycleStore {
             // for ([`awaiting_account_hold`] also refuses a finished row).
             rec.awaiting_account_since = None;
         } else {
+            if let Some(prev) = rec.finished_at {
+                // Keep the HIGHEST cleared stamp, so two unmark/re-mark cycles
+                // in one millisecond (t, t+1, ...) never come back to t.
+                let mut stamps = self
+                    .unmarked_stamps
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let hwm = stamps.entry(claude_session_id.to_string()).or_insert(prev);
+                *hwm = (*hwm).max(prev);
+            }
             rec.finished_at = None;
             rec.finish_reason = None;
             rec.finish_synced = false;
@@ -9413,6 +9450,48 @@ mod tests {
         );
     }
 
+    /// An unmark then a re-mark is stamped through `restamp_at` like a direct
+    /// re-finish, so the new mark never carries the stamp the unmark cleared.
+    #[test]
+    fn a_re_mark_after_an_unmark_never_reuses_the_cleared_stamp() {
+        // Back-to-back mark/unmark/re-mark lands inside one millisecond on most
+        // iterations, which is exactly the window where the re-mark used to
+        // take the cleared stamp again (CI, qontinui-runner#3139 run
+        // 44964663935). Many iterations make that window near-certain.
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        store.record_open(rec("s"));
+        // Every stamp, not only the previous one: two cycles in one
+        // millisecond must not come back to an earlier mark's stamp.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let at = store
+                .set_finished("s", true, None)
+                .unwrap()
+                .record
+                .finished_at
+                .unwrap();
+            assert!(seen.insert(at), "a re-mark reused an earlier stamp {at}");
+            store.set_finished("s", false, None).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_new_stamp_clears_every_earlier_one_and_never_runs_far_ahead() {
+        assert_eq!(restamp_at(1_000, 1_000), 1_001, "equal-now moves past it");
+        assert_eq!(restamp_at(1_001, 1_000), 1_002, "behind the high-water too");
+        assert_eq!(
+            restamp_at(1_000, 5_000),
+            5_000,
+            "a later clock is taken as-is"
+        );
+        assert_eq!(
+            restamp_at(10_000, 400),
+            400,
+            "a clock stepped far back is not dated into the future"
+        );
+    }
+
     /// Review round 2, L-a: every observer hand-off — a fresh mark, the
     /// no-op retry's snapshot, an unmark — runs with `finish_forward` held,
     /// so a concurrent unmark cannot enqueue between a snapshot and its
@@ -9474,12 +9553,12 @@ mod tests {
         );
     }
 
-    /// A restamp only has to DIFFER from the old stamp (that is all the ACK
-    /// matcher needs): two finishes inside one millisecond still differ, and a
-    /// clock stepped backwards dates the new finish at `now` rather than
-    /// pushing it past the old one into the future.
+    /// A restamp always clears the old stamp: two finishes inside one
+    /// millisecond, or a clock less than a second behind, give one past it;
+    /// a clock stepped back a second or more dates the new finish at `now`
+    /// rather than pushing it far into the future.
     #[test]
-    fn a_restamp_always_differs_and_never_runs_ahead_of_the_clock() {
+    fn a_restamp_always_differs_and_never_runs_far_ahead_of_the_clock() {
         assert_eq!(restamp_at(1_000, 1_000), 1_001, "equal-now still differs");
         assert_eq!(
             restamp_at(1_000, 5_000),
@@ -9488,8 +9567,13 @@ mod tests {
         );
         assert_eq!(
             restamp_at(1_000, 400),
+            1_001,
+            "a clock less than a second behind still clears the old stamp"
+        );
+        assert_eq!(
+            restamp_at(5_000, 400),
             400,
-            "a clock stepped back is not pushed into the future"
+            "a clock stepped far back is not pushed into the future"
         );
         for (prev, now) in [(1_000, 1_000), (1_000, 5_000), (1_000, 400)] {
             assert_ne!(restamp_at(prev, now), prev);
