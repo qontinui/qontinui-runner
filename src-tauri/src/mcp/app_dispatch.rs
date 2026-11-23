@@ -268,7 +268,10 @@ impl AppDispatcher {
         let payload = payload.for_transport(entry.transport);
 
         match entry.transport {
-            AppTransport::Websocket => self.websocket_arm(app_id, action, &entry, payload).await,
+            AppTransport::Websocket => {
+                self.websocket_arm(app_id, action, &entry, None, payload)
+                    .await
+            }
             AppTransport::Http => {
                 let base = entry.app.url.trim_end_matches('/');
                 let base_path = entry.app.base_path.trim_end_matches('/');
@@ -321,11 +324,16 @@ impl AppDispatcher {
 
     /// The WebSocket arm of [`Self::dispatch`], for an `entry` already read
     /// as WebSocket-registered.
+    ///
+    /// `pinned` is the connection the caller must reach and no other (see
+    /// [`Self::dispatch_websocket_pinned`]); `None` routes to whichever
+    /// connection holds `app_id` at send time.
     async fn websocket_arm(
         &self,
         app_id: &str,
         action: &str,
         entry: &RegisteredApp,
+        pinned: Option<u64>,
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, DispatchError> {
         debug!(
@@ -375,7 +383,14 @@ impl AppDispatcher {
             .registry
             .touch(app_id, entry.websocket_conn_id, &entry.principal)
             .await;
-        let response = self.command_relay.dispatch(app_id, action, payload).await?;
+        let response = match pinned {
+            Some(conn_id) => {
+                self.command_relay
+                    .dispatch_to_conn(app_id, conn_id, action, payload)
+                    .await?
+            }
+            None => self.command_relay.dispatch(app_id, action, payload).await?,
+        };
         Ok(response.result.unwrap_or(serde_json::Value::Null))
     }
 
@@ -401,7 +416,47 @@ impl AppDispatcher {
         if entry.transport != AppTransport::Websocket {
             return Err(DispatchError::NotWebsocket(app_id.to_string()));
         }
-        self.websocket_arm(app_id, action, &entry, payload).await
+        self.websocket_arm(app_id, action, &entry, None, payload)
+            .await
+    }
+
+    /// [`Self::dispatch_websocket`], pinned to connection `conn_id`: the
+    /// command reaches that connection or nothing.
+    ///
+    /// For a caller that read a property of ONE connection — the capabilities
+    /// its register frame advertised — and must not have the command land on
+    /// a replacement that never advertised it. Refused with
+    /// [`CommandRelayError::Displaced`] when the app's row already names
+    /// another connection, or when the relay's routing slot has moved by the
+    /// time of the send ([`CommandRelay::dispatch_to_conn`] checks and sends
+    /// under one lock). The enqueue-time liveness refresh of
+    /// [`Self::websocket_arm`] is kept, guarded on `conn_id`.
+    pub async fn dispatch_websocket_pinned(
+        &self,
+        app_id: &str,
+        conn_id: u64,
+        action: &str,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, DispatchError> {
+        let entry = self
+            .registry
+            .get_live(app_id)
+            .await
+            .ok_or_else(|| DispatchError::NotRegistered(app_id.to_string()))?;
+        if entry.transport != AppTransport::Websocket {
+            return Err(DispatchError::NotWebsocket(app_id.to_string()));
+        }
+        if entry.websocket_conn_id != Some(conn_id) {
+            return Err(DispatchError::WebSocket(CommandRelayError::Displaced(
+                format!(
+                    "app '{app_id}' is now registered on connection {:?}, not the pinned \
+                     connection {conn_id}",
+                    entry.websocket_conn_id
+                ),
+            )));
+        }
+        self.websocket_arm(app_id, action, &entry, Some(conn_id), payload)
+            .await
     }
 
     /// HTTP-only variant of `dispatch_active` for proxy handlers that hit a

@@ -58,25 +58,50 @@ impl FrameProvider for WsRelayScreenshotSource {
 /// The row is READ AGAIN right before every dispatch, and the
 /// [`SCREENSHOT_CAPABILITY`] re-checked on it: a capability-less client that
 /// re-registered under the same id after resolution is refused (422) rather
-/// than sent `getScreenshot` blind. That NARROWS the window, it does not close
-/// it: [`AppDispatcher::dispatch_websocket`] re-reads the row itself, and
-/// [`crate::mcp::command_relay::CommandRelay::dispatch`] then routes by app id
-/// to whichever connection holds it at send time, so a capability-less client
-/// that re-registers in the microseconds between this check and the send can
-/// still receive the command — it answers `NO_HANDLER`, which surfaces as
-/// `CaptureFailed`. Closing it needs a relay dispatch pinned to the checked
-/// `websocket_conn_id`. A registration that turned HTTP is fetched over
-/// HTTP. A flip to HTTP between that read and the dispatch
-/// ([`DispatchError::NotWebsocket`]) is re-resolved ONCE; a second flip is
-/// [`FrameSourceError::Unreachable`]. A row that is gone was live when the
-/// capture was routed, so that is `Unreachable` (502, retryable), not an
-/// unknown target.
+/// than sent `getScreenshot` blind. The dispatch is then PINNED to the
+/// `websocket_conn_id` that row named
+/// ([`AppDispatcher::dispatch_websocket_pinned`]): the command reaches the
+/// connection whose capability was just read, or nothing. A client that
+/// re-registers between the check and the send — the window the unpinned
+/// `dispatch_websocket` left open, where a capability-less replacement
+/// received the command and answered `NO_HANDLER` — makes the pinned
+/// dispatch refuse with [`CommandRelayError::Displaced`] (the relay checks
+/// the routing slot and sends under one lock), and the capture loops back to
+/// the re-read, so that replacement is refused 422 `FRAME_SOURCE_UNSUPPORTED`
+/// while a capable one is captured on its new connection.
+///
+/// A registration that turned HTTP is fetched over HTTP. A flip to HTTP
+/// between that read and the dispatch ([`DispatchError::NotWebsocket`]) or a
+/// replaced connection is re-resolved ONCE; a second one is
+/// [`FrameSourceError::Unreachable`] (retryable). A row that is gone was live
+/// when the capture was routed, so that is `Unreachable` (502, retryable),
+/// not an unknown target.
 pub(crate) async fn capture_over_relay(
     dispatcher: &AppDispatcher,
     registry: &AppRegistry,
     app_id: &str,
 ) -> Result<Frame, FrameSourceError> {
-    for attempt in 0..2 {
+    capture_over_relay_with(dispatcher, registry, app_id, || async {}).await
+}
+
+/// How many times [`capture_over_relay`] reads the row: the first read plus
+/// ONE re-resolution after a transport flip or a replaced connection.
+const CAPTURE_ATTEMPTS: u32 = 2;
+
+/// [`capture_over_relay`], with `after_capability_read` run between the
+/// capability check and the dispatch — a no-op in production; the seam lets a
+/// test re-register the app at exactly the point the pinning protects.
+async fn capture_over_relay_with<F, Fut>(
+    dispatcher: &AppDispatcher,
+    registry: &AppRegistry,
+    app_id: &str,
+    mut after_capability_read: F,
+) -> Result<Frame, FrameSourceError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    for attempt in 0..CAPTURE_ATTEMPTS {
         let entry = registry
             .get_live(app_id)
             .await
@@ -89,24 +114,44 @@ pub(crate) async fn capture_over_relay(
             }
             AppTransport::Websocket => {
                 require_screenshot_capability(app_id, &entry)?;
+                let conn_id = entry.websocket_conn_id.ok_or_else(|| {
+                    from_dispatch_error(
+                        app_id,
+                        DispatchError::WebSocket(CommandRelayError::NotConnected(
+                            app_id.to_string(),
+                        )),
+                    )
+                })?;
+                after_capability_read().await;
                 match dispatcher
-                    .dispatch_websocket(app_id, SCREENSHOT_ACTION, json!({}))
+                    .dispatch_websocket_pinned(app_id, conn_id, SCREENSHOT_ACTION, json!({}))
                     .await
                 {
-                    Err(DispatchError::NotWebsocket(_)) if attempt == 0 => continue,
+                    Err(e) if is_rerouted(&e) && attempt + 1 < CAPTURE_ATTEMPTS => continue,
                     result => return decode(app_id, result),
                 }
             }
         }
     }
-    // Reached only if attempt 1 ALSO hit `NotWebsocket` — impossible as the
-    // loop is written (the `if attempt == 0` guard sends attempt 1's result to
-    // `decode`), but the compiler cannot see that, and if the guard ever
-    // changes this is the honest answer: the row flipped transport twice.
+    // Reached only if the LAST attempt was rerouted too — impossible as the
+    // loop is written (the `attempt + 1 < CAPTURE_ATTEMPTS` guard sends the
+    // last attempt's result to `decode`), but the compiler cannot see that,
+    // and if the guard ever changes this is the honest answer: the row moved
+    // on every attempt.
     Err(from_dispatch_error(
         app_id,
         DispatchError::NotWebsocket(app_id.to_string()),
     ))
+}
+
+/// A dispatch refused because the app's registration moved after it was
+/// read — to HTTP, or to another connection. Both are re-resolved from a
+/// fresh row rather than reported.
+fn is_rerouted(err: &DispatchError) -> bool {
+    matches!(
+        err,
+        DispatchError::NotWebsocket(_) | DispatchError::WebSocket(CommandRelayError::Displaced(_))
+    )
 }
 
 /// The app's row vanished after the capture was routed to it.
@@ -133,7 +178,7 @@ fn decode(
     })
 }
 
-/// Map every failure [`AppDispatcher::dispatch_websocket`] can return.
+/// Map every failure [`AppDispatcher::dispatch_websocket_pinned`] can return.
 pub(crate) fn from_dispatch_error(app_id: &str, err: DispatchError) -> FrameSourceError {
     let unreachable = |message: String, retryable: Option<bool>| FrameSourceError::Unreachable {
         message,
@@ -183,7 +228,7 @@ pub(crate) fn from_dispatch_error(app_id: &str, err: DispatchError) -> FrameSour
                 FrameSourceError::RunnerCapture(format!("app '{app_id}': {e}"))
             }
         },
-        // The HTTP-arm variants: `dispatch_websocket` never takes that arm,
+        // The HTTP-arm variants: the WebSocket dispatch never takes that arm,
         // but every variant is mapped rather than defaulted.
         DispatchError::AppAnswered {
             error,
@@ -425,6 +470,162 @@ mod tests {
         assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY, "{err:?}");
         assert_eq!(err.code(), "FRAME_SOURCE_UNSUPPORTED");
         assert!(rx.try_recv().is_err(), "no getScreenshot may be sent blind");
+    }
+
+    /// Re-register `app_id` on a FRESH connection advertising `capabilities`
+    /// — the wrapper reconnecting. Returns the new conn id and its outbound
+    /// channel.
+    async fn reconnect(
+        relay: &CommandRelay,
+        registry: &AppRegistry,
+        app_id: &str,
+        capabilities: &[&str],
+    ) -> (u64, tokio::sync::mpsc::Receiver<String>) {
+        let (conn_id, rx) = relay.ws_manager().test_register(app_id).await;
+        let mut app = sample_app(app_id, "ws://runner/ui-bridge/ws");
+        app.capabilities = capabilities.iter().map(|c| c.to_string()).collect();
+        registry
+            .upsert(app, None, AppTransport::Websocket, Some(conn_id), None)
+            .await;
+        (conn_id, rx)
+    }
+
+    /// A screenshot reply for `command_id`, resolved on `conn_id`.
+    async fn answer_screenshot(relay: &CommandRelay, conn_id: u64, command_id: String) {
+        relay
+            .resolve(
+                conn_id,
+                BindingMode::Enforce,
+                CommandResponse {
+                    command_id,
+                    success: true,
+                    result: Some(json!({"screenshot": png_b64(80, 40), "width": 80, "height": 40})),
+                    error: None,
+                },
+            )
+            .await;
+    }
+
+    type Replacement = Arc<tokio::sync::Mutex<Option<(u64, tokio::sync::mpsc::Receiver<String>)>>>;
+
+    /// A hook that reconnects `app_id` advertising `capabilities` the FIRST
+    /// time it runs — between the capability read and the send — and parks
+    /// the new connection in the returned slot.
+    fn reconnect_once(
+        relay: &Arc<CommandRelay>,
+        registry: &Arc<AppRegistry>,
+        app_id: &'static str,
+        capabilities: &'static [&'static str],
+    ) -> (
+        Replacement,
+        impl FnMut() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+    ) {
+        let slot: Replacement = Arc::new(tokio::sync::Mutex::new(None));
+        let (relay, registry, hook_slot) = (relay.clone(), registry.clone(), slot.clone());
+        let mut reconnected = false;
+        let hook = move || {
+            let first = !reconnected;
+            reconnected = true;
+            let (relay, registry, slot) = (relay.clone(), registry.clone(), hook_slot.clone());
+            Box::pin(async move {
+                if first {
+                    *slot.lock().await =
+                        Some(reconnect(&relay, &registry, app_id, capabilities).await);
+                }
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        };
+        (slot, hook)
+    }
+
+    /// Phase 2 (plan `2026-11-22-vision-capture-websocket-follow-ups`): the
+    /// capability is read on one connection, and a capability-LESS client
+    /// reconnects under the same id before the send. The capture is refused
+    /// 422 FRAME_SOURCE_UNSUPPORTED, and NOTHING reaches either connection —
+    /// before the pin, the command was routed to the replacement, which
+    /// answered `NO_HANDLER`.
+    #[tokio::test]
+    async fn a_capability_less_reconnect_after_the_capability_read_is_refused_422() {
+        let (dispatcher, registry, relay, _old_conn, mut old_rx) =
+            ws_app("wapp", &[SCREENSHOT_CAPABILITY], Duration::from_secs(5)).await;
+        let (slot, hook) = reconnect_once(&relay, &registry, "wapp", &["control"]);
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            capture_over_relay_with(&dispatcher, &registry, "wapp", hook),
+        )
+        .await
+        .expect("the capture settles without waiting on a reply")
+        .expect_err("a capability-less replacement must be refused");
+        assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY, "{err:?}");
+        assert_eq!(err.code(), "FRAME_SOURCE_UNSUPPORTED");
+        let (_new_conn, mut new_rx) = slot.lock().await.take().expect("reconnected");
+        assert!(
+            new_rx.try_recv().is_err(),
+            "getScreenshot reached a connection that never advertised screenshot"
+        );
+        assert!(
+            old_rx.try_recv().is_err(),
+            "the replaced connection got a frame"
+        );
+        assert_eq!(relay.pending_count().await, 0);
+    }
+
+    /// The same connection between the capability read and the send (its
+    /// row merely refreshed) is captured: the pin does not refuse the
+    /// connection it was taken from.
+    #[tokio::test]
+    async fn the_same_connection_after_the_capability_read_is_captured() {
+        let (dispatcher, registry, relay, conn_id, mut rx) =
+            ws_app("wapp", &[SCREENSHOT_CAPABILITY], Duration::from_secs(5)).await;
+        let hook_registry = registry.clone();
+        let pending = tokio::spawn(async move {
+            capture_over_relay_with(&dispatcher, &registry, "wapp", || {
+                let registry = hook_registry.clone();
+                async move {
+                    let mut app = sample_app("wapp", "ws://runner/ui-bridge/ws");
+                    app.capabilities = vec![SCREENSHOT_CAPABILITY.to_string()];
+                    registry
+                        .upsert(app, None, AppTransport::Websocket, Some(conn_id), None)
+                        .await;
+                }
+            })
+            .await
+        });
+        let command_id = screenshot_command(&mut rx).await;
+        answer_screenshot(&relay, conn_id, command_id).await;
+        let frame = pending.await.unwrap().expect("frame");
+        assert_eq!((frame.width, frame.height), (80, 40));
+    }
+
+    /// A CAPABLE client that reconnects between the read and the send is
+    /// re-resolved and captured on its NEW connection — never on the old one.
+    #[tokio::test]
+    async fn a_capable_reconnect_after_the_capability_read_is_captured_on_the_new_connection() {
+        let (dispatcher, registry, relay, _old_conn, mut old_rx) =
+            ws_app("wapp", &[SCREENSHOT_CAPABILITY], Duration::from_secs(5)).await;
+        let (slot, hook) = reconnect_once(&relay, &registry, "wapp", &[SCREENSHOT_CAPABILITY]);
+        let pending = tokio::spawn(async move {
+            capture_over_relay_with(&dispatcher, &registry, "wapp", hook).await
+        });
+        let (new_conn, mut new_rx) = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(r) = slot.lock().await.take() {
+                    break r;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the hook reconnected");
+        let command_id = screenshot_command(&mut new_rx).await;
+        answer_screenshot(&relay, new_conn, command_id).await;
+        pending
+            .await
+            .unwrap()
+            .expect("frame from the new connection");
+        assert!(
+            old_rx.try_recv().is_err(),
+            "the replaced connection got a frame"
+        );
     }
 
     /// A4: a row that vanished after routing is 502 APP_UNREACHABLE, retryable.
