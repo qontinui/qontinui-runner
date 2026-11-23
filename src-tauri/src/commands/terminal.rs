@@ -130,11 +130,9 @@ pub(crate) fn rebind_adopted_coord_session(
 /// How long [`rebind_adopted_terminal`] waits for `setup()` to manage the
 /// `SessionRegistry` before it gives the rebind up. The boot sweep starts in
 /// `setup()` well before the registry is managed, so a fast census can adopt a
-/// pane first; the wait is on the sweep's own OS thread.
-///
-/// Deliberately NOT a term of `holder_boot_sweep::RESTORE_WAIT`: it ends when
-/// `setup()` reaches `mark_runtime_ready` (right after the registry is
-/// managed), which nothing the sweep's own steps do can delay.
+/// pane first. The rebind runs on its own thread, off the sweep's settle path
+/// (`holder_boot_sweep::spawn_adoption_rebind`), so neither this wait nor the
+/// resume probe after it is a term of `holder_boot_sweep::RESTORE_WAIT`.
 const ADOPTION_REGISTRY_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Wait (bounded by `bound`, polling) until `ready` answers true. Returns
@@ -198,15 +196,9 @@ pub(crate) fn rebind_adopted_terminal(
         );
         return None;
     };
-    // A row another live pane of this runner is bound to — or one another
-    // create is resuming right now — is not this pane's to resume: two panes
-    // on one coord row would each close it on exit (finding 77046422, the
-    // rule `coord_wiring::wire_coord_session` applies to every resume). The
-    // claim is held from that check until the adopted pane is bound.
     let resume_claim: std::cell::RefCell<Option<crate::session::pane_store::ResumeClaim>> =
         std::cell::RefCell::new(None);
     let resume_registry = registry.clone();
-    let claim_store = pane_store.clone();
     // Re-key the resumed row to the harness session id this pane's process was
     // pinned to at spawn, exactly as `terminal_create`'s resume arm does (plan
     // 2026-10-23-a-hookless-resume-in-a-runner-pane-leaves-the-session-with-no-active-coord-row,
@@ -221,62 +213,101 @@ pub(crate) fn rebind_adopted_terminal(
         &pane_store,
         intent_sharing_from_settings(),
         |prior, intent| {
-            let Some(claim) = claim_store.claim_resume(prior) else {
-                return Err("another create is resuming this coord row right now".to_string());
-            };
-            match terminal_manager.coord_row_bound_at(prior) {
-                Some(None) => {}
-                Some(Some(_)) => {
-                    return Err("another live pane is bound to this coord row".to_string())
-                }
-                None => return Err("the terminal map is unreadable (UNKNOWN)".to_string()),
-            }
-            *resume_claim.borrow_mut() = Some(claim);
-            tauri::async_runtime::block_on(resume_registry.resume_external(
-                prior,
-                intent,
-                pinned_session_id,
-            ))
-            .map_err(|e| e.to_string())
+            adoption_resume_guarded(terminal_manager, &pane_store, prior, &resume_claim, || {
+                tauri::async_runtime::block_on(resume_registry.resume_external(
+                    prior,
+                    intent,
+                    pinned_session_id,
+                ))
+                .map_err(|e| e.to_string())
+            })
         },
         // The resumed row's registry record carries the binding's tenant and
         // intent, which `bind_registered_coord_session` reads back and
         // re-records.
         |coord_id, _binding| {
             let _rt = rt.enter();
-            coord_wiring::bind_registered_coord_session(
+            adoption_bind_resumed(
                 terminal_manager,
                 &registry,
-                session.id(),
+                &pane_store,
+                &session,
                 coord_id,
-                Some(pane_store.clone()),
-                "holder_adoption",
+                &resume_claim,
             );
-            // Bound: the terminal map alone protects the row from here on.
-            drop(resume_claim.borrow_mut().take());
-            // The hook is installed FIRST and the exit checked AFTER (the
-            // relay's remote-create pattern): a pane that exited before the
-            // hook was in place — during the registry wait or the resume — ran
-            // its exit with no hook, so close the row it just resumed here.
-            // An exit after the install fires the hook; both is a no-op repeat.
-            // The REAL exit is the waiter's `exit_snapshot`, never `!is_alive()`:
-            // a handoff detach (a restart landing inside this window) also
-            // clears `alive`, and closing then would retire a live process's
-            // row and drop the binding the next runner adopts it by.
-            if session.exit_snapshot().is_some() {
-                if let Err(e) = registry.close_by_id(coord_id) {
-                    warn!(
-                        terminal_id = %session.id(),
-                        coord_session = %coord_id,
-                        error = %e,
-                        "adoption: the adopted pane exited before its hook was installed — \
-                         coord session close failed"
-                    );
-                }
-                pane_store.remove_terminal(session.id());
-            }
         },
     )
+}
+
+/// The resume half of [`rebind_adopted_terminal`]. A row another live pane of
+/// this runner is bound to — or one another create is resuming right now — is
+/// not this pane's to resume: two panes on one coord row would each close it on
+/// exit (finding 77046422, the rule `coord_wiring::wire_coord_session` applies
+/// to every resume). An unreadable terminal map is UNKNOWN and refused the same
+/// way. Otherwise the resume claim is parked in `claim_slot` — held until
+/// [`adoption_bind_resumed`] has bound the pane — and `resume` runs.
+fn adoption_resume_guarded(
+    terminal_manager: &TerminalManager,
+    pane_store: &PaneSessionStore,
+    prior: uuid::Uuid,
+    claim_slot: &std::cell::RefCell<Option<crate::session::pane_store::ResumeClaim>>,
+    resume: impl FnOnce() -> Result<uuid::Uuid, String>,
+) -> Result<uuid::Uuid, String> {
+    let Some(claim) = pane_store.claim_resume(prior) else {
+        return Err("another create is resuming this coord row right now".to_string());
+    };
+    match terminal_manager.coord_row_bound_at(prior) {
+        Some(None) => {}
+        Some(Some(_)) => return Err("another live pane is bound to this coord row".to_string()),
+        None => return Err("the terminal map is unreadable (UNKNOWN)".to_string()),
+    }
+    *claim_slot.borrow_mut() = Some(claim);
+    resume()
+}
+
+/// The wire half of [`rebind_adopted_terminal`], run under a tokio runtime:
+/// bind the adopted pane to its resumed coord row through the shared wiring
+/// (`coord_wiring::bind_registered_coord_session` — hook, holder binding,
+/// output pipe), release the resume claim, then catch an exit that came first.
+///
+/// The hook is installed FIRST and the exit checked AFTER (the relay's
+/// remote-create pattern): a pane that exited before the hook was in place —
+/// during the registry wait or the resume — ran its exit with no hook, so the
+/// row it just resumed is closed here. An exit after the install fires the
+/// hook; both is a no-op repeat. The REAL exit is the waiter's
+/// `exit_snapshot`, never `!is_alive()`: a handoff detach (a restart landing
+/// inside this window) also clears `alive`, and closing then would retire a
+/// live process's row and drop the binding the next runner adopts it by.
+fn adoption_bind_resumed(
+    terminal_manager: &TerminalManager,
+    registry: &Arc<SessionRegistry>,
+    pane_store: &Arc<PaneSessionStore>,
+    session: &crate::terminal::session::TerminalSession,
+    coord_id: uuid::Uuid,
+    claim_slot: &std::cell::RefCell<Option<crate::session::pane_store::ResumeClaim>>,
+) {
+    coord_wiring::bind_registered_coord_session(
+        terminal_manager,
+        registry,
+        session.id(),
+        coord_id,
+        Some(pane_store.clone()),
+        "holder_adoption",
+    );
+    // Bound: the terminal map alone protects the row from here on.
+    drop(claim_slot.borrow_mut().take());
+    if session.exit_snapshot().is_some() {
+        if let Err(e) = registry.close_by_id(coord_id) {
+            warn!(
+                terminal_id = %session.id(),
+                coord_session = %coord_id,
+                error = %e,
+                "adoption: the adopted pane exited before its hook was installed — \
+                 coord session close failed"
+            );
+        }
+        pane_store.remove_terminal(session.id());
+    }
 }
 
 /// Parse a spawn surface's optional tenant argument.
@@ -3845,6 +3876,122 @@ mod adoption_coord_tests {
             local.coord_session_id().is_some(),
             "still bound to its coord row"
         );
+    }
+
+    /// The production rebind's resume half (rebase review A2): a free row is
+    /// resumed with its claim parked until the bind; a row another create is
+    /// resuming, or one another live pane is bound to, is refused without
+    /// running the resume and without parking a claim.
+    #[test]
+    fn the_adoption_resume_refuses_a_row_it_cannot_prove_free() {
+        use std::cell::RefCell;
+        let dir = tempfile::tempdir().unwrap();
+        let store = PaneSessionStore::open(dir.path().join("panes.json")).unwrap();
+        let tm = TerminalManager::new();
+        let row = uuid::Uuid::new_v4();
+
+        let slot = RefCell::new(None);
+        assert_eq!(
+            adoption_resume_guarded(&tm, &store, row, &slot, || Ok(row)),
+            Ok(row)
+        );
+        assert!(slot.borrow().is_some(), "the claim is held until the bind");
+
+        // Another create (the claim above) is resuming the same row.
+        let other = RefCell::new(None);
+        let mut ran = false;
+        assert!(adoption_resume_guarded(&tm, &store, row, &other, || {
+            ran = true;
+            Ok(row)
+        })
+        .is_err());
+        assert!(!ran, "a refused resume never runs");
+        assert!(other.borrow().is_none());
+        drop(slot.borrow_mut().take());
+
+        // A live pane of this runner is bound to the row.
+        let holder = Arc::new(pane(&format!("bound-{}", uuid::Uuid::new_v4())));
+        tm.insert_for_test(holder.id(), holder.clone());
+        tm.bind_coord_session(&holder, row);
+        let mut ran = false;
+        assert!(adoption_resume_guarded(&tm, &store, row, &other, || {
+            ran = true;
+            Ok(row)
+        })
+        .is_err());
+        assert!(!ran, "a row another live pane holds is never resumed");
+        assert!(other.borrow().is_none());
+        assert!(
+            store.claim_resume(row).is_some(),
+            "a refusal releases its claim"
+        );
+    }
+
+    /// The production rebind's wire half (rebase review A2), over a real
+    /// `SessionRegistry`: it binds the adopted pane, records its holder
+    /// binding and releases the claim; and a pane whose process already
+    /// EXITED before the hook was installed has the resumed row closed and its
+    /// binding forgotten.
+    #[tokio::test]
+    async fn the_adoption_bind_wires_the_pane_and_closes_a_row_whose_pane_exited_first() {
+        use std::cell::RefCell;
+        let fx = coord_wiring::test_support::registry();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(PaneSessionStore::open(dir.path().join("panes.json")).unwrap());
+        let tm = TerminalManager::new();
+        let register = || {
+            fx.registry
+                .register_external_with_lineage(
+                    coord_wiring::terminal_shell_intent(
+                        Some("adoption test"),
+                        "x",
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    ),
+                    None,
+                    None,
+                )
+                .expect("registers")
+        };
+        let state = |id| fx.registry.describe_by_id(id).expect("row").state;
+
+        // Live pane: bound, binding recorded, row left active, claim released.
+        let live_id = format!("adopt-live-{}", uuid::Uuid::new_v4());
+        let live = Arc::new(pane(&live_id));
+        tm.insert_for_test(&live_id, live.clone());
+        let live_row = register();
+        let slot = RefCell::new(store.claim_resume(live_row));
+        assert!(slot.borrow().is_some());
+        adoption_bind_resumed(&tm, &fx.registry, &store, &live, live_row, &slot);
+        assert_eq!(live.coord_session_id(), Some(live_row));
+        assert!(slot.borrow().is_none(), "the claim is released once bound");
+        assert!(store.claim_resume(live_row).is_some());
+        assert_eq!(
+            adoption_prior_binding(&store, &live_id).map(|b| b.coord_id),
+            Some(live_row)
+        );
+        assert!(
+            !matches!(state(live_row), crate::session::SessionState::Closed),
+            "a live adopted pane's row stays open"
+        );
+
+        // A pane that exited during the registry wait / the resume.
+        let gone_id = format!("adopt-gone-{}", uuid::Uuid::new_v4());
+        let gone = Arc::new(pane(&gone_id));
+        tm.insert_for_test(&gone_id, gone.clone());
+        assert!(!gone.settle_waiter_for_test(Ok(0), &RecordingWaiterEffects::default()));
+        assert!(gone.exit_snapshot().is_some());
+        let gone_row = register();
+        let slot = RefCell::new(store.claim_resume(gone_row));
+        adoption_bind_resumed(&tm, &fx.registry, &store, &gone, gone_row, &slot);
+        assert!(
+            matches!(state(gone_row), crate::session::SessionState::Closed),
+            "the row a pane that already exited was resumed onto is closed"
+        );
+        assert_eq!(adoption_prior_binding(&store, &gone_id), None);
     }
 
     #[test]
