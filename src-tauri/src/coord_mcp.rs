@@ -12838,17 +12838,27 @@ fn session_nonce(terminal_id: &str, workdir: Option<&str>) -> SessionNonce {
 /// overlap ([`repo_expectation_from_session_nonce`]); each is UNKNOWN, never
 /// "no credential":
 /// - `coord_mcp_delivery_unrecorded` — this process never recorded a delivery
-///   for the terminal (an adopted holder pane, a previous process's terminal);
+///   for the terminal (a previous process's terminal, or an adopted pane whose
+///   restored binding carries no terminal id);
 /// - `no_session_nonce` — the seam delivered the terminal no key, or delivered
 ///   the cwd's file but no `workdir` was given to read it from;
 /// - `no_runner_nonce_in_cwd_file` — the cwd's `.mcp.json` holds no runner key
-///   now.
+///   now;
+/// - `nonce_not_live` — a key was found but is not a live binding in this
+///   process (revoked, expired, or another runner's).
+///
+/// `workdir` must be the hosting lifecycle record's cwd, never request input:
+/// the file it names is the credential's source.
 pub(crate) fn terminal_session_credential(
     terminal_id: &str,
     workdir: Option<&str>,
 ) -> Result<String, &'static str> {
     match session_nonce(terminal_id, workdir) {
-        SessionNonce::Nonce(Some(nonce)) => Ok(nonce),
+        // Both arms are checked live here, not only the per-terminal one:
+        // the cwd file can outlive its key (revoked, expired, another
+        // runner's), and a door comparing against a dead key would admit it.
+        SessionNonce::Nonce(Some(nonce)) if live_binding(&nonce).is_some() => Ok(nonce),
+        SessionNonce::Nonce(Some(_)) => Err("nonce_not_live"),
         SessionNonce::Nonce(None) => Err("no_runner_nonce_in_cwd_file"),
         SessionNonce::NoNonce => Err("no_session_nonce"),
         SessionNonce::DeliveryUnrecorded => Err("coord_mcp_delivery_unrecorded"),
@@ -27158,6 +27168,32 @@ mod spawn_tenant_credential_tests {
         assert_eq!(
             terminal_session_credential(&foreign_term, Some(&foreign)),
             Err("no_runner_nonce_in_cwd_file")
+        );
+
+        // A runner-shaped key that this process holds no live binding for.
+        let stale = workdir(&amb, "cred-unknown-stale");
+        write_coord_mcp_proxy_config(&stale, PORT, None);
+        let stale_mcp = Path::new(&stale).join(".mcp.json");
+        let live_key = read_proxy_nonce(&stale_mcp).expect("a cwd key");
+        let dead_key = "f".repeat(live_key.len());
+        assert_ne!(live_key, dead_key);
+        let body = std::fs::read_to_string(&stale_mcp).unwrap();
+        assert!(
+            body.contains(&live_key),
+            "the key is inline in the http document"
+        );
+        std::fs::write(&stale_mcp, body.replace(&live_key, &dead_key)).unwrap();
+        assert_eq!(
+            read_proxy_nonce(&stale_mcp).as_deref(),
+            Some(dead_key.as_str())
+        );
+        let stale_term = terminal();
+        let delivered = deliver_terminal_coord_mcp(&stale, &stale_term, None, Some(PORT)).unwrap();
+        assert_eq!(delivered.delivery, CoordMcpDelivery::WorkdirDeclared);
+        assert_eq!(
+            terminal_session_credential(&stale_term, Some(&stale)),
+            Err("nonce_not_live"),
+            "a key in the cwd file that no live binding backs is not the credential"
         );
     }
 
