@@ -159,17 +159,38 @@ pub fn mint_tenant(
 /// How long a tenant's `transcript_sync_enabled` answer is reused.
 const POLICY_REUSE: Duration = Duration::from_secs(300);
 
-static POLICY_CACHE: Mutex<Option<HashMap<Uuid, (Instant, bool)>>> = Mutex::new(None);
+/// How long a NOT ESTABLISHED answer is reused. Short: a dark coord must not
+/// make every adoption of a boot storm wait out its own request timeout, but a
+/// recovered coord should be heard within moments.
+const POLICY_REUSE_UNKNOWN: Duration = Duration::from_secs(20);
+
+static POLICY_CACHE: Mutex<Option<HashMap<Uuid, (Instant, Option<bool>)>>> = Mutex::new(None);
 static POLICY_FETCH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-fn cached_policy(tenant: Uuid) -> Option<bool> {
+/// `Some(answer)` when a fresh answer (possibly NOT ESTABLISHED) is cached.
+fn cached_policy(tenant: Uuid) -> Option<Option<bool>> {
     let g = POLICY_CACHE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     g.as_ref()
         .and_then(|m| m.get(&tenant))
-        .filter(|(at, _)| at.elapsed() < POLICY_REUSE)
+        .filter(|(at, v)| {
+            at.elapsed()
+                < if v.is_some() {
+                    POLICY_REUSE
+                } else {
+                    POLICY_REUSE_UNKNOWN
+                }
+        })
         .map(|(_, v)| *v)
+}
+
+fn remember_policy(tenant: Uuid, answer: Option<bool>) {
+    POLICY_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_or_insert_with(HashMap::new)
+        .insert(tenant, (Instant::now(), answer));
 }
 
 /// The tenant's `transcript_sync_enabled`, from coord's `/tenant-policy`
@@ -179,12 +200,25 @@ fn cached_policy(tenant: Uuid) -> Option<bool> {
 /// storm costs one request per tenant.
 async fn tenant_transcript_sync_enabled(tenant: Uuid) -> Option<bool> {
     if let Some(v) = cached_policy(tenant) {
-        return Some(v);
+        return v;
     }
     let _one = POLICY_FETCH.lock().await;
     if let Some(v) = cached_policy(tenant) {
-        return Some(v);
+        return v;
     }
+    let answer = fetch_policy(tenant).await;
+    remember_policy(tenant, answer);
+    answer
+}
+
+/// Unit tests never reach coord: an unseeded tenant is NOT ESTABLISHED.
+#[cfg(test)]
+async fn fetch_policy(_tenant: Uuid) -> Option<bool> {
+    None
+}
+
+#[cfg(not(test))]
+async fn fetch_policy(tenant: Uuid) -> Option<bool> {
     let (base, _src) = qontinui_runner_lib::profiles::coord_base_with_source();
     let url = format!(
         "{}/tenant-policy?tenant_id={tenant}",
@@ -203,13 +237,7 @@ async fn tenant_transcript_sync_enabled(tenant: Uuid) -> Option<bool> {
         return None;
     }
     let body: serde_json::Value = resp.json().await.ok()?;
-    let enabled = body.get("transcript_sync_enabled")?.as_bool()?;
-    POLICY_CACHE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get_or_insert_with(HashMap::new)
-        .insert(tenant, (Instant::now(), enabled));
-    Some(enabled)
+    body.get("transcript_sync_enabled")?.as_bool()
 }
 
 /// Licence a mint: the tenant must be resolvable ([`mint_tenant`]) AND its
@@ -234,6 +262,80 @@ async fn mint_gate() -> Result<Uuid, String> {
         None => Err(format!(
             "tenant {tenant}'s transcript_sync_enabled not established: not minting"
         )),
+    }
+}
+
+/// Pure: the tenants whose `transcript_sync_enabled` must ALL read `true`
+/// before an ADOPTION binds and replays. A live pane's stated tenant names
+/// itself; every other adoption's row belongs to a tenant this code does not
+/// know, so it takes every bound tenant (strictest wins), falling back to the
+/// default binding when no bound set was recorded. Empty means unresolvable
+/// and the adoption is refused. `None` for a mint or defer (not an adoption).
+pub fn adopt_gate_tenants(
+    decision: &Decision,
+    bound: &[Uuid],
+    default_binding: Option<Uuid>,
+) -> Option<Vec<Uuid>> {
+    match decision {
+        Decision::Mint(_) | Decision::Defer(_) => None,
+        Decision::AdoptLivePane {
+            tenant: NewSessionTenant::Stated(t),
+            ..
+        } => Some(vec![*t]),
+        Decision::Adopt(_) | Decision::AdoptLivePane { .. } => {
+            let mut v: Vec<Uuid> = bound.to_vec();
+            if v.is_empty() {
+                v.extend(default_binding);
+            }
+            Some(v)
+        }
+    }
+}
+
+/// Pure: fold per-tenant answers into the adoption verdict. Anything but an
+/// observed `true` for every tenant (including an empty tenant set) refuses.
+pub fn adopt_verdict(answers: &[(Uuid, Option<bool>)]) -> Result<(), String> {
+    if answers.is_empty() {
+        return Err("no tenant resolved for the adoption: not binding".to_string());
+    }
+    for (t, a) in answers {
+        match a {
+            Some(true) => {}
+            Some(false) => return Err(format!("tenant {t} has transcript sync off: not adopting")),
+            None => {
+                return Err(format!(
+                    "tenant {t}'s transcript_sync_enabled not established: not adopting"
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Licence an adoption the way [`mint_gate`] licenses a mint: the binding
+/// replays the transcript into a coord row and stamps the absolute
+/// `config_dir`, which a tenant that opted out has not agreed to send.
+/// Non-adoption decisions pass through unchanged.
+async fn adopt_gate(decision: Decision) -> Decision {
+    let Some(tenants) = adopt_gate_tenants(
+        &decision,
+        &crate::egress::bound_tenant_ids(),
+        crate::auth::default_binding_tenant(),
+    ) else {
+        return decision;
+    };
+    let mut answers = Vec::with_capacity(tenants.len());
+    for t in tenants {
+        let answer = tenant_transcript_sync_enabled(t).await;
+        answers.push((t, answer));
+        // One refusal settles it: do not ask the remaining tenants.
+        if answer != Some(true) {
+            break;
+        }
+    }
+    match adopt_verdict(&answers) {
+        Ok(()) => decision,
+        Err(why) => Decision::Defer(why),
     }
 }
 
@@ -487,8 +589,19 @@ where
             }
         }
     };
-    let permitted = crate::egress::transcript_sync_gate_session(bind_scope(&decision)).is_open();
-    let (t, p, d) = (tailer.clone(), path.to_path_buf(), decision.clone());
+    // The adoption licence: the decision RETURNED is what was settled; what is
+    // APPLIED is that decision unless a bound tenant's sync is not observed ON.
+    let applied = adopt_gate(decision.clone()).await;
+    if let Decision::Defer(why) = &applied {
+        if applied != decision {
+            info!(
+                "transcript_autobind: {} — adoption refused: {why}",
+                identity.claude_session_id
+            );
+        }
+    }
+    let permitted = crate::egress::transcript_sync_gate_session(bind_scope(&applied)).is_open();
+    let (t, p, d) = (tailer.clone(), path.to_path_buf(), applied);
     let joined = qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
         apply_decision(&t, &identity, &p, &d, permitted).inspect(|k| t.note_autobind(*k))
     })
@@ -680,6 +793,93 @@ mod tests {
     use crate::session::SessionEventKind;
 
     const CSID: &str = "7e0b5d6a-9b8e-4f2c-a3d1-c1d9f0e7a2b4";
+
+    #[test]
+    fn adoption_needs_every_resolved_tenant_to_observe_sync_on() {
+        let (a, b) = (Uuid::from_u128(0xad01), Uuid::from_u128(0xad02));
+        let row = Uuid::from_u128(0xad03);
+        // Live pane with a stated tenant: just that tenant.
+        let pane = Decision::AdoptLivePane {
+            row,
+            tenant: NewSessionTenant::Stated(a),
+        };
+        assert_eq!(adopt_gate_tenants(&pane, &[a, b], None), Some(vec![a]));
+        // Coord row / outbox adoption: every bound tenant, else the default.
+        assert_eq!(
+            adopt_gate_tenants(&Decision::Adopt(row), &[a, b], None),
+            Some(vec![a, b])
+        );
+        assert_eq!(
+            adopt_gate_tenants(&Decision::Adopt(row), &[], Some(b)),
+            Some(vec![b])
+        );
+        assert_eq!(
+            adopt_gate_tenants(&Decision::Adopt(row), &[], None),
+            Some(vec![])
+        );
+        // Not adoptions.
+        assert_eq!(adopt_gate_tenants(&Decision::Mint(a), &[a], None), None);
+        assert_eq!(
+            adopt_gate_tenants(&Decision::Defer("x".into()), &[a], None),
+            None
+        );
+        // Verdict: only observed-true everywhere passes; UNKNOWN never counts as ON.
+        assert!(adopt_verdict(&[(a, Some(true)), (b, Some(true))]).is_ok());
+        assert!(adopt_verdict(&[(a, Some(true)), (b, Some(false))]).is_err());
+        assert!(adopt_verdict(&[(a, Some(true)), (b, None)]).is_err());
+        assert!(adopt_verdict(&[]).is_err());
+    }
+
+    fn seed_policy(tenant: Uuid, v: bool) {
+        remember_policy(tenant, Some(v));
+    }
+
+    /// A live pane's adoption binds only where its tenant's sync is observed
+    /// ON; unseeded (UNKNOWN) and off both defer; a mint passes through.
+    #[tokio::test]
+    async fn adopt_gate_defers_unless_the_tenant_is_observed_on() {
+        let (on, off, unknown) = (
+            Uuid::from_u128(0xad11),
+            Uuid::from_u128(0xad12),
+            Uuid::from_u128(0xad13),
+        );
+        seed_policy(on, true);
+        seed_policy(off, false);
+        let pane = |t| Decision::AdoptLivePane {
+            row: Uuid::from_u128(0xad14),
+            tenant: NewSessionTenant::Stated(t),
+        };
+        assert_eq!(adopt_gate(pane(on)).await, pane(on));
+        assert!(matches!(adopt_gate(pane(off)).await, Decision::Defer(_)));
+        assert!(matches!(
+            adopt_gate(pane(unknown)).await,
+            Decision::Defer(_)
+        ));
+        let mint = Decision::Mint(unknown);
+        assert_eq!(adopt_gate(mint.clone()).await, mint);
+    }
+
+    /// End to end: with no tenant observed ON, an adoption through
+    /// `bind_one_with` binds nothing and writes nothing.
+    #[tokio::test]
+    async fn an_adoption_without_observed_consent_binds_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (t, registrar, outbox) = tailer(dir.path());
+        let path = transcript(dir.path(), CSID, "{\"type\":\"user\"}\n");
+        let id = identity_from_path(&path).unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let coords = Uuid::new_v4();
+        let decision = bind_one_with(
+            &t,
+            id,
+            &path,
+            counting_resolver(calls, RowResolution::Existing(coords), || {}),
+        )
+        .await;
+        assert_eq!(decision, Decision::Adopt(coords), "the SETTLED decision");
+        assert_eq!(registrar.session_id_for(CSID), None, "nothing was bound");
+        assert!(outbox.pending().unwrap().is_empty(), "nothing was written");
+    }
 
     #[test]
     fn identity_reads_config_dir_and_account_from_the_path() {
