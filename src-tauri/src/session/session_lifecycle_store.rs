@@ -512,8 +512,9 @@ const RESTAMP_MAX_LEAD_MS: i64 = 100;
 ///
 /// `now`, unless that is not past `high` (finishes inside one millisecond,
 /// or a chain of them: mark, unmark, re-mark, unmark, re-mark), in which case
-/// one past `high` — so the new stamp differs from EVERY earlier one, not
-/// only the latest. The ACK matcher
+/// one past `high` — so the new stamp differs from every earlier one, not
+/// only the latest, unless the clock stepped back by more than
+/// [`RESTAMP_MAX_LEAD_MS`] (see below). The ACK matcher
 /// ([`SessionLifecycleStore::mark_finish_synced`]) needs exactly that: a
 /// late ACK of any older row can never sync the new mark. A `now` more than
 /// [`RESTAMP_MAX_LEAD_MS`] behind `high` (a clock stepped backwards) is
