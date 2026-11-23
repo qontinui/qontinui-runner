@@ -498,10 +498,12 @@ mod tests {
     /// AFTER connecting: the one on coord's `_control`/`subscribed` frame, or
     /// the legacy re-fetch 5 s after connect. Either is a real delivery path
     /// for the population, so the bound is a generous 30 s with no timing
-    /// window to land in; which of the two fetches fired is pinned by the unit
-    /// tests in `directive_fetch` (`the_post_subscribed_fetch_...`,
-    /// `a_coord_without_the_subscribed_frame_...`) and the frame classifier
-    /// test below, not here.
+    /// window to land in. The schedule's decisions (which events fetch) are
+    /// pinned by the unit tests in `directive_fetch`
+    /// (`the_post_subscribed_fetch_...`, `a_coord_without_the_subscribed_frame_...`)
+    /// and the frame classifier test below; the pump's wiring of the
+    /// `subscribed` arm to a spawn is exercised here only as one of the two
+    /// delivery paths.
     ///
     /// Written against what the pre-change runner already had
     /// (`connect_and_pump_ci`, `get_ci_node_settings`, the credential store),

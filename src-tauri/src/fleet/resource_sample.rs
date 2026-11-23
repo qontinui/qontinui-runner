@@ -3886,8 +3886,11 @@ MemAvailable:   15335424 kB
         // is on the lane the body was actually charged to: its own name when
         // a lane was free, else the overflow lane — and an always-None or
         // always-empty field still fails, because neither key is then present.
+        // The lane is read from the live accessor (the source of truth), never
+        // from the published map under test, so a wire map that dropped the
+        // named lane cannot steer this onto the overflow arm.
         use qontinui_runner_lib::wedge_diagnostics::OVERFLOW_LANE_NAME;
-        let charged = if published.contains_key(SPAWNER) {
+        let charged = if tracked_blocking_by_thread().contains_key(SPAWNER) {
             SPAWNER
         } else {
             OVERFLOW_LANE_NAME
