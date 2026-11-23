@@ -648,7 +648,7 @@ impl TerminalManager {
                     &info.id,
                     &crate::session::session_lifecycle_store::SessionIdentityUpdate {
                         bypass_permissions: Some(bypass_permissions),
-                        tenant_id: spawn_tenant.map(|t| t.to_string()),
+                        tenant_id: spawn_tenant_stamp(spawn_tenant),
                         ..Default::default()
                     },
                 );
@@ -1431,8 +1431,26 @@ pub(crate) fn command_implies_bypass_permissions(argv: &[String]) -> bool {
         || joined.contains("--permission-mode=bypassPermissions")
 }
 
+/// What the lifecycle record's `tenant_id` is stamped with for a spawn: the
+/// CALLER'S chosen tenant, and nothing when the caller chose none. Never a
+/// resolved or default tenant — `policy_tenant::live_read_then_recorded`
+/// promotes this stamp to the session's tenant at close time, so a default
+/// written here would file a session's compliance under the default tenant on
+/// a multi-bound device.
+fn spawn_tenant_stamp(spawn_tenant: Option<uuid::Uuid>) -> Option<String> {
+    spawn_tenant.map(|t| t.to_string())
+}
+
 #[cfg(test)]
 mod tests {
+    /// No tenant chosen records no tenant: the stamp is never a default.
+    #[test]
+    fn a_spawn_with_no_chosen_tenant_stamps_none() {
+        assert_eq!(super::spawn_tenant_stamp(None), None);
+        let t = uuid::Uuid::from_bytes([7; 16]);
+        assert_eq!(super::spawn_tenant_stamp(Some(t)), Some(t.to_string()));
+    }
+
     /// The `terminal-created` wire shape the frontend reads: `surface` sits
     /// beside the flattened `TerminalInfo` fields, never nested under an `info`
     /// key. Losing the flatten or renaming `surface` would stay green elsewhere

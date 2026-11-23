@@ -397,12 +397,45 @@ impl CapRegistry {
         true
     }
 
-    /// Record one ENFORCED continuation. Best-effort (poisoned lock ⇒ no-op).
+    /// Give back a slot [`Self::try_claim`] took at `stamp`, for a claim whose
+    /// delivery then lost (another Stop already sent the nudge). Removes one
+    /// stamp equal to `stamp`; best-effort (poisoned lock ⇒ no-op).
+    fn release(&self, key: &str, stamp: Instant) {
+        if let Ok(mut g) = self.inner.lock() {
+            if let Some(stamps) = g.get_mut(key) {
+                if let Some(i) = stamps.iter().rposition(|t| *t == stamp) {
+                    stamps.remove(i);
+                }
+            }
+        }
+    }
+
+    /// Record one ENFORCED continuation unconditionally — a test seam for
+    /// filling the window; production claims through [`Self::try_claim`].
+    #[cfg(test)]
     fn record(&self, key: &str, now: Instant) {
         if let Ok(mut g) = self.inner.lock() {
             g.entry(key.to_string()).or_default().push(now);
         }
     }
+}
+
+/// An enforced block takes its cap slot at the decision, checked and recorded
+/// under one lock ([`CapRegistry::try_claim`]); a Stop that lost the last slot
+/// to a racing one gets `exhausted()` — the cap-exhausted verdict, an allow
+/// with `would_block`. Any verdict that does not block claims nothing.
+fn claim_or_downgrade(
+    reg: &CapRegistry,
+    key: &str,
+    now: Instant,
+    cap: usize,
+    verdict: Verdict,
+    exhausted: impl FnOnce() -> Verdict,
+) -> Verdict {
+    if verdict.decision == "block" && !reg.try_claim(key, now, cap) {
+        return exhausted();
+    }
+    verdict
 }
 
 static CAP_REGISTRY: OnceLock<CapRegistry> = OnceLock::new();
@@ -905,7 +938,9 @@ fn deliver_compliance_nudge(
     // runner session can span several — so sharing a budget was never
     // measuring one thing.
     let cap_key = format!("compliance:{session_key}");
-    if cap_registry().would_exceed(&cap_key, now, effective_cap()) {
+    // Checked and taken under one lock, so two Stops cannot both take the
+    // last slot; a claim whose delivery then loses is given back below.
+    if !cap_registry().try_claim(&cap_key, now, effective_cap()) {
         info!(
             session = %session_key,
             "continuation-verdict: session-compliance nudge suppressed — hourly cap reached"
@@ -924,9 +959,9 @@ fn deliver_compliance_nudge(
         nudge.class,
         nudge.max_attempts,
     ) {
+        cap_registry().release(&cap_key, now);
         return None;
     }
-    cap_registry().record(&cap_key, now);
     // Names the class AND the attempt, because the string is operator-visible in
     // both the verdict log and `VerdictResponse.reason` — "nudging once" on
     // attempt 3 of 3 is exactly the kind of confidently-wrong line this whole
@@ -1116,13 +1151,14 @@ pub async fn continuation_verdict(
     let cap = effective_cap();
     let cap_exhausted = cap_registry().would_exceed(session_key, now, cap);
 
-    let mut verdict = decide(mode, stop_hook_active, &status, cap_exhausted);
-    // An enforced block takes its cap slot HERE, checked and recorded under one
-    // lock. A racing Stop that took the last slot since the read above turns
-    // this one into the cap-exhausted verdict.
-    if verdict.decision == "block" && !cap_registry().try_claim(session_key, now, cap) {
-        verdict = decide(mode, stop_hook_active, &status, true);
-    }
+    let verdict = claim_or_downgrade(
+        cap_registry(),
+        session_key,
+        now,
+        cap,
+        decide(mode, stop_hook_active, &status, cap_exhausted),
+        || decide(mode, stop_hook_active, &status, true),
+    );
 
     // A continuation block already carries its own prompt — never stack a
     // second one onto the same turn. The compliance nudge is offered only
