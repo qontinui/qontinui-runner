@@ -102,8 +102,8 @@ pub mod spawn_prompt; // The spawn-time system-prompt carrier: ONE composed file
                       // can read the same pin the proxy does — see the lib declaration for why.
                       // Re-exported here so every `crate::session::tenant_pin::…` path is unchanged.
 pub use qontinui_runner_lib::tenant_pin;
-pub mod finish_net_retire; // Every runner finish door retires the finished session's implement→ship nets BEFORE writing the mark (plan 2026-11-23-an-operator-finish-from-the-runner-ui-still-fires-the-finished-sessions-implement-ship-net, Phase 1)
 pub mod finish_heal; // Heal finished marks stamped synced over a write coord never applied; the finish read-back's coord.observed (plan 2026-11-05-finish-synced-is-stamped-on-a-2xx-that-did-not-move-session-status, Phase 5)
+pub mod finish_net_retire; // Every runner finish door retires the finished session's implement→ship nets BEFORE writing the mark (plan 2026-11-23-an-operator-finish-from-the-runner-ui-still-fires-the-finished-sessions-implement-ship-net, Phase 1)
 pub mod finished_close; // The wind-down executor's `finished_close` arm: switch, cadence, candidates, published custody (plan 2026-10-03-finished-runner-sessions-close-their-window-without-a-drain)
 pub mod finished_close_guard; // The finished_close arm's close guard: every served close condition judged fresh per close, SHADOW in Phase 1 (plan 2026-11-16-finished-close-mints-its-close-authority-from-the-served-close-conditions)
 pub mod spawn_report_spool; // Undelivered `spawn-failed` reports spooled to the session outbox and replayed by the CoordSync drain (plan 2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling, Phase 6)

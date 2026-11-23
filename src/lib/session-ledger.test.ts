@@ -274,6 +274,18 @@ describe("invoke wrappers", () => {
     expect(retired.withdrew).toBe(true);
     expect(retired.notice).toBeNull();
 
+    // A cancel-only finish (not the registrant) counts too: the cancelled
+    // continuation is not restored by an Unfinish either.
+    invokeMock.mockResolvedValue({
+      success: true,
+      message: null,
+      data: {
+        changed: "marker",
+        nets: { verdict: "RETIRED", withdrawn: [], cancelled: ["g2"], unretired: [] },
+      },
+    });
+    expect((await setSessionFinished("aaaa-1111", true)).withdrew).toBe(true);
+
     // The runner always sends `rearm` on an unmark; the line shows only when
     // the earlier finish withdrew a net.
     invokeMock.mockResolvedValue({

@@ -279,7 +279,10 @@ pub async fn retire_before_finish(
     let Some(record) = store.get(claude_session_id) else {
         return NetsReport::Skipped("the session is unknown to the lifecycle registry");
     };
-    if record.finished_at.is_some() && (only_if_unfinished || reason.is_none()) {
+    // The store's own rule (`non_empty`): a blank or whitespace reason is no
+    // reason, so a `{"reason":""}` re-finish is a read-back, not a restamp.
+    let reason_given = reason.is_some_and(|r| !r.trim().is_empty());
+    if record.finished_at.is_some() && (only_if_unfinished || !reason_given) {
         return NetsReport::Skipped(
             "the mark is already set and this call writes none; nets are retired when a finish writes the mark",
         );
@@ -402,8 +405,12 @@ pub trait NetsCoord: Send + Sync {
     async fn list_plan_reserves(&self) -> Result<ReservePage, String>;
     async fn list_gates(&self, stem: &str) -> Result<Vec<GateRow>, String>;
     async fn read_gate(&self, gate_id: &str) -> Result<Option<GateRow>, String>;
-    async fn write(&self, verb: GateWrite, gate_id: &str, reason: &str)
-        -> Result<WriteAnswer, String>;
+    async fn write(
+        &self,
+        verb: GateWrite,
+        gate_id: &str,
+        reason: &str,
+    ) -> Result<WriteAnswer, String>;
 }
 
 /// Whether this device is proven bound to a single tenant.
@@ -500,7 +507,8 @@ pub async fn retire_nets_with(
     stems.dedup();
     // A reserve the target holds whose key is not a stem this run can name
     // is still a reserve whose net may fire: UNKNOWN, never dropped to NONE.
-    let (stems, odd): (Vec<String>, Vec<String>) = stems.into_iter().partition(|k| plan_stem(k).is_some());
+    let (stems, odd): (Vec<String>, Vec<String>) =
+        stems.into_iter().partition(|k| plan_stem(k).is_some());
     let stems: Vec<String> = stems
         .into_iter()
         .filter_map(|k| plan_stem(&k).map(str::to_string))
@@ -545,9 +553,8 @@ pub async fn retire_nets_with(
         return out;
     };
 
-    let reason = format!(
-        "implement\u{2192}ship net retired: finished by {by} (runner finish door)"
-    );
+    let reason =
+        format!("implement\u{2192}ship net retired: finished by {by} (runner finish door)");
 
     // 3-4. Each plan's nets.
     for stem in &stems {
@@ -568,7 +575,11 @@ pub async fn retire_nets_with(
                     &row.gate_id,
                     format!(
                         "NET_INERT: registered by another device ({}), left alone",
-                        if row.registered_by.is_empty() { "none recorded" } else { row.registered_by.as_str() }
+                        if row.registered_by.is_empty() {
+                            "none recorded"
+                        } else {
+                            row.registered_by.as_str()
+                        }
                     ),
                 );
                 continue;
@@ -595,12 +606,21 @@ async fn retire_one(
             return out.inert(
                 stem,
                 &id,
-                format!("verdict={}: a non-clear terminal verdict dispatches nothing", row.verdict),
+                format!(
+                    "verdict={}: a non-clear terminal verdict dispatches nothing",
+                    row.verdict
+                ),
             )
         }
         "cleared" => return settle_cleared(io, budget, out, stem, row, reason).await,
         "open" => {}
-        other => return out.unretire(stem, Some(&id), format!("the row reads an unrecognised verdict '{other}'")),
+        other => {
+            return out.unretire(
+                stem,
+                Some(&id),
+                format!("the row reads an unrecognised verdict '{other}'"),
+            )
+        }
     }
 
     let withdraw = budget
@@ -615,13 +635,18 @@ async fn retire_one(
             // Never mute: a muted gate is skipped by the sweep and stays open
             // for ever (served coordination `gate-lifecycle-end`).
             cancel_text = match budget
-                .call("the continuation cancel",
+                .call(
+                    "the continuation cancel",
                     io.write(GateWrite::CancelContinuation, &id, reason),
                 )
                 .await
             {
                 Ok(WriteAnswer::Ok) => "cancelled".to_string(),
-                Ok(WriteAnswer::NotRegistrant(t) | WriteAnswer::Consumed(t) | WriteAnswer::Refused(t)) => t,
+                Ok(
+                    WriteAnswer::NotRegistrant(t)
+                    | WriteAnswer::Consumed(t)
+                    | WriteAnswer::Refused(t),
+                ) => t,
                 Err(e) => e,
             };
             t.clone()
@@ -630,16 +655,17 @@ async fn retire_one(
         Err(e) => e.clone(),
     };
 
-    let back = match budget
-        .call("the read-back", io.read_gate(&id))
-        .await
-    {
+    let back = match budget.call("the read-back", io.read_gate(&id)).await {
         Ok(Some(b)) => b,
         Ok(None) => {
-            return out.unretire(stem, Some(&id), "the read-back after the withdraw found no row")
+            return out.unreadable(
+                stem,
+                Some(&id),
+                "the read-back after the withdraw found no row",
+            )
         }
         Err(e) => {
-            return out.unretire(
+            return out.unreadable(
                 stem,
                 Some(&id),
                 format!("the read-back after the withdraw could not be made ({e})"),
@@ -695,7 +721,11 @@ async fn settle_cleared(
         );
     }
     if !row.continuation_live() {
-        return out.inert(stem, &id, "verdict=cleared, continuation not live: nothing left to dispatch");
+        return out.inert(
+            stem,
+            &id,
+            "verdict=cleared, continuation not live: nothing left to dispatch",
+        );
     }
     let why = match budget
         .call("the continuation cancel",
@@ -728,8 +758,8 @@ async fn settle_cleared(
             format!("the net already cleared and its continuation is still live after the cancel ({why})"),
         ),
         Ok(Some(_)) => out.cancelled.push(id),
-        Ok(None) => out.unretire(stem, Some(&id), "the cancel's read-back found no row"),
-        Err(e) => out.unretire(
+        Ok(None) => out.unreadable(stem, Some(&id), "the cancel's read-back found no row"),
+        Err(e) => out.unreadable(
             stem,
             Some(&id),
             format!("the net already cleared; the cancel's read-back could not be made ({e})"),
@@ -752,7 +782,12 @@ struct HttpNetsCoord {
 }
 
 fn body_head(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(200).collect()
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(200)
+        .collect()
 }
 
 impl HttpNetsCoord {
@@ -781,19 +816,29 @@ impl HttpNetsCoord {
             ));
         }
         if status != 200 {
-            return Err(format!("GET /coord/agent-gates answered HTTP {status}: {}", body_head(&text)));
+            return Err(format!(
+                "GET /coord/agent-gates answered HTTP {status}: {}",
+                body_head(&text)
+            ));
         }
-        let v: serde_json::Value =
-            serde_json::from_str(&text).map_err(|e| format!("GET /coord/agent-gates: unparseable body ({e})"))?;
+        let v: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| format!("GET /coord/agent-gates: unparseable body ({e})"))?;
         let gates = v
             .get("gates")
             .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| "GET /coord/agent-gates: the body carries no `gates` array".to_string())?;
+            .ok_or_else(|| {
+                "GET /coord/agent-gates: the body carries no `gates` array".to_string()
+            })?;
         let truncated = v
             .get("truncated")
             .and_then(serde_json::Value::as_bool)
-            .ok_or_else(|| "GET /coord/agent-gates: the body carries no `truncated` flag".to_string())?;
-        Ok((gates.iter().filter_map(GateRow::from_json).collect(), truncated))
+            .ok_or_else(|| {
+                "GET /coord/agent-gates: the body carries no `truncated` flag".to_string()
+            })?;
+        Ok((
+            gates.iter().filter_map(GateRow::from_json).collect(),
+            truncated,
+        ))
     }
 }
 
@@ -814,14 +859,19 @@ impl NetsCoord for HttpNetsCoord {
         let status = resp.status().as_u16();
         let text = resp.text().await.unwrap_or_default();
         if status != 200 {
-            return Err(format!("GET /coord/claims/list answered HTTP {status}: {}", body_head(&text)));
+            return Err(format!(
+                "GET /coord/claims/list answered HTTP {status}: {}",
+                body_head(&text)
+            ));
         }
-        let v: serde_json::Value =
-            serde_json::from_str(&text).map_err(|e| format!("GET /coord/claims/list: unparseable body ({e})"))?;
+        let v: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| format!("GET /coord/claims/list: unparseable body ({e})"))?;
         let holders = v
             .get("holders")
             .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| "GET /coord/claims/list: the body carries no `holders` array".to_string())?;
+            .ok_or_else(|| {
+                "GET /coord/claims/list: the body carries no `holders` array".to_string()
+            })?;
         Ok(ReservePage {
             holders: holders
                 .iter()
@@ -870,10 +920,17 @@ impl NetsCoord for HttpNetsCoord {
         Ok(rows.into_iter().find(|r| r.gate_id == gate_id))
     }
 
-    async fn write(&self, verb: GateWrite, gate_id: &str, reason: &str) -> Result<WriteAnswer, String> {
+    async fn write(
+        &self,
+        verb: GateWrite,
+        gate_id: &str,
+        reason: &str,
+    ) -> Result<WriteAnswer, String> {
         let path = match verb {
             GateWrite::Withdraw => format!("/coord/gates/{gate_id}/withdraw"),
-            GateWrite::CancelContinuation => format!("/coord/gates/{gate_id}/agent/continuation-cancel"),
+            GateWrite::CancelContinuation => {
+                format!("/coord/gates/{gate_id}/agent/continuation-cancel")
+            }
         };
         let resp = self
             .client
@@ -885,7 +942,10 @@ impl NetsCoord for HttpNetsCoord {
             .await
             .map_err(|e| format!("POST {path}: {e}"))?;
         let status = resp.status().as_u16();
-        let text = format!("HTTP {status} from POST {path}: {}", body_head(&resp.text().await.unwrap_or_default()));
+        let text = format!(
+            "HTTP {status} from POST {path}: {}",
+            body_head(&resp.text().await.unwrap_or_default())
+        );
         Ok(match status {
             200..=299 => WriteAnswer::Ok,
             403 if verb == GateWrite::Withdraw => WriteAnswer::NotRegistrant(text),
@@ -931,18 +991,25 @@ fn read_context() -> (RetireContext, Option<String>, String) {
 /// `budget` (the doors pass [`DOOR_BUDGET`]), the device-context read
 /// included; never fails — every failure, the budget running out among them,
 /// is in the outcome (UNKNOWN), and the caller writes the mark regardless.
-pub async fn retire_nets_for_finish(claude_session_id: &str, by: &str, budget: Duration) -> NetsOutcome {
+pub async fn retire_nets_for_finish(
+    claude_session_id: &str,
+    by: &str,
+    budget: Duration,
+) -> NetsOutcome {
     let started = Instant::now();
-    let (ctx, jwt, base) = match tokio::time::timeout(budget, tokio::task::spawn_blocking(read_context)).await {
-        Ok(Ok(parts)) => parts,
-        Ok(Err(e)) => return NetsOutcome::unknown(format!("the device context read panicked: {e}")),
-        Err(_) => {
-            return NetsOutcome::unknown(format!(
-                "the device context read outlived the retire budget ({}s)",
-                budget.as_secs()
-            ))
-        }
-    };
+    let (ctx, jwt, base) =
+        match tokio::time::timeout(budget, tokio::task::spawn_blocking(read_context)).await {
+            Ok(Ok(parts)) => parts,
+            Ok(Err(e)) => {
+                return NetsOutcome::unknown(format!("the device context read panicked: {e}"))
+            }
+            Err(_) => {
+                return NetsOutcome::unknown(format!(
+                    "the device context read outlived the retire budget ({}s)",
+                    budget.as_secs()
+                ))
+            }
+        };
     // No client-level timeout: every request carries its own [`CALL_CAP`].
     let client = match reqwest::Client::builder().build() {
         Ok(c) => c,
@@ -1002,6 +1069,7 @@ pub(crate) mod tests {
         pub reserves: Option<ReservePage>,
         pub gates: Mutex<Vec<GateRow>>,
         pub gate_read_fails: bool,
+        pub read_back_fails: bool,
         pub withdraw_answer: Option<WriteAnswer>,
         pub writes: Mutex<Vec<(GateWrite, String)>>,
     }
@@ -1009,7 +1077,9 @@ pub(crate) mod tests {
     #[async_trait::async_trait]
     impl NetsCoord for FakeCoord {
         async fn list_plan_reserves(&self) -> Result<ReservePage, String> {
-            self.reserves.clone().ok_or_else(|| "unreachable".to_string())
+            self.reserves
+                .clone()
+                .ok_or_else(|| "unreachable".to_string())
         }
         async fn list_gates(&self, _stem: &str) -> Result<Vec<GateRow>, String> {
             if self.gate_read_fails {
@@ -1018,10 +1088,27 @@ pub(crate) mod tests {
             Ok(self.gates.lock().unwrap().clone())
         }
         async fn read_gate(&self, gate_id: &str) -> Result<Option<GateRow>, String> {
-            Ok(self.gates.lock().unwrap().iter().find(|g| g.gate_id == gate_id).cloned())
+            if self.read_back_fails {
+                return Err("HTTP 503".to_string());
+            }
+            Ok(self
+                .gates
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|g| g.gate_id == gate_id)
+                .cloned())
         }
-        async fn write(&self, verb: GateWrite, gate_id: &str, _reason: &str) -> Result<WriteAnswer, String> {
-            self.writes.lock().unwrap().push((verb, gate_id.to_string()));
+        async fn write(
+            &self,
+            verb: GateWrite,
+            gate_id: &str,
+            _reason: &str,
+        ) -> Result<WriteAnswer, String> {
+            self.writes
+                .lock()
+                .unwrap()
+                .push((verb, gate_id.to_string()));
             let answer = match verb {
                 GateWrite::Withdraw => self.withdraw_answer.clone().unwrap_or(WriteAnswer::Ok),
                 GateWrite::CancelContinuation => WriteAnswer::Ok,
@@ -1061,21 +1148,34 @@ pub(crate) mod tests {
     }
 
     fn page(holders: Vec<ReserveRow>) -> Option<ReservePage> {
-        Some(ReservePage { holders, truncated: false })
+        Some(ReservePage {
+            holders,
+            truncated: false,
+        })
     }
 
     #[tokio::test]
     async fn one_open_net_is_withdrawn_and_read_back() {
         let io = FakeCoord {
-            reserves: page(vec![reserve("p1", &TARGET.to_lowercase()), reserve("p2", OTHER)]),
+            reserves: page(vec![
+                reserve("p1", &TARGET.to_lowercase()),
+                reserve("p2", OTHER),
+            ]),
             gates: Mutex::new(vec![net("g1", "open", ME)]),
             ..Default::default()
         };
         let out = run(&io, &single()).await;
-        assert_eq!(out.stems, vec!["p1".to_string()], "only the target's reserve, matched case-insensitively");
+        assert_eq!(
+            out.stems,
+            vec!["p1".to_string()],
+            "only the target's reserve, matched case-insensitively"
+        );
         assert_eq!(out.withdrawn, vec!["g1".to_string()]);
         assert_eq!(out.verdict(), NetsVerdict::Retired);
-        assert_eq!(*io.writes.lock().unwrap(), vec![(GateWrite::Withdraw, "g1".to_string())]);
+        assert_eq!(
+            *io.writes.lock().unwrap(),
+            vec![(GateWrite::Withdraw, "g1".to_string())]
+        );
         assert_eq!(out.to_json()["verdict"], "RETIRED");
     }
 
@@ -1094,7 +1194,10 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_truncated_list_with_no_match_is_unknown_not_none() {
         let io = FakeCoord {
-            reserves: Some(ReservePage { holders: vec![], truncated: true }),
+            reserves: Some(ReservePage {
+                holders: vec![],
+                truncated: true,
+            }),
             ..Default::default()
         };
         assert_eq!(run(&io, &single()).await.verdict(), NetsVerdict::Unknown);
@@ -1194,7 +1297,10 @@ pub(crate) mod tests {
             ..Default::default()
         };
         let out = run(&io, &single()).await;
-        assert_eq!(*io.writes.lock().unwrap(), vec![(GateWrite::CancelContinuation, "g1".to_string())]);
+        assert_eq!(
+            *io.writes.lock().unwrap(),
+            vec![(GateWrite::CancelContinuation, "g1".to_string())]
+        );
         assert_eq!(out.cancelled, vec!["g1".to_string()]);
     }
 
@@ -1228,6 +1334,91 @@ pub(crate) mod tests {
         assert!(row.is_net());
         assert!(row.continuation_live());
         assert_eq!(row.gate_id, "96e61cde-4092-455b-83b8-94ea4f1b6b95");
+    }
+
+    #[tokio::test]
+    async fn a_failed_read_back_after_a_withdraw_is_unknown_not_unretired() {
+        let io = FakeCoord {
+            reserves: page(vec![reserve("p1", TARGET)]),
+            gates: Mutex::new(vec![net("g1", "open", ME)]),
+            read_back_fails: true,
+            ..Default::default()
+        };
+        let out = run(&io, &single()).await;
+        assert_eq!(
+            *io.writes.lock().unwrap(),
+            vec![(GateWrite::Withdraw, "g1".to_string())]
+        );
+        assert_eq!(out.verdict(), NetsVerdict::Unknown);
+        assert_eq!(out.unretired[0].gate_id.as_deref(), Some("g1"));
+        assert!(out.unretired[0].unreadable);
+    }
+
+    #[tokio::test]
+    async fn a_blank_reason_on_a_finished_mark_is_a_read_back_and_runs_no_retire() {
+        let (store, _dir) = fresh_store();
+        store
+            .set_finished(ID, true, Some("done".to_string()))
+            .unwrap();
+        let p = probe(&store, FakeCoord::default());
+        for reason in [None, Some(""), Some("   ")] {
+            let report = retire_before_finish(
+                &store,
+                p.as_ref(),
+                ID,
+                true,
+                reason,
+                false,
+                "test",
+                DOOR_BUDGET,
+            )
+            .await;
+            assert!(
+                matches!(report, NetsReport::Skipped(_)),
+                "{reason:?}: {report:?}"
+            );
+        }
+        assert!(p.calls.lock().unwrap().is_empty());
+        // A real reason is a restamp: it writes the mark, so it retires first.
+        let report = retire_before_finish(
+            &store,
+            p.as_ref(),
+            ID,
+            true,
+            Some("again"),
+            false,
+            "test",
+            DOOR_BUDGET,
+        )
+        .await;
+        assert!(matches!(report, NetsReport::Ran(_)));
+    }
+
+    /// A coord that accepts the connection and never answers: the run must
+    /// still end inside the door budget, UNKNOWN, writing nothing.
+    #[tokio::test]
+    async fn a_dark_coord_ends_inside_the_door_budget_as_unknown() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock); // never read, never answered
+            }
+        });
+        let io = HttpNetsCoord {
+            base: format!("http://{addr}"),
+            jwt: Some("test-jwt".to_string()),
+            client: reqwest::Client::new(),
+        };
+        let started = Instant::now();
+        let out = retire_nets_with(&io, &single(), TARGET, "test", DOOR_BUDGET).await;
+        let took = started.elapsed();
+        assert_eq!(out.verdict(), NetsVerdict::Unknown, "{out:?}");
+        assert!(
+            took < Duration::from_secs(11),
+            "a dark coord held the door {took:?}"
+        );
     }
 
     #[tokio::test]
@@ -1297,7 +1488,10 @@ pub(crate) mod tests {
         use axum::response::IntoResponse;
         let path = uri.path().to_string();
         let query = uri.query().unwrap_or("").to_string();
-        st.seen.lock().unwrap().push(format!("{method} {path}?{query}"));
+        st.seen
+            .lock()
+            .unwrap()
+            .push(format!("{method} {path}?{query}"));
         let json = |code: StatusCode, v: serde_json::Value| (code, axum::Json(v)).into_response();
         let param = |k: &str| {
             query
@@ -1316,22 +1510,53 @@ pub(crate) mod tests {
         if path == "/coord/agent-gates" {
             let gates = st.gates.lock().unwrap().clone();
             if let Some(id) = param("gate_id") {
-                let rows: Vec<_> = gates.into_iter().filter(|g| g["gate_id"] == id.as_str()).collect();
-                return json(StatusCode::OK, serde_json::json!({"gates": rows, "truncated": false}));
+                let rows: Vec<_> = gates
+                    .into_iter()
+                    .filter(|g| g["gate_id"] == id.as_str())
+                    .collect();
+                return json(
+                    StatusCode::OK,
+                    serde_json::json!({"gates": rows, "truncated": false}),
+                );
             }
             if st.two_pages {
                 let first = param("offset").as_deref() == Some("0");
-                let row = if first { gates[0].clone() } else { gates[1].clone() };
-                return json(StatusCode::OK, serde_json::json!({"gates": [row], "truncated": first}));
+                let row = if first {
+                    gates[0].clone()
+                } else {
+                    gates[1].clone()
+                };
+                return json(
+                    StatusCode::OK,
+                    serde_json::json!({"gates": [row], "truncated": first}),
+                );
             }
-            return json(StatusCode::OK, serde_json::json!({"gates": gates, "truncated": false}));
+            return json(
+                StatusCode::OK,
+                serde_json::json!({"gates": gates, "truncated": false}),
+            );
         }
         if let Some(rest) = path.strip_prefix("/coord/gates/") {
             let (id, action) = rest.split_once('/').unwrap_or((rest, ""));
             match (id, action) {
-                ("g403", "withdraw") => return json(StatusCode::FORBIDDEN, serde_json::json!({"error": "not_registrant"})),
-                ("g409", "withdraw") => return json(StatusCode::CONFLICT, serde_json::json!({"error": "already_consumed"})),
-                ("g500", "withdraw") => return json(StatusCode::BAD_GATEWAY, serde_json::json!({"error": "upstream"})),
+                ("g403", "withdraw") => {
+                    return json(
+                        StatusCode::FORBIDDEN,
+                        serde_json::json!({"error": "not_registrant"}),
+                    )
+                }
+                ("g409", "withdraw") => {
+                    return json(
+                        StatusCode::CONFLICT,
+                        serde_json::json!({"error": "already_consumed"}),
+                    )
+                }
+                ("g500", "withdraw") => {
+                    return json(
+                        StatusCode::BAD_GATEWAY,
+                        serde_json::json!({"error": "upstream"}),
+                    )
+                }
                 (_, "withdraw") | (_, "agent/continuation-cancel") => {
                     let mut gates = st.gates.lock().unwrap();
                     if let Some(g) = gates.iter_mut().find(|g| g["gate_id"] == id) {
@@ -1347,7 +1572,10 @@ pub(crate) mod tests {
                 _ => {}
             }
         }
-        json(StatusCode::NOT_FOUND, serde_json::json!({"error": "no route"}))
+        json(
+            StatusCode::NOT_FOUND,
+            serde_json::json!({"error": "no route"}),
+        )
     }
 
     async fn serve_stub(st: Arc<StubCoord>) -> HttpNetsCoord {
@@ -1374,8 +1602,9 @@ pub(crate) mod tests {
         let page = io.list_plan_reserves().await.unwrap();
         assert!(page.truncated);
         assert_eq!(page.holders, vec![reserve("p1", &TARGET.to_lowercase())]);
-        assert!(st.seen.lock().unwrap()[0]
-            .contains("kind=semantic_resource&prefix=plan%3A&limit=500"));
+        assert!(
+            st.seen.lock().unwrap()[0].contains("kind=semantic_resource&prefix=plan%3A&limit=500")
+        );
     }
 
     #[tokio::test]
@@ -1387,12 +1616,18 @@ pub(crate) mod tests {
         });
         let io = serve_stub(st.clone()).await;
         let rows = io.list_gates("p1").await.unwrap();
-        assert_eq!(rows.iter().map(|r| r.gate_id.as_str()).collect::<Vec<_>>(), ["g1", "g2"]);
+        assert_eq!(
+            rows.iter().map(|r| r.gate_id.as_str()).collect::<Vec<_>>(),
+            ["g1", "g2"]
+        );
         let seen = st.seen.lock().unwrap().clone();
         assert_eq!(seen.len(), 2);
         assert!(seen[0].contains("work_unit_slug=p1&limit=100&offset=0"));
         assert!(seen[1].contains("offset=100"));
-        assert!(seen.iter().all(|q| !q.contains("open_only")), "the route refuses unknown keys");
+        assert!(
+            seen.iter().all(|q| !q.contains("open_only")),
+            "the route refuses unknown keys"
+        );
     }
 
     #[tokio::test]
@@ -1410,7 +1645,9 @@ pub(crate) mod tests {
         assert_eq!(out.cancelled, vec!["g403".to_string()], "{:?}", out);
         assert_eq!(out.verdict(), NetsVerdict::Retired);
         let seen = st.seen.lock().unwrap().clone();
-        assert!(seen.iter().any(|q| q.starts_with("POST /coord/gates/g403/agent/continuation-cancel")));
+        assert!(seen
+            .iter()
+            .any(|q| q.starts_with("POST /coord/gates/g403/agent/continuation-cancel")));
         assert!(seen.iter().all(|q| !q.contains("mute")));
     }
 
@@ -1421,7 +1658,10 @@ pub(crate) mod tests {
             io.write(GateWrite::Withdraw, "g409", "r").await,
             Ok(WriteAnswer::Consumed(_))
         ));
-        assert!(io.write(GateWrite::Withdraw, "g500", "r").await.is_err(), "a 5xx is unanswered");
+        assert!(
+            io.write(GateWrite::Withdraw, "g500", "r").await.is_err(),
+            "a 5xx is unanswered"
+        );
         assert_eq!(
             io.write(GateWrite::Withdraw, "g1", "r").await,
             Ok(WriteAnswer::Ok)
@@ -1455,7 +1695,10 @@ pub(crate) mod tests {
     #[async_trait::async_trait]
     impl FinishNetRetirer for OrderProbe {
         async fn retire(&self, claude_session_id: &str, by: &str, budget: Duration) -> NetsOutcome {
-            let at_call = self.store.get(claude_session_id).and_then(|r| r.finished_at);
+            let at_call = self
+                .store
+                .get(claude_session_id)
+                .and_then(|r| r.finished_at);
             self.calls
                 .lock()
                 .unwrap()
@@ -1471,14 +1714,16 @@ pub(crate) mod tests {
         Arc<OrderProbe>,
         &'static str,
         bool,
-    ) -> Pin<Box<dyn Future<Output = Option<serde_json::Value>> + Send>>;
+    )
+        -> Pin<Box<dyn Future<Output = Option<serde_json::Value>> + Send>>;
 
     const ID: &str = "door-session";
 
     fn fresh_store() -> (Arc<SessionLifecycleStore>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap());
+        let store = Arc::new(
+            SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap(),
+        );
         store.record_open(
             serde_json::from_value(serde_json::json!({
                 "claudeSessionId": ID,
@@ -1504,7 +1749,10 @@ pub(crate) mod tests {
 
     /// Run one finish through `door` with `coord`; assert the retire ran ONCE
     /// and BEFORE the mark, and that the mark is set whatever it answered.
-    async fn finish_through(door: DoorFn, coord: FakeCoord) -> (Arc<OrderProbe>, Option<serde_json::Value>) {
+    async fn finish_through(
+        door: DoorFn,
+        coord: FakeCoord,
+    ) -> (Arc<OrderProbe>, Option<serde_json::Value>) {
         let (store, _dir) = fresh_store();
         let p = probe(&store, coord);
         let body = door(store.clone(), p.clone(), ID, true).await;
@@ -1538,7 +1786,10 @@ pub(crate) mod tests {
             },
         )
         .await;
-        assert_eq!(*p.coord.writes.lock().unwrap(), vec![(GateWrite::Withdraw, "g1".to_string())]);
+        assert_eq!(
+            *p.coord.writes.lock().unwrap(),
+            vec![(GateWrite::Withdraw, "g1".to_string())]
+        );
         if let Some(n) = nets(&body) {
             assert_eq!(n["verdict"], "RETIRED");
             assert_eq!(n["withdrawn"], serde_json::json!(["g1"]));
@@ -1594,7 +1845,9 @@ pub(crate) mod tests {
         // An unmark never calls the helper, and says the net is not re-armed.
         if has_unmark {
             let (store, _dir) = fresh_store();
-            store.set_finished(ID, true, Some("done".to_string())).unwrap();
+            store
+                .set_finished(ID, true, Some("done".to_string()))
+                .unwrap();
             let p = probe(
                 &store,
                 FakeCoord {
@@ -1604,7 +1857,10 @@ pub(crate) mod tests {
                 },
             );
             let body = door(store.clone(), p.clone(), ID, false).await;
-            assert!(p.calls.lock().unwrap().is_empty(), "an unmark must never retire nets");
+            assert!(
+                p.calls.lock().unwrap().is_empty(),
+                "an unmark must never retire nets"
+            );
             assert!(store.get(ID).unwrap().finished_at.is_none());
             if let Some(n) = nets(&body) {
                 assert_eq!(n["rearm"], REARM_NOTE);

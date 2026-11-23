@@ -304,7 +304,7 @@ export function finishNetsNotice(
  * `FinishOutcome::response_json`). It is NOT a failure to retry — re-read the
  * roster to see which. `notice` is {@link finishNetsNotice} of the body's
  * `nets` (pass `earlierFinishWithdrew` on an unfinish); `withdrew` says a
- * finish withdrew at least one net, for the caller to remember until an
+ * finish withdrew (or cancelled the continuation of) at least one net, for the caller to remember until an
  * Unfinish.
  */
 export async function setSessionFinished(
@@ -330,6 +330,8 @@ export async function setSessionFinished(
   const changed = res.success && res.data?.changed !== "none";
   const nets = res.success ? res.data?.nets : null;
   const notice = finishNetsNotice(nets, finished, earlierFinishWithdrew);
-  const withdrew = finished && (nets?.withdrawn?.length ?? 0) > 0;
+  // A cancelled net is not restored by an Unfinish either.
+  const withdrew =
+    finished && (nets?.withdrawn?.length ?? 0) + (nets?.cancelled?.length ?? 0) > 0;
   return { changed, message: res.message ?? null, notice, withdrew };
 }
