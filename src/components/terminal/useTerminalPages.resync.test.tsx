@@ -8,7 +8,7 @@
  * is actually exercised.
  */
 
-import { act, createElement } from "react";
+import { StrictMode, act, createElement } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -97,7 +97,11 @@ async function settle() {
  * pattern of `useTerminalPages.prune.test.tsx`, generalized to any label and
  * to a page-pinned pop-out via `?page=<id>`).
  */
-async function mountWindow(label: string, pinnedPage?: string): Promise<MountedWindow> {
+async function mountWindow(
+  label: string,
+  pinnedPage?: string,
+  strict = false,
+): Promise<MountedWindow> {
   const container = document.createElement("div");
   document.body.appendChild(container);
   const root = createRoot(container);
@@ -112,7 +116,9 @@ async function mountWindow(label: string, pinnedPage?: string): Promise<MountedW
   windowLabel.current = label;
   if (pinnedPage) window.history.replaceState({}, "", `?page=${pinnedPage}`);
   try {
-    await act(async () => root.render(createElement(Win)));
+    await act(async () =>
+      root.render(strict ? createElement(StrictMode, null, createElement(Win)) : createElement(Win)),
+    );
     await settle();
   } finally {
     windowLabel.current = "main";
@@ -248,7 +254,8 @@ describe("a write in one window reaches the others", () => {
     act(() => void pop.hook().renamePage("p1", "Second"));
 
     expect(names(main.hook().allPages)).toEqual(["Second", "Beta", "Gamma"]);
-    // The receiver's synchronous roster (the rename refusal reads it) follows too.
+    // The receiver's synchronous roster (the rename refusal reads it) follows
+    // too, once the reload commits (the `allPagesRef` sync effect).
     expect(main.hook().renamePage("p2", "Second")).toBe(false);
   });
 
@@ -269,6 +276,50 @@ describe("a write in one window reaches the others", () => {
 });
 
 describe("the receiver's branches", () => {
+  it("a reload never replaces this window's own write queued earlier in the same batch", async () => {
+    const main = await mountWindow("main");
+
+    act(() => {
+      // A pending update first, so the next one is queued, not run eagerly.
+      void main.hook().renamePage("p1", "Renamed");
+      main.hook().addPage("Queued");
+      // Another window's event arrives before main renders: the store it reads
+      // holds the rename but not yet the queued page.
+      expect(persisted()).toHaveLength(3);
+      dispatch(TERMINAL_PAGES_SAVED_EVENT, { source: "term-2", digest: rosterDigest(persisted()) });
+    });
+    await settle();
+
+    expect(names(persisted())).toContain("Queued");
+    expect(names(main.hook().allPages)).toEqual(names(persisted()));
+  });
+
+  it("under StrictMode a save sends one broadcast and each window holds one listener", async () => {
+    const main = await mountWindow("main", undefined, true);
+    const pop = await mountWindow("term-2", undefined, true);
+    expect(bus.listeners.get(TERMINAL_PAGES_SAVED_EVENT) ?? []).toHaveLength(2);
+
+    act(() => void pop.hook().renamePage("p3", "Strict"));
+
+    expect(savedEvents()).toHaveLength(1);
+    expect(names(main.hook().allPages)).toEqual(["Alpha", "Beta", "Strict"]);
+  });
+
+  it("this window's own save cancels a pending read of an older foreign digest", async () => {
+    const main = await mountWindow("main");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.useFakeTimers();
+    // A foreign digest the store never reaches: main starts retrying.
+    receiveFrom("term-2", rosterDigest([ROSTER[0]]));
+    // Main then saves; its own echo supersedes the pending read.
+    act(() => void main.hook().renamePage("p2", "Own"));
+    act(() => void vi.advanceTimersByTime(1_000));
+    vi.useRealTimers();
+
+    expect(warn).not.toHaveBeenCalled();
+    expect(names(main.hook().allPages)).toEqual(["Alpha", "Own", "Gamma"]);
+  });
+
   it("own echo: the saving window ignores its own event", async () => {
     const pop = await mountWindow("term-2");
     bus.hold = true;
