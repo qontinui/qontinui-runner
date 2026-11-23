@@ -712,8 +712,9 @@ export function useTerminalPages() {
         if (next === read.base) return prev;
         const saved = savePages(next);
         lastSaveRefusedRef.current = !saved;
-        // The digest of what a reader of the store gets back
-        // (`readPersistedPages` classifies origins; idempotent on `next`).
+        // The digest of what a reader of the store gets back: `readPersistedPages`
+        // classifies origins, and `next` may lack one (built on `loadPages`'s
+        // unclassified default page when the store was empty).
         if (saved) broadcastDueRef.current = rosterDigest(withClassifiedOrigins(next));
         return next;
       });
@@ -800,7 +801,12 @@ export function useTerminalPages() {
   // The store write can reach this webview after the event does, so the read
   // is retried until the stored roster's digest is the one the sender saved;
   // after the last retry the last non-null read is applied (a newer write that
-  // displaced the digest sends its own event).
+  // displaced the digest sends its own event). A write that becomes visible
+  // only after the retry budget (5 x 50 ms) is not re-read: this window shows
+  // the older roster, with a warning, until the next save anywhere.
+  //
+  // Once the listener is registered, the store is read once to catch up on a
+  // save another window made between this window's mount and that moment.
   useEffect(() => {
     let disposed = false;
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -865,7 +871,7 @@ export function useTerminalPages() {
         }
       };
       attempt();
-    });
+    }, apply);
 
     return () => {
       disposed = true;
