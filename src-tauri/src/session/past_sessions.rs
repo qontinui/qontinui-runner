@@ -240,7 +240,8 @@ fn resume_config_dir(
     working_dir: Option<&str>,
     session_id: &str,
 ) -> Option<String> {
-    let has_recorded = recorded.is_some_and(|d| !d.trim().is_empty());
+    let has_recorded =
+        crate::session::session_ledger::has_usable_recorded_config_dir(recorded);
     let holders: Option<Vec<PathBuf>> = if has_recorded {
         None
     } else {

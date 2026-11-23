@@ -432,10 +432,7 @@ pub fn capture(
             // The account a resume runs under: the recorded dir, else the one
             // config dir holding the transcript. The transcript scan runs only
             // for a record that carries no dir of its own.
-            let has_recorded = rec
-                .config_dir
-                .as_deref()
-                .is_some_and(|d| !d.trim().is_empty());
+            let has_recorded = has_usable_recorded_config_dir(rec.config_dir.as_deref());
             let holders = if has_recorded {
                 None
             } else {
@@ -1016,7 +1013,36 @@ pub fn resolve_config_dir(
     recorded: Option<&str>,
     transcript_holders: Option<&[PathBuf]>,
 ) -> Option<String> {
-    if let Some(dir) = recorded.map(str::trim).filter(|d| !d.is_empty()) {
+    resolve_config_dir_with(recorded, transcript_holders, is_retired_default_home)
+}
+
+/// A default home (`~/.claude`) that no longer exists is a retired account:
+/// `resume_command_for` would type no `CLAUDE_CONFIG_DIR` for it and the resume
+/// would land on the shell's ambient account. Same existence test as the
+/// `claude_default_config_home` command.
+fn is_retired_default_home(dir: &str) -> bool {
+    qontinui_runner_lib::session_archive::discovery::is_default_config_home_from_env(dir)
+        && !std::path::Path::new(dir).is_dir()
+}
+
+/// Does the record carry a recorded dir that [`resolve_config_dir`] will use?
+/// When not (blank, or a retired default home), the caller must probe the
+/// transcript holders so the fallback has evidence to resolve from.
+pub fn has_usable_recorded_config_dir(recorded: Option<&str>) -> bool {
+    recorded
+        .map(str::trim)
+        .is_some_and(|d| !d.is_empty() && !is_retired_default_home(d))
+}
+
+fn resolve_config_dir_with(
+    recorded: Option<&str>,
+    transcript_holders: Option<&[PathBuf]>,
+    retired_default: impl Fn(&str) -> bool,
+) -> Option<String> {
+    if let Some(dir) = recorded
+        .map(str::trim)
+        .filter(|d| !d.is_empty() && !retired_default(d))
+    {
         return Some(dir.to_string());
     }
     match transcript_holders? {
@@ -1943,6 +1969,25 @@ mod tests {
         assert_eq!(resolve_config_dir(None, Some(&[x, y])), None);
         assert_eq!(resolve_config_dir(None, Some(&[])), None);
         assert_eq!(resolve_config_dir(None, None), None);
+    }
+
+    /// A recorded default home that no longer exists is a retired account: the
+    /// unique transcript holder wins, and with no holder the account is unknown
+    /// rather than the ambient one.
+    #[test]
+    fn a_retired_default_home_yields_to_the_transcript_holder() {
+        let g = PathBuf::from("/a/.claude-gmail");
+        let retired = |d: &str| d == "/a/.claude";
+        assert_eq!(
+            resolve_config_dir_with(Some("/a/.claude"), Some(std::slice::from_ref(&g)), retired)
+                .as_deref(),
+            Some("/a/.claude-gmail")
+        );
+        assert_eq!(resolve_config_dir_with(Some("/a/.claude"), Some(&[]), retired), None);
+        assert_eq!(
+            resolve_config_dir_with(Some("/a/.claude"), None, |_| false).as_deref(),
+            Some("/a/.claude")
+        );
     }
 
     /// An empty capture must never destroy a non-empty prior — that is how a

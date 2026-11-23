@@ -763,6 +763,38 @@ describe("classifyRestoreAction — needs-account (no silent default account)", 
 });
 
 describe("resolveRestoreAccount", () => {
+  it("a recorded default home that does not exist falls through to the transcript holder", () => {
+    // home = null is what the backend answers for a retired default home.
+    expect(
+      resolveRestoreAccount(
+        {
+          configDir: "/a/.claude",
+          transcriptConfigDirCount: 1,
+          transcriptConfigDir: "/a/.claude-gmail",
+          transcriptConfigDirIsDefault: false,
+        },
+        null,
+      ),
+    ).toEqual({ kind: "resolved", recordDir: "/a/.claude-gmail", typedDir: "/a/.claude-gmail" });
+    expect(
+      resolveRestoreAccount({ configDir: "/a/.claude", transcriptConfigDirCount: 0 }, null),
+    ).toEqual({ kind: "unknown", reason: "no-transcript-holder" });
+    expect(
+      resolveRestoreAccount({ configDir: "/a/.claude", transcriptConfigDirCount: 2 }, null),
+    ).toEqual({ kind: "unknown", reason: "ambiguous-transcript" });
+    expect(
+      resolveRestoreAccount(
+        {
+          configDir: "/a/.claude",
+          transcriptConfigDirCount: 1,
+          transcriptConfigDir: "/a/.claude",
+          transcriptConfigDirIsDefault: true,
+        },
+        null,
+      ),
+    ).toEqual({ kind: "resolved", recordDir: "/a/.claude", typedDir: undefined });
+  });
+
   it("takes the recorded dir first", () => {
     expect(
       resolveRestoreAccount({ configDir: "/a/.claude-x", transcriptConfigDirCount: 2 }, HOME),
@@ -824,9 +856,10 @@ describe("resolveRestoreAccount", () => {
   });
 
   it("with the default home unreadable, a dir that may be it is needs-account, never typed", () => {
+    // No transcript evidence either: still needs-account, never typed on a guess.
     expect(resolveRestoreAccount({ configDir: "/home/u/.claude" }, null)).toEqual({
       kind: "unknown",
-      reason: "default-home-unknown",
+      reason: "transcript-unprobed",
     });
     // Any other account is still typed as itself.
     expect(resolveRestoreAccount({ configDir: "/home/u/.claude-x" }, null)).toEqual({
