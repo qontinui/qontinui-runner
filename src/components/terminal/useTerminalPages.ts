@@ -813,6 +813,8 @@ export function useTerminalPages() {
     // the `allPagesRef` sync effect above.
     const apply = () => {
       setPages((prev) => {
+        // The one refused-save check, made when the update runs: while this
+        // window's last save was refused its copy is newer than the store.
         if (lastSaveRefusedRef.current) return prev;
         // An empty or unreadable store keeps this window's copy.
         const target = readPersistedPages();
@@ -834,7 +836,6 @@ export function useTerminalPages() {
         lastOwnDigest = digest;
         return;
       }
-      if (lastSaveRefusedRef.current) return;
       // A newer foreign event supersedes a read still waiting on an older digest.
       if (retryTimer) clearTimeout(retryTimer);
       retryTimer = null;
@@ -842,7 +843,7 @@ export function useTerminalPages() {
       let lastRead: TerminalPageConfig[] | null = null;
       const attempt = () => {
         retryTimer = null;
-        if (disposed || lastSaveRefusedRef.current) return;
+        if (disposed) return;
         const stored = readPersistedPages();
         if (stored) lastRead = stored;
         if (stored && rosterDigest(stored) === digest) {
