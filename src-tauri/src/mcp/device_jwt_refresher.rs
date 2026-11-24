@@ -9005,10 +9005,13 @@ mod tenant_slot_refresh_tests {
         qontinui_runner_lib::pair::CoordBoundTenantsRead::Unknown("test: sidecar not read")
     }
 
+    /// A distinct test tenant per `n` in 0..16. 0..=5 keep their historical
+    /// `a`..`f` spelling; 6..=15 continue with the hex digits `0`..`9`.
     fn tenant(n: u8) -> uuid::Uuid {
+        assert!(n < 16, "tenant(n) supports n in 0..16, got {n}");
+        let c = char::from_digit((u32::from(n) + 10) % 16, 16).expect("hex digit");
         uuid::Uuid::parse_str(&format!(
-            "{c}{c}{c}{c}{c}{c}{c}{c}-{c}{c}{c}{c}-4{c}{c}{c}-8{c}{c}{c}-{c}{c}{c}{c}{c}{c}{c}{c}{c}{c}{c}{c}",
-            c = (b'a' + n) as char
+            "{c}{c}{c}{c}{c}{c}{c}{c}-{c}{c}{c}{c}-4{c}{c}{c}-8{c}{c}{c}-{c}{c}{c}{c}{c}{c}{c}{c}{c}{c}{c}{c}"
         ))
         .expect("valid uuid")
     }
@@ -15569,10 +15572,13 @@ mod tenant_seed_arm_tests {
         chrono::Utc::now().timestamp() + 3600
     }
 
+    /// A distinct test tenant per `n` in 0..16. 0..=5 keep their historical
+    /// `a`..`f` spelling; 6..=15 continue with the hex digits `0`..`9`.
     fn tenant(n: u8) -> uuid::Uuid {
+        assert!(n < 16, "tenant(n) supports n in 0..16, got {n}");
+        let c = char::from_digit((u32::from(n) + 10) % 16, 16).expect("hex digit");
         uuid::Uuid::parse_str(&format!(
-            "{c}{c}{c}{c}{c}{c}{c}{c}-{c}{c}{c}{c}-4{c}{c}{c}-8{c}{c}{c}-{c}{c}{c}{c}{c}{c}{c}{c}{c}{c}{c}{c}",
-            c = (b'a' + n) as char
+            "{c}{c}{c}{c}{c}{c}{c}{c}-{c}{c}{c}{c}-4{c}{c}{c}-8{c}{c}{c}-{c}{c}{c}{c}{c}{c}{c}{c}{c}{c}{c}{c}"
         ))
         .expect("valid uuid")
     }
