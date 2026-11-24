@@ -790,14 +790,18 @@ async fn run_orchestrator(
                         }
                         ModifyAction::Revive { cursor } => {
                             // No `path_looks_like_workflow_session` sniff: the
-                            // tail passed the in-task re-check before it
-                            // parked. The cursor is carried OUT from under the
-                            // lock: if the retention sweep or a `Remove` drops
-                            // the parked entry between this decision and
-                            // `schedule_tail` re-taking the lock, the `None`
-                            // arm still starts at the parked cursor rather
-                            // than at EOF, so the append that woke us is not
-                            // skipped.
+                            // file's head was judged from offset 0 before this
+                            // tail's chain began (by the `Create` / `Fresh`
+                            // sniff, startup discovery's `list_sessions`
+                            // filter, or step 6 on the chain's offset-0
+                            // batch), and a revived tail never re-judges a
+                            // mid-file batch (`HeadWorkflowCheck`). The cursor
+                            // is carried OUT from under the lock: if the
+                            // retention sweep or a `Remove` drops the parked
+                            // entry between this decision and `schedule_tail`
+                            // re-taking the lock, the `None` arm still starts
+                            // at the parked cursor rather than at EOF, so the
+                            // append that woke us is not skipped.
                             if let Some(w) = cohort.observe(&session_id, Instant::now()) {
                                 record_cohort_wake(&w);
                             }
@@ -931,29 +935,30 @@ impl SidechainTail {
 }
 
 /// Step 6 of [`tail_session`]: which appended batches the workflow-session
-/// re-check judges, held across one tail's batches. The tail's first batch is
-/// judged, and the first batch after a truncation, whatever offset it
-/// begins at.
+/// re-check judges. Exactly the batches that begin at FILE offset 0 — the
+/// file's head — whatever batch of the tail they are and however the tail
+/// started: the first batch of a tail from `TailStart::Start`, or from
+/// `TailStart::Eof` on an empty file, and the first batch after a truncation,
+/// which restarts the cursor at 0. A batch that begins anywhere else is never
+/// judged, because a mid-file record says nothing about the file.
+///
+/// Stateless: an offset-0 batch recurs only after a truncation, because the
+/// cursor otherwise only grows and an empty batch is never delivered, so the
+/// offset rule needs no judged-once latch and no truncation re-arm.
 #[derive(Debug, Default)]
-struct HeadWorkflowCheck {
-    /// A batch has been judged since the tail started or last truncated.
-    judged: bool,
-}
+struct HeadWorkflowCheck {}
 
 impl HeadWorkflowCheck {
-    /// `true` = tear the tail down: `bytes` — one appended batch beginning at
-    /// FILE offset `file_start`, `truncated` when the file shrank and the
-    /// cursor restarted at 0 before it — is judged, and its first five lines
+    /// `true` = tear the tail down: `bytes`, one appended batch beginning at
+    /// FILE offset `file_start`, is the file's head, and its first five lines
     /// carry the workflow marker ([`is_workflow_session_marker`] reads only
-    /// those).
+    /// those). `truncated` (the file shrank and the cursor restarted at 0
+    /// before this batch) needs no handling of its own: such a batch begins
+    /// at offset 0, so it is judged.
     fn judge(&mut self, file_start: u64, bytes: &str, truncated: bool) -> bool {
-        if truncated {
-            self.judged = false;
-        }
-        if self.judged {
+        if file_start != 0 {
             return false;
         }
-        self.judged = true;
         is_workflow_session_marker(bytes)
     }
 }
@@ -965,8 +970,8 @@ impl HeadWorkflowCheck {
 /// NOT a workflow session, and both callers depend on that:
 ///
 /// - the dispatcher then schedules the tail, and the in-task re-check (step 6
-///   of [`tail_session`]) tears it down if the marker shows up after the
-///   first wake;
+///   of [`tail_session`]) tears it down if the marker shows up in the batch
+///   that begins at offset 0;
 /// - [`SidechainTail::resolve`] reads the PARENT through this function, so an
 ///   unreadable parent must not read as workflow: if it did, a parent that was
 ///   briefly unreadable at a sidechain's tail start would stop that sidechain
@@ -976,7 +981,8 @@ fn path_looks_like_workflow_session(path: &Path) -> bool {
     let f = match std::fs::File::open(path) {
         Ok(f) => f,
         // File not yet readable → treat as not-workflow; the in-task re-check
-        // will tear down if the marker shows up later.
+        // tears down if the marker shows up in the batch that begins at
+        // offset 0.
         Err(_) => return false,
     };
     let reader = BufReader::new(f);
@@ -1667,12 +1673,18 @@ async fn settle_batch(
     bytes: &str,
     truncated: bool,
 ) -> Option<TailExit> {
-    // ── 6. Workflow-session re-check on first complete wake ───────────────
+    // ── 6. Workflow-session re-check of the file's head ───────────────────
     //
     // Creation-time discovery may race the writer: the file existed at
-    // `Create` but the `queue-operation` marker hadn't landed yet.
-    // After the first read pass we have the batch; if the marker is in its
-    // first lines, this is a workflow session — log and tear down.
+    // `Create` but the `queue-operation` marker hadn't landed yet, and the
+    // tail started at offset 0. So a batch that begins at FILE offset 0 — the
+    // file's head — is judged here: if its first lines carry the marker, this
+    // is a workflow session; log and tear down. A batch that begins anywhere
+    // else is never judged. A mid-file record says nothing about the file: an
+    // interactive transcript appends a `queue-operation` enqueue/remove pair
+    // mid-file for every queued prompt and task notification. And a tail that
+    // opens mid-file (revived at its parked cursor, or started at EOF) had
+    // the head judged from offset 0 by whatever scheduled it.
     if check.judge(file_start, bytes, truncated) {
         info!(
             "transcript_watcher: tearing down tail for workflow session {} (detected post-creation)",
