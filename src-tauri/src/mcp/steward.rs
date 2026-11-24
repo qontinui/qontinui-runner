@@ -1176,9 +1176,8 @@ pub(crate) enum RestartOutcome {
     Deferred(String),
 }
 
-/// The shared start path behind the HTTP route and the Tauri command. `origin`
-/// decides how the coord device drain applies: `Steward` (autonomous) is
-/// deferred while the drain holds, `OperatorTerminal` is not.
+/// Run [`start_steward`] detached from the caller's future, so a disconnecting
+/// client cannot cancel a start whose PTY has already opened.
 async fn start_steward_detached(
     app_handle: tauri::AppHandle,
     kind: String,
@@ -1191,6 +1190,9 @@ async fn start_steward_detached(
     crate::spawn_off_worker::run_detached(start_steward(app_handle, kind, request, origin)).await
 }
 
+/// The shared start path behind the HTTP route and the Tauri command. `origin`
+/// decides how the coord device drain applies: `Steward` (autonomous) is
+/// deferred while the drain holds, `OperatorTerminal` is not.
 async fn start_steward(
     app_handle: tauri::AppHandle,
     kind: String,
