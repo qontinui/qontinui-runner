@@ -1443,9 +1443,9 @@ pub(crate) fn build_visibility_report(
     // from a malformed payload must not panic the sort.
     occlusions.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.total_cmp(&a.1)));
     let entries: Vec<serde_json::Value> = occlusions.into_iter().map(|(_, _, e)| e).collect();
-    // The same order for the clipped list: text-bearing first (clipped text
-    // is information the reader loses), then worst ratio first.
-    clipped.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.total_cmp(&a.1)));
+    // The SDK's clipped order: worst ratio first, and nothing else. `sort_by`
+    // is stable, so equal ratios keep registry order, as the SDK's does.
+    clipped.sort_by(|a, b| b.1.total_cmp(&a.1));
     let clipped_entries: Vec<serde_json::Value> = clipped.into_iter().map(|(_, _, e)| e).collect();
 
     let verdict = if elements.is_empty() {
@@ -1501,8 +1501,9 @@ pub(crate) fn build_visibility_report(
     })
 }
 
-/// What `data.occlusionText` says about the occlusion entries' fields that
-/// name or quote the webview (`element`, `occludedBy`, `label`, `text`):
+/// What `data.occlusionText` says about the fields of the occlusion and
+/// clipped entries that name or quote the webview (`element`, `occludedBy`,
+/// `label`, `text`):
 /// `"included"` for a local read, `"withheld"` for a relayed one.
 pub(crate) const OCCLUSION_TEXT_INCLUDED: &str = "included";
 /// See [`OCCLUSION_TEXT_INCLUDED`].
@@ -2172,7 +2173,7 @@ mod visibility_tests {
     /// list is ordered text-bearing first then worst ratio, and an element
     /// with no `clippedPct` (an older bundle) contributes nothing.
     #[test]
-    fn clipped_entries_take_min_ratio_and_the_occlusion_order() {
+    fn clipped_entries_take_min_ratio_and_the_sdk_ratio_order() {
         let elements = vec![
             el("hairline", "", json!({ "clippedPct": 1 })),
             el("blank-90", "", json!({ "clippedPct": 90 })),
@@ -2196,12 +2197,35 @@ mod visibility_tests {
             .iter()
             .map(|e| e["element"].as_str().unwrap())
             .collect();
-        assert_eq!(ids, vec!["text-70", "text-20", "blank-90"]);
+        assert_eq!(ids, vec!["blank-90", "text-70", "text-20"]);
         let strict = build_visibility_report(&elements, 0.8, false, None);
         assert_eq!(strict["clipped"].as_array().unwrap().len(), 1);
         // A zero clip is no clip, even at `minRatio: 0`.
         let all = build_visibility_report(&elements, 0.0, false, None);
         assert_eq!(all["clipped"].as_array().unwrap().len(), 4);
+    }
+
+    /// Equal ratios keep registry order (a stable sort), as the SDK's does;
+    /// text carries no priority in the clipped list.
+    #[test]
+    fn clipped_ties_keep_registry_order() {
+        let elements = vec![
+            el("first-blank", "", json!({ "clippedPct": 50 })),
+            el(
+                "second-text",
+                "",
+                json!({ "clippedPct": 50, "textContent": "t" }),
+            ),
+            el("third-blank", "", json!({ "clippedPct": 50 })),
+        ];
+        let report = build_visibility_report(&elements, 0.02, false, None);
+        let ids: Vec<&str> = report["clipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["element"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["first-blank", "second-text", "third-blank"]);
     }
 
     /// Relayed: a clipped entry keeps only `ratio` and `scrollReachable`; its

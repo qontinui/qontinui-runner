@@ -118,7 +118,7 @@
 //! the component read (`ui_bridge::elements::ComponentSources`), which keeps
 //! a relayed read to the runner's own registry, and the occlusion sweep
 //! (`ui_bridge::screenshots::disclose_occlusion_text`), which drops every
-//! occlusion entry's ids, label and text from a relayed report.
+//! occlusion and clipped entry's ids, label and text from a relayed report.
 //!
 //! # The drift tripwire
 //!
@@ -224,8 +224,8 @@ pub const RELAY_ALLOWED: &[(&str, &str)] = &[
     // (`useDiscoveryEvents.ts` `readModalContext`). The analysis is one pass
     // over the discovered elements. A RELAYED report names and quotes nothing
     // from the webview: `screenshots::disclose_occlusion_text`, keyed on
-    // [`RELAYED_REQUEST_HEADER`], drops each entry's `label` and `text` and
-    // its `element` and `occludedBy` ids (the SDK commonly slugifies an
+    // [`RELAYED_REQUEST_HEADER`], drops each occlusion and clipped entry's
+    // `label` and `text` and its `element` and `occludedBy` ids (the SDK commonly slugifies an
     // element's label or heading text into its id), and says
     // `occlusionText: "withheld"`. As defence in depth the response still
     // takes the snapshot's egress gate
