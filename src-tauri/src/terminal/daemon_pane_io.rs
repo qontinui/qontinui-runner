@@ -4034,13 +4034,19 @@ mod tests {
             assert!(got.starts_with(b"\x1b[?1049h") && got.ends_with(b"DONE\x1b[?2004h"));
             // Byte-exact: the stream part of what the pane delivered, between
             // the 8-byte `?1049h` preamble and the 8-byte `?2004h` postamble,
-            // is exactly the tail the holder serves — so it starts where the
-            // holder said, not merely at the right length.
+            // is exactly the tail the holder serves. The tail is uniform `x`
+            // ending in `DONE`, so this pins the envelope boundaries; where the
+            // tail STARTS is pinned only jointly with the exact length, the
+            // `ends_with` and the `offset == end` checks above — keep all four.
             let stream = &got[b"\x1b[?1049h".len()..got.len() - b"\x1b[?2004h".len()];
             assert_eq!(tail.len(), TAIL, "the bare tail is one full tail");
+            let first_diff = stream.iter().zip(tail.iter()).position(|(a, b)| a != b);
             assert!(
                 stream == &tail[..],
-                "the delivered stream bytes are exactly the holder's tail"
+                "the delivered stream bytes are exactly the holder's tail \
+                 (stream {} bytes, tail {} bytes, first difference at {first_diff:?})",
+                stream.len(),
+                tail.len()
             );
             assert!(
                 !contains(&got, b"were lost here"),
