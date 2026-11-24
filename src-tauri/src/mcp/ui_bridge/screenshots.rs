@@ -1364,7 +1364,7 @@ pub(crate) fn build_visibility_report(
     // Ancestor-overflow clipping, reported BESIDE the occlusions and never in
     // them: it does not feed `verdict` or `hidesText`, so a page whose only
     // findings are clipped entries reads `clear` with this list served.
-    let mut clipped: Vec<(bool, f64, serde_json::Value)> = Vec::new();
+    let mut clipped: Vec<(f64, serde_json::Value)> = Vec::new();
     let mut expected_overlays_filtered: u64 = 0;
     // Did ANY element carry occlusion data at all? See `occlusionDataObserved`
     // below - this is what separates "nothing is covered" from "this webview's
@@ -1405,7 +1405,6 @@ pub(crate) fn build_visibility_report(
                 let scroll_reachable =
                     state.get("clipScrollable").and_then(|v| v.as_bool()) == Some(true);
                 clipped.push((
-                    !text.is_empty(),
                     clip_ratio,
                     clipped_entry(id, label, text, clip_ratio, scroll_reachable),
                 ));
@@ -1445,8 +1444,8 @@ pub(crate) fn build_visibility_report(
     let entries: Vec<serde_json::Value> = occlusions.into_iter().map(|(_, _, e)| e).collect();
     // The SDK's clipped order: worst ratio first, and nothing else. `sort_by`
     // is stable, so equal ratios keep registry order, as the SDK's does.
-    clipped.sort_by(|a, b| b.1.total_cmp(&a.1));
-    let clipped_entries: Vec<serde_json::Value> = clipped.into_iter().map(|(_, _, e)| e).collect();
+    clipped.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let clipped_entries: Vec<serde_json::Value> = clipped.into_iter().map(|(_, e)| e).collect();
 
     let verdict = if elements.is_empty() {
         // An empty list from a registry with no elements is UNKNOWN, not
@@ -1489,6 +1488,8 @@ pub(crate) fn build_visibility_report(
         // field now varies with the page instead of being a constant, and
         // `/control/visibility` performs a real sweep for the first time.
         // That is a behavioural change of the bump, not of this function.
+        //
+        // `clippedPct` counts too: a clip measurement is occlusion-sweep data.
         //
         // `false` therefore means: no element in this snapshot carried any
         // occlusion field, so `clear` is "no occlusion OBSERVED", not proof
@@ -2169,8 +2170,40 @@ mod visibility_tests {
         assert_eq!(report["clipped"][0]["element"], json!("nav"));
     }
 
+    /// The clip is recorded before the occlusion is filtered: an element whose
+    /// occlusion falls under the `minRatio` floor is still listed as clipped,
+    /// as the SDK records it independently.
+    #[test]
+    fn a_clip_survives_its_occlusion_falling_under_min_ratio() {
+        let elements = vec![el(
+            "nav",
+            "Nav",
+            json!({ "occludedBy": "div.footer", "occludedPct": 1, "clippedPct": 50 }),
+        )];
+        let report = build_visibility_report(&elements, 0.02, false, None);
+        assert_eq!(report["occlusions"].as_array().map(Vec::len), Some(0));
+        assert_eq!(report["clipped"][0]["element"], json!("nav"));
+    }
+
+    /// ...and one whose occluder is an expected modal overlay is still listed
+    /// as clipped.
+    #[test]
+    fn a_clip_survives_its_occluder_being_an_expected_overlay() {
+        let elements = vec![el(
+            "nav",
+            "Nav",
+            json!({ "occludedBy": "modal-1", "occludedPct": 80, "clippedPct": 50 }),
+        )];
+        let modals: std::collections::HashSet<String> =
+            ["modal-1".to_string()].into_iter().collect();
+        let report = build_visibility_report(&elements, 0.02, false, Some(&modals));
+        assert_eq!(report["occlusions"].as_array().map(Vec::len), Some(0));
+        assert_eq!(report["clipped"][0]["element"], json!("nav"));
+    }
+
     /// `minRatio` filters the clipped list the way it filters occlusions, the
-    /// list is ordered text-bearing first then worst ratio, and an element
+    /// list is ordered worst ratio first with no text priority (the SDK's
+    /// order), and an element
     /// with no `clippedPct` (an older bundle) contributes nothing.
     #[test]
     fn clipped_entries_take_min_ratio_and_the_sdk_ratio_order() {
