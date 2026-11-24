@@ -165,9 +165,6 @@ mod tests {
     /// A fixture machine with an identity, pinned to A, bound to A and B.
     fn fixture() -> (IsolatedAmbient, std::path::PathBuf) {
         let amb = IsolatedAmbient::new();
-        // The view now classifies each candidate's credential; keep that read
-        // off the operator's real OS keychain. Restored when `amb` drops.
-        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
         let machine = amb.write_machine_json(&format!(
             r#"{{"device_id":"11111111-0000-4000-8000-000000000001","hostname":"box","active_tenant_id":"{TENANT_A}"}}"#
         ));

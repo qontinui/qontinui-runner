@@ -9090,7 +9090,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_close_patch_presents_the_sessions_own_tenant_credential() {
         let amb = crate::test_env::isolated_ambient();
-        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
         amb.write_machine_json("{\"device_id\":\"fixture-device\"}");
         let storage = std::path::PathBuf::from(
             std::env::var("QONTINUI_SECURE_STORAGE_DIR")
@@ -11189,7 +11188,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_tenant_switch_retargets_the_flag_poll_without_a_restart() {
         let amb = crate::test_env::isolated_ambient();
-        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
         let a = Uuid::parse_str("aaaaaaaa-0000-4000-8000-00000000000a").unwrap();
         let b = Uuid::parse_str("bbbbbbbb-0000-4000-8000-00000000000b").unwrap();
         two_binding_machine(&amb, Some(a), a, b);
@@ -11260,7 +11258,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_started_flag_poll_asks_coord_about_the_pinned_tenant() {
         let amb = crate::test_env::isolated_ambient();
-        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
         let a = Uuid::parse_str("aaaaaaaa-0000-4000-8000-00000000000a").unwrap();
         let b = Uuid::parse_str("bbbbbbbb-0000-4000-8000-00000000000b").unwrap();
         two_binding_machine(&amb, Some(b), a, b);
@@ -11306,7 +11303,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_flag_poll_spawns_unpinned_and_follows_a_later_pin() {
         let amb = crate::test_env::isolated_ambient();
-        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
         let a = Uuid::parse_str("aaaaaaaa-0000-4000-8000-00000000000a").unwrap();
         let b = Uuid::parse_str("bbbbbbbb-0000-4000-8000-00000000000b").unwrap();
         two_binding_machine(&amb, None, a, b);

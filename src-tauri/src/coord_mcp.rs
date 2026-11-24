@@ -26671,13 +26671,10 @@ mod spawn_tenant_credential_tests {
     fn the_tenancy_report_names_a_row_credential_divergence_and_an_unknown() {
         use crate::commands::session_info::{project_tenancy, TENANCY_RESOLVED, TENANCY_UNKNOWN};
         let amb = crate::test_env::isolated_ambient();
-        // The UNKNOWN half needs a device JWT with no tenant claim, and
-        // `AuthManager::get_access_token` falls back to the OS keychain, which
-        // the fixture does not isolate: on a paired dev box that slot holds the
-        // operator's real token, whose tenant then resolves instead of the
-        // refusal. CI already runs with the keychain off; so does this test.
-        // Restored on drop: the key is in `ambient::AMBIENT_ENV_KEYS`.
-        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
+        // The UNKNOWN half needs a device JWT with no tenant claim. The
+        // keychain fallback in `AuthManager::get_access_token` cannot hand it
+        // the operator's real token: a test binary never reaches the OS
+        // keychain (`auth::deny_os_keychain_for_this_test_process`).
         amb.write_active_tenant_id(tenant_a());
         let (wd, term) = (workdir(&amb, "report"), terminal());
         let _ = provision_coord_mcp_config_file(&wd, Some(&term), None, Some(PORT))

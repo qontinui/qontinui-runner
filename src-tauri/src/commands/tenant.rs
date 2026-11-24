@@ -760,7 +760,6 @@ mod tests {
     #[test]
     fn candidate_credentials_tell_live_expired_and_absent_apart() {
         let _amb = crate::test_env::isolated_ambient();
-        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
         let dir = tempdir().unwrap();
         let am = crate::auth::AuthManager::with_storage(
             crate::secure_storage::SecureStorage::with_path(dir.path().join("creds.enc")).unwrap(),

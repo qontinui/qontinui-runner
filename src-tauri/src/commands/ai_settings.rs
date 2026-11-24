@@ -3424,19 +3424,19 @@ mod usage_report_scope_tests {
     /// - `QONTINUI_PORT` is removed, so the fixture reads as the primary on its
     ///   default API port (`QONTINUI_PRIMARY_PORT` is already removed by the
     ///   fixture).
-    /// - The prepaid half of every fleet report must find no key: the keychain
-    ///   is switched to its file store and both env fallbacks are removed, so
-    ///   no test calls a provider or blocks on a locked secret service.
+    /// - The prepaid half of every fleet report must find no key: both env
+    ///   fallbacks are removed, and a test binary never reaches the OS keychain
+    ///   (`instance_env::os_keychain_allowed` is shut by the test-process
+    ///   marker), so no test calls a provider or blocks on a locked secret
+    ///   service.
     fn extra_env() -> EnvVarRestore {
         let restore = EnvVarRestore::capture(&[
             "XDG_CONFIG_HOME",
             "QONTINUI_ACCOUNT_USAGE_REPORT_DISABLED",
-            "QONTINUI_DISABLE_KEYCHAIN",
             "DEEPSEEK_API_KEY",
             "OPENAI_COMPATIBLE_API_KEY",
             "QONTINUI_PORT",
         ]);
-        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
         for key in [
             "QONTINUI_PORT",
             "QONTINUI_ACCOUNT_USAGE_REPORT_DISABLED",

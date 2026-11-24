@@ -18,19 +18,21 @@
 //! keychain while the mark is set. It replaced a dozen per-module
 //! `set_var("QONTINUI_DISABLE_KEYCHAIN", "1")` workarounds.
 //!
-//! The guard covers `AuthManager` only. This ratchet keeps the rest honest:
+//! The same mark shuts `instance_env::os_keychain_allowed`, the gate every other
+//! keychain store names, so in a unit-test binary no gated store reaches the
+//! keychain either. This ratchet keeps the inventory honest:
 //!
 //! - A new `Entry::new` call (any of the `keyring` crate's constructors —
 //!   `new`, `new_with_target`, `new_with_credential`) outside the allowlist
 //!   fails here, so whoever adds one must decide whether tests can
-//!   reach it — and give it a test seam (as `registry_creds` does with a fake
-//!   store) or route it through `AuthManager`'s guard.
-//! - A literal `set_var("QONTINUI_DISABLE_KEYCHAIN"` anywhere under `src/` but the one file
-//!   still pending PR #2001 fails here, and so does any mention of the
-//!   `"QONTINUI_DISABLE_KEYCHAIN"` name outside the four files that own it.
-//!   Either means someone is re-growing the per-module workaround instead of
-//!   trusting the guard. A per-file scan cannot see a setter wrapped in a
-//!   helper inside one of those four files; review is the backstop there.
+//!   reach it — and put it behind `os_keychain_allowed` or route it through
+//!   `AuthManager`'s guard.
+//! - A literal `set_var("QONTINUI_DISABLE_KEYCHAIN"` anywhere under `src/`
+//!   fails here, and so does any mention of the `"QONTINUI_DISABLE_KEYCHAIN"`
+//!   name outside the files that own it. Either means someone is re-growing the
+//!   per-module workaround instead of trusting the guard. A per-file scan
+//!   cannot see a setter wrapped in a helper inside one of those files; review
+//!   is the backstop there.
 //!
 //! A source scan, not a proof: it cannot see a keychain call spelled through an
 //! aliased import, a re-export or a macro. The load-time guard itself covers the
@@ -45,32 +47,30 @@ use std::path::{Path, PathBuf};
 /// tests cannot reach the real keychain through each.
 const KEYRING_CALL_SITES: &[(&str, &str)] = &[
     (
+        "ambient.rs",
+        "no call: the keychain-gate source scan names `Entry::new` in string literals",
+    ),
+    (
         "auth.rs",
         "AuthManager — refused in every test binary by the load-time marker",
     ),
     (
         "config_facade.rs",
-        "no test calls its keychain getters or setters",
+        "behind os_keychain_allowed, which the test-process marker shuts",
     ),
     (
         "install_effects_producer/registry_creds.rs",
-        "tests use the FakeStore behind RegistryTokenLookup",
+        "behind os_keychain_allowed; tests use the FakeStore behind RegistryTokenLookup",
     ),
     (
         "security/credential_proxy.rs",
-        "tests cover placeholder generation only",
+        "behind os_keychain_allowed; tests cover placeholder generation only",
     ),
     (
         "wrappers/credentials.rs",
-        "tests cover name validation only",
+        "behind os_keychain_allowed; tests cover name validation only",
     ),
 ];
-
-/// Files still allowed a literal `set_var("QONTINUI_DISABLE_KEYCHAIN", ...)`.
-/// `commands/auth.rs` `hermetic_auth_manager` still sets it; that file is owned
-/// by open PR qontinui-runner#2001, and Phase 6 of the plan removes the set
-/// after that lands.
-const DISABLE_KEYCHAIN_SETTERS: &[&str] = &["commands/auth.rs"];
 
 /// Files allowed to name `"QONTINUI_DISABLE_KEYCHAIN"` at all, and why.
 const DISABLE_KEYCHAIN_NAMERS: &[(&str, &str)] = &[
@@ -81,8 +81,8 @@ const DISABLE_KEYCHAIN_NAMERS: &[(&str, &str)] = &[
     ),
     ("ci_node/manifest.rs", "the CI env it forwards to CI steps"),
     (
-        "commands/auth.rs",
-        "hermetic_auth_manager, pending PR #2001",
+        "instance_env.rs",
+        "the startup default a subject runner exports under an instance root",
     ),
 ];
 
@@ -184,13 +184,9 @@ fn no_test_reenables_the_per_module_keychain_workaround() {
     );
 
     let setters = files_containing("set_var(\"QONTINUI_DISABLE_KEYCHAIN\"");
-    let unlisted_setters: Vec<&String> = setters
-        .iter()
-        .filter(|path| !DISABLE_KEYCHAIN_SETTERS.contains(&path.as_str()))
-        .collect();
     assert!(
-        unlisted_setters.is_empty(),
-        "{unlisted_setters:?} set QONTINUI_DISABLE_KEYCHAIN; the load-time guard makes that \
+        setters.is_empty(),
+        "{setters:?} set QONTINUI_DISABLE_KEYCHAIN; the load-time guard makes that \
          redundant — remove it."
     );
 }

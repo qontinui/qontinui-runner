@@ -62,8 +62,8 @@ pub(super) struct Door {
 /// Enter the door ambient:
 /// - [`crate::test_env::isolated_ambient`] supplies the env lock and an empty
 ///   config and secure-storage dir;
-/// - the keychain is switched off, so `store_tokens` never writes the
-///   operator's real one;
+/// - `store_tokens` never writes the operator's real keychain: a test binary
+///   never reaches it (`auth::deny_os_keychain_for_this_test_process`);
 /// - every proxy variable is cleared, so a proxy in the developer's shell is
 ///   never handed a request, and `NO_PROXY` is then set to exactly what the
 ///   runner exports at startup (`outbound_net::LOOPBACK_NO_PROXY`). The
@@ -79,8 +79,6 @@ pub(super) struct Door {
 /// - an unexpired device JWT is stored where `connect_sdk_app` will find it.
 pub(super) fn door() -> Door {
     let ambient = crate::test_env::isolated_ambient();
-    // Restored by the fixture: the key is in `ambient::AMBIENT_ENV_KEYS`.
-    std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
     let proxies = crate::test_env::EnvVarRestore::capture(&PROXY_ENV);
     for key in PROXY_ENV {
         std::env::remove_var(key);

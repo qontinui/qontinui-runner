@@ -359,7 +359,9 @@ fn keychain_enabled_env() -> bool {
 /// `tests/keychain_call_sites_are_enumerated.rs` keeps new keychain call sites
 /// from appearing unnoticed. While it is set, [`AuthManager::keychain_enabled`]
 /// answers `false` for every instance not built by
-/// [`AuthManager::with_storage_force_keychain`].
+/// [`AuthManager::with_storage_force_keychain`], and
+/// `instance_env::os_keychain_allowed` — the gate every other keychain store
+/// names — answers `false` too.
 ///
 /// Why a process marker and not `#[cfg(test)]` or `QONTINUI_DISABLE_KEYCHAIN`:
 /// - The env var protected only the runs that set it. CI sets it; a local
@@ -377,8 +379,9 @@ fn keychain_enabled_env() -> bool {
 /// Plan `2026-10-05-runner-unit-tests-write-to-the-real-os-keychain`.
 static OS_KEYCHAIN_DENIED_FOR_TEST_PROCESS: AtomicBool = AtomicBool::new(false);
 
-/// Marks this process as a test binary, so [`AuthManager`] never reaches the
-/// OS keychain from it. Called only from the `#[cfg(test)]` load-time hooks in
+/// Marks this process as a test binary, so neither [`AuthManager`] nor any
+/// store behind `instance_env::os_keychain_allowed` reaches the OS keychain
+/// from it. Called only from the `#[cfg(test)]` load-time hooks in
 /// `lib.rs` and `main.rs`; a shipped runner never calls it.
 #[doc(hidden)]
 pub fn deny_os_keychain_for_this_test_process() {
@@ -551,9 +554,11 @@ impl AuthManager {
     /// keychain call site in this module. In order:
     /// 1. a [`Self::with_storage_force_keychain`] instance (tests only) is
     ///    enabled — the one explicit opt-in;
-    /// 2. in a test binary ([`os_keychain_denied_for_this_test_process`]) every
+    /// 2. a [`Self::with_storage_no_keychain`] instance (tests only) is
+    ///    disabled;
+    /// 3. in a test binary ([`os_keychain_denied_for_this_test_process`]) every
     ///    other instance is disabled, whatever the environment says;
-    /// 3. otherwise [`keychain_enabled_env`] decides.
+    /// 4. otherwise [`keychain_enabled_env`] decides.
     fn keychain_enabled(&self) -> bool {
         #[cfg(test)]
         if self.force_keychain_enabled {
@@ -625,12 +630,12 @@ impl AuthManager {
     ///
     /// Exists for exactly one caller: the pair-code hang regression test
     /// (`pair::pair_code_hang_regression_tests`, plan
-    /// `2026-08-29-qontinui-profile-device-pair-never-exits` Phase 4). CI
-    /// runs the whole test binary with `QONTINUI_DISABLE_KEYCHAIN=1`
-    /// (`ci_node/manifest.rs`) so existing tests never touch the real OS
-    /// keychain — but that same env var would silently skip the keychain
-    /// write path the regression test exists to exercise, making it pass
-    /// vacuously on both the fixed and unfixed tree. An instance-level
+    /// `2026-08-29-qontinui-profile-device-pair-never-exits` Phase 4). Every
+    /// other instance in a test binary is refused the keychain by the
+    /// test-process marker (and CI also sets `QONTINUI_DISABLE_KEYCHAIN=1`),
+    /// which would silently skip the keychain write path the regression test
+    /// exists to exercise, making it pass vacuously on both the fixed and
+    /// unfixed tree. An instance-level
     /// override sidesteps this without mutating process-global env (which
     /// would race every other test reading `QONTINUI_DISABLE_KEYCHAIN` in
     /// parallel) and without touching any non-test code path.

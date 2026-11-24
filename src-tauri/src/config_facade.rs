@@ -1191,7 +1191,13 @@ mod tests {
     #[test]
     fn under_an_instance_root_the_keychain_helper_never_touches_the_os_keychain() {
         let amb = crate::test_env::isolated_ambient();
+        use qontinui_runner_lib::instance_env::{instance_root, os_keychain_allowed_from};
+        // The test-process marker shuts `os_keychain_allowed` in every unit
+        // test on its own, so prove the ROOT arm separately: open before the
+        // root is set, shut after.
+        assert!(os_keychain_allowed_from(instance_root().as_deref()));
         std::env::set_var("QONTINUI_INSTANCE_ROOT", amb.dir().join("subject"));
+        assert!(!os_keychain_allowed_from(instance_root().as_deref()));
         // A unique test service, never `com.qontinui.runner.ai`: if the gate
         // ever regressed, the store below would land in a throwaway entry
         // rather than overwrite a real secret.
