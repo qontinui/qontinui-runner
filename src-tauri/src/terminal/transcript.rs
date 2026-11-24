@@ -1585,22 +1585,23 @@ pub fn get_latest_session_id(
 /// Check if a JSONL transcript belongs to a workflow-spawned session.
 ///
 /// Runner-spawned sessions (workflow generation, summarization, auto-debug) are
-/// identified by two markers:
-/// 1. A `queue-operation` record within the first five lines (all runner one-shot sessions)
-/// 2. `permissionMode: "bypassPermissions"` in the first user message (supervisor sessions)
+/// identified by one marker: a `queue-operation` record within the first five
+/// lines (all runner one-shot sessions).
 ///
-/// Interactive sessions never have marker 1 in their first five records. They
-/// do write it later: an interactive transcript appends a `queue-operation`
-/// enqueue/remove pair for each queued prompt and each task notification, so
-/// only the first five lines are evidence. Marker 2 is not checked (see the
-/// body): an interactive session run with `--dangerously-skip-permissions`
-/// carries it too.
+/// Interactive sessions never have it in their first five records. They do
+/// write it later: an interactive transcript appends `queue-operation` records
+/// mid-file (an `enqueue`, later a `remove` or `dequeue`) for queued prompts
+/// and task notifications, so only the first five lines are evidence.
+///
+/// `permissionMode: "bypassPermissions"` is NOT a marker, though supervisor
+/// sessions carry it: an interactive session run with
+/// `--dangerously-skip-permissions` carries it too (see the body).
 fn is_workflow_session(content: &str) -> bool {
     for line in content.lines().take(5) {
         // queue-operation is the only reliable signal — runner-spawned one-shot
         // sessions always start with this record; interactive sessions never
-        // have it in their first five records (they append it mid-file, for
-        // each queued prompt and task notification).
+        // have it in their first five records (they append `queue-operation`
+        // records mid-file for queued prompts and task notifications).
         // Do NOT filter on bypassPermissions: users running Claude with
         // --dangerously-skip-permissions also have that in their permission-mode
         // record, and excluding them hides every interactive session.
