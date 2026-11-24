@@ -3731,42 +3731,52 @@ impl PgDb {
         // Fix effectiveness: counted by verdict in SQL and folded through
         // `FixVerdictCounts`. A NULL is unjudged, never effective.
         let mut reflection_fix_effectiveness = Vec::new();
-        if let Ok(rows) = conn.query(
-            &format!(
-                r#"SELECT fix_type, source_agent, {}
+        if let Ok(rows) = conn
+            .query(
+                &format!(
+                    r#"SELECT fix_type, source_agent, {}
              FROM reflection_fixes
              WHERE created_at > $1::TEXT::timestamptz
              GROUP BY fix_type, source_agent ORDER BY COUNT(*) DESC"#,
-                crate::reflection::fix_verdicts::COUNT_COLUMNS
-            ),
-            &[&since],
-        ).await {
+                    crate::reflection::fix_verdicts::COUNT_COLUMNS
+                ),
+                &[&since],
+            )
+            .await
+        {
             for r in &rows {
-                let counts = match crate::reflection::fix_verdicts::FixVerdictCounts::from_row(r, 2) {
+                let counts = match crate::reflection::fix_verdicts::FixVerdictCounts::from_row(r, 2)
+                {
                     Ok(c) => c,
                     Err(e) => {
                         tracing::warn!("get_failure_analysis: fix effectiveness row: {}", e);
                         continue;
                     }
                 };
-                let (fix_type, source_agent) = match (r.try_get::<_, String>(0), r.try_get::<_, Option<String>>(1)) {
-                    (Ok(t), Ok(a)) => (t, a),
-                    (Err(e), _) | (_, Err(e)) => {
-                        tracing::warn!("get_failure_analysis: fix effectiveness row key: {}", e);
-                        continue;
-                    }
-                };
-                reflection_fix_effectiveness.push(crate::meta_optimizer::failure_analysis::FixEffectivenessRecord {
-                    fix_type,
-                    source_agent,
-                    total: counts.total(),
-                    effective: counts.effective,
-                    ineffective: counts.ineffective,
-                    caused_regression: counts.caused_regression,
-                    inconclusive: counts.inconclusive,
-                    unjudged: counts.unjudged,
-                    effectiveness_rate: counts.effective_rate().map(|rate| rate * 100.0),
-                });
+                let (fix_type, source_agent) =
+                    match (r.try_get::<_, String>(0), r.try_get::<_, Option<String>>(1)) {
+                        (Ok(t), Ok(a)) => (t, a),
+                        (Err(e), _) | (_, Err(e)) => {
+                            tracing::warn!(
+                                "get_failure_analysis: fix effectiveness row key: {}",
+                                e
+                            );
+                            continue;
+                        }
+                    };
+                reflection_fix_effectiveness.push(
+                    crate::meta_optimizer::failure_analysis::FixEffectivenessRecord {
+                        fix_type,
+                        source_agent,
+                        total: counts.total(),
+                        effective: counts.effective,
+                        ineffective: counts.ineffective,
+                        caused_regression: counts.caused_regression,
+                        inconclusive: counts.inconclusive,
+                        unjudged: counts.unjudged,
+                        effectiveness_rate: counts.effective_rate().map(|rate| rate * 100.0),
+                    },
+                );
             }
         }
 

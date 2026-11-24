@@ -26,7 +26,14 @@ async fn plant_fix(
               status, effectiveness, source_agent, applied_at, created_at) \
          VALUES ($1, $2, $3, 'context_addition', 'wfv-p4 verdict fixture', 'applied', $4, $5, \
                  $6::TEXT::timestamptz, $6::TEXT::timestamptz)",
-        &[&id, &source_run, &reflection_run, &effectiveness, &agent, &created],
+        &[
+            &id,
+            &source_run,
+            &reflection_run,
+            &effectiveness,
+            &agent,
+            &created,
+        ],
     )
     .await
     .expect("insert reflection_fixes fixture");
@@ -44,7 +51,16 @@ async fn pg_an_only_unjudged_workflow_has_no_rate_and_zero_ineffective() {
     insert_run(&pg, &run, &wf, Some("2026-01-01T00:00:00Z")).await;
     let created = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     for n in 0..3 {
-        plant_fix(&pg, &format!("{wf}-f{n}"), &run, &reflection, None, &created, &wf).await;
+        plant_fix(
+            &pg,
+            &format!("{wf}-f{n}"),
+            &run,
+            &reflection,
+            None,
+            &created,
+            &wf,
+        )
+        .await;
     }
 
     let report = pg
@@ -91,7 +107,16 @@ async fn pg_each_verdict_lands_in_its_own_bucket_and_the_rate_is_over_judged_fix
         ("c", Some("inconclusive")),
         ("u", None),
     ] {
-        plant_fix(&pg, &format!("{wf}-{name}"), &run, &reflection, verdict, &created, &wf).await;
+        plant_fix(
+            &pg,
+            &format!("{wf}-{name}"),
+            &run,
+            &reflection,
+            verdict,
+            &created,
+            &wf,
+        )
+        .await;
     }
 
     let report = pg
@@ -142,7 +167,16 @@ async fn pg_failure_analysis_never_counts_a_null_as_effective() {
     let only_null = format!("{wf}-null");
     let mixed = format!("{wf}-mixed");
     for n in 0..2 {
-        plant_fix(&pg, &format!("{wf}-n{n}"), &run, &reflection, None, &created, &only_null).await;
+        plant_fix(
+            &pg,
+            &format!("{wf}-n{n}"),
+            &run,
+            &reflection,
+            None,
+            &created,
+            &only_null,
+        )
+        .await;
     }
     for (name, verdict) in [
         ("me", Some("effective")),
@@ -152,7 +186,16 @@ async fn pg_failure_analysis_never_counts_a_null_as_effective() {
         ("mc", Some("inconclusive")),
         ("mu", None),
     ] {
-        plant_fix(&pg, &format!("{wf}-{name}"), &run, &reflection, verdict, &created, &mixed).await;
+        plant_fix(
+            &pg,
+            &format!("{wf}-{name}"),
+            &run,
+            &reflection,
+            verdict,
+            &created,
+            &mixed,
+        )
+        .await;
     }
 
     let analysis = pg

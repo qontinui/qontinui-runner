@@ -108,7 +108,12 @@ mod tests {
 
     #[test]
     fn the_sql_columns_name_each_verdict_once() {
-        for verdict in ["effective", "ineffective", "caused_regression", "inconclusive"] {
+        for verdict in [
+            "effective",
+            "ineffective",
+            "caused_regression",
+            "inconclusive",
+        ] {
             assert!(COUNT_COLUMNS.contains(&format!("effectiveness = '{verdict}'")));
         }
         assert_eq!(COUNT_COLUMNS.matches("COUNT(*) FILTER").count(), 5);
