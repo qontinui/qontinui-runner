@@ -1243,7 +1243,9 @@ fn occlusion_entry(
         "source": "hit-test",
     });
     let obj = entry.as_object_mut().expect("json! built an object");
-    if let Some(label) = label.filter(|l| !l.is_empty()) {
+    // As given, empty string included: the SDK serialises `label: el.label`,
+    // which drops only an absent label, never `""`.
+    if let Some(label) = label {
         obj.insert("label".to_string(), serde_json::json!(label));
     }
     if !text.is_empty() {
@@ -1277,7 +1279,9 @@ fn clipped_entry(
         "scrollReachable": scroll_reachable,
     });
     let obj = entry.as_object_mut().expect("json! built an object");
-    if let Some(label) = label.filter(|l| !l.is_empty()) {
+    // As given, empty string included: the SDK serialises `label: el.label`,
+    // which drops only an absent label, never `""`.
+    if let Some(label) = label {
         obj.insert("label".to_string(), serde_json::json!(label));
     }
     if !text.is_empty() {
@@ -2140,6 +2144,42 @@ mod visibility_tests {
         assert_eq!(entry["scrollReachable"], json!(true));
         for absent in ["occludedBy", "hidesText", "isExpectedOverlay", "source"] {
             assert!(entry.get(absent).is_none(), "{absent} on a clipped entry");
+        }
+    }
+
+    /// SDK parity: `buildVisibilityReport` serialises `label: el.label`, so an
+    /// empty-string label reaches the wire as `""` on both an occlusion and a
+    /// clipped entry; only an ABSENT label is left out. Fails if either entry
+    /// filters `""` again.
+    #[test]
+    fn an_empty_label_is_kept_as_given_and_an_absent_one_is_omitted() {
+        let state = json!({
+            "visible": true,
+            "occludedBy": "minimap",
+            "occludedPct": 50,
+            "clippedPct": 40,
+            "clipScrollable": false,
+            "textContent": "Zone",
+        });
+        let elements = vec![
+            json!({ "id": "empty-label", "label": "", "state": state.clone() }),
+            json!({ "id": "no-label", "state": state }),
+        ];
+        let report = build_visibility_report(&elements, 0.02, false, None);
+        for list in ["occlusions", "clipped"] {
+            let entries = report[list].as_array().unwrap();
+            let by_id = |id: &str| {
+                entries
+                    .iter()
+                    .find(|e| e["element"] == json!(id))
+                    .unwrap_or_else(|| panic!("{id} missing from {list}"))
+            };
+            assert_eq!(
+                by_id("empty-label").get("label"),
+                Some(&json!("")),
+                "{list}"
+            );
+            assert!(by_id("no-label").get("label").is_none(), "{list}");
         }
     }
 
