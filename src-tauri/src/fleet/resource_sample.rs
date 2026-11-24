@@ -2424,6 +2424,7 @@ fn warn_once(class: &str, msg: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qontinui_runner_lib::wedge_diagnostics::OVERFLOW_LANE_NAME;
 
     /// Plan `2026-11-13-computer-services-cap-and-sample-outcome` Phase 2: a
     /// 2xx whose body is unreadable or undocumented reads UNKNOWN, never
@@ -3826,8 +3827,9 @@ MemAvailable:   15335424 kB
     /// against for `thread_count`.
     ///
     /// Puts one tracked body in flight on a thread this fixture names, so the
-    /// expected lane key is a constant rather than whatever the test harness
-    /// happened to call the running thread — same technique
+    /// expected lane key is this fixture's own name (or, once the binary has
+    /// used up every named lane, the overflow lane) rather than whatever the
+    /// test harness happened to call the running thread — same technique
     /// `wedge_diagnostics`'s own
     /// `assert_a_body_is_charged_to_its_spawner` fixture uses. `spawn_blocking_tracked`
     /// charges the GLOBAL lane table (there is no way to hand it a private
@@ -3868,27 +3870,56 @@ MemAvailable:   15335424 kB
         let wsl = parse_meminfo("MemTotal: 1024 kB\n", "Ubuntu-24.04".to_string()).expect("parses");
         assert_eq!(wsl.blocking_lanes, None);
 
+        // WHICH lane the body was charged to is a property of the whole test
+        // binary, not of this module: lanes are keyed by distinct thread name,
+        // first-come and never released, so once `MAX_BLOCKING_LANES` distinct
+        // thread names in this binary have charged a tracked body, this
+        // fixture's body lands in the overflow lane. Asserting the named lane
+        // unconditionally reddened qontinui/qontinui-runner#2707, which added
+        // tracked-body call sites that tests in this binary exercise — the
+        // #1447 shape `wedge_diagnostics`'s `LaneTable` doc describes. So read
+        // the lane from the source of truth `collect_host_lane` reads, then
+        // require the published map to carry the fixture in THAT lane. The
+        // overflow branch can only check presence; that `collect_host_lane`
+        // publishes the live table at all is pinned by source in
+        // `the_host_lane_publishes_the_live_blocking_lane_table`.
+        let live = tracked_blocking_by_thread();
+        let charged_to = if live.contains_key(SPAWNER) {
+            SPAWNER
+        } else {
+            OVERFLOW_LANE_NAME
+        };
+        eprintln!("blocking-lane fixture charged to {charged_to}");
+        assert!(
+            live.get(charged_to).copied().is_some_and(|n| n >= 1),
+            "the fixture's body must still be tracked while it is in flight: {live:?}"
+        );
+
         let host = collect_host_lane();
         let published = host
             .blocking_lanes
             .as_ref()
             .expect("the host lane must publish a blocking_lanes map");
-        assert_eq!(
-            published.get(SPAWNER).copied(),
-            Some(1),
-            "the fixture's own in-flight body did not appear in the published \
-             breakdown: {published:?}"
-        );
-        // Cross-checks the live accessor directly, not just the wire struct —
-        // the same key this fixture's body is charged to on the source of
-        // truth `collect_host_lane` reads from.
-        assert!(
-            tracked_blocking_by_thread()
-                .get(SPAWNER)
-                .copied()
-                .is_some_and(|n| n >= 1),
-            "the fixture's body must still be tracked while it is in flight"
-        );
+        if charged_to == SPAWNER {
+            // A free lane: the fixture owns it alone, so the count is exact.
+            assert_eq!(
+                published.get(SPAWNER).copied(),
+                Some(1),
+                "the fixture's own in-flight body did not appear in the published \
+                 breakdown: {published:?}"
+            );
+        } else {
+            // Lanes exhausted: the overflow lane is shared with every other
+            // overflowed body still in flight, so only presence is exact.
+            assert!(
+                published
+                    .get(OVERFLOW_LANE_NAME)
+                    .copied()
+                    .is_some_and(|n| n >= 1),
+                "the fixture's body overflowed, but the published breakdown has no \
+                 {OVERFLOW_LANE_NAME} entry: {published:?}"
+            );
+        }
 
         let _ = release_tx.send(());
         fixture.join().expect("fixture thread");
@@ -4180,6 +4211,19 @@ MemAvailable:   15335424 kB
         assert!(
             body.contains("launch_capacity::live_with_memory("),
             "the launch capacity must be built from the passed-in reading"
+        );
+    }
+
+    /// Source pin beside `the_host_lane_carries_the_blocking_lane_breakdown`,
+    /// whose overflow branch can only check that the shared overflow lane is
+    /// present: the host lane's `blocking_lanes` must be built from the LIVE
+    /// tracked-body table, not a cached or synthesized map.
+    #[test]
+    fn the_host_lane_publishes_the_live_blocking_lane_table() {
+        let body = collect_host_lane_src();
+        assert!(
+            body.contains("s.blocking_lanes = Some(\n        tracked_blocking_by_thread()"),
+            "collect_host_lane must publish blocking_lanes from tracked_blocking_by_thread()"
         );
     }
 
