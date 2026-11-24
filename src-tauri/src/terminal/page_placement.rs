@@ -1,11 +1,15 @@
 //! The page-capacity rule: where an AUTOMATIC placement puts a new terminal.
 //!
-//! One rule, used by every placement the operator did not make: the gate
-//! continuation, the condition check, the looping-agent spawn, and every
+//! Every placement the operator did not make reads its loads from here. The
+//! typed autonomous spawns — the gate continuation, the condition check, the
+//! looping-agent spawn and the stewards — take [`page_loads`] and
+//! [`PAGE_ZONE_CEILING`] but choose among their own `<kind>-<n>` pages
+//! ([`super::spawn_pages`]). Every
 //! [`TerminalManager::create`](super::TerminalManager::create) called with no
 //! page (`POST /terminals` without `pageId`, the agent-facing tauri_proxy
-//! create, the web-relay create, stewards, the SessionRegistry PTY and
-//! claude_cli transports).
+//! create, the web-relay create, the SessionRegistry PTY and claude_cli
+//! transports) is placed by [`pick_page`] here, which never chooses a typed
+//! spawn page: those belong to their kind.
 //! An explicit page and an adopted holder pane (`insert_with_io`) never come
 //! through here, and neither does an OPERATOR spawn: the webview sends the
 //! `default` page as `null`, so the Tauri `terminal_create` command (the one
@@ -45,8 +49,9 @@
 //!   and placing a new session onto a page its restore then refills is the
 //!   defect this fixes.
 //! - A create still in flight is not in the live list yet, so a burst of
-//!   simultaneous automatic spawns can each read the same page as having room.
-//!   That predates this module and is out of its scope.
+//!   simultaneous unpaged creates can each read the same page as having room.
+//!   That predates this module and is out of its scope. The typed spawns close
+//!   it for themselves with a reservation (`spawn_pages::place`).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -220,13 +225,23 @@ pub(crate) fn page_loads(
     page_loads_under(tm, store, RestoreView::current())
 }
 
+/// The loads an unpaged placement chooses among: every page but the typed
+/// spawn pages (`post-merge-1`, `impl-2`, …), which hold only their own kind
+/// and are filled through [`super::spawn_pages::place`].
+fn untyped_loads(loads: Vec<(String, usize)>) -> Vec<(String, usize)> {
+    loads
+        .into_iter()
+        .filter(|(page, _)| !super::spawn_pages::is_spawn_group_page(page))
+        .collect()
+}
+
 fn pick_under(
     tm: &TerminalManager,
     store: Option<&SessionLifecycleStore>,
     view: RestoreView,
 ) -> String {
     pick_page(
-        &page_loads_under(tm, store, view),
+        &untyped_loads(page_loads_under(tm, store, view)),
         PAGE_ZONE_CEILING,
         || uuid::Uuid::new_v4().to_string(),
     )
@@ -273,6 +288,28 @@ mod tests {
     }
 
     // ---- pick_page (moved from agent_runtime.rs) ----
+
+    #[test]
+    fn an_unpaged_placement_never_picks_a_typed_spawn_page() {
+        let loads = untyped_loads(vec![
+            page("default", PAGE_ZONE_CEILING),
+            page("impl-1", 1),
+            page("checks-1", 0),
+            page("p-operator", 4),
+        ]);
+        assert_eq!(
+            pick_page(&loads, PAGE_ZONE_CEILING, || MINTED.to_string()),
+            "p-operator"
+        );
+        let only_typed = untyped_loads(vec![
+            page("default", PAGE_ZONE_CEILING),
+            page("stewards-1", 0),
+        ]);
+        assert_eq!(
+            pick_page(&only_typed, PAGE_ZONE_CEILING, || MINTED.to_string()),
+            MINTED
+        );
+    }
 
     #[test]
     fn pick_page_default_under_ceiling_picks_default() {
