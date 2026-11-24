@@ -7008,7 +7008,7 @@ mod component_input_tests {
 
     fn capture(root: CaptureRect, parent: CaptureRect) -> ComponentCapture {
         ComponentCapture {
-            schema_version: 1,
+            schema_version: Some(1),
             source_sha: Some("abc123".to_string()),
             root: Some(CaptureRoot {
                 bbox: Some(root),
