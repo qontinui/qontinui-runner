@@ -795,6 +795,38 @@ fn an_unanswered_claude_read_adds_no_block() {
     assert!(exclude(&c).lines().any(|l| l.trim() == ".mcp.json"));
 }
 
+/// The prior branch RESOLVES (its commit object is there) but its tree cannot
+/// be read, so `ls-tree` fails. That is UNKNOWN, not "tracks nothing": no
+/// block. The control call first shows the same branch, readable, adds one,
+/// so the assertion is not vacuous.
+#[test]
+fn a_prior_whose_tree_cannot_be_read_adds_no_block() {
+    let c = Canon::new();
+    git(&c.path, &["switch", "-q", "-c", "unreadable"]);
+    std::fs::write(c.path.join("only-here.txt"), "x\n").unwrap();
+    git(&c.path, &["add", "only-here.txt"]);
+    git(&c.path, &["commit", "-q", "-m", "a tree of its own"]);
+    let tree = git(&c.path, &["rev-parse", "unreadable^{tree}"]);
+    git(&c.path, &["switch", "-q", "main"]);
+
+    prepare_canonical_excludes(&c.path, "unreadable", AGENT_BRANCH);
+    assert!(has_block(&c), "control: a readable prior with no .claude adds the block");
+    remove_allocation_excludes(&c.path, AGENT_BRANCH);
+    assert!(!has_block(&c));
+
+    let loose = c
+        .path
+        .join(".git")
+        .join("objects")
+        .join(&tree[..2])
+        .join(&tree[2..]);
+    std::fs::remove_file(&loose).expect("the prior's tree is a loose object");
+    git(&c.path, &["rev-parse", "--verify", "--quiet", "refs/heads/unreadable"]);
+
+    prepare_canonical_excludes(&c.path, "unreadable", AGENT_BRANCH);
+    assert!(!has_block(&c), "an unreadable tree is UNKNOWN: {:?}", exclude(&c));
+}
+
 // ------------------------------------------------ block bytes and guards
 
 fn exclude_path(c: &Canon) -> PathBuf {
