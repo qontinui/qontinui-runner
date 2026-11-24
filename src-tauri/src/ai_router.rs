@@ -186,28 +186,11 @@ impl RoutingConfig {
 // Task Complexity
 // ============================================================================
 
-/// Assessed complexity level of a task.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TaskComplexity {
-    /// Simple tasks: quick fixes, small changes, formatting
-    Simple,
-    /// Medium tasks: feature additions, bug fixes, moderate refactoring
-    Medium,
-    /// Complex tasks: architecture changes, major refactoring, security audits
-    Complex,
-}
-
-impl TaskComplexity {
-    /// Get a human-readable name for this complexity level.
-    pub fn display_name(&self) -> &'static str {
-        match self {
-            Self::Simple => "Simple",
-            Self::Medium => "Medium",
-            Self::Complex => "Complex",
-        }
-    }
-}
+/// Assessed complexity level of a task. The canonical definition lives in the
+/// lib crate so the schema-export pipeline can see it (it is carried on the
+/// `execution-status` Tauri channel) — see
+/// `qontinui_runner_lib::tauri_event_payloads`.
+pub use qontinui_runner_lib::tauri_event_payloads::TaskComplexity;
 
 // ============================================================================
 // Complexity Assessment

@@ -19,6 +19,65 @@ use schemars::schema_for;
 use serde_json::{Map, Value};
 
 // ============================================================================
+// Schema-only field helper
+// ============================================================================
+
+/// Schema-only stand-in for an `Option<T>` field that is ALWAYS serialized —
+/// no `skip_serializing_if`, so `None` goes out as `null`, never as a missing
+/// key.
+///
+/// Used as `#[schemars(with = "crate::schema_export::Nullable<T>")]`. The
+/// schemas are exported under schemars' default *deserialize* contract, in
+/// which a plain `Option<T>` field is OPTIONAL (`x?: T | null`), because serde
+/// accepts it missing on the way in. For a payload the runner EMITS that
+/// overstates the uncertainty: the key is always there. This wrapper keeps the
+/// nullable schema but is not itself an `Option`, so schemars marks the field
+/// required (`x: T | null`) — the shape a consumer actually receives. Serde is
+/// untouched; the field stays `Option<T>`.
+pub struct Nullable<T>(std::marker::PhantomData<T>);
+
+impl<T: schemars::JsonSchema> schemars::JsonSchema for Nullable<T> {
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        <Option<T> as schemars::JsonSchema>::schema_name()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        <Option<T> as schemars::JsonSchema>::json_schema(generator)
+    }
+}
+
+/// Schema-only stand-in for a free `String` field whose KNOWN values are the
+/// closed vocabulary `V`, but which is open at runtime — serde accepts and
+/// round-trips any string (user rows, imports, community payloads).
+///
+/// Used as `#[schemars(with = "crate::schema_export::OpenVocab<V>")]`. The
+/// schema is `V | string`: the vocabulary stays named and published (so `V`'s
+/// own binding is still there to narrow against), while the field's binding
+/// admits the foreign values the wire really carries instead of overstating
+/// them as impossible. Serde is untouched; the field stays `String`.
+pub struct OpenVocab<V>(std::marker::PhantomData<V>);
+
+impl<V: schemars::JsonSchema> schemars::JsonSchema for OpenVocab<V> {
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        format!("OpenVocab_{}", V::schema_name()).into()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "anyOf": [generator.subschema_for::<V>(), { "type": "string" }]
+        })
+    }
+}
+
+// ============================================================================
 // Export function
 // ============================================================================
 
@@ -814,7 +873,7 @@ pub fn export_all_schemas() -> Value {
     // 2026-08-31-runner-publishes-embedded-command-defaults Phase 1). The
     // corpus resolves `account override → fleet default → embedded default`,
     // and the store has never held a row for that third rung — the bodies
-    // exist only inside THIS binary (`fleet_commands.rs`, `fleet_skills.rs`,
+    // exist only inside THIS binary (`fleet_commands.rs`, the fleet skills module,
     // `fleet_agents.rs`), so qontinui-web has no baseline to diff an override
     // against. This is the type the runner publishes to close that gap.
     // Registered HERE, beside `AgentTextUnit*`, and deliberately NOT beside
@@ -992,6 +1051,71 @@ pub fn export_all_schemas() -> Value {
     // single reference site. (1) ──
     add!("ImageSlotSpec", qis::ImageSlotSpec);
 
+    // ── runner-local: execution-status channel (`orchestrator::status_events`)
+    // — session 4e (plan 2026-09-12-residual-work-from-the-april-2026-plan-audit
+    // Phase 3). The snake_case wire events the frontend's `useExecutionStatus`
+    // folds into its display state; published under the `Raw*` names the
+    // hand-authored mirror in `ts/src/execution/_api.ts` Tier 3 always used. ──
+    add!("TaskComplexity", tep::TaskComplexity);
+    add!("HookTrigger", tep::HookTrigger);
+    add!("RawRoutingDecisionPayload", tep::RoutingDecisionPayload);
+    add!("RawRetryAttemptPayload", tep::RetryAttemptPayload);
+    add!("RawRetryStatePayload", tep::RetryStatePayload);
+    add!("RawTokenCountPayload", tep::TokenCountPayload);
+    add!("RawCompressionResultPayload", tep::CompressionResultPayload);
+    add!("RawHookExecutionPayload", tep::HookExecutionPayload);
+    add!("RawExecutionStatusEvent", tep::ExecutionStatusEvent);
+
+    // ── runner-local: known issues (`crate::known_issue_types`, the wire of the
+    // `known_issues` Tauri commands) — session 4e. Generic names carry a
+    // `KnownIssue*` title so they cannot collide in this flat registry. ──
+    use crate::known_issue_types as kit;
+    add!("KnownIssueCategory", kit::IssueCategory);
+    add!("KnownIssueScopeType", kit::ScopeType);
+    add!("KnownIssueDetectionMethod", kit::DetectionMethod);
+    add!("KnownIssueSeverity", kit::IssueSeverity);
+    add!("KnownIssueStatus", kit::IssueStatus);
+    add!("KnownIssueProvenance", kit::IssueProvenance);
+    add!("KnownIssue", kit::KnownIssue);
+    add!("CreateKnownIssueRequest", kit::CreateKnownIssueRequest);
+    add!("UpdateKnownIssueRequest", kit::UpdateKnownIssueRequest);
+    add!("ListKnownIssuesQuery", kit::ListKnownIssuesQuery);
+    add!("IssuePatternTemplate", kit::IssuePatternTemplate);
+    add!(
+        "CreatePatternTemplateRequest",
+        kit::CreatePatternTemplateRequest
+    );
+    add!("IssuePatternTemplateParameter", kit::TemplateParameter);
+
+    // ── runner-local: skills (`crate::skill_types`, the skill registry's wire)
+    // — session 4e. The first six are schema-only vocabularies for fields that
+    // stay free `String`s in serde; see that module's doc. ──
+    use crate::skill_types as sk;
+    add!("SkillCategory", sk::SkillCategory);
+    add!("SkillParameterType", sk::SkillParameterType);
+    add!("SkillAllowedPhase", sk::SkillAllowedPhase);
+    add!("SkillApprovalStatus", sk::SkillApprovalStatus);
+    add!("SkillExportContentType", sk::SkillExportContentType);
+    add!("SkillSource", sk::SkillSourceSchema);
+    add!("SkillParameterOption", sk::SkillParameterOption);
+    add!("SkillAuthor", sk::SkillAuthor);
+    add!("SkillParameter", sk::SkillParameter);
+    add!("SkillParameterDependency", sk::ParameterDependency);
+    add!("SkillRef", sk::SkillRef);
+    add!("SkillTemplate", sk::SkillTemplate);
+    add!("SkillDefinition", sk::SkillDefinition);
+    add!("SkillOrigin", sk::SkillOrigin);
+    add!("SkillExportManifest", sk::SkillExportManifest);
+    add!("SkillExport", sk::SkillExport);
+    add!("SkillImportResult", sk::SkillImportResult);
+
+    // ── runner-local: UI Bridge structured action plan — the RESPONSE side of
+    // `/ui-bridge/.../action-plan` (`crate::ui_bridge_action_plan`) — session
+    // 4e. `ActionPlanResponse` publishes as `ActionPlanResult`, the TS name. ──
+    use crate::ui_bridge_action_plan as uap;
+    add!("PlannedActionResult", uap::PlannedActionResult);
+    add!("ActionPlanResult", uap::ActionPlanResponse);
+
     Value::Object(m)
 }
 
@@ -1109,8 +1233,11 @@ mod tests {
         // - VerificationAgentContext (its only producer, the orchestrator
         // verifier's context builder, went with the types above; coord
         // finding 7c536351) = 619.
-        // The codegen's "Processing N top-level types" line should read 619 here.
-        assert_eq!(obj.len(), 619, "Expected 619 schema entries");
+        // + the 41 session-4e runner-local types (9 execution-status, 13 known
+        // issues, 17 skills, 2 action-plan responses; plan
+        // 2026-09-12-residual-work-from-the-april-2026-plan-audit Phase 3) = 660.
+        // The codegen's "Processing N top-level types" line should read 660 here.
+        assert_eq!(obj.len(), 660, "Expected 660 schema entries");
         // Nothing in the product fills these any more, so registering one
         // again would export a DTO that has no producer.
         for removed in [
@@ -1164,6 +1291,14 @@ mod tests {
             obj.contains_key("ImageSlotSpec"),
             "Missing ImageSlotSpec schema from qontinui_types::image_slot"
         );
+        for name in [
+            "RawExecutionStatusEvent",
+            "KnownIssue",
+            "SkillDefinition",
+            "ActionPlanResult",
+        ] {
+            assert!(obj.contains_key(name), "Missing {name} schema (session 4e)");
+        }
         assert!(
             obj.contains_key("RunnerInstance") && obj.contains_key("RunnerInstanceRole"),
             "Missing RunnerInstance / RunnerInstanceRole schema"
@@ -1182,6 +1317,42 @@ mod tests {
             obj.contains_key("UnifiedWorkflow"),
             "Missing UnifiedWorkflow schema from qontinui_types::workflow"
         );
+    }
+
+    #[test]
+    fn session_4e_schema_shapes_are_pinned() {
+        // The generated bindings depend on these three schemars behaviours;
+        // pin them here so a schemars upgrade cannot change them unnoticed.
+        let schemas = export_all_schemas();
+
+        // OpenVocab<V> is `anyOf [V, string]`.
+        let category = &schemas["SkillDefinition"]["properties"]["category"];
+        let any_of = category["anyOf"].as_array().expect("category is anyOf");
+        assert_eq!(any_of.len(), 2, "{category}");
+        assert_eq!(any_of[1], serde_json::json!({ "type": "string" }));
+
+        // Nullable<T> is required AND nullable.
+        let routing = &schemas["RawRoutingDecisionPayload"];
+        let required = routing["required"].as_array().unwrap();
+        assert!(required.contains(&serde_json::json!("prompt_preview")));
+        assert!(routing["properties"]["prompt_preview"]["type"]
+            .as_array()
+            .is_some_and(|t| t.contains(&serde_json::json!("null"))));
+
+        // Every execution-status variant is a closed object that still names
+        // its `type` tag, so `additionalProperties: false` cannot reject it.
+        let variants = schemas["RawExecutionStatusEvent"]["oneOf"]
+            .as_array()
+            .expect("tagged union is oneOf");
+        assert_eq!(variants.len(), 7);
+        for v in variants {
+            assert_eq!(v["additionalProperties"], serde_json::json!(false), "{v}");
+            assert!(v["properties"]["type"].is_object(), "{v}");
+            assert!(v["required"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("type")));
+        }
     }
 
     #[test]

@@ -72,9 +72,11 @@ export function useExecutionStatus(): UseExecutionStatusReturn {
       factors: decision.factors,
       selectedModel: decision.selected_model,
       timestamp,
-      promptPreview: decision.prompt_preview,
-      fileCount: decision.file_count,
-      criteriaCount: decision.criteria_count,
+      // The runner always sends these keys, as `null` when unknown; the display
+      // state models "unknown" as absent (RoutingStatusSection tests `!== undefined`).
+      promptPreview: decision.prompt_preview ?? undefined,
+      fileCount: decision.file_count ?? undefined,
+      criteriaCount: decision.criteria_count ?? undefined,
     };
 
     setStatus((prev) => ({
