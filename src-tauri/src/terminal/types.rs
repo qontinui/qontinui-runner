@@ -54,6 +54,13 @@ pub struct RemoteTabIdentity {
     /// grant is minted in the tenant the session lives in — coord resolves an
     /// attach target within the presented principal's tenant only.
     pub tenant: Option<String>,
+    /// The last relay-reconnect reattach this tab's pane spliced, with the
+    /// arm derived on the source (plan
+    /// `2026-09-26-a5-reattach-acceptance-has-no-drivable-trigger-so-have-offset-ships-unexercised`,
+    /// Phase 3). `None` until the first reattach. Read from the pane at query
+    /// time by `TerminalManager::remote_identities`, so it is always the
+    /// LATEST reattach, never the attach-time snapshot.
+    pub last_reattach: Option<super::remote_pane_io::ReattachRecord>,
 }
 
 /// What `terminal_attach_remote` returns: the ordinary `TerminalInfo` the
