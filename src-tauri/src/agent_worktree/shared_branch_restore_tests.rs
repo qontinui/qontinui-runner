@@ -327,6 +327,85 @@ fn a_deleted_prior_branch_keeps_the_checkout() {
 }
 
 #[test]
+fn a_prior_branch_sharing_its_name_with_a_tag_is_restored() {
+    // `symbolic-ref --short` abbreviates such a branch to `heads/feature`,
+    // which names no branch, so the restore read a live prior as missing.
+    let mut c = Canon::new();
+    git(&c.path, &["switch", "-q", "-c", "feature"]);
+    git(&c.path, &["tag", "feature"]);
+    c.parent_sha = c.head();
+    let sb = c.switch();
+    assert_eq!(sb.prior_ref, "feature");
+
+    assert_eq!(restore(&c, &sb), RestoreOutcome::Restored);
+    assert_eq!(c.head_ref(), "refs/heads/feature");
+}
+
+/// A tag sharing the prior branch's name points at a commit whose `.claude/`
+/// differs from the branch's. The versioned-`.claude/` check must read the
+/// BRANCH (which versions a command) and add no block; reading the tag (which
+/// versions nothing there) would hide the operator's tree.
+#[test]
+fn the_claude_check_reads_the_prior_branch_not_a_same_named_tag() {
+    let mut c = Canon::new();
+    git(&c.path, &["switch", "-q", "-c", "feature"]);
+    git(&c.path, &["tag", "feature"]);
+    std::fs::create_dir_all(c.path.join(".claude/commands")).unwrap();
+    std::fs::write(c.path.join(".claude/commands/a.md"), "authored\n").unwrap();
+    git(&c.path, &["add", ".claude"]);
+    git(&c.path, &["commit", "-q", "-m", "authored command"]);
+    git(&c.path, &["switch", "-q", "main"]);
+    c.parent_sha = c.head();
+    git(&c.path, &["switch", "-q", "feature"]);
+    let sb = c.switch();
+    assert_eq!(sb.prior_ref, "feature");
+    assert!(
+        !has_block(&c),
+        "the branch versions .claude/: no block {:?}",
+        exclude(&c)
+    );
+}
+
+/// Every proof holds — the operator's file is IGNORED on the agent branch, so
+/// the unfiltered listing does not show it — but the prior branch TRACKS that
+/// path. git's default would overwrite the file silently; the restore must
+/// refuse instead and leave it intact.
+#[test]
+fn an_ignored_file_the_prior_ref_tracks_is_never_overwritten() {
+    let mut c = Canon::new();
+    git(&c.path, &["switch", "-q", "-c", "prior"]);
+    std::fs::write(c.path.join("cfg.txt"), "tracked on prior\n").unwrap();
+    git(&c.path, &["add", "cfg.txt"]);
+    git(&c.path, &["commit", "-q", "-m", "prior tracks cfg"]);
+    git(&c.path, &["switch", "-q", "main"]);
+    std::fs::write(c.path.join(".gitignore"), "cfg.txt\n").unwrap();
+    git(&c.path, &["add", ".gitignore"]);
+    git(&c.path, &["commit", "-q", "-m", "ignore cfg"]);
+    c.parent_sha = c.head();
+    git(&c.path, &["switch", "-q", "prior"]);
+    let sb = c.switch();
+    assert_eq!(sb.prior_ref, "prior");
+    assert!(
+        !c.path.join("cfg.txt").exists(),
+        "the switch took the tracked file away"
+    );
+    std::fs::write(c.path.join("cfg.txt"), "operator's\n").unwrap();
+
+    let out = restore(&c, &sb);
+
+    assert!(
+        matches!(&out, RestoreOutcome::Kept(RestoreKeep::SwitchFailed(_))),
+        "{out:?}"
+    );
+    assert_eq!(c.head_ref(), format!("refs/heads/{AGENT_BRANCH}"));
+    assert_eq!(
+        std::fs::read_to_string(c.path.join("cfg.txt")).unwrap(),
+        "operator's\n",
+        "the operator's ignored file survives"
+    );
+}
+
+#[test]
 fn an_incomplete_record_never_acts() {
     let c = Canon::new();
     let sb = c.switch();
@@ -443,6 +522,66 @@ async fn a_refused_shared_branch_spawn_puts_the_canonical_back_despite_provision
     // The runner's artifacts are still there (ignored, not deleted).
     assert!(c.path.join(".mcp.json").exists());
     assert!(c.path.join(".claude").join("commands").is_dir());
+}
+
+/// A `Restored` checkout holds the operator's branch again, so the context's
+/// `Drop` must not hand it to the fs-observer push or the edit-effect verify:
+/// both would diff it against the allocation's `parent_sha` and file the
+/// operator's commits as this agent's edits.
+#[tokio::test]
+async fn drop_does_not_observe_a_restored_checkout() {
+    let _amb = super::super::test_coord::isolate();
+    let c = Canon::new();
+    let sb = c.switch();
+    let agent = format!("sb-drop-observe-{}", uuid::Uuid::new_v4());
+    let ctx = shared_branch_context(&c, &sb, &agent);
+
+    let report = ctx
+        .remove_unspawned_unreported_with("test door", false, "refused", |_| None)
+        .await;
+    assert_eq!(
+        report.trees[0].1,
+        TreeOutcome::Kept(KeepReason::SharedBranchCheckout(RestoreOutcome::Restored)),
+        "{report:?}"
+    );
+
+    let observed = crate::agent_worktree::isolated_edit::drop_observed_recorder::take(&agent)
+        .expect("the context dropped");
+    assert!(
+        observed.is_empty(),
+        "a restored checkout was handed to Drop's producers: {observed:?}"
+    );
+}
+
+/// Kept (here: a commit on the agent branch), the checkout still holds this
+/// allocation's work, so `Drop` observes it as before.
+#[tokio::test]
+async fn drop_still_observes_a_kept_shared_branch_checkout() {
+    let _amb = super::super::test_coord::isolate();
+    let c = Canon::new();
+    let sb = c.switch();
+    std::fs::write(c.path.join("work.txt"), "x").unwrap();
+    git(&c.path, &["add", "work.txt"]);
+    git(&c.path, &["commit", "-q", "-m", "agent work"]);
+    let agent = format!("sb-drop-observe-kept-{}", uuid::Uuid::new_v4());
+    let ctx = shared_branch_context(&c, &sb, &agent);
+
+    let report = ctx
+        .remove_unspawned_unreported_with("test door", false, "refused", |_| None)
+        .await;
+    assert!(
+        matches!(
+            &report.trees[0].1,
+            TreeOutcome::Kept(KeepReason::SharedBranchCheckout(RestoreOutcome::Kept(
+                RestoreKeep::BranchMoved { .. }
+            )))
+        ),
+        "{report:?}"
+    );
+
+    let observed = crate::agent_worktree::isolated_edit::drop_observed_recorder::take(&agent)
+        .expect("the context dropped");
+    assert_eq!(observed, vec![c.path.clone()]);
 }
 
 /// The restore runs while the allocation still holds its claims: the
@@ -648,7 +787,8 @@ fn a_versioned_claude_tree_gets_no_block_and_an_untracked_command_keeps_it_dirty
 #[test]
 fn an_unanswered_claude_read_adds_no_block() {
     let c = Canon::new();
-    // `ls-tree` of a ref that does not resolve fails: UNKNOWN adds nothing.
+    // A prior ref that resolves to no branch and no commit is UNKNOWN
+    // (`resolve_prior` refuses it before any `ls-tree`): it adds nothing.
     prepare_canonical_excludes(&c.path, "refs/heads/no-such-ref", AGENT_BRANCH);
     assert!(!has_block(&c), "{:?}", exclude(&c));
     // The roster half is unconditional and still applied.

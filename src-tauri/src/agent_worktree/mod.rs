@@ -2996,7 +2996,13 @@ fn current_ref(path: &std::path::Path) -> Option<String> {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
     };
-    read(&["symbolic-ref", "--quiet", "--short", "HEAD"]).or_else(|| read(&["rev-parse", "HEAD"]))
+    // The full ref with `refs/heads/` stripped, never `--short`: that
+    // abbreviates a branch sharing its name with a tag to `heads/<name>`,
+    // which names no branch, so a refused spawn's restore would read a live
+    // prior branch as missing.
+    read(&["symbolic-ref", "--quiet", "HEAD"])
+        .and_then(|r| r.strip_prefix("refs/heads/").map(str::to_string))
+        .or_else(|| read(&["rev-parse", "HEAD"]))
 }
 
 /// Create or check out a feature branch in the canonical checkout for the
