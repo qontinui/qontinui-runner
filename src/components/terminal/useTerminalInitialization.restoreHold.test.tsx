@@ -48,6 +48,11 @@ import { instanceStorage } from "@/lib/instance-storage";
 import { useZoneLayout, zoneLayoutStorageKey } from "./useZoneLayout";
 import { useZoneLabelsAndTags } from "./useZoneLabelsAndTags";
 import { useTerminalInitialization } from "./useTerminalInitialization";
+import {
+  PAGES_STORAGE_KEY,
+  TERMINAL_PAGE_REMOVED_EVENT,
+  useTerminalPages,
+} from "./useTerminalPages";
 
 const PAGE = "hold-test";
 const NOOP = () => {};
@@ -91,7 +96,15 @@ const reconnect = async () => {
   return reconnectIndeterminate ? null : [];
 };
 
-function Page({ value, pageId = PAGE }: { value: ScopeValue; pageId?: string }) {
+function Page({
+  value,
+  pageId = PAGE,
+  persistence = PERSISTENCE,
+}: {
+  value: ScopeValue;
+  pageId?: string;
+  persistence?: typeof PERSISTENCE;
+}) {
   useTerminalInitialization({
     pageId,
     authenticated: true,
@@ -105,7 +118,7 @@ function Page({ value, pageId = PAGE }: { value: ScopeValue; pageId?: string }) 
     updateTab: NOOP,
     zoneLayout: value.zone,
     labelsAndTags: value.labels,
-    sessionPersistence: PERSISTENCE,
+    sessionPersistence: persistence,
     layoutState: LAYOUT_STATE,
   } as never);
   return null;
@@ -189,6 +202,69 @@ function TwoPages({
   );
 }
 
+/** One stable register callback per page id, made on first use. */
+function stableRegister(
+  registers: Map<string, (v: ScopeValue) => void>,
+  id: string,
+  setValues: (update: (p: Record<string, ScopeValue>) => Record<string, ScopeValue>) => void,
+): (v: ScopeValue) => void {
+  let r = registers.get(id);
+  if (!r) {
+    r = (v: ScopeValue) => setValues((p) => ({ ...p, [id]: v }));
+    registers.set(id, r);
+  }
+  return r;
+}
+
+/** The api box a page's scope publishes into, made on first use. */
+function scopeApi(
+  scopes: Record<string, { current: Api | null }>,
+  id: string,
+): { current: Api | null } {
+  scopes[id] ??= { current: null };
+  return scopes[id];
+}
+
+/**
+ * The page roster from the real `useTerminalPages`, one scope per page in it,
+ * and one restore hook following the active page — the provider's wiring, so a
+ * page is removed and re-added through the hook's own `removePage`/`openPage`.
+ */
+function WithPages({
+  onPages,
+  scopeFor,
+  saves,
+}: {
+  onPages: (pages: ReturnType<typeof useTerminalPages>) => void;
+  scopeFor: (id: string) => { current: Api | null };
+  saves: string[];
+}) {
+  const pages = useTerminalPages();
+  useEffect(() => {
+    onPages(pages);
+  });
+  const [values, setValues] = useState<Record<string, ScopeValue>>({});
+  const registers = useMemo(() => new Map<string, (v: ScopeValue) => void>(), []);
+  const registerFor = (id: string) => stableRegister(registers, id, setValues);
+  const active = pages.activePageId;
+  // One persistence per active page, recording which page each save is for.
+  const persistence = useMemo(
+    () => ({ ...PERSISTENCE, saveSessionLayout: () => void saves.push(active) }),
+    [active, saves],
+  );
+  // The restore hook stays mounted across the switch, as TerminalPage's does:
+  // a page with no scope yet borrows another's for the instant it lasts.
+  const value = values[active] ?? Object.values(values)[0];
+  return (
+    <>
+      {pages.allPages.map((p) => (
+        <Scope key={p.id} pageId={p.id} register={registerFor(p.id)} api={scopeFor(p.id)} />
+      ))}
+      {value ? <Page value={value} pageId={active} persistence={persistence} /> : null}
+    </>
+  );
+}
+
 const ROOM = { setup: 20_000 };
 
 async function until(what: string, ready: () => boolean): Promise<void> {
@@ -238,7 +314,7 @@ beforeEach(() => {
 afterEach(async () => {
   root.unmount();
   vi.restoreAllMocks();
-  instanceStorage.removeItem?.(zoneLayoutStorageKey(PAGE, "main"));
+  instanceStorage.removeItem(zoneLayoutStorageKey(PAGE, "main"));
   await settle(20);
 });
 
@@ -454,5 +530,194 @@ describe("restore runs and the trim hold", () => {
 
     finishSecondRead();
     await until("the trim the hold deferred", () => api.current?.zone.layoutId !== "six-pack");
+  }, 30_000);
+
+  // Found by the 2026-11-13 since-restart E2E: every render retries a deferred
+  // page, and each retry published the page as neither deferred nor restored
+  // until its fetch came back, so the strip and its rows flapped between
+  // "deferred by drain" and "page not opened".
+  it("keeps reporting a drain-deferred page as deferred through its retries", async () => {
+    const reports: string[][] = [];
+    fake.invoke = async (cmd, args) => {
+      if (cmd === "terminal_report_restore_progress") {
+        reports.push([
+          ...((args as { deferredPages?: string[] } | undefined)?.deferredPages ?? []),
+        ]);
+        return { success: true, data: null };
+      }
+      await settle(5);
+      if (cmd === "terminal_session_list_open") {
+        return { success: true, data: { sessions: [], deferredByDrain: { reason: "drain" } } };
+      }
+      return { success: true, data: { settled: true, held: [] } };
+    };
+    mount();
+    await until("the first deferral report", () => reports.some((r) => r.includes(PAGE)));
+    await renderUntil("two retries", api, () => reconnectRuns >= 3);
+    await settle(100);
+    const first = reports.findIndex((r) => r.includes(PAGE));
+    const after = reports.slice(first);
+    expect(after.length).toBeGreaterThan(1);
+    for (const r of after) expect(r).toContain(PAGE);
+  }, 30_000);
+
+  it("keeps a drain-deferred page held when a retry aborts on an indeterminate reconnect", async () => {
+    const reports: string[][] = [];
+    fake.invoke = async (cmd, args) => {
+      if (cmd === "terminal_report_restore_progress") {
+        reports.push([
+          ...((args as { deferredPages?: string[] } | undefined)?.deferredPages ?? []),
+        ]);
+        return { success: true, data: null };
+      }
+      await settle(5);
+      if (cmd === "terminal_session_list_open") {
+        return { success: true, data: { sessions: [], deferredByDrain: { reason: "drain" } } };
+      }
+      return { success: true, data: { settled: true, held: [] } };
+    };
+    mount();
+    await until("the first deferral report", () => reports.some((r) => r.includes(PAGE)));
+    reconnectIndeterminate = true;
+    const before = reconnectRuns;
+    const reportsBefore = reports.length;
+    await renderUntil("an aborted retry", api, () => reconnectRuns >= before + 1);
+    await settle(100);
+    // The retry published, so the loop below has a post-abort report to check.
+    expect(reports.length).toBeGreaterThan(reportsBefore);
+    const first = reports.findIndex((r) => r.includes(PAGE));
+    for (const r of reports.slice(first)) expect(r).toContain(PAGE);
+  }, 30_000);
+
+  // A drain-held page's owed sessions never got a pane, so `removePage`
+  // (which closes only live terminals) closes none of them: the page must be
+  // pruned when it leaves the layout, or it is reported owed forever.
+  type Progress = { complete: string[]; deferred: string[] };
+  function captureProgress(): Progress[] {
+    const reports: Progress[] = [];
+    fake.invoke = async (cmd, args) => {
+      if (cmd === "terminal_report_restore_progress") {
+        const a = args as { completePages?: string[]; deferredPages?: string[] } | undefined;
+        reports.push({
+          complete: [...(a?.completePages ?? [])],
+          deferred: [...(a?.deferredPages ?? [])],
+        });
+        return { success: true, data: null };
+      }
+      await settle(5);
+      if (cmd === "terminal_session_list_open") {
+        return { success: true, data: { sessions: [], deferredByDrain: { reason: "drain" } } };
+      }
+      return { success: true, data: { settled: true, held: [] } };
+    };
+    return reports;
+  }
+  const removePage = (pageId: string) =>
+    window.dispatchEvent(new CustomEvent(TERMINAL_PAGE_REMOVED_EVENT, { detail: { pageId } }));
+  const deferredReport = (reports: Progress[]) => () =>
+    reports.some((r) => r.deferred.includes(PAGE));
+
+  it("stops reporting a drain-deferred page once the page is removed", async () => {
+    const reports = captureProgress();
+    mount();
+    await until("the first deferral report", deferredReport(reports));
+    // A deferred page is reported complete too (its restore gate opened).
+    // Wait for a quiet moment in which the latest report says so, so the
+    // removal below is taken from that state.
+    await until("a settled report with the page complete and deferred", () => {
+      const last = reports.at(-1);
+      return !!last && last.complete.includes(PAGE) && last.deferred.includes(PAGE);
+    });
+    await settle(300);
+    const last = reports.at(-1);
+    expect(last?.complete).toContain(PAGE);
+    expect(last?.deferred).toContain(PAGE);
+    const reportsBefore = reports.length;
+    // The listener publishes synchronously, so this report is the removal's.
+    removePage(PAGE);
+    expect(reports.length).toBeGreaterThan(reportsBefore);
+    const atRemoval = reports[reportsBefore];
+    // In neither set: pruned from `deferred` alone, the backend would read the
+    // page as restored.
+    expect(atRemoval?.deferred).not.toContain(PAGE);
+    expect(atRemoval?.complete).not.toContain(PAGE);
+    // A retry still in flight for the removed page does not hold it again.
+    await renderUntil("a later retry", api, () => reconnectRuns >= 3);
+    await settle(100);
+    for (const r of reports.slice(reportsBefore)) {
+      expect(r.deferred).not.toContain(PAGE);
+      expect(r.complete).not.toContain(PAGE);
+    }
+  }, 30_000);
+
+  // A removed id can come back ("default" through reconcile, an explicit id
+  // through `openPage`); once it is in the layout again it is tracked again.
+  it("reports a re-added page as deferred again when the drain defers it", async () => {
+    const reports = captureProgress();
+    mount();
+    await until("the first deferral report", deferredReport(reports));
+    removePage(PAGE);
+    await settle(100);
+    instanceStorage.setJSON(PAGES_STORAGE_KEY, [
+      { id: "default", name: "Terminal", createdAt: 0 },
+      { id: PAGE, name: "Page 2", createdAt: 1 },
+    ]);
+    try {
+      const reportsBefore = reports.length;
+      await renderUntil("the re-added page deferred again", api, () =>
+        reports.slice(reportsBefore).some((r) => r.deferred.includes(PAGE)),
+      );
+    } finally {
+      instanceStorage.removeItem(PAGES_STORAGE_KEY);
+    }
+  }, 30_000);
+  // A page whose restore COMPLETED, then removed and re-added through the
+  // page hook's own doors, restores again: it is reported complete again and
+  // its auto-save (gated on that set) resumes.
+  it("restores a completed page again after it is removed and re-added", async () => {
+    const reports = captureProgress();
+    const inner = fake.invoke;
+    fake.invoke = async (cmd, args) => {
+      if (cmd === "terminal_session_list_open") {
+        await settle(5);
+        return { success: true, data: { sessions: [], deferredByDrain: null } };
+      }
+      return inner(cmd, args);
+    };
+    const OTHER = "other-page";
+    instanceStorage.setJSON(PAGES_STORAGE_KEY, [
+      { id: OTHER, name: "Page 1", createdAt: 1 },
+      { id: PAGE, name: "Page 2", createdAt: 2 },
+    ]);
+    instanceStorage.setItem("qontinui-terminal-active-page", PAGE);
+    const pagesRef: { current: ReturnType<typeof useTerminalPages> | null } = { current: null };
+    const scopes: Record<string, { current: Api | null }> = {};
+
+    const saves: string[] = [];
+    try {
+      root = createRoot(document.createElement("div"));
+      root.render(
+        <WithPages
+          onPages={(p) => (pagesRef.current = p)}
+          scopeFor={(id) => scopeApi(scopes, id)}
+          saves={saves}
+        />,
+      );
+      const completeNow = () => reports.at(-1)?.complete.includes(PAGE) === true;
+      await until("the page's restore to complete", completeNow);
+      await pagesRef.current?.removePage(PAGE);
+      await until("the removal reported", () => !completeNow());
+      await until("another page active", () => pagesRef.current?.activePageId !== PAGE);
+
+      pagesRef.current?.openPage(PAGE, "Page 2");
+      await until("the re-added page complete again", completeNow);
+      await until("the re-added page's scope", () => scopes[PAGE]?.current != null);
+      const savesBefore = saves.length;
+      await scopes[PAGE].current?.createTerminal();
+      await until("auto-save for the re-added page", () => saves.slice(savesBefore).includes(PAGE));
+    } finally {
+      instanceStorage.removeItem(PAGES_STORAGE_KEY);
+      instanceStorage.removeItem("qontinui-terminal-active-page");
+    }
   }, 30_000);
 });

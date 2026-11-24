@@ -1106,6 +1106,16 @@ mod tests {
                 lit: syn::Lit::Str(s),
                 ..
             }) => Recorded::Literal(s.value()),
+            syn::Expr::MethodCall(m)
+                if m.args.is_empty()
+                    && m.method == "as_str"
+                    && typed_close_reason(&m.receiver).is_some() =>
+            {
+                classify(&m.receiver)
+            }
+            syn::Expr::Path(_) if typed_close_reason(e).is_some() => {
+                Recorded::Const(typed_close_reason(e).unwrap_or_default())
+            }
             syn::Expr::Path(p) => {
                 let name = p
                     .path
@@ -1123,6 +1133,34 @@ mod tests {
             }
             _ => Recorded::Indirect(render(e)),
         }
+    }
+
+    /// `CloseReason::<Variant>` (any path prefix) rendered as
+    /// `"CloseReason::<Variant>"` — a variant of the typed set every
+    /// production close writes (`crate::session::close_reason`), or `None`
+    /// for any other expression.
+    fn typed_close_reason(e: &syn::Expr) -> Option<String> {
+        let syn::Expr::Path(p) = e else { return None };
+        let segs: Vec<String> = p
+            .path
+            .segments
+            .iter()
+            .map(|s| s.ident.to_string())
+            .collect();
+        match segs.as_slice() {
+            [.., ty, variant] if ty == "CloseReason" => Some(format!("CloseReason::{variant}")),
+            _ => None,
+        }
+    }
+
+    /// The wire string a `"CloseReason::<Variant>"` rendering names, or
+    /// `None` for a variant the typed set does not have.
+    fn typed_close_reason_wire(rendered: &str) -> Option<&'static str> {
+        let variant = rendered.strip_prefix("CloseReason::")?;
+        crate::session::close_reason::CloseReason::ALL
+            .into_iter()
+            .find(|r| format!("{r:?}") == variant)
+            .map(|r| r.as_str())
     }
 
     /// The reason argument of `record_close` / `record_close_checked`. A
@@ -1420,7 +1458,18 @@ mod tests {
                             lit: syn::Lit::Str(s),
                             ..
                         }) => out.push((name, s.value())),
-                        _ => panic!("{name} is not a string literal"),
+                        // `CloseReason::<Variant>.as_str()`: the typed set's
+                        // own wire string.
+                        syn::Expr::MethodCall(m) if m.method == "as_str" && m.args.is_empty() => {
+                            let wire = typed_close_reason(&m.receiver)
+                                .as_deref()
+                                .and_then(typed_close_reason_wire)
+                                .unwrap_or_else(|| panic!("{name} names no CloseReason variant"));
+                            out.push((name, wire.to_string()));
+                        }
+                        _ => panic!(
+                            "{name} is neither a string literal nor a CloseReason wire string"
+                        ),
                     }
                 }
             }
@@ -1527,32 +1576,32 @@ mod tests {
         // A new writer must be added here — deliberately: this list IS the
         // enumeration the plan asked for.
         const MINTS: &[(&str, &str, &str)] = &[
-            ("main.rs", "run_app", "CLOSE_REASON_NEVER_STARTED"),
-            ("main.rs", "run_app", "CLOSE_REASON_NO_TERMINAL"),
+            ("main.rs", "run_app", "CloseReason::NeverStarted"),
+            ("main.rs", "run_app", "CloseReason::NoTerminal"),
             (
                 "orchestration_loop/ai_session_executor.rs",
                 "teardown_unbound_worker",
-                "CLOSE_REASON_WORKER_BIND_FAILED",
+                "CloseReason::WorkerNotBound",
             ),
             (
                 "session/session_lifecycle_store.rs",
-                "SessionLifecycleStore::record_open",
-                "CLOSE_REASON_SUPERSEDED",
+                "SessionLifecycleStore::record_open_guarded",
+                "CloseReason::Superseded",
             ),
             (
                 "session/session_lifecycle_store.rs",
-                "SessionLifecycleStore::record_open",
-                "CLOSE_REASON_SUPERSEDED_TERMINAL_REUSE",
+                "SessionLifecycleStore::record_open_guarded",
+                "CloseReason::SupersededTerminalReuse",
             ),
             (
                 "session/session_lifecycle_store.rs",
                 "SessionLifecycleStore::repair_terminal_id_collisions",
-                "CLOSE_REASON_SUPERSEDED_TERMINAL_REUSE",
+                "CloseReason::SupersededTerminalReuse",
             ),
             (
                 "terminal/respawn_liveness.rs",
                 "end_failed",
-                "CLOSE_REASON_PTY_EXIT",
+                "CloseReason::PtyExit",
             ),
         ];
         // Sites that forward a reason chosen elsewhere, by (file, enclosing
@@ -1561,8 +1610,10 @@ mod tests {
         // - `SessionLifecycleStore::record_close` hands its `reason` parameter
         //   to `record_close_checked`, which stores it in the field; their
         //   callers are the other sites in this census;
-        // - `terminal_session_record_close` forwards the FRONTEND's `reason`
-        //   (`frontend_close_reasons_are_enumerated`) to `record_close_for`,
+        // - `record_close_request` (the body of `terminal_session_record_close`)
+        //   parses the FRONTEND's `reason` into the typed `CloseReason` set,
+        //   refusing anything outside it (`frontend_close_reasons_are_enumerated`),
+        //   and forwards it to `record_close_for`,
         //   which hands it to `SessionLifecycleStore::record_close_gated`;
         // - `record_close_gated` records either that `reason` unchanged or the
         //   launch-failure verdict on it (`verdict.reason`), and
@@ -1586,7 +1637,7 @@ mod tests {
             (
                 "session/session_lifecycle_store.rs",
                 "SessionLifecycleStore::record_close_checked",
-                "reason",
+                "reason.as_str()",
                 1,
             ),
             (
@@ -1601,12 +1652,7 @@ mod tests {
                 "verdict.reason",
                 1,
             ),
-            (
-                "commands/terminal.rs",
-                "terminal_session_record_close",
-                "reason",
-                1,
-            ),
+            ("commands/terminal.rs", "record_close_request", "reason", 1),
             ("commands/terminal.rs", "record_close_for", "reason", 1),
             (
                 "terminal/launch_failure.rs",
@@ -1657,6 +1703,15 @@ mod tests {
                 "close_reason",
                 1,
             ),
+            // The since-restart aftermath mirrors the reason the lifecycle
+            // row it read already carries (`Close::of_record`), so it mints
+            // nothing a census-pinned writer did not.
+            (
+                "session/ledger_aftermath.rs",
+                "LedgerAftermath::observe_registry",
+                "close.map(<expr>)",
+                1,
+            ),
         ];
 
         let sites = close_write_census();
@@ -1673,8 +1728,11 @@ mod tests {
                     mints.push((s.file.clone(), s.func.clone(), format!("{v:?}")));
                 }
                 Recorded::Const(n) => {
-                    match consts.iter().find(|(c, _)| c == n) {
-                        Some((_, v)) if code_for_close_reason(v).is_some() => {}
+                    let value = typed_close_reason_wire(n)
+                        .map(str::to_string)
+                        .or_else(|| consts.iter().find(|(c, _)| c == n).map(|(_, v)| v.clone()));
+                    match value {
+                        Some(v) if code_for_close_reason(&v).is_some() => {}
                         _ => problems.push(format!("{} in {}: constant {n}", s.file, s.func)),
                     }
                     mints.push((s.file.clone(), s.func.clone(), n.clone()));
@@ -1853,33 +1911,34 @@ mod tests {
     /// re-close arm and the no-evidence arm.
     #[test]
     fn the_launch_failure_verdict_only_records_mapped_reasons() {
+        use crate::session::close_reason::CloseReason;
         use crate::terminal::launch_failure::{close_reason_for_launch, PriorClose};
-        let mapped = [
-            CLOSE_REASON_EXPLICIT,
-            CLOSE_REASON_PTY_EXIT,
-            CLOSE_REASON_POLL_DEAD,
-            CLOSE_REASON_TERMINAL_ONLY_IDLE,
-            CLOSE_REASON_NEVER_STARTED,
-            CLOSE_REASON_NO_TERMINAL,
-            CLOSE_REASON_SUPERSEDED,
-            CLOSE_REASON_SUPERSEDED_TERMINAL_REUSE,
-            CLOSE_REASON_WORKER_BIND_FAILED,
-            CLOSE_REASON_LAUNCH_FAILED,
-        ];
-        for proposed in mapped {
+        // The typed set every production close writes is mapped whole, so a
+        // variant added there without a stop code fails here.
+        for reason in CloseReason::ALL {
+            assert!(
+                code_for_close_reason(reason.as_str()).is_some(),
+                "{reason:?} = {:?} has no stop code",
+                reason.as_str()
+            );
+        }
+        for proposed in CloseReason::ALL {
             for prior in [
                 None,
                 Some(PriorClose {
-                    reason: CLOSE_REASON_LAUNCH_FAILED,
+                    reason: CloseReason::LaunchFailed,
                     at_ms: 0,
                 }),
             ] {
                 let got = close_reason_for_launch(proposed, prior, None, None, None, None);
                 assert!(
-                    got == proposed || got == CLOSE_REASON_LAUNCH_FAILED,
+                    got == proposed || got == CloseReason::LaunchFailed,
                     "{proposed} -> {got}"
                 );
-                assert!(code_for_close_reason(got).is_some(), "{proposed} -> {got}");
+                assert!(
+                    code_for_close_reason(got.as_str()).is_some(),
+                    "{proposed} -> {got}"
+                );
             }
         }
     }
@@ -1900,7 +1959,7 @@ mod tests {
         ] {
             let reason = close_reason_for_dead_shell(tier);
             assert!(
-                code_for_close_reason(reason).is_some(),
+                code_for_close_reason(reason.as_str()).is_some(),
                 "{tier:?} -> {reason}"
             );
         }

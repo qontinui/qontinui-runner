@@ -907,7 +907,7 @@ fn teardown_unbound_worker(app_handle: &tauri::AppHandle, task_run_id: Uuid) -> 
     {
         store.record_close(
             &trid,
-            crate::session::session_lifecycle_store::CLOSE_REASON_WORKER_BIND_FAILED,
+            crate::session::close_reason::CloseReason::WorkerNotBound,
         );
         closed.push("lifecycle record");
     }

@@ -57,11 +57,13 @@
 //! has fully absorbed the old surface.
 
 pub mod attach; // Remote-attach grants: the `attach_request` directive arm + device-bound catch-up poll (plan 2026-08-31-remote-session-tabs-in-runner-terminal, Phase 3c)
+pub mod awaiting_restore; // Is a row still OWED a restore by this process? One tri-state predicate shared by page placement and the since-restart ledger's restoreOwed (plan 2026-11-11-since-restart-roster-counts-closed-sessions-as-missing, Phase 4 / D3)
 pub mod census; // Machine-wide live Claude session census → POST /coord/session-census/:device_id (plan 2026-10-01-a-commit-author-session-is-unreachable-because-every-session-roster-is-per-account, Phases 2+4)
 pub mod classify_finished; // `classify_child` ARMED for the finished_close arm: the census replaces the 60 s boot-window rule with it and the close exempts a proven shim (plan 2026-11-04-runner-finished-close-closes-nothing-on-any-box, Phase 2b)
 pub mod claude_activity; // The ACTIVITY axis of a live `claude` (working/idle/stale/unknown) — report-only, rendered as /restart-readiness live_claude.by_activity (plan 2026-09-29-quiet-is-measured-by-session-existence-and-machine-wide-so-a-24x7-box-never-gets-one, Phase 6)
 pub mod claude_hook;
 pub mod claude_session_registry;
+pub mod close_reason; // The TYPED close-reason set every production close writes, with the exhaustive deliberate classification (plan 2026-11-11-since-restart-roster-counts-closed-sessions-as-missing, D2 / Phase 3)
 pub mod closeout_spool; // Producer for the two closeout outbox kinds — the loopback coord-write forwarders spool here when coord is UNREACHABLE (plan 2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline, Phase 3)
 pub mod continuation_finish_relay; // Relays a gate continuation's own work_completed/work_abandoned onto session_status finished, on its own ticker (plan 2026-10-28-finished-gate-continuations-never-free-a-slot-so-the-box-deadlocks-at-the-continuation-cap, Phase 2)
 pub mod coord_identity; // THE seam that re-keys a pane's coord row to the harness id pid-exact evidence names — hook, rung 2, R2 resume (plan 2026-10-23-a-hookless-resume-in-a-runner-pane-leaves-the-session-with-no-active-coord-row, D1)
@@ -76,6 +78,7 @@ pub mod handoff;
 pub mod identity_stamp; // Reports every session id this machine can resolve (account root + names, live or ended) to coord's POST /coord/session-identity/:device_id (plan 2026-10-19-session-lookup-by-name-shows-claude-account-in-web, Phase 2)
 pub mod in_flight; // The ONE session-scope in-flight registry — migration, resume door and respawn receiver; held by the lifecycle poll (plan 2026-10-20-account-migration-respawn-dies-during-cli-reinstall-churn, Phase 4)
 pub mod intent;
+pub mod ledger_aftermath; // What came back, closed and finished after each restart, per observing boot, kept past the registry's prune (plan 2026-11-11-since-restart-roster-counts-closed-sessions-as-missing, Phase 2)
 pub mod local_store;
 pub mod observation_epoch; // The last instant the liveness poll could SEE the process table — bounds open-row restore admission (plan 2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-restore-set, Phase 2)
 pub mod operator_touch; // Operator-touch idempotency-key + payload builder, shared by every B2 trigger (plan 2026-08-27-operator-touch-observation-runner-emitter, Phase B2)

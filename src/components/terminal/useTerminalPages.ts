@@ -22,6 +22,7 @@ import {
   type PageRename,
   type RemovedPage,
 } from "./pagePrune";
+import { LIST_OPEN_PURPOSE } from "./sessionRecordArgs";
 
 /**
  * Who made a page. `"auto"`: the runner synthesized it (a reconcile tab for a
@@ -101,6 +102,19 @@ export function readPinnedPageId(): string | null {
 export function loadPages(): TerminalPageConfig[] {
   return readPersistedPages() ?? [{ id: "default", name: "Terminal", createdAt: 0 }];
 }
+
+/**
+ * Window event dispatched once a page has left the layout, with detail
+ * `{ pageId }`. It is derived from the committed roster (`useTerminalPages`
+ * diffs each committed `allPages` against the previous one), so it fires only
+ * for a removal that actually happened. The restore hook
+ * (`useTerminalInitialization`) prunes the page from what it reports as
+ * restored and drain-deferred: a deferred page's owed sessions never got a
+ * pane, so closing the page's live terminals does not close them, and without
+ * the prune the page would be reported as owed a restore for as long as the
+ * window lives.
+ */
+export const TERMINAL_PAGE_REMOVED_EVENT = "terminal-page-removed";
 
 /**
  * The page ids that actually EXIST in this window's persisted layout (same
@@ -513,7 +527,7 @@ export async function readOccupiedPageIds(): Promise<OccupancyRead> {
   try {
     const resp = await invoke<{
       data?: { sessions?: Array<{ pageId?: string }>; deferredByDrain?: unknown };
-    }>("terminal_session_list_open");
+    }>("terminal_session_list_open", { purpose: LIST_OPEN_PURPOSE.pageOccupancy });
     const sessions = resp?.data?.sessions;
     if (Array.isArray(sessions)) {
       for (const id of pageIdsFromSessions(sessions)) ids.add(id);
@@ -642,6 +656,23 @@ export function useTerminalPages() {
     [],
   );
 
+  // Announce every page that left the committed roster
+  // (`TERMINAL_PAGE_REMOVED_EVENT`), decided from the same state the `setPages`
+  // updaters produced rather than from a ref that may lag them.
+  const committedPagesRef = useRef<TerminalPageConfig[]>(allPages);
+  useEffect(() => {
+    const prev = committedPagesRef.current;
+    committedPagesRef.current = allPages;
+    if (prev === allPages) return;
+    const now = new Set(allPages.map((p) => p.id));
+    for (const p of prev) {
+      if (!now.has(p.id)) {
+        window.dispatchEvent(
+          new CustomEvent(TERMINAL_PAGE_REMOVED_EVENT, { detail: { pageId: p.id } }),
+        );
+      }
+    }
+  }, [allPages]);
   // Page ids the operator closed this session. `reconcile` skips them: the
   // backend can still report a just-closed page (a PTY not yet dead, or its
   // restore record not yet marked closed), and without this guard the
@@ -803,7 +834,9 @@ export function useTerminalPages() {
         instanceStorage.removeByPrefix(prefix);
       }
 
-      // Can't remove the last page.
+      // Can't remove the last page. The removal is announced from the
+      // committed roster (the effect beside `allPagesRef`), so a refused
+      // removal — the last page — announces nothing.
       updatePages((base) => (base.length <= 1 ? base : base.filter((p) => p.id !== id)));
 
       // Switch to "default" if the active page was deleted; the normalize

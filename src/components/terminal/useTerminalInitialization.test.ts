@@ -234,6 +234,14 @@ describe("reportTreeReset (tree-reset observability)", () => {
       reportTreeReset({ mountNumber: 2, pageIds: ["default"] }),
     ).resolves.toBeUndefined();
   });
+
+  it("reads the restore set as `tree-reset-report`, never as the boot restore", async () => {
+    mockInvoke.mockResolvedValue({ success: true, message: null, data: { sessions: [] } });
+    await reportTreeReset({ mountNumber: 2, pageIds: ["default"] });
+    expect(mockInvoke).toHaveBeenCalledWith("terminal_session_list_open", {
+      purpose: "tree-reset-report",
+    });
+  });
 });
 
 // Orphan-page adoption (2026-07-13 session-loss incident): a record whose

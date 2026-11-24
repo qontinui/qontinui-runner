@@ -32,9 +32,7 @@ function makeState(collisions: PredictedCollision[]): MidSessionProbeState {
 describe("formatToastSummary", () => {
   it("pluralizes a single collision held by one session", () => {
     const summary = formatToastSummary(
-      makeState([
-        makeCollision("src/foo.ts", [{ task_run_id: "t1", holder_name: "alpha" }]),
-      ]),
+      makeState([makeCollision("src/foo.ts", [{ task_run_id: "t1", holder_name: "alpha" }])]),
     );
     expect(summary.header).toBe("1 file held by another session");
   });
@@ -71,9 +69,7 @@ describe("formatToastSummary", () => {
           { task_run_id: "t1", holder_name: "alpha" },
           { task_run_id: "t2", holder_name: "beta" },
         ]),
-        makeCollision("relative\\path\\bar.rs", [
-          { task_run_id: "t3", holder_name: "gamma" },
-        ]),
+        makeCollision("relative\\path\\bar.rs", [{ task_run_id: "t3", holder_name: "gamma" }]),
       ]),
     );
     expect(summary.rows).toHaveLength(2);
@@ -98,9 +94,7 @@ describe("formatToastSummary", () => {
   it("falls back to 'unknown' when other_holders is empty", () => {
     // Defensive shape — runner filters out the caller's own holder
     // before serializing, so a 0-holder row is unusual but possible.
-    const summary = formatToastSummary(
-      makeState([makeCollision("src/foo.ts", [])]),
-    );
+    const summary = formatToastSummary(makeState([makeCollision("src/foo.ts", [])]));
     expect(summary.rows[0].holder_name).toBe("unknown");
     expect(summary.rows[0].holders_label).toBe("unknown");
   });

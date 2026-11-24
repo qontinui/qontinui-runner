@@ -9,6 +9,7 @@ use tracing::{debug, info, warn};
 
 use crate::commands::CommandResponse;
 use crate::error::AppError;
+use crate::session::close_reason::{CloseReason, UnknownCloseReason};
 use crate::session::pane_store::{PaneKey, PaneSessionStore};
 use crate::session::session_lifecycle_store::{
     CloseOutcome, SessionLifecycleStore, TerminalSessionRecord,
@@ -1653,6 +1654,10 @@ pub fn terminal_session_clear_restore_pending(
 /// close of this terminal's own record (`alreadyClosed`) is a no-op, not a
 /// failure, and so is a close naming a terminal whose session already moved to
 /// a new PTY (`terminalSuperseded` — the account-migration hand-off).
+///
+/// `reason` must be a wire string of the typed close-reason set
+/// ([`CloseReason`]); anything else is refused with an error and closes
+/// nothing.
 #[tauri::command]
 pub fn terminal_session_record_close(
     store: tauri::State<'_, Arc<SessionLifecycleStore>>,
@@ -1661,20 +1666,48 @@ pub fn terminal_session_record_close(
     terminal_id: Option<String>,
     reason: String,
 ) -> Result<CommandResponse, String> {
-    let outcome = record_close_for(
+    let outcome = record_close_request(
         &terminal_manager,
         &store,
         &claude_session_id,
         terminal_id.as_deref(),
         &reason,
-    );
+    )?;
     Ok(close_outcome_response(&outcome))
 }
 
-/// The body of [`terminal_session_record_close`]: the close behind THIS
-/// manager's shutdown latch, so a `pty-exit` that arrives after
-/// [`TerminalManager::close_all`] began leaves its row as it was (plan
-/// `2026-10-28-force-exited-runner-restore-set-follow-ups`, Phase 6).
+/// The IPC door's body: the webview's `reason` PARSED into the typed
+/// close-reason set (plan
+/// `2026-11-11-since-restart-roster-counts-closed-sessions-as-missing`, D2) —
+/// a string outside it is refused and nothing is closed — then
+/// [`record_close_for`].
+pub(crate) fn record_close_request(
+    terminal_manager: &TerminalManager,
+    store: &SessionLifecycleStore,
+    claude_session_id: &str,
+    terminal_id: Option<&str>,
+    reason: &str,
+) -> Result<CloseOutcome, String> {
+    let reason: CloseReason = reason.parse().map_err(|e: UnknownCloseReason| {
+        warn!(
+            claude_session_id,
+            error = %e,
+            "terminal_session_record_close: refused a close reason outside the typed set — nothing closed"
+        );
+        format!("terminal_session_record_close refused: {e}")
+    })?;
+    Ok(record_close_for(
+        terminal_manager,
+        store,
+        claude_session_id,
+        terminal_id,
+        reason,
+    ))
+}
+
+/// The close behind THIS manager's shutdown latch, so a `pty-exit` that
+/// arrives after [`TerminalManager::close_all`] began leaves its row as it was
+/// (plan `2026-10-28-force-exited-runner-restore-set-follow-ups`, Phase 6).
 ///
 /// The named terminal's spawn time goes along for the `launch-failed` close
 /// rule (plan `2026-11-10-migration-holds-for-missing-claude-cli`, D3), read
@@ -1685,7 +1718,7 @@ pub(crate) fn record_close_for(
     store: &SessionLifecycleStore,
     claude_session_id: &str,
     terminal_id: Option<&str>,
-    reason: &str,
+    reason: CloseReason,
 ) -> CloseOutcome {
     let terminal_created_at_ms = terminal_id
         .and_then(|t| terminal_manager.get(t))
@@ -1807,6 +1840,29 @@ pub async fn terminal_holder_sweep_settled() -> Result<CommandResponse, String> 
 /// The `purpose` value the boot restore passes to [`terminal_session_list_open`].
 pub const LIST_OPEN_PURPOSE_RESTORE: &str = "restore";
 
+/// How loudly one drain-deferred [`terminal_session_list_open`] read is logged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeferralLog {
+    Warn,
+    Debug,
+}
+
+/// WARN only for the boot restore's own read, and only when that read moved
+/// the boot-restore phase (`NotYetRun` → `Withheld`): the one deferral that
+/// changes what the lifecycle poll does. The boot restore asking again (another
+/// page, a re-render), and every reader that only looks at the set, log at
+/// debug, naming the reader. Measured 2026-11-11 on a drained primary: 438
+/// `restore deferred` WARN lines in five minutes, most from readers that passed
+/// no purpose (plan
+/// `2026-11-11-since-restart-roster-counts-closed-sessions-as-missing`, Phase 7).
+pub(crate) fn deferral_log(is_boot_restore: bool, phase_moved: bool) -> DeferralLog {
+    if is_boot_restore && phase_moved {
+        DeferralLog::Warn
+    } else {
+        DeferralLog::Debug
+    }
+}
+
 /// List every RESTORABLE Claude terminal session from the lifecycle registry.
 /// The grid hydrates its session tiles from this on boot instead of
 /// `localStorage`.
@@ -1822,12 +1878,14 @@ pub const LIST_OPEN_PURPOSE_RESTORE: &str = "restore";
 /// resurrects exactly the sessions that died with the runner.
 ///
 /// `purpose`: `Some("restore")` ONLY from the boot restore itself
-/// (`fetchRestoreSet`). Several other frontend readers (page reconcile, the
+/// (`fetchRestoreSet`). Several other frontend readers (page occupancy, the
 /// worker-adoption probe, tree-reset reporting) call this same command; only
 /// the restore's own call may tell the lifecycle poll that the boot restore
 /// was withheld or has run (see `BootRestorePhase`). A reader that merely
 /// LOOKS at the set must not release the poll's hold on records nobody has
-/// restored yet.
+/// restored yet. Those readers pass a purpose naming themselves
+/// (`LIST_OPEN_PURPOSE` in the webview's `sessionRecordArgs.ts`), which only
+/// labels the deferral's debug line ([`deferral_log`]).
 #[tauri::command]
 pub fn terminal_session_list_open(
     store: tauri::State<'_, Arc<SessionLifecycleStore>>,
@@ -1846,18 +1904,26 @@ pub fn terminal_session_list_open(
             "boot_resume:terminal_tabs",
         )
     {
-        tracing::warn!("terminal_session_list_open: restore deferred — {reason}");
         // Tell the lifecycle poll the boot restore is WITHHELD, so it does not
         // sweep the very records this deferral promises to restore later as
         // `no-terminal` orphans (plan
         // `2026-10-01-drain-deferred-restore-is-swept-as-orphans`). No-op once
         // the restore has run.
-        crate::session::session_lifecycle_store::apply_boot_restore_latch_event(
+        let phase_moved = crate::session::session_lifecycle_store::apply_boot_restore_latch_event(
             crate::session::session_lifecycle_store::boot_restore_latch_event(
                 is_boot_restore,
                 true,
             ),
         );
+        match deferral_log(is_boot_restore, phase_moved) {
+            DeferralLog::Warn => {
+                tracing::warn!("terminal_session_list_open: restore deferred — {reason}")
+            }
+            DeferralLog::Debug => tracing::debug!(
+                reader = purpose.as_deref().unwrap_or("unnamed"),
+                "terminal_session_list_open: restore deferred for this reader — {reason}"
+            ),
+        }
         return Ok(CommandResponse {
             success: true,
             message: Some(reason.clone()),
@@ -2076,6 +2142,44 @@ pub async fn session_ledger_report(
     })
     .await
     .map_err(|e| format!("session ledger report failed: {e}"))
+}
+
+/// The webview's boot-restore progress for the calling window: which pages'
+/// restores have run to their end, which the coord drain deferred, and every
+/// page in the persisted layout (`useTerminalInitialization.ts`,
+/// `publishRestorePages`). The since-restart ledger reads it so a row whose
+/// page already restored without it is not reported as still owed a restore
+/// ([`crate::session::awaiting_restore::PagesRestored`]). Keyed by window
+/// label, as each window restores the pages it shows.
+///
+/// It trusts the local webview, its only caller, for WHICH pages it names, and
+/// bounds only the shape ([`PageRestoreProgress::from_report`]: an oversized
+/// report is recorded as unreadable). A report from a closed window is refused:
+/// the registry tombstones a window's label when it is forgotten, under the
+/// same lock, until a window with that label is built again — `destroy()` is
+/// asynchronous, so the closing webview may still report after the forget.
+/// A label with no live window at all is dropped here before reaching it.
+///
+/// [`PageRestoreProgress::from_report`]: crate::session::awaiting_restore::PageRestoreProgress::from_report
+#[tauri::command]
+pub fn terminal_report_restore_progress(
+    window: tauri::Window,
+    complete_pages: Vec<String>,
+    deferred_pages: Vec<String>,
+    known_page_ids: Vec<String>,
+) {
+    let label = window.label();
+    if window.app_handle().get_webview_window(label).is_none() {
+        return;
+    }
+    crate::session::awaiting_restore::record_page_restore_progress(
+        label,
+        crate::session::awaiting_restore::PageRestoreProgress::from_report(
+            complete_pages,
+            deferred_pages,
+            known_page_ids,
+        ),
+    );
 }
 
 /// The operator's "Capture now": capture the current roster with reason
@@ -2421,8 +2525,9 @@ pub(crate) struct SessionCaptureHint {
     /// `"pinned"`) and demotes the transcript poller to a verification arm.
     pub claude_session_id: Option<String>,
     /// Grid zone to durably record (account-migration respawns preserve the
-    /// migrated session's tile placement). `None` → zone 0 (the historical
-    /// continuation behavior — wrong zone beats a lost session).
+    /// migrated session's tile placement). `None` → the "no zone" sentinel
+    /// (`UNZONED_ZONE_INDEX`): the zone is unknown, and a restore auto-fills
+    /// such a row into a free zone, so the session is placed, never lost.
     pub zone_index: Option<i32>,
     /// When `true`, inject the autonomous-agent git author/committer identity
     /// (`GIT_AUTHOR_*`/`GIT_COMMITTER_*`) into the spawned PTY's env so the
@@ -2979,7 +3084,8 @@ pub(crate) fn create_terminal_session_backend(
             // actually put the pane on (its unpaged arm picks one), so the
             // record and the live pane never disagree.
             let record_page_id = hint_page_id.unwrap_or_else(|| info.page_id.clone());
-            let record_zone_index = hint_zone_index.unwrap_or(0);
+            let record_zone_index =
+                crate::session::session_lifecycle_store::recorded_zone_for(hint_zone_index);
             if let Some(pinned) = pinned_session_id {
                 // Pre-pinned id: record synchronously, then verify async that
                 // the transcript appears. NEVER rebinds from transcripts.
@@ -3095,7 +3201,8 @@ fn resolve_latest_claude_session_id(
 /// The resolver is injected so this loop is unit-testable without a real
 /// on-disk transcript. On the first resolve it builds a [`TerminalSessionRecord`]
 /// (restored into `zone_index` / the hint page — callers without a meaningful
-/// zone pass 0; wrong zone beats a lost session) and records it; on timeout
+/// zone pass `UNZONED_ZONE_INDEX`, which a restore auto-fills) and records it;
+/// on timeout
 /// it `warn!`s and gives up without recording.
 #[allow(clippy::too_many_arguments)]
 async fn poll_and_record_session<F>(
@@ -3423,6 +3530,26 @@ pub fn plugin() -> TauriPlugin<tauri::Wry> {
 
 #[cfg(test)]
 mod tests {
+    /// Phase 7 of plan `2026-11-11-since-restart-roster-counts-closed-sessions-as-missing`:
+    /// the restore deferral WARNs once per boot-restore phase change, for the
+    /// boot restore's own read only; every other arm is debug.
+    #[test]
+    fn the_restore_deferral_warns_only_for_the_boot_restores_read_that_moved_the_phase() {
+        use super::{deferral_log, DeferralLog};
+        assert_eq!(deferral_log(true, true), DeferralLog::Warn);
+        assert_eq!(
+            deferral_log(true, false),
+            DeferralLog::Debug,
+            "the boot restore asking again moves nothing"
+        );
+        assert_eq!(
+            deferral_log(false, true),
+            DeferralLog::Debug,
+            "a reader that only looks never warns"
+        );
+        assert_eq!(deferral_log(false, false), DeferralLog::Debug);
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -3708,20 +3835,38 @@ mod tests {
         }
         let tm = TerminalManager::new();
 
-        let before = record_close_for(&tm, &store, "before", Some("term-before"), "pty-exit");
+        let before = record_close_for(
+            &tm,
+            &store,
+            "before",
+            Some("term-before"),
+            CloseReason::PtyExit,
+        );
         assert!(matches!(before, CloseOutcome::Closed { .. }), "{before:?}");
         assert_eq!(store.get("before").unwrap().state, "closed");
 
         let _ = tm.close_all(std::time::Instant::now());
 
-        let after = record_close_for(&tm, &store, "after", Some("term-after"), "pty-exit");
+        let after = record_close_for(
+            &tm,
+            &store,
+            "after",
+            Some("term-after"),
+            CloseReason::PtyExit,
+        );
         assert!(
             matches!(after, CloseOutcome::IgnoredDuringShutdown { .. }),
             "{after:?}"
         );
         assert_eq!(store.get("after").unwrap().state, "open");
 
-        let user = record_close_for(&tm, &store, "user", Some("term-user"), "explicit");
+        let user = record_close_for(
+            &tm,
+            &store,
+            "user",
+            Some("term-user"),
+            CloseReason::Explicit,
+        );
         assert!(matches!(user, CloseOutcome::Closed { .. }), "{user:?}");
     }
 
@@ -3751,11 +3896,44 @@ mod tests {
         let tm = TerminalManager::new();
         assert!(tm.get(&term).is_none(), "the pane is gone from the manager");
 
-        let out = record_close_for(&tm, &store, &id, Some(term.as_str()), "pty-exit");
+        let out = record_close_for(&tm, &store, &id, Some(term.as_str()), CloseReason::PtyExit);
         assert!(matches!(out, CloseOutcome::Closed { .. }), "{out:?}");
         assert_eq!(
             store.get(&id).unwrap().close_reason.as_deref(),
             Some("pty-exit")
+        );
+    }
+
+    /// Plan `2026-11-11-since-restart-roster-counts-closed-sessions-as-missing`,
+    /// Phase 3: the IPC door parses the webview's reason into the typed
+    /// close-reason set and refuses a string outside it, closing nothing — the
+    /// dead `user-close` key included. Mutation: `record_close_request` mapping
+    /// an unknown string to `CloseReason::Explicit` instead of refusing it.
+    #[test]
+    fn the_close_door_refuses_a_reason_outside_the_typed_set_and_closes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        let mut r = restore_candidate_record("s");
+        r.terminal_id = "term-s".to_string();
+        store.record_open(r);
+        let tm = TerminalManager::new();
+
+        for bad in ["user-close", "migrated", "", "EXPLICIT"] {
+            let err = record_close_request(&tm, &store, "s", Some("term-s"), bad).unwrap_err();
+            assert!(err.contains("unknown close reason"), "{bad:?}: {err}");
+            assert_eq!(
+                store.get("s").unwrap().state,
+                "open",
+                "{bad:?} closed nothing"
+            );
+        }
+
+        let ok = record_close_request(&tm, &store, "s", Some("term-s"), "explicit").unwrap();
+        assert!(matches!(ok, CloseOutcome::Closed { .. }), "{ok:?}");
+        assert_eq!(
+            store.get("s").unwrap().close_reason.as_deref(),
+            Some("explicit"),
+            "the wire string is stored unchanged"
         );
     }
 

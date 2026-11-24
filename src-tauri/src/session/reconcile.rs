@@ -77,8 +77,8 @@ use std::path::{Path, PathBuf};
 use crate::process_capture::process_tree::ProcessSnapshot;
 use crate::session::claude_activity::{read_provider_rows, ProviderRowValidity};
 use crate::session::session_lifecycle_store::{
-    SessionLifecycleStore, TerminalSessionRecord, DEFAULT_PROVIDER, ORIGIN_AUTHORITATIVE,
-    ORIGIN_OBSERVED, ORIGIN_RECONCILED, UNZONED_ZONE_INDEX,
+    InferredBind, SessionLifecycleStore, TerminalSessionRecord, DEFAULT_PROVIDER,
+    ORIGIN_AUTHORITATIVE, ORIGIN_OBSERVED, ORIGIN_RECONCILED, UNZONED_ZONE_INDEX,
 };
 use crate::terminal::graceful_exit::PaneLook;
 use qontinui_runner_lib::session_archive::discovery::config_dir_compare_key;
@@ -182,6 +182,17 @@ pub enum ReconcileAction {
         config_dir: String,
         origin: BindOrigin,
         confirmed: bool,
+    },
+    /// The evidence asked for a `Bind` and the store's write-time liveness
+    /// guard did not write it ([`SessionLifecycleStore::bind_inferred`]): the
+    /// pane it named had exited by then, or the session's row is open on
+    /// another live pane, or the store was unavailable. Nothing was written, so
+    /// nothing downstream treats it as a bind: no `session-bound` tab stamp, no
+    /// rung-2 coord re-key.
+    BindNotWritten {
+        terminal_id: String,
+        session_id: String,
+        reason: InferredBind,
     },
     /// Rung 3 had MORE THAN ONE passing candidate — the observed bind can't be
     /// uniquely resolved this tick. Skip it (no write); a later tick, with a
@@ -427,7 +438,9 @@ pub fn is_phantom_record(
 /// never re-emitted — so `placement.zoneIndex` read `-1` for every session in
 /// the store and the session-info dropdown could not report where a session
 /// lives. The caller passes the zone the terminal's existing open record
-/// already carries, so an unknown never overwrites a known value.
+/// carries when it records one, else the session's own zone when its row is on the
+/// pane's page (see [`run_reconcile`]), so an unknown never overwrites a known
+/// value.
 fn bind_record(
     pty: &LivePty,
     session_id: &str,
@@ -503,15 +516,24 @@ pub trait TranscriptIndex {
 /// cmdline query failed, or found nothing) simply degrades every terminal to the
 /// rung-3 transcript correlation: fail-open by construction.
 ///
+/// `terminals_live_now` reads the panes alive at WRITE time. `live` is what
+/// the pass captured at its start, and a pass can wait up to 30 s on its
+/// transcript prescan between the two, so every bind goes through
+/// [`SessionLifecycleStore::bind_inferred`] with a fresh read taken just before
+/// it (plan `2026-11-11-since-restart-roster-counts-closed-sessions-as-missing`,
+/// Phase 1).
+///
 /// Returns the actions taken (for logging/tests). Side effects: each `Bind`
-/// writes a record (CONFIRMED when the bind is confirmed); each `PrunePhantom`
-/// removes the row. `LeaveAlone` / `SkipAmbiguous` are no-ops.
+/// wrote a record (CONFIRMED when the bind is confirmed), and a bind the guard
+/// did not write is reported `BindNotWritten`; each `PrunePhantom` removes the
+/// row. `LeaveAlone` / `SkipAmbiguous` are no-ops.
 pub fn run_reconcile<I: TranscriptIndex>(
     store: &SessionLifecycleStore,
     live: &[LivePty],
     snapshot: &ProcessSnapshot,
     index: &I,
     cmdline_ids: &HashMap<u32, String>,
+    terminals_live_now: &dyn Fn() -> HashSet<String>,
 ) -> Vec<ReconcileAction> {
     let live_terminal_ids: HashSet<String> = live.iter().map(|p| p.terminal_id.clone()).collect();
     // Live panes that still host a claude anchor this pass. Only such a pane
@@ -612,77 +634,115 @@ pub fn run_reconcile<I: TranscriptIndex>(
             &claimed_ids,
             cmdline_id_live_owner.as_deref(),
         );
-        match &action {
+        let action = match action {
             ReconcileAction::Bind {
+                terminal_id,
                 session_id,
                 config_dir,
                 origin,
                 confirmed,
-                ..
             } => {
-                // Carry the zone the terminal's existing open record already
-                // holds. `existing` is keyed on the TERMINAL, which is the
-                // right key: the zone is a property of where the PTY sits in
-                // the grid, not of the session id that happens to own it — so
-                // this survives a bind that supersedes a differently-keyed
-                // sibling row on the same terminal. No record yet ⇒ genuinely
-                // unknown ⇒ the sentinel, which is honest rather than lossy.
-                let zone_index = existing
+                // Where the pane sits, as best known, in three steps.
+                //
+                // 1. The pane's own open row, when it records a zone. A pane
+                //    spawned with a zone hint records that zone on its seam row
+                //    (`create_terminal_session_backend`), and the frontend's
+                //    record carries the tab's zone; either is where THIS pane
+                //    sits, so a session that lands in another zone of the same
+                //    page must not get its old zone back. A spawn that does not
+                //    know the zone records the sentinel (the identity seam in
+                //    `terminal/session.rs`, a backend spawn with no hint), so 0
+                //    is a real zone here. A row a pre-sentinel build wrote still
+                //    carries its placeholder 0 and reads as zone 0: the webview's
+                //    zone backstop (`planZoneReemits`) seeds a session it has not
+                //    ledgered from its first observation WITHOUT emitting, so it
+                //    rewrites that row only after a zone move. That lasts only
+                //    through the upgrade; every row written since records the
+                //    sentinel for an unknown zone.
+                // 2. The session's own zone, while its row is on the pane's
+                //    page. A respawn (account migration, restore, holder
+                //    adoption) reopens "on the same grid page/zone"
+                //    (`account_migration.rs`), so a pane row that knows nothing
+                //    must not erase it (coord finding f0a0c310). Only on the
+                //    pane's page: the bind takes the page from the pane
+                //    (`bind_record`), so a hand resume into a pane on another page
+                //    must not carry the old page's zone onto it.
+                // 3. Neither ⇒ the sentinel, which is honest rather than lossy.
+                let pane_zone = existing
                     .as_ref()
                     .map(|r| r.zone_index)
+                    .filter(|z| *z != UNZONED_ZONE_INDEX);
+                let zone_index = pane_zone
+                    .or_else(|| {
+                        store
+                            .get(&session_id)
+                            .filter(|r| r.page_id == pty.page_id)
+                            .map(|r| r.zone_index)
+                            .filter(|z| *z != UNZONED_ZONE_INDEX)
+                    })
                     .unwrap_or(UNZONED_ZONE_INDEX);
                 // A confirmed bind is written CONFIRMED (see `bind_record`) so
                 // `record_open`'s supersede retires the identity seam's
-                // unconfirmed sibling on this terminal in the same write.
-                store.record_open(bind_record(
-                    pty,
-                    session_id,
-                    config_dir,
-                    origin.as_origin_const(),
-                    *confirmed,
-                    zone_index,
-                ));
-                if *confirmed {
-                    // Claim the id so no other live terminal in this pass binds
-                    // it too.
-                    claimed_ids.insert(session_id.clone());
-                }
-                match origin {
-                    BindOrigin::Observed => {
-                        // "No silent cap": a session recovered ONLY via the
-                        // observed correlation is observable (the shim-bypass
-                        // edge).
-                        tracing::info!(
-                            terminal_id = %pty.terminal_id,
-                            claude_session = %session_id,
-                            working_dir = %pty.working_dir,
-                            confirmed = *confirmed,
-                            "session binder: bound a launch-agnostic session via process-start-anchored transcript correlation"
-                        );
+                // unconfirmed sibling on this terminal in the same write. The
+                // panes alive NOW, not at the pass's start, decide whether it is
+                // written at all.
+                //
+                // The guard reads a pane as live for two questions: is the
+                // TARGET a live PTY now, and does the row's CURRENT pane still
+                // hold it. A pane that is no longer a live PTY holds nothing.
+                // A live one holds unless this pass CAPTURED it and saw, by the
+                // same owner rule as the rung-2 check above, that it no longer
+                // runs this session: its claude exited (no anchor in the
+                // capture, its shell living on) or now names another session.
+                // A pane the capture never saw — the account migration's new
+                // pane, spawned after the pass read the live set while the
+                // source pane's claude still runs `--resume <sid>` until the
+                // proof-then-close — holds: absence of evidence is not
+                // evidence of a switch, and moving the row back onto the
+                // source pane is the f0a0c310 re-point.
+                let live_now = terminals_live_now();
+                let target = pty.terminal_id.as_str();
+                let holds_session = |t: &str| {
+                    if !live_terminal_ids.contains(t) {
+                        return true;
                     }
-                    BindOrigin::Authoritative => {
-                        tracing::debug!(
-                            terminal_id = %pty.terminal_id,
-                            claude_session = %session_id,
-                            confirmed = *confirmed,
-                            "session binder: bound authoritative session from typed --session-id cmdline"
-                        );
+                    anchored_terminal_pids.get(t).is_some_and(|owner_pid| {
+                        cmdline_ids
+                            .get(owner_pid)
+                            .is_none_or(|owner_sid| *owner_sid == session_id)
+                    })
+                };
+                let written = store.bind_inferred(
+                    bind_record(
+                        pty,
+                        &session_id,
+                        &config_dir,
+                        origin.as_origin_const(),
+                        confirmed,
+                        zone_index,
+                    ),
+                    &|t: &str| live_now.contains(t) && (t == target || holds_session(t)),
+                );
+                if written == InferredBind::Bound {
+                    if confirmed {
+                        // Claim the id so no other live terminal in this pass
+                        // binds it too.
+                        claimed_ids.insert(session_id.clone());
                     }
-                    BindOrigin::Reconciled => {
-                        // Degraded rung 4: no start anchor was resolvable, so the
-                        // bind rests on the uniqueness gate alone and is written
-                        // `reconciled`, which restore opens as a plain terminal
-                        // (terminal-only, never auto-resumed). Logged at info
-                        // (not debug) because a
-                        // recurring one means the process table is failing to
-                        // yield creation times — the anchor, not the bind, is the
-                        // thing to fix.
-                        tracing::info!(
-                            terminal_id = %pty.terminal_id,
-                            claude_session = %session_id,
-                            working_dir = %pty.working_dir,
-                            "session binder: no start anchor available — bound the unique cwd transcript as RECONCILED (restores as a plain terminal, never auto-resumed)"
-                        );
+                    log_bind(pty, &session_id, origin, confirmed);
+                    ReconcileAction::Bind {
+                        terminal_id,
+                        session_id,
+                        config_dir,
+                        origin,
+                        confirmed,
+                    }
+                } else {
+                    log_bind_not_written(&terminal_id, &session_id, &written);
+                    ReconcileAction::BindNotWritten {
+                        terminal_id,
+                        session_id,
+                        reason: written,
                     }
                 }
             }
@@ -692,10 +752,10 @@ pub fn run_reconcile<I: TranscriptIndex>(
                     working_dir = %pty.working_dir,
                     "session binder: >1 candidate transcript — skipping ambiguous bind this pass"
                 );
+                ReconcileAction::SkipAmbiguous { terminal_id }
             }
-            ReconcileAction::LeaveAlone { .. } => {}
-            ReconcileAction::PrunePhantom { .. } => {}
-        }
+            other => other,
+        };
         actions.push(action);
     }
 
@@ -717,6 +777,76 @@ pub fn run_reconcile<I: TranscriptIndex>(
     }
 
     actions
+}
+
+/// Log one bind [`run_reconcile`] wrote, by the evidence grade it was written
+/// under.
+fn log_bind(pty: &LivePty, session_id: &str, origin: BindOrigin, confirmed: bool) {
+    match origin {
+        BindOrigin::Observed => {
+            // "No silent cap": a session recovered ONLY via the observed
+            // correlation is observable (the shim-bypass edge).
+            tracing::info!(
+                terminal_id = %pty.terminal_id,
+                claude_session = %session_id,
+                working_dir = %pty.working_dir,
+                confirmed,
+                "session binder: bound a launch-agnostic session via process-start-anchored transcript correlation"
+            );
+        }
+        BindOrigin::Authoritative => {
+            tracing::debug!(
+                terminal_id = %pty.terminal_id,
+                claude_session = %session_id,
+                confirmed,
+                "session binder: bound authoritative session from typed --session-id cmdline"
+            );
+        }
+        BindOrigin::Reconciled => {
+            // Degraded rung 4: no start anchor was resolvable, so the bind
+            // rests on the uniqueness gate alone and is written `reconciled`,
+            // which restore opens as a plain terminal (terminal-only, never
+            // auto-resumed). Logged at info (not debug) because a recurring one
+            // means the process table is failing to yield creation times — the
+            // anchor, not the bind, is the thing to fix.
+            tracing::info!(
+                terminal_id = %pty.terminal_id,
+                claude_session = %session_id,
+                working_dir = %pty.working_dir,
+                "session binder: no start anchor available — bound the unique cwd transcript as RECONCILED (restores as a plain terminal, never auto-resumed)"
+            );
+        }
+    }
+}
+
+/// Log one bind the store's write-time guard did not write. A pane that exited
+/// between the pass's capture and its write — the stale-evidence case the guard
+/// exists for — is rare and worth seeing, so info. A second live pane running
+/// the same session repeats on every pass for as long as both live, so debug.
+fn log_bind_not_written(terminal_id: &str, session_id: &str, reason: &InferredBind) {
+    match reason {
+        InferredBind::TargetNotLive { .. } => tracing::info!(
+            terminal_id,
+            claude_session = session_id,
+            "session binder: bind REFUSED — the pane its evidence named is no longer live (the \
+             evidence was read before that pane exited); the row keeps its binding"
+        ),
+        InferredBind::RowOnLivePane {
+            terminal_id: row_terminal,
+        } => tracing::debug!(
+            terminal_id,
+            claude_session = session_id,
+            row_terminal_id = %row_terminal,
+            "session binder: bind refused — the session's row is open on another live pane, \
+             and an inference does not move a running session"
+        ),
+        InferredBind::StoreUnavailable => tracing::warn!(
+            terminal_id,
+            claude_session = session_id,
+            "session binder: bind NOT written — the lifecycle store's lock is poisoned"
+        ),
+        InferredBind::Bound => {}
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -873,9 +1003,15 @@ impl PrescannedTranscriptIndex {
     /// runtime is the thing that is sick. The bound is therefore
     /// [`crate::off_runtime::deadline`], measured by the OS scheduler.
     ///
-    /// Degrading is safe by contract: an empty snapshot binds nothing and
-    /// prunes nothing, because a pair the prescan never probed answers
-    /// `transcript_exists = true` (missing evidence is UNKNOWN, never "no").
+    /// Degrading is safe by contract: an empty snapshot makes no
+    /// transcript-correlated (rung 3 or 4) bind and prunes nothing, because a
+    /// pair the prescan never probed answers `transcript_exists = true`
+    /// (missing evidence is UNKNOWN, never "no"). Rung 2 does not consult the
+    /// index: a pane whose claude names its session id on its command line is
+    /// still bound — unconfirmed, as no transcript was found — through
+    /// [`SessionLifecycleStore::bind_inferred`]'s write-time liveness guard,
+    /// which is what keeps a bind from evidence this old off a pane that has
+    /// since exited.
     async fn spawn_scan<F>(scan: F) -> Self
     where
         F: FnOnce() -> Self + Send + 'static,
@@ -897,7 +1033,9 @@ impl PrescannedTranscriptIndex {
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
-                        "session reconcile: transcript prescan task failed — this pass binds and prunes nothing"
+                        "session reconcile: transcript prescan task failed — this pass makes no \
+                         transcript-correlated bind and prunes nothing; a command-line (rung 2) \
+                         bind still applies, to the panes live when it is written"
                     );
                     Self::default()
                 }
@@ -906,9 +1044,10 @@ impl PrescannedTranscriptIndex {
                 tracing::warn!(
                     timeout_secs = timeout.as_secs(),
                     "session reconcile: the transcript prescan did not finish within its bound \
-                     (blocking pool exhausted?) — this pass binds and prunes nothing. The bound \
-                     is measured on a dedicated OS thread, so it fires even when every tokio \
-                     worker is parked."
+                     (blocking pool exhausted?) — this pass makes no transcript-correlated bind \
+                     and prunes nothing; a command-line (rung 2) bind still applies, to the \
+                     panes live when it is written. The bound is measured on a dedicated OS \
+                     thread, so it fires even when every tokio worker is parked."
                 );
                 Self::default()
             }
@@ -1406,9 +1545,14 @@ fn anchor_live_ptys(live: &[LivePty], look: &PaneLook) -> Vec<LivePty> {
 ///
 /// `context` tags the INFO log ("boot" / "periodic") so a binder-only recovery is
 /// attributable to the pass that made it (the "no silent cap" observability
-/// requirement). Fail-open throughout: a snapshot / cmdline / scan failure
-/// degrades to "bound nothing this pass", never worse than today's behavior and
-/// never a panic in the poll loop.
+/// requirement). Fail-open throughout, never a panic in the poll loop: an
+/// unknown snapshot anchors no pane, so nothing is bound; a failed cmdline query
+/// sends every pane to rung 3; a failed or timed-out transcript prescan leaves
+/// only rung 2's command-line binds.
+///
+/// `terminals_live_now` is the panes alive at WRITE time — see
+/// [`run_reconcile`]; production passes [`live_panes_of`] over the
+/// `TerminalManager`.
 ///
 /// Returns the actions taken so the caller can propagate binds to the frontend
 /// (`session-bound` tab-stamp events — see [`session_bound_payloads`]); the
@@ -1418,6 +1562,7 @@ pub async fn run_reconcile_pass(
     live: &[LivePty],
     look: &PaneLook,
     context: &str,
+    terminals_live_now: &(dyn Fn() -> HashSet<String> + Sync),
 ) -> Vec<ReconcileAction> {
     let snapshot = look.snapshot();
     let live = anchor_live_ptys(live, look);
@@ -1472,7 +1617,14 @@ pub async fn run_reconcile_pass(
         .map(|r| (r.claude_session_id, r.working_dir))
         .collect();
     let index = PrescannedTranscriptIndex::scan_off_runtime(scan_dirs, probes).await;
-    let actions = run_reconcile(store, &live, snapshot, &index, &cmdline_ids);
+    let actions = run_reconcile(
+        store,
+        &live,
+        snapshot,
+        &index,
+        &cmdline_ids,
+        terminals_live_now,
+    );
 
     let bound = actions
         .iter()
@@ -1498,11 +1650,16 @@ pub async fn run_reconcile_pass(
         .iter()
         .filter(|a| matches!(a, ReconcileAction::PrunePhantom { .. }))
         .count();
-    if bound > 0 || pruned > 0 || ambiguous > 0 {
+    let not_written = actions
+        .iter()
+        .filter(|a| matches!(a, ReconcileAction::BindNotWritten { .. }))
+        .count();
+    if bound > 0 || pruned > 0 || ambiguous > 0 || not_written > 0 {
         tracing::info!(
             bound,
             observed,
             ambiguous,
+            not_written,
             pruned,
             live = live.len(),
             context,
@@ -1521,6 +1678,7 @@ pub async fn run_reconcile_pass(
 pub async fn run_at_boot(
     store: &SessionLifecycleStore,
     live: Vec<LivePty>,
+    terminals_live_now: &(dyn Fn() -> HashSet<String> + Sync),
 ) -> Vec<ReconcileAction> {
     // One-time P4 registry-corruption repair (plan
     // `2026-07-19-runner-session-restore-mass-strand-and-git-popup`, Phase 3):
@@ -1549,7 +1707,27 @@ pub async fn run_at_boot(
     }
     let roots: Vec<u32> = live.iter().filter_map(|pty| pty.pid).collect();
     let look = PaneLook::take(&roots).await;
-    run_reconcile_pass(store, &live, &look, "boot").await
+    run_reconcile_pass(store, &live, &look, "boot", terminals_live_now).await
+}
+
+/// The ids of the panes whose PTY is alive in this process right now: the
+/// write-time liveness [`run_reconcile`] reads before each bind. The same
+/// membership the awaiting-account mark snapshots (`commands::terminal`): the
+/// manager's terminals whose child has not exited. Read OUTSIDE the store's
+/// lock, so the manager's lock and the store's are never held together.
+pub fn live_panes_of(tm: &crate::terminal::TerminalManager) -> HashSet<String> {
+    tm.sessions_snapshot()
+        .into_iter()
+        .filter(|(_, session)| session.is_alive())
+        .map(|(id, _)| id)
+        .collect()
+}
+
+/// A [`run_reconcile`] liveness read for a test whose captured `live` list is
+/// still current at write time: every listed pane is live.
+#[cfg(test)]
+pub(crate) fn every_listed_pty_is_live(live: &[LivePty]) -> impl Fn() -> HashSet<String> + '_ {
+    move || live.iter().map(|p| p.terminal_id.clone()).collect()
 }
 
 /// Wire payload for the `session-bound` Tauri event — the binder→frontend
@@ -2450,7 +2628,14 @@ mod tests {
             existing_ids,
         };
 
-        let actions = run_reconcile(&store, &live, &snapshot, &index, &no_cmdlines());
+        let actions = run_reconcile(
+            &store,
+            &live,
+            &snapshot,
+            &index,
+            &no_cmdlines(),
+            &every_listed_pty_is_live(&live),
+        );
 
         // The live PTY was bound as observed (process-anchored unique).
         assert!(actions.iter().any(|a| matches!(
@@ -2500,10 +2685,24 @@ mod tests {
             existing_ids,
         };
 
-        run_reconcile(&store, &live, &snapshot, &index, &no_cmdlines());
+        run_reconcile(
+            &store,
+            &live,
+            &snapshot,
+            &index,
+            &no_cmdlines(),
+            &every_listed_pty_is_live(&live),
+        );
         // The bound record now carries the LIVE terminal id, so the 2nd pass
         // finds it confirmed-by-terminal and leaves it alone.
-        let second = run_reconcile(&store, &live, &snapshot, &index, &no_cmdlines());
+        let second = run_reconcile(
+            &store,
+            &live,
+            &snapshot,
+            &index,
+            &no_cmdlines(),
+            &every_listed_pty_is_live(&live),
+        );
         assert!(
             second.iter().any(|a| matches!(
                 a,
@@ -2539,7 +2738,14 @@ mod tests {
         let cmdlines: HashMap<u32, String> =
             [(777u32, "typed-id".to_string())].into_iter().collect();
 
-        run_reconcile(&store, &live, &snapshot, &index, &cmdlines);
+        run_reconcile(
+            &store,
+            &live,
+            &snapshot,
+            &index,
+            &cmdlines,
+            &every_listed_pty_is_live(&live),
+        );
 
         let rec = store.get("typed-id").expect("cmdline bind written");
         assert_eq!(
@@ -2623,7 +2829,14 @@ mod tests {
                 .collect(),
         };
 
-        run_reconcile(&store, &live, &snapshot, &index, &no_cmdlines());
+        run_reconcile(
+            &store,
+            &live,
+            &snapshot,
+            &index,
+            &no_cmdlines(),
+            &every_listed_pty_is_live(&live),
+        );
 
         let seam = store.get("seam-pin").expect("seam row still present");
         assert_eq!(
@@ -2657,8 +2870,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
 
-        // The seam's spawn-time row, already resolved into a real zone by the
-        // frontend backstop.
+        // A seam-keyed row on the pane that records a zone (a spawn with a zone
+        // hint records it; a hint-less spawn records the sentinel).
         store.record_open(TerminalSessionRecord {
             claude_session_id: "seam-pin".to_string(),
             config_dir: None,
@@ -2715,7 +2928,14 @@ mod tests {
             existing_ids: ["real-sess".to_string()].into_iter().collect(),
         };
 
-        run_reconcile(&store, &live, &snapshot, &index, &no_cmdlines());
+        run_reconcile(
+            &store,
+            &live,
+            &snapshot,
+            &index,
+            &no_cmdlines(),
+            &every_listed_pty_is_live(&live),
+        );
 
         let bound = store.get("real-sess").expect("observed bind written");
         assert_eq!(
@@ -2759,7 +2979,14 @@ mod tests {
             existing_ids: ["real-sess".to_string()].into_iter().collect(),
         };
 
-        run_reconcile(&store, &live, &snapshot, &index, &no_cmdlines());
+        run_reconcile(
+            &store,
+            &live,
+            &snapshot,
+            &index,
+            &no_cmdlines(),
+            &every_listed_pty_is_live(&live),
+        );
 
         assert_eq!(
             store
@@ -2795,7 +3022,14 @@ mod tests {
             existing_ids: ["foreign-sess".to_string()].into_iter().collect(),
         };
 
-        let actions = run_reconcile(&store, &live, &snapshot, &index, &no_cmdlines());
+        let actions = run_reconcile(
+            &store,
+            &live,
+            &snapshot,
+            &index,
+            &no_cmdlines(),
+            &every_listed_pty_is_live(&live),
+        );
 
         assert!(
             actions.iter().any(|a| matches!(
@@ -2858,7 +3092,14 @@ mod tests {
             &crate::terminal::graceful_exit::PaneLook::image_only(&stale),
         );
         assert_eq!(anchored[0].ai_pid, None, "a stale table anchors nothing");
-        let actions = run_reconcile(&store, &anchored, &stale, &index(), &no_cmdlines());
+        let actions = run_reconcile(
+            &store,
+            &anchored,
+            &stale,
+            &index(),
+            &no_cmdlines(),
+            &every_listed_pty_is_live(&anchored),
+        );
         assert!(
             !actions
                 .iter()
@@ -2879,7 +3120,14 @@ mod tests {
             Some(5151),
             "a fresh table anchors claude"
         );
-        let actions = run_reconcile(&store, &anchored, &fresh, &index(), &no_cmdlines());
+        let actions = run_reconcile(
+            &store,
+            &anchored,
+            &fresh,
+            &index(),
+            &no_cmdlines(),
+            &every_listed_pty_is_live(&anchored),
+        );
         assert!(
             actions
                 .iter()
@@ -2917,7 +3165,14 @@ mod tests {
             existing_ids: ["real-sess".to_string()].into_iter().collect(),
         };
 
-        let actions = run_reconcile(&store, &live, &snapshot, &index, &no_cmdlines());
+        let actions = run_reconcile(
+            &store,
+            &live,
+            &snapshot,
+            &index,
+            &no_cmdlines(),
+            &every_listed_pty_is_live(&live),
+        );
 
         assert!(
             actions.contains(&ReconcileAction::Bind {
@@ -3034,6 +3289,9 @@ mod tests {
             &ProcessSnapshot::default(),
             &two_root_index("d1-a"),
             &cmdlines,
+            &crate::session::reconcile::every_listed_pty_is_live(&[pty_anchored(
+                "term-new", 777, 1_000, "/repo",
+            )]),
         );
 
         assert_eq!(
@@ -3069,6 +3327,9 @@ mod tests {
             &ProcessSnapshot::default(),
             &two_root_index("d1-a3"),
             &no_cmdlines(),
+            &crate::session::reconcile::every_listed_pty_is_live(&[pty_anchored(
+                "term-new", 777, 1_000, "/repo",
+            )]),
         );
 
         assert_eq!(
@@ -3119,6 +3380,10 @@ mod tests {
             &ProcessSnapshot::default(),
             &index,
             &cmdlines,
+            &crate::session::reconcile::every_listed_pty_is_live(&[
+                pty_anchored("term-typed", 777, 1_000, "/repo"),
+                pty_anchored("term-observed", 888, 1_000, "/repo2"),
+            ]),
         );
 
         for sid in ["d1-b-typed", "d1-b-observed"] {
@@ -3162,6 +3427,10 @@ mod tests {
             &ProcessSnapshot::default(),
             &two_root_index("d1-c"),
             &cmdlines,
+            &crate::session::reconcile::every_listed_pty_is_live(&[
+                pty_anchored("term-new", 222, 1_000, "/repo"),
+                pty_anchored("term-old", 111, 1_000, "/repo"),
+            ]),
         );
         assert_eq!(
             actions,
@@ -3211,6 +3480,10 @@ mod tests {
             &ProcessSnapshot::default(),
             &two_root_index("d1-x"),
             &cmdlines,
+            &crate::session::reconcile::every_listed_pty_is_live(&[
+                pty("term-shell", Some(1), "/repo"),
+                pty_anchored("term-resume", 333, 1_000, "/repo"),
+            ]),
         );
 
         assert_eq!(store.get("d1-x").unwrap().terminal_id, "term-resume");
@@ -3241,6 +3514,10 @@ mod tests {
             &ProcessSnapshot::default(),
             &two_root_index("d1-y"),
             &cmdlines,
+            &crate::session::reconcile::every_listed_pty_is_live(&[
+                pty_anchored("term-resume", 555, 1_000, "/repo"),
+                pty_anchored("term-reused", 444, 1_000, "/repo"),
+            ]),
         );
 
         assert_eq!(store.get("d1-y").unwrap().terminal_id, "term-resume");
@@ -3268,6 +3545,10 @@ mod tests {
             &ProcessSnapshot::default(),
             &two_root_index("d1-z"),
             &cmdlines,
+            &crate::session::reconcile::every_listed_pty_is_live(&[
+                pty_anchored("term-owner", 666, 1_000, "/repo"),
+                pty_anchored("term-other", 777, 1_000, "/repo"),
+            ]),
         );
 
         assert!(
@@ -3303,6 +3584,9 @@ mod tests {
             &ProcessSnapshot::default(),
             &two_root_index(sid),
             &cmdlines,
+            &crate::session::reconcile::every_listed_pty_is_live(&[pty_anchored(
+                "term-old", 111, 1_000, "/repo",
+            )]),
         );
         assert!(
             matches!(&actions[..], [ReconcileAction::Bind { terminal_id, .. }] if terminal_id == "term-old"),
@@ -3416,3 +3700,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod stale_bind_tests;
