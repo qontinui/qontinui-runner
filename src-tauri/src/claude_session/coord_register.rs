@@ -1551,9 +1551,15 @@ impl AiCoordRegistrar {
     /// sessions ever get, so an idle session ages to `stale` at coord's
     /// threshold. No-op (silently) if the session was never registered or the
     /// gate is off.
-    pub fn heartbeat_on_interaction(&self, task_run_id: &str) {
+    ///
+    /// Returns whether a `Heartbeat` row was RECORDED in the outbox: `false`
+    /// when the key has no binding (never registered, or evicted since the
+    /// caller looked) or the outbox write failed. Queued is all it can say —
+    /// whether coord then applies the row is decided downstream. Callers that
+    /// only need the side effect may ignore it.
+    pub fn heartbeat_on_interaction(&self, task_run_id: &str) -> bool {
         let Some(session_id) = self.session_id_for(task_run_id) else {
-            return;
+            return false;
         };
         let payload = self.stamp_tenant(
             session_id,
@@ -1569,11 +1575,13 @@ impl AiCoordRegistrar {
                 "ai_coord_register: outbox Heartbeat write failed for {} (best-effort): {}",
                 task_run_id, e
             );
+            false
         } else {
             debug!(
                 "ai_coord_register: interaction heartbeat for {} (coord {})",
                 task_run_id, session_id
             );
+            true
         }
     }
 
@@ -2810,6 +2818,34 @@ mod tests {
     }
 
     const OWNING_TENANT: Uuid = Uuid::from_u128(0xc231d9da_0ca8_4fe4_bd81_0e3d6c20339a);
+
+    /// `heartbeat_on_interaction` reports whether it RECORDED a Heartbeat row:
+    /// `false` for an unbound key and for a failed outbox write, `true` only
+    /// when the row was written. The session tailer counts sidechain
+    /// heartbeats on this answer.
+    #[test]
+    fn heartbeat_on_interaction_reports_whether_it_recorded_a_row() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, dir) = registrar();
+        assert!(!reg.heartbeat_on_interaction("never-registered"));
+
+        let trid = Uuid::new_v4().to_string();
+        reg.register_session(&trid, "heartbeat return", None)
+            .unwrap();
+        assert!(
+            reg.heartbeat_on_interaction(&trid),
+            "a written row is recorded"
+        );
+
+        let outbox_path = dir.path().join("outbox.jsonl");
+        std::fs::remove_file(&outbox_path).unwrap();
+        std::fs::create_dir(&outbox_path).unwrap();
+        assert!(
+            !reg.heartbeat_on_interaction(&trid),
+            "a failed outbox write records nothing"
+        );
+    }
 
     #[test]
     fn every_row_of_a_session_carries_its_owning_tenant() {

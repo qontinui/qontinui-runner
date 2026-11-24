@@ -274,11 +274,13 @@ pub struct SessionTranscriptTailer {
 }
 
 /// What one liveness check did: whether the key is bound, and whether this
-/// call sent its heartbeat (bound AND its throttle slot was due).
+/// call RECORDED a heartbeat — bound, its throttle slot due, AND the
+/// registrar wrote the `Heartbeat` outbox row
+/// ([`AiCoordRegistrar::heartbeat_on_interaction`] returned `true`).
 #[derive(Debug, Clone, Copy)]
 struct HeartbeatOutcome {
     bound: bool,
-    sent: bool,
+    recorded: bool,
 }
 
 /// [`SessionTranscriptTailer::admit`]'s verdict on one batch.
@@ -654,7 +656,8 @@ struct Coverage {
     /// coord (plan `2026-11-12-transcript-autobind-adopts-a-previous-boot-row-that-a-live-pane-has-replaced` D1).
     autobind_adopted_live_pane: u64,
     /// Heartbeats [`SessionTranscriptTailer::note_sidechain_activity`]
-    /// actually SENT for a parent session: bound and due, not throttled.
+    /// RECORDED for a parent session: bound, due (not throttled), and written
+    /// to the outbox by the registrar.
     sidechain_heartbeats: u64,
     /// Transcript sync's gate (the user's toggle AND the tenant's
     /// `egress_transcript_sync`) as observed at the last append. `None` until
@@ -667,7 +670,7 @@ struct Coverage {
     /// idle fleet without losing the ability to say "still nothing bound".
     /// Compared field by field, not as a sum: a held batch moves one count
     /// from `appends_emitted` to `held_batches`, which a sum cannot see.
-    last_reported: [u64; 9],
+    last_reported: [u64; 10],
 }
 
 /// Point-in-time coverage snapshot. `Serialize` so a health/diagnostic surface
@@ -708,12 +711,17 @@ pub struct CoverageReport {
     /// `autobind_adopted` (coord's pick), so the two adoption sources stay
     /// measurable.
     pub autobind_adopted_live_pane: u64,
-    /// Coord heartbeats sent for a PARENT session because one of its subagent
-    /// sidechains grew (bound and due — a throttled or unbound note is not
-    /// counted), since this runner process started. Apart from every other
-    /// heartbeat, so "subagent activity kept a parent's row alive" is
-    /// observable on its own: each transcript heartbeat logs the same
-    /// `interaction heartbeat for` line in the registrar, whatever sent it.
+    /// Coord `Heartbeat` rows RECORDED in the outbox for a PARENT session
+    /// because one of its subagent sidechains grew, since this runner process
+    /// started. A throttled note, an unbound or workflow parent, and a
+    /// heartbeat the registrar did not write (outbox write failed, binding
+    /// gone) are not counted. Recorded means queued for coord: whether coord
+    /// applied the row is not known here. Kept apart from every other
+    /// heartbeat because the registrar logs the same debug-level
+    /// `interaction heartbeat for` line whatever sent one; each counted
+    /// heartbeat is also logged at INFO (see
+    /// [`SessionTranscriptTailer::note_sidechain_activity`]) and the periodic
+    /// `session_transcript_tailer: coverage` line carries this count.
     pub sidechain_heartbeats: u64,
 }
 
@@ -972,10 +980,15 @@ impl SessionTranscriptTailer {
     /// OWNER, so a parent plus any number of sidechains still sends at most one
     /// heartbeat per [`TRANSCRIPT_HEARTBEAT_INTERVAL`]. It emits NO transcript
     /// bytes: a sidechain's content never enters the parent's transcript lane.
-    /// An unbound owner heartbeats nothing. Each heartbeat it SENDS is counted
-    /// in [`CoverageReport::sidechain_heartbeats`] and logged as
-    /// `sidechain heartbeat for <owner>`, so it is observable apart from the
-    /// parent's own and the operator's heartbeats.
+    /// An unbound owner heartbeats nothing. Each heartbeat the registrar
+    /// RECORDS for it is counted in [`CoverageReport::sidechain_heartbeats`]
+    /// and logged at INFO as `session_transcript_tailer: sidechain heartbeat
+    /// recorded for parent session` with the parent's key in the structured
+    /// field `owner` — at most once per parent per
+    /// [`TRANSCRIPT_HEARTBEAT_INTERVAL`] — so it is observable at the runner's
+    /// default log level, apart from the parent's own and the operator's
+    /// heartbeats. "Recorded" means the outbox row was written; whether coord
+    /// then keeps the row alive is not known here.
     pub fn note_sidechain_activity(&self, owner_key: &str, len: usize) {
         self.note_sidechain_activity_at(owner_key, len, Instant::now());
     }
@@ -985,12 +998,11 @@ impl SessionTranscriptTailer {
         if len == 0 {
             return;
         }
-        if self.heartbeat_if_bound(owner_key, now).sent {
+        if self.heartbeat_if_bound(owner_key, now).recorded {
             self.lock_coverage().sidechain_heartbeats += 1;
-            tracing::debug!(
-                "session_transcript_tailer: sidechain heartbeat for {}: subagent activity \
-                 kept the parent's coord row alive",
-                owner_key
+            tracing::info!(
+                owner = %owner_key,
+                "session_transcript_tailer: sidechain heartbeat recorded for parent session"
             );
         }
     }
@@ -998,15 +1010,17 @@ impl SessionTranscriptTailer {
     /// The liveness half of an append, shared by [`Self::admit`] /
     /// [`Self::admit_sidechain`] and [`Self::note_sidechain_activity`]: when
     /// `session_key` is BOUND and its throttle slot is due, heartbeat its coord
-    /// row. Says whether the key is bound and whether this call sent the
-    /// heartbeat. An unbound key never claims the throttle slot.
+    /// row. Says whether the key is bound and whether the registrar RECORDED
+    /// the heartbeat. One binding lookup and one throttle claim per call; an
+    /// unbound key never claims the throttle slot, and a due slot stays
+    /// claimed even when the registrar records nothing (the next attempt is
+    /// the next window, as before).
     fn heartbeat_if_bound(&self, session_key: &str, now: Instant) -> HeartbeatOutcome {
         let bound = self.registrar.session_id_for(session_key).is_some();
-        let sent = bound && self.heartbeat_due(session_key, now);
-        if sent {
-            self.registrar.heartbeat_on_interaction(session_key);
-        }
-        HeartbeatOutcome { bound, sent }
+        let recorded = bound
+            && self.heartbeat_due(session_key, now)
+            && self.registrar.heartbeat_on_interaction(session_key);
+        HeartbeatOutcome { bound, recorded }
     }
 
     /// Claim the heartbeat slot for `session_key` at `now`: `true` (and the
@@ -1805,6 +1819,7 @@ impl SessionTranscriptTailer {
             report.autobind_minted,
             report.autobind_deferred,
             report.autobind_adopted_live_pane,
+            report.sidechain_heartbeats,
         ];
 
         let mut cov = self.lock_coverage();
@@ -1849,6 +1864,7 @@ impl SessionTranscriptTailer {
                 autobind_adopted_live_pane = report.autobind_adopted_live_pane,
                 autobind_minted = report.autobind_minted,
                 autobind_deferred = report.autobind_deferred,
+                sidechain_heartbeats = report.sidechain_heartbeats,
                 "session_transcript_tailer: coverage"
             );
         }
@@ -2341,6 +2357,57 @@ mod tests {
         t.note_sidechain_activity_at(&csid, 8, w3);
         assert_eq!(heartbeats_for(&outbox, coord) - before, 3);
         assert_eq!(t.coverage().sidechain_heartbeats, 2);
+    }
+
+    /// Review fix (runner review r4, finding 2): the count is of heartbeats the
+    /// registrar RECORDED, not of ones handed to it. With the outbox unwritable
+    /// — the write fails, so `heartbeat_on_interaction` records no row — a
+    /// bound, due sidechain note counts nothing.
+    #[test]
+    fn a_sidechain_heartbeat_the_registrar_does_not_record_is_not_counted() {
+        let dir = tempdir().unwrap();
+        let (t, registrar, _outbox) = tailer(dir.path());
+        let csid = Uuid::new_v4().to_string();
+        sniff_register(&registrar, &csid);
+
+        // A writable outbox: the heartbeat is recorded and counted.
+        let t0 = Instant::now();
+        t.note_sidechain_activity_at(&csid, 8, t0);
+        assert_eq!(t.coverage().sidechain_heartbeats, 1);
+
+        // The outbox becomes unwritable (its path is now a directory), so the
+        // next window's heartbeat is attempted but not recorded.
+        let outbox_path = dir.path().join("outbox.jsonl");
+        std::fs::remove_file(&outbox_path).unwrap();
+        std::fs::create_dir(&outbox_path).unwrap();
+        let w2 = t0 + TRANSCRIPT_HEARTBEAT_INTERVAL + Duration::from_secs(1);
+        assert!(t.is_bound(&csid), "still bound: the heartbeat is due");
+        t.note_sidechain_activity_at(&csid, 8, w2);
+        assert_eq!(
+            t.coverage().sidechain_heartbeats,
+            1,
+            "a heartbeat no outbox row carries is not counted"
+        );
+    }
+
+    /// Review fix (runner review r4, finding 1): a sample whose ONLY change is
+    /// a recorded sidechain heartbeat moves the periodic coverage summary, so
+    /// the INFO `session_transcript_tailer: coverage` line carries it.
+    #[test]
+    fn a_sidechain_heartbeat_alone_moves_the_coverage_summary() {
+        let dir = tempdir().unwrap();
+        let (t, registrar, _outbox) = tailer(dir.path());
+        let csid = Uuid::new_v4().to_string();
+        sniff_register(&registrar, &csid);
+        assert!(!t.report_coverage_once(), "nothing has moved yet");
+
+        t.note_sidechain_activity_at(&csid, 8, Instant::now());
+        assert_eq!(t.coverage().sidechain_heartbeats, 1);
+        assert!(
+            t.report_coverage_once(),
+            "a sidechain heartbeat alone must be reported"
+        );
+        assert!(!t.report_coverage_once(), "and only once");
     }
 
     /// A sidechain note for an UNBOUND parent sends nothing, so counts nothing.
