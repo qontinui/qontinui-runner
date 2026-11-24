@@ -88,10 +88,13 @@ pub fn normalize_registration(pages: Vec<PageLabelInput>) -> Result<Vec<Register
             .label
             .map(|l| truncate_label(l.trim()))
             .filter(|l| !l.is_empty());
+        // A window label is an identifier, not display text: keep it verbatim
+        // or drop it. A cut one would name no real window (plan D8 "never
+        // guessed"), so a label over the cap is dropped, not truncated.
         let window = page
             .window
-            .map(|w| truncate_label(w.trim()))
-            .filter(|w| !w.is_empty());
+            .map(|w| w.trim().to_string())
+            .filter(|w| !w.is_empty() && w.chars().count() <= MAX_LABEL_CHARS);
         ordered.push((
             position,
             RegisteredPage {
@@ -233,8 +236,8 @@ mod tests {
     }
 
     /// The window travels with each page: a pop-out label is kept, a blank
-    /// or absent one is no window, and an over-long one is capped like a
-    /// label.
+    /// or absent one is no window, and an over-long one is DROPPED (a cut
+    /// identifier would name no real window).
     #[test]
     fn each_page_keeps_the_window_it_is_shown_in() {
         let long = "w".repeat(MAX_LABEL_CHARS + 10);
@@ -251,8 +254,6 @@ mod tests {
             .into_iter()
             .map(|p| (p.page_id, p.window))
             .collect();
-        let mut cut = "w".repeat(MAX_LABEL_CHARS - 1);
-        cut.push(TRUNCATION_MARK);
         assert_eq!(
             windows,
             vec![
@@ -260,7 +261,7 @@ mod tests {
                 ("p-pop".to_string(), Some("terminal-popout-3".to_string())),
                 ("p-blank".to_string(), None),
                 ("p-old".to_string(), None),
-                ("p-long".to_string(), Some(cut)),
+                ("p-long".to_string(), None),
             ]
         );
     }
