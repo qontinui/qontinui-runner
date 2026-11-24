@@ -2197,9 +2197,9 @@ fn list_lifecycle_open_records_in(store: &SessionLifecycleStore) -> Vec<OpenLife
 /// already absent reports `false` rather than erroring, so a clear is
 /// idempotent.
 ///
-/// The marker goes FIRST, so a clear that removed anything at all has removed
-/// the marker: a clear that fails part-way never leaves the next open reading
-/// an emptied store as DEGRADED.
+/// The marker goes LAST, so a clear that fails part-way leaves it in place
+/// and the store keeps answering unheld sessions UNKNOWN — never a partly
+/// cleared store with no marker reading as clean.
 fn clear_lifecycle_store_at(path: &Path) -> Result<(bool, bool, bool), (StatusCode, String)> {
     let wal = crate::session::session_lifecycle_store::wal_path_for(path);
     // A degraded-load marker left by an earlier load would keep the cleared
@@ -2207,9 +2207,9 @@ fn clear_lifecycle_store_at(path: &Path) -> Result<(bool, bool, bool), (StatusCo
     let marker = crate::session::session_lifecycle_store::degraded_marker_path(path);
     let mut removed = [false; 3];
     for (slot, target) in [
-        (2usize, marker.as_path()),
         (0usize, path),
         (1usize, wal.as_path()),
+        (2usize, marker.as_path()),
     ] {
         match std::fs::remove_file(target) {
             Ok(()) => removed[slot] = true,

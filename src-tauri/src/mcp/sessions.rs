@@ -1210,8 +1210,9 @@ fn transcript_bind_env(
                         RecordUnknown::Degraded(DegradedLoad::FromEarlierLoad) => {
                             "lifecycle_store_unreadable: the lifecycle snapshot \
                              (`terminal-sessions*.json`) is DEGRADED by an earlier load: its \
-                             `.degraded` marker sits beside it; whatever that load preserved \
-                             is a `.quarantine-<ms>` sibling, and the runner log names both"
+                             `.degraded` marker sits beside it; a `.quarantine-<ms>` sibling \
+                             holds what that load preserved, if anything; that load's log line \
+                             says which"
                         }
                     }
                 })?
@@ -3956,6 +3957,35 @@ mod tests {
                 "{detail}"
             );
             assert!(!detail.contains("quarantine"), "{detail}");
+
+            // A snapshot that reads in full (`{}`) beside an EARLIER load's
+            // marker: the refusal hedges, because this load preserved nothing
+            // and cannot know what that one did.
+            let earlier_path = state_dir.join("earlier-terminal-sessions.json");
+            std::fs::write(&earlier_path, b"{}").unwrap();
+            std::fs::write(
+                crate::session::session_lifecycle_store::degraded_marker_path(&earlier_path),
+                b"{\"reason\":\"read failed\",\"degraded_at_ms\":1}\n",
+            )
+            .unwrap();
+            let earlier = Arc::new(SessionLifecycleStore::open(&earlier_path).unwrap());
+            let (status, v) =
+                call_route(&t, Some(&earlier), &watched, &bearer(&key), &body(&csid)).await;
+            let detail = refused(
+                status,
+                &v,
+                &outbox,
+                &[wd.as_str(), bound.as_str(), state_dir_str.as_str()],
+            );
+            assert!(detail.contains("DEGRADED by an earlier load"), "{detail}");
+            assert!(
+                detail.contains(
+                    "a `.quarantine-<ms>` sibling holds what that load preserved, if anything; \
+                     that load's log line says which"
+                ),
+                "{detail}"
+            );
+            assert!(!detail.contains("original is preserved"), "{detail}");
 
             let store = Arc::new(
                 SessionLifecycleStore::open(state_dir.join("terminal-sessions.json")).unwrap(),

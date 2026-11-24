@@ -6256,7 +6256,7 @@ fn report_still_degraded(path: &Path) {
     error!(
         marker = %degraded_marker_path(path).display(),
         snapshot = %path.display(),
-        "session_lifecycle_store: snapshot is still DEGRADED from an earlier load — sessions it does not hold read UNKNOWN. Whatever that load preserved is a `.quarantine-<ms>` sibling of the snapshot, if anything is (that load's log line says which). To end the state by hand: delete the marker; it takes effect on the next open or reload"
+        "session_lifecycle_store: snapshot is still DEGRADED from an earlier load — sessions it does not hold read UNKNOWN. A `.quarantine-<ms>` sibling of the snapshot holds what that load preserved, if anything; that load's log line says which. To end the state by hand: delete the marker; it takes effect on the next open or reload"
     );
 }
 
@@ -6287,6 +6287,9 @@ thread_local! {
     /// only.
     static FORCE_READ_ERROR_FOR_TEST: std::cell::Cell<Option<std::io::ErrorKind>> =
         const { std::cell::Cell::new(None) };
+    /// Test seam: make [`copy_synced`] fail AFTER it created the destination
+    /// (and wrote part of it), on this thread only.
+    static FAIL_COPY_AFTER_CREATE_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Write `bytes` to `path` and fsync the file. `create_new` refuses an
@@ -6321,6 +6324,57 @@ fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Why [`copy_synced`] did not preserve the file.
+enum CopyFailure {
+    /// The destination already existed (`create_new`): nothing was written
+    /// and nothing is removed.
+    Collision(std::io::Error),
+    /// The copy itself failed; any partial file THIS call created is gone.
+    Copy(std::io::Error),
+}
+
+/// Copy `src` to a NEW file `dst` and fsync it. The destination is created
+/// with `create_new`, so an existing file is never touched; a copy that fails
+/// after creating it removes the partial file it created (a partial
+/// "preserved original" is worse than none), and only that one.
+fn copy_synced(src: &Path, dst: &Path) -> Result<(), CopyFailure> {
+    let mut from = std::fs::File::open(src).map_err(CopyFailure::Copy)?;
+    let mut to = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dst)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(CopyFailure::Collision(e))
+        }
+        Err(e) => return Err(CopyFailure::Copy(e)),
+    };
+    let copied = (|| -> std::io::Result<()> {
+        #[cfg(test)]
+        if FAIL_COPY_AFTER_CREATE_FOR_TEST.with(|f| f.get()) {
+            to.write_all(b"partial")?;
+            return Err(std::io::Error::other("test seam: copy failed after create"));
+        }
+        std::io::copy(&mut from, &mut to)?;
+        to.sync_all()
+    })();
+    if let Err(e) = copied {
+        drop(to);
+        match std::fs::remove_file(dst) {
+            Ok(()) => {}
+            Err(rm) if rm.kind() == std::io::ErrorKind::NotFound => {}
+            Err(rm) => warn!(
+                error = %rm,
+                path = %dst.display(),
+                "session_lifecycle_store: failed to remove a partial quarantine copy"
+            ),
+        }
+        return Err(CopyFailure::Copy(e));
+    }
+    Ok(())
+}
+
 /// An earlier quarantine copy of `path` holding exactly `bytes`, if any — a
 /// repeat of the same degraded load preserves nothing new.
 fn existing_quarantine_with(path: &Path, bytes: &[u8]) -> Option<PathBuf> {
@@ -6347,7 +6401,8 @@ fn existing_quarantine_with(path: &Path, bytes: &[u8]) -> Option<PathBuf> {
 ///    and time survive a repeat;
 /// 2. preserve the original as `<snapshot>.quarantine-<ms>`, fsynced: the
 ///    bytes this load read (skipped when an earlier quarantine already holds
-///    exactly those bytes), else a copy, else — only for a file this process
+///    exactly those bytes and can be fsynced), else a copy ([`copy_synced`]),
+///    else — only for a file this process
 ///    may not read (`PermissionDenied`) or a directory (`IsADirectory`) — a
 ///    rename, which needs no read. Any other read error leaves the file where
 ///    it is, unpreserved;
@@ -6384,34 +6439,26 @@ fn quarantine_degraded_snapshot(path: &Path, original: Original<'_>, reason: &st
             ));
         }
         match original {
-            Original::Read(b) => match existing_quarantine_with(path, b) {
-                Some(same) => {
-                    // An earlier copy holds these bytes; make sure IT is
-                    // durable before relying on it, then fall through to the
-                    // directory fsync like a fresh copy.
-                    std::fs::OpenOptions::new()
-                        .write(true)
-                        .open(&same)?
-                        .sync_all()?;
+            Original::Read(b) => {
+                // An earlier copy holding exactly these bytes is relied on only
+                // once IT is durable. The fsync goes through a READ-ONLY handle,
+                // so a read-only quarantine (mode 0444, another owner, the
+                // Windows read-only attribute) still counts; where even that
+                // fails, a fresh copy is written instead of giving up.
+                let durable_same = existing_quarantine_with(path, b)
+                    .filter(|same| std::fs::File::open(same).and_then(|f| f.sync_all()).is_ok());
+                if let Some(same) = durable_same {
                     sync_parent_dir(path)?;
                     return Ok(same);
                 }
-                None => write_synced(&quarantine, b, true)?,
-            },
-            Original::Unreadable(kind) => match std::fs::copy(path, &quarantine) {
-                Ok(_) => std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(&quarantine)?
-                    .sync_all()?,
-                Err(copy_err) => {
-                    // A failed copy may have left a partial file under the
-                    // quarantine name; a partial "preserved original" is worse
-                    // than none.
-                    match std::fs::remove_file(&quarantine) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(e) => return Err(e),
-                    }
+                write_synced(&quarantine, b, true)?;
+            }
+            Original::Unreadable(kind) => match copy_synced(path, &quarantine) {
+                Ok(()) => {}
+                // The quarantine name was already taken: nothing of ours is
+                // there, and preservation failed — as on the write path.
+                Err(CopyFailure::Collision(e)) => return Err(e),
+                Err(CopyFailure::Copy(copy_err)) => {
                     if matches!(
                         kind,
                         std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::IsADirectory
@@ -7679,10 +7726,6 @@ mod tests {
             RecordUnknown::Degraded(DegradedLoad::FromEarlierLoad),
             "the reopen read the compacted snapshot in full; the marker is an earlier load's"
         );
-        assert!(matches!(
-            store.get_checked("absent"),
-            Err(RecordUnknown::Degraded(_))
-        ));
         assert!(store.get_checked("recorded-since").unwrap().is_some());
     }
 
@@ -7854,6 +7897,80 @@ mod tests {
         store.compact();
         assert!(path.is_dir(), "never overwritten");
         assert_eq!(std::fs::read(path.join("inside")).unwrap(), b"kept");
+    }
+
+    /// A1 (round-5 review): an earlier quarantine that is READ-ONLY (mode
+    /// 0444) still dedupes — its fsync goes through a read-only handle — so
+    /// the load is Quarantined, never OnlyCopy.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_earlier_quarantine_still_counts_as_preserved() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let older = path.with_extension("json.quarantine-1");
+        std::fs::write(&older, b"[]").unwrap();
+        std::fs::set_permissions(&older, std::fs::Permissions::from_mode(0o444)).unwrap();
+        if std::fs::OpenOptions::new().write(true).open(&older).is_ok() {
+            // A user permissions do not bind (root) can write a 0444 file, so
+            // the read-only case cannot be produced this way.
+            eprintln!("skipped: this user can write a mode-0444 file");
+            return;
+        }
+        std::fs::write(&path, b"[]").unwrap();
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        assert_eq!(
+            store.get_checked("absent").unwrap_err(),
+            RecordUnknown::Degraded(DegradedLoad::Quarantined)
+        );
+        assert_eq!(
+            quarantined(&path),
+            vec![older],
+            "deduped onto the read-only copy"
+        );
+    }
+
+    /// A5 (round-5 review): a copy that fails AFTER creating its destination
+    /// removes the partial file it created — no half-written "preserved
+    /// original" is left behind.
+    #[test]
+    fn a_copy_failing_after_create_leaves_no_partial_quarantine() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        std::fs::write(&path, b"{}").unwrap();
+        // The read "fails" with a kind that has no rename fallback, so the
+        // copy is the only preservation attempted.
+        FORCE_READ_ERROR_FOR_TEST.with(|f| f.set(Some(std::io::ErrorKind::Interrupted)));
+        FAIL_COPY_AFTER_CREATE_FOR_TEST.with(|f| f.set(true));
+        let store = SessionLifecycleStore::open(&path);
+        FAIL_COPY_AFTER_CREATE_FOR_TEST.with(|f| f.set(false));
+        FORCE_READ_ERROR_FOR_TEST.with(|f| f.set(None));
+        let store = store.unwrap();
+        assert!(
+            quarantined(&path).is_empty(),
+            "the partial copy was removed"
+        );
+        assert_eq!(
+            store.get_checked("absent").unwrap_err(),
+            RecordUnknown::Degraded(DegradedLoad::OnlyCopy)
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"{}", "left in place");
+    }
+
+    /// A copy whose destination name is already TAKEN is a failed
+    /// preservation, and the existing file is not removed.
+    #[test]
+    fn a_quarantine_name_collision_is_a_failed_preservation() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        std::fs::write(&src, b"new").unwrap();
+        std::fs::write(&dst, b"someone else's").unwrap();
+        assert!(matches!(
+            copy_synced(&src, &dst),
+            Err(CopyFailure::Collision(_))
+        ));
+        assert_eq!(std::fs::read(&dst).unwrap(), b"someone else's");
     }
 
     /// The quarantine dedupe compares BYTES: an earlier quarantine holding
