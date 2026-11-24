@@ -2261,6 +2261,33 @@ mod visibility_tests {
         assert_eq!(ids, vec!["first-blank", "second-text", "third-blank"]);
     }
 
+    /// The stable order holds past the small-slice cutoff. Rust's unstable
+    /// sort is insertion sort (stable in practice) for slices of 20 or fewer,
+    /// so the three-entry test above cannot tell `sort_by` from
+    /// `sort_unstable_by`; 33 alternating 50/90 ties can.
+    #[test]
+    fn clipped_ties_keep_registry_order_beyond_the_small_sort_cutoff() {
+        let elements: Vec<serde_json::Value> = (0..33)
+            .map(|i| {
+                let pct = if i % 2 == 0 { 50 } else { 90 };
+                el(&format!("e{i:02}"), "", json!({ "clippedPct": pct }))
+            })
+            .collect();
+        let report = build_visibility_report(&elements, 0.02, false, None);
+        let ids: Vec<String> = report["clipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["element"].as_str().unwrap().to_string())
+            .collect();
+        let expected: Vec<String> = (1..33)
+            .step_by(2)
+            .chain((0..33).step_by(2))
+            .map(|i| format!("e{i:02}"))
+            .collect();
+        assert_eq!(ids, expected);
+    }
+
     /// Relayed: a clipped entry keeps only `ratio` and `scrollReachable`; its
     /// id, label and text never reach the wire. Fails if the relay filter
     /// stops walking `clipped[]`.

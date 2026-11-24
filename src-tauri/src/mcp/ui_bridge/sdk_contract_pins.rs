@@ -305,8 +305,9 @@ fn visibility_report_pins_the_sdk_report_level_keys() {
         report["occlusions"].is_array(),
         "`occlusions` is the SDK's entry list"
     );
-    assert!(
-        report["clipped"].is_array(),
+    assert_eq!(
+        report["clipped"].as_array().map(Vec::len),
+        Some(0),
         "`clipped` is a required key of the SDK's VisibilityReport, present \
          (empty) even when nothing is clipped"
     );
