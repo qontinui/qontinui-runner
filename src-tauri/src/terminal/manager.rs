@@ -1038,6 +1038,8 @@ impl TerminalManager {
             "terminal-page-changed",
             &payload,
         );
+        // The session's page moved: post the census early (D7b).
+        crate::session_placement::request_census_post();
         Ok(())
     }
 
@@ -1065,6 +1067,8 @@ impl TerminalManager {
 
         if let Some(session) = session {
             session.close();
+            // A terminal closed: its session leaves the census early (D7d).
+            crate::session_placement::request_census_post();
             Ok(())
         } else {
             Err(format!("Terminal session not found: {}", id))
@@ -1227,6 +1231,7 @@ impl TerminalManager {
         match session {
             Some(session) => {
                 session.close_after_graceful_exit();
+                crate::session_placement::request_census_post();
                 Ok(())
             }
             None => Err(format!("Terminal session not found: {}", id)),

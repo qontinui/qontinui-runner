@@ -1413,6 +1413,7 @@ mod tests {
             page_id: id.to_string(),
             label: Some(label.to_string()),
             order,
+            window: None,
         };
         let labels = PageLabels::new(
             vec![

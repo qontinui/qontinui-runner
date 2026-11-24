@@ -289,6 +289,7 @@ mod semantic_conventions;
 mod served_corpus;
 mod server_mode;
 mod session; // Plan 2026-05-22-coord-native-session-coordination Phase 2 — unified Session primitive
+mod session_placement; // Runner page/terminal/window placement on the session census + debounced early census post (plan 2026-11-16-runner-page-name-reaches-the-coord-session-identity-card, Phase 4)
 mod session_pr_reconciler; // Runner-local per-session PR attribution → project.session_prs (Terminal dropdown)
                            // Hook-free, runner-side WIP-attribution capture (mirrors fleet::tree_publisher).
                            // Reads each hosted session's transcript and POSTs file-edit attribution to
