@@ -6303,8 +6303,42 @@ fn write_synced(path: &Path, bytes: &[u8], create_new: bool) -> std::io::Result<
         opts.create(true).truncate(true);
     }
     let mut f = opts.open(path)?;
-    f.write_all(bytes)?;
-    f.sync_all()
+    let written = f.write_all(bytes).and_then(|()| f.sync_all());
+    if let Err(e) = written {
+        if create_new {
+            // This call created the file: a half-written one must not be
+            // left behind under its name.
+            drop(f);
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(rm) if rm.kind() == std::io::ErrorKind::NotFound => {}
+                Err(rm) => warn!(
+                    error = %rm,
+                    path = %path.display(),
+                    "session_lifecycle_store: failed to remove a partially written file"
+                ),
+            }
+        }
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// fsync an EXISTING file. A write handle first: on Windows `sync_all` is
+/// `FlushFileBuffers`, which requires write access, so a read-only handle
+/// always fails there. Only on Unix, where `fsync` works on a read-only
+/// descriptor, does a `PermissionDenied` open fall back to one, so a
+/// read-only file (mode 0444, another owner) can still be made durable. On
+/// Windows any failure is an `Err`.
+fn fsync_existing(p: &Path) -> std::io::Result<()> {
+    match std::fs::OpenOptions::new().write(true).open(p) {
+        Ok(f) => f.sync_all(),
+        #[cfg(unix)]
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            std::fs::File::open(p)?.sync_all()
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// fsync the directory holding `path`, so the names created in it (the marker,
@@ -6441,12 +6475,12 @@ fn quarantine_degraded_snapshot(path: &Path, original: Original<'_>, reason: &st
         match original {
             Original::Read(b) => {
                 // An earlier copy holding exactly these bytes is relied on only
-                // once IT is durable. The fsync goes through a READ-ONLY handle,
-                // so a read-only quarantine (mode 0444, another owner, the
-                // Windows read-only attribute) still counts; where even that
-                // fails, a fresh copy is written instead of giving up.
-                let durable_same = existing_quarantine_with(path, b)
-                    .filter(|same| std::fs::File::open(same).and_then(|f| f.sync_all()).is_ok());
+                // once IT is durable ([`fsync_existing`]). On Unix a read-only
+                // quarantine (mode 0444, another owner) is fsynced through a
+                // read-only handle and still counts. Wherever the fsync fails,
+                // a fresh copy is written instead of giving up.
+                let durable_same =
+                    existing_quarantine_with(path, b).filter(|same| fsync_existing(same).is_ok());
                 if let Some(same) = durable_same {
                     sync_parent_dir(path)?;
                     return Ok(same);
@@ -7928,6 +7962,34 @@ mod tests {
             vec![older],
             "deduped onto the read-only copy"
         );
+    }
+
+    /// `fsync_existing` on an ordinary writable file succeeds on every OS —
+    /// the case the quarantine dedupe relies on.
+    #[test]
+    fn fsync_existing_syncs_a_writable_file() {
+        let dir = tempdir().unwrap();
+        let f = dir.path().join("plain");
+        std::fs::write(&f, b"bytes").unwrap();
+        fsync_existing(&f).unwrap();
+        assert_eq!(std::fs::read(&f).unwrap(), b"bytes");
+    }
+
+    /// Unix: a file this user may not open for writing (mode 0444) is
+    /// fsynced through the read-only fallback.
+    #[cfg(unix)]
+    #[test]
+    fn fsync_existing_falls_back_to_a_read_only_handle_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let f = dir.path().join("read-only");
+        std::fs::write(&f, b"bytes").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o444)).unwrap();
+        if std::fs::OpenOptions::new().write(true).open(&f).is_ok() {
+            eprintln!("skipped: this user can write a mode-0444 file");
+            return;
+        }
+        fsync_existing(&f).unwrap();
     }
 
     /// A5 (round-5 review): a copy that fails AFTER creating its destination
