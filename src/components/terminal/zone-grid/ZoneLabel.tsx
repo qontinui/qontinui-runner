@@ -6,6 +6,7 @@ import type { ZoneAssignments, SessionState } from "../useZoneLayout";
 import { STATE_BORDER_COLORS, ZONE_HEADER_HEIGHT_PX } from "./constants";
 import { isNonDurablePty, NON_DURABLE_TOOLTIP, NON_DURABLE_LABEL } from "../sessionDurability";
 import { TenantBadge } from "../TenantBadge";
+import { HolderBadge } from "../HolderBadge";
 import { RemoteTabControls } from "../RemoteTabControls";
 import { useTerminalWindowActions } from "../useTerminalWindowActions";
 import { SessionInfoDropdown } from "../SessionInfoDropdown";
@@ -220,6 +221,11 @@ export function ZoneLabel({
           <span className="truncate">{NON_DURABLE_LABEL}</span>
         </span>
       )}
+
+      {/* Plan 2026-11-24 D7: a pane that would not survive a runner upgrade
+          (in-process PTY, or a holder in the runner's cgroup) says so. Remote
+          and plan tabs have no local pane to ask about. */}
+      {tab.type !== "plan" && !tab.remote && <HolderBadge terminalId={tab.id} />}
 
       {/* F1 — which tenant this session is acting as. Self-hides on a
           single-tenant device, and when nothing names a tenant: no spawn

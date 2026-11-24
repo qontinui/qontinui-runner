@@ -274,12 +274,22 @@ pub(crate) fn get_terminal_manager(state: &ApiState) -> Arc<TerminalManager> {
 /// The field NAME is a contract: `qontinui-claude-config`'s
 /// `/triage-sessions` reads it to decide whether a non-bypass session can be
 /// typed into without answering a dialog.
+///
+/// A LOCAL pane also carries its holder state flattened in — `holder`,
+/// `upgradeSafe` and `notUpgradeSafe` (plan
+/// `2026-11-24-runner-upgrades-itself-daily-keeping-sessions-alive-with-no-outage-and-automatic-rollback`
+/// D7): `holder: false` names, machine-readably, why the pane runs inside the
+/// runner (`holder_disabled`, `holder_spawn_failed` with its `kind`) and
+/// `unprotected_cgroup` a holder that dies with the runner's unit. A remote
+/// mirror carries none of the three keys.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TerminalListEntry {
     #[serde(flatten)]
     pub info: crate::terminal::types::TerminalInfo,
     pub permission_request_hook: &'static str,
+    #[serde(flatten)]
+    pub holder: Option<crate::terminal::daemon_pane_io::HolderState>,
 }
 
 /// Build the listing rows. PURE.
@@ -288,9 +298,14 @@ pub(crate) fn terminal_list_entries(
         crate::terminal::types::TerminalInfo,
         crate::session::claude_hook::PermissionRequestHook,
     )>,
+    holder_states: &std::collections::HashMap<
+        String,
+        Option<crate::terminal::daemon_pane_io::HolderState>,
+    >,
 ) -> Vec<TerminalListEntry> {
     rows.into_iter()
         .map(|(info, hook)| TerminalListEntry {
+            holder: holder_states.get(&info.id).cloned().flatten(),
             info,
             permission_request_hook: hook.as_str(),
         })
@@ -302,7 +317,13 @@ pub async fn list_terminals_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let terminal_manager = get_terminal_manager(&state);
-    let terminals = terminal_list_entries(terminal_manager.list_with_permission_request_hooks());
+    let holder_states = terminal_manager
+        .holder_states()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+    let terminals = terminal_list_entries(
+        terminal_manager.list_with_permission_request_hooks(),
+        &holder_states,
+    );
 
     Ok(Json(ApiResponse::success(serde_json::json!({
         "terminals": terminals
@@ -1488,10 +1509,13 @@ mod tests {
             total_bytes_produced: 7,
             page_id: "default".to_string(),
         };
-        let rows = terminal_list_entries(vec![
-            (info("t-reg", 1), PermissionRequestHook::Registered),
-            (info("t-abs", 2), PermissionRequestHook::Absent),
-        ]);
+        let rows = terminal_list_entries(
+            vec![
+                (info("t-reg", 1), PermissionRequestHook::Registered),
+                (info("t-abs", 2), PermissionRequestHook::Absent),
+            ],
+            &std::collections::HashMap::new(),
+        );
         let v = serde_json::to_value(&rows).unwrap();
         assert_eq!(v[0]["permissionRequestHook"], "registered");
         assert_eq!(v[1]["permissionRequestHook"], "absent");
@@ -1505,6 +1529,56 @@ mod tests {
             plain.as_object().unwrap().len() + 1,
             "exactly one key added"
         );
+    }
+
+    /// Plan 2026-11-24 D7: a fallback pane's row carries `holder: false` and
+    /// the machine-readable reason; a holder pane `holder: true`; a remote
+    /// mirror (no state) none of the keys.
+    #[test]
+    fn terminal_rows_carry_the_structured_holder_state() {
+        use crate::session::claude_hook::PermissionRequestHook;
+        use crate::terminal::daemon_pane_io::{HolderState, NotUpgradeSafe};
+        let info = |id: &str| crate::terminal::types::TerminalInfo {
+            id: id.to_string(),
+            title: "T".to_string(),
+            pid: None,
+            cols: 80,
+            rows: 24,
+            working_dir: "/w".to_string(),
+            is_alive: true,
+            exit_code: None,
+            created_at: 1,
+            total_bytes_produced: 0,
+            page_id: "default".to_string(),
+        };
+        let states = std::collections::HashMap::from([
+            (
+                "t-fallback".to_string(),
+                Some(HolderState::in_process(NotUpgradeSafe::HolderSpawnFailed {
+                    kind: "child_enoent".into(),
+                    detail: "PTY holder spawn failed: …".into(),
+                })),
+            ),
+            ("t-holder".to_string(), Some(HolderState::holder(None))),
+            ("t-remote".to_string(), None),
+        ]);
+        let rows = terminal_list_entries(
+            vec![
+                (info("t-fallback"), PermissionRequestHook::Absent),
+                (info("t-holder"), PermissionRequestHook::Absent),
+                (info("t-remote"), PermissionRequestHook::Absent),
+            ],
+            &states,
+        );
+        let v = serde_json::to_value(&rows).unwrap();
+        assert_eq!(v[0]["holder"], false);
+        assert_eq!(v[0]["upgradeSafe"], false);
+        assert_eq!(v[0]["notUpgradeSafe"]["reason"], "holder_spawn_failed");
+        assert_eq!(v[0]["notUpgradeSafe"]["kind"], "child_enoent");
+        assert_eq!(v[1]["holder"], true);
+        assert_eq!(v[1]["upgradeSafe"], true);
+        assert!(v[1]["notUpgradeSafe"].is_null());
+        assert!(v[2].get("holder").is_none(), "{}", v[2]);
     }
 
     /// The handler serves the rows from the hook-aware listing, not the bare

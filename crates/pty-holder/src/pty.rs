@@ -387,12 +387,18 @@ fn other(e: impl std::fmt::Display) -> io::Error {
 
 /// The child's command. The environment is CLEARED and replaced by exactly
 /// `spec.env` (plan D6: nothing of the holder's own environment reaches the
-/// pane).
-fn build_command(spec: &ChildSpec) -> CommandBuilder {
+/// pane). `program`, when `Some`, replaces `argv[0]`: it is the path
+/// [`resolve_program`] found for THIS attempt (portable-pty execs the resolved
+/// path with `argv[0]` set to it either way, so the child sees no difference).
+fn build_command(spec: &ChildSpec, program: Option<std::ffi::OsString>) -> CommandBuilder {
     let mut cmd = if spec.argv.is_empty() {
         CommandBuilder::new_default_prog()
     } else {
-        CommandBuilder::from_argv(spec.argv.clone())
+        let mut argv = spec.argv.clone();
+        if let Some(program) = program {
+            argv[0] = program;
+        }
+        CommandBuilder::from_argv(argv)
     };
     cmd.env_clear();
     for (k, v) in &spec.env {
@@ -402,6 +408,133 @@ fn build_command(spec: &ChildSpec) -> CommandBuilder {
         cmd.cwd(cwd);
     }
     cmd
+}
+
+/// Spawn the pane's child on `slave`, retrying a transient launch failure
+/// (plan `2026-11-24-runner-upgrades-itself-daily-keeping-sessions-alive-with-no-outage-and-automatic-rollback`
+/// D7 (2a)): the Claude CLI's auto-updater moves `bin/claude` aside for about
+/// 2 s, and a pane spawned in that window used to make the holder exit 5 and
+/// the runner fall back to an in-process PTY that dies with the runner.
+///
+/// The program is RESOLVED AGAIN on every attempt ([`resolve_program`]), never
+/// cached from the first: a reinstall re-creates the file (or the PATH entry)
+/// it replaces, and only a fresh lookup sees it. What is transient is decided
+/// by [`crate::transient::transient_kind`], the classifier the runner's
+/// headless spawns use; descriptor exhaustion stays a one-attempt hard error,
+/// reported as `cause=emfile`.
+pub(crate) fn spawn_child_with_retry(
+    slave: &dyn portable_pty::SlavePty,
+    spec: &ChildSpec,
+    delays: &[Duration],
+    sleep: impl FnMut(Duration),
+) -> Result<Box<dyn portable_pty::Child + Send + Sync>, crate::transient::SpawnFailure> {
+    use crate::transient::{retry_transient_sync, AttemptError};
+    retry_transient_sync(
+        delays,
+        || {
+            let program = resolve_program(spec)?;
+            slave
+                .spawn_command(build_command(spec, program))
+                .map_err(|e| match e.downcast::<io::Error>() {
+                    // A failed exec (`ENOENT` / `ETXTBSY` / `ENOEXEC`, reported
+                    // through std's exec-error pipe — the vendored
+                    // portable-pty patch keeps it open) or a failed fork/pipe
+                    // (`EMFILE`): typed, so it is classified.
+                    Ok(io) => AttemptError::from(io),
+                    // portable-pty's own refusals carry no errno.
+                    Err(other) => AttemptError {
+                        error: io::Error::other(other.to_string()),
+                        text: other.to_string(),
+                    },
+                })
+        },
+        sleep,
+    )
+}
+
+/// The program this attempt will exec, looked up NOW the way portable-pty
+/// would (`cmdbuilder.rs` `search_path`), so a missing or not-yet-executable
+/// file is a TYPED error the retry can classify, instead of portable-pty's
+/// errno-less text. `Ok(None)` = no override (the default shell, or a platform
+/// where portable-pty's own lookup is kept).
+#[cfg(unix)]
+fn resolve_program(
+    spec: &ChildSpec,
+) -> Result<Option<std::ffi::OsString>, crate::transient::AttemptError> {
+    use std::path::{Path, PathBuf};
+    let Some(exe) = spec.argv.first() else {
+        return Ok(None);
+    };
+    let exe_path = Path::new(exe);
+    let executable = |p: &Path| -> io::Result<()> {
+        let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes())
+            .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+        // SAFETY: `c` is a valid NUL-terminated path for the call's duration.
+        if unsafe { libc::access(c.as_ptr(), libc::X_OK) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    };
+    if exe_path.is_absolute() {
+        return match executable(exe_path) {
+            Ok(()) => Ok(Some(exe_path.as_os_str().to_owned())),
+            Err(error) => Err(crate::transient::AttemptError {
+                text: format!(
+                    "Unable to spawn {} because it doesn't exist on the filesystem or is not \
+                     executable ({error})",
+                    exe_path.display()
+                ),
+                error,
+            }),
+        };
+    }
+    // Relative: the child's cwd first (portable-pty uses the home dir when the
+    // cwd is not a directory), then the CHILD's PATH — `spec.env`, the
+    // environment the child gets, never the holder's own.
+    let env = |k: &str| {
+        spec.env
+            .iter()
+            .find(|(n, _)| n == k)
+            .map(|(_, v)| v.as_os_str())
+    };
+    let base: Option<PathBuf> = spec
+        .cwd
+        .as_deref()
+        .map(PathBuf::from)
+        .filter(|d| d.is_dir())
+        .or_else(|| env("HOME").map(PathBuf::from));
+    if let Some(base) = base {
+        let candidate = base.join(exe_path);
+        if candidate.exists() {
+            return Ok(Some(candidate.into_os_string()));
+        }
+    }
+    if let Some(path) = env("PATH") {
+        for dir in std::env::split_paths(path) {
+            let candidate = dir.join(exe_path);
+            if executable(&candidate).is_ok() {
+                return Ok(Some(candidate.into_os_string()));
+            }
+        }
+    }
+    Err(crate::transient::AttemptError {
+        error: io::Error::from_raw_os_error(libc::ENOENT),
+        text: format!(
+            "Unable to spawn {} because it doesn't exist on the filesystem and was not found \
+             in PATH",
+            exe_path.display()
+        ),
+    })
+}
+
+/// Windows: portable-pty's own lookup (PATHEXT, `.exe` suffixing) is kept; a
+/// failed `CreateProcessW` still arrives typed and is classified the same way.
+#[cfg(not(unix))]
+fn resolve_program(
+    _spec: &ChildSpec,
+) -> Result<Option<std::ffi::OsString>, crate::transient::AttemptError> {
+    Ok(None)
 }
 
 /// What a successor holder adopts (plan Phase 8): everything
@@ -433,10 +566,16 @@ impl Pane {
                 pixel_height: 0,
             })
             .map_err(|e| other(format!("openpty: {e}")))?;
-        let child = pair
-            .slave
-            .spawn_command(build_command(spec))
-            .map_err(|e| other(format!("spawn: {e}")))?;
+        let child = spawn_child_with_retry(
+            pair.slave.as_ref(),
+            spec,
+            &crate::transient::SPAWN_RETRY_DELAYS,
+            std::thread::sleep,
+        )
+        .map_err(|f| {
+            let e = f.into_io_error();
+            io::Error::new(e.kind(), format!("spawn: {e}"))
+        })?;
         // The holder keeps only the master; the child holds the slave, so the
         // master sees EOF once the child (and anything it left holding the
         // slave) is gone.
@@ -1644,5 +1783,75 @@ mod tests {
         let other = drain_refusal(true, false).unwrap();
         assert!(other.contains("cannot be drained without risking silent input loss"));
         assert!(other.contains("Linux only"));
+    }
+
+    /// Plan 2026-11-24 D7 (2a): the child's program missing at the first
+    /// attempt (a CLI reinstall window) is retried, and the retry RE-RESOLVES
+    /// the path — the file the "reinstall" puts back during the first back-off
+    /// is what the second attempt execs. EMFILE-class and other non-transient
+    /// failures are not retried (`transient`'s own tests).
+    #[cfg(unix)]
+    #[test]
+    fn pty_holder_child_spawn_rides_out_a_missing_program() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "ptyh-enoent-{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let program = dir.join("claude");
+        let mut spec = ChildSpec::new(vec![program.clone().into()]);
+        spec.cwd = Some(dir.clone().into());
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut slept = Vec::new();
+        let mut child = spawn_child_with_retry(
+            pair.slave.as_ref(),
+            &spec,
+            &crate::transient::SPAWN_RETRY_DELAYS,
+            |d| {
+                slept.push(d);
+                std::fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
+                std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+            },
+        )
+        .expect("the reinstalled program spawns on the retry");
+        // At least the first back-off was taken (a concurrent test's fork can
+        // hold the fresh file open for writing — ETXTBSY — which is itself a
+        // transient kind and costs one more).
+        assert_eq!(slept.first(), Some(&crate::transient::SPAWN_RETRY_DELAYS[0]));
+        let _ = child.wait();
+
+        // A program that never comes back: every attempt is made, and the
+        // failure names its cause for the runner.
+        let missing = dir.join("never");
+        let spec = ChildSpec::new(vec![missing.into()]);
+        let mut attempts = 0;
+        let err = spawn_child_with_retry(
+            pair.slave.as_ref(),
+            &spec,
+            &crate::transient::SPAWN_RETRY_DELAYS,
+            |_| attempts += 1,
+        )
+        .err()
+        .expect("never spawns");
+        assert_eq!(attempts, crate::transient::SPAWN_RETRY_DELAYS.len());
+        assert_eq!(err.cause, "enoent");
+        let text = err.into_io_error().to_string();
+        assert!(
+            text.starts_with("Unable to spawn ") && text.contains("[cause=enoent attempts=4"),
+            "{text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
