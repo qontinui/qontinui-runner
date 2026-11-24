@@ -359,6 +359,7 @@ mod tests {
             tenant: None,
             grant_jti: jti.to_string(),
             history_available: false,
+            last_reattach: None,
         }
     }
 

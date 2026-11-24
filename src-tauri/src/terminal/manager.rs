@@ -1658,6 +1658,7 @@ mod tests {
                 remote_terminal_id: "remote-term".into(),
                 grant_jti: "jti-1".into(),
                 history_available: false,
+                tenant: None,
                 last_reattach: None,
             },
         );
