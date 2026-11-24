@@ -51,7 +51,7 @@
 //! so a coord outage costs one bounded probe per window, not one per append.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -104,6 +104,19 @@ pub fn identity_from_path(path: &Path) -> Option<TranscriptIdentity> {
     })
 }
 
+/// The parent session of a SUBAGENT SIDECHAIN: its key and its own
+/// transcript. See [`sidechain_owner`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidechainOwner {
+    /// The parent's session key — its Claude Code session id.
+    pub key: String,
+    /// The parent's own transcript, `<config>/projects/<cwd>/<sid>.jsonl`:
+    /// the path a bind of the parent is attempted for
+    /// ([`spawn_ensure_bound`]), since the sidechain's own path names no
+    /// session.
+    pub path: PathBuf,
+}
+
 /// The session a SUBAGENT SIDECHAIN belongs to, read from its path alone.
 ///
 /// Claude Code writes a subagent's transcript to
@@ -115,12 +128,12 @@ pub fn identity_from_path(path: &Path) -> Option<TranscriptIdentity> {
 /// `2026-11-23-coord-closes-a-session-parked-on-background-subagents-and-the-heartbeat-d2-veto-fires-its-net`
 /// Phase 2).
 ///
-/// Returns the parent's session key (its Claude Code session id) only when the
-/// path has exactly that shape AND the sibling parent path
-/// `<config>/projects/<cwd>/<sid>.jsonl` passes [`identity_from_path`] — the
-/// UUID and `projects`-depth checks are that parser's, not a second one.
-/// `None` otherwise, including for a top-level transcript.
-pub fn owning_session_key(path: &Path) -> Option<String> {
+/// Returns the parent only when the path has exactly that shape AND the
+/// sibling parent path `<config>/projects/<cwd>/<sid>.jsonl` passes
+/// [`identity_from_path`] — the UUID and `projects`-depth checks are that
+/// parser's, not a second one. `None` otherwise, including for a top-level
+/// transcript. The parent file need not exist.
+pub fn sidechain_owner(path: &Path) -> Option<SidechainOwner> {
     if path.extension()?.to_str()? != "jsonl" {
         return None;
     }
@@ -131,7 +144,14 @@ pub fn owning_session_key(path: &Path) -> Option<String> {
     let session_dir = subagents.parent()?;
     let sid = session_dir.file_name()?.to_str()?;
     let parent = session_dir.with_file_name(format!("{sid}.jsonl"));
-    identity_from_path(&parent).map(|id| id.claude_session_id)
+    let key = identity_from_path(&parent)?.claude_session_id;
+    Some(SidechainOwner { key, path: parent })
+}
+
+/// [`sidechain_owner`]'s key alone: the parent session id of a subagent
+/// sidechain path, `None` for anything else.
+pub fn owning_session_key(path: &Path) -> Option<String> {
+    sidechain_owner(path).map(|o| o.key)
 }
 
 /// What to do with a transcript given what coord said.
@@ -747,6 +767,17 @@ mod tests {
             .join(CSID)
             .join("subagents/agent-a1b2c3.jsonl");
         assert_eq!(owning_session_key(&p).as_deref(), Some(CSID));
+        // The owner's own transcript is the path a bind of the parent is
+        // attempted for.
+        let owner = sidechain_owner(&p).expect("a sidechain has an owner");
+        assert_eq!(
+            owner.path,
+            Path::new("/home/u/.claude-gmail/projects/-home-u-proj").join(format!("{CSID}.jsonl"))
+        );
+        assert_eq!(
+            identity_from_path(&owner.path).unwrap().claude_session_id,
+            CSID
+        );
     }
 
     #[test]

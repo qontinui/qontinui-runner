@@ -52,10 +52,28 @@
 //! `2026-11-23-coord-closes-a-session-parked-on-background-subagents-and-the-heartbeat-d2-veto-fires-its-net`
 //! Phase 2). The watcher therefore also calls
 //! [`SessionTranscriptTailer::note_sidechain_activity`] with the parent's key
-//! ([`crate::session::transcript_autobind::owning_session_key`]): the same
+//! ([`crate::session::transcript_autobind::sidechain_owner`]): the same
 //! binding lookup and the same throttle slot as the parent's own appends, so
 //! a parent plus N sidechains still heartbeats at most once per interval, and
-//! no sidechain byte is emitted under the parent's key.
+//! no sidechain byte is emitted under the parent's key. Three further rules:
+//!
+//! - **An unbound parent's bind is retried from its sidechain.** A parent
+//!   whose `.jsonl` is quiet gets no bind attempt of its own after tail start,
+//!   so a sidechain append retries it — for the PARENT's transcript path, under
+//!   the same per-session attempt throttle
+//!   ([`crate::session::transcript_autobind::spawn_ensure_bound`]).
+//! - **A workflow parent's sidechains are not its liveness.** The watcher
+//!   never hands a workflow (`queue-operation`) transcript to this tailer, yet
+//!   such a parent CAN be bound: the pinned plane's registrar key is its
+//!   `task_run_id`, which the runner pins as the CLI session id
+//!   (`AiCoordRegistrar::session_id_for`), so `<task_run_id>/subagents/*.jsonl`
+//!   resolves to a bound key. Its sidechains carry no marker of their own, so
+//!   the watcher reads the PARENT's first lines once per sidechain tail and,
+//!   for a workflow parent, neither heartbeats nor binds it — the sidechain
+//!   lane serves the same plane as the parent lane.
+//! - **A sidechain stem is not a coverage hole.** Its own batches go through
+//!   [`SessionTranscriptTailer::admit_sidechain`], which drops an unbound
+//!   `agent-*` key without counting it.
 //!
 //! ## Coverage is the thing to watch, not liveness
 //!
@@ -228,7 +246,9 @@ const MAX_REPORTED_UNBOUND: usize = 16;
 /// Tails watched Claude Code transcripts into the coord transcript stream.
 /// Managed as Tauri state (`Arc<SessionTranscriptTailer>`) and handed to the
 /// transcript watcher, which feeds it from its per-session tail loop
-/// ([`Self::admit`] then [`Self::try_emit_batch`] / [`Self::emit_batch`]).
+/// ([`Self::admit`] then [`Self::try_emit_batch`] / [`Self::emit_batch`]; for
+/// a subagent sidechain, [`Self::note_sidechain_activity`] for the parent's
+/// liveness and [`Self::admit_sidechain`] under the sidechain's own key).
 pub struct SessionTranscriptTailer {
     emitter: Arc<TranscriptEmitter>,
     registrar: Arc<AiCoordRegistrar>,
@@ -245,8 +265,11 @@ pub struct SessionTranscriptTailer {
     identities: Mutex<HashMap<PathBuf, String>>,
     /// [`PREFIX_REPLAY_CAP_BYTES`]; a field so tests can shrink it.
     prefix_cap: u64,
-    /// Session key → when [`Self::admit`] last heartbeated it. Bounded: see
-    /// [`HEARTBEAT_THROTTLE_PRUNE_AT`].
+    /// Session key → when it was last heartbeated for transcript activity.
+    /// Two writers share each slot: [`Self::admit`] / [`Self::admit_sidechain`]
+    /// for the key's own appends, and [`Self::note_sidechain_activity`] for a
+    /// PARENT key whose subagent sidechain grew — one slot per parent, however
+    /// many sidechains it has. Bounded: see [`HEARTBEAT_THROTTLE_PRUNE_AT`].
     heartbeat_at: Mutex<HashMap<String, Instant>>,
 }
 
@@ -835,6 +858,51 @@ impl SessionTranscriptTailer {
         transcript_sync_permitted: bool,
         now: Instant,
     ) -> Admit {
+        self.admit_inner(session_key, len, transcript_sync_permitted, now, false)
+    }
+
+    /// [`Self::admit`] for a batch of a subagent SIDECHAIN, keyed by the
+    /// sidechain's own stem (`agent-<x>`) — the watcher calls it for a path
+    /// [`crate::session::transcript_autobind::sidechain_owner`] recognises.
+    ///
+    /// Identical to `admit` for a BOUND key. An UNBOUND sidechain key — every
+    /// one in practice, since nothing binds a sidechain stem — is dropped
+    /// WITHOUT coverage accounting: it is not a session, so it is not a
+    /// coverage hole, and counting it put one never-pruned `agent-*` id per
+    /// tailed sidechain into the unbound set and `appends_skipped_unbound`,
+    /// burying the real holes (module header, "Coverage is the thing to
+    /// watch"). The sidechain's liveness meaning is carried separately, to
+    /// its parent, by [`Self::note_sidechain_activity`].
+    pub fn admit_sidechain(
+        &self,
+        session_key: &str,
+        len: usize,
+        transcript_sync_permitted: bool,
+    ) -> Admit {
+        self.admit_sidechain_at(session_key, len, transcript_sync_permitted, Instant::now())
+    }
+
+    /// [`Self::admit_sidechain`] with the clock supplied.
+    pub(crate) fn admit_sidechain_at(
+        &self,
+        session_key: &str,
+        len: usize,
+        transcript_sync_permitted: bool,
+        now: Instant,
+    ) -> Admit {
+        self.admit_inner(session_key, len, transcript_sync_permitted, now, true)
+    }
+
+    /// `admit` and `admit_sidechain`. `sidechain` only changes what an UNBOUND
+    /// key costs: a dropped batch with no coverage accounting.
+    fn admit_inner(
+        &self,
+        session_key: &str,
+        len: usize,
+        transcript_sync_permitted: bool,
+        now: Instant,
+        sidechain: bool,
+    ) -> Admit {
         if len == 0 {
             return Admit::Drop;
         }
@@ -845,6 +913,9 @@ impl SessionTranscriptTailer {
         // pane being tailed right now". Resolved BEFORE Gate 1 because the
         // liveness heartbeat does not depend on transcript consent.
         let bound = self.heartbeat_if_bound(session_key, now);
+        if sidechain && !bound {
+            return Admit::Drop;
+        }
 
         if !transcript_sync_permitted {
             let mut cov = self.lock_coverage();
@@ -876,8 +947,9 @@ impl SessionTranscriptTailer {
     ///
     /// The transcript watcher calls this for a
     /// `<projects>/<cwd>/<sid>/subagents/<name>.jsonl` append, with `owner_key`
-    /// from [`crate::session::transcript_autobind::owning_session_key`],
-    /// BESIDE its usual [`Self::admit`] of the sidechain under its own key.
+    /// from [`crate::session::transcript_autobind::sidechain_owner`], BESIDE
+    /// [`Self::admit_sidechain`] of the sidechain under its own key — unless
+    /// the parent is a workflow session (module header).
     /// It shares `admit`'s binding lookup and heartbeat throttle, keyed by the
     /// OWNER, so a parent plus any number of sidechains still sends at most one
     /// heartbeat per [`TRANSCRIPT_HEARTBEAT_INTERVAL`]. It emits NO transcript
@@ -895,8 +967,8 @@ impl SessionTranscriptTailer {
         self.heartbeat_if_bound(owner_key, now);
     }
 
-    /// The liveness half of an append, shared by [`Self::admit_at`] and
-    /// [`Self::note_sidechain_activity_at`]: when `session_key` is BOUND and
+    /// The liveness half of an append, shared by [`Self::admit`] /
+    /// [`Self::admit_sidechain`] and [`Self::note_sidechain_activity`]: when `session_key` is BOUND and
     /// its throttle slot is due, heartbeat its coord row. Returns whether the
     /// key is bound. An unbound key never claims the throttle slot.
     fn heartbeat_if_bound(&self, session_key: &str, now: Instant) -> bool {
@@ -2077,10 +2149,11 @@ mod tests {
         (owner, name.to_string())
     }
 
-    /// One sidechain append as the transcript watcher handles it: `admit`
-    /// under the sidechain's own key, then the owner's liveness note.
+    /// One sidechain append as the transcript watcher handles it:
+    /// `admit_sidechain` under the sidechain's own key, then the owner's
+    /// liveness note.
     fn sidechain_append(t: &SessionTranscriptTailer, owner: &str, key: &str, at: Instant) -> Admit {
-        let verdict = t.admit_at(key, 8, true, at);
+        let verdict = t.admit_sidechain_at(key, 8, true, at);
         t.note_sidechain_activity_at(owner, 8, at);
         verdict
     }
@@ -2168,6 +2241,40 @@ mod tests {
             1,
             "the unbound sidechain appends did not claim the parent's slot"
         );
+    }
+
+    /// Review fix (runner review r1, finding 3): a sidechain's own key is not
+    /// a session, so its unbound batches are dropped WITHOUT coverage
+    /// accounting — whatever Gate 1 says — while the parent lane's unbound
+    /// accounting is unchanged.
+    #[test]
+    fn a_sidechain_stem_is_not_counted_as_a_coverage_hole() {
+        let dir = tempdir().unwrap();
+        let (t, _registrar, _outbox) = tailer(dir.path());
+        let t0 = Instant::now();
+        for i in 0..3u64 {
+            assert_eq!(
+                t.admit_sidechain_at("agent-x", 8, true, t0 + Duration::from_secs(i)),
+                Admit::Drop
+            );
+        }
+        assert_eq!(t.admit_sidechain_at("agent-y", 8, false, t0), Admit::Drop);
+        let r = t.coverage();
+        assert!(
+            r.unbound_session_ids.is_empty(),
+            "no sidechain stem is reported as a coverage hole: {:?}",
+            r.unbound_session_ids
+        );
+        assert_eq!(r.sessions_unbound, 0);
+        assert_eq!(r.appends_skipped_unbound, 0);
+        assert_eq!(r.appends_skipped_gate_off, 0);
+
+        // The parent lane is unchanged: an unbound SESSION key is still a hole.
+        let csid = Uuid::new_v4().to_string();
+        assert_eq!(t.admit_at(&csid, 8, true, t0), Admit::Drop);
+        let r = t.coverage();
+        assert_eq!(r.unbound_session_ids, vec![csid]);
+        assert_eq!(r.appends_skipped_unbound, 1);
     }
 
     /// The liveness note carries no content: a sidechain append emits no
