@@ -720,8 +720,10 @@ pub struct CoverageReport {
     /// heartbeat because the registrar logs the same debug-level
     /// `interaction heartbeat for` line whatever sent one; each counted
     /// heartbeat is also logged at INFO (see
-    /// [`SessionTranscriptTailer::note_sidechain_activity`]) and the periodic
-    /// `session_transcript_tailer: coverage` line carries this count.
+    /// [`SessionTranscriptTailer::note_sidechain_activity`]), and every
+    /// periodic coverage sample carries this count, whichever variant is
+    /// written: the INFO `session_transcript_tailer: coverage` line, or the
+    /// WARN `RUNNING BUT REACHING NO PANE` line of the blind state.
     pub sidechain_heartbeats: u64,
 }
 
@@ -1841,6 +1843,7 @@ impl SessionTranscriptTailer {
                 transcript_holes = report.transcript_holes,
                 held_batches = report.held_batches,
                 autobind_deferred = report.autobind_deferred,
+                sidechain_heartbeats = report.sidechain_heartbeats,
                 "session_transcript_tailer: RUNNING BUT REACHING NO PANE — every watched \
                  transcript lacks a coord session binding, so nothing is being synced. The \
                  watcher binds each transcript itself (transcript_autobind) and the \
@@ -2408,6 +2411,139 @@ mod tests {
             "a sidechain heartbeat alone must be reported"
         );
         assert!(!t.report_coverage_once(), "and only once");
+    }
+
+    /// Capture everything logged at INFO and above on THIS thread while the
+    /// returned guard lives — the pattern of `plan_workunit_adapter::trigger`'s
+    /// `CapturedLogs`: thread-local (`set_default`), ANSI off so a field
+    /// renders as plain `name=value`.
+    struct CapturedLogs {
+        buf: Arc<Mutex<Vec<u8>>>,
+        _guard: tracing::subscriber::DefaultGuard,
+    }
+
+    impl CapturedLogs {
+        fn start() -> Self {
+            use std::io::Write;
+
+            #[derive(Clone, Default)]
+            struct Writer(Arc<Mutex<Vec<u8>>>);
+            impl Write for Writer {
+                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                    self.0
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .extend_from_slice(buf);
+                    Ok(buf.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Writer {
+                type Writer = Writer;
+                fn make_writer(&'a self) -> Self::Writer {
+                    self.clone()
+                }
+            }
+
+            let writer = Writer::default();
+            let buf = writer.0.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(writer)
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .finish();
+            let guard = tracing::subscriber::set_default(subscriber);
+            Self { buf, _guard: guard }
+        }
+
+        /// The captured lines containing `needle`.
+        fn lines_with(&self, needle: &str) -> Vec<String> {
+            String::from_utf8_lossy(&self.buf.lock().unwrap_or_else(|e| e.into_inner()))
+                .lines()
+                .filter(|l| l.contains(needle))
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    /// Runner review r5, finding 2: a RECORDED sidechain heartbeat writes one
+    /// INFO event — at the runner's default level — with the exact message and
+    /// the parent's key in the structured field `owner`; a throttled note
+    /// writes none.
+    #[test]
+    fn a_recorded_sidechain_heartbeat_logs_an_info_line_naming_its_owner() {
+        let dir = tempdir().unwrap();
+        let (t, registrar, _outbox) = tailer(dir.path());
+        let csid = Uuid::new_v4().to_string();
+        sniff_register(&registrar, &csid);
+
+        let logs = CapturedLogs::start();
+        let t0 = Instant::now();
+        t.note_sidechain_activity_at(&csid, 8, t0);
+        t.note_sidechain_activity_at(&csid, 8, t0 + Duration::from_secs(5));
+        let lines = logs.lines_with(
+            "session_transcript_tailer: sidechain heartbeat recorded for parent session",
+        );
+        assert_eq!(lines.len(), 1, "one line per recorded heartbeat: {lines:?}");
+        assert!(lines[0].contains(" INFO "), "INFO level: {}", lines[0]);
+        assert!(
+            lines[0].contains(&format!("owner={csid}")),
+            "the parent key is the `owner` field: {}",
+            lines[0]
+        );
+    }
+
+    /// Runner review r5, finding 2: the INFO coverage line carries
+    /// `sidechain_heartbeats`.
+    #[test]
+    fn the_info_coverage_line_carries_sidechain_heartbeats() {
+        let dir = tempdir().unwrap();
+        let (t, registrar, _outbox) = tailer(dir.path());
+        let csid = Uuid::new_v4().to_string();
+        sniff_register(&registrar, &csid);
+        t.note_sidechain_activity_at(&csid, 8, Instant::now());
+
+        let logs = CapturedLogs::start();
+        assert!(t.report_coverage_once());
+        let lines = logs.lines_with("session_transcript_tailer: coverage");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains(" INFO "), "{}", lines[0]);
+        assert!(
+            lines[0].contains("sidechain_heartbeats=1"),
+            "the INFO coverage line carries the count: {}",
+            lines[0]
+        );
+    }
+
+    /// Runner review r5, finding 1: in the blind state (an unbound session and
+    /// none tailed) `report_coverage_once` writes only the WARN line, and that
+    /// line carries `sidechain_heartbeats` too.
+    #[test]
+    fn the_blind_warn_coverage_line_carries_sidechain_heartbeats() {
+        let dir = tempdir().unwrap();
+        let (t, registrar, _outbox) = tailer(dir.path());
+        let parent = Uuid::new_v4().to_string();
+        sniff_register(&registrar, &parent);
+        let t0 = Instant::now();
+        t.note_sidechain_activity_at(&parent, 8, t0);
+        // One unbound session, none tailed: the blind state.
+        let unbound = Uuid::new_v4().to_string();
+        assert_eq!(t.admit_at(&unbound, 8, true, t0), Admit::Drop);
+        let r = t.coverage();
+        assert!(r.sessions_unbound > 0 && r.sessions_tailed == 0, "blind");
+
+        let logs = CapturedLogs::start();
+        assert!(t.report_coverage_once());
+        let lines = logs.lines_with("RUNNING BUT REACHING NO PANE");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains(" WARN "), "{}", lines[0]);
+        assert!(
+            lines[0].contains("sidechain_heartbeats=1"),
+            "the blind WARN line carries the count: {}",
+            lines[0]
+        );
     }
 
     /// A sidechain note for an UNBOUND parent sends nothing, so counts nothing.
