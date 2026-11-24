@@ -1185,16 +1185,34 @@ fn transcript_bind_env(
             let store = lifecycle.as_ref().ok_or("lifecycle_store_unavailable")?;
             Ok(store
                 .get_checked(csid)
-                .map_err(|_| {
-                    // Name WHERE an operator looks, by file name only: a
-                    // refusal detail never carries a path.
-                    if store.is_load_degraded() {
-                        "lifecycle_store_unreadable: the lifecycle snapshot \
-                         (`terminal-sessions*.json`) is DEGRADED: its `.degraded` marker \
-                         sits beside it and the original is preserved as its \
-                         `.quarantine-<ms>` sibling; the runner log names both paths"
-                    } else {
-                        "lifecycle_store_unreadable: the lifecycle store's lock is poisoned"
+                .map_err(|cause| {
+                    // Name WHERE an operator looks, by file name only (a
+                    // refusal detail never carries a path), and say truthfully
+                    // whether the original survives: the cause is the one the
+                    // store decided under its own lock.
+                    use crate::session::session_lifecycle_store::{DegradedLoad, RecordUnknown};
+                    match cause {
+                        RecordUnknown::Poisoned => {
+                            "lifecycle_store_unreadable: the lifecycle store's lock is poisoned"
+                        }
+                        RecordUnknown::Degraded(DegradedLoad::Quarantined) => {
+                            "lifecycle_store_unreadable: the lifecycle snapshot \
+                             (`terminal-sessions*.json`) is DEGRADED: its `.degraded` marker \
+                             sits beside it and the original is preserved as its \
+                             `.quarantine-<ms>` sibling; the runner log names both paths"
+                        }
+                        RecordUnknown::Degraded(DegradedLoad::OnlyCopy) => {
+                            "lifecycle_store_unreadable: the lifecycle snapshot \
+                             (`terminal-sessions*.json`) is DEGRADED and UNPRESERVED: the \
+                             snapshot is the only copy of the lost rows; do not modify or \
+                             delete it; the runner log names it"
+                        }
+                        RecordUnknown::Degraded(DegradedLoad::FromEarlierLoad) => {
+                            "lifecycle_store_unreadable: the lifecycle snapshot \
+                             (`terminal-sessions*.json`) is DEGRADED by an earlier load: its \
+                             `.degraded` marker sits beside it; whatever that load preserved \
+                             is a `.quarantine-<ms>` sibling, and the runner log names both"
+                        }
                     }
                 })?
                 .filter(|rec| rec.state == "open" && !rec.terminal_id.trim().is_empty())
@@ -3902,6 +3920,42 @@ mod tests {
             assert!(detail.contains("DEGRADED"), "{detail}");
             assert!(detail.contains("`.degraded` marker"), "{detail}");
             assert!(detail.contains("`.quarantine-<ms>`"), "{detail}");
+            assert!(detail.contains("original is preserved"), "{detail}");
+
+            // A degraded snapshot whose preservation FAILED is the only copy
+            // of the lost rows: the refusal must say so, and must not send an
+            // operator to a quarantine that does not exist.
+            let unpreserved_path = state_dir.join("unpreserved-terminal-sessions.json");
+            std::fs::write(&unpreserved_path, b"[]").unwrap();
+            crate::session::session_lifecycle_store::FAIL_QUARANTINE_FOR_TEST.with(|f| f.set(true));
+            let opened = SessionLifecycleStore::open(&unpreserved_path);
+            crate::session::session_lifecycle_store::FAIL_QUARANTINE_FOR_TEST
+                .with(|f| f.set(false));
+            let unpreserved = Arc::new(opened.unwrap());
+            let (status, v) = call_route(
+                &t,
+                Some(&unpreserved),
+                &watched,
+                &bearer(&key),
+                &body(&csid),
+            )
+            .await;
+            let detail = refused(
+                status,
+                &v,
+                &outbox,
+                &[wd.as_str(), bound.as_str(), state_dir_str.as_str()],
+            );
+            assert!(detail.contains("lifecycle_store_unreadable"), "{detail}");
+            assert!(detail.contains("UNPRESERVED"), "{detail}");
+            assert!(
+                detail.contains(
+                    "the snapshot is the only copy of the lost rows; do not modify or delete it; \
+                     the runner log names it"
+                ),
+                "{detail}"
+            );
+            assert!(!detail.contains("quarantine"), "{detail}");
 
             let store = Arc::new(
                 SessionLifecycleStore::open(state_dir.join("terminal-sessions.json")).unwrap(),

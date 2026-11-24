@@ -1933,6 +1933,10 @@ pub struct ClearLifecycleResponse {
     /// replays its deltas over the empty snapshot on the next `open()` and
     /// resurrects the very rows the clear discarded.
     pub removed_wal: bool,
+    /// Whether a degraded-load marker existed beside the snapshot and was
+    /// deleted. Left behind, the next store opened at this path would start
+    /// DEGRADED and answer every session it does not hold UNKNOWN.
+    pub marker_removed: bool,
     pub path: String,
     /// Whether the RUNNING store adopted the clear (`reload_from_disk`).
     /// `false` means no store was registered in this process — the file was
@@ -2189,18 +2193,23 @@ fn list_lifecycle_open_records_in(store: &SessionLifecycleStore) -> Vec<OpenLife
 /// clear was asked to discard on the very next open — the same silent-loss
 /// shape [`seed_lifecycle_store_at`] already guards against, inverted.
 ///
-/// Returns `(snapshot_removed, wal_removed)`; a file that was already absent
-/// reports `false` rather than erroring, so a clear is idempotent.
-fn clear_lifecycle_store_at(path: &Path) -> Result<(bool, bool), (StatusCode, String)> {
+/// Returns `(snapshot_removed, wal_removed, marker_removed)`; a file that was
+/// already absent reports `false` rather than erroring, so a clear is
+/// idempotent.
+///
+/// The marker goes FIRST, so a clear that removed anything at all has removed
+/// the marker: a clear that fails part-way never leaves the next open reading
+/// an emptied store as DEGRADED.
+fn clear_lifecycle_store_at(path: &Path) -> Result<(bool, bool, bool), (StatusCode, String)> {
     let wal = crate::session::session_lifecycle_store::wal_path_for(path);
     // A degraded-load marker left by an earlier load would keep the cleared
     // store answering unheld sessions UNKNOWN; a clear starts from nothing.
     let marker = crate::session::session_lifecycle_store::degraded_marker_path(path);
     let mut removed = [false; 3];
     for (slot, target) in [
+        (2usize, marker.as_path()),
         (0usize, path),
         (1usize, wal.as_path()),
-        (2usize, marker.as_path()),
     ] {
         match std::fs::remove_file(target) {
             Ok(()) => removed[slot] = true,
@@ -2213,7 +2222,7 @@ fn clear_lifecycle_store_at(path: &Path) -> Result<(bool, bool), (StatusCode, St
             }
         }
     }
-    Ok((removed[0], removed[1]))
+    Ok((removed[0], removed[1], removed[2]))
 }
 
 async fn seed_lifecycle_store_handler(
@@ -2340,7 +2349,7 @@ async fn clear_lifecycle_store_handler(
     // (a port-named file is no longer the key) — clear the current instance's
     // own store, the only coherent meaning here.
     let path = crate::session::session_lifecycle_store::store_path();
-    let (removed, removed_wal) = match clear_lifecycle_store_at(&path) {
+    let (removed, removed_wal, marker_removed) = match clear_lifecycle_store_at(&path) {
         Ok(pair) => pair,
         Err((code, error)) => {
             return Err((
@@ -2392,6 +2401,7 @@ async fn clear_lifecycle_store_handler(
         success: true,
         removed,
         removed_wal,
+        marker_removed,
         path: path.display().to_string(),
         reloaded,
         in_memory_records,
@@ -5127,7 +5137,7 @@ mod tests {
         );
         assert_eq!(list_lifecycle_open_in(&store).len(), 4);
 
-        let (removed, _removed_wal) = clear_lifecycle_store_at(&path).expect("clear");
+        let (removed, _removed_wal, _) = clear_lifecycle_store_at(&path).expect("clear");
         assert!(removed, "the snapshot existed and was deleted");
         // The half the handler used to skip. Without it the store still holds
         // all four and rewrites them on its next persist.
@@ -5201,7 +5211,7 @@ mod tests {
         }
         assert!(wal.exists(), "precondition: the write path left a WAL");
 
-        let (_removed, removed_wal) = clear_lifecycle_store_at(&path).expect("clear");
+        let (_removed, removed_wal, _) = clear_lifecycle_store_at(&path).expect("clear");
         assert!(removed_wal, "the clear must delete the WAL");
         assert!(!wal.exists());
         assert!(
@@ -5230,7 +5240,8 @@ mod tests {
             "precondition: the degraded load left a marker"
         );
 
-        clear_lifecycle_store_at(&path).expect("clear");
+        let (_, _, marker_removed) = clear_lifecycle_store_at(&path).expect("clear");
+        assert!(marker_removed, "the clear reports the marker it removed");
         assert!(!marker.exists(), "the clear must delete the marker");
         assert!(!SessionLifecycleStore::open(&path)
             .unwrap()
