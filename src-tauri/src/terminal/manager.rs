@@ -1457,20 +1457,30 @@ mod tests {
         assert_eq!(super::spawn_tenant_stamp(Some(t)), Some(t.to_string()));
     }
 
-    /// Review round 6 A2: the update the spawn WRITES carries no tenant when
-    /// the caller chose none, and exactly the chosen one otherwise. This is
-    /// the value the writer passes to `update_identity_by_terminal`, so a
-    /// writer that went back to stamping a resolved or default tenant fails
-    /// here.
+    /// Review round 6 A2: `spawn_identity_update` carries no tenant when the
+    /// caller chose none, exactly the chosen one otherwise, and no other
+    /// field. This pins the helper's rule. That the spawn writer passes the
+    /// helper's value (and builds no update inline) is held by review, not by
+    /// this test.
     #[test]
     fn the_spawn_identity_update_carries_only_the_chosen_tenant() {
-        let none = super::spawn_identity_update(true, None);
-        assert_eq!(none.tenant_id, None);
-        assert_eq!(none.bypass_permissions, Some(true));
+        use crate::session::session_lifecycle_store::SessionIdentityUpdate;
+        assert_eq!(
+            super::spawn_identity_update(true, None),
+            SessionIdentityUpdate {
+                bypass_permissions: Some(true),
+                ..Default::default()
+            }
+        );
         let t = uuid::Uuid::from_bytes([9; 16]);
-        let chosen = super::spawn_identity_update(false, Some(t));
-        assert_eq!(chosen.tenant_id, Some(t.to_string()));
-        assert_eq!(chosen.bypass_permissions, Some(false));
+        assert_eq!(
+            super::spawn_identity_update(false, Some(t)),
+            SessionIdentityUpdate {
+                bypass_permissions: Some(false),
+                tenant_id: Some(t.to_string()),
+                ..Default::default()
+            }
+        );
     }
 
     /// The `terminal-created` wire shape the frontend reads: `surface` sits
