@@ -92,7 +92,10 @@ payload=""
 IFS= read -r -t 1 -d '' payload || true
 
 port="${QONTINUI_RUNNER_API_PORT:-${QONTINUI_INSTALL_INTERCEPT_PORT:-}}"
-term="${QONTINUI_TERMINAL_ID:-}"
+# The route key: the runner terminal id, else — for a stream-json AI session,
+# which has no terminal — the AI session id its coord-mcp nonce was recorded
+# under (plan 2026-11-21-sessions-spawn-takes-the-parent-mcp-json-and-acts-as-the-default-tenant D3).
+term="${QONTINUI_TERMINAL_ID:-${QONTINUI_AI_SESSION_ID:-}}"
 [ -z "$port" ] && exit 0
 command -v curl >/dev/null 2>&1 || exit 0
 
@@ -327,8 +330,9 @@ case "$csid" in
   *) csid="" ;;
 esac
 
-# Session key for ADDRESSING the route: prefer the runner terminal id (the
-# route resolves it against local state), else the Claude session id — the same
+# Session key for ADDRESSING the route: prefer the runner terminal id (or, for
+# a stream-json AI session, its AI session id — `term` above; the route resolves
+# either against local state), else the Claude session id — the terminal-first
 # precedence `claude_stop_hook.sh` uses, so both hooks key on one identity.
 # Deliberately separate from `csid` above: this one names the route's path
 # segment, that one names WHO the read is attributed to.

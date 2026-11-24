@@ -399,6 +399,9 @@ async fn spawn_session(
                 session_live: false,
             });
         }
+        // Reachable by id from here — and so closable through
+        // `POST /sessions/{id}/close`, which refuses every id not recorded here.
+        sm.record_http_spawned(&trid);
 
         crate::commands::ai_session::emit_session_state(&handle, &trid, &trid, session.state());
 
@@ -860,6 +863,63 @@ async fn finish_session(
         finish_heal::decorate_read_back(&mut body, &rb, store.get(&id).as_ref());
     }
     Ok(Json(body))
+}
+
+/// `POST /sessions/{id}/close` — close a session `POST /sessions/spawn`
+/// started: the same close the Tauri `close_ai_session` command runs (the
+/// child ended, its coord-mcp delivery retired, the coord row closed, the task
+/// run `stopped`). `404` for an id that door did not spawn. Idempotent: a
+/// repeat close answers `200` with `was_live: false`.
+async fn close_session(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let session_manager: Arc<crate::claude_session::SessionManager> = state
+        .app_handle
+        .state::<Arc<crate::claude_session::SessionManager>>()
+        .inner()
+        .clone();
+    apply_close_session(&session_manager, &id, || {
+        crate::commands::ai_session::close_ai_session_in(
+            &state.app_handle,
+            &session_manager,
+            Some(state.app_state.pg_db.as_ref()),
+            &id,
+        )
+    })
+    .await
+}
+
+/// The close route's body, minus axum: the spawned-id check, then `close`.
+async fn apply_close_session<F, Fut>(
+    session_manager: &crate::claude_session::SessionManager,
+    id: &str,
+    close: F,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = crate::commands::ai_session::AiSessionClose>,
+{
+    if !session_manager.was_http_spawned(id) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!(
+                "no session {id} was started by POST /sessions/spawn on this runner — this door \
+                 closes only those"
+            ),
+        ));
+    }
+    let closed = close().await;
+    info!(
+        "Closed spawned session task_run_id={} was_live={} coord_mcp_retired={}",
+        id, closed.was_live, closed.coord_mcp_retired
+    );
+    Ok(Json(serde_json::json!({
+        "task_run_id": id,
+        "state": "closed",
+        "was_live": closed.was_live,
+        "coord_mcp_retired": closed.coord_mcp_retired,
+    })))
 }
 
 /// Whether a finish outcome is the READ-BACK: a re-finish that wrote nothing
@@ -3165,6 +3225,11 @@ pub fn routes() -> Router<Arc<ApiState>> {
         // and gets no drift guard from one; its contract is covered by the
         // handler tests below instead.
         .route("/sessions/{id}/finish", post(finish_session))
+        // End a session THIS door's `/sessions/spawn` started (plan
+        // 2026-11-21-sessions-spawn-takes-the-parent-mcp-json-and-acts-as-the-default-tenant
+        // Phase 5). Any other id is a 404, so it never closes a terminal or
+        // another caller's session.
+        .route("/sessions/{id}/close", post(close_session))
         // Phase 4.4 (plan 2026-09-28 author-session slot): bind a Claude Code
         // session into the transcript tailer and replay its prefix. A
         // credential door (`origin_guard::CREDENTIAL_DOORS`) that authorizes
@@ -3183,6 +3248,208 @@ pub fn routes() -> Router<Arc<ApiState>> {
         )
         // Why a session stopped (or that it has not) — read-only, local.
         .route("/sessions/{id}/stop-reason", get(get_stop_reason))
+}
+
+/// `POST /sessions/{id}/close` (plan
+/// `2026-11-21-sessions-spawn-takes-the-parent-mcp-json-and-acts-as-the-default-tenant`
+/// Phase 5), through [`apply_close_session`] and the REAL shared close
+/// ([`crate::commands::ai_session::close_ai_session_with`]). A live
+/// `ClaudeSession` needs a real `claude` child, so the session here is the
+/// part of a spawn that outlives it: the coord-mcp delivery under its id.
+#[cfg(test)]
+mod close_session_route_tests {
+    use super::*;
+    use crate::claude_session::coord_mcp_delivery::{deliver_for_ai_session, CoordMcpLease};
+    use crate::claude_session::SessionManager;
+
+    const PORT: u16 = 23_953;
+
+    /// A spawn's coord-mcp delivery for `id`: its nonce, and the lease the
+    /// child's waiter would hold.
+    fn delivered(amb: &crate::test_env::IsolatedAmbient, id: &str) -> (String, CoordMcpLease) {
+        let wd = amb
+            .root()
+            .join(format!("wd-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&wd).unwrap();
+        let d = deliver_for_ai_session(wd.to_str().unwrap(), id, None, Some(PORT)).unwrap();
+        let config = d.argv()[1].clone();
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(config).unwrap()).unwrap();
+        let nonce = crate::coord_mcp_config::proxy_nonce_from_config_doc(&doc).unwrap();
+        (nonce, d.into_lease())
+    }
+
+    async fn close(sm: &SessionManager, id: &str) -> Result<serde_json::Value, StatusCode> {
+        let emitted = std::cell::Cell::new(false);
+        let out = apply_close_session(sm, id, || {
+            crate::commands::ai_session::close_ai_session_with(
+                sm,
+                None,
+                None,
+                |_| emitted.set(true),
+                id,
+            )
+        })
+        .await
+        .map(|Json(v)| v)
+        .map_err(|(status, _)| status);
+        // No `ClaudeSession` is registered in these tests (one needs a real
+        // child), so no close here removes one: no closed state is emitted,
+        // however often the id is closed. (The `stopped` write is SQL-guarded
+        // and needs a database; these tests pass none.)
+        assert!(
+            !emitted.get(),
+            "only a close of a LIVE session emits the closed state"
+        );
+        if let Ok(body) = &out {
+            assert_eq!(body["was_live"], false);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn closing_a_spawned_session_retires_its_coord_mcp() {
+        let amb = crate::test_env::isolated_ambient();
+        let sm = SessionManager::new();
+        let id = uuid::Uuid::new_v4().to_string();
+        let (nonce, _lease) = delivered(&amb, &id);
+        sm.record_http_spawned(&id);
+
+        let body = close(&sm, &id).await.expect("a spawned id closes");
+
+        assert_eq!(body["state"], "closed");
+        assert_eq!(body["task_run_id"], id.as_str());
+        assert_eq!(body["coord_mcp_retired"], true);
+        assert!(!crate::coord_mcp::proxy_nonce_is_valid(&nonce));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_id_is_a_404() {
+        let sm = SessionManager::new();
+        assert_eq!(
+            close(&sm, &uuid::Uuid::new_v4().to_string()).await,
+            Err(StatusCode::NOT_FOUND)
+        );
+    }
+
+    /// A session another `ClaudeSession::spawn` caller started (a task run, a
+    /// workflow phase) is not this door's: 404, and its credential is left
+    /// alone.
+    #[tokio::test]
+    async fn a_session_another_caller_spawned_is_a_404_and_untouched() {
+        let amb = crate::test_env::isolated_ambient();
+        let sm = SessionManager::new();
+        let id = uuid::Uuid::new_v4().to_string();
+        let (nonce, lease) = delivered(&amb, &id);
+
+        assert_eq!(close(&sm, &id).await, Err(StatusCode::NOT_FOUND));
+        assert!(crate::coord_mcp::proxy_nonce_is_valid(&nonce));
+        drop(lease);
+        assert!(!crate::coord_mcp::proxy_nonce_is_valid(&nonce));
+    }
+
+    #[tokio::test]
+    async fn closing_twice_is_idempotent() {
+        let amb = crate::test_env::isolated_ambient();
+        let sm = SessionManager::new();
+        let id = uuid::Uuid::new_v4().to_string();
+        let (_nonce, _lease) = delivered(&amb, &id);
+        sm.record_http_spawned(&id);
+
+        let first = close(&sm, &id).await.unwrap();
+        let second = close(&sm, &id)
+            .await
+            .expect("a repeat close is not an error");
+
+        assert_eq!(first["coord_mcp_retired"], true);
+        assert_eq!(second["state"], "closed");
+        assert_eq!(second["was_live"], false);
+        assert_eq!(second["coord_mcp_retired"], false);
+    }
+
+    #[test]
+    fn the_close_route_is_registered() {
+        let src = include_str!("sessions.rs");
+        assert!(src.contains(concat!(
+            ".route(\"/sessions/{id}/close\", ",
+            "post(close_session))"
+        )));
+    }
+}
+
+/// The REAL bundled SessionStart policy hook, run by `bash` against a listener
+/// that echoes the route id it was addressed with: a stream-json AI session
+/// (no terminal id) addresses `/sessions/{id}/policy-context` by its exported
+/// `QONTINUI_AI_SESSION_ID`, and a terminal id still wins when both are set
+/// (plan `2026-11-21-sessions-spawn-takes-the-parent-mcp-json-and-acts-as-the-default-tenant`
+/// Phase 3, D3).
+#[cfg(test)]
+mod policy_hook_route_key_tests {
+    use super::*;
+
+    const HOOK: &str = include_str!("../../resources/session-restore/claude_policy_hook.sh");
+
+    async fn echo_id(Path(id): Path<String>) -> Json<serde_json::Value> {
+        Json(serde_json::json!({ "seen": id }))
+    }
+
+    /// Run the hook with `env` (and an empty SessionStart payload); its stdout.
+    async fn run_hook(env: &[(&str, &str)]) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app: Router = Router::new().route("/sessions/{id}/policy-context", get(echo_id));
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let hook = tmp.path().join("claude_policy_hook.sh");
+        std::fs::write(&hook, HOOK).unwrap();
+        let mut cmd = std::process::Command::new("bash");
+        cmd.arg("-c")
+            .arg(format!("exec bash '{}' < /dev/null", hook.display()))
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("QONTINUI_RUNNER_API_PORT", port.to_string());
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = tokio::task::spawn_blocking(move || {
+            crate::process_helpers::output_with_timeout(cmd, std::time::Duration::from_secs(30))
+        })
+        .await
+        .unwrap()
+        .expect("the hook runs inside its budget");
+        server.abort();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    #[tokio::test]
+    async fn an_ai_session_addresses_the_route_by_its_ai_session_id() {
+        let out = run_hook(&[("QONTINUI_AI_SESSION_ID", "ai-7305fc49")]).await;
+        assert_eq!(out, r#"{"seen":"ai-7305fc49"}"#);
+    }
+
+    #[tokio::test]
+    async fn a_terminal_id_still_wins_over_an_ai_session_id() {
+        let out = run_hook(&[
+            ("QONTINUI_TERMINAL_ID", "term-1"),
+            ("QONTINUI_AI_SESSION_ID", "ai-7305fc49"),
+        ])
+        .await;
+        assert_eq!(out, r#"{"seen":"term-1"}"#);
+    }
+
+    /// Neither id and no payload: nothing names the session, so the hook asks
+    /// nothing (the payload's Claude id is the remaining rung).
+    #[tokio::test]
+    async fn with_no_id_at_all_the_hook_asks_nothing() {
+        assert_eq!(run_hook(&[]).await, "");
+    }
 }
 
 /// Permission-prompt capture through the routes the population uses (plan

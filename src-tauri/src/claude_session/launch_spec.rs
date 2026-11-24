@@ -244,6 +244,13 @@ pub struct LaunchSpec {
     /// `--append-system-prompt <s>`, `--add-dir <d>`, and the trailing
     /// `-- <prompt>` positional. Never reordered or deduped within.
     pub extra_required: Vec<String>,
+    /// Template flags the caller OWNS even where it supplies none, in either
+    /// spelling: a template's copy is always dropped. The stream-json spawn owns
+    /// `--mcp-config`, `--strict-mcp-config`, `--settings`,
+    /// `--append-system-prompt` and `--append-system-prompt-file` on every
+    /// coord-mcp arm — including the one where the session's own config is its
+    /// cwd's `.mcp.json` and the runner passes no MCP flag at all.
+    pub owned_flags: Vec<String>,
 }
 
 /// Maximum length (chars) of a `--name` value.
@@ -555,11 +562,46 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
                 // Any other operator flag is layered in, unless the caller's
                 // extra_required already provides that flag (spec wins).
                 _ => {
-                    if provided.contains(&unit.name) {
+                    // By NAME, whatever the spelling: `--mcp-config=/x` from a
+                    // template is the same flag as the caller's spaced one.
+                    let supplied = provided.contains(flag_name_only(&unit.name));
+                    let owned = spec
+                        .owned_flags
+                        .iter()
+                        .any(|f| f == flag_name_only(&unit.name));
+                    if owned && !supplied {
+                        // Its own line: the caller passes no such flag, so the
+                        // "supplies the same flag" wording would be false.
                         tracing::warn!(
                             flag = %flag_name_only(&unit.name),
-                            "launch template flag dropped: the caller supplies the same flag"
+                            "launch template flag dropped: the runner owns this flag for this \
+                             spawn (it composes the value itself, or deliberately passes none), \
+                             so a template copy never reaches the argv"
                         );
+                    } else if supplied {
+                        if flag_name_only(&unit.name) == "--mcp-config" {
+                            // The runner's coord-mcp is authoritative (plan
+                            // 2026-11-21-…-acts-as-the-default-tenant D1). A
+                            // config path is not a secret; name what was lost.
+                            let dropped = unit
+                                .name
+                                .split_once('=')
+                                .map(|(_, v)| v.to_string())
+                                .or_else(|| unit.values.first().cloned())
+                                .unwrap_or_default();
+                            tracing::warn!(
+                                dropped_mcp_config = %dropped,
+                                "launch template --mcp-config dropped: the runner supplies this \
+                                 session's own coord-mcp config, which is authoritative"
+                            );
+                        } else {
+                            tracing::warn!(
+                                flag = %flag_name_only(&unit.name),
+                                "launch template flag dropped from the argv: the caller supplies \
+                                 the same flag (a caller that composes it — the stream-json \
+                                 spawn's --settings — folds the template's value in first)"
+                            );
+                        }
                     } else {
                         other_units.push(unit);
                     }
@@ -789,6 +831,44 @@ fn is_permitted_under_allow_list(token: &str) -> bool {
     )
 }
 
+/// The value every occurrence of one of `names` (spaced or `=`-attached) carries
+/// in the operator template that [`compose_flags`] layers in for `cfg`, in
+/// order, as `(flag name, value)`.
+///
+/// For a caller that SUPPLIES such a flag itself and therefore has the
+/// template's copy dropped from the argv, but must not lose what it said: the
+/// stream-json spawn folds a template `--settings` into its one merged settings
+/// file and a template append prompt into its one prompt carrier. Read-only —
+/// the composed argv is unaffected.
+///
+/// `pin` is the session id [`compose_flags`] substitutes for `{sessionId}`
+/// (the resume id, else the new-session id), so a value that embeds the
+/// placeholder reads exactly as the composed argv would carry it.
+pub(crate) fn template_flag_values(
+    cfg: &LaunchConfig,
+    pin: Option<&str>,
+    names: &[&str],
+) -> Vec<(String, String)> {
+    let Some(template) = claude_template(cfg) else {
+        return Vec::new();
+    };
+    let tokens = shell_tokenize(&template.replace(SESSION_ID_PLACEHOLDER, pin.unwrap_or("")));
+    parse_units(tokens.get(1..).unwrap_or(&[]))
+        .into_iter()
+        .filter_map(|unit| {
+            let name = flag_name_only(&unit.name).to_string();
+            if !names.contains(&name.as_str()) {
+                return None;
+            }
+            let value = match unit.name.split_once('=') {
+                Some((_, v)) => Some(v.to_string()),
+                None => unit.values.first().cloned(),
+            }?;
+            Some((name, value))
+        })
+        .collect()
+}
+
 /// A template flag's NAME for a log line: the part before an attached `=value`
 /// (review L2). A value can be a path or a secret, and never reaches a log.
 fn flag_name_only(token: &str) -> &str {
@@ -825,12 +905,14 @@ fn provides_append_prompt_flag(extra: &[String]) -> bool {
 }
 
 /// Flag names (`--foo`) present in the caller's `extra_required`, used to keep a
-/// template from duplicating a flag the spec already provides.
+/// template from duplicating a flag the spec already provides. Stored by name
+/// only ([`flag_name_only`]), so an `=`-attached spelling on either side is
+/// the same flag.
 fn provided_flag_names(extra: &[String]) -> HashSet<String> {
     extra
         .iter()
         .filter(|t| t.len() > 2 && t.starts_with("--"))
-        .cloned()
+        .map(|t| flag_name_only(t).to_string())
         .collect()
 }
 
@@ -986,6 +1068,138 @@ mod tests {
             account_command: None,
             ..Default::default()
         }
+    }
+
+    /// A template's `--mcp-config` never reaches a spawn whose caller supplies
+    /// the runner's own (plan
+    /// `2026-11-21-sessions-spawn-takes-the-parent-mcp-json-and-acts-as-the-default-tenant`
+    /// Phase 2) — in the spaced spelling AND the `=`-attached one, which the
+    /// name-only dedup used to miss, under the bypass posture the stream-json
+    /// spawn uses (where `is_allow_list_owned_flag` does not apply).
+    #[test]
+    fn a_template_mcp_config_is_dropped_in_either_spelling_when_the_caller_supplies_one() {
+        for template in [
+            "claude --mcp-config /operator/mcp.json --verbose",
+            "claude --mcp-config=/x --verbose",
+        ] {
+            let mut s = spec();
+            s.extra_required = vec!["--mcp-config".to_string(), "/runner/coord.json".to_string()];
+            let argv = render_argv(&s, &tmpl(template), "claude");
+            let configs: Vec<&String> = argv
+                .iter()
+                .filter(|a| flag_name_only(a) == "--mcp-config")
+                .collect();
+            assert_eq!(configs.len(), 1, "{template}: {argv:?}");
+            assert_eq!(
+                value_after(&argv, "--mcp-config"),
+                Some("/runner/coord.json"),
+                "{template}: {argv:?}"
+            );
+            assert!(
+                !argv
+                    .iter()
+                    .any(|a| a == "/operator/mcp.json" || a.contains("=/x")),
+                "{template}: {argv:?}"
+            );
+            // The rest of the template still layers in.
+            assert!(
+                argv.iter().any(|a| a == "--verbose"),
+                "{template}: {argv:?}"
+            );
+        }
+    }
+
+    /// What a template says for flags a caller supplies itself, in either
+    /// spelling and in order — and nothing for flags it does not carry.
+    #[test]
+    fn template_flag_values_reads_both_spellings_in_order() {
+        let cfg = tmpl(
+            "claude --settings /op/a.json --append-system-prompt \"be terse\" \
+             --settings=/op/b.json --verbose",
+        );
+        assert_eq!(
+            template_flag_values(&cfg, None, &["--settings"]),
+            vec![
+                ("--settings".to_string(), "/op/a.json".to_string()),
+                ("--settings".to_string(), "/op/b.json".to_string()),
+            ]
+        );
+        assert_eq!(
+            template_flag_values(
+                &cfg,
+                None,
+                &["--append-system-prompt", "--append-system-prompt-file"]
+            ),
+            vec![("--append-system-prompt".to_string(), "be terse".to_string())]
+        );
+        assert!(template_flag_values(&cfg, None, &["--mcp-config"]).is_empty());
+        assert!(template_flag_values(&LaunchConfig::default(), None, &["--settings"]).is_empty());
+    }
+
+    /// `{sessionId}` reads as the pin [`compose_flags`] substitutes.
+    #[test]
+    fn template_flag_values_substitutes_the_session_pin() {
+        let cfg = tmpl("claude --settings /op/{sessionId}.json");
+        assert_eq!(
+            template_flag_values(&cfg, Some("abc-123"), &["--settings"]),
+            vec![("--settings".to_string(), "/op/abc-123.json".to_string())]
+        );
+    }
+
+    /// An owned flag is dropped from the template even when the caller does not
+    /// supply it — in either spelling — and nothing else is.
+    #[test]
+    fn an_owned_flag_is_dropped_from_the_template_although_the_caller_supplies_none() {
+        let mut s = spec();
+        s.owned_flags = vec![
+            "--mcp-config".to_string(),
+            "--strict-mcp-config".to_string(),
+        ];
+        for template in [
+            "claude --mcp-config /operator/mcp.json --strict-mcp-config --verbose",
+            "claude --mcp-config=/operator/mcp.json --strict-mcp-config --verbose",
+        ] {
+            let argv = render_argv(&s, &tmpl(template), "claude");
+            assert!(
+                !argv
+                    .iter()
+                    .any(|a| flag_name_only(a) == "--mcp-config" || a == "--strict-mcp-config"),
+                "{template}: {argv:?}"
+            );
+            assert!(
+                argv.iter().any(|a| a == "--verbose"),
+                "{template}: {argv:?}"
+            );
+        }
+    }
+
+    /// The same rule holds for every flag, not only `--mcp-config`: a caller's
+    /// `--settings` drops a template's `--settings=…`, so the spawn carries ONE.
+    #[test]
+    fn an_attached_template_flag_is_dropped_when_the_caller_supplies_that_flag() {
+        let mut s = spec();
+        s.extra_required = vec![
+            "--settings".to_string(),
+            "/runner/settings.json".to_string(),
+        ];
+        let argv = render_argv(&s, &tmpl("claude --settings=/operator/s.json"), "claude");
+        assert_eq!(
+            argv.iter()
+                .filter(|a| flag_name_only(a) == "--settings")
+                .count(),
+            1,
+            "{argv:?}"
+        );
+        // A template flag the caller does NOT supply still survives attached.
+        let argv = render_argv(
+            &spec(),
+            &tmpl("claude --settings=/operator/s.json"),
+            "claude",
+        );
+        assert!(
+            argv.iter().any(|a| a == "--settings=/operator/s.json"),
+            "{argv:?}"
+        );
     }
 
     /// Locate the value following `flag` in an argv slice.

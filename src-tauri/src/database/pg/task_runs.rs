@@ -338,6 +338,29 @@ impl PgDb {
         Ok(())
     }
 
+    /// Mark a task run `stopped` (and stamp `completed_at`, as
+    /// [`Self::stop_task_run`] does) only while it is still ACTIVE — `running`,
+    /// `paused` or `cancelling` — never over a status it already reached.
+    /// Returns whether a row changed. The session-close door's write: a close that
+    /// races (or follows) the run's own terminal transition must not rewrite
+    /// how the run ended.
+    pub async fn stop_task_run_if_active(&self, id: &str) -> Result<bool, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let changed = conn
+            .execute(
+                "UPDATE task_runs SET status = 'stopped', updated_at = NOW(), completed_at = NOW() \
+                 WHERE id = $1 AND status IN ('running', 'paused', 'cancelling')",
+                &[&id as &(dyn tokio_postgres::types::ToSql + Sync)],
+            )
+            .await
+            .map_err(|e| crate::database::pg::pg_err("PG stop_task_run_if_active", &e))?;
+        Ok(changed > 0)
+    }
+
     /// Complete a task run (status='complete', set completed_at).
     pub async fn complete_task_run(&self, id: &str) -> Result<(), String> {
         let conn = self

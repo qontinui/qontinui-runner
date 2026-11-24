@@ -10,10 +10,12 @@
 //! - Interrupt support for stopping mid-turn
 //! - Autonomous-to-interactive context switching
 
+pub(crate) mod coord_mcp_delivery;
 pub mod coord_register;
 pub mod dispatcher;
 pub mod federation;
 pub(crate) mod heartbeat;
+pub(crate) mod launch_extras;
 pub mod launch_spec;
 pub mod manager;
 pub(crate) mod pane_row_owner;

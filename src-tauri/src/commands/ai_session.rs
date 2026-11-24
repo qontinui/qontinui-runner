@@ -706,38 +706,17 @@ pub async fn create_ai_session(
 pub async fn close_ai_session(
     app_handle: tauri::AppHandle,
     session_manager: tauri::State<'_, Arc<SessionManager>>,
-    ai_coord_registrar: tauri::State<
-        '_,
-        Arc<crate::claude_session::coord_register::AiCoordRegistrar>,
-    >,
     app_state: tauri::State<'_, StorageCompartment>,
     task_run_id: String,
 ) -> Result<CommandResponse, String> {
     info!("close_ai_session: task_run_id={}", task_run_id);
-
-    // Remove and close the session
-    if let Some(session) = session_manager.remove(&task_run_id) {
-        let _ = session.close();
-    }
-
-    // Session-automation Phase 0 (R5) — emit the coord `closed` event + evict
-    // the R4 index so coord.sessions doesn't leak a ghost row. Best-effort.
-    ai_coord_registrar.close_session(&task_run_id);
-
-    // Update DB status
-    let _ = app_state
-        .pg_db()
-        .update_task_run_status(&task_run_id, "stopped")
-        .await;
-
-    // Emit closed state
-    emit_session_state(
+    close_ai_session_in(
         &app_handle,
+        session_manager.inner(),
+        Some(app_state.pg_db().as_ref()),
         &task_run_id,
-        &task_run_id,
-        SessionState::Closed,
-    );
-
+    )
+    .await;
     Ok(CommandResponse {
         success: true,
         message: Some("AI session closed".to_string()),
@@ -745,6 +724,92 @@ pub async fn close_ai_session(
             "state": "closed",
         })),
     })
+}
+
+/// What closing one AI session did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AiSessionClose {
+    /// A session was registered under the id and has been removed and closed
+    /// (`false`: none was — a repeat close, or an id never registered). Its
+    /// child may already have exited: nothing removes a chat session from the
+    /// manager on child exit.
+    pub(crate) was_live: bool,
+    /// A coord-mcp delivery was still live under the id and has been retired.
+    pub(crate) coord_mcp_retired: bool,
+}
+
+/// THE close of an AI session, shared by the Tauri `close_ai_session` command
+/// and `POST /sessions/{id}/close`, over the live app state.
+pub(crate) async fn close_ai_session_in(
+    app_handle: &tauri::AppHandle,
+    session_manager: &SessionManager,
+    pg: Option<&crate::database::pg::PgDb>,
+    task_run_id: &str,
+) -> AiSessionClose {
+    let registrar =
+        app_handle.try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>();
+    close_ai_session_with(
+        session_manager,
+        registrar.as_ref().map(|r| r.inner().as_ref()),
+        pg,
+        |id| emit_session_state(app_handle, id, id, SessionState::Closed),
+        task_run_id,
+    )
+    .await
+}
+
+/// [`close_ai_session_in`] over explicit collaborators, so the close is
+/// testable without an app handle. Idempotent: every step is a no-op on an id
+/// that is already closed.
+///
+/// 1. Remove the session and close it (which ends the child; its waiter then
+///    retires the coord-mcp lease it holds).
+/// 2. Retire any coord-mcp delivery still live under the id or the session's
+///    own id — the same retire, run here so a close never depends on the
+///    child's exit being observed.
+/// 3. Session-automation Phase 0 (R5): emit the coord `closed` event and evict
+///    the R4 index, so coord.sessions doesn't leak a ghost row. Best-effort.
+/// 4. Mark the task run `stopped` — in SQL, only while it is still
+///    non-terminal ([`crate::database::pg::PgDb::stop_task_run_if_active`]), so
+///    a close never rewrites a `complete` or `failed` the run reached on its
+///    own, and a repeat close changes no row. The write is unconditional on
+///    this side because a closed session can still be registered after its
+///    child ended: nothing removes a chat session from the manager when its
+///    child exits, so "was registered" is not "was running".
+/// 5. Emit the closed state only when a registered session was closed here,
+///    so a repeat close does not announce a second close.
+pub(crate) async fn close_ai_session_with(
+    session_manager: &SessionManager,
+    registrar: Option<&crate::claude_session::coord_register::AiCoordRegistrar>,
+    pg: Option<&crate::database::pg::PgDb>,
+    emit_closed: impl FnOnce(&str),
+    task_run_id: &str,
+) -> AiSessionClose {
+    let session = session_manager.remove(task_run_id);
+    let was_live = session.is_some();
+    let mut coord_mcp_retired = false;
+    if let Some(session) = session {
+        let _ = session.close();
+        coord_mcp_retired |= crate::claude_session::coord_mcp_delivery::retire_session_coord_mcp(
+            session.session_id(),
+        );
+    }
+    coord_mcp_retired |=
+        crate::claude_session::coord_mcp_delivery::retire_session_coord_mcp(task_run_id);
+
+    if let Some(registrar) = registrar {
+        registrar.close_session(task_run_id);
+    }
+    if let Some(pg) = pg {
+        let _ = pg.stop_task_run_if_active(task_run_id).await;
+    }
+    if was_live {
+        emit_closed(task_run_id);
+    }
+    AiSessionClose {
+        was_live,
+        coord_mcp_retired,
+    }
 }
 
 /// Rename an AI session.

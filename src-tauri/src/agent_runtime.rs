@@ -8226,6 +8226,13 @@ async fn run_continuation_terminal(
         let bound_port = app
             .try_state::<Arc<crate::commands::AppState>>()
             .map(|s| crate::mcp::types::runner_api_port(s.inner()));
+        // Stays an in-cwd `.mcp.json`, NOT `coord_mcp::deliver_session_coord_mcp`
+        // (plan 2026-11-21-sessions-spawn-takes-the-parent-mcp-json-and-acts-as-the-default-tenant
+        // Phase 2): a cwd file already beats an ancestor `.mcp.json`'s coord-mcp
+        // (finding a1a66bfe case f), so this arm is not exposed, and `qontinui-pr`
+        // finds its credential ONLY by walking up to a `.mcp.json` until that
+        // plan's Phase 4 teaches it `QONTINUI_MCP_CONFIG`. Moving it first would
+        // send `qontinui-pr` in this session to the workspace root's key.
         let coord_mcp =
             crate::coord_mcp::provision_coord_mcp_for_session(workdir, bound_port, None);
         // What `<workdir>/.claude/` serves, for the briefing's `[served-corpus: …]`
@@ -9898,6 +9905,13 @@ async fn run_continuation_headless(
     // memory clause is gated on, and provisioning runs before the spawn here so
     // the honest value is available (plan
     // `2026-08-21-memory-clause-liveness-gate-is-coarser-than-the-session`).
+    // Stays an in-cwd `.mcp.json`, NOT `coord_mcp::deliver_session_coord_mcp`
+    // (plan 2026-11-21-sessions-spawn-takes-the-parent-mcp-json-and-acts-as-the-default-tenant
+    // Phase 2): a cwd file already beats an ancestor `.mcp.json`'s coord-mcp
+    // (finding a1a66bfe case f), so this arm is not exposed, and `qontinui-pr`
+    // finds its credential ONLY by walking up to a `.mcp.json` until that
+    // plan's Phase 4 teaches it `QONTINUI_MCP_CONFIG`. Moving it first would
+    // send `qontinui-pr` in this session to the workspace root's key.
     let coord_mcp = crate::coord_mcp::provision_coord_mcp_for_session(workdir, bound_port, None);
     // No per-spawn pin here: a gate continuation carries no account field —
     // the `pick_best_account` call above is the whole selection.
