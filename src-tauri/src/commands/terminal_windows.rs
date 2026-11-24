@@ -93,8 +93,9 @@ fn build_pop_out_webview(
     // A page-bound pop-out also carries `&page=<id>` so the frontend pins
     // itself to that one terminal page (ignoring the shared active-page) and
     // renders only that page's grid.
-    // Page ids are always `"default"` or a v4 UUID (see `useTerminalPages`
-    // `addPage`), both URL-safe — no percent-encoding needed.
+    // Page ids are `"default"`, a v4 UUID (see `useTerminalPages` `addPage`) or
+    // a typed spawn page `<group>-<n>` (`terminal::spawn_pages`), all URL-safe —
+    // no percent-encoding needed.
     let url = match bound_page {
         Some(page) => tauri::WebviewUrl::App(
             format!("index.html?view=terminal&window={}&page={}", label, page).into(),
