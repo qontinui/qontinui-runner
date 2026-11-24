@@ -47,6 +47,8 @@
 //! | `POST /terminals` | [`finish_terminal_create`], `FreshPinned` |
 //! | `POST /steward/{kind}/start` (`mcp/steward.rs`) | [`finish_terminal_create`], `FreshPinned` |
 //! | `create_terminal_session_backend` (gate continuations) | its own lineage register, then [`bind_registered_coord_session`] |
+//! | relay remote create (`mcp/backend_relay.rs`) | `register_external_confirmed`, then [`wire_registry_hook`] (liveness checked before the pipe) |
+//! | holder boot-sweep adoption (`commands::terminal::rebind_adopted_terminal`) | `resume_external` of the recorded binding, then [`bind_registered_coord_session`] |
 //!
 //! The steward create path is NOT exempt, and never was on purpose: a steward
 //! pane is a terminal-hosted agent session like any other, nothing in
@@ -63,14 +65,30 @@
 //!
 //! The remote-CREATE path (`mcp/backend_relay.rs`) registers through
 //! `register_external_confirmed`, a different contract (the id is reported
-//! only once coord has confirmed the row), and is out of this module's scope.
+//! only once coord has confirmed the row), so it does not call
+//! [`wire_coord_session`] — but it installs the same exit hook through
+//! [`wire_registry_hook`], because it must check liveness between the hook and
+//! the output pipe.
+//!
+//! # The holder-pane binding, and the boot sweep's adoption
+//!
+//! Plan `2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them`,
+//! D8. A HOLDER-backed pane can outlive this runner (a handoff restart detaches
+//! it; a crash leaves it), and the next runner's boot sweep adopts it under the
+//! same terminal id. For that adoption to resume the pane's coord row — in its
+//! OWN tenant — the binding is recorded by terminal id in the pane store
+//! ([`TerminalCoordBinding`]) when the hook is installed, and forgotten on the
+//! pane's REAL exit. The waiter never runs the hook on a handoff detach (a
+//! detach is not an exit), so a handed-off pane keeps both its row and its
+//! binding. The adoption itself is `commands::terminal::rebind_adopted_terminal`,
+//! which resumes the row and then calls [`bind_registered_coord_session`].
 
 use std::sync::Arc;
 
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::session::pane_store::{PaneKey, PaneSessionStore};
+use crate::session::pane_store::{PaneKey, PaneSessionStore, TerminalCoordBinding};
 use crate::session::{Intent, SessionError, SessionKind, SessionRegistry};
 use crate::terminal::TerminalManager;
 
@@ -134,7 +152,8 @@ pub(crate) fn terminal_shell_intent(
 
 /// Register (or resume) the coord session row for terminal `terminal_id` and
 /// wire it onto the pane: pane-store put, `bind_coord_session`, the on-exit
-/// coord close hook, and the output pipe. Returns the coord session id, or
+/// coord close hook, the holder-pane binding in `binding_store` (see
+/// [`wire_coord_hook`]), and the output pipe. Returns the coord session id, or
 /// `None` when registration failed (logged; the terminal is unaffected — a
 /// coord hiccup must never fail a spawn).
 ///
@@ -155,6 +174,7 @@ pub(crate) async fn wire_coord_session(
     terminal_id: &str,
     intent: Intent,
     registration: CoordRegistration,
+    binding_store: Option<Arc<PaneSessionStore>>,
     door: &'static str,
 ) -> Option<Uuid> {
     // Key the row by the harness session id the identity seam pinned this PTY
@@ -294,7 +314,14 @@ pub(crate) async fn wire_coord_session(
         }
     };
 
-    bind_registered_coord_session(terminal_manager, registry, terminal_id, coord_id, door);
+    bind_registered_coord_session(
+        terminal_manager,
+        registry,
+        terminal_id,
+        coord_id,
+        binding_store,
+        door,
+    );
     // The row is now visible as bound in the terminal map, so the map check
     // alone protects it from here on.
     drop(resume_claim);
@@ -319,6 +346,196 @@ pub(crate) async fn wire_coord_session(
     Some(coord_id)
 }
 
+/// Where a terminal's coord exit hook sends its two coord-facing effects —
+/// the session close and the operator-touch `session_exit` trigger. Behind a
+/// trait so the hook [`coord_exit_hook`] builds is tested without a live
+/// [`SessionRegistry`].
+pub(crate) trait CoordExitTarget: Send + Sync {
+    /// Close coord session `coord_id` (idempotent).
+    fn close_session(&self, coord_id: Uuid, door: &'static str);
+    /// The operator-touch `session_exit` trigger for a genuine non-zero exit.
+    fn session_exit(&self, coord_id: Uuid, pinned_session_id: &str, code: Option<i32>);
+}
+
+impl CoordExitTarget for SessionRegistry {
+    fn close_session(&self, coord_id: Uuid, door: &'static str) {
+        // Shares the idempotent `close_by_id` path with `terminal_close`, so a
+        // double-close (exit + explicit close) is a no-op.
+        if let Err(e) = self.close_by_id(coord_id) {
+            warn!(
+                coord_session = %coord_id,
+                door,
+                error = %e,
+                "terminal exit hook: coord session close failed"
+            );
+        }
+    }
+    fn session_exit(&self, coord_id: Uuid, pinned_session_id: &str, code: Option<i32>) {
+        // Trigger 4 (session_exit) — plan
+        // 2026-08-27-operator-touch-observation-runner-emitter, Phase B2.
+        crate::session::operator_touch::emit_session_exit_if_nonzero(
+            self,
+            coord_id,
+            Some(pinned_session_id),
+            code,
+        );
+    }
+}
+
+/// The intent fields a terminal's coord row was registered with that an
+/// ADOPTION must resume it with ([`TerminalCoordBinding`] minus the id). The
+/// tenant above all: a resume probe under the wrong tenant's credential 404s
+/// and re-registers the session as a NEW row in the default tenant.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CoordBindingIntent {
+    pub tenant_id: Option<Uuid>,
+    pub repo: Option<String>,
+    pub work_unit_slug: Option<String>,
+    pub correlation_topic: Option<String>,
+}
+
+impl CoordBindingIntent {
+    /// The fields of `intent` an adoption must carry over.
+    pub(crate) fn of(intent: &Intent) -> Self {
+        CoordBindingIntent {
+            tenant_id: intent.tenant_id,
+            repo: intent.repo.clone(),
+            work_unit_slug: intent.work_unit_slug.clone(),
+            correlation_topic: intent.correlation_topic.clone(),
+        }
+    }
+
+    fn binding(&self, coord_id: Uuid) -> TerminalCoordBinding {
+        TerminalCoordBinding {
+            coord_id,
+            tenant_id: self.tenant_id,
+            repo: self.repo.clone(),
+            work_unit_slug: self.work_unit_slug.clone(),
+            correlation_topic: self.correlation_topic.clone(),
+        }
+    }
+
+    pub(crate) fn from_binding(b: &TerminalCoordBinding) -> Self {
+        CoordBindingIntent {
+            tenant_id: b.tenant_id,
+            repo: b.repo.clone(),
+            work_unit_slug: b.work_unit_slug.clone(),
+            correlation_topic: b.correlation_topic.clone(),
+        }
+    }
+}
+
+/// The ONE coord exit hook every terminal create door installs, and the boot
+/// sweep's adoption of a holder pane too. On the pane's REAL exit (the waiter
+/// never runs it on a handoff detach — plan
+/// `2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them`,
+/// D3): close the coord row; forget the terminal's coord binding an adoption
+/// would resume (the terminal is gone for good); tell the continuation
+/// registry (a gate continuation, or a boot-restored one per plan 2026-10-03
+/// D3, is registered against THIS terminal, so its death must reach the same
+/// producer — a no-op for any terminal the registry does not hold, i.e. every
+/// ordinary tab); then the operator-touch `session_exit` trigger.
+///
+/// `rt` is the tokio runtime the continuation's capacity re-poll spawns on:
+/// the waiter thread that fires the hook has none, so it is captured where the
+/// hook is installed.
+pub(crate) fn coord_exit_hook(
+    target: Arc<dyn CoordExitTarget>,
+    terminal_id: String,
+    pinned_session_id: String,
+    binding_store: Option<Arc<PaneSessionStore>>,
+    rt: Option<tokio::runtime::Handle>,
+    door: &'static str,
+) -> Box<dyn Fn(Uuid, crate::terminal::session::PaneExitFacts) + Send + Sync> {
+    Box::new(move |coord_id, exit| {
+        target.close_session(coord_id, door);
+        if let Some(store) = &binding_store {
+            store.remove_terminal(&terminal_id);
+        }
+        crate::agent_runtime::notify_continuation_terminal_exit(
+            &terminal_id,
+            rt.as_ref(),
+            Some(exit),
+        );
+        target.session_exit(coord_id, &pinned_session_id, exit.agent_exit_code());
+    })
+}
+
+/// Bind `session` to coord row `coord_id` and install the shared
+/// [`coord_exit_hook`] over any [`CoordExitTarget`]. For a HOLDER-backed pane
+/// — the one kind a later adoption can bring back — the binding is also
+/// recorded in `binding_store` under the terminal id, with `binding`'s intent.
+/// No output pipe: see [`bind_registered_coord_session`].
+///
+/// Captures the current tokio runtime for the hook (see [`coord_exit_hook`]);
+/// every caller runs under one.
+pub(crate) fn wire_coord_hook(
+    terminal_manager: &TerminalManager,
+    session: &crate::terminal::session::TerminalSession,
+    target: Arc<dyn CoordExitTarget>,
+    coord_id: Uuid,
+    binding: &CoordBindingIntent,
+    binding_store: Option<Arc<PaneSessionStore>>,
+    door: &'static str,
+) {
+    terminal_manager.bind_coord_session(session, coord_id);
+    if let Some(store) = &binding_store {
+        if session.is_holder_backed() {
+            store.put_terminal(session.id(), binding.binding(coord_id));
+        }
+    }
+    session.set_on_exit(coord_exit_hook(
+        target,
+        session.id().to_string(),
+        // Fixed at spawn — safe to capture as an owned String.
+        session.pinned_session_id().to_string(),
+        binding_store,
+        tokio::runtime::Handle::try_current().ok(),
+        door,
+    ));
+}
+
+/// [`wire_coord_hook`] over the real [`SessionRegistry`]: the binding is read
+/// back from the registry's record of `coord_id`, whose intent the registry
+/// has already stamped with the tenant the row actually lives in (the spawn's
+/// choice, or the device default) — not from what the caller asked for, which
+/// may be `None`. No output pipe: for a door that must check liveness between
+/// installing the hook and attaching the pipe (the relay's remote create).
+pub(crate) fn wire_registry_hook(
+    terminal_manager: &TerminalManager,
+    session: &crate::terminal::session::TerminalSession,
+    registry: &Arc<SessionRegistry>,
+    coord_id: Uuid,
+    binding_store: Option<Arc<PaneSessionStore>>,
+    door: &'static str,
+) {
+    let binding = registry
+        .describe_by_id(coord_id)
+        .map(|d| CoordBindingIntent::of(&d.intent))
+        .unwrap_or_default();
+    let target: Arc<dyn CoordExitTarget> = registry.clone();
+    wire_coord_hook(
+        terminal_manager,
+        session,
+        target,
+        coord_id,
+        &binding,
+        binding_store,
+        door,
+    );
+}
+
+/// The pane store a door records the holder-pane binding in, from managed
+/// state. `None` with no handle (a unit test) or before `setup()` managed it.
+pub(crate) fn binding_store_of(
+    app_handle: Option<&tauri::AppHandle>,
+) -> Option<Arc<PaneSessionStore>> {
+    use tauri::Manager;
+    app_handle
+        .and_then(|h| h.try_state::<Arc<PaneSessionStore>>())
+        .map(|s| s.inner().clone())
+}
+
 /// Whether a terminal whose process is still running is bound to coord row
 /// `row`. An exited pane lingers in the map, bound, until its tab closes; it
 /// will never resume the row, so the pane key may move off it.
@@ -330,64 +547,33 @@ fn live_pane_holds(terminal_manager: &TerminalManager, row: Uuid) -> bool {
 }
 
 /// Wire an ALREADY-REGISTERED coord row `coord_id` onto terminal
-/// `terminal_id`: [`TerminalManager::bind_coord_session`], the on-exit coord
-/// close hook, and the output pipe. A no-op when the terminal is gone.
+/// `terminal_id`: [`TerminalManager::bind_coord_session`], the holder-pane
+/// binding in `binding_store` (see [`wire_coord_hook`]), the shared
+/// [`coord_exit_hook`], and the output pipe. A no-op when the terminal is
+/// gone.
 ///
 /// The half of [`wire_coord_session`] the synchronous backend spawn
-/// (`create_terminal_session_backend`) shares: it registers with its own
-/// capture-hint lineage, then calls this. Must run under a tokio runtime (the
-/// exit hook captures its handle; the PTY waiter thread that fires the hook
-/// has none).
+/// (`create_terminal_session_backend`) and the boot sweep's adoption share:
+/// each registers (or resumes) the row its own way, then calls this. Must run
+/// under a tokio runtime (the exit hook captures its handle, and the output
+/// pipe is a tokio task; the PTY waiter thread that fires the hook has none).
 pub(crate) fn bind_registered_coord_session(
     terminal_manager: &TerminalManager,
     registry: &Arc<SessionRegistry>,
     terminal_id: &str,
     coord_id: Uuid,
+    binding_store: Option<Arc<PaneSessionStore>>,
     door: &'static str,
 ) {
     if let Some(session) = terminal_manager.get(terminal_id) {
-        terminal_manager.bind_coord_session(&session, coord_id);
-
-        // R1 — the on-exit hook: the PTY waiter thread closes the coord
-        // session mirror the instant the process exits, instead of leaving a
-        // ghost until coord's own stale→closed watcher reaps it. Shares the
-        // idempotent `close_by_id` path with `terminal_close`, so a
-        // double-close (exit + explicit close) is a no-op.
-        let close_registry = registry.clone();
-        // Fixed at spawn — safe to capture as an owned String.
-        let exit_pinned_session_id = session.pinned_session_id().to_string();
-        // A gate continuation (or a boot-restored one, plan 2026-10-03 D3) is
-        // registered in the continuation registry against THIS terminal, so
-        // its death must reach the same producer; a no-op for any terminal the
-        // registry does not hold — every ordinary tab.
-        let exited_terminal_id = terminal_id.to_string();
-        // The waiter thread that fires the hook has no tokio runtime, so
-        // capture this one here; every caller runs under tokio.
-        let exit_rt_handle = tokio::runtime::Handle::try_current().ok();
-        session.set_on_exit(Box::new(move |coord_id, exit| {
-            if let Err(e) = close_registry.close_by_id(coord_id) {
-                warn!(
-                    coord_session = %coord_id,
-                    door,
-                    error = %e,
-                    "terminal exit hook: coord session close failed"
-                );
-            }
-            crate::agent_runtime::notify_continuation_terminal_exit(
-                &exited_terminal_id,
-                exit_rt_handle.as_ref(),
-                Some(exit),
-            );
-            // Trigger 4 (session_exit) — plan
-            // 2026-08-27-operator-touch-observation-runner-emitter, Phase B2.
-            crate::session::operator_touch::emit_session_exit_if_nonzero(
-                &close_registry,
-                coord_id,
-                Some(&exit_pinned_session_id),
-                exit.agent_exit_code(),
-            );
-        }));
-
+        wire_registry_hook(
+            terminal_manager,
+            &session,
+            registry,
+            coord_id,
+            binding_store,
+            door,
+        );
         // The output pipe so PTY output streams to coord.
         let rx = session.subscribe_output();
         registry.attach_output_pipe(coord_id, rx, true);
@@ -431,6 +617,7 @@ pub(crate) async fn finish_terminal_create(
                 terminal_id,
                 intent,
                 registration,
+                binding_store_of(app_handle),
                 door,
             )
             .await
@@ -542,6 +729,7 @@ mod tests {
             "t-pinned",
             intent(),
             CoordRegistration::FreshPinned,
+            None,
             "test",
         )
         .await
@@ -559,10 +747,10 @@ mod tests {
             .registry
             .register_external_with_lineage(intent(), None, None)
             .expect("registers");
-        bind_registered_coord_session(&tm, &fx.registry, "t-backend", coord, "test");
+        bind_registered_coord_session(&tm, &fx.registry, "t-backend", coord, None, "test");
         assert_eq!(session.coord_session_id(), Some(coord));
         // A vanished terminal is a no-op, not a panic.
-        bind_registered_coord_session(&tm, &fx.registry, "t-gone", coord, "test");
+        bind_registered_coord_session(&tm, &fx.registry, "t-gone", coord, None, "test");
     }
 
     /// `PaneKeyed` persists the id over the pane key, so the next create of
@@ -584,6 +772,7 @@ mod tests {
                 pane_store: store.clone(),
                 pane_key: key.clone(),
             },
+            None,
             "test",
         )
         .await
@@ -623,6 +812,7 @@ mod tests {
             "t-first",
             intent(),
             registration(),
+            None,
             "test",
         )
         .await
@@ -634,6 +824,7 @@ mod tests {
             "t-second",
             intent(),
             registration(),
+            None,
             "test",
         )
         .await
@@ -676,6 +867,7 @@ mod tests {
             "t-racer",
             intent(),
             registration(),
+            None,
             "test",
         )
         .await
@@ -707,6 +899,7 @@ mod tests {
             "t-exited",
             intent(),
             registration(),
+            None,
             "test",
         )
         .await
@@ -718,6 +911,7 @@ mod tests {
             "t-next",
             intent(),
             registration(),
+            None,
             "test",
         )
         .await
