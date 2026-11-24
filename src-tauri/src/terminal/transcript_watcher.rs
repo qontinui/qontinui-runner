@@ -2357,6 +2357,11 @@ mod tests {
             "a tailed sidechain append heartbeats its bound parent exactly once per window"
         );
         assert_eq!(
+            fx.tailer.coverage().sidechain_heartbeats,
+            1,
+            "the served coverage report counts that heartbeat as sidechain-sourced"
+        );
+        assert_eq!(
             rows_for(&fx.outbox, coord, SessionEventKind::OutputChunk),
             0,
             "no sidechain byte reached the parent's transcript lane"
@@ -2403,6 +2408,11 @@ mod tests {
             !unbound.iter().any(|k| k == "agent-x"),
             "the sidechain stem is not a coverage hole: {unbound:?}"
         );
+        assert_eq!(
+            fx.tailer.coverage().sidechain_heartbeats,
+            0,
+            "an unbound parent's sidechain sends, and counts, no heartbeat"
+        );
     }
 
     /// Review fix (runner review r1, finding 4): a WORKFLOW parent can be
@@ -2446,6 +2456,7 @@ mod tests {
             0,
             "a workflow parent's sidechain heartbeats nothing"
         );
+        assert_eq!(fx.tailer.coverage().sidechain_heartbeats, 0);
         assert!(sidechain.is_some_and(|sc| sc.owner_is_workflow));
     }
 

@@ -273,6 +273,14 @@ pub struct SessionTranscriptTailer {
     heartbeat_at: Mutex<HashMap<String, Instant>>,
 }
 
+/// What one liveness check did: whether the key is bound, and whether this
+/// call sent its heartbeat (bound AND its throttle slot was due).
+#[derive(Debug, Clone, Copy)]
+struct HeartbeatOutcome {
+    bound: bool,
+    sent: bool,
+}
+
 /// [`SessionTranscriptTailer::admit`]'s verdict on one batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Admit {
@@ -645,6 +653,9 @@ struct Coverage {
     /// Sessions bound by adopting the LIVE pane's own row, without asking
     /// coord (plan `2026-11-12-transcript-autobind-adopts-a-previous-boot-row-that-a-live-pane-has-replaced` D1).
     autobind_adopted_live_pane: u64,
+    /// Heartbeats [`SessionTranscriptTailer::note_sidechain_activity`]
+    /// actually SENT for a parent session: bound and due, not throttled.
+    sidechain_heartbeats: u64,
     /// Transcript sync's gate (the user's toggle AND the tenant's
     /// `egress_transcript_sync`) as observed at the last append. `None` until
     /// an append is seen —
@@ -697,6 +708,13 @@ pub struct CoverageReport {
     /// `autobind_adopted` (coord's pick), so the two adoption sources stay
     /// measurable.
     pub autobind_adopted_live_pane: u64,
+    /// Coord heartbeats sent for a PARENT session because one of its subagent
+    /// sidechains grew (bound and due — a throttled or unbound note is not
+    /// counted), since this runner process started. Apart from every other
+    /// heartbeat, so "subagent activity kept a parent's row alive" is
+    /// observable on its own: each transcript heartbeat logs the same
+    /// `interaction heartbeat for` line in the registrar, whatever sent it.
+    pub sidechain_heartbeats: u64,
 }
 
 /// How an auto-bind attempt ended, for the coverage counters.
@@ -912,7 +930,7 @@ impl SessionTranscriptTailer {
         // a once-per-session debug line, which cannot answer "is every live
         // pane being tailed right now". Resolved BEFORE Gate 1 because the
         // liveness heartbeat does not depend on transcript consent.
-        let bound = self.heartbeat_if_bound(session_key, now);
+        let bound = self.heartbeat_if_bound(session_key, now).bound;
         if sidechain && !bound {
             return Admit::Drop;
         }
@@ -953,8 +971,11 @@ impl SessionTranscriptTailer {
     /// It shares `admit`'s binding lookup and heartbeat throttle, keyed by the
     /// OWNER, so a parent plus any number of sidechains still sends at most one
     /// heartbeat per [`TRANSCRIPT_HEARTBEAT_INTERVAL`]. It emits NO transcript
-    /// bytes: a sidechain's content never enters the parent's transcript lane,
-    /// and it touches no coverage counter. An unbound owner heartbeats nothing.
+    /// bytes: a sidechain's content never enters the parent's transcript lane.
+    /// An unbound owner heartbeats nothing. Each heartbeat it SENDS is counted
+    /// in [`CoverageReport::sidechain_heartbeats`] and logged as
+    /// `sidechain heartbeat for <owner>`, so it is observable apart from the
+    /// parent's own and the operator's heartbeats.
     pub fn note_sidechain_activity(&self, owner_key: &str, len: usize) {
         self.note_sidechain_activity_at(owner_key, len, Instant::now());
     }
@@ -964,19 +985,28 @@ impl SessionTranscriptTailer {
         if len == 0 {
             return;
         }
-        self.heartbeat_if_bound(owner_key, now);
+        if self.heartbeat_if_bound(owner_key, now).sent {
+            self.lock_coverage().sidechain_heartbeats += 1;
+            tracing::debug!(
+                "session_transcript_tailer: sidechain heartbeat for {}: subagent activity \
+                 kept the parent's coord row alive",
+                owner_key
+            );
+        }
     }
 
     /// The liveness half of an append, shared by [`Self::admit`] /
-    /// [`Self::admit_sidechain`] and [`Self::note_sidechain_activity`]: when `session_key` is BOUND and
-    /// its throttle slot is due, heartbeat its coord row. Returns whether the
-    /// key is bound. An unbound key never claims the throttle slot.
-    fn heartbeat_if_bound(&self, session_key: &str, now: Instant) -> bool {
+    /// [`Self::admit_sidechain`] and [`Self::note_sidechain_activity`]: when
+    /// `session_key` is BOUND and its throttle slot is due, heartbeat its coord
+    /// row. Says whether the key is bound and whether this call sent the
+    /// heartbeat. An unbound key never claims the throttle slot.
+    fn heartbeat_if_bound(&self, session_key: &str, now: Instant) -> HeartbeatOutcome {
         let bound = self.registrar.session_id_for(session_key).is_some();
-        if bound && self.heartbeat_due(session_key, now) {
+        let sent = bound && self.heartbeat_due(session_key, now);
+        if sent {
             self.registrar.heartbeat_on_interaction(session_key);
         }
-        bound
+        HeartbeatOutcome { bound, sent }
     }
 
     /// Claim the heartbeat slot for `session_key` at `now`: `true` (and the
@@ -1735,6 +1765,7 @@ impl SessionTranscriptTailer {
             autobind_minted: cov.autobind_minted,
             autobind_deferred: cov.autobind_deferred,
             autobind_adopted_live_pane: cov.autobind_adopted_live_pane,
+            sidechain_heartbeats: cov.sidechain_heartbeats,
         }
     }
 
@@ -2276,6 +2307,57 @@ mod tests {
         let r = t.coverage();
         assert_eq!(r.unbound_session_ids, vec![csid]);
         assert_eq!(r.appends_skipped_unbound, 1);
+    }
+
+    /// Plan Phase 2 sentinel: every heartbeat a sidechain note SENDS is counted
+    /// apart from every other heartbeat — once per window however many
+    /// sidechain batches land in it, and never for the parent's own append.
+    #[test]
+    fn sidechain_heartbeats_counts_each_heartbeat_a_sidechain_sends() {
+        let dir = tempdir().unwrap();
+        let (t, registrar, outbox) = tailer(dir.path());
+        let csid = Uuid::new_v4().to_string();
+        let coord = sniff_register(&registrar, &csid);
+        let before = heartbeats_for(&outbox, coord);
+        assert_eq!(t.coverage().sidechain_heartbeats, 0);
+
+        // Two sidechain batches inside one window: one heartbeat, one count.
+        let t0 = Instant::now();
+        t.note_sidechain_activity_at(&csid, 8, t0);
+        t.note_sidechain_activity_at(&csid, 8, t0 + Duration::from_secs(5));
+        assert_eq!(heartbeats_for(&outbox, coord) - before, 1);
+        assert_eq!(t.coverage().sidechain_heartbeats, 1);
+
+        // The parent's OWN append in the next window heartbeats, but is not a
+        // sidechain heartbeat; a sidechain note behind it is throttled.
+        let w2 = t0 + TRANSCRIPT_HEARTBEAT_INTERVAL + Duration::from_secs(1);
+        assert_eq!(t.admit_at(&csid, 8, false, w2), Admit::Withheld);
+        t.note_sidechain_activity_at(&csid, 8, w2 + Duration::from_secs(1));
+        assert_eq!(heartbeats_for(&outbox, coord) - before, 2);
+        assert_eq!(t.coverage().sidechain_heartbeats, 1);
+
+        // The next window's first sidechain note sends, and counts.
+        let w3 = w2 + TRANSCRIPT_HEARTBEAT_INTERVAL + Duration::from_secs(1);
+        t.note_sidechain_activity_at(&csid, 8, w3);
+        assert_eq!(heartbeats_for(&outbox, coord) - before, 3);
+        assert_eq!(t.coverage().sidechain_heartbeats, 2);
+    }
+
+    /// A sidechain note for an UNBOUND parent sends nothing, so counts nothing.
+    #[test]
+    fn sidechain_heartbeats_does_not_count_an_unbound_parent() {
+        let dir = tempdir().unwrap();
+        let (t, _registrar, outbox) = tailer(dir.path());
+        let t0 = Instant::now();
+        for i in 0..3u64 {
+            t.note_sidechain_activity_at(
+                "7e0b5d6a-9b8e-4f2c-a3d1-c1d9f0e7a2b4",
+                8,
+                t0 + Duration::from_secs(i * 61),
+            );
+        }
+        assert_eq!(all_heartbeats(&outbox), 0);
+        assert_eq!(t.coverage().sidechain_heartbeats, 0);
     }
 
     /// The liveness note carries no content: a sidechain append emits no
