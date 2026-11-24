@@ -2194,7 +2194,8 @@ mod visibility_tests {
             "Nav",
             json!({ "occludedBy": "modal-1", "occludedPct": 80, "clippedPct": 50 }),
         )];
-        let modals: HashSet<String> = ["modal-1".to_string()].into_iter().collect();
+        let modals: std::collections::HashSet<String> =
+            ["modal-1".to_string()].into_iter().collect();
         let report = build_visibility_report(&elements, 0.02, false, Some(&modals));
         assert_eq!(report["occlusions"].as_array().map(Vec::len), Some(0));
         assert_eq!(report["clipped"][0]["element"], json!("nav"));
