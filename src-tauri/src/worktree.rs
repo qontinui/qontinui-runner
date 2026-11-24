@@ -549,8 +549,12 @@ pub(crate) fn parse_dirty_paths(
         }
 
         let is_untracked = xy == "??";
-        let is_modified_tracked =
-            matches!(x, 'M' | 'D' | 'A' | 'R' | 'C') || matches!(y, 'M' | 'D' | 'R' | 'C');
+        // `y == 'A'` is an intent-to-add entry (`git add -N`): the path is in
+        // the index with worktree content a merge would overwrite. `U` on
+        // either side (and `AA`/`DD`) is an unmerged entry from an earlier
+        // conflict. Both are dirty.
+        let is_modified_tracked = matches!(x, 'M' | 'D' | 'A' | 'R' | 'C' | 'U')
+            || matches!(y, 'M' | 'D' | 'A' | 'R' | 'C' | 'U');
 
         if is_untracked {
             if include_untracked {
@@ -1267,20 +1271,22 @@ mod tests {
 
     #[test]
     fn test_parse_dirty_paths_modified_tracked() {
-        let porcelain = " M foo.rs\0MM bar.rs\0?? scratch.txt\0 D gone.rs\0";
+        let porcelain = " M foo.rs\0MM bar.rs\0?? scratch.txt\0 D gone.rs\0 A ita.rs\0UU both.rs\0";
         let dirty = parse_dirty_paths(porcelain, false);
         assert!(dirty.contains("foo.rs"));
         assert!(dirty.contains("bar.rs"));
         assert!(dirty.contains("gone.rs"));
+        assert!(dirty.contains("ita.rs"), "intent-to-add is dirty");
+        assert!(dirty.contains("both.rs"), "unmerged is dirty");
         assert!(
             !dirty.contains("scratch.txt"),
             "untracked excluded by default"
         );
-        assert_eq!(dirty.len(), 3);
+        assert_eq!(dirty.len(), 5);
 
         let dirty_with_untracked = parse_dirty_paths(porcelain, true);
         assert!(dirty_with_untracked.contains("scratch.txt"));
-        assert_eq!(dirty_with_untracked.len(), 4);
+        assert_eq!(dirty_with_untracked.len(), 6);
     }
 
     #[test]
