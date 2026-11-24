@@ -6480,6 +6480,15 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     // release / reclaim.
     "coord_unbind_repo_tenant",
     "coord_unmute_gate",
+    // Plan 2026-10-09-coord-knows-which-box-holds-which-credential Phase 3: the
+    // credential-probe catalogue AGENT write (twin `PUT
+    // /coord/agent-credential-probe-specs`, qontinui-coord#4484). coord's
+    // `agent_tool_access::DEVICE_DEFAULT_TOOLS` grants it; the handler's
+    // `credential_probes::authorize_agent_writer` (possession + tenant-admin
+    // user) is the authorization. This list only forwards. Without it, this
+    // proxy refused the seed the door exists for (coord-revive.sh read it as
+    // METHOD_NOT_ALLOWED cause=drift), forcing the HTTP twin.
+    "coord_upsert_credential_probe_spec",
     // Plan 2026-09-20-trust-calibration-… Phase 4: the lane's queue read.
     "coord_verification_queue",
     "coord_watch_verdict",
@@ -17719,6 +17728,37 @@ mod coord_mcp_body_gate_tests {
             parsed.allowed
         );
         assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
+    }
+
+    /// Plan `2026-10-09-coord-knows-which-box-holds-which-credential` Phase 3:
+    /// the catalogue's agent WRITE forwards too, in sorted position, so a
+    /// proxied session can seed a spec instead of falling back to the HTTP twin.
+    #[test]
+    fn coord_upsert_credential_probe_spec_is_allowed_and_parses_from_source() {
+        assert!(coord_mcp_tool_is_allowed(
+            "coord_upsert_credential_probe_spec"
+        ));
+        assert!(
+            COORD_MCP_ALLOWED_TOOLS
+                .binary_search(&"coord_upsert_credential_probe_spec")
+                .is_ok(),
+            "membership is a binary_search, so the entry must sit in sorted position"
+        );
+        assert!(
+            !COORD_MCP_DELIBERATE_EXCLUSIONS.contains(&"coord_upsert_credential_probe_spec"),
+            "a tool cannot be both forwarded and deliberately excluded"
+        );
+        let parsed = working_tree_tool_policy();
+        assert_eq!(
+            parsed
+                .allowed
+                .iter()
+                .filter(|t| t.as_str() == "coord_upsert_credential_probe_spec")
+                .count(),
+            1,
+            "the parser must read the entry exactly once: {:?}",
+            parsed.allowed
+        );
     }
 
     /// Plan `2026-11-02-publishing-state-is-unreadable-to-agents-and-to-anchors`
