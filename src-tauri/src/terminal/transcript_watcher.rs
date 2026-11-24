@@ -931,11 +931,18 @@ impl SidechainTail {
 }
 
 /// Cheap sniff for `is_workflow_session` without re-loading via
-/// `list_sessions`. Reads up to the first 5 lines of the file. Returns true
-/// if it's a workflow session OR if the file can't be read yet (which is
-/// common immediately after `Create` because the writer hasn't flushed) —
-/// callers fall back to spawning the task and the in-task re-check (step 7
-/// in the loop) catches it after the first wake.
+/// `list_sessions`. Reads up to the first 5 lines of the file and returns true
+/// only when they carry the workflow marker. A file that cannot be opened yet
+/// (common immediately after `Create`, before the writer has flushed) reads as
+/// NOT a workflow session, and both callers depend on that:
+///
+/// - the dispatcher then schedules the tail, and the in-task re-check (step 6
+///   of [`tail_session`]) tears it down if the marker shows up after the
+///   first wake;
+/// - [`SidechainTail::resolve`] reads the PARENT through this function, so an
+///   unreadable parent must not read as workflow: if it did, a parent that was
+///   briefly unreadable at a sidechain's tail start would stop that sidechain
+///   heartbeating it for the whole tail.
 fn path_looks_like_workflow_session(path: &Path) -> bool {
     use std::io::{BufRead, BufReader};
     let f = match std::fs::File::open(path) {

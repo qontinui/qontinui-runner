@@ -148,12 +148,6 @@ pub fn sidechain_owner(path: &Path) -> Option<SidechainOwner> {
     Some(SidechainOwner { key, path: parent })
 }
 
-/// [`sidechain_owner`]'s key alone: the parent session id of a subagent
-/// sidechain path, `None` for anything else.
-pub fn owning_session_key(path: &Path) -> Option<String> {
-    sidechain_owner(path).map(|o| o.key)
-}
-
 /// What to do with a transcript given what coord said.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
@@ -762,11 +756,11 @@ mod tests {
     }
 
     #[test]
-    fn owning_session_key_names_the_parent_of_a_subagent_sidechain() {
+    fn sidechain_owner_names_the_parent_of_a_subagent_sidechain() {
         let p = Path::new("/home/u/.claude-gmail/projects/-home-u-proj")
             .join(CSID)
             .join("subagents/agent-a1b2c3.jsonl");
-        assert_eq!(owning_session_key(&p).as_deref(), Some(CSID));
+        assert_eq!(sidechain_owner(&p).map(|o| o.key).as_deref(), Some(CSID));
         // The owner's own transcript is the path a bind of the parent is
         // attempted for.
         let owner = sidechain_owner(&p).expect("a sidechain has an owner");
@@ -781,38 +775,38 @@ mod tests {
     }
 
     #[test]
-    fn owning_session_key_refuses_everything_that_is_not_a_sidechain() {
+    fn sidechain_owner_refuses_everything_that_is_not_a_sidechain() {
         // A non-UUID grandparent.
-        assert!(owning_session_key(Path::new(
+        assert!(sidechain_owner(Path::new(
             "/c/.claude/projects/p/not-a-uuid/subagents/agent-x.jsonl"
         ))
         .is_none());
         // A top-level transcript is its own session, not a sidechain.
         assert!(
-            owning_session_key(Path::new(&format!("/c/.claude/projects/p/{CSID}.jsonl"))).is_none()
+            sidechain_owner(Path::new(&format!("/c/.claude/projects/p/{CSID}.jsonl"))).is_none()
         );
         // A `subagents` dir at the wrong depth (directly under projects/).
-        assert!(owning_session_key(Path::new(&format!(
+        assert!(sidechain_owner(Path::new(&format!(
             "/c/.claude/projects/{CSID}/subagents/agent-x.jsonl"
         )))
         .is_none());
         // ...or one level too deep.
-        assert!(owning_session_key(Path::new(&format!(
+        assert!(sidechain_owner(Path::new(&format!(
             "/c/.claude/projects/p/q/{CSID}/subagents/agent-x.jsonl"
         )))
         .is_none());
         // A `<uuid>/subagents/x.jsonl` outside `projects/<cwd>/`.
-        assert!(owning_session_key(Path::new(&format!(
+        assert!(sidechain_owner(Path::new(&format!(
             "/c/.claude/other/p/{CSID}/subagents/agent-x.jsonl"
         )))
         .is_none());
         // The directory is not named `subagents`.
-        assert!(owning_session_key(Path::new(&format!(
+        assert!(sidechain_owner(Path::new(&format!(
             "/c/.claude/projects/p/{CSID}/tools/agent-x.jsonl"
         )))
         .is_none());
         // Not a JSONL.
-        assert!(owning_session_key(Path::new(&format!(
+        assert!(sidechain_owner(Path::new(&format!(
             "/c/.claude/projects/p/{CSID}/subagents/agent-x.txt"
         )))
         .is_none());

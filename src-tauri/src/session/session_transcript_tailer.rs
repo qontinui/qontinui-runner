@@ -2144,7 +2144,8 @@ mod tests {
             .join(".claude/projects/-cwd")
             .join(parent)
             .join(format!("subagents/{name}.jsonl"));
-        let owner = crate::session::transcript_autobind::owning_session_key(&path)
+        let owner = crate::session::transcript_autobind::sidechain_owner(&path)
+            .map(|o| o.key)
             .expect("a sidechain path names its parent");
         (owner, name.to_string())
     }
