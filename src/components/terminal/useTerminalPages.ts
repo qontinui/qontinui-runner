@@ -173,17 +173,35 @@ export interface PageLabelRegistration {
   pageId: string;
   label: string;
   order: number;
+  /**
+   * The window the page is shown in: the pop-out window's label when the page
+   * is detached into one (`boundPages`), otherwise `"main"`. The backend puts
+   * it on the session census as `page_window` (plan
+   * `2026-11-16-runner-page-name-reaches-the-coord-session-identity-card`, D8).
+   */
+  window: string;
 }
 
 /**
  * Pure: the registration payload — EVERY page in tab order, pages detached
  * into a pop-out and the internal "default" page included, numbered by
- * position. The backend replaces its whole registration with it.
+ * position, each with the window it is shown in. The backend replaces its
+ * whole registration with it.
  */
-export function pageLabelRegistration(pages: readonly TerminalPageConfig[]): {
+export function pageLabelRegistration(
+  pages: readonly TerminalPageConfig[],
+  boundPages: Readonly<Record<string, string>> = {},
+): {
   pages: PageLabelRegistration[];
 } {
-  return { pages: pages.map((p, order) => ({ pageId: p.id, label: p.name, order })) };
+  return {
+    pages: pages.map((p, order) => ({
+      pageId: p.id,
+      label: p.name,
+      order,
+      window: boundPages[p.id] ?? MAIN_WINDOW_LABEL,
+    })),
+  };
 }
 
 /**
@@ -621,16 +639,6 @@ export function useTerminalPages() {
   const [registersLabels] = useState(
     () => pinnedPageId === null && readWindowLabel() === MAIN_WINDOW_LABEL,
   );
-  // One effect on the roster, never a call per mutation: a rename, a reorder,
-  // a close, a page `reconcile` synthesizes, `ensureProjectPage`, `openPage`
-  // and `addPage` all reach the backend through this. Best-effort: until it
-  // lands the backend serves no labels, and says so (`labelsRegistered`).
-  useEffect(() => {
-    if (!registersLabels) return;
-    invoke(REGISTER_PAGE_LABELS_COMMAND, pageLabelRegistration(allPages)).catch((err) => {
-      console.warn("[useTerminalPages] tab-label registration failed:", err);
-    });
-  }, [allPages, registersLabels]);
   // Latest page roster, readable SYNCHRONOUSLY by `ensureProjectPage` (which
   // must return the resolved page id to its caller immediately, before the
   // `setPages` updater has run). Kept in sync from an effect and, eagerly,
@@ -703,6 +711,21 @@ export function useTerminalPages() {
   // `WindowAssignmentsContext` keeps the mirror in sync with the Rust truth.
   const [boundPages, setBoundPages] = useState<Record<string, string>>(getPageBindings);
   useEffect(() => subscribePageBindings(() => setBoundPages(getPageBindings())), []);
+
+  // One effect on the roster and the pop-out bindings, never a call per
+  // mutation: a rename, a reorder, a close, a page `reconcile` synthesizes,
+  // `ensureProjectPage`, `openPage`, `addPage`, and a page popped out into (or
+  // back from) a pop-out window all reach the backend through this.
+  // Best-effort: until it lands the backend serves no labels, and says so
+  // (`labelsRegistered`).
+  useEffect(() => {
+    if (!registersLabels) return;
+    invoke(REGISTER_PAGE_LABELS_COMMAND, pageLabelRegistration(allPages, boundPages)).catch(
+      (err) => {
+        console.warn("[useTerminalPages] tab-label registration failed:", err);
+      },
+    );
+  }, [allPages, boundPages, registersLabels]);
 
   // Page ids that currently host at least one live terminal OR restorable
   // session — the "occupied" signal that decides whether the internal "default"
