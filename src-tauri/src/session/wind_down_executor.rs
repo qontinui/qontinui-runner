@@ -2242,27 +2242,41 @@ impl CloseEffects for LiveCloseEffects<'_> {
     ) -> Result<Vec<finished_close_guard::PendingMessage>, String> {
         use tauri::Manager;
         let rows = wind_down_observer::fetch_pending_messages(session_id).await?;
-        let registrar = self
+        // Attribution needs both resolvers. Without one, a row that IS for
+        // this session could read as nobody's, so the read is refused instead.
+        let Some(store) = self.store.as_ref() else {
+            return Err(
+                "the session lifecycle store is not available, so pending messages cannot be \
+                 attributed"
+                    .to_string(),
+            );
+        };
+        let Some(registrar) = self
             .app
             .try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>()
-            .map(|r| r.inner().clone());
+            .map(|r| r.inner().clone())
+        else {
+            return Err(
+                "the coord session registrar is not available, so pending messages cannot be \
+                 attributed"
+                    .to_string(),
+            );
+        };
         Ok(rows
             .into_iter()
             .map(|(message_id, to_session)| {
-                // Two of the delivery poller's three resolutions: a lifecycle
-                // record keyed by the id, else coord's session UUID through
-                // the registrar's forward index. Its direct SDK-session arm is
-                // not applied, so a row addressed to an SDK session's own
-                // task-run id stays unattributed here, which the messages arm
-                // reads as UNKNOWN.
-                let owner = self
-                    .store
-                    .as_ref()
-                    .and_then(|store| store.get(&to_session))
+                // The two resolutions by which the delivery poller reaches a
+                // terminal session: a lifecycle record keyed by the id, else
+                // coord's session UUID through the registrar's forward index.
+                // Its third, a direct SDK session keyed by its task-run id, is
+                // never a terminal pane, so a row only that arm would take
+                // reads as no session this arm could close (`owner` `None`).
+                let owner = store
+                    .get(&to_session)
                     .map(|r| r.claude_session_id)
                     .or_else(|| {
                         let uuid = to_session.parse::<uuid::Uuid>().ok()?;
-                        registrar.as_ref()?.task_run_id_for(&uuid)
+                        registrar.task_run_id_for(&uuid)
                     });
                 finished_close_guard::PendingMessage {
                     message_id,

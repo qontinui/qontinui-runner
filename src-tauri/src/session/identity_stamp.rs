@@ -213,15 +213,19 @@ pub fn is_uuid_shaped(s: &str) -> bool {
     s.len() == 36 && uuid::Uuid::try_parse(s).is_ok()
 }
 
-/// Unix ms → RFC 3339 with millisecond precision and a `Z` suffix; `None` for
-/// a non-positive or out-of-range value. One fixed format, so the watermark's
-/// string comparison is a comparison of instants.
-fn ms_to_rfc3339(ms: i64) -> Option<String> {
+/// RFC 3339 with millisecond precision and a `Z` suffix — the ONE spelling of
+/// an instant this reporter and the session census post to coord. One fixed
+/// format, so the watermark's string comparison is a comparison of instants.
+pub(super) fn rfc3339(t: DateTime<Utc>) -> String {
+    t.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+/// Unix ms → [`rfc3339`]; `None` for a non-positive or out-of-range value.
+pub(super) fn ms_to_rfc3339(ms: i64) -> Option<String> {
     if ms <= 0 {
         return None;
     }
-    DateTime::<Utc>::from_timestamp_millis(ms)
-        .map(|t| t.to_rfc3339_opts(SecondsFormat::Millis, true))
+    DateTime::<Utc>::from_timestamp_millis(ms).map(rfc3339)
 }
 
 /// A name coord will accept, or `None`. Over-long names are omitted, never cut:

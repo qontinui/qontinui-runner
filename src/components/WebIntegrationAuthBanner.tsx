@@ -65,6 +65,7 @@ import {
   type AuthBannerStatus,
   type CredentialDarkSignal,
 } from "./web-integration-banner-logic";
+import { PRODUCTION_BACKEND_URL } from "@/lib/savedBackendUrl";
 
 // ---------------------------------------------------------------------------
 // Component
@@ -72,9 +73,6 @@ import {
 
 /** Session-storage key used for dismissal persistence across re-renders. */
 const DISMISS_STORAGE_KEY = "qontinui:web-integration-auth-banner:dismissed-signature";
-
-/** Fallback backend URL when status hasn't loaded yet. */
-const DEFAULT_BACKEND_URL = "https://api.qontinui.io";
 
 function readDismissedSignature(): string | null {
   try {
@@ -107,7 +105,7 @@ export function WebIntegrationAuthBanner() {
   // the same `get_web_integration_status` fetch that feeds the banner; falls
   // back to the production API host when the status hasn't loaded or carries no
   // backendUrl (the Rust command then derives the web origin itself).
-  const [backendUrl, setBackendUrl] = useState<string>(DEFAULT_BACKEND_URL);
+  const [backendUrl, setBackendUrl] = useState<string>(PRODUCTION_BACKEND_URL);
   const [dismissedSignature, setDismissedSignature] = useState<string | null>(() =>
     readDismissedSignature(),
   );

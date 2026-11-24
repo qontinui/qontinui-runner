@@ -1403,7 +1403,7 @@ static APP_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::On
 /// ## Why 16, and why not 2-4
 ///
 /// This is not an auxiliary runtime. `fleet-pub-rt` (1 worker) and `mcp-api-rt`
-/// ([`mcp_api::API_RUNTIME_WORKER_THREADS`] = 4) each serve one subsystem and
+/// (`mcp_api::serve::API_RUNTIME_WORKER_THREADS` = 4) each serve one subsystem and
 /// are sized for it. This one serves every Tauri IPC command and every
 /// `tauri::async_runtime::spawn` in the process — and `serve_on_dedicated_runtime`
 /// exists precisely BECAUSE this runtime has a history of being wedged by a
@@ -1603,7 +1603,7 @@ mod app_runtime_tests {
 /// `process::exit`, and would otherwise pay for a runtime they discard.
 ///
 /// Fail-open in both directions, the same posture
-/// `mcp_api::serve_on_dedicated_runtime` takes for the same reason — a
+/// `mcp_api::serve::serve_on_dedicated_runtime` takes for the same reason — a
 /// degraded runtime is strictly better than no runner:
 /// - a runtime we cannot BUILD leaves Tauri to build its own (today's behaviour);
 /// - a slot that is already TAKEN is caught rather than fatal, and the runtime
@@ -2347,8 +2347,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // dodge build-lock contention. Those match no worktree pattern,
                 // so the reaper never sees them — they filled D: to 1.3% free
                 // (2026-07-23, ~1.35 TB recovered by hand). This poller reaps
-                // that population: out-of-tree cargo target roots (CACHEDIR.TAG)
-                // that are not building (no held .cargo-lock, deepest artifact
+                // that population: out-of-tree cargo target roots (a
+                // `CACHEDIR.TAG` or `.rustc_info.json` marker —
+                // `cargo_target_marker::has_cargo_marker`) that are not building (no held .cargo-lock, deepest artifact
                 // mtime past the grace) and not reparse points, junction-safe.
                 // DRY-RUN by default (logs "would reap"); armed via
                 // COORD_ORPHAN_TARGET_REAP_ENABLED. Default 900s cadence
@@ -5408,7 +5409,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     // retire it non-restorably rather than
                                     // reporting a phantom `poll-dead`.
                                     poll_lifecycle_store
-                                        .record_close(&rec.claude_session_id, "never-started");
+                                        .record_close(
+                                            &rec.claude_session_id,
+                                            crate::session::session_lifecycle_store::CLOSE_REASON_NEVER_STARTED,
+                                        );
                                     consecutive_dead.remove(&rec.claude_session_id);
                                     consecutive_no_match.remove(&rec.claude_session_id);
                                     tracing::info!(
@@ -5440,7 +5444,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     // a ghost inherited from a prior process).
                                     // `"no-terminal"` is non-restorable.
                                     poll_lifecycle_store
-                                        .record_close(&rec.claude_session_id, "no-terminal");
+                                        .record_close(
+                                            &rec.claude_session_id,
+                                            crate::session::session_lifecycle_store::CLOSE_REASON_NO_TERMINAL,
+                                        );
                                     consecutive_dead.remove(&rec.claude_session_id);
                                     consecutive_no_match.remove(&rec.claude_session_id);
                                     tracing::info!(
