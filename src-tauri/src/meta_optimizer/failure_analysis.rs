@@ -63,7 +63,10 @@ pub struct FixEffectivenessRecord {
     pub effective: i64,
     pub ineffective: i64,
     pub caused_regression: i64,
-    pub effectiveness_rate: f64,
+    pub inconclusive: i64,
+    pub unjudged: i64,
+    /// Percentage of judged fixes that were effective; `None` when none is judged.
+    pub effectiveness_rate: Option<f64>,
     pub source_agent: Option<String>,
 }
 

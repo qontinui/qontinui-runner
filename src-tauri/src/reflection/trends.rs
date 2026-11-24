@@ -41,7 +41,10 @@ pub struct EffectivenessBucket {
     pub effective: u32,
     pub ineffective: u32,
     pub regression: u32,
-    pub effectiveness_rate: f64,
+    pub inconclusive: u32,
+    pub unjudged: u32,
+    /// `None` when nothing in the bucket is judged.
+    pub effectiveness_rate: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -94,7 +94,7 @@ mod tests {
             // exposure counts with try_get (plan
             // 2026-11-06-a-product-workflow-verification-with-nothing-to-check-never-reports-passed,
             // Phase 4).
-            baseline: 530,
+            baseline: 529,
             gate_wiring: &[
                 ("clippy.toml", "disallowed-methods"),
                 ("clippy.toml", "tokio_postgres::Row::get"),

@@ -602,41 +602,39 @@ impl PgDb {
         let fixes = self
             .get_fixes_by_workflow_name_filtered(workflow_name, None, None)
             .await?;
-        let total = fixes.len() as u32;
-
-        let mut effective = 0u32;
-        let mut ineffective = 0u32;
-        let mut regression = 0u32;
-        let mut inconclusive = 0u32;
-        let mut unevaluated = 0u32;
-
-        for fix in &fixes {
-            match fix.effectiveness.as_deref() {
-                Some("effective") => effective += 1,
-                Some("ineffective") => ineffective += 1,
-                Some("caused_regression") => regression += 1,
-                Some("inconclusive") => inconclusive += 1,
-                None => unevaluated += 1,
-                _ => unevaluated += 1,
-            }
-        }
-
-        let evaluated = effective + ineffective + regression;
-        let effectiveness_rate = if evaluated > 0 {
-            effective as f64 / evaluated as f64
-        } else {
-            0.0
+        let counts = {
+            let conn = self
+                .pool
+                .get()
+                .await
+                .map_err(|e| format!("PG pool error: {}", e))?;
+            let row = conn
+                .query_one(
+                    &format!(
+                        "SELECT {} FROM reflection_fixes \
+                         WHERE source_task_run_id IN \
+                               (SELECT id FROM task_runs WHERE workflow_name = $1)",
+                        crate::reflection::fix_verdicts::COUNT_COLUMNS
+                    ),
+                    &[&workflow_name],
+                )
+                .await
+                .map_err(|e| crate::database::pg::pg_err("PG get_effectiveness_report", &e))?;
+            crate::reflection::fix_verdicts::FixVerdictCounts::from_row(&row, 0)?
+        };
+        let count = |n: i64| -> Result<u32, String> {
+            u32::try_from(n).map_err(|_| format!("fix count {n} does not fit a u32"))
         };
 
         Ok(crate::reflection::types::EffectivenessReport {
             workflow_name: workflow_name.to_string(),
-            total_fixes: total,
-            effective_count: effective,
-            ineffective_count: ineffective,
-            regression_count: regression,
-            inconclusive_count: inconclusive,
-            unevaluated_count: unevaluated,
-            effectiveness_rate,
+            total_fixes: count(counts.total())?,
+            effective_count: count(counts.effective)?,
+            ineffective_count: count(counts.ineffective)?,
+            regression_count: count(counts.caused_regression)?,
+            inconclusive_count: count(counts.inconclusive)?,
+            unevaluated_count: count(counts.unjudged)?,
+            effectiveness_rate: counts.effective_rate(),
             fixes,
         })
     }
@@ -2639,10 +2637,6 @@ impl PgDb {
     }
 
     /// Get time-bucketed effectiveness rate from reflection_fixes.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
-    )]
     pub async fn get_effectiveness_over_time(
         &self,
         workflow_name: &str,
@@ -2662,12 +2656,12 @@ impl PgDb {
         };
         let base_query = format!(
             r#"SELECT DATE_TRUNC('{}', created_at::timestamp)::TEXT as bucket,
-                      COUNT(*) as total,
-                      SUM(CASE WHEN effectiveness = 'effective' THEN 1 ELSE 0 END) as effective
+                      {}
                FROM reflection_fixes
                WHERE source_task_run_id IN (SELECT id FROM task_runs WHERE workflow_name = $1)
                {} GROUP BY bucket ORDER BY bucket ASC"#,
             date_trunc,
+            crate::reflection::fix_verdicts::COUNT_COLUMNS,
             if cutoff.is_some() {
                 "AND created_at > $2::TEXT::timestamptz"
             } else {
@@ -2680,24 +2674,24 @@ impl PgDb {
             conn.query(&base_query, &[&workflow_name]).await
         }
         .map_err(|e| crate::database::pg::pg_err("PG get_effectiveness_over_time", &e))?;
+        let count = |n: i64| -> Result<u32, String> {
+            u32::try_from(n).map_err(|_| format!("fix count {n} does not fit a u32"))
+        };
         let mut eb = Vec::new();
         for row in &rows {
-            let bucket_label: String = row.get(0);
-            let total: i64 = row.get(1);
-            let effective: i64 = row.get(2);
-            let ineffective = total - effective;
-            let rate = if total > 0 {
-                effective as f64 / total as f64
-            } else {
-                0.0
-            };
+            let bucket_label: String = row
+                .try_get(0)
+                .map_err(|e| format!("effectiveness bucket label: {e}"))?;
+            let counts = crate::reflection::fix_verdicts::FixVerdictCounts::from_row(row, 1)?;
             eb.push(crate::reflection::trends::EffectivenessBucket {
                 bucket: bucket_label,
-                total: total as u32,
-                effective: effective as u32,
-                ineffective: ineffective as u32,
-                regression: 0,
-                effectiveness_rate: rate,
+                total: count(counts.total())?,
+                effective: count(counts.effective)?,
+                ineffective: count(counts.ineffective)?,
+                regression: count(counts.caused_regression)?,
+                inconclusive: count(counts.inconclusive)?,
+                unjudged: count(counts.unjudged)?,
+                effectiveness_rate: counts.effective_rate(),
             });
         }
         Ok(crate::reflection::trends::EffectivenessOverTime {
@@ -2736,3 +2730,6 @@ mod ranker_tests;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod verdict_tests;
