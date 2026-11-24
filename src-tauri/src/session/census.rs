@@ -671,6 +671,8 @@ async fn publisher_loop(app: tauri::AppHandle) {
             _ = ticker.tick() => {}
             _ = early.wait() => {}
         }
+        // Whichever arm won, this post answers every request made so far.
+        early.clear();
         let state = tick(&app, client.as_ref()).await;
         if last.as_ref() != Some(&state) {
             log_transition(&state);
@@ -750,9 +752,7 @@ impl HostedSubstrate {
     /// Every confirmed session's placement on THIS runner, through the layout
     /// join (`session_placement::placements_by_session`). Empty before the
     /// terminal manager is up.
-    fn placements(
-        &self,
-    ) -> std::collections::HashMap<String, crate::session_placement::Placement> {
+    fn placements(&self) -> std::collections::HashMap<String, crate::session_placement::Placement> {
         let Some(terminals) = &self.terminals else {
             return std::collections::HashMap::new();
         };

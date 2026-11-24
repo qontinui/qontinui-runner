@@ -96,12 +96,13 @@ pub fn placements_by_session(
             if session_id.is_empty() {
                 continue;
             }
-            out.entry(session_id.to_string()).or_insert_with(|| Placement {
-                terminal_id: terminal.info.id.clone(),
-                page_id: page.page_id.clone(),
-                page_name: page.label.clone(),
-                page_window: page.window.clone(),
-            });
+            out.entry(session_id.to_string())
+                .or_insert_with(|| Placement {
+                    terminal_id: terminal.info.id.clone(),
+                    page_id: page.page_id.clone(),
+                    page_name: page.label.clone(),
+                    page_window: page.window.clone(),
+                });
         }
     }
     out
@@ -155,6 +156,16 @@ impl EarlyPost {
             self.notify.notified().await;
         }
         tokio::time::sleep(self.debounce).await;
+        self.clear();
+    }
+
+    /// Mark every request so far as answered by the post about to be taken.
+    /// The publisher calls it right before each post, whichever arm woke it, so
+    /// an interval post that wins the race against a pending debounce also
+    /// consumes that request instead of being followed by a redundant early
+    /// post. Safe because each trigger site mutates state BEFORE requesting:
+    /// a request cleared here is reflected in the snapshot taken next.
+    pub fn clear(&self) {
         self.requested.store(false, Ordering::SeqCst);
     }
 }
@@ -345,7 +356,10 @@ mod tests {
             })
         );
         // Hosted by another runner on the device: no terminal here.
-        assert_eq!(placement_json(&rows, SID_ELSEWHERE), serde_json::Value::Null);
+        assert_eq!(
+            placement_json(&rows, SID_ELSEWHERE),
+            serde_json::Value::Null
+        );
     }
 
     /// A plain shell holds only the provisional record the spawn seam writes;
@@ -404,5 +418,25 @@ mod tests {
         early.request();
         tokio::time::sleep(Duration::from_millis(2100)).await;
         assert_eq!(posts.load(Ordering::SeqCst), 2);
+    }
+
+    /// An interval post that wins the race against a pending debounce clears
+    /// the request: no redundant early post follows it.
+    #[tokio::test(start_paused = true)]
+    async fn an_interval_post_answers_a_pending_request() {
+        let early = EarlyPost::new(EARLY_POST_DEBOUNCE);
+        early.request();
+        // The publisher's interval arm wins mid-debounce and posts.
+        early.clear();
+        let waited = tokio::time::timeout(Duration::from_secs(30), early.wait()).await;
+        assert!(
+            waited.is_err(),
+            "no early post after the interval answered it"
+        );
+
+        // A request after the clear is still honoured.
+        early.request();
+        let waited = tokio::time::timeout(Duration::from_secs(3), early.wait()).await;
+        assert!(waited.is_ok(), "a later request posts");
     }
 }
