@@ -810,7 +810,10 @@ fn a_prior_whose_tree_cannot_be_read_adds_no_block() {
     git(&c.path, &["switch", "-q", "main"]);
 
     prepare_canonical_excludes(&c.path, "unreadable", AGENT_BRANCH);
-    assert!(has_block(&c), "control: a readable prior with no .claude adds the block");
+    assert!(
+        has_block(&c),
+        "control: a readable prior with no .claude adds the block"
+    );
     remove_allocation_excludes(&c.path, AGENT_BRANCH);
     assert!(!has_block(&c));
 
@@ -821,10 +824,17 @@ fn a_prior_whose_tree_cannot_be_read_adds_no_block() {
         .join(&tree[..2])
         .join(&tree[2..]);
     std::fs::remove_file(&loose).expect("the prior's tree is a loose object");
-    git(&c.path, &["rev-parse", "--verify", "--quiet", "refs/heads/unreadable"]);
+    git(
+        &c.path,
+        &["rev-parse", "--verify", "--quiet", "refs/heads/unreadable"],
+    );
 
     prepare_canonical_excludes(&c.path, "unreadable", AGENT_BRANCH);
-    assert!(!has_block(&c), "an unreadable tree is UNKNOWN: {:?}", exclude(&c));
+    assert!(
+        !has_block(&c),
+        "an unreadable tree is UNKNOWN: {:?}",
+        exclude(&c)
+    );
 }
 
 // ------------------------------------------------ block bytes and guards
