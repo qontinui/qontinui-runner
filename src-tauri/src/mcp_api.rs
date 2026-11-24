@@ -6270,6 +6270,14 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     // Phase 3: the agent upstream-adopt (identical body, latest publication only).
     "coord_adopt_upstream_prompt_document",
     "coord_agent_registry_effective",
+    // Plan 2026-11-24-tenant-admins-switch-agent-spawns-off-per-agent-type
+    // Phase 4: admits the report the agent-spawn guard hook is to send (plan
+    // Phase 5) for an agent type it found no registry row for, so the admin
+    // catalog (Phase 3b, coord) can list it as `observed`. Designed as a
+    // best-effort background call on an `UNKNOWN_AGENT` miss that never blocks
+    // the spawn; until coord serves the tool, a call answers an error the hook
+    // ignores. It confers no spawn authority.
+    "coord_agent_registry_observe",
     "coord_alert_claim",
     "coord_alert_queue",
     "coord_alert_release",
@@ -17830,6 +17838,40 @@ mod coord_mcp_body_gate_tests {
                 parsed.allowed
             );
         }
+        assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
+    }
+
+    /// Plan `2026-11-24-tenant-admins-switch-agent-spawns-off-per-agent-type`
+    /// Phase 4: the guard hook's unknown-agent report forwards, in sorted
+    /// position, is not a deliberate exclusion, passes the body gate, and the
+    /// comment above it does not hide it from the source-text parse.
+    #[test]
+    fn coord_agent_registry_observe_is_allowed_and_parses_from_source() {
+        let tool = "coord_agent_registry_observe";
+        assert!(coord_mcp_tool_is_allowed(tool));
+        assert!(
+            COORD_MCP_ALLOWED_TOOLS.binary_search(&tool).is_ok(),
+            "membership is a binary_search, so the entry must sit in sorted position"
+        );
+        assert!(
+            !coord_mcp_withholding_is_deliberate(tool),
+            "{tool} must not also be a deliberate exclusion"
+        );
+        assert!(
+            gate(serde_json::json!({
+                "jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":tool,"arguments":{"agent_name":"explore"}}
+            }))
+            .is_ok(),
+            "{tool} must be callable through the proxy"
+        );
+        let parsed = working_tree_tool_policy();
+        assert_eq!(
+            parsed.allowed.iter().filter(|t| t.as_str() == tool).count(),
+            1,
+            "the parser must read the entry exactly once: {:?}",
+            parsed.allowed
+        );
         assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
     }
 
