@@ -3380,8 +3380,10 @@ pub struct AssertResponse {
     /// hide and the restore, and whether the page ended restored.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text_visibility: Option<super::text_visibility::TextVisibilityRun>,
-    /// One entry per `matches_isolated_render` assertion: what its baseline
-    /// and in-situ capture resolved to. Omitted when the request has none.
+    /// One entry per distinct `(component, baseline)` pair named by the
+    /// request's `matches_isolated_render` assertions (repeats are merged):
+    /// what its baseline and in-situ capture resolved to. Omitted when the
+    /// request has none.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub component_inputs: Vec<ComponentInputReport>,
 }
