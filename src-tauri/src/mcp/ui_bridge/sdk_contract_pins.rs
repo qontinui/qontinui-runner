@@ -305,6 +305,11 @@ fn visibility_report_pins_the_sdk_report_level_keys() {
         report["occlusions"].is_array(),
         "`occlusions` is the SDK's entry list"
     );
+    assert!(
+        report["clipped"].is_array(),
+        "`clipped` is a required key of the SDK's VisibilityReport, present \
+         (empty) even when nothing is clipped"
+    );
     assert_eq!(
         report["elementCount"], 1,
         "`elementCount` is the size of the swept population, not of the result \
@@ -508,6 +513,31 @@ fn visibility_min_ratio_is_a_strict_below_filter() {
         below_threshold["verdict"], "clear",
         "a fully-filtered list is `clear`, not `unknown_empty_registry` — the \
          registry was not empty"
+    );
+
+    // The clipped list shares the boundary: the SDK keeps a clip when
+    // `clipRatio >= minRatio`, so a clip exactly AT the threshold is listed and
+    // one just below it is not.
+    let clipped = [serde_json::json!({
+        "id": "tab-2",
+        "state": {
+            "visible": false,
+            "visibilityReason": "clipped",
+            "clippedPct": 2,
+            "clipScrollable": false,
+        }
+    })];
+    let at = build_visibility_report(&clipped, 0.02, false, None);
+    assert_eq!(
+        at["clipped"].as_array().map(Vec::len),
+        Some(1),
+        "a clip exactly AT minRatio is listed, matching the SDK's `>=`"
+    );
+    let below = build_visibility_report(&clipped, 0.020_001, false, None);
+    assert_eq!(
+        below["clipped"].as_array().map(Vec::len),
+        Some(0),
+        "a clip just below minRatio is dropped"
     );
 }
 
