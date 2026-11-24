@@ -18,3 +18,7 @@ pub mod egress_context;
 // (`crate_roots_ratchet` fails on that).
 pub use qontinui_runner_lib::util::error_chain;
 pub mod path_extraction;
+// Resolve a path through its nearest EXISTING directory ancestor (the
+// ancestor-walk-then-rejoin the snapshot reader and the worktree census both
+// need). One copy; see the module doc for why it is not `Path::canonicalize`.
+pub mod existing_ancestor;
