@@ -1164,16 +1164,72 @@ pub(super) fn newest_artifact_age(target_root: &Path) -> Option<Duration> {
 /// this; the reaper's own logging keeps the scalar form.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SizeMeasurement {
+    /// APPARENT size: the sum of every regular file's length, a hardlinked
+    /// file counted once per link (directory entries and symlinks are not
+    /// counted, so this is close to, not equal to, `du --apparent-size
+    /// --count-links`; plain `du` counts each inode once).
     pub bytes: u64,
     /// Sub-directories whose `read_dir` failed. `> 0` ⇒ `bytes` is a LOWER
     /// BOUND, and the caller must say so rather than present it as exact.
     pub unreadable_dirs: usize,
+    /// The bytes that REMOVING the directory would free: each inode counted
+    /// once, and an inode that is still linked from outside the directory
+    /// counted not at all (a pnpm `node_modules` hardlinks its packages from
+    /// the content-addressed store, so its apparent size is mostly the
+    /// store's). `None` = UNKNOWN: off unix the directory record carries no
+    /// link count and the walk does not open files to read one,
+    /// and a walk that hit an unreadable sub-directory (`unreadable_dirs > 0`)
+    /// cannot tell an outside link from one hidden in the unread part.
+    /// It is exclusive by LENGTH: a reflink/CoW clone (pnpm's `clone` import
+    /// on btrfs or APFS) has one link yet shares its extents, and a sparse
+    /// file's length exceeds its blocks, so on such files it can overstate
+    /// what removal frees.
+    /// Plan `2026-11-22-worktree-census-counts-hardlinked-pnpm-store-bytes-as-reclaimable`.
+    pub exclusive_bytes: Option<u64>,
 }
+
+/// Inodes seen with `nlink > 1`, keyed by `(dev, ino)`: `(len, nlink, seen)`.
+#[cfg(unix)]
+type SharedInodes = std::collections::HashMap<(u64, u64), (u64, u64, u64)>;
 
 /// Measure `dir` recursively, junction-safe. `None` iff `dir` itself could not
 /// be read at all — an UNKNOWN size, never a zero.
 pub(super) fn measure_dir_size(dir: &Path) -> Option<SizeMeasurement> {
-    let read = std::fs::read_dir(dir).ok()?;
+    #[cfg(unix)]
+    {
+        let mut shared = SharedInodes::new();
+        let mut unique_bytes = 0u64;
+        let mut m = measure_dir_size_walk(dir, &mut shared, &mut unique_bytes).ok()?;
+        // An inode whose every link was seen inside the tree goes with it;
+        // one with links elsewhere survives the removal and frees nothing.
+        let shared_freed = shared
+            .values()
+            .filter(|(_, nlink, seen)| seen >= nlink)
+            .fold(0u64, |acc, (len, _, _)| acc.saturating_add(*len));
+        // A partial walk cannot tell an outside link from one in the unread
+        // part, so its figure is not exact: UNKNOWN, never a lower bound
+        // presented as a measurement.
+        m.exclusive_bytes =
+            (m.unreadable_dirs == 0).then(|| unique_bytes.saturating_add(shared_freed));
+        Some(m)
+    }
+    #[cfg(not(unix))]
+    {
+        measure_dir_size_walk(dir).ok()
+    }
+}
+
+/// The recursive walk behind [`measure_dir_size`]. On unix it records each
+/// regular file's identity so the caller can compute exclusive bytes; the
+/// returned measurement's `exclusive_bytes` is left `None` for the caller.
+/// `Err` carries `dir`'s own `read_dir` failure, so a parent can tell a
+/// sub-directory that vanished from one it could not read.
+fn measure_dir_size_walk(
+    dir: &Path,
+    #[cfg(unix)] shared: &mut SharedInodes,
+    #[cfg(unix)] unique_bytes: &mut u64,
+) -> std::io::Result<SizeMeasurement> {
+    let read = std::fs::read_dir(dir)?;
     let mut m = SizeMeasurement::default();
     for entry in read {
         // An entry that errors after a successful open would otherwise be
@@ -1186,9 +1242,15 @@ pub(super) fn measure_dir_size(dir: &Path) -> Option<SizeMeasurement> {
         // file of every candidate target and used to open each one. On Windows
         // a record's size can lag a file that is open for writing (NTFS updates
         // the directory entry lazily), so a target mid-build can read a little
-        // low. Sizes here feed reports, never a reap decision.
+        // low. Sizes here feed reports, never a reap decision. On unix this is
+        // an lstat, which already carries dev/ino/nlink — no extra syscall.
         let meta = match entry.metadata() {
             Ok(meta) => meta,
+            // Removed between `readdir` and `lstat` (a `target/` mid-build,
+            // an install in progress): it is no longer there to free, and
+            // counting it unreadable would make the whole tree's exclusivity
+            // UNKNOWN for a file that does not exist.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(_) => {
                 m.unreadable_dirs += 1;
                 continue;
@@ -1206,18 +1268,40 @@ pub(super) fn measure_dir_size(dir: &Path) -> Option<SizeMeasurement> {
                 continue;
             }
             let path = entry.path();
-            match measure_dir_size(&path) {
-                Some(child) => {
+            #[cfg(unix)]
+            let child = measure_dir_size_walk(&path, shared, unique_bytes);
+            #[cfg(not(unix))]
+            let child = measure_dir_size_walk(&path);
+            match child {
+                Ok(child) => {
                     m.bytes = m.bytes.saturating_add(child.bytes);
                     m.unreadable_dirs += child.unreadable_dirs;
                 }
-                None => m.unreadable_dirs += 1,
+                // A sub-directory removed between this readdir and its own
+                // (a cargo incremental session dir mid-build) is gone, not
+                // unreadable: skip it as the lstat arm skips a vanished file.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => m.unreadable_dirs += 1,
             }
         } else if ft.is_file() {
             m.bytes = m.bytes.saturating_add(meta.len());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if meta.nlink() <= 1 {
+                    *unique_bytes = unique_bytes.saturating_add(meta.len());
+                } else {
+                    let e = shared.entry((meta.dev(), meta.ino())).or_insert((
+                        meta.len(),
+                        meta.nlink(),
+                        0,
+                    ));
+                    e.2 += 1;
+                }
+            }
         }
     }
-    Some(m)
+    Ok(m)
 }
 
 /// The reason a candidate was NOT reaped this tick (for shadow-mode logging and
@@ -4356,11 +4440,13 @@ mod tests {",
         let partial = render_size(Some(SizeMeasurement {
             bytes: 1_073_741_824,
             unreadable_dirs: 3,
+            exclusive_bytes: None,
         }));
         assert!(partial.contains("LOWER BOUND"), "{partial}");
         let exact = render_size(Some(SizeMeasurement {
             bytes: 2_147_483_648,
             unreadable_dirs: 0,
+            exclusive_bytes: None,
         }));
         assert_eq!(exact, "2.00 GB");
     }
@@ -5434,13 +5520,16 @@ mod tests {",
 
     #[test]
     fn the_size_walk_reads_directory_records_not_files() {
-        let code = prod_fn_code("measure_dir_size");
-        assert!(code.contains("entry.metadata()"));
-        for opened in ["symlink_metadata(", "is_junction("] {
-            assert!(
-                !code.contains(opened),
-                "`{opened}` opens every file of every candidate target it sizes"
-            );
+        let walk = prod_fn_code("measure_dir_size_walk");
+        assert!(walk.contains("entry.metadata()"));
+        let entry = prod_fn_code("measure_dir_size");
+        for code in [&walk, &entry] {
+            for opened in ["symlink_metadata(", "is_junction(", "fs::metadata("] {
+                assert!(
+                    !code.contains(opened),
+                    "`{opened}` opens every file of every candidate target it sizes"
+                );
+            }
         }
     }
 
@@ -5473,6 +5562,95 @@ mod tests {",
             "100 + 250 + 7; the linked tree is never counted"
         );
         assert_eq!(m.unreadable_dirs, 0);
+        #[cfg(unix)]
+        assert_eq!(
+            m.exclusive_bytes,
+            Some(357),
+            "no hardlinks: every byte is freed by removing the tree"
+        );
+        #[cfg(not(unix))]
+        assert_eq!(m.exclusive_bytes, None, "no link count off unix: UNKNOWN");
+    }
+
+    /// A walk that could not read a sub-directory reports exclusivity as
+    /// UNKNOWN: the hidden part may hold the other link of an inode it saw.
+    #[cfg(unix)]
+    #[test]
+    fn a_partial_walk_reports_exclusive_bytes_as_unknown() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("seen.bin"), vec![0u8; 10]).unwrap();
+        let locked = root.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::hard_link(root.join("seen.bin"), locked.join("other.bin")).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let readable_anyway = std::fs::read_dir(&locked).is_ok();
+        let m = measure_dir_size(root);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if readable_anyway {
+            // Running as root: permissions do not bind, nothing to observe.
+            eprintln!("SKIP a_partial_walk_reports_exclusive_bytes_as_unknown: permissions do not bind for this user");
+            return;
+        }
+        let m = m.expect("root is readable");
+        assert_eq!(m.unreadable_dirs, 1);
+        assert_eq!(
+            m.exclusive_bytes, None,
+            "a lower bound is not a measurement"
+        );
+        let full = measure_dir_size(root).expect("readable again");
+        assert_eq!(
+            full.exclusive_bytes,
+            Some(10),
+            "both links in-tree: freed once"
+        );
+    }
+
+    /// Exclusive bytes count each inode once and drop an inode still linked
+    /// from outside the tree — the shape of a pnpm `node_modules` whose
+    /// packages are hardlinked from the content-addressed store. Unlinking
+    /// the outside copy must move the figure, so a hardcoded value fails.
+    #[cfg(unix)]
+    #[test]
+    fn exclusive_bytes_dedupe_inodes_and_drop_outside_linked_files() {
+        let outside = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Linked from outside: 1000 apparent bytes, 0 freed while the store
+        // copy lives.
+        let store_copy = outside.path().join("store.bin");
+        std::fs::write(&store_copy, vec![0u8; 1000]).unwrap();
+        std::fs::create_dir(root.join("pkg")).unwrap();
+        std::fs::hard_link(&store_copy, root.join("pkg").join("store.bin")).unwrap();
+        // Unique: 30 bytes.
+        std::fs::write(root.join("unique.bin"), vec![0u8; 30]).unwrap();
+        // An in-tree pair (a cargo uplift): 200 apparent twice, freed once.
+        std::fs::write(root.join("pair-a.bin"), vec![0u8; 200]).unwrap();
+        std::fs::hard_link(root.join("pair-a.bin"), root.join("pkg").join("pair-b.bin")).unwrap();
+
+        let m = measure_dir_size(root).expect("root is readable");
+        assert_eq!(m.bytes, 1000 + 30 + 200 + 200, "apparent size, per link");
+        assert_eq!(m.exclusive_bytes, Some(30 + 200));
+
+        std::fs::remove_file(&store_copy).unwrap();
+        let m = measure_dir_size(root).expect("root is readable");
+        assert_eq!(m.bytes, 1430, "apparent size does not move");
+        assert_eq!(
+            m.exclusive_bytes,
+            Some(1000 + 30 + 200),
+            "with the outside link gone, removing the tree frees that file"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn exclusive_bytes_are_unknown_on_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.bin"), vec![0u8; 10]).unwrap();
+        let m = measure_dir_size(dir.path()).expect("root is readable");
+        assert_eq!(m.bytes, 10);
+        assert_eq!(m.exclusive_bytes, None);
     }
 
     /// The reparse test the walkers now apply to a directory RECORD answers
