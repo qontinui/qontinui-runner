@@ -1185,7 +1185,18 @@ fn transcript_bind_env(
             let store = lifecycle.as_ref().ok_or("lifecycle_store_unavailable")?;
             Ok(store
                 .get_checked(csid)
-                .map_err(|_| "lifecycle_store_unreadable")?
+                .map_err(|_| {
+                    // Name WHERE an operator looks, by file name only: a
+                    // refusal detail never carries a path.
+                    if store.is_load_degraded() {
+                        "lifecycle_store_unreadable: the lifecycle snapshot \
+                         (`terminal-sessions*.json`) is DEGRADED: its `.degraded` marker \
+                         sits beside it and the original is preserved as its \
+                         `.quarantine-<ms>` sibling; the runner log names both paths"
+                    } else {
+                        "lifecycle_store_unreadable: the lifecycle store's lock is poisoned"
+                    }
+                })?
                 .filter(|rec| rec.state == "open" && !rec.terminal_id.trim().is_empty())
                 .map(|rec| SessionHost {
                     terminal_id: rec.terminal_id,
@@ -3741,7 +3752,14 @@ mod tests {
         /// would resolve `.mcp.json` against the runner process's cwd. The
         /// workdir is created UNDER that cwd, so its relative spelling reaches
         /// the real file (keeping it would bind) and shares the cwd's drive on
-        /// Windows; the guard removes it.
+        /// Windows.
+        ///
+        /// Needs a WRITABLE cwd (the crate dir under `cargo test`). The tempdir
+        /// guard removes it; only a panic or a killed run leaves a
+        /// `.t10-relative-wd-*` dir, which `src-tauri/.gitignore` ignores. It
+        /// does not chdir into a tempdir instead: nothing serialises the
+        /// process cwd (`terminal/pane_io.rs` relies on no test calling
+        /// `set_current_dir`), so a chdir would race every concurrent test.
         #[tokio::test]
         async fn t10_a_relative_hosting_workdir_is_no_workdir() {
             use crate::session::session_lifecycle_store::{
@@ -3862,6 +3880,7 @@ mod tests {
             let detail = refused(status, &v, &outbox, &[wd.as_str(), bound.as_str()]);
             assert!(detail.contains("lifecycle_store_unreadable"), "{detail}");
             assert!(detail.contains("UNKNOWN"), "{detail}");
+            assert!(detail.contains("lock is poisoned"), "{detail}");
 
             // So is a store whose snapshot loaded DEGRADED (here: a file that
             // is not a JSON object, so it starts empty). Its silence about the
@@ -3871,9 +3890,18 @@ mod tests {
             let degraded = Arc::new(SessionLifecycleStore::open(&degraded_path).unwrap());
             let (status, v) =
                 call_route(&t, Some(&degraded), &watched, &bearer(&key), &body(&csid)).await;
-            let detail = refused(status, &v, &outbox, &[wd.as_str(), bound.as_str()]);
+            let state_dir_str = state_dir.to_string_lossy().into_owned();
+            let detail = refused(
+                status,
+                &v,
+                &outbox,
+                &[wd.as_str(), bound.as_str(), state_dir_str.as_str()],
+            );
             assert!(detail.contains("lifecycle_store_unreadable"), "{detail}");
             assert!(detail.contains("UNKNOWN"), "{detail}");
+            assert!(detail.contains("DEGRADED"), "{detail}");
+            assert!(detail.contains("`.degraded` marker"), "{detail}");
+            assert!(detail.contains("`.quarantine-<ms>`"), "{detail}");
 
             let store = Arc::new(
                 SessionLifecycleStore::open(state_dir.join("terminal-sessions.json")).unwrap(),

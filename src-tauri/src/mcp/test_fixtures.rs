@@ -2181,7 +2181,8 @@ fn list_lifecycle_open_records_in(store: &SessionLifecycleStore) -> Vec<OpenLife
 }
 
 /// Core clear logic, path-injectable so it's unit-testable without an
-/// `ApiState`. Removes the snapshot AND its sibling WAL.
+/// `ApiState`. Removes the snapshot, its sibling WAL, and any degraded-load
+/// marker beside it.
 ///
 /// Dropping the WAL is not optional: `SessionLifecycleStore::open` replays it
 /// OVER the snapshot, so a WAL surviving a "clear" resurrects every row the
@@ -2192,8 +2193,15 @@ fn list_lifecycle_open_records_in(store: &SessionLifecycleStore) -> Vec<OpenLife
 /// reports `false` rather than erroring, so a clear is idempotent.
 fn clear_lifecycle_store_at(path: &Path) -> Result<(bool, bool), (StatusCode, String)> {
     let wal = crate::session::session_lifecycle_store::wal_path_for(path);
-    let mut removed = [false; 2];
-    for (slot, target) in [(0usize, path), (1usize, wal.as_path())] {
+    // A degraded-load marker left by an earlier load would keep the cleared
+    // store answering unheld sessions UNKNOWN; a clear starts from nothing.
+    let marker = crate::session::session_lifecycle_store::degraded_marker_path(path);
+    let mut removed = [false; 3];
+    for (slot, target) in [
+        (0usize, path),
+        (1usize, wal.as_path()),
+        (2usize, marker.as_path()),
+    ] {
         match std::fs::remove_file(target) {
             Ok(()) => removed[slot] = true,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -5200,6 +5208,33 @@ mod tests {
             list_lifecycle_open_at(&path).is_empty(),
             "the next reader sees an empty store, not the WAL-replayed rows"
         );
+    }
+
+    /// The clear also drops a degraded-load marker: left behind, the next
+    /// store opened at the cleared path would start DEGRADED and answer every
+    /// session it does not hold UNKNOWN.
+    #[test]
+    fn clear_lifecycle_store_drops_the_degraded_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        std::fs::write(&path, b"[]").unwrap();
+        let marker = crate::session::session_lifecycle_store::degraded_marker_path(&path);
+        assert!(
+            SessionLifecycleStore::open(&path)
+                .unwrap()
+                .is_load_degraded(),
+            "precondition: a degraded load"
+        );
+        assert!(
+            marker.exists(),
+            "precondition: the degraded load left a marker"
+        );
+
+        clear_lifecycle_store_at(&path).expect("clear");
+        assert!(!marker.exists(), "the clear must delete the marker");
+        assert!(!SessionLifecycleStore::open(&path)
+            .unwrap()
+            .is_load_degraded());
     }
 
     /// The read-back must read the SAME store the runner is using. This is the
