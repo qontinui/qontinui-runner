@@ -48,6 +48,7 @@ import { deriveStatusBanner } from "./webIntegrationBanner";
 import { EgressPrivacyPanel } from "./EgressPrivacyPanel";
 import type { LogFunction } from "./types";
 import type { SetRunnerTierResult } from "@/hooks/useRunnerTier";
+import { PRODUCTION_BACKEND_URL } from "@/lib/savedBackendUrl";
 import {
   usePerfCaps,
   loadPerfCaps,
@@ -251,7 +252,7 @@ function deriveWebAppUrl(backendUrl: string): string | null {
 // Component
 // ---------------------------------------------------------------------------
 
-const PLACEHOLDER_BACKEND_URL = "https://api.qontinui.io";
+const PLACEHOLDER_BACKEND_URL = PRODUCTION_BACKEND_URL;
 
 /**
  * The connection-state banner. Renders from `deriveStatusBanner`, so every
