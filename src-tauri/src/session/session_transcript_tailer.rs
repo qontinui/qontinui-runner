@@ -2413,59 +2413,16 @@ mod tests {
         assert!(!t.report_coverage_once(), "and only once");
     }
 
-    /// Capture everything logged at INFO and above on THIS thread while the
-    /// returned guard lives — the pattern of `plan_workunit_adapter::trigger`'s
-    /// `CapturedLogs`: thread-local (`set_default`), ANSI off so a field
-    /// renders as plain `name=value`.
-    struct CapturedLogs {
-        buf: Arc<Mutex<Vec<u8>>>,
-        _guard: tracing::subscriber::DefaultGuard,
-    }
-
-    impl CapturedLogs {
-        fn start() -> Self {
-            use std::io::Write;
-
-            #[derive(Clone, Default)]
-            struct Writer(Arc<Mutex<Vec<u8>>>);
-            impl Write for Writer {
-                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                    self.0
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .extend_from_slice(buf);
-                    Ok(buf.len())
-                }
-                fn flush(&mut self) -> std::io::Result<()> {
-                    Ok(())
-                }
-            }
-            impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Writer {
-                type Writer = Writer;
-                fn make_writer(&'a self) -> Self::Writer {
-                    self.clone()
-                }
-            }
-
-            let writer = Writer::default();
-            let buf = writer.0.clone();
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(writer)
-                .with_ansi(false)
-                .with_max_level(tracing::Level::INFO)
-                .finish();
-            let guard = tracing::subscriber::set_default(subscriber);
-            Self { buf, _guard: guard }
-        }
-
-        /// The captured lines containing `needle`.
-        fn lines_with(&self, needle: &str) -> Vec<String> {
-            String::from_utf8_lossy(&self.buf.lock().unwrap_or_else(|e| e.into_inner()))
-                .lines()
-                .filter(|l| l.contains(needle))
-                .map(str::to_string)
-                .collect()
-        }
+    /// The lines of `logs` containing `needle`. `logs` comes from
+    /// [`crate::resource_guard::capture_logs`] (INFO and above, ANSI off, so a
+    /// field renders as plain `name=value`), which a bin-crate log assertion
+    /// goes through so a parallel subscriber-less test cannot cache `never`
+    /// for the call site under test.
+    fn lines_with(logs: &str, needle: &str) -> Vec<String> {
+        logs.lines()
+            .filter(|l| l.contains(needle))
+            .map(str::to_string)
+            .collect()
     }
 
     /// Runner review r5, finding 2: a RECORDED sidechain heartbeat writes one
@@ -2479,11 +2436,13 @@ mod tests {
         let csid = Uuid::new_v4().to_string();
         sniff_register(&registrar, &csid);
 
-        let logs = CapturedLogs::start();
-        let t0 = Instant::now();
-        t.note_sidechain_activity_at(&csid, 8, t0);
-        t.note_sidechain_activity_at(&csid, 8, t0 + Duration::from_secs(5));
-        let lines = logs.lines_with(
+        let ((), logs) = crate::resource_guard::capture_logs(|| {
+            let t0 = Instant::now();
+            t.note_sidechain_activity_at(&csid, 8, t0);
+            t.note_sidechain_activity_at(&csid, 8, t0 + Duration::from_secs(5));
+        });
+        let lines = lines_with(
+            &logs,
             "session_transcript_tailer: sidechain heartbeat recorded for parent session",
         );
         assert_eq!(lines.len(), 1, "one line per recorded heartbeat: {lines:?}");
@@ -2505,9 +2464,9 @@ mod tests {
         sniff_register(&registrar, &csid);
         t.note_sidechain_activity_at(&csid, 8, Instant::now());
 
-        let logs = CapturedLogs::start();
-        assert!(t.report_coverage_once());
-        let lines = logs.lines_with("session_transcript_tailer: coverage");
+        let (reported, logs) = crate::resource_guard::capture_logs(|| t.report_coverage_once());
+        assert!(reported);
+        let lines = lines_with(&logs, "session_transcript_tailer: coverage");
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].contains(" INFO "), "{}", lines[0]);
         assert!(
@@ -2534,9 +2493,9 @@ mod tests {
         let r = t.coverage();
         assert!(r.sessions_unbound > 0 && r.sessions_tailed == 0, "blind");
 
-        let logs = CapturedLogs::start();
-        assert!(t.report_coverage_once());
-        let lines = logs.lines_with("RUNNING BUT REACHING NO PANE");
+        let (reported, logs) = crate::resource_guard::capture_logs(|| t.report_coverage_once());
+        assert!(reported);
+        let lines = lines_with(&logs, "RUNNING BUT REACHING NO PANE");
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].contains(" WARN "), "{}", lines[0]);
         assert!(
