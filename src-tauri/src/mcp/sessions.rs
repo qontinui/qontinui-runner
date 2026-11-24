@@ -3738,18 +3738,23 @@ mod tests {
         /// production host lookup drops it, so the terminal's declared
         /// credential cannot be read (`no_session_nonce`) and the shared key is
         /// refused, even with the terminal's own proof. Kept, the relative path
-        /// would resolve `.mcp.json` against the runner process's cwd. The path
-        /// here is built to reach the real workdir FROM that cwd, so keeping it
-        /// would bind.
+        /// would resolve `.mcp.json` against the runner process's cwd. The
+        /// workdir is created UNDER that cwd, so its relative spelling reaches
+        /// the real file (keeping it would bind) and shares the cwd's drive on
+        /// Windows; the guard removes it.
         #[tokio::test]
         async fn t10_a_relative_hosting_workdir_is_no_workdir() {
             use crate::session::session_lifecycle_store::{
                 test_open_record, SessionLifecycleStore, ORIGIN_AUTHORITATIVE,
             };
-            use std::path::{Component, Path, PathBuf};
             let amb = crate::test_env::isolated_ambient();
             let _sync_on = route_machine(&amb);
-            let wd = fresh_workdir(amb.dir());
+            let cwd = std::env::current_dir().unwrap();
+            let under_cwd = tempfile::Builder::new()
+                .prefix(".t10-relative-wd-")
+                .tempdir_in(&cwd)
+                .unwrap();
+            let wd = fresh_workdir(under_cwd.path());
             crate::coord_mcp::write_coord_mcp_proxy_config(&wd, PORT, None);
             let key = cwd_key(&wd);
             let a = terminal();
@@ -3758,19 +3763,10 @@ mod tests {
             let granted_a = grant(&a);
 
             // `wd`, spelled relative to the process cwd.
-            let cwd = std::env::current_dir().unwrap();
-            let mut rel = PathBuf::new();
-            for _ in cwd
-                .components()
-                .filter(|c| matches!(c, Component::Normal(_)))
-            {
-                rel.push("..");
-            }
-            for c in Path::new(&wd).components() {
-                if let Component::Normal(part) = c {
-                    rel.push(part);
-                }
-            }
+            let rel = std::path::Path::new(&wd)
+                .strip_prefix(&cwd)
+                .expect("the workdir was created under the cwd")
+                .to_path_buf();
             assert!(!rel.is_absolute());
             assert!(
                 rel.join(".mcp.json").is_file(),

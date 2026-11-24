@@ -1378,14 +1378,25 @@ pub struct SessionLifecycleStore {
     /// outlive a sub-millisecond window. Taken only while the `map` lock is
     /// held (lock order `map` then this).
     unmarked_stamps: Mutex<HashMap<String, i64>>,
-    /// Whether the snapshot this map was last loaded from could NOT be read
-    /// in full ([`load_map`]): the read failed, the file was not a
-    /// JSON object, or a malformed row was dropped. Each starts the map
-    /// without records the file held, so an id the map does not hold may
-    /// still be a live session. Only [`Self::get_checked`] reads it, and only
-    /// to answer such an id UNKNOWN instead of "no record". Set at
+    /// Whether this store's snapshot is DEGRADED ([`load_map`]): this load,
+    /// or an earlier one whose marker file ([`degraded_marker_path`]) is still
+    /// on disk, could not read the snapshot in full — the read failed, the
+    /// file was not a JSON object, or a malformed row was dropped. Each starts
+    /// the map without records the file held, so an id the map does not hold
+    /// may still be a live session. Durable by the marker: a compaction that
+    /// rewrites the snapshot from the partial map, or a restart, does not
+    /// clear it — only [`Self::clear_degraded_marker`] does. Only
+    /// [`Self::get_checked`] (and [`Self::is_load_degraded`]) read it, and
+    /// only to answer such an id UNKNOWN instead of "no record". Set at
     /// [`Self::open`] and re-set by [`Self::reload_from_disk`].
     load_degraded: AtomicBool,
+    /// Whether this process may write the snapshot. `false` when a degraded
+    /// load could not PRESERVE the original snapshot (the marker or the
+    /// quarantine copy failed — [`quarantine_degraded_snapshot`]): writing the
+    /// partial map over a snapshot whose read failed would destroy the very
+    /// records the load could not read. While `false`, [`Self::compact`] and
+    /// [`Self::reload_from_disk`] keep the WAL and never touch the snapshot.
+    snapshot_writable: AtomicBool,
 }
 
 /// What [`SessionLifecycleStore::redirect_finish`] did.
@@ -1586,7 +1597,7 @@ impl SessionLifecycleStore {
             std::fs::create_dir_all(parent)?;
         }
         let wal_path = wal_path_for(&path);
-        let (mut map, load_degraded) = load_map(&path);
+        let (mut map, load_degraded, snapshot_writable) = load_map(&path);
         let replay = replay_wal(&wal_path, &mut map);
         // A held row is unbound by rule; a file written before the rule (or by
         // hand) may still carry its old terminal id.
@@ -1612,6 +1623,7 @@ impl SessionLifecycleStore {
             finish_forward: Mutex::new(()),
             unmarked_stamps: Mutex::new(HashMap::new()),
             load_degraded: AtomicBool::new(load_degraded),
+            snapshot_writable: AtomicBool::new(snapshot_writable),
         };
         if replay.applied > 0 || replay.damaged {
             info!(
@@ -4526,10 +4538,11 @@ impl SessionLifecycleStore {
     ///
     /// - the lock is poisoned — every id is `Err`, as in
     ///   [`Self::all_records_checked`];
-    /// - the snapshot was loaded DEGRADED ([`load_map`]: a read
-    ///   error, a file that is not a JSON object, or a dropped malformed row) —
-    ///   an id the map does not hold is `Err`, because the record may be one
-    ///   the load lost, while an id it does hold is still `Ok(Some)`.
+    /// - the snapshot is DEGRADED ([`load_map`]: a read error, a file that is
+    ///   not a JSON object, or a dropped malformed row, in this load or in an
+    ///   earlier one whose marker is still on disk) — an id the map does not
+    ///   hold is `Err`, because the record may be one a load lost, while an
+    ///   id it does hold is still `Ok(Some)`.
     ///
     /// Only this reader distinguishes a degraded load; every other reader
     /// answers from the map as it stands.
@@ -5169,8 +5182,9 @@ impl SessionLifecycleStore {
             .wal
             .lock()
             .map_err(|_| std::io::Error::other("session lifecycle WAL lock poisoned"))?;
-        let (mut fresh, degraded) = load_map(&self.path);
+        let (mut fresh, degraded, writable) = load_map(&self.path);
         self.load_degraded.store(degraded, Ordering::Release);
+        self.snapshot_writable.store(writable, Ordering::Release);
         let replay = replay_wal(&self.wal_path, &mut fresh);
         // Same rule as `open`: a held row is unbound. The rewrite below
         // persists it.
@@ -5187,6 +5201,16 @@ impl SessionLifecycleStore {
         }
         *m = fresh;
         let count = m.len();
+        if !writable {
+            // The snapshot's read failed and could not be preserved: never
+            // write over it, and keep the WAL — it is the only durable record
+            // of the reloaded state.
+            warn!(
+                path = %self.path.display(),
+                "session_lifecycle_store: reload skipped the snapshot rewrite — an unreadable snapshot could not be preserved"
+            );
+            return Ok(count);
+        }
         if let Err(e) = write_map(&self.path, &m) {
             warn!(error = %e, "session_lifecycle_store: reload snapshot rewrite failed");
         }
@@ -5205,6 +5229,38 @@ impl SessionLifecycleStore {
             ),
         }
         Ok(count)
+    }
+
+    /// Whether this store's snapshot is DEGRADED (see the `load_degraded`
+    /// field): a load could not read it in full, now or in an earlier process
+    /// whose marker is still on disk. While `true`, [`Self::get_checked`]
+    /// answers an id the map does not hold UNKNOWN.
+    pub fn is_load_degraded(&self) -> bool {
+        self.load_degraded.load(Ordering::Acquire)
+    }
+
+    /// The explicit MAINTENANCE action that ends a degraded state: remove the
+    /// marker file ([`degraded_marker_path`]) and stop answering unheld ids
+    /// UNKNOWN. Call it only once the preserved original
+    /// (`<snapshot>.quarantine-<ms>`, beside the snapshot) has been inspected
+    /// and whatever it held that matters has been restored or given up — no
+    /// other path clears the state, because every other path (a compaction, a
+    /// restart) would launder a lost record into "unhosted".
+    ///
+    /// It does NOT re-enable snapshot writes that a failed preservation
+    /// disabled; a reopen or [`Self::reload_from_disk`] re-decides that.
+    pub fn clear_degraded_marker(&self) -> std::io::Result<()> {
+        match std::fs::remove_file(degraded_marker_path(&self.path)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        self.load_degraded.store(false, Ordering::Release);
+        info!(
+            path = %self.path.display(),
+            "session_lifecycle_store: degraded marker cleared by maintenance"
+        );
+        Ok(())
     }
 
     /// Fold the WAL into the JSON snapshot and truncate it.
@@ -5231,6 +5287,16 @@ impl SessionLifecycleStore {
                 return;
             }
         };
+        if !self.snapshot_writable.load(Ordering::Acquire) {
+            // A degraded load could not preserve the snapshot it failed to
+            // read; rewriting it from the partial map would destroy what it
+            // still holds. The WAL stays the durable record.
+            debug!(
+                path = %self.path.display(),
+                "session_lifecycle_store: compaction skipped — the unreadable snapshot is unpreserved"
+            );
+            return;
+        }
         if let Err(e) = write_map(&self.path, &m) {
             warn!(
                 error = %e,
@@ -5965,17 +6031,25 @@ fn dedupe_open_by_terminal(records: Vec<TerminalSessionRecord>) -> Vec<TerminalS
 /// Load the JSON snapshot at `path`, and say whether the load was DEGRADED:
 /// `true` when the file exists but could not be read in full — the read
 /// failed, the file is not a JSON object, or at least one malformed row was
-/// dropped. Each of those returns a map missing records the file held. An
-/// absent file is a fresh install, not a degraded load.
-fn load_map(path: &Path) -> (HashMap<String, TerminalSessionRecord>, bool) {
+/// dropped — and also whenever an earlier degraded load's MARKER is still on
+/// disk ([`degraded_marker_path`]), since the snapshot may since have been
+/// rewritten from that load's partial map. An absent file with no marker is a
+/// fresh install, not a degraded load.
+///
+/// Every degraded load PRESERVES the original before anything can overwrite
+/// it ([`quarantine_degraded_snapshot`]). The third value says whether the
+/// snapshot may be written: `false` only when that preservation failed.
+fn load_map(path: &Path) -> (HashMap<String, TerminalSessionRecord>, bool, bool) {
+    let marked = degraded_marker_path(path).exists();
     if !path.exists() {
-        return (HashMap::new(), false);
+        return (HashMap::new(), marked, true);
     }
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => {
             warn!(error = %e, "session_lifecycle_store: read failed — starting empty");
-            return (HashMap::new(), true);
+            let writable = quarantine_degraded_snapshot(path, None, "read failed");
+            return (HashMap::new(), true, writable);
         }
     };
     // Two-stage parse so ONE malformed record can't discard the whole store.
@@ -5995,7 +6069,8 @@ fn load_map(path: &Path) -> (HashMap<String, TerminalSessionRecord>, bool) {
                 path = %path.display(),
                 "session_lifecycle_store: corrupt map file (not a JSON object) — starting empty"
             );
-            return (HashMap::new(), true);
+            let writable = quarantine_degraded_snapshot(path, Some(&bytes), "not a JSON object");
+            return (HashMap::new(), true, writable);
         }
     };
 
@@ -6023,8 +6098,10 @@ fn load_map(path: &Path) -> (HashMap<String, TerminalSessionRecord>, bool) {
         }
     }
 
-    let degraded = !dropped.is_empty();
-    if !dropped.is_empty() {
+    let dropped_any = !dropped.is_empty();
+    let mut writable = true;
+    if dropped_any {
+        writable = quarantine_degraded_snapshot(path, Some(&bytes), "malformed record(s) dropped");
         warn!(
             dropped = dropped.len(),
             kept = map.len(),
@@ -6051,7 +6128,66 @@ fn load_map(path: &Path) -> (HashMap<String, TerminalSessionRecord>, bool) {
         }
     }
 
-    (map, degraded)
+    (map, marked || dropped_any, writable)
+}
+
+/// The marker file that keeps a degraded snapshot degraded across a
+/// compaction and a restart: `<snapshot>` with the extension `json.degraded`.
+/// Only [`SessionLifecycleStore::clear_degraded_marker`] removes it.
+fn degraded_marker_path(path: &Path) -> PathBuf {
+    path.with_extension("json.degraded")
+}
+
+/// Make a degraded load durable, and preserve the snapshot it could not read
+/// in full, BEFORE any compaction can rewrite it from the partial map:
+///
+/// 1. write the marker ([`degraded_marker_path`]) — first, so a crash after
+///    the original is moved aside still reopens degraded;
+/// 2. preserve the original as `<snapshot>.quarantine-<ms>`: the bytes this
+///    load read when it has them, else a copy, else (a file this process
+///    cannot read) a rename, which needs no read.
+///
+/// Returns whether the snapshot may now be written. `false` when either step
+/// failed: then the original is the only copy of what the load lost, and the
+/// store must not write over it ([`SessionLifecycleStore::compact`]).
+fn quarantine_degraded_snapshot(path: &Path, bytes: Option<&[u8]>, reason: &str) -> bool {
+    let now = Utc::now().timestamp_millis();
+    let marker = degraded_marker_path(path);
+    let marker_body = format!("{{\"reason\":{reason:?},\"degraded_at_ms\":{now}}}\n");
+    if let Err(e) = std::fs::write(&marker, marker_body) {
+        warn!(
+            error = %e,
+            path = %marker.display(),
+            "session_lifecycle_store: failed to write the degraded marker — the snapshot will not be rewritten"
+        );
+        return false;
+    }
+    let quarantine = path.with_extension(format!("json.quarantine-{now}"));
+    let preserved = match bytes {
+        Some(b) => std::fs::write(&quarantine, b),
+        None => std::fs::copy(path, &quarantine)
+            .map(|_| ())
+            .or_else(|_| std::fs::rename(path, &quarantine)),
+    };
+    match preserved {
+        Ok(()) => {
+            warn!(
+                reason,
+                path = %quarantine.display(),
+                "session_lifecycle_store: degraded snapshot preserved; unheld sessions read UNKNOWN until maintenance clears the marker"
+            );
+            true
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                reason,
+                path = %path.display(),
+                "session_lifecycle_store: failed to preserve the degraded snapshot — it will not be rewritten"
+            );
+            false
+        }
+    }
 }
 
 fn write_map(path: &Path, map: &HashMap<String, TerminalSessionRecord>) -> std::io::Result<()> {
@@ -7173,10 +7309,24 @@ mod tests {
                 .map(|r| r.claude_session_id),
             Some("recorded-since".to_string())
         );
-        // A reload from a snapshot that reads in full is a clean load again.
+        // A reload from a snapshot that now reads in full is STILL degraded:
+        // the marker outlives the bad file. Only maintenance clears it.
         std::fs::write(&path, b"{}").unwrap();
         store.reload_from_disk().unwrap();
+        assert!(store.is_load_degraded());
+        assert_eq!(
+            store.get_checked("absent").unwrap_err(),
+            RegistryUnavailable
+        );
+        store.clear_degraded_marker().unwrap();
+        assert!(!store.is_load_degraded());
         assert!(store.get_checked("absent").unwrap().is_none());
+        drop(store);
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        assert!(
+            store.get_checked("absent").unwrap().is_none(),
+            "a cleared marker stays cleared across a reopen"
+        );
 
         // A dropped malformed row: the good row is held, an unheld id is UNKNOWN.
         let dir = tempdir().unwrap();
@@ -7215,6 +7365,146 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
         assert!(store.get_checked("absent").unwrap().is_none());
+    }
+
+    /// The files a degraded load preserved beside `path`
+    /// (`<snapshot>.quarantine-<ms>`).
+    fn quarantined(path: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let mut out: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(&format!("{name}.quarantine-"))
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Open `path` (degraded), record a session, COMPACT — which rewrites the
+    /// snapshot from the partial map — drop, and reopen. The reopened store
+    /// must still answer an unheld id UNKNOWN: the record the first load lost
+    /// is not "unhosted" because a compaction happened in between.
+    fn degraded_survives_compaction_and_reopen(path: &std::path::Path) {
+        let store = SessionLifecycleStore::open(path).unwrap();
+        assert!(store.is_load_degraded());
+        store.record_open(rec("recorded-since"));
+        store.compact();
+        drop(store);
+        let store = SessionLifecycleStore::open(path).unwrap();
+        assert!(
+            store.is_load_degraded(),
+            "the compaction rewrote a clean snapshot, and the reopen must not read it as clean"
+        );
+        assert_eq!(
+            store.get_checked("absent").unwrap_err(),
+            RegistryUnavailable
+        );
+        assert!(store.get_checked("recorded-since").unwrap().is_some());
+    }
+
+    /// M1 (round-2 review): the degraded state is DURABLE. For each degraded
+    /// shape the original snapshot is preserved byte-for-byte before the
+    /// compaction can overwrite it, and the state survives compaction and a
+    /// restart.
+    #[test]
+    fn a_degraded_load_survives_compaction_and_restart_and_keeps_the_original() {
+        // Not a JSON object.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        std::fs::write(&path, b"[\"not-an-object\"]").unwrap();
+        degraded_survives_compaction_and_reopen(&path);
+        let q = quarantined(&path);
+        assert_eq!(q.len(), 1, "{q:?}");
+        assert_eq!(std::fs::read(&q[0]).unwrap(), b"[\"not-an-object\"]");
+
+        // A dropped malformed row.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let original = serde_json::to_vec(&serde_json::json!({
+            "good": serde_json::to_value(rec("good")).unwrap(),
+            "bad": 42,
+        }))
+        .unwrap();
+        std::fs::write(&path, &original).unwrap();
+        degraded_survives_compaction_and_reopen(&path);
+        let q = quarantined(&path);
+        assert_eq!(q.len(), 1, "{q:?}");
+        assert_eq!(std::fs::read(&q[0]).unwrap(), original);
+
+        // A read error (the snapshot path is a directory): there are no bytes
+        // to copy, so the original is moved aside whole.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("inside"), b"kept").unwrap();
+        degraded_survives_compaction_and_reopen(&path);
+        let q = quarantined(&path);
+        assert_eq!(q.len(), 1, "{q:?}");
+        assert_eq!(std::fs::read(q[0].join("inside")).unwrap(), b"kept");
+    }
+
+    /// The read-error shape that happens in the field: a snapshot FILE this
+    /// process cannot read. It is moved aside (a rename needs no read), and
+    /// its bytes survive the compaction untouched.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_snapshot_is_moved_aside_with_its_bytes_intact() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let original = serde_json::to_vec(&serde_json::json!({
+            "lost": serde_json::to_value(rec("lost")).unwrap(),
+        }))
+        .unwrap();
+        std::fs::write(&path, &original).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&path).is_ok() {
+            // Running as a user permissions do not bind (root): no read error
+            // can be produced this way.
+            eprintln!("skipped: this user can read a mode-000 file");
+            return;
+        }
+        degraded_survives_compaction_and_reopen(&path);
+        let q = quarantined(&path);
+        assert_eq!(q.len(), 1, "{q:?}");
+        std::fs::set_permissions(&q[0], std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(std::fs::read(&q[0]).unwrap(), original);
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        assert_eq!(
+            store.get_checked("lost").unwrap_err(),
+            RegistryUnavailable,
+            "the record the unreadable snapshot held is UNKNOWN, never unhosted"
+        );
+    }
+
+    /// A4 (reviewer): when a degraded load cannot PRESERVE the original (here
+    /// the marker cannot be written, because a directory sits at its path),
+    /// the store never writes over the snapshot — a compaction keeps the WAL
+    /// and leaves the original bytes exactly as they were.
+    #[test]
+    fn an_unpreserved_degraded_snapshot_is_never_overwritten() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        std::fs::write(&path, b"[]").unwrap();
+        std::fs::create_dir(path.with_extension("json.degraded")).unwrap();
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.record_open(rec("recorded-since"));
+        store.compact();
+        assert_eq!(std::fs::read(&path).unwrap(), b"[]");
+        assert!(quarantined(&path).is_empty());
+        drop(store);
+        // The WAL kept the mutation.
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        assert!(store.get_checked("recorded-since").unwrap().is_some());
+        assert_eq!(
+            store.get_checked("absent").unwrap_err(),
+            RegistryUnavailable
+        );
     }
 
     // ── Write-ahead log (Phase 6, B1) ───────────────────────────────────────
@@ -13424,7 +13714,7 @@ mod tests {
         drop(store);
         // Read the RAW file, not a reopened store: a reopen detaches again at
         // load, so it could not tell a persisted detach from a re-derived one.
-        let (on_disk, _) = load_map(&path);
+        let (on_disk, _, _) = load_map(&path);
         assert_eq!(on_disk["held"].terminal_id, "", "the detach was persisted");
         assert_eq!(on_disk["expired"].terminal_id, "term-expired");
     }
