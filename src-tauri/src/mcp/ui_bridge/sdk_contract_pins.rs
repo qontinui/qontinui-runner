@@ -443,7 +443,7 @@ fn a_clipped_only_element_reads_clear_with_one_clipped_entry_and_relays_no_eleme
 
     assert_eq!(
         report["verdict"], "clear",
-        "clipping is not covering: a clipped-only page is `clear`, never a          fourth verdict and never `occlusions_found`"
+        "clipping is not covering: a clipped-only page is `clear`, never a fourth verdict and never `occlusions_found`"
     );
     assert_eq!(report["occlusions"].as_array().map(Vec::len), Some(0));
     let clipped = report["clipped"]
