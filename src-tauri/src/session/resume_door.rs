@@ -632,6 +632,12 @@ async fn resume_one(
         Ok(claim) => claim,
         Err(why) => return ResumeRow::skipped(&cand.id, why),
     };
+    // Wait out a runner-owned CLI install FIRST, before the live-holder and
+    // drain checks below: the `--resume` resolver waits on the same flag, and
+    // a wait taken after those checks would leave them up to
+    // `claude_cli_spawn::CLI_UPDATE_WAIT` stale by spawn time. Returns at once
+    // when no install is running.
+    crate::claude_cli_spawn::await_cli_update_quiescent().await;
     // Under a model gateway the resumed pane runs with the gateway's
     // CLAUDE_CONFIG_DIR (finalize_child_env pins it), where this session's
     // transcript does not exist, so `--resume` would find nothing. Refuse the
@@ -765,10 +771,10 @@ fn proven_terminal(
         RespawnOutcome::Died {
             exit_code,
             attempts,
-            ..
+            retry_spawn_error,
         } => Err(Box::new(ResumeRow::failed(
             id,
-            RespawnOutcome::died_reason(exit_code, attempts),
+            RespawnOutcome::died_detail(exit_code, attempts, retry_spawn_error.as_deref()),
             None,
         ))),
         // The pane is LEFT RUNNING (it keeps the row): a caller must not read
@@ -1285,6 +1291,20 @@ mod tests {
         assert_eq!(
             died.verdict,
             "failed(respawn-died: exit 127 after 3 attempts)"
+        );
+        let retry_unspawnable = proven_terminal(
+            ID,
+            RespawnOutcome::Died {
+                exit_code: Some(127),
+                attempts: 3,
+                retry_spawn_error: Some("claude not found".into()),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            retry_unspawnable.reason.as_deref(),
+            Some("respawn-died: exit 127 after 3 attempts; last retry could not spawn: claude not found"),
+            "a retry that never spawned must be named, not reported as a third death"
         );
         let unconfirmed = proven_terminal(
             ID,

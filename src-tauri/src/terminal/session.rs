@@ -29,6 +29,7 @@ use super::visibility::{
     ActivityDigestState, BackgroundHold, TerminalActivityWire, VisibilityState, VisibilityTier,
     ACTIVITY_DIGEST_LINES, ACTIVITY_EVENT,
 };
+use super::PYTHONUTF8_ENV;
 
 /// Shell integration scripts embedded at compile time.
 #[cfg(target_os = "windows")]
@@ -2720,8 +2721,9 @@ impl TerminalSession {
 
     /// The terminal-INVARIANT half of the PTY child's environment: the nested-
     /// session markers this seam strips, `TERM`, the runner-context markers and
-    /// port, the continuation-verdict forward, the runner briefing, and the
-    /// non-interactive git credential posture.
+    /// port, the continuation-verdict forward, the runner briefing, the
+    /// non-interactive git credential posture, and the Windows `PYTHONUTF8=1`
+    /// default.
     ///
     /// Runs FIRST, before the caller-supplied `extra_env`, so a caller can
     /// intentionally override any of it; the credential scrub in
@@ -2842,6 +2844,34 @@ impl TerminalSession {
         // `credential_helper::non_interactive_git_env` for the three layers,
         // the precedence rationale, and the named trade-off.
         crate::credential_helper::apply_non_interactive_git_env_pty(cmd);
+        Self::apply_python_utf8_default(cmd, cfg!(windows));
+    }
+
+    /// Python UTF-8 mode for the session's Python on Windows.
+    ///
+    /// Windows Python's text I/O defaults to the ANSI code page (e.g. cp1252),
+    /// so a session helper that prints a character outside it to a pipe
+    /// crashes. That has published corrupted input: an almost-empty PR body
+    /// that wiped coord's trailers (plan
+    /// `2026-11-08-plan-stamp-and-pr-body-publish-doors-trust-a-corrupted-input-file`,
+    /// Phase 3). `PYTHONUTF8=1` makes stdio and `open()` default to UTF-8.
+    /// It does NOT change newline translation: a text-mode write on Windows
+    /// still turns LF into CRLF, which the plan-stamp door's shape gate
+    /// (qontinui-claude-config `land-plan-stamp.sh`) refuses instead.
+    ///
+    /// Set only on Windows, and only when the variable is not already set
+    /// (inherited from the runner's own environment): an operator override,
+    /// including `PYTHONUTF8=0`, wins. It runs before the caller's
+    /// `extra_env`, so a caller can override it as well. This is the PTY seam;
+    /// the headless agent-session seams apply the same rule through
+    /// [`crate::terminal::apply_python_utf8_default_std`] /
+    /// [`crate::terminal::apply_python_utf8_default_tokio`]. The runner's own
+    /// Python subprocess is untouched.
+    /// `is_windows` is a parameter so the rule is testable on every host.
+    pub(crate) fn apply_python_utf8_default(cmd: &mut CommandBuilder, is_windows: bool) {
+        if is_windows && cmd.get_env(PYTHONUTF8_ENV).is_none() {
+            cmd.env(PYTHONUTF8_ENV, "1");
+        }
     }
 
     /// The `CLAUDE_CONFIG_DIR` a caller pinned onto this PTY through
@@ -5710,6 +5740,59 @@ pub(crate) mod tests {
             Some("/tmp/claude-config"),
             "the resolved account pin must still be applied"
         );
+    }
+
+    /// Plan 2026-11-08-plan-stamp-and-pr-body-publish-doors-trust-a-corrupted-input-file
+    /// Phase 3: a Windows PTY child gets `PYTHONUTF8=1` unless it already has a
+    /// value, and a non-Windows child is left alone.
+    #[test]
+    fn python_utf8_default_sets_on_windows_when_unset() {
+        let mut cmd = CommandBuilder::new("dummy");
+        cmd.env_remove(PYTHONUTF8_ENV);
+        TerminalSession::apply_python_utf8_default(&mut cmd, true);
+        assert_eq!(
+            cmd.get_env(PYTHONUTF8_ENV).and_then(|v| v.to_str()),
+            Some("1"),
+            "a Windows session must run Python in UTF-8 mode"
+        );
+    }
+
+    #[test]
+    fn python_utf8_default_keeps_an_operator_override() {
+        let mut cmd = CommandBuilder::new("dummy");
+        cmd.env(PYTHONUTF8_ENV, "0");
+        TerminalSession::apply_python_utf8_default(&mut cmd, true);
+        assert_eq!(
+            cmd.get_env(PYTHONUTF8_ENV).and_then(|v| v.to_str()),
+            Some("0"),
+            "an inherited PYTHONUTF8 must win"
+        );
+    }
+
+    #[test]
+    fn python_utf8_default_is_windows_only() {
+        let mut cmd = CommandBuilder::new("dummy");
+        cmd.env_remove(PYTHONUTF8_ENV);
+        TerminalSession::apply_python_utf8_default(&mut cmd, false);
+        assert!(
+            cmd.get_env(PYTHONUTF8_ENV).is_none(),
+            "a non-Windows session must not gain PYTHONUTF8"
+        );
+    }
+
+    /// The seam itself carries the default on this host's platform, so dropping
+    /// the call from `apply_base_child_env` reddens a test (on Windows CI).
+    #[test]
+    fn pty_apply_base_child_env_applies_python_utf8_default_per_platform() {
+        let mut cmd = CommandBuilder::new("dummy");
+        cmd.env_remove(PYTHONUTF8_ENV);
+        TerminalSession::apply_base_child_env(&mut cmd);
+        let got = cmd.get_env(PYTHONUTF8_ENV).and_then(|v| v.to_str());
+        if cfg!(windows) {
+            assert_eq!(got, Some("1"));
+        } else {
+            assert_eq!(got, None);
+        }
     }
 
     /// The non-interactive git credential posture, asserted from the ONE shared

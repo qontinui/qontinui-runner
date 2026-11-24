@@ -108,7 +108,9 @@ describe("select-layout", () => {
       pageId: "page-2",
       tabCount: 5,
       leftTmux: false,
-      layoutOrigin: "operator",
+      // Auto-grow overrides the split with its own `auto` request, so the
+      // grown six-pack is the runner's, whoever asked for the split.
+      layoutOrigin: "auto",
     });
     expect(callRegistry).toHaveBeenCalledWith("terminal.layout", {
       preset: "2",
@@ -149,6 +151,13 @@ describe("select-layout", () => {
       preset: "split",
       page: "page-2",
       origin: "auto",
+    });
+  });
+
+  it("reports an operator request that fits as the operator's", async () => {
+    await expect(select({ layoutId: "six-pack", pageId: "page-2" })).resolves.toMatchObject({
+      layoutId: "six-pack",
+      layoutOrigin: "operator",
     });
   });
 

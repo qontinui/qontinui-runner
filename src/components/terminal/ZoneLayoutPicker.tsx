@@ -173,7 +173,8 @@ export function ZoneLayoutPicker({
           'chose the layout: "auto" hands the page to the runner, which then trims its grid ' +
           "when tabs close, but only when the request changes the page's layout id; an auto " +
           "request on a tmux-mode page is refused, because it would not leave tmux. Returns " +
-          "layoutOrigin, the origin the page holds afterwards (as get-page-layout reports it).",
+          "layoutOrigin, the origin the page holds afterwards (as get-page-layout reports it): " +
+          '"auto" whenever the grid grows past the request, since the runner chose that grid.',
         paramSchema: SELECT_LAYOUT_SCHEMA,
         // `write` — switches the grid preset and redistributes zone assignments. No
         // terminal is ended: `applyLayout` preserves in-range assignments and only
@@ -206,11 +207,20 @@ export function ZoneLayoutPicker({
           // the page no longer says it was in it.
           const target = getPageSession(pageId ?? activePageId);
           const leftTmux = target?.zoneLayout.workMode === "tmux";
+          // The registry's verdict is prose; a caller trimming a grid needs
+          // the id the grid SETTLES at. Auto-grow keeps every live tab in a
+          // zone, so it is the same pure rule the registry reports with. A
+          // `/layout` request exits tmux mode, so the settle is predicted for
+          // grid mode, as `terminal.layout` does.
+          const tabs = target?.tabs.length ?? tabCount;
+          const settled = computeAutoGrowLayoutId(requested, tabs, "grid") ?? requested;
           // Who the page belongs to afterwards, by the hook's own rule, not the
           // origin that was asked for: an auto request re-asserting the page's
-          // own layout takes nothing. Unknown when the page could not be read.
+          // own layout takes nothing, and a request auto-grow overrides leaves
+          // the page the runner's whoever sent it. Unknown when the page could
+          // not be read.
           const layoutOrigin = target
-            ? predictLayoutOrigin(target.zoneLayout, requested, origin)
+            ? predictLayoutOrigin(target.zoneLayout, requested, origin, settled)
             : null;
           // Phase 1c — delegates to registry `terminal.layout`. The
           // registry handler calls the same `zoneLayout.setLayoutId`
@@ -226,13 +236,6 @@ export function ZoneLayoutPicker({
             ...(origin === "auto" ? { origin } : {}),
           });
           setOpen(false);
-          // The registry's verdict is prose; a caller trimming a grid needs
-          // the id the grid SETTLES at. Auto-grow keeps every live tab in a
-          // zone, so it is the same pure rule the registry reports with. A
-          // `/layout` request exits tmux mode, so the settle is predicted for
-          // grid mode, as `terminal.layout` does.
-          const tabs = target?.tabs.length ?? tabCount;
-          const settled = computeAutoGrowLayoutId(requested, tabs, "grid") ?? requested;
           return {
             requested,
             layoutId: settled,
