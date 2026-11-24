@@ -10,7 +10,7 @@ use crate::str_utils::truncate_str;
 use crate::unified_workflows::CreateUnifiedWorkflowRequest;
 use axum::http::StatusCode;
 use qontinui_types::paths::{SiblingCheckoutAbsent, SiblingFallback, WorkspaceRootUnresolved};
-use qontinui_types::refusal::RefusalSource;
+use qontinui_types::refusal::{RefusalCode, RefusalSource};
 use regex::Regex;
 use serde::Serialize;
 use serde_json::json;
@@ -107,10 +107,21 @@ impl SyncError {
                     },
                 )
             }
-            SyncError::Failed(why) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ApiResponse::error(format!("Slash command sync failed: {why}")),
-            ),
+            SyncError::Failed(why) => {
+                let message = format!("Slash command sync failed: {why}");
+                let code = RefusalCode::InternalError.as_str();
+                let refusal = crate::mcp::refusal_envelope::refusal_for_envelope(
+                    code,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Some(&message),
+                    None,
+                    None,
+                );
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ApiResponse::error_with_refusal(message, code, refusal),
+                )
+            }
         }
     }
 }

@@ -611,7 +611,7 @@ struct A;
     const FREE_TEXT_CONSTRUCTORS: [FreeTextConstructor; 4] = [
         FreeTextConstructor {
             needle: "api_error(",
-            baseline: 1255,
+            baseline: 1245,
         },
         FreeTextConstructor {
             needle: "ApiResponse::error(",
