@@ -17,9 +17,9 @@ When `$ARGUMENTS` matches a project name (`web`, `qontinui-web`, `runner`, `qont
 
 ### 1. Discover all routable pages
 
-**qontinui-web** — glob `<workspace-root>/qontinui-web/frontend/src/app/(app)/*/page.tsx`. Each directory name is a route slug. Base URL = `https://qontinui.io/<slug>`. If `<workspace-root>/qontinui-web` is not checked out, report that project mode needs the web repo and stop.
+**qontinui-web** — glob `qontinui-web/frontend/src/app/(app)/*/page.tsx` under your workspace root (the directory holding your repo checkouts). Each directory name is a route slug. Base URL = `https://qontinui.io/<slug>`. If `qontinui-web` is not checked out there, report that project mode needs the web repo and stop.
 
-**qontinui-runner** — read `VALID_TAB_IDS` from `<workspace-root>/qontinui-runner/src/components/app/tab-types.ts`. Each ID is a page slug. If `<workspace-root>/qontinui-runner` is not checked out, report that project mode needs the runner repo and stop.
+**qontinui-runner** — read `VALID_TAB_IDS` from `qontinui-runner/src/components/app/tab-types.ts` under your workspace root. Each ID is a page slug. If `qontinui-runner` is not checked out there, report that project mode needs the runner repo and stop.
 
 ### 2. Diff against existing specs
 

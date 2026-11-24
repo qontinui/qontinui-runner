@@ -22,7 +22,12 @@ vi.mock("@/contexts/TenantContext", () => ({
 }));
 
 import { PerTenantPaths, PlanScanStatus } from "./PathsSettings";
-import { tenantDraftsFrom, type PathSettings, type ResolvedPaths } from "./pathsSettingsHelpers";
+import {
+  tenantDraftsFrom,
+  type PathSettings,
+  type ResolvedPaths,
+  type WorkUnitPostureView,
+} from "./pathsSettingsHelpers";
 
 const TIER_ON_NOTE = "Sessions write per tenant; the scanner reads device-wide.";
 const TIER_OFF_NOTE = "Per-tenant paths do not turn scanning on.";
@@ -44,7 +49,10 @@ function perTenant(planTierActive: boolean, showSwitcher = true): string {
   );
 }
 
-function resolved(planTierActive: boolean): ResolvedPaths {
+function resolved(
+  planTierActive: boolean,
+  posture: WorkUnitPostureView | null = planTierActive ? { state: "write" } : null,
+): ResolvedPaths {
   return {
     plans_dir: planTierActive ? "/plans" : null,
     prompts_dir: null,
@@ -53,6 +61,7 @@ function resolved(planTierActive: boolean): ResolvedPaths {
     plan_tier_active: planTierActive,
     plan_scan_roots: planTierActive ? 1 : null,
     plan_scan_divergence: null,
+    plan_work_unit_posture: posture,
   };
 }
 
@@ -87,5 +96,32 @@ describe("PlanScanStatus banner", () => {
     expect(renderToStaticMarkup(<PlanScanStatus resolved={resolved(false)} />)).toContain(
       "No device-wide plans directory is in effect",
     );
+  });
+
+  it("claims work units reach coord only when the adapter is pushing them", () => {
+    const banner = (posture: WorkUnitPostureView | null) =>
+      renderToStaticMarkup(<PlanScanStatus resolved={resolved(true, posture)} />);
+    const PUSHING = "pushing work units to coord";
+
+    expect(banner({ state: "write" })).toContain(PUSHING);
+
+    const multi = banner({ state: "withheld_multi_bound", tenants: 3 });
+    expect(multi).not.toContain(PUSHING);
+    expect(multi).toContain("pushes no work units to coord");
+    expect(multi).toContain("bound to 3 tenants");
+
+    const unknownBindings = banner({ state: "withheld_bindings_unknown" });
+    expect(unknownBindings).not.toContain(PUSHING);
+    expect(unknownBindings).toContain("tenant bindings is missing or stale");
+
+    const notYet = banner(null);
+    expect(notYet).not.toContain(PUSHING);
+    expect(notYet).toContain("has not completed a scan cycle since the runner started");
+
+    // Only a pushing posture earns the green check.
+    expect(banner({ state: "write" })).toContain("lucide-check");
+    expect(multi).not.toContain("lucide-check");
+    expect(unknownBindings).not.toContain("lucide-check");
+    expect(notYet).not.toContain("lucide-check");
   });
 });

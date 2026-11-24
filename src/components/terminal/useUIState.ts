@@ -1,6 +1,7 @@
 import { useReducer, useCallback } from "react";
 import { instanceStorage } from "@/lib/instance-storage";
 import type { ViewMode } from "./ZoneGrid";
+import { MINIMAP_POSITION_KEY, parseMinimapOffset, type MinimapOffset } from "./minimapPosition";
 
 interface UIState {
   viewMode: ViewMode;
@@ -11,6 +12,12 @@ interface UIState {
   controlPanelCollapsed: boolean;
   /** Zone minimap overlay. Default ON; toggled from the StatusStrip. */
   showMinimap: boolean;
+  /**
+   * Where the operator dragged the minimap, as an offset from the grid's
+   * top-right corner. `null` = the original location. Persisted per instance
+   * under `zone-minimap-position`.
+   */
+  minimapOffset: MinimapOffset | null;
   selectedZones: Set<number>;
   outputSearch: string;
   showOutputSearch: boolean;
@@ -35,6 +42,8 @@ type UIAction =
   | { type: "TOGGLE_CONTROL_PANEL_COLLAPSED" }
   | { type: "SET_SHOW_MINIMAP"; payload: boolean }
   | { type: "TOGGLE_MINIMAP" }
+  | { type: "SET_MINIMAP_OFFSET"; payload: MinimapOffset }
+  | { type: "RESET_MINIMAP_OFFSET" }
   | { type: "SET_SELECTED_ZONES"; payload: Set<number> }
   | { type: "TOGGLE_ZONE_SELECTION"; payload: number }
   | { type: "CLEAR_SELECTION" }
@@ -86,6 +95,14 @@ export function uiReducer(state: UIState, action: UIAction): UIState {
       const next = !state.showMinimap;
       instanceStorage.setItem("zone-minimap", String(next));
       return { ...state, showMinimap: next };
+    }
+    case "SET_MINIMAP_OFFSET": {
+      instanceStorage.setItem(MINIMAP_POSITION_KEY, JSON.stringify(action.payload));
+      return { ...state, minimapOffset: action.payload };
+    }
+    case "RESET_MINIMAP_OFFSET": {
+      instanceStorage.removeItem(MINIMAP_POSITION_KEY);
+      return { ...state, minimapOffset: null };
     }
     case "SET_CONTROL_PANEL_COLLAPSED":
       return { ...state, controlPanelCollapsed: action.payload };
@@ -153,6 +170,7 @@ export function createInitialState(): UIState {
     // than `=== "true"`) is what makes an absent key mean "on"; the
     // `showControlPanel` idiom above is the opposite default on purpose.
     showMinimap: instanceStorage.getItem("zone-minimap") !== "false",
+    minimapOffset: parseMinimapOffset(instanceStorage.getItem(MINIMAP_POSITION_KEY)),
     selectedZones: new Set(),
     outputSearch: "",
     showOutputSearch: false,
@@ -170,6 +188,11 @@ export function useUIState() {
   const toggleAutoLayout = useCallback(() => dispatch({ type: "TOGGLE_AUTO_LAYOUT" }), []);
   const cycleViewMode = useCallback(() => dispatch({ type: "CYCLE_VIEW_MODE" }), []);
   const toggleMinimap = useCallback(() => dispatch({ type: "TOGGLE_MINIMAP" }), []);
+  const setMinimapOffset = useCallback(
+    (offset: MinimapOffset) => dispatch({ type: "SET_MINIMAP_OFFSET", payload: offset }),
+    [],
+  );
+  const resetMinimapOffset = useCallback(() => dispatch({ type: "RESET_MINIMAP_OFFSET" }), []);
 
   return {
     state,
@@ -178,6 +201,8 @@ export function useUIState() {
     toggleAutoLayout,
     cycleViewMode,
     toggleMinimap,
+    setMinimapOffset,
+    resetMinimapOffset,
   } as const;
 }
 

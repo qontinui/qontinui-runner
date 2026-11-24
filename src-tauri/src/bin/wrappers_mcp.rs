@@ -1321,6 +1321,9 @@ fn primary_base_url() -> String {
 }
 
 fn main() {
+    // A subject runner's root (`QONTINUI_INSTANCE_ROOT`) is validated and its
+    // defaults exported before anything here reads a path; no-op otherwise.
+    qontinui_runner_lib::instance_env::enforce_instance_root_or_exit(false);
     eprintln!("[wrappers-mcp] starting (version {})", SERVER_VERSION);
 
     let base = primary_base_url();

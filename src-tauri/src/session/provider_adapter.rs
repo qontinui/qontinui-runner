@@ -196,6 +196,20 @@ pub trait SessionProviderAdapter: Send + Sync {
 /// real caller and a cross-language drift guard.
 pub struct ClaudeAdapter;
 
+/// `claude <permission flags> --session-id <pinned>` — the identity-pinned
+/// launch head, with the permission flags rendered by the shared launch-spec
+/// renderer so this site cannot drift from the others.
+fn claude_identity_argv(
+    pinned: &str,
+    permission: &crate::claude_session::launch_spec::PermissionMode,
+) -> Vec<String> {
+    let mut argv = vec!["claude".to_string()];
+    argv.extend(permission.render());
+    argv.push("--session-id".to_string());
+    argv.push(pinned.to_string());
+    argv
+}
+
 impl SessionProviderAdapter for ClaudeAdapter {
     fn provider(&self) -> &'static str {
         DEFAULT_PROVIDER // "claude"
@@ -208,14 +222,13 @@ impl SessionProviderAdapter for ClaudeAdapter {
         // (`--permission-mode bypassPermissions`) matches the operator's
         // clg/clh/clp wrappers so a runner-spawned session never stalls on a
         // permission prompt (mirrors `aiLaunchCommand.ts`).
+        //
+        // The permission flag comes from the operator's session posture (review
+        // M2): bypass by default, `dontAsk` + the allow-list when selected.
         let pinned = uuid::Uuid::new_v4().to_string();
-        let mut argv = vec![
-            "claude".to_string(),
-            "--permission-mode".to_string(),
-            "bypassPermissions".to_string(),
-            "--session-id".to_string(),
-            pinned.clone(),
-        ];
+        let permission = crate::settings::get_claude_session_permission()
+            .apply(crate::claude_session::launch_spec::PermissionMode::BypassPermissions);
+        let mut argv = claude_identity_argv(&pinned, &permission);
         // Attach the SessionStart capture hook ADDITIVELY via `--settings`
         // (never touches `~/.claude`). When the delivery resolves to a settings
         // file, it rides on the argv; otherwise identity still rides the pin.
@@ -325,6 +338,33 @@ mod tests {
         // Unknown provider degrades to the Claude adapter (never drops).
         assert_eq!(adapter_for("gemini").provider(), "claude");
         assert_eq!(adapter_for("totally-new").provider(), "claude");
+    }
+
+    /// Review M2: the provider-adapter launch honours the allow-list posture.
+    #[test]
+    fn identity_argv_renders_the_session_permission_posture() {
+        use crate::claude_session::launch_spec::PermissionMode;
+        let argv = claude_identity_argv(
+            "pin-1",
+            &PermissionMode::AllowList {
+                tools: vec!["Read".to_string()],
+            },
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "claude",
+                "--permission-mode",
+                "dontAsk",
+                "--allowedTools",
+                "Read",
+                "--session-id",
+                "pin-1"
+            ]
+        );
+        assert!(!argv.iter().any(|a| a == "bypassPermissions"));
+        let bypass = claude_identity_argv("pin-1", &PermissionMode::BypassPermissions);
+        assert_eq!(&bypass[1..3], ["--permission-mode", "bypassPermissions"]);
     }
 
     #[test]

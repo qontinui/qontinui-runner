@@ -16,15 +16,21 @@
 //! `subscription_scope_required`; a token that is present but bad is refused
 //! as a credential failure, never downgraded to anonymous. `?pattern=` is no
 //! longer how the scope is chosen: alongside a token it only narrows the
-//! principal's entitlement, and WITHOUT one it is admitted only inside a
-//! legacy allowlist (`anonymous_entitlement`) and refused 403
-//! `pattern_out_of_scope` outside it. This module never sends `?pattern=`.
+//! principal's entitlement, and WITHOUT one it is refused outright — 403
+//! `pattern_removed` on its own, `subscription_scope_required` beside a
+//! `?subscribe=`. Coord no longer keeps an anonymous allowlist
+//! (qontinui-coord#3219, plan
+//! `2026-09-20-fleet-tab-attach-loses-the-grant-push-race` item 1). This module
+//! never sends `?pattern=`: it names its scope only through `?subscribe=`,
+//! presenting the device JWT (as `?token=` and `Authorization: Bearer`)
+//! whenever one resolves.
 //!
 //! This module is the single place that knows both halves:
 //!
 //! - [`build_ws_url`] — scheme swap, idempotent `/ws`, `?subscribe=<name>`;
 //! - [`connect`] — resolve the device JWT PER CONNECT and present it as
-//!   `?token=` AND `Authorization: Bearer`, BOUND the attempt by
+//!   `?token=` AND `Authorization: Bearer`, connect through
+//!   `outbound_net::connect_ws` (the proxy-aware connect), BOUND the attempt by
 //!   [`CONNECT_TIMEOUT`], then name any refusal (status + coord's `error`
 //!   code) so a 401/403 reconnect flap is diagnosable from the log, and hand
 //!   a 401 to the device-JWT refresher through [`set_unauthorized_hook`].
@@ -186,29 +192,22 @@ pub type CoordWs =
 /// `lane` is the log prefix of the calling subscriber.
 pub async fn connect(ws_url: &str, lane: &str) -> anyhow::Result<CoordWs> {
     let request = build_upgrade_request(ws_url, lane)?;
-    let attempt = match tokio::time::timeout(
-        CONNECT_TIMEOUT,
-        tokio_tungstenite::connect_async(request),
-    )
-    .await
-    {
-        Ok(inner) => inner,
-        // Render the expired budget as the transport error it is, so the
-        // caller's existing `Err` arm backs off and retries exactly as it
-        // would for a refused connection. See [`CONNECT_TIMEOUT`].
-        Err(_elapsed) => Err(tungstenite::Error::Io(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            format!(
-                "coord /ws connect exceeded {}s with no handshake response",
-                CONNECT_TIMEOUT.as_secs()
-            ),
-        ))),
-    };
-    match attempt {
-        Ok((ws, _resp)) => Ok(ws),
+    // Through the HTTP proxy the environment (or the OS system proxy) names
+    // for coord, or direct — `outbound_net::connect_ws` decides, with the same
+    // matcher reqwest uses. Bounded by [`CONNECT_TIMEOUT`]: an expired budget
+    // surfaces as `Io(TimedOut)`, so the caller's existing `Err` arm backs off
+    // and retries exactly as it would for a refused connection.
+    match crate::outbound_net::connect_ws(request, CONNECT_TIMEOUT).await {
+        Ok(ws) => Ok(ws),
         Err(e) => {
-            log_upgrade_failure(lane, &e);
-            if upgrade_refusal_is_unauthorized(&e) {
+            match e.as_tungstenite() {
+                Some(inner) => log_upgrade_failure(lane, inner),
+                None => warn!(
+                    "{lane}: coord /ws connect failed at the HTTP proxy: {e} — the proxy, not \
+                     coord, refused; check network.proxy_url / HTTPS_PROXY"
+                ),
+            }
+            if e.is_unauthorized() {
                 kick_unauthorized_hook(lane);
             }
             Err(anyhow::anyhow!("WS upgrade: {e}"))
@@ -416,8 +415,10 @@ pub(crate) fn log_upgrade_failure(lane: &str, e: &tungstenite::Error) {
                 403 => {
                     " — not admitted: no credential was sent (coord code \
                         subscription_scope_required), the credential verified but is a \
-                        capability grant rather than a principal, or the principal cannot \
-                        resolve this subscription"
+                        capability grant rather than a principal, the principal cannot \
+                        resolve this subscription, or (coord code pattern_removed) coord \
+                        received an anonymous `?pattern=` with no `?subscribe=`, a shape this \
+                        module never sends — look for a proxy rewrite of the URL"
                 }
                 _ => "",
             };
@@ -513,8 +514,9 @@ mod tests {
         );
     }
 
-    /// The URL never carries a `?pattern=` — the new coord refuses it 400 and
-    /// the old one would PSUBSCRIBE a caller-chosen glob, which is the leak.
+    /// The URL never carries a `?pattern=` — coord refuses an anonymous one
+    /// 403 `pattern_removed`, and a coord older than the server-derived
+    /// subscription would PSUBSCRIBE a caller-chosen glob, which is the leak.
     #[test]
     fn build_ws_url_never_emits_a_pattern_query() {
         for sub in [

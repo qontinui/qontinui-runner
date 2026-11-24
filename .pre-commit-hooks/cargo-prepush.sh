@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# Pre-push guard: mirrors CI's Rust gate so a correctness failure is surfaced
-# in 60-90s of local cycle time instead of 8-15 min of CI roundtrip per push.
+# Pre-push guard: mirrors the default-target clippy/fmt gate of CI's ubuntu leg so a
+# correctness failure is surfaced in 60-90s of local cycle time instead of
+# 8-15 min of CI roundtrip per push. CI's parallel `clippy-windows` job ALSO
+# lints test targets (`--all-targets`), so a deny-tier lint in shared
+# #[cfg(test)] code passes this hook and fails that job (see the T1 note below).
 # Tiered per plan 2026-07-05-lint-tiers-and-diff-scoped-gates: formatting
 # auto-applies (never blocks), and clippy runs plain (no `-D warnings`) so only
 # deny-tier (correctness/suspicious) lints from Cargo.toml [lints.clippy] block.
@@ -19,8 +22,13 @@
 #   QONTINUI_PREPUSH_STRICT=1    turn the "cannot load this workspace" DECLINE
 #                                below into a hard failure. Off by default; see
 #                                the preflight's own comment for why declining
-#                                is the right default there.
-#   git push --no-verify         skips both, because git never invokes the hook
+#                                is the right default there. It also turns the
+#                                tree-lock and holder-deadline declines into one.
+#   AGENT_BUILD_STALL_SECS / AGENT_BUILD_MAX_WALL_SECS
+#                                the holder deadline on the guarded clippy
+#                                (defaults here 600 / 2700; lib/shared-target.sh,
+#                                "Bounding the build").
+#   git push --no-verify        skips both, because git never invokes the hook
 #                                at all. Nothing in this file can preserve fmt
 #                                for you in that case; prefer
 #                                QONTINUI_PREPUSH_SKIP=1.
@@ -88,8 +96,8 @@ if [[ -f "$PUSH_RANGE_LIB" && -f "$CRATE_INPUTS_LIB" ]]; then
     echo "[pre-push] no upstream, origin/HEAD or origin/main to scope the diff against — running the full gate"
   else
     # THE SCOPE IS NOT `src-tauri/`, and the gap is not only about embeds.
-    # `cd src-tauri && cargo clippy` — this hook's own command, and CI's —
-    # also compiles the in-repo path dependencies (`crates/spec-check`,
+    # `cd src-tauri && cargo clippy` — this hook's own command, and CI's
+    # (clippy-windows adds `--all-targets`) — also compiles the in-repo path dependencies (`crates/spec-check`,
     # `crates/runner-stats`, `crates/runner-win32`, `vendor/tao-0.35.0`), reads
     # what `build.rs` declares (`src/components/app/tab-types.ts`, whose
     # absence build.rs turns into a deliberate `panic!`), and takes its verdict
@@ -275,7 +283,8 @@ STRICT="${QONTINUI_PREPUSH_STRICT:-0}"
 # DELIBERATE. gen-events-drift.sh truthfully tells you CI does NOT cover its TS
 # domain. Here the reverse is true and verified: ci.yml runs
 # `cargo fmt -- --check` and `cargo clippy` inside the REQUIRED
-# `test (ubuntu-22.04)` context, plus a parallel `clippy-windows` job. Copying
+# `test (ubuntu-22.04)` context, plus a parallel `clippy-windows` job (check
+# context `Clippy (windows)`, run with `--all-targets`). Copying
 # the sibling's wording would tell developers they are unprotected when they
 # are not.
 cannot_evaluate() {
@@ -296,7 +305,8 @@ cannot_evaluate() {
   echo "[pre-push]   Coverage while this is unresolved: CI STILL GATES BOTH HALVES." >&2
   echo "[pre-push]   ci.yml runs 'cargo fmt -- --check' and 'cargo clippy' inside the" >&2
   echo "[pre-push]   required 'test (ubuntu-22.04)' context, plus a parallel" >&2
-  echo "[pre-push]   'clippy-windows' job. Declining here costs LATENCY, NOT COVERAGE:" >&2
+  echo "[pre-push]   'Clippy (windows)' check (which also lints test targets)." >&2
+  echo "[pre-push]   Declining here costs LATENCY, NOT COVERAGE:" >&2
   echo "[pre-push]   you lose the 60-90s local signal, not the gate itself." >&2
   if [[ "$STRICT" == "1" ]]; then
     echo "[pre-push]   QONTINUI_PREPUSH_STRICT=1 — treating this as a failure." >&2
@@ -340,7 +350,16 @@ if [[ "$metadata_rc" -ne 0 ]]; then
     exit 1
   elif [[ "$metadata_rc" -eq 127 ]] || grep -qiE 'command not found|could not execute' "$METADATA_LOG"; then
     echo "[pre-push] FAIL — cargo could not run at all (exit $metadata_rc). This is NOT a lint failure."
-    echo "          Check the toolchain: install Rust via rustup."
+    # The usual cause on an agent box is that Rust is installed but missing from
+    # a non-login shell's PATH. The helper names that case instead of telling the
+    # pusher to install Rust.
+    if [[ -f "$SCRIPT_DIR/lib/cargo-remedy.sh" ]]; then
+      # shellcheck source=lib/cargo-remedy.sh
+      . "$SCRIPT_DIR/lib/cargo-remedy.sh"
+      cargo_unrunnable_remedy
+    else
+      echo "          Check the toolchain: install Rust via rustup."
+    fi
     exit 1
   else
     # Honest terminal: non-zero, but nothing in the log identifies why. Say that
@@ -418,21 +437,81 @@ fmt_fingerprint() {
   git -C "$ROOT" diff HEAD -- src-tauri | git hash-object --stdin || echo "unavailable"
 }
 fmt_before="$(fmt_fingerprint)"
-cargo fmt
-fmt_after="$(fmt_fingerprint)"
 
-# Re-stage any src-tauri files fmt rewrote. `git add -u` on the src-tauri tree
-# picks up tracked-file modifications only (no new/untracked files). Best-effort:
-# if nothing changed this is a no-op.
-git -C "$ROOT" add -u -- src-tauri || true
+# The files under src-tauri/ that ALREADY carry unstaged edits, recorded before
+# fmt runs. Under pre-commit's own pre-push invocation this set is empty — the
+# framework has stashed every unstaged edit and checked the tree out to the
+# index — so `git add -u` used to stage exactly fmt's output and nothing else.
+# Run WITHOUT that stash (the stash-free shim mechanism, or a hand run; see
+# prepush-stash-guard.sh and findings 690aaeec / d0958551), a bare
+# `git add -u -- src-tauri` would silently stage the caller's in-progress edits
+# into their next commit. So only files that were clean before fmt are staged;
+# a dirty file fmt also rewrote is left unstaged and named. Each dirty file's
+# content hash is kept too, so the note names only the ones fmt touched.
+dirty_before=()
+while IFS= read -r -d '' _path; do
+  dirty_before+=("$_path")
+done < <(git -C "$ROOT" diff --name-only -z -- src-tauri 2>/dev/null)
+dirty_hashes() {
+  [[ "${#dirty_before[@]}" -gt 0 ]] || return 0
+  printf '%s\n' "${dirty_before[@]}" | git -C "$ROOT" hash-object --stdin-paths 2>/dev/null || true
+}
+dirty_hashes_before="$(dirty_hashes)"
+
+fmt_rc=0
+cargo fmt || fmt_rc=$?
+if [[ "$fmt_rc" -ne 0 ]]; then
+  # Formatting never blocks (T2 above). A parse error fmt trips on is either in
+  # the pushed code — clippy below reports it as a compile error — or in an
+  # unstaged edit this push does not carry.
+  echo "[pre-push] NOTE — cargo fmt exited $fmt_rc; continuing (formatting never blocks)."
+fi
+fmt_after="$(fmt_fingerprint)"
+dirty_hashes_after="$(dirty_hashes)"
+
+# Re-stage the src-tauri files fmt rewrote that had no unstaged edits of their
+# own. Tracked-file modifications only (no new/untracked files), as `git add -u`
+# was. Best-effort: if nothing changed this is a no-op.
+declare -A _was_dirty=()
+for _path in ${dirty_before[@]+"${dirty_before[@]}"}; do
+  _was_dirty["$_path"]=1
+done
+to_stage=()
+while IFS= read -r -d '' _path; do
+  [[ -n "${_was_dirty[$_path]+x}" ]] || to_stage+=("$_path")
+done < <(git -C "$ROOT" diff --name-only -z -- src-tauri 2>/dev/null)
+# The caller's dirty files fmt rewrote: same order on both sides, so compare
+# line by line. An unreadable hash on either side names the file (over-report).
+left_dirty=()
+if [[ "${#dirty_before[@]}" -gt 0 ]]; then
+  mapfile -t _hb <<<"$dirty_hashes_before"
+  mapfile -t _ha <<<"$dirty_hashes_after"
+  for _i in "${!dirty_before[@]}"; do
+    if [[ -z "${_hb[$_i]:-}" || "${_hb[$_i]:-}" != "${_ha[$_i]:-}" ]]; then
+      left_dirty+=("${dirty_before[$_i]}")
+    fi
+  done
+fi
+if [[ "${#to_stage[@]}" -gt 0 ]]; then
+  git -C "$ROOT" --literal-pathspecs add -- "${to_stage[@]}" || true
+fi
 
 if [[ "$fmt_before" != "$fmt_after" ]]; then
   echo
-  echo "[pre-push] NOTE — cargo fmt rewrote files, and they are now STAGED."
+  if [[ "${#to_stage[@]}" -gt 0 ]]; then
+    echo "[pre-push] NOTE — cargo fmt rewrote files, and they are now STAGED."
+  else
+    echo "[pre-push] NOTE — cargo fmt rewrote files."
+  fi
   echo "          A pre-push hook cannot alter commits that are already being"
   echo "          pushed, so THIS push still carries the unformatted tree and"
   echo "          CI's required 'Format Rust code check' will red it. Commit"
   echo "          (or amend) the staged fmt fix and push again."
+  if [[ "${#left_dirty[@]}" -gt 0 ]]; then
+    echo "          fmt also reformatted these files IN PLACE, but they already held"
+    echo "          UNSTAGED edits of yours, so nothing in them was staged:"
+    printf '            %s\n' "${left_dirty[@]}"
+  fi
   echo
 fi
 
@@ -443,8 +522,12 @@ if [[ "$SKIP_CLIPPY" == "1" ]]; then
 fi
 
 # T1 (correctness) — block. Plain `cargo clippy`: NO `--all-targets` (that
-# compiles #[cfg(test)] modules this PR didn't touch — stricter than CI and a
-# frequent source of unrelated-lint push blocks) and NO `-D warnings` (that
+# compiles #[cfg(test)] modules this PR didn't touch, a frequent source of
+# unrelated-lint push blocks, and it would lengthen every push on fleet
+# hosts). This makes the hook LOOSER than CI's `clippy-windows` job for test
+# code — that job runs `--all-targets` per PR (qontinui-runner#2392), so a
+# deny-tier lint in shared #[cfg(test)] code is caught there, not here; the
+# ubuntu leg stays default-target like this hook. Also NO `-D warnings` (that
 # would promote every warning to an error and neuter the Cargo.toml tiering).
 # Lint levels come solely from `[lints.clippy]` in src-tauri/Cargo.toml: a
 # `deny`-tier (correctness/suspicious) lint still exits non-zero and blocks,
@@ -478,10 +561,70 @@ echo "[pre-push] cargo clippy (levels from Cargo.toml [lints.clippy]; deny-tier 
 # a cause it cannot support.
 CLIPPY_LOG="$(mktemp)"
 cleanup_clippy_log() { rm -f "$CLIPPY_LOG"; }
-trap 'restore_lock; cleanup_clippy_log' EXIT
+# A missing lib/shared-target.sh (noted above) defines no release; the trap
+# must still run the other two.
+declare -F release_shared_target >/dev/null 2>&1 || release_shared_target() { :; }
+trap 'restore_lock; cleanup_clippy_log; release_shared_target' EXIT
+
+# Build under the shared target's TREE LOCK and freshness ledger, or not at all.
+# Without them cargo replays a PEER worktree's units from a shared target as
+# Fresh, and clippy reports that peer's errors as this tree's: on 2026-10-29 a
+# false `error[E0432]` for a module that existed in the pushed tree (coord
+# finding 7b603cde; see lib/shared-target.sh). Taken AFTER the skip exit, so a
+# fmt-only push takes no lock, and after every scope-sensitive git call above.
+GUARD_RC=10
+if declare -F guard_shared_target >/dev/null 2>&1; then
+  GUARD_RC=0
+  guard_shared_target "$ROOT" "[pre-push]" "$ROOT/src-tauri" || GUARD_RC=$?
+fi
+# The one decline path, shared by a guard that could not be taken and by a
+# guarded build the holder deadline stopped (lib/shared-target.sh, "Bounding
+# the build"): both cost LATENCY, NOT COVERAGE, and both block only under
+# QONTINUI_PREPUSH_STRICT=1. $1 is the reason; the rest are the lines saying
+# why clippy produced no verdict.
+decline_guarded_clippy() {
+  local reason="$1" line; shift
+  echo >&2
+  echo "[pre-push] CANNOT RUN CLIPPY GUARDED — $reason." >&2
+  for line in "$@"; do echo "[pre-push]   $line" >&2; done
+  echo "[pre-push]   CI still gates clippy ('test (ubuntu-22.04)', 'Clippy (windows)'); fmt above" >&2
+  echo "[pre-push]   still ran. This costs LATENCY, NOT COVERAGE." >&2
+  if [[ "$STRICT" == "1" ]]; then
+    echo "[pre-push]   QONTINUI_PREPUSH_STRICT=1 — treating this as a failure." >&2
+    exit 1
+  fi
+  echo "[pre-push]   Not blocking the push. Set QONTINUI_PREPUSH_STRICT=1 to block instead." >&2
+  exit 0
+}
+case "$GUARD_RC" in
+  0|10) ;;
+  *)
+    decline_guarded_clippy "${SHARED_TARGET_GUARD_REASON:-guard rc $GUARD_RC}" \
+      "A clippy run without the tree lock can replay a PEER worktree's build as" \
+      "Fresh and report errors that are not in this tree, so it is not run."
+    ;;
+esac
 
 clippy_rc=0
-cargo clippy 2>&1 | tee "$CLIPPY_LOG" || clippy_rc=$?
+# `9>&-`: the tree lock's descriptor (flock arm) must not leak into cargo or a
+# daemon it spawns, which could otherwise hold the lock past this hook's exit.
+#
+# `guarded_build` (lib/shared-target.sh) runs it under the holder deadline
+# (abs_run) when qontinui-claude-config's lib is here, else exactly as a bare
+# `cargo clippy`. As a pipeline element under `pipefail` the pipeline's status
+# is the build's whenever the build is the failing stage (tee does not fail),
+# so `clippy_rc` is cargo's status, or 124 when abs_run returned a deadline
+# stop. On the path where the element exec'd into cargo the status is the
+# SIGTERM's 143, and `shared_target_build_stopped` reads the deadline's own
+# verdict for this hook's pid instead.
+declare -F guarded_build >/dev/null 2>&1 || guarded_build() { "$@"; }
+declare -F shared_target_build_stopped >/dev/null 2>&1 || shared_target_build_stopped() { return 1; }
+guarded_build cargo clippy 9>&- 2>&1 | tee "$CLIPPY_LOG" || clippy_rc=$?
+if shared_target_build_stopped "$clippy_rc" "[pre-push]"; then
+  decline_guarded_clippy "$SHARED_TARGET_GUARD_REASON" \
+    "The run was stopped, not judged: no clippy verdict, and its output above is" \
+    "partial. Retry once the peer build holding cargo's target lock finishes."
+fi
 if [[ "$clippy_rc" -ne 0 ]]; then
   rc="$clippy_rc"
   echo
@@ -501,6 +644,25 @@ if [[ "$clippy_rc" -ne 0 ]]; then
   elif [[ "$rc" -eq 127 ]] || grep -qiE 'command not found|could not execute|no such file or directory' "$CLIPPY_LOG"; then
     echo "[pre-push] FAIL — clippy could not run at all (exit $rc). This is NOT a lint failure."
     echo "          Check the toolchain: rustup component add clippy."
+  elif grep -qE '^error\[E[0-9]{4}\]' "$CLIPPY_LOG"; then
+    # A rustc error CODE is a compile error, not a clippy lint (lints carry
+    # none). Calling it "a lint fired" sent the 2026-10-29 push hunting a lint
+    # that did not exist.
+    echo "[pre-push] FAIL — a compile error (or deny-tier lint) — see the error[E…] lines above."
+    # Said on EVERY coded error, guarded or not: the tree lock only knows builds
+    # that take it, and cargo-guard.sh (until qontinui-claude-config#1823),
+    # rust-analyzer or a raw cargo can still leave a peer's units in the target
+    # (see lib/shared-target.sh, "WHAT IT DOES NOT COVER").
+    if [[ "$GUARD_RC" == "10" ]]; then
+      echo "          This target is UNGUARDED, so a peer checkout's stale build can"
+      echo "          be the cause."
+    else
+      echo "          The target was guarded, but builds that skip the tree lock can"
+      echo "          still leave a peer checkout's stale units behind."
+    fi
+    echo "          If the error names code that EXISTS in this tree, re-run with a"
+    echo "          private CARGO_TARGET_DIR before changing any code."
+    echo "          Fix it, or QONTINUI_PREPUSH_SKIP=1 git push to let CI gate."
   elif grep -qE '^error(\[|:)' "$CLIPPY_LOG"; then
     echo "[pre-push] FAIL — a deny-tier (correctness/suspicious) clippy lint fired."
     echo "          Fix the lint, or QONTINUI_PREPUSH_SKIP=1 git push to let CI gate."

@@ -357,27 +357,73 @@ pub fn parse_reporter_step(raw: Option<&str>) -> Option<String> {
 /// MUST stay sorted: membership is a `binary_search`.
 const READ_TOOLS: &[&str] = &[
     "coord_agent_registry_effective",
+    "coord_alert_queue",
     "coord_am_i_clear",
+    // The auto-publisher's status (direction, settles_at, held, the kill
+    // switch; qontinui-coord#4238). No read prefix covers it.
+    "coord_auto_publish_status",
     "coord_blockers",
     "coord_build_info",
     "coord_can",
     "coord_change_conflict",
+    // A run's jobs and a job's bounded log tail (coord's GitHub App reads;
+    // a retry is idempotent but each call may spend one accounted App read);
+    // no prefix below covers the `coord_ci_` pair.
+    "coord_ci_job_log_tail",
+    "coord_ci_run_jobs",
+    // This and coord_repo_tenant_bindings, coord_resolve_pr_author_session,
+    // coord_resolve_session, coord_secret_presence, coord_slo_metrics,
+    // coord_subproject_get, coord_symbol_lookup, coord_tenants_for_repo and
+    // coord_twin_catalog below are each documented "Read-only" (or a pure
+    // query/list/resolve) in coord's tool registry snapshot at fc3544aec. No
+    // read prefix covers them (`coord_resolve_` would also claim the
+    // unverified coord_resolve_origin), so they are exact entries.
+    "coord_claim_check",
+    // The condition-runs read (twin `GET /coord/agent-condition-runs`); no read
+    // prefix covers it, so without this it reads as a write.
+    "coord_condition_runs",
     "coord_conflict_check",
     "coord_diagnose",
     "coord_diff_impact",
+    // The read-back of an expedited-land request; its write twin is
+    // `coord_request_expedited_land`. No read prefix covers it.
+    "coord_expedited_land_status",
+    // No `coord_fleet_` prefix covers it, so without this it reads as a write.
+    "coord_fleet_dispatch_roles",
+    "coord_fleet_drain_status",
     "coord_inbox",
     "coord_layering_triage",
     "coord_memory_get",
     "coord_memory_overview",
     "coord_memory_search",
     "coord_merge_order",
+    "coord_message_status",
     "coord_migration_queue",
+    "coord_next_step_settings_effective",
     "coord_orient",
+    "coord_overlord_interventions",
+    "coord_pending_agent_questions",
     "coord_pr_status",
+    "coord_primary_tree_branch_status",
+    "coord_project_state",
     "coord_reevaluate_dry",
+    "coord_repo_tenant_bindings",
+    "coord_resolve_pr_author_session",
+    "coord_resolve_session",
+    "coord_secret_presence",
+    "coord_session_obligations",
     "coord_session_worktrees",
+    "coord_sessions_unfinished",
+    "coord_slo_metrics",
+    "coord_subproject_get",
+    "coord_symbol_lookup",
+    "coord_tenants_for_repo",
+    "coord_twin_catalog",
     "coord_verification_queue",
+    "coord_watch_verdict",
     "coord_who_is_working_on",
+    // Not covered by the `coord_work_unit_list` prefix below.
+    "coord_work_unit_overview",
 ];
 
 /// Read-only tool FAMILIES by prefix.
@@ -944,15 +990,84 @@ mod tests {
             operation_for_call("tools/call", Some("coord_can")),
             OPERATION_READ
         );
+        // The sender's receipt read matches no read prefix, so only its
+        // exact `READ_TOOLS` entry keeps it from defaulting to a write.
+        assert_eq!(
+            operation_for_call("tools/call", Some("coord_message_status")),
+            OPERATION_READ
+        );
         // The by-id memory read-back is an exact read, while its write
         // siblings (`coord_memory_record` / `_supersede`) stay writes.
         assert_eq!(
             operation_for_call("tools/call", Some("coord_memory_get")),
             OPERATION_READ
         );
+        // The condition-runs read matches no read prefix either.
+        assert_eq!(
+            operation_for_call("tools/call", Some("coord_condition_runs")),
+            OPERATION_READ
+        );
         assert_eq!(
             operation_for_call("tools/call", Some("coord_memory_record")),
             OPERATION_WRITE
+        );
+        // The App-backed CI reads match no read prefix, so only their exact
+        // `READ_TOOLS` entries keep them from defaulting to writes.
+        for tool in ["coord_ci_run_jobs", "coord_ci_job_log_tail"] {
+            assert_eq!(operation_for_call("tools/call", Some(tool)), OPERATION_READ);
+        }
+        // The overlord's proof reads and ledger reads are reads; the ledger
+        // appends (`coord_overlord_record`, and the triage-pass ledger's
+        // `coord_overlord_pass_record`) stay writes. The pass ledger's two reads
+        // are reads by the `coord_query_` prefix, with no exact entry.
+        for tool in [
+            "coord_watch_verdict",
+            "coord_session_obligations",
+            "coord_overlord_interventions",
+            "coord_query_overlord_passes",
+            "coord_query_overlord_flow",
+        ] {
+            assert_eq!(operation_for_call("tools/call", Some(tool)), OPERATION_READ);
+        }
+        for tool in ["coord_overlord_record", "coord_overlord_pass_record"] {
+            assert_eq!(
+                operation_for_call("tools/call", Some(tool)),
+                OPERATION_WRITE,
+                "{tool} is a ledger append"
+            );
+        }
+        for tool in [
+            "coord_alert_queue",
+            "coord_auto_publish_status",
+            "coord_claim_check",
+            "coord_expedited_land_status",
+            "coord_repo_tenant_bindings",
+            "coord_resolve_pr_author_session",
+            "coord_resolve_session",
+            "coord_secret_presence",
+            "coord_slo_metrics",
+            "coord_subproject_get",
+            "coord_symbol_lookup",
+            "coord_tenants_for_repo",
+            "coord_twin_catalog",
+            "coord_fleet_dispatch_roles",
+            "coord_fleet_drain_status",
+            "coord_next_step_settings_effective",
+            "coord_pending_agent_questions",
+            "coord_primary_tree_branch_status",
+            "coord_work_unit_overview",
+        ] {
+            assert_eq!(operation_for_call("tools/call", Some(tool)), OPERATION_READ);
+        }
+        // The one-screen reads: neither is prefix-covered (`coord_work_unit_list`
+        // does not claim `coord_work_unit_overview`), so both are exact entries.
+        assert_eq!(
+            operation_for_call("tools/call", Some("coord_project_state")),
+            OPERATION_READ
+        );
+        assert_eq!(
+            operation_for_call("tools/call", Some("coord_work_unit_overview")),
+            OPERATION_READ
         );
         // `coord_can` is exact, so the cancel WRITE is not swallowed by it.
         assert_eq!(

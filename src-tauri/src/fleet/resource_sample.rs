@@ -43,7 +43,7 @@ use std::time::Duration;
 
 use qontinui_runner_lib::wedge_diagnostics::{spawn_blocking_tracked, tracked_blocking_by_thread};
 use serde::Serialize;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Default sample cadence in seconds.
 ///
@@ -201,6 +201,64 @@ pub(crate) struct ResourceSample {
     /// equivalent, and a fabricated 0.0 would read as "idle".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) load_1m: Option<f64>,
+    /// CPU package temperature in degrees Celsius, display only (plan
+    /// `2026-10-13-cpu-temperature-in-fleet-resource-telemetry`). `None` means
+    /// UNMEASURED: Windows, the `wsl` lane (no `/sys/class/thermal`), a Linux
+    /// host with no `x86_pkg_temp` zone or `coretemp` hwmon, or an implausible
+    /// reading. Never a fabricated 0, which would read as "cool".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cpu_temp_c: Option<f64>,
+    /// Whole-host CPU busy ratio in permille (0..=1000), measured between this
+    /// sample and the previous one on every OS. `None` on the first sample
+    /// after start (no delta exists yet) — never a fabricated 0.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cpu_busy_permille: Option<i32>,
+    /// 5- and 15-minute load averages — same source and same `None` rule as
+    /// [`Self::load_1m`] (plan 2026-09-30 §3.4: extend the existing column
+    /// family, never a second `load1`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) load_5m: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) load_15m: Option<f64>,
+    /// Linux PSI, percent 0-100, from `/proc/pressure/{memory,cpu,io}`.
+    /// `psi_cpu_full_*` is `None` on kernels before 5.13, which print no
+    /// `full` line for cpu — UNKNOWN, not "no stall".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) psi_memory_some_avg10: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) psi_memory_some_avg60: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) psi_memory_full_avg10: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) psi_memory_full_avg60: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) psi_cpu_some_avg10: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) psi_cpu_some_avg60: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) psi_cpu_full_avg10: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) psi_cpu_full_avg60: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) psi_io_some_avg10: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) psi_io_some_avg60: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) psi_io_full_avg10: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) psi_io_full_avg60: Option<f64>,
+    /// `/proc/vmstat` `oom_kill` — monotonic since boot, so a delta across a
+    /// `boot_id` change is meaningless and consumers must key on both.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) oom_kill_total: Option<u64>,
+    /// The kernel's per-boot UUID (`/proc/sys/kernel/random/boot_id`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) boot_id: Option<String>,
+    /// Axis name → `measured` | `not_supported` | `unavailable` for the axes
+    /// this lane attempted (see [`crate::fleet::host_axes`]). An axis absent
+    /// from the manifest was not attempted by this lane: UNKNOWN.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) measured: Option<BTreeMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) mem_total_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -280,17 +338,16 @@ pub(crate) struct ResourceSample {
     /// box is this gap, not a regression; `/health` `threadCeilings` names the
     /// enforced pair and where each number came from.
     ///
-    /// Publishing the effective ceilings beside the reading is the fix, and it
-    /// is deliberately NOT done here yet, because it would be inert and noisy:
-    /// `coord.device_resource_samples` has no ceiling columns (alembic in
-    /// qontinui-web is the sole author of `coord.*` schema, and no such
-    /// revision exists), so coord's ingest would route both keys into
-    /// `ResourceSampleItem::unknown_fields` — which it DROPS after emitting a
-    /// `tracing::warn!` naming them, on the log surface reserved for publisher
-    /// typos. At a 30 s tick that is ~2,880 warn lines per runner per day
-    /// buying a consumer nothing. The migration lands first; the publisher
-    /// follows it. Until then, grade this number knowing you may be grading it
-    /// against a ceiling the runner does not use.
+    /// The fix is published beside this field: the host lane carries
+    /// [`Self::launch_headroom`], [`Self::launch_verdict`], the GRADED reading
+    /// and the enforced warn / critical ceilings, so coord admits against the
+    /// device's own answer (plan
+    /// `2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling`
+    /// Phase 2). That plan orders the rollout: coord's ingest of those keys
+    /// (and qontinui-web's columns) deploys BEFORE a runner publishing them
+    /// merges, because a key coord does not know lands in
+    /// `ResourceSampleItem::unknown_fields` with a `tracing::warn!` — ~2,880
+    /// lines per runner per day at a 30 s tick.
     ///
     /// This doc used to say coord "grades this warn at 256 / critical at 400,
     /// the same two numbers as this runner's shipped
@@ -331,6 +388,40 @@ pub(crate) struct ResourceSample {
     /// documents.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) active_terminal_sessions: Option<i32>,
+    /// Further unattended launches this runner's own admission would take
+    /// right now before refusing one (`0` = the next launch is refused) —
+    /// [`crate::launch_capacity::launch_headroom`], the same projection
+    /// `admit_launch` decides on, capped at
+    /// [`crate::launch_capacity::LAUNCH_HEADROOM_CAP`]. coord admits a spawn on
+    /// this device only against it (plan
+    /// `2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling`).
+    ///
+    /// **Host lane only**, for [`Self::thread_count`]'s placement reason: it is
+    /// the runner PROCESS's admission. `None` when the session guard is
+    /// disabled (`launch_verdict = guard_disabled`) — UNKNOWN, never `0`, which
+    /// would read as "full". `i32` for the `INTEGER` counter-group reason
+    /// [`Self::thread_count`] gives.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) launch_headroom: Option<i32>,
+    /// `proceed` / `warn` / `critical` / `guard_disabled` / `unreadable` —
+    /// [`crate::launch_capacity::LaunchVerdict::as_str`], the vocabulary coord's
+    /// CHECK constraint carries. Host lane only; always `Some` there.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) launch_verdict: Option<String>,
+    /// The GRADED thread reading (raw minus the idle blocking pool) the
+    /// thread lane judges — the number the two ceilings below apply to, NOT
+    /// [`Self::thread_count`]. `None` when the guard is disabled or the thread
+    /// table was unreadable. Host lane only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) thread_graded: Option<i32>,
+    /// The per-machine thread ceilings the runner ENFORCES
+    /// ([`crate::resource_guard::merge_thread_ceilings`]). A launch is refused
+    /// above the warn one. `None` only when the guard is disabled. Host lane
+    /// only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) thread_warn_ceiling: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) thread_critical_ceiling: Option<i32>,
     /// Per-lane breakdown of THIS runner process's in-flight tracked blocking
     /// bodies — [`qontinui_runner_lib::wedge_diagnostics::tracked_blocking_by_thread`],
     /// keyed by the thread that spawned each body. Bounded to
@@ -440,6 +531,23 @@ pub(crate) struct ResourceSample {
     /// are different facts about a device.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) sock_source: Option<String>,
+    /// Per-slice cgroup v2 memory (`ci-runners.slice`, `agent-builds.slice`,
+    /// `qontinui-runner.slice`): `memory.current/high/max` and the
+    /// `memory.events` `high/max/oom_kill` counters, as a JSON map keyed by
+    /// slice (plan `2026-10-19-ci-nodes-run-the-tauri-runner-always-on-as-ci-node-role`
+    /// Phase 0b; shape in [`crate::fleet::slice_telemetry`]). **Host lane only**
+    /// and Linux only: `None` is UNKNOWN, never 0 — see [`Self::slice_source`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cgroup_slices: Option<serde_json::Value>,
+    /// PSI `memory`/`cpu`/`io` `some`/`full` `avg10`/`avg60`, system-wide and
+    /// per slice. `None` = unmeasured (not Linux, PSI disabled), never zeroes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) psi: Option<serde_json::Value>,
+    /// `"linux_cgroup_v2"` when the cgroup tree was read, `"not_supported"`
+    /// when this host cannot be measured. A lane that never probes (WSL)
+    /// publishes `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) slice_source: Option<String>,
     /// `'runner' | 'supervisor' | 'ci-step'`. Distinguishes this row from the
     /// supervisor's host-lane row for the same device.
     pub(crate) source: String,
@@ -577,12 +685,43 @@ impl Saturation {
 }
 
 impl ResourceSample {
+    /// Write the launch capacity onto this sample — the only way its five
+    /// fields are set. Counts saturate into `i32` (a pathological count must
+    /// not wrap to a negative, which reads as room against every line).
+    fn set_launch_capacity(&mut self, capacity: &crate::launch_capacity::LaunchCapacity) {
+        let narrow = |n: usize| i32::try_from(n).unwrap_or(i32::MAX);
+        self.launch_headroom = capacity.headroom.map(narrow);
+        self.launch_verdict = Some(capacity.verdict.as_str().to_string());
+        self.thread_graded = capacity.graded.map(narrow);
+        self.thread_warn_ceiling = capacity.warn.map(narrow);
+        self.thread_critical_ceiling = capacity.critical.map(narrow);
+    }
+
     fn empty(lane: Lane, lane_instance: Option<String>) -> Self {
         Self {
             lane: lane.as_str().to_string(),
             lane_instance,
             cpu_cores: None,
             load_1m: None,
+            cpu_temp_c: None,
+            cpu_busy_permille: None,
+            load_5m: None,
+            load_15m: None,
+            psi_memory_some_avg10: None,
+            psi_memory_some_avg60: None,
+            psi_memory_full_avg10: None,
+            psi_memory_full_avg60: None,
+            psi_cpu_some_avg10: None,
+            psi_cpu_some_avg60: None,
+            psi_cpu_full_avg10: None,
+            psi_cpu_full_avg60: None,
+            psi_io_some_avg10: None,
+            psi_io_some_avg60: None,
+            psi_io_full_avg10: None,
+            psi_io_full_avg60: None,
+            oom_kill_total: None,
+            boot_id: None,
+            measured: None,
             mem_total_bytes: None,
             mem_available_bytes: None,
             commit_total_bytes: None,
@@ -598,6 +737,11 @@ impl ResourceSample {
             ci_jobs_running: None,
             thread_count: None,
             active_terminal_sessions: None,
+            launch_headroom: None,
+            launch_verdict: None,
+            thread_graded: None,
+            thread_warn_ceiling: None,
+            thread_critical_ceiling: None,
             blocking_lanes: None,
             threads_max: None,
             threads_used: None,
@@ -610,6 +754,9 @@ impl ResourceSample {
             sock_established_local: None,
             sock_time_wait_local: None,
             sock_source: None,
+            cgroup_slices: None,
+            psi: None,
+            slice_source: None,
             source: "runner".to_string(),
         }
     }
@@ -638,6 +785,116 @@ impl ResourceSample {
             }
         }
         self.saturation_source = Some(r.source.as_str().to_string());
+    }
+
+    /// The `wsl` lane's load triple from its existing procfs `cat`, with a
+    /// manifest naming the three load axes (and nothing else it did not try).
+    fn set_wsl_load(&mut self, load: Option<crate::fleet::host_axes::LoadAvg>) {
+        use crate::fleet::host_axes::{Measured, AXIS_LOAD_15M, AXIS_LOAD_1M, AXIS_LOAD_5M};
+        let m = Measured::from_read(&load).as_str().to_string();
+        if let Some(l) = load {
+            self.load_1m = Some(l.one);
+            self.load_5m = Some(l.five);
+            self.load_15m = Some(l.fifteen);
+        }
+        self.measured = Some(
+            [AXIS_LOAD_1M, AXIS_LOAD_5M, AXIS_LOAD_15M]
+                .iter()
+                .map(|a| (a.to_string(), m.clone()))
+                .collect(),
+        );
+    }
+
+    /// Write the §3.4 kernel pressure axes and their manifest — the ONLY way
+    /// the load/PSI/OOM/boot fields are set, so the values and the manifest
+    /// that explains their absence always come from one reading.
+    pub(crate) fn set_host_axes(&mut self, a: &crate::fleet::host_axes::HostAxes) {
+        if let Some(l) = a.load {
+            self.load_1m = Some(l.one);
+            self.load_5m = Some(l.five);
+            self.load_15m = Some(l.fifteen);
+        }
+        let split = |p: Option<crate::fleet::host_axes::Psi>| {
+            let p = p.unwrap_or_default();
+            (
+                p.some.map(|x| x.0),
+                p.some.map(|x| x.1),
+                p.full.map(|x| x.0),
+                p.full.map(|x| x.1),
+            )
+        };
+        (
+            self.psi_memory_some_avg10,
+            self.psi_memory_some_avg60,
+            self.psi_memory_full_avg10,
+            self.psi_memory_full_avg60,
+        ) = split(a.psi_memory);
+        (
+            self.psi_cpu_some_avg10,
+            self.psi_cpu_some_avg60,
+            self.psi_cpu_full_avg10,
+            self.psi_cpu_full_avg60,
+        ) = split(a.psi_cpu);
+        (
+            self.psi_io_some_avg10,
+            self.psi_io_some_avg60,
+            self.psi_io_full_avg10,
+            self.psi_io_full_avg60,
+        ) = split(a.psi_io);
+        self.oom_kill_total = a.oom_kill_total;
+        self.boot_id = a.boot_id.clone();
+        self.measured = (!a.measured.is_empty()).then(|| a.measured.clone());
+    }
+
+    /// Overwrite each flat `psi_<res>_*` group from `psi.system.<res>` when
+    /// that resource is present there, so a row never carries two
+    /// disagreeing readings of system PSI. A resource absent from
+    /// `psi.system` keeps the value [`Self::set_host_axes`] wrote.
+    pub(crate) fn align_flat_psi_with_system(&mut self) {
+        let Some(system) = self.psi.as_ref().and_then(|p| p.get("system")).cloned() else {
+            return;
+        };
+        let pick = |res: &str, line: &str, avg: &str| {
+            system
+                .get(res)
+                .and_then(|r| r.get(line))
+                .and_then(|l| l.get(avg))
+                .and_then(serde_json::Value::as_f64)
+        };
+        let group = |res: &str| {
+            system.get(res).map(|_| {
+                (
+                    pick(res, "some", "avg10"),
+                    pick(res, "some", "avg60"),
+                    pick(res, "full", "avg10"),
+                    pick(res, "full", "avg60"),
+                )
+            })
+        };
+        if let Some(g) = group("memory") {
+            (
+                self.psi_memory_some_avg10,
+                self.psi_memory_some_avg60,
+                self.psi_memory_full_avg10,
+                self.psi_memory_full_avg60,
+            ) = g;
+        }
+        if let Some(g) = group("cpu") {
+            (
+                self.psi_cpu_some_avg10,
+                self.psi_cpu_some_avg60,
+                self.psi_cpu_full_avg10,
+                self.psi_cpu_full_avg60,
+            ) = g;
+        }
+        if let Some(g) = group("io") {
+            (
+                self.psi_io_some_avg10,
+                self.psi_io_some_avg60,
+                self.psi_io_full_avg10,
+                self.psi_io_full_avg60,
+            ) = g;
+        }
     }
 }
 
@@ -815,6 +1072,158 @@ fn read_memory_status() -> Option<MemoryStatus> {
     }
 }
 
+/// Cumulative CPU time counters, in arbitrary but consistent units (100 ns
+/// ticks on Windows, USER_HZ jiffies on Linux). `busy` excludes idle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CpuTimes {
+    pub(crate) idle: u64,
+    pub(crate) total: u64,
+}
+
+/// Busy permille between two cumulative readings, clamped to 0..=1000.
+/// `None` when no time elapsed or a counter went backwards (UNKNOWN, not 0).
+pub(crate) fn cpu_busy_permille_between(prev: CpuTimes, cur: CpuTimes) -> Option<i32> {
+    let total = cur.total.checked_sub(prev.total)?;
+    let idle = cur.idle.checked_sub(prev.idle)?;
+    if total == 0 {
+        return None;
+    }
+    let busy = total.saturating_sub(idle);
+    let permille = (u128::from(busy) * 1000 / u128::from(total)).min(1000);
+    Some(permille as i32)
+}
+
+/// Advance the previous-reading slot and return the delta since it. The first
+/// call (empty slot) stores the reading and returns `None`.
+pub(crate) fn advance_cpu_busy(slot: &mut Option<CpuTimes>, cur: CpuTimes) -> Option<i32> {
+    let prev = slot.replace(cur);
+    prev.and_then(|p| cpu_busy_permille_between(p, cur))
+}
+
+#[cfg(windows)]
+fn read_cpu_times() -> Option<CpuTimes> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::GetSystemTimes;
+    let zero = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let (mut idle, mut kernel, mut user) = (zero, zero, zero);
+    // SAFETY: three valid out-pointers to FILETIME structs.
+    let ok = unsafe { GetSystemTimes(&mut idle, &mut kernel, &mut user) };
+    if ok == 0 {
+        return None;
+    }
+    let ft = |f: FILETIME| (u64::from(f.dwHighDateTime) << 32) | u64::from(f.dwLowDateTime);
+    // Kernel time INCLUDES idle time on Windows.
+    Some(CpuTimes {
+        idle: ft(idle),
+        total: ft(kernel).checked_add(ft(user))?,
+    })
+}
+
+/// Parse the aggregate `cpu ` line of `/proc/stat`.
+#[cfg(any(not(windows), test))]
+pub(crate) fn parse_proc_stat_cpu(text: &str) -> Option<CpuTimes> {
+    let line = text.lines().find(|l| l.starts_with("cpu "))?;
+    let v: Vec<u64> = line
+        .split_whitespace()
+        .skip(1)
+        .map(|x| x.parse().ok())
+        .collect::<Option<Vec<_>>>()?;
+    if v.len() < 4 {
+        return None;
+    }
+    // user nice system idle iowait irq softirq steal (guest is already in user).
+    let idle = v[3].checked_add(v.get(4).copied().unwrap_or(0))?;
+    let total = v.iter().take(8).try_fold(0u64, |a, x| a.checked_add(*x))?;
+    Some(CpuTimes { idle, total })
+}
+
+#[cfg(not(windows))]
+fn read_cpu_times() -> Option<CpuTimes> {
+    parse_proc_stat_cpu(&std::fs::read_to_string("/proc/stat").ok()?)
+}
+
+/// Host CPU busy permille since the previous call; `None` on the first call.
+fn sample_cpu_busy_permille() -> Option<i32> {
+    static PREV: std::sync::Mutex<Option<CpuTimes>> = std::sync::Mutex::new(None);
+    let cur = read_cpu_times()?;
+    let mut slot = PREV.lock().unwrap_or_else(|e| e.into_inner());
+    advance_cpu_busy(&mut slot, cur)
+}
+
+/// Accepted RAW sysfs range, millidegrees Celsius: `1..=150000`, i.e. a
+/// converted `0.001..=150` C. Raw `0` is rejected on purpose (a stuck or
+/// unavailable sensor reads 0, and "0 C" must never become a datum), and so is
+/// any negative raw value (a driver error sentinel such as `-1`). This is the
+/// unified collector rule mirrored by the supervisor follow-up.
+const CPU_TEMP_RAW_MIN_MILLI: i64 = 1;
+const CPU_TEMP_RAW_MAX_MILLI: i64 = 150_000;
+
+/// Parse one sysfs temperature file body (millidegrees Celsius) into Celsius.
+/// `None` on empty or non-numeric text or a raw value outside
+/// [`CPU_TEMP_RAW_MIN_MILLI`]..=[`CPU_TEMP_RAW_MAX_MILLI`]. `/1000` is applied
+/// exactly once, here, so the wire is always Celsius.
+fn parse_millidegrees_c(text: &str) -> Option<f64> {
+    let milli: i64 = text.trim().parse().ok()?;
+    (CPU_TEMP_RAW_MIN_MILLI..=CPU_TEMP_RAW_MAX_MILLI)
+        .contains(&milli)
+        .then(|| milli as f64 / 1000.0)
+}
+
+/// Read the CPU package temperature from a sysfs tree rooted at `sys_root`
+/// (`/sys` in production; a fake tree in tests).
+///
+/// 1. The MAX valid `temp` over ALL `class/thermal/thermal_zone*` whose `type`
+///    is exactly `x86_pkg_temp` (independent of directory order).
+/// 2. If no such zone yields a valid value: the MAX valid `temp*_input` over
+///    ALL `class/hwmon/hwmon*` whose `name` is exactly `coretemp`.
+///
+/// A directory or file that cannot be read or parsed is skipped, never
+/// escalated: it contributes nothing, and the remaining readings still count.
+/// `None` only when nothing valid was found (UNKNOWN, never zero).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn read_cpu_package_temp_c(sys_root: &std::path::Path) -> Option<f64> {
+    fn read(p: std::path::PathBuf) -> Option<String> {
+        std::fs::read_to_string(p).ok()
+    }
+    fn max_of(a: Option<f64>, b: Option<f64>) -> Option<f64> {
+        match (a, b) {
+            (Some(x), Some(y)) => Some(x.max(y)),
+            (x, None) => x,
+            (None, y) => y,
+        }
+    }
+    // An unreadable directory yields no entries rather than an error.
+    fn entries(dir: std::path::PathBuf, prefix: &str) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(prefix))
+            .map(|e| e.path())
+            .collect()
+    }
+
+    let zones = entries(sys_root.join("class/thermal"), "thermal_zone")
+        .into_iter()
+        .filter(|z| read(z.join("type")).is_some_and(|t| t.trim() == "x86_pkg_temp"))
+        .filter_map(|z| read(z.join("temp")).and_then(|t| parse_millidegrees_c(&t)))
+        .fold(None, |m, c| max_of(m, Some(c)));
+    if zones.is_some() {
+        return zones;
+    }
+
+    entries(sys_root.join("class/hwmon"), "hwmon")
+        .into_iter()
+        .filter(|h| read(h.join("name")).is_some_and(|n| n.trim() == "coretemp"))
+        .flat_map(|h| entries(h, "temp"))
+        .filter(|p| p.to_string_lossy().ends_with("_input"))
+        .filter_map(|p| read(p).and_then(|t| parse_millidegrees_c(&t)))
+        .fold(None, |m, c| max_of(m, Some(c)))
+}
+
 /// Collect the `host` lane. Blocking (sysinfo refresh + a disk enumeration), so
 /// callers run it on a blocking pool.
 ///
@@ -857,7 +1266,8 @@ fn collect_host_lane() -> ResourceSample {
     // already returned, and the spawn gate and the fleet dashboard are now
     // literally the same reading rather than two probes of the same quantity —
     // `spawn_gate_reading` calls this identical function.
-    if let Some(m) = memory_status() {
+    let memory = memory_status();
+    if let Some(m) = memory {
         if m.phys_total > 0 {
             s.mem_total_bytes = Some(m.phys_total);
             s.mem_available_bytes = Some(m.phys_available);
@@ -866,26 +1276,38 @@ fn collect_host_lane() -> ResourceSample {
         s.commit_available_bytes = Some(m.commit_available);
     }
 
-    // Windows has no load average; sysinfo returns zeros there, and a
-    // fabricated 0.0 would render as "idle" on a saturated box.
-    #[cfg(not(windows))]
+    // Load 1/5/15, PSI, the oom_kill counter and boot_id, with a manifest
+    // naming which were measured. Windows has no load average (sysinfo
+    // returns zeros there) and no PSI: its manifest says `not_supported` and
+    // the values stay NULL — a fabricated 0.0 would render as "idle" on a
+    // saturated box.
+    s.set_host_axes(&crate::fleet::host_axes::collect());
+
+    // Linux only: Windows has no unprivileged package-temperature interface and
+    // `sysinfo`'s `component` feature is deliberately not enabled.
+    #[cfg(target_os = "linux")]
     {
-        s.load_1m = Some(sysinfo::System::load_average().one);
+        s.cpu_temp_c = read_cpu_package_temp_c(std::path::Path::new("/sys"));
     }
+
+    s.cpu_busy_permille = sample_cpu_busy_permille();
 
     // Same volume probe the disk floor gates on, so the dashboard's disk figure
     // and the gate's are literally one reading.
     if let Some(root) = crate::agent_runtime::qontinui_root_dir() {
-        if let Some((mount, total, free)) = crate::ci_node::admission::probe_volume_for(&root) {
-            s.disk_mount = Some(mount.to_string_lossy().to_string());
-            s.disk_total_bytes = Some(total);
-            s.disk_free_bytes = Some(free);
+        if let Some(volume) = crate::ci_node::admission::probe_volume_for(&root) {
+            s.disk_mount = Some(volume.mount.to_string_lossy().to_string());
+            s.disk_total_bytes = Some(volume.total);
+            s.disk_free_bytes = Some(volume.available);
         }
     }
 
     // The runner's build lane IS its `ci_node` executor, so slots and CI jobs
     // are the same occupancy read two ways. The supervisor publishes the
-    // Windows build pool's slots under `source='supervisor'`.
+    // Windows build pool's slots under `source='supervisor'`. The total is what
+    // admission admits against: with the capacity model (plan 2026-11-05
+    // Phase 7) an unset capacity follows the box's load, so busy can briefly
+    // read above total after the model lowers it.
     let ci = crate::settings::get_ci_node_settings();
     let (running, queued) = crate::ci_node::admission::occupancy();
     if ci.enabled {
@@ -932,6 +1354,20 @@ fn collect_host_lane() -> ResourceSample {
         s.active_terminal_sessions
             .and_then(|n| usize::try_from(n).ok()),
     );
+
+    // The launch capacity coord admits against (plan
+    // `2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling`
+    // Phase 2): judged against the SAME memory reading this sample publishes
+    // (the `memory` taken above), plus the live thread reading — this function
+    // already runs inside `spawn_blocking_tracked`, so the synchronous
+    // thread-table read never lands on an async worker. Host lane only, for the
+    // spawn-pressure pair's placement reason: it is this runner PROCESS's
+    // admission, which no other lane owns.
+    s.set_launch_capacity(&crate::launch_capacity::live_with_memory((
+        Lane::Host.as_str(),
+        memory.map(|m| m.commit_available),
+        memory.map(|m| m.phys_available),
+    )));
 
     s.blocking_lanes = Some(
         tracked_blocking_by_thread()
@@ -986,6 +1422,19 @@ fn collect_host_lane() -> ResourceSample {
             );
         }
     }
+
+    // Per-slice cgroup memory + PSI (plan 2026-10-19-ci-nodes-run-the-tauri-
+    // runner-always-on-as-ci-node-role, Phase 0b). Host lane only, for the
+    // socket census's reason: the `wsl` lane is a different cgroup tree. Off
+    // Linux this stamps `slice_source = "not_supported"` and nothing else.
+    let t = crate::fleet::slice_telemetry::collect();
+    s.cgroup_slices = t.cgroup_slices;
+    s.psi = t.psi;
+    s.slice_source = t.slice_source;
+    // One reading per row: the flat `psi_*` columns and `psi.system` describe
+    // the same quantity, so where the slice reader saw system PSI the flat
+    // fields are taken from it rather than from host_axes' earlier read.
+    s.align_flat_psi_with_system();
 
     s
 }
@@ -1099,7 +1548,7 @@ pub(crate) fn spawn_gate_reading() -> (&'static str, Option<u64>, Option<u64>) {
 /// `wsl.exe` (98k handles, 23% of all system handles) over ~3h — jamming the
 /// very distro it was trying to read, and outliving the fault that started it.
 #[cfg(windows)]
-async fn wsl_probe(args: &[&str]) -> Option<std::process::Output> {
+pub(crate) async fn wsl_probe(args: &[&str]) -> Option<std::process::Output> {
     let mut cmd = crate::process_helpers::tokio_no_window("wsl.exe");
     cmd.args(args)
         .kill_on_drop(true)
@@ -1159,7 +1608,7 @@ async fn resolve_wsl_distro() -> Option<String> {
 /// NUL-interleaved garbage that parses as a distro name. Same class as the
 /// UTF-16LE Tauri log encoding this repo already tripped over once.
 #[cfg(windows)]
-fn decode_utf16le(bytes: &[u8]) -> String {
+pub(crate) fn decode_utf16le(bytes: &[u8]) -> String {
     let units: Vec<u16> = bytes
         .chunks_exact(2)
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
@@ -1233,6 +1682,11 @@ async fn collect_wsl_lane() -> Option<ResourceSample> {
     let text = String::from_utf8_lossy(&out.stdout);
     let mut sample = parse_meminfo(&text, distro)?;
     sample.set_saturation(parse_proc_saturation(&text));
+    // `/proc/loadavg` already rides this one `cat`; PSI, vmstat and boot_id
+    // do not (three PSI files share one line shape and could not be told
+    // apart without markers), so this lane's manifest names only the load
+    // axes it actually attempted.
+    sample.set_wsl_load(crate::fleet::host_axes::parse_loadavg(&text));
     attach_wsl_disk(&mut sample);
     Some(sample)
 }
@@ -1291,10 +1745,10 @@ fn attach_wsl_disk(sample: &mut ResourceSample) {
     // The SAME single enumeration site the host lane and the CI-node disk floor
     // read, so the dashboard's number and the gate's are one reading rather
     // than two instruments that agree on a name.
-    if let Some((mount, total, free)) = crate::ci_node::admission::probe_volume_for(&root) {
-        sample.disk_mount = Some(mount.to_string_lossy().to_string());
-        sample.disk_total_bytes = Some(total);
-        sample.disk_free_bytes = Some(free);
+    if let Some(volume) = crate::ci_node::admission::probe_volume_for(&root) {
+        sample.disk_mount = Some(volume.mount.to_string_lossy().to_string());
+        sample.disk_total_bytes = Some(volume.total);
+        sample.disk_free_bytes = Some(volume.available);
     }
 }
 
@@ -1658,28 +2112,309 @@ pub(crate) async fn publish_once() {
         .await
     {
         Ok(resp) if resp.status().is_success() => {
-            debug!(
-                "fleet::resource_sample: published {} lane(s)",
-                body.samples.len()
-            );
+            // A 200 is not "stored": coord drops invalid items and unknown
+            // fields INSIDE a 200 and says so only in the body.
+            let text = resp.text().await.ok();
+            log_sample_ack(sample_ack(text.as_deref(), body.samples.len()));
         }
         Ok(resp) => {
             let status = resp.status();
-            warn_once(format!("POST {url} -> HTTP {status}"));
+            warn_once(
+                &http_failure_class(status.as_u16()),
+                format!("POST {url} -> HTTP {status}"),
+            );
         }
-        Err(e) => warn_once(format!("POST {url} failed: {e}")),
+        Err(e) => warn_once(
+            transport_failure_class(e.is_connect(), e.is_timeout()),
+            format!("POST {url} failed: {e}"),
+        ),
     }
 }
 
-/// Log a publish failure loudly the first few times, then quietly.
+/// The one line logged for a 2xx body that is not coord's documented outcome.
+const ACK_UNKNOWN_LINE: &str =
+    "coord's 2xx body is not the documented outcome; whether the samples were stored is UNKNOWN";
+
+/// What a 2xx from `POST /coord/devices/{id}/resource-sample` established.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SampleAck {
+    /// The documented outcome naming no loss: coord stored `persisted` of the
+    /// `sent` lanes, and `persisted` is not fewer than `sent`.
+    Stored { persisted: u64, sent: usize },
+    /// The documented outcome naming what coord did NOT store.
+    Problems(Vec<String>),
+    /// The body could not be read, is not the documented outcome, or names no
+    /// `persisted` count: whether anything was stored is UNKNOWN — never read
+    /// as success.
+    Unknown,
+}
+
+/// Classify a 2xx body (`None` = it could not be read) for `sent` lanes. A
+/// clean body that persisted fewer lanes than were sent is a loss, not a
+/// store. PURE.
+pub(crate) fn sample_ack(body: Option<&str>, sent: usize) -> SampleAck {
+    let Some(body) = body else {
+        return SampleAck::Unknown;
+    };
+    match sample_ack_problems(body) {
+        None => SampleAck::Unknown,
+        Some(problems) if !problems.is_empty() => SampleAck::Problems(problems),
+        Some(_) => serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v.get("persisted")?.as_u64())
+            .map_or(SampleAck::Unknown, |persisted| {
+                if persisted < sent as u64 {
+                    SampleAck::Problems(vec![format!(
+                        "coord persisted {persisted} of {sent} sent sample(s)"
+                    )])
+                } else {
+                    SampleAck::Stored { persisted, sent }
+                }
+            }),
+    }
+}
+
+/// The line a [`SampleAck`] logs, or `None` for [`SampleAck::Problems`], whose
+/// lines are [`log_ack_problems`]'s. PURE.
+pub(crate) fn sample_ack_line(ack: &SampleAck) -> Option<String> {
+    match ack {
+        SampleAck::Stored { persisted, sent } => {
+            Some(format!("coord stored {persisted}/{sent} lane(s)"))
+        }
+        SampleAck::Problems(_) => None,
+        SampleAck::Unknown => Some(ACK_UNKNOWN_LINE.to_string()),
+    }
+}
+
+/// Log one 2xx outcome: a clean store at debug (and the recovery line when an
+/// earlier loss cleared), a loss through [`log_ack_problems`], and an UNKNOWN
+/// outcome at info ONCE per process.
+fn log_sample_ack(ack: SampleAck) {
+    let line = sample_ack_line(&ack);
+    match ack {
+        SampleAck::Stored { .. } => {
+            log_ack_problems(Vec::new());
+            if let Some(line) = line {
+                debug!("fleet::resource_sample: {line}");
+            }
+        }
+        SampleAck::Problems(problems) => log_ack_problems(problems),
+        SampleAck::Unknown => {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if let Some(line) = line {
+                if !LOGGED.swap(true, Ordering::Relaxed) {
+                    info!("fleet::resource_sample: {line}");
+                } else {
+                    debug!("fleet::resource_sample: {line}");
+                }
+            }
+        }
+    }
+}
+
+/// What a 200 from `POST /coord/devices/{id}/resource-sample` says was NOT
+/// stored, one line per kind of loss. Empty = everything sent was stored.
+/// `None` = the body is not a JSON object (an older coord, or a body that could
+/// not be read) — UNKNOWN, which is neither a loss nor a recovery. PURE.
+pub(crate) fn sample_ack_problems(body: &str) -> Option<Vec<String>> {
+    let v = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .filter(serde_json::Value::is_object)
+        // An object carrying none of the documented counts is not the
+        // documented shape: UNKNOWN, not "everything was stored".
+        .filter(|v| {
+            ["received", "accepted", "persisted", "rejected"]
+                .iter()
+                .any(|k| v.get(*k).is_some())
+        })?;
+    let num = |k: &str| v.get(k).and_then(serde_json::Value::as_u64);
+    let strs = |k: &str| -> Vec<String> {
+        v.get(k)
+            .and_then(serde_json::Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut out = Vec::new();
+    let rejected = strs("rejected");
+    if !rejected.is_empty() {
+        out.push(format!(
+            "coord dropped invalid sample(s): {}",
+            rejected.join("; ")
+        ));
+    }
+    let unknown = strs("unknown_fields");
+    if !unknown.is_empty() {
+        out.push(format!(
+            "coord did not recognise and did NOT store field(s) {unknown:?}"
+        ));
+    }
+    if v.get("schema_pending").and_then(serde_json::Value::as_bool) == Some(true) {
+        out.push(
+            "coord's samples table is not migrated yet (schema_pending) — samples were not stored"
+                .into(),
+        );
+    } else if let (Some(accepted), Some(persisted)) = (num("accepted"), num("persisted")) {
+        if persisted < accepted {
+            out.push(format!(
+                "coord persisted {persisted} of {accepted} accepted sample(s)"
+            ));
+        }
+    }
+    // Only meaningful for rows that landed: coord leaves it `false` when
+    // nothing was persisted, and that loss is already named above.
+    if num("persisted").is_some_and(|n| n > 0)
+        && v.get("computer_axes_stored")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
+    {
+        out.push(
+            "coord did not store the computer-model axes (load_5m/15m, PSI, oom_kill_total, \
+             boot_id, measured) — its catalogue does not carry them yet"
+                .into(),
+        );
+    }
+    if v.get("body_device_id_mismatch")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        out.push("coord saw a body device_id that disagrees with the path (the path won)".into());
+    }
+    Some(out)
+}
+
+/// The change key of a problem list: every whitespace-separated token that is
+/// a NUMBER (as `f64` parses it, after trimming punctuation — so `140`,
+/// `100.5`, `101`, `-3`, `NaN`, `inf`) becomes `#`, so a value coord echoes
+/// ("psi_cpu_some 140 is outside its domain", "persisted 3 of 5") does not make
+/// the same steady loss read as a new one every push. Field names are kept
+/// whole: `load_5m` and `load_15m`, or `avg10` and `avg60`, stay distinct
+/// because neither token parses as a number. PURE.
+pub(crate) fn ack_problems_key(problems: &[String]) -> Vec<String> {
+    let token_key = |t: &str| -> String {
+        let core =
+            t.trim_matches(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '-' | '+' | '.')));
+        let core = core.trim_end_matches('.');
+        if !core.is_empty() && core.parse::<f64>().is_ok() {
+            t.replacen(core, "#", 1)
+        } else {
+            t.to_string()
+        }
+    };
+    problems
+        .iter()
+        .map(|p| {
+            p.split_whitespace()
+                .map(token_key)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect()
+}
+
+/// Log [`sample_ack_problems`] when its [`ack_problems_key`] CHANGES (a
+/// steady partial loss at a 30 s cadence would otherwise repeat forever), and
+/// say once when it clears.
+fn log_ack_problems(problems: Vec<String>) {
+    static LAST: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let Ok(mut last) = LAST.lock() else {
+        return;
+    };
+    let key = ack_problems_key(&problems);
+    if *last == key {
+        return;
+    }
+    if problems.is_empty() {
+        debug!("fleet::resource_sample: coord stores every sample again");
+    } else {
+        warn!(
+            "fleet::resource_sample: published, but {}",
+            problems.join(" | ")
+        );
+    }
+    *last = key;
+}
+
+/// WARNs each publish-failure class gets per process before it drops to debug.
+const WARNS_PER_FAILURE_CLASS: u32 = 3;
+
+/// The failure class of a non-2xx answer: `http:<status>`. PURE.
+pub(crate) fn http_failure_class(status: u16) -> String {
+    format!("http:{status}")
+}
+
+/// The failure class of a request that got no answer, from
+/// `reqwest::Error::is_connect` / `is_timeout`. PURE.
+pub(crate) fn transport_failure_class(is_connect: bool, is_timeout: bool) -> &'static str {
+    if is_connect {
+        "transport:connect"
+    } else if is_timeout {
+        "transport:timeout"
+    } else {
+        "transport:other"
+    }
+}
+
+/// A failure arriving after this long with NO failure at all starts a new
+/// outage, and every class gets its full WARN budget back. A delivered POST
+/// alone does not: a coord answering 2xx and 503 by turns would otherwise
+/// refill the budget between every pair and WARN every failure.
+const FAILURE_QUIET_SECS: u64 = 600;
+
+/// The per-class WARN budget, refilled by a quiet period ([`FAILURE_QUIET_SECS`]).
+#[derive(Debug, Default)]
+pub(crate) struct FailureWarns {
+    spent: BTreeMap<String, u32>,
+    last_failure: Option<std::time::Instant>,
+}
+
+impl FailureWarns {
+    pub(crate) const fn new() -> Self {
+        Self {
+            spent: BTreeMap::new(),
+            last_failure: None,
+        }
+    }
+
+    /// Record one failure of `class` at `now`: `true` = WARN it, while the
+    /// class has budget left. PURE.
+    pub(crate) fn admit(&mut self, class: &str, now: std::time::Instant) -> bool {
+        let quiet = std::time::Duration::from_secs(FAILURE_QUIET_SECS);
+        if self
+            .last_failure
+            .is_some_and(|t| now.saturating_duration_since(t) >= quiet)
+        {
+            self.spent.clear();
+        }
+        self.last_failure = Some(now);
+        let spent = self.spent.entry(class.to_string()).or_default();
+        *spent = spent.saturating_add(1);
+        *spent <= WARNS_PER_FAILURE_CLASS
+    }
+}
+
+/// The per-process budget [`warn_once`] spends.
+static FAILURE_WARNS: std::sync::Mutex<FailureWarns> = std::sync::Mutex::new(FailureWarns::new());
+
+/// Log a publish failure loudly the first few times PER CLASS, then quietly.
 ///
 /// A 30s sampler against a coord that is down for an hour would otherwise emit
 /// 120 identical WARNs and bury whatever the operator is actually reading. The
-/// first ones are the diagnosis; the rest are noise.
-fn warn_once(msg: String) {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static SEEN: AtomicU32 = AtomicU32::new(0);
-    if SEEN.fetch_add(1, Ordering::Relaxed) < 3 {
+/// first ones are the diagnosis; the rest are noise. The budget is per failure
+/// class, so a NEW kind of failure (a 422 after three 503s, a refused connect
+/// after three 5xx) is WARNed rather than lost under the first kind's budget,
+/// and it refills after [`FAILURE_QUIET_SECS`] without a failure, so the next
+/// outage is diagnosable too.
+fn warn_once(class: &str, msg: String) {
+    let loud = FAILURE_WARNS
+        .lock()
+        .map(|mut b| b.admit(class, std::time::Instant::now()))
+        .unwrap_or(true);
+    if loud {
         warn!("fleet::resource_sample: {msg} (best-effort — sample dropped)");
     } else {
         debug!("fleet::resource_sample: {msg} (best-effort — sample dropped)");
@@ -1689,6 +2424,460 @@ fn warn_once(msg: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qontinui_runner_lib::wedge_diagnostics::OVERFLOW_LANE_NAME;
+
+    /// Plan `2026-11-13-computer-services-cap-and-sample-outcome` Phase 2: a
+    /// 2xx whose body is unreadable or undocumented reads UNKNOWN, never
+    /// "stored"; a clean body names how many lanes coord stored.
+    #[test]
+    fn an_unread_2xx_is_unknown_and_a_clean_one_names_what_was_stored() {
+        for unknown in [
+            None,
+            Some(""),
+            Some("not json"),
+            Some("{}"),
+            Some(r#"{"rejected":[]}"#),
+        ] {
+            let ack = sample_ack(unknown, 2);
+            assert_eq!(ack, SampleAck::Unknown, "{unknown:?}");
+            let line = sample_ack_line(&ack).unwrap();
+            assert_eq!(
+                line,
+                "coord's 2xx body is not the documented outcome; whether the samples were stored is UNKNOWN"
+            );
+            assert!(
+                !line.starts_with("coord stored"),
+                "no stored line for {unknown:?}"
+            );
+        }
+
+        let clean = r#"{"received":2,"accepted":2,"persisted":2,"rejected":[],"schema_pending":false,"computer_axes_stored":true,"unknown_fields":[]}"#;
+        let ack = sample_ack(Some(clean), 2);
+        assert_eq!(
+            ack,
+            SampleAck::Stored {
+                persisted: 2,
+                sent: 2
+            }
+        );
+        assert_eq!(
+            sample_ack_line(&ack).as_deref(),
+            Some("coord stored 2/2 lane(s)")
+        );
+
+        // Review A2: a body naming no loss of its own but persisting fewer
+        // lanes than were sent is a loss, never a debug "stored" line — and
+        // its key masks the numbers, so a steady shortfall is logged once.
+        let short = sample_ack(Some(r#"{"persisted":1}"#), 2);
+        assert_eq!(
+            short,
+            SampleAck::Problems(vec!["coord persisted 1 of 2 sent sample(s)".to_string()])
+        );
+        assert_eq!(sample_ack_line(&short), None);
+        assert_eq!(
+            ack_problems_key(&["coord persisted 1 of 2 sent sample(s)".to_string()]),
+            ack_problems_key(&["coord persisted 3 of 4 sent sample(s)".to_string()])
+        );
+
+        let lossy = r#"{"received":2,"accepted":2,"persisted":1}"#;
+        let ack = sample_ack(Some(lossy), 2);
+        assert!(
+            matches!(&ack, SampleAck::Problems(p) if p.len() == 1),
+            "{ack:?}"
+        );
+        assert_eq!(sample_ack_line(&ack), None);
+    }
+
+    /// Review round 3, A3: a coord answering 2xx and 503 by turns does not
+    /// refill the budget — the 503s stop WARNing after three — and a quiet
+    /// period of ten minutes without a failure does, so the next outage is
+    /// WARNed again.
+    #[test]
+    fn only_a_quiet_period_refills_the_warn_budget() {
+        let t0 = std::time::Instant::now();
+        let at = |secs: u64| t0 + std::time::Duration::from_secs(secs);
+        let mut warns = FailureWarns::new();
+        // A 503 every other 30 s tick (a 2xx between each) for 40 minutes.
+        let loud = (0..40)
+            .filter(|i| warns.admit("http:503", at(i * 60)))
+            .count();
+        assert_eq!(
+            loud, 3,
+            "alternating 2xx/503 WARNs three 503s, not every one"
+        );
+        // Ten minutes of 2xx since the last failure: a new outage.
+        assert!(warns.admit("http:503", at(39 * 60 + 600)));
+        // Just under ten minutes is not quiet enough.
+        let mut warns = FailureWarns::new();
+        for i in 0..3 {
+            assert!(warns.admit("http:503", at(i)));
+        }
+        assert!(!warns.admit("http:503", at(2 + 599)));
+    }
+
+    /// Phase 2: each failure class has its own budget of three WARNs.
+    #[test]
+    fn a_new_failure_class_is_warned_after_three_of_another() {
+        let now = std::time::Instant::now();
+        let mut warns = FailureWarns::new();
+        for _ in 0..3 {
+            assert!(warns.admit(&http_failure_class(503), now));
+        }
+        assert!(
+            !warns.admit(&http_failure_class(503), now),
+            "a fourth 503 is quiet"
+        );
+        assert_eq!(http_failure_class(422), "http:422");
+        assert!(
+            warns.admit(&http_failure_class(422), now),
+            "a 422 after three 503s is WARNed"
+        );
+
+        let mut warns = FailureWarns::new();
+        for status in [500, 502, 503] {
+            for _ in 0..3 {
+                assert!(warns.admit(&http_failure_class(status), now));
+            }
+        }
+        let connect = transport_failure_class(true, false);
+        assert_eq!(connect, "transport:connect");
+        assert!(
+            warns.admit(connect, now),
+            "a refused connect after the 5xx is WARNed"
+        );
+        assert_eq!(transport_failure_class(false, true), "transport:timeout");
+        assert_eq!(transport_failure_class(false, false), "transport:other");
+    }
+
+    #[test]
+    fn a_200_ack_names_what_coord_did_not_store() {
+        let clean = r#"{"received":3,"accepted":3,"persisted":3,"rejected":[],"schema_pending":false,"computer_axes_stored":true,"computer_id":null,"body_device_id_mismatch":false,"unknown_fields":[]}"#;
+        assert_eq!(sample_ack_problems(clean), Some(vec![]));
+        assert_eq!(
+            sample_ack_problems(""),
+            None,
+            "an unread body is UNKNOWN, not clean"
+        );
+        assert_eq!(sample_ack_problems("not json"), None);
+        assert_eq!(sample_ack_problems("[]"), None);
+
+        let lossy = r#"{"received":3,"accepted":2,"persisted":1,"rejected":["lane \"x\": unknown"],"schema_pending":false,"computer_axes_stored":false,"body_device_id_mismatch":true,"unknown_fields":["psi_cpu_sme"]}"#;
+        let p = sample_ack_problems(lossy).unwrap();
+        assert_eq!(p.len(), 5, "{p:?}");
+        assert!(p[0].contains("lane \"x\": unknown"));
+        assert!(p[1].contains("psi_cpu_sme"));
+        assert!(p[2].contains("persisted 1 of 2"));
+        assert!(p[3].contains("computer-model axes"));
+        assert!(p[4].contains("device_id"));
+
+        // schema_pending explains the shortfall; it is not reported twice.
+        let pending = r#"{"accepted":2,"persisted":0,"schema_pending":true}"#;
+        let p = sample_ack_problems(pending).unwrap();
+        assert_eq!(p.len(), 1);
+        assert!(p[0].contains("schema_pending"));
+
+        // A value coord echoes does not make a steady loss read as new.
+        let a = sample_ack_problems(
+            r#"{"rejected":["psi_cpu_some 140 is outside its domain"],"accepted":5,"persisted":3}"#,
+        )
+        .unwrap();
+        let b = sample_ack_problems(
+            r#"{"rejected":["psi_cpu_some 151 is outside its domain"],"accepted":4,"persisted":2}"#,
+        )
+        .unwrap();
+        assert_ne!(a, b);
+        assert_eq!(ack_problems_key(&a), ack_problems_key(&b));
+        let c = sample_ack_problems(r#"{"rejected":["load_5m 9 is outside its domain"]}"#).unwrap();
+        assert_ne!(
+            ack_problems_key(&a),
+            ack_problems_key(&c),
+            "a different field is a new loss"
+        );
+        // Field names differing only in digits stay distinct; a value's
+        // formatting (101 vs 100.5, NaN, a sign) does not.
+        let key = |s: &str| ack_problems_key(&[s.to_string()]);
+        assert_ne!(
+            key("psi_memory_some_avg10 140 is outside its domain"),
+            key("psi_memory_some_avg60 140 is outside its domain")
+        );
+        assert_ne!(key("load_5m 9 is outside"), key("load_15m 9 is outside"));
+        assert_eq!(
+            key("psi_cpu_some 100.5 is outside"),
+            key("psi_cpu_some 101 is outside")
+        );
+        assert_eq!(
+            key("psi_cpu_some NaN is outside"),
+            key("psi_cpu_some -3 is outside")
+        );
+        assert_eq!(key("… and 5 more"), key("… and 12 more"));
+        // A sentence-final value merges; a quoted field name next to it does not.
+        assert_eq!(
+            key("axis \"psi\" has state 5."),
+            key("axis \"psi\" has state 7.")
+        );
+        assert_ne!(key("field(s) [\"gpus_v2\"]"), key("field(s) [\"gpus_v3\"]"));
+        assert_eq!(
+            sample_ack_problems("{}"),
+            None,
+            "no documented key is UNKNOWN"
+        );
+    }
+
+    /// One row never carries two readings of system PSI: `psi.system` wins
+    /// for every resource it names, and a resource it omits keeps the
+    /// host_axes value.
+    #[test]
+    fn flat_psi_aligns_with_psi_system() {
+        let mut s = ResourceSample::empty(Lane::Host, None);
+        s.psi_memory_some_avg10 = Some(9.0);
+        s.psi_memory_full_avg60 = Some(9.0);
+        s.psi_io_some_avg10 = Some(7.0);
+        s.psi = Some(serde_json::json!({"system": {
+            "memory": {"some": {"avg10": 1.5, "avg60": 2.25}},
+            "cpu": {"some": {"avg10": 3.0, "avg60": 4.0}}
+        }}));
+        s.align_flat_psi_with_system();
+        assert_eq!(s.psi_memory_some_avg10, Some(1.5));
+        assert_eq!(s.psi_memory_some_avg60, Some(2.25));
+        // `full` absent in the reading: UNKNOWN, not the stale 9.0.
+        assert_eq!(s.psi_memory_full_avg60, None);
+        assert_eq!(s.psi_cpu_some_avg60, Some(4.0));
+        assert_eq!(s.psi_cpu_full_avg10, None);
+        // io absent from psi.system: the host_axes value stands.
+        assert_eq!(s.psi_io_some_avg10, Some(7.0));
+
+        // No psi at all: nothing changes.
+        let mut t = ResourceSample::empty(Lane::Host, None);
+        t.psi_cpu_some_avg10 = Some(5.0);
+        t.align_flat_psi_with_system();
+        assert_eq!(t.psi_cpu_some_avg10, Some(5.0));
+    }
+
+    #[test]
+    fn cpu_temp_parse_millidegrees() {
+        assert_eq!(parse_millidegrees_c("71000"), Some(71.0));
+        assert_eq!(parse_millidegrees_c("71000\n"), Some(71.0));
+        assert_eq!(parse_millidegrees_c(""), None);
+        assert_eq!(parse_millidegrees_c("abc"), None);
+        assert_eq!(parse_millidegrees_c("-1"), None);
+        assert_eq!(parse_millidegrees_c("0"), None);
+        assert_eq!(parse_millidegrees_c("1"), Some(0.001));
+        assert_eq!(parse_millidegrees_c("150000"), Some(150.0));
+        assert_eq!(parse_millidegrees_c("150001"), None);
+        assert_eq!(parse_millidegrees_c("255000"), None);
+    }
+
+    fn fake_sys(name: &str) -> std::path::PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("qontinui-cputemp-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn put(root: &std::path::Path, rel: &str, body: &str) {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    }
+
+    #[test]
+    fn cpu_temp_reader_prefers_pkg_zone_then_coretemp_then_none() {
+        let r = fake_sys("zone");
+        put(&r, "class/thermal/thermal_zone0/type", "acpitz\n");
+        put(&r, "class/thermal/thermal_zone0/temp", "20000\n");
+        put(&r, "class/thermal/thermal_zone1/type", "x86_pkg_temp\n");
+        put(&r, "class/thermal/thermal_zone1/temp", "71000\n");
+        put(&r, "class/hwmon/hwmon3/name", "coretemp\n");
+        put(&r, "class/hwmon/hwmon3/temp1_input", "90000\n");
+        assert_eq!(read_cpu_package_temp_c(&r), Some(71.0));
+        let _ = std::fs::remove_dir_all(&r);
+
+        let r = fake_sys("hwmon");
+        put(&r, "class/hwmon/hwmon1/name", "nvme\n");
+        put(&r, "class/hwmon/hwmon1/temp1_input", "99000\n");
+        put(&r, "class/hwmon/hwmon3/name", "coretemp\n");
+        put(&r, "class/hwmon/hwmon3/temp1_input", "55000\n");
+        put(&r, "class/hwmon/hwmon3/temp2_input", "63500\n");
+        put(&r, "class/hwmon/hwmon3/temp3_input", "255000\n");
+        assert_eq!(read_cpu_package_temp_c(&r), Some(63.5));
+        let _ = std::fs::remove_dir_all(&r);
+
+        let r = fake_sys("bad");
+        put(&r, "class/thermal/thermal_zone0/type", "x86_pkg_temp\n");
+        put(&r, "class/thermal/thermal_zone0/temp", "abc");
+        assert_eq!(read_cpu_package_temp_c(&r), None);
+        assert_eq!(read_cpu_package_temp_c(&r.join("missing")), None);
+        let _ = std::fs::remove_dir_all(&r);
+    }
+
+    #[test]
+    fn cpu_temp_takes_max_over_all_pkg_zones_regardless_of_order() {
+        for (first, second) in [("60000", "75000"), ("75000", "60000")] {
+            let r = fake_sys("twozones");
+            put(&r, "class/thermal/thermal_zone0/type", "x86_pkg_temp\n");
+            put(&r, "class/thermal/thermal_zone0/temp", first);
+            put(&r, "class/thermal/thermal_zone1/type", "x86_pkg_temp\n");
+            put(&r, "class/thermal/thermal_zone1/temp", second);
+            put(&r, "class/thermal/thermal_zone2/type", "x86_pkg_temp\n");
+            put(&r, "class/thermal/thermal_zone2/temp", "0\n");
+            assert_eq!(read_cpu_package_temp_c(&r), Some(75.0));
+            let _ = std::fs::remove_dir_all(&r);
+        }
+    }
+
+    #[test]
+    fn cpu_temp_falls_back_to_max_across_all_coretemp_hwmons() {
+        let r = fake_sys("twohw");
+        put(&r, "class/thermal/thermal_zone0/type", "x86_pkg_temp\n");
+        put(&r, "class/thermal/thermal_zone0/temp", "0\n");
+        put(&r, "class/hwmon/hwmon1/name", "coretemp\n");
+        put(&r, "class/hwmon/hwmon1/temp1_input", "58000\n");
+        put(&r, "class/hwmon/hwmon2/name", "coretemp\n");
+        put(&r, "class/hwmon/hwmon2/temp1_input", "66500\n");
+        put(&r, "class/hwmon/hwmon2/temp2_input", "-1\n");
+        put(&r, "class/hwmon/hwmon3/name", "coretemp_other\n");
+        put(&r, "class/hwmon/hwmon3/temp1_input", "99000\n");
+        assert_eq!(read_cpu_package_temp_c(&r), Some(66.5));
+        let _ = std::fs::remove_dir_all(&r);
+    }
+
+    #[test]
+    fn cpu_temp_unreadable_entry_does_not_discard_a_valid_reading() {
+        let r = fake_sys("unreadable");
+        // A zone whose `temp` is a DIRECTORY (read fails) and one whose
+        // `type` file is missing, beside a valid zone.
+        std::fs::create_dir_all(r.join("class/thermal/thermal_zone0/temp")).unwrap();
+        put(&r, "class/thermal/thermal_zone0/type", "x86_pkg_temp\n");
+        std::fs::create_dir_all(r.join("class/thermal/thermal_zone1")).unwrap();
+        put(&r, "class/thermal/thermal_zone2/type", "x86_pkg_temp\n");
+        put(&r, "class/thermal/thermal_zone2/temp", "64000\n");
+        // hwmon: an unreadable hwmon dir name entry beside a valid one.
+        std::fs::create_dir_all(r.join("class/hwmon/hwmon0/name")).unwrap();
+        assert_eq!(read_cpu_package_temp_c(&r), Some(64.0));
+        let _ = std::fs::remove_dir_all(&r);
+
+        let r = fake_sys("unreadable-hw");
+        std::fs::create_dir_all(r.join("class/hwmon/hwmon0/name")).unwrap();
+        put(&r, "class/hwmon/hwmon1/name", "coretemp\n");
+        put(&r, "class/hwmon/hwmon1/temp1_input", "51000\n");
+        std::fs::create_dir_all(r.join("class/hwmon/hwmon1/temp2_input")).unwrap();
+        assert_eq!(read_cpu_package_temp_c(&r), Some(51.0));
+        let _ = std::fs::remove_dir_all(&r);
+    }
+
+    #[test]
+    fn cpu_temp_serializes_only_when_known_and_wsl_stays_none() {
+        let mut s = ResourceSample::empty(Lane::Host, None);
+        let j = serde_json::to_value(&s).unwrap();
+        assert!(j.get("cpu_temp_c").is_none(), "None must omit the key");
+        s.cpu_temp_c = Some(71.5);
+        let j = serde_json::to_value(&s).unwrap();
+        assert_eq!(j["cpu_temp_c"], 71.5);
+        let w = ResourceSample::empty(Lane::Wsl, Some("Ubuntu".into()));
+        assert_eq!(w.cpu_temp_c, None);
+        assert!(serde_json::to_value(&w)
+            .unwrap()
+            .get("cpu_temp_c")
+            .is_none());
+    }
+
+    #[test]
+    fn cpu_busy_delta_arithmetic() {
+        let a = CpuTimes {
+            idle: 100,
+            total: 200,
+        };
+        let b = CpuTimes {
+            idle: 150,
+            total: 300,
+        };
+        // 100 total, 50 idle -> 500 permille.
+        assert_eq!(cpu_busy_permille_between(a, b), Some(500));
+        assert_eq!(cpu_busy_permille_between(a, a), None);
+    }
+
+    #[test]
+    fn cpu_busy_first_tick_is_none_then_measured() {
+        let mut slot = None;
+        let a = CpuTimes {
+            idle: 0,
+            total: 100,
+        };
+        assert_eq!(advance_cpu_busy(&mut slot, a), None);
+        let b = CpuTimes {
+            idle: 0,
+            total: 200,
+        };
+        assert_eq!(advance_cpu_busy(&mut slot, b), Some(1000));
+    }
+
+    #[test]
+    fn cpu_busy_clamps_and_rejects_backwards() {
+        let a = CpuTimes {
+            idle: 0,
+            total: 100,
+        };
+        // idle moved backwards relative to total growth is rejected, not wrapped.
+        assert_eq!(
+            cpu_busy_permille_between(
+                CpuTimes {
+                    idle: 10,
+                    total: 100
+                },
+                CpuTimes {
+                    idle: 5,
+                    total: 200
+                }
+            ),
+            None
+        );
+        // idle grew more than total: busy saturates at 0.
+        assert_eq!(
+            cpu_busy_permille_between(
+                a,
+                CpuTimes {
+                    idle: 100,
+                    total: 150
+                }
+            ),
+            Some(0)
+        );
+        // counter reset
+        assert_eq!(
+            cpu_busy_permille_between(
+                CpuTimes {
+                    idle: 0,
+                    total: 500
+                },
+                a
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn proc_stat_parse() {
+        let t = parse_proc_stat_cpu("cpu  10 0 10 70 10 0 0 0 0 0\ncpu0 1 1 1 1\n").unwrap();
+        assert_eq!(
+            t,
+            CpuTimes {
+                idle: 80,
+                total: 100
+            }
+        );
+        assert!(parse_proc_stat_cpu("nothing").is_none());
+    }
+
+    #[test]
+    fn host_sample_serializes_cpu_busy_only_when_known() {
+        let mut s = ResourceSample::empty(Lane::Host, None);
+        let j = serde_json::to_value(&s).unwrap();
+        assert!(j.get("cpu_busy_permille").is_none());
+        s.cpu_busy_permille = Some(420);
+        let j = serde_json::to_value(&s).unwrap();
+        assert_eq!(j["cpu_busy_permille"], 420);
+    }
 
     #[test]
     fn sample_cadence_is_floored_and_much_faster_than_the_budget() {
@@ -1814,6 +3003,88 @@ SwapFree:        8036352 kB
              measurement"
         );
         assert!(!obj.contains_key("lane_instance"));
+    }
+
+    /// Plan 2026-09-30 §3.4 / contract §2: the new axes use coord's exact
+    /// column names, and the manifest rides beside them. Built from synthetic
+    /// procfs text in the kernel's line shape, with the cpu PSI file unreadable.
+    #[test]
+    fn the_pressure_axes_use_the_contract_wire_names() {
+        let axes = crate::fleet::host_axes::linux_axes_from(
+            Some("32.07 28.81 31.69 31/16803 2177659\n"),
+            Some("some avg10=2.12 avg60=7.81 avg300=2.78 total=1\nfull avg10=1.95 avg60=7.18 avg300=2.56 total=1\n"),
+            None,
+            Some("some avg10=2.97 avg60=9.17 avg300=3.48 total=1\n"),
+            Some("pgfault 9\noom_kill 6\n"),
+            Some("0f0e0d0c-0b0a-4908-8706-050403020100\n"),
+        );
+        let mut s = ResourceSample::empty(Lane::Host, None);
+        s.set_host_axes(&axes);
+        let v = serde_json::to_value(&s).unwrap();
+        let o = v.as_object().unwrap();
+        assert_eq!(o["load_1m"], 32.07);
+        assert_eq!(o["load_5m"], 28.81);
+        assert_eq!(o["load_15m"], 31.69);
+        assert_eq!(o["psi_memory_some_avg10"], 2.12);
+        assert_eq!(o["psi_memory_some_avg60"], 7.81);
+        assert_eq!(o["psi_memory_full_avg10"], 1.95);
+        assert_eq!(o["psi_memory_full_avg60"], 7.18);
+        assert_eq!(o["psi_io_some_avg10"], 2.97);
+        assert_eq!(o["psi_io_some_avg60"], 9.17);
+        // An io file with no `full` line and an unreadable cpu file: absent,
+        // never zero.
+        for k in [
+            "psi_io_full_avg10",
+            "psi_io_full_avg60",
+            "psi_cpu_some_avg10",
+            "psi_cpu_some_avg60",
+            "psi_cpu_full_avg10",
+            "psi_cpu_full_avg60",
+        ] {
+            assert!(!o.contains_key(k), "{k} must be absent");
+        }
+        assert_eq!(o["oom_kill_total"], 6);
+        assert_eq!(o["boot_id"], "0f0e0d0c-0b0a-4908-8706-050403020100");
+        assert_eq!(
+            o["measured"],
+            serde_json::json!({
+                "boot_id": "measured",
+                "load_15m": "measured",
+                "load_1m": "measured",
+                "load_5m": "measured",
+                "oom_kill_total": "measured",
+                "psi_cpu": "unavailable",
+                "psi_io": "measured",
+                "psi_memory": "measured"
+            })
+        );
+
+        // Windows: every axis `not_supported`, no value at all.
+        let mut w = ResourceSample::empty(Lane::Host, None);
+        w.set_host_axes(&crate::fleet::host_axes::windows_axes());
+        let v = serde_json::to_value(&w).unwrap();
+        let o = v.as_object().unwrap();
+        assert!(!o.contains_key("load_1m"));
+        assert!(!o.contains_key("psi_memory_some_avg60"));
+        assert_eq!(o["measured"]["psi_memory"], "not_supported");
+        assert_eq!(o["measured"]["load_1m"], "not_supported");
+    }
+
+    #[test]
+    fn the_wsl_lane_names_only_the_load_axes_it_attempted() {
+        let mut s = ResourceSample::empty(Lane::Wsl, Some("Ubuntu-24.04".into()));
+        s.set_wsl_load(crate::fleet::host_axes::parse_loadavg(
+            "1.00 2.00 3.00 4/500 99\n",
+        ));
+        assert_eq!(s.load_15m, Some(3.0));
+        assert_eq!(
+            serde_json::to_value(&s.measured).unwrap(),
+            serde_json::json!({"load_1m":"measured","load_5m":"measured","load_15m":"measured"})
+        );
+        let mut u = ResourceSample::empty(Lane::Wsl, None);
+        u.set_wsl_load(None);
+        assert_eq!(u.load_1m, None);
+        assert_eq!(u.measured.unwrap()["load_1m"], "unavailable");
     }
 
     #[test]
@@ -2451,6 +3722,103 @@ MemAvailable:   15335424 kB
         );
     }
 
+    /// The launch capacity coord admits against is the runner PROCESS's own
+    /// admission, so only the host lane carries it, and it carries it on every
+    /// tick (plan `2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling`
+    /// Phase 2 step 4).
+    ///
+    /// Mutation: drop the `set_launch_capacity` call from `collect_host_lane`
+    /// (the host asserts fail), or call it from `parse_meminfo` (the WSL ones do).
+    #[test]
+    fn the_host_lane_publishes_the_launch_fields_and_wsl_does_not() {
+        let wsl = parse_meminfo("MemTotal: 1024 kB\n", "Ubuntu-24.04".to_string()).expect("parses");
+        assert_eq!(wsl.lane, "wsl");
+        assert_eq!(wsl.launch_headroom, None);
+        assert_eq!(wsl.launch_verdict, None);
+        assert_eq!(wsl.thread_graded, None);
+        assert_eq!(wsl.thread_warn_ceiling, None);
+        assert_eq!(wsl.thread_critical_ceiling, None);
+        let wsl_json = serde_json::to_value(&wsl).expect("serializes");
+        for key in [
+            "launch_headroom",
+            "launch_verdict",
+            "thread_graded",
+            "thread_warn_ceiling",
+            "thread_critical_ceiling",
+        ] {
+            assert!(
+                wsl_json.get(key).is_none(),
+                "the wsl lane must not carry {key}"
+            );
+        }
+
+        let host = collect_host_lane();
+        let verdict = host
+            .launch_verdict
+            .clone()
+            .expect("the host lane must publish a launch verdict on every tick");
+        assert!(
+            [
+                "proceed",
+                "warn",
+                "critical",
+                "guard_disabled",
+                "unreadable"
+            ]
+            .contains(&verdict.as_str()),
+            "{verdict}"
+        );
+        if verdict == "guard_disabled" {
+            // A disabled guard enforces nothing: no number, never a 0.
+            assert_eq!(host.launch_headroom, None);
+            assert_eq!(host.thread_warn_ceiling, None);
+        } else {
+            let headroom = host
+                .launch_headroom
+                .expect("an enabled guard publishes headroom");
+            let cap = i32::try_from(crate::launch_capacity::LAUNCH_HEADROOM_CAP).expect("small");
+            assert!((0..=cap).contains(&headroom), "{headroom}");
+            let (warn, critical) = (
+                host.thread_warn_ceiling.expect("warn ceiling"),
+                host.thread_critical_ceiling.expect("critical ceiling"),
+            );
+            assert!(warn > 0 && critical >= warn, "{warn} / {critical}");
+        }
+        // The wire names coord's ingest DTO keys on.
+        let host_json = serde_json::to_value(&host).expect("serializes");
+        assert_eq!(host_json["launch_verdict"], verdict.as_str());
+
+        // The setter maps every field, and a disabled guard serializes no number.
+        let mut probe = ResourceSample::empty(Lane::Host, None);
+        probe.set_launch_capacity(&crate::launch_capacity::LaunchCapacity {
+            verdict: crate::launch_capacity::LaunchVerdict::Warn,
+            headroom: Some(0),
+            graded: Some(380),
+            warn: Some(376),
+            critical: Some(usize::MAX),
+        });
+        let v = serde_json::to_value(&probe).expect("serializes");
+        assert_eq!(v["launch_headroom"], 0);
+        assert_eq!(v["launch_verdict"], "warn");
+        assert_eq!(v["thread_graded"], 380);
+        assert_eq!(v["thread_warn_ceiling"], 376);
+        assert_eq!(
+            v["thread_critical_ceiling"],
+            i32::MAX,
+            "saturates, never wraps"
+        );
+        probe.set_launch_capacity(&crate::launch_capacity::LaunchCapacity {
+            verdict: crate::launch_capacity::LaunchVerdict::GuardDisabled,
+            headroom: None,
+            graded: None,
+            warn: None,
+            critical: None,
+        });
+        let v = serde_json::to_value(&probe).expect("serializes");
+        assert!(v.get("launch_headroom").is_none());
+        assert_eq!(v["launch_verdict"], "guard_disabled");
+    }
+
     /// The host lane's `blocking_lanes` breakdown must actually reflect
     /// [`tracked_blocking_by_thread`] — an always-`None` or always-empty field
     /// would pass a shape check while publishing nothing useful during an
@@ -2459,8 +3827,9 @@ MemAvailable:   15335424 kB
     /// against for `thread_count`.
     ///
     /// Puts one tracked body in flight on a thread this fixture names, so the
-    /// expected lane key is a constant rather than whatever the test harness
-    /// happened to call the running thread — same technique
+    /// expected lane key is this fixture's own name (or, once the binary has
+    /// used up every named lane, the overflow lane) rather than whatever the
+    /// test harness happened to call the running thread — same technique
     /// `wedge_diagnostics`'s own
     /// `assert_a_body_is_charged_to_its_spawner` fixture uses. `spawn_blocking_tracked`
     /// charges the GLOBAL lane table (there is no way to hand it a private
@@ -2501,27 +3870,56 @@ MemAvailable:   15335424 kB
         let wsl = parse_meminfo("MemTotal: 1024 kB\n", "Ubuntu-24.04".to_string()).expect("parses");
         assert_eq!(wsl.blocking_lanes, None);
 
+        // WHICH lane the body was charged to is a property of the whole test
+        // binary, not of this module: lanes are keyed by distinct thread name,
+        // first-come and never released, so once `MAX_BLOCKING_LANES` distinct
+        // thread names in this binary have charged a tracked body, this
+        // fixture's body lands in the overflow lane. Asserting the named lane
+        // unconditionally reddened qontinui/qontinui-runner#2707, which added
+        // tracked-body call sites that tests in this binary exercise — the
+        // #1447 shape `wedge_diagnostics`'s `LaneTable` doc describes. So read
+        // the lane from the source of truth `collect_host_lane` reads, then
+        // require the published map to carry the fixture in THAT lane. The
+        // overflow branch can only check presence; that `collect_host_lane`
+        // publishes the live table at all is pinned by source in
+        // `the_host_lane_publishes_the_live_blocking_lane_table`.
+        let live = tracked_blocking_by_thread();
+        let charged_to = if live.contains_key(SPAWNER) {
+            SPAWNER
+        } else {
+            OVERFLOW_LANE_NAME
+        };
+        eprintln!("blocking-lane fixture charged to {charged_to}");
+        assert!(
+            live.get(charged_to).copied().is_some_and(|n| n >= 1),
+            "the fixture's body must still be tracked while it is in flight: {live:?}"
+        );
+
         let host = collect_host_lane();
         let published = host
             .blocking_lanes
             .as_ref()
             .expect("the host lane must publish a blocking_lanes map");
-        assert_eq!(
-            published.get(SPAWNER).copied(),
-            Some(1),
-            "the fixture's own in-flight body did not appear in the published \
-             breakdown: {published:?}"
-        );
-        // Cross-checks the live accessor directly, not just the wire struct —
-        // the same key this fixture's body is charged to on the source of
-        // truth `collect_host_lane` reads from.
-        assert!(
-            tracked_blocking_by_thread()
-                .get(SPAWNER)
-                .copied()
-                .is_some_and(|n| n >= 1),
-            "the fixture's body must still be tracked while it is in flight"
-        );
+        if charged_to == SPAWNER {
+            // A free lane: the fixture owns it alone, so the count is exact.
+            assert_eq!(
+                published.get(SPAWNER).copied(),
+                Some(1),
+                "the fixture's own in-flight body did not appear in the published \
+                 breakdown: {published:?}"
+            );
+        } else {
+            // Lanes exhausted: the overflow lane is shared with every other
+            // overflowed body still in flight, so only presence is exact.
+            assert!(
+                published
+                    .get(OVERFLOW_LANE_NAME)
+                    .copied()
+                    .is_some_and(|n| n >= 1),
+                "the fixture's body overflowed, but the published breakdown has no \
+                 {OVERFLOW_LANE_NAME} entry: {published:?}"
+            );
+        }
 
         let _ = release_tx.send(());
         fixture.join().expect("fixture thread");
@@ -2589,6 +3987,50 @@ MemAvailable:   15335424 kB
                 "{typo} is not a column coord binds — it would be swallowed by \
                  `unknown_fields` and the real column would stay NULL forever"
             );
+        }
+    }
+
+    /// Coord binds these exact three names (web `slice_tel_01`); a rename lands
+    /// in `unknown_fields` and the real column stays NULL forever. Unmeasured
+    /// is ABSENT from the wire, never 0 or an empty object.
+    #[test]
+    fn the_slice_telemetry_uses_the_migrations_exact_wire_names() {
+        let mut s = ResourceSample::empty(Lane::Host, None);
+        let v = serde_json::to_value(&s).expect("serializes");
+        for key in ["cgroup_slices", "psi", "slice_source"] {
+            assert!(
+                !v.as_object().unwrap().contains_key(key),
+                "{key} must be absent when unmeasured"
+            );
+        }
+        s.cgroup_slices = Some(serde_json::json!({"ci-runners.slice": {"memory_current": 1}}));
+        s.psi = Some(serde_json::json!({"system": {}}));
+        s.slice_source = Some("linux_cgroup_v2".to_string());
+        let v = serde_json::to_value(&s).expect("serializes");
+        let obj = v.as_object().unwrap();
+        assert!(obj["cgroup_slices"]["ci-runners.slice"].is_object());
+        assert!(obj["psi"].is_object());
+        assert_eq!(obj["slice_source"], "linux_cgroup_v2");
+    }
+
+    /// Only the host lane takes the slice reading; off Linux it says
+    /// `not_supported` rather than publishing values.
+    #[test]
+    fn only_the_host_lane_takes_a_slice_reading() {
+        let wsl = parse_meminfo("MemTotal: 1024 kB\n", "Ubuntu-24.04".to_string()).expect("parses");
+        assert_eq!(wsl.slice_source, None);
+        assert_eq!(wsl.cgroup_slices, None);
+        let host = collect_host_lane();
+        let source = host
+            .slice_source
+            .as_deref()
+            .expect("the host lane always states a slice source");
+        assert!(matches!(source, "linux_cgroup_v2" | "not_supported"));
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(source, "not_supported");
+            assert_eq!(host.cgroup_slices, None);
+            assert_eq!(host.psi, None);
         }
     }
 
@@ -2730,6 +4172,58 @@ MemAvailable:   15335424 kB
             "every `as i32` in the host lane must be preceded by its clamp — a \
              bare narrowing is how a count becomes a negative, and a negative \
              reads `ok` against every ceiling this sample can carry"
+        );
+    }
+
+    /// The launch capacity on a host sample is judged against the SAME memory
+    /// reading the sample publishes: `collect_host_lane` takes exactly one
+    /// `memory_status()` and never reaches for a second, independent reading
+    /// through `lane_verdicts()` or an `AdmissionReading::live()` /
+    /// `launch_capacity::live()`-style call. A lexical guard.
+    ///
+    /// Mutation: call `crate::launch_capacity::live()` (or
+    /// `resource_guard::lane_verdicts()`) from `collect_host_lane`, or take a
+    /// second `memory_status()`.
+    #[test]
+    fn the_host_lane_judges_launch_capacity_on_the_memory_reading_it_publishes() {
+        let body = collect_host_lane_src();
+        assert_eq!(
+            body.matches("memory_status()").count(),
+            1,
+            "collect_host_lane must take exactly ONE memory reading"
+        );
+        for second_reading in [
+            "lane_verdicts()",
+            "spawn_gate_reading()",
+            "available_commit_bytes()",
+            "available_phys_bytes()",
+            "exhaustion_memory_reading(",
+        ] {
+            assert!(
+                !body.contains(second_reading),
+                "collect_host_lane must not take a second memory reading through {second_reading}"
+            );
+        }
+        assert!(
+            !body.contains("::live()"),
+            "collect_host_lane must not take a second reading through a ::live() constructor"
+        );
+        assert!(
+            body.contains("launch_capacity::live_with_memory("),
+            "the launch capacity must be built from the passed-in reading"
+        );
+    }
+
+    /// Source pin beside `the_host_lane_carries_the_blocking_lane_breakdown`,
+    /// whose overflow branch can only check that the shared overflow lane is
+    /// present: the host lane's `blocking_lanes` must be built from the LIVE
+    /// tracked-body table, not a cached or synthesized map.
+    #[test]
+    fn the_host_lane_publishes_the_live_blocking_lane_table() {
+        let body = collect_host_lane_src();
+        assert!(
+            body.contains("s.blocking_lanes = Some(\n        tracked_blocking_by_thread()"),
+            "collect_host_lane must publish blocking_lanes from tracked_blocking_by_thread()"
         );
     }
 

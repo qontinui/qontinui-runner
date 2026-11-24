@@ -158,6 +158,12 @@ pub enum SkipReason {
     Absent,
     /// The caller named an id that is not in the current reapable set.
     NotReapable,
+    /// Another checkout of the SAME allocation (a sibling under the agent's
+    /// `<worktree-root>/<agent-uuid>/` dir) is dirty, unreadable or building
+    /// right now — [`reclaim::busy_allocation_sibling`]. Runner-local and
+    /// execution-time only: the survey never carries it, because only the live
+    /// re-check probes the siblings.
+    SiblingBusy,
 }
 
 impl SkipReason {
@@ -179,6 +185,7 @@ impl SkipReason {
             SkipReason::CoordUnreachable => "coord-unreachable",
             SkipReason::Absent => "absent",
             SkipReason::NotReapable => "not-reapable",
+            SkipReason::SiblingBusy => "sibling-busy",
         }
     }
 
@@ -229,6 +236,10 @@ impl SkipReason {
             }
             SkipReason::Absent => "No longer present on disk.",
             SkipReason::NotReapable => "Not in the reapable set at execution time.",
+            SkipReason::SiblingBusy => {
+                "Another checkout of this allocation is dirty, unreadable or building — \
+                 the removal waits until every sibling is clean and idle."
+            }
         }
     }
 
@@ -1645,6 +1656,27 @@ fn execute_targets(targets: Vec<SurveyItem>, dry_run: bool) -> ReclaimOutcome {
             continue;
         }
 
+        // The allocation's OTHER checkouts — live, like every guard above, and
+        // only once the target itself passed (each sibling costs a bounded
+        // `git status`). Checked before the dry-run branch so a dry run
+        // reports the same refusal a real run would make.
+        if let Some((sibling, busy)) = reclaim::busy_allocation_sibling(&path) {
+            reclaim::log_busy_sibling_skip(&path, &sibling, busy);
+            let reason = SkipReason::SiblingBusy;
+            outcome.skipped.push(SkippedItem {
+                id: item.id.clone(),
+                worktree_path: item.worktree_path.clone(),
+                reason: reason.as_str(),
+                detail: format!(
+                    "{} ({} is {})",
+                    reason.detail(),
+                    sibling.display(),
+                    busy.as_str()
+                ),
+            });
+            continue;
+        }
+
         if dry_run {
             outcome.removed.push(RemovedItem {
                 id: item.id.clone(),
@@ -2024,20 +2056,17 @@ pub fn build_wip_orphans(survey: &Survey, now: chrono::DateTime<chrono::Utc>) ->
             // DELIBERATELY still offered: it is the one line that answers the
             // question the row is actually asking.
             let dirtiness_measured = item.is_dirty_known;
-            let resume_command = match (
-                item.session_id.as_deref(),
-                item.config_dir.as_deref(),
-                quoted_path.as_deref(),
-            ) {
-                (Some(id), Some(dir), Some(path))
-                    if dirtiness_measured && custody::is_shell_safe_token(id) =>
-                {
-                    custody::shell_quote_path(dir).map(|dir| {
-                        format!("cd \"{path}\" && CLAUDE_CONFIG_DIR=\"{dir}\" claude --resume {id}")
-                    })
+            // The shared resume line (`session_ledger::resume_command_for`):
+            // `None` for a ghost, or an id whose account root we could not
+            // establish — NEVER guessed, see the field docs.
+            let resume_command = match item.session_id.as_deref() {
+                Some(id) if dirtiness_measured && quoted_path.is_some() => {
+                    crate::session::session_ledger::resume_command_for(
+                        Some(&item.worktree_path),
+                        item.config_dir.as_deref(),
+                        id,
+                    )
                 }
-                // A ghost, or an id whose account root we could not establish.
-                // NEVER guessed — see the field docs.
                 _ => None,
             };
             // GATED ON `captured`, not on the commit merely existing. A record
@@ -2436,11 +2465,15 @@ mod tests {
             nm_present: true,
             nm_is_junction: true,
             nm_bytes: 0,
+            nm_exclusive_bytes: Some(0),
             target_present: true,
             target_is_junction: false,
             target_bytes: 4096,
+            target_exclusive_bytes: Some(4096),
             build_target_dir: None,
             build_slot: None,
+            build_target_volume_path: None,
+            worktree_volume_path: None,
             last_access_mtime: None,
             attributable_bytes: 4096,
             landed_in_main: Some(true),
@@ -2843,12 +2876,16 @@ mod tests {
                     drive_letter: Some("C:".to_string()),
                     total_bytes: 1_000,
                     free_bytes: 400,
+                    removable: false,
+                    read_only: false,
                 },
                 census::VolumeReport {
                     volume: "D:".to_string(),
                     drive_letter: Some("D:".to_string()),
                     total_bytes: 4_000,
                     free_bytes: 93,
+                    removable: false,
+                    read_only: false,
                 },
             ],
             taken_at: now - age,
@@ -3097,6 +3134,68 @@ mod tests {
         assert_eq!(outcome.skipped.len(), 1);
         assert_eq!(outcome.skipped[0].reason, "absent");
         assert!(!outcome.skipped[0].detail.is_empty(), "never a silent drop");
+    }
+
+    /// The allocation-sibling guard on the on-demand path: a target that
+    /// passes every one of its OWN live guards (clean, idle, present) is still
+    /// refused while another checkout of the same allocation holds work — as
+    /// `sibling-busy`, naming the sibling, and never removed.
+    #[test]
+    fn removal_waits_while_an_allocation_sibling_is_dirty() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join("019fbb24-1c2d-7b3e-9f40-5a6b7c8d9e0f");
+        let target = agent_dir.join("qontinui-runner");
+        let sibling = agent_dir.join("qontinui-schemas");
+        for repo in [&target, &sibling] {
+            std::fs::create_dir_all(repo).unwrap();
+            let out = crate::agent_worktree::reclaim::tests::hermetic_git()
+                .args(["-c", "init.defaultBranch=main", "init", "-q"])
+                .arg(repo)
+                .output()
+                .expect("git on PATH");
+            assert!(out.status.success(), "git init: {out:?}");
+        }
+        // Sibling: a STAGED file, so it is dirty under any ambient config.
+        std::fs::write(sibling.join("wip.txt"), "uncommitted").unwrap();
+        let out = crate::agent_worktree::reclaim::tests::hermetic_git()
+            .arg("-C")
+            .arg(&sibling)
+            .args(["add", "wip.txt"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git add: {out:?}");
+        // Target: clean, and aged past the G6 activity window so the target's
+        // own `building` guard does not answer first.
+        let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+        filetime::set_file_mtime(&target, old).unwrap();
+
+        let wt = target.to_string_lossy().to_string();
+        let item = SurveyItem {
+            id: norm_path(&wt),
+            worktree_path: wt.clone(),
+            repo: "qontinui-runner".to_string(),
+            branch: None,
+            status: "reapable",
+            reason: None,
+            reason_detail: None,
+            is_dirty: false,
+            building: false,
+            pinned: false,
+            landed_in_main: Some(true),
+            attributable_bytes: 4096,
+            junctioned_paths: Vec::new(),
+            coord_reason: Some("worktree:lifecycle:pr_merged".to_string()),
+            ..unattributed_item_fields()
+        };
+        let outcome = execute_targets(vec![item], /* dry_run */ false);
+        assert!(outcome.removed.is_empty(), "{outcome:?}");
+        assert_eq!(outcome.skipped.len(), 1, "{outcome:?}");
+        assert_eq!(outcome.skipped[0].reason, "sibling-busy");
+        // The skipped row names the busy sibling and its state (read through
+        // Debug so the assertion does not depend on the row's field layout).
+        let row = format!("{:?}", outcome.skipped[0]);
+        assert!(row.contains("qontinui-schemas is dirty"), "{row}");
+        assert!(target.exists(), "the target must not be touched");
     }
 
     // -----------------------------------------------------------------------
@@ -3967,7 +4066,7 @@ mod tests {
     }
 
     /// Every `SkipReason` variant — the list the per-variant tests iterate.
-    const ALL_SKIP_REASONS: [SkipReason; 16] = [
+    const ALL_SKIP_REASONS: [SkipReason; 17] = [
         SkipReason::Dirty,
         SkipReason::DirtinessUnknown,
         SkipReason::Pinned,
@@ -3984,6 +4083,7 @@ mod tests {
         SkipReason::CoordUnreachable,
         SkipReason::Absent,
         SkipReason::NotReapable,
+        SkipReason::SiblingBusy,
     ];
 
     #[test]

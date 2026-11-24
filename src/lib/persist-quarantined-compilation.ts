@@ -12,7 +12,7 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
-import { tracedFetch } from "@/lib/runner-api";
+import { tracedFetch, runnerBaseForPort } from "@/lib/runner-api";
 import type { QuarantineRecord } from "@/lib/compile-state-machine";
 
 export async function persistQuarantinedCompilation(record: QuarantineRecord): Promise<void> {
@@ -28,7 +28,7 @@ export async function persistQuarantinedCompilation(record: QuarantineRecord): P
   }
 
   try {
-    const res = await tracedFetch(`http://localhost:${port}/state-machine/quarantine`, {
+    const res = await tracedFetch(`${runnerBaseForPort(port)}/state-machine/quarantine`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(record),

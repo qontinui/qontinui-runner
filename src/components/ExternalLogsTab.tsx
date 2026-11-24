@@ -18,7 +18,11 @@ import {
   Copy,
   Check,
 } from "lucide-react";
-import type { LogSourceContent, ProjectLogConfig } from "../types/projectLogs";
+import {
+  sourceSizeLabel,
+  type LogSourceContent,
+  type ProjectLogConfig,
+} from "../types/projectLogs";
 import { useAutoScroll } from "../hooks";
 import { getAccentColors, getStatusColors } from "@/design-system";
 
@@ -159,6 +163,7 @@ export function ExternalLogsTab({
           <div className="flex gap-1">
             {safeSources.map((source) => {
               const hasError = !!source.error;
+              const sizeLabel = sourceSizeLabel(source);
               return (
                 <button
                   key={source.sourceId}
@@ -177,7 +182,7 @@ export function ExternalLogsTab({
                     <AlertCircle className={`w-3 h-3 ${getStatusColors("warning").icon}`} />
                   )}
                   {source.sourceName}
-                  <span className="text-xs opacity-70">({source.totalLines})</span>
+                  {sizeLabel && <span className="text-xs opacity-70">({sizeLabel})</span>}
                 </button>
               );
             })}

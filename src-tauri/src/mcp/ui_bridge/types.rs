@@ -47,12 +47,7 @@ impl RequestHints for UIBridgeActionRequest {
     }
     fn shape_error_data() -> Option<serde_json::Value> {
         Some(serde_json::json!({
-            "allowedActions": [
-                "click", "doubleClick", "double_click", "double", "right", "middle",
-                "type", "sendKeys", "clear", "select", "focus", "blur", "hover",
-                "scroll", "scrollIntoView", "scroll_into_view", "check", "uncheck",
-                "toggle", "drag", "setValue", "submit", "reset", "autocomplete"
-            ]
+            "allowedActions": crate::mcp::ui_bridge::elements::SUPPORTED_ACTION_NAMES
         }))
     }
 }
@@ -213,10 +208,10 @@ impl UIBridgeDiscoveryRequest {
     ///
     /// The keys this struct DOES name keep the grammar [`Self::resolve`] gives
     /// them — top-level beats `options`, snake_case folds to camelCase — and an
-    /// unset one is OMITTED rather than sent as `null`. That omission is
-    /// load-bearing: the frontend seeds `includeHidden: true` beneath the
-    /// caller's filters, and an explicit `null` would override the seed with a
-    /// value the SDK reads as false. Untyped keys follow the same precedence:
+    /// unset one is OMITTED rather than sent as `null`, so the frontend's
+    /// `includeHidden: true` default (`withIncludeHiddenDefault`, which also
+    /// treats a `null` as unset) is what the SDK sees for an unset flag rather
+    /// than a `null` it would read as false. Untyped keys follow the same precedence:
     /// nested first, then top-level over it. `force` is a meta-flag about
     /// registry state, so it travels beside `options`, never inside it.
     pub(crate) fn discover_ipc_request(
@@ -574,21 +569,54 @@ impl UiBridgeError {
 
     /// Reject an unknown action name BEFORE any IPC / RecoveryExecutor flow
     /// can synthesize a misleading success. Mirrors the `tab/activate` ->
-    /// `knownTabs` prior art: hint carries the full supported-action list so
+    /// `knownTabs` prior art: the context carries the accepted-action list so
     /// callers can self-correct without an extra round-trip.
-    pub fn invalid_action(unknown: &str, supported: &[&str]) -> Self {
+    ///
+    /// `accepted` is `element_id`'s own list (built-ins it advertises plus its
+    /// registered custom actions), not the global one. The context gains
+    /// `didYouMean` and `paramsHint` when a synonym or a spelling-only fix the
+    /// element accepts exists (see [`super::action_vocabulary`]), following
+    /// `type_param_invalid`'s `didYouMean` shape.
+    pub fn invalid_action<S: AsRef<str>>(
+        unknown: &str,
+        element_id: &str,
+        accepted: &[S],
+        requested_params: Option<&serde_json::Value>,
+        keyboard_entry: bool,
+    ) -> Self {
+        let names: Vec<&str> = accepted.iter().map(AsRef::as_ref).collect();
+        let mut message = if names.is_empty() {
+            format!(
+                "Unknown action '{}' for element '{}'. This element advertises no actions.",
+                unknown, element_id
+            )
+        } else {
+            format!(
+                "Unknown action '{}' for element '{}'. This element accepts: {}.",
+                unknown,
+                element_id,
+                names.join(", ")
+            )
+        };
+        let mut context = serde_json::json!({
+            "action": unknown,
+            "elementId": element_id,
+            "supportedActions": names,
+        });
+        if let Some(suggestion) = super::action_vocabulary::ActionSuggestion::resolve(
+            unknown,
+            accepted,
+            requested_params,
+            keyboard_entry,
+        ) {
+            message.push_str(&suggestion.message_suffix());
+            suggestion.attach_to(&mut context);
+        }
         Self {
             code: UiBridgeErrorCode::InvalidRequest,
-            message: format!(
-                "Unknown action '{}'. Supported actions: {}",
-                unknown,
-                supported.join(", ")
-            ),
+            message,
             recovery: Some(RecoveryHint::Unrecoverable),
-            context: Some(serde_json::json!({
-                "action": unknown,
-                "supportedActions": supported,
-            })),
+            context: Some(context),
         }
     }
 
@@ -1387,5 +1415,21 @@ mod readiness_classification_tests {
                 "{msg} must not classify as FRONTEND_NOT_READY"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod allowed_actions_tests {
+    use super::*;
+
+    /// The shape-error `allowedActions` list is derived from the route's own
+    /// allowlist, so it cannot drift from what `is_builtin_action` accepts.
+    #[test]
+    fn action_request_allowed_actions_equal_supported_action_names() {
+        let data = UIBridgeActionRequest::shape_error_data().expect("data");
+        assert_eq!(
+            data["allowedActions"],
+            serde_json::json!(crate::mcp::ui_bridge::elements::SUPPORTED_ACTION_NAMES)
+        );
     }
 }

@@ -105,9 +105,8 @@ impl PromptSnippetLibrary {
 ///
 /// Scoped per-runner for secondary instances.
 fn get_prompt_snippets_dir() -> Result<PathBuf, String> {
-    let raw_base = dirs::config_dir()
-        .ok_or("Failed to get config directory")?
-        .join("com.qontinui.runner");
+    let raw_base = qontinui_runner_lib::instance_env::runner_config_base()
+        .ok_or("Failed to get config directory")?;
     let base_dir = crate::instance::scope_path(&raw_base);
 
     let new_dir = base_dir.join("prompt-snippets");

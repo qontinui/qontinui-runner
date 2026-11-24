@@ -10,6 +10,7 @@ import {
   acquireWebglSlot,
   setWebglSlotVisible,
   __webglSlotKeys,
+  __webglDormantKeys,
   __resetWebglLruForTest,
 } from "./webglContextLru";
 
@@ -117,5 +118,135 @@ describe("webglContextLru", () => {
   it("ignores visibility updates for panes holding no slot (e.g. ghostty)", () => {
     expect(() => setWebglSlotVisible("ghostty-pane", true)).not.toThrow();
     expect(__webglSlotKeys()).toEqual([]);
+  });
+});
+
+describe("webglContextLru — restore on reveal", () => {
+  /** A pane that registers a restore path, as `XtermBackend` does. */
+  function restorable(key: string, visible: boolean) {
+    const downgrade = vi.fn();
+    const restore = vi.fn();
+    const handle = acquireWebglSlot(key, downgrade, visible, restore);
+    return { downgrade, restore, handle };
+  }
+
+  it("parks an evicted restorable pane dormant instead of dropping it", () => {
+    const hidden = restorable("hidden", false);
+    fill(MAX_WEBGL_PANES - 1);
+    acquireWebglSlot("newcomer", vi.fn());
+    expect(hidden.downgrade).toHaveBeenCalledTimes(1);
+    expect(__webglSlotKeys()).not.toContain("hidden");
+    expect(__webglDormantKeys()).toEqual(["hidden"]);
+  });
+
+  it("revealing a dormant pane re-seats it as most-recently-used and restores WebGL", () => {
+    const hidden = restorable("hidden", false);
+    fill(MAX_WEBGL_PANES - 1, false);
+    acquireWebglSlot("newcomer", vi.fn());
+    expect(hidden.restore).not.toHaveBeenCalled();
+
+    setWebglSlotVisible("hidden", true);
+
+    expect(hidden.restore).toHaveBeenCalledTimes(1);
+    expect(__webglDormantKeys()).toEqual([]);
+    // Re-seating made room by evicting the oldest hidden holder (p0).
+    expect(__webglSlotKeys()).toEqual(["p1", "p2", "p3", "p4", "p5", "p6", "newcomer", "hidden"]);
+  });
+
+  it("does not restore on a hide, and restores only once per eviction", () => {
+    const hidden = restorable("hidden", false);
+    fill(MAX_WEBGL_PANES - 1, false);
+    acquireWebglSlot("newcomer", vi.fn());
+    setWebglSlotVisible("hidden", false);
+    expect(hidden.restore).not.toHaveBeenCalled();
+    setWebglSlotVisible("hidden", true);
+    setWebglSlotVisible("hidden", true);
+    expect(hidden.restore).toHaveBeenCalledTimes(1);
+  });
+
+  it("an eviction without a restore path stays final", () => {
+    const downgrade = vi.fn();
+    acquireWebglSlot("plain", downgrade, false);
+    fill(MAX_WEBGL_PANES - 1);
+    acquireWebglSlot("newcomer", vi.fn());
+    setWebglSlotVisible("plain", true);
+    expect(__webglDormantKeys()).toEqual([]);
+    expect(__webglSlotKeys()).not.toContain("plain");
+  });
+
+  it("release() drops a dormant registration, so a disposed pane is never restored", () => {
+    const hidden = restorable("hidden", false);
+    fill(MAX_WEBGL_PANES - 1);
+    acquireWebglSlot("newcomer", vi.fn());
+    hidden.handle.release();
+    expect(__webglDormantKeys()).toEqual([]);
+    setWebglSlotVisible("hidden", true);
+    expect(hidden.restore).not.toHaveBeenCalled();
+  });
+
+  it("a restore that throws gives the seat back", () => {
+    const consoleWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    acquireWebglSlot("fragile", vi.fn(), false, () => {
+      throw new Error("no WebGL");
+    });
+    fill(MAX_WEBGL_PANES - 1, false);
+    acquireWebglSlot("newcomer", vi.fn());
+    setWebglSlotVisible("fragile", true);
+    expect(__webglSlotKeys()).not.toContain("fragile");
+    expect(__webglDormantKeys()).toEqual([]);
+    expect(consoleWarn).toHaveBeenCalled();
+    consoleWarn.mockRestore();
+  });
+
+  it("a reveal never displaces a visible pane: 9 visible, one dormant, reveal → no eviction", () => {
+    // A grid of nine visible panes: the ninth acquire evicted p0 (all were
+    // visible, so the oldest went), which is now dormant and — being in the
+    // grid — visible. Un-maximizing reveals every pane again.
+    const p0 = restorable("p0", true);
+    const others: Array<ReturnType<typeof restorable>> = [];
+    for (let i = 1; i <= MAX_WEBGL_PANES; i++) others.push(restorable(`p${i}`, true));
+    expect(p0.downgrade).toHaveBeenCalledTimes(1);
+    expect(__webglDormantKeys()).toEqual(["p0"]);
+
+    for (let i = 0; i <= MAX_WEBGL_PANES; i++) setWebglSlotVisible(`p${i}`, true);
+
+    // Nobody gave up a context to re-seat p0, and p0 waits on Canvas.
+    for (const pane of others) expect(pane.downgrade).not.toHaveBeenCalled();
+    expect(p0.restore).not.toHaveBeenCalled();
+    expect(__webglDormantKeys()).toEqual(["p0"]);
+    expect(__webglSlotKeys()).toHaveLength(MAX_WEBGL_PANES);
+  });
+
+  it("a waiting visible pane is re-seated as soon as a holder hides", () => {
+    const p0 = restorable("p0", true);
+    const others: Array<ReturnType<typeof restorable>> = [];
+    for (let i = 1; i <= MAX_WEBGL_PANES; i++) others.push(restorable(`p${i}`, true));
+    setWebglSlotVisible("p0", true);
+    expect(p0.restore).not.toHaveBeenCalled();
+
+    setWebglSlotVisible("p3", false);
+
+    expect(others[2].downgrade).toHaveBeenCalledTimes(1);
+    expect(p0.restore).toHaveBeenCalledTimes(1);
+    expect(__webglSlotKeys()).toContain("p0");
+    expect(__webglDormantKeys()).toEqual(["p3"]);
+  });
+
+  it("a waiting visible pane is re-seated when a holder is disposed", () => {
+    const p0 = restorable("p0", true);
+    const others: Array<ReturnType<typeof restorable>> = [];
+    for (let i = 1; i <= MAX_WEBGL_PANES; i++) others.push(restorable(`p${i}`, true));
+    others[4].handle.release();
+    expect(p0.restore).toHaveBeenCalledTimes(1);
+    for (const pane of others) expect(pane.downgrade).not.toHaveBeenCalled();
+  });
+
+  it("a hidden dormant pane is not re-seated when a seat frees", () => {
+    const hidden = restorable("hidden", false);
+    const handles = [];
+    for (let i = 0; i < MAX_WEBGL_PANES; i++) handles.push(acquireWebglSlot(`p${i}`, vi.fn()));
+    expect(__webglDormantKeys()).toEqual(["hidden"]);
+    handles[0].release();
+    expect(hidden.restore).not.toHaveBeenCalled();
   });
 });

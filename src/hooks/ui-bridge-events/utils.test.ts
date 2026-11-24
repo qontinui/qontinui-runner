@@ -178,6 +178,14 @@ describe("isElementActionAllowed — execute_action per-element gate", () => {
   it("does NOT exempt hoverClick when click is absent", () => {
     expect(isElementActionAllowed(["focus", "blur", "hover"], "hoverClick")).toBe(false);
   });
+
+  it("exempts unhover wherever hover is advertised (releases a forced hover)", () => {
+    expect(isElementActionAllowed(["focus", "click", "hover"], "unhover")).toBe(true);
+  });
+
+  it("does NOT exempt unhover when hover is absent", () => {
+    expect(isElementActionAllowed(["focus", "click"], "unhover")).toBe(false);
+  });
 });
 
 describe("compileEvaluateExpression — page_evaluate wrapping", () => {
@@ -869,10 +877,10 @@ describe("toFindRequest - one filter seam for both discover and find", () => {
 describe("pong window labels", () => {
   it("pongUrl carries the provenance, the sender's label and its document nonce", () => {
     expect(pongUrl(9876, "event", "main")).toBe(
-      `http://localhost:9876/ui-bridge/pong?source=event&label=main&doc=${encodeURIComponent(DOCUMENT_NONCE)}`,
+      `http://127.0.0.1:9876/ui-bridge/pong?source=event&label=main&doc=${encodeURIComponent(DOCUMENT_NONCE)}`,
     );
     expect(pongUrl("9877", "safety-net", "terminal-abc")).toBe(
-      `http://localhost:9877/ui-bridge/pong?source=safety-net&label=terminal-abc&doc=${encodeURIComponent(DOCUMENT_NONCE)}`,
+      `http://127.0.0.1:9877/ui-bridge/pong?source=safety-net&label=terminal-abc&doc=${encodeURIComponent(DOCUMENT_NONCE)}`,
     );
   });
 

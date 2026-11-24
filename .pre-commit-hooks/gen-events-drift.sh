@@ -64,9 +64,22 @@
 #                   diff are already upstream and the drift predates the push.
 #                   Reported in full, as an informational note, and not
 #                   blocking. STRICT mode still blocks.
-#   unavailable   — the base could not be resolved (shallow clone, no remote).
+#   unavailable   — the question could not be answered: the base could not be
+#                   resolved (shallow clone, no remote), or a git diff /
+#                   ls-files call that reads the touched paths failed.
 #                   Fails closed: today's hard failure, plus a line saying
 #                   attribution could not run.
+#
+# A pusher-caused verdict is then refined FILE BY FILE
+# (`lib/gen-events-file-attribution.sh`). Touching a codegen input is not the
+# same as moving every drifted binding. Take a push that edits one runner
+# module while qontinui-schemas carries 14 bindings the runner has not yet
+# registered (runner main on 2026-10-30). It cannot have moved any of those
+# 14, yet four pushes in one week were refused for exactly that drift and went
+# out with SKIP=. So each drifted file is held against the push only when the
+# push touched an input that can move THAT file. If none can, the verdict is
+# pre-existing. If the per-file rule cannot run, the whole-push verdict
+# stands, as before.
 #
 # The check itself is unchanged — the same regeneration, the same comparison,
 # the same full diffstat in every arm. Only the blame moved.
@@ -105,7 +118,32 @@ set -euo pipefail
 STRICT="${QONTINUI_GEN_EVENTS_DRIFT_STRICT:-0}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RUNNER_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# The repo root is NOT "$SCRIPT_DIR/..": the commit-sourced pre-push shim
+# (qontinui-claude-config install-repo-git-hooks.sh, shim v2) may run this hook
+# from a copy of .pre-commit-hooks/ extracted into a private temp dir, whose
+# parent is not the checkout - so a root derived from our own location would look
+# for ../qontinui-schemas in the temp dir and report CANNOT EVALUATE, checking
+# nothing. Order: the root the shim exports; the git checkout this script sits in
+# (in place, or run by path from a test); the checkout we were invoked from (the
+# shim and pre-commit both run hooks with cwd at the repo top level); and only
+# then our own parent directory.
+#
+# The two git lookups run WITHOUT the scope variables git exports to hooks: in a
+# linked worktree git sets GIT_DIR (and no GIT_WORK_TREE), so the work tree
+# becomes the cwd and `git -C "$SCRIPT_DIR" rev-parse --show-toplevel` answers
+# `.pre-commit-hooks` itself. gen_events_clear_inherited_git_env (below) cannot
+# simply move up here: it records GIT_INDEX_FILE against the hook's real GIT_DIR.
+# An exported root is accepted only when it looks like this repo (src-tauri/),
+# so a stale or foreign value falls through rather than aborting on `cd`.
+_root_git() { env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE -u GIT_PREFIX git "$@"; }
+RUNNER_DIR=""
+if [ -n "${QONTINUI_HOOK_REPO_ROOT:-}" ] && [ -d "${QONTINUI_HOOK_REPO_ROOT}/src-tauri" ]; then
+    RUNNER_DIR="$QONTINUI_HOOK_REPO_ROOT"
+fi
+[ -n "$RUNNER_DIR" ] || RUNNER_DIR="$(_root_git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
+[ -n "$RUNNER_DIR" ] || RUNNER_DIR="$(_root_git rev-parse --show-toplevel 2>/dev/null || true)"
+[ -n "$RUNNER_DIR" ] || RUNNER_DIR="$SCRIPT_DIR/.."
+RUNNER_DIR="$(cd "$RUNNER_DIR" && pwd)"
 
 # `cd`-and-`pwd` only works on a path that exists; resolve defensively so a
 # missing sibling produces our own message rather than a bash error.
@@ -134,6 +172,26 @@ fi
 # shellcheck source=lib/gen-events-attribution.sh
 . "$ATTRIBUTION_LIB"
 
+# The per-file refinement. Same guarded-source shape. A missing copy of this
+# library cannot clear anyone: without it the whole-push verdict stands.
+FILE_ATTRIBUTION_LIB="$SCRIPT_DIR/lib/gen-events-file-attribution.sh"
+if [ ! -f "$FILE_ATTRIBUTION_LIB" ]; then
+    fail "ERROR: missing $FILE_ATTRIBUTION_LIB"
+    fail "Restore the file (it ships with this repo) or bypass this push with:"
+    fail "    SKIP=gen-events-drift git push"
+    exit 1
+fi
+# shellcheck source=lib/gen-events-file-attribution.sh
+. "$FILE_ATTRIBUTION_LIB"
+
+# Which stage this is, for every line below that would otherwise say "push":
+# this hook also runs at pre-commit, where "this push" is false. Under the
+# direct pre-push shim nothing but git's stdin says so, and nothing in this
+# hook reads stdin — so read it here, once, first.
+gen_events_detect_stage_from_stdin
+STAGE="$(gen_events_stage)"
+if [ "$STAGE" = "push" ]; then BYPASS_CMD="git push"; else BYPASS_CMD="git commit"; fi
+
 # The TypeScript codegen's own Node dependencies. Same guarded-source shape and
 # the same reason: without it the hook dies with a raw bash error instead of a
 # typed message. See that file's header for why a missing `node_modules` in the
@@ -142,12 +200,24 @@ TS_CODEGEN_DEPS_LIB="$SCRIPT_DIR/lib/ts-codegen-deps.sh"
 if [ ! -f "$TS_CODEGEN_DEPS_LIB" ]; then
     fail "ERROR: missing $TS_CODEGEN_DEPS_LIB"
     fail "The drift guard cannot run the TypeScript codegen without it. Restore"
-    fail "the file (it ships with this repo) or bypass this push with:"
-    fail "    SKIP=gen-events-drift git push"
+    fail "the file (it ships with this repo) or bypass this $STAGE with:"
+    fail "    SKIP=gen-events-drift $BYPASS_CMD"
     exit 1
 fi
 # shellcheck source=lib/ts-codegen-deps.sh
 . "$TS_CODEGEN_DEPS_LIB"
+
+# Scratch-tree removal that survives a read-only baseline snapshot. Same
+# guarded-source shape as the two libraries above.
+SCRATCH_CLEANUP_LIB="$SCRIPT_DIR/lib/scratch-cleanup.sh"
+if [ ! -f "$SCRATCH_CLEANUP_LIB" ]; then
+    fail "ERROR: missing $SCRATCH_CLEANUP_LIB"
+    fail "Restore the file (it ships with this repo) or bypass this push with:"
+    fail "    SKIP=gen-events-drift git push"
+    exit 1
+fi
+# shellcheck source=lib/scratch-cleanup.sh
+. "$SCRATCH_CLEANUP_LIB"
 
 # Before the first `git`. A hook inherits GIT_DIR, which overrides every
 # `git -C <dir>` below — including the ones aimed at $SCHEMAS_DIR, which would
@@ -187,7 +257,7 @@ cannot_evaluate() {
         fail "  QONTINUI_GEN_EVENTS_DRIFT_STRICT=1 — treating this as a failure."
         exit 1
     fi
-    fail "  Not blocking the push — a missing local build artifact is not"
+    fail "  Not blocking the $STAGE — a missing local build artifact is not"
     fail "  evidence of drift. Set QONTINUI_GEN_EVENTS_DRIFT_STRICT=1 to block."
     echo
     exit 0
@@ -251,13 +321,24 @@ case "$SCRATCH_PARENT/" in
         fail "    schemas : $SCHEMAS_DIR"
         fail "This hook must never write into a repository it does not own; that"
         fail "tree holds other sessions' uncommitted work. Point TMPDIR somewhere"
-        fail "outside the schemas checkout and re-push."
+        fail "outside the schemas checkout and re-run."
         exit 1
         ;;
 esac
 
 SCRATCH_ROOT="$(mktemp -d -t gen-events-drift-XXXXXXXX)"
-cleanup() { rm -rf "$SCRATCH_ROOT"; }
+# scratch_dir_remove, not a bare `rm -rf`: the baseline snapshot below is a
+# `cp -R` that keeps the source's modes, and a read-only baseline (the SHA-keyed
+# sibling store) left directories `rm` could not empty. As the EXIT trap's last
+# command, that failure became this hook's exit status and aborted a push whose
+# drift check had passed (coord finding 51901722). See lib/scratch-cleanup.sh.
+# The tree-lock release runs FIRST and always returns 0, so the scratch removal
+# stays the trap's last command (see above). Defined only once the shared-target
+# library is sourced below; absent, there is nothing to release.
+cleanup() {
+    if declare -F release_shared_target >/dev/null 2>&1; then release_shared_target; fi
+    scratch_dir_remove "$SCRATCH_ROOT"
+}
 trap cleanup EXIT
 
 # Belt and braces: mktemp may ignore TMPDIR (some implementations, or a -t
@@ -267,7 +348,7 @@ case "$SCRATCH_ROOT_ABS/" in
     "$SCHEMAS_DIR"/*)
         fail "REFUSING TO RUN — mktemp placed the scratch directory INSIDE the"
         fail "qontinui-schemas checkout ($SCRATCH_ROOT_ABS). Set TMPDIR to a path"
-        fail "outside $SCHEMAS_DIR and re-push."
+        fail "outside $SCHEMAS_DIR and re-run."
         exit 1
         ;;
 esac
@@ -367,10 +448,36 @@ if [ -f "$SHARED_TARGET_LIB" ]; then
     # shellcheck source=lib/shared-target.sh
     . "$SHARED_TARGET_LIB"
     resolve_shared_target "$RUNNER_DIR" "[gen-events-drift]"
+    # The release build below writes the same shared target, so it runs under
+    # the same tree lock and freshness ledger as cargo-prepush.sh's clippy
+    # (coord finding 7b603cde; see the library). Released by `cleanup` on EXIT,
+    # so the lock spans the whole generate_types.sh child. On 1-4 the build is
+    # NOT run unguarded: a peer's stale units would make the drift verdict about
+    # another tree. rc 10 (no library on this machine) builds as before.
+    GUARD_RC=0
+    guard_shared_target "$RUNNER_DIR" "[gen-events-drift]" "$RUNNER_DIR/src-tauri" || GUARD_RC=$?
+    case "$GUARD_RC" in
+        0|10) ;;
+        1|3)
+            cannot_evaluate \
+                "the shared cargo target could not be guarded: ${SHARED_TARGET_GUARD_REASON:-guard rc $GUARD_RC}" \
+                "retry once the peer build holding the tree lock finishes (raise QONTINUI_PREPUSH_TREE_LOCK_MAX_WAIT to wait longer)" ;;
+        *)
+            cannot_evaluate \
+                "the shared cargo target could not be guarded: ${SHARED_TARGET_GUARD_REASON:-guard rc $GUARD_RC}" \
+                "fix the cause named above (for a 'cargo metadata' failure, run 'cargo metadata --no-deps --format-version 1' in $RUNNER_DIR/src-tauri for cargo's full error), then push again" ;;
+    esac
 else
     log "NOTE — missing $SHARED_TARGET_LIB, so the shared target cannot be"
     log "       resolved. Building into this checkout's own target/."
 fi
+
+# The build runs under the holder deadline (lib/shared-target.sh, "Bounding the
+# build") when qontinui-claude-config's lib is here: it holds the tree lock, so
+# a build stalled behind cargo's own target lock must not hold it for hours.
+# Absent the library (or the shared-target lib itself), it runs as before.
+declare -F guarded_build >/dev/null 2>&1 || guarded_build() { "$@"; }
+declare -F shared_target_build_stopped >/dev/null 2>&1 || shared_target_build_stopped() { return 1; }
 
 log "regenerating Rust JSON Schemas + per-type TS bindings into a scratch dir..."
 log "  scratch  : $SCRATCH_DIR"
@@ -410,7 +517,7 @@ QONTINUI_PY_OUT_DIR="$SCRATCH_PY_DIR" \
 QONTINUI_SCHEMAS_DIR="$SCHEMAS_DIR" \
 QONTINUI_SCHEMAS_JSON="$SCRATCH_ROOT/schemas.json" \
 QONTINUI_TS_COMPILE_SCRIPT="$TS_CODEGEN_DEPS_SCRIPT" \
-    bash src-tauri/scripts/generate_types.sh --ts-only >"$GEN_LOG" 2>&1
+    guarded_build bash src-tauri/scripts/generate_types.sh --ts-only >"$GEN_LOG" 2>&1 9>&-
 GEN_RC=$?
 set -e
 
@@ -430,7 +537,7 @@ tripwire_epilogue() {
     fail "  1. A CONCURRENT SESSION wrote to $SCHEMAS_DIR"
     fail "     during the ~minute this hook took. On a box running several"
     fail "     sessions against one shared checkout this is the likely cause,"
-    fail "     and nothing is wrong with your push — just re-run it."
+    fail "     and nothing is wrong with your $STAGE — just re-run it."
     fail "  2. A REGRESSION IN THIS HOOK. It is required to be read-only with"
     fail "     respect to that checkout; if it wrote there, peer work may have"
     fail "     been overwritten and this needs fixing at the source."
@@ -483,6 +590,13 @@ fi
 # checkout. The tripwire is the safety property; it is evaluated first,
 # unconditionally, whatever codegen did.
 
+# A deadline stop is "cannot evaluate", exactly like a tree-lock timeout: the
+# run was stopped, not judged, so it is no evidence of drift (STRICT blocks).
+if shared_target_build_stopped "$GEN_RC" "[gen-events-drift]"; then
+    cannot_evaluate \
+        "$SHARED_TARGET_GUARD_REASON" \
+        "retry once the peer build holding cargo's target lock finishes (raise AGENT_BUILD_STALL_SECS / AGENT_BUILD_MAX_WALL_SECS to allow longer)"
+fi
 if [ "$GEN_RC" -ne 0 ]; then
     fail "ERROR: generate_types.sh failed (exit $GEN_RC). Last 30 lines:"
     tail -n 30 "$GEN_LOG" >&2 || true
@@ -533,6 +647,16 @@ fi
 
 gen_events_attribution "$RUNNER_DIR"
 
+# A whole-push MINE is refined file by file: is each drifted file one this
+# push's touched inputs can move? `whole-push` means the refinement could not
+# run, and then the MINE verdict stands exactly as before. Never run for the
+# other two states: `pre-existing` already clears, and `unavailable` must not
+# be argued out of failing closed.
+FILE_ATTRIBUTION_STATE=""
+if [ "$ATTRIBUTION_STATE" = "mine" ]; then
+    gen_events_file_attribution "$RUNNER_DIR" "$BASELINE_DIR" "$SCRATCH_DIR"
+fi
+
 # The regeneration commands and the shared-checkout caveat: the same remedy in
 # every arm — only the urgency differs — so each arm supplies its own
 # lead-in line and calls this for the body. It really is printed from one
@@ -549,6 +673,21 @@ print_remedy() {
     "$say" "(That command DOES write into qontinui-schemas — run it deliberately, when"
     "$say" " you are ready to own the change, and coordinate first if other sessions"
     "$say" " share that checkout. This hook itself never writes there.)"
+}
+
+# The regeneration remedy rewrites the WHOLE generated directory, so it would
+# also DELETE the bindings that are ahead of the runner: those registered on
+# neither side, usually pending registrations (coord finding 19f8a714).
+# Printed after the remedy in every arm that lists such bindings. $1 is the
+# emitter, as for `print_remedy`.
+print_ahead_caveat() {
+    local say="${1:-fail}"
+    [ "${FILE_ATTRIBUTION_AHEAD:-0}" -gt 0 ] || return 0
+    "$say" "BUT: that regeneration would also DELETE the $FILE_ATTRIBUTION_AHEAD binding(s) listed above as"
+    "$say" "ahead of the runner. They are usually pending registrations"
+    "$say" "(qontinui-schemas codegen/pending-registration.toml names the runner PR that"
+    "$say" "registers each, and landing that PR is what clears them). Commit only the"
+    "$say" "other files from the regenerated tree, and keep those."
 }
 
 # Whether the shared checkout is ALSO dirty in the compared path — a second,
@@ -576,10 +715,26 @@ if [ "$ATTRIBUTION_STATE" = "pre-existing" ] && [ "$STRICT" != "1" ]; then
     # push's to answer for, and blocking on it would train everyone to reach
     # for SKIP=, which is how a guard stops being read at all.
     echo
-    log "PRE-EXISTING DRIFT — not caused by this push."
+    log "PRE-EXISTING DRIFT — not caused by this $STAGE."
     log "The bindings on disk at $BASELINE_DIR do not match what this repo's"
-    log "Rust generates. But this push changes NONE of the sources that feed"
-    log "them — nothing under ${GEN_EVENTS_ATTRIBUTION_PATHS[*]}"
+    log "Rust generates. But this $STAGE changes NONE of the sources that feed"
+    DIR_INPUTS=""
+    for entry in "${GEN_EVENTS_ATTRIBUTION_PATHS[@]}"; do
+        case "$entry" in */) DIR_INPUTS+="${DIR_INPUTS:+ }$entry" ;; esac
+    done
+    log "them — nothing under $DIR_INPUTS"
+    log "or in any other input listed in lib/gen-events-attribution.sh"
+    if [ -z "$ATTRIBUTION_EXCLUDES_DROPPED_REASON" ]; then
+        log "(markdown aside — the premise guard found no way for it to reach schemas.json;"
+        log " see lib/gen-events-attribution.sh)"
+    else
+        log "(markdown included this time: $ATTRIBUTION_EXCLUDES_DROPPED_REASON)"
+    fi
+    if [ -z "$ATTRIBUTION_BUNDLE_EXCLUDES_DROPPED_REASON" ]; then
+        log "(and src-tauri/src/fleet_skills .sh/.py files aside, under their own premise guard)"
+    else
+        log "(fleet_skills .sh/.py included this time: $ATTRIBUTION_BUNDLE_EXCLUDES_DROPPED_REASON)"
+    fi
     log "differs between HEAD and $ATTRIBUTION_BASE_REF (merge-base ${ATTRIBUTION_BASE_SHA:0:12}),"
     log "and the working tree adds nothing either. The inputs behind the diff"
     log "below are therefore already upstream: the shared checkout's artifact is"
@@ -588,8 +743,35 @@ if [ "$ATTRIBUTION_STATE" = "pre-existing" ] && [ "$STRICT" != "1" ]; then
     git --no-pager diff --no-index --stat -- "$BASELINE_DIR" "$SCRATCH_DIR" || true
     print_dirty_checkout_note log
     echo
-    log "Nothing to do for this push. To clear it for everyone:"
+    log "Nothing to do for this $STAGE. To clear it for everyone:"
     print_remedy log
+    log "Set QONTINUI_GEN_EVENTS_DRIFT_STRICT=1 to block on pre-existing drift too."
+    echo
+    exit 0
+fi
+
+if [ "$ATTRIBUTION_STATE" = "mine" ] && [ "$FILE_ATTRIBUTION_STATE" = "pre-existing" ] \
+   && [ "$STRICT" != "1" ]; then
+    # The push DOES touch codegen inputs — but none that can move any file in
+    # this diff. Same non-blocking verdict as the arm above, with the reason
+    # given per file, because "this push changes nothing that feeds them" is
+    # not true here and must not be printed.
+    echo
+    log "PRE-EXISTING DRIFT — not caused by this $STAGE."
+    log "The bindings on disk at $BASELINE_DIR do not match what this repo's"
+    log "Rust generates. Codegen inputs did change here, measured against"
+    log "$ATTRIBUTION_BASE_REF (merge-base ${ATTRIBUTION_BASE_SHA:0:12}):"
+    gen_events_render_inputs "    " | sed 's/^/[gen-events-drift] /'
+    log "but none of them can move these files:"
+    gen_events_render_file_list pre "    " | sed 's/^/[gen-events-drift] /'
+    log "(per-file rules: lib/gen-events-file-attribution.sh)"
+    echo
+    git --no-pager diff --no-index --stat -- "$BASELINE_DIR" "$SCRATCH_DIR" || true
+    print_dirty_checkout_note log
+    echo
+    log "Nothing to do for this $STAGE. To clear it for everyone:"
+    print_remedy log
+    print_ahead_caveat log
     log "Set QONTINUI_GEN_EVENTS_DRIFT_STRICT=1 to block on pre-existing drift too."
     echo
     exit 0
@@ -597,19 +779,44 @@ fi
 
 echo
 fail "ERROR: Generated Tauri event bindings are stale."
-if [ "$ATTRIBUTION_STATE" = "mine" ]; then
-    fail "This push changes sources that feed them, so the diff below is yours."
-    fail "Measured against $ATTRIBUTION_BASE_REF (merge-base ${ATTRIBUTION_BASE_SHA:0:12}); the files are:"
-    printf '%s\n' "$ATTRIBUTION_TOUCHED" | sed 's/^/[gen-events-drift]     /' >&2
-    fail "Part of the diff may still be pre-existing — the baseline is a build"
-    fail "artifact in a shared checkout and may have been behind before you began."
+if [ "$ATTRIBUTION_STATE" = "mine" ] && [ "$FILE_ATTRIBUTION_STATE" = "mine" ]; then
+    # Per file: name what this push can move, and keep what it cannot apart,
+    # so a pusher fixes their own drift and is not sent after someone else's.
+    # Worded by WHERE each input changed, not "this push changes": an input
+    # may be only a dirty working-tree file the push does not carry, and each
+    # reason names its input with that label.
+    fail "Inputs that changed here move these drifted files, measured against"
+    fail "$ATTRIBUTION_BASE_REF (merge-base ${ATTRIBUTION_BASE_SHA:0:12}):"
+    gen_events_render_file_list mine "    " | sed 's/^/[gen-events-drift] /' >&2
+    if [ -n "$FILE_ATTRIBUTION_PRE" ]; then
+        fail "These were already drifted at the merge-base, and are not held against this $STAGE:"
+        gen_events_render_file_list pre "    " | sed 's/^/[gen-events-drift] /' >&2
+    fi
+    fail "The codegen inputs that changed, and whether this $STAGE carries them:"
+    gen_events_render_mine --inputs-only | sed 's/^/[gen-events-drift] /' >&2
+elif [ "$ATTRIBUTION_STATE" = "mine" ] && [ "$FILE_ATTRIBUTION_STATE" = "pre-existing" ]; then
+    # Only reachable under STRICT.
+    fail "This drift is PRE-EXISTING — none of the inputs that changed here can move"
+    fail "these files — but QONTINUI_GEN_EVENTS_DRIFT_STRICT=1 blocks on it:"
+    gen_events_render_file_list pre "    " | sed 's/^/[gen-events-drift] /' >&2
+elif [ "$ATTRIBUTION_STATE" = "mine" ]; then
+    # Per-file attribution could not run, so the whole push answers for the
+    # whole diff, as it did before per-file attribution existed. Say why, so
+    # a pusher who sees a familiar refusal knows which premise stopped it.
+    fail "Per-file attribution could not run: ${FILE_ATTRIBUTION_REASON:-no reason recorded}."
+    fail "So the whole $STAGE is held to the whole diff."
+    # The whole explanation — lead line, per-file source labels, and the note
+    # on inputs that are not in the push — is rendered by the library, where
+    # the attribution self-test pins it. Here it only gets the prefix and
+    # the stream.
+    gen_events_render_mine | sed 's/^/[gen-events-drift] /' >&2
 elif [ "$ATTRIBUTION_STATE" = "pre-existing" ]; then
     # Only reachable under STRICT. Say why it blocks rather than printing the
     # "this is yours" line, which would be false.
-    fail "This drift is PRE-EXISTING — this push changes none of the sources that"
+    fail "This drift is PRE-EXISTING — this $STAGE changes none of the sources that"
     fail "feed the bindings — but QONTINUI_GEN_EVENTS_DRIFT_STRICT=1 blocks on it."
 elif [ "$ATTRIBUTION_STATE" = "unavailable" ]; then
-    fail "Could not tell whether this push caused it: $ATTRIBUTION_UNAVAILABLE_REASON."
+    fail "Could not tell whether this $STAGE caused it: $ATTRIBUTION_UNAVAILABLE_REASON."
     fail "Failing closed. A hook that cannot attribute drift must not excuse it —"
     fail "the alternative is silently clearing a real break."
 else
@@ -618,15 +825,16 @@ else
     # an empty reason and read as a diagnosed verdict.
     fail "Attribution returned an unrecognized state: '$ATTRIBUTION_STATE'."
     fail "That is a bug in lib/gen-events-attribution.sh, not a verdict about"
-    fail "this push. Failing closed, for the same reason 'unavailable' does."
+    fail "this $STAGE. Failing closed, for the same reason 'unavailable' does."
 fi
 echo >&2
 git --no-pager diff --no-index --stat -- "$BASELINE_DIR" "$SCRATCH_DIR" >&2 || true
 echo >&2
 fail "Refresh the shared bindings by regenerating and committing them there:"
 print_remedy
+print_ahead_caveat
 print_dirty_checkout_note
 
 echo >&2
-fail "Bypass for this push only: SKIP=gen-events-drift git push"
+fail "Bypass for this $STAGE only: SKIP=gen-events-drift $BYPASS_CMD"
 exit 1

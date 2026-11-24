@@ -270,15 +270,31 @@ never `grep -n` in a checkout you did not just verify; a shared checkout is
 almost never on `origin/main`.
 
 ⚠️ **On the ci-baseline door a 403 and a 404 mean opposite things, and only
-one of them is about the door.** Measured the same day, same request otherwise:
+one of them is about the door.** Measured with the same request otherwise
+(dates and bearers under the table):
 
 | Status | What it means |
 |---|---|
 | `403` | no usable bearer reached coord. That is the **door**: UNKNOWN about the data. |
 | `200` | a baseline exists for that exact `(repo, workflow_name)`; read `failure_pattern`. |
-| `404` | `{"error":"no baseline recorded for this (repo, workflow_name)"}` — a **data** answer, not a broken door. Do not report it as a failed read; fall back to the author's commits and say you did. |
+| `404` `code: no_baseline` | `{"code":"no_baseline","error":"no baseline recorded for this (repo, workflow_name)","repo":…,"workflow_name":…}` — a **data** answer, not a broken door. Do not report it as a failed read; fall back to the author's commits and say you did. A coord build that predates the `code` field sends that body with no `code`. Read a code-less 404 as `no_baseline` **only if you sent the full `owner%2Frepo` form**: a build older than qontinui-coord#3302 never resolves a bare name, so a bare-name miss there comes back as this same code-less body and is UNKNOWN. |
+| `404` `code: repo_unresolved` | the **identifier** did not resolve: a bare repo name (no `owner/`) that matched none, or more than one, of the repos your tenant owns (qontinui-coord#3302) — or, on a coord build carrying qontinui-coord#3832, a full `owner/name` your tenant does not own (or one misspelled — matching is exact, case included), because that PR made this route tenant-private. That is UNKNOWN about the data, **not** "no baseline". For a bare name, re-send the full `<owner%2Frepo>` form; for a full name, check the spelling first; if it is right, the repo is not one your tenant owns, and nothing on this door will read it for you. |
 
-The 404 does **not** discriminate "coord has no baseline yet" from "your
+The `403`, `200` and code-less `404` rows were measured on 2026-09-01: the `200`
+and code-less `404` with an agent JWT, the `403` without a usable bearer. The two `code` rows were measured on 2026-10-20, after
+qontinui-coord#3302 (`repo_unresolved`) and #3339 (`no_baseline`) shipped them
+(coord build `40498d7ab`, device-JWT bearer); the `200` row answered again under
+that device JWT the same day. An unknown `workflow_name` under
+`owner%2Frepo` answered `no_baseline`. A bare name that did not resolve answered
+`repo_unresolved`. A bare name that resolved answered `no_baseline`, and its
+`repo` field echoed the resolved `owner/name`. The ambiguous-bare-name arm
+(more than one owned repo matches) is still read from the handler
+(`crates/coord/src/ci_baseline.rs` `handler`), not measured, and so is the
+full-name ownership arm qontinui-coord#3832 added. Always sending
+`owner%2Frepo` sidesteps every bare-name arm; it does not sidestep the
+ownership one.
+
+Tell the two 404s apart by `code`, never by matching the `error` prose. The `no_baseline` 404 does **not** discriminate "coord has no baseline yet" from "your
 `workflow_name` is spelled differently from what coord ingested" — both return
 that same body — so never read it as "this repo has no CI history".
 
@@ -529,6 +545,17 @@ paragraph exists to prevent. ⚠️ **Empty output is UNKNOWN, not “the red is
 real”**: it means no `failure`/`cancelled` job on this run at all, so re-read
 the run's own conclusion rather than renewing the wait against it.
 
+⚠️ **One NON-empty `failed_steps` list is infra too: a declared step
+timeout.** GitHub reports a step-level `timeout-minutes` expiry as a plain
+`failure`, so that job shows exactly one failed step and looks genuine. It is
+told apart only by its check-run annotations — a title containing `TIMED OUT`
+and `(not a verdict on this PR)`:
+`gh api "repos/OWNER/REPO/check-runs/<job_id>/annotations" --jq '.[] | (.title // "") | select(test("TIMED OUT.*[(]not a verdict on this PR[)]"))'`
+(an Actions job id IS its check-run id). `qontinui-coord`'s `coord-db-tests`
+emits it, and on `main` it flaps red→green on the same commit — so it too
+self-heals only on a re-run. The classifier table is Tier T in
+`.claude/commands/babysit-prs.md` Step 3.
+
 Still emit `wait` — firing the re-run is not this agent's authority — but say
 so in the `rationale` so the wait is attributed and someone can clear it, and
 do not keep renewing `next_check_at` against a red that cannot clear itself.
@@ -586,11 +613,16 @@ ALL of these hold:
    the Input schema above — the schema's nearest is
    `main_status.recent_failure_pattern`, and nothing fills that in for you now.
    Read the table yourself: `GET /coord/ci-baseline/<owner%2Frepo>/<workflow_name>`
-   is live and answered **200 to an agent JWT** (measured 2026-09-01). Its `404`
-   is a **data** answer — *"no baseline recorded for this (repo,
-   workflow_name)"* — so fall back to the author's commits and say the baseline
-   was absent; only a `403` is UNKNOWN about the door. Both readings are
-   tabulated under **Input**.
+   is live and answered **200 to an agent JWT** (measured 2026-09-01). Its
+   `no_baseline` `404` is a **data** answer — *"no baseline recorded for this
+   (repo, workflow_name)"* — so fall back to the author's commits and say the
+   baseline was absent; a `403` is UNKNOWN about the door, and a
+   `repo_unresolved` `404` is UNKNOWN about the identifier — re-send
+   `owner%2Frepo` if you sent a bare name; if you already sent the full name,
+   check its spelling (matching is exact, case included) and otherwise stop,
+   since on a coord build carrying qontinui-coord#3832 that answer means your
+   tenant does not own the repo (read from the handler, not measured) and a
+   re-send only loops. All three readings are tabulated under **Input**.
 4. macOS stuck >90min with no log progress (check `pr.last_predicate_eval_at`)
 5. Sibling PRs report the same stall.
    ⚠️ **This criterion had the same defect criterion 3 above did, two
@@ -802,7 +834,7 @@ document this rule already cites: `coord-gates-and-access.md` records
 back **to an agent JWT** under strict mode, where the machine arm never fires
 and those kinds are not allowlisted — so arm 4 is the only arm that could have
 served them — three of the four controls above; `worktree_repair_husks` is
-classified arm-4 by the same document's decomposition table rather than by that
+named in that class by the same document's 2026-08-29 sample rather than by that
 read. A device JWT measured all four on 2026-09-02 (`1`, `3`, `3`, `1`), which
 agrees. Run the control anyway rather than inheriting either result:
 postures change, and the control costs one GET.

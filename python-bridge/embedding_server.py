@@ -59,6 +59,10 @@ an empty map) but the child inherits the runner's environment, so these are set
 on the runner process, not per-service.
 """
 
+import os_trust  # noqa: F401  # side effect: outbound TLS trusts the OS store (os_trust.py)
+
+# isort: split
+
 import os
 import sys
 import threading

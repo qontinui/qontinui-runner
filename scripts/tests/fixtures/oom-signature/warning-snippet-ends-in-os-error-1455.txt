@@ -1,0 +1,11 @@
+   Compiling qontinui-runner v1.0.11 (/home/runner/work/qontinui-runner/qontinui-runner/src-tauri)
+warning: unused doc comment
+  --> src-tauri/src/util/resource_exhaustion.rs:42:1
+   |
+42 | /// The paging file is too small for this operation to complete. (os error 1455)
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ rustdoc does not generate documentation for macro invocations
+   |
+error: could not compile `qontinui-runner` (lib test); 1 warning emitted
+
+Caused by:
+  process didn't exit successfully: `rustc --crate-name qontinui_runner_lib --edition=2021 src/lib.rs` (signal: 9, SIGKILL: kill)

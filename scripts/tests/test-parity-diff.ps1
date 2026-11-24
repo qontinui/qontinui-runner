@@ -411,6 +411,433 @@ $objR = ConvertTo-ParityReportObject -Result $r5 -GeneratedAt "2026-09-02T00:00:
 Assert-Equal "refusal serializes null"  $null $objR.counts.parity_defects
 Assert-Equal "refusal flag serialized"  $true $objR.schema_refused
 
+Write-Host "[11] the filesystem witness rules (Phase 5)"
+# A witness is the harness's OWN directory listing. These rules decide when it
+# CONTRADICTS the manifest's self-report -- the check that stops this harness
+# certifying provisioning it never saw land.
+$mObserved = New-Manifest   # the real fixture: every provisioning row is `unknown`
+# Give three provisioning rows an observed rung so the "claims units" arm is reachable.
+foreach ($row in @($mObserved.rows)) {
+    if ($row.id -eq 'fleet_commands')   { $row.rung = 'embedded' }
+    if ($row.id -eq 'fleet_skills')     { $row.rung = 'embedded' }
+    if ($row.id -eq 'agent_definitions'){ $row.rung = 'operator_checkout' }
+}
+
+# (a) observed rung over an EMPTY directory -> a disagreement naming the row.
+$witnessEmpty = [PSCustomObject]@{ commands = 0; skills = 0; agents = 0 }
+$dis = @(Get-ParitySelfReportDisagreements -Manifest $mObserved -Witness $witnessEmpty)
+Assert-True  "empty dirs contradict observed rows" (@($dis).Count -ge 3)
+Assert-True  "the kind names the direction" (@($dis | Where-Object { $_.kind -eq 'row_claims_units_but_directory_is_empty' }).Count -ge 3)
+Assert-True  "fleet_commands is named"      (@($dis | Where-Object { $_.id -eq 'fleet_commands' }).Count -eq 1)
+
+# (b) a count that could NOT be taken contradicts nothing. `$null` is "could not
+# look"; 0 is "looked and found nothing". Conflating them would manufacture
+# findings out of an unreadable directory.
+$witnessUnknown = [PSCustomObject]@{ commands = $null; skills = $null; agents = $null }
+$disU = @(Get-ParitySelfReportDisagreements -Manifest $mObserved -Witness $witnessUnknown)
+Assert-Equal "unknown counts contradict nothing" 0 (@($disU).Count)
+
+# (c) files present under a row that took no reading -> the opposite direction.
+$mUnknown = New-Manifest    # untouched: every provisioning row is `unknown`
+$witnessFull = [PSCustomObject]@{ commands = 73; skills = 12; agents = 9 }
+$disR = @(Get-ParitySelfReportDisagreements -Manifest $mUnknown -Witness $witnessFull)
+Assert-True  "files under an unknown row are reported" (@($disR | Where-Object { $_.kind -eq 'directory_has_units_but_row_is_unknown' }).Count -ge 1)
+
+# (d) EVERY provisioning row observed, WITH files -> nothing to report.
+# Note $mObserved gave only three rows a rung, so against a full listing the
+# four still-`unknown` rows legitimately disagree (arm (c)) -- which is why this
+# case needs its own fully-observed manifest rather than reusing that one. The
+# first version of this assertion got that wrong and the rule was right.
+$mAllObserved = New-Manifest
+foreach ($row in @($mAllObserved.rows)) {
+    if ($script:ParityWitnessDirs.ContainsKey($row.id)) { $row.rung = 'embedded' }
+}
+$disOk = @(Get-ParitySelfReportDisagreements -Manifest $mAllObserved -Witness $witnessFull)
+Assert-Equal "agreement reports nothing" 0 (@($disOk).Count)
+# ... and the partially-observed manifest against the same listing reports
+# exactly the rows that took no reading.
+$disPartial = @(Get-ParitySelfReportDisagreements -Manifest $mObserved -Witness $witnessFull)
+# TWO. The witness map covers SIX provisioning rows (slash_commands is
+# deliberately not one -- it writes nothing into a session workdir), three were
+# given a rung above, and of the three remaining one has no row in this fixture
+# at all: `agent_skills_registry`, which did not exist when the fixture was
+# emitted on 2026-09-02. A capability the manifest does not carry is SKIPPED
+# rather than invented, which is the behaviour this number pins -- and it is the
+# arm that matters when the published leg is an older release whose roster is
+# genuinely shorter.
+Assert-Equal "only the unread rows present in the manifest are named" 2 (@($disPartial).Count)
+Assert-True  "and all of them in the unknown-row direction" (@($disPartial | Where-Object { $_.kind -eq 'directory_has_units_but_row_is_unknown' }).Count -eq 2)
+Assert-Equal "a capability absent from the manifest is never invented" 0 (@($disPartial | Where-Object { $_.id -eq 'agent_skills_registry' }).Count)
+# The regression this pins: `slash_commands` is an IMPORT of a checkout's
+# commands, not a provision into the session workdir, so the workdir listing can
+# neither confirm nor contradict it. Mapping it to .claude/commands made every
+# run emit a finding about this harness whose note was false in both halves --
+# and the first version of this suite pinned that wrong behaviour as "3".
+Assert-Equal "slash_commands is never witnessed against a workdir listing" 0 (@($disPartial | Where-Object { $_.id -eq 'slash_commands' }).Count)
+$disAll = @(Get-ParitySelfReportDisagreements -Manifest $mUnknown -Witness $witnessFull)
+Assert-Equal "not even when every row is unknown and the dirs are full" 0 (@($disAll | Where-Object { $_.id -eq 'slash_commands' }).Count)
+
+# (e) a missing manifest or witness is UNKNOWN, never a finding.
+Assert-Equal "null manifest yields nothing" 0 (@(Get-ParitySelfReportDisagreements -Manifest $null -Witness $witnessFull).Count)
+Assert-Equal "null witness yields nothing"  0 (@(Get-ParitySelfReportDisagreements -Manifest $mObserved -Witness $null).Count)
+
+Write-Host "[11a] rung 'unresolved' claims NO units (correction over #1844)"
+# agent_runtime returns `unresolved` for agent_definitions BY DESIGN on any
+# install with no qontinui-claude-config checkout -- every normal published leg.
+# The rule first read it as "claims units", which inverted both answers.
+$mUnres = [PSCustomObject]@{ rows = @(
+    [PSCustomObject]@{ id = 'fleet_agents';      rung = 'unresolved' },
+    [PSCustomObject]@{ id = 'agent_definitions'; rung = 'unresolved' }) }
+Assert-Equal "unresolved over 0 files is consistent, not a finding" 0 (@(Get-ParitySelfReportDisagreements -Manifest $mUnres -Witness @{ agents = 0 }).Count)
+$disUn = @(Get-ParitySelfReportDisagreements -Manifest $mUnres -Witness @{ agents = 5 })
+Assert-Equal "unresolved over N files is a disagreement, once per row" 2 $disUn.Count
+Assert-True  "named in the unresolved direction" (@($disUn | Where-Object { $_.kind -eq 'directory_has_units_but_row_is_unresolved' }).Count -eq 2)
+Assert-Equal "and never as 'row claims units'" 0 (@($disUn | Where-Object { $_.kind -eq 'row_claims_units_but_directory_is_empty' }).Count)
+# The NORMAL published shape: fleet_agents writes its embedded floor into the
+# SAME .claude/agents that agent_definitions reports `unresolved` for. Those
+# files are explained by the sibling row and contradict nothing -- a rule that
+# flagged them would fire on every published leg in the mirror direction.
+$mPubShape = [PSCustomObject]@{ rows = @(
+    [PSCustomObject]@{ id = 'fleet_agents';      rung = 'embedded' },
+    [PSCustomObject]@{ id = 'agent_definitions'; rung = 'unresolved' }) }
+Assert-Equal "unresolved beside a sibling that claims the dir: N files consistent" 0 (@(Get-ParitySelfReportDisagreements -Manifest $mPubShape -Witness @{ agents = 9 }).Count)
+$disPubEmpty = @(Get-ParitySelfReportDisagreements -Manifest $mPubShape -Witness @{ agents = 0 })
+Assert-Equal "...but 0 files still contradicts the sibling's claim, and only it" 1 $disPubEmpty.Count
+Assert-Equal "...naming the sibling" 'fleet_agents' $disPubEmpty[0].id
+Assert-True  "unresolved is NOT an unobserved rung for the parity count" (Test-ParityRungObserved -Rung 'unresolved')
+
+Write-Host "[11c] the witness is gated on the terminal door (correction over #1844)"
+# Commands and skills are written only by POST /terminals. When that door did
+# not create a terminal, the empty directory is "never provisioned" -- the
+# counts must be UNKNOWN, or a refusal becomes a fabricated parity defect.
+$wtRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("pp-witness-" + [System.Guid]::NewGuid().ToString('N').Substring(0, 8))
+$wdDev = Join-Path $wtRoot 'dev'; $wdPub = Join-Path $wtRoot 'pub'
+New-Item -ItemType Directory -Force -Path (Join-Path $wdDev '.claude/commands') | Out-Null
+New-Item -ItemType Directory -Force -Path $wdPub | Out-Null
+foreach ($n in 1..3) { Set-Content -LiteralPath (Join-Path $wdDev ".claude/commands/c$n.md") -Value 'x' }
+try {
+    $wDev = Get-ParityProvisionWitness -Workdir $wdDev -TerminalOutcome 'created(abc)'
+    Assert-Equal "created terminal: commands counted" 3 $wDev.commands
+    Assert-Equal "created terminal: a missing skills dir is a real 0" 0 $wDev.skills
+    Assert-Equal "no probe workdir: agents UNKNOWN" $null $wDev.agents
+    $wDevClose = Get-ParityProvisionWitness -Workdir $wdDev -TerminalOutcome 'created(abc);close_failed'
+    Assert-Equal "created-then-close-failed still provisioned" 3 $wDevClose.commands
+
+    $wPubRefused = Get-ParityProvisionWitness -Workdir $wdPub -TerminalOutcome 'unknown(terminal_create_refused: HTTP 403 x)'
+    Assert-Equal "refused terminal: commands UNKNOWN, not 0" $null $wPubRefused.commands
+    Assert-Equal "refused terminal: skills UNKNOWN, not 0"   $null $wPubRefused.skills
+    Assert-Equal "omitted outcome: commands UNKNOWN" $null (Get-ParityProvisionWitness -Workdir $wdDev).commands
+
+    # Refused on ONE leg: the reviewer's repro shape (dev=41 vs a refused published leg).
+    Assert-Equal "refused on the published leg -> unknown, never provisioned_fewer" 'unknown(no_command_listing_on_the_published_leg)' (Get-ParitySlashCommandsStatus -DevWitness ([PSCustomObject]@{ commands = 41; skills = 12; agents = 9 }) -PublishedWitness $wPubRefused)
+    Assert-Equal "refused on the dev leg -> unknown naming dev" 'unknown(no_command_listing_on_the_dev_leg)' (Get-ParitySlashCommandsStatus -DevWitness $wPubRefused -PublishedWitness $wDev)
+    # Refused on BOTH legs: not none_provisioned.
+    $wDevRefused = Get-ParityProvisionWitness -Workdir $wdPub -TerminalOutcome 'not_attempted'
+    Assert-Equal "refused on both legs -> unknown, never none_provisioned" 'unknown(no_command_listing_on_either_leg)' (Get-ParitySlashCommandsStatus -DevWitness $wDevRefused -PublishedWitness $wPubRefused)
+    # And a refused leg's witness contradicts no manifest row.
+    Assert-Equal "a refused leg's witness raises no self-report finding" 0 (@(Get-ParitySelfReportDisagreements -Manifest $mObserved -Witness $wPubRefused).Count)
+} finally {
+    Remove-Item -LiteralPath $wtRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+Write-Host "[11b] a HASHTABLE witness behaves exactly like a PSCustomObject one"
+# The shape this file's own doc comments describe. The two need different
+# accessors and the difference is SILENT -- on a hashtable
+# `$w.PSObject.Properties.Name` enumerates IsReadOnly/Keys/Count/... and never
+# the keys, so a rule written for one shape reports "nothing to say" for the
+# other. That is a false clean, which is the one failure class this file exists
+# to prevent, so both shapes are pinned here.
+$htEmpty = @{ commands = 0; skills = 0; agents = 0 }
+$htFull  = @{ commands = 73; skills = 12; agents = 9 }
+Assert-Equal "hashtable: empty dirs contradict observed rows" (@(Get-ParitySelfReportDisagreements -Manifest $mObserved -Witness $witnessEmpty).Count) (@(Get-ParitySelfReportDisagreements -Manifest $mObserved -Witness $htEmpty).Count)
+Assert-Equal "hashtable: full dirs agree with observed rows"  (@(Get-ParitySelfReportDisagreements -Manifest $mAllObserved -Witness $witnessFull).Count) (@(Get-ParitySelfReportDisagreements -Manifest $mAllObserved -Witness $htFull).Count)
+Assert-Equal "hashtable: the verdict resolves, not unknown" 'provisioned_fewer(dev=93,published=72)' (Get-ParitySlashCommandsStatus -DevWitness @{ commands = 93 } -PublishedWitness @{ commands = 72 })
+# An absent key is still "could not look", on either shape.
+Assert-Equal "hashtable: an absent key is unknown, not zero" 'unknown(no_command_listing_on_the_dev_leg)' (Get-ParitySlashCommandsStatus -DevWitness @{ skills = 1 } -PublishedWitness @{ commands = 5 })
+Assert-Equal 'hashtable: a present $null key is unknown too' 'unknown(no_command_listing_on_the_published_leg)' (Get-ParitySlashCommandsStatus -DevWitness @{ commands = 5 } -PublishedWitness @{ commands = $null })
+
+Write-Host "[12] the typed slash-commands verdict (Phase 5, exit (d))"
+Assert-Equal "equal counts" 'provisioned_equal' (Get-ParitySlashCommandsStatus -DevWitness ([PSCustomObject]@{ commands = 73 }) -PublishedWitness ([PSCustomObject]@{ commands = 73 }))
+# The metric's baseline defect: a dev box with a checkout resolves more commands
+# than a published install carrying only its embedded bundle.
+Assert-Equal "published fewer is typed WITH both counts" 'provisioned_fewer(dev=93,published=72)' (Get-ParitySlashCommandsStatus -DevWitness ([PSCustomObject]@{ commands = 93 }) -PublishedWitness ([PSCustomObject]@{ commands = 72 }))
+Assert-Equal "published MORE is stated, not folded" 'provisioned_more(dev=10,published=11)' (Get-ParitySlashCommandsStatus -DevWitness ([PSCustomObject]@{ commands = 10 }) -PublishedWitness ([PSCustomObject]@{ commands = 11 }))
+Assert-Equal "both zero"  'none_provisioned' (Get-ParitySlashCommandsStatus -DevWitness ([PSCustomObject]@{ commands = 0 }) -PublishedWitness ([PSCustomObject]@{ commands = 0 }))
+# An unreadable leg is UNKNOWN and names WHICH leg -- never 0, never 'equal'.
+Assert-Equal "dev unreadable"       'unknown(no_command_listing_on_the_dev_leg)'       (Get-ParitySlashCommandsStatus -DevWitness ([PSCustomObject]@{ commands = $null }) -PublishedWitness ([PSCustomObject]@{ commands = 5 }))
+Assert-Equal "published unreadable" 'unknown(no_command_listing_on_the_published_leg)' (Get-ParitySlashCommandsStatus -DevWitness ([PSCustomObject]@{ commands = 5 }) -PublishedWitness ([PSCustomObject]@{ commands = $null }))
+Assert-Equal "neither leg"          'unknown(no_command_listing_on_either_leg)'        (Get-ParitySlashCommandsStatus -DevWitness $null -PublishedWitness $null)
+
+Write-Host "[13] ConvertFrom-VerbatimPath (the CI defect that lost both control legs)"
+# Rust's std::fs::canonicalize hands back a VERBATIM path on Windows, and the
+# provision-probe's `provisioned_into` is exactly that. PowerShell cannot carry
+# it: `Join-Path` throws *"the value of argument \"drive\" is null"*. Measured on
+# run 36615500004 -- the throw escaped the witness, was caught as a manifest-read
+# failure, and reported NEGATIVE-CONTROL-UNAVAILABLE for BOTH legs, so the
+# instrument certified nothing while the job stayed green.
+Assert-Equal "verbatim drive path is stripped"  'D:\a\_temp\x\probe-abc' (ConvertFrom-VerbatimPath '\\?\D:\a\_temp\x\probe-abc')
+Assert-Equal "verbatim UNC becomes a real UNC"  '\\srv\share\x'          (ConvertFrom-VerbatimPath '\\?\UNC\srv\share\x')
+Assert-Equal "an ordinary path is untouched"    'D:\plain\path'            (ConvertFrom-VerbatimPath 'D:\plain\path')
+Assert-Equal "a posix path is untouched"        '/tmp/x'                   (ConvertFrom-VerbatimPath '/tmp/x')
+Assert-Equal "empty in, empty out"              ''                         (ConvertFrom-VerbatimPath '')
+# `[string]$Path` coerces $null to '', which is the safe landing: every caller
+# guards with IsNullOrWhiteSpace, so '' and $null behave identically downstream.
+Assert-Equal "null in, empty out"               ''                         (ConvertFrom-VerbatimPath $null)
+# The property that actually matters: the OUTPUT no longer carries the prefix
+# that PowerShell cannot parse. Asserted as a STRING, because `Join-Path`
+# resolves drive qualifiers against the LOCAL platform -- a `D:` assertion throws
+# "Cannot find drive" on Linux and would make this suite platform-bound, while
+# the whole point of it is that it runs anywhere and gates on 5.1.
+Assert-True  "the result carries no verbatim prefix" (-not ((ConvertFrom-VerbatimPath '\\?\D:\a\x') -like '\\?\*'))
+Assert-Equal "and is the plain drive path"      'D:\a\x' (ConvertFrom-VerbatimPath '\\?\D:\a\x')
+
+# The Join-Path half is the real regression, so pin it where it is meaningful:
+# on Windows, where the drive exists and the raw form is what threw in CI.
+if ($IsWindows -or $env:OS -eq 'Windows_NT') {
+    $joined = Join-Path (ConvertFrom-VerbatimPath ('\\?\' + $env:SystemDrive + '\a\x')) '.claude'
+    Assert-True  "the normalized result joins on Windows" ($joined -like '*a\x\.claude')
+    $threw = $false
+    try { $null = Join-Path ('\\?\' + $env:SystemDrive + '\a\x') '.claude' } catch { $threw = $true }
+    Assert-True  "and the raw verbatim form still throws" $threw
+} else {
+    Write-Host "  skip Join-Path arms (not Windows; drive qualifiers do not resolve here)" -ForegroundColor DarkGray
+}
+
+# ---------------------------------------------------------------------------
+# 14. THE SUMMARY HEADLINE (plan
+#     2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports,
+#     Phase 2). The job summary is what a human reads, and its first line is
+#     often ALL they read. A line that says "parity" while rows went unobserved
+#     must carry the unobserved count on that same line -- otherwise a heading
+#     reading "capability parity" above `parity_defects = 0` certifies parity
+#     over a run that compared nothing.
+# ---------------------------------------------------------------------------
+Write-Host "[14] the summary never says 'parity' without the unobserved count"
+
+# Every line naming parity must also name the unobserved count, on that line.
+function Get-ParityLinesMissingUnobserved {
+    param([string[]]$Lines, [int]$Unobserved)
+    $n = [regex]::Escape("$Unobserved")
+    return @($Lines | Where-Object {
+        ($_ -match '(?i)parity') -and
+        -not ($_ -match "(?i)(\b$n\b[^.|]{0,40}unobserved|unobserved[^.|]{0,20}\b$n\b)")
+    })
+}
+
+# The all-unknown pair: r9, every one of the 9 rows `unknown` on both legs.
+$md9 = @(Format-ParitySummaryMarkdown -Result $r9)
+$bare9 = @(Get-ParityLinesMissingUnobserved -Lines $md9 -Unobserved 9)
+Assert-True  "the all-unknown summary names parity at all (the check is not vacuous)" (@($md9 | Where-Object { $_ -match '(?i)parity' }).Count -ge 1)
+Assert-Equal "no line says parity without the unobserved count (all rows unknown)" 0 $bare9.Count
+foreach ($b in $bare9) { Write-Host "         offending line: $b" -ForegroundColor Red }
+Assert-True  "first line says UNOBSERVED (9 of 9)" ($md9[0] -match 'UNOBSERVED' -and $md9[0] -match '\b9 of 9\b')
+
+# The threshold. 8 (identical fixture copies) and exactly 7 are THIN; 6 is not,
+# but still states its count.
+$md1 = @(Format-ParitySummaryMarkdown -Result $r1)
+Assert-True  "unobserved=8: first line says UNOBSERVED" ($md1[0] -match 'UNOBSERVED' -and $md1[0] -match '\b8 of 9\b')
+Assert-Equal "unobserved=8: no bare parity line" 0 (@(Get-ParityLinesMissingUnobserved -Lines $md1 -Unobserved 8)).Count
+$r7u = Compare-CapabilityManifests -Dev (Set-Rung (New-Manifest) 'bundled_resources' 'dev_checkout') -Published (Set-Rung (New-Manifest) 'bundled_resources' 'bundle_resource')
+Assert-Equal "fixture for the boundary has exactly 7 unobserved" 7 $r7u.UnobservedCount
+$md7 = @(Format-ParitySummaryMarkdown -Result $r7u)
+Assert-True  "unobserved=7 (the threshold): first line says UNOBSERVED" ($md7[0] -match 'UNOBSERVED' -and $md7[0] -match '\b7 of 9\b')
+$md4 = @(Format-ParitySummaryMarkdown -Result $r4)
+Assert-True  "unobserved=6: first line is not THIN" (-not ($md4[0] -match 'THIN'))
+Assert-True  "unobserved=6: first line still states the count" ($md4[0] -match '\b6 of 9 rows unobserved\b')
+Assert-Equal "unobserved=6: no bare parity line" 0 (@(Get-ParityLinesMissingUnobserved -Lines $md4 -Unobserved 6)).Count
+# A refusal compared NOTHING, so every row is unobserved -- and it says so with
+# the count, not as a carve-out from the rule.
+$md5 = @(Format-ParitySummaryMarkdown -Result $r5)
+Assert-True  "refusal: first line says REFUSED" ($md5[0] -match 'REFUSED')
+Assert-True  "refusal: first line says 9 of 9 rows UNOBSERVED (refused)" ($md5[0] -match '\b9 of 9 rows UNOBSERVED \(refused\)')
+Assert-Equal "refusal: no bare parity line" 0 (@(Get-ParityLinesMissingUnobserved -Lines $md5 -Unobserved 9)).Count
+
+# A comparison that could not run at all (published-parity.ps1's exit-2 paths)
+# writes one line, and it too states the unobserved state and the skew.
+$provX = New-ParityProvenance -SkewCommits 'unknown(shallow_clone)'
+$lineX = Format-ParityUnavailableSummaryLine -Reason 'manifest_read_failed' -Provenance $provX
+Assert-True  "unavailable: the line says every row is UNOBSERVED" ($lineX -match 'all rows UNOBSERVED')
+Assert-True  "unavailable: the line names the reason"            ($lineX -match 'UNAVAILABLE \(manifest_read_failed\)')
+Assert-True  "unavailable: the line carries skew_commits verbatim" ($lineX -match 'skew_commits: unknown\(shallow_clone\)')
+Assert-True  "unavailable: never a parity_defects number"         ($lineX -match 'parity_defects: n/a')
+
+# ---------------------------------------------------------------------------
+# 15. PROVENANCE PASSES THROUGH UNTOUCHED. skew_commits states what the count
+#     was computed across; the comparator carries it and never changes it --
+#     and the one value nothing may invent is 0.
+# ---------------------------------------------------------------------------
+Write-Host "[15] provenance and skew_commits survive the comparator"
+$sibs = @([PSCustomObject]@{ repo = 'qontinui/qontinui-schemas'; path = 'x'; sha = ('a' * 40) })
+$prov = New-ParityProvenance -DevSha ('d' * 40) -PublishedTag 'v1.0.11' -PublishedSha ('e' * 40) -SkewCommits 736 `
+    -RunId '123' -RunEvent 'schedule' -GeneratedAt '2026-10-04T07:00:00Z' -ManifestAxis 'observed' `
+    -BehaviouralAxis 'unknown(not_yet_measured)' -Siblings $sibs
+Assert-Equal "constructor keeps the count" 736 $prov.skew_commits
+$objP = ConvertTo-ParityReportObject -Result $r2 -GeneratedAt '2026-10-04T07:00:00Z' -Observability ([PSCustomObject]@{ door = 'test' }) -Provenance $prov
+Assert-True  "the report carries the SAME provenance object" ([object]::ReferenceEquals($prov, $objP.provenance))
+Assert-Equal "report_version bumped for the new block" 2 $objP.report_version
+Assert-Equal "skew_commits survives the comparator" 736 $objP.provenance.skew_commits
+$roundP = ($objP | ConvertTo-Json -Depth 10) | ConvertFrom-Json
+Assert-Equal "skew_commits survives the JSON round-trip" 736 $roundP.provenance.skew_commits
+Assert-Equal "manifest axis round-trips" 'observed' $roundP.provenance.axes.manifest
+Assert-Equal "sibling sha round-trips, as recorded" ('a' * 40) (@($roundP.provenance.siblings)[0].sha)
+Assert-True  "siblings are never claimed same-SHA" ($roundP.provenance.siblings_note -match 'NOT at the release')
+Assert-Equal "the counts are untouched by the block" 1 $roundP.counts.parity_defects
+$mdP = @(Format-ParitySummaryMarkdown -Result $r2 -Provenance $prov)
+Assert-True  "the summary states skew_commits verbatim" (@($mdP | Where-Object { $_ -match 'skew_commits: 736\b' }).Count -eq 1)
+
+# Same-SHA: 0 is a reading, and survives as 0 -- not null, not unknown.
+$prov0 = New-ParityProvenance -DevSha ('d' * 40) -PublishedTag 'v1.0.12' -PublishedSha ('d' * 40) -SkewCommits 0 -ManifestAxis 'observed'
+$round0 = (ConvertTo-ParityReportObject -Result $r2 -GeneratedAt 'x' -Provenance $prov0 | ConvertTo-Json -Depth 10) | ConvertFrom-Json
+Assert-Equal "a same-SHA 0 survives as 0" '0' "$($round0.provenance.skew_commits)"
+# Not computed is UNKNOWN, never 0.
+$provN = New-ParityProvenance -DevSha ('d' * 40) -PublishedTag 'v1.0.11' -SkewCommits $null
+Assert-Equal "a null skew becomes unknown, never 0" 'unknown(not_computed)' $provN.skew_commits
+$provU = New-ParityProvenance -SkewCommits 'unknown(shallow_clone)'
+$roundU = (ConvertTo-ParityReportObject -Result $r9 -GeneratedAt 'x' -Provenance $provU | ConvertTo-Json -Depth 10) | ConvertFrom-Json
+Assert-Equal "an unknown skew survives verbatim" 'unknown(shallow_clone)' $roundU.provenance.skew_commits
+Assert-True  "and the summary says unknown, not 0" (@(Format-ParitySummaryMarkdown -Result $r9 -Provenance $provU | Where-Object { $_ -match 'skew_commits: unknown\(shallow_clone\)' }).Count -eq 1)
+Assert-Equal "a garbage skew string is unknown, never passed through" 'unknown(unparseable_skew: lots)' (New-ParityProvenance -SkewCommits 'lots').skew_commits
+Assert-Equal "an unrecorded axis is unknown" 'unknown(not_recorded)' $provN.axes.manifest
+
+# The manifest axis is `observed` only when something was compared.
+Assert-Equal "axis: comparable rows -> observed"     'observed' (Get-ParityManifestAxis -Result $r2)
+Assert-Equal "axis: all unknown -> unknown"          'unknown(no_comparable_rows)' (Get-ParityManifestAxis -Result $r9)
+Assert-True  "axis: schema refusal -> unknown"       ((Get-ParityManifestAxis -Result $r5) -like 'unknown(schema_refused*')
+
+# The behavioural stamp touches ONE field -- skew_commits least of all.
+$stamped = ($objP | ConvertTo-Json -Depth 10) | ConvertFrom-Json
+Assert-True  "stamp applies"                          (Set-ParityBehaviouralAxis -Report $stamped -Axis 'observed')
+Assert-Equal "behavioural axis stamped"               'observed' $stamped.provenance.axes.behavioural
+Assert-Equal "stamping leaves skew_commits alone"     736 $stamped.provenance.skew_commits
+Assert-Equal "stamping leaves the manifest axis alone" 'observed' $stamped.provenance.axes.manifest
+$null = Set-ParityBehaviouralAxis -Report $stamped -Axis 'fine i guess'
+Assert-Equal "a malformed axis is recorded as unknown" 'unknown(unparseable_axis_value: fine i guess)' $stamped.provenance.axes.behavioural
+Assert-Equal "a report with no provenance is not stamped" $false (Set-ParityBehaviouralAxis -Report ([PSCustomObject]@{ report_version = 1 }) -Axis 'observed')
+
+# The file-to-file stamp the workflow step calls: atomic, one field, honest
+# about a missing artifact or a missing axis file.
+$stRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("pp-stamp-" + [System.Guid]::NewGuid().ToString('N').Substring(0, 8))
+New-Item -ItemType Directory -Force -Path $stRoot | Out-Null
+try {
+    $jp = Join-Path $stRoot 'published-parity.json'
+    $ap = Join-Path $stRoot 'behavioural-axis.txt'
+    [System.IO.File]::WriteAllText($jp, ($objP | ConvertTo-Json -Depth 10), (New-Object System.Text.UTF8Encoding($false)))
+    Assert-Equal "stamp file: no axis file still stamps" 'stamped' (Update-ParityReportBehaviouralAxis -JsonPath $jp -AxisPath $ap)
+    $after1 = Get-Content -LiteralPath $jp -Raw | ConvertFrom-Json
+    Assert-Equal "stamp file: a missing axis file is unknown, never observed" 'unknown(behavioural_step_did_not_report)' $after1.provenance.axes.behavioural
+    Set-Content -LiteralPath $ap -Value 'observed'
+    Assert-Equal "stamp file: stamped" 'stamped' (Update-ParityReportBehaviouralAxis -JsonPath $jp -AxisPath $ap)
+    $after2 = Get-Content -LiteralPath $jp -Raw | ConvertFrom-Json
+    Assert-Equal "stamp file: observed written"           'observed' $after2.provenance.axes.behavioural
+    Assert-Equal "stamp file: skew_commits untouched"     736 $after2.provenance.skew_commits
+    Assert-Equal "stamp file: counts untouched"           1 $after2.counts.parity_defects
+    Assert-Equal "stamp file: no .tmp left behind"        $false (Test-Path -LiteralPath "$jp.tmp")
+    Assert-Equal "stamp file: a missing artifact is reported" 'no_artifact' (Update-ParityReportBehaviouralAxis -JsonPath (Join-Path $stRoot 'absent.json') -AxisPath $ap)
+    $old = Join-Path $stRoot 'v1.json'
+    Set-Content -LiteralPath $old -Value '{"report_version":1}'
+    Assert-Equal "stamp file: a v1 artifact is left alone" 'no_axes_block' (Update-ParityReportBehaviouralAxis -JsonPath $old -AxisPath $ap)
+} finally {
+    Remove-Item -LiteralPath $stRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# ---------------------------------------------------------------------------
+# 16. skew_commits FROM A REAL GIT REPO. The shapes CI meets: a tag behind
+#     HEAD, the tag AT HEAD (the same-SHA dispatch), a tag the checkout does
+#     not have, and a shallow clone -- where `rev-list --count` exits 0 with an
+#     undercount, so the only honest answer is unknown.
+# ---------------------------------------------------------------------------
+Write-Host "[16] skew_commits over a real repository"
+function Invoke-TestGit {
+    param([string]$Dir, [string[]]$GitArgs)
+    $ErrorActionPreference = 'Continue'
+    $o = & git -C $Dir -c user.name=parity-test -c user.email=parity-test@invalid -c commit.gpgsign=false -c tag.gpgsign=false @GitArgs 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "git $($GitArgs -join ' ') failed: $($o | Out-String)" }
+}
+$gitCmd = Get-Command git -ErrorAction SilentlyContinue
+Assert-True "git is available (these cases pin the never-0 rule and must not skip)" ($null -ne $gitCmd)
+if ($null -ne $gitCmd) {
+    $gRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("pp-skew-" + [System.Guid]::NewGuid().ToString('N').Substring(0, 8))
+    $repo = Join-Path $gRoot 'qontinui-runner'
+    New-Item -ItemType Directory -Force -Path $repo | Out-Null
+    try {
+        Invoke-TestGit $repo @('init', '-q')
+        Invoke-TestGit $repo @('commit', '-q', '--allow-empty', '-m', 'release commit')
+        Invoke-TestGit $repo @('tag', 'v9.9.9')
+        $sk0 = Get-ParitySkewProvenance -RepoDir $repo -Tag 'v9.9.9'
+        Assert-Equal "tag AT HEAD: skew 0 (the same-SHA leg)" '0' "$($sk0.skew_commits)"
+        Assert-Equal "tag AT HEAD: dev_sha == published_sha" $sk0.dev_sha $sk0.published_sha
+
+        Invoke-TestGit $repo @('commit', '-q', '--allow-empty', '-m', 'after 1')
+        Invoke-TestGit $repo @('commit', '-q', '--allow-empty', '-m', 'after 2')
+        Invoke-TestGit $repo @('commit', '-q', '--allow-empty', '-m', 'after 3')
+        $sk3 = Get-ParitySkewProvenance -RepoDir $repo -Tag 'v9.9.9'
+        Assert-Equal "three commits past the tag: skew 3" '3' "$($sk3.skew_commits)"
+        Assert-True  "dev_sha is a full sha" ($sk3.dev_sha -match '^[0-9a-f]{40}$')
+        Assert-True  "published_sha differs from dev_sha" ($sk3.published_sha -ne $sk3.dev_sha)
+
+        $skMissing = Get-ParitySkewProvenance -RepoDir $repo -Tag 'v0.0.0-not-here'
+        Assert-Equal "missing tag: unknown, never 0" 'unknown(tag_not_in_checkout: v0.0.0-not-here)' $skMissing.skew_commits
+        Assert-Equal "missing tag: published_sha unknown too" 'unknown(tag_not_in_checkout: v0.0.0-not-here)' $skMissing.published_sha
+        Assert-Equal "no tag given: unknown" 'unknown(no_published_tag)' (Get-ParitySkewProvenance -RepoDir $repo -Tag '').skew_commits
+
+        # The shallow clone: the tag IS present (fetched by name), HEAD is not
+        # the tag, and the history between them is not -- the CI default.
+        $shallow = Join-Path $gRoot 'shallow'
+        # A file:// URL, not a plain path: git ignores --depth for a local-path clone
+        # (it hardlinks the whole object store), which would make this clone deep.
+        # ::new, not a [System.Uri] cast: the cast parses a POSIX path as RELATIVE
+        # and AbsoluteUri then reads empty.
+        $url = [System.Uri]::new((Resolve-Path -LiteralPath $repo).Path).AbsoluteUri
+        Invoke-TestGit $gRoot @('clone', '-q', '--depth', '1', '--no-tags', $url, $shallow)
+        Invoke-TestGit $shallow @('fetch', '-q', '--depth', '1', 'origin', 'tag', 'v9.9.9')
+        $skShallow = Get-ParitySkewProvenance -RepoDir $shallow -Tag 'v9.9.9'
+        Assert-True  "shallow: the tag was resolved (the arm under test is reached)" ($skShallow.published_sha -match '^[0-9a-f]{40}$')
+        Assert-Equal "shallow: unknown, never the undercount" 'unknown(shallow_clone)' $skShallow.skew_commits
+
+        $notRepo = Join-Path $gRoot 'not-a-repo'
+        New-Item -ItemType Directory -Force -Path $notRepo | Out-Null
+        $skNone = Get-ParitySkewProvenance -RepoDir $notRepo -Tag 'v9.9.9'
+        Assert-True  "not a checkout: dev_sha unknown" ($skNone.dev_sha -like 'unknown(dev_checkout_unreadable*')
+        Assert-True  "not a checkout: skew never 0" ("$($skNone.skew_commits)" -ne '0')
+
+        # Siblings are read where checkout-sibling puts them: beside the runner.
+        $sibRows = @(Get-ParitySiblingProvenance -RepoRoot $repo -Repos @('qontinui/shallow', 'qontinui/ui-bridge'))
+        Assert-True  "a present sibling is recorded by sha" ((@($sibRows | Where-Object { $_.repo -eq 'qontinui/shallow' })[0].sha) -match '^[0-9a-f]{40}$')
+        Assert-Equal "an absent sibling is unknown" 'unknown(not_checked_out)' (@($sibRows | Where-Object { $_.repo -eq 'qontinui/ui-bridge' })[0].sha)
+
+        # ANCESTRY. `rev-list --count <tag>..HEAD` is a skew only when the tag
+        # is an ancestor of HEAD. HEAD BEHIND the tag counts 0 while the SHAs
+        # differ (a fabricated same-SHA reading); diverged histories undercount.
+        # Both must be unknown -- never a number.
+        Invoke-TestGit $repo @('tag', 'v9.9.10')            # at the tip: 3 past v9.9.9
+        Invoke-TestGit $repo @('checkout', '-q', '--detach', 'v9.9.9')
+        $skBehind = Get-ParitySkewProvenance -RepoDir $repo -Tag 'v9.9.10'
+        Assert-Equal "HEAD behind the tag: unknown, never 0" 'unknown(tag_not_ancestor_of_head)' $skBehind.skew_commits
+        Assert-True  "HEAD behind the tag: not a number" ($skBehind.skew_commits -is [string])
+        Assert-True  "HEAD behind the tag: the SHAs really differ" ($skBehind.dev_sha -ne $skBehind.published_sha)
+        Assert-Equal "HEAD behind the tag: divergence dev_only" 0 $skBehind.divergence.dev_only_commits
+        Assert-Equal "HEAD behind the tag: divergence published_only" 3 $skBehind.divergence.published_only_commits
+
+        Invoke-TestGit $repo @('checkout', '-q', '-b', 'side')
+        Invoke-TestGit $repo @('commit', '-q', '--allow-empty', '-m', 'side commit')
+        $skSide = Get-ParitySkewProvenance -RepoDir $repo -Tag 'v9.9.10'
+        Assert-Equal "diverged history: unknown, never the undercount" 'unknown(tag_not_ancestor_of_head)' $skSide.skew_commits
+        Assert-True  "diverged history: not a number" ($skSide.skew_commits -is [string])
+        Assert-Equal "diverged history: divergence dev_only" 1 $skSide.divergence.dev_only_commits
+        Assert-Equal "diverged history: divergence published_only" 3 $skSide.divergence.published_only_commits
+        # ...and the divergence rides in the provenance block, beside -- not
+        # inside -- the unknown skew.
+        $provD = New-ParityProvenance -SkewCommits $skSide.skew_commits -Divergence $skSide.divergence
+        Assert-Equal "divergence carried in provenance" 1 $provD.divergence.dev_only_commits
+        Assert-Equal "skew stays unknown beside it" 'unknown(tag_not_ancestor_of_head)' $provD.skew_commits
+        # The linear case is unaffected: a tag that IS an ancestor still counts.
+        Assert-Equal "linear: a tag that IS an ancestor still counts (1 commit past v9.9.9)" '1' "$((Get-ParitySkewProvenance -RepoDir $repo -Tag 'v9.9.9').skew_commits)"
+        Assert-Equal "linear: no divergence recorded" $null (Get-ParitySkewProvenance -RepoDir $repo -Tag 'v9.9.9').divergence
+    } finally {
+        Remove-Item -LiteralPath $gRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 Write-Host ""
 if ($failures -gt 0) {
     Write-Host "PARITY-DIFF-TESTS FAILED: $failures of $checks checks" -ForegroundColor Red

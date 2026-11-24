@@ -27,6 +27,21 @@
 //! something RUNNING: there is no reason to start a database before finding out
 //! a declared tool does not exist for this platform.
 //!
+//! ## What a step inherits
+//!
+//! A step inherits the runner's process environment MINUS the scrub in
+//! [`super::step_env`]: the model-credential class, every inherited
+//! `*_MODEL_CMD` key and the runner's own credential values are removed before
+//! the step's `env` and the executor's exports are applied, and every step gets
+//! `CLAUDE_CONFIG_DIR` pointed at an empty directory of its own under the
+//! dispatch root, so a `claude` inside a step starts with no login. `HOME` is
+//! still inherited, so this is not a sandbox: see the module docs of
+//! [`super::step_env`] for what it does not stop. Provisioning children (tools,
+//! siblings, services) are handled differently: they do not pass through that
+//! scrub, and plan
+//! `2026-11-06-ci-node-provisioning-children-inherit-only-an-allowlisted-environment`
+//! owns their environment.
+//!
 //! ## Capture-before-cleanup (type-enforced, not conventional)
 //!
 //! The steps' JUnit report lives INSIDE the dispatch worktree that
@@ -49,6 +64,7 @@
 //! no way to report without having been handed the capture slot. Re-breaking
 //! this requires deleting a type, not reordering two lines.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -61,26 +77,32 @@ use super::manifest::{CiManifest, CiStep};
 use super::reporting::{self, LinePusher, ProgressSink, StepSummary};
 use super::CiDispatchPayload;
 
-/// Job-wide committed-memory ceiling for one dispatch's process tree
-/// (Windows). Deliberately generous — rustc at `CARGO_BUILD_JOBS=1` on this
-/// workspace legitimately commits >10 GiB — because this is a runaway
-/// backstop, not a tuning knob; the real throttle is the jobs cap.
-#[cfg(windows)]
-const CI_JOB_MEMORY_LIMIT_BYTES: usize = 32 * 1024 * 1024 * 1024;
+/// Job-wide memory ceiling for one dispatch's process tree. Deliberately
+/// generous — rustc at `CARGO_BUILD_JOBS=1` on this workspace legitimately
+/// commits >10 GiB — because this is a runaway backstop, not a tuning knob;
+/// the real throttle is the jobs cap. Windows enforces it with a Job Object,
+/// Linux with a cgroup v2 `memory.max` ([`super::cgroup`]): one number, both
+/// arms.
+#[cfg_attr(not(any(windows, target_os = "linux", test)), allow(dead_code))]
+pub(crate) const CI_JOB_MEMORY_LIMIT_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 
-/// Per-dispatch Job Object carrying the memory backstop. A no-op unit on
-/// non-Windows so call sites stay platform-uniform.
+/// Per-dispatch containment carrying the memory backstop: a Job Object on
+/// Windows, a cgroup v2 child on Linux (degrading explicitly, see
+/// [`super::cgroup`]), a no-op elsewhere so call sites stay platform-uniform.
 struct CiJob {
     #[cfg(windows)]
     inner: Option<qontinui_runner_win32::ScopedKillOnCloseJob>,
+    #[cfg(target_os = "linux")]
+    cgroup: super::cgroup::Containment,
 }
 
 impl CiJob {
-    fn create() -> Self {
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+    fn create(dispatch_id: &str) -> Self {
         #[cfg(windows)]
         {
             let inner = qontinui_runner_win32::ScopedKillOnCloseJob::create(Some(
-                CI_JOB_MEMORY_LIMIT_BYTES,
+                CI_JOB_MEMORY_LIMIT_BYTES as usize,
             ));
             if inner.is_none() {
                 warn!(
@@ -90,21 +112,84 @@ impl CiJob {
             }
             Self { inner }
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        {
+            Self {
+                cgroup: super::cgroup::Containment::create(dispatch_id, CI_JOB_MEMORY_LIMIT_BYTES),
+            }
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             Self {}
         }
     }
 
+    /// One line naming the containment state for the dispatch log (Linux
+    /// only; the Windows arm already warns when its job is unavailable).
+    fn describe(&self) -> Option<String> {
+        #[cfg(target_os = "linux")]
+        {
+            Some(self.cgroup.describe())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
+
+    /// Make the step command start inside the dispatch containment (before
+    /// spawn, so no descendant can run outside it).
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+    fn prepare(&self, cmd: &mut tokio::process::Command) {
+        #[cfg(target_os = "linux")]
+        if let super::cgroup::Containment::Cgroup(c) = &self.cgroup {
+            c.prepare(cmd);
+        }
+    }
+
     /// Assign a spawned step child to the dispatch job (in addition to the
     /// global job the caller already assigned it to).
-    #[cfg_attr(not(windows), allow(unused_variables))]
+    #[cfg_attr(not(any(windows, target_os = "linux")), allow(unused_variables))]
     fn assign(&self, child: &tokio::process::Child) {
         #[cfg(windows)]
         if let (Some(job), Some(raw)) = (self.inner.as_ref(), child.raw_handle()) {
             // SAFETY: `raw` came from the live `child` the caller still owns.
             unsafe { job.assign(raw as windows_sys::Win32::Foundation::HANDLE) };
         }
+        #[cfg(target_os = "linux")]
+        if let super::cgroup::Containment::Cgroup(c) = &self.cgroup {
+            c.adopt(child);
+        }
+    }
+
+    /// Kill every process of the dispatch (cancel / lease loss / timeout).
+    /// Windows kills the tree by pid elsewhere; this is the Linux subtree kill.
+    fn kill_all(&self) {
+        #[cfg(target_os = "linux")]
+        if let super::cgroup::Containment::Cgroup(c) = &self.cgroup {
+            let path = c.kill();
+            tracing::debug!("ci_node: dispatch cgroup killed via {path:?}");
+        }
+    }
+
+    /// The dispatch cgroup's cumulative kernel `oom_kill` count. `None` off
+    /// Linux, when uncontained, or when `memory.events` is unreadable.
+    fn oom_kill_count(&self) -> Option<u64> {
+        #[cfg(target_os = "linux")]
+        if let super::cgroup::Containment::Cgroup(c) = &self.cgroup {
+            return c.oom_kill_count();
+        }
+        None
+    }
+
+    /// A log line when the kernel OOM-killed part of the dispatch since the
+    /// last call, so a memory kill reads as one rather than as a bare signal.
+    fn memory_kill_note(&self) -> Option<String> {
+        #[cfg(target_os = "linux")]
+        if let super::cgroup::Containment::Cgroup(c) = &self.cgroup {
+            return c.take_oom_note();
+        }
+        None
     }
 }
 
@@ -178,15 +263,19 @@ impl StepOutcome {
 /// Run one dispatch end-to-end. Never panics; always POSTs a result (via
 /// the retrying reporter) and always cleans up the worktree it created.
 ///
-/// `host` and `max_concurrent` are the host probe and the resolved capacity
-/// `admission::submit` admitted this dispatch against — passed through rather
-/// than re-read so the host share below is sized by the SAME N admission used.
+/// `host` and `share_n` are the host probe and the N of equal host
+/// shares this dispatch is sized as one of: the static partition of `host`, or
+/// the operator's explicit value (`CiNodeSettings::dispatch_share_for`).
+/// Admission never runs more than N side by side — the capacity model can
+/// lower that count, never raise it (`host_sizing`) — so the shares never
+/// oversubscribe the host. Passed through rather than re-read so the share
+/// below is the one admission decided.
 pub(crate) async fn run_dispatch(
     payload: CiDispatchPayload,
     root: PathBuf,
     cancel: CancellationToken,
     host: host_sizing::HostCapacity,
-    max_concurrent: u32,
+    share_n: u32,
 ) {
     let base = {
         let pinned = payload.coord_http_url.trim().trim_end_matches('/');
@@ -206,6 +295,12 @@ pub(crate) async fn run_dispatch(
             pinned.to_string()
         }
     };
+
+    // What this function runs itself, outside the job's containment, counts as
+    // an uncontained run (see `cgroup::OutsideCgroup`): the setup from here
+    // until the containment is settled, then what follows the steps. Declared
+    // before everything it covers, so it drops last.
+    let mut outside = super::cgroup::OutsideCgroup::setup(&payload.dispatch_id);
 
     let sink = ProgressSink::start(base.clone(), payload.dispatch_id.clone(), cancel.clone());
     sink.push(&format!(
@@ -320,9 +415,9 @@ pub(crate) async fn run_dispatch(
     // memory and cpu count cannot change mid-build in any way worth re-reading.
     //
     // Sized against this dispatch's SHARE of the host, not the whole of it: the
-    // node admits up to N dispatches side by side (the same N `admission.rs`
-    // admitted this one against), and N dispatches each sized to the whole host
-    // oversubscribe it N-fold — see `host_sizing::share`.
+    // node admits at most N dispatches side by side (fewer when the capacity
+    // model says the box is busy — `host_sizing`), and N dispatches each sized
+    // to the whole host oversubscribe it N-fold — see `host_sizing::share`.
     //
     // THE TRADE-OFF, stated so it is a choice and not a surprise: the partition
     // is STATIC. A lone build on a big host still gets only 1/N of it — on
@@ -332,7 +427,7 @@ pub(crate) async fn run_dispatch(
     // oversubscribe the host — exactly the OOM class this exists to prevent.
     // The operator's lever for fewer, fatter builds is a LOWER explicit
     // `ci_node.max_concurrent_builds`, which widens each share.
-    let concurrency = max_concurrent.max(1);
+    let concurrency = share_n.max(1);
     let host = host_sizing::derive(host_sizing::share(host, concurrency));
     let build_jobs = manifest.limits.effective_cargo_build_jobs(host);
     let test_threads = manifest.limits.effective_test_threads(host);
@@ -460,11 +555,21 @@ pub(crate) async fn run_dispatch(
 
     // Per-dispatch memory-backstop job (held across all steps; dropping it
     // at dispatch end kill-on-closes any stray build processes).
-    let ci_job = CiJob::create();
+    let ci_job = CiJob::create(&payload.dispatch_id);
+    outside.settled();
+    if let Some(line) = ci_job.describe() {
+        sink.push(&line);
+    }
+
+    // The directory cleanup removes whole. Each step's own empty
+    // `CLAUDE_CONFIG_DIR` is made under it, keyed by the step's index (see
+    // `run_step`).
+    let dispatch_root = super::checkout::ci_dispatch_root(&root, &payload.dispatch_id);
 
     // ── Steps (sequential; first failure short-circuits) ──
     let mut overall = StepOutcome::Success;
-    for step in &manifest.steps {
+    let mut result_reason: Option<&'static str> = None;
+    for (step_index, step) in manifest.steps.iter().enumerate() {
         if cancel.is_cancelled() {
             overall = StepOutcome::Cancelled;
             break;
@@ -476,7 +581,19 @@ pub(crate) async fn run_dispatch(
             step.effective_timeout_secs()
         ));
         let step_started = Instant::now();
-        let outcome = run_step(step, &dispatch_env, &worktree, &ci_job, &sink, &cancel).await;
+        let oom_before = ci_job.oom_kill_count();
+        let outcome = run_step(
+            step,
+            &dispatch_env,
+            &dispatch_root,
+            step_index,
+            &worktree,
+            &ci_job,
+            &sink,
+            &cancel,
+        )
+        .await;
+        let oom_after = ci_job.oom_kill_count();
         let duration = step_started.elapsed().as_secs();
         sink.push(&format!(
             "[ci-node] step {} → {} in {duration}s",
@@ -489,10 +606,12 @@ pub(crate) async fn run_dispatch(
             duration_secs: duration,
         });
         if outcome != StepOutcome::Success {
+            result_reason = step_failure_reason(&outcome, oom_before, oom_after);
             overall = outcome;
             break;
         }
     }
+    outside.after_steps();
 
     let conclusion = match overall {
         StepOutcome::Success => "success",
@@ -525,7 +644,7 @@ pub(crate) async fn run_dispatch(
         &payload.dispatch_id,
         conclusion,
         &steps_summary,
-        None,
+        result_reason,
         &tail,
         capture.artifact(),
         Some(&canonical_outcome),
@@ -533,6 +652,31 @@ pub(crate) async fn run_dispatch(
     .await;
     // The receipt is the only key to cleanup; the artifact is already sent.
     workspace.cleanup(reported).await;
+}
+
+/// `summary.reason` for a dispatch whose failing step the kernel OOM-killed
+/// inside the dispatch cgroup. Same vocabulary as the Actions lane's
+/// `out_of_memory` no-verdict marker (coord `main_baseline_no_verdict`). Coord
+/// stores a dispatch `summary` as opaque JSON today and acts on no reason, so
+/// this is an operator-readable label until coord's dispatch-result ingest
+/// reads it. The conclusion stays `failure`; this only names why.
+const OUT_OF_MEMORY_REASON: &str = "out_of_memory";
+
+/// The result reason for a non-success step: `out_of_memory` only when the
+/// cgroup's `oom_kill` counter PROVABLY rose across the step. An unreadable
+/// counter on either side is UNKNOWN and claims nothing.
+fn step_failure_reason(
+    outcome: &StepOutcome,
+    oom_before: Option<u64>,
+    oom_after: Option<u64>,
+) -> Option<&'static str> {
+    if matches!(outcome, StepOutcome::Success | StepOutcome::Cancelled) {
+        return None;
+    }
+    match (oom_before, oom_after) {
+        (Some(b), Some(a)) if a > b => Some(OUT_OF_MEMORY_REASON),
+        _ => None,
+    }
 }
 
 /// Provision what the manifest declares. Returns the tool directories to
@@ -643,8 +787,14 @@ fn resolve_step_cwd(worktree: &Path, step: &CiStep) -> Result<PathBuf, String> {
 /// Build the tokio Command for a step's argv. On Windows the creation
 /// flags combine `CREATE_NO_WINDOW` with `BELOW_NORMAL_PRIORITY_CLASS` so a
 /// CI build never steals the foreground from the developer.
+///
+/// Built on [`crate::process_helpers::tokio_no_window`] so a step whose argv
+/// starts with `git` gets the same git posture as every other runner git
+/// spawn: prompt-proof, and scrubbed of a repository-local env (`GIT_DIR`, …)
+/// inherited from whoever launched the runner — which would otherwise point
+/// the step at the launcher's repo instead of the worktree it runs in.
 fn build_step_command(program: &str, args: &[String]) -> tokio::process::Command {
-    let mut cmd = tokio::process::Command::new(program);
+    let mut cmd = crate::process_helpers::tokio_no_window(program);
     cmd.args(args);
     #[cfg(target_os = "windows")]
     {
@@ -657,33 +807,58 @@ fn build_step_command(program: &str, args: &[String]) -> tokio::process::Command
     cmd
 }
 
+/// Everything a step command is given before it spawns: its cwd and pipes,
+/// then the step env scrub's `removals` taken out of the inherited
+/// environment, THEN `envs`, then the dispatch containment. Removals come
+/// first so an executor-owned value such as `CLAUDE_CONFIG_DIR` is set, not
+/// removed.
+///
+/// A named fn rather than a closure in `spawn_step_child`, so a test observes
+/// the code the direct command and the Windows `cmd.exe /C` shim both run, not
+/// a copy of it.
+fn apply_step_env(
+    cmd: &mut tokio::process::Command,
+    cwd: &Path,
+    removals: &[OsString],
+    envs: &[(String, String)],
+    ci_job: &CiJob,
+) {
+    cmd.current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for k in removals {
+        cmd.env_remove(k);
+    }
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    ci_job.prepare(cmd);
+}
+
 /// Spawn a step child, falling back to a `cmd.exe /C` respawn on Windows
 /// when the program is a `.cmd`/`.bat` shim (pnpm) that `CreateProcess`
 /// cannot launch directly. Argv tokens are metacharacter-validated by the
 /// manifest, so the shim path cannot smuggle shell syntax.
+///
+/// Both commands get the same [`apply_step_env`]: the `removals` (the step
+/// env scrub, see [`super::step_env`]) and then the `envs`.
 fn spawn_step_child(
     step: &CiStep,
     cwd: &Path,
+    removals: &[OsString],
     envs: &[(String, String)],
+    ci_job: &CiJob,
 ) -> Result<tokio::process::Child, String> {
-    let apply = |cmd: &mut tokio::process::Command| {
-        cmd.current_dir(cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        for (k, v) in envs {
-            cmd.env(k, v);
-        }
-    };
     let mut direct = build_step_command(&step.command[0], &step.command[1..]);
-    apply(&mut direct);
+    apply_step_env(&mut direct, cwd, removals, envs, ci_job);
     match direct.spawn() {
         Ok(child) => Ok(child),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound && cfg!(target_os = "windows") => {
             let mut argv: Vec<String> = vec!["/C".to_string()];
             argv.extend(step.command.iter().cloned());
             let mut shim = build_step_command("cmd.exe", &argv);
-            apply(&mut shim);
+            apply_step_env(&mut shim, cwd, removals, envs, ci_job);
             shim.spawn()
                 .map_err(|e2| format!("spawn {:?} (direct: {e}; cmd /C: {e2})", step.command))
         }
@@ -691,17 +866,23 @@ fn spawn_step_child(
     }
 }
 
-/// Kill a step's process tree. On Windows `taskkill /T` takes the whole
-/// tree (killing only the direct child would orphan cargo/node under a
-/// `cmd.exe` shim until Job-Object close); elsewhere `start_kill` suffices.
-async fn kill_step_tree(child: &mut tokio::process::Child) {
+/// Kill a step's process tree. On Windows the in-process tree kill takes the
+/// whole tree (killing only the direct child would orphan cargo/node under a
+/// `cmd.exe` shim until Job-Object close) without spawning a process;
+/// elsewhere `start_kill` suffices.
+async fn kill_step_tree(child: &mut tokio::process::Child, ci_job: &CiJob) {
+    // Linux: the whole dispatch cgroup, which also takes daemonised
+    // grandchildren a pid-tree walk would miss.
+    ci_job.kill_all();
     #[cfg(target_os = "windows")]
     {
         if let Some(pid) = child.id() {
-            let _ = crate::process_helpers::tokio_no_window("taskkill")
-                .args(["/F", "/T", "/PID", &pid.to_string()])
-                .output()
-                .await;
+            if let Err(e) =
+                crate::tree_kill::kill_tree_by_pid_async(pid, std::time::Duration::from_secs(5))
+                    .await
+            {
+                tracing::debug!("ci step tree kill of pid {pid}: {e}");
+            }
         }
     }
     let _ = child.start_kill();
@@ -782,9 +963,16 @@ fn tool_path(tool_dirs: &[PathBuf]) -> Option<String> {
 }
 
 /// Run one step: spawn, pump output, enforce timeout + cancellation.
+///
+/// `dispatch_root` is the directory the dispatch's cleanup removes whole, and
+/// `step_index` keys the step's own empty `CLAUDE_CONFIG_DIR` under it (see
+/// [`super::step_env`]).
+#[allow(clippy::too_many_arguments)]
 async fn run_step(
     step: &CiStep,
     dispatch_env: &DispatchEnv,
+    dispatch_root: &Path,
+    step_index: usize,
     worktree: &Path,
     ci_job: &CiJob,
     sink: &ProgressSink,
@@ -798,16 +986,54 @@ async fn run_step(
         }
     };
 
+    // A config dir of this step's own, made just before it runs and real and
+    // empty at the moment it is made. A `claude` here finds no login, and a
+    // process an EARLIER step left running, writing where ITS
+    // `CLAUDE_CONFIG_DIR` points, writes into that step's directory, not this
+    // one. It does not stop a process running as the node owner from writing
+    // wherever it can, this step's directory included (see `super::step_env`).
+    // No empty directory, no step: it never runs pointed at one that was not
+    // empty when made. Filesystem work, so on the blocking pool, like the
+    // dispatch-root delete in `checkout`.
+    let config_dir = {
+        let root = dispatch_root.to_path_buf();
+        match tokio::task::spawn_blocking(move || {
+            super::step_env::fresh_empty_config_dir(&root, step_index)
+        })
+        .await
+        {
+            Ok(Ok(dir)) => dir,
+            Ok(Err(e)) => {
+                sink.push(&format!("[ci-node] step {}: {e}", step.name));
+                return StepOutcome::Failure;
+            }
+            Err(e) => {
+                sink.push(&format!(
+                    "[ci-node] step {}: preparing its empty CLAUDE_CONFIG_DIR did not complete: {e}",
+                    step.name
+                ));
+                return StepOutcome::Failure;
+            }
+        }
+    };
+
     // Env: allowlisted step env first, then the executor's exports, which WIN
-    // over the step.
+    // over the step, then the pinned config dir.
     let mut envs: Vec<(String, String)> = step
         .env
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     envs.extend(dispatch_env.exports.iter().cloned());
+    envs.push((
+        super::step_env::CLAUDE_CONFIG_DIR_ENV.to_string(),
+        config_dir.to_string_lossy().to_string(),
+    ));
 
-    let mut child = match spawn_step_child(step, &cwd, &envs) {
+    // The scrub: no step inherits a model credential, a model command or the
+    // runner's credential values. Computed per step from this process's env.
+    let removals = super::step_env::current_step_env_removals();
+    let mut child = match spawn_step_child(step, &cwd, &removals, &envs, ci_job) {
         Ok(c) => c,
         Err(e) => {
             sink.push(&format!("[ci-node] step {}: {e}", step.name));
@@ -861,7 +1087,7 @@ async fn run_step(
                 step.name,
                 timeout.as_secs()
             ));
-            kill_step_tree(&mut child).await;
+            kill_step_tree(&mut child, ci_job).await;
             StepOutcome::Timeout
         }
         _ = cancel.cancelled() => {
@@ -869,10 +1095,14 @@ async fn run_step(
                 "[ci-node] step {} cancelled — killing process tree",
                 step.name
             ));
-            kill_step_tree(&mut child).await;
+            kill_step_tree(&mut child, ci_job).await;
             StepOutcome::Cancelled
         }
     };
+
+    if let Some(note) = ci_job.memory_kill_note() {
+        sink.push(&note);
+    }
 
     // The pumps end when the pipes close (child exit or kill).
     if let Some(t) = out_task {
@@ -885,21 +1115,193 @@ async fn run_step(
 }
 
 /// Per-line pump for one stream.
+///
+/// Reads the bytes up to each `\n` and renders them lossily, so a line that
+/// is not valid UTF-8 shows with U+FFFD in place of the bad bytes and the
+/// pump goes on. (`lines()` returns `InvalidData` there: the pump ended, the
+/// rest of the log was dropped silently, and a step still writing met a
+/// closed read end and died of SIGPIPE, exit 141.) A final line with no
+/// trailing `\n` is still logged. Any other read error is logged once, and
+/// the rest of the stream is drained unlogged so the writer is never cut off.
 async fn pump_lines<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
     stream: R,
     pusher: LinePusher,
     step_name: String,
     stream_tag: &'static str,
 ) {
-    let mut lines = BufReader::new(stream).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        pusher.push(&format!("[{step_name}:{stream_tag}] {line}"));
+    let mut reader = BufReader::new(stream);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf).await {
+            Ok(0) => break,
+            Ok(_) => {
+                if buf.last() == Some(&b'\n') {
+                    buf.pop();
+                    if buf.last() == Some(&b'\r') {
+                        buf.pop();
+                    }
+                }
+                let line = String::from_utf8_lossy(&buf);
+                pusher.push(&format!("[{step_name}:{stream_tag}] {line}"));
+            }
+            Err(e) => {
+                pusher.push(&format!(
+                    "[ci-node] step {step_name} {stream_tag} read error: {e}"
+                ));
+                // Keep draining so a step still writing is never cut off by a
+                // closed read end (SIGPIPE); what it writes now is discarded.
+                let _ = tokio::io::copy(&mut reader, &mut tokio::io::sink()).await;
+                break;
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A CI step whose argv starts with `git` gets the runner's git posture:
+    /// every repository-local variable is removed (`get_envs` reports a
+    /// removal as `None`), so a `GIT_DIR` inherited from the runner's launcher
+    /// cannot point the step at another repo. Pins `build_step_command` to
+    /// `tokio_no_window` — a bare `Command::new(program)` fails this.
+    #[test]
+    fn a_git_step_is_scrubbed_of_the_repo_local_env() {
+        let cmd = build_step_command("git", &["status".to_string()]);
+        let removed: Vec<String> = cmd
+            .as_std()
+            .get_envs()
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        for var in qontinui_runner_lib::git_posture::REPO_LOCAL_GIT_ENV {
+            assert!(
+                removed.iter().any(|r| r == var),
+                "a git CI step must not inherit {var}; removed: {removed:?}"
+            );
+        }
+    }
+
+    /// Where the runner's CI node actually enters sibling provisioning:
+    /// [`provision`], called by `run_dispatch` with the dispatch root under
+    /// `<root>/.ci-worktrees/<id>`. The runner's CI root is the workspace
+    /// root, itself a git repository, so that dispatch root sits INSIDE an
+    /// enclosing repo whose own `.git/config` carries an `insteadOf` routing
+    /// the sibling's GitHub URL to a local repository. The sibling's git must
+    /// not read it: isolated, the GitHub URL is asked as-is (a repository that
+    /// does not exist, so the resolve fails offline or not); unisolated, the
+    /// rewrite answers the resolve with the local repository's tip, so
+    /// provisioning gets past `resolving …` (and fails later, at the fetch,
+    /// which runs in the sibling's own repo) — the `resolving` error is what
+    /// tells the two apart.
+    #[tokio::test]
+    async fn a_dispatch_provision_ignores_an_enclosing_repos_url_rewrite() {
+        let git = |cwd: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        let dir = tempfile::tempdir().unwrap();
+        // A local "remote" with one commit on `main`, at `<dir>/remote.git`.
+        let remote = dir.path().join("remote.git");
+        std::fs::create_dir_all(&remote).unwrap();
+        git(&remote, &["init", "-q", "-b", "main"]);
+        git(
+            &remote,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "local",
+            ],
+        );
+        // The CI root: a git repository whose local config rewrites the
+        // sibling's GitHub URL (`https://github.com/qontinui-arming-probe/
+        // remote.git`) to the local repository above.
+        let root = dir.path().join("ws");
+        std::fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q"]);
+        git(
+            &root,
+            &[
+                "config",
+                &format!("url.{}/.insteadOf", dir.path().display()),
+                "https://github.com/qontinui-arming-probe/",
+            ],
+        );
+        let payload: CiDispatchPayload = serde_json::from_value(serde_json::json!({
+            "dispatch_id": "d-1",
+            "repo": "qontinui/qontinui-runner",
+            "head_sha": "s",
+            "fetch_url": "u",
+            "candidate_ref": "refs/heads/merge-candidate/1",
+        }))
+        .unwrap();
+        let worktree = super::super::checkout::ci_worktree_path(&root, "d-1", &payload.repo);
+        std::fs::create_dir_all(&worktree).unwrap();
+        let manifest = super::super::manifest::parse_and_validate(
+            "version = 1\n[[siblings]]\nrepo = \"qontinui-arming-probe/remote\"\n\
+             pin = \"default-branch\"\nbranch = \"main\"\n\
+             [[steps]]\nname = \"x\"\ncommand = [\"true\"]\n",
+        )
+        .unwrap();
+        let cancel = CancellationToken::new();
+        // A coord base nothing listens on: the sink's flusher fails and drops.
+        let sink = ProgressSink::start(
+            "http://127.0.0.1:9".to_string(),
+            "d-1".to_string(),
+            cancel.clone(),
+        );
+        let mut services = super::super::services::ServiceStack::new("d-1");
+
+        let res = provision(
+            &payload,
+            &root,
+            &worktree,
+            &manifest,
+            &sink,
+            &cancel,
+            &mut services,
+        )
+        .await;
+        let err = res.expect_err("the enclosing repo's rewrite reached sibling git");
+        assert!(
+            err.contains("resolving qontinui-arming-probe/remote@main"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn oom_reason_only_when_the_counter_provably_rose() {
+        use StepOutcome::*;
+        assert_eq!(
+            step_failure_reason(&Failure, Some(0), Some(1)),
+            Some("out_of_memory")
+        );
+        assert_eq!(
+            step_failure_reason(&Timeout, Some(2), Some(3)),
+            Some("out_of_memory")
+        );
+        // No rise, or an unreadable counter on either side: claims nothing.
+        assert_eq!(step_failure_reason(&Failure, Some(1), Some(1)), None);
+        assert_eq!(step_failure_reason(&Failure, None, Some(1)), None);
+        assert_eq!(step_failure_reason(&Failure, Some(0), None), None);
+        // A cancelled or successful step is never relabelled.
+        assert_eq!(step_failure_reason(&Cancelled, Some(0), Some(1)), None);
+        assert_eq!(step_failure_reason(&Success, Some(0), Some(1)), None);
+    }
 
     #[test]
     fn step_outcome_conclusions() {
@@ -1150,5 +1552,748 @@ mod tests {
                 "{bad}: got {err}"
             );
         }
+    }
+
+    // ── The step env scrub, end to end ──────────────────────────────────────
+
+    /// One planted canary per scrub class, plus a positive control outside
+    /// every class. Each is a name no non-test runner code reads (`git grep`
+    /// at `a5161f4da`): the class canary and the two `QONTINUI_STEP_ENV_*`
+    /// names occur nowhere else in the tree, and `QONTINUI_OPERATOR2_PASSWORD`
+    /// is only NAMED, by the removal list `terminal::CREDENTIAL_VALUE_ENV_VARS`
+    /// and by test code.
+    const CLASS_CANARY: &str = "CLAUDE_CODE_SKIP_MANTLE_AUTH";
+    const HOST_LIST_CANARY: &str = "QONTINUI_OPERATOR2_PASSWORD";
+    const MODEL_CMD_CANARY: &str = "QONTINUI_STEP_ENV_PROBE_MODEL_CMD";
+    const KEEP_CANARY: &str = "QONTINUI_STEP_ENV_KEEP_CANARY";
+    const CANARIES: [&str; 4] = [
+        CLASS_CANARY,
+        HOST_LIST_CANARY,
+        MODEL_CMD_CANARY,
+        KEEP_CANARY,
+    ];
+
+    /// A step as the manifest would hand it over. Built directly: the probes
+    /// below quote their program text, which the manifest's argv check (a
+    /// separate, upstream gate) is not under test here.
+    fn probe_step(name: &str, command: Vec<String>) -> CiStep {
+        CiStep {
+            name: name.to_string(),
+            command,
+            env: Default::default(),
+            timeout_secs: Some(120),
+            working_dir: None,
+        }
+    }
+
+    #[cfg(windows)]
+    fn powershell(script: String) -> Vec<String> {
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command"]
+            .iter()
+            .map(|s| s.to_string())
+            .chain([script])
+            .collect()
+    }
+
+    /// The probe: `seen=<NAME>` for each canary that is SET in the step's
+    /// environment, then `cfg=<CLAUDE_CONFIG_DIR>` and `done`. It prints names,
+    /// never a dump: whenever the scrub is broken the box's real environment
+    /// reaches the child, and the sink keeps only `LOG_TAIL_CAP_BYTES` of
+    /// tail, which a dump could fill.
+    fn env_probe_command() -> Vec<String> {
+        #[cfg(not(windows))]
+        {
+            let program = format!(
+                r#"BEGIN {{ n = split("{}", k, " "); for (i = 1; i <= n; i++) if (k[i] in ENVIRON) print "seen=" k[i]; print "cfg=" ENVIRON["CLAUDE_CONFIG_DIR"]; print "done" }}"#,
+                CANARIES.join(" ")
+            );
+            vec!["awk".to_string(), program]
+        }
+        #[cfg(windows)]
+        {
+            let names = CANARIES
+                .iter()
+                .map(|n| format!("'{n}'"))
+                .collect::<Vec<_>>()
+                .join(",");
+            powershell(format!(
+                "foreach ($n in {names}) {{ if (Test-Path ('Env:' + $n)) {{ 'seen=' + $n }} }}; \
+                 'cfg=' + $env:CLAUDE_CONFIG_DIR; 'done'"
+            ))
+        }
+    }
+
+    /// The stdout lines one step printed, in order, without the
+    /// `[<step>:out] ` prefix `pump_lines` adds.
+    fn step_out(tail: &str, step: &str) -> Vec<String> {
+        let prefix = format!("[{step}:out] ");
+        tail.lines()
+            .filter_map(|l| l.strip_prefix(prefix.as_str()))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Step 2: print `cfg=<CLAUDE_CONFIG_DIR>`, list it (`entry=<name>` per
+    /// entry), plant a file `planted` in it, print `S2-PLANTED`, list it again,
+    /// print `S2-DONE`. With the variable unset it touches nothing (never
+    /// `/planted`).
+    fn plant_command() -> Vec<String> {
+        #[cfg(not(windows))]
+        {
+            let list = r#"ls -A "$D" | while IFS= read -r e; do echo "entry=$e"; done"#;
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!(
+                    r#"D=${{CLAUDE_CONFIG_DIR:-}}; echo "cfg=$D"; if [ -n "$D" ]; then {list}; touch "$D/planted"; echo S2-PLANTED; {list}; fi; echo S2-DONE"#
+                ),
+            ]
+        }
+        #[cfg(windows)]
+        {
+            let list =
+                "Get-ChildItem -Force -LiteralPath $d | ForEach-Object { 'entry=' + $_.Name }";
+            powershell(format!(
+                "$d = $env:CLAUDE_CONFIG_DIR; 'cfg=' + $d; if ($d) {{ {list}; \
+                 New-Item -ItemType File -Path (Join-Path $d 'planted') | Out-Null; \
+                 'S2-PLANTED'; {list} }}; 'S2-DONE'"
+            ))
+        }
+    }
+
+    /// Step 3: print `cfg=<CLAUDE_CONFIG_DIR>`, then `dir-ok` when that is an
+    /// existing directory, then list it (`entry=<name>` per entry), then print
+    /// `S3-DONE`.
+    fn list_command() -> Vec<String> {
+        #[cfg(not(windows))]
+        {
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                r#"D=${CLAUDE_CONFIG_DIR:-}; echo "cfg=$D"; if [ -d "$D" ]; then echo dir-ok; fi; if [ -n "$D" ]; then ls -A "$D" | while IFS= read -r e; do echo "entry=$e"; done; fi; echo S3-DONE"#
+                    .to_string(),
+            ]
+        }
+        #[cfg(windows)]
+        {
+            powershell(
+                "$d = $env:CLAUDE_CONFIG_DIR; 'cfg=' + $d; \
+                 if ($d -and (Test-Path -LiteralPath $d -PathType Container)) { 'dir-ok' }; \
+                 if ($d) { Get-ChildItem -Force -LiteralPath $d | \
+                 ForEach-Object { 'entry=' + $_.Name } }; 'S3-DONE'"
+                    .to_string(),
+            )
+        }
+    }
+
+    /// THE POPULATION'S PATH, end to end, entering at `run_step` (which the
+    /// convention test below pins as `run_dispatch`'s only step path): a
+    /// credential the RUNNER process holds never reaches a CI step, whichever
+    /// class it belongs to, and every step gets `CLAUDE_CONFIG_DIR` pointed at
+    /// an empty directory of its own under the dispatch root, so what step 2
+    /// plants is not where step 3 is pointed. A step whose empty directory
+    /// cannot be made does not run at all.
+    #[tokio::test]
+    async fn a_ci_step_inherits_no_scrubbed_credential_and_gets_an_empty_config_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let dispatch_id = "step-env-e2e";
+        let dispatch_root = super::super::checkout::ci_dispatch_root(root, dispatch_id);
+        let worktree =
+            super::super::checkout::ci_worktree_path(root, dispatch_id, "qontinui/qontinui-runner");
+        std::fs::create_dir_all(&worktree).unwrap();
+        // Step 4's dispatch root is a regular file, so no empty config dir can
+        // be made under it.
+        let file_root = root.join("dispatch-root-is-a-file");
+        std::fs::write(&file_root, "x").unwrap();
+        let dispatch_env = DispatchEnv::build(
+            1,
+            1,
+            &root.join(".ci-target").join("qontinui-runner"),
+            &[],
+            &[],
+        );
+        let cancel = CancellationToken::new();
+        // A coord base nothing listens on: the sink's flusher fails and drops,
+        // and the tail ring still records every line.
+        let sink = ProgressSink::start(
+            "http://127.0.0.1:9".to_string(),
+            dispatch_id.to_string(),
+            cancel.clone(),
+        );
+
+        let env_guard = crate::test_env::env_lock();
+        let restore = crate::test_env::EnvVarRestore::capture(&CANARIES);
+        for name in CANARIES {
+            std::env::set_var(name, "planted-dummy-value");
+        }
+        // Inside the lock: cgroup discovery reads `QONTINUI_CI_CGROUP_ROOT`.
+        let ci_job = CiJob::create(dispatch_id);
+        let steps = [
+            (
+                probe_step("s1", env_probe_command()),
+                dispatch_root.as_path(),
+            ),
+            (probe_step("s2", plant_command()), dispatch_root.as_path()),
+            (probe_step("s3", list_command()), dispatch_root.as_path()),
+            (probe_step("s4", env_probe_command()), file_root.as_path()),
+        ];
+        let mut outcomes = Vec::new();
+        for (step_index, (step, step_dispatch_root)) in steps.iter().enumerate() {
+            outcomes.push(
+                run_step(
+                    step,
+                    &dispatch_env,
+                    step_dispatch_root,
+                    step_index,
+                    &worktree,
+                    &ci_job,
+                    &sink,
+                    &cancel,
+                )
+                .await,
+            );
+        }
+        // Restore, then release, BEFORE `finish()`: on a dead-port sink with
+        // no device JWT it takes seconds, and every env-touching test in the
+        // binary would queue behind this lock for them. The job goes first,
+        // still inside the lock: it holds `ci_node`'s process-wide dispatch
+        // counts (a containment, and an uncontained run when it could not
+        // make one), and a slice-telemetry test that takes the lock next would
+        // read them as a CI job running beside session work.
+        drop(ci_job);
+        drop(restore);
+        drop(env_guard);
+
+        let tail = sink.finish().await;
+        let [out1, out2, out3, out4] = ["s1", "s2", "s3", "s4"].map(|s| step_out(&tail, s));
+        assert_eq!(
+            outcomes,
+            [
+                StepOutcome::Success,
+                StepOutcome::Success,
+                StepOutcome::Success,
+                StepOutcome::Failure
+            ],
+            "steps 1-3 must run and step 4 must not: s1 {out1:?}, s2 {out2:?}, s3 {out3:?}, s4 {out4:?}"
+        );
+        // A missing sentinel means that step never ran to its end: UNKNOWN,
+        // never "nothing leaked".
+        assert!(
+            out1.iter().any(|l| l == "done"),
+            "step 1 printed no `done`: {out1:?}"
+        );
+        assert_eq!(
+            out2.last().map(String::as_str),
+            Some("S2-DONE"),
+            "step 2 did not finish: {out2:?}"
+        );
+        assert_eq!(
+            out3.last().map(String::as_str),
+            Some("S3-DONE"),
+            "step 3 did not finish: {out3:?}"
+        );
+
+        let seen: Vec<&str> = out1
+            .iter()
+            .filter_map(|l| l.strip_prefix("seen="))
+            .collect();
+        assert!(
+            seen.contains(&KEEP_CANARY),
+            "the positive control did not reach the step, so the probe proves nothing: {seen:?}"
+        );
+        let leaked: Vec<&str> = seen.into_iter().filter(|n| *n != KEEP_CANARY).collect();
+        assert!(
+            leaked.is_empty(),
+            "a scrubbed name reached a CI step: {leaked:?}"
+        );
+
+        // Every step got a pinned CLAUDE_CONFIG_DIR inside the dispatch unit
+        // cleanup deletes, whatever this test process's own value is.
+        let parent = dispatch_root.join(".ci-claude-config");
+        let cfg_of = |out: &[String]| -> Vec<String> {
+            out.iter()
+                .filter_map(|l| l.strip_prefix("cfg="))
+                .map(str::to_string)
+                .collect()
+        };
+        let cfgs = [cfg_of(&out1), cfg_of(&out2), cfg_of(&out3)];
+        for (step_index, cfg) in cfgs.iter().enumerate() {
+            assert!(
+                cfg.len() == 1 && !cfg[0].is_empty() && Path::new(&cfg[0]).starts_with(&parent),
+                "step {} did not get a pinned CLAUDE_CONFIG_DIR under {}: {cfg:?}",
+                step_index + 1,
+                parent.display()
+            );
+        }
+        // Each step's own (distinct indexes, so distinct paths): a process step 2
+        // left running would write into a directory step 3 is not pointed at.
+        for (step_index, cfg) in cfgs.iter().enumerate() {
+            assert_eq!(
+                cfg[0],
+                parent.join(step_index.to_string()).to_string_lossy(),
+                "step {} is not in its own per-step config dir",
+                step_index + 1
+            );
+        }
+
+        let without_cfg = |out: &[String]| -> Vec<String> {
+            out.iter()
+                .filter(|l| !l.starts_with("cfg="))
+                .cloned()
+                .collect()
+        };
+        assert_eq!(
+            without_cfg(&out2),
+            ["S2-PLANTED", "entry=planted", "S2-DONE"],
+            "step 2 must find its dir empty, then see only the file it planted"
+        );
+        assert_eq!(
+            without_cfg(&out3),
+            ["dir-ok", "S3-DONE"],
+            "step 3's dir must exist and be empty: it is not step 2's"
+        );
+
+        assert!(
+            tail.lines()
+                .any(|l| l.starts_with("[ci-node] step s4: ") && l.contains(".ci-claude-config")),
+            "step 4 failed without saying it could not make its empty config dir"
+        );
+        assert!(
+            out4.is_empty(),
+            "step 4 ran although no empty config dir could be made: {out4:?}"
+        );
+    }
+
+    /// The scrub's order, observed on the built command through the production
+    /// fn both spawn paths call: every removal reads `None`, except
+    /// `CLAUDE_CONFIG_DIR`, which `envs` sets AFTER the removals, so the step
+    /// gets the pinned directory rather than nothing.
+    #[test]
+    fn apply_step_env_removes_before_it_sets_so_the_pinned_config_dir_survives() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pinned = tmp
+            .path()
+            .join(".ci-claude-config")
+            .to_string_lossy()
+            .into_owned();
+        let removals = [
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CONFIG_DIR",
+            "QONTINUI_OPERATOR2_PASSWORD",
+            "DOCS_EVAL_MODEL_CMD",
+        ]
+        .map(OsString::from);
+        let envs = vec![
+            ("CI".to_string(), "true".to_string()),
+            ("CLAUDE_CONFIG_DIR".to_string(), pinned.clone()),
+        ];
+        // Inside the lock: cgroup discovery reads `QONTINUI_CI_CGROUP_ROOT`,
+        // and the job holds `ci_node`'s process-wide dispatch counts, which a
+        // slice-telemetry test holding the lock must not see move, so it is
+        // made and dropped while the lock is held.
+        let env = crate::test_env::env_lock();
+        let ci_job = CiJob::create("apply-step-env-test");
+        let mut cmd = build_step_command("probe", &[]);
+        apply_step_env(&mut cmd, tmp.path(), &removals, &envs, &ci_job);
+        drop(ci_job);
+        drop(env);
+
+        let set: std::collections::HashMap<String, Option<String>> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        for name in [
+            "ANTHROPIC_API_KEY",
+            "QONTINUI_OPERATOR2_PASSWORD",
+            "DOCS_EVAL_MODEL_CMD",
+        ] {
+            assert_eq!(
+                set.get(name),
+                Some(&None),
+                "{name} must be removed: {set:?}"
+            );
+        }
+        assert_eq!(
+            set.get("CLAUDE_CONFIG_DIR"),
+            Some(&Some(pinned)),
+            "the pinned config dir must be SET after the removals"
+        );
+        assert_eq!(set.get("CI"), Some(&Some("true".to_string())));
+    }
+
+    /// The fn a line of `executor.rs` defines, if it defines one:
+    /// `[pub(crate) ][async ]fn <ident>`. Anything else in front of `fn` (an
+    /// expression, a string, an attribute) is not a definition.
+    fn fn_defined_on(code: &str) -> Option<String> {
+        let mut words = code.split_whitespace().skip_while(|word| {
+            matches!(
+                *word,
+                "pub" | "pub(crate)" | "pub(super)" | "async" | "const" | "unsafe"
+            )
+        });
+        if words.next()? != "fn" {
+            return None;
+        }
+        let ident: String = words
+            .next()?
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        (!ident.is_empty()).then_some(ident)
+    }
+
+    /// The callee path of every call on one line of CODE (comments removed,
+    /// literals emptied): the run of identifier characters and `::` just before
+    /// each `(`, such as `crate::process_helpers::tokio_no_window`. A turbofish
+    /// is skipped first, so `new::<&str>(` is a call of `new`. A `(` after
+    /// anything else (a space, `)`, `!`, a `>` that closes no turbofish) names
+    /// no callee, and a definition (`fn x(`) is not a call.
+    fn callees(code: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for (at, c) in code.char_indices() {
+            if c != '(' {
+                continue;
+            }
+            let before = code.get(..at).unwrap_or("");
+            let before = before
+                .strip_suffix('>')
+                .and_then(|b| b.rfind("::<"))
+                .and_then(|i| before.get(..i))
+                .unwrap_or(before);
+            let Some(start) = before
+                .char_indices()
+                .rev()
+                .take_while(|(_, ch)| ch.is_alphanumeric() || *ch == '_' || *ch == ':')
+                .last()
+                .map(|(i, _)| i)
+            else {
+                continue;
+            };
+            let path = before.get(start..).unwrap_or("").trim_start_matches(':');
+            let lead = before.get(..start).unwrap_or("").trim_end();
+            let is_definition = lead
+                .strip_suffix("fn")
+                .is_some_and(|rest| !rest.ends_with(|ch: char| ch.is_alphanumeric() || ch == '_'));
+            if !path.is_empty() && !is_definition {
+                out.push(path.to_string());
+            }
+        }
+        out
+    }
+
+    /// Every call in `src`, as `(enclosing fn, callee path)`, in order. The
+    /// text is read as CODE only, through the lexer the lib's own source
+    /// guards use (`process_helpers::code_lexer`): comments are removed and
+    /// string and char literals emptied, with a block comment or a string
+    /// carried from one line into the next, so a mention in a comment or a
+    /// literal is never a call. The enclosing fn is the nearest `fn` defined
+    /// above the call, which holds in this file: it defines no fn inside
+    /// another.
+    fn calls_in(src: &str) -> Vec<(String, String)> {
+        use crate::process_helpers::code_lexer::{code_only_from, Lex};
+        let mut lex = Lex::Code;
+        let mut current = String::new();
+        let mut out = Vec::new();
+        for line in src.lines() {
+            let code = code_only_from(line, &mut lex);
+            if let Some(defined) = fn_defined_on(code.trim_start()) {
+                current = defined;
+            }
+            out.extend(
+                callees(&code)
+                    .into_iter()
+                    .map(|callee| (current.clone(), callee)),
+            );
+        }
+        out
+    }
+
+    /// Whether `path` names `tail`, by whole segments: `run_step` and
+    /// `super::run_step` do, `run_step_unpinned` does not.
+    fn path_is(path: &str, tail: &str) -> bool {
+        path == tail || path.ends_with(&format!("::{tail}"))
+    }
+
+    /// The enclosing fn of every call of `tail` in `src`'s code, in order.
+    fn calls_of(src: &str, tail: &str) -> Vec<String> {
+        calls_in(src)
+            .into_iter()
+            .filter(|(_, callee)| path_is(callee, tail))
+            .map(|(enclosing, _)| enclosing)
+            .collect()
+    }
+
+    /// The process builders and runners `process_helpers` exports, by name, so
+    /// an unqualified call after a `use` is caught too. A trailing `*` is a
+    /// prefix.
+    // Mirrors `process_helpers`' exports BY HAND: update it whenever they change.
+    const PROCESS_HELPERS_BUILDERS: [&str; 9] = [
+        "no_window",
+        "tokio_no_window",
+        "cmd_no_window",
+        "tokio_cmd_no_window",
+        "scrubbed_git",
+        "start_detached",
+        "run_with_timeout*",
+        "output_with_timeout*",
+        "run_probe*",
+    ];
+
+    /// Whether a callee path, as a DIRECT call by path, constructs or runs a
+    /// process: `Command::new`, any call through `process_helpers::`, or a
+    /// `process_helpers` builder by name.
+    fn builds_a_process(callee: &str) -> bool {
+        let name = callee.rsplit("::").next().unwrap_or(callee);
+        path_is(callee, "Command::new")
+            || callee.contains("process_helpers::")
+            || PROCESS_HELPERS_BUILDERS
+                .iter()
+                .any(|builder| match builder.strip_suffix('*') {
+                    Some(prefix) => name.starts_with(prefix),
+                    None => name == *builder,
+                })
+    }
+
+    /// THE STEP PATH IS ONE PATH, in this file. The end-to-end test enters at
+    /// `run_step`; this pins, for the production code of this file only, that
+    /// `run_dispatch` reaches a step only through it, that `run_step` spawns
+    /// only through `spawn_step_child`, that both of `spawn_step_child`'s
+    /// commands get the scrub through `apply_step_env`, that
+    /// `build_step_command` has no other caller in this file, and that the
+    /// only process constructed in this file by a direct call by path is
+    /// `build_step_command`'s `process_helpers::tokio_no_window`: no
+    /// `Command::new`, no other call through `process_helpers::` and no other
+    /// `process_helpers` builder by name ([`PROCESS_HELPERS_BUILDERS`]). Calls
+    /// are found in code only, never in a comment or a literal, and a
+    /// turbofish is read through. A new caller, a wrapper or a second spawn
+    /// path in this file turns it red.
+    ///
+    /// Out of its reach: a constructor passed as a value
+    /// (`.map(Command::new)`), a `use … as` alias, a nested turbofish
+    /// (`Command::new::<Vec::<u8>>(`), a qualified-self call
+    /// (`<Command>::new(`), and processes run by helpers in OTHER modules this
+    /// file calls (`checkout`, `tools`, `canonical`, `tree_kill`). A step
+    /// spawned from another module is outside it too
+    /// (`env_agent/apply_versions.rs` has an unrelated `run_step`).
+    #[test]
+    fn the_step_path_is_run_dispatch_then_run_step_then_spawn_step_child() {
+        let (production, _) = include_str!("executor.rs")
+            .split_once("mod tests {")
+            .expect("executor.rs has a `mod tests {`");
+        assert_eq!(
+            calls_of(production, "run_step"),
+            ["run_dispatch"],
+            "run_step must be called exactly once, by run_dispatch"
+        );
+        assert_eq!(
+            calls_of(production, "spawn_step_child"),
+            ["run_step"],
+            "spawn_step_child must be called exactly once, by run_step"
+        );
+        assert_eq!(
+            calls_of(production, "apply_step_env"),
+            ["spawn_step_child", "spawn_step_child"],
+            "apply_step_env must be called exactly twice, both by spawn_step_child"
+        );
+        // And no step command is built anywhere else in this file, so none can
+        // bypass the scrub on its way to a spawn.
+        assert_eq!(
+            calls_of(production, "build_step_command"),
+            ["spawn_step_child", "spawn_step_child"],
+            "build_step_command must be called exactly twice, both by spawn_step_child"
+        );
+        let process_calls: Vec<String> = calls_in(production)
+            .into_iter()
+            .filter(|(_, callee)| builds_a_process(callee))
+            .map(|(enclosing, callee)| format!("{enclosing} -> {callee}"))
+            .collect();
+        assert_eq!(
+            process_calls,
+            ["build_step_command -> crate::process_helpers::tokio_no_window"],
+            "the only process this file constructs by a direct call by path must be \
+             build_step_command's, and this file calls through process_helpers only in \
+             build_step_command"
+        );
+    }
+
+    /// The scan itself, on synthetic source: the shapes it must catch and the
+    /// ones it must ignore, lookalike names among them. A regression in
+    /// `path_is`, the `process_helpers::` arm, the builder-name match (exact,
+    /// or a prefix on `*`), the turbofish skip, the definition check or the
+    /// lexer turns THIS red, instead of quietly changing what the call-path
+    /// test above lets through.
+    #[test]
+    fn the_process_scan_catches_direct_calls_and_ignores_mentions() {
+        let src = r#"
+fn std_command() {
+    let _ = std::process::Command::new("sh");
+}
+fn tokio_command() {
+    let _ = tokio::process::Command::new("sh"); // Command::new( in a comment
+}
+fn turbofish_command() {
+    let _ = std::process::Command::new::<&str>("sh");
+}
+fn unqualified_builder() {
+    use crate::process_helpers::tokio_no_window;
+    let _ = tokio_no_window("sh");
+}
+fn prefixed_runner() {
+    let _ = run_with_timeout_detailed(cmd, limit);
+}
+fn qualified_other() {
+    let _ = crate::process_helpers::some_future_runner(x);
+}
+fn in_a_literal() {
+    let _ = "Command::new(";
+}
+fn in_a_block_comment() {
+    /* a comment over several lines
+       std::process::Command::new("sh")
+       still the comment */
+    let _ = 1;
+}
+fn lookalike() {
+    let _ = MyCommand::new();
+    let _ = my_tokio_no_window();
+}
+fn tokio_no_window(program: &str) {}
+"#;
+        let found: Vec<String> = calls_in(src)
+            .into_iter()
+            .filter(|(_, callee)| builds_a_process(callee))
+            .map(|(enclosing, callee)| format!("{enclosing} -> {callee}"))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                "std_command -> std::process::Command::new",
+                "tokio_command -> tokio::process::Command::new",
+                "turbofish_command -> std::process::Command::new",
+                "unqualified_builder -> tokio_no_window",
+                "prefixed_runner -> run_with_timeout_detailed",
+                "qualified_other -> crate::process_helpers::some_future_runner",
+            ],
+            "the scan missed a direct call, or counted a comment, a literal, a definition or a \
+             lookalike name"
+        );
+    }
+
+    /// Run one step through `run_step` with a fresh fixture and a tail-only
+    /// sink, and return its outcome and the sink's tail. Tail-only, not a
+    /// dead-port sink: with no device JWT every dead-port POST waits out the
+    /// re-mint window. Since #2805 the flusher retries a failed POST once per
+    /// `FLUSH_INTERVAL` rather than once per line, but each retry, and the
+    /// final drain's two attempts, still pay that wait, so `finish()` would
+    /// take seconds per step that this test has no use for.
+    #[cfg(unix)]
+    async fn run_one_probe_step(dispatch_id: &str, step: CiStep) -> (StepOutcome, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let dispatch_root = super::super::checkout::ci_dispatch_root(root, dispatch_id);
+        let worktree =
+            super::super::checkout::ci_worktree_path(root, dispatch_id, "qontinui/qontinui-runner");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let dispatch_env = DispatchEnv::build(
+            1,
+            1,
+            &root.join(".ci-target").join("qontinui-runner"),
+            &[],
+            &[],
+        );
+        let cancel = CancellationToken::new();
+        let sink = ProgressSink::tail_only();
+        // Inside the lock: cgroup discovery reads `QONTINUI_CI_CGROUP_ROOT`,
+        // and the job holds `ci_node`'s process-wide dispatch counts (an
+        // uncontained run when it could not make a cgroup), which a
+        // slice-telemetry test holding the lock must not see move. So the job
+        // lives and is dropped inside the lock.
+        let env = crate::test_env::env_lock();
+        let ci_job = CiJob::create(dispatch_id);
+        let outcome = run_step(
+            &step,
+            &dispatch_env,
+            &dispatch_root,
+            0,
+            &worktree,
+            &ci_job,
+            &sink,
+            &cancel,
+        )
+        .await;
+        drop(ci_job);
+        drop(env);
+        let tail = sink.finish().await;
+        (outcome, tail)
+    }
+
+    /// Arming sentinel for the output pump: a line that is not valid UTF-8
+    /// shows in the log with U+FFFD in place of the bad byte, and every line
+    /// after it is still logged. The old `lines()` pump ended at the first
+    /// such line and dropped the rest of the step's output silently.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_non_utf8_line_shows_as_a_replacement_character_and_the_log_goes_on() {
+        let (outcome, tail) = run_one_probe_step(
+            "non-utf8-line",
+            probe_step(
+                "bytes",
+                vec!["printf".to_string(), r"a\n\377\nb\n".to_string()],
+            ),
+        )
+        .await;
+        let out = step_out(&tail, "bytes");
+        assert_eq!(outcome, StepOutcome::Success, "{tail}");
+        assert_eq!(out, ["a", "\u{FFFD}", "b"], "{tail}");
+    }
+
+    /// A step that keeps writing past a non-UTF-8 line, well beyond the pipe
+    /// buffer, still succeeds and its log runs to its last line: the pump keeps
+    /// draining the pipe, so the writer is never cut off by a closed read end
+    /// (the old pump's exit was SIGPIPE, 141). The tail ring keeps only
+    /// `LOG_TAIL_CAP_BYTES`, so neither the line count nor the first line is
+    /// asserted.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_step_writing_past_a_non_utf8_line_succeeds_to_its_last_line() {
+        let (outcome, tail) = run_one_probe_step(
+            "non-utf8-flood",
+            probe_step(
+                "flood",
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    r"printf 'x\377\n'; seq 1 40000".to_string(),
+                ],
+            ),
+        )
+        .await;
+        let out = step_out(&tail, "flood");
+        let ci_node: Vec<&str> = tail
+            .lines()
+            .filter(|l| l.starts_with("[ci-node]"))
+            .collect();
+        assert_eq!(
+            outcome,
+            StepOutcome::Success,
+            "last: {:?}, ci-node lines: {ci_node:#?}",
+            out.last()
+        );
+        assert_eq!(
+            out.last().map(String::as_str),
+            Some("40000"),
+            "{ci_node:#?}"
+        );
+        assert!(
+            tail.lines().all(|l| !l.contains("read error")),
+            "{ci_node:#?}"
+        );
     }
 }

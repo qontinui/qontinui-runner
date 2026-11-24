@@ -73,6 +73,14 @@ export interface GridSnapshot {
    * runner build; optional so an older build (no field) degrades to `false`.
    */
   alt_screen?: boolean;
+  /**
+   * Exclusive end, in the session's absolute output stream, of the bytes the
+   * snapshot reflects (`Grid::stream_end`). A pane that paints the snapshot
+   * already shows every stream byte before it, so it must not replay them.
+   * Optional: a runner build that predates it omits it, and then the
+   * reconnect path does not paint (it replays from the ring instead).
+   */
+  stream_offset?: number;
   /** Row-major: cells[row * cols + col]. Length === rows * cols. */
   cells: GridCell[];
 }

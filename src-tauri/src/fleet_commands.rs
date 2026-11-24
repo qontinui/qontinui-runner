@@ -26,25 +26,16 @@
 //! ## Every written body states its provenance
 //!
 //! A body is written with ONE generated key at line 2 of its YAML frontmatter
-//! (see [`with_provenance`]):
+//! (see [`crate::provenance::with_provenance`]):
 //!
 //! ```text
 //! qontinui-provenance: source=<builtin|served|disk_cache> canonical=qontinui-claude-config:.claude/commands/<name>.md blob=<sha1> runner_build=<RUNNER_BUILD_ID>
 //! ```
 //!
-//! `blob` is the git blob id of the body bytes with the key excluded. For a
-//! builtin it equals `git hash-object` of the VENDORED file this build
-//! embedded — and of the canonical file only while the two are in byte parity.
-//! After a fetch, `git -C qontinui-claude-config log --all --find-object=<blob>
-//! -- .claude/commands/<name>.md` separates a stale copy (the blob is an older
-//! canonical version) from a fork (no version of that file ever held it).
-//! A provisioned file is checkable on its own — no sibling checkout, no runner —
-//! by [`provenance_consistent`], or from a shell: when line 3 is `---` (a
-//! prepended block) `tail -n +4 <file> | git hash-object --stdin`, otherwise
-//! (the key was inserted into existing frontmatter) `sed 2d <file> | git
-//! hash-object --stdin`; with no git at all, the sha1 of
-//! `blob <byte-length>\0<body>`. The key is a write-time transform only: the
-//! embedded consts and the files beside this module never carry it.
+//! The grammar, the hash rule and the strip rule live in [`crate::provenance`],
+//! shared with the skill provisioner (`crate::fleet_skills`), which stamps each
+//! `SKILL.md` with the same key. What `blob` proves and how to check a file
+//! from a shell are documented there.
 //!
 //! Adding a command is adding a `.md` file next to them plus one line in
 //! [`FLEET_COMMANDS`]. Nothing in this module or its consumers may assume the
@@ -54,7 +45,9 @@
 //!
 //! What is embedded here is the **default**. A signed-in account may override
 //! any command by name, and `crate::agent_commands` resolves
-//! `fresh fetch → disk cache → embedded default` before anything is written.
+//! `account override (fresh fetch, else disk cache) → canonical
+//! qontinui-claude-config@origin/main (crate::canonical_corpus) → embedded
+//! default` before anything is written.
 //! Because the default is compiled in, an unauthenticated, offline, or
 //! first-run device still gets a working command set and the network is never
 //! on the critical path.
@@ -67,8 +60,12 @@ use std::path::Path;
 
 use tracing::{info, warn};
 
-use crate::agent_commands::{AgentCommandRegistry, CommandSource};
+use crate::agent_commands::AgentCommandRegistry;
 use crate::capability_manifest::{self, CapabilityObservation, ProvisionReport};
+use crate::provenance::{
+    command_canonical, provenance_consistent, strip_provenance, with_provenance, ProvenanceError,
+    ProvenanceLine,
+};
 
 /// `/vet-plan` procedure, bundled into the binary. Vendored from
 /// qontinui-claude-config `.claude/commands/vet-plan.md` (canonical) — edit it
@@ -200,6 +197,14 @@ const CREATE_PLAN: &str = include_str!("fleet_commands/create-plan.md");
 /// qontinui-claude-config `.claude/commands/find-debt.md` (canonical) — edit it
 /// there, then re-vendor.
 const FIND_DEBT: &str = include_str!("fleet_commands/find-debt.md");
+
+/// `/finish-session` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/finish-session.md` (canonical) — edit it
+/// there, then re-vendor. Bundled because the bundled `/unattended` closes every
+/// session with it: a dispatched session on a device with no fleet `.claude`
+/// tree otherwise has no way to record `session_status=finished` (plan
+/// `2026-10-29-bundle-finish-session-so-every-dispatched-session-can-record-finished`).
+const FINISH_SESSION: &str = include_str!("fleet_commands/finish-session.md");
 
 /// `/fix` procedure, bundled into the binary. Vendored from
 /// qontinui-claude-config `.claude/commands/fix.md` (canonical) — edit it
@@ -367,6 +372,7 @@ pub(crate) const FLEET_COMMANDS: &[(&str, &str)] = &[
     ("code-fix", CODE_FIX),
     ("create-plan", CREATE_PLAN),
     ("find-debt", FIND_DEBT),
+    ("finish-session", FINISH_SESSION),
     ("fix", FIX),
     ("implement-phase", IMPLEMENT_PHASE),
     ("improve-all", IMPROVE_ALL),
@@ -396,165 +402,6 @@ pub(crate) const FLEET_COMMANDS: &[(&str, &str)] = &[
     ("vet-imp", VET_IMP),
     ("workflow-runs", WORKFLOW_RUNS),
 ];
-
-/// The YAML frontmatter key [`with_provenance`] writes at line 2 of every
-/// provisioned command file.
-pub(crate) const PROVENANCE_KEY: &str = "qontinui-provenance:";
-
-/// The build identity stamped into `runner_build=` — the same compile-time
-/// value `/health` reports as `buildId`.
-const RUNNER_BUILD: &str = env!("RUNNER_BUILD_ID");
-
-/// The parsed fields of one `qontinui-provenance:` line.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ProvenanceLine {
-    /// `builtin` / `served` / `disk_cache` — [`CommandSource::as_str`].
-    pub source: String,
-    /// `qontinui-claude-config:.claude/commands/<name>.md`.
-    pub canonical: String,
-    /// Lowercase 40-hex git blob id of the body, provenance excluded.
-    pub blob: String,
-    /// The `RUNNER_BUILD_ID` of the binary that wrote the file.
-    pub runner_build: String,
-}
-
-impl ProvenanceLine {
-    /// Parse the text after [`PROVENANCE_KEY`]. `None` unless all four fields
-    /// are present.
-    fn parse(value: &str) -> Option<Self> {
-        let (mut source, mut canonical, mut blob, mut runner_build) = (None, None, None, None);
-        for token in value.split_whitespace() {
-            let (k, v) = token.split_once('=')?;
-            let slot = match k {
-                "source" => &mut source,
-                "canonical" => &mut canonical,
-                "blob" => &mut blob,
-                "runner_build" => &mut runner_build,
-                _ => continue,
-            };
-            *slot = Some(v.to_string());
-        }
-        Some(Self {
-            source: source?,
-            canonical: canonical?,
-            blob: blob?,
-            runner_build: runner_build?,
-        })
-    }
-}
-
-/// Why [`provenance_consistent`] refused a file.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ProvenanceError {
-    /// No well-formed `qontinui-provenance:` line at line 2 of a frontmatter
-    /// block — the file carries no claim to check.
-    Missing,
-    /// The body no longer hashes to the blob the line recorded: it was edited
-    /// after it was written, or the line was copied onto another body.
-    BlobMismatch { recorded: String, actual: String },
-}
-
-/// Git blob id (`git hash-object`) of `bytes`, lowercase 40-hex.
-fn git_blob_id(bytes: &[u8]) -> String {
-    // Hashing an in-memory buffer cannot fail for the Blob type; the fallback
-    // keeps this total rather than panicking inside a fail-soft provisioner.
-    git2::Oid::hash_object(git2::ObjectType::Blob, bytes)
-        .map(|oid| oid.to_string())
-        .unwrap_or_default()
-}
-
-/// The content of a line with its terminator (`\n` or `\r\n`) removed.
-fn line_content(line: &str) -> &str {
-    line.strip_suffix('\n')
-        .map(|l| l.strip_suffix('\r').unwrap_or(l))
-        .unwrap_or(line)
-}
-
-/// `text` split into its first line (terminator included) and the remainder.
-fn split_first_line(text: &str) -> (&str, &str) {
-    match text.find('\n') {
-        Some(i) => text.split_at(i + 1),
-        None => (text, ""),
-    }
-}
-
-/// `body` with ONE generated `qontinui-provenance:` key placed at line 2, in
-/// YAML frontmatter.
-///
-/// Placement, because YAML frontmatter is recognised only when it starts at
-/// line 1 (the convention Claude Code's command loader follows) — nothing is ever put above an existing `---`:
-/// - a body that opens a NON-EMPTY frontmatter block (`---\n` or `---\r\n`
-///   followed by anything but a closing `---`) gets the key inserted as the
-///   first line inside it, with the opener's own line ending;
-/// - every other body gets a new `---\n<key>\n---\n` block prepended and is
-///   otherwise unchanged. That includes a body opening an EMPTY block
-///   (`---\n---\n`): inserting into it would produce bytes identical to a
-///   prepended block over the empty block's remainder, and
-///   [`strip_provenance`] could not tell the two apart.
-///
-/// `blob` is computed over `body` BEFORE the key is added, so it equals
-/// `git hash-object` of the vendored file for an unmodified builtin (and of the
-/// canonical file only while the two are in byte parity).
-pub(crate) fn with_provenance(name: &str, body: &str, source: CommandSource) -> String {
-    let key = format!(
-        "{PROVENANCE_KEY} source={} canonical=qontinui-claude-config:.claude/commands/{name}.md \
-         blob={} runner_build={RUNNER_BUILD}",
-        source.as_str(),
-        git_blob_id(body.as_bytes()),
-    );
-    let (first, rest) = split_first_line(body);
-    let opens_block = first == "---\n" || first == "---\r\n";
-    let (second, _) = split_first_line(rest);
-    if opens_block && line_content(second) != "---" {
-        let eol = if first.ends_with("\r\n") {
-            "\r\n"
-        } else {
-            "\n"
-        };
-        format!("{first}{key}{eol}{rest}")
-    } else {
-        format!("---\n{key}\n---\n{body}")
-    }
-}
-
-/// Undo [`with_provenance`]: remove exactly the one `qontinui-provenance:` line
-/// at line 2 — and the frontmatter block around it when that block is then
-/// empty (the one `with_provenance` created) — returning the parsed line and
-/// the original body, byte-for-byte. `None` when line 2 is not a well-formed
-/// provenance line inside a frontmatter opener.
-pub(crate) fn strip_provenance(text: &str) -> Option<(ProvenanceLine, String)> {
-    let (first, rest) = split_first_line(text);
-    if first != "---\n" && first != "---\r\n" {
-        return None;
-    }
-    let (key_line, after_key) = split_first_line(rest);
-    let value = line_content(key_line).strip_prefix(PROVENANCE_KEY)?;
-    let parsed = ProvenanceLine::parse(value)?;
-    let (third, after_third) = split_first_line(after_key);
-    let body = if line_content(third) == "---" {
-        // The block holds nothing but the key: `with_provenance` created it.
-        after_third.to_string()
-    } else {
-        format!("{first}{after_key}")
-    };
-    Some((parsed, body))
-}
-
-/// Check a provisioned command file against its own provenance line: strip the
-/// line, re-hash what remains, and compare with the recorded `blob`. Needs
-/// nothing but the file — no sibling checkout, no runner.
-pub(crate) fn provenance_consistent(text: &str) -> Result<ProvenanceLine, ProvenanceError> {
-    let (line, body) = strip_provenance(text).ok_or(ProvenanceError::Missing)?;
-    let actual = git_blob_id(body.as_bytes());
-    if actual == line.blob {
-        Ok(line)
-    } else {
-        Err(ProvenanceError::BlobMismatch {
-            recorded: line.blob,
-            actual,
-        })
-    }
-}
 
 /// What a destination that ALREADY EXISTS says about itself, read back from its
 /// own provenance line just before [`provision_fleet_commands_into`] overwrites
@@ -620,6 +467,7 @@ fn classify_existing(dst: &Path) -> Option<Existing> {
                     canonical: String::new(),
                     blob: String::new(),
                     runner_build: String::new(),
+                    canonical_sha: None,
                 });
             Some(Existing::Edited(Box::new(EditedFile {
                 source: line.source,
@@ -648,9 +496,9 @@ fn classify_existing(dst: &Path) -> Option<Existing> {
 /// broken cache each degrade one step and warn, never propagate.
 ///
 /// Idempotent, and existing files are overwritten — EXCEPT where the
-/// destination is already tracked by the enclosing git repository, which is
-/// skipped (see [`provision_fleet_commands_into`] and
-/// [`crate::provision_guard`]).
+/// destination is already tracked by the enclosing git repository, or the
+/// tracked-file probe could not answer inside one; both are skipped (see
+/// [`provision_fleet_commands_into`] and [`crate::provision_guard`]).
 pub(crate) fn provision_fleet_commands_for_session(workdir: &str) {
     let registry = crate::agent_commands::resolve_registry();
     let commands_dir = Path::new(workdir).join(".claude").join("commands");
@@ -711,26 +559,37 @@ pub(crate) fn provision_fleet_commands_for_session(workdir: &str) {
 /// used to replace the repo's own content with the binary's embedded copy and
 /// leave the tree dirty.
 ///
-/// **This is not only the narrow two-file case.** `qontinui-dev-notes` tracks
-/// exactly `vet-plan.md` + `implement-plan.md`, but `qontinui-claude-config`
-/// tracks all seven — so a session spawned there provisions ZERO commands, and
-/// a tracked file outranks an account override. The measured table, and why
-/// that is the intended outcome, are in [`crate::provision_guard`]'s module doc.
+/// **This is not a narrow case.** `qontinui-claude-config` tracks all of them —
+/// so a session spawned there provisions ZERO commands, and a tracked file
+/// outranks an account override. Why that is the intended outcome is in
+/// [`crate::provision_guard`]'s module doc.
 ///
 /// **Fail-soft, and this is a hard requirement.** The tracked probe
 /// ([`crate::provision_guard::TrackedPaths::probe`]) resolves EVERY failure — an
 /// unreadable or absent git dir, no `git` binary, any non-zero exit, and a `git`
-/// that hangs — to "nothing tracked", i.e. to writing exactly as before. A
-/// skipped write must never become an aborted spawn, and a failed or slow probe
-/// must never become one either. The probe runs ONCE per pass, not once per
-/// file, so this costs one process spawn rather than seven.
-fn provision_fleet_commands_into(
+/// that hangs — to "nothing tracked", i.e. to writing exactly as before, with ONE
+/// narrowing: when that failure happens inside a repository (a `.git` at or
+/// above the dir), only ABSENT files are written and existing ones are kept
+/// (see that module's "UNKNOWN inside a repository" section). A skipped write
+/// must never become an aborted spawn, and a failed or slow probe must never
+/// become one either. The probe runs ONCE per pass, not once per
+/// file, so this costs one process spawn rather than one per command.
+pub(crate) fn provision_fleet_commands_into(
     commands_dir: &Path,
     registry: &AgentCommandRegistry,
 ) -> std::io::Result<ProvisionReport> {
     std::fs::create_dir_all(commands_dir)?;
-    let tracked = crate::provision_guard::TrackedPaths::probe(commands_dir);
     let resolved = registry.all();
+    // Versioned iff the repo tracks a BUILTIN command this binary would write,
+    // never merely "anything under .claude/commands" (provision_guard module
+    // doc). Builtins only: they are the roster the skip is confined to, and an
+    // account-only command is a path no commit of the repo will ever add.
+    let tracked = crate::provision_guard::TrackedPaths::probe(commands_dir).versioning(
+        resolved
+            .iter()
+            .filter(|c| registry.is_builtin(&c.name))
+            .map(|c| std::path::PathBuf::from(c.file_name())),
+    );
     // The BODIES are the embedded defaults unless an override replaced one; the
     // rung of the account layer itself is the separate `agent_commands_registry`
     // row, which `provision_fleet_commands_for_session` records.
@@ -741,17 +600,20 @@ fn provision_fleet_commands_into(
     )
     .with_destination(commands_dir.display().to_string());
     let mut edited = 0usize;
+    // What this pass actually wrote, relative to `commands_dir`, so exactly
+    // those paths (never a tracked one) are excluded from `git status` below.
+    let mut written: Vec<std::path::PathBuf> = Vec::new();
     for command in &resolved {
         let file_name = command.file_name();
         let dst = commands_dir.join(&file_name);
-        if tracked.should_skip(&dst, Path::new(&file_name)) {
+        if let Some(reason) = tracked.skip_reason(&dst, Path::new(&file_name)) {
             info!(
-                "fleet_commands: skipping {} — it is tracked by the enclosing git \
-                 repository, and overwriting it would silently replace that repo's \
-                 own content and dirty its tree",
-                dst.display()
+                "fleet_commands: skipping {} — {}; overwriting it could silently \
+                 replace the enclosing repo's own content and dirty its tree",
+                dst.display(),
+                reason.describe()
             );
-            out.skip(file_name, capability_manifest::SkipReason::GitTracked);
+            out.skip(file_name, reason);
             continue;
         }
         // The write below is still unconditional — this reads the OUTGOING file
@@ -789,15 +651,31 @@ fn provision_fleet_commands_into(
         }
         std::fs::write(
             &dst,
-            with_provenance(&command.name, &command.body, command.source),
+            with_provenance(
+                &command_canonical(&command.name),
+                &command.body,
+                command.source.as_str(),
+                command.canonical.as_ref().map(|c| c.short()),
+            ),
         )?;
         out.record_written();
+        written.push(std::path::PathBuf::from(&file_name));
     }
+    // Keep what this pass wrote out of the checkout's `git status`, so a
+    // session cwd that is a git checkout does not read dirty (see
+    // `crate::provision_exclude`). Best-effort: never fails the pass.
+    crate::provision_exclude::exclude_written_paths(
+        "fleet_commands",
+        commands_dir,
+        &written,
+        &tracked,
+    );
     // Built after the loop rather than at construction so it can carry the
     // read-back count; a pass that clobbered nobody's edits reads as before.
     let mut detail = format!(
-        "{} embedded default(s), {} account override(s)",
+        "{} embedded default(s), {} canonical body(ies), {} account override(s)",
         registry.builtin_count(),
+        registry.canonical_count(),
         registry.override_count()
     );
     if edited > 0 {
@@ -817,6 +695,8 @@ fn provision_fleet_commands_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_commands::CommandSource;
+    use crate::provenance::{git_blob_id, PROVENANCE_KEY, RUNNER_BUILD};
 
     #[test]
     fn provisions_every_embedded_command_into_dir() {
@@ -922,6 +802,161 @@ mod tests {
         assert_ne!(on_disk, default_body);
     }
 
+    /// A fresh checkout used as a session cwd must not read dirty after a
+    /// provisioning pass: every command written gets its own anchored line in
+    /// the repo's `info/exclude` (never a blanket `.claude/commands/`), and a
+    /// second pass leaves that file byte-identical.
+    #[test]
+    fn provisioned_commands_do_not_dirty_the_checkout() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let commands_dir = tmp.path().join(".claude").join("commands");
+        crate::provision_guard::test_support::git_init(tmp.path());
+
+        let registry = AgentCommandRegistry::new();
+        let out = provision_fleet_commands_into(&commands_dir, &registry).expect("provision");
+        assert_eq!(out.written, FLEET_COMMANDS.len());
+        let o = crate::process_helpers::no_window("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["status", "--porcelain", "--untracked-files=all"])
+            .output()
+            .expect("git status");
+        assert!(o.status.success());
+        assert_eq!(
+            String::from_utf8(o.stdout).unwrap(),
+            "",
+            "nothing reads untracked"
+        );
+
+        let exclude = tmp.path().join(".git").join("info").join("exclude");
+        let first = std::fs::read_to_string(&exclude).unwrap();
+        for (name, _) in FLEET_COMMANDS {
+            assert!(
+                first
+                    .lines()
+                    .any(|l| l == format!("/.claude/commands/{name}.md")),
+                "{name} has its own line"
+            );
+        }
+        assert!(!first.lines().any(|l| l.trim() == "/.claude/commands/"));
+        provision_fleet_commands_into(&commands_dir, &registry).expect("provision again");
+        assert_eq!(std::fs::read_to_string(&exclude).unwrap(), first);
+    }
+
+    /// A command excluded by one pass whose directory the repository then
+    /// starts versioning is HELD BACK (`RootVersioned`) by the next pass, and
+    /// that pass drops its stale exclude line — otherwise the line would hide a
+    /// file a person later creates at that path. A person's own line outside
+    /// the runner's marker block naming the same path is never touched.
+    #[test]
+    fn a_held_back_command_loses_its_exclude_line() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let commands_dir = tmp.path().join(".claude").join("commands");
+        crate::provision_guard::test_support::git_init(tmp.path());
+        let registry = AgentCommandRegistry::new();
+        provision_fleet_commands_into(&commands_dir, &registry).expect("first pass");
+
+        let (vendored, _) = FLEET_COMMANDS[0];
+        let (held, _) = FLEET_COMMANDS[1];
+        let held_line = format!("/.claude/commands/{held}.md");
+        let exclude = tmp.path().join(".git").join("info").join("exclude");
+        let first = std::fs::read_to_string(&exclude).unwrap();
+        assert!(first.lines().any(|l| l == held_line), "{first}");
+        // A person's own line naming the same path, ABOVE the runner's block.
+        std::fs::write(&exclude, format!("# mine\n{held_line}\n{first}")).unwrap();
+
+        // The repository starts versioning the commands dir: it stages one
+        // builtin, and `held` is not on disk (upstream has not delivered it).
+        let git = |args: &[&str]| {
+            let ok = crate::process_helpers::no_window("git")
+                .arg("-C")
+                .arg(tmp.path())
+                .args(args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("run git")
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["add", "-f", &format!(".claude/commands/{vendored}.md")]);
+        std::fs::remove_file(commands_dir.join(format!("{held}.md"))).unwrap();
+
+        let out = provision_fleet_commands_into(&commands_dir, &registry).expect("second pass");
+        let held_skip = out
+            .skipped
+            .iter()
+            .find(|s| s.unit == format!("{held}.md"))
+            .expect("the absent builtin is held back");
+        assert_eq!(
+            held_skip.reason,
+            capability_manifest::SkipReason::RootVersioned
+        );
+
+        let text = std::fs::read_to_string(&exclude).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        let held_positions: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| **l == held_line)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            held_positions,
+            vec![1],
+            "only the person's line survives: {text}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|l| *l == format!("/.claude/commands/{vendored}.md")),
+            "the now-tracked command's line is dropped too: {text}"
+        );
+        // Every command the second pass still wrote keeps its line, so the
+        // prune is not a wipe, and nothing but the staged builtin shows.
+        for (name, _) in &FLEET_COMMANDS[2..] {
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| *l == format!("/.claude/commands/{name}.md")),
+                "{name} keeps its line: {text}"
+            );
+        }
+        let porcelain = |dir: &std::path::Path| {
+            let o = crate::process_helpers::no_window("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["status", "--porcelain", "--untracked-files=all"])
+                .output()
+                .expect("git status");
+            String::from_utf8(o.stdout).unwrap()
+        };
+        assert_eq!(
+            porcelain(tmp.path()),
+            format!("A  .claude/commands/{vendored}.md\n"),
+            "only the staged builtin shows"
+        );
+        // Remove the person's line: a file they now create at the held path
+        // is visible to `git status`, because no runner line hides it.
+        std::fs::write(
+            &exclude,
+            text.replacen(&format!("# mine\n{held_line}\n"), "", 1),
+        )
+        .unwrap();
+        std::fs::write(commands_dir.join(format!("{held}.md")), b"mine\n").unwrap();
+        let o = crate::process_helpers::no_window("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["status", "--porcelain", "--untracked-files=all"])
+            .output()
+            .expect("git status");
+        let status = String::from_utf8(o.stdout).unwrap();
+        assert!(
+            status.contains(&format!("?? .claude/commands/{held}.md")),
+            "{status}"
+        );
+    }
+
     /// A destination that is TRACKED by the enclosing git repository must be
     /// left alone. `qontinui-claude-config` and `qontinui-dev-notes` both track
     /// exactly `.claude/commands/vet-plan.md` and `implement-plan.md`; spawning
@@ -943,25 +978,202 @@ mod tests {
         let registry = AgentCommandRegistry::new();
         let out = provision_fleet_commands_into(&commands_dir, &registry).expect("provision");
 
-        assert_eq!(out.skipped.len(), 1, "the tracked file should be skipped");
         // The REASON is the deliverable: a bare count is the same unreadable
         // signal the `warn!` this report replaces already was.
+        let tracked_skip = out
+            .skipped
+            .iter()
+            .find(|s| s.unit == format!("{tracked_name}.md"))
+            .expect("the tracked file is skipped");
         assert_eq!(
-            out.skipped[0].reason,
+            tracked_skip.reason,
             crate::capability_manifest::SkipReason::GitTracked
         );
-        assert_eq!(out.skipped[0].unit, format!("{tracked_name}.md"));
         assert!(out.is_degraded(), "a skipped unit means the pass degraded");
-        assert_eq!(
-            out.written,
-            FLEET_COMMANDS.len() - 1,
-            "every OTHER command should still be written"
-        );
+        // The repo now VERSIONS `.claude/commands`, so every OTHER command is
+        // absent and untracked there and is not created (plan
+        // 2026-11-09-a-provisioned-copy-of-an-upstream-added-file-wedges-the-served-checkout-fast-forward
+        // Phase 2) — see `an_upstream_added_command_is_not_created_in_a_root_versioned_checkout`.
+        assert_eq!(out.skipped.len(), FLEET_COMMANDS.len());
+        assert_eq!(out.written, 0);
         assert_eq!(
             std::fs::read_to_string(&tracked).unwrap(),
             "# the repo's own body\n",
             "a tracked destination must keep the repo's content, not the embedded copy"
         );
+    }
+
+    /// Entering where a spawn enters: inside a repository whose git cannot be
+    /// asked (a linked-worktree `.git` FILE pointing at a gitdir that does not
+    /// exist), an EXISTING command file is kept with
+    /// [`SkipReason::ProbeUnknownInRepo`] and every absent one is still written.
+    /// Before plan `2026-10-04-shared-checkouts-pull-deterministically` Phase 2
+    /// the failed probe read "nothing tracked" and the existing file was
+    /// overwritten.
+    ///
+    /// [`SkipReason::ProbeUnknownInRepo`]: crate::capability_manifest::SkipReason::ProbeUnknownInRepo
+    #[test]
+    fn an_unanswered_probe_inside_a_repo_keeps_existing_commands() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        crate::provision_guard::test_support::assert_not_in_any_repo(tmp.path());
+        std::fs::write(
+            tmp.path().join(".git"),
+            b"gitdir: /nonexistent/qontinui-fleet-commands-test\n",
+        )
+        .unwrap();
+        let commands_dir = tmp.path().join(".claude").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+
+        let (existing_name, _) = FLEET_COMMANDS[0];
+        let existing = commands_dir.join(format!("{existing_name}.md"));
+        std::fs::write(&existing, b"# a body git could not vouch for\n").unwrap();
+
+        let registry = AgentCommandRegistry::new();
+        let out = provision_fleet_commands_into(&commands_dir, &registry).expect("provision");
+
+        assert_eq!(out.skipped.len(), 1, "only the existing file is kept");
+        assert_eq!(
+            out.skipped[0].reason,
+            crate::capability_manifest::SkipReason::ProbeUnknownInRepo
+        );
+        assert_eq!(
+            std::fs::read_to_string(&existing).unwrap(),
+            "# a body git could not vouch for\n",
+            "an existing file must not be overwritten when git could not be asked"
+        );
+        assert_eq!(
+            out.written,
+            FLEET_COMMANDS.len() - 1,
+            "every absent command is still written"
+        );
+    }
+
+    /// Plan `2026-11-09-a-provisioned-copy-of-an-upstream-added-file-wedges-the-served-checkout-fast-forward`
+    /// Phase 2, entering where a session spawn enters: a STALE claude-config
+    /// checkout tracks every bundled command but one, which upstream added
+    /// after this checkout's HEAD. Writing that one as an untracked file is what
+    /// wedged the checkout's `git merge --ff-only` (git refuses an untracked file
+    /// at an incoming path even when its bytes are identical), so it must not
+    /// be created; a command the checkout tracks but the user deleted is still
+    /// written, as before.
+    #[test]
+    fn an_upstream_added_command_is_not_created_in_a_root_versioned_checkout() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let commands_dir = tmp.path().join(".claude").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        crate::provision_guard::test_support::git_init(tmp.path());
+
+        assert!(FLEET_COMMANDS.len() >= 3, "fixture needs three commands");
+        let (added, _) = FLEET_COMMANDS[0];
+        let (deleted, deleted_body) = FLEET_COMMANDS[1];
+        for (name, _) in &FLEET_COMMANDS[1..] {
+            let dst = commands_dir.join(format!("{name}.md"));
+            std::fs::write(&dst, format!("# repo body for {name}\n")).unwrap();
+            crate::provision_guard::test_support::git_add(tmp.path(), &dst);
+        }
+        std::fs::remove_file(commands_dir.join(format!("{deleted}.md"))).unwrap();
+
+        let out = provision_fleet_commands_into(&commands_dir, &AgentCommandRegistry::new())
+            .expect("provision");
+
+        assert!(
+            !commands_dir.join(format!("{added}.md")).exists(),
+            "an upstream-added command must not be created in a checkout that versions the tree"
+        );
+        assert!(
+            out.skipped.iter().any(|s| s.unit == format!("{added}.md")
+                && s.reason == crate::capability_manifest::SkipReason::RootVersioned),
+            "the skip is recorded as root_versioned, got {:?}",
+            out.skipped
+        );
+        assert_eq!(
+            strip_provenance(
+                &std::fs::read_to_string(commands_dir.join(format!("{deleted}.md"))).unwrap()
+            )
+            .expect("provenance line")
+            .1,
+            deleted_body,
+            "a tracked-but-deleted command is still written"
+        );
+        assert_eq!(out.written, 1, "only the tracked-but-deleted one");
+    }
+
+    /// The root-versioned skip is confined to BUILTIN commands: an account
+    /// command with no embedded counterpart is a path no commit of the repo
+    /// will ever add, so it is still written in a checkout that versions the
+    /// tree — while an absent builtin there is not.
+    #[test]
+    fn an_account_only_command_is_still_written_in_a_root_versioned_checkout() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let commands_dir = tmp.path().join(".claude").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        crate::provision_guard::test_support::git_init(tmp.path());
+
+        let (tracked_name, _) = FLEET_COMMANDS[0];
+        let (absent_builtin, _) = FLEET_COMMANDS[1];
+        let dst = commands_dir.join(format!("{tracked_name}.md"));
+        std::fs::write(&dst, b"# the repo's own body\n").unwrap();
+        crate::provision_guard::test_support::git_add(tmp.path(), &dst);
+
+        let novel = "account-only-procedure";
+        assert!(FLEET_COMMANDS.iter().all(|(n, _)| *n != novel));
+        let mut registry = AgentCommandRegistry::new();
+        registry.set_overrides(
+            vec![qontinui_types::agent_commands::AgentCommand {
+                id: "id-1".to_string(),
+                organization_id: Some("org-1".to_string()),
+                created_by_user_id: None,
+                name: novel.to_string(),
+                body: "# my own procedure\n".to_string(),
+                checksum: None,
+                is_shared: false,
+                current_version: 1,
+                created_at: "2026-11-09T00:00:00Z".to_string(),
+                updated_at: "2026-11-09T00:00:00Z".to_string(),
+            }],
+            crate::agent_commands::CommandSource::Served,
+        );
+
+        let out = provision_fleet_commands_into(&commands_dir, &registry).expect("provision");
+
+        assert_eq!(
+            strip_provenance(
+                &std::fs::read_to_string(commands_dir.join(format!("{novel}.md")))
+                    .expect("the account-only command is written")
+            )
+            .expect("provenance line")
+            .1,
+            "# my own procedure\n"
+        );
+        assert!(
+            !commands_dir.join(format!("{absent_builtin}.md")).exists(),
+            "an absent builtin is still withheld in a versioned checkout"
+        );
+        assert!(
+            !out.skipped.iter().any(|s| s.unit == format!("{novel}.md")),
+            "the account-only command is not skipped, got {:?}",
+            out.skipped
+        );
+    }
+
+    /// A repository that tracks only a command of its OWN under
+    /// `.claude/commands` does not version the bundle: every bundled command is
+    /// still written.
+    #[test]
+    fn a_repo_tracking_only_its_own_command_still_gets_every_bundled_one() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let commands_dir = tmp.path().join(".claude").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        crate::provision_guard::test_support::git_init(tmp.path());
+        let own = commands_dir.join("repo-local-only-command.md");
+        std::fs::write(&own, b"# mine\n").unwrap();
+        crate::provision_guard::test_support::git_add(tmp.path(), &own);
+
+        let out = provision_fleet_commands_into(&commands_dir, &AgentCommandRegistry::new())
+            .expect("provision");
+
+        assert!(out.skipped.is_empty(), "got {:?}", out.skipped);
+        assert_eq!(out.written, FLEET_COMMANDS.len());
     }
 
     /// The blast radius the module doc names: a checkout that tracks EVERY
@@ -1040,7 +1252,12 @@ mod tests {
 
         let out = provision_fleet_commands_into(&commands_dir, &registry).expect("provision");
 
-        assert_eq!(out.skipped.len(), 1);
+        assert!(
+            out.skipped.iter().any(|s| s.unit == format!("{name}.md")
+                && s.reason == crate::capability_manifest::SkipReason::GitTracked),
+            "the overridden command is skipped as tracked, got {:?}",
+            out.skipped
+        );
         assert_eq!(
             std::fs::read_to_string(&dst).unwrap(),
             "# the repo's own body\n",
@@ -1187,11 +1404,6 @@ mod tests {
     /// the `git hash-object` of the vendored file itself.
     #[test]
     fn the_recorded_blob_is_the_git_blob_id_of_the_original_body() {
-        // Known answer: `printf 'hello\n' | git hash-object --stdin`.
-        assert_eq!(
-            git_blob_id(b"hello\n"),
-            "ce013625030ba8dba906f756967f9e9ca394464a"
-        );
         for name in ["vet-plan", "policy"] {
             let on_disk = provision_one(&AgentCommandRegistry::new(), name);
             let (line, _) = strip_provenance(&on_disk).expect("provenance line");
@@ -1240,7 +1452,7 @@ mod tests {
                 CommandSource::Served,
                 CommandSource::DiskCache,
             ] {
-                let written = with_provenance("x", body, source);
+                let written = with_provenance(&command_canonical("x"), body, source.as_str(), None);
                 assert!(
                     written.starts_with("---"),
                     "frontmatter must start at line 1"
@@ -1253,7 +1465,12 @@ mod tests {
             }
         }
         // CRLF frontmatter keeps its own line endings on the inserted line.
-        let crlf = with_provenance("x", "---\r\na: 1\r\n---\r\n", CommandSource::Builtin);
+        let crlf = with_provenance(
+            &command_canonical("x"),
+            "---\r\na: 1\r\n---\r\n",
+            "builtin",
+            None,
+        );
         assert!(crlf
             .split_once("\r\n")
             .unwrap()
@@ -1295,6 +1512,39 @@ mod tests {
             provenance_consistent("# no provenance\n"),
             Err(ProvenanceError::Missing)
         );
+    }
+
+    /// A canonical body is written with `source=canonical` and the 12-hex
+    /// `canonical_sha` of the `qontinui-claude-config` commit it was read at,
+    /// and the file stays self-consistent.
+    #[test]
+    fn a_canonical_body_is_stamped_with_its_snapshot() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let (name, _) = FLEET_COMMANDS[0];
+        let path = format!(".claude/commands/{name}.md");
+        let url = crate::canonical_corpus::test_support::remote_with(
+            tmp.path(),
+            &[(&path, "# canonical body\n")],
+        );
+        let mirror = crate::canonical_corpus::test_support::mirror(tmp.path(), &url);
+        let snapshot = mirror.refresh().expect("refresh");
+        let canonical = mirror.load(&snapshot, &[name], &[]).expect("load").commands;
+        let (registry, _) = crate::agent_commands::resolve_with(
+            crate::agent_commands::FetchOutcome::NoAccount,
+            None,
+            Some(&canonical),
+        );
+        let on_disk = provision_one(&registry, name);
+        let line = provenance_consistent(&on_disk).expect("self-consistent");
+        assert_eq!(line.source, "canonical");
+        assert_eq!(line.canonical_sha.as_deref(), Some(snapshot.short()));
+        assert_eq!(line.canonical, command_canonical(name));
+        assert_eq!(strip_provenance(&on_disk).unwrap().1, "# canonical body\n");
+        // A command the canonical rung did not supply carries no canonical_sha.
+        let (other, _) = FLEET_COMMANDS[1];
+        let other_line = provenance_consistent(&provision_one(&registry, other)).unwrap();
+        assert_eq!(other_line.source, "builtin");
+        assert_eq!(other_line.canonical_sha, None);
     }
 
     /// `source=` names the layer that actually supplied the body.
@@ -1717,28 +1967,65 @@ mod tests {
         }
     }
 
-    /// Gate verbs coord serves in operator/agent PAIRS: each has a
-    /// device-authed twin one path segment away, under an `/agent/` INFIX —
-    /// `POST /coord/gates/:gate_id/agent/<verb>`. The unprefixed
-    /// `POST /coord/gates/:gate_id/<verb>` is the OPERATOR door and answers a
-    /// device or agent JWT `401 operator context missing; SSO required`.
+    /// What the UNPREFIXED `POST /coord/gates/:gate_id/<verb>` is, for a verb
+    /// whose device-authed twin sits under the `/agent/` INFIX
+    /// (`POST /coord/gates/:gate_id/agent/<verb>`). Either way an agent sent to
+    /// the bare path fails; only the status it gets differs.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum BareRoute {
+        /// The OPERATOR door: a device or agent JWT gets
+        /// `401 operator context missing; SSO required`.
+        Operator401,
+        /// No such route at all. coord built only the `/agent/` form, so the
+        /// bare path falls through to `doors::no_such_route` and answers 404.
+        Absent404,
+    }
+
+    /// Every gate verb with an `/agent/` twin, each with the class of its bare
+    /// route. One table, so a verb cannot be added without a class, and the
+    /// violation message cannot default a 404 verb to the 401 text.
     ///
     /// Ported from `qontinui-claude-config`'s `scripts/lint-gate-route-tier.py`
-    /// (check #21), which cannot hold the line here: it needs a
+    /// (check #21, its `TWIN_VERBS`), which cannot hold the line here: it needs a
     /// `qontinui-claude-config` checkout to exist and be current, and no job in
     /// this repo's CI runs it. Same reasoning as
     /// [`bundled_gate_registration_commands_teach_the_mechanics`] — these bodies
     /// are what actually ship, so the invariant is asserted where the files
     /// live.
-    const OPERATOR_TIER_TWIN_VERBS: &[&str] = &[
-        "reject",
-        "reopen",
-        "mute",
-        "unmute",
-        "snooze",
-        "continuation-cancel",
-        "force-clear",
-        "audience",
+    ///
+    /// **Nothing here checks this table against `TWIN_VERBS`.** Check #32
+    /// (`lint-coord-door-parity.py`) holds `TWIN_VERBS` against its own door
+    /// table, but no check reads this file, so a verb check #21 gains has to be
+    /// added here by hand. That is how `repoint` and `correct` were missing.
+    const GATE_TWIN_VERBS: &[(&str, BareRoute)] = &[
+        ("reject", BareRoute::Operator401),
+        ("reopen", BareRoute::Operator401),
+        ("mute", BareRoute::Operator401),
+        ("unmute", BareRoute::Operator401),
+        ("snooze", BareRoute::Operator401),
+        ("continuation-cancel", BareRoute::Operator401),
+        ("force-clear", BareRoute::Operator401),
+        ("audience", BareRoute::Operator401),
+        // No operator half: the registrant rule fails closed for an operator
+        // bearer, so only `/agent/repoint` exists (qontinui-coord#2056).
+        ("repoint", BareRoute::Absent404),
+        // No operator half: an insert-only annotation of a CLEARED gate, built
+        // at `/agent/correct` only (qontinui-coord#3047).
+        ("correct", BareRoute::Absent404),
+    ];
+
+    /// Gate verbs with NO `/agent/` twin, whose bare path is legitimately what
+    /// an agent (or nobody) uses: `approve` is operator-only; `attest` and
+    /// `withdraw` are device-authed on the bare path; the two continuation acks
+    /// are unauthenticated runner data-plane routes. The union of check #21's
+    /// `OPERATOR_ONLY_VERBS`, `BARE_PATH_DEVICE_AUTHED` and
+    /// `UNAUTHENTICATED_RUNNER_ACK`. None may ever be flagged.
+    const GATE_VERBS_WITHOUT_TWIN: &[&str] = &[
+        "approve",
+        "attest",
+        "withdraw",
+        "continuation-consumed",
+        "continuation-deferred",
     ];
 
     /// Same-line exemption marker, spelled exactly as the Python linter spells
@@ -1771,8 +2058,10 @@ mod tests {
         })
     }
 
-    /// No bundled command may instruct an agent to POST an operator-tier gate
-    /// verb that HAS a device-authed twin.
+    /// No bundled command may instruct an agent to POST the bare route of a gate
+    /// verb that HAS a device-authed `/agent/` twin — the operator's door (401)
+    /// for most of them, a route that does not exist (404) for the rest. The
+    /// name predates the 404 class.
     ///
     /// On 2026-08-20 gate `7902e457` spawned a redundant terminal against a plan
     /// already stamped SHIPPED, because the shipped bodies told agents to POST
@@ -1805,9 +2094,9 @@ mod tests {
     /// matching reports clean forever.
     #[test]
     fn bundled_commands_never_send_agents_to_operator_tier_gate_routes() {
-        let verb_alt = OPERATOR_TIER_TWIN_VERBS
+        let verb_alt = GATE_TWIN_VERBS
             .iter()
-            .map(|v| regex::escape(v))
+            .map(|(v, _)| regex::escape(v))
             .collect::<Vec<_>>()
             .join("|");
         // `/coord/gates/<anchor>/<twin verb>`.
@@ -1840,7 +2129,21 @@ mod tests {
             !candidate.is_match("POST $COORD_HTTP_URL/coord/gates/<gate_id>/agent/mute"),
             "route-tier pattern flags the CORRECT twin form"
         );
-        for verb in ["approve", "attest", "withdraw", "continuation-consumed"] {
+        for (verb, _) in GATE_TWIN_VERBS {
+            assert!(
+                candidate.is_match(&format!("POST /coord/gates/<id>/{verb}")),
+                "route-tier pattern misses the bare {verb:?} route"
+            );
+            assert!(
+                !candidate.is_match(&format!("POST /coord/gates/<id>/agent/{verb}")),
+                "route-tier pattern flags the CORRECT twin form of {verb:?}"
+            );
+            assert!(
+                !GATE_VERBS_WITHOUT_TWIN.contains(verb),
+                "{verb:?} is listed both as a twin verb and as a verb with no twin"
+            );
+        }
+        for verb in GATE_VERBS_WITHOUT_TWIN {
             assert!(
                 !candidate.is_match(&format!("POST /coord/gates/<id>/{verb}")),
                 "route-tier pattern flags {verb:?}, a verb with no `/agent/` twin"
@@ -1891,14 +2194,33 @@ mod tests {
                         continue;
                     }
                     let verb = &caps["verb"];
+                    let bare = GATE_TWIN_VERBS
+                        .iter()
+                        .find(|(v, _)| *v == verb)
+                        .map(|(_, bare)| *bare)
+                        .expect("the candidate pattern is built from GATE_TWIN_VERBS");
+                    // A 404 verb has no operator door, so the `operator`
+                    // exemption is never the fix for it: that would silence a
+                    // real defect. Only the explicit marker is offered; the
+                    // exemption itself still fires for every class, in parity
+                    // with check #21.
+                    let tail = match bare {
+                        BareRoute::Operator401 => format!(
+                            "the unprefixed route is the operator's and answers an agent \
+                             401. If this line IS documenting the operator door, say \
+                             'operator' on it (or add '{ROUTE_TIER_ALLOW_MARKER}')."
+                        ),
+                        BareRoute::Absent404 => format!(
+                            "the unprefixed route does not exist and answers 404; there is \
+                             no operator door to document. If this line deliberately names \
+                             the missing bare path, add '{ROUTE_TIER_ALLOW_MARKER}'."
+                        ),
+                    };
                     violations.push(format!(
                         "  qontinui-claude-config/.claude/commands/{name}.md (bundled here as \
                          src-tauri/src/fleet_commands/{name}.md):{}: `{}` — `{verb}` has a \
                          device-authed twin. An agent must POST \
-                         /coord/gates/<id>/agent/{verb}; the unprefixed route is the \
-                         operator's and answers an agent 401. If this line IS documenting \
-                         the operator door, say 'operator' on it (or add \
-                         '{ROUTE_TIER_ALLOW_MARKER}').",
+                         /coord/gates/<id>/agent/{verb}; {tail}",
                         idx + 1,
                         &caps[0],
                     ));
@@ -1908,9 +2230,10 @@ mod tests {
 
         assert!(
             violations.is_empty(),
-            "bundled agent command(s) send AGENTS to operator-tier gate routes — the agent \
-             twin sits one path segment away, and the 401 it avoids has already cost a real \
-             session (gate 7902e457, 2026-08-20). {} violation(s):\n{}",
+            "bundled agent command(s) send AGENTS to the bare route of a gate verb that has an \
+             `/agent/` twin — the twin sits one path segment away, and the bare route's 401 \
+             has already cost a real session (gate 7902e457, 2026-08-20); a 404 verb fails \
+             the same way. {} violation(s):\n{}",
             violations.len(),
             violations.join("\n")
         );
@@ -2688,5 +3011,112 @@ mod tests {
              Phase 5) or this guard's content probe went stale. Both are findings; \
              neither is a pass"
         );
+    }
+
+    /// The bundled `/unattended` closes every session by running
+    /// `/finish-session`, so the bundle must carry `/finish-session` too.
+    ///
+    /// Before plan
+    /// `2026-10-29-bundle-finish-session-so-every-dispatched-session-can-record-finished`
+    /// (Phase 3) it did not: a runner-dispatched session on a device with no
+    /// fleet `.claude` tree was told to run a command its workdir never had, so
+    /// it could not record `session_status=finished` and a rebuilt runner kept
+    /// offering it for resume. Literals are spelled here on purpose — this test
+    /// must fail if the roster line is dropped, not follow it.
+    #[test]
+    fn bundle_carries_finish_session_beside_unattended() {
+        let roster: Vec<&str> = FLEET_COMMANDS.iter().map(|(n, _)| *n).collect();
+        assert!(
+            roster.contains(&"finish-session"),
+            "FLEET_COMMANDS has no \"finish-session\" entry, but the bundled \
+             /unattended ends every session with /finish-session — a dispatched \
+             session on a device without a fleet .claude tree cannot record \
+             finished. Restore (\"finish-session\", FINISH_SESSION) in FLEET_COMMANDS"
+        );
+        let unattended = FLEET_COMMANDS
+            .iter()
+            .find(|(n, _)| *n == "unattended")
+            .map(|(_, b)| *b)
+            .expect("the bundle carries \"unattended\"");
+
+        // Every `/finish-session` reference, read as the whole slash-command
+        // token it starts (so `/finish-session-foo` would be read as
+        // `finish-session-foo`, not as a hit on the roster name).
+        // Split on `/` rather than byte-slicing after a match, so no index can
+        // land inside a UTF-8 character (the bodies are full of em dashes).
+        let mut references = 0usize;
+        for after_slash in unattended.split('/').skip(1) {
+            let token: String = after_slash
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                .collect();
+            if !token.starts_with("finish-session") {
+                continue;
+            }
+            assert!(
+                roster.contains(&token.as_str()),
+                "the bundled /unattended references /{token}, which is not a bundled \
+                 command name — the reference dangles on any device whose workdir \
+                 only has the bundle. Bundled names: {roster:?}"
+            );
+            references += 1;
+        }
+        assert!(
+            references > 0,
+            "the bundled /unattended no longer references /finish-session, so this \
+             guard watches an edge that no longer exists. Re-read the plan before \
+             dropping finish-session from the bundle"
+        );
+    }
+
+    /// `/whereami` documents the `[provisioned: …]` token's
+    /// `skipped-<reason>=<n>` spellings as a closed list, and the renderer
+    /// (`served_corpus::Provisioned::render`) emits one per `SkipReason::wire()`
+    /// with `_` spelled `-`. A reason added without its doc entry renders a
+    /// token the card's reader has never been told about — which is how
+    /// `probe_unknown_in_repo` (qontinui-runner#2304) shipped.
+    ///
+    /// The `match` below is exhaustive, so a new variant fails to compile here
+    /// until it gets an arm. That is a PROMPT to add it to `roster` too, not a
+    /// guarantee: an arm added without a roster entry still compiles. The
+    /// search is confined to the `provisioned` row, so a spelling mentioned
+    /// elsewhere in the card cannot satisfy it.
+    #[test]
+    fn whereami_names_every_skip_reason_the_provisioned_token_can_render() {
+        use crate::capability_manifest::SkipReason;
+        let row = WHEREAMI
+            .lines()
+            .find(|l| l.starts_with("| `provisioned` |"))
+            .expect("whereami.md has a `provisioned` row in its token table");
+        let roster = [
+            SkipReason::GitTracked,
+            SkipReason::ProbeUnknownInRepo,
+            SkipReason::RootVersioned,
+            SkipReason::WriteFailed(String::new()),
+            SkipReason::Unresolved(String::new()),
+            SkipReason::Rejected(String::new()),
+            SkipReason::RepoAuthored,
+            SkipReason::OperatorAuthored(String::new()),
+            SkipReason::ServedInPlace,
+        ];
+        for reason in &roster {
+            match reason {
+                SkipReason::GitTracked
+                | SkipReason::ProbeUnknownInRepo
+                | SkipReason::RootVersioned
+                | SkipReason::WriteFailed(_)
+                | SkipReason::Unresolved(_)
+                | SkipReason::Rejected(_)
+                | SkipReason::RepoAuthored
+                | SkipReason::OperatorAuthored(_)
+                | SkipReason::ServedInPlace => {}
+            }
+            let spelled = format!("`{}`", reason.wire().replace('_', "-"));
+            assert!(
+                row.contains(&spelled),
+                "whereami.md's `provisioned` row does not name {spelled}; add it there \
+                 (canonical: qontinui-claude-config .claude/commands/whereami.md) and re-vendor"
+            );
+        }
     }
 }

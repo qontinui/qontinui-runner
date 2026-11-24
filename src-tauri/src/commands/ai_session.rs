@@ -259,15 +259,18 @@ pub async fn send_user_message(
     // loop) is what lets an idle session age to `stale` so the inject trigger
     // can fire (P0.2). Best-effort + no-op when the session isn't registered.
     ai_coord_registrar.heartbeat_on_interaction(&task_run_id);
-    // Session-progress reporting — the same operator-interaction boundary is the
-    // work-activity signal that advances `coord.sessions.last_progress_at` (the
-    // producer the session-stall watcher was starved of). Orthogonal to the
-    // liveness heartbeat above; same best-effort/no-op-when-unregistered posture.
-    ai_coord_registrar.progress_on_interaction(&task_run_id);
 
     let session = session_manager
         .get(&task_run_id)
         .ok_or_else(|| format!("No active session found for task_run_id: {}", task_run_id))?;
+    // Session-progress reporting — the same operator-interaction boundary is the
+    // work-activity signal that advances `coord.sessions.last_progress_at` (the
+    // producer the session-stall watcher was starved of). Orthogonal to the
+    // liveness heartbeat above; same best-effort/no-op-when-unregistered posture.
+    // After the lookup: an interaction revives a finished session (it clears
+    // the local finished mark before its `working` report), so it happens only
+    // for a message that actually reaches a live session.
+    ai_coord_registrar.progress_on_interaction(&task_run_id);
 
     // Emit the user's message as an ai-output event so it appears in the conversation.
     // We emit directly (not via emit_ai_output) so we can include task_run_id
@@ -437,7 +440,7 @@ pub async fn get_ai_session_state(
 /// task-run insert has been awaited, when that insert then fails.
 ///
 /// Two things now run unconditionally between building the insert future and
-/// polling it: `register_session` (hoisted ahead of the spawn because the
+/// polling it: `register_session_in` (hoisted ahead of the spawn because the
 /// minted coord session id seeds the agent_logs emitter) and
 /// `AgentLogEmitter::start` (which opens the session's queue in the shared
 /// emitter service). Before the insert and the spawn were run concurrently,
@@ -535,9 +538,15 @@ pub async fn create_ai_session(
     // Done BEFORE spawn (it only needs the task_run_id) so the minted coord
     // session id is available to seed the Phase-1b agent_logs emitter, which the
     // stdout reader + waiter threads need at spawn time. The R6 idempotency
-    // guard means this is the single Started write; the later (post-spawn)
-    // success re-register is a no-op.
-    let coord_session_id = ai_coord_registrar.register_session(&task_run_id, &name, None);
+    // guard makes this the single Started write.
+    //
+    // The session's tenant follows the workspace + repo it is spawned into —
+    // the runner's process cwd, the same directory the spawn below resolves
+    // (plan 2026-09-20 Phase 5).
+    let spawn_cwd = std::env::current_dir().ok();
+    let coord_session_id = ai_coord_registrar
+        .register_session_in(&task_run_id, &name, None, spawn_cwd.as_deref())
+        .await;
 
     // Phase 1b/1c — build the interactive-agent log emitter when the
     // `QONTINUI_AGENT_LOGS_FROM_SESSIONS` gate is ON (the default) and the
@@ -612,7 +621,7 @@ pub async fn create_ai_session(
             }
             Err(e) => {
                 warn!("Failed to spawn AI session: {}", e);
-                Err(e)
+                Err(e.message)
             }
         }
     });
@@ -1579,6 +1588,11 @@ async fn reacquire_and_restore_session_worktree(
     //    original claim → idempotent renew within TTL / clean re-take after.
     let agent_session_id = crate::drain::stable_ai_session_id(task_run_id);
     let intent = format!("resume chat session {task_run_id}");
+    // Plan 2026-10-10 D7 (narrowed by vet V5): every NON-PRIMARY repo the
+    // session had its own worktree for is plausibly edited, so it is re-requested
+    // as an edit sibling — otherwise a co-requested consumer that declares it
+    // would have it redirected at the read-only sibling store on resume.
+    let edit_siblings = crate::agent_worktree::edit_sibling::resume_edit_siblings(&repos);
 
     match acquire(AcquireRequest {
         repos: &repos,
@@ -1589,6 +1603,9 @@ async fn reacquire_and_restore_session_worktree(
         agent_session_id: Some(agent_session_id),
         spawn_tenant: None,
         shared_branch: crate::agent_worktree::SharedBranchPolicy::Honor,
+        edit_siblings: &edit_siblings,
+        // An interactive spawn has a user waiting: no retry budget.
+        transport_retry: std::time::Duration::ZERO,
     })
     .await
     {
@@ -1697,6 +1714,58 @@ async fn reacquire_and_restore_session_worktree(
             };
             (None, notes, None, claim_status, WipStatus::None)
         }
+    }
+}
+
+/// The door name the AI-session resume's removal logs and reports under.
+const RESUME_DOOR: &str = "AI session resume";
+
+/// A resumed session's spawn that failed inside the blocking closure: the
+/// failure text, whether a child may have run in the tree, and the
+/// re-acquired context, handed back so the failure arm can give it to the
+/// remover instead of dropping it unreported inside the closure.
+struct ResumeSpawnFailure {
+    message: String,
+    child_started: bool,
+    /// Boxed: the context is large and rides only the failure arm.
+    ctx: Option<Box<crate::agent_worktree::isolated_edit::IsolatedEditContext>>,
+}
+
+/// A resume refused BEFORE any spawn was attempted: no child ran in the
+/// re-acquired tree, so it is handed to `remove` with `child_started = false`
+/// (the remover still keeps a tree a restored WIP made dirty). `None` — no
+/// worktree was re-acquired — hands nothing over.
+fn abandon_before_resume_spawn(
+    ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
+    reason: &str,
+    remove: impl FnOnce(crate::agent_worktree::isolated_edit::IsolatedEditContext, bool, &str),
+) {
+    if let Some(ctx) = ctx {
+        remove(ctx, false, reason);
+    }
+}
+
+/// Settle a resumed session's blocking spawn (plan
+/// `2026-11-08-a-spawn-refused-after-its-worktree-allocation-leaves-the-tree-on-disk`,
+/// Phase 3): a spawn failure hands the context it carries to `remove` with its
+/// `child_started`; a join error (a panic, possibly after the CLI went live)
+/// hands nothing over. The answer keeps the shape the resume loop matches on.
+///
+/// `remove` is the seam the tests drive; the resume passes
+/// `IsolatedEditContext::remove_unspawned`.
+fn settle_resume_spawn(
+    joined: Result<Result<(), ResumeSpawnFailure>, tokio::task::JoinError>,
+    remove: impl FnOnce(crate::agent_worktree::isolated_edit::IsolatedEditContext, bool, &str),
+) -> Result<Result<(), String>, tokio::task::JoinError> {
+    match joined {
+        Ok(Ok(())) => Ok(Ok(())),
+        Ok(Err(failure)) => {
+            if let Some(ctx) = failure.ctx {
+                remove(*ctx, failure.child_started, &failure.message);
+            }
+            Ok(Err(failure.message))
+        }
+        Err(join) => Err(join),
     }
 }
 
@@ -1939,6 +2008,19 @@ pub async fn resume_ai_sessions(
         } else {
             let replay_prompt = build_replay_prompt(&turns, None);
             if replay_prompt.is_empty() {
+                // Refused before any spawn: no child ran in the re-acquired
+                // tree, so it is handed to the remover (removed only when it
+                // proves it holds nothing — a restored WIP keeps it) and the
+                // allocation reported, instead of dropping it on disk (plan
+                // `2026-11-08-a-spawn-refused-after-its-worktree-allocation-leaves-the-tree-on-disk`,
+                // Phase 3).
+                abandon_before_resume_spawn(
+                    reacquired_ctx,
+                    "empty replay prompt",
+                    |ctx, child_started, reason| {
+                        ctx.remove_unspawned(RESUME_DOOR, child_started, reason)
+                    },
+                );
                 mark_failed(
                     task_run_id.clone(),
                     "empty replay prompt".to_string(),
@@ -1986,15 +2068,26 @@ pub async fn resume_ai_sessions(
         // idempotency guard makes the later post-spawn register a no-op), so
         // the minted coord session id can seed the Phase-1b agent_logs emitter
         // the spawn's stdout/waiter threads consume. `None` registrar → no id.
-        let coord_session_id = ai_coord_registrar
-            .as_ref()
-            .and_then(|reg| reg.register_session(&task_run_id, &task_name, None));
+        // The tenant follows the workspace + repo it re-spawns into (plan
+        // 2026-09-20 Phase 5).
+        let coord_session_id = match ai_coord_registrar.as_ref() {
+            Some(reg) => {
+                reg.register_session_in(
+                    &task_run_id,
+                    &task_name,
+                    None,
+                    Some(std::path::Path::new(&working_dir_for_spawn)),
+                )
+                .await
+            }
+            None => None,
+        };
         // Phase 1b/1c emitter — `None` (default) unless the
         // `QONTINUI_AGENT_LOGS_FROM_SESSIONS` gate is ON and the id resolved.
         let agent_log_emitter = coord_session_id
             .and_then(crate::claude_session::coord_register::AgentLogEmitter::start);
 
-        let spawn_result = spawn_blocking_tracked(move || -> Result<(), String> {
+        let joined = spawn_blocking_tracked(move || -> Result<(), ResumeSpawnFailure> {
             let session_ctx = AiSessionContext::setup(&trid, &name_for_ctx);
 
             // Pin/resume the CLI session id to the task_run_id. `is_resume` is
@@ -2019,13 +2112,32 @@ pub async fn resume_ai_sessions(
                 None, // tool_policy
                 Some(&cli_session_ctx),
                 agent_log_emitter, // Phase 1b/1c agent_logs emitter (None unless gated)
-            )
-            .map_err(|e| format!("spawn failed: {}", e))?;
+            );
+            // Every failure from here on hands the re-acquired context back.
+            // `ClaudeSession::spawn`'s typed failure says which side of the CLI
+            // process it came from, so a pre-child refusal there lets the
+            // remover take a fresh, empty tree back; register / the initial
+            // prompt run against a live CLI, so those keep it (report only).
+            let session = match session {
+                Ok(session) => Arc::new(session),
+                Err(e) => {
+                    // door-scan: keep(handed-back) the failure carries the context to settle_resume_spawn
+                    return Err(ResumeSpawnFailure {
+                        message: format!("spawn failed: {}", e.message),
+                        child_started: e.child_started,
+                        ctx: reacquired_ctx_for_spawn.map(Box::new),
+                    });
+                }
+            };
 
-            let session = Arc::new(session);
-
-            sm.register(&trid, session.clone())
-                .map_err(|e| format!("register failed: {}", e))?;
+            if let Err(e) = sm.register(&trid, session.clone()) {
+                // door-scan: keep(handed-back) the failure carries the context to settle_resume_spawn
+                return Err(ResumeSpawnFailure {
+                    message: format!("register failed: {}", e),
+                    child_started: true,
+                    ctx: reacquired_ctx_for_spawn.map(Box::new),
+                });
+            }
 
             // Park the re-acquired worktree claim on the now-registered
             // session so the heartbeat lives for its lifetime and the claim
@@ -2047,9 +2159,15 @@ pub async fn resume_ai_sessions(
             // note. It does not append to output_log, so the next restart's
             // replay won't double-count.
             if let Some(prompt) = initial_for_spawn.as_deref() {
-                session
-                    .send_initial_prompt(prompt)
-                    .map_err(|e| format!("send_initial_prompt failed: {}", e))?;
+                if let Err(e) = session.send_initial_prompt(prompt) {
+                    // door-scan: keep(handed-back) the failure carries the context to settle_resume_spawn
+                    return Err(ResumeSpawnFailure {
+                        message: format!("send_initial_prompt failed: {}", e),
+                        child_started: true,
+                        // Parked above; taken back so the remover reports it.
+                        ctx: session.take_isolated_edit_ctx().map(Box::new),
+                    });
+                }
             }
 
             // Emit the state event with resumed=true so the frontend can
@@ -2059,6 +2177,9 @@ pub async fn resume_ai_sessions(
             Ok(())
         })
         .await;
+        let spawn_result = settle_resume_spawn(joined, |ctx, child_started, message| {
+            ctx.remove_unspawned(RESUME_DOOR, child_started, message)
+        });
 
         // Best-effort emergent-task row for the resumed session (deconflicter
         // attaches to the assigned_session_id). Identical pattern to
@@ -2549,7 +2670,9 @@ mod failed_task_run_teardown_tests {
         let (reg, _dir) = registrar();
         let task_run_id = uuid::Uuid::new_v4().to_string();
 
-        // Exactly what the command does before the `join!`.
+        // What the command does before the `join!` — minus the tenant
+        // resolution `register_session_in` adds, which needs a workdir and
+        // network and is not what this test is about.
         let coord_session_id = reg
             .register_session(&task_run_id, "New Chat", None)
             .expect("registration enabled by default");
@@ -2593,5 +2716,90 @@ mod failed_task_run_teardown_tests {
         // Repeat close of an already-closed session.
         teardown_coord_session_for_failed_task_run(&reg, None, &task_run_id);
         assert_eq!(reg.session_id_for(&task_run_id), None);
+    }
+}
+
+/// Plan `2026-11-08-a-spawn-refused-after-its-worktree-allocation-leaves-the-tree-on-disk`
+/// Phase 3: a spawn failure hands its context to the remover with its own
+/// `child_started`; a failure carrying no context, and a join error, hand
+/// over nothing.
+#[cfg(test)]
+mod resume_unspawned_tests {
+    use super::*;
+    use crate::agent_worktree::isolated_edit::IsolatedEditContext;
+
+    fn ctx() -> Option<IsolatedEditContext> {
+        Some(IsolatedEditContext::for_test_with_agent_id(
+            "6f1c2a7e-0000-4000-8000-00000000beef".to_string(),
+            Vec::new(),
+            Vec::new(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn a_spawn_failure_hands_its_context_to_the_remover_with_its_child_flag() {
+        for child_started in [false, true] {
+            let mut handed = Vec::new();
+            let joined = Ok(Err(ResumeSpawnFailure {
+                message: "spawn failed: boom".to_string(),
+                child_started,
+                ctx: ctx().map(Box::new),
+            }));
+            let out = settle_resume_spawn(joined, |c, started, msg| {
+                handed.push((c.agent_id.clone(), started, msg.to_string()))
+            });
+            assert_eq!(
+                out.expect("not a join error"),
+                Err("spawn failed: boom".to_string()),
+                "the failure text is answered"
+            );
+            assert_eq!(
+                handed,
+                vec![(
+                    "6f1c2a7e-0000-4000-8000-00000000beef".to_string(),
+                    child_started,
+                    "spawn failed: boom".to_string()
+                )]
+            );
+        }
+
+        let mut calls = 0;
+        let joined = Ok(Err(ResumeSpawnFailure {
+            message: "no ctx".to_string(),
+            child_started: false,
+            ctx: None,
+        }));
+        let _ = settle_resume_spawn(joined, |_, _, _| calls += 1);
+        assert_eq!(calls, 0, "no context, nothing to hand over");
+
+        let join = tokio::spawn(async { panic!("panicked after the CLI went live") })
+            .await
+            .expect_err("a panicking task is a join error");
+        let mut calls = 0;
+        let out = settle_resume_spawn(Err(join), |_, _, _| calls += 1);
+        assert!(out.is_err());
+        assert_eq!(calls, 0, "a join error hands nothing over");
+    }
+
+    /// Plan Phase 3 (review A8c): the resume's empty-replay refusal comes
+    /// before any spawn, so it hands the re-acquired context to the remover
+    /// with `child_started = false`, once.
+    #[test]
+    fn an_empty_replay_refusal_hands_the_tree_to_the_remover_as_unspawned() {
+        let mut handed = Vec::new();
+        abandon_before_resume_spawn(ctx(), "empty replay prompt", |c, started, why| {
+            handed.push((c.agent_id.clone(), started, why.to_string()))
+        });
+        assert_eq!(
+            handed,
+            vec![(
+                "6f1c2a7e-0000-4000-8000-00000000beef".to_string(),
+                false,
+                "empty replay prompt".to_string()
+            )]
+        );
+        let mut calls = 0;
+        abandon_before_resume_spawn(None, "x", |_, _, _| calls += 1);
+        assert_eq!(calls, 0);
     }
 }

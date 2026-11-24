@@ -1,8 +1,13 @@
 /**
- * useGlobalLogSources - Hook for managing global log sources
+ * useGlobalLogSources - Hook for reading the global log source settings
  *
- * This hook loads log sources from the global settings (shared across all projects)
- * and provides functionality to read log content from those sources.
+ * Loads the log sources from the global settings (shared across all projects).
+ * It reads SETTINGS only, never log content: it used to read every enabled
+ * source's tail whenever the settings loaded — on each webview load and each
+ * SettingsPanel mount — and the runner served that by reading its whole day
+ * log (2.9 GB measured) into memory, for a result no consumer used (plan
+ * `2026-11-11-runner-glibc-arena-retention-and-whole-log-tail` Phase 2). Log
+ * content is read by the project-logs view, through `read_project_logs`.
  */
 
 import { useState, useCallback, useEffect } from "react";
@@ -50,54 +55,23 @@ interface GlobalLogSourceSettings {
   include_all_when_no_profile: boolean;
 }
 
-interface LogSourceContent {
-  source_id: string;
-  source_name: string;
-  lines: string[];
-  total_lines: number;
-  file_path: string;
-  last_modified?: string;
-  error?: string;
-}
-
 interface TauriResult<T> {
   success: boolean;
   data?: T;
   message?: string;
 }
 
-export interface GlobalLogsState {
-  sources: Array<{
-    sourceId: string;
-    sourceName: string;
-    lines: string[];
-    totalLines: number;
-    filePath: string;
-    error?: string;
-  }>;
-  loading: boolean;
-  error?: string;
-  lastRefresh?: string;
-}
-
 export interface UseGlobalLogSourcesReturn {
   settings: GlobalLogSourceSettings | null;
-  logsState: GlobalLogsState;
   loading: boolean;
   error?: string;
   loadSettings: () => Promise<void>;
-  refreshLogs: () => Promise<void>;
-  getEnabledSources: () => GlobalLogSource[];
 }
 
 export function useGlobalLogSources(): UseGlobalLogSourcesReturn {
   const [settings, setSettings] = useState<GlobalLogSourceSettings | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | undefined>();
-  const [logsState, setLogsState] = useState<GlobalLogsState>({
-    sources: [],
-    loading: false,
-  });
 
   // Load settings from backend
   const loadSettings = useCallback(async () => {
@@ -118,101 +92,16 @@ export function useGlobalLogSources(): UseGlobalLogSourcesReturn {
     }
   }, []);
 
-  // Get enabled sources based on current settings
-  const getEnabledSources = useCallback((): GlobalLogSource[] => {
-    if (!settings) return [];
-
-    // If a default profile is set, use its sources
-    if (settings.default_profile_id) {
-      const profile = settings.profiles.find((p) => p.id === settings.default_profile_id);
-      if (profile) {
-        return settings.sources.filter((s) => s.enabled && profile.source_ids.includes(s.id));
-      }
-    }
-
-    // If include_all_when_no_profile is true, return all enabled sources
-    if (settings.include_all_when_no_profile) {
-      return settings.sources.filter((s) => s.enabled);
-    }
-
-    return [];
-  }, [settings]);
-
-  // Read log content from enabled sources
-  const refreshLogs = useCallback(async () => {
-    if (!settings) return;
-
-    setLogsState((prev) => ({ ...prev, loading: true, error: undefined }));
-
-    try {
-      const enabledSources = getEnabledSources();
-      const sourceIds = enabledSources.map((s) => s.id);
-
-      if (sourceIds.length === 0) {
-        setLogsState({
-          sources: [],
-          loading: false,
-          lastRefresh: new Date().toISOString(),
-        });
-        return;
-      }
-
-      const result = await invoke<TauriResult<LogSourceContent[]>>("read_global_log_sources", {
-        sourceIds,
-      });
-
-      if (result.success && result.data) {
-        const sources = result.data.map((content) => ({
-          sourceId: content.source_id,
-          sourceName: content.source_name,
-          lines: content.lines,
-          totalLines: content.total_lines,
-          filePath: content.file_path,
-          error: content.error,
-        }));
-
-        setLogsState({
-          sources,
-          loading: false,
-          lastRefresh: new Date().toISOString(),
-        });
-      } else {
-        setLogsState((prev) => ({
-          ...prev,
-          loading: false,
-          error: result.message || "Failed to read logs",
-        }));
-      }
-    } catch (err) {
-      console.error("Failed to read global log sources:", err);
-      setLogsState((prev) => ({
-        ...prev,
-        loading: false,
-        error: describeThrown(err, "Failed to read logs"),
-      }));
-    }
-  }, [settings, getEnabledSources]);
-
   // Load settings on mount
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- the initial load: its synchronous setLoading(true) / setError(undefined) equal the initial state, so they schedule no extra render
     loadSettings();
   }, [loadSettings]);
 
-  // Refresh logs when settings change
-  useEffect(() => {
-    if (settings && settings.sources.length > 0) {
-      refreshLogs();
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- refreshLogs is stable, only trigger on settings change
-  }, [settings]);
-
   return {
     settings,
-    logsState,
     loading,
     error,
     loadSettings,
-    refreshLogs,
-    getEnabledSources,
   };
 }

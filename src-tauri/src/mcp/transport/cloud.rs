@@ -23,6 +23,12 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use super::TransportError;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+/// Hard ceiling on one relay connect (proxy TCP + CONNECT + TLS + upgrade).
+/// The same 20 s as the runner's other WebSocket transports
+/// (`coord_ws::CONNECT_TIMEOUT`, `backend_relay::CONNECT_TIMEOUT`).
+const TUNNEL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 // ============================================================================
 // Tunnel protocol types
@@ -97,13 +103,27 @@ impl CloudTransport {
         device_id: &str,
         auth_token: &str,
     ) -> Result<u16, TransportError> {
+        // `ws_url` carries `?token=<auth_token>`: it is NEVER logged. The log
+        // line names the relay host only.
         let ws_url = build_ws_url(&self.backend_url, device_id, auth_token);
 
-        info!("[cloud-transport] Connecting to relay: {}", ws_url);
+        info!(
+            "[cloud-transport] Connecting to relay {} for device {}",
+            relay_host_for_log(&self.backend_url),
+            device_id
+        );
 
-        let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url)
-            .await
-            .map_err(|e| TransportError::PairingError(format!("WS connect failed: {e}")))?;
+        let request = ws_url
+            .as_str()
+            .into_client_request()
+            .map_err(|e| TransportError::PairingError(format!("invalid relay URL: {e}")))?;
+        // Proxy-aware (plan 2026-10-10-spec-front-end-phase-9-generic-boundary
+        // Phase 4) and bounded — the bare `connect_async` this replaced had no
+        // timeout, so a black-holed relay parked the caller forever.
+        let ws_stream =
+            qontinui_runner_lib::outbound_net::connect_ws(request, TUNNEL_CONNECT_TIMEOUT)
+                .await
+                .map_err(|e| TransportError::PairingError(format!("WS connect failed: {e}")))?;
 
         // Bind local listener on any available port
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -114,6 +134,7 @@ impl CloudTransport {
             .local_addr()
             .map_err(|e| TransportError::ProxyBindFailed(e.to_string()))?
             .port();
+        super::mark_off_machine_forwarder(local_port);
 
         info!(
             "[cloud-transport] Tunnel for {} listening on 127.0.0.1:{}",
@@ -254,8 +275,8 @@ impl CloudTransport {
                     }
 
                     // Shutdown signal
-                    _ = shutdown_rx.changed() => {
-                        if *shutdown_rx.borrow() {
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
                             info!("[cloud-transport] Shutdown signal received");
                             break;
                         }
@@ -291,8 +312,8 @@ impl CloudTransport {
                             }
                         }
                     }
-                    _ = shutdown_rx2.changed() => {
-                        if *shutdown_rx2.borrow() {
+                    changed = shutdown_rx2.changed() => {
+                        if changed.is_err() || *shutdown_rx2.borrow() {
                             break;
                         }
                     }
@@ -306,10 +327,20 @@ impl CloudTransport {
             task_handle,
         };
 
-        self.tunnels
+        let replaced = self
+            .tunnels
             .lock()
             .await
             .insert(device_id.to_string(), handle);
+        if let Some(replaced) = replaced {
+            info!("[cloud-transport] Replacing tunnel for {}", device_id);
+            // In a task of its own: a stalled relay must not park the caller's poll.
+            tokio::spawn(async move {
+                let replaced_port = replaced.local_port;
+                replaced.shutdown().await;
+                super::unmark_off_machine_forwarder(replaced_port);
+            });
+        }
 
         Ok(local_port)
     }
@@ -319,7 +350,9 @@ impl CloudTransport {
         let handle = self.tunnels.lock().await.remove(device_id);
         if let Some(h) = handle {
             info!("[cloud-transport] Closing tunnel for {}", device_id);
+            let local_port = h.local_port;
             h.shutdown().await;
+            super::unmark_off_machine_forwarder(local_port);
         }
     }
 
@@ -328,7 +361,9 @@ impl CloudTransport {
         let handles: Vec<(String, TunnelHandle)> = self.tunnels.lock().await.drain().collect();
         for (device_id, handle) in handles {
             info!("[cloud-transport] Closing tunnel for {}", device_id);
+            let local_port = handle.local_port;
             handle.shutdown().await;
+            super::unmark_off_machine_forwarder(local_port);
         }
     }
 }
@@ -473,6 +508,20 @@ fn build_ws_url(backend_url: &str, device_id: &str, auth_token: &str) -> String 
     )
 }
 
+/// The relay's `host[:port]` for a log line — scheme, path and query
+/// stripped, so nothing credential-shaped can ride along. An unparseable base
+/// is withheld whole rather than printed raw.
+fn relay_host_for_log(backend_url: &str) -> String {
+    match url::Url::parse(backend_url.trim()) {
+        Ok(u) => match (u.host_str(), u.port()) {
+            (Some(h), Some(p)) => format!("{h}:{p}"),
+            (Some(h), None) => h.to_string(),
+            (None, _) => "<relay host unavailable>".to_string(),
+        },
+        Err(_) => "<unparseable relay base withheld>".to_string(),
+    }
+}
+
 /// Which cloud-relay path a given device should use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloudPath {
@@ -509,5 +558,193 @@ fn status_text(code: u16) -> &'static str {
         503 => "Service Unavailable",
         504 => "Gateway Timeout",
         _ => "Unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    #[derive(Clone, Default)]
+    struct Sink(Arc<StdMutex<Vec<u8>>>);
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+        type Writer = Sink;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// The tunnel URL carries `?token=<device token>`. Opening a tunnel must
+    /// log the relay host and never the URL or the token (the line this
+    /// replaced logged the whole URL).
+    #[tokio::test]
+    async fn opening_a_tunnel_never_logs_the_device_token() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let saw_token = Arc::new(StdMutex::new(None::<String>));
+        let saw = saw_token.clone();
+        tokio::spawn(async move {
+            use tokio_tungstenite::tungstenite::handshake::server::{
+                ErrorResponse, Request as SReq, Response as SResp,
+            };
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_hdr_async(
+                stream,
+                move |req: &SReq, resp: SResp| -> Result<SResp, ErrorResponse> {
+                    *saw.lock().unwrap() = req.uri().query().map(str::to_string);
+                    Ok(resp)
+                },
+            )
+            .await;
+            if let Ok(mut ws) = ws {
+                while let Some(Ok(_)) = ws.next().await {}
+            }
+        });
+
+        let sink = Sink::default();
+        let buf = sink.0.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink)
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let transport = CloudTransport::new(format!("http://127.0.0.1:{port}"));
+        let local_port = transport
+            .open_tunnel("device-under-test", "TOKEN-must-not-be-logged")
+            .await
+            .expect("tunnel opens against the local relay");
+        drop(guard);
+        let _forget = crate::mcp::transport::ForgetForwarder(local_port);
+        assert!(local_port > 0);
+        assert_eq!(
+            saw_token.lock().unwrap().as_deref(),
+            Some("token=TOKEN-must-not-be-logged"),
+            "the relay still receives the token on the wire"
+        );
+
+        let logs = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        assert!(
+            logs.contains(&format!(
+                "Connecting to relay 127.0.0.1:{port} for device device-under-test"
+            )),
+            "the capture must see the connect line, or this test proves nothing: {logs:?}"
+        );
+        assert!(
+            !logs.contains("TOKEN-must-not-be-logged"),
+            "token leaked: {logs:?}"
+        );
+        assert!(!logs.contains("token="), "a token query leaked: {logs:?}");
+    }
+
+    /// A relay that accepts any number of tunnels and reads them until they end.
+    async fn spawn_relay() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    if let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await {
+                        while let Some(Ok(_)) = ws.next().await {}
+                    }
+                });
+            }
+        });
+        format!("http://127.0.0.1:{relay_port}")
+    }
+
+    /// A tunnel's port is marked for as long as the tunnel exists, and closing
+    /// the tunnel gives the port back.
+    #[tokio::test]
+    async fn a_tunnel_port_is_a_forwarder_until_the_tunnel_closes() {
+        let transport = CloudTransport::new(spawn_relay().await);
+        let local_port = transport
+            .open_tunnel("device-under-test", "token")
+            .await
+            .expect("tunnel opens against the local relay");
+        assert!(crate::mcp::transport::is_off_machine_forwarder(local_port));
+
+        transport.close_tunnel("device-under-test").await;
+        assert!(!crate::mcp::transport::is_off_machine_forwarder(local_port));
+    }
+
+    /// Reopening a device's tunnel closes the old one, whose port stops being a
+    /// forwarder. The scanner reopens after a device is removed and comes back.
+    #[tokio::test]
+    async fn reopening_a_tunnel_closes_the_one_it_replaces() {
+        let transport = CloudTransport::new(spawn_relay().await);
+        let first = transport
+            .open_tunnel("device-under-test", "token")
+            .await
+            .expect("first tunnel");
+        let second = transport
+            .open_tunnel("device-under-test", "token")
+            .await
+            .expect("second tunnel");
+        let _forget = crate::mcp::transport::ForgetForwarder(second);
+
+        assert!(crate::mcp::transport::is_off_machine_forwarder(second));
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while crate::mcp::transport::is_off_machine_forwarder(first) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the replaced tunnel closes in the background");
+    }
+
+    /// Dropping the handle stops the tunnel, as `TunnelHandle` documents: the
+    /// listener closes rather than the tasks spinning on a dead shutdown channel.
+    #[tokio::test]
+    async fn a_dropped_tunnel_handle_stops_the_tunnel() {
+        let transport = CloudTransport::new(spawn_relay().await);
+        let local_port = transport
+            .open_tunnel("device-under-test", "token")
+            .await
+            .expect("tunnel opens against the local relay");
+        // Forgotten while the port is still bound, so no peer is handed it marked.
+        crate::mcp::transport::unmark_off_machine_forwarder(local_port);
+        drop(transport);
+
+        let refused = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while tokio::net::TcpStream::connect(("127.0.0.1", local_port))
+                .await
+                .is_ok()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(refused.is_ok(), "the tunnel's listener stayed open");
+    }
+
+    #[test]
+    fn relay_host_for_log_strips_everything_but_the_host() {
+        assert_eq!(
+            relay_host_for_log("https://api.example.test/"),
+            "api.example.test"
+        );
+        assert_eq!(
+            relay_host_for_log("http://127.0.0.1:8000"),
+            "127.0.0.1:8000"
+        );
+        assert_eq!(
+            relay_host_for_log("https://api.example.test/x?token=abc"),
+            "api.example.test"
+        );
+        assert_eq!(
+            relay_host_for_log("not a url"),
+            "<unparseable relay base withheld>"
+        );
     }
 }

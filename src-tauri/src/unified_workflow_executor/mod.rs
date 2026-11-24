@@ -66,6 +66,11 @@ pub mod compensation;
 pub mod conditional_routing;
 pub mod convergence;
 pub mod deferred_feedback;
+mod evaluate_verification;
+// The output log's summary line and its verdict words, for the parser's tests
+// in `mcp/task_run_structured_output.rs`; the module itself stays private.
+#[cfg(test)]
+pub(crate) use evaluate_verification::{every_verdict_label, verification_summary_line};
 mod health_monitor;
 mod loop_controller;
 mod loop_handlers;
@@ -80,7 +85,6 @@ mod phases;
 pub mod prehydration;
 pub mod replay;
 mod resume;
-pub mod review_subtask;
 pub(crate) mod startup_resume;
 pub mod states;
 pub(crate) mod step_conversion;
@@ -107,9 +111,7 @@ pub use loop_controller::{
 pub use startup_resume::{
     extract_workflow_id_from_task_id, resume_interrupted_workflows, ResumeConfig,
 };
-pub use types::{
-    get_parent_task_id, CiFailureContext, LoopConfig, LoopResult, StageConfig, WorkflowPhase,
-};
+pub use types::{get_parent_task_id, LoopConfig, LoopResult, StageConfig, WorkflowPhase};
 
 // Types exposed for API consumers and advanced usage
 // These may not be directly used in this crate but are part of the public API

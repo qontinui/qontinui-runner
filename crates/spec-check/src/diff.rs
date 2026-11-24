@@ -31,7 +31,7 @@ use qontinui_types::text_norm::normalize_text;
 use qontinui_types::ui_bridge::UIBridgeElement;
 
 use crate::criteria::{
-    score_aria_label, score_attributes, score_role, score_tag, score_text, score_visibility,
+    score_aria_label, score_attributes, score_role_against, score_tag, score_text, score_visibility,
 };
 use crate::derive;
 use crate::snapshot::{ElementIdx, IndexedSnapshot};
@@ -109,15 +109,15 @@ impl SelectivityIndex {
         let mut text_word_counts: HashMap<String, u32> = HashMap::new();
 
         // Selectivity weights must reflect the same value-space the matcher
-        // operates on — use the derive layer so a `{role: heading}` criterion
-        // sees the IDF weight of the *derived* role population, not the
+        // operates on: every role name an element ANSWERS to
+        // (`criteria::element_role_names` — its derived role, its kind, the
+        // role its kind implies, the one-way `select` / `input` reach), as the
+        // snapshot's role index keys it. A `{role: heading}` criterion then
+        // sees the IDF weight of the population that would match it, not the
         // top-level (almost-always-None) `el.role` distribution.
         for (_idx, el) in indexed.iter_elements() {
-            if let Some(role) = derive::role(el) {
-                let key = normalize_text(&role);
-                if !key.is_empty() {
-                    *role_counts.entry(key).or_insert(0) += 1;
-                }
+            for key in crate::criteria::element_role_names(el) {
+                *role_counts.entry(key).or_insert(0) += 1;
             }
             if let Some(tag) = el.tag_name.as_deref() {
                 let key = normalize_text(tag);
@@ -324,7 +324,7 @@ pub(crate) fn score_element_against(
 
     if let Some(role) = crit.role.as_deref() {
         let observed = derive::role(el);
-        let sim = score_role(role, &observed);
+        let sim = score_role_against(role, el);
         let w = sel.weight_for_role(role);
         score += sim * w;
         if sim < 1.0 {

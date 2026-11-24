@@ -290,17 +290,15 @@ impl ManagedProcess {
         if let Some(pid) = self.runtime.pid {
             #[cfg(windows)]
             {
-                // On Windows, use taskkill to kill the process tree.
-                // Bounded: `stop()` is reached from the 30s restate health
-                // loop's restart path, and a `taskkill` that never returns
+                // On Windows, end the process tree in-process. Bounded and
+                // off the runtime: `stop()` is reached from the 30s restate
+                // health loop's restart path, and a kill that never returned
                 // used to park this tokio worker thread outright.
-                let mut kill_cmd = crate::process_helpers::no_window("taskkill");
-                kill_cmd.args(["/F", "/T", "/PID", &pid.to_string()]);
-                let _ = crate::process_helpers::run_probe(
-                    kill_cmd,
-                    Duration::from_secs(10),
-                    "process_capture::process: taskkill",
-                );
+                if let Err(e) =
+                    crate::tree_kill::kill_tree_by_pid_async(pid, Duration::from_secs(10)).await
+                {
+                    tracing::warn!("process_capture::process: tree kill of pid {pid}: {e}");
+                }
             }
 
             #[cfg(not(windows))]
@@ -323,15 +321,24 @@ impl ManagedProcess {
             handle.abort();
         }
 
-        // If health port is configured, ensure it's free
+        // If health port is configured, ensure it's free. The root's tree kill
+        // cannot reach a worker whose parent already exited (a reloader that
+        // handed its listener to a child and died), so a port still held is
+        // freed by reaping the TRACKED descendants first — each checked
+        // against its recorded creation time — then the port's owner, then
+        // waiting again (`health::free_port_after_stop`). The tracked set is
+        // taken here, before the clear below, because this is its last use.
         if let Some(port) = self.config.health_port {
-            if !health::wait_for_port_free(port, Duration::from_secs(5)).await {
-                warn!(
-                    "Port {} still in use after stopping '{}', attempting port kill",
-                    port, self.config.name
-                );
-                health::kill_port_process(port).await;
-            }
+            let tracked = std::mem::take(&mut self.runtime.descendant_pids);
+            health::free_port_after_stop(
+                &self.config.name,
+                port,
+                &tracked,
+                |p| health::wait_for_port_free(p, Duration::from_secs(5)),
+                health::kill_descendant_tree,
+                health::kill_port_process,
+            )
+            .await;
         }
 
         self.runtime.state = ProcessState::Stopped;
@@ -638,6 +645,53 @@ mod tests {
         assert!(
             early_exit.lock().unwrap().is_some(),
             "second generation early_exit should populate after restart"
+        );
+    }
+}
+
+/// `stop()` frees a still-held health port from its TRACKED descendants
+/// before it forgets them: the set is taken, handed to
+/// `health::free_port_after_stop` (whose sequence `health`'s own tests pin)
+/// with `kill_descendant_tree` as the reap, and only then cleared. Read from
+/// this file's source, because driving `stop()` itself would kill real pids.
+#[cfg(test)]
+mod stop_order_tests {
+    const SRC: &str = include_str!("process.rs");
+
+    #[test]
+    fn stop_frees_the_port_from_the_tracked_set_before_clearing_it() {
+        let mut body: Vec<&str> = Vec::new();
+        for line in SRC.lines() {
+            if body.is_empty() {
+                if line == "    pub async fn stop(&mut self) {" {
+                    body.push(line);
+                }
+                continue;
+            }
+            body.push(line);
+            if line == "    }" {
+                break;
+            }
+        }
+        assert_eq!(
+            body.last(),
+            Some(&"    }"),
+            "no complete `stop` in process.rs"
+        );
+        let pos = |needle: &str| {
+            body.iter()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("`{needle}` not in stop():\n{}", body.join("\n")))
+        };
+        let take = pos("std::mem::take(&mut self.runtime.descendant_pids)");
+        let free = pos("health::free_port_after_stop(");
+        let tracked = pos("&tracked,");
+        let reap = pos("health::kill_descendant_tree,");
+        let clear = pos("self.runtime.descendant_pids.clear()");
+        assert!(
+            take < free && free < tracked && tracked < reap && reap < clear,
+            "stop() must take the tracked set, reap it through free_port_after_stop, then \
+             clear (take {take}, free {free}, tracked {tracked}, reap {reap}, clear {clear})"
         );
     }
 }

@@ -60,17 +60,18 @@ function getStepTypeStyle(stepType: string) {
 
 export function AwasStepsSection() {
   const { selectedRunId, selectedRun: _selectedRun } = useRunSelection();
-  const [pageSize, setPageSize] = useState(PAGE_SIZE);
   const {
     data: awasData,
     isLoading,
     error,
-  } = useTaskRunAwasSteps(selectedRunId, undefined, pageSize);
+    fetchNextPage,
+    isFetchingNextPage,
+  } = useTaskRunAwasSteps(selectedRunId, undefined, PAGE_SIZE);
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
 
   const loadMore = useCallback(() => {
-    setPageSize((prev) => prev + PAGE_SIZE);
-  }, []);
+    void fetchNextPage();
+  }, [fetchNextPage]);
 
   const toggleExpanded = (id: string) => {
     setExpandedIds((prev) => {
@@ -111,7 +112,7 @@ export function AwasStepsSection() {
     );
   }
 
-  if (!awasData || awasData.steps.length === 0) {
+  if (!awasData || awasData.rows.length === 0) {
     return (
       <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
         <Bot className="w-8 h-8 mb-3 opacity-50" />
@@ -126,17 +127,19 @@ export function AwasStepsSection() {
         <span className="text-sm font-medium">AWAS Steps:</span>
         <span className={`flex items-center gap-1 text-sm ${getStatusColors("success").text}`}>
           <CheckCircle className="w-4 h-4" />
-          {awasData.success_count} successful
+          {awasData.first.success_count ?? "—"} successful
         </span>
         <span className={`flex items-center gap-1 text-sm ${getStatusColors("error").text}`}>
           <XCircle className="w-4 h-4" />
-          {awasData.failed_count} failed
+          {awasData.first.failed_count ?? "—"} failed
         </span>
-        <span className="text-xs text-muted-foreground ml-auto">{awasData.count} total steps</span>
+        <span className="text-xs text-muted-foreground ml-auto">
+          {awasData.first.total ?? awasData.rows.length} total steps
+        </span>
       </div>
 
       <div className="space-y-2">
-        {awasData.steps.map((step: TaskRunAwasStepDb) => {
+        {awasData.rows.map((step: TaskRunAwasStepDb) => {
           const stepTypeStyle = getStepTypeStyle(step.step_type);
           const isExpanded = expandedIds.has(step.id);
           const parameters = parseJson(step.parameters);
@@ -232,13 +235,14 @@ export function AwasStepsSection() {
             </div>
           );
         })}
-        {awasData.has_more && (
+        {awasData.hasMore && (
           <button
             onClick={loadMore}
+            disabled={isFetchingNextPage}
             className="w-full py-2 text-xs text-muted-foreground hover:text-foreground flex items-center justify-center gap-1 border border-border rounded hover:bg-muted/50 transition-colors"
           >
             <ChevronDown className="w-3 h-3" />
-            Show more ({awasData.count - awasData.steps.length} remaining)
+            Show more ({awasData.remaining ?? "more"} remaining)
           </button>
         )}
       </div>

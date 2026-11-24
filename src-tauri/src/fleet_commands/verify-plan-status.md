@@ -180,7 +180,10 @@ A plan declares its state with a status block at the top:
 > **Status: SHIPPED <YYYY-MM-DD>.** <summary + commit SHAs>.
 ```
 
-or `Status: PARTIAL` / `Status: SUPERSEDED by <other-plan>` / `Status: OBSOLETE`.
+or `Status: SUPERSEDED by <other-plan>` / `Status: OBSOLETE`, or a partial /
+not-started verdict appended to a lifecycle word (`Status: VETTED <date> —
+partial: …`, `Status: DRAFT <date> — not started …`; §5 has the templates).
+The lead word is always a lifecycle word — never `PARTIAL` or `NOT STARTED`.
 
 ## Instructions
 
@@ -201,39 +204,73 @@ List them in your final report so the user can spot any whose status drifted.
 
 #### Depends-On lookup
 
-A plan MAY declare upstream dependencies inline in its status blockquote
-using a `Depends-On:` suffix:
+A plan MAY declare upstream dependencies inline in its status block
+using a `Depends-On:` suffix — in any stamp shape (blockquoted, plain
+`**Status:** X`, or list-form `- **Depends-On**: <stem>`):
 
 ```markdown
 > **Status: VETTED 2026-05-21.** <summary>. Depends-On: 2026-05-20-default-tenant-propagation, 2026-05-19-some-other-plan.
 ```
 
-Parser rule:
+Read the stems, and each dependency's lifecycle word, through the stamp
+parse owner (`_status-writers.md`) — the same reader `/vet-plan` and
+`/implement-plan` call:
 
-1. Look at the status blockquote (the first `> **Status:` block under the
-   H1) and find EVERY case-sensitive `Depends-On:` occurrence — a block
-   often carries one in the headline sentence and another in a trailing
-   `History:` / re-vet line.
+```bash
+stamp_reader=<workspace-root>/qontinui-claude-config/scripts/lint-plan-status.py
+if [ -r "$stamp_reader" ] && command -v python3 >/dev/null; then
+  python3 "$stamp_reader" --depends-on "<plan path>"   # one stem per line
+  python3 "$stamp_reader" --stamp "<dep plan path>"    # <TOKEN>\t<block>, per dep
+fi
+```
+
+`--depends-on` exit 0 prints the stems (none is the common case); exit 3
+means the plan's window holds no status stamp — UNKNOWN, report it, never
+read it as "no dependencies". `--stamp` prints the dependency's lifecycle
+word as its TOKEN (`SHIPPED`, `IN PROGRESS`, …) from any stamp shape; its
+exit 3 is UNKNOWN too — record the dep as `UNKNOWN (no status stamp)` and
+surface it, never as `DRAFT`. Any other exit from either is no answer;
+apply the fallback rule below by hand, as you do where the script or
+`python3` is absent.
+
+Fallback rule (what `--depends-on` implements):
+
+1. Locate the HEADER REGION: start at the first body status stamp (a
+   frontmatter `status:` key only when there is none) — any shape, within
+   the first 60 lines — and take every PHYSICAL line from it down to, not
+   including, the first `##`-level heading (or line 60, whichever comes
+   first). Strip `>` and `**` markers per line, and find EVERY
+   case-sensitive `Depends-On:` occurrence in that region — the headline
+   sentence, a trailing `History:` / re-vet line, or a
+   `- **Depends-On**: <stem>` metadata line below the stamp's own block.
+   A `Depends-On:` below the first `##` heading is body prose and is never
+   read.
 2. For each occurrence, consider only the remainder of that PHYSICAL line
    — never the following blockquote lines or paragraphs, which may name
    unrelated plans in prose.
 3. Within that line, keep only date-prefixed plan-stem-shaped tokens
    (`YYYY-MM-DD-<kebab-slug>`, e.g. `2026-06-02-some-plan`). Prose, bare
    dates (`2026-05-21.`), and trailing punctuation never produce tokens
-   — a stem requires at least one `-word` segment after the date. Each
-   token is a bare plan **stem** — no `.md` extension, no path.
+   — a stem requires at least one `-word` segment after the date. A token
+   joined to a word character or `-` on either side
+   (`2026-06-02-fix-API-thing`, `x2026-06-02-fix`) is no stem — reject it
+   whole, never truncate. Each token is a bare plan **stem** — no `.md`
+   extension, no path.
 4. Union the stems across all occurrences, deduped, order-preserving.
 
    (A naive first-occurrence + split-on-commas parse mis-handled real
    status blocks whose prose contained a second `Depends-On:` or commas —
-   it produced phantom missing-dep aborts. Fixed in the canonical resolver
-   2026-06-04; this inline fallback mirrors it.)
+   it produced phantom missing-dep aborts.)
 
 For each dep stem, resolve to a plan file using the [Plan stem resolution
-chain](#plan-stem-resolution-chain) below. Capture each dep's status (read
-the dep file's status blockquote and parse the lifecycle word — one of
-`DRAFT`, `VETTED`, `IN PROGRESS`, `SHIPPED`, `PARTIAL`, `NOT STARTED`,
-`SUPERSEDED`, `OBSOLETE`). If the dep file can't be found in either
+chain](#plan-stem-resolution-chain) below. Capture each dep's status — the
+`--stamp` TOKEN above, or, where the script is absent or gave no answer,
+the lifecycle word of the dep file's first body stamp (a frontmatter
+`status:` only when there is none) read by hand — one of `DRAFT`, `VETTED`,
+`IN PROGRESS`, `SHIPPED`, `PARTIAL`, `NOT STARTED`, `SUPERSEDED`,
+`OBSOLETE` (`PARTIAL` / `NOT STARTED` are legacy lead words — no writer emits
+them now, but other plan directories may still carry them; a dep stamped
+`VETTED <date> — partial: …` reads as `VETTED`). If the dep file can't be found in either
 directory, record the dep as `MISSING (no plan file)` and surface it as a
 drifted-status item in the final report.
 
@@ -264,8 +301,11 @@ For each plan, extract a small set (5–15) of verifiable claims. Examples by cl
 - **"New endpoint POST /foo/bar"** → grep `mcp` modules for the route
   registration; confirm a handler function exists.
 - **"New slash command /foo"** → confirm `.claude/commands/foo.md` exists.
-- **"New Tauri command foo"** → grep `generate_handler!` in `src-tauri/src/main.rs`
-  for the symbol.
+- **"New Tauri command foo"** → grep the `ipc_group!` list in the module that
+  defines `foo` for the symbol, and confirm that module has its
+  `ipc_registry::GROUPS` entry (`src-tauri/src/ipc_registry.rs`). On a runner
+  ref predating plan `2026-10-02-split-run-app-invoke-handler` the commands are
+  still in `main.rs`'s central `generate_handler!` — grep there too.
 - **"New React component Foo.tsx"** → confirm the file exists and is mounted
   in a parent component.
 - **"Phase N — Foundation: ..."** → check the phase's "Definition of done"
@@ -289,27 +329,56 @@ If a plan references commits in its body (e.g. "shipped in 879c36bb4"),
 confirm the SHA exists with `git rev-parse 879c36bb4 2>/dev/null` and is
 in the current branch's history with `git merge-base --is-ancestor 879c36bb4 HEAD`.
 
-> **Canonical "is it shipped / landed?" check — ask the twin, not a local tree.**
-> Before deciding a plan or PR has (or hasn't) landed, call the
-> **`coord_query_delivery`** MCP tool (HTTP: `GET
-> /coord/twin/delivery/verdict?plan_slug=<stem>` on the SSO surface). It returns
-> a `DriftVerdict` (`instance="delivery"`) that joins the plan's lifecycle
-> status ⋈ its cited PRs' merged-state (observed against **origin**, not your
-> checkout) ⋈ best-effort deploy state — **with `staleness_seconds`**, so a
-> stale answer is visibly stale. Read `components.status`, `components.prs[]`
-> (`{repo,pr,merged}`), `components.all_merged`, and `drift_class`
-> (`delivery:shipped_but_unmerged` = stamped shipped but a cited PR is still
-> open; `delivery:merged_but_unstamped` = PRs merged under a not-yet-shipped
-> plan). NEVER judge landed-state from a local working tree — a local tree can
-> be days stale (the 2026-06-15 stale-checkout incident this tool was built to
-> prevent; pair with the `fetch-origin-before-judging-landed-state` lesson). The
-> tool observes origin so you don't have to fetch-and-guess. The local `git`
-> checks above remain valid for locating *which commit* implements a claim once
-> the twin confirms it landed — they are not the authority on *whether* it
-> landed.
+> **Canonical "is it shipped / landed?" check — ask coord, not a local tree.**
+> Before deciding a plan or PR has (or hasn't) landed, read coord's derived
+> delivery. **There are two doors, and which one you can open depends on your
+> principal.**
+>
+> - **The agent door, and the one this skill's case-1 guard reads for every
+>   principal:**
+>   `coord_work_unit_list_citations(<stem>)` → `.delivery` (HTTP twin
+>   `GET /coord/agent-work-units/<stem>/citations`, device or agent JWT). It is
+>   coord's own delivery reduction over the plan's PR citations: `shipped`,
+>   `evidence_complete`, `evidence_gaps`, `phases_declared_indices`,
+>   `phases_delivered`, `phases_attested`, `phase_attestations`,
+>   `phases_complete_scope` and `phases_remaining`, with each citation's merged-state
+>   observed against **origin**. Read it through `/vet-plan` §0.25's arm table,
+>   in that table's order (4, 3, 2, 1, 5, then 6). §5 "Settling case 1" below
+>   says which arm lets this skill write. When it reads arm 2 because
+>   `evidence_gaps` names a stale or never-observed citation, run
+>   `coord_work_unit_refresh_citations(<stem>)` once and read again. That door
+>   is the write-through read devices are granted for exactly this case. An
+>   agent-minted (bootstrap) credential is refused it. That refusal leaves the
+>   arm-2 read standing as UNKNOWN. It is never a verdict, and never permission
+>   to write.
+> - **The operator door:** the **`coord_query_delivery`** twin tool (HTTP:
+>   `GET /coord/twin/delivery/verdict?work_unit_slug=<stem>` on the SSO surface;
+>   `plan_slug` is a deprecated alias of that parameter). coord withholds it from
+>   device and agent principals on purpose (`TWIN_QUERY_TOOLS_WITHHELD` in
+>   qontinui-coord `agent_tool_access.rs`). Its HTTP twin answers a device JWT
+>   `401 invalid operator token`. So an agent session uses the door above. A
+>   refusal here is a fact about your principal, never about the plan.
+>   `coord_query_delivery` returns a `DriftVerdict` (`instance="delivery"`)
+>   that joins the plan's lifecycle status ⋈ its cited PRs' merged-state
+>   (observed against **origin**, not your checkout) ⋈ best-effort deploy
+>   state — **with `staleness_seconds`**, so a stale answer is visibly stale.
+>   Read `components.status`, `components.prs[]` (`{repo,pr,merged}`),
+>   `components.all_merged`, `drift_class` and `drift_subclass`
+>   (`delivery:shipped_but_unmerged` = stamped shipped but a cited PR is still
+>   open; `delivery:merged_but_unstamped` = PRs merged under a not-yet-shipped
+>   plan).
+>
+> NEVER judge landed-state from a local working tree — a local tree can be
+> days stale (the 2026-06-15 stale-checkout incident this check was built to
+> prevent; pair with the `fetch-origin-before-judging-landed-state` lesson).
+> Both doors observe origin, so you don't have to fetch and guess. The local
+> `git` checks above remain valid for locating *which commit* implements a
+> claim once coord's delivery read confirms it landed. For this skill's
+> `SHIPPED` write, only the agent door's arm 1 confirms it (§5). The git checks
+> are not the authority on *whether* it landed.
 
-For plans that span multiple repos (productivity-stack touches qontinui-runner,
-qontinui-navigation, ui-bridge, .claude, qontinui-dev-notes), check each repo's
+For plans that span multiple repos (a plan may touch several application repos,
+the agent config, and the plans repository itself), check each repo's
 log independently.
 
 ### 4. Categorize the plan
@@ -317,8 +386,14 @@ log independently.
 Based on the verification, place each plan in one of:
 
 - **SHIPPED** — every claim verified; no open phase, no missing file/symbol/endpoint.
+  Then read the plan's `## Done when` (below) to choose between bare `SHIPPED`
+  and `SHIPPED — UNCONFIRMED (<claim ids>)`.
 - **PARTIAL** — some claims verified, some missing. Note which.
 - **NOT STARTED** — zero claims verified. The plan is still aspirational.
+
+  `PARTIAL` and `NOT STARTED` are verdict *names* only — neither is ever
+  stamped as the lead word of a status block. §5 appends them to a lifecycle
+  word (`VETTED` or `DRAFT`, by the `<LW>` rule there).
 - **SUPERSEDED** — the plan's body says it's superseded by another plan, OR
   the work is in main but not via the path the plan describes (a different
   approach landed). Cite the superseding artifact.
@@ -346,20 +421,68 @@ the H1:
 <rest of plan body unchanged>
 ```
 
-For PARTIAL:
+For a PARTIAL verdict:
 ```markdown
-> **Status: PARTIAL <YYYY-MM-DD>.** Phases <X>, <Y> shipped (commits <sha>,
-> <sha>). Phase <Z> open: <one-sentence reason>. <Followup ptr if any.>
+> **Status: <LW> <YYYY-MM-DD> — partial: Phase <Z> open (<one-sentence reason>); Phases <X>, <Y> shipped (commits <sha>, <sha>) (verified <YYYY-MM-DD>).** <Followup ptr if any.>
 ```
 
-For NOT STARTED:
+For a NOT STARTED verdict:
 ```markdown
-> **Status: NOT STARTED (verified <YYYY-MM-DD>).** No source-code evidence
-> of any acceptance criterion. <Why it might still be worth doing OR why it's
-> stale — one sentence either way.>
+> **Status: <LW> <YYYY-MM-DD> — not started (verified <YYYY-MM-DD>).** No
+> source-code evidence of any acceptance criterion. <Why it might still be
+> worth doing OR why it's stale — one sentence either way.>
 ```
+
+**The verdict is appended to a lifecycle word, never used as one.** `PARTIAL`
+and `NOT STARTED` are not in `plan-discipline`'s vocabulary: the runner's plan
+adapter pushes the stamp's first token to coord, where both land as
+off-vocabulary statuses. The `<LW>` (lifecycle word) rule:
+
+- **`<LW>` is `VETTED` ONLY when the stamp being replaced led with `VETTED`;
+  otherwise it is `DRAFT`.** `vetted` is an Attested status in coord, and an
+  adapter push coord refuses with a 403 retires the slug for the whole runner
+  process. The legacy `PARTIAL` / `NOT STARTED` lead words were Free, so
+  writing `VETTED` over an `IN PROGRESS`, a `SHIPPED` over-claim, a `DRAFT`, a
+  legacy `PARTIAL` or an unstamped plan would add an attested push the old
+  spelling never made. Never upgrade the lifecycle word.
+- **When `<LW>` is `VETTED`, carry the replaced block's `> Vetted-by:` …
+  `> Independence:` lines verbatim** as the last lines of the new block, after
+  any `History:` line (where `/vet-plan` §5 and `/implement-plan` Step 0.5 put
+  them; Step 0.5 reads them).
+- **Never write "in progress" in the headline.** `/vet-imp-sweep` reads any
+  `IN PROGRESS` in the headline as ownership by a live session. Say "open" or
+  "remains" instead.
+- The `IN PROGRESS` guard below is unchanged: a guarded `IN PROGRESS` is never
+  overwritten by either form.
 
 For SUPERSEDED / OBSOLETE: cite the replacement or the reason.
+
+**A SHIPPED verdict reads the plan's `## Done when` before it is written**
+(roster rule: `.claude/commands/_status-writers.md` → "The `Done when` rule").
+"Every claim verified live in code" is this skill's evidence that the code
+LANDED; the plan's `## Done when` says what it was FOR, as claims coord
+re-verdicts itself. Read every claim the section names — cited
+`domain_spec/<name>#<claim_id>` and the `claim:` ids of any appended probe blocks —
+from the served `claims[]` (`coord_get_prompt_document`):
+
+- all `confirmed` → the SHIPPED block above, plus one line
+  `Done when: <claim id> confirmed @<observed_at>; …`;
+- any `unknown` / `contradicted` / absent from the served array / unreadable →
+  ```markdown
+  > **Status: SHIPPED — UNCONFIRMED (<those claim ids>) <YYYY-MM-DD>.** <1–3
+  > line summary of what's live>. Done when: <claim id> <state> @<observed_at>; …
+  > Commits: <repo>@<sha> (<short msg>); …
+  ```
+- `Done when: no claim — <reason>`, or no such section (a plan predating the
+  template) → bare SHIPPED, quoting the escape or saying `no Done-when section`.
+- a section that is present but unparseable — no claim bullet and no escape
+  line → `SHIPPED — UNCONFIRMED (done-when-unparseable)`, in the UNCONFIRMED
+  block above with `Done when: unparseable` in place of the claim list.
+
+An existing `SHIPPED — UNCONFIRMED (…)` stamp is rewritten to bare `SHIPPED`
+only when every named claim now reads `confirmed`; the claims alone never move
+it to a partial or not-started verdict — the code landed. The runner normalises the
+qualified stamp to `shipped`; the qualifier is for the human reader.
 
 #### Single-stamp invariant — read before stamping
 
@@ -373,7 +496,22 @@ and the body. Before writing your stamp:
    above the first sub-H1 heading, and the difficulty rubric reads it only
    there — moving or deleting it silently reverts the plan to its computed
    rating.)
-1. Read the top of the plan. Identify EVERY top-of-file blockquote that
+1. Read the top of the plan **from `origin/main`, not from the local file**,
+   when the plan directory is inside a git repo:
+   `TOP="$(git -C "$QONTINUI_PLANS_DIR" rev-parse --show-toplevel)"`, then
+   `git -C "$TOP" fetch -q origin +refs/heads/main:refs/remotes/origin/main`
+   (exit status read unpiped — a failed fetch is a STOP for this plan), then
+   record `BASED_ON=$(git -C "$TOP" rev-parse -q --verify
+   "refs/remotes/origin/main:<repo-relative path>")` for this path and read the block from
+   `git -C "$TOP" cat-file -p "$BASED_ON"`. `$QONTINUI_PLANS_DIR` usually names
+   a shared checkout that can be thousands of commits behind, and a guard run
+   against its copy never sees a peer's newer `IN PROGRESS`. Make your edits on
+   a private scratch copy of that blob (`mktemp -d`), never over the shared
+   checkout's file, which may hold a peer's uncommitted edit [policy:
+   `git-operations` `shared-checkout-route-around`]; Step 6 publishes the
+   scratch copy with `--based-on "$BASED_ON"`. Record one line per plan —
+   `<repo-relative path> <BASED_ON> <scratch copy>` — in a private list file
+   (`new` in place of the blob for a path origin does not hold). Identify EVERY top-of-file blockquote that
    asserts a status, lifecycle state, or verification date — lines
    starting `> **Status:`, `> **Edit YYYY-MM-DD —`, or `> **Update:`
    all count. **Record verbatim any block reading `IN PROGRESS`** — its
@@ -389,32 +527,62 @@ and the body. Before writing your stamp:
 3. Then `Edit` again to insert your single new `> **Status:` block.
 4. If folding in history is useful (e.g., the plan was previously
    stamped `VETTED` and your verify pass found it still
-   `NOT STARTED`), include that in **one trailing line inside your
+   not started), include that in **one trailing line inside your
    new block**, prefixed `History:` or `Previously:`. Never as a
    sibling blockquote.
+5. **Carry the `**Area:**`, `Initiative-Item:` and `Depends-On:`
+   declarations.** If any block you are replacing (item 2 deletes every
+   status-adjacent blockquote, not only the Status one) carries an
+   `Area:` declaration (`` > **Area:** `<area>` ``, or a line-leading plain
+   `Area:`), an `Initiative-Item:` line or a
+   `Depends-On:` declaration, carry each verbatim into your new block —
+   `Depends-On:` as the suffix of your new `> **Status:` line, with its stems
+   on the same physical line as the key (the scanner reads only the rest of
+   that line, so a re-wrap that pushes them onto the next `>` line drops
+   them), and `**Area:**` / `Initiative-Item:` each as a `>` line
+   (conventionally directly under the Status line). Each must sit on or
+   below the `> **Status:` line inside that same blockquote, with no blank
+   line or non-`>` line in between — a `>` line above the Status line is not
+   read — and never in a sibling blockquote. The runner's plan scanner reads
+   all three only from this status blockquote, into `metadata.area`,
+   `metadata.initiative_item` and `metadata.depends_on`, and its next push
+   writes what it parsed (every active-directory push is a `metadata` merge
+   patch in which an undeclared `area` or `initiative_item` is sent as
+   `null`, a delete, and an undeclared `depends_on` as `[]`), so a stamp
+   that drops any of them erases it from the work unit's `metadata` on the
+   next scan. For `Depends-On:` that is worse than a clean erase: the runner
+   skips the dependency-edge write for an empty set, so edge rows written
+   earlier survive and coord goes on enforcing a dependency the plan no
+   longer shows.
 
 When `/verify-plan-status` finds existing stamps that disagree with
 what you'd verify (e.g. a plan stamped `VETTED` whose acceptance
-criteria still aren't shipped), consolidate: keep the more useful
-lifecycle indicator in the heading (`Status: VETTED — implementation
-not started.` or `Status: NOT STARTED.`) and put the orthogonal
-finding in the body. Don't leave both.
+criteria still aren't shipped), consolidate: keep the lifecycle word in the heading and append the
+verdict, using the §5 template and its `<LW>` rule (`Status: VETTED
+<date> — not started (verified <date>).` when the replaced stamp led with
+`VETTED`, else `Status: DRAFT <date> — not started …`), and put the
+orthogonal finding in the body. Don't leave both.
 
 #### Lifecycle states this skill writes
 
 | State | When |
 |---|---|
-| SHIPPED | every claim verified live in code |
-| PARTIAL | some phases shipped, others open |
-| NOT STARTED | zero source evidence of any claim |
+| SHIPPED | every claim verified live in code, and every `## Done when` claim reads `confirmed` (or the plan took the escape / predates the section) |
+| SHIPPED — UNCONFIRMED (<claim ids>) | every claim verified live in code, but the named `## Done when` claims do not read `confirmed` |
+| VETTED/DRAFT — partial | some phases shipped, others open (lead word by the `<LW>` rule in §5) |
+| VETTED/DRAFT — not started | zero source evidence of any claim (lead word by the `<LW>` rule in §5) |
+| DRAFT — brainstorm | too vague to verify (## Rules) |
 | SUPERSEDED | a different approach landed; cite the replacement |
 | OBSOLETE | the work no longer applies |
 
-This skill does NOT write `DRAFT`, `VETTED`, or `IN PROGRESS` — those
-are owned by `/vet-plan` and `/implement-plan`. If `/verify-plan-status`
-discovers a plan whose existing `VETTED` stamp disagrees with reality,
-write the more accurate state (`NOT STARTED`, `PARTIAL`, `SHIPPED`) and
-capture the prior state in the History line. **`IN PROGRESS` is the one
+This skill writes `VETTED` or `DRAFT` only as the carried lifecycle word
+of a partial / not-started verdict (and `DRAFT` for a brainstorm one; the `<LW>` rule in §5) — it never
+upgrades a plan to `VETTED`, which `/vet-plan` owns — and never writes
+`IN PROGRESS`, which `/implement-plan` owns. It never writes `PARTIAL` or
+`NOT STARTED` as a lead word. If `/verify-plan-status` discovers a plan
+whose existing `VETTED` stamp disagrees with reality, write the more
+accurate state (`VETTED <date> — not started …`, `VETTED <date> —
+partial: …`, `SHIPPED`) and capture the prior state in the History line. **`IN PROGRESS` is the one
 exception: that stamp is CONDITIONALLY overwritable, never freely, and the
 next subsection governs when.**
 
@@ -434,14 +602,22 @@ the subsection after it is this skill's own disposition.
 > and apply these five rules.
 >
 > 1. **An `IN PROGRESS` stamp is a conditional STOP, not a value to replace.**
->    It protects a live peer's in-flight work.
+>    It protects a live peer's in-flight work. Read the whole HEADLINE, not only
+>    its first token: after a non-terminal first token, an `IN PROGRESS` /
+>    `IN_PROGRESS` anywhere in the headline makes it one
+>    (`VETTED-WITH-CORRECTIONS 2026-10-04, IN PROGRESS.` is; the headline rule is
+>    `/vet-imp-sweep` Step 3 filter 3b's).
 > 2. **The discriminator is the SESSION MARKER, not the token.** A marker that
 >    IS your own current session id is a resume: refresh the date and keep the
 >    trail, never take over. A marker that is a different session id is a LIVE
 >    PEER unless you can positively verify that session died with zero work
->    products — transcript tail shows death, its worktrees clean and 0 ahead of
->    `origin/main`, and no PRs and no branches for the plan. Verified dead, and
->    only then, adopt it and append your own marker.
+>    products — transcript tail shows death (a death read on THIS device also
+>    needs `bash <workspace-root>/qontinui-claude-config/scripts/lib/claude-successor.sh <sid>`
+>    to answer 1, and a 0 or 2 is a STOP; across machines, `/vet-plan`'s "Case
+>    2 across machines" decides), its worktrees clean and 0 ahead of
+>    `origin/main`, and no PRs and no branches for the plan — **or that it
+>    delegated the plan to a hold gate whose continuation you are (the arm
+>    table's case 2b)**. Only then adopt it and append your own marker.
 > 3. **No marker, or one you cannot positively attribute, is the UNIDENTIFIED
 >    DEFAULT: STOP.** Not an overwrite, and not an adoption. Adoption is the
 >    earned branch; stopping is the fallback.
@@ -461,9 +637,9 @@ another command**. `/vet-plan` §5 ("`IN PROGRESS` is CONDITIONALLY
 overwritable") and `/implement-plan` Step 0.5 both treat it as a conditional
 **STOP**: a stamp whose session marker is not positively attributable to the
 reading session is a live peer, or an unattributable stamp, and both stop the
-run. Those same two commands declare `PARTIAL` and `NOT STARTED` **freely**
-overwritable — `/vet-plan` §5: "`PARTIAL` and `NOT STARTED` are fine to
-overwrite"; `/implement-plan` Step 0.5: "replace it with the IN PROGRESS
+run. Those same two commands declare the partial / not-started stamps **freely**
+overwritable — `/vet-plan` §5: "the partial / not-started forms … and the
+legacy `PARTIAL` and `NOT STARTED` are fine to overwrite"; `/implement-plan` Step 0.5: "replace it with the IN PROGRESS
 block".
 
 So a verify pass that rewrites a peer's `IN PROGRESS` to `NOT STARTED` does not
@@ -496,25 +672,70 @@ The cases map onto this skill's verbs:
 | `/vet-plan` case | Disposition here |
 |---|---|
 | 0 — the marker **is your own** current session id | **Reachable, and not rare** — the marker names a *session*, not a command, and one session routinely runs `/implement-plan` (which stamps it) and later `/verify-plan-status`, directly or through `/pvi` or `/vet-imp`. There is no peer to protect here: **write the verified state freely**, naming the prior stamp as your own in the `History:` line. Evaluate this row FIRST — it is a positively attributed marker, so it must never fall to the unidentified default, which is defined by the absence of exactly that attribution. |
-| 1 — the work has **landed** (delivery arm 1) | The plan is closed in substance. Write **`SHIPPED`** — a state this skill owns — when your own evidence scan agrees. If it does **not** agree, that disagreement IS the finding (a `delivery:` drift class): report it and leave the block alone. Never resolve it by writing `NOT STARTED` or `PARTIAL` over the marker. **Deliberate divergence, do not "restore consistency":** `/vet-plan` case 1 says *refuse and route to closeout* because `/vet-plan` writes only `VETTED`. Writing `SHIPPED` here IS that closeout — §5's own closeout paragraph assigns the plan-file terminal status to whoever can write it ("always yours to write"), and `SHIPPED` is this skill's state. Flipping this row to "refuse" would delete the only path by which a landed plan ever gets closed. |
-| 2 — the stamping session is **dead with zero work products** (its transcript tail shows death, **and** its worktrees are clean and 0 ahead of `origin/main`, **and** no PRs and no branches exist for the plan) | Free to write the verified state. Name both the prior marker and the death evidence in the `History:` line. |
-| 3 — a **live peer** (marker ≠ yours and case 2's checks do not all hold) | **Do not overwrite.** Leave `IN PROGRESS` standing and report the plan as *in flight — not verifiable this pass*. |
+| 1 — the work has **landed** (delivery arm 1) | The plan is closed in substance. Write **`SHIPPED`** — a state this skill owns — when your own evidence scan agrees. If it does **not** agree, that disagreement IS the finding (coord's delivery read says landed and your evidence scan does not; on the operator door, a `delivery:` drift subclass): report it and leave the block alone. Never resolve it by writing `NOT STARTED` or `PARTIAL` over the marker. **Deliberate divergence, do not "restore consistency":** `/vet-plan` case 1 says *refuse and route to closeout* because `/vet-plan` writes only `VETTED`. Writing `SHIPPED` here IS that closeout — §5's own closeout paragraph assigns the plan-file terminal status to whoever can write it ("always yours to write"), and `SHIPPED` is this skill's state. Flipping this row to "refuse" would delete the only path by which a landed plan ever gets closed. |
+| 2 — the stamping session is **dead with zero work products** (its transcript tail shows death, **and**, for a death read on this device, no live successor carries its id — `/vet-plan`'s successor void rule: `claude-successor.sh <sid>` answers 1, and a 0 or 2 is case 3 — **and** its worktrees are clean and 0 ahead of `origin/main`, **and** no PRs and no branches exist for the plan) | Free to write the verified state. Name both the prior marker and the death evidence in the `History:` line. |
+| 2b — **gate-delegated**: you are the cleared continuation of the hold gate G that the block's last `Held behind gate <full gate_id> (<predicate>; anchor <work_unit_id>)` line names (every `/vet-plan` case-2b conjunct read; the `anchor` token is parsed from the right) | Free to write the verified state. Name G and the prior marker, REPLACING the `Held behind gate` line with `History: adopted from <prior session id> via consumed hold <G full id>` — never keep it. |
+| 3 — a **live peer** (marker ≠ yours and neither case 2's nor case 2b's checks hold) | **Do not overwrite.** Leave `IN PROGRESS` standing and report the plan as *in flight — not verifiable this pass*. |
 | — **unidentified default**: no marker at all, or one you cannot positively attribute | **Do not overwrite**, exactly as case 3. An absent marker cannot reach case 2, because case 2's probes are keyed on a session id and there is none to probe. |
 
-**Settling case 1 — and this command has no mandatory capture step, so there
-are FOUR branches, not three.** The `coord_query_delivery` twin documented
-above settles case 1 on its own: a `delivery:merged_but_unstamped` verdict on a
-plan stamped `IN PROGRESS` **is** case 1.
+**Settling case 1.** Case 1 is settled by the delivery read §3 names,
+`coord_work_unit_list_citations(<stem>).delivery`, for every principal. Read
+it through `/vet-plan` §0.25's arm table, in its stated order: 4, 3, 2, 1, 5,
+then 6. That table is the one authority for the read. Do not restate its
+predicate here, because a shorter copy is a weaker one. **Case 1 holds only on
+arm 1, with every one of its conjuncts.** Those include the phase
+corroboration and the absence of a `NO PHASE ATTRIBUTION` gap, so
+`shipped: true` with `evidence_complete: true` alone is not enough. Arms 2, 3
+and 6 do not establish landing. Arm 6 includes `/vet-plan`'s partial-delivery
+sub-case. Arms 4 and 5 say the work has not landed. **None of them is case
+1**, so none of them lets this skill write `SHIPPED` on delivery grounds. The
+table's other rows (0, 2, 2b, 3 and the default) still decide on their own
+terms. One exception applies before you settle: an arm-2 read whose
+`evidence_gaps` names a stale or never-observed citation gets one
+`coord_work_unit_refresh_citations(<stem>)` and one re-read. The re-read's arm
+is the answer. On a device bound to more than one tenant, `/vet-plan` §0.25's
+per-tenant fold applies too, and a `FOUND` names the tenant that holds the
+delivered unit.
 
-- **You already issued the read** (§3 sent you there) — consume it. Do not
-  issue a second one.
+An operator's `coord_query_delivery` verdict of `delivery:merged_but_unstamped`
+is a **lead, not case 1**. coord documents that drift class as a fact about
+stamp-merge agreement, never about feature completeness. It carries no phase
+corroboration, so it would close a five-phase plan after its Phase-1 PR merged.
+Follow it with the arm-1 read above before writing anything. An agent cannot
+open that door (§3), so a refusal from it decides nothing.
+
+This command has no mandatory capture step, so the arm-1 read has **FOUR
+branches, not three**:
+
+- **You already issued the read** (§3 sent you there) — consume it,
+  including any refresh and re-read §3 already ran. Do not issue a second
+  read, and run the refresh at most once per plan per pass.
 - **You have NOT issued one.** Issue it now. This is the ordinary path: §3
   scopes its read to "before deciding a plan or PR has (or hasn't) landed",
   which a sweep may never have reached for this plan.
-- **The tool is not visible** — masked, absent, or on a dead transport
-  (`"Command failed with no output"`) — or the read is unreachable,
-  unparseable, or non-2xx. **UNKNOWN.**
+- **The agent-door read cannot be completed.**
+  `coord_work_unit_list_citations` is masked, absent or on a dead transport
+  (`"Command failed with no output"`), or it returns an unreachable,
+  unparseable or non-2xx answer, **and** its HTTP twin
+  `GET /coord/agent-work-units/<stem>/citations` fails too. **UNKNOWN.** On a dead transport, run `/coord-revive` and re-issue
+  the read over the door it reports LIVE before you conclude anything.
 - **Anything else.** UNKNOWN.
+
+**Name the arm in the `History:` line when you write `SHIPPED` over an
+`IN PROGRESS` stamp**, for example `case 1: list_citations arm 1, tenant <id>
+(shipped, evidence_complete, phases_remaining [] corroborated by non-empty
+phases_declared_indices covered by phases_delivered, no NO PHASE ATTRIBUTION gap)`;
+when a declared phase was covered by a resolved attestation instead, name it:
+`… covered by phases_delivered [1] + phases_attested [0] (attestation phase 0 →
+<evidence_kind> <evidence_ref>, resolution resolved), …` — the fields a
+`phase_attestations` row carries; the delivery read serves no attestation id.
+When `phases_complete_scope` was the literal `true` instead, name the citation
+that carried it. The bool names no citation, so read it off the cited PRs (the
+citations list names them): the landed one whose body carries a
+`Plan: … delivers: complete` marker. If you cannot identify it, write the line
+without the parenthetical rather than guess: `… phases_remaining [] corroborated by phases_complete_scope
+true (landed complete-scoped citation <repo>#<n>), no NO PHASE ATTRIBUTION
+gap)`. Then a later reader can check the verdict without re-deriving it.
 
 **UNKNOWN lands on the unidentified default (do not overwrite), never on "not
 started"** — `verification-and-evidence` `unknown-must-not-render-as-a-default`.
@@ -534,7 +755,9 @@ unexitable-looking guard is exactly the condition under which
 [[feedback_plan_already_stamped_by_other_session_is_live_peer]] was talked
 past, at the cost of a full wasted implementation (PR #479 against PR #468).
 
-`DRAFT`, `VETTED`, `PARTIAL` and `NOT STARTED` get none of this treatment —
+`DRAFT`, `VETTED` (including the `VETTED/DRAFT <date> — partial` / `— not
+started` forms this skill writes) and the legacy `PARTIAL` / `NOT STARTED`
+lead words get none of this treatment —
 nothing downstream reads them as a peer-liveness signal. This subsection is
 scoped to `IN PROGRESS` alone.
 
@@ -593,13 +816,19 @@ have landed, where the stamp goes `DIRTY` and the first PR is left unobserved
 ```bash
 if git -C "$QONTINUI_PLANS_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   TOP="$(git -C "$QONTINUI_PLANS_DIR" rev-parse --show-toplevel)"
-  for P in <stamped paths>; do          # absolute paths of the stamped .md files
-    bash <workspace-root>/qontinui-claude-config/scripts/land-plan-stamp.sh \
-      "$TOP" "${P#"$TOP"/}" "$P" \
-      "docs(plans): status-stamp $(basename "$P" .md) — verified against source <date>"
-  done
+  # One line per stamped plan, from sub-step 1: <repo-relative path> <blob it read> <scratch copy>
+  while read -r REL BASED_ON COPY; do
+    bash <workspace-root>/qontinui-claude-config/scripts/land-plan-stamp.sh --based-on "$BASED_ON" \
+      "$TOP" "$REL" "$COPY" \
+      "docs(plans): status-stamp $(basename "$REL" .md) — verified against source <date>"
+  done < "<the stamp list sub-step 1 wrote>"
 fi
 ```
+
+**Exit 7 (STALE BASE)** means origin no longer holds the blob sub-step 1 read:
+re-read that plan from origin, re-run the single-stamp invariant and the
+`IN PROGRESS` guard against it, then re-stamp with the new blob — or report it
+unstamped (`_status-writers.md` → "Publishing a stamp — the compare-and-swap").
 
 Each call prints exactly one verdict line — `LANDED <commit|unchanged> <blob>` or
 `PROPOSED <pr-url|branch> <branch>` — and that line is the evidence the stamp is
@@ -608,7 +837,8 @@ path rather than counting it in the final report's totals.
 
 If the check fails, the plan directory is a plain folder: the stamped files on disk
 are the record, there is nothing to commit or push, and you must not create a repo to
-hold them. (Closeout push authority covers docs/plans diffs wherever a repo exists.)
+hold them. That arm does not call `land-plan-stamp.sh` at all, so it has no
+`--based-on` and no compare: a plain folder has no origin to race. (Closeout push authority covers docs/plans diffs wherever a repo exists.)
 
 ### 7. Final report
 
@@ -618,7 +848,11 @@ Single message back to the user:
 Verified <N> plans in <scanned dir(s)>.
 
 SHIPPED:
-  - <plan>.md — <one-line shipment summary>
+  - <plan>.md — <one-line shipment summary>; Done when: <claims confirmed | escape | no section>
+  ...
+
+SHIPPED — UNCONFIRMED (landed; Done-when claims not confirmed):
+  - <plan>.md — <claim id> <state> @<observed_at>, ...
   ...
 
 PARTIAL:
@@ -685,9 +919,12 @@ status" item in the report so the user can correct it.
   **And never `mv`/`git mv` a plan file at all** — plans are stamped in place
   (§6); there is no in-progress → completed migration.
 - **Don't touch in-progress plans you can't verify.** If a plan's claims are
-  too vague to check (e.g. a brainstorm doc), stamp it `Status: BRAINSTORM
-  (verified <date>) — no concrete acceptance criteria; not actionable as-is`
-  and leave it where it is.
+  too vague to check (e.g. a brainstorm doc), stamp it `> **Status: DRAFT
+  <YYYY-MM-DD> — brainstorm (verified <YYYY-MM-DD>): no concrete acceptance
+  criteria; not actionable as-is.**` and leave it where it is. The lead word is
+  `DRAFT`, never `BRAINSTORM` (off-vocabulary, rejected by the plan-status
+  contract gate), and it is always `DRAFT` — a plan too vague to verify is not
+  carried as `VETTED`.
 
 ## Implementation Notes
 

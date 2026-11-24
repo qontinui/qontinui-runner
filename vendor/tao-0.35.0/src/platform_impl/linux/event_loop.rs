@@ -8,7 +8,10 @@ use std::{
   error::Error,
   process,
   rc::Rc,
-  sync::atomic::{AtomicBool, Ordering},
+  sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+  },
   time::Instant,
 };
 
@@ -57,7 +60,7 @@ pub struct EventLoopWindowTarget<T> {
   /// Gtk application
   pub(crate) app: gtk::Application,
   /// Window Ids of the application
-  pub(crate) windows: Rc<RefCell<HashSet<WindowId>>>,
+  pub(crate) windows: Arc<RefCell<HashSet<WindowId>>>,
   /// Window requests sender
   pub(crate) window_requests_tx: glib::Sender<(WindowId, WindowRequest)>,
   /// Draw event sender
@@ -247,7 +250,7 @@ impl<T: 'static> EventLoop<T> {
     let window_target = EventLoopWindowTarget {
       display,
       app,
-      windows: Rc::new(RefCell::new(HashSet::new())),
+      windows: Arc::new(RefCell::new(HashSet::new())),
       window_requests_tx,
       draw_tx: draw_tx_,
       _marker: std::marker::PhantomData,

@@ -35,6 +35,7 @@
 //! module; they are deliberately absent until the P1 work-unit API lands.
 
 pub mod body_push;
+pub mod metadata;
 pub mod parser;
 pub mod push;
 pub mod ref_scan;
@@ -52,15 +53,16 @@ pub use body_push::{
     ScanRootKind, ScanRootReport, ScanRootReporter, ScannedArtifact,
 };
 pub use parser::{
-    parse_work_unit, slug_from_filename, ParsedPhase, ParsedWorkUnit, PlanConvention,
+    parse_work_unit, slug_from_filename, ParsedLabelPhase, ParsedPhase, ParsedWorkUnit,
+    PlanConvention,
 };
 pub use push::{push_work_unit, HttpWorkUnitSink, PushOutcome, PushOutcomeKind, WorkUnitSink};
 pub use trigger::{
-    adapter_metrics, backfill_work_units_once, measure_scan_divergence, newly_disappeared_slugs,
-    read_device_binding_count, reconcile_archive_once, reconcile_once, resolve_plans_archive_dir,
-    resolve_plans_dir, resolve_prompts_dir, scan_plan_dir, scan_roots_at_source,
-    spawn_if_configured, work_unit_write_posture, ArchiveSummary, BindingCountReading, CycleScan,
-    GitRefReader, MetricsSnapshot, PathInputs, PathReader, PlanDirScan, ProcessGit,
-    ReconcileSummary, RetiredSlugs, RetirementReason, ScanCensusInputs, ScanDivergence,
-    ScanDivergenceState, WorkUnitBackfillSummary, WorkUnitWritePosture,
+    adapter_metrics, backfill_work_units_once, newly_disappeared_slugs, read_device_binding_count,
+    reconcile_archive_once, reconcile_once, resolve_plans_archive_dir, resolve_plans_dir,
+    resolve_prompts_dir, scan_plan_dir, scan_roots_at_source, spawn_if_configured,
+    work_unit_write_posture, ArchiveSummary, BindingCountReading, CycleScan, GitRefReader,
+    MetricsSnapshot, PathInputs, PathReader, PlanDirScan, ProcessGit, ReconcileSummary,
+    RetiredSlugs, RetirementReason, ScanCensusInputs, ScanDivergence, ScanDivergenceState,
+    WorkUnitBackfillSummary, WorkUnitWritePosture,
 };

@@ -250,15 +250,17 @@ export const aiDataService = {
   },
 
   /**
-   * Get Playwright test results from SQLite database.
+   * Get one keyset page of a run's Playwright results.
    * @param taskRunId - Task run ID to get results for
+   * @param limit - Page size (default 200, max 1000)
+   * @param cursor - The previous page's `next_cursor`; omit for the first page
    */
   async getTaskRunPlaywrightResults(
     taskRunId: string,
     limit?: number,
-    offset?: number,
+    cursor?: string,
   ): Promise<AiDataResponse<TaskRunPlaywrightResultsDbResult>> {
-    return invoke("get_task_run_playwright_results_from_db", { taskRunId, limit, offset });
+    return invoke("get_task_run_playwright_results_from_db", { taskRunId, limit, cursor });
   },
 
   /**
@@ -275,28 +277,32 @@ export const aiDataService = {
    * Get API requests for a task run from SQLite database.
    * @param taskRunId - Task run ID to get API requests for
    * @param successFilter - Optional filter by success status (true = success only, false = failures only)
+   * @param limit - Page size (default 200, max 1000)
+   * @param cursor - The previous page's `next_cursor` (minted under the same filter); omit for the first page
    */
   async getTaskRunApiRequests(
     taskRunId: string,
     successFilter?: boolean,
     limit?: number,
-    offset?: number,
+    cursor?: string,
   ): Promise<AiDataResponse<TaskRunApiRequestsDbResult>> {
-    return invoke("get_task_run_api_requests_from_db", { taskRunId, successFilter, limit, offset });
+    return invoke("get_task_run_api_requests_from_db", { taskRunId, successFilter, limit, cursor });
   },
 
   /**
    * Get AWAS steps for a task run from SQLite database.
    * @param taskRunId - Task run ID to get AWAS steps for
    * @param stepType - Optional filter by step type ('awas_discover', 'awas_execute', etc.)
+   * @param limit - Page size (default 200, max 1000)
+   * @param cursor - The previous page's `next_cursor` (minted under the same filter); omit for the first page
    */
   async getTaskRunAwasSteps(
     taskRunId: string,
     stepType?: string,
     limit?: number,
-    offset?: number,
+    cursor?: string,
   ): Promise<AiDataResponse<TaskRunAwasStepsDbResult>> {
-    return invoke("get_task_run_awas_steps_from_db", { taskRunId, stepType, limit, offset });
+    return invoke("get_task_run_awas_steps_from_db", { taskRunId, stepType, limit, cursor });
   },
 
   /**

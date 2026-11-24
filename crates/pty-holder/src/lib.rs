@@ -7,10 +7,13 @@
 //! holder process (D13: one holder per pane) that outlives the runner; this
 //! crate is that holder's skeleton and the runner's way of talking to it.
 //!
-//! **Phase 1 is transport only — there is no PTY here.** The holder takes its
-//! lock, binds its endpoint, and answers the handshake, `census`, `ping` and
-//! (typed `unsupported`) `prepare_upgrade`. Phase 2 adds the PTY and
-//! `DaemonPaneIo` in the runner.
+//! **Phase 2: the holder owns its pane's PTY.** It is started with the child's
+//! spec ([`spec`]), takes its lock, spawns the child on a PTY it keeps ([`pty`]),
+//! binds its endpoint, and serves the data path (protocol version 2: attach
+//! with an offset, output frames with absolute offsets, input, resize,
+//! pause/resume, kill, detach, exit) beside Phase 1's handshake / `census` /
+//! `ping` / `prepare_upgrade`. The runner spawns holders through [`spawn`];
+//! its `DaemonPaneIo` is the client of [`client::Client::attach`].
 //!
 //! Why a separate crate and binary (the D3 decision of 2026-09-28): the
 //! re-exec'd runner binary cost 24.4 MB of private memory per holder, and D13
@@ -26,15 +29,51 @@
 //! - [`pane`] — pane ids and the paths / pipe name derived from them.
 //! - [`lock`] — the per-pane advisory lock and its record.
 //! - [`transport`] — Unix socket / Windows named pipe, OS-level authorization (D5).
-//! - [`server`] — the holder: start-up order and the allowlisted dispatch.
-//! - [`client`] — connect + handshake, `probe`, `census`.
+//! - [`spec`] — the child spec, delivered as a consumed 0600 file.
+//! - [`ring`] — the bounded output ring with absolute offsets.
+//! - [`modes`] — the terminal-mode tracker behind an attach's restore
+//!   envelope (Phase 2b, D14); [`metadata`] — its cwd/title as reply strings.
+//! - [`scrollback`] — the ring's durable, offset-anchored tail on disk (Phase
+//!   4, D7): capped, 0600, atomically replaced on a timer with a change mark.
+//! - [`pty`] — the PTY, the child, and when the holder may exit.
+//! - [`startup`] — fd closing, `SIGCHLD`, `setsid`, stdio: the holder's first
+//!   acts.
+//! - [`server`] — the holder: start-up order, the allowlisted dispatch, the
+//!   per-connection output pump.
+//! - [`client`] — connect + handshake, `probe`, `census`, `attach`.
+//! - [`spawn`] — the RUNNER side of a holder's birth: cgroup escape, Windows
+//!   job breakaway and its WMI fallback, the ready line, verified-pid
+//!   teardown, reaping.
+//! - [`proc_identity`] — a process's start token, so a recorded pid can be
+//!   told from a recycled one (Phase 3).
+//! - [`reap`] — a pane's process tree is reaped by its own holder at pane end,
+//!   and a dead holder's proven remainder by the boot sweep (Phase 3, D8).
+//! - [`sweep`] — the boot sweep: the per-pane lock directory IS the orphan
+//!   ledger; live panes are handed to the caller to adopt (Phase 3).
+//! - `handoff` (Unix only) — the in-place holder upgrade: `prepare_upgrade`
+//!   hands a live pane to a successor holder by an inherited master fd, ack
+//!   before dispose (Phase 8, D12a). Windows has none (D12).
 
 pub mod client;
 pub mod frame;
+#[cfg(unix)]
+pub mod handoff;
 pub mod lock;
+pub mod metadata;
+pub mod modes;
 pub mod pane;
+pub mod proc_identity;
 pub mod protocol;
+pub mod pty;
+pub mod reap;
+pub mod ring;
+pub mod scrollback;
 pub mod server;
+pub mod spawn;
+pub mod spec;
+pub mod startup;
+pub mod sweep;
+pub mod terminate;
 pub mod transport;
 
 #[cfg(test)]

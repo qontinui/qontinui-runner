@@ -269,10 +269,12 @@ test("resolveBudgetMs reads the knob and falls back to the 3-minute default, nev
 // 102391645194) while still reporting green, because the step is
 // `continue-on-error`.
 //
-// Reordering is not the fix: `Unpoison` has no `if: always()`, so a red suite
-// skips it, and a red suite is precisely what this ingest exists to record. The
-// step therefore carries its own `COORD_HTTP_URL`, which beats $GITHUB_ENV for
-// that step alone.
+// Reordering was not the fix when this guard was written: `Unpoison` then had
+// no `if: always()`, so a red suite skipped it, and a red suite is precisely
+// what this ingest exists to record. It runs always() since 2026-11-03 (a
+// self-hosted Windows registration keeps the poison in its real, persistent
+// profile), but it is still ordered AFTER the ingest. The step therefore
+// carries its own `COORD_HTTP_URL`, which beats $GITHUB_ENV for that step alone.
 //
 // ===========================================================================
 // WHAT THIS GUARD DOES NOT DO -- read before adding to it

@@ -80,9 +80,12 @@ import {
   parseConcurrencyInput,
   parseThreadCeilingInput,
   type CiNodeHostSuggestion,
+  unsetConcurrencyCount,
+  unsetConcurrencyText,
   type ThreadCeilingsReport,
   parseRepoAllowlist,
   sessionFloorsAreInverted,
+  threadCeilingPlaceholder,
   threadCeilingSourceText,
   threadCeilingsAreInverted,
 } from "./resourceGuardHelpers";
@@ -752,7 +755,7 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
                     hostSuggestion.mem_gib ?? "unknown"
                   } GB)`
                 : "Suggestion unavailable"}
-              {ciNode.max_concurrent_builds === null ? " — in use (not set explicitly)." : "."}
+              .
             </p>
             <button
               type="button"
@@ -764,9 +767,23 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
               disabled={!ciNode.enabled || ciNode.max_concurrent_builds === null}
               className="text-[10px] px-2 py-0.5 rounded-md bg-muted/50 hover:bg-muted disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              {hostSuggestion ? `Use suggested (${hostSuggestion.suggested})` : "Use suggested"}
+              {(() => {
+                const n = unsetConcurrencyCount(hostSuggestion);
+                return n === null ? "Clear to unset" : `Clear to unset (${n})`;
+              })()}
             </button>
           </div>
+          {(() => {
+            const text = unsetConcurrencyText(hostSuggestion);
+            return text ? (
+              <p
+                data-ui-bridge-id="settings.resource-guard-max-builds-unset-resolves-to"
+                className="text-[10px] text-muted-foreground"
+              >
+                {text}
+              </p>
+            ) : null;
+          })()}
           {ciNode.enabled &&
             (() => {
               const warning = concurrencyAboveSuggestionWarning(
@@ -786,9 +803,10 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
               ) : null;
             })()}
           <p className="text-[10px] text-muted-foreground">
-            Also the build capacity this device advertises to coord. Unset follows the host
-            suggestion; an explicit value always wins, and &quot;Use suggested&quot; returns to it.
-            Range {MAX_CONCURRENT_BUILDS_MIN}-{MAX_CONCURRENT_BUILDS_MAX}.
+            Also the build capacity this device advertises to coord. Unset follows coord&apos;s
+            capacity model when it answers, else the host suggestion; an explicit value always wins,
+            and &quot;Clear to unset&quot; returns to it. Range {MAX_CONCURRENT_BUILDS_MIN}-
+            {MAX_CONCURRENT_BUILDS_MAX}.
           </p>
         </div>
 
@@ -819,7 +837,7 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
             className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
           />
           <p className="text-[10px] text-muted-foreground">
-            Free space required on the QONTINUI_ROOT volume to START a build. Cannot be 0 — a zero
+            Free space required on the Workspace root volume to START a build. Cannot be 0 — a zero
             floor disables the guard rather than relaxing it.
           </p>
         </div>
@@ -917,7 +935,6 @@ function ThreadCeilingInput({
   help,
 }: ThreadCeilingInputProps) {
   const id = `resource-guard-${tier}-threads`;
-  const enforced = report ? report[tier] : null;
   return (
     <div className="space-y-1.5">
       <label className="text-xs font-medium" htmlFor={id}>
@@ -931,13 +948,7 @@ function ThreadCeilingInput({
         max={THREAD_CEILING_ABS_MAX}
         step={1}
         value={draft ?? value ?? ""}
-        placeholder={
-          // Only when the report IS the machine default may its number be
-          // quoted as one; anything else would be re-deriving the fold here.
-          enforced !== null && report?.provenance[tier] !== "local"
-            ? `machine default (${enforced})`
-            : "machine default"
-        }
+        placeholder={threadCeilingPlaceholder(tier, report)}
         onChange={(e) => onDraft(e.target.value)}
         onBlur={() => {
           if (draft === null) return;

@@ -523,6 +523,12 @@ impl AgentSkillRegistry {
             .or_else(|| self.builtin.iter().find(|s| s.name == name))
     }
 
+    /// The embedded default named `name`, whatever overrides it — its files are
+    /// the paths the vendoring repository's history can add.
+    pub fn builtin(&self, name: &str) -> Option<&ResolvedSkill> {
+        self.builtin.iter().find(|b| b.name == name)
+    }
+
     /// How many defaults are embedded in this binary.
     pub fn builtin_count(&self) -> usize {
         self.builtin.len()
@@ -569,7 +575,7 @@ struct CachedSkills {
 /// Absolute path of the skill cache for this runner instance, or `None` when
 /// the platform has no config dir.
 fn cache_path() -> Option<PathBuf> {
-    let base = dirs::config_dir()?.join("com.qontinui.runner");
+    let base = qontinui_runner_lib::instance_env::runner_config_base()?;
     Some(crate::instance::scope_path(&base).join(CACHE_FILE))
 }
 

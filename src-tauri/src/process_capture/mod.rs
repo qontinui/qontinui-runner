@@ -24,6 +24,7 @@
 //!             └─ Existing dedup + SQLite storage
 //! ```
 
+pub mod agent_cli;
 pub mod build_errors;
 pub mod cleanup;
 pub mod commands;
@@ -32,6 +33,7 @@ pub mod manager;
 pub mod orphan_state;
 pub mod primary_proxy;
 pub(crate) mod process;
+pub mod process_table;
 pub mod process_tree;
 pub mod stream_parser;
 pub mod types;

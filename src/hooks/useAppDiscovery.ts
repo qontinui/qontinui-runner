@@ -11,6 +11,7 @@
 
 import { useState, useCallback, useEffect, useRef } from "react";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { describeThrown } from "@/lib/utils";
 
 // ============================================================================
 // Types
@@ -175,8 +176,8 @@ export function useAppDiscovery(): UseAppDiscoveryReturn {
       setMobileDevices(result.mobile);
       setLastScanAt(result.scannedAt);
     } catch (err) {
-      if ((err as Error).name !== "AbortError") {
-        setError((err as Error).message);
+      if (!(err instanceof Error && err.name === "AbortError")) {
+        setError(describeThrown(err, "App scan failed"));
       }
     } finally {
       setIsScanning(false);
@@ -193,7 +194,7 @@ export function useAppDiscovery(): UseAppDiscoveryReturn {
       setWebApps(apps);
       setLastScanAt(Date.now());
     } catch (err) {
-      setError((err as Error).message);
+      setError(describeThrown(err, "Web app scan failed"));
     } finally {
       scanningWebRef.current = false;
       setIsScanningWeb(false);
@@ -210,7 +211,7 @@ export function useAppDiscovery(): UseAppDiscoveryReturn {
       setDesktopApps(apps);
       setLastScanAt(Date.now());
     } catch (err) {
-      setError((err as Error).message);
+      setError(describeThrown(err, "Desktop app scan failed"));
     } finally {
       scanningDesktopRef.current = false;
       setIsScanningDesktop(false);
@@ -227,7 +228,7 @@ export function useAppDiscovery(): UseAppDiscoveryReturn {
       setMobileDevices(devices);
       setLastScanAt(Date.now());
     } catch (err) {
-      setError((err as Error).message);
+      setError(describeThrown(err, "Mobile device scan failed"));
     } finally {
       scanningMobileRef.current = false;
       setIsScanningMobile(false);
@@ -251,7 +252,7 @@ export function useAppDiscovery(): UseAppDiscoveryReturn {
         }
         return json.data as ForwardDeviceResult;
       } catch (err) {
-        setError((err as Error).message);
+        setError(describeThrown(err, "Device forward failed"));
         return null;
       }
     },
@@ -283,7 +284,7 @@ export function useAppDiscovery(): UseAppDiscoveryReturn {
     } catch (err) {
       // Don't blow away the previous list on a transient poll failure — just
       // surface the error for the UI. A later successful poll will replace it.
-      setError((err as Error).message);
+      setError(describeThrown(err, "Failed to refresh registered apps"));
     } finally {
       registeredInflightRef.current = false;
     }
@@ -309,7 +310,7 @@ export function useAppDiscovery(): UseAppDiscoveryReturn {
         await refreshRegistered();
         return json.data as DiscoveredApp;
       } catch (err) {
-        setError((err as Error).message);
+        setError(describeThrown(err, "App registration failed"));
         return null;
       }
     },
@@ -336,7 +337,7 @@ export function useAppDiscovery(): UseAppDiscoveryReturn {
         await refreshRegistered();
         return Boolean(json.data);
       } catch (err) {
-        setError((err as Error).message);
+        setError(describeThrown(err, "App deregistration failed"));
         return false;
       }
     },

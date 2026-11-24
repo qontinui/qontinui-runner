@@ -136,21 +136,41 @@ export function useTaskRunGql(id: string, skip = false) {
   });
 }
 
+/** The bounded-read envelope of one `taskRunOutput` page (sizes in bytes). */
+export interface TaskRunOutputPageMeta {
+  count: number;
+  limit: number;
+  shown: number;
+  /** Bytes from this page's start to the end of the output. */
+  total: number | null;
+  truncated: boolean | null;
+  boundKind: "EXACT" | "AT_LEAST" | "COMPLETE" | "UNKNOWN";
+  /** Pass back as `cursor` for the following page; null at the end. */
+  nextCursor: string | null;
+  available: boolean;
+  enumerateVia: string | null;
+}
+
 export interface TaskRunOutputData {
   taskRunId: string;
   content: string;
+  /** Length of the whole output in bytes. */
   totalLength: number;
-  offset: number;
-  hasMore: boolean;
+  page: TaskRunOutputPageMeta;
 }
 
 /**
- * Fetch task run output with offset/limit pagination.
- * Defaults to last 10000 characters.
+ * Fetch one page of task run output, walked from the start by an opaque byte
+ * cursor: omit `cursor` for the first page, pass `page.nextCursor` for the next.
  */
-export function useTaskRunOutputGql(id: string, offset = 0, limit = 10000, skip = false) {
+export function useTaskRunOutputGql(
+  id: string,
+  cursor: string | null = null,
+  limit = 10000,
+  skip = false,
+) {
   return useQuery<{ taskRunOutput: TaskRunOutputData }>(TASK_RUN_OUTPUT_QUERY, {
-    variables: { id, offset, limit },
+    variables: { id, cursor, limit },
     skip: skip || !id,
   });
 }

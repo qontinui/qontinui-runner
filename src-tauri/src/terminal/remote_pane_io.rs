@@ -37,8 +37,8 @@
 //! [`ERROR_EXIT_CODE`] (`1`), matching `LocalPty`'s "non-zero falls back to 1".
 
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -46,6 +46,7 @@ use serde_json::{json, Value};
 use tracing::{debug, warn};
 
 use super::pane_io::{CredentialScrub, PaneIo};
+use super::pane_output::PaneOutput;
 
 /// Exit code `wait` reports after a LOCAL detach (`kill`/`release`).
 pub const DETACH_EXIT_CODE: i32 = 0;
@@ -231,21 +232,15 @@ pub struct RemotePaneIo {
     /// The grant JWT, kept so a relay reconnect can re-present it.
     grant: String,
     sink: Arc<dyn RemoteFrameSink>,
-    /// Sender half of the output channel. `None` once closed — the reader
-    /// sees EOF when the last sender drops.
-    output_tx: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
-    /// Receiver half, taken exactly once by [`PaneIo::reader`].
-    output_rx: Mutex<Option<mpsc::Receiver<Vec<u8>>>>,
-    /// The settled exit code; `wait` parks on the condvar until it is `Some`.
-    exit: Mutex<Option<i32>>,
-    exit_cv: Condvar,
+    /// The output channel, the absolute target offset of the next byte this
+    /// pane expects (the reconnect splice point), and the exit slot — shared
+    /// machinery with `DaemonPaneIo` (see [`PaneOutput`]), keyed by
+    /// `grant_jti`.
+    out: PaneOutput,
     /// `remote_terminal_detach` is QUEUED at most once per pane. A failed
     /// attempt does not latch, so the `release()` that follows a failed
     /// `kill()` on the close path retries it.
     detach: Mutex<DetachOutcome>,
-    /// Absolute target offset of the next byte this pane expects — the
-    /// reconnect splice point.
-    remote_offset: AtomicU64,
     cols: AtomicU16,
     rows: AtomicU16,
     /// Absolute target offset of the first seed byte — the upper bound of the
@@ -279,33 +274,33 @@ impl RemotePaneIo {
         rows: u16,
         seed: AttachedRing,
     ) -> Self {
-        let (tx, rx) = mpsc::channel::<Vec<u8>>();
-        let next_offset = seed.start_offset.saturating_add(seed.buffer.len() as u64);
         debug!(
             seed_bytes = seed.buffer.len(),
             start_offset = seed.start_offset,
             target_total = seed.total_bytes_produced,
             "remote pane: seeded from the target's ring"
         );
-        if !seed.buffer.is_empty() {
-            // The receiver is alive (we hold it), so this cannot fail.
-            let _ = tx.send(seed.buffer);
-        }
+        let grant_jti = grant_jti.into();
+        let seed_start = seed.start_offset;
+        let history_start = seed.history_start;
+        let out = PaneOutput::new(
+            grant_jti.clone(),
+            seed.buffer,
+            seed.start_offset,
+            lost_output_marker,
+        );
+        let next_offset = out.offset();
         Self {
-            grant_jti: grant_jti.into(),
+            grant_jti,
             terminal_id: terminal_id.into(),
             grant: grant.into(),
             sink,
-            output_tx: Mutex::new(Some(tx)),
-            output_rx: Mutex::new(Some(rx)),
-            exit: Mutex::new(None),
-            exit_cv: Condvar::new(),
+            out,
             detach: Mutex::new(DetachOutcome::NotAttempted),
-            remote_offset: AtomicU64::new(next_offset),
             cols: AtomicU16::new(cols),
             rows: AtomicU16::new(rows),
-            seed_start: seed.start_offset,
-            history_start: seed.history_start,
+            seed_start,
+            history_start,
             interactivity: Arc::new(Mutex::new(InteractivityState {
                 next_seq: 1,
                 snapshot: RemoteInteractivity {
@@ -511,7 +506,7 @@ impl RemotePaneIo {
 
     /// Absolute target offset of the next byte this pane expects.
     pub fn remote_offset(&self) -> u64 {
-        self.remote_offset.load(Ordering::Acquire)
+        self.out.offset()
     }
 
     /// The viewport last announced with `resize` (or the attach size).
@@ -524,29 +519,14 @@ impl RemotePaneIo {
 
     /// True once `wait` has an answer — the routing client sweeps these.
     pub fn is_finished(&self) -> bool {
-        self.exit.lock().map(|e| e.is_some()).unwrap_or(true)
+        self.out.is_finished()
     }
 
     /// Queue one output chunk from the target (already decoded). Silently
     /// dropped once the pane is closed — a late frame after exit has nowhere
     /// to go, exactly like bytes after a local PTY's EOF.
     pub fn push_output(&self, bytes: &[u8]) {
-        if bytes.is_empty() {
-            return;
-        }
-        let Ok(tx) = self.output_tx.lock() else {
-            return;
-        };
-        let delivered = match tx.as_ref() {
-            Some(tx) if tx.send(bytes.to_vec()).is_ok() => {
-                self.remote_offset
-                    .fetch_add(bytes.len() as u64, Ordering::AcqRel);
-                true
-            }
-            _ => false,
-        };
-        drop(tx);
-        if delivered {
+        if self.out.push_output(bytes) {
             self.note_frame_received();
         }
     }
@@ -555,15 +535,7 @@ impl RemotePaneIo {
     /// notice — without moving the remote offset, so the splice arithmetic
     /// stays anchored to the target's stream.
     pub fn push_local(&self, bytes: &[u8]) {
-        if bytes.is_empty() {
-            return;
-        }
-        let Ok(tx) = self.output_tx.lock() else {
-            return;
-        };
-        if let Some(tx) = tx.as_ref() {
-            let _ = tx.send(bytes.to_vec());
-        }
+        self.out.push_local(bytes);
     }
 
     /// The relay carrying this pane dropped. Say so in the pane; the session
@@ -579,56 +551,18 @@ impl RemotePaneIo {
     /// we were away — the loss is written into the pane as an in-band marker
     /// (never silently) and the whole ring is delivered after it.
     pub fn splice_replay(&self, ring: &AttachedRing) {
-        let have = self.remote_offset();
-        let start = ring.start_offset;
-        let end = start.saturating_add(ring.buffer.len() as u64);
-        if have >= end {
-            debug!(
-                grant_jti = %self.grant_jti,
-                have,
-                ring_end = end,
-                "remote pane: reattach ring adds nothing new"
-            );
-            // Still a frame the target answered with — the read half holds —
-            // but only while the pane is open, as in `push_output`: a frame
-            // after exit went nowhere and is not a receipt.
-            if self.output_open() {
-                self.note_frame_received();
-            }
-            return;
+        // A delivered ring, or one adding nothing while the pane is open, is a
+        // frame the target answered with — the read half holds. After exit it
+        // went nowhere and is not a receipt (`PaneOutput::splice` decides).
+        if self.out.splice(ring.start_offset, &ring.buffer) {
+            self.note_frame_received();
         }
-        let skip = if have > start {
-            (have - start) as usize
-        } else {
-            if have < start {
-                let lost = start - have;
-                warn!(
-                    grant_jti = %self.grant_jti,
-                    lost_bytes = lost,
-                    "remote pane: reattach ring starts past the last byte seen — output was lost while detached"
-                );
-                self.push_local(&lost_output_marker(lost));
-            }
-            0
-        };
-        // `push_output` advances the offset by the delivered length; align it
-        // to the ring's own start first so the arithmetic lands on `end`.
-        self.remote_offset
-            .store(start.saturating_add(skip as u64), Ordering::Release);
-        // `push_output` stamps the receipt when it delivers.
-        self.push_output(&ring.buffer[skip..]);
     }
 
     /// Settle the exit code (first writer wins) and close the output channel
     /// so a reader blocked in `read()` sees EOF.
     pub fn mark_exit(&self, code: i32) {
-        if let Ok(mut slot) = self.exit.lock() {
-            if slot.is_none() {
-                *slot = Some(code);
-            }
-        }
-        self.exit_cv.notify_all();
-        self.close_output();
+        self.out.settle(Ok(code));
     }
 
     /// A `remote_terminal_error` for this pane: logged, then treated as an
@@ -658,17 +592,8 @@ impl RemotePaneIo {
         self.mark_exit(ERROR_EXIT_CODE);
     }
 
-    fn output_open(&self) -> bool {
-        self.output_tx
-            .lock()
-            .map(|tx| tx.is_some())
-            .unwrap_or(false)
-    }
-
     fn close_output(&self) {
-        if let Ok(mut tx) = self.output_tx.lock() {
-            drop(tx.take());
-        }
+        self.out.close_output();
     }
 
     fn send(&self, frame: Value) -> Result<(), String> {
@@ -741,36 +666,6 @@ impl RemotePaneIo {
     }
 }
 
-/// Blocking `Read` over the output channel: yields queued chunks in order,
-/// EOF once every sender is gone.
-struct ChannelReader {
-    rx: mpsc::Receiver<Vec<u8>>,
-    pending: Vec<u8>,
-    pos: usize,
-}
-
-impl Read for ChannelReader {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        if self.pos >= self.pending.len() {
-            match self.rx.recv() {
-                Ok(chunk) => {
-                    self.pending = chunk;
-                    self.pos = 0;
-                }
-                // Every sender dropped: the pane exited or was released.
-                Err(mpsc::RecvError) => return Ok(0),
-            }
-        }
-        let n = (self.pending.len() - self.pos).min(buf.len());
-        buf[..n].copy_from_slice(&self.pending[self.pos..self.pos + n]);
-        self.pos += n;
-        Ok(n)
-    }
-}
-
 /// `Write` that ships each write as one `remote_terminal_input` frame,
 /// stamped with the pane's next `seq`.
 struct FrameWriter {
@@ -817,17 +712,7 @@ impl Write for FrameWriter {
 
 impl PaneIo for RemotePaneIo {
     fn reader(&self) -> Result<Box<dyn Read + Send>, String> {
-        let rx = self
-            .output_rx
-            .lock()
-            .map_err(|e| format!("Remote pane reader lock poisoned: {}", e))?
-            .take()
-            .ok_or_else(|| "remote pane reader already taken".to_string())?;
-        Ok(Box::new(ChannelReader {
-            rx,
-            pending: Vec::new(),
-            pos: 0,
-        }))
+        self.out.take_reader()
     }
 
     fn writer(&self) -> Result<Box<dyn Write + Send>, String> {
@@ -852,19 +737,7 @@ impl PaneIo for RemotePaneIo {
     }
 
     fn wait(&self) -> Result<i32, String> {
-        let mut slot = self
-            .exit
-            .lock()
-            .map_err(|e| format!("Remote pane exit lock poisoned: {}", e))?;
-        loop {
-            if let Some(code) = *slot {
-                return Ok(code);
-            }
-            slot = self
-                .exit_cv
-                .wait(slot)
-                .map_err(|e| format!("Remote pane exit lock poisoned: {}", e))?;
-        }
+        self.out.wait()
     }
 
     fn kill(&self, _budget: Duration) -> Result<(), String> {

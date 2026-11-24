@@ -17,6 +17,9 @@
 //! - [`frontier`]  the batched frontier upsert
 //! - [`health`]    `GET /apps/{app_id}/journey/health`
 //! - [`retention`] the runner-side 90-day prune of its own database
+//! - [`read`]      bounded reads of the ledger for the query routes
+//! - [`routes`]    `GET /apps/{app_id}/journey/*` — the Phase 2 query door
+//!   and the Phase 4 `edge-timing` read
 //! - `route_coverage` (test) every POST route under `/ui-bridge` is classified
 
 pub mod capture;
@@ -24,18 +27,18 @@ pub mod cursor;
 pub mod frontier;
 pub mod health;
 pub mod node;
+pub mod read;
 pub mod retention;
+pub mod routes;
 
 #[cfg(test)]
 mod route_coverage;
+#[cfg(test)]
+pub(crate) mod test_fixtures;
 
 /// Axum routes exported by this module. Merged into the main router in
 /// `mcp_api.rs` beside `spec_api::routes()`, under the same per-app
-/// `/apps/{app_id}/...` prefix.
+/// `/apps/{app_id}/...` prefix. See [`routes`] for the route table.
 pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
-    use axum::routing::get;
-    axum::Router::new().route(
-        "/apps/{app_id}/journey/health",
-        get(health::get_journey_health),
-    )
+    routes::router()
 }

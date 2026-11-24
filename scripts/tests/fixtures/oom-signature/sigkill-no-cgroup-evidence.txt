@@ -1,0 +1,5 @@
+   Compiling qontinui-runner v1.0.11 (/home/runner/work/qontinui-runner/qontinui-runner/src-tauri)
+error: could not compile `qontinui-runner` (lib test)
+
+Caused by:
+  process didn't exit successfully: `/home/runner/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin/rustc --crate-name qontinui_runner_lib --edition=2021 src/lib.rs` (signal: 9, SIGKILL: kill)

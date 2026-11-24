@@ -105,7 +105,6 @@ declare module "@qontinui/ui-bridge/artifacts" {
   export interface ArtifactSource {
     specId?: string;
     contractId?: string;
-    matrixId?: string;
     runId?: string;
     triggeredBy: "manual" | "ci" | "scheduled" | "workflow-step";
   }
@@ -135,7 +134,6 @@ declare module "@qontinui/ui-bridge/artifacts" {
   export interface ArtifactQuery {
     specId?: string;
     contractId?: string;
-    matrixId?: string;
     runId?: string;
     dateRange?: { from: string; to: string };
     passedOnly?: boolean;
@@ -193,133 +191,6 @@ declare module "@qontinui/ui-bridge/artifacts" {
     query(query: ArtifactQuery): Promise<ResultArtifact[]>;
     verify(artifactId: string): Promise<boolean>;
     count(): Promise<number>;
-  }
-}
-
-// =============================================================================
-// @qontinui/ui-bridge/contracts (source exists, dist not yet built)
-// =============================================================================
-
-declare module "@qontinui/ui-bridge/contracts" {
-  type SpecAssertion = import("@qontinui/ui-bridge").SpecAssertion;
-
-  export type ContractCheck =
-    | {
-        type: "assertion";
-        assertion: SpecAssertion;
-      }
-    | {
-        type: "api";
-        endpoint: string;
-        method: "GET" | "POST" | "PUT" | "DELETE";
-        expectedStatus: number;
-        headers?: Record<string, string>;
-        timeout?: number;
-      };
-
-  export interface ContractCondition {
-    id: string;
-    description: string;
-    check: ContractCheck;
-    onFailure: "skip" | "fail" | "warn";
-  }
-
-  export type ContractVerification =
-    | {
-        type: "specGroupRef";
-        specId: string;
-        groupId: string;
-      }
-    | {
-        type: "inline";
-        assertions: SpecAssertion[];
-      };
-
-  export interface ContractMetadata {
-    author?: string;
-    component?: string;
-    pageUrl?: string;
-    tags?: string[];
-    createdAt?: string;
-    updatedAt?: string;
-  }
-
-  export interface VerificationContract {
-    id: string;
-    name: string;
-    description: string;
-    version: string;
-    preconditions: ContractCondition[];
-    verification: ContractVerification;
-    postconditions: ContractCondition[];
-    metadata?: ContractMetadata;
-  }
-
-  export interface ContractConfig {
-    version: string;
-    contracts: VerificationContract[];
-    metadata?: {
-      author?: string;
-      description?: string;
-    };
-  }
-
-  export interface ConditionResult {
-    conditionId: string;
-    description: string;
-    passed: boolean;
-    assertionResult?: unknown;
-    apiResult?: {
-      status: number;
-      ok: boolean;
-      durationMs: number;
-    };
-    onFailure: "skip" | "fail" | "warn";
-    skippedContract: boolean;
-    durationMs: number;
-  }
-
-  export interface ContractExecutionResult {
-    contractId: string;
-    contractName: string;
-    preconditionResults: ConditionResult[];
-    preconditionsPassed: boolean;
-    skipped: boolean;
-    verificationResults: unknown[] | null;
-    verificationPassed: boolean;
-    postconditionResults: ConditionResult[] | null;
-    postconditionsPassed: boolean;
-    passed: boolean;
-    warnings: string[];
-    durationMs: number;
-    timestamp: number;
-  }
-
-  export const CONTRACT_CONFIG_VERSION: string;
-  export const CONTRACT_FILE_EXTENSION: string;
-
-  export class ContractExecutor {
-    execute(
-      contract: VerificationContract,
-      options?: ContractExecutionOptions,
-    ): Promise<ContractExecutionResult>;
-  }
-
-  export interface ContractExecutionOptions {
-    timeout?: number;
-    [key: string]: unknown;
-  }
-
-  export function validateContractConfig(config: unknown): ContractValidationResult;
-
-  export interface ContractValidationError {
-    path: string;
-    message: string;
-  }
-
-  export interface ContractValidationResult {
-    valid: boolean;
-    errors: ContractValidationError[];
   }
 }
 
@@ -463,10 +334,6 @@ declare module "@qontinui/ui-bridge-auto" {
 // =============================================================================
 
 // =============================================================================
-// html2canvas (missing type declarations)
-// =============================================================================
-
-// =============================================================================
 // @testing-library/react — used only via dynamic import in vdom-renderer.ts
 // (test-only dep, not installed in production)
 // =============================================================================
@@ -482,41 +349,4 @@ declare module "@testing-library/react" {
 
   export function render(element: ReactElement): RenderResult;
   export const screen: Record<string, unknown>;
-}
-
-// =============================================================================
-// html2canvas (missing type declarations)
-// =============================================================================
-
-declare module "html2canvas" {
-  interface Html2CanvasOptions {
-    allowTaint?: boolean;
-    backgroundColor?: string | null;
-    canvas?: HTMLCanvasElement;
-    foreignObjectRendering?: boolean;
-    imageTimeout?: number;
-    ignoreElements?: (element: Element) => boolean;
-    logging?: boolean;
-    onclone?: (document: Document, element: HTMLElement) => void;
-    proxy?: string | null;
-    removeContainer?: boolean;
-    scale?: number;
-    useCORS?: boolean;
-    width?: number;
-    height?: number;
-    x?: number;
-    y?: number;
-    scrollX?: number;
-    scrollY?: number;
-    windowWidth?: number;
-    windowHeight?: number;
-    [key: string]: unknown;
-  }
-
-  function html2canvas(
-    element: HTMLElement,
-    options?: Partial<Html2CanvasOptions>,
-  ): Promise<HTMLCanvasElement>;
-
-  export default html2canvas;
 }

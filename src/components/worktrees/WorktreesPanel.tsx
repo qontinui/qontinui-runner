@@ -39,9 +39,9 @@ import {
   CheckCircle2,
   Clock,
 } from "lucide-react";
+import { formatBytes } from "@/lib/formatting";
 import {
   useReclaimableWorktrees,
-  formatBytes,
   formatAge,
   REASON_LABEL,
   type WorktreeSurvey,
@@ -69,6 +69,7 @@ function reasonTone(reason: string | null): string {
       return "text-[#bb9af7] bg-[#bb9af7]/10";
     case "building":
     case "session-live":
+    case "sibling-busy":
       return "text-[#e0af68] bg-[#e0af68]/10";
     case "coord-unreachable":
     case "error":

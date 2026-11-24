@@ -14,15 +14,19 @@
  *
  * The five paths that render a live session:
  *   1. full zone header      `zone-grid/ZoneLabel.tsx`      → mounts
- *   2. single / maximized    `ZoneGrid.tsx`                 → mounts
- *   3. solo session strip    `ZoneGrid.tsx`                 → mounts
+ *   2. maximized header      `zone-grid/MaximizedHeader.tsx`→ mounts
+ *   3. solo session strip    `zone-grid/ZoneCell.tsx`       → mounts
  *   4. compact zone card     `zone-grid/CompactZoneCard.tsx`→ mounts (this fix)
- *   5. off-grid parking      `zone-grid/HiddenTerminal.tsx` → deliberately NOT
+ *   5. parked cell           `zone-grid/ZoneCell.tsx`       → deliberately NOT
+ *      (an unzoned grid tab, an off-screen tmux tab, or a zone behind the
+ *      maximized one: `isParked`)
  *
- * (5) is `<div className="hidden">`: a trigger there would be invisible, not
- * keyboard-reachable, and — having no zone — every hidden tab would register
- * the SAME `terminal-session-info-trigger--1` id. Its reachable home is the
- * zone control panel's Unassigned list, which is separate work.
+ * (5) is a `display: none` cell: a trigger there would be invisible, not
+ * keyboard-reachable, and — a parked cell's index being no zone on screen —
+ * would register the same `terminal-session-info-trigger-<n>` id as a real
+ * one. Its reachable homes are the zone control panel's Unassigned list and
+ * the session manager. The maximized zone's cell hides the zone chrome too
+ * (`hideZoneChrome`); its trigger is the maximized header's.
  */
 
 import { readFileSync } from "node:fs";
@@ -36,8 +40,8 @@ const read = (rel: string) => readFileSync(fileURLToPath(new URL(rel, import.met
 
 const COMPACT = read("./CompactZoneCard.tsx");
 const ZONE_LABEL = read("./ZoneLabel.tsx");
-const HIDDEN = read("./HiddenTerminal.tsx");
-const ZONE_GRID = read("../ZoneGrid.tsx");
+const MAXIMIZED_HEADER = read("./MaximizedHeader.tsx");
+const ZONE_CELL = read("./ZoneCell.tsx");
 
 /** The one call shape every mount site uses. */
 const MOUNT = "<SessionInfoDropdown claudeSessionId={tab.claudeSessionId}";
@@ -53,16 +57,21 @@ describe("SessionInfoDropdown mount sites", () => {
   });
 
   it("still mounts in the single/maximized header and the solo strip", () => {
-    expect(ZONE_GRID).toContain(`${MOUNT} zoneIndex={singleViewZone} />`);
-    expect(ZONE_GRID).toContain(`${MOUNT} zoneIndex={zoneIdx} />`);
+    expect(MAXIMIZED_HEADER).toContain(`${MOUNT} zoneIndex={zoneIdx} />`);
+    expect(ZONE_CELL).toContain("{isMaximizedPane && maximizedNav && (");
+    expect(ZONE_CELL).toContain(`${MOUNT} zoneIndex={zoneIdx} />`);
   });
 
-  it("does NOT mount inside the off-grid hidden parking slot", () => {
+  it("does NOT mount inside a parked cell", () => {
     // A `display: none` subtree is neither visible nor keyboard-reachable, and
-    // an unassigned tab has no zone index to key the element ids off. If this
-    // ever changes, the id scheme has to grow a non-zone discriminator first.
-    expect(HIDDEN).not.toContain("SessionInfoDropdown");
-    expect(HIDDEN).toContain('className="hidden"');
+    // a parked tab has no zone index of its own to key the element ids off. If
+    // this ever changes, the id scheme has to grow a non-zone discriminator
+    // first. Both mount sites in the cell are gated off for a parked cell.
+    expect(ZONE_CELL).toContain('const isParked = presentation === "parked";');
+    expect(ZONE_CELL).toContain("const hideZoneChrome = isParked || isMaximizedPane;");
+    expect(ZONE_CELL).toContain("const showLabels = showLabelsProp && !hideZoneChrome;");
+    expect(ZONE_CELL).toMatch(/const soloSessionInfo =\s*!hideZoneChrome &&/);
+    expect(ZONE_CELL).toContain('${isParked ? "hidden" : ""}');
   });
 });
 
@@ -84,7 +93,62 @@ describe("SessionInfoDropdown addressability across mount sites", () => {
     // `showCompactCard` gates the two apart in the zone cell, and
     // `showSoloSessionInfo` excludes the compact card outright — so at most one
     // of the three mount sites renders for any given `zoneIdx`.
-    expect(ZONE_GRID).toContain("{showCompactCard && (");
-    expect(ZONE_GRID).toContain("{!showCompactCard && showLabels && (");
+    expect(ZONE_CELL).toContain("{showCompactCard && (");
+    expect(ZONE_CELL).toContain("{!showCompactCard && showLabels && (");
+  });
+});
+
+/**
+ * The tenant badge renders wherever the dropdown renders (plan
+ * `2026-11-08-tenant-badge-parity-and-oracle-fixtures` D2), under the SAME
+ * zone's id (D1): a mount file whose badge is missing, or keyed off a
+ * different zone expression than its dropdown, either hides the tenant in one
+ * layout or registers a badge id against the wrong zone.
+ */
+describe("TenantBadge mount sites mirror the SessionInfoDropdown mount sites", () => {
+  /** The `zoneIndex={…}` expression of every `<Tag …>` mount, in source order. */
+  function zoneExprs(source: string, tag: string): string[] {
+    const re = new RegExp(`<${tag}\\b[^>]*?\\bzoneIndex=\\{([^}]+)\\}`, "g");
+    return [...source.matchAll(re)].map((m) => m[1]);
+  }
+
+  const SITES: [string, string][] = [
+    ["ZoneLabel.tsx", ZONE_LABEL],
+    ["MaximizedHeader.tsx", MAXIMIZED_HEADER],
+    ["ZoneCell.tsx", ZONE_CELL],
+    ["CompactZoneCard.tsx", COMPACT],
+  ];
+
+  it.each(SITES)("%s mounts <TenantBadge with its dropdown's zone expression", (_file, source) => {
+    const dropdownZones = zoneExprs(source, "SessionInfoDropdown");
+    expect(dropdownZones.length).toBeGreaterThan(0);
+    expect(source).toContain("<TenantBadge");
+    expect(zoneExprs(source, "TenantBadge")).toEqual(dropdownZones);
+  });
+
+  it("every <TenantBadge mount passes a zoneIndex (no shared id can come back)", () => {
+    for (const [, source] of SITES) {
+      const mounts = source.match(/<TenantBadge\b/g) ?? [];
+      expect(zoneExprs(source, "TenantBadge")).toHaveLength(mounts.length);
+    }
+  });
+});
+
+/**
+ * `ZoneCell` is memoized per tab and must stay context-free: the tenant
+ * switcher flag reaches it as the `tenantSwitcherShown` prop (plan
+ * `2026-11-08-tenant-badge-parity-and-oracle-fixtures` D2). A context read in
+ * the cell would re-render every zone on each tenant-context change.
+ */
+describe("ZoneCell stays context-free for the tenant flag", () => {
+  it("reads neither useTenant nor TenantContext", () => {
+    // Code lines only: the prop's docstring names `useTenant()` to say why not.
+    const code = ZONE_CELL.split("\n")
+      .filter((line) => !/^\s*(\*|\/\/|\/\*)/.test(line))
+      .join("\n");
+    expect(code).not.toMatch(/\buseTenant\s*\(/);
+    expect(code).not.toMatch(/\bTenantContext\b/);
+    expect(code).not.toMatch(/\buseContext\s*\(/);
+    expect(ZONE_CELL).toContain("tenantSwitcherShown");
   });
 });

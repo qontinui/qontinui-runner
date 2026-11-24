@@ -27,6 +27,12 @@ pub mod accessibility;
 // fails an unguarded test read by NAME instead of by assertion mismatch.
 // Plan `2026-09-03-runner-tests-read-ambient-machine-state`.
 pub mod ambient;
+// The test-binary gate on env-resolved settings writes: a thread holding no
+// `env_lock` may not write a settings file into whatever directory the process
+// environment names — another test's fixture. Compiled to `Ok(())` outside a
+// test binary. Plan
+// `2026-11-11-unguarded-test-threads-write-settings-json-into-a-live-fixtures-config-dir`.
+pub mod env_write_gate;
 // Pure install-interception core (classify + gate + wire types), shared by the
 // `qontinui-runner` bin (via `install_effects_producer::intercept`) AND the
 // standalone `qontinui-shim` Windows `.exe` shadow stub. Lifted into the lib
@@ -40,12 +46,15 @@ pub mod observable_bridge;
 // gauges (`LIVE_PIPE_READERS`, `DETACHED_CHILDREN`) exist once per process.
 pub mod git_posture;
 pub mod process_helpers;
+// Deadline-honest bounded run (process creation INCLUDED) for read-only
+// probes; reuses `process_helpers` internals, so it lives beside it.
+pub mod process_deadline;
 pub mod profile_cli;
 // Out-of-process PTY holder (plan
-// `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`). In the
-// LIB crate so `main()` can dispatch to it before any Tauri init, exactly like
-// `profile_cli`, and so Phase 1 can grow the spike into the real
-// `--pty-holder` without touching the runner bin's module tree.
+// `2026-09-12-out-of-process-pty-owner-for-terminal-hosted-sessions`): the
+// runner's door to spawning a pane's holder. In the LIB crate because it needs
+// nothing from the bin; the bin's `terminal::daemon_pane_io` composes it with
+// the bin-only instance scoping.
 pub mod pty_holder;
 // Out-of-process runner discovery: the bound-API-port breadcrumb. In the LIB
 // crate for the same reason as `intercept_core` — the WRITER is the runner bin
@@ -54,6 +63,10 @@ pub mod pty_holder;
 // a second bin cannot import from the runner bin's module tree. One module ⇒
 // one schema ⇒ writer and reader cannot drift. See the module doc.
 pub mod profiles;
+// Journey query answer values (plan 2026-09-20-ui-bridge-represents-the-
+// users-path-and-the-passage-of-time): registered by `schema_export`, built by
+// the bin's `journey::routes`.
+pub mod journey_wire;
 pub mod relay_envelopes;
 pub mod runner_breadcrumb;
 pub mod schema_export;
@@ -67,6 +80,13 @@ pub mod tauri_event_payloads;
 // corrupt (which, with the fail-closed sign-out marker, reads as a logout the
 // operator never performed).
 pub mod fs_atomic;
+
+// Bounded reads of a file's END — the one tail reader (`read_tail_lossy` for
+// transcript scans, `tail_lines` for log views). In the lib so its core can be
+// tested against a synthetic source, and so every reader of a log's end shares
+// one bound instead of growing another whole-file read. Plan
+// `2026-11-11-runner-glibc-arena-retention-and-whole-log-tail`, Phase 2.
+pub mod file_tail;
 
 // Runner instance identity from the process env (`QONTINUI_INSTANCE_NAME`) —
 // the ONE primary/secondary predicate. In the lib for the same reason as
@@ -89,6 +109,11 @@ pub mod fs_perms;
 /// durable `device_id`. The runner bin imports it, and `auth` must consult it
 /// before falling back to its own cache.
 pub mod machine_identity;
+// Proxy resolution and the ONE proxy-aware WebSocket connect (plan
+// `2026-10-10-spec-front-end-phase-9-generic-boundary` Phase 4). In the lib
+// beside `coord_ws`, which it serves; the bin's relay and cloud tunnel reach it
+// as `qontinui_runner_lib::outbound_net`.
+pub mod outbound_net;
 pub mod secure_storage;
 /// The machine's tenant pin — moved out of the bin-only `session` tree so the
 /// LIB can read it too (plan
@@ -118,10 +143,23 @@ pub mod mcp_spill;
 // the `qontinui_profile env` CLI and the Tauri runner GUI share one code path.
 // Moved out of the binary crate at P4: the bundled cluster is now the runner's
 // ONLY database, so the lib-side consumers (env_agent's db_schema pool, the
-// `qontinui-specs` CLI) must be able to address it. It has no `crate::`
-// dependencies, so the move is mechanical.
+// `qontinui-specs` CLI) must be able to address it. It had no `crate::`
+// dependencies then, so the move was mechanical; it has gained three since:
+// `crate::instance_env` (its default data root) and, in its test harness,
+// `crate::process_helpers` and `crate::runner_breadcrumb`.
+// The one predicate for "this directory is a cargo target dir", shared by the
+// embedded-PG test harness here and the bin crate's orphan-target reaper.
+pub mod cargo_target_marker;
 pub mod embedded_pg;
 pub mod env_agent;
+
+// The runner's one circuit-breaker state machine, and the PostgreSQL checkout
+// point built on it (plan
+// `2026-10-19-runner-pg-unreachable-costs-every-caller-a-pool-timeout`). Lib,
+// not bin, because `env_agent` above holds a clone of the boot pool: a
+// bin-side breaker could not cover it.
+pub mod circuit;
+pub mod pg_circuit;
 
 // THE `source()`-chain renderer, shared by the lib and the bin.
 //
@@ -157,10 +195,29 @@ pub mod util {
 // handle; only the runner bin registers the allocator.
 pub mod alloc_breadcrumb;
 
+// glibc malloc tuning (plan
+// `2026-11-11-runner-glibc-arena-retention-and-whole-log-tail`, Phases 1 and
+// 3): the arena cap `main()` applies as its first statement, the allocator
+// reading the health monitor takes every tick, and the hourly `malloc_trim(0)`.
+// In the LIB so the `arena_cap_holds` integration test applies and measures
+// the same cap the runner does. A no-op that says `unsupported` off linux-gnu.
+pub mod malloc_tuning;
+
+// Per-local-user connection guard for every runner TCP listener (plan
+// `2026-10-04-runner-loopback-api-refuses-other-local-users`): refuses a
+// loopback connection whose peer process runs as a different OS user. In the
+// LIB because the `:9876` API (bin) and the pairing / Cognito callback
+// listeners (lib) all wrap their listeners with it.
+pub mod peer_user_guard;
+
 // Device-pairing flow (headless + browser-mediated). Lifted out of
 // `bin/qontinui_profile.rs` so both the CLI and the Tauri runner GUI
 // share one code path. See `pair.rs` for the canonical wire shapes.
 pub mod pair;
+
+// The qontinui-web FRONTEND origin (pages like /connect-runner), distinct from
+// its API origin. Shared by the runner's `api_config` and `pair`.
+pub mod web_origin;
 
 // Cognito Hosted-UI sign-in (RFC 8252 PKCE). Phase 5 of the
 // unified-Cognito-identity plan. Tauri-free (loopback + system browser); the
@@ -172,6 +229,10 @@ pub mod cognito;
 // the marker names so the spawn-site strips, the startup warning and the
 // `coord doctor` check can never disagree on the spelling.
 pub mod claude_env;
+/// Long-lived Claude OAuth tokens (`claude setup-token`) stored per account in
+/// `<config dir>/settings.json` — the one reader account selection, the usage
+/// probe, the warm path and the doctor share.
+pub mod claude_oauth_token;
 
 // `coord doctor` self-check (plan 2026-06-13 Phase 4). Lifted into the lib so
 // BOTH the standalone `coord_doctor` bin and the in-app Tauri command
@@ -281,6 +342,12 @@ pub mod session_archive;
 /// `2026-08-29-runner-work-scoped-writes-default-tenant-credential`). In the
 /// lib crate because the plan adapter above is its principal consumer.
 pub mod repo_tenant;
+
+/// The context-size reading of a Claude Code `Stop` event (plan
+/// `2026-10-28-one-session-lifecycle-authority` Phase 82, folding
+/// qontinui-claude-config#1915). Pure; the `/lifecycle/hook` route (Phase 83)
+/// is its consumer.
+pub mod stop_context;
 
 // ============================================================================
 // Test-only: shared process-wide env lock

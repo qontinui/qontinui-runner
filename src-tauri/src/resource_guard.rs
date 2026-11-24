@@ -384,7 +384,7 @@ pub(crate) const CALIBRATION_BASELINE: usize = 151;
 /// scaled term uses this same cap on its baseline, but is NOT capped by it as a
 /// whole: its session-capacity arm grows with `per_session × capacity`, which
 /// is bounded by the machine (cores, `MemTotal`) and by
-/// [`MAX_THREADS_PER_SESSION`] — so a leak in a `terminal-*` family cannot
+/// [`MAX_THREADS_PER_SESSION`] — so a leak in a per-session family cannot
 /// inflate the multiplier — and its pool arm by the live session-thread count.
 /// Every ceiling is bounded by [`THREAD_CEILING_ABS_MAX`]. That bound is the
 /// whole answer to "does a slow leak eventually disable this lane?" — it does
@@ -406,15 +406,20 @@ pub(crate) const AT_REST_BASELINE_MAX: usize = 512;
 /// exactly when the box was loaded. The at-rest floor is now the graded total
 /// minus the threads the census NAMES as per-session
 /// ([`session_thread_attribution`]). This constant survives in two places
-/// only: the subtrahend on a platform with no name census (macOS, or a walk
-/// that failed), and — through `min(3, MAX_THREADS_PER_SESSION)` — the input
-/// to [`PER_SESSION_THREADS_FALLBACK`], where it LOSES to the family count,
+/// only: through `max(3, MAX_THREADS_PER_SESSION)` as
+/// [`NO_CENSUS_THREADS_PER_SESSION`], the subtrahend on a platform with no name
+/// census (macOS, or a walk that failed), where it LOSES to the holder-backed
+/// pane's 4 because there the larger number is the strict one; and through
+/// `min(3, MIN_THREADS_PER_SESSION)` as the input to
+/// [`PER_SESSION_THREADS_FALLBACK`], where it LOSES to the in-process 2,
 /// because there it is a multiplier and the larger number would loosen.
 ///
-/// **3, from the control's own documentation**, not from the thread-name census.
-/// [`crate::agent_runtime::DEFAULT_CONTINUATION_SESSION_CAP`]'s doc derives
-/// "roughly 3 OS threads per continuation session" from the 2026-08-29 wedge's
-/// own arithmetic (540 threads at ~130 sessions over a 150-151 idle baseline).
+/// **3, from the 2026-08-29 wedge's own arithmetic**, not from the thread-name
+/// census: 540 threads at ~130 continuation sessions over a 150-151 idle
+/// baseline is roughly 3 OS threads per session. (That derivation used to live
+/// on `agent_runtime`'s `DEFAULT_CONTINUATION_SESSION_CAP`, a fixed count cap
+/// retired on 2026-10-03; it is kept here, beside the one constant that still
+/// consumes it.)
 /// The 2026-09-18 census finds only 2 NAMED per-session threads
 /// (`terminal-waiter`, `terminal-reader`) but also shows per-session
 /// `pipe-drain` and `transcript-scan`, so 2 is a floor and 3 is the measured
@@ -427,6 +432,17 @@ pub(crate) const AT_REST_BASELINE_MAX: usize = 512;
 /// load leak into the baseline and loosen the ceiling as the box fills — the
 /// guard getting weaker exactly when it is needed.
 pub(crate) const THREADS_PER_SESSION: usize = 3;
+
+/// The per-session subtrahend [`session_thread_attribution`] uses when there is
+/// no name census: `max(THREADS_PER_SESSION, MAX_THREADS_PER_SESSION)` = **4**.
+/// SUBTRACTED, so the larger figure is the strict one — a holder-backed pane
+/// holds 4 runner threads and the pane mix is unknowable without names.
+pub(crate) const NO_CENSUS_THREADS_PER_SESSION: usize =
+    if THREADS_PER_SESSION > MAX_THREADS_PER_SESSION {
+        THREADS_PER_SESSION
+    } else {
+        MAX_THREADS_PER_SESSION
+    };
 
 /// How many observations the trailing window keeps.
 ///
@@ -637,9 +653,10 @@ pub(crate) fn record_at_rest_sample(total_threads: Option<usize>, live_sessions:
     // The session subtraction is taken from the SAME census the idle pool was
     // graded out of, so the two subtractions are over one snapshot of names
     // and are disjoint by construction: the pool rows are `app-rt` /
-    // `tokio-rt-worker`, the session families are `terminal-*`.
+    // `tokio-rt-worker`, the session families are `terminal-*` and `pty-holder-ctl` / `-pump`.
     let census_session_threads = census.as_ref().map(|c| c.session_threads);
-    note_session_thread_sample(census_session_threads, live_sessions);
+    let census_holder_threads = census.as_ref().map(|c| c.holder_session_threads);
+    note_session_thread_sample(census_session_threads, census_holder_threads, live_sessions);
     let attributed = session_thread_attribution(census_session_threads, live_sessions);
     let Some(at_rest) = at_rest_estimate(total_threads, attributed) else {
         return;
@@ -657,7 +674,7 @@ pub(crate) fn record_at_rest_sample(total_threads: Option<usize>, live_sessions:
 /// Plan `2026-10-01-runner-thread-ceilings-ignore-the-machine-and-the-guard-
 /// dialog-says-low-memory`, Phase 1: by NAME, from the census's uncapped
 /// per-session tally ([`ThreadNameCensus::session_threads`] — the
-/// `terminal-reader` / `terminal-waiter` families), not by multiplying the
+/// `terminal-*` and `pty-holder-ctl` / `-pump` families), not by multiplying the
 /// session count by a constant. On the 2026-10-01 incident box that is the
 /// difference between subtracting the 328 threads the terminals actually held
 /// and subtracting 492 — more than the whole graded process.
@@ -682,10 +699,11 @@ pub(crate) fn record_at_rest_sample(total_threads: Option<usize>, live_sessions:
 ///   threads are still session threads by name, and subtracting them is the
 ///   strict direction.)
 /// - **No census** — a platform without per-thread names (macOS), or a walk
-///   that failed: the constant path, `sessions × THREADS_PER_SESSION`. 3 is
-///   above the census's measured 2, so this over-subtracts, which lowers the
-///   floor and is the strict direction; it is today's behaviour on those
-///   platforms, unchanged.
+///   that failed: the constant path, `sessions × NO_CENSUS_THREADS_PER_SESSION`
+///   (4). Without names the pane mix is unknown, and a holder-backed pane holds
+///   4 runner threads, so anything less could UNDER-subtract and let session
+///   load leak into the baseline. 4 over-subtracts on an in-process box, which
+///   lowers the floor and is the strict direction.
 pub(crate) fn session_thread_attribution(
     census_session_threads: Option<usize>,
     live_sessions: Option<usize>,
@@ -694,7 +712,7 @@ pub(crate) fn session_thread_attribution(
     match census_session_threads {
         Some(named) if census_misread(named, sessions) => None,
         Some(named) => Some(named),
-        None => Some(sessions.saturating_mul(THREADS_PER_SESSION)),
+        None => Some(sessions.saturating_mul(NO_CENSUS_THREADS_PER_SESSION)),
     }
 }
 
@@ -706,57 +724,109 @@ fn census_misread(named: usize, sessions: usize) -> bool {
     named < sessions
 }
 
-/// The most threads one terminal can legitimately hold: the number of
-/// per-session families (`terminal-reader`, `terminal-waiter`) — **2**.
+/// The fewest threads a live terminal holds: the in-process per-session
+/// families (`terminal-reader`, `terminal-waiter`) every pane carries whatever
+/// its pane I/O — **2**.
+pub(crate) const MIN_THREADS_PER_SESSION: usize =
+    qontinui_runner_lib::wedge_diagnostics::IN_PROCESS_SESSION_THREAD_FAMILIES.len();
+
+/// The most threads one terminal can legitimately hold: every per-session
+/// family — the two in-process ones plus a holder-backed pane's
+/// `pty-holder-ctl` / `pty-holder-pump` — **4**.
 ///
 /// A measured ratio above it is not a fatter terminal; it is a teardown race
 /// (threads of terminals the registry already dropped) or a leak in a
-/// `terminal-*` family. Both are exactly the conditions under which the guard
+/// per-session family. Both are exactly the conditions under which the guard
 /// must NOT loosen, and threads-per-session is a MULTIPLIER on the
 /// session-capacity arm of [`scaled_thread_ceilings`] — so it is capped here.
 pub(crate) const MAX_THREADS_PER_SESSION: usize =
     qontinui_runner_lib::wedge_diagnostics::SESSION_THREAD_FAMILIES.len();
 
 /// The threads-per-session [`scaled_thread_ceilings`] multiplies by when no
-/// fresh tick measured one: `min(THREADS_PER_SESSION, MAX_THREADS_PER_SESSION)`
+/// fresh tick measured one: `min(THREADS_PER_SESSION, MIN_THREADS_PER_SESSION)`
 /// = **2**.
 ///
-/// Not [`THREADS_PER_SESSION`]'s 3. "3 is strict" holds for the at-rest
-/// baseline, where the figure is SUBTRACTED (over-subtracting lowers the
-/// floor). Here it is MULTIPLIED into a ceiling, where the larger number is
-/// the looser one — so the fallback takes the smaller of the two.
+/// Not [`THREADS_PER_SESSION`]'s 3, and not [`MAX_THREADS_PER_SESSION`]'s 4.
+/// "3 is strict" holds for the at-rest baseline, where the figure is
+/// SUBTRACTED (over-subtracting lowers the floor). Here it is MULTIPLIED into a
+/// ceiling, where the larger number is the looser one — so the fallback takes
+/// the smallest structural value a terminal can have.
 pub(crate) const PER_SESSION_THREADS_FALLBACK: usize =
-    if THREADS_PER_SESSION < MAX_THREADS_PER_SESSION {
+    if THREADS_PER_SESSION < MIN_THREADS_PER_SESSION {
         THREADS_PER_SESSION
     } else {
-        MAX_THREADS_PER_SESSION
+        MIN_THREADS_PER_SESSION
     };
 
-/// Threads per live terminal as one observation measures them, or `None` when
-/// it cannot. PURE.
+/// Threads per live terminal one observation SUPPORTS, or `None` when it
+/// cannot support any. PURE.
 ///
-/// Integer division, rounding DOWN, and capped at [`MAX_THREADS_PER_SESSION`]:
-/// this feeds the session-capacity arm of [`scaled_thread_ceilings`] as a
-/// multiplier, and a smaller multiplier is a lower (stricter) ceiling — so a
-/// teardown race or a leaked `terminal-*` thread can never inflate it. Fewer
-/// named threads than terminals ([`census_misread`]) reads `None`, as does any
-/// UNKNOWN half and a box with no terminals (nothing to divide by). `None`
-/// falls back to [`PER_SESSION_THREADS_FALLBACK`] downstream.
+/// **The answer is structural.** Every live terminal holds the
+/// [`MIN_THREADS_PER_SESSION`] in-process family threads, and a holder-backed
+/// one adds the runner-side `pty-holder-ctl` / `pty-holder-pump` pair, so a
+/// box's figure is `2 + (holder-family threads per terminal)`, and that second
+/// term lies in `[0, 2]`. Only the HOLDER count moves the answer:
+///
+/// - **A leak in an in-process family** (`terminal-reader` / `-waiter`, a
+///   teardown race, exited-but-open panes) cannot move it at all. The in-process
+///   term is the constant 2 whatever the named total says.
+/// - **The holder term is rounded to NEAREST, ties DOWN** (`x.5 → x`), and is
+///   capped at 2. It errs by at most half a thread per session in either
+///   direction. Nearest rather than floor so that a few exited-but-open holder
+///   panes (registry count a little above the thread-holding count) do not cut
+///   an all-holder box from 4 to 3, the halving defect plan `2026-10-15-…`
+///   fixed for the in-process pair.
+/// - **The holder count is bounded by coherence.** Every holder-backed pane
+///   also holds its own in-process pair, so a coherent census has
+///   `holder <= named - holder`. The term uses `min(holder, named - holder)`,
+///   so leftover holder threads from panes the registry already dropped cannot
+///   push it past what the census's in-process pairs support. A holder-family
+///   leak is bounded at +2, the structural maximum, either way.
+///
+/// The history this replaces, so nobody re-derives it. Plan
+/// `2026-10-15-per-session-thread-ratio-floors-to-one-and-halves-the-session-arm`
+/// stopped a quotient rounded DOWN collapsing 298 named / 153 registered to
+/// **1**. After that fix the function answered the structural 2 for every
+/// coherent tick. That was right while every pane was in-process, and wrong
+/// once holder-backed panes (4 runner threads each) arrived: on nawa,
+/// 2026-11-04, 234 holder panes carried 936 session threads while the guard
+/// multiplied capacity by 2.
+///
+/// The measurement still decides WHETHER there is an answer. Fewer named
+/// threads than terminals ([`census_misread`]) reads `None`, and so does any
+/// UNKNOWN half or a box with no terminals. `None` falls back to
+/// [`PER_SESSION_THREADS_FALLBACK`] downstream, and the mis-read itself makes
+/// the scaled term UNKNOWN through [`SESSION_CENSUS_MISREAD`].
 pub(crate) fn per_session_threads_from(
     census_session_threads: Option<usize>,
+    census_holder_threads: Option<usize>,
     live_sessions: Option<usize>,
 ) -> Option<usize> {
-    let (Some(named), Some(sessions)) = (census_session_threads, live_sessions) else {
+    let (Some(named), Some(holder), Some(sessions)) =
+        (census_session_threads, census_holder_threads, live_sessions)
+    else {
         return None;
     };
     if sessions == 0 || census_misread(named, sessions) {
         return None;
     }
-    Some((named / sessions).min(MAX_THREADS_PER_SESSION))
+    // Every holder pane also holds an in-process pair, so a coherent census
+    // has `holder <= named - holder`; anything beyond that is not a pane.
+    let holder = holder.min(named.saturating_sub(holder));
+    // round_half_down(holder / sessions) == floor((2·holder + sessions − 1) / (2·sessions)).
+    let holder_per_session =
+        holder.saturating_mul(2).saturating_add(sessions - 1) / sessions.saturating_mul(2);
+    Some(MIN_THREADS_PER_SESSION.saturating_add(holder_per_session.min(HOLDER_THREADS_PER_SESSION)))
 }
 
-/// The most recent tick's measured threads-per-session, stamped with when it
-/// was taken.
+/// The runner threads a holder-backed pane adds over an in-process one
+/// (`pty-holder-ctl`, `pty-holder-pump`) — **2**.
+const HOLDER_THREADS_PER_SESSION: usize =
+    qontinui_runner_lib::wedge_diagnostics::HOLDER_SESSION_THREAD_FAMILIES.len();
+
+/// The most recent tick's threads-per-session ([`per_session_threads_from`]:
+/// 2 plus the holder term, present only when the tick's census was coherent),
+/// stamped with when it was taken.
 ///
 /// Recorded beside the at-rest window on the same 30 s
 /// [`crate::fleet::resource_sample`] tick, for the reason that tick feeds the
@@ -764,13 +834,17 @@ pub(crate) fn per_session_threads_from(
 /// not take the `TerminalManager` lock to get one (see
 /// `the_spawn_gate_reading_did_not_grow_the_spawn_pressure_probes`). Aged by
 /// [`AT_REST_SAMPLE_MAX_AGE`] on read, so a stalled publisher decays to the
-/// [`THREADS_PER_SESSION`] fallback rather than freezing a stale ratio.
+/// [`PER_SESSION_THREADS_FALLBACK`] rather than freezing a stale reading.
 static SESSION_THREAD_SAMPLE: Mutex<Option<(std::time::Instant, usize)>> = Mutex::new(None);
 
 /// Fold one tick's `(named session threads, live sessions)` into
 /// [`SESSION_THREAD_SAMPLE`]. An observation that measures nothing leaves the
 /// previous sample to age out on its own rather than overwriting it.
-fn note_session_thread_sample(census_session_threads: Option<usize>, live_sessions: Option<usize>) {
+fn note_session_thread_sample(
+    census_session_threads: Option<usize>,
+    census_holder_threads: Option<usize>,
+    live_sessions: Option<usize>,
+) {
     // The mis-read flag is set by an incoherent tick and cleared by any tick
     // that can judge coherence and finds it, so `/health` names the state the
     // census is in NOW rather than one it was in once.
@@ -779,7 +853,9 @@ fn note_session_thread_sample(census_session_threads: Option<usize>, live_sessio
             *flag = census_misread(named, sessions).then(std::time::Instant::now);
         }
     }
-    let Some(per_session) = per_session_threads_from(census_session_threads, live_sessions) else {
+    let Some(per_session) =
+        per_session_threads_from(census_session_threads, census_holder_threads, live_sessions)
+    else {
         return;
     };
     if let Ok(mut slot) = SESSION_THREAD_SAMPLE.lock() {
@@ -806,8 +882,8 @@ fn session_census_misread_now() -> bool {
         })
 }
 
-/// The measured threads-per-session, or `None` when no fresh tick measured
-/// one (or the lock is poisoned) — UNKNOWN, which
+/// The threads-per-session a fresh coherent tick confirmed, or `None` when no
+/// fresh tick could (or the lock is poisoned) — UNKNOWN, which
 /// [`scaled_thread_ceilings`] renders as [`PER_SESSION_THREADS_FALLBACK`].
 pub(crate) fn measured_per_session_threads() -> Option<usize> {
     let slot = SESSION_THREAD_SAMPLE.lock().ok()?;
@@ -868,8 +944,9 @@ pub(crate) fn at_rest_thread_baseline() -> Option<usize> {
 /// A thread ceiling is a HEADROOM figure wearing an absolute number's clothes.
 /// 256 and 400 mean "105 and 249 threads of room above a runner that idles at
 /// 151" — that is how [`THREAD_CEILING_MIN`]'s doc derives them and how
-/// [`crate::agent_runtime::DEFAULT_CONTINUATION_SESSION_CAP`]'s doc converts
-/// them to ~35 and ~83 sessions on the calibration box. Enforced as absolutes on a machine whose idle
+/// [`THREADS_PER_SESSION`] converts them to ~35 and ~83 sessions on the
+/// calibration box (an in-process box; a holder-backed pane holds 4 runner
+/// threads, so ~26 and ~62 there). Enforced as absolutes on a machine whose idle
 /// floor is 400, they are not a stricter guard: they are a LATCH. Every
 /// continuation is deferred, the deferral frees ~3 threads against a floor of
 /// ~400, and so the deferral cannot clear the condition that caused it.
@@ -938,7 +1015,7 @@ impl LaneMetric {
     /// CRITICAL refusal wire ([`CRITICAL_REFUSAL_PREFIX`], parsed by
     /// `src/lib/resourceGuard.ts`). Snake case to match the Rust field names it
     /// stands in for; the webview only ever compares it, never renders it.
-    fn wire_name(self) -> &'static str {
+    pub(crate) fn wire_name(self) -> &'static str {
         match self {
             LaneMetric::FreeCommitBytes => "free_commit_bytes",
             LaneMetric::ThreadCount => "thread_count",
@@ -1013,7 +1090,11 @@ pub(crate) struct GateObservation {
     /// [`Lane::as_str`] — `"host"`, `"wsl"` or `"threads"`. Never a literal.
     pub(crate) lane: String,
     pub(crate) metric: LaneMetric,
-    /// What was measured, in the metric's own unit.
+    /// What was measured, in the metric's own unit — or, for an unattended
+    /// admission refused by [`projected_verdict`], the PROJECTED reading: the
+    /// measured value with every admitted, not-yet-running spawn charged at
+    /// [`ProjectedSpawnCost`]. The box never read that number; the deferral log
+    /// line names the pending count beside it.
     pub(crate) observed: u64,
     /// The floor it fell below, or the ceiling it rose above.
     pub(crate) limit: u64,
@@ -1158,19 +1239,12 @@ pub(crate) fn evaluate(
         // Unreadable sensor ⇒ no opinion ⇒ proceed. Fail open.
         return SpawnGate::Proceed;
     };
-    let observation = |limit: u64| GateObservation {
-        lane: lane.to_string(),
-        metric: LaneMetric::FreeCommitBytes,
-        observed: free,
-        limit,
-    };
-    if free < guard.critical_free_commit_bytes {
-        return SpawnGate::Critical(observation(guard.critical_free_commit_bytes));
-    }
-    if free < guard.warn_free_commit_bytes {
-        return SpawnGate::Warn(observation(guard.warn_free_commit_bytes));
-    }
-    SpawnGate::Proceed
+    evaluate_floors(
+        lane,
+        free,
+        guard.warn_free_commit_bytes,
+        guard.critical_free_commit_bytes,
+    )
 }
 
 /// Pure verdict over an injected thread count and the machine owner's ceilings.
@@ -1397,7 +1471,8 @@ pub(crate) struct ThreadCapacityInputs {
     pub(crate) mem_total_bytes: Option<u64>,
     /// The measured at-rest thread floor ([`at_rest_thread_baseline`]).
     pub(crate) baseline: Option<usize>,
-    /// Measured threads per live terminal ([`measured_per_session_threads`]).
+    /// Threads per live terminal a fresh coherent tick confirmed
+    /// ([`measured_per_session_threads`]).
     pub(crate) per_session_threads: Option<usize>,
     /// Named per-session threads in the census right now
     /// ([`ThreadNameCensus::session_threads`]).
@@ -1458,7 +1533,7 @@ pub(crate) struct ScaledThreadCeilings {
     /// The baseline actually used: the measured floor capped at
     /// [`AT_REST_BASELINE_MAX`], or [`CALIBRATION_BASELINE`] when UNKNOWN.
     pub(crate) baseline_used: usize,
-    /// The threads-per-session actually used: measured and capped at
+    /// The threads-per-session actually used: the confirmed value capped at
     /// [`MAX_THREADS_PER_SESSION`], or [`PER_SESSION_THREADS_FALLBACK`] when
     /// UNKNOWN.
     pub(crate) per_session_threads_used: usize,
@@ -1470,9 +1545,9 @@ pub(crate) struct ScaledThreadCeilings {
 /// dialog-says-low-memory`, §3 "Session capacity". The runner's thread count
 /// measures two different things and this keeps them apart:
 ///
-/// 1. **Session threads** (2 per terminal) are a stand-in for session LOAD,
-///    whose real limits are CPU and memory — properties of the machine. So the
-///    session-capacity arm scales:
+/// 1. **Session threads** (2 per in-process terminal, 4 per holder-backed one)
+///    are a stand-in for session LOAD, whose real limits are CPU and memory —
+///    properties of the machine. So the session-capacity arm scales:
 ///    `baseline + per_session × min(SESSIONS_PER_CORE × cores, (MemTotal − reserve) / PER_SESSION_RSS)`.
 /// 2. **Everything else** is judged against tokio's 512-slot blocking pool,
 ///    which does NOT grow with the machine. So the pool arm keeps today's
@@ -1490,7 +1565,7 @@ pub(crate) struct ScaledThreadCeilings {
 /// falls back to the hardcoded floor — exactly the pre-scaling behaviour. An
 /// UNKNOWN baseline is NOT an error: it uses [`CALIBRATION_BASELINE`], the
 /// floor the shipped ceilings were derived against, and an UNKNOWN
-/// per-session figure uses [`PER_SESSION_THREADS_FALLBACK`]. A measured one is
+/// per-session figure uses [`PER_SESSION_THREADS_FALLBACK`]. A supplied one is
 /// capped at [`MAX_THREADS_PER_SESSION`].
 pub(crate) fn scaled_thread_ceilings(
     inputs: &ThreadCapacityInputs,
@@ -1508,7 +1583,9 @@ pub(crate) fn scaled_thread_ceilings(
         .map(|b| b.min(AT_REST_BASELINE_MAX))
         .unwrap_or(CALIBRATION_BASELINE);
     // Capped even when "measured": the input is a plain field, and the cap is
-    // what makes a leaked or racing `terminal-*` thread unable to loosen this.
+    // what bounds a leaked or racing per-session thread's effect on this (the
+    // measured value itself is sized from the holder families alone, so a
+    // `terminal-*` leak cannot move it — see `per_session_threads_from`).
     let per_session = inputs
         .per_session_threads
         .map(|n| n.min(MAX_THREADS_PER_SESSION))
@@ -1985,7 +2062,10 @@ pub(crate) fn effective_session_floors(
 /// point). It does a blocking sysinfo refresh, and [`effective_thread_ceilings`]
 /// runs on every spawn, so it is cached in a `OnceLock` — neither quantity
 /// changes under a live process in any way this guard should chase.
-fn host_capacity() -> crate::ci_node::host_sizing::HostCapacity {
+///
+/// Also read by `fleet::host_capabilities` for the `mem_ge_<N>` memory-tier
+/// tokens, so the heartbeat and this guard judge the same `MemTotal`.
+pub(crate) fn host_capacity() -> crate::ci_node::host_sizing::HostCapacity {
     static HOST: std::sync::OnceLock<crate::ci_node::host_sizing::HostCapacity> =
         std::sync::OnceLock::new();
     *HOST.get_or_init(crate::ci_node::host_sizing::probe)
@@ -2307,8 +2387,9 @@ fn graded_trip_message(severity: &str, reading: &GradedThreadReading, limit: u64
     )
 }
 
-/// The thread lane's live verdict, folded and evaluated. Shared by
-/// [`probe_for_spawn`] and [`thread_pressure`] so the two can never drift.
+/// The thread lane's live reading, ceilings and verdict. [`lane_verdicts`] is its
+/// only caller, so the gate ([`probe_for_spawn`]) and the `/health` report can
+/// never drift.
 ///
 /// **The single call site of
 /// [`crate::health_monitor::thread_count_reading_memoized`]**, which is what
@@ -2326,11 +2407,17 @@ fn graded_trip_message(severity: &str, reading: &GradedThreadReading, limit: u64
 /// honest. `evaluate_threads` and the ceilings it compares against are
 /// untouched; the `GateObservation.observed` every refusal quotes is the
 /// graded number, and [`note_graded_trip`] logs the raw one beside it.
-fn thread_lane_verdict(local: &SessionGuardSettings) -> SpawnGate {
+fn thread_lane_verdict(local: &SessionGuardSettings) -> ThreadLane {
     let census = crate::health_monitor::thread_name_census_memoized();
     let ceilings = effective_thread_ceilings_given(local, census.as_ref()).ceilings;
+    let lane = |graded: Option<usize>, verdict: SpawnGate| ThreadLane {
+        graded,
+        warn_ceiling: ceilings.warn,
+        critical_ceiling: ceilings.critical,
+        verdict,
+    };
     let Some(total) = crate::health_monitor::thread_count_reading_memoized() else {
-        return evaluate_threads(None, local.enabled, ceilings);
+        return lane(None, evaluate_threads(None, local.enabled, ceilings));
     };
     let reading = graded_thread_reading(
         total,
@@ -2341,40 +2428,281 @@ fn thread_lane_verdict(local: &SessionGuardSettings) -> SpawnGate {
     );
     let verdict = evaluate_threads(Some(reading.graded), local.enabled, ceilings);
     note_graded_trip(&verdict, &reading);
-    verdict
+    lane(Some(reading.graded), verdict)
 }
 
-/// The thread lane's verdict on its own, live — **the entry point for callers
-/// that are not a spawn.**
+/// What [`thread_lane_verdict`] read and decided.
+#[derive(Debug, Clone)]
+pub(crate) struct ThreadLane {
+    /// The GRADED thread count (raw minus the idle blocking pool). `None` when
+    /// the OS thread table could not be read — UNKNOWN, never zero.
+    pub(crate) graded: Option<usize>,
+    /// The effective ceilings the reading was judged against.
+    pub(crate) warn_ceiling: usize,
+    pub(crate) critical_ceiling: usize,
+    pub(crate) verdict: SpawnGate,
+}
+
+/// Both lanes' readings and verdicts, taken ONCE — see [`lane_verdicts`].
+#[derive(Debug, Clone)]
+pub(crate) struct LaneVerdicts {
+    /// The memory lane the reading came from ([`Lane::as_str`]).
+    pub(crate) memory_lane: &'static str,
+    /// Free commit as read (`MemAvailable` off Windows). `None` is UNKNOWN.
+    pub(crate) free_commit_bytes: Option<u64>,
+    /// Free physical memory as read. Reported, never judged.
+    pub(crate) free_phys_bytes: Option<u64>,
+    /// The effective floors the commit reading was judged against.
+    pub(crate) warn_free_commit_bytes: u64,
+    pub(crate) critical_free_commit_bytes: u64,
+    /// The memory lane's verdict.
+    pub(crate) memory: SpawnGate,
+    /// The thread lane's graded reading, ceilings and verdict.
+    pub(crate) threads: ThreadLane,
+}
+
+/// Both lanes' readings and verdicts, read ONCE — the one place the live
+/// readings are taken, so [`probe_for_spawn`] (the gate) and the `/health`
+/// `spawnAdmission` block (the report) can never compute different verdicts
+/// from different reads.
 ///
-/// Phase 1 of `2026-08-30-load-aware-spawn-admission-control` calls this from
-/// `agent_runtime::evaluate_continuation_guard`, and it needs a DIFFERENT
-/// threshold from the one [`admit_spawn`] enforces. The asymmetry is deliberate
-/// and belongs to the caller, which is why this returns the whole
-/// [`SpawnGate`] rather than a bool:
+/// `None` when the session guard is disabled: no reading is taken at all, which
+/// is the cost argument [`probe_for_spawn`]'s doc makes.
 ///
-/// - A **gate continuation** may defer at [`SpawnGate::Warn`]. It can wait and
-///   be re-delivered, nobody is sitting in front of it, and back-pressure that
-///   arrives early is the entire point of a queue — so the cheap verdict is the
-///   right one to act on.
-/// - An **operator's own spawn** is refused only at [`SpawnGate::Critical`], and
-///   even then overridably ([`admit_spawn`]). Refusing a human's terminal on a
-///   soft signal is the false positive this module's doctrine ranks worst.
-///
-/// So: match on the verdict, act at the severity your caller's cost of waiting
-/// justifies. Do not invent a second set of thresholds — the numbers are folded
-/// once, from settings and the fleet, by [`effective_thread_ceilings`].
-///
-/// Short-circuits on a disabled guard before touching the sensor, exactly as
-/// [`probe_for_spawn`] does: a machine owner who turned the guard off pays
-/// nothing.
-pub(crate) fn thread_pressure() -> SpawnGate {
+/// **Logs nothing on its own** apart from what the two lane folds already log on
+/// a transition, so a polled route can call it freely; the shadowed-lane `warn!`
+/// belongs to the gate, not to a read.
+pub(crate) fn lane_verdicts() -> Option<LaneVerdicts> {
     let local = crate::settings::get_session_guard_settings();
     if !local.enabled {
-        return SpawnGate::Proceed;
+        return None;
     }
-    thread_lane_verdict(&local)
+    // The reading carries free PHYSICAL alongside free commit — one
+    // `GlobalMemoryStatusEx` fills both, so the second figure costs nothing.
+    // Phase 1 of plan `2026-08-08-memory-floors-watch-commit-and-physical` is
+    // behaviour-neutral BY CONSTRUCTION: the verdict below still consults the
+    // commit figure and only the commit figure. Phase 2 is what gives the
+    // physical reading a floor of its own; do not add one here.
+    Some(lane_verdicts_given(
+        &local,
+        crate::fleet::resource_sample::spawn_gate_reading(),
+    ))
 }
+
+/// [`lane_verdicts`] over a memory reading the caller ALREADY took — the
+/// `(lane, free commit, free physical)` triple
+/// [`crate::fleet::resource_sample::spawn_gate_reading`] returns. The host-lane
+/// sampler passes the one `memory_status()` it publishes, so the launch
+/// capacity on a sample is judged against the very memory figures that sample
+/// carries (plan `2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling`
+/// Phase 2). `None` when the session guard is disabled, as [`lane_verdicts`].
+pub(crate) fn lane_verdicts_with_memory(
+    memory: (&'static str, Option<u64>, Option<u64>),
+) -> Option<LaneVerdicts> {
+    let local = crate::settings::get_session_guard_settings();
+    if !local.enabled {
+        return None;
+    }
+    Some(lane_verdicts_given(&local, memory))
+}
+
+/// Both lanes over one memory reading and the live thread reading.
+fn lane_verdicts_given(
+    local: &SessionGuardSettings,
+    (lane, free_commit_bytes, free_phys_bytes): (&'static str, Option<u64>, Option<u64>),
+) -> LaneVerdicts {
+    let floors = effective_session_floors(local, lane);
+    let memory = evaluate(lane, free_commit_bytes, &floors);
+    let threads = thread_lane_verdict(local);
+    LaneVerdicts {
+        memory_lane: lane,
+        free_commit_bytes,
+        free_phys_bytes,
+        warn_free_commit_bytes: floors.warn_free_commit_bytes,
+        critical_free_commit_bytes: floors.critical_free_commit_bytes,
+        memory,
+        threads,
+    }
+}
+
+/// The composed (heavier-lane) verdict of a [`LaneVerdicts`], without the
+/// shadowed-lane log [`probe_for_spawn`] writes. For a report, not a gate.
+pub(crate) fn composed_verdict(lanes: &LaneVerdicts) -> SpawnGate {
+    compose_lanes(lanes.memory.clone(), lanes.threads.verdict.clone()).0
+}
+
+// =============================================================================
+// Projected cost of admitted-but-not-yet-running unattended spawns
+// =============================================================================
+
+/// What ONE admitted, not-yet-registered unattended spawn is projected to cost
+/// each resource lane once its `claude` is running.
+///
+/// ## Why admission needs a projection at all
+///
+/// Both lanes read the box AS IT IS. A continuation that has passed the guard
+/// but has not yet registered — it is still posting coord's consume claim,
+/// acquiring a worktree, warming the trust dial, creating its PTY — has no
+/// process yet, so neither reading can see it. A replay of N pending rows
+/// (`poll_pending_continuations` spawns one task per row, unbounded) therefore
+/// reads the SAME pre-burst headroom N times and admits all N. That is the
+/// 2026-10-27 spaceship incident's shape (20 continuations passed the guard at
+/// once with `QONTINUI_CONTINUATION_SESSION_CAP=9`, as measured in the Why of
+/// plan `2026-10-28-gate-continuation-cap-is-a-real-permit`), and it is that
+/// plan's insight, carried here into the
+/// resource-lane admission instead of into a fixed count (plan
+/// `2026-10-28-finished-gate-continuations-never-free-a-slot-so-the-box-deadlocks-at-the-continuation-cap`
+/// D2; the count stays retired by operator direction 2026-10-03).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProjectedSpawnCost {
+    /// Free commit (`MemAvailable` off Windows) one session is projected to
+    /// take — [`PER_SESSION_RSS_BYTES`], the same per-session figure the thread
+    /// ceilings are scaled by.
+    pub(crate) commit_bytes: u64,
+    /// Runner threads one session is projected to add — the measured
+    /// threads-per-session when a fresh tick measured one, else
+    /// [`PER_SESSION_THREADS_FALLBACK`].
+    pub(crate) threads: usize,
+}
+
+impl ProjectedSpawnCost {
+    /// The live projection.
+    pub(crate) fn live() -> Self {
+        Self {
+            commit_bytes: PER_SESSION_RSS_BYTES,
+            threads: measured_per_session_threads().unwrap_or(PER_SESSION_THREADS_FALLBACK),
+        }
+    }
+}
+
+/// One admission reading: both lanes' readings (or `None` for a disabled
+/// session guard, which takes no reading at all) and the projected cost of
+/// each admitted-but-not-yet-running spawn.
+///
+/// The reading is taken ONCE, outside any lock (it is a synchronous OS read);
+/// [`Self::projected`] is pure and cheap, so the caller can fold in its count
+/// of pending admissions under the lock that also records the new one. That
+/// split is what makes the bound hold across CONCURRENT guard passes.
+#[derive(Debug, Clone)]
+pub(crate) struct AdmissionReading {
+    pub(crate) lanes: Option<LaneVerdicts>,
+    pub(crate) cost: ProjectedSpawnCost,
+}
+
+impl AdmissionReading {
+    /// The live reading: [`lane_verdicts`] (the ONE place the live readings are
+    /// taken, shared with `/health` `spawnAdmission`) plus
+    /// [`ProjectedSpawnCost::live`].
+    pub(crate) fn live() -> Self {
+        Self {
+            lanes: lane_verdicts(),
+            cost: ProjectedSpawnCost::live(),
+        }
+    }
+
+    /// PURE: the composed verdict once `pending` admitted-but-not-yet-running
+    /// spawns are charged against the readings, with the lane that tripped but
+    /// lost the report beside it. See [`projected_verdict`]. Safe to call under
+    /// a lock: it reads nothing and logs nothing — hand the second half to
+    /// [`note_admission_shadowed_lane`] once the lock is released.
+    pub(crate) fn projected(&self, pending: usize) -> (SpawnGate, Option<SpawnGate>) {
+        projected_lanes(self.lanes.as_ref(), pending, self.cost)
+    }
+}
+
+/// The shadowed (lane, severity) unattended admission last logged — its own
+/// cell, apart from [`LAST_SHADOWED_LANE`], because the admission verdict is
+/// PROJECTED and can shadow a different lane than [`probe_for_spawn`]'s raw one
+/// at the same instant; one shared cell would flip on every interleaving and
+/// defeat the edge trigger.
+static LAST_ADMISSION_SHADOWED_LANE: Mutex<Option<(LaneMetric, &'static str)>> = Mutex::new(None);
+
+/// The edge-triggered "a second lane also tripped" line for unattended
+/// admission (the shadowed half of [`AdmissionReading::projected`]). Call it
+/// OUTSIDE any registry lock.
+pub(crate) fn note_admission_shadowed_lane(shadowed: Option<&SpawnGate>) {
+    note_shadowed_lane(shadowed, &LAST_ADMISSION_SHADOWED_LANE);
+}
+
+/// PURE: the composed (heavier-lane) verdict once `pending` admitted spawns
+/// that are not yet running are charged at `cost` each.
+///
+/// - `lanes: None` is a disabled guard ⇒ [`SpawnGate::Proceed`], as
+///   [`probe_for_spawn`] answers.
+/// - `pending == 0` is EXACTLY [`composed_verdict`] — the projection never
+///   changes an answer the readings alone give.
+/// - An UNREADABLE lane (`None` reading) stays unreadable: it has no opinion
+///   and projects to none, the fail-open doctrine this module is built on. So
+///   a box whose sensors cannot be read is not bounded by this projection
+///   either — it never was by the readings.
+/// - Free commit saturates at 0; the thread count saturates at `usize::MAX`.
+pub(crate) fn projected_verdict(
+    lanes: Option<&LaneVerdicts>,
+    pending: usize,
+    cost: ProjectedSpawnCost,
+) -> SpawnGate {
+    projected_lanes(lanes, pending, cost).0
+}
+
+/// [`projected_verdict`] with the shadowed lane [`compose_lanes`] reports beside
+/// the heavier one. PURE.
+fn projected_lanes(
+    lanes: Option<&LaneVerdicts>,
+    pending: usize,
+    cost: ProjectedSpawnCost,
+) -> (SpawnGate, Option<SpawnGate>) {
+    let Some(lanes) = lanes else {
+        return (SpawnGate::Proceed, None);
+    };
+    if pending == 0 {
+        return compose_lanes(lanes.memory.clone(), lanes.threads.verdict.clone());
+    }
+    let pending_bytes = cost.commit_bytes.saturating_mul(pending as u64);
+    let memory = match lanes.free_commit_bytes {
+        Some(free) => evaluate_floors(
+            lanes.memory_lane,
+            free.saturating_sub(pending_bytes),
+            lanes.warn_free_commit_bytes,
+            lanes.critical_free_commit_bytes,
+        ),
+        None => lanes.memory.clone(),
+    };
+    let threads = match lanes.threads.graded {
+        Some(graded) => evaluate_threads(
+            Some(graded.saturating_add(cost.threads.saturating_mul(pending))),
+            true,
+            ThreadCeilings {
+                warn: lanes.threads.warn_ceiling,
+                critical: lanes.threads.critical_ceiling,
+            },
+        ),
+        None => lanes.threads.verdict.clone(),
+    };
+    compose_lanes(memory, threads)
+}
+
+/// [`evaluate`]'s comparison over explicit floors, for a caller that holds the
+/// already-folded floors ([`LaneVerdicts`]) rather than a settings struct. Same
+/// strictly-below boundaries, same critical-first order.
+fn evaluate_floors(lane: &str, free: u64, warn: u64, critical: u64) -> SpawnGate {
+    let observation = |limit: u64| GateObservation {
+        lane: lane.to_string(),
+        metric: LaneMetric::FreeCommitBytes,
+        observed: free,
+        limit,
+    };
+    if free < critical {
+        return SpawnGate::Critical(observation(critical));
+    }
+    if free < warn {
+        return SpawnGate::Warn(observation(warn));
+    }
+    SpawnGate::Proceed
+}
+
+/// The shadowed (lane, severity) [`probe_for_spawn`] last logged, so its line is
+/// written on a TRANSITION rather than on every call.
+static LAST_SHADOWED_LANE: Mutex<Option<(LaneMetric, &'static str)>> = Mutex::new(None);
 
 /// Live verdict: read the limits, take one reading per lane, evaluate both,
 /// report the heavier.
@@ -2410,23 +2738,22 @@ pub(crate) fn thread_pressure() -> SpawnGate {
 /// The fleet terms are folded in AFTER the readings, because the lane to look
 /// the memory floors up under comes from the reading itself.
 pub(crate) fn probe_for_spawn() -> SpawnGate {
-    let local = crate::settings::get_session_guard_settings();
-    if !local.enabled {
+    let Some(lanes) = lane_verdicts() else {
         return SpawnGate::Proceed;
-    }
-    // The reading now carries free PHYSICAL alongside free commit — one
-    // `GlobalMemoryStatusEx` fills both, so the second figure costs nothing.
-    // Phase 1 of plan `2026-08-08-memory-floors-watch-commit-and-physical` is
-    // behaviour-neutral BY CONSTRUCTION: the verdict below still consults the
-    // commit figure and only the commit figure. Phase 2 is what gives the
-    // physical reading a floor of its own; do not add one here.
-    let (lane, free_commit_bytes, _free_phys_bytes) =
-        crate::fleet::resource_sample::spawn_gate_reading();
-    let floors = effective_session_floors(&local, lane);
-    let memory = evaluate(lane, free_commit_bytes, &floors);
-    let threads = thread_lane_verdict(&local);
+    };
+    let (reported, shadowed) = compose_lanes(lanes.memory, lanes.threads.verdict);
+    note_shadowed_lane(shadowed.as_ref(), &LAST_SHADOWED_LANE);
+    reported
+}
 
-    let (reported, shadowed) = compose_lanes(memory, threads);
+/// The edge-triggered "a second lane also tripped" line, written when the
+/// shadowed (lane, severity) pair differs from the one `last` holds. The gate
+/// ([`probe_for_spawn`]) and unattended admission
+/// ([`note_admission_shadowed_lane`]) each pass their own cell.
+fn note_shadowed_lane(
+    shadowed: Option<&SpawnGate>,
+    last: &Mutex<Option<(LaneMetric, &'static str)>>,
+) {
     // The lane that tripped but lost the report. Logged so the operator's log
     // says both, even though the toast or the refusal can only say one. The
     // severity word comes from the shadowed verdict itself, not from the
@@ -2435,7 +2762,25 @@ pub(crate) fn probe_for_spawn() -> SpawnGate {
     // operator stop trusting the line. Read through `tripped()` so a `Proceed`
     // is a `None` rather than a panic arm: this runs immediately before a PTY
     // opens, and nothing on that path may be able to unwind.
-    if let Some((severity, obs)) = shadowed.as_ref().and_then(SpawnGate::tripped) {
+    //
+    // EDGE-TRIGGERED, like the graded trip line (`note_graded_trip`): the
+    // unattended pre-check now calls this once per pending continuation per
+    // poll, so a level-triggered line would write N copies per poll under a
+    // backlog with both lanes tripped. It is written when the shadowed
+    // (lane, severity) pair CHANGES, and not again until it does.
+    let shadow_key = shadowed
+        .and_then(SpawnGate::tripped)
+        .map(|(severity, obs)| (obs.metric, severity));
+    let shadow_changed = {
+        let mut last = last.lock().unwrap_or_else(|e| e.into_inner());
+        let changed = *last != shadow_key;
+        *last = shadow_key;
+        changed
+    };
+    if let Some((severity, obs)) = shadowed
+        .and_then(SpawnGate::tripped)
+        .filter(|_| shadow_changed)
+    {
         warn!(
             lane = %obs.lane,
             metric = obs.metric.wire_name(),
@@ -2447,7 +2792,6 @@ pub(crate) fn probe_for_spawn() -> SpawnGate {
             obs.clause(severity),
         );
     }
-    reported
 }
 
 /// `bytes` as `"1.42 GiB"`. Two decimals because the shipped critical floor is
@@ -2566,10 +2910,12 @@ pub(crate) fn admit_spawn(
 /// isolated git worktree first: under `QONTINUI_AGENT_WORKTREE_MODE`,
 /// `acquire_for_terminal` runs a `git worktree add`, takes a coord claim, starts
 /// a heartbeat task and shells out to `git config` for the credential helper. On
-/// a CRITICAL refusal all of that is thrown away, and `IsolatedEditContext::Drop`
-/// releases the claim but does NOT remove the materialized worktree — so every
-/// refusal leaks a directory, and the operator's "Start anyway" retry materializes
-/// a second one. Refusing before the acquisition costs one
+/// a CRITICAL refusal all of that is thrown away. `IsolatedEditContext::Drop`
+/// releases the claim but does not remove the materialized worktree; the door's
+/// `IsolatedEditContext::remove_unspawned` takes a pre-child refusal's fresh,
+/// empty tree back off disk, but only after a `git worktree add` and a removal
+/// both ran — and the operator's "Start anyway" retry materializes a second
+/// one. Refusing before the acquisition costs one
 /// `GlobalMemoryStatusEx` call plus — at most once per
 /// [`crate::health_monitor::THREAD_READING_TTL`], and in practice never here,
 /// because [`admit_spawn`] takes the same reading milliseconds later — one
@@ -3027,6 +3373,68 @@ impl BackgroundShed {
     }
 }
 
+/// Test-only: [`tracing::subscriber::with_default`] for a test that asserts on
+/// what it logged, without a parallel test silently disabling a callsite for it.
+/// A new capture should go through this. Not on it, by class: a capture that
+/// holds a `set_default` guard across an `.await`, which a closure cannot
+/// (`mcp/transport/cloud.rs`, `coord_questions.rs`); one with its own serial
+/// lock, rebuild and retry (`terminal/session.rs`, `secure_storage.rs`); one
+/// over test-local callsites (`logging.rs`); one that asserts on no log line at
+/// all (`otel.rs`, which counts exporter connections); and every lib-crate
+/// module, which cannot reach this bin-crate one (`plan_workunit_adapter/trigger.rs`,
+/// `outbound_net.rs`, `secure_storage.rs`).
+///
+/// Tracing's callsite `Interest` cache is PROCESS-global. While at most one
+/// dispatcher is registered, tracing-core takes its `JustOne` path, which
+/// computes a newly registered callsite's interest from the REGISTERING thread's
+/// default alone. So when a parallel test with no subscriber reaches a callsite
+/// first, it caches `never` (its default is `NoSubscriber`) and the live capture
+/// never sees that line. Observed in 3 of 3 runs of
+/// `cargo test fleet::tests::cred_`. `shed_log_is_edge_triggered` losing an
+/// `info!` once (qontinui-runner#2429's handoff notes) has this shape, though
+/// that one failure was not reproduced.
+///
+/// Two PROCESS-LIFETIME no-op dispatchers keep tracing-core off that path for
+/// good (`has_just_one` is `len <= 1` over the live set), so every registration
+/// consults every live dispatcher, under the dispatcher list's lock, and
+/// registering the capture rebuilds every callsite. The explicit rebuild is a
+/// guard for the first call, when a registration that read `JustOne` before both
+/// no-op dispatchers were live can still store its `never` afterwards.
+///
+/// The side effect is confined to test binaries: no-op dispatchers report no
+/// level hint, so `LevelFilter::current()` reads TRACE. Each capture still
+/// filters at its own level.
+#[cfg(test)]
+pub(crate) fn with_log_capture<S, R>(subscriber: S, f: impl FnOnce() -> R) -> R
+where
+    S: tracing::Subscriber + Send + Sync + 'static,
+{
+    static NO_OP_DISPATCHERS: std::sync::OnceLock<[tracing::Dispatch; 2]> =
+        std::sync::OnceLock::new();
+    NO_OP_DISPATCHERS.get_or_init(|| {
+        std::array::from_fn(
+            |_| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()),
+        )
+    });
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
+        f()
+    })
+}
+
+/// Test-only: the exact refusal text [`precheck_spawn`] and [`admit_spawn`]
+/// return on a CRITICAL verdict, produced by the real [`evaluate`] →
+/// [`critical_refusal`] pair over the shipped defaults with no free commit at
+/// all. For the doors that type this refusal, so a reworded producer cannot
+/// drift away from their answer silently.
+#[cfg(test)]
+pub(crate) fn critical_refusal_fixture(what: &str) -> String {
+    match evaluate("host", Some(0), &SessionGuardSettings::default()) {
+        SpawnGate::Critical(observation) => critical_refusal(what, &observation),
+        other => panic!("zero free commit must be CRITICAL under the defaults, got {other:?}"),
+    }
+}
+
 /// Test-only: run `f` with a scoped `tracing` subscriber and return what it
 /// logged at INFO and above. Scoped (`with_default`) rather than global because
 /// the harness runs tests in parallel and a global subscriber can be set once.
@@ -3063,7 +3471,7 @@ pub(crate) fn capture_logs<R>(f: impl FnOnce() -> R) -> (R, String) {
         .with_ansi(false)
         .with_max_level(tracing::Level::INFO)
         .finish();
-    let out = tracing::subscriber::with_default(subscriber, f);
+    let out = with_log_capture(subscriber, f);
     let text = String::from_utf8_lossy(&buf.lock().unwrap_or_else(|e| e.into_inner())).into_owned();
     (out, text)
 }
@@ -3502,6 +3910,7 @@ mod tests {
                 .filter(|(name, _)| name.starts_with("terminal-"))
                 .map(|(_, n)| n)
                 .sum(),
+            holder_session_threads: 0,
             sampled_at: std::time::SystemTime::UNIX_EPOCH,
         }
     }
@@ -4276,10 +4685,11 @@ mod tests {
     #[test]
     fn the_at_rest_estimate_subtracts_session_load_and_never_invents_one() {
         // 424 threads with 11 live sessions is the 2026-09-18 reading; on a
-        // platform with no name census the constant path attributes 33.
+        // platform with no name census the constant path attributes
+        // 11 × NO_CENSUS_THREADS_PER_SESSION = 44 (strict for any pane mix).
         let attributed = session_thread_attribution(None, Some(11));
-        assert_eq!(attributed, Some(33));
-        assert_eq!(at_rest_estimate(Some(424), attributed), Some(391));
+        assert_eq!(attributed, Some(44));
+        assert_eq!(at_rest_estimate(Some(424), attributed), Some(380));
 
         // EITHER half UNKNOWN produces no sample at all. A `0` substituted for
         // the session count would raise the estimated floor, raise the ceiling
@@ -4357,19 +4767,20 @@ mod tests {
                 "{platform}"
             );
             assert_eq!(
-                per_session_threads_from(Some(census.session_threads), Some(164)),
+                per_session_threads_from(Some(census.session_threads), Some(0), Some(164)),
                 Some(2),
                 "{platform}"
             );
         }
 
-        // What the constant path made of the same box: 7 on the raw count, and
-        // `None` on any graded total it actually carried — either way a zero
-        // shift on the busiest box in the fleet.
+        // What the no-census constant path makes of the same box: `None` on the
+        // raw count and on any graded total — a zero shift, the strict answer
+        // when the names that would size it are missing.
         assert_eq!(
             at_rest_estimate(Some(499), session_thread_attribution(None, Some(164))),
-            Some(7),
-            "on the RAW count the constant path is the draft's 7…"
+            None,
+            "on the RAW count the constant path (now × 4, strict for any pane mix) \
+             over-subtracts past the whole process…"
         );
         assert_eq!(
             at_rest_estimate(Some(300), session_thread_attribution(None, Some(164))),
@@ -4379,18 +4790,58 @@ mod tests {
     }
 
     /// **A leak cannot loosen the ceiling.** 20 live sessions and 300 leaked
-    /// `terminal-reader` threads (340 named): the measured ratio would be 17
-    /// per session, but no terminal holds more than the two family threads, so
-    /// it is capped at [`MAX_THREADS_PER_SESSION`] — and even a raw 17 handed
-    /// straight to the scaled term is capped there. The ceiling stays at the
-    /// 2-per-session value.
+    /// `terminal-reader` threads (340 named): the multiplier is sized from the
+    /// HOLDER families only, so an in-process leak leaves it at 2. A holder
+    /// family leak is capped at the structural 4 — and even a raw 17 handed
+    /// straight to the scaled term is capped there.
     #[test]
-    fn leaked_session_threads_do_not_raise_the_ceiling_past_two_per_session() {
-        assert_eq!(MAX_THREADS_PER_SESSION, 2);
-        assert_eq!(per_session_threads_from(Some(340), Some(20)), Some(2));
+    fn leaked_session_threads_do_not_raise_the_ceiling_past_four_per_session() {
+        assert_eq!(MIN_THREADS_PER_SESSION, 2);
+        assert_eq!(MAX_THREADS_PER_SESSION, 4);
+        assert_eq!(NO_CENSUS_THREADS_PER_SESSION, 4);
+        // In-process leak: no effect on the multiplier at all, and the session
+        // arm it yields is exactly the unleaked box's.
+        assert_eq!(
+            per_session_threads_from(Some(340), Some(0), Some(20)),
+            Some(2)
+        );
+        assert_eq!(
+            per_session_threads_from(Some(40), Some(0), Some(20)),
+            Some(2)
+        );
+        // Holder-family leak: bounded by coherence (holder <= named - holder)
+        // and by the structural maximum…
+        assert_eq!(
+            per_session_threads_from(Some(400), Some(340), Some(20)),
+            Some(4)
+        );
+        // …and holder threads without in-process pairs to match raise nothing.
+        assert_eq!(
+            per_session_threads_from(Some(40), Some(20), Some(20)),
+            Some(3)
+        );
+        assert_eq!(
+            per_session_threads_from(Some(30), Some(25), Some(20)),
+            Some(2)
+        );
+        let in_process_leak = ThreadCapacityInputs {
+            per_session_threads: per_session_threads_from(Some(340), Some(0), Some(20)),
+            session_threads_now: Some(340),
+            ..merytshost_loaded()
+        };
+        let unleaked = ThreadCapacityInputs {
+            per_session_threads: Some(2),
+            ..in_process_leak
+        };
+        assert_eq!(
+            scaled_thread_ceilings(&in_process_leak)
+                .unwrap()
+                .session_arm,
+            scaled_thread_ceilings(&unleaked).unwrap().session_arm,
+        );
 
         let honest = ThreadCapacityInputs {
-            per_session_threads: Some(2),
+            per_session_threads: Some(4),
             session_threads_now: Some(340),
             ..merytshost_loaded()
         };
@@ -4400,14 +4851,148 @@ mod tests {
         };
         let honest_scaled = scaled_thread_ceilings(&honest).unwrap();
         let leaked_scaled = scaled_thread_ceilings(&leaked).unwrap();
-        assert_eq!(leaked_scaled.per_session_threads_used, 2);
+        assert_eq!(leaked_scaled.per_session_threads_used, 4);
         assert_eq!(leaked_scaled.ceilings, honest_scaled.ceilings);
-        // …and that value is the 2-per-session session-capacity arm: 171 + 2 ×
-        // (192 warn | 288 critical).
-        assert!(leaked_scaled.ceilings.warn <= 171 + 2 * 192);
-        assert!(leaked_scaled.ceilings.critical <= 171 + 2 * 288);
+        // …and that value is bounded by the 4-per-session session-capacity
+        // arm: 171 + 4 × (192 warn | 288 critical).
+        assert!(leaked_scaled.ceilings.warn <= 171 + 4 * 192);
+        assert!(leaked_scaled.ceilings.critical <= 171 + 4 * 288);
         let merged = merge_thread_ceilings(&defaults(), SessionFloors::default(), &leaked);
-        assert!(merged.ceilings.warn <= 171 + 2 * 192, "{merged:?}");
+        assert!(merged.ceilings.warn <= 171 + 4 * 192, "{merged:?}");
+    }
+
+    /// The per-session figure is `2 + holder threads per terminal`, the holder
+    /// term rounded HALF-DOWN so a mixed box errs small (strict), and registry
+    /// skew from exited-but-open panes neither halves nor inflates it.
+    #[test]
+    fn per_session_ratio_reads_the_holder_mix_rounded_half_down() {
+        // All in-process, a few exited-but-open panes (plan 2026-10-15's case).
+        assert_eq!(
+            per_session_threads_from(Some(298), Some(0), Some(153)),
+            Some(2)
+        );
+        // All in-process, a teardown race a little above two.
+        assert_eq!(
+            per_session_threads_from(Some(44), Some(0), Some(20)),
+            Some(2)
+        );
+        // A quarter holder-backed: holder term 0.5 rounds DOWN to 0.
+        assert_eq!(
+            per_session_threads_from(Some(50), Some(10), Some(20)),
+            Some(2)
+        );
+        // Half holder-backed: 10 × 2 + 10 × 4, holder term exactly 1.
+        assert_eq!(
+            per_session_threads_from(Some(60), Some(20), Some(20)),
+            Some(3)
+        );
+        // Three quarters: holder term 1.5 rounds DOWN to 1.
+        assert_eq!(
+            per_session_threads_from(Some(70), Some(30), Some(20)),
+            Some(3)
+        );
+        // All holder-backed (nawa 2026-11-04), and with a few exited panes.
+        assert_eq!(
+            per_session_threads_from(Some(936), Some(468), Some(234)),
+            Some(4)
+        );
+        assert_eq!(
+            per_session_threads_from(Some(936), Some(468), Some(240)),
+            Some(4)
+        );
+        // Mis-read and UNKNOWN arms unchanged; an UNKNOWN holder half is UNKNOWN.
+        assert_eq!(per_session_threads_from(Some(10), Some(0), Some(20)), None);
+        assert_eq!(per_session_threads_from(Some(10), Some(0), Some(0)), None);
+        assert_eq!(per_session_threads_from(None, Some(0), Some(20)), None);
+        assert_eq!(per_session_threads_from(Some(40), None, Some(20)), None);
+    }
+
+    /// **The nawa regression (2026-11-04).** 128 cores, 503 GiB, 234
+    /// holder-backed panes, each holding `terminal-reader`, `terminal-waiter`,
+    /// `pty-holder-ctl-*` and `pty-holder-pump-*` in the runner: 936 session
+    /// threads, a graded reading of 1090. Counting only the first two families
+    /// put the other 468 into the at-rest baseline (622, capped to 512), so the
+    /// pool arm sat at `512 + 468 + 105 = 1085` and every continuation deferred
+    /// at `thread_pressure:warn:1099_over_1085` with the OS nowhere near a
+    /// limit. Counted correctly the baseline is the process's real ~154 and the
+    /// same reading proceeds — while the pool arm still keeps only its fixed
+    /// 105 / 249 threads of NON-session headroom, which is the 2026-08-29
+    /// blocking-pool wedge protection, unchanged.
+    #[test]
+    fn nawa_holder_panes_do_not_trip_the_pool_arm() {
+        use qontinui_runner_lib::wedge_diagnostics::finish_thread_name_census;
+        let mut names: Vec<String> = Vec::new();
+        for family in [
+            "terminal-reader",
+            "terminal-waiter",
+            "pty-holder-ctl-",
+            "pty-holder-pump",
+        ] {
+            names.extend(vec![family.to_string(); 234]);
+        }
+        for i in 0..154 {
+            names.push(format!("worker{}-x", i % 30));
+        }
+        let census = finish_thread_name_census(names).expect("census");
+        assert_eq!(census.session_threads, 936);
+        let graded = 1090;
+        let attributed = session_thread_attribution(Some(census.session_threads), Some(234));
+        let baseline = at_rest_estimate(Some(graded), attributed);
+        assert_eq!(baseline, Some(154));
+
+        let inputs = ThreadCapacityInputs {
+            cores: Some(128),
+            mem_total_bytes: Some(540_655_071_232),
+            baseline,
+            per_session_threads: per_session_threads_from(
+                Some(census.session_threads),
+                Some(census.holder_session_threads),
+                Some(234),
+            ),
+            session_threads_now: Some(936),
+            session_census_misread: false,
+        };
+        let merged = merge_thread_ceilings(&defaults(), SessionFloors::default(), &inputs);
+        let scaled = merged.scaled.as_ref().unwrap();
+        assert_eq!(scaled.per_session_threads_used, 4);
+        assert_eq!(scaled.pool_arm.warn, 154 + 936 + POOL_HEADROOM_WARN);
+        assert_eq!(scaled.pool_arm.critical, 154 + 936 + POOL_HEADROOM_CRITICAL);
+        assert_eq!(merged.ceilings.warn, 1195, "{merged:?}");
+        assert_eq!(merged.ceilings.critical, 1339, "{merged:?}");
+        assert_eq!(merged.warn_source, CeilingSource::Scaled);
+        assert_eq!(
+            evaluate_threads(Some(graded), true, merged.ceilings),
+            SpawnGate::Proceed
+        );
+
+        // The protection that remains real: non-session growth past the pool
+        // headroom still warns, and past the critical headroom still refuses.
+        assert!(matches!(
+            evaluate_threads(
+                Some(154 + 936 + POOL_HEADROOM_WARN + 1),
+                true,
+                merged.ceilings
+            ),
+            SpawnGate::Warn(_)
+        ));
+        assert!(matches!(
+            evaluate_threads(
+                Some(154 + 936 + POOL_HEADROOM_CRITICAL + 1),
+                true,
+                merged.ceilings
+            ),
+            SpawnGate::Critical(_)
+        ));
+
+        // What the two-family census made of the same box: the reported 1085.
+        let old_inputs = ThreadCapacityInputs {
+            baseline: Some(622),
+            per_session_threads: Some(2),
+            session_threads_now: Some(468),
+            ..inputs
+        };
+        let old = merge_thread_ceilings(&defaults(), SessionFloors::default(), &old_inputs);
+        assert_eq!(old.ceilings.warn, 1085);
     }
 
     /// When the census contradicts the session count, the scaled term is
@@ -4469,19 +5054,69 @@ mod tests {
         assert_eq!(session_thread_attribution(Some(4), Some(0)), Some(4));
 
         // The per-session ratio has no UNKNOWN-as-zero arm either.
-        assert_eq!(per_session_threads_from(Some(0), Some(164)), None);
+        assert_eq!(per_session_threads_from(Some(0), Some(0), Some(164)), None);
         assert_eq!(
-            per_session_threads_from(Some(100), Some(164)),
+            per_session_threads_from(Some(100), Some(0), Some(164)),
             None,
             "a mis-read"
         );
-        assert_eq!(per_session_threads_from(Some(328), Some(0)), None);
-        assert_eq!(per_session_threads_from(None, Some(164)), None);
+        assert_eq!(per_session_threads_from(Some(328), Some(0), Some(0)), None);
+        assert_eq!(per_session_threads_from(None, Some(0), Some(164)), None);
         assert_eq!(
-            per_session_threads_from(Some(329), Some(164)),
+            per_session_threads_from(Some(329), Some(0), Some(164)),
             Some(2),
-            "rounds down"
+            "a coherent observation reads the structural 2"
         );
+    }
+
+    /// **Regression, merytshost 2026-10-15.** 298 named session threads (149
+    /// live terminals × 2) against a registry count of 153 — four panes
+    /// exited-but-open, or a census 30 s behind the registry. The quotient is
+    /// 1.94; the old round-DOWN read it as **1**, halved the session-capacity
+    /// arm (235 + 1 × 288 = 523 instead of 235 + 2 × 288 = 811) and made the
+    /// effective critical ceiling 523 rather than the pool arm's 782, so the
+    /// runner refused gate continuations at 594 threads on a 48-core,
+    /// 368 GB box.
+    #[test]
+    fn a_registry_a_few_above_the_thread_pairs_does_not_halve_the_session_arm() {
+        assert_eq!(
+            per_session_threads_from(Some(298), Some(0), Some(153)),
+            Some(2)
+        );
+        // The coherence boundary — exactly one named thread per registered
+        // terminal — is still 2; a ceiling division would have read 1 here.
+        assert_eq!(
+            per_session_threads_from(Some(153), Some(0), Some(153)),
+            Some(2)
+        );
+        // …and nothing reads above the structural value, however skewed.
+        assert_eq!(
+            per_session_threads_from(Some(10_000), Some(0), Some(1)),
+            Some(2)
+        );
+
+        let inputs = ThreadCapacityInputs {
+            baseline: Some(235),
+            per_session_threads: per_session_threads_from(Some(298), Some(0), Some(153)),
+            session_threads_now: Some(298),
+            ..merytshost_loaded()
+        };
+        let scaled = scaled_thread_ceilings(&inputs).unwrap();
+        assert_eq!(scaled.per_session_threads_used, 2);
+        assert_eq!(scaled.session_capacity.critical, 288);
+        assert_eq!(scaled.session_arm.critical, 235 + 2 * 288);
+        assert_eq!(scaled.pool_arm.critical, 235 + 298 + POOL_HEADROOM_CRITICAL);
+        assert_eq!(
+            scaled.ceilings.critical, 782,
+            "the pool arm decides, not a halved session arm"
+        );
+        assert!(scaled.ceilings.critical > 594, "{scaled:?}");
+
+        // …and the ENFORCED ceiling — what read `thread_pressure:critical` at
+        // 594 — is that scaled value, not the floor.
+        let merged = merge_thread_ceilings(&defaults(), SessionFloors::default(), &inputs);
+        assert_eq!(merged.critical_source, CeilingSource::Scaled, "{merged:?}");
+        assert!(merged.ceilings.critical > 594, "{merged:?}");
     }
 
     /// **The window must be able to RISE, and no single sample may pin it.**
@@ -4819,7 +5454,7 @@ mod tests {
         );
         assert_eq!(
             PER_SESSION_THREADS_FALLBACK, 2,
-            "the multiplier's fallback is min(3, families): the larger number would loosen"
+            "the multiplier's fallback is min(3, in-process families): the larger number would loosen"
         );
     }
 
@@ -5607,5 +6242,139 @@ mod tests {
             }
         });
         assert!(quiet.is_empty(), "{quiet}");
+    }
+
+    /// The interest race [`with_log_capture`] closes: an uncaptured thread hits
+    /// the callsite FIRST, while this capture is live, and the capture must still
+    /// see the same callsite. Deterministic when run alone. In a full threaded
+    /// run, another test's live dispatcher can hide a removed fix.
+    #[test]
+    fn capture_logs_sees_a_callsite_first_hit_on_an_uncaptured_thread() {
+        fn emit() {
+            tracing::info!("first-hit interest probe");
+        }
+        let ((), logs) = capture_logs(|| {
+            std::thread::spawn(emit)
+                .join()
+                .expect("the uncaptured thread must not panic");
+            emit();
+        });
+        // One, not two: the spawned thread has no subscriber to write to.
+        assert_eq!(
+            logs.matches("first-hit interest probe").count(),
+            1,
+            "{logs}"
+        );
+    }
+
+    // ── projected_verdict ────────────────────────────────────────────────
+
+    const PROJ_COST: ProjectedSpawnCost = ProjectedSpawnCost {
+        commit_bytes: 100,
+        threads: 10,
+    };
+
+    fn proj_lanes(free: Option<u64>, graded: Option<usize>) -> LaneVerdicts {
+        let ceilings = ThreadCeilings {
+            warn: 100,
+            critical: 200,
+        };
+        let floors = SessionGuardSettings {
+            warn_free_commit_bytes: 1_000,
+            critical_free_commit_bytes: 500,
+            ..SessionGuardSettings::default()
+        };
+        LaneVerdicts {
+            memory_lane: "host",
+            free_commit_bytes: free,
+            free_phys_bytes: None,
+            warn_free_commit_bytes: floors.warn_free_commit_bytes,
+            critical_free_commit_bytes: floors.critical_free_commit_bytes,
+            memory: evaluate("host", free, &floors),
+            threads: ThreadLane {
+                graded,
+                warn_ceiling: ceilings.warn,
+                critical_ceiling: ceilings.critical,
+                verdict: evaluate_threads(graded, true, ceilings),
+            },
+        }
+    }
+
+    /// Nothing pending: the projection is EXACTLY the composed verdict, so it
+    /// never changes an answer the readings alone give.
+    #[test]
+    fn projection_with_nothing_pending_is_the_composed_verdict() {
+        for lanes in [
+            proj_lanes(Some(1_500), Some(50)),
+            proj_lanes(Some(900), Some(50)),
+            proj_lanes(Some(1_500), Some(150)),
+            proj_lanes(None, None),
+        ] {
+            assert_eq!(
+                projected_verdict(Some(&lanes), 0, PROJ_COST),
+                composed_verdict(&lanes)
+            );
+        }
+        assert_eq!(
+            projected_verdict(None, 99, PROJ_COST),
+            SpawnGate::Proceed,
+            "disabled guard"
+        );
+    }
+
+    /// Each pending admission is charged against BOTH lanes: free commit falls by
+    /// `commit_bytes` and the thread reading rises by `threads`, and the verdict
+    /// names the projected reading.
+    #[test]
+    fn projection_charges_each_pending_spawn_against_both_lanes() {
+        // 1_250 free, warn floor 1_000, 100 per spawn: 0..=2 pending proceed,
+        // 3 pending projects 950 -> Warn, 8 pending projects 450 -> Critical.
+        let mem = proj_lanes(Some(1_250), None);
+        assert_eq!(
+            projected_verdict(Some(&mem), 2, PROJ_COST),
+            SpawnGate::Proceed
+        );
+        match projected_verdict(Some(&mem), 3, PROJ_COST) {
+            SpawnGate::Warn(obs) => assert_eq!((obs.observed, obs.limit), (950, 1_000)),
+            other => panic!("expected memory Warn, got {other:?}"),
+        }
+        assert!(matches!(
+            projected_verdict(Some(&mem), 8, PROJ_COST),
+            SpawnGate::Critical(_)
+        ));
+
+        // 75 graded threads, warn ceiling 100, 10 per spawn: 2 pending -> 95,
+        // 3 pending -> 105 > 100.
+        let thr = proj_lanes(None, Some(75));
+        assert_eq!(
+            projected_verdict(Some(&thr), 2, PROJ_COST),
+            SpawnGate::Proceed
+        );
+        match projected_verdict(Some(&thr), 3, PROJ_COST) {
+            SpawnGate::Warn(obs) => {
+                assert_eq!(obs.metric, LaneMetric::ThreadCount);
+                assert_eq!((obs.observed, obs.limit), (105, 100));
+            }
+            other => panic!("expected thread Warn, got {other:?}"),
+        }
+    }
+
+    /// FAIL OPEN: an unreadable lane has no opinion and projects to none, and
+    /// the arithmetic saturates rather than wrapping.
+    #[test]
+    fn projection_leaves_unknown_readings_unknown_and_saturates() {
+        let unknown = proj_lanes(None, None);
+        assert_eq!(
+            projected_verdict(Some(&unknown), 1_000, PROJ_COST),
+            SpawnGate::Proceed
+        );
+        let huge = ProjectedSpawnCost {
+            commit_bytes: u64::MAX,
+            threads: usize::MAX,
+        };
+        match projected_verdict(Some(&proj_lanes(Some(1_500), Some(1))), 2, huge) {
+            SpawnGate::Critical(obs) => assert_eq!(obs.observed, 0, "free commit saturates at 0"),
+            other => panic!("expected Critical, got {other:?}"),
+        }
     }
 }

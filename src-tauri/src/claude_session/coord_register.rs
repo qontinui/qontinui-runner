@@ -74,6 +74,22 @@ use crate::session::local_store::OutboxWriter;
 use crate::session::session_lifecycle_store::{FinishSync, LocalOnlyReason};
 use crate::session::SessionEventKind;
 
+use super::pane_row_owner::{BindDoor, PaneRowLookup, PaneRowOwners};
+
+/// The finish re-offer after a move (same plan, D5) — a child module for the
+/// same reason.
+mod finish_reoffer;
+/// The pane-row transfer (plan
+/// `2026-11-12-transcript-autobind-adopts-a-previous-boot-row-that-a-live-pane-has-replaced`
+/// D4) — a child module so it reaches [`Inner`]'s private maps without
+/// widening them.
+mod pane_transfer;
+pub(crate) use finish_reoffer::registrar_finish_reoffers;
+pub(crate) use pane_transfer::{
+    pane_row_moves_not_owner, pin_seed_takes_ever_deferred, registrar_terminal_row_disagreements,
+    MoveOutcome, Mover,
+};
+
 /// Default-ON env gate for AI-session coord registration (P0.3). Any of
 /// `0` / `false` / `off` (case-insensitive) disables it; anything else
 /// (including unset) leaves it ON.
@@ -105,13 +121,79 @@ pub fn agent_logs_from_sessions_enabled() -> bool {
 
 /// Per-call overrides for [`AiCoordRegistrar::register_inner`]; both `None`
 /// for the pinned and sniffed planes.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct RegisterOverrides {
     /// Adopt this existing coord session id instead of minting one; no
     /// `Started` row is written for it.
     adopt: Option<Uuid>,
     /// Stamp this tenant instead of the resolver's answer.
     tenant: Option<Uuid>,
+    /// A tenant the CALLER already decided: stamped verbatim, with no
+    /// fallback to the resolver. Outranks `tenant`. Set by
+    /// [`AiCoordRegistrar::register_session_in`], where a
+    /// [`NewSessionTenant::Refused`] ("no tenant can be stated for this
+    /// workdir") must not be papered over with the resolver's machine default,
+    /// and is recorded so the session's federation is not either.
+    decided_tenant: Option<NewSessionTenant>,
+    /// Resume parameters stamped on a FRESH `Started` row.
+    resume: ResumeParams,
+    /// The door this registration comes through. `None` derives it from the
+    /// plane: [`BindDoor::Pinned`] with a `task_run_id`, else
+    /// [`BindDoor::Sniffed`]. [`AiCoordRegistrar::bind_transcript_session`]
+    /// states [`BindDoor::Transcript`].
+    door: Option<BindDoor>,
+    /// The adopted row is a LIVE pane's own row that the key owns (plan D1).
+    /// When an owner ENTRY on the row names the key, any OTHER key on it is
+    /// evicted in the R6 critical section instead of refusing
+    /// [`TranscriptBindRefusal::CoordSessionInUse`]. An entry naming another
+    /// id refuses; so does a contested row the key holds by the pin seed
+    /// alone (the pin is not evidence of what the pane runs after `/clear`).
+    take_from_live_pane: bool,
+}
+
+/// The parameters a later `claude --resume` must be pinned to: which account's
+/// config dir holds the transcript. Sent as optional fields on the `Started`
+/// create body, which coord persists best-effort to
+/// `coord.sessions.account_label` / `config_dir` (plan
+/// `2026-10-06-closed-sessions-whose-work-is-unfinished-are-found-fleet-wide-and-resumed`
+/// Phase 1). Both `None` for every plane that does not know them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResumeParams {
+    pub account_label: Option<String>,
+    pub config_dir: Option<String>,
+}
+
+/// See [`AiCoordRegistrar::recorded_row`] and
+/// [`AiCoordRegistrar::recorded_row_for_record`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RecordedCoordRow {
+    /// The coord session row this process resolves the session to. Callers
+    /// compare it with the hosting terminal's own row
+    /// (`TerminalSession::coord_session_id`): when they are the same row, it
+    /// is `SessionRegistry`'s, whatever plane reached it.
+    pub coord_session_id: Uuid,
+    /// How this process came to know the row.
+    pub origin: RecordedRowOrigin,
+}
+
+/// How [`RecordedCoordRow::coord_session_id`] became known to this process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecordedRowOrigin {
+    /// This registrar MINTED the row; `tenant` is the create body's tenant
+    /// (`None`: none resolved, so coord stamped its own default).
+    Minted { tenant: Option<Uuid> },
+    /// This registrar ADOPTED an existing row by id (`bind_transcript_session`
+    /// with `adopt: Some(..)` — e.g. transcript auto-bind of a terminal's own
+    /// `SessionRegistry` row). Its create-time tenant was never written or
+    /// observed here.
+    Adopted,
+    /// No registrar entry: the live terminal PINNED to a link of the
+    /// session's adoption chain carries this row (`SessionRegistry`'s).
+    TerminalPinned,
+    /// The registrar's per-row state (`tenants` / `adopted`) is behind a
+    /// poisoned lock, so whether the row was minted or adopted — and under
+    /// which tenant — cannot be read.
+    StatePoisoned,
 }
 
 /// Why [`AiCoordRegistrar::bind_transcript_session`] declined.
@@ -168,10 +250,25 @@ struct Inner {
     /// The thin rows' wire bodies are rebuilt from named fields, so the
     /// stamp only picks the credential slot; it never reaches coord.
     tenants: Mutex<HashMap<Uuid, Uuid>>,
+    /// The coord `session_id`s registered since boot through
+    /// [`AiCoordRegistrar::register_session_in`] whose decision stated NO
+    /// tenant ([`NewSessionTenant::Unstated`] or [`NewSessionTenant::Refused`];
+    /// a stated one is in `tenants`). Kept beside `tenants` and evicted with
+    /// it, so the session's federation ([`federation_session_tenant`]) reuses
+    /// the decision — a refusal stays a refusal — instead of resolving again.
+    undecided: Mutex<HashMap<Uuid, NewSessionTenant>>,
+    /// The coord session ids this process ADOPTED (`bind_transcript_session`
+    /// with `adopt: Some(..)`) rather than minted. For those `tenants` holds
+    /// the tenant the runner STAMPS on its own rows, not the tenant coord
+    /// created the row under — the runner never wrote that create body — so
+    /// [`AiCoordRegistrar::recorded_row`] reports them as not observed.
+    adopted: Mutex<std::collections::HashSet<Uuid>>,
     /// Resolves a new session's tenant. [`crate::session::resolve_new_session_tenant`]
     /// in production (the same source `SessionRegistry` stamps from); tests
     /// that assert on tenants inject a fixed answer
-    /// ([`AiCoordRegistrar::with_tenant_resolver`]).
+    /// ([`AiCoordRegistrar::with_tenant_resolver`]). NOT consulted by
+    /// [`AiCoordRegistrar::register_session_in`] with a workdir, which decides
+    /// through [`crate::session::resolve_new_session_tenant_in`] instead.
     tenant_resolver: fn() -> Option<Uuid>,
     /// Session-identity fabric Phase 1 — lifecycle store the registrar
     /// persists the coord-minted `fsh_` session handle into (next to the
@@ -185,8 +282,10 @@ struct Inner {
     ///
     /// A terminal-hosted `claude` registers with coord through
     /// `SessionRegistry::register_external_with_lineage` (keyed by the harness
-    /// id the PTY child was pinned to), never through this registrar, so
-    /// `reverse` never holds its coord id. The terminal mirrors that id onto
+    /// id the PTY child was pinned to), so this registrar did not MINT its
+    /// row; `reverse` holds that coord id only once transcript auto-bind has
+    /// ADOPTED it (`bind_transcript_session` with `adopt: Some(..)`), which
+    /// this arm must not wait for. The terminal mirrors that id onto
     /// itself (`TerminalSession::set_coord_session_id`); main.rs injects a
     /// closure that reads it back by PINNED harness id
     /// (`TerminalManager::coord_session_id_for_pinned`). A session the
@@ -199,6 +298,17 @@ struct Inner {
     /// constructible without one (tests, ephemeral registrars). Unattached →
     /// the arm misses.
     terminal_coord_lookup: OnceLock<TerminalCoordLookup>,
+    /// The pane-row owner map and each row's bind door (plan D1/D4); see
+    /// [`super::pane_row_owner`]. A leaf lock.
+    pane_rows: PaneRowOwners,
+    /// Answers whether some LIVE terminal holds a coord row
+    /// ([`PaneRowLookup::Live`] with its tenant per plan D3 and its bind
+    /// instant), that none does ([`PaneRowLookup::Gone`]), or that the
+    /// terminal plane could not be read ([`PaneRowLookup::Unknown`]).
+    /// main.rs wires it to `TerminalManager` and
+    /// `SessionRegistry::tenant_scope_of`. Unattached → no row is a live
+    /// pane's, so no live-pane adoption, seam move or finish-time repair runs.
+    pane_row_tenant: OnceLock<PaneRowLookupFn>,
     /// Test-only observability for the Phase-1 handle hook: counts every
     /// DECISION to fire it ([`AiCoordRegistrar::spawn_handle_register`]),
     /// incremented BEFORE the attached-store gate — so unit tests (which
@@ -211,6 +321,9 @@ struct Inner {
 /// See [`Inner::terminal_coord_lookup`]. Argument: a harness id; answers the
 /// coord row of the live terminal PINNED to it.
 type TerminalCoordLookup = Box<dyn Fn(&str) -> Option<Uuid> + Send + Sync>;
+
+/// See [`Inner::pane_row_tenant`].
+type PaneRowLookupFn = Box<dyn Fn(Uuid) -> PaneRowLookup + Send + Sync>;
 
 /// How many predecessors [`resolve_adoption_chain`] follows before giving up —
 /// each hop is one `/clear` inside the same provider process.
@@ -275,9 +388,13 @@ impl AiCoordRegistrar {
                 forward: Mutex::new(HashMap::new()),
                 reverse: Mutex::new(HashMap::new()),
                 tenants: Mutex::new(HashMap::new()),
+                undecided: Mutex::new(HashMap::new()),
+                adopted: Mutex::new(std::collections::HashSet::new()),
                 tenant_resolver,
                 lifecycle_store: OnceLock::new(),
                 terminal_coord_lookup: OnceLock::new(),
+                pane_rows: PaneRowOwners::default(),
+                pane_row_tenant: OnceLock::new(),
                 #[cfg(test)]
                 handle_hook_fires: std::sync::atomic::AtomicU64::new(0),
             }),
@@ -320,12 +437,34 @@ impl AiCoordRegistrar {
     /// `None` when neither arm knows the id. One LINK of
     /// [`Self::resolve_record`]'s adoption chain.
     fn resolve_coord_session_id(&self, claude_session_id: &str) -> Option<Uuid> {
-        self.session_id_for(claude_session_id).or_else(|| {
-            self.inner
-                .terminal_coord_lookup
-                .get()
-                .and_then(|lookup| lookup(claude_session_id))
-        })
+        self.session_id_for(claude_session_id)
+            .or_else(|| self.pinned_terminal_row(claude_session_id, &[claude_session_id]))
+    }
+
+    /// The terminal arm, owner-checked (plan D1, "One narrowing"): the row of
+    /// the live terminal PINNED to `pinned`, answered only while no owner entry
+    /// on that row names an id outside `chain` — the record's own id and the
+    /// predecessors walked so far. A pin whose row now runs another session
+    /// (the pin was evicted by a transfer) answers `None`, so its finish is
+    /// never queued to the row the pane now runs that session on; a `/clear`
+    /// successor that owns the row still resolves through its predecessor's
+    /// pin. Removes answers, never adds one. The ONE helper every terminal-arm
+    /// call site uses.
+    fn pinned_terminal_row(&self, pinned: &str, chain: &[&str]) -> Option<Uuid> {
+        let row = self
+            .inner
+            .terminal_coord_lookup
+            .get()
+            .and_then(|lookup| lookup(pinned))?;
+        self.row_admits_chain(row, chain).then_some(row)
+    }
+
+    /// Whether no owner entry on `row` names an id outside `chain`.
+    fn row_admits_chain(&self, row: Uuid, chain: &[&str]) -> bool {
+        match self.inner.pane_rows.owner_of(row) {
+            None => true,
+            Some(owner) => chain.iter().any(|id| id.trim() == owner),
+        }
     }
 
     /// Resolve the coord row a lifecycle record's finished marker addresses:
@@ -346,18 +485,21 @@ impl AiCoordRegistrar {
         bound: Option<(&str, Uuid)>,
     ) -> Option<Uuid> {
         let store = self.inner.lifecycle_store.get();
+        let mut walked: Vec<String> = Vec::new();
         resolve_adoption_chain(
             claude_session_id,
             adopted_from,
             |id| {
+                walked.push(id.to_string());
+                let chain: Vec<&str> = walked.iter().map(String::as_str).collect();
                 self.session_id_for(id)
-                    .or_else(|| bound.filter(|(pinned, _)| *pinned == id).map(|(_, c)| c))
                     .or_else(|| {
-                        self.inner
-                            .terminal_coord_lookup
-                            .get()
-                            .and_then(|lookup| lookup(id))
+                        bound
+                            .filter(|(pinned, _)| *pinned == id)
+                            .map(|(_, c)| c)
+                            .filter(|c| self.row_admits_chain(*c, &chain))
                     })
+                    .or_else(|| self.pinned_terminal_row(id, &chain))
             },
             |id| store.and_then(|s| s.get(id)).and_then(|r| r.adopted_from),
         )
@@ -379,10 +521,53 @@ impl AiCoordRegistrar {
         &self,
         rec: &crate::session::session_lifecycle_store::TerminalSessionRecord,
     ) -> FinishSync {
+        // The finish-time repair (plan D4): an auto-bind entry that disagrees
+        // with the session's live pane row is moved onto it first, so this
+        // write and every one after it address the pane row.
+        let repaired = self.repair_onto_live_pane(&rec.claude_session_id);
         let resolved =
             self.resolve_record(&rec.claude_session_id, rec.adopted_from.as_deref(), None);
+        // A mark the finish heal RE-ADDRESSED (plan
+        // `2026-11-07-a-runner-finish-is-addressed-to-a-stale-coord-row-after-a-pane-respawn`
+        // Phase 4) goes to the row coord named as live while it is unsynced —
+        // never back to the stale row the in-process resolvers may still name,
+        // whose ack would stamp the mark synced on it.
+        let resolved = match (
+            rec.finished_at,
+            rec.finish_synced,
+            rec.finish_coord_readdressed,
+            rec.finish_coord_session_id,
+        ) {
+            (Some(_), false, true, Some(sent)) => {
+                if resolved.is_some_and(|r| r != sent) {
+                    info!(
+                        "ai_coord_register: {}'s finish was re-addressed to coord session {} — \
+                         sending it there, not to {:?}",
+                        rec.claude_session_id, sent, resolved
+                    );
+                }
+                Some(sent)
+            }
+            _ => resolved,
+        };
         match rec.finished_at {
-            Some(at) => self.finish_session_on(&rec.claude_session_id, resolved, Some(at)),
+            Some(at) => {
+                let sync = self.finish_session_on(
+                    &rec.claude_session_id,
+                    resolved,
+                    Some(at),
+                    rec.finish_reason.as_deref(),
+                );
+                // D5 for the repair: this forward IS the re-offer to the pane
+                // row (`finish_forward` is held here, so the door cannot be
+                // taken); record the row it went to.
+                if let (Some(row), FinishSync::Queued { coord_session_id }) = (repaired, &sync) {
+                    if *coord_session_id == row {
+                        self.note_repaired_finish_row(&rec.claude_session_id, at, row);
+                    }
+                }
+                sync
+            }
             None => self.unfinish_session_on(&rec.claude_session_id, resolved),
         }
     }
@@ -426,6 +611,27 @@ impl AiCoordRegistrar {
             .and_then(|g| g.get(session_key).copied())
     }
 
+    /// The coord session id of a `Started` row for `claude_session_id` that is
+    /// still sitting UNDELIVERED in the outbox, if any. The R4 index is empty
+    /// after a restart, so a pane whose `Started` was written before the
+    /// restart and not yet drained is invisible to [`Self::session_id_for`]
+    /// while coord (which has not received it) answers `unknown` — minting then
+    /// would create a second row beside it. A caller about to mint asks this
+    /// first and ADOPTS the answer instead.
+    pub fn pending_started_session_for(&self, claude_session_id: &str) -> Option<Uuid> {
+        let pending = self.inner.outbox.pending().ok()?;
+        pending
+            .into_iter()
+            .filter(|r| r.event_kind == SessionEventKind::Started.as_str())
+            .find(|r| {
+                r.payload
+                    .get("claude_code_session_id")
+                    .and_then(|v| v.as_str())
+                    == Some(claude_session_id)
+            })
+            .map(|r| r.session_id)
+    }
+
     /// R1/R2 — register (or idempotently re-register) an authenticated AI
     /// session with coord. Mints a fresh coord `session_id` (UUIDv7), writes a
     /// `Started` outbox row carrying `task_run_id`, and records the R4 index.
@@ -455,6 +661,51 @@ impl AiCoordRegistrar {
             purpose,
             repo,
             RegisterOverrides::default(),
+        )
+        .ok()
+    }
+
+    /// [`Self::register_session`] for a session whose spawn directory is
+    /// known: its tenant follows the workspace and the repo in `workdir`
+    /// ([`crate::session::resolve_new_session_tenant_in`]) rather than the
+    /// machine's default, so the coord record names the tenant that owns the
+    /// work and, on a multi-bound device, its writes present that tenant's
+    /// device-JWT slot. A REFUSED (or undetermined) decision stamps no tenant: the writes go
+    /// `TenantScope::Unresolved` (unauthenticated on a multi-bound device, the
+    /// default slot on a single-bound one, where the default is the only
+    /// credential there is). `workdir: None` is [`Self::register_session`]
+    /// exactly.
+    ///
+    /// A key ALREADY registered in this process (by [`Self::register_session`]
+    /// or the sniffed-resume path, R6) keeps its first registration: this
+    /// call's decision is discarded, as every R6 hit discards its inputs.
+    ///
+    /// The tenant is decided BEFORE the R6 dedupe, so a session that is
+    /// already registered pays one resolution for a no-op; registration is
+    /// once per session, and the resolution is bounded.
+    pub async fn register_session_in(
+        &self,
+        task_run_id: &str,
+        purpose: &str,
+        repo: Option<String>,
+        workdir: Option<&std::path::Path>,
+    ) -> Option<Uuid> {
+        let Some(workdir) = workdir else {
+            return self.register_session(task_run_id, purpose, repo);
+        };
+        if !registration_enabled() {
+            return None;
+        }
+        let decided = crate::session::resolve_new_session_tenant_in(Some(workdir)).await;
+        self.register_inner(
+            task_run_id,
+            Some(task_run_id),
+            purpose,
+            repo,
+            RegisterOverrides {
+                decided_tenant: Some(decided),
+                ..RegisterOverrides::default()
+            },
         )
         .ok()
     }
@@ -540,14 +791,65 @@ impl AiCoordRegistrar {
         claude_session_id: &str,
         adopt: Option<Uuid>,
         tenant: Option<Uuid>,
+        resume: ResumeParams,
     ) -> Result<Uuid, TranscriptBindRefusal> {
         self.register_inner(
             claude_session_id,
             None,
             "Claude Code session (transcript bind)",
             None,
-            RegisterOverrides { adopt, tenant },
+            RegisterOverrides {
+                adopt,
+                tenant,
+                resume,
+                decided_tenant: None,
+                door: Some(BindDoor::Transcript),
+                take_from_live_pane: false,
+            },
         )
+    }
+
+    /// [`Self::bind_transcript_session`] for a harness id a LIVE pane hosts
+    /// (plan D1): adopt the pane's own row `row`, stamped with that row's
+    /// tenant `tenant` (plan D3 — `Stated(t)` from the pane row's scope, else
+    /// `Undetermined`, never the machine default). Any OTHER key bound to
+    /// `row` (the pane's pin, adopted before the pane's process switched id)
+    /// is evicted in the same critical section — no `Closed` for anything —
+    /// but ONLY when an owner entry on `row` names this key. An entry naming
+    /// another id, or other keys on a row this key holds by the pin seed
+    /// alone, refuses [`TranscriptBindRefusal::CoordSessionInUse`] (auto-bind
+    /// defers and retries). An R6 hit returns the
+    /// existing id, as every registration does.
+    ///
+    /// Once the key is on `row`, a finish another row ACKed is re-offered to
+    /// it ([`Self::reoffer_finish_to`], plan D5) — after `register_inner`'s
+    /// own late delivery, whose pending row the re-offer does not duplicate.
+    /// Same lock rules as [`Self::deliver_owed_finish`].
+    pub fn bind_transcript_session_on_live_pane(
+        &self,
+        claude_session_id: &str,
+        row: Uuid,
+        tenant: NewSessionTenant,
+        resume: ResumeParams,
+    ) -> Result<Uuid, TranscriptBindRefusal> {
+        let bound = self.register_inner(
+            claude_session_id,
+            None,
+            "Claude Code session (transcript bind)",
+            None,
+            RegisterOverrides {
+                adopt: Some(row),
+                tenant: None,
+                resume,
+                decided_tenant: Some(tenant),
+                door: Some(BindDoor::Transcript),
+                take_from_live_pane: true,
+            },
+        )?;
+        if bound == row {
+            self.reoffer_finish_to(claude_session_id, row);
+        }
+        Ok(bound)
     }
 
     /// Shared register core for the pinned (`task_run_id = Some`) and sniffed
@@ -574,7 +876,20 @@ impl AiCoordRegistrar {
         // An adopted id names a coord row that already exists (see
         // `bind_transcript_session`); otherwise mint one.
         let session_id = adopt_coord_session.unwrap_or_else(crate::session::uuid_v7);
-        let tenant = overrides.tenant.or_else(|| (self.inner.tenant_resolver)());
+        // Only a STANDING tenant-less decision is recorded; an Undetermined one
+        // is left for a later reader to ask again.
+        let decided_without_tenant = overrides
+            .decided_tenant
+            .filter(|d| d.tenant().is_none() && d.is_standing());
+        let tenant = match overrides.decided_tenant {
+            Some(decided) => decided.tenant(),
+            None => overrides.tenant.or_else(|| (self.inner.tenant_resolver)()),
+        };
+        let door = overrides.door.unwrap_or(if task_run_id.is_some() {
+            BindDoor::Pinned
+        } else {
+            BindDoor::Sniffed
+        });
 
         // R6 — check-AND-reserve atomically under ONE reverse-map lock
         // acquisition (review W1). `spawn_register_typed_resume` dispatches a
@@ -597,23 +912,89 @@ impl AiCoordRegistrar {
             };
             match rev.get(claude_session_id) {
                 Some(existing) => Some(*existing),
-                // Adoption of an id another key already holds: refused in the
-                // SAME critical section as the reservation, so two adopters
-                // cannot both win.
-                None if adopt_coord_session.is_some_and(|a| {
-                    rev.iter().any(|(k, v)| *v == a && k != claude_session_id)
-                }) =>
+                // A live-pane adoption (plan D1) of a row another id OWNS is
+                // refused: the owner entry is the seam's evidence of what
+                // the pane runs, re-validated here inside the section.
+                None if overrides.take_from_live_pane
+                    && !self.inner.pane_rows.admits(session_id, claude_session_id) =>
                 {
                     return Err(TranscriptBindRefusal::CoordSessionInUse);
                 }
+                // Adoption of an id another key already holds: refused in the
+                // SAME critical section as the reservation, so two adopters
+                // cannot both win — except a live-pane adoption whose
+                // authority is an OWNER ENTRY naming this key (the seam's
+                // evidence of what the pane runs now), which TAKES the row
+                // (plan D1/D4): the other keys are evicted below. A take whose only authority
+                // is the PIN SEED never evicts: after a `/clear` the pane's
+                // pin P no longer names what the pane runs, and P's older
+                // transcript must not take the row from the successor that
+                // bound it — so it defers like any other contested adoption.
+                None if adopt_coord_session.is_some_and(|a| {
+                    rev.iter().any(|(k, v)| *v == a && k != claude_session_id)
+                        && !(overrides.take_from_live_pane
+                            && self.inner.pane_rows.owner_of(a).as_deref()
+                                == Some(claude_session_id.trim()))
+                }) =>
+                {
+                    if overrides.take_from_live_pane {
+                        // Only the pin seed says the pane runs this key, and
+                        // another key holds the row: deferred (auto-bind
+                        // retries). It stays deferred until a running-id seam
+                        // source names the key — for the pane's whole life if
+                        // the pane has no hook and no provider-registry row —
+                        // so each pair is counted once and logged apart from
+                        // the generic deferral.
+                        if pane_transfer::note_pin_seed_take_deferred(session_id, claude_session_id)
+                        {
+                            info!(
+                                "ai_coord_register: deferred: pin seed contested — {} holds \
+                                 coord session {} only by its pane's pin, and another key is \
+                                 bound there; not evicting it. It stays deferred until the \
+                                 provider registry or the SessionStart hook names {} on that \
+                                 row — for the pane's life if it has neither",
+                                claude_session_id, session_id, claude_session_id
+                            );
+                        } else {
+                            debug!(
+                                "ai_coord_register: deferred again: pin seed contested — {} on {}",
+                                claude_session_id, session_id
+                            );
+                        }
+                    }
+                    return Err(TranscriptBindRefusal::CoordSessionInUse);
+                }
                 None => {
+                    if overrides.take_from_live_pane {
+                        self.evict_other_keys_on(&mut rev, session_id, claude_session_id);
+                    }
                     rev.insert(claude_session_id.to_string(), session_id);
+                    self.inner.pane_rows.set_door(session_id, door);
                     // Record the tenant in the SAME critical section: the id
                     // is resolvable through `session_id_for` from here on, so
                     // a concurrent heartbeat / progress / transcript row must
                     // already find its tenant.
                     if let (Some(t), Ok(mut tenants)) = (tenant, self.inner.tenants.lock()) {
                         tenants.insert(session_id, t);
+                    }
+                    if let (Some(d), Ok(mut undecided)) =
+                        (decided_without_tenant, self.inner.undecided.lock())
+                    {
+                        undecided.insert(session_id, d);
+                    }
+                    if adopt_coord_session.is_some() {
+                        // Written THROUGH a poisoned lock rather than skipped:
+                        // a skipped insert would let `recorded_row` report an
+                        // adopted row as minted here. The poison itself stays
+                        // set, so readers report the state as poisoned.
+                        let mut adopted = self.inner.adopted.lock().unwrap_or_else(|p| {
+                            warn!(
+                                "ai_coord_register: adopted-row set lock poisoned — recording {} anyway",
+                                session_id
+                            );
+                            p.into_inner()
+                        });
+                        adopted.insert(session_id);
                     }
                     None
                 }
@@ -723,6 +1104,24 @@ impl AiCoordRegistrar {
         if uuid::Uuid::parse_str(claude_session_id.trim()).is_ok() {
             payload["claude_code_session_id"] = json!(claude_session_id);
         }
+        // Resume parameters (unfinished-resume Phase 1) — optional on the wire,
+        // so a coord that predates them ignores the keys.
+        if let Some(a) = overrides
+            .resume
+            .account_label
+            .as_deref()
+            .filter(|a| !a.is_empty())
+        {
+            payload["account_label"] = json!(a);
+        }
+        if let Some(c) = overrides
+            .resume
+            .config_dir
+            .as_deref()
+            .filter(|c| !c.is_empty())
+        {
+            payload["config_dir"] = json!(c);
+        }
 
         // An ADOPTED row already exists coord-side, so writing `Started` for
         // it would at best be absorbed by the drain's 409 handling and at
@@ -754,9 +1153,7 @@ impl AiCoordRegistrar {
                     rev.remove(claude_session_id);
                 }
             }
-            if let Ok(mut tenants) = self.inner.tenants.lock() {
-                tenants.remove(&session_id);
-            }
+            self.evict_tenant(session_id);
             return Err(TranscriptBindRefusal::RegistrationDisabled);
         }
 
@@ -998,6 +1395,54 @@ impl AiCoordRegistrar {
         payload
     }
 
+    /// The tenant decision `session_key`'s registration recorded, if it
+    /// recorded one: the stamped tenant (see [`Inner::tenants`]), else a
+    /// tenant-less decision from [`Self::register_session_in`] (see
+    /// [`Inner::undecided`]). `None` when this process has not registered it,
+    /// or registered it without deciding (plain [`Self::register_session`]
+    /// with no tenant resolved).
+    pub(crate) fn recorded_decision(&self, session_key: &str) -> Option<NewSessionTenant> {
+        let session_id = self.session_id_for(session_key)?;
+        let stated = self
+            .inner
+            .tenants
+            .lock()
+            .ok()
+            .and_then(|g| g.get(&session_id).copied());
+        match stated {
+            Some(t) => Some(NewSessionTenant::Stated(t)),
+            None => self
+                .inner
+                .undecided
+                .lock()
+                .ok()
+                .and_then(|g| g.get(&session_id).copied()),
+        }
+    }
+
+    /// Drop `session_id`'s per-row state: its tenant decision (`tenants` /
+    /// `undecided`), its adopted mark (`adopted`) and its bind door.
+    fn evict_tenant(&self, session_id: Uuid) {
+        self.inner.pane_rows.forget_door(session_id);
+        // Through a poisoned lock, as the insert side writes: a skipped
+        // removal would leave a stale mark for a later row under this id.
+        self.inner
+            .tenants
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&session_id);
+        self.inner
+            .undecided
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&session_id);
+        self.inner
+            .adopted
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&session_id);
+    }
+
     /// The tenant `session_key`'s coord session was recorded under at
     /// registration (see [`Inner::tenants`]), or `None` when this process has
     /// not registered it or no tenant resolved. `session_key` is the R4 index
@@ -1011,11 +1456,101 @@ impl AiCoordRegistrar {
             .and_then(|g| g.get(&session_id).copied())
     }
 
+    /// What this registrar's OWN index holds for `session_key`'s coord row:
+    /// `None` when it has not registered it since boot; otherwise the row id
+    /// and whether it was MINTED here (with the create body's tenant) or
+    /// ADOPTED (an existing coord row bound by id, whose create-time tenant the
+    /// runner never wrote). A poisoned per-row state lock answers
+    /// [`RecordedRowOrigin::StatePoisoned`] — never a guess either way.
+    /// In-process only — no I/O.
+    pub(crate) fn recorded_row(&self, session_key: &str) -> Option<RecordedCoordRow> {
+        let coord_session_id = self.session_id_for(session_key)?;
+        // One lock at a time (`.ok()` drops a poisoned guard at once), so this
+        // read never holds both per-row locks.
+        let adopted = self
+            .inner
+            .adopted
+            .lock()
+            .ok()
+            .map(|g| g.contains(&coord_session_id));
+        let tenant = self
+            .inner
+            .tenants
+            .lock()
+            .ok()
+            .map(|g| g.get(&coord_session_id).copied());
+        let origin = match (adopted, tenant) {
+            (Some(true), _) => RecordedRowOrigin::Adopted,
+            (Some(false), Some(tenant)) => RecordedRowOrigin::Minted { tenant },
+            _ => RecordedRowOrigin::StatePoisoned,
+        };
+        Some(RecordedCoordRow {
+            coord_session_id,
+            origin,
+        })
+    }
+
+    /// The coord row a lifecycle record resolves to, by the same adoption-chain
+    /// rule as [`Self::resolve_record`] (the session's own row first, else its
+    /// `/clear` predecessor's, recursively): each link is this registrar's own
+    /// entry ([`Self::recorded_row`]), else the live terminal pinned to that
+    /// link ([`RecordedRowOrigin::TerminalPinned`]). `None` when no link
+    /// resolves. In-process only — no I/O.
+    pub(crate) fn recorded_row_for_record(
+        &self,
+        claude_session_id: &str,
+        adopted_from: Option<&str>,
+    ) -> Option<RecordedCoordRow> {
+        self.recorded_row_for_record_pinned(claude_session_id, adopted_from, None)
+            .0
+    }
+
+    /// [`Self::recorded_row_for_record`], also reporting whether any link the
+    /// walk VISITED is `pin` (the hosting terminal's pinned session id). The
+    /// walk stops at the first link that resolves, so the flag covers the whole
+    /// chain exactly when the row is `None` — the only case its caller uses it
+    /// for (naming the reason of a miss). `None` / an empty pin is never
+    /// matched. In-process only — no I/O.
+    pub(crate) fn recorded_row_for_record_pinned(
+        &self,
+        claude_session_id: &str,
+        adopted_from: Option<&str>,
+        pin: Option<&str>,
+    ) -> (Option<RecordedCoordRow>, bool) {
+        let store = self.inner.lifecycle_store.get();
+        let pin = pin.map(str::trim).filter(|p| !p.is_empty());
+        let mut pinned_link = false;
+        let mut walked: Vec<String> = Vec::new();
+        let row = resolve_adoption_chain(
+            claude_session_id.trim(),
+            adopted_from,
+            |id| {
+                if pin == Some(id.trim()) {
+                    pinned_link = true;
+                }
+                walked.push(id.to_string());
+                let chain: Vec<&str> = walked.iter().map(String::as_str).collect();
+                self.recorded_row(id).or_else(|| {
+                    self.pinned_terminal_row(id, &chain)
+                        .map(|coord_session_id| RecordedCoordRow {
+                            coord_session_id,
+                            origin: RecordedRowOrigin::TerminalPinned,
+                        })
+                })
+            },
+            |id| store.and_then(|s| s.get(id)).and_then(|r| r.adopted_from),
+        );
+        (row, pinned_link)
+    }
+
     /// R3 — emit a coord heartbeat for the AI session backing `task_run_id`,
-    /// driven by **operator interaction** (called from `send_user_message`).
-    /// This is the ONLY heartbeat these sessions ever get, so an idle session
-    /// ages to `stale` at coord's threshold. No-op (silently) if the session
-    /// was never registered or the gate is off.
+    /// driven by **operator interaction** (called from `send_user_message`)
+    /// and by **transcript activity** (`SessionTranscriptTailer::admit`, at
+    /// most once a minute per key, for a terminal-hosted pane that never
+    /// reaches `send_user_message`). These are the ONLY heartbeats these
+    /// sessions ever get, so an idle session ages to `stale` at coord's
+    /// threshold. No-op (silently) if the session was never registered or the
+    /// gate is off.
     pub fn heartbeat_on_interaction(&self, task_run_id: &str) {
         let Some(session_id) = self.session_id_for(task_run_id) else {
             return;
@@ -1059,10 +1594,95 @@ impl AiCoordRegistrar {
     /// the `QONTINUI_SESSION_AUTOMATION_REGISTER` kill switch disables it: a
     /// disabled session has no R4 index entry, so this resolves to `None`.
     /// Best-effort throughout — a write failure never disturbs the live session.
+    ///
+    /// **An interaction REVIVES a finished session**, and coord already reads
+    /// it that way (a `working` report moves its row off `finished`). So a
+    /// local finished mark is cleared FIRST, through `set_finished`, before
+    /// the `working` row is queued: a mark left finished locally while coord
+    /// reads `working` is exactly what the finish heal
+    /// (`session::finish_heal`) would re-finish, since a `working` re-assertion
+    /// over a row the lost finish never moved does not advance coord's
+    /// `since` (plan
+    /// `2026-11-05-finish-synced-is-stamped-on-a-2xx-that-did-not-move-session-status`,
+    /// D3). A planned-restart drain is NOT an interaction — it calls
+    /// [`Self::progress_on_drain`].
     pub fn progress_on_interaction(&self, task_run_id: &str) {
         let Some(session_id) = self.session_id_for(task_run_id) else {
             return;
         };
+        // The unmark's own observer already queues the `working` row to the
+        // same coord row; queue a second only when it did not (no store, no
+        // finished mark, a failed write, or a different/unresolved row).
+        if self.revive_local_mark(task_run_id) == Some(session_id) {
+            return;
+        }
+        self.enqueue_working(task_run_id, session_id);
+    }
+
+    /// The drain's progress bump for a session preserved across a planned
+    /// restart (`drain.rs`). Unlike [`Self::progress_on_interaction`] it is no
+    /// revival: a session whose local mark is FINISHED gets no `working` row
+    /// at all (it would revive coord's row behind the operator's back), and
+    /// its mark is left alone. No-op for an unregistered session.
+    pub fn progress_on_drain(&self, task_run_id: &str) {
+        let Some(session_id) = self.session_id_for(task_run_id) else {
+            return;
+        };
+        if self.local_mark_finished(task_run_id) {
+            debug!(
+                "ai_coord_register: drain progress skipped for {} — its local mark is finished",
+                task_run_id
+            );
+            return;
+        }
+        self.enqueue_working(task_run_id, session_id);
+    }
+
+    /// Whether the attached lifecycle store holds a finished mark for `id`.
+    fn local_mark_finished(&self, claude_session_id: &str) -> bool {
+        self.inner
+            .lifecycle_store
+            .get()
+            .and_then(|s| s.get(claude_session_id))
+            .is_some_and(|r| r.finished_at.is_some())
+    }
+
+    /// Clear a local finished mark on revival, through the one funnel
+    /// (`set_finished`), whose finish observer queues the unmark's own
+    /// `working` row. Returns the coord row that `working` row was queued to,
+    /// or `None` when none was (no store, no finished mark, a failed clear, or
+    /// the unmark stayed local-only) — so the caller queues exactly one.
+    /// Lock order: takes the store's `finish_forward`, so it must not run
+    /// under any store or registrar lock — the interaction callers hold none.
+    fn revive_local_mark(&self, claude_session_id: &str) -> Option<Uuid> {
+        let store = self.inner.lifecycle_store.get()?;
+        if !self.local_mark_finished(claude_session_id) {
+            return None;
+        }
+        match store.set_finished(claude_session_id, false, None) {
+            Ok(out) => {
+                info!(
+                    "ai_coord_register: interaction revived {} — its local finished mark is \
+                     cleared before the working report",
+                    claude_session_id
+                );
+                match out.coord {
+                    FinishSync::Queued { coord_session_id } => Some(coord_session_id),
+                    _ => None,
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "ai_coord_register: could not clear the finished mark of revived {}: {:?}",
+                    claude_session_id, e
+                );
+                None
+            }
+        }
+    }
+
+    /// Queue the `working` progress row for an interaction / drain bump.
+    fn enqueue_working(&self, task_run_id: &str, session_id: Uuid) {
         // Minimal body: `session_status="working"`. Coord stamps
         // `last_progress_at=now()` on receipt (no explicit `last_progress_at`
         // or `progress_detail` sent — the interaction itself is the signal).
@@ -1100,7 +1720,9 @@ impl AiCoordRegistrar {
     /// onto the local record — the discriminator the boot reconcile turns on.
     ///
     /// `finished_at` rides in the payload too, so a late ACK for an older mark
-    /// cannot stamp a newer one synced (`mark_finish_synced`).
+    /// cannot stamp a newer one synced (`mark_finish_synced`), and the drain
+    /// sends it to coord as the PATCH's `last_progress_at`, so coord dates the
+    /// finish at the mark rather than at the drain.
     ///
     /// The coord id is resolved across every runner-hosted plane
     /// ([`Self::resolve_coord_session_id`]). Returns [`FinishSync::Queued`]
@@ -1115,7 +1737,7 @@ impl AiCoordRegistrar {
     /// never disturbs the session.
     pub fn finish_session(&self, claude_session_id: &str, finished_at: Option<i64>) -> FinishSync {
         let resolved = self.resolve_coord_session_id(claude_session_id);
-        self.finish_session_on(claude_session_id, resolved, finished_at)
+        self.finish_session_on(claude_session_id, resolved, finished_at, None)
     }
 
     /// [`Self::finish_session`] against an already-resolved coord row
@@ -1125,6 +1747,7 @@ impl AiCoordRegistrar {
         claude_session_id: &str,
         resolved: Option<Uuid>,
         finished_at: Option<i64>,
+        finish_reason: Option<&str>,
     ) -> FinishSync {
         let Some(session_id) = resolved else {
             warn!(
@@ -1134,7 +1757,7 @@ impl AiCoordRegistrar {
             );
             return FinishSync::LocalOnly(LocalOnlyReason::NoCoordSession);
         };
-        self.enqueue_finished(claude_session_id, session_id, finished_at)
+        self.enqueue_finished(claude_session_id, session_id, finished_at, finish_reason)
     }
 
     /// Enqueue the `Finished` row for `claude_session_id`, addressed to the
@@ -1144,6 +1767,7 @@ impl AiCoordRegistrar {
         claude_session_id: &str,
         session_id: Uuid,
         finished_at: Option<i64>,
+        finish_reason: Option<&str>,
     ) -> FinishSync {
         let payload = self.stamp_tenant(
             session_id,
@@ -1151,6 +1775,7 @@ impl AiCoordRegistrar {
                 "id": session_id,
                 "claude_session_id": claude_session_id,
                 "finished_at": finished_at,
+                "finish_reason": finish_reason,
             }),
         );
         match self.inner.outbox.record(
@@ -1248,10 +1873,92 @@ impl AiCoordRegistrar {
                          to coord session {} — delivering the owed write",
                         rec.claude_session_id, target
                     );
-                    self.enqueue_finished(&rec.claude_session_id, target, rec.finished_at)
+                    self.enqueue_finished(
+                        &rec.claude_session_id,
+                        target,
+                        rec.finished_at,
+                        rec.finish_reason.as_deref(),
+                    )
                 })
                 .collect()
         })
+    }
+
+    /// Re-send ONE finished mark the heal found coord's own row contradicting
+    /// (`session::finish_heal`, plan
+    /// `2026-11-05-finish-synced-is-stamped-on-a-2xx-that-did-not-move-session-status`,
+    /// Phase 5), addressed to `target` — the mark's own coord row. Goes
+    /// through the serialized late-delivery body exactly as
+    /// [`Self::deliver_owed_to`] does: the read of the still-unsynced mark and
+    /// the enqueue share `finish_forward`, so an unmark that won the race
+    /// leaves nothing to send and a `Finished` can never land after its
+    /// `working`. `None` when the mark is no longer finished-and-unsynced at
+    /// `finished_at` (unmarked, restamped, or no store attached).
+    pub fn redeliver_finish(
+        &self,
+        claude_session_id: &str,
+        finished_at: i64,
+        target: Uuid,
+    ) -> Option<FinishSync> {
+        let store = self.inner.lifecycle_store.get()?;
+        store.with_unsynced_finished_records(|records| {
+            records
+                .into_iter()
+                .find(|r| {
+                    r.claude_session_id == claude_session_id && r.finished_at == Some(finished_at)
+                })
+                .map(|r| {
+                    info!(
+                        "ai_coord_register: coord's row for {} does not read finished — \
+                         re-sending its finished mark to coord session {}",
+                        r.claude_session_id, target
+                    );
+                    self.enqueue_finished(
+                        &r.claude_session_id,
+                        target,
+                        r.finished_at,
+                        r.finish_reason.as_deref(),
+                    )
+                })
+        })
+    }
+
+    /// Whether a `Finished` outbox row for `claude_session_id` carrying
+    /// `finished_at` and addressed to coord row `row` is still pending
+    /// (undelivered). A row queued to a DIFFERENT coord row does not count:
+    /// it will not finish this one. `None` when the outbox cannot be read —
+    /// UNKNOWN, never "not queued".
+    pub(crate) fn finished_row_pending(
+        &self,
+        claude_session_id: &str,
+        finished_at: i64,
+        row: Uuid,
+    ) -> Option<bool> {
+        match self.inner.outbox.pending() {
+            Ok(rows) => Some(rows.iter().any(|r| {
+                r.session_id == row
+                    && r.event_kind == SessionEventKind::Finished.as_str()
+                    && r.payload["claude_session_id"].as_str() == Some(claude_session_id)
+                    && r.payload["finished_at"].as_i64() == Some(finished_at)
+            })),
+            Err(e) => {
+                warn!(
+                    "ai_coord_register: could not read the outbox to check {}'s pending \
+                     finish: {}",
+                    claude_session_id, e
+                );
+                None
+            }
+        }
+    }
+
+    /// The coord row a lifecycle record's finished mark addresses, resolved
+    /// in-process ([`Self::resolve_record`]); `None` when nothing resolves.
+    pub(crate) fn finish_row_for(
+        &self,
+        rec: &crate::session::session_lifecycle_store::TerminalSessionRecord,
+    ) -> Option<Uuid> {
+        self.resolve_record(&rec.claude_session_id, rec.adopted_from.as_deref(), None)
     }
 
     /// Tell coord an operator UNMARKED this session's finished marker, so
@@ -1346,9 +2053,7 @@ impl AiCoordRegistrar {
         // Read the tenant for the `Closed` row, then evict it with the rest of
         // the R4 index.
         let payload = self.stamp_tenant(session_id, json!({ "id": session_id }));
-        if let Ok(mut tenants) = self.inner.tenants.lock() {
-            tenants.remove(&session_id);
-        }
+        self.evict_tenant(session_id);
 
         // A `Closed` row carries no body — the drain loop maps it to
         // `PATCH /sessions/:id {state:"closed"}`. Coord finalizes it like any
@@ -1388,20 +2093,29 @@ impl AiCoordRegistrar {
 /// (`{task_run_id}-agentic-N`, …), so the spawn site passes the owning
 /// `task_run_id` after its own id.
 ///
-/// Falls back to the registrar's own resolver
-/// ([`crate::session::resolve_new_session_tenant`]) when no key is registered
-/// yet (the orchestration worker registers after it spawns) or registration
-/// resolved no tenant — nothing is recorded then, so an unpaired device that
-/// pairs between the two can still disagree.
+/// A session whose registration decided without a tenant answers that same
+/// decision; a [`NewSessionTenant::Refused`] then runs the session
+/// unfederated: `build_federation_ctx` would otherwise fill the gap with the
+/// paired default — the cross-tenant filing the refusal exists to prevent.
+///
+/// Falls back to `resolve` — the spawn site's blocking call into
+/// [`crate::session::resolve_new_session_tenant_in`] for the spawn's working
+/// directory, so an unregistered session's federation follows its workspace
+/// and repo exactly as its registration would have — when no key is
+/// registered yet (the orchestration worker registers after it spawns) or was
+/// registered without a standing decision. A session registered AFTER it
+/// spawns can therefore still disagree with its federation — notably when the
+/// repo had not settled at spawn (machine rows) but has by registration.
 pub(crate) fn federation_session_tenant(
     registrar: Option<&AiCoordRegistrar>,
     session_keys: &[&str],
-) -> Option<Uuid> {
-    federation_session_tenant_with(
-        registrar,
-        session_keys,
-        crate::session::resolve_new_session_tenant,
-    )
+    resolve: impl FnOnce() -> NewSessionTenant,
+) -> NewSessionTenant {
+    // The FIRST key with any recorded decision answers, in key order: the
+    // spawn's own registration outranks its owning run's.
+    registrar
+        .and_then(|r| session_keys.iter().find_map(|k| r.recorded_decision(k)))
+        .unwrap_or_else(resolve)
 }
 
 /// The registrar keys a spawn's federation looks its tenant up by, in order
@@ -1424,18 +2138,7 @@ pub(crate) fn federation_session_keys<'a>(
     .collect()
 }
 
-/// [`federation_session_tenant`] with the fallback resolver injected.
-fn federation_session_tenant_with(
-    registrar: Option<&AiCoordRegistrar>,
-    session_keys: &[&str],
-    fallback: fn() -> Option<Uuid>,
-) -> Option<Uuid> {
-    registrar
-        .and_then(|r| session_keys.iter().find_map(|k| r.recorded_tenant(k)))
-        .or_else(fallback)
-}
-
-use crate::session::SessionKind;
+use crate::session::{NewSessionTenant, SessionKind};
 
 // ============================================================================
 // Interactive-agent log emitter (Phase 1b/1c)
@@ -2175,29 +2878,366 @@ mod tests {
 
         assert_eq!(reg.recorded_tenant(&trid), Some(OWNING_TENANT));
         assert_eq!(
-            federation_session_tenant_with(Some(&reg), &[&trid], || Some(REPINNED)),
-            Some(OWNING_TENANT)
+            federation_session_tenant(Some(&reg), &[&trid], || NewSessionTenant::Stated(REPINNED)),
+            NewSessionTenant::Stated(OWNING_TENANT)
         );
         // A unified-workflow phase session spawns under a suffixed id the
         // registrar never saw; the owning task_run_id, tried next, still hits.
         let phase_id = format!("{trid}-agentic-1");
         assert_eq!(
-            federation_session_tenant_with(Some(&reg), &[&phase_id, &trid], || Some(REPINNED)),
-            Some(OWNING_TENANT)
+            federation_session_tenant(
+                Some(&reg),
+                &[&phase_id, &trid],
+                || NewSessionTenant::Stated(REPINNED)
+            ),
+            NewSessionTenant::Stated(OWNING_TENANT)
         );
         // No key registered (or no registrar): the fallback answers.
         assert_eq!(
-            federation_session_tenant_with(Some(&reg), &[&phase_id], || Some(REPINNED)),
-            Some(REPINNED)
+            federation_session_tenant(Some(&reg), &[&phase_id], || NewSessionTenant::Stated(
+                REPINNED
+            )),
+            NewSessionTenant::Stated(REPINNED)
         );
         assert_eq!(
-            federation_session_tenant_with(None, &[&trid], || Some(REPINNED)),
-            Some(REPINNED)
+            federation_session_tenant(None, &[&trid], || NewSessionTenant::Stated(REPINNED)),
+            NewSessionTenant::Stated(REPINNED)
         );
 
         // Closing evicts it along with the rest of the R4 index.
         reg.close_session(&trid);
         assert_eq!(reg.recorded_tenant(&trid), None);
+    }
+
+    #[test]
+    fn a_decided_tenant_is_stamped_verbatim_and_a_decided_none_never_falls_back() {
+        // `register_session_in` hands the registrar the tenant its workspace
+        // and repo decided. That answer must win over the resolver's machine
+        // default — and a decided NONE (a refusal: the repo's tenant is not
+        // paired here) must stay none, not be papered over with the default.
+        const REPO_TENANT: Uuid = Uuid::from_u128(0x0b0b_0000_0000_4000_8000_0000000000d1);
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar_with_tenant(|| Some(OWNING_TENANT));
+
+        let decided = Uuid::new_v4().to_string();
+        let id = reg
+            .register_inner(
+                &decided,
+                Some(&decided),
+                "repo-owned",
+                None,
+                RegisterOverrides {
+                    decided_tenant: Some(NewSessionTenant::Stated(REPO_TENANT)),
+                    ..RegisterOverrides::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(reg.recorded_tenant(&decided), Some(REPO_TENANT));
+
+        let refused = Uuid::new_v4().to_string();
+        let refused_id = reg
+            .register_inner(
+                &refused,
+                Some(&refused),
+                "refused",
+                None,
+                RegisterOverrides {
+                    decided_tenant: Some(NewSessionTenant::Refused),
+                    // Even a caller-named tenant does not outrank a decision.
+                    tenant: Some(OWNING_TENANT),
+                    ..RegisterOverrides::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(reg.recorded_tenant(&refused), None);
+        assert_eq!(
+            reg.recorded_decision(&refused),
+            Some(NewSessionTenant::Refused)
+        );
+        assert_eq!(
+            reg.recorded_decision(&decided),
+            Some(NewSessionTenant::Stated(REPO_TENANT))
+        );
+        // Federation reads the refusal rather than resolving a default of its
+        // own; the stated session federates under its decided tenant.
+        assert_eq!(
+            federation_session_tenant(Some(&reg), &[&refused], || {
+                NewSessionTenant::Stated(OWNING_TENANT)
+            }),
+            NewSessionTenant::Refused
+        );
+        assert_eq!(
+            federation_session_tenant(Some(&reg), &[&decided], || NewSessionTenant::Refused),
+            NewSessionTenant::Stated(REPO_TENANT)
+        );
+        // Key order decides: the spawn's own registration outranks its run's,
+        // whichever kind of decision each recorded.
+        assert_eq!(
+            federation_session_tenant(Some(&reg), &[&refused, &decided], || {
+                NewSessionTenant::Stated(OWNING_TENANT)
+            }),
+            NewSessionTenant::Refused
+        );
+        assert_eq!(
+            federation_session_tenant(Some(&reg), &[&decided, &refused], || {
+                NewSessionTenant::Refused
+            }),
+            NewSessionTenant::Stated(REPO_TENANT)
+        );
+        // A decided Unstated is reused too — federation does not resolve again.
+        let unstated = Uuid::new_v4().to_string();
+        reg.register_inner(
+            &unstated,
+            Some(&unstated),
+            "unstated",
+            None,
+            RegisterOverrides {
+                decided_tenant: Some(NewSessionTenant::Unstated),
+                ..RegisterOverrides::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            federation_session_tenant(Some(&reg), &[&unstated], || {
+                panic!("a recorded decision must not be resolved again")
+            }),
+            NewSessionTenant::Unstated
+        );
+        // An Undetermined decision is NOT recorded: federation asks again.
+        let undetermined = Uuid::new_v4().to_string();
+        reg.register_inner(
+            &undetermined,
+            Some(&undetermined),
+            "undetermined",
+            None,
+            RegisterOverrides {
+                decided_tenant: Some(NewSessionTenant::Undetermined),
+                ..RegisterOverrides::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(reg.recorded_decision(&undetermined), None);
+        assert_eq!(
+            federation_session_tenant(Some(&reg), &[&undetermined], || {
+                NewSessionTenant::Stated(REPO_TENANT)
+            }),
+            NewSessionTenant::Stated(REPO_TENANT)
+        );
+
+        let pending = reg.inner.outbox.pending().unwrap();
+        let started = |sid: Uuid| {
+            pending
+                .iter()
+                .find(|r| r.session_id == sid && r.event_kind == SessionEventKind::Started.as_str())
+                .expect("a Started row")
+                .payload
+                .get("tenant_id")
+                .cloned()
+        };
+        assert_eq!(started(id), Some(json!(REPO_TENANT)));
+        assert!(
+            started(refused_id).map_or(true, |t| t.is_null()),
+            "a refused decision must not be stamped with the machine default"
+        );
+        // Closing evicts the refusal with the rest of the R4 index.
+        reg.close_session(&refused);
+        assert_eq!(reg.recorded_decision(&refused), None);
+    }
+
+    #[test]
+    fn recorded_row_tells_a_minted_row_from_an_adopted_one() {
+        // An adopted row already existed coord-side: the tenant the registrar
+        // holds for it is the caller's stamp, not the tenant coord created it
+        // under, so it must not be reported as the row's observed tenant.
+        const CALLER_TENANT: Uuid = Uuid::from_u128(0x0b0b_0000_0000_4000_8000_000000000002);
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar_with_tenant(|| Some(OWNING_TENANT));
+
+        let minted_key = Uuid::new_v4().to_string();
+        let minted_row = reg
+            .bind_transcript_session(&minted_key, None, None, ResumeParams::default())
+            .unwrap();
+        assert_eq!(
+            reg.recorded_row(&minted_key),
+            Some(RecordedCoordRow {
+                coord_session_id: minted_row,
+                origin: RecordedRowOrigin::Minted {
+                    tenant: Some(OWNING_TENANT)
+                },
+            })
+        );
+
+        let adopted_key = Uuid::new_v4().to_string();
+        let existing_row = Uuid::new_v4();
+        let bound = reg
+            .bind_transcript_session(
+                &adopted_key,
+                Some(existing_row),
+                Some(CALLER_TENANT),
+                ResumeParams::default(),
+            )
+            .unwrap();
+        assert_eq!(bound, existing_row);
+        assert_eq!(
+            reg.recorded_row(&adopted_key),
+            Some(RecordedCoordRow {
+                coord_session_id: existing_row,
+                origin: RecordedRowOrigin::Adopted,
+            })
+        );
+
+        // An unregistered key has no row; closing evicts the adopted mark.
+        assert_eq!(reg.recorded_row("never-registered"), None);
+        reg.close_session(&adopted_key);
+        assert_eq!(reg.recorded_row(&adopted_key), None);
+        assert!(reg.inner.adopted.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_poisoned_row_state_lock_reads_as_poisoned_never_as_adopted_or_minted() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar_with_tenant(|| Some(OWNING_TENANT));
+        let minted_key = Uuid::new_v4().to_string();
+        let minted_row = reg
+            .bind_transcript_session(&minted_key, None, None, ResumeParams::default())
+            .unwrap();
+
+        // Poison the adopted-row set.
+        let inner = reg.inner.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = inner.adopted.lock().unwrap();
+            panic!("poison the adopted-row set");
+        })
+        .join();
+        assert!(reg.inner.adopted.is_poisoned());
+        assert_eq!(
+            reg.recorded_row(&minted_key),
+            Some(RecordedCoordRow {
+                coord_session_id: minted_row,
+                origin: RecordedRowOrigin::StatePoisoned,
+            })
+        );
+
+        // The insert side writes THROUGH the poison, so an adoption made now
+        // is still in the set (and still reads as poisoned, not minted).
+        let adopted_key = Uuid::new_v4().to_string();
+        let existing_row = Uuid::new_v4();
+        reg.bind_transcript_session(
+            &adopted_key,
+            Some(existing_row),
+            None,
+            ResumeParams::default(),
+        )
+        .unwrap();
+        let held = reg
+            .inner
+            .adopted
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&existing_row);
+        assert!(held, "a poisoned lock must not drop the adopted mark");
+        assert_eq!(
+            reg.recorded_row(&adopted_key).map(|r| r.origin),
+            Some(RecordedRowOrigin::StatePoisoned)
+        );
+    }
+
+    /// The transcript auto-bind path: a terminal-pinned session's own
+    /// `SessionRegistry` row is ADOPTED by the registrar, so the record
+    /// resolves to that row with origin `Adopted` — the same id the terminal
+    /// carries, which is how session-info tells it is the terminal's row.
+    #[test]
+    fn recorded_row_for_record_follows_the_adoption_chain_to_the_pinned_terminal() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let (store, _sdir) = attach_store(&reg);
+        let pinned = "pinned-for-record";
+        let terminal = "term-record";
+        let pane_coord = Uuid::new_v4();
+        attach_one_terminal(&reg, pinned, pane_coord);
+        open_on(&store, pinned, terminal, None);
+        open_on(&store, "cleared-1", terminal, Some(pinned));
+        open_on(&store, "cleared-2", terminal, Some("cleared-1"));
+
+        // No registrar entry: the pinned terminal answers, for the pinned id
+        // and for every `/clear` successor down the chain.
+        let terminal_row = Some(RecordedCoordRow {
+            coord_session_id: pane_coord,
+            origin: RecordedRowOrigin::TerminalPinned,
+        });
+        assert_eq!(reg.recorded_row_for_record(pinned, None), terminal_row);
+        assert_eq!(
+            reg.recorded_row_for_record("cleared-1", Some(pinned)),
+            terminal_row
+        );
+        assert_eq!(
+            reg.recorded_row_for_record("cleared-2", Some("cleared-1")),
+            terminal_row
+        );
+        // A typed resume in the pane has no predecessor: not the pane's row.
+        assert_eq!(reg.recorded_row_for_record("typed-resume", None), None);
+
+        // Auto-bind adopts the terminal's own row for the pinned id.
+        reg.bind_transcript_session(pinned, Some(pane_coord), None, ResumeParams::default())
+            .unwrap();
+        let adopted = Some(RecordedCoordRow {
+            coord_session_id: pane_coord,
+            origin: RecordedRowOrigin::Adopted,
+        });
+        assert_eq!(reg.recorded_row_for_record(pinned, None), adopted);
+        assert_eq!(
+            reg.recorded_row_for_record("cleared-1", Some(pinned)),
+            adopted
+        );
+    }
+
+    /// The pin is matched against EVERY link the walk visits, not only the
+    /// session and its direct predecessor: a 2nd+ `/clear` successor of the
+    /// pinned id whose terminal carries no coord row yet is still "pinned
+    /// here" (so session-info names `terminal_row_not_wired`, not
+    /// `not_registered_by_this_process`).
+    #[test]
+    fn the_pinned_flag_covers_every_link_of_the_adoption_chain() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let (store, _sdir) = attach_store(&reg);
+        // No terminal lookup wired: no link resolves to a row.
+        let terminal = "term-unwired";
+        open_on(&store, "root-pin", terminal, None);
+        open_on(&store, "succ-1", terminal, Some("root-pin"));
+        open_on(&store, "succ-2", terminal, Some("succ-1"));
+        open_on(&store, "succ-3", terminal, Some("succ-2"));
+
+        for (id, pred) in [
+            ("root-pin", None),
+            ("succ-1", Some("root-pin")),
+            ("succ-2", Some("succ-1")),
+            ("succ-3", Some("succ-2")),
+        ] {
+            assert_eq!(
+                reg.recorded_row_for_record_pinned(id, pred, Some("root-pin")),
+                (None, true),
+                "{id} reaches the pin through its chain"
+            );
+            assert_eq!(
+                reg.recorded_row_for_record_pinned(id, pred, Some("some-other-pin")),
+                (None, false)
+            );
+        }
+        // An empty or absent pin never matches.
+        assert_eq!(
+            reg.recorded_row_for_record_pinned("succ-2", Some("succ-1"), Some("  ")),
+            (None, false)
+        );
+        assert_eq!(
+            reg.recorded_row_for_record_pinned("succ-2", Some("succ-1"), None),
+            (None, false)
+        );
     }
 
     #[test]
@@ -2406,7 +3446,7 @@ mod tests {
         );
 
         let at = store
-            .set_finished(csid, true, None)
+            .set_finished(csid, true, Some("dismissed".to_string()))
             .unwrap()
             .record
             .finished_at;
@@ -2422,6 +3462,7 @@ mod tests {
         assert_eq!(pending[0].session_id, coord_id);
         assert_eq!(pending[0].event_kind, SessionEventKind::Finished.as_str());
         assert_eq!(pending[0].payload["finished_at"], json!(at));
+        assert_eq!(pending[0].payload["finish_reason"], json!("dismissed"));
 
         store.mark_finish_synced(csid, at);
         assert!(
@@ -2483,7 +3524,7 @@ mod tests {
     fn attach_one_terminal(reg: &AiCoordRegistrar, pinned: &'static str, coord: Uuid) {
         reg.attach_terminal_coord_lookup(move |csid| {
             crate::terminal::manager::resolve_pinned_coord(
-                std::iter::once((pinned, Some(coord))),
+                std::iter::once((pinned, Some((coord, 1)))),
                 csid,
             )
         });
@@ -2872,6 +3913,1320 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------------
+    // Plan `2026-11-12-transcript-autobind-adopts-a-previous-boot-row-that-
+    // a-live-pane-has-replaced`: the pane-row owner, the live-pane adoption
+    // (D1), the tenant stamp (D3), the one transfer and its movers (D4) and
+    // the re-key seam (D2).
+    // ------------------------------------------------------------------
+
+    use crate::claude_session::pane_row_owner::PaneRowFacts;
+    use crate::session::coord_identity::RekeySource;
+
+    const PANE_TENANT: Uuid = Uuid::from_u128(0x9a7e_0000_0000_4000_8000_0000_0000_000a);
+
+    /// The live pane rows the registrar's pane-row lookup answers (row →
+    /// tenant per D3), mutable by the test.
+    fn attach_live_rows(reg: &AiCoordRegistrar) -> Arc<Mutex<HashMap<Uuid, NewSessionTenant>>> {
+        let rows: Arc<Mutex<HashMap<Uuid, NewSessionTenant>>> = Default::default();
+        let r = rows.clone();
+        reg.attach_pane_row_tenant(move |row| {
+            r.lock().unwrap().get(&row).map(|t| PaneRowFacts {
+                tenant: *t,
+                bound_at_ms: Some(1_000),
+                bind_seq: Some(1),
+            })
+        });
+        rows
+    }
+
+    /// The terminal lookup exactly as main.rs wires it (the production
+    /// newest-bound rule), over mutable `(pinned, (row, bind seq))` panes.
+    type Panes = Arc<Mutex<Vec<(String, Option<(Uuid, u64)>)>>>;
+    fn attach_panes(reg: &AiCoordRegistrar) -> Panes {
+        let panes: Panes = Default::default();
+        let p = panes.clone();
+        reg.attach_terminal_coord_lookup(move |csid| {
+            let g = p.lock().unwrap();
+            crate::terminal::manager::resolve_pinned_coord(
+                g.iter().map(|(pin, b)| (pin.as_str(), *b)),
+                csid,
+            )
+        });
+        panes
+    }
+
+    fn rows_of_kind(reg: &AiCoordRegistrar, kind: SessionEventKind) -> Vec<OutboxRow> {
+        reg.inner
+            .outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.event_kind == kind.as_str())
+            .collect()
+    }
+
+    type OutboxRow = crate::session::local_store::OutboxRecord;
+
+    /// D1 + D4: the pane pinned to P adopted its row R; the seam then saw the
+    /// pane's process run X (an in-pane `/resume X`). X's live-pane adoption
+    /// TAKES R — the pin is evicted, keeps no row, and closing it queues
+    /// nothing for R (X still runs there).
+    #[test]
+    fn a_live_pane_adoption_evicts_the_pin_the_seam_replaced() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let (p, x) = ("pane-pin-p", "in-pane-resume-x");
+        let r = Uuid::new_v4();
+        attach_live_rows(&reg)
+            .lock()
+            .unwrap()
+            .insert(r, NewSessionTenant::Undetermined);
+        attach_panes(&reg)
+            .lock()
+            .unwrap()
+            .push((p.to_string(), Some((r, 1))));
+        assert_eq!(
+            reg.bind_transcript_session(p, Some(r), None, ResumeParams::default()),
+            Ok(r)
+        );
+        assert_eq!(reg.live_terminal_row(p).map(|l| l.row), Some(r));
+
+        // The seam advances R's owner to X; X is unbound, so nothing moves.
+        assert_eq!(
+            reg.note_pane_row(r, x, RekeySource::ProviderRegistry),
+            MoveOutcome::Unbound
+        );
+        assert_eq!(reg.session_id_for(x), None, "the seam never binds");
+        assert_eq!(reg.live_terminal_row(x).map(|l| l.row), Some(r));
+        assert_eq!(reg.live_terminal_row(p), None, "the pin lost its row");
+
+        assert_eq!(
+            reg.bind_transcript_session_on_live_pane(
+                x,
+                r,
+                NewSessionTenant::Undetermined,
+                ResumeParams::default()
+            ),
+            Ok(r)
+        );
+        assert_eq!(reg.session_id_for(x), Some(r));
+        assert_eq!(reg.session_id_for(p), None, "the pin was evicted");
+        assert_eq!(reg.task_run_id_for(&r), Some(x.to_string()));
+        assert_eq!(
+            reg.recorded_row(x).map(|r| r.origin),
+            Some(RecordedRowOrigin::Adopted)
+        );
+
+        reg.close_session(p);
+        assert!(
+            reg.inner.outbox.pending().unwrap().is_empty(),
+            "closing the evicted pin queues nothing for R"
+        );
+        assert_eq!(reg.session_id_for(x), Some(r));
+    }
+
+    /// The live-pane adoption of a row another id OWNS is refused — the owner
+    /// entry is re-validated inside the R6 section.
+    #[test]
+    fn a_live_pane_adoption_of_a_row_another_id_owns_is_refused() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let r = Uuid::new_v4();
+        attach_live_rows(&reg)
+            .lock()
+            .unwrap()
+            .insert(r, NewSessionTenant::Undetermined);
+        reg.note_pane_row(r, "owner-y", RekeySource::ProviderRegistry);
+        assert_eq!(
+            reg.bind_transcript_session_on_live_pane(
+                "other-x",
+                r,
+                NewSessionTenant::Undetermined,
+                ResumeParams::default()
+            ),
+            Err(TranscriptBindRefusal::CoordSessionInUse)
+        );
+        assert_eq!(reg.session_id_for("other-x"), None);
+    }
+
+    /// The typed-resume discriminator (M-a beside the owner rule): a typed
+    /// `claude --resume X` registers X's OWN sniffed row S first; the seam
+    /// later advances the pane's row R to X; an auto-bind attempt for X then
+    /// finds X bound. X stays on S — neither the seam nor the live-pane door
+    /// moves a sniffed entry.
+    #[test]
+    fn a_typed_resume_keeps_its_sniffed_row_after_the_seam_advances_the_pane_owner() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let (p, x) = ("pane-pinned-p", "typed-resume-x");
+        let r = Uuid::new_v4();
+        attach_live_rows(&reg)
+            .lock()
+            .unwrap()
+            .insert(r, NewSessionTenant::Undetermined);
+        attach_panes(&reg)
+            .lock()
+            .unwrap()
+            .push((p.to_string(), Some((r, 1))));
+
+        let s = reg
+            .register_sniffed_session(x, "typed resume", None)
+            .expect("sniffed");
+        assert_ne!(s, r);
+        assert_eq!(
+            reg.note_pane_row(r, x, RekeySource::ProviderRegistry),
+            MoveOutcome::NotEligible
+        );
+        assert_eq!(
+            reg.bind_transcript_session_on_live_pane(
+                x,
+                r,
+                NewSessionTenant::Undetermined,
+                ResumeParams::default()
+            ),
+            Ok(s),
+            "an R6 hit: X is already bound, to its own row"
+        );
+        assert_eq!(reg.session_id_for(x), Some(s));
+        assert_eq!(
+            reg.finish_session(x, Some(3)),
+            FinishSync::Queued {
+                coord_session_id: s
+            }
+        );
+    }
+
+    /// D3: the adopted pane row carries the pane row's own tenant, on every
+    /// write; an unresolved scope sends no top-level `tenant_id`, records no
+    /// tenant, and is never filled with the machine default.
+    #[test]
+    fn a_live_pane_adoption_stamps_the_pane_rows_tenant() {
+        const MACHINE: Uuid = Uuid::from_u128(0x3ac4_0000_0000_4000_8000_0000_0000_0001);
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar_with_tenant(|| Some(MACHINE));
+        let (stated, unresolved) = (Uuid::new_v4(), Uuid::new_v4());
+
+        reg.bind_transcript_session_on_live_pane(
+            "stated-x",
+            stated,
+            NewSessionTenant::Stated(PANE_TENANT),
+            ResumeParams::default(),
+        )
+        .unwrap();
+        reg.bind_transcript_session_on_live_pane(
+            "unresolved-x",
+            unresolved,
+            NewSessionTenant::Undetermined,
+            ResumeParams::default(),
+        )
+        .unwrap();
+        assert_eq!(reg.recorded_tenant("stated-x"), Some(PANE_TENANT));
+        assert_eq!(reg.recorded_tenant("unresolved-x"), None);
+
+        reg.heartbeat_on_interaction("stated-x");
+        reg.heartbeat_on_interaction("unresolved-x");
+        let beats = rows_of_kind(&reg, SessionEventKind::Heartbeat);
+        assert_eq!(beats.len(), 2, "{beats:?}");
+        for b in &beats {
+            if b.session_id == stated {
+                assert_eq!(b.payload["tenant_id"], json!(PANE_TENANT));
+            } else {
+                assert_eq!(b.session_id, unresolved);
+                assert!(
+                    b.payload.get("tenant_id").is_none(),
+                    "an unresolved scope sends no tenant_id, never the machine's: {b:?}"
+                );
+            }
+        }
+    }
+
+    /// Two live panes pinned to X during a migration overlap: the live-pane
+    /// adoption takes the NEWEST-bound pane's row, whatever order the
+    /// manager's map yields them in.
+    #[test]
+    fn a_live_pane_adoption_takes_the_newest_bound_of_two_pinned_panes() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        for newest_first in [false, true] {
+            let (reg, _dir) = registrar();
+            let x = "migrated-x";
+            let (old, new) = (Uuid::new_v4(), Uuid::new_v4());
+            let live = attach_live_rows(&reg);
+            live.lock()
+                .unwrap()
+                .insert(old, NewSessionTenant::Undetermined);
+            live.lock()
+                .unwrap()
+                .insert(new, NewSessionTenant::Stated(PANE_TENANT));
+            let panes = attach_panes(&reg);
+            let mut v = vec![
+                (x.to_string(), Some((old, 10))),
+                (x.to_string(), Some((new, 11))),
+            ];
+            if newest_first {
+                v.reverse();
+            }
+            *panes.lock().unwrap() = v;
+
+            let l = reg.live_terminal_row(x).expect("a live pane hosts X");
+            assert_eq!(l.row, new);
+            assert_eq!(l.tenant, NewSessionTenant::Stated(PANE_TENANT));
+            assert_eq!(
+                reg.bind_transcript_session_on_live_pane(
+                    x,
+                    l.row,
+                    l.tenant,
+                    ResumeParams::default()
+                ),
+                Ok(new)
+            );
+        }
+    }
+
+    /// Q3 Amendment 2: after the transfer evicts the pin P from R, a finish for
+    /// P is local-only — never queued to R, where X now runs.
+    #[test]
+    fn a_finish_for_an_evicted_pin_stays_local_only() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let (store, _sdir) = attach_store(&reg);
+        let (p, x) = ("evicted-pin-p", "running-x");
+        let r = Uuid::new_v4();
+        attach_live_rows(&reg)
+            .lock()
+            .unwrap()
+            .insert(r, NewSessionTenant::Undetermined);
+        attach_panes(&reg)
+            .lock()
+            .unwrap()
+            .push((p.to_string(), Some((r, 1))));
+        open_on(&store, p, "term-pane", None);
+        reg.bind_transcript_session(p, Some(r), None, ResumeParams::default())
+            .unwrap();
+        reg.note_pane_row(r, x, RekeySource::ProviderRegistry);
+        reg.bind_transcript_session_on_live_pane(
+            x,
+            r,
+            NewSessionTenant::Undetermined,
+            ResumeParams::default(),
+        )
+        .unwrap();
+
+        let _ = store.set_finished(p, true, None).unwrap();
+        assert_eq!(
+            reg.forward_finish_change(&store.get(p).unwrap()),
+            FinishSync::LocalOnly(LocalOnlyReason::NoCoordSession),
+            "the pin's terminal arm no longer answers the row X owns"
+        );
+        assert_eq!(
+            reg.finish_session(p, Some(1)),
+            FinishSync::LocalOnly(LocalOnlyReason::NoCoordSession)
+        );
+        assert!(finished_rows(&reg).is_empty(), "nothing queued to R");
+    }
+
+    /// A `/clear` successor that the seam made the pane row's owner still
+    /// resolves through its predecessor's pin: the owner check admits an id
+    /// of the record's own chain.
+    #[test]
+    fn a_clear_successor_that_owns_the_pane_row_resolves_through_the_pin() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let (store, _sdir) = attach_store(&reg);
+        let (p, y) = ("pinned-before-clear", "cleared-into-y");
+        let r = Uuid::new_v4();
+        attach_live_rows(&reg)
+            .lock()
+            .unwrap()
+            .insert(r, NewSessionTenant::Undetermined);
+        attach_panes(&reg)
+            .lock()
+            .unwrap()
+            .push((p.to_string(), Some((r, 1))));
+        open_on(&store, p, "term-pane", None);
+        open_on(&store, y, "term-pane", Some(p));
+        reg.note_pane_row(r, y, RekeySource::ProviderRegistry);
+        let _ = store.set_finished(y, true, None).unwrap();
+        assert_eq!(
+            reg.forward_finish_change(&store.get(y).unwrap()),
+            FinishSync::Queued {
+                coord_session_id: r
+            }
+        );
+    }
+
+    /// Review fix #1: a `/clear` in the pane pinned to P makes it run Y, and
+    /// Y's transcript binds to the pane row R through coord's pick before the
+    /// seam ticks. P's OLDER transcript is then tailed: the owner rule still
+    /// answers R for P by the pin seed alone — which is not evidence of what
+    /// the pane runs — so neither P's live-pane adoption nor a finish-time
+    /// repair for P may take R from Y. Once the seam names Y, P is refused for
+    /// the owner reason.
+    #[test]
+    fn a_pin_seed_alone_never_takes_the_row_from_a_clear_successor() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let (store, _sdir) = attach_store(&reg);
+        let (p, y) = ("pinned-before-clear-p", "cleared-into-y");
+        let r = Uuid::new_v4();
+        attach_live_rows(&reg)
+            .lock()
+            .unwrap()
+            .insert(r, NewSessionTenant::Undetermined);
+        attach_panes(&reg)
+            .lock()
+            .unwrap()
+            .push((p.to_string(), Some((r, 1))));
+        reg.bind_transcript_session(y, Some(r), None, ResumeParams::default())
+            .unwrap();
+        assert_eq!(
+            reg.live_terminal_row(p).map(|l| l.row),
+            Some(r),
+            "precondition: the pin seed answers R for P"
+        );
+
+        // P's older transcript: the live-pane adoption is refused (auto-bind
+        // defers), and Y keeps R.
+        assert_eq!(
+            reg.bind_transcript_session_on_live_pane(
+                p,
+                r,
+                NewSessionTenant::Undetermined,
+                ResumeParams::default()
+            ),
+            Err(TranscriptBindRefusal::CoordSessionInUse)
+        );
+        assert_eq!(reg.session_id_for(p), None);
+        assert_eq!(reg.session_id_for(y), Some(r));
+        assert_eq!(reg.task_run_id_for(&r), Some(y.to_string()));
+
+        // P bound elsewhere (coord's pick) and finished: the repair does not
+        // take R either.
+        let stale = Uuid::new_v4();
+        reg.bind_transcript_session(p, Some(stale), None, ResumeParams::default())
+            .unwrap();
+        assert_eq!(
+            reg.move_onto_pane_row(p, r, Mover::Repair, NewSessionTenant::Undetermined),
+            MoveOutcome::Contested
+        );
+        open_on(&store, p, "term-pane", None);
+        let _ = store.set_finished(p, true, None).unwrap();
+        assert_eq!(
+            reg.forward_finish_change(&store.get(p).unwrap()),
+            FinishSync::Queued {
+                coord_session_id: stale
+            }
+        );
+        assert_eq!(reg.session_id_for(y), Some(r), "Y still holds R");
+        reg.heartbeat_on_interaction(y);
+        assert!(rows_of_kind(&reg, SessionEventKind::Heartbeat)
+            .iter()
+            .any(|h| h.session_id == r));
+
+        // The seam names Y: R is Y's by an entry now, and P is refused on it.
+        assert_eq!(
+            reg.note_pane_row(r, y, RekeySource::ProviderRegistry),
+            MoveOutcome::Unchanged
+        );
+        assert_eq!(
+            reg.move_onto_pane_row(p, r, Mover::Repair, NewSessionTenant::Undetermined),
+            MoveOutcome::NotOwner
+        );
+        assert_eq!(reg.session_id_for(y), Some(r));
+    }
+
+    /// Review fix #2: the bind trigger mints no owner entry; the migration
+    /// overlap is covered by the owner rule instead. The old pane's row R_old
+    /// carries a seam entry for X; a NEW pane pinned to X is bound to R_new
+    /// later. The bind moves X onto R_new; the panes are ranked by bind
+    /// instant, so the old pane's re-confirmations cannot take X back while
+    /// the new pane is live.
+    #[test]
+    fn a_newer_pane_for_the_id_outranks_the_old_panes_seam_entry() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let rows: Arc<Mutex<HashMap<Uuid, i64>>> = Default::default();
+        {
+            let rows = rows.clone();
+            reg.attach_pane_row_tenant(move |row| {
+                rows.lock().unwrap().get(&row).map(|at| PaneRowFacts {
+                    tenant: NewSessionTenant::Undetermined,
+                    bound_at_ms: Some(*at),
+                    bind_seq: Some(*at as u64),
+                })
+            });
+        }
+        let panes = attach_panes(&reg);
+        let x = "migrated-session-x";
+        let (stale, r_old, r_new) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        rows.lock().unwrap().insert(r_old, 1);
+        panes
+            .lock()
+            .unwrap()
+            .push(("old-pane-pin".to_string(), Some((r_old, 1))));
+        reg.bind_transcript_session(x, Some(stale), None, ResumeParams::default())
+            .unwrap();
+        assert_eq!(
+            reg.note_pane_row(r_old, x, RekeySource::ProviderRegistry),
+            MoveOutcome::Moved { from: stale }
+        );
+
+        // The migration's new pane, pinned to X, bound after the entry began.
+        let later = chrono::Utc::now().timestamp_millis() + 60_000;
+        rows.lock().unwrap().insert(r_new, later);
+        panes
+            .lock()
+            .unwrap()
+            .push((x.to_string(), Some((r_new, 2))));
+        reg.on_terminal_coord_bind(x, "term-new", r_new);
+        assert_eq!(reg.session_id_for(x), Some(r_new));
+        assert_eq!(
+            reg.inner.pane_rows.owner_of(r_new),
+            None,
+            "the bind mints no owner entry"
+        );
+        assert_eq!(reg.live_terminal_row(x).map(|l| l.row), Some(r_new));
+
+        // Second review (A2): the NEW pane's seam tick runs first, so the
+        // entry moves to R_new; then the old pane — still running X —
+        // re-confirms, interleaved with the new pane's ticks. The later-bound
+        // pane keeps X on every tick: no flip back to R_old.
+        assert_eq!(
+            reg.note_pane_row(r_new, x, RekeySource::ProviderRegistry),
+            MoveOutcome::Unchanged
+        );
+        assert_eq!(reg.inner.pane_rows.owner_of(r_new).as_deref(), Some(x));
+        assert_eq!(reg.inner.pane_rows.owner_of(r_old), None);
+        for tick in 0..6 {
+            assert_eq!(
+                reg.note_pane_row(r_old, x, RekeySource::ProviderRegistry),
+                MoveOutcome::NotLivePane,
+                "old pane re-confirm, tick {tick}"
+            );
+            assert_eq!(
+                reg.inner.pane_rows.owner_of(r_old),
+                None,
+                "the old pane's re-confirmation never takes the owner back (tick {tick})"
+            );
+            assert_eq!(
+                reg.note_pane_row(r_new, x, RekeySource::ProviderRegistry),
+                MoveOutcome::Unchanged,
+                "new pane tick {tick}"
+            );
+            assert_eq!(reg.session_id_for(x), Some(r_new), "tick {tick}");
+            assert_eq!(reg.live_terminal_row(x).map(|l| l.row), Some(r_new));
+        }
+
+        // What is NOT guaranteed past the later pane's life: once it closes
+        // and is swept, the old pane — the only one left running X — takes X
+        // back on its next confirmation.
+        rows.lock().unwrap().remove(&r_new);
+        panes.lock().unwrap().retain(|(pin, _)| pin != x);
+        reg.sweep_closed_pane_rows();
+        assert_eq!(reg.inner.pane_rows.owner_of(r_new), None, "swept");
+        assert_eq!(
+            reg.note_pane_row(r_old, x, RekeySource::ProviderRegistry),
+            MoveOutcome::Moved { from: r_new }
+        );
+        assert_eq!(reg.session_id_for(x), Some(r_old));
+    }
+
+    /// Second review (A1): the argv rung names the PIN, not what the pane runs
+    /// after a `/clear`. A pane spawned with `--session-id P` runs `/clear`
+    /// and is now Y; Y binds the pane row R through coord. Every tick the
+    /// provider registry has no valid row, so rung 2 confirms P on R — and P
+    /// must neither become R's owner nor evict Y. When the provider registry
+    /// then names Y, Y owns R and P is refused for the owner reason.
+    #[test]
+    fn a_rung2_confirmation_of_the_pin_never_takes_the_row_from_a_clear_successor() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let (p, y) = ("spawned-with-session-id-p", "after-clear-y");
+        let r = Uuid::new_v4();
+        attach_live_rows(&reg)
+            .lock()
+            .unwrap()
+            .insert(r, NewSessionTenant::Undetermined);
+        attach_panes(&reg)
+            .lock()
+            .unwrap()
+            .push((p.to_string(), Some((r, 1))));
+        // Y binds R through coord's pick; P's older transcript bound elsewhere.
+        reg.bind_transcript_session(y, Some(r), None, ResumeParams::default())
+            .unwrap();
+        let stale = Uuid::new_v4();
+        reg.bind_transcript_session(p, Some(stale), None, ResumeParams::default())
+            .unwrap();
+
+        for source in [
+            RekeySource::Rung2,
+            RekeySource::R2Resume,
+            RekeySource::Rung2,
+        ] {
+            assert_eq!(
+                reg.note_pane_row(r, p, source),
+                MoveOutcome::Contested,
+                "{source:?} confirms the pin: no eviction"
+            );
+            assert_eq!(
+                reg.inner.pane_rows.owner_of(r),
+                None,
+                "{source:?} never advances the owner"
+            );
+            assert_eq!(reg.session_id_for(y), Some(r), "Y keeps R");
+            assert_eq!(reg.session_id_for(p), Some(stale));
+        }
+
+        // The provider registry names what the pane runs now: Y.
+        assert_eq!(
+            reg.note_pane_row(r, y, RekeySource::ProviderRegistry),
+            MoveOutcome::Unchanged
+        );
+        assert_eq!(reg.inner.pane_rows.owner_of(r).as_deref(), Some(y));
+        assert_eq!(
+            reg.note_pane_row(r, p, RekeySource::Rung2),
+            MoveOutcome::NotLivePane,
+            "the pin's row now belongs to Y by an entry"
+        );
+        assert_eq!(reg.session_id_for(y), Some(r));
+        assert!(rows_of_kind(&reg, SessionEventKind::Closed).is_empty());
+    }
+
+    /// Second review (A4) / third review (A4): a refused pin-seed take is
+    /// counted apart from the generic deferral, once per `(row, session)`
+    /// pair however often auto-bind retries it.
+    #[test]
+    fn a_contested_pin_seed_take_is_counted_once_per_pair() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let r = Uuid::new_v4();
+        reg.bind_transcript_session("holder-y", Some(r), None, ResumeParams::default())
+            .unwrap();
+        let before = pin_seed_takes_ever_deferred();
+        for _ in 0..3 {
+            assert_eq!(
+                reg.bind_transcript_session_on_live_pane(
+                    "pin-p",
+                    r,
+                    NewSessionTenant::Undetermined,
+                    ResumeParams::default()
+                ),
+                Err(TranscriptBindRefusal::CoordSessionInUse)
+            );
+        }
+        assert!(pin_seed_takes_ever_deferred() > before);
+        assert!(
+            !pane_transfer::note_pin_seed_take_deferred(r, "pin-p"),
+            "the pair was recorded once; retries add nothing"
+        );
+    }
+
+    /// Third review (A1): a retried running-id confirmation for a pane that
+    /// has since CLOSED must not displace the id's entry on the pane that runs
+    /// it now — here pane B, which reached X by an in-pane `/resume` (it is
+    /// not pinned to X).
+    #[test]
+    fn a_confirmation_for_a_closed_pane_never_displaces_the_live_panes_entry() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let live = attach_live_rows(&reg);
+        let x = "resumed-in-pane-b";
+        let (r_a, r_b) = (Uuid::new_v4(), Uuid::new_v4());
+        live.lock()
+            .unwrap()
+            .insert(r_b, NewSessionTenant::Undetermined);
+        reg.note_pane_row(r_b, x, RekeySource::ProviderRegistry);
+        assert_eq!(reg.inner.pane_rows.owner_of(r_b).as_deref(), Some(x));
+
+        // Pane A (closed: no live terminal holds R_A) has a deferred hook
+        // re-key for X that fires now.
+        assert_eq!(
+            reg.note_pane_row(r_a, x, RekeySource::Hook),
+            MoveOutcome::NotLivePane
+        );
+        assert_eq!(
+            reg.inner.pane_rows.owner_of(r_a),
+            None,
+            "never parked on R_A"
+        );
+        assert_eq!(reg.inner.pane_rows.owner_of(r_b).as_deref(), Some(x));
+        assert_eq!(reg.live_terminal_row(x).map(|l| l.row), Some(r_b));
+    }
+
+    /// Third review (A2): pane B, pinned to X and bound later, `/clear`ed to Y
+    /// (R_B is Y's by an entry). The older pane A still runs X; B's pin must
+    /// not block A's advance, or X would be routable nowhere while B lives.
+    #[test]
+    fn a_later_pin_whose_row_another_id_owns_does_not_block_the_advance() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let rows: Arc<Mutex<HashMap<Uuid, i64>>> = Default::default();
+        {
+            let rows = rows.clone();
+            reg.attach_pane_row_tenant(move |row| {
+                rows.lock().unwrap().get(&row).map(|at| PaneRowFacts {
+                    tenant: NewSessionTenant::Undetermined,
+                    bound_at_ms: Some(*at),
+                    bind_seq: Some(*at as u64),
+                })
+            });
+        }
+        let panes = attach_panes(&reg);
+        let (x, y) = ("still-running-in-a", "b-after-clear");
+        let (r_a, r_b) = (Uuid::new_v4(), Uuid::new_v4());
+        rows.lock().unwrap().insert(r_a, 100);
+        rows.lock().unwrap().insert(r_b, 200);
+        panes
+            .lock()
+            .unwrap()
+            .push(("pane-a-pin".to_string(), Some((r_a, 1))));
+        panes.lock().unwrap().push((x.to_string(), Some((r_b, 2))));
+        reg.note_pane_row(r_b, y, RekeySource::ProviderRegistry);
+        assert_eq!(reg.inner.pane_rows.owner_of(r_b).as_deref(), Some(y));
+
+        reg.note_pane_row(r_a, x, RekeySource::ProviderRegistry);
+        assert_eq!(
+            reg.inner.pane_rows.owner_of(r_a).as_deref(),
+            Some(x),
+            "B's pin does not outrank A: B runs Y now"
+        );
+        assert_eq!(reg.live_terminal_row(x).map(|l| l.row), Some(r_a));
+    }
+
+    /// The bind trigger does not move X onto a row whose owner entry names
+    /// another id: `NotOwner`, nothing evicted, counted.
+    #[test]
+    fn the_bind_trigger_does_not_move_onto_a_row_another_id_owns() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let (x, y) = ("bound-x", "owner-y");
+        let (stale, r) = (Uuid::new_v4(), Uuid::new_v4());
+        attach_live_rows(&reg)
+            .lock()
+            .unwrap()
+            .insert(r, NewSessionTenant::Undetermined);
+        reg.bind_transcript_session(x, Some(stale), None, ResumeParams::default())
+            .unwrap();
+        reg.note_pane_row(r, y, RekeySource::ProviderRegistry);
+        reg.bind_transcript_session_on_live_pane(
+            y,
+            r,
+            NewSessionTenant::Undetermined,
+            ResumeParams::default(),
+        )
+        .unwrap();
+
+        let before = pane_row_moves_not_owner();
+        assert_eq!(
+            reg.move_onto_pane_row(x, r, Mover::Bind, NewSessionTenant::Undetermined),
+            MoveOutcome::NotOwner
+        );
+        assert!(pane_row_moves_not_owner() > before, "counted");
+        reg.on_terminal_coord_bind(x, "term-x", r);
+        assert_eq!(reg.session_id_for(x), Some(stale), "nothing moved");
+        assert_eq!(reg.session_id_for(y), Some(r), "nothing evicted");
+        assert_eq!(reg.task_run_id_for(&r), Some(y.to_string()));
+    }
+
+    /// D4's finish-time repair: X adopted a stale row R′ while its pane is
+    /// bound to R, and no seam or bind trigger ran. The finish moves the entry
+    /// first, so it and the next heartbeat address R, and the repair is
+    /// counted.
+    #[test]
+    fn a_finish_repairs_a_stale_adoption_onto_the_live_pane_row() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let (store, _sdir) = attach_store(&reg);
+        let x = "pane-hosted-x";
+        let (stale, r) = (Uuid::new_v4(), Uuid::new_v4());
+        attach_live_rows(&reg)
+            .lock()
+            .unwrap()
+            .insert(r, NewSessionTenant::Stated(PANE_TENANT));
+        attach_panes(&reg)
+            .lock()
+            .unwrap()
+            .push((x.to_string(), Some((r, 1))));
+        open_on(&store, x, "term-pane", None);
+        reg.bind_transcript_session(x, Some(stale), None, ResumeParams::default())
+            .unwrap();
+
+        let before = registrar_terminal_row_disagreements();
+        let _ = store.set_finished(x, true, None).unwrap();
+        assert_eq!(
+            reg.forward_finish_change(&store.get(x).unwrap()),
+            FinishSync::Queued {
+                coord_session_id: r
+            }
+        );
+        assert!(registrar_terminal_row_disagreements() > before, "counted");
+        assert_eq!(reg.session_id_for(x), Some(r));
+        reg.heartbeat_on_interaction(x);
+        let beats = rows_of_kind(&reg, SessionEventKind::Heartbeat);
+        assert_eq!(beats.len(), 1);
+        assert_eq!(beats[0].session_id, r);
+        assert_eq!(beats[0].payload["tenant_id"], json!(PANE_TENANT));
+        assert!(
+            rows_of_kind(&reg, SessionEventKind::Closed).is_empty(),
+            "an ADOPTED stale row is left to coord's reaper"
+        );
+    }
+
+    /// The shape #2711's override asserted the other way: a SNIFFED X beside a
+    /// live pane pinned to X keeps its own row — the repair never moves a
+    /// sniffed entry.
+    #[test]
+    fn a_finish_does_not_move_a_sniffed_entry_beside_a_pinned_pane() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let (store, _sdir) = attach_store(&reg);
+        let x = "sniffed-x";
+        let r = Uuid::new_v4();
+        attach_live_rows(&reg)
+            .lock()
+            .unwrap()
+            .insert(r, NewSessionTenant::Undetermined);
+        attach_panes(&reg)
+            .lock()
+            .unwrap()
+            .push((x.to_string(), Some((r, 1))));
+        open_on(&store, x, "term-pane", None);
+        let s = reg
+            .register_sniffed_session(x, "typed resume", None)
+            .unwrap();
+        let _ = store.set_finished(x, true, None).unwrap();
+        assert_eq!(
+            reg.forward_finish_change(&store.get(x).unwrap()),
+            FinishSync::Queued {
+                coord_session_id: s
+            }
+        );
+        assert_eq!(reg.session_id_for(x), Some(s));
+    }
+
+    /// Taken from #2711 (`a_rebind_observer_moves_heartbeat_progress_and_tenant_to_the_new_row`),
+    /// tenant per D3: with NO terminal lookup attached, the coord-bind
+    /// observer alone moves every row-keyed write (heartbeat, progress,
+    /// finish, the inject resolver) onto the pane row, which reads ADOPTED and
+    /// carries the pane row's own tenant — and no `tenant_id` when the pane
+    /// row's scope is unresolved.
+    #[test]
+    fn a_terminal_bind_moves_every_row_keyed_write_onto_the_pane_row() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let live = attach_live_rows(&reg);
+        let csid = "respawned-pane-session";
+        let (old, new) = (Uuid::new_v4(), Uuid::new_v4());
+        live.lock()
+            .unwrap()
+            .insert(new, NewSessionTenant::Stated(PANE_TENANT));
+        reg.bind_transcript_session(
+            csid,
+            Some(old),
+            Some(OWNING_TENANT),
+            ResumeParams::default(),
+        )
+        .unwrap();
+
+        reg.on_terminal_coord_bind(csid, "term-new", new);
+
+        assert_eq!(reg.session_id_for(csid), Some(new));
+        assert_eq!(reg.task_run_id_for(&new), Some(csid.to_string()));
+        assert_eq!(reg.task_run_id_for(&old), None);
+        assert_eq!(reg.recorded_tenant(csid), Some(PANE_TENANT));
+        assert_eq!(
+            reg.recorded_row(csid).map(|r| r.origin),
+            Some(RecordedRowOrigin::Adopted),
+            "the pane row was minted elsewhere, never reported as minted here"
+        );
+        reg.heartbeat_on_interaction(csid);
+        reg.progress_on_interaction(csid);
+        assert_eq!(
+            reg.finish_session(csid, Some(9)),
+            FinishSync::Queued {
+                coord_session_id: new
+            }
+        );
+        let pending = reg.inner.outbox.pending().unwrap();
+        assert_eq!(pending.len(), 3, "{pending:?}");
+        for row in &pending {
+            assert_eq!(
+                row.session_id, new,
+                "{} row addressed the old row",
+                row.event_kind
+            );
+            assert_eq!(row.payload["id"], json!(new));
+            assert_eq!(
+                row.payload["tenant_id"],
+                json!(PANE_TENANT),
+                "{} row lost the pane row's tenant",
+                row.event_kind
+            );
+        }
+
+        // A pane row whose scope is unresolved: the writes carry no tenant.
+        let other = "respawned-unresolved";
+        let (old2, new2) = (Uuid::new_v4(), Uuid::new_v4());
+        reg.bind_transcript_session(
+            other,
+            Some(old2),
+            Some(OWNING_TENANT),
+            ResumeParams::default(),
+        )
+        .unwrap();
+        reg.on_terminal_coord_bind(other, "term-new2", new2);
+        assert_eq!(reg.session_id_for(other), Some(new2));
+        assert_eq!(reg.recorded_tenant(other), None);
+        reg.heartbeat_on_interaction(other);
+        let beat = rows_of_kind(&reg, SessionEventKind::Heartbeat)
+            .into_iter()
+            .find(|r| r.session_id == new2)
+            .expect("heartbeat to the pane row");
+        assert!(beat.payload.get("tenant_id").is_none(), "{beat:?}");
+    }
+
+    /// Taken from #2711: an old row this registrar MINTED has no other closer,
+    /// so the transfer closes it — stamped with ITS OWN tenant. A second bind
+    /// to the same row is a no-op and closes nothing more.
+    #[test]
+    fn a_rebind_closes_an_old_row_this_registrar_minted() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let csid = "minted-then-respawned";
+        let minted = reg
+            .bind_transcript_session(csid, None, Some(OWNING_TENANT), ResumeParams::default())
+            .unwrap();
+        let new = Uuid::new_v4();
+        reg.on_terminal_coord_bind(csid, "term-new", new);
+        assert_eq!(
+            reg.move_onto_pane_row(csid, new, Mover::Bind, NewSessionTenant::Undetermined),
+            MoveOutcome::Unchanged
+        );
+        let closed = rows_of_kind(&reg, SessionEventKind::Closed);
+        assert_eq!(closed.len(), 1, "{closed:?}");
+        assert_eq!(closed[0].session_id, minted);
+        assert_eq!(closed[0].payload["id"], json!(minted));
+        assert_eq!(closed[0].payload["tenant_id"], json!(OWNING_TENANT));
+        assert_eq!(reg.session_id_for(csid), Some(new));
+    }
+
+    /// Taken from #2711.
+    #[test]
+    fn rebind_to_the_same_row_is_a_no_op() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let csid = "same-row-session";
+        let row = Uuid::new_v4();
+        assert_eq!(
+            reg.move_onto_pane_row(csid, row, Mover::Bind, NewSessionTenant::Undetermined),
+            MoveOutcome::Unbound,
+            "a first bind has nothing to move"
+        );
+        reg.on_terminal_coord_bind(csid, "term", row);
+        assert_eq!(reg.session_id_for(csid), None, "and binds nothing");
+
+        reg.bind_transcript_session(
+            csid,
+            Some(row),
+            Some(OWNING_TENANT),
+            ResumeParams::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            reg.move_onto_pane_row(csid, row, Mover::Bind, NewSessionTenant::Undetermined),
+            MoveOutcome::Unchanged
+        );
+        reg.on_terminal_coord_bind(csid, "term", row);
+        assert_eq!(reg.session_id_for(csid), Some(row));
+        assert_eq!(reg.task_run_id_for(&row), Some(csid.to_string()));
+        assert_eq!(reg.recorded_tenant(csid), Some(OWNING_TENANT));
+        assert!(reg.inner.outbox.pending().unwrap().is_empty());
+    }
+
+    /// Taken from #2711: main.rs's coord-bind observer calls
+    /// `on_terminal_coord_bind` (which moves the entry, then delivers owed
+    /// marks), not `deliver_owed_finish` alone. The closure is not reachable
+    /// from a unit test, so the wiring is pinned by source scan.
+    #[test]
+    fn the_coord_bind_observer_rebinds_the_registrar() {
+        let main = include_str!("../main.rs");
+        let (_, after) = main
+            .split_once("term_for_session.attach_coord_bind_observer(")
+            .expect("main.rs attaches the coord-bind observer");
+        let region: String = after.chars().take(400).collect();
+        assert!(
+            region.contains("r.on_terminal_coord_bind(pinned, terminal_id, coord_id)"),
+            "{region}"
+        );
+        assert!(!region.contains("r.deliver_owed_finish("), "{region}");
+    }
+
+    /// Phase 2: main.rs wires the re-key seam's observer to
+    /// `note_pane_row`, and the live-pane-row lookup to the terminal manager
+    /// and the session registry (source scan, as above).
+    #[test]
+    fn the_rekey_observer_is_wired_to_the_registrar() {
+        let main = include_str!("../main.rs");
+        let (_, after) = main
+            .split_once("registry.attach_rekey_observer(")
+            .expect("main.rs attaches the re-key observer");
+        let region: String = after.chars().take(300).collect();
+        assert!(
+            region.contains("r.note_pane_row(row, csid, source)"),
+            "{region}"
+        );
+        let (_, after) = main
+            .split_once("ai_coord_registrar.attach_pane_row_tenant(")
+            .expect("main.rs attaches the pane-row lookup");
+        let region: String = after.chars().take(1200).collect();
+        assert!(region.contains(".coord_row_bound_at(row)"), "{region}");
+        assert!(region.contains(".tenant_scope_of(row)"), "{region}");
+        assert!(
+            region.contains("return PaneRowLookup::Unknown;"),
+            "an unreadable plane must answer Unknown, never Gone: {region}"
+        );
+    }
+
+    /// Taken from #2711 (vet D5): after the registrar follows a migrated pane
+    /// to its new row, the OLD pane's exit close must not close the live row
+    /// through the store's close observer. The migration marks the old
+    /// terminal superseded, so the store answers `TerminalSuperseded` and
+    /// fires nothing; a close racing ahead of the mark is a mis-bound
+    /// `NotFound`, which fires nothing either.
+    #[test]
+    fn closing_the_superseded_pane_after_a_rebind_leaves_the_live_row_open() {
+        use crate::session::session_lifecycle_store::{test_open_record, CloseOutcome};
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let reg = Arc::new(reg);
+        let (store, _store_dir) = attach_store(&reg);
+        {
+            let reg = Arc::downgrade(&reg);
+            store.attach_close_observer(move |csid| {
+                if let Some(r) = reg.upgrade() {
+                    r.close_session(csid);
+                }
+            });
+        }
+        // Non-uuid: keeps the attached store's handle hook network-silent.
+        let csid = "migrated-pane-session";
+        let (old, new) = (Uuid::new_v4(), Uuid::new_v4());
+        let on = |terminal: &str| {
+            let mut rec = test_open_record(csid);
+            rec.terminal_id = terminal.to_string();
+            rec.origin =
+                Some(crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE.to_string());
+            rec
+        };
+        store.record_open(on("term-old"));
+        reg.bind_transcript_session(csid, Some(old), None, ResumeParams::default())
+            .unwrap();
+
+        // The migration: the record re-keys onto the new pane, which is bound
+        // to its freshly minted row; then the old pane is marked and closed.
+        store.record_open(on("term-new"));
+        reg.on_terminal_coord_bind(csid, "term-new", new);
+        store.mark_terminal_superseded("term-old", "term-new");
+        assert!(matches!(
+            store.record_close_checked(csid, Some("term-old"), "pty-exit"),
+            CloseOutcome::TerminalSuperseded { .. }
+        ));
+        assert!(matches!(
+            store.record_close_checked(csid, Some("term-old"), "pty-exit"),
+            CloseOutcome::NotFound { .. }
+        ));
+
+        assert_eq!(
+            reg.session_id_for(csid),
+            Some(new),
+            "the live row stays bound"
+        );
+        assert_eq!(store.get(csid).unwrap().state, "open");
+        assert!(
+            rows_of_kind(&reg, SessionEventKind::Closed).is_empty(),
+            "no coord Closed for either row of a live session"
+        );
+    }
+
+    /// The registry + registrar wired as main.rs wires them: the seam's
+    /// observer calls `note_pane_row`, and the live-pane-row lookup answers
+    /// the rows in `live` with the registry's own tenant scope.
+    fn wire_seam(
+        registry: &Arc<crate::session::SessionRegistry>,
+        reg: &Arc<AiCoordRegistrar>,
+        live: Arc<Mutex<std::collections::HashSet<Uuid>>>,
+    ) {
+        let r = Arc::downgrade(reg);
+        registry.attach_rekey_observer(move |row, csid, source| {
+            if let Some(r) = r.upgrade() {
+                r.note_pane_row(row, csid, source);
+            }
+        });
+        let sreg = Arc::downgrade(registry);
+        reg.attach_pane_row_tenant(move |row| {
+            if !live.lock().unwrap().contains(&row) {
+                return None;
+            }
+            Some(PaneRowFacts {
+                tenant: crate::claude_session::pane_row_owner::tenant_from_scope(
+                    sreg.upgrade()?.tenant_scope_of(row),
+                ),
+                bound_at_ms: Some(1_000),
+                bind_seq: Some(1),
+            })
+        });
+    }
+
+    /// Plan Phase 2 "Done when" — the finding's reproduction. After a runner
+    /// restart, auto-bind adopted the PREVIOUS boot's row for X while the pane
+    /// hosting X runs on its own new row R. The re-key seam then confirms R
+    /// onto X; the session's finish must be queued to R, the pane row.
+    #[test]
+    fn a_pane_sessions_finish_after_a_restart_lands_on_the_pane_row() {
+        use crate::session::coord_identity::{confirm_for_terminal, RekeyOutcome, RekeySource};
+        let _amb = crate::test_env::isolated_ambient();
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let sdir = tempfile::tempdir().unwrap();
+        let (registry, _soutbox) = crate::session::coord_identity::tests::registry(sdir.path());
+        const PIN: &str = "90aea717-0000-4000-8000-000000000001";
+        const X: &str = "90aea717-0000-4000-8000-0000000000aa";
+        let pane_row = registry
+            .register_external_with_lineage(
+                crate::session::coord_identity::tests::intent(),
+                None,
+                Some(PIN.into()),
+            )
+            .unwrap();
+        let (reg, _dir) = registrar();
+        let reg = Arc::new(reg);
+        let live: Arc<Mutex<std::collections::HashSet<Uuid>>> = Default::default();
+        live.lock().unwrap().insert(pane_row);
+        wire_seam(&registry, &reg, live);
+
+        // Boot: auto-bind ran ahead of the pane's bind and adopted coord's
+        // pick — the previous boot's row, still active.
+        let previous_boot_row = Uuid::new_v4();
+        reg.bind_transcript_session(X, Some(previous_boot_row), None, ResumeParams::default())
+            .unwrap();
+        assert_eq!(reg.session_id_for(X), Some(previous_boot_row));
+
+        // The seam confirms the pane row onto X (provider registry).
+        assert_eq!(
+            confirm_for_terminal(
+                &registry,
+                "t1",
+                Some(pane_row),
+                X,
+                RekeySource::ProviderRegistry
+            ),
+            RekeyOutcome::Queued
+        );
+        assert_eq!(reg.session_id_for(X), Some(pane_row));
+
+        // The finish.
+        let (store, _sdir2) = attach_store(&reg);
+        {
+            let r = Arc::downgrade(&reg);
+            store.attach_finish_observer(move |rec| match r.upgrade() {
+                Some(r) => r.forward_finish_change(rec),
+                None => FinishSync::LocalOnly(LocalOnlyReason::NoForwarder),
+            });
+        }
+        store.record_open(crate::session::session_lifecycle_store::test_open_record(X));
+        let out = store.set_finished(X, true, None).unwrap();
+        assert_eq!(
+            out.coord,
+            FinishSync::Queued {
+                coord_session_id: pane_row
+            },
+            "the finish names the pane row, not the previous boot's"
+        );
+        assert!(
+            reg.inner
+                .outbox
+                .pending()
+                .unwrap()
+                .iter()
+                .all(|r| r.session_id != previous_boot_row),
+            "nothing is written to the previous boot's row after the move"
+        );
+    }
+
+    /// Phase 2: after adopting R′ for X, a seam confirm of the pane row R onto
+    /// X moves the entry — through `Queued` and through `AlreadyCurrent`, and
+    /// through `confirm_for_session` (the retry doors) as well as
+    /// `confirm_for_terminal` — so the finish and the heartbeat address R. An
+    /// ADOPTED R′ gets no `Closed`.
+    #[test]
+    fn a_seam_confirm_moves_an_adopted_entry_onto_the_pane_row() {
+        use crate::session::coord_identity::{
+            confirm_for_session, confirm_for_terminal, RekeyOutcome, RekeySource,
+        };
+        let _amb = crate::test_env::isolated_ambient();
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        const PIN: &str = "5ea70000-0000-4000-8000-000000000001";
+        const X: &str = "5ea70000-0000-4000-8000-0000000000aa";
+        const Y: &str = "5ea70000-0000-4000-8000-0000000000bb";
+        let sdir = tempfile::tempdir().unwrap();
+        let (registry, _o) = crate::session::coord_identity::tests::registry(sdir.path());
+        let intent = crate::session::coord_identity::tests::intent;
+        let (reg, _dir) = registrar();
+        let reg = Arc::new(reg);
+        let live: Arc<Mutex<std::collections::HashSet<Uuid>>> = Default::default();
+        wire_seam(&registry, &reg, live.clone());
+
+        // Queued, through the terminal door.
+        let r1 = registry
+            .register_external_with_lineage(intent(), None, Some(PIN.into()))
+            .unwrap();
+        live.lock().unwrap().insert(r1);
+        let stale1 = Uuid::new_v4();
+        reg.bind_transcript_session(X, Some(stale1), None, ResumeParams::default())
+            .unwrap();
+        assert_eq!(
+            confirm_for_terminal(&registry, "t1", Some(r1), X, RekeySource::ProviderRegistry),
+            RekeyOutcome::Queued
+        );
+        assert_eq!(reg.session_id_for(X), Some(r1));
+        assert_eq!(
+            reg.finish_session(X, Some(1)),
+            FinishSync::Queued {
+                coord_session_id: r1
+            }
+        );
+        reg.heartbeat_on_interaction(X);
+        assert!(rows_of_kind(&reg, SessionEventKind::Heartbeat)
+            .iter()
+            .all(|h| h.session_id == r1));
+
+        // AlreadyCurrent, through the session door: the record already
+        // carries Y when the registrar's stale entry appears.
+        let r2 = registry
+            .register_external_with_lineage(intent(), None, Some(PIN.into()))
+            .unwrap();
+        assert_eq!(
+            confirm_for_session(&registry, r2, Y, RekeySource::ProviderRegistry),
+            RekeyOutcome::Queued,
+            "the observer fires, but R2 is no live pane yet: nothing moves"
+        );
+        live.lock().unwrap().insert(r2);
+        let stale2 = Uuid::new_v4();
+        reg.bind_transcript_session(Y, Some(stale2), None, ResumeParams::default())
+            .unwrap();
+        assert_eq!(
+            confirm_for_session(&registry, r2, Y, RekeySource::ProviderRegistry),
+            RekeyOutcome::AlreadyCurrent
+        );
+        assert_eq!(reg.session_id_for(Y), Some(r2));
+        assert_eq!(
+            reg.finish_session(Y, Some(2)),
+            FinishSync::Queued {
+                coord_session_id: r2
+            }
+        );
+        assert!(
+            rows_of_kind(&reg, SessionEventKind::Closed).is_empty(),
+            "an adopted R′ gets no Closed"
+        );
+    }
+
+    /// Phase 2: the seam never moves a sniffed or pinned-plane entry, and
+    /// never binds an absent one.
+    #[test]
+    fn the_seam_moves_no_sniffed_or_pinned_entry_and_binds_nothing() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let live = attach_live_rows(&reg);
+        let (r1, r2, r3) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        for r in [r1, r2, r3] {
+            live.lock()
+                .unwrap()
+                .insert(r, NewSessionTenant::Undetermined);
+        }
+        let s = reg
+            .register_sniffed_session("sniffed-x", "typed resume", None)
+            .unwrap();
+        assert_eq!(
+            reg.note_pane_row(r1, "sniffed-x", RekeySource::ProviderRegistry),
+            MoveOutcome::NotEligible
+        );
+        assert_eq!(reg.session_id_for("sniffed-x"), Some(s));
+
+        let p = reg
+            .register_session("pinned-task-run", "ai session", None)
+            .unwrap();
+        assert_eq!(
+            reg.note_pane_row(r2, "pinned-task-run", RekeySource::ProviderRegistry),
+            MoveOutcome::NotEligible
+        );
+        assert_eq!(reg.session_id_for("pinned-task-run"), Some(p));
+
+        assert_eq!(
+            reg.note_pane_row(r3, "absent-x", RekeySource::ProviderRegistry),
+            MoveOutcome::Unbound
+        );
+        assert_eq!(reg.session_id_for("absent-x"), None);
+        assert!(rows_of_kind(&reg, SessionEventKind::Closed).is_empty());
+    }
+
+    /// Phase 2 (re-vet): an auto-bind-MINTED `reverse[X] = M` (coord did not
+    /// know X when auto-bind ran) is moved onto the pane row, and exactly one
+    /// `Closed` is queued for M, stamped with M's tenant; a second confirm
+    /// queues nothing more.
+    #[test]
+    fn the_seam_moves_a_minted_entry_and_closes_the_minted_row_once() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let live = attach_live_rows(&reg);
+        let r = Uuid::new_v4();
+        live.lock()
+            .unwrap()
+            .insert(r, NewSessionTenant::Stated(PANE_TENANT));
+        let x = "minted-by-autobind";
+        let m = reg
+            .bind_transcript_session(x, None, Some(OWNING_TENANT), ResumeParams::default())
+            .unwrap();
+
+        assert_eq!(
+            reg.note_pane_row(r, x, RekeySource::ProviderRegistry),
+            MoveOutcome::Moved { from: m }
+        );
+        assert_eq!(
+            reg.note_pane_row(r, x, RekeySource::ProviderRegistry),
+            MoveOutcome::Unchanged
+        );
+        let closed = rows_of_kind(&reg, SessionEventKind::Closed);
+        assert_eq!(closed.len(), 1, "{closed:?}");
+        assert_eq!(closed[0].session_id, m);
+        assert_eq!(closed[0].payload["tenant_id"], json!(OWNING_TENANT));
+        assert_eq!(reg.session_id_for(x), Some(r));
+        assert_eq!(reg.recorded_tenant(x), Some(PANE_TENANT));
+    }
+
     #[test]
     fn pinned_register_also_forwards_claude_code_session_id() {
         // The addressability fix: coord's `create_session` upserts
@@ -3148,6 +5503,7 @@ mod tests {
                 provider: crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
                 origin: None,
                 restore_pending_at: None,
+                awaiting_account_since: None,
                 confirmed_at: None,
                 handle: None,
                 account_label: None,
@@ -3162,10 +5518,17 @@ mod tests {
                 finished_at: None,
                 wind_down_outcome: None,
                 wind_down_at: None,
+                wind_down_arm: None,
                 finish_reason: None,
                 finish_synced: false,
+                finish_coord_session_id: None,
+                finish_coord_readdressed: false,
                 spawn_device_default: None,
                 adopted_from: None,
+                last_session_start_at: None,
+                gate_id: None,
+                gate_consuming_device_id: None,
+                gate_bound_boot_ms: None,
             },
         );
         let finished_at = store
@@ -3249,6 +5612,7 @@ mod tests {
                 provider: crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
                 origin: None,
                 restore_pending_at: None,
+                awaiting_account_since: None,
                 confirmed_at: None,
                 handle: None,
                 account_label: None,
@@ -3263,10 +5627,17 @@ mod tests {
                 finished_at: None,
                 wind_down_outcome: None,
                 wind_down_at: None,
+                wind_down_arm: None,
                 finish_reason: None,
                 finish_synced: false,
+                finish_coord_session_id: None,
+                finish_coord_readdressed: false,
                 spawn_device_default: None,
                 adopted_from: None,
+                last_session_start_at: None,
+                gate_id: None,
+                gate_consuming_device_id: None,
+                gate_bound_boot_ms: None,
             },
         );
         let coord_id = reg
@@ -4076,5 +6447,840 @@ mod tests {
         assert!(reg.session_id_for(&trid).is_none());
 
         std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+    }
+
+    // ------------------------------------------------------------------
+    // Plan `2026-11-12-transcript-autobind-adopts-a-previous-boot-row-that-
+    // a-live-pane-has-replaced` D5 (Phase 3): a move re-offers a finish
+    // another row ACKed, on #2704's record.
+    // ------------------------------------------------------------------
+
+    use super::finish_reoffer::{race_after_decision, ReofferOutcome};
+
+    /// A registrar and store wired as main.rs wires them (the store's finish
+    /// observer forwards to the registrar), with mutable live pane rows
+    /// (row → the pane's bind instant, unix ms) and pinned panes.
+    struct ReofferRig {
+        reg: Arc<AiCoordRegistrar>,
+        store: Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>,
+        live: Arc<Mutex<HashMap<Uuid, i64>>>,
+        panes: Panes,
+        dirs: (tempfile::TempDir, tempfile::TempDir),
+    }
+
+    fn reoffer_rig() -> ReofferRig {
+        let (reg, dir) = registrar();
+        let reg = Arc::new(reg);
+        let (store, sdir) = attach_store(&reg);
+        let weak = Arc::downgrade(&reg);
+        store.attach_finish_observer(move |rec| match weak.upgrade() {
+            Some(r) => r.forward_finish_change(rec),
+            None => FinishSync::LocalOnly(LocalOnlyReason::NoForwarder),
+        });
+        let live: Arc<Mutex<HashMap<Uuid, i64>>> = Default::default();
+        let l = live.clone();
+        reg.attach_pane_row_tenant(move |row| {
+            l.lock().unwrap().get(&row).map(|at| PaneRowFacts {
+                tenant: NewSessionTenant::Undetermined,
+                bound_at_ms: Some(*at),
+                bind_seq: Some(1),
+            })
+        });
+        let panes = attach_panes(&reg);
+        ReofferRig {
+            reg,
+            store,
+            live,
+            panes,
+            dirs: (dir, sdir),
+        }
+    }
+
+    impl ReofferRig {
+        /// The drain delivered every pending row, and `row` was OBSERVED
+        /// reading `finished` for `x`'s mark at `at` (#2704's ACK stamp).
+        fn ack(&self, x: &str, at: i64, row: Uuid) {
+            let keys: Vec<(Uuid, i64)> = self
+                .reg
+                .inner
+                .outbox
+                .pending()
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.session_id, r.seq))
+                .collect();
+            self.reg.inner.outbox.ack(&keys).unwrap();
+            self.store.mark_finish_synced_on(x, Some(at), Some(row));
+        }
+
+        /// `x` adopts the stale row R′ through auto-bind, is marked finished
+        /// there, and R′ ACKs it. Returns `(R′, finished_at)`.
+        fn finished_on_stale(&self, x: &str) -> (Uuid, i64) {
+            open_on(&self.store, x, "term-pane", None);
+            let stale = Uuid::new_v4();
+            self.reg
+                .bind_transcript_session(x, Some(stale), None, ResumeParams::default())
+                .unwrap();
+            let out = self.store.set_finished(x, true, None).unwrap();
+            assert_eq!(
+                out.coord,
+                FinishSync::Queued {
+                    coord_session_id: stale
+                }
+            );
+            let at = out.record.finished_at.unwrap();
+            self.ack(x, at, stale);
+            let rec = self.store.get(x).unwrap();
+            assert!(rec.finish_synced);
+            assert_eq!(rec.finish_coord_session_id, Some(stale));
+            (stale, at)
+        }
+
+        /// A live pane pinned to `x`, bound to `row` at `bound_at_ms`.
+        fn show_pane(&self, x: &str, row: Uuid, bound_at_ms: i64) {
+            self.live.lock().unwrap().insert(row, bound_at_ms);
+            self.panes
+                .lock()
+                .unwrap()
+                .push((x.to_string(), Some((row, 1))));
+        }
+
+        /// The mark's `(finish_synced, finish_coord_session_id)`.
+        fn mark(&self, x: &str) -> (bool, Option<Uuid>) {
+            let rec = self.store.get(x).unwrap();
+            (rec.finish_synced, rec.finish_coord_session_id)
+        }
+    }
+
+    /// D5 through the seam: X's finish was ACKed by the stale row R′ its
+    /// auto-bind adopted; the seam then repoints X onto its pane row R. One
+    /// `Finished` is queued to R, and the mark reads unsynced — naming R as
+    /// the row it was sent to — until R's own observed ACK stamps it.
+    #[test]
+    fn a_finish_acked_by_a_stale_row_is_re_offered_to_the_pane_row_on_repoint() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let rig = reoffer_rig();
+        let x = "reoffer-seam-x";
+        let (stale, at) = rig.finished_on_stale(x);
+        let r = Uuid::new_v4();
+        rig.show_pane(x, r, 1_000);
+
+        let before = registrar_finish_reoffers();
+        assert_eq!(
+            rig.reg.note_pane_row(r, x, RekeySource::Rung2),
+            MoveOutcome::Moved { from: stale }
+        );
+        assert_eq!(finished_rows(&rig.reg), vec![(r, x.to_string())]);
+        assert!(registrar_finish_reoffers() > before, "counted");
+        assert_eq!(rig.mark(x), (false, Some(r)), "unsynced until R ACKs");
+
+        // The next tick finds the mark already sent to R: nothing more.
+        assert_eq!(
+            rig.reg.note_pane_row(r, x, RekeySource::Rung2),
+            MoveOutcome::Unchanged
+        );
+        assert_eq!(finished_rows(&rig.reg).len(), 1);
+
+        rig.ack(x, at, r);
+        assert_eq!(rig.mark(x), (true, Some(r)));
+    }
+
+    /// D5 review (MAJOR 1): the bind trigger on the REAL timestamp path. A
+    /// pane pinned to X is bound to R after R′ ACKed X's finish, through
+    /// `TerminalManager::bind_coord_session` wired as main.rs wires it. The
+    /// bind stamps the pane's bind instant at the bind itself, so X's
+    /// ownership of R begins after the finish: the bind moves the entry, but
+    /// neither it nor any later seam tick re-offers the finish (the bind
+    /// trigger is not a re-offer caller for exactly this reason).
+    #[test]
+    fn a_pane_bound_after_the_finish_never_has_it_re_offered() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let reg = Arc::new(reg);
+        let (store, _sdir) = attach_store(&reg);
+        {
+            let weak = Arc::downgrade(&reg);
+            store.attach_finish_observer(move |rec| match weak.upgrade() {
+                Some(r) => r.forward_finish_change(rec),
+                None => FinishSync::LocalOnly(LocalOnlyReason::NoForwarder),
+            });
+        }
+        let tm = Arc::new(crate::terminal::manager::TerminalManager::new());
+        {
+            let tm = Arc::downgrade(&tm);
+            reg.attach_terminal_coord_lookup(move |csid| {
+                tm.upgrade()?.coord_session_id_for_pinned(csid)
+            });
+        }
+        {
+            let tm = Arc::downgrade(&tm);
+            reg.attach_pane_row_tenant(move |row| {
+                let Some(binding) = tm.upgrade().and_then(|t| t.coord_row_bound_at(row)) else {
+                    return PaneRowLookup::Unknown;
+                };
+                let Some((bound_at_ms, bind_seq)) = binding else {
+                    return PaneRowLookup::Gone;
+                };
+                PaneRowLookup::Live(PaneRowFacts {
+                    tenant: NewSessionTenant::Undetermined,
+                    bound_at_ms: Some(bound_at_ms),
+                    bind_seq: Some(bind_seq),
+                })
+            });
+        }
+        {
+            let weak = Arc::downgrade(&reg);
+            tm.attach_coord_bind_observer(move |pinned, terminal_id, coord_id| {
+                if let Some(r) = weak.upgrade() {
+                    r.on_terminal_coord_bind(pinned, terminal_id, coord_id);
+                }
+            });
+        }
+        // `make_test_session`'s spawn-time pin.
+        let x = "test-pinned-session";
+        open_on(&store, x, "term-x", None);
+        let stale = Uuid::new_v4();
+        reg.bind_transcript_session(x, Some(stale), None, ResumeParams::default())
+            .unwrap();
+        let at = store
+            .set_finished(x, true, None)
+            .unwrap()
+            .record
+            .finished_at
+            .unwrap();
+        let keys: Vec<(Uuid, i64)> = reg
+            .inner
+            .outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.session_id, r.seq))
+            .collect();
+        reg.inner.outbox.ack(&keys).unwrap();
+        store.mark_finish_synced_on(x, Some(at), Some(stale));
+
+        let session = Arc::new(crate::terminal::session::tests::make_test_session(
+            Arc::new(Mutex::new(Vec::new())),
+        ));
+        tm.insert_for_test("term-x", session.clone());
+        let r = Uuid::new_v4();
+        tm.bind_coord_session(&session, r);
+        assert_eq!(reg.session_id_for(x), Some(r), "the bind moved the entry");
+        let owned = reg
+            .live_terminal_row(x)
+            .and_then(|l| l.owned_since_ms)
+            .expect("the pin seed carries the real bind instant");
+        assert!(owned >= at, "stamped at the bind: {owned} < {at}");
+
+        for source in [RekeySource::Rung2, RekeySource::Hook] {
+            assert_eq!(reg.note_pane_row(r, x, source), MoveOutcome::Unchanged);
+        }
+        assert_eq!(
+            reg.reoffer_finish_to(x, r),
+            ReofferOutcome::OwnedAfterFinish
+        );
+        assert!(finished_rows(&reg).is_empty());
+        let rec = store.get(x).unwrap();
+        assert!(rec.finish_synced, "the mark keeps R′'s ACK");
+        assert_eq!(rec.finish_coord_session_id, Some(stale));
+    }
+
+    /// D5 review (MAJOR 2): a hook-grade source first confirms X on the row of
+    /// the pane PINNED to X only after X's finish. The pane has run X since
+    /// it was bound (no other id was ever seen there), so ownership dates
+    /// from the bind and the finish R′ ACKed is re-offered to R.
+    #[test]
+    fn a_hook_confirming_x_on_its_own_pinned_row_after_the_finish_still_re_offers() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let rig = reoffer_rig();
+        let x = "reoffer-hook-x";
+        let (stale, at) = rig.finished_on_stale(x);
+        let r = Uuid::new_v4();
+        rig.show_pane(x, r, 1_000);
+
+        assert_eq!(
+            rig.reg.note_pane_row(r, x, RekeySource::Hook),
+            MoveOutcome::Moved { from: stale }
+        );
+        assert_eq!(finished_rows(&rig.reg), vec![(r, x.to_string())]);
+        assert_eq!(rig.mark(x), (false, Some(r)));
+        rig.ack(x, at, r);
+        assert_eq!(rig.mark(x), (true, Some(r)));
+    }
+
+    /// Round-2 review: X is pinned and bound before its finish, R′ ACKs it;
+    /// an in-pane `/clear` successor P is seen on R through rung 2 ONLY;
+    /// then `/resume X` and the hook confirms X. X runs again, so the finish
+    /// R′ ACKed must not be re-offered to R — the row's history carries P
+    /// although P never advanced the owner.
+    #[test]
+    fn a_clear_successor_seen_only_through_rung2_keeps_a_resumed_finish_off_the_pane_row() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let rig = reoffer_rig();
+        let x = "reoffer-clear-resume-x";
+        let (stale, _) = rig.finished_on_stale(x);
+        let r = Uuid::new_v4();
+        rig.show_pane(x, r, 1_000);
+
+        let p = "clear-successor-p";
+        rig.reg.note_pane_row(r, p, RekeySource::Rung2);
+        assert_eq!(
+            rig.reg.inner.pane_rows.owner_of(r),
+            None,
+            "rung 2 never advances the owner"
+        );
+        assert_eq!(
+            rig.reg.note_pane_row(r, x, RekeySource::Hook),
+            MoveOutcome::Moved { from: stale }
+        );
+        assert!(
+            finished_rows(&rig.reg).is_empty(),
+            "no finish onto a resumed session"
+        );
+        assert_eq!(rig.mark(x), (true, Some(stale)));
+        assert_eq!(
+            rig.reg.reoffer_finish_to(x, r),
+            ReofferOutcome::OwnedAfterFinish
+        );
+    }
+
+    /// One re-address target, two triggers (D5 beside the finish heal's
+    /// re-address, plan `2026-11-07-...` Phase 4): a mark the heal
+    /// re-addressed to the row coord OBSERVED as live is never re-offered to
+    /// the pane row — not while the heal's re-send is in flight, and not after
+    /// that row confirms — so the two cannot ping-pong. The registrar's
+    /// unsynced routing keeps sending it to the heal's row.
+    #[test]
+    fn a_heal_readdressed_finish_is_never_re_offered_to_the_pane_row() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let rig = reoffer_rig();
+        let x = "reoffer-heal-x";
+        let (stale, at) = rig.finished_on_stale(x);
+        // The heal re-addresses the synced mark to C, coord's live row.
+        let c = Uuid::new_v4();
+        assert!(rig
+            .store
+            .note_finish_readdressed(x, at, c, true, Some(stale)));
+        let r = Uuid::new_v4();
+        rig.show_pane(x, r, 1_000);
+
+        assert_eq!(
+            rig.reg.note_pane_row(r, x, RekeySource::Rung2),
+            MoveOutcome::Moved { from: stale }
+        );
+        assert!(
+            finished_rows(&rig.reg).is_empty(),
+            "nothing re-offered to R"
+        );
+        assert_eq!(rig.mark(x), (false, Some(c)));
+        assert_eq!(
+            rig.reg.reoffer_finish_to(x, r),
+            ReofferOutcome::HealReaddressed
+        );
+
+        // The retry door (a reason-less re-finish of the unsynced mark) sends
+        // to the heal's row, although the registrar's entry is on R.
+        assert_eq!(
+            rig.store.set_finished(x, true, None).unwrap().coord,
+            FinishSync::Queued {
+                coord_session_id: c
+            }
+        );
+        assert_eq!(finished_rows(&rig.reg), vec![(c, x.to_string())]);
+
+        // C confirms. Later ticks still leave the heal's row alone.
+        rig.ack(x, at, c);
+        assert_eq!(rig.mark(x), (true, Some(c)));
+        for _ in 0..2 {
+            assert_eq!(
+                rig.reg.note_pane_row(r, x, RekeySource::Rung2),
+                MoveOutcome::Unchanged
+            );
+        }
+        assert!(finished_rows(&rig.reg).is_empty());
+        assert_eq!(rig.mark(x), (true, Some(c)));
+    }
+
+    /// A heal re-address that lands between the re-offer's decision and its
+    /// door wins: the door re-reads the flag under `finish_forward`.
+    #[test]
+    fn a_heal_readdress_racing_the_re_offer_wins() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let rig = reoffer_rig();
+        let x = "reoffer-heal-race-x";
+        let (stale, at) = rig.finished_on_stale(x);
+        let r = Uuid::new_v4();
+        rig.show_pane(x, r, 1_000);
+        let c = Uuid::new_v4();
+        let store = rig.store.clone();
+        race_after_decision(move || {
+            assert!(store.note_finish_readdressed(x, at, c, true, Some(stale)));
+        });
+
+        assert_eq!(
+            rig.reg.reoffer_finish_to(x, r),
+            ReofferOutcome::HealReaddressed
+        );
+        assert!(finished_rows(&rig.reg).is_empty());
+        assert_eq!(rig.mark(x), (false, Some(c)));
+    }
+
+    /// Round-3 review: the boot sweep's UNSYNCED path. The heal reads the mark
+    /// (its own row the stale R′, a drop left it unsynced) and decides to
+    /// re-address it to H, the row coord names; before its re-address lands,
+    /// the pane-row re-offer queues the finish to R. The heal's compare-and-
+    /// set on the row it read refuses (`MarkChanged`): nothing is sent to H,
+    /// the mark keeps R, and no `Finished` is left pending to two rows.
+    #[test]
+    fn a_heal_re_address_over_a_mark_the_re_offer_moved_is_refused() {
+        use crate::session::finish_heal::{apply_heal_observed, HealOutcome, Observations};
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let rig = reoffer_rig();
+        let x = "reoffer-heal-interleave-x";
+        open_on(&rig.store, x, "term-pane", None);
+        let stale = Uuid::new_v4();
+        rig.reg
+            .bind_transcript_session(x, Some(stale), None, ResumeParams::default())
+            .unwrap();
+        let at = rig
+            .store
+            .set_finished(x, true, None)
+            .unwrap()
+            .record
+            .finished_at
+            .unwrap();
+        // The drain delivered it, coord's row never read `finished`: the
+        // unconfirmed drop records R′ as the sent row and leaves it unsynced.
+        let keys: Vec<(Uuid, i64)> = rig
+            .reg
+            .inner
+            .outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .map(|o| (o.session_id, o.seq))
+            .collect();
+        rig.reg.inner.outbox.ack(&keys).unwrap();
+        rig.store.note_finish_sent_row(x, Some(at), stale);
+        assert_eq!(rig.mark(x), (false, Some(stale)));
+
+        // 1. The boot sweep reads the mark.
+        let snapshot = rig.store.get(x).unwrap();
+
+        // 2. The pane-row re-offer moves it onto R and queues the finish.
+        let r = Uuid::new_v4();
+        rig.show_pane(x, r, 1_000);
+        assert_eq!(
+            rig.reg.note_pane_row(r, x, RekeySource::Rung2),
+            MoveOutcome::Moved { from: stale }
+        );
+        assert_eq!(finished_rows(&rig.reg), vec![(r, x.to_string())]);
+        assert_eq!(rig.mark(x), (false, Some(r)));
+
+        // 3. The heal, over its earlier snapshot, finds coord naming H —
+        // active, NULL, registered before the finish — and re-addresses.
+        let h = Uuid::new_v4();
+        let before = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(at - 60_000)
+            .unwrap()
+            .to_rfc3339();
+        let fetch = crate::mcp::session_work_status::fetch_from_body_for_test(
+            json!({
+                "statuses": {x: {"session_status": null, "since": null,
+                                 "coord_session_id": h.to_string(), "state": "active",
+                                 "started_at": before}},
+                "unknown": [], "invalid": [], "input_truncated": false,
+                "sessionBridgeColumnPresent": true
+            }),
+            1,
+        );
+        let ids = vec![x.to_string()];
+        let port: &dyn crate::session::finish_heal::HealPort = rig.reg.as_ref();
+        let out = apply_heal_observed(
+            &rig.store,
+            Some(port),
+            std::slice::from_ref(&snapshot),
+            &Observations::from_fetch(&ids, &fetch),
+            at + 1_000,
+            true,
+        );
+        assert_eq!(out, vec![(x.to_string(), HealOutcome::MarkChanged)]);
+
+        // 4. Nothing went to H; the mark keeps R, and is not flagged.
+        assert_eq!(finished_rows(&rig.reg), vec![(r, x.to_string())]);
+        assert_eq!(rig.mark(x), (false, Some(r)));
+        assert!(!rig.store.get(x).unwrap().finish_coord_readdressed);
+        // A heal that read the CURRENT target would still be allowed.
+        assert!(rig.store.note_finish_readdressed(x, at, h, false, Some(r)));
+    }
+
+    /// The other direction: after a re-offer moved the mark onto R, the
+    /// registrar's unsynced routing (the retry door) sends to R through the
+    /// in-process resolution — the re-offer sets no override flag — and a
+    /// later heal re-address to coord's row replaces it, after which the
+    /// re-offer stands aside.
+    #[test]
+    fn a_re_offered_finish_routes_to_the_pane_row_until_the_heal_names_another() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let rig = reoffer_rig();
+        let x = "reoffer-then-heal-x";
+        let (stale, at) = rig.finished_on_stale(x);
+        let r = Uuid::new_v4();
+        rig.show_pane(x, r, 1_000);
+        assert_eq!(
+            rig.reg.note_pane_row(r, x, RekeySource::Rung2),
+            MoveOutcome::Moved { from: stale }
+        );
+        assert!(!rig.store.get(x).unwrap().finish_coord_readdressed);
+        assert_eq!(
+            rig.store.set_finished(x, true, None).unwrap().coord,
+            FinishSync::Queued {
+                coord_session_id: r
+            }
+        );
+
+        // The heal later finds coord naming C as the live row.
+        let c = Uuid::new_v4();
+        assert!(rig.store.note_finish_readdressed(x, at, c, false, Some(r)));
+        assert_eq!(
+            rig.reg.note_pane_row(r, x, RekeySource::Rung2),
+            MoveOutcome::Unchanged
+        );
+        assert_eq!(rig.mark(x), (false, Some(c)), "the heal's row stands");
+        assert!(finished_rows(&rig.reg).iter().all(|(row, _)| *row == r));
+    }
+
+    /// D5 through the finish-time repair: the operator re-states X's finish
+    /// (a restamp) after R′ ACKed it. The repair moves X onto R inside the
+    /// finish observer, the forward itself is the one `Finished` to R, and
+    /// R is recorded as the row it was sent to — so the next seam tick
+    /// queues nothing more.
+    #[test]
+    fn a_finish_acked_by_a_stale_row_reaches_the_pane_row_through_the_finish_time_repair() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let rig = reoffer_rig();
+        let x = "reoffer-repair-x";
+        let (_stale, at) = rig.finished_on_stale(x);
+        let r = Uuid::new_v4();
+        rig.show_pane(x, r, 1_000);
+
+        let before = registrar_terminal_row_disagreements();
+        let out = rig
+            .store
+            .set_finished(x, true, Some("restated".into()))
+            .unwrap();
+        assert_eq!(
+            out.coord,
+            FinishSync::Queued {
+                coord_session_id: r
+            }
+        );
+        assert!(registrar_terminal_row_disagreements() > before, "repaired");
+        let at2 = out.record.finished_at.unwrap();
+        assert_ne!(at2, at, "a restamp");
+        assert_eq!(finished_rows(&rig.reg), vec![(r, x.to_string())]);
+        assert_eq!(rig.mark(x), (false, Some(r)));
+
+        assert_eq!(
+            rig.reg.note_pane_row(r, x, RekeySource::Rung2),
+            MoveOutcome::Unchanged
+        );
+        assert_eq!(finished_rows(&rig.reg).len(), 1, "no second Finished");
+
+        rig.ack(x, at2, r);
+        assert_eq!(rig.mark(x), (true, Some(r)));
+    }
+
+    /// D5 through the live-pane adoption: after a restart the registrar knows
+    /// nothing of X, while its durable mark reads synced by R′. Auto-bind
+    /// adopts the pane row R and re-offers the finish there.
+    #[test]
+    fn a_finish_acked_by_a_stale_row_is_re_offered_on_a_live_pane_adoption() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let rig = reoffer_rig();
+        let x = "reoffer-adopt-x";
+        open_on(&rig.store, x, "term-pane", None);
+        let out = rig.store.set_finished(x, true, None).unwrap();
+        let at = out.record.finished_at.unwrap();
+        let stale = Uuid::new_v4();
+        rig.store.mark_finish_synced_on(x, Some(at), Some(stale));
+        let r = Uuid::new_v4();
+        rig.show_pane(x, r, 1_000);
+
+        assert_eq!(
+            rig.reg.bind_transcript_session_on_live_pane(
+                x,
+                r,
+                NewSessionTenant::Undetermined,
+                ResumeParams::default()
+            ),
+            Ok(r)
+        );
+        assert_eq!(finished_rows(&rig.reg), vec![(r, x.to_string())]);
+        assert_eq!(rig.mark(x), (false, Some(r)));
+    }
+
+    /// A stale row's ACK that drains AFTER the move: the move's own re-offer
+    /// finds the finish still in flight and does nothing; the next
+    /// `AlreadyCurrent` tick re-offers it, exactly once over two ticks.
+    #[test]
+    fn a_stale_rows_ack_draining_after_the_move_is_re_offered_once() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let rig = reoffer_rig();
+        let x = "reoffer-late-ack-x";
+        open_on(&rig.store, x, "term-pane", None);
+        let stale = Uuid::new_v4();
+        rig.reg
+            .bind_transcript_session(x, Some(stale), None, ResumeParams::default())
+            .unwrap();
+        let at = rig
+            .store
+            .set_finished(x, true, None)
+            .unwrap()
+            .record
+            .finished_at
+            .unwrap();
+        let r = Uuid::new_v4();
+        rig.show_pane(x, r, 1_000);
+
+        assert_eq!(
+            rig.reg.note_pane_row(r, x, RekeySource::Rung2),
+            MoveOutcome::Moved { from: stale }
+        );
+        assert_eq!(rig.mark(x), (false, None), "still in flight to R′");
+        assert_eq!(
+            finished_rows(&rig.reg),
+            vec![(stale, x.to_string())],
+            "nothing re-offered while in flight"
+        );
+
+        rig.ack(x, at, stale);
+        for _ in 0..2 {
+            assert_eq!(
+                rig.reg.note_pane_row(r, x, RekeySource::Rung2),
+                MoveOutcome::Unchanged
+            );
+        }
+        assert_eq!(finished_rows(&rig.reg), vec![(r, x.to_string())]);
+        assert_eq!(rig.mark(x), (false, Some(r)));
+    }
+
+    /// The revival guard: a mark whose `finished_at` precedes X's ownership
+    /// of R is not re-offered — neither for an in-pane `/resume` (a
+    /// running-id source advances R's owner to X only now) nor for a pane
+    /// bound to R after the finish. The mark keeps its ACK.
+    #[test]
+    fn a_finish_that_precedes_the_ownership_of_the_pane_row_is_not_re_offered() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let rig = reoffer_rig();
+
+        // In-pane resume: R's pane runs another pin; the hook-grade source
+        // names X there only after X's finish.
+        let x1 = "revived-in-pane";
+        let (stale1, _) = rig.finished_on_stale(x1);
+        let r1 = Uuid::new_v4();
+        rig.show_pane("the-panes-own-pin", r1, 1_000);
+        assert_eq!(
+            rig.reg.note_pane_row(r1, x1, RekeySource::ProviderRegistry),
+            MoveOutcome::Moved { from: stale1 }
+        );
+        assert!(finished_rows(&rig.reg).is_empty());
+        assert_eq!(rig.mark(x1), (true, Some(stale1)));
+
+        // Resumed into a new pane, bound after the finish.
+        let x2 = "revived-into-a-new-pane";
+        let (stale2, at2) = rig.finished_on_stale(x2);
+        let r2 = Uuid::new_v4();
+        rig.show_pane(x2, r2, at2 + 60_000);
+        rig.reg.on_terminal_coord_bind(x2, "term-new", r2);
+        assert_eq!(rig.reg.session_id_for(x2), Some(r2));
+        assert!(finished_rows(&rig.reg).is_empty());
+        assert_eq!(rig.mark(x2), (true, Some(stale2)));
+
+        // An ownership instant the owner rule cannot state is never read as
+        // "before the finish".
+        assert_eq!(
+            rig.reg.reoffer_finish_to(x2, Uuid::new_v4()),
+            super::finish_reoffer::ReofferOutcome::OwnershipUnknown
+        );
+    }
+
+    /// An unmark racing the re-offer — landing after its decision, before its
+    /// door — leaves no `Finished` queued: the door re-reads the mark under
+    /// `finish_forward`. Only the unmark's own `working` is queued, and a
+    /// later tick queues nothing. An unmark-and-re-mark in the same window
+    /// leaves only the new mark's own forward.
+    #[test]
+    fn an_unmark_racing_the_re_offer_leaves_nothing_queued() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let rig = reoffer_rig();
+        let x = "reoffer-race-x";
+        let (stale, _) = rig.finished_on_stale(x);
+        let r = Uuid::new_v4();
+        rig.show_pane(x, r, 1_000);
+        let store = rig.store.clone();
+        race_after_decision(move || {
+            store.set_finished(x, false, None).unwrap();
+        });
+
+        assert_eq!(
+            rig.reg.note_pane_row(r, x, RekeySource::Rung2),
+            MoveOutcome::Moved { from: stale }
+        );
+        assert!(finished_rows(&rig.reg).is_empty());
+        let working = rows_of_kind(&rig.reg, SessionEventKind::Progress);
+        assert_eq!(working.len(), 1, "{working:?}");
+        assert_eq!(working[0].session_id, r);
+        assert_eq!(working[0].payload["session_status"], json!("working"));
+        assert_eq!(rig.store.get(x).unwrap().finished_at, None);
+        assert_eq!(rig.mark(x), (false, None));
+        assert_eq!(
+            rig.reg.note_pane_row(r, x, RekeySource::Rung2),
+            MoveOutcome::Unchanged
+        );
+        assert!(finished_rows(&rig.reg).is_empty());
+
+        // Unmark and re-mark between the decision and the door.
+        let rig = reoffer_rig();
+        let y = "reoffer-race-y";
+        let (stale, at) = rig.finished_on_stale(y);
+        let r = Uuid::new_v4();
+        rig.show_pane(y, r, 1_000);
+        // Belt and braces: the store already stamps a re-mark after an unmark
+        // past the cleared stamp (`restamp_at`). Waiting for the wall clock to
+        // pass `at` as well keeps this test about the re-offer race rather
+        // than about the store's stamping, which its own tests cover.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while chrono::Utc::now().timestamp_millis() <= at {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "wall clock did not pass the first mark's finished_at ({at}) within 5s"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let store = rig.store.clone();
+        race_after_decision(move || {
+            store.set_finished(y, false, None).unwrap();
+            store.set_finished(y, true, None).unwrap();
+        });
+        assert_eq!(
+            rig.reg.note_pane_row(r, y, RekeySource::Rung2),
+            MoveOutcome::Moved { from: stale }
+        );
+        let rows = rig.reg.inner.outbox.pending().unwrap();
+        let finishes: Vec<_> = rows
+            .iter()
+            .filter(|o| o.event_kind == SessionEventKind::Finished.as_str())
+            .collect();
+        assert_eq!(finishes.len(), 1, "only the new mark's own: {rows:?}");
+        assert_eq!(finishes[0].session_id, r);
+        assert_ne!(finishes[0].payload["finished_at"], json!(at));
+    }
+
+    /// The re-offer's dedupe: a `Finished` for this very mark already pending
+    /// to the pane row is not queued again; the stamp is withdrawn and R is
+    /// recorded, so R's ACK of the pending row stamps it.
+    #[test]
+    fn a_finish_already_pending_to_the_pane_row_is_not_queued_twice() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let rig = reoffer_rig();
+        let x = "reoffer-pending-x";
+        let (_stale, at) = rig.finished_on_stale(x);
+        let r = Uuid::new_v4();
+        rig.show_pane(x, r, 1_000);
+        rig.reg.enqueue_finished(x, r, Some(at), None);
+
+        assert_eq!(
+            rig.reg.reoffer_finish_to(x, r),
+            ReofferOutcome::AlreadyQueued
+        );
+        assert_eq!(finished_rows(&rig.reg), vec![(r, x.to_string())]);
+        assert_eq!(rig.mark(x), (false, Some(r)));
+        rig.ack(x, at, r);
+        assert_eq!(rig.mark(x), (true, Some(r)));
+    }
+
+    /// A failed outbox write: the stamp is withdrawn but R is NOT recorded,
+    /// so the next attempt re-offers once the outbox writes again.
+    #[test]
+    fn a_failed_outbox_write_leaves_the_re_offer_for_the_next_tick() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let rig = reoffer_rig();
+        let x = "reoffer-outbox-x";
+        let (stale, _) = rig.finished_on_stale(x);
+        let r = Uuid::new_v4();
+        rig.show_pane(x, r, 1_000);
+        // A directory where the outbox file belongs: every append fails.
+        let path = rig.dirs.0.path().join("outbox.jsonl");
+        let _ = std::fs::remove_file(&path);
+        std::fs::create_dir(&path).unwrap();
+
+        assert_eq!(rig.reg.reoffer_finish_to(x, r), ReofferOutcome::NotQueued);
+        assert_eq!(
+            rig.mark(x),
+            (false, Some(stale)),
+            "the stamp is withdrawn, the row not recorded"
+        );
+
+        std::fs::remove_dir(&path).unwrap();
+        assert_eq!(
+            rig.reg.reoffer_finish_to(x, r),
+            ReofferOutcome::Reoffered { from: stale }
+        );
+        assert_eq!(finished_rows(&rig.reg), vec![(r, x.to_string())]);
+        assert_eq!(rig.mark(x), (false, Some(r)));
+    }
+
+    /// Two re-offers of one mark that both pass their decision at once queue
+    /// exactly one `Finished`: the door is one `finish_forward` section, and
+    /// the loser re-reads the mark naming R.
+    #[test]
+    fn two_concurrent_re_offers_of_one_mark_queue_one_finish() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let rig = reoffer_rig();
+        let x = "reoffer-concurrent-x";
+        let (stale, _) = rig.finished_on_stale(x);
+        let r = Uuid::new_v4();
+        rig.show_pane(x, r, 1_000);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        let outcomes: Vec<ReofferOutcome> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let b = barrier.clone();
+                    let reg = &rig.reg;
+                    s.spawn(move || {
+                        // Both threads hold their decision until both have one.
+                        race_after_decision(move || {
+                            b.wait();
+                        });
+                        reg.reoffer_finish_to(x, r)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert!(
+            outcomes.contains(&ReofferOutcome::Reoffered { from: stale })
+                && outcomes.contains(&ReofferOutcome::AlreadyOnRow),
+            "{outcomes:?}"
+        );
+        assert_eq!(finished_rows(&rig.reg), vec![(r, x.to_string())]);
+        assert_eq!(rig.mark(x), (false, Some(r)));
     }
 }

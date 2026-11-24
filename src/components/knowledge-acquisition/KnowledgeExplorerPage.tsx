@@ -20,7 +20,7 @@ import {
   AlertCircle,
   FileSearch,
 } from "lucide-react";
-import { cn } from "@/lib/utils";
+import { cn, describeThrown } from "@/lib/utils";
 import {
   useKnowledgeSearch,
   useResearchError,
@@ -190,7 +190,7 @@ function SearchTab() {
         {error && (
           <div className="flex items-center gap-2 p-3 mb-4 bg-red-500/10 border border-red-500/20 rounded-lg text-red-400 text-sm">
             <AlertCircle className="w-4 h-4 flex-shrink-0" />
-            {(error as Error).message}
+            {describeThrown(error, "Knowledge search failed")}
           </div>
         )}
 

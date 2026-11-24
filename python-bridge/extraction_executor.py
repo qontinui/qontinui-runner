@@ -22,16 +22,18 @@ This separation enables concurrent execution because:
 3. Both can run simultaneously without contention
 """
 
+import os_trust  # noqa: F401  # side effect: outbound TLS trusts the OS store (os_trust.py)
+
+# isort: split
+
 import asyncio
 import json
 import logging
 import os
 import sys
-import tempfile
 import threading
 import time
 import traceback
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -44,18 +46,6 @@ logging.basicConfig(
 if "--disable-console-logging" in sys.argv:
     os.environ["QONTINUI_DISABLE_CONSOLE_LOGGING"] = "1"
     sys.argv.remove("--disable-console-logging")
-
-# IMMEDIATE debug logging to verify executor is being invoked
-debug_log_path = os.path.join(tempfile.gettempdir(), "extraction_executor_startup.log")
-try:
-    with open(debug_log_path, "a", encoding="utf-8") as f:
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-        f.write(f"[{timestamp}] EXTRACTION EXECUTOR STARTED - extraction_executor.py is running\n")
-        f.write(
-            f"[{timestamp}] Console logging disabled: {os.getenv('QONTINUI_DISABLE_CONSOLE_LOGGING') == '1'}\n"
-        )
-except Exception:
-    pass
 
 # CRITICAL: Send READY signal IMMEDIATELY to prevent timeout
 sys.stdout.write(

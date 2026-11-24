@@ -299,9 +299,9 @@ export function TaskRunLivePanel({ taskRunId, className, compact = false }: Task
                   Output ({(output.totalLength / 1024).toFixed(1)}KB)
                 </span>
                 <div className="flex items-center gap-2">
-                  {output.hasMore && (
+                  {output.page.nextCursor && (
                     <button
-                      onClick={() => fetchMoreOutput(output.offset + output.content.length)}
+                      onClick={() => fetchMoreOutput(output.page.nextCursor ?? "")}
                       className="text-xs text-primary hover:underline flex items-center gap-1"
                     >
                       <ArrowUp className="w-3 h-3" />

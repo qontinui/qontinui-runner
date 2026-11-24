@@ -1,7 +1,7 @@
 ---
-description: "Shepherd this session's PRs to landed — watch CI, fix red in-session, diagnose green-but-stuck PRs via coord's pr-merge events, hand a diagnosed coord defect to the operator (an agent does not merge — the recovery merge is denied to agents fleet-wide since PR #328), then write a remediation plan and run /vet-imp on it so coord itself gets fixed."
+description: "Shepherd this session's PRs to landed — watch CI, fix red in-session, diagnose green-but-stuck PRs via coord's pr-merge events, merge a diagnosed coord defect directly through the one notifying door (scripts/agent-direct-merge.sh; served policy git-operations direct-merge-with-notification, operator decision 2026-10-16), then write a remediation plan and run /vet-imp on it so coord itself gets fixed."
 argument-hint: "[repo#123 ...] [--threshold=45m] [--no-merge] [--no-remediate] [--once]"
-allowed-tools: Read, Write, Edit, Bash, PowerShell, Grep, Glob, Monitor, Skill, ToolSearch, TaskCreate, TaskUpdate
+allowed-tools: Read, Write, Edit, Bash, PowerShell, Grep, Glob, Monitor, Skill, ToolSearch, TaskCreate, TaskUpdate, Agent
 ---
 
 # Babysit PRs — shepherd session PRs to landed
@@ -15,18 +15,26 @@ keeps CLAUDE.md's "coord is the sole merge authority" rule intact: coord is
 bypassed only when coord is provably the thing that's broken, and the bypass is
 always paid for with a fix.
 
-⚠️ **Since 2026-08-21 (PR #328) the bypass is not YOURS to perform.** The
-shared `.claude/settings.json` denies `Bash(gh pr merge)` / `Bash(gh pr
-merge:*)` fleet-wide. `git-guard.sh` additionally blocks the `gh api`
-REST and GraphQL spellings of the same act (#353) — briefly unwired
-fleet-wide (qontinui-claude-config PR #567) along with its unrelated
-destructive git/rm/cargo arms (those stay removed, at the repo owner's
-explicit request), then re-wired the same day narrowed to ONLY this
-merge-route check. So for an agent this command's terminal state
-on a diagnosed defect is **hand-off, not merge**: post the audit comment, hand
-the PR to the operator with a gate or an escalation, and go write the
-remediation plan. Every "admin-merge" below describes the operator's step, not
-yours — Step 6 states this in full. Do not read any of it as latitude.
+⚠️ **Since 2026-10-16 the bypass IS yours to perform, through ONE door.**
+Served policy `git-operations` `direct-merge-with-notification` (operator
+decision 2026-10-16) made a direct merge take-and-notify: on a diagnosed coord
+defect, the agent merges, and
+`<workspace-root>/qontinui-claude-config/scripts/agent-direct-merge.sh` posts
+the operator notification (`force_merge`) after the merge. The raw spellings
+stay denied: the shared `.claude/settings.json` denies `Bash(gh pr merge)` /
+`Bash(gh pr merge:*)` (PR #328), and `git-guard.sh` blocks the `gh api` REST and
+GraphQL merge routes (#353), because each would skip the notification. From
+2026-08-21 until 2026-10-16 this step ended in an operator hand-off; Step 6
+states what replaced it.
+
+⚠️ **Since 2026-10-24 the expedited door comes before that merge, wherever it
+serves the PR.** Served policy `git-operations` `expedited-land-request`
+(operator-approved 2026-10-24, finding `df77afe8`) lets an agent ASK coord to
+land a red-main remedy, and coord's door accepts the request only from the PR's
+authoring session. Coord re-derives every condition and lands
+the PR itself. Where that door served the PR, it comes before Step 6's direct
+merge, under the recovery condition the clause names. Otherwise, Step 6 is
+unchanged. Step 5a carries the procedure.
 
 ## Arguments
 
@@ -37,16 +45,12 @@ yours — Step 6 states this in full. Do not read any of it as latitude.
     the diagnosis ladder fires. Default `45m`. Accepts `30m`, `2h`.
   - `--no-merge` — never admin-merge; diagnose, remediate the cause, and
     report only. Use when you want the investigation without the recovery.
-    **Its meaning shifted with PR #328, it did not go inert.** The deny already
-    makes the merge unreachable to you, so the flag no longer gates *your*
-    merge — nothing does, because you have none. What it still gates is the
-    **hand-off REQUEST**: with `--no-merge` you diagnose, remediate and report,
-    and you do **not** ask the operator to merge. Suppressing that request is
-    what the flag now buys. It re-arms against an agent's own merge the moment
-    the deny is lifted, so do **not** read its absence as permission — the same
-    reading `--max-recovery-merges` gets in `/merge-train-steward`. The audit
-    comment is owed either way; under `--no-merge` write it as a diagnosis-only
-    record.
+    Since 2026-10-16 it gates YOUR merge again: without it, a diagnosed coord
+    defect is merged through `scripts/agent-direct-merge.sh` (Step 6); with it,
+    you diagnose, remediate and report, and neither merge nor ask the operator
+    to. (From PR #328 on 2026-08-21 until 2026-10-16 agents had no merge, so the
+    flag only suppressed the hand-off request.) The audit comment is owed
+    either way; under `--no-merge` write it as a diagnosis-only record.
   - `--no-remediate` — skip the remediation-plan + `/vet-imp` step (recovery
     only). The defect evidence is still written to the PR comment.
   - `--once` — single pass (no watch loop): assess, act, report, exit.
@@ -63,7 +67,28 @@ gh pr list --repo <owner/repo> --state open --head "$BRANCH" --json number,title
 Include PRs the session opened via stacked worktrees. Build a table:
 `repo | PR | branch | head_sha | labels | deps` — record `coord:stacked-on=` /
 `coord:upstream-of=` labels as dependency edges (parents land before children).
-Skip drafts. If zero PRs found and none given, report and exit.
+Skip drafts, **and skip PRs coord reports held**: read each PR's card with
+`coord_pr_status {repo, number}` and apply the hold-read rule. A `hold` object
+(`{held_by, reason, kind, since}`, placed with `coord_set_pr_hold`) is held;
+`hold: null` is not held. A card with `hold_unknown: true`, or no card at all, is
+UNKNOWN. A card with NO `hold` key depends on whether COORD serves the hold —
+check ONCE whether coord's own `tools/list` offers `coord_set_pr_hold`, read
+through a door that does not filter it. Your session's visible tool list does
+not answer this: a runner proxy filters it through its own allowlist, so a tool
+absent there may still be served. Ask that proxy what it withheld:
+`GET <proxy base>/coord-mcp/tool-policy` — `coordMcpDrift.driftedTools` names
+the tools coord granted and the proxy filtered (trust it only when its
+`observedAt` is after you started the check, i.e. before your own
+`tools/list`), and `deliberateExclusions` /
+`deliberateExclusionPrefixes` name the ones it filters on purpose, which leave
+the answer unknown. If coord's list is read and lacks it, no PR can be
+coord-held, so the missing key means not held and a draft is the hold signal;
+if coord serves it (whether or not your door passes it), or you cannot tell,
+the missing key is UNKNOWN. Treat every UNKNOWN as held, never as releasable, and
+say so in the table. Once the GitHub Free downgrade is in effect a draft no longer
+exists on a private repo, so `isDraft` alone misses every hold there. A
+held PR is not stuck: do not "recover" it, and never release a hold you did not
+place. If zero PRs found and none given, report and exit.
 
 **Then declare the hand-off of each PR's worktree** once its branch is pushed,
 so a session that waits days on the train stops holding a worktree slot. Run
@@ -104,6 +129,53 @@ about below. Background and the three transcripts:
 design, so a multi-PR fan-out still goes through the Monitor tool — one
 `watch-until.sh --pr` per PR, or the hand-rolled loop below if you genuinely
 need one table across PRs. Whichever you use, the traps below still apply.
+
+**Closeout exit — when the authoring session runs this on its own PRs** (see
+the scope rule under "Rules"). Closeout mode does **not** loop and does not
+wait: read each PR's head — the head this session last pushed — once. Two
+shapes keep the session here, because each is something it can do right now: a
+check on that head that has already concluded red for a code error in this
+session's diff (send it to Step 3), and a textual conflict — `coord_pr_status`
+reads `rebase_block_disposition: author_acts` — which coord will not propose, so
+rebase and push once [policy: a-textual-conflict-is-owed-not-watched]. Every
+other head shape exits now (operator decision 2026-10-17, tightening [policy:
+pr-session-finished-when-prs-initially-green]: checks still running on the last
+push no longer hold the session open):
+
+- Checks still `pending` — `pr-checks.sh` reports `queued` and `in_progress`
+  alike as `pending`, and `pending=` also counts a workflow run that has not
+  created its jobs yet (or sits between a `needs:` job and its dependents), so
+  `pending=1` beside all-settled rows is a workflow still to start, not a
+  settled head; `pr-checks.sh runs <owner/repo> <n>` names it. Coord observes
+  their results by webhook and pushes a later red to the author: its
+  `ci_rework` prompt to a live author, its `pr_fix` fixer lane for a dead one.
+  Waiting for them is not owed work.
+- `first_fully_green_at` was stamped at least once on that head. A later red
+  flip, or a red that appeared because `main` moved, does not un-green it for
+  this test. The stamp's reset rule below serves Step 4's clock, not this exit.
+- Red only for a cause that is not a code error: refused before it ran,
+  starved or abandoned in a queue, or a real failure that a control on pristine
+  `main` proves pre-existing [policy:
+  a-red-check-is-not-automatically-a-code-error]. Record which class applies.
+- `no-ci`, all-skipped, all-cancelled, BEHIND or UNSTABLE because `main`
+  moved, or queued for land. These are coord's to carry rather than this session's to
+  wait on.
+
+For each exiting PR that has no live gate yet, register a `pr_merged` gate
+through `/gate` and READ IT BACK [policy: gate-read-back]. A gate that is not
+read back leaves the unit DROPPED under `/unattended`'s rules, not WATCHED. A
+`pr_merged` gate on a PR that no longer carries the commit does not watch it:
+see `/unattended`'s `pr_merged` hazards. Report the PR as
+`handed-to-train (gate <id>)`, naming its check state (`green`, `pending`, or
+the non-code red class). That is the state `/unattended` calls WATCHED and the
+session-protocol footer calls `in-train`, and the session owes nothing further
+on it [policy: finish-to-zero-means-zero-OWED-BY-THIS-SESSION].
+
+In closeout mode the time tick, Step 4's diagnosis and `--threshold` do not
+apply: nothing is waited on, so nothing ages. `--once` behaves the same.
+
+A dedicated shepherding session ignores this exit and keeps watching to
+`MERGED` / `CLOSED`.
 
 Use the Monitor tool (persistent) with a poll script that emits one line per
 state transition per PR: each check flip (`pass`/`fail`), `MERGED`, `CLOSED`.
@@ -201,7 +273,7 @@ an admin-merge precondition. ⚠️ **Read that requirement as "≥ 1 non-skippe
 that PASSED", not "≥ 1 non-skipped check EXISTS"** — the shorter form is satisfied
 by a single check that is still `pending`, which is not green either. The
 definition above is the binding one; this sentence is its summary, not a weaker
-alternative. **Measured** 2026-08-24 across `qontinui-dev-notes`:
+alternative. **Measured** 2026-08-24 across the fleet's plans repo:
 **4 of 9** stuck PRs had zero CI runs, so the head shape this predicate misreads
 is common. The misread itself is **derived from the predicate's wording, not
 observed** — do not cite the 4-of-9 figure as evidence that a session actually
@@ -220,7 +292,7 @@ would bar that PR from Step 6 **forever**. The **never-fired** class is the
 defect one: zero checks **plus** `input_freshness.ci_check_row_count: 0` **plus**
 `actions/runs?head_sha=<FULL 40-char sha>` → `total_count: 0`. The
 **no-baseline** class is coord's `required-checks-missing` question,
-not this one, and `merge-train-steward.md` handles it under `no-baseline:<workflow>`.
+not this one, and `/merge-train-steward` (where your deployment provides it) handles it under `no-baseline:<workflow>`.
 
 ⚠️ **The third cause is the ALL-SKIPPED head, and the 3-part signature above does
 NOT sort it** — this is one warning with three arms, not a two-arm rule with a
@@ -255,12 +327,26 @@ When a check fails on a PR this session authored, fix it here (do not spawn).
 **Classify from the failed job's STEPS before you read anything else** — the
 first bullet below is that test, and the log is the second one, not the first.
 Only once the classification says “real” do you read the failing run log
-(`gh run view <id> --log-failed`), and then only for what it sends you to fix:
+(**coord first** — `coord_ci_job_log_tail {repo, job_id}`;
+`gh api repos/<owner>/<repo>/actions/jobs/<job_id>/logs` is the labelled fallback,
+see "Coord doors for job and log reads" below — **never** `gh run view --log-failed`,
+which on some gh builds prints nothing, exit 0, for a job that failed), and then
+only for what it sends you to fix:
 
 - **Transient infra** (rate-limit fetching a tool version, runner eviction,
   network, a self-hosted runner losing its GitHub session mid-job):
   `gh run rerun <id> --failed`. At most 2 reruns per head before treating as
   real.
+
+  ⚠️ **`--failed`, never `--job`.** A run's check rows are its LATEST attempt's,
+  so re-running one job of a run that also carries a required check can delete
+  that check's green row: measured once, on `qontinui-coord#3551`, and it held
+  the PR about 4 h. A `--failed` re-run also makes a new attempt; no case of one
+  deleting a green row is recorded, which is not proof it cannot. An orphaned
+  advisory job beside a green required one is left alone, or handled by a fresh
+  head. Read the run's job list before any re-run. Diagnosis and recovery:
+  `/merge-train-steward` (where your deployment provides it), its *A required
+  check VANISHED* row.
 
   ⚠️ **Identify this class from the job's STEPS — `cancelled` is the minority
   shape.** Most infra kills on this fleet arrive as `conclusion: failure`, which
@@ -274,9 +360,56 @@ Only once the classification says “real” do you read the failing run log
   means no `failure`/`cancelled` job on this run, so go back and re-read the
   run's own conclusion before concluding anything.
 
+  **Coord first:** `coord_ci_run_jobs {repo, run_id, include_steps: true}` returns
+  the same jobs without spending the shared user token (free from coord's
+  observations when it has the run; otherwise one paced App read). Select the jobs
+  whose `conclusion` is `failure` or `cancelled`; `steps[]` is present only with
+  `include_steps: true`, and `steps_error` set means steps are ABSENT (UNKNOWN,
+  not "no failed step"; `failed_step_count` still holds). A typed error
+  (`github_app_budget_refused`, `github_app_unavailable`, `github_not_found`, …) or
+  a tool that answers METHOD_NOT_ALLOWED / not found is "coord could not answer",
+  not "no jobs" — use the fallback and say so.
+
   ```bash
+  # FALLBACK (spends the shared user token) — only when coord_ci_run_jobs could not answer.
   gh api "repos/OWNER/REPO/actions/runs/<run_id>/jobs?per_page=100" --jq '.jobs[] | select(.conclusion == "failure" or .conclusion == "cancelled") | {name, conclusion, steps: [(.steps // [])[] | {name, conclusion}]}'
   ```
+
+  **Coord doors for job and log reads.** Plan `2026-11-05-agent-github-reads-go-through-coord-not-the-shared-user-token`
+  Phase 1e. Two read tools replace the REST reads above:
+  `coord_ci_run_jobs` (jobs of a run id) and `coord_ci_job_log_tail` (a BOUNDED
+  tail of one job's log: ≤200 lines and ≤64 KiB, anchored on the last `##[error]`
+  line). Find the job id from `coord_ci_run_jobs` or `coord_pr_status`
+  `.checks[].check_id`.
+
+  - **Partial reads are partial.** `log_complete: false` / `fetch.read_capped`
+    means the log was NOT read to its end and `total_lines`/`total_bytes` are
+    null; `truncated` / `line_cut` mean the window was cut. Treat the tail as a
+    partial view: a missing `FAILED` line is not evidence of its absence, and
+    an empty/404 log keeps its existing meaning below (steps are the evidence).
+  - **Steps gate the tier table.** Tier 1/2 below apply only when
+    `include_steps: true` was passed AND `steps_error` is unset. Otherwise the
+    steps are UNKNOWN: an absent or empty `steps` is NOT the Tier 2 “steps is
+    empty” signal. Re-read via the fallback before classifying. `failed_step_count`
+    alone never substitutes for the step scan.
+  - **Log-dependent rows.** The Tier T remedy (“a test the log names
+    `... FAILED`”) and Tier 3 (string grep) read a bounded tail; a miss there is
+    not a miss in the log. Do not take it for “my diff touches no named test”.
+  - **Argument types.** `run_id` and `job_id` are integers, not strings, e.g.
+    `coord_ci_run_jobs {"repo":"owner/name","run_id":123,"include_steps":true}`;
+    pass a `check_id` from `coord_pr_status` as an integer. `job_id` comes from
+    the jobs read. The coord list states no page cap: if the job count looks short
+    of the workflow's matrix, treat it as possibly truncated and use the fallback.
+  - **Reachability.** Through a runner whose proxy allowlist predates these
+    tools both answer METHOD_NOT_ALLOWED (`cause=drift`; qontinui-runner#2666).
+    That is "the proxy could not carry it", not "coord has no answer": call
+    coord's direct `/mcp` door with a device JWT, or fall back.
+  - **Label the fallback.** Whenever you use `gh run view` / `gh api …/jobs` /
+    `…/logs`, write one line in your status naming it as the fallback and why
+    (`<the coord tool that failed>: <error or METHOD_NOT_ALLOWED>`), so the shared-token
+    spend stays attributable.
+  - `gh pr list --head` is **not** switched here: its coord field (Phase 2d,
+    qontinui-coord#3823) is not yet served.
 
   ⚠️ **`(.steps // [])` is load-bearing, and CI guards the bracket
   spelling of it and nothing else.**
@@ -299,7 +432,7 @@ Only once the classification says “real” do you read the failing run log
   |---|---|---|---|
   | **1 (primary)** | `conclusion == "failure"` ∧ `steps` non-empty ∧ **NO step has `conclusion == "failure"`** | infrastructure kill | **re-run it** |
   | **2** | `conclusion == "failure"` ∧ `steps` is **empty** | infra-unknown | re-run it |
-  | **T (declared step timeout)** | `conclusion == "failure"` ∧ the job's check-run annotations carry a title containing `TIMED OUT (not a verdict on this PR)` — read with `gh api "repos/OWNER/REPO/check-runs/<job_id>/annotations" --jq '.[].title'` (an Actions job id IS its check-run id) | step killed at its `timeout-minutes` bound: the suite did **not** complete, the run is **inconclusive** | **re-run it** (counts against the 2 reruns); fix in-session only if your diff touches the file of a test the log names `... FAILED` |
+  | **T (declared step timeout)** | `conclusion == "failure"` ∧ the job's check-run annotations carry a title containing `TIMED OUT` **and** `(not a verdict on this PR)` — read with `gh api "repos/OWNER/REPO/check-runs/<job_id>/annotations" --jq '.[] \| (.title // "") \| select(test("TIMED OUT.*[(]not a verdict on this PR[)]"))'` (an Actions job id IS its check-run id; match both words, not the one contiguous string — a build-phase kill was titled `TIMED OUT IN THE BUILD (not a verdict on this PR)` before coord unified its titles under the one marker, and older runs still carry it) | step killed at its `timeout-minutes` bound: the suite did **not** complete (a build-phase kill ran **no test at all**), the run is **inconclusive** | **re-run it** (counts against the 2 reruns); fix in-session only if your diff touches the file of a test the log names `... FAILED` |
   | **3 (confirmatory only)** | log contains `The runner has received a shutdown signal` or `lost communication with the server` | corroborates Tier 1/2 | **never sufficient alone** |
   | **none — deliberately untiered** | `conclusion == "cancelled"` (the jq above selects it, so it *will* appear in this output) | **no verdict reached** — the tiers are all keyed on `conclusion == "failure"`, and a cancel must not fall through them into "otherwise → genuine" | **Scope-dependent — read the note below before acting.** On a **PR head**: do not count it as a red. On a **main baseline**: the infra-cancelled class — apply the *matching* row of the steward's red-main remedies table (two remedies, each conditioned) |
 
@@ -349,7 +482,7 @@ Only once the classification says “real” do you read the failing run log
   tip. Row 1 is also **not reached by reading the run `conclusion`**. The condition
   travels with the citation, so cite the table rather than copying a remedy out of it.
 
-  Both halves live in `.claude/commands/merge-train-steward.md`: the PR-head half
+  Both halves live in `/merge-train-steward`, where your deployment provides it: the PR-head half
   is the **"`cancel` bucket misread as a failure"** row; the main-baseline half is
   **row 1 of the red-main remedies table** (`RED(cancelled)`) and the verdict
   vocabulary beside it.
@@ -363,9 +496,13 @@ Only once the classification says “real” do you read the failing run log
   costs a full download per job; the GitHub-hosted OOM emits the **identical**
   string; and it is **blind to one of the two death shapes outright** — when the
   runner vanishes before flushing, `GET /actions/jobs/<id>/logs` **404s** and the
-  frozen step is visible ONLY in the `steps` array. So `--log-failed` returning
-  nothing useful is not evidence of a real failure; it is the signature of the
-  shape you cannot see that way.
+  frozen step is visible ONLY in the `steps` array. So an empty log read
+  decides nothing in either direction. A 404 from the jobs endpoint is the
+  vanished-runner shape (infra), and on some gh builds `gh run view --log-failed`
+  prints nothing, exit 0, for every failed job it reads (gh 2.46.0, 2026-11-15:
+  empty for all 9 failed Frontend CI runs read, while the jobs endpoint above
+  served each failed Unit-test job's log it was asked for — finding `7f3d5ae8`). The `steps` array
+  decides; read the log through the jobs endpoint.
 
   **ANY failed step means a genuine failure of that step** — Tier 1 requires
   ZERO, so the count that separates the two causes is zero-vs-nonzero. **The
@@ -384,13 +521,16 @@ Only once the classification says “real” do you read the failing run log
   attempt.
 
   If the re-run comes back with a genuinely **failed step**, the Tier-1/2
-  classification was wrong: stop re-running and treat it as real. But a repeat
+  classification was wrong: stop re-running and treat it as real. (Classify the
+  re-run with the same table first: a Tier-T job ALWAYS has one failed step, so
+  a repeat Tier-T annotation is still inconclusive and spends the 2-rerun bound —
+  it is not the genuine failure this sentence means.) But a repeat
   **zero-failed-step** death is *still* infra — `qontinui-coord` run
   `32336379112` died the same way on attempt 2 (2026-08-20, both jobs on
   `msi-wsl`), so a re-run is not a guaranteed escape while the host is in that
   state. It just spends the second of your 2 permitted reruns, after which
   report the PR as **blocked-on-infra**, not as a code failure. Full derivation,
-  counts and validation live in `.claude/commands/merge-train-steward.md` →
+  counts and validation live in `/merge-train-steward` (where your deployment provides it) →
   “The `failure`-side discriminator is STEP-LEVEL”.
 - **Real failure**: fix in the PR's worktree, commit, push. Bounded to ~3
   fix rounds per PR (per `feedback_autonomous_commit_ship`); if still red,
@@ -414,6 +554,41 @@ Only once the classification says “real” do you read the failing run log
   migration-bearing PRs check `alembic heads` against PR ∪ main; a conflict
   here is a REAL failure to fix now (re-parent onto the new chain tip),
   because coord's speculative CI will hit it even though the PR looks green.
+
+**Claim the PR before the first commit of every fix round** — the
+`Transient infra` re-run above changes no head and needs no claim; a `Real
+failure` fix and a stale-green re-parent do. Authorship does not keep coord's
+own fixers off a head: coord's `pr_fix` dispatch, a Merge
+Shepherd on another machine and a peer running this command all read one
+exclusion, the reserved claim `coord_adopt_pr` writes (plan
+`2026-11-18-merge-shepherd-subagents-and-cross-machine-anti-overlap` D3.3). So,
+once Step 3 has decided to change the PR and before you commit:
+
+```
+coord_adopt_pr {repo: "<owner/repo>", pr_number: <N>, head_sha: "<current head, full sha>", action: "claim"}
+```
+
+- **`claimed`** — you hold the head. Fix, commit, push, then release:
+  `{..., head_sha: "<the head you claimed>", action: "release", pushed_head: "<the FULL 40-character sha you pushed>"}`.
+  With `pushed_head`, coord holds your pushed head with an observe marker while
+  its CI runs, so no other worker picks up a head whose fix is already in CI. An
+  abbreviated sha is refused, so read it with `git rev-parse HEAD`. If the
+  release is refused because `pushed_head` is an unknown argument (a coord that
+  predates it), release again without it.
+- **`held_by`** — another worker holds this head (a coord fixer agent, or a
+  session at `session:<uuid>`, which `coord_send_message` reaches). Do not push
+  to the branch. Wait and claim again in a later round. `held_by` at tier 14 is
+  someone's pushed head whose CI is still running.
+- **`head_not_current`** — re-read the head and claim once more.
+- **`capped`** — the PR's shared attempt budget is spent. Stop fixing it and
+  report it as `blocked-legitimate` with the answer quoted.
+- **`not_visible`**, an error, or no answer at all — if every door fails to
+  carry the call (`coord-revive.sh call coord_adopt_pr '<json>'` is the
+  fallback) — UNKNOWN.
+  Make no commit to the PR this round; say so in the exit report.
+
+Release every claim you still hold before you exit, whatever the outcome
+(`action: "release"`, no `pushed_head` when nothing was pushed).
 
 ## Step 4 — Green-or-no-CI past threshold → diagnose via coord
 
@@ -508,9 +683,14 @@ the gap either — `mergeable: MERGEABLE` reports the absence of a textual
 conflict, never the satisfaction of a required-check ruleset. Treat "required
 context missing/never reported" as its own stuck class here, distinct from
 both **red CI** (Step 3) and **green but stuck for some other reason** (queue,
-stacked dependency, coord itself wedged — the rest of 4d's table): it is 4d's
-`required-checks-missing` row, and it is a **Legitimate hold**, never a lesser
-severity than a visible red — a PR can carry zero failing checks and still be
+stacked dependency, coord itself wedged — the rest of 4d's table). The block
+code alone does not settle the row. `required-checks-missing` is that row of 4d,
+a **Legitimate hold**. `merge-state-unsettled` is Transient while young; past the
+dwell it is the phantom arm of 4d's **Coord defect** row, except that a context
+whose workflow died at `startup_failure` or never triggered on this head is a
+**Legitimate hold**, by the two causes named below. Any other code, such as
+`ci-pending`, is not settled by this split. Whatever the code, it is never a
+lesser severity than a visible red — a PR can carry zero failing checks and still be
 unmergeable. Where coord's PR-status surface (`coord_pr_status` / `/pr-status`)
 is available, a `blockers` entry naming an unestablished required-check state
 is the actionable signal here (a companion coord change is adding this
@@ -518,9 +698,23 @@ wording); treat it with the same urgency as a red check, not lower, since
 `gh pr checks` alone will never surface it. Once the missing context is
 identified, `startup_failure` (the workflow started and died) and "never
 triggered" (the trigger/path filter excludes this branch) are different,
-actionable causes — re-run the workflow for the former, fix the
-trigger/path filter for the latter — name which one you found rather than
-treating them as interchangeable.
+actionable causes — name which one you found rather than treating them as
+interchangeable. Fix the trigger/path filter for the latter. For the former,
+**do not re-run, `--failed` included**: the default is to move the head. The one
+exception is a single full re-run (`gh run rerun <id> -R <repo>`, outside Step
+3's 2-rerun bound) of a PR-head run whose latest attempt is `startup_failure`
+with zero jobs, after an earlier attempt of that same run dispatched jobs that
+ran steps. Read each attempt's jobs
+(`GET repos/<r>/actions/runs/<id>/attempts/<n>/jobs`) to test that. Every other
+shape stays un-re-run: the re-run is one-way on an undispatched run, and whether
+`startup_failure` behaves the same is deliberately unmeasured
+(`/merge-train-steward`, where your deployment provides it: the NEVER DISPATCHED
+section and the *A required check VANISHED* and *Runs EXIST but none of them can
+ever conclude* rows). Move the head only on a branch this session owns, otherwise
+hand back to the author; run the carries-the-push check under **Real failure**
+first, and Step 4a.5 if the push is a rebase. If the new head also ends in
+`startup_failure`, treat the cause as not per-run: stop pushing, read the workflow file
+and the run's annotations, and report the PR `blocked-legitimate`.
 
 **4a. GitHub-side sanity** — `gh pr view --json isDraft,mergeable,mergeStateStatus,labels`:
 draft, DIRTY (textual conflict → rebase it yourself), or a `coord:blocked` /
@@ -550,10 +744,10 @@ reading it as clean.
 exactly one replica must report `is_leader: true`. No leader = coord outage →
 skip to Step 6 with class `coord-down`. **This is no longer a "CLAUDE.md
 hand-merge exception"** — that phrasing cited text CLAUDE.md no longer carries.
-CLAUDE.md's `merge-authority` bullet now says the #328 deny blocks this very
-recovery and that "**that path now ends in an operator hand-off**". A
-`coord-down` PR still enters Step 6; what it reaches there is the hand-off, not
-a merge you perform.
+A `coord-down` PR enters Step 6, where the merge is yours through
+`scripts/agent-direct-merge.sh`. Its notification is coord-carried, so with coord
+fully down the merge can exit 5 (merged, not notified) when the HTTP twin is
+down too. Post the notification by hand once coord answers.
 
 **4c. Coord's verdict** — mint a headless operator token and read the event
 stream (never echo the token):
@@ -593,14 +787,49 @@ PR's CURRENT head (mismatch = stale ingest). Also useful:
 and `GET /merge/queue` (an in-flight proposal means coord is actively landing
 it — WAIT, do not race it).
 
-**4d. Classify** the `block_reason_code`:
+**4d. Classify** the `block_reason_code`. `<session-workdir>` is the coord-revive skill directory's root: the session
+workdir the runner provisioned the skill into, else — for a hand-started session
+whose cwd carries no copy, as most agent worktrees do not — a checked-out copy
+of your deployment's agent config. Substitute it; an unsubstituted
+`<session-workdir>` produces `No such file or directory`, which is a paste
+error, not a missing door.
 
 | Class | Codes / signals | Action |
 |---|---|---|
 | **Transient — wait** | `ci-pending` (**only once you have PROVEN CI actually fired — see the note under this table**), `below-green-dwell`, `merge-state-unsettled` (young), in-flight proposal in `/merge/queue` | Nothing. Reset no clocks; check again next poll. |
-| **Legitimate hold — fix the cause, NEVER bypass** | `ci-not-green`, `main-red`, `main-status-unknown`, `not-open`, `required-checks-missing`, `behind-main-or-unstable` (DIRTY), `auto-merge-disabled`, `dry-run-mode`, `escalate-path-matched`, `has-cross-repo-dependency` via `stacked-on` with parent still open | Fix in-session (rebase, fix CI). For `escalate-path-matched`, read what coord is actually waiting on and fix THAT — see the note under this table; never route around it (no recovery merge, no override you arrange yourself). ⚠️ For `ci-not-green` **and `main-red` alike, run Step 3's step-level classifier on the failed job FIRST**: a Tier-1/2 kill is not a cause to fix, it is a re-run — of main's own run in the `main-red` case — and it will **never** self-heal on its own. A `main-red` hold is a legitimate hold either way, but the remedy is not the same one. |
-| **Coord defect — recover + remediate** | `has-cross-repo-dependency` where the labeled PR is the UPSTREAM of the edge (`coord:upstream-of=` deadlock — engine parent-resolution inverted); `unlandable_cycle` spinning (cycles > ~5) with all members green; `merge-state-unsettled` dwell > 2× threshold on a fully-green head (phantom required-context wedge, coord#638); latest hydration `head_sha` ≠ current head for > 1h (stale ingest); predicate `result: pass` with no landing and no queue entry for > 1h; `has-blocking-label` on a live PR (retired code — should be extinct) | Step 5 → 6. |
-| **Coord down** | no leader across 4–8 health samples, **and** `bash <workspace-root>/qontinui-claude-config/.claude/skills/coord-revive/coord-revive.sh --floor-claim` printed a `FLOOR-CLAIM:` block reading `verdict=FLOOR` — paste it into the report. `verdict=UNKNOWN` (exit 5: sampled under this box's own load) is NOT this class; wait for the builds to finish and sample again | Step 6 directly — which for an agent ends in the operator hand-off, not a merge (#328). |
+| **Legitimate hold — fix the cause, NEVER bypass** | `ci-not-green`, `main-red` (except on the red-main fix PR itself, labelled `coord:red-main-fix`: it is the one PR that cannot pass a red main, so ask coord's expedited door for it first (Step 5a). Where the door did not serve it, in parallel with the door and unchanged, `scripts/agent-direct-merge.sh` may merge it as before, under `direct-merge-with-notification`. Where it did serve it, the script may merge it only under Step 5a's recovery condition), `main-status-unknown`, `not-open`, `required-checks-missing`, `behind-main-or-unstable` (DIRTY), `auto-merge-disabled`, `dry-run-mode`, `escalate-path-matched`, `has-cross-repo-dependency` via `stacked-on` with parent still open, `has-cross-repo-dependency` whose detail reads `waits-on:<repo>#<n> (declared upstream via that PR's coord:upstream-of label; …)`, `dependency-upstream-closed` (both: see the `waits-on:` note under this table) | Fix in-session (rebase, fix CI). For `escalate-path-matched`, read what coord is actually waiting on and fix THAT — see the note under this table; never route around it (no recovery merge, no override you arrange yourself). ⚠️ For `ci-not-green` **and `main-red` alike, run Step 3's step-level classifier on the failed job FIRST**: a Tier-1/2/T kill is not a cause to fix, it is a re-run — of main's own run in the `main-red` case — and it will **never** self-heal on its own. A `main-red` hold is a legitimate hold either way, but the remedy is not the same one. |
+| **Coord defect — recover + remediate** | `unlandable_cycle` spinning (cycles > ~5) with all members green (unless its code is `has-cross-repo-dependency` or `dependency-upstream-closed` -- a stale or retracted dependency row: clear it at its source with Step 5 lever 2, because Step 6's door refuses both codes); `merge-state-unsettled` dwell > 2× threshold on a fully-green head (phantom required-context wedge, coord#638 — **unless the missing required context's workflow DID run on this head and that run's latest attempt is a 0-job `startup_failure`, or the workflow never triggered on this head because its own `on:` filter excludes it: that is no coord defect but a Legitimate hold, so follow the matching arm of Step 4's preamble**); latest hydration `head_sha` ≠ current head for > 1h (stale ingest); predicate `result: pass` with no landing and no queue entry for > 1h; `has-blocking-label` on a live PR (retired code — should be extinct) | Step 5 → 6. |
+| **Coord down** | no leader across 4–8 health samples, **and** `bash <session-workdir>/.claude/skills/coord-revive/coord-revive.sh --floor-claim` printed a `FLOOR-CLAIM:` block reading `verdict=FLOOR` — paste it into the report. `verdict=UNKNOWN` (exit 5: sampled under this box's own load) is NOT this class; wait for the builds to finish and sample again | Step 6 directly — the merge through `scripts/agent-direct-merge.sh`; expect exit 5 (merged, notify later) while coord is down. |
+
+**A `waits-on:` from an upstream's `coord:upstream-of=` label is a hold,
+never a coord defect.** The label on `<repo>#<n>` orders this PR after it.
+The labeled upstream never shows a code for its own `upstream-of` label,
+which is Neutral. Read this PR's `coord_pr_status` → `dep_edges` entry for
+the upstream (`kind: "upstream_of"`, `self_waits: true`):
+
+- **Upstream open:** shepherd `<repo>#<n>`. This PR lands after it.
+- **Upstream closed without landing** (`parent_state: closed`,
+  `satisfied` not `true`; the code and the detail do not change): coord keeps it
+  as a parent on purpose, fail-closed. `dependency-upstream-closed` reports
+  the same state for a closed `stacked-on`/`downstream-of` parent. Re-anchor
+  the label onto the successor PR or, when the dependency is obsolete, drop
+  it. Either way, remove it from `<repo>#<n>` with Step 5 lever 2's
+  mechanics: setting it on the successor alone leaves this PR stranded. For
+  `dependency-upstream-closed` the label sits on this PR instead. Removing
+  it on GitHub, plus any `Coord-Downstream-Of:` / `Coord-Stacked-On:` body
+  line, is enough for a `downstream-of`, because hydration then prunes that
+  row from every source after a grace window. A `stacked-on` also leaves an
+  edge this PR owns, and hydration does not re-sync it, so afterwards fire
+  one `pull_request` event on THIS PR (lever 3's no-op label touch).
+- **The two PRs wait on each other:** the declarations contradict. Usually
+  one PR carries both `coord:upstream-of=X` and `coord:downstream-of=X`, and
+  its card shows `direction_conflict: true`. Two `downstream-of` labels naming
+  each other also deadlock, and no flag shows it. Remove the wrong one, an
+  `upstream-of` with lever 2's mechanics, a `downstream-of` as just
+  described.
+
+Never recover-merge past any of these. Step 6's `--override-gate` is not a
+remedy for a declared ordering.
 
 **`escalate-path-matched` is a hold with a named pending gate — read it before
 deciding who acts.** `coord_pr_merge_verdict {repo, pr_number}` returns an
@@ -611,11 +840,11 @@ not apply to this code), no override arranged by the agent.
 
 | `pending_gate` | What coord is waiting on | Action | Exit state |
 |---|---|---|---|
-| `migration_classifier` | the migration failed coord's additive-safety classifier (`qontinui-coord` `crates/coord/src/pr_merge/migration_classifier.rs`); `reason` names the op | Fix the named op in the migration and push — `auto_if_provably_safe` then lands it with no human. If the op is fine and the CLASSIFIER is wrong, fix the classifier in qontinui-coord (plan → `/vet-imp`) and file a finding; the PR waits on that fix | `fixed-and-waiting` (migration fixed) or `blocked-legitimate` (classifier fix in flight) |
+| `migration_classifier` | the migration failed coord's additive-safety classifier (`qontinui-coord` `crates/coord/src/pr_merge/migration_classifier.rs`); `reason` names the op | Fix the named op in the migration and push — `auto_if_provably_safe` then lands it with no human. If the op is fine and the CLASSIFIER is wrong, fix the classifier in qontinui-coord (plan → `/vet-imp`) and file a finding; the PR waits on that fix — or, if the op is intended, clear it through the evidence door as an `agent` hit (step 6 below) | `fixed-and-waiting` (migration fixed, or evidence bundle accepted and the hit cleared) or `blocked-legitimate` (classifier fix in flight) |
 | `reversal_gate` | the repo's `Migration Reversal Gate` check at the head is absent or not green | Fix that check | `fixed-and-waiting` |
 | `migration_disposition` | coord could not EVALUATE the migration (fetch failure, no GitHub App client, file missing at head) — not a check | Fix the cause `reason` names; if transient, re-evaluate (`coord_reevaluate`) | `fixed-and-waiting` |
 | `secret_scan` | the secret scan must pass, and THEN an operator override is still required | Get the scan green, then ask the operator — secrets is closed-list item 1 | `operator-escalated` |
-| `awaiting_operator_override` | category `infra` / `dependencies` / `other`, any disposition — and also a `migrations` hit whose policy is `block_hard` / `block_soft`, or any hit on coord's secret floor. ⚠️ **For an `infra` / `dependencies` / `other` hit off the floor, the string predates coord's evidence door and does NOT mean operator-only** — coord's own `next_action` for those names the door; for the migration and floor cases it says operator-only, and means it | Read the per-hit `clearable_by` table (next note) and act per hit: `agent` → submit an evidence bundle; `operator` → ask the operator with a recommendation (closed-list item 2); `classifier` → see the `classifier` bullet (a `block_hard` / `block_soft` migration is operator-only) | `fixed-and-waiting` (bundle accepted, every hit cleared) or `operator-escalated` (an `operator` hit remains) |
+| `awaiting_operator_override` | category `infra` / `dependencies` / `other`, any disposition — and also a `migrations` hit whose policy is `block_hard` / `block_soft`, or any hit on coord's secret floor. ⚠️ **Off the floor, the string predates coord's evidence door and does NOT mean operator-only** — coord's own `next_action` names the door for those hits, migrations included; only for a floor hit does it say operator-only, and mean it | Read the per-hit `clearable_by` table (next note) and act per hit: `agent` → submit an evidence bundle (a `migrations` hit adds the conditions in step 6 below); `operator` → ask the operator with a recommendation (closed-list item 2) | `fixed-and-waiting` (bundle accepted, every hit cleared) or `operator-escalated` (an `operator` hit remains) |
 
 **Read `clearable_by` per HIT before deciding anyone but you acts — the
 verdict's `escalate` block does not carry it.** Coord appends a per-hit table
@@ -624,11 +853,22 @@ run, and the same content flattened into `coord_pr_status` `blockers`
 (`escalate-path hits: agent: …; operator: …`). It is computed from the head's
 FILES (`qontinui-coord` `pr_merge::escalate_evidence::clearable_by` /
 `escalate_hit_rows`), so it is present even while an earlier tier masks the
-escalate one — the line then reads "pending behind `<code>`"; clear that tier
-first. One PR can carry hits with different values; each is handled on its own:
+escalate one — the line then reads "pending behind `<code>`". That names a
+masking tier only when `<code>` is a real block code; then clear that tier
+first. **`none` is not one:** coord renders the verdict code `none` as a masking
+tier (`qontinui-coord` `mcp/tools.rs`, the `masking` match beside the
+`hit_table_blocker_line` call, which treats only `escalate-path-matched` and an
+absent code as unmasked; an absent code renders no line at all), so ``pending behind `none` `` names no tier at all.
+`none` is the PASS code: the predicate has already decided those hits do not
+block, and the line beside it is a card display defect. Do not wait for a
+`none` tier to clear (it never will), and do not spend a review on those hits
+for this reason — if the PR still does not land, re-evaluate it once (Step 5,
+lever 1) and treat the hits as blocking only if the fresh code is
+`escalate-path-matched`. The steward's Step 2 row **Green candidates discarded
+at the land seam** is the same case seen from the train. One PR can carry hits with different values; each is handled on its own:
 
-- **`agent`** (`infra`, `dependencies`, `other`, off the secret floor) — you
-  clear it. Call `coord_submit_escalate_evidence` (on the device default tool
+- **`agent`** (`infra`, `dependencies`, `other`, `migrations`, off the secret
+  floor, in every disposition including `block_hard`) — you clear it. Call `coord_submit_escalate_evidence` (on the device default tool
   set; HTTP twin `POST /pr-merge/repos/:repo/pulls/:number/agent/escalate-evidence`;
   both run the one core `pr_merge::escalate_evidence::submit_escalate_evidence`).
   Arguments `{repo, pr, head_sha, hits, review, independence, category_proof?}`
@@ -642,9 +882,36 @@ first. One PR can carry hits with different values; each is handled on its own:
   3. One `hits[]` entry per `agent` hit — evidence is all-or-nothing per head
      (`hits_uncovered`). Each `disclosure` must QUOTE, verbatim, a line from
      that file's diff at this head and say why the change is acceptable; coord
-     checks the quote mechanically. ⚠️ The tool description says a
-     `category_proof` replaces that grounding; the core deliberately does NOT
-     (`check_hit_evidence`) — quote the diff anyway.
+     checks the quote mechanically. A `category_proof` does NOT replace that
+     grounding (`check_hit_evidence`) — quote the diff anyway. Coord builds
+     predating qontinui-coord#2642 (`d2bcce3be`) still describe the tool as if it did.
+     The quoted line is a changed (`+`/`-`) line of 12 or more non-whitespace
+     characters, matched after whitespace is collapsed and never case-folded;
+     in a file that has any such line, only such a line grounds. A file whose
+     changed lines are ALL shorter (a one-line `.gitignore` reading `/target`,
+     or, once step 4's audit is met, a `"libc",` `Cargo.lock` edit) cannot be
+     grounded on a coord build that does not serve qontinui-coord#3435: it is
+     refused `disclosure_unverifiable` with cause `no_quotable_lines` (over
+     MCP, a message that opens "could not be obtained" but says the section
+     "has no quotable changed line" — this cause, not a fetch failure). On a
+     build that serves it, quote one short changed line that holds a letter or
+     digit WHOLE — in backticks, single quotes or on a line of its own, EQUAL
+     to the line, never a substring — and name its hunk's `@@ -a,b +c,d @@`
+     range copied exactly as the diff prints it, in a disclosure of at most
+     4096 bytes that names no more hunk ranges than the file has hunks
+     (`escalate_evidence::disclosure_is_grounded`). A short line with no letter
+     or digit (`}`, `};`) never grounds, on any build. Whether the serving
+     build has #3435: its land commit — #3435's, or that of a PR adopting it
+     (`coord_pr_status` `merge_commit`, once `land_stamp` reads `terminal` or
+     `current_head`) — must be an ancestor of the `build_sha` that
+     `GET https://coord.qontinui.io/health` serves; then
+     `git merge-base --is-ancestor <merge_commit> <build_sha>` in a fetched
+     qontinui-coord checkout exits 0 when it is, 1 when it is not, and 128 (a
+     sha the clone lacks, or a `build_sha` of `unknown`) is UNKNOWN. No build
+     has it until #3435, or a PR adopting it, lands. The refusal tells too: a
+     file whose changed lines are all short, at least one holding a letter or
+     digit, is refused `no_quotable_lines` only by a build without #3435 (a
+     punctuation-only file is refused that way by every build).
   4. A `dependencies` hit additionally needs a `category_proof` (version-only,
      first-party provenance) or `package_audit` entries
      `{package, publisher, verified}`; without one it is `dependency_not_audited`,
@@ -652,6 +919,17 @@ first. One PR can carry hits with different values; each is handled on its own:
   5. `independence` `{claim, verified, against}`, all non-empty. A subagent
      handed the diff and not your reasoning qualifies, sharing your device
      credential included — the recorded claim is the control.
+  6. A `migrations` hit — a migration the classifier REJECTED (a planned
+     `DROP`, a rewrite), or one under a `block_hard` / `block_soft` policy the
+     classifier never ran on — additionally needs: the `Migration Reversal
+     Gate` green at this head (coord reads it itself, and re-reads it at every
+     evaluation); ONE migration file per bundle, and not a merge revision; and
+     no change on the same head to what defines the gate (CI workflows or
+     actions, the alembic config). An additive migration the classifier
+     CLEARED is not a blocking hit, so the bundle does not cover it.
+     (`qontinui-coord` `escalate_evidence::clearable_by`, since
+     qontinui-coord#2869, `26fef6b6` + `86fde506`; builds before it answered `classifier` here and
+     refused the hit `not_agent_clearable`.)
 
   The credential must be holder-issued (the anonymous `POST /agents/credential`
   mint is refused) AND carry the `introspect` scope — the anonymous
@@ -662,17 +940,109 @@ first. One PR can carry hits with different values; each is handled on its own:
   announces the clearance to the operator feed, and only then writes the marker
   itself. Refusals name the failed check: `head_moved` (re-submit against
   `current_head`), `review_not_for_head` (add the trailer), `disclosure_not_grounded`
-  (quote the diff), `disclosure_unverifiable` and `notification_failed`
-  (retryable; no marker was written). Verify by read — re-read
-  `coord_pr_merge_verdict` — never by the call's own success.
-- **`classifier`** (`migrations`) — never put it in a bundle: naming it is
-  refused (`not_agent_clearable`), and leaving it out leaves it in the
-  accepted bundle's `not_cleared`. The remedy depends on the disposition. Under
-  `auto_if_provably_safe` it is the `migration_classifier` / `reversal_gate`
-  rows above. Under `block_hard` / `block_soft` the classifier never runs, so
-  the hit is operator-only (coord `merge_verdict::escalate_next_action_on_floor`
-  says so). Ask the operator with a recommendation: override, or change the
-  supplying escalate policy (`sources`) to `auto_if_provably_safe`.
+  (quote the diff as step 3 says), `dependency_not_audited`, `reversal_gate_not_green`
+  (retryable once the gate runs green), `reversal_gate_untrusted` (the head
+  also changes the gate's definition — land that separately first),
+  `migration_not_singular` (split the migrations, one per head),
+  `not_agent_clearable` (an `operator` hit was named), `notification_failed`
+  (retryable; no marker was written), and `disclosure_unverifiable` (no marker
+  was written; whether a retry helps is decided by its cause, never assumed —
+  the HTTP twin's JSON body carries `cause` and `retryable`, while over MCP
+  the refusal is the one line `<code>: <message>`, whose message says
+  `retryable` or `not retryable` and names the cause in prose). Two of its
+  causes, `patch_unavailable` and `not_in_listing`, read differently on a
+  coord build that serves the mirror change (the coord PR citing plan
+  `2026-11-03-escalate-evidence-mirror-grounds-patchless-files`; see the
+  next paragraph). On a build without it, only `fetch_failed` whose last read
+  failed transiently answers `retryable: true`: resubmit, and on a cool-down
+  (the body's `cooldown_until`) resubmit the SAME bundle unchanged when the
+  message says.
+  Every other cause comes back unchanged on resubmission. A file refused
+  `no_quotable_lines` whose changed lines are all short, at least one holding
+  a letter or digit, grounds only by step 3's whole-line quote once a build
+  serving qontinui-coord#3435 is live; until then no bundle clears it, so the
+  PR is `blocked-legitimate` (the coord fix is in flight), or, if it cannot
+  wait, ask the operator as below. On a build without the mirror change,
+  `not_in_listing` is GitHub's 3,000-file listing cap — split the PR.
+  A non-retryable `fetch_failed` means coord could not read the diff at all
+  (`unified_cause` / `files_api_cause`, or the message, name the failed read;
+  nothing in your bundle caused it). That, `patch_unavailable` on a build
+  without the mirror change (binary, or the file's own diff too large),
+  `not_in_diff`, `ambiguous_section`, and a `no_quotable_lines` file with
+  nothing to quote (binary, rename, mode change, punctuation only) leave no
+  disclosure that can ground the hit — ask the operator for the override with
+  a recommendation (closed-list item 2), naming the failed read where that is
+  the cause.
+
+  **On a coord build that serves the mirror change, a file GitHub serves no
+  patch for is grounded on coord's own mirror: `patch_unavailable` or
+  `not_in_listing` alone sends it to neither the operator nor a split.**
+  GitHub serves no `patch` for a file whose own diff is too large or that
+  falls past the PR's cumulative diff limit, and its listing stops at 3,000
+  files. A build serving the coord PR citing plan
+  `2026-11-03-escalate-evidence-mirror-grounds-patchless-files` reads such a
+  file's section from coord's bare mirror instead — the PR's pinned head
+  against its merge base, in GitHub's patch format — and grounds the
+  disclosure on it by step 3's rules, unchanged. On such a build:
+
+  - Quote the file from its section of the whole read
+    `git fetch origin <base> && git diff --unified=3 --inter-hunk-context=1 --find-renames -l1000 origin/<base>...<head>`
+    (`git fetch origin pull/<n>/head` first when your clone lacks `<head>`).
+    For a file whose changed lines are all short, name the `@@` range THAT
+    command prints: git's default `--inter-hunk-context=0` splits hunks
+    GitHub fuses, so a range copied from it can differ, and a range that
+    differs is refused. The exception is a section coord grounded during
+    its own GitHub cool-down: it reads at `--inter-hunk-context=0`, so a
+    refusal there names that command, and you quote from it. Read the PR
+    whole; never narrow a renamed file to
+    `-- <path>` alone, which turns it into a whole-file add — use
+    `-- <previous path> <path>`. `coord_submit_escalate_evidence`'s own
+    description says the same on such a build.
+  - Read `patch_unavailable` / `not_in_listing` together with their `mirror`
+    field, the code naming why coord's mirror could not stand in for that
+    file: the HTTP twin's body carries it beside `cause`, and the MCP line's
+    message names it. `retryable` is derived from that code, so resubmit on
+    `retryable: true` — the transient codes `no_mirror` (coord has begun a
+    background clone, which can take minutes), `fetch_failed`,
+    `fetch_timed_out` and `diff_failed` (coord's own git against its mirror,
+    not a GitHub read), and `busy` (another grounding holds coord's permit).
+    `head_absent` is `retryable: true` as well, but resubmit only after
+    re-reading the head, as the next bullet says; if `head_sha` is unchanged,
+    the same bundle is the right resubmission.
+  - On `mirror: head_absent`, coord's fresh fetch lacks the head you named:
+    GitHub's pull ref lags, or the head moved. Re-read `coord_pr_status` and
+    resubmit at its `head_sha` (a head that moved needs steps 1-3 again).
+    Never ask the operator for it.
+  - Ask the operator only when `mirror` names a non-retryable miss (for
+    example `too_large`, `disagrees_with_github` or `not_in_mirror_diff`), and
+    name that code in the ask — closed-list item 2, with a recommendation.
+  - A `disclosure_not_grounded` or `no_quotable_lines` refusal carrying
+    `section_source: "mirror"` was judged against the mirror's section; its
+    message names the command and the `merge_base` coord read, so re-quote
+    from that output. A binary file's mirror section still offers nothing to
+    quote, so it stays the operator's, as above.
+
+  Whether the serving build has the mirror change: that coord PR's land
+  commit — or that of a PR adopting it (`coord_pr_status` `merge_commit`, once
+  `land_stamp` reads `terminal` or `current_head`;
+  coord's work-unit citation list for that plan stem names the PR) — must be
+  an ancestor of the `build_sha` that `GET https://coord.qontinui.io/health`
+  serves, read with `git merge-base --is-ancestor <merge_commit> <build_sha>`
+  exactly as for #3435 above (exit 0 it is, 1 it is not, 128 UNKNOWN). No
+  build has it until that PR, or a PR adopting it, lands. The refusal tells
+  too, one way only: a `patch_unavailable` / `not_in_listing` refusal that
+  carries a `mirror` code came from a build with it. One without the code
+  settles nothing — read the build as above.
+
+  Verify by read — re-read `coord_pr_merge_verdict` — never by the call's own
+  success.
+- **A migration the classifier rejected** — two remedies, and the choice is
+  yours. If the op is avoidable, fix it in the migration and push (the
+  `migration_classifier` row above). If it is intended, clear it through the
+  door as an `agent` hit (step 6). Under `block_hard` / `block_soft` the
+  classifier never runs, so the door is the remedy; coord's own `next_action`
+  (`merge_verdict::escalate_next_action_on_floor`) names it, with an operator
+  override or an `auto_if_provably_safe` policy change as the alternatives.
 - **`operator`** — a `secrets` hit is the `secret_scan` row (get the scan green,
   then ask the operator). A non-secrets hit on coord's compiled-in secret floor
   has no scan step and is an operator override only. The floor is empty
@@ -744,7 +1114,7 @@ three values and a missing arm is a silent misroute:
 
 - **`CONFLICTING`** → **resolve the conflict; CI follows.** `gh pr close && gh pr
   reopen` is a **no-op** here — it succeeds and schedules nothing (verified on
-  `qontinui-dev-notes#203`, `#84`, `#78`). Do not go hunting for disabled
+  plans-repo PRs #203, #84 and #78). Do not go hunting for disabled
   Actions or a missing workflow file; that is the wrong diagnosis.
 - **`UNKNOWN`** → **not an arm — re-read it.** Poll `mergeable` again after a
   short delay and act only on a settled value. `UNKNOWN` is UNKNOWN, never a
@@ -752,10 +1122,10 @@ three values and a missing arm is a silent misroute:
   nothing and leaves the PR exactly as stuck.
 - **`MERGEABLE`** with CI simply never fired → `gh pr close <n> && gh pr reopen
   <n>` fires `reopened` and schedules it, with no content change, no new commit
-  and the same head sha (verified on `qontinui-dev-notes#153`: green in ~20 s,
+  and the same head sha (verified on plans-repo PR #153: green in ~20 s,
   which then let coord reach its real verdict, `[already-landed] — close this
   PR`). ⚠️ A `MERGEABLE`/`CLEAN` read is **GitHub's merge test passing**, never
-  "coord can rebase this" — measured 2026-08-19, `qontinui-dev-notes#148` read
+  "coord can rebase this" — measured 2026-08-19, plans-repo PR #148 read
   `mergeable: MERGEABLE, mergeStateStatus: CLEAN` while coord held a **terminal
   `conflict`**, stuck 30.8h (steward, **Green-but-dirty** row). That caveat bears
   on a coord *rebase* hold, **not** on an absent workflow run — GitHub's merge ref
@@ -765,8 +1135,8 @@ three values and a missing arm is a silent misroute:
 
 Either way this is a **legitimate hold you can clear** — not a coord defect, and
 not something to wait out. Measured 2026-08-24: **4 of 9** stuck
-`qontinui-dev-notes` PRs were in this state. Full row:
-`.claude/commands/merge-train-steward.md` → **"Conflicting PR gets NO new CI —
+plans-repo PRs were in this state. Full row, where your deployment provides
+`/merge-train-steward`: its **"Conflicting PR gets NO new CI —
 coord parks it in `ci-pending` forever"**.
 
 ## Step 5 — Sanctioned recovery levers (before any admin-merge)
@@ -776,9 +1146,47 @@ Try cheapest-first; give each one ~2 poll cycles to take effect:
 1. **Force re-evaluation**: `POST /pr-merge/prs/<owner>/<repo>/<pr>/reevaluate`
    (same bearer) — runs one predicate eval immediately. Cures stale snapshots.
 2. **Remove the defective input** when the diagnosis identifies one — e.g.
-   the `coord:upstream-of` deadlock is broken by removing that label from the
-   upstream PR (ordering usually survives via the dep edge until the next label
-   sync, and the upstream lands first anyway). Remove it over the REST labels
+   a `coord:upstream-of=` label that 4d's `waits-on:` note found obsolete or
+   contradictory is retracted from the upstream PR (once coord re-syncs that
+   PR's edges, the `upstream_of` edge is gone and the PR the label names
+   stops waiting on it).
+
+   ⚠️ **First read which coord rows declare it, and each row's `source`:**
+   `coord_pr_status(repo, number)` on the upstream PR → `labels` (`labels:
+   null` is UNKNOWN, not "no row"). Read every `coord:upstream-of=` row whose
+   value names the downstream PR, in any spelling: a short `<repo>#<n>`
+   (which takes the upstream's owner), an owner-qualified one and a body
+   trailer can each declare the same edge. The
+   dependency graph derives edges from labels of any source, so the edge
+   stands until every such row is gone. Coord's GitHub-label reconcile
+   (webhook and hydration) deletes `github` rows only, and hydration's
+   source-agnostic dependency prune covers only `coord:stacked-on=` and
+   `coord:downstream-of=`. Each source therefore needs its own remedy:
+
+   - `source: github`: the GitHub DELETE below; the `unlabeled` webhook then
+     re-syncs the edges. If the body also carries a `Coord-Upstream-Of:` line
+     for the same PR, that same webhook re-inserts the label as
+     `coord_trailer`, so take the line out first. Follow the next arm only
+     when the read already shows a `coord_trailer` row.
+   - `source: coord_trailer` (a `Coord-Upstream-Of:` line in the PR body):
+     take the line out of the body, because every webhook re-inserts a
+     trailer row the body still declares. No sanctioned agent door deletes
+     the row itself. It needs the operator's admin-gated
+     `DELETE /pr-merge/labels/<owner>/<repo>/<pr>/<label>` (`<label>`
+     `@uri`-encoded, as below; `.claude/skills/coord-pr-label/SKILL.md` →
+     "Removing a label you set" lists it), so surface it to the operator
+     with that recommendation. That DELETE does not re-sync edges, so
+     afterwards fire one `pull_request` event on the upstream PR with lever
+     3's no-op label touch.
+   - `source: coord_skill` (what `/coord-pr-label` writes): retract it
+     through coord's label door, `.claude/skills/coord-pr-label/SKILL.md` →
+     "Removing a label you set". That door is replace mode, which deletes
+     every `coord_skill` row on the PR that you leave out, so post every other
+     `coord_skill` label as the keep set, and read its caveats first. It
+     re-syncs the edges itself and strips the GitHub label, except a label
+     set in the short `<repo>#<n>` form (its caveats say why).
+
+   Remove a `github` label over the REST labels
    route, **not with `gh pr edit --remove-label`**, which cannot run here at
    all: `gh pr edit` prefetches `repository.pullRequest.projectCards` over
    GraphQL, GitHub refuses that under the Projects-classic sunset, and it exits
@@ -803,6 +1211,29 @@ Try cheapest-first; give each one ~2 poll cycles to take effect:
    for `PATCH .../issues/<n>` with a `labels` array instead — that route
    **replaces the whole label set**, stripping every other `coord:*` edge on
    the PR, which is the same clobber hazard `-f body=` carries on the body.
+
+   Then read it back:
+   - GitHub's labels on the upstream PR: run the DELETE above if the label is
+     still there.
+   - `coord_pr_status` on the upstream PR: `labels` holds no row naming the
+     downstream `<repo>#<n>`.
+   - `coord_pr_status` on the PR the label names: `dep_edges` holds no entry
+     with `kind: "upstream_of"`, `self_waits: true` and `other` = the
+     upstream's owner-qualified `<owner>/<repo>#<n>`. If one remains with
+     `source: "label"`, that PR carries its own `coord:downstream-of=` for the
+     upstream, which also holds it. An empty `dep_edges` is not evidence: the
+     field reads `[]` when coord could not read it.
+
+   Then run lever 1's reevaluate on the named PR and read the newest
+   `predicate_eval` (Step 4c): the confirmation is a detail that no longer
+   reads `waits-on:<the upstream> (declared upstream via …`. If it still does,
+   fire one `pull_request` event on the UPSTREAM PR with lever 3's no-op label
+   touch (the edge belongs to the upstream, and hydration never re-syncs
+   edges), then reevaluate again. A `waits-on:` that now says `(derived
+   migration stack: …` is a derived alembic ordering, not this edge. The same
+   touch clears an orphaned edge, one with no declaring row
+   left: fire it on the PR that owns the edge, the upstream for
+   `kind: "upstream_of"` and this PR for `kind: "stacked_on"`.
 3. **Fresh hydration**: a no-op label touch, or a new head push if you have a
    legitimate commit to add (never an empty commit just to poke coord). A head
    push here is subject to the same carries-the-push check as Step 3's —
@@ -813,62 +1244,187 @@ Try cheapest-first; give each one ~2 poll cycles to take effect:
 If a lever clears the block (predicate flips to `pass`/`ci-pending`), return
 to the watch loop — coord lands it, no admin-merge.
 
+## Step 5a — Expedited land: ask coord first (red-main remedy only)
+
+Served policy `git-operations` `expedited-land-request` governs this step. Read
+it live (`/policy get policy git-operations`) before you act. This page
+deliberately does not restate its conditions, its reason codes, or its
+definition of when the door *served* a PR. The clause owns all three. Its only
+arm is `red_main_remedy`, and it decides two things here:
+
+- whether you may ask coord to land a PR on the expedited path, and
+- whether a PR coord could not land may then reach Step 6's direct merge.
+
+**When to ask.** Ask only when that arm's condition holds for this PR. That is
+typically the red-main fix that 4d's `main-red` row holds behind its own red
+main, labelled `coord:red-main-fix`. Do not ask with `coord_stall`. The clause
+does not cover that arm.
+
+Coord accepts the request only from the PR's authoring session. A shepherding
+session that did not author the PR gets `not_author_session`, which is a
+not-served outcome. In that case Step 6 applies unchanged, and all of its
+preconditions still gate it. That includes the served clause's bar on merging
+the PR of an author who is live and has not asked you to. In that case, message
+the author and ask it to file the expedited request itself. Merge only if it
+asks you to, or once it is no longer live.
+
+**How to ask.**
+
+- **MCP:** `coord_request_expedited_land`, with `{repo, pr, head_sha, reason:
+  "red_main_remedy", disclosure, independence, remedies_jobs?,
+  idempotency_key?, wait_secs?}`. `independence` is an object, `{claim, verified,
+  against}`.
+- **HTTP twin:** `POST /pr-merge/repos/:repo/pulls/:number/agent/expedite`.
+  Use it where the runner's proxy masks the tool, which it does on purpose: the
+  tool is a deliberate exclusion there.
+  - `repo` and `pr` go in the PATH, not the body. The body is `{head_sha,
+    reason, disclosure, independence, remedies_jobs?, idempotency_key?, wait_secs?}`, and
+    the door rejects unknown fields.
+  - Send a device JWT for the tenant proven to own the repo. Get it with
+    `ctc_owner_tenant`, then `ctc_stage_for_tenant`, from
+    `scripts/lib/coord-tenant-credential.sh`. Pass the bearer as `-H @file`.
+  - Also send `X-Coord-Caller-Session` set to your COORD session id. That is
+    `$QONTINUI_AGENT_SESSION_ID`, or, outside the runner, the `session_id`
+    that `coord_bind_self_session {create_if_absent: true}` returns. Never
+    send the harness id (`$CLAUDE_CODE_SESSION_ID`): coord matches the header
+    against `agent_sessions.id` and answers `requester_unresolved`.
+- **What the request must carry.** The `disclosure` quotes at least one changed
+  line of this head and names each remedied job. The `independence` claim
+  comes from a fresh-context reviewer who was given the diff and not your
+  rationale.
+- **Read it back** with `coord_expedited_land_status {request_id}`, or `GET
+  /pr-merge/agent/expedite/:request_id`.
+- **Record the `request_id`** in the PR audit comment and in the exit report.
+  A refusal raised before coord writes the request row carries no
+  `request_id`, so record its `refusal.code` instead. That covers credential,
+  ownership, requester, `pr_busy` and rate-limit refusals. A switch refusal
+  (`disabled`) does carry one, so record both.
+
+**What to do with the answer.** Follow `refusal.body`, and branch on
+`refusal.handoff_class`, never on prose. Judge whether the door served the PR
+against the clause's definition. Read `refusal.code` before the class: `shadow`
+and `proposal_voided{shadow}` have their own row. A request in one of coord's
+live states is coord's to finish, so do not race it. The live states are
+`LIVE_STATES` in `pr_merge/expedite/door.rs`. Read that list rather than this
+page, but today it is `pending`, `evaluating`, `admitted`, `land_unconfirmed`
+and `land_unknown`.
+
+| How it ended, or `handoff_class` | What you do |
+|---|---|
+| `landed` | Done. Coord landed it, notified, and read the land back. |
+| Still live: any `LIVE_STATES` member | Wait and re-read the status. Do not merge in parallel. |
+| Any other end state after admission (`landed_unattributed`, `land_rolled_back`, `proposal_cancelled`, `proposal_failed`, `expired`, …) | The door served the PR. Step 6 applies only under the recovery condition below. Coord may have opened a child request, and the parent's response does not carry the child's id. Ask again for the same head: `pr_busy` names the live request. If the code is also `pr_side`, both rows apply: fix the PR and ask again. |
+| `pr_side` | Fix the PR, then ask again for the new head. |
+| `rate_concurrency` | Re-ask only after `retry_after_secs`, or after `detail.until` for `breaker_open`. For `pr_busy`, read back the request it names. Where `refusal.body` says to use the ordinary train, do that. |
+| `refusal.code` `shadow` before admission | The lever is not live, so it served nothing. Step 6 applies unchanged and in parallel. |
+| `proposal_voided{shadow}`, after `admitted` | A shadow-mode evaluation never served the PR, whatever row it left. The clause says so since its 2026-10-25 amendment (finding `018b7341`, settling the gap filed as `9bce99e6`). Step 6 applies unchanged and in parallel. Ask the door again once the switch is `on` if you still want the expedited path. A re-ask that goes live puts the PR back under the "Still live" row, so do not run Step 6's merge while it is live. |
+| `never`: `requester_unresolved`, `credential_lacks_possession` | Fix the request exactly as `refusal.body` tells you, for example by correcting the session header, and send it again. Do this only where the body says to. A resend with a corrected session id is a new request, not a retry: coord marks the code non-retryable only on the same transport and header. |
+| `never`: `author_unresolved` | Wait for the branch to be bound, as `refusal.body` says, then ask again. |
+| `never`: any other code (`disabled` included), `trigger_side`, `scope` | Not served. Step 6 applies unchanged. |
+| `coord_side`, `github_input` | The door served the PR. Coord retries the pre-admission codes itself, and opens a child request for `proposal_voided{coord_void}` and `proposal_failed{infra}`. Re-read the status, or the child's status, until it ends. |
+| `worker_unavailable` | Re-ask after `retry_after_secs`. |
+| `environment` | `prior_infra_cooling`: wait out `retry_after_secs`. Once the cooling is spent, or the code is `prior_infra_budget_exhausted`, the door did not serve the PR, and Step 6 applies unchanged. |
+| `coord_defect_final` (`coord_retries_exhausted`) | See below. |
+
+**When coord's retries are spent.** On `coord_retries_exhausted`, read
+`refusal.detail.last_code` and find its class in coord's own table
+(`refusal.rs` `handoff_class()`).
+
+- **Recovery-eligible: `coord_side` or `worker_unavailable`.** For
+  `worker_unavailable`, wait out its `retry_after_secs` and re-ask once first.
+  The clause makes both recovery-eligible only after Step 6's own diagnosis.
+  That is necessary but not sufficient. Step 6 must still diagnose the
+  ordinary train for this PR on its own evidence, and confirm that no live
+  proposal for it is in flight. A dead expedite worker says nothing about the
+  ordinary train.
+- **`github_input`.** Wait for `retry_after_secs`, then re-ask.
+- **`environment`.** Not served. Step 6 applies unchanged.
+
+Never ask again to get past a non-retryable refusal: a refusal is the answer.
+Never re-run `main` to manufacture evidence.
+
+**When the door gave no typed answer.** There are two different cases:
+
+- **Neither a typed `refusal` nor a `request_id` came back.** Record it as `expedite-unreached (<what you observed>)`. This happens when no credential was proven
+  for the owning tenant, when the call returned nothing typed, or when coord
+  is down. Coord down is stated only as the `FLOOR-CLAIM: verdict=FLOOR` block
+  that Step 6's diagnosis-class precondition names. In any of these, the door
+  did not serve the PR, and Step 6 applies unchanged and in parallel.
+- **A `request_id` came back, but its status cannot be read.** That is UNKNOWN,
+  not "not served". The request may still be live. Merging in parallel risks a
+  second land, so keep re-reading.
+
+Before naming any cause, check `coord_recent_findings` for the repo, because a
+peer may already have recorded the failure. In the audit comment, quote what
+you observed, not a cause you guessed.
+
+**Where the clause's own words leave a case open, it is a gap in the clause,
+not in this page.** Read it the stricter way, and record the gap. The shadow
+case above was one instance, until the operator settled it in the clause.
+
 ## Step 6 — Admin-merge (recovery path only)
 
 > "Admin-merge" here is shorthand for **hand-merging outside coord**. It does
 > NOT mean `gh pr merge --admin` — that flag is not the mechanism (see item 2
 > of the procedure below).
 
-> ### ⚠️ An agent CANNOT complete this step (since 2026-08-21, PR #328)
+> ### An agent completes this step through the sanctioned door (since 2026-10-16)
 >
-> Read this before working the preconditions, so you do not spend a rebase and
-> a full CI cycle reaching a wall. PR #328 added
-> `deny: ["Bash(gh pr merge)", "Bash(gh pr merge:*)"]` to the shared
-> `.claude/settings.json` — which, via the workspace-root `.claude` symlink, is
-> this session's settings. A `deny` is evaluated before `ask` and `allow`, holds
-> in **every** permission mode including `bypassPermissions`, cannot be
-> overridden by `settings.local.json` / user settings / `--allowedTools`, and
-> **cannot be approved by a `PreToolUse` hook**. Compound and wrapped spellings
-> (`cd x && …`, `;`, `bash -c "…"`, a leading `VAR=…`) are split and matched
-> independently, so none of them evade it.
+> Served policy `git-operations` `direct-merge-with-notification` (operator
+> decision 2026-10-16, finding `53a7609b`) made the recovery merge
+> take-and-notify. Item 2's merge is yours, and it runs through ONE command:
 >
-> Item 2 below is therefore **denied to every agent in this fleet**. It is
-> left in place because it is still the correct procedure — it is just the
-> operator's to run now, not yours. ("Denied", not "impossible": the deny and
-> the guard cover the spellings an agent actually reaches for, not every
-> conceivable client — see "Do not route around the deny" below. The boundary
-> is the policy; the mechanism is a backstop.)
+> ```bash
+> bash <workspace-root>/qontinui-claude-config/scripts/agent-direct-merge.sh \
+>   --repo <owner/name> --pr <n> --reason "<diagnosis class + the block_reason_code evidence>"
+> ```
 >
-> **So: work Steps 1–5 fully, and when a genuine coord-defect diagnosis reaches
-> the merge, hand it over instead of attempting it.** Register the gate
-> (`/gate`) or escalation FIRST — naming the PR, the diagnosis class and the
-> `block_reason_code` evidence — then post the Step 6 item 1 audit comment
-> quoting that ref, so the PR is watched rather than silently dropped by a
-> session that just stopped. (This is the one place the "audit trail first"
-> ordering inverts, and it inverts because the hazard it guarded against is
-> gone: there is no merge left for you to perform ahead of the record. What the
-> comment now has to carry is the ref, and you cannot quote a ref you have not
-> yet obtained.) Then continue to Step 7 — the remediation plan is unaffected
-> and is the part that kills the defect class.
+> It refuses (exit 3, nothing merged) unless the PR is OPEN, not a draft,
+> `mergeStateStatus` CLEAN, and every check but coord's own merge gate is green
+> at the head it pins. It merges with `sha=<that head>`, so GitHub refuses if the
+> head moved, posts `coord_notify_sensitive_action` action `force_merge`, and
+> reads the merge sha back on the base. **Exit 5 means the merge STANDS but the
+> notification did not land: post it by hand at once** with the line it printed.
+> Exit 4 is no merge by this call (GitHub refused it, or the PR was merged some
+> other way); a ruleset refusal is final for an agent: hand that one PR to the
+> operator with a gate or an escalation, as this step did before. Exit 6 is
+> merged and notified but not read back on the base: re-read it. Exit 7 is
+> UNKNOWN (the merge call failed and the PR could not be re-read): check the PR
+> by hand before anything else.
 >
-> **Do not route around the deny.** `gh pr merge` wraps
-> `PUT /repos/{owner}/{repo}/pulls/{n}/merge`; reaching that endpoint via
-> `gh api` is the same act, and is blocked by `git-guard.sh` with a
-> typed reason — that hook was briefly unwired fleet-wide (qontinui-claude-config
-> PR #567) along with its unrelated destructive git/rm/cargo arms (those stay
-> removed), then re-wired the same day narrowed to ONLY this merge-route
-> check, so it mechanically stops this spelling again.
+> It reads coord's gate code from the merge-gate check's title and checks it
+> against an allowlist. `main-red` proceeds only on the PR labelled
+> `coord:red-main-fix`; `passed` (the train means to land it) and the codes
+> the script admits as coord defects (`merge-state-unsettled`, or no gate
+> check at all when coord is down) only with `--override-gate`, which is
+> recorded in the notification; a dependency hold
+> (`has-cross-repo-dependency`, `dependency-upstream-closed`: an ordering
+> declared by a label or trailer, or derived from a migration stack, fixed at
+> its source; 4d's `waits-on:` note), `escalate-path-matched` and every other
+> code refuse, flag or no flag.
 >
-> Background, and why this diverges from served policy `git-operations`
-> `merge-authority` @8 (whose second sentence sanctions this recovery):
-> `qontinui-claude-config/knowledge-base/qontinui-specific/coord-merge-train.md`
-> → "That last step is MECHANICALLY DENIED to agents". Whether the deny stays is
-> the operator's call; it is recorded as a policy gap, not resolved here.
+> **The raw spellings stay denied, so do not route around the door.**
+> `gh pr merge` (settings deny, PR #328) and the `gh api` REST and GraphQL
+> merge routes (`git-guard.sh`) are blocked because they skip the notification,
+> and `--admin` is never the mechanism (item 2). The script calls the REST route
+> itself, after its preflight.
 
 Preconditions — ALL must hold:
-- Diagnosis class is **coord defect** or **coord down** (never a legitimate
-  hold, never transient) — and **coord down** is stated only as the
-  `FLOOR-CLAIM: verdict=FLOOR` block from `bash <workspace-root>/qontinui-claude-config/.claude/skills/coord-revive/coord-revive.sh --floor-claim`, pasted verbatim.
+- **Step 5a's door comes first wherever it served this PR.** "Served" is the
+  clause's own definition. If the door served the PR, this step is reached
+  only after `coord_retries_exhausted`, and only when its `last_code` is
+  recovery-eligible: `coord_side`, or `worker_unavailable` after one re-ask
+  (Step 5a). Even then, the bullets below must also hold for the ordinary
+  train, including that no proposal for this PR is in flight. Every other
+  outcome is "not served": for it this step is unchanged and runs in parallel.
+  [policy: git-operations/expedited-land-request]
+- Diagnosis class is **coord defect**, **coord down**, or `main-red` on the
+  PR labelled `coord:red-main-fix`. That last case is the red-main fix held by
+  its own red main, which served policy `git-operations`
+  `direct-merge-with-notification` names, subject to Step 5a where the door
+  served it. The diagnosis class is never any other legitimate hold, and never
+  transient. **Coord down** is stated only as the
+  `FLOOR-CLAIM: verdict=FLOOR` block from `bash <session-workdir>/.claude/skills/coord-revive/coord-revive.sh --floor-claim`, pasted verbatim.
 - Step 5 levers tried and did not clear it (skip levers when coord is down).
 - `/merge/queue` shows no in-flight proposal for this PR (do not race coord).
 - CI is fully green on the CURRENT head, including the stale-green re-check
@@ -915,7 +1471,7 @@ Preconditions — ALL must hold:
   ⚠️ **An empty result there is ambiguous — check `[.rules[].type]` before reading
   it as "nothing is required".** Empty means either the ruleset genuinely has no
   `required_status_checks` rule or your read did not land. Measured 2026-08-25:
-  `qontinui-claude-config` returns `["deletion","non_fast_forward"]` (genuinely
+  the agent-config repo returns `["deletion","non_fast_forward"]` (genuinely
   no required checks) while `qontinui-runner` returns `["non_fast_forward",
   "deletion","required_status_checks","pull_request"]` and lists 10 contexts —
   so the same empty output distinguishes the two only via the rule-type read.
@@ -954,15 +1510,17 @@ Then:
 
    ⚠️ **Write the disposition you actually performed.** This step used to
    dictate the closing line *"admin-merged as coord-defect recovery; remediation
-   plan follows"* — and since #328 an agent reaching here has **not** merged,
-   so that line publishes a false claim on a public PR and mislabels the
-   PR's state for coord, for the operator, and for the next session that reads
-   the thread. Item 1 is still yours; its wording had to follow item 2 into the
-   hand-off. Close the comment with, as applicable:
+   plan follows"* whatever happened — and from #328 until 2026-10-16 an agent
+   reaching here had **not** merged, so that line published false claims on
+   public PRs. Close the comment with the disposition that actually happened,
+   as applicable:
 
-   - **agent** — *"diagnosed coord-defect recovery; the recovery merge is denied
-     to agents fleet-wide (PR #328), so this PR is handed to the operator, who
-     holds the merge capability. Gate/escalation: `<ref>`. Remediation plan
+   - **agent, merged** — *"merged directly as coord-defect recovery through
+     agent-direct-merge.sh (`<merge sha>`; operator notified, force_merge).
+     Remediation plan follows."*
+   - **agent, GitHub refused the merge (exit 4)** — *"diagnosed coord-defect
+     recovery; GitHub refused the direct merge (`<the refusal>`), so this PR is
+     handed to the operator. Gate/escalation: `<ref>`. Remediation plan
      follows."*
    - **agent, under `--no-merge`** — the same record **without** the hand-off
      request: state the diagnosis and the evidence, and do not ask the operator
@@ -986,8 +1544,8 @@ Then:
    `OrganizationAdmin` with `bypass_mode: always`; only the three
    `*-protect-main` rulesets (coord, web, claude-config) are App-only. Bypass
    lists differ **per repo** — re-read `bypass_actors` for the repo in hand
-   rather than restating any table — see the `--admin` section of
-   `qontinui-claude-config/knowledge-base/qontinui-specific/coord-merge-train.md`.
+   rather than restating any table — see the `--admin` section of the coord
+   merge-train reference in your deployment's knowledge base, where it ships one.
    Whether `--admin` actually succeeds anywhere is untested by design, so it is
    not a path to reach for. **Own the branch first** (`git-operations`
    `own-artifact-lifecycle`): if this session does not, **re-read served
@@ -1010,14 +1568,15 @@ Then:
    carries-the-push check runs before and after it, re-testing the PRE-rebase
    head; a PR that landed under you while it read stuck needs no recovery, and
    the rebase would re-propose its landed commits), wait for the required
-   checks to go green on the up-to-date head, then plain
-   `gh pr merge <n> --rebase`. Strict rulesets (qontinui-web) need
+   checks to go green on the up-to-date head, then merge through
+   `scripts/agent-direct-merge.sh --repo <o/r> --pr <n> --reason "<…>"`
+   (it picks rebase when the repo allows it). Strict rulesets (qontinui-web) need
    the up-to-date head; non-strict ones (qontinui-coord) merge as soon as the
    required checks are green on the current head.
    **A peer's coord PROPOSAL is not its branch.** A proposal holding a merge
    slot past the repo's own `stall_window_secs` can be cancelled by any session,
    but only through the class A/B/C table and the per-target probe in
-   `/merge-train-steward` (the `self_blocking` arm) — `unblock: true` only, a
+   `/merge-train-steward` (the `self_blocking` arm; where your deployment does not provide that command, do not cancel the proposal at all: report it as a held proposal and continue to Step 6) — `unblock: true` only, a
    Stop-mode cancel is class C, and a 409 from the door is a successful guard,
    never something to retry.
    **Adopting a foreign branch (route-around) — the only shape it may take.**
@@ -1040,15 +1599,48 @@ Then:
    settled fork — do not re-litigate it (coord#1815's rescue re-opened one
    `design-tradeoff-ranking#1` had already decided); a `deploy_order[]` item
    is a landing constraint your new PR inherits (`Coord-Downstream-Of:`).
+   **Then reserve the adoption, before the first commit.** Several paths
+   reach an orphaned PR (this one, `/handoff-stuck-pr` exit 3,
+   `/merge-train-steward` Class 5, a `/resume-unfinished` continuation), and
+   on 2026-10-22 three sessions adopted one piece of work within an hour
+   (plan `2026-10-31-adopt-wip-has-no-reservation-so-concurrent-sessions-adopt-the-same-work`).
+   Run `bash <workspace-root>/qontinui-claude-config/scripts/adopt-wip-reserve.sh --pr <owner/repo#N>`.
+   Exit 0 (`RESERVED`): heartbeat the claim it names (the script's header
+   maps the line onto `scripts/coord-claim-heartbeat.sh` `add` / `start`), and
+   release it only once the same command with `--check` added prints
+   `ADOPTED` naming YOUR new PR. `--check` takes no claim; `NOT_ADOPTED`
+   means GitHub has not indexed your PR yet, so keep heartbeating and check
+   again. Exit 1: `ADOPTED` names a PR that already adopted #N, so there is
+   nothing to adopt — an open or merged PR whose `Adoption-Supersedes:` line
+   covers #N or whose title declares `supersedes #N`, a CLOSED one whose own
+   coord card shows it landed (a coord ff-land is CLOSED on GitHub), or a
+   successor #N's card lists in `superseded_by` or `superseded_by_refused` as open, merged or landed; `HELD` means another adopter holds it now, so do not start a second
+   adoption; `RENEWED` means your own session already holds it, which is
+   yours only when your own earlier call for that key printed UNKNOWN. Exit 2
+   is UNKNOWN: do not adopt on it — including a CLOSED adopter whose coord card
+   could not be read, which the reason line names (read `coord_pr_status` on it).
+   **The `adopt-wip:` reservation says who adopts the work; it does not keep
+   coord's fixers off the original PR.** So before your first commit, ALSO take
+   the original PR's reserved claim, as in Step 3:
+   `coord_adopt_pr {repo, pr_number: <N>, head_sha: <its current head>, action: "claim"}`.
+   Adopt only on `claimed`. `held_by` means another worker holds that head, so
+   release your `adopt-wip:` reservation and do not adopt. Release the
+   `coord_adopt_pr` claim (no `pushed_head`, since you never push to the
+   original) once your new PR reads back, together with the `adopt-wip:` release
+   above. The two locks answer different questions, and an adoption holds both.
    The clause's bound is the original branch: never rebase it, never
    force-push it, never push to it at all. Take its content onto a fresh
    branch off current `origin/main` (cherry-pick or re-apply in a worktree —
-   once qontinui-claude-config#901 lands, the trailer hook records you as
+   once config-repo PR #901 lands, the trailer hook records you as
    `Rebased-By:` and never as the author; until then a replay stamps YOUR
    `Session-Id:` onto the author's commits, which is the corruption that PR
    closes, so check its state before trusting the trailers you produced),
    open a NEW PR from that branch, and leave the
-   original PR to be superseded. Open it in `/implement-plan` Step 4.5b's
+   original PR to be superseded. Before it opens, run `/implement-plan`
+   Step 4.3 (fold in open follow-ups on the files this diff touches) on the
+   new branch — one `Resolves-Followup:` line per fold, each moved to `fixing`
+   after the read-back; a follow-up `fixing` under the PR you supersede is
+   carried to the new PR, not skipped (Step 4.3's superseding-PR exception). Open it in `/implement-plan` Step 4.5b's
    served door order and READ it back — `gh pr list --repo <owner/repo>
    --head <new-branch> --state all --json number,url,state,headRefOid` must
    return a row whose `headRefOid` is the head you pushed; the create call's
@@ -1074,7 +1666,7 @@ Then:
    rewritten record (the plan's §2c). Trailerless commits you re-applied need
    a `Session-Id-Inherited: <sha> <origin|unknown>` line per commit in the
    same body — the inherited arm of the Session-Id trailer gate, where the
-   target repo runs one (`qontinui-dev-notes`'s
+   target repo runs one (its
    `.github/workflows/require-session-id-trailer.yml` documents the grammar;
    read the target repo's own workflow rather than assuming); do not
    rebase-to-stamp them.
@@ -1086,6 +1678,21 @@ Then:
    it on next eval; only intervene if it doesn't.
 
 ## Step 7 — Remediation plan + /vet-imp
+
+**Read the fleet policy before you write a line of this plan.** Plans authored
+without it keep making decisions the engineering and other policies already
+decide. Fetch FRESH — never from memory, they version frequently:
+`coord_list_prompt_documents`, then `coord_get_prompt_document` (kind `policy`)
+for at least `engineering-priorities`, `planning-and-scope`, `plan-discipline`,
+`implementation-priorities`, `testing`, `verification-and-evidence`,
+`operating-rules`, `security-and-autonomy`, `production-and-cost` and
+`git-operations`, plus `ux-priorities` when the work touches a user-facing
+surface. Where those tools are not visible, `/policy list` / `/policy get policy
+<name>` reads the same documents. Apply them: every design choice a clause
+decides is written to that clause, with `[policy: <doc>/<clause>]` beside it, and
+a plan never contradicts a clause silently. If a document cannot be read, say so
+in the plan as `Policy review: UNKNOWN (<what failed>)` — an unread policy is not
+a policy that said nothing.
 
 Skip only if `--no-remediate`. Every coord-defect diagnosis — whether or not
 an admin-merge happened — produces a plan so the defect class dies:
@@ -1105,17 +1712,58 @@ an admin-merge happened — produces a plan so the defect class dies:
      `stuck_pr_watcher` / `coord.alerts` have caught this class? If yes, the
      plan includes the alert).
    - **Recovery taken**: labels removed, and — for each PR that reached the
-     merge step — the **hand-off** filed (gate id or escalation ref, and the
-     operator it went to), with links. Record `admin-merges performed` only when
-     an operator actually performed one; an agent's row is a hand-off, and
-     writing it as a merge puts a false recovery into the plan that the fix is
-     then designed against.
+     merge step — the merge sha and its `force_merge` notification, or, when
+     GitHub refused the merge (exit 4), the **hand-off** filed (gate id or
+     escalation ref), with links. Record a merge only when the script reported
+     one (`MERGED … as <sha>`); writing a refused merge as performed puts a false
+     recovery into the plan that the fix is then designed against.
 2. Invoke `Skill: vet-imp` with that plan path.
 3. If the session must end before the fix lands, register a coord gate via
    `/gate` (or `/blocked`) on the fix PR instead of leaving a silent stall.
 
 ## Rules
 
+- **Scope of a session's duty (operator instruction 2026-10-08; served policy
+  `finished-criteria`, read it via `/policy` rather than from this line).** A
+  session that implements PRs is finished once those PRs are pushed and nothing
+  it can act on right now remains — no check its own last push already turned
+  red for a code error, no textual conflict coord reads as `author_acts`, and
+  no missing gate [policy:
+  session-finished-at-green-not-at-merged, tightened by operator decision
+  2026-10-17: checks still running no longer hold it open]. Shepherding them to merge is coord's
+  merge train, plus its `ci_rework` / `escalate_evidence` / `pr_blocked` /
+  `stuck_pr_nudge` dispatch [policy:
+  finishing-is-a-handoff-not-an-abandonment]. That splits this command into two
+  uses, and they stop at different points:
+  - **Closeout of the authoring session** — the session that authored the PRs
+    runs this on its own PRs. Its goal is pushed with nothing owed, not green
+    and not landed: fix a check its own push already turned red (Step 3),
+    rebase once on an `author_acts` textual conflict, gate the rest, and stop at
+    Step 2's closeout exit. Checks still running, a PR that went BEHIND or
+    UNSTABLE only because `main` moved, or one queued behind
+    a backed-up runner pool, is coord's to carry, not a reason to stay. Step 4's
+    green-past-threshold clock does not keep this session alive.
+  - **A dedicated shepherding session** — invoked as a gate's
+    `run_skill babysit-prs` continuation, or launched to watch PRs it did not
+    author. The served policy names this command as that separate activity, so
+    landed IS its goal: Steps 2 and 4–7 apply in full. Two adjustments:
+    - Step 1's auto-detection finds only branches this session owns, so pass
+      the PRs as explicit pr-refs (a gate continuation carries them in its
+      args). Otherwise Step 1 finds none and exits. A DRAFT among PRs a gate's
+      continuation names explicitly with an ownerless-stranded hint
+      (`/dev-ops-steward`'s hand-off) is NOT a hold signal: its owner is gone,
+      so adopt it by route-around like any other.
+    - Step 3 fixes only a PR this session authored. A red on someone else's
+      branch goes to `/handoff-stuck-pr` while its author is live. Once the
+      author is gone, adopt it per Step 6 → "Adopting a foreign branch",
+      under a FRESH read of `git-operations` [policy:
+      abandoned-pr-branch-is-adoptable-by-route-around].
+
+  "Red for a code reason" is decided by the failure's own signature, not by the
+  colour [policy: a-red-check-is-not-automatically-a-code-error]: a job refused
+  before it ran, or one starved or abandoned in a queue, is not a code error,
+  and neither is a real failure that a control run on pristine `main` proves
+  pre-existing.
 - **Never bypass a legitimate hold.** `escalate-path-matched` and red CI are
   the system working. The command's value is telling these apart from
   defects, with evidence. For `escalate-path-matched`, "never bypass" is not
@@ -1128,10 +1776,12 @@ an admin-merge happened — produces a plan so the defect class dies:
   the PR. "It's been a while" is not a diagnosis. The bar does not drop just
   because the act moved to the operator; it rises, because they are acting on
   your evidence rather than their own.
-- **Never report a merge you did not perform.** Since #328 an agent's terminal
-  state on a diagnosed defect is `handed-to-operator`. Both the PR audit comment
-  (Step 6 item 1) and the exit report must say so.
-- **Bounded loops.** Max 3 CI-fix rounds per PR, 2 infra reruns per head,
+- **Never report a merge you did not perform.** An agent's terminal state on a
+  diagnosed defect is `merged-direct` (the script printed `MERGED … as <sha>`
+  and exit 0, 5 or 6) or `handed-to-operator` (exit 4, GitHub refused). Exit 5 is
+  a merge whose notification is still owed. Both the PR audit comment (Step 6
+  item 1) and the exit report say which.
+- **Bounded loops.** Max 3 CI-fix rounds per PR, 2 infra reruns per head (plus the one recovery re-run in Step 4's preamble),
   one remediation plan per defect class per run (dedupe: if `$QONTINUI_PLANS_DIR`
   already has a plan for this defect class, reference it instead of writing a
   twin; check before writing). **The directory is not the surface of record** — discovery
@@ -1146,8 +1796,97 @@ an admin-merge happened — produces a plan so the defect class dies:
   UNKNOWN is the expected failure here, so **say which check actually ran** in the
   exit report rather than recording the dedupe as passed.
 - **Don't race coord.** An in-flight queue proposal always wins; wait.
-- **Report on exit**: per-PR final state (merged-by-coord / **handed-to-operator**
-  / admin-merged / fixed-and-waiting / blocked-legitimate / operator-escalated),
+- **Subagents are counted by coord, and fixers stay bounded.** Every subagent
+  this command starts (a fresh-context reviewer, or a fixer) first takes a child
+  slot: `coord_child_slot {action: "acquire"}`, and spawns on `granted`.
+  Any other answer (the tool missing, unknown, unreachable or silent) is
+  settled by this rule, and nothing else:
+
+  **Resolve `coord_child_slot` before relying on any answer that is not
+  `granted` or `refused`.** "Not deployed" needs POSITIVE proof from coord
+  itself, because a coord that serves the tool also produces every other
+  symptom (a deferred tool not loaded yet, a dead native transport, a `-32601`
+  from a stale runner-proxy allowlist):
+
+  1. **Load it.** If the tool is not in your tool list, load it with
+     `ToolSearch` (`select:` its name). A tool that loads is used: call it.
+  2. **Probe coord's own door** when it does not load, or its call is
+     rejected as an unknown tool or method. This is unauthenticated and goes
+     around both the MCP client and the runner proxy. Run it afresh before
+     EVERY uncounted spawn, in this cycle; never reuse an answer from the
+     journal, an earlier cycle or an earlier report:
+
+     ```bash
+     # envelope-ok: reads only the HTTP status and a fixed-token match on coord's unknown-route 404; no envelope key is read
+     out=$(curl -sS -m 10 -w '\n%{http_code}' -X POST https://coord.qontinui.io/coord/child-slots -H 'Content-Type: application/json' -d '{}') || true
+     code=${out##*$'\n'}
+     case "$out" in *'"error":"no_such_route"'*) err=no_such_route ;; *) err=other ;; esac
+     echo "code=$code error=$err at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+     ```
+
+     - `code=404` AND `error=no_such_route` (coord's own typed answer for a
+       path it does not register) — **child slots are not deployed**. Start
+       the child uncounted, as before child slots existed, within every other
+       rule here. There is no slot to heartbeat or release for it.
+     - `code=404` with any other body (a proxy, a load balancer, a captive
+       portal) — not coord's answer, so it proves nothing: a refusal.
+     - any other HTTP code (`401`, `403`, `405`, `422`, ...) — the route
+       exists, so admission IS deployed and the tool must work. Call it through
+       `coord-revive.sh call coord_child_slot '{"action":"acquire"}'` (the
+       coord-revive skill's resolver). If that fails too, it is a refusal.
+     - `000`, an empty code, or a timeout — UNKNOWN, which is a refusal.
+  3. **Transport down** — the call is unreachable, times out, or answers
+     "Command failed with no output" — is a refusal for this cycle: start no
+     child. A reviewer waits and retries (the bounded backoff below); it never
+     reviews inline.
+
+  Whenever a child runs uncounted, record the proof in the exit report: the
+  probe's `code`, its `error` value and its UTC time, from THIS cycle's
+  probe. Whenever a transport failure refused a child, record the door and
+  the exact error.
+
+  Run every child as a
+  BACKGROUND Agent call: a foreground child blocks you, and a blocked parent
+  cannot heartbeat. Wait for children with `Monitor` on a bounded until-loop
+  with a timeout of a few minutes (well inside the slot's 600 s lapse), never a
+  foreground sleep; on each wake heartbeat every slot you hold
+  (`{action: "heartbeat", n}`) and check every child. Never end a turn only
+  waiting on a child. Release each slot (`{action: "release", n}`) as soon as its
+  child returns. An explicit `refused`, or an error from a coord that serves the
+  tool, is a REFUSAL:
+  - a **fixer** is not spawned; do that work yourself, serially;
+  - a **reviewer** whose review a gate requires (a pre-PR review, the
+    independence review an expedite or an adoption needs) is never replaced by
+    an inline self-review: inline review is legitimate only under a recorded
+    `degrade` disposition (served `verification-and-evidence`
+    `code-review-invocation-path`). Release the slot of every child that has
+    already returned (a child still running stays counted), and retry the
+    acquire with a bounded backoff, 3 tries over about 10 minutes. Still
+    refused: open no PR and request no expedite for that change, and report the
+    PR as `blocked-legitimate` with
+    `pre-PR review owed; reviewer child slot refused (held_by=<key>)`. For a
+    pre-PR review, record it through `review-arm-record.sh`: the registry read in `reads[]` as it
+    came back, with `"blocked": "pre-PR review owed; reviewer child slot refused
+    (held_by=<key>)"` added to that read row; NO `reviews[]` row, because no
+    review ran; and no arm of your own invention. When the change is an
+    adoption's NEW branch, push that branch so the work survives the worktree's
+    reclaim; never push to an open PR's head on this stop, because that push
+    would be the unreviewed change.
+
+  Step 3 fixes in-session. A dedicated shepherding session that splits red PRs
+  across fixer subagents follows the served `agent_playbook/merge-shepherd` §4
+  rule: at most 3 fixers at once and only as many as coord granted; related PRs
+  in ONE repo whose changed files do not overlap (`coord_conflict_check`); each
+  PR claimed with `coord_adopt_pr` before its child starts and released with
+  `pushed_head` after the push; at the first refused slot, claim none of the
+  batch's remaining PRs. There are no nested subagents, no child started in the
+  background and killed later, and no fan-out against one shared cause.
+  Children pass no `effort`, so they inherit yours, and they never claim or take
+  slots themselves: this session is the single claimant.
+- **Report on exit**: per-PR final state (merged-by-coord / `expedited-landed (request <id>)` / `expedite-pending (request <id>)` / `expedite-refused (<code>[, request <id>])` / `expedite-unreached (<observed>)` / **handed-to-operator**
+  / admin-merged [after request <id>] / fixed-and-waiting / blocked-legitimate / operator-escalated
+  / `handed-to-train (gate <id>)` for a closeout exit (Step 2), with its check
+  state),
   defects found, plan path + vet-imp outcome. `handed-to-operator` is the state
   a diagnosed defect ends in when an agent ran this command, and it carries the
   gate id or escalation ref that makes the PR watched; `admin-merged` is

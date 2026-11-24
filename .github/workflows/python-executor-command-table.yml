@@ -1,0 +1,89 @@
+name: Python executor command table
+
+# Runs the guards in python-bridge/tests/test_executor_command_table.py: every
+# Rust-sent command has a Python handler, the command table matches its snapshot,
+# and no mixin handler is decorated or declared twice. The file reads the executor
+# and its mixins as source (ast), so it needs only pytest, numpy and Pillow (what
+# tests/conftest.py imports) -- not the qontinui library or any GPU dependency.
+# Also runs python-bridge/tests/test_no_temp_debug_logs.py, the same kind of
+# stdlib-only ast guard: no bridge source writes a debug log under the OS temp
+# dir or ~ (plan 2026-11-14-one-xlib-distribution-and-no-tmp-debug-logs-in-the-python-bridge),
+# and tests/test_event_path_no_temp_writes.py, which exercises the event path with
+# its heavy imports stubbed so it too needs only these packages.
+# And python-bridge/tests/test_single_xlib_owner.py (stdlib tomllib only): the
+# bridge lock names exactly one distribution that installs `Xlib/` (python-xlib),
+# and neither pyautogui nor mouseinfo, which would bring back the python3-xlib
+# fork (same plan, phase 3).
+#
+# Hermetic: no network, no credentials. NOT a merge gate (absent from the repo
+# ruleset's required contexts). It is inside ci-integrity.yml's scope
+# (`.github/workflows/**`) on a main-based PR, so the PR that adds or edits this
+# file needs `ci:gate-change=declared`.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "python-bridge/**"
+      - "src-tauri/src/**"
+      - ".github/workflows/python-executor-command-table.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "python-bridge/**"
+      - "src-tauri/src/**"
+      - ".github/workflows/python-executor-command-table.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# PR-SCOPED SUPERSESSION (shared hosted-job cap relief, 2026-10-05). A FIRST-
+# attempt `pull_request` run joins a per-workflow, per-PR group and cancels the
+# run it supersedes there: a `synchronize` cancels the older head's run, and a
+# `reopened` cancels the same-head run it re-does (coord's ci-abandoned
+# recovery is a close+reopen). Every OTHER run -- whichever of push (main,
+# develop, merge-candidate*/** -- coord's candidate CI), schedule,
+# workflow_dispatch and workflow_run this file has, and EVERY re-run (run_attempt > 1) -- gets a
+# group unique to its run id + attempt, so it is never cancelled, never reaped
+# while pending, and never queues behind anything.
+# The group is ONE expression on purpose: coord models a group template by
+# interpolating only `github.event_name` / `github.ref` and collapsing every
+# other expression to "" (qontinui-coord ci_observer.rs resolve_group_template),
+# and run_is_reaper_at_risk never matches an empty group, so no push run here is
+# modelled as reapable by a land.
+# RESIDUAL: two pushes seconds apart can have
+# their runs CREATED out of order, so the older head's run cancels the newer
+# head's; the next push (or a close+reopen) heals it.
+# Pattern: qontinui-claude-config#1475.
+concurrency:
+  group: ${{ (github.event_name == 'pull_request' && github.run_attempt == 1) && format('{0}-pr-{1}', github.workflow, github.event.pull_request.number) || format('{0}-run-{1}-{2}', github.workflow, github.run_id, github.run_attempt) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.run_attempt == 1 }}
+
+jobs:
+  command-table:
+    name: Executor command table guards
+    # coord-pools: [self-hosted, Linux, X64, qontinui-host-nawa, qontinui, ram-2g] | [ubuntu-latest]
+    runs-on: ${{ fromJSON(((vars.RUNNER_CI_LANE_PYTHON_EXECUTOR_COMMAND_TABLE || vars.RUNNER_CI_LIGHT_LANE) == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && '["self-hosted","Linux","X64","qontinui-host-nawa","qontinui","ram-2g"]' || '"ubuntu-latest"') }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # A per-job venv under runner.temp, not the interpreter setup-python
+      # resolved: on a persistent self-hosted runner that interpreter lives in
+      # the runner's tool cache and outlives the job, so a bare `pip install`
+      # would leave these packages behind for every later job on the runner.
+      - name: Install test dependencies
+        run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install pytest numpy pillow
+
+      - name: Run the command-table and temp-debug-log guards
+        # conftest.py imports `models`, so pytest must run from python-bridge/.
+        working-directory: python-bridge
+        run: python -m pytest tests/test_executor_command_table.py tests/test_no_temp_debug_logs.py tests/test_event_path_no_temp_writes.py tests/test_single_xlib_owner.py -q

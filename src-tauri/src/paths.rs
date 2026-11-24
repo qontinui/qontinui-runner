@@ -63,10 +63,12 @@ pub fn get_dev_logs_dir() -> PathBuf {
 
 /// Get the default dev logs directory (cross-platform).
 fn get_default_dev_logs_dir() -> PathBuf {
-    dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("qontinui-runner")
-        .join("dev-logs")
+    qontinui_runner_lib::instance_env::platform_dir(
+        qontinui_runner_lib::instance_env::PlatformDir::DataLocal,
+    )
+    .unwrap_or_else(|| PathBuf::from("."))
+    .join("qontinui-runner")
+    .join("dev-logs")
 }
 
 /// Basename prefix of the runner's own rolling tracing sink. The daily
@@ -165,10 +167,12 @@ pub fn get_api_images_dir() -> PathBuf {
 /// derived analysis cache, rooted directly at the runner's app-data dir so it is
 /// independent of the dev-logs override and the per-instance scoping.
 pub fn get_code_graph_dir() -> PathBuf {
-    let base = dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("qontinui-runner")
-        .join("code-graph");
+    let base = qontinui_runner_lib::instance_env::platform_dir(
+        qontinui_runner_lib::instance_env::PlatformDir::DataLocal,
+    )
+    .unwrap_or_else(|| PathBuf::from("."))
+    .join("qontinui-runner")
+    .join("code-graph");
     ensure_dir_exists(&base);
     base
 }

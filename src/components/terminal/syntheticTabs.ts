@@ -58,8 +58,11 @@ export function isSyntheticTab(tabOrId: TerminalTab | string | null | undefined)
 export interface InjectedSessionProbe {
   /** Synthetic tab id (`synthetic-…`) for a tab-backed fake; else a real id or null. */
   zoneTabId: string | null;
-  /** The transcript record this session was projected from. */
-  _transcript: Pick<TranscriptSession, "injected_live_status" | "injected_tab">;
+  /**
+   * The transcript record this session was projected from; `null` for a
+   * tab-sourced row (`sessionManagerLiveRows.ts`), which no transcript backs.
+   */
+  _transcript: Pick<TranscriptSession, "injected_live_status" | "injected_tab"> | null;
 }
 
 /**
@@ -79,8 +82,8 @@ export interface InjectedSessionProbe {
  */
 export function isInjectedSession(session: InjectedSessionProbe): boolean {
   return (
-    session._transcript.injected_live_status != null ||
-    session._transcript.injected_tab != null ||
+    session._transcript?.injected_live_status != null ||
+    session._transcript?.injected_tab != null ||
     isSyntheticTab(session.zoneTabId)
   );
 }

@@ -51,13 +51,65 @@ export interface CiNodeHostSuggestion {
   cpus: number;
   mem_gib: number | null;
   limiting_term: "cores" | "memory" | null;
+  /**
+   * What an UNSET `max_concurrent_builds` resolves to right now (plan
+   * `2026-11-05-one-free-resource-model-places-sessions-builds-and-ci`
+   * Phase 7): coord's capacity model's Lane B total when the D9 dial permits
+   * and the read is fresh, else the static `suggested` with why the model did
+   * not answer. Absent from a runner predating Phase 7 — UNKNOWN, never "static".
+   */
+  unset_resolves_to?: CiNodeUnsetResolution;
+}
+
+/** `host_suggestion.unset_resolves_to` — one arm per `ConcurrencySource`. */
+export type CiNodeUnsetResolution =
+  | {
+      source: "model";
+      count: number;
+      running_at_sample: number;
+      slots_c1: number;
+      static_partition: number;
+    }
+  | { source: "static"; count: number; unknown_reason: string };
+
+/**
+ * The line under the concurrency input saying what an unset value gives this
+ * machine NOW. The static `suggested` is only what it gives when coord's
+ * capacity model does not answer, so naming it while the model sizes the node
+ * would be false. It never says "in use": the panel's state is unsaved, and a
+ * disabled node runs nothing. Returns `null` when no suggestion is loaded.
+ */
+export function unsetConcurrencyText(suggestion: CiNodeHostSuggestion | null): string | null {
+  if (suggestion === null) return null;
+  const r = suggestion.unset_resolves_to;
+  if (r === undefined) {
+    return "Unset gives: unknown (this runner build does not report it).";
+  }
+  if (r.source === "model") {
+    const sum = r.running_at_sample + r.slots_c1;
+    const capped =
+      sum > r.count
+        ? `, capped from ${sum}`
+        : sum < r.count
+          ? `, raised from ${sum} (minimum 1)`
+          : "";
+    return `Unset gives ${r.count} now, from coord's capacity model (${r.running_at_sample} running + ${r.slots_c1} free CI slots${capped}; static ceiling ${r.static_partition}).`;
+  }
+  return `Unset gives ${r.count} now, the host suggestion — the capacity model did not answer: ${r.unknown_reason}.`;
+}
+
+/** What clearing the explicit cap gives, for the button's label; `null` = unknown. */
+export function unsetConcurrencyCount(suggestion: CiNodeHostSuggestion | null): number | null {
+  if (suggestion === null) return null;
+  // Absent (a runner predating Phase 7) is UNKNOWN, never the static value.
+  return suggestion.unset_resolves_to?.count ?? null;
 }
 
 /**
  * Commit the concurrency input's text draft (called on blur, never per
  * keystroke). Anything numeric is an explicit override clamped to the
  * validator's range; empty or non-numeric text REVERTS to `previous` — it never
- * silently switches to "use the host suggestion". The "Use suggested" button is
+ * silently switches to unset. The "Clear to unset" button is
  * the only way to write `null`.
  */
 export function parseConcurrencyInput(raw: string, previous: number | null): number | null {
@@ -341,6 +393,32 @@ export function threadCeilingSourceText(
       return "raised to the warn ceiling — the lighter verdict has to fire first";
     case "census_misread":
       return "the built-in floor — the thread census disagreed with the live session count, so this machine's sized default is unknown right now";
+  }
+}
+
+/**
+ * The empty thread-ceiling input's placeholder.
+ *
+ * It quotes the enforced number only when that number IS this machine's
+ * default — provenance `scaled`, `floor` or `census_misread`, the three arms
+ * that name the default the runner chose. Under every other arm the enforced
+ * value is something else: a fleet ceiling, a clamp, or the warn ceiling the
+ * ladder raised critical to. Labelling it "machine default (N)" would be the
+ * lie the line under the input exists to correct. The bare words are honest
+ * there, and that line still states the number and its reason.
+ */
+export function threadCeilingPlaceholder(
+  which: "warn" | "critical",
+  report: ThreadCeilingsReport | null,
+): string {
+  if (!report) return "machine default";
+  switch (report.provenance[which]) {
+    case "scaled":
+    case "floor":
+    case "census_misread":
+      return `machine default (${report[which]})`;
+    default:
+      return "machine default";
   }
 }
 

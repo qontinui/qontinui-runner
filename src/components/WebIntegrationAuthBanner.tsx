@@ -40,6 +40,11 @@ import { AlertCircle, X } from "lucide-react";
 
 import { useRunnerTier } from "@/hooks/useRunnerTier";
 import { useTenant } from "@/contexts/TenantContext";
+import {
+  NO_BROWSER_HINT,
+  PendingSignInNotice,
+  isSignInCancelled,
+} from "@/components/PendingSignInNotice";
 
 import {
   applyCredentialDarkSignal,
@@ -48,9 +53,11 @@ import {
   effectiveCredentialDark,
   GET_COORD_CREDENTIAL_POSTURE_CMD,
   makeRePairClickHandler,
+  makeRetryRefreshHandler,
   makeSwitchTenantHandler,
   normalizeCredentialDarkSignal,
   RE_PAIR_CTA_GRACE_MS,
+  retryErrorSurvives,
   shouldShowAuthBanner,
   shouldShowRePairCta,
   statusSignature,
@@ -58,6 +65,7 @@ import {
   type AuthBannerStatus,
   type CredentialDarkSignal,
 } from "./web-integration-banner-logic";
+import { PRODUCTION_BACKEND_URL } from "@/lib/savedBackendUrl";
 
 // ---------------------------------------------------------------------------
 // Component
@@ -65,9 +73,6 @@ import {
 
 /** Session-storage key used for dismissal persistence across re-renders. */
 const DISMISS_STORAGE_KEY = "qontinui:web-integration-auth-banner:dismissed-signature";
-
-/** Fallback backend URL when status hasn't loaded yet. */
-const DEFAULT_BACKEND_URL = "https://api.qontinui.io";
 
 function readDismissedSignature(): string | null {
   try {
@@ -100,7 +105,7 @@ export function WebIntegrationAuthBanner() {
   // the same `get_web_integration_status` fetch that feeds the banner; falls
   // back to the production API host when the status hasn't loaded or carries no
   // backendUrl (the Rust command then derives the web origin itself).
-  const [backendUrl, setBackendUrl] = useState<string>(DEFAULT_BACKEND_URL);
+  const [backendUrl, setBackendUrl] = useState<string>(PRODUCTION_BACKEND_URL);
   const [dismissedSignature, setDismissedSignature] = useState<string | null>(() =>
     readDismissedSignature(),
   );
@@ -123,6 +128,16 @@ export function WebIntegrationAuthBanner() {
   const [nowTick, setNowTick] = useState<number>(() => Date.now());
   const [reKicking, setReKicking] = useState(false);
   const [reKickError, setReKickError] = useState<string | null>(null);
+  // The credential banner's "Retry refresh now" result: its inline error and
+  // the posture signal it was written about. Held apart from `reKickError`
+  // because a concluded `unrefreshable` swaps the CTA to the sign-in, and the
+  // error must stay visible beside the new button — but only until a posture
+  // signal that says something else arrives (`retryErrorSurvives`).
+  const [retryRefresh, setRetryRefresh] = useState<{
+    error: string;
+    signal: CredentialDarkSignal | null;
+  } | null>(null);
+  const retryRefreshError = retryRefresh?.error ?? null;
 
   // Credential-dark signal. The device-JWT refresher emits
   // `autonomy-credential-dark` with `{dark, cause, message, cta, since}` for
@@ -268,6 +283,7 @@ export function WebIntegrationAuthBanner() {
       const signal = normalizeCredentialDarkSignal(event.payload);
       if (!cancelled && signal !== null) {
         setCredentialDarkBySource((prev) => applyCredentialDarkSignal(prev, signal));
+        setRetryRefresh((prev) => (prev && retryErrorSurvives(prev.signal, signal) ? prev : null));
       }
     });
     return () => {
@@ -301,6 +317,9 @@ export function WebIntegrationAuthBanner() {
           // health, and it is not a recovery: contribute nothing.
           if (signal !== null) {
             setCredentialDarkBySource((prev) => applyCredentialDarkSignal(prev, signal));
+            setRetryRefresh((prev) =>
+              prev && retryErrorSurvives(prev.signal, signal) ? prev : null,
+            );
           }
         })
         .catch(() => {
@@ -379,9 +398,12 @@ export function WebIntegrationAuthBanner() {
       // `web-integration-changed`, which refreshes the status + device-JWT
       // probe above and hides the banner.
       await invoke<void>("cognito_sign_in", { backendUrl });
+      // A retry's "did not recover" is answered by this sign-in.
+      setRetryRefresh(null);
       window.dispatchEvent(new CustomEvent("runner-tier-changed"));
     } catch (err) {
-      setAuthorizeError(String(err));
+      // The user's own Cancel (from the pending-sign-in notice) is not a failure.
+      if (!isSignInCancelled(err)) setAuthorizeError(String(err));
     } finally {
       setAuthorizing(false);
     }
@@ -432,6 +454,28 @@ export function WebIntegrationAuthBanner() {
     setDismissedSignature(sig);
   }, [status, deviceJwtPresent, credentialDark]);
 
+  // "Retry refresh now": kick the refresher, WAIT for the pass it triggers,
+  // and render from the posture that pass left behind — so a retry that could
+  // not recover the credential says so (and an `unrefreshable` verdict swaps
+  // the button to the sign-in) instead of silently changing nothing.
+  const handleRetryRefresh = useCallback(async () => {
+    setReKicking(true);
+    setRetryRefresh(null);
+    try {
+      const retry = makeRetryRefreshHandler((cmd, args) => invoke<unknown>(cmd, args));
+      const result = await retry();
+      const signal = result.signal;
+      if (signal !== null) {
+        setCredentialDarkBySource((prev) => applyCredentialDarkSignal(prev, signal));
+      }
+      setRetryRefresh(result.error === null ? null : { error: result.error, signal });
+    } catch (err) {
+      setRetryRefresh({ error: String(err), signal: null });
+    } finally {
+      setReKicking(false);
+    }
+  }, []);
+
   // The credential banner's CTA. Both destinations are commands that already
   // exist: an interactive Cognito re-login, or the headless refresher kick.
   const handleCredentialCta = useCallback(
@@ -440,9 +484,9 @@ export function WebIntegrationAuthBanner() {
         await handleAuthorize();
         return;
       }
-      await handleRePair();
+      await handleRetryRefresh();
     },
-    [handleAuthorize, handleRePair],
+    [handleAuthorize, handleRetryRefresh],
   );
 
   if (tier !== "qontinui_account") return null;
@@ -458,6 +502,7 @@ export function WebIntegrationAuthBanner() {
     const busy = presentation.ctaAction === "cognito_sign_in" ? authorizing : reKicking;
     const ctaError =
       (presentation.ctaAction === "cognito_sign_in" ? authorizeError : reKickError) ??
+      retryRefreshError ??
       (presentation.showSwitchTenant ? switchTenantError : null);
     return (
       <div
@@ -498,6 +543,10 @@ export function WebIntegrationAuthBanner() {
                 <span style={{ color: "hsl(var(--destructive, 0 84% 60%))" }}>{ctaError}</span>
               </>
             ) : null}
+            <PendingSignInNotice
+              active={presentation.ctaAction === "cognito_sign_in" && authorizing}
+              noBrowserHint={NO_BROWSER_HINT.settings}
+            />
           </div>
           {presentation.showSwitchTenant && tenantSwitcherOpen ? (
             <div
@@ -714,6 +763,7 @@ export function WebIntegrationAuthBanner() {
               <span style={{ color: "hsl(var(--destructive, 0 84% 60%))" }}>{authorizeError}</span>
             </>
           ) : null}
+          <PendingSignInNotice active={authorizing} noBrowserHint={NO_BROWSER_HINT.settings} />
         </div>
       </div>
       <button

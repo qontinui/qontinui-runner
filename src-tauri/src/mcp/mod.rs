@@ -78,6 +78,7 @@ pub mod extraction;
 pub mod file_browser;
 pub mod file_registry;
 pub mod findings_api;
+pub mod fleet_capacity_api;
 pub mod fleet_policy_poller;
 pub mod generation_rules_api;
 pub mod generator_eval;
@@ -101,6 +102,7 @@ pub mod mcp_servers;
 pub mod memory_consolidation_api;
 pub mod meta_optimizer_api;
 pub mod misc;
+pub mod model_gateway_read;
 pub mod models;
 pub mod monitors;
 pub mod observations_api;
@@ -117,6 +119,7 @@ pub mod plan_library;
 pub mod playwright;
 pub mod playwright_collection;
 pub mod policy_context;
+pub mod policy_tenant; // whose policy a session is briefed under (plan 2026-11-13-runner-policy-injection-uses-the-device-default-tenant-not-the-sessions)
 pub mod prm_export;
 pub mod probe_executor;
 pub mod processes;
@@ -142,6 +145,15 @@ pub mod reviews;
 pub mod saved_api_requests;
 pub mod scheduler;
 pub mod sdk_client;
+pub mod sdk_http;
+// The connect handshake's door tests (coord finding c89c2766), in a file of
+// their own so a whole-file revert of sdk_client.rs keeps them.
+#[cfg(test)]
+mod sdk_connect_door_tests;
+// Device pairing at the same doors, with a stand-in phone that gates its routes as
+// ui-bridge-native's pairing does.
+#[cfg(test)]
+mod device_pairing_door_tests;
 pub mod sdk_terminal_buffer;
 pub mod security_audit;
 pub mod server;
@@ -150,6 +162,7 @@ pub mod session_compliance;
 pub mod session_message_poller;
 pub mod session_recap;
 pub mod session_repository;
+pub mod session_review;
 pub mod session_work_status;
 pub mod sessions;
 pub mod settings;
@@ -428,11 +441,6 @@ mod route_registration_tests {
     #[test]
     fn the_control_flags_a_family_whose_merge_was_deleted() {
         let mut sources = crate_sources();
-        let api = sources
-            .keys()
-            .find(|p| p.ends_with("mcp_api.rs"))
-            .expect("mcp_api.rs is in the tree")
-            .clone();
         // Composed at runtime on purpose. Spelled as one literal, this needle
         // would ITSELF be a `session_briefing::routes()` occurrence in this
         // file, and would mount the very family the test is trying to unmount
@@ -441,11 +449,25 @@ mod route_registration_tests {
         let family = "session_briefing";
         let merge = format!(".merge(crate::mcp::{family}::routes())");
 
-        let text = sources.get_mut(&api).expect("just found it");
+        // The file that REGISTERS the family, found by its code rather than by
+        // its name: the registration moves as `mcp_api` is split into
+        // `mcp_api/` (plan
+        // `2026-10-04-runner-mcp-api-rs-holds-the-http-composition-root-health-and-five-proxies-in-one-file`
+        // D5), so a hardcoded `mcp_api.rs` would one day mutate a file that no
+        // longer carries it. Comment-stripped, because this module's own doc
+        // comments QUOTE the merge and must not be mistaken for it.
+        let registering: Vec<PathBuf> = sources
+            .iter()
+            .filter(|(_, text)| strip_comments(text).contains(&merge))
+            .map(|(path, _)| path.clone())
+            .collect();
         assert!(
-            text.contains(&merge),
-            "the registration this test deletes must exist to begin with"
+            registering.len() == 1,
+            "the registration this test deletes must exist to begin with, in \
+             exactly one file; found it in {registering:?}"
         );
+
+        let text = sources.get_mut(&registering[0]).expect("just found it");
         *text = text.replace(&merge, "");
 
         assert!(

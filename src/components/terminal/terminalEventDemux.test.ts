@@ -25,6 +25,10 @@ vi.mock("@tauri-apps/api/event", () => ({
   }),
 }));
 
+// The ownership check (`isOwnedByThisWindow`) lives beside the tier
+// reconciler, whose roster publish schedules a `terminal_set_visibility` invoke.
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async () => undefined) }));
+
 import {
   registerTerminalOutputHandler,
   registerTerminalExitHandler,
@@ -33,6 +37,8 @@ import {
   __resetTerminalDemuxForTest,
 } from "./terminalEventDemux";
 import { _activeSubscriptionCount } from "@/hooks/ui-bridge-events/singleton-listener";
+import { publishRoster, __resetVisibilityTiersForTest } from "./terminalVisibilityTiers";
+import { transportStats } from "./transportStats";
 
 /** Fire the mocked listener for one event name. */
 function emit(eventName: string, payload: unknown): void {
@@ -47,6 +53,8 @@ function outputEvent(terminalId: string, data = "", offset?: number) {
 
 beforeEach(() => {
   __resetTerminalDemuxForTest();
+  __resetVisibilityTiersForTest();
+  transportStats.reset();
   listenCalls.length = 0;
   unlistenSpies.length = 0;
 });
@@ -190,5 +198,56 @@ describe("terminal-exit demux", () => {
     expect(__terminalDemuxStats().exit.listening).toBe(false);
     expect(__terminalDemuxStats().output.listening).toBe(true);
     unregOut();
+  });
+});
+
+describe("transport counters (plan 2026-09-20 Phase 1)", () => {
+  it("counts each output event once per window, however many consumers share the listener", async () => {
+    publishRoster("page-1", ["term-a"]);
+    const unregPane = registerTerminalOutputHandler("term-a", vi.fn());
+    const releaseTap = subscribeTerminalOutputStream(vi.fn());
+    await Promise.resolve();
+
+    emit("terminal-output", outputEvent("term-a", "aGk="));
+    emit("terminal-output", outputEvent("term-a", "aGk="));
+
+    expect(transportStats.eventsDelivered).toBe(2);
+    expect(transportStats.eventsForeign).toBe(0);
+    unregPane();
+    releaseTap();
+  });
+
+  it("classifies an event for a terminal nothing in this window owns as foreign", async () => {
+    publishRoster("page-1", ["term-a"]);
+    const releaseTap = subscribeTerminalOutputStream(vi.fn());
+    await Promise.resolve();
+
+    emit("terminal-output", outputEvent("term-a"));
+    emit("terminal-output", outputEvent("term-elsewhere"));
+    emit("terminal-output", outputEvent("term-elsewhere"));
+
+    expect(transportStats.eventsDelivered).toBe(3);
+    expect(transportStats.eventsForeign).toBe(2);
+    releaseTap();
+  });
+
+  it("counts events with only a pane handler and no page tap", async () => {
+    const unregPane = registerTerminalOutputHandler("term-b", vi.fn());
+    await Promise.resolve();
+
+    emit("terminal-output", outputEvent("term-b"));
+
+    // No roster published, no tier declared: nothing in the window owns it.
+    expect(transportStats.eventsDelivered).toBe(1);
+    expect(transportStats.eventsForeign).toBe(1);
+    unregPane();
+  });
+
+  it("does not count terminal-exit events", async () => {
+    const unreg = registerTerminalExitHandler("term-a", vi.fn());
+    await Promise.resolve();
+    emit("terminal-exit", { terminalId: "term-a", exitCode: 0 });
+    expect(transportStats.eventsDelivered).toBe(0);
+    unreg();
   });
 });

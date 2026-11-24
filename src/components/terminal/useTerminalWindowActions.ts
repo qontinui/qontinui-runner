@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { instanceStorage } from "@/lib/instance-storage";
 import { setPageBinding } from "@/lib/pageBindings";
 import { zoneLayoutStorageKey } from "./useZoneLayout";
+import { sessionSidebarStorageKey } from "./sessionSidebarPersistence";
 
 /**
  * A runner-owned OS window (the main window or a `term-N` pop-out), as
@@ -30,12 +31,9 @@ export function useTerminalWindowActions() {
   }, []);
 
   /** Move `tabId` to an existing window (`"main"` or `"term-N"`). */
-  const moveTabToWindow = useCallback(
-    async (tabId: string, windowLabel: string): Promise<void> => {
-      await invoke("assign_session_to_window", { sessionId: tabId, windowLabel });
-    },
-    [],
-  );
+  const moveTabToWindow = useCallback(async (tabId: string, windowLabel: string): Promise<void> => {
+    await invoke("assign_session_to_window", { sessionId: tabId, windowLabel });
+  }, []);
 
   /** Enumerate the runner's own windows (main + pop-outs). */
   const listWindows = useCallback(async (): Promise<RunnerWindowRecord[]> => {
@@ -69,6 +67,19 @@ export function useTerminalWindowActions() {
       }
     } catch {
       // Layout copy is best-effort — the pop-out falls back to auto-layout.
+    }
+    // The Session Manager sidebar travels with the layout: a page detached in
+    // tmux work mode needs its navigator open in the new window too.
+    try {
+      const sidebar = instanceStorage.getJSON<unknown>(
+        sessionSidebarStorageKey(pageId, "main"),
+        null,
+      );
+      if (sidebar !== null) {
+        instanceStorage.setJSON(sessionSidebarStorageKey(pageId, rec.label), sidebar);
+      }
+    } catch {
+      // Best-effort, like the layout copy — the pop-out falls back to the default.
     }
     // Optimistic mirror update so the main window hides + switches off the page
     // without waiting for the Rust snapshot refresh (window-opened) to arrive.

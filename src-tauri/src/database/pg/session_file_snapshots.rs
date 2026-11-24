@@ -287,8 +287,9 @@ impl PgDb {
 /// keeping disk usage bounded.
 pub const SNAPSHOT_RETENTION_DAYS: i32 = 7;
 
-/// Spawn a background task that prunes old snapshot rows + blobs once every
-/// 24 hours. The task survives until the runner exits — there's no
+/// Spawn a background task that prunes old snapshot rows + blobs — and the
+/// `project.session_review_*` rows (`database/pg/session_review.rs`) — once
+/// every 24 hours. The task survives until the runner exits — there's no
 /// shutdown signalling because the operation is short and idempotent.
 ///
 /// Patterned after `memory::scheduler::start_memory_scheduler`, with an
@@ -317,6 +318,24 @@ pub fn start_session_snapshot_pruner(pg: Arc<PgDb>) -> tauri::async_runtime::Joi
                 }
                 Err(e) => {
                     warn!("session_file_snapshots pruner: prune failed: {}", e);
+                }
+            }
+            // Review read marks and notes ride the same tick and retention —
+            // they describe the diffs these snapshots are the "before" of.
+            match pg
+                .prune_session_review_older_than(super::session_review::REVIEW_RETENTION_DAYS)
+                .await
+            {
+                Ok((hunks, notes)) => {
+                    if hunks > 0 || notes > 0 {
+                        info!(
+                            "session review pruner: pruned {} read marks, {} notes",
+                            hunks, notes
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!("session review pruner: prune failed: {}", e);
                 }
             }
         }

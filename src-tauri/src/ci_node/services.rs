@@ -2195,6 +2195,32 @@ mod tests {
             .to_string();
         assert_eq!(password.len(), 32);
 
+        // The runtime the stack actually chose, which may be podman.
+        let runtime = stack
+            .runtime
+            .clone()
+            .expect("a provisioned stack has a runtime");
+
+        // Both registry images declare a `VOLUME`, so each container owns an
+        // anonymous volume. Read them BEFORE teardown so the removal's `-v` can
+        // be proven on a real daemon, not only as a pinned argv string.
+        let mut inspect = vec![
+            "inspect",
+            "--format",
+            "{{range .Mounts}}{{if eq .Type \"volume\"}}{{.Name}} {{end}}{{end}}",
+        ];
+        inspect.extend(stack.container_names().iter().map(String::as_str));
+        let volumes: Vec<String> = run_capture(&runtime, &inspect, CONTAINER_CMD_TIMEOUT, None)
+            .await
+            .expect("inspect must answer")
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        assert!(
+            volumes.len() >= 2,
+            "every registry image declares a VOLUME, so each container owns one: {volumes:?}"
+        );
+
         let log = stack.removal_log();
         stack.teardown().await;
         assert!(stack.container_names().is_empty());
@@ -2206,7 +2232,7 @@ mod tests {
 
         // Nothing labelled with this dispatch survives.
         let leftovers = run_capture(
-            "docker",
+            &runtime,
             &[
                 "ps",
                 "-aq",
@@ -2221,6 +2247,26 @@ mod tests {
         assert!(
             leftovers.trim().is_empty(),
             "containers leaked: {leftovers:?}"
+        );
+
+        // ...and nor does any of their anonymous volumes: `rm -f` without `-v`
+        // leaves exactly these behind (plan
+        // 2026-10-02-orphaned-anonymous-docker-volumes-stop-producers-and-reap-nightly).
+        let remaining = run_capture(
+            &runtime,
+            &["volume", "ls", "-q"],
+            CONTAINER_CMD_TIMEOUT,
+            None,
+        )
+        .await
+        .expect("volume ls must answer");
+        let orphaned: Vec<&String> = volumes
+            .iter()
+            .filter(|v| remaining.lines().any(|l| l.trim() == v.as_str()))
+            .collect();
+        assert!(
+            orphaned.is_empty(),
+            "teardown orphaned anonymous volumes: {orphaned:?}"
         );
     }
 

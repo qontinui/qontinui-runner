@@ -29,17 +29,24 @@
 //!
 //! # File semantics
 //!
-//! The log file is a *last crash* record, not a history: each startup
-//! truncates it on install. If the runner boots successfully, the file
-//! stays there until the next panic overwrites it. The supervisor uses
-//! mtime-within-60s of exit to decide whether a given exit corresponds
-//! to the panic on disk.
+//! The log file is a *last panic* record, not a history: every panic that
+//! reaches [`write_panic_log`] rewrites it whole (`File::create`; a
+//! recursive panic or a failed write leaves the previous contents), and
+//! installing the hook does NOT truncate it. A runner that boots cleanly
+//! therefore leaves an OLDER process's panic on disk until its own next
+//! panic overwrites it, so a reader must not take the file's presence as
+//! this process's panic — the `pid=` on the header line is what names the
+//! process. For how the supervisor matches a panic to a spawn (and any
+//! time window it applies), see qontinui-supervisor's
+//! `dev_action::attribution::is_startup_panic_of` and
+//! `process::manager::check_and_record_panic_log`.
 //!
 //! # Log dir resolution
 //!
 //! 1. `QONTINUI_RUNNER_LOG_DIR` env var (supervisor sets this when spawning).
 //! 2. `<LOCALAPPDATA>/qontinui-runner/dev-logs` (Windows) or the platform
-//!    equivalent via `dirs::data_local_dir()`.
+//!    equivalent via `instance_env::platform_dir(DataLocal)` (inside the
+//!    instance root for a subject runner).
 //!
 //! We deliberately do *not* consult `crate::paths::get_dev_logs_dir()`
 //! here because that helper reads settings — which may itself panic
@@ -51,7 +58,8 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// File name inside the log dir. One file per startup — overwritten.
+/// File name inside the log dir. Holds only the most recent panic; each
+/// panic that reaches [`write_panic_log`] overwrites it whole.
 pub const PANIC_LOG_FILENAME: &str = "runner-panic.log";
 
 /// Re-entrancy guard so a panic *inside* the panic hook doesn't recurse.
@@ -66,10 +74,12 @@ pub fn resolve_log_dir() -> PathBuf {
             return PathBuf::from(custom);
         }
     }
-    dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("qontinui-runner")
-        .join("dev-logs")
+    qontinui_runner_lib::instance_env::platform_dir(
+        qontinui_runner_lib::instance_env::PlatformDir::DataLocal,
+    )
+    .unwrap_or_else(|| PathBuf::from("."))
+    .join("qontinui-runner")
+    .join("dev-logs")
 }
 
 /// Full path to the panic log file.

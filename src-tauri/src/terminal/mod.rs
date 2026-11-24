@@ -3,30 +3,55 @@
 //! Provides full terminal emulation inside the runner via `portable-pty`.
 //! Each session spawns a native shell (PowerShell on Windows, $SHELL on Unix)
 //! with proper environment for running Claude CLI and other dev tools.
+//!
+//! Spawn-path contract: [`runner_context`] renders with zero I/O; the one
+//! bounded I/O a spawn seam performs for it is the served-corpus measurement
+//! ([`crate::served_corpus::probe`], or [`crate::served_corpus::probe_start`]
+//! joined later), whose result the seam passes in beside the per-session
+//! `CoordMcpDelivery`.
 
 pub mod account_migration;
 pub mod agent_status_sideband;
 pub mod auto_response;
 pub mod auto_response_fleet;
 pub mod claude_resume_sniff;
+pub mod close_authority;
 pub mod commit_report;
 pub mod context_watcher;
 pub mod coord_warn;
+pub mod daemon_pane_io;
 pub mod exit_notice;
+pub mod focus_coalescer;
 pub mod graceful_exit;
 pub mod grid;
+pub mod holder_boot_sweep;
+pub mod holder_census;
+#[cfg(test)]
+mod idle_chrome_replay;
 pub mod interceptor;
+pub mod launch_failure; // The identity shim's launch-failure reports (plan 2026-11-10-migration-holds-for-missing-claude-cli)
+pub(crate) mod limit_hint; // the usage-limit hint's decision path behind an injectable env (plan 2026-11-05-runner-terminal-pages-collide-crowd-and-overfill-and-limit-stalled-sessions-never-resume, Phase 2)
+pub(crate) mod limit_reset; // continue-in-place / park a session stopped at a usage limit (plan 2026-11-05-runner-terminal-pages-collide-crowd-and-overfill-and-limit-stalled-sessions-never-resume, Phase 2)
+pub(crate) mod limit_stop; // transcript-read usage-limit stop classifier and the park list (plan 2026-11-05-runner-terminal-pages-collide-crowd-and-overfill-and-limit-stalled-sessions-never-resume, Phases 1-2)
 pub mod manager;
 pub mod operator_touch_watch; // Trigger 1 (idle_at_prompt, riding the context_watcher grid-scan tick) + the Notification-hook landing pad for triggers 2/3 (permission_prompt) (plan 2026-08-27-operator-touch-observation-runner-emitter, Phase B2)
 pub mod output_scan;
+pub mod page_placement;
 pub mod pane_io;
+pub mod pane_output;
 pub mod phantom_turn;
 pub mod remote_pane_io;
+pub mod respawn_liveness; // Is the resumed CLI alive? The proof + retry-then-rollback every `--resume` respawn passes (plan 2026-10-20-account-migration-respawn-dies-during-cli-reinstall-churn, Phase 4)
 mod scan_gate;
 pub mod scan_interval;
 pub mod session;
+pub mod session_carry;
+pub mod spawn_refusal;
 pub mod transcript;
 pub mod transcript_watcher;
+#[cfg(test)]
+mod transport_cost;
+pub mod transport_stats;
 pub mod types;
 pub mod usage_limit;
 pub mod visibility;
@@ -189,6 +214,18 @@ pub(crate) fn scrub_credential_env_pty(cmd: &mut portable_pty::CommandBuilder) {
     for name in CREDENTIAL_VALUE_ENV_VARS {
         cmd.env_remove(name);
     }
+    apply_model_gateway_env_pty(cmd);
+}
+
+/// Twin of [`apply_model_gateway_env_std`] for this seam's `Command` type.
+fn apply_model_gateway_env_pty(cmd: &mut portable_pty::CommandBuilder) {
+    let plan = crate::model_gateway::live_child_env_plan();
+    for name in &plan.remove {
+        cmd.env_remove(name);
+    }
+    for (k, v) in &plan.set {
+        cmd.env(k, v);
+    }
 }
 
 /// Strip [`CREDENTIAL_VALUE_ENV_VARS`] from a tokio child's environment.
@@ -199,6 +236,18 @@ pub(crate) fn scrub_credential_env_pty(cmd: &mut portable_pty::CommandBuilder) {
 pub(crate) fn scrub_credential_env_tokio(cmd: &mut tokio::process::Command) {
     for name in CREDENTIAL_VALUE_ENV_VARS {
         cmd.env_remove(name);
+    }
+    apply_model_gateway_env_tokio(cmd);
+}
+
+/// Twin of [`apply_model_gateway_env_std`] for this seam's `Command` type.
+fn apply_model_gateway_env_tokio(cmd: &mut tokio::process::Command) {
+    let plan = crate::model_gateway::live_child_env_plan();
+    for name in &plan.remove {
+        cmd.env_remove(name);
+    }
+    for (k, v) in &plan.set {
+        cmd.env(k, v);
     }
 }
 
@@ -220,6 +269,106 @@ pub(crate) fn scrub_credential_env_tokio(cmd: &mut tokio::process::Command) {
 pub(crate) fn scrub_credential_env_std(cmd: &mut std::process::Command) {
     for name in CREDENTIAL_VALUE_ENV_VARS {
         cmd.env_remove(name);
+    }
+    apply_model_gateway_env_std(cmd);
+}
+
+/// The variable that turns on Python UTF-8 mode; see
+/// [`session::TerminalSession::apply_python_utf8_default`] (the PTY seam) and
+/// [`apply_python_utf8_default_std`] (the headless seams).
+pub(crate) const PYTHONUTF8_ENV: &str = "PYTHONUTF8";
+
+/// Whether a headless spawn seam must set `PYTHONUTF8=1`: on Windows only,
+/// and only when neither the caller (an explicit `env` / `env_remove` on the
+/// command) nor the runner's own environment already decided it.
+///
+/// The same rule as the PTY seam's
+/// [`session::TerminalSession::apply_python_utf8_default`] (plan
+/// `2026-11-08-plan-stamp-and-pr-body-publish-doors-trust-a-corrupted-input-file`
+/// Phase 3). A `std::process::Command`, unlike a PTY `CommandBuilder`, does not
+/// seed its env map from the process, so "already set" has two halves here: the
+/// command's own explicit entries and the inherited process env. Pure, so it is
+/// testable on every host.
+pub(crate) fn python_utf8_default_needed(
+    is_windows: bool,
+    caller_decided: bool,
+    inherited: Option<&std::ffi::OsStr>,
+) -> bool {
+    is_windows && !caller_decided && inherited.is_none()
+}
+
+/// Whether `cmd` carries an explicit `PYTHONUTF8` entry (set or removed).
+/// Windows env names are case-insensitive, so the match ignores case.
+fn caller_decided_python_utf8(cmd: &std::process::Command) -> bool {
+    cmd.get_envs()
+        .any(|(k, _)| k.eq_ignore_ascii_case(PYTHONUTF8_ENV))
+}
+
+/// Apply the Windows `PYTHONUTF8=1` default to a headless `std` spawn seam —
+/// every seam that also carries the non-interactive git posture, because each
+/// spawns a `claude` whose helpers run Python. Order-independent: it never
+/// overwrites a value the caller set, before or after this call.
+pub(crate) fn apply_python_utf8_default_std(cmd: &mut std::process::Command) {
+    let inherited = std::env::var_os(PYTHONUTF8_ENV);
+    if python_utf8_default_needed(
+        cfg!(windows),
+        caller_decided_python_utf8(cmd),
+        inherited.as_deref(),
+    ) {
+        cmd.env(PYTHONUTF8_ENV, "1");
+    }
+}
+
+/// Twin of [`apply_python_utf8_default_std`] for the tokio seams.
+pub(crate) fn apply_python_utf8_default_tokio(cmd: &mut tokio::process::Command) {
+    let inherited = std::env::var_os(PYTHONUTF8_ENV);
+    if python_utf8_default_needed(
+        cfg!(windows),
+        caller_decided_python_utf8(cmd.as_std()),
+        inherited.as_deref(),
+    ) {
+        cmd.env(PYTHONUTF8_ENV, "1");
+    }
+}
+
+/// Test-only assertion: a headless spawn seam applied the Windows
+/// `PYTHONUTF8=1` default — set on Windows when the test process inherits no
+/// value, absent otherwise. Shared by the per-seam tests so dropping the call
+/// from any seam reddens that seam's test on the Windows CI leg.
+#[cfg(test)]
+pub(crate) fn assert_python_utf8_default_std(cmd: &std::process::Command, seam: &str) {
+    let got = cmd
+        .get_envs()
+        .find(|(k, _)| k.eq_ignore_ascii_case(PYTHONUTF8_ENV))
+        .and_then(|(_, v)| v.map(|v| v.to_string_lossy().to_string()));
+    let expected =
+        (cfg!(windows) && std::env::var_os(PYTHONUTF8_ENV).is_none()).then(|| "1".to_string());
+    assert_eq!(
+        got, expected,
+        "{seam}: the Windows PYTHONUTF8=1 default is not applied as expected"
+    );
+}
+
+/// [`assert_python_utf8_default_std`] over a `tokio::process::Command`.
+#[cfg(test)]
+pub(crate) fn assert_python_utf8_default_tokio(cmd: &tokio::process::Command, seam: &str) {
+    assert_python_utf8_default_std(cmd.as_std(), seam);
+}
+
+/// The model-gateway half of the child env posture
+/// ([`crate::model_gateway::live_child_env_plan`]): on an install that declares
+/// a gateway, the child runs under the gateway config dir with
+/// `ANTHROPIC_BASE_URL` set and env-borne vendor credentials removed. It runs
+/// inside the scrub, which every seam calls LAST, so it overrides any
+/// subscription-account `CLAUDE_CONFIG_DIR` pin set earlier in the seam. A
+/// no-op without a gateway.
+fn apply_model_gateway_env_std(cmd: &mut std::process::Command) {
+    let plan = crate::model_gateway::live_child_env_plan();
+    for name in &plan.remove {
+        cmd.env_remove(name);
+    }
+    for (k, v) in &plan.set {
+        cmd.env(k, v);
     }
 }
 
@@ -308,9 +457,18 @@ pub const RUNNER_CONTEXT_SOURCE_MARKER: &str = concat!(
 /// 2. line 2 — the provenance label, e.g.
 ///    `[briefing: coord session_briefing/runner-session v7]` or
 ///    `[briefing: builtin-fallback]`;
-/// 3. the base body: the cached coord document with the closed placeholder
+/// 3. the key-addressed header lines: `[coord-credential: …]` when the
+///    runner's credential is not live, then `[served-corpus: …]`, always —
+///    see [`crate::served_corpus`];
+/// 4. the base body: the cached coord document with the closed placeholder
 ///    vocabulary substituted, or the builtin;
-/// 4. the fleet-gated plan-capture clause, on the same condition as before.
+/// 5. the fleet-gated plan-capture clause, on the same condition as before.
+///
+/// The spawn-path I/O this render needs is done by the SEAM, not here: each
+/// seam measures its workdir with the bounded [`crate::served_corpus::probe`]
+/// (the terminal spawn starts [`crate::served_corpus::probe_start`] early and
+/// joins it) and passes the result in as `served`, exactly as it passes
+/// `coord_mcp`.
 ///
 /// Every degradation — coord unreachable, unpaired runner, absent document, a
 /// body that fails the render-time guard — falls back to the builtin and SAYS
@@ -430,7 +588,11 @@ pub const RUNNER_CONTEXT_SOURCE_MARKER: &str = concat!(
 /// `QONTINUI_PLAN_LIBRARY_WRITE` means — use the backend door, and record any
 /// refusal as DEFERRED-WITH-CAUSE rather than as "capture is impossible" (plan
 /// `2026-09-02-plan-capture-briefing-names-a-door-that-is-off`).
-pub fn runner_context(api_port: u16, coord_mcp: crate::coord_mcp::CoordMcpDelivery) -> String {
+pub fn runner_context(
+    api_port: u16,
+    coord_mcp: crate::coord_mcp::CoordMcpDelivery,
+    served: &crate::served_corpus::ServedCorpus,
+) -> String {
     use crate::coord_mcp::CoordMcpDelivery;
     use crate::mcp::fleet_policy_poller::{BRIEFING_PLAN_CAPTURE_CLAUSE, BRIEFING_RUNNER_SESSION};
     use crate::mcp::session_briefing;
@@ -529,8 +691,17 @@ pub fn runner_context(api_port: u16, coord_mcp: crate::coord_mcp::CoordMcpDelive
         .map(|l| format!("{l}\n"))
         .unwrap_or_default();
 
+    // The served-corpus header line, ALWAYS present: which `.claude/` this
+    // session was served, its drift as of the last fetch, and whether its files
+    // are this build's bundle (plan `2026-09-03-served-corpus-provenance-at-spawn`).
+    // Measured by the SEAM and handed in, like `coord_mcp`; rendering it is a
+    // pure format. It follows the conditional credential line, so it is line 3
+    // or line 4 — readers address it by its `[served-corpus: ` key, never by
+    // position.
+    let served = served.render_line();
+
     format!(
-        "{RUNNER_CONTEXT_SOURCE_MARKER}\n{provenance}\n{credential}{}{briefing}",
+        "{RUNNER_CONTEXT_SOURCE_MARKER}\n{provenance}\n{credential}{served}\n{}{briefing}",
         base.text
     )
 }
@@ -929,16 +1100,70 @@ fn push_visible_run(out: &mut String, run: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::{
+        apply_python_utf8_default_std, apply_python_utf8_default_tokio, python_utf8_default_needed,
+        PYTHONUTF8_ENV,
+    };
+    use super::{
         memory_clause, memory_clause_conditional, plan_capture_clause_body, runner_context,
         scrub_credential_env_pty, scrub_credential_env_std, scrub_credential_env_tokio,
         spawn_seam_api_port, strip_ansi, CREDENTIAL_VALUE_ENV_VARS, PLAN_CAPTURE_CLAUSE_TEMPLATE,
         RUNNER_CONTEXT_SOURCE_MARKER,
     };
     use crate::coord_mcp::CoordMcpDelivery;
+
+    /// The headless seams' `PYTHONUTF8` rule (plan
+    /// `2026-11-08-plan-stamp-and-pr-body-publish-doors-trust-a-corrupted-input-file`
+    /// Phase 3, extended past the PTY seam): set only on Windows, and never
+    /// over a caller's explicit entry or an inherited value.
+    #[test]
+    fn python_utf8_default_needed_only_on_windows_when_undecided() {
+        let zero = std::ffi::OsStr::new("0");
+        assert!(python_utf8_default_needed(true, false, None));
+        assert!(!python_utf8_default_needed(true, true, None), "caller wins");
+        assert!(
+            !python_utf8_default_needed(true, false, Some(zero)),
+            "an inherited PYTHONUTF8=0 wins"
+        );
+        assert!(
+            !python_utf8_default_needed(false, false, None),
+            "not off Windows"
+        );
+    }
+
+    /// A caller's explicit entry — in any case, and a removal too — is never
+    /// overwritten by the headless seam helper.
+    #[test]
+    fn apply_python_utf8_default_std_keeps_a_caller_entry() {
+        let mut cmd = std::process::Command::new("dummy");
+        cmd.env("pythonutf8", "0");
+        apply_python_utf8_default_std(&mut cmd);
+        let entries: Vec<_> = cmd
+            .get_envs()
+            .filter(|(k, _)| k.eq_ignore_ascii_case(PYTHONUTF8_ENV))
+            .map(|(k, v)| (k.to_os_string(), v.map(|v| v.to_os_string())))
+            .collect();
+        assert_eq!(
+            entries,
+            vec![("pythonutf8".into(), Some("0".into()))],
+            "the caller's entry must be the only one"
+        );
+
+        let mut removed = tokio::process::Command::new("dummy");
+        removed.env_remove(PYTHONUTF8_ENV);
+        apply_python_utf8_default_tokio(&mut removed);
+        assert!(
+            removed
+                .as_std()
+                .get_envs()
+                .all(|(k, v)| !k.eq_ignore_ascii_case(PYTHONUTF8_ENV) || v.is_none()),
+            "an explicit removal must stay a removal"
+        );
+    }
     use crate::mcp::fleet_policy_poller::{
         briefing_for_test, pin_plan_capture_level_for_test, BriefingProvenance,
         BRIEFING_PLAN_CAPTURE_CLAUSE, BRIEFING_RUNNER_SESSION, PLAN_CAPTURE_RECORD,
     };
+    use crate::served_corpus::ServedCorpus;
 
     /// Hold the coord-credential posture at UNKNOWN for the life of the guard.
     ///
@@ -1146,7 +1371,11 @@ mod tests {
         // and running it in an undefined level state is the kind of latent race
         // that only shows up once someone strengthens the assertion.
         let _pin = pin_plan_capture_level_for_test("off");
-        let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
+        let briefing = runner_context(
+            9876,
+            CoordMcpDelivery::Unprovisioned,
+            &ServedCorpus::unknown("test"),
+        );
         assert_eq!(
             briefing.lines().next(),
             Some(RUNNER_CONTEXT_SOURCE_MARKER),
@@ -1169,7 +1398,11 @@ mod tests {
         // this pins it quiet so that line is absent for this render.
         let _cred_quiet = quiet_credential_posture();
         let _pin = pin_plan_capture_level_for_test("off");
-        let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
+        let briefing = runner_context(
+            9876,
+            CoordMcpDelivery::Unprovisioned,
+            &ServedCorpus::unknown("test"),
+        );
         assert!(
             briefing.contains("/coord/agent-prompt-documents (list, optional ?kind= filter)"),
             "the list fallback must be the agent door: {briefing}"
@@ -1213,7 +1446,11 @@ mod tests {
             ),
         );
 
-        let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
+        let briefing = runner_context(
+            9876,
+            CoordMcpDelivery::Unprovisioned,
+            &ServedCorpus::unknown("test"),
+        );
         assert!(
             !briefing.contains("/coord/prompt-documents"),
             "an edited body must not be able to advertise the operator door: {briefing}"
@@ -1257,7 +1494,11 @@ mod tests {
         let _cred_quiet = quiet_credential_posture();
         let _pin = pin_plan_capture_level_for_test("off");
 
-        let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
+        let briefing = runner_context(
+            9876,
+            CoordMcpDelivery::Unprovisioned,
+            &ServedCorpus::unknown("test"),
+        );
         assert!(
             !briefing.contains(CLAUSE_MARKER),
             "the capture clause must not appear at level off"
@@ -1299,7 +1540,11 @@ mod tests {
         let _cred_quiet = quiet_credential_posture();
         let _pin = pin_plan_capture_level_for_test(PLAN_CAPTURE_RECORD);
 
-        let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
+        let briefing = runner_context(
+            9876,
+            CoordMcpDelivery::Unprovisioned,
+            &ServedCorpus::unknown("test"),
+        );
 
         // The runner door, on the loopback API port the caller passed.
         assert!(briefing.contains("http://127.0.0.1:9876/plan-library/artifacts"));
@@ -1412,7 +1657,11 @@ mod tests {
         let pin = pin_plan_capture_level_for_test("off");
         for level in ["observe", "gate", "recording", "RECORD ", "", "on"] {
             pin.set(level);
-            let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
+            let briefing = runner_context(
+                9876,
+                CoordMcpDelivery::Unprovisioned,
+                &ServedCorpus::unknown("test"),
+            );
             assert!(
                 !briefing.contains(CLAUSE_MARKER),
                 "level `{level}` must not inject the clause"
@@ -1443,7 +1692,11 @@ mod tests {
         let _cred_quiet = quiet_credential_posture();
         let _pin = pin_plan_capture_level_for_test(PLAN_CAPTURE_RECORD);
 
-        let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
+        let briefing = runner_context(
+            9876,
+            CoordMcpDelivery::Unprovisioned,
+            &ServedCorpus::unknown("test"),
+        );
         for forbidden in [
             "tenant_id",
             "organization_id",
@@ -1607,7 +1860,11 @@ mod tests {
         // this pins it quiet so that line is absent for this render.
         let _cred_quiet = quiet_credential_posture();
         let _pin = pin_plan_capture_level_for_test("off");
-        let briefing = runner_context(9876, CoordMcpDelivery::Provisioned);
+        let briefing = runner_context(
+            9876,
+            CoordMcpDelivery::Provisioned,
+            &ServedCorpus::unknown("test"),
+        );
         assert!(
             briefing.contains("coord_memory_record"),
             "a provisioned session must be told to author with the tool: {briefing}"
@@ -1631,7 +1888,11 @@ mod tests {
         // this pins it quiet so that line is absent for this render.
         let _cred_quiet = quiet_credential_posture();
         let _pin = pin_plan_capture_level_for_test("off");
-        let briefing = runner_context(9876, CoordMcpDelivery::WorkdirDeclared);
+        let briefing = runner_context(
+            9876,
+            CoordMcpDelivery::WorkdirDeclared,
+            &ServedCorpus::unknown("test"),
+        );
         assert!(
             briefing.contains("coord_memory_record"),
             "the directive must still reach a workdir-declared session: {briefing}"
@@ -1655,7 +1916,11 @@ mod tests {
         // this pins it quiet so that line is absent for this render.
         let _cred_quiet = quiet_credential_posture();
         let _pin = pin_plan_capture_level_for_test("off");
-        let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
+        let briefing = runner_context(
+            9876,
+            CoordMcpDelivery::Unprovisioned,
+            &ServedCorpus::unknown("test"),
+        );
         assert!(
             !briefing.contains("coord_memory_record"),
             "ungated briefing leaked the memory directive: {briefing}"
@@ -1676,7 +1941,11 @@ mod tests {
         // this pins it quiet so that line is absent for this render.
         let _cred_quiet = quiet_credential_posture();
         let _pin = pin_plan_capture_level_for_test("off");
-        let briefing = runner_context(9876, CoordMcpDelivery::Unknown);
+        let briefing = runner_context(
+            9876,
+            CoordMcpDelivery::Unknown,
+            &ServedCorpus::unknown("test"),
+        );
         assert!(
             briefing.ends_with(&memory_clause_conditional()),
             "Unknown must render the conditional variant: {briefing}"
@@ -1697,7 +1966,11 @@ mod tests {
         let _pin = pin_plan_capture_level_for_test("off");
         let composed = format!(
             "{}{}",
-            runner_context(9876, CoordMcpDelivery::Unprovisioned),
+            runner_context(
+                9876,
+                CoordMcpDelivery::Unprovisioned,
+                &ServedCorpus::unknown("test")
+            ),
             memory_clause()
         );
         assert!(
@@ -1730,7 +2003,11 @@ mod tests {
                 briefing_for_test(bad, 5, BriefingProvenance::Coord),
             );
 
-            let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
+            let briefing = runner_context(
+                9876,
+                CoordMcpDelivery::Unprovisioned,
+                &ServedCorpus::unknown("test"),
+            );
             assert!(
                 !briefing.contains("agent_id")
                     && !briefing.contains("01a01eb4-718a-7303-825a-94ec0d0ade91"),
@@ -1798,14 +2075,78 @@ If context runs low, act BEFORE exhaustion: request a handoff (coord_request_han
             .replace("__WEB__", &web_base)
     }
 
-    /// Split a render into (line 1, line 2, everything else).
+    /// Split a render into (line 1, line 2, the body after the header lines).
+    ///
+    /// The key-addressed header lines ([`header_lines`]) sit between line 2
+    /// and the body; they are skipped here so the byte-identical body anchors
+    /// keep pinning the body alone.
     fn split_render(briefing: &str) -> (&str, &str, &str) {
         let mut parts = briefing.splitn(3, '\n');
-        (
-            parts.next().unwrap_or_default(),
-            parts.next().unwrap_or_default(),
-            parts.next().unwrap_or_default(),
-        )
+        let marker = parts.next().unwrap_or_default();
+        let provenance = parts.next().unwrap_or_default();
+        let mut rest = parts.next().unwrap_or_default();
+        while rest.starts_with('[') {
+            rest = rest.split_once('\n').map(|(_, r)| r).unwrap_or_default();
+        }
+        (marker, provenance, rest)
+    }
+
+    /// The key-addressed header lines: the contiguous `[`-prefixed lines after
+    /// line 2. Readers find a header line by its key, never by its position.
+    fn header_lines(briefing: &str) -> Vec<&str> {
+        briefing
+            .lines()
+            .skip(2)
+            .take_while(|l| l.starts_with('['))
+            .collect()
+    }
+
+    /// The served-corpus line is ALWAYS present, and on a quiet credential
+    /// posture it is the only header line — line 3.
+    #[test]
+    fn the_served_corpus_line_is_always_a_header_line() {
+        let _cred_quiet = quiet_credential_posture();
+        let _pin = pin_plan_capture_level_for_test("off");
+
+        let briefing = runner_context(
+            9876,
+            CoordMcpDelivery::Unprovisioned,
+            &ServedCorpus::unknown("test"),
+        );
+        assert_eq!(
+            header_lines(&briefing),
+            vec!["[served-corpus: UNKNOWN (test)]"]
+        );
+        // Lines 1 and 2 are untouched by it.
+        assert_eq!(briefing.lines().next(), Some(RUNNER_CONTEXT_SOURCE_MARKER));
+        assert!(briefing
+            .lines()
+            .nth(1)
+            .unwrap_or_default()
+            .starts_with("[briefing: "));
+    }
+
+    /// With a non-live credential posture the credential line keeps line 3 —
+    /// the position `/whereami` already reads it at — and the served-corpus
+    /// line follows it as line 4.
+    #[test]
+    fn the_credential_line_precedes_the_served_corpus_line() {
+        use crate::mcp::device_jwt_refresher::CoordCredentialPosture as P;
+        let _cred = crate::mcp::device_jwt_refresher::posture_test_lock();
+        let _pin = pin_plan_capture_level_for_test("off");
+        crate::mcp::device_jwt_refresher::reset_coord_credential_posture_for_test();
+        publish_posture(P::Expired);
+
+        let briefing = runner_context(
+            9876,
+            CoordMcpDelivery::Unprovisioned,
+            &ServedCorpus::unknown("test"),
+        );
+        let headers = header_lines(&briefing);
+        crate::mcp::device_jwt_refresher::reset_coord_credential_posture_for_test();
+        assert_eq!(headers.len(), 2, "{headers:?}");
+        assert!(headers[0].starts_with("[coord-credential: "), "{headers:?}");
+        assert_eq!(headers[1], "[served-corpus: UNKNOWN (test)]");
     }
 
     /// With nothing cached — the arm EVERY runner runs on until coord's half of
@@ -1825,7 +2166,11 @@ If context runs low, act BEFORE exhaustion: request a handoff (coord_request_han
         let _amb = crate::test_env::isolated_ambient();
         let _pin = pin_plan_capture_level_for_test("off");
 
-        let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
+        let briefing = runner_context(
+            9876,
+            CoordMcpDelivery::Unprovisioned,
+            &ServedCorpus::unknown("test"),
+        );
         let (marker, provenance, body) = split_render(&briefing);
 
         assert_eq!(marker, RUNNER_CONTEXT_SOURCE_MARKER);
@@ -1849,7 +2194,11 @@ If context runs low, act BEFORE exhaustion: request a handoff (coord_request_han
         let _amb = crate::test_env::isolated_ambient();
         let _pin = pin_plan_capture_level_for_test(PLAN_CAPTURE_RECORD);
 
-        let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
+        let briefing = runner_context(
+            9876,
+            CoordMcpDelivery::Unprovisioned,
+            &ServedCorpus::unknown("test"),
+        );
         let (marker, provenance, body) = split_render(&briefing);
 
         assert_eq!(marker, RUNNER_CONTEXT_SOURCE_MARKER);
@@ -1883,7 +2232,11 @@ If context runs low, act BEFORE exhaustion: request a handoff (coord_request_han
             ),
         );
 
-        let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
+        let briefing = runner_context(
+            9876,
+            CoordMcpDelivery::Unprovisioned,
+            &ServedCorpus::unknown("test"),
+        );
         let (marker, provenance, body) = split_render(&briefing);
 
         assert_eq!(marker, RUNNER_CONTEXT_SOURCE_MARKER);
@@ -1913,7 +2266,11 @@ If context runs low, act BEFORE exhaustion: request a handoff (coord_request_han
             briefing_for_test("Restored briefing.", 4, BriefingProvenance::Cached),
         );
 
-        let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
+        let briefing = runner_context(
+            9876,
+            CoordMcpDelivery::Unprovisioned,
+            &ServedCorpus::unknown("test"),
+        );
         let (_, provenance, body) = split_render(&briefing);
 
         assert_eq!(provenance, "[briefing: cached v4 (stale)]");
@@ -1935,7 +2292,11 @@ If context runs low, act BEFORE exhaustion: request a handoff (coord_request_han
             briefing_for_test("Edited clause.", 3, BriefingProvenance::Coord),
         );
 
-        let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
+        let briefing = runner_context(
+            9876,
+            CoordMcpDelivery::Unprovisioned,
+            &ServedCorpus::unknown("test"),
+        );
         let (_, provenance, body) = split_render(&briefing);
 
         assert_eq!(
@@ -1981,7 +2342,11 @@ If context runs low, act BEFORE exhaustion: request a handoff (coord_request_han
                 briefing_for_test(&bad, 11, BriefingProvenance::Coord),
             );
 
-            let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
+            let briefing = runner_context(
+                9876,
+                CoordMcpDelivery::Unprovisioned,
+                &ServedCorpus::unknown("test"),
+            );
             let (marker, provenance, body) = split_render(&briefing);
 
             assert_eq!(marker, RUNNER_CONTEXT_SOURCE_MARKER, "body: {bad:.48}");
@@ -2000,7 +2365,11 @@ If context runs low, act BEFORE exhaustion: request a handoff (coord_request_han
     #[test]
     fn the_api_port_reaches_the_rendered_briefing() {
         let _pin = pin_plan_capture_level_for_test("off");
-        let briefing = runner_context(41234, CoordMcpDelivery::Unprovisioned);
+        let briefing = runner_context(
+            41234,
+            CoordMcpDelivery::Unprovisioned,
+            &ServedCorpus::unknown("test"),
+        );
         assert!(briefing.contains("http://127.0.0.1:41234"), "{briefing}");
         assert!(!briefing.contains("http://127.0.0.1:9876"), "{briefing}");
     }
@@ -2188,7 +2557,11 @@ If context runs low, act BEFORE exhaustion: request a handoff (coord_request_han
         ] {
             crate::mcp::device_jwt_refresher::reset_coord_credential_posture_for_test();
             let since = publish_posture(posture);
-            let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
+            let briefing = runner_context(
+                9876,
+                CoordMcpDelivery::Unprovisioned,
+                &ServedCorpus::unknown("test"),
+            );
             let line3 = briefing.lines().nth(2).unwrap_or_default();
             assert!(
                 line3.starts_with("[coord-credential: "),
@@ -2229,7 +2602,11 @@ If context runs low, act BEFORE exhaustion: request a handoff (coord_request_han
             if let Some(p) = seed {
                 publish_posture(p);
             }
-            let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
+            let briefing = runner_context(
+                9876,
+                CoordMcpDelivery::Unprovisioned,
+                &ServedCorpus::unknown("test"),
+            );
             assert!(
                 !briefing.contains("[coord-credential:"),
                 "seed {seed:?} must add no credential line: {briefing}"

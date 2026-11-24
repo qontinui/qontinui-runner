@@ -777,9 +777,11 @@ pub fn build_hardener_middleware() -> AiMiddlewareChain {
 ///   using `runner_port` (not the legacy hardcoded `9876`) in the injected
 ///   step's URL.
 ///
-/// In both modes all `localhost:<any>/ui-bridge/...` URLs are migrated to
-/// `localhost:{runner_port}/ui-bridge/...`, so temp runners on non-default
-/// ports produce correct workflows.
+/// In both modes all `localhost:<any>/ui-bridge/...` and
+/// `127.0.0.1:<any>/ui-bridge/...` URLs are migrated to
+/// `127.0.0.1:{runner_port}/ui-bridge/...`, so temp runners on non-default
+/// ports produce correct workflows and no step pays the doomed `::1` connect
+/// a `localhost` spelling costs (the runner binds IPv4 loopback only).
 pub fn normalize_ui_bridge_urls(
     workflow: &UnifiedWorkflow,
     target_family: crate::mcp::types::UiBridgeFamily,
@@ -856,8 +858,9 @@ pub fn normalize_ui_bridge_urls(
                 "mode": "shell",
                 "name": "Connect UI Bridge SDK",
                 "command": format!(
-                    "curl -s -X POST http://localhost:{}/ui-bridge/sdk/connect -H \"Content-Type: application/json\" -d '{{\"url\": \"{}\"}}'",
-                    runner_port, target_url
+                    "curl -s -X POST {}/ui-bridge/sdk/connect -H \"Content-Type: application/json\" -d '{{\"url\": \"{}\"}}'",
+                    crate::mcp::types::runner_loopback_base(runner_port),
+                    target_url
                 ),
                 "fail_on_error": true
             });
@@ -913,7 +916,8 @@ fn step_is_sdk_connect(step: &Value) -> bool {
 ///
 /// - Rewrites `/ui-bridge/sdk/<path>` ↔ `/ui-bridge/control/<path>` based on
 ///   `target_family`.
-/// - Rewrites `localhost:<any>/ui-bridge/` → `localhost:{runner_port}/ui-bridge/`.
+/// - Rewrites `localhost:<any>/ui-bridge/` and `127.0.0.1:<any>/ui-bridge/` →
+///   `127.0.0.1:{runner_port}/ui-bridge/`.
 ///
 /// Returns true if any string in the step was modified.
 fn normalize_urls_in_step(
@@ -1025,11 +1029,15 @@ fn rewrite_ui_bridge_url_string(
 }
 
 /// Replace `localhost:<port>/ui-bridge/` **and** `127.0.0.1:<port>/ui-bridge/`
-/// with `localhost:{runner_port}/ui-bridge/` for every occurrence, leaving
+/// with `127.0.0.1:{runner_port}/ui-bridge/` for every occurrence, leaving
 /// non-ui-bridge host references alone.
 ///
-/// We standardize the host to `localhost` (matches the rest of the codebase's
-/// convention) regardless of whether the input used `localhost` or `127.0.0.1`.
+/// The host is standardized to the address the runner's API actually binds
+/// (`mcp::types::RUNNER_API_BIND_IP`, the IPv4 loopback) whichever spelling the
+/// input used: on Windows `localhost` resolves to `::1` first, where nothing
+/// listens, so every new connection to a `localhost` URL pays a failed IPv6
+/// connect (~0.2 s for curl, ~2 s for PowerShell / Python). Plan
+/// 2026-10-25-runner-self-calls-dial-localhost-and-pay-a-doomed-ipv6-connect.
 #[expect(
     clippy::string_slice,
     reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
@@ -1062,9 +1070,12 @@ fn rewrite_localhost_port_for_ui_bridge(input: &str, runner_port: u16) -> String
         let tail = &after[digit_end..];
 
         if tail.starts_with("/ui-bridge/") && !port_str.is_empty() {
-            // Rewrite host to the canonical `localhost:` with our runner_port.
-            out.push_str("localhost:");
-            out.push_str(&runner_port.to_string());
+            // Rewrite host to the bound address with our runner_port.
+            out.push_str(&format!(
+                "{}:{}",
+                crate::mcp::types::RUNNER_API_BIND_IP,
+                runner_port
+            ));
         } else {
             // Not a ui-bridge URL — leave host + port as-is.
             out.push_str(needle);
@@ -1323,14 +1334,14 @@ Each step should check one thing well rather than trying to replicate the entire
 Common conversions:
 | Playwright test checks... | SDK equivalent |
 |---|---|
-| Element exists on page | `command`: `curl -sf http://localhost:9876/ui-bridge/sdk/elements?contentOnly=true \| grep "elementId"` |
-| Text content visible | `command`: `curl -sf -X POST http://localhost:9876/ui-bridge/sdk/ai/search -H "Content-Type: application/json" -d '{"text":"..."}' \| grep "expected-text"` |
-| Tab/section present | `command`: `curl -sf http://localhost:9876/ui-bridge/sdk/elements?contentOnly=true \| grep "tab-name"` |
-| Page loads without errors | `command`: `curl -sf http://localhost:9876/ui-bridge/sdk/snapshot \| grep "elements"` |
+| Element exists on page | `command`: `curl -sf http://127.0.0.1:9876/ui-bridge/sdk/elements?contentOnly=true \| grep "elementId"` |
+| Text content visible | `command`: `curl -sf -X POST http://127.0.0.1:9876/ui-bridge/sdk/ai/search -H "Content-Type: application/json" -d '{"text":"..."}' \| grep "expected-text"` |
+| Tab/section present | `command`: `curl -sf http://127.0.0.1:9876/ui-bridge/sdk/elements?contentOnly=true \| grep "tab-name"` |
+| Page loads without errors | `command`: `curl -sf http://127.0.0.1:9876/ui-bridge/sdk/snapshot \| grep "elements"` |
 | Element state assertion | `ui_bridge`: Use assert action with target element and expected value |
-| Element count/state | `command`: `curl -sf http://localhost:9876/ui-bridge/sdk/elements \| grep "expected-element"` |
+| Element count/state | `command`: `curl -sf http://127.0.0.1:9876/ui-bridge/sdk/elements \| grep "expected-element"` |
 
-**URL base for all SDK endpoints:** `http://localhost:9876/ui-bridge/sdk/`
+**URL base for all SDK endpoints:** `http://127.0.0.1:9876/ui-bridge/sdk/`
 
 Keep the original step's `id` on ONE of the replacement steps, and generate new UUIDs for additional steps.
 
@@ -1398,7 +1409,7 @@ correct page to check UI state.
      "type": "command",
      "phase": "verification",
      "name": "Navigate to target page",
-     "command": "curl -sf -X POST http://localhost:9876/ui-bridge/sdk/page/navigate -H \"Content-Type: application/json\" -d \"{\\\"url\\\": \\\"<extracted-url>\\\"}\"",
+     "command": "curl -sf -X POST http://127.0.0.1:9876/ui-bridge/sdk/page/navigate -H \"Content-Type: application/json\" -d \"{\\\"url\\\": \\\"<extracted-url>\\\"}\"",
      "fail_on_error": true
    }
    ```
@@ -1437,11 +1448,11 @@ verify that the tab has spatial visualization content. Add content-specific chec
         prompt.push_str("This workflow targets a web application. ");
         if app_context.has_sdk_connect {
             prompt.push_str("UI Bridge SDK is connected in setup. Use SDK endpoints:\n");
-            prompt.push_str("- Element list: `GET http://localhost:9876/ui-bridge/sdk/elements?contentOnly=true`\n");
-            prompt.push_str("- AI search: `POST http://localhost:9876/ui-bridge/sdk/ai/search` with body `{\"text\":\"query\"}`\n");
+            prompt.push_str("- Element list: `GET http://127.0.0.1:9876/ui-bridge/sdk/elements?contentOnly=true`\n");
+            prompt.push_str("- AI search: `POST http://127.0.0.1:9876/ui-bridge/sdk/ai/search` with body `{\"text\":\"query\"}`\n");
             prompt
-                .push_str("- Page snapshot: `GET http://localhost:9876/ui-bridge/sdk/snapshot`\n");
-            prompt.push_str("- Execute action: `POST http://localhost:9876/ui-bridge/sdk/ai/execute` with body `{\"action\":\"click\",\"elementId\":\"id\"}`\n");
+                .push_str("- Page snapshot: `GET http://127.0.0.1:9876/ui-bridge/sdk/snapshot`\n");
+            prompt.push_str("- Execute action: `POST http://127.0.0.1:9876/ui-bridge/sdk/ai/execute` with body `{\"action\":\"click\",\"elementId\":\"id\"}`\n");
             if let Some(ref nav_url) = app_context.setup_navigate_url {
                 prompt.push_str(&format!(
                     "- Setup navigates to: `{}` — verification should navigate here before SDK checks (Rule 4)\n",
@@ -2409,8 +2420,8 @@ mod tests {
             first_cmd
         );
         assert!(
-            first_cmd.contains("localhost:9876"),
-            "Injected connect step should use the supplied runner_port: {}",
+            first_cmd.contains("http://127.0.0.1:9876/ui-bridge/sdk/connect"),
+            "Injected connect step should use the bound address and the supplied runner_port: {}",
             first_cmd
         );
         // The original /control/ nav step should now be on /sdk/.
@@ -2448,7 +2459,7 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(
-            first_cmd.contains("localhost:9877/ui-bridge/sdk/connect"),
+            first_cmd.contains("http://127.0.0.1:9877/ui-bridge/sdk/connect"),
             "Connect step should target port 9877: {}",
             first_cmd
         );
@@ -2461,8 +2472,8 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(
-            nav_cmd.contains("localhost:9877/ui-bridge/"),
-            "ui-bridge URL should use port 9877: {}",
+            nav_cmd.contains("http://127.0.0.1:9877/ui-bridge/"),
+            "ui-bridge URL should use 127.0.0.1:9877: {}",
             nav_cmd
         );
         assert!(
@@ -2471,7 +2482,8 @@ mod tests {
             nav_cmd
         );
         assert!(
-            !nav_cmd.contains("localhost:9876/ui-bridge/"),
+            !nav_cmd.contains("localhost:9876/ui-bridge/")
+                && !nav_cmd.contains("localhost:9877/ui-bridge/"),
             "Old port 9876 must be gone: {}",
             nav_cmd
         );
@@ -2483,7 +2495,7 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(
-            ver_cmd.contains("localhost:9877/ui-bridge/sdk/snapshot"),
+            ver_cmd.contains("http://127.0.0.1:9877/ui-bridge/sdk/snapshot"),
             "Verification URL should use port 9877: {}",
             ver_cmd
         );
@@ -2948,10 +2960,10 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_rewrites_127_0_0_1_to_localhost_runner_port() {
-        // Builder emitted a command using `127.0.0.1:7777/ui-bridge/sdk/...`
-        // instead of `localhost:`. The normalizer must:
-        //   1. rewrite the host from `127.0.0.1` to `localhost`
+    fn test_normalize_rewrites_wrong_port_127_0_0_1_to_bound_runner_port() {
+        // Builder emitted a command using `127.0.0.1:7777/ui-bridge/sdk/...`.
+        // The normalizer must:
+        //   1. keep the host at the bound address `127.0.0.1`
         //   2. migrate the port from 7777 to the runner_port (9877)
         //   3. swap `/sdk/` to `/control/` (Control mode)
         let workflow = make_test_workflow(vec![json!({
@@ -2967,13 +2979,13 @@ mod tests {
             .unwrap();
 
         assert!(
-            cmd.contains("localhost:9877/ui-bridge/control/snapshot"),
-            "127.0.0.1:7777 should be rewritten to localhost:9877 and /sdk/ to /control/: {}",
+            cmd.contains("http://127.0.0.1:9877/ui-bridge/control/snapshot"),
+            "127.0.0.1:7777 should be rewritten to 127.0.0.1:9877 and /sdk/ to /control/: {}",
             cmd
         );
         assert!(
-            !cmd.contains("127.0.0.1"),
-            "Host must be standardized to localhost (no 127.0.0.1 left): {}",
+            !cmd.contains("localhost"),
+            "Host must be standardized to the bound 127.0.0.1 (no localhost): {}",
             cmd
         );
         assert!(
@@ -3019,10 +3031,10 @@ mod tests {
             cmd
         );
         // Sanity: port migration should also have happened (it's already 9877
-        // here, but the invariant is the URL's host:port is localhost:9877).
+        // here, but the invariant is the URL's host:port is 127.0.0.1:9877).
         assert!(
-            cmd.contains("localhost:9877/ui-bridge/"),
-            "URL should use localhost:9877: {}",
+            cmd.contains("http://127.0.0.1:9877/ui-bridge/"),
+            "URL should use 127.0.0.1:9877: {}",
             cmd
         );
     }

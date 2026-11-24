@@ -72,6 +72,16 @@ async fn spawn(config: BindingConfig) -> Server {
 /// `EnforceDoors`). R7 claims its refusal holds in EVERY route policy, so its
 /// test exercises more than one.
 async fn spawn_with_policy(policy: Option<&str>, config: BindingConfig) -> Server {
+    spawn_routed(policy, config, relay_router).await
+}
+
+/// [`spawn_with_policy`] serving the router `routes` builds instead of
+/// [`relay_router`].
+async fn spawn_routed(
+    policy: Option<&str>,
+    config: BindingConfig,
+    routes: fn(RelayState) -> Router,
+) -> Server {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let bound = Arc::new(AtomicU16::new(port));
@@ -84,7 +94,7 @@ async fn spawn_with_policy(policy: Option<&str>, config: BindingConfig) -> Serve
         Arc::new(|| Arc::new(Vec::<NormOrigin>::new())),
     ));
     let relay = RelayState::standalone(config);
-    let router: Router = relay_router(relay.clone());
+    let router: Router = routes(relay.clone());
     let router = origin_guard::apply(router, guard);
     tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
@@ -238,7 +248,10 @@ impl Server {
 
     // -- WebSocket wrappers ----------------------------------------------
 
-    async fn ws_open(&self, origin: Option<&str>) -> Ws {
+    /// Open a WebSocket to the UI Bridge, sending `origin` as the `Origin`
+    /// header when given. `Err` names a timed-out or refused upgrade, or a
+    /// non-101 status.
+    async fn ws_open_try(&self, origin: Option<&str>) -> Result<Ws, String> {
         let mut req = format!("ws://127.0.0.1:{}/ui-bridge/ws", self.port)
             .into_client_request()
             .unwrap();
@@ -248,17 +261,35 @@ impl Server {
         }
         let (stream, resp) = tokio::time::timeout(PROMPT, tokio_tungstenite::connect_async(req))
             .await
-            .expect("upgrade within 5s")
-            .expect("upgrade accepted");
-        assert_eq!(resp.status().as_u16(), 101, "upgrade status");
-        Ws { stream }
+            .map_err(|_| format!("no upgrade within {PROMPT:?}"))?
+            .map_err(|e| format!("upgrade refused: {e:?}"))?;
+        if resp.status().as_u16() != 101 {
+            return Err(format!("upgrade status {}", resp.status()));
+        }
+        Ok(Ws { stream })
     }
 
     /// Open a socket from `origin` and send the register frame the extension's
     /// live relay / a Node wrapper sends. Returns the socket and the runner's
     /// first reply frame.
     async fn ws_register(&self, origin: Option<&str>, app_id: &str) -> (Ws, Value) {
-        let mut ws = self.ws_open(origin).await;
+        let (ws, reply) = self
+            .ws_register_try(origin, app_id)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let reply = reply.unwrap_or_else(|seen| panic!("no reply to the register frame: {seen}"));
+        (ws, reply)
+    }
+
+    /// [`Self::ws_register`] that never panics. `Err` when the socket could
+    /// not be opened or the frame not sent; otherwise the socket and either
+    /// the reply or what arrived instead of one ([`Ws::recv_reply`]).
+    async fn ws_register_try(
+        &self,
+        origin: Option<&str>,
+        app_id: &str,
+    ) -> Result<(Ws, Result<Value, String>), String> {
+        let mut ws = self.ws_open_try(origin).await?;
         let mut frame = json!({
             "type": "register",
             "transport": "websocket",
@@ -270,9 +301,12 @@ impl Server {
             frame["origin"] = json!(o);
             frame["pageUrl"] = json!(format!("{o}/page"));
         }
-        ws.send(frame).await;
-        let reply = ws.recv().await.expect("a reply to the register frame");
-        (ws, reply)
+        ws.stream
+            .send(WsMessage::Text(frame.to_string().into()))
+            .await
+            .map_err(|e| format!("register frame not sent: {e:?}"))?;
+        let reply = ws.recv_reply().await;
+        Ok((ws, reply))
     }
 
     // -- SSE relay tabs ----------------------------------------------------
@@ -484,6 +518,40 @@ impl Ws {
                 }
                 Ok(Some(Ok(_))) => continue,
             }
+        }
+    }
+
+    /// Next text frame as JSON, like [`Self::recv`], but on failure say WHAT
+    /// arrived instead — a Close frame, a transport error (and its kind), a
+    /// bare EOF, a non-JSON text, or nothing within [`PROMPT`] — and how long
+    /// it took. `recv` folds all five into `None`, which is all that Windows CI
+    /// job 115095200692 of `concurrent_claims_single_winner` could report, so
+    /// the mechanism behind its failure could not be told apart.
+    async fn recv_reply(&mut self) -> Result<Value, String> {
+        let started = tokio::time::Instant::now();
+        let mut skipped = Vec::new();
+        loop {
+            let left = PROMPT.saturating_sub(started.elapsed());
+            let seen = match tokio::time::timeout(left, self.stream.next()).await {
+                Ok(Some(Ok(WsMessage::Text(t)))) => {
+                    match serde_json::from_str::<Value>(t.as_str()) {
+                        Ok(v) => return Ok(v),
+                        Err(e) => format!("a non-JSON text frame ({e}): {t}"),
+                    }
+                }
+                Ok(Some(Ok(WsMessage::Close(frame)))) => format!("a Close frame {frame:?}"),
+                Ok(Some(Ok(other))) => {
+                    skipped.push(format!("{other:?}"));
+                    continue;
+                }
+                Ok(Some(Err(e))) => format!("a transport error: {e:?}"),
+                Ok(None) => "EOF with no Close frame".to_string(),
+                Err(_) => format!("nothing within {PROMPT:?}"),
+            };
+            return Err(format!(
+                "{seen} after {:?} (non-text frames skipped first: {skipped:?})",
+                started.elapsed()
+            ));
         }
     }
 
@@ -1675,35 +1743,58 @@ async fn sdk_switch_refused_to_foreign() {
 }
 
 /// R1 is checked and written under one lock.
+///
+/// Every attempt is collected before anything is asserted — including one
+/// whose socket could not be opened or whose frame could not be sent — so a
+/// failure reports all 50 and the server's own R1 refusal ledgers in ONE
+/// message. Windows CI job 115095200692 (run 38335714046, attempt 1) failed
+/// this test with 21 of 50 sockets getting no JSON reply (`recv` returned
+/// `None`), and the old `expect` could say neither what those sockets saw nor
+/// whether the server had refused their claims.
 #[tokio::test]
 async fn concurrent_claims_single_winner() {
+    const ATTEMPTS: usize = 50;
     let s = Arc::new(spawn(BindingConfig::default()).await);
     let (_holder, ack) = s.ws_register(Some(GOOD), "app").await;
     let holder_conn = ack["connId"].as_u64().unwrap();
 
     let mut attempts = Vec::new();
-    for _ in 0..50 {
+    for _ in 0..ATTEMPTS {
         let s = s.clone();
         attempts.push(tokio::spawn(async move {
-            let (ws, reply) = s.ws_register(Some(EVIL), "app").await;
-            (ws, reply)
+            s.ws_register_try(Some(EVIL), "app").await
         }));
     }
     let mut held = 0;
+    let mut other = Vec::new();
     let mut sockets = Vec::new();
-    for a in attempts {
-        let (ws, reply) = a.await.unwrap();
-        if ack_refusal_code(&reply) == Some("UIB_REGISTRATION_HELD") {
-            held += 1;
+    for (i, a) in attempts.into_iter().enumerate() {
+        match a.await.unwrap() {
+            Ok((ws, reply)) => {
+                sockets.push(ws);
+                match reply {
+                    Ok(r) if ack_refusal_code(&r) == Some("UIB_REGISTRATION_HELD") => held += 1,
+                    Ok(r) => other.push(format!("attempt {i}: unexpected reply {r}")),
+                    Err(seen) => other.push(format!("attempt {i}: no reply — {seen}")),
+                }
+            }
+            Err(e) => other.push(format!("attempt {i}: {e}")),
         }
-        sockets.push(ws);
-        assert_eq!(
-            conn_for(&s, "app").await,
-            Some(holder_conn),
-            "the routing slot moved"
-        );
     }
-    assert_eq!(held, 50, "every concurrent foreign claim must be refused");
+    let slot = conn_for(&s, "app").await;
+    // Read after every attempt finished. An attempt that timed out may not
+    // be counted YET, so a short ledger means "not counted", not "not seen".
+    let ledgers = json!({
+        RULE_R1_SLOT: s.rule(RULE_R1_SLOT).await,
+        RULE_R1: s.rule(RULE_R1).await,
+    });
+    assert!(
+        held == ATTEMPTS && slot == Some(holder_conn),
+        "every concurrent foreign claim must be refused and the routing slot must not move: \
+         {held}/{ATTEMPTS} replied UIB_REGISTRATION_HELD; slot {slot:?} (holder {holder_conn}); \
+         the server's refusal ledgers {ledgers}; the rest:\n{}",
+        other.join("\n")
+    );
 }
 
 /// R2's liveness arm.
@@ -2363,4 +2454,384 @@ fn counters_are_per_instance() {
     assert_eq!(a.counters.get("R6").would_refuse, 1);
     assert_eq!(b.counters.get("R1"), RuleCount::default());
     assert_eq!(a.health_json()["rules"]["R1"]["refused"], 1);
+}
+
+// ===========================================================================
+// coord finding fb3fb468 — a wrapper's failure frame, through the relay's doors
+// ===========================================================================
+
+/// The door a wrapper app's frames come in through: one call into the
+/// production upgrade handler. [`relay_router`] mounts the handler by name;
+/// this spells the entry as a CALL so a static reader of the test (the arming
+/// record's prove step) can see which door the test enters through.
+async fn wrapper_frames_door(
+    ws: axum::extract::WebSocketUpgrade,
+    state: State<RelayState>,
+    principal: Option<axum::Extension<crate::mcp::origin_guard::RequesterPrincipal>>,
+) -> axum::response::Response {
+    axum::response::IntoResponse::into_response(
+        crate::mcp::ws_relay::ws_upgrade_handler(ws, state, principal).await,
+    )
+}
+
+/// The door an agent's command comes in through, spelled the same way.
+async fn agent_dispatch_door(
+    state: State<RelayState>,
+    app_id: axum::extract::Path<String>,
+    body: Json<crate::mcp::app_discovery::AppDispatchRequest>,
+) -> (
+    axum::http::StatusCode,
+    Json<crate::mcp::types::ApiResponse<Value>>,
+) {
+    crate::mcp::app_discovery::dispatch_to_app(state, app_id, body).await
+}
+
+/// Those two doors at their production route patterns, plus the HTTP register
+/// route an HTTP-transport app registers through.
+fn relay_doors(relay: RelayState) -> Router {
+    use crate::mcp::app_discovery::register_app;
+    Router::new()
+        .route("/ui-bridge/ws", any(wrapper_frames_door))
+        .route(
+            "/ui-bridge/apps/{app_id}/dispatch",
+            post(agent_dispatch_door),
+        )
+        .route("/ui-bridge/apps/register", post(register_app))
+        .with_state(relay)
+}
+
+/// A wrapper client — a tokio-tungstenite socket registered as `node-app` —
+/// and an agent's command already delivered to it: `(server, wrapper, the
+/// agent's pending call, commandId)`.
+async fn a_command_in_flight_to_a_wrapper(
+) -> (Server, Ws, tokio::task::JoinHandle<(u16, Value)>, String) {
+    let s = spawn_routed(None, BindingConfig::default(), relay_doors).await;
+    let (mut wrapper, ack) = s.ws_register(None, "node-app").await;
+    assert_eq!(ack["type"], "registered", "{ack}");
+    let agent = s.app_dispatch("node-app");
+    let command = wrapper
+        .recv()
+        .await
+        .expect("the wrapper receives the agent's command");
+    let command_id = command["commandId"]
+        .as_str()
+        .expect("the command frame carries its commandId")
+        .to_string();
+    (s, wrapper, agent, command_id)
+}
+
+/// fb3fb468, over the wire. A wrapper that cannot run a command answers with
+/// ui-bridge's structured failure object, `{code, message, retryable}` — the
+/// shape ui-bridge-wrapper's live transport sends. The agent that sent the
+/// command is answered AT ONCE, with that code and that retry verdict, as the
+/// app's own failure. Before the fix the runner could not read the frame and
+/// dropped it, and the agent sat out the whole relay timeout for an answer
+/// that had already arrived.
+#[tokio::test]
+async fn a_wrappers_failure_frame_answers_the_agent_at_once_with_its_code() {
+    let (_s, mut wrapper, agent, command_id) = a_command_in_flight_to_a_wrapper().await;
+    wrapper
+        .send(json!({
+            "type": "response",
+            "commandId": command_id,
+            "success": false,
+            "error": {
+                "code": "NO_HANDLER",
+                "message": "No handler registered for action 'getControlSnapshot'",
+                "retryable": false,
+            },
+        }))
+        .await;
+
+    let (status, body) = tokio::time::timeout(PROMPT, agent)
+        .await
+        .expect("the agent is answered when the wrapper answers, not at the relay timeout")
+        .unwrap();
+    assert_eq!(status, 502, "{body}");
+    assert_eq!(code(&body), Some("NO_HANDLER"), "{body}");
+    assert_eq!(body["hint"]["failure_origin"], "app", "{body}");
+    assert_eq!(body["hint"]["retryable"], false, "{body}");
+}
+
+/// fb3fb468's other half. A response frame the runner cannot read, but which
+/// names its command, settles THAT command at once instead of being dropped
+/// while the agent sits out the relay timeout. It is not the app's own
+/// failure — what the app reported is unknown — so nothing lands in the
+/// app-code slot, the origin is `transport` and retryability is `null`.
+#[tokio::test]
+async fn an_unreadable_response_frame_answers_the_agent_at_once_not_as_the_apps_failure() {
+    let (_s, mut wrapper, agent, command_id) = a_command_in_flight_to_a_wrapper().await;
+    wrapper
+        .send(json!({
+            "type": "response",
+            "commandId": command_id,
+            "success": "no",
+        }))
+        .await;
+
+    let (status, body) = tokio::time::timeout(PROMPT, agent)
+        .await
+        .expect("the agent is answered when the wrapper answers, not at the relay timeout")
+        .unwrap();
+    assert_eq!(status, 502, "{body}");
+    assert_eq!(
+        code(&body),
+        None,
+        "nothing lands in the app-code slot: {body}"
+    );
+    assert_eq!(body["hint"]["failure_origin"], "transport", "{body}");
+    assert_eq!(body["hint"]["retryable"], Value::Null, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("could not be read")),
+        "{body}"
+    );
+}
+
+/// The HTTP twin: an HTTP-transport app that answers its dispatch with
+/// `{success:false, error, code}` reaches the agent through the same door
+/// with its own code, as the app's failure, and retryability `null` — the
+/// app did not say.
+#[tokio::test]
+async fn an_http_apps_failure_answers_the_agent_with_its_code() {
+    let s = spawn_routed(None, BindingConfig::default(), relay_doors).await;
+    let app = Router::new().route(
+        "/dispatch",
+        post(|| async {
+            Json(json!({
+                "success": false,
+                "error": "No handler registered for action 'getControlSnapshot'",
+                "code": "NO_HANDLER",
+            }))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let app_port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let (status, body) = s
+        .post(
+            "/ui-bridge/apps/register",
+            agent(),
+            json!({ "appId": "http-app", "appName": "HTTP app", "appType": "web",
+                    "transport": "http",
+                    "baseUrl": format!("http://127.0.0.1:{app_port}") }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    let (status, body) = tokio::time::timeout(PROMPT, s.app_dispatch("http-app"))
+        .await
+        .expect("the agent is answered when the app answers")
+        .unwrap();
+    assert_eq!(status, 502, "{body}");
+    assert_eq!(code(&body), Some("NO_HANDLER"), "{body}");
+    assert_eq!(body["hint"]["failure_origin"], "app", "{body}");
+    assert_eq!(body["hint"]["retryable"], Value::Null, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("No handler registered")),
+        "{body}"
+    );
+}
+
+/// The HTTP twin of the wrapper's structured failure. An HTTP-transport app
+/// that answers with the wrapper's object `error`, `{code, message,
+/// retryable}`, reaches the agent through the same door with that code, that
+/// message and that retry verdict, as the WebSocket arm reports a wrapper's
+/// failure frame. Before, the object read as "Unknown error from SDK app",
+/// with no code and retryability `null`.
+#[tokio::test]
+async fn an_http_apps_object_error_answers_the_agent_with_its_code_and_retry_verdict() {
+    let s = spawn_routed(None, BindingConfig::default(), relay_doors).await;
+    let app = Router::new().route(
+        "/dispatch",
+        post(|| async {
+            Json(json!({
+                "success": false,
+                "error": {
+                    "code": "APP_BUSY",
+                    "message": "The app is busy rendering; try again",
+                    "retryable": true,
+                },
+            }))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let app_port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let (status, body) = s
+        .post(
+            "/ui-bridge/apps/register",
+            agent(),
+            json!({ "appId": "http-app", "appName": "HTTP app", "appType": "web",
+                    "transport": "http",
+                    "baseUrl": format!("http://127.0.0.1:{app_port}") }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    let (status, body) = tokio::time::timeout(PROMPT, s.app_dispatch("http-app"))
+        .await
+        .expect("the agent is answered when the app answers")
+        .unwrap();
+    assert_eq!(status, 502, "{body}");
+    assert_eq!(code(&body), Some("APP_BUSY"), "{body}");
+    assert_eq!(body["hint"]["failure_origin"], "app", "{body}");
+    assert_eq!(body["hint"]["retryable"], true, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("The app is busy rendering")),
+        "{body}"
+    );
+}
+
+/// The two refusals that fire BEFORE any binding rule runs -- a first frame
+/// that is not a register frame, and a register frame declaring a transport
+/// other than `websocket` -- both end in a WebSocket Close frame through the
+/// same bounded close path as a refused claim (`close_gracefully`), and
+/// register nothing.
+///
+/// What this pins is the clean-close CONTRACT (a Close frame, not EOF or a
+/// transport error). It does not reproduce the Windows RST that motivated
+/// the shared drain: on loopback the refused frame and anything after it are
+/// already in tungstenite's userspace buffer, so no unread kernel data is
+/// left to trigger one. That mechanism is exercised only by
+/// `concurrent_claims_single_winner` on the Windows CI job.
+#[tokio::test]
+async fn pre_register_rejections_close_cleanly() {
+    let s = spawn(BindingConfig::default()).await;
+    let wrong_transport = json!({
+        "type": "register",
+        "transport": "sse",
+        "appId": "app",
+        "appName": "app (test)",
+        "appType": "wrapper",
+        "origin": GOOD,
+        "pageUrl": format!("{GOOD}/page"),
+    });
+    let not_register = json!({ "type": "hello", "appId": "app" });
+    for (case, first) in [
+        ("wrong transport", wrong_transport),
+        ("not a register frame", not_register),
+    ] {
+        let mut ws = s.ws_open_try(Some(GOOD)).await.expect("upgrade");
+        ws.send(first).await;
+        let seen = tokio::time::timeout(PROMPT, ws.stream.next()).await;
+        assert!(
+            matches!(seen, Ok(Some(Ok(WsMessage::Close(_))))),
+            "{case}: a refused first frame must end in a Close frame, got {seen:?}"
+        );
+        assert!(
+            s.registered("app").await.is_none(),
+            "{case}: a refused first frame must not register the app"
+        );
+    }
+}
+
+/// Plan `2026-11-21-vision-capture-cannot-frame-a-websocket-transport-app`
+/// Phase 1 test (a) — the assumption probe for the vision WebSocket arm. A
+/// client registered with the `screenshot` capability answers `getScreenshot`
+/// with a 4 MiB+ base64 PNG `response` frame that REALLY crosses the socket
+/// (`tokio-tungstenite` against the served router), inside the relay's
+/// command timeout, and the capture decodes its width, height and HiDPI scale.
+/// If this fails the relay's payload ceiling is too low and the arm must set
+/// the limit explicitly — never lower the image quality silently.
+#[tokio::test]
+async fn a_capable_websocket_client_answers_a_4_mib_screenshot_over_the_socket() {
+    use crate::mcp::ui_bridge::vision_frame_source::ws_relay_source::capture_over_relay;
+    use crate::mcp::ui_bridge::vision_frame_source::{SCREENSHOT_ACTION, SCREENSHOT_CAPABILITY};
+    use base64::Engine as _;
+
+    // Incompressible pixels (xorshift noise), so the PNG stays as large as
+    // its raw RGBA: 1100×800×4 ≈ 3.4 MiB, ≈ 4.5 MiB once base64-encoded.
+    let (w, h) = (1100u32, 800u32);
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    let img = image::RgbaImage::from_fn(w, h, |_, _| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        let b = seed.to_le_bytes();
+        image::Rgba([b[0], b[1], b[2], 255])
+    });
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(img)
+        .write_to(&mut png, image::ImageFormat::Png)
+        .expect("encode png");
+    let b64 = base64::engine::general_purpose::STANDARD.encode(png.into_inner());
+    assert!(
+        b64.len() >= 4 * 1024 * 1024,
+        "the probe must carry at least 4 MiB of base64, got {} bytes",
+        b64.len()
+    );
+
+    let s = spawn(BindingConfig::default()).await;
+    let mut wrapper = s.ws_open_try(None).await.expect("upgrade");
+    wrapper
+        .send(json!({
+            "type": "register",
+            "transport": "websocket",
+            "appId": "shot-app",
+            "appName": "shot-app (test)",
+            "appType": "wrapper",
+            "capabilities": [SCREENSHOT_CAPABILITY],
+        }))
+        .await;
+    let ack = wrapper.recv_reply().await.expect("register ack");
+    assert_eq!(ack["type"], "registered", "{ack}");
+    let row = s
+        .relay
+        .app_registry
+        .get_live("shot-app")
+        .await
+        .expect("live row");
+    assert!(
+        row.app
+            .capabilities
+            .iter()
+            .any(|c| c == SCREENSHOT_CAPABILITY),
+        "the register frame's capability reaches the registry: {:?}",
+        row.app.capabilities
+    );
+
+    let dispatcher = s.relay.app_dispatcher.clone();
+    let registry = s.relay.app_registry.clone();
+    let capture =
+        tokio::spawn(async move { capture_over_relay(&dispatcher, &registry, "shot-app").await });
+
+    let command = loop {
+        let frame = wrapper
+            .recv()
+            .await
+            .expect("the wrapper receives the command");
+        if frame["type"] == "command" {
+            break frame;
+        }
+    };
+    assert_eq!(command["action"], SCREENSHOT_ACTION, "{command}");
+    let command_id = command["commandId"]
+        .as_str()
+        .expect("commandId")
+        .to_string();
+    // Reported CSS width is half the PNG's: a 2× HiDPI frame.
+    wrapper
+        .respond(
+            &command_id,
+            json!({ "screenshot": b64, "width": w / 2, "height": h / 2 }),
+        )
+        .await;
+
+    let frame = tokio::time::timeout(Duration::from_secs(30), capture)
+        .await
+        .expect("the capture settles inside the relay's 30 s command timeout")
+        .unwrap()
+        .expect("the 4 MiB frame crossed the socket and decoded");
+    assert_eq!((frame.width, frame.height), (w, h));
+    assert!((frame.source.scale_factor - 2.0).abs() < 1e-9);
 }

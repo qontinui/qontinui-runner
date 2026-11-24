@@ -136,6 +136,34 @@ new_fixture
 printf '.github/actions/some-new-action/action.yml\n' > "$FIXTURE/files.txt"
 run_case "C a brand-new composite action is guarded" 1 no "without declaring it"
 
+# The trigger's one exact path, end to end through the shell. A `paths:` entry
+# with no `case` arm fires the run and then drops the path, which reads as green.
+# test-surface.py section 7 compares the two lists; this proves the arm that is
+# there actually lets the path through. The findings are stubbed like every other
+# scenario, so the token is asserted as the shell handles it, not as it is derived.
+new_fixture
+printf 'scripts/check_untimed_subprocess.py\n' > "$FIXTURE/files.txt"
+run_case "S1 the exact gating script alone is guarded" 1 no "without declaring it"
+
+new_fixture
+printf 'scripts/check_untimed_subprocess.py\n' > "$FIXTURE/files.txt"
+finding CHANGED scripts/check_untimed_subprocess.py check_untimed_subprocess#file
+printf 'ci:gate-change=declared\n' > "$FIXTURE/labels.txt"
+printf 'Gate-Change: check_untimed_subprocess#file\n' > "$FIXTURE/body.txt"
+run_case "S2 naming it does not excuse the weak label" 1 no "--add-label 'ci:gate-change=alters-a-gate'"
+
+new_fixture
+printf 'scripts/check_untimed_subprocess.py\n' > "$FIXTURE/files.txt"
+finding CHANGED scripts/check_untimed_subprocess.py check_untimed_subprocess#file
+printf 'ci:gate-change=alters-a-gate\n' > "$FIXTURE/labels.txt"
+printf 'Gate-Change: check_untimed_subprocess#file\n' > "$FIXTURE/body.txt"
+run_case "S3 ...and passes once it is declared and named" 0 yes "check_untimed_subprocess#file"
+
+# Matched exactly: a neighbour of the gating script is not a gate.
+new_fixture
+printf 'scripts/check_untimed_subprocess.py.bak\nscripts/check_untimed_subprocess_helper.py\n' > "$FIXTURE/files.txt"
+run_case "S4 a lookalike of the exact path is not a hit" 0 no "No gating workflow modified"
+
 # --- additive path -----------------------------------------------------------
 new_fixture
 printf '.github/workflows/ci.yml\n' > "$FIXTURE/files.txt"
@@ -335,7 +363,9 @@ run_case "X9 an unreadable file count is a hard error, not a skip" 1 no "certifi
 # mechanism being added elsewhere in the run block, and it equally cannot catch
 # the FIRST one being narrowed -- tightening the `case "${f}" in
 # .github/workflows/*|.github/actions/*)` scope filter to a subdirectory would
-# un-watch paths with NON_GATING still empty and this still green.
+# un-watch paths with NON_GATING still empty and this still green. That half is
+# test-surface.py section 7's, which compares the filter's arms to the trigger and
+# rejects any arm that can drop a path before the default.
 NON_GATING_AWK='/^read -r -d .. NON_GATING <</{f=1;next} /^NONGATING$/{f=0} f'
 if [ ! -s "$BLOCK" ]; then
   echo "  FAIL  N1a NON_GATING is measurable -- the run-block did not extract, so nothing was measured"; FAIL=$((FAIL+1))

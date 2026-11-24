@@ -63,6 +63,11 @@ name: Flake escalation
 # `test-flakiness`; findings expire after ~14 days, so trust the plan stem
 # first); the fix is a coord/web index or a horizon-bounded read, never a
 # change to this workflow.
+# A server-side failure (`history_read: failed`, a 5xx, a transport error) is
+# retried ONCE after 30 s before it counts: coord's read is cold-I/O-bound,
+# and measured 2026-10-05 the calls right after a failed one were served warm
+# in seconds. A second failure still exits 1 — the retry adds an observation,
+# it never turns UNKNOWN into "no flakes".
 # `history_read: thin` (no test has 20 samples yet) is a notice and exits 0.
 #
 # The plan's second escalation arm — "any occurrence on a push to
@@ -117,9 +122,7 @@ permissions:
 # interpolating only `github.event_name` / `github.ref` and collapsing every
 # other expression to "" (qontinui-coord ci_observer.rs resolve_group_template),
 # and run_is_reaper_at_risk never matches an empty group, so no push run here is
-# modelled as reapable by a land. (KNOWN coord gap: the budget-cancel candidate
-# scan in stuck_pr_watcher.rs compares groups with `=`, so every "" group
-# matches every other one and suppresses its auto re-run; fix belongs in coord.)
+# modelled as reapable by a land.
 # RESIDUAL: two pushes seconds apart can have
 # their runs CREATED out of order, so the older head's run cancels the newer
 # head's; the next push (or a close+reopen) heals it.
@@ -152,8 +155,9 @@ jobs:
     name: Escalate flaky tests from coord's history
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
-    # The coord read is bounded at 120 s inside the script; the rest is a
-    # handful of `gh` calls.
+    # The coord read is bounded at 120 s inside the script, and a read that
+    # fails server-side is retried ONCE after 30 s (cold-cache reads warm the
+    # cache they fail on), so at most ~270 s; the rest is a handful of `gh` calls.
     timeout-minutes: 10
     # One group per TRIGGERING CI run, and one for the nightly/dispatch.
     # A single shared group would be worse than a race: GitHub keeps at most

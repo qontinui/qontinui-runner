@@ -1,14 +1,13 @@
 """Integration tests for component interactions.
 
-This module verifies that UnifiedDataCollector, ScreenshotService, StateMemory,
-and TreeViewLayer work together correctly in realistic scenarios.
+This module verifies that UnifiedDataCollector, ScreenshotService and StateMemory
+work together correctly in realistic scenarios.
 
 Test Coverage:
 - Full action recording flow with all components
 - Sequential action recording with state evolution
 - State transition recording and verification
 - Screenshot integration and retrieval
-- Tree view generation from recorded actions
 - Match result recording with screenshots
 """
 
@@ -20,7 +19,6 @@ from pathlib import Path
 import pytest
 
 from services.screenshot_service import ScreenshotService
-from services.tree_view_layer import TreeViewLayer
 from services.unified_data_collector import UnifiedDataCollector
 
 # ============================================================================
@@ -452,124 +450,7 @@ def test_screenshot_integration(temp_storage, mock_state_memory):
 
 
 # ============================================================================
-# Test 5: Tree View from Recorded Actions
-# ============================================================================
-
-
-def test_tree_view_from_recorded_actions(data_collector, mock_state_memory):
-    """Test creating tree views from recorded actions.
-
-    Scenario:
-    1. Record multiple actions with different hierarchies
-    2. Create execution_tree_view from records
-    3. Verify tree structure is correct
-    4. Test other views as well
-    """
-    # Setup initial state
-    mock_state_memory.set_active_states([])
-
-    records = []
-
-    # Record action 1 (root)
-    start_time = time.time()
-    data_collector.start_action("action-001", None, "workflow-1", 0)
-    mock_state_memory.add_state("StateA")
-    record_1 = data_collector.create_record(
-        action_type="ACTION_1", start_time=start_time, end_time=start_time + 0.1, success=True
-    )
-    records.append(record_1)
-
-    # Record action 2 (child of action 1)
-    start_time = time.time()
-    data_collector.start_action("action-002", "action-001", "workflow-1", 1)
-    mock_state_memory.add_state("StateB")
-    record_2 = data_collector.create_record(
-        action_type="ACTION_2", start_time=start_time, end_time=start_time + 0.1, success=True
-    )
-    records.append(record_2)
-
-    # Record action 3 (child of action 2)
-    start_time = time.time()
-    data_collector.start_action("action-003", "action-002", "workflow-1", 2)
-    record_3 = data_collector.create_record(
-        action_type="ACTION_3", start_time=start_time, end_time=start_time + 0.1, success=True
-    )
-    records.append(record_3)
-
-    # Record action 4 (root, different workflow)
-    start_time = time.time()
-    data_collector.start_action("action-004", None, "workflow-2", 0)
-    mock_state_memory.remove_state("StateA")
-    record_4 = data_collector.create_record(
-        action_type="ACTION_4", start_time=start_time, end_time=start_time + 0.1, success=True
-    )
-    records.append(record_4)
-
-    # Test execution tree view
-    execution_tree = TreeViewLayer.execution_tree_view(records)
-    assert len(execution_tree) > 0
-
-    # Verify hierarchy
-    workflow_1_node = next(n for n in execution_tree if n.id == "workflow-1")
-    assert workflow_1_node is not None
-    assert len(workflow_1_node.children) >= 1
-
-    # Find action-001 in workflow-1
-    action_1_node = next(n for n in workflow_1_node.children if n.id == "action-001")
-    assert action_1_node is not None
-    assert len(action_1_node.children) >= 1
-
-    # Find action-002 as child of action-001
-    action_2_node = next(n for n in action_1_node.children if n.id == "action-002")
-    assert action_2_node is not None
-    assert len(action_2_node.children) >= 1
-
-    # Find action-003 as child of action-002
-    action_3_node = next(n for n in action_2_node.children if n.id == "action-003")
-    assert action_3_node is not None
-
-    # Test action-only tree view
-    action_tree = TreeViewLayer.action_only_tree_view(records)
-    assert len(action_tree) == 4
-    assert all(node.type == "action" for node in action_tree)
-
-    # Test state transition tree view
-    state_transition_tree = TreeViewLayer.state_transition_tree_view(records)
-    assert len(state_transition_tree) > 0
-
-    # Should have "States Entered" and "States Exited" groups
-    group_labels = [node.label for node in state_transition_tree]
-    assert any("Entered" in label for label in group_labels)
-    assert any("Exited" in label for label in group_labels)
-
-    # Test timeline tree view
-    timeline_tree = TreeViewLayer.timeline_tree_view(records)
-    assert len(timeline_tree) > 0
-    assert all("[" in node.label for node in timeline_tree)  # Has timestamp
-
-    # Test state grouped tree view
-    state_grouped_tree = TreeViewLayer.state_grouped_tree_view(records)
-    assert len(state_grouped_tree) > 0
-    assert all(node.type == "state_group" for node in state_grouped_tree)
-
-    # Test serialization
-    for tree in [
-        execution_tree,
-        action_tree,
-        state_transition_tree,
-        timeline_tree,
-        state_grouped_tree,
-    ]:
-        tree_dict = [node.to_dict() for node in tree]
-        assert isinstance(tree_dict, list)
-        if tree_dict:
-            assert "id" in tree_dict[0]
-            assert "label" in tree_dict[0]
-            assert "children" in tree_dict[0]
-
-
-# ============================================================================
-# Test 6: Match Result with Screenshot
+# Test 5: Match Result with Screenshot
 # ============================================================================
 
 
@@ -673,7 +554,7 @@ def test_match_result_with_screenshot(temp_storage, mock_state_memory):
 
 
 # ============================================================================
-# Test 7: Error Handling and Edge Cases
+# Test 6: Error Handling and Edge Cases
 # ============================================================================
 
 
@@ -752,29 +633,8 @@ def test_collector_without_screenshot_service(mock_state_memory):
     assert record.screenshot_reference is None
 
 
-def test_empty_tree_views():
-    """Test tree view generation with empty record list."""
-    empty_records = []
-
-    # All views should handle empty records gracefully
-    execution_tree = TreeViewLayer.execution_tree_view(empty_records)
-    assert execution_tree == []
-
-    action_tree = TreeViewLayer.action_only_tree_view(empty_records)
-    assert action_tree == []
-
-    state_tree = TreeViewLayer.state_transition_tree_view(empty_records)
-    assert state_tree == []
-
-    timeline_tree = TreeViewLayer.timeline_tree_view(empty_records)
-    assert timeline_tree == []
-
-    grouped_tree = TreeViewLayer.state_grouped_tree_view(empty_records)
-    assert grouped_tree == []
-
-
 # ============================================================================
-# Test 8: Complex Workflow Integration
+# Test 7: Complex Workflow Integration
 # ============================================================================
 
 
@@ -925,30 +785,6 @@ def test_complex_workflow_integration(temp_storage, mock_state_memory):
     for record in screenshot_records:
         screenshot = screenshot_service.get_screenshot(record.screenshot_reference)
         assert screenshot is not None
-
-    # Generate tree views
-    execution_tree = TreeViewLayer.execution_tree_view(records)
-    assert len(execution_tree) > 0
-
-    state_transition_tree = TreeViewLayer.state_transition_tree_view(records)
-    assert len(state_transition_tree) > 0
-
-    # Verify tree can be serialized
-    tree_dict = [node.to_dict() for node in execution_tree]
-    assert len(tree_dict) > 0
-
-    # Verify state changes are reflected in tree
-    # We need to recursively check all nodes, not just top-level ones
-    def has_state_change_in_tree(nodes):
-        """Recursively check if any node has state changes."""
-        for node in nodes:
-            if node.metadata.get("has_state_change", False):
-                return True
-            if node.children and has_state_change_in_tree(node.children):
-                return True
-        return False
-
-    assert has_state_change_in_tree(execution_tree)
 
 
 if __name__ == "__main__":

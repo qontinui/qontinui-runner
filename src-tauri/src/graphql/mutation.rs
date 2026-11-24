@@ -332,9 +332,14 @@ impl MutationRoot {
             info!("GraphQL: Killing AI process PID {} for task {}", pid, id);
             #[cfg(target_os = "windows")]
             {
-                let _ = crate::process_helpers::no_window("taskkill")
-                    .args(["/F", "/T", "/PID", &pid.to_string()])
-                    .output();
+                if let Err(e) = crate::tree_kill::kill_tree_by_pid_async(
+                    *pid,
+                    std::time::Duration::from_secs(5),
+                )
+                .await
+                {
+                    info!("GraphQL: tree kill of PID {pid}: {e}");
+                }
             }
             #[cfg(not(target_os = "windows"))]
             {

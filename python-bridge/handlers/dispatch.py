@@ -12,9 +12,8 @@ subprocess for each inbound WS bridge command. Protocol:
   exceptions are caught by the handler and surfaced as a structured
   error response on stdout — exit code stays 0 for those.
 
-The dispatcher imports its handler module lazily so adding a new
-command in a follow-up phase is a one-line addition to ``_COMMANDS``
-plus a new submodule.
+The dispatcher imports its handler module lazily: adding a new command
+is a new ``elif`` branch in ``_load_handler`` plus a new submodule.
 """
 
 from __future__ import annotations

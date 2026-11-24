@@ -14,10 +14,11 @@ use std::ptr::{null, null_mut};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, LocalFree, ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE,
-    ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_IO_PENDING, ERROR_NO_DATA,
-    ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED, GENERIC_READ, GENERIC_WRITE,
-    HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, DuplicateHandle, GetLastError, LocalFree, DUPLICATE_SAME_ACCESS,
+    ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER,
+    ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
+    ERROR_PIPE_NOT_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -27,8 +28,9 @@ use windows_sys::Win32::Security::{
     TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED,
-    OPEN_EXISTING, PIPE_ACCESS_DUPLEX, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
+    CreateFileW, FlushFileBuffers, ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE,
+    FILE_FLAG_OVERLAPPED, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, SECURITY_IDENTIFICATION,
+    SECURITY_SQOS_PRESENT,
 };
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeServerProcessId,
@@ -40,7 +42,7 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
-use super::remaining;
+use super::{remaining, ShutFlag};
 
 const PIPE_BUFFER: u32 = 64 * 1024;
 
@@ -93,22 +95,84 @@ pub struct Conn {
     handle: Handle,
     read_event: Handle,
     write_event: Handle,
-    timeout: Option<Duration>,
+    read_timeout: Option<Duration>,
+    write_timeout: Option<Duration>,
+    /// Shared by every [`Conn::try_clone`] of this connection; see
+    /// [`ShutFlag`] and [`Conn::shutdown`].
+    shut: ShutFlag,
 }
 
 impl Conn {
-    fn from_handle(handle: Handle) -> io::Result<Conn> {
+    fn from_handle(handle: Handle, shut: ShutFlag) -> io::Result<Conn> {
         Ok(Conn {
             handle,
             read_event: new_event()?,
             write_event: new_event()?,
-            timeout: None,
+            read_timeout: None,
+            write_timeout: None,
+            shut,
         })
     }
 
     /// Bound every subsequent read and write; `None` blocks indefinitely.
     pub fn set_timeout(&mut self, t: Option<Duration>) -> io::Result<()> {
-        self.timeout = t;
+        self.read_timeout = t;
+        self.write_timeout = t;
+        Ok(())
+    }
+
+    /// Bound every subsequent READ only. Per handle on Windows (unlike the
+    /// per-socket Unix option), but kept split for the same contract.
+    pub fn set_read_timeout(&mut self, t: Option<Duration>) -> io::Result<()> {
+        self.read_timeout = t;
+        Ok(())
+    }
+
+    /// Bound every subsequent WRITE only.
+    pub fn set_write_timeout(&mut self, t: Option<Duration>) -> io::Result<()> {
+        self.write_timeout = t;
+        Ok(())
+    }
+
+    /// A second handle on the same pipe instance (`DuplicateHandle`), with its
+    /// own events, so one thread can read while another writes. Each
+    /// overlapped operation carries its own `OVERLAPPED` and event, so the two
+    /// never complete each other's I/O.
+    pub fn try_clone(&self) -> io::Result<Conn> {
+        let mut dup: HANDLE = null_mut();
+        // SAFETY: duplicating a handle we own into this same process; `dup` is
+        // a valid out-parameter and is owned by the `Handle` below.
+        let ok = unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                self.handle.0,
+                GetCurrentProcess(),
+                &mut dup,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Conn::from_handle(Handle(dup), self.shut.clone())
+    }
+
+    /// Block until the peer has read everything written so far
+    /// (`FlushFileBuffers`). A pipe server that exits right after its last
+    /// write can otherwise lose the unread tail; the holder calls this after
+    /// the `exit` frame and before it exits. UNBOUNDED by itself — a peer that
+    /// never reads pins the caller. The holder calls it only from a
+    /// connection's own pump thread, on a handle of its own and OUTSIDE the
+    /// connection's writer lock, so a peer that stops reading pins that pump
+    /// alone (the holder still exits at its exit linger), never the dispatch
+    /// thread's replies or teardown.
+    pub fn flush_to_peer(&self) -> io::Result<()> {
+        // SAFETY: a valid pipe handle.
+        if unsafe { FlushFileBuffers(self.handle.0) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
         Ok(())
     }
 
@@ -124,8 +188,36 @@ impl Conn {
         Ok(pid)
     }
 
-    /// Close the connection after a rejection (drop does the same).
-    pub fn shutdown(&self) {}
+    /// Shut the connection down, permanently, for EVERY handle on it.
+    ///
+    /// What it guarantees:
+    /// 1. **Permanent.** It sets the connection's shared [`ShutFlag`] first.
+    ///    Every later read on any `try_clone` of this connection returns EOF
+    ///    and every later write fails `BrokenPipe` without touching the pipe —
+    ///    the Unix `SHUT_RDWR` contract. `overlapped` checks the flag before it
+    ///    issues an operation and again right after, cancelling its own I/O if
+    ///    the flag went up in between, so no operation can slip past a
+    ///    shutdown.
+    /// 2. **Unblocks.** It then cancels the I/O pending on the pipe's FILE
+    ///    OBJECT (`CancelIoEx` with a null `OVERLAPPED`; every `try_clone`
+    ///    duplicates the handle onto that object), so a blocked read and a
+    ///    blocked write both return.
+    /// 3. **Delivers what was written.** It does NOT disconnect the pipe: the
+    ///    connection ends when the last handle is dropped (`CloseHandle`),
+    ///    and data already written stays readable by the peer.
+    ///    `DisconnectNamedPipe` discards it — which is why every `rejected`
+    ///    frame (written immediately before a shutdown) used to reach the
+    ///    client as EOF mid-frame (round 4: four transport tests on the first
+    ///    Windows run of Phase 2).
+    ///
+    /// It does NOT reach the PEER's handles: the peer sees the connection end
+    /// only when this side's last handle is dropped. (Type-checked here;
+    /// executed on the `holder-crates (windows-latest)` CI leg.)
+    pub fn shutdown(&self) {
+        self.shut.shut();
+        // SAFETY: a valid handle; a null OVERLAPPED cancels all of its I/O.
+        unsafe { CancelIoEx(self.handle.0, null()) };
+    }
 
     /// Run one overlapped operation to completion or timeout.
     ///
@@ -137,6 +229,10 @@ impl Conn {
         is_read: bool,
         start: impl FnOnce(*mut OVERLAPPED) -> i32,
     ) -> io::Result<usize> {
+        // A shut connection does no more I/O (see `Conn::shutdown`).
+        if self.shut.is_shut() {
+            return ShutFlag::result(is_read);
+        }
         // SAFETY: OVERLAPPED is plain data; zeroed is its initial state.
         let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
         ov.hEvent = event.0;
@@ -146,9 +242,31 @@ impl Conn {
             if e != ERROR_IO_PENDING {
                 return self.map_err(e, is_read);
             }
+            // Issued and pending. A `shutdown` that landed between the check
+            // above and the issue cancelled nothing of ours (it ran first), so
+            // look again now and cancel this operation ourselves. Bytes it
+            // already moved are still reported.
+            if self.shut.is_shut() {
+                let mut n = 0u32;
+                // SAFETY: cancel exactly this operation, then WAIT for it so
+                // `ov` is not freed while the kernel still references it.
+                unsafe {
+                    CancelIoEx(self.handle.0, &ov);
+                    GetOverlappedResult(self.handle.0, &ov, &mut n, 1);
+                }
+                if n > 0 {
+                    return Ok(n as usize);
+                }
+                return ShutFlag::result(is_read);
+            }
         }
         // SAFETY: a valid event handle.
-        let waited = unsafe { WaitForSingleObject(event.0, timeout_ms(self.timeout)) };
+        let timeout = if is_read {
+            self.read_timeout
+        } else {
+            self.write_timeout
+        };
+        let waited = unsafe { WaitForSingleObject(event.0, timeout_ms(timeout)) };
         let mut n = 0u32;
         if waited == WAIT_TIMEOUT {
             // SAFETY: cancel exactly this operation, then WAIT for it to finish
@@ -334,17 +452,24 @@ pub struct Listener {
 struct AcceptState {
     /// The listening instance (the type invariant: `Some` from `bind` on).
     pending: Option<Handle>,
-    /// Consecutive accepts in which the pending instance could neither be
-    /// reset (`DisconnectNamedPipe`) nor replaced. Past
-    /// [`MAX_STUCK_INSTANCE_RETRIES`] the instance is declared broken.
+    /// When the pending instance first could neither be reset
+    /// (`DisconnectNamedPipe`) nor replaced, in an unbroken run of such
+    /// accepts. `None` while accepts are healthy.
+    stuck_since: Option<Instant>,
+    /// Consecutive "cannot reset, cannot replace" accepts, for the message.
     stuck: u32,
 }
 
-/// How many consecutive "cannot reset, cannot replace" accepts are retried
-/// (with the server's backoff, up to ~30 s) before the listener gives up with
-/// a [`super::FatalAcceptError`] rather than retrying one broken instance
-/// forever.
-pub const MAX_STUCK_INSTANCE_RETRIES: u32 = 30;
+/// How long an unbroken run of "cannot reset, cannot replace" accepts may last
+/// before the listener reports a [`super::FatalAcceptError`].
+///
+/// TIME-BASED AND LONG on purpose (plan Phase 1 hand-off, Phase 2): since
+/// Phase 2 the holder owns a PTY, and an endpoint problem must never end the
+/// session it holds. Phase 1's 30-consecutive-attempts bound (~25 s) would have
+/// done exactly that. And even a "fatal" accept error no longer exits the
+/// holder — `server::Holder::run` logs it and keeps retrying at its longest
+/// backoff — so this bound now only decides when the log says "fatal".
+pub const STUCK_INSTANCE_FATAL_AFTER: Duration = Duration::from_secs(15 * 60);
 
 impl std::fmt::Debug for Listener {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -361,6 +486,7 @@ impl Listener {
             sd: owner_only_descriptor()?,
             state: std::sync::Mutex::new(AcceptState {
                 pending: None,
+                stuck_since: None,
                 stuck: 0,
             }),
         };
@@ -468,8 +594,9 @@ impl Listener {
                 Ok(next) => {
                     st.pending = Some(next);
                     st.stuck = 0;
+                    st.stuck_since = None;
                     drop(st);
-                    Conn::from_handle(h)
+                    Conn::from_handle(h, ShutFlag::default())
                 }
                 Err(e) => {
                     // No replacement: this client cannot be served without
@@ -489,6 +616,7 @@ impl Listener {
                 if unsafe { DisconnectNamedPipe(h.0) } != 0 {
                     st.pending = Some(h);
                     st.stuck = 0;
+                    st.stuck_since = None;
                     return Err(e);
                 }
                 let disconnect_err = io::Error::last_os_error();
@@ -496,6 +624,7 @@ impl Listener {
                     Ok(next) => {
                         st.pending = Some(next);
                         st.stuck = 0;
+                        st.stuck_since = None;
                         drop(h);
                         Err(e)
                     }
@@ -505,11 +634,13 @@ impl Listener {
                         // retry it forever.
                         st.pending = Some(h);
                         st.stuck += 1;
-                        if st.stuck >= MAX_STUCK_INSTANCE_RETRIES {
+                        let since = *st.stuck_since.get_or_insert_with(Instant::now);
+                        if since.elapsed() >= STUCK_INSTANCE_FATAL_AFTER {
                             return Err(io::Error::other(super::FatalAcceptError(format!(
-                                "pipe instance unusable after {} consecutive attempts: \
+                                "pipe instance unusable for {:?} ({} consecutive attempts): \
                                  connect failed ({e}), DisconnectNamedPipe failed \
                                  ({disconnect_err}), CreateNamedPipeW failed ({create_err})",
+                                since.elapsed(),
                                 st.stuck
                             ))));
                         }
@@ -542,7 +673,7 @@ pub fn connect(name: &str, deadline: Instant) -> io::Result<Conn> {
             )
         };
         if h != INVALID_HANDLE_VALUE {
-            return Conn::from_handle(Handle(h));
+            return Conn::from_handle(Handle(h), ShutFlag::default());
         }
         match last_error() {
             ERROR_PIPE_BUSY => {

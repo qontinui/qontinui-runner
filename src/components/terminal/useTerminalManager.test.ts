@@ -15,6 +15,7 @@ import {
   reduceCreatedTerminal,
   shouldIngestCreatedTerminal,
   nextActiveIdAfterIngest,
+  noteTerminalCreated,
   backfillClaudeSessionIds,
   resolveSpawnWorkingDir,
   reconcileTabsWithBackend,
@@ -29,6 +30,7 @@ import {
   type TerminalTab,
   type SessionIdsByTerminal,
 } from "./useTerminalManager";
+import type { TerminalCreatedPayload } from "./useTerminalManager";
 import type { TerminalSessionRecord } from "./types";
 
 const tab = (id: string, overrides: Partial<TerminalTab> = {}): TerminalTab => ({
@@ -45,8 +47,8 @@ const tab = (id: string, overrides: Partial<TerminalTab> = {}): TerminalTab => (
 const createdEvent = (
   id: string,
   pageId: string,
-  overrides: Partial<TerminalInfo> = {},
-): TerminalInfo => ({
+  overrides: Partial<TerminalCreatedPayload> = {},
+): TerminalCreatedPayload => ({
   id,
   title: id,
   pid: 100,
@@ -147,18 +149,75 @@ describe("reduceCreatedTerminal (ingest + dedup)", () => {
 // nothing. `nextActiveIdAfterIngest` is the pure decision the listener consults
 // before `setActiveId`. (Plan: 2026-06-07-gate-continuation-auto-surface-and-focus.)
 describe("nextActiveIdAfterIngest (auto-select on ingest)", () => {
-  it("returns the new terminal id when this is a genuinely-new tab", () => {
-    expect(nextActiveIdAfterIngest(createdEvent("cont-1", "default"), true)).toBe("cont-1");
+  const surfaced = { surface: true };
+
+  it("returns the new terminal id when this is a genuinely-new tab the runner surfaced", () => {
+    expect(nextActiveIdAfterIngest(createdEvent("cont-1", "default", surfaced), true)).toBe(
+      "cont-1",
+    );
   });
 
   it("returns null for a dedup'd re-delivery so focus is never stolen", () => {
-    expect(nextActiveIdAfterIngest(createdEvent("cont-1", "default"), false)).toBeNull();
+    expect(nextActiveIdAfterIngest(createdEvent("cont-1", "default", surfaced), false)).toBeNull();
+  });
+
+  // Plan 2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-
+  // continuation-cap, D3: the runner coalesces unattended spawns to one
+  // surfaced tab per minute; the rest carry `surface: false` and must appear
+  // as tabs WITHOUT taking the selection.
+  it("surface:false — a new tab the runner coalesced is NOT selected", () => {
+    expect(
+      nextActiveIdAfterIngest(createdEvent("cont-3", "default", { surface: false }), true),
+    ).toBeNull();
+  });
+
+  it("surface:true — a new tab the runner surfaced IS selected", () => {
+    expect(
+      nextActiveIdAfterIngest(createdEvent("cont-4", "default", { surface: true }), true),
+    ).toBe("cont-4");
+  });
+
+  it("an absent surface is not a yes", () => {
+    expect(nextActiveIdAfterIngest(createdEvent("cont-5", "default"), true)).toBeNull();
+  });
+
+  it("a burst: only the surfaced tab of three new tabs is selected, all three are appended", () => {
+    let tabs: TerminalTab[] = [];
+    const selected: string[] = [];
+    for (const [id, surface] of [
+      ["b-1", true],
+      ["b-2", false],
+      ["b-3", false],
+    ] as const) {
+      const info = createdEvent(id, "default", { surface });
+      const isNew = !tabs.some((t) => t.id === info.id);
+      tabs = reduceCreatedTerminal(tabs, info);
+      const sel = nextActiveIdAfterIngest(info, isNew);
+      if (sel !== null) selected.push(sel);
+    }
+    expect(tabs.map((t) => t.id)).toEqual(["b-1", "b-2", "b-3"]);
+    expect(selected).toEqual(["b-1"]);
+    expect(tabs.map((t) => t.coalesced === true)).toEqual([false, true, true]);
+  });
+
+  it("noteTerminalCreated selects a surfaced tab once, and never on a re-delivery", () => {
+    const ingested = new Set<string>();
+    const surfaced = createdEvent("n-1", "default", { surface: true });
+    expect(noteTerminalCreated(ingested, surfaced)).toEqual({ wasNew: true, selectId: "n-1" });
+    expect(ingested.has("n-1")).toBe(true);
+    expect(noteTerminalCreated(ingested, surfaced)).toEqual({ wasNew: false, selectId: null });
+
+    const suppressed = createdEvent("n-2", "default", { surface: false });
+    expect(noteTerminalCreated(ingested, suppressed)).toEqual({ wasNew: true, selectId: null });
+    // A later delivery of a suppressed tab cannot turn into a selection.
+    const late = createdEvent("n-2", "default", { surface: true });
+    expect(noteTerminalCreated(ingested, late)).toEqual({ wasNew: false, selectId: null });
   });
 
   it("end-to-end: a fresh continuation ingest both appends AND selects the tab", () => {
     // Mirror the listener: reduce (append) + decide selection from is-new.
     const prev: TerminalTab[] = [];
-    const info = createdEvent("cont-2", "default");
+    const info = createdEvent("cont-2", "default", surfaced);
     const isNew = !prev.some((t) => t.id === info.id);
     const next = reduceCreatedTerminal(prev, info);
     expect(next).not.toBe(prev); // appended
@@ -167,11 +226,58 @@ describe("nextActiveIdAfterIngest (auto-select on ingest)", () => {
 
   it("end-to-end: a re-delivered continuation neither re-appends NOR re-selects", () => {
     const prev: TerminalTab[] = [tab("cont-2")];
-    const info = createdEvent("cont-2", "default");
+    const info = createdEvent("cont-2", "default", surfaced);
     const isNew = !prev.some((t) => t.id === info.id);
     const next = reduceCreatedTerminal(prev, info);
     expect(next).toBe(prev); // dedup'd — same identity
     expect(nextActiveIdAfterIngest(info, isNew)).toBeNull(); // no focus steal
+  });
+});
+
+describe("a re-sync-added tab waits for its surface verdict", () => {
+  it("the re-sync adds a missed terminal as coalesced and awaiting its verdict", () => {
+    const next = reconcileTabsWithBackend([], [createdEvent("r-1", "p")], 1_700_000_000_000);
+    expect(next).toHaveLength(1);
+    expect(next[0].coalesced).toBe(true);
+    expect(next[0].awaitingSurfaceVerdict).toBe(true);
+  });
+
+  it("a late surface:true clears coalesced and settles the verdict", () => {
+    const tabs = reconcileTabsWithBackend([], [createdEvent("r-2", "p")], 1_700_000_000_000);
+    const info = createdEvent("r-2", "p", { surface: true });
+    const next = reduceCreatedTerminal(tabs, info);
+    expect(next).not.toBe(tabs);
+    expect(next).toHaveLength(1);
+    expect(next[0].coalesced).toBeUndefined();
+    expect(next[0].awaitingSurfaceVerdict).toBeUndefined();
+  });
+
+  it("a late surface:false keeps the tab coalesced and settles the verdict", () => {
+    const tabs = reconcileTabsWithBackend([], [createdEvent("r-3", "p")], 1_700_000_000_000);
+    const next = reduceCreatedTerminal(tabs, createdEvent("r-3", "p", { surface: false }));
+    expect(next[0].coalesced).toBe(true);
+    expect(next[0].awaitingSurfaceVerdict).toBeUndefined();
+  });
+
+  it("a payload with no surface (the page-move adopt) settles nothing", () => {
+    const tabs = reconcileTabsWithBackend([], [createdEvent("r-4", "p")], 1_700_000_000_000);
+    expect(reduceCreatedTerminal(tabs, createdEvent("r-4", "p"))).toBe(tabs);
+    // ...so the real event, arriving after it, still applies its verdict.
+    const next = reduceCreatedTerminal(tabs, createdEvent("r-4", "p", { surface: true }));
+    expect(next[0].coalesced).toBeUndefined();
+  });
+
+  it("the verdict applies once: a re-delivery after it is a no-op", () => {
+    const tabs = reconcileTabsWithBackend([], [createdEvent("r-5", "p")], 1_700_000_000_000);
+    const settled = reduceCreatedTerminal(tabs, createdEvent("r-5", "p", { surface: false }));
+    expect(reduceCreatedTerminal(settled, createdEvent("r-5", "p", { surface: true }))).toBe(
+      settled,
+    );
+  });
+
+  it("a suppressed tab ingested by the event is never flipped by a re-delivery", () => {
+    const tabs = reduceCreatedTerminal([], createdEvent("r-6", "p", { surface: false }));
+    expect(reduceCreatedTerminal(tabs, createdEvent("r-6", "p", { surface: true }))).toBe(tabs);
   });
 });
 

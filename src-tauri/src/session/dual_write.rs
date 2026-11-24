@@ -29,9 +29,12 @@
 //!
 //! The gate is closed unless ALL of these hold:
 //!
-//! 1. The runner resolved an `active_tenant_id` from
-//!    `~/.qontinui/machine.json`. MSI's `machine.json` has none today, so
-//!    the gate never even queries coord — it stays a hard no-op.
+//! 1. `~/.qontinui/machine.json` currently names an `active_tenant_id`.
+//!    The flag poll ([`super::coord_sync::CoordSync::start_flag_poll_task`])
+//!    re-reads that pin at the top of every tick and retargets this gate when
+//!    it changes, so a `PUT /tenant/active` (or a hand edit) is followed
+//!    within one poll interval. With no pin the poll asks coord nothing and
+//!    the gate stays closed.
 //! 2. Coord's `/tenant-policy?tenant_id=<id>` returns
 //!    `session_coordination_enabled = true` for that tenant. The DB column
 //!    defaults `false` and the coord-side missing-row fallback is also
@@ -73,29 +76,32 @@ pub struct DualWriteGate {
     /// Cached `session_coordination_enabled` for this runner's tenant.
     /// Default `false` (dormant). The poll task is the only writer.
     enabled: AtomicBool,
-    /// The tenant whose policy gates this runner, resolved once from
-    /// `machine.json` at construction. `None` → the gate never opens and
-    /// the poll task short-circuits (no tenant → no coord-native mirror).
+    /// The tenant whose policy gates this runner — the `machine.json` pin as
+    /// the flag poll last read it. `None` until the poll's first tick, and
+    /// whenever the machine is unpinned: the poll then asks coord nothing and
+    /// the gate stays closed. Written only through [`Self::retarget`].
     tenant_id: Mutex<Option<Uuid>>,
     /// Poll cadence, env-tunable via `QONTINUI_SESSION_FLAG_POLL_SECS`.
     poll_interval: Duration,
 }
 
 impl DualWriteGate {
-    /// Construct a gate, resolving the active tenant from
-    /// `~/.qontinui/machine.json`'s `active_tenant_id` field (plan §D12 —
-    /// written on the first multi-tenant prompt). Single-tenant operators
-    /// have no such field, so the gate stays permanently dormant for them
-    /// regardless of any tenant's flag.
+    /// Construct a dormant gate bound to no tenant.
+    ///
+    /// It deliberately does NOT read the pin: a value read here would be
+    /// frozen for the life of the process, which is exactly how a
+    /// `PUT /tenant/active` used to be invisible to this gate until the next
+    /// runner start. The flag poll owns the pin read — it resolves
+    /// `machine.json`'s `active_tenant_id` (plan §D12) on every tick and
+    /// binds the result through [`Self::retarget`].
     pub fn new() -> Self {
-        let tenant_id = resolve_active_tenant_id();
         let poll_interval = Duration::from_secs(env_u64(
             "QONTINUI_SESSION_FLAG_POLL_SECS",
             DEFAULT_FLAG_POLL_SECS,
         ));
         Self {
             enabled: AtomicBool::new(false),
-            tenant_id: Mutex::new(tenant_id),
+            tenant_id: Mutex::new(None),
             poll_interval,
         }
     }
@@ -123,6 +129,26 @@ impl DualWriteGate {
             .tenant_id
             .lock()
             .expect("dual_write tenant slot poisoned")
+    }
+
+    /// Bind the gate to `tenant` — the pin the flag poll just read.
+    ///
+    /// On a change the cached flag is CLOSED before the new tenant is stored,
+    /// so the hot path never observes the old tenant's `true` under the new
+    /// tenant's name, and the new tenant's gate opens only once its own flag
+    /// has been fetched. Returns the previous tenant when it changed, `None`
+    /// when the pin is the one already bound (a no-op).
+    pub(super) fn retarget(&self, tenant: Option<Uuid>) -> Option<Option<Uuid>> {
+        let previous = self.tenant_id();
+        if previous == tenant {
+            return None;
+        }
+        self.apply(false);
+        *self
+            .tenant_id
+            .lock()
+            .expect("dual_write tenant slot poisoned") = tenant;
+        Some(previous)
     }
 
     /// Poll cadence — surfaced for the poll task + tests.
@@ -205,10 +231,41 @@ mod tests {
         // No active tenant resolved (single-tenant operator). Even an
         // explicit apply(true) would enable the atom, but the poll task
         // (see coord_sync) never calls apply for a None tenant — it
-        // short-circuits. This test pins the precondition the poll task
+        // skips the fetch. This test pins the precondition the poll task
         // relies on.
         let gate = DualWriteGate::new_for_test(None, Duration::from_secs(1));
         assert!(gate.tenant_id().is_none());
         assert!(!gate.enabled());
+    }
+
+    /// A pin switch closes the gate BEFORE the new tenant is bound: the old
+    /// tenant's flag must never be read as the new tenant's.
+    #[test]
+    fn retarget_closes_the_gate_and_binds_the_new_tenant() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let gate = DualWriteGate::new_for_test(Some(a), Duration::from_secs(1));
+        gate.apply(true);
+
+        assert_eq!(gate.retarget(Some(a)), None, "the same pin is a no-op");
+        assert!(gate.enabled(), "a no-op retarget keeps the fetched flag");
+
+        assert_eq!(gate.retarget(Some(b)), Some(Some(a)));
+        assert_eq!(gate.tenant_id(), Some(b));
+        assert!(
+            !gate.enabled(),
+            "tenant A's flag must not carry over to tenant B"
+        );
+
+        gate.apply(true);
+        assert_eq!(gate.retarget(None), Some(Some(b)));
+        assert_eq!(gate.tenant_id(), None);
+        assert!(!gate.enabled(), "unpinning closes the gate");
+    }
+
+    /// Construction reads no pin; the poll binds it on its first tick.
+    #[test]
+    fn new_binds_no_tenant() {
+        assert_eq!(DualWriteGate::new().tenant_id(), None);
     }
 }

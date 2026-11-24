@@ -290,12 +290,12 @@ The result: fewer wasted iterations, faster convergence, and better root-cause f
       resources: [
         {
           title: "Blame Attribution Spec",
-          url: "http://localhost:9876/spec/page/blame-attribution",
+          url: "http://127.0.0.1:9876/spec/page/blame-attribution",
           type: "documentation",
         },
         {
           title: "Convergence Widget Spec",
-          url: "http://localhost:9876/spec/page/convergence-widget",
+          url: "http://127.0.0.1:9876/spec/page/convergence-widget",
           type: "documentation",
         },
       ],

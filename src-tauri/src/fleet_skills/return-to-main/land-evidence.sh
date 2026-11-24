@@ -2,13 +2,55 @@
 # land-evidence.sh — did this branch's "unlanded" work actually LAND?
 #
 # Plan 2026-09-13-nightly-return-to-main-sweep, Phase 3a. Finding a911a385:
-# qontinui-dev-notes sat on `followup/pr1260-landing-state-update` (eed39fc2)
+# a plans repository sat on `followup/pr1260-landing-state-update` (eed39fc2)
 # and the classifier said UNIQUE_WIP forever. The commit HAD landed — PR #511,
 # merged as c7df1d44 after a rebase WITH conflict resolution (patch-id changed)
 # and later upstream edits to the same lines (content arm failed too). Deciding
 # it took a land signal plus a content comparison. This helper gathers both; the
 # judgment step reads it and decides whether to pass `--adjudicated-landed`.
-# It never acts and never writes to the checkout.
+# It never acts and never writes to the checkout. Its ONE write is the verdict
+# CACHE below: a git note under refs/notes/land-evidence in the checkout's
+# repository (never the working tree, the index, a branch or HEAD).
+#
+# CACHE (plan 2026-09-17-stop-hand-cleaning-stale-branches-and-dead-worktrees,
+# Phase 6 item 4). Deriving a verdict walks GitHub, coord and the history, up to
+# minutes per branch, and a census over thousands of worktrees (the class-2
+# reaper) re-derived every one of them on every pass until it no longer fit its
+# caller's timeout (finding 4cd7dfcb). A DECIDED verdict is therefore recorded as
+# a note on the TIP commit and re-used while it still holds:
+#   key       (tip sha -- the note's object; branch; upstream ref name; --corpus;
+#             --repo; --coord-hours; the tunables that bound a conclusion
+#             (status-block cap, supersession line budget, coord window cap,
+#             LAND_EVIDENCE_PYTHON); a hash of this script, the classifier and
+#             every file in their lib directories). A change to any of those
+#             files is a different key, so a fixed bug there never replays its
+#             old answer; a change in a TOOL they call (git, gh, python) is not.
+#             The repository is the note's own: worktrees of one repo share it.
+#   PROVEN_LANDED  re-used while the upstream it was proven against is an
+#             ANCESTOR of (or equal to) the upstream now. A land proven against
+#             an upstream that has since only fast-forwarded is still a land; an
+#             upstream that was rewritten past it is a miss.
+#   SUPERSEDED     re-used only against the IDENTICAL upstream sha. It authorizes
+#             a discard, and nothing here proves a later upstream cannot have
+#             re-introduced what it judged superseded, so it buys no reach.
+#   PARTIAL / NONE re-used for at most LAND_EVIDENCE_CACHE_NEGATIVE_TTL seconds
+#             (default 21600 = 6 h), whatever the upstream did. A negative can
+#             turn positive (the PR merges, upstream catches up), and the TTL
+#             is what bounds how long a stale negative is served. Its error
+#             points the safe way: a stale NONE makes a destructive consumer
+#             ABSTAIN, never act.
+#   UNKNOWN   is NEVER cached. An unanswerable probe is not a result; caching it
+#             would make one transient door failure permanent. A fatal run, a
+#             --help and a usage error write nothing either.
+# A hit replays the recorded --json document, prefixed with a `cache` object
+# naming where and when it was recorded, with `checkout` and `ref` re-pointed at
+# this run (its `commits` stay relative to `cache.recorded_upstream`); the exit
+# code is the recorded verdict's. A record is served only to the tip its
+# document names, so a note git copied onto a rewritten commit is a miss. In
+# human mode a hit prints the header, the cache line and EVIDENCE only. The write is best-effort and never changes a verdict: a failed or
+# lost write (git notes takes no compare-and-swap, so two concurrent writers can
+# drop one entry) is only a later miss. LAND_EVIDENCE_CACHE=0 neither reads nor
+# writes; LAND_EVIDENCE_CACHE=refresh skips the read and re-records.
 #
 # FOR EACH unlanded commit (the classifier's `unlanded_commits`; with --ref, the
 # classifier's own primitive `git cherry <upstream> <ref>`), landing CANDIDATES:
@@ -126,10 +168,13 @@
 # decidable for this fleet's own plan corpus, because `plan-discipline` gives
 # plan status a classified vocabulary. A path qualifies when it matches
 # `plans/*.md`, exists upstream, the two copies are BYTE-IDENTICAL once each
-# side's leading status blockquote (the `>` block before the first `## `) is
-# removed, and upstream's status is a STRICTLY later state in the lifecycle
-# (draft < vetted < in progress < shipped < superseded/obsolete). An unparseable
-# status on either side is UNKNOWN, never "later". Comparing the two bodies
+# side's status block is removed, and upstream's status is a STRICTLY later
+# state in the lifecycle (draft < vetted < in progress < shipped <
+# superseded/obsolete). The block and the word are read by the stamp parse
+# owner, lib/plan_stamp.py (every stamp shape: blockquote, plain, list, bare,
+# bold no-colon); with no Python the arm falls back to the leading `>` block
+# before the first `## ` and says so in its reason. An unparseable status on
+# either side is UNKNOWN, never "later". Comparing the two bodies
 # WHOLE is what lets this profile be exempt from the removed-lines refusal
 # above: a line dropped from the body shows up as a body difference, whereas a
 # test that only checked where each ADDED line landed would have missed it.
@@ -188,7 +233,15 @@
 #                     Doors in probes: upstream, merges, classifier, ancestry, github,
 #                     reachability, pairing, same_subject, coord, object_store,
 #                     supersession.
+#                     Every document OPENS with "cache":{"status","hit",
+#                     "recorded_at","recorded_upstream","recorded_checkout",
+#                     "detail"}: status is hit | miss-then-stored as
+#                     stored / refresh-stored (read back) | store_lost |
+#                     store_failed | not_cacheable | not_reached | disabled.
 # ENV  LAND_EVIDENCE_GH / _CURL / _CLASSIFIER / _LIB_DIR / _PYTHON (overrides),
+#      LAND_EVIDENCE_CACHE (1 default | 0 off | refresh: skip the read, record),
+#      LAND_EVIDENCE_CACHE_NEGATIVE_TTL (seconds a PARTIAL/NONE is re-used,
+#      default 21600),
 #      LAND_EVIDENCE_SUPERSEDE_MAX_LINES (default 200): once a commit's
 #      branch-only lines reach this many IN TOTAL across the paths it touches,
 #      the general arm stops probing and the rest are SUPERSEDED_CANDIDATE — a
@@ -219,6 +272,9 @@ CURL="${LAND_EVIDENCE_CURL:-curl}"
 COORD_URL="${LAND_EVIDENCE_COORD_URL:-${COORD_HTTP_URL:-https://coord.qontinui.io}}"
 NET_TIMEOUT="${LAND_EVIDENCE_TIMEOUT:-60}"; case "$NET_TIMEOUT" in ''|*[!0-9]*) NET_TIMEOUT=60 ;; esac
 MAX_HOURS="${LAND_EVIDENCE_COORD_MAX_HOURS:-720}"; case "$MAX_HOURS" in ''|*[!0-9]*) MAX_HOURS=720 ;; esac
+CACHE_MODE="${LAND_EVIDENCE_CACHE:-1}"; case "$CACHE_MODE" in 0|refresh) ;; *) CACHE_MODE=1 ;; esac
+CACHE_NEG_TTL="${LAND_EVIDENCE_CACHE_NEGATIVE_TTL:-21600}"; case "$CACHE_NEG_TTL" in ''|*[!0-9]*) CACHE_NEG_TTL=21600 ;; esac
+CACHE_REF=refs/notes/land-evidence
 
 if [ -r "$LIB_DIR/git-scope.sh" ]; then . "$LIB_DIR/git-scope.sh"; fi
 if declare -F git_scope_strip >/dev/null 2>&1; then
@@ -297,7 +353,7 @@ C_SHA=(); C_SUBJ=(); C_DATE=(); C_CT=(); C_VERDICT=()
 S_VERDICT=(); S_JSON=(); SUPER_FAILED=0
 MAX_SUPER_LINES="${LAND_EVIDENCE_SUPERSEDE_MAX_LINES:-200}"
 case "$MAX_SUPER_LINES" in ''|*[!0-9]*) MAX_SUPER_LINES=200 ;; esac
-# The longest leading `>` run --corpus plan-document will treat as a status
+# The longest status block --corpus plan-document will treat as a status
 # STAMP. Beyond it the block is a chapter, and the profile would be licensed to
 # ignore substance hidden inside the one region it does not compare.
 MAX_STATUS_BLOCK_LINES="${LAND_EVIDENCE_STATUS_BLOCK_MAX_LINES:-40}"
@@ -306,7 +362,7 @@ K_CI=(); K_KIND=(); K_REF=(); K_PR=(); K_MC=(); K_RD=(); K_TOT=(); K_PRES=(); K_
 UPSTREAM=""; TIP=""; BRANCH=""; STRENGTH=""; FLOOR=""; LAND_SIGNAL=false; FATAL=""; AHEAD_MERGES=""
 
 emit() {
-  local i j rc first
+  local rc
   # The ahead-merge cap (VERDICT, above) lives here because every exit runs
   # through emit, so no early return can carry a PROVEN_LANDED past it.
   if [ "$STRENGTH" = PROVEN_LANDED ] && [ "${AHEAD_MERGES:-x}" != 0 ]; then FLOOR=PARTIAL; STRENGTH=UNKNOWN; fi
@@ -317,7 +373,22 @@ emit() {
   # than PARTIAL because supersession never produced a land candidate.
   if [ "$STRENGTH" = SUPERSEDED ] && [ "${AHEAD_MERGES:-x}" != 0 ]; then FLOOR=NONE; STRENGTH=UNKNOWN; fi
   case "$STRENGTH" in PROVEN_LANDED) rc=0 ;; PARTIAL) rc=1 ;; NONE) rc=2 ;; SUPERSEDED) rc=5 ;; *) rc=3; STRENGTH=UNKNOWN ;; esac
+  cache_store
+  # Keep why the lookup missed beside what the store did with the fresh verdict.
+  [ "$CACHE_HIT" = 0 ] && [ -n "$CACHE_LOOKUP" ] && CACHE_DETAIL="$CACHE_DETAIL (lookup: $CACHE_LOOKUP)"
   if [ "$MODE" = json ]; then
+    printf '{%s,' "$(cache_json)"
+    emit_doc | cut -c2-
+  else
+    emit_human
+  fi
+  exit "$rc"
+}
+# The verdict document WITHOUT the cache object: what --json prints after it,
+# and the bytes a cache note records.
+emit_doc() {
+  local i j first
+  {
     printf '{"checkout":%s,"branch":%s,"ref":%s,"tip":%s,"upstream":%s,"repo":%s,"ahead_merge_commits":%s,"commits":[' \
       "$(jstr "$CHECKOUT")" "$(jstr "$BRANCH")" "$(jstr "${REF:-HEAD}")" "$(jstr "$TIP")" "$(jstr "$UPSTREAM")" "$(jstr "$SLUG")" "$(jnum "$AHEAD_MERGES")"
     for i in "${!C_SHA[@]}"; do
@@ -341,7 +412,10 @@ emit() {
       printf '{"door":%s,"status":%s,"detail":%s}' "$(jstr "${P_DOOR[$i]}")" "$(jstr "${P_STATUS[$i]}")" "$(jstr "${P_DETAIL[$i]}")"
     done
     printf ']}\n'
-  else
+  }
+}
+emit_human() {
+  local i j
     printf 'land-evidence: %s  ref=%s branch=%s upstream=%s repo=%s ahead_merges=%s\n' "$CHECKOUT" "${REF:-HEAD}" "${BRANCH:-<none>}" "${UPSTREAM:-<none>}" "${SLUG:-<none>}" "${AHEAD_MERGES:-uncounted}"
     [ -n "$FATAL" ] && printf '  ERROR: %s\n' "$FATAL"
     for i in "${!C_SHA[@]}"; do
@@ -354,11 +428,177 @@ emit() {
       [ -n "${S_VERDICT[$i]:-}" ] && printf '      %-20s %s\n' "supersession" "${S_VERDICT[$i]}"
     done
     for i in "${!P_DOOR[@]}"; do printf '  probe %-12s %-10s %s\n' "${P_DOOR[$i]}" "${P_STATUS[$i]}" "${P_DETAIL[$i]}"; done
+    printf '  cache %-12s %s\n' "$CACHE_STATUS" "$CACHE_DETAIL"
     printf '\n  EVIDENCE: %s%s  (land signal: %s)\n' "$STRENGTH" "$([ -n "$FLOOR" ] && [ "$FLOOR" != "$STRENGTH" ] && printf ' (floor %s)' "$FLOOR")" "$LAND_SIGNAL"
+}
+fatal() { FATAL="$1"; STRENGTH=UNKNOWN; emit; }
+
+# ---------------------------------------------------------------------------
+# verdict cache (see CACHE in the header). Every function here is best-effort:
+# a failure is a miss or an unrecorded verdict, never a changed one.
+if [ "$CACHE_MODE" = 0 ]; then CACHE_STATUS=disabled; CACHE_DETAIL="LAND_EVIDENCE_CACHE=0: neither read nor written"
+else CACHE_STATUS=not_reached; CACHE_DETAIL="the run ended before the cache was consulted"; fi
+CACHE_KEY=""; UP_SHA=""; CACHE_DOC=""; CACHE_LOOKUP=""
+CACHE_HIT=0; CACHE_REC_AT=""; CACHE_REC_UP=""; CACHE_REC_CO=""
+cache_json() {
+  printf '"cache":{"status":%s,"hit":%s,"recorded_at":%s,"recorded_upstream":%s,"recorded_checkout":%s,"detail":%s}' \
+    "$(jstr "$CACHE_STATUS")" "$([ "$CACHE_HIT" = 1 ] && echo true || echo false)" \
+    "$(jnum "$CACHE_REC_AT")" "$(jstr "$CACHE_REC_UP")" "$(jstr "$CACHE_REC_CO")" "$(jstr "$CACHE_DETAIL")"
+}
+# The logic version: this script, the classifier it consults, and EVERY file in
+# the lib directories either of them sources (over-inclusive on purpose: a file
+# that does not decide a verdict only costs a miss when it changes). git
+# hash-object needs no repository.
+cache_logic_hash() {
+  local f d files=("${BASH_SOURCE[0]}" "$CLASSIFIER")
+  for d in "$LIB_DIR" "$(dirname "$CLASSIFIER")/lib"; do
+    [ -d "$d" ] || continue
+    for f in "$d"/*.sh "$d"/*.py; do [ -f "$f" ] && files+=("$f"); done
+  done
+  for f in "${files[@]}"; do [ -r "$f" ] || { echo "missing:$f"; return 1; }; done
+  cat "${files[@]}" | git hash-object --stdin 2>/dev/null
+}
+# One record per line: le1 TAB key TAB verdict TAB upstream-sha TAB epoch TAB
+# base64(checkout) TAB base64(document). Tabs and newlines cannot occur in the
+# key (refnames forbid control characters; the rest is stripped).
+cache_clean() { printf '%s' "$1" | tr -d '\t\n\r'; }
+cache_key() {
+  local h
+  h="$(cache_logic_hash)" || return 1
+  [ -n "$h" ] || return 1
+  # e= carries the tunables that bound what a verdict may conclude: the status-
+  # block cap and the supersession line budget (both bound SUPERSEDED), the coord
+  # window cap, and the interpreter override the stamp parse resolves from
+  # (LAND_EVIDENCE_PYTHON, else PYTHON; an unset one resolves by PATH, which the
+  # key does not see).
+  printf 'b=%s u=%s c=%s r=%s h=%s e=%s/%s/%s/%s v=%s' "$(cache_clean "${BRANCH:--}")" "$(cache_clean "$UPSTREAM")" \
+    "${CORPUS:--}" "$(cache_clean "${SLUG:--}")" "${HOURS_OPT:--}" \
+    "$MAX_STATUS_BLOCK_LINES" "$MAX_SUPER_LINES" "$MAX_HOURS" "$(cache_clean "${LAND_EVIDENCE_PYTHON:-${PYTHON:--}}")" "$h"
+}
+b64() { base64 | tr -d '\n'; }
+cache_lookup() {
+  local note line k v up at co doc now age
+  [ "$CACHE_MODE" = 0 ] && return 1
+  CACHE_KEY="$(cache_key)" || { CACHE_STATUS=not_cacheable; CACHE_DETAIL="could not hash the deciding logic ($(cache_logic_hash 2>/dev/null))"; CACHE_KEY=""; return 1; }
+  if [ "$CACHE_MODE" = refresh ]; then CACHE_STATUS=refresh; CACHE_DETAIL="LAND_EVIDENCE_CACHE=refresh: read skipped"; return 1; fi
+  CACHE_STATUS=miss; CACHE_DETAIL="no record for this tip and key"
+  note="$(g notes --ref="$CACHE_REF" show "$TIP" 2>/dev/null)" || { CACHE_LOOKUP="$CACHE_DETAIL"; return 1; }
+  now="$(date +%s)"
+  while IFS=$'\t' read -r tag k v up at co doc; do
+    [ "$tag" = le1 ] && [ "$k" = "$CACHE_KEY" ] || continue
+    case "$at" in ''|*[!0-9]*) continue ;; esac
+    case "$up" in *[!0-9a-f]*|'') continue ;; esac
+    age=$((now - at))
+    case "$v" in
+      PROVEN_LANDED)
+        if ! g merge-base --is-ancestor "$up" "$UP_SHA" 2>/dev/null; then
+          CACHE_DETAIL="recorded PROVEN_LANDED against upstream ${up:0:12}, which is not an ancestor of $UPSTREAM (${UP_SHA:0:12}) now"; continue
+        fi ;;
+      SUPERSEDED)
+        if [ "$up" != "$UP_SHA" ]; then
+          CACHE_DETAIL="recorded SUPERSEDED against upstream ${up:0:12}; $UPSTREAM is ${UP_SHA:0:12} now and SUPERSEDED is re-used only against the identical upstream"; continue
+        fi ;;
+      PARTIAL|NONE)
+        if [ "$age" -lt 0 ] || [ "$age" -gt "$CACHE_NEG_TTL" ]; then
+          CACHE_DETAIL="recorded $v ${age}s ago, outside the ${CACHE_NEG_TTL}s negative TTL"; continue
+        fi ;;
+      *) continue ;;
+    esac
+    doc="$(printf '%s' "$doc" | base64 -d 2>/dev/null)" || { CACHE_DETAIL="a matching record did not decode"; continue; }
+    case "$doc" in '{"checkout":'*'}') ;; *) CACHE_DETAIL="a matching record holds no verdict document"; continue ;; esac
+    # A note can be COPIED onto a rewritten commit (notes.rewriteRef on amend or
+    # rebase, `git notes copy`), carrying a land proven for its predecessor onto
+    # a tip with work that never landed. The document names the tip it judged.
+    case "$doc" in *",\"tip\":\"$TIP\","*) ;; *) CACHE_DETAIL="a matching record judged a different tip (a note copied onto a rewritten commit)"; continue ;; esac
+    CACHE_HIT=1; CACHE_STATUS=hit; STRENGTH="$v"
+    CACHE_REC_AT="$at"; CACHE_REC_UP="$up"; CACHE_REC_CO="$(printf '%s' "$co" | base64 -d 2>/dev/null)"
+    CACHE_DETAIL="$v recorded ${age}s ago against $UPSTREAM ${up:0:12} (now ${UP_SHA:0:12}); LAND_EVIDENCE_CACHE=0 re-derives"
+    CACHE_DOC="$doc"
+    return 0
+  done <<<"$note"
+  CACHE_LOOKUP="$CACHE_DETAIL"
+  return 1
+}
+cache_replay() {
+  local rc ls
+  case "$STRENGTH" in PROVEN_LANDED) rc=0 ;; PARTIAL) rc=1 ;; NONE) rc=2 ;; SUPERSEDED) rc=5 ;; *) rc=3 ;; esac
+  if [ "$MODE" = json ]; then
+    # Re-point `checkout` and `ref` at THIS run; the recording checkout is in the
+    # cache object. `branch` is part of the key, so it is already this run's.
+    # The document's `commits` stay relative to the upstream it was recorded
+    # against (`cache.recorded_upstream`).
+    printf '{%s,"checkout":%s,"branch":%s,"ref":%s,"tip":%s\n' "$(cache_json)" "$(jstr "$CHECKOUT")" \
+      "$(jstr "$BRANCH")" "$(jstr "${REF:-HEAD}")" "${CACHE_DOC#*,\"tip\":}"
+  else
+    ls="$(printf '%s' "$CACHE_DOC" | sed -n 's/.*"land_signal":\(true\|false\).*/\1/p')"
+    printf 'land-evidence: %s  ref=%s branch=%s upstream=%s\n' "$CHECKOUT" "${REF:-HEAD}" "${BRANCH:-<none>}" "$UPSTREAM"
+    printf '  cache %-12s %s\n' "$CACHE_STATUS" "$CACHE_DETAIL"
+    printf '  recorded from %s\n' "${CACHE_REC_CO:-<unknown checkout>}"
+    printf '\n  EVIDENCE: %s  (land signal: %s)\n' "$STRENGTH" "${ls:-unknown}"
   fi
   exit "$rc"
 }
-fatal() { FATAL="$1"; STRENGTH=UNKNOWN; emit; }
+# Every `git notes add` is a commit on $CACHE_REF, and a census over thousands
+# of worktrees writes thousands of them a pass. Once the ref's history reaches
+# CACHE_HISTORY_MAX commits, drop the notes of objects this repository no longer
+# has, then replace the history with ONE parentless commit of the current tree,
+# moved with a compare-and-swap on the tip read here: a writer that landed in
+# between makes the swap fail, and its note survives for the next compaction.
+CACHE_HISTORY_MAX="${LAND_EVIDENCE_CACHE_HISTORY_MAX:-500}"; case "$CACHE_HISTORY_MAX" in ""|*[!0-9]*|0) CACHE_HISTORY_MAX=500 ;; esac
+cache_compact() {
+  local old tree new
+  g rev-parse -q --verify "$CACHE_REF~$CACHE_HISTORY_MAX" >/dev/null 2>&1 || return 0
+  g -c user.name=land-evidence -c user.email=land-evidence@localhost \
+    notes --ref="$CACHE_REF" prune >/dev/null 2>&1
+  old="$(g rev-parse -q --verify "$CACHE_REF" 2>/dev/null)" || return 0
+  tree="$(g rev-parse -q --verify "$old^{tree}" 2>/dev/null)" || return 0
+  new="$(printf 'land-evidence cache: history compacted\n' | g -c user.name=land-evidence -c user.email=land-evidence@localhost \
+    commit-tree "$tree" 2>/dev/null)" || return 0
+  [ -n "$new" ] && g update-ref "$CACHE_REF" "$new" "$old" >/dev/null 2>&1
+  return 0
+}
+cache_store() {
+  local doc note kept line n
+  [ "$CACHE_HIT" = 1 ] && return 0
+  [ "$CACHE_MODE" = 0 ] && return 0
+  [ -n "$CACHE_KEY" ] || return 0
+  case "$STRENGTH" in PROVEN_LANDED|SUPERSEDED|PARTIAL|NONE) ;; *)
+    CACHE_STATUS=not_cacheable; CACHE_DETAIL="$STRENGTH is never recorded"; return 0 ;; esac
+  [ -z "$FATAL" ] && [ -n "$UP_SHA" ] && [ -n "$TIP" ] || { CACHE_STATUS=not_cacheable; CACHE_DETAIL="run did not complete"; return 0; }
+  doc="$(emit_doc)"
+  note="$(g notes --ref="$CACHE_REF" show "$TIP" 2>/dev/null)"
+  # Keep every other key's record (newest 7), replace this key's.
+  kept="$(printf '%s\n' "$note" | CK="$CACHE_KEY" awk -F'\t' '$1=="le1" && $2!=ENVIRON["CK"]' | tail -n 7)"
+  line="$(printf 'le1\t%s\t%s\t%s\t%s\t%s\t%s' "$CACHE_KEY" "$STRENGTH" "$UP_SHA" "$(date +%s)" \
+    "$(printf '%s' "$CHECKOUT" | b64)" "$(printf '%s' "$doc" | b64)")"
+  for n in 1 2 3; do
+    if { [ -n "$kept" ] && printf '%s\n' "$kept"; printf '%s\n' "$line"; } \
+        | g -c user.name=land-evidence -c user.email=land-evidence@localhost \
+            notes --ref="$CACHE_REF" add -f -F - "$TIP" >/dev/null 2>"$TMP/cache.err"; then
+      # `git notes add` moves the ref with no expected old value, so a concurrent
+      # writer can drop this record after the add returns 0. Report what a read
+      # back observed, not what the write returned.
+      # Both answers are as of the read-back: a later writer can still drop it.
+      if g notes --ref="$CACHE_REF" show "$TIP" 2>/dev/null | grep -qxF -- "$line"; then
+        CACHE_STATUS="$([ "$CACHE_MODE" = refresh ] && echo refresh-stored || echo stored)"
+        CACHE_DETAIL="$STRENGTH recorded on ${TIP:0:12} in $CACHE_REF against $UPSTREAM ${UP_SHA:0:12} (present at read-back)"
+        cache_compact
+        return 0
+      fi
+      CACHE_STATUS=store_lost
+      CACHE_DETAIL="git notes add returned 0 but the record was absent at read-back (a concurrent writer replaced the note); a run that finds no record re-derives"
+    elif [ "$CACHE_STATUS" = store_lost ]; then
+      CACHE_DETAIL="an earlier add was absent at read-back and the retry's add then failed: $(head -1 "$TMP/cache.err" | cut -c1-160)"
+    fi
+    # Re-read before a retry: another key's record may have been written since.
+    note="$(g notes --ref="$CACHE_REF" show "$TIP" 2>/dev/null)"
+    kept="$(printf '%s\n' "$note" | CK="$CACHE_KEY" awk -F'\t' '$1=="le1" && $2!=ENVIRON["CK"]' | tail -n 7)"
+    sleep "0.$((RANDOM % 5 + 1))"
+  done
+  [ "$CACHE_STATUS" = store_lost ] && return 0
+  CACHE_STATUS=store_failed; CACHE_DETAIL="git notes add failed 3x: $(head -1 "$TMP/cache.err" | cut -c1-160)"
+  return 0
+}
 
 # ---------------------------------------------------------------------------
 # upstream, tip, branch
@@ -385,6 +625,8 @@ else
   BRANCH="${BRANCH_OPT:-$(g symbolic-ref -q --short HEAD 2>/dev/null)}"
 fi
 g merge-base "$UPSTREAM" "$TIP" >/dev/null 2>&1 || { probe upstream failed "no merge base between $UPSTREAM and ${TIP:0:12}"; fatal "unrelated histories"; }
+UP_SHA="$(g rev-parse -q --verify "$UPSTREAM^{commit}" 2>/dev/null)"
+if [ -n "$UP_SHA" ] && cache_lookup; then cache_replay; fi
 
 # ---------------------------------------------------------------------------
 # ahead merge commits: counted before any evidence, because none of it looks at
@@ -866,10 +1108,59 @@ plan_status_rank() { # <status text> -> rank, or 1 when unparseable
     *) return 1 ;;
   esac
 }
-# The status word of the leading status blockquote, i.e. the `> **Status:` line
-# in the `>` block before the first `## ` heading. Anything after the first
-# comma, period or `**` is prose, and a trailing date is not the word.
+# THE STAMP IS READ BY THE PARSE OWNER, lib/plan_stamp.py -- the stdlib-only
+# stamp parse that check #34 re-exports, carried in this skill's lib/ as a
+# byte-identical twin of the shared copy (return-to-main-skill-test.sh I2).
+# The awk below this block is the FALLBACK for a device with no Python 3 (or no
+# readable module): it reads only a `> **Status:` blockquote, so a plain
+# (`**Status:** X`), list (`- **Status**: X`), bare (`Status: X`) or bold
+# no-colon stamp read as "no stamp", and a run-on word (`SHIPPED (code)`) read
+# as unparseable -- both UNKNOWN, so the arm abstained on 171 of 2674 plans at
+# corpus commit 07d9c897 (plan 2026-10-16-two-stamp-readers-still-bypass-the-parse-owner-land-evidence-and-depends-on
+# Phase 2). Every reason the arm gives under the fallback says so.
+#
+# plan_stamp_init decides the mode ONCE, in the calling shell: plan_status_of
+# and plan_status_bounds run inside `$(...)`, where a resolution would be lost.
+PLAN_STAMP_PY="$LIB_DIR/plan_stamp.py"
+PLAN_STAMP_MODE=""   # py | awk, set by plan_stamp_init
+PLAN_STAMP_FALLBACK_NOTE=""
+plan_stamp_init() {
+  [ -n "$PLAN_STAMP_MODE" ] && return 0
+  if [ ! -r "$PLAN_STAMP_PY" ]; then
+    PLAN_STAMP_MODE=awk; PLAN_STAMP_FALLBACK_NOTE=" (awk fallback: lib/plan_stamp.py is not readable)"
+  elif resolve_python; then
+    PLAN_STAMP_MODE=py
+  else
+    PLAN_STAMP_MODE=awk; PLAN_STAMP_FALLBACK_NOTE=" (awk fallback: no Python)"
+  fi
+}
+# A module exit other than 0 (answer) or 3 (no stamp) is a FAILED read, never
+# "no status block": it is recorded in $TMP/plan_stamp.rc (these run inside
+# `$(...)`, so a variable would be lost) and the arm names it in its reason.
+plan_stamp_py() { # <--token|--bounds> <file> -> the module's one line, or its exit code
+  local out rc
+  out="$("${PY[@]}" "$(np "$PLAN_STAMP_PY")" "$1" "$(np "$2")" 2>/dev/null)"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    [ "$rc" -eq 3 ] || printf '%s\n' "$rc" >> "$TMP/plan_stamp.rc"
+    return "$rc"
+  fi
+  printf '%s' "$out" | tr -d '\r'   # Windows Python prints CRLF
+}
+plan_stamp_failure() { # -> " (stamp reader failed: exit N)" when a read failed, else nothing
+  [ -s "$TMP/plan_stamp.rc" ] || return 0
+  printf ' (stamp reader failed: exit %s)' "$(sort -u "$TMP/plan_stamp.rc" | tr '\n' ' ' | sed 's/ $//; s/ /,/g')"
+}
+# The status word: the module's TOKEN, lowercased (`shipped`, `in progress`;
+# `SHIPPED -- UNCONFIRMED` folds to `shipped`, which ranks later than VETTED,
+# correct for a supersession comparison). Fallback: the leading `> **Status:`
+# line before the first `## `; anything after the first comma, period or `**`
+# is prose, and a trailing date is not the word.
 plan_status_of() { # <file> -> the status word, or 1
+  if [ "$PLAN_STAMP_MODE" = py ]; then
+    local w; w="$(plan_stamp_py --token "$1")" || return 1
+    [ -n "$w" ] || return 1
+    printf '%s\n' "$w"; return 0
+  fi
   awk '
     /^## / { exit }
     /^> \*\*Status:/ {
@@ -884,9 +1175,18 @@ plan_status_of() { # <file> -> the status word, or 1
     END { exit !found }
   ' "$1" 2>/dev/null
 }
-# "<first> <last>" of the leading, STRICTLY CONTIGUOUS `>` block before the
-# first `## ` heading -- the bounds branch-only lines must lie inside.
+# "<first> <last>" of the status block -- the bounds branch-only lines must lie
+# inside: the module's `--bounds` extent (a quoted stamp and every `>` line
+# under it; an unquoted stamp's line plus the `Key: value` lines directly under
+# it, so a design sentence below `**Status:** X` is compared, not ignored). Fallback: the
+# leading, STRICTLY CONTIGUOUS `>` block before the first `## ` heading.
 plan_status_bounds() { # <file> -> "<start> <end>", or 1
+  if [ "$PLAN_STAMP_MODE" = py ]; then
+    local b; b="$(plan_stamp_py --bounds "$1")" || return 1
+    case "$b" in [0-9]*' '[0-9]*) printf '%s\n' "$b"; return 0 ;; esac
+    printf 'malformed\n' >> "$TMP/plan_stamp.rc"
+    return 1
+  fi
   awk '
     /^## / { exit }
     /^>/ { if (!s) { s = NR; e = NR } else if (NR == e + 1) { e = NR } else exit; next }
@@ -953,7 +1253,7 @@ supersede_commit() { # <ci> -> sets S_VERDICT[ci] and S_JSON[ci]
   local _pd_reason _bounds _bs _be _outside _bst _ust _br _ur _urc
   local verdict=SUPERSEDED reason="" pjson="" pfirst=1
   local up_exists up_newest up_at up_n br_n pverdict preason bo_json bofirst off txt disp n_bo
-  local _ep _el _eu _rec _cum_bo=0 _pd_settled _pd_carry="" _ubounds _awo_rc _bodisp
+  local _ep _el _eu _rec _cum_bo=0 _pd_settled _pd_carry="" _pd_note="" _ubounds _awo_rc _bodisp
   l="${C_SHA[$ci]}"
   # max(%at, %ct), and an unreadable date is UNKNOWN. `${...:-0}` would make
   # EVERY upstream commit "later than" this one, turning a failed read into the
@@ -1058,22 +1358,26 @@ supersede_commit() { # <ci> -> sets S_VERDICT[ci] and S_JSON[ci]
     # does not recognise.
     _pd_settled=0
     if [ "$pverdict" = SUPERSEDED ] && [ "$CORPUS" = plan-document ]; then
-      _pd_reason=""
+      _pd_reason=""; _pd_note=""
       case "$path" in
         plans/*.md) ;;
         *) _pd_reason="'$path' is not plans/*.md" ;;
       esac
       if [ -z "$_pd_reason" ]; then
         # The confinement test compares the two files WHOLE with their leading
-        # status blockquotes removed. An earlier draft only checked that each
+        # status blocks removed. An earlier draft only checked that each
         # branch-only ADDED line fell inside the block, which said nothing about
         # lines the commit REMOVED from the body -- a plan edit that quietly
         # dropped a section would have passed. If the remainders are byte-equal,
         # then EVERY difference in either direction is inside the status block.
+        plan_stamp_init; _pd_note="$PLAN_STAMP_FALLBACK_NOTE"; rm -f "$TMP/plan_stamp.rc"
         _bounds="$(plan_status_bounds "$TMP/s.post")" || _bounds=""
         _ubounds="$(plan_status_bounds "$TMP/s.up")" || _ubounds=""
-        if [ -z "$_bounds" ] || [ -z "$_ubounds" ]; then
-          _pd_reason="a leading status blockquote is missing on $([ -z "$_bounds" ] && printf 'the branch'; [ -z "$_bounds" ] && [ -z "$_ubounds" ] && printf ' and '; [ -z "$_ubounds" ] && printf 'the upstream') side, so the change cannot be confined to one"
+        if [ -s "$TMP/plan_stamp.rc" ]; then
+          _pd_reason="the stamp reader could not read the status block, so it is UNKNOWN (never absent) and the change cannot be confined to it"
+          _pd_note="$_pd_note$(plan_stamp_failure)"
+        elif [ -z "$_bounds" ] || [ -z "$_ubounds" ]; then
+          _pd_reason="no status block is located on $([ -z "$_bounds" ] && printf 'the branch'; [ -z "$_bounds" ] && [ -z "$_ubounds" ] && printf ' and '; [ -z "$_ubounds" ] && printf 'the upstream') side, so the change cannot be confined to one"
         else
           _bs="${_bounds%% *}"; _be="${_bounds##* }"
           sed "${_bs},${_be}d" "$TMP/s.post" > "$TMP/s.post.body" 2>/dev/null || : > "$TMP/s.post.body"
@@ -1084,21 +1388,22 @@ supersede_commit() { # <ci> -> sets S_VERDICT[ci] and S_JSON[ci]
           # unique design lines against a one-line upstream would exit 5 on an
           # empty-vs-empty comparison. Refuse it.
           if [ ! -s "$TMP/s.post.body" ] || [ ! -s "$TMP/s.up.body" ]; then
-            _pd_reason="one of the two copies has NO body outside its leading status blockquote, so an identical-bodies comparison would be vacuous"
+            _pd_reason="one of the two copies has NO body outside its status block, so an identical-bodies comparison would be vacuous"
           # A status blockquote is a stamp, not a chapter. An unbounded leading
           # `>` run lets substance hide inside the very region the profile is
           # licensed to ignore, so cap it.
           elif [ "$((_be - _bs + 1))" -gt "$MAX_STATUS_BLOCK_LINES" ] \
             || [ "$(( ${_ubounds##* } - ${_ubounds%% *} + 1 ))" -gt "$MAX_STATUS_BLOCK_LINES" ]; then
-            _pd_reason="a leading status blockquote longer than $MAX_STATUS_BLOCK_LINES lines is not a status stamp; substance inside it would be ignored"
+            _pd_reason="a status block longer than $MAX_STATUS_BLOCK_LINES lines is not a status stamp; substance inside it would be ignored"
           elif ! cmp -s "$TMP/s.post.body" "$TMP/s.up.body"; then
-            _pd_reason="the two copies differ OUTSIDE the leading status blockquote: that is substance, not a superseded status stamp"
+            _pd_reason="the two copies differ OUTSIDE the status block: that is substance, not a superseded status stamp"
           fi
         fi
       fi
       if [ -z "$_pd_reason" ]; then
         _bst="$(plan_status_of "$TMP/s.post")" || _bst=""
         _ust="$(plan_status_of "$TMP/s.up")" || _ust=""
+        _pd_note="$_pd_note$(plan_stamp_failure)"
         _br="$(plan_status_rank "$_bst")" || _br=""
         _ur="$(plan_status_rank "$_ust")" || _ur=""
         if [ -z "$_br" ] || [ -z "$_ur" ]; then
@@ -1106,13 +1411,13 @@ supersede_commit() { # <ci> -> sets S_VERDICT[ci] and S_JSON[ci]
         elif [ "$_ur" -le "$_br" ]; then
           _pd_reason="upstream status '$_ust' is not STRICTLY later than the branch's '$_bst'"
         else
-          preason="plan-document: the two copies are identical outside the leading status blockquote (branch lines $_bs-$_be) and upstream is '$_ust' against the branch's '$_bst'"
+          preason="plan-document: the two copies are identical outside the status block (branch lines $_bs-$_be) and upstream is '$_ust' against the branch's '$_bst'$_pd_note"
           _pd_settled=1
         fi
       fi
       # NOT settled by the profile -> fall through to the general arm, carrying
       # the profile's reason only if the general arm cannot settle it either.
-      [ "$_pd_settled" = 1 ] || _pd_carry="$_pd_reason"
+      [ "$_pd_settled" = 1 ] || _pd_carry="$_pd_reason$_pd_note"
     fi
     # THE REMOVAL HOLE. This arm observes ADDED lines only: for each added line it
     # asks whether upstream later removed it. A commit that REMOVES content or

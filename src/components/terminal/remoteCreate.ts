@@ -213,6 +213,18 @@ export function describeRemoteCreateFailure(err: unknown): RemoteCreateRefusal {
       ],
     };
   }
+  // The relay passes only the codes it lists by name; until it lists this one
+  // it arrives prefixed `target_said_`, so match both spellings.
+  if (code === "role_closes_agent_lane" || code === "target_said_role_closes_agent_lane") {
+    return {
+      ...base,
+      headline: "That device does not take sessions — its dispatch role closes the agent lane",
+      remedy: [
+        "coord's dispatch role for that machine closes the agent lane (`ci_node` or `bench`), so its runner refuses remote creates. Nothing was spawned, and the create is not queued.",
+        "This is not the create dial and not a drain: pick another device, or change the machine's role.",
+      ],
+    };
+  }
   if (code === "drain_unreadable") {
     return {
       ...base,
@@ -347,4 +359,60 @@ export function createButtonState(group: { deviceId: string; isCallerDevice: boo
     return { disabled: true, reason: "coord did not report a device id to address." };
   }
   return { disabled: false, reason: null };
+}
+
+/**
+ * One "New terminal" the fleet picker's EMPTY state may offer for a device
+ * pinned by id — the create that has no device group (and so no group tenant)
+ * behind it.
+ */
+export interface EmptyCreateTarget {
+  /** The tenant the create mints its grant under — and so the tenant the new
+   * session is created in. `null` only in a single-tenant read that named no
+   * tenant, where the runner's own authority order is the read's own. */
+  tenant: string | null;
+  /** Shown beside the button in a merged read, so the operator sees which
+   * tenant each one creates in. `null` in a single-tenant read. */
+  tenantLabel: string | null;
+}
+
+/** Why a merged empty state offers no create: no tenant answered to create in. */
+export const EMPTY_CREATE_NO_TENANT_REASON =
+  "choose a tenant to create in — no tenant's read answered, so there is none this page belongs to";
+
+/**
+ * The creates the fleet picker's empty state offers, given which tenants the
+ * read covered (plan
+ * `2026-09-29-fleet-view-reads-one-unchosen-tenant-so-a-multi-bound-device-sees-a-fraction-of-its-fleet`).
+ *
+ * - A SINGLE-tenant read offers one create under the tenant that read
+ *   presented (`singleTenant`; null when it named none) — the pre-merge
+ *   behaviour.
+ * - A MERGED read has no one tenant the empty page belongs to, and sending none
+ *   would let the runner's authority order pick a tenant the operator never
+ *   chose. So it offers one create PER tenant that answered, each naming its
+ *   tenant. An answered walk whose tenant is unnamed is skipped for the same
+ *   reason. With none left, `targets` is empty and `disabledReason` says why.
+ */
+export function emptyCreateTargets(args: {
+  merged: boolean;
+  singleTenant: string | null;
+  answeredTenants: readonly (string | null)[];
+  shortTenant: (tenant: string) => string;
+}): { targets: EmptyCreateTarget[]; disabledReason: string | null } {
+  if (!args.merged) {
+    return { targets: [{ tenant: args.singleTenant, tenantLabel: null }], disabledReason: null };
+  }
+  const seen = new Set<string>();
+  const targets: EmptyCreateTarget[] = [];
+  for (const t of args.answeredTenants) {
+    const tenant = t?.trim();
+    if (!tenant || seen.has(tenant)) continue;
+    seen.add(tenant);
+    targets.push({ tenant, tenantLabel: args.shortTenant(tenant) });
+  }
+  return {
+    targets,
+    disabledReason: targets.length === 0 ? EMPTY_CREATE_NO_TENANT_REASON : null,
+  };
 }

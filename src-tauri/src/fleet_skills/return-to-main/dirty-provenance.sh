@@ -41,6 +41,18 @@
 #                        that is not in the object store cannot be checked out,
 #                        so it fails closed. Classed UNIQUE; an untracked such
 #                        file is never in untracked_on_upstream.
+#                        CONTENT_UPSTREAM: when such a file's RAW bytes ARE the
+#                        tip's blob (`hash-object --no-filters` == the tip blob,
+#                        under the tip's mode) and its index holds nothing else
+#                        (index column blank, or the index entry equals the
+#                        tip's blob and mode), the file stays UNIQUE and not
+#                        restorable -- a checkout rewrites those bytes (an LF
+#                        copy under core.autocrlf=true or eol=crlf) -- but it
+#                        carries `content_upstream: true` and a reason naming
+#                        the tip blob: nothing in it exists only on disk. Only
+#                        this arm sets it, never in --stash mode, and the RAW
+#                        hash is what is compared (a lossy clean filter's
+#                        stored hash can equal the tip; its raw bytes cannot).
 #   (occupied path)      worktree only: a leading component of the path is a
 #                        non-directory or a symlink on disk (an ignored file
 #                        `a` where git has `a/b`), or -- for a deletion -- the
@@ -111,6 +123,34 @@
 # tree) are never classified into files[] and never affect the verdict or the
 # exit code. One whose bytes AND mode equal `<upstream>:<path>` at the tip is
 # listed in `untracked_on_upstream`; every other one is only counted.
+# Of those others, one whose line 2 is the runner provisioner's
+# `qontinui-provenance:` stamp is ALSO listed in `untracked_stamp_on_upstream`
+# when the stamp verifies (lib/provenance_stamp.py `verify`: the runner's
+# closed grammar, `canonical=` naming exactly this file's own repo-relative
+# path, the body without the stamp hashing to its own `blob=`) AND that stripped
+# body, under the tip's mode, is exactly what the fast-forward writes at this
+# path: the checkout of the tip blob (`cat-file --filters`, smudge and eol
+# conversion applied) has the stripped body's own hash, and cleans back to the
+# tip blob (in --stash mode, where the ^3 blob is already the stored form, the
+# stripped hash must equal the tip blob). The file is then the tip's content
+# plus the machine-written key line. It stays out of `untracked_on_upstream`
+# and is still counted as not on upstream -- its BYTES are not the tip's, and a
+# residue snapshot of them could never be reaped. A stamped file the arm could
+# not judge (no readable lib/provenance_stamp.py, no python3, a helper failure,
+# an unreadable checkout of the tip blob) is listed in
+# `untracked_stamp_undecided` instead: never admitted. The arm also judges a
+# stamped file the filtered rule caught: git marks every stamped `.md` under
+# `*.md text eol=lf` filtered, only because its own stamped blob was never
+# stored, and the round trip above is made against the tip blob, which is.
+# A symlink, an occupied or attribute-unstable file, and one whose tip read failed
+# (or with no upstream at all), never reaches the arm: those gates run first.
+# Every untracked file whose bytes were NOT compared with the tip's -- a
+# symlink, a filtered file the stamp arm did not decide, an occupied or
+# attribute-unstable path, one in a chunk whose tip read failed (or with no
+# upstream ref at all), an unhashable file -- is also listed in
+# `untracked_unjudged`, so a reader can say UNKNOWN about it rather than "not
+# the tip's bytes". The served-tree refresher is the consumer of these lists;
+# the sweep reads none of them.
 #
 # RESTORABLE — what a residue restore may act on (per file, `restorable` plus
 # `restorable_reason`). A class is a statement about BYTES:
@@ -149,18 +189,35 @@
 #   --json            one JSON object on stdout:
 #                     {"checkout","mode","stash","head","upstream","runner":{...},
 #                      "files":[{"path","class","evidence","status",
-#                                "restorable","restorable_reason"}],
+#                                "restorable","restorable_reason",
+#                                "content_upstream"}],
 #                      "counts":{"UPSTREAM_CURRENT","UPSTREAM_HISTORICAL",
 #                                "RUNNER_BUNDLE","EOL_ONLY","UNIQUE","UNKNOWN"},
 #                      "all_residue","unique_count","unknown_count",
 #                      "outside_footprint_count","restorable_count",
 #                      "untracked_count","untracked_on_upstream":[<path>...],
-#                      "untracked_on_upstream_count","verdict","error"}
+#                      "untracked_on_upstream_count","verdict","error",
+#                      "content_unique_count",
+#                      "untracked_stamp_on_upstream":[<path>...],
+#                      "untracked_stamp_on_upstream_count",
+#                      "untracked_stamp_undecided":[<path>...],
+#                      "stamp_verifier","untracked_unjudged":[<path>...]}
 #                     `all_residue` is true iff EVERY dirty tracked file is
 #                     restorable (vacuously true when none is), and is exactly
 #                     the exit-0 condition. `untracked_count` is ALL untracked
 #                     files; `untracked_on_upstream` lists the tip-equal ones
 #                     as plain strings (never as files[] objects).
+#                     `content_unique_count` is the UNIQUE files whose
+#                     `content_upstream` is false -- the ones holding content
+#                     that exists only on disk; `unique_count` counts all.
+#                     `untracked_stamp_on_upstream` / `_undecided` are the
+#                     stamp arm's two lists (see UNTRACKED above), disjoint
+#                     from `untracked_on_upstream`; `stamp_verifier` is
+#                     `not_needed` (no untracked stamped file reached the arm),
+#                     `ok`, or the reason the helper could not run.
+#                     `untracked_unjudged` lists the untracked files whose
+#                     bytes were never compared with the tip's (UNTRACKED
+#                     above); a consumer reads those as UNKNOWN.
 #   --summary         the token-lean answer to "is this WIP already on main?",
 #                     one `key: value` line each (same exit codes):
 #                       dirty-provenance summary: <checkout> (worktree|snapshot <rev>)
@@ -170,8 +227,17 @@
 #                       verdict: <VERDICT> exit=<rc>
 #                       error: <text>        only when the run could not read
 #                       not-restorable: <CLASS> <path>   one per such file
+#                       eol-rewrite-only: <path> (content equals <up> tip; restore
+#                         with git restore --source=<up> --worktree -- <path>)
+#                                                    one per content_upstream file
 #                       untracked: <t> total, <a> on upstream, <b> not on upstream
 #                       untracked-not-on-upstream: <path>  one per such file
+#                       untracked-stamp-on-upstream: <path>  one per file the
+#                         stamp arm admitted (also a not-on-upstream line)
+#                       untracked-stamp-undecided: <path> (<why>)  one per
+#                         stamped file the arm could not judge
+#                       untracked-unjudged: <path> (<why>)  one per file never
+#                         compared with the tip
 #                     No evidence strings; `--json` has them. Mutually
 #                     exclusive with --json (usage error).
 #   --stash <rev>     evaluate <rev> (a `git stash create`/refs/wip snapshot)
@@ -183,12 +249,28 @@
 # ENV  QONTINUI_RUNNER_HEALTH (default http://127.0.0.1:9876/health; any curl
 #      URL, file:// included), QONTINUI_HEALTH_TIMEOUT (default 12 s),
 #      DIRTY_PROVENANCE_LIB_DIR (where lib/*.sh live; default beside this file),
+#      DIRTY_PROVENANCE_PYTHON (interpreter for the stamp arm; default python3,
+#      then python; when set and not runnable the stamp arm answers UNKNOWN),
 #      DIRTY_PROVENANCE_CHUNK_BYTES (argv budget per batched git read).
+#      The stamp arm reads lib/provenance_stamp.py from DIRTY_PROVENANCE_LIB_DIR
+#      only -- no fallback path is searched -- so under the default (this
+#      skill's own lib/, which carries no copy) every stamped untracked file is
+#      `untracked_stamp_undecided`. The served-tree refresher points the
+#      variable at its own lib/, which carries one.
 #
 # EXIT  0 every dirty tracked file is restorable (vacuously true when none is)
-#       1 at least one file is DECIDED not restorable: a UNIQUE file (verdict
-#         UNIQUE_PRESENT), or a RUNNER_BUNDLE/EOL_ONLY file outside the
-#         provisioner footprint (verdict OUTSIDE_FOOTPRINT when none is UNIQUE)
+#       1 at least one file is DECIDED not restorable. Verdict, first match:
+#         UNIQUE_PRESENT     a UNIQUE file whose content_upstream is false;
+#         OUTSIDE_FOOTPRINT  a RUNNER_BUNDLE/EOL_ONLY file outside the
+#                            provisioner footprint;
+#         EOL_REWRITE_ONLY   every UNIQUE file is content_upstream and none is
+#                            outside the footprint: a restore would rewrite
+#                            their line endings, but each holds the tip's own
+#                            blob, so nothing UNIQUE exists only on disk.
+#                            UNKNOWN files may also be present (read
+#                            unknown_count). Still exit 1 -- the exit code
+#                            says "restorable", and these are not.
+#         A fatal error (exit 3) outranks all three; each outranks UNKNOWN.
 #       3 UNKNOWN/INCOMPLETE — nothing decided-unrestorable, but some file
 #         could not be decided, or the checkout/snapshot could not be read
 #       4 usage error
@@ -277,19 +359,20 @@ sline() { local s="$1"; s="${s//$'\n'/\\n}"; s="${s//$'\r'/\\r}"; s="${s//$'\t'/
 
 # ---------------------------------------------------------------------------
 # results
-F_PATH=(); F_CLASS=(); F_EVID=(); F_STATUS=(); F_REST=(); F_RREASON=()
+F_PATH=(); F_CLASS=(); F_EVID=(); F_STATUS=(); F_REST=(); F_RREASON=(); F_CUP=()
 FILTERED_EVID="checking the stored blob back out (clean filter / eol conversion) does not reproduce the on-disk bytes: restoring would lose the raw bytes"
 ATTR_EVID="attributes_unstable: a .gitattributes is dirty or differs between HEAD and the upstream tip, and this file has a conversion in effect, so whether a restore reproduces its bytes was decided under attributes the restore/fast-forward will not use"
 MODE_EVID="mode change is not reproducible from upstream"
 SYMLINK_EVID="symlink entry: a symlink is never restored as residue (its snapshot could never be reaped)"
 UNTRACKED=0; UNT_ON_UP=(); UNT_OTHER=()
+UNT_STAMP_ON_UP=(); UNT_STAMP_UNDECIDED=(); UNT_STAMP_WHY=(); UNT_UNJUDGED=(); UNT_UNJUDGED_WHY=()
 FATAL=""
 
 # The runner provisioner's footprint (see RESTORABLE in the header).
 in_footprint() { case "$1" in .claude/commands/?*|.claude/skills/?*) return 0 ;; *) return 1 ;; esac; }
 
-add_file() { # <path> <class> <evidence> <status>; derives restorable + reason
-  local r=false why
+add_file() { # <path> <class> <evidence> <status> [<content_upstream tip blob>]; derives restorable + reason
+  local r=false why cup=false
   case "$2" in
     UPSTREAM_CURRENT)
       r=true; why="UPSTREAM_CURRENT: equals the upstream tip (blob and mode), so restoring it and fast-forwarding reproduces these exact bytes (or deletes the path again) and nothing is lost" ;;
@@ -298,26 +381,30 @@ add_file() { # <path> <class> <evidence> <status>; derives restorable + reason
     RUNNER_BUNDLE|EOL_ONLY)
       if in_footprint "$1"; then r=true; why="residue class inside the provisioner footprint (.claude/commands/**, .claude/skills/**)"
       else why="outside provisioner footprint: a $2 file here is byte-identical to a deliberate edit (a CRLF change, a hand-copied bundle file), and only .claude/commands/** and .claude/skills/** are the provisioner's"; fi ;;
-    UNIQUE) why="class UNIQUE: content nothing upstream has, never restored" ;;
+    UNIQUE)
+      if [ -n "${5:-}" ]; then cup=true
+        why="class UNIQUE: line endings differ from a checkout; the content equals the $UPSTREAM tip blob ${5:0:12}, but a restore rewrites these bytes, so it is never restored (git restore --source=$UPSTREAM --worktree -- <path> clears it)"
+      else why="class UNIQUE: content nothing upstream has, never restored"; fi ;;
     *) why="class $2: undecided, never restored" ;;
   esac
-  F_PATH+=("$1"); F_CLASS+=("$2"); F_EVID+=("$3"); F_STATUS+=("$4"); F_REST+=("$r"); F_RREASON+=("$why")
+  F_PATH+=("$1"); F_CLASS+=("$2"); F_EVID+=("$3"); F_STATUS+=("$4"); F_REST+=("$r"); F_RREASON+=("$why"); F_CUP+=("$cup")
 }
 
 emit() {
-  local i n_cur=0 n_hist=0 n_bun=0 n_eol=0 n_uniq=0 n_unk=0 n_out=0 n_rest=0 rc verdict all p
+  local i n_cur=0 n_hist=0 n_bun=0 n_eol=0 n_uniq=0 n_cup=0 n_unk=0 n_out=0 n_rest=0 rc verdict all p
   for i in "${!F_CLASS[@]}"; do
     case "${F_CLASS[$i]}" in
       UPSTREAM_CURRENT) n_cur=$((n_cur+1)) ;; UPSTREAM_HISTORICAL) n_hist=$((n_hist+1)) ;;
       RUNNER_BUNDLE) n_bun=$((n_bun+1)) ;; EOL_ONLY) n_eol=$((n_eol+1)) ;;
-      UNIQUE) n_uniq=$((n_uniq+1)) ;; *) n_unk=$((n_unk+1)) ;;
+      UNIQUE) n_uniq=$((n_uniq+1)); [ "${F_CUP[$i]}" = true ] && n_cup=$((n_cup+1)) ;; *) n_unk=$((n_unk+1)) ;;
     esac
     if [ "${F_REST[$i]}" = true ]; then n_rest=$((n_rest+1))
     else case "${F_CLASS[$i]}" in RUNNER_BUNDLE|EOL_ONLY) n_out=$((n_out+1)) ;; esac; fi
   done
   if [ -n "$FATAL" ]; then verdict=UNKNOWN; rc=3
-  elif [ "$n_uniq" -gt 0 ]; then verdict=UNIQUE_PRESENT; rc=1
+  elif [ "$((n_uniq - n_cup))" -gt 0 ]; then verdict=UNIQUE_PRESENT; rc=1
   elif [ "$n_out" -gt 0 ]; then verdict=OUTSIDE_FOOTPRINT; rc=1
+  elif [ "$n_cup" -gt 0 ]; then verdict=EOL_REWRITE_ONLY; rc=1
   elif [ "$n_unk" -gt 0 ]; then verdict=UNKNOWN; rc=3
   else verdict=ALL_RESIDUE; rc=0; fi
   # all_residue == "every dirty tracked file is restorable" == exit 0: rc 0
@@ -335,7 +422,8 @@ emit() {
       [ "$i" -gt 0 ] && printf ','
       printf '{"path":'; jstr "${F_PATH[$i]}"; printf ',"class":'; jstr "${F_CLASS[$i]}"
       printf ',"evidence":'; jstr "${F_EVID[$i]}"; printf ',"status":'; jstr "${F_STATUS[$i]}"
-      printf ',"restorable":%s,"restorable_reason":' "${F_REST[$i]}"; jstr "${F_RREASON[$i]}"; printf '}'
+      printf ',"restorable":%s,"restorable_reason":' "${F_REST[$i]}"; jstr "${F_RREASON[$i]}"
+      printf ',"content_upstream":%s}' "${F_CUP[$i]}"
     done
     printf '],"counts":{"UPSTREAM_CURRENT":%d,"UPSTREAM_HISTORICAL":%d,"RUNNER_BUNDLE":%d,"EOL_ONLY":%d,"UNIQUE":%d,"UNKNOWN":%d},' \
       "$n_cur" "$n_hist" "$n_bun" "$n_eol" "$n_uniq" "$n_unk"
@@ -344,7 +432,17 @@ emit() {
     printf '"untracked_on_upstream":['
     i=0
     for p in ${UNT_ON_UP[@]+"${UNT_ON_UP[@]}"}; do [ "$i" -gt 0 ] && printf ','; jstr "$p"; i=$((i+1)); done
-    printf '],"untracked_on_upstream_count":%d,"verdict":%s,"error":%s}\n' "${#UNT_ON_UP[@]}" "$(jstr "$verdict")" "$(jstr "$FATAL")"
+    printf '],"untracked_on_upstream_count":%d,"verdict":%s,"error":%s,"content_unique_count":%d' "${#UNT_ON_UP[@]}" "$(jstr "$verdict")" "$(jstr "$FATAL")" "$((n_uniq - n_cup))"
+    printf ',"untracked_stamp_on_upstream":['
+    i=0
+    for p in ${UNT_STAMP_ON_UP[@]+"${UNT_STAMP_ON_UP[@]}"}; do [ "$i" -gt 0 ] && printf ','; jstr "$p"; i=$((i+1)); done
+    printf '],"untracked_stamp_on_upstream_count":%d,"untracked_stamp_undecided":[' "${#UNT_STAMP_ON_UP[@]}"
+    i=0
+    for p in ${UNT_STAMP_UNDECIDED[@]+"${UNT_STAMP_UNDECIDED[@]}"}; do [ "$i" -gt 0 ] && printf ','; jstr "$p"; i=$((i+1)); done
+    printf '],"stamp_verifier":%s,"untracked_unjudged":[' "$(jstr "${STAMP_STATE:-not_needed}")"
+    i=0
+    for p in ${UNT_UNJUDGED[@]+"${UNT_UNJUDGED[@]}"}; do [ "$i" -gt 0 ] && printf ','; jstr "$p"; i=$((i+1)); done
+    printf ']}\n'
   elif [ "$MODE" = summary ]; then
     printf 'dirty-provenance summary: %s (%s)\n' "$(sline "$CHECKOUT")" "$([ -n "$STASH" ] && printf 'snapshot %s' "$(sline "$STASH")" || printf worktree)"
     printf 'upstream: %s\n' "${UPSTREAM:-<none>}"
@@ -355,8 +453,20 @@ emit() {
     for i in "${!F_PATH[@]}"; do
       [ "${F_REST[$i]}" = true ] || { printf 'not-restorable: %s ' "${F_CLASS[$i]}"; sline "${F_PATH[$i]}"; printf '\n'; }
     done
+    for i in "${!F_PATH[@]}"; do
+      [ "${F_CUP[$i]}" = true ] || continue
+      printf 'eol-rewrite-only: '; sline "${F_PATH[$i]}"
+      printf ' (content equals %s tip; restore with git restore --source=%s --worktree -- ' "$UPSTREAM" "$UPSTREAM"; sline "${F_PATH[$i]}"; printf ')\n'
+    done
     printf 'untracked: %d total, %d on upstream, %d not on upstream\n' "$UNTRACKED" "${#UNT_ON_UP[@]}" "$((UNTRACKED - ${#UNT_ON_UP[@]}))"
     for p in ${UNT_OTHER[@]+"${UNT_OTHER[@]}"}; do printf 'untracked-not-on-upstream: '; sline "$p"; printf '\n'; done
+    for p in ${UNT_STAMP_ON_UP[@]+"${UNT_STAMP_ON_UP[@]}"}; do printf 'untracked-stamp-on-upstream: '; sline "$p"; printf '\n'; done
+    for i in ${UNT_STAMP_UNDECIDED[@]+"${!UNT_STAMP_UNDECIDED[@]}"}; do
+      printf 'untracked-stamp-undecided: '; sline "${UNT_STAMP_UNDECIDED[$i]}"; printf ' ('; sline "${UNT_STAMP_WHY[$i]}"; printf ')\n'
+    done
+    for i in ${UNT_UNJUDGED[@]+"${!UNT_UNJUDGED[@]}"}; do
+      printf 'untracked-unjudged: '; sline "${UNT_UNJUDGED[$i]}"; printf ' ('; sline "${UNT_UNJUDGED_WHY[$i]}"; printf ')\n'
+    done
   else
     printf 'dirty-provenance: %s%s\n' "$CHECKOUT" "$([ -n "$STASH" ] && printf ' (snapshot %s)' "$STASH")"
     printf '  upstream=%s  runner build arm=%s%s\n' "${UPSTREAM:-<none>}" "${BUILD_STATE:-not_needed}" \
@@ -365,7 +475,9 @@ emit() {
     for i in "${!F_PATH[@]}"; do
       printf '  %-19s %s\n      %s\n      restorable=%s: %s\n' "${F_CLASS[$i]}" "${F_PATH[$i]}" "${F_EVID[$i]}" \
         "${F_REST[$i]}" "${F_RREASON[$i]}"
+      [ "${F_CUP[$i]}" = true ] && printf '      content_upstream=true\n'
     done
+    for p in ${UNT_STAMP_ON_UP[@]+"${UNT_STAMP_ON_UP[@]}"}; do printf '  %-19s %s (untracked; verified provisioner stamp over the tip blob)\n' STAMP_ON_UPSTREAM "$p"; done
     for p in ${UNT_ON_UP[@]+"${UNT_ON_UP[@]}"}; do printf '  %-19s %s (untracked)\n' UPSTREAM_CURRENT "$p"; done
     printf '\n  current=%d historical=%d bundle=%d eol_only=%d unique=%d unknown=%d outside_footprint=%d restorable=%d untracked=%d (on upstream %d)\n  VERDICT: %s\n' \
       "$n_cur" "$n_hist" "$n_bun" "$n_eol" "$n_uniq" "$n_unk" "$n_out" "$n_rest" "$UNTRACKED" "${#UNT_ON_UP[@]}" "$verdict"
@@ -435,10 +547,41 @@ resolve_bundle_arm() {
 hash_nocr() { tr -d '\r' | cksum; }
 
 # ---------------------------------------------------------------------------
+# The provisioner-stamp arm. `provenance_stamp.py verify <path>` reads the
+# version's BYTES on stdin and prints NONE | OK <stripped-blob> | NO <why>.
+# Resolved lazily, once, on the first stamped version: STAMP_STATE is "ok" or
+# carries the reason the arm cannot run (-> UNKNOWN, never restorable).
+STAMP_STATE=""; STAMP_PY=""; STAMP_HELPER="$LIB_DIR/provenance_stamp.py"
+resolve_stamp_arm() {
+  [ -z "$STAMP_STATE" ] || return 0
+  local c
+  if [ ! -r "$STAMP_HELPER" ]; then STAMP_STATE="lib/provenance_stamp.py is not readable in $LIB_DIR"; return 0; fi
+  if [ -n "${DIRTY_PROVENANCE_PYTHON:-}" ]; then
+    command -v "$DIRTY_PROVENANCE_PYTHON" >/dev/null 2>&1 && STAMP_PY="$DIRTY_PROVENANCE_PYTHON"
+  else
+    for c in python3 python; do
+      if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys; sys.exit(0 if sys.version_info[0] == 3 else 1)' >/dev/null 2>&1; then STAMP_PY="$c"; break; fi
+    done
+  fi
+  if [ -z "$STAMP_PY" ]; then STAMP_STATE="no usable python3 to read the provisioner stamp"; return 0; fi
+  STAMP_STATE=ok
+}
+# stamp_bytes <blob> <rawfile>: the version's bytes on stdout
+stamp_bytes() { if [ -n "$2" ] && [ -f "$2" ]; then cat -- "$2"; else g cat-file blob "$1"; fi; }
+# stamp_line2_is_key <blob> <rawfile> -> 0 when line 2 starts with the stamp key
+stamp_line2_is_key() {
+  local l2=""
+  if [ -n "$2" ] && [ -f "$2" ]; then { IFS= read -r l2; IFS= read -r l2; } < "$2" 2>/dev/null || true
+  else l2="$(g cat-file blob "$1" 2>/dev/null | sed -n 2p)"; fi
+  case "$l2" in qontinui-provenance:*) return 0 ;; esac
+  return 1
+}
+
+# ---------------------------------------------------------------------------
 # Batched reads. Every per-path lookup below is a bash associative array filled
 # by a handful of git calls, so the cost is O(chunks), not O(files).
 declare -A TIP_M=() TIP_B=() TIP_READ=() HEAD_M=() HEAD_B=() IXE_M=() IXE_B=() WT_M=() WT_B=()
-declare -A HIST=() HIST_FAILED=() CUR=() WT_FILTERED=() CONV=() TIPCONV=()
+declare -A HIST=() HIST_FAILED=() CUR=() WT_FILTERED=() WT_RAW=() CONV=() TIPCONV=()
 CONV_ALL=0; TIPCONV_ALL=0
 
 # read_conv <cur|tip> <path>... -> CONV / TIPCONV [path]=1 for every path with a
@@ -582,7 +725,7 @@ hash_worktree() { # <path>... -> WT_B / WT_M (+ WT_FILTERED) for every readable 
       WT_M["$p"]="$(wt_mode "$p")"
       if unsafe_for_stdin_paths "$p"; then
         WT_B["$p"]="$(g hash-object -- "$p" 2>/dev/null)"
-        r="$(g hash-object --no-filters -- "$p" 2>/dev/null)"
+        r="$(g hash-object --no-filters -- "$p" 2>/dev/null)"; WT_RAW["$p"]="$r"
         if [ -z "$r" ] || [ "$r" != "${WT_B[$p]}" ] || has_conv "$p"; then
           smudge_reproduces "$p" "${WT_B[$p]}" "$r" || WT_FILTERED["$p"]=1
         fi
@@ -608,6 +751,7 @@ hash_worktree() { # <path>... -> WT_B / WT_M (+ WT_FILTERED) for every readable 
   fi
   for i in "${!list[@]}"; do
     p="${list[$i]}"
+    WT_RAW["$p"]="${raw[$i]}"
     [ -n "${raw[$i]}" ] && [ "${raw[$i]}" = "${WT_B[$p]:-}" ] && ! has_conv "$p" && continue
     smudge_reproduces "$p" "${WT_B[$p]:-}" "${raw[$i]}" || WT_FILTERED["$p"]=1
   done
@@ -705,6 +849,27 @@ classify_version() {
 # A version spec is "<label>=<blob>=<mode>=<rawfile>" (rawfile last: it may hold '=').
 spec_parse() { local r; SP_L="${1%%=*}"; r="${1#*=}"; SP_B="${r%%=*}"; r="${r#*=}"; SP_M="${r%%=*}"; SP_R="${r#*=}"; }
 
+# content_upstream_blob <path> <status> -> prints the tip blob when a file the
+# filtered-bytes arm classed UNIQUE holds, byte for byte, the tip's own blob
+# (its RAW `--no-filters` hash equals the tip blob, under the tip's mode) and its
+# index carries nothing else (index column blank, or the index entry equals the
+# tip blob and mode). Prints nothing otherwise. Such a file is still UNIQUE --
+# its checkout would rewrite the bytes (an LF copy under core.autocrlf=true or
+# eol=crlf) -- but nothing in it exists only on disk: `content_upstream`.
+# Never in --stash mode; the RAW hash is compared, never the stored one, so a
+# lossy clean filter (whose stored hash may equal the tip) never qualifies.
+content_upstream_blob() {
+  local p="$1" st="$2" tb
+  [ -z "$STASH" ] && [ -n "$UPSTREAM" ] || return 0
+  tb="${TIP_B[$p]:-}"
+  [ -n "$tb" ] && [ -n "${WT_RAW[$p]:-}" ] && [ "${WT_RAW[$p]}" = "$tb" ] || return 0
+  [ -n "${WT_M[$p]:-}" ] && [ "${WT_M[$p]}" = "${TIP_M[$p]:-}" ] || return 0
+  if [ "${st:0:1}" != " " ]; then
+    [ "${IXE_B[$p]:-}" = "$tb" ] && [ "${IXE_M[$p]:-}" = "${TIP_M[$p]:-}" ] || return 0
+  fi
+  printf '%s' "$tb"
+}
+
 # is_current <path> <spec>... -> 0 when EVERY version equals the tip (blob and mode)
 is_current() {
   local p="$1" spec
@@ -765,20 +930,71 @@ classify_deletion() {
 
 # decide_untracked <path> <blob> <mode>
 decide_untracked() {
-  if [ "$3" = 120000 ]; then UNT_OTHER+=("$1"); return; fi
-  if [ -z "$STASH" ] && [ -n "${WT_FILTERED[$1]+s}" ]; then UNT_OTHER+=("$1"); return; fi
-  if [ -z "$STASH" ] && parent_blocked "$1"; then UNT_OTHER+=("$1"); return; fi
-  if [ -z "$STASH" ] && [ "$ATTR_UNSTABLE" = 1 ] && { has_conv "$1" || has_tipconv "$1"; }; then UNT_OTHER+=("$1"); return; fi
+  if [ "$3" = 120000 ]; then UNT_OTHER+=("$1"); unt_unjudged "$1" "a symlink, never compared"; return; fi
+  if [ -z "$STASH" ] && parent_blocked "$1"; then UNT_OTHER+=("$1"); unt_unjudged "$1" "$BLOCKED_AT is not a directory on disk"; return; fi
+  if [ -z "$STASH" ] && [ "$ATTR_UNSTABLE" = 1 ] && { has_conv "$1" || has_tipconv "$1"; }; then UNT_OTHER+=("$1"); unt_unjudged "$1" "attributes_unstable"; return; fi
+  if [ -z "$UPSTREAM" ] || [ -z "${TIP_READ[$1]+s}" ]; then UNT_OTHER+=("$1"); unt_unjudged "$1" "$([ -n "$UPSTREAM" ] && echo 'the read of the tip failed' || echo 'no upstream ref')"; return; fi
+  if [ -z "$STASH" ] && [ -n "${WT_FILTERED[$1]+s}" ]; then UNT_OTHER+=("$1"); untracked_stamp_admit "$1" "$2" "$3"; [ $? = 1 ] && unt_unjudged "$1" "filtered: a checkout of its stored blob does not reproduce its bytes, or that blob is not stored"; return; fi
   if [ -n "$UPSTREAM" ] && [ -n "$2" ] && [ -n "${TIP_B[$1]:-}" ] && [ "$2" = "${TIP_B[$1]}" ] && [ "$3" = "${TIP_M[$1]}" ]; then
     UNT_ON_UP+=("$1")
-  else UNT_OTHER+=("$1"); fi
+  else UNT_OTHER+=("$1"); untracked_stamp_admit "$1" "$2" "$3"; [ $? = 1 ] && [ -z "$2" ] && unt_unjudged "$1" "its bytes could not be hashed"; fi
+}
+
+# unt_unjudged <path> <why>: an untracked file whose bytes were never compared
+# with the tip's (UNT_UNJUDGED, `untracked_unjudged`). It is still counted as
+# not on upstream; the list is what lets a reader say UNKNOWN about it instead
+# of "not the tip's bytes".
+unt_unjudged() { UNT_UNJUDGED+=("$1"); UNT_UNJUDGED_WHY+=("$2"); }
+
+# untracked_stamp_admit <path> <blob> <mode> -> 0 admitted (UNT_STAMP_ON_UP),
+# 2 undecided (UNT_STAMP_UNDECIDED), 1 neither (not stamped, or decided not
+# admitted). The stamp arm for an untracked file the byte rule did not list (see
+# UNTRACKED in the header); only a file whose line 2 IS the key reaches python.
+# A verified stamp is admitted only when the body without it is exactly what the
+# fast-forward writes at this path, under the tip's mode:
+#   worktree  the checkout of the tip blob (`cat-file --filters --path`, smudge
+#             and eol conversion applied) hashes, as raw bytes, to the stripped
+#             body's own hash, and that checkout cleans back to the tip blob.
+#             The tip blob IS in the store, so this also judges a file git marks
+#             filtered only because ITS OWN stamped blob was never stored (every
+#             stamped .md under `*.md text eol=lf`), on the bytes that matter.
+#   --stash   the ^3 blob is already the stored form: the stripped body's hash
+#             must equal the tip blob.
+untracked_stamp_admit() {
+  local p="$1" raw="" sv sblob tco tcl
+  [ -n "$UPSTREAM" ] && [ -n "${TIP_B[$p]:-}" ] && [ -n "$3" ] && [ "$3" = "${TIP_M[$p]:-}" ] || return 1
+  [ -n "$STASH" ] || raw="$CHECKOUT/$p"
+  stamp_line2_is_key "$2" "$raw" || return 1
+  resolve_stamp_arm
+  if [ "$STAMP_STATE" != ok ]; then UNT_STAMP_UNDECIDED+=("$p"); UNT_STAMP_WHY+=("$STAMP_STATE"); return 2; fi
+  if ! sv="$(set -o pipefail; stamp_bytes "$2" "$raw" 2>/dev/null | "$STAMP_PY" "$(native_path_w "$STAMP_HELPER")" verify "$p" 2>/dev/null)" || [ -z "$sv" ]; then
+    UNT_STAMP_UNDECIDED+=("$p"); UNT_STAMP_WHY+=("the stamp helper failed on this file"); return 2
+  fi
+  sv="${sv%$'\r'}"
+  case "$sv" in
+    "OK "[0-9a-f]*) sblob="${sv#OK }" ;;
+    "NO "*|NONE) return 1 ;;
+    *) UNT_STAMP_UNDECIDED+=("$p"); UNT_STAMP_WHY+=("the stamp helper answered '$sv'"); return 2 ;;
+  esac
+  if [ -n "$STASH" ]; then
+    [ "$sblob" = "${TIP_B[$p]}" ] || return 1
+  else
+    tco="$(set -o pipefail; g cat-file --filters --path="$p" "${TIP_B[$p]}" 2>/dev/null | g hash-object --no-filters --stdin 2>/dev/null)" || tco=""
+    tcl="$(set -o pipefail; g cat-file --filters --path="$p" "${TIP_B[$p]}" 2>/dev/null | g hash-object --stdin --path="$p" 2>/dev/null)" || tcl=""
+    if [ -z "$tco" ] || [ -z "$tcl" ]; then
+      UNT_STAMP_UNDECIDED+=("$p"); UNT_STAMP_WHY+=("the checkout of the tip blob ${TIP_B[$p]:0:12} could not be read"); return 2
+    fi
+    [ "$sblob" = "$tco" ] && [ "$tcl" = "${TIP_B[$p]}" ] || return 1
+  fi
+  UNT_STAMP_ON_UP+=("$p")
+  return 0
 }
 
 # ---------------------------------------------------------------------------
 # Pass 1 collects the records; the batched reads run once over all of them;
 # pass 2 decides each file in record order.
 ATTR_UNSTABLE=0
-R_P=(); R_ST=(); R_KIND=(); R_EV=(); R_SW=(); R_SI=()   # KIND: VER | DEL | UNIQUE | UNKNOWN (R_EV = its evidence); R_SW/R_SI = worktree/index spec
+R_P=(); R_ST=(); R_KIND=(); R_EV=(); R_SW=(); R_SI=(); R_CUP=()   # KIND: VER | DEL | UNIQUE | UNKNOWN (R_EV = its evidence); R_SW/R_SI = worktree/index spec
 VER_P=(); ALL_P=(); UNT_P=(); UNT_B=(); UNT_M=()
 if [ -n "$STASH" ]; then
   BASE_SHA="$(g rev-parse -q --verify "$STASH^1^{commit}" 2>/dev/null)" && \
@@ -893,7 +1109,7 @@ for i in "${!R_P[@]}"; do
       R_KIND[$i]=UNIQUE; R_EV[$i]="$BLOCKED_AT is a file or symlink on disk where git has a directory: a restore would replace it"; continue
     fi
     if [ -n "${WT_FILTERED[$p]+s}" ]; then
-      R_KIND[$i]=UNIQUE; R_EV[$i]="$FILTERED_EVID"; continue
+      R_KIND[$i]=UNIQUE; R_EV[$i]="$FILTERED_EVID"; R_CUP[$i]="$(content_upstream_blob "$p" "${R_ST[$i]}")"; continue
     fi
     if [ "$ATTR_UNSTABLE" = 1 ] && { has_conv "$p" || has_tipconv "$p"; }; then
       R_KIND[$i]=UNKNOWN; R_EV[$i]="$ATTR_EVID"; continue
@@ -909,7 +1125,7 @@ if [ -n "$UPSTREAM" ] && [ "${#HIST_NEED[@]}" -gt 0 ]; then chunked _hist_chunk 
 for i in "${!R_P[@]}"; do
   p="${R_P[$i]}"
   case "${R_KIND[$i]}" in
-    UNIQUE) add_file "$p" UNIQUE "${R_EV[$i]}" "${R_ST[$i]}" ;;
+    UNIQUE) add_file "$p" UNIQUE "${R_EV[$i]}" "${R_ST[$i]}" "${R_CUP[$i]:-}" ;;
     UNKNOWN) add_file "$p" UNKNOWN "${R_EV[$i]}" "${R_ST[$i]}" ;;
     DEL) classify_deletion "$p" "${R_ST[$i]}" ;;
     VER) specs=(); [ -z "${R_SW[$i]}" ] || specs+=("${R_SW[$i]}"); [ -z "${R_SI[$i]}" ] || specs+=("${R_SI[$i]}")

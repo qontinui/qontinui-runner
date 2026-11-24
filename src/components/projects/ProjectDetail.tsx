@@ -237,6 +237,7 @@ export function ProjectDetail({
                   <span className="font-medium">{proc.name}</span>
                   {proc.healthPort ? (
                     <span className="text-muted-foreground">
+                      {/* runner-localhost-ok: a project process's own health port, not a runner */}
                       http://localhost:{proc.healthPort}
                     </span>
                   ) : null}

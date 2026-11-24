@@ -3,8 +3,9 @@
 //! A periodic poller ([`scan_grids_once`] / [`spawn_grid_scan_loop`]) reads each
 //! live terminal's *rendered* VT grid (not its raw byte stream) and watches for
 //! the Claude CLI's token-exhaustion messages ("Claude usage limit reached",
-//! "5-hour limit reached ∙ resets …", …). When one appears it hands a
-//! (debounced) hint to [`super::account_migration::handle_usage_limit_hint`].
+//! "5-hour limit reached ∙ resets …", "You've hit your weekly limit · resets …",
+//! …). When one appears it hands a (debounced) hint to
+//! [`super::account_migration::handle_usage_limit_hint`].
 //!
 //! ## Why scan the grid, not the byte stream
 //!
@@ -26,11 +27,16 @@
 //!
 //! ## Firing policy
 //!
-//! Level-triggered with a per-terminal debounce ([`HINT_DEBOUNCE`], 300s): while
-//! a limit message stays visible the hint re-fires at most once per debounce
-//! window, so a persistently-painted error keeps the (probe-guarded) migration
-//! path armed without hammering it. This preserves the original hook's effective
-//! behavior (where TUI repaints re-fed the bytes under the same debounce).
+//! Two filters per terminal: a pass scans a screen only when its grid generation
+//! has advanced ([`super::scan_gate`]), and a match fires only when the debounce
+//! ([`HINT_DEBOUNCE`], 300s) has passed since that terminal's last hint. A match the
+//! debounce suppresses keeps the screen due for a scan, so a limit message that
+//! paints inside the window and then freezes still fires once the window ends.
+//!
+//! A pane that keeps repainting a limit message therefore re-fires at most every
+//! 300s, while a message frozen on an idle screen, such as the limit menu, fires
+//! once: if that hint found the probe unconfirmed or no migration target, nothing
+//! retries until the pane's grid changes again.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -54,8 +60,29 @@ const USAGE_LIMIT_PATTERNS: &[&str] = &[
     "5-hour limit reached",
     "weekly limit reached",
     "hit your usage limit",
+    // CLI 2.1.x banner: "You've hit your weekly limit · resets Oct 17, 10pm".
+    // None of the "… limit reached" spellings match it (2026-10-16 and
+    // 2026-10-20: sessions stranded on it with a healthy migration target
+    // idle). The leading "You've" is omitted — apostrophe style varies.
+    "hit your weekly limit",
+    "hit your 5-hour limit",
+    "hit your session limit",
     "out of extra usage",
     "session limit reached",
+    "hit your opus limit",
+    "hit your sonnet limit",
+    "hit your fable limit",
+    // A per-model cap's other spelling: "You've reached your Fable limit. Run
+    // /usage-credits to continue or switch models".
+    "reached your fable limit",
+    "hit your limit",
+    // An org/account monthly SPEND cap: "You've hit your org's monthly spend
+    // limit". No "… limit reached" / "hit your limit" spelling matches it
+    // (plan 2026-11-13-devops-scheduled-remote-agent-relaunches-into-an-exhausted-account,
+    // Evidence 3). The usage probe cannot see a spend cap, so this banner is
+    // the only signal there is. The headless classifier (`ai_provider::limit_hit`)
+    // treats it as a catch-all that only a stated reset confirms.
+    "spend limit",
     // Generic catch-alls LAST (specific patterns above win the label). The
     // CLI's phrasing shifts across releases ("Opus weekly limit reached",
     // "limit reached ∙ resets 3am", "You're out of usage until…") — a missed
@@ -63,6 +90,22 @@ const USAGE_LIMIT_PATTERNS: &[&str] = &[
     // probe-confirmed no-op.
     "limit reached",
     "out of usage",
+    // Menu-only signal, after the catch-alls; any banner keeps the label (plan
+    // 2026-11-12-a-limit-hit-by-a-background-subagent-shows-only-the-rate-limit-menu-so-the-pane-is-never-migrated).
+    // When a BACKGROUND subagent hits the limit, the pane paints only the
+    // /rate-limit-options menu ("What do you want to do? 1. Stop and wait for
+    // limit to reset …") under "Waiting for 1 background agent to finish" —
+    // no "hit your …" banner, so none of the entries above matched and the
+    // pane sat unmigrated for 14 h. The menu's stop option is matched, not
+    // its question, because "What do you want to do?" titles unrelated Claude
+    // Code menus too; claude-config's `LIMIT_MENU` (close-finished-sessions.py)
+    // reads this menu by the same option text. The label is conditional in
+    // the CLI (2.1.323): it is just "Stop" for a usage-billed account, and for
+    // a `credits_required` overage rejection on any account, and this entry
+    // does not match that shorter menu (plan follow-up d5c89e8e). A weekly or
+    // 5-hour limit on a subscription account, the measured case, draws the
+    // full text.
+    "stop and wait for limit to reset",
 ];
 
 /// Minimum gap between two hint firings for the same terminal. A limit message
@@ -80,7 +123,8 @@ fn normalized_indicates_usage_limit(normalized: &str) -> Option<&'static str> {
 }
 
 /// First matching usage-limit pattern in a raw (un-normalized) screen/window.
-/// Normalizes then delegates — the public matcher seam used by the unit tests.
+/// Normalizes then delegates — the matcher [`scan_grids_once`] runs on every
+/// due terminal's rendered screen, and the seam the unit tests enter through.
 pub fn window_indicates_usage_limit(window: &str) -> Option<&'static str> {
     normalized_indicates_usage_limit(&normalize(window))
 }
@@ -92,7 +136,7 @@ pub fn window_indicates_usage_limit(window: &str) -> Option<&'static str> {
 /// edge map).
 static FIRE_STATE: Mutex<Option<HashMap<String, Option<Instant>>>> = Mutex::new(None);
 
-/// Per-terminal output-byte watermarks so a tick skips sessions whose rendered
+/// Per-terminal grid-generation watermarks so a tick skips sessions whose rendered
 /// screen cannot have changed since the previous pass (see
 /// [`super::scan_gate`]). This scanner keeps its OWN gate — sharing one with
 /// `auto_response` would let whichever tick ran first consume the change on the
@@ -101,7 +145,7 @@ static SCAN_GATE: Mutex<Option<super::scan_gate::ScanGate>> = Mutex::new(None);
 
 /// Pure firing decision: given the matched pattern (if any), the terminal's
 /// last-fired time, and `now`, return the pattern iff a hint should fire and
-/// update `last_fired`. Debounce-gated level trigger. The unit-test seam.
+/// update `last_fired`. The unit-test seam.
 fn should_fire(
     matched: Option<&'static str>,
     last_fired: &mut Option<Instant>,
@@ -118,12 +162,32 @@ fn should_fire(
     Some(pattern)
 }
 
+/// [`should_fire`], plus what a suppressed match owes the scan gate. The gate has
+/// already recorded this screen as seen, so a limit message the debounce swallows
+/// and that then freezes (a menu painted just after an earlier hint) would never
+/// be scanned again. Forgetting the watermark keeps it due until the debounce
+/// lets it fire.
+fn fire_or_keep_due(
+    terminal_id: &str,
+    matched: Option<&'static str>,
+    last_fired: &mut Option<Instant>,
+    gate: &mut super::scan_gate::ScanGate,
+    now: Instant,
+    debounce: Duration,
+) -> Option<&'static str> {
+    let fired = should_fire(matched, last_fired, now, debounce);
+    if matched.is_some() && fired.is_none() {
+        gate.forget(terminal_id);
+    }
+    fired
+}
+
 // ── Grid scanner ─────────────────────────────────────────────────────────────
 
 /// One scan pass over every live terminal: read its rendered screen, and for
 /// any terminal showing a usage-limit message (debounce-permitting) spawn the
-/// account-migration hint. Cheap: one `text_snapshot` + substring scan per live
-/// terminal per tick.
+/// account-migration hint. Cheap: one `text_snapshot` + substring scan per
+/// terminal the scan gate reports as due, per tick.
 pub fn scan_grids_once() {
     use tauri::Manager;
 
@@ -147,7 +211,8 @@ pub fn scan_grids_once() {
         for (tid, session) in &sessions {
             // Skip sessions whose grid has not been mutated since the last
             // pass — the rendered screen is byte-identical, so a limit message
-            // frozen on an idle terminal is not re-detected. One atomic load
+            // frozen on an idle terminal is not re-detected once it has fired.
+            // One atomic load
             // instead of a grid lock + full screen render.
             if !gate.should_scan(tid, session.grid_generation()) {
                 continue;
@@ -160,11 +225,15 @@ pub fn scan_grids_once() {
                 let guard = grid.lock().unwrap_or_else(|e| e.into_inner());
                 guard.text_snapshot().text
             };
-            let matched = normalized_indicates_usage_limit(&normalize(&text));
+            // The same matcher the unit tests enter through, so every fixture
+            // there is a statement about this scan's matcher.
+            let matched = window_indicates_usage_limit(&text);
             // `entry` defaults to "never fired" → the first appearance fires
             // immediately; thereafter the debounce gates re-fires.
             let last_fired = map.entry(tid.clone()).or_insert(None);
-            if let Some(pattern) = should_fire(matched, last_fired, now, HINT_DEBOUNCE) {
+            if let Some(pattern) =
+                fire_or_keep_due(tid, matched, last_fired, gate, now, HINT_DEBOUNCE)
+            {
                 to_fire.push((tid.clone(), pattern));
             }
         }
@@ -190,7 +259,7 @@ pub fn scan_grids_once() {
 /// `settings.performance.grid_scan_interval_ms`, else the historical 1500 ms —
 /// that setting's default. Floored at 200 ms either way. 1.5s is far under the
 /// 300s debounce, so a freshly-painted limit message is caught promptly while
-/// costing a trivial substring pass per terminal per tick. See
+/// costing a trivial substring pass per due terminal per tick. See
 /// `terminal::scan_interval` for the precedence rules.
 fn scan_interval() -> Duration {
     crate::terminal::scan_interval::scan_interval_from_env("QONTINUI_USAGE_LIMIT_SCAN_INTERVAL_MS")
@@ -209,7 +278,7 @@ pub fn spawn_grid_scan_loop() {
             loop {
                 ticker.tick().await;
                 hb.tick();
-                // Locking every session's grid and rendering a full screen is CPU
+                // Locking each due session's grid and rendering a full screen is CPU
                 // + lock work, not I/O — keep it off the runtime's worker pool
                 // (same shape as `build_drift::run_periodic`). A panicked sweep is
                 // logged and the loop keeps ticking.
@@ -240,6 +309,174 @@ mod tests {
         assert_eq!(
             window_indicates_usage_limit("Weekly limit reached — resets Thursday"),
             Some("weekly limit reached")
+        );
+        assert_eq!(
+            window_indicates_usage_limit(
+                "  ⎿  You've hit your weekly limit · resets Oct 21, 10pm (Europe/Berlin)"
+            ),
+            Some("hit your weekly limit")
+        );
+        assert_eq!(
+            window_indicates_usage_limit("You've hit your limit · resets 3am"),
+            Some("hit your limit")
+        );
+    }
+
+    #[test]
+    fn hit_your_limit_phrasing_matches() {
+        // Verbatim from a stranded session transcript, 2026-10-16.
+        assert_eq!(
+            window_indicates_usage_limit(
+                "You've hit your weekly limit \u{b7} resets Oct 17, 10pm (Europe/Berlin)"
+            ),
+            Some("hit your weekly limit")
+        );
+        assert_eq!(
+            window_indicates_usage_limit("You\u{2019}ve hit your 5-hour limit \u{b7} resets 3am"),
+            Some("hit your 5-hour limit")
+        );
+    }
+
+    #[test]
+    fn every_pattern_is_reachable() {
+        // `find` returns the FIRST match, so a pattern that repeats an earlier
+        // one, or contains an earlier one as a substring, can never be the
+        // label returned. Two parallel fixes once left five such dead entries.
+        for (j, later) in USAGE_LIMIT_PATTERNS.iter().enumerate() {
+            for earlier in &USAGE_LIMIT_PATTERNS[..j] {
+                assert!(
+                    !later.contains(earlier),
+                    "pattern {later:?} is shadowed by earlier pattern {earlier:?}"
+                );
+            }
+            assert_eq!(window_indicates_usage_limit(later), Some(*later));
+        }
+    }
+
+    #[test]
+    fn hit_your_banners_keep_their_label_beside_other_phrases() {
+        // Priority order, not just reachability: these labels are what the
+        // migration reads, so a co-painted generic phrase must not take over.
+        // The last block pins the menu-only entry below every banner AND both
+        // catch-alls (the plan names this test as that entry's priority test).
+        assert_eq!(
+            window_indicates_usage_limit("out of extra usage\nYou've hit your weekly limit"),
+            Some("hit your weekly limit")
+        );
+        assert_eq!(
+            window_indicates_usage_limit("session limit reached · You've hit your session limit"),
+            Some("hit your session limit")
+        );
+        assert_eq!(
+            window_indicates_usage_limit("limit reached · You've hit your limit · out of usage"),
+            Some("hit your limit")
+        );
+        // A banner painted beside the limit menu keeps the banner's label: the
+        // menu entry sits after the catch-alls.
+        assert_eq!(
+            window_indicates_usage_limit(&format!(
+                "{LIMIT_MENU_ONLY_TAIL}\nYou've hit your weekly limit"
+            )),
+            Some("hit your weekly limit")
+        );
+        assert_eq!(
+            window_indicates_usage_limit(&format!(
+                "{LIMIT_MENU_ONLY_TAIL}\nlimit reached · resets 3am"
+            )),
+            Some("limit reached")
+        );
+        // ...and it sits after BOTH catch-alls, not between them.
+        assert_eq!(
+            window_indicates_usage_limit(&format!("{LIMIT_MENU_ONLY_TAIL}\nYou're out of usage")),
+            Some("out of usage")
+        );
+    }
+
+    /// The bottom of the rendered screen of a pane whose usage limit was hit by
+    /// a BACKGROUND subagent: the spinner, panel note, menu and bottom border
+    /// are reconstructed from the tail measured on 2026-11-12 (merytshost,
+    /// pane db0a8eb9; PTY bytes, ANSI-stripped) and laid out as the rendered
+    /// grid would show them, not copied byte for byte; the footer row
+    /// after the border is illustrative, not measured. No "hit your …" banner
+    /// anywhere (plan
+    /// 2026-11-12-a-limit-hit-by-a-background-subagent-shows-only-the-rate-limit-menu-so-the-pane-is-never-migrated).
+    const LIMIT_MENU_ONLY_TAIL: &str = "\
+✻ Waiting for 1 background agent to finish
+
+ Background task update waiting while this panel is open
+
+ What do you want to do?
+
+ ❯ 1. Stop and wait for limit to reset
+   2. Wait here, then continue automatically at Nov 18, 9pm
+   3. Switch to usage credits
+
+ Enter to confirm · Esc to cancel
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+  ⏵⏵ bypass permissions on (shift+tab to cycle)
+";
+
+    #[test]
+    fn limit_menu_without_a_banner_matches() {
+        assert_eq!(
+            window_indicates_usage_limit(LIMIT_MENU_ONLY_TAIL),
+            Some("stop and wait for limit to reset")
+        );
+    }
+
+    #[test]
+    fn an_unrelated_menu_question_does_not_match() {
+        // "What do you want to do?" opens other Claude Code menus too.
+        assert_eq!(
+            window_indicates_usage_limit("What do you want to do?\n 1. Yes\n 2. No"),
+            None
+        );
+    }
+
+    #[test]
+    fn the_short_stop_label_is_not_matched() {
+        // The known limitation, pinned: the CLI's short "Stop" label (a
+        // usage-billed account, or a credits_required overage rejection) is
+        // not matched by the menu entry (plan follow-up d5c89e8e).
+        assert_eq!(
+            window_indicates_usage_limit(
+                "What do you want to do?\n ❯ 1. Stop\n   2. Switch to usage credits"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn reached_your_model_limit_matches() {
+        // Verbatim from the fleet's provider-limit tooling
+        // (qontinui-claude-config scripts/rate-limit-reset-test.sh).
+        assert_eq!(
+            window_indicates_usage_limit(
+                "You've reached your Fable limit. Run /usage-credits to continue or switch models"
+            ),
+            Some("reached your fable limit")
+        );
+        // The CLI's "You've hit your ${limit}" banner template (read from the 2.1.304
+        // binary) with its "Fable limit" cap name; the reset text is illustrative.
+        assert_eq!(
+            window_indicates_usage_limit("You've hit your Fable limit \u{b7} resets Oct 21, 10pm"),
+            Some("hit your fable limit")
+        );
+        assert_eq!(
+            window_indicates_usage_limit("You've used 82% of your Fable limit"),
+            None
+        );
+    }
+
+    #[test]
+    fn spend_limit_banner_matches() {
+        // Plan `2026-11-13-devops-scheduled-remote-agent-relaunches-into-an-exhausted-account`
+        // test (f): the monthly spend-cap banner matched none of the patterns.
+        assert_eq!(
+            window_indicates_usage_limit(
+                "You've hit your org's monthly spend limit \u{b7} resets Dec 1, 12am (UTC)"
+            ),
+            Some("spend limit")
         );
     }
 
@@ -274,6 +511,64 @@ mod tests {
             ),
             Some("usage limit reached")
         );
+    }
+
+    #[test]
+    fn a_suppressed_match_that_freezes_still_fires_when_the_debounce_ends() {
+        let debounce = Duration::from_secs(300);
+        let t0 = Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        let mut gate = crate::terminal::scan_gate::ScanGate::new();
+        let mut last = None;
+        let hit = Some("hit your weekly limit");
+
+        // An earlier hint fires and opens the debounce window.
+        assert!(gate.should_scan("t", 1));
+        assert_eq!(
+            fire_or_keep_due("t", hit, &mut last, &mut gate, at(0), debounce),
+            hit
+        );
+
+        // The limit menu paints inside the window, then the screen freezes on
+        // generation 2: suppressed, but still due for a scan on every later tick.
+        assert!(gate.should_scan("t", 2));
+        assert_eq!(
+            fire_or_keep_due("t", hit, &mut last, &mut gate, at(10), debounce),
+            None
+        );
+        assert!(gate.should_scan("t", 2));
+        assert_eq!(
+            fire_or_keep_due("t", hit, &mut last, &mut gate, at(299), debounce),
+            None
+        );
+
+        // The window ends: it fires once, and the frozen screen then rests.
+        assert!(gate.should_scan("t", 2));
+        assert_eq!(
+            fire_or_keep_due("t", hit, &mut last, &mut gate, at(300), debounce),
+            hit
+        );
+        assert!(!gate.should_scan("t", 2));
+    }
+
+    #[test]
+    fn a_screen_with_no_match_is_not_kept_due() {
+        let t0 = Instant::now();
+        let mut gate = crate::terminal::scan_gate::ScanGate::new();
+        let mut last = Some(t0);
+        assert!(gate.should_scan("t", 1));
+        assert_eq!(
+            fire_or_keep_due(
+                "t",
+                None,
+                &mut last,
+                &mut gate,
+                t0,
+                Duration::from_secs(300)
+            ),
+            None
+        );
+        assert!(!gate.should_scan("t", 1));
     }
 
     #[test]

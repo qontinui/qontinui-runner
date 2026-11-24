@@ -1,0 +1,1605 @@
+//! `POST /control/sessions/resume {ids | all: true, generation?}` — the runner's own door
+//! for re-launching CLOSED sessions on THIS device.
+//!
+//! Plan `2026-10-06-closed-sessions-whose-work-is-unfinished-are-found-fleet-wide-and-resumed`
+//! Phase 4. It is the respawn receiver's materialise flow
+//! ([`super::respawn`]) with a LOCAL source: the transcript is already under the
+//! row's own `CLAUDE_CONFIG_DIR`, so there is no coord fetch, no handoff bundle
+//! and no account re-pin — the session comes back under the account it ran on,
+//! in the cwd it ran in. The flow ends in the same shared seam the receiver
+//! uses, [`crate::terminal::account_migration::spawn_resumed_pane`] (an argv
+//! spawn, so no typed-command retry exists to fail).
+//!
+//! It is a backend route, deliberately independent of any mounted React
+//! frontend (an HTTP door must work on a headless runner).
+//!
+//! ## It is a credential door
+//!
+//! The route spawns `claude` processes with the user's account on the user's
+//! behalf, so it is on `origin_guard::CREDENTIAL_DOORS`: a browser origin the
+//! guard does not trust never reaches it. Inside the handler the request must
+//! also be unambiguous — a JSON body naming non-empty `ids`, or the explicit
+//! flag `all: true`. An empty or bare body is a 400, never "everything", and a
+//! non-JSON content type is a 415, so a cross-site form POST (which can send
+//! neither) cannot trigger a fleet-wide resume.
+//!
+//! ## Why a call cannot double-spawn
+//!
+//! Three independent guards sit between a request and a spawn: the shared
+//! session-scope in-flight registry ([`super::in_flight`]; two concurrent calls
+//! naming one id: the second is `skipped(in_flight)`, and a session an account
+//! migration or the respawn receiver is moving is `skipped(in_flight(<who>))`),
+//! a process-table read that refuses an id some live `claude` already holds
+//! (`skipped(live_process)`), and the batch itself runs in a DETACHED task, so
+//! a caller that disconnects mid-batch neither cancels the remaining ids nor
+//! leaves a half-verified spawn behind — every id still
+//! gets its verdict, in the log if nobody is waiting for the response.
+//!
+//! ## Per-id flow ([`resume_one`])
+//!
+//! 0. no other call is already resuming the id, and no live `claude` process
+//!    already holds it ([`claim_for_door`], [`live_holder`]);
+//! 1. the id is well-formed, has a lifecycle row, the row is `closed`, not
+//!    marked finished, owned by the claude provider, with a known config dir and
+//!    a cwd that still exists;
+//! 2. the transcript exists locally — `--resume` against nothing would start an
+//!    EMPTY conversation wearing the old id, the fabricated half this plan
+//!    forbids;
+//! 3. the device drain gate, as [`SpawnOrigin::Respawn`], deferred (never
+//!    dropped) while the device is drained;
+//! 4. the per-session account-hop budget, `MIGRATION_CAP`, shared with the
+//!    automatic migration and the respawn receiver (checked last, immediately
+//!    before the spawn, because the check consumes a slot);
+//! 5. spawn, PROVE the resumed CLI alive (running and painting,
+//!    [`crate::terminal::respawn_liveness`]; a pane that dies is retried, and an
+//!    id whose every attempt died is `failed(respawn-died: …)`), then VERIFY BY
+//!    READING THE PROCESS: exactly one `claude --resume
+//!    <id>` under the new pane, whose cwd and `CLAUDE_CONFIG_DIR` (where the
+//!    platform exposes them) are the ones the row recorded.
+//!
+//! Every id gets exactly one verdict: `resumed`, `failed(<reason>)` or
+//! `skipped(<reason>)`. A refusal before the spawn is a skip; anything that
+//! went wrong at or after the spawn is a failure.
+//!
+//! ## `generation`
+//!
+//! The rebuild plan's ledger-generation restore shares this route. The ledger
+//! carries no generation concept today ([`super::session_ledger`] has none), so
+//! the field is ACCEPTED, logged and echoed back, and filters nothing. It is
+//! not silently ignored: the report says `generation_applied: false`.
+//!
+//! The admission-lease path (plan 2026-09-13 spawn-admission) is not landed
+//! here; once it is, a mid-batch refusal marks the rest `skipped(admission)`.
+
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::body::Bytes;
+use axum::extract::State;
+use axum::routing::post;
+use axum::{Json, Router};
+use serde::{Deserialize, Serialize};
+use tracing::{info, warn};
+
+use super::session_lifecycle_store::{SessionLifecycleStore, TerminalSessionRecord};
+use super::SessionRegistry;
+use crate::coord_drain_state::{DrainGate, SpawnOrigin};
+use crate::mcp::types::{api_error, ApiResponse, ApiState};
+use crate::process_capture::process_tree::config_dir_of_pid;
+use crate::terminal::TerminalManager;
+
+/// Most ids one call will act on. Each resume is verified by a process read, so
+/// an unbounded batch would pin the request for minutes.
+pub const MAX_IDS: usize = 50;
+
+/// How long to wait for the resumed `claude` to appear before calling the
+/// spawn failed.
+const VERIFY_DEADLINE: Duration = Duration::from_secs(20);
+const VERIFY_POLL: Duration = Duration::from_millis(500);
+
+/// Routes contributed by this module; merged in `mcp_api.rs`. A runner-native
+/// route, not part of the UI-Bridge SDK manifest.
+pub fn routes() -> Router<Arc<ApiState>> {
+    Router::new().route("/control/sessions/resume", post(post_sessions_resume))
+}
+
+// ---------------------------------------------------------------------------
+// Wire types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResumeRequest {
+    /// Claude session ids to resume. Must be non-empty when present; exclusive
+    /// with `all`.
+    #[serde(default)]
+    pub ids: Option<Vec<String>>,
+    /// Explicitly resume every closed, unfinished claude session this
+    /// device's lifecycle store holds. Without it (or `ids`) the request is
+    /// refused: an empty body must never mean "all".
+    #[serde(default)]
+    pub all: Option<bool>,
+    /// The rebuild plan's ledger generation. Accepted and echoed; see the
+    /// module docs.
+    #[serde(default)]
+    pub generation: Option<String>,
+}
+
+/// One id's verdict.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ResumeRow {
+    pub id: String,
+    /// `resumed` | `failed` | `skipped`.
+    pub outcome: &'static str,
+    /// Present for `failed` and `skipped`.
+    pub reason: Option<String>,
+    /// `resumed` | `failed(<reason>)` | `skipped(<reason>)` — the spelling the
+    /// plan names, for a reader that wants one string.
+    pub verdict: String,
+    /// What the process read observed (only on `resumed`, or on a `failed`
+    /// that got far enough to observe something).
+    pub evidence: Option<ProcessEvidence>,
+}
+
+impl ResumeRow {
+    fn resumed(id: &str, evidence: ProcessEvidence) -> Self {
+        Self {
+            id: id.to_string(),
+            outcome: "resumed",
+            reason: None,
+            verdict: "resumed".to_string(),
+            evidence: Some(evidence),
+        }
+    }
+    fn failed(id: &str, reason: impl Into<String>, evidence: Option<ProcessEvidence>) -> Self {
+        let reason = reason.into();
+        Self {
+            id: id.to_string(),
+            outcome: "failed",
+            verdict: format!("failed({reason})"),
+            reason: Some(reason),
+            evidence,
+        }
+    }
+    fn skipped(id: &str, reason: impl Into<String>) -> Self {
+        let reason = reason.into();
+        Self {
+            id: id.to_string(),
+            outcome: "skipped",
+            verdict: format!("skipped({reason})"),
+            reason: Some(reason),
+            evidence: None,
+        }
+    }
+}
+
+/// What reading the process table showed about the resumed session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProcessEvidence {
+    pub terminal_id: String,
+    pub pid: Option<u32>,
+    pub cmdline: Option<String>,
+    /// `null` = this platform could not say (never a guess).
+    pub cwd: Option<String>,
+    /// `null` = this platform could not say (never a guess).
+    pub claude_config_dir: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ResumeReport {
+    pub generation: Option<String>,
+    /// `false` — no ledger generation exists to filter by. See module docs.
+    pub generation_applied: bool,
+    pub requested: usize,
+    pub resumed: usize,
+    pub failed: usize,
+    pub skipped: usize,
+    pub results: Vec<ResumeRow>,
+}
+
+// ---------------------------------------------------------------------------
+// Pure decisions
+// ---------------------------------------------------------------------------
+
+/// A row that passed every precondition that needs no I/O beyond the row.
+#[derive(Debug, Clone)]
+struct Candidate {
+    id: String,
+    config_dir: String,
+    working_dir: String,
+    title: String,
+    page_id: String,
+    zone_index: i32,
+}
+
+/// Why a lifecycle row cannot be resumed, or the candidate it yields.
+fn classify(id: &str, rec: Option<&TerminalSessionRecord>) -> Result<Candidate, String> {
+    if !super::session_id::is_valid_session_id(id) {
+        return Err("invalid_id".to_string());
+    }
+    let Some(rec) = rec else {
+        return Err("not_found".to_string());
+    };
+    if rec.provider != super::session_lifecycle_store::DEFAULT_PROVIDER {
+        return Err(format!("provider_{}", rec.provider));
+    }
+    if rec.state != "closed" {
+        return Err("not_closed".to_string());
+    }
+    if rec.finished_at.is_some() {
+        return Err("finished".to_string());
+    }
+    let config_dir = rec
+        .config_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "no_config_dir".to_string())?;
+    let working_dir = rec
+        .working_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "no_working_dir".to_string())?;
+    let short = id.get(..8).unwrap_or(id);
+    Ok(Candidate {
+        id: id.to_string(),
+        config_dir: config_dir.to_string(),
+        working_dir: working_dir.to_string(),
+        title: rec
+            .title
+            .clone()
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or_else(|| format!("Resumed {short}")),
+        page_id: rec.page_id.clone(),
+        zone_index: rec.zone_index,
+    })
+}
+
+/// What a request asked for, once validated.
+#[derive(Debug, PartialEq, Eq)]
+enum Scope {
+    Ids(Vec<String>),
+    All,
+}
+
+impl ResumeRequest {
+    /// An explicit scope or an error — never a default of "everything".
+    fn scope(&self) -> Result<Scope, String> {
+        let all = self.all == Some(true);
+        match (&self.ids, all) {
+            (Some(_), true) => Err("`ids` and `all: true` are mutually exclusive".to_string()),
+            (Some(ids), false) if ids.iter().all(|i| i.trim().is_empty()) => {
+                Err("`ids` is empty — name at least one id, or send `all: true`".to_string())
+            }
+            (Some(ids), false) => Ok(Scope::Ids(ids.clone())),
+            (None, true) => Ok(Scope::All),
+            (None, false) => Err("body must name non-empty `ids` or `all: true`".to_string()),
+        }
+    }
+}
+
+/// The ids this call acts on: the caller's, de-duplicated in order, or every
+/// closed unfinished claude row for [`Scope::All`].
+fn select_ids(scope: &Scope, all: &[TerminalSessionRecord]) -> Vec<String> {
+    match scope {
+        Scope::Ids(ids) => {
+            let mut seen = std::collections::HashSet::new();
+            ids.iter()
+                .map(|i| i.trim().to_string())
+                .filter(|i| !i.is_empty() && seen.insert(i.clone()))
+                .collect()
+        }
+        Scope::All => {
+            let mut rows: Vec<&TerminalSessionRecord> = all
+                .iter()
+                .filter(|r| {
+                    r.state == "closed"
+                        && r.finished_at.is_none()
+                        && r.provider == super::session_lifecycle_store::DEFAULT_PROVIDER
+                })
+                .collect();
+            // Most recently closed first: that is the work most likely still wanted.
+            rows.sort_by_key(|r| std::cmp::Reverse(r.closed_at.unwrap_or(0)));
+            rows.into_iter()
+                .map(|r| r.claude_session_id.clone())
+                .collect()
+        }
+    }
+}
+
+/// The admission decision after the I/O preconditions: drain first, then the
+/// account-hop budget. `cap_permits` is called ONLY when the drain allows —
+/// it records-and-checks, so charging a slot for a deferred attempt would let
+/// a drain burn a session's whole 24h budget.
+fn admit(gate: DrainGate, cap_permits: impl FnOnce() -> bool) -> Result<(), String> {
+    if let DrainGate::Defer { reason, .. } = gate {
+        return Err(format!("drain: {reason}"));
+    }
+    if !cap_permits() {
+        return Err("cap_reached".to_string());
+    }
+    Ok(())
+}
+
+/// The skip reason for a resume while a model gateway is declared (or its
+/// state is unknown), `None` otherwise. PURE over `gateway_declared`.
+fn gateway_refusal(gateway_declared: bool) -> Option<String> {
+    gateway_declared.then(|| {
+        format!(
+            "model_gateway: {}; a resumed pane would run under the gateway's \
+             CLAUDE_CONFIG_DIR, where this session's transcript does not exist",
+            crate::model_gateway::SUBSCRIPTION_OFF_REASON
+        )
+    })
+}
+
+/// [`gateway_refusal`] over the live gateway state.
+fn live_gateway_refusal() -> Option<String> {
+    gateway_refusal(crate::model_gateway::gateway_declared())
+}
+
+/// One live `claude` process as read from the process table.
+#[derive(Debug, Clone)]
+struct ClaudeProc {
+    pid: u32,
+    cmdline: String,
+    cwd: Option<String>,
+    config_dir: Option<String>,
+}
+
+/// `Ok` only when exactly one `claude --resume <id>` is present and every
+/// fact the platform could read agrees with the row. `Err(None)` = not there
+/// YET (keep polling); `Err(Some(reason))` = wrong, stop.
+fn judge(
+    procs: &[ClaudeProc],
+    cand: &Candidate,
+    terminal_id: &str,
+) -> Result<ProcessEvidence, Option<String>> {
+    let matching: Vec<&ClaudeProc> = procs
+        .iter()
+        .filter(|p| {
+            crate::process_capture::process_tree::parse_session_id_from_cmdline(&p.cmdline)
+                .as_deref()
+                == Some(cand.id.as_str())
+        })
+        .collect();
+    let p = match matching.as_slice() {
+        [] => return Err(None),
+        [one] => *one,
+        many => return Err(Some(format!("multiple_resume_processes({})", many.len()))),
+    };
+    if let Some(cwd) = &p.cwd {
+        if !same_path(cwd, &cand.working_dir) {
+            return Err(Some(format!(
+                "cwd_mismatch(want {}, got {cwd})",
+                cand.working_dir
+            )));
+        }
+    }
+    if let Some(dir) = &p.config_dir {
+        if !same_path(dir, &cand.config_dir) {
+            return Err(Some(format!(
+                "config_dir_mismatch(want {}, got {dir})",
+                cand.config_dir
+            )));
+        }
+    }
+    Ok(ProcessEvidence {
+        terminal_id: terminal_id.to_string(),
+        pid: Some(p.pid),
+        cmdline: Some(p.cmdline.clone()),
+        cwd: p.cwd.clone(),
+        claude_config_dir: p.config_dir.clone(),
+    })
+}
+
+/// Path equality tolerant of trailing separators, `\` vs `/`, and symlinks
+/// where both sides resolve. Case-insensitive only where the filesystem is
+/// (Windows, macOS): on Linux `/Work` and `/work` are different directories,
+/// and calling them equal would pass a resume pinned to the wrong tree.
+fn same_path(a: &str, b: &str) -> bool {
+    same_path_with(a, b, cfg!(any(windows, target_os = "macos")))
+}
+
+fn same_path_with(a: &str, b: &str, case_insensitive: bool) -> bool {
+    let norm = |s: &str| {
+        let canon = std::fs::canonicalize(s)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| s.to_string());
+        let canon = canon.replace('\\', "/").trim_end_matches('/').to_string();
+        if case_insensitive {
+            canon.to_lowercase()
+        } else {
+            canon
+        }
+    };
+    norm(a) == norm(b)
+}
+
+// ---------------------------------------------------------------------------
+// Double-spawn guards
+// ---------------------------------------------------------------------------
+
+/// Claim `id` in the shared session-scope in-flight registry
+/// ([`super::in_flight`]) for the door, held through spawn AND verify. Two
+/// concurrent door calls naming one id: the second is `skipped(in_flight)`. A
+/// session another mover holds — an account migration mid-proof, the respawn
+/// receiver — is `skipped(in_flight(<holder>))`: resuming it would put a second
+/// process on one transcript.
+fn claim_for_door(id: &str) -> Result<super::in_flight::SessionInFlight, String> {
+    super::in_flight::SessionInFlight::claim(id, "resume-door").map_err(|holder| {
+        if holder == "resume-door" {
+            "in_flight".to_string()
+        } else {
+            format!("in_flight({holder})")
+        }
+    })
+}
+
+/// Pure: the pid of a `claude` among `procs` (`(pid, cmdline)`) that is
+/// already running session `id`.
+fn holder_of(procs: &[(u32, String)], id: &str) -> Option<u32> {
+    procs.iter().find_map(|(pid, cmd)| {
+        (crate::process_capture::process_tree::parse_session_id_from_cmdline(cmd).as_deref()
+            == Some(id))
+        .then_some(*pid)
+    })
+}
+
+/// Is any live `claude` on this machine already running session `id`
+/// (`--resume <id>` or `--session-id <id>`)? `Err` when the process table
+/// could not be read — which must NOT read as "nobody holds it": a resume of a
+/// live session is a second process writing one transcript.
+async fn live_holder(id: &str) -> Result<Option<u32>, String> {
+    use crate::process_capture::process_tree as pt;
+    // A read begun now, never the memo: a `claude` started moments ago is the
+    // very holder this guard exists to see.
+    let snap = pt::snapshot_process_table_fresh().await;
+    if snap.stale || snap.names.is_empty() {
+        return Err("process_table_unreadable".to_string());
+    }
+    let pids: Vec<u32> = snap
+        .names
+        .keys()
+        .copied()
+        .filter(|p| pt::is_countable_claude(*p, &snap))
+        .collect();
+    holder_from_command_lines(pt::command_lines_for_pids(&pids).await, id)
+}
+
+/// Pure: the holder of session `id` from the claude processes' command lines.
+/// `Err` when the command-line read is UNKNOWN (`None`: the read failed and no
+/// fallback answered) — an empty map there would read as "nobody holds it",
+/// and the resume it lets through would fork a live session.
+fn holder_from_command_lines(
+    cmdlines: Option<std::collections::HashMap<u32, String>>,
+    id: &str,
+) -> Result<Option<u32>, String> {
+    let Some(cmdlines) = cmdlines else {
+        return Err("process_table_unreadable".to_string());
+    };
+    let procs: Vec<(u32, String)> = cmdlines.into_iter().collect();
+    Ok(holder_of(&procs, id))
+}
+
+// ---------------------------------------------------------------------------
+// I/O: the spawn site
+// ---------------------------------------------------------------------------
+
+/// Why one verify poll could not read the pane — the poll is skipped, and
+/// when EVERY poll was skipped, the last one's reason is the verdict.
+const PROCESS_TABLE_UNREADABLE: &str = "process_table_unreadable";
+/// The pane holds a process Claude Code's session registry could not settle
+/// (it may be the resumed npm-installed `claude`), so the list is undecided.
+const REGISTRY_UNDECIDED: &str = "registry_undecided";
+
+/// Read the claude processes under `terminal_id`'s pane. `Err` names why the
+/// poll could not read it: the pane is gone or the table is UNKNOWN (a failed
+/// or stale read) — [`PROCESS_TABLE_UNREADABLE`] — or the pane's `claude` set
+/// is UNDECIDED — [`REGISTRY_UNDECIDED`] ([`claude_pids_under`]). An empty or
+/// partial list from any of them would read as "the resumed claude is not
+/// there". A read begun now (never the memo), since [`verify`] can disprove a
+/// resume from it.
+async fn read_claude_procs(
+    tm: &Arc<TerminalManager>,
+    terminal_id: &str,
+) -> Result<Vec<ClaudeProc>, &'static str> {
+    use crate::process_capture::process_tree as pt;
+    let root = tm
+        .get(terminal_id)
+        .and_then(|t| t.child_pid())
+        .ok_or(PROCESS_TABLE_UNREADABLE)?;
+    let look = crate::terminal::graceful_exit::PaneLook::take_fresh(&[root]).await;
+    let pids = claude_pids_under(&look, root)?;
+    // An UNKNOWN command-line read skips this poll, exactly as an UNKNOWN
+    // table does: a list built from it would drop every process (each
+    // `ClaudeProc` needs its cmdline) and read as "the resumed claude is not
+    // there". The caller polls again.
+    let cmdlines = pt::command_lines_for_pids(&pids)
+        .await
+        .ok_or(PROCESS_TABLE_UNREADABLE)?;
+    let cwds = pt::working_directories_for_pids(&pids).await;
+    Ok(pids
+        .into_iter()
+        .filter_map(|pid| {
+            Some(ClaudeProc {
+                pid,
+                cmdline: cmdlines.get(&pid)?.clone(),
+                cwd: cwds.get(&pid).cloned(),
+                config_dir: config_dir_of_pid(pid),
+            })
+        })
+        .collect())
+}
+
+/// Every live `claude` under `root` in `look` — an image-proven one, or a pid
+/// Claude Code's session registry names whatever its image, so a resumed
+/// npm-installed `claude` (`node … cli.js`) is seen. `None` (skip this poll)
+/// for an UNKNOWN table and for an UNDECIDED set: a pid the registry could not
+/// settle may be the resumed `claude`, and leaving it out would disprove a
+/// resume that happened. The `Err` says which ([`PROCESS_TABLE_UNREADABLE`]
+/// or [`REGISTRY_UNDECIDED`]).
+fn claude_pids_under(
+    look: &crate::terminal::graceful_exit::PaneLook,
+    root: u32,
+) -> Result<Vec<u32>, &'static str> {
+    if look.snapshot().is_unknown() {
+        return Err(PROCESS_TABLE_UNREADABLE);
+    }
+    look.claude_pids(root).map_err(|_| REGISTRY_UNDECIDED)
+}
+
+/// Poll the process table until the resumed claude is proven (or disproven).
+async fn verify(
+    tm: &Arc<TerminalManager>,
+    cand: &Candidate,
+    terminal_id: &str,
+) -> Result<ProcessEvidence, String> {
+    verify_with(
+        cand,
+        terminal_id,
+        VERIFY_DEADLINE,
+        VERIFY_POLL,
+        || tm.get(terminal_id).is_some(),
+        || read_claude_procs(tm, terminal_id),
+    )
+    .await
+}
+
+/// The poll loop behind [`verify`], over an injected pane check and process
+/// read (`Err(reason)` = that poll could not read the pane). At the deadline
+/// it reports `no_claude_resume_process_observed` only when at least one poll
+/// actually READ it; when every poll was skipped it reports the last skip's
+/// reason (`process_table_unreadable` or `registry_undecided`) — "could not
+/// look" is not "looked and found nothing".
+async fn verify_with<A, R, Fut>(
+    cand: &Candidate,
+    terminal_id: &str,
+    deadline: Duration,
+    poll: Duration,
+    mut pane_alive: A,
+    mut read: R,
+) -> Result<ProcessEvidence, String>
+where
+    A: FnMut() -> bool,
+    R: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<ClaudeProc>, &'static str>>,
+{
+    let deadline = tokio::time::Instant::now() + deadline;
+    let mut any_poll_readable = false;
+    let mut last_skip = PROCESS_TABLE_UNREADABLE;
+    loop {
+        if !pane_alive() {
+            return Err("pane_vanished_before_claude_appeared".to_string());
+        }
+        match read().await {
+            Ok(procs) => {
+                any_poll_readable = true;
+                match judge(&procs, cand, terminal_id) {
+                    Ok(ev) => return Ok(ev),
+                    Err(Some(reason)) => return Err(reason),
+                    Err(None) => {}
+                }
+            }
+            Err(reason) => last_skip = reason,
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(if any_poll_readable {
+                "no_claude_resume_process_observed"
+            } else {
+                last_skip
+            }
+            .to_string());
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
+/// Resume one session: gate, budget, spawn, verify. The spawn site registered
+/// in `runner_spawn_sites.txt` — the drain gate lives HERE and branches on its
+/// result.
+async fn resume_one(
+    app: &tauri::AppHandle,
+    tm: &Arc<TerminalManager>,
+    registry: &Arc<SessionRegistry>,
+    store: &SessionLifecycleStore,
+    cand: Candidate,
+) -> ResumeRow {
+    // One mover per id at a time, held through spawn, proof AND verify.
+    let _in_flight = match claim_for_door(&cand.id) {
+        Ok(claim) => claim,
+        Err(why) => return ResumeRow::skipped(&cand.id, why),
+    };
+    // Wait out a runner-owned CLI install FIRST, before the live-holder and
+    // drain checks below: the `--resume` resolver waits on the same flag, and
+    // a wait taken after those checks would leave them up to
+    // `claude_cli_spawn::CLI_UPDATE_WAIT` stale by spawn time. Returns at once
+    // when no install is running.
+    crate::claude_cli_spawn::await_cli_update_quiescent().await;
+    // Under a model gateway the resumed pane runs with the gateway's
+    // CLAUDE_CONFIG_DIR (finalize_child_env pins it), where this session's
+    // transcript does not exist, so `--resume` would find nothing. Refuse the
+    // same way account migration does.
+    if let Some(why) = live_gateway_refusal() {
+        return ResumeRow::skipped(&cand.id, why);
+    }
+    // A live claude already running this id: resuming would be a second
+    // process on one transcript.
+    match live_holder(&cand.id).await {
+        Ok(None) => {}
+        Ok(Some(pid)) => return ResumeRow::skipped(&cand.id, format!("live_process(pid {pid})")),
+        Err(why) => return ResumeRow::skipped(&cand.id, why),
+    }
+    // The transcript, local — a missing one must never become `--resume` of
+    // nothing.
+    let transcript = crate::terminal::transcript::session_transcript_path(
+        Path::new(&cand.config_dir),
+        &cand.working_dir,
+        &cand.id,
+    );
+    if !transcript.is_file() {
+        return ResumeRow::skipped(&cand.id, "no_transcript");
+    }
+    if !Path::new(&cand.working_dir).is_dir() {
+        return ResumeRow::skipped(&cand.id, "working_dir_missing");
+    }
+    let gate = match crate::coord_drain_state::drain_gate_for_work(
+        SpawnOrigin::Respawn,
+        &format!("resume:{}", cand.id),
+    ) {
+        DrainGate::Allow => DrainGate::Allow,
+        deferred => deferred,
+    };
+    // A launchable ABSOLUTE `claude` must resolve (retried, never the bare
+    // name) BEFORE `admit` consumes a cap slot, so a CLI that stays missing
+    // spends no budget and the id is a pre-spawn skip. The first spawn uses
+    // this path; each retry resolves again.
+    let first_bin = match crate::claude_cli_spawn::resolve_resume_claude_bin(
+        &crate::claude_cli_spawn::RETRY_DELAYS,
+    )
+    .await
+    {
+        Ok(bin) => bin,
+        Err(e) => return ResumeRow::skipped(&cand.id, e),
+    };
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    if let Err(why) = admit(gate, || {
+        crate::terminal::account_migration::migration_cap_permits(&cand.id, now_ms)
+    }) {
+        return ResumeRow::skipped(&cand.id, why);
+    }
+
+    // An operator resume is not a continuation. Drop the closed row's gate
+    // identity when its outcome is already owned: bound by this process, or
+    // past D2's decision (reported by the close observer, or owned by the
+    // process that bound it). Otherwise `record_open`'s sticky merge carries it
+    // into the reopened row, and the next non-restorable close posts a
+    // duplicate `runner_restart` report. An unreported gate is kept, so a
+    // spawn that fails below loses nothing.
+    if store.release_gate_identity(
+        &cand.id,
+        crate::session::tracking_health::primary_boot_unix_millis_or_init(),
+    ) {
+        info!(id = %cand.id, "resume_door: released the closed row's settled gate identity");
+    }
+    // Spawn, then PROVE the resumed CLI alive (running and painting) before
+    // the process read below — a child that exits before painting is retried,
+    // and when every attempt dies the dead pane is closed and the id reported
+    // failed, never resumed.
+    let mut effects = DoorRespawn {
+        first_bin: Some(first_bin),
+        app: app.clone(),
+        tm: tm.clone(),
+        registry: registry.clone(),
+        cand: cand.clone(),
+    };
+    let outcome = crate::terminal::respawn_liveness::confirm_respawn(
+        &mut effects,
+        store,
+        None,
+        crate::terminal::respawn_liveness::MAX_RESPAWN_ATTEMPTS,
+    )
+    .await;
+    let terminal_id = match proven_terminal(&cand.id, outcome) {
+        Ok(terminal_id) => terminal_id,
+        Err(row) => return *row,
+    };
+    match verify(tm, &cand, &terminal_id).await {
+        Ok(ev) => ResumeRow::resumed(&cand.id, ev),
+        Err(reason) => ResumeRow::failed(
+            &cand.id,
+            reason,
+            Some(ProcessEvidence {
+                terminal_id,
+                pid: None,
+                cmdline: None,
+                cwd: None,
+                claude_config_dir: None,
+            }),
+        ),
+    }
+}
+
+/// Pure: the terminal a proven respawn landed on, or the id's `failed` row.
+/// Only [`RespawnOutcome::Alive`] proceeds to the process read; a death is
+/// `failed(respawn-died: …)`, never `resumed`.
+fn proven_terminal(
+    id: &str,
+    outcome: crate::terminal::respawn_liveness::RespawnOutcome,
+) -> Result<String, Box<ResumeRow>> {
+    use crate::terminal::respawn_liveness::RespawnOutcome;
+    match outcome {
+        RespawnOutcome::Alive { terminal_id, .. } => Ok(terminal_id),
+        RespawnOutcome::NotSpawned(e) => {
+            Err(Box::new(ResumeRow::failed(id, format!("spawn: {e}"), None)))
+        }
+        // Only a migration (which has an old pane) rolls back; never here.
+        RespawnOutcome::UnconfirmedRolledBack { .. } => Err(Box::new(ResumeRow::failed(
+            id,
+            "resumed_cli_never_painted",
+            None,
+        ))),
+        // The user closed the pane while it was being proven: their answer,
+        // not a failure to retry.
+        // An old-pane close is a migration's only (`old: None` here), so the
+        // second arm never fires; it reads the same as a user close.
+        RespawnOutcome::ClosedByUser { .. } | RespawnOutcome::OldPaneClosed { .. } => {
+            Err(Box::new(ResumeRow::failed(id, "closed_by_user", None)))
+        }
+        RespawnOutcome::Died {
+            exit_code,
+            attempts,
+            retry_spawn_error,
+        } => Err(Box::new(ResumeRow::failed(
+            id,
+            RespawnOutcome::died_detail(exit_code, attempts, retry_spawn_error.as_deref()),
+            None,
+        ))),
+        // The pane is LEFT RUNNING (it keeps the row): a caller must not read
+        // this as "nothing running".
+        RespawnOutcome::Unconfirmed { terminal_id } => Err(Box::new(ResumeRow::failed(
+            id,
+            "respawn-unconfirmed: running, never painted",
+            Some(ProcessEvidence {
+                terminal_id,
+                pid: None,
+                cmdline: None,
+                cwd: None,
+                claude_config_dir: None,
+            }),
+        ))),
+    }
+}
+
+/// The door's side of
+/// [`crate::terminal::respawn_liveness::RespawnEffects`]: one resumed pane under
+/// the row's own account. Its PTY spawn runs inline on the async worker, like
+/// every other respawn caller's; only the model sniff goes to the blocking pool.
+struct DoorRespawn {
+    /// The binary resolved before the cap slot was spent, for the first spawn.
+    first_bin: Option<String>,
+    app: tauri::AppHandle,
+    tm: Arc<TerminalManager>,
+    registry: Arc<SessionRegistry>,
+    cand: Candidate,
+}
+
+impl crate::terminal::respawn_liveness::RespawnEffects for DoorRespawn {
+    fn claude_session_id(&self) -> &str {
+        &self.cand.id
+    }
+
+    async fn spawn_next(&mut self) -> Result<String, String> {
+        // The async pre-step: the ABSOLUTE binary, retried, never bare — the
+        // one resolved before the cap check for the first spawn.
+        let claude_bin = match self.first_bin.take() {
+            Some(bin) => bin,
+            None => {
+                crate::claude_cli_spawn::resolve_resume_claude_bin(
+                    &crate::claude_cli_spawn::RETRY_DELAYS,
+                )
+                .await?
+            }
+        };
+        let cand = &self.cand;
+        // Model is sniffed off the row's transcript. The read is blocking
+        // I/O, so it goes to the blocking pool; the spawn below does not.
+        let model = crate::terminal::account_migration::sniff_transcript_model(
+            crate::terminal::transcript::session_transcript_path(
+                Path::new(&cand.config_dir),
+                &cand.working_dir,
+                &cand.id,
+            ),
+        )
+        .await;
+        // Whose policy body the respawn's system-prompt file carries: the
+        // tenant a session in its working dir resolves to, awaited HERE because
+        // the spawn seam below is synchronous (plan
+        // `2026-11-13-runner-policy-injection-uses-the-device-default-tenant-not-the-sessions`
+        // Design §6). Resolved per attempt: a retry spawns afresh.
+        let policy_tenant =
+            crate::mcp::policy_tenant::new_session_policy_tenant(Path::new(&cand.working_dir))
+                .await;
+        // The seam is synchronous and runs here, on the async worker, NOT on
+        // the blocking pool, exactly as the migration's and the respawn
+        // receiver's `spawn_next` do: a spawn handed to `spawn_blocking` keeps
+        // running when this future is cancelled (task abort, shutdown), and
+        // would create a pane, and re-key the row onto it, that the respawn's
+        // close hold never learns about. Inline, a cancel lands before or after
+        // the spawn, never inside it.
+        crate::terminal::account_migration::spawn_resumed_pane(
+            &self.app,
+            &self.tm,
+            &self.registry,
+            crate::terminal::account_migration::ResumeSpawn {
+                claude_bin,
+                claude_session_id: &cand.id,
+                working_dir: &cand.working_dir,
+                model,
+                config_dir: &cand.config_dir,
+                title: cand.title.clone(),
+                page_id: cand.page_id.clone(),
+                zone_index: cand.zone_index,
+                work_unit_slug: None,
+                correlation_topic: None,
+                intent_repo: None,
+                coord_lineage: Some(crate::commands::terminal::CoordSessionLineage {
+                    parent_session_id: None,
+                    claude_code_session_id: Some(cand.id.clone()),
+                }),
+                // Creates a new process: respect the spawn-time resource
+                // floor like every other autonomous spawn.
+                resource_override: false,
+                // The door passes no gate. A settled gate was released
+                // above. A prior-generation gate that nothing has reported
+                // yet stays on the row. D2 reports it when the reopened row
+                // next closes non-restorably, or this process's exit hook
+                // reports it if `record_pinned_session_open` adopts the
+                // reopen under D3.
+                gate_identity: None,
+                origin: crate::coord_drain_state::SpawnOrigin::BootResume,
+                policy_tenant,
+            },
+        )
+        .map(|(terminal_id, _coord_id)| terminal_id)
+    }
+
+    async fn await_liveness(
+        &mut self,
+        terminal_id: &str,
+    ) -> crate::terminal::respawn_liveness::LivenessVerdict {
+        crate::terminal::respawn_liveness::await_resumed_cli(
+            &self.tm,
+            terminal_id,
+            crate::terminal::respawn_liveness::RESUME_LIVENESS_DEADLINE,
+        )
+        .await
+    }
+
+    async fn pause_before_retry(&mut self, retry: usize) {
+        tokio::time::sleep(crate::terminal::respawn_liveness::retry_delay(retry)).await;
+    }
+
+    fn panes(&self) -> std::sync::Arc<dyn crate::terminal::respawn_liveness::PaneOps> {
+        std::sync::Arc::new(crate::terminal::respawn_liveness::ManagerPanes(
+            std::sync::Arc::clone(&self.tm),
+        ))
+    }
+}
+
+fn tally(generation: Option<String>, requested: usize, results: Vec<ResumeRow>) -> ResumeReport {
+    let n = |o: &str| results.iter().filter(|r| r.outcome == o).count();
+    ResumeReport {
+        generation,
+        generation_applied: false,
+        requested,
+        resumed: n("resumed"),
+        failed: n("failed"),
+        skipped: n("skipped"),
+        results,
+    }
+}
+
+/// Run the batch to completion, one id at a time. Spawned DETACHED by the
+/// handler: it owns everything it needs and is not tied to the request future.
+async fn run_batch(
+    app: tauri::AppHandle,
+    tm: Arc<TerminalManager>,
+    registry: Arc<SessionRegistry>,
+    store: Arc<SessionLifecycleStore>,
+    ids: Vec<String>,
+) -> Vec<ResumeRow> {
+    let mut results = Vec::new();
+    for id in &ids {
+        let row = match classify(id, store.get(id).as_ref()) {
+            Err(why) => ResumeRow::skipped(id, why),
+            Ok(cand) => resume_one(&app, &tm, &registry, &store, cand).await,
+        };
+        info!(id = %row.id, verdict = %row.verdict, "resume_door: verdict");
+        results.push(row);
+    }
+    results
+}
+
+/// `true` when the `Content-Type` header names JSON (`application/json`, with
+/// or without parameters, any case, or a `+json` suffix type).
+fn is_json_content_type(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            let essence = v
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            essence == "application/json" || essence.ends_with("+json")
+        })
+        .unwrap_or(false)
+}
+
+async fn post_sessions_resume(
+    State(state): State<Arc<ApiState>>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Result<Json<ApiResponse<ResumeReport>>, (axum::http::StatusCode, Json<ApiResponse<()>>)> {
+    use axum::http::StatusCode;
+    use tauri::Manager;
+
+    if !is_json_content_type(&headers) {
+        return Err((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            Json(api_error(
+                "Content-Type must be application/json — NOTHING was resumed".to_string(),
+            )),
+        ));
+    }
+    let req: ResumeRequest = serde_json::from_slice(&body).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(api_error(format!(
+                "body must be {{ids | all: true, generation?}}: {e}"
+            ))),
+        )
+    })?;
+    let scope = req
+        .scope()
+        .map_err(|why| (StatusCode::BAD_REQUEST, Json(api_error(why))))?;
+    if let Scope::Ids(ids) = &scope {
+        if ids.len() > MAX_IDS {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(api_error(format!("at most {MAX_IDS} ids per call"))),
+            ));
+        }
+    }
+    let unavailable = |what: &str| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(api_error(format!(
+                "{what} not available — NOTHING was resumed"
+            ))),
+        )
+    };
+    let store = state
+        .app_handle
+        .try_state::<Arc<SessionLifecycleStore>>()
+        .map(|s| s.inner().clone())
+        .ok_or_else(|| unavailable("lifecycle store"))?;
+    let tm = state
+        .app_handle
+        .try_state::<Arc<TerminalManager>>()
+        .map(|s| s.inner().clone())
+        .ok_or_else(|| unavailable("terminal manager"))?;
+    let registry = state
+        .app_handle
+        .try_state::<Arc<SessionRegistry>>()
+        .map(|s| s.inner().clone())
+        .ok_or_else(|| unavailable("session registry"))?;
+
+    let mut ids = select_ids(&scope, &store.all_records());
+    if ids.len() > MAX_IDS {
+        warn!(
+            n = ids.len(),
+            "resume_door: more unfinished sessions than one call takes; acting on the first {MAX_IDS}"
+        );
+        ids.truncate(MAX_IDS);
+    }
+    info!(
+        requested = ids.len(),
+        generation = ?req.generation,
+        "resume_door: resuming closed sessions"
+    );
+
+    let requested = ids.len();
+    // Detached: a caller that hangs up mid-batch must not cancel the ids still
+    // to come (nor orphan a spawn between its start and its verification).
+    // Every id's verdict is logged by `run_batch` whether or not anyone is
+    // still waiting for the response.
+    let batch = tokio::spawn(run_batch(
+        state.app_handle.clone(),
+        tm,
+        registry,
+        store,
+        ids,
+    ));
+    let results = batch.await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!(
+                "resume batch task failed ({e}) — see the per-id verdicts in the runner log"
+            ))),
+        )
+    })?;
+    Ok(Json(ApiResponse::success(tally(
+        req.generation,
+        requested,
+        results,
+    ))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::coord_drain_state::DeferClass;
+
+    const ID: &str = "0b9f6c1e-1111-4222-8333-444455556666";
+
+    fn rec(state: &str) -> TerminalSessionRecord {
+        TerminalSessionRecord {
+            claude_session_id: ID.to_string(),
+            config_dir: Some("/cfg".to_string()),
+            working_dir: Some("/work".to_string()),
+            page_id: "default".to_string(),
+            zone_index: 2,
+            title: None,
+            terminal_id: "t".to_string(),
+            opened_at: 0,
+            last_seen_at: 0,
+            state: state.to_string(),
+            closed_at: Some(5),
+            close_reason: None,
+            provider: super::super::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
+            origin: None,
+            restore_pending_at: None,
+            awaiting_account_since: None,
+            confirmed_at: None,
+            handle: None,
+            account_label: None,
+            account_wrapper: None,
+            session_name: None,
+            name_source: None,
+            tenant_id: None,
+            task_run_id: None,
+            bypass_permissions: None,
+            restored_from_boot_at: None,
+            restore_tier: None,
+            finished_at: None,
+            wind_down_outcome: None,
+            wind_down_at: None,
+            wind_down_arm: None,
+            finish_reason: None,
+            finish_synced: false,
+            finish_coord_session_id: None,
+            finish_coord_readdressed: false,
+            spawn_device_default: None,
+            adopted_from: None,
+            last_session_start_at: None,
+            gate_id: None,
+            gate_consuming_device_id: None,
+            gate_bound_boot_ms: None,
+        }
+    }
+
+    fn reason(r: Result<Candidate, String>) -> String {
+        r.expect_err("must be skipped")
+    }
+
+    #[test]
+    fn a_declared_gateway_refuses_the_resume_with_a_reason() {
+        assert_eq!(gateway_refusal(false), None);
+        let why = gateway_refusal(true).expect("refused");
+        assert!(why.starts_with("model_gateway: "), "{why}");
+        assert!(why.contains("transcript does not exist"), "{why}");
+    }
+
+    /// Wiring: the live reader follows the gateway state (a recorded gateway
+    /// with no declaration reads UNKNOWN, which also refuses).
+    #[test]
+    fn the_live_gateway_state_reaches_the_resume_refusal() {
+        let _amb = crate::test_env::isolated_ambient();
+        assert_eq!(live_gateway_refusal(), None);
+        let g = crate::model_gateway::ModelGatewaySettings {
+            base_url: Some("https://resume-gw.example.com".to_string()),
+            api_key_helper: Some("echo resume-key".to_string()),
+            ..Default::default()
+        }
+        .resolve()
+        .unwrap()
+        .unwrap();
+        crate::model_gateway::write_marker_at(&crate::model_gateway::gateway_dir().unwrap(), &g)
+            .unwrap();
+        assert!(live_gateway_refusal().is_some());
+    }
+
+    #[test]
+    fn classify_names_every_skip_reason() {
+        assert_eq!(
+            reason(classify("bad id!", Some(&rec("closed")))),
+            "invalid_id"
+        );
+        assert_eq!(reason(classify(ID, None)), "not_found");
+        assert_eq!(reason(classify(ID, Some(&rec("open")))), "not_closed");
+        let mut finished = rec("closed");
+        finished.finished_at = Some(9);
+        assert_eq!(reason(classify(ID, Some(&finished))), "finished");
+        let mut other = rec("closed");
+        other.provider = "gemini".to_string();
+        assert_eq!(reason(classify(ID, Some(&other))), "provider_gemini");
+        let mut nocfg = rec("closed");
+        nocfg.config_dir = Some("  ".to_string());
+        assert_eq!(reason(classify(ID, Some(&nocfg))), "no_config_dir");
+        let mut nowd = rec("closed");
+        nowd.working_dir = None;
+        assert_eq!(reason(classify(ID, Some(&nowd))), "no_working_dir");
+        let ok = classify(ID, Some(&rec("closed"))).unwrap();
+        assert_eq!((ok.config_dir.as_str(), ok.zone_index), ("/cfg", 2));
+    }
+
+    #[test]
+    fn select_ids_defaults_to_closed_unfinished_newest_first_and_dedups_explicit() {
+        let mut a = rec("closed");
+        a.claude_session_id = "a".into();
+        a.closed_at = Some(1);
+        let mut b = rec("closed");
+        b.claude_session_id = "b".into();
+        b.closed_at = Some(9);
+        let mut fin = rec("closed");
+        fin.claude_session_id = "fin".into();
+        fin.finished_at = Some(1);
+        let mut open = rec("open");
+        open.claude_session_id = "open".into();
+        let all = [a, b, fin, open];
+        assert_eq!(select_ids(&Scope::All, &all), ["b", "a"]);
+        let explicit = Scope::Ids(vec![" x ".into(), "x".into(), "y".into()]);
+        assert_eq!(select_ids(&explicit, &all), ["x", "y"]);
+    }
+
+    fn req(json: serde_json::Value) -> ResumeRequest {
+        serde_json::from_value(json).expect("decode")
+    }
+
+    #[test]
+    fn an_empty_or_bare_request_never_means_all() {
+        for bare in [
+            serde_json::json!({}),
+            serde_json::json!({"generation": "g"}),
+            serde_json::json!({"all": false}),
+            serde_json::json!({"ids": []}),
+            serde_json::json!({"ids": ["  "]}),
+        ] {
+            assert!(
+                req(bare.clone()).scope().is_err(),
+                "{bare} must be refused, not widened to all"
+            );
+        }
+        assert_eq!(
+            req(serde_json::json!({"all": true})).scope(),
+            Ok(Scope::All)
+        );
+        assert_eq!(
+            req(serde_json::json!({"ids": ["a"]})).scope(),
+            Ok(Scope::Ids(vec!["a".into()]))
+        );
+        // Ambiguity is refused too.
+        assert!(req(serde_json::json!({"ids": ["a"], "all": true}))
+            .scope()
+            .is_err());
+        // An unknown field (a typo of `all`) is a decode error, not a bare body.
+        assert!(serde_json::from_value::<ResumeRequest>(serde_json::json!({"al": true})).is_err());
+    }
+
+    #[test]
+    fn only_a_json_content_type_is_accepted() {
+        use axum::http::{header::CONTENT_TYPE, HeaderMap, HeaderValue};
+        let with = |v: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(CONTENT_TYPE, HeaderValue::from_str(v).unwrap());
+            h
+        };
+        assert!(is_json_content_type(&with("application/json")));
+        assert!(is_json_content_type(&with(
+            "Application/JSON; charset=utf-8"
+        )));
+        assert!(!is_json_content_type(&with("text/plain")));
+        assert!(!is_json_content_type(&with(
+            "application/x-www-form-urlencoded"
+        )));
+        assert!(!is_json_content_type(&HeaderMap::new()));
+    }
+
+    #[test]
+    fn a_second_claim_on_one_id_is_refused_until_the_first_is_released() {
+        let id = "in-flight-test-3f2a-resume-door";
+        let first = claim_for_door(id).expect("first claim");
+        assert_eq!(
+            claim_for_door(id).unwrap_err(),
+            "in_flight",
+            "concurrent call must lose"
+        );
+        assert!(claim_for_door("another-id-resume-door").is_ok());
+        drop(first);
+        assert!(claim_for_door(id).is_ok(), "released on drop");
+    }
+
+    /// A resume-door call naming a session an account migration is moving is
+    /// refused, naming the holder — one mover per Claude session (plan
+    /// 2026-10-20-account-migration-respawn-dies-during-cli-reinstall-churn,
+    /// Phase 4).
+    #[test]
+    fn a_door_call_for_a_migrating_session_is_refused_naming_the_mover() {
+        let id = "in-flight-test-door-vs-migration";
+        let migration =
+            super::super::in_flight::SessionInFlight::claim(id, "account-migration").expect("free");
+        assert_eq!(
+            claim_for_door(id).unwrap_err(),
+            "in_flight(account-migration)"
+        );
+        drop(migration);
+        assert!(claim_for_door(id).is_ok());
+    }
+
+    /// The door reports a respawn whose every attempt died as `failed`, with
+    /// the typed reason — never `resumed` — and only `Alive` reaches the
+    /// process read.
+    #[test]
+    fn the_door_reports_failure_on_died_and_proceeds_only_on_alive() {
+        use crate::terminal::respawn_liveness::RespawnOutcome;
+        let died = proven_terminal(
+            ID,
+            RespawnOutcome::Died {
+                exit_code: Some(127),
+                attempts: 3,
+                retry_spawn_error: None,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(died.outcome, "failed");
+        assert_eq!(
+            died.verdict,
+            "failed(respawn-died: exit 127 after 3 attempts)"
+        );
+        let retry_unspawnable = proven_terminal(
+            ID,
+            RespawnOutcome::Died {
+                exit_code: Some(127),
+                attempts: 3,
+                retry_spawn_error: Some("claude not found".into()),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            retry_unspawnable.reason.as_deref(),
+            Some("respawn-died: exit 127 after 3 attempts; last retry could not spawn: claude not found"),
+            "a retry that never spawned must be named, not reported as a third death"
+        );
+        let unconfirmed = proven_terminal(
+            ID,
+            RespawnOutcome::Unconfirmed {
+                terminal_id: "t2".into(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            unconfirmed.reason.as_deref(),
+            Some("respawn-unconfirmed: running, never painted"),
+            "the pane is left running, and the reason must say so"
+        );
+        assert_eq!(
+            proven_terminal(
+                ID,
+                RespawnOutcome::Alive {
+                    terminal_id: "t3".into(),
+                    attempts: 2
+                }
+            )
+            .unwrap(),
+            "t3"
+        );
+    }
+
+    #[test]
+    fn a_live_claude_on_the_id_is_found_by_its_cmdline() {
+        let procs = vec![
+            (
+                7,
+                "/bin/claude --resume 11111111-1111-4111-8111-111111111111".to_string(),
+            ),
+            (9, format!("/bin/claude --session-id {ID}")),
+        ];
+        assert_eq!(holder_of(&procs, ID), Some(9));
+        assert_eq!(holder_of(&procs[..1], ID), None);
+        assert_eq!(holder_of(&[], ID), None);
+    }
+
+    /// W-A: the fork guard (`live_holder`) REFUSES when the command-line read
+    /// is UNKNOWN — it must not read "could not read the command lines" as
+    /// "nobody holds this session" and let a second `claude --resume` in. A
+    /// read that answered decides as before, including an empty answer.
+    #[test]
+    fn resume_door_live_holder_refuses_when_command_lines_are_unreadable() {
+        assert_eq!(
+            holder_from_command_lines(None, ID),
+            Err("process_table_unreadable".to_string()),
+            "an UNKNOWN command-line read refuses"
+        );
+        let read = std::collections::HashMap::from([(9, format!("/bin/claude --resume {ID}"))]);
+        assert_eq!(holder_from_command_lines(Some(read), ID), Ok(Some(9)));
+        assert_eq!(
+            holder_from_command_lines(Some(std::collections::HashMap::new()), ID),
+            Ok(None),
+            "a read that answered with no holder lets the resume through"
+        );
+    }
+
+    #[test]
+    fn path_case_folds_only_where_the_filesystem_does() {
+        assert!(same_path_with("/Work/Proj", "/work/proj", true));
+        assert!(!same_path_with("/Work/Proj", "/work/proj", false));
+        assert!(same_path_with("/work/proj/", "/work/proj", false));
+        assert_eq!(
+            same_path("/Work/Proj", "/work/proj"),
+            cfg!(any(windows, target_os = "macos"))
+        );
+    }
+
+    #[test]
+    fn drain_defers_without_charging_the_cap() {
+        let mut asked = false;
+        let gate = DrainGate::Defer {
+            reason: "device drained".into(),
+            class: DeferClass::Drained,
+        };
+        let r = admit(gate, || {
+            asked = true;
+            true
+        });
+        assert_eq!(r, Err("drain: device drained".to_string()));
+        assert!(!asked, "a deferred attempt must not consume a budget slot");
+    }
+
+    #[test]
+    fn the_cap_admits_three_then_refuses_the_fourth() {
+        let id = "cap-test-1b2c3d4e-resume-door";
+        let now = chrono::Utc::now().timestamp_millis();
+        let permits = || crate::terminal::account_migration::migration_cap_permits(id, now);
+        for _ in 0..crate::terminal::account_migration::MIGRATION_CAP {
+            assert_eq!(admit(DrainGate::Allow, permits), Ok(()));
+        }
+        assert_eq!(
+            admit(DrainGate::Allow, permits),
+            Err("cap_reached".to_string())
+        );
+    }
+
+    fn cand() -> Candidate {
+        classify(ID, Some(&rec("closed"))).unwrap()
+    }
+
+    fn proc(cmd: &str, cwd: Option<&str>, cfg: Option<&str>) -> ClaudeProc {
+        ClaudeProc {
+            pid: 42,
+            cmdline: cmd.to_string(),
+            cwd: cwd.map(String::from),
+            config_dir: cfg.map(String::from),
+        }
+    }
+
+    /// Nit 2: when EVERY poll's table is UNKNOWN, `verify` says it could not
+    /// look (`process_table_unreadable`), not that it looked and found nothing.
+    /// One readable poll is enough to have looked.
+    #[tokio::test]
+    async fn resume_door_verify_reports_an_unreadable_table_not_an_absent_process() {
+        let c = cand();
+        let window = Duration::from_millis(40);
+        let poll = Duration::from_millis(5);
+
+        let every_poll_unknown = verify_with(
+            &c,
+            "t",
+            window,
+            poll,
+            || true,
+            || std::future::ready(Err(PROCESS_TABLE_UNREADABLE)),
+        )
+        .await;
+        assert_eq!(
+            every_poll_unknown,
+            Err("process_table_unreadable".to_string())
+        );
+
+        let read_and_empty = verify_with(
+            &c,
+            "t",
+            window,
+            poll,
+            || true,
+            || std::future::ready(Ok(Vec::new())),
+        )
+        .await;
+        assert_eq!(
+            read_and_empty,
+            Err("no_claude_resume_process_observed".to_string())
+        );
+
+        let mut polls = 0;
+        let one_readable = verify_with(
+            &c,
+            "t",
+            window,
+            poll,
+            || true,
+            || {
+                polls += 1;
+                std::future::ready(if polls == 2 {
+                    Ok(Vec::new())
+                } else {
+                    Err(PROCESS_TABLE_UNREADABLE)
+                })
+            },
+        )
+        .await;
+        assert_eq!(
+            one_readable,
+            Err("no_claude_resume_process_observed".to_string())
+        );
+
+        let good = format!("/bin/claude --resume {ID}");
+        let found = verify_with(
+            &c,
+            "t",
+            window,
+            poll,
+            || true,
+            || std::future::ready(Ok(vec![proc(&good, None, None)])),
+        )
+        .await;
+        assert_eq!(found.map(|ev| ev.pid), Ok(Some(42)));
+
+        // Every poll UNDECIDED (a `node` the session registry could not
+        // settle may be the resumed `claude`): reported as such, never as an
+        // unreadable table and never as "not observed".
+        let every_poll_undecided = verify_with(
+            &c,
+            "t",
+            window,
+            poll,
+            || true,
+            || std::future::ready(Err(REGISTRY_UNDECIDED)),
+        )
+        .await;
+        assert_eq!(every_poll_undecided, Err("registry_undecided".to_string()));
+    }
+
+    #[test]
+    fn judge_requires_exactly_one_matching_resume_process() {
+        let good = format!("/bin/claude --permission-mode bypassPermissions --resume {ID}");
+        // Not there yet: keep polling.
+        assert_eq!(judge(&[], &cand(), "t").unwrap_err(), None);
+        let other = "/bin/claude --resume 11111111-1111-4111-8111-111111111111";
+        assert_eq!(
+            judge(&[proc(other, None, None)], &cand(), "t").unwrap_err(),
+            None
+        );
+        // One match, unreadable cwd/config: accepted, fields stay null.
+        let ev = judge(&[proc(&good, None, None)], &cand(), "t").unwrap();
+        assert_eq!(
+            (ev.pid, ev.cwd, ev.claude_config_dir),
+            (Some(42), None, None)
+        );
+        // Two matches: a double spawn is a failure, not a success.
+        let two = [proc(&good, None, None), proc(&good, None, None)];
+        assert_eq!(
+            judge(&two, &cand(), "t").unwrap_err(),
+            Some("multiple_resume_processes(2)".to_string())
+        );
+    }
+
+    #[test]
+    fn judge_fails_on_a_wrong_cwd_or_config_dir_but_not_on_unknown() {
+        let good = format!("claude --resume {ID}");
+        let bad_cwd = judge(&[proc(&good, Some("/elsewhere"), None)], &cand(), "t");
+        assert!(bad_cwd.unwrap_err().unwrap().starts_with("cwd_mismatch"));
+        let bad_cfg = judge(&[proc(&good, Some("/work"), Some("/other"))], &cand(), "t");
+        assert!(bad_cfg
+            .unwrap_err()
+            .unwrap()
+            .starts_with("config_dir_mismatch"));
+        assert!(judge(&[proc(&good, Some("/work/"), Some("/cfg"))], &cand(), "t").is_ok());
+    }
+
+    #[test]
+    fn verdict_strings_use_the_plan_spelling() {
+        assert_eq!(
+            ResumeRow::skipped("i", "cap_reached").verdict,
+            "skipped(cap_reached)"
+        );
+        assert_eq!(ResumeRow::failed("i", "boom", None).verdict, "failed(boom)");
+        let report = tally(
+            Some("g1".into()),
+            3,
+            vec![
+                ResumeRow::skipped("a", "x"),
+                ResumeRow::failed("b", "y", None),
+                ResumeRow::skipped("c", "z"),
+            ],
+        );
+        assert_eq!((report.resumed, report.failed, report.skipped), (0, 1, 2));
+        assert!(!report.generation_applied);
+    }
+
+    /// Shell 5 → `node` 50 (an npm-installed `claude`, `node … cli.js`).
+    fn npm_pane_table() -> crate::process_capture::process_tree::ProcessSnapshot {
+        let mut snap = crate::process_capture::process_tree::ProcessSnapshot {
+            stale: false,
+            ..Default::default()
+        };
+        snap.parent_map.insert(1, vec![5]);
+        snap.parent_map.insert(5, vec![50]);
+        for (pid, name, started) in [(5, "bash", 1_000), (50, "node", 1_050)] {
+            snap.names.insert(pid, name.to_string());
+            snap.creation_times.insert(pid, started);
+        }
+        snap
+    }
+
+    fn npm_look(
+        witness: crate::terminal::graceful_exit::RegistryWitness,
+    ) -> crate::terminal::graceful_exit::PaneLook {
+        crate::terminal::graceful_exit::PaneLook::over_whole_table(npm_pane_table(), witness)
+    }
+
+    /// The resume verifier sees a resumed npm `claude` the registry names.
+    /// Partner: drop the witness and the pane reads claude-free (a resume
+    /// that happened would be disproven). Unsettled, the poll is skipped
+    /// (`None`), never an empty list.
+    #[test]
+    fn a_resumed_npm_claude_is_seen_and_an_unsettled_poll_is_skipped() {
+        use crate::terminal::graceful_exit::RegistryWitness;
+        assert_eq!(
+            claude_pids_under(&npm_look(RegistryWitness::naming(&[50])), 5),
+            Ok(vec![50])
+        );
+        assert_eq!(
+            claude_pids_under(&npm_look(RegistryWitness::naming(&[])), 5),
+            Ok(vec![])
+        );
+        assert_eq!(
+            claude_pids_under(&npm_look(RegistryWitness::unreadable("test")), 5),
+            Err(REGISTRY_UNDECIDED)
+        );
+    }
+}

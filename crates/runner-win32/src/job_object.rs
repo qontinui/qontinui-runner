@@ -63,7 +63,7 @@ static JOB_OBJECT: OnceLock<JobObjectHandle> = OnceLock::new();
 ///
 /// Must be called once at application startup (before spawning any child processes).
 /// If initialization fails, child processes will not be auto-killed on crash,
-/// but the explicit taskkill in the shutdown handler still provides cleanup.
+/// but the explicit tree kill in the shutdown handler still provides cleanup.
 pub fn init_job_object() {
     JOB_OBJECT.get_or_init(|| {
         unsafe {
@@ -107,7 +107,7 @@ pub fn init_job_object() {
 /// Assign a child process to the global Job Object.
 ///
 /// When the runner exits (even via crash), Windows will automatically kill
-/// all assigned processes. This is a safety net — the explicit taskkill
+/// all assigned processes. This is a safety net — the explicit tree kill
 /// in the shutdown handler provides the primary cleanup.
 ///
 /// # Safety

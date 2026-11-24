@@ -19,7 +19,9 @@ use tracing::{error, info};
 
 use super::compartments::BridgeCompartment;
 use super::CommandResponse;
-use crate::executor::{is_default_bridge_running_compartment, with_default_bridge_compartment};
+use crate::executor::{
+    is_default_bridge_running_compartment, run_bridge_blocking, with_default_bridge_compartment,
+};
 
 /// Configuration for interaction recording
 #[derive(Debug, Serialize, Deserialize)]
@@ -54,17 +56,30 @@ pub struct InteractionRecordingStatus {
 /// # Returns
 /// * `Ok(CommandResponse)` - Success with session_id and output_dir
 /// * `Err(String)` - Error if recording fails to start
+///
+/// The three commands here are `async` with a blocking body: each waits on the
+/// bridge, and a sync command would wait on the main thread (plan
+/// `2026-11-04-runner-wedge-detector-reads-a-boot-as-a-wedge-and-never-bound-is-silent`
+/// Phase 3).
 #[tauri::command]
-pub fn start_interaction_recording(
+pub async fn start_interaction_recording(
     config: InteractionRecordingConfig,
-    bridge: State<BridgeCompartment>,
+    bridge: State<'_, BridgeCompartment>,
+) -> Result<CommandResponse, String> {
+    let bridge = bridge.inner().clone();
+    run_bridge_blocking(move || start_interaction_recording_blocking(config, &bridge)).await?
+}
+
+fn start_interaction_recording_blocking(
+    config: InteractionRecordingConfig,
+    bridge: &BridgeCompartment,
 ) -> Result<CommandResponse, String> {
     info!(
         "Starting interaction recording: session_id={:?}, fps={:?}",
         config.session_id, config.fps
     );
 
-    if !is_default_bridge_running_compartment(&bridge) {
+    if !is_default_bridge_running_compartment(bridge) {
         return Err("Python executor is not running. Please start the executor first.".to_string());
     }
 
@@ -74,7 +89,7 @@ pub fn start_interaction_recording(
         "output_dir": config.output_dir,
     });
 
-    with_default_bridge_compartment(&bridge, |bridge| {
+    with_default_bridge_compartment(bridge, |bridge| {
         bridge
             .send_command("start_interaction_recording", Some(params.clone()))
             .map_err(|e| {
@@ -101,16 +116,23 @@ pub fn start_interaction_recording(
 /// * `Ok(CommandResponse)` - Success with file paths and event count
 /// * `Err(String)` - Error if recording fails to stop
 #[tauri::command]
-pub fn stop_interaction_recording(
-    bridge: State<BridgeCompartment>,
+pub async fn stop_interaction_recording(
+    bridge: State<'_, BridgeCompartment>,
+) -> Result<CommandResponse, String> {
+    let bridge = bridge.inner().clone();
+    run_bridge_blocking(move || stop_interaction_recording_blocking(&bridge)).await?
+}
+
+fn stop_interaction_recording_blocking(
+    bridge: &BridgeCompartment,
 ) -> Result<CommandResponse, String> {
     info!("Stopping interaction recording");
 
-    if !is_default_bridge_running_compartment(&bridge) {
+    if !is_default_bridge_running_compartment(bridge) {
         return Err("Python executor is not running. Please start the executor first.".to_string());
     }
 
-    with_default_bridge_compartment(&bridge, |bridge| {
+    with_default_bridge_compartment(bridge, |bridge| {
         bridge
             .send_command("stop_interaction_recording", None)
             .map_err(|e| {
@@ -137,11 +159,18 @@ pub fn stop_interaction_recording(
 /// * `Ok(CommandResponse)` - Success with status data
 /// * `Err(String)` - Error if status query fails
 #[tauri::command]
-pub fn get_interaction_recording_status(
-    bridge: State<BridgeCompartment>,
+pub async fn get_interaction_recording_status(
+    bridge: State<'_, BridgeCompartment>,
+) -> Result<CommandResponse, String> {
+    let bridge = bridge.inner().clone();
+    run_bridge_blocking(move || get_interaction_recording_status_blocking(&bridge)).await?
+}
+
+fn get_interaction_recording_status_blocking(
+    bridge: &BridgeCompartment,
 ) -> Result<CommandResponse, String> {
     // Return not recording if executor is not running
-    if !is_default_bridge_running_compartment(&bridge) {
+    if !is_default_bridge_running_compartment(bridge) {
         return Ok(CommandResponse {
             success: true,
             message: None,
@@ -151,7 +180,7 @@ pub fn get_interaction_recording_status(
         });
     }
 
-    with_default_bridge_compartment(&bridge, |bridge| {
+    with_default_bridge_compartment(bridge, |bridge| {
         bridge
             .send_command("get_interaction_recording_status", None)
             .map_err(|e| {

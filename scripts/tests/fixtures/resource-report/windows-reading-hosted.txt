@@ -1,0 +1,7 @@
+phys_mem_mb=16378
+commit_limit_mb=49146
+peak_commit_mb=48990
+pagefile_alloc_mb=32768
+pagefile_peak_mb=32767
+phys_mem_mb=16380
+commit_limit_mb=49148

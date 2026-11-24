@@ -113,7 +113,10 @@ impl StepHandler for WrapperActionHandler {
         let timeout_secs = step
             .timeout_seconds
             .unwrap_or(DEFAULT_DISPATCH_TIMEOUT_SECS);
+        // Loopback only (this runner's own API): never through a configured
+        // HTTP proxy.
         let client = match reqwest::Client::builder()
+            .no_proxy()
             .timeout(Duration::from_secs(timeout_secs.max(1)))
             .build()
         {

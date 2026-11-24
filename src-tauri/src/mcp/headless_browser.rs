@@ -330,7 +330,8 @@ pub async fn spawn_headless(
     // Prevent child from blocking on stdin
     cmd.stdin(std::process::Stdio::null());
 
-    let child = cmd.spawn().map_err(|e| {
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut child = cmd.spawn().map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             axum::Json(ApiResponse::error(format!(
@@ -383,11 +384,14 @@ pub async fn spawn_headless(
             "spawn_headless: timeout waiting for SDK connection (app_id={}, session={})",
             request.app_id, session_id
         );
-        // Kill the child process since it failed to connect
+        // Kill the child process since it failed to connect.
+        // Root only, as the `taskkill /PID <pid> /F` this replaced (no `/T`),
+        // through the handle the child already holds: no process is created.
+        // Windows only, like the `taskkill` it replaces (off Windows that spawn
+        // failed and nothing was killed — unchanged here, a separate defect).
+        #[cfg(windows)]
         if child.id().is_some() {
-            let _ = crate::process_helpers::no_window("taskkill")
-                .args(["/PID", &pid.to_string(), "/F"])
-                .output();
+            let _ = child.start_kill();
         }
 
         return Err((

@@ -169,6 +169,17 @@ pub struct AdapterMetrics {
     /// record — a secondary/temp runner (it runs no register heartbeat), or a
     /// primary whose heartbeat is not succeeding.
     pub work_unit_writes_withheld_unknown_total: AtomicU64,
+    /// The work-unit write posture the loop decided on its last ARMED tick
+    /// (gauge) — see [`work_unit_write_posture`]. The two counters above say
+    /// how often writes were withheld; only this says whether they are being
+    /// withheld NOW, which is what a surface claiming "work units reach coord"
+    /// has to read.
+    ///
+    /// `None` before the first armed tick, and reset to `None` on every idle
+    /// (tier-off) tick: the posture is decided only when something is scanned,
+    /// so a reading left over from before the tier went off would describe a
+    /// cycle that is no longer running.
+    pub work_unit_write_posture: std::sync::Mutex<Option<WorkUnitWritePosture>>,
 }
 
 /// A point-in-time read of [`AdapterMetrics`].
@@ -197,6 +208,9 @@ pub struct MetricsSnapshot {
     pub seed_errors_total: u64,
     pub work_unit_writes_withheld_total: u64,
     pub work_unit_writes_withheld_unknown_total: u64,
+    /// The last armed tick's posture; `None` before one, or while the tier is
+    /// off — see [`AdapterMetrics::work_unit_write_posture`].
+    pub work_unit_write_posture: Option<WorkUnitWritePosture>,
 }
 
 impl AdapterMetrics {
@@ -237,6 +251,10 @@ impl AdapterMetrics {
             work_unit_writes_withheld_unknown_total: self
                 .work_unit_writes_withheld_unknown_total
                 .load(Ordering::Relaxed),
+            work_unit_write_posture: *self
+                .work_unit_write_posture
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
         }
     }
 }
@@ -443,7 +461,7 @@ impl ScanDivergence {
     }
 
     /// UNKNOWN with a named reason. Used for the failures that happen OUTSIDE
-    /// [`measure_scan_divergence`] — a probe task that could not be joined —
+    /// [`measure_scan_divergence_pinned`] — a probe task that could not be joined —
     /// so those never degrade into silence either.
     pub fn unknown(plans_dir: Option<String>, detail: impl Into<String>) -> Self {
         Self {
@@ -527,7 +545,7 @@ impl ScanDivergence {
     }
 }
 
-/// The four git reads [`measure_scan_divergence`] needs, behind a trait so the
+/// The four git reads [`measure_scan_divergence_pinned`] needs, behind a trait so the
 /// measurement is a pure function of its answers.
 ///
 /// Injected rather than called directly because the interesting cases — no
@@ -708,23 +726,15 @@ pub fn combine_refresh_stamps(
     }
 }
 
-/// Measure the scan source against the ref it should be reading.
+/// Measure the scan source against the ref it should be reading, resolving the
+/// default ref through the cycle's [`CycleRefPin`] — the tick's door, so the
+/// reading's `ref_sha` / `behind` / `ahead` / `ref_age_secs` describe the
+/// commit the cycle's `ref` census is listed at (plan
+/// `2026-10-02-scan-divergence-probe-reads-the-cycle-ref-pin`).
 ///
 /// Pure over `git` and the clock: every branch is reachable from a fake
 /// reader, which is what makes the four states testable without a repo on
-/// disk, and `now_unix` is a parameter so the ref's age is too.
-pub fn measure_scan_divergence(
-    plans_dir: Option<&Path>,
-    git: &dyn GitRefReader,
-    now_unix: i64,
-) -> ScanDivergence {
-    measure_scan_divergence_pinned(plans_dir, git, None, &|| now_unix)
-}
-
-/// [`measure_scan_divergence`] resolving the default ref through the cycle's
-/// [`CycleRefPin`] — the tick's door, so the reading's `ref_sha` / `behind` /
-/// `ahead` / `ref_age_secs` describe the commit the cycle's `ref` census is
-/// listed at (plan `2026-10-02-scan-divergence-probe-reads-the-cycle-ref-pin`).
+/// disk, and the clock is a parameter so the ref's age is too.
 ///
 /// `clock` is read AFTER the pin resolves, never before: on a writing pin the
 /// first resolution performs the cycle's fetch (up to `SCAN_FETCH_TIMEOUT`), and
@@ -752,13 +762,13 @@ pub fn measure_scan_divergence_pinned(
     reading.observed_at(now_unix)
 }
 
-/// The tick's measurement: [`measure_scan_divergence`] plus the reading's
+/// The tick's measurement: [`measure_scan_divergence_pinned`] plus the reading's
 /// plan-library `source_repo` key.
 ///
 /// Run on the blocking pool with the git probes because
 /// [`super::body_push::derive_source_repo`] walks the filesystem for a `.git`
 /// — work that does not belong on the single-worker runtime the scan-root
-/// report is later posted from. Kept out of [`measure_scan_divergence`] so
+/// report is later posted from. Kept out of [`measure_scan_divergence_pinned`] so
 /// that stays pure over its fake reader.
 fn measure_scan_source(
     dir: &Path,
@@ -2744,6 +2754,35 @@ fn record_ref_listing_gaps(
     }
 }
 
+/// Warn about each status-block header (`Area:`, `Initiative-Item:`) the
+/// parser rejected, once per plan per pass, from every loop that pushes work
+/// units: the active reconcile, the archive stamp and the CLI backfill. Not
+/// from the parse, which is pure and which the plan-library body sync runs
+/// over the same files.
+///
+/// Every one of those patches omits a rejected key, so coord keeps the stored
+/// value, which the plan file no longer vouches for. This warning is the only
+/// thing that shows it. Deliberately repeated every pass: the declaration
+/// stays visible until the plan file is fixed.
+fn warn_if_header_rejected(u: &ParsedWorkUnit) {
+    if let Some(why) = &u.area_rejected {
+        tracing::warn!(
+            slug = %u.slug,
+            path = %u.source_path,
+            "plan adapter: status-block `Area:` rejected — {why}; \
+             metadata.area omitted for this plan, so coord keeps any stored value"
+        );
+    }
+    if let Some(why) = &u.initiative_item_rejected {
+        tracing::warn!(
+            slug = %u.slug,
+            path = %u.source_path,
+            "plan adapter: status-block `Initiative-Item:` rejected — {why}; \
+             metadata.initiative_item omitted for this plan, so coord keeps any stored value"
+        );
+    }
+}
+
 /// Push every parsed unit through the edge-trigger + conflict logic, updating
 /// the client-side `last_applied` memory and the shared metrics. Pure of IO
 /// beyond the sink, so it is unit-tested with a fake sink.
@@ -2762,19 +2801,7 @@ pub async fn reconcile_once<S: WorkUnitSink + ?Sized>(
         ..Default::default()
     };
     for u in parsed_units {
-        // A status-block `Area:` the parser rejected: warned here, once per
-        // plan per reconcile pass, and nowhere else — the parse is pure, and
-        // the plan-library body sync parses the same files. The push still
-        // runs, with `metadata.area` omitted. Deliberately repeated every
-        // pass: the declaration stays visible until the plan file is fixed.
-        if let Some(why) = &u.area_rejected {
-            tracing::warn!(
-                slug = %u.slug,
-                path = %u.source_path,
-                "plan adapter: status-block `Area:` rejected — {why}; \
-                 metadata.area omitted for this plan"
-            );
-        }
+        warn_if_header_rejected(u);
         // A push coord has already refused is not re-issued: the request would
         // be byte-identical, so the verdict would be too. Stopping here — rather
         // than merely muting the log — is what makes this a fix and not a mute:
@@ -3266,8 +3293,9 @@ pub struct WorkUnitBackfillSummary {
 ///   would route every unit down `UpsertWithStatus` and bypass the deferral
 ///   entirely — silently overwriting exactly the statuses it protects.
 ///
-/// Dependency edges are deliberately NOT pushed here: `build_metadata` already
-/// carries `depends_on` in the `metadata` JSONB (the documented fallback), and
+/// Dependency edges are deliberately NOT pushed here: the metadata patch
+/// ([`super::metadata::active_dir_patch`]) already carries `depends_on` in the
+/// `metadata` JSONB (the documented fallback), and
 /// the edge table is the reconcile loop's incremental business.
 ///
 /// `scope` is the tenant that owns the corpus being backfilled, resolved once
@@ -3285,6 +3313,7 @@ pub async fn backfill_work_units_once<S: WorkUnitSink + ?Sized>(
         ..Default::default()
     };
     for u in parsed_units {
+        warn_if_header_rejected(u);
         let seed = match sink.current_status(&u.slug, scope).await {
             Ok(s) => s,
             Err(e) => {
@@ -3382,6 +3411,7 @@ pub async fn reconcile_archive_once<S: WorkUnitSink + ?Sized>(
         ..Default::default()
     };
     for u in archived_units {
+        warn_if_header_rejected(u);
         match push_archive_metadata(sink, u, scope).await {
             Ok(()) => {
                 summary.stamped += 1;
@@ -3870,6 +3900,12 @@ impl LoopState {
                 ScanDivergence::not_scanning().observed_at(chrono::Utc::now().timestamp()),
                 metrics,
             );
+            // No posture is decided on an idle tick, so none may stand: see
+            // [`AdapterMetrics::work_unit_write_posture`].
+            *metrics
+                .work_unit_write_posture
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = None;
             // Nothing is scanned — but a device whose plans dir was just
             // cleared must SAY so to the read side, or its last `measured` row
             // keeps being quoted until it ages out. The body sync's library
@@ -3955,6 +3991,10 @@ impl LoopState {
             self.bulk_seeded = false;
         }
         self.last_write_posture = Some(posture);
+        *metrics
+            .work_unit_write_posture
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(posture);
 
         // ONE ref state for this whole cycle (see [`CycleRefPin`]). Created
         // here, after the posture and BEFORE the scan-divergence probe, so the
@@ -5691,6 +5731,20 @@ mod tests {
     use super::*;
     use anyhow::Result;
     use std::sync::Mutex;
+
+    /// [`measure_scan_divergence_pinned`] with no pin and a constant clock —
+    /// the shape most probe tests want. Test-only: since the probe reads the
+    /// cycle's pin (plan
+    /// `2026-10-02-scan-divergence-probe-reads-the-cycle-ref-pin`) production
+    /// has no unpinned caller, and a public unpinned door would invite one
+    /// that re-creates the probe-vs-census commit mismatch.
+    fn measure_scan_divergence(
+        plans_dir: Option<&Path>,
+        git: &dyn GitRefReader,
+        now_unix: i64,
+    ) -> ScanDivergence {
+        measure_scan_divergence_pinned(plans_dir, git, None, &|| now_unix)
+    }
 
     /// W2: [`read_device_binding_count`] fills `local` from
     /// `auth::device_binding_count`, and nothing else observes WHICH auth
@@ -10838,7 +10892,12 @@ Body.
             depends_on,
             area: None,
             area_rejected: None,
+            initiative_item: None,
+            initiative_item_rejected: None,
             phases: vec![],
+            phase_labels: vec![],
+            phases_undeclared: vec![],
+            repos: vec![],
             source_path: format!("plans/{slug}.md"),
             content: String::new(),
         }
@@ -11183,12 +11242,93 @@ Body.
         }
     }
 
+    /// The archive stamp and the CLI backfill omit a rejected `Area:` or
+    /// `Initiative-Item:` exactly as the active reconcile does, so coord keeps
+    /// the stored value, and each must warn as the reconcile does. Each pass
+    /// runs over one unit with both headers rejected and one with both
+    /// accepted, and only the rejected one is warned about, once per header.
+    /// The omission is asserted too, because the warning's claim is only true
+    /// while it holds.
+    #[tokio::test]
+    async fn archive_stamp_and_backfill_warn_once_per_pass_for_a_rejected_header() {
+        use super::super::parser::HeaderRejection;
+        let buf = LogBuf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let bad = ParsedWorkUnit {
+            area_rejected: Some(HeaderRejection::NotKebab("agent_worktree".to_string())),
+            initiative_item_rejected: Some(HeaderRejection::NotKebab("One Screen".to_string())),
+            ..unit("2026-01-01-bad-headers", "draft")
+        };
+        let good = ParsedWorkUnit {
+            area: Some("ci-runners".to_string()),
+            initiative_item: Some("one-screen".to_string()),
+            ..unit("2026-01-01-good-headers", "draft")
+        };
+        let units = vec![bad, good];
+        let warned_lines = |header: &str| {
+            let needle = format!("status-block `{header}:` rejected");
+            let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+            log.lines()
+                .filter(|l| l.contains(&needle))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+
+        let archive_sink = FakeSink::default();
+        let metrics = AdapterMetrics::default();
+        reconcile_archive_once(&units, &archive_sink, &metrics, TenantScope::Unresolved).await;
+        assert_eq!(
+            warned_lines("Area").len(),
+            1,
+            "the archive stamp warns once"
+        );
+        assert_eq!(
+            warned_lines("Initiative-Item").len(),
+            1,
+            "the archive stamp warns once"
+        );
+
+        let backfill_sink = FakeSink::default();
+        backfill_work_units_once(&units, &backfill_sink, TenantScope::Unresolved).await;
+        for (header, value) in [
+            ("Area", "agent_worktree"),
+            ("Initiative-Item", "One Screen"),
+        ] {
+            let warned = warned_lines(header);
+            assert_eq!(warned.len(), 2, "the backfill warns once more: {warned:?}");
+            assert!(warned
+                .iter()
+                .all(|l| l.contains("2026-01-01-bad-headers") && l.contains(value)));
+        }
+
+        for sink in [&archive_sink, &backfill_sink] {
+            let upserts = sink.upserts.lock().unwrap();
+            let patch = upserts
+                .iter()
+                .find(|b| b.slug == "2026-01-01-bad-headers")
+                .and_then(|b| b.metadata_patch.as_ref())
+                .expect("the rejected unit was still pushed");
+            assert!(patch.get("area").is_none(), "area omitted: {patch}");
+            assert!(
+                patch.get("initiative_item").is_none(),
+                "initiative_item omitted: {patch}"
+            );
+        }
+    }
+
     /// A rejected status-block `Area:` is warned by the reconcile — exactly
     /// once per plan per pass — and the push still lands, with `metadata.area`
     /// omitted. A unit with an accepted area is not warned and carries it.
     #[tokio::test]
     async fn reconcile_warns_once_per_pass_for_a_rejected_area() {
-        use super::super::parser::AreaRejection;
+        use super::super::parser::HeaderRejection;
         let buf = LogBuf::default();
         let writer = buf.clone();
         let subscriber = tracing_subscriber::fmt()
@@ -11205,7 +11345,7 @@ Body.
         let mut forb = RetiredSlugs::default();
         let mut forb_deps: HashSet<String> = HashSet::new();
         let bad = ParsedWorkUnit {
-            area_rejected: Some(AreaRejection::NotKebab("agent_worktree".to_string())),
+            area_rejected: Some(HeaderRejection::NotKebab("agent_worktree".to_string())),
             ..unit("2026-01-01-bad-area", "draft")
         };
         let good = ParsedWorkUnit {
@@ -11247,15 +11387,92 @@ Body.
                 .iter()
                 .rev()
                 .find(|b| b.slug == slug)
-                .and_then(|b| b.metadata.clone().or_else(|| b.metadata_patch.clone()))
+                .and_then(|b| b.metadata_patch.clone())
                 .expect("the unit was pushed")
         };
-        // A phase-less plan goes out as a patch, where an undeclared area is
-        // an explicit `null` (RFC 7396 delete) rather than an absent key.
-        assert!(meta_for("2026-01-01-bad-area")
-            .get("area")
-            .is_none_or(|a| a.is_null()));
+        // A rejected `Area:` is OMITTED from the patch (the stored area is
+        // kept); an undeclared one would be an explicit `null` (RFC 7396 delete).
+        assert!(meta_for("2026-01-01-bad-area").get("area").is_none());
         assert_eq!(meta_for("2026-01-01-good-area")["area"], "ci-runners");
+    }
+
+    /// `Initiative-Item:` mirrors `Area:`: a rejected declaration is warned
+    /// once per plan per pass, and the push still lands with
+    /// `metadata.initiative_item` omitted, which the warning says; an accepted
+    /// one is carried.
+    #[tokio::test]
+    async fn reconcile_warns_once_per_pass_for_a_rejected_initiative_item() {
+        use super::super::parser::HeaderRejection;
+        let buf = LogBuf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let sink = FakeSink::default();
+        let metrics = AdapterMetrics::default();
+        let mut mem = HashMap::new();
+        let mut deps = HashMap::new();
+        let mut forb = RetiredSlugs::default();
+        let mut forb_deps: HashSet<String> = HashSet::new();
+        let bad = ParsedWorkUnit {
+            initiative_item_rejected: Some(HeaderRejection::NotKebab("One Screen".to_string())),
+            ..unit("2026-01-01-bad-item", "draft")
+        };
+        let good = ParsedWorkUnit {
+            initiative_item: Some("one-screen".to_string()),
+            ..unit("2026-01-01-good-item", "draft")
+        };
+        let units = vec![bad, good];
+        for _ in 0..2 {
+            reconcile_once(
+                &units,
+                &mut mem,
+                &mut deps,
+                &mut forb,
+                &mut forb_deps,
+                &sink,
+                &metrics,
+                TenantScope::Unresolved,
+            )
+            .await;
+        }
+
+        let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let warned: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains("status-block `Initiative-Item:` rejected"))
+            .collect();
+        assert_eq!(
+            warned.len(),
+            2,
+            "one warning per pass for the one bad plan: {log}"
+        );
+        assert!(warned.iter().all(|l| l.contains("2026-01-01-bad-item")
+            && l.contains("One Screen")
+            && l.contains("metadata.initiative_item omitted")));
+
+        let upserts = sink.upserts.lock().unwrap();
+        let meta_for = |slug: &str| {
+            upserts
+                .iter()
+                .rev()
+                .find(|b| b.slug == slug)
+                .and_then(|b| b.metadata_patch.clone())
+                .expect("the unit was pushed")
+        };
+        // A rejected `Initiative-Item:` is OMITTED from the patch (the stored
+        // value is kept); an undeclared one would be an explicit `null`.
+        assert!(meta_for("2026-01-01-bad-item")
+            .get("initiative_item")
+            .is_none());
+        assert_eq!(
+            meta_for("2026-01-01-good-item")["initiative_item"],
+            "one-screen"
+        );
     }
 
     #[tokio::test]
@@ -12444,10 +12661,7 @@ Body.
             let last = upserts.last().expect("at least one upsert");
             assert_eq!(last.title.as_deref(), Some("Renamed twice"));
             assert_eq!(
-                last.metadata
-                    .as_ref()
-                    .or(last.metadata_patch.as_ref())
-                    .expect("metadata")["source_path"],
+                last.metadata_patch.as_ref().expect("metadata")["source_path"],
                 "plans/archive-candidates/a.md",
                 "a moved plan's provenance must follow it"
             );
@@ -13783,6 +13997,11 @@ Body.
         assert_eq!(snap.work_unit_writes_withheld_total, 2);
         assert_eq!(snap.work_unit_writes_withheld_unknown_total, 0);
         assert_eq!(snap.cycles_total, 2, "a withheld cycle is still a cycle");
+        assert_eq!(
+            snap.work_unit_write_posture,
+            Some(WorkUnitWritePosture::WithheldMultiBound(3)),
+            "the gauge says withheld NOW, not just that it once was"
+        );
         let logged = logs.text();
         assert_eq!(
             logged.matches("bound to 3 tenants").count(),
@@ -13801,6 +14020,19 @@ Body.
             "the active plan and the archive stamp both push when single-bound"
         );
         assert_eq!(metrics.snapshot().work_unit_writes_withheld_total, 0);
+        assert_eq!(
+            metrics.snapshot().work_unit_write_posture,
+            Some(WorkUnitWritePosture::Write)
+        );
+
+        // Tier switched off: no posture is decided, so none may stand.
+        *cell.lock().unwrap() = PathInputs::default();
+        state.tick(&sink, &metrics).await;
+        assert_eq!(
+            metrics.snapshot().work_unit_write_posture,
+            None,
+            "an idle tick clears the posture rather than leaving the last one standing"
+        );
     }
 
     /// **A WITHHELD cycle still LISTS the ref, and still reports both stem
@@ -14801,7 +15033,7 @@ Body.
         assert_eq!(last.slug, "s");
         assert_eq!(last.status, None, "metadata-only: no status on the wire");
         assert!(
-            last.metadata.is_some() || last.metadata_patch.is_some(),
+            last.metadata_patch.is_some(),
             "provenance keeps reaching coord"
         );
         assert_eq!(

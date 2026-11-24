@@ -339,6 +339,7 @@ pub(crate) fn build_inline_child_command(
     // is an infinite silent hang. One shared list, eight seams; see
     // `credential_helper::non_interactive_git_env`.
     crate::credential_helper::apply_non_interactive_git_env_std(&mut cmd);
+    crate::terminal::apply_python_utf8_default_std(&mut cmd);
     crate::terminal::scrub_credential_env_std(&mut cmd);
 
     cmd
@@ -383,6 +384,9 @@ fn run_claude_session_inline(
 ) -> Result<CliSessionOutput, String> {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    if let Some(refusal) = crate::model_gateway::spawn_refusal() {
+        return Err(refusal);
+    }
     use std::sync::{mpsc, Arc};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -512,12 +516,19 @@ fn run_claude_session_inline(
         extra_required,
         ..Default::default()
     };
-    let launch_cfg = {
+    // ONE account resolution, so the launch template and the trust pre-accept
+    // below name the same account. The resolved dir is a process-global that
+    // every `pick_best_account` rewrites, and under `WeightedRandom` (the
+    // default) each pick is a fresh draw, so two reads could disagree when a
+    // sibling spawn picks in between. (This seam sets no `CLAUDE_CONFIG_DIR`
+    // on the child itself — see plan
+    // `2026-11-05-a-spawn-takes-its-own-account-pick-not-the-shared-resolved-dir`.)
+    let config_dir = {
         let ai = crate::settings::get_ai_settings();
-        let (config_dir, _config_dir_source) =
-            crate::ai_provider::get_effective_config_dir(&ai.claude_cli);
-        crate::claude_session::launch_spec::LaunchConfig::from_settings(config_dir.as_deref())
+        crate::ai_provider::get_effective_config_dir(&ai.claude_cli).0
     };
+    let launch_cfg =
+        crate::claude_session::launch_spec::LaunchConfig::from_settings(config_dir.as_deref());
     let (program, cli_args) =
         crate::claude_session::launch_spec::render_program_and_argv(&spec, &launch_cfg);
 
@@ -533,11 +544,9 @@ fn run_claude_session_inline(
     // arm and the dial is read from cache, both of which say so in the report
     // rather than pretending coord was asked.
     {
-        let ai = crate::settings::get_ai_settings();
-        let (trust_dir, _src) = crate::ai_provider::get_effective_config_dir(&ai.claude_cli);
         let gate = crate::claude_session::trust_gate::pre_accept_for_account_sync(
             working_dir,
-            trust_dir.as_deref(),
+            config_dir.as_deref(),
             crate::claude_session::trust_gate::SpawnSurface::NonInteractive,
         );
         if let Some(refusal) = gate.decision.refusal() {
@@ -565,8 +574,10 @@ fn run_claude_session_inline(
             // tenant `AiCoordRegistrar` stamped them with, looked up by this
             // spawn's own id, then by the owning task run's id (a workflow
             // phase session's id is suffixed; the run is what registered).
-            // Neither registered yet, or no tenant recorded: the registrar's
-            // own resolver. `None` on an unresolvable or unpaired machine.
+            // Neither registered yet, or no tenant recorded: resolve it as
+            // a registration would, from the workspace and the repo in this
+            // spawn's working directory (plan 2026-09-20 Phase 5). A REFUSED
+            // decision skips federation rather than federating the default.
             crate::claude_session::coord_register::federation_session_tenant(
                 tauri::Manager::try_state::<
                     std::sync::Arc<crate::claude_session::coord_register::AiCoordRegistrar>,
@@ -578,6 +589,11 @@ fn run_claude_session_inline(
                     task_run_id,
                     session_ctx.as_ref(),
                 ),
+                || {
+                    run_async_inline(crate::session::resolve_new_session_tenant_in(Some(
+                        std::path::Path::new(working_dir),
+                    )))
+                },
             ),
         ) {
             Ok(ctx) => Some(ctx),
@@ -759,7 +775,7 @@ fn run_claude_session_inline(
     let heartbeat_handle = thread::spawn(move || {
         let mut last_update = 0u64;
         loop {
-            if stop_rx.try_recv().is_ok() {
+            if super::heartbeat::heartbeat_should_stop(&stop_rx) {
                 break;
             }
             thread::sleep(Duration::from_millis(100));
@@ -2847,5 +2863,6 @@ mod spawn_env_tests {
             &cmd,
             "build_inline_child_command",
         );
+        crate::terminal::assert_python_utf8_default_std(&cmd, "build_inline_child_command");
     }
 }

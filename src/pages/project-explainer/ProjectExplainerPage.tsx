@@ -15,7 +15,7 @@ import { BookOpen, ArrowLeft, Home, Loader2, Send, X } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import mermaid from "mermaid";
-import { getApiBase } from "@/lib/runner-api";
+import { readFile } from "@/pages/ui-bridge-integration/integrationApi";
 import { useAiSession } from "@/hooks/useAiSession";
 import { StreamingMessageView } from "@/components/shared";
 import { useUIElement } from "@qontinui/ui-bridge";
@@ -116,15 +116,7 @@ export function ProjectExplainerPage() {
       setLoading(true);
       setLoadError(null);
       try {
-        const resp = await fetch(`${getApiBase()}/ui-bridge/integration/read-file`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            project_path: projectPath.trim(),
-            file_path: `${EXPLAINER_ROOT}/${relPath}`,
-          }),
-        });
-        const data = (await resp.json()) as { success: boolean; data?: string; error?: string };
+        const data = await readFile(projectPath.trim(), `${EXPLAINER_ROOT}/${relPath}`);
         if (!data.success || data.data === undefined) {
           setLoadError(data.error || `Could not load ${relPath}`);
           setMarkdown("");

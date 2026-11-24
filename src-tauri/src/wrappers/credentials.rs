@@ -37,8 +37,10 @@ pub fn keyring_service(wrapper_id: &str) -> String {
 /// Errors raised by credential operations.
 #[derive(Debug, thiserror::Error)]
 pub enum CredentialError {
-    #[error("invalid env var name '{0}'")]
-    InvalidName(String),
+    /// Carries only the rejected name's LENGTH: a manifest's name is
+    /// wrapper-supplied, and this error's Display reaches logs and HTTP bodies.
+    #[error("invalid env var name (len={0})")]
+    InvalidName(usize),
     #[error("keyring error: {0}")]
     Keyring(String),
 }
@@ -51,20 +53,37 @@ impl From<keyring::Error> for CredentialError {
     }
 }
 
-/// Validate an env var name. Allows the standard unix env var charset
-/// (`A-Z`, `0-9`, `_`) and forbids the empty string. Helps surface
-/// frontend bugs before they corrupt the keyring with weird keys.
+/// Validate an env var name for storing, reading or injecting it: the
+/// manifest's rule (`manifest::env_var_name_ok`, `^[A-Z_][A-Z0-9_]{0,63}$`).
+/// Helps surface frontend bugs before they corrupt the keyring with weird
+/// keys.
 fn validate_name(name: &str) -> Result<(), CredentialError> {
-    if name.is_empty() {
-        return Err(CredentialError::InvalidName(name.to_string()));
+    if super::manifest::env_var_name_ok(name) {
+        Ok(())
+    } else {
+        Err(CredentialError::InvalidName(name.len()))
     }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
-    {
-        return Err(CredentialError::InvalidName(name.to_string()));
+}
+
+/// The rule earlier builds stored names under: non-empty `[A-Z0-9_]`, any
+/// length, any first character. A value stored under such a name (a leading
+/// digit, more than 64 characters) must stay REMOVABLE, so `delete` and the
+/// uninstall cleanup accept it; `set`, `get` and injection keep the strict
+/// rule.
+fn legacy_name_ok(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// `validate_name`, widened to the legacy rule: for removal only.
+fn validate_name_for_removal(name: &str) -> Result<(), CredentialError> {
+    if super::manifest::env_var_name_ok(name) || legacy_name_ok(name) {
+        Ok(())
+    } else {
+        Err(CredentialError::InvalidName(name.len()))
     }
-    Ok(())
 }
 
 /// Per-wrapper credential namespace.
@@ -79,6 +98,10 @@ impl CredentialStore {
     /// existing value.
     pub fn set(wrapper_id: &str, name: &str, value: &str) -> Result<(), CredentialError> {
         validate_name(name)?;
+        // The keychain gate (`instance_env::os_keychain_allowed`).
+        if !qontinui_runner_lib::instance_env::os_keychain_allowed() {
+            return Err(qontinui_runner_lib::instance_env::keychain_disabled_error().into());
+        }
         let entry = Entry::new(&keyring_service(wrapper_id), name)?;
         entry.set_password(value)?;
         Ok(())
@@ -89,6 +112,9 @@ impl CredentialStore {
     /// this.
     pub fn get(wrapper_id: &str, name: &str) -> Result<Option<String>, CredentialError> {
         validate_name(name)?;
+        if !qontinui_runner_lib::instance_env::os_keychain_allowed() {
+            return Ok(None);
+        }
         let entry = Entry::new(&keyring_service(wrapper_id), name)?;
         match entry.get_password() {
             Ok(s) => Ok(Some(s)),
@@ -112,9 +138,17 @@ impl CredentialStore {
         matches!(Self::get(wrapper_id, name), Ok(Some(_)))
     }
 
-    /// Remove a credential. No-op if it doesn't exist.
+    /// Remove a credential. No-op if it doesn't exist. Accepts a name in the
+    /// legacy charset too (`legacy_name_ok`), so a value an earlier build
+    /// stored is never orphaned in the keyring. Such a legacy-named value is
+    /// listed as `<rejected, len=N>` with `hasValue: false`, so a DELETE
+    /// removes it only when the caller already knows the exact name;
+    /// otherwise it is removed on uninstall (`clear_for_wrapper`).
     pub fn delete(wrapper_id: &str, name: &str) -> Result<(), CredentialError> {
-        validate_name(name)?;
+        validate_name_for_removal(name)?;
+        if !qontinui_runner_lib::instance_env::os_keychain_allowed() {
+            return Ok(());
+        }
         let entry = Entry::new(&keyring_service(wrapper_id), name)?;
         match entry.delete_credential() {
             Ok(()) => Ok(()),
@@ -132,10 +166,22 @@ impl CredentialStore {
     /// keyring backend limitation, called out in the install docs.
     pub fn clear_for_wrapper(wrapper_id: &str, env_var_names: &[String]) {
         for name in env_var_names {
+            // A name valid under neither rule can hold no stored value — no
+            // build's `set` accepted it — so it is skipped. A legacy name is
+            // still removed. Either way only a name in the CURRENT shape is
+            // ever logged; any other by its length.
+            let label = super::manifest::label_if(name, super::manifest::env_var_name_ok(name));
+            if validate_name_for_removal(name).is_err() {
+                warn!(
+                    "wrappers.credentials: skipped an invalid env var name ({}) for wrapper '{}'",
+                    label, wrapper_id
+                );
+                continue;
+            }
             if let Err(e) = Self::delete(wrapper_id, name) {
                 warn!(
-                    "wrappers.credentials: delete '{}' for wrapper '{}' failed: {}",
-                    name, wrapper_id, e
+                    "wrappers.credentials: delete {} for wrapper '{}' failed: {}",
+                    label, wrapper_id, e
                 );
             }
         }
@@ -157,5 +203,55 @@ mod tests {
         assert!(validate_name("lowercase").is_err());
         assert!(validate_name("HAS-DASH").is_err());
         assert!(validate_name("V0_TOKEN").is_ok());
+        // The error carries the length, never the name.
+        let secret = concat!("sk-", "live-0123456789");
+        let msg = validate_name(secret).unwrap_err().to_string();
+        assert!(
+            !msg.contains(secret) && msg.contains(&format!("len={}", secret.len())),
+            "{msg}"
+        );
+    }
+
+    /// A name an earlier build could store (leading digit, longer than 64)
+    /// stays removable, never storable or readable; a name valid under
+    /// neither rule is refused for removal too, by length only.
+    #[test]
+    fn a_legacy_name_is_removable_but_not_storable() {
+        for legacy in ["1LEAD".to_string(), "A".repeat(65)] {
+            assert!(validate_name_for_removal(&legacy).is_ok(), "{legacy}");
+            assert!(validate_name(&legacy).is_err(), "{legacy}");
+            assert!(
+                matches!(
+                    CredentialStore::set("w", &legacy, "v"),
+                    Err(CredentialError::InvalidName(_))
+                ),
+                "{legacy}"
+            );
+            assert!(
+                matches!(
+                    CredentialStore::get("w", &legacy),
+                    Err(CredentialError::InvalidName(_))
+                ),
+                "{legacy}"
+            );
+        }
+        let bad = concat!("sk-", "live-0123456789");
+        let msg = validate_name_for_removal(bad).unwrap_err().to_string();
+        assert!(
+            !msg.contains(bad) && msg.contains(&format!("len={}", bad.len())),
+            "{msg}"
+        );
+    }
+
+    /// Uninstall over a persisted index whose env var name is invalid: the
+    /// name is skipped (no keyring call) and never logged.
+    #[test]
+    fn uninstall_never_logs_an_invalid_env_var_name() {
+        let secret = concat!("sk-", "live-0123456789");
+        let logs = super::super::capture_logs(|| {
+            CredentialStore::clear_for_wrapper("w", &[secret.to_string()]);
+        });
+        assert!(!logs.contains(secret), "{logs}");
+        assert!(logs.contains("skipped an invalid env var name"), "{logs}");
     }
 }

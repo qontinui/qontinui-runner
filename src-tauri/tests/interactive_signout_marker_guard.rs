@@ -39,6 +39,11 @@
 //! - `pair::persist_pairing`'s own module and the device-JWT refresher must NOT
 //!   call `clear_interactive_signed_out`.
 //!
+//! Out-of-line `#[cfg(test)] mod <name>;` files are test code in their
+//! entirety and are skipped ([`test_only_module_files`]). Known gap: the scan
+//! matches the call TEXT, so a `persist_pairing` bound to a name and then
+//! called is not seen.
+//!
 //! It is a file-level backstop, not a proof: it cannot tell you the clear
 //! happens AFTER the pairing was persisted (that ordering is covered by the
 //! unit tests in `auth.rs`'s `signed_in_verdict_tests` and by review). It does
@@ -83,10 +88,11 @@ fn every_pairing_path_clears_the_interactive_signout_marker() {
     collect_rs(&src, &mut files);
     files.sort();
 
+    let test_only = test_only_module_files(&src, &files);
     let mut offenders: Vec<String> = Vec::new();
     for file in &files {
         let rel = rel_path(&src, file);
-        if rel == PERSIST_PAIRING_DEFINITION {
+        if rel == PERSIST_PAIRING_DEFINITION || test_only.contains(&rel) {
             continue;
         }
         let text = read(file);
@@ -132,9 +138,13 @@ fn only_allowlisted_sites_clear_the_interactive_signout_marker() {
     collect_rs(&src, &mut files);
     files.sort();
 
+    let test_only = test_only_module_files(&src, &files);
     let mut offenders: Vec<String> = Vec::new();
     for file in &files {
         let rel = rel_path(&src, file);
+        if test_only.contains(&rel) {
+            continue;
+        }
         let text = read(file);
         if production_lines(&text)
             .iter()
@@ -163,6 +173,49 @@ fn only_allowlisted_sites_clear_the_interactive_signout_marker() {
             .collect::<Vec<_>>()
             .join("\n")
     );
+}
+
+/// Files that ARE out-of-line `#[cfg(test)] mod <name>;` modules — test code
+/// in their entirety, which [`production_lines`] (it only sees an inline
+/// `#[cfg(test)]` block) would otherwise read as production. A declaration in
+/// `<dir>/<file>.rs` (or `mod.rs` / `main.rs` / `lib.rs`) names
+/// `<module dir>/<name>.rs` or `<module dir>/<name>/mod.rs`.
+fn test_only_module_files(src: &Path, files: &[PathBuf]) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    for file in files {
+        let rel = rel_path(src, file);
+        let (parent, name) = rel.rsplit_once('/').unwrap_or(("", rel.as_str()));
+        let module_dir = if matches!(name, "mod.rs" | "main.rs" | "lib.rs") {
+            parent.to_string()
+        } else {
+            rel.trim_end_matches(".rs").to_string()
+        };
+        let prefix = if module_dir.is_empty() {
+            String::new()
+        } else {
+            format!("{module_dir}/")
+        };
+        let mut pending_cfg_test = false;
+        for line in read(file).lines() {
+            let t = line.trim();
+            if t.starts_with("//") || t.is_empty() {
+                continue;
+            }
+            if t == "#[cfg(test)]" {
+                pending_cfg_test = true;
+                continue;
+            }
+            if pending_cfg_test {
+                let decl = t.strip_prefix("pub(crate) ").unwrap_or(t);
+                if let Some(m) = decl.strip_prefix("mod ").and_then(|r| r.strip_suffix(';')) {
+                    out.insert(format!("{prefix}{m}.rs"));
+                    out.insert(format!("{prefix}{m}/mod.rs"));
+                }
+            }
+            pending_cfg_test = false;
+        }
+    }
+    out
 }
 
 fn read(path: &Path) -> String {
@@ -260,4 +313,27 @@ fn strip_inline_comments(line: &str) -> String {
         s.truncate(idx);
     }
     s
+}
+
+/// The out-of-line test-module detector finds the modules `main.rs` declares
+/// `#[cfg(test)]` — measured when written: `tier_matrix_tests`,
+/// `subject_isolation_harness` among them — and nothing a plain `mod x;` names.
+#[test]
+fn out_of_line_test_modules_are_recognised() {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    collect_rs(&src, &mut files);
+    let test_only = test_only_module_files(&src, &files);
+    for expected in ["tier_matrix_tests.rs", "subject_isolation_harness.rs"] {
+        assert!(
+            test_only.contains(expected),
+            "{expected} not recognised: {test_only:?}"
+        );
+    }
+    for production in ["pair.rs", "settings.rs", "commands/auth.rs"] {
+        assert!(
+            !test_only.contains(production),
+            "{production} wrongly test-only"
+        );
+    }
 }

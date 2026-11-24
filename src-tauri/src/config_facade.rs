@@ -379,6 +379,11 @@ impl KeychainHelper {
 
     /// Store a secret in the keychain.
     pub fn store(&self, key: &str, value: &str) -> Result<()> {
+        // The keychain gate (`instance_env::os_keychain_allowed`): a refused write
+        // is an error, never a silent success that loses the secret.
+        if !qontinui_runner_lib::instance_env::os_keychain_allowed() {
+            return Err(qontinui_runner_lib::instance_env::keychain_disabled_error().into());
+        }
         let entry = Entry::new(&self.service, key)?;
         entry.set_password(value)?;
         info!("Stored {} in keychain (service: {})", key, self.service);
@@ -391,6 +396,9 @@ impl KeychainHelper {
     /// `Ok(None)` if it doesn't exist,
     /// or an error if something went wrong.
     pub fn get(&self, key: &str) -> Result<Option<String>> {
+        if !qontinui_runner_lib::instance_env::os_keychain_allowed() {
+            return Ok(None);
+        }
         let entry = Entry::new(&self.service, key)?;
         match entry.get_password() {
             Ok(v) => Ok(Some(v)),
@@ -403,6 +411,9 @@ impl KeychainHelper {
     ///
     /// This is idempotent - it won't error if the secret doesn't exist.
     pub fn delete(&self, key: &str) -> Result<()> {
+        if !qontinui_runner_lib::instance_env::os_keychain_allowed() {
+            return Ok(());
+        }
         let entry = Entry::new(&self.service, key)?;
         // Ignore NoEntry error - it's fine if it doesn't exist
         match entry.delete_credential() {
@@ -671,12 +682,6 @@ pub fn get_interactive_sessions_enabled() -> bool {
     load_settings().ai.interactive_sessions_enabled
 }
 
-/// Save the interactive sessions enabled setting.
-pub fn save_interactive_sessions_enabled(enabled: bool) -> Result<(), String> {
-    info!("Saving interactive sessions enabled setting: {}", enabled);
-    update_settings(|settings| settings.ai.interactive_sessions_enabled = enabled)
-}
-
 /// Get the user-configured custom UI Bridge discovery ports.
 /// These are merged with the hardcoded `DESKTOP_APP_PORTS` at scan time.
 pub fn get_discovery_ports() -> Vec<u16> {
@@ -711,6 +716,20 @@ pub fn save_claude_config_dirs(dirs: Vec<String>) -> Result<(), String> {
         dirs.len()
     );
     crate::claude_accounts::update(move |roster| roster.claude_config_dirs = dirs)
+}
+
+/// ADD Claude Code config directories to the machine-global roster, never
+/// removing one (`crate::claude_accounts::append_config_dirs`). Returns how
+/// many were added. The first-run setup wizard uses this; the Settings page's
+/// replace-style [`save_claude_config_dirs`] stays the only way to remove one.
+pub fn append_claude_config_dirs(dirs: &[String]) -> Result<usize, String> {
+    let added = crate::claude_accounts::append_config_dirs(dirs)?;
+    info!(
+        "Added {} of {} Claude config dirs (machine-global claude-accounts.json, add-only)",
+        added,
+        dirs.len()
+    );
+    Ok(added)
 }
 
 /// Get custom launch commands per account config directory.
@@ -876,8 +895,9 @@ pub fn seed_default_log_sources_if_empty() {
             category: LogSourceCategory::Runner,
             source_type: "file".to_string(),
             // The runner writes its tracing to `<dev_logs>/qontinui-runner.log.<date>`
-            // (see crate::logging). Point at the stable basename — read_single_source
-            // resolves the newest dated rotation. NOT `runner-tauri.log`, which is the
+            // (see crate::logging). Point at the stable basename —
+            // commands::project_logs::resolve_source_file resolves the newest
+            // dated rotation. NOT `runner-tauri.log`, which is the
             // supervisor's captured stdout, not the runner's own tracing.
             path: format!(
                 "{}/{}",
@@ -1161,5 +1181,27 @@ mod tests {
         );
         assert_eq!(GlobalLogSourceSettings::field_name(), "log_sources");
         assert_eq!(CloudRelaySettings::field_name(), "cloud_relay");
+    }
+
+    /// Plan `2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-runner`
+    /// D2, through the real entry point: under an instance root the keychain
+    /// helper never reaches the machine-shared OS keychain — a read answers
+    /// "absent", a delete is a no-op, and a write is refused with the gate's
+    /// error instead of overwriting the harness's secret.
+    #[test]
+    fn under_an_instance_root_the_keychain_helper_never_touches_the_os_keychain() {
+        let amb = crate::test_env::isolated_ambient();
+        std::env::set_var("QONTINUI_INSTANCE_ROOT", amb.dir().join("subject"));
+        // A unique test service, never `com.qontinui.runner.ai`: if the gate
+        // ever regressed, the store below would land in a throwaway entry
+        // rather than overwrite a real secret.
+        let keychain = KeychainHelper::new(&format!(
+            "com.qontinui.runner.test.keychain-gate.{}",
+            uuid::Uuid::new_v4()
+        ));
+        assert_eq!(keychain.get("api_key").unwrap(), None);
+        assert!(keychain.delete("api_key").is_ok());
+        let err = keychain.store("api_key", "sk-never-stored").unwrap_err();
+        assert!(err.to_string().contains("keychain is disabled"), "{err}");
     }
 }

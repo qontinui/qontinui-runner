@@ -33,8 +33,49 @@ const VALUE_PRESERVING = `
 export function g(err: unknown, q: { error: unknown }) {
   const e = err instanceof Error ? err : new Error(String(err));
   const maybe = q.error instanceof Error ? q.error : null;
-  return [e, maybe];
+  const neg = !(err instanceof Error) ? new Error(String(err)) : err;
+  const stack = err instanceof TypeError ? err.stack : undefined;
+  return [e, maybe, neg, stack];
 }
+`;
+
+/**
+ * One fixture per escape route the 2026-10-08 widening closed. Each must report
+ * EXACTLY once — the arms REPLACE the original plain-`Error` selector rather
+ * than accompany it, so a double report would mean two arms overlap.
+ */
+const ESCAPE_ROUTES: Record<string, string> = {
+  subclass: `export const a = (e: unknown) => (e instanceof TypeError ? e.message : "x");`,
+  optionalChain: `export const a = (e: any) => (e instanceof Error ? e?.message : "x");`,
+  negated: `export const a = (e: unknown) => (!(e instanceof Error) ? "x" : e.message);`,
+  negatedOptionalChain: `export const a = (e: any) => (!(e instanceof Error) ? "x" : e?.message);`,
+};
+
+/** A subclass-specific text whose other branch keeps the cause: allowed. */
+const SUBCLASS_KEEPS_CAUSE = `
+declare class ApiError extends Error {}
+declare function describeThrown(e: unknown, f: string): string;
+export const a = (e: unknown) => (e instanceof ApiError ? e.message : describeThrown(e, "x"));
+export const b = (e: unknown) => (!(e instanceof ApiError) ? describeThrown(e, "x") : e.message);
+export const c = (e: any) => (e instanceof ApiError ? e?.message : describeThrown(e, "x"));
+export const d = (e: any) => (!(e instanceof ApiError) ? describeThrown(e, "x") : e?.message);
+`;
+
+/** A cast OUTSIDE a catch is out of the cast arm's scope (the value's type is known there). */
+const CAST_OUTSIDE_CATCH = `
+export const m = (err: unknown) => (err as Error).message;
+`;
+
+/** The CAST spelling: production files only. */
+const CAST_IN_CATCH = `
+export function f(setError: (m: string) => void) {
+  try {
+    doThing();
+  } catch (err) {
+    setError((err as Error).message);
+  }
+}
+declare function doThing(): void;
 `;
 
 const POPULATION_NAME = `
@@ -74,5 +115,51 @@ describe("catch-site discard guard (eslint.config.js)", () => {
   it("does not fire on the value-preserving shapes", async () => {
     const msgs = await restrictedSyntaxMessages(VALUE_PRESERVING, "src/hooks/__fixture__.ts");
     expect(msgs).toEqual([]);
+  }, 60_000);
+
+  for (const [name, source] of Object.entries(ESCAPE_ROUTES)) {
+    it(`fires exactly once on the ${name} escape route`, async () => {
+      const msgs = await restrictedSyntaxMessages(source, "src/hooks/__fixture__.ts");
+      expect(msgs).toHaveLength(1);
+      expect(msgs[0]).toContain("describeThrown");
+    }, 60_000);
+  }
+
+  it("fires on a cast-in-catch in a production file, including under terminal/**", async () => {
+    for (const path of ["src/hooks/__fixture__.ts", "src/components/terminal/__fixture__.tsx"]) {
+      const msgs = await restrictedSyntaxMessages(CAST_IN_CATCH, path);
+      expect(msgs).toHaveLength(1);
+      expect(msgs[0]).toContain("is a cast, not a check");
+    }
+  }, 60_000);
+
+  it("does NOT fire on a cast-in-catch in a test file, but keeps the ternary arms there", async () => {
+    for (const path of [
+      "src/hooks/__fixture__.test.ts",
+      "src/components/terminal/__fixture__.test.tsx",
+      "src/hooks/__tests__/fixture.ts",
+      "src/lib/__test-helpers__/fixture.ts",
+    ]) {
+      expect(await restrictedSyntaxMessages(CAST_IN_CATCH, path)).toEqual([]);
+      expect(await restrictedSyntaxMessages(DISCARD, path)).toHaveLength(1);
+    }
+    // The terminal test-file block must still carry the population-name list.
+    const pop = await restrictedSyntaxMessages(
+      POPULATION_NAME,
+      "src/components/terminal/__fixture__.test.tsx",
+    );
+    expect(pop.some((m) => m.includes("sessionCount"))).toBe(true);
+  }, 60_000);
+
+  it("allows a subclass ternary whose other branch already calls describeThrown", async () => {
+    expect(
+      await restrictedSyntaxMessages(SUBCLASS_KEEPS_CAUSE, "src/hooks/__fixture__.ts"),
+    ).toEqual([]);
+  }, 60_000);
+
+  it("scopes the cast arm to a catch clause", async () => {
+    expect(await restrictedSyntaxMessages(CAST_OUTSIDE_CATCH, "src/hooks/__fixture__.ts")).toEqual(
+      [],
+    );
   }, 60_000);
 });

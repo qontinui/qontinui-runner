@@ -21,6 +21,11 @@ pub struct AiDataResponse<T> {
     pub data: Option<T>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// A stable machine code for a refusal the caller can act on (e.g.
+    /// `cursor_malformed`: restart the walk without `cursor`). Absent on
+    /// success and on an uncoded failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
 }
 
 impl<T> AiDataResponse<T> {
@@ -29,6 +34,7 @@ impl<T> AiDataResponse<T> {
             success: true,
             data: Some(data),
             error: None,
+            error_code: None,
         }
     }
 
@@ -37,6 +43,17 @@ impl<T> AiDataResponse<T> {
             success: false,
             data: None,
             error: Some(message),
+            error_code: None,
+        }
+    }
+
+    /// A failure carrying a stable machine `code` beside its message.
+    pub fn err_coded(code: &str, message: String) -> Self {
+        Self {
+            success: false,
+            data: None,
+            error: Some(message),
+            error_code: Some(code.to_string()),
         }
     }
 }
@@ -1197,8 +1214,12 @@ pub async fn get_contexts_for_viewer() -> Result<AiDataResponse<ContextsResult>,
 // SQLite Event Queries (migrated from JSONL)
 // =============================================================================
 
+use crate::database::pg::task_run_events::{TaskRunLogCounts, TaskRunLogPage};
 use crate::database::{
     TaskRunApiRequest, TaskRunAwasStep, TaskRunEvent, TaskRunPlaywrightResult, TaskRunScreenshot,
+};
+use qontinui_types::page::{
+    BoundedReadMeta, CursorScope, KeysetPosition, Page, ScopeFingerprint, SortKey,
 };
 
 /// Result of querying task run events from SQLite.
@@ -1271,53 +1292,209 @@ pub async fn get_task_run_screenshots_from_db(
     }
 }
 
-/// Result of querying Playwright results from SQLite.
+// -----------------------------------------------------------------------------
+// Keyset pages over a run's Playwright results, API requests and AWAS steps
+// -----------------------------------------------------------------------------
+//
+// Plan `2026-09-05-every-bounded-read-is-a-page-that-reads-as-a-corpus`,
+// Phase 5b. These three commands used to page with `LIMIT/OFFSET` and a
+// hand-computed `has_more = offset + len < total` (the count and the page
+// were two statements). The order was `created_at` alone, with no tiebreak,
+// so rows sharing a timestamp had no stable position and an OFFSET page could
+// repeat one row and silently skip another; the filtered variants loaded the
+// whole run into memory and skipped in Rust. They now walk the immutable
+// `(created_at, id)` with the shared opaque cursor codec
+// (`qontinui_types::page`), filter in the statement, and disclose the page
+// through the shared `BoundedReadMeta` envelope keys, flattened beside each
+// result's collection key.
+//
+// **Cost.** A page statement carries no window count (`COUNT(*) OVER ()` reads
+// every remaining row, big text columns included, on every page: O(n^2) over a
+// walk). It is `LIMIT limit + 1`, and the exact population counts are a separate
+// statement over the small columns, run on the FIRST page only. A first page is
+// `bound_kind: exact`; every later page is `at_least` (or `complete` on the last)
+// and omits the per-status counts.
+
+/// The page size when the caller passes no `limit`.
+const TASK_RUN_LOG_PAGE_DEFAULT: i64 = 200;
+/// The largest page a caller can ask for; `limit` is clamped to `1..=` this,
+/// and the envelope's `limit` reports the cap actually applied.
+const TASK_RUN_LOG_PAGE_MAX: i64 = 1000;
+
+/// The keyset sequence of `task_run_playwright_results`: `(created_at, id)`
+/// ascending. Both columns are written once by the INSERT and never updated
+/// (pinned by `tests::per_run_log_keys_have_no_update_site`).
+struct PlaywrightResultsWalk;
+impl SortKey for PlaywrightResultsWalk {
+    const ID: &'static str = "runner.task_run_playwright_results:created_at,id:asc";
+}
+
+/// The keyset sequence of `task_run_api_requests`; see [`PlaywrightResultsWalk`].
+struct ApiRequestsWalk;
+impl SortKey for ApiRequestsWalk {
+    const ID: &'static str = "runner.task_run_api_requests:created_at,id:asc";
+}
+
+/// The keyset sequence of `task_run_awas_steps`; see [`PlaywrightResultsWalk`].
+struct AwasStepsWalk;
+impl SortKey for AwasStepsWalk {
+    const ID: &'static str = "runner.task_run_awas_steps:created_at,id:asc";
+}
+
+/// The cap a per-run log page applies: the caller's `limit`, defaulted and
+/// clamped to `1..=TASK_RUN_LOG_PAGE_MAX`.
+fn task_run_log_limit(limit: Option<i64>) -> i64 {
+    limit
+        .unwrap_or(TASK_RUN_LOG_PAGE_DEFAULT)
+        .clamp(1, TASK_RUN_LOG_PAGE_MAX)
+}
+
+/// Decode a caller-supplied `cursor` against the read's scope. `None` is the
+/// first page; a token this read did not mint is the typed `cursor_malformed`
+/// refusal (never a clamp to the nearest position, which would resume the walk
+/// with rows silently missing).
+fn decode_log_cursor<K: SortKey, T>(
+    scope: &ScopeFingerprint<K>,
+    cursor: Option<&str>,
+    surface: &str,
+) -> Result<Option<KeysetPosition>, AiDataResponse<T>> {
+    match cursor {
+        None => Ok(None),
+        Some(token) => scope
+            .decode(token)
+            .map(Some)
+            .map_err(|e| AiDataResponse::err_coded(e.code(), e.refusal(surface))),
+    }
+}
+
+/// The keyset position of a served row. The statement compares `id` as TEXT,
+/// so the position is only exact when the stored id is the canonical
+/// lowercase-hyphenated form `Uuid::to_string` re-renders — every row the
+/// runner inserts is (`Uuid::new_v4().to_string()`). Anything else cannot be
+/// resumed after, and saying so beats minting a cursor that skips rows.
+fn log_row_position(id: &str, created_at: DateTime<Utc>) -> Result<KeysetPosition, String> {
+    match uuid::Uuid::parse_str(id) {
+        Ok(uuid) if uuid.to_string() == id => Ok(KeysetPosition {
+            at: created_at,
+            id: uuid,
+        }),
+        _ => Err(format!(
+            "row id {id:?} is not a canonical lowercase uuid, so the walk cannot resume after it"
+        )),
+    }
+}
+
+/// Build the page's rows and shared [`BoundedReadMeta`] from a keyset fetch of
+/// up to `limit + 1` rows (the extra row is the has-more probe).
+///
+/// The has-more fact comes from the probe, read in the SAME statement as the
+/// rows. On the FIRST page the separate counts statement also ran, so the bound
+/// is `exact` (`total` = the whole filtered run) — provided it agrees with the
+/// probe; a run still appending rows can make the two statements disagree, and
+/// then the honest answer is the probe's `at_least`. Every later page has no
+/// counts and is `at_least` while rows remain, `complete` on the last page. The
+/// next cursor is minted from the LAST KEPT row, never the probe.
+fn log_page<T, K: SortKey>(
+    fetched: TaskRunLogPage<T>,
+    limit: i64,
+    scope: &ScopeFingerprint<K>,
+    id_of: fn(&T) -> &str,
+) -> Result<(Vec<T>, BoundedReadMeta), String> {
+    let TaskRunLogPage { mut rows, counts } = fetched;
+    let keep = usize::try_from(limit.max(1)).unwrap_or(usize::MAX);
+    let has_more = rows.len() > keep;
+    // Refuse to mint a cursor that would skip rows (non-canonical id) before
+    // the page is built; a last page needs no cursor and so no such id.
+    if has_more {
+        if let Some((row, at)) = rows.get(keep - 1) {
+            log_row_position(id_of(row), *at)?;
+        }
+    }
+    let cursor_of = |(row, at): &(T, DateTime<Utc>)| {
+        log_row_position(id_of(row), *at)
+            .map(|pos| scope.encode(pos))
+            .unwrap_or_default()
+    };
+    let exact_total = counts
+        .map(|c| c.total)
+        .filter(|total| (*total > keep as i64) == has_more);
+    let page = match exact_total {
+        Some(total) => {
+            rows.truncate(keep);
+            Page::from_window_count(rows, limit, total, cursor_of)
+        }
+        None => Page::from_probe(rows, limit, cursor_of),
+    };
+    let meta = page.meta();
+    Ok((
+        page.into_rows().into_iter().map(|(row, _)| row).collect(),
+        meta,
+    ))
+}
+
+/// One keyset page of a run's Playwright results.
 #[derive(Debug, Serialize)]
 pub struct TaskRunPlaywrightResultsResult {
     pub task_run_id: String,
     pub results: Vec<TaskRunPlaywrightResult>,
-    pub count: usize,
-    pub passed: usize,
-    pub failed: usize,
-    pub has_more: bool,
+    /// Tests that passed across the whole run. Present on the FIRST page only
+    /// (the page that ran the counts statement), absent — not zero — on every
+    /// later page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub passed: Option<i64>,
+    /// Tests that failed across the whole run; first page only, like `passed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed: Option<i64>,
+    /// `count`, `limit`, `shown`, `total`, `truncated`, `bound_kind`,
+    /// `next_cursor`, … — pass `next_cursor` back as `cursor` for the next page.
+    #[serde(flatten)]
+    pub page: BoundedReadMeta,
 }
 
-/// Get Playwright test results from PG database with SQL-level pagination.
+/// Get one keyset page of a run's Playwright results. Omit `cursor` for the
+/// first page; pass the previous response's `next_cursor` for the next.
 #[tauri::command]
 pub async fn get_task_run_playwright_results_from_db(
     state: State<'_, StorageCompartment>,
     task_run_id: String,
-    limit: Option<usize>,
-    offset: Option<usize>,
+    limit: Option<i64>,
+    cursor: Option<String>,
 ) -> Result<AiDataResponse<TaskRunPlaywrightResultsResult>, String> {
-    let lim = limit.unwrap_or(200) as i64;
-    let off = offset.unwrap_or(0) as i64;
+    let limit = task_run_log_limit(limit);
+    let scope = CursorScope::<PlaywrightResultsWalk>::new()
+        .opt_str("task_run_id", Some(&task_run_id))
+        .finish();
+    let after = match decode_log_cursor(
+        &scope,
+        cursor.as_deref(),
+        "get_task_run_playwright_results_from_db",
+    ) {
+        Ok(after) => after,
+        Err(refusal) => return Ok(refusal),
+    };
 
-    let total_count = state
+    let fetched = match state
         .pg_db()
-        .count_task_run_table("task_run_playwright_results", &task_run_id)
-        .await
-        .unwrap_or(0) as usize;
-
-    match state
-        .pg_db()
-        .get_task_run_playwright_results_paginated(&task_run_id, lim, off)
+        .get_task_run_playwright_results_page(&task_run_id, after, limit)
         .await
     {
-        Ok(results) => {
-            let passed = results.iter().filter(|r| r.status == "passed").count();
-            let failed = results.iter().filter(|r| r.status == "failed").count();
-            let has_more = (off as usize) + results.len() < total_count;
-
-            Ok(AiDataResponse::ok(TaskRunPlaywrightResultsResult {
-                task_run_id,
-                results,
-                count: total_count,
-                passed,
-                failed,
-                has_more,
-            }))
-        }
+        Ok(fetched) => fetched,
+        Err(e) => return Ok(AiDataResponse::err(e)),
+    };
+    let (passed, failed) = (
+        fetched.counts.map(|c| c.succeeded),
+        fetched.counts.map(|c| c.failed),
+    );
+    match log_page(fetched, limit, &scope, |r: &TaskRunPlaywrightResult| {
+        r.id.as_str()
+    }) {
+        Ok((results, page)) => Ok(AiDataResponse::ok(TaskRunPlaywrightResultsResult {
+            task_run_id,
+            page,
+            results,
+            passed,
+            failed,
+        })),
         Err(e) => Ok(AiDataResponse::err(e)),
     }
 }
@@ -1374,171 +1551,138 @@ pub async fn get_task_run_migrated_logs_summary(
     }))
 }
 
-/// Result of querying API requests from SQLite.
+/// One keyset page of a run's API requests.
 #[derive(Debug, Serialize)]
 pub struct TaskRunApiRequestsResult {
     pub task_run_id: String,
     pub requests: Vec<TaskRunApiRequest>,
-    pub count: usize,
-    pub total_count: usize,
-    pub success_count: usize,
-    pub failed_count: usize,
-    pub has_more: bool,
+    /// Requests that succeeded across the whole (filtered) run. Present on the
+    /// FIRST page only, absent — not zero — on every later page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub success_count: Option<i64>,
+    /// Requests that failed across the whole (filtered) run; first page only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_count: Option<i64>,
+    /// `count`, `limit`, `shown`, `total`, `truncated`, `bound_kind`,
+    /// `next_cursor`, … — pass `next_cursor` back as `cursor` for the next page.
+    #[serde(flatten)]
+    pub page: BoundedReadMeta,
 }
 
-/// Get API requests for a task run from PG database with SQL-level pagination.
+/// Get one keyset page of a run's API requests, optionally only the
+/// succeeded or failed ones. A cursor is bound to the `success_filter` it was
+/// minted under.
 #[tauri::command]
 pub async fn get_task_run_api_requests_from_db(
     state: State<'_, StorageCompartment>,
     task_run_id: String,
     success_filter: Option<bool>,
-    limit: Option<usize>,
-    offset: Option<usize>,
+    limit: Option<i64>,
+    cursor: Option<String>,
 ) -> Result<AiDataResponse<TaskRunApiRequestsResult>, String> {
-    let lim = limit.unwrap_or(200);
-    let off = offset.unwrap_or(0);
+    let limit = task_run_log_limit(limit);
+    let scope = CursorScope::<ApiRequestsWalk>::new()
+        .opt_str("task_run_id", Some(&task_run_id))
+        .opt_str(
+            "success_filter",
+            success_filter.map(|s| if s { "true" } else { "false" }),
+        )
+        .finish();
+    let after = match decode_log_cursor(
+        &scope,
+        cursor.as_deref(),
+        "get_task_run_api_requests_from_db",
+    ) {
+        Ok(after) => after,
+        Err(refusal) => return Ok(refusal),
+    };
 
-    // When no filter, use SQL-level LIMIT/OFFSET (avoids loading all rows into Rust memory)
-    if success_filter.is_none() {
-        let total_count = state
-            .pg_db()
-            .count_task_run_table("task_run_api_requests", &task_run_id)
-            .await
-            .unwrap_or(0) as usize;
-
-        match state
-            .pg_db()
-            .get_task_run_api_requests_paginated(&task_run_id, lim as i64, off as i64)
-            .await
-        {
-            Ok(requests) => {
-                let success_count = requests.iter().filter(|r| r.success).count();
-                let failed_count = requests.iter().filter(|r| !r.success).count();
-                let has_more = off + requests.len() < total_count;
-
-                Ok(AiDataResponse::ok(TaskRunApiRequestsResult {
-                    task_run_id,
-                    requests,
-                    count: total_count,
-                    total_count,
-                    success_count,
-                    failed_count,
-                    has_more,
-                }))
-            }
-            Err(e) => Ok(AiDataResponse::err(e)),
-        }
-    } else {
-        // With success_filter, must fetch all then filter in memory
-        match state.pg_db().get_task_run_api_requests(&task_run_id).await {
-            Ok(all_requests) => {
-                let filter = success_filter.unwrap();
-                let filtered: Vec<_> = all_requests
-                    .into_iter()
-                    .filter(|r| r.success == filter)
-                    .collect();
-                let total_count = filtered.len();
-                let success_count = filtered.iter().filter(|r| r.success).count();
-                let failed_count = filtered.iter().filter(|r| !r.success).count();
-                let requests: Vec<_> = filtered.into_iter().skip(off).take(lim).collect();
-                let has_more = off + requests.len() < total_count;
-
-                Ok(AiDataResponse::ok(TaskRunApiRequestsResult {
-                    task_run_id,
-                    requests,
-                    count: total_count,
-                    total_count,
-                    success_count,
-                    failed_count,
-                    has_more,
-                }))
-            }
-            Err(e) => Ok(AiDataResponse::err(e)),
-        }
+    let fetched = match state
+        .pg_db()
+        .get_task_run_api_requests_page(&task_run_id, success_filter, after, limit)
+        .await
+    {
+        Ok(fetched) => fetched,
+        Err(e) => return Ok(AiDataResponse::err(e)),
+    };
+    let (success_count, failed_count) = (
+        fetched.counts.map(|c| c.succeeded),
+        fetched.counts.map(|c| c.failed),
+    );
+    match log_page(fetched, limit, &scope, |r: &TaskRunApiRequest| {
+        r.id.as_str()
+    }) {
+        Ok((requests, page)) => Ok(AiDataResponse::ok(TaskRunApiRequestsResult {
+            task_run_id,
+            page,
+            requests,
+            success_count,
+            failed_count,
+        })),
+        Err(e) => Ok(AiDataResponse::err(e)),
     }
 }
 
-/// Result of querying AWAS steps from SQLite.
+/// One keyset page of a run's AWAS steps.
 #[derive(Debug, Serialize)]
 pub struct TaskRunAwasStepsResult {
     pub task_run_id: String,
     pub steps: Vec<TaskRunAwasStep>,
-    pub count: usize,
-    pub total_count: usize,
-    pub success_count: usize,
-    pub failed_count: usize,
-    pub has_more: bool,
+    /// Steps that succeeded across the whole (filtered) run. Present on the
+    /// FIRST page only, absent — not zero — on every later page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub success_count: Option<i64>,
+    /// Steps that failed across the whole (filtered) run; first page only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_count: Option<i64>,
+    /// `count`, `limit`, `shown`, `total`, `truncated`, `bound_kind`,
+    /// `next_cursor`, … — pass `next_cursor` back as `cursor` for the next page.
+    #[serde(flatten)]
+    pub page: BoundedReadMeta,
 }
 
-/// Get AWAS steps for a task run from database with SQL-level pagination.
+/// Get one keyset page of a run's AWAS steps, optionally only one
+/// `step_type`. A cursor is bound to the `step_type` it was minted under.
 #[tauri::command]
 pub async fn get_task_run_awas_steps_from_db(
     state: State<'_, StorageCompartment>,
     task_run_id: String,
     step_type: Option<String>,
-    limit: Option<usize>,
-    offset: Option<usize>,
+    limit: Option<i64>,
+    cursor: Option<String>,
 ) -> Result<AiDataResponse<TaskRunAwasStepsResult>, String> {
-    let lim = limit.unwrap_or(200);
-    let off = offset.unwrap_or(0);
+    let limit = task_run_log_limit(limit);
+    let scope = CursorScope::<AwasStepsWalk>::new()
+        .opt_str("task_run_id", Some(&task_run_id))
+        .opt_str("step_type", step_type.as_deref())
+        .finish();
+    let after =
+        match decode_log_cursor(&scope, cursor.as_deref(), "get_task_run_awas_steps_from_db") {
+            Ok(after) => after,
+            Err(refusal) => return Ok(refusal),
+        };
 
-    // When no filter, use SQL-level LIMIT/OFFSET
-    if step_type.is_none() {
-        let total_count = state
-            .pg_db()
-            .count_task_run_table("task_run_awas_steps", &task_run_id)
-            .await
-            .unwrap_or(0) as usize;
-
-        match state
-            .pg_db()
-            .get_task_run_awas_steps_paginated(&task_run_id, lim as i64, off as i64)
-            .await
-        {
-            Ok(steps) => {
-                let success_count = steps.iter().filter(|s| s.success).count();
-                let failed_count = steps.iter().filter(|s| !s.success).count();
-                let has_more = off + steps.len() < total_count;
-
-                Ok(AiDataResponse::ok(TaskRunAwasStepsResult {
-                    task_run_id,
-                    steps,
-                    count: total_count,
-                    total_count,
-                    success_count,
-                    failed_count,
-                    has_more,
-                }))
-            }
-            Err(e) => Ok(AiDataResponse::err(e)),
-        }
-    } else {
-        // With step_type filter, must fetch all then filter in memory
-        match state.pg_db().get_task_run_awas_steps(&task_run_id).await {
-            Ok(all_steps) => {
-                let filter_type = step_type.unwrap();
-                let filtered: Vec<_> = all_steps
-                    .into_iter()
-                    .filter(|s| s.step_type == filter_type)
-                    .collect();
-                let total_count = filtered.len();
-                let success_count = filtered.iter().filter(|s| s.success).count();
-                let failed_count = filtered.iter().filter(|s| !s.success).count();
-                let steps: Vec<_> = filtered.into_iter().skip(off).take(lim).collect();
-                let has_more = off + steps.len() < total_count;
-
-                Ok(AiDataResponse::ok(TaskRunAwasStepsResult {
-                    task_run_id,
-                    steps,
-                    count: total_count,
-                    total_count,
-                    success_count,
-                    failed_count,
-                    has_more,
-                }))
-            }
-            Err(e) => Ok(AiDataResponse::err(e)),
-        }
+    let fetched = match state
+        .pg_db()
+        .get_task_run_awas_steps_page(&task_run_id, step_type.as_deref(), after, limit)
+        .await
+    {
+        Ok(fetched) => fetched,
+        Err(e) => return Ok(AiDataResponse::err(e)),
+    };
+    let (success_count, failed_count) = (
+        fetched.counts.map(|c| c.succeeded),
+        fetched.counts.map(|c| c.failed),
+    );
+    match log_page(fetched, limit, &scope, |r: &TaskRunAwasStep| r.id.as_str()) {
+        Ok((steps, page)) => Ok(AiDataResponse::ok(TaskRunAwasStepsResult {
+            task_run_id,
+            page,
+            steps,
+            success_count,
+            failed_count,
+        })),
+        Err(e) => Ok(AiDataResponse::err(e)),
     }
 }
 
@@ -1712,4 +1856,305 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             get_task_run_context,
         ])
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use qontinui_types::page::BoundKind;
+    use std::path::Path;
+
+    fn at(micros: i64) -> DateTime<Utc> {
+        DateTime::<Utc>::from_timestamp_micros(micros).unwrap_or(DateTime::UNIX_EPOCH)
+    }
+
+    fn scope(task_run_id: &str) -> ScopeFingerprint<PlaywrightResultsWalk> {
+        CursorScope::<PlaywrightResultsWalk>::new()
+            .opt_str("task_run_id", Some(task_run_id))
+            .finish()
+    }
+
+    /// A fake fetch: just row ids. `exact_total` is the first page's counts
+    /// statement (`None` = a later page, which never ran one).
+    fn fetched(ids: &[&str], exact_total: Option<i64>) -> TaskRunLogPage<String> {
+        TaskRunLogPage {
+            rows: ids
+                .iter()
+                .enumerate()
+                .map(|(i, id)| (id.to_string(), at(1_790_000_000_000_000 + i as i64)))
+                .collect(),
+            counts: exact_total.map(|total| TaskRunLogCounts {
+                total,
+                succeeded: 0,
+                failed: 0,
+            }),
+        }
+    }
+
+    const ID_A: &str = "0b7c8e2a-1f3d-4c5e-9a6b-7c8d9e0f1a2b";
+    const ID_B: &str = "1c8d9f3b-2a4e-4d6f-8b7c-8d9e0f1a2b3c";
+    const ID_C: &str = "2d9e0a4c-3b5f-4e7a-9c8d-9e0f1a2b3c4d";
+
+    #[test]
+    fn limit_is_defaulted_and_clamped() {
+        assert_eq!(task_run_log_limit(None), TASK_RUN_LOG_PAGE_DEFAULT);
+        assert_eq!(task_run_log_limit(Some(0)), 1);
+        assert_eq!(task_run_log_limit(Some(-5)), 1);
+        assert_eq!(task_run_log_limit(Some(50)), 50);
+        assert_eq!(task_run_log_limit(Some(i64::MAX)), TASK_RUN_LOG_PAGE_MAX);
+    }
+
+    #[test]
+    fn the_first_page_is_exact_and_mints_its_cursor_from_the_last_kept_row_not_the_probe() {
+        let scope = scope("run-1");
+        // limit 2: A and B are the page, C is the has-more probe.
+        let (rows, meta) = log_page(
+            fetched(&[ID_A, ID_B, ID_C], Some(5)),
+            2,
+            &scope,
+            |r: &String| r.as_str(),
+        )
+        .expect("canonical ids mint a cursor");
+        assert_eq!(rows, vec![ID_A.to_string(), ID_B.to_string()]);
+        assert_eq!(meta.bound_kind, BoundKind::Exact);
+        assert_eq!(meta.total, Some(5));
+        assert_eq!(meta.truncated, Some(true));
+        assert_eq!(meta.shown, 2);
+        assert_eq!(meta.limit, 2);
+        let token = meta.next_cursor.expect("truncated page carries a cursor");
+        let pos = scope.decode(&token).expect("the same scope decodes it");
+        assert_eq!(pos.id.to_string(), ID_B, "the last KEPT row, not the probe");
+        assert_eq!(pos.at, at(1_790_000_000_000_001));
+    }
+
+    #[test]
+    fn a_later_page_runs_no_count_and_reports_at_least_while_rows_remain() {
+        let scope = scope("run-1");
+        let (rows, meta) = log_page(
+            fetched(&[ID_A, ID_B, ID_C], None),
+            2,
+            &scope,
+            |r: &String| r.as_str(),
+        )
+        .expect("mint");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(meta.bound_kind, BoundKind::AtLeast);
+        assert_eq!(meta.truncated, Some(true));
+        assert_eq!(meta.total, None, "no exact total without the count");
+        let pos = scope
+            .decode(&meta.next_cursor.expect("cursor"))
+            .expect("decodes");
+        assert_eq!(pos.id.to_string(), ID_B);
+    }
+
+    #[test]
+    fn the_last_page_is_complete_with_no_cursor_with_or_without_counts() {
+        // Later last page: no counts, no probe row.
+        let (_, meta) = log_page(
+            fetched(&[ID_A, ID_B], None),
+            2,
+            &scope("run-1"),
+            |r: &String| r.as_str(),
+        )
+        .expect("no cursor needed");
+        assert_eq!(meta.bound_kind, BoundKind::Complete);
+        assert_eq!(meta.truncated, Some(false));
+        assert_eq!(meta.next_cursor, None);
+        assert_eq!(meta.enumerate_via, None);
+        // First and only page: exact.
+        let (_, meta) = log_page(
+            fetched(&[ID_A, ID_B], Some(2)),
+            200,
+            &scope("run-1"),
+            |r: &String| r.as_str(),
+        )
+        .expect("no cursor needed");
+        assert_eq!(meta.bound_kind, BoundKind::Exact);
+        assert_eq!(meta.truncated, Some(false));
+        assert_eq!(meta.total, Some(2));
+        assert_eq!(meta.next_cursor, None);
+    }
+
+    #[test]
+    fn counts_that_disagree_with_the_probe_fall_back_to_at_least() {
+        // A running task appended a row between the page and the counts
+        // statements: the counts say the page is complete, the probe row says
+        // more exists. The probe (same snapshot as the rows) wins, honestly.
+        let (rows, meta) = log_page(
+            fetched(&[ID_A, ID_B, ID_C], Some(2)),
+            2,
+            &scope("run-1"),
+            |r: &String| r.as_str(),
+        )
+        .expect("mint");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(meta.bound_kind, BoundKind::AtLeast);
+        assert_eq!(meta.truncated, Some(true));
+        assert!(meta.next_cursor.is_some());
+    }
+
+    #[test]
+    fn an_empty_walk_is_an_exact_zero_not_unknown() {
+        let (rows, meta) = log_page(fetched(&[], Some(0)), 200, &scope("run-1"), |r: &String| {
+            r.as_str()
+        })
+        .expect("empty");
+        assert!(rows.is_empty());
+        assert_eq!(meta.total, Some(0));
+        assert_eq!(meta.truncated, Some(false));
+        assert!(meta.available);
+    }
+
+    #[test]
+    fn a_non_canonical_id_refuses_to_mint_rather_than_skip_rows() {
+        let upper = ID_B.to_uppercase();
+        let err = log_page(
+            fetched(&[ID_A, upper.as_str(), ID_C], None),
+            2,
+            &scope("run-1"),
+            |r: &String| r.as_str(),
+        )
+        .expect_err("an id the TEXT comparison would misplace cannot be resumed after");
+        assert!(err.contains("canonical"), "{err}");
+        // ...but a non-canonical id on a page that needs no cursor is fine.
+        assert!(log_page(
+            fetched(&["not-a-uuid"], Some(1)),
+            2,
+            &scope("run-1"),
+            |r: &String| r.as_str()
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_foreign_or_garbage_cursor_is_the_typed_cursor_malformed_refusal() {
+        let minted = scope("run-1").encode(KeysetPosition {
+            at: at(1_790_000_000_000_000),
+            id: uuid::Uuid::parse_str(ID_A).unwrap_or_default(),
+        });
+        // Replayed against another run: refused, never paged.
+        for (token, other) in [(minted.as_str(), "run-2"), ("garbage", "run-1")] {
+            let refusal = decode_log_cursor::<_, ()>(&scope(other), Some(token), "test_surface")
+                .expect_err("not a token this read minted");
+            assert_eq!(refusal.error_code.as_deref(), Some("cursor_malformed"));
+            let message = refusal.error.unwrap_or_default();
+            assert!(
+                message.contains("`cursor`"),
+                "names the parameter: {message}"
+            );
+            assert!(message.contains("test_surface"), "{message}");
+            assert!(!refusal.success);
+        }
+        // The same scope resumes, and no cursor is the first page.
+        assert!(
+            decode_log_cursor::<_, ()>(&scope("run-1"), Some(&minted), "s")
+                .expect("own token")
+                .is_some()
+        );
+        assert_eq!(
+            decode_log_cursor::<_, ()>(&scope("run-1"), None, "s").expect("first page"),
+            None
+        );
+    }
+
+    #[test]
+    fn the_envelope_flattens_beside_the_collection_with_every_key_present() {
+        let (_, page) = log_page(
+            fetched(&[ID_A, ID_B], Some(3)),
+            1,
+            &scope("run-1"),
+            |r: &String| r.as_str(),
+        )
+        .expect("mint");
+        let result = TaskRunPlaywrightResultsResult {
+            task_run_id: "run-1".into(),
+            page,
+            results: Vec::new(),
+            passed: Some(1),
+            failed: Some(0),
+        };
+        let v = serde_json::to_value(&result).expect("serializes");
+        for key in [
+            "results",
+            "count",
+            "limit",
+            "shown",
+            "total",
+            "truncated",
+            "bound_kind",
+            "next_cursor",
+            "available",
+            "filter_narrowed",
+            "enumerate_via",
+        ] {
+            assert!(v.get(key).is_some(), "missing `{key}` in {v}");
+        }
+        assert!(v.get("has_more").is_none(), "has_more is deleted, not kept");
+        assert!(v.get("offset").is_none());
+    }
+
+    /// Plan D8: a keyset walk is only lossless over a key no statement
+    /// updates. Fails if any SQL the runner ships can move a per-run log row's
+    /// `created_at` or `id` across a cursor.
+    #[test]
+    fn per_run_log_keys_have_no_update_site() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let update = regex::Regex::new(
+            r"(?is)\bUPDATE\s+(?:\w+\.)?(task_run_playwright_results|task_run_api_requests|task_run_awas_steps)\b([^;]*?)\bSET\b([^;]*)",
+        )
+        .expect("regex");
+        let key_assign = regex::Regex::new(r"(?i)\b(created_at|id)\s*=").expect("regex");
+        let mut scanned = 0usize;
+        let mut inserts_seen = 0usize;
+        let mut offenders = Vec::new();
+        for dir in ["queries", "src"] {
+            walk(&root.join(dir), &mut |path, text| {
+                scanned += 1;
+                if path.extension().and_then(|e| e.to_str()) == Some("sql") {
+                    inserts_seen += text.matches("INSERT INTO task_run_api_requests").count();
+                }
+                for caps in update.captures_iter(text) {
+                    // Only the SET list — stop at a WHERE so `WHERE id = …`
+                    // is not read as an assignment.
+                    let set_list = caps[3]
+                        .to_ascii_uppercase()
+                        .split("WHERE")
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
+                    if key_assign.is_match(&set_list) {
+                        offenders.push(format!("{}: {}", path.display(), &caps[0]));
+                    }
+                }
+            });
+        }
+        assert!(scanned > 100, "the scan walked {scanned} files — vacuous");
+        assert!(
+            inserts_seen > 0,
+            "the scan never saw the table's INSERT — it is not reading the SQL"
+        );
+        assert!(
+            offenders.is_empty(),
+            "an UPDATE moves a keyset sort key (plan D8) — the walk would drop rows: {offenders:#?}"
+        );
+    }
+
+    fn walk(dir: &Path, f: &mut dyn FnMut(&Path, &str)) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, f);
+            } else if matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("rs" | "sql")
+            ) {
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    f(&path, &text);
+                }
+            }
+        }
+    }
 }

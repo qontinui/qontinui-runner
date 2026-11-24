@@ -7,8 +7,10 @@
 //!    (already minted by `qontinui_profile device init`).
 //! 2. Detects local resources (cpu_cores, memory_gb, disk_total_gb)
 //!    via `sysinfo`.
-//! 3. Derives the agent-side budget per §3.2:
-//!    `max_concurrent_agents = floor((memory_gb - 4) / 4)`.
+//! 3. Derives the agent-side budget with [`derive_max_agents`] — the minimum
+//!    of a session-memory term and a CPU term, a mirror of coord's
+//!    `fleet::derive_agent_capacity` (coord stores its own derivation on
+//!    ingest, so this number is advisory).
 //! 4. POSTs the budget columns it OWNS — not `role`, which the supervisor
 //!    owns; see [`DeviceBudgetRequest`] — to
 //!    `POST /coord/devices/{device_id}/budget` via coord HTTP. Phase 3
@@ -45,6 +47,23 @@ use qontinui_runner_lib::profiles::connected_coord_base;
 
 use crate::database::pg::PgDb;
 
+/// The `svc:imagegen` host probe: a cached, bounded `GET /v1/models` of the
+/// local llama-swap, advertising the token only when an entry DECLARES image
+/// output (plan `2026-10-13-image-generation-and-visual-judgment`, Phase 25).
+/// Appended in [`host_capabilities`].
+pub(crate) mod imagegen_probe;
+
+/// The `cred` family's regional half: fetches coord's probe catalogue, treats it
+/// as untrusted input, and runs what may run through the family's probe machinery
+/// (plan `2026-10-09-coord-knows-which-box-holds-which-credential`, Phase 3).
+mod cred_probe_specs;
+
+/// The periodic coord heartbeat loop: drives [`heartbeat_to_coord`] under a
+/// per-tick timeout, warns on stalls, and logs a 10-minute summary (plan
+/// `2026-10-29-a-drained-device-is-alerted-as-no-runner-online`, Phase 3).
+pub(crate) mod heartbeat_loop;
+pub use heartbeat_loop::spawn_heartbeat;
+
 /// Per-machine resource samples (plan §A1/§A2). Driven from
 /// [`spawn_budget_republisher`] so it inherits that function's
 /// shared-machine-state ownership gate instead of restating it — see the
@@ -57,6 +76,25 @@ pub(crate) mod resource_sample;
 /// for why the local/remote split is load-bearing and why an unmeasured census
 /// is `None` rather than a row of zeroes.
 pub(crate) mod socket_census;
+
+/// Per-slice cgroup v2 memory and PSI telemetry (plan
+/// `2026-10-19-ci-nodes-run-the-tauri-runner-always-on-as-ci-node-role`,
+/// Phase 0b). Consumed by [`resource_sample`]'s host lane; off Linux it reports
+/// `not_supported` rather than zeroes.
+pub(crate) mod slice_telemetry;
+
+/// Kernel pressure axes for the host lane — load 1/5/15, PSI, the `oom_kill`
+/// counter and `boot_id`, each with a `measured` manifest (plan
+/// `2026-09-30-the-fleet-machine-is-not-a-first-class-coord-entity-and-coord-has-no-resource-model`
+/// §3.4). Consumed by [`resource_sample`] and [`computer`].
+pub(crate) mod host_axes;
+
+/// The fleet computer as a first-class entity: identity, static capacity,
+/// watched services, events and `POST /coord/computers/report` (same plan,
+/// Phase 2 + the runner half of Phase 6). Ticked from
+/// [`spawn_budget_republisher`] so it inherits that function's shared-state
+/// ownership gate, exactly like [`resource_sample`].
+pub(crate) mod computer;
 
 /// §3.2 declared role. Mirrors `qontinui-coord::fleet::MachineRole`.
 /// The runner publishes itself as `Agent`; the supervisor publishes
@@ -85,11 +123,146 @@ pub struct Resources {
     pub disk_total_gb: u64,
 }
 
-/// §3.2 default policy: a dev workstation reserves 4 GiB for the OS +
-/// 4 GiB per agent steady-state. Underflow saturates at 0 for tiny
-/// machines.
-pub fn derive_max_agents(memory_gb: u32) -> u32 {
-    memory_gb.saturating_sub(4) / 4
+// Per-session cost model — a MIRROR of qontinui-coord `crates/coord/src/fleet.rs`
+// (plan `2026-11-04-worktree-cap-charges-4gb-per-allocation-so-a-503gb-box-caps-at-124`).
+// coord is the authority: its budget ingest replaces a non-zero
+// `max_concurrent_agents` this runner publishes with coord's own derivation
+// from the same publish's `memory_gb` / `cpu_cores` / `ci_reserved_gib`, keeps
+// the last stored value when `ci_reserved_gib` is omitted, and stores an
+// explicit `0` (the Build role's) verbatim, so a drift here changes only this
+// runner's own log
+// line and `last_budget.json`, never a cap. The worked-example test below is the
+// same table coord pins; keep the two in step.
+
+/// MiB of RAM one interactive agent session is charged.
+const SESSION_COST_MEM_MIB: u32 = 512;
+/// Milli-cores one interactive session is charged.
+const SESSION_COST_CPU_MILLI: u32 = 200;
+/// GiB no session may eat into (OS, runner, proxies).
+const OS_RESERVE_GIB: u32 = 8;
+/// GiB one build slot is charged.
+const BUILD_MEM_GIB: u32 = 4;
+/// The derivation never answers below this.
+const MIN_DEVICE_AGENTS: u32 = 3;
+
+/// `min(memory_gb / 4, cpu_cores / 4)` — coord's `derive_max_builds`.
+fn derive_max_builds(memory_gb: u32, cpu_cores: u32) -> u32 {
+    (memory_gb / BUILD_MEM_GIB).min(cpu_cores / 4)
+}
+
+/// How many concurrent agent sessions this machine can carry:
+/// `max(MIN_DEVICE_AGENTS, min(mem_term, cpu_term))`, where
+/// `mem_term = (memory_gb − 8 − builds × 4 − ci_reserved_gib) / 0.5 GiB` and
+/// `cpu_term = (cpu_cores − max(2, ceil(cores / 10))) / 0.2`.
+pub fn derive_max_agents(memory_gb: u32, cpu_cores: u32, ci_reserved_gib: u32) -> u32 {
+    let build_reserve = derive_max_builds(memory_gb, cpu_cores).saturating_mul(BUILD_MEM_GIB);
+    let session_mem_gib = memory_gb
+        .saturating_sub(OS_RESERVE_GIB)
+        .saturating_sub(build_reserve)
+        .saturating_sub(ci_reserved_gib);
+    let mem_term = u64::from(session_mem_gib) * 1024 / u64::from(SESSION_COST_MEM_MIB);
+    let session_cores = cpu_cores.saturating_sub(cpu_cores.div_ceil(10).max(2));
+    let cpu_term = u64::from(session_cores) * 1000 / u64::from(SESSION_COST_CPU_MILLI);
+    let derived = mem_term.min(cpu_term).min(u64::from(u32::MAX)) as u32;
+    derived.max(MIN_DEVICE_AGENTS)
+}
+
+/// GiB one CI job slot is charged off Linux, where no cgroup bound can be read:
+/// the 16 GB size of the hosted runner the CI jobs are written for (coord's
+/// `fleet_placement::C1_SLOT_MEM_GIB`).
+const CI_JOB_MEM_GIB: u32 = 16;
+
+/// What this host's cgroup tree says CI may take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CiReservation {
+    /// The sum of each `ci.slice/*.slice` bound, rounded UP to a GiB; `0` when
+    /// the host has no `ci.slice`.
+    Bounded(u32),
+    /// A CI slice exists with neither `memory.high` nor `memory.max` set, so
+    /// CI may take the whole box: the reservation is UNKNOWN, never zero.
+    Unbounded,
+    /// No unified cgroup v2 tree to read (Windows, macOS, cgroup v1).
+    NoCgroup,
+}
+
+/// A slice's memory bound in bytes: `memory.high` when numeric, else
+/// `memory.max` when numeric. cgroup v2 spells "no limit" as `max`.
+fn slice_bound_bytes(dir: &std::path::Path) -> Option<u64> {
+    ["memory.high", "memory.max"].iter().find_map(|f| {
+        std::fs::read_to_string(dir.join(f))
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    })
+}
+
+/// [`CiReservation`] read from a cgroup v2 root (`/sys/fs/cgroup` in
+/// production; a fixture directory in tests).
+pub(crate) fn ci_reservation_from_root(root: &std::path::Path) -> CiReservation {
+    if !root.join("cgroup.controllers").exists() {
+        return CiReservation::NoCgroup;
+    }
+    let ci = root.join("ci.slice");
+    if !ci.is_dir() {
+        return CiReservation::Bounded(0);
+    }
+    let mut children: Vec<std::path::PathBuf> = std::fs::read_dir(&ci)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.is_dir() && p.extension().is_some_and(|x| x == "slice"))
+                .collect()
+        })
+        .unwrap_or_default();
+    children.sort();
+    // The parent's own bound caps everything under it. With no child slices,
+    // CI runs (if at all) directly in `ci.slice`, so only its own bound can
+    // answer: an unbounded `ci.slice` is UNKNOWN, never zero — zero is only
+    // the answer for a host with no `ci.slice` at all.
+    let parent = slice_bound_bytes(&ci);
+    let children_total: Option<u64> = if children.is_empty() {
+        None
+    } else {
+        children
+            .iter()
+            .map(|c| slice_bound_bytes(c))
+            .try_fold(0u64, |acc, b| b.map(|b| acc.saturating_add(b)))
+    };
+    let total = match (parent, children_total) {
+        (Some(p), Some(c)) => Some(p.min(c)),
+        (Some(p), None) => Some(p),
+        (None, c) => c,
+    };
+    match total {
+        Some(bytes) => {
+            let gib = bytes.div_ceil(1024 * 1024 * 1024);
+            CiReservation::Bounded(gib.min(u64::from(u32::MAX)) as u32)
+        }
+        None => CiReservation::Unbounded,
+    }
+}
+
+/// This host's [`CiReservation`].
+fn probe_ci_reservation() -> CiReservation {
+    if cfg!(target_os = "linux") {
+        ci_reservation_from_root(std::path::Path::new("/sys/fs/cgroup"))
+    } else {
+        CiReservation::NoCgroup
+    }
+}
+
+/// The `ci_reserved_gib` this runner publishes: the cgroup bound on Linux,
+/// the CI job slots × [`CI_JOB_MEM_GIB`] where no cgroup can be read, and
+/// `None` (omitted, so coord keeps its last stored agent count) when a CI
+/// slice is unbounded. The slots are the node's configured or STATIC
+/// partition, never the capacity model's current answer: the plan makes the
+/// reservation one of the model's inputs (Phase 5), and feeding the model's
+/// output back into it would move the reservation, and the agent cap derived
+/// from it, inversely to load.
+fn published_ci_reserved_gib(reservation: CiReservation, ci_jobs: u32) -> Option<u32> {
+    match reservation {
+        CiReservation::Bounded(gib) => Some(gib),
+        CiReservation::Unbounded => None,
+        CiReservation::NoCgroup => Some(ci_jobs.saturating_mul(CI_JOB_MEM_GIB)),
+    }
 }
 
 /// Detect cpu_cores / memory_gb / disk_total_gb on the current host.
@@ -194,39 +367,157 @@ pub(crate) struct LocalBindingSet {
     /// Every locally-held binding (deduped; always contains
     /// `default_tenant`).
     pub(crate) tenant_ids: Vec<uuid::Uuid>,
+    /// Which source answered — it decides which credential a request made on
+    /// the strength of this set can present ([`Self::bearer_scope`]).
+    pub(crate) source: BindingSource,
 }
 
-/// Resolve the device's binding set for coord-side requests
-/// (`POST /coord/devices/register`). Returns the first hit:
+/// Where [`resolve_binding_set`] found the binding set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BindingSource {
+    /// `paired_user.json`.
+    PairedUserFile,
+    /// The legacy `access_token` slot's `tenant_id` claim.
+    LegacySlotClaim,
+    /// The per-tenant `device_jwt:<tenant>` slots' own claims — the
+    /// last-resort source when the file is gone and the legacy slot is dead.
+    TenantSlotClaims,
+}
+
+impl LocalBindingSet {
+    /// The credential scope a device-level request resolved from this set
+    /// presents. `Device` (the legacy slot) everywhere it can answer; when the
+    /// set came from the per-tenant slots the legacy slot is by construction
+    /// dead or empty, so `Device` would send the request unauthenticated —
+    /// `Owned(default)` presents the default's own usable slot instead.
+    pub(crate) fn bearer_scope(&self) -> crate::auth::TenantScope {
+        match self.source {
+            BindingSource::TenantSlotClaims => crate::auth::TenantScope::Owned(self.default_tenant),
+            BindingSource::PairedUserFile | BindingSource::LegacySlotClaim => {
+                crate::auth::TenantScope::Device
+            }
+        }
+    }
+}
+
+/// Resolve the device's binding set for coord-side requests. Returns the
+/// first hit:
 ///
 /// 1. `paired_user.json` — the v2-migrated binding set (legacy files
 ///    yield their one synthesized entry); the default is
 ///    `default_tenant_id`/`tenant_id`.
-/// 2. JWT-claim fallback — decode `tenant_id` from the cached
-///    device-token JWT via
-///    [`qontinui_runner_lib::pair::tenant_id_from_oauth_claim`]; the set
-///    is that single tenant. (The pre-8a opportunistic disk backfill is
-///    gone — the register response's `tenant_ids` reconciliation is the
-///    file's healer now, and per-tick resolution works without the
-///    write-back.)
-/// 3. `None` — no source has a usable tenant. Callers must skip the
-///    request (coord rejects with `400 tenant_id_required`).
+/// 2. The legacy `access_token` JWT's `tenant_id` claim
+///    ([`qontinui_runner_lib::pair::tenant_id_from_oauth_claim`]) — a usable
+///    token's first, a present-but-dead one's otherwise (the historical
+///    branch); the set is that single tenant. (The pre-8a opportunistic disk
+///    backfill is gone — the register response's `tenant_ids`
+///    reconciliation is the file's healer now, and per-tick resolution works
+///    without the write-back.)
+/// 3. `None` — no source has a tenant. Callers must skip the request.
+///
+/// Deliberately NO per-tenant-slot branch: every [`resolve_tenant_id`]
+/// caller (slot leases and spawns, session attribution, coord registration)
+/// stamps the answer on a write, and an arbitrary slot tenant — possibly one
+/// coord has unbound — is the wrong thing to stamp (review round 2,
+/// MEDIUM 2). The register heartbeat alone has that fallback:
+/// [`resolve_heartbeat_binding_set`].
 pub(crate) fn resolve_binding_set() -> Option<LocalBindingSet> {
-    // Branch 1 — paired_user.json (v2-migrated view)
-    if let Some(s) = qontinui_runner_lib::pair::read_paired_tenant_id_from_disk() {
-        if let Ok(default_tenant) = uuid::Uuid::parse_str(s.trim()) {
-            let mut tenant_ids = qontinui_runner_lib::pair::read_paired_binding_tenant_ids();
-            if !tenant_ids.contains(&default_tenant) {
-                tenant_ids.insert(0, default_tenant);
-            }
-            return Some(LocalBindingSet {
-                default_tenant,
-                tenant_ids,
-            });
+    resolve_binding_set_with(&BindingSources::production())
+}
+
+/// [`resolve_binding_set`] over injected sources. Takes the SAME source set
+/// the heartbeat does and deliberately never reads `slots`, `bound` or
+/// `active` — so a test handing it panicking slot sources pins that the
+/// non-heartbeat path cannot regain the slot fallback (review round 3).
+pub(crate) fn resolve_binding_set_with(src: &BindingSources<'_>) -> Option<LocalBindingSet> {
+    choose_binding_set(src.file, src.legacy, || None)
+}
+
+/// The register heartbeat's binding set: [`resolve_binding_set`]'s sources,
+/// then — after a usable legacy claim and before a dead one — the per-tenant
+/// slots' own claims ([`heartbeat_slot_fallback`]). Plan
+/// `2026-09-29-vanished-paired-user-json-leaves-a-live-jwt-with-no-coord-credential`
+/// review finding 1: with the file gone and the legacy slot dead, the
+/// heartbeat was never sent, so `coord_bound_tenants.json` was never
+/// re-stamped, the bound set aged to UNKNOWN, and the heal's Guard 1 refused
+/// forever. The heartbeat presents the chosen default's own slot JWT
+/// ([`LocalBindingSet::bearer_scope`]), the same tenant it sends as
+/// `tenant_id`.
+pub(crate) fn resolve_heartbeat_binding_set() -> Option<LocalBindingSet> {
+    resolve_heartbeat_binding_set_with(&BindingSources::production())
+}
+
+/// [`resolve_heartbeat_binding_set`] over injected sources: the slot
+/// candidates, coord's bound set and the active tenant are read only when
+/// the file and a usable legacy claim both missed, and are fed to
+/// [`heartbeat_slot_fallback`].
+pub(crate) fn resolve_heartbeat_binding_set_with(
+    src: &BindingSources<'_>,
+) -> Option<LocalBindingSet> {
+    choose_binding_set(src.file, src.legacy, || {
+        let candidates = (src.slots)()?;
+        heartbeat_slot_fallback(candidates, &(src.bound)(), (src.active)())
+    })
+}
+
+/// Every source the two binding-set resolvers read, injectable so their
+/// WIRING — which sources each consults, and what the heartbeat hands its
+/// fallback — is testable without a credential store (review round 3).
+/// [`BindingSources::production`] is the real set.
+pub(crate) struct BindingSources<'a> {
+    /// Branch 1: `paired_user.json`'s default + binding set.
+    pub(crate) file: &'a dyn Fn() -> Option<(uuid::Uuid, Vec<uuid::Uuid>)>,
+    /// Branch 2: the legacy slot's claim tenant and whether it is USABLE.
+    pub(crate) legacy: &'a dyn Fn() -> Option<(uuid::Uuid, bool)>,
+    /// Heartbeat only: tenants whose per-tenant slot holds a usable,
+    /// self-naming JWT.
+    pub(crate) slots: &'a dyn Fn() -> Option<Vec<uuid::Uuid>>,
+    /// Heartbeat only: coord's recorded bound set.
+    pub(crate) bound: &'a dyn Fn() -> qontinui_runner_lib::pair::CoordBoundTenantsRead,
+    /// Heartbeat only: `machine.json`'s `active_tenant_id`.
+    pub(crate) active: &'a dyn Fn() -> Option<uuid::Uuid>,
+}
+
+impl BindingSources<'static> {
+    /// The real sources.
+    pub(crate) fn production() -> Self {
+        Self {
+            file: &read_file_binding_source,
+            legacy: &read_legacy_binding_source,
+            slots: &read_slot_claim_candidates,
+            bound: &qontinui_runner_lib::pair::coord_bound_tenants,
+            active: &read_active_tenant,
         }
     }
+}
 
-    // Branch 2 — cached device-token JWT (the legacy/default slot)
+/// Heartbeat source: the per-tenant slots' usable, self-naming tenants.
+fn read_slot_claim_candidates() -> Option<Vec<uuid::Uuid>> {
+    qontinui_runner_lib::pair::usable_slot_claim_tenants().map(|(_, candidates)| candidates)
+}
+
+/// Heartbeat source: `machine.json`'s `active_tenant_id`. A DIRECT pin read,
+/// so it is classified in `commands::tenant::PIN_SURFACES`
+/// (`register_heartbeat_slot_fallback_default`, live): `read_machine_json` is a
+/// fresh file read, and this runs on every heartbeat that reaches the slot
+/// fallback.
+fn read_active_tenant() -> Option<uuid::Uuid> {
+    qontinui_runner_lib::ambient::read_machine_json().active_tenant_uuid()
+}
+
+/// Branch 1 source: `paired_user.json`'s default + binding set.
+fn read_file_binding_source() -> Option<(uuid::Uuid, Vec<uuid::Uuid>)> {
+    let s = qontinui_runner_lib::pair::read_paired_tenant_id_from_disk()?;
+    let default_tenant = uuid::Uuid::parse_str(s.trim()).ok()?;
+    Some((
+        default_tenant,
+        qontinui_runner_lib::pair::read_paired_binding_tenant_ids(),
+    ))
+}
+
+/// Branch 2 source: the legacy slot's claim tenant, and whether its token is
+/// USABLE.
+fn read_legacy_binding_source() -> Option<(uuid::Uuid, bool)> {
     let token = crate::auth::AuthManager::new()
         .get_access_token()
         .ok()
@@ -235,11 +526,77 @@ pub(crate) fn resolve_binding_set() -> Option<LocalBindingSet> {
         return None;
     }
     let claim = qontinui_runner_lib::pair::tenant_id_from_oauth_claim(&token)?;
-    let parsed = uuid::Uuid::parse_str(claim.trim()).ok()?;
-    Some(LocalBindingSet {
-        default_tenant: parsed,
-        tenant_ids: vec![parsed],
-    })
+    let tenant = uuid::Uuid::parse_str(claim.trim()).ok()?;
+    Some((tenant, crate::auth::slot_jwt_is_usable(&token)))
+}
+
+/// The heartbeat's per-tenant-slot fallback over its inputs: `candidates`
+/// are the tenants whose slot holds a usable, self-naming JWT.
+///
+/// - When coord's recorded bound set is `Known`, only candidates in it
+///   survive — a slot for a tenant coord unbound is never heartbeated as.
+///   When it is `Unknown`, every candidate is allowed: the heartbeat is the
+///   very thing that re-stamps the set, so filtering on an unknown set would
+///   rebuild the lockout this fallback ends.
+/// - The default is `machine.json`'s `active_tenant_id` when it is among the
+///   survivors, else the greatest id (deterministic).
+///
+/// `None` when no candidate survives.
+pub(crate) fn heartbeat_slot_fallback(
+    mut candidates: Vec<uuid::Uuid>,
+    bound: &qontinui_runner_lib::pair::CoordBoundTenantsRead,
+    active_tenant: Option<uuid::Uuid>,
+) -> Option<(uuid::Uuid, Vec<uuid::Uuid>)> {
+    if let qontinui_runner_lib::pair::CoordBoundTenantsRead::Known(set) = bound {
+        candidates.retain(|t| set.contains(t));
+    }
+    candidates.sort();
+    candidates.dedup();
+    let default = active_tenant
+        .filter(|a| candidates.contains(a))
+        .or_else(|| candidates.last().copied())?;
+    Some((default, candidates))
+}
+
+/// Pure-over-injected-sources core of [`resolve_binding_set`] and
+/// [`resolve_heartbeat_binding_set`], so the branch order is testable
+/// without a credential store. `file` is branch 1; `legacy` yields the
+/// legacy slot's claim tenant and whether that token is USABLE; `slots` is
+/// the heartbeat-only per-tenant-slot fallback (`|| None` everywhere else),
+/// consulted after a usable legacy claim and before a dead one. Each source
+/// is read only when every earlier branch missed.
+pub(crate) fn choose_binding_set(
+    file: impl FnOnce() -> Option<(uuid::Uuid, Vec<uuid::Uuid>)>,
+    legacy: impl FnOnce() -> Option<(uuid::Uuid, bool)>,
+    slots: impl FnOnce() -> Option<(uuid::Uuid, Vec<uuid::Uuid>)>,
+) -> Option<LocalBindingSet> {
+    if let Some((default_tenant, mut tenant_ids)) = file() {
+        if !tenant_ids.contains(&default_tenant) {
+            tenant_ids.insert(0, default_tenant);
+        }
+        return Some(LocalBindingSet {
+            default_tenant,
+            tenant_ids,
+            source: BindingSource::PairedUserFile,
+        });
+    }
+    let legacy = legacy();
+    let single = |t: uuid::Uuid| LocalBindingSet {
+        default_tenant: t,
+        tenant_ids: vec![t],
+        source: BindingSource::LegacySlotClaim,
+    };
+    if let Some((t, true)) = legacy {
+        return Some(single(t));
+    }
+    if let Some((default_tenant, tenant_ids)) = slots() {
+        return Some(LocalBindingSet {
+            default_tenant,
+            tenant_ids,
+            source: BindingSource::TenantSlotClaims,
+        });
+    }
+    legacy.map(|(t, _)| single(t))
 }
 
 /// Single-tenant convenience over [`resolve_binding_set`]: the DEFAULT
@@ -272,6 +629,29 @@ fn response_tenant_id(body: &str) -> Option<uuid::Uuid> {
 static COORD_ONLY_BINDINGS_WARNED: std::sync::OnceLock<
     std::sync::Mutex<std::collections::BTreeSet<uuid::Uuid>>,
 > = std::sync::OnceLock::new();
+
+/// Act on one heartbeat reconcile pass: log and `notify` when it changed local
+/// binding state, then flag each binding only coord holds. The reconcile drops
+/// bindings with no user action, so without the notify the tenant list and its
+/// credential notes keep showing a binding the device has lost until the app
+/// restarts. `notify` is a parameter so a test can count it; the heartbeat
+/// passes [`crate::commands::web_integration::notify_tenant_bindings_changed`].
+fn apply_binding_reconcile_report(
+    report: qontinui_runner_lib::pair::BindingReconcileReport,
+    notify: impl FnOnce(),
+) {
+    if report.changed() {
+        info!(
+            "fleet::heartbeat: reconciled bindings against coord \
+             (dropped={:?} dropped_slots={:?} default_repointed={:?})",
+            report.dropped, report.dropped_slots, report.default_repointed
+        );
+        notify();
+    }
+    for (t, slot) in report.coord_only {
+        warn_coord_only_binding_once(t, slot);
+    }
+}
 
 fn warn_coord_only_binding_once(tenant: uuid::Uuid, slot: qontinui_runner_lib::auth::SlotState) {
     let set = COORD_ONLY_BINDINGS_WARNED
@@ -381,7 +761,7 @@ fn last_budget_cache_path() -> Option<PathBuf> {
 /// | `role` | supervisor (publishes `build`) | **absent — see below** |
 /// | `max_concurrent_builds` | supervisor | **absent — see the capacity split below** |
 /// | `max_concurrent_ci_jobs` | runner | always sent |
-/// | `max_concurrent_agents` | runner | always sent |
+/// | `max_concurrent_agents` | **coord** (for a non-zero value it stores its own derivation from this payload's `memory_gb`/`cpu_cores`/`ci_reserved_gib`, or keeps the last stored value when `ci_reserved_gib` is absent; see the per-session cost-model note above `SESSION_COST_MEM_MIB`) | always sent: an advisory derived value for the Agent role, an explicit `0` (stored verbatim) for the Build role |
 /// | `cpu_cores`, `memory_gb`, `disk_*` | neither — they describe the BOX | always sent by both |
 ///
 /// Scoped to THIS payload. `ci_runner_labels` is also supervisor-owned but
@@ -450,6 +830,12 @@ struct DeviceBudgetRequest {
     disk_total_gb: i64,
     disk_reserved_gb: i64,
     max_concurrent_agents: i32,
+    /// GiB of host memory this host's CI may take ([`published_ci_reserved_gib`]).
+    /// coord derives the stored `max_concurrent_agents` from it, and OMITTED
+    /// (an unbounded CI slice) means "unknown": coord then keeps its last
+    /// stored value rather than reading CI as zero.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    ci_reserved_gib: Option<u32>,
     /// CI job slots — the column this runner unambiguously owns, read only by
     /// coord's `ci_dispatch` for devices advertising the `ci_node` capability.
     ///
@@ -478,9 +864,20 @@ struct DeviceBudgetRequest {
 /// three copies of it was two too many.
 use crate::util::error_chain::error_chain;
 
-/// POST the budget payload with exponential backoff (2s, 4s, 8s, 16s, 32s, 60s).
-/// Returns Ok on first success; returns Err with the last error if every
-/// attempt fails. The caller decides whether to surface or swallow.
+/// How a budget publish is delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BudgetDelivery {
+    /// The boot publish and the periodic re-assert: retried with backoff.
+    Retry,
+    /// A change-triggered publish on the sample loop: one attempt, so a
+    /// failing budget route can never hold that loop for minutes.
+    Once,
+}
+
+/// POST the budget payload — under [`BudgetDelivery::Retry`] with exponential
+/// backoff (2s, 4s, 8s, 16s, 32s, 60s), under [`BudgetDelivery::Once`] one
+/// attempt. Returns Ok on first success; returns Err with the last error if
+/// every attempt fails. The caller decides whether to surface or swallow.
 ///
 /// Per the runner-bootable-when-coord-down property, this is the ONLY
 /// place we busy-wait on coord HTTP; the caller wraps this in
@@ -489,6 +886,7 @@ async fn post_budget_with_retry(
     coord_base: &str,
     device_id: &str,
     body: &DeviceBudgetRequest,
+    delivery: BudgetDelivery,
 ) -> Result<(), String> {
     let url = format!("{}/coord/devices/{}/budget", coord_base, device_id);
     let client = reqwest::Client::builder()
@@ -496,7 +894,10 @@ async fn post_budget_with_retry(
         .build()
         .map_err(|e| format!("reqwest client build: {e}"))?;
     let mut last_err = String::new();
-    let backoff_ms: [u64; 6] = [2_000, 4_000, 8_000, 16_000, 32_000, 60_000];
+    let backoff_ms: &[u64] = match delivery {
+        BudgetDelivery::Retry => &[2_000, 4_000, 8_000, 16_000, 32_000, 60_000],
+        BudgetDelivery::Once => &[0],
+    };
     for (attempt, delay_ms) in backoff_ms.iter().enumerate() {
         // coord-tenant-scope(device): device_id (:481) is the only identity in scope; the budget row is device-keyed and coord's handler reads no tenant at all.
         match crate::auth::attach_device_auth(client.post(&url).json(body))
@@ -679,6 +1080,13 @@ pub(crate) fn machine_state_publish_allowed(owns_shared_root_state: bool) -> boo
 /// `role` is consumed here (it decides the agent cap) but deliberately never
 /// reaches the payload — see [`DeviceBudgetRequest`] for why the supervisor
 /// owns that column.
+///
+/// `suggested` is the CI node's suggestion for an unset capacity, resolved by
+/// the caller ([`crate::ci_node::host_sizing::suggested_concurrent_builds_now`]:
+/// the capacity model's Lane B total when it answers, else the static formula)
+/// so this function stays pure; `host` gives the static partition the
+/// reservation is sized from.
+#[allow(clippy::too_many_arguments)]
 fn build_budget_request(
     hostname: &str,
     role: MachineRole,
@@ -686,7 +1094,20 @@ fn build_budget_request(
     disk_reserved_gb: u64,
     ci: &crate::settings::CiNodeSettings,
     host: crate::ci_node::host_sizing::HostCapacity,
+    suggested: u32,
+    ci_reservation: CiReservation,
 ) -> DeviceBudgetRequest {
+    let (ci_jobs, reserved_jobs) = if ci.enabled {
+        (
+            ci.configured_or(suggested),
+            ci.configured_or(crate::ci_node::host_sizing::suggested_concurrent_builds(
+                host,
+            )),
+        )
+    } else {
+        (0, 0)
+    };
+    let ci_reserved_gib = published_ci_reserved_gib(ci_reservation, reserved_jobs);
     DeviceBudgetRequest {
         hostname: hostname.to_string(),
         cpu_cores: resources.cpu_cores.min(i32::MAX as u32) as i32,
@@ -694,22 +1115,28 @@ fn build_budget_request(
         disk_total_gb: resources.disk_total_gb.min(i64::MAX as u64) as i64,
         disk_reserved_gb: disk_reserved_gb.min(i64::MAX as u64) as i64,
         max_concurrent_agents: match role {
-            MachineRole::Agent => derive_max_agents(resources.memory_gb) as i32,
+            // Advisory: coord stores its own derivation (and keeps its last
+            // stored value when `ci_reserved_gib` is omitted).
+            MachineRole::Agent => derive_max_agents(
+                resources.memory_gb,
+                resources.cpu_cores,
+                ci_reserved_gib.unwrap_or(0),
+            ) as i32,
             MachineRole::Build => 0,
         },
+        ci_reserved_gib,
         // `ci.max_concurrent_builds` is the RUNNER-LOCAL settings key
-        // (`ci_node.max_concurrent_builds`; unset ⇒ the host suggestion for
-        // `host`) — resolved through the same accessor `ci_node/admission.rs`
-        // admits against, so the advertised and admitted numbers cannot
-        // diverge. It is deliberately not renamed. It is operator-visible, and
-        // the split is about which coord COLUMN carries the number, not about
-        // what the node calls its own capacity. `host` is passed in rather than
-        // probed here so this function stays pure over its arguments.
-        max_concurrent_ci_jobs: if ci.enabled {
-            ci.configured_or_suggested_builds(host).min(i32::MAX as u32) as i32
-        } else {
-            0
-        },
+        // (`ci_node.max_concurrent_builds`; unset ⇒ `suggested`) — resolved
+        // through the same accessor `ci_node/admission.rs` admits against
+        // (`CiNodeSettings::configured_or`). The capacity model's answer moves
+        // between budget periods, so the republisher re-publishes whenever this
+        // number changes (`spawn_budget_republisher`): the advertised number
+        // trails the admitted one by at most one sample interval. It is
+        // deliberately not renamed. It is operator-visible, and the split is
+        // about which coord COLUMN carries the number, not about what the node
+        // calls its own capacity. `host` and `suggested` are passed in rather
+        // than probed here so this function stays pure over its arguments.
+        max_concurrent_ci_jobs: ci_jobs.min(i32::MAX as u32) as i32,
     }
 }
 
@@ -743,6 +1170,16 @@ pub async fn publish_budget(
     resources: Resources,
     disk_reserved_gb: u64,
 ) -> Result<(), String> {
+    publish_budget_with(role, resources, disk_reserved_gb, BudgetDelivery::Retry).await
+}
+
+/// [`publish_budget`] with its delivery chosen ([`BudgetDelivery`]).
+async fn publish_budget_with(
+    role: MachineRole,
+    resources: Resources,
+    disk_reserved_gb: u64,
+    delivery: BudgetDelivery,
+) -> Result<(), String> {
     if !machine_state_publish_allowed(crate::instance::owns_shared_root_state()) {
         info!(
             instance = ?crate::instance::instance_name(),
@@ -775,13 +1212,26 @@ pub async fn publish_budget(
     let device_id_str = device_id_uuid.to_string();
 
     let ci = crate::settings::get_ci_node_settings();
+    let host = crate::ci_node::host_sizing::probe();
+    // The capacity model is read only when its answer is used: a CI node
+    // with no explicit capacity (`configured_or_suggested_builds` reads
+    // nothing for an explicit one). A disabled node publishes 0 CI jobs and
+    // `build_budget_request` ignores `suggested`, so it reads no model and logs
+    // no D9 records for a consumer that is off on this box.
+    let suggested = if ci.enabled {
+        ci.configured_or_suggested_builds(host)
+    } else {
+        0
+    };
     let body = build_budget_request(
         &device.hostname,
         role,
         resources,
         disk_reserved_gb,
         &ci,
-        crate::ci_node::host_sizing::probe(),
+        host,
+        suggested,
+        probe_ci_reservation(),
     );
 
     // Cache the payload regardless of whether the POST succeeds — this is
@@ -798,8 +1248,12 @@ pub async fn publish_budget(
         }
     };
 
-    match post_budget_with_retry(&coord_base, &device_id_str, &body).await {
+    match post_budget_with_retry(&coord_base, &device_id_str, &body, delivery).await {
         Ok(()) => {
+            // Recorded only once coord took it: a failed publish leaves the
+            // old value, so `advertised_ci_jobs_changed` retries on the next
+            // sample tick with one attempt (`BudgetDelivery::Once`).
+            record_advertised_ci_jobs(body.max_concurrent_ci_jobs);
             // Columns this runner does NOT own are named as `not published`,
             // so the ownership split is visible in the log rather than
             // inferable only from the wire. Silence about which fields were
@@ -851,6 +1305,32 @@ fn budget_republish_secs() -> u64 {
         .and_then(|s| s.parse().ok())
         .unwrap_or(BUDGET_REPUBLISH_DEFAULT_SECS)
         .max(60)
+}
+
+/// The `max_concurrent_ci_jobs` the last SUCCESSFUL budget publish carried;
+/// `-1` = none yet in this process.
+static ADVERTISED_CI_JOBS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+
+fn record_advertised_ci_jobs(jobs: i32) {
+    ADVERTISED_CI_JOBS.store(i64::from(jobs), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Has the CI node's capacity moved off what the last successful budget
+/// publish advertised? With the capacity model (plan
+/// `2026-11-05-one-free-resource-model-places-sessions-builds-and-ci` Phase 7)
+/// an unset capacity changes with the box's load, and coord's `ci_dispatch`
+/// places against the advertised column, so a change is re-published on the
+/// next sample tick rather than at the next budget period. Takes `ci_state`'s
+/// lock through the model's read; the republisher holds no lock.
+fn advertised_ci_jobs_changed() -> bool {
+    let ci = crate::settings::get_ci_node_settings();
+    let now = if ci.enabled {
+        ci.configured_or_suggested_builds(crate::ci_node::host_sizing::probe())
+    } else {
+        0
+    };
+    let advertised = ADVERTISED_CI_JOBS.load(std::sync::atomic::Ordering::Relaxed);
+    advertised >= 0 && advertised != i64::from(now.min(i32::MAX as u32))
 }
 
 /// Periodically re-assert this device's budget, so a clobbered or stale
@@ -909,6 +1389,14 @@ fn budget_republish_secs() -> u64 {
 /// therefore has up to one sample interval of granularity error (600s becomes
 /// 600–630s), which is immaterial for a self-heal loop and is the price of not
 /// running two timers.
+///
+/// One exception, and it is a CHANGE, not a re-assert: when the CI node's
+/// capacity moves off what the last successful publish advertised (the
+/// capacity model's answer follows the box's load —
+/// [`advertised_ci_jobs_changed`]), the budget is published on that tick with
+/// ONE attempt ([`BudgetDelivery::Once`]), so a failing budget route costs a
+/// tick at most one request timeout and never the retry ladder; a failure
+/// leaves the advertised value unrecorded, so the next tick tries again.
 pub fn spawn_budget_republisher(role: MachineRole) {
     if !machine_state_publish_allowed(crate::instance::owns_shared_root_state()) {
         info!(
@@ -939,26 +1427,59 @@ pub fn spawn_budget_republisher(role: MachineRole) {
             // payload fires immediately — the first sample lands one sample
             // interval in, the first re-assert one full budget period in.
             let mut next_budget = tokio::time::Instant::now() + Duration::from_secs(budget_secs);
+            // The computer reporter (identity, services, events) rides this
+            // same gated loop — no timer or gate of its own. Rebuilt per
+            // supervised run; its durable state lives on disk.
+            let mut reporter = computer::Reporter::new();
             loop {
                 tokio::time::sleep(resource_sample::jittered_sleep(sample_secs)).await;
                 hb.tick();
 
                 // Observation lane: best-effort, never retried, never fatal.
                 resource_sample::publish_once().await;
+                reporter.tick().await;
 
-                if tokio::time::Instant::now() < next_budget {
-                    continue;
+                // The CI node sizes its concurrency from coord's capacity
+                // model (plan 2026-11-05-one-free-resource-model-places-
+                // sessions-builds-and-ci Phase 7) and reads the cached row
+                // synchronously; this keeps it warm on the one periodic
+                // publisher rather than a timer of its own (coord is asked
+                // only when the kept read is stale — `fleet_capacity`).
+                if crate::settings::get_ci_node_settings().enabled {
+                    crate::ci_node::host_sizing::refresh_model().await;
+                    // A cap the model raised re-admits what it deferred.
+                    crate::ci_node::admission::drain_deferred_on_cap_rise();
                 }
+
+                let due = tokio::time::Instant::now() >= next_budget;
+                let delivery = if due {
+                    BudgetDelivery::Retry
+                } else if advertised_ci_jobs_changed() {
+                    BudgetDelivery::Once
+                } else {
+                    continue;
+                };
                 // Authoritative lane. Resources are re-detected each time: disk
                 // fills, and the ci_node settings this derives
                 // `max_concurrent_builds` from can change while the runner is up
                 // (the setting is designed to need no restart —
                 // `ci_node/subscription.rs` re-reads it every loop).
                 let resources = detect_resources();
-                if let Err(e) = publish_budget(role, resources, 0).await {
-                    warn!("fleet::budget_republisher: re-publish failed (will retry): {e}");
+                match publish_budget_with(role, resources, 0, delivery).await {
+                    Err(e) if due => {
+                        warn!("fleet::budget_republisher: re-publish failed (will retry): {e}")
+                    }
+                    // A change publish that failed is retried on the next
+                    // tick (its value stays unrecorded), so it logs quietly.
+                    Err(e) => tracing::debug!(
+                        "fleet::budget_republisher: CI capacity change publish failed \
+                         (next tick retries): {e}"
+                    ),
+                    Ok(()) => {}
                 }
-                next_budget = tokio::time::Instant::now() + Duration::from_secs(budget_secs);
+                if due {
+                    next_budget = tokio::time::Instant::now() + Duration::from_secs(budget_secs);
+                }
             }
         },
     );
@@ -1301,6 +1822,15 @@ fn parse_node_major(raw: &str) -> Option<u32> {
 // `capabilities @> '["ci_node"]'::jsonb` filters in coord's `ci_dispatch.rs`
 // read it, and `ci:node` would break all of them for zero capability gain.
 //
+// The memory tiers `mem_ge_<N>` (N in `MEMORY_TIERS_GIB`: 8..256 GiB,
+// cumulative) are the second exception to that grammar, after bare `ci_node`,
+// and deliberately so: plan
+// `2026-10-02-fleet-machine-roles-workhorse-bench-ci-node` A6 fixes the
+// spelling as the wire contract `canonical_repos.ci_node_required_capabilities`
+// seeds name, and coord's `@>` containment needs no grammar. Total memory is
+// read once per process (`resource_guard::host_capacity`), not behind
+// `HOST_PROBE_TTL`.
+//
 // `runtime:webview` was added by plan
 // `2026-09-09-continuation-dispatch-fails-silently-three-times-in-four` Phase 2.
 // That plan named the root cause of its 21 `spawn_failed: no Tauri AppHandle`
@@ -1342,6 +1872,8 @@ fn parse_node_major(raw: &str) -> Option<u32> {
 struct SlowHostProbes {
     powershell: bool,
     docker: bool,
+    /// `claude` resolves to a launchable executable ([`claude_launchable`]).
+    claude: bool,
 }
 
 static SLOW_HOST_PROBE_CACHE: Mutex<Option<(SlowHostProbes, std::time::Instant)>> =
@@ -1366,6 +1898,7 @@ fn slow_host_probes() -> SlowHostProbes {
     let probes = SlowHostProbes {
         powershell: powershell_on_path(),
         docker: docker_daemon_answers(),
+        claude: claude_launchable(),
     };
     if let Ok(mut g) = SLOW_HOST_PROBE_CACHE.lock() {
         *g = Some((probes, std::time::Instant::now()));
@@ -1373,15 +1906,148 @@ fn slow_host_probes() -> SlowHostProbes {
     probes
 }
 
-/// The probed host-fact capability set for the heartbeat.
+/// The probed host-fact capability set — `os:*`, `runtime:*`, the webview
+/// token, plus `svc:imagegen` when the local image upstream declares an
+/// image-output model ([`imagegen_probe`]; plan
+/// `2026-10-13-image-generation-and-visual-judgment`, Phase 25). Deliberately
+/// WITHOUT the credential-presence family: that one is joined in
+/// [`heartbeat_capabilities`] only, so a caller asking for host facts (tests
+/// among them) can never start a live `gh` / `aws` probe.
+///
+/// The image probe is an HTTP request on a cache miss, so this function
+/// BLOCKS: the heartbeat assembles its capability base
+/// ([`heartbeat_device_capabilities`], which reaches this) on the blocking pool.
 fn host_capabilities() -> Vec<String> {
-    let slow = slow_host_probes();
-    build_host_capabilities(
+    let mut caps = assemble_host_capabilities(
         current_os_label(),
-        slow.powershell,
-        slow.docker,
+        slow_host_probes(),
         webview_runtime_available(),
-    )
+        host_mem_total_bytes(),
+    );
+    caps.extend(imagegen_probe::capability_tokens());
+    caps
+}
+
+/// [`host_capabilities`] minus the image probe, from the probes' results:
+/// the [`build_host_capabilities`] set plus the condition-check token, which
+/// two of the probes decide together. Pure, so a test can hand it every
+/// combination a real host produces.
+fn assemble_host_capabilities(
+    os: &str,
+    slow: SlowHostProbes,
+    webview: bool,
+    mem_total_bytes: Option<u64>,
+) -> Vec<String> {
+    let mut caps =
+        build_host_capabilities(os, slow.powershell, slow.docker, webview, mem_total_bytes);
+    caps.extend(condition_secret_substitution_capability(
+        webview,
+        slow.claude,
+    ));
+    caps
+}
+
+/// The heartbeat's host capability set: [`host_capabilities`] plus the
+/// credential-presence family — `probes:cred`, `cred:gh`, `cred:aws-sts` and
+/// the regional tokens coord's catalogue names — read from its own cache (see the section header above
+/// [`CRED_PROBES_MARKER`]); that read never blocks on a probe. Called only by
+/// `heartbeat_to_coord`, on the blocking pool. The other caller of
+/// [`cred_capabilities`] is [`heartbeat_join_failure_capabilities`], which runs
+/// on the async worker, so that read must stay non-blocking.
+fn heartbeat_capabilities() -> Vec<String> {
+    let mut caps = host_capabilities();
+    caps.extend(cred_capabilities());
+    caps
+}
+
+/// The host's TOTAL physical memory in bytes, or `None` when it could not be
+/// read.
+///
+/// Reuses the shipped, once-per-process `resource_guard::host_capacity` probe
+/// (`ci_node::host_sizing::probe` behind a `OnceLock`) rather than adding a
+/// third sysinfo reader, so the heartbeat's tiers and the resource guard judge
+/// the same `MemTotal`. Total memory does not change under a live process, so
+/// the process-lifetime cache costs nothing a TTL would buy back.
+///
+/// `None` advertises NO `mem_ge_*` token — never a guess. That is the
+/// fail-closed direction for a repo requiring a tier (plan
+/// `2026-10-02-fleet-machine-roles-workhorse-bench-ci-node` A6): the device is
+/// simply not electable for it.
+fn host_mem_total_bytes() -> Option<u64> {
+    let total = crate::resource_guard::host_capacity().mem_bytes;
+    if total.is_none() {
+        // debug!, the same posture as the other host probes' "not advertised"
+        // arms: an unreadable MemTotal is a standing property of a locked-down
+        // host, and the heartbeat asks every 30s.
+        debug!("host_capabilities: total physical memory unreadable — no mem_ge_* tier advertised");
+    }
+    total
+}
+
+/// The memory tiers, in GiB (1 GiB = 1024^3 bytes), for which the heartbeat
+/// advertises a `mem_ge_<N>` capability token (plan
+/// `2026-10-02-fleet-machine-roles-workhorse-bench-ci-node` A6 / D10).
+///
+/// * **Cumulative.** A host advertises EVERY tier it meets, not just the
+///   highest — a 48 GiB host sends `mem_ge_8`, `mem_ge_16` and `mem_ge_32` — so
+///   a repo listing `mem_ge_32` in `canonical_repos.ci_node_required_capabilities`
+///   matches it through coord's plain `capabilities @> required` containment
+///   filter, with no numeric comparison anywhere in coord.
+/// * **Coarse powers of two.** A small RAM change (a module added, a VM resized
+///   by a few GiB) does not churn the capability vector, and adjacent tiers are
+///   a factor of two apart, which is what makes the tolerance below safe.
+/// * **The spelling is a wire contract.** Respelling a token, or removing a
+///   tier, silently un-targets every repo that requires it, with nothing red on
+///   either side.
+const MEMORY_TIERS_GIB: [u64; 6] = [8, 16, 32, 64, 128, 256];
+
+/// Prefix of the memory-tier capability token: `mem_ge_<N>` for N in
+/// [`MEMORY_TIERS_GIB`].
+const MEMORY_TIER_CAPABILITY_PREFIX: &str = "mem_ge_";
+
+/// How far below a tier's nominal size the reported total may fall and still
+/// meet it, in percent.
+///
+/// **Why a tolerance at all.** The OS never reports the nominal DIMM size: the
+/// firmware, a hardware-reserved range and an integrated GPU's carve-out are
+/// subtracted first. A "16 GB" laptop reports ~15.6 GiB (`MemTotal`
+/// 16,375,488 KiB, the shape `resource_sample`'s fixtures carry), and a strict
+/// `total >= 16 GiB` would place it in the 8 GiB tier alongside machines with
+/// half its memory — the opposite of what the operator means by "a 16 GB
+/// machine".
+///
+/// **Why 10%.** It absorbs the usual firmware/iGPU reservation (a few percent
+/// of the nominal size) while staying far from the tier below: tiers are 2x
+/// apart, so a host is placed in tier N only if its total is at least 90% of
+/// N's nominal size — the "nominally that size" case the tolerance exists for.
+/// Common non-power-of-two configurations (12, 24, 48, 96, 192 GiB) all sit
+/// below the 90% line of the tier above them and stay in the tier below.
+///
+/// **A runner inside WSL2 or a VM** reports the VM's allocation (WSL2 defaults
+/// to half the host), not the host's, and advertises that tier. That is the
+/// intended answer: it is the memory a build there actually gets.
+const MEMORY_TIER_TOLERANCE_PERCENT: u64 = 10;
+
+/// The cumulative `mem_ge_<N>` tokens a host with `mem_total_bytes` of total
+/// physical memory meets. Pure.
+///
+/// A host meets tier N iff `total >= N GiB * (100 - MEMORY_TIER_TOLERANCE_PERCENT) / 100`
+/// (see [`MEMORY_TIER_TOLERANCE_PERCENT`] for why not a strict `>= N GiB`).
+/// `None` (memory unreadable) yields no tokens.
+fn memory_tier_capabilities(mem_total_bytes: Option<u64>) -> Vec<String> {
+    const GIB: u128 = 1024 * 1024 * 1024;
+    let Some(total) = mem_total_bytes else {
+        return Vec::new();
+    };
+    // u128 so `total * 100` cannot overflow for any u64 total.
+    let total_pct = u128::from(total) * 100;
+    MEMORY_TIERS_GIB
+        .iter()
+        .filter(|&&tier| {
+            total_pct >= u128::from(tier) * GIB * u128::from(100 - MEMORY_TIER_TOLERANCE_PERCENT)
+        })
+        .map(|tier| format!("{MEMORY_TIER_CAPABILITY_PREFIX}{tier}"))
+        .collect()
 }
 
 /// The capability token asserting this device has a usable webview runtime and
@@ -1466,8 +2132,16 @@ fn webview_runtime_available() -> bool {
 
 /// Pure host-capability assembly (unit-tested without disk or subprocesses),
 /// mirroring `build_ci_node_labels`. Every input is a settled probe verdict;
-/// this function performs no probing of its own.
-fn build_host_capabilities(os: &str, powershell: bool, docker: bool, webview: bool) -> Vec<String> {
+/// this function performs no probing of its own. `mem_total_bytes` is the
+/// host's total physical memory (`None` = unreadable, which advertises no
+/// memory tier); see [`memory_tier_capabilities`].
+fn build_host_capabilities(
+    os: &str,
+    powershell: bool,
+    docker: bool,
+    webview: bool,
+    mem_total_bytes: Option<u64>,
+) -> Vec<String> {
     let mut caps = vec![format!("os:{os}")];
     if powershell {
         caps.push("shell:powershell".to_string());
@@ -1478,7 +2152,71 @@ fn build_host_capabilities(os: &str, powershell: bool, docker: bool, webview: bo
     if webview {
         caps.push(WEBVIEW_RUNTIME_CAPABILITY.to_string());
     }
+    caps.extend(memory_tier_capabilities(mem_total_bytes));
     caps
+}
+
+/// The capability token asserting this runner substitutes a condition check's
+/// `{{secret:<ref>}}` placeholders inside its SDK `type` action
+/// ([`crate::condition_secrets`]), and can launch the session that types them.
+///
+/// Plan
+/// `2026-11-06-a-regression-test-run-is-judged-by-what-it-covered-and-a-silent-run-reads-unknown`
+/// Phase 13, D-D7a: coord places a condition group whose `auth_setup` carries
+/// a credential only on a device advertising this token, and otherwise reads
+/// the run `unknown`, never a plaintext prompt. Coord's placement verdict reads
+/// the token and NOT `claude_code_available`, so the token itself carries the
+/// launch precondition ([`condition_secret_substitution_capability`]).
+///
+/// The spelling is frozen for the same reason as
+/// [`WEBVIEW_RUNTIME_CAPABILITY`]: a respelling silently un-targets every
+/// secret-bearing condition group, with nothing red on either side.
+pub const CONDITION_SECRET_SUBSTITUTION_CAPABILITY: &str = "condition:secret_substitution";
+
+/// `Some(token)` when this runner has what a condition-check session needs
+/// from its host: a webview runtime to host its visible terminal (the first
+/// thing `agent_runtime::run_condition_check_terminal` needs) AND a `claude`
+/// that resolves to a launchable executable. Necessary, not sufficient: a
+/// launch also needs spawn authorization, a signed-in account and a workspace
+/// root, which this host fact does not see. Fail-closed like
+/// [`webview_runtime_available`]: advertising falsely sends a run carrying
+/// secrets to a device that then cannot spawn its session; not advertising
+/// only moves the run elsewhere, or reads it `unknown`. Pure.
+fn condition_secret_substitution_capability(webview: bool, claude: bool) -> Option<String> {
+    (webview && claude).then(|| CONDITION_SECRET_SUBSTITUTION_CAPABILITY.to_string())
+}
+
+/// True when what a condition-check spawn execs is the absolute path of an
+/// existing, executable file. The spawn execs `agent_runtime::resolve_claude_bin`
+/// as it is (`run_condition_check_terminal`), so a miss there, a bare name, is
+/// not a launch this runner can vouch for, and neither is an explicit
+/// `QONTINUI_CLAUDE_BIN` naming a file without its execute bit. Stats PATH, so
+/// it is cached behind `HOST_PROBE_TTL` with the other slow probes.
+fn claude_launchable() -> bool {
+    is_launchable_file(std::path::Path::new(
+        &crate::agent_runtime::resolve_claude_bin(),
+    ))
+}
+
+/// An absolute path to a regular file that, on unix, carries an execute bit.
+fn is_launchable_file(path: &std::path::Path) -> bool {
+    if !path.is_absolute() {
+        return false;
+    }
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file() && has_execute_bit(&metadata))
+}
+
+#[cfg(unix)]
+fn has_execute_bit(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+/// Windows has no execute bit: what launches is decided by the extension,
+/// which `agent_runtime::resolve_claude_bin`'s PATH walk restricts.
+#[cfg(not(unix))]
+fn has_execute_bit(_metadata: &std::fs::Metadata) -> bool {
+    true
 }
 
 /// Prefix of the per-repo CI allowlist token: one `ci_repo:<entry>` per
@@ -1510,6 +2248,33 @@ pub(crate) const MAX_CI_REPO_CAPABILITIES: usize = 64;
 /// Set once the truncation above has been logged, so it is logged once.
 static CI_REPO_CAP_WARNED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// The base of the capability vector `heartbeat_to_coord` sends: CI tokens,
+/// host facts and the credential family ([`heartbeat_capabilities`]). The
+/// heartbeat then appends the skill tokens ([`skill_capability_tokens`]),
+/// which depend on its bearer. Its own function so the heartbeat's exact
+/// expression is what the seam test exercises.
+///
+/// BLOCKS on a host-probe cache miss (via [`host_capabilities`]), so the
+/// heartbeat runs it on the blocking pool, never inline on its async worker.
+fn heartbeat_device_capabilities(ci_node: bool, repo_allowlist: &[String]) -> Vec<String> {
+    build_device_capabilities(ci_node, repo_allowlist, &heartbeat_capabilities())
+}
+
+/// The capability base when the blocking assembly panicked: CI tokens, the OS
+/// fact (the one host token that needs no probe) and the credential family.
+///
+/// The vector is AUTHORITATIVE, so whatever is left out here is retracted from
+/// `coord.devices.capabilities` by this heartbeat. A panic in an unrelated host
+/// probe says nothing about this box's credentials, and leaving the family out
+/// would also drop `probes:cred`, turning the device from "probed" into
+/// "unprobed" for a tick. The read cannot block or probe: it is the same cache
+/// [`cred_capabilities`] always answers from.
+fn heartbeat_join_failure_capabilities(ci_node: bool, repo_allowlist: &[String]) -> Vec<String> {
+    let mut host = vec![format!("os:{}", current_os_label())];
+    host.extend(cred_capabilities());
+    build_device_capabilities(ci_node, repo_allowlist, &host)
+}
 
 /// Pure assembly of the whole `capabilities` vector the heartbeat sends.
 ///
@@ -1552,6 +2317,42 @@ fn build_device_capabilities(
     }
     caps.extend(host.iter().cloned());
     caps
+}
+
+/// The capability token a device advertises when it can run the expedited-land
+/// independence review (plan `2026-10-13-coord-expedited-land-lever-for-agents`,
+/// S13 and Phase 3b). coord registers each sampled review gate with
+/// `required_capabilities: ["skill:expedite-review"]`, so only a device that
+/// advertises this is dispatched one.
+///
+/// Advertised ONLY when BOTH hold — the token therefore implies the review can
+/// actually be delivered:
+/// * the `expedite-review` skill is in the corpus this runner serves
+///   ([`crate::fleet_skills::skill_is_served`]); and
+/// * the runner holds a LIVE device JWT for the heartbeat's own bearer scope,
+///   because the skill posts its verdict to a device-JWT coord route.
+///
+/// Spelling is frozen for the same reason as [`WEBVIEW_RUNTIME_CAPABILITY`]: a
+/// registration names it verbatim.
+pub const EXPEDITE_REVIEW_CAPABILITY: &str = "skill:expedite-review";
+
+/// The skill the capability stands for, as named in the served corpus.
+pub const EXPEDITE_REVIEW_SKILL: &str = "expedite-review";
+
+/// The skill-capability tokens, from the two facts above. Pure.
+fn skill_capabilities(expedite_review_served: bool, device_jwt_live: bool) -> Vec<String> {
+    if expedite_review_served && device_jwt_live {
+        vec![EXPEDITE_REVIEW_CAPABILITY.to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+/// The heartbeat's skill-capability tokens: asks `served` about EXACTLY the
+/// skill the token stands for. Split out so a test pins the name the heartbeat
+/// looks up, not just the AND.
+fn skill_capability_tokens(served: impl Fn(&str) -> bool, device_jwt_live: bool) -> Vec<String> {
+    skill_capabilities(served(EXPEDITE_REVIEW_SKILL), device_jwt_live)
 }
 
 /// True when a PowerShell interpreter resolves on PATH — `pwsh` (PowerShell 7,
@@ -1635,33 +2436,88 @@ fn command_succeeds_within(program: &str, args: &[&str], budget: Duration, label
 /// True when `name` resolves to an executable file in some `PATH` entry.
 /// On Windows every `PATHEXT` suffix is tried as well as the bare name.
 fn binary_on_path(name: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    let exts: Vec<String> = if cfg!(target_os = "windows") {
-        std::env::var("PATHEXT")
-            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
-            .split(';')
+    find_on_path(name).is_some()
+}
+
+/// The first executable file `name` resolves to across the `PATH` entries.
+/// On Windows the `PATHEXT` rule applies — see [`resolve_in_dirs`].
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    let exts: Option<Vec<String>> = cfg!(target_os = "windows")
+        .then(|| parse_pathext(std::env::var("PATHEXT").ok().as_deref()));
+    resolve_in_dirs(name, std::env::split_paths(&path), exts.as_deref())
+}
+
+/// The default `PATHEXT` subset used when the variable is unset — or set but
+/// yielding no extension at all (`PATHEXT=` / `PATHEXT=;;`), which would
+/// otherwise make EVERY tool read as not-on-PATH: a silent false negative.
+const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD";
+
+/// Split a `PATHEXT` value into its non-empty extensions, falling back to
+/// [`DEFAULT_PATHEXT`] when the value is absent or filters down to nothing.
+fn parse_pathext(raw: Option<&str>) -> Vec<String> {
+    let split = |v: &str| -> Vec<String> {
+        v.split(';')
+            .map(str::trim)
             .filter(|e| !e.is_empty())
-            .map(|e| e.to_string())
+            .map(str::to_string)
             .collect()
-    } else {
-        Vec::new()
     };
-    for dir in std::env::split_paths(&path) {
+    let exts = raw.map(split).unwrap_or_default();
+    if exts.is_empty() {
+        split(DEFAULT_PATHEXT)
+    } else {
+        exts
+    }
+}
+
+/// PATH resolution over `dirs`. `pathext` is `Some` for Windows semantics and
+/// `None` for Unix (a bare name, gated on an execute bit).
+///
+/// Windows: a name that ALREADY ends in a `PATHEXT` extension (`gh.exe`) is
+/// tried as given and nothing else; any other name is tried ONLY with each
+/// `PATHEXT` suffix appended, never bare. An extensionless file sitting beside
+/// `gh.exe` (a Git Bash / MSYS shell script, a stray download) cannot be
+/// spawned by `CreateProcess`, so resolving to it would turn an installed tool
+/// into a spawn failure.
+fn resolve_in_dirs(
+    name: &str,
+    dirs: impl IntoIterator<Item = PathBuf>,
+    pathext: Option<&[String]>,
+) -> Option<PathBuf> {
+    let has_pathext_ext = |exts: &[String]| {
+        let lower = name.to_ascii_lowercase();
+        exts.iter()
+            .any(|e| lower.ends_with(&e.to_ascii_lowercase()))
+    };
+    for dir in dirs {
         if dir.as_os_str().is_empty() {
             continue;
         }
-        if is_executable_file(&dir.join(name)) {
-            return true;
-        }
-        for ext in &exts {
-            if is_executable_file(&dir.join(format!("{name}{ext}"))) {
-                return true;
+        match pathext {
+            None => {
+                let bare = dir.join(name);
+                if is_executable_file(&bare) {
+                    return Some(bare);
+                }
+            }
+            Some(exts) if has_pathext_ext(exts) => {
+                let bare = dir.join(name);
+                if is_executable_file(&bare) {
+                    return Some(bare);
+                }
+            }
+            Some(exts) => {
+                for ext in exts {
+                    let candidate = dir.join(format!("{name}{ext}"));
+                    if is_executable_file(&candidate) {
+                        return Some(candidate);
+                    }
+                }
             }
         }
     }
-    false
+    None
 }
 
 /// A regular file with at least one execute bit set.
@@ -1675,10 +2531,982 @@ fn is_executable_file(p: &std::path::Path) -> bool {
 }
 
 /// A regular file (Windows carries executability in the extension, which
-/// `binary_on_path` has already applied via `PATHEXT`).
+/// [`resolve_in_dirs`] has already applied via `PATHEXT`).
 #[cfg(not(unix))]
 fn is_executable_file(p: &std::path::Path) -> bool {
     std::fs::metadata(p).map(|md| md.is_file()).unwrap_or(false)
+}
+
+// =============================================================================
+// Credential-presence capability family — `cred:gh`, `cred:aws-sts` and the
+// `probes:cred` marker (plan
+// `2026-10-09-coord-knows-which-box-holds-which-credential`, Phase 2), plus the
+// regional `cred:aws-ssm:<region>` / `cred:aws-ecs:<region>` tokens coord's
+// probe catalogue names (Phase 3, `fleet/cred_probe_specs.rs`).
+//
+// Coord places credential-gated continuations by matching
+// `required_capabilities` against `coord.devices.capabilities` (D1), so a
+// credential this device holds is advertised as a plain token in the same
+// AUTHORITATIVE vector as `os:*` / `runtime:*`. Retraction therefore needs no
+// new mechanism: a token absent from the next heartbeat is absent from the
+// column (`heartbeat_always_sends_capabilities_but_omits_empty_ci_labels`).
+//
+// Four properties this section exists to hold:
+//
+//   * VALUE-FREE. Each probe is classified by EXIT CODE ONLY (D2). The child's
+//     stdin/stdout/stderr are all `Stdio::null()` — never a pipe, never a
+//     buffer — so nothing the CLI prints (an account id, a login, a token) can
+//     reach a log, the heartbeat or a panic message. The token variables are
+//     withheld from the child (`CRED_PROBE_WITHHELD_ENV`, the census's set), so
+//     a token exported into the runner's own environment cannot make a probe
+//     pass: the probe measures what the MACHINE stores. Logs name the token and
+//     its state, nothing else.
+//   * TRI-STATE, and an absence is asserted only when it was measured. The
+//     classification table is the one `credential-presence-census.sh` ships
+//     (qontinui-claude-config `scripts/credential-presence-census.sh`
+//     `probe_gh` / `probe_aws`), not a new one. "Not separable" outcomes —
+//     a timeout, a configured-but-failing login, aws's 254/255 — are
+//     `Unknown`, never `Absent`.
+//   * MEMOIZE AN ANSWER, NEVER A FAILURE (D2 "Retraction"). `Present` and
+//     `Absent` replace the memo; an `Absent` retracts on the next heartbeat.
+//     An `Unknown` keeps the last ANSWER for one `HOST_PROBE_TTL`, then drops
+//     the token — so a network blip does not strand placement, and a lasting
+//     loss does not attract work forever.
+//   * OFF THE HEARTBEAT'S CRITICAL PATH. The two CLIs can each take seconds
+//     (gh and sts both reach the network), so a stale family is refreshed on a
+//     detached, single-flight thread and the heartbeat reads whatever the cache
+//     last settled. The first heartbeat after a runner start therefore carries
+//     no `cred:` token and no `probes:cred` marker — honestly "not probed yet"
+//     — and the next one (30 s later) carries the probed family.
+// =============================================================================
+
+/// The marker a runner that RUNS the `cred` family always advertises (D4):
+/// "this build probes", not "something is present". Without it coord cannot
+/// tell a device that probed and found nothing from one whose build predates
+/// the probes, and `no_capable_device` would assert an absence nobody
+/// measured. Present even when every probe answered `Unknown`.
+pub(crate) const CRED_PROBES_MARKER: &str = "probes:cred";
+
+/// The marker a runner advertises while its LAST regional cycle read an
+/// ANSWERED catalogue and measured every token in it: no spec left unrun, no
+/// unreadable or refused row, and no `Unknown` verdict. [`CRED_PROBES_MARKER`]
+/// says only that the built-in probes ran, so without this coord cannot tell a
+/// box that probed `cred:aws-ssm:<region>` and found nothing from one whose
+/// catalogue fetch never answered (plan
+/// `2026-11-20-regional-cred-absence-is-measured-only-where-the-regional-probe-ran`).
+pub(crate) const CRED_REGIONAL_PROBES_MARKER: &str = "probes:cred-regional";
+
+/// A stored GitHub CLI login for `github.com` whose ACTIVE account answers
+/// `gh auth status --active`.
+pub(crate) const CRED_GH_CAPABILITY: &str = "cred:gh";
+
+/// Some AWS identity answers `aws sts get-caller-identity`. Proves an
+/// identity exists, not which account it is: the account id the call prints
+/// goes to the null device unread, and coord never holds it (D1).
+pub(crate) const CRED_AWS_STS_CAPABILITY: &str = "cred:aws-sts";
+
+/// Withheld from every credential probe's environment — the census's set. A
+/// token exported into the runner process must not make a probe pass (the
+/// probe asks what the machine STORES), and must not be handed to a child the
+/// runner does not need to authenticate.
+const CRED_PROBE_WITHHELD_ENV: [&str; 6] = [
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+];
+
+/// Per-probe budget. Both calls reach the network; a probe past this is
+/// killed and reads `Unknown`. It runs on the detached refresh thread, so the
+/// budget bounds staleness, never a heartbeat.
+const CRED_PROBE_BUDGET: Duration = Duration::from_secs(10);
+
+/// Upper bound on the bytes scanned from gh's `hosts.yml`. A real file is a
+/// few hundred bytes; a file that fills the cap without a `github.com:` line
+/// is read as `Unreadable` (cannot tell), never as "no login".
+const GH_HOSTS_READ_CAP: usize = 256 * 1024;
+
+/// One probe's verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CredState {
+    /// The probe answered yes.
+    Present,
+    /// The probe answered no, definitively (D2's Absent arms).
+    Absent,
+    /// The probe could not answer (timeout, unreachable, not separable).
+    Unknown,
+}
+
+impl CredState {
+    fn as_str(self) -> &'static str {
+        match self {
+            CredState::Present => "present",
+            CredState::Absent => "absent",
+            CredState::Unknown => "unknown",
+        }
+    }
+}
+
+/// How a bounded credential-probe child ended. Carries the exit code because
+/// D2 classifies by it — the one thing [`command_succeeds_within`] does not
+/// return.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeExit {
+    /// Exited with this code.
+    Code(i32),
+    /// Exited without a code (killed by a signal on Unix).
+    NoCode,
+    /// The binary resolved but could not be spawned.
+    SpawnFailed,
+    /// Ran past its budget and was killed.
+    TimedOut,
+    /// `try_wait` itself failed.
+    WaitFailed,
+}
+
+/// Whether gh's `hosts.yml` carries a `github.com` login — the census's
+/// `gh_login_config`, which is the only thing that separates gh's exit 1
+/// "not logged in" from "logged in, token check failed".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GhLogin {
+    /// A `^github\.com:` key line is present.
+    Configured,
+    /// The file is absent, or present without that line.
+    None,
+    /// The file exists but cannot be read (or overflowed the read cap).
+    Unreadable,
+    /// gh's config location cannot be established (no APPDATA / HOME).
+    Unlocatable,
+}
+
+/// Everything a credential probe reads from its surroundings, captured once
+/// per refresh. Production builds it with [`CredProbeEnv::from_process`];
+/// tests build it hermetically, so no test mutates the process environment.
+///
+/// Holds presence facts and LOCATIONS only — never a credential's value.
+#[derive(Debug, Clone, Default)]
+struct CredProbeEnv {
+    /// `gh` resolved on PATH; `None` = not on PATH (an Absent arm).
+    gh: Option<PathBuf>,
+    /// `aws` resolved on PATH; `None` = not on PATH (an Absent arm).
+    aws: Option<PathBuf>,
+    gh_config_dir: Option<PathBuf>,
+    xdg_config_home: Option<PathBuf>,
+    appdata: Option<PathBuf>,
+    home: Option<PathBuf>,
+    /// `AWS_PROFILE` is set (its value is not kept).
+    aws_profile_set: bool,
+    /// `AWS_CONFIG_FILE` is set (its value is not kept).
+    aws_config_file_set: bool,
+    /// `AWS_SHARED_CREDENTIALS_FILE` is set (its value is not kept).
+    aws_shared_credentials_file_set: bool,
+    /// gh's Windows lookup arm (`%APPDATA%\GitHub CLI`) applies.
+    windows: bool,
+    budget: Duration,
+}
+
+/// A non-empty environment variable, as the census's `${VAR:-}` tests read it.
+fn non_empty_env(name: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(name).filter(|v| !v.is_empty())
+}
+
+impl CredProbeEnv {
+    fn from_process() -> Self {
+        CredProbeEnv {
+            gh: find_on_path("gh"),
+            aws: find_on_path("aws"),
+            gh_config_dir: non_empty_env("GH_CONFIG_DIR").map(PathBuf::from),
+            xdg_config_home: non_empty_env("XDG_CONFIG_HOME").map(PathBuf::from),
+            appdata: non_empty_env("APPDATA").map(PathBuf::from),
+            home: dirs::home_dir(),
+            aws_profile_set: non_empty_env("AWS_PROFILE").is_some(),
+            aws_config_file_set: non_empty_env("AWS_CONFIG_FILE").is_some(),
+            aws_shared_credentials_file_set: non_empty_env("AWS_SHARED_CREDENTIALS_FILE").is_some(),
+            windows: cfg!(target_os = "windows"),
+            budget: CRED_PROBE_BUDGET,
+        }
+    }
+}
+
+/// gh's `hosts.yml`, located in gh's own order: `GH_CONFIG_DIR`, then
+/// `XDG_CONFIG_HOME/gh`, then (Windows) `%APPDATA%\GitHub CLI`, then
+/// `~/.config/gh`. `None` when the location cannot be established.
+fn gh_hosts_file(env: &CredProbeEnv) -> Option<PathBuf> {
+    let dir = if let Some(d) = &env.gh_config_dir {
+        d.clone()
+    } else if let Some(x) = &env.xdg_config_home {
+        x.join("gh")
+    } else if env.windows {
+        env.appdata.as_ref()?.join("GitHub CLI")
+    } else {
+        env.home.as_ref()?.join(".config").join("gh")
+    };
+    Some(dir.join("hosts.yml"))
+}
+
+/// The key line the census matches (`grep -q '^github\.com:'`).
+const GH_HOSTS_GITHUB_KEY: &[u8] = b"github.com:";
+
+/// A streaming `^github\.com:` matcher. Its whole state is a match-progress
+/// index into [`GH_HOSTS_GITHUB_KEY`] for the current line and the found bit —
+/// it never stores a byte of the input, so a line carrying an `oauth_token`
+/// passes through it without being kept anywhere.
+#[derive(Debug, Clone, Copy)]
+struct GithubKeyLineMatcher {
+    /// `Some(i)`: the current line's first `i` bytes match the key so far.
+    /// `None`: the current line has already diverged.
+    progress: Option<usize>,
+    found: bool,
+}
+
+impl GithubKeyLineMatcher {
+    const fn new() -> Self {
+        GithubKeyLineMatcher {
+            progress: Some(0),
+            found: false,
+        }
+    }
+
+    fn feed(&mut self, chunk: &[u8]) {
+        for &b in chunk {
+            if self.found {
+                return;
+            }
+            if b == b'\n' {
+                self.progress = Some(0);
+                continue;
+            }
+            self.progress = match self.progress {
+                Some(i) if GH_HOSTS_GITHUB_KEY[i] == b => {
+                    if i + 1 == GH_HOSTS_GITHUB_KEY.len() {
+                        self.found = true;
+                    }
+                    Some(i + 1)
+                }
+                _ => None,
+            };
+        }
+    }
+}
+
+/// True when some line of `hosts` begins with the `github.com:` key — the
+/// census's `grep -q '^github\.com:'`, and the only fact taken from the file.
+fn hosts_yml_has_github_login(hosts: &[u8]) -> bool {
+    let mut m = GithubKeyLineMatcher::new();
+    m.feed(hosts);
+    m.found
+}
+
+/// Scan gh's `hosts.yml` and keep ONE bit: whether a `github.com` login is
+/// configured. The file can hold an `oauth_token`, so it is never read into a
+/// buffer the probe owns: a [`std::io::BufReader`] streams it through its own
+/// fixed-size internal buffer, each chunk goes through
+/// [`GithubKeyLineMatcher`] (which stores no input byte), and the scan stops
+/// at the first match. Nothing from the file is logged, and the verdict is the
+/// only thing returned. (The BufReader's buffer is ordinary heap memory freed
+/// unzeroed — the guarantee is "never retained or surfaced", not "scrubbed".)
+fn gh_login_config(env: &CredProbeEnv) -> GhLogin {
+    use std::io::{BufRead, Read};
+    let Some(path) = gh_hosts_file(env) else {
+        return GhLogin::Unlocatable;
+    };
+    let file = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return GhLogin::None,
+        // A config dir we cannot search hides the file rather than lacking it.
+        Err(_) => return GhLogin::Unreadable,
+    };
+    let mut reader = std::io::BufReader::new(file.take(GH_HOSTS_READ_CAP as u64));
+    let mut matcher = GithubKeyLineMatcher::new();
+    let mut scanned = 0usize;
+    loop {
+        let n = match reader.fill_buf() {
+            Ok([]) => break,
+            Ok(chunk) => {
+                matcher.feed(chunk);
+                chunk.len()
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return GhLogin::Unreadable,
+        };
+        reader.consume(n);
+        scanned += n;
+        if matcher.found {
+            return GhLogin::Configured;
+        }
+    }
+    if scanned >= GH_HOSTS_READ_CAP {
+        // Filled the cap without the line: the line may sit past it.
+        GhLogin::Unreadable
+    } else {
+        GhLogin::None
+    }
+}
+
+/// Presence test that never opens the file: `Ok` = present, `NotFound` =
+/// absent, any other error (an unsearchable `~/.aws`) = cannot tell, which is
+/// counted as present so it can only ever turn an Absent into an Unknown.
+fn path_present_or_unstattable(p: &std::path::Path) -> bool {
+    match std::fs::metadata(p) {
+        Ok(_) => true,
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+/// Whether ANY aws configuration exists — the census's `has_config`: the
+/// PRESENCE of `~/.aws/config` / `~/.aws/credentials`, or `AWS_PROFILE` /
+/// `AWS_CONFIG_FILE` / `AWS_SHARED_CREDENTIALS_FILE` being set. Never their
+/// content. The three key variables do NOT count: they are withheld from the
+/// probe, so they cannot have made it fail. With no home directory the files
+/// cannot be checked, which reads as "configured" (cannot tell).
+fn aws_has_config(env: &CredProbeEnv) -> bool {
+    if env.aws_profile_set || env.aws_config_file_set || env.aws_shared_credentials_file_set {
+        return true;
+    }
+    let Some(home) = &env.home else {
+        return true;
+    };
+    let dir = home.join(".aws");
+    path_present_or_unstattable(&dir.join("config"))
+        || path_present_or_unstattable(&dir.join("credentials"))
+}
+
+/// The one way a credential probe's child is built: all three stdio streams
+/// null (never captured), the token variables withheld, and the two
+/// interactive surfaces (aws's pager, gh's prompts and update notifier) off.
+fn cred_probe_command(program: &std::path::Path, args: &[&str]) -> std::process::Command {
+    let mut cmd = crate::process_helpers::no_window(program);
+    cmd.args(args);
+    for name in CRED_PROBE_WITHHELD_ENV {
+        cmd.env_remove(name);
+    }
+    cmd.env("AWS_PAGER", "")
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_NO_UPDATE_NOTIFIER", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    cmd
+}
+
+/// Bounded "how did this command exit" probe — the exit-code sibling of
+/// [`command_succeeds_within`]: spawns the prepared command (whose stdio
+/// [`cred_probe_command`] has nulled), polls `try_wait` at 25 ms up to
+/// `budget`, then kills. Logs nothing: the caller logs the token and state.
+///
+/// The kill takes the WHOLE process tree, not just the child: `aws` on
+/// Windows is an `aws.cmd` shim that runs the real CLI as a grandchild, and
+/// `Child::kill` alone would leave that grandchild running. The tree is
+/// addressed through [`crate::process_helpers::ChildTreeGuard`] (a
+/// kill-on-close Job Object on Windows, an own process group + `killpg` on
+/// Unix) — armed before the spawn, dropped (= killed) on overrun, and
+/// released on a normal exit exactly as `run_with_timeout` does.
+fn command_exit_within(mut cmd: std::process::Command, budget: Duration) -> ProbeExit {
+    use crate::process_helpers::ChildTreeGuard;
+    let started = std::time::Instant::now();
+    ChildTreeGuard::arm(&mut cmd);
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(_) => return ProbeExit::SpawnFailed,
+    };
+    let tree = ChildTreeGuard::attach_armed(&child);
+    let deadline = started + budget;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                tree.disarm();
+                return status.code().map_or(ProbeExit::NoCode, ProbeExit::Code);
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    drop(tree);
+                    let _ = child.wait();
+                    return ProbeExit::TimedOut;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                drop(tree);
+                let _ = child.wait();
+                return ProbeExit::WaitFailed;
+            }
+        }
+    }
+}
+
+/// D2's gh table (census `probe_gh`), applied to the exit of
+/// `gh auth status --active --hostname github.com` ([`GH_AUTH_STATUS_ARGS`])
+/// — or, on a gh too old to know `--active`, of the legacy
+/// `gh auth status --hostname github.com` ([`GH_AUTH_STATUS_LEGACY_ARGS`]).
+/// Which one ran is decided by [`gh_knows_active_flag`]'s value-free
+/// `gh auth status --active --help` check, so an old gh is never asked a flag
+/// it rejects (it would exit 1 on the unknown flag and read Unknown forever —
+/// a silent false negative). Both forms are classified by this same table.
+/// `--active` matters where it exists: without it gh exits 1 when ANY stored
+/// account for the host has a problem — a stale, inactive second login
+/// included — which would read a working active login as Unknown; on the
+/// legacy path that imprecision is accepted, since a gh without `--active`
+/// has no way to scope the check. `exit` is `None` when gh is not on PATH.
+/// `login` is consulted only on exit 1/4, where gh reports both "not logged
+/// in" and "logged in, token check failed" (invalid token OR GitHub
+/// unreachable): only a definitively-absent login makes that an Absent.
+fn classify_gh(exit: Option<ProbeExit>, login: impl FnOnce() -> GhLogin) -> CredState {
+    match exit {
+        None => CredState::Absent,
+        Some(ProbeExit::Code(0)) => CredState::Present,
+        Some(ProbeExit::Code(1 | 4)) => match login() {
+            GhLogin::None => CredState::Absent,
+            GhLogin::Configured | GhLogin::Unreadable | GhLogin::Unlocatable => CredState::Unknown,
+        },
+        Some(_) => CredState::Unknown,
+    }
+}
+
+/// D2's aws table (census `probe_aws`). `exit` is `None` when aws is not on
+/// PATH. 253 ("no credentials resolved") is an Absent only when nothing is
+/// configured — a config naming an SSO or process source lands there too.
+/// 254 (credentials rejected), 255 (aws's catch-all, which includes "network
+/// unreachable") and a timeout are Unknown.
+///
+/// **Deliberate difference from the census:** here exit 0 alone is
+/// `Present`. The census additionally checks that stdout is a 12-digit account
+/// id; this probe cannot, because its stdout is the null device by design
+/// (VALUE-FREE — the account id is never read into the runner at all). The
+/// cost is that an aws that exits 0 without printing an account counts as
+/// Present here and not in the census.
+fn classify_aws_sts(exit: Option<ProbeExit>, has_config: impl FnOnce() -> bool) -> CredState {
+    match exit {
+        None => CredState::Absent,
+        Some(ProbeExit::Code(0)) => CredState::Present,
+        Some(ProbeExit::Code(253)) => {
+            if has_config() {
+                CredState::Unknown
+            } else {
+                CredState::Absent
+            }
+        }
+        Some(_) => CredState::Unknown,
+    }
+}
+
+/// The gh probe's arguments. `--active` scopes the verdict to the ACTIVE
+/// account (see [`classify_gh`]).
+const GH_AUTH_STATUS_ARGS: [&str; 5] = ["auth", "status", "--active", "--hostname", "github.com"];
+
+/// The gh probe's arguments on a gh that predates `--active`.
+const GH_AUTH_STATUS_LEGACY_ARGS: [&str; 4] = ["auth", "status", "--hostname", "github.com"];
+
+/// The value-free capability check: exit 0 iff this gh parses `--active`.
+/// cobra rejects an unknown flag (exit 1) before it would print help, and
+/// `--help` touches no credential.
+const GH_ACTIVE_FLAG_CHECK_ARGS: [&str; 4] = ["auth", "status", "--active", "--help"];
+
+/// Memo of "does the gh at this path know `--active`", keyed by the resolved
+/// binary path and EXPIRING after [`HOST_PROBE_TTL`]: an in-place upgrade or
+/// downgrade keeps the path (MSI, apt, brew, a scoop shim), and a non-zero
+/// exit may come from a broken config rather than the flag, so a
+/// process-lifetime memo would pin a stale answer until the runner restarts.
+/// Only a DEFINITIVE answer is memoized: a timeout or spawn failure falls back
+/// to the legacy args for that run and is re-checked next time.
+static GH_ACTIVE_FLAG_CACHE: Mutex<
+    Option<std::collections::HashMap<PathBuf, (bool, std::time::Instant)>>,
+> = Mutex::new(None);
+
+/// Whether the gh at `gh` knows `auth status --active`: the memo, else
+/// [`GH_ACTIVE_FLAG_CHECK_ARGS`] run under the same null stdio, withheld
+/// tokens, timeout and process-tree guard as the probe itself.
+fn gh_knows_active_flag(gh: &std::path::Path, budget: Duration) -> bool {
+    if let Some(known) = GH_ACTIVE_FLAG_CACHE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(gh).copied())
+        .filter(|(_, at)| at.elapsed() < HOST_PROBE_TTL)
+        .map(|(knows, _)| knows)
+    {
+        return known;
+    }
+    let knows = match command_exit_within(
+        cred_probe_command(gh, &GH_ACTIVE_FLAG_CHECK_ARGS),
+        budget,
+    ) {
+        ProbeExit::Code(0) => true,
+        ProbeExit::Code(_) => false,
+        other => {
+            debug!(
+                "host_capabilities: {CRED_GH_CAPABILITY}: `--active` capability check inconclusive ({other:?}) — legacy args this run"
+            );
+            return false;
+        }
+    };
+    if !knows {
+        info!(
+            "host_capabilities: {CRED_GH_CAPABILITY}: gh does not know `auth status --active` — probing with legacy args"
+        );
+    }
+    GH_ACTIVE_FLAG_CACHE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_or_insert_with(Default::default)
+        .insert(gh.to_path_buf(), (knows, std::time::Instant::now()));
+    knows
+}
+
+/// The `gh auth status` arguments for the gh at `gh`: `--active` when it
+/// knows the flag, the legacy form otherwise.
+fn gh_auth_status_args(gh: &std::path::Path, budget: Duration) -> &'static [&'static str] {
+    if gh_knows_active_flag(gh, budget) {
+        &GH_AUTH_STATUS_ARGS
+    } else {
+        &GH_AUTH_STATUS_LEGACY_ARGS
+    }
+}
+
+/// The aws probe's arguments. `--query Account --output text` keeps the
+/// census's command line; the output itself goes to the null device unread.
+const AWS_STS_ARGS: [&str; 6] = [
+    "sts",
+    "get-caller-identity",
+    "--query",
+    "Account",
+    "--output",
+    "text",
+];
+
+/// Log that a probe's binary is not on PATH — the token and that state only.
+fn log_cred_binary_not_on_path(token: &str, binary: &str) {
+    debug!("host_capabilities: {token}: `{binary}` not on PATH — state=absent");
+}
+
+fn probe_gh(env: &CredProbeEnv) -> CredState {
+    let exit = match env.gh.as_deref() {
+        Some(gh) => Some(command_exit_within(
+            cred_probe_command(gh, gh_auth_status_args(gh, env.budget)),
+            env.budget,
+        )),
+        None => {
+            log_cred_binary_not_on_path(CRED_GH_CAPABILITY, "gh");
+            None
+        }
+    };
+    classify_gh(exit, || gh_login_config(env))
+}
+
+fn probe_aws_sts(env: &CredProbeEnv) -> CredState {
+    let exit = match env.aws.as_deref() {
+        Some(aws) => Some(command_exit_within(
+            cred_probe_command(aws, &AWS_STS_ARGS),
+            env.budget,
+        )),
+        None => {
+            log_cred_binary_not_on_path(CRED_AWS_STS_CAPABILITY, "aws");
+            None
+        }
+    };
+    classify_aws_sts(exit, || aws_has_config(env))
+}
+
+/// Run every built-in credential probe once. Slow (each probe may take up to
+/// `env.budget`), so production calls it only from the refresh thread.
+fn probe_cred_family(env: &CredProbeEnv) -> Vec<(&'static str, CredState)> {
+    vec![
+        (CRED_GH_CAPABILITY, probe_gh(env)),
+        (CRED_AWS_STS_CAPABILITY, probe_aws_sts(env)),
+    ]
+}
+
+/// One token's memoized ANSWER. `unknown_since` is set while probes keep
+/// answering `Unknown`, and bounds how long the answer is held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CredMemo {
+    present: bool,
+    unknown_since: Option<std::time::Instant>,
+}
+
+/// Fold one verdict into a token's memo — "memoize an answer, never a
+/// failure". `Present`/`Absent` replace the memo outright (so an Absent
+/// retracts at once). An `Unknown` keeps the previous answer while it has
+/// been unknown for less than `ttl`, and drops the memo — and with it the
+/// token — once it has been unknown for a whole `ttl`. An `Unknown` with no
+/// previous answer stays unanswered.
+fn fold_cred_memo(
+    prev: Option<CredMemo>,
+    state: CredState,
+    now: std::time::Instant,
+    ttl: Duration,
+) -> Option<CredMemo> {
+    match state {
+        CredState::Present => Some(CredMemo {
+            present: true,
+            unknown_since: None,
+        }),
+        CredState::Absent => Some(CredMemo {
+            present: false,
+            unknown_since: None,
+        }),
+        CredState::Unknown => {
+            let prev = prev?;
+            let since = prev.unknown_since.unwrap_or(now);
+            (now.saturating_duration_since(since) < ttl).then_some(CredMemo {
+                present: prev.present,
+                unknown_since: Some(since),
+            })
+        }
+    }
+}
+
+/// Log one token's verdict — token and state only — at `info!` when its
+/// advertisement flips, `debug!` otherwise.
+fn log_cred_advertisement(token: &str, state: &str, was: bool, is: bool) {
+    if was != is {
+        info!("host_capabilities: {token} state={state} advertised={is}");
+    } else {
+        debug!("host_capabilities: {token} state={state} advertised={is}");
+    }
+}
+
+/// The `cred` family's cache: when it last ran, and each token's memo.
+///
+/// The built-in tokens and the catalogue's regional tokens sit in separate maps
+/// so that nothing a catalogue fetch does can reach `cred:gh` or `cred:aws-sts`:
+/// [`Self::apply_regional`] has no access path to `memos`, and the marker is
+/// derived from `ran_at` alone.
+#[derive(Debug)]
+struct CredFamilyState {
+    ran_at: Option<std::time::Instant>,
+    memos: std::collections::BTreeMap<&'static str, CredMemo>,
+    /// Keyed by the token [`cred_probe_specs::RegionalProbe::token`] rebuilt from
+    /// a validated spec, so every key is D1-grammar and safe to log.
+    regional: std::collections::BTreeMap<String, CredMemo>,
+    /// The last regional cycle read an answered catalogue and measured every
+    /// token in it; drives [`CRED_REGIONAL_PROBES_MARKER`].
+    regional_measured: bool,
+}
+
+impl CredFamilyState {
+    const fn new() -> Self {
+        CredFamilyState {
+            ran_at: None,
+            memos: std::collections::BTreeMap::new(),
+            regional: std::collections::BTreeMap::new(),
+            regional_measured: false,
+        }
+    }
+
+    /// True when the family has never run, or last ran a whole `ttl` ago.
+    fn is_stale(&self, now: std::time::Instant, ttl: Duration) -> bool {
+        self.ran_at
+            .is_none_or(|t| now.saturating_duration_since(t) >= ttl)
+    }
+
+    /// Fold one run's verdicts in. Logs each token's state — token and state
+    /// only — at `info!` when its advertisement flips, `debug!` otherwise.
+    fn apply(
+        &mut self,
+        verdicts: &[(&'static str, CredState)],
+        now: std::time::Instant,
+        ttl: Duration,
+    ) {
+        for &(token, state) in verdicts {
+            let before = self.memos.get(token).copied();
+            let after = fold_cred_memo(before, state, now, ttl);
+            let was = before.is_some_and(|m| m.present);
+            let is = after.is_some_and(|m| m.present);
+            log_cred_advertisement(token, state.as_str(), was, is);
+            match after {
+                Some(m) => {
+                    self.memos.insert(token, m);
+                }
+                None => {
+                    self.memos.remove(token);
+                }
+            }
+        }
+        self.ran_at = Some(now);
+    }
+
+    /// Fold one verdict into one regional token's memo.
+    fn fold_regional(
+        &mut self,
+        token: &str,
+        state: CredState,
+        now: std::time::Instant,
+        ttl: Duration,
+    ) {
+        let before = self.regional.get(token).copied();
+        let after = fold_cred_memo(before, state, now, ttl);
+        // A token never earned and still not held says nothing; logging it
+        // would let a long list of unmeasured rows bypass the refusal-log cap.
+        if before.is_some() || after.is_some() {
+            log_cred_advertisement(
+                token,
+                state.as_str(),
+                before.is_some_and(|m| m.present),
+                after.is_some_and(|m| m.present),
+            );
+        }
+        match after {
+            Some(m) => {
+                self.regional.insert(token.to_string(), m);
+            }
+            None => {
+                self.regional.remove(token);
+            }
+        }
+    }
+
+    /// Fold one catalogue cycle in. D2's three outcomes:
+    ///
+    /// * No answer at all: nothing was measured, so every earned token folds as
+    ///   `Unknown` (its last answer holds for one TTL, then it drops).
+    /// * An answered catalogue: a token it no longer names was REMOVED and retracts
+    ///   here, with no hold, whatever its memo said. Every token it does name folds
+    ///   its own verdict, and a token past the run cap or named by a row of a kind
+    ///   this build does not know folds as `Unknown`: listed, but not measured.
+    /// * An answered catalogue holding an unreadable row: its silence about a token
+    ///   is not a removal, so a token no row names folds as `Unknown`. A token a
+    ///   readable row named and failed a check on still retracts at once.
+    ///
+    /// Never touches `memos` or `ran_at`. Sets `regional_measured`, which drives
+    /// [`CRED_REGIONAL_PROBES_MARKER`]: true only when the catalogue answered and
+    /// every token it lists reached a Present/Absent verdict this cycle.
+    fn apply_regional(
+        &mut self,
+        cycle: &cred_probe_specs::RegionalCycle,
+        now: std::time::Instant,
+        ttl: Duration,
+    ) {
+        match cycle {
+            cred_probe_specs::RegionalCycle::NoAnswer => {
+                // Nothing was measured this cycle.
+                self.regional_measured = false;
+                let earned: Vec<String> = self.regional.keys().cloned().collect();
+                for token in &earned {
+                    self.fold_regional(token, CredState::Unknown, now, ttl);
+                }
+            }
+            cred_probe_specs::RegionalCycle::Answered {
+                verdicts,
+                not_run,
+                unreadable_rows,
+                refused_tokens,
+                skipped_rows,
+            } => {
+                // Every catalogued token reached a verdict: nothing past the run
+                // cap, no unreadable, refused or unknown-kind row, no inconclusive
+                // answer.
+                self.regional_measured = not_run.is_empty()
+                    && !*unreadable_rows
+                    && !*skipped_rows
+                    && refused_tokens.is_empty()
+                    && verdicts.iter().all(|(_, s)| *s != CredState::Unknown);
+                let unnamed: Vec<String> = self
+                    .regional
+                    .keys()
+                    .filter(|token| {
+                        !verdicts.iter().any(|(t, _)| t == *token) && !not_run.contains(token)
+                    })
+                    .cloned()
+                    .collect();
+                for token in &unnamed {
+                    if *unreadable_rows && !refused_tokens.contains(token) {
+                        self.fold_regional(token, CredState::Unknown, now, ttl);
+                    } else {
+                        let was = self.regional.remove(token).is_some_and(|m| m.present);
+                        log_cred_advertisement(token, "removed", was, false);
+                    }
+                }
+                for (token, state) in verdicts {
+                    self.fold_regional(token, *state, now, ttl);
+                }
+                for token in not_run {
+                    self.fold_regional(token, CredState::Unknown, now, ttl);
+                }
+            }
+        }
+    }
+
+    /// The tokens this family contributes to the heartbeat: nothing before
+    /// the first run (honestly unprobed), and afterwards [`CRED_PROBES_MARKER`]
+    /// (then [`CRED_REGIONAL_PROBES_MARKER`] while the last regional cycle measured
+    /// its whole catalogue)
+    /// plus every token whose memo holds a positive answer.
+    fn advertised(&self) -> Vec<String> {
+        if self.ran_at.is_none() {
+            return Vec::new();
+        }
+        let mut caps = vec![CRED_PROBES_MARKER.to_string()];
+        if self.regional_measured {
+            caps.push(CRED_REGIONAL_PROBES_MARKER.to_string());
+        }
+        caps.extend(
+            self.memos
+                .iter()
+                .filter(|(_, m)| m.present)
+                .map(|(token, _)| (*token).to_string()),
+        );
+        caps.extend(
+            self.regional
+                .iter()
+                .filter(|(_, m)| m.present)
+                .map(|(token, _)| token.clone()),
+        );
+        caps
+    }
+}
+
+/// The process-wide `cred` family cache, beside `SLOW_HOST_PROBE_CACHE` and
+/// on the same `HOST_PROBE_TTL`.
+static CRED_FAMILY_CACHE: Mutex<CredFamilyState> = Mutex::new(CredFamilyState::new());
+
+/// Single-flight latch for the refresh thread.
+static CRED_REFRESH_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The `cred` tokens for this heartbeat — a cache read that never blocks on a
+/// probe. When the family is stale it starts (at most one) background refresh
+/// and returns what the cache holds now; the refresh's result rides the next
+/// heartbeat.
+fn cred_capabilities() -> Vec<String> {
+    let (stale, caps) = {
+        let g = CRED_FAMILY_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        (
+            g.is_stale(std::time::Instant::now(), HOST_PROBE_TTL),
+            g.advertised(),
+        )
+    };
+    if stale {
+        spawn_cred_refresh();
+    }
+    caps
+}
+
+/// One whole family cycle, in the order that keeps the regional half from ever
+/// costing the built-ins anything: `cred:gh`, `cred:aws-sts` and the marker are
+/// settled in the cache BEFORE the catalogue is fetched, so a slow fetch or up to
+/// sixteen slow regional probes cannot delay them, and a failed fetch has nothing
+/// of theirs to disturb. The lock is held only to fold, never across a probe.
+///
+/// Both folds are stamped `started`, the cycle's START, not its end. The next
+/// cycle starts no sooner than `ran_at + ttl`, so consecutive regional folds are
+/// at least `ttl` apart however long the probes took, and D2's "hold for one TTL"
+/// is one cycle rather than two.
+#[cfg(test)]
+fn run_cred_refresh_cycle(
+    cache: &Mutex<CredFamilyState>,
+    env: &CredProbeEnv,
+    fetch_specs: impl FnOnce() -> Result<Vec<serde_json::Value>, cred_probe_specs::SpecFetchFailure>,
+    started: std::time::Instant,
+    ttl: Duration,
+) {
+    run_cred_refresh_cycle_scoped(cache, env, fetch_specs, started, ttl, true);
+}
+
+/// [`run_cred_refresh_cycle`] with the catalogue's tenancy. `single_tenant` is
+/// whether the device is bound to exactly ONE tenant. The catalogue is fetched
+/// under one binding's bearer, but the capability list is device-wide and coord
+/// reads it under every tenant the device is bound to, so on a multi-bound device
+/// [`CRED_REGIONAL_PROBES_MARKER`] would attest one tenant's catalogue to all of
+/// them. It is withheld there (coord then reads every regional zero as UNKNOWN);
+/// the regional tokens themselves fold exactly as before.
+fn run_cred_refresh_cycle_scoped(
+    cache: &Mutex<CredFamilyState>,
+    env: &CredProbeEnv,
+    fetch_specs: impl FnOnce() -> Result<Vec<serde_json::Value>, cred_probe_specs::SpecFetchFailure>,
+    started: std::time::Instant,
+    ttl: Duration,
+    single_tenant: bool,
+) {
+    let verdicts = probe_cred_family(env);
+    cache
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .apply(&verdicts, started, ttl);
+    let regional = cred_probe_specs::run_regional_cycle(fetch_specs(), env);
+    let mut state = cache.lock().unwrap_or_else(|p| p.into_inner());
+    state.apply_regional(&regional, started, ttl);
+    // Under the same lock, so no heartbeat reads the marker in between.
+    state.regional_measured &= single_tenant;
+}
+
+/// Whether this device is bound to exactly ONE tenant, by BOTH reads: the local
+/// binding set (what the catalogue fetch's bearer comes from) and coord's own
+/// echoed set (`coord_bound_tenants.json`, what coord reads the capability list
+/// under). The local set alone can say one while coord binds two: the legacy-slot
+/// branch always reports one tenant, and `paired_user.json` heals only on a
+/// register response. Anything unresolved or UNKNOWN withholds the marker.
+fn heartbeat_binding_is_single_tenant() -> bool {
+    binding_is_single_tenant(
+        resolve_heartbeat_binding_set().as_ref(),
+        &qontinui_runner_lib::pair::coord_bound_tenants(),
+    )
+}
+
+/// The pure half of [`heartbeat_binding_is_single_tenant`].
+fn binding_is_single_tenant(
+    local: Option<&LocalBindingSet>,
+    coord: &qontinui_runner_lib::pair::CoordBoundTenantsRead,
+) -> bool {
+    use qontinui_runner_lib::pair::CoordBoundTenantsRead;
+    // ONE tenant, and the SAME one: a rebind with a stale local file would
+    // otherwise fetch tenant a's catalogue while coord reads the marker under b.
+    match (local, coord) {
+        (Some(set), CoordBoundTenantsRead::Known(v)) => {
+            v.len() == 1 && set.tenant_ids.as_slice() == v.as_slice()
+        }
+        _ => false,
+    }
+}
+
+/// Run the family once on a detached thread and fold it into
+/// [`CRED_FAMILY_CACHE`]. The latch is released by a drop guard, so a
+/// panicking probe cannot wedge every later refresh.
+fn spawn_cred_refresh() {
+    use std::sync::atomic::Ordering;
+    // Hermetic-test seam: a unit-test process must never run the operator's
+    // real `gh` / `aws` (a live STS call with real credentials, on a detached
+    // thread that outlives the test). Tests drive the family through
+    // `probe_cred_family` / `run_cred_refresh_cycle` with a hermetic
+    // `CredProbeEnv` instead.
+    if cfg!(test) {
+        debug!("host_capabilities: cred probe refresh suppressed under cfg(test)");
+        return;
+    }
+    if CRED_REFRESH_IN_FLIGHT.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    struct Release;
+    impl Drop for Release {
+        fn drop(&mut self) {
+            CRED_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
+        }
+    }
+    let spawned = std::thread::Builder::new()
+        .name("cred-probe".into())
+        .spawn(|| {
+            let _release = Release;
+            let started = std::time::Instant::now();
+            let env = CredProbeEnv::from_process();
+            let single_tenant = heartbeat_binding_is_single_tenant();
+            run_cred_refresh_cycle_scoped(
+                &CRED_FAMILY_CACHE,
+                &env,
+                cred_probe_specs::fetch_probe_specs,
+                started,
+                HOST_PROBE_TTL,
+                single_tenant,
+            );
+        });
+    if let Err(e) = spawned {
+        CRED_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
+        warn!(
+            "host_capabilities: cred probe thread could not start ({e}); retrying next heartbeat"
+        );
+    }
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -1696,8 +3524,8 @@ struct HeartbeatPayload {
     claude_code_available: bool,
     /// REQUIRED by coord's `post_device_register` handler — absence
     /// produces `400 tenant_id_required` (see qontinui-coord
-    /// `routes_phase3.rs:257-269`). Resolved via [`resolve_binding_set`]
-    /// (the DEFAULT binding) before the payload is constructed; if
+    /// `routes_phase3.rs:257-269`). Resolved via
+    /// [`resolve_heartbeat_binding_set`] (the DEFAULT binding) before the payload is constructed; if
     /// `None` there, the heartbeat is skipped rather than 400-spamming
     /// coord. Phase 2 of the default-tenant-propagation plan.
     tenant_id: uuid::Uuid,
@@ -1794,6 +3622,19 @@ struct HeartbeatPayload {
     /// additive/backward-safe contract as `git_sha`.
     #[serde(skip_serializing_if = "Option::is_none")]
     commits_behind: Option<u64>,
+    /// The session-PR reconciler's credential's own `X-RateLimit-*` reading,
+    /// with its login, the per-consumer charged counts and the meter's start
+    /// (plan
+    /// `2026-10-30-session-pr-reconciler-drains-the-user-github-rest-budget-re-polling-terminal-prs`,
+    /// Phase 4). coord files it under `core:user:<login digest>/device:<id>`,
+    /// so a burn of the user bucket SHARED by every box on the identity is
+    /// visible from any box. OMITTED — never sent as a guess — before the
+    /// reconciler's first request, while its login is unresolved, or when the
+    /// reading is stale or unusable ([`crate::github_budget::build_user_budget_report`]).
+    /// Additive: a coord predating the block ignores the unknown key, and a
+    /// block coord refuses is dropped without failing the register.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    github_user_budget: Option<crate::github_budget::UserBudgetReport>,
 }
 
 /// Suppress serializing the field when it's the default. Keeps the
@@ -1802,6 +3643,103 @@ struct HeartbeatPayload {
 /// the moment the probe starts passing.
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+/// Dedupe the "machine.json present but unloadable" heartbeat warning.
+static MACHINE_JSON_UNLOADABLE_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// PURE: what the heartbeat reports when [`load_device_file`] produced no
+/// device, given the fallible read of the same file.
+///
+/// `NotEnrolled` ALLOWS autonomous spawns and makes the drain gate ignore a
+/// cached dispatch role, so it is reported only when the file is positively
+/// ABSENT (or there is no home directory to hold one). A file that exists but
+/// could not be read or parsed, or that names no device_id / hostname, is
+/// `NotSent`, which `coord_drain_state::note_heartbeat` settles through its
+/// own `enrollment()` read. The same split `enrollment()` makes.
+pub(crate) fn unloadable_device_outcome(
+    read: &Result<
+        qontinui_runner_lib::ambient::MachineJson,
+        qontinui_runner_lib::ambient::MachineJsonError,
+    >,
+) -> crate::coord_drain_state::HeartbeatOutcome {
+    use crate::coord_drain_state::HeartbeatOutcome;
+    use qontinui_runner_lib::ambient::MachineJsonError;
+    match read {
+        Err(MachineJsonError::NoHomeDir) => HeartbeatOutcome::NotEnrolled {
+            why: "no home directory, so there is no machine.json",
+        },
+        Err(e) if e.is_missing() => HeartbeatOutcome::NotEnrolled {
+            why: "~/.qontinui/machine.json is missing",
+        },
+        Err(_) => HeartbeatOutcome::NotSent {
+            why: "~/.qontinui/machine.json is present but could not be read",
+        },
+        Ok(_) => HeartbeatOutcome::NotSent {
+            why: "~/.qontinui/machine.json names no device_id or hostname",
+        },
+    }
+}
+
+#[cfg(test)]
+mod unloadable_device_outcome_tests {
+    use super::unloadable_device_outcome;
+    use crate::coord_drain_state::HeartbeatOutcome;
+    use qontinui_runner_lib::ambient::{try_parse_machine_json, MachineJsonError};
+    use std::io::{Error, ErrorKind};
+    use std::path::PathBuf;
+
+    fn read_err(kind: ErrorKind) -> MachineJsonError {
+        MachineJsonError::Read {
+            path: PathBuf::from("machine.json"),
+            source: Error::from(kind),
+        }
+    }
+
+    /// Only a positively absent file is "not enrolled"; anything merely
+    /// unreadable or incomplete must not be, or one transient read opens a
+    /// ci_node box's agent lane (the drain gate ignores the role while not
+    /// enrolled).
+    #[test]
+    fn only_an_absent_machine_json_is_not_enrolled() {
+        for read in [
+            Err(read_err(ErrorKind::NotFound)),
+            Err(MachineJsonError::NoHomeDir),
+        ] {
+            assert!(
+                matches!(
+                    unloadable_device_outcome(&read),
+                    HeartbeatOutcome::NotEnrolled { .. }
+                ),
+                "{read:?}"
+            );
+        }
+        let parse = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+        let unreadable = [
+            Err(read_err(ErrorKind::PermissionDenied)),
+            Err(read_err(ErrorKind::Other)),
+            Err(MachineJsonError::Parse {
+                path: PathBuf::from("machine.json"),
+                source: parse,
+            }),
+            // Readable, but no hostname / no device_id.
+            Ok(
+                try_parse_machine_json(br#"{"device_id":"6c2f8a3e-1d1b-4c86-9d1e-2b9f6a2a0f10"}"#)
+                    .unwrap(),
+            ),
+            Ok(try_parse_machine_json(br#"{"hostname":"box"}"#).unwrap()),
+        ];
+        for read in unreadable {
+            assert!(
+                matches!(
+                    unloadable_device_outcome(&read),
+                    HeartbeatOutcome::NotSent { .. }
+                ),
+                "{read:?}"
+            );
+        }
+    }
 }
 
 /// POST `{device_id, hostname, claude_code_available}` to
@@ -1832,16 +3770,37 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
             why: "a secondary instance sends no register payload",
         });
     }
+    // `NotEnrolled` ALLOWS autonomous spawns and makes the drain gate ignore a
+    // cached dispatch role, so it is reported only when the device file is
+    // positively ABSENT. Anything that merely could not be read — a locked or
+    // half-written machine.json, one with no hostname, a garbage device_id, a
+    // coord base that did not resolve — is `NotSent`, which
+    // `coord_drain_state::note_heartbeat` settles through its own `enrollment()`
+    // read (a miss, trending to Unknown, unless that read proves "not a coord
+    // device"). One transient read must not open a `ci_node` box's agent lane.
     let device = match load_device_file() {
         Some(d) => d,
         None => {
-            info!(
-                "fleet::heartbeat: ~/.qontinui/machine.json missing — \
-                 run `qontinui_profile device init` to enable fleet visibility. Skipping."
-            );
-            return Ok(HeartbeatOutcome::NotEnrolled {
-                why: "~/.qontinui/machine.json is missing",
-            });
+            let outcome =
+                unloadable_device_outcome(&qontinui_runner_lib::ambient::try_read_machine_json());
+            match outcome {
+                HeartbeatOutcome::NotEnrolled { .. } => info!(
+                    "fleet::heartbeat: ~/.qontinui/machine.json missing — \
+                     run `qontinui_profile device init` to enable fleet visibility. Skipping."
+                ),
+                _ => {
+                    if !MACHINE_JSON_UNLOADABLE_WARNED
+                        .swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        warn!(
+                            "fleet::heartbeat: ~/.qontinui/machine.json is present but could \
+                             not be read, or names no device_id/hostname. Skipping the \
+                             register POST; the drain state reads it as a miss. (Logged once.)"
+                        );
+                    }
+                }
+            }
+            return Ok(outcome);
         }
     };
 
@@ -1849,7 +3808,7 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
         Ok(id) => id,
         Err(e) => {
             warn!("fleet::heartbeat: machine.json device_id is not a valid UUID ({e}). Skipping.");
-            return Ok(HeartbeatOutcome::NotEnrolled {
+            return Ok(HeartbeatOutcome::NotSent {
                 why: "machine.json device_id is not a UUID",
             });
         }
@@ -1862,13 +3821,15 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
                 "fleet::heartbeat: ~/.qontinui/profiles.json missing or active profile \
                  has no coord_url — no coord to heartbeat to. Skipping."
             );
-            return Ok(HeartbeatOutcome::NotEnrolled {
-                why: "the active profile has no coord_url",
+            // `enrollment()` tells a profile with no coord_url (not enrolled)
+            // from a settings.json it could not read (indeterminate).
+            return Ok(HeartbeatOutcome::NotSent {
+                why: "no coord base resolved for the register POST",
             });
         }
     };
 
-    let bindings = match resolve_binding_set() {
+    let bindings = match resolve_heartbeat_binding_set() {
         Some(b) => b,
         None => {
             warn_tenant_id_unresolvable_once();
@@ -1880,8 +3841,19 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
             });
         }
     };
+    let bearer_scope = bindings.bearer_scope();
 
-    let claude_code_available = claude_code_probe();
+    // Off the async worker: this loop runs on a current_thread runtime, so the
+    // synchronous probe (a `claude --version` fork, up to its 3s budget) would
+    // block the only worker — and with it the tick timer that bounds this whole
+    // call in `heartbeat_loop::run_tick`. On the blocking pool the await is
+    // bounded by that tick timeout. A failed probe task counts as unavailable.
+    let claude_code_available = spawn_blocking_tracked(claude_code_probe)
+        .await
+        .unwrap_or_else(|e| {
+            warn!("fleet::heartbeat: claude_code_probe task failed ({e}); advertising unavailable");
+            false
+        });
 
     let (capture_preview_count, monitor_crop_count, last_capture_fallback_at) =
         capture_telemetry_snapshot();
@@ -1906,8 +3878,28 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
     //     itself retractable, so a stale label set left behind by a device that
     //     turned CI-node mode off is unreachable by any CI filter.
     let ci = crate::settings::get_ci_node_settings();
-    let capabilities =
-        build_device_capabilities(ci.enabled, &ci.repo_allowlist, &host_capabilities());
+    // The host probes block (a `docker version` fork, and on a cache miss a
+    // bounded `GET /v1/models` of the image upstream), so the capability base
+    // is assembled on the blocking pool rather than on this async task's
+    // worker. A join failure (a panicking probe) still advertises the CI tokens,
+    // the OS fact (the one host token that needs no probe) and the credential
+    // family from its non-blocking cache: `heartbeat_join_failure_capabilities`.
+    let (ci_enabled, repo_allowlist) = (ci.enabled, ci.repo_allowlist.clone());
+    let mut capabilities =
+        spawn_blocking_tracked(move || heartbeat_device_capabilities(ci_enabled, &repo_allowlist))
+            .await
+            .unwrap_or_else(|_| {
+                heartbeat_join_failure_capabilities(ci.enabled, &ci.repo_allowlist)
+            });
+    // Skill capabilities (plan 2026-10-13-coord-expedited-land-lever-for-agents
+    // Phase 3b): advertised only when the skill is served AND the bearer this
+    // heartbeat presents is a live device JWT.
+    let device_jwt_live = crate::auth::device_bearer_scoped(bearer_scope)
+        .is_some_and(|t| crate::auth::slot_jwt_is_usable(&t));
+    capabilities.extend(skill_capability_tokens(
+        crate::fleet_skills::skill_is_served,
+        device_jwt_live,
+    ));
     let ci_runner_labels = if ci.enabled {
         ci_node_labels()
     } else {
@@ -1947,16 +3939,23 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
         git_sha,
         main_sha,
         commits_behind,
+        github_user_budget: crate::github_budget::user_budget_report(),
     };
     let url = format!("{base}/coord/devices/register");
 
-    let client = reqwest::Client::builder()
+    // OS resolver: under the old hickory resolver this request spent its whole
+    // 5 s cap on DNS on a VPN box (outbound_net::os_dns).
+    let client = qontinui_runner_lib::outbound_net::os_dns::client_builder()
         .timeout(Duration::from_secs(5))
         .build()
         .map_err(|e| format!("reqwest builder: {e}"))?;
 
-    // coord-tenant-scope(device): device registration -- the payload already carries tenant_id = bindings.default_tenant and tenant_ids (:1374-1388); the default binding IS the right answer here.
-    let resp = crate::auth::attach_device_auth(client.post(&url).json(&payload))
+    // The bearer follows the binding set's source (`LocalBindingSet::bearer_scope`):
+    // the default binding's legacy slot normally, and the default tenant's OWN
+    // per-tenant slot when the set came from those slots — the legacy slot is
+    // dead then, and an unauthenticated register is what let the bound set age
+    // to UNKNOWN (plan 2026-09-29-vanished-paired-user-json-…, review finding 1).
+    let resp = crate::auth::attach_device_auth_for(client.post(&url).json(&payload), bearer_scope)
         .send()
         .await
         .map_err(|e| format!("POST {url}: {}", error_chain(&e)))?;
@@ -1982,34 +3981,22 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
         // Best-effort throughout: a parse/IO miss just retries next tick.
         let body = resp.text().await.unwrap_or_default();
         if let Some(coord_set) = qontinui_runner_lib::pair::response_tenant_ids(&body) {
-            // Record coord's COUNT before reconciling: the plan adapter asks
-            // "is this device bound to more than one tenant?", which the
-            // slot-backed binding file cannot answer (plan
-            // 2026-09-17-plan-adapter-mints-work-units-under-the-default-binding-of-a-multi-bound-device).
-            if let Err(e) = qontinui_runner_lib::pair::record_coord_bound_tenants(&coord_set) {
-                tracing::debug!("fleet::heartbeat: coord-bound tenant record non-fatal: {e}");
-            }
-            // Off the async worker: the reconcile holds file locks that may
-            // wait (bounded) on a peer process.
+            // Record the echo AND reconcile against it under ONE hold of the
+            // binding-store lock, so the paired_user.json heal never reads
+            // this echo beside the previous pass's omission streaks (plan
+            // 2026-09-29-vanished-paired-user-json-leaves-a-live-jwt-with-no-coord-credential).
+            // Off the async worker: the lock waits (bounded) on a peer process.
             let reconcile_set = coord_set;
             let reconciled = spawn_blocking_tracked(move || {
-                qontinui_runner_lib::pair::reconcile_paired_bindings(&reconcile_set)
+                qontinui_runner_lib::pair::record_and_reconcile_coord_bound_tenants(&reconcile_set)
             })
             .await
             .unwrap_or_else(|e| Err(format!("reconcile task failed: {e}")));
             match reconciled {
-                Ok(report) => {
-                    if report.changed() {
-                        info!(
-                            "fleet::heartbeat: reconciled bindings against coord \
-                             (dropped={:?} dropped_slots={:?} default_repointed={:?})",
-                            report.dropped, report.dropped_slots, report.default_repointed
-                        );
-                    }
-                    for (t, slot) in report.coord_only {
-                        warn_coord_only_binding_once(t, slot);
-                    }
-                }
+                Ok(report) => apply_binding_reconcile_report(
+                    report,
+                    crate::commands::web_integration::notify_tenant_bindings_changed,
+                ),
                 Err(e) => {
                     tracing::debug!("fleet::heartbeat: binding reconcile non-fatal: {e}");
                 }
@@ -2017,14 +4004,28 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
         } else if let Some(resp_tenant) = response_tenant_id(&body) {
             // Legacy echo-heal (single-value; v2-file-aware no-op).
             // Scheduled for deletion in Phase 10 item 4.
-            if let Err(e) = qontinui_runner_lib::pair::backfill_paired_tenant_id(&resp_tenant) {
-                tracing::debug!("fleet::heartbeat: tenant_id write-back non-fatal: {e}");
+            // Off the async worker: it takes the binding-store lock, whose
+            // wait is bounded but may sit on a peer process.
+            let backfilled = spawn_blocking_tracked(move || {
+                qontinui_runner_lib::pair::backfill_paired_tenant_id(&resp_tenant)
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("backfill task failed: {e}")));
+            match backfilled {
+                Ok(true) => crate::commands::web_integration::notify_tenant_bindings_changed(),
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::debug!("fleet::heartbeat: tenant_id write-back non-fatal: {e}");
+                }
             }
         }
         // D2: the same body carries this device's drain state. An absent or
         // unparseable object folds to `Unknown`, never to clear.
+        // The device's dispatch role rides in the same `drain` object; an
+        // absent one keeps today's behaviour.
         Ok(HeartbeatOutcome::Registered {
             drain: crate::coord_drain_state::parse_register_response(&body),
+            dispatch_role: crate::coord_drain_state::parse_register_role(&body),
         })
     } else {
         let body = resp.text().await.unwrap_or_default();
@@ -2166,69 +4167,9 @@ fn detect_claude_code_now() -> bool {
     }
 }
 
-/// Spawn the periodic heartbeat task on the ambient tokio runtime.
-///
-/// Interval is read from `COORD_HEARTBEAT_INTERVAL_SECS` (default 30s,
-/// floored at 1s). `MissedTickBehavior::Skip` mirrors the watcher in
-/// `qontinui-coord/src/health_watcher.rs:99-100` — if a tick is missed
-/// (e.g. system suspend), skip catch-up and resume on the next aligned
-/// tick. Heartbeat failures `warn!` and retry on the next interval;
-/// the loop never panics.
-pub fn spawn_heartbeat() {
-    let secs: u64 = std::env::var("COORD_HEARTBEAT_INTERVAL_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(30)
-        .max(1);
-
-    info!(
-        "fleet::heartbeat: starting periodic heartbeat task, interval={}s",
-        secs
-    );
-
-    // Supervised (plan 2026-09-03-…-supervisor Phase 4): a panic in a tick
-    // used to kill this task silently and let coord's 120s liveness TTL
-    // expire; the supervisor rebuilds the loop after a bounded backoff and
-    // `/health` `supervised_workers` shows the restart. Per-run state lives
-    // inside the future, so a rebuilt loop re-enters cleanly from the top.
-    crate::worker_supervisor::spawn_supervised_with_heartbeat(
-        "fleet.heartbeat",
-        move |hb| async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(secs));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            // Failure-streak counter: each WARN carries the running count (so
-            // log timestamps reveal whether ticks are actually firing every
-            // `secs`), and recovery logs once at info — the success path is
-            // otherwise debug-quiet, which hid the 2026-06-03 outage's
-            // intermittency from the default log level.
-            let mut consecutive_failures: u32 = 0;
-            loop {
-                tick.tick().await;
-                hb.tick();
-                match heartbeat_to_coord().await {
-                    Err(e) => {
-                        consecutive_failures += 1;
-                        warn!(
-                            "fleet::heartbeat: {e} (consecutive_failures={consecutive_failures})"
-                        );
-                        // Three of these in a row make the drain state Unknown.
-                        crate::coord_drain_state::note_heartbeat_failure(&e);
-                    }
-                    Ok(outcome) => {
-                        if consecutive_failures > 0 {
-                            info!(
-                                "fleet::heartbeat: recovered after {consecutive_failures} \
-                                 failed tick(s)"
-                            );
-                            consecutive_failures = 0;
-                        }
-                        crate::coord_drain_state::note_heartbeat(outcome).await;
-                    }
-                }
-            }
-        },
-    );
-}
+// The loop that drives `heartbeat_to_coord` (`spawn_heartbeat`) lives in
+// `fleet/heartbeat_loop.rs`, with its tick timeout, stall warning and periodic
+// summary line.
 
 // =============================================================================
 // Primary-tree state publisher
@@ -2239,7 +4180,7 @@ pub fn spawn_heartbeat() {
 // + `git rev-parse HEAD` + `git symbolic-ref --short HEAD` + mtime-scans the
 // working tree, then POSTs one row per repo to `<base>/coord/trees/upsert`.
 //
-// Mirrors the `heartbeat_to_coord` + `spawn_heartbeat` pair above:
+// Mirrors `heartbeat_to_coord` above and its loop, `heartbeat_loop::spawn_heartbeat`:
 // - Reuses `load_device_file` for identity.
 // - Reuses `profiles::connected_coord_base` for the coord HTTP endpoint.
 // - Best-effort: errors `warn!` and the next tick retries; the loop never
@@ -2414,8 +4355,37 @@ const MANAGED_REPO_EXCLUDES: &[&str] = &[
     "agent-worktrees/",
     ".agent-worktrees/",
     ".coord-mcp-status",
+    // The breadcrumb's atomic-replace temp file (`coord_mcp::replace_breadcrumb`),
+    // which a crash between its write and its rename would leave behind.
+    ".coord-mcp-status.tmp-*",
     ".claude/worktrees/",
 ];
+
+/// The one in-process lock every `.git/info/exclude` writer holds across its
+/// read-modify-write: [`ensure_repo_info_exclude`], the shared-branch
+/// allocation block's add / remove / sweep
+/// (`agent_worktree::shared_branch_restore`), and the provisioners'
+/// per-path block (`provision_exclude::update_exclude`). In-process only —
+/// another runner process on the same box is not excluded by it, and a block
+/// such a race resurrects is reaped by the shared-branch module's stale-block
+/// sweep.
+pub(crate) fn info_exclude_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Read a `.git/info/exclude` for a rewrite: an absent file is empty; any
+/// other read failure, and content that is not UTF-8, is an `Err`, so the
+/// caller never rewrites a file it could not read faithfully.
+pub(crate) fn read_info_exclude(path: &std::path::Path) -> Result<String, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            String::from_utf8(bytes).map_err(|e| format!("{} is not UTF-8 ({e})", path.display()))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(format!("read {}: {e}", path.display())),
+    }
+}
 
 /// Header line bracketing the runner-managed block in a repo's
 /// `.git/info/exclude` — lets the operator see who added the entries.
@@ -2434,7 +4404,14 @@ const MANAGED_EXCLUDE_MARKER: &str = "# qontinui-runner: machine-local artifacts
 /// walks primary trees anyway). Best-effort: any IO error is swallowed — a
 /// missed exclude just means the tree reads dirty for one more cycle, never a
 /// panic.
-fn ensure_repo_info_exclude(repo_path: &std::path::Path) {
+///
+/// Also applied to a canonical checkout right before the runner switches it
+/// onto a `shared_branch` agent branch
+/// ([`crate::agent_worktree::shared_branch_restore::prepare_canonical_excludes`]),
+/// because the session provisioned there writes these artifacts into the
+/// canonical checkout itself, and a refused spawn's restore requires that
+/// checkout to read fully clean.
+pub(crate) fn ensure_repo_info_exclude(repo_path: &std::path::Path) {
     // `.git` as a directory == primary checkout. Skip worktree `.git` files
     // and bare/odd layouts.
     if !repo_path.join(".git").is_dir() {
@@ -2442,7 +4419,24 @@ fn ensure_repo_info_exclude(repo_path: &std::path::Path) {
     }
     let info_dir = repo_path.join(".git").join("info");
     let exclude_path = info_dir.join("exclude");
-    let existing = std::fs::read_to_string(&exclude_path).unwrap_or_default();
+    // Every writer of a `.git/info/exclude` holds this lock across its
+    // read-modify-write, so this roster heal, the shared-branch allocation
+    // block (`agent_worktree::shared_branch_restore`) and the provisioners'
+    // per-path block (`provision_exclude`) never lose each other's edit.
+    let _excl = info_exclude_lock();
+    // A file that exists but cannot be read (or is not UTF-8) is never
+    // rewritten: rewriting it from an empty string would drop the operator's
+    // own lines.
+    let existing = match read_info_exclude(&exclude_path) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(
+                "fleet::ensure_repo_info_exclude: {e} — left as is, so the machine-local \
+                 artifacts are NOT excluded in this repo until the file is readable UTF-8"
+            );
+            return;
+        }
+    };
 
     // Match on whole (trimmed) lines so a substring like `.mcp.json.bak` never
     // counts as already-covered.
@@ -3681,9 +5675,11 @@ fn spawn_skill_parity_pass_if_due() {
             }
             None => {
                 report_skill_parity_unreached(
-                    "the workspace root did not resolve, so neither tree could be \
-                     located — set QONTINUI_ROOT or the runner's paths.workspace_root"
-                        .to_string(),
+                    format!(
+                        "the workspace root did not resolve, so neither tree could be \
+                         located — set the \"{}\" setting to the folder that holds them",
+                        qontinui_types::paths::WORKSPACE_ROOT_SETTING
+                    ),
                     None,
                 );
                 None
@@ -3715,7 +5711,7 @@ fn spawn_skill_parity_pass_if_due() {
 /// `2026-08-04-remove-hardcoded-machine-paths-from-product-code`.
 ///
 /// Still `Option`: a miss means this publish pass finds no repos and says so
-/// (see the "QONTINUI_ROOT to override. Skipping." log below), which is honest
+/// (see the "no workspace root resolved" log below), which is honest
 /// degradation rather than an error.
 fn qontinui_root() -> Option<PathBuf> {
     crate::workspace_paths::workspace_root()
@@ -4937,16 +6933,22 @@ pub async fn publish_tree_state() -> Result<(), String> {
         }
     };
 
-    let root = match qontinui_root() {
-        Some(p) => p,
-        None => {
+    let root = match crate::workspace_paths::runner_workspace_root().require() {
+        Ok(p) => p,
+        Err(unresolved) => {
             info!(
-                "fleet::tree_publisher: no qontinui-root directory found (set \
-                 QONTINUI_ROOT to override). Skipping."
+                "fleet::tree_publisher: {unresolved} With no workspace root there are no \
+                 repos to publish. Skipping."
             );
             return Ok(());
         }
     };
+
+    // The checkouts this walk skips (no `qontinui-` prefix) still get the
+    // shared-branch stale exclude-block sweep each cycle; the walk below
+    // sweeps the `qontinui-*` ones itself.
+    crate::agent_worktree::shared_branch_restore::sweep_unpublished_checkouts(&root, base.clone())
+        .await;
 
     // Walk top-level entries; only `qontinui-*` dirs with a `.git/`
     // count. Skip `.wt/` sibling worktree dirs explicitly — those are
@@ -4956,7 +6958,8 @@ pub async fn publish_tree_state() -> Result<(), String> {
         Err(e) => return Err(format!("read_dir {root}: {e}", root = root.display())),
     };
 
-    let client = reqwest::Client::builder()
+    // OS resolver — see the register heartbeat above and outbound_net::os_dns.
+    let client = qontinui_runner_lib::outbound_net::os_dns::client_builder()
         .timeout(Duration::from_secs(5))
         .build()
         .map_err(|e| format!("reqwest builder: {e}"))?;
@@ -5020,6 +7023,15 @@ pub async fn publish_tree_state() -> Result<(), String> {
             let fetch_path = path.clone();
             let _ = spawn_blocking_tracked(move || fetch_remote_refs_blocking(&fetch_path)).await;
         }
+
+        // Reap a shared-branch allocation's `.git/info/exclude` block that a
+        // runner exit, crash or restart left behind (only a provably dead
+        // allocation's; any unknown keeps it). Cheap when there is none.
+        crate::agent_worktree::shared_branch_restore::sweep_checkout(
+            path.clone(),
+            Some(base.clone()),
+        )
+        .await;
 
         let capture_path = path.clone();
         let mut payload = match spawn_blocking_tracked(move || {
@@ -5158,6 +7170,13 @@ pub fn spawn_tree_publisher() {
     crate::worker_supervisor::spawn_supervised_with_heartbeat(
         "fleet.tree_publisher",
         move |hb| async move {
+            // Startup: reap shared-branch allocation blocks a previous runner
+            // left in the canonical checkouts' `.git/info/exclude`, whether or
+            // not this box can publish (no coord base still reaps a block
+            // whose branch is gone). Re-run on a supervised restart, which is
+            // harmless: the sweep is idempotent and keeps anything live.
+            crate::agent_worktree::shared_branch_restore::sweep_workspace(connected_coord_base())
+                .await;
             let mut tick = tokio::time::interval(Duration::from_secs(secs));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             // Rebuilt with the loop on a supervised restart, so a restart
@@ -5349,7 +7368,10 @@ async fn runner_has_active_tasks() -> bool {
     let port = crate::mcp::types::get_mcp_api_port();
     let probe = async move {
         let resp = reqwest::Client::new()
-            .get(format!("http://localhost:{port}/task-runs/running"))
+            .get(format!(
+                "{}/task-runs/running",
+                crate::mcp::types::runner_loopback_base(port)
+            ))
             .send()
             .await
             .ok()?;
@@ -5848,6 +7870,64 @@ fn execute_build_and_restart(app: &qontinui_types::apps::App, app_id: &str) -> R
 mod tests {
     use super::*;
 
+    /// The reconcile runs on a heartbeat with no user action, so a changed
+    /// binding set has to reach the UI from here or it never does, and an
+    /// unchanged pass (every 30 s heartbeat) must not reach it at all.
+    #[test]
+    fn only_a_changed_binding_reconcile_tells_the_ui() {
+        use qontinui_runner_lib::pair::BindingReconcileReport;
+        let notified = |report: BindingReconcileReport| {
+            let mut count = 0;
+            apply_binding_reconcile_report(report, || count += 1);
+            count
+        };
+        let tenant = uuid::Uuid::from_u128(7);
+        assert_eq!(notified(BindingReconcileReport::default()), 0);
+        assert_eq!(
+            notified(BindingReconcileReport {
+                held: vec![(tenant, 1)],
+                ..Default::default()
+            }),
+            0,
+            "a held binding changed nothing"
+        );
+        for changed in [
+            BindingReconcileReport {
+                dropped: vec![tenant],
+                ..Default::default()
+            },
+            BindingReconcileReport {
+                dropped_slots: vec![tenant],
+                ..Default::default()
+            },
+            BindingReconcileReport {
+                default_repointed: Some(None),
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(notified(changed.clone()), 1, "{changed:?}");
+        }
+    }
+
+    /// The heartbeat hands its report to the function the test above drives,
+    /// with the event that the tenant list listens for.
+    #[test]
+    fn the_heartbeat_reconcile_notifies_with_the_bindings_event() {
+        // Whitespace is collapsed on both sides, so a reformat cannot fail this.
+        // The needle cannot match its own spelling here: the `\` continuation
+        // stays in the squashed source between `report,` and `crate::`.
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let needle = "Ok(report) => apply_binding_reconcile_report( report, \
+                      crate::commands::web_integration::notify_tenant_bindings_changed,";
+        let source = squash(include_str!("fleet.rs"));
+        assert!(source.contains(&squash(needle)));
+        // The legacy backfill announces only when it reports a rewrite.
+        assert!(source.contains(&squash(
+            "Ok(true) => crate::commands::web_integration::notify_tenant_bindings_changed(), \
+             Ok(false) => {}"
+        )));
+    }
+
     /// Phase 3 (plan 2026-09-23-…-ungated): at a CRITICAL verdict the tree
     /// publisher's tick never calls `publish_tree_state` — so no `capture_tree`
     /// and no `fetch_due` `git fetch`, zero `git` spawns — across repeated
@@ -6032,9 +8112,12 @@ mod tests {",
             (
                 "agent_worktree/census.rs",
                 include_str!("agent_worktree/census.rs"),
-                2,
-                "the periodic walk spawn AND `ChunkPoster::resolve_dest`, the POST chokepoint \
-                 every walk trigger routes through",
+                1,
+                "`runs_machine_census`, the module's one spelling of the rule. Its call \
+                 sites — the periodic walk spawn, `ChunkPoster::resolve_dest` (the POST \
+                 chokepoint every walk trigger routes through) and the volume probe — are \
+                 pinned by census.rs's own `the_census_post_chokepoint_carries_the_guard` and \
+                 `the_walk_spawn_and_the_volume_probe_ask_runs_machine_census`",
             ),
             (
                 "agent_worktree/fs_backstop.rs",
@@ -6183,6 +8266,8 @@ mod tests {",
             0,
             ci,
             test_host(),
+            crate::ci_node::host_sizing::suggested_concurrent_builds(test_host()),
+            CiReservation::Bounded(0),
         ))
         .expect("budget payload must serialize")
     }
@@ -6222,7 +8307,7 @@ mod tests {",
         // fix inverts into the mirror-image outage.
         assert_eq!(
             json.get("max_concurrent_agents").and_then(|v| v.as_i64()),
-            Some(derive_max_agents(32) as i64),
+            Some(derive_max_agents(32, 8, 0) as i64),
             "the runner owns the agent cap and must keep publishing it"
         );
         // Machine-resource fields describe the BOX, not this process — both
@@ -6259,6 +8344,8 @@ mod tests {",
                     0,
                     &ci_settings(enabled, 2),
                     test_host(),
+                    12,
+                    CiReservation::Bounded(0),
                 ))
                 .expect("budget payload must serialize");
                 assert!(
@@ -6486,8 +8573,11 @@ mod tests {",
         // file. A future entry spelled `/target-agent` or `target-agent/**`
         // would land in the exclude file and exclude nothing; only a fixture
         // derived from the roster catches that.
+        // A glob entry is materialized as one concrete name it matches (`*`
+        // is not a legal filename character on Windows).
+        let concrete = |pat: &str| pat.trim_end_matches('/').replace('*', "x");
         for pat in MANAGED_REPO_EXCLUDES {
-            let p = dir.join(pat.trim_end_matches('/'));
+            let p = dir.join(concrete(*pat));
             if pat.ends_with('/') {
                 std::fs::create_dir_all(&p).unwrap();
                 std::fs::write(p.join("x"), "x").unwrap();
@@ -6507,7 +8597,7 @@ mod tests {",
         // an entry that stopped being reported ride on a sibling's line and the
         // assert would silently stop asserting.
         for pat in MANAGED_REPO_EXCLUDES {
-            let want = pat.trim_end_matches('/');
+            let want = concrete(*pat);
             assert!(
                 before.lines().any(|l| {
                     l.split_whitespace()
@@ -6545,6 +8635,22 @@ mod tests {",
         assert_eq!(first, second, "second call must be a no-op");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `.git/info/exclude` that is not UTF-8 is left byte-identical: the heal
+    /// used to read it with `read_to_string(..).unwrap_or_default()` and then
+    /// rewrite it from an EMPTY string, deleting every operator line.
+    #[test]
+    fn ensure_repo_info_exclude_leaves_a_non_utf8_file_byte_identical() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let info = dir.path().join(".git").join("info");
+        std::fs::create_dir_all(&info).unwrap();
+        let before = b"operator-line\n\xff not utf-8\n".to_vec();
+        std::fs::write(info.join("exclude"), &before).unwrap();
+
+        ensure_repo_info_exclude(dir.path());
+
+        assert_eq!(std::fs::read(info.join("exclude")).unwrap(), before);
     }
 
     #[test]
@@ -6725,13 +8831,232 @@ mod tests {",
         UNKNOWN_TENANT_WARNED.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// The same worked-example table coord's `fleet.rs` pins
+    /// (`derive_agent_capacity_matches_plan_examples`).
     #[test]
     fn derive_max_agents_examples() {
-        assert_eq!(derive_max_agents(32), 7);
-        assert_eq!(derive_max_agents(16), 3);
-        assert_eq!(derive_max_agents(8), 1);
-        assert_eq!(derive_max_agents(4), 0);
-        assert_eq!(derive_max_agents(0), 0);
+        for (name, mem, cores, ci, want) in [
+            ("nawa", 503, 128, 327, 80),
+            ("nilan", 503, 128, 231, 272),
+            ("merytshost", 368, 48, 200, 215),
+            ("64 GB desktop, 16 threads, no CI", 64, 16, 0, 70),
+            ("monster", 31, 8, 0, 30),
+            ("MSI", 31, 16, 0, 14),
+            ("16 GB laptop, 8 threads", 16, 8, 0, 3),
+            ("nomad", 15, 8, 0, 3),
+            ("empty", 0, 0, 0, 3),
+        ] {
+            assert_eq!(derive_max_agents(mem, cores, ci), want, "{name}");
+        }
+    }
+
+    /// A cgroup v2 fixture. An empty `high` / `max` string leaves that file
+    /// ABSENT, so a slice missing one (or both) bound files can be built.
+    fn cgroup_fixture(slices: &[(&str, &str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("cgroup.controllers"), "memory cpu\n").unwrap();
+        for (name, high, max) in slices {
+            let p = dir.path().join(name);
+            std::fs::create_dir_all(&p).unwrap();
+            if !high.is_empty() {
+                std::fs::write(p.join("memory.high"), format!("{high}\n")).unwrap();
+            }
+            if !max.is_empty() {
+                std::fs::write(p.join("memory.max"), format!("{max}\n")).unwrap();
+            }
+        }
+        dir
+    }
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn ci_reservation_edge_cases() {
+        // memory.high file absent, memory.max numeric: max answers.
+        let d = cgroup_fixture(&[
+            ("ci.slice", "max", "max"),
+            ("ci.slice/ci-a.slice", "", &(10 * GIB).to_string()),
+        ]);
+        assert_eq!(
+            ci_reservation_from_root(d.path()),
+            CiReservation::Bounded(10)
+        );
+        // A child slice with no memory files at all is unbounded: unknown.
+        let d = cgroup_fixture(&[("ci.slice", "max", "max"), ("ci.slice/ci-a.slice", "", "")]);
+        assert_eq!(ci_reservation_from_root(d.path()), CiReservation::Unbounded);
+        // A parent bound tighter than its children's sum caps it.
+        let d = cgroup_fixture(&[
+            ("ci.slice", &(50 * GIB).to_string(), "max"),
+            ("ci.slice/ci-a.slice", &(40 * GIB).to_string(), "max"),
+            ("ci.slice/ci-b.slice", &(40 * GIB).to_string(), "max"),
+        ]);
+        assert_eq!(
+            ci_reservation_from_root(d.path()),
+            CiReservation::Bounded(50)
+        );
+        // A bounded parent covers an unbounded child.
+        let d = cgroup_fixture(&[
+            ("ci.slice", &(64 * GIB).to_string(), "max"),
+            ("ci.slice/ci-a.slice", "max", "max"),
+        ]);
+        assert_eq!(
+            ci_reservation_from_root(d.path()),
+            CiReservation::Bounded(64)
+        );
+        // ci.slice with no children: its own bound, else UNKNOWN (never zero).
+        let d = cgroup_fixture(&[("ci.slice", "max", &(8 * GIB).to_string())]);
+        assert_eq!(
+            ci_reservation_from_root(d.path()),
+            CiReservation::Bounded(8)
+        );
+        let d = cgroup_fixture(&[("ci.slice", "max", "max")]);
+        assert_eq!(ci_reservation_from_root(d.path()), CiReservation::Unbounded);
+        // One byte over a GiB rounds up.
+        let d = cgroup_fixture(&[
+            ("ci.slice", "max", "max"),
+            ("ci.slice/ci-a.slice", &(GIB + 1).to_string(), "max"),
+        ]);
+        assert_eq!(
+            ci_reservation_from_root(d.path()),
+            CiReservation::Bounded(2)
+        );
+    }
+
+    #[test]
+    fn a_ci_node_with_no_cgroup_publishes_its_job_slots_times_16() {
+        let ci = ci_settings(true, 2);
+        let json = serde_json::to_value(build_budget_request(
+            "test-host",
+            MachineRole::Agent,
+            Resources {
+                cpu_cores: 16,
+                memory_gb: 64,
+                disk_total_gb: 1000,
+            },
+            0,
+            &ci,
+            test_host(),
+            12,
+            CiReservation::NoCgroup,
+        ))
+        .unwrap();
+        let jobs = json["max_concurrent_ci_jobs"].as_i64().expect("ci jobs");
+        assert_eq!(json["ci_reserved_gib"].as_i64(), Some(jobs * 16));
+    }
+
+    /// Plan 2026-11-05 Phase 7: an unset capacity ADVERTISES the suggestion it
+    /// is handed (the capacity model's answer), but the reservation published
+    /// for a host with no cgroup — which the plan makes a model input — is sized from
+    /// the static partition, so a loaded box's falling model total cannot
+    /// shrink its reservation and raise its agent cap.
+    #[test]
+    fn the_reservation_is_the_static_partition_not_the_models_answer() {
+        let mut ci = ci_settings(true, 0);
+        ci.max_concurrent_builds = None;
+        let mk = |suggested| {
+            serde_json::to_value(build_budget_request(
+                "test-host",
+                MachineRole::Agent,
+                Resources {
+                    cpu_cores: 16,
+                    memory_gb: 64,
+                    disk_total_gb: 1000,
+                },
+                0,
+                &ci,
+                test_host(),
+                suggested,
+                CiReservation::NoCgroup,
+            ))
+            .unwrap()
+        };
+        let busy = mk(1);
+        let idle = mk(12);
+        assert_eq!(busy["max_concurrent_ci_jobs"].as_i64(), Some(1));
+        assert_eq!(idle["max_concurrent_ci_jobs"].as_i64(), Some(12));
+        // 48c/368 GiB's static partition is 12 slots: 12 × 16 GiB either way.
+        assert_eq!(busy["ci_reserved_gib"].as_i64(), Some(192));
+        assert_eq!(busy["ci_reserved_gib"], idle["ci_reserved_gib"]);
+        assert_eq!(
+            busy["max_concurrent_agents"], idle["max_concurrent_agents"],
+            "the agent cap must not move with the model's answer"
+        );
+    }
+
+    /// nawa's tree as read 2026-11-04: `ci-runners.slice` high 230.4 GiB,
+    /// `ci-winvm.slice` high `max` / max 96 GiB -> 327 GiB (rounded up).
+    #[test]
+    fn ci_reservation_sums_each_slice_high_else_max() {
+        let d = cgroup_fixture(&[
+            ("ci.slice", "max", "max"),
+            ("ci.slice/ci-runners.slice", "247389487104", "274877906944"),
+            ("ci.slice/ci-winvm.slice", "max", "103079215104"),
+        ]);
+        assert_eq!(
+            ci_reservation_from_root(d.path()),
+            CiReservation::Bounded(327)
+        );
+    }
+
+    #[test]
+    fn an_unbounded_ci_slice_is_unknown_and_omitted() {
+        let d = cgroup_fixture(&[
+            ("ci.slice", "max", "max"),
+            ("ci.slice/ci-runners.slice", "247389487104", "max"),
+            ("ci.slice/ci-other.slice", "max", "max"),
+        ]);
+        assert_eq!(ci_reservation_from_root(d.path()), CiReservation::Unbounded);
+        assert_eq!(published_ci_reserved_gib(CiReservation::Unbounded, 4), None);
+    }
+
+    #[test]
+    fn no_ci_slice_is_zero_and_no_cgroup_falls_back_to_ci_jobs() {
+        let d = cgroup_fixture(&[]);
+        assert_eq!(
+            ci_reservation_from_root(d.path()),
+            CiReservation::Bounded(0)
+        );
+        let bare = tempfile::tempdir().unwrap();
+        assert_eq!(
+            ci_reservation_from_root(bare.path()),
+            CiReservation::NoCgroup
+        );
+        assert_eq!(
+            published_ci_reserved_gib(CiReservation::NoCgroup, 2),
+            Some(32)
+        );
+        assert_eq!(
+            published_ci_reserved_gib(CiReservation::NoCgroup, 0),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn budget_payload_omits_an_unknown_ci_reservation() {
+        let ci = ci_settings(false, 2);
+        let mk = |r| {
+            serde_json::to_value(build_budget_request(
+                "test-host",
+                MachineRole::Agent,
+                Resources {
+                    cpu_cores: 128,
+                    memory_gb: 503,
+                    disk_total_gb: 1000,
+                },
+                0,
+                &ci,
+                test_host(),
+                12,
+                r,
+            ))
+            .unwrap()
+        };
+        let known = mk(CiReservation::Bounded(327));
+        assert_eq!(known["ci_reserved_gib"].as_i64(), Some(327));
+        assert_eq!(known["max_concurrent_agents"].as_i64(), Some(80));
+        assert!(mk(CiReservation::Unbounded)
+            .get("ci_reserved_gib")
+            .is_none());
     }
 
     #[test]
@@ -6828,11 +9153,67 @@ mod tests {",
             git_sha: None,
             main_sha: None,
             commits_behind: None,
+            github_user_budget: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert!(
             body.get("claude_code_available").is_none(),
             "false value should be omitted from heartbeat wire"
+        );
+    }
+
+    /// Plan 2026-10-30-…, Phase 4: the user-bucket block rides the register
+    /// body under coord's key, snake_case inside, and is ABSENT (not `null`)
+    /// when there is nothing honest to report.
+    #[test]
+    fn heartbeat_payload_carries_the_github_user_budget_block_only_when_present() {
+        let payload = |github_user_budget| HeartbeatPayload {
+            device_id: uuid::Uuid::nil(),
+            hostname: "test".into(),
+            claude_code_available: false,
+            tenant_id: uuid::Uuid::nil(),
+            tenant_ids: vec![uuid::Uuid::nil()],
+            capture_preview_count: 0,
+            monitor_crop_count: 0,
+            last_capture_fallback_at: None,
+            capabilities: Vec::new(),
+            ci_runner_labels: Vec::new(),
+            git_sha: None,
+            main_sha: None,
+            commits_behind: None,
+            github_user_budget,
+        };
+        let absent = serde_json::to_value(payload(None)).unwrap();
+        assert!(
+            absent.get("github_user_budget").is_none(),
+            "no reading/login ⇒ the key is omitted, never null or a guess"
+        );
+
+        let report = crate::github_budget::UserBudgetReport {
+            login: "jspinak".into(),
+            limit: 5000,
+            remaining: 4100,
+            used: Some(900),
+            reset_at_unix: 1_763_560_000,
+            resource: "core".into(),
+            charged_by_consumer: [("session_pr_reconciler".to_string(), 4350_u64)]
+                .into_iter()
+                .collect(),
+            process_started_at_unix: Some(1_763_500_000),
+        };
+        let body = serde_json::to_value(payload(Some(report))).unwrap();
+        assert_eq!(
+            body["github_user_budget"],
+            serde_json::json!({
+                "login": "jspinak",
+                "limit": 5000,
+                "remaining": 4100,
+                "used": 900,
+                "reset_at_unix": 1_763_560_000_i64,
+                "resource": "core",
+                "charged_by_consumer": {"session_pr_reconciler": 4350},
+                "process_started_at_unix": 1_763_500_000_i64,
+            })
         );
     }
 
@@ -6852,6 +9233,7 @@ mod tests {",
             git_sha: None,
             main_sha: None,
             commits_behind: None,
+            github_user_budget: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -6882,6 +9264,7 @@ mod tests {",
             git_sha: None,
             main_sha: None,
             commits_behind: None,
+            github_user_budget: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -6910,6 +9293,7 @@ mod tests {",
             git_sha: None,
             main_sha: None,
             commits_behind: None,
+            github_user_budget: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -6944,6 +9328,7 @@ mod tests {",
             git_sha: None,
             main_sha: None,
             commits_behind: None,
+            github_user_budget: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -6979,6 +9364,7 @@ mod tests {",
             git_sha: None,
             main_sha: None,
             commits_behind: None,
+            github_user_budget: None,
         };
         let body0 = serde_json::to_value(&p0).unwrap();
         assert!(
@@ -7053,6 +9439,7 @@ mod tests {",
             git_sha: None,
             main_sha: None,
             commits_behind: None,
+            github_user_budget: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -7093,6 +9480,7 @@ mod tests {",
             git_sha: Some("dc7aa9c5aaaa"),
             main_sha: Some("dc7aa9c5aaaabbbbccccddddeeeeffff00001111".into()),
             commits_behind: Some(4),
+            github_user_budget: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert_eq!(
@@ -7143,6 +9531,7 @@ mod tests {",
             git_sha,
             main_sha: None,
             commits_behind: None,
+            github_user_budget: None,
         };
         let body = serde_json::to_value(&p).unwrap();
         assert!(
@@ -7313,6 +9702,7 @@ mod tests {",
             git_sha: None,
             main_sha: None,
             commits_behind: None,
+            github_user_budget: None,
         }
     }
 
@@ -7352,6 +9742,41 @@ mod tests {",
         );
     }
 
+    /// Plan 2026-10-13-coord-expedited-land-lever-for-agents Phase 3b: the
+    /// review capability is advertised only when the skill is served AND the
+    /// heartbeat's bearer is a live device JWT — each half alone is not enough,
+    /// so a device that cannot post a verdict is never dispatched a review.
+    #[test]
+    fn expedite_review_capability_needs_served_skill_and_live_jwt() {
+        assert_eq!(
+            skill_capabilities(true, true),
+            vec![EXPEDITE_REVIEW_CAPABILITY.to_string()]
+        );
+        assert!(skill_capabilities(true, false).is_empty(), "no live JWT");
+        assert!(
+            skill_capabilities(false, true).is_empty(),
+            "skill not served"
+        );
+        assert!(skill_capabilities(false, false).is_empty());
+        assert_eq!(EXPEDITE_REVIEW_CAPABILITY, "skill:expedite-review");
+    }
+
+    /// The heartbeat asks the served corpus about exactly `expedite-review`.
+    #[test]
+    fn skill_capability_tokens_look_up_the_expedite_review_skill() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let served = |name: &str| {
+            asked.borrow_mut().push(name.to_string());
+            name == "expedite-review"
+        };
+        assert_eq!(
+            skill_capability_tokens(served, true),
+            vec![EXPEDITE_REVIEW_CAPABILITY.to_string()]
+        );
+        assert_eq!(asked.borrow().as_slice(), ["expedite-review".to_string()]);
+        assert!(skill_capability_tokens(|_| false, true).is_empty());
+    }
+
     /// The populated wire shape: every advertised token appears verbatim, in
     /// the assembled order, with `ci_node` still a BARE token (not `ci:node`)
     /// so coord's eight `capabilities @> '["ci_node"]'::jsonb` filters keep
@@ -7361,7 +9786,7 @@ mod tests {",
         let caps = build_device_capabilities(
             true,
             &[],
-            &build_host_capabilities("windows", true, true, true),
+            &build_host_capabilities("windows", true, true, true, Some(48 * GIB_BYTES)),
         );
         let body = serde_json::to_value(heartbeat_payload_with_ci(caps, Vec::new())).unwrap();
         assert_eq!(
@@ -7371,7 +9796,10 @@ mod tests {",
                 "os:windows",
                 "shell:powershell",
                 "runtime:docker",
-                "runtime:webview"
+                "runtime:webview",
+                "mem_ge_8",
+                "mem_ge_16",
+                "mem_ge_32"
             ])),
             "populated capabilities must ride the wire verbatim, got {body}"
         );
@@ -7449,29 +9877,151 @@ mod tests {",
     #[test]
     fn host_capability_assembly_full_set() {
         assert_eq!(
-            build_host_capabilities("windows", true, true, true),
+            build_host_capabilities("windows", true, true, true, Some(64 * GIB_BYTES)),
             vec![
                 "os:windows",
                 "shell:powershell",
                 "runtime:docker",
-                "runtime:webview"
+                "runtime:webview",
+                "mem_ge_8",
+                "mem_ge_16",
+                "mem_ge_32",
+                "mem_ge_64"
             ]
         );
+    }
+
+    // ── Memory-tier tokens (plan
+    //    2026-10-02-fleet-machine-roles-workhorse-bench-ci-node A6 / D10) ──
+
+    const GIB_BYTES: u64 = 1024 * 1024 * 1024;
+
+    /// The tokens are CUMULATIVE: a host advertises every tier it meets, so a
+    /// repo requiring `mem_ge_32` matches a 48 GiB host through plain `@>`.
+    #[test]
+    fn memory_tiers_are_cumulative() {
+        assert_eq!(
+            memory_tier_capabilities(Some(48 * GIB_BYTES)),
+            vec!["mem_ge_8", "mem_ge_16", "mem_ge_32"]
+        );
+        assert_eq!(
+            memory_tier_capabilities(Some(256 * GIB_BYTES)),
+            vec![
+                "mem_ge_8",
+                "mem_ge_16",
+                "mem_ge_32",
+                "mem_ge_64",
+                "mem_ge_128",
+                "mem_ge_256"
+            ]
+        );
+        assert_eq!(
+            memory_tier_capabilities(Some(u64::MAX)),
+            vec![
+                "mem_ge_8",
+                "mem_ge_16",
+                "mem_ge_32",
+                "mem_ge_64",
+                "mem_ge_128",
+                "mem_ge_256"
+            ],
+            "no overflow at the top of the range"
+        );
+    }
+
+    /// The case the tolerance exists for: a nominal "16 GB" machine reports
+    /// `MemTotal` 16,375,488 KiB (~15.6 GiB). It must land in the 16 GiB tier,
+    /// not alongside 8 GiB machines.
+    #[test]
+    fn nominal_16gb_host_reporting_15_6_gib_meets_mem_ge_16() {
+        let total = 16_375_488 * 1024;
+        assert!(total < 16 * GIB_BYTES, "fixture must be under nominal");
+        assert_eq!(
+            memory_tier_capabilities(Some(total)),
+            vec!["mem_ge_8", "mem_ge_16"]
+        );
+    }
+
+    /// The threshold sits at exactly 90% of the tier's nominal size, and
+    /// non-power-of-two configurations stay in the tier below.
+    #[test]
+    fn memory_tier_threshold_boundaries() {
+        // 90% of 16 GiB = 14.4 GiB is not a whole number of bytes; `line` is
+        // the first byte at or above it, which meets the tier...
+        let line = (16 * GIB_BYTES * 9).div_ceil(10);
+        assert!(memory_tier_capabilities(Some(line)).contains(&"mem_ge_16".to_string()));
+        // ...one byte under does not.
+        assert_eq!(memory_tier_capabilities(Some(line - 1)), vec!["mem_ge_8"]);
+        // A ~7.44 GiB "8 GB" box meets mem_ge_8 (its line is 7.2 GiB).
+        assert_eq!(
+            memory_tier_capabilities(Some(7_800_000 * 1024)),
+            vec!["mem_ge_8"]
+        );
+        // 12 / 24 / 48 GiB stay in the tier below the next power of two.
+        assert_eq!(
+            memory_tier_capabilities(Some(12 * GIB_BYTES)),
+            vec!["mem_ge_8"]
+        );
+        assert_eq!(
+            memory_tier_capabilities(Some(24 * GIB_BYTES)),
+            vec!["mem_ge_8", "mem_ge_16"]
+        );
+        assert!(!memory_tier_capabilities(Some(48 * GIB_BYTES)).contains(&"mem_ge_64".to_string()));
+        // A small host meets no tier at all.
+        assert!(memory_tier_capabilities(Some(4 * GIB_BYTES)).is_empty());
+        assert!(memory_tier_capabilities(Some(0)).is_empty());
+    }
+
+    /// Unreadable memory advertises NO tier — never a guess. For a repo that
+    /// requires a tier, that fails closed (the device is not electable).
+    #[test]
+    fn unreadable_memory_advertises_no_tier() {
+        assert!(memory_tier_capabilities(None).is_empty());
+        let caps = build_host_capabilities("linux", false, false, false, None);
+        assert_eq!(caps, vec!["os:linux"]);
+        assert!(!caps
+            .iter()
+            .any(|c| c.starts_with(MEMORY_TIER_CAPABILITY_PREFIX)));
+    }
+
+    /// The spelling is a wire contract with `ci_node_required_capabilities`
+    /// seeds: pin the exact bytes of every tier token.
+    #[test]
+    fn memory_tier_token_spelling_is_pinned() {
+        assert_eq!(MEMORY_TIER_CAPABILITY_PREFIX, "mem_ge_");
+        assert_eq!(MEMORY_TIERS_GIB, [8, 16, 32, 64, 128, 256]);
+    }
+
+    /// The live probe path: this process can read its own memory, and the
+    /// assembled host set carries exactly the tiers its `MemTotal` meets,
+    /// agreeing with the shared resource-guard probe. No particular tier is
+    /// asserted, so the test does not depend on the host's size.
+    #[test]
+    fn live_host_capabilities_carry_the_probed_memory_tiers() {
+        let mem = crate::resource_guard::host_capacity().mem_bytes;
+        assert!(mem.is_some(), "a test host must be able to read its memory");
+        let expected = memory_tier_capabilities(mem);
+        let caps = host_capabilities();
+        let got: Vec<&String> = caps
+            .iter()
+            .filter(|c| c.starts_with(MEMORY_TIER_CAPABILITY_PREFIX))
+            .collect();
+        assert_eq!(got, expected.iter().collect::<Vec<_>>());
     }
 
     /// Each probe contributes independently.
     #[test]
     fn host_capability_assembly_partial_sets() {
         assert_eq!(
-            build_host_capabilities("linux", true, false, false),
+            build_host_capabilities("linux", true, false, false, None),
             vec!["os:linux", "shell:powershell"]
         );
         assert_eq!(
-            build_host_capabilities("macos", false, true, false),
+            build_host_capabilities("macos", false, true, false, None),
             vec!["os:macos", "runtime:docker"]
         );
         assert_eq!(
-            build_host_capabilities("linux", false, false, true),
+            build_host_capabilities("linux", false, false, true, None),
             vec!["os:linux", "runtime:webview"],
             "a headless-OS box WITH a webview runtime still advertises it — the \
              token is probed, never inferred from the OS"
@@ -7484,7 +10034,7 @@ mod tests {",
     /// coord must NOT see `shell:powershell` for it.
     #[test]
     fn host_capability_assembly_degrades_to_os_only() {
-        let caps = build_host_capabilities("linux", false, false, false);
+        let caps = build_host_capabilities("linux", false, false, false, None);
         assert_eq!(caps, vec!["os:linux"]);
         assert!(
             !caps.iter().any(|c| c == "shell:powershell"),
@@ -7511,7 +10061,7 @@ mod tests {",
             ("windows", true, true),
             ("macos", false, true),
         ] {
-            let caps = build_host_capabilities(os, powershell, docker, false);
+            let caps = build_host_capabilities(os, powershell, docker, false, None);
             assert!(
                 !caps.iter().any(|c| c == WEBVIEW_RUNTIME_CAPABILITY),
                 "os={os} with no webview runtime must not advertise \
@@ -7528,7 +10078,7 @@ mod tests {",
     fn webview_capability_token_spelling_is_pinned() {
         assert_eq!(WEBVIEW_RUNTIME_CAPABILITY, "runtime:webview");
         assert!(
-            build_host_capabilities("linux", false, false, true)
+            build_host_capabilities("linux", false, false, true, None)
                 .iter()
                 .any(|c| c == "runtime:webview"),
             "the advertised token must be the pinned literal, not a near-miss"
@@ -7553,12 +10103,87 @@ mod tests {",
         );
     }
 
+    /// Plan
+    /// `2026-11-06-a-regression-test-run-is-judged-by-what-it-covered-and-a-silent-run-reads-unknown`
+    /// Phase 13 (D-D7a): `condition:secret_substitution` is advertised only
+    /// when this runner can launch a condition-check session, a webview
+    /// runtime AND a launchable `claude`, because coord's placement verdict
+    /// reads the token and not `claude_code_available`.
+    #[test]
+    fn condition_secrets_capability_is_advertised_only_when_a_condition_check_can_launch() {
+        assert_eq!(
+            CONDITION_SECRET_SUBSTITUTION_CAPABILITY,
+            "condition:secret_substitution"
+        );
+        assert_eq!(
+            condition_secret_substitution_capability(true, true).as_deref(),
+            Some("condition:secret_substitution")
+        );
+        for (webview, claude) in [(true, false), (false, true), (false, false)] {
+            assert_eq!(
+                condition_secret_substitution_capability(webview, claude),
+                None,
+                "webview={webview} claude={claude}: no condition-check session can launch"
+            );
+        }
+        // The assembled set reads BOTH probes: every combination a host can
+        // produce, through the same assembly `host_capabilities` runs.
+        for (webview, claude) in [(true, true), (true, false), (false, true), (false, false)] {
+            let slow = SlowHostProbes {
+                powershell: false,
+                docker: false,
+                claude,
+            };
+            assert_eq!(
+                assemble_host_capabilities("linux", slow, webview, None)
+                    .iter()
+                    .any(|c| c == CONDITION_SECRET_SUBSTITUTION_CAPABILITY),
+                webview && claude,
+                "webview={webview} claude={claude}"
+            );
+        }
+        // A unit-test process holds no Tauri runtime, so the live set must not
+        // carry the token whatever PATH holds.
+        assert!(!webview_runtime_available());
+        assert!(
+            !host_capabilities()
+                .iter()
+                .any(|c| c == CONDITION_SECRET_SUBSTITUTION_CAPABILITY),
+            "the token was advertised by a runner that cannot launch a condition check"
+        );
+    }
+
+    /// `claude` counts as launchable only when it is an absolute, regular,
+    /// executable file: `resolve_claude_bin` hands an explicit
+    /// `QONTINUI_CLAUDE_BIN` back as it is, and a launch of a non-executable
+    /// one would fail.
+    #[cfg(unix)]
+    #[test]
+    fn condition_secrets_a_claude_without_its_execute_bit_is_not_launchable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let bin = dir.path().join("claude");
+        std::fs::write(&bin, "#!/bin/sh\n").expect("written");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o644)).expect("mode");
+        assert!(!is_launchable_file(&bin), "no execute bit");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        assert!(
+            is_launchable_file(&bin),
+            "anti-vacuity: an executable file is"
+        );
+        assert!(!is_launchable_file(dir.path()), "a directory is not");
+        assert!(
+            !is_launchable_file(std::path::Path::new("claude")),
+            "a bare name is not"
+        );
+    }
+
     /// Host facts ride the heartbeat WHETHER OR NOT CI-node mode is on —
     /// continuation dispatch is not a CI concern, and most of the fleet is
     /// not a CI node. `ci_node` alone is conditional, and stays a BARE token.
     #[test]
     fn device_capabilities_advertise_host_facts_without_ci_node() {
-        let host = build_host_capabilities("linux", true, false, false);
+        let host = build_host_capabilities("linux", true, false, false, None);
         let allow = vec![
             "qontinui/qontinui-runner".to_string(),
             "qontinui-coord".to_string(),
@@ -7677,16 +10302,64 @@ mod tests {",
         );
     }
 
+    /// Serializes the tests that seed the process-global
+    /// [`CRED_FAMILY_CACHE`], so one test's seeded state never leaks into
+    /// another's reads.
+    static CRED_FAMILY_CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Cache invariant: two back-to-back calls agree, and the OS fact is
     /// always present (it is `cfg!`-derived, so it cannot fail to probe).
     /// Also records what THIS host actually advertises.
+    ///
+    /// M1 is NON-vacuous: [`CRED_FAMILY_CACHE`] is seeded with an advertised
+    /// `cred:gh` first (it is otherwise always empty under test, since the
+    /// refresh is suppressed), so the "host facts exclude the cred family"
+    /// assertion is made against a cache that HAS cred tokens to leak, and
+    /// [`heartbeat_capabilities`] is shown to carry them. The prior cache
+    /// state is restored on every exit, panics included.
     #[test]
     fn host_capabilities_probe_smoke() {
+        let _serial = CRED_FAMILY_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        struct Restore(Option<CredFamilyState>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                if let Some(prior) = self.0.take() {
+                    *CRED_FAMILY_CACHE.lock().unwrap_or_else(|p| p.into_inner()) = prior;
+                }
+            }
+        }
+        let _restore = {
+            let mut g = CRED_FAMILY_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+            let mut seeded = CredFamilyState::new();
+            // Fresh (ran_at = now), so `cred_capabilities` sees it as not
+            // stale and serves it as-is.
+            seeded.apply(
+                &[(CRED_GH_CAPABILITY, CredState::Present)],
+                std::time::Instant::now(),
+                HOST_PROBE_TTL,
+            );
+            Restore(Some(std::mem::replace(&mut *g, seeded)))
+        };
+
         if let Ok(mut g) = SLOW_HOST_PROBE_CACHE.lock() {
             *g = None;
         }
+        let heartbeat = heartbeat_capabilities();
+        assert!(
+            heartbeat.iter().any(|c| c == CRED_PROBES_MARKER)
+                && heartbeat.iter().any(|c| c == CRED_GH_CAPABILITY),
+            "anti-vacuity: heartbeat_capabilities must carry the seeded cred family, got {heartbeat:?}"
+        );
         let first = host_capabilities();
         let second = host_capabilities();
+        assert!(
+            !first
+                .iter()
+                .any(|c| c.starts_with("cred:") || c == CRED_PROBES_MARKER),
+            "host_capabilities must not carry the cred family (heartbeat-only), got {first:?}"
+        );
         assert_eq!(
             first, second,
             "host_capabilities must be cache-stable across consecutive calls"
@@ -7700,6 +10373,1320 @@ mod tests {",
         eprintln!("host_capabilities() on this host = {first:?}");
     }
 
+    /// The heartbeat's join-failure arm (`heartbeat_to_coord`'s `unwrap_or_else`
+    /// over the blocking assembly) keeps the credential family. The vector is
+    /// authoritative, so dropping it there would retract every `cred:*` token
+    /// and the `probes:cred` marker because an unrelated host probe panicked.
+    #[test]
+    fn a_join_failure_heartbeat_keeps_the_credential_family() {
+        let _serial = CRED_FAMILY_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        struct Restore(Option<CredFamilyState>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                if let Some(prior) = self.0.take() {
+                    *CRED_FAMILY_CACHE.lock().unwrap_or_else(|p| p.into_inner()) = prior;
+                }
+            }
+        }
+        let mut seeded = CredFamilyState::new();
+        seeded.apply(
+            &[(CRED_GH_CAPABILITY, CredState::Present)],
+            std::time::Instant::now(),
+            HOST_PROBE_TTL,
+        );
+        let _restore = {
+            let mut g = CRED_FAMILY_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+            Restore(Some(std::mem::replace(&mut *g, seeded)))
+        };
+        let allow = vec!["qontinui-runner".to_string()];
+        let caps = heartbeat_join_failure_capabilities(true, &allow);
+        for token in [
+            "ci_node",
+            "ci_repo:qontinui-runner",
+            CRED_PROBES_MARKER,
+            CRED_GH_CAPABILITY,
+        ] {
+            assert!(caps.iter().any(|c| c == token), "{token} missing: {caps:?}");
+        }
+        assert!(caps
+            .iter()
+            .any(|c| c == &format!("os:{}", current_os_label())));
+        // And the heartbeat really routes its join failure through it.
+        let src = include_str!("fleet.rs");
+        let prod = prod_part(src);
+        let (_, from_fn) = prod
+            .split_once("pub async fn heartbeat_to_coord(")
+            .expect("heartbeat_to_coord is defined in fleet.rs");
+        let (body, _) = from_fn
+            .split_once("\n}\n")
+            .expect("heartbeat_to_coord ends");
+        assert!(
+            squeezed(body).contains(
+                ".unwrap_or_else(|_|{heartbeat_join_failure_capabilities(ci.enabled,&ci.repo_allowlist)})"
+            ),
+            "heartbeat_to_coord's join-failure arm must call heartbeat_join_failure_capabilities"
+        );
+        // That arm runs on the async worker, so the helper must reach no
+        // blocking probe — the same banned set the blocking-pool pin uses.
+        let (_, helper) = prod
+            .split_once("fn heartbeat_join_failure_capabilities(")
+            .expect("the helper is defined in fleet.rs");
+        let (helper, _) = helper.split_once("\n}\n").expect("the helper ends");
+        let helper = squeezed(helper);
+        for blocking in [
+            "heartbeat_device_capabilities",
+            "heartbeat_capabilities",
+            "host_capabilities",
+            "capability_tokens",
+            "slow_host_probes",
+            "claude_code_probe",
+        ] {
+            assert!(
+                !calls_fn(&helper, blocking),
+                "heartbeat_join_failure_capabilities runs on the async worker and must not call {blocking}(..)"
+            );
+        }
+    }
+
+    /// ARMING test at the heartbeat seam (plan
+    /// 2026-10-09-coord-knows-which-box-holds-which-credential, Phase 2).
+    ///
+    /// Enters exactly where the population enters: the capability vector
+    /// `heartbeat_to_coord` puts on the register payload is
+    /// `heartbeat_device_capabilities(ci_enabled, &repo_allowlist)` (copies of
+    /// the CI-node settings, run on the blocking pool), and
+    /// this test calls that same function (CI-node off and on) with the
+    /// family cache seeded as a
+    /// finished probe run would leave it. It never runs a probe: the cache is
+    /// seeded by value, and the background refresh is suppressed under
+    /// `cfg(test)`. The prior cache state is restored on every exit.
+    #[test]
+    fn heartbeat_payload_capabilities_carry_seeded_cred_tokens() {
+        let _serial = CRED_FAMILY_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        struct Restore(Option<CredFamilyState>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                if let Some(prior) = self.0.take() {
+                    *CRED_FAMILY_CACHE.lock().unwrap_or_else(|p| p.into_inner()) = prior;
+                }
+            }
+        }
+        let now = std::time::Instant::now();
+        let mut memos = std::collections::BTreeMap::new();
+        for token in [CRED_GH_CAPABILITY, CRED_AWS_STS_CAPABILITY] {
+            memos.insert(
+                token,
+                CredMemo {
+                    present: true,
+                    unknown_since: None,
+                },
+            );
+        }
+        let regional_token = "cred:aws-ssm:eu-central-1";
+        let seeded = CredFamilyState {
+            ran_at: Some(now),
+            memos,
+            regional: std::iter::once((
+                regional_token.to_string(),
+                CredMemo {
+                    present: true,
+                    unknown_since: None,
+                },
+            ))
+            .collect(),
+            regional_measured: false,
+        };
+        let _restore = {
+            let mut g = CRED_FAMILY_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+            Restore(Some(std::mem::replace(&mut *g, seeded)))
+        };
+
+        for (ci_enabled, allowlist) in [
+            (false, Vec::<String>::new()),
+            (true, vec!["qontinui-runner".to_string()]),
+        ] {
+            let payload_caps = heartbeat_device_capabilities(ci_enabled, &allowlist);
+            for token in [
+                CRED_PROBES_MARKER,
+                CRED_GH_CAPABILITY,
+                CRED_AWS_STS_CAPABILITY,
+                regional_token,
+            ] {
+                assert!(
+                    payload_caps.iter().any(|c| c == token),
+                    "the heartbeat payload's capabilities (ci_node={ci_enabled}) must carry \
+                     `{token}` from a seeded cred cache, got {payload_caps:?}"
+                );
+            }
+            assert!(
+                payload_caps
+                    .iter()
+                    .any(|c| c == &format!("os:{}", current_os_label())),
+                "the host facts must still ride beside the cred family, got {payload_caps:?}"
+            );
+        }
+    }
+
+    // ── Credential-presence family (plan
+    //    2026-10-09-coord-knows-which-box-holds-which-credential, Phase 2) ──
+
+    /// A fake secret the shims print on BOTH streams and plant in gh's
+    /// `hosts.yml`. It must never surface in a log, the heartbeat payload, a
+    /// verdict's Debug rendering or a panic message.
+    pub(super) const CRED_FAKE_SECRET: &str = "FAKE-SECRET-ghp_credprobecanary0123456789";
+
+    pub(super) const CRED_TEST_TTL: Duration = Duration::from_secs(300);
+
+    /// A listed token that was never earned and still is not held says nothing
+    /// in the logs, so a long list of unmeasured catalogue rows cannot bypass the
+    /// refusal-log cap. The token that IS newly advertised in the same fold is the
+    /// control that shows the capture sees this family's lines.
+    #[test]
+    fn an_unearned_listed_token_folds_without_a_log_line() {
+        const NEVER: &str = "cred:aws-ecs:ap-south-1";
+        const SEEN: &str = "cred:aws-ecs:eu-central-1";
+        let (held, logs) = capture_cred_logs(|| {
+            let mut state = CredFamilyState::new();
+            let cycle = super::cred_probe_specs::RegionalCycle::Answered {
+                verdicts: vec![(SEEN.to_string(), CredState::Present)],
+                not_run: vec![NEVER.to_string()],
+                unreadable_rows: false,
+                refused_tokens: Vec::new(),
+                skipped_rows: false,
+            };
+            state.apply_regional(&cycle, std::time::Instant::now(), CRED_TEST_TTL);
+            state.regional.contains_key(NEVER)
+        });
+        assert!(!held, "an unmeasured token is not memoized");
+        assert!(
+            logs.contains(SEEN),
+            "control: the capture saw the fold: {logs}"
+        );
+        assert!(!logs.contains(NEVER), "{logs}");
+    }
+
+    /// `probes:cred-regional` says THIS box measured every token of an answered
+    /// catalogue on its last regional cycle — the evidence coord needs before it
+    /// may read a regional token's absence as measured (plan
+    /// `2026-11-20-regional-cred-absence-is-measured-only-where-the-regional-probe-ran`;
+    /// `probes:cred` attests only the built-in probes). Any cycle that left a
+    /// catalogued token unmeasured withdraws it.
+    #[test]
+    fn the_regional_marker_is_advertised_only_after_a_fully_measured_answered_cycle() {
+        const SSM: &str = "cred:aws-ssm:eu-central-1";
+        const ECS: &str = "cred:aws-ecs:eu-central-1";
+        let now = std::time::Instant::now();
+        let answered = |verdicts: Vec<(&str, CredState)>,
+                        not_run: Vec<&str>,
+                        unreadable_rows: bool,
+                        refused: Vec<&str>| {
+            super::cred_probe_specs::RegionalCycle::Answered {
+                verdicts: verdicts
+                    .into_iter()
+                    .map(|(t, s)| (t.to_string(), s))
+                    .collect(),
+                not_run: not_run.into_iter().map(str::to_string).collect(),
+                unreadable_rows,
+                refused_tokens: refused.into_iter().map(str::to_string).collect(),
+                skipped_rows: false,
+            }
+        };
+        let has_marker = |s: &CredFamilyState| {
+            s.advertised()
+                .iter()
+                .any(|c| c == CRED_REGIONAL_PROBES_MARKER)
+        };
+
+        let mut state = CredFamilyState::new();
+        // Before the family's first run nothing is advertised, marker included.
+        state.apply_regional(
+            &answered(vec![(SSM, CredState::Absent)], vec![], false, vec![]),
+            now,
+            CRED_TEST_TTL,
+        );
+        assert!(state.advertised().is_empty());
+        state.apply(&[], now, CRED_TEST_TTL);
+        // Every listed token measured (an Absent verdict is a measurement): marker.
+        assert!(has_marker(&state), "{:?}", state.advertised());
+        assert_eq!(
+            state.advertised()[..2],
+            [
+                CRED_PROBES_MARKER.to_string(),
+                CRED_REGIONAL_PROBES_MARKER.to_string()
+            ]
+        );
+        // An answered EMPTY catalogue leaves nothing unmeasured.
+        state.apply_regional(&answered(vec![], vec![], false, vec![]), now, CRED_TEST_TTL);
+        assert!(has_marker(&state));
+
+        // Each way a cycle leaves a catalogued token unmeasured withdraws it.
+        let unmeasured = [
+            (
+                "no answer",
+                super::cred_probe_specs::RegionalCycle::NoAnswer,
+            ),
+            (
+                "an inconclusive verdict",
+                answered(
+                    vec![(SSM, CredState::Present), (ECS, CredState::Unknown)],
+                    vec![],
+                    false,
+                    vec![],
+                ),
+            ),
+            (
+                "a spec past the run cap",
+                answered(vec![(SSM, CredState::Absent)], vec![ECS], false, vec![]),
+            ),
+            (
+                "an unreadable row",
+                answered(vec![(SSM, CredState::Absent)], vec![], true, vec![]),
+            ),
+            (
+                "a refused spec",
+                answered(vec![(SSM, CredState::Absent)], vec![], false, vec![ECS]),
+            ),
+            (
+                // A skipped row whose token was not kept (off-grammar) leaves no
+                // trace in the lists above; the flag still withdraws the marker.
+                "a skipped row with no kept token",
+                super::cred_probe_specs::RegionalCycle::Answered {
+                    verdicts: vec![(SSM.to_string(), CredState::Absent)],
+                    not_run: Vec::new(),
+                    unreadable_rows: false,
+                    refused_tokens: Vec::new(),
+                    skipped_rows: true,
+                },
+            ),
+        ];
+        for (why, cycle) in unmeasured {
+            state.apply_regional(
+                &answered(vec![(SSM, CredState::Absent)], vec![], false, vec![]),
+                now,
+                CRED_TEST_TTL,
+            );
+            assert!(has_marker(&state), "control before {why}");
+            state.apply_regional(&cycle, now, CRED_TEST_TTL);
+            assert!(!has_marker(&state), "{why}: {:?}", state.advertised());
+            // The built-in marker is never touched by a regional cycle.
+            assert!(
+                state.advertised().iter().any(|c| c == CRED_PROBES_MARKER),
+                "{why}"
+            );
+        }
+    }
+
+    /// Single-tenant needs BOTH reads to say exactly one tenant: a local set of one
+    /// beside a coord set of two (the legacy-slot / stale-file shape) withholds the
+    /// regional marker, and so does any unresolved or UNKNOWN read.
+    #[test]
+    fn the_regional_marker_needs_both_binding_reads_to_name_one_tenant() {
+        use qontinui_runner_lib::pair::CoordBoundTenantsRead as Coord;
+        let a = uuid::Uuid::from_u128(1);
+        let b = uuid::Uuid::from_u128(2);
+        let local = |ids: Vec<uuid::Uuid>| LocalBindingSet {
+            default_tenant: ids[0],
+            tenant_ids: ids,
+            source: BindingSource::LegacySlotClaim,
+        };
+        let one = local(vec![a]);
+        let two = local(vec![a, b]);
+        assert!(binding_is_single_tenant(Some(&one), &Coord::Known(vec![a])));
+        assert!(!binding_is_single_tenant(
+            Some(&one),
+            &Coord::Known(vec![a, b])
+        ));
+        assert!(!binding_is_single_tenant(
+            Some(&two),
+            &Coord::Known(vec![a])
+        ));
+        assert!(!binding_is_single_tenant(
+            Some(&one),
+            &Coord::Unknown("unread")
+        ));
+        assert!(!binding_is_single_tenant(None, &Coord::Known(vec![a])));
+        // One tenant each, but not the same one (a rebind with a stale local file).
+        assert!(!binding_is_single_tenant(
+            Some(&one),
+            &Coord::Known(vec![b])
+        ));
+        assert!(!binding_is_single_tenant(
+            Some(&one),
+            &Coord::Known(Vec::new())
+        ));
+    }
+
+    /// What a shim does when run.
+    #[derive(Clone, Copy)]
+    pub(super) enum Shim {
+        /// Print the fake secret on stdout and stderr, then exit with this code.
+        Exit(i32),
+        /// Print the fake secret, then hang far past any test budget.
+        Hang,
+    }
+
+    /// Write an executable shim named `name` into `dir` and return its path.
+    pub(super) fn write_cred_shim(dir: &std::path::Path, name: &str, shim: Shim) -> PathBuf {
+        #[cfg(windows)]
+        {
+            let path = dir.join(format!("{name}.cmd"));
+            let tail = match shim {
+                Shim::Exit(code) => format!("exit /b {code}\r\n"),
+                Shim::Hang => "ping -n 60 127.0.0.1 >nul\r\nexit /b 0\r\n".to_string(),
+            };
+            let body = format!(
+                "@echo off\r\necho {CRED_FAKE_SECRET}\r\necho {CRED_FAKE_SECRET} 1>&2\r\n{tail}"
+            );
+            std::fs::write(&path, body).unwrap();
+            path
+        }
+        #[cfg(not(windows))]
+        {
+            let path = dir.join(name);
+            let tail = match shim {
+                Shim::Exit(code) => format!("exit {code}\n"),
+                Shim::Hang => "exec sleep 60\n".to_string(),
+            };
+            let body =
+                format!("#!/bin/sh\necho {CRED_FAKE_SECRET}\necho {CRED_FAKE_SECRET} >&2\n{tail}");
+            write_executable_script(&path, &body);
+            path
+        }
+    }
+
+    /// Write `body` to `path` as a mode-755 script WITHOUT this process ever
+    /// holding a write descriptor on it, so an exec of it can never fail
+    /// ETXTBSY. Every shim this module's tests exec is written through here.
+    ///
+    /// Why the plain `fs::write` + `set_permissions` this replaced flaked (CI
+    /// job 123922633970, `cred_absent_aws_retracts_on_next_heartbeat_payload`):
+    /// while this thread's write fd is open, a sibling test thread that forks
+    /// copies it into its child, where it stays open until that child execs
+    /// (`O_CLOEXEC` closes it only then). The file's write count is held for
+    /// that window, and an exec of the shim inside it is refused ETXTBSY —
+    /// which `command_exit_within` reads as `SpawnFailed`, i.e. `Unknown`.
+    ///
+    /// Write-to-temp + `rename` does NOT close this: the leaked descriptor
+    /// pins the INODE, and `rename` moves that same inode into place. Handing
+    /// the write to a child `sh` does: the descriptor then exists only in that
+    /// child's fd table, which no fork of this process copies, and it is gone
+    /// once the child is reaped — before this returns.
+    #[cfg(not(windows))]
+    pub(super) fn write_executable_script(path: &std::path::Path, body: &str) {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut writer = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(r#"cat >"$1" && chmod 755 "$1""#)
+            .arg("sh")
+            .arg(path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn /bin/sh to write the shim");
+        // A writer that died early (say, the directory is missing) closes the
+        // pipe: let the exit-status assert below report its stderr instead.
+        if let Err(e) = writer
+            .stdin
+            .take()
+            .expect("the writer's stdin is piped")
+            .write_all(body.as_bytes())
+        {
+            assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::BrokenPipe,
+                "feed the shim body to its writer: {e}"
+            );
+        }
+        let out = writer.wait_with_output().expect("reap the shim writer");
+        assert!(
+            out.status.success(),
+            "writing the shim {} failed ({}): {}",
+            path.display(),
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Iterations of [`cred_shim_is_execable_while_other_threads_fork`].
+    const CRED_SHIM_STRESS_ITERS: usize = 300;
+
+    /// REGRESSION (CI job 123922633970, `cred_absent_aws_retracts_on_next_heartbeat_payload`
+    /// at step 3): a shim the fixture just wrote must exec, even while other
+    /// threads fork. Four threads spawn `true` in a loop for the whole run —
+    /// the shape of a parallel `cargo test` — while this thread rewrites the
+    /// same shim path (step 3's shape) and spawns it. Any spawn refused with
+    /// ETXTBSY is the fixture leaking its write descriptor into a sibling
+    /// fork, which the cred probe reads as `SpawnFailed` -> Unknown. Against
+    /// the old `fs::write` + `set_permissions` fixture this goes red at 300
+    /// iterations on a many-core box (see the PR that added it for counts).
+    #[cfg(unix)]
+    #[test]
+    fn cred_shim_is_execable_while_other_threads_fork() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        /// Stops the forkers however this test exits — a panic in the loop
+        /// must not leave them forking under every later test in the binary.
+        struct StopOnDrop(std::sync::Arc<AtomicBool>);
+        impl Drop for StopOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let stop_guard = StopOnDrop(stop.clone());
+        let forkers: Vec<_> = (0..4)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = std::process::Command::new("true")
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .status();
+                    }
+                })
+            })
+            .collect();
+        let mut busy = 0usize;
+        let mut other = Vec::new();
+        for i in 0..CRED_SHIM_STRESS_ITERS {
+            let shim = write_cred_shim(&bin, "aws", Shim::Exit(0));
+            match std::process::Command::new(&shim)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+            {
+                Ok(s) if s.code() == Some(0) => {}
+                Ok(s) => other.push(format!("iteration {i}: exit {s:?}")),
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => busy += 1,
+                Err(e) => other.push(format!("iteration {i}: {e}")),
+            }
+        }
+        drop(stop_guard);
+        for f in forkers {
+            f.join().unwrap();
+        }
+        eprintln!(
+            "cred shim stress: {CRED_SHIM_STRESS_ITERS} writes+execs, {busy} ETXTBSY, {} other",
+            other.len()
+        );
+        assert!(other.is_empty(), "unexpected shim outcomes: {other:?}");
+        assert_eq!(
+            busy, 0,
+            "{busy} of {CRED_SHIM_STRESS_ITERS} freshly written shims were refused \
+             with ETXTBSY — the fixture's write descriptor leaked into a sibling fork"
+        );
+    }
+
+    /// A shim that, before printing the fake secret and exiting 0, records
+    /// into `report` (a side file — never its own stdout) its arguments and
+    /// where its stdout/stderr point:
+    ///
+    /// * Linux: `readlink /proc/$$/fd/{1,2}` — the SHELL's fds (`$$`), not
+    ///   readlink's own, whose fd 1 is the redirect into `report`.
+    /// * Windows: a PowerShell helper inherits the `.cmd` shim's std handles
+    ///   and records `GetFileType` + whether `GetConsoleMode` succeeds for
+    ///   each. The null device is `FILE_TYPE_CHAR` (2) with no console mode;
+    ///   an inherited console is 2 WITH a console mode, a pipe is 3, a file 1.
+    #[cfg(any(windows, target_os = "linux"))]
+    pub(super) fn write_stdio_report_shim(
+        dir: &std::path::Path,
+        name: &str,
+        report: &std::path::Path,
+    ) -> PathBuf {
+        #[cfg(windows)]
+        {
+            let ps1 = dir.join(format!("{name}-stdio.ps1"));
+            std::fs::write(
+                &ps1,
+                r#"param([string]$Out)
+$sig = '[DllImport("kernel32.dll")] public static extern System.IntPtr GetStdHandle(int n);
+[DllImport("kernel32.dll")] public static extern uint GetFileType(System.IntPtr h);
+[DllImport("kernel32.dll")] public static extern bool GetConsoleMode(System.IntPtr h, out uint m);'
+$k = Add-Type -MemberDefinition $sig -Name StdioProbe -Namespace CredShim -PassThru
+$lines = foreach ($n in @(-11, -12)) {
+  $h = $k::GetStdHandle($n)
+  $m = [uint32]0
+  $c = $k::GetConsoleMode($h, [ref]$m)
+  "type=$($k::GetFileType($h)) console=$c"
+}
+Add-Content -LiteralPath $Out -Value $lines
+"#,
+            )
+            .unwrap();
+            let path = dir.join(format!("{name}.cmd"));
+            let body = format!(
+                "@echo off\r\n\
+                 >>\"{report}\" echo args=%*\r\n\
+                 \"%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"{ps1}\" \"{report}\"\r\n\
+                 echo {CRED_FAKE_SECRET}\r\n\
+                 echo {CRED_FAKE_SECRET} 1>&2\r\n\
+                 exit /b 0\r\n",
+                report = report.display(),
+                ps1 = ps1.display(),
+            );
+            std::fs::write(&path, body).unwrap();
+            path
+        }
+        #[cfg(not(windows))]
+        {
+            let path = dir.join(name);
+            let report = report.display();
+            let body = format!(
+                "#!/bin/sh\n\
+                 echo \"args=$*\" >>'{report}'\n\
+                 echo \"fd1=$(readlink /proc/$$/fd/1)\" >>'{report}'\n\
+                 echo \"fd2=$(readlink /proc/$$/fd/2)\" >>'{report}'\n\
+                 echo {CRED_FAKE_SECRET}\n\
+                 echo {CRED_FAKE_SECRET} >&2\n\
+                 exit 0\n"
+            );
+            write_executable_script(&path, &body);
+            path
+        }
+    }
+
+    /// A probe environment rooted in `home`, touching nothing of the real
+    /// machine: no binary resolved (both tools "not on PATH"), gh's config dir
+    /// pinned under `home`, no aws variables.
+    pub(super) fn hermetic_cred_env(home: &std::path::Path) -> CredProbeEnv {
+        CredProbeEnv {
+            gh: None,
+            aws: None,
+            gh_config_dir: Some(home.join("gh")),
+            xdg_config_home: None,
+            appdata: None,
+            home: Some(home.to_path_buf()),
+            aws_profile_set: false,
+            aws_config_file_set: false,
+            aws_shared_credentials_file_set: false,
+            windows: cfg!(windows),
+            budget: Duration::from_secs(15),
+        }
+    }
+
+    /// Plant gh's `hosts.yml` under the hermetic gh config dir, carrying an
+    /// `oauth_token` that is the fake secret — the read must keep one bit.
+    fn plant_gh_hosts(home: &std::path::Path, with_github_login: bool) {
+        let dir = home.join("gh");
+        std::fs::create_dir_all(&dir).unwrap();
+        let host = if with_github_login {
+            "github.com"
+        } else {
+            "ghe.example.internal"
+        };
+        std::fs::write(
+            dir.join("hosts.yml"),
+            format!("{host}:\n    oauth_token: {CRED_FAKE_SECRET}\n    user: someone\n"),
+        )
+        .unwrap();
+    }
+
+    /// One heartbeat tick of the family, exactly as production schedules it:
+    /// re-probe only when stale, then fold.
+    fn cred_tick(state: &mut CredFamilyState, env: &CredProbeEnv, now: std::time::Instant) {
+        if state.is_stale(now, CRED_TEST_TTL) {
+            let verdicts = probe_cred_family(env);
+            state.apply(&verdicts, now, CRED_TEST_TTL);
+        }
+    }
+
+    /// The `capabilities` array of the heartbeat payload built from this
+    /// family state — through the same assembly `heartbeat_to_coord` runs
+    /// (`build_host_capabilities` + the family's tokens, then
+    /// `build_device_capabilities`, then the payload's serialization).
+    pub(super) fn cred_payload_capabilities(state: &CredFamilyState) -> (Vec<String>, String) {
+        let mut host = build_host_capabilities("linux", false, false, false, None);
+        host.extend(state.advertised());
+        let caps = build_device_capabilities(false, &[], &host);
+        let body = serde_json::to_value(heartbeat_payload_with_ci(caps, Vec::new())).unwrap();
+        let wire = body.to_string();
+        let list = body
+            .get("capabilities")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        (list, wire)
+    }
+
+    /// Run `f` with every `tracing` event on this thread captured (at TRACE,
+    /// so `debug!` lines are included) and return the captured text.
+    pub(super) fn capture_cred_logs<R>(f: impl FnOnce() -> R) -> (R, String) {
+        #[derive(Clone, Default)]
+        struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let out = crate::resource_guard::with_log_capture(subscriber, f);
+        let text = String::from_utf8_lossy(&buf.0.lock().unwrap()).into_owned();
+        (out, text)
+    }
+
+    /// D2's gh table, row by row (census `probe_gh`).
+    #[test]
+    fn cred_gh_classification_follows_the_census_table() {
+        let never = || -> GhLogin { panic!("login consulted outside exit 1/4") };
+        assert_eq!(classify_gh(None, never), CredState::Absent, "not on PATH");
+        assert_eq!(
+            classify_gh(Some(ProbeExit::Code(0)), never),
+            CredState::Present
+        );
+        for code in [1, 4] {
+            assert_eq!(
+                classify_gh(Some(ProbeExit::Code(code)), || GhLogin::None),
+                CredState::Absent,
+                "exit {code} with no github.com host is a measured absence"
+            );
+            for login in [
+                GhLogin::Configured,
+                GhLogin::Unreadable,
+                GhLogin::Unlocatable,
+            ] {
+                assert_eq!(
+                    classify_gh(Some(ProbeExit::Code(code)), || login),
+                    CredState::Unknown,
+                    "exit {code} with {login:?}: invalid token vs unreachable is not separable"
+                );
+            }
+        }
+        for exit in [
+            ProbeExit::TimedOut,
+            ProbeExit::SpawnFailed,
+            ProbeExit::WaitFailed,
+            ProbeExit::NoCode,
+            ProbeExit::Code(2),
+            ProbeExit::Code(127),
+        ] {
+            assert_eq!(
+                classify_gh(Some(exit), never),
+                CredState::Unknown,
+                "{exit:?}"
+            );
+        }
+    }
+
+    /// D2's aws table, row by row (census `probe_aws`).
+    #[test]
+    fn cred_aws_sts_classification_follows_the_census_table() {
+        let never = || -> bool { panic!("config consulted outside exit 253") };
+        assert_eq!(
+            classify_aws_sts(None, never),
+            CredState::Absent,
+            "not on PATH"
+        );
+        assert_eq!(
+            classify_aws_sts(Some(ProbeExit::Code(0)), never),
+            CredState::Present
+        );
+        assert_eq!(
+            classify_aws_sts(Some(ProbeExit::Code(253)), || false),
+            CredState::Absent,
+            "253 with nothing configured is a measured absence"
+        );
+        assert_eq!(
+            classify_aws_sts(Some(ProbeExit::Code(253)), || true),
+            CredState::Unknown,
+            "253 with a config (SSO / process source) is not separable"
+        );
+        for exit in [
+            ProbeExit::Code(254),
+            ProbeExit::Code(255),
+            ProbeExit::Code(1),
+            ProbeExit::TimedOut,
+            ProbeExit::SpawnFailed,
+            ProbeExit::NoCode,
+        ] {
+            assert_eq!(
+                classify_aws_sts(Some(exit), never),
+                CredState::Unknown,
+                "{exit:?}"
+            );
+        }
+    }
+
+    /// "Memoize an answer, never a failure": an Unknown keeps the last answer
+    /// while it has been unknown for under one TTL, then drops it; an Absent
+    /// replaces a Present at once; an Unknown with no answer stays unanswered.
+    #[test]
+    fn cred_unknown_holds_the_last_answer_for_one_ttl_then_drops() {
+        let t0 = std::time::Instant::now();
+        let ttl = CRED_TEST_TTL;
+        let present = fold_cred_memo(None, CredState::Present, t0, ttl);
+        assert_eq!(present.map(|m| m.present), Some(true));
+        let held = fold_cred_memo(present, CredState::Unknown, t0 + ttl, ttl);
+        assert_eq!(held.map(|m| m.present), Some(true), "first Unknown holds");
+        let still = fold_cred_memo(held, CredState::Unknown, t0 + ttl + ttl / 2, ttl);
+        assert_eq!(still.map(|m| m.present), Some(true), "held within one TTL");
+        assert_eq!(
+            fold_cred_memo(still, CredState::Unknown, t0 + ttl + ttl, ttl),
+            None,
+            "unknown for a whole TTL drops the answer"
+        );
+        assert_eq!(
+            fold_cred_memo(present, CredState::Absent, t0 + ttl, ttl).map(|m| m.present),
+            Some(false),
+            "a definitive Absent retracts immediately"
+        );
+        assert_eq!(fold_cred_memo(None, CredState::Unknown, t0, ttl), None);
+        let recovered = fold_cred_memo(held, CredState::Present, t0 + ttl + ttl / 2, ttl);
+        assert_eq!(
+            recovered,
+            Some(CredMemo {
+                present: true,
+                unknown_since: None
+            }),
+            "an answer after an Unknown resets the hold window"
+        );
+    }
+
+    /// gh's config lookup order, and the one-bit read of `hosts.yml`.
+    #[test]
+    fn gh_hosts_lookup_order_and_one_line_match() {
+        let base = PathBuf::from("base");
+        let mut env = CredProbeEnv {
+            home: Some(base.join("home")),
+            appdata: Some(base.join("appdata")),
+            xdg_config_home: Some(base.join("xdg")),
+            gh_config_dir: Some(base.join("ghcfg")),
+            windows: true,
+            ..CredProbeEnv::default()
+        };
+        assert_eq!(
+            gh_hosts_file(&env),
+            Some(base.join("ghcfg").join("hosts.yml"))
+        );
+        env.gh_config_dir = None;
+        assert_eq!(
+            gh_hosts_file(&env),
+            Some(base.join("xdg").join("gh").join("hosts.yml"))
+        );
+        env.xdg_config_home = None;
+        assert_eq!(
+            gh_hosts_file(&env),
+            Some(base.join("appdata").join("GitHub CLI").join("hosts.yml"))
+        );
+        env.appdata = None;
+        assert_eq!(
+            gh_hosts_file(&env),
+            None,
+            "Windows without APPDATA is unlocatable"
+        );
+        env.windows = false;
+        assert_eq!(
+            gh_hosts_file(&env),
+            Some(
+                base.join("home")
+                    .join(".config")
+                    .join("gh")
+                    .join("hosts.yml")
+            )
+        );
+        env.home = None;
+        assert_eq!(gh_login_config(&env), GhLogin::Unlocatable);
+
+        assert!(hosts_yml_has_github_login(b"github.com:\n    user: x\n"));
+        assert!(hosts_yml_has_github_login(
+            b"ghe.example:\n  u: y\ngithub.com:\n"
+        ));
+        assert!(
+            !hosts_yml_has_github_login(b"  github.com:\n"),
+            "indented is not a key line"
+        );
+        assert!(!hosts_yml_has_github_login(
+            b"ghe.example:\n  host: github.com:\n"
+        ));
+        assert!(!hosts_yml_has_github_login(b""));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let env = hermetic_cred_env(tmp.path());
+        assert_eq!(gh_login_config(&env), GhLogin::None, "no file is no login");
+        plant_gh_hosts(tmp.path(), false);
+        assert_eq!(gh_login_config(&env), GhLogin::None);
+        plant_gh_hosts(tmp.path(), true);
+        let verdict = gh_login_config(&env);
+        assert_eq!(verdict, GhLogin::Configured);
+        assert!(!format!("{verdict:?}").contains(CRED_FAKE_SECRET));
+    }
+
+    /// The aws 253 split reads PRESENCE only: the files' existence, or the
+    /// three pointer variables being set.
+    #[test]
+    fn aws_config_is_presence_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut env = hermetic_cred_env(tmp.path());
+        assert!(!aws_has_config(&env), "an empty home has no aws config");
+        let setters: [fn(&mut CredProbeEnv); 3] = [
+            |e| e.aws_profile_set = true,
+            |e| e.aws_config_file_set = true,
+            |e| e.aws_shared_credentials_file_set = true,
+        ];
+        for set in setters {
+            let mut e = env.clone();
+            set(&mut e);
+            assert!(aws_has_config(&e));
+        }
+        std::fs::create_dir_all(tmp.path().join(".aws")).unwrap();
+        assert!(!aws_has_config(&env), "an empty ~/.aws is not a config");
+        std::fs::write(
+            tmp.path().join(".aws").join("credentials"),
+            CRED_FAKE_SECRET,
+        )
+        .unwrap();
+        assert!(aws_has_config(&env));
+        std::fs::remove_file(tmp.path().join(".aws").join("credentials")).unwrap();
+        std::fs::write(tmp.path().join(".aws").join("config"), "[default]\n").unwrap();
+        assert!(aws_has_config(&env));
+        env.home = None;
+        assert!(
+            aws_has_config(&env),
+            "no home: cannot tell, so never an Absent"
+        );
+    }
+
+    /// The child a probe runs gets the token variables REMOVED, aws's pager
+    /// and gh's prompts off — pinned through the command's own env table.
+    #[test]
+    fn cred_probe_command_withholds_tokens_and_disables_prompts() {
+        let cmd = cred_probe_command(std::path::Path::new("gh"), &["auth", "status"]);
+        let envs: std::collections::HashMap<String, Option<String>> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        for name in CRED_PROBE_WITHHELD_ENV {
+            assert_eq!(
+                envs.get(name),
+                Some(&None),
+                "{name} must be withheld from the probe"
+            );
+        }
+        for name in [
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "GH_ENTERPRISE_TOKEN",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+        ] {
+            assert!(
+                CRED_PROBE_WITHHELD_ENV.contains(&name),
+                "{name} is in the census's set"
+            );
+        }
+        assert_eq!(envs.get("AWS_PAGER"), Some(&Some(String::new())));
+        assert_eq!(envs.get("GH_PROMPT_DISABLED"), Some(&Some("1".to_string())));
+    }
+
+    /// The marker rides whenever the family RAN — even when every probe was
+    /// Unknown — and never before it ran.
+    #[test]
+    fn cred_family_marker_rides_even_when_every_probe_is_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        plant_gh_hosts(tmp.path(), true);
+        let mut env = hermetic_cred_env(tmp.path());
+        env.gh = Some(write_cred_shim(&bin, "gh", Shim::Exit(1)));
+        env.aws = Some(write_cred_shim(&bin, "aws", Shim::Exit(255)));
+
+        let mut state = CredFamilyState::new();
+        assert!(state.advertised().is_empty(), "unprobed advertises nothing");
+        let (caps, _) = cred_payload_capabilities(&state);
+        assert!(!caps.iter().any(|c| c == CRED_PROBES_MARKER));
+
+        cred_tick(&mut state, &env, std::time::Instant::now());
+        assert_eq!(state.advertised(), vec![CRED_PROBES_MARKER.to_string()]);
+        let (caps, _) = cred_payload_capabilities(&state);
+        assert_eq!(caps, vec!["os:linux", "probes:cred"]);
+    }
+
+    /// The no-leak test (D2 / Risks "A probe that leaks"): both shims print
+    /// the fake secret on stdout AND stderr, and gh's `hosts.yml` carries it
+    /// as an `oauth_token`. Nothing the family logs, sends or renders may
+    /// contain it — checked on the captured `tracing` output (TRACE level),
+    /// the serialized heartbeat payload, the state's Debug rendering and the
+    /// panic boundary. The log assertion is anti-vacuous: the capture must
+    /// hold the family's own `cred:gh` line.
+    #[test]
+    fn cred_probe_shim_secret_never_reaches_logs_payload_or_panic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        plant_gh_hosts(tmp.path(), true);
+        let mut env = hermetic_cred_env(tmp.path());
+        // The gh shim also reports where its stdout/stderr point, so a
+        // regression from `Stdio::null()` to `inherit()` / a pipe fails here
+        // even though the secret would then only reach the test's own output.
+        let stdio_report = tmp.path().join("gh-stdio-report.txt");
+        #[cfg(any(windows, target_os = "linux"))]
+        {
+            env.gh = Some(write_stdio_report_shim(&bin, "gh", &stdio_report));
+            // The Windows report spins up PowerShell + Add-Type.
+            env.budget = Duration::from_secs(90);
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
+        {
+            let _ = &stdio_report;
+            env.gh = Some(write_cred_shim(&bin, "gh", Shim::Exit(0)));
+        }
+        env.aws = Some(write_cred_shim(&bin, "aws", Shim::Exit(254)));
+
+        let (outcome, logs) = capture_cred_logs(|| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut state = CredFamilyState::new();
+                cred_tick(&mut state, &env, std::time::Instant::now());
+                // Exit 1 with the secret-bearing hosts.yml: the streaming scan.
+                env.gh = Some(write_cred_shim(&bin, "gh-again", Shim::Exit(1)));
+                let gh_again = probe_gh(&env);
+                (state, gh_again)
+            }))
+        });
+        let (state, gh_again) = match outcome {
+            Ok(v) => v,
+            Err(payload) => {
+                let msg = payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_default();
+                assert!(
+                    !msg.contains(CRED_FAKE_SECRET),
+                    "a panic message carried the probe's secret"
+                );
+                panic!("the cred family panicked: {msg}");
+            }
+        };
+        assert_eq!(
+            gh_again,
+            CredState::Unknown,
+            "exit 1 with a configured login"
+        );
+
+        let (caps, wire) = cred_payload_capabilities(&state);
+        assert_eq!(caps, vec!["os:linux", "probes:cred", "cred:gh"]);
+
+        #[cfg(any(windows, target_os = "linux"))]
+        {
+            let report = std::fs::read_to_string(&stdio_report)
+                .expect("anti-vacuity: the gh shim must have written its stdio report");
+            let lines: Vec<&str> = report.lines().map(str::trim).collect();
+            // Two invocations: the value-free `--active` capability check,
+            // then (the shim accepting it) the `--active` status probe.
+            let args: Vec<&str> = lines
+                .iter()
+                .copied()
+                .filter(|l| l.starts_with("args="))
+                .collect();
+            assert_eq!(
+                args,
+                vec![
+                    "args=auth status --active --help",
+                    "args=auth status --active --hostname github.com"
+                ],
+                "gh must be capability-checked, then probed as \
+                 `auth status --active --hostname github.com`, got {report:?}"
+            );
+            #[cfg(target_os = "linux")]
+            for fd in ["fd1", "fd2"] {
+                let prefix = format!("{fd}=");
+                let seen: Vec<&str> = lines
+                    .iter()
+                    .copied()
+                    .filter(|l| l.starts_with(&prefix))
+                    .collect();
+                assert_eq!(
+                    seen.len(),
+                    2,
+                    "one {fd} line per invocation, got {report:?}"
+                );
+                assert!(
+                    seen.iter().all(|l| *l == format!("{fd}=/dev/null")),
+                    "every probe child's {fd} must be the null device, got {report:?}"
+                );
+            }
+            #[cfg(windows)]
+            {
+                let handles: Vec<&&str> = lines.iter().filter(|l| l.starts_with("type=")).collect();
+                assert_eq!(
+                    handles.len(),
+                    4,
+                    "one stdout + one stderr line per invocation expected, got {report:?}"
+                );
+                for h in handles {
+                    assert_eq!(
+                        *h, "type=2 console=False",
+                        "the probe child's stdout/stderr must be the NUL device \
+                         (FILE_TYPE_CHAR, no console mode), got {report:?}"
+                    );
+                }
+            }
+        }
+
+        assert!(
+            logs.contains("cred:gh"),
+            "anti-vacuity: the capture must hold the family's own log line, got {logs:?}"
+        );
+        for (surface, text) in [
+            ("log", logs.clone()),
+            ("heartbeat payload", wire.clone()),
+            ("state Debug", format!("{state:?}")),
+            ("verdict Debug", format!("{gh_again:?}")),
+            ("probe env Debug", format!("{env:?}")),
+        ] {
+            assert!(
+                !text.contains(CRED_FAKE_SECRET) && !text.contains("FAKE-SECRET"),
+                "the probe's secret reached the {surface}: {text}"
+            );
+        }
+    }
+
+    /// ARMING (enters through the heartbeat builder): `aws` present and
+    /// answering, then ABSENT from PATH — the next payload retracts
+    /// `cred:aws-sts` while keeping the marker. Then the 253-with-no-config
+    /// arm retracts the same way.
+    #[test]
+    fn cred_absent_aws_retracts_on_next_heartbeat_payload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let mut env = hermetic_cred_env(tmp.path());
+        env.aws = Some(write_cred_shim(&bin, "aws", Shim::Exit(0)));
+
+        let t0 = std::time::Instant::now();
+        let mut state = CredFamilyState::new();
+        cred_tick(&mut state, &env, t0);
+        let (caps, _) = cred_payload_capabilities(&state);
+        assert_eq!(caps, vec!["os:linux", "probes:cred", "cred:aws-sts"]);
+
+        // aws uninstalled: not on PATH is a definitive Absent.
+        env.aws = None;
+        cred_tick(&mut state, &env, t0 + CRED_TEST_TTL);
+        let (caps, wire) = cred_payload_capabilities(&state);
+        assert_eq!(
+            caps,
+            vec!["os:linux", "probes:cred"],
+            "an Absent must retract on the next payload, got {wire}"
+        );
+
+        // Back, answering, then 253 with nothing configured: Absent again.
+        env.aws = Some(write_cred_shim(&bin, "aws", Shim::Exit(0)));
+        cred_tick(&mut state, &env, t0 + CRED_TEST_TTL * 2);
+        assert!(state
+            .advertised()
+            .iter()
+            .any(|c| c == CRED_AWS_STS_CAPABILITY));
+        env.aws = Some(write_cred_shim(&bin, "aws253", Shim::Exit(253)));
+        cred_tick(&mut state, &env, t0 + CRED_TEST_TTL * 3);
+        let (caps, _) = cred_payload_capabilities(&state);
+        assert_eq!(caps, vec!["os:linux", "probes:cred"]);
+    }
+
+    /// ARMING (enters through the heartbeat builder): a probe that HANGS past
+    /// its budget is killed and reads Unknown; the last answer is held for one
+    /// TTL (and the family is not re-probed inside it), then dropped.
+    #[test]
+    fn cred_hung_probe_holds_one_ttl_then_drops() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let mut env = hermetic_cred_env(tmp.path());
+        env.aws = Some(write_cred_shim(&bin, "aws", Shim::Exit(0)));
+
+        let t0 = std::time::Instant::now();
+        let mut state = CredFamilyState::new();
+        cred_tick(&mut state, &env, t0);
+        assert!(state
+            .advertised()
+            .iter()
+            .any(|c| c == CRED_AWS_STS_CAPABILITY));
+
+        env.aws = Some(write_cred_shim(&bin, "aws-hang", Shim::Hang));
+        env.budget = Duration::from_millis(600);
+        let started = std::time::Instant::now();
+        assert_eq!(probe_aws_sts(&env), CredState::Unknown, "a hang is Unknown");
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the hung probe must be killed at its budget"
+        );
+
+        cred_tick(&mut state, &env, t0 + CRED_TEST_TTL);
+        let (caps, _) = cred_payload_capabilities(&state);
+        assert_eq!(
+            caps,
+            vec!["os:linux", "probes:cred", "cred:aws-sts"],
+            "the first Unknown holds the last answer"
+        );
+        // Inside the TTL the family is not re-run, so nothing moves.
+        cred_tick(&mut state, &env, t0 + CRED_TEST_TTL + CRED_TEST_TTL / 2);
+        assert!(state
+            .advertised()
+            .iter()
+            .any(|c| c == CRED_AWS_STS_CAPABILITY));
+
+        cred_tick(&mut state, &env, t0 + CRED_TEST_TTL * 2);
+        let (caps, _) = cred_payload_capabilities(&state);
+        assert_eq!(
+            caps,
+            vec!["os:linux", "probes:cred"],
+            "unknown for a whole TTL drops the token; the marker stays"
+        );
+    }
+
+    /// `svc:imagegen` rides the heartbeat's host set exactly when the image
+    /// probe's verdict is positive (plan
+    /// `2026-10-13-image-generation-and-visual-judgment`, Phase 25). The
+    /// verdict is forced on this test's thread, so this pins the WIRING into
+    /// `host_capabilities`, independent of whether this host runs llama-swap;
+    /// the probe's own verdicts are tested in `fleet::imagegen_probe`.
+    #[test]
+    fn host_capabilities_append_the_imagegen_probe() {
+        let token = imagegen_probe::IMAGEGEN_CAPABILITY;
+        imagegen_probe::force_verdict_for_test(Some(true));
+        let with = host_capabilities();
+        imagegen_probe::force_verdict_for_test(Some(false));
+        let without = host_capabilities();
+        imagegen_probe::force_verdict_for_test(None);
+        assert!(
+            with.iter().any(|c| c == token),
+            "a positive image probe must advertise {token}, got {with:?}"
+        );
+        assert!(
+            !without.iter().any(|c| c == token),
+            "a negative image probe must advertise nothing, got {without:?}"
+        );
+        assert!(
+            with.iter()
+                .any(|c| c == &format!("os:{}", current_os_label())),
+            "the token is appended to the host facts, never in place of them"
+        );
+        // And it reaches the heartbeat's vector whether or not CI-node mode is on.
+        for ci in [false, true] {
+            assert!(build_device_capabilities(ci, &[], &with)
+                .iter()
+                .any(|c| c == token));
+        }
+    }
+
+    /// The heartbeat runs the host probes on the blocking pool, never inline
+    /// on its async worker: `host_capabilities` blocks on a cache miss (a
+    /// `docker version` fork, the image probe's HTTP request), and the
+    /// heartbeat reaches it through `heartbeat_device_capabilities`. A source
+    /// contract, because a blocking call inline in an async fn compiles and
+    /// passes every behavioural test while it stalls a runtime worker.
+    ///
+    /// Only the PRODUCTION half of the file is scanned (cut at the test module
+    /// header, via `prod_part`), so the string literals in this test can never
+    /// satisfy or trip it. Whitespace is squeezed out so a rustfmt rewrap does
+    /// not hide a call. The body must make exactly ONE call that reaches the
+    /// host probes, the blocking-pool assembly of the capability base,
+    /// `spawn_blocking_tracked(move || heartbeat_device_capabilities(..))`.
+    /// With that call cut out, the rest must not call
+    /// `heartbeat_device_capabilities`, `heartbeat_capabilities`,
+    /// `host_capabilities`, or the two blocking probes those wrap,
+    /// `slow_host_probes` and the image probe's `capability_tokens`. A name
+    /// counts as a call only where it is not the tail of a longer identifier
+    /// ([`calls_fn`]), so the heartbeat's own `skill_capability_tokens(...)`
+    /// is not mistaken for the image probe, while `imagegen_probe::capability_tokens(`
+    /// and a bare `capability_tokens(` after a `use` both are caught.
+    #[test]
+    fn heartbeat_runs_the_host_probes_on_the_blocking_pool() {
+        let src = include_str!("fleet.rs");
+        let prod = prod_part(src);
+        assert!(
+            prod.len() < src.len(),
+            "the test module header must be found"
+        );
+        let (_, from_fn) = prod
+            .split_once("pub async fn heartbeat_to_coord(")
+            .expect("heartbeat_to_coord is defined in fleet.rs");
+        let (body, _) = from_fn
+            .split_once("\n}\n")
+            .expect("heartbeat_to_coord ends");
+        let body = squeezed(body);
+        // The ONE sanctioned call that reaches the host probes: the capability
+        // base, assembled on the blocking pool.
+        let offload = "spawn_blocking_tracked(move||heartbeat_device_capabilities(ci_enabled,&repo_allowlist))";
+        assert_eq!(
+            body.matches(offload).count(),
+            1,
+            "heartbeat_to_coord must assemble its capability base exactly once, via \
+             spawn_blocking_tracked(move || heartbeat_device_capabilities(ci_enabled, &repo_allowlist))"
+        );
+        let rest = body.replacen(offload, "", 1);
+        for inline in [
+            "heartbeat_device_capabilities",
+            "heartbeat_capabilities",
+            "host_capabilities",
+            "capability_tokens",
+            "slow_host_probes",
+            "claude_code_probe",
+        ] {
+            assert!(
+                !calls_fn(&rest, inline),
+                "heartbeat_to_coord must not call {inline}(..) inline on its async worker"
+            );
+        }
+        // The matcher itself: a path-qualified or bare call counts; a longer
+        // identifier ending in the name does not.
+        assert!(calls_fn(
+            "x=imagegen_probe::capability_tokens();",
+            "capability_tokens"
+        ));
+        assert!(calls_fn(
+            "x.extend(capability_tokens());",
+            "capability_tokens"
+        ));
+        assert!(!calls_fn(
+            "x.extend(skill_capability_tokens(a,b));",
+            "capability_tokens"
+        ));
+        assert!(!calls_fn(
+            "spawn_blocking_tracked(host_capabilities)",
+            "host_capabilities"
+        ));
+    }
+
+    /// True when `src` contains `name(` where `name` is a whole identifier, not
+    /// the tail of a longer one (`skill_capability_tokens(` does not call
+    /// `capability_tokens`). A `::` path prefix still counts as a call.
+    fn calls_fn(src: &str, name: &str) -> bool {
+        let needle = format!("{name}(");
+        src.match_indices(&needle).any(|(at, _)| {
+            src.get(..at)
+                .and_then(|before| before.chars().next_back())
+                .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
+        })
+    }
+
     /// PATH resolution must not hallucinate. A name that cannot exist
     /// resolves to false; on unix `sh` is guaranteed present.
     #[test]
@@ -7707,6 +11694,304 @@ mod tests {",
         assert!(!binary_on_path("qontinui-definitely-not-a-real-binary-xyz"));
         #[cfg(unix)]
         assert!(binary_on_path("sh"), "`sh` must resolve on any unix PATH");
+    }
+
+    /// Windows PATH semantics: an extensionless file beside `gh.cmd` (an MSYS
+    /// shell script `CreateProcess` cannot run) never wins — even when it
+    /// sits in an EARLIER directory; a name already carrying a `PATHEXT`
+    /// extension resolves as given; and Unix semantics stay bare-name.
+    /// Platform-independent: `pathext` selects the semantics.
+    #[test]
+    fn path_resolution_prefers_pathext_and_skips_unspawnable_bare_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let early = tmp.path().join("early");
+        let late = tmp.path().join("late");
+        std::fs::create_dir_all(&early).unwrap();
+        std::fs::create_dir_all(&late).unwrap();
+        let make = |p: PathBuf| {
+            std::fs::write(&p, "x").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            p
+        };
+        let bare_early = make(early.join("gh"));
+        let bare_late = make(late.join("gh"));
+        let cmd_late = make(late.join("gh.cmd"));
+        // Lowercase so the joined candidate names match on a case-sensitive
+        // filesystem too; Windows matches either case.
+        let exts: Vec<String> = [".com", ".exe", ".bat", ".cmd"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let dirs = || vec![early.clone(), late.clone()];
+
+        assert_eq!(
+            resolve_in_dirs("gh", dirs(), Some(&exts)),
+            Some(cmd_late.clone()),
+            "Windows: the bare `gh` files must be skipped for `gh.cmd`"
+        );
+        assert_ne!(
+            resolve_in_dirs("gh", dirs(), Some(&exts)),
+            Some(bare_early.clone())
+        );
+        assert_ne!(resolve_in_dirs("gh", dirs(), Some(&exts)), Some(bare_late));
+        assert_eq!(
+            resolve_in_dirs("gh.cmd", dirs(), Some(&exts)),
+            Some(cmd_late.clone()),
+            "a name with a PATHEXT extension resolves as given"
+        );
+        assert_eq!(
+            resolve_in_dirs("aws", dirs(), Some(&exts)),
+            None,
+            "nothing spawnable is nothing"
+        );
+        assert_eq!(
+            resolve_in_dirs("gh", dirs(), None),
+            Some(bare_early),
+            "Unix semantics: the first bare executable"
+        );
+    }
+
+    /// W2: a probe that overruns its budget is killed TOGETHER WITH its
+    /// grandchildren (a `.cmd` shim's real CLI), not just the direct child.
+    #[test]
+    fn cred_probe_overrun_kills_the_whole_process_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_file = tmp.path().join("grandchild.pid");
+        #[cfg(windows)]
+        let (shim, budget) = {
+            let path = tmp.path().join("aws.cmd");
+            std::fs::write(
+                &path,
+                format!(
+                    "@echo off\r\n\
+                     \"%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -NonInteractive -Command \"Set-Content -LiteralPath '{}' -Value $PID; Start-Sleep -Seconds 120\"\r\n\
+                     exit /b 0\r\n",
+                    pid_file.display()
+                ),
+            )
+            .unwrap();
+            (path, Duration::from_secs(20))
+        };
+        #[cfg(not(windows))]
+        let (shim, budget) = {
+            let path = tmp.path().join("aws");
+            write_executable_script(
+                &path,
+                &format!(
+                    "#!/bin/sh\nsleep 120 &\necho $! >'{}'\nwait\n",
+                    pid_file.display()
+                ),
+            );
+            (path, Duration::from_secs(2))
+        };
+
+        let exit = command_exit_within(cred_probe_command(&shim, &AWS_STS_ARGS), budget);
+        assert_eq!(exit, ProbeExit::TimedOut);
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .expect("anti-vacuity: the grandchild must have recorded its pid before the kill")
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while crate::process_capture::health::pid_alive(pid) && !grandchild_is_zombie(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "grandchild pid {pid} survived the probe's overrun kill"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// A killed-but-unreaped process still answers `kill(pid, 0)`; on Linux
+    /// read its state so a zombie awaiting its reaper counts as dead.
+    fn grandchild_is_zombie(_pid: u32) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::read_to_string(format!("/proc/{_pid}/stat"))
+                .ok()
+                .and_then(|s| {
+                    s.rsplit_once(')')
+                        .map(|(_, rest)| rest.trim_start().starts_with('Z'))
+                })
+                .unwrap_or(false)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
+    /// M2: the gh probe scopes to the ACTIVE account.
+    #[test]
+    fn gh_probe_args_scope_to_the_active_account() {
+        assert_eq!(
+            GH_AUTH_STATUS_ARGS,
+            ["auth", "status", "--active", "--hostname", "github.com"]
+        );
+        assert_eq!(
+            GH_AUTH_STATUS_LEGACY_ARGS,
+            ["auth", "status", "--hostname", "github.com"]
+        );
+        assert_eq!(
+            GH_ACTIVE_FLAG_CHECK_ARGS,
+            ["auth", "status", "--active", "--help"]
+        );
+    }
+
+    /// A gh shim that appends `args=<argv>` to `log` per run, prints the fake
+    /// secret, and exits 1 when handed `--active` unless `accepts_active` (an
+    /// older gh rejecting the unknown flag); otherwise exits 0.
+    fn write_gh_active_shim(
+        dir: &std::path::Path,
+        name: &str,
+        accepts_active: bool,
+        log: &std::path::Path,
+    ) -> PathBuf {
+        #[cfg(windows)]
+        {
+            let path = dir.join(format!("{name}.cmd"));
+            let refuse = if accepts_active {
+                String::new()
+            } else {
+                "for %%a in (%*) do if \"%%~a\"==\"--active\" exit /b 1\r\n".to_string()
+            };
+            let body = format!(
+                "@echo off\r\n\
+                 >>\"{log}\" echo args=%*\r\n\
+                 echo {CRED_FAKE_SECRET}\r\n\
+                 echo {CRED_FAKE_SECRET} 1>&2\r\n\
+                 {refuse}\
+                 exit /b 0\r\n",
+                log = log.display(),
+            );
+            std::fs::write(&path, body).unwrap();
+            path
+        }
+        #[cfg(not(windows))]
+        {
+            let path = dir.join(name);
+            let refuse = if accepts_active {
+                String::new()
+            } else {
+                "for a in \"$@\"; do [ \"$a\" = --active ] && exit 1; done\n".to_string()
+            };
+            let body = format!(
+                "#!/bin/sh\n\
+                 echo \"args=$*\" >>'{log}'\n\
+                 echo {CRED_FAKE_SECRET}\n\
+                 echo {CRED_FAKE_SECRET} >&2\n\
+                 {refuse}\
+                 exit 0\n",
+                log = log.display(),
+            );
+            write_executable_script(&path, &body);
+            path
+        }
+    }
+
+    fn gh_shim_invocations(log: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(log)
+            .expect("anti-vacuity: the gh shim must have logged its invocations")
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+
+    /// W-1: a gh that rejects `--active` is detected by the
+    /// value-free capability check and probed with the LEGACY args: exit 0
+    /// there reads Present, not the Unknown-forever an `--active` exit 1
+    /// would give. The bit is memoized: a second probe skips the check.
+    #[test]
+    fn gh_without_active_flag_falls_back_to_legacy_args() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        plant_gh_hosts(tmp.path(), true);
+        let log = tmp.path().join("gh-old.log");
+        let mut env = hermetic_cred_env(tmp.path());
+        env.gh = Some(write_gh_active_shim(&bin, "gh", false, &log));
+
+        assert_eq!(probe_gh(&env), CredState::Present);
+        assert_eq!(
+            gh_shim_invocations(&log),
+            vec![
+                "args=auth status --active --help",
+                "args=auth status --hostname github.com",
+            ],
+            "an old gh must be capability-checked, then probed WITHOUT `--active`"
+        );
+
+        assert_eq!(probe_gh(&env), CredState::Present);
+        let calls = gh_shim_invocations(&log);
+        assert_eq!(
+            calls.len(),
+            3,
+            "the `--active` bit is cached for one HOST_PROBE_TTL: no second capability check, got {calls:?}"
+        );
+        assert_eq!(calls[2], "args=auth status --hostname github.com");
+    }
+
+    /// W-1: a gh that knows `--active` is probed with it.
+    #[test]
+    fn gh_with_active_flag_uses_active_args() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        plant_gh_hosts(tmp.path(), true);
+        let log = tmp.path().join("gh-new.log");
+        let mut env = hermetic_cred_env(tmp.path());
+        env.gh = Some(write_gh_active_shim(&bin, "gh", true, &log));
+
+        assert_eq!(probe_gh(&env), CredState::Present);
+        assert_eq!(
+            gh_shim_invocations(&log),
+            vec![
+                "args=auth status --active --help",
+                "args=auth status --active --hostname github.com",
+            ],
+        );
+    }
+
+    /// S-2: `PATHEXT` set but yielding no extension falls back to the
+    /// default list instead of making every tool read not-on-PATH.
+    #[test]
+    fn empty_pathext_falls_back_to_the_default_list() {
+        let default: Vec<String> = [".COM", ".EXE", ".BAT", ".CMD"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(parse_pathext(None), default, "unset");
+        assert_eq!(parse_pathext(Some("")), default, "set but empty");
+        assert_eq!(parse_pathext(Some(";;")), default, "only separators");
+        assert_eq!(parse_pathext(Some(" ; ")), default, "only whitespace");
+        assert_eq!(
+            parse_pathext(Some(".EXE;;.PS1")),
+            vec![".EXE".to_string(), ".PS1".to_string()],
+            "a real value is kept, empties dropped"
+        );
+
+        // End to end: the fallback list still resolves a `.cmd` tool.
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = tmp.path().join("gh.cmd");
+        std::fs::write(&tool, "x").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let exts: Vec<String> = parse_pathext(Some(""))
+            .into_iter()
+            .map(|e| e.to_ascii_lowercase())
+            .collect();
+        assert_eq!(
+            resolve_in_dirs("gh", vec![tmp.path().to_path_buf()], Some(&exts)),
+            Some(tool)
+        );
     }
 
     // ---- auto-fresh: refusing to call nothing a build ----
@@ -8783,6 +13068,273 @@ mod tests {",
             skill_parity_record_path_from(None, None),
             None,
             "no state dir and no ~/.qontinui is None, which the caller warns about"
+        );
+    }
+}
+
+/// Plan `2026-09-29-vanished-paired-user-json-leaves-a-live-jwt-with-no-coord-credential`,
+/// review finding 1: with `paired_user.json` gone AND the legacy slot dead,
+/// the heartbeat must still resolve a binding set — from the per-tenant slots
+/// — and present that slot's credential, so it keeps re-stamping
+/// `coord_bound_tenants.json` and the heal's Guard 1 never locks out.
+#[cfg(test)]
+mod binding_set_resolution_tests {
+    use super::*;
+
+    fn t(n: u8) -> uuid::Uuid {
+        uuid::Uuid::from_bytes([n; 16])
+    }
+
+    #[test]
+    fn the_file_wins_and_presents_the_default_slot() {
+        let set = choose_binding_set(
+            || Some((t(1), vec![t(2)])),
+            || panic!("the legacy slot is not read when the file answers"),
+            || panic!("the per-tenant slots are not read when the file answers"),
+        )
+        .expect("file");
+        assert_eq!(set.default_tenant, t(1));
+        assert_eq!(set.tenant_ids, vec![t(1), t(2)]);
+        assert_eq!(set.source, BindingSource::PairedUserFile);
+        assert_eq!(set.bearer_scope(), crate::auth::TenantScope::Device);
+    }
+
+    #[test]
+    fn a_usable_legacy_slot_answers_before_the_per_tenant_slots() {
+        let set = choose_binding_set(
+            || None,
+            || Some((t(3), true)),
+            || panic!("slots are not read when a usable legacy JWT answers"),
+        )
+        .expect("legacy");
+        assert_eq!(set.tenant_ids, vec![t(3)]);
+        assert_eq!(set.bearer_scope(), crate::auth::TenantScope::Device);
+    }
+
+    /// THE lockout shape: no file, legacy slot empty or dead, a usable
+    /// per-tenant slot. The heartbeat is sent, under that slot's credential.
+    #[test]
+    fn no_file_and_a_dead_or_empty_legacy_slot_fall_back_to_the_per_tenant_slots() {
+        for legacy in [None, Some((t(9), false))] {
+            let set = choose_binding_set(|| None, || legacy, || Some((t(5), vec![t(4), t(5)])))
+                .expect("the heartbeat must still resolve a binding set");
+            assert_eq!(set.default_tenant, t(5));
+            assert_eq!(set.tenant_ids, vec![t(4), t(5)]);
+            assert_eq!(set.source, BindingSource::TenantSlotClaims);
+            // Device would present the dead/empty legacy slot, i.e. nothing.
+            assert_eq!(
+                set.bearer_scope(),
+                crate::auth::TenantScope::Owned(t(5)),
+                "{legacy:?}"
+            );
+        }
+    }
+
+    /// Injected sources: `file` and `legacy` as given; the three heartbeat
+    /// sources PANIC, so any resolver that reads them fails the test.
+    fn sources_without_slots<'a>(
+        file: &'a dyn Fn() -> Option<(uuid::Uuid, Vec<uuid::Uuid>)>,
+        legacy: &'a dyn Fn() -> Option<(uuid::Uuid, bool)>,
+    ) -> BindingSources<'a> {
+        BindingSources {
+            file,
+            legacy,
+            slots: &|| panic!("the per-tenant slots must not be read"),
+            bound: &|| panic!("coord's bound set must not be read"),
+            active: &|| panic!("machine.json's active tenant must not be read"),
+        }
+    }
+
+    /// Review round 2, MEDIUM 2 + round 3: the per-tenant-slot fallback is
+    /// the heartbeat's ALONE, pinned through `resolve_binding_set`'s own
+    /// wiring (`resolve_binding_set_with`, which `resolve_binding_set` calls
+    /// with the real sources) rather than through `choose_binding_set` with a
+    /// hand-written `|| None` — so re-adding the slot fallback there fails
+    /// this test. It is handed panicking slot / bound / active sources: with
+    /// no file and an empty legacy slot it answers `None` without touching
+    /// them, and a dead legacy slot still yields its claim (the historical
+    /// behaviour).
+    #[test]
+    fn the_non_heartbeat_path_never_falls_back_to_the_per_tenant_slots() {
+        assert!(resolve_binding_set_with(&sources_without_slots(&|| None, &|| None)).is_none());
+        let dead =
+            resolve_binding_set_with(&sources_without_slots(&|| None, &|| Some((t(7), false))))
+                .expect("a dead legacy claim still names its tenant");
+        assert_eq!(dead.default_tenant, t(7));
+        assert_eq!(dead.source, BindingSource::LegacySlotClaim);
+        // Given the SAME no-file / no-legacy shape and usable slots, the
+        // heartbeat resolver does read them — the counter proves the source
+        // is wired there and only there.
+        let slot_reads = std::cell::Cell::new(0u32);
+        let slots = || {
+            slot_reads.set(slot_reads.get() + 1);
+            Some(vec![t(4), t(5)])
+        };
+        let src = BindingSources {
+            file: &|| None,
+            legacy: &|| None,
+            slots: &slots,
+            bound: &|| qontinui_runner_lib::pair::CoordBoundTenantsRead::Unknown("never recorded"),
+            active: &|| None,
+        };
+        assert!(resolve_binding_set_with(&src).is_none());
+        assert_eq!(
+            slot_reads.get(),
+            0,
+            "resolve_binding_set_with read the slots"
+        );
+        let hb = resolve_heartbeat_binding_set_with(&src)
+            .expect("the heartbeat resolves from the slots");
+        assert_eq!(slot_reads.get(), 1);
+        assert_eq!(hb.default_tenant, t(5));
+        assert_eq!(hb.source, BindingSource::TenantSlotClaims);
+        assert_eq!(hb.bearer_scope(), crate::auth::TenantScope::Owned(t(5)));
+    }
+
+    /// Review round 3: `resolve_heartbeat_binding_set_with` feeds the bound
+    /// set and the active tenant into the slot fallback — a Known set
+    /// excludes an unbound slot tenant (even the greatest id, even the
+    /// active one), the active tenant is preferred when it survives, and the
+    /// file or a usable legacy claim still answers first without any
+    /// heartbeat source being read.
+    #[test]
+    fn the_heartbeat_resolver_feeds_bound_and_active_into_the_slot_fallback() {
+        use qontinui_runner_lib::pair::CoordBoundTenantsRead as B;
+        let resolve = |bound: Vec<uuid::Uuid>, active: Option<uuid::Uuid>| {
+            let bound_fn = move || B::Known(bound.clone());
+            let active_fn = move || active;
+            resolve_heartbeat_binding_set_with(&BindingSources {
+                file: &|| None,
+                legacy: &|| Some((t(9), false)),
+                slots: &|| Some(vec![t(4), t(5), t(6)]),
+                bound: &bound_fn,
+                active: &active_fn,
+            })
+        };
+        // Unbound 6 (the greatest id) is excluded; greatest bound wins.
+        let set = resolve(vec![t(4), t(5)], None).expect("slot-backed");
+        assert_eq!(set.default_tenant, t(5));
+        assert_eq!(set.tenant_ids, vec![t(4), t(5)]);
+        assert_eq!(set.source, BindingSource::TenantSlotClaims);
+        // The active tenant is preferred over the greatest id…
+        let set = resolve(vec![t(4), t(5)], Some(t(4))).expect("slot-backed");
+        assert_eq!(set.default_tenant, t(4));
+        assert_eq!(set.bearer_scope(), crate::auth::TenantScope::Owned(t(4)));
+        // …but never when coord does not list it as bound.
+        let set = resolve(vec![t(4), t(5)], Some(t(6))).expect("slot-backed");
+        assert_eq!(set.default_tenant, t(5));
+        // A Known set listing none of the slots: the dead legacy claim.
+        let set = resolve(vec![t(1)], None).expect("legacy claim");
+        assert_eq!(set.default_tenant, t(9));
+        assert_eq!(set.source, BindingSource::LegacySlotClaim);
+        // The file answers first; the heartbeat sources are never read.
+        let set = resolve_heartbeat_binding_set_with(&sources_without_slots(
+            &|| Some((t(1), vec![t(1)])),
+            &|| panic!("the legacy slot is not read when the file answers"),
+        ))
+        .expect("file");
+        assert_eq!(set.source, BindingSource::PairedUserFile);
+        // So does a usable legacy claim.
+        let set = resolve_heartbeat_binding_set_with(&sources_without_slots(&|| None, &|| {
+            Some((t(3), true))
+        }))
+        .expect("legacy");
+        assert_eq!(set.source, BindingSource::LegacySlotClaim);
+    }
+
+    /// The heartbeat's slot fallback drops tenants coord's KNOWN set does not
+    /// list; an UNKNOWN set allows every candidate (the heartbeat is what
+    /// re-stamps it — filtering there would rebuild the lockout); a Known set
+    /// that lists none of them yields `None`.
+    #[test]
+    fn the_heartbeat_slot_fallback_is_filtered_by_a_known_bound_set() {
+        use qontinui_runner_lib::pair::CoordBoundTenantsRead as B;
+        assert_eq!(
+            heartbeat_slot_fallback(vec![t(4), t(5), t(6)], &B::Known(vec![t(4)]), None),
+            Some((t(4), vec![t(4)])),
+            "unbound 5 and 6 (greater ids) must not be chosen"
+        );
+        assert_eq!(
+            heartbeat_slot_fallback(vec![t(6), t(4)], &B::Unknown("stale"), None),
+            Some((t(6), vec![t(4), t(6)]))
+        );
+        assert_eq!(
+            heartbeat_slot_fallback(vec![t(5)], &B::Known(vec![t(4)]), None),
+            None
+        );
+    }
+
+    /// `machine.json`'s `active_tenant_id` is the default when it survives
+    /// the filter; otherwise the greatest id — never an active tenant that
+    /// holds no usable slot or that coord unbound.
+    #[test]
+    fn the_heartbeat_slot_fallback_prefers_the_active_tenant() {
+        use qontinui_runner_lib::pair::CoordBoundTenantsRead as B;
+        assert_eq!(
+            heartbeat_slot_fallback(vec![t(4), t(5)], &B::Unknown("stale"), Some(t(4))),
+            Some((t(4), vec![t(4), t(5)]))
+        );
+        // Active tenant holds no usable slot: greatest id.
+        assert_eq!(
+            heartbeat_slot_fallback(vec![t(4), t(5)], &B::Unknown("stale"), Some(t(9))),
+            Some((t(5), vec![t(4), t(5)]))
+        );
+        // Active tenant is outside coord's known set: filtered, not chosen.
+        assert_eq!(
+            heartbeat_slot_fallback(vec![t(4), t(5)], &B::Known(vec![t(5)]), Some(t(4))),
+            Some((t(5), vec![t(5)]))
+        );
+        // The bearer scope follows the chosen default.
+        let set = choose_binding_set(
+            || None,
+            || Some((t(9), false)),
+            || heartbeat_slot_fallback(vec![t(4), t(5)], &B::Unknown("stale"), Some(t(4))),
+        )
+        .expect("slot-backed");
+        assert_eq!(set.default_tenant, t(4));
+        assert_eq!(set.bearer_scope(), crate::auth::TenantScope::Owned(t(4)));
+    }
+
+    #[test]
+    fn a_dead_legacy_claim_is_the_last_resort_and_nothing_is_none() {
+        let set =
+            choose_binding_set(|| None, || Some((t(7), false)), || None).expect("dead legacy");
+        assert_eq!(set.tenant_ids, vec![t(7)]);
+        assert_eq!(set.source, BindingSource::LegacySlotClaim);
+        assert!(choose_binding_set(|| None, || None, || None).is_none());
+    }
+
+    /// End to end over a real store: the slot-backed scope resolves to the
+    /// slot's own JWT, so the register is authenticated rather than anonymous.
+    #[test]
+    fn the_slot_backed_scope_presents_the_slots_jwt_while_device_presents_nothing() {
+        use base64::Engine as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = crate::secure_storage::SecureStorage::with_path(dir.path().join("t.enc"))
+            .expect("storage");
+        let am = crate::auth::AuthManager::with_storage_no_keychain(storage);
+        let tenant = uuid::Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap();
+        let enc = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+        let payload = format!(
+            r#"{{"sub":"device:d","tenant_id":"{tenant}","user_id":"22222222-2222-4222-8222-222222222222","exp":{}}}"#,
+            chrono::Utc::now().timestamp() + 3600
+        );
+        let jwt = format!(
+            "{}.{}.sig",
+            enc(br#"{"alg":"none"}"#),
+            enc(payload.as_bytes())
+        );
+        am.store_tenant_device_jwt(&tenant, &jwt).expect("slot");
+        let set = choose_binding_set(|| None, || None, || Some((tenant, vec![tenant])))
+            .expect("slot-backed set");
+        assert_eq!(
+            crate::auth::select_scoped_bearer(&am, set.bearer_scope(), None, 1).as_deref(),
+            Some(jwt.as_str())
+        );
+        assert_eq!(
+            crate::auth::select_scoped_bearer(&am, crate::auth::TenantScope::Device, None, 1),
+            None,
+            "the legacy slot is empty: Device would send the heartbeat anonymously"
         );
     }
 }
