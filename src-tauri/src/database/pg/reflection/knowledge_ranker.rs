@@ -4,7 +4,7 @@
 //!
 //! Both reads used to fail without saying so. The ranker selected
 //! `tk.last_validated_at` and `tk.reflection_fix_id`, columns
-//! `project.task_knowledge` has never had, so it errored on every database
+//! `project.task_knowledge` does not declare in the generated schema, so it errored on every database
 //! and its only workflow caller fell back to a chronological list without a
 //! log. Velocity keyed on `reflection_fixes.target_component`, which nothing
 //! in the runner writes, and read a failed count as 0. Here every read that
@@ -211,7 +211,7 @@ impl PgDb {
                         Some(v) => *v,
                         None => {
                             let v = self
-                                .compute_change_velocity(&component, RANKER_VELOCITY_WINDOW)
+                                .compute_change_velocity(&path, RANKER_VELOCITY_WINDOW)
                                 .await?;
                             velocities.insert(component, v);
                             v

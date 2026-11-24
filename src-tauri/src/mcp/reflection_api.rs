@@ -637,12 +637,8 @@ pub async fn change_velocity_handler(
 ) -> Result<Json<ApiResponse<f64>>, (StatusCode, Json<ApiResponse<()>>)> {
     let component = query.component.clone();
     let window = query.window;
-    crate::database::pg::reflection::require_window(window).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(api_error(e)),
-        )
-    })?;
+    crate::database::pg::reflection::require_window(window)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(api_error(e))))?;
     let velocity = state
         .app_state
         .pg_db
