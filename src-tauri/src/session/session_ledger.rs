@@ -1983,7 +1983,10 @@ mod tests {
                 .as_deref(),
             Some("/a/.claude-gmail")
         );
-        assert_eq!(resolve_config_dir_with(Some("/a/.claude"), Some(&[]), retired), None);
+        assert_eq!(
+            resolve_config_dir_with(Some("/a/.claude"), Some(&[]), retired),
+            None
+        );
         assert_eq!(
             resolve_config_dir_with(Some("/a/.claude"), None, |_| false).as_deref(),
             Some("/a/.claude")
