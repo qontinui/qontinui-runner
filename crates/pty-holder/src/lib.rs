@@ -36,6 +36,9 @@
 //! - [`scrollback`] — the ring's durable, offset-anchored tail on disk (Phase
 //!   4, D7): capped, 0600, atomically replaced on a timer with a change mark.
 //! - [`pty`] — the PTY, the child, and when the holder may exit.
+//! - [`transient`] — which launch failures a CLI reinstall can cause, and the
+//!   bounded retry the holder's child spawn and the runner's headless spawns
+//!   share (plan 2026-11-24, Phase 5b).
 //! - [`startup`] — fd closing, `SIGCHLD`, `setsid`, stdio: the holder's first
 //!   acts.
 //! - [`server`] — the holder: start-up order, the allowlisted dispatch, the
@@ -74,6 +77,7 @@ pub mod spec;
 pub mod startup;
 pub mod sweep;
 pub mod terminate;
+pub mod transient;
 pub mod transport;
 
 #[cfg(test)]

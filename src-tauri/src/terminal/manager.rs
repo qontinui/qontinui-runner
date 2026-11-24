@@ -734,6 +734,8 @@ impl TerminalManager {
             io,
             pinned_session_id,
             origin,
+            // A remote mirror: the holder question is the target device's.
+            None,
         )
     }
 
@@ -776,6 +778,10 @@ impl TerminalManager {
         );
         let (title, cwd) = pane.session_identity();
         let (cols, rows) = pane.dims();
+        // A pane that was adopted survived a runner exit already, so its
+        // holder is outside the runner's cgroup: an unprotected one dies with
+        // the unit. Upgrade-safe.
+        let holder_state = super::daemon_pane_io::HolderState::holder(pane.unprotected());
         let io: Arc<dyn super::pane_io::PaneIo> = pane.clone();
         self.insert_with_io(
             terminal_id.to_string(),
@@ -790,6 +796,7 @@ impl TerminalManager {
             // A holder pane re-adopted at boot: coalesced like any other
             // boot-time resume, so a sweep of N panes selects at most one.
             SpawnOrigin::BootResume,
+            Some(holder_state),
         )
         .map_err(|e| {
             // The session could not be built around the attached pane. DETACH
@@ -864,6 +871,7 @@ impl TerminalManager {
         io: Arc<dyn super::pane_io::PaneIo>,
         pinned_session_id: String,
         origin: SpawnOrigin,
+        holder_state: Option<super::daemon_pane_io::HolderState>,
     ) -> Result<TerminalInfo, String> {
         let page_id = page_id.unwrap_or_else(|| "default".to_string());
 
@@ -881,6 +889,9 @@ impl TerminalManager {
             pinned_session_id,
         )?;
 
+        if let Some(state) = holder_state {
+            session.set_holder_state(state);
+        }
         let info = session.info();
         let session = Arc::new(session);
 
@@ -1268,6 +1279,29 @@ impl TerminalManager {
             .collect();
         rows.sort_by_key(|(info, _)| info.created_at);
         rows
+    }
+
+    /// Every open terminal's [`HolderState`](super::daemon_pane_io::HolderState)
+    /// by id, `None` for a pane with no local holder question (a remote
+    /// mirror). For `GET /terminals`, the `terminal_holder_states` command and
+    /// `/restart-readiness` (plan
+    /// `2026-11-24-runner-upgrades-itself-daily-keeping-sessions-alive-with-no-outage-and-automatic-rollback`
+    /// D7).
+    ///
+    /// `Err` on a poisoned registry: an unreadable listing is never an empty
+    /// one (a reader would take it for "no non-holder panes").
+    pub fn holder_states(
+        &self,
+    ) -> Result<std::collections::HashMap<String, Option<super::daemon_pane_io::HolderState>>, String>
+    {
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|e| format!("terminal registry lock poisoned: {e}"))?;
+        Ok(sessions
+            .iter()
+            .map(|(id, s)| (id.clone(), s.holder_state().cloned()))
+            .collect())
     }
 
     /// Get the number of active sessions, with a poisoned lock rendered as `0`.

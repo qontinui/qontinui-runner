@@ -1652,6 +1652,12 @@ pub struct TerminalSession {
     /// holder pane, a remote mirror, a test fixture) reads `absent`.
     permission_request_hook:
         std::sync::OnceLock<crate::session::claude_hook::PermissionRequestHook>,
+    /// What backs this pane's PTY (plan
+    /// `2026-11-24-runner-upgrades-itself-daily-keeping-sessions-alive-with-no-outage-and-automatic-rollback`
+    /// D7): a holder, or an in-process PTY and WHY. Set once, by [`Self::spawn`]
+    /// and by the manager's holder adoption; unset for a remote mirror (the
+    /// holder question is about the session's own device) and a test fixture.
+    holder_state: std::sync::OnceLock<crate::terminal::daemon_pane_io::HolderState>,
     /// The per-spawn nonce this terminal's child carries as
     /// `QONTINUI_PERMREQ_NONCE`, once [`Self::spawn`] registered it as the
     /// terminal's grant (`session::permission_accept`). `Drop` forgets the
@@ -2029,16 +2035,26 @@ impl TerminalSession {
         // credential-scrub obligation (see `pane_io`); `finalize_child_env`
         // above already ran the same scrub as the production env tail.
         let sealed = ScrubbedCommand::seal(cmd);
-        let io: Arc<dyn PaneIo> = match opened {
-            // A local spawn that fails started no child.
-            Some(opened) => Arc::new(opened.spawn(sealed).map_err(SpawnFailure::before_child)?),
+        let (io, holder_state): (Arc<dyn PaneIo>, _) = match opened {
+            // A local spawn that fails started no child. In-process by
+            // configuration (`terminal.pty_holder` off).
+            Some(opened) => (
+                Arc::new(opened.spawn(sealed).map_err(SpawnFailure::before_child)?)
+                    as Arc<dyn PaneIo>,
+                crate::terminal::daemon_pane_io::HolderState::in_process(
+                    crate::terminal::daemon_pane_io::NotUpgradeSafe::HolderDisabled,
+                ),
+            ),
             // A holder failure has already been through the holder AND its
             // in-process fallback; a holder process may have started before
             // its attach was refused, so it is not proven child-free.
-            None => crate::terminal::daemon_pane_io::spawn_holder_pane_or_fallback(
-                &id, sealed, cols, rows,
-            )
-            .map_err(SpawnFailure::after_child)?,
+            None => {
+                let spawned = crate::terminal::daemon_pane_io::spawn_holder_pane_or_fallback(
+                    &id, sealed, cols, rows,
+                )
+                .map_err(SpawnFailure::after_child)?;
+                (spawned.io, spawned.state)
+            }
         };
 
         let session = Self::spawn_with_io(
@@ -2061,6 +2077,7 @@ impl TerminalSession {
         // grant, so the pad never answers its prompts.
         session.set_permission_request_hook(permission_request_hook);
         session.record_permission_request_grant(permreq_nonce, spawn_tenant);
+        session.set_holder_state(holder_state);
         Ok(session)
     }
 
@@ -2705,6 +2722,7 @@ impl TerminalSession {
             coord_bound_at_ms: std::sync::atomic::AtomicI64::new(0),
             spawn_name: std::sync::OnceLock::new(),
             permission_request_hook: std::sync::OnceLock::new(),
+            holder_state: std::sync::OnceLock::new(),
             permission_request_nonce: std::sync::OnceLock::new(),
             agent_status_last,
             grid_idle_tracker: Mutex::new(qontinui_runner_lib::wind_down::GridIdleTracker::new()),
@@ -4796,6 +4814,17 @@ impl TerminalSession {
         let _ = self.permission_request_hook.set(hook);
     }
 
+    /// Record what backs this pane's PTY (first write wins).
+    pub fn set_holder_state(&self, state: crate::terminal::daemon_pane_io::HolderState) {
+        let _ = self.holder_state.set(state);
+    }
+
+    /// What backs this pane's PTY, or `None` for a pane with no local holder
+    /// question (a remote mirror) or none recorded.
+    pub fn holder_state(&self) -> Option<&crate::terminal::daemon_pane_io::HolderState> {
+        self.holder_state.get()
+    }
+
     /// Register this terminal's permission auto-accept grant: the nonce its
     /// child env carries and the tenant it was spawned for (`None` when the
     /// caller named none). First write wins.
@@ -6213,6 +6242,7 @@ pub(crate) mod tests {
             coord_bound_at_ms: std::sync::atomic::AtomicI64::new(0),
             spawn_name: std::sync::OnceLock::new(),
             permission_request_hook: std::sync::OnceLock::new(),
+            holder_state: std::sync::OnceLock::new(),
             permission_request_nonce: std::sync::OnceLock::new(),
             agent_status_last: Arc::new(Mutex::new(None)),
             grid_idle_tracker: Mutex::new(qontinui_runner_lib::wind_down::GridIdleTracker::new()),

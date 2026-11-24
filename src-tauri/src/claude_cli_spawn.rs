@@ -32,12 +32,9 @@ use std::time::{Duration, Instant};
 use tracing::warn;
 
 /// Back-off before each RETRY. `len() + 1` attempts in all; the sum (10 s) is
-/// the most a spawn waits before reporting failure.
-pub(crate) const RETRY_DELAYS: [Duration; 3] = [
-    Duration::from_secs(1),
-    Duration::from_secs(3),
-    Duration::from_secs(6),
-];
+/// the most a spawn waits before reporting failure. The SAME budget the PTY
+/// holder's child spawn uses (`qontinui_pty_holder::transient`).
+pub(crate) const RETRY_DELAYS: [Duration; 3] = qontinui_pty_holder::transient::SPAWN_RETRY_DELAYS;
 
 /// Back-off before each RETRY of an account migration's
 /// [`resolve_resume_claude_bin`]: 7 attempts over 45 s. Longer than [`RETRY_DELAYS`] because a PATH miss here is not one
@@ -73,50 +70,12 @@ pub(crate) const CLI_UNAVAILABLE_HEAD: &str = "claude_cli_unavailable:";
 /// The short kind token for a spawn error that a CLI reinstall in progress can
 /// produce, or `None` when the error is not one of those.
 ///
-/// It matches the OS code first and falls back to the portable
-/// [`io::ErrorKind`]. That fallback is never used for ENOEXEC or ETXTBSY,
-/// which have no stable `ErrorKind` of their own. Windows `193`
-/// (`ERROR_BAD_EXE_FORMAT`) is deliberately NOT transient. On this runner it
-/// means a direct `CreateProcessW` of the extensionless identity shim, which
-/// is a deterministic defect that a retry would only repeat.
-pub(crate) fn transient_kind(e: &io::Error) -> Option<&'static str> {
-    if let Some(code) = e.raw_os_error() {
-        // A raw code we did not list is NOT transient: the portable
-        // `ErrorKind` fallback below would otherwise sweep in, e.g., `EPERM`
-        // (a `setpgid` failure) as `PermissionDenied`.
-        #[cfg(unix)]
-        {
-            return match code {
-                libc::ENOENT => Some("enoent"),
-                libc::EACCES => Some("eacces"),
-                libc::ENOEXEC => Some("enoexec"),
-                libc::ETXTBSY => Some("etxtbsy"),
-                _ => None,
-            };
-        }
-        #[cfg(windows)]
-        {
-            return match code {
-                // ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND
-                2 | 3 => Some("enoent"),
-                // ERROR_ACCESS_DENIED
-                5 => Some("eacces"),
-                // ERROR_SHARING_VIOLATION: the exe is still being written.
-                32 => Some("sharing_violation"),
-                _ => None,
-            };
-        }
-        // A target with no table above falls through to the kind check.
-        #[cfg(not(any(unix, windows)))]
-        let _ = code;
-    }
-    // No raw code (e.g. std's own "program not found" on Windows): the kind.
-    match e.kind() {
-        io::ErrorKind::NotFound => Some("enoent"),
-        io::ErrorKind::PermissionDenied => Some("eacces"),
-        _ => None,
-    }
-}
+/// Defined ONCE, in `qontinui_pty_holder::transient`, because the PTY holder's
+/// child spawn hits the same reinstall window and that crate cannot depend on
+/// this one (plan
+/// `2026-11-24-runner-upgrades-itself-daily-keeping-sessions-alive-with-no-outage-and-automatic-rollback`
+/// D7 (2a)): one classification, two spawners.
+pub(crate) use qontinui_pty_holder::transient::transient_kind;
 
 /// A spawn that did not produce a child: the last error, and how hard we tried.
 #[derive(Debug)]
