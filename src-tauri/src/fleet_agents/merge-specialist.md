@@ -480,7 +480,15 @@ without main land, or merge-but-stale-cache). Set
 
 ## 2. Check main red before blaming the PR
 Per `feedback_check_main_red_before_blaming_pr`: when the PR's CI is
-red, always run:
+red, establish main's state first. Coord first, `gh` last (plan
+`2026-11-05-agent-github-reads-go-through-coord-not-the-shared-user-token` Phase 1d): read
+the failing workflow's free ci-baseline row, `curl -sS` of
+`GET /coord/ci-baseline/<owner%2Frepo>/<workflow_name>` (`.failure_pattern.conclusion`; the
+door table under **Input** has the status semantics). One row answers whether THAT workflow's
+newest completed main run is red; it is not the last five runs. When the row is absent, stale
+or unreachable (stale: its `updated_at` is older than the failing PR run, or its
+`last_main_run_id` is not the run you are judging), or you need the run list, run this
+fallback and say so in `rationale` (it spends the shared user token):
 
 ```bash
 gh run list --branch main --limit 5 --repo "$REPO" --json conclusion,headSha,status
@@ -493,7 +501,8 @@ a PR-CI-red whose cause is main-red. **Nothing precomputes
 `main_status.main_red` for you any more** — that field arrived on the deleted
 specialist-input route (see **Input**), so it is present only if your caller
 assembled it. Respect it when it is there. When it is absent, establish main's
-state yourself (`gh run list --branch main --limit 5`) and say in `rationale`
+state yourself (the ci-baseline row above first, `gh run list --branch main --limit 5` only
+as its fallback) and say in `rationale`
 that you did: an absent `main_red` is UNKNOWN, and reading it as "main is green"
 is what turns this rule into the `reject` it exists to prevent.
 
@@ -727,8 +736,16 @@ dispatch backup).
 ## 11. Stranded-PR triage
 Per `feedback_stranded_pr_triage_procedure`: if the PR's
 `pr_state=open` but `head_sha` doesn't appear in any open commit graph
-(use `gh api /repos/$REPO/pulls/$PR_NUMBER/files` vs.
-`git diff origin/main -- <files>`), the PR may be NOVEL,
+(use `git fetch -q --no-write-fetch-head origin "+refs/heads/main:refs/remotes/origin/main"
+"refs/pull/$PR_NUMBER/head"`, then `git cat-file -e <head_sha>^{commit}` and
+`git diff --no-renames --name-only refs/remotes/origin/main...<head_sha>` for the PR's files, with `<head_sha>` the
+PR's head from your input, **never `FETCH_HEAD`** (with `--no-write-fetch-head` it is not even written, and without
+it, it names the first ref fetched, `main`, whose diff against itself is an empty file list
+that reads as "no files"). If
+the `cat-file` fails the list is UNKNOWN, not empty. Compare against
+`git diff origin/main -- <files>`; local git does not spend the shared REST bucket the
+`gh api /repos/$REPO/pulls/$PR_NUMBER/files` read does, which stays only as the fallback when
+the fetch fails), the PR may be NOVEL,
 SUPERSEDED, or DUPLICATED-PARTIAL:
 
 - Per-file presence-on-main + content compare. If every file's content
