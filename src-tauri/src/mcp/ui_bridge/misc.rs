@@ -190,25 +190,162 @@ ipc_handler_path_get!(
 // Structural capture (matches_isolated_render)
 // ============================================================================
 
-/// The SDK's typed capture refusal (`component_capture_refused`), read off a
-/// flattened IPC answer: its reason and the HTTP status the SDK answers it
-/// with — 404 `not_found`, 422 `no_mounted_elements`. `None` for any other
-/// answer.
-pub(crate) fn capture_refusal(answer: &serde_json::Value) -> Option<(&'static str, StatusCode)> {
-    if answer.get("success").and_then(|v| v.as_bool()) != Some(false)
-        || answer.get("error").and_then(|v| v.as_str()) != Some("component_capture_refused")
-    {
+/// The SDK's capture refusal marker: the whole `error` of an HTTP refusal, and
+/// the prefix of a relayed one (`component_capture_refused:<reason>: <msg>`).
+const CAPTURE_REFUSED: &str = "component_capture_refused";
+
+/// The SDK's typed capture refusal: its reason, the HTTP status the SDK
+/// answers it with (404 `not_found`, 422 `no_mounted_elements`), and the SDK's
+/// own message when the answer carried one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CaptureRefusal {
+    pub reason: &'static str,
+    pub status: StatusCode,
+    pub message: Option<String>,
+}
+
+impl CaptureRefusal {
+    fn from_reason(reason: &str, message: Option<String>) -> Option<Self> {
+        let (reason, status) = match reason {
+            "not_found" => ("not_found", StatusCode::NOT_FOUND),
+            "no_mounted_elements" => ("no_mounted_elements", StatusCode::UNPROCESSABLE_ENTITY),
+            _ => return None,
+        };
+        Some(Self {
+            reason,
+            status,
+            message: message.filter(|m| !m.trim().is_empty()),
+        })
+    }
+
+    /// The SDK's diagnostic code for the reason.
+    pub fn code(&self) -> &'static str {
+        if self.reason == "not_found" {
+            "UB-ELEM-NOT-FOUND"
+        } else {
+            "UB-OBS-INPUT-MISSING"
+        }
+    }
+
+    /// The SDK's HTTP refusal body: `error` and `reason` at the top level, the
+    /// refusal repeated under `data`, the message (when known) as the one
+    /// suggestion.
+    pub fn body(&self) -> serde_json::Value {
+        serde_json::json!({
+            "success": false,
+            "error": CAPTURE_REFUSED,
+            "reason": self.reason,
+            "code": self.code(),
+            "data": { "error": CAPTURE_REFUSED, "reason": self.reason },
+            "suggestions": self.message.iter().collect::<Vec<_>>(),
+        })
+    }
+
+    /// One line for a report: `component_capture_refused: <reason> (<message>)`.
+    pub fn describe(&self) -> String {
+        match &self.message {
+            Some(m) => format!("{CAPTURE_REFUSED}: {} ({m})", self.reason),
+            None => format!("{CAPTURE_REFUSED}: {}", self.reason),
+        }
+    }
+}
+
+/// A refusal relayed as a message (`component_capture_refused:<reason>[: msg]`)
+/// — what the SDK's in-page relay dispatcher sends over a WebSocket wrapper.
+fn refusal_from_message(text: &str) -> Option<CaptureRefusal> {
+    let rest = text.strip_prefix(CAPTURE_REFUSED)?.strip_prefix(':')?;
+    let (reason, message) = match rest.split_once(':') {
+        Some((reason, message)) => (reason, Some(message.trim().to_string())),
+        None => (rest, None),
+    };
+    CaptureRefusal::from_reason(reason.trim(), message)
+}
+
+/// The reason a refusal's SDK code stands for.
+fn reason_from_code(code: Option<&str>) -> Option<&'static str> {
+    match code? {
+        "UB-ELEM-NOT-FOUND" => Some("not_found"),
+        "UB-OBS-INPUT-MISSING" => Some("no_mounted_elements"),
+        _ => None,
+    }
+}
+
+/// The typed refusal in a capture answer — the HTTP envelope (`error` is the
+/// marker, `reason` top level or under `data`) or a relayed inner failure
+/// (`error` carries the reason). `None` for any other answer.
+pub(crate) fn capture_refusal(answer: &serde_json::Value) -> Option<CaptureRefusal> {
+    if answer.get("success").and_then(|v| v.as_bool()) != Some(false) {
         return None;
+    }
+    let error = answer.get("error").and_then(|v| v.as_str())?;
+    if error != CAPTURE_REFUSED {
+        return refusal_from_message(error);
     }
     let reason = answer
         .get("reason")
         .or_else(|| answer.get("data").and_then(|d| d.get("reason")))
-        .and_then(|v| v.as_str())?;
-    match reason {
-        "not_found" => Some(("not_found", StatusCode::NOT_FOUND)),
-        "no_mounted_elements" => Some(("no_mounted_elements", StatusCode::UNPROCESSABLE_ENTITY)),
+        .and_then(|v| v.as_str())
+        .or_else(|| reason_from_code(answer.get("code").and_then(|v| v.as_str())))?;
+    let message = answer
+        .get("suggestions")
+        .and_then(|s| s.get(0))
+        .or_else(|| answer.get("message"))
+        .or_else(|| answer.get("data").and_then(|d| d.get("message")))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    CaptureRefusal::from_reason(reason, message)
+}
+
+/// The typed refusal inside an app-dispatch failure, on either transport: an
+/// HTTP app's answered refusal (its reason recovered from the message, the
+/// SDK code or the status), an unparsed HTTP error body, or a WebSocket
+/// wrapper's relayed refusal message. `None` for every other failure.
+pub(crate) fn capture_refusal_from_dispatch(
+    err: &crate::mcp::app_dispatch::DispatchError,
+) -> Option<CaptureRefusal> {
+    use crate::mcp::app_dispatch::DispatchError;
+    use crate::mcp::command_relay::CommandRelayError;
+    match err {
+        DispatchError::AppAnswered {
+            error,
+            code,
+            status,
+            ..
+        } => refusal_from_message(error).or_else(|| {
+            if error != CAPTURE_REFUSED {
+                return None;
+            }
+            let reason = reason_from_code(code.as_deref()).or(match status {
+                404 => Some("not_found"),
+                422 => Some("no_mounted_elements"),
+                _ => None,
+            })?;
+            CaptureRefusal::from_reason(reason, None)
+        }),
+        DispatchError::HttpStatus { body, .. } => serde_json::from_str(body)
+            .ok()
+            .and_then(|json| capture_refusal(&json)),
+        DispatchError::WebSocket(CommandRelayError::WrapperError(failure)) => {
+            refusal_from_message(&failure.message).or_else(|| {
+                (failure.message == CAPTURE_REFUSED)
+                    .then(|| reason_from_code(failure.code.as_deref()))
+                    .flatten()
+                    .and_then(|reason| CaptureRefusal::from_reason(reason, None))
+            })
+        }
         _ => None,
     }
+}
+
+/// The SDK capture path relative to the UI Bridge mount, for `kind`
+/// `component` or `element`: `/control/<kind>/<id>/capture[?props=true]`, the id
+/// percent-encoded.
+pub(crate) fn capture_path(kind: &str, id: &str, props: bool) -> String {
+    format!(
+        "/control/{kind}/{}/capture{}",
+        urlencoding::encode(id),
+        if props { "?props=true" } else { "" }
+    )
 }
 
 /// A capture route's failure body. The typed refusal is a plain JSON object
@@ -248,22 +385,8 @@ async fn capture_via_ipc(
     )
     .await;
     if let Ok(answer) = &result {
-        if let Some((reason, status)) = capture_refusal(answer) {
-            let code = if reason == "not_found" {
-                "UB-ELEM-NOT-FOUND"
-            } else {
-                "UB-OBS-INPUT-MISSING"
-            };
-            return Err((
-                status,
-                Json(serde_json::json!({
-                    "success": false,
-                    "error": "component_capture_refused",
-                    "reason": reason,
-                    "code": code,
-                    "data": { "error": "component_capture_refused", "reason": reason },
-                })),
-            ));
+        if let Some(refusal) = capture_refusal(answer) {
+            return Err((refusal.status, Json(refusal.body())));
         }
     }
     wrap_ipc_result_keeping_failure_data(result).map_err(|(status, Json(body))| {

@@ -492,7 +492,7 @@ fn dispatch_err_to_string(err: DispatchError) -> String {
 
 /// Borrowing form of [`dispatch_err_to_string`], for callers that still need
 /// the typed error after rendering it (the IPC-fallback gate).
-fn dispatch_err_message(err: &DispatchError) -> String {
+pub(crate) fn dispatch_err_message(err: &DispatchError) -> String {
     match err {
         DispatchError::NotConnected => "No active SDK app connection".to_string(),
         DispatchError::NotResponsive(msg) => msg.clone(),
@@ -688,6 +688,30 @@ pub async fn dispatch_app_request_by_id(
         http_body,
     )
     .await
+}
+
+/// [`dispatch_app_request_by_id`] keeping the TYPED [`DispatchError`], for a
+/// caller that reads a failure's class or payload (the vision capture fetch
+/// recovers the SDK's typed capture refusal from it).
+pub(crate) async fn dispatch_app_request_by_id_typed(
+    state: &Arc<ApiState>,
+    app_id: &str,
+    action: &str,
+    ws_payload: serde_json::Value,
+    http_method: Method,
+    http_path: &str,
+    http_body: Option<serde_json::Value>,
+) -> Result<serde_json::Value, DispatchError> {
+    state
+        .app_dispatcher
+        .dispatch(
+            app_id,
+            action,
+            http_method,
+            http_path,
+            split_arm_payloads(ws_payload, http_body),
+        )
+        .await
 }
 
 /// [`dispatch_app_request_by_id`] over the dispatcher alone, so a test drives
@@ -6029,62 +6053,74 @@ async fn handle_component_state(
     }
 }
 
+/// The `/ui-bridge/sdk/[control/]{component,element}/:id/capture` wrappers:
+/// dispatch `action` (`getComponentCapture` / `getElementCapture`) to the
+/// active SDK app on either transport and answer as the SDK route does.
+///
+/// - A capture is returned as the app answered it (the HTTP arm's
+///   `{success, data}` envelope, or the bare capture a WebSocket wrapper
+///   relays).
+/// - The typed `component_capture_refused` refusal keeps its status (404
+///   `not_found`, 422 `no_mounted_elements`) and its top-level `reason`,
+///   whether the app answered it over HTTP or relayed it as a message.
+/// - Any other dispatch failure is answered 502 `{success:false, error}`.
+async fn sdk_capture(
+    state: &Arc<ApiState>,
+    action: &str,
+    kind: &str,
+    id: String,
+    props: bool,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::mcp::ui_bridge::misc::{
+        capture_path, capture_refusal, capture_refusal_from_dispatch,
+    };
+    let path = capture_path(kind, &id, props);
+    match dispatch_app_request_typed(
+        state,
+        action,
+        serde_json::json!({ "id": id, "props": props }),
+        Method::GET,
+        &path,
+        None,
+    )
+    .await
+    {
+        Ok(data) => match capture_refusal(&data) {
+            Some(refusal) => Err((refusal.status, Json(refusal.body()))),
+            None => Ok(Json(data)),
+        },
+        Err(e) => match capture_refusal_from_dispatch(&e) {
+            Some(refusal) => Err((refusal.status, Json(refusal.body()))),
+            None => Err((
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "success": false, "error": dispatch_err_message(&e) })),
+            )),
+        },
+    }
+}
+
 /// GET /ui-bridge/sdk/component/:id/capture — the component's structural
 /// `ComponentCapture` (`matches_isolated_render`, plan
-/// 2026-11-13-ui-bridge-matches-isolated-render-assertion). The SDK's answer is
-/// returned verbatim, the typed `component_capture_refused` refusal included.
+/// 2026-11-13-ui-bridge-matches-isolated-render-assertion). See
+/// [`sdk_capture`] for what each outcome answers.
 async fn handle_component_capture(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
     Query(q): Query<crate::mcp::ui_bridge::misc::CaptureQuery>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let props = crate::mcp::ui_bridge::misc::props_opt_in(q.props.as_deref());
-    let path = if props {
-        format!("/control/component/{}/capture?props=true", id)
-    } else {
-        format!("/control/component/{}/capture", id)
-    };
-    match dispatch_app_request(
-        &state,
-        "getComponentCapture",
-        serde_json::json!({ "id": id, "props": props }),
-        Method::GET,
-        &path,
-        None,
-    )
-    .await
-    {
-        Ok(data) => Json(data),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
-    }
+    sdk_capture(&state, "getComponentCapture", "component", id, props).await
 }
 
 /// GET /ui-bridge/sdk/element/:id/capture — the structural `ComponentCapture`
-/// rooted at one registered element.
+/// rooted at one registered element. See [`sdk_capture`].
 async fn handle_element_capture(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
     Query(q): Query<crate::mcp::ui_bridge::misc::CaptureQuery>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let props = crate::mcp::ui_bridge::misc::props_opt_in(q.props.as_deref());
-    let path = if props {
-        format!("/control/element/{}/capture?props=true", id)
-    } else {
-        format!("/control/element/{}/capture", id)
-    };
-    match dispatch_app_request(
-        &state,
-        "getElementCapture",
-        serde_json::json!({ "id": id, "props": props }),
-        Method::GET,
-        &path,
-        None,
-    )
-    .await
-    {
-        Ok(data) => Json(data),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
-    }
+    sdk_capture(&state, "getElementCapture", "element", id, props).await
 }
 
 /// POST /ui-bridge/sdk/component/:id/action/:actionId — Execute component action

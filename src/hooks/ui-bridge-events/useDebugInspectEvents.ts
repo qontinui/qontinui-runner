@@ -624,7 +624,8 @@ export function useDebugInspectEvents(
           // answers byte-for-byte what an SDK-mounted server answers on
           // `GET /control/{component,element}/:id/capture`. A refusal keeps the
           // SDK's typed shape: `error: "component_capture_refused"` with the
-          // `reason` under `data`, which the Rust handler maps to 404 / 422.
+          // `reason` and the SDK's `message` under `data`, which the Rust
+          // handler maps to 404 / 422.
           // `props: true` is the route's `?props=true` opt-in; props are left
           // out of a capture unless asked for.
           const { id, props } = (payload.params || {}) as { id?: string; props?: boolean };
@@ -661,7 +662,9 @@ export function useDebugInspectEvents(
               type,
               success: false,
               error: result.refusal.error,
-              data: result.refusal,
+              // The SDK's human message rides beside the typed refusal, so the
+              // runner can say why (not only that) the capture was refused.
+              data: { ...result.refusal, message: result.message },
               timestamp: Date.now(),
             });
           }

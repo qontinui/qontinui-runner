@@ -143,6 +143,17 @@ pub struct ComponentBaselineStore {
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// The store as the component-baseline routes' handler state: extracted from
+/// the runner's `ApiState`, and mountable on its own in a test router.
+#[derive(Debug, Clone)]
+pub struct ComponentBaselines(pub std::sync::Arc<ComponentBaselineStore>);
+
+impl axum::extract::FromRef<std::sync::Arc<crate::mcp::types::ApiState>> for ComponentBaselines {
+    fn from_ref(state: &std::sync::Arc<crate::mcp::types::ApiState>) -> Self {
+        Self(state.vision_component_baselines.clone())
+    }
+}
+
 impl ComponentBaselineStore {
     /// A store rooted at `<vision_cache_root>/component_baselines`. Creates
     /// nothing until the first write.
@@ -161,7 +172,9 @@ impl ComponentBaselineStore {
     }
 
     /// Store `baseline` under its own `name`, replacing any earlier one with
-    /// the same name. Atomic (temp file + rename).
+    /// the same name. Atomic and durable: the temp file is written and synced
+    /// before the rename, so a crash leaves either the old file or the new
+    /// one whole.
     pub fn put(&self, baseline: &ComponentBaseline) -> Result<PathBuf, StoreError> {
         validate_name(&baseline.name).map_err(StoreError::InvalidName)?;
         std::fs::create_dir_all(&self.dir)
@@ -175,7 +188,12 @@ impl ComponentBaselineStore {
             std::process::id(),
             TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
-        if let Err(e) = std::fs::write(&tmp, &bytes) {
+        let written = std::fs::File::create(&tmp).and_then(|mut f| {
+            use std::io::Write;
+            f.write_all(&bytes)?;
+            f.sync_all()
+        });
+        if let Err(e) = written {
             let _ = std::fs::remove_file(&tmp);
             return Err(StoreError::Io(format!("write {}: {e}", tmp.display())));
         }

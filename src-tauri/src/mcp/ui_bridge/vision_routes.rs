@@ -2188,7 +2188,7 @@ pub(crate) const UNTRUSTED_VISION_BODY_LIMIT: usize = 2 * 1024 * 1024;
 /// answered 413 without reading the body; any other body — chunked, with no
 /// length — is read only until it passes the limit, and then answered 413.
 /// What was read is handed on unchanged. A trusted requester passes untouched.
-/// Mounted on those two routes only.
+/// Mounted on those two routes and on `POST /ui-bridge/vision/component-baseline`.
 async fn limit_untrusted_vision_body(
     request: axum::extract::Request,
     next: axum::middleware::Next,
@@ -4011,6 +4011,15 @@ async fn vision_baselines_list_handler(
 /// Timeout for fetching an in-situ capture from a remote target.
 const COMPONENT_CAPTURE_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How many in-situ captures one `vision/assert` fetches at once.
+const COMPONENT_CAPTURE_FETCH_CONCURRENCY: usize = 4;
+
+/// The most distinct components one `vision/assert` fetches an in-situ
+/// capture for. A component past the bound is not fetched: its source reads
+/// `over_limit` and its assertions answer `unknown{input_missing}`. Captures
+/// the request supplies in `componentCaptures` are not counted.
+pub(crate) const MAX_COMPONENT_CAPTURE_FETCHES: usize = 16;
+
 /// Where a `matches_isolated_render` assertion's in-situ capture came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -4022,6 +4031,12 @@ pub enum ComponentCaptureSource {
     /// Neither: the assertion answers `unknown{input_missing}`, and
     /// `captureError` says why.
     Absent,
+    /// Not fetched, because no baseline named for this component loaded: the
+    /// assertion answers `unknown{input_missing}` for the baseline anyway.
+    NotNeeded,
+    /// Not fetched: past [`MAX_COMPONENT_CAPTURE_FETCHES`] for one request. The
+    /// assertion answers `unknown{input_missing}`.
+    OverLimit,
 }
 
 /// What the named baseline resolved to.
@@ -4120,26 +4135,21 @@ fn load_component_baselines(
 }
 
 /// Read a `ComponentCapture` out of a capture route's answer: the SDK's
-/// `{success, data}` envelope, or the flat capture the runner's IPC layer
-/// returns. A `success:false` answer (the typed `component_capture_refused`
-/// refusal among them) is an error naming its reason.
+/// `{success, data}` envelope, or the flat capture the runner's IPC layer and
+/// a WebSocket wrapper return. The typed `component_capture_refused` refusal
+/// (either shape) and any other `success:false` answer are errors.
 fn capture_from_answer(
     answer: &serde_json::Value,
 ) -> Result<qontinui_vision_core::ComponentCapture, String> {
+    if let Some(refusal) = super::misc::capture_refusal(answer) {
+        return Err(refusal.describe());
+    }
     if answer.get("success").and_then(|v| v.as_bool()) == Some(false) {
-        let error = answer
+        return Err(answer
             .get("error")
             .and_then(|v| v.as_str())
-            .unwrap_or("capture failed");
-        let reason = answer
-            .get("data")
-            .and_then(|d| d.get("reason"))
-            .or_else(|| answer.get("reason"))
-            .and_then(|v| v.as_str());
-        return Err(match reason {
-            Some(r) => format!("{error}: {r}"),
-            None => error.to_string(),
-        });
+            .unwrap_or("capture failed")
+            .to_string());
     }
     let payload = match answer.get("data") {
         Some(d) if answer.get("success").is_some() => d,
@@ -4148,12 +4158,72 @@ fn capture_from_answer(
     serde_json::from_value(payload.clone()).map_err(|e| format!("capture did not parse: {e}"))
 }
 
-/// Fetch the in-situ capture of `component` from `target` (with the owning
-/// component's scrubbed props only when `props`): the runner's own
-/// webview over IPC when `target` is absent (the same frontend handler
-/// `GET /ui-bridge/control/component/{id}/capture` reaches), else the
-/// registered device's or app's UI Bridge capture route over HTTP — the same
-/// target resolution the frame source uses.
+/// Read at most `limit` bytes of `resp`'s body: a declared or streamed body
+/// past the limit is an error, never buffered whole.
+async fn read_body_capped(mut resp: reqwest::Response, limit: usize) -> Result<Vec<u8>, String> {
+    if resp.content_length().is_some_and(|len| len > limit as u64) {
+        return Err(format!("body is larger than {limit} bytes"));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| format!("read body: {e}"))? {
+        if body.len() + chunk.len() > limit {
+            return Err(format!("body is larger than {limit} bytes"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// Fetch the in-situ capture from a registered phone's UI Bridge server at
+/// `base_url`: signed when the phone requires pairing (the frame source's
+/// [`crate::mcp::sdk_http::probe_device_client`]), the body read up to
+/// [`VISION_FRAME_BODY_LIMIT`].
+async fn fetch_device_capture(
+    base_url: &str,
+    component: &str,
+    props: bool,
+) -> Result<qontinui_vision_core::ComponentCapture, String> {
+    let base = base_url.trim_end_matches('/');
+    let url = format!(
+        "{base}/ui-bridge{}",
+        super::misc::capture_path("component", component, props)
+    );
+    let http = reqwest::Client::builder()
+        .timeout(COMPONENT_CAPTURE_HTTP_TIMEOUT)
+        .connect_timeout(std::time::Duration::from_secs(3))
+        .build()
+        .map_err(|e| format!("build capture client: {e}"))?;
+    let client = crate::mcp::sdk_http::probe_device_client(base, http)
+        .await
+        .map_err(|e| format!("capture at {url}: {e}"))?;
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("capture request to {url}: {e}"))?;
+    let status = resp.status();
+    let bytes = read_body_capped(resp, VISION_FRAME_BODY_LIMIT)
+        .await
+        .map_err(|e| format!("capture {url} (HTTP {status}): {e}"))?;
+    let body: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("capture {url} answered HTTP {status} with a non-JSON body: {e}"))?;
+    capture_from_answer(&body).map_err(|e| format!("{url} (HTTP {status}): {e}"))
+}
+
+/// Fetch the in-situ capture of `component` (with the owning component's
+/// scrubbed props only when `props`) from where the request points:
+///
+/// - no `target`: the runner's own webview over IPC, the same frontend handler
+///   `GET /ui-bridge/control/component/{id}/capture` reaches;
+/// - a registered phone: its UI Bridge capture route, signed when it requires
+///   pairing ([`fetch_device_capture`]);
+/// - a live registered app: `getComponentCapture` through the app dispatcher,
+///   which picks the app's transport — an HTTP app's capture route, or a
+///   WebSocket wrapper's relay (a Storybook page under `ui-bridge-inject` has
+///   a page URL and no capture route of its own).
+///
+/// A typed `component_capture_refused` refusal on any of them is an error
+/// naming its reason, never a capture.
 async fn fetch_component_capture(
     state: &Arc<ApiState>,
     target: Option<&str>,
@@ -4169,66 +4239,147 @@ async fn fetch_component_capture(
         .await?;
         return capture_from_answer(&answer);
     };
-    let base_url = match state
+    if let Some(url) = state
         .physical_device_registry
         .get_active_proxy_url(target)
         .await
     {
-        Some(url) => url,
-        None => match state.app_registry.get_live(target).await {
-            Some(entry) => entry.app.url.clone(),
-            None => {
-                return Err(format!(
-                    "target '{target}' is neither a registered device nor a live app, so no \
-                     capture route was reachable"
-                ))
-            }
-        },
-    };
-    let url = format!(
-        "{}/ui-bridge/control/component/{}/capture{}",
-        base_url.trim_end_matches('/'),
-        urlencoding::encode(component),
-        if props { "?props=true" } else { "" }
-    );
-    let client = reqwest::Client::builder()
-        .timeout(COMPONENT_CAPTURE_HTTP_TIMEOUT)
-        .connect_timeout(std::time::Duration::from_secs(3))
-        .build()
-        .map_err(|e| format!("build capture client: {e}"))?;
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| format!("capture request to {url}: {e}"))?;
-    let status = resp.status();
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("capture {url} answered HTTP {status} with a non-JSON body: {e}"))?;
-    capture_from_answer(&body).map_err(|e| format!("{url} (HTTP {status}): {e}"))
+        return fetch_device_capture(&url, component, props).await;
+    }
+    if state.app_registry.get_live(target).await.is_none() {
+        return Err(format!(
+            "target '{target}' is neither a registered device nor a live app, so no \
+             capture route was reachable"
+        ));
+    }
+    match crate::mcp::sdk_client::dispatch_app_request_by_id_typed(
+        state,
+        target,
+        "getComponentCapture",
+        serde_json::json!({ "id": component, "props": props }),
+        reqwest::Method::GET,
+        &super::misc::capture_path("component", component, props),
+        None,
+    )
+    .await
+    {
+        Ok(answer) => capture_from_answer(&answer),
+        Err(e) => Err(match super::misc::capture_refusal_from_dispatch(&e) {
+            Some(refusal) => refusal.describe(),
+            None => format!(
+                "capture from app '{target}': {}",
+                crate::mcp::sdk_client::dispatch_err_message(&e)
+            ),
+        }),
+    }
+}
+
+/// Which components to fetch an in-situ capture for, and what every other
+/// component's capture source is. A component is fetched only when the request
+/// did not supply its capture, some baseline named for it loaded, and it is
+/// among the first [`MAX_COMPONENT_CAPTURE_FETCHES`] such components in
+/// request order.
+fn plan_capture_fetches(
+    pairs: &[(String, String)],
+    supplied: &std::collections::HashMap<String, qontinui_vision_core::ComponentCapture>,
+    baselines: &std::collections::HashMap<String, qontinui_vision_core::ComponentBaseline>,
+) -> (
+    Vec<String>,
+    std::collections::HashMap<String, (ComponentCaptureSource, Option<String>)>,
+) {
+    let mut fetch: Vec<String> = Vec::new();
+    let mut settled = std::collections::HashMap::new();
+    let mut components: Vec<&String> = Vec::new();
+    for (component, _) in pairs {
+        if !components.contains(&component) {
+            components.push(component);
+        }
+    }
+    for component in components {
+        if supplied.contains_key(component) {
+            settled.insert(component.clone(), (ComponentCaptureSource::Supplied, None));
+            continue;
+        }
+        let needed = pairs
+            .iter()
+            .any(|(c, b)| c == component && baselines.contains_key(b));
+        if !needed {
+            settled.insert(
+                component.clone(),
+                (
+                    ComponentCaptureSource::NotNeeded,
+                    Some("not fetched: no baseline named for this component loaded".to_string()),
+                ),
+            );
+        } else if fetch.len() >= MAX_COMPONENT_CAPTURE_FETCHES {
+            settled.insert(
+                component.clone(),
+                (
+                    ComponentCaptureSource::OverLimit,
+                    Some(format!(
+                        "not fetched: one request fetches at most \
+                         {MAX_COMPONENT_CAPTURE_FETCHES} component captures"
+                    )),
+                ),
+            );
+        } else {
+            fetch.push(component.clone());
+        }
+    }
+    (fetch, settled)
 }
 
 /// Resolve both inputs of every `matches_isolated_render` assertion: the
 /// named baselines from the durable store, and the in-situ captures from the
-/// request's `componentCaptures` or, for a component it does not carry, a
-/// fetch from the request's target.
+/// request's `componentCaptures` or, for a component it does not carry and
+/// that some loaded baseline needs, a fetch from the request's target
+/// ([`plan_capture_fetches`]; at most [`COMPONENT_CAPTURE_FETCH_CONCURRENCY`]
+/// at once).
 async fn gather_component_inputs(
     state: &Arc<ApiState>,
     assertions: &[qontinui_vision_core::Assertion],
     supplied: Option<std::collections::HashMap<String, qontinui_vision_core::ComponentCapture>>,
     target: Option<&str>,
-) -> (
+) -> GatheredComponentInputs {
+    gather_component_inputs_with(
+        state.vision_component_baselines.clone(),
+        assertions,
+        supplied,
+        move |component: String, props: bool| async move {
+            fetch_component_capture(state, target, &component, props).await
+        },
+    )
+    .await
+}
+
+/// What [`gather_component_inputs`] resolved: the loaded baselines, the
+/// in-situ captures, and one report per `(component, baseline)` pair. Both maps
+/// are `None` when the request has no `matches_isolated_render`.
+type GatheredComponentInputs = (
     Option<std::collections::HashMap<String, qontinui_vision_core::ComponentBaseline>>,
     Option<std::collections::HashMap<String, qontinui_vision_core::ComponentCapture>>,
     Vec<ComponentInputReport>,
-) {
+);
+
+/// [`gather_component_inputs`] over a store and a capture fetcher, so a test
+/// drives it with no `ApiState` and no network.
+async fn gather_component_inputs_with<F, Fut>(
+    store: Arc<super::component_baseline_store::ComponentBaselineStore>,
+    assertions: &[qontinui_vision_core::Assertion],
+    supplied: Option<std::collections::HashMap<String, qontinui_vision_core::ComponentCapture>>,
+    fetch: F,
+) -> GatheredComponentInputs
+where
+    F: Fn(String, bool) -> Fut,
+    Fut: std::future::Future<Output = Result<qontinui_vision_core::ComponentCapture, String>>,
+{
+    use futures::stream::StreamExt;
+
     let pairs = isolated_render_pairs(assertions);
     if pairs.is_empty() {
         return (None, None, Vec::new());
     }
     let wants_props = components_needing_props(assertions);
-    let store = state.vision_component_baselines.clone();
     let lookup_pairs = pairs.clone();
     let (baselines, baseline_status) =
         tokio::task::spawn_blocking(move || load_component_baselines(&store, &lookup_pairs))
@@ -4248,27 +4399,25 @@ async fn gather_component_inputs(
             });
 
     let mut captures = supplied.unwrap_or_default();
-    let mut capture_status: std::collections::HashMap<
-        String,
-        (ComponentCaptureSource, Option<String>),
-    > = std::collections::HashMap::new();
-    for (component, _) in &pairs {
-        if capture_status.contains_key(component) {
-            continue;
-        }
-        let s = if captures.contains_key(component) {
-            (ComponentCaptureSource::Supplied, None)
-        } else {
-            let props = wants_props.contains(component);
-            match fetch_component_capture(state, target, component, props).await {
-                Ok(c) => {
-                    captures.insert(component.clone(), c);
-                    (ComponentCaptureSource::Fetched, None)
-                }
-                Err(e) => (ComponentCaptureSource::Absent, Some(e)),
+    let (to_fetch, mut capture_status) = plan_capture_fetches(&pairs, &captures, &baselines);
+    let fetched: Vec<_> = futures::stream::iter(to_fetch)
+        .map(|component| {
+            let props = wants_props.contains(&component);
+            let fetching = fetch(component.clone(), props);
+            async move { (component, fetching.await) }
+        })
+        .buffer_unordered(COMPONENT_CAPTURE_FETCH_CONCURRENCY)
+        .collect()
+        .await;
+    for (component, result) in fetched {
+        let s = match result {
+            Ok(c) => {
+                captures.insert(component.clone(), c);
+                (ComponentCaptureSource::Fetched, None)
             }
+            Err(e) => (ComponentCaptureSource::Absent, Some(e)),
         };
-        capture_status.insert(component.clone(), s);
+        capture_status.insert(component, s);
     }
 
     let reports = pairs
@@ -4346,7 +4495,7 @@ fn component_store_error(
 /// durably under its name (replacing any earlier one). Read back by
 /// `matches_isolated_render` in `vision/assert`, and it survives a restart.
 async fn vision_component_baseline_store_handler(
-    State(state): State<Arc<ApiState>>,
+    State(baselines): State<super::component_baseline_store::ComponentBaselines>,
     UiBridgeJson(req): UiBridgeJson<ComponentBaselineRequest>,
 ) -> Result<
     Json<ApiResponse<super::component_baseline_store::ComponentBaselineSummary>>,
@@ -4359,7 +4508,7 @@ async fn vision_component_baseline_store_handler(
         captured_at: Some(chrono::Utc::now()),
         capture: req.capture,
     };
-    let store = state.vision_component_baselines.clone();
+    let store = baselines.0.clone();
     let summary = super::component_baseline_store::ComponentBaselineSummary::from(&baseline);
     tokio::task::spawn_blocking(move || store.put(&baseline))
         .await
@@ -4381,13 +4530,13 @@ async fn vision_component_baseline_store_handler(
 /// baseline whole. A query parameter, not a path segment, because names
 /// contain `/`. 404 when none is stored under the name.
 async fn vision_component_baseline_get_handler(
-    State(state): State<Arc<ApiState>>,
+    State(baselines): State<super::component_baseline_store::ComponentBaselines>,
     Query(q): Query<ComponentBaselineQuery>,
 ) -> Result<
     Json<ApiResponse<qontinui_vision_core::ComponentBaseline>>,
     (StatusCode, Json<ApiResponse<()>>),
 > {
-    let store = state.vision_component_baselines.clone();
+    let store = baselines.0.clone();
     let name = q.name.clone();
     let found = tokio::task::spawn_blocking(move || store.get(&name))
         .await
@@ -4413,12 +4562,12 @@ async fn vision_component_baseline_get_handler(
 /// `GET /ui-bridge/vision/component-baselines` — list the stored baselines
 /// (provenance only, no capture bodies) plus any file that could not be read.
 async fn vision_component_baselines_list_handler(
-    State(state): State<Arc<ApiState>>,
+    State(baselines): State<super::component_baseline_store::ComponentBaselines>,
 ) -> Result<
     Json<ApiResponse<super::component_baseline_store::ComponentBaselineListing>>,
     (StatusCode, Json<ApiResponse<()>>),
 > {
-    let store = state.vision_component_baselines.clone();
+    let store = baselines.0.clone();
     let listing = tokio::task::spawn_blocking(move || store.list())
         .await
         .map_err(|e| {
@@ -4455,9 +4604,13 @@ pub fn routes() -> Router<Arc<ApiState>> {
                 .layer(axum::middleware::from_fn(limit_untrusted_vision_body)),
         )
         .route("/ui-bridge/vision/baseline", post(vision_baseline_handler))
+        // A baseline carries a whole capture (up to the SDK's node cap), so it
+        // takes the assert route's limit, under the same untrusted cap.
         .route(
             "/ui-bridge/vision/component-baseline",
             post(vision_component_baseline_store_handler)
+                .layer(DefaultBodyLimit::max(VISION_FRAME_BODY_LIMIT))
+                .layer(axum::middleware::from_fn(limit_untrusted_vision_body))
                 .get(vision_component_baseline_get_handler),
         )
         .route(
@@ -6703,9 +6856,10 @@ mod text_hidden_tests {
         }
     }
 
-    /// Both frame-B routes mount the untrusted body limit, as the stand-in in
-    /// `through_the_body_limit` does — and no other vision route needs it,
-    /// since only these two raise the body limit.
+    /// The two frame-B routes and the component-baseline store mount the
+    /// untrusted body limit, as the stand-in in `through_the_body_limit` does —
+    /// and no other vision route needs it, since only these three raise the
+    /// body limit.
     #[test]
     fn both_vision_frame_routes_mount_the_untrusted_body_limit() {
         let src = include_str!("vision_routes.rs");
@@ -6713,6 +6867,7 @@ mod text_hidden_tests {
         for path in [
             "\"/ui-bridge/vision/analyze\"",
             "\"/ui-bridge/vision/assert\"",
+            "\"/ui-bridge/vision/component-baseline\"",
         ] {
             let (_, rest) = routes.split_once(path).expect(path);
             let (mount, _) = rest.split_once(".route(").unwrap_or((rest, ""));
@@ -6728,12 +6883,12 @@ mod text_hidden_tests {
         }
         assert_eq!(
             routes.matches("DefaultBodyLimit::max(").count(),
-            2,
+            3,
             "a route that raises the body limit needs the untrusted limit too: {routes}"
         );
         assert_eq!(
             routes.matches("limit_untrusted_vision_body").count(),
-            2,
+            3,
             "{routes}"
         );
     }
@@ -7248,18 +7403,18 @@ mod component_input_tests {
         let not_found = serde_json::json!({
             "success": false, "error": "component_capture_refused", "reason": "not_found"
         });
-        assert_eq!(
-            capture_refusal(&not_found),
-            Some(("not_found", StatusCode::NOT_FOUND))
-        );
+        let r = capture_refusal(&not_found).unwrap();
+        assert_eq!((r.reason, r.status), ("not_found", StatusCode::NOT_FOUND));
         let unmounted = serde_json::json!({
             "success": false, "error": "component_capture_refused",
-            "data": {"reason": "no_mounted_elements"}
+            "data": {"reason": "no_mounted_elements", "message": "nothing mounted"}
         });
+        let r = capture_refusal(&unmounted).unwrap();
         assert_eq!(
-            capture_refusal(&unmounted),
-            Some(("no_mounted_elements", StatusCode::UNPROCESSABLE_ENTITY))
+            (r.reason, r.status),
+            ("no_mounted_elements", StatusCode::UNPROCESSABLE_ENTITY)
         );
+        assert_eq!(r.message.as_deref(), Some("nothing mounted"));
         assert_eq!(
             capture_refusal(&serde_json::json!({"success": false, "error": "other"})),
             None
@@ -7268,5 +7423,284 @@ mod component_input_tests {
             capture_refusal(&serde_json::json!({"schemaVersion": 1})),
             None
         );
+    }
+
+    /// The relayed form a WebSocket wrapper answers with — the reason encoded
+    /// in the message — reads as the same refusal, inside an answer or as a
+    /// wrapper failure, and the envelope keeps `reason` at the top level.
+    #[test]
+    fn a_relayed_capture_refusal_is_a_refusal_not_a_capture() {
+        use super::super::misc::{capture_refusal, capture_refusal_from_dispatch};
+        use crate::mcp::app_dispatch::DispatchError;
+        use crate::mcp::command_relay::{CommandRelayError, WrapperFailure};
+
+        let inner = serde_json::json!({
+            "success": false,
+            "error": "component_capture_refused:not_found: no component 'x' is registered",
+            "reason": "not_found",
+            "code": "UB-ELEM-NOT-FOUND",
+        });
+        let r = capture_refusal(&inner).unwrap();
+        assert_eq!(r.status, StatusCode::NOT_FOUND);
+        assert_eq!(r.message.as_deref(), Some("no component 'x' is registered"));
+        assert!(capture_from_answer(&inner)
+            .unwrap_err()
+            .starts_with("component_capture_refused: not_found"));
+
+        let ws = DispatchError::WebSocket(CommandRelayError::WrapperError(WrapperFailure {
+            code: Some("HANDLER_ERROR".to_string()),
+            message: "component_capture_refused:no_mounted_elements: unmounted".to_string(),
+            retryable: None,
+        }));
+        let r = capture_refusal_from_dispatch(&ws).unwrap();
+        assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+        let body = r.body();
+        assert_eq!(body["error"], "component_capture_refused");
+        assert_eq!(body["reason"], "no_mounted_elements");
+        assert_eq!(body["code"], "UB-OBS-INPUT-MISSING");
+        assert_eq!(body["data"]["reason"], "no_mounted_elements");
+
+        // An HTTP app's answered refusal keeps only `error` as the message:
+        // the reason comes back from the SDK code, else the status.
+        let http = |code: Option<&str>, status: u16| DispatchError::AppAnswered {
+            url: "http://app/ui-bridge/control/component/x/capture".to_string(),
+            status,
+            error: "component_capture_refused".to_string(),
+            code: code.map(str::to_string),
+            retryable: None,
+        };
+        let by_code = capture_refusal_from_dispatch(&http(Some("UB-ELEM-NOT-FOUND"), 500)).unwrap();
+        assert_eq!(by_code.reason, "not_found");
+        let by_status = capture_refusal_from_dispatch(&http(None, 422)).unwrap();
+        assert_eq!(by_status.reason, "no_mounted_elements");
+        assert_eq!(capture_refusal_from_dispatch(&http(None, 500)), None);
+        assert_eq!(
+            capture_refusal_from_dispatch(&DispatchError::NotConnected),
+            None
+        );
+    }
+
+    /// The three component-baseline store handlers, mounted on their own state.
+    fn store_router(dir: &std::path::Path) -> axum::Router {
+        use super::super::component_baseline_store::ComponentBaselines;
+        axum::Router::new()
+            .route(
+                "/ui-bridge/vision/component-baseline",
+                axum::routing::post(vision_component_baseline_store_handler)
+                    .get(vision_component_baseline_get_handler),
+            )
+            .route(
+                "/ui-bridge/vision/component-baselines",
+                get(vision_component_baselines_list_handler),
+            )
+            .with_state(ComponentBaselines(Arc::new(
+                ComponentBaselineStore::under_vision_cache_root(dir),
+            )))
+    }
+
+    async fn call(
+        router: &axum::Router,
+        method: &str,
+        uri: &str,
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, serde_json::Value) {
+        use tower::ServiceExt;
+        let mut req = axum::http::Request::builder().method(method).uri(uri);
+        let body = match body {
+            Some(b) => {
+                req = req.header("content-type", "application/json");
+                axum::body::Body::from(b.to_string())
+            }
+            None => axum::body::Body::empty(),
+        };
+        let resp = router
+            .clone()
+            .oneshot(req.body(body).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    #[tokio::test]
+    async fn the_store_handlers_refuse_a_missing_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let router = store_router(tmp.path());
+        let cap = serde_json::to_value(capture(
+            rect(0.0, 0.0, 10.0, 10.0),
+            rect(0.0, 0.0, 10.0, 10.0),
+        ))
+        .unwrap();
+        let (status, _) = call(
+            &router,
+            "POST",
+            "/ui-bridge/vision/component-baseline",
+            Some(serde_json::json!({ "capture": cap })),
+        )
+        .await;
+        // A body missing a field is the envelope's shape error: 422, with the
+        // request's hints (`envelope_422`). A missing query name is a 400.
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let (status, _) = call(&router, "GET", "/ui-bridge/vision/component-baseline", None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn the_store_handlers_round_trip_and_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        let router = store_router(tmp.path());
+        let cap = serde_json::to_value(capture(
+            rect(0.0, 0.0, 10.0, 10.0),
+            rect(0.0, 0.0, 10.0, 10.0),
+        ))
+        .unwrap();
+        let (status, body) = call(
+            &router,
+            "POST",
+            "/ui-bridge/vision/component-baseline",
+            Some(serde_json::json!({
+                "name": NAME, "storyId": "DateRangePicker--default", "capture": cap
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["data"]["name"], NAME);
+
+        let uri = format!(
+            "/ui-bridge/vision/component-baseline?name={}",
+            urlencoding::encode(NAME)
+        );
+        let (status, body) = call(&router, "GET", &uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["data"]["name"], NAME);
+        assert_eq!(body["data"]["capture"]["schemaVersion"], 1);
+
+        let (status, _) = call(
+            &router,
+            "GET",
+            "/ui-bridge/vision/component-baseline?name=storybook%2Fnone%40x",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, body) = call(
+            &router,
+            "GET",
+            "/ui-bridge/vision/component-baselines",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let names: Vec<&str> = body["data"]["baselines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|b| b["name"].as_str())
+            .collect();
+        assert_eq!(names, vec![NAME]);
+    }
+
+    /// A fetcher that records each call and answers with `answer`.
+    fn recording_fetch(
+        calls: Arc<std::sync::Mutex<Vec<(String, bool)>>>,
+        answer: ComponentCapture,
+    ) -> impl Fn(
+        String,
+        bool,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ComponentCapture, String>> + Send>,
+    > {
+        move |component, props| {
+            calls.lock().unwrap().push((component, props));
+            let answer = answer.clone();
+            Box::pin(async move { Ok(answer) })
+        }
+    }
+
+    /// A supplied capture is used as-is, and a component whose baseline did
+    /// not load is never fetched: no network at all for either.
+    #[tokio::test]
+    async fn supplied_captures_and_missing_baselines_fetch_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(ComponentBaselineStore::under_vision_cache_root(tmp.path()));
+        let assertions: Vec<qontinui_vision_core::Assertion> =
+            serde_json::from_value(serde_json::json!([
+                {"type":"matches_isolated_render","component":COMPONENT,"baseline":NAME},
+                {"type":"matches_isolated_render","component":"other","baseline":"missing@x"}
+            ]))
+            .unwrap();
+        let page = rect(0.0, 0.0, 10.0, 10.0);
+        let supplied = HashMap::from([(COMPONENT.to_string(), capture(page, page))]);
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (baselines, captures, reports) = gather_component_inputs_with(
+            store,
+            &assertions,
+            Some(supplied),
+            recording_fetch(calls.clone(), capture(page, page)),
+        )
+        .await;
+        assert!(calls.lock().unwrap().is_empty(), "nothing may be fetched");
+        assert!(baselines.unwrap().is_empty());
+        assert!(captures.unwrap().contains_key(COMPONENT));
+        assert_eq!(reports.len(), 2);
+        assert_eq!(
+            reports[0].baseline_status,
+            ComponentBaselineStatus::NotRegistered
+        );
+        assert_eq!(reports[0].capture, ComponentCaptureSource::Supplied);
+        assert_eq!(reports[1].capture, ComponentCaptureSource::NotNeeded);
+        assert!(reports[1].capture_error.is_some());
+    }
+
+    /// Only components a loaded baseline needs are fetched, with props only
+    /// where an assertion compares them, and no more than the per-request cap.
+    #[tokio::test]
+    async fn fetches_are_needed_only_and_capped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ComponentBaselineStore::under_vision_cache_root(tmp.path());
+        let page = rect(0.0, 0.0, 10.0, 10.0);
+        store_baseline(&store, capture(page, page));
+        let n = MAX_COMPONENT_CAPTURE_FETCHES + 2;
+        let assertions: Vec<qontinui_vision_core::Assertion> = (0..n)
+            .map(|i| {
+                serde_json::from_value(serde_json::json!({
+                    "type": "matches_isolated_render",
+                    "component": format!("c{i}"),
+                    "baseline": NAME,
+                    "compare_props": i == 0,
+                }))
+                .unwrap()
+            })
+            .collect();
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (_, captures, reports) = gather_component_inputs_with(
+            Arc::new(store),
+            &assertions,
+            None,
+            recording_fetch(calls.clone(), capture(page, page)),
+        )
+        .await;
+        let calls = calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), MAX_COMPONENT_CAPTURE_FETCHES);
+        assert!(calls.contains(&("c0".to_string(), true)));
+        assert!(calls.contains(&("c1".to_string(), false)));
+        assert_eq!(captures.unwrap().len(), MAX_COMPONENT_CAPTURE_FETCHES);
+        let over: Vec<&str> = reports
+            .iter()
+            .filter(|r| r.capture == ComponentCaptureSource::OverLimit)
+            .map(|r| r.component.as_str())
+            .collect();
+        assert_eq!(over.len(), 2, "{reports:?}");
+        assert!(reports
+            .iter()
+            .take(MAX_COMPONENT_CAPTURE_FETCHES)
+            .all(|r| r.capture == ComponentCaptureSource::Fetched));
     }
 }
