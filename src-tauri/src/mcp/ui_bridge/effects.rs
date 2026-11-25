@@ -50,8 +50,11 @@ use std::sync::Arc;
 use crate::mcp::sdk_client::sdk_request;
 use crate::mcp::types::ApiState;
 
-use super::elements::try_ws_dispatch_for_app;
-use super::request::ui_bridge_request_sync;
+use super::elements::{
+    component_target_window, split_component_target_window, try_ws_dispatch_for_app,
+    ComponentActionQueryParams,
+};
+use super::request::{target_window_payload, ui_bridge_request_sync};
 
 /// Query parameters for `GET /ui-bridge/effects/recent`.
 #[derive(Debug, Deserialize)]
@@ -119,16 +122,20 @@ fn build_sdk_path(limit: Option<i64>) -> String {
 pub async fn ui_bridge_predict_component_action_handler(
     State(state): State<Arc<ApiState>>,
     Path((id, action_id)): Path<(String, String)>,
+    Query(query): Query<ComponentActionQueryParams>,
     body: Bytes,
 ) -> Json<serde_json::Value> {
-    let raw_body = parse_predict_body(&body);
-    let ipc_request = normalize_predict_body(&raw_body);
-    let ipc_payload = serde_json::json!({
-        "componentId": id,
-        "actionId": action_id,
-        "request": ipc_request,
-    });
+    let ipc_payload = predict_ipc_payload(
+        &id,
+        &action_id,
+        parse_predict_body(&body),
+        query.window_label,
+    );
 
+    // As on the invocation route, the WS fast path reaches an EXTERNAL SDK
+    // app, never a runner window, so it gets the payload without the target
+    // window — identical to what it received before per-window routing.
+    let (_, ws_payload) = split_component_target_window(ipc_payload.clone());
     let ws_path = build_predict_sdk_path(&id, &action_id);
     if let Some(ws_outcome) = try_ws_dispatch_for_app(
         &state.app_registry,
@@ -137,7 +144,7 @@ pub async fn ui_bridge_predict_component_action_handler(
         "predictComponentAction",
         Method::POST,
         &ws_path,
-        ipc_payload.clone(),
+        ws_payload,
     )
     .await
     {
@@ -151,6 +158,27 @@ pub async fn ui_bridge_predict_component_action_handler(
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
     }
+}
+
+/// Build the predict IPC payload: `{componentId, actionId, request}` plus the
+/// target window, taken from the `?windowLabel=` query only, as on the
+/// invocation route ([`component_target_window`]): a body `windowLabel` is a
+/// param the predictor may read (`predictMoveTerminal`), never a route.
+fn predict_ipc_payload(
+    id: &str,
+    action_id: &str,
+    raw_body: serde_json::Value,
+    query_label: Option<String>,
+) -> serde_json::Value {
+    let window_label = component_target_window(query_label);
+    target_window_payload(
+        serde_json::json!({
+            "componentId": id,
+            "actionId": action_id,
+            "request": normalize_predict_body(&raw_body),
+        }),
+        window_label.as_deref(),
+    )
 }
 
 /// Build the SDK-side predict path for a component action.
@@ -385,5 +413,42 @@ mod tests {
     fn build_sdk_path_forwards_limit() {
         assert_eq!(build_sdk_path(Some(25)), "/effects/recent?limit=25");
         assert_eq!(build_sdk_path(None), "/effects/recent");
+    }
+
+    #[test]
+    fn predict_payload_honours_window_label_like_the_invocation_route() {
+        // Absent: byte-identical to the pre-routing payload.
+        let p = predict_ipc_payload("c", "a", serde_json::json!({"x": 1}), None);
+        assert_eq!(
+            p,
+            serde_json::json!({"componentId":"c","actionId":"a","request":{"params":{"x":1}}})
+        );
+        // A body `windowLabel` is a param (predictMoveTerminal reads it), not
+        // a route.
+        let p = predict_ipc_payload(
+            "c",
+            "a",
+            serde_json::json!({"windowLabel": "term-1", "x": 1}),
+            None,
+        );
+        assert!(p.get("windowLabel").is_none(), "{p}");
+        assert_eq!(
+            p["request"],
+            serde_json::json!({"params": {"windowLabel": "term-1", "x": 1}})
+        );
+        // The query routes, and the body param still reaches the predictor.
+        let p = predict_ipc_payload(
+            "c",
+            "a",
+            serde_json::json!({"windowLabel": "main"}),
+            Some("term-query".into()),
+        );
+        assert_eq!(p["windowLabel"], "term-query");
+        assert_eq!(
+            p["request"],
+            serde_json::json!({"params": {"windowLabel": "main"}})
+        );
+        let p = predict_ipc_payload("c", "a", serde_json::json!({}), Some(String::new()));
+        assert!(p.get("windowLabel").is_none(), "{p}");
     }
 }

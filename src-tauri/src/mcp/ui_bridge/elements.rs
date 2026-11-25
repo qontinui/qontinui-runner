@@ -2728,14 +2728,18 @@ pub async fn ui_bridge_get_component_handler(
 pub async fn ui_bridge_execute_component_action_handler(
     State(state): State<Arc<ApiState>>,
     Path((id, action_id)): Path<(String, String)>,
+    Query(query): Query<ComponentActionQueryParams>,
     request: UiBridgeJson<UIBridgeComponentActionRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     // Which app the action landed on — a WS wrapper registered under the
     // component id, else the runner's own webview — as the dispatch itself
-    // routed it, not from a second registry read that could disagree.
-    let (app_id, result) = component_action_dispatch(
+    // routed it, not from a second registry read that could disagree. The
+    // window scope is the pop-out window the IPC arm targeted (None for
+    // `main` and for the WS arm), read off the payload the dispatch sent.
+    let (app_id, window_scope, result) = component_action_dispatch(
         State(Arc::clone(&state)),
         Path((id.clone(), action_id.clone())),
+        query.window_label,
         request,
     )
     .await;
@@ -2743,10 +2747,11 @@ pub async fn ui_bridge_execute_component_action_handler(
     // `ChokePoint::ComponentAction`, the same kind as the SDK component action
     // (`sdk_client::record_sdk_component_action`): the choke point names the
     // ACTION KIND, so the SDK/control transport distinction is NOT recorded.
+    // The cursor scope is the targeted window, as `execute_action` records it.
     if let Some(failed) = crate::journey::capture::control_action_verdict(&result) {
         crate::journey::capture::record_action(
             state.app_state.pg_db.clone(),
-            crate::journey::cursor::CursorKey::new(app_id, None),
+            crate::journey::cursor::CursorKey::new(app_id, window_scope.as_deref()),
             crate::journey::cursor::ActionSpec::component(&id, &action_id),
             crate::journey::cursor::Provenance::default(),
             failed,
@@ -2755,32 +2760,94 @@ pub async fn ui_bridge_execute_component_action_handler(
     result
 }
 
+/// Optional query parameters for the component-action route (and its
+/// sibling predict route in `effects.rs`).
+#[derive(Debug, Deserialize, Default)]
+pub struct ComponentActionQueryParams {
+    /// Optional `?windowLabel=term-1` — run the component action in a pop-out
+    /// runner window (discoverable via `GET /ui-bridge/control/runner-windows`
+    /// or the `list-runner-windows` component action). Omitted, empty, or
+    /// `main` → the main window, byte-identical to the single-window request.
+    #[serde(default, rename = "windowLabel")]
+    pub window_label: Option<String>,
+}
+
+/// Resolve the target window of a component-action-shaped request from the
+/// `?windowLabel=` QUERY only (empty = absent).
+///
+/// Unlike `execute_action`, the body is never read for routing: a component
+/// action's flat body keys ARE its params (`merged_params()`), and an action
+/// may declare `windowLabel` as its own param — `move-terminal-to-window` does
+/// (`TerminalPage.tsx`). Taking a body `windowLabel` for routing would strip
+/// that param and send the call to the wrong window.
+pub(crate) fn component_target_window(query_label: Option<String>) -> Option<String> {
+    query_label.filter(|s| !s.is_empty())
+}
+
+/// Build the IPC payload of a component action: `{componentId, actionId,
+/// params}` plus the target window (via
+/// [`super::request::target_window_payload`], which `ui_bridge_request_sync`
+/// splits back off to route the emit). Pure, so the routing is unit-tested
+/// without a Tauri app.
+pub(crate) fn component_action_ipc_payload(
+    id: &str,
+    action_id: &str,
+    request: UIBridgeComponentActionRequest,
+    query_label: Option<String>,
+) -> serde_json::Value {
+    let window_label = component_target_window(query_label);
+    // Accept both `{"params":{...}}` and the bare `{"layoutId":"single"}`
+    // shape the action's `paramSchema` advertises — merged_params() folds any
+    // flat top-level keys into params (element-action route parity).
+    let merged_params = request.merged_params();
+    super::request::target_window_payload(
+        serde_json::json!({
+            "componentId": id,
+            "actionId": action_id,
+            "params": merged_params
+        }),
+        window_label.as_deref(),
+    )
+}
+
+/// Split the target window back off an IPC payload built by
+/// [`component_action_ipc_payload`]: `(window, payload without it)`. `None`
+/// means the main window.
+pub(crate) fn split_component_target_window(
+    mut payload: serde_json::Value,
+) -> (Option<String>, serde_json::Value) {
+    let label = payload
+        .as_object_mut()
+        .and_then(|o| o.remove(super::request::TARGET_WINDOW_FIELD))
+        .and_then(|v| v.as_str().map(String::from));
+    (label, payload)
+}
+
 type ComponentActionResult =
     Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)>;
 
 /// The body of [`ui_bridge_execute_component_action_handler`], split out so
 /// the journey capture sees every exit in one place. Returns the app the
-/// action was routed to beside its result.
+/// action was routed to and the pop-out window it targeted beside its result.
 async fn component_action_dispatch(
     State(state): State<Arc<ApiState>>,
     Path((id, action_id)): Path<(String, String)>,
+    query_label: Option<String>,
     UiBridgeJson(request): UiBridgeJson<UIBridgeComponentActionRequest>,
-) -> (String, ComponentActionResult) {
+) -> (String, Option<String>, ComponentActionResult) {
     info!(
         "UI Bridge API: Executing action {} on component {}",
         action_id, id
     );
 
-    // Accept both `{"params":{...}}` and the bare `{"layoutId":"single"}`
-    // shape the action's `paramSchema` advertises — merged_params() folds any
-    // flat top-level keys into params (element-action route parity).
-    let merged_params = request.merged_params();
-    let payload = serde_json::json!({
-        "componentId": id,
-        "actionId": action_id,
-        "params": merged_params
-    });
+    let payload = component_action_ipc_payload(&id, &action_id, request, query_label);
 
+    // The WS fast path is deliberately left window-agnostic: it reaches an
+    // EXTERNAL SDK app registered over WS under this component id, never one
+    // of this runner's own webview windows, so a `windowLabel` means nothing
+    // there. It gets the payload WITHOUT the target-window field — identical
+    // to what it received before per-window routing existed.
+    let (window_scope, ws_payload) = split_component_target_window(payload.clone());
     let ws_path = format!("/ui-bridge/control/component/{}/action/{}", id, action_id);
     if let Some(ws_outcome) = try_ws_dispatch_for_app(
         &state.app_registry,
@@ -2789,7 +2856,7 @@ async fn component_action_dispatch(
         "executeComponentAction",
         Method::POST,
         &ws_path,
-        payload.clone(),
+        ws_payload,
     )
     .await
     {
@@ -2797,10 +2864,11 @@ async fn component_action_dispatch(
             Ok(value) => Ok(Json(ApiResponse::success(value))),
             Err(e) => Err(ws_dispatch_error_response(e)),
         };
-        return (id, result);
+        return (id, None, result);
     }
     (
         crate::spec_api::storage::RUNNER_APP_ID.to_string(),
+        window_scope,
         component_action_ipc(&state, &id, &action_id, payload).await,
     )
 }
@@ -7799,5 +7867,116 @@ mod read_value_payload_tests {
         let p = read_value_ipc_payload(&json!({"selector":"#a"}));
         assert_eq!(p["windowLabel"], "");
         assert_eq!(p["params"], json!({"selector":"#a"}));
+    }
+}
+
+#[cfg(test)]
+mod component_action_window_tests {
+    //! The component-action route honours `windowLabel` (plan
+    //! 2026-11-23-runner-terminal-page-popout-ui-bridge-and-resync-lag, D2).
+    use super::{component_action_ipc_payload, split_component_target_window};
+    use crate::mcp::ui_bridge::types::UIBridgeComponentActionRequest;
+    use serde_json::json;
+
+    fn req(body: serde_json::Value) -> UIBridgeComponentActionRequest {
+        serde_json::from_value(body).expect("deserialize")
+    }
+
+    #[test]
+    fn absent_label_targets_main_byte_identically() {
+        let p = component_action_ipc_payload("terminal-page", "get-x", req(json!({})), None);
+        assert_eq!(
+            p,
+            json!({"componentId":"terminal-page","actionId":"get-x","params":null})
+        );
+    }
+
+    #[test]
+    fn label_from_the_query_reaches_the_payload() {
+        let p = component_action_ipc_payload(
+            "terminal-page",
+            "get-x",
+            req(json!({"pageId":"p1"})),
+            Some("term-2".into()),
+        );
+        assert_eq!(p["windowLabel"], "term-2");
+        assert_eq!(p["params"], json!({"pageId":"p1"}));
+    }
+
+    #[test]
+    fn a_body_window_label_is_a_param_not_a_route() {
+        // `move-terminal-to-window` declares `windowLabel` as its own flat
+        // param: it must reach the handler in main, not reroute the call.
+        let p = component_action_ipc_payload(
+            "terminal-page",
+            "move-terminal-to-window",
+            req(json!({"terminalId":"t1","windowLabel":"term-2"})),
+            None,
+        );
+        assert!(p.get("windowLabel").is_none(), "{p}");
+        assert_eq!(
+            p["params"],
+            json!({"terminalId":"t1","windowLabel":"term-2"})
+        );
+    }
+
+    #[test]
+    fn query_routes_while_a_body_window_label_stays_a_param() {
+        let p = component_action_ipc_payload(
+            "terminal-page",
+            "move-terminal-to-window",
+            req(json!({"terminalId":"t1","windowLabel":"main"})),
+            Some("term-2".into()),
+        );
+        assert_eq!(p["windowLabel"], "term-2");
+        assert_eq!(p["params"], json!({"terminalId":"t1","windowLabel":"main"}));
+    }
+
+    #[test]
+    fn an_empty_query_label_is_absent() {
+        let p = component_action_ipc_payload("c", "a", req(json!({})), Some(String::new()));
+        assert!(p.get("windowLabel").is_none(), "{p}");
+        assert_eq!(p["params"], json!(null));
+    }
+
+    #[test]
+    fn main_label_is_the_default_payload() {
+        let p = component_action_ipc_payload("c", "a", req(json!({})), Some("main".into()));
+        assert!(p.get("windowLabel").is_none(), "{p}");
+    }
+
+    /// The HTTP entry seam: `?windowLabel=` (camelCase, via the serde rename)
+    /// must deserialize into `window_label`, or every pop-out-targeted call
+    /// would silently run in main with every builder test still green.
+    #[test]
+    fn the_window_label_query_param_deserializes() {
+        use super::ComponentActionQueryParams;
+        use axum::extract::Query;
+        let parse = |uri: &str| {
+            Query::<ComponentActionQueryParams>::try_from_uri(&uri.parse().unwrap())
+                .expect("query parses")
+                .0
+                .window_label
+        };
+        assert_eq!(parse("/x?windowLabel=term-2").as_deref(), Some("term-2"));
+        assert_eq!(parse("/x").as_deref(), None);
+        // The snake_case spelling is not the wire name.
+        assert_eq!(parse("/x?window_label=term-2").as_deref(), None);
+    }
+
+    #[test]
+    fn split_hands_the_ws_arm_the_payload_without_the_window() {
+        let p = component_action_ipc_payload(
+            "c",
+            "a",
+            req(json!({"params":{"x":1}})),
+            Some("term-1".into()),
+        );
+        let (label, ws) = split_component_target_window(p);
+        assert_eq!(label.as_deref(), Some("term-1"));
+        assert_eq!(
+            ws,
+            json!({"componentId":"c","actionId":"a","params":{"x":1}})
+        );
     }
 }

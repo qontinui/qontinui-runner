@@ -512,7 +512,7 @@
           "source": "migrated",
           "target": {
             "criteria": {
-              "accessibleName": "Close page"
+              "title": "Close page"
             },
             "label": "Required element for Multiple Terminal Pages",
             "type": "search"
@@ -1368,7 +1368,7 @@
             "role": "button"
           },
           {
-            "accessibleName": "Close page"
+            "title": "Close page"
           },
           {
             "textContains": "Loading terminals"

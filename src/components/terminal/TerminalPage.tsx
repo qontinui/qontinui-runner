@@ -48,6 +48,8 @@ import { UnzonedChip } from "./UnzonedChip";
 import { HiddenWorkersChip } from "./HiddenWorkersChip";
 import { computeQuickLaunchLayoutId } from "./useZoneLayout";
 import { buildCreatePlainTerminalAction } from "./createPlainTerminalAction";
+import { buildRosterResyncStatsAction } from "./rosterResyncAction";
+import { readWindowLabel } from "@/lib/windowLabel";
 import {
   planMaximizeZone,
   planToggleMaximizeZone,
@@ -603,6 +605,10 @@ function TerminalPageInner({
         signature: LIST_RUNNER_WINDOWS_SIGNATURE,
         handler: async () => invoke("list_runner_windows"),
       },
+      // How this window's cross-window roster resyncs ended (D3 of plan
+      // 2026-11-23-runner-terminal-page-popout-ui-bridge-and-resync-lag).
+      // Read from a pop-out with `?windowLabel=term-N`.
+      buildRosterResyncStatsAction(readWindowLabel),
       // P2 (orphan sweep) — operator-initiated cleanup of empty pop-out windows
       // (no live tab). Reuses the same backend sweep the boot-restore path uses.
       // Returns the labels swept.
