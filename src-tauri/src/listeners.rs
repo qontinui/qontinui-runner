@@ -694,12 +694,13 @@ impl LivezVerdict {
 
     /// Whether a runner MAY be there: everything except a failed connect,
     /// bytes that are not HTTP, and a complete status line with a code no
-    /// runner sends. A caller that DESTROYS something on a "dead" verdict (a sibling's credential file, its registration)
-    /// uses this, so a live runner that was merely slow ([`Self::Silent`]) is
-    /// never taken for dead — a false "dead" there costs a live sibling its
-    /// credentials, while a false "alive" keeps a leftover for as long as the
-    /// port stays silent (bounded in practice by whatever holds the port: a
-    /// socket unit activates its runner on the probe's own connect).
+    /// runner sends. A caller that DESTROYS something on a "dead" verdict (a
+    /// sibling's credential file, its registration) uses this, so a live
+    /// runner that was merely slow ([`Self::Silent`]) is never taken for
+    /// dead. A false "dead" there costs a live sibling its credentials, while
+    /// a false "alive" keeps a leftover for as long as the port stays silent
+    /// (bounded in practice by whatever holds the port: a socket unit
+    /// activates its runner on the probe's own connect).
     pub fn may_be_alive(self) -> bool {
         matches!(self, Self::Live | Self::Booting | Self::Silent)
     }
