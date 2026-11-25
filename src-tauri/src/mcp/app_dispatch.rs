@@ -394,11 +394,10 @@ impl AppDispatcher {
         let payload = payload.for_transport(entry.transport);
 
         match entry.transport {
-            AppTransport::Websocket => {
-                self.websocket_arm(app_id, action, &entry, None, payload)
-                    .await
-                    .map(Dispatched::Websocket)
-            }
+            AppTransport::Websocket => self
+                .websocket_arm(app_id, action, &entry, None, payload)
+                .await
+                .map(Dispatched::Websocket),
             AppTransport::Http => {
                 let base = entry.app.url.trim_end_matches('/');
                 let base_path = entry.app.base_path.trim_end_matches('/');

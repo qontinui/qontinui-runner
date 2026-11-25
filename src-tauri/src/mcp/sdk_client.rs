@@ -26,7 +26,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-use super::app_dispatch::{ws_result_envelope, AppDispatcher, ArmPayloads, DispatchError, Dispatched};
+use super::app_dispatch::{
+    ws_result_envelope, AppDispatcher, ArmPayloads, DispatchError, Dispatched,
+};
 use super::app_registry::AppTransport;
 use super::types::{ApiResponse, ApiState};
 use super::ui_bridge::ui_bridge_request_sync;
@@ -2629,12 +2631,8 @@ async fn handle_element_action(
         .await
         {
             Ok(data) => {
-                // Normalised at THIS boundary: the app's JSON is forwarded to the
-                // caller and logged below, so a body with no boolean `success` (a
-                // relay frame whose `result` was absent arrives as `null`) is
-                // rewritten to an explicit `success: false` + `INDETERMINATE:`
-                // error instead of reading as success here and at every
-                // permissive consumer downstream.
+                // The answer is forwarded to the caller and logged below, so it
+                // is read strictly: see `ws_element_action_result`.
                 let (data, success, err) = ws_element_action_result(data);
                 (Json(data), success, err)
             }
@@ -11131,10 +11129,7 @@ mod text_visibility_dispatch_tests {
     async fn ws_pass_through_route_answers_top_level_success() {
         let mut t = ws_target().await;
         let summary = json!({"title": "Home", "elementCount": 3});
-        let (dispatcher, connection) = (
-            Arc::clone(&t.dispatcher),
-            Arc::clone(&t.connection),
-        );
+        let (dispatcher, connection) = (Arc::clone(&t.dispatcher), Arc::clone(&t.connection));
         let pending = tokio::spawn(async move {
             super::dispatch_app_request_typed_with(
                 &connection,
@@ -11164,10 +11159,7 @@ mod text_visibility_dispatch_tests {
     async fn ws_ai_find_result_reaches_handle_ai_find_with_success() {
         let mut t = ws_target().await;
         let found = json!({"found": true, "element": {"id": "save"}, "confidence": 0.9});
-        let (dispatcher, connection) = (
-            Arc::clone(&t.dispatcher),
-            Arc::clone(&t.connection),
-        );
+        let (dispatcher, connection) = (Arc::clone(&t.dispatcher), Arc::clone(&t.connection));
         let pending = tokio::spawn(async move {
             super::dispatch_app_request_typed_with(
                 &connection,
@@ -11192,14 +11184,21 @@ mod text_visibility_dispatch_tests {
             .split("\nasync fn ")
             .next()
             .unwrap_or_default();
+        // The dispatch arm only: from the dispatch call to its first `Err(`
+        // arm, so the IPC fallback's own `Ok(data) => Json(data)` further
+        // down cannot satisfy the pin.
+        let dispatch_arm = body
+            .split_once("dispatch_app_request_typed(")
+            .expect("handle_ai_find must dispatch through the read envelope")
+            .1
+            .split("Err(")
+            .next()
+            .unwrap_or_default();
         assert!(
-            body.contains("dispatch_app_request_typed("),
-            "handle_ai_find must dispatch through the read envelope"
-        );
-        assert!(
-            body.contains("Ok(data) => Json(data)")
-                || body.contains("Ok(data) => Json(ai_read_envelope(\"ai/find\", data))"),
-            "handle_ai_find must forward the enveloped answer: {body}"
+            dispatch_arm.contains("Ok(data) => Json(data)")
+                // The shape peer PR #2396's `ai_read_envelope` gives this arm.
+                || dispatch_arm.contains("Ok(data) => Json(ai_read_envelope(\"ai/find\", data))"),
+            "handle_ai_find must forward the enveloped answer: {dispatch_arm}"
         );
     }
 
@@ -11237,10 +11236,7 @@ mod text_visibility_dispatch_tests {
         use crate::mcp::ui_bridge::request::INDETERMINATE_ACTION_ERROR;
         for result in [None, Some(json!({"elementId": "save"}))] {
             let mut t = ws_target().await;
-            let (dispatcher, connection) = (
-                Arc::clone(&t.dispatcher),
-                Arc::clone(&t.connection),
-            );
+            let (dispatcher, connection) = (Arc::clone(&t.dispatcher), Arc::clone(&t.connection));
             let pending = tokio::spawn(async move {
                 super::dispatch_app_request_action_typed_with(
                     &connection,
@@ -11275,10 +11271,7 @@ mod text_visibility_dispatch_tests {
             (json!({"success": false, "error": "disabled"}), false),
         ] {
             let mut t = ws_target().await;
-            let (dispatcher, connection) = (
-                Arc::clone(&t.dispatcher),
-                Arc::clone(&t.connection),
-            );
+            let (dispatcher, connection) = (Arc::clone(&t.dispatcher), Arc::clone(&t.connection));
             let pending = tokio::spawn(async move {
                 super::dispatch_app_request_action_typed_with(
                     &connection,
