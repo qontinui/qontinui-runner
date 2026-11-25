@@ -2896,6 +2896,13 @@ pub(crate) fn admit_spawn(
                 what = %what,
                 "resource_guard: refusing to spawn past the session critical limit"
             );
+            crate::pressure_stop::record_observation(
+                crate::pressure_stop::StopKind::RefusedSpawn,
+                "critical",
+                crate::pressure_stop::WhatClass::from_spawn_noun(what),
+                &observation,
+                serde_json::Value::Null,
+            );
             Err(critical_refusal(what, &observation))
         }
     }
@@ -2954,6 +2961,13 @@ pub(crate) fn precheck_spawn(what: &str, resource_override: bool) -> Result<(), 
                 what = %what,
                 "resource_guard: refusing a {what} before its worktree/claim acquisition \
                  (pre-check; the spawn seam would refuse it too)"
+            );
+            crate::pressure_stop::record_observation(
+                crate::pressure_stop::StopKind::RefusedSpawn,
+                "critical",
+                crate::pressure_stop::WhatClass::from_spawn_noun(what),
+                &observation,
+                serde_json::Value::Null,
             );
             Err(critical_refusal(what, &observation))
         }

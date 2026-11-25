@@ -264,6 +264,11 @@ mod repo_detection;
 /// (`terminal::session`) and the secondary runner process (`instance_manager`) —
 /// sit in different subtrees.
 mod resource_guard;
+/// The durable record of every resource-guard refusal or deferral, posted to
+/// coord with the box's stats (plan
+/// `2026-11-24-pressure-stops-record-box-stats-in-coord`, Phase 3). Beside
+/// `resource_guard` because every hook site is a guard verdict.
+mod pressure_stop;
 mod restate;
 mod rework;
 mod routing;

@@ -118,6 +118,12 @@ export interface SessionGuardSettingsValue {
  */
 interface SessionGuardResponse extends SessionGuardSettingsValue {
   thread_ceilings?: ThreadCeilingsReport | null;
+  /**
+   * `Settings.report_pressure_stops` — a top-level setting shown here because
+   * it reports this guard's refusals to coord. `null` = the runner could not
+   * read its settings file (UNKNOWN); absent = a runner build without it.
+   */
+  report_pressure_stops?: boolean | null;
 }
 
 /** Wire shape of `settings::CiNodeSettings`. */
@@ -179,6 +185,9 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
     critical: number | null;
   }>({ warn: null, critical: null });
   const [guardEnabled, setGuardEnabled] = useState(DEFAULT_SESSION_GUARD.enabled);
+  // `null` until the runner answers, and after an unreadable answer: UNKNOWN
+  // is rendered as such and never saved back as a guessed default.
+  const [reportStops, setReportStops] = useState<boolean | null>(null);
 
   const [ciNode, setCiNode] = useState<CiNodeSettingsValue>(DEFAULT_CI_NODE);
   const [hostSuggestion, setHostSuggestion] = useState<CiNodeHostSuggestion | null>(null);
@@ -210,7 +219,8 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
         if (guardResult?.success && guardResult.data) {
           // `thread_ceilings` is the runner's read-only report, not a setting:
           // split it off so it never rides into saved state.
-          const { thread_ceilings, ...persisted } = guardResult.data;
+          const { thread_ceilings, report_pressure_stops, ...persisted } = guardResult.data;
+          setReportStops(report_pressure_stops ?? null);
           const g = { ...DEFAULT_SESSION_GUARD, ...persisted };
           setWarnGib(bytesToGib(g.warn_free_commit_bytes));
           setCriticalGib(bytesToGib(g.critical_free_commit_bytes));
@@ -305,7 +315,8 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
         onLog("warning", "Could not re-read the enforced thread ceilings after saving");
         return;
       }
-      const { thread_ceilings, ...persisted } = result.data;
+      const { thread_ceilings, report_pressure_stops, ...persisted } = result.data;
+      setReportStops(report_pressure_stops ?? null);
       // An unset override is an ABSENT key on the wire (the runner never writes
       // `null`, which older builds cannot parse), so normalise it here.
       const warn = persisted.warn_thread_count ?? null;
@@ -351,6 +362,8 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
         criticalFreeCommitBytes: gibToBytes(criticalGib),
         warnThreadCount: pendingWarnThreads,
         criticalThreadCount: pendingCriticalThreads,
+        // Omitted while UNKNOWN, which leaves the stored value alone.
+        reportPressureStops: reportStops ?? undefined,
       });
       if (!guardResult?.success) {
         throw new Error(guardResult?.message || "Unknown error saving session-guard settings");
@@ -470,6 +483,31 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
             checked={guardEnabled}
             onChange={setGuardEnabled}
           />
+        </div>
+
+        <div className="flex items-center justify-between">
+          <div>
+            <h4 className="font-medium text-sm">Report stops to coord</h4>
+            <p className="text-xs text-muted-foreground">
+              Each refusal or deferral is recorded in coord with this box&apos;s session count, CI
+              occupancy and limits at that moment. Numbers and fixed labels only — no paths,
+              commands or prompts.
+            </p>
+          </div>
+          {reportStops === null ? (
+            <span
+              className="text-xs text-muted-foreground"
+              data-ui-bridge-id="settings.resource-guard-report-stops-unknown"
+            >
+              unknown
+            </span>
+          ) : (
+            <ToggleSwitch
+              data-ui-bridge-id="settings.resource-guard-report-stops"
+              checked={reportStops}
+              onChange={setReportStops}
+            />
+          )}
         </div>
 
         <div className="space-y-1.5">

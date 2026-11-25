@@ -3961,6 +3961,15 @@ pub struct Settings {
     /// `load_settings`) rather than silently flipping to the new default.
     #[serde(default = "default_session_metadata_sync_enabled")]
     pub session_metadata_sync_enabled: bool,
+    /// Report resource-guard refusals and deferrals to coord, with this box's
+    /// session count, CI occupancy and calibration at that instant (plan
+    /// `2026-11-24-pressure-stops-record-box-stats-in-coord`, Phase 3;
+    /// `crate::pressure_stop`). Default TRUE: the events carry fixed tokens and
+    /// numbers only (no paths, commands or prompts), so this is opt-out. Off
+    /// means nothing is queued. Read on the fleet republisher tick and on
+    /// save, so a change needs no restart.
+    #[serde(default = "default_report_pressure_stops")]
+    pub report_pressure_stops: bool,
     /// CI-node opt-in (plan `2026-07-15-runner-as-ci-node-migration`,
     /// Phase 0). Default fully off — see [`CiNodeSettings`]. Read-only at
     /// runtime (heartbeat + executor); no save path exists yet, so the
@@ -4166,6 +4175,10 @@ pub struct ApiSettings {
 }
 
 fn default_session_metadata_sync_enabled() -> bool {
+    true
+}
+
+fn default_report_pressure_stops() -> bool {
     true
 }
 
@@ -6935,6 +6948,24 @@ pub fn get_session_metadata_sync_enabled() -> bool {
 /// Persist the session metadata sync consent flag.
 pub fn save_session_metadata_sync_enabled(enabled: bool) -> Result<(), String> {
     update_settings(|settings| settings.session_metadata_sync_enabled = enabled)
+}
+
+/// `Settings.report_pressure_stops`, or `None` when the settings file could
+/// not be read authoritatively — UNKNOWN, so the caller keeps the value it
+/// last knew rather than reading a placeholder default as the operator's.
+pub fn get_report_pressure_stops() -> Option<bool> {
+    let loaded = load_settings_full();
+    loaded
+        .is_authoritative()
+        .then_some(loaded.settings.report_pressure_stops)
+}
+
+/// Persist `Settings.report_pressure_stops` and apply it to the running
+/// emitter at once.
+pub fn save_report_pressure_stops(enabled: bool) -> Result<(), String> {
+    update_settings(|settings| settings.report_pressure_stops = enabled)?;
+    crate::pressure_stop::set_enabled(enabled);
+    Ok(())
 }
 
 // ============================================================================
