@@ -94,12 +94,14 @@ pub fn inherited_markers_detail(markers: &[&str]) -> String {
 /// copies of the list — a recorded follow-up, plan-library edge
 /// `2ce2a5a6-da43-4585-a372-d533fb50b7e7`.
 pub fn claude_argv_chooses_session<S: AsRef<str>>(args: &[S]) -> bool {
-    let mut tokens = args
-        .iter()
-        .map(AsRef::as_ref)
-        .take_while(|a| *a != "--")
-        .peekable();
+    let mut tokens = args.iter().map(AsRef::as_ref).peekable();
     while let Some(a) = tokens.next() {
+        // `--` ends the options, so nothing after it is a session choice. A
+        // `--` that is an option's VALUE (`--name -- -c`) never reaches here:
+        // it is consumed below, as commander consumes it, and the scan goes on.
+        if a == "--" {
+            return false;
+        }
         let t = a.to_ascii_lowercase();
         if matches!(
             t.as_str(),
@@ -117,7 +119,8 @@ pub fn claude_argv_chooses_session<S: AsRef<str>>(args: &[S]) -> bool {
         } else if CLAUDE_VARIADIC_FLAGS.contains(&a) {
             // Variadic options take every following token up to the next one
             // that starts with `-` (commander's rule), so a `resume` in that
-            // run is a value. The `--` that ends the scan stops it too.
+            // run is a value. A `--` also starts with `-`, so it ends the run
+            // and is then read as the terminator.
             while tokens.next_if(|v| !v.starts_with('-')).is_some() {}
         }
     }
@@ -125,7 +128,9 @@ pub fn claude_argv_chooses_session<S: AsRef<str>>(args: &[S]) -> bool {
 }
 
 /// Claude Code options that take exactly ONE value, which is consumed even
-/// when it starts with `-` (commander's rule for a required option-argument).
+/// when it starts with `-`, `--` included (commander's rule for a required
+/// option-argument). The script identity shims (`resources/intercept/
+/// identity_shim.bash` / `.cmd`) carry the same two lists; a test pins them.
 /// Case-sensitive, as the CLI is. A flag missing from this list only costs
 /// the old behaviour for its value (it is scanned as a token), so the list
 /// errs toward the options a runner or an operator template actually sends.
@@ -150,6 +155,7 @@ pub const CLAUDE_VALUE_FLAGS: &[&str] = &[
     "--max-turns",
     "--max-budget-usd",
     "--json-schema",
+    "--plugin-dir",
 ];
 
 /// Claude Code options that take one or more values: everything up to the
@@ -161,7 +167,6 @@ pub const CLAUDE_VARIADIC_FLAGS: &[&str] = &[
     "--disallowedTools",
     "--disallowed-tools",
     "--mcp-config",
-    "--plugin-dir",
     "--tools",
     "--betas",
 ];
@@ -239,6 +244,7 @@ mod tests {
             &["--verbose", "resume"],
             &["--model", "opus", "-c"],
             &["--add-dir", "a", "b", "--continue"],
+            &["--name", "--", "-c"],
         ] {
             assert!(
                 claude_argv_chooses_session(argv),
@@ -259,11 +265,68 @@ mod tests {
             &["--session-id-ish"],
             &["--", "resume"],
             &["--name=resume"],
+            &["--add-dir", "a", "--", "-c"],
+            &["--plugin-dir", "p", "--verbose"],
         ] {
             assert!(
                 !claude_argv_chooses_session(argv),
                 "{argv:?} chooses no session"
             );
+        }
+    }
+
+    /// The script shims carry their own copies of the two option lists. Every
+    /// option the Rust scan skips must be skipped by both scripts too, or a
+    /// script-shim pane is left unpinned where the runner predicts a pin
+    /// (review round 5, A1).
+    #[test]
+    fn script_shims_carry_the_same_option_lists() {
+        const BASH: &str = include_str!("../resources/intercept/identity_shim.bash");
+        const CMD: &str = include_str!("../resources/intercept/identity_shim.cmd");
+        // The `case` pattern line that starts with `first|` (the whole pattern,
+        // first flag included).
+        let bash_list = |first: &str| -> Vec<String> {
+            let marker = format!("{first}|");
+            let line = BASH
+                .lines()
+                .find(|l| l.trim_start().starts_with(&marker))
+                .unwrap_or_else(|| panic!("bash shim has no `{marker}` pattern line"));
+            line.trim()
+                .trim_end_matches(')')
+                .split('|')
+                .map(|f| f.trim().to_string())
+                .collect()
+        };
+        let cmd_list = |var: &str| -> Vec<String> {
+            let prefix = format!("set \"{var}= ");
+            let line = CMD
+                .lines()
+                .find(|l| l.trim_start().starts_with(&prefix))
+                .unwrap_or_else(|| panic!("cmd shim has no `{var}` list"));
+            line.trim_start()
+                .trim_start_matches(&prefix)
+                .trim_end_matches(" \"")
+                .split(' ')
+                .map(str::to_string)
+                .collect()
+        };
+        let mut want_value: Vec<String> =
+            CLAUDE_VALUE_FLAGS.iter().map(|s| s.to_string()).collect();
+        let mut want_variadic: Vec<String> = CLAUDE_VARIADIC_FLAGS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        want_value.sort();
+        want_variadic.sort();
+        for (got, want, which) in [
+            (bash_list("--name"), &want_value, "bash value"),
+            (bash_list("--add-dir"), &want_variadic, "bash variadic"),
+            (cmd_list("VALUE_FLAGS"), &want_value, "cmd value"),
+            (cmd_list("VARIADIC_FLAGS"), &want_variadic, "cmd variadic"),
+        ] {
+            let mut got = got;
+            got.sort();
+            assert_eq!(&got, want, "{which} list drifted from the Rust list");
         }
     }
 }
