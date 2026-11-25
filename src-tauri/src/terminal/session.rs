@@ -7693,7 +7693,10 @@ pub(crate) mod tests {
     fn identity_fail_open_branch_keeps_the_appended_toolchain_dirs() {
         let (_amb, _restore, cargo_bin) = toolchain_fixture(&[]);
         let mut cmd = CommandBuilder::new("dummy");
-        TerminalSession::apply_fail_open_child_path(&mut cmd);
+        // The `None` arm's own helper, not `apply_fail_open_child_path`
+        // alone: a helper that went back to reading the raw runner PATH
+        // would drop the appended toolchain dirs and red this test.
+        TerminalSession::start_without_identity_shim(&mut cmd, "term-failopen", "pane", "");
         let got = child_path_entries(&cmd);
         assert!(
             !got.is_empty(),
