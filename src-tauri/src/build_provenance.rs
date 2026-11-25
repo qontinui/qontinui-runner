@@ -179,9 +179,59 @@ pub fn health_json() -> Value {
     )
 }
 
+/// The `qontinui-runner --provenance` object: this binary's own identity,
+/// read from the same compile-time stamps `/health` serves, so a caller that
+/// runs a CANDIDATE binary learns what that binary was built from without
+/// trusting any sidecar next to it (plan
+/// `2026-11-24-runner-upgrades-itself-daily-keeping-sessions-alive-with-no-outage-and-automatic-rollback`,
+/// D3.1: "the binary cannot lie about itself").
+///
+/// `gitDirty` is three-valued exactly as on `/health`: `null` means the build
+/// script could not measure it, which an upgrade preflight reads as UNKNOWN,
+/// never as clean.
+pub fn self_provenance_json() -> Value {
+    self_provenance_from(&health_json(), build_profile_json())
+}
+
+fn self_provenance_from(health: &Value, build_profile: Value) -> Value {
+    json!({
+        "gitSha": health["gitSha"].clone(),
+        "gitDirty": health["gitDirty"].clone(),
+        "buildId": health["buildId"].clone(),
+        "buildProfile": build_profile,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn self_provenance_carries_the_health_identity_and_keeps_unknown_dirty_null() {
+        let health = provenance_from(
+            Stamps {
+                git_sha: "abc123def456",
+                git_dirty: "unknown",
+                tree_hash: "t",
+                rust_src_hash: "r",
+                frontend_src_hash: "f",
+                halves_agree: "true",
+                build_id: "abc123def-1",
+            },
+            build_from("release-checked", "3", true),
+        );
+        let p = self_provenance_from(&health, Value::String("release-checked".into()));
+        assert_eq!(p["gitSha"], "abc123def456");
+        assert_eq!(p["gitDirty"], Value::Null);
+        assert_eq!(p["buildId"], "abc123def-1");
+        assert_eq!(p["buildProfile"], "release-checked");
+        assert_eq!(p.as_object().map(|o| o.len()), Some(4));
+        // The live binary's own object carries the same four keys.
+        let live = self_provenance_json();
+        for k in ["gitSha", "gitDirty", "buildId", "buildProfile"] {
+            assert!(live.get(k).is_some(), "missing {k}");
+        }
+    }
 
     #[test]
     fn unknown_stamps_surface_as_null_never_as_agree_or_clean() {

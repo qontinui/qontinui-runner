@@ -1425,6 +1425,16 @@ fn rfc3339_to_millis(s: &str) -> Option<i64> {
 pub async fn restart_readiness_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Json<RestartReadiness> {
+    Json(compute_restart_readiness(&state).await)
+}
+
+/// The verdict `GET /restart-readiness` serves, computed fresh. Shared with
+/// the upgrade preflight (`crate::runner_upgrade::preflight`), which reads
+/// the session and holder census from THIS verdict rather than deriving a
+/// second one (plan
+/// `2026-11-24-runner-upgrades-itself-daily-keeping-sessions-alive-with-no-outage-and-automatic-rollback`,
+/// D3.1: one census, one verdict).
+pub async fn compute_restart_readiness(state: &Arc<ApiState>) -> RestartReadiness {
     use tauri::Manager;
 
     let now_ms = chrono::Utc::now().timestamp_millis();
@@ -1636,7 +1646,7 @@ pub async fn restart_readiness_handler(
     // Fresher than the 600 s background census: the systemd watchdog gate
     // reads the newest published verdict (plan 2026-10-19 Phase 2b).
     crate::sd_notify::publish_readiness_verdict(&verdict, observed_at);
-    Json(verdict)
+    verdict
 }
 
 // ---------------------------------------------------------------------------

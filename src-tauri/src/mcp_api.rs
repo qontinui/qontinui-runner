@@ -14178,6 +14178,7 @@ pub fn create_router(
         .merge(crate::mcp::agent_tokens::routes())
         .merge(crate::install_effects_producer::routes())
         .merge(crate::session::resume_door::routes())
+        .merge(crate::runner_upgrade::routes::routes())
         .merge(crate::mcp::token_analytics::routes())
         .merge(crate::mcp::otel_status::routes())
         .merge(crate::mcp::container_status::routes())
