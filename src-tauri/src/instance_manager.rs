@@ -236,7 +236,8 @@ impl InstanceManager {
         registered.values().cloned().collect()
     }
 
-    /// Remove registered instances whose runner does not answer `/livez`.
+    /// Remove registered instances whose port is positively not a runner's (a
+    /// refused connect, or a non-runner answer to `/livez`).
     /// Returns the number of instances removed.
     ///
     /// An HTTP answer, not a TCP connect: a port held by a socket unit (or by an

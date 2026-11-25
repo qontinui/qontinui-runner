@@ -582,7 +582,8 @@ pub fn adopt_inherited_at_startup() {
             },
         )
     };
-    if INHERITED.set(store).is_err() {
+    let took_fds = matches!(&outcome, StartupAdoption::Taken { names, .. } if !names.is_empty());
+    if INHERITED.set(store).is_err() && took_fds {
         // An accessor ran before adoption and created an empty store; the fds
         // just taken would be dropped (closed) with `store`. Say so loudly.
         eprintln!(
@@ -620,8 +621,9 @@ pub fn log_startup_adoption() {
                 tracing::warn!(
                     ?names,
                     "listeners: inherited sockets arrived but none is named `api` — set \
-                     FileDescriptorName=api in the socket unit; the API will bind its port \
-                     itself and will NOT fall back to another port"
+                     FileDescriptorName=api in the socket unit; the API will try to bind its \
+                     port itself, which FAILS while the unit holds it, and will NOT fall back \
+                     to another port"
                 );
             }
             if not_open.is_empty() {
@@ -672,8 +674,10 @@ pub enum LivezVerdict {
     /// The connect itself failed inside the budget (refused, unreachable, or
     /// timed out before the handshake): nothing listens on the port.
     NoAnswer,
-    /// The connect succeeded but no HTTP status line came back inside the
-    /// budget (silence, a reset, or bytes that are not HTTP). Two different
+    /// The connect succeeded but nothing — or only a strict prefix of
+    /// `HTTP/` — came back inside the budget (silence or a reset). Bytes that
+    /// are not HTTP are [`Self::NoAnswer`] instead: they prove something other
+    /// than a runner holds the port. Two different
     /// worlds look like this and a probe cannot tell them apart: a socket unit
     /// holding a DEAD runner's port (the kernel completes the handshake from
     /// the backlog), and a LIVE runner too loaded to answer in time.
@@ -691,7 +695,9 @@ impl LivezVerdict {
     /// on a "dead" verdict (a sibling's credential file, its registration)
     /// uses this, so a live runner that was merely slow ([`Self::Silent`]) is
     /// never taken for dead — a false "dead" there costs a live sibling its
-    /// credentials, while a false "alive" only keeps a leftover one pass longer.
+    /// credentials, while a false "alive" keeps a leftover for as long as the
+    /// port stays silent (bounded in practice by whatever holds the port: a
+    /// socket unit activates its runner on the probe's own connect).
     pub fn may_be_alive(self) -> bool {
         matches!(self, Self::Live | Self::Booting | Self::Silent)
     }
@@ -737,7 +743,9 @@ pub fn probe_livez(addr: SocketAddr, budget: Duration) -> LivezVerdict {
         }
     }
     match classify_livez_response(&buf) {
-        LivezVerdict::NoAnswer => LivezVerdict::Silent,
+        // Nothing, or a reply cut off inside `HTTP/`: silence, not evidence.
+        LivezVerdict::NoAnswer if b"HTTP/".starts_with(&buf) => LivezVerdict::Silent,
+        // Bytes that are not HTTP: positively not a runner.
         verdict => verdict,
     }
 }
@@ -868,8 +876,9 @@ mod tests {
     }
 
     /// A port that accepts the connect and never answers — what a socket unit
-    /// holding a dead runner's port looks like — is NOT alive. The connect-only
-    /// probe this replaces called it alive.
+    /// holding a dead runner's port, and a live runner too loaded to answer,
+    /// both look like — is `Silent`: not a positive answer, but kept by the
+    /// destructive callers.
     #[test]
     fn a_listener_that_never_answers_is_silent_and_kept() {
         let silent = std::net::TcpListener::bind(loopback(0)).unwrap();
@@ -889,6 +898,24 @@ mod tests {
             "budget not honoured"
         );
         drop(silent);
+    }
+
+    /// A port whose holder answers with bytes that are not HTTP is positively
+    /// not a runner: not kept as `Silent`.
+    #[test]
+    fn a_non_http_reply_is_not_a_runner() {
+        let server = std::net::TcpListener::bind(loopback(0)).unwrap();
+        let addr = server.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut s, _) = server.accept().unwrap();
+            let mut req = [0u8; 1024];
+            let _ = s.read(&mut req);
+            s.write_all(b"-ERR unknown command\r\n").unwrap();
+        });
+        let verdict = probe_livez(addr, Duration::from_secs(5));
+        handle.join().unwrap();
+        assert_eq!(verdict, LivezVerdict::NoAnswer);
+        assert!(!verdict.may_be_alive());
     }
 
     /// A closed port is not alive either.
