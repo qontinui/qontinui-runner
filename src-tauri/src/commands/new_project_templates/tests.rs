@@ -542,8 +542,9 @@ fn dep_range(pkg: &serde_json::Value, name: &str) -> Option<String> {
 /// crate: `, `), so each comparator set is rewritten before parsing. One
 /// leading `v` after the operator is dropped, as npm does (`>=v1.2.3`).
 ///
-/// A prerelease comparator (`>=0.54.0-0`) also returns `None`: npm and the
-/// crate match prereleases by different rules, and no peer here uses one.
+/// A prerelease comparator (`>=0.54.0-0`) also returns `None`: this
+/// translation does not handle prerelease comparators, so it refuses them
+/// (fail-closed), and no kit peer uses one.
 fn npm_range_satisfied(range: &str, version: &str) -> Option<bool> {
     let version = semver::Version::parse(version.trim()).ok()?;
     let mut satisfied = false;
