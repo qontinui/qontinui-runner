@@ -39,9 +39,12 @@ fn replace_kit_ref(c: &str, spec: &str) -> String {
     let Some(hit) = c.find(marker) else {
         return c.to_string();
     };
-    let start = c[..hit].rfind('"').expect("kit ref is a quoted string") + 1;
-    let end = hit + c[hit..].find('"').expect("kit ref is a quoted string");
-    format!("{}{spec}{}", &c[..start], &c[end..])
+    let (before, after) = c.split_at(hit);
+    let start = before.rfind('"').expect("kit ref is a quoted string") + 1;
+    let end = after.find('"').expect("kit ref is a quoted string");
+    let (head, _) = before.split_at(start);
+    let (_, tail) = after.split_at(end);
+    format!("{head}{spec}{tail}")
 }
 
 /// Every path the design-bearing template must write.
@@ -536,7 +539,11 @@ fn dep_range(pkg: &serde_json::Value, name: &str) -> Option<String> {
 ///
 /// npm and the `semver` crate disagree on a bare `X.Y.Z` (npm: exact; the
 /// crate: `^X.Y.Z`) and on separators (npm: whitespace within a set; the
-/// crate: `, `), so each comparator set is rewritten before parsing.
+/// crate: `, `), so each comparator set is rewritten before parsing. One
+/// leading `v` after the operator is dropped, as npm does (`>=v1.2.3`).
+///
+/// A prerelease comparator (`>=0.54.0-0`) also returns `None`: npm and the
+/// crate match prereleases by different rules, and no peer here uses one.
 fn npm_range_satisfied(range: &str, version: &str) -> Option<bool> {
     let version = semver::Version::parse(version.trim()).ok()?;
     let mut satisfied = false;
@@ -553,7 +560,11 @@ fn npm_range_satisfied(range: &str, version: &str) -> Option<bool> {
                 continue;
             }
             let token = format!("{}{token}", std::mem::take(&mut pending_op));
-            let bare = token.trim_start_matches(['<', '>', '=', '^', '~', 'v']);
+            let op_len = token
+                .find(|c: char| !matches!(c, '<' | '>' | '=' | '^' | '~'))
+                .unwrap_or(token.len());
+            let (op, rest) = token.split_at(op_len);
+            let bare = rest.strip_prefix('v').unwrap_or(rest);
             // Wildcards assert nothing; hyphen ranges and tags do not translate.
             if bare.is_empty()
                 || bare
@@ -562,11 +573,8 @@ fn npm_range_satisfied(range: &str, version: &str) -> Option<bool> {
             {
                 return None;
             }
-            if token.starts_with(|c: char| c.is_ascii_digit()) {
-                comparators.push(format!("={token}"));
-            } else {
-                comparators.push(token);
-            }
+            let op = if op.is_empty() { "=" } else { op };
+            comparators.push(format!("{op}{bare}"));
         }
         if comparators.is_empty() || !pending_op.is_empty() {
             return None;
@@ -723,6 +731,11 @@ fn npm_range_satisfied_reads_npm_grammar() {
     assert_eq!(npm_range_satisfied("<0.56.0", "0.55.9"), Some(true));
     assert_eq!(npm_range_satisfied(">= 0.54.0 < 1", "0.99.0"), Some(true));
     assert_eq!(npm_range_satisfied("=0.54.0", "0.54.1"), Some(false));
+    // One leading `v` after the operator is npm grammar.
+    assert_eq!(npm_range_satisfied("v0.56.0", "0.56.0"), Some(true));
+    assert_eq!(npm_range_satisfied(">=v0.54.0 <1", "0.56.0"), Some(true));
+    // Prerelease comparators are refused (npm and the crate disagree on them).
+    assert_eq!(npm_range_satisfied(">=0.54.0-0 <1", "0.56.0"), None);
     // Wildcards, hyphen ranges and tags are refused, never read as satisfied.
     for range in ["x", "X", "0.x", "0.56.*", "0.54.0 - 0.56.0", "latest", ""] {
         assert_eq!(npm_range_satisfied(range, "0.56.0"), None, "{range:?}");
@@ -743,8 +756,8 @@ fn template_tool_and_kit_peer_pins_agree() {
     assert!(violations.is_empty(), "{violations:#?}");
 }
 
-/// Each seed breaks exactly one rule of `kit_chain_violations` on a
-/// known-good synthetic triple, independent of the live pins.
+/// Each seed applied to a known-good synthetic triple must redden the rule of
+/// `kit_chain_violations` it names, independent of the live pins.
 #[test]
 fn kit_chain_checks_redden_on_each_seeded_violation() {
     let deps = r#"{
@@ -830,6 +843,15 @@ fn kit_chain_checks_redden_on_each_seeded_violation() {
         ),
         "rule 1 (kit ref)",
     );
+    // Rule 1: the tool installs no kit at all.
+    reddens(
+        kit_chain_violations(
+            template,
+            &edit(&tool, "/dependencies/@qontinui~1design-kit", None),
+            &lock,
+        ),
+        "rule 1 (kit ref): template pins @qontinui/design-kit Some(\"github:qontinui/qontinui-design-kit#v0.2.1\"), the kit tool None",
+    );
     // Rule 2: each template pin drifts from the tool's, in either section.
     for (pointer, pin, needle) in [
         (
@@ -873,6 +895,42 @@ fn kit_chain_checks_redden_on_each_seeded_violation() {
             ),
         ),
         "rule 3 (stale lock)",
+    );
+    // Rule 3: the lock has no root package entry at all.
+    reddens(
+        kit_chain_violations(template, &tool, &edit(&lock, "/packages/", None)),
+        "rule 3 (stale lock): package-lock.json root dependencies None",
+    );
+    // Rule 4: the tool's kit ref names no `#v<tag>`.
+    reddens(
+        kit_chain_violations(
+            template,
+            &edit(
+                &tool,
+                "/dependencies/@qontinui~1design-kit",
+                Some("github:qontinui/qontinui-design-kit"),
+            ),
+            &lock,
+        ),
+        "rule 4 (lock kit entry): @qontinui/design-kit locked at version Some(\"0.2.1\"), the kit tool's tag is None",
+    );
+    // Rules 4 and 5: the lock has no entry for the kit.
+    let violations = kit_chain_violations(
+        template,
+        &tool,
+        &edit(&lock, "/packages/node_modules~1@qontinui~1design-kit", None),
+    );
+    reddens(
+        violations.clone(),
+        "rule 4 (lock kit entry): @qontinui/design-kit resolved `` does not end in a 40-hex sha",
+    );
+    reddens(
+        violations.clone(),
+        "rule 4 (lock kit entry): @qontinui/design-kit locked at version None",
+    );
+    reddens(
+        violations,
+        "rule 5 (kit peer): the locked kit records no peer for @qontinui/ui-bridge",
     );
     // Rule 4: the locked kit is a different version than the tool's tag.
     reddens(

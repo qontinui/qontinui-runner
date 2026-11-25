@@ -2755,7 +2755,7 @@ jobs:
           set -euo pipefail
           scaffold="$RUNNER_TEMP/scaffold"
           mkdir -p "$scaffold"
-          sed 's/{{app_id}}/ci-scaffold/g' \
+          sed -e 's/{{app_id}}/ci-scaffold/g' -e 's/{{name}}/ci-scaffold/g' \
             src-tauri/src/commands/new_project_templates/react-ui-bridge/package.json.tmpl \
             > "$scaffold/package.json"
           if grep -q '{{' "$scaffold/package.json"; then
