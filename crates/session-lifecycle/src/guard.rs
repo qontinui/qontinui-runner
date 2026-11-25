@@ -42,6 +42,9 @@ pub struct GuardReport {
     pub guards: Vec<Guard>,
     /// When the grace window ends, if the session is continuously idle.
     pub grace_until: Option<Timestamp>,
+    /// G3 is short ONLY by its grace clock: the session is idle inside the
+    /// window and nothing else about G3 (shells, pane kind) refuses.
+    grace_pending: bool,
     digest: crate::state::Digest,
 }
 
@@ -54,14 +57,11 @@ impl GuardReport {
     /// The conjunction with G3 set aside as long as ONLY its grace clock is
     /// short: every other conjunct (and G3's non-grace part) is `True`.
     pub fn cleared_but_for_grace(&self) -> bool {
-        let Some(until) = self.grace_until else {
-            return false;
-        };
-        let _ = until;
-        self.guards.iter().all(|g| match g.id {
-            GuardId::G3 => g.value.is_true() || g.note.starts_with("grace"),
-            _ => g.value.is_true(),
-        })
+        self.grace_pending
+            && self
+                .guards
+                .iter()
+                .all(|g| g.id == GuardId::G3 || g.value.is_true())
     }
 
     /// The first conjunct that is not `True`, for `close_refused`.
@@ -105,11 +105,12 @@ pub fn evaluate(
 ) -> GuardReport {
     let mut guards: Vec<Guard> = Vec::new();
     let mut grace_until = None;
+    let mut grace_pending = false;
 
     // G1: the coord row says finished.
     guards.push(g(
         GuardId::G1,
-        s.coord_finished.clone(),
+        s.coord_finished.value.clone(),
         "coord session_status=finished",
     ));
 
@@ -121,7 +122,7 @@ pub fn evaluate(
     };
     guards.push(g(
         GuardId::G2,
-        w.and(s.revived.clone().negate()),
+        w.and(s.revived.value.clone().negate()),
         "W=Finished and not R",
     ));
 
@@ -136,6 +137,7 @@ pub fn evaluate(
             if now >= until {
                 (Tri::True, "idle through the grace window".to_string())
             } else {
+                grace_pending = true;
                 (Tri::False, "grace window still running".to_string())
             }
         }
@@ -152,6 +154,8 @@ pub fn evaluate(
         PaneKind::Steward | PaneKind::Looping => Tri::False,
         PaneKind::Unreadable => Tri::unknown("pane_kind", "unreadable"),
     };
+    // A non-closable pane in its grace is not "grace pending".
+    grace_pending = grace_pending && pane.is_true();
     guards.push(g(GuardId::G3, g3.and(pane), note));
 
     // G4: S = empty.
@@ -221,6 +225,9 @@ pub fn evaluate(
         fresh_or_unknown("parked", s.parked.fresh(now, tau::P)),
         fresh_or_unknown("owned", s.owned.fresh(now, tau::O)),
         fresh_or_unknown("custody", s.custody.fresh(now, tau::K)),
+        fresh_or_unknown("work", s.work.fresh(now, tau::W)),
+        fresh_or_unknown("coord_finished", s.coord_finished.fresh(now, tau::C)),
+        fresh_or_unknown("revived", s.revived.fresh(now, tau::R)),
         match &s.schema_skew {
             Some(u) => unknown_of(u),
             None => Tri::True,
@@ -277,6 +284,7 @@ pub fn evaluate(
     GuardReport {
         guards,
         grace_until,
+        grace_pending,
         digest,
     }
 }

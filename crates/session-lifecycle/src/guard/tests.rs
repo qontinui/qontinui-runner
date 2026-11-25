@@ -33,20 +33,28 @@ fn expect_not_true(mut s: SessionState, mutate: impl FnOnce(&mut SessionState), 
 
 #[test]
 fn g1_coord_row() {
-    expect_not_true(closable(), |s| s.coord_finished = Tri::False, GuardId::G1);
     expect_not_true(
         closable(),
-        |s| s.coord_finished = Tri::unknown("c", "x"),
+        |s| s.coord_finished = Observed::new(Tri::False, NOW),
+        GuardId::G1,
+    );
+    expect_not_true(
+        closable(),
+        |s| s.coord_finished = Observed::new(Tri::unknown("c", "x"), NOW),
         GuardId::G1,
     );
 }
 
 #[test]
 fn g2_declaration_and_revival() {
-    expect_not_true(closable(), |s| s.revived = Tri::True, GuardId::G2);
     expect_not_true(
         closable(),
-        |s| s.revived = Tri::unknown("r", "x"),
+        |s| s.revived = Observed::new(Tri::True, NOW),
+        GuardId::G2,
+    );
+    expect_not_true(
+        closable(),
+        |s| s.revived = Observed::new(Tri::unknown("r", "x"), NOW),
         GuardId::G2,
     );
     expect_not_true(
@@ -157,7 +165,7 @@ fn g4_g5_g6() {
             s.parked = Observed::new(
                 Parked::ApiError {
                     kind: ApiErrorKind::Overloaded,
-                    retryable: true,
+                    since: NOW,
                 },
                 NOW,
             )
@@ -354,79 +362,265 @@ fn cleared_but_for_grace_names_a_pending_grace_only() {
     let r = report(&s);
     assert!(r.cleared_but_for_grace());
     assert_eq!(r.grace_until, Some(Timestamp(NOW.0 + 5 * MIN)));
-    s.coord_finished = Tri::False;
+    s.coord_finished = Observed::new(Tri::False, NOW);
     assert!(!report(&s).cleared_but_for_grace());
 }
 
-#[allow(clippy::string_slice)]
 /// S1: `Action::Close` has exactly one construction site in the crate's
-/// non-test source. A construction is `Action::Close {` that is not a pattern
-/// (`{ .. }`); comment lines and everything after a `#[cfg(test)]` line are
-/// ignored.
+/// non-test source. Every `.rs` file under `src/` is scanned (the directory is
+/// walked at test time, so a new file cannot hide a second site). The scan
+/// works on the whole file with comments and string literals blanked, so a
+/// multi-line `Action::Close\n{` is caught, as is `use Action::Close` (an
+/// import that would make a bare `Close { .. }` construction possible).
+/// Pattern uses (`{ .. }`) are not constructions. Test modules (`tests.rs`,
+/// `testkit.rs`, and everything after a `#[cfg(test)]` line) are excluded.
 #[test]
 fn s1_action_close_has_exactly_one_construction_site() {
-    let files: &[(&str, &str)] = &[
-        ("lib.rs", include_str!("../lib.rs")),
-        ("classify_child.rs", include_str!("../classify_child.rs")),
-        ("state.rs", include_str!("../state.rs")),
-        ("stray.rs", include_str!("../stray.rs")),
-        ("model.rs", include_str!("../model.rs")),
-        ("guard.rs", include_str!("../guard.rs")),
-        ("decide.rs", include_str!("../decide.rs")),
-        ("evaluate/mod.rs", include_str!("../evaluate/mod.rs")),
-        (
-            "evaluate/registry.rs",
-            include_str!("../evaluate/registry.rs"),
-        ),
-        (
-            "evaluate/transcript.rs",
-            include_str!("../evaluate/transcript.rs"),
-        ),
-        (
-            "evaluate/custody.rs",
-            include_str!("../evaluate/custody.rs"),
-        ),
-        (
-            "evaluate/restore.rs",
-            include_str!("../evaluate/restore.rs"),
-        ),
-    ];
-    let mut sites = Vec::new();
-    for (name, src) in files {
-        for (n, line) in src.lines().enumerate() {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with("#[cfg(test)]") {
-                break;
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
             }
-            if trimmed.starts_with("//") {
-                continue;
-            }
-            let mut rest = line;
-            while let Some(i) = rest.find("Action::Close") {
-                let after = rest[i + "Action::Close".len()..].trim_start();
-                if let Some(body) = after.strip_prefix('{') {
-                    if !body.trim_start().starts_with("..") {
-                        sites.push(format!("{name}:{}", n + 1));
-                    }
+        }
+    }
+    fn blank(src: &str) -> String {
+        // Blank line comments and string / char literals, keeping newlines.
+        let b: Vec<char> = src.chars().collect();
+        let mut out = String::new();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == '/' && b.get(i + 1) == Some(&'/') {
+                while i < b.len() && b[i] != '\n' {
+                    i += 1;
                 }
-                rest = &rest[i + "Action::Close".len()..];
+            } else if b[i] == '"' {
+                out.push(' ');
+                i += 1;
+                while i < b.len() && b[i] != '"' {
+                    if b[i] == '\\' {
+                        i += 1;
+                    }
+                    if b.get(i) == Some(&'\n') {
+                        out.push('\n');
+                    }
+                    i += 1;
+                }
+                i += 1;
+            } else {
+                out.push(b[i]);
+                i += 1;
             }
+        }
+        out
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    walk(&root, &mut files);
+    assert!(files.len() >= 10, "the walk found {} files", files.len());
+    let mut sites = Vec::new();
+    let mut imports = Vec::new();
+    for f in &files {
+        let name = f.strip_prefix(&root).unwrap().display().to_string();
+        if name.ends_with("tests.rs") || name.ends_with("testkit.rs") {
+            continue;
+        }
+        let src = std::fs::read_to_string(f).unwrap();
+        let live = match src.find("#[cfg(test)]") {
+            Some(i) => src.get(..i).unwrap_or(&src),
+            None => &src,
+        };
+        let text = blank(live);
+        let mut rest = text.as_str();
+        let mut offset = 0;
+        while let Some(i) = rest.find("Action::Close") {
+            let abs = offset + i;
+            let after = text.get(abs + "Action::Close".len()..).unwrap_or("");
+            let before = text.get(..abs).unwrap_or("");
+            let line = before.matches('\n').count() + 1;
+            if before.trim_end().ends_with("use") {
+                imports.push(format!("{name}:{line}"));
+            }
+            if let Some(body) = after.trim_start().strip_prefix('{') {
+                if !body.trim_start().starts_with("..") {
+                    sites.push(format!("{name}:{line}"));
+                }
+            }
+            offset = abs + "Action::Close".len();
+            rest = text.get(offset..).unwrap_or("");
+        }
+        // `use Action::*` / `use crate::model::Action::{Close, ..}` forms.
+        if text.contains("Action::*") || text.contains("Action::{") {
+            imports.push(format!("{name}: glob or brace import of Action"));
         }
     }
     assert_eq!(sites.len(), 1, "construction sites: {sites:?}");
     assert!(sites[0].starts_with("guard.rs"), "{sites:?}");
+    assert!(
+        imports.is_empty(),
+        "imports that hide a construction: {imports:?}"
+    );
 }
 
-/// S2's guard half: turning any one conjunct from True to Unknown can never
-/// leave the verdict True (monotone in safety).
+/// S2's guard half, driven through `evaluate()` and `decide()`: every single
+/// conjunct's input made Unknown or stale — one at a time — leaves the verdict
+/// not True and the decision not a Close.
 #[test]
-fn an_unknown_conjunct_never_clears() {
-    let base = report(&closable());
-    for (i, _) in base.guards.iter().enumerate() {
-        let mut r = base.clone();
-        r.guards[i].value = Tri::unknown("probe", "x");
-        assert!(!r.verdict().is_true());
-        assert!(r.close_proof().is_none());
-        assert!(close_action(&r, NOW).is_none());
+fn an_unknown_or_stale_conjunct_never_clears() {
+    let u = || Unk::new("probe", "forced");
+    let old = Timestamp(NOW.0 - 30 * MIN);
+    type Mut = Box<dyn Fn(&mut SessionState)>;
+    let cases: Vec<(&str, GuardId, Mut)> = vec![
+        (
+            "coord unknown",
+            GuardId::G1,
+            Box::new(move |s| s.coord_finished = Observed::new(Tri::Unknown(u()), NOW)),
+        ),
+        (
+            "coord stale",
+            GuardId::G9,
+            Box::new(move |s| s.coord_finished = Observed::new(Tri::True, old)),
+        ),
+        (
+            "W unknown",
+            GuardId::G2,
+            Box::new(move |s| s.work = Observed::new(Declared::Unknown(u()), NOW)),
+        ),
+        (
+            "W stale",
+            GuardId::G9,
+            Box::new(move |s| s.work = Observed::new(s.work.value.clone(), old)),
+        ),
+        (
+            "R unknown",
+            GuardId::G2,
+            Box::new(move |s| s.revived = Observed::new(Tri::Unknown(u()), NOW)),
+        ),
+        (
+            "R stale",
+            GuardId::G9,
+            Box::new(move |s| s.revived = Observed::new(Tri::False, old)),
+        ),
+        (
+            "activity unknown",
+            GuardId::G3,
+            Box::new(move |s| s.activity = Observed::new(Activity::Unknown(u()), NOW)),
+        ),
+        (
+            "activity stale",
+            GuardId::G9,
+            Box::new(move |s| s.activity = Observed::new(s.activity.value.clone(), old)),
+        ),
+        (
+            "S unknown",
+            GuardId::G4,
+            Box::new(move |s| s.selfcont = Observed::new(SelfConts::Unknown(u()), NOW)),
+        ),
+        (
+            "S stale",
+            GuardId::G9,
+            Box::new(move |s| s.selfcont = Observed::new(s.selfcont.value.clone(), old)),
+        ),
+        (
+            "P unknown",
+            GuardId::G5,
+            Box::new(move |s| s.parked = Observed::new(Parked::Unknown(u()), NOW)),
+        ),
+        (
+            "P stale",
+            GuardId::G9,
+            Box::new(move |s| s.parked = Observed::new(Parked::None, old)),
+        ),
+        (
+            "I unknown",
+            GuardId::G6,
+            Box::new(move |s| s.input = Observed::new(Input::Unknown(u()), NOW)),
+        ),
+        (
+            "I stale",
+            GuardId::G9,
+            Box::new(move |s| s.input = Observed::new(Input::Clear, old)),
+        ),
+        (
+            "K unknown",
+            GuardId::G7,
+            Box::new(move |s| s.custody = Observed::new(CustodyAxis::Unknown(u()), NOW)),
+        ),
+        (
+            "K stale",
+            GuardId::G9,
+            Box::new(move |s| s.custody = Observed::new(s.custody.value.clone(), old)),
+        ),
+        (
+            "O unknown",
+            GuardId::G8,
+            Box::new(move |s| s.owned = Observed::new(OwnedAxis::Unknown(u()), NOW)),
+        ),
+        (
+            "O stale",
+            GuardId::G9,
+            Box::new(move |s| {
+                s.owned = Observed::new(OwnedAxis::Known, Timestamp(NOW.0 - 20 * MIN))
+            }),
+        ),
+        (
+            "H stale",
+            GuardId::G9,
+            Box::new(move |s| s.hosting = Observed::new(s.hosting.value.clone(), old)),
+        ),
+        (
+            "schema skew",
+            GuardId::G9,
+            Box::new(move |s| s.schema_skew = Some(u())),
+        ),
+        (
+            "pane kind unreadable",
+            GuardId::G3,
+            Box::new(|s| s.pane_kind = PaneKind::Unreadable),
+        ),
+    ];
+    for (name, id, m) in &cases {
+        let mut s = closable();
+        m(&mut s);
+        let r = report(&s);
+        assert!(!r.verdict().is_true(), "{name}: the verdict stayed True");
+        assert!(
+            r.guards.iter().any(|g| g.id == *id && !g.value.is_true()),
+            "{name}: expected {id:?} to refuse: {:?}",
+            r.guards
+        );
+        assert!(r.close_proof().is_none(), "{name}");
+        let dec = crate::decide::decide(&s, &[done("w")], &dials(), X, NOW);
+        assert!(!dec.action.is_close(), "{name}: {dec:?}");
     }
+    // Control: the unmutated state closes, so every refusal above is the mutation's.
+    assert!(
+        crate::decide::decide(&closable(), &[done("w")], &dials(), X, NOW)
+            .action
+            .is_close()
+    );
+}
+
+#[test]
+fn a_non_closable_pane_in_its_grace_is_not_grace_pending() {
+    let mut s = closable();
+    s.activity = Observed::new(
+        Activity::Idle {
+            since_turn_end: NOW,
+            grace_from: Timestamp(NOW.0 - 5 * MIN),
+        },
+        NOW,
+    );
+    s.pane_kind = PaneKind::Steward;
+    let r = report(&s);
+    assert!(!r.cleared_but_for_grace());
+    let dec = crate::decide::decide(&s, &[done("w")], &dials(), X, NOW);
+    assert!(!matches!(
+        dec.action,
+        Action::Observe {
+            why: crate::model::ObserveWhy::GraceRunning { .. }
+        }
+    ));
 }

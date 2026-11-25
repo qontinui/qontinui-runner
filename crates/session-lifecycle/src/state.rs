@@ -93,6 +93,12 @@ pub mod tau {
     /// K is read fresh for every close; the actuator re-reads it itself, so a
     /// Decision accepts a read this recent.
     pub const K: Dur = Dur::secs(60);
+    /// W (declared work), read against the transcript and coord (G2).
+    pub const W: Dur = Dur::secs(60);
+    /// R (revived), read against the finish stamp (G2).
+    pub const R: Dur = Dur::secs(60);
+    /// The coord row (G1): C2's cache is 45 s.
+    pub const C: Dur = Dur::secs(45);
 }
 
 // ---------------------------------------------------------------------------
@@ -548,7 +554,8 @@ pub enum Parked {
     },
     ApiError {
         kind: ApiErrorKind,
-        retryable: bool,
+        /// When the turn ended on the error (D12's backoff runs from it).
+        since: Timestamp,
     },
     Unknown(Unk),
 }
@@ -738,9 +745,9 @@ pub struct SessionState {
     pub pane_kind: PaneKind,
     /// **R**, derived by [`crate::evaluate::revived`] from the main transcript
     /// before `decide` runs (a field because `decide` is pure over its input).
-    pub revived: Tri,
+    pub revived: Observed<Tri>,
     /// G1: the coord row reads `session_status = finished`, read fresh.
-    pub coord_finished: Tri,
+    pub coord_finished: Observed<Tri>,
     /// The close-time schedules a resume would bring back, read from the
     /// transcript at the exit (D4's hold test); `Unknown` keeps it down.
     pub exit_schedules: Option<SelfConts>,
@@ -753,6 +760,9 @@ pub struct SessionState {
     /// the agent itself (a restored continuation): the exit code describes the
     /// shell (#2373).
     pub shell_hosted: bool,
+    /// A close issued and not yet acknowledged (the time it was issued): phase 8
+    /// `Closing`, the inbox freezes and no second Close is emitted (S6).
+    pub closing: Option<Timestamp>,
     /// Any hold after a relayed exit currently standing.
     pub hold: Option<Hold>,
     pub ledger: Ledger,
@@ -777,12 +787,13 @@ impl SessionState {
             custody: Observed::new(CustodyAxis::Unknown(u("custody")), at),
             mode: Mode::Unknown,
             pane_kind: PaneKind::Unreadable,
-            revived: Tri::unknown("revived", "not yet read"),
-            coord_finished: Tri::unknown("coord_row", "not yet read"),
+            revived: Observed::new(Tri::unknown("revived", "not yet read"), at),
+            coord_finished: Observed::new(Tri::unknown("coord_row", "not yet read"), at),
             exit_schedules: None,
             operator_hold: false,
             continuation_gate: None,
             shell_hosted: false,
+            closing: None,
             hold: None,
             ledger: Ledger::default(),
             schema_skew: None,
@@ -865,6 +876,10 @@ pub enum EventKind {
     },
     /// R.
     RevivedRead(Tri),
+    /// A Close was issued (its acknowledgement is pending).
+    CloseIssued,
+    /// The close was read back (the pane is gone) or refused by the actuator.
+    CloseSettled,
     /// Mode and pane kind.
     ModeRead {
         mode: Mode,
@@ -949,9 +964,17 @@ fn apply(s: &mut SessionState, e: &Event) {
         }
         EventKind::HostExit(facts) => {
             s.hosting = Observed::new(Hosting::Exited(facts.clone()), at);
+            s.closing = None;
         }
         EventKind::TurnStart => {
             s.activity = Observed::new(Activity::Turn, at);
+            // A turn opening after the finish reads invalidates what R and the
+            // coord row said: both must be re-read before anything acts on them.
+            s.revived = Observed::new(Tri::unknown("revived", "a turn opened after the read"), at);
+            s.coord_finished = Observed::new(
+                Tri::unknown("coord_row", "a turn opened after the read"),
+                at,
+            );
             // A real prompt ends a hold and any parking.
             if matches!(
                 s.parked.value,
@@ -1088,8 +1111,10 @@ fn apply(s: &mut SessionState, e: &Event) {
         EventKind::WorkRead(w) => s.work = Observed::new(w.clone(), at),
         EventKind::OwnedRead(o) => s.owned = Observed::new(o.clone(), at),
         EventKind::CustodyRead(c) => s.custody = Observed::new(c.clone(), at),
-        EventKind::CoordRow { finished } => s.coord_finished = finished.clone(),
-        EventKind::RevivedRead(r) => s.revived = r.clone(),
+        EventKind::CoordRow { finished } => s.coord_finished = Observed::new(finished.clone(), at),
+        EventKind::RevivedRead(r) => s.revived = Observed::new(r.clone(), at),
+        EventKind::CloseIssued => s.closing = Some(at),
+        EventKind::CloseSettled => s.closing = None,
         EventKind::ModeRead { mode, pane_kind } => {
             s.mode = *mode;
             s.pane_kind = *pane_kind;
@@ -1234,6 +1259,29 @@ pub fn phase_of(s: &SessionState, items: ItemFacts, closing: bool, now: Timestam
     if !s.selfcont.fresh(now, tau::S) {
         return Phase::Unknown(Unk::new("selfcont", "stale"));
     }
+    // S2: an Unknown W, O, K, R or coord row never acts — not even a Continue
+    // of an owed item — so each is a phase of its own (D0) on a live host.
+    if let Declared::Unknown(u) = &s.work.value {
+        return Phase::Unknown(u.clone());
+    }
+    if let OwnedAxis::Unknown(u) = &s.owned.value {
+        return Phase::Unknown(u.clone());
+    }
+    if let CustodyAxis::Unknown(u) = &s.custody.value {
+        return Phase::Unknown(u.clone());
+    }
+    if let Tri::Unknown(u) = &s.revived.value {
+        return Phase::Unknown(u.clone());
+    }
+    if let Tri::Unknown(u) = &s.coord_finished.value {
+        return Phase::Unknown(u.clone());
+    }
+    if !s.work.fresh(now, tau::W) {
+        return Phase::Unknown(Unk::new("work", "stale"));
+    }
+    if matches!(s.work.value, Declared::Finished { .. }) && !s.revived.fresh(now, tau::R) {
+        return Phase::Unknown(Unk::new("revived", "stale"));
+    }
     // 1 Spawning
     match &s.hosting.value {
         Hosting::Spawning => return Phase::Spawning,
@@ -1274,11 +1322,11 @@ pub fn phase_of(s: &SessionState, items: ItemFacts, closing: bool, now: Timestam
         return Phase::Closing;
     }
     // 7 Stopped and its sub-phases.
-    if s.revived.is_true() {
+    if s.revived.value.is_true() {
         return Phase::Stopped(Stopped::Revived);
     }
-    if s.revived.is_unknown() && matches!(s.work.value, Declared::Finished { .. }) {
-        return Phase::Unknown(match &s.revived {
+    if s.revived.value.is_unknown() && matches!(s.work.value, Declared::Finished { .. }) {
+        return Phase::Unknown(match &s.revived.value {
             Tri::Unknown(u) => u.clone(),
             _ => Unk::new("revived", "unread"),
         });

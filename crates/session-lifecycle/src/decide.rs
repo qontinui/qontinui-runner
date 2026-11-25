@@ -65,6 +65,12 @@ pub const DRAFT_STALE: Dur = Dur::hours(24);
 /// D7: a dialog in an unattended session is reported after this long.
 pub const DIALOG_STALE: Dur = Dur::mins(30);
 
+/// D12: how long a request error waits before its one Continue.
+pub const ERROR_BACKOFF: Dur = Dur::mins(2);
+
+/// How long a Close may wait for its acknowledgement (S6).
+pub const CLOSE_ACK_TIMEOUT: Dur = Dur::mins(5);
+
 const RETRY_SET: &str = "__retry__";
 const CLOSEOUT_SET: &str = "__closeout__";
 const STRAY_SET: &str = "__stray__";
@@ -237,7 +243,7 @@ pub fn decide(
         digest,
     };
     let facts = item_facts(s, items);
-    let phase = crate::state::phase_of(s, facts, false, now);
+    let phase = crate::state::phase_of(s, facts, s.closing.is_some(), now);
     let mut d = match &phase {
         Phase::Unknown(u) => d0(&ctx, u),
         Phase::Spawning => observe(RuleId::D5, ObserveWhy::Spawning).why("phase", &phase),
@@ -247,11 +253,7 @@ pub fn decide(
         Phase::Parked => parked(&ctx),
         Phase::Scheduled => scheduled(&ctx),
         Phase::Stopped(st) => stopped(&ctx, st),
-        Phase::Closing => observe(
-            RuleId::D20,
-            ObserveWhy::Gated("a close is in flight".into()),
-        )
-        .why("phase", &phase),
+        Phase::Closing => closing(&ctx),
         Phase::Closed { finished } => closed(&ctx, *finished),
     };
     hold_riders(&ctx, &mut d);
@@ -277,6 +279,24 @@ fn finish(ctx: &Ctx, d: Dec, phase: &Phase) -> Decision {
 // ---------------------------------------------------------------------------
 // D0
 // ---------------------------------------------------------------------------
+
+/// Phase 8: a Close was issued and its acknowledgement is pending. The inbox is
+/// frozen and NO second Close is emitted (S6: no blind retry); an
+/// acknowledgement that does not come inside [`CLOSE_ACK_TIMEOUT`] is reported
+/// as failed, and the next Decision is a new one (backoff is the actuator's).
+fn closing(ctx: &Ctx) -> Dec {
+    let issued = ctx.s.closing.unwrap_or(ctx.now);
+    if ctx.now.since(issued) > CLOSE_ACK_TIMEOUT {
+        report(
+            RuleId::D20,
+            Consumer::GatingAndDetecting,
+            DetectionKind::CloseNotAcknowledged,
+            "a Close was issued and not acknowledged inside its timeout",
+        )
+    } else {
+        observe(RuleId::D20, ObserveWhy::CloseInFlight)
+    }
+}
 
 fn d0(ctx: &Ctx, u: &Unk) -> Dec {
     let persisted = ctx
@@ -642,14 +662,15 @@ fn parked(ctx: &Ctx) -> Dec {
                 migrate,
             )
         }
-        Parked::ApiError { kind, retryable } => {
-            if !*retryable {
-                return report(
-                    RuleId::D12,
-                    Consumer::Gating,
-                    DetectionKind::ParkedNotRetryable,
-                    format!("the last turn failed with {kind:?}, which is not retryable"),
-                );
+        // D12 (§3.2): every request-error kind — `overloaded`, `server_error`,
+        // `invalid_request`, `max_output_tokens`, `unknown` — gets ONE Continue
+        // after a backoff ("the last turn failed with <kind>; continue it"); a
+        // repeat is a Report. There is no `retryable` split: the table names no
+        // kind that is only reported.
+        Parked::ApiError { kind, since } => {
+            let ready = since.plus(ERROR_BACKOFF);
+            if ctx.now < ready {
+                return observe(RuleId::D12, ObserveWhy::Backoff { until: ready });
             }
             let retry = [RETRY_SET.to_string()];
             let set = item_set_hash(&retry);
@@ -789,7 +810,7 @@ fn stopped(ctx: &Ctx, st: &Stopped) -> Dec {
     match st {
         // D14: as D1.
         Stopped::Revived => Dec::new(RuleId::D14, Consumer::Gating, Action::WithdrawFinish)
-            .why("revived", &s.revived)
+            .why("revived", &s.revived.value)
             .why("work", &s.work.value),
         Stopped::Owing => owing(ctx),
         Stopped::Undeclared => undeclared(ctx),
@@ -1183,7 +1204,7 @@ fn closed_inner(ctx: &Ctx, f: &ExitFacts, is_finished: bool) -> Dec {
             return observe(RuleId::D2, ObserveWhy::Gated("close not read back".into()));
         }
         // D1: a close that cut a revival.
-        if s.revived.is_true() {
+        if s.revived.value.is_true() {
             let cut = [CUT_SET.to_string()];
             let _ = cut;
             return Dec::new(
@@ -1194,7 +1215,7 @@ fn closed_inner(ctx: &Ctx, f: &ExitFacts, is_finished: bool) -> Dec {
                     via: ResumeVia::WithMessage,
                 },
             )
-            .why("revived", &s.revived);
+            .why("revived", &s.revived.value);
         }
         return report(
             RuleId::D2,

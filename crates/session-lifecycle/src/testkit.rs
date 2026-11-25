@@ -60,8 +60,8 @@ pub fn closable() -> SessionState {
     );
     s.mode = Mode::Unattended;
     s.pane_kind = PaneKind::Terminal;
-    s.revived = Tri::False;
-    s.coord_finished = Tri::True;
+    s.revived = Observed::new(Tri::False, NOW);
+    s.coord_finished = Observed::new(Tri::True, NOW);
     s
 }
 
