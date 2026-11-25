@@ -693,9 +693,8 @@ impl LivezVerdict {
     }
 
     /// Whether a runner MAY be there: everything except a failed connect,
-    /// bytes that are not HTTP, and a complete HTTP answer that is not a
-    /// runner's. A caller that DESTROYS something
-    /// on a "dead" verdict (a sibling's credential file, its registration)
+    /// bytes that are not HTTP, and a complete status line with a code no
+    /// runner sends. A caller that DESTROYS something on a "dead" verdict (a sibling's credential file, its registration)
     /// uses this, so a live runner that was merely slow ([`Self::Silent`]) is
     /// never taken for dead — a false "dead" there costs a live sibling its
     /// credentials, while a false "alive" keeps a leftover for as long as the
@@ -811,7 +810,8 @@ pub fn classify_livez_response(raw: &[u8]) -> LivezVerdict {
 
 /// Whether a runner MAY be on `127.0.0.1:port` ([`LivezVerdict::may_be_alive`]):
 /// false only when the connect fails, or the port's holder answers with bytes
-/// that are not HTTP or with a complete non-runner HTTP answer. For callers that reap or deregister on `false`. A silent port is
+/// that are not HTTP or with a complete status line carrying a code no runner
+/// sends. For callers that reap or deregister on `false`. A silent port is
 /// kept: under a socket unit that may be a dead runner's port, but the runner
 /// that owns that port reaps its own leftovers when it comes back, and a
 /// sibling must never reap a live-but-loaded runner's files.
@@ -936,11 +936,12 @@ mod tests {
         drop(silent);
     }
 
-    /// An HTTP-looking reply the server did not finish is `Silent` (a loaded
-    /// live runner cut off by the deadline looks like that); a finished one,
-    /// or bytes that are not HTTP, are believed.
+    /// A reply cut off before its status line was complete, or a 503 cut off
+    /// before its body, is `Silent` (a loaded live runner looks like that); a
+    /// complete non-runner status line, or bytes that are not HTTP, are
+    /// believed with or without EOF.
     #[test]
-    fn a_cut_off_http_reply_is_silent_and_a_finished_one_is_not() {
+    fn a_reply_cut_off_before_its_status_line_or_a_503_body_is_silent() {
         let resolve = |raw: &[u8], closed: bool| {
             resolve_probe_reply(classify_livez_response(raw), raw, closed)
         };
@@ -964,6 +965,8 @@ mod tests {
                 "closed={closed}"
             );
         }
+        // A complete status line whose code does not parse is not a runner's.
+        assert_eq!(resolve(b"HTTP/1.1 abc\r\n", false), LivezVerdict::NoAnswer);
         // A finished 503 without the booting code is not a runner's.
         assert_eq!(
             resolve(b"HTTP/1.1 503 Service Unavailable\r\n\r\nx", true),
