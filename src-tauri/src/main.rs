@@ -240,6 +240,11 @@ mod pm_detect;
 mod process_capture;
 pub(crate) use qontinui_runner_lib::process_deadline;
 pub(crate) use qontinui_runner_lib::process_helpers;
+/// The durable record of every resource-guard refusal or deferral, posted to
+/// coord with the box's stats (plan
+/// `2026-11-24-pressure-stops-record-box-stats-in-coord`, Phase 3). Every
+/// hook site is a `resource_guard` verdict.
+mod pressure_stop;
 /// Projects dashboard — the server-side join over the saved-project
 /// registry (`ProjectSnapshot`). See `commands::saved_projects` for the
 /// registry itself.
@@ -264,11 +269,6 @@ mod repo_detection;
 /// (`terminal::session`) and the secondary runner process (`instance_manager`) —
 /// sit in different subtrees.
 mod resource_guard;
-/// The durable record of every resource-guard refusal or deferral, posted to
-/// coord with the box's stats (plan
-/// `2026-11-24-pressure-stops-record-box-stats-in-coord`, Phase 3). Beside
-/// `resource_guard` because every hook site is a guard verdict.
-mod pressure_stop;
 mod restate;
 mod rework;
 mod routing;
