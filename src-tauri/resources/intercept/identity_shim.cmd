@@ -107,41 +107,52 @@ set "REPLACEMENT_PROMPT=0"
 rem The VALUE of a Claude Code option is not a session choice (--name resume,
 rem --model -c), so it is skipped: a single-value option consumes its next
 rem token even when that is --, a variadic one consumes up to the next token
-rem starting with - (commander's rules). Nothing after a bare -- is a choice.
+rem that is an option (longer than "-" and starting with -), as commander
+rem does. Nothing after a bare -- is a choice.
 rem These two lists are the Rust CLAUDE_VALUE_FLAGS / CLAUDE_VARIADIC_FLAGS in
 rem src/claude_env.rs, and a test there pins them together: keep each on its
 rem one `set` line, space-separated, with a space after = and before the quote.
+rem The scan walks %1 with SHIFT rather than `for %%A in (%*)`, which treats a
+rem token holding * or ? as a file pattern and DROPS it when nothing matches
+rem (`--name "Why?" -c` would then read -c as the name). SHIFT leaves %* intact
+rem for the exec lines below. Residual: cmd splits arguments on = , ; so an
+rem inline `--add-dir=a` reads as `--add-dir a` here, unlike the Rust and bash
+rem scans; `--append-system-prompt-file=x` relies on that split (below).
 set "VALUE_FLAGS= --name -n --model --fallback-model --permission-mode --permission-prompt-tool --append-system-prompt --append-system-prompt-file --system-prompt --system-prompt-file --output-format --input-format --settings --setting-sources --agent --agents --effort --max-turns --max-budget-usd --json-schema --plugin-dir "
 set "VARIADIC_FLAGS= --add-dir --allowedTools --allowed-tools --disallowedTools --disallowed-tools --mcp-config --tools --betas "
 set "SKIP_VALUES=0"
 set "OPTS_ENDED=0"
-for %%A in (%*) do (
-  set "TOK=%%~A"
-  set "IS_VALUE=0"
-  if "!SKIP_VALUES!"=="2" (
-    if "!TOK:~0,1!"=="-" (set "SKIP_VALUES=0") else (set "IS_VALUE=1")
-  )
-  if "!SKIP_VALUES!"=="1" (
-    set "SKIP_VALUES=0"
-    set "IS_VALUE=1"
-  )
-  if "!IS_VALUE!"=="0" if "!OPTS_ENDED!"=="0" (
-    if "!TOK!"=="--" set "OPTS_ENDED=1"
-    if /I "!TOK!"=="--session-id" set "USER_CHOSE=1"
-    if /I "!TOK!"=="--resume" set "USER_CHOSE=1"
-    if /I "!TOK!"=="-r" set "USER_CHOSE=1"
-    if /I "!TOK!"=="resume" set "USER_CHOSE=1"
-    if /I "!TOK!"=="--continue" set "USER_CHOSE=1"
-    if /I "!TOK!"=="-c" set "USER_CHOSE=1"
-    for %%F in (!VALUE_FLAGS!) do if "!TOK!"=="%%F" set "SKIP_VALUES=1"
-    for %%F in (!VARIADIC_FLAGS!) do if "!TOK!"=="%%F" set "SKIP_VALUES=2"
-  )
-  if "!PREV_APF!"=="1" if defined QONTINUI_POLICY_DELIVERED_FILE if /I "!TOK!"=="!QONTINUI_POLICY_DELIVERED_FILE!" set "KEEP_POLICY_SHA=1"
-  set "PREV_APF=0"
-  if /I "!TOK!"=="--append-system-prompt-file" set "PREV_APF=1"
-  if /I "!TOK!"=="--system-prompt" set "REPLACEMENT_PROMPT=1"
-  if /I "!TOK!"=="--system-prompt-file" set "REPLACEMENT_PROMPT=1"
+:scan_args
+if [%1]==[] goto :scan_args_done
+set "TOK=%~1"
+set "IS_VALUE=0"
+set "IS_OPTION=0"
+if "!TOK:~0,1!"=="-" if not "!TOK!"=="-" set "IS_OPTION=1"
+if "!SKIP_VALUES!"=="2" if "!IS_OPTION!"=="1" set "SKIP_VALUES=0"
+if "!SKIP_VALUES!"=="2" set "IS_VALUE=1"
+if "!SKIP_VALUES!"=="1" (
+  set "SKIP_VALUES=0"
+  set "IS_VALUE=1"
 )
+if "!IS_VALUE!"=="0" if "!OPTS_ENDED!"=="0" (
+  if "!TOK!"=="--" set "OPTS_ENDED=1"
+  if /I "!TOK!"=="--session-id" set "USER_CHOSE=1"
+  if /I "!TOK!"=="--resume" set "USER_CHOSE=1"
+  if /I "!TOK!"=="-r" set "USER_CHOSE=1"
+  if /I "!TOK!"=="resume" set "USER_CHOSE=1"
+  if /I "!TOK!"=="--continue" set "USER_CHOSE=1"
+  if /I "!TOK!"=="-c" set "USER_CHOSE=1"
+  for %%F in (!VALUE_FLAGS!) do if "!TOK!"=="%%F" set "SKIP_VALUES=1"
+  for %%F in (!VARIADIC_FLAGS!) do if "!TOK!"=="%%F" set "SKIP_VALUES=2"
+)
+if "!PREV_APF!"=="1" if defined QONTINUI_POLICY_DELIVERED_FILE if /I "!TOK!"=="!QONTINUI_POLICY_DELIVERED_FILE!" set "KEEP_POLICY_SHA=1"
+set "PREV_APF=0"
+if /I "!TOK!"=="--append-system-prompt-file" set "PREV_APF=1"
+if /I "!TOK!"=="--system-prompt" set "REPLACEMENT_PROMPT=1"
+if /I "!TOK!"=="--system-prompt-file" set "REPLACEMENT_PROMPT=1"
+shift
+goto :scan_args
+:scan_args_done
 
 rem ---- spawn-time policy delivery marker -------------------------------------
 rem QONTINUI_POLICY_DELIVERED_SHA says THIS claude received the policy body in
@@ -149,7 +160,7 @@ rem its system prompt, and QONTINUI_POLICY_DELIVERED_FILE names the composed
 rem file it rode in. Only a claude whose argv passes THAT file to
 rem --append-system-prompt-file did; an inherited marker on a nested claude
 rem (bare, or with its own --append-system-prompt-file) would make the policy
-rem hook skip a body that session never got. (The `for` above splits
+rem hook skip a body that session never got. (cmd's argument parsing splits
 rem `--append-system-prompt-file=x` on `=`, so the file is the token after the
 rem flag in both spellings.) A REPLACEMENT prompt (--system-prompt[-file])
 rem withholds it as well: whether Claude Code still applies the append file

@@ -117,11 +117,15 @@ pub fn claude_argv_chooses_session<S: AsRef<str>>(args: &[S]) -> bool {
         if CLAUDE_VALUE_FLAGS.contains(&a) {
             tokens.next();
         } else if CLAUDE_VARIADIC_FLAGS.contains(&a) {
-            // Variadic options take every following token up to the next one
-            // that starts with `-` (commander's rule), so a `resume` in that
-            // run is a value. A `--` also starts with `-`, so it ends the run
-            // and is then read as the terminator.
-            while tokens.next_if(|v| !v.starts_with('-')).is_some() {}
+            // Variadic options take every following token up to the next
+            // option, i.e. one longer than `-` that starts with it
+            // (commander's `maybeOption`), so a `resume` or a lone `-` in that
+            // run is a value. A `--` is an option by that test, so it ends the
+            // run and is then read as the terminator.
+            while tokens
+                .next_if(|v| !(v.len() > 1 && v.starts_with('-')))
+                .is_some()
+            {}
         }
     }
     false
@@ -267,12 +271,108 @@ mod tests {
             &["--name=resume"],
             &["--add-dir", "a", "--", "-c"],
             &["--plugin-dir", "p", "--verbose"],
+            &["--add-dir", "a", "-", "resume"],
         ] {
             assert!(
                 !claude_argv_chooses_session(argv),
                 "{argv:?} chooses no session"
             );
         }
+    }
+
+    /// One argv table every session-choice scan is held to: the Rust scan
+    /// here, and the bash / .cmd identity shim loops below. `true` = the argv
+    /// already chooses a session, so the shim must not pin.
+    const SCAN_CASES: &[(&[&str], bool)] = &[
+        (&["--session-id", "x"], true),
+        (&["--resume"], true),
+        (&["-r", "x"], true),
+        (&["resume"], true),
+        (&["--continue"], true),
+        (&["-c"], true),
+        (&["--verbose", "resume"], true),
+        (&["--model", "opus", "-c"], true),
+        (&["--add-dir", "a", "b", "--continue"], true),
+        (&["--name", "--", "-c"], true),
+        (&["--name", "", "-c"], true),
+        (&["--name", "resume"], false),
+        (&["-n", "-c"], false),
+        (&["--model", "-r"], false),
+        (&["--add-dir", "a", "resume"], false),
+        (&["--add-dir", "", "resume"], false),
+        (&["--allowedTools", "Bash", "resume", "--", "-c"], false),
+        (&["--", "resume"], false),
+        (&["--add-dir", "a", "--", "-c"], false),
+        (&["--plugin-dir", "p", "--verbose"], false),
+        (&["--add-dir", "a", "-", "resume"], false),
+        (&["-p", "hi"], false),
+        (&["--name", "Why?", "-c"], true),
+        (&["--name", "x*", "-c"], true),
+    ];
+
+    #[test]
+    fn the_rust_scan_matches_the_shared_table() {
+        for (argv, want) in SCAN_CASES {
+            assert_eq!(claude_argv_chooses_session(argv), *want, "{argv:?}");
+        }
+    }
+
+    /// Run `loop_body` (one shim's scan, extracted verbatim) over every row of
+    /// [`SCAN_CASES`] and compare what it prints with the table.
+    fn assert_script_scan_matches(program: &str, pre_args: &[&str], file_name: &str, script: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(file_name);
+        std::fs::write(&path, script).unwrap();
+        for (argv, want) in SCAN_CASES {
+            let out = std::process::Command::new(program)
+                .args(pre_args)
+                .arg(&path)
+                .args(argv.iter())
+                .output()
+                .unwrap_or_else(|e| panic!("{program} did not start: {e}"));
+            let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let want = if *want { "1" } else { "0" };
+            assert_eq!(got, want, "{program} scan of {argv:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_bash_shim_scan_matches_the_shared_table() {
+        const BASH: &str = include_str!("../resources/intercept/identity_shim.bash");
+        let start = BASH
+            .find("user_chose_session=0\n")
+            .expect("bash shim has the scan");
+        let end = BASH
+            .get(start..)
+            .and_then(|rest| rest.find("\ndone\n"))
+            .expect("bash scan loop closes")
+            + start
+            + "\ndone\n".len();
+        let body = BASH.get(start..end).expect("scan slice");
+        let script = format!("{body}echo \"$user_chose_session\"\n");
+        assert_script_scan_matches("bash", &[], "scan.sh", &script);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_cmd_shim_scan_matches_the_shared_table() {
+        const CMD: &str = include_str!("../resources/intercept/identity_shim.cmd");
+        let start = CMD
+            .find("set \"USER_CHOSE=0\"")
+            .expect("cmd shim has the scan");
+        let end = CMD
+            .get(start..)
+            .and_then(|rest| rest.find(":scan_args_done"))
+            .expect("cmd scan loop closes")
+            + start
+            + ":scan_args_done".len();
+        let body = CMD.get(start..end).expect("scan slice");
+        let script = format!(
+            "@echo off\r\nsetlocal EnableDelayedExpansion\r\n{}\r\necho !USER_CHOSE!\r\n",
+            body.replace("\r\n", "\n").replace('\n', "\r\n")
+        );
+        assert_script_scan_matches("cmd.exe", &["/d", "/c"], "scan.cmd", &script);
     }
 
     /// The script shims carry their own copies of the two option lists. Every
