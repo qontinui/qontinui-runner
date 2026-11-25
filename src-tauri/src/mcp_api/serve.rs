@@ -139,28 +139,163 @@ pub(crate) fn lan_reachable_for_bound_addr(addr: &std::net::SocketAddr) -> bool 
     !addr.ip().is_loopback()
 }
 
-/// Try to bind to a port with SO_REUSEADDR
-pub(super) fn try_bind_port(port: u16) -> Result<std::net::TcpListener, std::io::Error> {
-    // Create socket with SO_REUSEADDR to allow binding even if there are zombie connections
-    // This is necessary on Windows where TIME_WAIT/CLOSE_WAIT sockets can block port binding
-    let socket = socket2::Socket::new(
-        socket2::Domain::IPV4,
-        socket2::Type::STREAM,
-        Some(socket2::Protocol::TCP),
-    )?;
-    socket.set_reuse_address(true)?;
-    socket.set_nonblocking(true)?;
-    // Bind loopback only: all consumers (Claude Code, supervisor, web frontend) are
-    // co-located with the runner. Loopback traffic bypasses Windows Firewall, so
-    // every uniquely-renamed `qontinui-runner-<id>.exe` copy avoids triggering a
-    // first-run permission prompt. Also reduces attack surface — the API is never
-    // exposed to LAN. Every URL the runner builds for its own API names this SAME
-    // constant (`runner_loopback_base`), so the address a self-call dials cannot
-    // drift from the address bound here.
-    socket
-        .bind(&std::net::SocketAddr::from((crate::mcp::types::RUNNER_API_BIND_IP, port)).into())?;
-    socket.listen(1024)?;
-    Ok(socket.into())
+/// The address the API listener serves `port` on: `RUNNER_API_BIND_IP:port`,
+/// bound by `listeners::bind_reuseaddr` (SO_REUSEADDR, non-blocking, backlog
+/// 1024) or adopted from an inherited fd checked to be on exactly this address.
+///
+/// Loopback only: all consumers (Claude Code, supervisor, web frontend) are
+/// co-located with the runner. Loopback traffic bypasses Windows Firewall, so
+/// every uniquely-renamed `qontinui-runner-<id>.exe` copy avoids triggering a
+/// first-run permission prompt. Also reduces attack surface — the API is never
+/// exposed to LAN. Every URL the runner builds for its own API names this SAME
+/// constant (`runner_loopback_base`), so the address a self-call dials cannot
+/// drift from the address bound here.
+fn api_addr(port: u16) -> std::net::SocketAddr {
+    std::net::SocketAddr::from((crate::mcp::types::RUNNER_API_BIND_IP, port))
+}
+
+/// Acquire the API listener.
+///
+/// When an `api` fd was inherited (`inherited_api`), ONLY `port` is tried: the
+/// socket the supervisor of this process (a systemd socket unit, or a
+/// predecessor handing off) holds is the address every client dials, so moving
+/// to `port + 1` would leave them queued on a socket nobody serves. Otherwise
+/// `fallback_ports` (from `instance::api_ports_to_try`) are walked in order, as
+/// they always were. `adopt_or_bind` is `listeners::adopt_or_bind` bound to
+/// the `api` name in production; tests inject a store.
+pub(super) fn acquire_api_listener_with(
+    port: u16,
+    fallback_ports: &[u16],
+    inherited_api: bool,
+    adopt_or_bind: impl Fn(
+        std::net::SocketAddr,
+    ) -> std::io::Result<qontinui_runner_lib::listeners::AcquiredListener>,
+) -> Result<(qontinui_runner_lib::listeners::AcquiredListener, u16), std::io::Error> {
+    let only_requested = [port];
+    let ports: &[u16] = if inherited_api {
+        &only_requested
+    } else {
+        fallback_ports
+    };
+    let mut last_error = None;
+    for &try_port in ports {
+        info!("MCP API server: adopt_or_bind(api, {})...", try_port);
+        match adopt_or_bind(api_addr(try_port)) {
+            Ok(acquired) => return Ok((acquired, try_port)),
+            Err(e) => {
+                warn!("Failed to bind to port {}: {}", try_port, e);
+                last_error = Some(e);
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| std::io::Error::other("All ports failed")))
+}
+
+/// The answer to every request while the listener is adopted and the router is
+/// not built yet: `503`, `Retry-After: 2`, `ApiResponse` envelope with code
+/// `RUNNER_BOOTING`. Answering beats leaving the connection queued: a client
+/// learns the runner is coming back instead of waiting out its own timeout.
+pub(super) fn booting_response() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let body = crate::mcp::types::ApiResponse::<()>::error_with_code(
+        "the runner is booting: it holds its listener but its routes are not ready yet — \
+         retry after the Retry-After interval",
+        qontinui_runner_lib::listeners::RUNNER_BOOTING_CODE,
+    );
+    (
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        [(axum::http::header::RETRY_AFTER, "2")],
+        axum::Json(body),
+    )
+        .into_response()
+}
+
+/// Where the real router lands once `start_server` has built it.
+pub(super) type RouterSlot = Arc<std::sync::OnceLock<axum::Router>>;
+
+/// The service an adopted listener serves from the moment it is adopted: every
+/// request is answered [`booting_response`] until `slot` holds the real router,
+/// and is handed to that router from then on. One connection may span the
+/// swap (HTTP/1.1 keep-alive): each REQUEST reads the slot, so nothing is
+/// dropped and nothing is re-dialled.
+pub(super) fn booting_gate(slot: RouterSlot) -> axum::Router {
+    axum::Router::new().fallback(move |req: axum::extract::Request| {
+        let slot = slot.clone();
+        async move {
+            match slot.get() {
+                Some(router) => {
+                    let mut router = router.clone();
+                    match tower::Service::call(&mut router, req).await {
+                        Ok(response) => response,
+                        Err(never) => match never {},
+                    }
+                }
+                None => booting_response(),
+            }
+        }
+    })
+}
+
+/// An API listener adopted at boot and already being served by the
+/// [`booting_gate`], waiting for `start_server` to install the router.
+struct EarlyApi {
+    port: u16,
+    local_addr: Option<std::net::SocketAddr>,
+    slot: RouterSlot,
+    served: tokio::task::JoinHandle<std::io::Result<()>>,
+}
+
+static EARLY_API: std::sync::Mutex<Option<EarlyApi>> = std::sync::Mutex::new(None);
+
+fn take_early_api() -> Option<EarlyApi> {
+    EARLY_API
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take()
+}
+
+/// When an `api` listener was inherited (socket activation, or a predecessor's
+/// handoff), adopt it NOW and start answering it — every request gets
+/// [`booting_response`] until `start_server` installs the router.
+///
+/// Called from `run_app` as soon as logging exists, long before the Tauri
+/// setup reaches `start_server`: under a socket unit every connect made during
+/// boot is already queued in this socket's backlog, and the earlier it is
+/// accepted the sooner its client gets an answer. A plain launch (nothing
+/// inherited) does nothing here, so the normal boot path is unchanged.
+pub fn start_early_api_if_inherited() {
+    use qontinui_runner_lib::listeners::{self, API_LISTENER_NAME};
+    if !listeners::has_inherited(API_LISTENER_NAME) {
+        return;
+    }
+    let port = crate::mcp::types::get_mcp_api_port();
+    let listener = match listeners::take_inherited(API_LISTENER_NAME, api_addr(port)) {
+        Ok(Some(listener)) => listener,
+        Ok(None) => return,
+        Err(e) => {
+            warn!(
+                port,
+                error = %e,
+                "MCP API server: the inherited `api` listener is unusable and was closed — \
+                 the API will be bound at the usual point in boot"
+            );
+            return;
+        }
+    };
+    let local_addr = listener.local_addr().ok();
+    let slot: RouterSlot = Arc::new(std::sync::OnceLock::new());
+    let served = serve_on_dedicated_runtime(listener, booting_gate(slot.clone()), port);
+    info!(
+        port,
+        "MCP API server: adopted the inherited `api` listener at boot; answering 503 \
+         RUNNER_BOOTING until the router is ready"
+    );
+    *EARLY_API.lock().unwrap_or_else(|p| p.into_inner()) = Some(EarlyApi {
+        port,
+        local_addr,
+        slot,
+        served,
+    });
 }
 
 /// FINDING 3 — `/health` must not leak a tokio blocking thread per poll for
@@ -401,7 +536,7 @@ const API_RUNTIME_WORKER_THREADS: usize = 4;
 
 /// The dedicated local-API runtime, kept alive for the process's lifetime.
 ///
-/// It MUST outlive [`serve_on_dedicated_runtime`]'s stack frame: dropping a
+/// It MUST outlive the call to [`serve_on_dedicated_runtime`] that builds it: dropping a
 /// `Runtime` shuts its workers down, which would stop the server we just
 /// started — and dropping one from inside an async context panics outright.
 #[expect(
@@ -443,11 +578,21 @@ static API_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::On
 /// that created it. Building it here and moving it would leave it driven by the
 /// app runtime — reintroducing the coupling this function removes, and silently.
 /// So the *std* listener is what moves, and `from_std` runs on the far side.
-async fn serve_on_dedicated_runtime(
+fn serve_on_dedicated_runtime(
     std_listener: std::net::TcpListener,
     router: axum::Router,
     port: u16,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> tokio::task::JoinHandle<std::io::Result<()>> {
+    // Refuse every connection whose peer process runs as a different OS user
+    // (plan 2026-10-04-runner-loopback-api-refuses-other-local-users). Wrapped
+    // INSIDE the spawned task, on the runtime that serves it, because the
+    // guard's accept task is spawned on the runtime that wraps it.
+    let serve = async move {
+        let listener = tokio::net::TcpListener::from_std(std_listener)?;
+        let listener =
+            qontinui_runner_lib::peer_user_guard::GuardedListener::wrap(listener, "local-api")?;
+        axum::serve(listener, router).await
+    };
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(API_RUNTIME_WORKER_THREADS)
         .enable_all()
@@ -465,31 +610,20 @@ async fn serve_on_dedicated_runtime(
                  back to the shared app runtime. The API will again go deaf if \
                  any other subsystem blocks the app runtime's workers."
             );
-            let listener = tokio::net::TcpListener::from_std(std_listener)?;
-            let listener =
-                qontinui_runner_lib::peer_user_guard::GuardedListener::wrap(listener, "local-api")?;
-            return axum::serve(listener, router).await.map_err(Into::into);
+            return tauri::async_runtime::handle().inner().spawn(serve);
         }
     };
 
-    // `Runtime::spawn` schedules onto `rt`'s workers from this (app-runtime)
-    // thread, so no raw thread handoff is needed and there is no window in
-    // which the listener is owned by a thread that failed to start.
-    let served = rt.spawn(async move {
-        let listener = tokio::net::TcpListener::from_std(std_listener)?;
-        // Refuse every connection whose peer process runs as a different OS
-        // user (plan 2026-10-04-runner-loopback-api-refuses-other-local-users).
-        // Wrapped HERE, on the dedicated runtime, because the guard's accept
-        // task is spawned on the runtime that wraps it.
-        let listener =
-            qontinui_runner_lib::peer_user_guard::GuardedListener::wrap(listener, "local-api")?;
-        axum::serve(listener, router).await
-    });
+    // `Runtime::spawn` schedules onto `rt`'s workers from this thread (an app
+    // runtime worker, or `run_app`'s thread on the early-adoption path), so no
+    // raw thread handoff is needed and there is no window in which the
+    // listener is owned by a thread that failed to start.
+    let served = rt.spawn(serve);
 
-    // Park the runtime in a process-lifetime home. `set` can only fail if
-    // `start_server` ran twice; forgetting the loser is deliberate — dropping
-    // it here would shut down workers (and panic, since we are inside an async
-    // context) instead of leaking one runtime in a case that cannot occur once.
+    // Park the runtime in a process-lifetime home. `set` can only fail if the
+    // API were served twice; forgetting the loser is deliberate — dropping it
+    // here would shut down workers (and panic inside an async context) instead
+    // of leaking one runtime in a case that cannot occur once.
     if let Err(loser) = API_RUNTIME.set(rt) {
         std::mem::forget(loser);
     }
@@ -499,12 +633,119 @@ async fn serve_on_dedicated_runtime(
         workers = API_RUNTIME_WORKER_THREADS,
         "MCP API server: serving on a dedicated tokio runtime (isolated from the app runtime)"
     );
+    served
+}
 
+/// Wait for a serve task started by [`serve_on_dedicated_runtime`].
+async fn await_api_serve(
+    served: tokio::task::JoinHandle<std::io::Result<()>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match served.await {
         Ok(r) => r.map_err(Into::into),
         Err(e) => Err(Box::new(std::io::Error::other(format!(
             "MCP API serve task ended abnormally: {e}"
         )))),
+    }
+}
+
+/// Everything the runner records once it HOLDS its API listener, before any
+/// route is served: the bound port in `AppState` and the install shim, the
+/// LAN-reachability bit, the boot stage, and the loopback handshake key plus
+/// the breadcrumb that names it.
+fn record_api_listener(
+    app_state: &AppState,
+    requested_port: u16,
+    bound_port: u16,
+    local_addr: Option<std::net::SocketAddr>,
+) {
+    // Record whether the ACTUAL bound address is LAN-reachable (non-loopback).
+    // Read from the listener rather than assumed, so the heartbeat's
+    // `lan_reachable` advertisement stays honest if the bind strategy ever
+    // changes. Currently always false: the API listens on 127.0.0.1 only
+    // (intentional — see `api_addr`), and an adopted listener is checked
+    // to be on exactly that address.
+    let lan_bound = local_addr
+        .map(|addr| lan_reachable_for_bound_addr(&addr))
+        .unwrap_or(false);
+    app_state.api_lan_bound.store(lan_bound, Ordering::Relaxed);
+    if bound_port != requested_port {
+        warn!(
+            "Primary port {} was blocked, using fallback port {}. \
+             Restart the app after zombie connections clear.",
+            requested_port, bound_port
+        );
+    }
+    info!("MCP API server listening on port {}", bound_port);
+
+    // Store the actual bound port in AppState
+    app_state.api_port.store(bound_port, Ordering::Relaxed);
+
+    // Mirror the bound port into the install-interception shim's
+    // process-global so the terminal env-seam (which has no `app_state`)
+    // injects the CORRECT loopback port for secondary/temp runners — plan §6's
+    // #1 live-verification footgun. Set HERE, the same place app_state.api_port
+    // lands.
+    crate::install_effects_producer::intercept::set_bound_port(bound_port);
+    crate::boot_stage::stamp(crate::boot_stage::BootStage::ApiListenerBound);
+    // Bind latency from the process clock, logged on every start so the
+    // never-answered grace can be sized (and re-derived) from evidence, cold
+    // boots included.
+    let bind_latency_ms = crate::health_monitor::process_elapsed().as_millis() as u64;
+    info!(
+        port = bound_port,
+        bind_latency_ms,
+        "MCP API listener bound {bind_latency_ms} ms after process start"
+    );
+
+    // Rotate this runner start's SAME-USER loopback handshake key at the BOUND
+    // port's path (`~/.qontinui/runner-loopback-key-<port>`) and then advertise
+    // both the port and that path out-of-process in the breadcrumb record — the
+    // key BEFORE the record that names it, so a reader that sees the record can
+    // already read the key, and both BEFORE any route is served, so any caller
+    // that can reach `/health` can already drive
+    // `POST /coord-mcp/provision-session`. Keying on the bound port is what
+    // stops a second runner on this box (which shares `~/.qontinui`) from
+    // clobbering this one's key (plan
+    // 2026-09-07-the-runner-loopback-handshake-key-is-box-global-and-a-second-runner-clobbers-it).
+    // Synchronous and cheap; it never fails the boot — a write failure yields
+    // `None`, the record says so, and the mint route denies every request
+    // (fail-closed), which is a closed door, not an outage.
+    let key_path = crate::coord_mcp::publish_loopback_handshake_key(bound_port);
+    qontinui_runner_lib::runner_breadcrumb::publish(bound_port, key_path);
+}
+
+/// The API is serving routes: flip `api_ready`, tell systemd (`READY=1`), emit
+/// `api-ready`, and title the window for a non-default port or a named
+/// instance.
+fn announce_api_ready(app_state: &AppState, emitter: &tauri::AppHandle, port: u16) {
+    // Signal that the API is ready for requests
+    app_state.api_ready.store(true, Ordering::Relaxed);
+    // systemd `READY=1` half (plan 2026-10-19 Phase 2b); no-op without
+    // `NOTIFY_SOCKET`.
+    crate::sd_notify::mark_http_serving();
+    if let Err(e) = emitter.emit("api-ready", port) {
+        warn!("Failed to emit api-ready event: {}", e);
+    } else {
+        info!("Emitted api-ready event (port {})", port);
+    }
+
+    // Update window title if using non-default port or instance name
+    let default_port = crate::mcp::types::MCP_API_PORT;
+    let instance_name = crate::instance::instance_name();
+    let needs_title_update = port != default_port || instance_name.is_some();
+    if needs_title_update {
+        let title = match instance_name {
+            Some(name) => format!("Qontinui Runner — {} [:{}]", name, port),
+            None => format!("Qontinui Runner [:{}]", port),
+        };
+        if let Some(window) = emitter.get_webview_window(qontinui_runner_lib::get_main_window_label())
+        {
+            if let Err(e) = window.set_title(&title) {
+                warn!("Failed to set window title: {}", e);
+            } else {
+                info!("Window title set to: {}", title);
+            }
+        }
     }
 }
 
@@ -520,14 +761,14 @@ pub async fn start_server(
     let api_ready_flag = app_state.clone();
 
     // NOTE: this runner start's SAME-USER loopback handshake key is rotated in
-    // the bind-success arm below, NOT here — it is keyed on the port this
-    // runner ACTUALLY binds, which is unknown until the bind loop settles (a
+    // `record_api_listener`, NOT here — it is keyed on the port this runner
+    // ACTUALLY holds, which is unknown until the listener is acquired (a
     // blocked primary port silently promotes the runner onto `port + 1`).
 
     crate::boot_stage::stamp(crate::boot_stage::BootStage::ApiRouterBuild);
     info!("MCP API server: building router via create_router...");
     let router = create_router(app_state, rag_state, app_handle, instance_manager);
-    info!("MCP API server: create_router returned, entering bind loop");
+    info!("MCP API server: create_router returned, acquiring the listener");
 
     // The PG circuit breaker's prober needs a process-lived runtime: this one.
     // On a degraded boot (breaker Open, `cause=boot`) the prober starts now and
@@ -541,120 +782,227 @@ pub async fn start_server(
         crate::database::pg::health::spawn_health_refresher();
     }
 
-    // Try the requested port first, then fallback ports if zombie connections are blocking
-    // This can happen on Windows when previous process crashes leave orphaned sockets
     crate::boot_stage::stamp(crate::boot_stage::BootStage::ApiBindLoop);
-    let ports_to_try = crate::instance::api_ports_to_try(port);
-    let mut last_error = None;
 
-    for try_port in ports_to_try {
-        info!("MCP API server: try_bind_port({})...", try_port);
-        match try_bind_port(try_port) {
-            Ok(std_listener) => {
-                // Record whether the ACTUAL bound address is LAN-reachable
-                // (non-loopback). Read from the listener rather than assumed,
-                // so the heartbeat's `lan_reachable` advertisement stays
-                // honest if the bind strategy ever changes. Currently always
-                // false: `try_bind_port` binds 127.0.0.1 only (intentional —
-                // see the comment there).
-                let lan_bound = std_listener
-                    .local_addr()
-                    .map(|addr| lan_reachable_for_bound_addr(&addr))
-                    .unwrap_or(false);
-                api_ready_flag
-                    .api_lan_bound
-                    .store(lan_bound, Ordering::Relaxed);
-                if try_port != port {
-                    warn!(
-                        "Primary port {} was blocked, using fallback port {}. \
-                         Restart the app after zombie connections clear.",
-                        port, try_port
-                    );
-                }
-                info!("MCP API server listening on port {}", try_port);
-
-                // Store the actual bound port in AppState
-                api_ready_flag.api_port.store(try_port, Ordering::Relaxed);
-
-                // Mirror the bound port into the install-interception shim's
-                // process-global so the terminal env-seam (which has no
-                // `app_state`) injects the CORRECT loopback port for
-                // secondary/temp runners — plan §6's #1 live-verification
-                // footgun. Set HERE, the same place app_state.api_port lands.
-                crate::install_effects_producer::intercept::set_bound_port(try_port);
-                crate::boot_stage::stamp(crate::boot_stage::BootStage::ApiListenerBound);
-                // Bind latency from the process clock, logged on every start so
-                // the never-answered grace can be sized (and re-derived) from
-                // evidence, cold boots included.
-                let bind_latency_ms = crate::health_monitor::process_elapsed().as_millis() as u64;
-                info!(
-                    port = try_port,
-                    bind_latency_ms,
-                    "MCP API listener bound {bind_latency_ms} ms after process start"
-                );
-
-                // Rotate this runner start's SAME-USER loopback handshake key at
-                // the BOUND port's path (`~/.qontinui/runner-loopback-key-<port>`)
-                // and then advertise both the port and that path out-of-process
-                // in the breadcrumb record — the key BEFORE the record that
-                // names it, so a reader that sees the record can already read
-                // the key, and both BEFORE the socket is served, so any caller
-                // that can reach `/health` can already drive
-                // `POST /coord-mcp/provision-session`. Keying on the bound port
-                // is what stops a second runner on this box (which shares
-                // `~/.qontinui`) from clobbering this one's key (plan
-                // 2026-09-07-the-runner-loopback-handshake-key-is-box-global-
-                // and-a-second-runner-clobbers-it). Synchronous and cheap; it
-                // never fails the boot — a write failure yields `None`, the
-                // record says so, and the mint route denies every request
-                // (fail-closed), which is a closed door, not an outage.
-                let key_path = crate::coord_mcp::publish_loopback_handshake_key(try_port);
-                qontinui_runner_lib::runner_breadcrumb::publish(try_port, key_path);
-
-                // Port stored in api_ready_flag.api_port above; PG queries accept runner_port as parameter.
-
-                // Signal that the API is ready for requests
-                api_ready_flag.api_ready.store(true, Ordering::Relaxed);
-                // systemd `READY=1` half (plan 2026-10-19 Phase 2b); no-op
-                // without `NOTIFY_SOCKET`.
-                crate::sd_notify::mark_http_serving();
-                if let Err(e) = emitter.emit("api-ready", try_port) {
-                    warn!("Failed to emit api-ready event: {}", e);
-                } else {
-                    info!("Emitted api-ready event (port {})", try_port);
-                }
-
-                // Update window title if using non-default port or instance name
-                let default_port = crate::mcp::types::MCP_API_PORT;
-                let instance_name = crate::instance::instance_name();
-                let needs_title_update = try_port != default_port || instance_name.is_some();
-                if needs_title_update {
-                    let title = match instance_name {
-                        Some(name) => format!("Qontinui Runner — {} [:{}]", name, try_port),
-                        None => format!("Qontinui Runner [:{}]", try_port),
-                    };
-                    if let Some(window) =
-                        emitter.get_webview_window(qontinui_runner_lib::get_main_window_label())
-                    {
-                        if let Err(e) = window.set_title(&title) {
-                            warn!("Failed to set window title: {}", e);
-                        } else {
-                            info!("Window title set to: {}", title);
-                        }
-                    }
-                }
-
-                serve_on_dedicated_runtime(std_listener, router, try_port).await?;
-                return Ok(());
-            }
-            Err(e) => {
-                warn!("Failed to bind to port {}: {}", try_port, e);
-                last_error = Some(e);
-            }
+    // An inherited listener adopted at boot is already being answered by the
+    // booting gate: install the router behind it. No bind, no fallback port.
+    if let Some(early) = take_early_api() {
+        record_api_listener(&api_ready_flag, port, early.port, early.local_addr);
+        if early.slot.set(router).is_err() {
+            warn!("MCP API server: the booting gate already held a router — keeping it");
         }
+        info!(
+            port = early.port,
+            "MCP API server: router installed behind the adopted listener; booting gate open"
+        );
+        announce_api_ready(&api_ready_flag, &emitter, early.port);
+        return await_api_serve(early.served).await;
     }
 
-    Err(Box::new(last_error.unwrap_or_else(|| {
-        std::io::Error::other("All ports failed")
-    })))
+    // Try the requested port first, then fallback ports if zombie connections
+    // are blocking (Windows, after a crash leaves orphaned sockets) — unless an
+    // `api` listener was inherited, which never falls back.
+    use qontinui_runner_lib::listeners::{self, API_LISTENER_NAME};
+    let (acquired, bound_port) = acquire_api_listener_with(
+        port,
+        &crate::instance::api_ports_to_try(port),
+        listeners::has_inherited(API_LISTENER_NAME),
+        |addr| listeners::adopt_or_bind(API_LISTENER_NAME, addr),
+    )?;
+    info!(
+        port = bound_port,
+        origin = acquired.origin.as_str(),
+        "MCP API server: listener acquired"
+    );
+    record_api_listener(
+        &api_ready_flag,
+        port,
+        bound_port,
+        acquired.listener.local_addr().ok(),
+    );
+    announce_api_ready(&api_ready_flag, &emitter, bound_port);
+    await_api_serve(serve_on_dedicated_runtime(acquired.listener, router, bound_port)).await
+}
+
+#[cfg(test)]
+// Adoption is unix-only, so the adoption tests (and what they import) are too.
+#[cfg_attr(not(unix), allow(unused_imports))]
+mod listener_adoption_tests {
+    use super::{
+        acquire_api_listener_with, booting_gate, booting_response, serve_on_dedicated_runtime,
+        RouterSlot,
+    };
+    use qontinui_runner_lib::listeners::{
+        adopt_or_bind_from, bind_reuseaddr, AcquiredListener, InheritedListeners, ListenerOrigin,
+        API_LISTENER_NAME, ENV_LISTEN_FDNAMES, ENV_LISTEN_FDS, ENV_LISTEN_PID, RUNNER_BOOTING_CODE,
+    };
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
+    use std::sync::{Arc, Mutex};
+
+    /// A store holding one pre-bound listener named `api`, handed over through
+    /// the LISTEN_* protocol exactly as systemd would (fork-free: the fd number
+    /// is the protocol's start).
+    #[cfg(unix)]
+    fn store_with_inherited_api() -> (InheritedListeners, SocketAddr) {
+        use std::os::fd::IntoRawFd;
+        let pre = bind_reuseaddr(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let addr = pre.local_addr().unwrap();
+        let fd = pre.into_raw_fd();
+        let mut env = HashMap::from([
+            (ENV_LISTEN_PID.to_string(), "77".to_string()),
+            (ENV_LISTEN_FDS.to_string(), "1".to_string()),
+            (ENV_LISTEN_FDNAMES.to_string(), API_LISTENER_NAME.to_string()),
+        ]);
+        let (store, _) = InheritedListeners::from_env(&mut env, 77, fd);
+        assert!(env.is_empty(), "LISTEN_* must be cleared after adoption");
+        (store, addr)
+    }
+
+    /// An adopted listener is used as-is and the fallback loop never moves to
+    /// `port + 1` — not even to try binding it.
+    #[cfg(unix)]
+    #[test]
+    fn an_adopted_api_listener_never_falls_back_to_port_plus_one() {
+        let (store, addr) = store_with_inherited_api();
+        let port = addr.port();
+        let binds = Mutex::new(Vec::<u16>::new());
+        let (acquired, bound) = acquire_api_listener_with(
+            port,
+            &[port, port + 1, port + 2],
+            store.contains(API_LISTENER_NAME),
+            |a| {
+                adopt_or_bind_from(&store, API_LISTENER_NAME, a, |b| {
+                    binds.lock().unwrap().push(b.port());
+                    bind_reuseaddr(b)
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(acquired.origin, ListenerOrigin::Inherited);
+        assert_eq!(bound, port);
+        assert_eq!(acquired.listener.local_addr().unwrap(), addr);
+        assert!(binds.lock().unwrap().is_empty(), "nothing may be bound");
+    }
+
+    /// With an `api` fd inherited, a failure on the requested port is an
+    /// error — never a silent move to `port + 1`, which no client dials.
+    #[test]
+    fn an_inherited_api_that_fails_is_an_error_not_a_fallback() {
+        let tried = Mutex::new(Vec::<u16>::new());
+        let err = acquire_api_listener_with(9_876, &[9_876, 9_877, 9_878], true, |a| {
+            tried.lock().unwrap().push(a.port());
+            Err::<AcquiredListener, _>(std::io::Error::from(std::io::ErrorKind::AddrInUse))
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+        assert_eq!(*tried.lock().unwrap(), vec![9_876]);
+    }
+
+    /// Control: with nothing inherited the loop still walks the fallback ports
+    /// as it always did.
+    #[test]
+    fn a_plain_launch_keeps_the_fallback_loop() {
+        let tried = Mutex::new(Vec::<u16>::new());
+        let (acquired, bound) = acquire_api_listener_with(9_876, &[9_876, 9_877], false, |a| {
+            tried.lock().unwrap().push(a.port());
+            if a.port() == 9_876 {
+                Err(std::io::Error::from(std::io::ErrorKind::AddrInUse))
+            } else {
+                Ok(AcquiredListener {
+                    listener: bind_reuseaddr(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap(),
+                    origin: ListenerOrigin::Bound,
+                })
+            }
+        })
+        .unwrap();
+        assert_eq!(bound, 9_877);
+        assert_eq!(acquired.origin, ListenerOrigin::Bound);
+        assert_eq!(*tried.lock().unwrap(), vec![9_876, 9_877]);
+    }
+
+    #[tokio::test]
+    async fn the_booting_response_is_a_503_runner_booting_envelope_with_retry_after() {
+        let resp = booting_response();
+        assert_eq!(resp.status(), 503);
+        assert_eq!(resp.headers()["retry-after"], "2");
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["success"], false);
+        assert_eq!(v["code"], RUNNER_BOOTING_CODE);
+    }
+
+    async fn get(client: &reqwest::Client, addr: SocketAddr, path: &str) -> (u16, String, String) {
+        let resp = client
+            .get(format!("http://{addr}{path}"))
+            .send()
+            .await
+            .expect("a connect during boot must never be refused");
+        let status = resp.status().as_u16();
+        let retry = resp
+            .headers()
+            .get("retry-after")
+            .map(|v| v.to_str().unwrap().to_string())
+            .unwrap_or_default();
+        (status, retry, resp.text().await.unwrap())
+    }
+
+    /// The whole boot sequence over real sockets, through the production serve
+    /// path (dedicated runtime + peer-user guard): a listener handed over
+    /// through LISTEN_* is adopted; a client that connects while NOTHING
+    /// accepts yet (the simulated boot delay) gets an answer once serving
+    /// starts, not a refusal; requests before the router exists get
+    /// `503 RUNNER_BOOTING` + `Retry-After: 2`; once the router is installed the
+    /// SAME client (same keep-alive pool) gets `200`.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_connect_during_boot_gets_503_then_200_never_a_refusal() {
+        let (store, addr) = store_with_inherited_api();
+        let listener = store
+            .take(API_LISTENER_NAME, addr)
+            .unwrap()
+            .expect("the inherited api fd is adopted");
+
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .unwrap();
+
+        // Boot delay: the socket exists and nobody accepts. A request made now
+        // queues in the backlog.
+        let early = tokio::spawn({
+            let client = client.clone();
+            async move { get(&client, addr, "/livez").await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!early.is_finished(), "nothing accepts yet");
+
+        let slot: RouterSlot = Arc::new(std::sync::OnceLock::new());
+        let served = serve_on_dedicated_runtime(listener, booting_gate(slot.clone()), addr.port());
+
+        let (status, retry, body) = early.await.unwrap();
+        assert_eq!(status, 503, "{body}");
+        assert_eq!(retry, "2");
+        assert!(body.contains(RUNNER_BOOTING_CODE), "{body}");
+
+        let (status, _, body) = get(&client, addr, "/anything").await;
+        assert_eq!(status, 503);
+        assert!(body.contains(RUNNER_BOOTING_CODE), "{body}");
+
+        // The router is ready: install it behind the gate.
+        let router = axum::Router::new()
+            .route("/livez", axum::routing::get(|| async { "ok" }))
+            .fallback(super::not_found_handler);
+        assert!(slot.set(router).is_ok());
+
+        let (status, _, body) = get(&client, addr, "/livez").await;
+        assert_eq!((status, body.as_str()), (200, "ok"));
+        let (status, _, body) = get(&client, addr, "/no/such/route").await;
+        assert_eq!(status, 404, "the real router's own fallback answers: {body}");
+
+        served.abort();
+    }
 }

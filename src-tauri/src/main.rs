@@ -1777,6 +1777,19 @@ fn main() {
     // `outbound_net::log_startup_posture` in `run_app`.
     qontinui_runner_lib::outbound_net::apply_profile_environment_at_startup();
 
+    // Take every listening socket handed to this process through the
+    // `sd_listen_fds(3)` protocol (a systemd socket unit, or a predecessor's
+    // handoff) and REMOVE `LISTEN_PID` / `LISTEN_FDS` / `LISTEN_FDNAMES`, so no
+    // child believes the fds are its own; each taken fd is marked
+    // close-on-exec. HERE, beside the other environment writes, because
+    // removing a variable is sound only while no other thread exists. Nothing
+    // is validated or served yet, and nothing is logged (logging does not
+    // exist); `run_app` logs the outcome and starts answering an adopted API
+    // listener. Plan
+    // `2026-11-24-runner-upgrades-itself-daily-keeping-sessions-alive-with-no-outage-and-automatic-rollback`,
+    // Phase 2.
+    qontinui_runner_lib::listeners::adopt_inherited_at_startup();
+
     // Install the startup-panic hook FIRST, before any other setup. Panics
     // during early init (database connection, Tauri builder, axum router
     // construction) would otherwise vanish — the process exits with code 1
@@ -1870,6 +1883,16 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // N, source, mallopt's return code. An attempt, not proof; the health
     // monitor's `allocator` line carries the arena count that shows it holds.
     qontinui_runner_lib::malloc_tuning::log_startup_attempt();
+
+    // What `main` took from LISTEN_FDS before logging existed, then — when an
+    // `api` listener was inherited — start answering it NOW, on the dedicated
+    // API runtime, with 503 RUNNER_BOOTING until `mcp_api::start_server`
+    // installs the router. Under a socket unit every connect made while this
+    // process boots is already queued on that socket; accepting it this early
+    // turns a silent wait into an answer. A plain launch inherits nothing and
+    // this is a no-op, so the normal boot path is unchanged.
+    qontinui_runner_lib::listeners::log_startup_adoption();
+    mcp_api::start_early_api_if_inherited();
 
     // Best-effort live crash writer for the CATCHABLE subset (Windows
     // deliverable structured exceptions). The panic hooks above already write

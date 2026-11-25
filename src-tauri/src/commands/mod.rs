@@ -370,7 +370,7 @@ pub struct AppState {
     /// Whether the HTTP API server's actual bound address is LAN-reachable
     /// (i.e. it bound a non-loopback interface). Set by
     /// `mcp_api::start_server` from the listener's real local address at
-    /// bind time — currently always `false` because `try_bind_port`
+    /// bind time — currently always `false` because `mcp_api::serve::api_addr`
     /// intentionally binds `127.0.0.1` only — but DERIVED rather than
     /// hardcoded so a future non-loopback bind flips it automatically.
     /// Forwarded on backend heartbeats as `lan_reachable` so the fleet
