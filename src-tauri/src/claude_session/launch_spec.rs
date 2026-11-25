@@ -1567,6 +1567,28 @@ mod tests {
     #[test]
     fn of_two_pinned_session_flags_the_specs_kind_is_kept() {
         const ID: &str = "7b97f1e8-35c0-4bec-992d-63e5a3dc55d7";
+        // The other resume spellings: a resume_id pin keeps them over
+        // `--session-id`, whichever comes first.
+        for template in [
+            "claude --session-id {sessionId} -r {sessionId}",
+            "claude --session-id={sessionId} --resume={sessionId}",
+            "claude -r {sessionId} --session-id={sessionId}",
+        ] {
+            let mut s = spec();
+            s.resume_id = Some(ID.to_string());
+            let argv = render_argv(&s, &tmpl(template), "claude");
+            assert!(
+                !argv
+                    .iter()
+                    .any(|a| a == "--session-id" || a.starts_with("--session-id=")),
+                "{template}: {argv:?}"
+            );
+            assert!(
+                argv.iter()
+                    .any(|a| a == "-r" || a == &format!("--resume={ID}")),
+                "{template}: {argv:?}"
+            );
+        }
         for template in [
             "claude --session-id {sessionId} --resume {sessionId}",
             "claude --resume {sessionId} --session-id {sessionId}",

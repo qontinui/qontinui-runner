@@ -317,8 +317,15 @@ mod tests {
         }
     }
 
-    /// Run `loop_body` (one shim's scan, extracted verbatim) over every row of
-    /// [`SCAN_CASES`] and compare what it prints with the table.
+    /// Run `script` (one shim's scan, extracted verbatim, plus a line printing
+    /// its verdict) over every row of [`SCAN_CASES`] and compare what it prints
+    /// with the table. A failure names the exit status and stderr, so a script
+    /// that errored reads as an error, not as a bare 0-vs-1 mismatch.
+    ///
+    /// The `cmd /c` line holds more than two quotes on the empty-argument
+    /// rows, so a temp dir whose path contains a space would break it (cmd
+    /// strips the first and last quote); CI and default Windows temp paths
+    /// have none.
     fn assert_script_scan_matches(program: &str, pre_args: &[&str], file_name: &str, script: &str) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(file_name);
@@ -332,7 +339,13 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{program} did not start: {e}"));
             let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
             let want = if *want { "1" } else { "0" };
-            assert_eq!(got, want, "{program} scan of {argv:?}");
+            assert_eq!(
+                got,
+                want,
+                "{program} scan of {argv:?} (status {:?}, stderr {:?})",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
         }
     }
 
@@ -361,12 +374,16 @@ mod tests {
         let start = CMD
             .find("set \"USER_CHOSE=0\"")
             .expect("cmd shim has the scan");
+        // Anchor on the LABEL line: the text `:scan_args_done` first appears
+        // in the loop's own `goto :scan_args_done`, and a slice ending there
+        // would drop the loop body (review round 3, A1).
+        const LABEL: &str = "\n:scan_args_done";
         let end = CMD
             .get(start..)
-            .and_then(|rest| rest.find(":scan_args_done"))
+            .and_then(|rest| rest.find(LABEL))
             .expect("cmd scan loop closes")
             + start
-            + ":scan_args_done".len();
+            + LABEL.len();
         let body = CMD.get(start..end).expect("scan slice");
         let script = format!(
             "@echo off\r\nsetlocal EnableDelayedExpansion\r\n{}\r\necho !USER_CHOSE!\r\n",
