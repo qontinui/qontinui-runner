@@ -671,13 +671,13 @@ pub enum LivezVerdict {
     Booting,
     /// Some other HTTP status: something answers HTTP, but not as a runner.
     OtherStatus(u16),
-    /// The connect itself failed inside the budget (refused, unreachable, or
-    /// timed out before the handshake): nothing listens on the port.
+    /// Positively no runner: the connect failed inside the budget (refused,
+    /// unreachable, or timed out before the handshake), or the holder of the
+    /// port answered with bytes that do not start like `HTTP/`.
     NoAnswer,
-    /// The connect succeeded but nothing — or only a strict prefix of
-    /// `HTTP/` — came back inside the budget (silence or a reset). Bytes that
-    /// are not HTTP are [`Self::NoAnswer`] instead: they prove something other
-    /// than a runner holds the port. Two different
+    /// The connect succeeded but no runner's answer came back: nothing at all
+    /// (silence or a reset), or an HTTP-looking reply the server had not
+    /// finished when the budget ran out (see `resolve_probe_reply`). Two different
     /// worlds look like this and a probe cannot tell them apart: a socket unit
     /// holding a DEAD runner's port (the kernel completes the handshake from
     /// the backlog), and a LIVE runner too loaded to answer in time.
@@ -729,6 +729,10 @@ pub fn probe_livez(addr: SocketAddr, budget: Duration) -> LivezVerdict {
     const CAP: usize = 16 * 1024;
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 2048];
+    // Whether the server ended the reply itself (EOF). Under `Connection:
+    // close` a complete answer ends that way; anything else was cut off by the
+    // deadline, a reset or the cap.
+    let mut closed_by_server = false;
     loop {
         if Instant::now() >= deadline || buf.len() >= CAP {
             break;
@@ -737,16 +741,37 @@ pub fn probe_livez(addr: SocketAddr, budget: Duration) -> LivezVerdict {
             break;
         }
         match stream.read(&mut chunk) {
-            Ok(0) => break,
+            Ok(0) => {
+                closed_by_server = true;
+                break;
+            }
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
             Err(_) => break,
         }
     }
-    match classify_livez_response(&buf) {
-        // Nothing, or a reply cut off inside `HTTP/`: silence, not evidence.
-        LivezVerdict::NoAnswer if b"HTTP/".starts_with(&buf) => LivezVerdict::Silent,
-        // Bytes that are not HTTP: positively not a runner.
-        verdict => verdict,
+    resolve_probe_reply(classify_livez_response(&buf), &buf, closed_by_server)
+}
+
+/// Turn the classification of what was read into the probe's verdict.
+///
+/// - Nothing read at all: [`LivezVerdict::Silent`] (silence or a reset).
+/// - Bytes whose start is not `HTTP/`: kept as classified ([`LivezVerdict::NoAnswer`]),
+///   positive evidence that something other than a runner holds the port.
+/// - An HTTP-looking reply the server did NOT finish (no EOF) that classified
+///   as anything but a runner's answer: [`LivezVerdict::Silent`]. A loaded
+///   live runner cut off mid-status-line (`HTTP/1.1 50`) or before the
+///   `RUNNER_BOOTING` body of its `503` looks exactly like that, and the
+///   destructive callers must not reap it.
+fn resolve_probe_reply(verdict: LivezVerdict, buf: &[u8], closed_by_server: bool) -> LivezVerdict {
+    if buf.is_empty() {
+        return LivezVerdict::Silent;
+    }
+    let n = buf.len().min(5);
+    let http_like = buf[..n] == b"HTTP/"[..n];
+    match verdict {
+        LivezVerdict::Live | LivezVerdict::Booting => verdict,
+        _ if http_like && !closed_by_server => LivezVerdict::Silent,
+        other => other,
     }
 }
 
@@ -898,6 +923,37 @@ mod tests {
             "budget not honoured"
         );
         drop(silent);
+    }
+
+    /// An HTTP-looking reply the server did not finish is `Silent` (a loaded
+    /// live runner cut off by the deadline looks like that); a finished one,
+    /// or bytes that are not HTTP, are believed.
+    #[test]
+    fn a_cut_off_http_reply_is_silent_and_a_finished_one_is_not() {
+        let resolve = |raw: &[u8], closed: bool| {
+            resolve_probe_reply(classify_livez_response(raw), raw, closed)
+        };
+        // Cut off by the deadline (no EOF) anywhere before a runner's answer.
+        for raw in [
+            &b"HTT"[..],
+            b"HTTP/",
+            b"HTTP/1.1",
+            b"HTTP/1.1 50",
+            b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 2\r\n",
+        ] {
+            assert_eq!(resolve(raw, false), LivezVerdict::Silent, "{raw:?}");
+        }
+        // Nothing at all is silence, closed or not.
+        assert_eq!(resolve(b"", true), LivezVerdict::Silent);
+        // A finished reply that is not a runner's is believed.
+        assert_eq!(
+            resolve(b"HTTP/1.1 404 Not Found\r\n\r\n", true),
+            LivezVerdict::OtherStatus(404)
+        );
+        // Not HTTP is not a runner, finished or not.
+        assert_eq!(resolve(b"-ERR x\r\n", false), LivezVerdict::NoAnswer);
+        // A runner's answer is believed even if cut off after the status line.
+        assert_eq!(resolve(b"HTTP/1.1 200 OK\r\n", false), LivezVerdict::Live);
     }
 
     /// A port whose holder answers with bytes that are not HTTP is positively
