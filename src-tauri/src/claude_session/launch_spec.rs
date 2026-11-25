@@ -529,16 +529,28 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
                 // Session flags that NAME an id — `--session-id`, `--resume`,
                 // `-r` and the `--session-id=` / `--resume=` inline forms: when
                 // the operator positioned the id via the `{sessionId}`
-                // placeholder, keep the flag in place; otherwise the spec owns
-                // session and we drop the template's.
+                // placeholder, keep the flag that carries it in place;
+                // otherwise the spec owns session and we drop the template's.
+                // When the spec pins the session, a session flag that does NOT
+                // carry the pin is dropped even beside a placeholder: in
+                // `--session-id {sessionId} --resume <literal>` the literal
+                // would ship a second, different id (review A1 of
+                // qontinui-runner#3149).
                 n if names_session_id(n) => {
                     if had_placeholder {
                         let carries_pin = match pin {
                             Some(p) => unit.name.contains(p) || unit.values.iter().any(|v| v == p),
                             None => true,
                         };
-                        session_via_placeholder |= carries_pin;
-                        other_units.push(unit);
+                        if carries_pin {
+                            session_via_placeholder = true;
+                            other_units.push(unit);
+                        } else {
+                            tracing::warn!(
+                                flag = %flag_name_only(&unit.name),
+                                "launch template flag dropped: it names a session other than                                  the one the spec pins"
+                            );
+                        }
                     }
                 }
                 // Every other session choice — `--continue` / `-c` ("the most
@@ -1468,6 +1480,43 @@ mod tests {
                 "{template}: {argv:?}"
             );
             assert!(!argv.iter().any(|a| a == "-c"), "{template}: {argv:?}");
+        }
+    }
+
+    /// Beside a `{sessionId}` placeholder, a template session flag that names a
+    /// DIFFERENT, literal id is dropped when the spec pins the session: argv
+    /// carries exactly one session flag, and it is the pin (review round 5,
+    /// A1 of qontinui-runner#3149).
+    #[test]
+    fn a_literal_session_flag_beside_a_placeholder_is_dropped() {
+        const ID: &str = "7b97f1e8-35c0-4bec-992d-63e5a3dc55d7";
+        const OTHER: &str = "11111111-2222-4333-8444-555555555555";
+        for template in [
+            format!("claude --session-id {{sessionId}} --resume {OTHER}"),
+            format!("claude --resume {OTHER} --session-id {{sessionId}}"),
+            format!("claude --session-id={{sessionId}} -r {OTHER}"),
+            format!("claude --session-id {{sessionId}} --resume={OTHER}"),
+        ] {
+            let mut s = spec();
+            s.session_id = Some(ID.to_string());
+            let argv = render_argv(&s, &tmpl(&template), "claude");
+            let session_flags = argv
+                .iter()
+                .filter(|a| {
+                    let t = a.as_str();
+                    t == "--session-id"
+                        || t == "--resume"
+                        || t == "-r"
+                        || t.starts_with("--session-id=")
+                        || t.starts_with("--resume=")
+                })
+                .count();
+            assert_eq!(session_flags, 1, "{template}: {argv:?}");
+            assert!(
+                !argv.iter().any(|a| a.contains(OTHER)),
+                "{template}: {argv:?}"
+            );
+            assert!(argv.iter().any(|a| a.contains(ID)), "{template}: {argv:?}");
         }
     }
 
