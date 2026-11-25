@@ -93,6 +93,13 @@ export function externalToDiscovered(ext: ExternalElement): DiscoveredElement {
       ariaDisabled: ext.accessibility?.ariaDisabled ?? false,
       disabled: !ext.enabled && !(ext.accessibility?.ariaDisabled ?? false),
       focused: ext.focused,
+      // `@qontinui/ui-bridge@0.62` made `ariaBusy` a required state field.
+      // When the source sent the element's reading it is carried through.
+      // When it did not (an older SDK, a legacy extension), `false` is an
+      // ASSUMPTION, not an observation: it matches WAI-ARIA's default for an
+      // element with no `aria-busy` attribute, but such a source may be
+      // showing a busy element it never reported.
+      ariaBusy: ext.ariaBusy ?? false,
       textContent: asScrubbed(ext.text || ext.accessibleName || ext.accessibility?.accessibleName),
       value: asScrubbed(ext.value),
       checked: ext.checked,
