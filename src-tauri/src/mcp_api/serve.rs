@@ -803,9 +803,20 @@ pub async fn start_server(
     let (acquired, bound_port) = acquire_api_listener_with(
         port,
         &crate::instance::api_ports_to_try(port),
-        listeners::has_inherited(API_LISTENER_NAME),
+        // Not only an fd NAMED `api`: any inherited fd (or unreadable LISTEN_*
+        // variables) means a socket unit may hold this port, and falling back
+        // would put the runner on a port no client dials.
+        listeners::has_inherited(API_LISTENER_NAME) || listeners::inherited_at_startup(),
         |addr| listeners::adopt_or_bind(API_LISTENER_NAME, addr),
     )?;
+    let unclaimed = listeners::unclaimed_inherited();
+    if !unclaimed.is_empty() {
+        warn!(
+            ?unclaimed,
+            "MCP API server: inherited sockets no listener claimed stay open for the process \
+             lifetime"
+        );
+    }
     info!(
         port = bound_port,
         origin = acquired.origin.as_str(),
@@ -939,6 +950,7 @@ mod listener_adoption_tests {
         assert_eq!(v["code"], RUNNER_BOOTING_CODE);
     }
 
+    #[cfg(unix)]
     async fn get(client: &reqwest::Client, addr: SocketAddr, path: &str) -> (u16, String, String) {
         let resp = client
             .get(format!("http://{addr}{path}"))

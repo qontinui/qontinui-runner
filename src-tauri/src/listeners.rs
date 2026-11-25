@@ -44,6 +44,9 @@
 //! there" from a connect alone would call a dead runner alive. [`probe_livez`]
 //! asks `GET /livez` instead, under a deadline, and distinguishes a booting
 //! runner (`503 RUNNER_BOOTING`) from a live one and from nothing answering.
+//! A connect that is accepted and then answers nothing is `Silent`, which a
+//! probe cannot tell from a live runner too loaded to answer, so callers that
+//! destroy state on "dead" keep it ([`LivezVerdict::may_be_alive`]).
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -554,7 +557,10 @@ pub fn origin_of(name: &str) -> Option<ListenerOrigin> {
 /// single-threaded (it removes environment variables). Idempotent: a second
 /// call takes nothing.
 pub fn adopt_inherited_at_startup() {
-    if INHERITED.get().is_some() {
+    // Guard on the adoption record, not on INHERITED: `inherited()` lazily
+    // initialises that cell, so an accessor called before this would otherwise
+    // turn adoption off silently.
+    if STARTUP_ADOPTION.get().is_some() {
         return;
     }
     #[cfg(unix)]
@@ -576,8 +582,31 @@ pub fn adopt_inherited_at_startup() {
             },
         )
     };
-    let _ = INHERITED.set(store);
+    if INHERITED.set(store).is_err() {
+        // An accessor ran before adoption and created an empty store; the fds
+        // just taken would be dropped (closed) with `store`. Say so loudly.
+        eprintln!(
+            "listeners: an inherited-listener accessor ran before adoption; the inherited \
+             fds were closed and every listener will be bound"
+        );
+    }
     let _ = STARTUP_ADOPTION.set(outcome);
+}
+
+/// Whether the environment addressed inherited fds to this process at startup
+/// — taken (whatever their names) or present but unreadable. When true a
+/// socket unit may own the API port, so the API must never fall back to
+/// another port: a runner on `port + 1` is one no client dials.
+pub fn inherited_at_startup() -> bool {
+    matches!(
+        STARTUP_ADOPTION.get(),
+        Some(StartupAdoption::Taken { .. }) | Some(StartupAdoption::Refused(_))
+    )
+}
+
+/// Names of inherited fds still held (not handed to any listener).
+pub fn unclaimed_inherited() -> Vec<String> {
+    inherited().names()
 }
 
 /// Log what [`adopt_inherited_at_startup`] did, once logging exists.
@@ -587,6 +616,14 @@ pub fn log_startup_adoption() {
             tracing::debug!("listeners: no inherited listening sockets (LISTEN_FDS absent)")
         }
         Some(StartupAdoption::Taken { names, not_open }) => {
+            if !names.iter().any(|n| n == API_LISTENER_NAME) {
+                tracing::warn!(
+                    ?names,
+                    "listeners: inherited sockets arrived but none is named `api` — set \
+                     FileDescriptorName=api in the socket unit; the API will bind its port \
+                     itself and will NOT fall back to another port"
+                );
+            }
             if not_open.is_empty() {
                 tracing::info!(?names, "listeners: took inherited listening sockets");
             } else {
@@ -632,16 +669,31 @@ pub enum LivezVerdict {
     Booting,
     /// Some other HTTP status: something answers HTTP, but not as a runner.
     OtherStatus(u16),
-    /// No HTTP answer inside the budget: refused, reset, timed out, or not
-    /// HTTP. Under a socket unit a dead runner's port still accepts the
-    /// connect and lands here by timing out.
+    /// The connect itself failed inside the budget (refused, unreachable, or
+    /// timed out before the handshake): nothing listens on the port.
     NoAnswer,
+    /// The connect succeeded but no HTTP status line came back inside the
+    /// budget (silence, a reset, or bytes that are not HTTP). Two different
+    /// worlds look like this and a probe cannot tell them apart: a socket unit
+    /// holding a DEAD runner's port (the kernel completes the handshake from
+    /// the backlog), and a LIVE runner too loaded to answer in time.
+    Silent,
 }
 
 impl LivezVerdict {
-    /// A runner process is there (serving or booting).
+    /// A runner process is there (serving or booting): the positive answer.
     pub fn runner_alive(self) -> bool {
         matches!(self, Self::Live | Self::Booting)
+    }
+
+    /// Whether a runner MAY be there: everything except a failed connect and
+    /// an HTTP answer that is not a runner's. A caller that DESTROYS something
+    /// on a "dead" verdict (a sibling's credential file, its registration)
+    /// uses this, so a live runner that was merely slow ([`Self::Silent`]) is
+    /// never taken for dead — a false "dead" there costs a live sibling its
+    /// credentials, while a false "alive" only keeps a leftover one pass longer.
+    pub fn may_be_alive(self) -> bool {
+        matches!(self, Self::Live | Self::Booting | Self::Silent)
     }
 }
 
@@ -657,12 +709,13 @@ pub fn probe_livez(addr: SocketAddr, budget: Duration) -> LivezVerdict {
     let Ok(mut stream) = TcpStream::connect_timeout(&addr, remaining()) else {
         return LivezVerdict::NoAnswer;
     };
+    // From here on the port accepted the connect: no answer is `Silent`.
     let request =
         format!("GET /livez HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nAccept: */*\r\n\r\n");
     if stream.set_write_timeout(Some(remaining())).is_err()
         || stream.write_all(request.as_bytes()).is_err()
     {
-        return LivezVerdict::NoAnswer;
+        return LivezVerdict::Silent;
     }
     // Read until the server closes (Connection: close), the deadline passes,
     // or the cap is reached — the verdict needs the status line and, for a
@@ -683,7 +736,10 @@ pub fn probe_livez(addr: SocketAddr, budget: Duration) -> LivezVerdict {
             Err(_) => break,
         }
     }
-    classify_livez_response(&buf)
+    match classify_livez_response(&buf) {
+        LivezVerdict::NoAnswer => LivezVerdict::Silent,
+        verdict => verdict,
+    }
 }
 
 /// Classify raw response bytes (the pure half of [`probe_livez`]).
@@ -709,9 +765,14 @@ pub fn classify_livez_response(raw: &[u8]) -> LivezVerdict {
     }
 }
 
-/// Whether a runner answers `/livez` on `127.0.0.1:port` within `budget`.
+/// Whether a runner MAY be on `127.0.0.1:port` ([`LivezVerdict::may_be_alive`]):
+/// false only when the connect fails or something other than a runner answers
+/// HTTP there. For callers that reap or deregister on `false`. A silent port is
+/// kept: under a socket unit that may be a dead runner's port, but the runner
+/// that owns that port reaps its own leftovers when it comes back, and a
+/// sibling must never reap a live-but-loaded runner's files.
 pub fn loopback_runner_alive(port: u16, budget: Duration) -> bool {
-    probe_livez(SocketAddr::from(([127, 0, 0, 1], port)), budget).runner_alive()
+    probe_livez(SocketAddr::from(([127, 0, 0, 1], port)), budget).may_be_alive()
 }
 
 #[cfg(test)]
@@ -810,15 +871,19 @@ mod tests {
     /// holding a dead runner's port looks like — is NOT alive. The connect-only
     /// probe this replaces called it alive.
     #[test]
-    fn a_listener_that_never_answers_is_not_alive() {
+    fn a_listener_that_never_answers_is_silent_and_kept() {
         let silent = std::net::TcpListener::bind(loopback(0)).unwrap();
         let port = silent.local_addr().unwrap().port();
         // The kernel completes the handshake from the backlog; nobody accepts.
         assert!(TcpStream::connect(loopback(port)).is_ok());
         let started = Instant::now();
         let verdict = probe_livez(loopback(port), Duration::from_millis(300));
-        assert_eq!(verdict, LivezVerdict::NoAnswer);
+        assert_eq!(verdict, LivezVerdict::Silent);
+        // Not a positive answer...
         assert!(!verdict.runner_alive());
+        // ...but not proof of death either: a loaded live runner looks the same.
+        assert!(verdict.may_be_alive());
+        assert!(loopback_runner_alive(port, Duration::from_millis(300)));
         assert!(
             started.elapsed() < Duration::from_secs(3),
             "budget not honoured"
