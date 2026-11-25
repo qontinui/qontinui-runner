@@ -90,8 +90,8 @@ mod vcs_pr;
 
 use drain::drain_handler;
 pub(crate) use serve::lan_reachable_for_bound_addr;
-pub use serve::{start_early_api_if_inherited, start_server};
 use serve::{not_found_handler, runner_panic_handler};
+pub use serve::{start_early_api_if_inherited, start_server};
 use vcs_pr::vcs_create_pull_request_handler;
 
 /// Every source file of the `mcp_api` module, as `(path relative to src/, text)`:

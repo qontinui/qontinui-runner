@@ -272,7 +272,11 @@ impl InheritedListeners {
     /// `sd_listen_fds(3)` does with `unset_environment`. `fd_start` overrides
     /// `SD_LISTEN_FDS_START` so a test can hand over an fd it opened itself.
     #[cfg(unix)]
-    pub fn from_env(env: &mut dyn ListenEnv, our_pid: u32, fd_start: i32) -> (Self, StartupAdoption) {
+    pub fn from_env(
+        env: &mut dyn ListenEnv,
+        our_pid: u32,
+        fd_start: i32,
+    ) -> (Self, StartupAdoption) {
         use std::os::fd::{FromRawFd, OwnedFd};
 
         let parsed = parse_listen_env(
@@ -653,9 +657,8 @@ pub fn probe_livez(addr: SocketAddr, budget: Duration) -> LivezVerdict {
     let Ok(mut stream) = TcpStream::connect_timeout(&addr, remaining()) else {
         return LivezVerdict::NoAnswer;
     };
-    let request = format!(
-        "GET /livez HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nAccept: */*\r\n\r\n"
-    );
+    let request =
+        format!("GET /livez HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nAccept: */*\r\n\r\n");
     if stream.set_write_timeout(Some(remaining())).is_err()
         || stream.write_all(request.as_bytes()).is_err()
     {
@@ -731,13 +734,18 @@ mod tests {
 
     #[test]
     fn parse_names_default_to_unknown() {
-        let got = parse_listen_env(Some("7"), Some("2"), None, 7).unwrap().unwrap();
+        let got = parse_listen_env(Some("7"), Some("2"), None, 7)
+            .unwrap()
+            .unwrap();
         assert_eq!(got.names, vec![UNKNOWN_FD_NAME, UNKNOWN_FD_NAME]);
     }
 
     #[test]
     fn parse_ignores_fds_addressed_to_another_pid_or_absent() {
-        assert_eq!(parse_listen_env(Some("41"), Some("1"), Some("api"), 42), Ok(None));
+        assert_eq!(
+            parse_listen_env(Some("41"), Some("1"), Some("api"), 42),
+            Ok(None)
+        );
         assert_eq!(parse_listen_env(None, Some("1"), Some("api"), 42), Ok(None));
         assert_eq!(parse_listen_env(Some("42"), None, None, 42), Ok(None));
         assert_eq!(parse_listen_env(Some("42"), Some("0"), None, 42), Ok(None));
@@ -792,7 +800,10 @@ mod tests {
             LivezVerdict::OtherStatus(503)
         );
         assert_eq!(classify_livez_response(b""), LivezVerdict::NoAnswer);
-        assert_eq!(classify_livez_response(b"SSH-2.0-OpenSSH\r\n"), LivezVerdict::NoAnswer);
+        assert_eq!(
+            classify_livez_response(b"SSH-2.0-OpenSSH\r\n"),
+            LivezVerdict::NoAnswer
+        );
     }
 
     /// A port that accepts the connect and never answers — what a socket unit
@@ -808,7 +819,10 @@ mod tests {
         let verdict = probe_livez(loopback(port), Duration::from_millis(300));
         assert_eq!(verdict, LivezVerdict::NoAnswer);
         assert!(!verdict.runner_alive());
-        assert!(started.elapsed() < Duration::from_secs(3), "budget not honoured");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "budget not honoured"
+        );
         drop(silent);
     }
 
@@ -891,7 +905,10 @@ mod tests {
             }
             // SAFETY: fcntl on our own open fd.
             let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-            assert!(flags & libc::FD_CLOEXEC != 0, "inherited fd not close-on-exec");
+            assert!(
+                flags & libc::FD_CLOEXEC != 0,
+                "inherited fd not close-on-exec"
+            );
 
             let acquired = adopt_or_bind_from(&store, API_LISTENER_NAME, addr, |_| {
                 panic!("an inherited listener must not be re-bound")
@@ -975,6 +992,9 @@ mod tests {
         assert_eq!(v["supported"], serde_json::json!(cfg!(unix)));
         assert!(v.get("api").is_some());
         record_origin("health-json-test", ListenerOrigin::Inherited);
-        assert_eq!(origin_of("health-json-test"), Some(ListenerOrigin::Inherited));
+        assert_eq!(
+            origin_of("health-json-test"),
+            Some(ListenerOrigin::Inherited)
+        );
     }
 }
