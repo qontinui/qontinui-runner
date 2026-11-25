@@ -237,7 +237,7 @@ impl InstanceManager {
     }
 
     /// Remove registered instances whose port is positively not a runner's (a
-    /// refused connect, or a non-runner answer to `/livez`).
+    /// failed connect, or a non-runner answer to `/livez`).
     /// Returns the number of instances removed.
     ///
     /// An HTTP answer, not a TCP connect: a port held by a socket unit (or by an
@@ -247,8 +247,8 @@ impl InstanceManager {
     /// a port that accepts the connect but stays silent inside the budget
     /// (`LivezVerdict::Silent`): that is also what a live but loaded runner
     /// looks like, and deregistering a live instance costs more than keeping a
-    /// dead one's row one pass longer. An unrelated HTTP server on the port, or
-    /// a refused connect, is purged.
+    /// dead one's row for as long as its port stays silent. An unrelated server
+    /// that answers on the port, or a failed connect, is purged.
     pub async fn purge_unreachable_registered(&self) -> u32 {
         let registered = self.registered.lock().await;
         let to_check: Vec<(String, u16)> = registered
