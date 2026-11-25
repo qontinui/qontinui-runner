@@ -2157,12 +2157,12 @@ mod timeout_tests {
     /// the shape a `git` that spawns a credential/askpass helper takes. Eight
     /// seconds is comfortably longer than `COMPLETED_DRAIN_GRACE`, which is all
     /// the assertion needs.
-    #[cfg(unix)]
     ///
     /// The child creates `marker` as its first act, so a test can time the
     /// call from the moment the child started (see [`timed_after_child_start`])
     /// instead of from before the spawn, whose cost on a loaded box the drain
     /// grace does not cover.
+    #[cfg(unix)]
     fn completed_with_surviving_grandchild(marker: &std::path::Path) -> std::process::Command {
         let mut c = no_window("sh");
         c.arg("-c")
@@ -2225,7 +2225,7 @@ mod timeout_tests {
         }
 
         // The whole point: bounded by the drain grace, NOT by the grandchild's
-        // 30s lifetime and NOT forever.
+        // 8s lifetime and NOT forever.
         assert!(
             elapsed < COMPLETED_DRAIN_GRACE + Duration::from_secs(3),
             "the completed path blocked for {elapsed:?} waiting on a grandchild-held pipe"
