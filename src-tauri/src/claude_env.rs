@@ -73,8 +73,11 @@ pub fn inherited_markers_detail(markers: &[&str]) -> String {
 
 /// Did a `claude` argv (everything after the program) already choose a
 /// session? Then nothing may add a second one. Exact token match,
-/// case-insensitive: `--session-id`, `--resume`, `-r`, the `resume`
-/// subcommand, `--continue`, `-c`, plus the `--session-id=…` / `--resume=…`
+/// case-insensitive: `--session-id`, `--resume`, `-r`, a bare `resume` (kept
+/// though Claude Code 2.1.332 has no `resume` subcommand, so it is really a
+/// prompt; plan-library follow-up on plan
+/// `2026-11-21-a-live-claude-session-loses-its-sessions-pid-json-record`),
+/// `--continue`, `-c`, plus the `--session-id=…` / `--resume=…`
 /// inline forms. A merely-prefixed token (`--session-id-ish`) does NOT match,
 /// and neither does anything after a `--`, which is positional. Nor does the
 /// VALUE of a Claude Code option that takes one ([`CLAUDE_VALUE_FLAGS`],
@@ -119,9 +122,10 @@ pub fn claude_argv_chooses_session<S: AsRef<str>>(args: &[S]) -> bool {
         } else if CLAUDE_VARIADIC_FLAGS.contains(&a) {
             // Variadic options take every following token up to the next
             // option, i.e. one longer than `-` that starts with it
-            // (commander 13.1.0 `maybeOption`, `lib/command.js`), so a `resume` or a lone `-` in that
-            // run is a value. A `--` is an option by that test, so it ends the
-            // run and is then read as the terminator.
+            // (commander 13.1.0 `maybeOption`, `lib/command.js`), so a
+            // `resume` or a lone `-` in that run is a value. A `--` is an
+            // option by that test, so it ends the run and is then read as the
+            // terminator.
             while tokens
                 .next_if(|v| !(v.len() > 1 && v.starts_with('-')))
                 .is_some()
@@ -170,7 +174,7 @@ pub const CLAUDE_VALUE_FLAGS: &[&str] = &[
 ];
 
 /// Claude Code options that take one or more values: everything up to the
-/// next `-`-prefixed token.
+/// next token longer than `-` that starts with `-` (a lone `-` is a value).
 pub const CLAUDE_VARIADIC_FLAGS: &[&str] = &[
     "--add-dir",
     "--allowedTools",
@@ -314,6 +318,11 @@ mod tests {
         (&["--plugin-dir", "p", "--verbose"], false),
         (&["--add-dir", "a", "-", "resume"], false),
         (&["-p", "hi"], false),
+        (&["--file", "a", "resume"], false),
+        (&["--file", "a", "b", "-c"], true),
+        (&["--system-prompt-snapshot", "-c"], false),
+        (&["--autocompact", "resume"], false),
+        (&["--environment", "-r", "--continue"], true),
         (&["--name", "Why?", "-c"], true),
         (&["--name", "x*", "-c"], true),
     ];

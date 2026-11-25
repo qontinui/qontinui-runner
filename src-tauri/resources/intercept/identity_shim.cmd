@@ -119,8 +119,9 @@ rem for the exec lines below. Residual: cmd splits arguments on = , ; so an
 rem inline `--add-dir=a` reads as `--add-dir a` here, unlike the Rust and bash
 rem scans, and a variadic run then swallows what follows. Only a bare `resume`
 rem can be swallowed that way (-c, -r and every other choice start with - and
-rem end the run), and Claude Code has no `resume` subcommand, so no launch is
-rem affected. `--append-system-prompt-file=x` relies on that split (below).
+rem end the run), so `--add-dir=a resume` is pinned here and not by the Rust
+rem and bash scans. Claude Code has no `resume` subcommand, so pinning it is
+rem the correct outcome. `--append-system-prompt-file=x` relies on that split (below).
 set "VALUE_FLAGS= --name -n --model --fallback-model --permission-mode --permission-prompt-tool --append-system-prompt --append-system-prompt-file --system-prompt --system-prompt-file --output-format --input-format --settings --setting-sources --agent --agents --effort --max-turns --max-budget-usd --json-schema --plugin-dir --autocompact --debug-file --environment --permission-prompts --plugin-url --remote-control-session-name-prefix --system-prompt-snapshot "
 set "VARIADIC_FLAGS= --add-dir --allowedTools --allowed-tools --disallowedTools --disallowed-tools --mcp-config --tools --betas --file "
 set "SKIP_VALUES=0"
