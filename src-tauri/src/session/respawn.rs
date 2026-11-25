@@ -94,6 +94,7 @@ use base64::Engine;
 use serde::Deserialize;
 use uuid::Uuid;
 
+use super::coord_sync::drain_body;
 use super::handoff::HandoffError;
 use super::session_lifecycle_store::SessionLifecycleStore;
 use super::SessionRegistry;
@@ -391,7 +392,8 @@ pub(super) fn replay_pending_with<M, F>(
 }
 
 /// Respawns this process may materialize at once. Each one can take minutes
-/// (the 180 s liveness proof per attempt, a 120 s CLI-install wait, retries),
+/// (the 180 s liveness proof per attempt, up to 120 s of CLI-install wait before
+/// the drain check and again before each resolve, retries),
 /// so a catch-up replaying many pending rows must not open every PTY at once.
 const MAX_CONCURRENT_RESPAWNS: usize = 4;
 
@@ -797,6 +799,7 @@ async fn fetch_transcript_tier(
             session = %session_id,
             "session respawn: transcript fetch rejected"
         );
+        drain_body(resp).await;
         return Vec::new();
     }
     let body: serde_json::Value = match resp.json().await {
@@ -852,6 +855,12 @@ async fn materialize(
     coord_url: &str,
     respawn: &PendingRespawn,
 ) -> Result<String, RespawnError> {
+    // Wait out a runner-owned CLI install before step 0, so the drain check
+    // below is fresh when the spawn follows; the `--resume` resolver (step 4b)
+    // waits on the same flag and returns at once after this. The pending row
+    // is untouched by the wait.
+    crate::claude_cli_spawn::await_cli_update_quiescent().await;
+
     // 0. Coord's device drain (plan `2026-09-13-drained-runner-never-reaches-idle`,
     //    D3). A respawn is autonomous. Coord already withholds respawn rows from
     //    a drained device; this is defence in depth for a push that raced the
@@ -1103,9 +1112,11 @@ fn proven_terminal(
         RespawnOutcome::Died {
             exit_code,
             attempts,
-            ..
-        } => Err(RespawnError::Died(RespawnOutcome::died_reason(
-            exit_code, attempts,
+            retry_spawn_error,
+        } => Err(RespawnError::Died(RespawnOutcome::died_detail(
+            exit_code,
+            attempts,
+            retry_spawn_error.as_deref(),
         ))),
     }
 }
@@ -1732,6 +1743,22 @@ mod tests {
             msg.contains("not retried") && msg.contains("re-issue"),
             "a died respawn must not claim it stays pending: {msg}"
         );
+        let msg = proven_terminal(
+            Uuid::nil(),
+            RespawnOutcome::Died {
+                exit_code: Some(127),
+                attempts: 3,
+                retry_spawn_error: Some("claude not found".into()),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            msg.starts_with(
+                "respawn-died: exit 127 after 3 attempts; last retry could not spawn: claude not found"
+            ),
+            "{msg}"
+        );
         assert!(matches!(
             proven_terminal(Uuid::nil(), RespawnOutcome::NotSpawned("x".into())),
             Err(RespawnError::Spawn(_))
@@ -2187,5 +2214,24 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert_eq!(done.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+}
+
+/// The transcript fetch reads a rejection's body to the end (lifecycle plan
+/// Phase 85) — fails if that drain is removed.
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+    use crate::session::drain_probe::DrainProbe;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transcript_fetch_rejection_reads_the_body() {
+        let _amb = crate::test_env::isolated_ambient();
+        let probe = DrainProbe::spawn(500).await;
+        let bytes =
+            fetch_transcript_tier(&reqwest::Client::new(), &probe.base, Uuid::new_v4(), "warm")
+                .await;
+        assert!(bytes.is_empty());
+        probe.assert_all_drained().await;
     }
 }

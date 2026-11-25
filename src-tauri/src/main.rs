@@ -54,6 +54,7 @@ mod auth;
 mod auto_commit;
 mod automation_stack; // Can this box drive a GUI? — /health `automationStack` + the shared $DISPLAY resolution
 mod backup;
+mod boot_stage; // How far the boot got toward binding the listener — read by the wedge detector
 mod build_drift;
 // Which RUNG answered for each capability this binary delivers — the spine of
 // the published-vs-development parity check
@@ -137,6 +138,9 @@ mod runner_spawn_sites;
 // path in this binary - including mcp_api.rs's /health reporting - keeps
 // resolving unchanged.
 pub(crate) use qontinui_runner_lib::embedded_pg;
+// The cargo-target marker predicate lives in the lib crate (the test harness
+// needs it there); re-bound here for the orphan-target reaper.
+pub(crate) use qontinui_runner_lib::cargo_target_marker;
 mod error;
 mod error_monitor; // Must be declared before error (error re-exports ErrorSeverity from error_monitor)
 mod event_system;
@@ -223,6 +227,10 @@ mod online_learning;
 mod orchestration_loop;
 mod orchestration_loop_configs;
 mod orchestrator;
+/// Kernel pool, kernel objects and OS process-creation latency, measured on
+/// EVERY instance by one `os-health` thread (plan
+/// `2026-10-19-fleet-is-blind-to-kernel-object-leaks-and-os-process-creation-latency`).
+mod os_health;
 mod otel;
 mod outbound_trace; // Plan 2026-07-08-ui-bridge-reach-and-verify-gated-flows P5 — redacted outbound-call trace
 mod paths;
@@ -839,6 +847,7 @@ const DEGRADED_PLACEHOLDER_DSN: &str = "postgresql://qontinui@127.0.0.1:1/qontin
     reason = "borrows the process-lived APP_RUNTIME during synchronous boot, predates the disallowed_types gate — migrate to a tokio::runtime::Handle; plan 2026-09-12-residual-work-from-the-april-2026-plan-audit"
 )]
 fn boot_embedded_pg(rt: &tokio::runtime::Runtime) -> Arc<crate::database::pg::PgDb> {
+    boot_stage::stamp(boot_stage::BootStage::EmbeddedPostgresBootstrap);
     // Honours `QONTINUI_EMBEDDED_PG_DIR` (blank ⇒ unset), falling back to the
     // machine-shared default. A temp/test runner sets it and gets a cluster of
     // its own — install dir, data dir, password file and attach probe all hang
@@ -1049,6 +1058,7 @@ fn select_db_arm(
         return boot_embedded_pg(rt);
     };
 
+    boot_stage::stamp(boot_stage::BootStage::ConfiguredPostgresConnect);
     info!(
         "Connecting to the configured PostgreSQL via profile '{}'",
         profile.source
@@ -1122,8 +1132,8 @@ enum ManifestMode {
     Json,
     /// `--capability-manifest-doc` — the GENERATED roster checked in at
     /// `docs/runner-capabilities.md`. A pure function of `CAPABILITY_SPECS`
-    /// and `Rung::ALL`, carrying no runtime value, which is what lets
-    /// `.github/workflows/capability-manifest-fresh.yml` gate it.
+    /// and `Rung::ALL`, carrying no runtime value, which is what lets the test
+    /// `the_checked_in_capability_doc_matches_a_fresh_render` gate it.
     Doc,
 }
 
@@ -1400,7 +1410,7 @@ static APP_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::On
 /// ## Why 16, and why not 2-4
 ///
 /// This is not an auxiliary runtime. `fleet-pub-rt` (1 worker) and `mcp-api-rt`
-/// ([`mcp_api::API_RUNTIME_WORKER_THREADS`] = 4) each serve one subsystem and
+/// (`mcp_api::serve::API_RUNTIME_WORKER_THREADS` = 4) each serve one subsystem and
 /// are sized for it. This one serves every Tauri IPC command and every
 /// `tauri::async_runtime::spawn` in the process — and `serve_on_dedicated_runtime`
 /// exists precisely BECAUSE this runtime has a history of being wedged by a
@@ -1600,7 +1610,7 @@ mod app_runtime_tests {
 /// `process::exit`, and would otherwise pay for a runtime they discard.
 ///
 /// Fail-open in both directions, the same posture
-/// `mcp_api::serve_on_dedicated_runtime` takes for the same reason — a
+/// `mcp_api::serve::serve_on_dedicated_runtime` takes for the same reason — a
 /// degraded runtime is strictly better than no runner:
 /// - a runtime we cannot BUILD leaves Tauri to build its own (today's behaviour);
 /// - a slot that is already TAKEN is caught rather than fatal, and the runtime
@@ -1694,6 +1704,13 @@ fn main() {
     // `2026-11-11-runner-glibc-arena-retention-and-whole-log-tail` Phase 1;
     // `tests/arena_cap_is_mains_first_statement.rs` keeps it first.
     qontinui_runner_lib::malloc_tuning::apply_arena_cap_at_startup();
+
+    // Anchor the process clock (`health_monitor::MONOTONIC_EPOCH`) as early as
+    // possible: every boot-stage offset and the bind latency are measured from
+    // it, and the never-answered grace starts from it. This stamp precedes
+    // `init_logging`, so its log line goes nowhere; the stage is still
+    // recorded (it is the `+0` the later stage lines are offsets from).
+    boot_stage::stamp(boot_stage::BootStage::ProcessStart);
 
     // A SUBJECT runner (`QONTINUI_INSTANCE_ROOT` set) validates its launch env
     // and roots its locations BEFORE anything below reads a path; a no-op for
@@ -1855,6 +1872,17 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
     // Start health monitoring to detect resource exhaustion
     health_monitor::start_health_monitor();
+    boot_stage::stamp(boot_stage::BootStage::HealthMonitorStarted);
+
+    // Kernel objects, kernel pool and OS process-creation latency (plan
+    // `2026-10-19-fleet-is-blind-to-kernel-object-leaks-and-os-process-creation-latency`
+    // D1): ONE `os-health` std::thread, started here on EVERY instance —
+    // primary, secondary/temp, with or without a coord credential. It is
+    // deliberately NOT behind `fleet::machine_state_publish_allowed` or the
+    // secondary-instance gate (those govern PUBLISHING, which the primary's
+    // resource sampler still alone does), and it never runs on a tokio
+    // runtime: it must keep measuring while every runtime here is starved.
+    os_health::start();
 
     // Initialize Windows Job Object so spawned AI processes are auto-killed
     // if the runner crashes (safety net for the explicit tree kill in shutdown).
@@ -1955,7 +1983,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             .build()
             .expect("Failed to create tokio runtime for PG initialization");
 
+        boot_stage::stamp(boot_stage::BootStage::DatabaseArmSelect);
         let pg = select_db_arm(&rt, &profile);
+        boot_stage::stamp(boot_stage::BootStage::DevAppsAndOnlineLearning);
 
         // Gated on `pg_available_since_boot()` rather than on the arm: before
         // P4 `bootstrap_dev_apps` sat INSIDE the external arm's success branch,
@@ -2344,8 +2374,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // dodge build-lock contention. Those match no worktree pattern,
                 // so the reaper never sees them — they filled D: to 1.3% free
                 // (2026-07-23, ~1.35 TB recovered by hand). This poller reaps
-                // that population: out-of-tree cargo target roots (CACHEDIR.TAG)
-                // that are not building (no held .cargo-lock, deepest artifact
+                // that population: out-of-tree cargo target roots (a
+                // `CACHEDIR.TAG` or `.rustc_info.json` marker —
+                // `cargo_target_marker::has_cargo_marker`) that are not building (no held .cargo-lock, deepest artifact
                 // mtime past the grace) and not reparse points, junction-safe.
                 // DRY-RUN by default (logs "would reap"); armed via
                 // COORD_ORPHAN_TARGET_REAP_ENABLED. Default 900s cadence
@@ -2723,6 +2754,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // plugin — it would prevent them from starting since they share the same binary.
     let is_secondary_instance = instance::is_secondary();
 
+    boot_stage::stamp(boot_stage::BootStage::TauriBuilder);
     let mut builder = tauri::Builder::default();
 
     if !is_secondary_instance {
@@ -2895,6 +2927,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::ai_session::commit_session_progress,
             commands::ai_session::create_ai_session,
             coord_drain_state::coord_drain_state_get,
+            os_health::os_health_get,
             commands::operator_doors::operator_run_prompt,
             commands::operator_doors::operator_run_unified_workflow,
             commands::operator_doors::operator_execute_inline_workflow,
@@ -3816,6 +3849,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         // deleted as each module moves.
         .setup(|app| {
             info!("Tauri application setup starting");
+            boot_stage::stamp(boot_stage::BootStage::TauriSetup);
 
             // Capture the primary's boot instant ONCE, synchronously, before
             // anything can serve a request. It is the reference the PID-reuse
@@ -3878,6 +3912,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // heartbeats from `agent_claims`) can emit Tauri events
             // to the webview without taking an AppHandle parameter.
             tauri_app_handle::set(app.handle().clone());
+            boot_stage::stamp(boot_stage::BootStage::AppHandleSet);
 
             // Plan 2026-05-24-federation-verify-and-gitop.md Phase 4 —
             // initialize the process-wide observable-bridge registry.
@@ -5405,7 +5440,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     // retire it non-restorably rather than
                                     // reporting a phantom `poll-dead`.
                                     poll_lifecycle_store
-                                        .record_close(&rec.claude_session_id, "never-started");
+                                        .record_close(
+                                            &rec.claude_session_id,
+                                            crate::session::session_lifecycle_store::CLOSE_REASON_NEVER_STARTED,
+                                        );
                                     consecutive_dead.remove(&rec.claude_session_id);
                                     consecutive_no_match.remove(&rec.claude_session_id);
                                     tracing::info!(
@@ -5437,7 +5475,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     // a ghost inherited from a prior process).
                                     // `"no-terminal"` is non-restorable.
                                     poll_lifecycle_store
-                                        .record_close(&rec.claude_session_id, "no-terminal");
+                                        .record_close(
+                                            &rec.claude_session_id,
+                                            crate::session::session_lifecycle_store::CLOSE_REASON_NO_TERMINAL,
+                                        );
                                     consecutive_dead.remove(&rec.claude_session_id);
                                     consecutive_no_match.remove(&rec.claude_session_id);
                                     tracing::info!(
@@ -5989,6 +6030,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         is_secondary,
                     };
 
+                    boot_stage::stamp(boot_stage::BootStage::MainWindowBuild);
                     match webview_recovery::build_main_window(app.handle(), &spec) {
                         Ok(win) => {
                             // Phase 1a: subscribe to WebView2 `ProcessFailed` so a
@@ -6075,6 +6117,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             info!("Starting MCP API server on port {}", api_port);
             let mcp_app_handle = app.handle().clone();
             let mcp_instance_manager = app.state::<Arc<instance_manager::InstanceManager>>().inner().clone();
+            boot_stage::stamp(boot_stage::BootStage::ApiServerSpawn);
             tauri::async_runtime::spawn(async move {
                 info!("MCP API server task starting...");
                 match mcp_api::start_server(mcp_app_state, mcp_rag_state, mcp_app_handle, api_port, mcp_instance_manager).await {
@@ -7078,6 +7121,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             info!("Tauri application setup complete");
+            boot_stage::stamp(boot_stage::BootStage::SetupComplete);
             Ok(())
         })
         .on_window_event(|window, event| {

@@ -254,6 +254,29 @@ fn resume_config_dir(
     crate::session::session_ledger::resolve_config_dir(recorded, holders.as_deref())
 }
 
+/// THE resume line for one session, derived exactly as [`build_enriched`]
+/// derives Previous sessions' — the resolved account
+/// ([`resume_config_dir`]), the resume directory
+/// ([`crate::session::session_ledger::resume_dir_of`] over the launch dir and
+/// its worktree root), and
+/// [`crate::session::session_ledger::resume_command_for`]. `None` whenever
+/// that builder yields no line (an unknown account, an unsafe token).
+pub(crate) fn resume_command_for_record(
+    config_dir: Option<&str>,
+    working_dir: Option<&str>,
+    session_id: &str,
+) -> Option<String> {
+    let resolved_config_dir = resume_config_dir(config_dir, working_dir, session_id);
+    let worktree = working_dir
+        .and_then(crate::session::session_ledger::worktree_root_of)
+        .map(|p| p.to_string_lossy().replace('\\', "/"));
+    crate::session::session_ledger::resume_command_for(
+        crate::session::session_ledger::resume_dir_of(working_dir, worktree.as_deref()),
+        resolved_config_dir.as_deref(),
+        session_id,
+    )
+}
+
 /// Format a unix-millis timestamp into a short human date for the `"Session
 /// <date>"` fallback name.
 fn short_date(ts_ms: i64) -> String {

@@ -3386,7 +3386,14 @@ the Step 4 report, after the subproject note:
 > **Topics re-tag:** `<n>` confirmed/added, `<m>` removed — read back.
 
 or, when it did not land, `/finish-session`'s `UNKNOWN (<code>)` or
-`NOT written: <code>` form of that line.
+`NOT written: <code>` form of that line. In a subagent, where nothing is
+written, render instead:
+
+> **Topics re-tag — OWED BY THE PARENT.** This `/unattended` ran in a
+> subagent context; the parent's own `/unattended` re-tags the topics.
+
+A subagent's skipped re-tag is neither `UNKNOWN` nor `NOT written`: nothing was
+attempted, and the row says who owes it.
 
 ---
 

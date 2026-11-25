@@ -23,17 +23,11 @@
 //! Interim arm: plan `2026-10-28-one-session-lifecycle-authority` Phase 99 (the
 //! Migrator) is to carry this classifier into its `decide()`.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no caller until plan 2026-11-05 Phase 2 splits handle_usage_limit_hint"
-    )
-)]
-
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
+use std::sync::Mutex;
 
 use serde_json::Value;
 
@@ -63,6 +57,11 @@ pub(crate) struct LimitStop {
     pub resets_at_ms: Option<i64>,
     /// `quotaLimits.rateLimitType` (`seven_day`, `five_hour`, …), as written.
     pub rate_limit_type: Option<String>,
+    /// The error entry's own `timestamp` (RFC 3339), in milliseconds since
+    /// the epoch: when the session stopped. `None` when absent or unparseable.
+    /// A caller compares it with a later account migration, whose carried
+    /// transcript still ends at this stop.
+    pub stopped_at_ms: Option<i64>,
 }
 
 /// What the transcript says about a usage-limit stop.
@@ -308,11 +307,139 @@ fn classify(entry: &Value) -> LimitStopRead {
         .and_then(|q| q.get("rateLimitType"))
         .and_then(Value::as_str)
         .map(str::to_string);
+    let stopped_at_ms = entry
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .map(|t| t.timestamp_millis());
     LimitStopRead::Stopped(LimitStop {
         entry_uuid: entry_uuid.to_string(),
         resets_at_ms,
         rate_limit_type,
+        stopped_at_ms,
     })
+}
+
+// ── The park list (plan 2026-11-05 Phase 2) ──────────────────────────────────
+//
+// A session that stopped at a usage limit and cannot be continued or migrated
+// yet is PARKED here until a due time, and the scan loop re-hands it to
+// `account_migration::handle_usage_limit_hint` once that time has passed
+// (Phase 3 drains it). In memory only, on purpose: it is not durable state. A
+// restart loses it, and the next process re-derives a park from each
+// transcript that still ends at its stop. What a restart does lose is the
+// in-memory migration stamp the handler reads (`LAST_MIGRATED`), so a migrated
+// session whose continue nudge never landed is decided from its carried stop
+// again: parked until the OLD account's reset rather than continued at once.
+
+/// One parked session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Park {
+    pub terminal_id: String,
+    pub claude_session_id: String,
+    /// When the session is due to be handed back to the handler, in
+    /// milliseconds since the epoch.
+    pub due_at_ms: i64,
+}
+
+/// The parks, keyed by terminal: one pane has one pending re-entry.
+#[derive(Debug, Default)]
+pub(crate) struct ParkList {
+    by_terminal: HashMap<String, Park>,
+    /// The reason last REPORTED for each terminal's park. Kept when a due park
+    /// is taken, so a pane re-parked for the same reason on every re-entry
+    /// (a probe that keeps failing) reports once, not each time.
+    reported: HashMap<String, &'static str>,
+}
+
+impl ParkList {
+    /// Park `terminal_id` until `due_at_ms`. A second park of the same
+    /// terminal replaces the first: the newest decision about a pane is the
+    /// one that holds.
+    /// Returns whether the park is worth reporting: the terminal was last
+    /// reported under another reason, or never.
+    pub(crate) fn park(
+        &mut self,
+        terminal_id: &str,
+        claude_session_id: &str,
+        due_at_ms: i64,
+        reason: &'static str,
+    ) -> bool {
+        self.by_terminal.insert(
+            terminal_id.to_string(),
+            Park {
+                terminal_id: terminal_id.to_string(),
+                claude_session_id: claude_session_id.to_string(),
+                due_at_ms,
+            },
+        );
+        self.reported.insert(terminal_id.to_string(), reason) != Some(reason)
+    }
+
+    /// Remove and return every park due at `now_ms`, oldest due first.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "drained by the scan loop in plan 2026-11-05 Phase 3"
+        )
+    )]
+    pub(crate) fn take_due(&mut self, now_ms: i64) -> Vec<Park> {
+        let due: Vec<String> = self
+            .by_terminal
+            .iter()
+            .filter(|(_, p)| p.due_at_ms <= now_ms)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut taken: Vec<Park> = due
+            .iter()
+            .filter_map(|id| self.by_terminal.remove(id))
+            .collect();
+        taken.sort_by(|a, b| {
+            a.due_at_ms
+                .cmp(&b.due_at_ms)
+                .then_with(|| a.terminal_id.cmp(&b.terminal_id))
+        });
+        taken
+    }
+
+    /// Drop `terminal_id`'s pending park and its reported reason: its stop
+    /// was answered (a continue reached the pane, or the session was already
+    /// working), so a due re-entry would only re-read a session no longer
+    /// stopped, and a later stop's park is news again.
+    pub(crate) fn forget(&mut self, terminal_id: &str) {
+        self.by_terminal.remove(terminal_id);
+        self.reported.remove(terminal_id);
+    }
+
+    /// The park on `terminal_id`, if any.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by plan 2026-11-05 Phase 3 and by tests")
+    )]
+    pub(crate) fn get(&self, terminal_id: &str) -> Option<&Park> {
+        self.by_terminal.get(terminal_id)
+    }
+}
+
+/// The process's park list.
+static PARKS: Mutex<Option<ParkList>> = Mutex::new(None);
+
+/// Run `f` on the process's park list.
+pub(crate) fn with_parks<T>(f: impl FnOnce(&mut ParkList) -> T) -> T {
+    let mut guard = PARKS.lock().unwrap_or_else(|e| e.into_inner());
+    f(guard.get_or_insert_with(ParkList::default))
+}
+
+/// Park `terminal_id` until `due_at_ms` on the process's park list; whether
+/// to report it ([`ParkList::park`]).
+pub(crate) fn park(
+    terminal_id: &str,
+    claude_session_id: &str,
+    due_at_ms: i64,
+    reason: &'static str,
+) -> bool {
+    with_parks(|parks| parks.park(terminal_id, claude_session_id, due_at_ms, reason))
 }
 
 #[cfg(test)]
@@ -367,6 +494,8 @@ mod tests {
                 entry_uuid: SEVEN_DAY_UUID.to_string(),
                 resets_at_ms: Some(SEVEN_DAY_RESETS_AT_MS),
                 rate_limit_type: Some("seven_day".to_string()),
+                // 2026-11-02T16:29:41Z, the error entry's own timestamp.
+                stopped_at_ms: Some(1_793_636_981_000),
             })
         );
         // The fixture really does end in non-conversational lines: the last
@@ -384,6 +513,8 @@ mod tests {
                 // 2026-11-02T21:00:00Z
                 resets_at_ms: Some(1_793_653_200_000),
                 rate_limit_type: Some("five_hour".to_string()),
+                // 2026-11-02T18:37:12Z
+                stopped_at_ms: Some(1_793_644_632_000),
             })
         );
     }
@@ -439,6 +570,8 @@ mod tests {
                 entry_uuid: SEVEN_DAY_UUID.to_string(),
                 resets_at_ms: Some(SEVEN_DAY_RESETS_AT_MS),
                 rate_limit_type: Some("seven_day".to_string()),
+                // 2026-11-02T16:29:41Z, the error entry's own timestamp.
+                stopped_at_ms: Some(1_793_636_981_000),
             })
         );
     }
@@ -533,8 +666,22 @@ mod tests {
                 entry_uuid: SEVEN_DAY_UUID.to_string(),
                 resets_at_ms: None,
                 rate_limit_type: None,
+                stopped_at_ms: Some(1_793_636_981_000),
             })
         );
+    }
+
+    #[test]
+    fn a_stop_with_no_timestamp_has_no_stop_time() {
+        let mut entry = seven_day_error_entry();
+        entry.as_object_mut().unwrap().remove("timestamp");
+        assert!(matches!(
+            read(&format!("{entry}\n")),
+            LimitStopRead::Stopped(LimitStop {
+                stopped_at_ms: None,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -712,5 +859,59 @@ mod tests {
         let (read, span) = read_limit_stop(f.path());
         assert_eq!(span, ReadSpan::Whole);
         assert!(matches!(read, LimitStopRead::Stopped(ref s) if s.entry_uuid == SEVEN_DAY_UUID));
+    }
+
+    // ── The park list (plan 2026-11-05 Phase 2) ──────────────────────────────
+
+    #[test]
+    fn a_park_is_due_at_its_time_and_not_before() {
+        let mut parks = ParkList::default();
+        parks.park("t1", "s1", 1_000, "not-yet-reset");
+        assert!(parks.take_due(999).is_empty());
+        assert_eq!(
+            parks.take_due(1_000),
+            vec![Park {
+                terminal_id: "t1".to_string(),
+                claude_session_id: "s1".to_string(),
+                due_at_ms: 1_000,
+            }]
+        );
+        assert!(parks.get("t1").is_none());
+    }
+
+    #[test]
+    fn due_parks_come_out_oldest_first_and_a_repark_replaces() {
+        let mut parks = ParkList::default();
+        parks.park("t2", "s2", 2_000, "not-yet-reset");
+        parks.park("t1", "s1", 3_000, "not-yet-reset");
+        parks.park("t1", "s1", 1_000, "not-yet-reset");
+        parks.park("t3", "s3", 9_000, "not-yet-reset");
+        let due: Vec<(String, i64)> = parks
+            .take_due(5_000)
+            .into_iter()
+            .map(|p| (p.terminal_id, p.due_at_ms))
+            .collect();
+        assert_eq!(
+            due,
+            vec![("t1".to_string(), 1_000), ("t2".to_string(), 2_000)]
+        );
+        assert_eq!(parks.get("t3").map(|p| p.due_at_ms), Some(9_000));
+    }
+
+    #[test]
+    fn a_park_reports_once_per_reason_even_across_a_drain() {
+        let mut parks = ParkList::default();
+        assert!(parks.park("t1", "s1", 1_000, "probe-unknown"));
+        assert!(!parks.park("t1", "s1", 2_000, "probe-unknown"));
+        // Taken by the re-entry and parked again for the same reason: quiet.
+        assert_eq!(parks.take_due(5_000).len(), 1);
+        assert!(!parks.park("t1", "s1", 6_000, "probe-unknown"));
+        // A new reason is reported.
+        assert!(parks.park("t1", "s1", 7_000, "not-yet-reset"));
+        assert!(parks.park("t2", "s2", 7_000, "not-yet-reset"));
+        // Once its stop is answered, the pane's park and reason are gone.
+        parks.forget("t1");
+        assert!(parks.get("t1").is_none());
+        assert!(parks.park("t1", "s1", 9_000, "not-yet-reset"));
     }
 }

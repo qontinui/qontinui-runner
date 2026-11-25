@@ -251,11 +251,11 @@ pub(crate) const CLI_UPDATE_WAIT: Duration = Duration::from_secs(120);
 
 /// Returns once no runner-owned CLI install is in progress
 /// ([`crate::claude_cli_update`]), or after [`CLI_UPDATE_WAIT`]. Headless
-/// spawns through [`spawn_tokio_with_retry`] call this first, so an install the
-/// runner chose does not race them; PTY panes and the `--resume` seam do not
-/// wait yet (plan
+/// spawns through [`spawn_tokio_with_retry`] and the `--resume` seam
+/// ([`resolve_resume_claude_bin`]) call this first, so an install the runner
+/// chose does not race them; fresh PTY panes do not wait yet (plan
 /// `2026-10-20-account-migration-respawn-dies-during-cli-reinstall-churn`,
-/// Phase 2).
+/// Phase 2 and its "resume seam waits on the in-progress flag" follow-up).
 pub(crate) async fn await_cli_update_quiescent() {
     use crate::claude_cli_update::{wait_if_updating, UpdateWait};
     match wait_if_updating(CLI_UPDATE_WAIT).await {
@@ -311,12 +311,25 @@ pub(crate) async fn spawn_tokio_with_retry(
 /// `claude_cli_unavailable:not_found` error the callers already handle as a
 /// failed spawn.
 ///
+/// Before the first resolve it waits out a runner-owned CLI install
+/// ([`await_cli_update_quiescent`], at most [`CLI_UPDATE_WAIT`]): during the
+/// install `bin/claude` is moved aside on purpose, so resolving mid-install
+/// would only spend the retry budget on a window the runner itself opened. It
+/// returns at once when no install is running, which is the common case.
+///
 /// `delays` is the caller's budget: [`RESUME_RESOLVE_DELAYS`] for an account
 /// migration, whose old pane is still alive and loses its session if the
 /// respawn gives up early; [`RETRY_DELAYS`] for the resume door and the respawn
 /// receiver, which walk many candidates in turn and whose session is already
 /// closed, so a missing CLI skips the candidate instead of stalling the batch.
+/// A batch does still wait out a RUNNING install: those callers wait on the
+/// flag before their own drain and duplicate-process checks, so this wait
+/// usually returns at once for them. When the install outlived that first
+/// wait, or a new one started meanwhile, it waits once more, up to
+/// [`CLI_UPDATE_WAIT`] per resolve. Every waiter is released when the install
+/// ends.
 pub(crate) async fn resolve_resume_claude_bin(delays: &[Duration]) -> Result<String, String> {
+    await_cli_update_quiescent().await;
     resolve_with_retry(
         delays,
         || async {

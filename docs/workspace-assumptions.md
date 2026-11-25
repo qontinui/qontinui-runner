@@ -8,7 +8,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 
 | class | rows | hits | unreviewed | fallback_correct | dev_only_surface | defect |
 |---|---:|---:|---:|---:|---:|---:|
-| `repo_layout` | 66 | 79 | 54 | 10 | 2 | 0 |
+| `repo_layout` | 66 | 79 | 51 | 13 | 2 | 0 |
 | `dev_ports` | 28 | 28 | 26 | 0 | 2 | 0 |
 | `supervisor_dependency` | 57 | 57 | 0 | 47 | 4 | 6 |
 | `tenant_literal` | 0 | 0 | 0 | 0 | 0 | 0 |
@@ -16,7 +16,7 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `fleet_host_name` | 0 | 0 | 0 | 0 | 0 | 0 |
 | `fleet_device_uuid` | 0 | 0 | 0 | 0 | 0 | 0 |
 | `plans_dir` | 34 | 35 | 34 | 0 | 0 | 0 |
-| `os_bound_tooling` | 111 | 112 | 96 | 15 | 0 | 0 |
+| `os_bound_tooling` | 113 | 114 | 96 | 17 | 0 | 0 |
 
 ## `repo_layout` (66 rows)
 
@@ -81,9 +81,9 @@ Dispositions: `unreviewed` (not yet triaged), `fallback_correct` (the assumption
 | `src/provenance.rs` | `const CANONICAL_REPO` | `const CANONICAL_REPO: &str = "qontinui-claude-config";` | 1 | fallback_correct — The repository NAME the qontinui-provenance key's canonical= field is relative to — a label in a written grammar, never a path the runner resolves on disk. | — (no CAPABILITY_SPECS row) |
 | `src/reflection/workflow.rs` | `build_ui_bridge_completion_steps` | `- Write the full plan to 'qontinui-dev-notes/ui-bridge-implementation-plan.md'` | 1 | unreviewed — Surfaced by fleet-nouns.toml (A6); not yet triaged. | — (no CAPABILITY_SPECS row) |
 | `src/routing/q_router.rs` | `Domain::from_domain_tags` | `if lower.contains("frontend") \|\| lower.contains("ui-bridge") {` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
-| `src/slash_commands.rs` | `find_commands_directory_reported` | `"<workspace-root>/qontinui-claude-config/.claude/commands",` | 1 | unreviewed | `slash_commands` |
-| `src/slash_commands.rs` | `find_commands_directory_reported` | `"this device has no qontinui-claude-config checkout, and this import has \` | 1 | unreviewed | `slash_commands` |
-| `src/slash_commands.rs` | `find_commands_directory_reported` | `.join("qontinui-claude-config")` | 1 | unreviewed | `slash_commands` |
+| `src/slash_commands.rs` | `commands_directory_in` | `"<workspace-root>/qontinui-claude-config/.claude/commands",` | 1 | fallback_correct — The slash-command import scans <root>/qontinui-claude-config/.claude/commands and has no embedded copy. With no root, or no such checkout, it records an unresolved capability-manifest row and the route answers the typed 422 refusal (workspace_root_unresolved / sibling_checkout_absent, next action in the schemas Refusal) without touching the database — never a 500, never a deletion (runner#3129, finding 3dad3856). | `slash_commands` |
+| `src/slash_commands.rs` | `commands_directory_in` | `"this device has no qontinui-claude-config checkout, and this import has \` | 1 | fallback_correct — The slash-command import scans <root>/qontinui-claude-config/.claude/commands and has no embedded copy. With no root, or no such checkout, it records an unresolved capability-manifest row and the route answers the typed 422 refusal (workspace_root_unresolved / sibling_checkout_absent, next action in the schemas Refusal) without touching the database — never a 500, never a deletion (runner#3129, finding 3dad3856). | `slash_commands` |
+| `src/slash_commands.rs` | `const COMMANDS_SIBLING` | `const COMMANDS_SIBLING: &str = "qontinui-claude-config";` | 1 | fallback_correct — The sibling checkout name the slash-command import reads from and names in its sibling_checkout_absent refusal; its absence is handled by commands_directory_in's typed refusal (runner#3129). | `slash_commands` |
 | `src/ui_bridge_plugin.rs` | `init` | `Builder::new("ui-bridge")` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/workflow_generation/generator.rs` | `generate_workflow` | `\|\| stage_json.contains("ui-bridge");` | 1 | unreviewed | — (no CAPABILITY_SPECS row) |
 | `src/workspace_paths.rs` | `runner_workspace_root` | `"env QONTINUI_ROOT / QONTINUI_WORKSPACE_ROOT / settings paths.workspace_root (runner_workspace_root)",` | 1 | dev_only_surface — The label passed to ambient::canary, which reads it only while the canary is armed (cfg(test), an explicit arm, or a test binary running from cargo's deps directory; a release build compiles canary to Proceed and never reads it): it names the inputs an unguarded test reached, in the deflection message. An installed runner never shows it to an operator; the resolver it guards reads its inputs through the shared qontinui_types::paths rungs and degrades to Unresolved. Plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists B3. | `workspace_root` |
@@ -245,7 +245,7 @@ _No hits._
 | `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `let existing = get_setting::<PathSettings>().plans_dir;` | 1 | unreviewed |
 | `src/plans_dir_migration.rs` | `persist_env_plans_dir` | `update_setting::<PathSettings, _>(\|paths\| paths.plans_dir = Some(value.clone()))?;` | 1 | unreviewed |
 
-## `os_bound_tooling` (111 rows)
+## `os_bound_tooling` (113 rows)
 
 | file | symbol | excerpt | n | disposition |
 |---|---|---|---:|---|
@@ -341,6 +341,7 @@ _No hits._
 | `src/step_executor/legacy_steps.rs` | `StepExecutor::execute_shell_command_step` | `let mut c = crate::process_helpers::tokio_no_window("powershell");` | 1 | unreviewed |
 | `src/terminal/claude_resume_sniff.rs` | `is_claude_program` | `matches!(base, "claude" \| "claude.exe" \| "claude.cmd" \| "claude.ps1")` | 1 | unreviewed |
 | `src/terminal/session.rs` | `TerminalSession::assign_to_job_object` | `cfg(windows)-only fn 'assign_to_job_object' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
+| `src/ui_thread_probe.rs` | `publish_ui_thread_of` | `cfg(windows)-only fn 'publish_ui_thread_of' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — Captures the main window's owning thread id via GetWindowThreadProcessId when the HWND is cached; called only from the cfg(windows) HWND-cache path, and off Windows there is no HWND, and the record's 'ui_thread' field reads "unsupported_platform". |
 | `src/ui_thread_probe.rs` | `resolve_own_main_window` | `cfg(windows)-only fn 'resolve_own_main_window' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/webview_recovery.rs` | `attach_process_failed` | `cfg(windows)-only fn 'attach_process_failed' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/webview_recovery.rs` | `is_terminal_for_a_non_main_webview` | `cfg(windows)-only fn 'is_terminal_for_a_non_main_webview' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
@@ -350,6 +351,7 @@ _No hits._
 | `src/wedge_diagnostics.rs` | `names` | `cfg(windows)-only fn 'names' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/wedge_diagnostics.rs` | `own_threads` | `cfg(windows)-only fn 'own_threads' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/wedge_diagnostics.rs` | `thread_description` | `cfg(windows)-only fn 'thread_description' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
+| `src/wedge_diagnostics.rs` | `thread_state` | `cfg(windows)-only fn 'thread_state' has no cfg(not(windows)) sibling in this file` | 1 | fallback_correct — Reads one thread's kernel state and wait reason for the wedge-diagnostics 'ui_thread' field; called only from the cfg(windows) arm of capture_ui_thread_state; off Windows that arm answers "unsupported_platform" instead. |
 | `src/win32_compat.rs` | `ThreadDpiContextGuard::drop` | `cfg(windows)-only fn 'drop' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/win32_compat.rs` | `ThreadDpiContextGuard::is_active` | `cfg(windows)-only fn 'is_active' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |
 | `src/win32_compat.rs` | `ThreadDpiContextGuard::set_per_monitor_v2` | `cfg(windows)-only fn 'set_per_monitor_v2' has no cfg(not(windows)) sibling in this file` | 1 | unreviewed |

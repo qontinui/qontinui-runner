@@ -145,6 +145,7 @@ pub fn save_ai_settings(
     interactive_sessions_enabled: Option<bool>,
     auto_migrate_on_token_exhaustion: Option<bool>,
     auto_continue_after_migration: Option<bool>,
+    auto_continue_after_limit_reset: Option<bool>,
     account_selection_pinned: Option<bool>,
     runner_manages_cli_updates: Option<bool>,
 ) -> Result<CommandResponse, String> {
@@ -203,6 +204,8 @@ pub fn save_ai_settings(
                 ),
                 auto_continue_after_migration: auto_continue_after_migration
                     .unwrap_or(existing_settings.claude_cli.auto_continue_after_migration),
+                auto_continue_after_limit_reset: auto_continue_after_limit_reset
+                    .unwrap_or(existing_settings.claude_cli.auto_continue_after_limit_reset),
                 // `None` (an older frontend) preserves the configured value.
                 runner_manages_cli_updates: runner_manages_cli_updates
                     .unwrap_or(existing_settings.claude_cli.runner_manages_cli_updates),
@@ -1605,7 +1608,7 @@ pub(crate) const EXHAUSTION_UTILIZATION: f64 = 0.99;
 /// window; the header probe leaves it `None`). The session-window arm is what
 /// lets a "5-hour limit reached" migration hint confirm — the weekly number
 /// alone stays low when only the session window is exhausted.
-fn probe_result_exhausted(info: &AccountUsageInfo) -> bool {
+pub(crate) fn probe_result_exhausted(info: &AccountUsageInfo) -> bool {
     if info.error.is_some() || info.utilization >= EXHAUSTION_UTILIZATION {
         return true;
     }
@@ -1807,6 +1810,48 @@ fn roster_scope() -> Option<RosterScope> {
     )
 }
 
+/// Whether this refresh's account rows are the DEVICE's whole roster, sent to
+/// coord as `roster_complete`. coord retires a label absent from a complete
+/// report (plan
+/// `2026-11-17-coord-retires-claude-account-usage-rows-a-device-stopped-reporting`),
+/// so this must be `true` only when nothing on the device is left out:
+///
+/// - only the PRIMARY: a Subject runner reports its own pin under the same
+///   device id, which is a partial view of the device, and any other runner
+///   sends no account rows at all;
+/// - only when the refresh probed the roster (`probe_configured`, every
+///   configured dir) or the one account a lone-account runner spends
+///   (`probe_spent`);
+/// - only when it carries at least one account row (`reported_any`): an
+///   empty report (a model gateway, no candidate dir) says nothing about the
+///   device, and must not retire everything it reported before;
+/// - and, on the roster path, only when the account the runner actually
+///   SPENDS is among the reported labels (`spent_label_reported`). A Manual
+///   `config_dir` pin, or an unpinned inherited `CLAUDE_CONFIG_DIR` /
+///   `~/.claude`, can sit outside the roster; leaving it out of a complete
+///   report would retire the account every spawn runs on.
+///
+/// A Subject's own pin is never in the primary's complete report. It stays
+/// live because the Subject reports it itself every refresh and coord retires
+/// only a label no reporter has refreshed for 30 minutes; a Subject that stops
+/// reporting for that long has its label retired until its next report.
+///
+/// Known bound: a session still running on an account that has since left the
+/// roster, and is no longer the resolved pick, is in use but neither probed nor
+/// spent, so a complete report lets coord retire its label. The roster is the
+/// operator's statement of what is in use; this function cannot see past it.
+fn roster_complete(
+    scope: Option<RosterScope>,
+    plan: UsageRefreshPlan,
+    reported_any: bool,
+    spent_label_reported: bool,
+) -> bool {
+    scope == Some(RosterScope::Primary)
+        && (plan.probe_configured || plan.probe_spent)
+        && reported_any
+        && spent_label_reported
+}
+
 /// Env-free core of [`roster_scope`].
 fn account_scope_from(is_primary: bool, has_instance_root: bool) -> Option<RosterScope> {
     if is_primary {
@@ -1864,8 +1909,17 @@ async fn refresh_usage(caller: UsageRefreshCaller) -> Vec<AccountUsageInfo> {
     // ([`roster_scope`]); a secondary on the primary's machine-global roster
     // would repeat them. Prepaid is not roster-owned and is sent regardless.
     let reported: &[AccountUsageInfo] = if scope.is_some() { &results } else { &[] };
+    // The roster path probes the configured dirs only; the account a spawn
+    // actually runs on may sit outside them ([`roster_complete`]). Compared by
+    // label, because that is coord's key.
+    let spent_label_reported =
+        !(scope == Some(RosterScope::Primary) && plan.probe_configured && !plan.probe_spent)
+            || spent_account_dir(true)
+                .map(|dir| account_label(&dir))
+                .is_none_or(|label| reported.iter().any(|r| r.label == label));
+    let complete = roster_complete(scope, plan, !reported.is_empty(), spent_label_reported);
     if let Some(base) = report_base.filter(|_| !reported.is_empty() || !prepaid.is_empty()) {
-        usage_twin_report::report_to_coord(&base, reported, &active_dirs, &prepaid).await;
+        usage_twin_report::report_to_coord(&base, reported, &active_dirs, &prepaid, complete).await;
     }
     results
 }
@@ -1879,7 +1933,7 @@ async fn refresh_usage(caller: UsageRefreshCaller) -> Vec<AccountUsageInfo> {
 /// runner PR can land independently of the coord one.
 mod usage_twin_report {
     use serde::Serialize;
-    use tracing::{debug, warn};
+    use tracing::{debug, info, warn};
 
     /// Wire shape — SHARED CONTRACT with coord's
     /// `POST /coord/claude-accounts/usage` ingest. The row's display name is
@@ -1972,6 +2026,11 @@ mod usage_twin_report {
         /// This is what makes the operator string *"this machine will use:
         /// &lt;mode&gt;"* answerable from the feed alone.
         account_selection_mode: &'static str,
+        /// `true` only when `accounts` is this device's WHOLE roster
+        /// ([`super::roster_complete`]). coord retires labels a complete report
+        /// does not carry; `false`, like the key's absence from an older
+        /// runner, retires nothing.
+        roster_complete: bool,
     }
 
     /// The coord this runner reports to, or `None` when it reports nothing.
@@ -2009,9 +2068,10 @@ mod usage_twin_report {
         results: &[super::AccountUsageInfo],
         active_dirs: &std::collections::HashSet<String>,
         prepaid: &[crate::ai_provider::prepaid_balance::PrepaidBalanceInfo],
+        roster_complete: bool,
     ) {
         let url = format!("{}/coord/claude-accounts/usage", base.trim_end_matches('/'));
-        let body = WireBody {
+        let mut body = WireBody {
             accounts: results
                 .iter()
                 .filter_map(|r| {
@@ -2038,7 +2098,12 @@ mod usage_twin_report {
                 .collect(),
             prepaid: prepaid.iter().map(WirePrepaid::from_info).collect(),
             account_selection_mode: crate::claude_accounts::effective_selection_mode().as_str(),
+            roster_complete,
         };
+        // Completeness is a claim about the rows actually SENT: when every row
+        // was dropped for a non-bare label, an empty body must not claim the
+        // whole roster.
+        body.roster_complete = body.roster_complete && !body.accounts.is_empty();
         let client = match reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()
@@ -2066,6 +2131,15 @@ mod usage_twin_report {
                         prepaid = prepaid.len(),
                         "account usage mirrored to coord twin"
                     );
+                    match roster_log_line(
+                        last_roster_reason(),
+                        body.roster_complete,
+                        &RosterAnswer::from_body(&bytes),
+                    ) {
+                        Some(RosterLine::Info(line)) => info!("{line}"),
+                        Some(RosterLine::Warn(line)) => warn!("{line}"),
+                        None => {}
+                    }
                 } else {
                     let body = String::from_utf8_lossy(&bytes);
                     let posture = crate::mcp::device_jwt_refresher::coord_credential_posture()
@@ -2079,6 +2153,93 @@ mod usage_twin_report {
                 warn!(error = %e, "coord account-usage report failed — skipped");
             }
         }
+    }
+
+    /// The roster half of coord's ingest answer (qontinui-coord
+    /// `claude_account_usage.rs` `add_roster_half`): `roster_reason`, plus
+    /// `roster_retired` / `roster_purged` only when the step ran. A coord that
+    /// predates the roster step sends none of the three.
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct RosterAnswer {
+        reason: Option<String>,
+        retired: Option<u64>,
+        purged: Option<u64>,
+    }
+
+    impl RosterAnswer {
+        fn from_body(bytes: &[u8]) -> Self {
+            let Ok(v) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+                return Self::default();
+            };
+            Self {
+                reason: v
+                    .get("roster_reason")
+                    .and_then(|r| r.as_str())
+                    .map(str::to_string),
+                retired: v.get("roster_retired").and_then(|n| n.as_u64()),
+                purged: v.get("roster_purged").and_then(|n| n.as_u64()),
+            }
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum RosterLine {
+        Info(String),
+        Warn(String),
+    }
+
+    /// The `roster_reason` last WARNed for a complete report, so an unchanged
+    /// degraded answer does not re-WARN every refresh. Cleared on `applied`.
+    fn last_roster_reason() -> &'static std::sync::Mutex<Option<String>> {
+        static LAST: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+        &LAST
+    }
+
+    /// What to log about coord's roster answer, or `None`.
+    ///
+    /// Without this line the runner discards the only on-box evidence that a
+    /// `roster_complete: true` report actually retired anything: coord's usage
+    /// reads are operator-tier, so a device cannot read its own rows back.
+    ///
+    /// - Any retire or purge is an event and is logged at INFO every time.
+    /// - A report sent `roster_complete: true` that coord did not answer
+    ///   `applied` is WARNed once per distinct reason (`column_missing`,
+    ///   `failed`, `pool_unavailable`, …, or no reason at all from a coord
+    ///   that predates the roster step).
+    /// - A partial report is answered `not_complete` by design; nothing logs.
+    fn roster_log_line(
+        last: &std::sync::Mutex<Option<String>>,
+        sent_complete: bool,
+        answer: &RosterAnswer,
+    ) -> Option<RosterLine> {
+        let retired = answer.retired.unwrap_or(0);
+        let purged = answer.purged.unwrap_or(0);
+        if answer.reason.as_deref() == Some("applied") {
+            *last.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+        if retired > 0 || purged > 0 {
+            return Some(RosterLine::Info(format!(
+                "coord retired {retired} and purged {purged} account-usage label(s) \
+                 absent from this device's complete roster report"
+            )));
+        }
+        if !sent_complete || answer.reason.as_deref() == Some("applied") {
+            return None;
+        }
+        let reason = answer.reason.clone().unwrap_or_else(|| {
+            "absent from coord's answer (coord predates roster retirement?)".to_string()
+        });
+        {
+            let mut guard = last.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.as_deref() == Some(reason.as_str()) {
+                return None;
+            }
+            *guard = Some(reason.clone());
+        }
+        Some(RosterLine::Warn(format!(
+            "coord did not apply this device's complete account roster \
+             (roster_reason: {reason}) — labels this device stopped reporting stay listed"
+        )))
     }
 
     /// The (status, refusal token, posture) of the last refusal WARNed. The report runs on
@@ -2165,6 +2326,72 @@ mod usage_twin_report {
     mod tests {
         use super::*;
 
+        fn answer(json: &str) -> RosterAnswer {
+            RosterAnswer::from_body(json.as_bytes())
+        }
+
+        /// coord's roster answer: counts only when the step ran, and an
+        /// unparseable or pre-roster body reads as all-absent.
+        #[test]
+        fn roster_answer_reads_coords_keys() {
+            assert_eq!(
+                answer(r#"{"roster_reason":"applied","roster_retired":2,"roster_purged":1}"#),
+                RosterAnswer {
+                    reason: Some("applied".into()),
+                    retired: Some(2),
+                    purged: Some(1)
+                }
+            );
+            assert_eq!(
+                answer(r#"{"roster_reason":"column_missing"}"#),
+                RosterAnswer {
+                    reason: Some("column_missing".into()),
+                    ..Default::default()
+                }
+            );
+            assert_eq!(answer(r#"{"recorded":true}"#), RosterAnswer::default());
+            assert_eq!(answer("not json"), RosterAnswer::default());
+        }
+
+        #[test]
+        fn roster_log_line_reports_retires_and_degraded_complete_reports() {
+            let last = std::sync::Mutex::new(None);
+            // A retire is an event: logged every time.
+            let retired =
+                answer(r#"{"roster_reason":"applied","roster_retired":1,"roster_purged":0}"#);
+            for _ in 0..2 {
+                assert!(matches!(
+                    roster_log_line(&last, true, &retired),
+                    Some(RosterLine::Info(l)) if l.contains("retired 1")
+                ));
+            }
+            // A quiet `applied` and any partial report say nothing.
+            let quiet =
+                answer(r#"{"roster_reason":"applied","roster_retired":0,"roster_purged":0}"#);
+            assert_eq!(roster_log_line(&last, true, &quiet), None);
+            let partial =
+                answer(r#"{"roster_reason":"not_complete","roster_retired":0,"roster_purged":0}"#);
+            assert_eq!(roster_log_line(&last, false, &partial), None);
+            // A complete report coord could not apply WARNs once per reason.
+            let missing = answer(r#"{"roster_reason":"column_missing"}"#);
+            assert!(matches!(
+                roster_log_line(&last, true, &missing),
+                Some(RosterLine::Warn(l)) if l.contains("column_missing")
+            ));
+            assert_eq!(roster_log_line(&last, true, &missing), None);
+            let legacy = answer(r#"{"recorded":true}"#);
+            assert!(matches!(
+                roster_log_line(&last, true, &legacy),
+                Some(RosterLine::Warn(l)) if l.contains("predates")
+            ));
+            // `applied` re-arms the latch.
+            assert_eq!(roster_log_line(&last, true, &quiet), None);
+            assert!(matches!(
+                roster_log_line(&last, true, &missing),
+                Some(RosterLine::Warn(_))
+            ));
+        }
+
         /// The wire KEYS are the shared contract with coord's
         /// `claude_account_usage.rs`; a rename on either side is a silent
         /// data loss (serde drops unknown keys on the ingest side). Pin them.
@@ -2189,6 +2416,7 @@ mod usage_twin_report {
                 }],
                 prepaid: Vec::new(),
                 account_selection_mode: "least_usage",
+                roster_complete: true,
             };
             let v = serde_json::to_value(&body).expect("serializes");
 
@@ -2197,6 +2425,9 @@ mod usage_twin_report {
                 v["account_selection_mode"],
                 serde_json::json!("least_usage")
             );
+            // Per-report too: coord's `UsageReport::roster_complete`.
+            assert_eq!(v["roster_complete"], serde_json::json!(true));
+            assert!(v["accounts"][0].get("roster_complete").is_none());
             let acct = &v["accounts"][0];
             assert_eq!(acct["is_active"], serde_json::json!(true));
             // Identity stays the config-dir basename — never a full local path.
@@ -2272,7 +2503,7 @@ mod usage_twin_report {
                 row(r"C:\Users\someone\.claude"),
             ];
 
-            report_to_coord(&coord.base, &rows, &Default::default(), &[]).await;
+            report_to_coord(&coord.base, &rows, &Default::default(), &[], false).await;
 
             let bodies = coord.bodies();
             assert_eq!(bodies.len(), 1, "one report, one POST: {bodies:?}");
@@ -2317,6 +2548,7 @@ mod usage_twin_report {
                 }],
                 prepaid: Vec::new(),
                 account_selection_mode: "manual",
+                roster_complete: false,
             };
             let v = serde_json::to_value(&body).expect("serializes");
             assert_eq!(v["accounts"][0]["is_active"], serde_json::json!(false));
@@ -2355,6 +2587,7 @@ mod usage_twin_report {
                 accounts: Vec::new(),
                 prepaid: vec![WirePrepaid::from_info(&info)],
                 account_selection_mode: "manual",
+                roster_complete: false,
             };
             let v = serde_json::to_value(&body).expect("serializes");
             let p = &v["prepaid"][0];
@@ -3218,18 +3451,14 @@ mod usage_report_scope_tests {
     /// Assert `path` lies under `root`, comparing the two as the filesystem
     /// resolves them rather than as spelled (macOS spells its temp dir through
     /// the `/var` -> `/private/var` link). `path` may not exist yet, so its
-    /// nearest existing ancestor is resolved and the rest re-joined lexically.
+    /// nearest existing PATH — the leaf file itself when it exists, so a
+    /// symlinked file pointing outside the fixture is caught — is resolved and
+    /// the rest re-joined lexically. An unfollowable (dangling) link panics.
     /// Nothing is created, so a path that did escape is not touched.
     fn assert_inside(path: &std::path::Path, root: &std::path::Path, what: &str) {
         let root = std::fs::canonicalize(root).expect("canonicalize the fixture root");
-        let mut existing = path;
-        let mut rest = Vec::new();
-        while !existing.exists() {
-            rest.push(existing.file_name().expect("a path under a root has names"));
-            existing = existing.parent().expect("a path under a root has a parent");
-        }
-        let mut resolved = std::fs::canonicalize(existing).expect("canonicalize the ancestor");
-        resolved.extend(rest.into_iter().rev());
+        let resolved = crate::util::existing_ancestor::resolve_through_existing_path(path)
+            .expect("resolve the path through its nearest existing path");
         assert!(
             resolved.starts_with(&root),
             "{what}: {} (resolved {}) is not under {}",
@@ -3400,6 +3629,53 @@ mod usage_report_scope_tests {
         refresh_fleet_usage_report().await;
 
         assert_eq!(coord.reported_labels(), vec![".claude-pinned".to_string()]);
+        assert_eq!(
+            coord.bodies().last().expect("report")["roster_complete"],
+            serde_json::json!(true),
+            "a lone-account primary's spent account is its whole roster"
+        );
+    }
+
+    /// Two roster entries and a Manual pin outside them: the roster probe
+    /// leaves out the account every spawn runs on, so the report must not
+    /// claim the whole roster, or coord would retire that account.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_roster_report_missing_the_spent_account_is_not_complete() {
+        let amb = crate::test_env::isolated_ambient();
+        let _env = extra_env();
+        let coord = FakeCoord::start().await;
+        coord.connect();
+        let a = logged_in_dir(&amb, ".claude-a", None).await;
+        let b = logged_in_dir(&amb, ".claude-b", None).await;
+        let pinned = logged_in_dir(&amb, ".claude-pinned", None).await;
+        write_roster(
+            &amb,
+            vec![a.clone(), b.clone()],
+            AccountSelectionMode::Manual,
+            Some(pinned),
+        );
+
+        refresh_fleet_usage_report().await;
+        assert_eq!(coord.reported_labels().len(), 2, "{:?}", coord.bodies());
+        assert_eq!(
+            coord.bodies().last().expect("report")["roster_complete"],
+            serde_json::json!(false),
+            "the pinned account is not in the report"
+        );
+
+        write_roster(
+            &amb,
+            vec![a, b.clone()],
+            AccountSelectionMode::Manual,
+            Some(b),
+        );
+        refresh_fleet_usage_report().await;
+        assert_eq!(
+            coord.bodies().last().expect("report")["roster_complete"],
+            serde_json::json!(true),
+            "the pinned account is a roster entry, so the report is whole"
+        );
     }
 
     /// No list and no pin: a spawn inherits the runner's own environment, so
@@ -3468,6 +3744,11 @@ mod usage_report_scope_tests {
         refresh_fleet_usage_report().await;
         std::env::remove_var("QONTINUI_INSTANCE_ROOT");
         assert_eq!(coord.reported_labels(), vec![".claude-own".to_string()]);
+        assert_eq!(
+            coord.bodies().last().expect("report")["roster_complete"],
+            serde_json::json!(false),
+            "a Subject's pin is a partial view of the device"
+        );
     }
 
     /// Ownership follows where the roster resolved, not the runner's name: a
@@ -3514,6 +3795,12 @@ mod usage_report_scope_tests {
 
         refresh_fleet_usage_report().await;
         assert_eq!(coord.reported_labels().len(), 2, "the primary reports both");
+        let bodies = coord.bodies();
+        assert_eq!(
+            bodies.last().expect("the primary's report")["roster_complete"],
+            serde_json::json!(true),
+            "the primary's full probe is the device's whole roster"
+        );
     }
 
     /// The ownership table, with no env or filesystem.
@@ -3523,6 +3810,62 @@ mod usage_report_scope_tests {
         assert_eq!(account_scope_from(true, false), Some(Primary));
         assert_eq!(account_scope_from(false, true), Some(Subject));
         assert_eq!(account_scope_from(false, false), None);
+    }
+
+    /// Only the primary's probe of the roster (or of its one spent account) is
+    /// the device's whole roster. A Subject's pin shares the device id with the
+    /// primary's roster, so marking it complete would make coord retire every
+    /// account the primary reports.
+    #[test]
+    fn only_the_primarys_probed_roster_is_complete() {
+        use super::{roster_complete, RosterScope::*, UsageRefreshPlan};
+        let plan = |probe_configured, probe_spent| UsageRefreshPlan {
+            probe_configured,
+            probe_spent,
+            record_snapshot: probe_configured,
+        };
+        assert!(roster_complete(
+            Some(Primary),
+            plan(true, false),
+            true,
+            true
+        ));
+        assert!(roster_complete(
+            Some(Primary),
+            plan(false, true),
+            true,
+            true
+        ));
+        assert!(!roster_complete(
+            Some(Primary),
+            plan(false, false),
+            true,
+            true
+        ));
+        // An empty report never claims the whole roster.
+        assert!(!roster_complete(
+            Some(Primary),
+            plan(true, false),
+            false,
+            true
+        ));
+        assert!(!roster_complete(
+            Some(Primary),
+            plan(false, true),
+            false,
+            true
+        ));
+        // The spent account outside the probed roster makes it partial.
+        assert!(!roster_complete(
+            Some(Primary),
+            plan(true, false),
+            true,
+            false
+        ));
+        for probed in [plan(true, false), plan(false, true), plan(false, false)] {
+            assert!(!roster_complete(Some(Subject), probed, true, true));
+            assert!(!roster_complete(None, probed, true, true));
+        }
     }
 
     /// A nameless secondary that only its ports give away (a primary to proxy

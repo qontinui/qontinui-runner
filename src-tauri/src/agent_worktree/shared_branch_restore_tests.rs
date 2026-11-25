@@ -51,6 +51,22 @@ impl Canon {
         let path = tmp.path().join("canon");
         std::fs::create_dir_all(&path).unwrap();
         git(&path, &["init", "-q", "-b", "main"]);
+        // Hermetic ignore rules: a machine-global ignore (`core.excludesFile`,
+        // or the XDG `git/ignore` default) can hide files these tests create
+        // (e.g. `.claude/settings.local.json`), making `status --porcelain`
+        // empty and the restore proceed. A repo-local `core.excludesFile`
+        // pointing at an empty file overrides both, and is seen by the
+        // production git calls under test as well as by this helper.
+        let empty_excludes = tmp.path().join("empty-excludes");
+        std::fs::write(&empty_excludes, "").unwrap();
+        git(
+            &path,
+            &[
+                "config",
+                "core.excludesFile",
+                &empty_excludes.to_string_lossy().replace('\\', "/"),
+            ],
+        );
         std::fs::write(path.join("README.md"), "hello\n").unwrap();
         git(&path, &["add", "README.md"]);
         git(&path, &["commit", "-q", "-m", "init"]);

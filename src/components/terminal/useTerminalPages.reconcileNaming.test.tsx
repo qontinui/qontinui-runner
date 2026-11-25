@@ -13,7 +13,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
-vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(() => Promise.resolve(() => {})) }));
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn(() => Promise.resolve(() => {})),
+  // The roster-saved broadcast after each save (`terminalPagesSync`).
+  emit: vi.fn(() => Promise.resolve()),
+}));
 
 import { instanceStorage } from "@/lib/instance-storage";
 import { RESTART_BATCH_PAGE_IDS, ROSTER_BEFORE_RESTART } from "./fixtures/terminalPageRoster";
