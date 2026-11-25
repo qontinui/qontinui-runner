@@ -248,7 +248,12 @@ impl BudgetTracker {
 
     /// Record token consumption after an AI call.
     pub fn record(&self, phase: &str, tokens: u64, cost_usd: f64) -> BudgetResult {
-        let mut state = self.state.lock().unwrap();
+        // Poison-tolerant: a panic here unwinds through the agentic phase
+        // between its session row's create and its terminal write.
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.total_tokens += tokens;
         state.total_cost_usd += cost_usd;
 
@@ -308,14 +313,20 @@ impl BudgetTracker {
 
     /// Check if the overall budget is exhausted.
     pub fn is_exhausted(&self) -> bool {
-        let state = self.state.lock().unwrap();
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.total_cost_usd > self.budget.max_cost_per_run_usd
             || state.total_tokens > self.budget.max_tokens_per_run
     }
 
     /// Get remaining budget as a fraction (0.0 = exhausted, 1.0 = full).
     pub fn remaining_fraction(&self) -> f64 {
-        let state = self.state.lock().unwrap();
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let cost_remaining =
             1.0 - (state.total_cost_usd / self.budget.max_cost_per_run_usd).min(1.0);
         let token_remaining =
@@ -325,7 +336,10 @@ impl BudgetTracker {
 
     /// Get remaining budget for a specific phase.
     pub fn remaining_for_phase(&self, phase: &str) -> (u64, f64) {
-        let state = self.state.lock().unwrap();
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let consumed = state.per_phase.get(phase).copied().unwrap_or((0, 0.0));
 
         let phase_fraction = self.budget.phase_budgets.get(phase).copied().unwrap_or(1.0);
@@ -341,7 +355,10 @@ impl BudgetTracker {
 
     /// Get a snapshot of current consumption.
     pub fn snapshot(&self) -> BudgetSnapshot {
-        let state = self.state.lock().unwrap();
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         BudgetSnapshot {
             total_tokens: state.total_tokens,
             total_cost_usd: state.total_cost_usd,
@@ -449,6 +466,40 @@ impl AiMiddleware for BudgetEnforcementMiddleware {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tracker whose state mutex was poisoned by a panic while held — the
+    /// state the agentic phase reaches when any earlier holder panicked.
+    fn poisoned_tracker() -> BudgetTracker {
+        let tracker = BudgetTracker::with_defaults();
+        let held = std::panic::AssertUnwindSafe(&tracker);
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = held.state.lock().expect("first lock");
+            panic!("poison the budget state lock");
+        });
+        assert!(tracker.state.is_poisoned(), "fixture must poison the lock");
+        tracker
+    }
+
+    /// Recording spend on a poisoned tracker must not panic: the agentic
+    /// phase records spend between its session row's create and its terminal
+    /// write, and a panic there would leave the row resumable.
+    #[test]
+    fn record_survives_a_poisoned_state_lock() {
+        let tracker = poisoned_tracker();
+        let _ = tracker.record("agentic", 10, 0.01);
+        let state = tracker
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(state.total_tokens, 10);
+    }
+
+    /// Reading the spend snapshot on a poisoned tracker must not panic.
+    #[test]
+    fn snapshot_survives_a_poisoned_state_lock() {
+        let tracker = poisoned_tracker();
+        assert_eq!(tracker.snapshot().total_tokens, 0);
+    }
 
     #[test]
     fn test_budget_tracker_basic() {

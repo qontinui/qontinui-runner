@@ -5,7 +5,10 @@
 //!   canonical-hash. Serializes via `serde_jcs` (sorted keys, canonical number
 //!   form, RFC 8785 string escapes), hashes with SHA-256, returns
 //!   `"sha256-<hex>"`. Used by callers that already hold a fully-pruned
-//!   value (e.g. the script-emitter cache key).
+//!   value (e.g. the spec-version dedupe hash in
+//!   `spec_experimentation::versioning`). The script-emitter cache key
+//!   (`step_output::script_emitter`) does NOT go through here: it calls
+//!   `serde_jcs` directly.
 //! - `hash_ir_page_spec(&IrPageSpec) -> Result<String, HashError>` — strips
 //!   cosmetic provenance fields (`file`, `line`, `column`) at every level
 //!   before canonicalizing. Per §5.10 those are authoring artifacts that
@@ -53,15 +56,21 @@ fn clear_cosmetic_provenance(prov: &mut Option<qontinui_types::ir::IrProvenance>
 
 #[derive(Debug, Error)]
 pub enum HashError {
-    #[error("canonicalize failed: {0}")]
+    /// Carries the source error's full rendered message, which already
+    /// names the failure (`"canonicalize failed: ..."`), so it is displayed
+    /// verbatim rather than prefixed a second time.
+    #[error("{0}")]
     Canonicalize(String),
 }
 
+/// Deliberately NOT an exhaustive `match`: `CanonicalHashError` gains
+/// variants as the canonicaliser learns to refuse inputs no other language
+/// can reproduce (plan `2026-11-22-canonical-hash-genuine-rfc8785`), and a
+/// new variant must not require a lockstep runner change to compile. Every
+/// variant maps to `Canonicalize` carrying its rendered message.
 impl From<CanonicalHashError> for HashError {
     fn from(e: CanonicalHashError) -> Self {
-        match e {
-            CanonicalHashError::Canonicalize(msg) => HashError::Canonicalize(msg),
-        }
+        HashError::Canonicalize(e.to_string())
     }
 }
 
@@ -249,5 +258,17 @@ mod tests {
             hash_ir_page_spec(&a).unwrap(),
             hash_ir_page_spec(&b).unwrap()
         );
+    }
+
+    #[test]
+    fn canonical_hash_error_maps_to_canonicalize_with_its_message_once() {
+        // Pins the non-exhaustive mapping: whatever the source variant, the
+        // runner error is `Canonicalize` carrying the source's rendered
+        // message, displayed once (not "canonicalize failed: canonicalize
+        // failed: ...").
+        let mapped: HashError = CanonicalHashError::Canonicalize("boom".to_string()).into();
+        let HashError::Canonicalize(msg) = &mapped;
+        assert_eq!(msg, "canonicalize failed: boom");
+        assert_eq!(mapped.to_string(), "canonicalize failed: boom");
     }
 }

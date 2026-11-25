@@ -160,6 +160,33 @@ function recordRepairIfPersisted(): boolean {
 }
 
 /**
+ * The Tauri command that tells the runner backend this window's tab labels
+ * and order (`commands/terminal_pages.rs`). The backend serves them on
+ * `GET /terminal-pages` and `GET /terminal-layout`; without a registration it
+ * knows page ids only. Plan
+ * `2026-11-08-save-per-tab-runner-session-lists-on-sessions-page-kept-14-days`, D2.
+ */
+export const REGISTER_PAGE_LABELS_COMMAND = "terminal_pages_register";
+
+/** One page as the registration command takes it. */
+export interface PageLabelRegistration {
+  pageId: string;
+  label: string;
+  order: number;
+}
+
+/**
+ * Pure: the registration payload — EVERY page in tab order, pages detached
+ * into a pop-out and the internal "default" page included, numbered by
+ * position. The backend replaces its whole registration with it.
+ */
+export function pageLabelRegistration(pages: readonly TerminalPageConfig[]): {
+  pages: PageLabelRegistration[];
+} {
+  return { pages: pages.map((p, order) => ({ pageId: p.id, label: p.name, order })) };
+}
+
+/**
  * Pure reconciliation: union the persisted page tabs with the distinct backend
  * page_ids, synthesizing a tab for any backend id NOT already persisted so a
  * minted page (and continuations restored onto it) get a visible, selectable
@@ -538,15 +565,16 @@ export async function readOccupiedPageIds(): Promise<OccupancyRead> {
  * unreadable, or the restorable set withheld by a drain — removes nothing.
  * `remove` is the record-only `removeEmptyPage`, which itself keeps a page it
  * finds a terminal on; it resolves to `null` when it kept the page. Returns how
- * many pages were removed.
+ * many pages were removed, or `null` when the occupancy read was incomplete
+ * (UNKNOWN — distinct from `0`, "read fine, nothing empty").
  */
 export async function closeEmptyPagesWith<T>(
   visiblePages: TerminalPageConfig[],
   read: () => Promise<OccupancyRead>,
   remove: (id: string) => Promise<T | null>,
-): Promise<number> {
+): Promise<number | null> {
   const first = await read();
-  if (!first.complete) return 0;
+  if (!first.complete) return null;
   const { removed } = await removeEach(emptyPageIds(visiblePages, first.ids), read, remove);
   return removed.length;
 }
@@ -586,6 +614,23 @@ export function useTerminalPages() {
   );
 
   const [allPages, setPages] = useState<TerminalPageConfig[]>(loadPages);
+  // Only the main window registers tab labels with the backend. A page-pinned
+  // pop-out knows only its own page, so its list would wipe every other
+  // label; any other pop-out holds a roster that can lag the main window's.
+  // Both inputs are fixed for the window's lifetime, so decide once.
+  const [registersLabels] = useState(
+    () => pinnedPageId === null && readWindowLabel() === MAIN_WINDOW_LABEL,
+  );
+  // One effect on the roster, never a call per mutation: a rename, a reorder,
+  // a close, a page `reconcile` synthesizes, `ensureProjectPage`, `openPage`
+  // and `addPage` all reach the backend through this. Best-effort: until it
+  // lands the backend serves no labels, and says so (`labelsRegistered`).
+  useEffect(() => {
+    if (!registersLabels) return;
+    invoke(REGISTER_PAGE_LABELS_COMMAND, pageLabelRegistration(allPages)).catch((err) => {
+      console.warn("[useTerminalPages] tab-label registration failed:", err);
+    });
+  }, [allPages, registersLabels]);
   // Latest page roster, readable SYNCHRONOUSLY by `ensureProjectPage` (which
   // must return the resolved page id to its caller immediately, before the
   // `setPages` updater has run). Kept in sync from an effect and, eagerly,
@@ -888,7 +933,7 @@ export function useTerminalPages() {
    * reconcile). FAIL-CLOSED: an incomplete read — a source unreadable, or the
    * restorable set withheld by a drain — is UNKNOWN and removes nothing.
    * Record-only (`removeEmptyPage`): no PTY is closed. Returns the number of
-   * pages removed.
+   * pages removed, or `null` when the occupancy read was incomplete (UNKNOWN).
    */
   const closeEmptyPages = useCallback(
     () =>

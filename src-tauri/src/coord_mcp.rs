@@ -11429,15 +11429,23 @@ pub(crate) fn probe_and_breadcrumb_proxy_with_policy(
 ///
 /// KEPT deliberately (credential-hygiene Task 9 review, 2026-07-17): the
 /// app-data `--mcp-config` delivery (`provision_coord_mcp_config_file`) is the
-/// newer shape, but the in-workdir file has a hard consumer that cannot take
-/// `--mcp-config`: **`qontinui-pr`** (`src/bin/qontinui_cli.rs`,
-/// `find_session_mcp_config`) discovers the per-session proxy nonce + issuing
-/// runner port EXCLUSIVELY by a `.mcp.json` walk-up from cwd — it is a
-/// standalone CLI invoked ad hoc inside the session, with no launch seam to
-/// hand it a config path (only the PORT has an env override,
-/// `QONTINUI_RUNNER_API_PORT`; the nonce deliberately travels with the port in
-/// the same file so they can never cross runners). Headless agent spawns and
-/// the boot root/session reconcile also provision through this writer. The
+/// newer shape, and **`qontinui-pr`** (`src/bin/qontinui_cli.rs`,
+/// `discover_session_mcp_config`) now reads it FIRST: a session whose spawn
+/// exported [`MCP_CONFIG_ENV`] (`QONTINUI_MCP_CONFIG`) authenticates with the
+/// nonce + issuing-runner port from that file, and a set-but-missing or
+/// credential-less file is an error rather than a fall-through. The CLI falls
+/// back to a `.mcp.json` walk-up from cwd (`find_session_mcp_config`) ONLY when
+/// the variable is unset or empty — so this in-workdir file is still what
+/// `qontinui-pr` finds in a session spawned WITHOUT that export, which is why
+/// it is not deleted yet. Its readers include `qontinui-pr` in those sessions,
+/// the vendored coord-revive skill's L1/L2 doors and `call`/`tools` verbs, and
+/// a `claude` launched there without `--mcp-config`. Headless agent spawns
+/// and the boot root/session reconcile are other WRITERS through this
+/// function (plan
+/// `2026-11-21-sessions-spawn-takes-the-parent-mcp-json-and-acts-as-the-default-tenant`
+/// Phase 2 moves the direct-exec paths onto the env delivery). The nonce
+/// travels with the port in the same file on both arms, so they can never
+/// cross runners; `QONTINUI_RUNNER_API_PORT` overrides only the port. The
 /// compensating hardening: the write is owner-only (Task 6), so a leftover
 /// file is at least never world-readable.
 ///
@@ -25800,14 +25808,25 @@ mod runner_credential_tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         let mut saw_probe_write = false;
         while std::time::Instant::now() < deadline {
-            let text =
-                std::fs::read_to_string(&crumb).expect("breadcrumb is written SYNCHRONOUSLY");
+            // The file exists from the synchronous write onward, but the probe
+            // replaces it by rename; on Windows a read that lands inside that
+            // replace can fail (access denied) or see nothing. That is the
+            // reader racing the writer, not a defect, so a failed read is
+            // retried. A read that SUCCEEDS must still hold the credential
+            // verdict.
+            let Ok(text) = std::fs::read_to_string(&crumb) else {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                continue;
+            };
             assert!(
                 text.contains(BREADCRUMB_VERDICT_RUNNER_CREDENTIAL_EXPIRED),
                 "the breadcrumb must never become a stale-nonce story: {text}"
             );
             let line2 = text.lines().nth(1).unwrap_or_default();
-            let stamp: serde_json::Value = serde_json::from_str(line2.trim()).unwrap();
+            let Ok(stamp) = serde_json::from_str::<serde_json::Value>(line2.trim()) else {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                continue;
+            };
             if stamp["port"].as_u64() == Some(port as u64) {
                 saw_probe_write = true;
                 break;
