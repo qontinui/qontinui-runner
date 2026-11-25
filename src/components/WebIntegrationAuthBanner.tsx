@@ -52,6 +52,12 @@ import {
   credentialDarkPresentation,
   effectiveCredentialDark,
   GET_COORD_CREDENTIAL_POSTURE_CMD,
+  GET_RECOVERY_WARNING_CMD,
+  normalizeRecoveryWarning,
+  RECOVERY_WARNING_EVENT,
+  recoveryWarningSignature,
+  shouldShowRecoveryWarning,
+  type RecoveryWarning,
   makeRePairClickHandler,
   makeRetryRefreshHandler,
   makeSwitchTenantHandler,
@@ -111,6 +117,14 @@ export function WebIntegrationAuthBanner() {
   );
   const [authorizing, setAuthorizing] = useState(false);
   const [authorizeError, setAuthorizeError] = useState<string | null>(null);
+  // The "no automatic recovery is left" warning (`get_recovery_warning`), and
+  // the signature of the one the user dismissed this session.
+  const [recoveryWarning, setRecoveryWarning] = useState<RecoveryWarning | null>(null);
+  const [recoveryDismissed, setRecoveryDismissed] = useState<string | null>(null);
+  // Which banner started the in-flight/last sign-in: the recovery banner shows
+  // `authorizeError` only for a sign-in it started itself, never one left over
+  // from the credential-dark or first-pair banner.
+  const [signInFromRecovery, setSignInFromRecovery] = useState(false);
 
   // Phase 4 (unified-devices migration): post-upgrade re-pair CTA state.
   //
@@ -188,6 +202,16 @@ export function WebIntegrationAuthBanner() {
   const { ref: dismissButtonRef } = useUIElement({
     id: "web-integration-banner-dismiss",
     label: "Dismiss web integration authorization banner",
+    type: "button",
+  });
+  const { ref: recoverySignInButtonRef } = useUIElement({
+    id: "recovery-warning-sign-in",
+    label: "Sign in so this runner can recover its credential by itself",
+    type: "button",
+  });
+  const { ref: recoveryDismissButtonRef } = useUIElement({
+    id: "recovery-warning-dismiss",
+    label: "Dismiss the no-automatic-recovery warning",
     type: "button",
   });
   const { ref: rePairButtonRef } = useUIElement({
@@ -338,6 +362,37 @@ export function WebIntegrationAuthBanner() {
         .catch(() => {
           /* listener cleanup is best-effort */
         });
+    };
+  }, []);
+
+  // Plan 2026-11-15-headless-runner-recovers-its-coord-credential-without-a-human
+  // E2 — warn BEFORE an outage when this runner holds a credential but neither
+  // a Cognito session nor a device machine key. The posture still answers, so
+  // the credential-dark banner says nothing. Read on mount (the event has no
+  // replay) and re-read on the runner's nudge.
+  useEffect(() => {
+    let cancelled = false;
+    const fetchWarning = () => {
+      invoke<unknown>(GET_RECOVERY_WARNING_CMD)
+        .then((raw) => {
+          if (!cancelled) setRecoveryWarning(normalizeRecoveryWarning(raw));
+        })
+        .catch(() => {
+          // A runner build without the command: nothing to show.
+        });
+    };
+    fetchWarning();
+    const unlistenNudge = listen(RECOVERY_WARNING_EVENT, fetchWarning);
+    const unlistenChanged = listen("web-integration-changed", fetchWarning);
+    return () => {
+      cancelled = true;
+      for (const unlisten of [unlistenNudge, unlistenChanged]) {
+        unlisten
+          .then((fn) => fn())
+          .catch(() => {
+            /* listener cleanup is best-effort */
+          });
+      }
     };
   }, []);
 
@@ -591,6 +646,7 @@ export function WebIntegrationAuthBanner() {
             }
             type="button"
             onClick={() => {
+              setSignInFromRecovery(false);
               void handleCredentialCta(presentation.ctaAction!);
             }}
             disabled={busy}
@@ -722,7 +778,102 @@ export function WebIntegrationAuthBanner() {
     dismissedSignature,
     credentialDark,
   );
-  if (!visible) return null;
+  if (!visible) {
+    if (!shouldShowRecoveryWarning(recoveryWarning, credentialDark, recoveryDismissed)) {
+      return null;
+    }
+    const warning = recoveryWarning!;
+    return (
+      <div
+        ref={rootRef}
+        role="status"
+        aria-live="polite"
+        data-testid="recovery-warning-banner"
+        style={{
+          position: "fixed",
+          top: 16,
+          left: "50%",
+          transform: "translateX(-50%)",
+          zIndex: 9999,
+          display: "flex",
+          alignItems: "center",
+          gap: 12,
+          padding: "10px 14px",
+          background: "var(--bg-tertiary, #242837)",
+          color: "var(--text-primary, #e4e4e7)",
+          border: "1px solid hsl(var(--warning, 38 92% 50%))",
+          borderRadius: 8,
+          boxShadow: "0 4px 16px rgba(0, 0, 0, 0.35)",
+          fontSize: "0.875rem",
+          maxWidth: "min(640px, calc(100vw - 32px))",
+        }}
+      >
+        <AlertCircle
+          className="w-4 h-4 shrink-0"
+          style={{ color: "hsl(var(--warning, 38 92% 50%))" }}
+          aria-hidden="true"
+        />
+        <div style={{ display: "flex", flexDirection: "column", gap: 2, minWidth: 0 }}>
+          <div style={{ fontWeight: 600 }}>This runner cannot recover its credential by itself</div>
+          <div style={{ fontSize: "0.8125rem", opacity: 0.85 }}>
+            {warning.message}
+            {signInFromRecovery && authorizeError ? (
+              <>
+                <br />
+                <span style={{ color: "hsl(var(--destructive, 0 84% 60%))" }}>
+                  {authorizeError}
+                </span>
+              </>
+            ) : null}
+            <PendingSignInNotice active={authorizing} noBrowserHint={NO_BROWSER_HINT.settings} />
+          </div>
+        </div>
+        <button
+          ref={recoverySignInButtonRef}
+          type="button"
+          onClick={() => {
+            setSignInFromRecovery(true);
+            void handleAuthorize();
+          }}
+          disabled={authorizing}
+          style={{
+            background: "var(--accent, #6366f1)",
+            color: "#fff",
+            border: "none",
+            borderRadius: 4,
+            padding: "4px 10px",
+            fontSize: "0.8125rem",
+            fontWeight: 600,
+            cursor: authorizing ? "wait" : "pointer",
+            opacity: authorizing ? 0.7 : 1,
+            whiteSpace: "nowrap",
+          }}
+        >
+          {authorizing ? "Opening…" : "Sign in"}
+        </button>
+        <button
+          ref={recoveryDismissButtonRef}
+          type="button"
+          onClick={() => setRecoveryDismissed(recoveryWarningSignature(warning))}
+          aria-label="Dismiss"
+          style={{
+            background: "transparent",
+            color: "var(--text-primary, #e4e4e7)",
+            border: "none",
+            borderRadius: 4,
+            padding: "4px",
+            cursor: "pointer",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            opacity: 0.7,
+          }}
+        >
+          <X className="w-4 h-4" aria-hidden="true" />
+        </button>
+      </div>
+    );
+  }
 
   return (
     <div
@@ -769,7 +920,10 @@ export function WebIntegrationAuthBanner() {
       <button
         ref={authorizeButtonRef}
         type="button"
-        onClick={handleAuthorize}
+        onClick={() => {
+          setSignInFromRecovery(false);
+          void handleAuthorize();
+        }}
         disabled={authorizing}
         style={{
           background: "var(--accent, #6366f1)",

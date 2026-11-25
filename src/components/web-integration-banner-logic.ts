@@ -666,3 +666,57 @@ export function makeSwitchTenantHandler(deps: {
     await deps.invoker(KICK_DEVICE_JWT_REFRESHER_CMD, {});
   };
 }
+
+// ---------------------------------------------------------------------------
+// The "no automatic recovery is left" warning (plan
+// 2026-11-15-headless-runner-recovers-its-coord-credential-without-a-human, E2)
+// ---------------------------------------------------------------------------
+
+/** Command the banner reads the recovery warning with. */
+export const GET_RECOVERY_WARNING_CMD = "get_recovery_warning";
+
+/** Nudge event: the recovery warning changed, re-read the command. */
+export const RECOVERY_WARNING_EVENT = "autonomy-recovery-warning";
+
+/** Wire shape of `get_recovery_warning` (Rust `RecoveryWarning`). */
+export interface RecoveryWarning {
+  /** e.g. `no_cognito_session`, `no_device_machine_key`. */
+  missing: string[];
+  message: string;
+}
+
+/**
+ * Normalise a `get_recovery_warning` answer. `null` (no warning, or no
+ * refresher pass yet) and anything unparseable both mean "show nothing":
+ * this is a warning, so silence on a malformed payload costs a notice, never
+ * a false alarm.
+ */
+export function normalizeRecoveryWarning(raw: unknown): RecoveryWarning | null {
+  if (raw === null || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.message !== "string" || r.message.trim().length === 0) return null;
+  const missing = Array.isArray(r.missing)
+    ? r.missing.filter((m): m is string => typeof m === "string")
+    : [];
+  return { missing, message: r.message };
+}
+
+/** Dismissal key: a dismissed warning re-shows when what is missing changes. */
+export function recoveryWarningSignature(warning: RecoveryWarning): string {
+  return `R:${warning.missing.join(",")}`;
+}
+
+/**
+ * Whether the recovery warning renders. It yields to the credential-dark
+ * banner (whose own reason already names the missing recoveries on
+ * `unrefreshable`), and to a dismissal of the same warning.
+ */
+export function shouldShowRecoveryWarning(
+  warning: RecoveryWarning | null,
+  credentialDark: CredentialDarkSignal | null,
+  dismissedSignature: string | null,
+): boolean {
+  if (warning === null) return false;
+  if (credentialDark?.dark) return false;
+  return dismissedSignature !== recoveryWarningSignature(warning);
+}
