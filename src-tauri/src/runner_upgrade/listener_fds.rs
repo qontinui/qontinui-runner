@@ -4,8 +4,10 @@
 //!
 //! The runner binds its one fixed listener (`127.0.0.1:9876`) in
 //! `mcp_api/serve.rs`; plan Phase 2's `listeners::adopt_or_bind` owns that
-//! site. Whatever binds or adopts a listener registers its raw fd here under
-//! the `LISTEN_FDNAMES` name it must reach the successor by (`api`). The
+//! site. `mcp_api::serve::offer_api_listener_for_handoff` registers the API
+//! listener's raw fd here, on both the boot-time adoption and the ordinary
+//! acquire, under the `LISTEN_FDNAMES` name it must reach the successor by
+//! (`api`), and only when it holds the requested port. The
 //! executor reads [`registered`]; an empty registry means a self-managed
 //! handoff is NOT available on this process, and the preflight says so.
 //!
