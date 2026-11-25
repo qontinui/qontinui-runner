@@ -746,8 +746,21 @@ pub async fn read_back(
     read_back_from(store, port, csid, &fetch, Utc::now())
 }
 
-/// [`read_back`] over an explicit fetch result and clock. Pure over the store.
-pub fn read_back_from(
+/// Read coord for `csid` and report what it says, WITHOUT healing, requeueing
+/// or restamping anything: the read-only twin of [`read_back`], used by
+/// `GET /sessions/{id}`. `heal` is always `None`.
+pub async fn observe(
+    store: &SessionLifecycleStore,
+    port: Option<&dyn HealPort>,
+    csid: &str,
+) -> ReadBack {
+    let fetch = session_work_status::fetch(&[csid.to_string()]).await;
+    observe_from(store, port, csid, &fetch, Utc::now())
+}
+
+/// [`observe`] over an explicit fetch result and clock. Never writes the
+/// store; `heal` is `None`.
+pub fn observe_from(
     store: &SessionLifecycleStore,
     port: Option<&dyn HealPort>,
     csid: &str,
@@ -767,7 +780,26 @@ pub fn read_back_from(
             ),
         }
     };
-    let heal = rec
+    ReadBack {
+        observed,
+        observed_at: now,
+        unobserved_reason,
+        own_row,
+        heal: None,
+    }
+}
+
+/// [`read_back`] over an explicit fetch result and clock. Pure over the store.
+pub fn read_back_from(
+    store: &SessionLifecycleStore,
+    port: Option<&dyn HealPort>,
+    csid: &str,
+    fetch: &StatusFetch,
+    now: DateTime<Utc>,
+) -> ReadBack {
+    let rec = store.get(csid);
+    let mut rb = observe_from(store, port, csid, fetch, now);
+    rb.heal = rec
         .filter(|r| r.finished_at.is_some() && r.finish_synced)
         .and_then(|r| {
             apply_heal(store, port, &[r], fetch, now.timestamp_millis())
@@ -776,13 +808,42 @@ pub fn read_back_from(
                 .map(|(_, o)| o)
         });
     note_read_back();
-    ReadBack {
-        observed,
-        observed_at: now,
-        unobserved_reason,
-        own_row,
-        heal,
+    rb
+}
+
+/// The body of `GET /sessions/{id}` for a session the registry holds: its
+/// finish fields plus `coord.observed`, read WITHOUT mutating anything (`rb`
+/// must come from [`observe`] / [`observe_from`]).
+///
+/// `finishSynced` is the runner-local ACK flag, observed against coord the
+/// way [`decorate_read_back`] does. A session with no runner finish mark at
+/// all reports `finishSynced: null` with `finishSyncedReason:
+/// "no_runner_finish"` — never `false`, which would read as "coord write owed".
+/// Neither value is evidence of coord's state: `coord.observed` is.
+pub fn session_status_json(rec: &TerminalSessionRecord, rb: &ReadBack) -> JsonValue {
+    let mut resp = json!({
+        "success": true,
+        "session": {
+            "claudeSessionId": rec.claude_session_id,
+            "finishedAt": rec.finished_at,
+            "finishReason": rec.finish_reason,
+            "finishCoordSessionId": rec.finish_coord_session_id.map(|u| u.to_string()),
+            "finishSynced": rec.finish_synced,
+            "finishSyncedIs": "runner_local_ack_flag",
+        },
+        "coord": {},
+    });
+    decorate_read_back(&mut resp, rb, Some(rec));
+    if rec.finished_at.is_none() {
+        if let Some(session) = resp.get_mut("session").and_then(JsonValue::as_object_mut) {
+            session.insert("finishSynced".to_string(), JsonValue::Null);
+            session.insert(
+                "finishSyncedReason".to_string(),
+                JsonValue::String("no_runner_finish".to_string()),
+            );
+        }
     }
+    resp
 }
 
 /// Add `coord.observed` (and the heal's outcome) to a finish read-back

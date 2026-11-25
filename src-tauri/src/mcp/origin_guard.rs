@@ -307,6 +307,10 @@ pub const CREDENTIAL_DOORS: &[&str] = &[
     // from reading it. The webview (FirstParty) and agents (NonBrowser) are
     // unaffected.
     "GET /sessions/{id}/stop-reason",
+    // A session's finish state (plan 2026-11-25-a-session-reads-its-own-
+    // finished-status-from-one-honest-door, Phase 5a): echoes the free-text
+    // `finish_reason` and names coord row ids — the same class as stop-reason.
+    "GET /sessions/{id}",
     "/session-repository",
     "/session-repository/*",
     "GET /health/diagnostic-screenshot",

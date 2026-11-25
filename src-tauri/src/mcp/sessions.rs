@@ -801,6 +801,16 @@ pub struct FinishSessionRequest {
 ///   while on a synced mark it queues nothing (`reason: "not_requeued"`) —
 ///   read `session.finishSynced` for the current verdict.
 ///
+/// **`finishSynced` is a runner-local ACK flag, not coord's state** (plan
+/// `2026-11-25-a-session-reads-its-own-finished-status-from-one-honest-door`,
+/// Phase 5a). It is stamped only by the outbox drain on an observed ack, or by
+/// the finish heal sweep; the reply says so as `session.finishSyncedIs:
+/// "runner_local_ack_flag"`. `false` or absent is NOT evidence coord is
+/// unfinished (it has read `false` then `true` via the heal sweep with coord's
+/// row finished throughout), and `true` is not evidence either. Coord's row is
+/// the authority: read it via `coord.observed` on the read-only
+/// `GET /sessions/{id}` ([`get_session`]), which never requeues or restamps.
+///
 /// Honest local-only cases: a session whose harness id changed inside the
 /// provider WITHOUT a SessionStart hook reporting `source: "clear"` — the
 /// in-process `/resume` picker, or an adoption whose hook posted `startup`
@@ -860,6 +870,44 @@ async fn finish_session(
         finish_heal::decorate_read_back(&mut body, &rb, store.get(&id).as_ref());
     }
     Ok(Json(body))
+}
+
+/// `GET /sessions/{id}` — the read-only single-record read of a session's
+/// finish state: `session.{finishSynced, finishedAt, finishReason,
+/// finishCoordSessionId}` plus `coord.observed {sessionStatus, since,
+/// coordSessionId, observedAt, state, startedAt}` read from coord's
+/// work-status row.
+///
+/// Mutates nothing: unlike the reason-less re-`POST /finish` it neither heals,
+/// requeues nor restamps ([`finish_heal::observe`]). A session with no runner
+/// finish mark reports `finishSynced: null` + `finishSyncedReason:
+/// "no_runner_finish"`, never `false`. `finishSynced` is a runner-local ACK
+/// flag; `coord.observed` is the authority. `404` for an id the registry does
+/// not hold, `503` when the registry is unmanaged.
+async fn get_session(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    use crate::session::finish_heal;
+    let store = state
+        .app_handle
+        .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
+        .ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "session lifecycle store unavailable".to_string(),
+        ))?;
+    let rec = store.get(&id).ok_or((
+        StatusCode::NOT_FOUND,
+        format!("no session `{id}` in the lifecycle registry"),
+    ))?;
+    let registrar = state
+        .app_handle
+        .try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>();
+    let port = registrar
+        .as_ref()
+        .map(|r| r.inner().as_ref() as &dyn finish_heal::HealPort);
+    let rb = finish_heal::observe(store.inner(), port, &id).await;
+    Ok(Json(finish_heal::session_status_json(&rec, &rb)))
 }
 
 /// Whether a finish outcome is the READ-BACK: a re-finish that wrote nothing
@@ -3137,6 +3185,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/sessions/spawn", post(spawn_session))
         .route("/sessions/{id}/message", post(send_message))
         .route("/sessions/history", get(list_history))
+        .route("/sessions/{id}", get(get_session))
         .route("/sessions/compliance-coverage", get(compliance_coverage))
         .route("/sessions/tree-resets", get(list_tree_resets))
         .route("/sessions/{id}/touched-files", get(get_touched_files))
