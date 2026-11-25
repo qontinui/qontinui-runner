@@ -43,8 +43,8 @@ use crate::mcp::remote_create_reaper::{
     ClosingUnderCreateGrant, CreateCloseClaim, RemoteCreateReaper,
 };
 use crate::settings::{AcceptRemoteAttach, AcceptRemoteCreate};
-use crate::terminal::remote_pane_io::{AttachedRing, RemoteFrameSink, RemotePaneIo};
 use crate::terminal::input_funnel::RelayInputProvenance;
+use crate::terminal::remote_pane_io::{AttachedRing, RemoteFrameSink, RemotePaneIo};
 
 // ---------------------------------------------------------------------------
 // Target role — grants
@@ -5499,7 +5499,10 @@ mod tests {
         assert!(p[0].user_session_stamped());
         assert!(p[1].remote_block);
         assert_eq!(p[1].origin.as_deref(), Some("user_session"));
-        assert!(!p[1].user_session_stamped(), "a remote frame's origin is not authority");
+        assert!(
+            !p[1].user_session_stamped(),
+            "a remote frame's origin is not authority"
+        );
         assert!(!p[2].user_session_stamped());
         assert_eq!(p[2].origin, None);
     }
