@@ -4286,6 +4286,26 @@ fn admit_launch(
     let pending = lock_recover(continuation_sessions(), "continuation_sessions").reserved_spawns;
     let (decision, shadowed) = launch_admission(&reading, pending);
     crate::resource_guard::note_admission_shadowed_lane(shadowed.as_ref());
+    if decision.is_err() {
+        // The same projection the decision was taken from (pure arithmetic),
+        // re-read for the tripped lane's observation: the decision itself
+        // carries only the stamp string.
+        let (projected, _) = reading.projected(pending);
+        if let Some((severity, observation)) = projected.tripped() {
+            crate::pressure_stop::record_observation(
+                crate::pressure_stop::StopKind::DeferredLaunch,
+                severity,
+                crate::pressure_stop::WhatClass::CoordLaunch,
+                observation,
+                // The reading is charged with admitted, not-yet-running
+                // continuations: a projection whenever any are pending.
+                serde_json::json!({
+                    "observed_is_projection": pending > 0,
+                    "projected_pending_spawns": pending,
+                }),
+            );
+        }
+    }
     decision
 }
 
@@ -6857,7 +6877,10 @@ fn commit_pressure_stamp_reason(
 /// [`thread_pressure_stamp_reason`] (a wire class coord and the web already
 /// group on), the memory lane stamps [`commit_pressure_stamp_reason`]. The lane
 /// is read off the observation's METRIC, never re-derived from the severity.
-fn load_pressure_stamp_reason(
+///
+/// `pub(crate)` so `pressure_stop` records the same grammar as a stop event's
+/// `reason` rather than spelling it a second time.
+pub(crate) fn load_pressure_stamp_reason(
     severity: &str,
     observation: &crate::resource_guard::GateObservation,
 ) -> String {
@@ -7449,6 +7472,16 @@ async fn run_gate_continuation_inner(
                  — re-delivered by the next poll (anchor_key={:?})",
                 observation.clause(severity),
                 payload.anchor_key
+            );
+            crate::pressure_stop::record_observation(
+                crate::pressure_stop::StopKind::DeferredContinuation,
+                severity,
+                crate::pressure_stop::WhatClass::GateContinuation,
+                &observation,
+                // The guard judges a reading charged with admitted,
+                // not-yet-running spawns, and the verdict does not carry the
+                // pending count: say the number may be a projection.
+                serde_json::json!({"observed_may_be_projection": true}),
             );
             // The stamp reason names the lane and the REAL numbers, in the
             // `<class>:<detail>` shape coord-side grouping keys on:

@@ -328,31 +328,78 @@ pub(crate) fn admission_decision(
 /// exercised on its own, and so a future caller can ask the question without
 /// assembling a whole `CiNodeSettings`.
 pub(crate) fn headroom_defers(headroom: Headroom) -> bool {
+    headroom_defer_term(headroom).is_some()
+}
+
+/// Which term of [`headroom_defers`] said "not one more build", with the
+/// reading and the threshold it crossed — the record a deferred dispatch
+/// leaves in coord (plan `2026-11-24-pressure-stops-record-box-stats-in-coord`,
+/// Phase 3). Each threshold is quoted in the reading's own unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeadroomTerm {
+    /// Swap used against [`SWAP_DEFER_RATIO`] of the ceiling, in bytes.
+    Swap { used_bytes: u64, limit_bytes: u64 },
+    /// Tasks used against [`SATURATION_DEFER_RATIO`] of the ceiling that bounds
+    /// them; `counter` says which tasks (`"threads"` or `"pids"`).
+    Saturation {
+        used: u64,
+        limit: u64,
+        counter: &'static str,
+    },
+    /// Free commit against the defer floor ([`defer_commit_floor_gb`]), in
+    /// bytes.
+    Commit { free_bytes: u64, floor_bytes: u64 },
+}
+
+/// The ratio threshold `ratio × ceiling`, rounded UP, as the reading's unit:
+/// the smallest count at which `count / ceiling >= ratio`.
+fn ratio_limit(ceiling: u64, ratio: f64) -> u64 {
+    (ceiling as f64 * ratio).ceil() as u64
+}
+
+/// The single author of the headroom verdict: [`headroom_defers`] is
+/// `is_some()` of this. Order and comparisons are the decision's — swap, then
+/// saturation, then commit — and the limits are only quoted, never re-decided.
+pub(crate) fn headroom_defer_term(headroom: Headroom) -> Option<HeadroomTerm> {
     // Swap FIRST — see `SWAP_DEFER_RATIO`.
     if let Some(ratio) = headroom.swap_used_ratio() {
         if ratio >= SWAP_DEFER_RATIO {
-            return true;
+            let total = headroom.swap_total_bytes.unwrap_or(0);
+            return Some(HeadroomTerm::Swap {
+                used_bytes: headroom.swap_used_bytes.unwrap_or(0),
+                limit_bytes: ratio_limit(total, SWAP_DEFER_RATIO),
+            });
         }
     }
     // Saturation SECOND, and ahead of commit for the same reason swap is: it is
     // the axis a memory reading cannot see. A box at 99.3% of its task ceiling
     // reported 73.3 GB free commit, so consulting commit first would have
     // proceeded straight into a machine where the build's own `fork()` fails.
-    if let Some(ratio) = headroom.saturation_ratio() {
-        if ratio >= SATURATION_DEFER_RATIO {
-            return true;
+    if let Some(saturation) = headroom.saturation {
+        if saturation.ratio() >= SATURATION_DEFER_RATIO {
+            let used = u64::try_from(saturation.used()).unwrap_or(0);
+            let max = u64::try_from(saturation.max()).unwrap_or(0);
+            return Some(HeadroomTerm::Saturation {
+                used,
+                limit: ratio_limit(max, SATURATION_DEFER_RATIO),
+                counter: saturation.counter_name(),
+            });
         }
     }
     if let Some(free) = headroom.commit_available_bytes {
         // The band is `DEFER_FREE_COMMIT_GB`, widened by the machine owner's
         // live-session floor when they have declared one above it — see
         // `defer_commit_floor_gb` and `MAX_SESSION_DEFER_FLOOR_GB`.
-        if free / (1024 * 1024 * 1024) < defer_commit_floor_gb(headroom.session_warn_floor_bytes) {
-            return true;
+        let floor_gb = defer_commit_floor_gb(headroom.session_warn_floor_bytes);
+        if free / (1024 * 1024 * 1024) < floor_gb {
+            return Some(HeadroomTerm::Commit {
+                free_bytes: free,
+                floor_bytes: floor_gb * 1024 * 1024 * 1024,
+            });
         }
     }
     // Every reading unavailable ⇒ no opinion ⇒ proceed. Fail open.
-    false
+    None
 }
 
 /// Live headroom probe. Every field degrades to `None` independently, so a
@@ -1483,7 +1530,7 @@ fn admit(payload: CiDispatchPayload, stamp: Option<QueueStamp>) {
     // partition it never exceeds.
     let host = super::host_sizing::probe();
     let max_concurrent = settings.effective_max_concurrent_builds_for(host);
-    let decision = {
+    let (decision, at_cap) = {
         let state = ci_state().lock().unwrap();
         // Dedup: a dispatch already running or queued here is a duplicate
         // delivery (WS replay) — ignore it rather than double-building.
@@ -1499,18 +1546,27 @@ fn admit(payload: CiDispatchPayload, stamp: Option<QueueStamp>) {
             );
             return;
         }
-        admission_decision(
-            &settings,
-            max_concurrent,
-            &payload.repo,
-            state.running.len(),
-            headroom,
+        let running = state.running.len();
+        (
+            admission_decision(&settings, max_concurrent, &payload.repo, running, headroom),
+            // The at-cap arm of `admission_decision`, which it tests BEFORE
+            // headroom: a defer with this true is a full node, not pressure.
+            running >= max_concurrent.max(1) as usize,
         )
     };
 
     match decision {
         Admission::Reject(reason) => reject(&payload, reason),
         Admission::Defer => {
+            // Only the HEADROOM defer is a pressure stop (plan
+            // `2026-11-24-pressure-stops-record-box-stats-in-coord`, Phase 3);
+            // an at-cap defer is a full node. Recorded with no CI lock held —
+            // the recorder reads `occupancy()`, which takes it.
+            if !at_cap {
+                if let Some(term) = headroom_defer_term(headroom) {
+                    crate::pressure_stop::record_ci_headroom(term);
+                }
+            }
             let (dispatch_id, repo) = (payload.dispatch_id.clone(), payload.repo.clone());
             let (depth, needs_waker, needs_keeper) = {
                 let mut state = ci_state().lock().unwrap();

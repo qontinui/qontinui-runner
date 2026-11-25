@@ -1431,12 +1431,19 @@ pub fn spawn_budget_republisher(role: MachineRole) {
             // same gated loop — no timer or gate of its own. Rebuilt per
             // supervised run; its durable state lives on disk.
             let mut reporter = computer::Reporter::new();
+            // The pressure-stop switch as SET, from this loop's first moment;
+            // `flush` re-reads it every tick and discards the queue when off.
+            crate::pressure_stop::refresh_enabled_from_settings();
             loop {
                 tokio::time::sleep(resource_sample::jittered_sleep(sample_secs)).await;
                 hb.tick();
 
                 // Observation lane: best-effort, never retried, never fatal.
                 resource_sample::publish_once().await;
+                // Pressure-stop events the resource guard queued since the
+                // last tick (plan 2026-11-24-pressure-stops-record-box-stats-
+                // in-coord Phase 3): one batch, same gate, same cadence.
+                crate::pressure_stop::flush().await;
                 reporter.tick().await;
 
                 // The CI node sizes its concurrency from coord's capacity
