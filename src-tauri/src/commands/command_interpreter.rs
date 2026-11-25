@@ -153,6 +153,7 @@ pub(crate) fn build_interpret_command(prompt: &str) -> Command {
     // is an infinite silent hang. One shared list, eight seams; see
     // `credential_helper::non_interactive_git_env`.
     crate::credential_helper::apply_non_interactive_git_env_tokio(&mut cmd);
+    crate::terminal::apply_python_utf8_default_tokio(&mut cmd);
     crate::terminal::scrub_credential_env_tokio(&mut cmd);
 
     cmd
@@ -280,5 +281,6 @@ mod spawn_env_tests {
             &cmd,
             "build_interpret_command",
         );
+        crate::terminal::assert_python_utf8_default_tokio(&cmd, "build_interpret_command");
     }
 }

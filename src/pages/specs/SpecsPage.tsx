@@ -16,7 +16,7 @@
  */
 
 import { useEffect, useCallback, useReducer, useState, useMemo, useRef } from "react";
-import { ShieldCheck, FlaskConical, FileJson, X, CheckCircle2, AlertTriangle } from "lucide-react";
+import { ShieldCheck, FlaskConical, X, CheckCircle2, AlertTriangle } from "lucide-react";
 import { useUIComponent } from "@qontinui/ui-bridge";
 import { useSpecsState } from "./useSpecsState";
 import { ConnectionBar } from "./ConnectionBar";
@@ -34,7 +34,6 @@ import { instanceStorage } from "@/lib/instance-storage";
 import { createSummaryStep } from "@/types/unified-workflow";
 import { useKnownIssues } from "@/hooks/useKnownIssues";
 import { SpecExperimentationDashboard } from "@/components/specs/SpecExperimentationDashboard";
-import { ContractBuilder } from "./ContractBuilder";
 import type { LoadedSpec } from "./types";
 import { compileStateMachineFromSpecs } from "@/lib/compile-state-machine";
 import { persistCompiledStateMachine } from "@/lib/persist-compiled-state-machine";
@@ -79,7 +78,7 @@ interface SpecsPageState {
   isSavingWorkflow: boolean;
   forcePromptOnly: boolean;
   includeRegressionChecks: boolean;
-  viewMode: "editor" | "experimentation" | "contracts";
+  viewMode: "editor" | "experimentation";
   generateSpecRequest: GenerateSpecRequest;
 }
 
@@ -87,7 +86,7 @@ type SpecsPageAction =
   | { type: "SET_SAVING_WORKFLOW"; value: boolean }
   | { type: "TOGGLE_FORCE_PROMPT" }
   | { type: "TOGGLE_REGRESSION_CHECKS" }
-  | { type: "SET_VIEW_MODE"; value: "editor" | "experimentation" | "contracts" }
+  | { type: "SET_VIEW_MODE"; value: "editor" | "experimentation" }
   | { type: "SET_GENERATE_SPEC_REQUEST"; value: GenerateSpecRequest };
 
 function specsPageReducer(state: SpecsPageState, action: SpecsPageAction): SpecsPageState {
@@ -149,8 +148,8 @@ function SpecsPageHeader({
   onSetViewMode,
 }: {
   editMode: boolean;
-  viewMode: "editor" | "experimentation" | "contracts";
-  onSetViewMode: (mode: "editor" | "experimentation" | "contracts") => void;
+  viewMode: "editor" | "experimentation";
+  onSetViewMode: (mode: "editor" | "experimentation") => void;
 }) {
   return (
     <div className="flex items-center gap-3 px-4 py-3 border-b border-border">
@@ -169,17 +168,6 @@ function SpecsPageHeader({
           }`}
         >
           Editor
-        </button>
-        <button
-          onClick={() => onSetViewMode("contracts")}
-          className={`px-2 py-1 text-xs rounded flex items-center gap-1 ${
-            viewMode === "contracts"
-              ? "bg-zinc-700 text-zinc-100"
-              : "text-zinc-500 hover:text-zinc-300"
-          }`}
-        >
-          <FileJson className="w-3 h-3" />
-          Contracts
         </button>
         <button
           onClick={() => onSetViewMode("experimentation")}
@@ -738,11 +726,7 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
         onSetViewMode={(mode) => dispatch({ type: "SET_VIEW_MODE", value: mode })}
       />
 
-      {viewMode === "contracts" ? (
-        <div className="flex-1 min-h-0">
-          <ContractBuilder />
-        </div>
-      ) : viewMode === "experimentation" ? (
+      {viewMode === "experimentation" ? (
         <div className="flex-1 overflow-y-auto">
           <SpecExperimentationDashboard />
         </div>

@@ -26,8 +26,10 @@ CI runs this file in ``.github/workflows/python-executor-command-table.yml``. Lo
 from __future__ import annotations
 
 import ast
+import dataclasses
 import importlib.util
 import re
+import sys
 from pathlib import Path
 
 import pytest
@@ -40,24 +42,13 @@ METHODS_SNAPSHOT = Path(__file__).resolve().parent / "executor-methods.snapshot.
 PACKAGE_DIR = BRIDGE_DIR / "executor_commands"
 RUST_SRC = BRIDGE_DIR.parent / "src-tauri" / "src"
 
-_FOLLOW_UP = (
-    "follow-up: delete or route "
-    "(plan 2026-10-04-runner-python-executor-routes-118-commands-through-one-if-chain)"
-)
-
-# Command names the Rust side sends that no Python dispatcher handles; each returns
-# ``Unknown command`` today. Remove an entry when its sender is deleted or routed.
-KNOWN_UNHANDLED: dict[str, str] = {
-    # src-tauri/src/commands/state_machine.rs
-    "execute_transition": _FOLLOW_UP,
-    "navigate_to_multiple_states": _FOLLOW_UP,
-    "get_active_states": _FOLLOW_UP,
-    "get_available_transitions": _FOLLOW_UP,
-    # src-tauri/src/mcp/ai_generation.rs
-    "generate_macro_with_ai": _FOLLOW_UP,
-    "generate_prompt_snippet_with_ai": _FOLLOW_UP,
-    "suggest_check_groups_with_ai": _FOLLOW_UP,
-}
+# Command names the Rust side sends that no Python dispatcher handles; each would return
+# ``Unknown command``. Empty since plan
+# 2026-10-06-runner-python-bridge-guards-run-nowhere-and-seven-rust-commands-have-no-handler
+# deleted the last seven senders. ``test_every_rust_sent_command_is_handled`` fails on any
+# new unhandled sender; add an entry here only for a known gap, with a pointer to the plan
+# that will delete or route it.
+KNOWN_UNHANDLED: dict[str, str] = {}
 
 # Newline-tolerant: ``\s*`` spans the line break when the literal sits on the next line.
 _SEND_RE = re.compile(r'send_command(?:_and_wait|_async)?\(\s*"([^"]+)"')
@@ -159,8 +150,14 @@ def test_command_table_matches_snapshot():
     )
 
 
-def test_snapshot_has_118_commands():
-    assert len(SNAPSHOT.read_text(encoding="utf-8").splitlines()) == 118
+def test_snapshot_has_113_commands():
+    # 118 at the move; the two GUI element-capture commands were deleted after
+    # qontinui-runner#2242 removed the html2canvas capture they depended on,
+    # test_results_configure / test_results_status went with the QA-results handler
+    # they drove (see test_no_executor_file_touches_the_deleted_qa_results_handler), and
+    # `testing_run_test_case` (no sender; it passed a test case with no assertion) by plan
+    # 2026-11-06-a-product-workflow-verification-with-nothing-to-check-never-reports-passed.
+    assert len(SNAPSHOT.read_text(encoding="utf-8").splitlines()) == 113
 
 
 # 2 ---------------------------------------------------------------------------
@@ -242,6 +239,42 @@ def test_unknown_command_returns_the_old_dict():
         if isinstance(n, ast.Return) and n.value is not None
     ]
     assert _UNKNOWN_RETURN in returns
+
+
+@pytest.mark.parametrize(
+    ("method", "required"),
+    [
+        ("_cmd_load", "config_path"),
+        ("_cmd_start", "workflow_id"),
+        ("_cmd_navigate_to_state", "target_state_id (or state_id)"),
+    ],
+)
+def test_cmd_handlers_reject_a_missing_required_param(method, required):
+    """The handler's first statement after reading the key returns the required-param error."""
+    handler = _executor_methods()[method]
+    body = [
+        s
+        for s in handler.body
+        if not (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant))
+    ]
+    guards = [s for s in body if isinstance(s, ast.If) and isinstance(s.test, ast.UnaryOp)]
+    assert guards, f"{method} has no `if not <param>:` guard"
+    ret = guards[0].body[0]
+    assert isinstance(ret, ast.Return) and ret.value is not None
+    assert ast.literal_eval(ret.value) == {"success": False, "error": f"{required} is required"}
+    # The guard sits before the first call that consumes the value.
+    first_self_call = next(
+        i
+        for i, s in enumerate(body)
+        if any(
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and isinstance(n.func.value, ast.Name)
+            and n.func.value.id == "self"
+            for n in ast.walk(s)
+        )
+    )
+    assert body.index(guards[0]) < first_self_call
 
 
 # 5 ---------------------------------------------------------------------------
@@ -384,7 +417,11 @@ def test_build_command_table_rejects_a_mixin_that_is_not_a_base():
 
 # ``_host.py`` declares ``ExecutorHost`` under ``if TYPE_CHECKING`` only (``object`` at
 # run time), so its method stubs are not runtime definitions and are not counted.
-PRE_MOVE_METHOD_COUNT = 165
+# 165 at the move, less the five GUI element-capture methods deleted after
+# qontinui-runner#2242 removed the html2canvas capture they depended on, the two
+# ``_cmd_test_results_*`` handlers deleted with the QA-results handler, and
+# `_handle_testing_run_test_case` (see test_snapshot_has_113_commands).
+PRE_MOVE_METHOD_COUNT = 157
 QONTINUI_EXECUTOR_MAX_LINES = 1700
 MIXIN_MAX_LINES = 1000
 
@@ -523,3 +560,184 @@ def test_executor_file_stays_under_budget():
 def test_mixin_file_stays_under_budget(path):
     lines = len(path.read_text(encoding="utf-8").splitlines())
     assert lines <= MIXIN_MAX_LINES, f"{path.name} is {lines} lines"
+
+
+# 6 ---------------------------------------------------------------------------
+# sm_execute_transition must report a FAILED transition as a failure. The UI
+# Bridge runtime signals failure by returning a result whose ``success`` is
+# false (an unregistered id, a failed action), not by raising; the state
+# explorer reads this handler's ``success`` to mark a transition passed.
+
+
+@dataclasses.dataclass
+class _StubTransitionResult:
+    success: bool
+    error: str | None = None
+
+
+class _StubRuntime:
+    def __init__(self, result: object) -> None:
+        self._result = result
+
+    def execute_transition(self, transition_id: str) -> object:
+        return self._result
+
+
+class _StubEvents:
+    def emit_log(self, *_args: object, **_kwargs: object) -> None:
+        pass
+
+
+def _load_state_machine_mixin():
+    """``executor_commands/state_machine.py`` without running the package ``__init__``.
+
+    The package ``__init__`` imports every mixin, and those pull in cv2, numpy,
+    PIL and ``qontinui_schemas``; this file promises to run without any of them.
+    A stub package holds only ``_host`` (whose non-stdlib imports sit under
+    ``TYPE_CHECKING``) so the mixin's one relative import resolves.
+    """
+    import types
+
+    pkg_name = "_isolated_executor_commands"
+    pkg = types.ModuleType(pkg_name)
+    pkg.__path__ = [str(PACKAGE_DIR)]
+    sys.modules[pkg_name] = pkg
+    for leaf in ("_host", "state_machine"):
+        spec = importlib.util.spec_from_file_location(
+            f"{pkg_name}.{leaf}", PACKAGE_DIR / f"{leaf}.py"
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[f"{pkg_name}.{leaf}"] = module
+        spec.loader.exec_module(module)
+    return sys.modules[f"{pkg_name}.state_machine"]
+
+
+def _sm_handler(result: object):
+    mixin = _load_state_machine_mixin()
+    host = object.__new__(mixin.StateMachineCommands)
+    host._ui_bridge_runtime = _StubRuntime(result)  # type: ignore[attr-defined]
+    host.event_manager = _StubEvents()  # type: ignore[attr-defined]
+    return host._handle_sm_execute_transition
+
+
+def test_state_machine_mixin_loads_without_heavy_dependencies():
+    before = set(sys.modules)
+    _load_state_machine_mixin()
+    pulled = {m.split(".")[0] for m in set(sys.modules) - before}
+    assert not pulled & {"cv2", "numpy", "PIL", "qontinui", "qontinui_schemas"}
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        _StubTransitionResult(success=False, error="Transition 't1' not found"),
+        {"success": False, "error": "Transition 't1' not found"},
+    ],
+)
+def test_sm_execute_transition_reports_a_failed_result_as_failure(result):
+    response = _sm_handler(result)({"transition_id": "t1"})
+    assert response["success"] is False
+    assert response["error"] == "Transition 't1' not found"
+
+
+def test_sm_execute_transition_reports_a_successful_result_as_success():
+    response = _sm_handler(_StubTransitionResult(success=True))({"transition_id": "t1"})
+    assert response["success"] is True
+    assert response["result"] == {"success": True, "error": None}
+
+
+@pytest.mark.parametrize(
+    "result",
+    [_StubTransitionResult(success=False, error=None), None, {"error": "boom"}],
+)
+def test_sm_execute_transition_never_reports_an_unstated_success(result):
+    """A result that does not SAY it succeeded is a failure, with a named error."""
+    response = _sm_handler(result)({"transition_id": "t1"})
+    assert response["success"] is False
+    assert response["error"]
+
+
+# 7 ---------------------------------------------------------------------------
+# The QA-results handler is deleted, and nothing in the executor may reach for it
+# again. Its module (``test_results_handler.py``) never existed in this repo, so the
+# guarded import always left ``self.test_results_handler = None``, and
+# ``_run_workflow`` called ``self.test_results_handler.is_enabled()`` with no None
+# guard (formerly ``qontinui_executor.py:956``): every python-bridge ``start`` raised
+# AttributeError inside the workflow's ``try``. Plan
+# 2026-11-06-verification-stores-nothing-writes-are-deleted-and-their-open-write-doors-close
+# (Phase 8) deleted the handler, its two commands and the service it would have driven.
+
+_DELETED_HANDLER = "test_results_handler"
+
+
+def _names_handler(dotted: str | None) -> bool:
+    """True when a dotted module or import name has the deleted handler as any part."""
+    return _DELETED_HANDLER in (dotted or "").split(".")
+
+
+def handler_accesses(source: str) -> list[int]:
+    """Line numbers at which ``source`` touches the deleted QA-results handler.
+
+    Counted: the attribute (``self.test_results_handler``), a bare name, an import of
+    its module, and a string naming it exactly (``getattr(self, "test_results_handler")``).
+    A comment or prose that merely mentions it is not code, and is not counted.
+    """
+    hits = []
+    for node in ast.walk(ast.parse(source)):
+        if (
+            (isinstance(node, ast.Attribute) and node.attr == _DELETED_HANDLER)
+            or (isinstance(node, ast.Name) and node.id == _DELETED_HANDLER)
+            or (isinstance(node, ast.ImportFrom) and _names_handler(node.module))
+            or (
+                isinstance(node, (ast.Import, ast.ImportFrom))
+                and any(_names_handler(alias.name) for alias in node.names)
+            )
+            or (isinstance(node, ast.Constant) and node.value == _DELETED_HANDLER)
+        ):
+            hits.append(node.lineno)
+    return sorted(hits)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "self.test_results_handler.is_enabled()\n",  # the unguarded :956 read
+        "if self.test_results_handler and x:\n    pass\n",  # a guarded read is still a read
+        "self.test_results_handler = None\n",  # assigning it re-creates the attribute
+        "test_results_handler.configure()\n",  # a bare name
+        "getattr(self, 'test_results_handler', None)\n",  # by string
+        "from test_results_handler import TestResultsHandler\n",  # its module, from-import
+        "import test_results_handler\n",  # its module, plain import
+        "import test_results_handler.sub\n",  # a submodule of it, plain import
+        "from test_results_handler.sub import X\n",  # a submodule of it, from-import
+        "from services import test_results_handler\n",  # it, imported from a package
+        "from services.test_results_handler import X\n",  # it, as a package's module
+    ],
+)
+def test_handler_access_scanner_sees_each_shape(source):
+    assert handler_accesses(source) == [1]
+
+
+def test_handler_access_scanner_ignores_prose_and_lookalikes():
+    source = (
+        "# self.test_results_handler was deleted\n"
+        'note = "the test_results_handler is gone"\n'
+        "self.test_results = 1\n"
+        "self.results_handler = 2\n"
+    )
+    assert handler_accesses(source) == []
+
+
+@pytest.mark.parametrize(
+    "path",
+    [EXECUTOR, *sorted(PACKAGE_DIR.glob("*.py"))],
+    ids=lambda p: p.name,
+)
+def test_no_executor_file_touches_the_deleted_qa_results_handler(path):
+    hits = handler_accesses(path.read_text(encoding="utf-8"))
+    assert not hits, (
+        f"{path.name} touches `{_DELETED_HANDLER}` at line(s) {hits}. That handler is "
+        "deleted; its module never existed, so the attribute was always None and the "
+        "unguarded read in _run_workflow failed every `start` with AttributeError."
+    )

@@ -93,6 +93,14 @@ pub fn router() -> Router<Arc<ApiState>> {
         // newly-installed wrappers surface as MCP tools without an AI
         // session restart.
         .route("/wrappers/events", get(events_stream))
+        // While a condition-check session holds a secret, a `{{secret:<ref>}}`
+        // placeholder sent here is refused before the handler runs: `dispatch`, which sends its `params` verbatim to the wrapper, never
+        // substitutes, so it would reach the app as literal text
+        // (`crate::condition_secrets`). LAST, because `Router::layer` wraps
+        // only the routes registered before it.
+        .layer(axum::middleware::from_fn(
+            crate::condition_secrets::refuse_unsubstituted_placeholders,
+        ))
 }
 
 // ---------------------------------------------------------------------------
@@ -357,7 +365,12 @@ async fn list_credentials(
         .env_vars
         .iter()
         .map(|spec| CredentialDescriptor {
-            name: spec.name.clone(),
+            // Wrapper-supplied: a persisted index can predate scan-time
+            // validation, so an invalid name is shown by its length only.
+            name: super::manifest::label_if(
+                &spec.name,
+                super::manifest::env_var_name_ok(&spec.name),
+            ),
             has_value: CredentialStore::has(&id, &spec.name),
             description: spec.description.clone(),
             required: spec.required,

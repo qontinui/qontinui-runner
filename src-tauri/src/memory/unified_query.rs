@@ -605,8 +605,9 @@ fn retrieve_graph(graph: &KnowledgeGraph, query: &str, limit: usize) -> Vec<Memo
 async fn retrieve_tenant_memory(query: &str, limit: usize) -> Vec<MemoryResult> {
     use crate::database::embedding_client::EmbeddingClient;
 
-    // Consent gate: with cloud sync off, the query text must not egress.
-    if !crate::settings::get_cloud_sync_enabled() {
+    // Consent gate: with cloud sync off — the user's toggle OR the tenant's
+    // `egress_transcript_sync` switch — the query text must not egress.
+    if !crate::egress::transcript_sync_permitted() {
         return Vec::new();
     }
     let Some(base) = crate::memory::tenant_sync::resolve_web_base() else {

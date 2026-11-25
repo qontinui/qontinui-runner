@@ -1,0 +1,57 @@
+{
+  "provenance": {
+    "host": "merytshost (Linux 6.12.113+deb13-amd64, Python 3.13.5)",
+    "measured_at": "2026-11-08T06:22:00Z",
+    "method": "ssh merytshost 'ps -eo pid=,ppid=,etimes=,comm=,args='; subtree of one real claude; start = capture epoch - etimes (seconds, the runner's /proc granularity); coord-mcp-shim credential filenames redacted; tool-shell bodies redacted",
+    "shape": "bash(sleep()),python3()",
+    "census": "343 claude on the box at capture: 337 held exactly one python3 child, 341 python3 children ran `/usr/bin/python3 ~/Projects/qontinui-root/qontinui-claude-config/scripts/coord-mcp-shim.py --credential <path>`, 1 ran owned-run.py (a next dev server)",
+    "argv_2026_11_12": "argv added 2026-11-12, when the classifier began comparing a Linux argv element by element (Phase 2a review finding 3) instead of re-splitting a space-joined line. This capture's `cmdline` is `ps -o args=`, the argv joined with single spaces, which cannot be split back exactly, so it is kept as measured and each row's `argv` is that text cut at the argument boundaries its shape implies: every argument here is free of spaces except a `bash -c` body, kept whole. The shim row's shape was re-read on merytshost 2026-11-12 from /proc/<pid>/cmdline split on NUL: all 160 live python3 shim children of a claude read exactly four elements, [/usr/bin/python3, ~/Projects/qontinui-root/qontinui-claude-config/scripts/coord-mcp-shim.py, --credential, <path>], every read ending in one NUL. `start` stays this capture's epoch seconds: a stamp is compared only for equality between two reads of one source, and the runner itself now stamps Linux rows with /proc/<pid>/stat field 22 (clock ticks since boot)."
+  },
+  "platform": "linux",
+  "claude_pid": 2084636,
+  "table": [
+    {
+      "pid": 2084636,
+      "ppid": 2084117,
+      "image": "claude",
+      "start": 1793866186,
+      "cmdline": "<claude argv not recorded>"
+    },
+    {
+      "pid": 2094607,
+      "ppid": 2084636,
+      "image": "python3",
+      "start": 1793866188,
+      "cmdline": "/usr/bin/python3 /home/spinak/Projects/qontinui-root/qontinui-claude-config/scripts/coord-mcp-shim.py --credential /home/spinak/.qontinui/coord-mcp-shim/0123456789abcdef.json",
+      "argv": [
+        "/usr/bin/python3",
+        "/home/spinak/Projects/qontinui-root/qontinui-claude-config/scripts/coord-mcp-shim.py",
+        "--credential",
+        "/home/spinak/.qontinui/coord-mcp-shim/0123456789abcdef.json"
+      ]
+    },
+    {
+      "pid": 3107532,
+      "ppid": 2084636,
+      "image": "bash",
+      "start": 1793866984,
+      "cmdline": "/bin/bash -c <tool command redacted>",
+      "argv": [
+        "/bin/bash",
+        "-c",
+        "<tool command redacted>"
+      ]
+    },
+    {
+      "pid": 83430,
+      "ppid": 3107532,
+      "image": "sleep",
+      "start": 1794118918,
+      "cmdline": "sleep 10",
+      "argv": [
+        "sleep",
+        "10"
+      ]
+    }
+  ]
+}

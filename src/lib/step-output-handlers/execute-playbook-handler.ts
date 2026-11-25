@@ -47,8 +47,13 @@ interface RawExecutePlaybookOutput {
   completed?: boolean;
 }
 
+/**
+ * The step config fields this handler reads. The executor runs only the
+ * inline `content` body (`execute_playbook.rs` reads `prompt_content`, wire
+ * field `content`). A file-path field a stored step may still carry was never
+ * read by the executor, so it is not read here either.
+ */
 interface ExecutePlaybookStepConfig {
-  playbook_path?: string;
   content?: string;
   timeout_seconds?: number;
 }
@@ -97,7 +102,6 @@ export class ExecutePlaybookHandler implements StepOutputHandler<ExecutePlaybook
       duration_ms: metadata?.duration_ms ?? 0,
       success: metadata?.success ?? (completed && failed === 0),
       error: metadata?.error,
-      playbook_path: config.playbook_path,
       content: config.content,
       transitions,
       transitions_succeeded: succeeded,
@@ -120,9 +124,7 @@ export class ExecutePlaybookHandler implements StepOutputHandler<ExecutePlaybook
       : "Did Not Complete";
     lines.push(`- **Status:** ${statusEmoji} ${statusLabel}`);
 
-    if (output.playbook_path) {
-      lines.push(`- **Playbook:** ${output.playbook_path}`);
-    } else if (output.content) {
+    if (output.content) {
       const lineCount = output.content.split(/\r?\n/).length;
       lines.push(`- **Playbook:** inline (${lineCount} lines)`);
     }
@@ -167,8 +169,8 @@ export class ExecutePlaybookHandler implements StepOutputHandler<ExecutePlaybook
       }
     }
 
-    // Inline playbook body (only when no separate file)
-    if (output.content && !output.playbook_path) {
+    // The inline playbook body: the only source the executor reads.
+    if (output.content) {
       lines.push("");
       lines.push("**Playbook Content:**");
       lines.push("```markdown");
@@ -185,9 +187,8 @@ export class ExecutePlaybookHandler implements StepOutputHandler<ExecutePlaybook
   }
 
   toTestConfig(output: ExecutePlaybookStepOutput): TestAutoPopulateConfig | null {
-    if (!output.playbook_path && !output.content) {
-      // Without a playbook reference or body, there's nothing for the
-      // test to replay.
+    if (!output.content) {
+      // Without the inline body there's nothing for the test to replay.
       return null;
     }
 
@@ -198,8 +199,7 @@ export class ExecutePlaybookHandler implements StepOutputHandler<ExecutePlaybook
       expected_completed: output.completed,
     };
 
-    if (output.playbook_path) config.playbook_path = output.playbook_path;
-    if (output.content) config.content = output.content;
+    config.content = output.content;
     if (output.final_states && output.final_states.length > 0) {
       config.expected_final_states = output.final_states;
     }
@@ -210,7 +210,7 @@ export class ExecutePlaybookHandler implements StepOutputHandler<ExecutePlaybook
     return {
       config_key: "execute_playbook_config",
       config_value: config,
-      description: `Playbook config for ${output.playbook_path || "inline playbook"} (${output.transitions.length} transitions)`,
+      description: `Playbook config for inline playbook (${output.transitions.length} transitions)`,
     };
   }
 
@@ -315,13 +315,9 @@ export class ExecutePlaybookHandler implements StepOutputHandler<ExecutePlaybook
   }
 
   /**
-   * Derive a compact step name from the playbook source.
+   * Derive a compact step name from the inline playbook body.
    */
   private deriveName(config: ExecutePlaybookStepConfig): string {
-    if (config.playbook_path) {
-      const parts = config.playbook_path.split(/[\\/]/);
-      return parts[parts.length - 1] || config.playbook_path;
-    }
     if (config.content) {
       const firstLine = config.content.split(/\r?\n/).find((l) => l.trim().length > 0) ?? "";
       if (firstLine.length > 0)

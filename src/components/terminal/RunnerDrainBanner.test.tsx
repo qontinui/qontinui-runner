@@ -9,7 +9,10 @@ import { describe, it, expect } from "vitest";
 import {
   drainBannerModel,
   deferredLabel,
+  liveDismissal,
   RESTORE_NOTE,
+  ROLE_RESTORE_NOTE,
+  ROLE_UNKNOWN_HEADING,
   UNKNOWN_HEADING,
 } from "./RunnerDrainBanner";
 import {
@@ -35,6 +38,102 @@ function snap(over: Partial<CoordDrainSnapshot>): CoordDrainSnapshot {
 }
 
 describe("drainBannerModel", () => {
+  it("says autonomous spawns are off when the drain is clear but the dispatch role closes the agent lane", () => {
+    const m = drainBannerModel(
+      snap({
+        state: "clear",
+        autonomousSpawnsAllowed: false,
+        dispatchRole: "ci_node",
+        agentLaneClosedByRole: true,
+        deferredCount: 2,
+      }),
+    );
+    expect(m?.status).toBe("warning");
+    expect(m?.kind).toBe("role_closed");
+    expect(m?.heading).toMatch(/ci_node/);
+    expect(m?.restoreNote).toBe(ROLE_RESTORE_NOTE);
+    expect(m?.deferredLabel).toBe("2 deferred work items");
+    // Drained AND role-closed: the drain banner, but no promise that lifting
+    // the drain brings the tabs back.
+    const both = drainBannerModel(
+      snap({ state: "drained", autonomousSpawnsAllowed: false, agentLaneClosedByRole: true }),
+    );
+    expect(both?.kind).toBe("drained");
+    expect(both?.restoreNote).toBe(ROLE_RESTORE_NOTE);
+    // Unknown AND role-closed: same, no promise that a readable drain helps.
+    const unknownAndRole = drainBannerModel(
+      snap({
+        state: "unknown",
+        autonomousSpawnsAllowed: false,
+        bootReadPending: false,
+        agentLaneClosedByRole: true,
+      }),
+    );
+    expect(unknownAndRole?.kind).toBe("unknown");
+    expect(unknownAndRole?.restoreNote).toBe(ROLE_RESTORE_NOTE);
+    // An open role, or a runner that predates the field, keeps today's banner.
+    expect(
+      drainBannerModel(snap({ dispatchRole: "workhorse", agentLaneClosedByRole: false })),
+    ).toBeNull();
+    expect(drainBannerModel(snap({ state: "clear" }))).toBeNull();
+  });
+
+  it("says autonomous spawns are paused when the drain is clear but the dispatch role is unknown", () => {
+    const m = drainBannerModel(
+      snap({
+        state: "clear",
+        autonomousSpawnsAllowed: false,
+        dispatchRole: null,
+        agentLaneClosedByRole: false,
+        dispatchRoleSource: "unknown",
+        deferredCount: 1,
+      }),
+    );
+    expect(m?.kind).toBe("unknown");
+    expect(m?.status).toBe("error");
+    expect(m?.heading).toBe(ROLE_UNKNOWN_HEADING);
+    expect(m?.detail).toMatch(/dispatch role/);
+    expect(m?.restoreNote).toBe(RESTORE_NOTE);
+    expect(m?.deferredLabel).toBe("1 deferred work item");
+    // A known source, or a runner predating the field, shows nothing.
+    expect(drainBannerModel(snap({ dispatchRoleSource: "coord" }))).toBeNull();
+    expect(
+      drainBannerModel(snap({ dispatchRoleSource: "not_enrolled", state: "not_enrolled" })),
+    ).toBeNull();
+    // A drained device still shows the drain.
+    expect(
+      drainBannerModel(
+        snap({ state: "drained", autonomousSpawnsAllowed: false, dispatchRoleSource: "unknown" }),
+      )?.kind,
+    ).toBe("drained");
+  });
+
+  it("says a closing role carried over from before the restart is not re-confirmed yet", () => {
+    const m = drainBannerModel(
+      snap({
+        state: "clear",
+        autonomousSpawnsAllowed: false,
+        dispatchRole: "ci_node",
+        agentLaneClosedByRole: true,
+        dispatchRoleSource: "persisted",
+        dispatchRoleObservedAt: "2026-10-20T08:00:00Z",
+      }),
+    );
+    expect(m?.kind).toBe("role_closed");
+    expect(m?.detail).toMatch(/before this runner started/);
+    expect(m?.detail).toMatch(/not re-confirmed/);
+    const fresh = drainBannerModel(
+      snap({
+        state: "clear",
+        autonomousSpawnsAllowed: false,
+        dispatchRole: "ci_node",
+        agentLaneClosedByRole: true,
+        dispatchRoleSource: "coord",
+      }),
+    );
+    expect(fresh?.detail).toBeNull();
+  });
+
   it("renders nothing before the first read, when clear, and when not a coord device", () => {
     expect(drainBannerModel(null)).toBeNull();
     expect(drainBannerModel(snap({ state: "clear" }))).toBeNull();
@@ -71,6 +170,42 @@ describe("drainBannerModel", () => {
     expect(m?.heading).toBe(UNKNOWN_HEADING);
     expect(m?.detail).toBe("3 consecutive failed drain read(s)");
     expect(m?.deferredLabel).toBe("1 deferred work item");
+  });
+
+  it("keys dismissal on the episode, not on the per-read cause", () => {
+    const unknown = (cause: string) =>
+      drainBannerModel(
+        snap({
+          state: "unknown",
+          autonomousSpawnsAllowed: false,
+          since: "2026-09-14T09:00:00Z",
+          cause,
+        }),
+      )?.episodeKey;
+    // The backend rewrites the cause on every read; one episode keeps one key.
+    expect(unknown("3 consecutive failed drain read(s)")).toBe(
+      unknown("4 consecutive failed drain read(s)"),
+    );
+    const drained = (until: string | null, reason: string | null) =>
+      drainBannerModel(
+        snap({
+          state: "drained",
+          autonomousSpawnsAllowed: false,
+          until,
+          reason,
+        }),
+      )?.episodeKey;
+    // The heartbeat enters `drained` with no reason; the follow-up me/drain
+    // read fills it in for the same `until`. That is one episode, as the
+    // backend's `entered_drained` counts it.
+    expect(drained("2026-09-14T12:00:00Z", null)).toBe(drained("2026-09-14T12:00:00Z", "rebuild"));
+    // A new `until` is a new episode.
+    expect(drained("2026-09-14T12:00:00Z", "rebuild")).not.toBe(
+      drained("2026-09-14T13:00:00Z", "rebuild"),
+    );
+    expect(drained("2026-09-14T12:00:00Z", "rebuild")).not.toBe(
+      unknown("3 consecutive failed drain read(s)"),
+    );
   });
 
   it("omits the detail line for a drain with no until or reason", () => {
@@ -186,5 +321,24 @@ describe("drainBannerModel — boot", () => {
         snap({ state: "unknown", autonomousSpawnsAllowed: false, bootReadPending: false }),
       )?.heading,
     ).toBe(UNKNOWN_HEADING);
+  });
+});
+
+describe("liveDismissal", () => {
+  it("keeps a dismissal only while its own episode is current", () => {
+    expect(liveDismissal("drained|X", "drained|X")).toBe("drained|X");
+    expect(liveDismissal(null, "drained|X")).toBeNull();
+  });
+
+  it("spends a dismissal on any other episode, so drained → unknown → drained re-shows", () => {
+    // drained(X) dismissed, then the state goes unknown: the dismissal is spent…
+    const afterUnknown = liveDismissal("drained|X", "unknown|2026-09-14T09:00:00Z");
+    expect(afterUnknown).toBeNull();
+    // …so the same drained(X) returning shows the banner again.
+    expect(liveDismissal(afterUnknown, "drained|X")).toBeNull();
+  });
+
+  it("spends a dismissal when no banner shows (the drain cleared)", () => {
+    expect(liveDismissal("drained|X", null)).toBeNull();
   });
 });

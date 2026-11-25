@@ -32,9 +32,22 @@
 //! - **Windows** — [`ResolvedRoute::Windows`]:
 //!   `qontinui_runner_win32::holder_spawn::spawn_holder`, which decides plain
 //!   `DETACHED_PROCESS` vs `CREATE_BREAKAWAY_FROM_JOB` from `IsProcessInJob`
-//!   (plan D4 as corrected 2026-09-27) and returns a typed
-//!   [`SpawnError::NeedsWmiFallback`] when breakaway is refused — the WMI
-//!   route is Phase 3 and unbuilt.
+//!   (plan D4 as corrected 2026-09-27). When the enclosing job refuses
+//!   breakaway, the spawn is re-issued through WMI `Win32_Process.Create`
+//!   (`holder_spawn::spawn_holder_wmi`, Phase 3) with `--report`, and the ready
+//!   line is read from the pane's report file instead of a pipe. The route
+//!   actually taken is [`SpawnedHolder::windows_route`]. Breakaway happens per
+//!   holder spawn (D13): each pane's holder decides for itself.
+//!
+//! ## The new-tab budget
+//!
+//! Under D13 a holder spawn is on the path of every new tab, and the WMI
+//! route is far slower than `CreateProcess` (the Phase 0 measurement it was
+//! owed is UNRUN on Windows). So every spawn MEASURES itself —
+//! [`SpawnedHolder::ready_after`], spawn to ready line, whatever the route —
+//! and [`NEW_TAB_SPAWN_BUDGET`] is what a caller compares it with: over budget
+//! is logged with the route, never silently absorbed. The hard bound remains
+//! [`SpawnRequest::report_timeout`].
 //!
 //! ## What the spawner guarantees
 //!
@@ -67,7 +80,7 @@
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -92,6 +105,16 @@ pub const SYSTEMCTL_DEADLINE: Duration = Duration::from_secs(5);
 
 /// How often the shared reaper polls the holders it adopted.
 pub const REAP_INTERVAL: Duration = Duration::from_secs(2);
+
+/// What a new tab may spend on its holder's spawn before the delay is worth
+/// a warning: spawn to ready line, on any route. Not a deadline — a slower
+/// spawn still succeeds (the hard bound is the report timeout) — but the
+/// number the WMI route's latency is held against (plan D13 / Phase 3).
+pub const NEW_TAB_SPAWN_BUDGET: Duration = Duration::from_secs(2);
+
+/// How often a spawner reading a holder's report FILE (the WMI route) looks
+/// for it.
+pub const REPORT_FILE_POLL: Duration = Duration::from_millis(20);
 
 /// Read one line on a helper thread, giving up after `timeout`. `None` means
 /// the deadline passed (the helper thread stays parked on the pipe until its
@@ -230,22 +253,37 @@ pub fn verify_pty_child(_holder: i32, _child: i32) -> Option<i32> {
 
 /// `systemctl --user stop --no-block --quiet <unit>`, killed if it has not
 /// returned within `deadline`. The unit's processes are then killed by the
-/// manager asynchronously.
-pub fn stop_scope_unit(unit: &str, deadline: Duration) {
+/// manager asynchronously. `Err` says why the stop was not confirmed:
+/// `systemctl` missing, failed, or out of time.
+pub fn stop_scope_unit(unit: &str, deadline: Duration) -> Result<(), String> {
     // console-ok: only reached with a scope unit, i.e. on Linux.
-    let spawned = Command::new("systemctl")
+    let mut systemctl = Command::new("systemctl")
         .args(["--user", "stop", "--no-block", "--quiet", unit])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn();
-    if let Ok(mut systemctl) = spawned {
-        let end = Instant::now() + deadline;
-        while matches!(systemctl.try_wait(), Ok(None)) && Instant::now() < end {
-            std::thread::sleep(Duration::from_millis(20));
+        .spawn()
+        .map_err(|e| format!("systemctl: {e}"))?;
+    let end = Instant::now() + deadline;
+    loop {
+        match systemctl.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => return Err(format!("systemctl {status}")),
+            Ok(None) if Instant::now() < end => std::thread::sleep(Duration::from_millis(20)),
+            Ok(None) => {
+                let _ = systemctl.kill();
+                let _ = systemctl.wait();
+                return Err(format!(
+                    "systemctl gave no answer within {}ms",
+                    deadline.as_millis()
+                ));
+            }
+            Err(e) => {
+                let _ = systemctl.kill();
+                let _ = systemctl.wait();
+                return Err(format!("systemctl wait: {e}"));
+            }
         }
-        let _ = systemctl.kill();
-        let _ = systemctl.wait();
     }
 }
 
@@ -258,6 +296,10 @@ pub enum RouteRequest {
     Plain,
     /// Linux only: a transient systemd user scope. Never falls back.
     Scope,
+    /// Windows only: WMI `Win32_Process.Create`, without first trying
+    /// `CreateProcess`. What `Auto` falls back to inside a job that forbids
+    /// breakaway; asked for directly only to exercise that route.
+    Wmi,
 }
 
 /// A route, resolved for THIS OS.
@@ -327,11 +369,14 @@ pub fn decide_route(req: RouteRequest, facts: &HostFacts) -> Result<RouteDecisio
     };
     if facts.windows {
         return match req {
-            RouteRequest::Auto | RouteRequest::Plain => Ok(decision(ResolvedRoute::Windows, false)),
+            RouteRequest::Auto | RouteRequest::Plain | RouteRequest::Wmi => {
+                Ok(decision(ResolvedRoute::Windows, false))
+            }
             RouteRequest::Scope => Err("the scope route does not exist on Windows".into()),
         };
     }
     match req {
+        RouteRequest::Wmi => Err("the WMI route exists only on Windows".into()),
         RouteRequest::Auto if facts.in_unit_cgroup && facts.scope_tooling => {
             Ok(decision(ResolvedRoute::Scope, true))
         }
@@ -459,12 +504,10 @@ pub enum SpawnError {
     Route(String),
     /// The spec could not be written.
     Spec(std::io::Error),
-    /// The OS refused to start the process (or `systemd-run` is missing).
+    /// The OS refused to start the process (or `systemd-run` is missing; or,
+    /// on Windows, WMI `Win32_Process.Create` failed or reported a process
+    /// that is not the holder).
     Spawn(String),
-    /// Windows: the runner is in a job that forbids breakaway, and the WMI
-    /// fallback (plan Phase 3) is not built. Typed so it is never mistaken for
-    /// a spawn.
-    NeedsWmiFallback(String),
     /// The holder printed nothing within the report deadline.
     Silent {
         route: ResolvedRoute,
@@ -475,9 +518,27 @@ pub enum SpawnError {
     /// A success line whose `holder_pid` is not the process spawned: none of
     /// its pids are trusted.
     NotOurHolder { line: String, spawned_pid: u32 },
+    /// Windows WMI route: a holder for this pane is (or may be) LIVE but could
+    /// be neither held nor ended. A caller must NOT fall back to an
+    /// in-process PTY: the pane's command would run twice.
+    LiveHolderUnreachable(String),
+    /// Windows WMI route: a holder could not be held, but it RAN the pane's
+    /// command (it reported ready, or recorded a child) before it went away.
+    /// A caller must NOT fall back: that would run the command a second time.
+    RanUnheld(String),
 }
 
 impl SpawnError {
+    /// Whether a caller must NOT fall back to an in-process PTY after this
+    /// error: a holder may still be running the pane's command, or already
+    /// ran it.
+    pub fn forbids_fallback(&self) -> bool {
+        matches!(
+            self,
+            SpawnError::LiveHolderUnreachable(_) | SpawnError::RanUnheld(_)
+        )
+    }
+
     /// The `<kind>` of a `holder_error=<kind>` report (`lock_held`, `spec`,
     /// `child`, `detach`, `start`, `usage`).
     pub fn holder_error_kind(&self) -> Option<&str> {
@@ -497,7 +558,6 @@ impl std::fmt::Display for SpawnError {
             SpawnError::Route(m) => write!(f, "route: {m}"),
             SpawnError::Spec(e) => write!(f, "spec: {e}"),
             SpawnError::Spawn(m) => write!(f, "spawn: {m}"),
-            SpawnError::NeedsWmiFallback(m) => write!(f, "needs the WMI fallback: {m}"),
             SpawnError::Silent { route, reason } => {
                 write!(
                     f,
@@ -507,6 +567,18 @@ impl std::fmt::Display for SpawnError {
             }
             SpawnError::HolderFailed { line, status } => {
                 write!(f, "holder failed [{status}]: {line}")
+            }
+            SpawnError::RanUnheld(m) => {
+                write!(
+                    f,
+                    "the holder ran this pane's command and could not be held: {m}"
+                )
+            }
+            SpawnError::LiveHolderUnreachable(m) => {
+                write!(
+                    f,
+                    "a live holder for this pane could not be held or ended: {m}"
+                )
             }
             SpawnError::NotOurHolder { line, spawned_pid } => write!(
                 f,
@@ -530,23 +602,54 @@ pub struct SpawnedHolder {
     /// `Some` when this pane will NOT survive something the caller might
     /// assume it survives. Surface it; never drop it.
     pub unprotected: Option<Unprotected>,
-    /// Windows: the `holder_spawn` route actually taken (plain / breakaway).
+    /// Windows: the `holder_spawn` route actually taken (plain / breakaway /
+    /// WMI).
     #[cfg(windows)]
     pub windows_route: qontinui_runner_win32::holder_spawn::HolderSpawnRoute,
-    process: Child,
+    /// Spawn to ready line, measured — what [`NEW_TAB_SPAWN_BUDGET`] is held
+    /// against.
+    pub ready_after: Duration,
+    process: HolderProcess,
 }
 
 impl SpawnedHolder {
-    /// Reap the holder if it has exited, without blocking.
-    pub fn try_reap(&mut self) -> std::io::Result<Option<ExitStatus>> {
+    /// The route as one word: `plain`, `scope`, or on Windows the
+    /// `holder_spawn` route (`plain` / `breakaway` / `wmi`).
+    pub fn route_name(&self) -> &'static str {
+        #[cfg(windows)]
+        {
+            self.windows_route.as_str()
+        }
+        #[cfg(not(windows))]
+        {
+            self.route.as_str()
+        }
+    }
+
+    /// Whether this spawn took longer than [`NEW_TAB_SPAWN_BUDGET`].
+    pub fn over_new_tab_budget(&self) -> bool {
+        self.ready_after > NEW_TAB_SPAWN_BUDGET
+    }
+
+    /// `Some(exit description)` once the holder has exited (a child is then
+    /// reaped, here); `None` while it runs.
+    pub fn try_reap(&mut self) -> std::io::Result<Option<String>> {
         self.process.try_wait()
     }
 
     /// Hand the holder to the shared reaper, which collects its exit status
     /// whenever it ends (a holder that outlives this runner is reparented and
-    /// reaped by init instead). The usual end of a [`SpawnedHolder`].
+    /// reaped by init instead). A WMI-spawned holder is not our child and
+    /// leaves no zombie; its handle is simply closed. The usual end of a
+    /// [`SpawnedHolder`].
     pub fn reap_in_background(self) {
-        adopt_for_reaping(self.process);
+        match self.process {
+            HolderProcess::Child(child) => adopt_for_reaping(child),
+            #[cfg(windows)]
+            HolderProcess::Wmi(handle) => drop(handle),
+            #[cfg(windows)]
+            HolderProcess::Unheld { .. } => {}
+        }
     }
 
     /// End this pane outright — for a caller that cannot use the holder it
@@ -564,15 +667,103 @@ impl SpawnedHolder {
     }
 }
 
+/// The process a spawner holds for its holder.
+#[derive(Debug)]
+enum HolderProcess {
+    /// Spawned by `CreateProcess` / `fork`: our child.
+    Child(Child),
+    /// Spawned through WMI: a verified handle, not our child.
+    #[cfg(windows)]
+    Wmi(qontinui_runner_win32::holder_spawn::WmiProcess),
+    /// Spawned through WMI, held by PANE identity, not by handle: its report
+    /// said ready and its endpoint answered as that pid
+    /// (`settle_unheld_wmi_holder`). Ended through its verified lock.
+    #[cfg(windows)]
+    Unheld {
+        pid: u32,
+        pane_dir: PathBuf,
+        pane_id: PaneId,
+        /// Its ready line, already read from the report file.
+        ready_line: Option<String>,
+    },
+}
+
+impl HolderProcess {
+    fn id(&self) -> u32 {
+        match self {
+            HolderProcess::Child(c) => c.id(),
+            #[cfg(windows)]
+            HolderProcess::Wmi(w) => w.id(),
+            #[cfg(windows)]
+            HolderProcess::Unheld { pid, .. } => *pid,
+        }
+    }
+
+    /// `Some(exit description)` once it has exited.
+    fn try_wait(&mut self) -> std::io::Result<Option<String>> {
+        match self {
+            HolderProcess::Child(c) => Ok(c.try_wait()?.map(|s| s.to_string())),
+            #[cfg(windows)]
+            HolderProcess::Wmi(w) => Ok(w.try_wait()?.map(|code| format!("exit code: {code}"))),
+            // Alive while its lock is held; its exit code is not ours to see.
+            #[cfg(windows)]
+            HolderProcess::Unheld {
+                pane_dir, pane_id, ..
+            } => Ok(
+                match crate::lock::PaneLock::try_acquire_existing(&crate::pane::lock_path(
+                    pane_dir, pane_id,
+                )) {
+                    Ok(crate::lock::TryLock::Held) => None,
+                    _ => Some("exited (unheld)".into()),
+                },
+            ),
+        }
+    }
+
+    /// Kill and (for a child) reap.
+    fn kill_and_reap(&mut self) {
+        match self {
+            HolderProcess::Child(c) => {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+            #[cfg(windows)]
+            HolderProcess::Wmi(w) => {
+                let _ = w.kill();
+                let _ = w.wait_timeout(FAILURE_WAIT);
+            }
+            #[cfg(windows)]
+            HolderProcess::Unheld {
+                pid,
+                pane_dir,
+                pane_id,
+                ..
+            } => {
+                let _ = crate::terminate::terminate_verified_holder(pane_dir, pane_id, *pid);
+            }
+        }
+    }
+
+    /// Whatever the process wrote to its stderr pipe, if it has one.
+    fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
+        match self {
+            HolderProcess::Child(c) => c.stderr.take(),
+            #[cfg(windows)]
+            HolderProcess::Wmi(_) | HolderProcess::Unheld { .. } => None,
+        }
+    }
+}
+
 /// Leave nothing behind, in this order:
 /// 1. SIGKILL the PTY child named by `ready` — only when `ready`'s holder pid
 ///    is the process we spawned and [`verify_pty_child`] confirms the child;
 ///    unverifiable → no explicit signal (steps 2-3 still end it: the unit stop
 ///    kills its cgroup, and the holder's death hangs up its PTY).
 /// 2. Stop the holder's scope unit, if any, within [`SYSTEMCTL_DEADLINE`].
-/// 3. Kill and reap the holder process itself (on every route the holder is
-///    our direct child, so this does not wait on the manager).
-fn abandon(process: &mut Child, unit: Option<&str>, ready: Option<&ReadyLine>) {
+/// 3. Kill and reap the holder process itself (on every route but WMI the
+///    holder is our direct child, so this does not wait on the manager; a WMI
+///    holder is killed through its verified handle).
+fn abandon(process: &mut HolderProcess, unit: Option<&str>, ready: Option<&ReadyLine>) {
     #[cfg(unix)]
     if let Some(r) = ready {
         let ours = signalable_pid(process.id()) == Some(r.holder_pid);
@@ -587,10 +778,10 @@ fn abandon(process: &mut Child, unit: Option<&str>, ready: Option<&ReadyLine>) {
     #[cfg(not(unix))]
     let _ = ready;
     if let Some(unit) = unit {
-        stop_scope_unit(unit, SYSTEMCTL_DEADLINE);
+        // Best effort: the holder's kill below hangs up the PTY either way.
+        let _ = stop_scope_unit(unit, SYSTEMCTL_DEADLINE);
     }
-    let _ = process.kill();
-    let _ = process.wait();
+    process.kill_and_reap();
 }
 
 /// Why one attempt failed, before the fallback decision.
@@ -645,6 +836,7 @@ pub fn spawn_holder(req: &SpawnRequest<'_>) -> Result<SpawnedHolder, SpawnError>
     }
 }
 
+/// `--report` is added on the WMI route only (see the module docs).
 fn holder_args(req: &SpawnRequest<'_>) -> Vec<OsString> {
     vec![
         "--pane-dir".into(),
@@ -705,17 +897,28 @@ fn attempt(req: &SpawnRequest<'_>, route: ResolvedRoute) -> Result<SpawnedHolder
         } else {
             Stdio::null()
         });
+    let started = Instant::now();
     #[cfg(windows)]
-    let (mut process, windows_route) = spawn_os(&mut cmd)?;
+    let (mut process, windows_route) = spawn_os(&mut cmd, req)?;
     #[cfg(not(windows))]
-    let mut process = cmd
-        .spawn()
-        .map_err(|e| AttemptError::Other(SpawnError::Spawn(e.to_string())))?;
+    let mut process = HolderProcess::Child(
+        cmd.spawn()
+            .map_err(|e| AttemptError::Other(SpawnError::Spawn(e.to_string())))?,
+    );
 
-    let line = match process.stdout.take() {
-        Some(out) => read_line_within(out, req.report_timeout),
-        None => Some(String::new()),
+    let line = match &mut process {
+        HolderProcess::Child(child) => match child.stdout.take() {
+            Some(out) => read_line_within(out, req.report_timeout),
+            None => Some(String::new()),
+        },
+        #[cfg(windows)]
+        HolderProcess::Wmi(_) => {
+            read_report_file_within(req.pane_dir, req.pane_id, &mut process, req.report_timeout)
+        }
+        #[cfg(windows)]
+        HolderProcess::Unheld { ready_line, .. } => ready_line.take(),
     };
+    let ready_after = started.elapsed();
     let line = match line {
         Some(l) if !l.is_empty() => l,
         missed => {
@@ -754,21 +957,253 @@ fn attempt(req: &SpawnRequest<'_>, route: ResolvedRoute) -> Result<SpawnedHolder
         unprotected: None,
         #[cfg(windows)]
         windows_route,
+        ready_after,
         process,
     })
 }
 
+/// Windows: `CreateProcess` on the route `IsProcessInJob` decides, and WMI
+/// when that is breakaway and the job refuses it (or when WMI was asked for).
+/// The WMI holder gets `--report`: it has no stdout pipe to print on.
 #[cfg(windows)]
 fn spawn_os(
     cmd: &mut Command,
-) -> Result<(Child, qontinui_runner_win32::holder_spawn::HolderSpawnRoute), AttemptError> {
-    use qontinui_runner_win32::holder_spawn::{spawn_holder, HolderSpawnError};
-    spawn_holder(cmd).map_err(|e| match e {
-        HolderSpawnError::NeedsWmiFallback { .. } => {
-            AttemptError::Other(SpawnError::NeedsWmiFallback(e.to_string()))
+    req: &SpawnRequest<'_>,
+) -> Result<
+    (
+        HolderProcess,
+        qontinui_runner_win32::holder_spawn::HolderSpawnRoute,
+    ),
+    AttemptError,
+> {
+    use qontinui_runner_win32::holder_spawn::{
+        spawn_holder, spawn_holder_wmi, HolderSpawnError, HolderSpawnRoute,
+    };
+    if req.route != RouteRequest::Wmi {
+        match spawn_holder(cmd) {
+            Ok((child, route)) => return Ok((HolderProcess::Child(child), route)),
+            Err(HolderSpawnError::NeedsWmiFallback { .. }) => {}
+            Err(other) => return Err(AttemptError::Other(SpawnError::Spawn(other.to_string()))),
         }
-        other => AttemptError::Other(SpawnError::Spawn(other.to_string())),
+    }
+    let report = crate::pane::report_path(req.pane_dir, req.pane_id);
+    let _ = std::fs::remove_file(&report);
+    cmd.arg("--report");
+    match spawn_holder_wmi(cmd, req.report_timeout) {
+        Ok(w) => Ok((HolderProcess::Wmi(w), HolderSpawnRoute::Wmi)),
+        Err(e @ HolderSpawnError::WmiNotOurProcess { .. }) => {
+            settle_unheld_wmi_holder(req, &report, &e.to_string())
+                .map(|unheld| (unheld, HolderSpawnRoute::Wmi))
+        }
+        Err(e) => Err(AttemptError::Other(SpawnError::Spawn(e.to_string()))),
+    }
+}
+
+/// The holder WMI made could not be held by a process handle. Most often it
+/// failed fast (say `lock_held`) and exited before it could be opened — but it
+/// may be LIVE (its handle refused on a false identity mismatch), and a live
+/// holder must never be left running its command while the caller falls back
+/// to an in-process PTY (two copies of one command). So, in this order:
+///
+/// 1. **Unlink the spec.** If that succeeds, no holder consumed it and none
+///    ever can: no holder will run this pane's command, and falling back is
+///    safe. Any other failure than `NotFound` leaves a holder free to consume
+///    it later: [`SpawnError::LiveHolderUnreachable`].
+/// 2. `NotFound`: a holder consumed the spec, having taken the pane's lock
+///    first. Its report decides: `holder_ready` with an endpoint that answers
+///    the handshake as that pid → accepted, held by pane identity
+///    ([`HolderProcess::Unheld`]).
+/// 3. Otherwise the holder must be CONFIRMED dead before anything else: the
+///    pane's lock FREE (only `Ok(Acquired)` counts — an unreadable lock
+///    proves nothing), or — while it is held — the recorded holder ended
+///    through `terminate::terminate_verified_holder` and the lock seen free
+///    within [`FAILURE_WAIT`]. Anything short of that is
+///    [`SpawnError::LiveHolderUnreachable`]. And even a confirmed-dead holder
+///    forbids a fallback if it RAN the command (it reported ready, or
+///    recorded a child): [`SpawnError::RanUnheld`]. See [`unheld_verdict`].
+#[cfg(windows)]
+fn settle_unheld_wmi_holder(
+    req: &SpawnRequest<'_>,
+    report: &Path,
+    why: &str,
+) -> Result<HolderProcess, AttemptError> {
+    let fail = |e: SpawnError| Err(AttemptError::Other(e));
+    match std::fs::remove_file(spec_path(req.pane_dir, req.pane_id)) {
+        Ok(()) => {
+            return fail(SpawnError::Spawn(format!(
+                "{why}; the spec was still unconsumed and is now removed — no holder can run \
+                 this pane's command"
+            )))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return fail(SpawnError::LiveHolderUnreachable(format!(
+                "{why}; the spec could not be removed ({e}), so a holder may still run it"
+            )))
+        }
+    }
+    let deadline = Instant::now() + req.report_timeout;
+    let line = loop {
+        if let Some(line) = take_report_file(report).filter(|l| !l.is_empty()) {
+            break Some(line);
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(REPORT_FILE_POLL);
+    };
+    if let Some(ready) = line.as_deref().and_then(parse_ready_line) {
+        let answered =
+            crate::client::connect(req.pane_dir, req.pane_id, Instant::now() + FAILURE_WAIT)
+                .is_ok_and(|c| signalable_pid(c.hello_ack().holder_pid) == Some(ready.holder_pid));
+        if answered {
+            return Ok(HolderProcess::Unheld {
+                pid: ready.holder_pid as u32,
+                pane_dir: req.pane_dir.to_path_buf(),
+                pane_id: req.pane_id.clone(),
+                ready_line: line,
+            });
+        }
+    }
+    let lock_file = crate::pane::lock_path(req.pane_dir, req.pane_id);
+    let seen = || LockSeen::of(crate::lock::PaneLock::try_acquire_existing(&lock_file));
+    let record = crate::lock::read_record(&lock_file);
+    let mut lock = seen();
+    let mut ended = String::new();
+    if lock == LockSeen::Held {
+        // A holder consumed the spec and is alive: end it, through its
+        // verified lock, and see it go before anything else is decided.
+        if let Some(r) = &record {
+            let t = crate::terminate::terminate_verified_holder(
+                req.pane_dir,
+                req.pane_id,
+                r.holder_pid,
+            );
+            ended = format!("; holder pid {} ended: {}", r.holder_pid, t.detail);
+            let gone_by = Instant::now() + FAILURE_WAIT;
+            while t.signalled && lock == LockSeen::Held && Instant::now() < gone_by {
+                std::thread::sleep(REPORT_FILE_POLL);
+                lock = seen();
+            }
+        }
+    }
+    let reported = line.clone().unwrap_or_else(|| "no report".into());
+    let verdict = unheld_verdict(
+        line.as_deref().and_then(parse_ready_line).is_some(),
+        record.as_ref().is_some_and(|r| r.child_pid.is_some()),
+        reported.starts_with("holder_error="),
+        lock,
+    );
+    let context = format!("{why}{ended}; report: {reported}");
+    fail(match verdict {
+        UnheldVerdict::HolderFailed => SpawnError::HolderFailed {
+            line: reported,
+            status: format!("exited before it could be opened ({why})"),
+        },
+        UnheldVerdict::Fallback => SpawnError::Spawn(format!(
+            "{context}; the holder is gone and never ran the command"
+        )),
+        UnheldVerdict::Ran => SpawnError::RanUnheld(context),
+        UnheldVerdict::Unreachable => SpawnError::LiveHolderUnreachable(context),
     })
+}
+
+/// What a pane's lock says, read once: only `Ok(Acquired)` is FREE (review
+/// round 3, R3) — an error (a sharing violation, access denied, the file gone
+/// mid-read) proves nothing about the holder.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockSeen {
+    Free,
+    Held,
+    Unreadable,
+}
+
+#[cfg(any(windows, test))]
+impl LockSeen {
+    fn of(r: std::io::Result<crate::lock::TryLock>) -> Self {
+        match r {
+            Ok(crate::lock::TryLock::Acquired(_)) => LockSeen::Free,
+            Ok(crate::lock::TryLock::Held) => LockSeen::Held,
+            Err(_) => LockSeen::Unreadable,
+        }
+    }
+}
+
+/// How an unheld WMI holder that CONSUMED its pane's spec settles.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnheldVerdict {
+    /// It reported `holder_error=…` and is gone: it never ran the command.
+    HolderFailed,
+    /// It is gone and never got as far as the command: fall back.
+    Fallback,
+    /// It ran the command (it reported ready, or recorded a child) and is
+    /// gone now: falling back would run it a SECOND time (review round 3, R7).
+    Ran,
+    /// It may still be live, or nothing about it can be read: no fallback.
+    Unreachable,
+}
+
+/// The settle decision, over what was observed after the holder was (if it
+/// was live) ended: `ready` — its report was a ready line; `recorded_child` —
+/// its lock record names a child; `failed` — its report was
+/// `holder_error=…`; `lock` — the pane's lock, last read. Pure, so it is
+/// tested on every OS.
+#[cfg(any(windows, test))]
+fn unheld_verdict(
+    ready: bool,
+    recorded_child: bool,
+    failed: bool,
+    lock: LockSeen,
+) -> UnheldVerdict {
+    match lock {
+        LockSeen::Held | LockSeen::Unreadable => UnheldVerdict::Unreachable,
+        LockSeen::Free if ready || recorded_child => UnheldVerdict::Ran,
+        LockSeen::Free if failed => UnheldVerdict::HolderFailed,
+        LockSeen::Free => UnheldVerdict::Fallback,
+    }
+}
+
+/// Read (and remove) a holder's report file: its first line, or `None` when
+/// there is no such file yet.
+#[cfg(windows)]
+fn take_report_file(path: &Path) -> Option<String> {
+    let mut text = String::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(64 * 1024)
+        .read_to_string(&mut text)
+        .ok()?;
+    let _ = std::fs::remove_file(path);
+    Some(text.lines().next().unwrap_or("").to_string())
+}
+
+/// The WMI route's ready line: poll the pane's report file (written whole by
+/// a rename) until it appears, the holder exits without it (`Some("")`, as
+/// EOF on a pipe), or `timeout` passes (`None`). The file is removed once read.
+#[cfg(windows)]
+fn read_report_file_within(
+    pane_dir: &Path,
+    pane_id: &PaneId,
+    process: &mut HolderProcess,
+    timeout: Duration,
+) -> Option<String> {
+    let path = crate::pane::report_path(pane_dir, pane_id);
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(line) = take_report_file(&path) {
+            return Some(line);
+        }
+        if matches!(process.try_wait(), Ok(Some(_))) {
+            // It may have renamed the file just before exiting.
+            return Some(take_report_file(&path).unwrap_or_default());
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(REPORT_FILE_POLL);
+    }
 }
 
 /// Why a holder that printed nothing (or an error) failed, as one
@@ -776,24 +1211,22 @@ fn spawn_os(
 /// scope route, systemd-run's). Waits up to [`FAILURE_WAIT`] for the process
 /// to exit, KILLS it if it has not, then reads stderr — itself bounded, since
 /// a grandchild could still hold the pipe.
-fn failure_reason(process: &mut Child) -> String {
+fn failure_reason(process: &mut HolderProcess) -> String {
     let deadline = Instant::now() + FAILURE_WAIT;
     let status = loop {
         match process.try_wait() {
-            Ok(Some(s)) => break s.to_string(),
+            Ok(Some(s)) => break s,
             Ok(None) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(50));
             }
             _ => {
-                let _ = process.kill();
-                let _ = process.wait();
+                process.kill_and_reap();
                 break "still-running(killed)".to_string();
             }
         }
     };
     let err = process
-        .stderr
-        .take()
+        .take_stderr()
         .map(|e| {
             read_all_within(e, Duration::from_secs(2))
                 .unwrap_or_else(|| "<stderr read timed out>".into())
@@ -892,6 +1325,14 @@ mod tests {
             ResolvedRoute::Windows
         );
         assert!(decide_route(RouteRequest::Scope, &win).is_err());
+        assert_eq!(
+            decide_route(RouteRequest::Wmi, &win).unwrap().route,
+            ResolvedRoute::Windows
+        );
+        assert!(
+            decide_route(RouteRequest::Wmi, &f).is_err(),
+            "the WMI route exists only on Windows"
+        );
         let mac = HostFacts {
             linux: false,
             in_unit_cgroup: false,
@@ -1008,6 +1449,49 @@ mod tests {
     fn pty_holder_spawn_verify_pty_child_refuses_an_unrelated_process() {
         let me = std::process::id() as i32;
         assert_eq!(verify_pty_child(2, me), None);
+    }
+
+    /// Review round 3, R3 + R7: only a FREE lock lets anything fall back, and
+    /// even then not after the holder ran the command.
+    #[test]
+    fn pty_holder_spawn_unheld_wmi_verdict_never_runs_a_command_twice() {
+        use UnheldVerdict::*;
+        for ready in [false, true] {
+            for child in [false, true] {
+                for failed in [false, true] {
+                    for lock in [LockSeen::Held, LockSeen::Unreadable] {
+                        assert_eq!(
+                            unheld_verdict(ready, child, failed, lock),
+                            Unreachable,
+                            "a held or unreadable lock never falls back"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            unheld_verdict(true, false, false, LockSeen::Free),
+            Ran,
+            "R7"
+        );
+        assert_eq!(unheld_verdict(false, true, false, LockSeen::Free), Ran);
+        assert_eq!(
+            unheld_verdict(false, false, true, LockSeen::Free),
+            HolderFailed
+        );
+        assert_eq!(
+            unheld_verdict(false, false, false, LockSeen::Free),
+            Fallback
+        );
+        assert_eq!(
+            LockSeen::of(Err(std::io::Error::other("sharing violation"))),
+            LockSeen::Unreadable,
+            "R3: an error is not a free lock"
+        );
+        assert_eq!(LockSeen::of(Ok(crate::lock::TryLock::Held)), LockSeen::Held);
+        assert!(SpawnError::RanUnheld("x".into()).forbids_fallback());
+        assert!(SpawnError::LiveHolderUnreachable("x".into()).forbids_fallback());
+        assert!(!SpawnError::Spawn("x".into()).forbids_fallback());
     }
 
     #[test]

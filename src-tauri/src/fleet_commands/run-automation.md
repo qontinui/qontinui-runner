@@ -99,6 +99,7 @@ The qontinui-http.py script supports these commands:
 | `health` | Health check |
 | `monitors` | List available monitors |
 | `load-config <path>` | Load a workflow configuration file |
+| `load-last-config` | Reload the last config the runner saved (reports its saved workflow and monitor) |
 | `run-workflow <name>` | Run a workflow by name |
 | `stop` | Stop current execution |
 

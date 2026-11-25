@@ -345,7 +345,7 @@ pub fn restore_pop_out_windows(
                 tracing::warn!(
                     window = %label,
                     rejected_geometry = ?g,
-                    "restore_pop_out_windows: saved geometry is not restorable (minimized/zero-size) — using default placement and clearing it"
+                    "restore_pop_out_windows: saved geometry is not restorable (minimized/too small) — using default placement and clearing it"
                 );
                 assignments.clear_geometry(&label);
                 None
@@ -1262,5 +1262,14 @@ mod tests {
             snapshot_geometry(false, false, (-32000, -32000), (0, 0)),
             None
         );
+    }
+
+    #[test]
+    fn snapshot_geometry_refuses_a_collapsed_sliver_not_reported_minimized() {
+        // Capture is where a sliver got persisted, so the shared minimum must
+        // hold here too — maximized or not — while the prior record stands.
+        assert_eq!(snapshot_geometry(false, false, (177, 177), (15, 37)), None);
+        assert_eq!(snapshot_geometry(false, true, (0, 0), (160, 28)), None);
+        assert!(snapshot_geometry(false, false, (100, 100), (200, 150)).is_some());
     }
 }

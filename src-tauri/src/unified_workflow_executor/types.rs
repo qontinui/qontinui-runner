@@ -164,6 +164,13 @@ pub struct LoopResult {
     /// Whether the loop exited because fix attempts were exhausted without progress.
     #[serde(default)]
     pub fix_attempts_exhausted: bool,
+    /// Whether the loop exited because no required verification step produced
+    /// a result, so nothing was checked (`CompletionReason::NoVerificationSteps`).
+    /// Such an exit is not a pass, so `verification_passed` is false. It is not
+    /// a refuted fix either, so the compensation rollback and the worktree
+    /// finalizer skip it.
+    #[serde(default)]
+    pub no_verification_steps: bool,
     /// All unique file paths modified across all iterations (from resource tracker).
     #[serde(default)]
     pub files_modified: Vec<String>,
@@ -189,6 +196,8 @@ impl LoopResult {
     /// - Critical failure occurred
     /// - User stopped the workflow
     /// - Max iterations reached without unfixable signal
+    /// - No required verification step ran (`no_verification_steps`): nothing
+    ///   was checked, so there is no pass to complete on
     pub fn should_run_completion(&self) -> bool {
         !self.critical_failure
             && !self.was_stopped
@@ -202,6 +211,11 @@ impl LoopResult {
         } else if self.verification_passed {
             format!(
                 "Verification PASSED after {} iteration(s)",
+                self.iterations_run
+            )
+        } else if self.no_verification_steps {
+            format!(
+                "NOTHING VERIFIED after {} iteration(s) - no required verification step ran, so the result is unknown, not passed",
                 self.iterations_run
             )
         } else if self.unfixable_errors {
@@ -278,20 +292,6 @@ pub struct StageConfig {
     /// This is used by meta-workflows to ensure the AI hardener runs
     /// before save_workflow_artifact persists the final result.
     pub completion_prompts_first: bool,
-}
-
-/// Context from a CI failure that triggered an auto-resume.
-/// Populated by the PR watcher and consumed by the failure context builder.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CiFailureContext {
-    /// Names of CI checks that failed (e.g., "build", "test", "lint").
-    pub failed_check_names: Vec<String>,
-    /// Truncated log output per check (check_name -> log excerpt).
-    pub check_logs: HashMap<String, String>,
-    /// PR number that triggered this resume (if applicable).
-    pub pr_number: Option<u64>,
-    /// Whether the PR has a merge conflict.
-    pub merge_conflict: bool,
 }
 
 /// Configuration for the verification-agentic loop.
@@ -457,11 +457,8 @@ pub struct LoopConfig {
     /// Default: 3. Set to 0 to disable fix-attempt tracking (preserves existing behavior).
     pub max_fix_attempts: u32,
     /// Maximum number of CI-triggered auto-resumes before requiring manual intervention.
-    /// Used by the PR watcher (Phase 2). Default: 10.
+    /// Nothing reads it. Default: 10.
     pub max_ci_auto_resumes: u32,
-    /// CI failure context injected by the PR watcher when auto-resuming after CI failure.
-    /// When present, failed check names and logs are prepended to the failure context.
-    pub ci_failure_context: Option<CiFailureContext>,
     /// HTN planning configuration. When enabled, the loop attempts structured
     /// plan-based fixes before falling back to AI agentic sessions.
     pub htn_config: crate::planning_bridge::HtnConfig,
@@ -590,7 +587,6 @@ impl LoopConfig {
             }),
             max_fix_attempts: workflow.max_fix_attempts,
             max_ci_auto_resumes: workflow.max_ci_auto_resumes,
-            ci_failure_context: None,
             htn_config: {
                 let mut htn = crate::planning_bridge::HtnConfig {
                     enabled: workflow.htn_enabled,
@@ -1435,22 +1431,19 @@ mod tests {
 
     #[test]
     fn loop_result_omits_node_rollups_when_empty() {
-        let lr = LoopResult {
-            iterations_run: 1,
-            verification_passed: true,
-            max_iterations_reached: false,
-            critical_failure: false,
-            was_stopped: false,
-            unfixable_errors: false,
-            iteration_results: vec![],
-            total_tokens: None,
-            total_cost_usd: None,
-            fix_attempts_exhausted: false,
-            files_modified: Vec::new(),
-            fix_attempts: 0,
-            ci_auto_resumes: 0,
-            node_rollups: Vec::new(),
-        };
+        // Built from the required keys only, so every `#[serde(default)]` field
+        // (node_rollups, no_verification_steps, ...) takes its default without
+        // this fixture naming it.
+        let lr: LoopResult = serde_json::from_value(serde_json::json!({
+            "iterations_run": 1,
+            "verification_passed": true,
+            "max_iterations_reached": false,
+            "critical_failure": false,
+            "was_stopped": false,
+            "iteration_results": [],
+        }))
+        .expect("a LoopResult from its required keys");
+        assert!(lr.node_rollups.is_empty());
         let v = serde_json::to_value(&lr).unwrap();
         assert!(
             !v.as_object().unwrap().contains_key("node_rollups"),
@@ -1578,5 +1571,69 @@ mod tests {
 
         let unresolved_root: [Option<&Path>; 2] = [None, None];
         assert_eq!(first_existing(unresolved_root), None);
+    }
+}
+
+// LoopResult's nothing-checked exit: its summary, completion and serde default.
+#[cfg(test)]
+mod no_verification_steps_tests {
+    use super::LoopResult;
+
+    /// A loop that checked nothing: every runtime flag false, the cause set.
+    fn nothing_verified_loop_result() -> LoopResult {
+        LoopResult {
+            iterations_run: 1,
+            verification_passed: false,
+            max_iterations_reached: false,
+            critical_failure: false,
+            was_stopped: false,
+            unfixable_errors: false,
+            iteration_results: vec![],
+            total_tokens: None,
+            total_cost_usd: None,
+            fix_attempts_exhausted: false,
+            no_verification_steps: true,
+            files_modified: Vec::new(),
+            fix_attempts: 0,
+            ci_auto_resumes: 0,
+            node_rollups: Vec::new(),
+        }
+    }
+
+    /// `summary()` names why nothing passed, and it does not say that
+    /// verification failed. Before this arm such a result fell through to the
+    /// generic "Loop ended" line.
+    #[test]
+    fn summary_names_a_verification_that_checked_nothing() {
+        let summary = nothing_verified_loop_result().summary();
+        assert_eq!(
+            summary,
+            "NOTHING VERIFIED after 1 iteration(s) - no required verification step ran, so the result is unknown, not passed"
+        );
+        assert!(!summary.contains("PASSED"), "{}", summary);
+    }
+
+    /// Nothing checked does not run the completion phase: there is no pass to
+    /// complete on, and no unfixable signal either.
+    #[test]
+    fn a_verification_that_checked_nothing_does_not_run_completion() {
+        assert!(!nothing_verified_loop_result().should_run_completion());
+    }
+
+    /// A `LoopResult` serialized before the field existed reads back `false`
+    /// (`#[serde(default)]`), so an old payload never claims nothing was checked.
+    #[test]
+    fn a_loop_result_without_the_field_reads_no_verification_steps_false() {
+        let legacy = serde_json::json!({
+            "iterations_run": 2,
+            "verification_passed": true,
+            "max_iterations_reached": false,
+            "critical_failure": false,
+            "was_stopped": false,
+            "iteration_results": [],
+        });
+        let parsed: LoopResult = serde_json::from_value(legacy).unwrap();
+        assert!(!parsed.no_verification_steps);
+        assert!(parsed.verification_passed);
     }
 }

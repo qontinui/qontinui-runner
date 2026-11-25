@@ -6,7 +6,6 @@
 pub mod file_watcher;
 pub mod git_watcher;
 pub mod health_check;
-pub mod pr_watcher;
 pub mod schedule;
 pub mod ticket_watcher;
 pub mod webhook;

@@ -1,14 +1,21 @@
 //! GUI Config Pipeline handlers for MCP API
 //!
-//! Provides HTTP endpoints to capture element images from the current UI
-//! and build visual GUI automation configs (QontinuiConfig format).
+//! Provides HTTP endpoints to build visual GUI automation configs
+//! (QontinuiConfig format) from caller-supplied element images, plus the
+//! window-focus and executor-start helpers.
 //!
-//! The pipeline combines UI Bridge snapshot data (element positions) with
-//! screen captures, then uses the qontinui core library to crop elements
-//! and assemble configs.
+//! ## The element-capture routes were deleted
+//!
+//! `POST /gui-config/capture-elements` and `POST /gui-config/capture-multi-state`
+//! used to dispatch Python commands that fetched element images from
+//! `POST /ui-bridge/control/capture-element-images` — an html2canvas render in
+//! the frontend. That runner route was deleted by the vision-pipeline Phase 2
+//! (#119), and qontinui-runner#2242 deleted the frontend handler and
+//! html2canvas itself. Their only caller, qontinui-mcp's two capture tools, was
+//! deleted by qontinui-mcp#10, so the routes are gone too (404).
 
 use axum::{extract::State, http::StatusCode, response::Json};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
@@ -21,16 +28,6 @@ use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 // ============================================================================
 
 #[derive(Debug, Deserialize)]
-pub struct CaptureElementsRequest {
-    pub window_offset_x: Option<i32>,
-    pub window_offset_y: Option<i32>,
-    pub scale_factor: Option<f64>,
-    pub category_filter: Option<Vec<String>>,
-    pub min_element_size: Option<i32>,
-    pub padding: Option<i32>,
-}
-
-#[derive(Debug, Deserialize)]
 pub struct BuildGuiConfigRequest {
     pub name: String,
     pub states: serde_json::Value,
@@ -40,60 +37,9 @@ pub struct BuildGuiConfigRequest {
     pub similarity: Option<f64>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct CaptureMultiStateRequest {
-    pub name: String,
-    pub interactions: Vec<CaptureInteraction>,
-    pub min_element_size: Option<i32>,
-    pub description: Option<String>,
-    pub similarity: Option<f64>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct CaptureInteraction {
-    pub action_type: String,
-    pub target: Option<String>,
-    pub state_name: String,
-    pub wait_seconds: Option<f64>,
-}
-
 // ============================================================================
 // Helpers
 // ============================================================================
-
-/// Auto-detect the webview content area position and DPI scale factor.
-///
-/// UI Bridge element rects are relative to the viewport, but screenshots capture
-/// the entire monitor. This helper maps viewport coords to screenshot coords by
-/// detecting the content area's position on the monitor.
-fn detect_window_geometry(
-    app_handle: &tauri::AppHandle,
-    override_x: Option<i32>,
-    override_y: Option<i32>,
-    override_scale: Option<f64>,
-) -> (i32, i32, f64) {
-    use tauri::Manager;
-    let window = app_handle.get_webview_window(qontinui_runner_lib::get_main_window_label());
-    if let Some(win) = window {
-        let detected_scale = win.scale_factor().unwrap_or(1.0);
-        let pos = win.inner_position().unwrap_or_default();
-        info!(
-            "GUI Config: Detected window content area at ({}, {}), scale={}",
-            pos.x, pos.y, detected_scale
-        );
-        (
-            override_x.unwrap_or(pos.x),
-            override_y.unwrap_or(pos.y),
-            override_scale.unwrap_or(detected_scale),
-        )
-    } else {
-        (
-            override_x.unwrap_or(0),
-            override_y.unwrap_or(0),
-            override_scale.unwrap_or(1.0),
-        )
-    }
-}
 
 /// Bring the runner window to the foreground so screenshots capture its content.
 ///
@@ -144,90 +90,6 @@ fn runner_window_has_foreground(_app_handle: &tauri::AppHandle) -> Result<bool, 
 // ============================================================================
 // Handlers
 // ============================================================================
-
-/// POST /gui-config/capture-elements
-///
-/// Captures element images from the current UI by delegating to Python which:
-/// 1. Fetches the UI Bridge snapshot via HTTP
-/// 2. Captures a screenshot via the HAL
-/// 3. Runs the ElementImagePipeline to crop each element
-///
-/// Returns element images as a dict of element_id -> {base64_png, width, height, ...}
-pub async fn capture_elements(
-    State(state): State<Arc<ApiState>>,
-    Json(request): Json<CaptureElementsRequest>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("GUI Config: Capturing elements from current UI");
-
-    // NOTE: Window focus is handled by Python via Windows API (ctypes) before
-    // each screenshot capture. We don't call focus_runner_window() here because
-    // Python runs inside spawn_blocking — an HTTP callback would deadlock.
-
-    let api_port = state
-        .app_state
-        .api_port
-        .load(std::sync::atomic::Ordering::Relaxed);
-
-    let (offset_x, offset_y, scale) = detect_window_geometry(
-        &state.app_handle,
-        request.window_offset_x,
-        request.window_offset_y,
-        request.scale_factor,
-    );
-
-    let params = serde_json::json!({
-        "api_port": api_port,
-        "window_offset_x": offset_x,
-        "window_offset_y": offset_y,
-        "scale_factor": scale,
-        "category_filter": request.category_filter,
-        "min_element_size": request.min_element_size.unwrap_or(4),
-        "padding": request.padding.unwrap_or(0),
-    });
-
-    let app_state_clone = state.app_state.clone();
-    let result = spawn_blocking_tracked(move || {
-        with_default_bridge(&app_state_clone, |bridge| {
-            if !bridge.is_running() {
-                return Err("Python executor not running".to_string());
-            }
-            let timeout = std::time::Duration::from_secs(60);
-            bridge.send_command_and_wait("gui_config_capture_elements", Some(params), timeout)
-        })?
-    })
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("spawn_blocking error: {}", e))),
-        )
-    })?;
-
-    match result {
-        Ok(response) => {
-            if response.success {
-                Ok(Json(ApiResponse::success(
-                    response
-                        .data
-                        .unwrap_or(serde_json::json!({"success": true})),
-                )))
-            } else {
-                let error_msg = response
-                    .error
-                    .unwrap_or_else(|| "Pipeline failed".to_string());
-                error!("GUI Config: capture_elements failed: {}", error_msg);
-                Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(api_error(error_msg)),
-                ))
-            }
-        }
-        Err(e) => {
-            error!("GUI Config: capture_elements IPC error: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
-}
 
 /// POST /gui-config/build
 ///
@@ -288,93 +150,6 @@ pub async fn build_gui_config(
         }
         Err(e) => {
             error!("GUI Config: build IPC error: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
-}
-
-/// POST /gui-config/capture-multi-state
-///
-/// Orchestrates multi-state GUI config capture by:
-/// 1. Walking through a sequence of interactions (click, scroll, etc.)
-/// 2. At each step: capturing a screenshot + UI Bridge snapshot
-/// 3. Diffing element sets to find only NEW elements per state
-/// 4. Cropping element images and building a complete QontinuiConfig
-///
-/// Returns a complete multi-state config with images, states, and transitions.
-pub async fn capture_multi_state(
-    State(state): State<Arc<ApiState>>,
-    Json(request): Json<CaptureMultiStateRequest>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!(
-        "GUI Config: Multi-state capture '{}' with {} interactions",
-        request.name,
-        request.interactions.len()
-    );
-
-    // NOTE: Window focus is handled by Python via Windows API (ctypes) before
-    // each screenshot capture inside the loop.
-
-    let api_port = state
-        .app_state
-        .api_port
-        .load(std::sync::atomic::Ordering::Relaxed);
-
-    let (offset_x, offset_y, scale) = detect_window_geometry(&state.app_handle, None, None, None);
-
-    let params = serde_json::json!({
-        "api_port": api_port,
-        "window_offset_x": offset_x,
-        "window_offset_y": offset_y,
-        "scale_factor": scale,
-        "name": request.name,
-        "interactions": request.interactions,
-        "min_element_size": request.min_element_size.unwrap_or(4),
-        "description": request.description.unwrap_or_default(),
-        "similarity": request.similarity.unwrap_or(0.85),
-    });
-
-    let app_state_clone = state.app_state.clone();
-    let result = spawn_blocking_tracked(move || {
-        with_default_bridge(&app_state_clone, |bridge| {
-            if !bridge.is_running() {
-                return Err("Python executor not running".to_string());
-            }
-            // Multi-state capture with html2canvas rendering can take several minutes
-            // (30+ elements × 9 states × ~2s per element render)
-            let timeout = std::time::Duration::from_secs(600);
-            bridge.send_command_and_wait("gui_config_capture_multi_state", Some(params), timeout)
-        })?
-    })
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("spawn_blocking error: {}", e))),
-        )
-    })?;
-
-    match result {
-        Ok(response) => {
-            if response.success {
-                Ok(Json(ApiResponse::success(
-                    response
-                        .data
-                        .unwrap_or(serde_json::json!({"success": true})),
-                )))
-            } else {
-                let error_msg = response
-                    .error
-                    .unwrap_or_else(|| "Multi-state capture failed".to_string());
-                error!("GUI Config: capture_multi_state failed: {}", error_msg);
-                Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(api_error(error_msg)),
-                ))
-            }
-        }
-        Err(e) => {
-            error!("GUI Config: capture_multi_state IPC error: {}", e);
             Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
         }
     }
@@ -467,9 +242,7 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
     use axum::routing::post;
 
     axum::Router::new()
-        .route("/gui-config/capture-elements", post(capture_elements))
         .route("/gui-config/build", post(build_gui_config))
-        .route("/gui-config/capture-multi-state", post(capture_multi_state))
         .route("/gui-config/focus-window", post(focus_window))
         .route("/gui-config/start-executor", post(start_executor))
 }

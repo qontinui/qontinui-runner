@@ -351,6 +351,7 @@ pub(crate) fn build_scorer_command(
     // is an infinite silent hang. One shared list, eight seams; see
     // `credential_helper::non_interactive_git_env`.
     crate::credential_helper::apply_non_interactive_git_env_std(&mut cmd);
+    crate::terminal::apply_python_utf8_default_std(&mut cmd);
     crate::terminal::scrub_credential_env_std(&mut cmd);
 
     cmd
@@ -528,6 +529,13 @@ mod tests {
 
     #[test]
     fn scorer_command_scrubs_credential_values() {
+        // The scrub applies the LIVE model-gateway plan, which reads the
+        // runner config dir. A sibling test's `IsolatedAmbient` rewrites the
+        // process env (on Windows, `USERPROFILE` too, which can make the
+        // platform config dir unresolvable mid-test); an unresolvable dir is
+        // an unresolved gateway that pins `CLAUDE_CONFIG_DIR` away. Hold the
+        // fixture so this test reads a known, gateway-free config dir.
+        let _amb = crate::test_env::isolated_ambient();
         let cmd = build_scorer_command("claude", Some("/tmp/claude-config"));
 
         crate::terminal::assert_credentials_scrubbed_std(&cmd, "build_scorer_command");
@@ -566,5 +574,6 @@ mod tests {
             &cmd,
             "build_scorer_command",
         );
+        crate::terminal::assert_python_utf8_default_std(&cmd, "build_scorer_command");
     }
 }

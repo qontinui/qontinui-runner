@@ -6,7 +6,7 @@
 //! wrapper framework we only port the essentials:
 //!
 //! 1. A `pending` map keyed by `command_id`, each slot holding the routing
-//!    `conn_id` plus a `oneshot::Sender<CommandResponse>` that the response
+//!    `conn_id` plus a `oneshot::Sender<Resolution>` that the response
 //!    handler completes. The `conn_id` lets cleanup paths target a specific
 //!    socket — see `reject_by_conn`.
 //! 2. A `dispatch(app_id, action, payload)` call that
@@ -42,7 +42,7 @@ use tokio::sync::{oneshot, Mutex};
 use uuid::Uuid;
 
 use super::relay_binding::BindingMode;
-use super::ws_relay::{WsConnectionManager, WsOutboundError};
+use super::ws_relay::{PinnedSendError, WsConnectionManager, WsOutboundError};
 
 /// Default per-command timeout — long enough to cover a slow snapshot, short
 /// enough that wedged wrappers don't accumulate forever.
@@ -66,7 +66,102 @@ pub struct CommandResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
+    pub error: Option<WrapperFailure>,
+}
+
+/// The failure a wrapper REPORTED for one command: the `error` of a
+/// `{type:"response", success:false, error}` frame.
+///
+/// ui-bridge-wrapper's `LiveSessionTransport` — the transport the extension's
+/// live relay builds — sends `{code, message, retryable}`
+/// (`packages/ui-bridge-wrapper/src/transports/live.ts`). A bare string is
+/// still read — the one shape the runner accepted before — though no
+/// first-party sender sends one. Both are read by [`WrapperFailure::from_wire`].
+/// Until that reader existed the runner parsed `error` as a string only,
+/// rejected every structured failure frame whole, and the command it answered
+/// resolved 30 s later as a timeout (coord finding `fb3fb468`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WrapperFailure {
+    /// The wrapper's own machine-readable code (`NO_HANDLER`,
+    /// `HANDLER_ERROR`, …). `None` when it sent a bare string — a failure
+    /// with no code, never a code of `""`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    pub message: String,
+    /// Whether the wrapper says a retry can succeed. `None` means it did not
+    /// say, which is UNKNOWN — never read it as `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retryable: Option<bool>,
+}
+
+impl WrapperFailure {
+    /// A failure that carries only a message: no code, retryability unknown.
+    pub fn message_only(message: impl Into<String>) -> Self {
+        Self {
+            code: None,
+            message: message.into(),
+            retryable: None,
+        }
+    }
+
+    /// Read a response frame's raw `error` value. Total: whatever shape the
+    /// wrapper sent, the command it answers must resolve NOW with a failure
+    /// rather than time out, so no shape is refused.
+    ///
+    /// - `null` → no error (`None`);
+    /// - a string → that message, no code;
+    /// - an object → `code` (or `errorCode`), `message` (else `error`, else
+    ///   the object's own JSON text) and `retryable` when it is a boolean;
+    /// - anything else → its JSON text as the message.
+    pub fn from_wire(value: serde_json::Value) -> Option<Self> {
+        use serde_json::Value;
+        match value {
+            Value::Null => None,
+            Value::String(message) => Some(Self::message_only(message)),
+            Value::Object(map) => {
+                let text = |key: &str| match map.get(key) {
+                    Some(Value::String(s)) if !s.trim().is_empty() => Some(s.clone()),
+                    Some(Value::Number(n)) => Some(n.to_string()),
+                    _ => None,
+                };
+                let code = text("code").or_else(|| text("errorCode"));
+                let message = text("message")
+                    .or_else(|| text("error"))
+                    .unwrap_or_else(|| Value::Object(map.clone()).to_string());
+                let retryable = map.get("retryable").and_then(Value::as_bool);
+                Some(Self {
+                    code,
+                    message,
+                    retryable,
+                })
+            }
+            other => Some(Self::message_only(other.to_string())),
+        }
+    }
+}
+
+impl From<String> for WrapperFailure {
+    fn from(message: String) -> Self {
+        Self::message_only(message)
+    }
+}
+
+impl From<&str> for WrapperFailure {
+    fn from(message: &str) -> Self {
+        Self::message_only(message)
+    }
+}
+
+/// `CODE: message` when the wrapper sent a code, else the message alone — so
+/// every string rendering of a dispatch error (`dispatch_err_to_string` and
+/// the `{success:false, error}` bodies built from it) still names the code.
+impl std::fmt::Display for WrapperFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.code {
+            Some(code) => write!(f, "{code}: {}", self.message),
+            None => f.write_str(&self.message),
+        }
+    }
 }
 
 /// Errors surfaced by `CommandRelay::dispatch`.
@@ -76,9 +171,19 @@ pub enum CommandRelayError {
     #[error("app '{0}' is not connected over WebSocket")]
     NotConnected(String),
 
-    /// The wrapper returned `{success: false, error: "..."}`.
+    /// The wrapper answered `{success: false, error}`. Carries the wrapper's
+    /// own code and retryability, so a caller can hand them on instead of
+    /// flattening them into a message.
     #[error("wrapper returned error: {0}")]
-    WrapperError(String),
+    WrapperError(WrapperFailure),
+
+    /// The app ANSWERED this command — its response frame named it — but the
+    /// frame could not be read (coord finding `fb3fb468`). This is NOT the
+    /// app's own failure: what the app reported is unknown, so callers keep
+    /// it out of the app-code slot and, like a [`Self::Timeout`], treat the
+    /// outcome as unknown (`failure_origin: "transport"`, `retryable: null`).
+    #[error("the app answered, but its response frame could not be read: {0}")]
+    UnreadableResponse(String),
 
     /// The wrapper did not respond within `DEFAULT_COMMAND_TIMEOUT`.
     #[error("command timed out after {}ms waiting for wrapper response", .0.as_millis())]
@@ -110,6 +215,27 @@ impl From<WsOutboundError> for CommandRelayError {
             WsOutboundError::NotConnected => CommandRelayError::Disconnected,
             WsOutboundError::Send => CommandRelayError::Disconnected,
         }
+    }
+}
+
+/// How [`CommandRelay::send_and_await`] sends its frame.
+#[derive(Debug, Clone, Copy)]
+enum Route {
+    /// To the `conn_id` the caller just resolved from the app id.
+    Resolved,
+    /// To the `conn_id` the caller pinned, only while it holds the app's slot.
+    Pinned,
+}
+
+/// Map a pinned send's refusal onto the relay's error vocabulary.
+fn pinned_send_error(app_id: &str, conn_id: u64, err: PinnedSendError) -> CommandRelayError {
+    match err {
+        PinnedSendError::NotConnected => CommandRelayError::NotConnected(app_id.to_string()),
+        PinnedSendError::Displaced { current } => CommandRelayError::Displaced(format!(
+            "app '{app_id}' connection {conn_id} does not hold the app's routing slot \
+             (held by connection {current}); the command was not sent"
+        )),
+        PinnedSendError::Send => CommandRelayError::Disconnected,
     }
 }
 
@@ -147,7 +273,18 @@ pub struct ResolveOutcome {
 /// commands too.
 struct PendingEntry {
     conn_id: u64,
-    sender: oneshot::Sender<CommandResponse>,
+    sender: oneshot::Sender<Resolution>,
+}
+
+/// How a pending command was settled by the side it was routed to.
+#[derive(Debug)]
+enum Resolution {
+    /// A response frame that could be read (or a displacement written by
+    /// [`CommandRelay::reject_by_conn`]).
+    Answered(CommandResponse),
+    /// A response frame that named the command but could not be read — the
+    /// parse error is the payload. See [`CommandRelayError::UnreadableResponse`].
+    Unreadable(String),
 }
 
 /// CommandRelay — the pending-command state machine.
@@ -170,9 +307,21 @@ impl CommandRelay {
         })
     }
 
+    /// The connection manager this relay sends through — for tests that
+    /// play a wrapper reconnecting under an app id.
+    #[cfg(test)]
+    pub fn ws_manager(&self) -> &Arc<WsConnectionManager> {
+        &self.ws
+    }
+
     /// Dispatch a command to the wrapper identified by `app_id`. Resolves
     /// with the wrapper's response or returns a `CommandRelayError` on
     /// disconnect/timeout/error.
+    ///
+    /// Routes to whichever connection holds `app_id` when the command is
+    /// sent. A caller that must reach one SPECIFIC connection — because it
+    /// read something about that connection first — uses
+    /// [`Self::dispatch_to_conn`] instead.
     pub async fn dispatch(
         &self,
         app_id: &str,
@@ -187,7 +336,40 @@ impl CommandRelay {
             .conn_for_app(app_id)
             .await
             .ok_or_else(|| CommandRelayError::NotConnected(app_id.to_string()))?;
+        self.send_and_await(app_id, conn_id, Route::Resolved, action, payload)
+            .await
+    }
 
+    /// Dispatch a command to `conn_id` ONLY, and only while it still holds
+    /// `app_id`'s routing slot. Built on
+    /// [`WsConnectionManager::send_text_if_current`], so the slot check and
+    /// the send cannot be split by a reconnect.
+    ///
+    /// A replaced connection is [`CommandRelayError::Displaced`] and nothing
+    /// is sent to its replacement; an `app_id` with no slot at all is
+    /// [`CommandRelayError::NotConnected`]. Past the send it behaves exactly
+    /// as [`Self::dispatch`] (one pending-reply registration, one timeout).
+    pub async fn dispatch_to_conn(
+        &self,
+        app_id: &str,
+        conn_id: u64,
+        action: &str,
+        payload: serde_json::Value,
+    ) -> Result<CommandResponse, CommandRelayError> {
+        self.send_and_await(app_id, conn_id, Route::Pinned, action, payload)
+            .await
+    }
+
+    /// The shared body of [`Self::dispatch`] and [`Self::dispatch_to_conn`]:
+    /// register the pending reply, send the frame by `route`, await the reply.
+    async fn send_and_await(
+        &self,
+        app_id: &str,
+        conn_id: u64,
+        route: Route,
+        action: &str,
+        payload: serde_json::Value,
+    ) -> Result<CommandResponse, CommandRelayError> {
         let command_id = Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
 
@@ -213,28 +395,54 @@ impl CommandRelay {
             payload: &payload,
             timestamp: chrono::Utc::now().timestamp_millis(),
         };
-        let frame_json = serde_json::to_string(&frame)?;
+        let frame_json = match serde_json::to_string(&frame) {
+            Ok(json) => json,
+            Err(e) => {
+                self.pending.lock().await.remove(&command_id);
+                return Err(e.into());
+            }
+        };
 
-        if let Err(send_err) = self.ws.send_text(conn_id, frame_json).await {
+        let sent = match route {
+            Route::Resolved => self
+                .ws
+                .send_text(conn_id, frame_json)
+                .await
+                .map_err(CommandRelayError::from),
+            Route::Pinned => self
+                .ws
+                .send_text_if_current(app_id, conn_id, frame_json)
+                .await
+                .map_err(|e| pinned_send_error(app_id, conn_id, e)),
+        };
+        if let Err(send_err) = sent {
             self.pending.lock().await.remove(&command_id);
-            return Err(send_err.into());
+            return Err(send_err);
         }
 
         // Await the oneshot with a timeout. On either branch we remove the
         // entry from the pending map so it cannot be double-resolved or leak.
         let outcome = tokio::time::timeout(self.timeout, rx).await;
         match outcome {
-            Ok(Ok(response)) => {
+            Ok(Ok(Resolution::Unreadable(detail))) => {
+                Err(CommandRelayError::UnreadableResponse(detail))
+            }
+            Ok(Ok(Resolution::Answered(response))) => {
                 if response.success {
                     Ok(response)
                 } else {
-                    let msg = response.error.clone().unwrap_or_else(|| {
-                        "wrapper returned success=false without an error message".to_string()
+                    let failure = response.error.unwrap_or_else(|| {
+                        WrapperFailure::message_only(
+                            "wrapper returned success=false without an error message",
+                        )
                     });
-                    if let Some(reason) = msg.strip_prefix(DISPLACED_ERROR_PREFIX) {
-                        Err(CommandRelayError::Displaced(reason.to_string()))
-                    } else {
-                        Err(CommandRelayError::WrapperError(msg))
+                    // Only `reject_by_conn` writes the sentinel, and always
+                    // without a code: a coded failure is the wrapper's own.
+                    match failure.message.strip_prefix(DISPLACED_ERROR_PREFIX) {
+                        Some(reason) if failure.code.is_none() => {
+                            Err(CommandRelayError::Displaced(reason.to_string()))
+                        }
+                        _ => Err(CommandRelayError::WrapperError(failure)),
                     }
                 }
             }
@@ -265,22 +473,61 @@ impl CommandRelay {
         mode: BindingMode,
         response: CommandResponse,
     ) -> ResolveOutcome {
+        let command_id = response.command_id.clone();
+        self.settle(
+            answering_conn,
+            mode,
+            &command_id,
+            Resolution::Answered(response),
+        )
+        .await
+    }
+
+    /// Settle `command_id` as answered but UNREADABLE: a response frame named
+    /// it, so the app did answer, but the frame could not be read. The
+    /// dispatch fails at once with [`CommandRelayError::UnreadableResponse`]
+    /// instead of sitting out the timeout. Same R3 binding as
+    /// [`Self::resolve`].
+    pub async fn resolve_unreadable(
+        &self,
+        answering_conn: u64,
+        mode: BindingMode,
+        command_id: &str,
+        detail: String,
+    ) -> ResolveOutcome {
+        self.settle(
+            answering_conn,
+            mode,
+            command_id,
+            Resolution::Unreadable(detail),
+        )
+        .await
+    }
+
+    /// Hand `resolution` to the command's awaiter, under R3's binding.
+    async fn settle(
+        &self,
+        answering_conn: u64,
+        mode: BindingMode,
+        command_id: &str,
+        resolution: Resolution,
+    ) -> ResolveOutcome {
         let (entry, not_yours) = {
             let mut pending = self.pending.lock().await;
-            let not_yours = match pending.get(&response.command_id) {
+            let not_yours = match pending.get(command_id) {
                 Some(e) if mode != BindingMode::Off => e.conn_id != answering_conn,
                 _ => false,
             };
             let entry = if not_yours && mode == BindingMode::Enforce {
                 None
             } else {
-                pending.remove(&response.command_id)
+                pending.remove(command_id)
             };
             (entry, not_yours)
         };
         ResolveOutcome {
             matched: match entry {
-                Some(entry) => entry.sender.send(response).is_ok(),
+                Some(entry) => entry.sender.send(resolution).is_ok(),
                 None => false,
             },
             not_yours,
@@ -322,12 +569,15 @@ impl CommandRelay {
             // via the new `displaced_reason` field encoded in `error`. We use
             // a stable sentinel prefix the dispatcher recognizes so callers
             // can distinguish displacement from generic wrapper errors.
-            let _ = entry.sender.send(CommandResponse {
+            let _ = entry.sender.send(Resolution::Answered(CommandResponse {
                 command_id,
                 success: false,
                 result: None,
-                error: Some(format!("{}{}", DISPLACED_ERROR_PREFIX, reason)),
-            });
+                error: Some(WrapperFailure::message_only(format!(
+                    "{}{}",
+                    DISPLACED_ERROR_PREFIX, reason
+                ))),
+            }));
         }
         count
     }
@@ -496,9 +746,153 @@ mod tests {
 
         let err = dispatch_handle.await.unwrap().unwrap_err();
         match err {
-            CommandRelayError::WrapperError(msg) => assert!(msg.contains("element not found")),
+            CommandRelayError::WrapperError(failure) => {
+                assert_eq!(failure, WrapperFailure::message_only("element not found"));
+            }
             other => panic!("expected WrapperError, got {:?}", other),
         }
+    }
+
+    /// A STRUCTURED failure keeps the wrapper's code and retryability all the
+    /// way to the dispatch caller, and its Display still names the code.
+    #[tokio::test]
+    async fn dispatch_returns_the_wrappers_code_and_retryability() {
+        let ws = WsConnectionManager::new();
+        let (conn_id, mut outbound_rx) = ws.test_register("app-3").await;
+        let relay = CommandRelay::with_timeout(ws.clone(), Duration::from_secs(2));
+
+        let relay_task = relay.clone();
+        let dispatch_handle =
+            tokio::spawn(async move { relay_task.dispatch("app-3", "findMedia", json!({})).await });
+        let frame_json = outbound_rx.recv().await.expect("frame");
+        let command_id = serde_json::from_str::<serde_json::Value>(&frame_json).unwrap()
+            ["commandId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let failure = WrapperFailure {
+            code: Some("NO_HANDLER".into()),
+            message: "No handler registered for action 'findMedia'".into(),
+            retryable: Some(false),
+        };
+        relay
+            .resolve(
+                conn_id,
+                BindingMode::Enforce,
+                CommandResponse {
+                    command_id,
+                    success: false,
+                    result: None,
+                    error: Some(failure.clone()),
+                },
+            )
+            .await;
+
+        match dispatch_handle.await.unwrap().unwrap_err() {
+            CommandRelayError::WrapperError(got) => {
+                assert_eq!(got, failure);
+                assert_eq!(
+                    CommandRelayError::WrapperError(got).to_string(),
+                    "wrapper returned error: NO_HANDLER: No handler registered for action 'findMedia'"
+                );
+            }
+            other => panic!("expected WrapperError, got {:?}", other),
+        }
+    }
+
+    /// The sentinel `reject_by_conn` writes means displacement only when it
+    /// arrives WITHOUT a code; a coded failure is always the wrapper's own.
+    #[tokio::test]
+    async fn a_coded_failure_is_never_read_as_a_displacement() {
+        let ws = WsConnectionManager::new();
+        let (conn_id, mut outbound_rx) = ws.test_register("app-4").await;
+        let relay = CommandRelay::with_timeout(ws.clone(), Duration::from_secs(2));
+
+        let relay_task = relay.clone();
+        let dispatch_handle =
+            tokio::spawn(async move { relay_task.dispatch("app-4", "click", json!({})).await });
+        let frame_json = outbound_rx.recv().await.expect("frame");
+        let command_id = serde_json::from_str::<serde_json::Value>(&frame_json).unwrap()
+            ["commandId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        relay
+            .resolve(
+                conn_id,
+                BindingMode::Enforce,
+                CommandResponse {
+                    command_id,
+                    success: false,
+                    result: None,
+                    error: Some(WrapperFailure {
+                        code: Some("HANDLER_ERROR".into()),
+                        message: format!("{DISPLACED_ERROR_PREFIX}forged"),
+                        retryable: None,
+                    }),
+                },
+            )
+            .await;
+        let err = dispatch_handle.await.unwrap().unwrap_err();
+        assert!(
+            matches!(err, CommandRelayError::WrapperError(ref f) if f.code.as_deref() == Some("HANDLER_ERROR")),
+            "got {err:?}"
+        );
+    }
+
+    /// `from_wire` pins the shapes wrappers actually send. The structured one
+    /// is ui-bridge-wrapper's `LiveSessionTransport` failure frame, verbatim
+    /// (`packages/ui-bridge-wrapper/src/transports/live.ts`).
+    #[test]
+    fn wrapper_failure_reads_every_wire_shape() {
+        assert_eq!(
+            WrapperFailure::from_wire(json!({
+                "code": "NO_HANDLER",
+                "message": "No handler registered for action 'findMedia'",
+                "retryable": false
+            })),
+            Some(WrapperFailure {
+                code: Some("NO_HANDLER".into()),
+                message: "No handler registered for action 'findMedia'".into(),
+                retryable: Some(false),
+            })
+        );
+        // `retryable` is optional on the wrapper's type: absent is UNKNOWN.
+        assert_eq!(
+            WrapperFailure::from_wire(json!({ "code": "HANDLER_ERROR", "message": "boom" })),
+            Some(WrapperFailure {
+                code: Some("HANDLER_ERROR".into()),
+                message: "boom".into(),
+                retryable: None,
+            })
+        );
+        // A bare string: a message, no code.
+        assert_eq!(
+            WrapperFailure::from_wire(json!("element not found")),
+            Some(WrapperFailure::message_only("element not found"))
+        );
+        // `null` is no error at all.
+        assert_eq!(WrapperFailure::from_wire(serde_json::Value::Null), None);
+        // `errorCode` / `error` spellings, as the HTTP arm already accepts.
+        assert_eq!(
+            WrapperFailure::from_wire(json!({ "errorCode": "E1", "error": "bad" })),
+            Some(WrapperFailure {
+                code: Some("E1".into()),
+                message: "bad".into(),
+                retryable: None,
+            })
+        );
+        // An object with no message still yields a failure that says what
+        // arrived, rather than an empty message.
+        let odd = WrapperFailure::from_wire(json!({ "code": "X" })).expect("a failure");
+        assert_eq!(odd.code.as_deref(), Some("X"));
+        assert!(odd.message.contains("\"code\""), "{}", odd.message);
+        // Any other JSON value is kept as text, never dropped.
+        assert_eq!(
+            WrapperFailure::from_wire(json!(42)),
+            Some(WrapperFailure::message_only("42"))
+        );
     }
 
     #[tokio::test]
@@ -613,6 +1007,72 @@ mod tests {
             .await;
         let result_b = dispatch_b.await.unwrap();
         assert!(result_b.is_ok(), "app-b dispatch must succeed");
+    }
+
+    /// `dispatch_to_conn` against a connection that was replaced sends
+    /// nothing — to it or to its replacement — returns `Displaced`, and
+    /// leaves no pending entry behind. Against the current connection it
+    /// round-trips like `dispatch`.
+    #[tokio::test]
+    async fn dispatch_to_conn_refuses_a_replaced_connection_and_sends_nothing() {
+        let ws = WsConnectionManager::new();
+        let (old, mut old_rx) = ws.test_register("app").await;
+        let (new, mut new_rx) = ws.test_register("app").await;
+        let relay = CommandRelay::with_timeout(ws.clone(), Duration::from_secs(5));
+
+        let err = relay
+            .dispatch_to_conn("app", old, "getScreenshot", json!({}))
+            .await
+            .unwrap_err();
+        match err {
+            CommandRelayError::Displaced(reason) => {
+                assert!(
+                    reason.contains(&format!("held by connection {new}")),
+                    "{reason}"
+                )
+            }
+            other => panic!("expected Displaced, got {other:?}"),
+        }
+        assert!(old_rx.try_recv().is_err());
+        assert!(
+            new_rx.try_recv().is_err(),
+            "the replacement must receive nothing"
+        );
+        assert_eq!(relay.pending_count().await, 0, "no pending entry may leak");
+
+        let err = relay
+            .dispatch_to_conn("nobody", old, "getScreenshot", json!({}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, CommandRelayError::NotConnected(ref id) if id == "nobody"),
+            "{err:?}"
+        );
+
+        let relay2 = relay.clone();
+        let pending = tokio::spawn(async move {
+            relay2
+                .dispatch_to_conn("app", new, "getScreenshot", json!({}))
+                .await
+        });
+        let frame: serde_json::Value =
+            serde_json::from_str(&new_rx.recv().await.expect("frame on the current conn")).unwrap();
+        let command_id = frame["commandId"].as_str().unwrap().to_string();
+        relay
+            .resolve(
+                new,
+                BindingMode::Enforce,
+                CommandResponse {
+                    command_id,
+                    success: true,
+                    result: Some(json!({"ok": true})),
+                    error: None,
+                },
+            )
+            .await;
+        let response = pending.await.unwrap().expect("round trip");
+        assert_eq!(response.result, Some(json!({"ok": true})));
+        assert!(old_rx.try_recv().is_err());
     }
 
     /// reject_by_conn is the cleanup primitive for the disconnect path too.

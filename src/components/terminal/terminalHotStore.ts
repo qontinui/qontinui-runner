@@ -57,6 +57,12 @@ export interface HotMaps {
   pendingYieldRequests: Record<string, IncomingYieldRequest[]>;
   /** Incoming long-wait signals, keyed by the WAITER tab id. */
   pendingLongWaitSignals: Record<string, IncomingLongWaitSignal[]>;
+  /**
+   * Total bytes the tab's PTY has produced, as the runner counts them: the end
+   * of the newest `terminal-output` chunk (`offset + length`) or an activity
+   * digest's `totalBytesProduced`. Absent when no source has reported a total.
+   */
+  totalBytes: Record<string, number>;
 }
 
 export type HotField = keyof HotMaps;
@@ -69,6 +75,8 @@ export interface TabHotSlice {
   lockState: LockState | undefined;
   yieldRequests: IncomingYieldRequest[];
   longWaitSignals: IncomingLongWaitSignal[];
+  /** `undefined` = no total observed yet (UNKNOWN, never zero). */
+  totalBytes: number | undefined;
 }
 
 type Listener = () => void;
@@ -88,6 +96,7 @@ export const EMPTY_TAB_SLICE: TabHotSlice = Object.freeze({
   lockState: undefined,
   yieldRequests: EMPTY_YIELD_REQUESTS,
   longWaitSignals: EMPTY_LONG_WAIT_SIGNALS,
+  totalBytes: undefined,
 });
 
 const HOT_FIELDS: HotField[] = [
@@ -97,6 +106,7 @@ const HOT_FIELDS: HotField[] = [
   "lockStates",
   "pendingYieldRequests",
   "pendingLongWaitSignals",
+  "totalBytes",
 ];
 
 function emptyMaps(): HotMaps {
@@ -107,6 +117,7 @@ function emptyMaps(): HotMaps {
     lockStates: {},
     pendingYieldRequests: {},
     pendingLongWaitSignals: {},
+    totalBytes: {},
   };
 }
 
@@ -165,6 +176,7 @@ export class TerminalHotStore {
       lockState: this.maps.lockStates[tabId],
       yieldRequests: this.maps.pendingYieldRequests[tabId] ?? EMPTY_YIELD_REQUESTS,
       longWaitSignals: this.maps.pendingLongWaitSignals[tabId] ?? EMPTY_LONG_WAIT_SIGNALS,
+      totalBytes: this.maps.totalBytes[tabId],
     };
     this.tabSlices.set(tabId, slice);
     return slice;
@@ -233,6 +245,20 @@ export class TerminalHotStore {
     if (prev[tabId] === lines) return;
     this.maps.lastOutputLines = { ...prev, [tabId]: lines };
     this.publish("lastOutputLines", [tabId]);
+  }
+
+  /**
+   * Record a tab's total output. The count only grows, so a reading at or
+   * below the stored one (an activity digest that lags the output stream, or a
+   * replayed chunk) is ignored rather than moving the figure backwards.
+   */
+  noteTabTotalBytes(tabId: string, total: number): void {
+    if (!Number.isFinite(total) || total < 0) return;
+    const prev = this.maps.totalBytes;
+    const current = prev[tabId];
+    if (current !== undefined && total <= current) return;
+    this.maps.totalBytes = { ...prev, [tabId]: total };
+    this.publish("totalBytes", [tabId]);
   }
 
   /**

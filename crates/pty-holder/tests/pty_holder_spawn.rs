@@ -14,6 +14,8 @@
 //! here, not passed.
 #![cfg(unix)]
 
+mod common;
+
 use std::io::{BufRead, BufReader};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -113,7 +115,10 @@ fn pty_holder_spawn_parent_helper() {
                 h.holder_pid,
                 h.child_pid,
                 h.route.as_str(),
-                h.unprotected.as_ref().map(|u| u.to_string()).unwrap_or_default()
+                h.unprotected
+                    .as_ref()
+                    .map(|u| u.to_string())
+                    .unwrap_or_default()
             );
             // Keep the Child handle alive, exactly as a runner would, until
             // the outer test kills this process.
@@ -156,7 +161,10 @@ fn pty_holder_spawn_spawns_attaches_and_tears_down() {
     }
     if let Some((ppid, sid)) = ppid_and_session(child_pid) {
         assert_eq!(ppid, holder as i32, "the PTY child is the holder's");
-        assert_eq!(sid, child_pid as i32, "and leads its own session on the PTY");
+        assert_eq!(
+            sid, child_pid as i32,
+            "and leads its own session on the PTY"
+        );
     }
     let s = connect(&dir, &pane, soon())
         .unwrap()
@@ -173,7 +181,7 @@ fn pty_holder_spawn_spawns_attaches_and_tears_down() {
     }
     assert!(!alive(holder), "teardown reaped the holder");
     assert!(!alive(child_pid), "teardown ended the PTY child");
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }
 
 /// A second spawn for a live pane is the holder's typed `lock_held`, and the
@@ -188,9 +196,12 @@ fn pty_holder_spawn_second_spawn_for_a_live_pane_is_lock_held() {
     assert_eq!(err.holder_error_kind(), Some("lock_held"), "{err}");
     assert!(matches!(err, SpawnError::HolderFailed { .. }));
     assert!(alive(first.holder_pid) && alive(first.child_pid));
-    assert!(!dir.join("p1.spec").exists(), "the failed attempt's spec is gone");
+    assert!(
+        !dir.join("p1.spec").exists(),
+        "the failed attempt's spec is gone"
+    );
     first.teardown();
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }
 
 /// A FORCED plain route: inside a systemd unit cgroup the holder is returned
@@ -206,7 +217,10 @@ fn pty_holder_spawn_plain_route_flags_an_unprotected_cgroup() {
     let h = spawn_holder(&req).expect("plain spawn");
     assert_eq!(h.route, ResolvedRoute::Plain);
     let in_unit = HostFacts::probe().in_unit_cgroup;
-    eprintln!("pty_holder_spawn: plain in_unit_cgroup={in_unit} unprotected={:?}", h.unprotected);
+    eprintln!(
+        "pty_holder_spawn: plain in_unit_cgroup={in_unit} unprotected={:?}",
+        h.unprotected
+    );
     assert_eq!(
         h.unprotected,
         in_unit.then_some(Unprotected::Cgroup {
@@ -214,7 +228,7 @@ fn pty_holder_spawn_plain_route_flags_an_unprotected_cgroup() {
         })
     );
     h.teardown();
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }
 
 /// A holder executable that is not one: typed failure, nothing left behind.
@@ -229,7 +243,7 @@ fn pty_holder_spawn_bad_executable_fails_typed() {
     let err = spawn_holder(&req).unwrap_err();
     assert!(matches!(err, SpawnError::Spawn(_)), "{err}");
     assert!(!dir.join("p1.spec").exists());
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }
 
 /// The headline property for the spawn path (Phase 0's GO, re-run on the real
@@ -307,5 +321,5 @@ fn pty_holder_spawn_holder_survives_sigkill_of_its_spawner() {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(!alive(child), "cleanup: the child is gone");
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = common::remove_pane_dir(&dir);
 }

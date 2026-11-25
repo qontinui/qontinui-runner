@@ -46,7 +46,7 @@ struct PutActiveTenant {
 
 /// GET /tenant/active
 ///
-/// `{ active_tenant_id, source, pin, candidates }` — the same view the
+/// `{ active_tenant_id, source, pin, candidates, credentials }` — the same view the
 /// `get_active_tenant` Tauri command returns.
 async fn get_active_tenant() -> Result<Json<ApiResponse<ActiveTenantView>>, HandlerError> {
     let view = spawn_blocking_tracked(active_tenant_view)
@@ -89,9 +89,10 @@ fn status_for(err: &SetActiveTenantError) -> StatusCode {
 /// A write failure after the checks passed is 500 `MACHINE_JSON_WRITE_FAILED`.
 ///
 /// On success `data.takes_effect` is `"mixed"`: `data.surfaces` lists each pin
-/// consumer with `timing` `live` or `next_start`. Three surfaces are
-/// `next_start`, read once at startup: the dual-write gate, the coord-mcp
-/// nonce restore and the boot reconcile's on-disk nonce adoption.
+/// consumer with `timing` `live` or `next_start`. Two surfaces are
+/// `next_start`, read once at startup: the coord-mcp nonce restore and the
+/// boot reconcile's on-disk nonce adoption. The dual-write gate is `live`: its
+/// flag poll re-reads the pin each tick.
 /// `data.existing_sessions` counts this process's device coord-mcp keys, live
 /// AND graced (an evicted key keeps serving for the grace TTL): those pinned
 /// at creation keep their tenant, and those that were unpinned follow the new
@@ -164,6 +165,9 @@ mod tests {
     /// A fixture machine with an identity, pinned to A, bound to A and B.
     fn fixture() -> (IsolatedAmbient, std::path::PathBuf) {
         let amb = IsolatedAmbient::new();
+        // The view now classifies each candidate's credential; keep that read
+        // off the operator's real OS keychain. Restored when `amb` drops.
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
         let machine = amb.write_machine_json(&format!(
             r#"{{"device_id":"11111111-0000-4000-8000-000000000001","hostname":"box","active_tenant_id":"{TENANT_A}"}}"#
         ));
@@ -216,6 +220,20 @@ mod tests {
         assert_eq!(data["source"], "machine.json");
         assert_eq!(data["pin"], "pinned");
         assert_eq!(data["candidates"], serde_json::json!([TENANT_A, TENANT_B]));
+        // One credential entry per candidate, in candidate order — the HTTP
+        // door serves the same projection the Tauri command does.
+        let creds = data["credentials"]
+            .as_array()
+            .expect("credentials is served");
+        let tenants: Vec<&str> = creds
+            .iter()
+            .map(|c| c["tenant"].as_str().unwrap())
+            .collect();
+        assert_eq!(tenants, vec![TENANT_A, TENANT_B]);
+        for c in creds {
+            assert!(c["slot"].is_string(), "{c}");
+            assert!(c.get("can_act").is_some(), "{c}");
+        }
     }
 
     #[tokio::test]
@@ -303,7 +321,8 @@ mod tests {
 
     /// The per-surface effect report: every surface names a timing of `live`
     /// or `next_start` and a non-empty evidence locator, both timings occur,
-    /// the two startup readers are the ones classified `next_start`, and the
+    /// the two startup readers are the ones classified `next_start` (the
+    /// dual-write gate is `live`), and the
     /// running-session census carries both counts.
     #[tokio::test]
     async fn put_reports_per_surface_effect_timing_and_a_session_census() {
@@ -340,10 +359,23 @@ mod tests {
             next_start,
             [
                 "coord_mcp_nonce_restore",
-                "coord_mcp_on_disk_nonce_adoption",
-                "session_coordination_dual_write_gate"
+                "coord_mcp_on_disk_nonce_adoption"
             ],
             "exactly the startup readers are next_start"
+        );
+        let gate = surfaces
+            .iter()
+            .find(|s| s["surface"] == "session_coordination_dual_write_gate")
+            .expect("the dual-write gate is a reported surface");
+        assert_eq!(
+            gate["timing"], "live",
+            "the dual-write flag poll re-reads the pin each tick, so a PUT reaches it live"
+        );
+        assert!(
+            gate["evidence"].as_array().is_some_and(|e| e
+                .iter()
+                .any(|r| r == "session/coord_sync.rs::run_flag_poll_loop")),
+            "the gate's reader is the flag poll loop: {gate}"
         );
 
         let existing = &data["existing_sessions"];

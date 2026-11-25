@@ -224,8 +224,10 @@ struct ClaimResponse {
 /// and is surfaced for tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PollOutcome {
-    /// Consent gate closed — no calls made.
+    /// The user's consent (`cloud_sync_enabled`) is off — no calls made.
     ConsentOff,
+    /// The tenant's `egress_transcript_sync` switch is off — no calls made.
+    EgressOff,
     /// Unpaired (no device JWT) — no calls made.
     NoAuth,
     /// Claim returned no jobs.
@@ -258,6 +260,8 @@ pub struct MemoryJobPoller {
     /// silence. The `NoAuth` branch directly below was already loud; this makes
     /// the two symmetrical.
     warned_consent_off: Once,
+    /// Warn-once latch for the TENANT's `egress_transcript_sync` switch.
+    warned_egress_off: Once,
     /// How many times the consent-warn body actually ran. `Once` guarantees
     /// at most one; this makes that guarantee ASSERTABLE from a test instead
     /// of assumed (the plan's Acceptance asks for exactly that).
@@ -271,12 +275,13 @@ impl std::fmt::Debug for MemoryJobPoller {
 }
 
 impl MemoryJobPoller {
-    /// Production constructor: consent from `Settings.cloud_sync_enabled`,
+    /// Production constructor: consent from [`crate::egress::transcript_sync_permitted`]
+    /// (the user's `Settings.cloud_sync_enabled` AND the tenant's `egress_transcript_sync`),
     /// bearer from the default device-JWT slot, synthesizer = warm Claude,
     /// embedder = the local embedding service.
     pub fn new() -> Self {
         Self::with_probes(
-            Box::new(crate::settings::get_cloud_sync_enabled),
+            Box::new(crate::egress::transcript_sync_permitted),
             Box::new(crate::auth::device_bearer),
             Arc::new(warm_synthesize),
         )
@@ -295,6 +300,7 @@ impl MemoryJobPoller {
             embedder: EmbeddingClient::new(),
             warned_no_auth: Once::new(),
             warned_consent_off: Once::new(),
+            warned_egress_off: Once::new(),
             consent_warns: AtomicUsize::new(0),
         }
     }
@@ -326,6 +332,19 @@ impl MemoryJobPoller {
 
     async fn poll_once_inner(&self, client: &reqwest::Client, base: &str) -> PollOutcome {
         if !(self.gate)() {
+            // The gate is the user's toggle AND the tenant's switch; name the
+            // one that closed it, so `/health` and the log blame the right
+            // setting.
+            if !crate::egress::permit(crate::egress::Flow::TranscriptSync).allowed {
+                self.warned_egress_off.call_once(|| {
+                    warn!(
+                        "memory_jobs: egress_transcript_sync is off for this project — job \
+                         poller idle (no jobs will be claimed). It is the tenant's switch, \
+                         changed in the web console under Coord → Tenant policy."
+                    );
+                });
+                return PollOutcome::EgressOff;
+            }
             self.warned_consent_off.call_once(|| {
                 self.consent_warns.fetch_add(1, Ordering::Relaxed);
                 warn!(
@@ -751,6 +770,7 @@ const OUTCOME_IDLE: u8 = 4;
 const OUTCOME_DISABLED: u8 = 5;
 const OUTCOME_PROCESSED: u8 = 6;
 const OUTCOME_RETRY: u8 = 7;
+const OUTCOME_EGRESS_OFF: u8 = 8;
 
 /// Set once the poll loop task has been spawned.
 static POLLER_SPAWNED: AtomicBool = AtomicBool::new(false);
@@ -762,6 +782,7 @@ static POLLER_LAST_TICK_UNIX_MS: AtomicU64 = AtomicU64::new(0);
 fn outcome_code(outcome: &PollOutcome) -> u8 {
     match outcome {
         PollOutcome::ConsentOff => OUTCOME_CONSENT_OFF,
+        PollOutcome::EgressOff => OUTCOME_EGRESS_OFF,
         PollOutcome::NoAuth => OUTCOME_NO_AUTH,
         PollOutcome::Idle => OUTCOME_IDLE,
         PollOutcome::Disabled(_) => OUTCOME_DISABLED,
@@ -788,6 +809,11 @@ fn render_poller_health(spawned: bool, code: u8, last_tick_unix_ms: u64) -> Json
     let (last_outcome, gates_open, blocked_by): (Option<&str>, Option<bool>, Option<&str>) =
         match code {
             OUTCOME_CONSENT_OFF => (Some("consent_off"), Some(false), Some("cloud_sync_enabled")),
+            OUTCOME_EGRESS_OFF => (
+                Some("egress_off"),
+                Some(false),
+                Some("egress_transcript_sync"),
+            ),
             OUTCOME_NO_AUTH => (Some("no_auth"), Some(false), Some("device_jwt")),
             OUTCOME_NO_WEB_BASE => (Some("no_web_base"), Some(false), Some("web_backend_base")),
             OUTCOME_IDLE => (Some("idle"), Some(true), None),
@@ -880,6 +906,7 @@ async fn run_poll_loop(poller: Arc<MemoryJobPoller>) {
             PollOutcome::Processed(_)
             | PollOutcome::Idle
             | PollOutcome::ConsentOff
+            | PollOutcome::EgressOff
             | PollOutcome::NoAuth
             | PollOutcome::Disabled(_) => {
                 backoff = BACKOFF_INITIAL;
@@ -1180,6 +1207,23 @@ mod tests {
         assert_eq!(h["lastTickUnixMs"], json!(1_700_000_000_000u64));
     }
 
+    /// L3: when the TENANT's `egress_transcript_sync` switch is what closed the
+    /// gate, `/health` names that switch — not the user's toggle.
+    #[tokio::test]
+    async fn poller_health_names_the_tenant_switch_when_it_closed_the_gate() {
+        use crate::egress::{test_support::pin, Flow, Level};
+        let _pin = pin(Flow::TranscriptSync, Level::Off);
+        let p = MemoryJobPoller::with_probes(
+            Box::new(|| crate::egress::transcript_sync_permitted_with(|| true)),
+            Box::new(|| None),
+            ok_synth(),
+        );
+        let client = reqwest::Client::new();
+        let outcome = p.poll_once_inner(&client, "http://127.0.0.1:9").await;
+        let h = render_poller_health(true, outcome_code(&outcome), 1);
+        assert_eq!(h["blockedBy"], json!("egress_transcript_sync"));
+    }
+
     /// `gatesOpen` is "did the claim go out", not "did the work succeed":
     /// `disabled` and `retry` both cleared consent + auth + base.
     #[test]
@@ -1204,6 +1248,7 @@ mod tests {
     fn every_poll_outcome_has_a_health_code() {
         let all = [
             PollOutcome::ConsentOff,
+            PollOutcome::EgressOff,
             PollOutcome::NoAuth,
             PollOutcome::Idle,
             PollOutcome::Disabled("x"),

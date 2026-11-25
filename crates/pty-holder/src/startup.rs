@@ -38,6 +38,14 @@
 /// Close every fd >= 3 this process inherited.
 #[cfg(unix)]
 pub fn close_inherited_fds() {
+    close_inherited_fds_except(&[]);
+}
+
+/// [`close_inherited_fds`], keeping `keep` open — a holder upgrade's successor
+/// (plan Phase 8) inherits its pane's master, lock and control channel at
+/// fixed numbers (`crate::handoff`) and must close everything else.
+#[cfg(unix)]
+pub fn close_inherited_fds_except(keep: &[i32]) {
     let dir = if std::path::Path::new("/proc/self/fd").is_dir() {
         "/proc/self/fd"
     } else {
@@ -52,7 +60,7 @@ pub fn close_inherited_fds() {
             .collect(),
         Err(_) => return,
     };
-    for fd in fds.into_iter().filter(|&fd| fd > 2) {
+    for fd in fds.into_iter().filter(|&fd| fd > 2 && !keep.contains(&fd)) {
         // SAFETY: closing an fd number this process owns; nothing in this
         // process holds a Rust handle to any fd >= 3 at this point (callers run
         // this first thing in `main`).
@@ -139,3 +147,32 @@ pub fn silence_stdio() {
 /// the spawner's pipes, which close when the spawner reads EOF or exits.
 #[cfg(not(unix))]
 pub fn silence_stdio() {}
+
+/// Write the holder's one report line to `<pane-dir>/<pane-id>.report`, for a
+/// spawner that gave it no stdout pipe (the Windows WMI route, Phase 3; the
+/// holder is told so with `--report`). Atomic: written to a `.report-tmp` beside it,
+/// mode 0600, then renamed over — a spawner polling for the file never reads
+/// half a line.
+pub fn write_report(
+    pane_dir: &std::path::Path,
+    pane: &crate::pane::PaneId,
+    line: &str,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let path = crate::pane::report_path(pane_dir, pane);
+    let tmp = crate::pane::report_tmp_path(pane_dir, pane);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // A symlink planted at the temp path is refused, never written through.
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut f = opts.open(&tmp)?;
+    f.write_all(line.as_bytes())?;
+    f.write_all(b"\n")?;
+    f.sync_data()?;
+    drop(f);
+    std::fs::rename(&tmp, &path)
+}

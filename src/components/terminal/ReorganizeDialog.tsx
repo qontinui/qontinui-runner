@@ -11,6 +11,7 @@ import { X, Loader2, Check, AlertTriangle } from "lucide-react";
 import { executeAiTask } from "@/hooks/useAiTaskPolling";
 import { getApiPort } from "@/lib/runner-api";
 import type { TerminalPageConfig } from "./useTerminalPages";
+import { normalizeReorganizeGroups } from "./reorganizePlan";
 
 interface ReorganizeDialogProps {
   pages: TerminalPageConfig[];
@@ -199,7 +200,9 @@ Return this exact JSON format:
     if (!proposal) return;
     setState("applying");
     try {
-      await onApply(proposal);
+      // Trimmed so the apply's exact-name page lookup matches what
+      // `uniquePageName` stores (see `normalizeReorganizeGroups`).
+      await onApply({ ...proposal, pages: normalizeReorganizeGroups(proposal.pages) });
       setState("done");
     } catch (err) {
       setError(String(err));

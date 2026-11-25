@@ -49,6 +49,8 @@ static FRONTIER_UPSERTS: AtomicU64 = AtomicU64::new(0);
 static WRITES_NOT_ATTEMPTED: AtomicU64 = AtomicU64::new(0);
 static WRITE_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static PENDING_OPEN: AtomicU64 = AtomicU64::new(0);
+static TIMELINES_WRITTEN: AtomicU64 = AtomicU64::new(0);
+static TIMELINES_UNPARSEABLE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Default)]
 struct Recent {
@@ -59,6 +61,7 @@ struct Recent {
     last_prune_at: Option<String>,
     last_prune_deleted: Option<u64>,
     last_prune_skipped: Option<String>,
+    last_timeline_error: Option<String>,
 }
 
 fn recent() -> &'static Mutex<Recent> {
@@ -84,9 +87,13 @@ fn push_outcome(ok: bool, error: Option<String>) {
     }
 }
 
-/// An edge row landed; `frontier_cleared` rows left the frontier with it.
-pub(crate) fn record_edge_written(frontier_cleared: u64) {
+/// An edge row landed; `frontier_cleared` rows left the frontier with it;
+/// `with_timeline` = its `timeline` column was written (plan Phase 4).
+pub(crate) fn record_edge_written(frontier_cleared: u64, with_timeline: bool) {
     EDGES_WRITTEN.fetch_add(1, Ordering::Relaxed);
+    if with_timeline {
+        TIMELINES_WRITTEN.fetch_add(1, Ordering::Relaxed);
+    }
     FRONTIER_ROWS_CLEARED.fetch_add(frontier_cleared, Ordering::Relaxed);
     push_outcome(true, None);
 }
@@ -103,6 +110,19 @@ pub(crate) fn record_write_failure(error: String) {
     tracing::warn!("journey ledger write failed: {}", error);
     WRITE_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
     push_outcome(false, Some(error));
+}
+
+/// An execute-with-diff response carried a `timeline` that is not a
+/// `ChangeTimeline`. The edge is still recorded, with a NULL timeline; this
+/// count is what keeps "no timeline stored" from reading as "none sent".
+pub(crate) fn record_timeline_unparseable(error: String) {
+    tracing::warn!(
+        "journey: execute-with-diff timeline did not parse: {}",
+        error
+    );
+    TIMELINES_UNPARSEABLE.fetch_add(1, Ordering::Relaxed);
+    let mut r = recent().lock().unwrap_or_else(|p| p.into_inner());
+    r.last_timeline_error = Some(error);
 }
 
 /// A write was not attempted because the probe said the schema cannot take
@@ -215,6 +235,11 @@ pub struct JourneyCounters {
     /// Writes skipped because the probe said the schema cannot take them.
     pub writes_not_attempted: u64,
     pub write_failures_total: u64,
+    /// Edges written with a `timeline` (plan Phase 4).
+    pub timelines_written: u64,
+    /// Execute-with-diff timelines that did not parse and were not stored.
+    pub timelines_unparseable: u64,
+    pub last_timeline_error: Option<String>,
     pub recent_write_failures: u64,
     pub recent_window: u64,
     pub last_write_at: Option<String>,
@@ -261,6 +286,9 @@ pub(crate) fn snapshot_health(app_id: String) -> JourneyHealthResponse {
                 frontier_rows_cleared: FRONTIER_ROWS_CLEARED.load(Ordering::Relaxed),
                 writes_not_attempted: WRITES_NOT_ATTEMPTED.load(Ordering::Relaxed),
                 write_failures_total: WRITE_FAILURES_TOTAL.load(Ordering::Relaxed),
+                timelines_written: TIMELINES_WRITTEN.load(Ordering::Relaxed),
+                timelines_unparseable: TIMELINES_UNPARSEABLE.load(Ordering::Relaxed),
+                last_timeline_error: r.last_timeline_error.clone(),
                 recent_write_failures: failures as u64,
                 recent_window: RECENT_WINDOW as u64,
                 last_write_at: r.last_write_at.clone(),

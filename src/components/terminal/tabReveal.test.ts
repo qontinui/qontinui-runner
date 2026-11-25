@@ -80,6 +80,30 @@ describe("planTabReveal", () => {
   });
 });
 
+describe("planTabReveal under tmux mode's pinned `single` layout", () => {
+  // tmux mode pins the layout to `single` (one zone) and zone 0 holds the
+  // shown tab, so a session-manager click — `onFocusSessionTab`, unchanged —
+  // already swaps: every off-screen tab plans `{ zone: 0, assign: true }`.
+  it("swaps an off-screen tab into zone 0", () => {
+    expect(planTabReveal({ 0: "shown" }, 1, 0, "hidden")).toEqual({ zone: 0, assign: true });
+  });
+
+  it("swaps into zone 0 even while zone 0 is reserved for a restoring record", () => {
+    expect(planTabReveal({ 0: "shown" }, 1, 0, "hidden", new Set([0]))).toEqual({
+      zone: 0,
+      assign: true,
+    });
+  });
+
+  it("fills an empty zone 0 (the last tab closed, nothing shown yet)", () => {
+    expect(planTabReveal({}, 1, 0, "hidden")).toEqual({ zone: 0, assign: true });
+  });
+
+  it("only focuses the tab already on screen — no reassignment", () => {
+    expect(planTabReveal({ 0: "shown" }, 1, 0, "shown")).toEqual({ zone: 0, assign: false });
+  });
+});
+
 describe("liveTabIdForSession — which card clicks go to a terminal", () => {
   const real = { injected_live_status: null, injected_tab: null };
   const tabs = [
@@ -101,6 +125,14 @@ describe("liveTabIdForSession — which card clicks go to a terminal", () => {
 
   it("keeps the transcript for a tab id this window does not render", () => {
     expect(liveTabIdForSession({ zoneTabId: "t-gone", _transcript: real }, tabs)).toBeNull();
+  });
+
+  it("routes a tab-sourced row (no transcript) to its own live tab", () => {
+    expect(liveTabIdForSession({ zoneTabId: "t-live", _transcript: null }, tabs)).toBe("t-live");
+  });
+
+  it("routes nowhere for a tab-sourced row whose tab has since exited", () => {
+    expect(liveTabIdForSession({ zoneTabId: "t-dead", _transcript: null }, tabs)).toBeNull();
   });
 
   it("keeps the transcript for an injected fixture even when its tab id matches", () => {

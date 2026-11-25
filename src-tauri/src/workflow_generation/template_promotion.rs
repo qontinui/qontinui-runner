@@ -135,7 +135,8 @@ fn extract_parameters(workflow_json: &serde_json::Value) -> Vec<TemplateParamete
                 name: "app_url".to_string(),
                 description: "Application URL or host:port".to_string(),
                 default_value: s.clone(),
-                extraction_pattern: r"https?://[^\s/]+(?::\d+)?|localhost:\d+".to_string(),
+                extraction_pattern: r"https?://[^\s/]+(?::\d+)?|(?:localhost|127\.0\.0\.1):\d+"
+                    .to_string(),
             });
         }
 
@@ -345,6 +346,7 @@ mod tests {
         assert!(is_url_pattern("http://localhost:3000"));
         assert!(is_url_pattern("https://example.com/api"));
         assert!(is_url_pattern("localhost:8080"));
+        assert!(is_url_pattern("127.0.0.1:9876"));
         assert!(!is_url_pattern("hello world"));
         assert!(!is_url_pattern("cargo test"));
     }
@@ -386,6 +388,26 @@ mod tests {
         });
         let params = extract_parameters(&json);
         assert!(params.iter().any(|p| p.name == "app_url"));
+    }
+
+    /// The `app_url` extraction pattern recognises a scheme-less host:port in
+    /// either loopback spelling (the runner emits `127.0.0.1` since plan
+    /// 2026-10-25-runner-self-calls-dial-localhost-and-pay-a-doomed-ipv6-connect).
+    #[test]
+    fn test_app_url_extraction_pattern_matches_both_loopback_spellings() {
+        let json = serde_json::json!({"command": "curl 127.0.0.1:9876/health"});
+        let params = extract_parameters(&json);
+        let app_url = params
+            .iter()
+            .find(|p| p.name == "app_url")
+            .expect("an app_url parameter");
+        let re = regex::Regex::new(&app_url.extraction_pattern).expect("pattern compiles");
+        for (text, want) in [
+            ("curl 127.0.0.1:9876/health", "127.0.0.1:9876"),
+            ("curl localhost:3000/x", "localhost:3000"),
+        ] {
+            assert_eq!(re.find(text).map(|m| m.as_str()), Some(want), "{text}");
+        }
     }
 
     #[test]

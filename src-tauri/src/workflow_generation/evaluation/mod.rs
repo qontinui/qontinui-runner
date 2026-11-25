@@ -638,7 +638,8 @@ fn detect_target_family(
 /// 1. If `target_family` is `Control`, no step may reference the
 ///    `/ui-bridge/sdk/` path — that endpoint drives external SDK apps, not
 ///    the runner's own UI.
-/// 2. Any `localhost:<digits>/ui-bridge/...` occurrence must use
+/// 2. Any `localhost:<digits>/ui-bridge/...` or `127.0.0.1:<digits>/ui-bridge/...`
+///    occurrence must use
 ///    `<digits> == runner_port` — otherwise the workflow talks to a
 ///    different runner instance (or the default 9876 while bound elsewhere).
 ///
@@ -652,41 +653,45 @@ fn check_ui_bridge_url_invariants(
 
     let mut violations: Vec<String> = Vec::new();
 
-    // Regex-free scanner for `localhost:<digits>/ui-bridge/...` so we don't
-    // add a dependency just for this check.
-    fn find_wrong_port_violations(cmd: &str, runner_port: u16) -> Vec<u16> {
-        let mut wrong: Vec<u16> = Vec::new();
-        let needle = "localhost:";
+    // Regex-free scanner for `<loopback host>:<digits>/ui-bridge/...` so we
+    // don't add a dependency just for this check. BOTH loopback spellings are
+    // scanned: the runner itself emits `127.0.0.1` (plan
+    // 2026-10-25-runner-self-calls-dial-localhost-and-pay-a-doomed-ipv6-connect),
+    // and an LLM-authored step may still say `localhost`. Returns `(host, port)`
+    // for each wrong-port occurrence.
+    fn find_wrong_port_violations(cmd: &str, runner_port: u16) -> Vec<(&'static str, u16)> {
+        const HOSTS: [&str; 2] = ["localhost", "127.0.0.1"];
+        const SUFFIX: &str = "/ui-bridge/";
+        let mut wrong: Vec<(&'static str, u16)> = Vec::new();
         let bytes = cmd.as_bytes();
-        let mut i = 0;
-        while i + needle.len() < bytes.len() {
-            if &bytes[i..i + needle.len()] == needle.as_bytes() {
+        for host in HOSTS {
+            let needle = format!("{}:", host);
+            let mut i = 0;
+            while i + needle.len() < bytes.len() {
+                if &bytes[i..i + needle.len()] != needle.as_bytes() {
+                    i += 1;
+                    continue;
+                }
                 let start = i + needle.len();
                 let mut end = start;
                 while end < bytes.len() && bytes[end].is_ascii_digit() {
                     end += 1;
                 }
-                if end > start {
-                    // Must be followed by `/ui-bridge/` to be an invariant
-                    // we care about.
-                    let rest_start = end;
-                    let expected_suffix = "/ui-bridge/";
-                    if rest_start + expected_suffix.len() <= bytes.len()
-                        && &bytes[rest_start..rest_start + expected_suffix.len()]
-                            == expected_suffix.as_bytes()
+                // Must be followed by `/ui-bridge/` to be an invariant we care about.
+                if end > start
+                    && end + SUFFIX.len() <= bytes.len()
+                    && &bytes[end..end + SUFFIX.len()] == SUFFIX.as_bytes()
+                {
+                    if let Some(port) = std::str::from_utf8(&bytes[start..end])
+                        .ok()
+                        .and_then(|p| p.parse::<u16>().ok())
                     {
-                        if let Ok(port_str) = std::str::from_utf8(&bytes[start..end]) {
-                            if let Ok(port) = port_str.parse::<u16>() {
-                                if port != runner_port {
-                                    wrong.push(port);
-                                }
-                            }
+                        if port != runner_port {
+                            wrong.push((host, port));
                         }
                     }
                 }
                 i = end;
-            } else {
-                i += 1;
             }
         }
         wrong
@@ -714,13 +719,13 @@ fn check_ui_bridge_url_invariants(
             ));
         }
 
-        // Invariant 2: wrong port in `localhost:<n>/ui-bridge/...`.
-        for wrong in find_wrong_port_violations(cmd, runner_port) {
+        // Invariant 2: wrong port in `<loopback host>:<n>/ui-bridge/...`.
+        for (host, wrong) in find_wrong_port_violations(cmd, runner_port) {
             out.push(format!(
-                "UI Bridge wrong-port URL in {} step '{}': found 'localhost:{}/ui-bridge/...' \
+                "UI Bridge wrong-port URL in {} step '{}': found '{}:{}/ui-bridge/...' \
                  but this runner is bound to port {}. Phase B's URL rewriter should have \
                  replaced this.",
-                origin, step_id, wrong, runner_port
+                origin, step_id, host, wrong, runner_port
             ));
         }
     };
@@ -1096,6 +1101,50 @@ mod url_invariant_tests {
             "expected wrong-port violation mentioning both ports: {:?}",
             violations
         );
+    }
+
+    /// The runner emits `127.0.0.1` URLs since plan
+    /// 2026-10-25-runner-self-calls-dial-localhost-and-pay-a-doomed-ipv6-connect,
+    /// so the wrong-port invariant must see a wrong port under EITHER loopback
+    /// spelling, and name the spelling it found.
+    #[test]
+    fn wrong_port_is_flagged_under_each_loopback_spelling() {
+        for (cmd, host) in [
+            (
+                "curl http://localhost:9876/ui-bridge/control/snapshot",
+                "localhost",
+            ),
+            (
+                "curl http://127.0.0.1:9876/ui-bridge/control/snapshot",
+                "127.0.0.1",
+            ),
+        ] {
+            let wf = make_workflow_with_verification_steps(vec![json!({
+                "id": "step-1", "name": "Snapshot wrong port", "command": cmd,
+            })]);
+            let violations = check_ui_bridge_url_invariants(&wf, UiBridgeFamily::Control, 9877);
+            assert_eq!(violations.len(), 1, "{cmd}: {violations:?}");
+            assert!(
+                violations[0].contains(&format!("found '{host}:9876/ui-bridge/...'"))
+                    && violations[0].contains("bound to port 9877"),
+                "{cmd}: {}",
+                violations[0]
+            );
+        }
+    }
+
+    #[test]
+    fn right_port_passes_under_each_loopback_spelling() {
+        for cmd in [
+            "curl http://localhost:9877/ui-bridge/control/snapshot",
+            "curl http://127.0.0.1:9877/ui-bridge/control/snapshot",
+        ] {
+            let wf = make_workflow_with_verification_steps(vec![json!({
+                "id": "step-1", "name": "Snapshot", "command": cmd,
+            })]);
+            let violations = check_ui_bridge_url_invariants(&wf, UiBridgeFamily::Control, 9877);
+            assert!(violations.is_empty(), "{cmd}: {violations:?}");
+        }
     }
 
     #[test]

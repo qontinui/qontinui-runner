@@ -814,6 +814,7 @@ pub async fn autoconfigure_project(
 
     bind_project_processes(id.clone(), process_ids)?;
 
+    // runner-localhost-ok: a saved project's own dev server, not a runner port.
     let front_page_url = port.map(|p| format!("http://localhost:{p}"));
     if front_page_url.is_some() {
         set_project_front_page(id.clone(), front_page_url.clone())?;

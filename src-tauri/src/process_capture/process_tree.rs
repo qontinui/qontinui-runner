@@ -9,12 +9,14 @@
 //! process is doing its job. Phase 1 populates `ProcessRuntime.descendant_pids`
 //! / `service_pid`; Phase 2 reads `service_pid` to detect inner-worker death.
 //!
-//! Windows uses `Get-CimInstance Win32_Process` via PowerShell to snapshot
-//! `(ProcessId, ParentProcessId, CreationDate, Name)` for every running
-//! process, then BFS in Rust. Unix reads `/proc/<pid>/stat` for the parent and
-//! start time and `/proc/<pid>/comm` for the image name. The `Name`/`comm`
-//! image powers [`claude_present_in_inclusive_subtree`], the session-liveness
-//! signal.
+//! The table itself comes from [`super::process_table`], the runner's one
+//! shared, in-process provider: `sysinfo` on Windows (with
+//! `Get-CimInstance Win32_Process` via PowerShell kept only as its
+//! circuit-protected fallback), and on Unix `/proc/<pid>/stat` for the parent
+//! and start time and `/proc/<pid>/comm` for the image name. BFS runs in Rust.
+//! The image name is one of the two witnesses of a live `claude`; the
+//! session-liveness reads that combine it with Claude Code's own session
+//! registry live in `crate::terminal::graceful_exit::PaneLook`.
 
 use std::collections::HashMap;
 
@@ -30,6 +32,35 @@ pub struct PidWithSpawnedAt {
     /// Process creation time as Unix epoch seconds. `0` if the platform
     /// helper failed to resolve it (e.g. permission-denied on `/proc/<pid>/stat`).
     pub spawned_at_unix: i64,
+    /// The exact creation time (Windows FILETIME, 100 ns) when the table that
+    /// produced this record carried one ([`ProcessSnapshot::creation_filetimes`]).
+    /// A kill compares it EXACTLY against the live process's own; a record
+    /// without it (the WMI fallback, a non-Windows walk, or a file persisted
+    /// before this field) falls back to the second-granular window
+    /// (`health::is_same_process`). `serde(default)`: older persisted state
+    /// loads as `None`.
+    ///
+    /// Only an EXACT source may fill this: the in-process walk's
+    /// `GetProcessTimes` value. Open PR #2417 also fills `creation_filetimes`
+    /// from the CIM fallback, whose values are microsecond-truncated and can be
+    /// an hour off in the DST fall-back hour; the exact compare would refuse
+    /// every such record — fail safe, but the reap would silently stop. A
+    /// fallback-sourced time belongs in `spawned_at_unix` (the window), not here.
+    #[serde(default)]
+    pub spawned_at_ft: Option<u64>,
+}
+
+impl PidWithSpawnedAt {
+    /// `pid`'s record as `snapshot` saw it: its creation time in Unix seconds
+    /// (`0` when absent or unreadable) and its exact FILETIME when the
+    /// snapshot carries one.
+    pub fn from_snapshot(pid: u32, snapshot: &ProcessSnapshot) -> Self {
+        PidWithSpawnedAt {
+            pid,
+            spawned_at_unix: snapshot.creation_times.get(&pid).copied().unwrap_or(0),
+            spawned_at_ft: snapshot.creation_filetimes.get(&pid).copied(),
+        }
+    }
 }
 
 /// Snapshot of the process table relevant to one discovery pass.
@@ -40,9 +71,20 @@ pub struct PidWithSpawnedAt {
 /// re-querying WMI; `names[pid] -> image_name` carries each process's image
 /// (e.g. `claude.exe` on Windows, `comm` on Unix) so the session liveness
 /// poll can ask "is a live Claude process present in this subtree?" — the
-/// signal [`claude_present_in_inclusive_subtree`] reads.
-#[derive(Debug, Default)]
+/// image witness `crate::terminal::graceful_exit::PaneLook` reads.
+#[derive(Debug, Clone)]
 pub struct ProcessSnapshot {
+    /// `true` when this is NOT a fresh read: the last good snapshot served
+    /// after a failed one, or (with none) an empty table. `Default` sets it,
+    /// so a degrade arm can never present a fabricated table as fresh; only a
+    /// read that succeeded clears it ([`super::process_table`]). A kill or an
+    /// absence decision must treat it as UNKNOWN ([`Self::is_unknown`]).
+    pub stale: bool,
+    /// Wall-clock epoch millis at which the read that produced this table
+    /// BEGAN — a lower bound on when every row was observed. A memoized or
+    /// stale answer carries its original read's time, not the time it was
+    /// served. `0` when no read produced it (`Default`).
+    pub observed_at_ms: i64,
     pub parent_map: HashMap<u32, Vec<u32>>,
     pub creation_times: HashMap<u32, i64>,
     pub names: HashMap<u32, String>,
@@ -54,109 +96,81 @@ pub struct ProcessSnapshot {
     /// absent here (access denied, protected process) is treated as a real
     /// image — never as a shim.
     pub exe_paths: HashMap<u32, String>,
+    /// `creation_filetimes[pid] -> Windows FILETIME` — 100-ns ticks since
+    /// 1601-01-01 UTC, the kernel's own creation time (`GetProcessTimes`), the
+    /// same domain Claude Code writes as `procStart` in
+    /// `<config_dir>/sessions/<pid>.json`. Filled by the in-process walk
+    /// ([`super::process_table`]) for every row whose creation time it could
+    /// read and did not withhold as a pid reused mid-walk.
+    ///
+    /// Populated on Windows only. Empty elsewhere, and absent for a pid whose
+    /// creation time could not be read — which a consumer must read as
+    /// UNKNOWN, never as a match and never as a mismatch.
+    pub creation_filetimes: HashMap<u32, u64>,
+    /// `start_ticks[pid] -> /proc/<pid>/stat field 22`: the start time in clock
+    /// ticks since boot, exactly as the kernel records it. Constant for the
+    /// process's life and finer than `creation_times`' seconds (which divide
+    /// these ticks and add `btime`, a value a wall-clock step can move between
+    /// two reads), so a caller that binds a pid across two reads compares
+    /// these. Filled by the `/proc` walk ([`snapshot_process_table_sync`]) for
+    /// every row with a positive start.
+    ///
+    /// Populated on Linux only. Empty elsewhere, and absent for a pid whose
+    /// `stat` did not parse — UNKNOWN, as for `creation_filetimes`.
+    pub start_ticks: HashMap<u32, u64>,
 }
 
 /// Skew tolerance (millis) for the PID-reuse creation-time vs the reference
-/// instant comparison in [`claude_present_in_inclusive_subtree`]. Creation
+/// instant comparison in `crate::terminal::graceful_exit::PaneLook::claude_present`. Creation
 /// times come from WMI at second granularity, so a beat of rounding slack is
 /// always allowed before treating a tracked PID as reused.
 pub(crate) const PID_REUSE_SKEW_MS: i64 = 5_000;
 
-/// True iff a live Claude process is present in the **inclusive** subtree
-/// rooted at `root_pid` — i.e. `root_pid`'s own image is `claude*`, OR any
-/// descendant's image is `claude*`. This is the liveness signal the terminal-
-/// session poll uses: a session is alive iff there is a live Claude here, which
-/// is the correct question for **both** session shapes:
-/// - **Operator session:** tracked PID is the shell; `claude` is a child →
-///   present via a descendant.
-/// - **Agent / gate-continuation session:** tracked PID *is* `claude` (it is the
-///   portable-pty child) → present via the root, even when idle with zero
-///   children (the bug the old `descendant_count > 0` heuristic mis-closed).
-///
-/// `reference_unix_millis` guards PID reuse: if the tracked `root_pid`'s
-/// creation time predates the reference instant (beyond [`PID_REUSE_SKEW_MS`]),
-/// the PID cannot belong to anything this reference instant's process tree
-/// spawned — its image name must not be trusted, so the subtree is treated as
-/// claude-absent. The comparison normalizes units: `creation_times` is epoch
-/// **seconds**, `reference_unix_millis` is epoch **millis**.
-///
-/// **Pass the runner primary's own boot time here — NEVER a per-session-record
-/// timestamp like `opened_at`.** (Regression found live 2026-07-03, Phase 1
-/// verification of PR #630: a session record's `terminal_id` can legitimately
-/// be reused by a *later* record against an *already-running* terminal — e.g.
-/// a reconnect into an existing pane — since `record_open` dedups by
-/// `claude_session_id`, never by `terminal_id`. When that happens the tracked
-/// PID's real creation time predates the newer record's `opened_at` by design,
-/// not because of PID recycling, and the old `opened_at`-based guard falsely
-/// concluded "reused" — flipping a genuinely live, idle session to `poll-dead`
-/// after `LIVE_SHELL_DEAD_TICKS`. A PID cannot predate the primary's OWN boot
-/// time and still belong to a terminal this boot's `TerminalManager` spawned,
-/// so the boot start is the correct, restart-scoped reference instant: it
-/// still catches the genuine cross-restart PID-recycle case the guard exists
-/// for, without misfiring on ordinary same-boot terminal reuse.
-pub fn claude_present_in_inclusive_subtree(
-    root_pid: u32,
-    snapshot: &ProcessSnapshot,
-    reference_unix_millis: i64,
-) -> bool {
-    // PID-reuse guard on the tracked root (seconds → millis before comparing).
-    if let Some(&created_secs) = snapshot.creation_times.get(&root_pid) {
-        if created_secs > 0 && created_secs * 1000 + PID_REUSE_SKEW_MS < reference_unix_millis {
-            return false;
+impl Default for ProcessSnapshot {
+    /// An empty table flagged `stale`: absence of a read is UNKNOWN.
+    fn default() -> Self {
+        ProcessSnapshot {
+            stale: true,
+            observed_at_ms: 0,
+            parent_map: HashMap::new(),
+            creation_times: HashMap::new(),
+            names: HashMap::new(),
+            exe_paths: HashMap::new(),
+            creation_filetimes: HashMap::new(),
+            start_ticks: HashMap::new(),
         }
     }
-    if is_countable_claude(root_pid, snapshot) {
-        return true;
-    }
-    bfs_descendants_from(root_pid, &snapshot.parent_map, &snapshot.creation_times)
-        .iter()
-        .any(|d| is_countable_claude(d.pid, snapshot))
 }
 
-/// Every claude-image PID in the **inclusive** subtree rooted at `root_pid`
-/// (the root itself is included when its image is `claude*`). Same walk as
-/// [`claude_present_in_inclusive_subtree`] but returning the PIDs instead of
-/// a bool — the session-tracking health check
-/// ([`crate::session::tracking_health`]) uses it to cross-reference live
-/// Claude processes against the durable lifecycle records. No PID-reuse
-/// guard here: this is an enumeration, not a liveness verdict — callers that
-/// need the guard pair it with `claude_present_in_inclusive_subtree`.
-pub fn claude_pids_in_inclusive_subtree(root_pid: u32, snapshot: &ProcessSnapshot) -> Vec<u32> {
+impl ProcessSnapshot {
+    /// True when nothing may be concluded from this snapshot's absences: it is
+    /// `stale`, or its table is empty (the runner itself is always live, so an
+    /// empty table is a failed read). A caller that kills, closes, or respawns
+    /// because a process is NOT listed must not act when this is true.
+    pub fn is_unknown(&self) -> bool {
+        self.stale || self.parent_map.is_empty()
+    }
+}
+
+/// Every PID in the **inclusive** subtree rooted at `root_pid`: the root
+/// first — only when
+/// the table holds it, so a root that has already exited is not reported as a
+/// live process — then its descendants breadth-first. The walk the
+/// graceful-exit probe classifies pid by pid
+/// (`crate::terminal::graceful_exit::probe_from_snapshot`), where an image
+/// name is one witness of a `claude` and Claude Code's own registry record is
+/// the other.
+pub fn inclusive_subtree_pids(root_pid: u32, snapshot: &ProcessSnapshot) -> Vec<u32> {
     let mut out = Vec::new();
-    if is_countable_claude(root_pid, snapshot) {
+    if snapshot.names.contains_key(&root_pid) || snapshot.creation_times.contains_key(&root_pid) {
         out.push(root_pid);
     }
     out.extend(
         bfs_descendants_from(root_pid, &snapshot.parent_map, &snapshot.creation_times)
             .iter()
-            .filter(|d| is_countable_claude(d.pid, snapshot))
             .map(|d| d.pid),
     );
     out
-}
-
-/// The claude-image PID in the **inclusive** subtree rooted at `root_pid` with
-/// the EARLIEST KNOWN creation time, returned as `(pid, creation_secs)`.
-///
-/// "Anchor" because this pid's process-start is the correlation anchor the
-/// launch-agnostic session binder uses (its `--session-id` cmdline + its start
-/// time vs a transcript's first event). When several claude images live in the
-/// subtree (a resume relaunched claude under the same shell), the OLDEST is the
-/// session that has been running — the one whose transcript we want. Creation
-/// times are second-granular and may be unknown (`0`, e.g. a WMI/`/proc` miss);
-/// a KNOWN (`>0`) time always sorts before an unknown one, and unknowns sort
-/// last so a resolvable anchor is preferred. Returns `None` when the subtree
-/// hosts no claude image (built on [`claude_pids_in_inclusive_subtree`]).
-pub fn claude_anchor_in_subtree(root_pid: u32, snapshot: &ProcessSnapshot) -> Option<(u32, i64)> {
-    claude_pids_in_inclusive_subtree(root_pid, snapshot)
-        .into_iter()
-        .map(|pid| (pid, snapshot.creation_times.get(&pid).copied().unwrap_or(0)))
-        .min_by(|(_, a), (_, b)| {
-            // Prefer the earliest KNOWN creation; unknown (`<= 0`) sorts last.
-            let ka = if *a > 0 { *a } else { i64::MAX };
-            let kb = if *b > 0 { *b } else { i64::MAX };
-            ka.cmp(&kb)
-        })
 }
 
 /// Extract the session id a process command line NAMES, returning it ONLY when
@@ -181,10 +195,20 @@ pub fn claude_anchor_in_subtree(root_pid: u32, snapshot: &ProcessSnapshot) -> Op
 /// session-id", `claude_session/launch_spec.rs:225-235`) — the resume id is the
 /// one the process actually runs under.
 ///
+/// FORK: `--resume X --fork-session` names the PARENT, while the process runs a
+/// new id (`--session-id` when it was given one, otherwise one this argv does
+/// not carry). So a fork answers only from `--session-id`.
+///
 /// The UUID-shape gate is the safety net: a stray token that merely follows the
 /// flag text (or a `--session-idX` false prefix) can never be mistaken for a
 /// real id. `None` when no such flag is present or no value is UUID-shaped.
 pub fn parse_session_id_from_cmdline(cmdline: &str) -> Option<String> {
+    if cmdline
+        .split_whitespace()
+        .any(|t| t.trim_matches(|c| c == '"' || c == '\'') == "--fork-session")
+    {
+        return find_flag_uuid(cmdline, "--session-id", false);
+    }
     // resume first — see PRECEDENCE above.
     find_flag_uuid(cmdline, "--resume", false)
         .or_else(|| find_flag_uuid(cmdline, "-r", true))
@@ -258,16 +282,62 @@ fn is_uuid_shaped(s: &str) -> bool {
 /// Case-insensitive basename match on `claude` / `claude.exe`. Tolerates a
 /// path-qualified name (takes the basename) and a trailing `.exe`.
 fn is_claude_image(name: Option<&String>) -> bool {
-    let Some(name) = name else {
-        return false;
-    };
+    name.is_some_and(|name| image_stem(name) == "claude")
+}
+
+/// An image name as both image checks compare it: the last path component,
+/// lowercased, `.exe` stripped.
+fn image_stem(name: &str) -> String {
     let base = name
         .rsplit(['/', '\\'])
         .next()
         .unwrap_or(name)
         .to_ascii_lowercase();
-    let stem = base.strip_suffix(".exe").unwrap_or(&base);
-    stem == "claude"
+    match base.strip_suffix(".exe") {
+        Some(stem) => stem.to_string(),
+        None => base,
+    }
+}
+
+/// `CLAUDE_CONFIG_DIR` of a live process. Linux only (`/proc/<pid>/environ`);
+/// elsewhere `None`, which is "could not say", never a match. Read by the resume
+/// door (`session::resume_door`) and by the graceful-exit probe's registry
+/// witness, which adds each candidate's own config dir to the discovered ones.
+#[cfg(target_os = "linux")]
+pub(crate) fn config_dir_of_pid(pid: u32) -> Option<String> {
+    let bytes = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    bytes
+        .split(|b| *b == 0)
+        .filter_map(|kv| std::str::from_utf8(kv).ok())
+        .find_map(|kv| kv.strip_prefix("CLAUDE_CONFIG_DIR=").map(str::to_string))
+        .filter(|s| !s.is_empty())
+}
+
+/// See the Linux twin: no portable way to read another process's environment.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn config_dir_of_pid(_pid: u32) -> Option<String> {
+    None
+}
+
+/// The images a JS-runtime Claude Code is known to run as: the npm install is
+/// `node … cli.js` (`nodejs` where the distro names the binary so), and a build
+/// run under Bun is `bun`. These are the known images [`is_claude_image`] can
+/// miss a live `claude` behind — not the only possible ones: `deno`, or a
+/// version-suffixed `node22`, would escape this list too — and they are the
+/// ones the graceful-exit probe leaves UNDECIDED when Claude Code's session
+/// registry cannot answer (`crate::terminal::graceful_exit::RegistryWitness`);
+/// every other image is judged by itself, and a shell is never a `claude`.
+/// Compared after [`image_stem`], so `node.exe` and `/usr/bin/node` match too.
+const JS_RUNTIME_IMAGES: &[&str] = &["node", "nodejs", "bun"];
+
+/// Could `pid` be a JS-runtime Claude Code that its image alone cannot
+/// recognise? `true` for a [`JS_RUNTIME_IMAGES`] image, and for a pid whose
+/// image the snapshot could not read — an unknown image cannot rule it out.
+pub(crate) fn may_be_js_runtime_claude(pid: u32, snapshot: &ProcessSnapshot) -> bool {
+    snapshot
+        .names
+        .get(&pid)
+        .is_none_or(|name| JS_RUNTIME_IMAGES.contains(&image_stem(name).as_str()))
 }
 
 /// A pid counts as a live claude iff its image name matches `claude*` AND its
@@ -308,40 +378,35 @@ fn persistent_identity_shim_dir() -> Option<&'static str> {
 /// True iff `exe_path` points into one of qontinui's own claude-shim
 /// directories:
 ///
-/// - a per-terminal identity dir (`qontinui-identity-<terminal_id>`) or
-///   install-intercept dir (`qontinui-shim-<terminal_id>`), matched by the
-///   containing dir's basename prefix (the dirs are materialized under the
-///   system temp dir by `install_effects_producer::intercept::shim_materializer`,
-///   whose prefix constants are reused here), or
+/// - any qontinui shim dir, by the shared predicate
+///   [`is_qontinui_shim_dir`](crate::install_effects_producer::intercept::shim_materializer::is_qontinui_shim_dir)
+///   applied to the containing dir (an identity dir `qontinui-identity-*` or
+///   install-intercept dir `qontinui-shim-*` by name, or any dir sealed by the
+///   identity-build marker; a name miss costs one `stat` for that marker), or
 /// - the persistent identity dir (`persistent_identity_dir`, in prod
 ///   `profile_cli::identity_shim_dir()` = `~/.qontinui/runner/identity-shim`),
 ///   matched by the full containing dir (separator- and case-normalized —
 ///   Windows paths are case-insensitive).
 ///
-/// Pure over its inputs; parsed with manual `/`+`\` splitting (not
-/// `std::path`) so Windows-style snapshot paths behave identically on every
-/// host, mirroring [`is_claude_image`].
+/// Pure over its inputs apart from that marker probe; parsed with manual
+/// `/`+`\` splitting (not `std::path`) so Windows-style snapshot paths behave
+/// identically on every host, mirroring [`is_claude_image`].
 #[expect(
     clippy::string_slice,
     reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
 )]
 fn is_shim_dir_exe_path(exe_path: &str, persistent_identity_dir: Option<&str>) -> bool {
-    use crate::install_effects_producer::intercept::shim_materializer::{
-        IDENTITY_DIR_PREFIX, SHIM_DIR_PREFIX,
-    };
+    use crate::install_effects_producer::intercept::shim_materializer::is_qontinui_shim_dir;
     let trimmed = exe_path.trim_end_matches(['/', '\\']);
     // Split off the file name; what remains is the containing directory.
     let Some(sep_idx) = trimmed.rfind(['/', '\\']) else {
         return false; // bare name — no directory to key on
     };
     let dir = &trimmed[..sep_idx];
-    let dir_base = dir.rsplit(['/', '\\']).next().unwrap_or(dir);
-    // Case-folded like `normalize_dir` below: WMI can report case-mangled
-    // paths, and a miss here fails open to counting the shim as real.
-    let dir_base_lower = dir_base.to_ascii_lowercase();
-    if dir_base_lower.starts_with(IDENTITY_DIR_PREFIX)
-        || dir_base_lower.starts_with(SHIM_DIR_PREFIX)
-    {
+    // The name half splits on `/` AND `\` whatever the host and case-folds
+    // (WMI can report case-mangled paths; a miss fails open to counting the
+    // shim as real).
+    if is_qontinui_shim_dir(std::path::Path::new(dir)) {
         return true;
     }
     if let Some(stable) = persistent_identity_dir {
@@ -363,30 +428,153 @@ fn normalize_dir(p: &str) -> String {
         .to_ascii_lowercase()
 }
 
-/// Discover every descendant of `root_pid` (NOT including the root itself).
-///
-/// Returns `(descendants, parent_map)`. The parent map is restricted to the
-/// system-wide snapshot — `identify_service_pid` only walks the descendant
-/// subset, but the full map is useful for §3.5 sibling-tree reasoning.
-///
-/// Returns empty vectors on platform helper failure (logged at `warn!`).
-pub async fn discover_descendants_with_parent_map(
-    root_pid: u32,
-) -> (Vec<PidWithSpawnedAt>, HashMap<u32, Vec<u32>>) {
-    let snapshot = snapshot_process_table().await;
-    let descendants = collect_descendants_from_snapshot(root_pid, &snapshot);
-    (descendants, snapshot.parent_map)
+/// One fresh descendant-discovery pass ([`discover_descendants_with_parent_map`]).
+#[derive(Debug, Clone)]
+pub struct DescendantDiscovery {
+    /// The root's OWN record — its creation time as the same table saw it, so
+    /// the orphan reclaim's pid-reuse guard compares against when the root
+    /// was created, not when it was discovered.
+    pub root: PidWithSpawnedAt,
+    /// Every descendant (NOT the root), each with its exact FILETIME when the
+    /// table carries one.
+    pub descendants: Vec<PidWithSpawnedAt>,
+    /// The fresh table the pass read: its parent map for service
+    /// identification, and its creation times for [`merge_tracked`].
+    pub snapshot: ProcessSnapshot,
 }
 
-/// Take a fresh process-table snapshot — exposed for `orphan_state` so the
-/// startup reclaim pass can do its PID-reuse check without re-querying.
+/// The tracked set after a discovery pass: every descendant the walk found
+/// (`walked`), plus each PREVIOUSLY tracked entry the walk did not find that
+/// is still the same process in the SAME fresh `snapshot`
+/// (`health::is_same_process`: the exact FILETIME when both sides carry one,
+/// the 2 s window otherwise). An entry the table no longer lists, or whose
+/// pid now names another process, is dropped.
+///
+/// Why not replace: a walk from the root cannot reach a worker whose parent
+/// (a reloader) exited, yet that orphan may hold the health port; replacing
+/// the set would forget it, and `stop()` reaps only what is tracked.
+pub fn merge_tracked(
+    previous: &[PidWithSpawnedAt],
+    walked: Vec<PidWithSpawnedAt>,
+    snapshot: &ProcessSnapshot,
+) -> Vec<PidWithSpawnedAt> {
+    let mut merged = walked;
+    for prev in previous {
+        if merged.iter().any(|w| w.pid == prev.pid) {
+            continue;
+        }
+        let Some(&live_unix) = snapshot.creation_times.get(&prev.pid) else {
+            continue;
+        };
+        let live_ft = snapshot.creation_filetimes.get(&prev.pid).copied();
+        if super::health::is_same_process(*prev, live_unix, live_ft) {
+            merged.push(*prev);
+        }
+    }
+    merged
+}
+
+/// Discover every descendant of `root_pid` (NOT including the root itself).
+///
+/// Returns the root's own record, the descendants and the parent map. The
+/// parent map is restricted to the system-wide snapshot —
+/// `identify_service_pid` only walks the descendant subset, but the full map
+/// is useful for §3.5 sibling-tree reasoning.
+///
+/// Reads a table whose walk began after this call (never the memo): the
+/// caller runs once, seconds after a spawn, and a memoized table could predate
+/// the service process it is looking for — `identify_service_pid` would then
+/// settle on an intermediate wrapper for the life of the spawn.
+///
+/// `None` when the table is UNKNOWN ([`ProcessSnapshot::is_unknown`]: the read
+/// failed, or only a `stale` table describing the tree as it WAS is
+/// available) — distinct from a `Some` with no descendants, a read that found
+/// none.
+pub async fn discover_descendants_with_parent_map(root_pid: u32) -> Option<DescendantDiscovery> {
+    let snapshot = snapshot_process_table_fresh().await;
+    if snapshot.is_unknown() {
+        return None;
+    }
+    let root = PidWithSpawnedAt::from_snapshot(root_pid, &snapshot);
+    let descendants = collect_descendants_from_snapshot(root_pid, &snapshot);
+    Some(DescendantDiscovery {
+        root,
+        descendants,
+        snapshot,
+    })
+}
+
+/// A process-table snapshot, at most [`super::process_table::MEMO_TTL`] old,
+/// from the shared in-process provider. Check [`ProcessSnapshot::is_unknown`]
+/// before acting on an absence.
 pub async fn snapshot_process_table_public() -> ProcessSnapshot {
     snapshot_process_table().await
 }
 
-/// Convenience wrapper: discover descendants only.
-pub async fn discover_descendants(root_pid: u32) -> Vec<PidWithSpawnedAt> {
-    discover_descendants_with_parent_map(root_pid).await.0
+/// A process-table snapshot whose read began after this call (never the
+/// memo) — for a caller that closes, kills or respawns because a process is
+/// absent.
+pub async fn snapshot_process_table_fresh() -> ProcessSnapshot {
+    super::process_table::snapshot_fresh().await
+}
+
+/// Every snapshot in this module comes from the shared provider.
+async fn snapshot_process_table() -> ProcessSnapshot {
+    super::process_table::snapshot().await
+}
+
+/// TARGETED command-line lookup for EXACTLY the given pids — never a
+/// table-wide fetch. Read in-process by the shared provider
+/// ([`super::process_table::command_lines_for`]: `sysinfo` on Windows, with the
+/// WMI query as its fallback; `/proc/<pid>/cmdline` on Unix). Empty `pids` ⇒
+/// `Some(empty)`. A process missing from a `Some` map (dead, access-denied, no
+/// command-line) is simply absent.
+///
+/// `None` = UNKNOWN: the read failed and no fallback answered. A caller that
+/// decides from ABSENCE (nobody holds this session) must not read `None` as
+/// an empty map.
+pub async fn command_lines_for_pids(pids: &[u32]) -> Option<HashMap<u32, String>> {
+    super::process_table::command_lines_for(pids).await
+}
+
+/// The RAW argv of exactly `pids`, as each process was started with it, for a
+/// caller that matches command lines against a measured shape
+/// ([`super::process_table::raw_argvs_for`]): Windows answers its PEB's
+/// command line, Unix `/proc/<pid>/cmdline` split on NUL with every element
+/// kept. Use this, not [`command_lines_for_pids`], whenever the exact argv
+/// matters: that door's Windows answer is `sysinfo`'s argv rejoined, which
+/// loses cmd's `^"` escapes, and its Unix answer joins the argv with spaces, in
+/// which distinct argvs collapse. In-process only, with no fallback, bounded by
+/// `budget`; `hold` stays on the blocking thread until the read itself returns
+/// (see [`super::process_table::snapshot_unshared`]). `None` = UNKNOWN; a pid
+/// absent from a `Some` map is unreadable.
+pub async fn raw_argvs_for_pids<H: Send + 'static>(
+    pids: &[u32],
+    budget: std::time::Duration,
+    hold: H,
+) -> Option<HashMap<u32, session_lifecycle::Argv>> {
+    super::process_table::raw_argvs_for(pids, budget, hold).await
+}
+
+/// A fresh process table for an OBSERVER, walked privately and bounded by
+/// `budget` ([`super::process_table::snapshot_unshared`]): it shares nothing
+/// with the provider every other read goes through — no walk another caller
+/// can join, no memo, no fallback slot, no circuit — so it can change nothing
+/// any other caller is served. A failed or late walk answers stale (UNKNOWN);
+/// `hold` stays on the blocking thread until the walk itself returns, so a
+/// caller can count its walks still on the pool.
+pub async fn snapshot_process_table_unshared<H: Send + 'static>(
+    budget: std::time::Duration,
+    hold: H,
+) -> ProcessSnapshot {
+    super::process_table::snapshot_unshared(budget, hold).await
+}
+
+/// Whether `QONTINUI_PROCESS_TABLE_IN_PROCESS=0` has switched the in-process
+/// process-table read off (Windows only; never elsewhere). A caller whose every
+/// read is in-process only has nothing to read while it is set.
+pub fn in_process_table_read_disabled() -> bool {
+    super::process_table::in_process_disabled()
 }
 
 /// Identify which descendant is "the service" — port owner → leaf →
@@ -505,6 +693,7 @@ fn bfs_descendants_from(
         out.push(PidWithSpawnedAt {
             pid,
             spawned_at_unix: creation_times.get(&pid).copied().unwrap_or(0),
+            spawned_at_ft: None,
         });
         if let Some(kids) = parent_map.get(&pid) {
             for k in kids {
@@ -515,11 +704,16 @@ fn bfs_descendants_from(
     out
 }
 
+/// Every descendant of `root` in `snapshot`, each with the exact FILETIME the
+/// snapshot carries for it (W2: a later kill compares it exactly).
 fn collect_descendants_from_snapshot(
     root: u32,
     snapshot: &ProcessSnapshot,
 ) -> Vec<PidWithSpawnedAt> {
     bfs_descendants_from(root, &snapshot.parent_map, &snapshot.creation_times)
+        .into_iter()
+        .map(|d| PidWithSpawnedAt::from_snapshot(d.pid, snapshot))
+        .collect()
 }
 
 // ============================================================================
@@ -539,8 +733,11 @@ fn collect_descendants_from_snapshot(
 /// overlap to matter. 8s clears the slowest healthy query with room to spare
 /// while keeping a degraded-WMI machine's steady-state hold at well under one
 /// blocking-pool thread per caller.
-#[cfg(windows)]
-const WMI_SNAPSHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+///
+/// Not `cfg(windows)`: `process_table::JOIN_WAIT_MAX` is defined from it on
+/// every platform, so a caller never gives up on a fallback snapshot that is
+/// still inside its own budget.
+pub(super) const WMI_SNAPSHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// Budget for the per-PID `Win32_Process -Filter ProcessId=...` command-line
 /// query. Same WMI subsystem and the same degradation mode as
@@ -564,7 +761,7 @@ const PORT_OWNER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5
 // this file is `#[cfg]`-gated, so routing them all through one un-gated helper
 // is what makes the bounded-execution behaviour testable on every platform CI
 // runs on (see `bounded_probe_tests`) rather than only on Windows. See
-// `snapshot_process_table` for the incident this closes.
+// `powershell_snapshot` for the incident this closes.
 use crate::process_helpers::{run_probe as bounded_probe, ProbeOutcome};
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
@@ -597,14 +794,22 @@ use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 ///
 /// Routing through [`bounded_probe`] makes the worst case "this pass returns an
 /// empty snapshot and the thread goes back to the pool" instead of "one thread
-/// is gone forever". Degrading to [`ProcessSnapshot::default`] is the behaviour
-/// every other failure arm here already had.
+/// is gone forever". Degrading to [`ProcessSnapshot::default`] (empty, and
+/// `stale`) is the behaviour every other failure arm here already had.
+///
+/// **Since plan `2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap`
+/// Phase 5 this is the FALLBACK**, reached only through
+/// [`super::process_table`] when its in-process read fails, and skipped by its
+/// circuit after a failure. The eight callers above read the shared provider.
 #[cfg(windows)]
-async fn snapshot_process_table() -> ProcessSnapshot {
-    // ConvertTo-Json on a single row drops the array; force an array with @().
+pub(super) async fn powershell_snapshot() -> ProcessSnapshot {
+    // `@(...) | ConvertTo-Json` does NOT keep the array: the pipeline unrolls
+    // it, so a one-row result serializes as a bare object. `-InputObject`
+    // hands the array itself to ConvertTo-Json; `parse_json_rows` accepts
+    // either shape regardless.
     const SCRIPT: &str = "$ErrorActionPreference='SilentlyContinue'; \
-        @(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CreationDate,Name,ExecutablePath) | \
-        ConvertTo-Json -Compress -Depth 3";
+        ConvertTo-Json -InputObject @(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CreationDate,Name,ExecutablePath) \
+        -Compress -Depth 3";
 
     let probe = match spawn_blocking_tracked(|| {
         let mut cmd = crate::process_helpers::no_window("powershell");
@@ -651,9 +856,40 @@ struct WmiProcessRow {
     executable_path: Option<String>,
 }
 
+/// The rows of a PowerShell `ConvertTo-Json` answer, whatever shape it took:
+/// an array (the normal case), a bare object (one row whose array the
+/// pipeline unrolled), or empty / `null` (no rows). `Err` only when the text
+/// is none of those.
+#[cfg(any(windows, test))]
+fn parse_json_rows<T: serde::de::DeserializeOwned>(
+    json: &str,
+) -> Result<Vec<T>, serde_json::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany<T> {
+        Many(Vec<T>),
+        One(T),
+    }
+    let trimmed = json.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    if trimmed.starts_with('[') {
+        // Parsed directly so a bad row keeps serde's detailed error (the
+        // untagged enum below reports only "did not match any variant").
+        return serde_json::from_str(trimmed);
+    }
+    let parsed: Option<OneOrMany<T>> = serde_json::from_str(trimmed)?;
+    Ok(match parsed {
+        None => Vec::new(),
+        Some(OneOrMany::Many(rows)) => rows,
+        Some(OneOrMany::One(row)) => vec![row],
+    })
+}
+
 #[cfg(windows)]
 fn parse_powershell_snapshot(json: &str) -> ProcessSnapshot {
-    let rows: Vec<WmiProcessRow> = match serde_json::from_str(json) {
+    let rows: Vec<WmiProcessRow> = match parse_json_rows(json) {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!("process_tree: failed to parse WMI JSON: {e}");
@@ -729,30 +965,35 @@ pub async fn working_directories_for_pids(_pids: &[u32]) -> HashMap<u32, String>
     HashMap::new()
 }
 
-/// TARGETED command-line lookup for EXACTLY the given pids — never a
-/// table-wide fetch. Windows issues one WMI call filtered to the requested
-/// ProcessIds (`ProcessId=A or ProcessId=B ...`) selecting only
-/// `ProcessId,CommandLine`. Empty `pids` ⇒ empty map with NO PowerShell spawn.
-/// Fail-open: any process not in the result (dead, access-denied, no
-/// command-line) is simply absent from the map.
+/// The WMI fallback for [`command_lines_for_pids`]: one call filtered to the
+/// requested ProcessIds (`ProcessId=A or ProcessId=B ...`) selecting only
+/// `ProcessId,CommandLine`. `None` when the query degraded (join error,
+/// spawn failure, non-zero exit, timeout); empty `pids` ⇒ `Some(empty)` with
+/// NO PowerShell spawn.
 #[cfg(windows)]
-pub async fn command_lines_for_pids(pids: &[u32]) -> HashMap<u32, String> {
+pub(super) async fn command_lines_for_pids_powershell(
+    pids: &[u32],
+) -> Option<HashMap<u32, String>> {
     if pids.is_empty() {
-        return HashMap::new();
+        return Some(HashMap::new());
     }
     let filter = pids
         .iter()
         .map(|p| format!("ProcessId={p}"))
         .collect::<Vec<_>>()
         .join(" or ");
-    // Force an array with @() so ConvertTo-Json on a single row still parses.
+    // `@(...) | ConvertTo-Json` unrolls the array through the pipeline, so a
+    // single-pid answer came back as a bare JSON object and failed to parse
+    // ("invalid type: map, expected a sequence" — 505 times in one box's log).
+    // `-InputObject` passes the array itself; `parse_json_rows` also accepts
+    // the object shape, so either half alone would fix it.
     let script = format!(
         "$ErrorActionPreference='SilentlyContinue'; \
-        @(Get-CimInstance Win32_Process -Filter \"{filter}\" | Select-Object ProcessId,CommandLine) | \
-        ConvertTo-Json -Compress -Depth 3"
+        ConvertTo-Json -InputObject @(Get-CimInstance Win32_Process -Filter \"{filter}\" | Select-Object ProcessId,CommandLine) \
+        -Compress -Depth 3"
     );
 
-    // Bounded for the same reason as `snapshot_process_table`: this is the same
+    // Bounded for the same reason as `powershell_snapshot`: this is the same
     // WMI subsystem, reached from the periodic session-reconcile pass, and an
     // untimed `.output()` inside `spawn_blocking` is exactly the leak that
     // wedged the runner.
@@ -766,15 +1007,27 @@ pub async fn command_lines_for_pids(pids: &[u32]) -> HashMap<u32, String> {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!("process_tree: command-line query join error: {e}");
-            return HashMap::new();
+            return None;
         }
     };
 
     let ProbeOutcome::Captured(stdout) = probe else {
-        return HashMap::new();
+        return None;
     };
 
-    parse_command_lines_json(&String::from_utf8_lossy(&stdout))
+    let lines = parse_command_lines_json(&String::from_utf8_lossy(&stdout))?;
+    // The pids were just listed live, and under `SilentlyContinue` a failed
+    // CIM query prints `[]`: no command line for ANY asked pid is UNKNOWN,
+    // never "none of them holds anything". (A pid that died in between reads
+    // UNKNOWN too, which only ever makes a caller refuse.)
+    if lines.is_empty() {
+        tracing::debug!(
+            pids = pids.len(),
+            "process_tree: WMI command-line query named none of the asked pids; UNKNOWN"
+        );
+        return None;
+    }
+    Some(lines)
 }
 
 #[cfg(windows)]
@@ -786,17 +1039,17 @@ struct WmiCmdlineRow {
     command_line: Option<String>,
 }
 
+/// `None` when the answer is not parseable: an unreadable answer is UNKNOWN,
+/// never "none of these pids has a command line" (the resume fork guard reads
+/// an empty map as "nobody holds this session"), and `None` also keeps the
+/// provider's fallback circuit counting it as a failure.
 #[cfg(windows)]
-fn parse_command_lines_json(json: &str) -> HashMap<u32, String> {
-    let trimmed = json.trim();
-    if trimmed.is_empty() {
-        return HashMap::new();
-    }
-    let rows: Vec<WmiCmdlineRow> = match serde_json::from_str(trimmed) {
+fn parse_command_lines_json(json: &str) -> Option<HashMap<u32, String>> {
+    let rows: Vec<WmiCmdlineRow> = match parse_json_rows(json) {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!("process_tree: failed to parse command-line JSON: {e}");
-            return HashMap::new();
+            return None;
         }
     };
     let mut out = HashMap::new();
@@ -805,11 +1058,22 @@ fn parse_command_lines_json(json: &str) -> HashMap<u32, String> {
             out.insert(row.process_id, cl);
         }
     }
-    out
+    Some(out)
 }
 
+/// The pid owning the listening socket on local TCP `port`, read in-process
+/// from the listener table ([`super::process_table::port_owner`]); the
+/// `Get-NetTCPConnection` query below is its circuit-protected fallback.
 #[cfg(windows)]
 pub fn port_owner_pid(port: u16) -> Option<u32> {
+    super::process_table::port_owner(port)
+}
+
+/// The PowerShell fallback for [`port_owner_pid`]. The outer `None` means
+/// the query degraded (spawn failure, non-zero exit, timeout); `Some(None)`
+/// that it answered with no owner.
+#[cfg(windows)]
+pub(super) fn port_owner_pid_powershell(port: u16) -> Option<Option<u32>> {
     let script = format!(
         "$ErrorActionPreference='SilentlyContinue'; \
         $c = Get-NetTCPConnection -LocalPort {port} -ErrorAction SilentlyContinue | \
@@ -830,26 +1094,22 @@ pub fn port_owner_pid(port: u16) -> Option<u32> {
         return None;
     };
     let s = String::from_utf8_lossy(&stdout);
-    s.trim().lines().next().and_then(|l| l.trim().parse().ok())
+    Some(s.trim().lines().next().and_then(|l| l.trim().parse().ok()))
 }
 
 // ============================================================================
 // Unix implementation
 // ============================================================================
 
-#[cfg(unix)]
-async fn snapshot_process_table() -> ProcessSnapshot {
-    spawn_blocking_tracked(snapshot_process_table_sync)
-        .await
-        .unwrap_or_default()
-}
-
+/// The `/proc` walk — the Unix in-process read behind
+/// [`super::process_table`], which validates it (an unreadable `/proc` yields
+/// an empty table, which the provider treats as a failed read).
 #[cfg(unix)]
 #[expect(
     clippy::string_slice,
     reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
 )]
-fn snapshot_process_table_sync() -> ProcessSnapshot {
+pub(super) fn snapshot_process_table_sync() -> ProcessSnapshot {
     let mut snap = ProcessSnapshot::default();
 
     let btime = read_btime().unwrap_or(0);
@@ -898,6 +1158,13 @@ fn snapshot_process_table_sync() -> ProcessSnapshot {
         };
         snap.parent_map.entry(ppid).or_default().push(pid);
         snap.creation_times.insert(pid, spawned_at_unix);
+        // The same field 22, undivided: the exact stamp a pid is bound by
+        // across two reads (`ProcessSnapshot::start_ticks`).
+        if let Ok(ticks) = u64::try_from(starttime_ticks) {
+            if ticks > 0 {
+                snap.start_ticks.insert(pid, ticks);
+            }
+        }
         // Image name for the claude-present liveness signal. `/proc/<pid>/comm`
         // is the kernel's `TASK_COMM` (≤15 chars, no path) — `claude` fits.
         // Fall back to the `comm` field already parsed out of `stat` (the text
@@ -924,8 +1191,33 @@ fn snapshot_process_table_sync() -> ProcessSnapshot {
     snap
 }
 
+/// A `/proc/<pid>/stat` line's state (field 3) and start time in Unix
+/// seconds (field 22, clock ticks since boot, plus `btime`): the start time
+/// [`snapshot_process_table_sync`] records. `None` when a field does not
+/// parse or a time is not positive. Pure, so it is tested on every OS.
+pub(super) fn parse_proc_stat(stat: &str, btime: i64, ticks_per_sec: i64) -> Option<(char, i64)> {
+    // comm may hold spaces and parens; the fields follow its LAST ')'.
+    let (_, tail) = stat.rsplit_once(')')?;
+    let mut fields = tail.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    // The state was field 0 of the tail; the start time is field 19.
+    let ticks: i64 = fields.nth(18)?.parse().ok()?;
+    (btime > 0 && ticks > 0 && ticks_per_sec > 0).then(|| (state, btime + ticks / ticks_per_sec))
+}
+
+/// `pid`'s state and start time ([`parse_proc_stat`]) from
+/// `/proc/<pid>/stat`, against a `btime` the caller read once for the whole
+/// tick ([`read_btime`]). `None` when the pid is gone or `/proc` is absent.
 #[cfg(unix)]
-fn read_btime() -> Option<i64> {
+pub(super) fn proc_stat(pid: u32, btime: i64) -> Option<(char, i64)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let per_sec = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as i64;
+    parse_proc_stat(&stat, btime, per_sec)
+}
+
+/// The boot time (`btime`, Unix seconds) from `/proc/stat`.
+#[cfg(unix)]
+pub(super) fn read_btime() -> Option<i64> {
     let s = std::fs::read_to_string("/proc/stat").ok()?;
     for line in s.lines() {
         if let Some(rest) = line.strip_prefix("btime ") {
@@ -970,37 +1262,66 @@ pub async fn working_directories_for_pids(pids: &[u32]) -> HashMap<u32, String> 
     .unwrap_or_default()
 }
 
-/// TARGETED command-line lookup for EXACTLY the given pids — never a
-/// table-wide fetch. Unix reads `/proc/<pid>/cmdline` per pid (NUL-separated
-/// args → single space-joined string). Empty `pids` ⇒ empty map. Fail-open:
-/// an unreadable pid (dead, permission-denied) is simply absent from the map.
+/// `/proc/<pid>/cmdline` for exactly `pids` (NUL-separated args → one
+/// space-joined string) — the Unix in-process command-line read behind
+/// [`command_lines_for_pids`]. An unreadable pid (dead, permission-denied) is
+/// simply absent from the map.
 #[cfg(unix)]
-pub async fn command_lines_for_pids(pids: &[u32]) -> HashMap<u32, String> {
-    if pids.is_empty() {
-        return HashMap::new();
-    }
-    let pids = pids.to_vec();
-    spawn_blocking_tracked(move || {
-        let mut out = HashMap::new();
-        for pid in pids {
-            let Ok(bytes) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
-                continue;
-            };
-            let joined = bytes
-                .split(|b| *b == 0)
-                .filter(|part| !part.is_empty())
-                .map(|part| String::from_utf8_lossy(part).into_owned())
-                .collect::<Vec<_>>()
-                .join(" ");
-            let joined = joined.trim().to_string();
-            if !joined.is_empty() {
-                out.insert(pid, joined);
-            }
+pub(super) fn proc_command_lines(pids: &[u32]) -> HashMap<u32, String> {
+    let mut out = HashMap::new();
+    for &pid in pids {
+        let Ok(bytes) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            continue;
+        };
+        let joined = bytes
+            .split(|b| *b == 0)
+            .filter(|part| !part.is_empty())
+            .map(|part| String::from_utf8_lossy(part).into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let joined = joined.trim().to_string();
+        if !joined.is_empty() {
+            out.insert(pid, joined);
         }
-        out
-    })
-    .await
-    .unwrap_or_default()
+    }
+    out
+}
+
+/// `/proc/<pid>/cmdline` for exactly `pids`, as the argv each process was
+/// started with ([`split_proc_cmdline`]): every element kept, empty ones too,
+/// so two different argvs never read as one. The raw read behind
+/// [`super::process_table::raw_argvs_for`]; [`proc_command_lines`] keeps
+/// serving the space-joined line its own callers want. A pid that is dead,
+/// unreadable, or whose argv is not UTF-8 is absent.
+#[cfg(unix)]
+pub(super) fn proc_argvs(pids: &[u32]) -> HashMap<u32, Vec<String>> {
+    let mut out = HashMap::new();
+    for &pid in pids {
+        let Ok(bytes) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            continue;
+        };
+        if let Some(argv) = split_proc_cmdline(&bytes) {
+            out.insert(pid, argv);
+        }
+    }
+    out
+}
+
+/// PURE: a `/proc/<pid>/cmdline` read as an argv. The kernel writes each
+/// argument followed by a NUL, so exactly ONE trailing NUL terminates the last
+/// argument and every other NUL separates two: an empty argument is an empty
+/// element, never dropped. `None` for an empty read (a kernel thread, a
+/// zombie) and for an argument that is not UTF-8 — unreadable, rather than
+/// rewritten lossily into text another argv could also produce. Pure, so it is
+/// tested on every OS.
+pub(super) fn split_proc_cmdline(bytes: &[u8]) -> Option<Vec<String>> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let body = bytes.strip_suffix(b"\0").unwrap_or(bytes);
+    body.split(|b| *b == 0)
+        .map(|part| String::from_utf8(part.to_vec()).ok())
+        .collect()
 }
 
 #[cfg(unix)]
@@ -1217,8 +1538,184 @@ mod tests {
             .map(|(p, t)| PidWithSpawnedAt {
                 pid: *p,
                 spawned_at_unix: *t,
+                spawned_at_ft: None,
             })
             .collect()
+    }
+
+    /// A record taken from a snapshot carries the pid's CREATION time and,
+    /// when the table has it, the exact FILETIME (W2) — for the discovered
+    /// root as for every descendant (N7: the root used to be recorded with
+    /// the discovery instant). A pid the table does not list records `0` and
+    /// no FILETIME, which the reclaim and the kill treat as unknown.
+    #[test]
+    fn records_from_a_snapshot_carry_creation_time_and_filetime() {
+        let mut snap = ProcessSnapshot {
+            stale: false,
+            ..ProcessSnapshot::default()
+        };
+        snap.parent_map.insert(7, vec![8]);
+        snap.creation_times.insert(7, 1_715_911_000);
+        snap.creation_times.insert(8, 1_715_911_001);
+        snap.creation_filetimes.insert(7, 133_000_000_000_000_007);
+        assert_eq!(
+            PidWithSpawnedAt::from_snapshot(7, &snap),
+            PidWithSpawnedAt {
+                pid: 7,
+                spawned_at_unix: 1_715_911_000,
+                spawned_at_ft: Some(133_000_000_000_000_007),
+            }
+        );
+        assert_eq!(
+            PidWithSpawnedAt::from_snapshot(9, &snap),
+            PidWithSpawnedAt {
+                pid: 9,
+                spawned_at_unix: 0,
+                spawned_at_ft: None,
+            }
+        );
+        assert_eq!(
+            collect_descendants_from_snapshot(7, &snap),
+            vec![PidWithSpawnedAt {
+                pid: 8,
+                spawned_at_unix: 1_715_911_001,
+                spawned_at_ft: None,
+            }]
+        );
+        snap.creation_filetimes.insert(8, 133_000_000_000_000_018);
+        assert_eq!(
+            collect_descendants_from_snapshot(7, &snap)[0].spawned_at_ft,
+            Some(133_000_000_000_000_018)
+        );
+    }
+
+    /// B1: rediscovery merges instead of replacing. A tracked orphan the new
+    /// walk cannot reach (its parent exited) is kept while it is still the
+    /// same process; a tracked entry the table no longer lists is dropped,
+    /// and so is one whose pid now names another process (exact FILETIME,
+    /// or the 2 s window without one). The walk's own record wins on a pid
+    /// it found.
+    #[test]
+    fn merge_tracked_keeps_a_live_orphan_and_drops_the_dead_and_the_reused() {
+        let rec = |pid, unix, ft| PidWithSpawnedAt {
+            pid,
+            spawned_at_unix: unix,
+            spawned_at_ft: ft,
+        };
+        let mut snap = ProcessSnapshot {
+            stale: false,
+            ..ProcessSnapshot::default()
+        };
+        // 11: the walk's worker; 21: the orphan, same process; 23: reused
+        // (window arm); 24: reused (exact arm, same second); 22: gone.
+        for (pid, unix) in [(11, 1_000), (21, 1_005), (23, 1_100), (24, 1_006)] {
+            snap.parent_map.entry(0).or_default().push(pid);
+            snap.creation_times.insert(pid, unix);
+        }
+        snap.creation_filetimes.insert(21, 210);
+        snap.creation_filetimes.insert(24, 241);
+        let previous = [
+            rec(11, 999, None),
+            rec(21, 1_005, Some(210)),
+            rec(22, 1_004, None),
+            rec(23, 1_000, None),
+            rec(24, 1_006, Some(240)),
+        ];
+        let walked = vec![rec(11, 1_000, None)];
+        assert_eq!(
+            merge_tracked(&previous, walked, &snap),
+            vec![rec(11, 1_000, None), rec(21, 1_005, Some(210))]
+        );
+    }
+
+    /// The stat parser takes the state and start time from after comm's
+    /// LAST ')' (comm may hold both), and reports a zombie's `Z`.
+    #[test]
+    fn proc_stat_parser_reads_state_and_start_time_after_the_last_paren() {
+        let tail = "1 1234 1234 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 5000 0 0";
+        let zombie = format!("1234 (my (odd) proc) Z {tail}");
+        assert_eq!(
+            parse_proc_stat(&zombie, 1_700_000_000, 100),
+            Some(('Z', 1_700_000_050))
+        );
+        let running = format!("1234 (svc) S {tail}");
+        assert_eq!(
+            parse_proc_stat(&running, 1_700_000_000, 100),
+            Some(('S', 1_700_000_050))
+        );
+        assert_eq!(
+            parse_proc_stat("1234 (svc) S 1 2", 1_700_000_000, 100),
+            None
+        );
+        assert_eq!(parse_proc_stat(&running, 0, 100), None, "no boot time");
+    }
+
+    /// `/proc/<pid>/cmdline` → argv: one trailing NUL is a terminator, every
+    /// other NUL a separator, and an empty argument survives — so argvs that
+    /// join to the same space-separated line stay apart.
+    #[test]
+    fn proc_cmdline_splits_on_nul_and_keeps_empty_arguments() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            split_proc_cmdline(b"/usr/bin/python3\0/x/shim.py\0--credential\0/p.json\0"),
+            Some(s(&[
+                "/usr/bin/python3",
+                "/x/shim.py",
+                "--credential",
+                "/p.json"
+            ]))
+        );
+        // The collapse a space-joined read could not tell apart.
+        assert_eq!(
+            split_proc_cmdline(b"python3\0shim.py\0--credential x\0"),
+            Some(s(&["python3", "shim.py", "--credential x"]))
+        );
+        assert_ne!(
+            split_proc_cmdline(b"python3\0shim.py\0--credential x\0"),
+            split_proc_cmdline(b"python3\0shim.py\0--credential\0x\0")
+        );
+        // Empty arguments, in the middle and at the end, are elements.
+        assert_eq!(
+            split_proc_cmdline(b"a\0\0b\0\0"),
+            Some(s(&["a", "", "b", ""]))
+        );
+        assert_eq!(split_proc_cmdline(b"\0"), Some(s(&[""])));
+        // A rewritten title with no terminator is one argument.
+        assert_eq!(
+            split_proc_cmdline(b"next-server (v16)"),
+            Some(s(&["next-server (v16)"]))
+        );
+        assert_eq!(split_proc_cmdline(b""), None, "an empty read says nothing");
+        assert_eq!(
+            split_proc_cmdline(b"a\0\xff\0"),
+            None,
+            "not UTF-8 is unreadable"
+        );
+    }
+
+    /// The live `/proc` read of this very test process: the argv it was
+    /// started with, element for element.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_argvs_reads_this_process_as_started() {
+        let me = std::process::id();
+        let read = proc_argvs(&[me]);
+        let expected: Vec<String> = std::env::args().collect();
+        assert_eq!(read.get(&me), Some(&expected));
+        assert!(proc_argvs(&[u32::MAX]).is_empty(), "no such pid: absent");
+    }
+
+    /// The `/proc` walk stamps every row with field 22's ticks as well as the
+    /// derived seconds, and the ticks are the ones a second read agrees on.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_walk_carries_start_ticks_that_a_second_walk_repeats() {
+        let me = std::process::id();
+        let a = snapshot_process_table_sync();
+        let b = snapshot_process_table_sync();
+        let ticks = a.start_ticks.get(&me).copied();
+        assert!(ticks.is_some_and(|t| t > 0), "{ticks:?}");
+        assert_eq!(ticks, b.start_ticks.get(&me).copied());
     }
 
     #[test]
@@ -1235,6 +1732,26 @@ mod tests {
         let mut got: Vec<u32> = out.iter().map(|p| p.pid).collect();
         got.sort();
         assert_eq!(got, vec![2, 3, 4, 5]);
+    }
+
+    /// `Default` is UNKNOWN (stale and empty); a read that succeeded clears
+    /// `stale`, and only then do its absences count; a stale table is unknown
+    /// however full it is.
+    #[test]
+    fn process_tree_snapshot_default_is_stale_and_unknown() {
+        let d = ProcessSnapshot::default();
+        assert!(d.stale);
+        assert!(d.is_unknown());
+        let mut fresh = ProcessSnapshot::default();
+        fresh.parent_map.insert(1, vec![2]);
+        assert!(fresh.is_unknown(), "built from Default: still stale");
+        fresh.stale = false;
+        assert!(!fresh.is_unknown());
+        let empty_fresh = ProcessSnapshot {
+            stale: false,
+            ..ProcessSnapshot::default()
+        };
+        assert!(empty_fresh.is_unknown(), "an empty table is a failed read");
     }
 
     #[test]
@@ -1271,24 +1788,42 @@ mod tests {
     // exercise the image-name logic, not reuse.
     const REFERENCE_FRESH: i64 = 1_000_000;
 
+    // The subtree liveness reads live on `graceful_exit::PaneLook` (plan
+    // 2026-11-05-npm-installed-claude-is-invisible-…). These tests pin their
+    // IMAGE arm: a complete registry read that names nothing, over a look
+    // covering every pid in the table, judges each pid by its image alone.
+    fn image_look(snap: &ProcessSnapshot) -> crate::terminal::graceful_exit::PaneLook {
+        crate::terminal::graceful_exit::PaneLook::image_only(snap)
+    }
+
+    fn image_present(root: u32, snap: &ProcessSnapshot, reference: i64) -> bool {
+        image_look(snap)
+            .claude_present(root, reference)
+            .expect("an image-only reading is always decided")
+    }
+
+    fn image_pids(root: u32, snap: &ProcessSnapshot) -> Vec<u32> {
+        image_look(snap)
+            .claude_pids(root)
+            .expect("an image-only reading is always decided")
+    }
+
+    fn image_anchor(root: u32, snap: &ProcessSnapshot) -> Option<(u32, i64)> {
+        image_look(snap)
+            .claude_anchor(root)
+            .expect("an image-only reading is always decided")
+    }
+
     #[test]
     fn claude_present_root_is_claude() {
         // Agent / gate-continuation session: tracked PID *is* claude, zero
         // children — the exact idle shape the old descendant-count heuristic
         // mis-closed as poll-dead.
         let snap = snap_with(&[], &[(100, 1_000)], &[(100, "claude.exe")]);
-        assert!(claude_present_in_inclusive_subtree(
-            100,
-            &snap,
-            REFERENCE_FRESH
-        ));
+        assert!(image_present(100, &snap, REFERENCE_FRESH));
         // Case-insensitive, no extension, path-qualified — all match.
         let snap2 = snap_with(&[], &[(100, 1_000)], &[(100, "C:/bin/Claude")]);
-        assert!(claude_present_in_inclusive_subtree(
-            100,
-            &snap2,
-            REFERENCE_FRESH
-        ));
+        assert!(image_present(100, &snap2, REFERENCE_FRESH));
     }
 
     #[test]
@@ -1299,11 +1834,7 @@ mod tests {
             &[(200, 1_000), (201, 1_001)],
             &[(200, "powershell.exe"), (201, "claude")],
         );
-        assert!(claude_present_in_inclusive_subtree(
-            200,
-            &snap,
-            REFERENCE_FRESH
-        ));
+        assert!(image_present(200, &snap, REFERENCE_FRESH));
     }
 
     #[test]
@@ -1316,11 +1847,7 @@ mod tests {
             &[(300, 1_000), (301, 1_001)],
             &[(300, "pwsh.exe"), (301, "node.exe")],
         );
-        assert!(!claude_present_in_inclusive_subtree(
-            300,
-            &snap,
-            REFERENCE_FRESH
-        ));
+        assert!(!image_present(300, &snap, REFERENCE_FRESH));
     }
 
     #[test]
@@ -1332,18 +1859,14 @@ mod tests {
         // happened 1000s after this PID was created: a genuine cross-boot
         // PID recycle.)
         let reused = snap_with(&[], &[(400, 1_000)], &[(400, "claude.exe")]);
-        assert!(!claude_present_in_inclusive_subtree(
-            400, &reused, 2_000_000
-        ));
+        assert!(!image_present(400, &reused, 2_000_000));
         // Within the skew window (3ms later) it is NOT reuse — a freshly
         // spawned claude whose creation rounds just past the reference.
         let fresh = snap_with(&[], &[(400, 1_000)], &[(400, "claude.exe")]);
-        assert!(claude_present_in_inclusive_subtree(400, &fresh, 1_000_003));
+        assert!(image_present(400, &fresh, 1_000_003));
         // Unresolved creation time (0) must never count as reuse.
         let unknown = snap_with(&[], &[(400, 0)], &[(400, "claude.exe")]);
-        assert!(claude_present_in_inclusive_subtree(
-            400, &unknown, 2_000_000
-        ));
+        assert!(image_present(400, &unknown, 2_000_000));
     }
 
     /// Regression test for the live 2026-07-03 false-poll-dead-close incident
@@ -1361,15 +1884,11 @@ mod tests {
         let snap = snap_with(&[], &[(500, 1_000)], &[(500, "claude.exe")]);
         // The bug: a per-record `opened_at` well after this PID's creation
         // falsely reads as PID reuse.
-        assert!(!claude_present_in_inclusive_subtree(500, &snap, 2_000_000));
+        assert!(!image_present(500, &snap, 2_000_000));
         // The fix: the primary's own boot time (at/before the PID's creation)
         // correctly reads the same live PID as present, regardless of how
         // much later a reused terminal's newest session record was opened.
-        assert!(claude_present_in_inclusive_subtree(
-            500,
-            &snap,
-            REFERENCE_FRESH
-        ));
+        assert!(image_present(500, &snap, REFERENCE_FRESH));
     }
 
     /// The pure shim-dir predicate: per-terminal identity/install-intercept
@@ -1439,18 +1958,14 @@ mod tests {
             r"C:\Users\x\AppData\Local\Programs\claude\claude.exe".to_string(),
         );
 
-        let mut pids = claude_pids_in_inclusive_subtree(600, &snap);
+        let mut pids = image_pids(600, &snap);
         pids.sort();
         assert_eq!(
             pids,
             vec![602, 603],
             "shim 601 excluded; real + unknown-path kept"
         );
-        assert!(claude_present_in_inclusive_subtree(
-            600,
-            &snap,
-            REFERENCE_FRESH
-        ));
+        assert!(image_present(600, &snap, REFERENCE_FRESH));
 
         // Subtree holding ONLY the shim (real claude gone): claude-absent.
         let mut shim_only = snap_with(
@@ -1461,12 +1976,8 @@ mod tests {
         shim_only
             .exe_paths
             .insert(701, "/tmp/qontinui-identity-t2/claude".to_string());
-        assert!(claude_pids_in_inclusive_subtree(700, &shim_only).is_empty());
-        assert!(!claude_present_in_inclusive_subtree(
-            700,
-            &shim_only,
-            REFERENCE_FRESH
-        ));
+        assert!(image_pids(700, &shim_only).is_empty());
+        assert!(!image_present(700, &shim_only, REFERENCE_FRESH));
     }
 
     #[test]
@@ -1478,11 +1989,11 @@ mod tests {
             &[(200, 900), (201, 1_100), (202, 1_050)],
             &[(200, "pwsh.exe"), (201, "claude.exe"), (202, "claude")],
         );
-        assert_eq!(claude_anchor_in_subtree(200, &snap), Some((202, 1_050)));
+        assert_eq!(image_anchor(200, &snap), Some((202, 1_050)));
 
         // Root itself is claude with a known creation → anchor is the root.
         let root = snap_with(&[], &[(300, 1_000)], &[(300, "claude")]);
-        assert_eq!(claude_anchor_in_subtree(300, &root), Some((300, 1_000)));
+        assert_eq!(image_anchor(300, &root), Some((300, 1_000)));
 
         // Unknown (0) creation sorts LAST: the one with a known time wins.
         let mixed = snap_with(
@@ -1490,11 +2001,11 @@ mod tests {
             &[(400, 900), (401, 0), (402, 2_000)],
             &[(400, "sh"), (401, "claude"), (402, "claude")],
         );
-        assert_eq!(claude_anchor_in_subtree(400, &mixed), Some((402, 2_000)));
+        assert_eq!(image_anchor(400, &mixed), Some((402, 2_000)));
 
         // No claude image anywhere → None.
         let none = snap_with(&[(500, &[501])], &[], &[(500, "sh"), (501, "node")]);
-        assert_eq!(claude_anchor_in_subtree(500, &none), None);
+        assert_eq!(image_anchor(500, &none), None);
     }
 
     #[test]
@@ -1523,6 +2034,22 @@ mod tests {
         // Reject: `--resume` IS recognized now, but its value is not UUID-shaped
         // (and no other id-naming flag is present) → still None.
         assert_eq!(parse_session_id_from_cmdline("claude --resume abc"), None);
+    }
+
+    #[test]
+    fn parse_session_id_on_a_fork_never_names_the_parent() {
+        let parent = "11111111-2222-3333-4444-555555555555";
+        let child = "99999999-8888-7777-6666-555555555555";
+        assert_eq!(
+            parse_session_id_from_cmdline(&format!("claude --resume {parent} --fork-session")),
+            None
+        );
+        assert_eq!(
+            parse_session_id_from_cmdline(&format!(
+                "claude --resume {parent} --session-id {child} --fork-session"
+            )),
+            Some(child.to_string())
+        );
     }
 
     #[test]
@@ -1612,7 +2139,7 @@ mod tests {
             {"ProcessId":11,"CommandLine":null},
             {"ProcessId":12,"CommandLine":"powershell.exe"}
         ]"#;
-        let map = parse_command_lines_json(json);
+        let map = parse_command_lines_json(json).expect("parses");
         assert_eq!(
             map.get(&10).map(|s| s.as_str()),
             Some("C:/bin/claude.exe --session-id abc")
@@ -1623,12 +2150,67 @@ mod tests {
         let single = r#"[{"ProcessId":20,"CommandLine":"claude"}]"#;
         assert_eq!(
             parse_command_lines_json(single)
+                .expect("parses")
                 .get(&20)
                 .map(|s| s.as_str()),
             Some("claude")
         );
-        // Empty stdout → empty map.
-        assert!(parse_command_lines_json("").is_empty());
+        // Empty stdout parses as no rows; the query wrapper, not the
+        // parser, reads "no row for any asked pid" as UNKNOWN.
+        assert_eq!(parse_command_lines_json("").map(|m| m.len()), Some(0));
+        // Unparseable output is UNKNOWN, never an empty map.
+        assert!(parse_command_lines_json("WARNING: something").is_none());
+        assert!(parse_command_lines_json(r#"[{"ProcessId":"x"}]"#).is_none());
+    }
+
+    /// The single-pid shape `@(...) | ConvertTo-Json` actually emits: the
+    /// pipeline unrolls the one-element array into a bare object. Before the
+    /// fix this failed with "invalid type: map, expected a sequence" and read
+    /// as no command line at all.
+    #[cfg(windows)]
+    #[test]
+    fn parse_command_lines_json_accepts_a_single_row_object() {
+        let single = r#"{"ProcessId":20,"CommandLine":"claude --resume abc"}"#;
+        let map = parse_command_lines_json(single).expect("parses");
+        assert_eq!(map.len(), 1);
+        assert_eq!(
+            map.get(&20).map(|s| s.as_str()),
+            Some("claude --resume abc")
+        );
+        assert_eq!(parse_command_lines_json("null").map(|m| m.len()), Some(0));
+    }
+
+    /// Same hardening on the snapshot fallback: one row as a bare object.
+    #[cfg(windows)]
+    #[test]
+    fn parse_powershell_snapshot_accepts_a_single_row_object() {
+        let single = r#"{"ProcessId":7,"ParentProcessId":1,"CreationDate":"/Date(1715911000000)/","Name":"claude.exe","ExecutablePath":null}"#;
+        let snap = parse_powershell_snapshot(single);
+        assert_eq!(
+            snap.parent_map.get(&1).map(|v| v.as_slice()),
+            Some(&[7u32][..])
+        );
+        assert_eq!(snap.names.get(&7).map(|s| s.as_str()), Some("claude.exe"));
+    }
+
+    /// The shape-tolerant row reader every PowerShell JSON parser here uses,
+    /// tested on every OS since the parsers themselves are Windows-only.
+    #[test]
+    fn parse_json_rows_accepts_array_object_null_and_empty() {
+        #[derive(Debug, PartialEq, Deserialize)]
+        struct Row {
+            #[serde(rename = "ProcessId")]
+            pid: u32,
+        }
+        let many: Vec<Row> = parse_json_rows(r#"[{"ProcessId":1},{"ProcessId":2}]"#).unwrap();
+        assert_eq!(many, vec![Row { pid: 1 }, Row { pid: 2 }]);
+        let one: Vec<Row> = parse_json_rows(r#"{"ProcessId":3}"#).unwrap();
+        assert_eq!(one, vec![Row { pid: 3 }]);
+        assert!(parse_json_rows::<Row>("null").unwrap().is_empty());
+        assert!(parse_json_rows::<Row>("  \r\n").unwrap().is_empty());
+        assert!(parse_json_rows::<Row>("[]").unwrap().is_empty());
+        assert!(parse_json_rows::<Row>("not json").is_err());
+        assert!(parse_json_rows::<Row>(r#"{"Other":1}"#).is_err());
     }
 
     #[test]
@@ -1744,10 +2326,6 @@ mod tests {
         // End-to-end: the inclusive-subtree helper sees claude under the shell.
         // reference == the shell's creation in millis so the reuse guard is a
         // no-op (creation does not predate the reference).
-        assert!(claude_present_in_inclusive_subtree(
-            10,
-            &snap,
-            1_715_911_000_000
-        ));
+        assert!(image_present(10, &snap, 1_715_911_000_000));
     }
 }

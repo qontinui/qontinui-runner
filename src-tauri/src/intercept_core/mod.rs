@@ -15,6 +15,12 @@
 //! - [`classify`] — install-verb tables + argv → `(packages, dev, lockfile_sync)`.
 //! - [`gate`] — the `should_block` truth table + `InterceptMode` parse.
 //!
+//! [`npm_placeholder`] is here for the same reason, though it is not pure: it
+//! reads the first bytes of a candidate file. So is [`shim_dir`] — the one
+//! "is this a qontinui shim dir" predicate every PATH walker shares — which
+//! probes for the identity marker, and whose persistent-dir arm reads the
+//! ambient home through `profile_cli::identity_shim_dir`.
+//!
 //! What stayed in the bin (`install_effects_producer`): everything that touches
 //! the coord HTTP client, the keyring, the producer route handlers, the
 //! `PreContext` TTL stash, FS observation, and the per-terminal shim
@@ -33,4 +39,7 @@
 
 pub mod classify;
 pub mod gate;
+pub mod npm_placeholder;
+pub mod settled;
+pub mod shim_dir;
 pub mod types;

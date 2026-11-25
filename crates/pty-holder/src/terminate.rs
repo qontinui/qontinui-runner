@@ -10,8 +10,9 @@
 //! 1. **Take a handle on the process first** — Linux `pidfd_open`, Windows
 //!    `OpenProcess`. From here on the handle refers to ONE process, whatever
 //!    later happens to the pid.
-//! 2. **Then verify** that this pane's lock is HELD right now and its record
-//!    names `holder_pid`. A holder that had died before step 1 left its lock
+//! 2. **Then verify** that this pane's lock is HELD right now, its record
+//!    names `holder_pid`, and — when the record carries the holder's start
+//!    token (Phase 3) — the process behind the handle is that holder. A holder that had died before step 1 left its lock
 //!    acquirable (the lock is an `flock` on a close-on-exec descriptor, so no
 //!    child inherits it), so a held lock naming the pid after step 1 means the
 //!    process behind the handle is that live holder.
@@ -38,6 +39,16 @@ use crate::spawn::signalable_pid;
 pub struct Termination {
     /// A kill was actually delivered to the verified holder.
     pub signalled: bool,
+    /// Nothing was signalled because the holder is PROVABLY already gone —
+    /// the pane's lock was free (also checked when no process had its pid
+    /// when the handle was taken, since a missing pid alone does not prove
+    /// it: an upgraded holder's successor runs under a pid of its own). Its
+    /// death already ended its child (module docs), so a caller must not
+    /// report the child as possibly still running (pty_holder review
+    /// follow-up L4). Never true together with `signalled`, and never
+    /// true on a refusal whose cause leaves the holder's state open (an
+    /// unreadable lock, a lock naming another pid, a failed signal).
+    pub holder_gone: bool,
     /// Human-readable: which path ran, or why nothing was signalled.
     pub detail: String,
 }
@@ -46,29 +57,82 @@ impl Termination {
     fn refused(detail: impl Into<String>) -> Self {
         Termination {
             signalled: false,
+            holder_gone: false,
             detail: format!("not signalled: {}", detail.into()),
+        }
+    }
+
+    fn gone(detail: impl Into<String>) -> Self {
+        Termination {
+            signalled: false,
+            holder_gone: true,
+            detail: format!("not signalled: {}", detail.into()),
+        }
+    }
+
+    fn from_refusal(r: Refusal) -> Self {
+        if r.gone {
+            Self::gone(r.why)
+        } else {
+            Self::refused(r.why)
+        }
+    }
+}
+
+/// Why verification refused, and whether the refusal itself proves the holder
+/// is gone.
+struct Refusal {
+    gone: bool,
+    why: String,
+}
+
+impl Refusal {
+    fn open(why: impl Into<String>) -> Self {
+        Refusal {
+            gone: false,
+            why: why.into(),
         }
     }
 }
 
 /// Step 2 of the module docs: the pane's lock is held and names `holder_pid`.
-fn verify_holder(pane_dir: &Path, pane_id: &PaneId, holder_pid: u32) -> Result<(), String> {
+fn verify_holder(pane_dir: &Path, pane_id: &PaneId, holder_pid: u32) -> Result<(), Refusal> {
     let lock_file = lock_path(pane_dir, pane_id);
     match PaneLock::try_acquire_existing(&lock_file) {
         Ok(TryLock::Held) => {}
         Ok(TryLock::Acquired(lock)) => {
             drop(lock);
-            return Err("the pane's lock is free — the holder is already dead".into());
+            return Err(Refusal {
+                gone: true,
+                why: "the pane's lock is free — the holder is already dead".into(),
+            });
         }
-        Err(e) => return Err(format!("lock unreadable: {e}")),
+        Err(e) => return Err(Refusal::open(format!("lock unreadable: {e}"))),
     }
     match read_record(&lock_file) {
+        // A held lock can be a transient hold (a prober, a forked child —
+        // finding 9bbe1079) on a dead holder's file whose pid was since
+        // reused: when the record carries the holder's start token, the
+        // process behind the handle must BE that holder.
+        Some(r)
+            if r.holder_pid == holder_pid
+                && r.holder_start.as_deref().is_some_and(|t| {
+                    !crate::proc_identity::is_same_process(holder_pid, Some(t))
+                }) =>
+        {
+            // Open, not gone: `is_same_process` is also false when the start
+            // token could not be read, which proves nothing about the holder.
+            Err(Refusal::open(format!(
+                "pid {holder_pid} is not the live holder the lock record names (its start \
+                 token differs or is gone): the holder has exited or the pid was reused"
+            )))
+        }
         Some(r) if r.holder_pid == holder_pid => Ok(()),
-        Some(r) => Err(format!(
+        Some(r) => Err(Refusal::open(format!(
             "the lock names holder pid {}, not {holder_pid}",
             r.holder_pid
-        )),
-        None => Err("no lock record to verify the pid against".into()),
+        ))),
+        None => Err(Refusal::open("no lock record to verify the pid against")),
     }
 }
 
@@ -85,11 +149,34 @@ pub fn terminate_verified_holder(
     imp::terminate(pid, || verify_holder(pane_dir, pane_id, holder_pid))
 }
 
+/// The handle could not be taken because no process has `pid`. That proves
+/// only that THIS pid is gone, not that the pane's holder is: an in-place
+/// upgrade hands the pane to a successor with a pid of its own before the
+/// client's reattach learns it. So the pane's lock still decides — gone only
+/// when verification proves it (the lock is free); any other answer leaves
+/// the holder's state open and refuses.
+fn no_such_process(
+    pid: i32,
+    err: &std::io::Error,
+    verify: impl FnOnce() -> Result<(), Refusal>,
+) -> Termination {
+    match verify() {
+        Err(r) if r.gone => Termination::gone(format!("no process {pid} ({err}) and {}", r.why)),
+        Err(r) => Termination::refused(format!(
+            "no process {pid} ({err}), but the holder's state is open: {}",
+            r.why
+        )),
+        Ok(()) => Termination::refused(format!(
+            "no process {pid} ({err}), but the pane's lock is still held and names it"
+        )),
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod imp {
-    use super::Termination;
+    use super::{Refusal, Termination};
 
-    pub(super) fn terminate(pid: i32, verify: impl FnOnce() -> Result<(), String>) -> Termination {
+    pub(super) fn terminate(pid: i32, verify: impl FnOnce() -> Result<(), Refusal>) -> Termination {
         // SAFETY: pidfd_open(pid, 0) takes no pointers; the result is either
         // -1 or a new descriptor owned (and closed) below.
         let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
@@ -98,11 +185,14 @@ mod imp {
             if err.raw_os_error() == Some(libc::ENOSYS) {
                 return super::plain_kill(pid, verify, "pidfd_open unavailable");
             }
+            if err.raw_os_error() == Some(libc::ESRCH) {
+                return super::no_such_process(pid, &err, verify);
+            }
             return Termination::refused(format!("pidfd_open({pid}): {err}"));
         }
         let fd = fd as libc::c_int;
         let result = match verify() {
-            Err(why) => Termination::refused(why),
+            Err(r) => Termination::from_refusal(r),
             Ok(()) => {
                 // SAFETY: a pidfd we own; null siginfo, no flags.
                 let rc = unsafe {
@@ -117,6 +207,7 @@ mod imp {
                 if rc == 0 {
                     Termination {
                         signalled: true,
+                        holder_gone: false,
                         detail: "SIGKILL to the verified holder through its pidfd".into(),
                     }
                 } else {
@@ -137,9 +228,9 @@ mod imp {
 
 #[cfg(all(unix, not(target_os = "linux")))]
 mod imp {
-    use super::Termination;
+    use super::{Refusal, Termination};
 
-    pub(super) fn terminate(pid: i32, verify: impl FnOnce() -> Result<(), String>) -> Termination {
+    pub(super) fn terminate(pid: i32, verify: impl FnOnce() -> Result<(), Refusal>) -> Termination {
         super::plain_kill(pid, verify, "no pidfd on this platform")
     }
 }
@@ -147,15 +238,16 @@ mod imp {
 /// Unix without a process handle: verify, then `kill(pid)`. See the module
 /// docs' residual.
 #[cfg(unix)]
-fn plain_kill(pid: i32, verify: impl FnOnce() -> Result<(), String>, why: &str) -> Termination {
-    if let Err(e) = verify() {
-        return Termination::refused(e);
+fn plain_kill(pid: i32, verify: impl FnOnce() -> Result<(), Refusal>, why: &str) -> Termination {
+    if let Err(r) = verify() {
+        return Termination::from_refusal(r);
     }
     // SAFETY: a plain signal to a pid in 2..=i32::MAX whose pane lock was just
     // verified held and naming it.
     if unsafe { libc::kill(pid, libc::SIGKILL) } == 0 {
         Termination {
             signalled: true,
+            holder_gone: false,
             detail: format!("SIGKILL to the verified holder by pid ({why})"),
         }
     } else {
@@ -165,27 +257,32 @@ fn plain_kill(pid: i32, verify: impl FnOnce() -> Result<(), String>, why: &str) 
 
 #[cfg(windows)]
 mod imp {
-    use super::Termination;
-    use windows_sys::Win32::Foundation::CloseHandle;
+    use super::{Refusal, Termination};
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER};
     use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
 
-    pub(super) fn terminate(pid: i32, verify: impl FnOnce() -> Result<(), String>) -> Termination {
+    pub(super) fn terminate(pid: i32, verify: impl FnOnce() -> Result<(), Refusal>) -> Termination {
         // SAFETY: OpenProcess takes no pointers; a non-null result is a handle
         // we own and close below.
         let h = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid as u32) };
         if h.is_null() {
-            return Termination::refused(format!(
-                "OpenProcess({pid}): {}",
-                std::io::Error::last_os_error()
-            ));
+            let err = std::io::Error::last_os_error();
+            // OpenProcess on a pid no process has answers
+            // ERROR_INVALID_PARAMETER; access-denied and the rest leave the
+            // holder's state open.
+            if err.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+                return super::no_such_process(pid, &err, verify);
+            }
+            return Termination::refused(format!("OpenProcess({pid}): {err}"));
         }
         let result = match verify() {
-            Err(why) => Termination::refused(why),
+            Err(r) => Termination::from_refusal(r),
             Ok(()) => {
                 // SAFETY: a valid process handle opened with PROCESS_TERMINATE.
                 if unsafe { TerminateProcess(h, 1) } != 0 {
                     Termination {
                         signalled: true,
+                        holder_gone: false,
                         detail: "TerminateProcess on the verified holder's handle (its job \
                                  ends the child tree)"
                             .into(),
@@ -217,6 +314,10 @@ mod tests {
             versions: vec![2],
             started_at_unix_ms: 0,
             holder_build: "test".into(),
+            child_start: None,
+            scope_unit: None,
+            holder_start: None,
+            ended: None,
         }
     }
 
@@ -245,8 +346,21 @@ mod tests {
             };
             lock.write_record(&record(victim.id())).unwrap();
         }
+        // The lock is free now — once no child that another test in this
+        // process forks shares its open file description any more (the
+        // fork-before-exec hold of finding 9bbe1079). Wait for that, so the
+        // case below is the free-lock case it means to be.
+        let end = Instant::now() + Duration::from_secs(5);
+        while !matches!(
+            PaneLock::try_acquire_existing(&lock_file),
+            Ok(TryLock::Acquired(_))
+        ) {
+            assert!(Instant::now() < end, "the dropped lock never became free");
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let t = terminate_verified_holder(&dir, &id, victim.id());
         assert!(!t.signalled, "{t:?}");
+        assert!(t.holder_gone, "a free lock proves the holder gone: {t:?}");
         assert!(
             victim.try_wait().unwrap().is_none(),
             "a free lock's pid was signalled"
@@ -258,9 +372,24 @@ mod tests {
         lock.write_record(&record(victim.id() + 1)).unwrap();
         let t = terminate_verified_holder(&dir, &id, victim.id());
         assert!(!t.signalled, "{t:?}");
+        assert!(
+            !t.holder_gone,
+            "a held lock naming another pid proves nothing about ours: {t:?}"
+        );
         assert!(victim.try_wait().unwrap().is_none());
 
-        lock.write_record(&record(victim.id())).unwrap();
+        // Review round 2, N5: the record names the pid, but its start token
+        // says the holder was another process — a reused pid is refused.
+        let mut reused = record(victim.id());
+        reused.holder_start = Some("linux:another-boot:1".into());
+        lock.write_record(&reused).unwrap();
+        let t = terminate_verified_holder(&dir, &id, victim.id());
+        assert!(!t.signalled, "{t:?}");
+        assert!(victim.try_wait().unwrap().is_none());
+
+        let mut genuine = record(victim.id());
+        genuine.holder_start = crate::proc_identity::start_token(victim.id());
+        lock.write_record(&genuine).unwrap();
         let t = terminate_verified_holder(&dir, &id, victim.id());
         assert!(t.signalled, "{t:?}");
         assert!(t.detail.contains("pidfd"), "{t:?}");
@@ -273,7 +402,87 @@ mod tests {
             !terminate_verified_holder(&dir, &id, 1).signalled,
             "pid 1 is never signalled"
         );
+        // The victim is reaped: no process has its pid now (barring reuse in
+        // these instants), so the handle cannot be taken. While the pane's
+        // lock is still held — an upgraded holder's successor, under a pid of
+        // its own — that is NOT proof the holder is gone: refused.
+        let t = terminate_verified_holder(&dir, &id, victim.id());
+        assert!(!t.signalled, "{t:?}");
+        assert!(!t.holder_gone, "a held lock leaves the holder open: {t:?}");
+        // With the lock free as well, the holder is provably gone. Wait out
+        // a forked-before-exec child's transient hold first (finding
+        // 9bbe1079), as above, so this is the free-lock case it means to be.
         drop(lock);
+        let end = Instant::now() + Duration::from_secs(5);
+        while !matches!(
+            PaneLock::try_acquire_existing(&lock_file),
+            Ok(TryLock::Acquired(_))
+        ) {
+            assert!(Instant::now() < end, "the dropped lock never became free");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let t = terminate_verified_holder(&dir, &id, victim.id());
+        assert!(!t.signalled, "{t:?}");
+        assert!(
+            t.holder_gone,
+            "a reaped pid over a free lock is a gone holder: {t:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review round 6, nit (b): a dead holder's lock held TRANSIENTLY — by
+    /// another open description, as a forked-but-not-yet-exec'd child or a
+    /// prober holds it (finding 9bbe1079) — over a record whose `holder_start`
+    /// does not match the process now behind that pid: the kill is refused.
+    #[test]
+    fn pty_holder_terminate_refuses_a_transient_hold_over_a_mismatched_token() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
+        let dir = std::env::temp_dir().join(format!("ptytt-{}-{nanos:x}", std::process::id()));
+        crate::pane::prepare_private_dir(&dir).unwrap();
+        let id = PaneId::new("t").unwrap();
+        let lock_file = lock_path(&dir, &id);
+        // The process the reused pid now names — this test's own.
+        let mut stranger = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        // The dead holder wrote its record, with ITS start token.
+        {
+            let TryLock::Acquired(mut lock) = PaneLock::try_acquire(&lock_file).unwrap() else {
+                panic!("fresh lock");
+            };
+            let mut dead = record(stranger.id());
+            dead.holder_start = Some("linux:the-dead-holders-boot:1".into());
+            lock.write_record(&dead).unwrap();
+        }
+        // A transient hold of the same file by another open description (a
+        // fork of another test may hold it an instant longer: wait it out).
+        let end = Instant::now() + Duration::from_secs(5);
+        let _transient = loop {
+            if let Ok(TryLock::Acquired(lock)) = PaneLock::try_acquire_existing(&lock_file) {
+                break lock;
+            }
+            assert!(
+                Instant::now() < end,
+                "the dead holder's lock never came free"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let t = terminate_verified_holder(&dir, &id, stranger.id());
+        assert!(!t.signalled, "{t:?}");
+        assert!(t.detail.contains("start token"), "{t:?}");
+        // An unreadable token reads the same as a mismatched one, so this
+        // refusal must not claim the holder is gone (review follow-up L4).
+        assert!(!t.holder_gone, "{t:?}");
+        assert!(
+            stranger.try_wait().unwrap().is_none(),
+            "the stranger behind the reused pid was signalled"
+        );
+        let _ = stranger.kill();
+        let _ = stranger.wait();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

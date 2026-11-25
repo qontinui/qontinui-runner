@@ -664,7 +664,12 @@ impl LoopController {
 
                 let (outcome, _injected) = self
                     .agentic_executor
-                    .run_agentic(
+                    .run_agentic_keyed(
+                        // Its own workflow_ai_sessions key: never resume the
+                        // worker's CLI session as the verifier (or vice versa).
+                        super::phases::agentic::session_phase_for(
+                            super::phases::agentic::AgenticRole::Verifier,
+                        ),
                         config,
                         iteration,
                         "", // No failure context — the verifier generates its own

@@ -25,6 +25,13 @@
 //! caller-authoritative — an operator template that carries a conflicting
 //! permission flag has that flag dropped, never applied. This invariant protects
 //! autonomous spawns from being silently downgraded out of bypass mode.
+//!
+//! The one thing that may replace the spec's permission is the operator's
+//! explicit session posture ([`SessionPermissionSetting`], carried on
+//! [`LaunchConfig`]): selecting `allow_list` swaps every site's bypass flag for
+//! [`PermissionMode::AllowList`], for machines whose IT-managed settings forbid
+//! bypass (plan `2026-10-09-spec-front-end-of-the-software-factory` D7). It is a
+//! typed setting, never a template flag.
 
 use std::collections::HashSet;
 
@@ -36,13 +43,126 @@ const SESSION_ID_PLACEHOLDER: &str = "{sessionId}";
 /// Caller-authoritative permission posture. Always wins over any permission flag
 /// found in an operator template. Defaults to `BypassPermissions` — every
 /// current spawn site is autonomous and must never stall on a prompt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum PermissionMode {
     /// `--permission-mode bypassPermissions` (interactive/stream-json sites).
     #[default]
     BypassPermissions,
     /// `--dangerously-skip-permissions` (autonomous `agent_runtime` sites).
     DangerouslySkip,
+    /// `--permission-mode dontAsk --allowedTools <tools…>`: autonomy without
+    /// bypass (plan `2026-10-09-spec-front-end-of-the-software-factory` D7), for
+    /// machines whose IT-managed Claude Code settings disable bypass mode.
+    ///
+    /// `dontAsk` is Claude Code's no-prompt mode at the same privilege level as
+    /// `default`: a tool something has pre-approved runs, anything else is
+    /// refused instead of raising a prompt nobody is there to answer. What THIS
+    /// renderer guarantees is narrower than "only these tools": the runner never
+    /// widens the list — a template's own tool list, settings file, prompt tool
+    /// and MCP config are dropped, and a caller's `--allowedTools` is
+    /// intersected with it. Settings layers the runner does not control (a
+    /// repository's `.claude/settings.json`, managed settings) can still
+    /// pre-approve more tools; govern those to bound a session fully. An empty
+    /// list renders no `--allowedTools`, so the runner pre-approves nothing.
+    AllowList { tools: Vec<String> },
+}
+
+impl PermissionMode {
+    /// Render this mode's argv flags.
+    pub fn render(&self) -> Vec<String> {
+        match self {
+            PermissionMode::BypassPermissions => {
+                vec![
+                    "--permission-mode".to_string(),
+                    "bypassPermissions".to_string(),
+                ]
+            }
+            PermissionMode::DangerouslySkip => vec!["--dangerously-skip-permissions".to_string()],
+            PermissionMode::AllowList { tools } => {
+                let mut out = vec!["--permission-mode".to_string(), "dontAsk".to_string()];
+                out.extend(allowed_tools_args(tools));
+                out
+            }
+        }
+    }
+}
+
+/// `["--allowedTools", t1, t2, …]` for the non-blank entries of `tools`, or
+/// nothing when none remain. The one renderer for the flag: the
+/// [`PermissionMode::AllowList`] spec, the scheduler's RemoteAgent launch
+/// (`scheduler_remote_agent::claude_args`) and a workflow node's tool policy
+/// (`tool_policy_args::build_tool_policy_cli`) all build it here.
+pub fn allowed_tools_args<S: AsRef<str>>(tools: &[S]) -> Vec<String> {
+    let kept: Vec<String> = tools
+        .iter()
+        .map(|t| t.as_ref().trim())
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect();
+    if kept.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(kept.len() + 1);
+    out.push("--allowedTools".to_string());
+    out.extend(kept);
+    out
+}
+
+/// Operator-selected permission posture for runner-spawned sessions
+/// (`settings.json` key `claude_session_permission`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum SessionPermissionSetting {
+    /// Each spawn site keeps its own bypass flag (the historical behavior).
+    #[default]
+    SiteDefault,
+    /// Every spawn runs [`PermissionMode::AllowList`] with these tools.
+    AllowList {
+        #[serde(default)]
+        tools: Vec<String>,
+    },
+}
+
+impl SessionPermissionSetting {
+    /// The mode a spawn uses under this setting.
+    pub fn apply(&self, site_default: PermissionMode) -> PermissionMode {
+        match self {
+            SessionPermissionSetting::SiteDefault => site_default,
+            SessionPermissionSetting::AllowList { tools } => PermissionMode::AllowList {
+                tools: tools.clone(),
+            },
+        }
+    }
+
+    /// Trim, drop blanks and duplicates, and refuse a tool spec that would
+    /// break argv rendering (a leading `-` reads as a flag).
+    pub fn normalized(&self) -> Result<Self, String> {
+        match self {
+            SessionPermissionSetting::SiteDefault => Ok(SessionPermissionSetting::SiteDefault),
+            SessionPermissionSetting::AllowList { tools } => {
+                let mut seen = HashSet::new();
+                let mut kept = Vec::new();
+                for t in tools {
+                    let t = t.trim();
+                    if t.is_empty() {
+                        continue;
+                    }
+                    if t.starts_with('-') {
+                        return Err(format!(
+                            "allow-list entry '{t}' starts with '-' and would be read as a flag"
+                        ));
+                    }
+                    if t.contains(['\r', '\n']) {
+                        return Err(format!("allow-list entry '{t}' contains a line break"));
+                    }
+                    if seen.insert(t.to_string()) {
+                        kept.push(t.to_string());
+                    }
+                }
+                Ok(SessionPermissionSetting::AllowList { tools: kept })
+            }
+        }
+    }
 }
 
 /// Operator-configured optional launch templates, resolved for one account.
@@ -60,6 +180,11 @@ pub struct LaunchConfig {
     /// per-account override. May be a real `claude …` template OR an opaque alias
     /// (e.g. `clg`) the runner cannot introspect.
     pub account_command: Option<String>,
+    /// `settings.claude_session_permission` — the operator's session permission
+    /// posture. When it selects `allow_list` it replaces the spec's site default
+    /// (see [`SessionPermissionSetting::apply`]); a template never decides
+    /// permission. `Default` (site default) keeps the spec's mode.
+    pub session_permission: SessionPermissionSetting,
 }
 
 impl LaunchConfig {
@@ -69,6 +194,17 @@ impl LaunchConfig {
     /// its account's config dir and hands it here).
     pub fn from_settings(config_dir: Option<&str>) -> Self {
         let default_template = crate::settings::get_claude_default_launch_command();
+        // A per-account command belongs to a subscription account, and those
+        // are off while a model gateway is declared (it may be an alias that
+        // pins its own account dir). Only the machine-global template applies.
+        let session_permission = crate::settings::get_claude_session_permission();
+        if crate::model_gateway::gateway_declared() {
+            return Self {
+                default_template,
+                account_command: None,
+                session_permission,
+            };
+        }
         let account_command = config_dir.and_then(|dir| {
             crate::settings::get_claude_account_launch_commands()
                 .get(dir)
@@ -77,6 +213,7 @@ impl LaunchConfig {
         Self {
             default_template,
             account_command,
+            session_permission,
         }
     }
 }
@@ -112,24 +249,71 @@ pub struct LaunchSpec {
 /// Maximum length (chars) of a `--name` value.
 pub const MAX_SESSION_NAME_CHARS: usize = 40;
 
+/// Bytes of SHA-256 an over-long name ends in, written as 8 lowercase hex chars.
+const SESSION_NAME_DIGEST_BYTES: usize = 4;
+
+/// Chars an over-long name keeps ahead of its `-<digest>`: 31 at a 40-char cap.
+const SESSION_NAME_HEAD_CHARS: usize = MAX_SESSION_NAME_CHARS - 1 - 2 * SESSION_NAME_DIGEST_BYTES;
+
 /// Make `raw` safe to hand to `claude --name`: control characters and newlines
-/// become spaces, whitespace runs collapse to one space, leading `-` is stripped
-/// (a value starting with `-` could be parsed as a flag), and the result is
-/// capped at [`MAX_SESSION_NAME_CHARS`] chars. `None` when nothing is left.
+/// become spaces, whitespace runs collapse to one space, and leading `-` is
+/// stripped (a value starting with `-` could be parsed as a flag). `None` when
+/// nothing is left.
+///
+/// A cleaned value of at most [`MAX_SESSION_NAME_CHARS`] chars is returned
+/// unchanged, so every name coord authors passes through byte-identical. A
+/// longer one is compacted, never cut silently: it becomes its longest run of
+/// leading whole tokens (split on `-` or ` `) that fits in 31 chars — a first
+/// token that alone overflows is cut by chars to 31 — followed by `-` and the
+/// first 8 lowercase hex of the SHA-256 of the whole cleaned value. The result
+/// fits the cap, stays distinct from a value that differs only past the cut,
+/// and never marks the cut with `…`. It is the session's name on every surface
+/// (`--name`, `~/.qontinui/session-names/<id>`, the tab), and
+/// `continuation-session.py` will not use a name ending in `…`, which reads as
+/// cut from a longer value that no surface holds. It also sanitises to itself,
+/// which `compose_flags` relies on when it re-sanitises a call site's name. Plan
+/// `2026-11-09-gate-continuations-get-a-display-truncated-name-so-the-visible-hand-off-refuses-them`
+/// D5.
 pub fn sanitize_session_name(raw: &str) -> Option<String> {
     let spaced: String = raw
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
     let collapsed = spaced.split_whitespace().collect::<Vec<_>>().join(" ");
-    let trimmed = collapsed.trim_start_matches(|c: char| c == '-' || c.is_whitespace());
-    let capped: String = trimmed.chars().take(MAX_SESSION_NAME_CHARS).collect();
-    let capped = capped.trim_end().to_string();
-    if capped.is_empty() {
+    let cleaned = collapsed.trim_start_matches(|c: char| c == '-' || c.is_whitespace());
+    if cleaned.is_empty() {
         None
+    } else if cleaned.chars().count() <= MAX_SESSION_NAME_CHARS {
+        Some(cleaned.to_string())
     } else {
-        Some(capped)
+        Some(compact_session_name(cleaned))
     }
+}
+
+/// [`sanitize_session_name`]'s form for a cleaned value over the cap:
+/// `<whole leading tokens>-<digest>`.
+fn compact_session_name(cleaned: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let is_sep = |c: char| c == '-' || c == ' ';
+    // Counted in chars throughout, never sliced by byte (`clippy::string_slice`).
+    let window: String = cleaned.chars().take(SESSION_NAME_HEAD_CHARS).collect();
+    let window_ends_a_token = cleaned
+        .chars()
+        .nth(SESSION_NAME_HEAD_CHARS)
+        .is_some_and(is_sep);
+    // Whole tokens only: a token the window ends inside is dropped, and so are
+    // the separators ahead of it. `cleaned` never starts with a separator, so a
+    // window holding none is a first token that alone overflows, cut by chars.
+    let head = if window_ends_a_token {
+        window.trim_end_matches(is_sep)
+    } else {
+        window
+            .rsplit_once(is_sep)
+            .map_or(window.as_str(), |(kept, _)| kept.trim_end_matches(is_sep))
+    };
+    let digest = Sha256::digest(cleaned.as_bytes());
+    let digest = hex::encode(&digest[..SESSION_NAME_DIGEST_BYTES]);
+    format!("{head}-{digest}")
 }
 
 /// A parsed template flag and the value tokens that follow it (arity inferred:
@@ -227,8 +411,21 @@ pub fn render_program_and_argv(spec: &LaunchSpec, cfg: &LaunchConfig) -> (String
 /// flags are joined onto a bare `claude` head and prefixed with the
 /// `CLAUDE_CONFIG_DIR` assignment (omitted when `config_dir` is `None`).
 pub fn render_pty_command(spec: &LaunchSpec, cfg: &LaunchConfig, is_windows: bool) -> String {
+    // An opaque alias applies no permission flag the runner can see, so under
+    // an allow-list posture it is refused (review M1): the composed command,
+    // which carries the allow-list, is typed instead.
+    let allow_list = matches!(
+        cfg.session_permission.apply(spec.permission.clone()),
+        PermissionMode::AllowList { .. }
+    );
     if let Some(alias) = pty_verbatim_alias(cfg) {
-        return alias;
+        if !allow_list {
+            return alias;
+        }
+        tracing::warn!(
+            "account launch alias ignored: an allow-list permission posture cannot be applied \
+             through an opaque alias"
+        );
     }
 
     let flags = compose_flags(spec, cfg);
@@ -255,24 +452,31 @@ pub fn render_pty_command(spec: &LaunchSpec, cfg: &LaunchConfig, is_windows: boo
 fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
 
-    // 1. Permission — caller-authoritative, always applied.
-    match spec.permission {
-        PermissionMode::BypassPermissions => {
-            out.push("--permission-mode".to_string());
-            out.push("bypassPermissions".to_string());
-        }
-        PermissionMode::DangerouslySkip => {
-            out.push("--dangerously-skip-permissions".to_string());
+    // 1. Permission — caller-authoritative, always applied. The operator's
+    //    explicit session posture may replace the site default; a template
+    //    never can.
+    //    Under an allow-list, a caller-supplied `--allowedTools` (a workflow
+    //    node's tool policy) NARROWS the list — it is intersected and removed
+    //    from the trailing args, never appended (review M1).
+    let mut permission = cfg.session_permission.apply(spec.permission.clone());
+    let mut extra_required = spec.extra_required.clone();
+    if let PermissionMode::AllowList { tools } = &permission {
+        if let Some(caller_tools) = take_caller_allowed_tools(&mut extra_required) {
+            permission = PermissionMode::AllowList {
+                tools: intersect_tool_lists(tools, &caller_tools),
+            };
         }
     }
+    out.extend(permission.render());
+    let allow_list_spec = matches!(permission, PermissionMode::AllowList { .. });
 
     // Resolve the claude template to layer in (per-account claude command wins
     // over the global default; an opaque account alias falls through to the
     // global default for the argv/compose path).
     let template = claude_template(cfg);
     let pin = spec.resume_id.as_deref().or(spec.session_id.as_deref());
-    let provided = provided_flag_names(&spec.extra_required);
-    let caller_owns_append_prompt = provides_append_prompt_flag(&spec.extra_required);
+    let provided = provided_flag_names(&extra_required);
+    let caller_owns_append_prompt = provides_append_prompt_flag(&extra_required);
     let name = spec.name.as_deref().and_then(sanitize_session_name);
 
     let mut template_model: Option<String> = None;
@@ -280,8 +484,13 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
     let mut session_via_placeholder = false;
 
     if let Some(t) = &template {
+        // `had_placeholder` only says the template MENTIONS `{sessionId}`.
+        // Whether the spec's own session flag is suppressed is decided per
+        // unit below: only a KEPT session-naming flag that carries the pin
+        // positions it. A placeholder anywhere else (`--name {sessionId}`, or
+        // `-c {sessionId}`, whose unit is dropped) leaves argv without an id
+        // unless the spec's flag is still appended.
         let had_placeholder = t.contains(SESSION_ID_PLACEHOLDER);
-        session_via_placeholder = had_placeholder;
         let substituted = t.replace(SESSION_ID_PLACEHOLDER, pin.unwrap_or(""));
         let tokens = shell_tokenize(&substituted);
         // Drop the `claude` head token (guaranteed present — `claude_template`
@@ -292,19 +501,67 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
                 // Permission is spec-owned: drop any template permission flag so
                 // it can never override the caller.
                 "--permission-mode" | "--dangerously-skip-permissions" => {}
-                // Model is decided below (spec beats template).
+                n if n.starts_with("--permission-mode=") => {}
+                // Under an allow-list spec the tool list is spec-owned too: a
+                // template's own `--allowedTools` would widen it, and
+                // `--allow-dangerously-skip-permissions` would re-open bypass.
+                n if allow_list_spec && is_allow_list_owned_flag(n) => {
+                    tracing::warn!(
+                        flag = %flag_name_only(n),
+                        "launch template flag dropped: the allow-list permission mode owns it"
+                    );
+                }
+                // Model is decided below (spec beats template), in either
+                // spelling: an attached `--model=<m>` left in `other_units`
+                // would ride along after the spec's `--model` and, the CLI
+                // taking the last value, silently override it.
                 "--model" => template_model = unit.values.first().cloned(),
+                n if n.starts_with("--model=") => {
+                    template_model = n
+                        .strip_prefix("--model=")
+                        .filter(|m| !m.is_empty())
+                        .map(str::to_string)
+                }
                 // Name is spec-owned when the caller supplies one: drop the
                 // template's `--name` / `-n` (either spelling) so two never ship.
                 "--name" | "-n" if name.is_some() => {}
                 n if name.is_some() && n.starts_with("--name=") => {}
-                // Session flags: when the operator positioned the id via the
-                // `{sessionId}` placeholder, keep the flag in place; otherwise the
-                // spec owns session and we drop the template's.
-                "--session-id" | "--resume" => {
+                // Session flags that NAME an id — `--session-id`, `--resume`,
+                // `-r` and the `--session-id=` / `--resume=` inline forms: when
+                // the operator positioned the id via the `{sessionId}`
+                // placeholder, keep the flag in place; otherwise the spec owns
+                // session and we drop the template's.
+                n if names_session_id(n) => {
                     if had_placeholder {
+                        let carries_pin = match pin {
+                            Some(p) => unit.name.contains(p) || unit.values.iter().any(|v| v == p),
+                            None => true,
+                        };
+                        session_via_placeholder |= carries_pin;
                         other_units.push(unit);
                     }
+                }
+                // Every other session choice — `--continue` / `-c` ("the most
+                // recent conversation in this cwd") and the `resume`
+                // subcommand, i.e. the rest of the one token set
+                // `claude_env::claude_argv_chooses_session` — cannot stand
+                // beside the spec's `--session-id` / `--resume`: Claude Code
+                // refuses the pair ("--session-id with --continue or --resume
+                // also needs --fork-session", measured on 2.1.330), and were it
+                // accepted the session would no longer be the one the runner
+                // pinned (plan
+                // `2026-11-21-a-live-claude-session-loses-its-sessions-pid-json-record`,
+                // Phase 2). So whenever the spec names a session it is dropped,
+                // including when the template positions that id itself through
+                // `{sessionId}`.
+                n if pin.is_some()
+                    && qontinui_runner_lib::claude_env::claude_argv_chooses_session(&[n]) =>
+                {
+                    tracing::warn!(
+                        flag = %flag_name_only(&unit.name),
+                        "launch template flag dropped: the spec pins the session, so the \
+                         template cannot choose a different one"
+                    );
                 }
                 // The append prompt flags are one mutually-exclusive group: when
                 // the caller supplies either (the runner's spawn-time carrier),
@@ -313,9 +570,20 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
                 // what a reader of the launch would never guess.
                 name if caller_owns_append_prompt && is_append_prompt_flag(name) => {
                     tracing::warn!(
-                        flag = %name,
+                        flag = %flag_name_only(name),
                         "launch template flag dropped: the caller's system-prompt carrier owns \
                          the append slot and Claude Code refuses both append flags together"
+                    );
+                }
+                // Under an allow-list ONLY a known-harmless template flag
+                // survives (review N4): anything else — `--plugin-dir` (plugins
+                // carry PreToolUse allow hooks), `--add-dir`, a flag this
+                // runner does not know yet — could widen what runs.
+                n if allow_list_spec && !is_permitted_under_allow_list(n) => {
+                    tracing::warn!(
+                        flag = %flag_name_only(n),
+                        "launch template flag dropped: not permitted under the allow-list \
+                         permission mode"
                     );
                 }
                 // Any other operator flag is layered in, unless the caller's
@@ -323,7 +591,7 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
                 _ => {
                     if provided.contains(&unit.name) {
                         tracing::warn!(
-                            flag = %unit.name,
+                            flag = %flag_name_only(&unit.name),
                             "launch template flag dropped: the caller supplies the same flag"
                         );
                     } else {
@@ -370,9 +638,91 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
 
     // 5. Caller's required trailing args, verbatim and in order (carries the
     //    `-- <prompt>` positional). Never reordered or deduped.
-    out.extend(spec.extra_required.iter().cloned());
+    out.extend(extra_required);
 
     out
+}
+
+/// Remove every `--allowedTools` / `--allowed-tools` unit (spaced or
+/// `=`-attached) ahead of the `--` terminator from `extra`, returning the tools
+/// they named, or `None` when the caller supplied no such flag.
+fn take_caller_allowed_tools(extra: &mut Vec<String>) -> Option<Vec<String>> {
+    let mut found: Option<Vec<String>> = None;
+    let mut kept = Vec::with_capacity(extra.len());
+    let mut i = 0;
+    while i < extra.len() {
+        let tok = &extra[i];
+        if tok == "--" {
+            kept.extend(extra[i..].iter().cloned());
+            break;
+        }
+        let (name, attached) = match tok.split_once('=') {
+            Some((n, v)) => (n, Some(v)),
+            None => (tok.as_str(), None),
+        };
+        if matches!(name, "--allowedTools" | "--allowed-tools") {
+            let list = found.get_or_insert_with(Vec::new);
+            if let Some(v) = attached {
+                list.extend(split_tool_specs(v));
+            }
+            i += 1;
+            while i < extra.len() && !extra[i].starts_with('-') {
+                list.extend(split_tool_specs(&extra[i]));
+                i += 1;
+            }
+            continue;
+        }
+        kept.push(tok.clone());
+        i += 1;
+    }
+    *extra = kept;
+    found
+}
+
+/// Split one `--allowedTools` value the way Claude Code reads it: comma or
+/// whitespace separated, except inside a specifier's parentheses
+/// (`Bash(git log, status)` is one tool).
+fn split_tool_specs(value: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut cur = String::new();
+    for ch in value.chars() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        if depth == 0 && (ch == ',' || ch.is_whitespace()) {
+            if !cur.trim().is_empty() {
+                out.push(cur.trim().to_string());
+            }
+            cur.clear();
+        } else {
+            cur.push(ch);
+        }
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur.trim().to_string());
+    }
+    out
+}
+
+/// The tools in `allow` that `narrower` also names, in `allow`'s order. Never
+/// adds a tool `allow` lacks — the allow-list can be narrowed, never widened.
+pub fn intersect_tool_lists<A: AsRef<str>, B: AsRef<str>>(
+    allow: &[A],
+    narrower: &[B],
+) -> Vec<String> {
+    let wanted: HashSet<String> = narrower
+        .iter()
+        .flat_map(|t| split_tool_specs(t.as_ref()))
+        .collect();
+    let mut seen = HashSet::new();
+    allow
+        .iter()
+        .flat_map(|t| split_tool_specs(t.as_ref()))
+        .filter(|t| wanted.contains(t) && seen.insert(t.clone()))
+        .collect()
 }
 
 /// The claude template to parse for flag composition, honoring precedence:
@@ -400,6 +750,17 @@ fn pty_verbatim_alias(cfg: &LaunchConfig) -> Option<String> {
         .as_ref()
         .filter(|a| !is_claude_command(a))
         .cloned()
+}
+
+/// Is this template unit a session flag that NAMES an id — `--session-id`,
+/// `--resume`, `-r`, or the `--session-id=…` / `--resume=…` inline form? A
+/// subset of `claude_env::claude_argv_chooses_session`: the members that can
+/// carry a `{sessionId}` placeholder. Case-insensitive, as that set is.
+fn names_session_id(name: &str) -> bool {
+    let t = name.to_ascii_lowercase();
+    matches!(t.as_str(), "--session-id" | "--resume" | "-r")
+        || t.starts_with("--session-id=")
+        || t.starts_with("--resume=")
 }
 
 /// Whether `s` is a recognizable `claude …` invocation (vs. an opaque alias).
@@ -438,6 +799,64 @@ const APPEND_PROMPT_FLAG_GROUP: [&str; 2] =
 fn is_append_prompt_flag(token: &str) -> bool {
     let name = token.split_once('=').map_or(token, |(name, _)| name);
     APPEND_PROMPT_FLAG_GROUP.contains(&name)
+}
+
+/// Template flags permitted under an [`PermissionMode::AllowList`] spec
+/// (spaced or `=`-attached). An allow-list of flags, not a deny-list, so a CLI
+/// flag added later is dropped until someone decides it is harmless.
+fn is_permitted_under_allow_list(token: &str) -> bool {
+    let name = token.split_once('=').map_or(token, |(name, _)| name);
+    matches!(
+        name,
+        "--model"
+            | "--fallback-model"
+            | "--effort"
+            | "--name"
+            | "-n"
+            | "--verbose"
+            | "--debug"
+            | "-d"
+            // `--debug-file` is NOT here (review L5): it writes to an
+            // arbitrary path. `--ide` and the `*-system-prompt-file` flags
+            // stay: they only READ a prompt file or attach to the IDE, and
+            // grant no tool.
+            | "--output-format"
+            | "--input-format"
+            | "--include-partial-messages"
+            | "--replay-user-messages"
+            | "--max-turns"
+            | "--append-system-prompt"
+            | "--append-system-prompt-file"
+            | "--system-prompt"
+            | "--system-prompt-file"
+            | "--exclude-dynamic-system-prompt-sections"
+            | "--ide"
+    )
+}
+
+/// A template flag's NAME for a log line: the part before an attached `=value`
+/// (review L2). A value can be a path or a secret, and never reaches a log.
+fn flag_name_only(token: &str) -> &str {
+    token.split_once('=').map_or(token, |(name, _)| name)
+}
+
+/// Template flags an [`PermissionMode::AllowList`] spec owns, in either the
+/// spaced or the `=`-attached spelling.
+fn is_allow_list_owned_flag(token: &str) -> bool {
+    let name = token.split_once('=').map_or(token, |(name, _)| name);
+    matches!(
+        name,
+        "--allowedTools"
+            | "--allowed-tools"
+            | "--allow-dangerously-skip-permissions"
+            // Each of these can pre-approve or proxy tools past the list: a
+            // settings layer's `permissions.allow`, a prompt tool that answers
+            // "allow", an MCP config that adds tools.
+            | "--settings"
+            | "--permission-prompt-tool"
+            | "--mcp-config"
+            | "--strict-mcp-config"
+    )
 }
 
 /// Does the caller's `extra_required` carry an append prompt flag ahead of its
@@ -538,6 +957,36 @@ fn shell_tokenize(s: &str) -> Vec<String> {
 /// characters the shell would otherwise split or interpret. Uses literal
 /// single-quoting for both PowerShell and POSIX (differing only in the escape of
 /// an embedded quote).
+/// The one check for a path the runner interpolates inside double quotes in a
+/// typed shell command (`CLAUDE_CONFIG_DIR="<dir>"`), used by both the launch
+/// and the resume renderer (review N5). Refuses anything that could close the
+/// quote or expand inside it on POSIX shells or PowerShell: `"`, backtick,
+/// `$`, `!` (history expansion), the Unicode quotes PowerShell treats as
+/// quotes (U+2018–U+201E), control characters, and a trailing backslash
+/// (which would escape the closing quote).
+pub fn check_shell_safe_path(path: &str) -> Result<(), String> {
+    let bad = path.chars().find(|c| {
+        matches!(c, '"' | '`' | '$' | '!')
+            || ('\u{2018}'..='\u{201E}').contains(c)
+            || c.is_control()
+    });
+    if let Some(c) = bad {
+        return Err(format!(
+            "refusing to type a command with an unsafe character ({c:?}) in the path {path:?}"
+        ));
+    }
+    if path.ends_with('\\') {
+        return Err(format!(
+            "refusing to type a command with a trailing backslash in the path {path:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// Characters PowerShell reads as a single quote inside a single-quoted
+/// literal: ASCII `'` and U+2018–U+201B. Each is escaped by doubling it.
+const POWERSHELL_SINGLE_QUOTES: &[char] = &['\'', '\u{2018}', '\u{2019}', '\u{201A}', '\u{201B}'];
+
 fn shell_quote(tok: &str, is_windows: bool) -> String {
     let safe = !tok.is_empty()
         && tok
@@ -547,8 +996,18 @@ fn shell_quote(tok: &str, is_windows: bool) -> String {
         return tok.to_string();
     }
     if is_windows {
-        // PowerShell single-quote literal: embedded ' is doubled.
-        format!("'{}'", tok.replace('\'', "''"))
+        // PowerShell single-quote literal: every character PowerShell reads as
+        // a single quote — ASCII and the Unicode ones — is doubled (review N5).
+        let mut out = String::with_capacity(tok.len() + 2);
+        out.push('\'');
+        for c in tok.chars() {
+            if POWERSHELL_SINGLE_QUOTES.contains(&c) {
+                out.push(c);
+            }
+            out.push(c);
+        }
+        out.push('\'');
+        out
     } else {
         // POSIX single-quote literal: embedded ' is closed, escaped, reopened.
         format!("'{}'", tok.replace('\'', "'\\''"))
@@ -570,6 +1029,7 @@ mod tests {
         LaunchConfig {
             default_template: Some(t.to_string()),
             account_command: None,
+            ..Default::default()
         }
     }
 
@@ -599,6 +1059,475 @@ mod tests {
         assert_eq!(argv.iter().filter(|a| *a == "--permission-mode").count(), 1);
     }
 
+    fn allow_list(tools: &[&str]) -> PermissionMode {
+        PermissionMode::AllowList {
+            tools: tools.iter().map(|t| t.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn allow_list_renders_dont_ask_and_the_tool_list() {
+        let mut s = spec();
+        s.permission = allow_list(&["Read", " Bash(git status) ", ""]);
+        s.extra_required = vec!["--".to_string(), "do it".to_string()];
+        let argv = render_argv(&s, &LaunchConfig::default(), "claude");
+        assert_eq!(
+            argv,
+            vec![
+                "claude",
+                "--permission-mode",
+                "dontAsk",
+                "--allowedTools",
+                "Read",
+                "Bash(git status)",
+                "--",
+                "do it"
+            ]
+        );
+        assert!(!argv
+            .iter()
+            .any(|a| a.contains("bypass") || a.contains("dangerously")));
+    }
+
+    /// Review M1: a caller-supplied `--allowedTools` (a workflow node's tool
+    /// policy) is INTERSECTED with the allow-list, never appended to it.
+    #[test]
+    fn allow_list_intersects_caller_allowed_tools() {
+        let mut s = spec();
+        s.permission = allow_list(&["Read", "Edit"]);
+        s.extra_required = vec![
+            "--allowedTools".to_string(),
+            "Read".to_string(),
+            "Bash".to_string(),
+            "--".to_string(),
+            "go".to_string(),
+        ];
+        let argv = render_argv(&s, &LaunchConfig::default(), "claude");
+        assert_eq!(
+            argv.iter().filter(|a| *a == "--allowedTools").count(),
+            1,
+            "{argv:?}"
+        );
+        assert_eq!(value_after(&argv, "--allowedTools"), Some("Read"));
+        assert!(!argv.iter().any(|a| a == "Bash" || a == "Edit"), "{argv:?}");
+        assert_eq!(&argv[argv.len() - 2..], ["--", "go"]);
+    }
+
+    /// Review M1: a caller tool list disjoint from the allow-list leaves the
+    /// session with NO pre-approved tools rather than the caller's.
+    #[test]
+    fn allow_list_disjoint_caller_tools_pre_approve_nothing() {
+        let mut s = spec();
+        s.permission = allow_list(&["Read"]);
+        s.extra_required = vec!["--allowedTools".to_string(), "Bash".to_string()];
+        let argv = render_argv(&s, &LaunchConfig::default(), "claude");
+        assert_eq!(argv, vec!["claude", "--permission-mode", "dontAsk"]);
+    }
+
+    /// Review M1: under an allow-list, a template may not carry its own
+    /// settings layer, permission-prompt tool or MCP config — each could
+    /// pre-approve or proxy tools past the list.
+    #[test]
+    fn allow_list_drops_template_settings_prompt_tool_and_mcp_config() {
+        let mut s = spec();
+        s.permission = allow_list(&["Read"]);
+        let argv = render_argv(
+            &s,
+            &tmpl(
+                "claude --settings /t/s.json --permission-prompt-tool mcp__x__y \
+                 --mcp-config /t/m.json --settings=/t/b.json --model opus",
+            ),
+            "claude",
+        );
+        for gone in [
+            "--settings",
+            "/t/s.json",
+            "--permission-prompt-tool",
+            "mcp__x__y",
+            "--mcp-config",
+            "/t/m.json",
+            "--settings=/t/b.json",
+        ] {
+            assert!(!argv.iter().any(|a| a == gone), "{gone} leaked: {argv:?}");
+        }
+        assert_eq!(value_after(&argv, "--model"), Some("opus"));
+    }
+
+    /// Review L2: a dropped flag is logged by name only, never its value.
+    #[test]
+    fn flag_name_only_strips_an_attached_value() {
+        assert_eq!(flag_name_only("--debug-file=/secret/path"), "--debug-file");
+        assert_eq!(flag_name_only("--settings={\"k\":\"v\"}"), "--settings");
+        assert_eq!(flag_name_only("--verbose"), "--verbose");
+    }
+
+    /// Review N4: under an allow-list only a known-harmless set of template
+    /// flags survives — `--plugin-dir` (plugins carry PreToolUse allow hooks)
+    /// and any flag the runner does not know are dropped.
+    #[test]
+    fn allow_list_keeps_only_permitted_template_flags() {
+        let mut s = spec();
+        s.permission = allow_list(&["Read"]);
+        let argv = render_argv(
+            &s,
+            &tmpl(
+                "claude --plugin-dir /p --brand-new-flag x --model opus --verbose \
+                 --add-dir /elsewhere",
+            ),
+            "claude",
+        );
+        for gone in [
+            "--plugin-dir",
+            "/p",
+            "--brand-new-flag",
+            "x",
+            "--add-dir",
+            "/elsewhere",
+        ] {
+            assert!(!argv.iter().any(|a| a == gone), "{gone} leaked: {argv:?}");
+        }
+        assert_eq!(value_after(&argv, "--model"), Some("opus"));
+        assert!(argv.iter().any(|a| a == "--verbose"));
+        // Review L5: `--debug-file` writes to an arbitrary path, so it is not
+        // harmless under an allow-list, in either spelling.
+        let argv = render_argv(
+            &s,
+            &tmpl("claude --debug-file /tmp/d.log --debug-file=/tmp/e.log --verbose"),
+            "claude",
+        );
+        assert!(
+            !argv
+                .iter()
+                .any(|a| a.starts_with("--debug-file") || a.ends_with(".log")),
+            "{argv:?}"
+        );
+        // Outside an allow-list the same template flags still layer in.
+        let argv = render_argv(&spec(), &tmpl("claude --plugin-dir /p"), "claude");
+        assert_eq!(value_after(&argv, "--plugin-dir"), Some("/p"));
+    }
+
+    /// Review N5: one shared refusal for paths interpolated into a typed
+    /// command — smart quotes, `!`, a trailing backslash and the existing set.
+    #[test]
+    fn shell_safe_path_check_refuses_quote_breakers() {
+        for bad in [
+            "/x\u{2018}y",
+            "/x\u{2019}y",
+            "/x\u{201C}y",
+            "/x\u{201D}y",
+            "/x\u{201E}y",
+            "/x!y",
+            "C:\\claude\\",
+            "/x\"y",
+            "/x$y",
+            "/x`y",
+            "/x\ny",
+        ] {
+            assert!(check_shell_safe_path(bad).is_err(), "{bad:?} accepted");
+        }
+        for good in [
+            "/home/u/.claude",
+            "C:\\Users\\a b\\.claude-x",
+            "C:/claude/acct (2)",
+        ] {
+            assert!(check_shell_safe_path(good).is_ok(), "{good:?} refused");
+        }
+    }
+
+    /// Review N5: PowerShell treats U+2018-201B as single quotes too, so the
+    /// single-quoted literal doubles them like `'`.
+    #[test]
+    fn powershell_quote_doubles_unicode_single_quotes() {
+        assert_eq!(shell_quote("a\u{2019}b", true), "'a\u{2019}\u{2019}b'");
+        assert_eq!(shell_quote("a\u{2018}b'c", true), "'a\u{2018}\u{2018}b''c'");
+    }
+
+    /// Review M1: an opaque account alias cannot be introspected, so under an
+    /// allow-list it is never typed; the composed command is used instead.
+    #[test]
+    fn allow_list_refuses_an_opaque_account_alias() {
+        let cfg = LaunchConfig {
+            account_command: Some("clg".to_string()),
+            session_permission: SessionPermissionSetting::AllowList {
+                tools: vec!["Read".to_string()],
+            },
+            ..Default::default()
+        };
+        let cmd = render_pty_command(&spec(), &cfg, false);
+        assert_ne!(cmd, "clg");
+        assert!(
+            cmd.starts_with("claude --permission-mode dontAsk --allowedTools Read"),
+            "{cmd}"
+        );
+    }
+
+    #[test]
+    fn allow_list_with_no_tools_renders_no_allowed_tools_flag() {
+        let mut s = spec();
+        s.permission = allow_list(&[" ", ""]);
+        let argv = render_argv(&s, &LaunchConfig::default(), "claude");
+        assert_eq!(argv, vec!["claude", "--permission-mode", "dontAsk"]);
+    }
+
+    /// Rendered from the spec, never from a template: a template's permission
+    /// flags, its own tool list and the bypass opt-in are all dropped.
+    #[test]
+    fn allow_list_drops_template_permission_and_tool_flags() {
+        let mut s = spec();
+        s.permission = allow_list(&["Read"]);
+        let argv = render_argv(
+            &s,
+            &tmpl(
+                "claude --permission-mode=bypassPermissions --allowedTools Bash Write \
+                 --allow-dangerously-skip-permissions --allowed-tools=Edit --model opus",
+            ),
+            "claude",
+        );
+        assert_eq!(argv.iter().filter(|a| *a == "--permission-mode").count(), 1);
+        assert_eq!(value_after(&argv, "--permission-mode"), Some("dontAsk"));
+        assert_eq!(argv.iter().filter(|a| *a == "--allowedTools").count(), 1);
+        for gone in [
+            "Bash",
+            "Write",
+            "--allow-dangerously-skip-permissions",
+            "--allowed-tools=Edit",
+            "--permission-mode=bypassPermissions",
+        ] {
+            assert!(!argv.iter().any(|a| a == gone), "{gone} leaked: {argv:?}");
+        }
+        // Unrelated template flags still layer in.
+        assert_eq!(value_after(&argv, "--model"), Some("opus"));
+    }
+
+    /// The same template flags are kept for a non-allow-list spec (only the
+    /// permission flag itself is spec-owned there).
+    #[test]
+    fn template_tool_list_kept_under_bypass() {
+        let argv = render_argv(&spec(), &tmpl("claude --allowedTools Bash"), "claude");
+        assert_eq!(value_after(&argv, "--allowedTools"), Some("Bash"));
+    }
+
+    #[test]
+    fn operator_allow_list_posture_replaces_every_site_default() {
+        let cfg = LaunchConfig {
+            session_permission: SessionPermissionSetting::AllowList {
+                tools: vec!["Read".to_string()],
+            },
+            ..Default::default()
+        };
+        for site in [
+            PermissionMode::BypassPermissions,
+            PermissionMode::DangerouslySkip,
+        ] {
+            let mut s = spec();
+            s.permission = site;
+            let argv = render_argv(&s, &cfg, "claude");
+            assert_eq!(
+                &argv[1..5],
+                ["--permission-mode", "dontAsk", "--allowedTools", "Read"]
+            );
+            assert!(!argv
+                .iter()
+                .any(|a| a.contains("dangerously") || a == "bypassPermissions"));
+        }
+        // The PTY renderer composes the same flags.
+        let cmd = render_pty_command(&spec(), &cfg, false);
+        assert!(
+            cmd.starts_with("claude --permission-mode dontAsk --allowedTools Read"),
+            "{cmd}"
+        );
+    }
+
+    #[test]
+    fn site_default_posture_keeps_the_spec_mode() {
+        let mut s = spec();
+        s.permission = PermissionMode::DangerouslySkip;
+        let argv = render_argv(&s, &LaunchConfig::default(), "claude");
+        assert_eq!(argv, vec!["claude", "--dangerously-skip-permissions"]);
+    }
+
+    /// Plan `2026-11-21-a-live-claude-session-loses-its-sessions-pid-json-record`
+    /// Phase 2: when the spec pins the session (new or resumed), an operator
+    /// template's `--continue` / `-c` is dropped, so argv carries exactly one
+    /// session choice — the spec's id.
+    #[test]
+    fn spec_owned_session_drops_a_template_continue() {
+        const ID: &str = "7b97f1e8-35c0-4bec-992d-63e5a3dc55d7";
+        for template in ["claude --continue --verbose", "claude -c --verbose"] {
+            let mut new_session = spec();
+            new_session.session_id = Some(ID.to_string());
+            let argv = render_argv(&new_session, &tmpl(template), "claude");
+            assert!(
+                !argv.iter().any(|a| a == "--continue" || a == "-c"),
+                "{template}: {argv:?}"
+            );
+            assert_eq!(
+                argv.iter().filter(|a| a.as_str() == "--session-id").count(),
+                1,
+                "{template}: {argv:?}"
+            );
+            assert_eq!(value_after(&argv, "--session-id"), Some(ID));
+            // The template's other flags still layer in.
+            assert!(
+                argv.iter().any(|a| a == "--verbose"),
+                "{template}: {argv:?}"
+            );
+
+            let mut resumed = spec();
+            resumed.resume_id = Some(ID.to_string());
+            let argv = render_argv(&resumed, &tmpl(template), "claude");
+            assert!(
+                !argv.iter().any(|a| a == "--continue" || a == "-c"),
+                "{template}: {argv:?}"
+            );
+            assert_eq!(
+                argv.iter().filter(|a| a.as_str() == "--resume").count(),
+                1,
+                "{template}: {argv:?}"
+            );
+            assert_eq!(value_after(&argv, "--resume"), Some(ID));
+        }
+
+        // With no spec session the operator's own choice is left alone.
+        let argv = render_argv(&spec(), &tmpl("claude --continue"), "claude");
+        assert!(argv.iter().any(|a| a == "--continue"), "{argv:?}");
+    }
+
+    /// The drop covers every spelling of a session choice in flag (or leading
+    /// subcommand) position, not only exact names: `-r <id>`, `--resume=<id>`,
+    /// `--session-id=<id>` and a leading `resume` subcommand in a template never
+    /// ride beside the spec's own id. (A bare `resume` that `parse_units` folds
+    /// in as the VALUE of a preceding flag is judged as that flag's value, not
+    /// as a session choice; that shape is not covered here.)
+    #[test]
+    fn spec_owned_session_drops_every_spelling_of_a_template_session_choice() {
+        const ID: &str = "7b97f1e8-35c0-4bec-992d-63e5a3dc55d7";
+        const OTHER: &str = "52e88829-c137-421d-893a-b45feac50a00";
+        for template in [
+            "claude -r 52e88829-c137-421d-893a-b45feac50a00 --verbose",
+            "claude --resume=52e88829-c137-421d-893a-b45feac50a00 --verbose",
+            "claude --session-id=52e88829-c137-421d-893a-b45feac50a00 --verbose",
+            "claude --SESSION-ID=52e88829-c137-421d-893a-b45feac50a00 --verbose",
+            "claude resume --verbose",
+        ] {
+            let mut new_session = spec();
+            new_session.session_id = Some(ID.to_string());
+            let argv = render_argv(&new_session, &tmpl(template), "claude");
+            assert_eq!(
+                argv.iter().filter(|a| a.as_str() == "--session-id").count(),
+                1,
+                "{template}: {argv:?}"
+            );
+            assert_eq!(
+                value_after(&argv, "--session-id"),
+                Some(ID),
+                "{template}: {argv:?}"
+            );
+            assert!(
+                !argv.iter().any(|a| a.contains(OTHER)
+                    || a == "-r"
+                    || a == "resume"
+                    || a.to_ascii_lowercase().starts_with("--session-id=")
+                    || a.starts_with("--resume")),
+                "{template}: {argv:?}"
+            );
+            assert!(
+                argv.iter().any(|a| a == "--verbose"),
+                "{template}: {argv:?}"
+            );
+        }
+
+        // A template that positions the id itself in the inline form keeps it
+        // there — and is then the only session flag.
+        let mut s = spec();
+        s.session_id = Some(ID.to_string());
+        let argv = render_argv(&s, &tmpl("claude --session-id={sessionId}"), "claude");
+        let inline = format!("--session-id={ID}");
+        assert_eq!(argv.iter().filter(|a| **a == inline).count(), 1, "{argv:?}");
+        assert!(!argv.iter().any(|a| a == "--session-id"), "{argv:?}");
+    }
+
+    /// A `{sessionId}` placeholder that does not sit in a kept session-naming
+    /// flag must not suppress the spec's own `--session-id`: argv still
+    /// carries exactly one id (review round 4, A1).
+    #[test]
+    fn a_placeholder_outside_a_kept_session_flag_still_gets_the_spec_session_id() {
+        const ID: &str = "7b97f1e8-35c0-4bec-992d-63e5a3dc55d7";
+        for template in ["claude --name {sessionId}", "claude -c {sessionId}"] {
+            let mut s = spec();
+            s.session_id = Some(ID.to_string());
+            let argv = render_argv(&s, &tmpl(template), "claude");
+            assert_eq!(
+                argv.iter().filter(|a| a.as_str() == "--session-id").count(),
+                1,
+                "{template}: {argv:?}"
+            );
+            assert_eq!(
+                value_after(&argv, "--session-id"),
+                Some(ID),
+                "{template}: {argv:?}"
+            );
+            assert!(!argv.iter().any(|a| a == "-c"), "{template}: {argv:?}");
+        }
+    }
+
+    /// `names_session_id` is a hand-spelled subset of the shared session-choice
+    /// set: every spelling it matches must also be a
+    /// `claude_env::claude_argv_chooses_session` match, so the two cannot drift
+    /// apart silently (review round 4, A3).
+    #[test]
+    fn names_session_id_is_a_subset_of_the_shared_session_choice_set() {
+        for name in [
+            "--session-id",
+            "--resume",
+            "-r",
+            "--session-id=x",
+            "--resume=x",
+            "--SESSION-ID",
+            "--Resume=x",
+        ] {
+            assert!(names_session_id(name), "{name}");
+            assert!(
+                qontinui_runner_lib::claude_env::claude_argv_chooses_session(&[name]),
+                "{name} names a session id but the shared set does not choose a session"
+            );
+        }
+    }
+
+    #[test]
+    fn session_permission_setting_serde_and_normalization() {
+        let v: SessionPermissionSetting =
+            serde_json::from_str(r#"{"mode":"site_default"}"#).unwrap();
+        assert_eq!(v, SessionPermissionSetting::SiteDefault);
+        let v: SessionPermissionSetting =
+            serde_json::from_str(r#"{"mode":"allow_list","tools":[" Read ","","Read","Edit"]}"#)
+                .unwrap();
+        assert_eq!(
+            v.normalized().unwrap(),
+            SessionPermissionSetting::AllowList {
+                tools: vec!["Read".to_string(), "Edit".to_string()]
+            }
+        );
+        let bad = SessionPermissionSetting::AllowList {
+            tools: vec!["--dangerously-skip-permissions".to_string()],
+        };
+        assert!(bad.normalized().is_err());
+        assert_eq!(
+            serde_json::to_string(&SessionPermissionSetting::default()).unwrap(),
+            r#"{"mode":"site_default"}"#
+        );
+    }
+
+    #[test]
+    fn allowed_tools_args_is_the_shared_renderer() {
+        assert!(allowed_tools_args::<&str>(&[]).is_empty());
+        assert!(allowed_tools_args(&["  ", ""]).is_empty());
+        assert_eq!(
+            allowed_tools_args(&[" Bash ", "Read"]),
+            vec!["--allowedTools", "Bash", "Read"]
+        );
+    }
+
     #[test]
     fn dangerously_skip_never_dropped_by_template() {
         let mut s = spec();
@@ -616,6 +1545,23 @@ mod tests {
         assert_eq!(value_after(&argv, "--model"), Some("opus"));
         assert!(!argv.iter().any(|a| a == "sonnet"));
         assert_eq!(argv.iter().filter(|a| *a == "--model").count(), 1);
+    }
+
+    /// The attached spelling is the template's model too: dropped under a spec
+    /// model (never a second, last-wins `--model=`), kept as the model when
+    /// the spec names none.
+    #[test]
+    fn spec_model_beats_an_attached_template_model() {
+        let mut s = spec();
+        s.model = Some("opus".to_string());
+        let argv = render_argv(&s, &tmpl("claude --model=sonnet"), "claude");
+        assert_eq!(value_after(&argv, "--model"), Some("opus"));
+        assert!(!argv.iter().any(|a| a.starts_with("--model=")), "{argv:?}");
+        assert_eq!(argv.iter().filter(|a| *a == "--model").count(), 1);
+
+        let argv = render_argv(&spec(), &tmpl("claude --model=sonnet"), "claude");
+        assert_eq!(value_after(&argv, "--model"), Some("sonnet"));
+        assert!(!argv.iter().any(|a| a.starts_with("--model=")), "{argv:?}");
     }
 
     #[test]
@@ -736,6 +1682,225 @@ mod tests {
             sanitize_session_name(&multi).unwrap().chars().count(),
             MAX_SESSION_NAME_CHARS
         );
+    }
+
+    // Plan `2026-11-09-gate-continuations-get-a-display-truncated-name-so-the-
+    // visible-hand-off-refuses-them`, D5 / Phase 3. Every expected string below
+    // was computed from an independent model of the rule, never from this
+    // function's output.
+
+    /// Every name coord authors fits the cap, so the runner hands it on byte for
+    /// byte: `--name`, the session-names file and the tab carry coord's string.
+    #[test]
+    fn sanitize_session_name_passes_every_coord_spawn_name_through_byte_identical() {
+        for name in [
+            "resume-terminal-titlebar-shows-f5782ab5",
+            "impl-terminal-titlebar-shows-694ae308",
+            "post-merge-a-very-long-8295759e#12345",
+            "fix-an-extraordinarily-ea25dfe5#123456",
+            "shepherd-an-ea25dfe5#123456",
+            "review-an-ea25dfe5#123456",
+            "red-main-an-extraordinarily-ea25dfe5",
+            "respond-red-main-an-ea25dfe5",
+            "respond-stall-an-ea25dfe5",
+            "resume-unit-9e9b1b7b-phase-3-5-c2abbf7c",
+            "resume-finding-b31b377d",
+            "resume-terminal-titlebar-shows-44b98580",
+        ] {
+            assert_eq!(sanitize_session_name(name).as_deref(), Some(name));
+        }
+    }
+
+    /// Enters where every runner spawn does: a `LaunchSpec.name` turned into
+    /// argv by `compose_flags`, the seam `render_argv` and `render_pty_command`
+    /// share. A long runner-own name reaches `--name` compacted; a coord name
+    /// reaches it byte-identical.
+    #[test]
+    fn compose_flags_compacts_an_overlong_session_name() {
+        let mut s = spec();
+        for (name, want) in [
+            (
+                "loop-nightly-merge-train-steward-watch-and-remediate",
+                "loop-nightly-merge-train-2c0ac670",
+            ),
+            (
+                "resume-unit-9e9b1b7b-phase-3-5-c2abbf7c",
+                "resume-unit-9e9b1b7b-phase-3-5-c2abbf7c",
+            ),
+        ] {
+            s.name = Some(name.to_string());
+            let flags = compose_flags(&s, &LaunchConfig::default());
+            assert_eq!(value_after(&flags, "--name"), Some(want), "{flags:?}");
+            assert_eq!(flags.iter().filter(|a| *a == "--name").count(), 1);
+        }
+    }
+
+    #[test]
+    fn sanitize_session_name_compacts_an_overlong_value_with_a_digest() {
+        let cases = [
+            ("x".repeat(100), format!("{}-09ecb6eb", "x".repeat(31))),
+            ("é".repeat(100), format!("{}-f42ec48e", "é".repeat(31))),
+            // `loop-nightly-merge-train-steward` is 32 > 31 chars: `-steward` goes.
+            (
+                "loop-nightly-merge-train-steward-watch-and-remediate".to_string(),
+                "loop-nightly-merge-train-2c0ac670".to_string(),
+            ),
+            // The cap is inclusive: 40 is kept whole, 41 is compacted.
+            ("a".repeat(40), "a".repeat(40)),
+            ("a".repeat(41), format!("{}-c0f8bd4d", "a".repeat(31))),
+            // A first token that alone overflows is cut by chars to 31.
+            (
+                format!("{}-tail-tokens", "x".repeat(35)),
+                format!("{}-15d13ceb", "x".repeat(31)),
+            ),
+            // Separators after the last kept token are dropped, not doubled.
+            (
+                format!("fix this - {}", "y".repeat(40)),
+                "fix this-bd4a7d26".to_string(),
+            ),
+            // A space splits tokens too, and stays verbatim inside the head.
+            (
+                "check-login page renders the dashboard with all widgets".to_string(),
+                "check-login page renders the-d7458ca1".to_string(),
+            ),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(sanitize_session_name(&raw), Some(want), "{raw:?}");
+        }
+    }
+
+    /// The digest covers the CLEANED value: leading dashes, control chars and
+    /// whitespace runs are normalised first, exactly as for a short name.
+    #[test]
+    fn sanitize_session_name_digests_the_cleaned_value() {
+        assert_eq!(
+            sanitize_session_name("  --loop-nightly-merge-train-steward-watch-and-remediate"),
+            Some("loop-nightly-merge-train-2c0ac670".to_string())
+        );
+        assert_eq!(
+            sanitize_session_name("loop-nightly\tmerge   train\u{7}steward watch-and-remediate"),
+            Some("loop-nightly merge train-3a0b0f5d".to_string())
+        );
+    }
+
+    /// The silent cut this replaces gave both of these
+    /// `loop-nightly-merge-train-steward-watch-a`.
+    #[test]
+    fn sanitize_session_name_keeps_names_that_differ_past_the_cut_distinct() {
+        let remediate =
+            sanitize_session_name("loop-nightly-merge-train-steward-watch-and-remediate");
+        let report = sanitize_session_name("loop-nightly-merge-train-steward-watch-and-report");
+        assert_eq!(report.as_deref(), Some("loop-nightly-merge-train-51629b35"));
+        assert_ne!(remediate, report);
+    }
+
+    /// Fixed-seed xorshift64, so a failing sweep input replays exactly.
+    fn xorshift(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    /// The first property the sweep's inputs violate, or `None`. A function of
+    /// the sanitiser so the sweep can be shown to REJECT a `…`-marked cut.
+    fn session_name_sweep_violation(
+        sanitize: fn(&str) -> Option<String>,
+        inputs: &[String],
+    ) -> Option<String> {
+        for raw in inputs {
+            let Some(out) = sanitize(raw) else { continue };
+            if out.contains('\u{2026}') {
+                return Some(format!("{raw:?} -> {out:?} carries U+2026"));
+            }
+            if out.chars().count() > MAX_SESSION_NAME_CHARS {
+                return Some(format!("{raw:?} -> {out:?} exceeds the cap"));
+            }
+            if out.starts_with('-') || out.starts_with(char::is_whitespace) {
+                return Some(format!("{raw:?} -> {out:?} starts with a dash or blank"));
+            }
+            // `compose_flags` sanitises a call site's already-sanitised name
+            // again, so `--name` matches the tab and the file only at a fixed point.
+            if sanitize(&out).as_deref() != Some(out.as_str()) {
+                return Some(format!("{raw:?} -> {out:?} is not a fixed point"));
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn sanitize_session_name_never_emits_an_ellipsis() {
+        // No piece carries `…`, so any in an output was introduced by the
+        // function; the dirty pieces exercise the cleanup ahead of the cap.
+        let long: &str = &"x".repeat(33);
+        let mut pieces: Vec<&str> = "a bb unit 9e9b1b7b é 日本語 🦀 #12345".split(' ').collect();
+        pieces.extend(["-", "--", " ", "   ", "\t", "\r\n", "\u{7}", long]);
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let inputs: Vec<String> = (0..500)
+            .map(|_| {
+                let len = 41 + (xorshift(&mut seed) % 160) as usize;
+                let mut raw = String::new();
+                while raw.chars().count() < len {
+                    raw.push_str(pieces[(xorshift(&mut seed) % pieces.len() as u64) as usize]);
+                }
+                raw
+            })
+            .collect();
+        assert_eq!(
+            session_name_sweep_violation(sanitize_session_name, &inputs),
+            None
+        );
+        // Negative control: the sweep catches the `…` cut coord used to author.
+        fn cut_with_ellipsis(raw: &str) -> Option<String> {
+            let kept: String = raw.chars().take(MAX_SESSION_NAME_CHARS - 1).collect();
+            Some(format!("{kept}\u{2026}"))
+        }
+        let caught = session_name_sweep_violation(cut_with_ellipsis, &inputs).unwrap_or_default();
+        assert!(caught.ends_with("carries U+2026"), "{caught:?}");
+    }
+
+    /// Clean long inputs (tokens joined by single `-`/` `), so the cleaned value
+    /// IS the input and the compacted form can be checked exactly.
+    #[test]
+    fn sanitize_session_name_compacts_to_whole_leading_tokens_and_the_digest() {
+        use sha2::{Digest, Sha256};
+        let is_sep = |c: char| c == '-' || c == ' ';
+        let long: &str = &"y".repeat(34);
+        let mut tokens: Vec<&str> = "a bb loop nightly 9e9b1b7b é 日本語 🦀 #12345"
+            .split(' ')
+            .collect();
+        tokens.push(long);
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        for _ in 0..500 {
+            let mut raw = String::new();
+            loop {
+                raw.push_str(tokens[(xorshift(&mut seed) % tokens.len() as u64) as usize]);
+                if raw.chars().count() > MAX_SESSION_NAME_CHARS {
+                    break;
+                }
+                raw.push(['-', ' '][(xorshift(&mut seed) % 2) as usize]);
+            }
+            let out = sanitize_session_name(&raw).unwrap();
+            let (head, digest) = out.rsplit_once('-').unwrap();
+            let want_digest = hex::encode(&Sha256::digest(raw.as_bytes())[..4]);
+            assert_eq!(digest, want_digest, "{raw:?} -> {out:?}");
+            let Some(rest) = raw.strip_prefix(head) else {
+                panic!("{raw:?} -> {out:?}: the head is not a prefix of the input");
+            };
+            let kept = head.chars().count();
+            if rest.starts_with(is_sep) {
+                // Whole tokens up to a token end; the next whole token does not fit.
+                let seps = rest.chars().take_while(|&c| is_sep(c)).count();
+                let next = rest.chars().skip(seps).take_while(|&c| !is_sep(c)).count();
+                assert!(
+                    !head.ends_with(is_sep) && kept <= 31 && kept + seps + next > 31,
+                    "{raw:?} -> {out:?}"
+                );
+            } else {
+                // The first token alone overflows: cut by chars to 31.
+                assert!(!head.contains(is_sep) && kept == 31, "{raw:?} -> {out:?}");
+            }
+        }
     }
 
     #[test]
@@ -941,6 +2106,7 @@ mod tests {
         let cfg = LaunchConfig {
             default_template: Some("claude --permission-mode bypassPermissions".to_string()),
             account_command: Some("clg".to_string()),
+            ..Default::default()
         };
         let mut s = spec();
         s.config_dir = Some("/home/x".to_string());
@@ -953,6 +2119,7 @@ mod tests {
         let cfg = LaunchConfig {
             default_template: Some("claude --model default".to_string()),
             account_command: Some("claude --model haiku".to_string()),
+            ..Default::default()
         };
         let argv = render_argv(&spec(), &cfg, "claude");
         // Per-account claude command wins over the global default.
@@ -964,6 +2131,7 @@ mod tests {
         let cfg = LaunchConfig {
             default_template: Some("claude --output-format stream-json".to_string()),
             account_command: Some("clg".to_string()),
+            ..Default::default()
         };
         let argv = render_argv(&spec(), &cfg, "/abs/claude");
         assert_eq!(argv[0], "/abs/claude");
@@ -999,6 +2167,9 @@ mod tests {
     #[test]
     #[cfg(not(target_os = "windows"))]
     fn program_and_argv_execs_claude_directly_off_windows() {
+        // Resolves PATH twice below; a test mutating PATH between them would
+        // make the two answers differ.
+        let _env_lock = crate::test_env::env_lock();
         let (program, args) = render_program_and_argv(&spec(), &LaunchConfig::default());
 
         assert_ne!(program, "cmd.exe", "cmd.exe does not exist off Windows");
@@ -1089,7 +2260,9 @@ mod tests {
 
     #[test]
     fn pty_ai_launch_session_placeholder_substituted() {
-        // `{sessionId}` placeholder: id substituted in place, not appended.
+        // `{sessionId}` placeholder: id substituted in place, not appended. The
+        // template's `--continue` is dropped: Claude Code refuses
+        // `--session-id X --continue` without `--fork-session`.
         let mut s = spec();
         s.config_dir = Some("/h/.claude-x".to_string());
         s.session_id = Some("abc".to_string());
@@ -1101,7 +2274,7 @@ mod tests {
         assert_eq!(
             cmd,
             "CLAUDE_CONFIG_DIR=\"/h/.claude-x\" \
-             claude --permission-mode bypassPermissions --session-id abc --continue"
+             claude --permission-mode bypassPermissions --session-id abc"
         );
     }
 
@@ -1114,6 +2287,7 @@ mod tests {
         let cfg = LaunchConfig {
             default_template: Some("claude --model opus".to_string()),
             account_command: Some("clh".to_string()),
+            ..Default::default()
         };
         let mut s = spec();
         s.config_dir = Some("C:\\claude\\.claude-hotmail".to_string());

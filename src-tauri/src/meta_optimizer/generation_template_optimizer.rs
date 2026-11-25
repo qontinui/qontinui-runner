@@ -85,7 +85,6 @@ pub fn build_config(execution_id: &str, workflow_name: &str, style_index: u32) -
         phase_timeout_ms: None,
         max_fix_attempts: 3,
         max_ci_auto_resumes: 10,
-        ci_failure_context: None,
         htn_config: crate::planning_bridge::HtnConfig::default(),
     }
 }

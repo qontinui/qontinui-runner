@@ -1706,7 +1706,9 @@ impl DeferEpisode {
         Self {
             class,
             stable_reason: match class {
-                DeferClass::Drained => Some(reason.to_string()),
+                // A role's reason names only the role, so it is as stable
+                // across ticks as a drain's.
+                DeferClass::Drained | DeferClass::RoleClosed => Some(reason.to_string()),
                 DeferClass::Unknown => None,
             },
         }

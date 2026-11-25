@@ -11,7 +11,8 @@
 //! rotation across the configured accounts.
 //!
 //! This module owns the dedicated `claude-accounts.json` file at the
-//! UNSCOPED canonical path `dirs::config_dir()/com.qontinui.runner/`,
+//! UNSCOPED canonical path `<platform config dir>/com.qontinui.runner/`
+//! (a subject runner's platform dirs live inside its instance root),
 //! deliberately IGNORING `QONTINUI_CONFIG_DIR` — the same resolution rule
 //! as `active_instances.json` in `instance_manager.rs`. `load_settings()`
 //! overlays the roster fields from this file onto the in-memory
@@ -101,26 +102,38 @@ impl ClaudeAccountsFile {
 /// unit-testable without touching process env or the real config dir.
 fn accounts_path_under(config_root: &Path) -> PathBuf {
     config_root
-        .join("com.qontinui.runner")
+        .join(qontinui_runner_lib::instance_env::RUNNER_BUNDLE_ID)
         .join(CLAUDE_ACCOUNTS_FILE)
 }
 
 /// Canonical machine-global path to `claude-accounts.json`.
 ///
-/// ALWAYS rooted at `dirs::config_dir()` — `QONTINUI_CONFIG_DIR` is
+/// ALWAYS rooted at the platform config dir — `QONTINUI_CONFIG_DIR` is
 /// deliberately ignored (unlike `settings::get_settings_path`), so every
 /// instance on the machine resolves the SAME file. Mirrors the unscoped
-/// `session_file_path` resolver for `active_instances.json`.
+/// `session_file_path` resolver for `active_instances.json`. The one
+/// exception is a SUBJECT runner (`QONTINUI_INSTANCE_ROOT`): through
+/// `instance_env::platform_dir` its "machine" is its own root, so it neither
+/// reads nor overwrites the harness's roster (plan
+/// `2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-runner`).
 pub fn claude_accounts_file_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| accounts_path_under(&d))
+    qontinui_runner_lib::instance_env::platform_dir(
+        qontinui_runner_lib::instance_env::PlatformDir::Config,
+    )
+    .map(|d| accounts_path_under(&d))
 }
 
 /// Unscoped canonical `settings.json` (the PRIMARY runner's file) — the
 /// migration source. Must NOT honor `QONTINUI_CONFIG_DIR`: a secondary
 /// running the migration has to probe the primary's file, not its own
-/// instance-scoped copy.
+/// instance-scoped copy. A SUBJECT runner has no primary to read from: its
+/// own `settings.json` (under its root's config dir) is the migration source.
 fn unscoped_settings_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("com.qontinui.runner").join("settings.json"))
+    if qontinui_runner_lib::instance_env::instance_root().is_some() {
+        return qontinui_runner_lib::instance_env::runner_config_dir()
+            .map(|(d, _)| d.join("settings.json"));
+    }
+    qontinui_runner_lib::instance_env::runner_config_base().map(|d| d.join("settings.json"))
 }
 
 /// Load the roster from `path`. Fail-open: missing or corrupt file → `None`
@@ -168,11 +181,19 @@ fn save_to(path: &Path, file: &ClaudeAccountsFile) -> Result<(), String> {
         .map_err(|e| format!("Failed to write {}: {}", path.display(), e))
 }
 
+/// [`claude_accounts_file_path`] for a WRITE through `door`: the path resolves
+/// from the process env, so in a test binary a thread holding no `env_lock` is
+/// refused first ([`qontinui_runner_lib::env_write_gate`]) — every env-resolving
+/// roster writer comes through here. Path-explicit [`save_to`] is not gated.
+fn roster_path_for_write(door: &'static str) -> Result<PathBuf, String> {
+    let path = claude_accounts_file_path();
+    qontinui_runner_lib::env_write_gate::check(door, path.as_deref())?;
+    path.ok_or_else(|| "Failed to resolve config directory for claude-accounts.json".to_string())
+}
+
 /// Atomically persist the roster to the canonical machine-global path.
 pub fn save(file: &ClaudeAccountsFile) -> Result<(), String> {
-    let path = claude_accounts_file_path()
-        .ok_or_else(|| "Failed to resolve config directory for claude-accounts.json".to_string())?;
-    save_to(&path, file)
+    save_to(&roster_path_for_write("claude_accounts::save")?, file)
 }
 
 /// One-shot best-effort migration: when `claude-accounts.json` is ABSENT but
@@ -260,15 +281,25 @@ fn migrate_seed(accounts_path: &Path, unscoped_settings: &Path) -> bool {
 
 /// Load the machine-global roster, running the one-shot migration first
 /// (at most once per process — `load_settings` calls this on every load).
+/// The seed is an env-resolved roster write, so a test-binary thread holding no
+/// `env_lock` skips it ([`roster_path_for_write`]).
+///
+/// The gate is decided OUTSIDE the `Once`: a refused caller must neither use it
+/// up (the seed would then never run for the process, whoever asks next) nor
+/// panic inside it under `strict_canary()` (a poisoned `Once` panics every later
+/// `load_settings` in the binary).
 pub fn load_with_migration() -> Option<ClaudeAccountsFile> {
     static MIGRATE_ONCE: std::sync::Once = std::sync::Once::new();
-    MIGRATE_ONCE.call_once(|| {
-        if let (Some(accounts), Some(settings)) =
-            (claude_accounts_file_path(), unscoped_settings_path())
-        {
-            migrate_seed(&accounts, &settings);
+    if !MIGRATE_ONCE.is_completed() {
+        if let (Ok(accounts), Some(settings)) = (
+            roster_path_for_write("claude_accounts::load_with_migration"),
+            unscoped_settings_path(),
+        ) {
+            MIGRATE_ONCE.call_once(|| {
+                migrate_seed(&accounts, &settings);
+            });
         }
-    });
+    }
     load()
 }
 
@@ -286,31 +317,89 @@ pub fn apply_roster_overlay(settings: &mut crate::settings::Settings, roster: Cl
     settings.ai.claude_cli.account_selection_pinned = roster.account_selection_pinned;
 }
 
-/// The one rule deciding which account-selection mode governs. PURE.
+/// Which input decided the effective account-selection mode — reported beside
+/// the mode wherever the mode is SHOWN (the AI-settings reads, the env
+/// capture) so a reader can tell a fleet override from a local choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountSelectionSource {
+    /// Unpinned, and the fleet's `account_selection_mode` policy has a value.
+    Fleet,
+    /// Unpinned, and the fleet has no opinion — the local mode applies.
+    Local,
+    /// Pinned — the local mode applies whatever the fleet says.
+    Pinned,
+}
+
+impl AccountSelectionSource {
+    /// The snake_case wire spelling — byte-identical to what serde emits
+    /// (pinned by `selection_source_str_matches_serde`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AccountSelectionSource::Fleet => "fleet",
+            AccountSelectionSource::Local => "local",
+            AccountSelectionSource::Pinned => "pinned",
+        }
+    }
+}
+
+/// The one rule deciding which account-selection mode governs, and which
+/// input decided it. PURE.
 ///
-/// A PINNED machine uses its local mode, full stop. An unpinned machine uses
-/// the fleet's `account_selection_mode` fleet-policy value when the fleet has
-/// an opinion (`Some`), else its local mode. This is FORCE-APPLY, not a
-/// default-fill: the local mode is always a concrete value on disk (the field
-/// is not an `Option`), so a fleet term that only filled an absent local value
-/// would never take effect on any machine that has ever saved settings.
+/// A PINNED machine uses its local mode, full stop (source `Pinned`, whether
+/// or not the fleet has a value — the pin is the thing the user controls). An
+/// unpinned machine uses the fleet's `account_selection_mode` fleet-policy
+/// value when the fleet has an opinion (`Some`, source `Fleet`), else its
+/// local mode (source `Local`). This is FORCE-APPLY, not a default-fill: the
+/// local mode is always a concrete value on disk (the field is not an
+/// `Option`), so a fleet term that only filled an absent local value would
+/// never take effect on any machine that has ever saved settings.
 ///
-/// Every decision site reads the mode through this function — the picker
+/// This is the ONE rule: every decision and report site goes through it —
+/// [`resolve_selection_mode`] is only its tested mode-half, used where the
+/// source is not needed. Sites: the picker
 /// ([`crate::ai_provider::account_usage::pick_best_account`]), the spawn-time
-/// config-dir resolution (`ai_provider::config::get_effective_config_dir`) and
-/// the per-device account report — so the fleet value cannot half-apply (the
-/// picker rotating under the fleet mode while the spawn path honours a local
-/// `manual`).
+/// config-dir resolution (`ai_provider::config::get_effective_config_dir`),
+/// the per-device account report, the AI-settings reads and the env capture —
+/// so the fleet value cannot half-apply and the source can never be computed
+/// by a second rule.
+pub fn resolve_selection(
+    local: AccountSelectionMode,
+    pinned: bool,
+    fleet: Option<AccountSelectionMode>,
+) -> (AccountSelectionMode, AccountSelectionSource) {
+    if pinned {
+        (local, AccountSelectionSource::Pinned)
+    } else {
+        match fleet {
+            Some(f) => (f, AccountSelectionSource::Fleet),
+            None => (local, AccountSelectionSource::Local),
+        }
+    }
+}
+
+/// The `selection_source` a REPORT (the env capture) should carry. PURE.
+///
+/// `answered` is whether coord has answered the fleet account-selection
+/// domain in this process. Before it has, an unpinned source is `unknown`
+/// rather than `local` — the cache's "no fleet opinion" then means "not yet
+/// asked". A pinned machine is `pinned` either way: no fleet answer can change
+/// that.
+pub fn reported_selection_source(source: AccountSelectionSource, answered: bool) -> &'static str {
+    if source == AccountSelectionSource::Pinned || answered {
+        source.as_str()
+    } else {
+        "unknown"
+    }
+}
+
+/// The mode half of [`resolve_selection`].
 pub fn resolve_selection_mode(
     local: AccountSelectionMode,
     pinned: bool,
     fleet: Option<AccountSelectionMode>,
 ) -> AccountSelectionMode {
-    if pinned {
-        local
-    } else {
-        fleet.unwrap_or(local)
-    }
+    resolve_selection(local, pinned, fleet).0
 }
 
 /// [`resolve_selection_mode`] applied to one `ClaudeCliSettings` document
@@ -322,11 +411,12 @@ pub fn resolve_selection_mode(
 /// unit tests hermetic: a test's settings value, not the host machine's
 /// `claude-accounts.json`, decides the local half).
 pub fn resolve_for_cli_settings(cli: &crate::settings::ClaudeCliSettings) -> AccountSelectionMode {
-    resolve_selection_mode(
+    resolve_selection(
         cli.account_selection_mode,
         cli.account_selection_pinned,
         crate::mcp::fleet_policy_poller::fleet_account_selection_mode(),
     )
+    .0
 }
 
 /// The machine's LOCAL `(mode, pinned)` pair, before any fleet term.
@@ -361,12 +451,31 @@ fn local_selection() -> (AccountSelectionMode, bool) {
 /// the machine, not about one instance's settings document, and the picker
 /// must rotate under the same mode the report names.
 pub fn effective_selection_mode() -> AccountSelectionMode {
+    effective_selection().0
+}
+
+/// [`effective_selection_mode`] plus the [`AccountSelectionSource`] that
+/// decided it — the pair the AI-settings reads and the env capture report, so
+/// a fleet override is visible as one rather than as an unexplained mode.
+pub fn effective_selection() -> (AccountSelectionMode, AccountSelectionSource) {
+    let (mode, source, _fleet) = effective_selection_with_fleet();
+    (mode, source)
+}
+
+/// [`effective_selection`] plus the RAW fleet-policy value it was resolved
+/// against (`None` = the fleet has no opinion), all from ONE read of the
+/// fleet cache so the three can never disagree. The Settings page needs the
+/// raw value to re-apply [`resolve_selection`] to its unsaved form state (an
+/// un-ticked pin, a different local mode) without a round trip.
+pub fn effective_selection_with_fleet() -> (
+    AccountSelectionMode,
+    AccountSelectionSource,
+    Option<AccountSelectionMode>,
+) {
     let (local, pinned) = local_selection();
-    resolve_selection_mode(
-        local,
-        pinned,
-        crate::mcp::fleet_policy_poller::fleet_account_selection_mode(),
-    )
+    let fleet = crate::mcp::fleet_policy_poller::fleet_account_selection_mode();
+    let (mode, source) = resolve_selection(local, pinned, fleet);
+    (mode, source, fleet)
 }
 
 /// Read-modify-write the machine-global roster file (last-writer-wins).
@@ -376,9 +485,77 @@ pub fn effective_selection_mode() -> AccountSelectionMode {
 /// not `Default` — so the first single-field write doesn't drop sibling
 /// roster fields that so far only lived in a per-instance settings.json.
 pub fn update(mutate: impl FnOnce(&mut ClaudeAccountsFile)) -> Result<(), String> {
+    let path = roster_path_for_write("claude_accounts::update")?;
     let mut file = load_with_migration().unwrap_or_else(roster_from_current_settings);
     mutate(&mut file);
-    save(&file)
+    save_to(&path, &file)
+}
+
+/// `true` when the roster file at `path` EXISTS but cannot be read or parsed.
+///
+/// [`load`] reads such a file as absent (fail-open, so settings load always
+/// succeeds), and the roster copy in the per-instance `settings.json` then
+/// applies instead. That copy is a shadow that whole-`Settings` saves keep
+/// rewriting, so it may be stale or empty. A caller about to WRITE the roster
+/// from what it read must check this first, or it overwrites the real roster
+/// with that copy.
+pub fn is_unreadable(path: &Path) -> bool {
+    path.exists() && load_from(path).is_none()
+}
+
+/// Add `dirs` to the roster's `claude_config_dirs`, never removing one.
+///
+/// The first-run setup wizard writes through this instead of the
+/// replace-style [`update`]: finishing a wizard must not shrink a roster an
+/// operator configured (qontinui-runner#2544; the incident is coord finding
+/// `bc9fdc87`). A dir already in the roster, under any spelling of the same
+/// path, is skipped. Returns how many were added; nothing is written when that
+/// is zero. Refuses, writing nothing, when the file exists but cannot be read.
+pub fn append_config_dirs(dirs: &[String]) -> Result<usize, String> {
+    let path = roster_path_for_write("claude_accounts::append_config_dirs")?;
+    append_config_dirs_at(&path, dirs, || {
+        load_with_migration().unwrap_or_else(roster_from_current_settings)
+    })
+}
+
+/// [`append_config_dirs`] against an explicit file. `start` supplies the
+/// roster when the file is absent (the same starting point [`update`] uses).
+fn append_config_dirs_at(
+    path: &Path,
+    dirs: &[String],
+    start: impl FnOnce() -> ClaudeAccountsFile,
+) -> Result<usize, String> {
+    if dirs.is_empty() {
+        return Ok(0);
+    }
+    let mut file = if path.exists() {
+        load_from(path).ok_or_else(|| {
+            format!(
+                "{} exists but cannot be read; refusing to write the Claude account roster",
+                path.display()
+            )
+        })?
+    } else {
+        start()
+    };
+    let same_dir = |a: &str, b: &str| {
+        a == b
+            || match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+                (Ok(ca), Ok(cb)) => ca == cb,
+                _ => false,
+            }
+    };
+    let mut added = 0;
+    for dir in dirs {
+        if !file.claude_config_dirs.iter().any(|d| same_dir(d, dir)) {
+            file.claude_config_dirs.push(dir.clone());
+            added += 1;
+        }
+    }
+    if added > 0 {
+        save_to(path, &file)?;
+    }
+    Ok(added)
 }
 
 /// Snapshot the roster fields from the current effective settings.
@@ -399,6 +576,121 @@ fn roster_from_current_settings() -> ClaudeAccountsFile {
 mod tests {
     use super::*;
 
+    // ── append_config_dirs: the wizard's add-only write ──────────────────
+
+    fn roster_at(path: &Path) -> ClaudeAccountsFile {
+        load_from(path).expect("roster readable")
+    }
+
+    fn mk_account(root: &Path, name: &str) -> String {
+        let d = root.join(name);
+        std::fs::create_dir_all(d.join("projects")).unwrap();
+        d.to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn append_adds_new_dirs_and_never_removes_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(CLAUDE_ACCOUNTS_FILE);
+        let a = mk_account(tmp.path(), ".claude-a");
+        let b = mk_account(tmp.path(), ".claude-b");
+        let existing = ClaudeAccountsFile {
+            claude_config_dirs: vec![a.clone()],
+            account_selection_mode: AccountSelectionMode::LeastUsage,
+            ..Default::default()
+        };
+        save_to(&path, &existing).unwrap();
+
+        let added = append_config_dirs_at(&path, &[b.clone(), a.clone()], || {
+            panic!("the file exists; the absent-file start must not run")
+        })
+        .unwrap();
+
+        assert_eq!(added, 1);
+        let after = roster_at(&path);
+        assert_eq!(after.claude_config_dirs, vec![a, b]);
+        assert_eq!(
+            after.account_selection_mode,
+            AccountSelectionMode::LeastUsage,
+            "sibling roster fields survive the append"
+        );
+    }
+
+    #[test]
+    fn append_of_nothing_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(CLAUDE_ACCOUNTS_FILE);
+        let added = append_config_dirs_at(&path, &[], ClaudeAccountsFile::default).unwrap();
+        assert_eq!(added, 0);
+        assert!(!path.exists(), "an empty append must not create the file");
+    }
+
+    #[test]
+    fn append_skips_a_dir_already_present_under_another_spelling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(CLAUDE_ACCOUNTS_FILE);
+        let a = mk_account(tmp.path(), ".claude-a");
+        let existing = ClaudeAccountsFile {
+            claude_config_dirs: vec![format!("{a}/")],
+            ..Default::default()
+        };
+        save_to(&path, &existing).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let added =
+            append_config_dirs_at(&path, std::slice::from_ref(&a), || unreachable!()).unwrap();
+
+        assert_eq!(added, 0);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "nothing new, nothing written"
+        );
+    }
+
+    #[test]
+    fn append_refuses_an_unreadable_roster_and_leaves_it_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(CLAUDE_ACCOUNTS_FILE);
+        std::fs::write(&path, b"{ not json").unwrap();
+        let b = mk_account(tmp.path(), ".claude-b");
+
+        let err = append_config_dirs_at(&path, &[b], ClaudeAccountsFile::default).unwrap_err();
+
+        assert!(err.contains("cannot be read"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"{ not json");
+        assert!(is_unreadable(&path));
+    }
+
+    #[test]
+    fn append_to_an_absent_file_starts_from_the_effective_roster() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(CLAUDE_ACCOUNTS_FILE);
+        let x = mk_account(tmp.path(), ".claude-x");
+        let b = mk_account(tmp.path(), ".claude-b");
+        let x_start = x.clone();
+
+        let added = append_config_dirs_at(&path, std::slice::from_ref(&b), move || {
+            ClaudeAccountsFile {
+                claude_config_dirs: vec![x_start],
+                ..Default::default()
+            }
+        })
+        .unwrap();
+
+        assert_eq!(added, 1);
+        assert_eq!(roster_at(&path).claude_config_dirs, vec![x, b]);
+    }
+
+    #[test]
+    fn readable_and_absent_rosters_are_not_unreadable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(CLAUDE_ACCOUNTS_FILE);
+        assert!(!is_unreadable(&path), "absent is not unreadable");
+        save_to(&path, &ClaudeAccountsFile::default()).unwrap();
+        assert!(!is_unreadable(&path), "a valid file is readable");
+    }
+
     #[test]
     fn path_builder_is_unscoped_canonical_shape() {
         let p = accounts_path_under(Path::new("/cfg"));
@@ -411,11 +703,12 @@ mod tests {
     }
 
     /// The canonical path must come straight from `dirs::config_dir()` —
-    /// `QONTINUI_CONFIG_DIR` plays no part. The resolver never reads env, so
-    /// this asserts equality with the dirs-derived path without mutating
-    /// process env (env-mutation would race other tests' `load_settings`).
+    /// `QONTINUI_CONFIG_DIR` plays no part. The resolver reads only
+    /// `QONTINUI_INSTANCE_ROOT` (through `instance_env::platform_dir`), so the
+    /// env lock keeps a sibling test's subject launch from racing it.
     #[test]
     fn canonical_path_ignores_qontinui_config_dir() {
+        let _lock = crate::test_env::env_lock();
         let expected = dirs::config_dir().map(|d| accounts_path_under(&d));
         assert_eq!(claude_accounts_file_path(), expected);
         if let Some(p) = claude_accounts_file_path() {
@@ -457,13 +750,15 @@ mod tests {
         // Corrupt → None (fail-open, no panic/error).
         std::fs::write(&path, b"{not json!!").unwrap();
         assert_eq!(load_from(&path), None);
-        // Partial JSON (missing fields) → defaults fill in.
+        // Partial JSON (missing fields) → defaults fill in. The mode is spelled
+        // as a literal: a roster storing no mode spreads spawns (weighted
+        // random), and moving the enum's `#[default]` must redden this.
         std::fs::write(&path, br#"{"claude_config_dirs":["/a"]}"#).unwrap();
         let parsed = load_from(&path).unwrap();
         assert_eq!(parsed.claude_config_dirs, vec!["/a".to_string()]);
         assert_eq!(
             parsed.account_selection_mode,
-            AccountSelectionMode::HighestExpectedUsage
+            AccountSelectionMode::WeightedRandom
         );
         assert_eq!(parsed.config_dir, None);
         // A roster written before the pin existed decodes UNPINNED.
@@ -625,36 +920,34 @@ mod tests {
     /// not pass by agreeing with itself.
     #[test]
     fn resolver_grid_pinned_keeps_local_unpinned_takes_the_fleet() {
-        let modes = [
-            AccountSelectionMode::Manual,
-            AccountSelectionMode::LeastUsage,
-            AccountSelectionMode::HighestExpectedUsage,
-        ];
-        let fleets = [
-            None,
-            Some(AccountSelectionMode::Manual),
-            Some(AccountSelectionMode::LeastUsage),
-            Some(AccountSelectionMode::HighestExpectedUsage),
-        ];
+        let modes = AccountSelectionMode::ALL;
+        let fleets: Vec<Option<AccountSelectionMode>> = std::iter::once(None)
+            .chain(modes.into_iter().map(Some))
+            .collect();
         let mut cells = 0;
         for local in modes {
             for pinned in [true, false] {
-                for fleet in fleets {
+                for &fleet in &fleets {
                     let expected = match (pinned, fleet) {
-                        (true, _) => local,
-                        (false, Some(f)) => f,
-                        (false, None) => local,
+                        (true, _) => (local, AccountSelectionSource::Pinned),
+                        (false, Some(f)) => (f, AccountSelectionSource::Fleet),
+                        (false, None) => (local, AccountSelectionSource::Local),
                     };
                     assert_eq!(
-                        resolve_selection_mode(local, pinned, fleet),
+                        resolve_selection(local, pinned, fleet),
                         expected,
                         "local={local:?} pinned={pinned} fleet={fleet:?}"
+                    );
+                    assert_eq!(
+                        resolve_selection_mode(local, pinned, fleet),
+                        expected.0,
+                        "mode half disagrees: local={local:?} pinned={pinned} fleet={fleet:?}"
                     );
                     cells += 1;
                 }
             }
         }
-        assert_eq!(cells, 24);
+        assert_eq!(cells, 60);
 
         // Literal anchors for the two cells the design turns on.
         assert_eq!(
@@ -675,6 +968,45 @@ mod tests {
             AccountSelectionMode::Manual,
             "a PINNED machine ignores the fleet"
         );
+        assert_eq!(
+            resolve_selection(
+                AccountSelectionMode::Manual,
+                true,
+                Some(AccountSelectionMode::HighestExpectedUsage)
+            ),
+            (AccountSelectionMode::Manual, AccountSelectionSource::Pinned),
+            "a pin reports Pinned even when the fleet has a value"
+        );
+        assert_eq!(
+            resolve_selection(AccountSelectionMode::Manual, false, None),
+            (AccountSelectionMode::Manual, AccountSelectionSource::Local),
+            "unpinned with no fleet opinion is Local"
+        );
+    }
+
+    #[test]
+    fn reported_source_is_unknown_until_the_fleet_answered() {
+        use AccountSelectionSource::*;
+        assert_eq!(reported_selection_source(Local, false), "unknown");
+        assert_eq!(reported_selection_source(Fleet, false), "unknown");
+        assert_eq!(reported_selection_source(Pinned, false), "pinned");
+        assert_eq!(reported_selection_source(Local, true), "local");
+        assert_eq!(reported_selection_source(Fleet, true), "fleet");
+        assert_eq!(reported_selection_source(Pinned, true), "pinned");
+    }
+
+    #[test]
+    fn selection_source_str_matches_serde() {
+        for src in [
+            AccountSelectionSource::Fleet,
+            AccountSelectionSource::Local,
+            AccountSelectionSource::Pinned,
+        ] {
+            assert_eq!(
+                serde_json::to_value(src).unwrap(),
+                serde_json::Value::String(src.as_str().to_string())
+            );
+        }
     }
 
     /// `resolve_for_cli_settings` reads the mode AND the pin off the document

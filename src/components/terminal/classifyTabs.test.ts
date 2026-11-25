@@ -12,10 +12,7 @@ const tabs = (...ids: string[]) => ids.map((id) => ({ id }));
  * the map yet mounted elsewhere, or to hold two values. This asserts both the
  * per-tab owner count and total map coverage.
  */
-function assertExactlyOneOrZeroOwner(
-  result: Map<string, TabClassification>,
-  allTabIds: string[],
-) {
+function assertExactlyOneOrZeroOwner(result: Map<string, TabClassification>, allTabIds: string[]) {
   for (const id of allTabIds) {
     expect(result.has(id)).toBe(true);
     const owners = mountOwnerCount(result.get(id)!);
@@ -104,5 +101,58 @@ describe("classifyTabs — flow mode (virtualized)", () => {
     // Across both passes 'b' is owned by at most one mount at a time.
     assertExactlyOneOrZeroOwner(far, ["a", "b"]);
     assertExactlyOneOrZeroOwner(near, ["a", "b"]);
+  });
+});
+
+describe("classifyTabs — tmux work mode", () => {
+  const mixed = [
+    { id: "a" },
+    { id: "b" },
+    { id: "plan", type: "plan" as const },
+    { id: "worker", sessionBacked: true },
+  ];
+
+  it("owns the shown tab as assigned and parks every other tab", () => {
+    const result = classifyTabs(mixed, { 0: "a" }, false, new Set(), "tmux");
+    expect([...result]).toEqual([
+      ["a", "assigned"],
+      ["b", "offscreen"],
+      ["plan", "offscreen-unmounted"],
+      ["worker", "offscreen-unmounted"],
+    ]);
+  });
+
+  it("never mounts a parked plan or worker tab, and mounts each PTY tab once", () => {
+    const result = classifyTabs(mixed, { 0: "a" }, false, new Set(), "tmux");
+    expect(mixed.map((t) => mountOwnerCount(result.get(t.id)!))).toEqual([1, 1, 0, 0]);
+    assertExactlyOneOrZeroOwner(result, ["a", "b", "plan", "worker"]);
+  });
+
+  it("classifies nothing hidden — grid's unzoned parking owns no tab in tmux", () => {
+    const result = classifyTabs(mixed, { 0: "b" }, false, new Set(), "tmux");
+    expect([...result.values()].filter((c) => c === "hidden")).toEqual([]);
+  });
+
+  it("a swap moves ownership between assigned and offscreen without a second owner", () => {
+    const before = classifyTabs(mixed, { 0: "a" }, false, new Set(), "tmux");
+    const after = classifyTabs(mixed, { 0: "b" }, false, new Set(), "tmux");
+    expect([before.get("a"), before.get("b")]).toEqual(["assigned", "offscreen"]);
+    expect([after.get("a"), after.get("b")]).toEqual(["offscreen", "assigned"]);
+    assertExactlyOneOrZeroOwner(after, ["a", "b", "plan", "worker"]);
+  });
+
+  it("a shown plan or worker tab is assigned — it renders through its zone path", () => {
+    expect(classifyTabs(mixed, { 0: "plan" }, false, new Set(), "tmux").get("plan")).toBe(
+      "assigned",
+    );
+    expect(classifyTabs(mixed, { 0: "worker" }, false, new Set(), "tmux").get("worker")).toBe(
+      "assigned",
+    );
+  });
+
+  it("ignores flow mode and viewport proximity", () => {
+    const result = classifyTabs(mixed, { 0: "a" }, true, new Set(["b"]), "tmux");
+    expect(result.get("a")).toBe("assigned");
+    expect(result.get("b")).toBe("offscreen");
   });
 });

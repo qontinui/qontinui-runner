@@ -28,6 +28,7 @@ use crate::mcp::shared::{emit_ai_output, AiSessionContext, FindingContext, Progr
 use crate::workflow_state::{ParsedProgress, ProgressParser};
 
 use super::dispatcher;
+use super::runner::{cli_session_pin, stream_json_launch_spec, CliPin};
 use super::state::{SessionState, SessionStateTracker};
 use super::writer::StdinWriter;
 
@@ -201,6 +202,19 @@ pub struct ClaudeSession {
 unsafe impl Send for ClaudeSession {}
 unsafe impl Sync for ClaudeSession {}
 
+/// The typed spawn failure for `message`, on the side of the CLI process the
+/// body reached ([`ClaudeSession::spawn`]).
+fn spawn_failure(
+    child_started: bool,
+    message: String,
+) -> crate::terminal::spawn_refusal::SpawnFailure {
+    if child_started {
+        crate::terminal::spawn_refusal::SpawnFailure::after_child(message)
+    } else {
+        crate::terminal::spawn_refusal::SpawnFailure::before_child(message)
+    }
+}
+
 impl ClaudeSession {
     /// Spawn a new interactive Claude CLI session.
     ///
@@ -210,6 +224,13 @@ impl ClaudeSession {
     /// When `worktree` is `Some`, `working_dir` MUST already be the worktree's
     /// path — the CLI inherits its cwd from there and the metadata is stored on
     /// the resulting session for downstream consumers (e.g. file registry).
+    ///
+    /// The failure is typed ([`crate::terminal::spawn_refusal::SpawnFailure`]):
+    /// `child_started` is `false` for every refusal before the CLI process was
+    /// spawned (the gateway refusals, the tool-policy settings write, the
+    /// process spawn itself) and `true` from the moment the process exists
+    /// (stdin, the state machine, the init handshake) — so a door that
+    /// allocated a worktree for this session may remove it only on `false`.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         working_dir: &str,
@@ -224,11 +245,52 @@ impl ClaudeSession {
         tool_policy: Option<&crate::workflow::dag_schema::ToolPolicy>,
         cli_session_ctx: Option<&crate::claude_session::runner::CliSessionContext>,
         agent_log_emitter: Option<super::coord_register::AgentLogEmitter>,
+    ) -> Result<Self, crate::terminal::spawn_refusal::SpawnFailure> {
+        let child_started = std::cell::Cell::new(false);
+        Self::spawn_body(
+            working_dir,
+            session_id,
+            app_handle,
+            session_ctx,
+            finding_ctx,
+            progress_ctx,
+            pid_tracker,
+            model_override,
+            worktree,
+            tool_policy,
+            cli_session_ctx,
+            agent_log_emitter,
+            &child_started,
+        )
+        .map_err(|message| spawn_failure(child_started.get(), message))
+    }
+
+    /// [`Self::spawn`]'s body: sets `child_started` the moment the CLI
+    /// process exists, so the typed failure can say which side of it an error
+    /// came from.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_body(
+        working_dir: &str,
+        session_id: &str,
+        app_handle: &tauri::AppHandle,
+        session_ctx: Option<AiSessionContext>,
+        finding_ctx: Option<FindingContext>,
+        progress_ctx: Option<ProgressContext>,
+        pid_tracker: Option<Arc<Mutex<Vec<u32>>>>,
+        model_override: Option<&str>,
+        worktree: Option<WorktreeInfo>,
+        tool_policy: Option<&crate::workflow::dag_schema::ToolPolicy>,
+        cli_session_ctx: Option<&crate::claude_session::runner::CliSessionContext>,
+        agent_log_emitter: Option<super::coord_register::AgentLogEmitter>,
+        child_started: &std::cell::Cell<bool>,
     ) -> Result<Self, String> {
         info!(
             "Spawning interactive Claude session: {} in {}",
             session_id, working_dir
         );
+        if let Some(refusal) = crate::model_gateway::spawn_refusal() {
+            return Err(refusal);
+        }
 
         // Spawn CLI with stream-json input AND output. The Command itself is
         // built further down, once `render_program_and_argv` has resolved the
@@ -271,24 +333,20 @@ impl ClaudeSession {
         // losslessly from that transcript. The chat path passes the runner's
         // own `session_id` (== task_run_id) as the CLI id so resume is
         // deterministic without persisting a separate Claude-internal id.
-        // `None` preserves today's behavior (CLI generates a random id).
-        let (session_id_pin, resume_id_pin) = match cli_session_ctx {
-            Some(ctx) if ctx.is_resume => {
-                info!(
-                    "Resuming Claude CLI session {} for interactive session {}",
-                    ctx.cli_session_id, session_id
-                );
-                (None, Some(ctx.cli_session_id.clone()))
-            }
-            Some(ctx) => {
-                info!(
-                    "Pinning Claude CLI session id {} for interactive session {}",
-                    ctx.cli_session_id, session_id
-                );
-                (Some(ctx.cli_session_id.clone()), None)
-            }
-            None => (None, None),
-        };
+        // `None` mints a fresh id here instead of letting the CLI pick one, so
+        // the id is in argv where the session census reads it (see
+        // `runner::CliPin`).
+        let cli_pin = cli_session_pin(cli_session_ctx);
+        match &cli_pin {
+            CliPin::Resume(id) => info!(
+                "Resuming Claude CLI session {} for interactive session {}",
+                id, session_id
+            ),
+            CliPin::New(id) => info!(
+                "Pinning Claude CLI session id {} for interactive session {}",
+                id, session_id
+            ),
+        }
 
         // Model override (e.g., from per-stage config) is fed to the seam below
         // as `spec.model` so it wins over any template `--model`.
@@ -342,14 +400,7 @@ impl ClaudeSession {
         // The operator's global template + per-account command layer in here;
         // with no operator config the composed tail is byte-identical to the
         // historical hand-built argv.
-        let spec = crate::claude_session::launch_spec::LaunchSpec {
-            permission: crate::claude_session::launch_spec::PermissionMode::BypassPermissions,
-            session_id: session_id_pin,
-            resume_id: resume_id_pin,
-            model: model_override.map(|m| m.to_string()),
-            extra_required,
-            ..Default::default()
-        };
+        let spec = stream_json_launch_spec(cli_pin, model_override, extra_required);
         let launch_cfg = crate::claude_session::launch_spec::LaunchConfig::from_settings(
             effective_config_dir.as_deref(),
         );
@@ -418,8 +469,10 @@ impl ClaudeSession {
             // tenant `AiCoordRegistrar` stamped them with, looked up by this
             // spawn's own id, then by the owning task run's id (a workflow
             // phase session's id is suffixed; the run is what registered).
-            // Neither registered yet, or no tenant recorded: the registrar's
-            // own resolver. `None` on an unresolvable or unpaired machine.
+            // Neither registered yet, or no tenant recorded: resolve it as
+            // a registration would, from the workspace and the repo in this
+            // spawn's working directory (plan 2026-09-20 Phase 5). A REFUSED
+            // decision skips federation rather than federating the default.
             crate::claude_session::coord_register::federation_session_tenant(
                 tauri::Manager::try_state::<
                     std::sync::Arc<crate::claude_session::coord_register::AiCoordRegistrar>,
@@ -431,6 +484,11 @@ impl ClaudeSession {
                     None,
                     session_ctx.as_ref(),
                 ),
+                || {
+                    Self::block_on_async(crate::session::resolve_new_session_tenant_in(Some(
+                        std::path::Path::new(working_dir),
+                    )))
+                },
             ),
         ) {
             Ok(ctx) => Some(ctx),
@@ -502,7 +560,12 @@ impl ClaudeSession {
         };
 
         let mut child = match cmd.spawn() {
-            Ok(c) => c,
+            Ok(c) => {
+                // From here a CLI process exists: every later failure may have
+                // left it running in `working_dir`.
+                child_started.set(true);
+                c
+            }
             Err(e) => {
                 // Clean up every federation watcher we just started so a
                 // spawn failure doesn't leave an orphaned `notify` hook
@@ -663,7 +726,7 @@ impl ClaudeSession {
         let heartbeat_handle = thread::spawn(move || {
             let mut last_update = 0u64;
             loop {
-                if stop_rx.try_recv().is_ok() {
+                if super::heartbeat::heartbeat_should_stop(&stop_rx) {
                     break;
                 }
                 thread::sleep(Duration::from_millis(100));
@@ -1431,6 +1494,23 @@ impl ClaudeSession {
         self.worktree.as_ref()
     }
 
+    /// The worktree paths of the `IsolatedEditContext` parked on this session
+    /// by [`Self::set_isolated_edit_ctx`], or empty when none is parked.
+    ///
+    /// Distinct from [`Self::worktree`]: an orchestration worker
+    /// (`dispatch_subtask`) and a resumed chat session are SPAWNED in their
+    /// allocated worktree rather than promoted into it, so the path lives only
+    /// on the parked context. A `shared_branch` row also names the canonical
+    /// checkout here, so a caller that needs "this session's own allocation"
+    /// must filter — see `SessionManager::task_run_id_for_workdir`.
+    pub fn isolated_worktree_paths(&self) -> Vec<PathBuf> {
+        self.isolated_edit_ctx
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(parked_worktree_paths))
+            .unwrap_or_default()
+    }
+
     /// Send the initial prompt to start the first turn.
     /// Transitions from Ready to Processing.
     pub fn send_initial_prompt(&self, prompt: &str) -> Result<(), String> {
@@ -1686,6 +1766,21 @@ impl ClaudeSession {
         if let Ok(mut slot) = self.isolated_edit_ctx.lock() {
             *slot = Some(ctx);
         }
+    }
+
+    /// Take the parked `IsolatedEditContext` back off this session, leaving
+    /// the slot empty, so a later `close()` / `Drop` does not release it.
+    /// Mirrors `TerminalSession::take_isolated_edit_ctx`. Used by a door whose
+    /// spawn failed after parking it, to hand the allocation to
+    /// `IsolatedEditContext::remove_unspawned` (which reports it) instead of
+    /// letting the close drop it unreported.
+    pub fn take_isolated_edit_ctx(
+        &self,
+    ) -> Option<crate::agent_worktree::isolated_edit::IsolatedEditContext> {
+        self.isolated_edit_ctx
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
     }
 
     /// `(worktree_path, parent_sha)` of every coord-allocated worktree the
@@ -2146,6 +2241,7 @@ impl ClaudeSession {
         // is an infinite silent hang. One shared list, eight seams; see
         // `credential_helper::non_interactive_git_env`.
         crate::credential_helper::apply_non_interactive_git_env_std(cmd);
+        crate::terminal::apply_python_utf8_default_std(cmd);
         crate::terminal::scrub_credential_env_std(cmd);
     }
 
@@ -2198,6 +2294,19 @@ impl std::fmt::Debug for ClaudeSession {
             .field("user_interacted", &self.has_user_interacted())
             .finish()
     }
+}
+
+/// The projection [`ClaudeSession::isolated_worktree_paths`] applies to a parked
+/// context: every materialized worktree path, in order. A free function so the
+/// snapshot loop in `SessionManager::task_run_id_for_workdir` can be tested
+/// against real contexts without a live `ClaudeSession`.
+pub(crate) fn parked_worktree_paths(
+    ctx: &crate::agent_worktree::isolated_edit::IsolatedEditContext,
+) -> Vec<PathBuf> {
+    ctx.worktrees
+        .iter()
+        .map(|w| w.worktree_path.clone())
+        .collect()
 }
 
 #[cfg(test)]
@@ -2268,6 +2377,7 @@ mod tests {
             &cmd,
             "ClaudeSession::finalize_child_env",
         );
+        crate::terminal::assert_python_utf8_default_std(&cmd, "ClaudeSession::finalize_child_env");
     }
 
     /// The `isolated_edit_ctx` slot on `ClaudeSession` is the worktree-isolation
@@ -2310,6 +2420,44 @@ mod tests {
             dropped.load(Ordering::SeqCst),
             "clearing the slot must drop the held context (releasing the claim) — \
              NOT leak it the way mem::forget did"
+        );
+    }
+
+    /// The typed spawn failure says which side of the CLI process an error
+    /// came from (plan
+    /// `2026-11-08-a-spawn-refused-after-its-worktree-allocation-leaves-the-tree-on-disk`):
+    /// only a pre-child failure may let a door remove its fresh tree.
+    #[test]
+    fn a_spawn_failure_carries_which_side_of_the_child_it_came_from() {
+        let before = super::spawn_failure(false, "model gateway refused".to_string());
+        assert!(!before.child_started);
+        assert_eq!(before.message, "model gateway refused");
+        assert!(super::spawn_failure(true, "init timeout".to_string()).child_started);
+    }
+
+    /// `child_started` flips exactly once, in the `Ok` arm of the CLI
+    /// process spawn — never before it (a pre-child refusal would then keep
+    /// its tree for no reason) and nowhere else.
+    #[test]
+    fn child_started_is_set_only_where_the_cli_process_comes_into_being() {
+        let src = include_str!("session.rs");
+        let body = src
+            .split_once(concat!("fn spawn_", "body("))
+            .expect("spawn_body")
+            .1;
+        let sets: Vec<usize> = body
+            .match_indices(concat!("child_started.", "set(true)"))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(sets.len(), 1, "set exactly once");
+        let spawn_at = body
+            .find(concat!("match cmd.", "spawn() {"))
+            .expect("the CLI process spawn");
+        assert!(sets[0] > spawn_at, "set only after the process spawn");
+        let between = body.get(spawn_at..sets[0]).expect("a char boundary");
+        assert!(
+            between.contains("Ok(c) =>") && !between.contains("Err("),
+            "set inside the spawn's Ok arm: {between}"
         );
     }
 }

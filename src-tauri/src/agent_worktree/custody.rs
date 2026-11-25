@@ -361,8 +361,70 @@ pub struct SessionIdentity {
     pub transcript: bool,
     /// WHICH account root holds it — the `CLAUDE_CONFIG_DIR` a resume line
     /// must name. Resolution sweeps all five roots, so this is not decorative:
-    /// resuming under the wrong root finds no transcript.
+    /// resuming under the wrong root finds no transcript. When the id has a
+    /// copy in several roots (an account migration copies the transcript and
+    /// resumes the same id elsewhere), this is the root whose copy holds the
+    /// NEWEST turn — the one `--resume` must use (see
+    /// [`SessionDirectory::copies_of`]).
     pub config_dir: Option<String>,
+}
+
+/// One on-disk copy of a session's transcript:
+/// `<config_dir>/projects/<encoded cwd>/<session id>.jsonl`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptCopy {
+    /// The account root as discovered — NOT case-normalized, so its basename
+    /// is the account label and the path can be handed to a shell as-is.
+    pub config_dir: PathBuf,
+    /// The transcript file itself.
+    pub path: PathBuf,
+    /// `(len, mtime)` as the walk saw them — the key the newest-turn cache
+    /// validates against. `None` when the metadata could not be read.
+    pub stamp: Option<crate::session::transcript_last_turn::FileStamp>,
+}
+
+/// Order a session's transcript copies so the one holding the NEWEST turn is
+/// first: a readable turn beats a readable file with no turn, which beats a
+/// copy that could not be read (or was not read).
+///
+/// The turn time decides first, never the mtime alone: a migration copy gets
+/// a FRESH mtime while holding only the original's turns, so once the resumed
+/// session speaks, its copy wins on the turn itself.
+///
+/// Ties on the turn — two copies holding the same newest turn — break on the
+/// most recently WRITTEN copy. That is what a migration looks like when the
+/// resumed session exits before its first turn: the migration wrote the copy
+/// into the target root after the original's last write, and the target root
+/// is the account `--resume` continued under. Ordering such a tie by name
+/// instead would re-stamp a migrated session back onto its OLD account
+/// (coord accepts an equal observation time). Only then the config dir, then
+/// the path, so a tie that mtime cannot settle never flaps between walks.
+pub(crate) fn order_by_newest_turn(
+    copies: &mut [TranscriptCopy],
+    read: &mut dyn FnMut(&TranscriptCopy) -> crate::session::transcript_last_turn::TurnRead,
+) {
+    use crate::session::transcript_last_turn::TurnRead;
+    if copies.len() < 2 {
+        return;
+    }
+    let rank = |r: TurnRead| match r {
+        TurnRead::Read(Some(ms)) => (2u8, ms),
+        TurnRead::Read(None) => (1, 0),
+        TurnRead::Deferred | TurnRead::Unreadable => (0, 0),
+    };
+    let mut keyed: Vec<((u8, i64), TranscriptCopy)> =
+        copies.iter().map(|c| (rank(read(c)), c.clone())).collect();
+    let written = |c: &TranscriptCopy| c.stamp.and_then(|s| s.modified_ms);
+    keyed.sort_by(|(ra, a), (rb, b)| {
+        rb.cmp(ra)
+            // Newest write first; an unknown mtime (`None`) sorts last.
+            .then_with(|| written(b).cmp(&written(a)))
+            .then_with(|| a.config_dir.cmp(&b.config_dir))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    for (slot, (_, c)) in copies.iter_mut().zip(keyed) {
+        *slot = c;
+    }
 }
 
 impl SessionIdentity {
@@ -392,11 +454,21 @@ impl SessionIdentity {
 /// transcript for this id exist anywhere" is the question that decides ghost
 /// vs resolvable; asking "does one exist under this path" would manufacture
 /// ghosts out of sessions that simply moved.
+///
+/// ## Every root is kept, not the first
+///
+/// An account migration copies a session's transcript into another account
+/// root and resumes the same id there, so one id can have a copy in several
+/// roots. Keeping only the first root the walk met made the answer depend on
+/// discovery order; every copy is kept instead and the copy holding the
+/// NEWEST turn is put first ([`order_by_newest_turn`]). Only multi-root ids
+/// pay a tail read for that, and the read is cached per `(len, mtime)`
+/// ([`crate::session::transcript_last_turn`]).
 #[derive(Debug, Clone, Default)]
 pub struct SessionDirectory {
     names: HashMap<String, String>,
-    /// id → the account root whose `projects/` holds its transcript.
-    transcripts: HashMap<String, String>,
+    /// id → every copy of its transcript, the newest-turn copy first.
+    transcripts: HashMap<String, Vec<TranscriptCopy>>,
     /// Roots actually walked — reported so an empty index is never mistaken
     /// for "no sessions exist".
     roots_scanned: usize,
@@ -408,12 +480,28 @@ impl SessionDirectory {
     /// counted out of `roots_scanned`, so [`Self::roots_scanned`] stays an
     /// honest statement of coverage.
     pub fn discover() -> Self {
+        Self::discover_from(
+            &session_names_dir(),
+            &crate::terminal::transcript::find_claude_config_dirs(),
+        )
+    }
+
+    /// [`Self::discover`] over an explicit names dir and root list — the
+    /// filesystem-shaped test seam.
+    pub(crate) fn discover_from(names_dir: &Path, roots: &[PathBuf]) -> Self {
+        use crate::session::transcript_last_turn::{last_turn_ms, ReadBudget};
         let mut me = Self::default();
-        me.load_names(&session_names_dir());
-        for root in crate::terminal::transcript::find_claude_config_dirs() {
-            if me.load_transcripts(&root) {
+        me.load_names(names_dir);
+        for root in roots {
+            if me.load_transcripts(root) {
                 me.roots_scanned += 1;
             }
+        }
+        // Unbounded: only ids with a copy in more than one root are read, and
+        // each read is cached until that file changes.
+        let mut budget = ReadBudget::Unbounded;
+        for copies in me.transcripts.values_mut() {
+            order_by_newest_turn(copies, &mut |c| last_turn_ms(&c.path, c.stamp, &mut budget));
         }
         me
     }
@@ -471,6 +559,40 @@ impl SessionDirectory {
         self.transcripts.len()
     }
 
+    /// The fleet tag name for `session_id` (`~/.qontinui/session-names/<id>`),
+    /// if one is recorded.
+    pub fn name_of(&self, session_id: &str) -> Option<&str> {
+        self.names
+            .get(&session_id.trim().to_ascii_lowercase())
+            .map(String::as_str)
+    }
+
+    /// Every transcript copy of `session_id`, the copy holding the newest turn
+    /// first. Empty when no root holds one.
+    pub fn copies_of(&self, session_id: &str) -> &[TranscriptCopy] {
+        self.transcripts
+            .get(&session_id.trim().to_ascii_lowercase())
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Every id that has at least one transcript copy, sorted — the ids whose
+    /// account root this machine can name.
+    pub fn transcribed_ids(&self) -> Vec<&str> {
+        let mut ids: Vec<&str> = self.transcripts.keys().map(String::as_str).collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Every transcript file the walk saw, across all roots.
+    pub fn transcript_paths(&self) -> std::collections::HashSet<PathBuf> {
+        self.transcripts
+            .values()
+            .flatten()
+            .map(|c| c.path.clone())
+            .collect()
+    }
+
     fn load_names(&mut self, dir: &Path) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
@@ -493,8 +615,9 @@ impl SessionDirectory {
         }
     }
 
-    /// Index `<root>/projects/*/<session-id>.jsonl`. Returns whether the root
-    /// was readable at all.
+    /// Index `<root>/projects/*/<session-id>.jsonl`, keeping EVERY copy (a
+    /// second root's copy of an id is a migration, not a duplicate to drop).
+    /// Returns whether the root was readable at all.
     fn load_transcripts(&mut self, root: &Path) -> bool {
         let projects = root.join("projects");
         let Ok(dirs) = std::fs::read_dir(&projects) else {
@@ -509,10 +632,23 @@ impl SessionDirectory {
                 if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                     continue;
                 }
-                if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
-                    self.transcripts
-                        .entry(stem.to_ascii_lowercase())
-                        .or_insert_with(|| norm(&root.to_string_lossy()));
+                let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let stamp = f
+                    .metadata()
+                    .ok()
+                    .map(|m| crate::session::transcript_last_turn::FileStamp::of(&m));
+                let copies = self
+                    .transcripts
+                    .entry(stem.to_ascii_lowercase())
+                    .or_default();
+                if copies.iter().all(|c| c.path != p) {
+                    copies.push(TranscriptCopy {
+                        config_dir: root.to_path_buf(),
+                        path: p,
+                        stamp,
+                    });
                 }
             }
         }
@@ -526,7 +662,11 @@ impl SessionDirectory {
     /// `roots_scanned` exists to let callers check.
     pub fn resolve(&self, session_id: &str) -> SessionIdentity {
         let key = session_id.trim().to_ascii_lowercase();
-        let config_dir = self.transcripts.get(&key).cloned();
+        let config_dir = self
+            .transcripts
+            .get(&key)
+            .and_then(|copies| copies.first())
+            .map(|c| norm(&c.config_dir.to_string_lossy()));
         SessionIdentity {
             name: self.names.get(&key).cloned(),
             transcript: config_dir.is_some(),
@@ -537,6 +677,7 @@ impl SessionDirectory {
     /// Test seam.
     #[cfg(test)]
     pub fn from_parts(names: &[(&str, &str)], transcripts: &[&str], roots_scanned: usize) -> Self {
+        let root = PathBuf::from("C:/claude/.claude-test");
         Self {
             names: names
                 .iter()
@@ -544,7 +685,15 @@ impl SessionDirectory {
                 .collect(),
             transcripts: transcripts
                 .iter()
-                .map(|t| (t.to_ascii_lowercase(), "C:/claude/.claude-test".to_string()))
+                .map(|t| {
+                    let id = t.to_ascii_lowercase();
+                    let copy = TranscriptCopy {
+                        config_dir: root.clone(),
+                        path: root.join("projects").join("p").join(format!("{id}.jsonl")),
+                        stamp: None,
+                    };
+                    (id, vec![copy])
+                })
                 .collect(),
             roots_scanned,
         }
@@ -1197,12 +1346,21 @@ pub mod coord {
         /// instead of failing the whole survey.
         #[serde(default)]
         pub work_unit_id: Option<String>,
+        /// `coord.agent_worktrees.status` — `allocated` | `active` | `merging`
+        /// | `merged` | `abandoned`. `None` from a coord that omits it.
+        #[serde(default)]
+        pub ledger_status: Option<String>,
     }
 
     #[derive(Debug, Clone, Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub struct CoordSessionRow {
         pub session_id: String,
+        /// The Claude Code session id this row is filed under — the KEY of
+        /// the keyed read, by which a keyed answer is mapped back to the id it
+        /// was asked about. `None` from a coord that omits it.
+        #[serde(default)]
+        pub claude_code_session_id: Option<String>,
         /// `expected` | `active` | `pending_resolution` | `stale` | `closed`.
         #[serde(default)]
         pub owner_session_state: Option<String>,
@@ -1235,6 +1393,12 @@ pub mod coord {
         /// [`walk_pages`] declares it partial when it came back full.
         #[serde(default, deserialize_with = "present_key")]
         pub next_cursor: Option<Option<String>>,
+        /// Whether `coord.sessions.claude_code_session_id` — the bridge the
+        /// ledger join runs through — exists on that database. Absent or
+        /// `false` makes `sessions: []` UNKNOWN rather than "no worktrees";
+        /// `None` from a coord that predates the field.
+        #[serde(default)]
+        pub session_bridge_column_present: Option<bool>,
     }
 
     /// Deserialize a present key (including `null`) as `Some(_)`, so an
@@ -1246,19 +1410,26 @@ pub mod coord {
         Option::<String>::deserialize(d).map(Some)
     }
 
-    /// Page size requested per walk step — coord's own clamp ceiling. A
-    /// pre-cursor coord honours `?limit=` too, so this is also the cap an old
-    /// coord's single page is compared against.
-    pub const PAGE_LIMIT: u32 = 500;
+    /// Page size requested per walk step. A pre-cursor coord honours
+    /// `?limit=` too, so this is also the cap an old coord's single page is
+    /// compared against.
+    ///
+    /// 100, not coord's 500-row clamp ceiling: a 500-row page measured 16-23 s
+    /// on a large tenant (coord finding bc41a3df-4657-43be-a971-06b6b4813f27),
+    /// past [`REQUEST_TIMEOUT`], and a page error fails the whole walk — so
+    /// the survey got no index at all. A smaller page is meant to answer
+    /// inside the deadline (unmeasured at 100 rows), so the walk returns at
+    /// least a PARTIAL index when [`SURVEY_WALK_BUDGET`] runs out.
+    pub const PAGE_LIMIT: u32 = 100;
 
-    /// Hard bound on the walk: 100 pages x 500 rows = 50,000 ledger rows, ~35x
+    /// Hard bound on the walk: 100 pages x 100 rows = 10,000 ledger rows, ~7x
     /// the largest tenant measured (~1,360 live worktrees). Hitting it is
     /// never silent — the index comes back with [`CoordOwnership::partial`]
     /// set.
     pub const MAX_PAGES: usize = 100;
 
     /// Wall-clock budget for the operator-facing survey's whole walk. The
-    /// per-request client timeout (15 s) bounds ONE page; this bounds the sum,
+    /// per-request timeout ([`REQUEST_TIMEOUT`]) bounds ONE page; this bounds the sum,
     /// so a slow ledger yields a partial index rather than an N x 15 s hang.
     pub const SURVEY_WALK_BUDGET: Duration = Duration::from_secs(20);
 
@@ -1277,8 +1448,21 @@ pub mod coord {
         let mut order: Vec<CoordSessionRow> = Vec::new();
         let mut at: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         let mut limit = None;
+        // The bridge column is reported per page: the merge carries `Some(true)`
+        // only when EVERY page reported it present, `Some(false)` when any page
+        // reported it absent, and `None` otherwise (a coord predating the field).
+        let mut bridge_all_true = true;
+        let mut bridge_any_false = false;
         for page in pages {
             limit = limit.or(page.limit);
+            match page.session_bridge_column_present {
+                Some(true) => {}
+                Some(false) => {
+                    bridge_any_false = true;
+                    bridge_all_true = false;
+                }
+                None => bridge_all_true = false,
+            }
             for s in page.sessions {
                 match at.get(&s.session_id) {
                     Some(&i) => {
@@ -1299,6 +1483,13 @@ pub mod coord {
             sessions: order,
             limit,
             next_cursor: Some(None),
+            session_bridge_column_present: if bridge_any_false {
+                Some(false)
+            } else if bridge_all_true {
+                Some(true)
+            } else {
+                None
+            },
         }
     }
 
@@ -1431,6 +1622,16 @@ pub mod coord {
         /// `None` ⇒ the walk reached `nextCursor: null` (or an old coord's one
         /// and only page).
         pub partial: Option<String>,
+        /// Claude session id (lowercased) → the `coord.sessions.id` coord's
+        /// KEYED read answered it with (its own `sessions[]` entry, whatever
+        /// that session's state). The ONLY way the custody gate resolves a
+        /// Claude session to its ledger rows. Empty for an index built by
+        /// [`Self::from_response`] alone.
+        coord_row_by_claude: std::collections::HashMap<String, String>,
+        /// Claude session id (lowercased) → why the keyed read did NOT answer
+        /// it (`unknown`, `invalid`, cut by `inputTruncated`, …). Such a
+        /// session's worktrees are UNKNOWN, never "none".
+        unanswered_by_claude: std::collections::HashMap<String, String>,
     }
 
     impl CoordOwnership {
@@ -1457,6 +1658,8 @@ pub mod coord {
                 by_path,
                 reachable: true,
                 partial: None,
+                coord_row_by_claude: std::collections::HashMap::new(),
+                unanswered_by_claude: std::collections::HashMap::new(),
             }
         }
 
@@ -1466,12 +1669,62 @@ pub mod coord {
             self
         }
 
+        /// Record which `coord.sessions.id` the keyed read answered each
+        /// Claude session id with.
+        pub fn record_coord_rows(&mut self, rows: impl IntoIterator<Item = (String, String)>) {
+            self.coord_row_by_claude.extend(
+                rows.into_iter()
+                    .map(|(claude, coord)| (claude.to_ascii_lowercase(), coord)),
+            );
+        }
+
+        /// Record why the keyed read did not answer each Claude session id.
+        pub fn record_unanswered(&mut self, ids: impl IntoIterator<Item = (String, String)>) {
+            self.unanswered_by_claude.extend(
+                ids.into_iter()
+                    .map(|(claude, why)| (claude.to_ascii_lowercase(), why)),
+            );
+        }
+
+        /// The `coord.sessions.id` the keyed read answered
+        /// `claude_session_id` with, if it did.
+        pub fn coord_session_for_claude(&self, claude_session_id: &str) -> Option<&str> {
+            self.coord_row_by_claude
+                .get(&claude_session_id.to_ascii_lowercase())
+                .map(String::as_str)
+        }
+
+        /// Why the keyed read did not answer `claude_session_id`, if it said.
+        pub fn unanswered_reason(&self, claude_session_id: &str) -> Option<&str> {
+            self.unanswered_by_claude
+                .get(&claude_session_id.to_ascii_lowercase())
+                .map(String::as_str)
+        }
+
         pub fn len(&self) -> usize {
             self.rows.len()
         }
 
         pub fn is_empty(&self) -> bool {
             self.rows.is_empty()
+        }
+
+        /// Every ledger worktree row allocated to `session_id` — a
+        /// `coord.sessions.id`, which is what this route keys its sessions on
+        /// (NOT a Claude session id). Paths are verbatim, so a RELATIVE ledger
+        /// path is the caller's to resolve against the workspace root. One row
+        /// per path, the first in ledger order.
+        pub fn worktrees_for_session(&self, session_id: &str) -> Vec<&CoordWorktreeRow> {
+            let mut out: Vec<&CoordWorktreeRow> = Vec::new();
+            for (sid, _, row, _) in &self.rows {
+                if sid.eq_ignore_ascii_case(session_id)
+                    && !row.worktree_path.is_empty()
+                    && !out.iter().any(|r| r.worktree_path == row.worktree_path)
+                {
+                    out.push(row);
+                }
+            }
+            out
         }
 
         /// Look one worktree up. `census_path` is absolute; coord's ledger path
@@ -1545,28 +1798,12 @@ pub mod coord {
             return Ok(None);
         };
         let base_url = format!("{}/coord/sessions/worktrees", base.trim_end_matches('/'));
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .build()
-            .map_err(|e| format!("build custody http client: {e}"))?;
+        let Some(client) = crate::coord_http::coord_client() else {
+            return Err("the shared coord HTTP client could not be built".to_string());
+        };
         let (merged, partial) = walk_pages(MAX_PAGES, budget, |cursor| {
             let url = page_url(&base_url, cursor.as_deref());
-            let client = client.clone();
-            async move {
-                let resp = crate::coord_http::coord_get(&client, &url)
-                    .send()
-                    .await
-                    .map_err(|e| format!("GET {url}: {e}"))?;
-                let status = resp.status();
-                if !status.is_success() {
-                    let body = resp.text().await.unwrap_or_default();
-                    let excerpt: String = body.chars().take(200).collect();
-                    return Err(format!("coord returned {status} for GET {url}: {excerpt}"));
-                }
-                resp.json::<CoordSessionWorktrees>()
-                    .await
-                    .map_err(|e| format!("decode session-worktrees: {e}"))
-            }
+            async move { get_json::<CoordSessionWorktrees>(client, &url, REQUEST_TIMEOUT).await }
         })
         .await?;
         Ok(Some(
@@ -1574,7 +1811,7 @@ pub mod coord {
         ))
     }
 
-    /// `…/coord/sessions/worktrees?limit=500[&cursor=<urlencoded>]`.
+    /// `…/coord/sessions/worktrees?limit=<PAGE_LIMIT>[&cursor=<urlencoded>]`.
     fn page_url(base_url: &str, cursor: Option<&str>) -> String {
         match cursor {
             Some(c) => format!(
@@ -1583,6 +1820,376 @@ pub mod coord {
             ),
             None => format!("{base_url}?limit={PAGE_LIMIT}"),
         }
+    }
+
+    /// coord's cap on the keyed read's key — `MAX_IDS` (500) on the coord
+    /// side (`qontinui-coord` `crates/coord/src/session_worktrees.rs`, via
+    /// `session_work_status::parse_ids`). Ids past it are cut and reported as
+    /// `inputTruncated`; the runner never sends more than
+    /// [`KEYED_CHUNK_IDS`] per request, so it never relies on that report.
+    pub const KEYED_MAX_IDS: usize = 500;
+
+    /// Ids per keyed request. Sized by coord's measured cost, not by its
+    /// [`KEYED_MAX_IDS`] cap: the keyed read's cost grows with the id count,
+    /// measured 4.8 s at 25 ids, 10-13 s at 69 and 24-27 s at 100-200 (coord
+    /// finding bc41a3df-4657-43be-a971-06b6b4813f27). A 200-id chunk therefore ran
+    /// past the per-request deadline and left every id in it UNKNOWN; 25 keeps
+    /// one chunk near 5 s, so a slow coord costs a few chunks rather than the
+    /// whole read. (It also keeps the request line near 1 KB.)
+    pub const KEYED_CHUNK_IDS: usize = 25;
+    const _: () = assert!(KEYED_CHUNK_IDS <= KEYED_MAX_IDS);
+
+    /// Keyed chunks in flight at once. coord's cost per keyed request is
+    /// dominated by per-id ledger work, so concurrent chunks spread it across
+    /// coord's workers instead of queueing it end to end: 69 ids (3 chunks)
+    /// take about one chunk's time rather than three. Small on purpose — this
+    /// read runs on every box every tick and must not become a load source.
+    pub const KEYED_CONCURRENCY: usize = 3;
+
+    /// Per-request deadline for one KEYED chunk: about six times the 4.8 s a
+    /// 25-id chunk measured, so a loaded coord still answers inside it. The
+    /// 15 s deadline the 200-id chunk ran under was below the 24.6 s coord
+    /// took to answer it.
+    pub const KEYED_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// The keyed read's overall budget for `chunks` chunks: one
+    /// [`KEYED_REQUEST_TIMEOUT`] per wave of [`KEYED_CONCURRENCY`] chunks, plus
+    /// a little slack for scheduling. Sized to the chunk count rather than
+    /// fixed, so a large candidate set is not cut short by a budget sized for
+    /// a small one; a chunk still running when it expires is UNKNOWN.
+    pub fn keyed_budget(chunks: usize) -> Duration {
+        let waves = chunks.div_ceil(KEYED_CONCURRENCY).max(1);
+        KEYED_REQUEST_TIMEOUT * waves as u32 + Duration::from_secs(5)
+    }
+
+    /// Per-request deadline for one survey page on the shared
+    /// [`crate::coord_http::coord_client`], which carries no global timeout
+    /// of its own. The walk as a whole is bounded by its caller's budget.
+    pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+    /// `"<what>: <error>: <source>: …"` — the error with its whole
+    /// `source()` chain. reqwest's own `Display` stops at `error sending
+    /// request for url (…)`; the cause a reader needs (`operation timed out`,
+    /// an OS error) is one or more `source()` hops down.
+    fn request_error(what: &str, e: &(dyn std::error::Error + 'static)) -> String {
+        format!("{what}: {}", crate::util::error_chain::error_chain(e))
+    }
+
+    /// GET `url` with the device bearer and `timeout`, and decode a 2xx body
+    /// as `T`. Every failure is `Err` with its full cause chain.
+    async fn get_json<T: serde::de::DeserializeOwned>(
+        client: &reqwest::Client,
+        url: &str,
+        timeout: Duration,
+    ) -> Result<T, String> {
+        send_json(crate::coord_http::coord_get(client, url), url, timeout).await
+    }
+
+    /// [`get_json`]'s transport half, over an already-built request — the
+    /// seam the tests drive without a device bearer.
+    async fn send_json<T: serde::de::DeserializeOwned>(
+        req: reqwest::RequestBuilder,
+        url: &str,
+        timeout: Duration,
+    ) -> Result<T, String> {
+        let resp = req
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(|e| request_error(&format!("GET {url}"), &e))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            let excerpt: String = body.chars().take(200).collect();
+            return Err(format!("coord returned {status} for GET {url}: {excerpt}"));
+        }
+        resp.json::<T>()
+            .await
+            .map_err(|e| request_error(&format!("decode GET {url}"), &e))
+    }
+
+    /// One `unknown` entry of the keyed read: an id coord resolved to no
+    /// `coord.sessions` row. Its `worktrees` (an allocate-only owner can have
+    /// some) are deliberately not read — the id is UNKNOWN, whatever it holds.
+    #[derive(Debug, Clone, Default, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct CoordKeyedUnknown {
+        #[serde(default)]
+        pub claude_code_session_id: String,
+    }
+
+    /// `GET /coord/sessions/worktrees?claude_code_session_ids=<csv>` — the
+    /// KEYED one-snapshot read. Every key is optional here so that a response
+    /// MISSING one is detectable rather than a decode error or a default.
+    #[derive(Debug, Clone, Default, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct CoordKeyedSessionWorktrees {
+        /// One entry per requested id that resolved to a `coord.sessions` row,
+        /// WHATEVER its state, including `worktrees: []`.
+        #[serde(default)]
+        pub sessions: Vec<CoordSessionRow>,
+        /// The accepted key, echoed. ABSENT ⇒ coord ignored the key (it
+        /// predates the keyed mode and served page one of the tenant walk).
+        #[serde(default)]
+        pub claude_code_session_ids: Option<Vec<String>>,
+        #[serde(default)]
+        pub unknown: Vec<CoordKeyedUnknown>,
+        #[serde(default)]
+        pub invalid: Vec<String>,
+        #[serde(default)]
+        pub input_truncated: bool,
+        #[serde(default)]
+        pub session_bridge_column_present: Option<bool>,
+    }
+
+    /// `…/coord/sessions/worktrees?claude_code_session_ids=<id>,<id>,…`, each
+    /// id URL-encoded.
+    pub fn keyed_url(base_url: &str, ids: &[String]) -> String {
+        let csv: Vec<String> = ids
+            .iter()
+            .map(|id| urlencoding::encode(id).into_owned())
+            .collect();
+        format!("{base_url}?claude_code_session_ids={}", csv.join(","))
+    }
+
+    /// The ids to ask about: trimmed, blanks dropped, deduplicated
+    /// case-insensitively in first-seen order, then cut into requests of at
+    /// most [`KEYED_CHUNK_IDS`].
+    pub fn keyed_chunks(claude_session_ids: &[String]) -> Vec<Vec<String>> {
+        let mut seen = std::collections::HashSet::new();
+        let ids: Vec<String> = claude_session_ids
+            .iter()
+            .map(|id| id.trim())
+            .filter(|id| !id.is_empty() && seen.insert(id.to_ascii_lowercase()))
+            .map(str::to_string)
+            .collect();
+        ids.chunks(KEYED_CHUNK_IDS)
+            .map(<[String]>::to_vec)
+            .collect()
+    }
+
+    /// Why one keyed response cannot be trusted at all, if it cannot: no
+    /// `claudeCodeSessionIds` echo (coord ignored the key), or a
+    /// `sessionBridgeColumnPresent` that is not `true`.
+    fn untrusted_keyed_response(resp: &CoordKeyedSessionWorktrees) -> Option<&'static str> {
+        if resp.claude_code_session_ids.is_none() {
+            return Some(
+                "coord answered the keyed session-worktrees read without the \
+                 `claudeCodeSessionIds` echo, so it ignored the key (a coord predating the keyed \
+                 mode serves page one of the tenant-wide walk instead): the answer is not about \
+                 these sessions",
+            );
+        }
+        if resp.session_bridge_column_present != Some(true) {
+            return Some(
+                "coord's keyed session-worktrees read does not report the claude_code_session_id \
+                 bridge column present, so no session in it can be resolved and an empty answer \
+                 is UNKNOWN, not \"no worktrees\"",
+            );
+        }
+        None
+    }
+
+    /// PURE: the custody index from the keyed reads — `(ids sent, coord's
+    /// answer or why there is none)` per chunk.
+    ///
+    /// **A chunk fails alone.** A chunk whose request failed (transport,
+    /// timeout, non-2xx, decode) or whose response cannot be trusted
+    /// ([`untrusted_keyed_response`]) records exactly ITS ids UNKNOWN with
+    /// that reason; every other chunk's answers still count. Only when there
+    /// were chunks and EVERY one failed is the whole read `Err` (UNKNOWN for
+    /// every session, carrying the first failure).
+    ///
+    /// Within a trusted response, an id is answered ONLY by its own
+    /// `sessions[]` entry (`claudeCodeSessionId → sessionId`), whatever that
+    /// session's state; an id that is in `invalid`, missing from the echo (cut
+    /// by `inputTruncated`), in `unknown`, or without exactly one entry is
+    /// recorded UNKNOWN with the reason — never "no worktrees".
+    pub fn ownership_from_keyed(
+        chunks: Vec<(Vec<String>, Result<CoordKeyedSessionWorktrees, String>)>,
+    ) -> Result<CoordOwnership, String> {
+        fn key(id: &str) -> String {
+            id.trim().to_ascii_lowercase()
+        }
+        let total = chunks.len();
+        let mut failures: Vec<String> = Vec::new();
+        let mut sessions: Vec<CoordSessionRow> = Vec::new();
+        let mut resolved: Vec<(String, String)> = Vec::new();
+        let mut unanswered: Vec<(String, String)> = Vec::new();
+        for (sent, answer) in chunks {
+            let trusted = answer.and_then(|resp| match untrusted_keyed_response(&resp) {
+                Some(why) => Err(why.to_string()),
+                None => Ok(resp),
+            });
+            let resp = match trusted {
+                Ok(resp) => resp,
+                Err(e) => {
+                    let why = format!("the keyed read of its {}-id chunk failed: {e}", sent.len());
+                    unanswered.extend(sent.iter().map(|id| (key(id), why.clone())));
+                    failures.push(e);
+                    continue;
+                }
+            };
+            let echo = resp.claude_code_session_ids.as_deref().unwrap_or_default();
+            let echoed: std::collections::HashSet<String> = echo.iter().map(|s| key(s)).collect();
+            let invalid: std::collections::HashSet<String> =
+                resp.invalid.iter().map(|s| key(s)).collect();
+            let unknown: std::collections::HashSet<String> = resp
+                .unknown
+                .iter()
+                .map(|u| key(&u.claude_code_session_id))
+                .collect();
+            let mut entries: std::collections::HashMap<String, Vec<&CoordSessionRow>> =
+                std::collections::HashMap::new();
+            for s in &resp.sessions {
+                if let Some(c) = s.claude_code_session_id.as_deref() {
+                    entries.entry(key(c)).or_default().push(s);
+                }
+            }
+            for id in &sent {
+                let k = key(id);
+                let why = if invalid.contains(&k) {
+                    "coord rejected it as not a session id (`invalid`)"
+                } else if !echoed.contains(&k) {
+                    if resp.input_truncated {
+                        "coord cut it from the request (`inputTruncated`)"
+                    } else {
+                        "coord did not echo it among the ids it answered for"
+                    }
+                } else if unknown.contains(&k) {
+                    "coord resolved it to no session row (`unknown`), and an allocate-only \
+                     owner can still hold worktrees under it"
+                } else {
+                    match entries.get(&k).map(Vec::as_slice) {
+                        Some([one]) if !one.session_id.trim().is_empty() => {
+                            resolved.push((k, one.session_id.clone()));
+                            sessions.push((*one).clone());
+                            continue;
+                        }
+                        Some([_, _, ..]) => "coord listed it under more than one session",
+                        _ => {
+                            "coord echoed it but answered it under neither `sessions` nor `unknown`"
+                        }
+                    }
+                };
+                unanswered.push((k, why.to_string()));
+            }
+        }
+        if total > 0 && failures.len() == total {
+            let first = failures.swap_remove(0);
+            return Err(if total == 1 {
+                first
+            } else {
+                format!("all {total} keyed session-worktrees chunks failed; the first: {first}")
+            });
+        }
+        let mut index = CoordOwnership::from_response(CoordSessionWorktrees {
+            sessions,
+            session_bridge_column_present: Some(true),
+            ..Default::default()
+        });
+        index.record_coord_rows(resolved);
+        index.record_unanswered(unanswered);
+        Ok(index)
+    }
+
+    /// Fetch every chunk through `fetch`, at most `concurrency` at once, all
+    /// under ONE overall deadline `budget` from now. A chunk that has not
+    /// answered by the deadline is `Err` for that chunk alone; answers are
+    /// returned in chunk order, each paired with the ids it was asked about.
+    pub async fn fetch_keyed_chunks<F, Fut>(
+        chunks: Vec<Vec<String>>,
+        concurrency: usize,
+        budget: Duration,
+        fetch: F,
+    ) -> Vec<(Vec<String>, Result<CoordKeyedSessionWorktrees, String>)>
+    where
+        F: Fn(Vec<String>) -> Fut,
+        Fut: std::future::Future<Output = Result<CoordKeyedSessionWorktrees, String>>,
+    {
+        use futures::stream::StreamExt;
+        let deadline = tokio::time::Instant::now() + budget;
+        // Unordered, so one slow chunk does not hold a slot past its own
+        // answer the way an ordered buffer's head-of-line would; the order is
+        // restored afterwards.
+        let mut answers: Vec<(
+            usize,
+            Vec<String>,
+            Result<CoordKeyedSessionWorktrees, String>,
+        )> = futures::stream::iter(chunks.into_iter().enumerate())
+            .map(|(at, chunk)| {
+                let fut = fetch(chunk.clone());
+                async move {
+                    let answer =
+                        tokio::time::timeout_at(deadline, fut)
+                            .await
+                            .unwrap_or_else(|_| {
+                                Err(format!(
+                                    "it did not answer within the keyed read's {}s overall budget",
+                                    budget.as_secs()
+                                ))
+                            });
+                    (at, chunk, answer)
+                }
+            })
+            .buffer_unordered(concurrency.max(1))
+            .collect()
+            .await;
+        answers.sort_by_key(|(at, _, _)| *at);
+        answers
+            .into_iter()
+            .map(|(_, chunk, answer)| (chunk, answer))
+            .collect()
+    }
+
+    /// The attributed-worktree index for exactly `claude_session_ids`, read
+    /// through coord's KEYED door
+    /// (`GET /coord/sessions/worktrees?claude_code_session_ids=<csv>`), one
+    /// request — one SQL snapshot of the session pick and its rows — per
+    /// [`KEYED_CHUNK_IDS`] ids, [`KEYED_CONCURRENCY`] in flight, each under
+    /// [`KEYED_REQUEST_TIMEOUT`] and all under [`keyed_budget`].
+    ///
+    /// For a custody gate a missing row reads as "nothing attributed", i.e.
+    /// clean, so this fails closed: `Err` (UNKNOWN at the gate) when no coord
+    /// base is configured, when the shared coord client is unavailable, and
+    /// when every chunk failed. A chunk that fails on its own — transport,
+    /// timeout, non-2xx, decode, or a response [`ownership_from_keyed`]
+    /// refuses — leaves exactly its ids UNKNOWN; per id, every answer but the
+    /// id's own `sessions[]` entry is recorded UNKNOWN.
+    ///
+    /// This replaced a tenant-wide walk of four state-filtered pages bracketed
+    /// by two work-status reads, which on a large tenant timed out on every
+    /// pass (coord answered `state=active` in 17 to >60 s; the keyed read in
+    /// 0.35 s — coord finding a7ab41b6-deb8-4977-b6db-fa742e1a6649) and so
+    /// refused every finished close as `ownership_unreadable`.
+    pub async fn fetch_live_ownership(
+        claude_session_ids: &[String],
+    ) -> Result<CoordOwnership, String> {
+        let Some(base) = qontinui_runner_lib::profiles::connected_coord_base() else {
+            return Err(
+                "no coord base is configured, so the session's worktree allocations cannot be read"
+                    .to_string(),
+            );
+        };
+        // Not unit-tested: `coord_client()` is a process-wide `OnceLock`
+        // whose `None` arm (a TLS backend that failed to initialise) a test
+        // cannot provoke. It is UNKNOWN like every other arm here.
+        let Some(client) = crate::coord_http::coord_client() else {
+            return Err(
+                "the shared coord HTTP client could not be built, so the session's worktree \
+                 allocations cannot be read"
+                    .to_string(),
+            );
+        };
+        let base_url = format!("{}/coord/sessions/worktrees", base.trim_end_matches('/'));
+        let chunks = keyed_chunks(claude_session_ids);
+        let budget = keyed_budget(chunks.len());
+        let answers = fetch_keyed_chunks(chunks, KEYED_CONCURRENCY, budget, |chunk| {
+            let url = keyed_url(&base_url, &chunk);
+            async move { get_json(client, &url, KEYED_REQUEST_TIMEOUT).await }
+        })
+        .await;
+        ownership_from_keyed(answers)
     }
 
     #[cfg(test)]
@@ -1935,12 +2542,425 @@ pub mod coord {
         fn the_cursor_is_url_encoded_and_the_limit_is_always_sent() {
             assert_eq!(
                 page_url("https://c/coord/sessions/worktrees", None),
-                "https://c/coord/sessions/worktrees?limit=500"
+                format!("https://c/coord/sessions/worktrees?limit={PAGE_LIMIT}")
             );
             assert_eq!(
                 page_url("https://c/coord/sessions/worktrees", Some("a+b/c=")),
-                "https://c/coord/sessions/worktrees?limit=500&cursor=a%2Bb%2Fc%3D"
+                format!(
+                    "https://c/coord/sessions/worktrees?limit={PAGE_LIMIT}&cursor=a%2Bb%2Fc%3D"
+                )
             );
+        }
+
+        /// A walk's pages merge by `sessionId` with every row kept, and the
+        /// merge keeps the bridge-column verdict honest: present only when
+        /// every page said so.
+        #[test]
+        fn a_walked_index_keeps_every_row_and_the_bridge_survives_the_merge() {
+            let p1 = page(
+                r#"{"sessionBridgeColumnPresent":true,"limit":2,"nextCursor":"c1","sessions":[
+                    {"sessionId":"a","worktrees":[{"worktreePath":"w1"},{"worktreePath":"w2"}]}]}"#,
+            );
+            let p2 = page(
+                r#"{"sessionBridgeColumnPresent":true,"limit":2,"nextCursor":null,"sessions":[
+                    {"sessionId":"a","worktrees":[{"worktreePath":"w3"}]}]}"#,
+            );
+            let merged = merge_pages(vec![p1.clone(), p2.clone()]);
+            assert_eq!(merged.session_bridge_column_present, Some(true));
+            let idx = CoordOwnership::from_response(merged);
+            assert_eq!(idx.worktrees_for_session("a").len(), 3);
+
+            let mut no_bridge = p2.clone();
+            no_bridge.session_bridge_column_present = None;
+            let merged = merge_pages(vec![p1.clone(), no_bridge]);
+            assert_eq!(merged.session_bridge_column_present, None);
+
+            let mut absent = p2;
+            absent.session_bridge_column_present = Some(false);
+            assert_eq!(
+                merge_pages(vec![p1, absent]).session_bridge_column_present,
+                Some(false)
+            );
+        }
+
+        // ---- the keyed read (plan 2026-11-04-runner-finished-close-…, Phase 1) --
+
+        fn keyed(json: &str) -> CoordKeyedSessionWorktrees {
+            serde_json::from_str(json).unwrap()
+        }
+
+        fn ids(v: &[&str]) -> Vec<String> {
+            v.iter().map(|s| s.to_string()).collect()
+        }
+
+        const A: &str = "aaaaaaaa-0000-0000-0000-000000000001";
+        const B: &str = "bbbbbbbb-0000-0000-0000-000000000002";
+
+        #[test]
+        fn the_keyed_request_names_exactly_the_ids_asked_about() {
+            assert_eq!(
+                keyed_url("https://c/coord/sessions/worktrees", &ids(&[A, "x y"])),
+                format!("https://c/coord/sessions/worktrees?claude_code_session_ids={A},x%20y")
+            );
+        }
+
+        #[test]
+        fn the_key_is_deduplicated_and_chunked_at_coords_cap() {
+            let many: Vec<String> = (0..KEYED_CHUNK_IDS * 2 + 1)
+                .map(|i| format!("{i:08x}-0000-0000-0000-000000000000"))
+                .collect();
+            let chunks = keyed_chunks(&many);
+            assert_eq!(
+                chunks.iter().map(Vec::len).collect::<Vec<_>>(),
+                vec![KEYED_CHUNK_IDS, KEYED_CHUNK_IDS, 1]
+            );
+            assert_eq!(chunks.concat(), many, "every id once, in order");
+            assert_eq!(
+                keyed_chunks(&ids(&[A, " ", &A.to_ascii_uppercase(), B])),
+                vec![ids(&[A, B])],
+                "blanks dropped, duplicates (case-insensitive) sent once"
+            );
+            assert!(keyed_chunks(&[]).is_empty(), "no ids, no request");
+        }
+
+        #[test]
+        fn a_2xx_without_the_echo_is_a_coord_that_ignored_the_key() {
+            // What a coord predating the keyed mode serves: page one of the
+            // tenant walk, bridge column and all — but no echo.
+            let page_one = keyed(&format!(
+                r#"{{"sessionBridgeColumnPresent":true,"nextCursor":null,"sessions":[
+                    {{"sessionId":"c-1","claudeCodeSessionId":"{A}","worktrees":[]}}]}}"#
+            ));
+            let err = ownership_from_keyed(vec![(ids(&[A]), Ok(page_one))]).unwrap_err();
+            assert!(err.contains("claudeCodeSessionIds"), "{err}");
+        }
+
+        #[test]
+        fn a_missing_or_false_bridge_column_is_unknown() {
+            for bridge in ["", r#""sessionBridgeColumnPresent":false,"#] {
+                let resp = keyed(&format!(
+                    r#"{{{bridge}"claudeCodeSessionIds":["{A}"],"sessions":[
+                        {{"sessionId":"c-1","claudeCodeSessionId":"{A}","worktrees":[]}}]}}"#
+                ));
+                let err = ownership_from_keyed(vec![(ids(&[A]), Ok(resp))]).unwrap_err();
+                assert!(err.contains("bridge column"), "{bridge}: {err}");
+            }
+        }
+
+        #[test]
+        fn unknown_invalid_truncated_and_unechoed_ids_are_unknown_never_empty() {
+            let resp = keyed(&format!(
+                r#"{{"sessionBridgeColumnPresent":true,"inputTruncated":true,
+                    "claudeCodeSessionIds":["{A}","{B}"],
+                    "unknown":[{{"claudeCodeSessionId":"{A}",
+                        "worktrees":[{{"worktreePath":"/abs/allocate-only"}}]}}],
+                    "invalid":["not-a-uuid"],
+                    "sessions":[{{"sessionId":"c-b","claudeCodeSessionId":"{B}","worktrees":[]}}]}}"#
+            ));
+            let sent = ids(&[A, B, "not-a-uuid", "cccccccc-0000-0000-0000-000000000003"]);
+            let idx = ownership_from_keyed(vec![(sent, Ok(resp))]).unwrap();
+            assert_eq!(idx.coord_session_for_claude(B), Some("c-b"));
+            for (id, why) in [
+                (A, "`unknown`"),
+                ("not-a-uuid", "`invalid`"),
+                ("cccccccc-0000-0000-0000-000000000003", "`inputTruncated`"),
+            ] {
+                assert_eq!(idx.coord_session_for_claude(id), None, "{id}");
+                let reason = idx.unanswered_reason(id).unwrap_or_default();
+                assert!(reason.contains(why), "{id}: {reason}");
+            }
+            assert!(
+                idx.worktrees_for_session("c-a").is_empty() && idx.is_empty(),
+                "an `unknown` id's allocate-only rows are never attributed"
+            );
+
+            // Not echoed, no truncation flag: still unanswered.
+            let resp = keyed(
+                r#"{"sessionBridgeColumnPresent":true,"claudeCodeSessionIds":[],"sessions":[]}"#,
+            );
+            let idx = ownership_from_keyed(vec![(ids(&[A]), Ok(resp))]).unwrap();
+            assert!(idx.unanswered_reason(A).unwrap().contains("did not echo"));
+        }
+
+        #[test]
+        fn an_echoed_id_with_no_entry_or_two_entries_is_unknown() {
+            let resp = keyed(&format!(
+                r#"{{"sessionBridgeColumnPresent":true,"claudeCodeSessionIds":["{A}","{B}"],
+                    "sessions":[
+                    {{"sessionId":"c-1","claudeCodeSessionId":"{B}","worktrees":[]}},
+                    {{"sessionId":"c-2","claudeCodeSessionId":"{B}","worktrees":[]}}]}}"#
+            ));
+            let idx = ownership_from_keyed(vec![(ids(&[A, B]), Ok(resp))]).unwrap();
+            assert!(idx.unanswered_reason(A).unwrap().contains("neither"));
+            assert!(idx.unanswered_reason(B).unwrap().contains("more than one"));
+            assert_eq!(idx.coord_session_for_claude(B), None);
+        }
+
+        /// `worktrees: []` on the id's own entry is a POSITIVE "holds nothing",
+        /// whatever the session's state; an entry's rows are attributed to it.
+        #[test]
+        fn an_entry_with_no_worktrees_is_positively_empty_whatever_its_state() {
+            let resp = keyed(&format!(
+                r#"{{"sessionBridgeColumnPresent":true,"inputTruncated":false,"invalid":[],
+                    "unknown":[],"claudeCodeSessionIds":["{A}","{B}"],"sessions":[
+                    {{"sessionId":"c-a","claudeCodeSessionId":"{A}","ownerSessionState":"closed",
+                      "worktrees":[]}},
+                    {{"sessionId":"c-b","claudeCodeSessionId":"{}","ownerSessionState":"stale",
+                      "worktrees":[{{"worktreePath":"agent-worktrees/b/r","repo":"r"}}]}}]}}"#,
+                B.to_ascii_uppercase()
+            ));
+            let idx = ownership_from_keyed(vec![(ids(&[A, B]), Ok(resp))]).unwrap();
+            assert_eq!(idx.coord_session_for_claude(A), Some("c-a"));
+            assert!(idx.unanswered_reason(A).is_none());
+            assert!(idx.worktrees_for_session("c-a").is_empty());
+            assert_eq!(idx.coord_session_for_claude(B), Some("c-b"));
+            assert_eq!(
+                idx.worktrees_for_session("c-b")[0].worktree_path,
+                "agent-worktrees/b/r"
+            );
+        }
+
+        fn good(id: &str, sid: &str) -> Result<CoordKeyedSessionWorktrees, String> {
+            Ok(keyed(&format!(
+                r#"{{"sessionBridgeColumnPresent":true,"claudeCodeSessionIds":["{id}"],
+                    "sessions":[{{"sessionId":"{sid}","claudeCodeSessionId":"{id}","worktrees":[]}}]}}"#
+            )))
+        }
+
+        const C: &str = "cccccccc-0000-0000-0000-000000000003";
+
+        /// A failed or untrusted chunk leaves exactly ITS ids UNKNOWN; the
+        /// other chunks' answers still count.
+        #[test]
+        fn a_bad_chunk_leaves_only_its_own_ids_unknown() {
+            let idx = ownership_from_keyed(vec![
+                (ids(&[A]), good(A, "c-a")),
+                (ids(&[B]), good(B, "c-b")),
+            ])
+            .unwrap();
+            assert_eq!(idx.coord_session_for_claude(A), Some("c-a"));
+            assert_eq!(idx.coord_session_for_claude(B), Some("c-b"));
+
+            let echo_less = Ok(keyed(
+                r#"{"sessionBridgeColumnPresent":true,"sessions":[]}"#,
+            ));
+            let timed_out = Err("GET u: operation timed out".to_string());
+            let idx = ownership_from_keyed(vec![
+                (ids(&[A]), good(A, "c-a")),
+                (ids(&[B]), echo_less),
+                (ids(&[C]), timed_out),
+            ])
+            .unwrap();
+            assert_eq!(idx.coord_session_for_claude(A), Some("c-a"));
+            assert!(idx.unanswered_reason(A).is_none());
+            for (id, why) in [(B, "claudeCodeSessionIds"), (C, "timed out")] {
+                assert_eq!(idx.coord_session_for_claude(id), None, "{id}");
+                let reason = idx.unanswered_reason(id).unwrap_or_default();
+                assert!(
+                    reason.contains("1-id chunk failed") && reason.contains(why),
+                    "{id}: {reason}"
+                );
+            }
+        }
+
+        /// Every chunk failing is the whole read failing: `Err`, which the
+        /// gate reads as `ownership_unreadable` for every session.
+        #[test]
+        fn every_chunk_failing_fails_the_read() {
+            let err = ownership_from_keyed(vec![
+                (ids(&[A]), Err("first".to_string())),
+                (ids(&[B]), Err("second".to_string())),
+            ])
+            .unwrap_err();
+            assert!(err.contains("all 2") && err.contains("first"), "{err}");
+            assert!(
+                ownership_from_keyed(vec![]).unwrap().is_empty(),
+                "no ids asked about is no failure"
+            );
+        }
+
+        #[test]
+        fn the_keyed_read_is_tuned_to_coords_measured_cost() {
+            assert_eq!(KEYED_CHUNK_IDS, 25);
+            assert_eq!(KEYED_REQUEST_TIMEOUT, Duration::from_secs(30));
+            assert_eq!(KEYED_CONCURRENCY, 3);
+            assert_eq!(PAGE_LIMIT, 100);
+            // 69 ids (the measured candidate set) is three chunks: one wave.
+            let many: Vec<String> = (0..69)
+                .map(|i| format!("{i:08x}-0000-0000-0000-000000000000"))
+                .collect();
+            let sizes: Vec<usize> = keyed_chunks(&many).iter().map(Vec::len).collect();
+            assert_eq!(sizes, vec![25, 25, 19]);
+            // The budget grows by one request deadline per wave of chunks.
+            assert_eq!(keyed_budget(0), Duration::from_secs(35));
+            assert_eq!(keyed_budget(3), Duration::from_secs(35));
+            assert_eq!(keyed_budget(4), Duration::from_secs(65));
+            assert_eq!(keyed_budget(9), Duration::from_secs(95));
+            assert!(keyed_budget(3) > KEYED_REQUEST_TIMEOUT);
+        }
+
+        /// Chunks run at most `concurrency` at once, under one overall
+        /// deadline; a chunk still running at the deadline is `Err` for that
+        /// chunk alone, and answers come back in chunk order.
+        #[tokio::test(start_paused = true)]
+        async fn chunks_run_bounded_and_a_slow_chunk_times_out_alone() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            use std::sync::Arc;
+            /// Decrements on drop, so a chunk the deadline cancels leaves.
+            struct Leave(Arc<AtomicUsize>);
+            impl Drop for Leave {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+            let in_flight = Arc::new(AtomicUsize::new(0));
+            let peak = Arc::new(AtomicUsize::new(0));
+            let chunks = vec![ids(&[A]), ids(&[B]), ids(&[C]), ids(&["d"]), ids(&["e"])];
+            let started = tokio::time::Instant::now();
+            let answers = fetch_keyed_chunks(chunks, 2, Duration::from_secs(25), |chunk| {
+                let (in_flight, peak) = (in_flight.clone(), peak.clone());
+                async move {
+                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    let _leave = Leave(in_flight);
+                    // C never answers in time; the rest take 10 s each.
+                    let secs = if chunk[0] == C { 1_000 } else { 10 };
+                    tokio::time::sleep(Duration::from_secs(secs)).await;
+                    let id = chunk[0].clone();
+                    good(&id, &format!("c-{id}"))
+                }
+            })
+            .await;
+            assert_eq!(peak.load(Ordering::SeqCst), 2, "bounded concurrency");
+            assert!(
+                started.elapsed() <= Duration::from_secs(25),
+                "one overall deadline"
+            );
+            let order: Vec<&str> = answers.iter().map(|(c, _)| c[0].as_str()).collect();
+            assert_eq!(order, vec![A, B, C, "d", "e"]);
+            for (chunk, answer) in &answers {
+                match chunk[0].as_str() {
+                    C => assert!(
+                        answer.as_ref().unwrap_err().contains("25s overall budget"),
+                        "{answer:?}"
+                    ),
+                    // `e` starts at 20 s (when `d`'s slot frees up) and
+                    // would finish at 30 s: past the deadline, so it too is
+                    // UNKNOWN — the budget, not the request, bounds it.
+                    "e" => assert!(answer.is_err(), "{answer:?}"),
+                    _ => assert!(answer.is_ok(), "{chunk:?}: {answer:?}"),
+                }
+            }
+            let idx = ownership_from_keyed(answers).unwrap();
+            assert_eq!(
+                idx.coord_session_for_claude(A),
+                Some(format!("c-{A}").as_str())
+            );
+            assert!(idx.unanswered_reason(C).unwrap().contains("overall budget"));
+        }
+
+        /// A timeout reads as a timeout: the rendered error carries reqwest's
+        /// `source()` chain, not only its generic `error sending request` head.
+        #[tokio::test]
+        async fn a_request_error_carries_its_source_cause() {
+            // Bound and never accepted: the connect completes, no answer comes.
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!(
+                "http://127.0.0.1:{}/coord/sessions/worktrees",
+                listener.local_addr().unwrap().port()
+            );
+            let err = send_json::<CoordKeyedSessionWorktrees>(
+                test_client().get(&url),
+                &url,
+                Duration::from_millis(200),
+            )
+            .await
+            .expect_err("nothing answers");
+            assert!(err.starts_with(&format!("GET {url}: ")), "{err}");
+            assert!(err.contains("timed out"), "the cause is rendered: {err}");
+            drop(listener);
+        }
+
+        /// A proxy-free client, so an ambient `HTTP_PROXY` cannot reroute
+        /// the loopback request these tests make.
+        fn test_client() -> reqwest::Client {
+            reqwest::Client::builder().no_proxy().build().unwrap()
+        }
+
+        /// Serve one canned HTTP response on a loopback port; return its URL.
+        async fn serve_once(response: &'static str) -> String {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!(
+                "http://127.0.0.1:{}/coord/sessions/worktrees",
+                listener.local_addr().unwrap().port()
+            );
+            tokio::spawn(async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock.write_all(response.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            });
+            url
+        }
+
+        /// A non-2xx and an undecodable 2xx are both `Err` — UNKNOWN at the
+        /// gate — never an empty index.
+        #[tokio::test]
+        async fn a_non_2xx_or_undecodable_answer_is_an_error() {
+            let url = serve_once(
+                "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 4\r\nconnection: close\r\n\r\nbusy",
+            )
+            .await;
+            let err = send_json::<CoordKeyedSessionWorktrees>(
+                test_client().get(&url),
+                &url,
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap_err();
+            assert!(err.contains("503") && err.contains("busy"), "{err}");
+
+            let url = serve_once(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 8\r\nconnection: close\r\n\r\nnot-json",
+            )
+            .await;
+            let err = send_json::<CoordKeyedSessionWorktrees>(
+                test_client().get(&url),
+                &url,
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap_err();
+            assert!(err.starts_with(&format!("decode GET {url}: ")), "{err}");
+        }
+
+        #[test]
+        fn worktrees_for_session_lists_only_that_sessions_rows() {
+            let idx = index(
+                r#"{"sessions":[
+                    {"sessionId":"AAAA-1","ownerSessionState":"active","worktrees":[
+                        {"worktreePath":"agent-worktrees/a/qontinui-runner","repo":"qontinui-runner"},
+                        {"worktreePath":"agent-worktrees/a/qontinui-schemas","repo":"qontinui-schemas"},
+                        {"worktreePath":"agent-worktrees/a/qontinui-runner","repo":"qontinui-runner"}]},
+                    {"sessionId":"bbbb-2","ownerSessionState":"active","worktrees":[
+                        {"worktreePath":"agent-worktrees/b/qontinui-web","repo":"qontinui-web"}]}]}"#,
+            );
+            let paths: Vec<&str> = idx
+                .worktrees_for_session("aaaa-1")
+                .into_iter()
+                .map(|r| r.worktree_path.as_str())
+                .collect();
+            assert_eq!(
+                paths,
+                vec![
+                    "agent-worktrees/a/qontinui-runner",
+                    "agent-worktrees/a/qontinui-schemas"
+                ],
+                "case-insensitive on the uuid, deduplicated, in ledger order"
+            );
+            assert!(idx.worktrees_for_session("cccc-3").is_empty());
         }
     }
 }
@@ -2639,5 +3659,57 @@ mod tests {
         );
         assert!(write_session_name("../evil", "x").is_err());
         assert!(write_session_name("", "x").is_err());
+    }
+
+    /// A migrated session's copies are ordered by their NEWEST TURN; equal
+    /// turns break on the most recently written copy (the migration target),
+    /// and only a tie mtime cannot settle falls to the config dir — so the
+    /// order never depends on which root the walk met first.
+    #[test]
+    fn transcript_copies_order_by_newest_turn_then_newest_write_then_config_dir() {
+        use crate::session::transcript_last_turn::{FileStamp, TurnRead};
+        let copy = |root: &str, modified_ms: Option<i64>| TranscriptCopy {
+            config_dir: PathBuf::from(root),
+            path: PathBuf::from(format!("{root}/projects/p/s.jsonl")),
+            stamp: Some(FileStamp {
+                len: 1,
+                modified_ms,
+            }),
+        };
+        let turn_of = |c: &TranscriptCopy| match c.config_dir.to_str() {
+            // `a` holds the newest turn but the OLDEST write: the turn wins.
+            Some("/h/.claude-a") => TurnRead::Read(Some(500)),
+            // b, c, f tie on the turn: the newest write wins (f), then the
+            // two with the same mtime fall to the dir (b before c).
+            Some("/h/.claude-b") => TurnRead::Read(Some(300)),
+            Some("/h/.claude-c") => TurnRead::Read(Some(300)),
+            Some("/h/.claude-f") => TurnRead::Read(Some(300)),
+            Some("/h/.claude-d") => TurnRead::Read(None),
+            _ => TurnRead::Unreadable,
+        };
+        let mut copies = vec![
+            copy("/h/.claude-e", Some(9_000)),
+            copy("/h/.claude-d", Some(8_000)),
+            copy("/h/.claude-c", Some(2_000)),
+            copy("/h/.claude-a", Some(1_000)),
+            copy("/h/.claude-b", Some(2_000)),
+            copy("/h/.claude-f", Some(7_000)),
+        ];
+        order_by_newest_turn(&mut copies, &mut |c| turn_of(c));
+        let order: Vec<&str> = copies
+            .iter()
+            .map(|c| c.config_dir.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                "/h/.claude-a", // newest turn, despite the oldest write
+                "/h/.claude-f", // tied turn, newest write
+                "/h/.claude-b", // tied turn and write: the dir decides
+                "/h/.claude-c",
+                "/h/.claude-d", // readable, no turn
+                "/h/.claude-e", // unreadable, despite the newest write
+            ]
+        );
     }
 }

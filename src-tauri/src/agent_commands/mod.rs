@@ -85,7 +85,8 @@ const FETCH_LIMIT: u32 = 500;
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 /// Filename of the on-disk override cache, under the runner's per-instance
-/// config dir (`dirs::config_dir()/com.qontinui.runner[/instance-<name>]`) —
+/// config dir (`<platform config dir>/com.qontinui.runner[/instance-<name>]`,
+/// via `instance_env::runner_config_base`) —
 /// the same convention `prompts.rs` and `backup.rs` already use for per-device
 /// state. Deliberately NOT a new path scheme.
 const CACHE_FILE: &str = "agent-commands-cache.json";
@@ -409,6 +410,13 @@ impl AgentCommandRegistry {
             .or_else(|| self.builtin.iter().find(|c| c.name == name))
     }
 
+    /// True iff `name` is a builtin command — one this binary embeds, so the
+    /// repository that vendors it can add the same path upstream. An
+    /// account-only command is not, and `provision_guard` never withholds it.
+    pub fn is_builtin(&self, name: &str) -> bool {
+        self.builtin.iter().any(|b| b.name == name)
+    }
+
     /// How many defaults are embedded in this binary.
     pub fn builtin_count(&self) -> usize {
         self.builtin.len()
@@ -449,7 +457,7 @@ struct CachedOverrides {
 /// Absolute path of the override cache for this runner instance, or `None`
 /// when the platform has no config dir.
 fn cache_path() -> Option<PathBuf> {
-    let base = dirs::config_dir()?.join("com.qontinui.runner");
+    let base = qontinui_runner_lib::instance_env::runner_config_base()?;
     Some(crate::instance::scope_path(&base).join(CACHE_FILE))
 }
 

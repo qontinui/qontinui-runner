@@ -20,6 +20,8 @@ import {
   clampGib,
   clampInt,
   concurrencyAboveSuggestionWarning,
+  unsetConcurrencyCount,
+  unsetConcurrencyText,
   MAX_CONCURRENT_BUILDS_MAX,
   MAX_CONCURRENT_BUILDS_MIN,
   parseConcurrencyInput,
@@ -366,7 +368,7 @@ describe("max concurrent builds bound", () => {
     expect(parseConcurrencyInput("0", 4)).toBe(1);
     expect(parseConcurrencyInput("999", 4)).toBe(64);
     // Empty or garbage on blur reverts to what was there — an explicit value
-    // stays explicit, and an unset one stays unset. Only the "Use suggested"
+    // stays explicit, and an unset one stays unset. Only the "Clear to unset"
     // button writes null.
     expect(parseConcurrencyInput("", 4)).toBe(4);
     expect(parseConcurrencyInput("abc", 4)).toBe(4);
@@ -381,5 +383,54 @@ describe("max concurrent builds bound", () => {
     expect(concurrencyAboveSuggestionWarning(4, null)).toBeNull();
     expect(concurrencyAboveSuggestionWarning(13, big)).toMatch(/cores/);
     expect(concurrencyAboveSuggestionWarning(3, msi)).toMatch(/memory/);
+  });
+});
+
+describe("unsetConcurrencyText / unsetConcurrencyCount", () => {
+  const base = { suggested: 12, cpus: 48, mem_gib: 368, limiting_term: "cores" as const };
+  const model = (running: number, slots: number, count: number) => ({
+    ...base,
+    unset_resolves_to: {
+      source: "model" as const,
+      count,
+      running_at_sample: running,
+      slots_c1: slots,
+      static_partition: 12,
+    },
+  });
+
+  it("names the model's total, not the static suggestion, when the model answers", () => {
+    const s = model(2, 3, 5);
+    const text = unsetConcurrencyText(s);
+    expect(text).toMatch(/^Unset gives 5 now, from coord's capacity model/);
+    expect(text).toMatch(/2 running \+ 3 free CI slots;/);
+    expect(text).not.toMatch(/capped/);
+    expect(text).not.toMatch(/in use/);
+    expect(unsetConcurrencyCount(s)).toBe(5);
+  });
+
+  it("says when the model's sum was clamped to the count", () => {
+    expect(unsetConcurrencyText(model(5, 20, 12))).toMatch(/capped from 25/);
+    expect(unsetConcurrencyText(model(0, 0, 1))).toMatch(/raised from 0 \(minimum 1\)/);
+  });
+
+  it("names the static fallback with the model's reason", () => {
+    const s = {
+      ...base,
+      unset_resolves_to: {
+        source: "static" as const,
+        count: 12,
+        unknown_reason: "the capacity data is stale",
+      },
+    };
+    expect(unsetConcurrencyText(s)).toMatch(/^Unset gives 12 now, the host suggestion .*stale\.$/);
+    expect(unsetConcurrencyCount(s)).toBe(12);
+  });
+
+  it("reads an absent field as UNKNOWN, never as the static suggestion", () => {
+    expect(unsetConcurrencyText(base)).toMatch(/unknown/);
+    expect(unsetConcurrencyCount(base)).toBeNull();
+    expect(unsetConcurrencyText(null)).toBeNull();
+    expect(unsetConcurrencyCount(null)).toBeNull();
   });
 });

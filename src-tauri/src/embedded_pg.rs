@@ -87,6 +87,20 @@ use std::sync::atomic::{AtomicU16, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
+/// The PostgreSQL every Postgres-backed test in the runner's test binaries
+/// runs against: one bundled cluster per test process, booted from a cached
+/// ready data directory, with a fresh database per test. See the module doc.
+///
+/// A child of this module so it reuses the schema rendering and transform, the
+/// port picker and the `postmaster.pid` name without widening them — it builds
+/// and starts its clusters itself, not through [`bootstrap`] — and compiled
+/// outside `cfg(test)` so one harness serves the lib's tests, the bin's tests
+/// and `tests/*.rs` alike (a `cfg(test)` module compiles into one crate's test
+/// binary only). Hidden: it is test infrastructure, not part of the runner's
+/// product surface.
+#[doc(hidden)]
+pub mod test_harness;
+
 /// Holds the running managed instance for the process lifetime so it is not
 /// dropped early (which would stop the server); stopped explicitly on exit via
 /// [`stop_on_exit`].
@@ -224,9 +238,9 @@ pub const EMBEDDED_PG_DIR_ENV: &str = "QONTINUI_EMBEDDED_PG_DIR";
 /// binaries and [`local_dsn`] must agree on this path or they will talk to
 /// different clusters. It was duplicated inline in `main.rs` before P4.
 pub fn default_data_root() -> PathBuf {
-    dirs::data_local_dir()
+    crate::instance_env::platform_dir(crate::instance_env::PlatformDir::DataLocal)
         .unwrap_or_else(std::env::temp_dir)
-        .join("com.qontinui.runner")
+        .join(crate::instance_env::RUNNER_BUNDLE_ID)
         .join("embedded-pg")
 }
 
@@ -709,9 +723,13 @@ pub async fn bootstrap(data_root: PathBuf, db_name: &str) -> Result<ManagedPg, S
         password_file: data_root.join("pg-pass"),
         host: "127.0.0.1".to_string(),
         temporary: false, // persist the cluster across launches
-        // The crate's default per-command timeout (initdb / pg_ctl) is 5s,
-        // which flakes under CI contention and on slow end-user disks — first
-        // initdb on a cold machine can legitimately take tens of seconds.
+        // Read only by `postgresql_embedded`'s `tokio` feature, which the
+        // runner does not enable: without it the crate runs initdb and pg_ctl
+        // to completion with no timeout of its own (pg_ctl's `--wait` gives up
+        // after its own 60 s, or `PGCTLTIMEOUT`; initdb has no bound), so this
+        // bounds nothing today. It is 60 s rather than the crate's 5 s default
+        // for the day that feature is on: a first initdb on a cold machine can
+        // take tens of seconds.
         timeout: Some(std::time::Duration::from_secs(60)),
         ..Settings::default()
     };
@@ -960,11 +978,61 @@ pub async fn bootstrap(data_root: PathBuf, db_name: &str) -> Result<ManagedPg, S
     })
 }
 
+/// The canonical schema dump (`schema.pg.sql.generated`, a `pg_dump`-style dump
+/// of the full canonical schema), embedded at compile time.
+///
+/// One copy serves the bundled cluster's schema apply ([`canonical_schema_sql`])
+/// and the test harness, which keys its template cache on the rendered SQL and
+/// pins its table count against this file's `CREATE TABLE` lines — so the count
+/// is read from the file rather than written down here, where it went stale.
+const CANONICAL_SCHEMA: &str = include_str!("../schema.pg.sql.generated");
+
+/// How [`canonical_schema_sql`] renders the dump's `public.vector(N)` columns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VectorColumns {
+    /// A server that ships no pgvector — the bundled one. The two transforms
+    /// documented on [`apply_canonical_schema`] apply.
+    Bytea,
+    /// A server that ships pgvector (an external test server opted into
+    /// through the harness's `QONTINUI_TEST_PG_URL`): the dump's own column
+    /// types and indexes, with the extension created first. This is the one
+    /// shape the transform cannot emulate, and the reason that opt-in exists.
+    Native,
+}
+
+/// The canonical schema as ONE SQL batch for a fresh database.
+///
+/// Both renderings make every `CREATE SCHEMA` idempotent — the dump emits
+/// `CREATE SCHEMA public;`, which errors on a fresh database where `public`
+/// already exists — and create pgcrypto first. pgcrypto is a STANDARD contrib
+/// extension shipped with Postgres (unlike pgvector); the schema uses
+/// `public.gen_random_bytes()` / `digest()` in column DEFAULTs, which must exist
+/// before the CREATE TABLEs, and the dump does not emit the extension (the
+/// dev/CI Postgres already has it). [`VectorColumns`] decides the rest.
+fn canonical_schema_sql(vectors: VectorColumns) -> String {
+    let idempotent = CANONICAL_SCHEMA.replace("CREATE SCHEMA ", "CREATE SCHEMA IF NOT EXISTS ");
+    match vectors {
+        VectorColumns::Bytea => {
+            let body: String = idempotent
+                .replace("public.vector(384)", "bytea")
+                .replace("public.vector(512)", "bytea")
+                .lines()
+                .filter(|l| !l.contains("ivfflat") && !l.contains("public.vector_cosine_ops"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;\n{body}")
+        }
+        VectorColumns::Native => format!(
+            "CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;\n\
+             CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;\n{idempotent}"
+        ),
+    }
+}
+
 /// Apply the bundled canonical schema to a freshly-created embedded database.
 ///
-/// The schema (`schema.pg.sql.generated`, a `pg_dump`-style dump of the full
-/// 362-table canonical schema) is embedded at compile time. Two transforms make
-/// it apply to a **pgvector-free** Postgres:
+/// The schema is [`CANONICAL_SCHEMA`]. Two transforms make it apply to a
+/// **pgvector-free** Postgres ([`VectorColumns::Bytea`]):
 ///
 ///   1. `public.vector(N)` column types → `bytea`. The runner stores every
 ///      embedding as `bytea` and computes cosine similarity in Rust
@@ -982,37 +1050,28 @@ pub async fn bootstrap(data_root: PathBuf, db_name: &str) -> Result<ManagedPg, S
 /// Applied whenever [`schema_applied`] reports the schema missing (fresh
 /// database, or a prior apply that crashed/rolled back).
 async fn apply_canonical_schema(url: &str) -> Result<(), String> {
-    const SCHEMA: &str = include_str!("../schema.pg.sql.generated");
-    let body: String = SCHEMA
-        .replace("public.vector(384)", "bytea")
-        .replace("public.vector(512)", "bytea")
-        // The dump emits `CREATE SCHEMA public;`, which errors on a fresh
-        // database (the `public` schema already exists). Make every schema
-        // creation idempotent so the one-shot apply cannot trip on it.
-        .replace("CREATE SCHEMA ", "CREATE SCHEMA IF NOT EXISTS ")
-        .lines()
-        .filter(|l| !l.contains("ivfflat") && !l.contains("public.vector_cosine_ops"))
-        .collect::<Vec<_>>()
-        .join("\n");
+    apply_schema_sql(
+        url,
+        &canonical_schema_sql(VectorColumns::Bytea),
+        "embedded PG",
+    )
+    .await
+}
 
-    // pgcrypto is a STANDARD contrib extension shipped with Postgres (unlike
-    // pgvector). The schema uses `public.gen_random_bytes()` / `digest()` in
-    // column DEFAULTs, which must exist before the CREATE TABLEs. The dump
-    // doesn't emit the extension (the dev/CI Postgres already has it), so
-    // provision it into `public` for the fresh embedded cluster.
-    let transformed =
-        format!("CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;\n{body}");
-
+/// Run `sql` against the database at `url` as one batch (one implicit
+/// transaction, so a failed apply leaves nothing behind), reporting the
+/// server's own diagnosis on failure. `target` names the server in messages.
+async fn apply_schema_sql(url: &str, sql: &str, target: &str) -> Result<(), String> {
     let (client, connection) = tokio_postgres::connect(url, tokio_postgres::NoTls)
         .await
-        .map_err(|e| format!("connect to embedded PG for schema apply failed: {e}"))?;
+        .map_err(|e| format!("connect to {target} for schema apply failed: {e}"))?;
     let conn_task = tokio::spawn(async move {
         if let Err(e) = connection.await {
-            tracing::warn!("embedded PG schema-apply connection closed with error: {e}");
+            tracing::warn!("schema-apply connection closed with error: {e}");
         }
     });
 
-    let result = client.batch_execute(&transformed).await.map_err(|e| {
+    let result = client.batch_execute(sql).await.map_err(|e| {
         let detail = e
             .as_db_error()
             .map(|db| {
@@ -1029,7 +1088,7 @@ async fn apply_canonical_schema(url: &str) -> Result<(), String> {
                 )
             })
             .unwrap_or_else(|| e.to_string());
-        format!("applying canonical schema to embedded PG failed: {detail}")
+        format!("applying canonical schema to {target} failed: {detail}")
     });
 
     drop(client); // closes the connection so the driver task can finish
@@ -1162,6 +1221,137 @@ mod tests {
              5432001   1730234880\n\
              {status}   \n"
         )
+    }
+
+    // ---- Bundled PostgreSQL release pin ----
+
+    /// The exact requirement `POSTGRESQL_VERSION = "=X.Y.Z"` declares in
+    /// `src-tauri/.cargo/config.toml`, or `None` when no such line exists.
+    fn pinned_postgres_requirement(config_toml: &str) -> Option<&str> {
+        config_toml.lines().find_map(|line| {
+            let value = line
+                .trim()
+                .strip_prefix("POSTGRESQL_VERSION")?
+                .trim_start()
+                .strip_prefix('=')?
+                .trim();
+            value.strip_prefix('"')?.split('"').next()
+        })
+    }
+
+    /// The binary embeds exactly the PostgreSQL release pinned in
+    /// `.cargo/config.toml`. Unpinned, the `bundled` build script took
+    /// upstream's newest release. On 2026-10-18 that was 18.6.1, whose initdb
+    /// needs GLIBC 2.36, and every boot test above failed on ubuntu-22.04.
+    ///
+    /// This also catches a STALE build: the build script keeps whatever
+    /// archive its OUT_DIR already holds, even after the pin changes, so a
+    /// warm target dir (a CI cache restore, a developer's tree) can embed a
+    /// release the pin no longer names.
+    #[test]
+    fn bundled_postgres_is_the_pinned_release() {
+        let pin = pinned_postgres_requirement(include_str!("../.cargo/config.toml"))
+            .expect("src-tauri/.cargo/config.toml must pin POSTGRESQL_VERSION = \"=X.Y.Z\"");
+        assert!(
+            pin.starts_with('=') && pin.matches('.').count() == 2,
+            "POSTGRESQL_VERSION must be an exact `=X.Y.Z` requirement, got {pin:?}"
+        );
+        assert_eq!(
+            Settings::default().version.to_string(),
+            pin,
+            "the binary embeds a different PostgreSQL release than the pin. Either \
+             POSTGRESQL_VERSION is set in the build environment (it overrides the \
+             [env] pin), or a stale postgresql_embedded OUT_DIR survived a pin change: \
+             run `node scripts/ci/purge-stale-bundled-postgres.mjs <target-dir>` and rebuild"
+        );
+    }
+
+    #[test]
+    fn pinned_postgres_requirement_parses_only_the_pin_line() {
+        assert_eq!(
+            pinned_postgres_requirement(
+                "[env]\n# POSTGRESQL_VERSION = \"=1.0.0\"\nPOSTGRESQL_VERSION = \"=18.6.0\"\n"
+            ),
+            Some("=18.6.0")
+        );
+        assert_eq!(
+            pinned_postgres_requirement("POSTGRESQL_VERSION_X = \"=1.0.0\"\n"),
+            None
+        );
+        assert_eq!(
+            pinned_postgres_requirement("[env]\nSCCACHE_SERVER_PORT = \"4230\"\n"),
+            None
+        );
+    }
+
+    // ---- The two schema renderings ----
+
+    fn create_table_lines(sql: &str) -> usize {
+        sql.lines()
+            .filter(|line| line.starts_with("CREATE TABLE "))
+            .count()
+    }
+
+    /// The bundled server's rendering holds no pgvector construct, creates
+    /// pgcrypto before anything uses it, makes every `CREATE SCHEMA`
+    /// idempotent — and drops no table on the way.
+    #[test]
+    fn the_bytea_rendering_holds_no_pgvector_and_drops_no_table() {
+        let sql = canonical_schema_sql(VectorColumns::Bytea);
+        assert!(
+            sql.starts_with("CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;\n"),
+            "pgcrypto must come first: column DEFAULTs call its functions"
+        );
+        for pgvector_only in [
+            "public.vector(",
+            "public.vector_cosine_ops",
+            "USING ivfflat",
+            "USING hnsw",
+            "CREATE EXTENSION IF NOT EXISTS vector",
+        ] {
+            assert!(
+                !sql.contains(pgvector_only),
+                "the bytea rendering still holds {pgvector_only:?}"
+            );
+        }
+        assert!(
+            !sql.contains("CREATE SCHEMA public;"),
+            "every CREATE SCHEMA must be idempotent on a fresh database"
+        );
+        assert_eq!(
+            create_table_lines(&sql),
+            create_table_lines(CANONICAL_SCHEMA),
+            "the transform dropped a CREATE TABLE"
+        );
+    }
+
+    /// The pgvector rendering keeps the dump's own vector columns and indexes
+    /// and creates the extension before them.
+    #[test]
+    fn the_native_rendering_keeps_the_dumps_vector_columns() {
+        let sql = canonical_schema_sql(VectorColumns::Native);
+        let extension = sql
+            .find("CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;")
+            .expect("the native rendering creates pgvector");
+        let first_vector = sql
+            .find("public.vector(")
+            .expect("the dump declares vector columns");
+        assert!(
+            extension < first_vector,
+            "pgvector must exist before a column uses it"
+        );
+        assert_eq!(
+            sql.matches("public.vector(").count(),
+            CANONICAL_SCHEMA.matches("public.vector(").count()
+        );
+        assert_eq!(
+            sql.matches("public.vector_cosine_ops").count(),
+            CANONICAL_SCHEMA.matches("public.vector_cosine_ops").count()
+        );
+        assert_eq!(
+            create_table_lines(&sql),
+            create_table_lines(CANONICAL_SCHEMA)
+        );
     }
 
     // ---- Data-root isolation (manual-test-loop iter 18, item 2) ----

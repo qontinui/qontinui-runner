@@ -48,8 +48,12 @@ pub fn start_schedule(
     tx: mpsc::Sender<TriggerEvent>,
     stop_signal: Arc<AtomicBool>,
 ) -> Result<tokio::task::JoinHandle<()>, String> {
-    // Validate cron expression up front
-    let schedule = cron::Schedule::from_str(&cron_expression)
+    // Validate cron expression up front, through the scheduler's one
+    // normalizer: 5-field standard cron gets its seconds field, and a numeric
+    // day-of-week reads in standard numbering (0/7 = Sunday, 1 = Monday)
+    // rather than the crate's 1 = Sunday (coord finding 35750774).
+    let schedule = crate::scheduler::normalize_cron(&cron_expression)
+        .and_then(|c| cron::Schedule::from_str(&c).map_err(|e| e.to_string()))
         .map_err(|e| format!("Invalid cron expression '{}': {}", cron_expression, e))?;
 
     // Parse timezone

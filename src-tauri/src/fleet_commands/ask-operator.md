@@ -27,11 +27,83 @@ infer it from the current context.
 
 ## Steps
 
+### 0. Find the clause that reserves it, and record what you found
+
+Before framing anything, write down two things, and keep them for step 3:
+
+- **The step or decision** you would hand to the operator, in one line.
+- **The served clause that reserves it to the operator.** Read it fresh this
+  run (`/policy get policy <name>`) and quote it as `<doc>@<current_version>
+  <clause id>: "<the line>"`. The only reserving sources are the
+  `agent-restricted-actions` catalog (an act) and the `escalation-bar` closed
+  list (a decision).
+
+Then branch:
+
+- **No clause reserves it.** Do not ask. The step is within your autonomy:
+  decide it under the decision policy (engineering, then UX, then
+  implementation priorities), record a POLICY_GAP if no clause covers the
+  case, and do the work.
+- **The clause is closed-list item 2** ("a resource you cannot obtain
+  yourself"), **or your premise is that no agent door exists** ("only an
+  operator can clear / run / approve this", a refusal such as
+  `no_agent_clearable_hits`, an SSO-only route). Run the door test before
+  asking, and keep each step's output:
+  1. Read `operating-rules` fresh and quote
+     `operator-asks-are-decisions-never-api-calls` with its `current_version`.
+     It says a missing door for a mechanical action is NOT an item-2 hit,
+     because building the door is agent work; item 2 still covers a
+     credential or access only a human can grant (an account, a billing
+     change, a third-party approval).
+  2. Search for a door already in flight: open pull requests across the
+     tenant's repositories, and the plan corpus, using a few distinctive words
+     from the refusal (its code, the route, the subsystem). Read the
+     candidates and keep only the ones that really are the missing door. A
+     search that failed, was not reviewed, or showed fewer results than it
+     matched (a capped page) proves nothing.
+  3. Decide. A door in flight means land it, or adopt it when its author is
+     not live. No door means build it. Either way this is not an operator
+     question [policy: operator-asks-are-decisions-never-api-calls]: do the
+     work and do not ask. What remains is only a credential, account, billing
+     change or third-party approval that only a human can grant, with the
+     reason no door can exist written down.
+  4. Before asking on that remainder, give a fresh-context subagent the
+     blocker, the two quoted clauses and your search results (not your
+     reasoning) and ask it to argue that this is agent work. If it names a
+     door you can verify, do the work instead. Put its verdict in step 0's
+     record. Only a remainder that survives this continues to step 1.
+
+  Where the fleet's door-test tool is installed, `/next-move` C0 ("Item 2 is a
+  hit only after the door test") runs these same steps through it.
+- **Any other clause** (a catalog hit, closed-list items 1, 3 or 4). Continue
+  to step 1.
+
+On 2026-10-04 a session asked the operator to clear a classifier-rejected
+migration's escalate marker, framed as "operator clears it" vs "rework the
+migration". The agent door was already open as a PR, and `operating-rules` had
+not been read that run. The shadow resolver agreed with option A, but only
+because the right answer was not among the options, so its agreement was
+circular.
+
 ### 1. Frame the decision
 
 - Phrase a single clear **question**.
 - Enumerate **2–4 concrete, mutually-exclusive options**, each `{label,
   description}`. `label` is a short stable id (e.g. `A`, or `postgres`).
+- **When the question's premise is that no agent door exists, one option MUST
+  be "an agent builds or lands the missing door"**, naming any door step 0
+  confirmed. An option set without it can only offer the operator two wrong
+  framings, and the shadow verdict over it means nothing.
+- **Open the question text with step 0's record:** the reserving clause, quoted
+  with its version, and, when the door test ran, the doors it confirmed, why
+  no door can exist, and the adversary's verdict. That line is what makes the question auditable: the question row is
+  coord's durable copy of why it was asked.
+- **Write your recommendation and what overturning it costs**, for step 3's
+  `recommendation` and `if_overturned`. Putting your pick first in `options` does
+  not record it. Without the `recommendation` argument the operator's one-screen
+  view labels the question an open question, which is unfinished work. It is not
+  refused: if you truly have no recommendation, ask anyway, and say why in the
+  question.
 - Pick the **surface** that selects the priority composition:
   - `user_facing` — a user-facing UX decision (ux-led).
   - `system_internal` — an implementation/code decision (engineering-led). **Default.**
@@ -67,7 +139,9 @@ coord_ask_question(
   options:    [{label, description}, ...],
   surface:    "<surface>",
   plan_phase: "<optional context label>",
-  scores:     { "<label>": { "<priority>": 0.0-1.0 } }
+  scores:     { "<label>": { "<priority>": 0.0-1.0 } },
+  recommendation: "<the option you recommend, and why>",
+  if_overturned:  "<what changes if the operator chooses differently>"
 )
 ```
 
@@ -76,6 +150,12 @@ verdict (`{status: resolved|undecided, option?, margin?}`): **what the policy
 resolver WOULD have answered**. This is recorded but NOT acted on (shadow). Show
 the shadow verdict in your output so the operator sees the policy's pick
 alongside their own.
+
+A pending reply also carries `shape`: `fork_with_recommendation` when the
+recommendation is on the question. `recommendation_recorded: false` means the
+question was recorded without it, and `recommendation_note` says why;
+`recommendation_recorded: true` with a note means it was stored but the write
+could not be confirmed. Report the note either way and do not ask again.
 
 **If `coord_ask_question` is unavailable** (not in this session's MCP allow-set
 / no coord connection): fall back to the built-in `AskUserQuestion`, and note in

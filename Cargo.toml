@@ -18,6 +18,11 @@ members = [
     # decided 2026-09-28): a dedicated minimal binary plus the frame protocol
     # and transport library both it and the runner link.
     "crates/pty-holder",
+    # The session-lifecycle kernel (plan 2026-10-28-one-session-lifecycle-authority,
+    # Phase 37): pure evaluators, no Tauri and no runner-lib dependency. First
+    # slice: classify_child (plan
+    # 2026-11-04-runner-finished-close-closes-nothing-on-any-box, Phase 2a).
+    "crates/session-lifecycle",
 ]
 resolver = "2"
 
@@ -163,3 +168,8 @@ lto = false
 # match) -- without that guard the crash would silently return.
 [patch.crates-io]
 tao = { path = "vendor/tao-0.35.0" }
+# portable-pty's pre_exec closed std's exec-error pipe, so a failed exec aborted
+# the child onto the pane instead of returning Err. Delta and removal condition:
+# `vendor/portable-pty-0.8.1/QONTINUI-PATCH.md`; guarded by
+# `src-tauri/tests/portable_pty_exec_failure_reports.rs`.
+portable-pty = { path = "vendor/portable-pty-0.8.1" }

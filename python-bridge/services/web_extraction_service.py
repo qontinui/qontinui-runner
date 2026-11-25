@@ -21,10 +21,10 @@ import numpy as np
 from PIL import Image
 from qontinui_schemas.common import utc_now
 
+from runner_api import runner_api_base
+
 logger = logging.getLogger(__name__)
 
-# Rust runner API URL for status updates
-RUNNER_API_URL = "http://localhost:9876"
 
 # Try to import OCR name generator
 try:
@@ -643,7 +643,7 @@ class WebExtractionService:
                     "errors": errors,
                 }
                 async with session.post(
-                    f"{RUNNER_API_URL}/extraction/complete",
+                    f"{runner_api_base()}/extraction/complete",
                     json=payload,
                     timeout=aiohttp.ClientTimeout(total=10),
                 ) as response:

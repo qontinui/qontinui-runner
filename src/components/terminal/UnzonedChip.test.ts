@@ -7,6 +7,8 @@
  * visual shell is verified by UI Bridge / manual tests once the spec updates.
  */
 
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { describe, it, expect } from "vitest";
 import { unzonedChipLabel } from "./UnzonedChip";
 
@@ -31,5 +33,20 @@ describe("unzonedChipLabel — chip renders only when sessions are hidden", () =
     expect(label).not.toBeNull();
     expect(label!.text).toBe("4 more");
     expect(label!.title).toContain("4 sessions are not visible");
+  });
+
+  it("renders nothing in tmux work mode, where off screen is the normal state", () => {
+    // Every session but the shown one is off screen in tmux mode; the session
+    // manager reaches them. A "2 more" anomaly chip there was the live check's
+    // finding.
+    expect(unzonedChipLabel(2, "tmux")).toBeNull();
+    expect(unzonedChipLabel(2, "grid")!.text).toBe("2 more");
+  });
+
+  it("the page hands the chip its work mode", () => {
+    const page = readFileSync(resolve(__dirname, "./TerminalPage.tsx"), "utf8");
+    expect(page).toMatch(
+      /<UnzonedChip\s+unassignedCount=\{zoneLayout\.unassignedTabIds\.length\}\s+workMode=\{zoneLayout\.workMode\}/,
+    );
   });
 });
