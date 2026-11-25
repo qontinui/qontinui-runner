@@ -343,7 +343,7 @@ fn read_state_flag(element: &serde_json::Value, field: &str) -> Option<bool> {
 ///
 /// `disabled` / `ariaDisabled` were added to [`ALLOWED_STATES`] ahead of the
 /// bridge that emits them: `@qontinui/ui-bridge@0.22.0` — the version this
-/// repo depends on (`^0.22.0`) — builds element state in `getElementState()`
+/// repo depended on when the probe was written — builds element state in `getElementState()`
 /// as `visible` / `enabled` / `focused` only, and its published
 /// `ElementState` type declares no `disabled` or `ariaDisabled` at all. The
 /// ui-bridge commit that splits them is not on that package's release
@@ -874,7 +874,7 @@ mod state_probe_tests {
     //!
     //! The regression these lock down: `disabled` / `ariaDisabled` were added
     //! to `ALLOWED_STATES` ahead of the bridge that emits them.
-    //! `@qontinui/ui-bridge@0.22.0` (the bridge this fixture reproduces) builds
+    //! `@qontinui/ui-bridge@0.22.0` (the bridge `pre_split_element` reproduces) builds
     //! element state as `visible` / `enabled` / `focused` only, so an
     //! absent-reads-as-`false` probe made both names permanently unmatchable
     //! — accepted at the door, then silently timed out.
@@ -956,7 +956,7 @@ mod state_probe_tests {
         );
     }
 
-    /// On the shipped bridge `disabled` is not on the wire, but it IS soundly
+    /// On the 0.22.0 bridge `disabled` is not on the wire, but it IS soundly
     /// derivable from the `enabled` fold — and this is the same derivation
     /// the SDK's own predicate runtime uses (`evaluateElementPredicate`'s
     /// `disabled` arm is `state.enabled === false`). Without it, a wait on
@@ -1030,8 +1030,8 @@ mod state_probe_tests {
         }
     }
 
-    /// The contract that ties the allow-list to reality: on the bridge build
-    /// this repo actually depends on, no accepted state may be silently stuck
+    /// The contract that ties the allow-list to reality: on the 0.22.0 bridge
+    /// build `pre_split_element` models, no accepted state may be silently stuck
     /// at `false` forever. Either the probe observes it, or it says it cannot
     /// — the one outcome ruled out is an unmatchable name that looks like a
     /// normal negative.
