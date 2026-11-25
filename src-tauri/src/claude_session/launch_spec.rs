@@ -584,8 +584,8 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
                     }
                 }
                 // Every other session choice — `--continue` / `-c` ("the most
-                // recent conversation in this cwd") and the `resume`
-                // subcommand, i.e. the rest of the one token set
+                // recent conversation in this cwd") and a bare `resume`
+                // token, i.e. the rest of the one token set
                 // `claude_env::claude_argv_chooses_session` — cannot stand
                 // beside the spec's `--session-id` / `--resume`: Claude Code
                 // refuses the pair ("--session-id with --continue or --resume
@@ -1523,8 +1523,9 @@ mod tests {
     /// Beside a `{sessionId}` placeholder, a template session flag that names a
     /// DIFFERENT, literal id is dropped when the spec pins the session: argv
     /// carries exactly one session flag, and it is the pin (review round 5,
-    /// A1 of qontinui-runner#3149). Two template flags that both carry the
-    /// pin keep only the first (review of the A1 fix, A6).
+    /// A1 of qontinui-runner#3149). Of two template flags that both carry the
+    /// pin, one is kept: the spec's kind, else the first (review of the A1
+    /// fix, A6).
     #[test]
     fn a_literal_session_flag_beside_a_placeholder_is_dropped() {
         const ID: &str = "7b97f1e8-35c0-4bec-992d-63e5a3dc55d7";
@@ -1534,7 +1535,8 @@ mod tests {
             format!("claude --resume {OTHER} --session-id {{sessionId}}"),
             format!("claude --session-id={{sessionId}} -r {OTHER}"),
             format!("claude --session-id {{sessionId}} --resume={OTHER}"),
-            // Two flags that BOTH carry the pin: only the first is kept.
+            // Two flags that BOTH carry the pin: one is kept, the one of the
+            // spec's kind (`--session-id` for the session_id spec here).
             "claude --session-id {sessionId} --resume {sessionId}".to_string(),
         ] {
             let mut s = spec();

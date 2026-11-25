@@ -75,8 +75,8 @@ pub fn inherited_markers_detail(markers: &[&str]) -> String {
 /// session? Then nothing may add a second one. Exact token match,
 /// case-insensitive: `--session-id`, `--resume`, `-r`, a bare `resume` (kept
 /// though Claude Code 2.1.332 has no `resume` subcommand, so it is really a
-/// prompt; plan-library follow-up on plan
-/// `2026-11-21-a-live-claude-session-loses-its-sessions-pid-json-record`),
+/// prompt; plan-library follow-up edge
+/// `23d2295f-98d4-4eaa-a999-ab2927ae0e4f`),
 /// `--continue`, `-c`, plus the `--session-id=…` / `--resume=…`
 /// inline forms. A merely-prefixed token (`--session-id-ish`) does NOT match,
 /// and neither does anything after a `--`, which is positional. Nor does the
@@ -122,7 +122,8 @@ pub fn claude_argv_chooses_session<S: AsRef<str>>(args: &[S]) -> bool {
         } else if CLAUDE_VARIADIC_FLAGS.contains(&a) {
             // Variadic options take every following token up to the next
             // option, i.e. one longer than `-` that starts with it
-            // (commander 13.1.0 `maybeOption`, `lib/command.js`), so a
+            // (commander's option test `arg.length > 1 && arg[0] === '-'`,
+            // which the Claude Code 2.1.332 binary carries), so a
             // `resume` or a lone `-` in that run is a value. A `--` is an
             // option by that test, so it ends the run and is then read as the
             // terminator.
@@ -140,8 +141,13 @@ pub fn claude_argv_chooses_session<S: AsRef<str>>(args: &[S]) -> bool {
 /// option-argument). The script identity shims (`resources/intercept/
 /// identity_shim.bash` / `.cmd`) carry the same two lists; a test pins them.
 /// Case-sensitive, as the CLI is. A flag missing from this list only costs
-/// the old behaviour for its value (it is scanned as a token), so the list
-/// errs toward the options a runner or an operator template actually sends.
+/// the old behaviour for its value (it is scanned as a token, so a value
+/// spelled like a session choice leaves the pane unpinned), so the list errs
+/// toward the options a runner or an operator template actually sends.
+/// Options with an OPTIONAL value (`-d/--debug [filter]`, `-w/--worktree
+/// [name]`, …), which take the next token only when it is not an option, are
+/// not modelled yet and get that old behaviour (follow-up edge
+/// `23d2295f-98d4-4eaa-a999-ab2927ae0e4f`).
 pub const CLAUDE_VALUE_FLAGS: &[&str] = &[
     "--name",
     "-n",
