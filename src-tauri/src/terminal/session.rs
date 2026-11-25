@@ -9203,9 +9203,10 @@ pub(crate) mod tests {
         );
         // Production code only: fixtures below call the mark by hand.
         let tests_at = src.find("pub(crate) mod tests {").expect("tests module");
-        let hits: Vec<usize> = src[..tests_at]
+        let hits: Vec<usize> = src
             .match_indices(call)
             .map(|(i, _)| i)
+            .filter(|&i| i < tests_at)
             .collect();
         assert_eq!(hits.len(), 1, "exactly one production mark call");
         assert!(
