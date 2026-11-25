@@ -270,6 +270,24 @@ fn reason_from_code(code: Option<&str>) -> Option<&'static str> {
     }
 }
 
+/// The capture payload inside a capture route's answer — the SDK's
+/// `{success, data}` envelope's `data`, else the answer itself (the flat
+/// capture the IPC layer and a WebSocket wrapper return) — when it is
+/// capture-shaped. Every field of a `ComponentCapture` is optional, so any
+/// JSON object would parse as an empty one; an answer carrying none of
+/// `schemaVersion`, `root` or `nodes` (an SDK without the route answering
+/// `{"error": …}`, a stray object) is `None`, never a capture.
+pub(crate) fn capture_payload(answer: &serde_json::Value) -> Option<&serde_json::Value> {
+    let payload = match answer.get("data") {
+        Some(d) if answer.get("success").is_some() => d,
+        _ => answer,
+    };
+    ["schemaVersion", "root", "nodes"]
+        .iter()
+        .any(|k| payload.get(k).is_some())
+        .then_some(payload)
+}
+
 /// The typed refusal in a capture answer — the HTTP envelope (`error` is the
 /// marker, `reason` top level or under `data`) or a relayed inner failure
 /// (`error` carries the reason). `None` for any other answer.

@@ -6064,8 +6064,9 @@ async fn handle_component_state(
 ///   `not_found`, 422 `no_mounted_elements`) and its top-level `reason`,
 ///   whether the app answered it over HTTP or relayed it as a message.
 /// - Any other failure is answered 502 `{success:false, error}`: a dispatch
-///   error, or a relayed answer that is `success:false` (not a refusal) or
-///   null ([`sdk_capture_answer`]).
+///   error, a relayed answer that is `success:false` (not a refusal) or
+///   null, or a 2xx answer that is not capture-shaped
+///   ([`crate::mcp::ui_bridge::misc::capture_payload`], [`sdk_capture_answer`]).
 async fn sdk_capture(
     state: &Arc<ApiState>,
     action: &str,
@@ -6116,6 +6117,16 @@ fn sdk_capture_answer(
                     .unwrap_or("the app answered success=false")
                     .to_string();
                 return Err(bad_gateway(error));
+            }
+            // A 2xx that is not capture-shaped (an SDK predating the route
+            // answering some other object) is a failed dispatch too: callers
+            // parse a capture's optional fields, so a stray object would read
+            // as an empty capture.
+            if crate::mcp::ui_bridge::misc::capture_payload(&data).is_none() {
+                return Err(bad_gateway(
+                    "the app's answer is not a ComponentCapture (no schemaVersion, root or nodes)"
+                        .into(),
+                ));
             }
             Ok(Json(data))
         }
@@ -9858,6 +9869,32 @@ mod sdk_capture_answer_tests {
             status(&sdk_capture_answer(Err(DispatchError::NotConnected))),
             502
         );
+    }
+
+    /// A 2xx that is not capture-shaped (an SDK predating the route answering
+    /// some other object) is a 502, never a 200 a caller reads as an empty
+    /// capture; the SDK envelope around a capture still passes.
+    #[test]
+    fn a_non_capture_answer_is_a_502() {
+        let stray = sdk_capture_answer(Ok(serde_json::json!({"ok": true})));
+        assert_eq!(status(&stray), 502);
+        let envelope_stray =
+            sdk_capture_answer(Ok(serde_json::json!({"success": true, "data": {"ok": true}})));
+        assert_eq!(status(&envelope_stray), 502);
+        let envelope = sdk_capture_answer(Ok(serde_json::json!({
+            "success": true, "data": {"schemaVersion": 1, "nodes": []}
+        })));
+        assert_eq!(status(&envelope), 200);
+        for flat in [
+            serde_json::json!({"root": {}}),
+            serde_json::json!({"nodes": []}),
+            // A flat capture with a `data` key but no `success` stays flat.
+            serde_json::json!({"schemaVersion": 1, "data": {}}),
+        ] {
+            assert_eq!(status(&sdk_capture_answer(Ok(flat.clone()))), 200, "{flat}");
+        }
+        let null_data = sdk_capture_answer(Ok(serde_json::json!({"success": true, "data": null})));
+        assert_eq!(status(&null_data), 502);
     }
 }
 

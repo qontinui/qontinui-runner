@@ -4154,22 +4154,12 @@ fn capture_from_answer(
             .unwrap_or("capture failed")
             .to_string());
     }
-    let payload = match answer.get("data") {
-        Some(d) if answer.get("success").is_some() => d,
-        _ => answer,
-    };
-    // Every field of a capture is optional, so any JSON object would parse as
-    // an empty one: an answer that is not capture-shaped (an SDK without the
-    // route answering `{"error": …}`, a null) is an error, never a capture.
-    if !["schemaVersion", "root", "nodes"]
-        .iter()
-        .any(|k| payload.get(k).is_some())
-    {
+    let Some(payload) = super::misc::capture_payload(answer) else {
         return Err(format!(
             "answer is not a ComponentCapture (no schemaVersion, root or nodes): {}",
-            truncate_for_error(&payload.to_string())
+            truncate_for_error(&answer.to_string())
         ));
-    }
+    };
     serde_json::from_value(payload.clone()).map_err(|e| format!("capture did not parse: {e}"))
 }
 

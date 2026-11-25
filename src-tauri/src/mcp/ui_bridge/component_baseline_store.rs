@@ -209,7 +209,14 @@ impl ComponentBaselineStore {
         // effort — the file is already whole on disk — and Unix only, where a
         // directory can be opened and synced.
         #[cfg(unix)]
-        let _ = std::fs::File::open(&self.dir).and_then(|dir| dir.sync_all());
+        if let Err(e) = std::fs::File::open(&self.dir).and_then(|dir| dir.sync_all()) {
+            tracing::warn!(
+                "component baseline store: stored {} but could not sync directory {}: {e} \
+                 (the rename may not survive a crash)",
+                target.display(),
+                self.dir.display()
+            );
+        }
         Ok(target)
     }
 
