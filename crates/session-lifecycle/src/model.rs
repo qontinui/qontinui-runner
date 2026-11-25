@@ -569,7 +569,7 @@ pub enum DetectionKind {
     CustodyOwed,
     ParkedAuthNoMigration,
     CloseNotCleared,
-    CloseNotAcknowledged,
+    CloseUnconfirmed,
     ResumeRefused,
 }
 

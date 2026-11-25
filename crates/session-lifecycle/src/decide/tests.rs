@@ -1485,15 +1485,17 @@ fn s2_an_unknown_axis_never_closes_withdraws_migrates_or_continues_into_unknown_
                 // closed path does not read leave its (resume / report) answer
                 // alone; none of the forbidden actions are reachable from it.
                 assert!(!dec.action.is_close(), "axis {a}: {dec:?}");
-                // Every axis the spec lists (H, A, S, P, I, W, O, K, R, the coord
-                // row, schema skew): no WithdrawFinish, Migrate or Continue.
+                // Every axis: no WithdrawFinish or Migrate. R (8) and the coord
+                // row (9) gate only finish / revival / close decisions, so an
+                // unfinished session is still served its Continue; every other
+                // axis also withholds the Continue.
                 assert!(
-                    !matches!(
-                        dec.action,
-                        Action::WithdrawFinish | Action::Migrate { .. } | Action::Continue { .. }
-                    ),
+                    !matches!(dec.action, Action::WithdrawFinish | Action::Migrate { .. }),
                     "axis {a}: {dec:?}"
                 );
+                if !matches!(a, 8 | 9) {
+                    assert!(!dec.action.is_continue(), "axis {a}: {dec:?}");
+                }
             }
         }
     }
@@ -1767,23 +1769,14 @@ fn a_second_tick_during_the_ack_window_emits_no_second_close() {
             "tick {tick}: {dec:?}"
         );
     }
-    // Past its timeout the unacknowledged close is reported failed, still
-    // without a second Close.
+    // Past its timeout the session is Stopped again: `close_unconfirmed` rides
+    // beside the decision ONCE, and a new Close waits out the backoff.
     let late = Timestamp(NOW.0 + 6 * MIN);
-    let mut at_late = issued.clone();
-    at_late.hosting = Observed::new(at_late.hosting.value.clone(), late);
-    at_late.activity = Observed::new(at_late.activity.value.clone(), late);
-    at_late.selfcont = Observed::new(at_late.selfcont.value.clone(), late);
-    at_late.parked = Observed::new(at_late.parked.value.clone(), late);
-    at_late.input = Observed::new(at_late.input.value.clone(), late);
-    at_late.work = Observed::new(at_late.work.value.clone(), late);
-    at_late.revived = Observed::new(at_late.revived.value.clone(), late);
-    at_late.coord_finished = Observed::new(at_late.coord_finished.value.clone(), late);
+    let at_late = refresh(&issued, late);
     let dec = decide(&at_late, &[done("w")], &dials(), X, late);
-    assert!(matches!(
-        &dec.action,
-        Action::Report { detection } if detection.kind == DetectionKind::CloseNotAcknowledged
-    ));
+    assert!(!dec.action.is_close());
+    assert!(dec.caps.iter().any(|c| matches!(c,
+        Cap::AlsoReport(d) if d.kind == DetectionKind::CloseUnconfirmed)));
     // Settling the close (or the host exiting) clears the in-flight fact.
     let settled = fold(
         issued.clone(),
@@ -1803,4 +1796,218 @@ fn a_second_tick_during_the_ack_window_emits_no_second_close() {
         }],
     );
     assert_eq!(exited_after.closing, None);
+}
+
+fn refresh(s: &SessionState, now: Timestamp) -> SessionState {
+    let mut s = s.clone();
+    s.hosting = Observed::new(s.hosting.value.clone(), now);
+    s.activity = Observed::new(s.activity.value.clone(), now);
+    s.selfcont = Observed::new(s.selfcont.value.clone(), now);
+    s.parked = Observed::new(s.parked.value.clone(), now);
+    s.input = Observed::new(s.input.value.clone(), now);
+    s.work = Observed::new(s.work.value.clone(), now);
+    s.owned = Observed::new(s.owned.value.clone(), now);
+    s.custody = Observed::new(s.custody.value.clone(), now);
+    s.revived = Observed::new(s.revived.value.clone(), now);
+    s.coord_finished = Observed::new(s.coord_finished.value.clone(), now);
+    s
+}
+
+fn issued_at(t: Timestamp) -> SessionState {
+    let mut s = closable();
+    s.closing = Some(t);
+    s
+}
+
+#[test]
+fn a_wedged_close_recovers_and_may_close_again_after_the_backoff() {
+    // No CloseSettled ever arrives.
+    let s = issued_at(NOW);
+    let ack_end = NOW.0 + 5 * MIN;
+    // Inside the ack window: frozen.
+    let w = refresh(&s, Timestamp(NOW.0 + MIN));
+    assert!(matches!(
+        decide(&w, &[done("w")], &dials(), X, Timestamp(NOW.0 + MIN)).action,
+        Action::Observe {
+            why: ObserveWhy::CloseInFlight
+        }
+    ));
+    // Past the timeout, inside the backoff: reported once, no Close.
+    let t1 = Timestamp(ack_end + MIN);
+    let dec = decide(&refresh(&s, t1), &[done("w")], &dials(), X, t1);
+    assert!(matches!(
+        dec.action,
+        Action::Observe {
+            why: ObserveWhy::Backoff { .. }
+        }
+    ));
+    assert!(dec
+        .caps
+        .iter()
+        .any(|c| matches!(c, Cap::AlsoReport(d) if d.kind == DetectionKind::CloseUnconfirmed)));
+    // Once the host records the report the rider stops (ONCE).
+    let mut recorded = refresh(&s, t1);
+    recorded
+        .ledger
+        .reported
+        .insert(format!("close_unconfirmed:{}", NOW.0), t1);
+    let dec = decide(&recorded, &[done("w")], &dials(), X, t1);
+    assert!(!dec.caps.iter().any(|c| matches!(c, Cap::AlsoReport(_))));
+    // After the backoff the session may close again.
+    let t2 = Timestamp(ack_end + CLOSE_BACKOFF.0 + MIN);
+    let dec = decide(&refresh(&s, t2), &[done("w")], &dials(), X, t2);
+    assert!(dec.action.is_close(), "{dec:?}");
+    // The fold's own record of the unconfirmed close works the same way.
+    use crate::state::{fold, Event, EventKind};
+    let folded = fold(
+        issued_at(NOW),
+        &[Event {
+            at: t1,
+            seq: 1,
+            kind: EventKind::CloseUnconfirmed,
+        }],
+    );
+    assert_eq!(folded.closing, None);
+    assert_eq!(folded.close_backoff_until, Some(t1.plus(CLOSE_BACKOFF)));
+    let dec = decide(&refresh(&folded, t1), &[done("w")], &dials(), X, t1);
+    assert!(matches!(
+        dec.action,
+        Action::Observe {
+            why: ObserveWhy::Backoff { .. }
+        }
+    ));
+    let dec = decide(
+        &refresh(&folded, t2.plus(Dur::mins(5))),
+        &[done("w")],
+        &dials(),
+        X,
+        t2.plus(Dur::mins(5)),
+    );
+    assert!(dec.action.is_close());
+}
+
+#[test]
+fn a_stale_closing_flag_does_not_mask_revived_owing_or_undeclared() {
+    let late = Timestamp(NOW.0 + 10 * MIN);
+    // Revived.
+    let mut r = issued_at(NOW);
+    r.revived = Observed::new(Tri::True, late);
+    let dec = decide(&refresh(&r, late), &[], &dials(), X, late);
+    assert_eq!(dec.action, Action::WithdrawFinish);
+    // Owing (unfinished).
+    let mut o = issued_at(NOW);
+    idle_unfinish_work(&mut o);
+    let dec = decide(&refresh(&o, late), &[owed("pr-1")], &dials(), X, late);
+    assert_eq!(rule(&dec), RuleId::D15);
+    // Undeclared.
+    let mut u = issued_at(NOW);
+    idle_unfinished(&mut u);
+    let dec = decide(&refresh(&u, late), &[], &dials(), X, late);
+    assert_eq!(rule(&dec), RuleId::D16);
+}
+
+#[test]
+fn a_turn_opening_clears_a_close_in_flight() {
+    use crate::state::{fold, Event, EventKind};
+    let s = fold(
+        issued_at(NOW),
+        &[Event {
+            at: NOW,
+            seq: 1,
+            kind: EventKind::TurnStart,
+        }],
+    );
+    assert_eq!(s.closing, None);
+}
+
+#[test]
+fn a_close_in_flight_freezes_the_parked_phase_so_d12_sends_no_continue() {
+    let mut s = issued_at(NOW);
+    s.parked = Observed::new(
+        Parked::ApiError {
+            kind: ApiErrorKind::ServerError,
+            since: Timestamp(NOW.0 - 10 * MIN),
+        },
+        NOW,
+    );
+    let dec = d(&s, &[]);
+    assert_eq!(rule(&dec), RuleId::D20);
+    assert!(matches!(
+        dec.action,
+        Action::Observe {
+            why: ObserveWhy::CloseInFlight
+        }
+    ));
+    // A dialog and a scheduled wake are frozen too.
+    let mut i = issued_at(NOW);
+    i.input = Observed::new(
+        Input::Dialog {
+            kind: DialogKind::Permission,
+            since: NOW,
+        },
+        NOW,
+    );
+    assert!(matches!(
+        d(&i, &[]).action,
+        Action::Observe {
+            why: ObserveWhy::CloseInFlight
+        }
+    ));
+    let mut sc = issued_at(NOW);
+    with_s(
+        &mut sc,
+        vec![SelfCont::LostOnNewInstance {
+            at: Timestamp(NOW.0 - 20 * MIN),
+        }],
+    );
+    assert!(matches!(
+        d(&sc, &[]).action,
+        Action::Observe {
+            why: ObserveWhy::CloseInFlight
+        }
+    ));
+}
+
+#[test]
+fn an_unreadable_coord_row_does_not_stop_an_unfinished_session_being_served() {
+    let unk = || Observed::new(Tri::unknown("coord_row", "unreadable"), NOW);
+    // Parked on a request error: D12 still continues.
+    let mut p = closable();
+    unfinish(&mut p);
+    p.coord_finished = unk();
+    p.revived = Observed::new(Tri::unknown("revived", "unreadable"), NOW);
+    p.parked = Observed::new(
+        Parked::ApiError {
+            kind: ApiErrorKind::Overloaded,
+            since: Timestamp(NOW.0 - 10 * MIN),
+        },
+        NOW,
+    );
+    let dec = d(&p, &[]);
+    assert_eq!(rule(&dec), RuleId::D12);
+    assert!(dec.action.is_continue());
+    // Owing: D15 still continues.
+    let mut o = closable();
+    idle_unfinish_work(&mut o);
+    o.coord_finished = unk();
+    o.revived = Observed::new(Tri::unknown("revived", "unreadable"), NOW);
+    let dec = d(&o, &[owed("pr-1")]);
+    assert_eq!(rule(&dec), RuleId::D15);
+    assert!(dec.action.is_continue());
+    // A FINISHED session with it Unknown never closes nor withdraws (S2).
+    let mut f = closable();
+    f.coord_finished = unk();
+    let dec = d(&f, &[owed("pr-1")]);
+    assert!(!dec.action.is_close() && dec.action != Action::WithdrawFinish);
+    // ... and a Migrate waits too.
+    let mut l = closable();
+    unfinish(&mut l);
+    limit(&mut l, 3 * 60 * MIN, true);
+    l.coord_finished = unk();
+    let mut di = dials();
+    di.budgets = Budgets::Known(vec!["b".into()]);
+    assert!(!matches!(
+        decide(&l, &[], &di, X, NOW).action,
+        Action::Migrate { .. }
+    ));
 }
