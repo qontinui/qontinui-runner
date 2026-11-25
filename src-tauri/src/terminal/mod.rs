@@ -29,6 +29,7 @@ pub mod holder_boot_sweep;
 pub mod holder_census;
 #[cfg(test)]
 mod idle_chrome_replay;
+pub mod input_funnel; // The pane's input funnel exposed: draft state + writer-tagged input history (plan 2026-10-28-one-session-lifecycle-authority, Phase 80)
 pub mod interceptor;
 pub mod launch_failure; // The identity shim's launch-failure reports (plan 2026-11-10-migration-holds-for-missing-claude-cli)
 pub mod layout; // The terminal↔confirmed-session join + registered tab labels behind terminal_list, GET /terminal-pages and GET /terminal-layout
