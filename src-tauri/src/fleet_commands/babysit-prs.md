@@ -1615,7 +1615,7 @@ Then:
    nothing to adopt — an open or merged PR whose `Adoption-Supersedes:` line
    covers #N or whose title declares `supersedes #N`, a CLOSED one whose own
    coord card shows it landed (a coord ff-land is CLOSED on GitHub), or a
-   successor #N's card lists in `superseded_by` or `superseded_by_refused` as open, merged or landed; `HELD` means another adopter holds it now, so do not start a second
+   successor #N's card lists in `superseded_by`, `superseded_by_refused` or `superseded_by_pending` as open, merged or landed; `HELD` means another adopter holds it now, so do not start a second
    adoption; `RENEWED` means your own session already holds it, which is
    yours only when your own earlier call for that key printed UNKNOWN. Exit 2
    is UNKNOWN: do not adopt on it — including a CLOSED adopter whose coord card
