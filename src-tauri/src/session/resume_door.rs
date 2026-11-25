@@ -943,6 +943,41 @@ async fn run_batch(
     results
 }
 
+/// Resume `ids` through the same per-id flow as `POST /control/sessions/resume`
+/// (every guard, the spawn, and the verification by process read), awaiting
+/// every verdict — for an in-process caller: the upgrade successor resuming
+/// the sessions that died with its predecessor (plan
+/// `2026-11-24-runner-upgrades-itself-daily-keeping-sessions-alive-with-no-outage-and-automatic-rollback`,
+/// D3 step 4).
+pub(crate) async fn resume_ids_in_process(
+    app: &tauri::AppHandle,
+    ids: Vec<String>,
+) -> Result<ResumeReport, String> {
+    use tauri::Manager;
+    let store = app
+        .try_state::<Arc<SessionLifecycleStore>>()
+        .map(|s| s.inner().clone())
+        .ok_or_else(|| "lifecycle store not available".to_string())?;
+    let tm = app
+        .try_state::<Arc<TerminalManager>>()
+        .map(|s| s.inner().clone())
+        .ok_or_else(|| "terminal manager not available".to_string())?;
+    let registry = app
+        .try_state::<Arc<SessionRegistry>>()
+        .map(|s| s.inner().clone())
+        .ok_or_else(|| "session registry not available".to_string())?;
+    let requested = ids.len();
+    let results = run_batch(app.clone(), tm, registry, store, ids).await;
+    Ok(tally(None, requested, results))
+}
+
+/// The pid of the live `claude` already holding session `id`, by a fresh
+/// process read (`Err` when the read is UNKNOWN) — the same read the door's
+/// double-spawn guard makes.
+pub(crate) async fn live_process_holding(id: &str) -> Result<Option<u32>, String> {
+    live_holder(id).await
+}
+
 /// `true` when the `Content-Type` header names JSON (`application/json`, with
 /// or without parameters, any case, or a `+json` suffix type).
 fn is_json_content_type(headers: &axum::http::HeaderMap) -> bool {

@@ -242,6 +242,13 @@ pub const CREDENTIAL_DOORS: &[&str] = &[
     "/graphql/ws",
     "/restart-runner",
     "/drain",
+    // The upgrade verb (plan 2026-11-24-runner-upgrades-itself-daily-keeping-
+    // sessions-alive-with-no-outage-and-automatic-rollback, D3.7): the POST
+    // swaps the build and exits the runner; the preflight GET RUNS the named
+    // candidate's binaries (`--provenance`, `--protocol-versions`). Neither is
+    // a browser's business.
+    "/runner/upgrade",
+    "/runner/upgrade/*",
     "/executor/restart",
     "/install-effects/run",
     "/ui-bridge/control/page/*",

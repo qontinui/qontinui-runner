@@ -1,0 +1,219 @@
+//! Process starts the upgrade needs: a detached process in its own session
+//! (the self-managed guard, a rolled-back runner), and a successor that
+//! inherits the listener fds under the `LISTEN_FDS` protocol (plan D1,
+//! "Self-managed"). The fd passing follows `pty-holder/src/handoff.rs`
+//! `spawn_successor`: high-numbered close-on-exec copies, `dup2`'d onto
+//! 3, 4, … in `pre_exec`, close-on-exec cleared on the targets.
+
+use std::path::Path;
+use std::time::Duration;
+
+/// Start `exe args…` with null stdio in a new session, so it outlives this
+/// process and is in nobody's process group. Its pid.
+#[cfg(unix)]
+pub fn spawn_detached(exe: &Path, args: &[String]) -> Result<u32, String> {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    let mut cmd = Command::new(exe);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: setsid is async-signal-safe and touches only the child.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = cmd
+        .spawn()
+        .map_err(|e| format!("start {}: {e}", exe.display()))?;
+    Ok(child.id())
+}
+
+#[cfg(not(unix))]
+pub fn spawn_detached(exe: &Path, _args: &[String]) -> Result<u32, String> {
+    Err(format!(
+        "a detached {} is the Windows self-managed path (plan Phase 8)",
+        exe.display()
+    ))
+}
+
+/// Start the successor `exe args…` with `fds` at 3, 4, … and `LISTEN_FDS`,
+/// `LISTEN_FDNAMES` and `LISTEN_PID` (its own pid — set by a one-line `sh`
+/// trampoline, `LISTEN_PID=$$ exec …`, because the pid is known only after
+/// the fork and an environment write is not async-signal-safe there).
+#[cfg(unix)]
+pub fn spawn_successor(exe: &Path, args: &[String], fds: &[(String, i32)]) -> Result<u32, String> {
+    use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    if fds.is_empty() {
+        return Err("no listener fd to pass".to_string());
+    }
+    // High-numbered CLOEXEC copies, so a dup2 onto 3.. can never clobber a
+    // source that happens to sit on a target number.
+    const ABOVE: i32 = 64;
+    let mut copies: Vec<OwnedFd> = Vec::with_capacity(fds.len());
+    for (name, fd) in fds {
+        // SAFETY: the fd is a listener this process holds open for its whole
+        // life (registered by the server that serves it); borrowing it only
+        // to duplicate it.
+        let borrowed = unsafe { BorrowedFd::borrow_raw(*fd) };
+        let dup = rustix_dup_cloexec(borrowed.as_raw_fd(), ABOVE)
+            .map_err(|e| format!("duplicate listener {name} (fd {fd}): {e}"))?;
+        copies.push(dup);
+    }
+    let sources: Vec<i32> = copies.iter().map(AsRawFd::as_raw_fd).collect();
+    let mut cmd = Command::new("/bin/sh");
+    cmd.arg("-c")
+        .arg("LISTEN_PID=$$; export LISTEN_PID; exec \"$0\" \"$@\"")
+        .arg(exe)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    for (k, v) in super::listener_fds::listen_env(fds) {
+        cmd.env(k, v);
+    }
+    // SAFETY: only dup2, fcntl and setsid run between fork and exec — all
+    // async-signal-safe — on fds open in the child.
+    unsafe {
+        cmd.pre_exec(move || {
+            for (i, src) in sources.iter().enumerate() {
+                let dst = 3 + i as i32;
+                if libc::dup2(*src, dst) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::fcntl(dst, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = cmd.spawn();
+    drop(copies);
+    let child = child.map_err(|e| format!("start the successor {}: {e}", exe.display()))?;
+    Ok(child.id())
+}
+
+#[cfg(unix)]
+fn rustix_dup_cloexec(fd: i32, above: i32) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: F_DUPFD_CLOEXEC duplicates an open fd to the lowest free number
+    // >= `above`; the result is owned by nothing else.
+    let new = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, above) };
+    if new < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `new` was just created above and is owned here only.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(new) })
+}
+
+#[cfg(not(unix))]
+pub fn spawn_successor(
+    exe: &Path,
+    _args: &[String],
+    _fds: &[(String, i32)],
+) -> Result<u32, String> {
+    Err(format!(
+        "starting {} with inherited listeners is the Windows handoff (plan Phase 8)",
+        exe.display()
+    ))
+}
+
+/// End `pid`: SIGTERM, then SIGKILL once `grace` has passed.
+#[cfg(unix)]
+pub fn terminate(pid: u32, grace: Duration) -> Result<(), String> {
+    let p = i32::try_from(pid).map_err(|_| format!("pid {pid} out of range"))?;
+    // SAFETY: sending a signal to a pid.
+    if unsafe { libc::kill(p, libc::SIGTERM) } != 0 {
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(());
+        }
+        return Err(format!("SIGTERM {pid}: {e}"));
+    }
+    let deadline = std::time::Instant::now() + grace;
+    while std::time::Instant::now() < deadline {
+        if !super::sys::pid_alive(pid) {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    // SAFETY: as above.
+    unsafe { libc::kill(p, libc::SIGKILL) };
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn terminate(pid: u32, _grace: Duration) -> Result<(), String> {
+    Err(format!("ending {pid} is the Windows guard (plan Phase 8)"))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// The successor sees the listener at fd 3, `LISTEN_FDS=1`,
+    /// `LISTEN_FDNAMES=api` and `LISTEN_PID` equal to its OWN pid — the
+    /// check sd_listen_fds(3) makes before adopting.
+    #[test]
+    fn successor_inherits_the_listener_under_the_listen_fds_protocol() {
+        use std::os::fd::AsRawFd;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("seen");
+        let script = dir.path().join("successor.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n[ -e /proc/self/fd/3 ] && fd3=yes || fd3=no\n\
+                 echo \"$LISTEN_FDS $LISTEN_FDNAMES $fd3 $([ \"$LISTEN_PID\" = \"$$\" ] && echo pid-ok || echo pid-bad) $1\" > {}\n",
+                out.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let pid = spawn_successor(
+            &script,
+            &["--upgrade-successor".to_string()],
+            &[("api".to_string(), listener.as_raw_fd())],
+        )
+        .unwrap();
+        assert!(pid > 0);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !out.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let seen = std::fs::read_to_string(&out).unwrap();
+        assert_eq!(seen.trim(), "1 api yes pid-ok --upgrade-successor");
+        // The parent still owns its listener.
+        assert_eq!(listener.local_addr().unwrap().port(), port);
+    }
+
+    #[test]
+    fn terminate_ends_a_process_and_tolerates_a_gone_one() {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        terminate(pid, Duration::from_secs(1)).unwrap();
+        let mut child = child;
+        let status = child.wait().unwrap();
+        assert!(!status.success());
+        assert!(terminate(pid, Duration::from_millis(10)).is_ok());
+    }
+}
