@@ -1566,7 +1566,10 @@ fn resume_door_is_a_credential_door_and_on_no_allowlist() {
 /// them.
 #[test]
 fn runner_upgrade_routes_are_credential_doors_and_on_no_allowlist() {
-    for (m, p) in [("POST", "/runner/upgrade"), ("GET", "/runner/upgrade/preflight")] {
+    for (m, p) in [
+        ("POST", "/runner/upgrade"),
+        ("GET", "/runner/upgrade/preflight"),
+    ] {
         assert!(is_credential_door(m, p), "{m} {p}");
         for list in [TRUSTED_ROUTES, FOREIGN_ROUTES, REVIEWED_NOT_DOOR] {
             assert!(!list.contains(&(m, p)), "{m} {p}");
