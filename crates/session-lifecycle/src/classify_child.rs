@@ -52,6 +52,7 @@
 //! No message-pump chain has been measured, so none is admitted; the class keeps
 //! the clause's name so the pump joins it when one is.
 
+use crate::stray::{stray_verdict, StrayContext, StrayEvidence, StrayProc, StrayVerdict};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// The Linux chain's id, as it appears in a verdict and a log line.
@@ -229,6 +230,10 @@ pub struct ChildVerdict {
     /// The measured chain matched, for [`ChildClass::ShimOrPump`].
     pub chain: Option<&'static str>,
     pub reason: String,
+    /// Set when this `Work` child is a background tool shell PROVEN unable to
+    /// finish on its own (architecture §4.1; [`crate::stray`]). A stray is still
+    /// `Work` for the close guard (G3).
+    pub stray: Option<StrayEvidence>,
 }
 
 impl ChildVerdict {
@@ -238,6 +243,7 @@ impl ChildVerdict {
             class,
             chain: None,
             reason: reason.into(),
+            stray: None,
         }
     }
 }
@@ -252,6 +258,11 @@ pub struct SessionVerdict {
     /// Set when the `claude` itself could not be bound, which refuses the
     /// session with no per-child verdicts.
     pub refusal: Option<String>,
+    /// True when the session has at least one child, every child is `Work`
+    /// and every one of them is a proven stray wait: the activity axis reads
+    /// `ShellPinned` with `stray_shells == shells` (§2.2 phase 3's exception).
+    /// `admit` stays false: a stray is still work for G3.
+    pub pinned_by_strays: bool,
 }
 
 impl SessionVerdict {
@@ -672,6 +683,63 @@ pub fn classify_child(
     argv: Option<&HashMap<u32, Argv>>,
     fresh: &ProcTable,
 ) -> ChildVerdict {
+    classify_child_with_strays(platform, child, first, argv, fresh, None)
+}
+
+/// [`classify_child`] plus the stray proofs of [`crate::stray`] for a Linux
+/// tool-shell child: `ctx` carries what the caller read beside the process table
+/// (start times, uids, polled files' mtimes and holders). With `None`, or off
+/// Linux, no stray is ever claimed (an unreadable input is work).
+pub fn classify_child_with_strays(
+    platform: Platform,
+    child: u32,
+    first: &ProcTable,
+    argv: Option<&HashMap<u32, Argv>>,
+    fresh: &ProcTable,
+    ctx: Option<&StrayContext>,
+) -> ChildVerdict {
+    let mut v = classify_child_inner(platform, child, first, argv, fresh);
+    if v.class == ChildClass::Work && platform == Platform::Linux {
+        if let (Some(ctx), Some(argv)) = (ctx, argv) {
+            let procs = stray_procs(first, argv);
+            let facts = ctx.facts(procs);
+            if let StrayVerdict::Stray(e) = stray_verdict(&facts, child, ctx.idle_min) {
+                v.stray = Some(e);
+            }
+        }
+    }
+    v
+}
+
+/// The process table in the stray classifier's form: every row's parent and its
+/// argv elements (empty when unreadable).
+fn stray_procs(first: &ProcTable, argv: &HashMap<u32, Argv>) -> BTreeMap<u32, StrayProc> {
+    first
+        .rows
+        .iter()
+        .map(|(pid, row)| {
+            let a = match argv.get(pid) {
+                Some(Argv::Elements(a)) => a.clone(),
+                _ => Vec::new(),
+            };
+            (
+                *pid,
+                StrayProc {
+                    ppid: row.ppid,
+                    argv: a,
+                },
+            )
+        })
+        .collect()
+}
+
+fn classify_child_inner(
+    platform: Platform,
+    child: u32,
+    first: &ProcTable,
+    argv: Option<&HashMap<u32, Argv>>,
+    fresh: &ProcTable,
+) -> ChildVerdict {
     use ChildClass::{ShimOrPump, Unknown, Work};
     if !first.fresh {
         return ChildVerdict::new(child, Unknown, "the process table is not a fresh read");
@@ -766,6 +834,7 @@ pub fn classify_child(
             class: ShimOrPump,
             chain: Some(chain),
             reason: format!("whole subtree matches the measured {chain} chain"),
+            stray: None,
         },
         Err(why) if child_image == "cmd" => ChildVerdict::new(
             child,
@@ -794,11 +863,25 @@ pub fn classify_session(
     argv: Option<&HashMap<u32, Argv>>,
     fresh: &ProcTable,
 ) -> SessionVerdict {
+    classify_session_with_strays(platform, claude_pid, first, argv, fresh, None)
+}
+
+/// [`classify_session`] with the stray proofs (see
+/// [`classify_child_with_strays`]).
+pub fn classify_session_with_strays(
+    platform: Platform,
+    claude_pid: u32,
+    first: &ProcTable,
+    argv: Option<&HashMap<u32, Argv>>,
+    fresh: &ProcTable,
+    ctx: Option<&StrayContext>,
+) -> SessionVerdict {
     let unbound = |why: String| SessionVerdict {
         claude_pid,
         admit: false,
         children: Vec::new(),
         refusal: Some(why),
+        pinned_by_strays: false,
     };
     if !first.fresh || !fresh.fresh {
         return unbound("a process table is not a fresh read".to_string());
@@ -823,14 +906,19 @@ pub fn classify_session(
     }
     let children: Vec<ChildVerdict> = first_kids
         .into_iter()
-        .map(|kid| classify_child(platform, kid, first, argv, fresh))
+        .map(|kid| classify_child_with_strays(platform, kid, first, argv, fresh, ctx))
         .collect();
     let admit = children.iter().all(|c| c.class == ChildClass::ShimOrPump);
+    let pinned_by_strays = !children.is_empty()
+        && children
+            .iter()
+            .all(|c| c.class == ChildClass::Work && c.stray.is_some());
     SessionVerdict {
         claude_pid,
         admit,
         children,
         refusal: None,
+        pinned_by_strays,
     }
 }
 
