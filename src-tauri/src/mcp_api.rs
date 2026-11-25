@@ -13072,9 +13072,10 @@ pub fn create_router(
             let session_counts = if workdirs.is_empty() {
                 Default::default()
             } else {
-                tokio::task::spawn_blocking(move || {
+                let session_reconcile = move || {
                     crate::coord_mcp::reconcile_session_configs(workdirs, reconcile_bound_port)
-                })
+                };
+                tokio::task::spawn_blocking(session_reconcile)
                 .await
                 .unwrap_or_else(|e| {
                     warn!("coord_mcp: boot session reconcile task failed ({e}); counts unknown, reported as zero");
@@ -13088,14 +13089,14 @@ pub fn create_router(
             // minting a fresh one that would strand a live client's cached nonce.
             // Blocking thread for the same reason as the session pass above. A
             // panicked pass reads as `Leave` (nothing applied), with a warning.
-            let root_action = tokio::task::spawn_blocking(move || {
-                crate::coord_mcp::reconcile_root_config(reconcile_bound_port)
-            })
-            .await
-            .unwrap_or_else(|e| {
-                warn!("coord_mcp: boot root reconcile task failed ({e}); reported as Leave");
-                crate::coord_mcp::RootReconcileAction::Leave
-            });
+            let root_reconcile =
+                move || crate::coord_mcp::reconcile_root_config(reconcile_bound_port);
+            let root_action = tokio::task::spawn_blocking(root_reconcile)
+                .await
+                .unwrap_or_else(|e| {
+                    warn!("coord_mcp: boot root reconcile task failed ({e}); reported as Leave");
+                    crate::coord_mcp::RootReconcileAction::Leave
+                });
 
             // Change 2 observability: one structured summary of restore vs
             // self-heal so a future silent rotation (restored=0 → root Rewrite) is
@@ -23958,6 +23959,17 @@ mod supervised_workers_health_tests {
                 Site::Call,
                 "tokio::task::spawn_blocking(move || {",
                 "one-shot blocking census of on-disk .mcp.json configs, awaited by the restore",
+            ),
+            (
+                Site::Call,
+                "tokio::task::spawn_blocking(session_reconcile)",
+                "awaited one-shot blocking reconcile of the session .mcp.json configs (reads \
+                 each config and may run bounded git spawns for the workdir-artifact exclude)",
+            ),
+            (
+                Site::Call,
+                "tokio::task::spawn_blocking(root_reconcile)",
+                "awaited one-shot blocking reconcile of the root .mcp.json config",
             ),
             (
                 Site::Call,
