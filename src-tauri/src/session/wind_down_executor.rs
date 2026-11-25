@@ -134,19 +134,28 @@
 //! `terminal::graceful_exit::CloseTabResult`. A refusal arrives here as
 //! [`WIND_DOWN_CLOSE_REFUSED`] and is recorded like any other outcome.
 //!
-//! ## Neither arm closes a live session yet (R0a)
+//! ## Only a guard `Close` can close a live session (R0a)
 //!
 //! Plan `2026-10-28-one-session-lifecycle-authority`, Phase 14: the primitive
-//! now requires a close authority once it finds a live `claude`, and only the
-//! lifecycle Closer (Phase 93) will be able to mint one. [`wind_down_exit`]
-//! presents none, so every close of a live session, by the drain arm or by
-//! `finished_close`, is refused before a byte is typed. Each refusal is logged
+//! requires a close authority once it finds a live `claude`. Plan
+//! `2026-11-16-finished-close-mints-its-close-authority-from-the-served-close-conditions`,
+//! Phase 2, makes exactly one caller able to present one: the `finished_close`
+//! arm, and only for a candidate the close guard
+//! ([`finished_close_guard::judge`]) answered `Close` for in the same
+//! iteration of [`close_batch`]. The token ([`finished_close_guard::GuardClose`],
+//! not the authority) is the only thing that flows through [`close_batch`] and
+//! [`CloseEffects::wind_down_one`]. [`wind_down_exit`] checks that its ids are
+//! the close's, then mints the authority immediately before its one
+//! `graceful_exit(` call. The drain arm hands it `None`, so every drain close of
+//! a live session is refused before a byte is typed. Each refusal is logged
 //! `no_close_authority` and recorded as [`WIND_DOWN_NO_CLOSE_AUTHORITY`].
+//! Lifecycle Phase 93 later replaces the guard's body with `decide()`.
 //!
 //! Both arms still run their eligibility, custody and budget logic in full,
 //! and a pane whose `claude` has already left is still handled as
-//! `NoLiveClaude`. The refusal is a narrowing of the primitive, not of this
-//! module.
+//! `NoLiveClaude`. An authority admits a close ATTEMPT, never forces one: the
+//! primitive's own refusals (a nested `claude`, a child process, a screen not at
+//! an empty prompt, the echo confirmation, the gone-probes) still stand.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -158,7 +167,7 @@ use tracing::{debug, info, warn};
 
 use crate::coord_drain_state::CoordDrainState;
 use crate::session::finished_close::{self, PassPlan, SkipReason};
-use crate::session::finished_close_guard::{self, GuardInputs, GuardVerdict};
+use crate::session::finished_close_guard::{self, GuardClose, GuardInputs, GuardVerdict};
 use crate::session::session_lifecycle_store::{
     SessionLifecycleStore, WIND_DOWN_ARM_DRAIN, WIND_DOWN_ARM_FINISHED_CLOSE, WIND_DOWN_CLOSED,
     WIND_DOWN_CLOSE_REFUSED, WIND_DOWN_CLOSE_UNKNOWN, WIND_DOWN_EXIT_STUCK,
@@ -170,6 +179,7 @@ use crate::session::wind_down_observer::{
     self, CustodyProbe, GitCustodyProbe, OwnershipRead, SessionCustodyContext,
 };
 use crate::settings::FinishedSessionClose;
+use crate::terminal::close_authority::CloseAuthority;
 use crate::terminal::graceful_exit::{ChildExemptions, GracefulExitOutcome};
 use crate::terminal::TerminalManager;
 use qontinui_runner_lib::wind_down::{
@@ -777,10 +787,11 @@ pub fn outcome_word(outcome: &GracefulExitOutcome) -> Option<&'static str> {
             Some(WIND_DOWN_NOT_ATTEMPTED)
         }
         // Nothing was typed here either, and it IS recorded. It is the
-        // refusal of a close this executor attempted on a live session, and the
-        // one read-back that the close-authority gate (R0a) is armed on this
-        // box: until the lifecycle Closer mints authorities, every close of a
-        // live session lands here.
+        // refusal of a close this executor attempted on a live session without
+        // an authority, and the one read-back that the close-authority gate
+        // (R0a) is armed on this box: a drain-arm close of a live session, and
+        // a `finished_close` close the guard did not answer `Close` for, land
+        // here.
         GracefulExitOutcome::NoCloseAuthority { .. } => Some(WIND_DOWN_NO_CLOSE_AUTHORITY),
         // These two return before anything is typed, so nothing happened to the
         // session and nothing is claimed.
@@ -842,15 +853,15 @@ pub fn claude_left(outcome: &GracefulExitOutcome) -> bool {
 
 /// PURE: does a close under `arm` record strays to present as child
 /// exemptions? Only [`CloseArm::FinishedClose`], and only while
-/// [`WIND_DOWN_PRESENTS_CLOSE_AUTHORITY`] is true.
+/// [`STRAY_EXEMPTION_ADMITTED`] is true.
 fn records_strays(arm: CloseArm) -> bool {
-    records_strays_when(arm, WIND_DOWN_PRESENTS_CLOSE_AUTHORITY)
+    records_strays_when(arm, STRAY_EXEMPTION_ADMITTED)
 }
 
 /// [`records_strays`] with the constant as a parameter, so a test can also
-/// judge the arm as it will be once the exit presents an authority.
-fn records_strays_when(arm: CloseArm, presents_close_authority: bool) -> bool {
-    arm == CloseArm::FinishedClose && presents_close_authority
+/// judge the arm as it will be once a served clause admits strays.
+fn records_strays_when(arm: CloseArm, stray_exemption_admitted: bool) -> bool {
+    arm == CloseArm::FinishedClose && stray_exemption_admitted
 }
 
 /// PURE: the `claude` pids a close of `session_id` under `arm` records strays
@@ -1753,12 +1764,19 @@ pub(crate) trait CloseEffects {
     ///
     /// `arm` is the arm closing it: only [`CloseArm::FinishedClose`] may record
     /// strays and present them as child exemptions, and only while
-    /// [`WIND_DOWN_PRESENTS_CLOSE_AUTHORITY`] is true.
+    /// [`STRAY_EXEMPTION_ADMITTED`] is true.
+    ///
+    /// `guard` is the close guard's `Close` token for exactly this candidate,
+    /// or `None`. It is the TOKEN that flows here, never the authority: the one
+    /// authority is minted from it inside [`wind_down_exit`], at the one call of
+    /// the primitive. `None` for the drain arm, and for any `finished_close`
+    /// candidate the guard did not answer `Close` for.
     async fn wind_down_one(
         &self,
         arm: CloseArm,
         session_id: &str,
         terminal_id: &str,
+        guard: Option<GuardClose>,
     ) -> Result<GracefulExitOutcome, String>;
     /// What kind of session this pane holds, and — for a steward — which kind
     /// of steward. Reads, not effects, but they come from the pass and the
@@ -1832,8 +1850,12 @@ pub(crate) trait CloseEffects {
 /// (`close guard: would mint | held <reason> | unknown <reason>`, with every
 /// input) and published as `windDown.closeGuard`, BEFORE the shadow branch, so
 /// a shadow-mode arm logs it too. Anything but `Close` makes no close attempt.
-/// A `Close` proceeds to today's [`CloseEffects::wind_down_one`], which still
-/// presents no close authority (Phase 2 mints).
+/// A `Close` hands its [`GuardClose`] token, straight from the verdict and for
+/// this candidate alone, to [`CloseEffects::wind_down_one`]; [`wind_down_exit`]
+/// mints the close authority from it (plan Phase 2). The token is never kept
+/// across candidates and never handed to the drain arm, and a shadow-mode arm
+/// drops it unused. A `Held` or `Unknown` verdict produces no token, so nothing
+/// can be minted for it.
 ///
 /// In `shadow`, every one of those checks still runs, and the close is logged
 /// instead of made. `graceful_exit`'s own refusals (a child process, a nested
@@ -1861,9 +1883,11 @@ pub(crate) async fn close_batch<E: CloseEffects + Sync>(
             }
             return outcomes;
         }
-        let custody = if arm == CloseArm::FinishedClose {
+        let (custody, guard) = if arm == CloseArm::FinishedClose {
             // Every input read for THIS close, in the order above, then the
-            // guard. Nothing past this point can be closed without it.
+            // guard. Nothing past this point can be closed without it, and the
+            // token it answers `Close` with is the only way to present a close
+            // authority.
             let (verdict, arms, custody) =
                 guard_one_close(effects, index, &session_id, &terminal_id).await;
             let judged_at_ms = Utc::now().timestamp_millis();
@@ -1873,9 +1897,7 @@ pub(crate) async fn close_batch<E: CloseEffects + Sync>(
                 finished_close_guard::view(&verdict, &arms, judged_at_ms),
             ));
             match verdict {
-                // Phase 1 is shadow: the token is judged and dropped, and the
-                // close below still presents no close authority.
-                GuardVerdict::Close(_) => custody,
+                GuardVerdict::Close(token) => (custody, Some(token)),
                 GuardVerdict::Held(r) | GuardVerdict::Unknown(r) => {
                     outcomes.push(outcome_for_guard_arm(r.arm));
                     continue;
@@ -1898,7 +1920,7 @@ pub(crate) async fn close_batch<E: CloseEffects + Sync>(
                 outcomes.push(CandidateOutcome::NoLongerEligible);
                 continue;
             }
-            None
+            (None, None)
         };
         if arm == CloseArm::FinishedClose {
             // The guard's reads can take most of a minute (coord obligations,
@@ -1918,11 +1940,15 @@ pub(crate) async fn close_batch<E: CloseEffects + Sync>(
             }
         }
         if admission == Admission::Shadow {
+            // The token is dropped unused: a shadow close mints nothing.
             effects.would_close(&session_id, &terminal_id, custody.as_ref());
             outcomes.push(CandidateOutcome::Shadowed);
             continue;
         }
-        let outcome = match effects.wind_down_one(arm, &session_id, &terminal_id).await {
+        let outcome = match effects
+            .wind_down_one(arm, &session_id, &terminal_id, guard)
+            .await
+        {
             Ok(outcome) => outcome,
             Err(e) => {
                 warn!(session_id = %session_id, terminal_id = %terminal_id, error = %e, "wind_down_executor: graceful exit could not start");
@@ -2069,36 +2095,51 @@ fn log_guard(
 }
 
 /// Does [`wind_down_exit`] present a close authority to the graceful exit?
-/// `false`: it passes `None`, because no production code can mint one until
-/// the lifecycle Closer does (plan `2026-10-28-one-session-lifecycle-authority`,
-/// Phase 93). So every exit that finds a live `claude` is refused
-/// `no_close_authority` BEFORE the child gate, and any strays recorded for that
-/// gate could never be used.
+/// `true`: it mints one, from the close guard's `Close` token, for the one
+/// `finished_close` close that token was judged for, and presents `None` for
+/// every other call (the drain arm, and any candidate the guard did not answer
+/// `Close` for). A source tripwire pins the argument: the module's one
+/// `graceful_exit(` call passes `guard.map(CloseAuthority::for_finished_close)`
+/// exactly while this is `true`, and the source scan in `runner_close_sites.rs`
+/// pins the one constructor and the one minter.
 ///
-/// The `finished_close` arm therefore records strays (a bounded `/proc` walk)
-/// only while this is `true` (plan
-/// `2026-11-08-wind-down-exempts-proven-strays-from-graceful-exit-child-refusal`,
-/// D4). A source tripwire pins the pairing: the module's one `graceful_exit(`
-/// call passes `None` exactly when this is `false`, so handing `wind_down_exit`
-/// an authority without flipping it is red, and flipping it turns the recording
-/// back on. Whoever flips it must first read served `finished-criteria`
-/// condition 2 (coord question `9b74628d`).
-pub const WIND_DOWN_PRESENTS_CLOSE_AUTHORITY: bool = false;
+/// This constant no longer gates stray recording: that is
+/// [`STRAY_EXEMPTION_ADMITTED`], which stays `false`.
+pub const WIND_DOWN_PRESENTS_CLOSE_AUTHORITY: bool = true;
+
+/// May the `finished_close` arm record the stray background shells a pane
+/// leaves behind and present them to the graceful exit as child exemptions
+/// (plan `2026-11-08-wind-down-exempts-proven-strays-from-graceful-exit-child-refusal`)?
+/// `false`: served policy `finished-criteria` condition 2 admits only
+/// `classify_child`'s shim or pump as a child that does not hold a session
+/// open, and coord question `9b74628d` (whether a stray wait loop is admitted
+/// too) is still open. Until a served clause admits strays, every stray counts
+/// as a child, the primitive refuses the close, and no `/proc` walk is made.
+///
+/// Separate from [`WIND_DOWN_PRESENTS_CLOSE_AUTHORITY`] on purpose: presenting
+/// an authority admits a close attempt and must not widen what the child gate
+/// leaves out. Whoever flips this must first read the served clause.
+pub const STRAY_EXEMPTION_ADMITTED: bool = false;
 
 /// The ONE way this module reaches a pane: `TerminalManager::graceful_exit`,
-/// presenting NO close authority, then the log line for what it answered.
+/// then the log line for what it answered. It is also the ONE minter of a
+/// close authority.
 ///
-/// See [`WIND_DOWN_PRESENTS_CLOSE_AUTHORITY`], which states that fact as a
-/// constant the stray recording is gated on.
+/// `guard` is the close guard's `Close` token for this candidate, or `None`.
+/// With a token this fn first checks that it was judged for THIS session and
+/// THIS pane and that the arm is [`CloseArm::FinishedClose`], and refuses
+/// (`Err`, so nothing is typed and the candidate is recorded `ExitNotStarted`)
+/// otherwise. It then mints the authority immediately before the one
+/// `graceful_exit(` call, by consuming the token. With `None` the primitive is
+/// handed no authority, so on any pane where the probe finds a live `claude` it
+/// refuses `no_close_authority` before typing a byte: that is the drain arm,
+/// whatever its eligibility verdict and custody gate said, and nothing in this
+/// module can relax it, because the check lives in the primitive. A pane whose
+/// `claude` is already gone still answers `NoLiveClaude`, untouched.
 ///
-/// No authority, because this executor has none to present. The lifecycle
-/// Closer is the only minter, and it does not exist until Phase 93 (plan
-/// `2026-10-28-one-session-lifecycle-authority`, R0a). So on any pane where the
-/// probe finds a live `claude`, the primitive refuses `no_close_authority`
-/// before typing a byte. That holds under EITHER arm, whatever the eligibility
-/// verdict and the custody gate said, and nothing in this module can relax it,
-/// because the check lives in the primitive. A pane whose `claude` is already
-/// gone still answers `NoLiveClaude`, untouched.
+/// An authority admits a close attempt and never forces one. The primitive
+/// still refuses a nested `claude`, a child process that is not exempt, a
+/// screen not at an empty prompt, and an `/exit` it cannot confirm.
 ///
 /// It is its own fn rather than inline in [`LiveCloseEffects`], so the per-arm
 /// tests can enter through [`close_batch`] and reach THIS code, and the real
@@ -2107,8 +2148,8 @@ pub const WIND_DOWN_PRESENTS_CLOSE_AUTHORITY: bool = false;
 ///
 /// `exempt` is the child-gate policy handed through to the primitive (plan
 /// `2026-11-08-wind-down-exempts-proven-strays-from-graceful-exit-child-refusal`):
-/// the strays the `finished_close` arm recorded, or none. It cannot get a close
-/// past the missing authority above; the primitive checks that first.
+/// the `finished_close` arm's shim-or-pump class, plus recorded strays only
+/// while [`STRAY_EXEMPTION_ADMITTED`]. An authority does not widen it.
 pub(crate) async fn wind_down_exit(
     manager: &Arc<TerminalManager>,
     arm: CloseArm,
@@ -2116,9 +2157,30 @@ pub(crate) async fn wind_down_exit(
     terminal_id: &str,
     kind: SessionKind,
     exempt: ChildExemptions,
+    guard: Option<GuardClose>,
 ) -> Result<GracefulExitOutcome, String> {
+    if let Some(proof) = &guard {
+        if arm != CloseArm::FinishedClose {
+            return Err(format!(
+                "refused: a close guard token was presented under the {} arm, which presents none",
+                arm.word()
+            ));
+        }
+        if proof.session_id() != session_id || proof.terminal_id() != terminal_id {
+            return Err(format!(
+                "refused: the close guard judged session {} in pane {}, not session {session_id} in pane {terminal_id}",
+                proof.session_id(),
+                proof.terminal_id()
+            ));
+        }
+    }
     let outcome = manager
-        .graceful_exit(terminal_id, EXIT_DEADLINE, None, exempt)
+        .graceful_exit(
+            terminal_id,
+            EXIT_DEADLINE,
+            guard.map(CloseAuthority::for_finished_close),
+            exempt,
+        )
         .await?;
     match &outcome {
         GracefulExitOutcome::Exited { .. } => {
@@ -2132,8 +2194,9 @@ pub(crate) async fn wind_down_exit(
             pids = ?claude_pids,
             outcome = WIND_DOWN_NO_CLOSE_AUTHORITY,
             "wind_down_executor: refused no_close_authority — a live claude is in the pane and \
-             no close authority can be presented before the lifecycle Closer exists; nothing \
-             typed, nothing closed, the session is still running"
+             no close authority was presented (the drain arm presents none, and the close \
+             guard did not answer Close for this session); nothing typed, nothing closed, the \
+             session is still running"
         ),
         other => {
             warn!(session_id = %session_id, terminal_id = %terminal_id, ?kind, arm = arm.word(), outcome = ?other, "wind_down_executor: not closed");
@@ -2336,6 +2399,7 @@ impl CloseEffects for LiveCloseEffects<'_> {
         arm: CloseArm,
         session_id: &str,
         terminal_id: &str,
+        guard: Option<GuardClose>,
     ) -> Result<GracefulExitOutcome, String> {
         let kind = self.observed.kind_for(terminal_id);
         let observation = self.observed.observation_for(terminal_id);
@@ -2361,16 +2425,16 @@ impl CloseEffects for LiveCloseEffects<'_> {
         // Only the panes the pass discounted a stray from: every other close reads
         // nothing extra. A shell not discounted there was work, and this close
         // would not have been admitted. And only for the `finished_close` arm,
-        // the population the policy names, while the exit presents an authority:
-        // without one the exit is refused before the child gate, and the walk
-        // would buy nothing (D4).
+        // the population the policy names, and only while a served clause admits
+        // strays at all (`STRAY_EXEMPTION_ADMITTED`).
         let presents_strays = records_strays(arm);
         let claudes = stray_claudes(arm, &self.pass.report.terminal_hosted, session_id);
         let manager = &self.manager;
         exit_ending_strays(
             crate::session::stray_wait::record_strays(claudes),
             // The ONE way this module reaches a pane. Never `TerminalManager::close`.
-            |recorded: &Vec<crate::session::stray_wait::RecordedStray>| {
+            // `move`: the exit runs once, and it consumes the guard token.
+            move |recorded: &Vec<crate::session::stray_wait::RecordedStray>| {
                 wind_down_exit(
                     manager,
                     arm,
@@ -2378,6 +2442,7 @@ impl CloseEffects for LiveCloseEffects<'_> {
                     terminal_id,
                     kind,
                     arm_exemptions(arm, stray_exemptions(presents_strays, recorded)),
+                    guard,
                 )
             },
             crate::session::stray_wait::end_strays,
@@ -3159,8 +3224,21 @@ mod tests {
         transcripts: HashMap<String, Result<TranscriptFacts, String>>,
         /// Every set of close-guard verdicts published, in order.
         guards: std::sync::Mutex<Vec<Vec<(String, wind_down::CloseGuardView)>>>,
+        /// What every `wind_down_one` was handed: the arm, the terminal, and
+        /// the `(session, terminal)` the close guard token was judged for.
+        tokens: std::sync::Mutex<Vec<SeenToken>>,
         calls: std::sync::Mutex<Vec<String>>,
         admission_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    /// One `wind_down_one` call: the arm, the terminal id, and the token's ids.
+    type SeenToken = (CloseArm, String, Option<(String, String)>);
+
+    /// The ids a guard token was judged for.
+    fn token_ids(guard: &Option<GuardClose>) -> Option<(String, String)> {
+        guard
+            .as_ref()
+            .map(|g| (g.session_id().to_string(), g.terminal_id().to_string()))
     }
 
     impl RecordingEffects {
@@ -3175,9 +3253,13 @@ mod tests {
                 messages: HashMap::new(),
                 transcripts: HashMap::new(),
                 guards: std::sync::Mutex::new(Vec::new()),
+                tokens: std::sync::Mutex::new(Vec::new()),
                 calls: std::sync::Mutex::new(Vec::new()),
                 admission_calls: std::sync::atomic::AtomicUsize::new(0),
             }
+        }
+        fn tokens(&self) -> Vec<SeenToken> {
+            self.tokens.lock().unwrap().clone()
         }
         fn messages(
             mut self,
@@ -3345,9 +3427,10 @@ mod tests {
     }
 
     /// D4 and D3: strays are recorded and presented ONLY for `finished_close`,
-    /// and only while the exit presents an authority. Today it does not
-    /// (`WIND_DOWN_PRESENTS_CLOSE_AUTHORITY` is false, pinned by the tripwire
-    /// below), so no arm records anything and every exit presents no exemption.
+    /// and only while a served clause admits strays
+    /// (`STRAY_EXEMPTION_ADMITTED`, which is false). Presenting a close
+    /// authority is a different constant and does not turn it on, so no arm
+    /// records anything and every exit presents no stray exemption.
     #[test]
     fn only_an_authorized_finished_close_records_or_presents_strays() {
         let stray = crate::session::stray_wait::RecordedStray {
@@ -3360,11 +3443,21 @@ mod tests {
             !records_strays(CloseArm::Drain),
             "the drain arm never records"
         );
+        assert!(
+            !STRAY_EXEMPTION_ADMITTED,
+            "served finished-criteria condition 2 (coord question 9b74628d) has not admitted strays"
+        );
+        assert!(
+            WIND_DOWN_PRESENTS_CLOSE_AUTHORITY,
+            "the finished_close arm presents a close authority"
+        );
         assert_eq!(
             records_strays(CloseArm::FinishedClose),
-            WIND_DOWN_PRESENTS_CLOSE_AUTHORITY,
-            "finished_close records exactly when the exit presents an authority"
+            STRAY_EXEMPTION_ADMITTED,
+            "finished_close records exactly when a served clause admits strays, whether or not \
+             the exit presents an authority"
         );
+        assert!(!records_strays(CloseArm::FinishedClose));
         assert!(stray_exemptions(false, std::slice::from_ref(&stray)).is_empty());
         assert_eq!(
             stray_exemptions(true, std::slice::from_ref(&stray)),
@@ -3382,15 +3475,15 @@ mod tests {
         let hosted = vec![mine, theirs, quiet];
 
         // Production: the drain arm never walks, and neither does
-        // finished_close while the exit presents no authority.
+        // finished_close while no served clause admits strays — although its
+        // exit now presents a close authority.
         assert!(stray_claudes(CloseArm::Drain, &hosted, "s1").is_empty());
-        assert_eq!(
+        assert!(
             stray_claudes(CloseArm::FinishedClose, &hosted, "s1").is_empty(),
-            !WIND_DOWN_PRESENTS_CLOSE_AUTHORITY,
-            "while no authority is presented, finished_close records nothing"
+            "while strays are not admitted, finished_close records nothing"
         );
 
-        // As it will be once an authority is presented: finished_close walks
+        // As it will be once a served clause admits strays: finished_close walks
         // exactly this session's stray-holding pane; the drain arm still never.
         assert!(!records_strays_when(CloseArm::Drain, true));
         assert!(!records_strays_when(CloseArm::FinishedClose, false));
@@ -3463,11 +3556,15 @@ mod tests {
     }
 
     /// D4's tripwire: the module's ONE `graceful_exit(` call presents an
-    /// authority exactly when [`WIND_DOWN_PRESENTS_CLOSE_AUTHORITY`] says so.
-    /// Handing `wind_down_exit` an authority without flipping the constant,
-    /// or flipping it without handing one, is red.
+    /// authority exactly when [`WIND_DOWN_PRESENTS_CLOSE_AUTHORITY`] says so,
+    /// and the authority is `guard.map(CloseAuthority::for_finished_close)`:
+    /// minted from the close guard's token, once, at that call. Handing
+    /// `wind_down_exit` an authority any other way without changing the
+    /// constant, or flipping it without handing one, is red; so is a second
+    /// mint anywhere in the module's executable lines.
     #[test]
-    fn the_one_graceful_exit_call_passes_none_exactly_when_no_authority_is_presented() {
+    fn the_one_graceful_exit_call_passes_the_guard_minted_authority_exactly_when_one_is_presented()
+    {
         let executor = executable_lines(include_str!("wind_down_executor.rs"));
         let calls: Vec<&str> = executor.split(".graceful_exit(").skip(1).collect();
         assert_eq!(calls.len(), 1, "exactly one graceful_exit call");
@@ -3500,12 +3597,64 @@ mod tests {
             "graceful_exit(id, deadline, authority, exemptions): {args:?}"
         );
         assert_eq!(
-            args[2] == "None",
-            !WIND_DOWN_PRESENTS_CLOSE_AUTHORITY,
+            args[2] == "guard.map(CloseAuthority::for_finished_close)",
+            WIND_DOWN_PRESENTS_CLOSE_AUTHORITY,
             "the authority argument is `{}` while WIND_DOWN_PRESENTS_CLOSE_AUTHORITY is {}",
             args[2],
             WIND_DOWN_PRESENTS_CLOSE_AUTHORITY
         );
+        assert!(
+            args[2] == "None" || args[2] == "guard.map(CloseAuthority::for_finished_close)",
+            "the authority argument may only be `None` or the guard-minted one: {}",
+            args[2]
+        );
+        assert_eq!(
+            executor
+                .matches("CloseAuthority::for_finished_close")
+                .count(),
+            1,
+            "the executor mints a close authority exactly once, at its one graceful_exit call"
+        );
+        // The token, not the authority, is what flows through the batch driver and
+        // the trait: the type is named nowhere in either, and the drain arm's
+        // branch of `close_batch` hands `wind_down_one` no token.
+        for (name, body) in [
+            (
+                "close_batch",
+                fn_body(&executor, "pub(crate) async fn close_batch<"),
+            ),
+            (
+                "CloseEffects",
+                fn_body(&executor, "pub(crate) trait CloseEffects {"),
+            ),
+        ] {
+            assert!(
+                !body.contains("CloseAuthority"),
+                "{name} names CloseAuthority — only the token may flow through it"
+            );
+        }
+        let batch = fn_body(&executor, "pub(crate) async fn close_batch<");
+        assert!(
+            batch.contains("(None, None)")
+                && batch.contains("GuardVerdict::Close(token) => (custody, Some(token))"),
+            "close_batch no longer keeps the token only on the guard's Close arm and passes none \
+             on the drain arm"
+        );
+    }
+
+    /// The text of the item that opens with `head`, up to the next line that
+    /// starts a top-level item (a line that begins in column 0 with `}`).
+    fn fn_body<'a>(executable: &'a str, head: &str) -> &'a str {
+        let start = executable
+            .find(head)
+            .unwrap_or_else(|| panic!("`{head}` is gone from the executor"));
+        // `str::get` rather than indexing: both offsets come from `find`, so
+        // they sit on char boundaries, but `clippy::string_slice` is denied.
+        let rest = executable
+            .get(start..)
+            .expect("`find` returns a char boundary");
+        let end = rest.find("\n}\n").map_or(rest.len(), |i| i + 3);
+        rest.get(..end).expect("`find` returns a char boundary")
     }
 
     fn exited() -> GracefulExitOutcome {
@@ -3597,11 +3746,16 @@ mod tests {
         }
         async fn wind_down_one(
             &self,
-            _arm: CloseArm,
+            arm: CloseArm,
             _session_id: &str,
             terminal_id: &str,
+            guard: Option<GuardClose>,
         ) -> Result<GracefulExitOutcome, String> {
             self.log(format!("exit:{terminal_id}"));
+            self.tokens
+                .lock()
+                .unwrap()
+                .push((arm, terminal_id.to_string(), token_ids(&guard)));
             match self.outcomes.get(terminal_id) {
                 Some(Ok(outcome)) => Ok(outcome.clone()),
                 Some(Err(e)) => Err(e.clone()),
@@ -3873,11 +4027,25 @@ mod tests {
     /// whose EXIT is the production [`wind_down_exit`], run against a real
     /// `TerminalManager`. Through it, a test enters an arm's own batch driver
     /// ([`close_batch`]) and reaches the real primitive.
+    ///
+    /// Every close-guard input answers `ok` unless a test sets it, so a
+    /// `finished_close` candidate reaches a guard `Close` by default.
     struct ManagerEffects {
         manager: Arc<TerminalManager>,
         recorded: std::sync::Mutex<Vec<(CloseArm, String, Option<&'static str>)>>,
         outcomes: std::sync::Mutex<Vec<GracefulExitOutcome>>,
         claude_seen: std::sync::Mutex<Vec<String>>,
+        /// The `(session, terminal)` ids of the guard token each
+        /// `wind_down_one` was handed (`None`: it was handed no token).
+        tokens: std::sync::Mutex<Vec<Option<(String, String)>>>,
+        /// The guard's inputs, as the re-checks answer them.
+        view: Option<wind_down::WindDownView>,
+        custody: CustodyVerdict,
+        obligations: ObligationsRead,
+        messages: Result<Vec<finished_close_guard::PendingMessage>, String>,
+        transcript: Result<TranscriptFacts, String>,
+        /// The strays the close recorded, handed to the exit's child gate.
+        strays: Vec<crate::session::stray_wait::RecordedStray>,
     }
 
     impl ManagerEffects {
@@ -3887,6 +4055,13 @@ mod tests {
                 recorded: std::sync::Mutex::default(),
                 outcomes: std::sync::Mutex::default(),
                 claude_seen: std::sync::Mutex::default(),
+                tokens: std::sync::Mutex::default(),
+                view: Some(finished_and_idle()),
+                custody: CustodyVerdict::Clean,
+                obligations: watched_read(),
+                messages: Ok(Vec::new()),
+                transcript: Ok(quiet_facts()),
+                strays: Vec::new(),
             }
         }
     }
@@ -3909,26 +4084,26 @@ mod tests {
             _session_id: &str,
             _terminal_id: &str,
         ) -> Option<wind_down::WindDownView> {
-            Some(finished_and_idle())
+            self.view.clone()
         }
         async fn recheck_custody(&self, _session_id: &str, _terminal_id: &str) -> CustodyJudged {
-            CustodyVerdict::Clean.into()
+            self.custody.clone().into()
         }
         async fn recheck_obligations(&self, _session_id: &str) -> ObligationsRead {
-            watched_read()
+            self.obligations.clone()
         }
         async fn undelivered_messages(
             &self,
             _session_id: &str,
         ) -> Result<Vec<finished_close_guard::PendingMessage>, String> {
-            Ok(Vec::new())
+            self.messages.clone()
         }
         async fn transcript_facts(
             &self,
             _session_id: &str,
             _finished_at_ms: Option<i64>,
         ) -> Result<TranscriptFacts, String> {
-            Ok(quiet_facts())
+            self.transcript.clone()
         }
         fn publish_close_guards(&self, _views: &[(String, wind_down::CloseGuardView)]) {}
         fn would_close(&self, _session_id: &str, terminal_id: &str, _: Option<&CustodyVerdict>) {
@@ -3939,14 +4114,17 @@ mod tests {
             arm: CloseArm,
             session_id: &str,
             terminal_id: &str,
+            guard: Option<GuardClose>,
         ) -> Result<GracefulExitOutcome, String> {
+            self.tokens.lock().unwrap().push(token_ids(&guard));
             wind_down_exit(
                 &self.manager,
                 arm,
                 session_id,
                 terminal_id,
                 SessionKind::Terminal,
-                arm_exemptions(arm, stray_exemptions(records_strays(arm), &[])),
+                arm_exemptions(arm, stray_exemptions(records_strays(arm), &self.strays)),
+                guard,
             )
             .await
         }
@@ -3984,7 +4162,8 @@ mod tests {
     /// production [`wind_down_exit`], and is REFUSED `no_close_authority`:
     /// nothing typed, nothing killed, the pane still registered. The refusal is
     /// recorded under the arm's word, and the probe's evidence still latches
-    /// `claude_seen`.
+    /// `claude_seen`. `effects` scripts the guard's inputs, so a `finished_close`
+    /// caller can be the one the guard did not answer `Close` for.
     async fn assert_arm_is_refused_without_a_close_authority(arm: CloseArm) {
         let pane = crate::terminal::session::tests::live_claude_pane();
         let manager = Arc::new(TerminalManager::new());
@@ -3997,6 +4176,11 @@ mod tests {
             &effects,
         )
         .await;
+        assert_eq!(
+            *effects.tokens.lock().unwrap(),
+            vec![None],
+            "{arm:?}: the exit was handed a guard token it was not entitled to"
+        );
 
         assert_eq!(outcomes, vec![CandidateOutcome::Attempted], "{arm:?}");
         assert_eq!(
@@ -4037,12 +4221,282 @@ mod tests {
         assert_arm_is_refused_without_a_close_authority(CloseArm::Drain).await;
     }
 
-    /// runner#2426's arm (default `On`, no drain needed). R0a refuses it like
-    /// every other caller until the Closer mints authorities.
-    #[tokio::test(start_paused = true)]
-    async fn the_finished_close_arm_is_refused_no_close_authority_on_a_finished_session_with_zero_children(
+    /// The scripted `claude` of `pane` leaves as soon as `/exit` has been typed
+    /// into it, which is what lets the real primitive run to `Exited`. Gives up
+    /// after ten virtual seconds without `/exit`, so a close that never types it
+    /// fails its test instead of hanging it.
+    async fn claude_leaves_once_exit_is_typed(
+        pane: &crate::terminal::session::tests::ScriptedPane,
     ) {
-        assert_arm_is_refused_without_a_close_authority(CloseArm::FinishedClose).await;
+        for _ in 0..1_000 {
+            if pane.typed().ends_with(b"/exit\r") {
+                pane.claude_leaves();
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// runner#2426's arm (default `On`, no drain needed), on a session its
+    /// guard answers `Close` for: the same pane the drain arm is refused on is
+    /// ADMITTED, because the arm mints its authority from the guard's token.
+    /// `/exit` is typed, the exit is not refused `no_close_authority`, and the
+    /// token it was handed was judged for exactly this session and pane.
+    ///
+    /// The scripted `claude` leaves once `/exit` is typed, so the real primitive
+    /// runs to `Exited` and removes the pane.
+    #[tokio::test(start_paused = true)]
+    async fn a_guard_close_on_a_finished_session_with_zero_children_reaches_exited() {
+        let pane = crate::terminal::session::tests::live_claude_pane();
+        let manager = Arc::new(TerminalManager::new());
+        manager.insert_for_test("t-finished", pane.session.clone());
+        let effects = ManagerEffects::new(manager.clone());
+
+        let leaves = claude_leaves_once_exit_is_typed(&pane);
+        let (outcomes, ()) = tokio::join!(
+            close_batch(
+                CloseArm::FinishedClose,
+                vec![("s-finished".to_string(), "t-finished".to_string())],
+                &effects,
+            ),
+            leaves
+        );
+
+        assert_eq!(outcomes, vec![CandidateOutcome::Attempted]);
+        assert_eq!(
+            *effects.tokens.lock().unwrap(),
+            vec![Some(("s-finished".to_string(), "t-finished".to_string()))],
+            "the token was judged for this session and this pane"
+        );
+        let outcomes = effects.outcomes.lock().unwrap().clone();
+        assert!(
+            matches!(outcomes.as_slice(), [GracefulExitOutcome::Exited { .. }]),
+            "a guard Close on a childless live claude must reach Exited: {outcomes:?}"
+        );
+        assert_eq!(pane.typed(), b"/exit\r");
+        assert_eq!(
+            *effects.recorded.lock().unwrap(),
+            vec![(
+                CloseArm::FinishedClose,
+                "s-finished".to_string(),
+                Some(WIND_DOWN_CLOSED)
+            )]
+        );
+        assert!(
+            manager.get("t-finished").is_none(),
+            "an exited pane is removed"
+        );
+    }
+
+    /// Every guard cell that is not `ok` — each arm held, each arm unknown —
+    /// produces NO token, so the real primitive is never reached for it:
+    /// nothing is typed, nothing is killed, no exit result is recorded, and
+    /// the pane stays registered. A mutation that hands the exit a token for a
+    /// `Held` or `Unknown` verdict types `/exit` into the pane and turns this
+    /// red.
+    #[tokio::test(start_paused = true)]
+    async fn no_held_or_unknown_guard_cell_reaches_the_primitive_or_types_anything() {
+        use finished_close_guard::PendingMessage;
+        type Cell = (&'static str, fn(&mut ManagerEffects));
+        let cells: Vec<Cell> = vec![
+            ("eligibility held", |e| e.view = Some(view("not_yet"))),
+            ("eligibility unknown", |e| e.view = None),
+            ("custody held", |e| {
+                e.custody = CustodyVerdict::Dirty(CustodyDirty::Uncommitted {
+                    path: "/ws/a".to_string(),
+                })
+            }),
+            ("custody unknown", |e| {
+                e.custody = CustodyVerdict::Unknown(CustodyUnknown::ProbeFailed {
+                    path: "/ws/b".to_string(),
+                    detail: "git status timed out".to_string(),
+                })
+            }),
+            ("obligations held", |e| e.obligations = unwatched()),
+            ("obligations unknown", |e| {
+                e.obligations = Err("coord unreachable".to_string())
+            }),
+            ("first_verdict held", |e| e.obligations = pr_waiting_on_ci()),
+            ("revival held", |e| {
+                e.transcript = Ok(TranscriptFacts {
+                    last_prompt_ms: Some(FINISHED_AT_MS + 60_000),
+                    ..quiet_facts()
+                })
+            }),
+            ("revival unknown", |e| {
+                e.transcript = Err("no transcript".to_string())
+            }),
+            ("undelivered_messages held", |e| {
+                e.messages = Ok(vec![PendingMessage {
+                    message_id: "m1".to_string(),
+                    to_session: "s-t-finished".to_string(),
+                    owner: Some("s-t-finished".to_string()),
+                }])
+            }),
+            ("undelivered_messages unknown", |e| {
+                e.messages = Err("coord unreachable".to_string())
+            }),
+        ];
+        for (name, set) in cells {
+            let pane = crate::terminal::session::tests::live_claude_pane();
+            let manager = Arc::new(TerminalManager::new());
+            manager.insert_for_test("t-finished", pane.session.clone());
+            let mut effects = ManagerEffects::new(manager.clone());
+            set(&mut effects);
+
+            let outcomes = close_batch(
+                CloseArm::FinishedClose,
+                vec![("s-t-finished".to_string(), "t-finished".to_string())],
+                &effects,
+            )
+            .await;
+
+            assert_eq!(outcomes.len(), 1, "{name}");
+            assert_ne!(outcomes[0], CandidateOutcome::Attempted, "{name}: closed");
+            assert!(
+                effects.tokens.lock().unwrap().is_empty(),
+                "{name}: wind_down_one was called, so a token could have reached the exit"
+            );
+            assert!(
+                effects.outcomes.lock().unwrap().is_empty(),
+                "{name}: the primitive was reached"
+            );
+            assert!(pane.typed().is_empty(), "{name}: typed into a live claude");
+            assert_eq!(pane.kills(), 0, "{name}");
+            assert!(manager.get("t-finished").is_some(), "{name}");
+        }
+    }
+
+    /// The primitive's own refusals stand under a guard `Close`: an authority
+    /// admits a close attempt, never forces one. A pane whose only child is a
+    /// recorded stray still reaches `Refused` for that child, because no served
+    /// clause admits strays ([`STRAY_EXEMPTION_ADMITTED`]) and so none is
+    /// presented, although the exit now presents a close authority.
+    #[tokio::test(start_paused = true)]
+    async fn a_pane_whose_only_child_is_a_recorded_stray_is_refused_under_a_guard_close() {
+        const CHILD: u32 = 5151;
+        let pane = crate::terminal::session::tests::live_claude_pane_with_child(CHILD);
+        let manager = Arc::new(TerminalManager::new());
+        manager.insert_for_test("t-finished", pane.session.clone());
+        let mut effects = ManagerEffects::new(manager.clone());
+        effects.strays = vec![crate::session::stray_wait::RecordedStray {
+            pid: CHILD,
+            start: 1,
+            argv: vec!["bash".to_string()],
+            class: "a".to_string(),
+        }];
+
+        let outcomes = close_batch(
+            CloseArm::FinishedClose,
+            vec![("s-finished".to_string(), "t-finished".to_string())],
+            &effects,
+        )
+        .await;
+
+        assert_eq!(outcomes, vec![CandidateOutcome::Attempted]);
+        assert_eq!(
+            *effects.tokens.lock().unwrap(),
+            vec![Some(("s-finished".to_string(), "t-finished".to_string()))],
+            "the guard answered Close, so the exit was handed the token"
+        );
+        match effects.outcomes.lock().unwrap().as_slice() {
+            [GracefulExitOutcome::Refused { reason, .. }] => assert_eq!(
+                reason, "the claude process has 1 child process(es) attached",
+                "the recorded stray still counts as a child"
+            ),
+            other => panic!("expected the child refusal, got {other:?}"),
+        }
+        assert!(pane.typed().is_empty(), "typed into a live claude");
+        assert_eq!(pane.kills(), 0);
+        assert!(manager.get("t-finished").is_some());
+    }
+
+    /// `wind_down_exit` mints only for the close its token was judged for, and
+    /// only under the `finished_close` arm. Each refusal is an `Err` before the
+    /// primitive is reached: nothing typed, nothing killed, the pane registered.
+    /// And with no token a `finished_close` close is refused `no_close_authority`
+    /// like every other caller.
+    #[tokio::test(start_paused = true)]
+    async fn wind_down_exit_refuses_a_token_for_another_close_or_under_the_drain_arm() {
+        async fn exit(
+            manager: &Arc<TerminalManager>,
+            arm: CloseArm,
+            guard: Option<GuardClose>,
+        ) -> Result<GracefulExitOutcome, String> {
+            wind_down_exit(
+                manager,
+                arm,
+                "s-finished",
+                "t-finished",
+                SessionKind::Terminal,
+                ChildExemptions::none(),
+                guard,
+            )
+            .await
+        }
+        let cases: Vec<(&str, CloseArm, Option<GuardClose>)> = vec![
+            (
+                "a token judged for another session",
+                CloseArm::FinishedClose,
+                Some(GuardClose::for_test("s-other", "t-finished")),
+            ),
+            (
+                "a token judged for another pane",
+                CloseArm::FinishedClose,
+                Some(GuardClose::for_test("s-finished", "t-other")),
+            ),
+            (
+                "a token presented under the drain arm",
+                CloseArm::Drain,
+                Some(GuardClose::for_test("s-finished", "t-finished")),
+            ),
+        ];
+        for (name, arm, guard) in cases {
+            let pane = crate::terminal::session::tests::live_claude_pane();
+            let manager = Arc::new(TerminalManager::new());
+            manager.insert_for_test("t-finished", pane.session.clone());
+            let refused = exit(&manager, arm, guard).await;
+            assert!(
+                refused.as_ref().is_err_and(|e| e.starts_with("refused:")),
+                "{name}: {refused:?}"
+            );
+            assert!(pane.typed().is_empty(), "{name}: typed into a live claude");
+            assert_eq!(pane.kills(), 0, "{name}");
+            assert!(manager.get("t-finished").is_some(), "{name}");
+        }
+
+        // No token: a finished_close close the guard did not answer Close for.
+        let pane = crate::terminal::session::tests::live_claude_pane();
+        let manager = Arc::new(TerminalManager::new());
+        manager.insert_for_test("t-finished", pane.session.clone());
+        let outcome = exit(&manager, CloseArm::FinishedClose, None)
+            .await
+            .expect("the pane is registered");
+        assert_eq!(
+            outcome,
+            GracefulExitOutcome::NoCloseAuthority {
+                claude_pids: pane.claude_pids.clone()
+            }
+        );
+        assert!(pane.typed().is_empty());
+
+        // The matching token under the finished_close arm is admitted.
+        let pane = crate::terminal::session::tests::live_claude_pane();
+        let manager = Arc::new(TerminalManager::new());
+        manager.insert_for_test("t-finished", pane.session.clone());
+        let leaves = claude_leaves_once_exit_is_typed(&pane);
+        let (admitted, ()) = tokio::join!(
+            exit(
+                &manager,
+                CloseArm::FinishedClose,
+                Some(GuardClose::for_test("s-finished", "t-finished")),
+            ),
+            leaves
+        );
+        assert!(
+            matches!(admitted, Ok(GracefulExitOutcome::Exited { .. })),
+            "{admitted:?}"
+        );
     }
 
     /// `claude_was_observed` reads the pids the exit actually saw, so a variant
@@ -5856,11 +6310,26 @@ mod tests {
             ]
         );
 
-        // Every input ok: the guard answers Close and the attempt proceeds.
+        assert!(
+            effects.tokens().is_empty(),
+            "no token reached an exit: {:?}",
+            effects.tokens()
+        );
+
+        // Every input ok: the guard answers Close and the attempt proceeds,
+        // handing the exit the token judged for exactly this candidate.
         let ok = RecordingEffects::new().eligible("t1");
         let outcomes = close_batch(CloseArm::FinishedClose, batch(&["t1"]), &ok).await;
         assert_eq!(outcomes, vec![CandidateOutcome::Attempted]);
         assert!(ok.calls().contains(&"exit:t1".to_string()));
+        assert_eq!(
+            ok.tokens(),
+            vec![(
+                CloseArm::FinishedClose,
+                "t1".to_string(),
+                Some(("s-t1".to_string(), "t1".to_string()))
+            )]
+        );
         assert_eq!(
             ok.guard_words(),
             vec![("s-t1".to_string(), "would_mint", None)]
@@ -5890,6 +6359,66 @@ mod tests {
             vec![
                 ("s-t1".to_string(), "would_mint", None),
                 ("s-t2".to_string(), "held", Some("first_verdict_pending")),
+            ]
+        );
+        assert!(
+            effects.tokens().is_empty(),
+            "a shadow close drops its token: nothing is handed to an exit"
+        );
+    }
+
+    /// The token is per candidate: in a batch the middle candidate is held, and
+    /// each exit is handed the token judged for its own session and pane — never
+    /// another candidate's, never one for the held one.
+    #[tokio::test]
+    async fn each_exit_is_handed_the_token_of_its_own_candidate() {
+        let effects = RecordingEffects::new()
+            .eligible("t1")
+            .eligible("t2")
+            .eligible("t3")
+            .obligations("t2", pr_waiting_on_ci());
+        let outcomes = close_batch(
+            CloseArm::FinishedClose,
+            batch(&["t1", "t2", "t3"]),
+            &effects,
+        )
+        .await;
+        assert_eq!(
+            outcomes,
+            vec![
+                CandidateOutcome::Attempted,
+                CandidateOutcome::GuardHeld,
+                CandidateOutcome::Attempted
+            ]
+        );
+        assert_eq!(
+            effects.tokens(),
+            vec![
+                (
+                    CloseArm::FinishedClose,
+                    "t1".to_string(),
+                    Some(("s-t1".to_string(), "t1".to_string()))
+                ),
+                (
+                    CloseArm::FinishedClose,
+                    "t3".to_string(),
+                    Some(("s-t3".to_string(), "t3".to_string()))
+                ),
+            ]
+        );
+    }
+
+    /// The drain arm presents no token to any exit, whatever its eligibility.
+    #[tokio::test]
+    async fn the_drain_arm_hands_no_exit_a_token() {
+        let effects = RecordingEffects::new().eligible("t2").eligible("t3");
+        close_batch(CloseArm::Drain, batch(&["t1", "t2", "t3"]), &effects).await;
+        assert_eq!(
+            effects.tokens(),
+            vec![
+                (CloseArm::Drain, "t1".to_string(), None),
+                (CloseArm::Drain, "t2".to_string(), None),
+                (CloseArm::Drain, "t3".to_string(), None),
             ]
         );
     }

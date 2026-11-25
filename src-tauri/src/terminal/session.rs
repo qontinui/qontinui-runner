@@ -6490,6 +6490,12 @@ pub(crate) mod tests {
         pub(crate) fn kills(&self) -> usize {
             self.io.kills()
         }
+
+        /// The scripted `claude` exits, as it does once a typed `/exit` is
+        /// honoured: every later probe of the pane finds none.
+        pub(crate) fn claude_leaves(&self) {
+            self._scripted.claude_leaves();
+        }
     }
 
     impl Drop for ScriptedPane {

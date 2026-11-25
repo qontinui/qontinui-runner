@@ -1091,10 +1091,11 @@ impl TerminalManager {
     /// **`authority`** (plan `2026-10-28-one-session-lifecycle-authority`,
     /// Phase 14 / R0a): once the probe has found a live `claude`, and before any
     /// byte is typed into it, a call presenting `None` is refused
-    /// `NoCloseAuthority`, with nothing typed and nothing closed. Nothing in
-    /// production can mint a [`CloseAuthority`] until the lifecycle Closer does
-    /// (Phase 93), so every caller passes `None` today and is refused on any
-    /// pane holding a live `claude`. A bare shell pane still answers
+    /// `NoCloseAuthority`, with nothing typed and nothing closed. Only the
+    /// `finished_close` arm's `wind_down_exit` mints one, from the close guard's
+    /// `Close` token (`CloseAuthority::for_finished_close`); every other caller
+    /// passes `None` and is refused on any pane holding a live `claude`. A bare
+    /// shell pane still answers
     /// `NoLiveClaude`, as before. See [`crate::terminal::close_authority`].
     ///
     /// **`exempt`** (plan

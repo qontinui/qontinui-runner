@@ -48,11 +48,14 @@
 //! ## The close-authority scan
 //!
 //! `terminal::close_authority::CloseAuthority` is what the graceful-exit
-//! primitive requires before it types into a live `claude`. Only the lifecycle
-//! Closer may ever obtain one (Phase 93), and from Phase 16 also the relay's
-//! operator arm. [`AUTHORIZED_MINTERS`] and [`AUTHORIZED_CONSTRUCTORS`] are
-//! empty until then. The scan is an ALLOWLIST. Each rule below is RED on
-//! production code:
+//! primitive requires before it types into a live `claude`. Today exactly one
+//! constructor exists, `CloseAuthority::for_finished_close`, which consumes the
+//! close guard's `GuardClose` token, and exactly one minter calls it, the
+//! `finished_close` arm's `wind_down_exit`. Phase 93 replaces the guard's body
+//! with the lifecycle Closer's `decide()` and keeps both; from Phase 16 the
+//! relay's operator arm may also join. [`AUTHORIZED_MINTERS`] and
+//! [`AUTHORIZED_CONSTRUCTORS`] hold exactly those entries. The scan is an
+//! ALLOWLIST. Each rule below is RED on production code:
 //!
 //! 1. SHAPE. There is one definition, in its own module, with at least one
 //!    field and every field private. Its derives are `Debug` and nothing else,
@@ -72,7 +75,10 @@
 //!    inside `terminal/close_authority.rs` (which rules 1-7 police), on a `use`
 //!    line, as the `authority: Option<…CloseAuthority>` parameter of one of
 //!    [`AUTHORITY_PARAM_FNS`], or inside an authorized minter. A transmute or a
-//!    zeroed value that names the type is therefore red.
+//!    zeroed value that names the type is therefore red. Inside an authorized
+//!    minter the only mention is the path of an authorized constructor
+//!    (`CloseAuthority::for_finished_close`), at most once per fn, so a second
+//!    mint, or any other use of the type there, is red.
 //! 9. Every call of the primitive passes `None` as its authority. The only
 //!    exceptions are a primitive entry point forwarding its own `authority`
 //!    parameter, and an authorized minter. This catches a forged value that
@@ -222,15 +228,20 @@ const AUTHORITY_FILE: &str = "terminal/close_authority.rs";
 const AUTHORITY_TYPE: &str = "CloseAuthority";
 
 /// Production fns that may CONSTRUCT a close authority (a struct literal, or a
-/// fn returning one), as `(file, fn)`. EMPTY until the lifecycle Closer
-/// (Phase 93 / R6) adds its mint here.
-const AUTHORIZED_CONSTRUCTORS: &[(&str, &str)] = &[];
+/// fn returning one), as `(file, fn)`. Exactly one: `for_finished_close`, which
+/// consumes the close guard's `GuardClose` token (plan
+/// `2026-11-16-finished-close-mints-its-close-authority-from-the-served-close-conditions`,
+/// Phase 2). The lifecycle Closer (Phase 93) replaces the guard's body, not this
+/// constructor.
+const AUTHORIZED_CONSTRUCTORS: &[(&str, &str)] =
+    &[("terminal/close_authority.rs", "for_finished_close")];
 
 /// Production fns that may OBTAIN a close authority by calling a constructor,
-/// as `(file, fn)`. EMPTY until the lifecycle Closer (Phase 93 / R6). From
+/// as `(file, fn)`. Exactly one: the `finished_close` arm's `wind_down_exit`,
+/// which mints once, immediately before its one `graceful_exit(` call. From
 /// Phase 16 the relay's operator arm may join it, for an end that carries the
 /// relay's `origin: user_session` stamp.
-const AUTHORIZED_MINTERS: &[(&str, &str)] = &[];
+const AUTHORIZED_MINTERS: &[(&str, &str)] = &[("session/wind_down_executor.rs", "wind_down_exit")];
 
 /// The only derive a close authority may carry. Anything else may build or
 /// duplicate one (`Default`, `Clone`, `Copy`, `Deserialize`, …), so the list is
@@ -1505,6 +1516,9 @@ struct AuthorityScan {
     violations: Vec<String>,
     /// Rule 8's allowed `authority` parameter mentions, as `file:fn`.
     param_mentions: Vec<String>,
+    /// Rule 8's mints inside authorized minters: one `file:fn` per mention of an
+    /// authorized constructor's path, so a test can prove the one mint was seen.
+    minter_calls: Vec<String>,
     /// Rule 9's primitive calls that pass `None`, as `file:fn`.
     none_calls: Vec<String>,
     /// Rule 9's primitive calls through which an entry point forwards its own
@@ -1913,6 +1927,7 @@ fn literal_violations(p: &Prepared, names: &BTreeSet<String>) -> Vec<String> {
 fn mention_violations(p: &Prepared, names: &BTreeSet<String>, scan: &mut AuthorityScan) {
     static PARAM: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     static ASSOC_CALL: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static ASSOC_PATH: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     if p.file == AUTHORITY_FILE {
         return;
     }
@@ -1921,6 +1936,8 @@ fn mention_violations(p: &Prepared, names: &BTreeSet<String>, scan: &mut Authori
         r"\bauthority\s*:\s*Option\s*<\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*$",
     );
     let assoc_call = once(&ASSOC_CALL, r"^\s*::\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(");
+    let assoc_path = once(&ASSOC_PATH, r"^\s*::\s*([A-Za-z_][A-Za-z0-9_]*)");
+    let mut mints_per_fn: BTreeMap<String, usize> = BTreeMap::new();
     for m in any_name_re(names, "").find_iter(&p.code_only) {
         let line = p.line_of(m.start());
         if p.structure.in_use_span(line) {
@@ -1928,6 +1945,39 @@ fn mention_violations(p: &Prepared, names: &BTreeSet<String>, scan: &mut Authori
         }
         let f = p.structure.innermost_fn(line);
         if is_authorized(AUTHORIZED_MINTERS, &p.file, f) {
+            // The minter's only legitimate mention is the path of an
+            // authorized constructor, once.
+            let owner = owner_of(p, line);
+            let constructor = assoc_path
+                .captures(p.code_only.get(m.end()..).unwrap_or(""))
+                .and_then(|c| c.get(1))
+                .map(|c| c.as_str())
+                .filter(|c| {
+                    AUTHORIZED_CONSTRUCTORS
+                        .iter()
+                        .any(|&(cf, cfn)| cf == AUTHORITY_FILE && cfn == *c)
+                });
+            match constructor {
+                Some(_) => {
+                    scan.minter_calls.push(format!("{}:{owner}", p.file));
+                    let count = mints_per_fn.entry(owner.clone()).or_default();
+                    *count += 1;
+                    if *count > 1 {
+                        scan.violations.push(format!(
+                            "{}:{line} ({owner}) mints a {AUTHORITY_TYPE} a second time — an \
+                             authorized minter mints once, immediately before its one call of \
+                             the primitive",
+                            p.file
+                        ));
+                    }
+                }
+                None => scan.violations.push(format!(
+                    "{}:{line} ({owner}) names `{}` other than as the path of an authorized \
+                     constructor — an authorized minter may only mint",
+                    p.file,
+                    m.as_str()
+                )),
+            }
             continue;
         }
         let prefix = prefix_of(p, m.start());
@@ -2396,8 +2446,9 @@ fn close_authority_has_no_constructor_outside_test_code() {
 
 /// The check above finds nothing; this proves it LOOKED. It found the test
 /// constructor, and that it is test-only. It allowed exactly the four entry
-/// points' `authority` parameters. It saw the three forwards between them, and
-/// it saw the production callers pass `None`. A scan gone blind to the type
+/// points' `authority` parameters. It saw the three forwards between them, it
+/// saw the production callers pass `None`, and it saw exactly one mint, at the
+/// `finished_close` arm's `wind_down_exit`. A scan gone blind to the type
 /// or to the calls fails here instead of passing vacuously.
 #[test]
 fn no_module_but_the_closer_can_obtain_a_close_authority() {
@@ -2455,11 +2506,16 @@ fn no_module_but_the_closer_can_obtain_a_close_authority() {
         "the four entry bodies use `authority` exactly as rule 9b allows: three forwards, \
          the log field's two words, and drive_graceful_exit's let-else"
     );
+    assert_eq!(
+        scan.minter_calls,
+        vec!["session/wind_down_executor.rs:wind_down_exit"],
+        "exactly one authorized minter call, at the `finished_close` arm's wind_down_exit — \
+         the scan either went blind to the mint or a second one exists"
+    );
     for caller in [
         "mcp/backend_relay.rs:end_admitted_terminal",
         "mcp/debug_graceful_exit.rs:graceful_exit_door",
         "mcp/steward.rs:stop_at_boundary",
-        "session/wind_down_executor.rs:wind_down_exit",
     ] {
         assert!(
             scan.none_calls.iter().any(|c| c == caller),
@@ -3162,17 +3218,176 @@ fn a_production_mint_outside_the_closer_is_red() {
         SEALED,
         &[(
             "session/wind_down_executor.rs",
-            "async fn wind_down_exit(m: &M) {\n    m.graceful_exit(id, d, Some(CloseAuthority::for_test())).await;\n}\n\
+            "async fn drain_exit(m: &M) {\n    m.graceful_exit(id, d, Some(CloseAuthority::for_test())).await;\n}\n\
              fn in_a_macro() { let v = vec![CloseAuthority::for_test()]; }\n",
         )],
     ));
     assert_eq!(violations.len(), 3, "{violations:#?}");
-    assert!(violations[0].contains("(wind_down_exit) calls `CloseAuthority::for_test`"));
+    assert!(violations[0].contains("(drain_exit) calls `CloseAuthority::for_test`"));
     assert!(violations[1].contains("(in_a_macro) calls `CloseAuthority::for_test`"));
     assert!(violations[2].contains(
-        "(wind_down_exit) passes `Some(CloseAuthority::for_test())` as the authority of \
+        "(drain_exit) passes `Some(CloseAuthority::for_test())` as the authority of \
          `graceful_exit(`"
     ));
+}
+
+/// The sealed type with its ONE production constructor, which takes the close
+/// guard's token by value.
+const SEALED_WITH_CONSTRUCTOR: &str = "use crate::session::finished_close_guard::GuardClose;\n\
+    #[derive(Debug)]\npub struct CloseAuthority {\n    _sealed: (),\n}\n\
+    impl CloseAuthority {\n    pub(crate) fn for_finished_close(_proof: GuardClose) -> Self {\n        Self { _sealed: () }\n    }\n}\n";
+
+/// The `finished_close` arm's one authorized shape: it mints once, as the
+/// argument of its one call of the primitive.
+const THE_MINTER: &str = "use crate::terminal::close_authority::CloseAuthority;\n\
+    pub(crate) async fn wind_down_exit(m: &M, guard: Option<GuardClose>) {\n    \
+    m.graceful_exit(id, d, guard.map(CloseAuthority::for_finished_close)).await;\n}\n";
+
+/// The control for the three reds below: the one constructor and the one
+/// minter, minting once, are green, and the scan SAW the mint.
+#[test]
+fn the_one_constructor_and_the_one_minter_are_green() {
+    let prepared = authority_tree(
+        SEALED_WITH_CONSTRUCTOR,
+        &[("session/wind_down_executor.rs", THE_MINTER)],
+    );
+    assert_eq!(close_authority_violations(&prepared), Vec::<String>::new());
+    assert_eq!(
+        close_authority_scan(&prepared).minter_calls,
+        vec!["session/wind_down_executor.rs:wind_down_exit"]
+    );
+}
+
+/// A second mint is red wherever it sits: a second call inside the one minter,
+/// the same constructor called from another fn of the minter's file, and a
+/// call from another file.
+#[test]
+fn a_second_minter_call_is_red() {
+    let twice = format!(
+        "{THE_MINTER}pub(crate) async fn wind_down_exit_again(m: &M, guard: Option<GuardClose>) {{\n    \
+         let a = guard.map(CloseAuthority::for_finished_close);\n}}\n"
+    );
+    assert_red(
+        &authority_tree(
+            SEALED_WITH_CONSTRUCTOR,
+            &[("session/wind_down_executor.rs", &twice)],
+        ),
+        &["(wind_down_exit_again) names `CloseAuthority`"],
+    );
+    // Two mints inside the one authorized minter.
+    let same_fn = THE_MINTER.replace(
+        ")).await;",
+        ")).await;\n    let spare = guard.map(CloseAuthority::for_finished_close);",
+    );
+    assert_red(
+        &authority_tree(
+            SEALED_WITH_CONSTRUCTOR,
+            &[("session/wind_down_executor.rs", &same_fn)],
+        ),
+        &["(wind_down_exit) mints a CloseAuthority a second time"],
+    );
+    // The constructor called from a fn of another file.
+    assert_red(
+        &authority_tree(
+            SEALED_WITH_CONSTRUCTOR,
+            &[(
+                "session/finished_close.rs",
+                "use crate::terminal::close_authority::CloseAuthority;\n\
+                 pub(crate) fn sneak(g: GuardClose) { let _a = CloseAuthority::for_finished_close(g); }\n",
+            )],
+        ),
+        &["session/finished_close.rs:2 (sneak) calls `CloseAuthority::for_finished_close`"],
+    );
+    // A same-named fn in another file is not the authorized minter.
+    assert_red(
+        &authority_tree(SEALED_WITH_CONSTRUCTOR, &[("mcp/steward.rs", THE_MINTER)]),
+        &["mcp/steward.rs:3 (wind_down_exit)"],
+    );
+}
+
+/// `close_batch` and the `CloseEffects` trait carry the `GuardClose` token
+/// only. A `CloseAuthority` there, as a parameter, a return type or a local,
+/// is red: the authority is minted at the one call of the primitive and
+/// nowhere upstream.
+#[test]
+fn a_close_authority_in_close_batch_or_the_trait_is_red() {
+    assert_red(
+        &authority_tree(
+            SEALED_WITH_CONSTRUCTOR,
+            &[(
+                "session/wind_down_executor.rs",
+                "use crate::terminal::close_authority::CloseAuthority;\n\
+                 pub(crate) async fn close_batch(arm: A, minted: Option<CloseAuthority>) {}\n\
+                 pub(crate) async fn close_batch_local(g: GuardClose) {\n    let kept = Some(CloseAuthority::for_finished_close(g));\n}\n",
+            )],
+        ),
+        &[
+            "session/wind_down_executor.rs:2 (close_batch) names `CloseAuthority`",
+            "session/wind_down_executor.rs:4 (close_batch_local) calls `CloseAuthority::for_finished_close`",
+        ],
+    );
+    assert_red(
+        &authority_tree(
+            SEALED_WITH_CONSTRUCTOR,
+            &[(
+                "session/wind_down_executor.rs",
+                "use crate::terminal::close_authority::CloseAuthority;\n\
+                 pub(crate) trait CloseEffects {\n    \
+                 async fn wind_down_one(&self, arm: A, session_id: &str, minted: Option<CloseAuthority>) -> R;\n}\n",
+            )],
+        ),
+        &["session/wind_down_executor.rs:3 (wind_down_one) names `CloseAuthority`"],
+    );
+}
+
+/// The drain arm presents no token, in either spelling: minting one for it, or
+/// handing the primitive a token it was given without minting.
+#[test]
+fn a_drain_arm_call_presenting_a_token_is_red() {
+    assert_red(
+        &authority_tree(
+            SEALED_WITH_CONSTRUCTOR,
+            &[(
+                "session/wind_down_executor.rs",
+                "use crate::terminal::close_authority::CloseAuthority;\n\
+                 pub(crate) async fn drain_exit(m: &M, token: GuardClose) {\n    \
+                 m.graceful_exit(id, d, Some(CloseAuthority::for_finished_close(token))).await;\n}\n",
+            )],
+        ),
+        &[
+            "(drain_exit) calls `CloseAuthority::for_finished_close`",
+            "(drain_exit) passes `Some(CloseAuthority::for_finished_close(token))` as the \
+             authority of `graceful_exit(`",
+        ],
+    );
+    assert_red(
+        &authority_tree(
+            SEALED_WITH_CONSTRUCTOR,
+            &[(
+                "session/wind_down_executor.rs",
+                "pub(crate) async fn drain_exit(m: &M, token: Option<GuardClose>) {\n    \
+                 m.graceful_exit(id, d, token).await;\n}\n",
+            )],
+        ),
+        &["(drain_exit) passes `token` as the authority of `graceful_exit(`"],
+    );
+}
+
+/// The one minter may mint and nothing else: a test constructor, or any other
+/// use of the type, inside it is red.
+#[test]
+fn the_minter_may_only_mint() {
+    assert_red(
+        &authority_tree(
+            SEALED_WITH_CONSTRUCTOR,
+            &[(
+                "session/wind_down_executor.rs",
+                "pub(crate) async fn wind_down_exit(m: &M) {\n    \
+                 m.graceful_exit(id, d, Some(CloseAuthority::for_test())).await;\n}\n",
+            )],
+        ),
+        &["(wind_down_exit) names `CloseAuthority` other than as the path of an authorized"],
+    );
 }
 
 /// Rule 8's one parameter position is `authority: Option<…CloseAuthority>`
