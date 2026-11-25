@@ -9472,8 +9472,9 @@ fn reap_configs_for_revoked_nonces(dir: &Path, revoked: &[String]) -> usize {
 /// while a true "dead" only costs this wait once per port per reap pass.
 const SIBLING_LIVEZ_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// True iff a RUNNER answers `GET /livez` on `127.0.0.1:port` (serving, or
-/// booting with `503 RUNNER_BOOTING`). Used by the session-restore reaper to
+/// True unless `127.0.0.1:port` is positively not a runner: the connect fails,
+/// or something other than a runner answers (`LivezVerdict::may_be_alive` —
+/// serving, booting with `503 RUNNER_BOOTING`, or silent). Used by the session-restore reaper to
 /// distinguish "another live runner's config" (keep) from "a dead runner's
 /// leftover" (reap).
 ///
