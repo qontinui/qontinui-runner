@@ -277,6 +277,11 @@ pub const CREDENTIAL_DOORS: &[&str] = &[
     // the POST also writes it to disk.
     "GET /ui-bridge/vision/component-baseline",
     "POST /ui-bridge/vision/component-baseline",
+    // `matches_isolated_render` in an assert reads stored baselines and
+    // fetches in-situ captures (props too, from the webview or a signed
+    // phone), and a props finding carries both prop values in its detail: the
+    // same data as the doors above, so the assert route is one too.
+    "POST /ui-bridge/vision/assert",
     "GET /sessions/{id}/transcript",
     // Returns the pre-edit snapshot text AND the current on-disk text of every
     // file a session touched — local source content, the same class as the

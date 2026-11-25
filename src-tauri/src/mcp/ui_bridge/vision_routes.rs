@@ -2174,10 +2174,12 @@ pub(crate) const VISION_FRAME_BODY_LIMIT: usize = 32 * 1024 * 1024;
 
 /// The request-body ceiling of `vision/analyze` and `vision/assert` for any
 /// requester but a NonBrowser or FirstParty one: axum's own 2 MiB `Json`
-/// default, what these routes accepted before frame B. Those two routes are
-/// not credential doors, so a Foreign browser page the origin guard admits can
-/// POST them; it gets no more analyzer input than before, and a frame B it may
-/// not send is never buffered at 32 MiB to be refused.
+/// default, what these routes accepted before frame B. `vision/analyze` is not
+/// a credential door, so a Foreign browser page the origin guard admits can
+/// POST it; it gets no more analyzer input than before, and a frame B it may
+/// not send is never buffered at 32 MiB to be refused. (`vision/assert` and
+/// `vision/component-baseline` are credential doors; the limit stays on them
+/// as defence in depth.)
 pub(crate) const UNTRUSTED_VISION_BODY_LIMIT: usize = 2 * 1024 * 1024;
 
 /// Hold a requester that is not NonBrowser or FirstParty to
@@ -4069,6 +4071,7 @@ pub struct ComponentInputReport {
 /// The `(component, baseline)` pairs of every `matches_isolated_render`
 /// assertion, in request order, deduplicated.
 fn isolated_render_pairs(assertions: &[qontinui_vision_core::Assertion]) -> Vec<(String, String)> {
+    let mut seen = std::collections::HashSet::new();
     let mut pairs: Vec<(String, String)> = Vec::new();
     for a in assertions {
         if let qontinui_vision_core::Assertion::MatchesIsolatedRender {
@@ -4078,7 +4081,7 @@ fn isolated_render_pairs(assertions: &[qontinui_vision_core::Assertion]) -> Vec<
         } = a
         {
             let pair = (component.to_string(), baseline.to_string());
-            if !pairs.contains(&pair) {
+            if seen.insert(pair.clone()) {
                 pairs.push(pair);
             }
         }
@@ -4155,7 +4158,27 @@ fn capture_from_answer(
         Some(d) if answer.get("success").is_some() => d,
         _ => answer,
     };
+    // Every field of a capture is optional, so any JSON object would parse as
+    // an empty one: an answer that is not capture-shaped (an SDK without the
+    // route answering `{"error": …}`, a null) is an error, never a capture.
+    if !["schemaVersion", "root", "nodes"]
+        .iter()
+        .any(|k| payload.get(k).is_some())
+    {
+        return Err(format!(
+            "answer is not a ComponentCapture (no schemaVersion, root or nodes): {}",
+            truncate_for_error(&payload.to_string())
+        ));
+    }
     serde_json::from_value(payload.clone()).map_err(|e| format!("capture did not parse: {e}"))
+}
+
+/// At most 200 characters of `text`, on a char boundary, for an error message.
+fn truncate_for_error(text: &str) -> String {
+    match text.char_indices().nth(200) {
+        Some((end, _)) => format!("{}…", text.get(..end).unwrap_or(text)),
+        None => text.to_string(),
+    }
 }
 
 /// Read at most `limit` bytes of `resp`'s body: a declared or streamed body
@@ -4207,7 +4230,26 @@ async fn fetch_device_capture(
         .map_err(|e| format!("capture {url} (HTTP {status}): {e}"))?;
     let body: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|e| format!("capture {url} answered HTTP {status} with a non-JSON body: {e}"))?;
-    capture_from_answer(&body).map_err(|e| format!("{url} (HTTP {status}): {e}"))
+    device_capture_answer(status, &body).map_err(|e| format!("{url} (HTTP {status}): {e}"))
+}
+
+/// A device's capture answer at `status`: the typed refusal names its reason
+/// at any status; any other non-2xx answer is an error naming the status; a
+/// 2xx answer must be capture-shaped ([`capture_from_answer`]).
+fn device_capture_answer(
+    status: reqwest::StatusCode,
+    body: &serde_json::Value,
+) -> Result<qontinui_vision_core::ComponentCapture, String> {
+    if let Some(refusal) = super::misc::capture_refusal(body) {
+        return Err(refusal.describe());
+    }
+    if !status.is_success() {
+        return Err(format!(
+            "capture route answered HTTP {status}: {}",
+            truncate_for_error(&body.to_string())
+        ));
+    }
+    capture_from_answer(body)
 }
 
 /// Fetch the in-situ capture of `component` (with the owning component's
@@ -4289,20 +4331,25 @@ fn plan_capture_fetches(
 ) {
     let mut fetch: Vec<String> = Vec::new();
     let mut settled = std::collections::HashMap::new();
-    let mut components: Vec<&String> = Vec::new();
-    for (component, _) in pairs {
-        if !components.contains(&component) {
-            components.push(component);
-        }
-    }
+    // One pass each, in request order: the distinct components, and the ones
+    // some loaded baseline needs.
+    let mut seen = std::collections::HashSet::new();
+    let components: Vec<&String> = pairs
+        .iter()
+        .map(|(component, _)| component)
+        .filter(|component| seen.insert(*component))
+        .collect();
+    let needed_by_a_baseline: std::collections::HashSet<&String> = pairs
+        .iter()
+        .filter(|(_, baseline)| baselines.contains_key(baseline))
+        .map(|(component, _)| component)
+        .collect();
     for component in components {
         if supplied.contains_key(component) {
             settled.insert(component.clone(), (ComponentCaptureSource::Supplied, None));
             continue;
         }
-        let needed = pairs
-            .iter()
-            .any(|(c, b)| c == component && baselines.contains_key(b));
+        let needed = needed_by_a_baseline.contains(component);
         if !needed {
             settled.insert(
                 component.clone(),
@@ -7478,6 +7525,34 @@ mod component_input_tests {
             capture_refusal_from_dispatch(&DispatchError::NotConnected),
             None
         );
+    }
+
+    /// A device answer that is not a capture is never one: an SDK without the
+    /// route answering 404 `{"error": …}`, any other non-2xx, or a 2xx body
+    /// with no capture shape. A refusal names its reason at any status.
+    #[test]
+    fn a_non_capture_device_answer_is_an_error_not_a_fetched_capture() {
+        use reqwest::StatusCode as S;
+        let no_route = serde_json::json!({"error": "Not Found"});
+        let e = device_capture_answer(S::NOT_FOUND, &no_route).unwrap_err();
+        assert!(e.contains("404"), "{e}");
+        assert!(device_capture_answer(S::BAD_GATEWAY, &serde_json::json!({})).is_err());
+        let e = device_capture_answer(S::OK, &serde_json::json!({"ok": true})).unwrap_err();
+        assert!(e.contains("not a ComponentCapture"), "{e}");
+        assert!(capture_from_answer(&serde_json::Value::Null).is_err());
+        assert!(capture_from_answer(&serde_json::json!({"success": true, "data": null})).is_err());
+
+        let refused = serde_json::json!({
+            "success": false, "error": "component_capture_refused", "reason": "not_found"
+        });
+        let e = device_capture_answer(S::NOT_FOUND, &refused).unwrap_err();
+        assert!(e.starts_with("component_capture_refused: not_found"), "{e}");
+
+        let page = rect(0.0, 0.0, 10.0, 10.0);
+        let ok = serde_json::json!({
+            "success": true, "data": serde_json::to_value(capture(page, page)).unwrap()
+        });
+        assert!(device_capture_answer(S::OK, &ok).is_ok());
     }
 
     /// The three component-baseline store handlers, mounted on their own state.

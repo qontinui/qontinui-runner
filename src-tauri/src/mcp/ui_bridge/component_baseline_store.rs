@@ -205,6 +205,11 @@ impl ComponentBaselineStore {
                 target.display()
             )));
         }
+        // Make the rename itself durable: sync the directory entry. Best
+        // effort — the file is already whole on disk — and Unix only, where a
+        // directory can be opened and synced.
+        #[cfg(unix)]
+        let _ = std::fs::File::open(&self.dir).and_then(|dir| dir.sync_all());
         Ok(target)
     }
 

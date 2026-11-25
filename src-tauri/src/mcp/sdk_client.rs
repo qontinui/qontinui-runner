@@ -6063,7 +6063,9 @@ async fn handle_component_state(
 /// - The typed `component_capture_refused` refusal keeps its status (404
 ///   `not_found`, 422 `no_mounted_elements`) and its top-level `reason`,
 ///   whether the app answered it over HTTP or relayed it as a message.
-/// - Any other dispatch failure is answered 502 `{success:false, error}`.
+/// - Any other failure is answered 502 `{success:false, error}`: a dispatch
+///   error, or a relayed answer that is `success:false` (not a refusal) or
+///   null ([`sdk_capture_answer`]).
 async fn sdk_capture(
     state: &Arc<ApiState>,
     action: &str,
@@ -6071,11 +6073,8 @@ async fn sdk_capture(
     id: String,
     props: bool,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    use crate::mcp::ui_bridge::misc::{
-        capture_path, capture_refusal, capture_refusal_from_dispatch,
-    };
-    let path = capture_path(kind, &id, props);
-    match dispatch_app_request_typed(
+    let path = crate::mcp::ui_bridge::misc::capture_path(kind, &id, props);
+    let result = dispatch_app_request_typed(
         state,
         action,
         serde_json::json!({ "id": id, "props": props }),
@@ -6083,18 +6082,46 @@ async fn sdk_capture(
         &path,
         None,
     )
-    .await
-    {
-        Ok(data) => match capture_refusal(&data) {
-            Some(refusal) => Err((refusal.status, Json(refusal.body()))),
-            None => Ok(Json(data)),
-        },
+    .await;
+    sdk_capture_answer(result)
+}
+
+/// How [`sdk_capture`] answers a dispatch result. Pure, so each arm is
+/// testable without an app.
+fn sdk_capture_answer(
+    result: Result<serde_json::Value, DispatchError>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::mcp::ui_bridge::misc::{capture_refusal, capture_refusal_from_dispatch};
+    let bad_gateway = |error: String| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "success": false, "error": error })),
+        )
+    };
+    match result {
+        Ok(data) => {
+            if let Some(refusal) = capture_refusal(&data) {
+                return Err((refusal.status, Json(refusal.body())));
+            }
+            // A WebSocket wrapper's relay hands back whatever the page
+            // answered: a non-refusal failure or no answer at all is a failed
+            // dispatch, as the HTTP arm reports it, never a 200.
+            if data.is_null() {
+                return Err(bad_gateway("the app answered the capture with null".into()));
+            }
+            if data.get("success").and_then(|v| v.as_bool()) == Some(false) {
+                let error = data
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("the app answered success=false")
+                    .to_string();
+                return Err(bad_gateway(error));
+            }
+            Ok(Json(data))
+        }
         Err(e) => match capture_refusal_from_dispatch(&e) {
             Some(refusal) => Err((refusal.status, Json(refusal.body()))),
-            None => Err((
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({ "success": false, "error": dispatch_err_message(&e) })),
-            )),
+            None => Err(bad_gateway(dispatch_err_message(&e))),
         },
     }
 }
@@ -9769,6 +9796,68 @@ mod tests {
             }
             assert_eq!(sent, body, "{transport:?}: the body is forwarded whole");
         }
+    }
+}
+
+#[cfg(test)]
+mod sdk_capture_answer_tests {
+    //! The `/ui-bridge/sdk/**/capture` answer per dispatch result
+    //! ([`sdk_capture_answer`]).
+    use super::*;
+    use crate::mcp::command_relay::{CommandRelayError, WrapperFailure};
+
+    fn status(r: &Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)>) -> u16 {
+        match r {
+            Ok(_) => 200,
+            Err((s, _)) => s.as_u16(),
+        }
+    }
+
+    #[test]
+    fn a_capture_is_200_and_a_refusal_keeps_its_status_and_reason() {
+        let ok = sdk_capture_answer(Ok(serde_json::json!({"schemaVersion": 1})));
+        assert_eq!(status(&ok), 200);
+
+        let relayed = sdk_capture_answer(Ok(serde_json::json!({
+            "success": false,
+            "error": "component_capture_refused:not_found: no such component",
+        })));
+        assert_eq!(status(&relayed), 404);
+        let Err((_, Json(body))) = relayed else {
+            unreachable!()
+        };
+        assert_eq!(body["reason"], "not_found");
+
+        let ws = sdk_capture_answer(Err(DispatchError::WebSocket(
+            CommandRelayError::WrapperError(WrapperFailure {
+                code: None,
+                message: "component_capture_refused:no_mounted_elements: none".to_string(),
+                retryable: None,
+            }),
+        )));
+        assert_eq!(status(&ws), 422);
+    }
+
+    /// A relayed non-refusal failure, a null answer and a plain dispatch error
+    /// are all 502 — never a 200 carrying a failure.
+    #[test]
+    fn every_other_failure_is_a_502() {
+        let failed = sdk_capture_answer(Ok(serde_json::json!({
+            "success": false, "error": "handler threw"
+        })));
+        assert_eq!(status(&failed), 502);
+        let Err((_, Json(body))) = failed else {
+            unreachable!()
+        };
+        assert_eq!(body["error"], "handler threw");
+        assert_eq!(
+            status(&sdk_capture_answer(Ok(serde_json::Value::Null))),
+            502
+        );
+        assert_eq!(
+            status(&sdk_capture_answer(Err(DispatchError::NotConnected))),
+            502
+        );
     }
 }
 
