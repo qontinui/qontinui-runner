@@ -236,6 +236,32 @@ pub(super) fn booting_gate(slot: RouterSlot) -> axum::Router {
     })
 }
 
+/// Offer the API listener to a self-managed upgrade (plan Phase 5): record
+/// its fd in [`crate::runner_upgrade::listener_fds`] under `api`, the name the
+/// successor adopts it by. Only a listener on the REQUESTED port is offered —
+/// the successor's adoption checks the address, so handing it a fallback-port
+/// socket would make the preflight promise a handoff the successor refuses.
+/// The fd stays owned by the server; tokio's `from_std` keeps its number.
+fn offer_api_listener_for_handoff(
+    listener: &std::net::TcpListener,
+    requested_port: u16,
+    bound_port: u16,
+) {
+    if bound_port != requested_port {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        crate::runner_upgrade::listener_fds::register(
+            qontinui_runner_lib::listeners::API_LISTENER_NAME,
+            listener.as_raw_fd(),
+        );
+    }
+    #[cfg(not(unix))]
+    let _ = listener;
+}
+
 /// An API listener adopted at boot and already being served by the
 /// [`booting_gate`], waiting for `start_server` to install the router.
 struct EarlyApi {
@@ -280,6 +306,8 @@ pub fn start_early_api_if_inherited() {
         }
     };
     let local_addr = listener.local_addr().ok();
+    // An adopted `api` listener is on `api_addr(port)` by construction.
+    offer_api_listener_for_handoff(&listener, port, port);
     let slot: RouterSlot = Arc::new(std::sync::OnceLock::new());
     let served = serve_on_dedicated_runtime(listener, booting_gate(slot.clone()), port);
     info!(
@@ -828,6 +856,7 @@ pub async fn start_server(
         bound_port,
         acquired.listener.local_addr().ok(),
     );
+    offer_api_listener_for_handoff(&acquired.listener, port, bound_port);
     announce_api_ready(&api_ready_flag, &emitter, bound_port);
     await_api_serve(serve_on_dedicated_runtime(
         acquired.listener,
