@@ -665,12 +665,178 @@ pub async fn fetch_obligations(claude_session_id: &str) -> Result<serde_json::Va
         );
     };
     let url = obligations_url(&base, claude_session_id);
-    read_obligations(
+    let first = read_obligations(
         crate::coord_http::coord_get(client, &url),
         &url,
         OBLIGATIONS_REQUEST_TIMEOUT,
     )
-    .await
+    .await?;
+    let deadline = tokio::time::Instant::now() + OBLIGATIONS_WALK_DEADLINE;
+    Ok(
+        walk_obligation_gate_pages(first, OBLIGATIONS_MAX_PAGES, |cursor| {
+            let page_url = obligations_gates_page_url(&url, &cursor);
+            let req = crate::coord_http::coord_get(client, &page_url);
+            async move {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(format!(
+                        "the {}s gates walk deadline passed",
+                        OBLIGATIONS_WALK_DEADLINE.as_secs()
+                    ));
+                }
+                read_obligations(req, &page_url, remaining.min(OBLIGATIONS_REQUEST_TIMEOUT)).await
+            }
+        })
+        .await,
+    )
+}
+
+/// Upper bound on pages one obligations read walks (coord's own in-process
+/// walk, `session_obligations_complete`, uses the same 50).
+pub const OBLIGATIONS_MAX_PAGES: usize = 50;
+
+/// One overall wall-clock bound on the follow-up gates pages of a single
+/// obligations read. Each page is still bounded by
+/// [`OBLIGATIONS_REQUEST_TIMEOUT`]; a walk that cannot finish inside this is
+/// UNKNOWN, never a partial read as whole.
+pub const OBLIGATIONS_WALK_DEADLINE: Duration = Duration::from_secs(120);
+
+/// The follow-up page URL: the first page's URL plus `sources=gates` and the
+/// cursor coord returned (`GET …/session-obligations/:id?sources=gates&gates_cursor=…`).
+pub fn obligations_gates_page_url(first_url: &str, cursor: &str) -> String {
+    format!(
+        "{first_url}?sources=gates&gates_cursor={}",
+        urlencoding::encode(cursor)
+    )
+}
+
+/// Follow coord's gates cursor (plan
+/// `2026-11-23-session-obligations-pages-its-gates-so-a-busy-device-can-be-proven-closeable`
+/// Phase 5). coord pages the gates source: an unrestricted first page carries
+/// `gates.next_cursor`, `pending_pages.gates` and `other_sources_read`, and
+/// reports `all_tracked_sources_read: false` until the walk ends — so without
+/// this a session on a busy device reads UNKNOWN forever.
+///
+/// Returns the first page unchanged when there is nothing to walk (no cursor —
+/// a single-page answer, or a coord predating paging), or when the first page
+/// could never become complete (`other_sources_read` not `true`, or
+/// `sources_scope` not `all`). Otherwise fetches gates-only pages, merges
+/// `gates.items` by `item.gate_id`, and sets `all_tracked_sources_read: true`
+/// ONLY when the last cursor was `null`, every page's gates coverage was
+/// `read`, and the delivered count matches `gates.totals` when coord served
+/// one. Any other end — a fetch error, a repeated cursor, a page adding no
+/// gate while a cursor remains, the page budget — leaves
+/// `all_tracked_sources_read: false` with `gates.truncated: true` and a
+/// `gates.walk.note` naming why, which [`wind_down::obligations_gate`] reads
+/// as UNKNOWN. It only ever withholds a close; it never grants one a single
+/// page would not have.
+pub async fn walk_obligation_gate_pages<F, Fut>(
+    first: serde_json::Value,
+    max_pages: usize,
+    mut fetch_page: F,
+) -> serde_json::Value
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<serde_json::Value, String>>,
+{
+    use serde_json::{json, Value};
+
+    let Some(mut next) = first["gates"]["next_cursor"].as_str().map(str::to_string) else {
+        return first;
+    };
+    if first["other_sources_read"] != json!(true) || first["sources_scope"] != json!("all") {
+        return first;
+    }
+    let mut merged = first;
+    let mut items: Vec<Value> = merged["gates"]["items"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let mut seen: HashSet<String> = items
+        .iter()
+        .filter_map(|g| g["item"]["gate_id"].as_str().map(str::to_string))
+        .collect();
+    let mut cursors: HashSet<String> = HashSet::new();
+    let mut pages = 1usize;
+    let mut note: Option<String> = None;
+    let mut degraded: Vec<Value> = Vec::new();
+    let mut finished = false;
+    loop {
+        if pages >= max_pages {
+            note = Some(format!("page budget of {max_pages} pages spent"));
+            break;
+        }
+        if !cursors.insert(next.clone()) {
+            note = Some("a cursor repeated".to_string());
+            break;
+        }
+        let page = match fetch_page(next.clone()).await {
+            Ok(p) => p,
+            Err(e) => {
+                note = Some(format!("page {} could not be read: {e}", pages + 1));
+                break;
+            }
+        };
+        pages += 1;
+        if page["gates"]["coverage"] != json!("read") {
+            degraded.push(json!({"page": pages, "gates": page["gates"]["parts"].clone()}));
+        }
+        let before = items.len();
+        for g in page["gates"]["items"].as_array().into_iter().flatten() {
+            if let Some(id) = g["item"]["gate_id"].as_str() {
+                if seen.insert(id.to_string()) {
+                    items.push(g.clone());
+                }
+            }
+        }
+        match &page["gates"]["next_cursor"] {
+            Value::Null => {
+                finished = true;
+                break;
+            }
+            Value::String(c) => {
+                if items.len() == before {
+                    note = Some("a page added no new gate while a cursor remained".to_string());
+                    break;
+                }
+                next = c.clone();
+            }
+            other => {
+                note = Some(format!(
+                    "page {pages} carried a non-string next_cursor: {other}"
+                ));
+                break;
+            }
+        }
+    }
+    if finished {
+        let totals = &merged["gates"]["totals"];
+        if let Some(proven) = totals["proven"].as_i64() {
+            let expected = proven + totals["uncertain"].as_i64().unwrap_or(0);
+            if expected != seen.len() as i64 {
+                note = Some(format!(
+                    "the walk delivered {} distinct gates but gates.totals counts {expected}",
+                    seen.len()
+                ));
+                finished = false;
+            }
+        }
+    }
+    let first_read = merged["gates"]["coverage"] == json!("read");
+    let complete = finished && first_read && degraded.is_empty();
+    let gates = &mut merged["gates"];
+    gates["count"] = json!(items.len());
+    gates["items"] = json!(items);
+    gates["next_cursor"] = if finished { Value::Null } else { json!(next) };
+    gates["truncated"] = json!(!finished);
+    gates["walk"] = json!({"pages": pages, "finished": finished, "note": note});
+    if !degraded.is_empty() {
+        gates["coverage"] = json!("degraded");
+        gates["page_errors"] = json!(degraded);
+    }
+    merged["pending_pages"] = json!({"gates": !finished});
+    merged["all_tracked_sources_read"] = json!(complete);
+    merged
 }
 
 /// The first worktree in coord's obligations answer (`worktrees.items[]`)
@@ -2602,6 +2768,205 @@ mod tests {
         assert_eq!(
             obligations_url("http://h", " a/b "),
             "http://h/coord/overlord/session-obligations/a%2Fb"
+        );
+    }
+
+    // ── Gates paging (plan 2026-11-23-session-obligations-pages-its-gates…, Phase 5) ──
+
+    fn gate(id: &str, verdict: &str) -> serde_json::Value {
+        serde_json::json!({"item": {"gate_id": id}, "verdict": verdict, "attribution": "proven"})
+    }
+
+    /// An unrestricted FIRST page the way paged coord serves it on a busy
+    /// device: gates truncated with a cursor, so `all_tracked_sources_read` is
+    /// false although every other source read in full.
+    fn first_page(items: Vec<serde_json::Value>, cursor: &str, total: i64) -> serde_json::Value {
+        serde_json::json!({
+            "all_tracked_sources_read": false,
+            "sources_scope": "all",
+            "requested_sources_read": false,
+            "other_sources_read": true,
+            "pending_pages": {"gates": true},
+            "session_proven_in_tenant": true,
+            "prs": {"coverage": "read", "items": []},
+            "gates": {"coverage": "read", "items": items, "truncated": true,
+                      "next_cursor": cursor, "totals": {"proven": total, "uncertain": 0}},
+            "worktrees": {"coverage": "read", "items": []},
+        })
+    }
+
+    fn gates_page(items: Vec<serde_json::Value>, cursor: Option<&str>) -> serde_json::Value {
+        serde_json::json!({
+            "all_tracked_sources_read": false,
+            "sources_scope": "partial",
+            "session_proven_in_tenant": true,
+            "gates": {"coverage": "read", "items": items, "truncated": cursor.is_some(),
+                      "next_cursor": cursor},
+        })
+    }
+
+    /// Serve `pages` by cursor from a map; record every cursor asked for.
+    async fn walk_over(
+        first: serde_json::Value,
+        pages: HashMap<String, Result<serde_json::Value, String>>,
+        max_pages: usize,
+    ) -> (serde_json::Value, Vec<String>) {
+        let asked = std::sync::Mutex::new(Vec::new());
+        let doc = walk_obligation_gate_pages(first, max_pages, |cursor| {
+            asked.lock().unwrap().push(cursor.clone());
+            let page = pages
+                .get(&cursor)
+                .cloned()
+                .unwrap_or_else(|| Err(format!("no page for {cursor}")));
+            async move { page }
+        })
+        .await;
+        (doc, asked.into_inner().unwrap())
+    }
+
+    fn three_pages(
+        last: serde_json::Value,
+    ) -> (
+        serde_json::Value,
+        HashMap<String, Result<serde_json::Value, String>>,
+    ) {
+        let first = first_page(vec![gate("g1", "watched"), gate("g2", "landed")], "c1", 5);
+        let pages = HashMap::from([
+            (
+                "c1".to_string(),
+                Ok(gates_page(
+                    vec![gate("g2", "landed"), gate("g3", "watched")],
+                    Some("c2"),
+                )),
+            ),
+            (
+                "c2".to_string(),
+                Ok(gates_page(vec![gate("g4", "watched"), last], None)),
+            ),
+        ]);
+        (first, pages)
+    }
+
+    #[tokio::test]
+    async fn a_busy_device_walk_reads_every_gate_and_becomes_judgeable() {
+        let (first, pages) = three_pages(gate("g5", "watched"));
+        // Before the walk the single page is UNKNOWN — the defect being fixed.
+        assert!(!wind_down::obligations_gate(&Ok(first.clone())).is_watched());
+
+        let (doc, asked) = walk_over(first, pages, OBLIGATIONS_MAX_PAGES).await;
+        assert_eq!(asked, vec!["c1", "c2"]);
+        assert_eq!(doc["all_tracked_sources_read"], true);
+        assert_eq!(
+            doc["gates"]["count"], 5,
+            "g2 delivered twice is merged once"
+        );
+        assert_eq!(doc["gates"]["truncated"], false);
+        assert!(doc["gates"]["next_cursor"].is_null());
+        assert_eq!(doc["gates"]["walk"]["pages"], 3);
+        assert_eq!(
+            wind_down::obligations_gate(&Ok(doc)),
+            wind_down::ObligationsVerdict::Watched { judged: 5 }
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unwatched_gate_on_the_last_page_is_found() {
+        let (first, pages) = three_pages(gate("g5", "not_watched"));
+        let (doc, _) = walk_over(first, pages, OBLIGATIONS_MAX_PAGES).await;
+        assert_eq!(doc["all_tracked_sources_read"], true);
+        assert_eq!(wind_down::obligations_gate(&Ok(doc)).as_str(), "unwatched");
+    }
+
+    #[tokio::test]
+    async fn every_unfinished_walk_stays_unknown() {
+        // A page that cannot be read.
+        let (first, mut pages) = three_pages(gate("g5", "watched"));
+        pages.insert("c2".to_string(), Err("coord returned 502".to_string()));
+        let (doc, _) = walk_over(first, pages, OBLIGATIONS_MAX_PAGES).await;
+        assert_eq!(doc["all_tracked_sources_read"], false);
+        assert_eq!(doc["gates"]["truncated"], true);
+        assert!(doc["gates"]["walk"]["note"]
+            .as_str()
+            .unwrap()
+            .contains("502"));
+        assert!(!wind_down::obligations_gate(&Ok(doc)).is_watched());
+
+        // A cursor that repeats.
+        let (first, mut pages) = three_pages(gate("g5", "watched"));
+        pages.insert(
+            "c2".to_string(),
+            Ok(gates_page(vec![gate("g9", "watched")], Some("c1"))),
+        );
+        let (doc, _) = walk_over(first, pages, OBLIGATIONS_MAX_PAGES).await;
+        assert_eq!(doc["all_tracked_sources_read"], false);
+        assert_eq!(doc["gates"]["walk"]["note"], "a cursor repeated");
+
+        // A page that adds nothing while a cursor remains.
+        let (first, mut pages) = three_pages(gate("g5", "watched"));
+        pages.insert(
+            "c2".to_string(),
+            Ok(gates_page(vec![gate("g3", "watched")], Some("c3"))),
+        );
+        let (doc, _) = walk_over(first, pages, OBLIGATIONS_MAX_PAGES).await;
+        assert_eq!(doc["all_tracked_sources_read"], false);
+
+        // The page budget.
+        let (first, pages) = three_pages(gate("g5", "watched"));
+        let (doc, asked) = walk_over(first, pages, 2).await;
+        assert_eq!(asked, vec!["c1"]);
+        assert_eq!(doc["all_tracked_sources_read"], false);
+        assert_eq!(doc["gates"]["next_cursor"], "c2");
+
+        // A degraded page.
+        let (first, mut pages) = three_pages(gate("g5", "watched"));
+        let mut bad = gates_page(vec![gate("g4", "watched"), gate("g5", "watched")], None);
+        bad["gates"]["coverage"] = serde_json::json!("degraded");
+        pages.insert("c2".to_string(), Ok(bad));
+        let (doc, _) = walk_over(first, pages, OBLIGATIONS_MAX_PAGES).await;
+        assert_eq!(doc["all_tracked_sources_read"], false);
+        assert_eq!(doc["gates"]["coverage"], "degraded");
+
+        // A finished walk whose count disagrees with coord's totals.
+        let (mut first, pages) = three_pages(gate("g5", "watched"));
+        first["gates"]["totals"]["proven"] = serde_json::json!(6);
+        let (doc, _) = walk_over(first, pages, OBLIGATIONS_MAX_PAGES).await;
+        assert_eq!(doc["all_tracked_sources_read"], false);
+        assert!(doc["gates"]["walk"]["note"]
+            .as_str()
+            .unwrap()
+            .contains("totals"));
+
+        // A non-string cursor.
+        let (first, mut pages) = three_pages(gate("g5", "watched"));
+        let mut odd = gates_page(vec![gate("g4", "watched")], None);
+        odd["gates"]["next_cursor"] = serde_json::json!(7);
+        pages.insert("c2".to_string(), Ok(odd));
+        let (doc, _) = walk_over(first, pages, OBLIGATIONS_MAX_PAGES).await;
+        assert_eq!(doc["all_tracked_sources_read"], false);
+    }
+
+    #[tokio::test]
+    async fn nothing_to_walk_returns_the_first_page_untouched() {
+        // A coord predating paging, or a single-page answer: no cursor.
+        let old = serde_json::json!({"all_tracked_sources_read": true,
+            "gates": {"coverage": "read", "items": [], "truncated": false}});
+        let (doc, asked) = walk_over(old.clone(), HashMap::new(), OBLIGATIONS_MAX_PAGES).await;
+        assert_eq!(doc, old);
+        assert!(asked.is_empty());
+
+        // Other sources did not read in full: a walk could never complete it.
+        let (mut first, pages) = three_pages(gate("g5", "watched"));
+        first["other_sources_read"] = serde_json::json!(false);
+        let (doc, asked) = walk_over(first.clone(), pages, OBLIGATIONS_MAX_PAGES).await;
+        assert_eq!(doc, first);
+        assert!(asked.is_empty());
+    }
+
+    #[test]
+    fn the_gates_page_url_restricts_to_gates_and_encodes_the_cursor() {
+        assert_eq!(
+            obligations_gates_page_url("http://h/coord/overlord/session-obligations/s", "v1.a+b/c="),
+            "http://h/coord/overlord/session-obligations/s?sources=gates&gates_cursor=v1.a%2Bb%2Fc%3D"
         );
     }
 
