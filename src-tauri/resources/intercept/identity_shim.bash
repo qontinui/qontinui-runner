@@ -443,7 +443,8 @@ fi
 # The VALUE of a Claude Code option is not a session choice (`--name resume`,
 # `--model -c`), so it is skipped. A single-value option consumes its next
 # token even when that is `--`; a variadic one consumes up to the next token
-# starting with `-` (commander's rules). The two lists below are the Rust
+# that is an option, i.e. longer than `-` and starting with it (commander's
+# rules; a lone `-` is a value). The two lists below are the Rust
 # CLAUDE_VALUE_FLAGS / CLAUDE_VARIADIC_FLAGS in src/claude_env.rs, and a test
 # there pins them together: keep each list on ONE line, starting with --name|
 # and --add-dir| respectively.
@@ -452,7 +453,7 @@ skip_values=0   # 1 = consume exactly one value; 2 = consume a variadic run
 for a in "$@"; do
   if [ "$skip_values" = 1 ]; then skip_values=0; continue; fi
   if [ "$skip_values" = 2 ]; then
-    case "$a" in -*) skip_values=0 ;; *) continue ;; esac
+    case "$a" in -?*) skip_values=0 ;; *) continue ;; esac
   fi
   case "$a" in
     --) break ;;
