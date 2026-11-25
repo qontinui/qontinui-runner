@@ -4284,8 +4284,21 @@ fn admit_launch(
     // RUNNING session twice (once in the readings, once here). Residual,
     // stated: a burst of LAUNCHES alone is bounded only by the readings.
     let pending = lock_recover(continuation_sessions(), "continuation_sessions").reserved_spawns;
-    let (decision, shadowed) = launch_admission(&reading, pending);
+    let (decision, shadowed, projected) = launch_admission(&reading, pending);
     crate::resource_guard::note_admission_shadowed_lane(shadowed.as_ref());
+    // A deferral is a stop: record the box's stats beside the reading that
+    // refused it. After the verdict, before the refusal is returned; the
+    // refusal itself is unchanged whatever the recorder does.
+    if decision.is_err() {
+        if let Some((severity, observation)) = projected.tripped() {
+            crate::pressure_stop::record_gate(
+                crate::pressure_stop::StopKind::DeferredLaunch,
+                severity,
+                crate::pressure_stop::WhatClass::CoordLaunch,
+                observation,
+            );
+        }
+    }
     decision
 }
 
@@ -4303,13 +4316,17 @@ fn admit_launch(
 pub(crate) fn launch_admission(
     reading: &crate::resource_guard::AdmissionReading,
     pending: usize,
-) -> (Result<(), String>, Option<crate::resource_guard::SpawnGate>) {
+) -> (
+    Result<(), String>,
+    Option<crate::resource_guard::SpawnGate>,
+    crate::resource_guard::SpawnGate,
+) {
     let (projected, shadowed) = reading.projected(pending);
     let decision = match launch_deferral_reason(&projected) {
         Some(reason) => Err(reason),
         None => Ok(()),
     };
-    (decision, shadowed)
+    (decision, shadowed, projected)
 }
 
 /// [`evaluate_continuation_guard`] with the load reading taken LIVE through
@@ -6857,7 +6874,7 @@ fn commit_pressure_stamp_reason(
 /// [`thread_pressure_stamp_reason`] (a wire class coord and the web already
 /// group on), the memory lane stamps [`commit_pressure_stamp_reason`]. The lane
 /// is read off the observation's METRIC, never re-derived from the severity.
-fn load_pressure_stamp_reason(
+pub(crate) fn load_pressure_stamp_reason(
     severity: &str,
     observation: &crate::resource_guard::GateObservation,
 ) -> String {
@@ -7449,6 +7466,14 @@ async fn run_gate_continuation_inner(
                  — re-delivered by the next poll (anchor_key={:?})",
                 observation.clause(severity),
                 payload.anchor_key
+            );
+            // The deferral is a stop: record what the box was carrying beside
+            // the reading that deferred it (warn and critical alike).
+            crate::pressure_stop::record_gate(
+                crate::pressure_stop::StopKind::DeferredContinuation,
+                severity,
+                crate::pressure_stop::WhatClass::GateContinuation,
+                &observation,
             );
             // The stamp reason names the lane and the REAL numbers, in the
             // `<class>:<detail>` shape coord-side grouping keys on:

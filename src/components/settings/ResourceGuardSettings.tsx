@@ -110,6 +110,11 @@ export interface SessionGuardSettingsValue {
   warn_thread_count?: number | null;
   critical_thread_count?: number | null;
   enabled: boolean;
+  /**
+   * Post each refusal or deferral to coord with the box's session count, CI
+   * runners and calibration. On by default; this is the per-machine off-switch.
+   */
+  report_pressure_stops: boolean;
 }
 
 /**
@@ -144,6 +149,7 @@ const DEFAULT_SESSION_GUARD: SessionGuardSettingsValue = {
   warn_thread_count: null,
   critical_thread_count: null,
   enabled: true,
+  report_pressure_stops: true,
 };
 
 const DEFAULT_CI_NODE: CiNodeSettingsValue = {
@@ -179,6 +185,9 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
     critical: number | null;
   }>({ warn: null, critical: null });
   const [guardEnabled, setGuardEnabled] = useState(DEFAULT_SESSION_GUARD.enabled);
+  const [reportPressureStops, setReportPressureStops] = useState(
+    DEFAULT_SESSION_GUARD.report_pressure_stops,
+  );
 
   const [ciNode, setCiNode] = useState<CiNodeSettingsValue>(DEFAULT_CI_NODE);
   const [hostSuggestion, setHostSuggestion] = useState<CiNodeHostSuggestion | null>(null);
@@ -222,6 +231,7 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
           setSavedThreads({ warn, critical });
           setThreadReport(thread_ceilings ?? null);
           setGuardEnabled(g.enabled);
+          setReportPressureStops(g.report_pressure_stops);
           onLog("debug", "Session-guard settings loaded");
         } else {
           onLog("warning", "Using default session-guard settings");
@@ -351,6 +361,7 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
         criticalFreeCommitBytes: gibToBytes(criticalGib),
         warnThreadCount: pendingWarnThreads,
         criticalThreadCount: pendingCriticalThreads,
+        reportPressureStops,
       });
       if (!guardResult?.success) {
         throw new Error(guardResult?.message || "Unknown error saving session-guard settings");
@@ -663,6 +674,23 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
             </p>
           </div>
         )}
+
+        <div className="flex items-center justify-between">
+          <div>
+            <h5 className="font-medium text-xs">Report refused spawns to coord</h5>
+            <p className="text-[10px] text-muted-foreground">
+              When this guard refuses or defers work for low memory or a high thread count, post one
+              event to coord with this machine&apos;s session count, active CI runners and
+              calibration. Fixed category names and numbers only — no command lines, paths or
+              prompts. Off sends nothing.
+            </p>
+          </div>
+          <ToggleSwitch
+            data-ui-bridge-id="settings.resource-guard-report-pressure-stops"
+            checked={reportPressureStops}
+            onChange={setReportPressureStops}
+          />
+        </div>
 
         <div className={`p-3 ${getAccentColors("blue").bg} rounded-lg flex gap-2`}>
           <Info className={`w-4 h-4 ${getAccentColors("blue").text} shrink-0 mt-0.5`} />

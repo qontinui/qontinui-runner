@@ -161,7 +161,9 @@ fn save_session_guard_settings_impl(
     critical_free_commit_bytes: u64,
     warn_thread_count: Option<usize>,
     critical_thread_count: Option<usize>,
+    report_pressure_stops: bool,
 ) -> Result<CommandResponse, AppError> {
+    info!(report_pressure_stops, "Saving session-guard pressure-stop reporting switch");
     info!(
         "Saving session-guard settings: enabled={}, warn_free_commit_bytes={}, \
          critical_free_commit_bytes={}, warn_thread_count={:?}, critical_thread_count={:?} \
@@ -231,6 +233,7 @@ fn save_session_guard_settings_impl(
         warn_thread_count,
         critical_thread_count,
         enabled,
+        report_pressure_stops,
     };
     settings::save_session_guard_settings(guard).map_err(AppError::ConfigError)?;
 
@@ -264,6 +267,7 @@ pub fn save_session_guard_settings(
     critical_free_commit_bytes: u64,
     warn_thread_count: Option<usize>,
     critical_thread_count: Option<usize>,
+    report_pressure_stops: bool,
 ) -> Result<CommandResponse, String> {
     save_session_guard_settings_impl(
         enabled,
@@ -271,6 +275,7 @@ pub fn save_session_guard_settings(
         critical_free_commit_bytes,
         warn_thread_count,
         critical_thread_count,
+        report_pressure_stops,
     )
     .map_err(String::from)
 }
@@ -488,7 +493,7 @@ mod tests {
     /// which of the two fields they transposed.
     #[test]
     fn inverted_floors_are_refused_before_any_write() {
-        let err = save_session_guard_settings_impl(true, GIB, 3 * GIB, None, None)
+        let err = save_session_guard_settings_impl(true, GIB, 3 * GIB, None, None, true)
             .expect_err("critical above warn must not persist");
         let msg = String::from(err);
         assert!(msg.contains(&GIB.to_string()), "{msg}");
@@ -540,7 +545,7 @@ mod tests {
             thread_ceiling_above_bound(Some(256), Some(max + 1)),
             Some(max + 1)
         );
-        let err = save_session_guard_settings_impl(true, 3 * GIB, GIB, Some(300), Some(max + 1))
+        let err = save_session_guard_settings_impl(true, 3 * GIB, GIB, Some(300), Some(max + 1), true)
             .expect_err("a ceiling past the bound must not persist");
         let msg = String::from(err);
         assert!(msg.contains(&(max + 1).to_string()), "{msg}");
@@ -554,7 +559,7 @@ mod tests {
     /// names both numbers so the operator can see which field they transposed.
     #[test]
     fn inverted_thread_ceilings_are_refused_before_any_write() {
-        let err = save_session_guard_settings_impl(true, 3 * GIB, GIB, Some(256), Some(200))
+        let err = save_session_guard_settings_impl(true, 3 * GIB, GIB, Some(256), Some(200), true)
             .expect_err("a critical ceiling below the warn ceiling must not persist");
         let msg = String::from(err);
         assert!(msg.contains("256"), "{msg}");

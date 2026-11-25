@@ -3368,6 +3368,20 @@ pub struct SessionGuardSettings {
     /// mean about the question, not about a sensor.
     #[serde(default = "default_session_guard_enabled")]
     pub enabled: bool,
+    /// Whether a refusal or deferral by this guard (either lane) is posted to
+    /// coord as a pressure-stop event carrying the box's session count, CI
+    /// runners and calibration (`crate::pressure_stop`, plan
+    /// `2026-11-24-pressure-stops-record-box-stats-in-coord`). Default **TRUE**:
+    /// the telemetry ships on, and this is the per-machine off-switch for data
+    /// that leaves the machine. It is separate from authorization, which is the
+    /// device credential the runner already holds. Off means nothing is queued.
+    /// An unreadable `settings.json` keeps the last value that was read.
+    #[serde(default = "default_report_pressure_stops")]
+    pub report_pressure_stops: bool,
+}
+
+fn default_report_pressure_stops() -> bool {
+    true
 }
 
 /// 3 GiB — see [`SessionGuardSettings`] on why the warn floor sits below
@@ -3489,6 +3503,7 @@ impl Default for SessionGuardSettings {
             warn_thread_count: None,
             critical_thread_count: None,
             enabled: default_session_guard_enabled(),
+            report_pressure_stops: default_report_pressure_stops(),
         }
     }
 }

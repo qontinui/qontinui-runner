@@ -259,6 +259,10 @@ mod repo_detection;
 /// (`terminal::session`) and the secondary runner process (`instance_manager`) —
 /// sit in different subtrees.
 mod resource_guard;
+/// Pressure-stop events: the resource guard's refusals and deferrals, posted
+/// to coord with the box's stats (plan
+/// `2026-11-24-pressure-stops-record-box-stats-in-coord`, Phase 3).
+mod pressure_stop;
 mod restate;
 mod rework;
 mod routing;

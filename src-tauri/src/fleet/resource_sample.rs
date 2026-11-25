@@ -670,6 +670,17 @@ impl Saturation {
         Self::new(SaturationCounter::Pids, used, max, source)
     }
 
+    /// The used half of the pair. Never negative: [`Self::new`] rejects that.
+    pub(crate) fn used(self) -> i64 {
+        self.used
+    }
+
+    /// The ceiling half of the pair. Always positive: [`Self::new`] rejects
+    /// anything else.
+    pub(crate) fn max(self) -> i64 {
+        self.max
+    }
+
     /// This reading's saturation ratio, `used / max`.
     ///
     /// **Total, not `Option`** — deliberately, and it is the payoff of the
@@ -1457,7 +1468,7 @@ fn collect_host_lane() -> ResourceSample {
 /// publish "this device is idle" for a device that did not answer, which on a
 /// `NULLS LAST` ranking is worse than publishing nothing at all. See
 /// [`ResourceSample::active_terminal_sessions`].
-fn live_terminal_session_count() -> Option<i32> {
+pub(crate) fn live_terminal_session_count() -> Option<i32> {
     use std::sync::Arc;
     let app = crate::tauri_app_handle::current()?;
     let manager = tauri::Manager::try_state::<Arc<crate::terminal::TerminalManager>>(&app)?;

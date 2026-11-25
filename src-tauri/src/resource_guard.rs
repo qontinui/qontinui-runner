@@ -2896,6 +2896,12 @@ pub(crate) fn admit_spawn(
                 what = %what,
                 "resource_guard: refusing to spawn past the session critical limit"
             );
+            crate::pressure_stop::record_gate(
+                crate::pressure_stop::StopKind::RefusedSpawn,
+                "critical",
+                crate::pressure_stop::WhatClass::for_spawn_what(what),
+                &observation,
+            );
             Err(critical_refusal(what, &observation))
         }
     }
@@ -2954,6 +2960,12 @@ pub(crate) fn precheck_spawn(what: &str, resource_override: bool) -> Result<(), 
                 what = %what,
                 "resource_guard: refusing a {what} before its worktree/claim acquisition \
                  (pre-check; the spawn seam would refuse it too)"
+            );
+            crate::pressure_stop::record_gate(
+                crate::pressure_stop::StopKind::RefusedSpawn,
+                "critical",
+                crate::pressure_stop::WhatClass::for_spawn_what(what),
+                &observation,
             );
             Err(critical_refusal(what, &observation))
         }
@@ -5871,6 +5883,7 @@ mod tests {
             warn_thread_count: Some(200),
             critical_thread_count: Some(300),
             enabled: true,
+            report_pressure_stops: true,
         };
 
         let floors = merge_floors(&local, fleet_bytes(Some(9 * GIB_U64), None));

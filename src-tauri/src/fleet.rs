@@ -1438,6 +1438,11 @@ pub fn spawn_budget_republisher(role: MachineRole) {
                 // Observation lane: best-effort, never retried, never fatal.
                 resource_sample::publish_once().await;
                 reporter.tick().await;
+                // Pressure-stop events the resource guard queued since the
+                // last tick (plan 2026-11-24-pressure-stops-record-box-stats-
+                // in-coord, Phase 3). Best-effort; quiet when the queue is
+                // empty, and it rides this loop's shared-state ownership gate.
+                crate::pressure_stop::flush().await;
 
                 // The CI node sizes its concurrency from coord's capacity
                 // model (plan 2026-11-05-one-free-resource-model-places-

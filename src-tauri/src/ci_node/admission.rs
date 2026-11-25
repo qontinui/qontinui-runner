@@ -20,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::{reporting, CiDispatchPayload};
+use crate::pressure_stop::StopReading;
 use crate::settings::CiNodeSettings;
 
 /// Pure admission verdict. `Reject` carries the operator-readable reason
@@ -328,31 +329,80 @@ pub(crate) fn admission_decision(
 /// exercised on its own, and so a future caller can ask the question without
 /// assembling a whole `CiNodeSettings`.
 pub(crate) fn headroom_defers(headroom: Headroom) -> bool {
+    headroom_defer_cause(headroom).is_some()
+}
+
+/// The reading that makes [`headroom_defers`] true, with the stamp-grammar
+/// reason naming it — `None` when headroom says go. The ONE author of the
+/// threshold policy: [`headroom_defers`] is exactly `is_some()` of this, so the
+/// pressure-stop event recorded for a deferral can never name a different term
+/// than the one that decided it.
+///
+/// Terms are tried in the order the policy has always used (swap, saturation,
+/// commit). Each cause carries the lane class and pool the event table keys on:
+/// swap and commit are memory (`host`), saturation is the task/PID table
+/// (`threads`). The reason prefix `ci_headroom:<term>` says which term, because
+/// a swap ratio and a commit floor are not the same unit under one lane name.
+pub(crate) fn headroom_defer_cause(headroom: Headroom) -> Option<(StopReading, String)> {
+    use crate::pressure_stop::PressureLane;
     // Swap FIRST — see `SWAP_DEFER_RATIO`.
-    if let Some(ratio) = headroom.swap_used_ratio() {
+    if let (Some(ratio), Some(total), Some(used)) = (
+        headroom.swap_used_ratio(),
+        headroom.swap_total_bytes,
+        headroom.swap_used_bytes,
+    ) {
         if ratio >= SWAP_DEFER_RATIO {
-            return true;
+            let limit = (total as f64 * SWAP_DEFER_RATIO) as u64;
+            return Some((
+                StopReading {
+                    lane: PressureLane::MemoryFreeCommit,
+                    guard_lane: "host".to_string(),
+                    observed: used,
+                    limit,
+                },
+                format!("ci_headroom:swap:{used}_over_{limit}"),
+            ));
         }
     }
     // Saturation SECOND, and ahead of commit for the same reason swap is: it is
     // the axis a memory reading cannot see. A box at 99.3% of its task ceiling
     // reported 73.3 GB free commit, so consulting commit first would have
     // proceeded straight into a machine where the build's own `fork()` fails.
-    if let Some(ratio) = headroom.saturation_ratio() {
-        if ratio >= SATURATION_DEFER_RATIO {
-            return true;
+    if let Some(saturation) = headroom.saturation {
+        if saturation.ratio() >= SATURATION_DEFER_RATIO {
+            let observed = u64::try_from(saturation.used()).unwrap_or(0);
+            let limit = (saturation.max() as f64 * SATURATION_DEFER_RATIO) as u64;
+            return Some((
+                StopReading {
+                    lane: PressureLane::ThreadPressure,
+                    guard_lane: "threads".to_string(),
+                    observed,
+                    limit,
+                },
+                format!("ci_headroom:saturation:{observed}_over_{limit}"),
+            ));
         }
     }
     if let Some(free) = headroom.commit_available_bytes {
         // The band is `DEFER_FREE_COMMIT_GB`, widened by the machine owner's
         // live-session floor when they have declared one above it — see
         // `defer_commit_floor_gb` and `MAX_SESSION_DEFER_FLOOR_GB`.
-        if free / (1024 * 1024 * 1024) < defer_commit_floor_gb(headroom.session_warn_floor_bytes) {
-            return true;
+        let floor_gb = defer_commit_floor_gb(headroom.session_warn_floor_bytes);
+        if free / (1024 * 1024 * 1024) < floor_gb {
+            let limit = floor_gb * 1024 * 1024 * 1024;
+            return Some((
+                StopReading {
+                    lane: PressureLane::MemoryFreeCommit,
+                    guard_lane: "host".to_string(),
+                    observed: free,
+                    limit,
+                },
+                format!("ci_headroom:commit:{free}_under_{limit}"),
+            ));
         }
     }
     // Every reading unavailable ⇒ no opinion ⇒ proceed. Fail open.
-    false
+    None
 }
 
 /// Live headroom probe. Every field degrades to `None` independently, so a
@@ -1483,7 +1533,7 @@ fn admit(payload: CiDispatchPayload, stamp: Option<QueueStamp>) {
     // partition it never exceeds.
     let host = super::host_sizing::probe();
     let max_concurrent = settings.effective_max_concurrent_builds_for(host);
-    let decision = {
+    let (decision, running_now) = {
         let state = ci_state().lock().unwrap();
         // Dedup: a dispatch already running or queued here is a duplicate
         // delivery (WS replay) — ignore it rather than double-building.
@@ -1499,12 +1549,10 @@ fn admit(payload: CiDispatchPayload, stamp: Option<QueueStamp>) {
             );
             return;
         }
-        admission_decision(
-            &settings,
-            max_concurrent,
-            &payload.repo,
-            state.running.len(),
-            headroom,
+        let running_now = state.running.len();
+        (
+            admission_decision(&settings, max_concurrent, &payload.repo, running_now, headroom),
+            running_now,
         )
     };
 
@@ -1534,6 +1582,24 @@ fn admit(payload: CiDispatchPayload, stamp: Option<QueueStamp>) {
                 "ci_node: deferring dispatch {dispatch_id} for {repo} (queue depth {depth}, \
                  waker_armed={needs_waker}) — at cap or below live headroom {headroom:?}"
             );
+            // Only the HEADROOM arm is a pressure stop: an at-cap defer is
+            // `admission_decision` saying the node is full of its own builds,
+            // not that the box ran short. The decision stays pure and returns a
+            // bare `Defer` for both, so the cause is re-asked here, at the
+            // caller, after the state lock above was released (the recorder
+            // reads the CI occupancy under that same lock). "warn": a CI defer
+            // is the lighter verdict - it never rejects.
+            if running_now < max_concurrent.max(1) as usize {
+                if let Some((reading, reason)) = headroom_defer_cause(headroom) {
+                    crate::pressure_stop::record_reading(
+                        crate::pressure_stop::StopKind::DeferredCiJob,
+                        "warn",
+                        crate::pressure_stop::WhatClass::CiJob,
+                        &reading,
+                        reason,
+                    );
+                }
+            }
             if needs_waker {
                 spawn_headroom_waker();
             }

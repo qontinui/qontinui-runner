@@ -899,6 +899,13 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
     // same session-less posture and E3 question as its parent's forwards.
     ("mcp/plan_library/followups.rs", "work-owed", 1),
     ("mcp/probe_executor.rs", "device", 1),
+    // `pressure_stop::deliver` (plan
+    // `2026-11-24-pressure-stops-record-box-stats-in-coord` Phase 3):
+    // `POST /coord/devices/{id}/resource-stop` is keyed by the device in the
+    // path and coord takes the tenant from the authenticated principal, never
+    // from the body, exactly as `post_resource_sample` does - `device` by
+    // construction.
+    ("pressure_stop.rs", "device", 1),
     ("repo_tenant.rs", "device", 2),
     ("plan_workunit_adapter/body_push.rs", "work-owed", 3),
 ];
@@ -1036,8 +1043,12 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
 /// artifact-keyed posture as its parent's forwards and the same E3 open
 /// question — web derives `organization_id` from the device principal. So
 /// `work-owed` 8 -> 9.
+///
+/// Plan `2026-11-24-pressure-stops-record-box-stats-in-coord` Phase 3 adds
+/// `pressure_stop::deliver`, the device-keyed `resource-stop` POST: `device` 22
+/// -> 23.
 const EXPECTED_TENANT_SCOPE_TOTALS: &[(&str, usize)] = &[
-    ("device", 22),
+    ("device", 23),
     ("session-noop", 11),
     ("session-owed", 0),
     ("work-owed", 9),
@@ -1199,8 +1210,8 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
         "every scanned defaulting call site should have been classified"
     );
     assert_eq!(
-        sites, 43,
-        "expected 43 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
+        sites, 44,
+        "expected 44 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
          session-scoped ones Phase 5 moved onto the tenant-STATING seam (52 - 12 = 40), plus 1 \
          new work-owed defaulting call site (mcp/plan_library.rs's upstream_get_raw, the \
          body-export forward, which shares upstream_get's qontinui-web base and its \
@@ -1260,7 +1271,7 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
          2026-10-10-small-followups-are-recorded-but-nothing-burns-them-down Phase 4 then \
          added mcp/plan_library/followups.rs's single `forward` (work-owed: the follow-up \
          family's five qontinui-web routes, the same session-less posture as its parent's \
-         forwards): 42 + 1 = 43. \
+         forwards): 42 + 1 = 43. Plan 2026-11-24-pressure-stops-record-box-stats-in-coord Phase 3 then added pressure_stop.rs's device-keyed resource-stop POST (device): 43 to 44. \
          Found {sites}. A change here \
          is fine — it just has \
          to be deliberate. It goes DOWN when a site adopts \
