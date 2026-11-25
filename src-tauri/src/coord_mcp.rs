@@ -9479,8 +9479,11 @@ const SIBLING_LIVEZ_BUDGET: std::time::Duration = std::time::Duration::from_secs
 ///
 /// Not a TCP connect: under a socket unit the port stays bound while the runner
 /// behind it is dead, and the kernel completes the handshake from the backlog,
-/// so a connect-only probe would keep every dead runner's credential file
-/// forever (plan
+/// so a connect-only probe could not tell a runner from an unrelated HTTP
+/// server. A port that accepts the connect and stays SILENT is still kept
+/// (`LivezVerdict::may_be_alive`): a live runner too loaded to answer in the
+/// budget looks the same, and the runner that owns a socket-unit port reaps its
+/// own leftovers when it comes back (plan
 /// `2026-11-24-runner-upgrades-itself-daily-keeping-sessions-alive-with-no-outage-and-automatic-rollback`,
 /// D1).
 fn loopback_port_alive(port: u16) -> bool {

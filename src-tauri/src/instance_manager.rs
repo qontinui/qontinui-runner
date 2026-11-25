@@ -242,7 +242,12 @@ impl InstanceManager {
     /// An HTTP answer, not a TCP connect: a port held by a socket unit (or by an
     /// unrelated process) accepts connects while no runner serves it (plan
     /// `2026-11-24-runner-upgrades-itself-daily-keeping-sessions-alive-with-no-outage-and-automatic-rollback`,
-    /// D1). A booting runner (`503 RUNNER_BOOTING`) counts as alive.
+    /// D1). A booting runner (`503 RUNNER_BOOTING`) counts as alive, and so does
+    /// a port that accepts the connect but stays silent inside the budget
+    /// (`LivezVerdict::Silent`): that is also what a live but loaded runner
+    /// looks like, and deregistering a live instance costs more than keeping a
+    /// dead one's row one pass longer. An unrelated HTTP server on the port, or
+    /// a refused connect, is purged.
     pub async fn purge_unreachable_registered(&self) -> u32 {
         let registered = self.registered.lock().await;
         let to_check: Vec<(String, u16)> = registered
