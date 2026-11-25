@@ -672,8 +672,9 @@ pub enum LivezVerdict {
     /// Some other HTTP status: something answers HTTP, but not as a runner.
     OtherStatus(u16),
     /// Positively no runner: the connect failed inside the budget (refused,
-    /// unreachable, or timed out before the handshake), or the holder of the
-    /// port answered with bytes that do not start like `HTTP/`.
+    /// unreachable, or timed out before the handshake), or what came back is
+    /// not a readable HTTP status line (see `resolve_probe_reply` for when
+    /// such a reply is [`Self::Silent`] instead).
     NoAnswer,
     /// The connect succeeded but no runner's answer came back: nothing at all
     /// (silence or a reset), or an HTTP-looking reply the server had not
@@ -692,9 +693,10 @@ impl LivezVerdict {
         matches!(self, Self::Live | Self::Booting)
     }
 
-    /// Whether a runner MAY be there: everything except a failed connect,
-    /// bytes that are not HTTP, and a complete status line with a code no
-    /// runner sends. A caller that DESTROYS something on a "dead" verdict (a
+    /// Whether a runner MAY be there: [`Self::Live`], [`Self::Booting`] or
+    /// [`Self::Silent`]. Every other verdict is positive evidence of no
+    /// runner; which replies are `Silent` is decided in one place,
+    /// `resolve_probe_reply`. A caller that DESTROYS something on a "dead" verdict (a
     /// sibling's credential file, its registration) uses this, so a live
     /// runner that was merely slow ([`Self::Silent`]) is never taken for
     /// dead. A false "dead" there costs a live sibling its credentials, while
@@ -809,10 +811,8 @@ pub fn classify_livez_response(raw: &[u8]) -> LivezVerdict {
     }
 }
 
-/// Whether a runner MAY be on `127.0.0.1:port` ([`LivezVerdict::may_be_alive`]):
-/// false only when the connect fails, or the port's holder answers with bytes
-/// that are not HTTP or with a complete status line carrying a code no runner
-/// sends. For callers that reap or deregister on `false`. A silent port is
+/// Whether a runner MAY be on `127.0.0.1:port`: [`probe_livez`] then
+/// [`LivezVerdict::may_be_alive`]. For callers that reap or deregister on `false`. A silent port is
 /// kept: under a socket unit that may be a dead runner's port, but the runner
 /// that owns that port reaps its own leftovers when it comes back, and a
 /// sibling must never reap a live-but-loaded runner's files.
@@ -956,6 +956,9 @@ mod tests {
         ] {
             assert_eq!(resolve(raw, false), LivezVerdict::Silent, "{raw:?}");
         }
+        // The same truncated replies, finished by the server, are believed.
+        assert_eq!(resolve(b"HTTP/1.1 50", true), LivezVerdict::OtherStatus(50));
+        assert_eq!(resolve(b"HTTP/", true), LivezVerdict::NoAnswer);
         // Nothing at all is silence, closed or not.
         assert_eq!(resolve(b"", true), LivezVerdict::Silent);
         // A complete non-runner status line is believed, finished or not.
