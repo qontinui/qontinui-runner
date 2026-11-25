@@ -2796,7 +2796,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // launch to it and exit (plan
     // 2026-11-24-runner-upgrades-itself-daily-keeping-sessions-alive-with-no-outage-and-automatic-rollback, D1).
     match runner_upgrade::cli::wait_for_predecessor_if_successor() {
-        Ok(true) => info!("runner upgrade: the predecessor has exited; this successor continues its boot"),
+        Ok(true) => {
+            info!("runner upgrade: the predecessor has exited; this successor continues its boot")
+        }
         Ok(false) => {}
         Err(e) => {
             error!("runner upgrade: not starting as the successor: {e}");
