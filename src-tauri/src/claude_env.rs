@@ -76,7 +76,11 @@ pub fn inherited_markers_detail(markers: &[&str]) -> String {
 /// case-insensitive: `--session-id`, `--resume`, `-r`, the `resume`
 /// subcommand, `--continue`, `-c`, plus the `--session-id=…` / `--resume=…`
 /// inline forms. A merely-prefixed token (`--session-id-ish`) does NOT match,
-/// and neither does anything after a `--`, which is positional.
+/// and neither does anything after a `--`, which is positional. Nor does the
+/// VALUE of a Claude Code option that takes one ([`CLAUDE_VALUE_FLAGS`],
+/// [`CLAUDE_VARIADIC_FLAGS`]): in `--name resume` or `--model -c` the token
+/// names a session title or a model, not a session choice, and reading it as
+/// one would leave the pane unpinned.
 ///
 /// The Rust spelling of that set, shared by every Rust reader: the native
 /// identity shim (`bin/qontinui_shim.rs`) decides from it whether to append
@@ -90,18 +94,77 @@ pub fn inherited_markers_detail(markers: &[&str]) -> String {
 /// copies of the list — a recorded follow-up, plan-library edge
 /// `2ce2a5a6-da43-4585-a372-d533fb50b7e7`.
 pub fn claude_argv_chooses_session<S: AsRef<str>>(args: &[S]) -> bool {
-    args.iter()
+    let mut tokens = args
+        .iter()
         .map(AsRef::as_ref)
         .take_while(|a| *a != "--")
-        .any(|a| {
-            let t = a.to_ascii_lowercase();
-            matches!(
-                t.as_str(),
-                "--session-id" | "--resume" | "-r" | "resume" | "--continue" | "-c"
-            ) || t.starts_with("--session-id=")
-                || t.starts_with("--resume=")
-        })
+        .peekable();
+    while let Some(a) = tokens.next() {
+        let t = a.to_ascii_lowercase();
+        if matches!(
+            t.as_str(),
+            "--session-id" | "--resume" | "-r" | "resume" | "--continue" | "-c"
+        ) || t.starts_with("--session-id=")
+            || t.starts_with("--resume=")
+        {
+            return true;
+        }
+        // An option's value is never a session choice. Inline `--flag=value`
+        // carries its value in the same token, so only the bare spelling
+        // consumes what follows.
+        if CLAUDE_VALUE_FLAGS.contains(&a) {
+            tokens.next();
+        } else if CLAUDE_VARIADIC_FLAGS.contains(&a) {
+            // Variadic options take every following token up to the next one
+            // that starts with `-` (commander's rule), so a `resume` in that
+            // run is a value. The `--` that ends the scan stops it too.
+            while tokens.next_if(|v| !v.starts_with('-')).is_some() {}
+        }
+    }
+    false
 }
+
+/// Claude Code options that take exactly ONE value, which is consumed even
+/// when it starts with `-` (commander's rule for a required option-argument).
+/// Case-sensitive, as the CLI is. A flag missing from this list only costs
+/// the old behaviour for its value (it is scanned as a token), so the list
+/// errs toward the options a runner or an operator template actually sends.
+pub const CLAUDE_VALUE_FLAGS: &[&str] = &[
+    "--name",
+    "-n",
+    "--model",
+    "--fallback-model",
+    "--permission-mode",
+    "--permission-prompt-tool",
+    "--append-system-prompt",
+    "--append-system-prompt-file",
+    "--system-prompt",
+    "--system-prompt-file",
+    "--output-format",
+    "--input-format",
+    "--settings",
+    "--setting-sources",
+    "--agent",
+    "--agents",
+    "--effort",
+    "--max-turns",
+    "--max-budget-usd",
+    "--json-schema",
+];
+
+/// Claude Code options that take one or more values: everything up to the
+/// next `-`-prefixed token.
+pub const CLAUDE_VARIADIC_FLAGS: &[&str] = &[
+    "--add-dir",
+    "--allowedTools",
+    "--allowed-tools",
+    "--disallowedTools",
+    "--disallowed-tools",
+    "--mcp-config",
+    "--plugin-dir",
+    "--tools",
+    "--betas",
+];
 
 #[cfg(test)]
 mod tests {
@@ -160,5 +223,47 @@ mod tests {
         let detail = inherited_markers_detail(&[CLAUDECODE_ENV, CLAUDE_CHILD_SESSION_ENV]);
         assert!(detail.contains(CLAUDECODE_ENV));
         assert!(detail.contains(CLAUDE_CHILD_SESSION_ENV));
+    }
+
+    #[test]
+    fn session_choice_tokens_are_recognised() {
+        for argv in [
+            &["--session-id", "x"][..],
+            &["--resume"],
+            &["-r", "x"],
+            &["resume"],
+            &["--continue"],
+            &["-c"],
+            &["--Session-Id=x"],
+            &["--resume=x"],
+            &["--verbose", "resume"],
+            &["--model", "opus", "-c"],
+            &["--add-dir", "a", "b", "--continue"],
+        ] {
+            assert!(
+                claude_argv_chooses_session(argv),
+                "{argv:?} chooses a session"
+            );
+        }
+    }
+
+    #[test]
+    fn an_option_value_is_not_a_session_choice() {
+        for argv in [
+            &["--name", "resume"][..],
+            &["-n", "-c"],
+            &["--model", "-r"],
+            &["--name", "resume", "--verbose"],
+            &["--add-dir", "a", "resume"],
+            &["--allowedTools", "Bash", "resume", "--", "-c"],
+            &["--session-id-ish"],
+            &["--", "resume"],
+            &["--name=resume"],
+        ] {
+            assert!(
+                !claude_argv_chooses_session(argv),
+                "{argv:?} chooses no session"
+            );
+        }
     }
 }
