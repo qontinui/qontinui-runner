@@ -15,9 +15,9 @@ import type { ExternalElement } from "../../types/ui-bridge-types";
  * not re-export `Scrubbed` (nor any of its minters) from a public entry point,
  * and the brand key is a module-private `unique symbol`, so a consumer can
  * neither name nor mint it. Deriving the alias from the wire type also keeps
- * this file compiling against BOTH the published `@qontinui/ui-bridge@0.22.0`
- * (where the field is a plain `string`, so this collapses to `string`) and
- * ui-bridge `main` (where it is `Scrubbed<string>`).
+ * this file compiling whichever shape the installed `@qontinui/ui-bridge`
+ * declares: a plain `string` (older releases such as 0.22.0, where this
+ * collapses to `string`) or `Scrubbed<string>`.
  */
 type ScrubbedString = NonNullable<DiscoveredElement["label"]>;
 

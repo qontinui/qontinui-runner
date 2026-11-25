@@ -350,6 +350,9 @@ fn read_state_flag(element: &serde_json::Value, field: &str) -> Option<bool> {
 /// package's release lineage. Reading an absent key as `false` therefore
 /// made BOTH new names permanently unmatchable: accepted at the door, then
 /// polled against a key the bridge never emits until the timeout expired.
+/// The split has since shipped (0.24.0, ui-bridge#166, per
+/// `src/lib/spec-execution/element-adapter.ts`), so the derived and
+/// not-observable arms below now serve older or external bridges.
 ///
 /// So each name gets the honest answer available on whichever build is running:
 ///
