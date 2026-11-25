@@ -559,7 +559,7 @@ async fn in_process_dismiss_recent_crash(
 ///
 /// - **The only gates in front of `POST /ui-bridge/invoke/{command}`** are
 ///   (1) the API listener binding the IPv4 loopback only
-///   (`mcp_api::try_bind_port`, `127.0.0.1`), (2) the command-NAME allowlist
+///   (`mcp_api::serve::api_addr`, `127.0.0.1`), (2) the command-NAME allowlist
 ///   ([`is_allowlisted`] — it gates which command, never who calls), and (3) the
 ///   backend relay's closed path allowlist (`mcp::relay_path_policy`), which
 ///   refuses this exact route to the remote `http_request` arm. There is NO

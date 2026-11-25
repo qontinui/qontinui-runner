@@ -25,7 +25,7 @@ struct HeartbeatPayload {
     /// listener's REAL local address (`AppState.api_lan_bound`, set in
     /// `mcp_api::start_server`) — currently always `false` because the
     /// runner API intentionally binds `127.0.0.1` only
-    /// (`mcp_api::try_bind_port`) while `ip` reports the machine's LAN IP.
+    /// (`mcp_api::serve::api_addr`) while `ip` reports the machine's LAN IP.
     /// Consumers (backend fleet registry → mobile) should treat `false` as
     /// "do not dial `ip:port` directly; use a loopback path (adb reverse)
     /// or a proxy". Additive field — backends that don't know it ignore it.

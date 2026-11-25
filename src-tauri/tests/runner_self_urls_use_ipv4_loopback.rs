@@ -4,7 +4,7 @@
 //! ## Why this test exists
 //!
 //! The runner's HTTP API binds the IPv4 loopback ONLY
-//! (`mcp_api.rs` `try_bind_port`, through `mcp::types::RUNNER_API_BIND_IP`).
+//! (`mcp_api/serve.rs` `api_addr`, through `mcp::types::RUNNER_API_BIND_IP`).
 //! Windows resolves `localhost` to `::1` FIRST, so every client that dials
 //! `http://localhost:<runner port>` first attempts a socket nobody listens on.
 //! Measured on a Windows fleet box (2026-10-25, live primary, `GET /health`):
