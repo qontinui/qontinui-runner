@@ -268,6 +268,15 @@ pub const CREDENTIAL_DOORS: &[&str] = &[
     // (scrubbed) props — the react-state class above. No browser caller.
     "GET /ui-bridge/control/component/{id}/capture",
     "GET /ui-bridge/control/element/{id}/capture",
+    // The same captures relayed from the active SDK app.
+    "GET /ui-bridge/sdk/component/{id}/capture",
+    "GET /ui-bridge/sdk/element/{id}/capture",
+    "GET /ui-bridge/sdk/control/component/{id}/capture",
+    "GET /ui-bridge/sdk/control/element/{id}/capture",
+    // A stored component baseline IS a capture (state and props included);
+    // the POST also writes it to disk.
+    "GET /ui-bridge/vision/component-baseline",
+    "POST /ui-bridge/vision/component-baseline",
     "GET /sessions/{id}/transcript",
     // Returns the pre-edit snapshot text AND the current on-disk text of every
     // file a session touched — local source content, the same class as the
