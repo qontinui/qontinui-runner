@@ -2743,6 +2743,27 @@ jobs:
           npm ci --prefix "$kit" --no-audit --no-fund
           echo "DESIGN_KIT_DIR=$kit" >> "$GITHUB_ENV"
 
+      # The New Project scaffold's first `npm install` must resolve: render the
+      # react-ui-bridge template's package.json and resolve it, peers included.
+      # The Rust check `template_tool_and_kit_peer_pins_agree` only implies
+      # this; here it is observed (an ERESOLVE against the kit's peer range
+      # once shipped every scaffold broken).
+      - name: Scaffold install resolves (rendered react-ui-bridge package.json)
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          scaffold="$RUNNER_TEMP/scaffold"
+          mkdir -p "$scaffold"
+          sed 's/{{app_id}}/ci-scaffold/g' \
+            src-tauri/src/commands/new_project_templates/react-ui-bridge/package.json.tmpl \
+            > "$scaffold/package.json"
+          if grep -q '{{' "$scaffold/package.json"; then
+            echo "::error::unrendered placeholder in the rendered template package.json"
+            exit 1
+          fi
+          npm install --package-lock-only --ignore-scripts --no-audit --no-fund --prefix "$scaffold"
+
       # APT half and CDN half split, so an apt hang is never misread as a CDN
       # or a validation failure. The Playwright version that matters is the kit
       # tool directory's.
