@@ -672,23 +672,41 @@ pub async fn fetch_obligations(claude_session_id: &str) -> Result<serde_json::Va
     )
     .await?;
     let deadline = tokio::time::Instant::now() + OBLIGATIONS_WALK_DEADLINE;
-    Ok(
-        walk_obligation_gate_pages(first, OBLIGATIONS_MAX_PAGES, |cursor| {
-            let page_url = obligations_gates_page_url(&url, &cursor);
-            let req = crate::coord_http::coord_get(client, &page_url);
-            async move {
-                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                if remaining.is_zero() {
-                    return Err(format!(
-                        "the {}s gates walk deadline passed",
-                        OBLIGATIONS_WALK_DEADLINE.as_secs()
-                    ));
-                }
-                read_obligations(req, &page_url, remaining.min(OBLIGATIONS_REQUEST_TIMEOUT)).await
+    let doc = walk_obligation_gate_pages(first, OBLIGATIONS_MAX_PAGES, |cursor| {
+        let page_url = obligations_gates_page_url(&url, &cursor);
+        let req = crate::coord_http::coord_get(client, &page_url);
+        async move {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(format!(
+                    "the {}s gates walk deadline passed",
+                    OBLIGATIONS_WALK_DEADLINE.as_secs()
+                ));
             }
-        })
-        .await,
-    )
+            read_obligations(req, &page_url, remaining.min(OBLIGATIONS_REQUEST_TIMEOUT)).await
+        }
+    })
+    .await;
+    walk_outcome(doc)
+}
+
+/// A walk that started and did not finish is a READ that failed, so it is
+/// `Err` naming why: [`wind_down::obligations_gate`] then reads it as
+/// unreadable, which trips the pass's `obligations_down` breaker instead of
+/// letting every later candidate walk a failing coord again, and the note
+/// reaches the verdict detail. A finished walk (or nothing to walk) is `Ok`;
+/// whether it is complete is still `all_tracked_sources_read`'s to say.
+pub fn walk_outcome(doc: serde_json::Value) -> Result<serde_json::Value, String> {
+    if doc["gates"]["walk"]["finished"] == serde_json::Value::Bool(false) {
+        return Err(format!(
+            "coord's gates pages could not all be read ({} page(s) read): {}",
+            doc["gates"]["walk"]["pages"],
+            doc["gates"]["walk"]["note"]
+                .as_str()
+                .unwrap_or("no reason recorded")
+        ));
+    }
+    Ok(doc)
 }
 
 /// Upper bound on pages one obligations read walks (coord's own in-process
@@ -836,6 +854,7 @@ where
     }
     merged["pending_pages"] = json!({"gates": !finished});
     merged["all_tracked_sources_read"] = json!(complete);
+    merged["requested_sources_read"] = json!(complete);
     merged
 }
 
@@ -2863,6 +2882,8 @@ mod tests {
         assert_eq!(doc["gates"]["truncated"], false);
         assert!(doc["gates"]["next_cursor"].is_null());
         assert_eq!(doc["gates"]["walk"]["pages"], 3);
+        assert_eq!(doc["requested_sources_read"], true);
+        assert!(walk_outcome(doc.clone()).is_ok());
         assert_eq!(
             wind_down::obligations_gate(&Ok(doc)),
             wind_down::ObligationsVerdict::Watched { judged: 5 }
@@ -2889,6 +2910,14 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("502"));
+        // fetch_obligations hands an unfinished walk on as a failed READ, so
+        // the pass's breaker trips and the note reaches the verdict.
+        let read = walk_outcome(doc.clone());
+        assert!(read.as_ref().unwrap_err().contains("502"), "{read:?}");
+        assert_eq!(
+            wind_down::obligations_gate(&read).reason(),
+            Some("obligations_unreadable")
+        );
         assert!(!wind_down::obligations_gate(&Ok(doc)).is_watched());
 
         // A cursor that repeats.
