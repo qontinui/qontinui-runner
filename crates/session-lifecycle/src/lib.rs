@@ -11,6 +11,12 @@
 //! lines (in each platform's [`Argv`] form) and a second, fresh table, and
 //! passes all three in.
 
+//!
+//! **Out of scope here.** The interim-host narrowing conjuncts I2 (composer
+//! witness), I3 (continuation-permit pacing), I4 (root-cwd move), I5 (close rate
+//! limit) and I7 (tenant proof) belong to Phases 52 and 54, where the interim
+//! host exists; this kernel carries only I1, I6 and I8 (see [`guard`]).
+
 pub mod classify_child;
 pub mod decide;
 pub mod evaluate;

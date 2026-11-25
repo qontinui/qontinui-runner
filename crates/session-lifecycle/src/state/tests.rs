@@ -89,7 +89,8 @@ fn known(now: u64) -> SessionState {
     s.work = Observed::new(Declared::Undeclared, t(now));
     s.owned = Observed::new(OwnedAxis::Known, t(now));
     s.custody = Observed::new(CustodyAxis::Known(vec![]), t(now));
-    s.revived = Tri::False;
+    s.revived = Observed::new(Tri::False, t(now));
+    s.coord_finished = Observed::new(Tri::False, t(now));
     s
 }
 
@@ -225,7 +226,7 @@ fn phases_follow_priority_order() {
     s.parked = Observed::new(
         Parked::ApiError {
             kind: ApiErrorKind::Overloaded,
-            retryable: true,
+            since: t(now),
         },
         t(now),
     );
@@ -381,12 +382,12 @@ fn finished_sub_phases() {
         Phase::Stopped(Stopped::FinishedUnverified)
     );
     s.custody = Observed::new(CustodyAxis::Known(vec![]), t(now));
-    s.revived = Tri::True;
+    s.revived = Observed::new(Tri::True, t(now));
     assert_eq!(
         phase_of(&s, none, false, t(now)),
         Phase::Stopped(Stopped::Revived)
     );
-    s.revived = Tri::unknown("r", "x");
+    s.revived = Observed::new(Tri::unknown("r", "x"), t(now));
     assert!(matches!(
         phase_of(&s, none, false, t(now)),
         Phase::Unknown(_)

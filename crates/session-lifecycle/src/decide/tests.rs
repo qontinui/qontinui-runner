@@ -16,7 +16,7 @@ fn rule(dec: &Decision) -> RuleId {
 
 fn idle_unfinished(s: &mut SessionState) {
     s.work = Observed::new(Declared::Undeclared, NOW);
-    s.coord_finished = Tri::False;
+    s.coord_finished = Observed::new(Tri::False, NOW);
     s.activity = Observed::new(
         Activity::Idle {
             since_turn_end: Timestamp(NOW.0 - 20 * MIN),
@@ -47,7 +47,7 @@ fn facts() -> ExitFacts {
 
 fn unfinish(s: &mut SessionState) {
     s.work = Observed::new(Declared::Working, NOW);
-    s.coord_finished = Tri::False;
+    s.coord_finished = Observed::new(Tri::False, NOW);
 }
 
 // ---- D0 --------------------------------------------------------------------
@@ -289,12 +289,53 @@ fn d11_auth_error_migrates_and_asks_the_operator_once_per_account() {
 }
 
 #[test]
-fn d12_a_retryable_error_continues_once_then_reports() {
+fn d12_a_request_error_continues_once_after_backoff_then_reports() {
     let mut s = closable();
     s.parked = Observed::new(
         Parked::ApiError {
             kind: ApiErrorKind::Overloaded,
-            retryable: true,
+            since: NOW,
+        },
+        NOW,
+    );
+    // Inside the backoff: observe, do not continue.
+    assert!(matches!(
+        d(&s, &[]).action,
+        Action::Observe {
+            why: ObserveWhy::Backoff { .. }
+        }
+    ));
+    // Every request-error kind of §3.2 is a Continue kind once the backoff ran.
+    for kind in [
+        ApiErrorKind::Overloaded,
+        ApiErrorKind::ServerError,
+        ApiErrorKind::InvalidRequest,
+        ApiErrorKind::MaxOutputTokens,
+        ApiErrorKind::Unknown,
+    ] {
+        let mut k = closable();
+        k.parked = Observed::new(
+            Parked::ApiError {
+                kind,
+                since: Timestamp(NOW.0 - 5 * MIN),
+            },
+            NOW,
+        );
+        assert!(
+            matches!(
+                d(&k, &[]).action,
+                Action::Continue {
+                    message: ContinueMsg::RetryAfterError { .. },
+                    ..
+                }
+            ),
+            "{kind:?}"
+        );
+    }
+    s.parked = Observed::new(
+        Parked::ApiError {
+            kind: ApiErrorKind::Overloaded,
+            since: Timestamp(NOW.0 - 5 * MIN),
         },
         NOW,
     );
@@ -417,7 +458,7 @@ fn d13_finished_yet_armed() {
 #[test]
 fn d14_a_revival_withdraws_the_finish() {
     let mut s = closable();
-    s.revived = Tri::True;
+    s.revived = Observed::new(Tri::True, NOW);
     let dec = d(&s, &[]);
     assert_eq!(rule(&dec), RuleId::D14);
     assert_eq!(dec.action, Action::WithdrawFinish);
@@ -698,7 +739,7 @@ fn d20_a_cleared_finished_session_closes_after_the_grace_and_waits_inside_it() {
 #[test]
 fn d20_a_refused_close_observes_then_reports_after_thirty_minutes() {
     let mut s = closable();
-    s.coord_finished = Tri::unknown("coord_row", "unreadable");
+    s.coord_finished = Observed::new(Tri::False, NOW);
     let dec = d(&s, &[done("w")]);
     assert!(matches!(
         dec.action,
@@ -879,7 +920,7 @@ fn d2_the_lifecycles_own_close_is_reported_and_a_cut_revival_is_resumed_d1() {
         matches!(&dec.action, Action::Report { detection } if detection.kind == DetectionKind::Closed)
     );
     let mut s = exited(f);
-    s.revived = Tri::True;
+    s.revived = Observed::new(Tri::True, NOW);
     let dec = d(&s, &[]);
     assert_eq!(rule(&dec), RuleId::D1);
     assert!(matches!(
@@ -1194,7 +1235,7 @@ fn a_held_session_gets_no_continue_of_any_rule() {
     p.parked = Observed::new(
         Parked::ApiError {
             kind: ApiErrorKind::ServerError,
-            retryable: true,
+            since: NOW,
         },
         NOW,
     );
@@ -1363,7 +1404,7 @@ fn bases() -> Vec<(SessionState, Vec<WorkItemView>)> {
     v.push((o.clone(), vec![owed("a")]));
     v.push((o, vec![]));
     let mut f = closable();
-    f.revived = Tri::True;
+    f.revived = Observed::new(Tri::True, NOW);
     v.push((f, vec![]));
     let mut l = closable();
     limit(&mut l, 3 * 60 * MIN, true);
@@ -1375,7 +1416,7 @@ fn bases() -> Vec<(SessionState, Vec<WorkItemView>)> {
     e.parked = Observed::new(
         Parked::ApiError {
             kind: ApiErrorKind::Overloaded,
-            retryable: true,
+            since: NOW,
         },
         NOW,
     );
@@ -1411,8 +1452,8 @@ fn unknownify(s: &SessionState, axis: usize) -> SessionState {
         5 => s.work = Observed::new(Declared::Unknown(u()), NOW),
         6 => s.owned = Observed::new(OwnedAxis::Unknown(u()), NOW),
         7 => s.custody = Observed::new(CustodyAxis::Unknown(u()), NOW),
-        8 => s.revived = Tri::Unknown(u()),
-        9 => s.coord_finished = Tri::Unknown(u()),
+        8 => s.revived = Observed::new(Tri::Unknown(u()), NOW),
+        9 => s.coord_finished = Observed::new(Tri::Unknown(u()), NOW),
         _ => s.schema_skew = Some(u()),
     }
     s
@@ -1444,24 +1485,15 @@ fn s2_an_unknown_axis_never_closes_withdraws_migrates_or_continues_into_unknown_
                 // closed path does not read leave its (resume / report) answer
                 // alone; none of the forbidden actions are reachable from it.
                 assert!(!dec.action.is_close(), "axis {a}: {dec:?}");
-                if matches!(a, 0..=4 | 10) {
-                    // Needed axes: the verdict withholds or is a typed Report.
-                    assert!(
-                        !matches!(
-                            dec.action,
-                            Action::WithdrawFinish
-                                | Action::Migrate { .. }
-                                | Action::Continue { .. }
-                        ),
-                        "axis {a}: {dec:?}"
-                    );
-                }
-                if a == 4 {
-                    assert!(!dec.action.is_continue());
-                }
-                if a == 8 || a == 9 || a == 6 || a == 7 {
-                    assert!(!dec.action.is_close(), "axis {a}");
-                }
+                // Every axis the spec lists (H, A, S, P, I, W, O, K, R, the coord
+                // row, schema skew): no WithdrawFinish, Migrate or Continue.
+                assert!(
+                    !matches!(
+                        dec.action,
+                        Action::WithdrawFinish | Action::Migrate { .. } | Action::Continue { .. }
+                    ),
+                    "axis {a}: {dec:?}"
+                );
             }
         }
     }
@@ -1622,4 +1654,153 @@ fn phases_are_covered_by_some_rule() {
         pid: 0,
         proc_start: 0,
     };
+}
+
+// ---- A1: W, the coord row and R must be fresh ------------------------------
+
+#[test]
+fn a_stale_w_coord_row_or_r_never_closes() {
+    let old = Timestamp(NOW.0 - 30 * MIN);
+    for (name, f) in [
+        (
+            "W",
+            Box::new(move |s: &mut SessionState| s.work = Observed::new(s.work.value.clone(), old))
+                as Box<dyn Fn(&mut SessionState)>,
+        ),
+        (
+            "coord",
+            Box::new(move |s: &mut SessionState| s.coord_finished = Observed::new(Tri::True, old)),
+        ),
+        (
+            "R",
+            Box::new(move |s: &mut SessionState| s.revived = Observed::new(Tri::False, old)),
+        ),
+    ] {
+        let mut s = closable();
+        f(&mut s);
+        let dec = d(&s, &[done("w")]);
+        assert!(!dec.action.is_close(), "{name}: {dec:?}");
+        assert!(
+            dec.guards.iter().any(|g| !g.value.is_true()) || rule(&dec) == RuleId::D0,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn a_turn_opening_invalidates_r_and_the_coord_row_until_re_read() {
+    use crate::state::{fold, Event, EventKind};
+    let s = closable();
+    let e = Event {
+        at: NOW,
+        seq: 1,
+        kind: EventKind::TurnStart,
+    };
+    let s = fold(s, &[e]);
+    assert!(s.revived.value.is_unknown());
+    assert!(s.coord_finished.value.is_unknown());
+    let s = fold(
+        s,
+        &[
+            Event {
+                at: NOW,
+                seq: 2,
+                kind: EventKind::TurnEnd,
+            },
+            Event {
+                at: NOW,
+                seq: 3,
+                kind: EventKind::RevivedRead(Tri::False),
+            },
+            Event {
+                at: NOW,
+                seq: 4,
+                kind: EventKind::CoordRow {
+                    finished: Tri::True,
+                },
+            },
+        ],
+    );
+    assert_eq!(s.revived.value, Tri::False);
+    assert_eq!(s.revived.observed_at, NOW);
+}
+
+// ---- A2: a Close in flight ---------------------------------------------------
+
+#[test]
+fn a_second_tick_during_the_ack_window_emits_no_second_close() {
+    use crate::state::{fold, Event, EventKind};
+    let s = closable();
+    let first = d(&s, &[done("w")]);
+    assert!(first.action.is_close());
+    // The actuator issues it: the fold records it in flight.
+    let issued = fold(
+        s,
+        &[Event {
+            at: NOW,
+            seq: 1,
+            kind: EventKind::CloseIssued,
+        }],
+    );
+    assert_eq!(issued.closing, Some(NOW));
+    for tick in 1..=4u64 {
+        let now = Timestamp(NOW.0 + tick * 30_000);
+        let mut at_tick = issued.clone();
+        // Keep every axis fresh for the later tick.
+        at_tick.hosting = Observed::new(at_tick.hosting.value.clone(), now);
+        at_tick.activity = Observed::new(at_tick.activity.value.clone(), now);
+        at_tick.selfcont = Observed::new(at_tick.selfcont.value.clone(), now);
+        at_tick.parked = Observed::new(at_tick.parked.value.clone(), now);
+        at_tick.input = Observed::new(at_tick.input.value.clone(), now);
+        at_tick.work = Observed::new(at_tick.work.value.clone(), now);
+        at_tick.revived = Observed::new(at_tick.revived.value.clone(), now);
+        at_tick.coord_finished = Observed::new(at_tick.coord_finished.value.clone(), now);
+        let dec = decide(&at_tick, &[done("w")], &dials(), X, now);
+        assert_eq!(dec.rule, RuleId::D20);
+        assert!(
+            matches!(
+                dec.action,
+                Action::Observe {
+                    why: ObserveWhy::CloseInFlight
+                }
+            ),
+            "tick {tick}: {dec:?}"
+        );
+    }
+    // Past its timeout the unacknowledged close is reported failed, still
+    // without a second Close.
+    let late = Timestamp(NOW.0 + 6 * MIN);
+    let mut at_late = issued.clone();
+    at_late.hosting = Observed::new(at_late.hosting.value.clone(), late);
+    at_late.activity = Observed::new(at_late.activity.value.clone(), late);
+    at_late.selfcont = Observed::new(at_late.selfcont.value.clone(), late);
+    at_late.parked = Observed::new(at_late.parked.value.clone(), late);
+    at_late.input = Observed::new(at_late.input.value.clone(), late);
+    at_late.work = Observed::new(at_late.work.value.clone(), late);
+    at_late.revived = Observed::new(at_late.revived.value.clone(), late);
+    at_late.coord_finished = Observed::new(at_late.coord_finished.value.clone(), late);
+    let dec = decide(&at_late, &[done("w")], &dials(), X, late);
+    assert!(matches!(
+        &dec.action,
+        Action::Report { detection } if detection.kind == DetectionKind::CloseNotAcknowledged
+    ));
+    // Settling the close (or the host exiting) clears the in-flight fact.
+    let settled = fold(
+        issued.clone(),
+        &[Event {
+            at: late,
+            seq: 2,
+            kind: EventKind::CloseSettled,
+        }],
+    );
+    assert_eq!(settled.closing, None);
+    let exited_after = fold(
+        issued,
+        &[Event {
+            at: late,
+            seq: 3,
+            kind: EventKind::HostExit(facts()),
+        }],
+    );
+    assert_eq!(exited_after.closing, None);
 }

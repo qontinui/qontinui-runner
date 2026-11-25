@@ -486,6 +486,7 @@ pub enum ObserveWhy {
     FinishedUnverifiedUnknown,
     GraceRunning { until: Timestamp },
     HeldAfterRelayedExit,
+    CloseInFlight,
     BudgetExhausted,
     DialOff,
     HostCannot,
@@ -566,9 +567,9 @@ pub enum DetectionKind {
     HeldAfterRelayedExit,
     FinishedUnverifiedUnknown,
     CustodyOwed,
-    ParkedNotRetryable,
     ParkedAuthNoMigration,
     CloseNotCleared,
+    CloseNotAcknowledged,
     ResumeRefused,
 }
 

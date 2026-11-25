@@ -596,7 +596,7 @@ pub fn parked_from(
             RecordKind::ApiError(ApiClass::Retryable(k)) => {
                 parked = Parked::ApiError {
                     kind: *k,
-                    retryable: true,
+                    since: r.at,
                 };
             }
             RecordKind::AutoContinueNotice { resets_at } => auto = Some((*resets_at, r.at)),
