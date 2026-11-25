@@ -17,7 +17,8 @@ import type { ExternalElement } from "../../types/ui-bridge-types";
  * neither name nor mint it. Deriving the alias from the wire type also keeps
  * this file compiling whichever shape the installed `@qontinui/ui-bridge`
  * declares: a plain `string` (older releases such as 0.22.0, where this
- * collapses to `string`) or `Scrubbed<string>`.
+ * collapses to `string`) or `Scrubbed<string>` (later releases, including
+ * the current pin).
  */
 type ScrubbedString = NonNullable<DiscoveredElement["label"]>;
 
@@ -80,7 +81,7 @@ export function externalToDiscovered(ext: ExternalElement): DiscoveredElement {
     state: {
       visible: ext.visible,
       enabled: ext.enabled,
-      // `@qontinui/ui-bridge@0.24.0` (ui-bridge#166) split the disabled axis:
+      // `@qontinui/ui-bridge@0.24.0` (ui-bridge#144) split the disabled axis:
       // `enabled` stayed as the DERIVED `!(disabled || ariaDisabled)`, and the
       // two independent signals became required fields. The external wire
       // carries only the folded bit plus `accessibility.ariaDisabled`, so this
