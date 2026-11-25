@@ -901,7 +901,7 @@ mod tests {
                 }
             );
             for key in LISTEN_ENV_KEYS {
-                assert!(env.get(key).is_none(), "{key} not cleared");
+                assert!(!env.contains_key(key), "{key} not cleared");
             }
             // SAFETY: fcntl on our own open fd.
             let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
