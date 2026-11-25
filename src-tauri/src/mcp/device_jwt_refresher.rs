@@ -16447,6 +16447,60 @@ mod tenant_seed_arm_tests {
         assert!(seen.lock().unwrap().is_empty());
     }
 
+    /// The production entry point: `run_due_seeds` against a coord that never
+    /// answers (connection refused) records the unanswered attempt, and the
+    /// planner holds the tenant silent through the backoff, then retries.
+    #[tokio::test]
+    async fn run_due_seeds_records_an_unanswered_seed_and_the_planner_retries_it_after_the_backoff() {
+        let _lock = super::posture_test_lock();
+        let presenter_t = tenant(0);
+        let t = uuid::Uuid::now_v7();
+        let (mgr, _) = store_with_presenter("run_due_transport", presenter_t);
+        let path = gap_state_path("run_due_transport");
+        let now = chrono::Utc::now().timestamp();
+        let planned = plan_gap_actions_at(&path, &gaps(&[t]), Some(&[]), Some(ACCT), now, true);
+        assert_eq!(planned, vec![GapAction::SeedDue(t)]);
+
+        // Port 1 refuses the connection: coord never answers.
+        let results = run_due_seeds(&mgr, "http://127.0.0.1:1", DID, &planned, Some(&path)).await;
+        assert_eq!(results.len(), 1, "{results:?}");
+        assert!(!results[0].1.reached_coord(), "{results:?}");
+        let rec = load_gap_ask_state(&path).tenants[&t.to_string()].clone();
+        assert_eq!(rec.seed_unanswered, 1, "{rec:?}");
+        assert!(!rec.seed_attempted, "the seed is re-armed: {rec:?}");
+
+        let pending =
+            plan_gap_actions_at(&path, &gaps(&[t]), Some(&[]), Some(ACCT), now + 60, true);
+        assert_eq!(pending, vec![GapAction::Silent(t)], "silent during the backoff");
+        let retry =
+            plan_gap_actions_at(&path, &gaps(&[t]), Some(&[]), Some(ACCT), now + 3600, true);
+        assert_eq!(retry, vec![GapAction::SeedDue(t)], "retried after the backoff");
+    }
+
+    /// The UI pull path serves the stored `seed_unanswered` count: once the
+    /// budget is spent the ask names the attempts.
+    #[test]
+    fn the_pull_path_names_the_attempts_once_the_unanswered_budget_is_spent() {
+        let path = gap_state_path("pull_spent_reason");
+        let t = tenant(2);
+        let mut now = 1_800_000_000;
+        for _ in 0..=BINDING_GAP_SEED_MAX_UNANSWERED {
+            plan_gap_actions_at(&path, &gaps(&[t]), Some(&[]), Some(ACCT), now, true);
+            record_seed_outcome_at(&path, &t, &SeedOutcome::Transport("refused".into()), now);
+            now += 10_000;
+        }
+        let actions = plan_gap_actions_at(&path, &gaps(&[t]), Some(&[]), Some(ACCT), now, true);
+        assert_eq!(notified(&actions).len(), 1, "the ask opens: {actions:?}");
+        let open = open_binding_gap_asks(&path, &qontinui_runner_lib::pair::CoordBoundTenantsRead::Known(vec![t]), Some(&[]), Some(ACCT))
+            .expect("known bound set");
+        assert_eq!(open.len(), 1, "{open:?}");
+        let reason = open[0]["reason"].as_str().expect("reason");
+        assert!(
+            reason.contains("6 attempts, coord never answered"),
+            "pull path must serve the stored count: {reason}"
+        );
+    }
+
     #[tokio::test]
     async fn an_unusable_2xx_and_a_dead_door_are_fallbacks_not_writes() {
         let (presenter_t, want) = (tenant(0), tenant(1));
