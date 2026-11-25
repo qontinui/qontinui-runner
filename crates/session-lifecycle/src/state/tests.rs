@@ -21,8 +21,8 @@ fn kleene_and_or_not() {
     assert_eq!(True.or(u()), True);
     assert!(False.or(u()).is_unknown());
     assert_eq!(False.or(False), False);
-    assert!(u().not().is_unknown());
-    assert_eq!(True.not(), False);
+    assert!(u().negate().is_unknown());
+    assert_eq!(True.negate(), False);
     assert_eq!(Tri::all([]), True);
     assert!(Tri::all([True, u(), True]).is_unknown());
     assert_eq!(Tri::all([True, u(), False]), False);
