@@ -109,7 +109,10 @@ fn only_allow_listed_modules_touch_the_oauth_slot() {
         }
     }
     println!("scanned={} allowed_hits={allowed_hits}", files.len());
-    assert!(allowed_hits > 0, "allow-listed readers matched nothing: scan is vacuous");
+    assert!(
+        allowed_hits > 0,
+        "allow-listed readers matched nothing: scan is vacuous"
+    );
     assert!(
         violations.is_empty(),
         "OAuth-slot material named outside the allow-list (add a reviewed reader to ALLOWED only \
