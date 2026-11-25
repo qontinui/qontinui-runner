@@ -6497,7 +6497,21 @@ fn quarantine_degraded_snapshot(path: &Path, original: Original<'_>, reason: &st
                         kind,
                         std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::IsADirectory
                     ) {
-                        std::fs::rename(path, &quarantine)?
+                        std::fs::rename(path, &quarantine)?;
+                        // The rename moved the original: nothing is left at
+                        // `path`, so an `Err` here would tell the operator the
+                        // snapshot "is the only copy" at a path that no longer
+                        // exists. The rows sit under one of the two names
+                        // whatever a crash does to the un-fsynced rename, so it
+                        // is preserved; say the directory fsync failed instead.
+                        if let Err(e) = sync_parent_dir(path) {
+                            warn!(
+                                error = %e,
+                                quarantine = %quarantine.display(),
+                                "session_lifecycle_store: quarantine renamed into place but its directory fsync failed; the original's bytes are under the quarantine name (or, after a crash, still under the snapshot name)"
+                            );
+                        }
+                        return Ok(quarantine.clone());
                     } else {
                         return Err(copy_err);
                     }
