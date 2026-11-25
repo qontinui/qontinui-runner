@@ -47,7 +47,9 @@
 //! already rated `Eligible`, never by `/restart-readiness`. The probes sit
 //! behind [`CustodyProbe`] so the gather is testable without shelling out;
 //! [`GitCustodyProbe`] is the shipped one, and every git call it makes is
-//! bounded by [`CUSTODY_PROBE_TIMEOUT`].
+//! bounded by [`CUSTODY_PROBE_TIMEOUT`]. The session's transcript is read
+//! through the same seam ([`CustodyProbe::transcript_scan`], bounded by
+//! [`crate::session::transcript_trees`]).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -58,11 +60,12 @@ use crate::agent_worktree::custody::{self, coord::CoordOwnership};
 use crate::mcp::session_work_status::StatusFetch;
 use crate::session::session_lifecycle_store::TerminalSessionRecord;
 use crate::session::tracking_health::{LiveClaudeProcess, SessionWorkStatus, TrackingHealthPass};
+use crate::session::transcript_trees::{self, TranscriptScan};
 use crate::terminal::agent_status_sideband::ObservedAgentState;
 use crate::terminal::TerminalManager;
 use qontinui_runner_lib::wind_down::{
     self, CustodyInputs, CustodyMember, EligibilityInputs, GridIdle, MemberState, SessionKind,
-    Sideband, SidebandState, WindDownView, WorkStatus,
+    Sideband, SidebandState, TranscriptRead, WindDownView, WorkStatus,
 };
 
 /// The cause recorded when the terminal-session plane cannot be counted
@@ -922,18 +925,136 @@ pub trait CustodyProbe: Send + Sync {
     async fn member_state(&self, root: &Path) -> MemberState;
     /// `wip_state` of the custody SLOT this session wrote in `root`, if any.
     async fn slot_wip_state(&self, root: &Path, claude_session_id: &str) -> Option<String>;
+    /// The directories the session's transcript names, and whether it proves
+    /// the session called no write-capable tool
+    /// ([`crate::session::transcript_trees`]).
+    async fn transcript_scan(&self, claude_session_id: &str) -> TranscriptScan;
+    /// What a REAPED allocation tree (one [`allocation_tree`] names that no
+    /// longer exists) left behind: its working tree is gone, but its branch
+    /// survives the reap in the primary checkout and may hold commits on no
+    /// remote. `Probed { dirty: false, ahead }` counts those commits;
+    /// `ProbeFailed` when the branch or its primary cannot be found or read.
+    async fn reaped_allocation_state(&self, tree: &Path) -> MemberState;
+}
+
+/// The worktree holding a directory the transcript names, found through its
+/// nearest EXISTING ancestor. A transcript can name a directory that has
+/// since been removed. `Ok(None)` only when the directory itself still exists
+/// and is in no repository (a scratch dir). A directory that is GONE stands
+/// for itself only inside its own live allocation tree ([`allocation_tree`]):
+/// anywhere else the tree the walk lands on (none, a primary checkout, or a
+/// linked worktree it was nested in) is not the tree the directory was in,
+/// which may have been removed with its work, so it is `Err`. Also `Err` when
+/// an existence check could not be answered, or no ancestor exists.
+async fn transcript_dir_root<P: CustodyProbe + ?Sized>(
+    probe: &P,
+    dir: &Path,
+) -> Result<Option<PathBuf>, String> {
+    for ancestor in dir.ancestors().filter(|a| !a.as_os_str().is_empty()) {
+        if probe.exists(ancestor).await? {
+            let root = probe.worktree_root(ancestor).await?;
+            if ancestor != dir {
+                let own = allocation_tree(dir);
+                let in_own_tree = matches!((&root, &own), (Some(r), Some(t))
+                    if custody::norm(&r.to_string_lossy()) == custody::norm(&t.to_string_lossy()));
+                if !in_own_tree {
+                    return Err(format!(
+                        "{} no longer exists and is not inside its own live allocation tree, so \
+                         the tree it was in is not known",
+                        dir.display()
+                    ));
+                }
+            }
+            return Ok(root);
+        }
+    }
+    Err(format!("no ancestor of {} exists", dir.display()))
+}
+
+/// The directories, under the workspace root, that allocations are
+/// materialised in: `allocate-worktree.sh`'s and the runner's own.
+const ALLOCATION_ROOT_DIRNAMES: [&str; 2] = [
+    crate::agent_worktree::canonical_paths::SCRIPT_WORKTREE_ROOT_DIRNAME,
+    crate::agent_worktree::canonical_paths::WORKTREE_ROOT_DIRNAME,
+];
+
+/// PURE: the allocation tree a directory sits under, by path alone —
+/// `<ws>/<root>/<agent_id>/<repo>`, or `<ws>/<root>/<agent_id>` when the
+/// directory names no `<repo>` component, where `<root>` is one of
+/// [`ALLOCATION_ROOT_DIRNAMES`]. `None` outside that layout, and for a
+/// dot-named `<agent_id>` (the shared `.siblings` store, never an allocation).
+pub fn allocation_tree(dir: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    let parts: Vec<Component> = dir.components().collect();
+    let at = parts.iter().position(|c| {
+        matches!(c, Component::Normal(n)
+            if ALLOCATION_ROOT_DIRNAMES
+                .iter()
+                .any(|root| n.to_string_lossy().eq_ignore_ascii_case(root)))
+    })?;
+    match parts.get(at + 1)? {
+        Component::Normal(id) if !id.to_string_lossy().starts_with('.') => {}
+        _ => return None,
+    }
+    let end = match parts.get(at + 2) {
+        Some(Component::Normal(_)) => at + 3,
+        _ => at + 2,
+    };
+    Some(parts[..end].iter().collect())
+}
+
+/// PURE: where a reaped allocation tree `<ws>/<root>/<agent_id>/<repo>` left
+/// its branch — the primary checkout `<ws>/<repo>` — and the first 12 hex
+/// digits of `<agent_id>`, which its branch name carries
+/// (`agent/<…>-<id12>/<slug>`). `Err` when the tree names no `<repo>` or the
+/// id has fewer than 12 hex digits.
+pub fn reaped_allocation_origin(tree: &Path) -> Result<(PathBuf, String), String> {
+    let unnamed = || format!("{} names no <agent_id>/<repo> allocation", tree.display());
+    let repo = tree.file_name().ok_or_else(unnamed)?;
+    let id_dir = tree.parent().ok_or_else(unnamed)?;
+    let id = id_dir.file_name().ok_or_else(unnamed)?.to_string_lossy();
+    let root = id_dir.parent().ok_or_else(unnamed)?;
+    let is_root = root.file_name().is_some_and(|n| {
+        ALLOCATION_ROOT_DIRNAMES
+            .iter()
+            .any(|r| n.to_string_lossy().eq_ignore_ascii_case(r))
+    });
+    let workspace = root.parent().filter(|_| is_root).ok_or_else(unnamed)?;
+    let id12: String = id.chars().filter(|c| *c != '-').take(12).collect();
+    if id12.len() < 12 || !id12.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "allocation id {id} does not carry the 12 hex digits its branch is named by"
+        ));
+    }
+    Ok((workspace.join(repo), id12.to_ascii_lowercase()))
+}
+
+/// PURE: is `refname` a branch of the allocation whose id starts `id12` —
+/// `refs/heads/agent/<…>-<id12>/<slug>`, or `refs/heads/agent/<…>-<id12>`
+/// with no slug?
+pub fn allocation_branch_matches(refname: &str, id12: &str) -> bool {
+    refname
+        .strip_prefix("refs/heads/agent/")
+        .and_then(|rest| rest.split('/').next())
+        .is_some_and(|owner| owner.to_ascii_lowercase().ends_with(&format!("-{id12}")))
 }
 
 /// Gather [`CustodyInputs`] for one candidate (D2b).
 ///
 /// The set is the repo holding the session's directory, every attributed
-/// worktree and every isolated-edit worktree, each resolved to its worktree
+/// worktree, every isolated-edit worktree and every worktree holding a
+/// directory the session's transcript names, each resolved to its worktree
 /// root and probed ONCE however many sources named it. A directory in no
 /// repository contributes no member, so a session at the workspace root is
-/// judged by its attributed worktrees alone. An attributed worktree whose
-/// ledger row is retired (merged or abandoned) and whose path no longer
-/// exists was reaped and is skipped; every other missing path is a failed
-/// probe.
+/// judged by the worktrees the other sources name. When none names one,
+/// the transcript's no-write proof decides (step 5 of
+/// [`wind_down::custody_gate`]), and a transcript that could not be read
+/// whole leaves any set UNKNOWN (step 6). An attributed worktree whose ledger
+/// row is retired (merged or abandoned) and whose path no longer exists was
+/// reaped and is skipped. A transcript directory under an allocation tree
+/// that is gone ([`allocation_tree`]) is covered and judged by the branch the
+/// reaped tree left ([`CustodyProbe::reaped_allocation_state`]). Every other
+/// missing path is a failed probe.
 ///
 /// When the verdict is already decided — no directory, or an unreadable
 /// attribution (the ownership read, or the isolated-edit context), both
@@ -964,6 +1085,7 @@ pub async fn gather_custody<P: CustodyProbe + ?Sized>(
             ownership,
             members: Vec::new(),
             covered: Vec::new(),
+            transcript: TranscriptRead::unread("not read: the verdict was already decided"),
         };
     };
 
@@ -1024,6 +1146,67 @@ pub async fn gather_custody<P: CustodyProbe + ?Sized>(
             }),
         }
     }
+    // The transcript's directories (plan
+    // `2026-11-20-triage-sessions-custody-reads-the-sessions-recorded-trees-not-its-cwd`,
+    // D1, D6, D10 and D11). One in no repository, such as a scratch dir or the
+    // workspace root itself, names no tree and contributes nothing. One in a
+    // primary checkout is that checkout, a member (D10). One under an
+    // allocation tree that is gone was reaped (D11): it is never walked up into
+    // the repository that encloses the allocation root. The tree is covered and
+    // judged by the branch it left behind, which survives the reap, so commits
+    // on no remote are not lost to a close.
+    let transcript = probe.transcript_scan(claude_session_id).await;
+    let mut allocations: HashMap<PathBuf, bool> = HashMap::new();
+    for dir in &transcript.dirs {
+        if let Some(tree) = allocation_tree(dir) {
+            let live = match allocations.get(&tree) {
+                Some(live) => Ok(*live),
+                None => probe.exists(&tree).await,
+            };
+            match live {
+                Ok(false) => {
+                    if allocations.insert(tree.clone(), false).is_none() {
+                        tracing::debug!(
+                            session_id = %claude_session_id,
+                            tree = %tree.display(),
+                            "custody: the transcript names a reaped allocation tree; judging its branch"
+                        );
+                        covered.push(tree.display().to_string());
+                        members.push(CustodyMember {
+                            path: tree.display().to_string(),
+                            state: probe.reaped_allocation_state(&tree).await,
+                            slot_wip_state: None,
+                        });
+                    }
+                    continue;
+                }
+                Ok(true) => {
+                    allocations.insert(tree, true);
+                }
+                Err(e) => {
+                    members.push(CustodyMember {
+                        path: dir.display().to_string(),
+                        state: MemberState::ProbeFailed(e),
+                        slot_wip_state: None,
+                    });
+                    continue;
+                }
+            }
+        }
+        match transcript_dir_root(probe, dir).await {
+            Ok(Some(root)) => {
+                if seen.insert(custody::norm(&root.to_string_lossy())) {
+                    roots.push(root);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => members.push(CustodyMember {
+                path: dir.display().to_string(),
+                state: MemberState::ProbeFailed(e),
+                slot_wip_state: None,
+            }),
+        }
+    }
     covered.extend(roots.iter().map(|r| r.display().to_string()));
     for root in roots {
         let state = probe.member_state(&root).await;
@@ -1039,11 +1222,13 @@ pub async fn gather_custody<P: CustodyProbe + ?Sized>(
         ownership,
         members,
         covered,
+        transcript: transcript.read,
     }
 }
 
 /// The shipped [`CustodyProbe`]: a filesystem walk for the root, git for the
-/// state, and the custody slot store for the cross-check.
+/// state, the custody slot store for the cross-check, and the session's
+/// transcript for the directories it names.
 #[derive(Debug, Clone, Copy)]
 pub struct GitCustodyProbe {
     /// Bound on each git subprocess.
@@ -1254,6 +1439,72 @@ impl CustodyProbe for GitCustodyProbe {
         .ok()
         .flatten()
     }
+
+    async fn transcript_scan(&self, claude_session_id: &str) -> TranscriptScan {
+        let session_id = claude_session_id.to_string();
+        qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+            transcript_trees::scan_session(&session_id)
+        })
+        .await
+        .unwrap_or_else(|e| TranscriptScan::unread(format!("the transcript scan died: {e}")))
+    }
+
+    async fn reaped_allocation_state(&self, tree: &Path) -> MemberState {
+        match self.reaped_branch_commits(tree).await {
+            Ok(ahead) => MemberState::Probed {
+                dirty: false,
+                ahead,
+            },
+            Err(e) => MemberState::ProbeFailed(e),
+        }
+    }
+}
+
+impl GitCustodyProbe {
+    /// The commits on no remote-tracking ref across every branch a reaped
+    /// allocation tree left in its primary checkout
+    /// ([`reaped_allocation_origin`]). `Err` when that primary is not a
+    /// primary checkout, no branch carries the allocation's id, or a git call
+    /// fails. A missing branch is not "nothing to lose": it may be the wrong
+    /// primary, so it is never read as zero.
+    async fn reaped_branch_commits(&self, tree: &Path) -> Result<u64, String> {
+        let (primary, id12) = reaped_allocation_origin(tree)?;
+        match std::fs::metadata(primary.join(".git")) {
+            Ok(meta) if meta.is_dir() => {}
+            _ => {
+                return Err(format!(
+                    "{} was reaped and {} is not the primary checkout its branch would be in",
+                    tree.display(),
+                    primary.display()
+                ))
+            }
+        }
+        let refs = self
+            .git_ok(
+                &primary,
+                &["for-each-ref", "--format=%(refname)", "refs/heads/agent/"],
+            )
+            .await?;
+        let branches: Vec<&str> = refs
+            .lines()
+            .filter(|r| allocation_branch_matches(r, &id12))
+            .collect();
+        if branches.is_empty() {
+            return Err(format!(
+                "{} was reaped and {} holds no branch refs/heads/agent/*-{id12} or \
+                 refs/heads/agent/*-{id12}/*, so what it left cannot be read",
+                tree.display(),
+                primary.display()
+            ));
+        }
+        let mut args = vec!["rev-list", "--count"];
+        args.extend(branches.iter().copied());
+        args.extend(["--not", "--remotes"]);
+        let count = self.git_ok(&primary, &args).await?;
+        count
+            .parse::<u64>()
+            .map_err(|e| format!("git {} printed {count:?}: {e}", args.join(" ")))
+    }
 }
 
 #[cfg(test)]
@@ -1380,7 +1631,9 @@ mod tests {
 
     // ── Custody inputs (finished_close, D2b/D2c) ─────────────────────────
 
-    use qontinui_runner_lib::wind_down::{custody_gate, CustodyUnknown, CustodyVerdict};
+    use qontinui_runner_lib::wind_down::{
+        custody_gate, CustodyDirty, CustodyUnknown, CustodyVerdict,
+    };
 
     /// A [`CustodyProbe`] answering from a script and recording every call.
     #[derive(Default)]
@@ -1397,6 +1650,12 @@ mod tests {
         missing: HashSet<PathBuf>,
         /// paths whose existence cannot be determined.
         exists_unreadable: HashSet<PathBuf>,
+        /// What the transcript scan answers. Absent = read whole, naming no
+        /// directory and no write-capable call: the tests that exercise the
+        /// other sources need a transcript that adds nothing.
+        transcript: Option<TranscriptScan>,
+        /// reaped allocation tree → what its branch left. Absent = unreadable.
+        reaped: HashMap<PathBuf, MemberState>,
         calls: std::sync::Mutex<Vec<String>>,
     }
 
@@ -1411,6 +1670,24 @@ mod tests {
         }
         fn calls(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
+        }
+        /// Script the transcript scan: the directories it names, the reason
+        /// it was not read whole (if any), and the write-capable call it holds
+        /// (if any).
+        fn transcript(
+            mut self,
+            dirs: &[&str],
+            incomplete: Option<&str>,
+            write_call: Option<&str>,
+        ) -> Self {
+            self.transcript = Some(TranscriptScan {
+                dirs: dirs.iter().map(PathBuf::from).collect(),
+                read: TranscriptRead {
+                    incomplete: incomplete.map(str::to_string),
+                    write_call: write_call.map(str::to_string),
+                },
+            });
+            self
         }
     }
 
@@ -1447,6 +1724,24 @@ mod tests {
         }
         async fn slot_wip_state(&self, root: &Path, _claude_session_id: &str) -> Option<String> {
             self.slots.get(root).cloned()
+        }
+        async fn reaped_allocation_state(&self, tree: &Path) -> MemberState {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("reaped:{}", tree.display()));
+            self.reaped.get(tree).cloned().unwrap_or_else(|| {
+                MemberState::ProbeFailed(format!("{}: no branch found", tree.display()))
+            })
+        }
+        async fn transcript_scan(&self, _claude_session_id: &str) -> TranscriptScan {
+            self.transcript.clone().unwrap_or(TranscriptScan {
+                dirs: Vec::new(),
+                read: TranscriptRead {
+                    incomplete: None,
+                    write_call: None,
+                },
+            })
         }
     }
 
@@ -1493,9 +1788,13 @@ mod tests {
                     ahead: 0,
                 },
             );
-        let none = gather_custody(&probe, &context(Some("/ws"), &[]), Ok(vec![]), "s").await;
+        let proven = FakeProbe::default().transcript(&["/ws"], None, None);
+        let none = gather_custody(&proven, &context(Some("/ws"), &[]), Ok(vec![]), "s").await;
         assert!(none.members.is_empty());
-        assert!(custody_gate(&none).is_clean(), "nothing attributed → clean");
+        assert!(
+            custody_gate(&none).is_clean(),
+            "nothing attributed and a proven no-write transcript → clean"
+        );
 
         let one = gather_custody(
             &probe,
@@ -1506,6 +1805,338 @@ mod tests {
         .await;
         assert_eq!(one.members.len(), 1);
         assert_eq!(custody_gate(&one).as_str(), "dirty");
+    }
+
+    /// D6: a worktree the transcript names is judged like any other member —
+    /// here the tree a workspace-root session edited by absolute path, whose
+    /// edited subdirectory is gone, so it resolves through its nearest
+    /// existing ancestor.
+    #[tokio::test]
+    async fn a_transcript_edit_target_in_a_dirty_worktree_is_a_member() {
+        let mut probe = FakeProbe::default()
+            .root(
+                "/ws/agent-worktrees/b/repo/src",
+                "/ws/agent-worktrees/b/repo",
+            )
+            .state(
+                "/ws/agent-worktrees/b/repo",
+                MemberState::Probed {
+                    dirty: true,
+                    ahead: 0,
+                },
+            )
+            .transcript(
+                &["/ws", "/ws/agent-worktrees/b/repo/src/gone"],
+                None,
+                Some("/p/s.jsonl line 3 calls \"Edit\""),
+            );
+        probe
+            .missing
+            .insert(PathBuf::from("/ws/agent-worktrees/b/repo/src/gone"));
+        let inputs = gather_custody(&probe, &context(Some("/ws"), &[]), Ok(vec![]), "s").await;
+        assert_eq!(
+            inputs
+                .members
+                .iter()
+                .map(|m| m.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/ws/agent-worktrees/b/repo"]
+        );
+        assert_eq!(inputs.covered, vec!["/ws/agent-worktrees/b/repo"]);
+        assert_eq!(
+            custody_gate(&inputs),
+            CustodyVerdict::Dirty(CustodyDirty::Uncommitted {
+                path: "/ws/agent-worktrees/b/repo".to_string()
+            })
+        );
+    }
+
+    /// D2/D6: a workspace-root session whose every source names no tree —
+    /// its transcript names only the root and a scratch dir, both in no
+    /// repository — is `Clean` only on the transcript's no-write proof.
+    #[tokio::test]
+    async fn a_workspace_root_session_that_names_no_tree_is_clean_only_on_proof() {
+        let ctx = context(Some("/ws"), &[]);
+        let dirs = ["/ws", "/home/u/.qontinui/scratch/s"];
+        let absent = FakeProbe::default().transcript(
+            &[],
+            Some("no transcript for session s under any of 3 account root(s)"),
+            None,
+        );
+        let unread = gather_custody(&absent, &ctx, Ok(vec![]), "s").await;
+        assert_eq!(
+            custody_gate(&unread).reason(),
+            Some("no_tree_unproven"),
+            "no transcript"
+        );
+
+        let bash =
+            FakeProbe::default().transcript(&dirs, None, Some("/p/s.jsonl line 9 calls \"Bash\""));
+        let bashed = gather_custody(&bash, &ctx, Ok(vec![]), "s").await;
+        assert!(bashed.members.is_empty() && bashed.covered.is_empty());
+        assert_eq!(custody_gate(&bashed).reason(), Some("no_tree_unproven"));
+
+        let proven = FakeProbe::default().transcript(&dirs, None, None);
+        let clean = gather_custody(&proven, &ctx, Ok(vec![]), "s").await;
+        assert_eq!(custody_gate(&clean), CustodyVerdict::Clean);
+    }
+
+    /// D10: a primary checkout the transcript names as a `cwd` (a read-only
+    /// `cd` leaves one) is that checkout, a member, and keeps the session in
+    /// custody.
+    #[tokio::test]
+    async fn a_primary_checkout_among_the_transcript_cwds_is_a_shared_checkout() {
+        let probe = FakeProbe::default()
+            .root("/ws/agent-worktrees/a/repo", "/ws/agent-worktrees/a/repo")
+            .root("/ws/qontinui-runner", "/ws/qontinui-runner")
+            .state("/ws/qontinui-runner", MemberState::PrimaryCheckout)
+            .transcript(&["/ws", "/ws/qontinui-runner"], None, None);
+        let inputs = gather_custody(
+            &probe,
+            &context(Some("/ws"), &[]),
+            Ok(vec![live("/ws/agent-worktrees/a/repo")]),
+            "s",
+        )
+        .await;
+        assert_eq!(
+            custody_gate(&inputs),
+            CustodyVerdict::Dirty(CustodyDirty::SharedCheckout {
+                path: "/ws/qontinui-runner".to_string()
+            })
+        );
+    }
+
+    const REAPED_TREE: &str = "/ws/agent-worktrees/gone/repo";
+
+    /// `p` as the custody code renders a path it rebuilt component by
+    /// component: unchanged on Unix, `\`-separated on Windows.
+    fn native(p: &str) -> String {
+        Path::new(p)
+            .components()
+            .collect::<PathBuf>()
+            .display()
+            .to_string()
+    }
+
+    /// A workspace-root-repo box (`/ws` is a primary) whose session's
+    /// transcript names two directories under the reaped allocation tree
+    /// [`REAPED_TREE`], and what that tree's branch reads (`None` =
+    /// unreadable).
+    fn reaped_allocation_probe(branch: Option<MemberState>) -> FakeProbe {
+        let mut probe = FakeProbe::default()
+            .root("/ws", "/ws")
+            .root("/ws/agent-worktrees", "/ws")
+            .state("/ws", MemberState::PrimaryCheckout)
+            .transcript(
+                &[
+                    "/ws/agent-worktrees/gone/repo/src",
+                    "/ws/agent-worktrees/gone/repo/docs",
+                ],
+                None,
+                Some("/p/s.jsonl line 3 calls \"Edit\""),
+            );
+        for p in [
+            "/ws/agent-worktrees/gone",
+            REAPED_TREE,
+            "/ws/agent-worktrees/gone/repo/src",
+            "/ws/agent-worktrees/gone/repo/docs",
+        ] {
+            probe.missing.insert(PathBuf::from(p));
+        }
+        if let Some(state) = branch {
+            probe.reaped.insert(PathBuf::from(REAPED_TREE), state);
+        }
+        probe
+    }
+
+    /// D11: a transcript directory under an allocation that is gone is that
+    /// reaped tree, covered and judged ONCE — never walked up into the
+    /// repository that encloses `agent-worktrees/`, which here is a primary
+    /// and would read `shared_checkout`.
+    #[tokio::test]
+    async fn a_transcript_path_under_a_reaped_allocation_is_never_its_enclosing_repo() {
+        let landed = reaped_allocation_probe(Some(MemberState::Probed {
+            dirty: false,
+            ahead: 0,
+        }));
+        let ctx = context(Some("/home/u/scratch"), &[]);
+        let inputs = gather_custody(&landed, &ctx, Ok(vec![]), "s").await;
+        assert_eq!(inputs.covered, vec![native(REAPED_TREE)]);
+        assert_eq!(
+            inputs
+                .members
+                .iter()
+                .map(|m| m.path.as_str())
+                .collect::<Vec<_>>(),
+            vec![native(REAPED_TREE)]
+        );
+        assert_eq!(custody_gate(&inputs), CustodyVerdict::Clean);
+        let calls = landed.calls();
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.starts_with("root:/ws/agent-worktrees")),
+            "{calls:?}"
+        );
+        assert_eq!(
+            calls.iter().filter(|c| c.starts_with("reaped:")).count(),
+            1,
+            "{calls:?}"
+        );
+    }
+
+    /// D11 refined: the reaped tree's branch survives the reap. Commits on no
+    /// remote read unpushed; a branch that cannot be read is unknown.
+    #[tokio::test]
+    async fn a_reaped_allocation_is_judged_by_the_branch_it_left() {
+        let ctx = context(Some("/home/u/scratch"), &[]);
+        let stranded = reaped_allocation_probe(Some(MemberState::Probed {
+            dirty: false,
+            ahead: 2,
+        }));
+        let inputs = gather_custody(&stranded, &ctx, Ok(vec![]), "s").await;
+        assert_eq!(
+            custody_gate(&inputs),
+            CustodyVerdict::Dirty(CustodyDirty::Unpushed {
+                path: native(REAPED_TREE),
+                ahead: 2
+            })
+        );
+
+        let unreadable = reaped_allocation_probe(None);
+        let inputs = gather_custody(&unreadable, &ctx, Ok(vec![]), "s").await;
+        assert_eq!(custody_gate(&inputs).reason(), Some("probe_failed"));
+    }
+
+    #[test]
+    fn the_allocation_tree_is_found_by_path_alone() {
+        let tree = |p: &str| allocation_tree(Path::new(p)).map(|t| t.display().to_string());
+        assert_eq!(
+            tree("/ws/agent-worktrees/01a1/qontinui-runner/src-tauri/src").as_deref(),
+            Some(native("/ws/agent-worktrees/01a1/qontinui-runner").as_str())
+        );
+        assert_eq!(
+            tree("/ws/agent-worktrees/01a1").as_deref(),
+            Some(native("/ws/agent-worktrees/01a1").as_str())
+        );
+        assert_eq!(
+            tree("/ws/qontinui-worktrees/01a1/qontinui-web/backend").as_deref(),
+            Some(native("/ws/qontinui-worktrees/01a1/qontinui-web").as_str())
+        );
+        assert_eq!(tree("/ws/agent-worktrees/.siblings/schemas@abc/rust"), None);
+        assert_eq!(tree("/ws/agent-worktrees"), None);
+        assert_eq!(tree("/ws/qontinui-runner/src"), None);
+    }
+
+    #[test]
+    fn a_reaped_tree_names_its_primary_and_its_allocation_id() {
+        let tree =
+            Path::new("/ws/agent-worktrees/01a1fd70-7e45-7001-ab8b-bf23c7372864/qontinui-runner");
+        assert_eq!(
+            reaped_allocation_origin(tree),
+            Ok((
+                PathBuf::from("/ws/qontinui-runner"),
+                "01a1fd707e45".to_string()
+            ))
+        );
+        assert!(reaped_allocation_origin(Path::new("/ws/agent-worktrees/01a1")).is_err());
+        assert!(reaped_allocation_origin(Path::new("/ws/agent-worktrees/xyz/repo")).is_err());
+        assert!(reaped_allocation_origin(Path::new("/ws/other/01a1fd70-7e45-7001/repo")).is_err());
+    }
+
+    #[test]
+    fn only_a_branch_carrying_the_allocation_id_is_its_branch() {
+        let id12 = "01a1fd707e45";
+        assert!(allocation_branch_matches(
+            "refs/heads/agent/eb2155ed4152-01a1fd707e45/2026-11-20-triage",
+            id12
+        ));
+        assert!(!allocation_branch_matches(
+            "refs/heads/agent/eb2155ed4152-01a1fd707e46/2026-11-20-triage",
+            id12
+        ));
+        assert!(allocation_branch_matches(
+            "refs/heads/agent/eb2155ed4152-01a1fd707e45",
+            id12
+        ));
+        assert!(!allocation_branch_matches(
+            "refs/heads/feat/x-01a1fd707e45/y",
+            id12
+        ));
+    }
+
+    /// Re-plan 2026-11-21: a transcript that could not be read whole leaves
+    /// a session UNKNOWN even when every tree it did name is clean.
+    #[tokio::test]
+    async fn an_unreadable_transcript_is_unknown_beside_a_clean_worktree() {
+        let probe = FakeProbe::default()
+            .root("/ws/wt/a", "/ws/wt/a")
+            .transcript(
+                &["/ws/wt/a"],
+                Some("/p/s.jsonl line 40 is not a record: EOF while parsing"),
+                None,
+            );
+        let inputs = gather_custody(&probe, &context(Some("/ws/wt/a"), &[]), Ok(vec![]), "s").await;
+        assert_eq!(
+            custody_gate(&inputs).reason(),
+            Some("transcript_unreadable")
+        );
+    }
+
+    /// Review A2: a transcript directory that is GONE, and whose walk-up finds
+    /// no repository, is a failed probe — it may have been a worktree outside
+    /// every known layout. One that still exists in no repository (a scratch
+    /// dir) adds nothing.
+    #[tokio::test]
+    async fn a_gone_transcript_directory_in_no_repository_is_a_failed_probe() {
+        let mut gone = FakeProbe::default()
+            .root("/ws/wt/a", "/ws/wt/a")
+            .transcript(&["/ws/qontinui-runner-wt-x/src"], None, None);
+        gone.missing
+            .insert(PathBuf::from("/ws/qontinui-runner-wt-x/src"));
+        gone.missing
+            .insert(PathBuf::from("/ws/qontinui-runner-wt-x"));
+        let inputs = gather_custody(&gone, &context(Some("/ws/wt/a"), &[]), Ok(vec![]), "s").await;
+        assert_eq!(custody_gate(&inputs).reason(), Some("probe_failed"));
+
+        let scratch = FakeProbe::default()
+            .root("/ws/wt/a", "/ws/wt/a")
+            .transcript(&["/home/u/.qontinui/scratch/s"], None, None);
+        let inputs =
+            gather_custody(&scratch, &context(Some("/ws/wt/a"), &[]), Ok(vec![]), "s").await;
+        assert_eq!(custody_gate(&inputs), CustodyVerdict::Clean);
+    }
+
+    /// Round-2 suggestion 5: a gone directory whose walk-up lands on a linked
+    /// worktree it was nested in (not its own allocation tree) is a failed
+    /// probe — the outer worktree's state does not stand for the gone one.
+    #[tokio::test]
+    async fn a_gone_directory_nested_in_another_linked_worktree_is_a_failed_probe() {
+        let mut nested = FakeProbe::default()
+            .root("/ws/wt/a", "/ws/wt/a")
+            .root("/ws/wt/a/.claude/worktrees", "/ws/wt/a")
+            .transcript(&["/ws/wt/a/.claude/worktrees/x/src"], None, None);
+        nested
+            .missing
+            .insert(PathBuf::from("/ws/wt/a/.claude/worktrees/x/src"));
+        nested
+            .missing
+            .insert(PathBuf::from("/ws/wt/a/.claude/worktrees/x"));
+        let inputs =
+            gather_custody(&nested, &context(Some("/ws/wt/a"), &[]), Ok(vec![]), "s").await;
+        assert_eq!(custody_gate(&inputs).reason(), Some("probe_failed"));
+    }
+
+    /// A transcript directory whose existence cannot be checked is a failed
+    /// probe, never "in no repository".
+    #[tokio::test]
+    async fn an_unanswerable_transcript_directory_is_a_failed_probe() {
+        let mut probe = FakeProbe::default().transcript(&["/mnt/stale/wt/src"], None, None);
+        probe
+            .exists_unreadable
+            .insert(PathBuf::from("/mnt/stale/wt/src"));
+        let inputs = gather_custody(&probe, &context(Some("/ws"), &[]), Ok(vec![]), "s").await;
+        assert_eq!(custody_gate(&inputs).reason(), Some("probe_failed"));
     }
 
     /// A multi-worktree session with one dirty sibling is not clean, and a
@@ -1842,6 +2473,70 @@ mod tests {
             "git {args:?} failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    /// D11 through the SHIPPED probe and a real git: a reaped allocation's
+    /// branch with nothing off the remotes reads clean, one commit on no
+    /// remote reads unpushed, and no branch carrying the id is a failed probe.
+    #[tokio::test]
+    async fn the_git_probe_judges_a_reaped_allocation_by_its_surviving_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        let origin = tmp.path().join("origin.git");
+        let primary = ws.join("repo");
+        std::fs::create_dir_all(&origin).unwrap();
+        git(&origin, &["init", "--bare", "-q"]);
+        git(
+            tmp.path(),
+            &[
+                "clone",
+                "-q",
+                origin.to_str().unwrap(),
+                primary.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(primary.join("README"), "x").unwrap();
+        git(&primary, &["add", "README"]);
+        git(&primary, &["commit", "-q", "-m", "init"]);
+        git(&primary, &["push", "-q", "-u", "origin", "HEAD:main"]);
+        git(&primary, &["fetch", "-q", "origin"]);
+        let branch = "agent/eb2155ed4152-01a1fd707e45/2026-11-20-x";
+        git(&primary, &["branch", branch, "origin/main"]);
+        let tree = ws
+            .join("agent-worktrees")
+            .join("01a1fd70-7e45-7001-ab8b-bf23c7372864")
+            .join("repo");
+
+        let probe = GitCustodyProbe::default();
+        assert_eq!(
+            probe.reaped_allocation_state(&tree).await,
+            MemberState::Probed {
+                dirty: false,
+                ahead: 0
+            }
+        );
+
+        git(&primary, &["checkout", "-q", branch]);
+        std::fs::write(primary.join("NEW"), "y").unwrap();
+        git(&primary, &["add", "NEW"]);
+        git(&primary, &["commit", "-q", "-m", "local only"]);
+        git(&primary, &["checkout", "-q", "main"]);
+        assert_eq!(
+            probe.reaped_allocation_state(&tree).await,
+            MemberState::Probed {
+                dirty: false,
+                ahead: 1
+            }
+        );
+
+        let other = ws
+            .join("agent-worktrees")
+            .join("99999999-0000-4000-8000-000000000000")
+            .join("repo");
+        assert!(matches!(
+            probe.reaped_allocation_state(&other).await,
+            MemberState::ProbeFailed(_)
+        ));
     }
 
     /// The D2c cases — clean, an untracked file, an unpushed commit, and a

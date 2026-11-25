@@ -1,0 +1,1143 @@
+//! The directories a session's transcript names, and whether it proves the
+//! session called no write-capable tool — the transcript source of the
+//! `finished_close` custody gather (plan
+//! `2026-11-20-triage-sessions-custody-reads-the-sessions-recorded-trees-not-its-cwd`,
+//! D1, D2 and D6).
+//!
+//! ## What is read
+//!
+//! * The session's main transcript `<project>/<id>.jsonl`: the NEWEST copy, by
+//!   the locator the close guard's revival arm already uses
+//!   ([`super::transcript_facts::find_copies`] and
+//!   [`super::transcript_facts::newest_copy`], which order copies by
+//!   [`crate::agent_worktree::custody::order_by_newest_turn`]). When several
+//!   copies cannot be ranked, every copy is read and the proof does not hold.
+//! * Every subagent sidechain under `<project>/<id>/subagents/`, at any depth
+//!   down to [`SIDECHAIN_MAX_DEPTH`] (a workflow's agents sit one level down,
+//!   in `subagents/workflows/<run>/`). The sidechains beside EVERY copy are
+//!   read. An account migration copies the main transcript, and nothing
+//!   establishes that it copies the `<id>/subagents` tree beside it.
+//!
+//! Only structured JSONL fields are read, never prose and never shell text.
+//! From each record that is the record's `cwd`; the parent directory of each
+//! write-tool target (`file_path` of `Edit`, `Write` and `MultiEdit`,
+//! `notebook_path` of `NotebookEdit`; a relative target is taken against the
+//! record's own `cwd`); and the name of every `tool_use`. The directories are
+//! returned unresolved. The custody gather resolves each one to the worktree
+//! holding it, and one in no worktree contributes nothing.
+//!
+//! ## What the read establishes (D2)
+//!
+//! [`TranscriptScan::read`] says whether every file was read to its end with
+//! every line parsed as a record ([`TranscriptRead::incomplete`]), and names
+//! the first `tool_use` of a tool outside [`READ_ONLY_TOOLS`]
+//! ([`TranscriptRead::write_call`]). The no-write proof holds only when there
+//! is neither. So `Bash`, `PowerShell`, `Edit`, `Write`, `MultiEdit`,
+//! `NotebookEdit`, `Agent`/`Task` (a subagent can write), every MCP tool and
+//! every tool this list does not know all break it. A `Bash`
+//! write into a tree the session never entered leaves no path here. That is
+//! why any `Bash` call denies the empty-set pass, rather than the scan parsing
+//! the command (the plan's Risks).
+//!
+//! ## Bounds and cache
+//!
+//! One scan reads at most [`SCAN_MAX_BYTES`] of files it has not cached, and
+//! stops at [`SCAN_DEADLINE`]. A scan cut short by either is incomplete, which
+//! the custody gate reads as UNKNOWN, never as a pass. A file read to its end
+//! is cached on its `(len, mtime)` [`FileStamp`], so a finished session, whose
+//! transcript no longer changes, is read once rather than on every executor
+//! tick. A cached file costs nothing against the byte bound.
+
+use std::collections::{BTreeSet, HashMap};
+use std::fmt;
+use std::io::{BufRead, BufReader, Read};
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+use serde::de::{Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::Deserialize;
+
+use super::transcript_facts::{find_copies, newest_copy};
+use super::transcript_last_turn::FileStamp;
+use qontinui_runner_lib::wind_down::TranscriptRead;
+
+/// The tools that cannot change a file in a worktree. A `tool_use` of any
+/// other name breaks the no-write proof. That includes the write tools D2
+/// names, `Skill` and `SlashCommand` (a skill can run in a subagent),
+/// `EnterWorktree`, every `mcp__*` tool, and any tool added after this list.
+pub const READ_ONLY_TOOLS: [&str; 14] = [
+    "Read",
+    "Glob",
+    "Grep",
+    "LS",
+    "NotebookRead",
+    "WebFetch",
+    "WebSearch",
+    "ToolSearch",
+    // Writes Claude Code's own todo list under its config dir, never a
+    // worktree.
+    "TodoWrite",
+    "AskUserQuestion",
+    "ExitPlanMode",
+    // Reads a background shell's output. Starting that shell was a `Bash`
+    // call, which already breaks the proof.
+    "BashOutput",
+    "ListMcpResourcesTool",
+    "ReadMcpResourceTool",
+];
+
+/// Is `tool` on [`READ_ONLY_TOOLS`]? The one predicate the proof reads.
+pub fn is_read_only_tool(tool: &str) -> bool {
+    READ_ONLY_TOOLS.contains(&tool)
+}
+
+/// The content-block kinds that are not tool calls. A block of any other kind
+/// (including one with no `type`) may be a call this scan cannot read, so it
+/// breaks the no-write proof rather than being skipped.
+pub const NON_CALL_BLOCKS: [&str; 6] = [
+    "text",
+    "thinking",
+    "redacted_thinking",
+    "tool_result",
+    "image",
+    "document",
+];
+
+/// The write tools whose input names the file they write, and the input key
+/// that carries it.
+const WRITE_TARGETS: [(&str, &str); 4] = [
+    ("Edit", "file_path"),
+    ("Write", "file_path"),
+    ("MultiEdit", "file_path"),
+    ("NotebookEdit", "notebook_path"),
+];
+
+/// Bytes one scan may read from files it has not cached. Transcripts of
+/// 143 MB exist on a fleet box.
+pub const SCAN_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
+/// How long one scan may run.
+pub const SCAN_DEADLINE: Duration = Duration::from_secs(20);
+
+/// How deep under `<id>/subagents/` sidechains are looked for.
+pub const SIDECHAIN_MAX_DEPTH: usize = 4;
+
+/// What one scan of a session's transcript established.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptScan {
+    /// Every distinct directory the transcript names: record `cwd`s and the
+    /// parent directory of each write-tool target. They are unresolved and
+    /// may no longer exist.
+    pub dirs: Vec<PathBuf>,
+    /// Whether the whole transcript, main and sidechains, was read, and the
+    /// first `tool_use` outside [`READ_ONLY_TOOLS`] it holds.
+    pub read: TranscriptRead,
+}
+
+impl TranscriptScan {
+    /// A scan that read nothing, for the reason given.
+    pub fn unread(why: impl Into<String>) -> Self {
+        Self {
+            dirs: Vec::new(),
+            read: TranscriptRead::unread(why),
+        }
+    }
+}
+
+/// What one transcript file holds.
+#[derive(Debug, Clone, Default)]
+struct FileScan {
+    dirs: BTreeSet<PathBuf>,
+    /// The first `tool_use` outside [`READ_ONLY_TOOLS`].
+    write_call: Option<String>,
+    /// Why the file does not count as read whole.
+    incomplete: Option<String>,
+    /// Bytes consumed.
+    bytes: u64,
+    /// The read reached the end of the file without an I/O error or the
+    /// deadline, so the result holds for as long as the file's stamp does.
+    reached_end: bool,
+}
+
+/// One transcript line, reduced to the fields the scan reads. serde skips
+/// every other field without buffering it, a tool result's body included.
+#[derive(Deserialize)]
+struct Record {
+    cwd: Option<String>,
+    message: Option<Message>,
+}
+
+#[derive(Deserialize)]
+struct Message {
+    content: Option<Blocks>,
+}
+
+/// A message's `content`: its blocks when it is an array, none when it is a
+/// string or null. Any other shape fails the line, which leaves the file
+/// incomplete.
+struct Blocks(Vec<Block>);
+
+impl<'de> Deserialize<'de> for Blocks {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct BlocksVisitor;
+        impl<'de> Visitor<'de> for BlocksVisitor {
+            type Value = Blocks;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a message content string or block array")
+            }
+            fn visit_str<E: serde::de::Error>(self, _text: &str) -> Result<Blocks, E> {
+                Ok(Blocks(Vec::new()))
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Blocks, E> {
+                Ok(Blocks(Vec::new()))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Blocks, A::Error> {
+                let mut blocks = Vec::new();
+                while let Some(block) = seq.next_element::<Block>()? {
+                    blocks.push(block);
+                }
+                Ok(Blocks(blocks))
+            }
+        }
+        deserializer.deserialize_any(BlocksVisitor)
+    }
+}
+
+#[derive(Deserialize)]
+struct Block {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    name: Option<String>,
+    input: Option<ToolInput>,
+}
+
+/// A `tool_use` input, read leniently: only the two path keys are kept, and an
+/// input of any shape parses, so a tool whose input is not an object cannot
+/// make the whole line unreadable. Only the write tools' targets are checked,
+/// in [`FileScan::fold`].
+#[derive(Default)]
+struct ToolInput {
+    /// The input was not a JSON object.
+    not_an_object: bool,
+    file_path: Option<serde_json::Value>,
+    notebook_path: Option<serde_json::Value>,
+}
+
+impl ToolInput {
+    /// The path under `key`: `Ok(None)` when absent, `Err` when the input is
+    /// not an object or the value is not a string.
+    fn path(&self, key: &str) -> Result<Option<&str>, ()> {
+        if self.not_an_object {
+            return Err(());
+        }
+        let value = match key {
+            "file_path" => &self.file_path,
+            "notebook_path" => &self.notebook_path,
+            _ => return Ok(None),
+        };
+        match value {
+            None => Ok(None),
+            Some(serde_json::Value::String(s)) => Ok(Some(s.as_str())),
+            Some(_) => Err(()),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolInput {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct InputVisitor;
+        impl<'de> Visitor<'de> for InputVisitor {
+            type Value = ToolInput;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a tool input of any shape")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<ToolInput, A::Error> {
+                let mut input = ToolInput::default();
+                while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                    match key.as_ref() {
+                        "file_path" => input.file_path = Some(map.next_value()?),
+                        "notebook_path" => input.notebook_path = Some(map.next_value()?),
+                        _ => {
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(input)
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<ToolInput, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(ToolInput::not_an_object())
+            }
+            fn visit_str<E: serde::de::Error>(self, _v: &str) -> Result<ToolInput, E> {
+                Ok(ToolInput::not_an_object())
+            }
+            fn visit_bool<E: serde::de::Error>(self, _v: bool) -> Result<ToolInput, E> {
+                Ok(ToolInput::not_an_object())
+            }
+            fn visit_i64<E: serde::de::Error>(self, _v: i64) -> Result<ToolInput, E> {
+                Ok(ToolInput::not_an_object())
+            }
+            fn visit_u64<E: serde::de::Error>(self, _v: u64) -> Result<ToolInput, E> {
+                Ok(ToolInput::not_an_object())
+            }
+            fn visit_f64<E: serde::de::Error>(self, _v: f64) -> Result<ToolInput, E> {
+                Ok(ToolInput::not_an_object())
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<ToolInput, E> {
+                Ok(ToolInput::not_an_object())
+            }
+        }
+        deserializer.deserialize_any(InputVisitor)
+    }
+}
+
+impl ToolInput {
+    fn not_an_object() -> Self {
+        Self {
+            not_an_object: true,
+            ..Self::default()
+        }
+    }
+}
+
+impl FileScan {
+    fn note_incomplete(&mut self, why: String) {
+        self.incomplete.get_or_insert(why);
+    }
+
+    /// Fold one parsed record in.
+    fn fold(&mut self, record: Record, label: &str, line: usize) {
+        let cwd = record
+            .cwd
+            .map(|c| PathBuf::from(c.trim()))
+            .filter(|c| !c.as_os_str().is_empty());
+        match &cwd {
+            Some(c) if c.is_absolute() => {
+                self.dirs.insert(c.clone());
+            }
+            Some(c) => self.note_incomplete(format!(
+                "{label} line {line} names a relative cwd {}",
+                c.display()
+            )),
+            None => {}
+        }
+        let blocks = record
+            .message
+            .and_then(|m| m.content)
+            .map_or_else(Vec::new, |b| b.0);
+        for block in blocks {
+            match block.kind.as_deref() {
+                Some("tool_use") => {}
+                Some(kind) if NON_CALL_BLOCKS.contains(&kind) => continue,
+                other => {
+                    if self.write_call.is_none() {
+                        self.write_call = Some(format!(
+                            "{label} line {line} holds a {:?} block, which may be a call",
+                            other.unwrap_or("")
+                        ));
+                    }
+                    continue;
+                }
+            }
+            let name = block.name.unwrap_or_default();
+            if self.write_call.is_none() && !is_read_only_tool(&name) {
+                self.write_call = Some(format!("{label} line {line} calls {name:?}"));
+            }
+            let Some((_, key)) = WRITE_TARGETS.iter().find(|(tool, _)| *tool == name) else {
+                continue;
+            };
+            let raw = match block.input.as_ref().map(|i| i.path(key)) {
+                Some(Ok(Some(raw))) => raw,
+                _ => {
+                    self.note_incomplete(format!(
+                        "{label} line {line}: the {name} call names no readable {key}"
+                    ));
+                    continue;
+                }
+            };
+            let target = PathBuf::from(raw.trim());
+            if target.as_os_str().is_empty() {
+                self.note_incomplete(format!(
+                    "{label} line {line}: the {name} call names an empty {key}"
+                ));
+                continue;
+            }
+            let absolute = if target.is_absolute() {
+                Some(target.clone())
+            } else {
+                cwd.as_ref()
+                    .filter(|c| c.is_absolute())
+                    .map(|c| c.join(&target))
+            };
+            match absolute.as_deref().and_then(Path::parent) {
+                Some(dir) => {
+                    self.dirs.insert(dir.to_path_buf());
+                }
+                None => self.note_incomplete(format!(
+                    "{label} line {line}: the {name} target {} cannot be located",
+                    target.display()
+                )),
+            }
+        }
+    }
+}
+
+/// Scan one transcript stream to its end, or to `deadline`. Pure apart from
+/// the clock. A line that is not a record is noted and the scan goes on, so
+/// the directories on later lines are still collected.
+fn scan_records<R: BufRead>(mut reader: R, deadline: Instant, label: &str) -> FileScan {
+    let mut scan = FileScan::default();
+    let mut line = Vec::new();
+    let mut number = 0usize;
+    loop {
+        if Instant::now() >= deadline {
+            scan.note_incomplete(format!(
+                "{label}: the scan ran out of time after line {number}"
+            ));
+            return scan;
+        }
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) => break,
+            Ok(n) => scan.bytes += n as u64,
+            Err(e) => {
+                scan.note_incomplete(format!("{label} could not be read: {e}"));
+                return scan;
+            }
+        }
+        number += 1;
+        let text = line.trim_ascii();
+        if text.is_empty() {
+            continue;
+        }
+        match serde_json::from_slice::<Record>(text) {
+            Ok(record) => scan.fold(record, label, number),
+            Err(e) => scan.note_incomplete(format!("{label} line {number} is not a record: {e}")),
+        }
+    }
+    scan.reached_end = true;
+    scan
+}
+
+type Cache = HashMap<PathBuf, (FileStamp, FileScan)>;
+
+fn cache() -> &'static Mutex<Cache> {
+    static CELL: OnceLock<Mutex<Cache>> = OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Hard ceiling on cached files. Past it the cache is cleared.
+const CACHE_CAP: usize = 4096;
+
+/// Scan one file, from the cache when its stamp is unchanged. `remaining` is
+/// the byte budget left, and it is debited by what was read.
+fn scan_file(path: &Path, remaining: &mut u64, deadline: Instant) -> FileScan {
+    scan_file_with(path, remaining, deadline, &|p| {
+        std::fs::metadata(p).ok().map(|m| FileStamp::of(&m))
+    })
+}
+
+/// [`scan_file`] with the post-read stat injected, so a test can stage a
+/// file that changes between the two stats.
+fn scan_file_with(
+    path: &Path,
+    remaining: &mut u64,
+    deadline: Instant,
+    restat: &dyn Fn(&Path) -> Option<FileStamp>,
+) -> FileScan {
+    let label = path.display().to_string();
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(e) => {
+            let mut scan = FileScan::default();
+            scan.note_incomplete(format!("{label} could not be read: {e}"));
+            return scan;
+        }
+    };
+    let stamp = FileStamp::of(&meta);
+    if stamp.modified_ms.is_some() {
+        if let Ok(guard) = cache().lock() {
+            if let Some((cached, scan)) = guard.get(path) {
+                if *cached == stamp {
+                    return scan.clone();
+                }
+            }
+        }
+    }
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) => {
+            let mut scan = FileScan::default();
+            scan.note_incomplete(format!("{label} could not be opened: {e}"));
+            return scan;
+        }
+    };
+    let left = *remaining;
+    let mut scan = scan_records(BufReader::new(file.take(left)), deadline, &label);
+    *remaining = left.saturating_sub(scan.bytes);
+    if stamp.len > left {
+        // The cut is the reason, whatever its torn last line also reported.
+        scan.reached_end = false;
+        scan.incomplete = Some(format!(
+            "{label} is {} bytes, past the {left} bytes left of the scan's byte bound",
+            stamp.len
+        ));
+        return scan;
+    }
+    // Stat again after the read: a file written meanwhile was not read as
+    // stamped. The bounded reader can stop exactly on a line boundary of a
+    // file that grew, which would otherwise read as whole.
+    let scan = settle_read(scan, stamp, restat(path), &label);
+    if scan.reached_end {
+        if let Ok(mut guard) = cache().lock() {
+            if guard.len() >= CACHE_CAP {
+                guard.clear();
+            }
+            guard.insert(path.to_path_buf(), (stamp, scan.clone()));
+        }
+    }
+    scan
+}
+
+/// PURE: a read stands as whole only when the file's stamp after the read
+/// equals the stamp before it, and that stamp carries a modification time.
+/// Otherwise it is incomplete, and never cached. A stamp with no modification
+/// time reduces the comparison to the length alone, which a same-length
+/// rewrite passes, so it never proves the read whole (as
+/// [`super::transcript_last_turn::FileStamp::of`] documents: an unstamped
+/// file is never cached).
+fn settle_read(
+    mut scan: FileScan,
+    before: FileStamp,
+    after: Option<FileStamp>,
+    label: &str,
+) -> FileScan {
+    if before.modified_ms.is_none() {
+        scan.reached_end = false;
+        scan.note_incomplete(format!(
+            "{label} has no modification time, so a change during the read cannot be ruled out"
+        ));
+    } else if after != Some(before) {
+        scan.reached_end = false;
+        scan.note_incomplete(format!("{label} changed while it was read"));
+    }
+    scan
+}
+
+/// Every `*.jsonl` under `dir`, down to `depth` levels. A `dir` that does not
+/// exist holds none. `Err` when a directory that exists could not be listed,
+/// when the tree is nested deeper than `depth`, or when it holds a symlink
+/// (not followed, so what lies behind it is unread).
+fn sidechain_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("{} could not be listed: {e}", dir.display())),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("{} listing broke off: {e}", dir.display()))?;
+        let path = entry.path();
+        let kind = entry
+            .file_type()
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        if kind.is_symlink() {
+            return Err(format!(
+                "{} is a symlink, which the scan does not follow",
+                path.display()
+            ));
+        }
+        if kind.is_dir() {
+            if depth == 0 {
+                return Err(format!(
+                    "{} is nested deeper than {SIDECHAIN_MAX_DEPTH} levels under subagents/",
+                    path.display()
+                ));
+            }
+            sidechain_files(&path, depth - 1, out)?;
+        } else if path.extension().is_some_and(|x| x == "jsonl") {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+/// Scan `session_id`'s transcript under `roots`: the newest copy's main file
+/// and the sidechains beside every copy, within `max_bytes` and `deadline`.
+pub fn scan_session_in(
+    roots: &[PathBuf],
+    session_id: &str,
+    max_bytes: u64,
+    deadline: Duration,
+) -> TranscriptScan {
+    let deadline = Instant::now() + deadline;
+    let copies = match find_copies(roots, session_id) {
+        Ok(copies) => copies,
+        Err(e) => return TranscriptScan::unread(e),
+    };
+    if copies.is_empty() {
+        return TranscriptScan::unread(format!(
+            "no transcript for session {session_id} under any of {} account root(s)",
+            roots.len()
+        ));
+    }
+    let mut failures: Vec<String> = Vec::new();
+    let mut files: Vec<PathBuf> = match newest_copy(copies.clone()) {
+        Ok(newest) => newest.into_iter().map(|c| c.path).collect(),
+        Err(e) => {
+            failures.push(e);
+            copies.iter().map(|c| c.path.clone()).collect()
+        }
+    };
+    for copy in &copies {
+        let subagents = copy.path.with_extension("").join("subagents");
+        if let Err(e) = sidechain_files(&subagents, SIDECHAIN_MAX_DEPTH, &mut files) {
+            failures.push(e);
+        }
+    }
+
+    let mut remaining = max_bytes;
+    let mut dirs: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut write_call: Option<String> = None;
+    for file in &files {
+        let scan = scan_file(file, &mut remaining, deadline);
+        dirs.extend(scan.dirs);
+        if write_call.is_none() {
+            write_call = scan.write_call;
+        }
+        failures.extend(scan.incomplete);
+    }
+    TranscriptScan {
+        dirs: dirs.into_iter().collect(),
+        read: TranscriptRead {
+            incomplete: failures.into_iter().next(),
+            write_call,
+        },
+    }
+}
+
+/// [`scan_session_in`] over every Claude config root this machine has, under
+/// the shipped bounds.
+pub fn scan_session(session_id: &str) -> TranscriptScan {
+    scan_session_in(
+        &crate::terminal::transcript::find_claude_config_dirs(),
+        session_id,
+        SCAN_MAX_BYTES,
+        SCAN_DEADLINE,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// An absolute fixture path for this platform: `/ws/...` on Unix, and
+    /// `C:\ws\...` on Windows, where a rootless `/ws` is NOT absolute (a
+    /// transcript there records a drive-letter cwd, so the scan rightly reads
+    /// `/ws` as relative). Backslashes keep a path the scan joins comparable
+    /// as text. Leaked so every fixture call site can take a `&str`; a test
+    /// process leaks a few hundred bytes.
+    fn abs(p: &str) -> &'static str {
+        let native = if cfg!(windows) {
+            format!("C:{}", p.replace('/', "\\"))
+        } else {
+            p.to_string()
+        };
+        Box::leak(native.into_boxed_str())
+    }
+
+    fn write(path: &Path, lines: &[String]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut f = std::fs::File::create(path).unwrap();
+        for line in lines {
+            writeln!(f, "{line}").unwrap();
+        }
+    }
+
+    /// An assistant record at `cwd` calling `tool` with `input`.
+    fn call(cwd: &str, tool: &str, input: serde_json::Value) -> String {
+        serde_json::json!({
+            "type": "assistant", "cwd": cwd, "timestamp": "2026-11-20T10:00:00.000Z",
+            "message": {"role": "assistant", "stop_reason": "tool_use",
+                        "content": [{"type": "tool_use", "id": "u1", "name": tool, "input": input}]},
+        })
+        .to_string()
+    }
+
+    /// A user record at `cwd`: a prompt, or a tool result.
+    fn said(cwd: &str, content: serde_json::Value) -> String {
+        serde_json::json!({
+            "type": "user", "cwd": cwd, "timestamp": "2026-11-20T10:00:01.000Z",
+            "message": {"role": "user", "content": content},
+        })
+        .to_string()
+    }
+
+    fn scan(lines: &[String]) -> FileScan {
+        let text = lines.join("\n");
+        scan_records(
+            text.as_bytes(),
+            Instant::now() + Duration::from_secs(60),
+            "t.jsonl",
+        )
+    }
+
+    fn dirs(scan: &FileScan) -> Vec<&str> {
+        scan.dirs.iter().map(|d| d.to_str().unwrap()).collect()
+    }
+
+    /// The `<root>/projects/<p>/<sid>.jsonl` path of one copy.
+    fn main_path(root: &Path, project: &str, sid: &str) -> PathBuf {
+        root.join("projects")
+            .join(project)
+            .join(format!("{sid}.jsonl"))
+    }
+
+    #[test]
+    fn the_allowlist_never_admits_a_tool_that_can_write() {
+        for tool in [
+            "Bash",
+            "PowerShell",
+            "Edit",
+            "Write",
+            "MultiEdit",
+            "NotebookEdit",
+            "Agent",
+            "Task",
+            "Skill",
+            "SlashCommand",
+            "EnterWorktree",
+            "mcp__coord__coord_register_gate",
+        ] {
+            assert!(!is_read_only_tool(tool), "{tool}");
+        }
+    }
+
+    #[test]
+    fn cwds_and_write_targets_are_collected_and_read_only_tools_prove_no_write() {
+        let read_only = scan(&[
+            said(abs("/ws"), serde_json::json!("look around")),
+            call(
+                abs("/ws"),
+                "Read",
+                serde_json::json!({"file_path": abs("/ws/wt/a/src/x.rs")}),
+            ),
+            said(
+                abs("/ws/wt/b"),
+                serde_json::json!([{"type": "tool_result", "tool_use_id": "u1",
+                                    "content": [{"type": "text", "text": "big"}]}]),
+            ),
+            "".to_string(),
+        ]);
+        // A Read target names no tree: only the records' cwds do.
+        assert_eq!(dirs(&read_only), vec![abs("/ws"), abs("/ws/wt/b")]);
+        assert_eq!(read_only.write_call, None);
+        assert_eq!(read_only.incomplete, None);
+        assert!(read_only.reached_end);
+
+        let wrote = scan(&[
+            call(
+                abs("/ws"),
+                "Edit",
+                serde_json::json!({"file_path": abs("/ws/wt/a/src/x.rs"), "old_string": "a"}),
+            ),
+            call(
+                abs("/ws"),
+                "NotebookEdit",
+                serde_json::json!({"notebook_path": abs("/ws/wt/n/nb.ipynb")}),
+            ),
+            // A relative target is taken against the record's own cwd.
+            call(
+                abs("/ws/wt/c"),
+                "Write",
+                serde_json::json!({"file_path": "docs/y.md", "content": "z"}),
+            ),
+        ]);
+        assert_eq!(
+            dirs(&wrote),
+            vec![
+                abs("/ws"),
+                abs("/ws/wt/a/src"),
+                abs("/ws/wt/c"),
+                abs("/ws/wt/c/docs"),
+                abs("/ws/wt/n")
+            ]
+        );
+        assert_eq!(
+            wrote.write_call.as_deref(),
+            Some("t.jsonl line 1 calls \"Edit\"")
+        );
+    }
+
+    #[test]
+    fn any_tool_off_the_allowlist_breaks_the_proof() {
+        for tool in ["Bash", "Agent", "Task", "mcp__x__y", "SomeFutureTool", ""] {
+            let s = scan(&[call(abs("/ws"), tool, serde_json::json!({}))]);
+            assert!(s.write_call.is_some(), "{tool:?}");
+        }
+    }
+
+    #[test]
+    fn a_line_that_is_not_a_record_is_incomplete_and_later_lines_still_count() {
+        let s = scan(&[
+            "{cut off".to_string(),
+            said(abs("/ws/wt/a"), serde_json::json!("go")),
+        ]);
+        assert!(s.incomplete.as_deref().unwrap().contains("line 1"));
+        assert_eq!(dirs(&s), vec![abs("/ws/wt/a")]);
+        // A content shape the scan does not know is not skipped in silence.
+        let odd =
+            scan(&[serde_json::json!({"cwd": abs("/ws"), "message": {"content": 7}}).to_string()]);
+        assert!(odd.incomplete.is_some());
+    }
+
+    #[test]
+    fn a_passed_deadline_is_incomplete() {
+        let line = said(abs("/ws"), serde_json::json!("go"));
+        let s = scan_records(line.as_bytes(), Instant::now(), "t.jsonl");
+        assert!(s.incomplete.as_deref().unwrap().contains("ran out of time"));
+        assert!(!s.reached_end);
+    }
+
+    #[test]
+    fn the_newest_copy_and_every_sidechain_are_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sid = "8c0e5a52-0000-4000-8000-000000000001";
+        let root = tmp.path().join(".claude-a");
+        let main = main_path(&root, "p1", sid);
+        write(&main, &[said(abs("/ws"), serde_json::json!("go"))]);
+        let roots = vec![root.clone()];
+        let clean = scan_session_in(&roots, sid, SCAN_MAX_BYTES, SCAN_DEADLINE);
+        assert_eq!(clean.dirs, vec![PathBuf::from(abs("/ws"))]);
+        assert_eq!(clean.read.no_write_proof(), Ok(()));
+
+        // A subagent's edit, and a workflow agent one level further down.
+        let subagents = main.with_extension("").join("subagents");
+        write(
+            &subagents.join("agent-a1.jsonl"),
+            &[call(
+                abs("/ws"),
+                "Edit",
+                serde_json::json!({"file_path": abs("/ws/wt/a/x.rs")}),
+            )],
+        );
+        write(
+            &subagents
+                .join("workflows")
+                .join("wf_1")
+                .join("agent-a2.jsonl"),
+            &[said(abs("/ws/wt/b"), serde_json::json!("go"))],
+        );
+        let both = scan_session_in(&roots, sid, SCAN_MAX_BYTES, SCAN_DEADLINE);
+        assert_eq!(
+            both.dirs,
+            vec![
+                PathBuf::from(abs("/ws")),
+                PathBuf::from(abs("/ws/wt/a")),
+                PathBuf::from(abs("/ws/wt/b"))
+            ]
+        );
+        assert_eq!(both.read.incomplete, None);
+        assert!(both.read.write_call.unwrap().contains("\"Edit\""));
+    }
+
+    #[test]
+    fn no_copy_a_bound_or_an_unrankable_copy_never_proves_anything() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sid = "8c0e5a52-0000-4000-8000-000000000002";
+        let a = tmp.path().join(".claude-a");
+        let b = tmp.path().join(".claude-b");
+        let none = scan_session_in(&[a.clone()], sid, SCAN_MAX_BYTES, SCAN_DEADLINE);
+        assert!(none.read.incomplete.unwrap().contains("no transcript"));
+
+        write(
+            &main_path(&a, "p1", sid),
+            &[said(abs("/ws/wt/a"), serde_json::json!("go"))],
+        );
+        let cut = scan_session_in(&[a.clone()], sid, 4, SCAN_DEADLINE);
+        assert!(cut.read.incomplete.unwrap().contains("byte bound"));
+
+        // A second copy that holds no turn cannot be ranked: every copy is
+        // read, and the proof does not hold.
+        write(
+            &main_path(&b, "p2", sid),
+            &[serde_json::json!({"type": "permission-mode", "cwd": abs("/ws/wt/b")}).to_string()],
+        );
+        let unranked = scan_session_in(&[a, b], sid, SCAN_MAX_BYTES, SCAN_DEADLINE);
+        assert!(unranked.read.incomplete.is_some());
+        assert_eq!(
+            unranked.dirs,
+            vec![
+                PathBuf::from(abs("/ws/wt/a")),
+                PathBuf::from(abs("/ws/wt/b"))
+            ]
+        );
+    }
+
+    /// Review A1: a read is whole only when the file's stamp did not move
+    /// across it — a bounded read can end on a line boundary of a file that
+    /// grew meanwhile.
+    #[test]
+    fn a_file_that_changed_while_it_was_read_is_incomplete() {
+        let before = FileStamp {
+            len: 10,
+            modified_ms: Some(1),
+        };
+        let whole = || FileScan {
+            reached_end: true,
+            ..FileScan::default()
+        };
+        let same = settle_read(whole(), before, Some(before), "t.jsonl");
+        assert!(same.reached_end && same.incomplete.is_none());
+        for after in [
+            Some(FileStamp {
+                len: 20,
+                modified_ms: Some(2),
+            }),
+            // Round-2 suggestion 1: the same length, a new mtime.
+            Some(FileStamp {
+                len: 10,
+                modified_ms: Some(2),
+            }),
+            None,
+        ] {
+            let moved = settle_read(whole(), before, after, "t.jsonl");
+            assert!(!moved.reached_end, "{after:?}");
+            assert!(moved
+                .incomplete
+                .unwrap()
+                .contains("changed while it was read"));
+        }
+    }
+
+    /// Round-2 suggestion 1: `scan_file` goes through the post-read check — a
+    /// file whose stamp moved between the two stats is incomplete and is not
+    /// cached.
+    #[test]
+    fn scan_file_marks_a_file_restamped_during_the_read_incomplete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("r.jsonl");
+        write(&p, &[said(abs("/ws"), serde_json::json!("go"))]);
+        let moved = |_: &Path| {
+            Some(FileStamp {
+                len: 1,
+                modified_ms: Some(1),
+            })
+        };
+        let mut left = SCAN_MAX_BYTES;
+        let far = Instant::now() + Duration::from_secs(60);
+        let s = scan_file_with(&p, &mut left, far, &moved);
+        assert!(!s.reached_end);
+        assert!(s.incomplete.unwrap().contains("changed while it was read"));
+        // Not cached: the honest re-read is whole.
+        let mut left = SCAN_MAX_BYTES;
+        let again = scan_file(&p, &mut left, far);
+        assert!(again.reached_end && again.incomplete.is_none());
+    }
+
+    /// Round-2 suggestion 2: a stamp with no modification time never proves a
+    /// read whole, even when it compares equal.
+    #[test]
+    fn a_stamp_without_a_modification_time_is_never_whole() {
+        let unstamped = FileStamp {
+            len: 10,
+            modified_ms: None,
+        };
+        let s = settle_read(
+            FileScan {
+                reached_end: true,
+                ..FileScan::default()
+            },
+            unstamped,
+            Some(unstamped),
+            "t.jsonl",
+        );
+        assert!(!s.reached_end);
+        assert!(s.incomplete.unwrap().contains("no modification time"));
+    }
+
+    /// Review A5: a block kind the scan does not know may be a call, so it
+    /// breaks the proof; the known non-call kinds do not.
+    #[test]
+    fn an_unknown_block_kind_breaks_the_proof() {
+        let line = |blocks: serde_json::Value| {
+            serde_json::json!({"type": "assistant", "cwd": abs("/ws"),
+                               "message": {"content": blocks}})
+            .to_string()
+        };
+        let known = scan(&[line(serde_json::json!([
+            {"type": "text", "text": "x"},
+            {"type": "thinking", "thinking": "y"},
+            {"type": "redacted_thinking", "data": "z"},
+            {"type": "image", "source": {}},
+        ]))]);
+        assert_eq!(known.write_call, None);
+        assert_eq!(known.incomplete, None);
+        for block in [
+            serde_json::json!({"type": "server_tool_use", "name": "web_search"}),
+            serde_json::json!({"name": "Bash"}),
+        ] {
+            let s = scan(&[line(serde_json::json!([block]))]);
+            assert!(s.write_call.is_some(), "{block}");
+        }
+    }
+
+    /// Review A6: only the write tools' inputs are type-checked. A tool whose
+    /// input is not an object leaves the line readable; a write tool whose
+    /// target cannot be read leaves the file incomplete.
+    #[test]
+    fn only_a_write_tools_input_is_type_checked() {
+        let odd = scan(&[
+            call(abs("/ws"), "mcp__x__y", serde_json::json!("not an object")),
+            call(abs("/ws"), "mcp__x__z", serde_json::json!({"file_path": 7})),
+            said(abs("/ws/wt/a"), serde_json::json!("go")),
+        ]);
+        assert_eq!(odd.incomplete, None);
+        assert_eq!(dirs(&odd), vec![abs("/ws"), abs("/ws/wt/a")]);
+        for input in [
+            serde_json::json!(["x"]),
+            serde_json::json!({"file_path": 7}),
+            serde_json::json!({}),
+        ] {
+            let s = scan(&[call(abs("/ws"), "Edit", input.clone())]);
+            assert!(s.incomplete.is_some(), "{input}");
+        }
+    }
+
+    /// Review A9: the cache is keyed on mtime as well as length — a rewrite
+    /// of the same length is read again.
+    #[test]
+    fn a_same_length_rewrite_is_read_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sid = "8c0e5a52-0000-4000-8000-000000000004";
+        let root = tmp.path().join(".claude-a");
+        let main = main_path(&root, "p1", sid);
+        let roots = vec![root];
+        let bash = call(abs("/ws"), "Bash", serde_json::json!({"command": "true"}));
+        let mut quiet = said(abs("/ws"), serde_json::json!("go"));
+        let pad = bash.len().checked_sub(quiet.len()).unwrap();
+        quiet = said(
+            // Grow the cwd by exactly `pad` bytes with no separator: a Windows
+            // `\` is escaped to two bytes in the JSON record.
+            &format!("{}{}", abs("/ws"), "p".repeat(pad)),
+            serde_json::json!("go"),
+        );
+        assert_eq!(quiet.len(), bash.len());
+        write(&main, &[quiet]);
+        let first = std::fs::metadata(&main).unwrap().modified().unwrap();
+        assert_eq!(
+            scan_session_in(&roots, sid, SCAN_MAX_BYTES, SCAN_DEADLINE)
+                .read
+                .no_write_proof(),
+            Ok(())
+        );
+        write(&main, &[bash]);
+        let f = std::fs::OpenOptions::new().write(true).open(&main).unwrap();
+        f.set_modified(first + Duration::from_secs(10)).unwrap();
+        drop(f);
+        assert!(scan_session_in(&roots, sid, SCAN_MAX_BYTES, SCAN_DEADLINE)
+            .read
+            .write_call
+            .unwrap()
+            .contains("\"Bash\""));
+    }
+
+    /// Review A9: sidechains nested past the depth bound are not read, so the
+    /// transcript is incomplete.
+    #[test]
+    fn a_sidechain_nested_too_deep_is_incomplete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sid = "8c0e5a52-0000-4000-8000-000000000005";
+        let root = tmp.path().join(".claude-a");
+        let main = main_path(&root, "p1", sid);
+        write(&main, &[said(abs("/ws"), serde_json::json!("go"))]);
+        let subagents = main.with_extension("").join("subagents");
+        let mut deep = subagents.clone();
+        for level in 0..=SIDECHAIN_MAX_DEPTH {
+            deep = deep.join(format!("d{level}"));
+        }
+        write(
+            &deep.join("agent-x.jsonl"),
+            &[said(abs("/ws"), serde_json::json!("go"))],
+        );
+        let roots = vec![root];
+        let too_deep = scan_session_in(&roots, sid, SCAN_MAX_BYTES, SCAN_DEADLINE);
+        assert!(too_deep.read.incomplete.unwrap().contains("nested deeper"));
+    }
+
+    /// Round-2 suggestion 3: a sidechain at exactly the depth bound is read.
+    #[test]
+    fn a_sidechain_at_the_depth_bound_is_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sid = "8c0e5a52-0000-4000-8000-000000000007";
+        let root = tmp.path().join(".claude-a");
+        let main = main_path(&root, "p1", sid);
+        write(&main, &[said(abs("/ws"), serde_json::json!("go"))]);
+        let mut deep = main.with_extension("").join("subagents");
+        for level in 0..SIDECHAIN_MAX_DEPTH {
+            deep = deep.join(format!("d{level}"));
+        }
+        write(
+            &deep.join("agent-x.jsonl"),
+            &[said(abs("/ws/wt/deep"), serde_json::json!("go"))],
+        );
+        let s = scan_session_in(&[root], sid, SCAN_MAX_BYTES, SCAN_DEADLINE);
+        assert_eq!(s.read.incomplete, None);
+        assert!(
+            s.dirs.contains(&PathBuf::from(abs("/ws/wt/deep"))),
+            "{:?}",
+            s.dirs
+        );
+    }
+
+    /// Review A10: a symlink under `subagents/` is not followed, so what lies
+    /// behind it is unread and the transcript is incomplete.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_sidechain_is_incomplete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sid = "8c0e5a52-0000-4000-8000-000000000006";
+        let root = tmp.path().join(".claude-a");
+        let main = main_path(&root, "p1", sid);
+        write(&main, &[said(abs("/ws"), serde_json::json!("go"))]);
+        let subagents = main.with_extension("").join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        let roots = vec![root];
+        let elsewhere = tmp.path().join("elsewhere.jsonl");
+        write(&elsewhere, &[said(abs("/ws"), serde_json::json!("go"))]);
+        std::os::unix::fs::symlink(&elsewhere, subagents.join("agent-y.jsonl")).unwrap();
+        let linked = scan_session_in(&roots, sid, SCAN_MAX_BYTES, SCAN_DEADLINE);
+        assert!(linked.read.incomplete.unwrap().contains("symlink"));
+    }
+
+    /// The cache must never serve a stale "no write": a file the session
+    /// wrote to since is read again.
+    #[test]
+    fn a_changed_file_is_read_again_and_not_served_from_the_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sid = "8c0e5a52-0000-4000-8000-000000000003";
+        let root = tmp.path().join(".claude-a");
+        let main = main_path(&root, "p1", sid);
+        let roots = vec![root];
+        write(&main, &[said(abs("/ws"), serde_json::json!("go"))]);
+        assert_eq!(
+            scan_session_in(&roots, sid, SCAN_MAX_BYTES, SCAN_DEADLINE)
+                .read
+                .no_write_proof(),
+            Ok(())
+        );
+        write(
+            &main,
+            &[
+                said(abs("/ws"), serde_json::json!("go")),
+                call(abs("/ws"), "Bash", serde_json::json!({"command": "true"})),
+            ],
+        );
+        assert!(scan_session_in(&roots, sid, SCAN_MAX_BYTES, SCAN_DEADLINE)
+            .read
+            .write_call
+            .unwrap()
+            .contains("\"Bash\""));
+    }
+}
