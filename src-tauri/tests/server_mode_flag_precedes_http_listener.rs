@@ -47,6 +47,14 @@
 //! editing `setup()`. If you need to restructure this, keep the invariant —
 //! **set the flag before anything can serve an HTTP request** — and update
 //! this test to assert whatever the new structure makes checkable.
+//!
+//! One listener answers EARLIER than `start_server` by design: an `api` socket
+//! inherited through LISTEN_FDS is served from `run_app` by
+//! `mcp_api::start_early_api_if_inherited`, but only through the booting gate,
+//! which answers every request `503 RUNNER_BOOTING` and runs no route handler
+//! until `start_server` installs the router. So the invariant this test guards
+//! — no ROUTE (the invoke route included) is served before the flag is set —
+//! still reduces to the order checked here.
 
 use std::path::PathBuf;
 

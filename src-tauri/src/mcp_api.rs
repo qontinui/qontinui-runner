@@ -90,7 +90,7 @@ mod vcs_pr;
 
 use drain::drain_handler;
 pub(crate) use serve::lan_reachable_for_bound_addr;
-pub use serve::start_server;
+pub use serve::{start_early_api_if_inherited, start_server};
 use serve::{not_found_handler, runner_panic_handler};
 use vcs_pr::vcs_create_pull_request_handler;
 
@@ -2796,6 +2796,14 @@ async fn health(
         // 2026-10-19-primary-runner-is-a-debug-build-and-nothing-shows-it,
         // Phase 2). Compile-time, like `buildId`.
         "buildProfile": qontinui_runner_lib::build_provenance::build_profile_json(),
+        // How the API listener was obtained (plan
+        // 2026-11-24-runner-upgrades-itself-daily-keeping-sessions-alive-with-no-outage-and-automatic-rollback,
+        // Phase 2). `supported`: this build can adopt an inherited listener on
+        // this OS — the socket-unit installer refuses a build without it, since
+        // such a build would fail to bind under a socket unit. `api`:
+        // `"inherited"` (taken from LISTEN_FDS, so it was never unbound across a
+        // restart) or `"bound"`; `null` before the listener was acquired.
+        "listenerInheritance": qontinui_runner_lib::listeners::health_json(),
         // WHAT TREE STATE the two build halves came from, as content hashes
         // (gitDirty, treeHash, rustSrcHash, frontendSrcHash, halvesAgree) —
         // compile-time constants, like `gitSha`/`buildId` above. Compare them
