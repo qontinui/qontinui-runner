@@ -79,6 +79,11 @@ pub const OVERDUE: Dur = Dur::mins(10);
 pub const KEEPALIVE: Dur = Dur::secs(1_200);
 /// A recurring session cron expires this long after creation (§2.1 S).
 pub const CRON_EXPIRY: Dur = Dur::days(7);
+/// How long a Close may wait for its acknowledgement before it is reported
+/// `close_unconfirmed` and the session returns to Stopped (§3.5 S6).
+pub const CLOSE_ACK_TIMEOUT: Dur = Dur::mins(5);
+/// The backoff before a new Close after an unconfirmed one (S6: 150 s base).
+pub const CLOSE_BACKOFF: Dur = Dur::secs(150);
 
 /// Freshness bounds, §2.5.
 pub mod tau {
@@ -763,6 +768,8 @@ pub struct SessionState {
     /// A close issued and not yet acknowledged (the time it was issued): phase 8
     /// `Closing`, the inbox freezes and no second Close is emitted (S6).
     pub closing: Option<Timestamp>,
+    /// No new Close before this: set when a close went unconfirmed.
+    pub close_backoff_until: Option<Timestamp>,
     /// Any hold after a relayed exit currently standing.
     pub hold: Option<Hold>,
     pub ledger: Ledger,
@@ -794,6 +801,7 @@ impl SessionState {
             continuation_gate: None,
             shell_hosted: false,
             closing: None,
+            close_backoff_until: None,
             hold: None,
             ledger: Ledger::default(),
             schema_skew: None,
@@ -880,6 +888,9 @@ pub enum EventKind {
     CloseIssued,
     /// The close was read back (the pane is gone) or refused by the actuator.
     CloseSettled,
+    /// The kernel reported `close_unconfirmed`: back to Stopped, with a backoff
+    /// before any new attempt.
+    CloseUnconfirmed,
     /// Mode and pane kind.
     ModeRead {
         mode: Mode,
@@ -968,6 +979,8 @@ fn apply(s: &mut SessionState, e: &Event) {
         }
         EventKind::TurnStart => {
             s.activity = Observed::new(Activity::Turn, at);
+            // A turn means the close did not take effect.
+            s.closing = None;
             // A turn opening after the finish reads invalidates what R and the
             // coord row said: both must be re-read before anything acts on them.
             s.revived = Observed::new(Tri::unknown("revived", "a turn opened after the read"), at);
@@ -1115,6 +1128,10 @@ fn apply(s: &mut SessionState, e: &Event) {
         EventKind::RevivedRead(r) => s.revived = Observed::new(r.clone(), at),
         EventKind::CloseIssued => s.closing = Some(at),
         EventKind::CloseSettled => s.closing = None,
+        EventKind::CloseUnconfirmed => {
+            s.closing = None;
+            s.close_backoff_until = Some(at.plus(CLOSE_BACKOFF));
+        }
         EventKind::ModeRead { mode, pane_kind } => {
             s.mode = *mode;
             s.pane_kind = *pane_kind;
@@ -1259,8 +1276,11 @@ pub fn phase_of(s: &SessionState, items: ItemFacts, closing: bool, now: Timestam
     if !s.selfcont.fresh(now, tau::S) {
         return Phase::Unknown(Unk::new("selfcont", "stale"));
     }
-    // S2: an Unknown W, O, K, R or coord row never acts — not even a Continue
-    // of an owed item — so each is a phase of its own (D0) on a live host.
+    // S2: an Unknown W, O or K never acts — not even a Continue of an owed
+    // item — so each is a phase of its own (D0) on a live host. R and the coord
+    // row gate only where a finish, revival or close decision depends on them
+    // (the Stopped phases below, and `decide`'s Migrate arms), so an unfinished
+    // working or parked session with an unreadable coord row is still served.
     if let Declared::Unknown(u) = &s.work.value {
         return Phase::Unknown(u.clone());
     }
@@ -1270,17 +1290,20 @@ pub fn phase_of(s: &SessionState, items: ItemFacts, closing: bool, now: Timestam
     if let CustodyAxis::Unknown(u) = &s.custody.value {
         return Phase::Unknown(u.clone());
     }
-    if let Tri::Unknown(u) = &s.revived.value {
-        return Phase::Unknown(u.clone());
-    }
-    if let Tri::Unknown(u) = &s.coord_finished.value {
-        return Phase::Unknown(u.clone());
-    }
     if !s.work.fresh(now, tau::W) {
         return Phase::Unknown(Unk::new("work", "stale"));
     }
-    if matches!(s.work.value, Declared::Finished { .. }) && !s.revived.fresh(now, tau::R) {
-        return Phase::Unknown(Unk::new("revived", "stale"));
+    if matches!(s.work.value, Declared::Finished { .. }) {
+        if let Tri::Unknown(u) = &s.revived.value {
+            return Phase::Unknown(u.clone());
+        }
+        if !s.revived.fresh(now, tau::R) {
+            return Phase::Unknown(Unk::new("revived", "stale"));
+        }
+        // A finish decision (WithdrawFinish, Close) reads the coord row too.
+        if let Tri::Unknown(u) = &s.coord_finished.value {
+            return Phase::Unknown(u.clone());
+        }
     }
     // 1 Spawning
     match &s.hosting.value {
@@ -1300,6 +1323,12 @@ pub fn phase_of(s: &SessionState, items: ItemFacts, closing: bool, now: Timestam
         }
         Activity::ShellPinned { .. } | Activity::Idle { .. } | Activity::Unknown(_) => {}
     }
+    // 8 Closing is tested BEFORE the interacting / parked / scheduled phases: a
+    // Close in flight freezes the inbox, so no Continue (D12 included) may go
+    // out while it waits for its acknowledgement.
+    if closing {
+        return Phase::Closing;
+    }
     // 4 Interacting
     match &s.input.value {
         Input::Dialog { .. } | Input::Draft { .. } => return Phase::Interacting,
@@ -1316,10 +1345,6 @@ pub fn phase_of(s: &SessionState, items: ItemFacts, closing: bool, now: Timestam
     // 6 Scheduled
     if !s.holding_selfcont().is_empty() {
         return Phase::Scheduled;
-    }
-    // 8 Closing precedes the Stopped decision only when a close is in flight.
-    if closing {
-        return Phase::Closing;
     }
     // 7 Stopped and its sub-phases.
     if s.revived.value.is_true() {

@@ -46,7 +46,7 @@ use crate::state::{
     AccountId, Activity, AutoContinue, CloseDoor, CronKind, Custody, CustodyAxis, Declared, Dur,
     ExitFacts, Hosting, Input, ItemFacts, Mode, NextMoveKind, OwnedAxis, PaneKind, Parked, Phase,
     Principal, SelfCont, SelfConts, SessionState, Stopped, Timestamp, Tri, TypedExit, Unk, Writer,
-    OVERDUE, T_MIG, UNKNOWN_REPORT_AFTER,
+    CLOSE_ACK_TIMEOUT, CLOSE_BACKOFF, OVERDUE, T_MIG, UNKNOWN_REPORT_AFTER,
 };
 
 /// `MIGRATION_CAP`: account migrations per session per 24 h
@@ -66,10 +66,11 @@ pub const DRAFT_STALE: Dur = Dur::hours(24);
 pub const DIALOG_STALE: Dur = Dur::mins(30);
 
 /// D12: how long a request error waits before its one Continue.
+///
+/// An IMPLEMENTATION CHOICE: §3.2 D12 says "Continue once after backoff" and
+/// names no duration. Two minutes lets a transient overload clear and is well
+/// inside the 10-minute Continue budget.
 pub const ERROR_BACKOFF: Dur = Dur::mins(2);
-
-/// How long a Close may wait for its acknowledgement (S6).
-pub const CLOSE_ACK_TIMEOUT: Dur = Dur::mins(5);
 
 const RETRY_SET: &str = "__retry__";
 const CLOSEOUT_SET: &str = "__closeout__";
@@ -243,7 +244,7 @@ pub fn decide(
         digest,
     };
     let facts = item_facts(s, items);
-    let phase = crate::state::phase_of(s, facts, s.closing.is_some(), now);
+    let phase = crate::state::phase_of(s, facts, close_in_flight(s, now), now);
     let mut d = match &phase {
         Phase::Unknown(u) => d0(&ctx, u),
         Phase::Spawning => observe(RuleId::D5, ObserveWhy::Spawning).why("phase", &phase),
@@ -257,6 +258,9 @@ pub fn decide(
         Phase::Closed { finished } => closed(&ctx, *finished),
     };
     hold_riders(&ctx, &mut d);
+    if let Some(c) = unconfirmed_rider(&ctx) {
+        d.caps.push(c);
+    }
     finish(&ctx, d, &phase)
 }
 
@@ -280,22 +284,48 @@ fn finish(ctx: &Ctx, d: Dec, phase: &Phase) -> Decision {
 // D0
 // ---------------------------------------------------------------------------
 
-/// Phase 8: a Close was issued and its acknowledgement is pending. The inbox is
-/// frozen and NO second Close is emitted (S6: no blind retry); an
-/// acknowledgement that does not come inside [`CLOSE_ACK_TIMEOUT`] is reported
-/// as failed, and the next Decision is a new one (backoff is the actuator's).
-fn closing(ctx: &Ctx) -> Dec {
-    let issued = ctx.s.closing.unwrap_or(ctx.now);
-    if ctx.now.since(issued) > CLOSE_ACK_TIMEOUT {
-        report(
-            RuleId::D20,
-            Consumer::GatingAndDetecting,
-            DetectionKind::CloseNotAcknowledged,
-            "a Close was issued and not acknowledged inside its timeout",
-        )
-    } else {
-        observe(RuleId::D20, ObserveWhy::CloseInFlight)
+/// Phase 8: a Close was issued and its acknowledgement is pending, inside
+/// [`CLOSE_ACK_TIMEOUT`]. The inbox is frozen and NO second Close is emitted
+/// (S6: no blind retry). Past the timeout the session is no longer `Closing`:
+/// `decide` treats it as Stopped again, reports `close_unconfirmed` ONCE as a
+/// rider ([`unconfirmed_rider`]) and refuses a new Close until the backoff ends
+/// ([`close_backoff_until`]); a turn opening clears the fact outright (§3.5).
+fn closing(_ctx: &Ctx) -> Dec {
+    observe(RuleId::D20, ObserveWhy::CloseInFlight)
+}
+
+/// The close in flight, if it is still inside its ack window.
+fn close_in_flight(s: &SessionState, now: Timestamp) -> bool {
+    s.closing.is_some_and(|t| now.since(t) <= CLOSE_ACK_TIMEOUT)
+}
+
+/// When a new Close is next allowed: after an unconfirmed one, its timeout plus
+/// the backoff; or the recorded `close_backoff_until` once the fold saw it.
+fn close_backoff_until(s: &SessionState) -> Option<Timestamp> {
+    let stale = s
+        .closing
+        .map(|t| t.plus(CLOSE_ACK_TIMEOUT).plus(CLOSE_BACKOFF));
+    match (stale, s.close_backoff_until) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
     }
+}
+
+/// `close_unconfirmed`, reported once per issued close: an ack timeout takes
+/// the session back to Stopped (§3.5 S6).
+fn unconfirmed_rider(ctx: &Ctx) -> Option<Cap> {
+    let t = ctx.s.closing?;
+    if ctx.now.since(t) <= CLOSE_ACK_TIMEOUT {
+        return None;
+    }
+    let key = format!("close_unconfirmed:{}", t.0);
+    if ctx.s.ledger.reported.contains_key(&key) {
+        return None;
+    }
+    Some(Cap::AlsoReport(Detection::new(
+        DetectionKind::CloseUnconfirmed,
+        format!("close_unconfirmed: a Close issued at {} was not acknowledged inside its timeout; ledger key {key}", t.0),
+    )))
 }
 
 fn d0(ctx: &Ctx, u: &Unk) -> Dec {
@@ -550,6 +580,15 @@ fn recent(ts: &[Timestamp], now: Timestamp, within: Dur) -> usize {
     ts.iter().filter(|t| now.since(**t) <= within).count()
 }
 
+/// R or the coord row Unknown: a Migrate resubmits a turn and moves an account,
+/// so (S2) it never acts while a finish-related axis is unreadable.
+fn finish_axes_unknown(s: &SessionState) -> Option<Unk> {
+    match (&s.revived.value, &s.coord_finished.value) {
+        (Tri::Unknown(u), _) | (_, Tri::Unknown(u)) => Some(u.clone()),
+        _ => None,
+    }
+}
+
 fn migration_available(ctx: &Ctx) -> bool {
     recent(&ctx.s.ledger.migrations, ctx.now, Dur::hours(24)) < MIGRATION_CAP
 }
@@ -598,6 +637,9 @@ fn parked(ctx: &Ctx) -> Dec {
                             if s.hold.is_some() {
                                 return observe(RuleId::D9, ObserveWhy::HeldAfterRelayedExit);
                             }
+                            if let Some(u) = finish_axes_unknown(s) {
+                                return observe(RuleId::D9, ObserveWhy::Unknown(u));
+                            }
                             if !ctx.dials.wake.available() {
                                 return observe(RuleId::D9, ObserveWhy::BudgetExhausted);
                             }
@@ -644,7 +686,10 @@ fn parked(ctx: &Ctx) -> Dec {
             };
             let migrate = can_migrate
                 .filter(|_| {
-                    migration_available(ctx) && s.hold.is_none() && ctx.dials.wake.available()
+                    migration_available(ctx)
+                        && s.hold.is_none()
+                        && finish_axes_unknown(s).is_none()
+                        && ctx.dials.wake.available()
                 })
                 .map(|to| {
                     Dec::new(
@@ -666,7 +711,9 @@ fn parked(ctx: &Ctx) -> Dec {
         // `invalid_request`, `max_output_tokens`, `unknown` — gets ONE Continue
         // after a backoff ("the last turn failed with <kind>; continue it"); a
         // repeat is a Report. There is no `retryable` split: the table names no
-        // kind that is only reported.
+        // kind that is only reported, so the earlier `retryable` field of
+        // `Parked::ApiError` is dropped in favour of `since` (when the turn
+        // ended on the error), which the backoff needs.
         Parked::ApiError { kind, since } => {
             let ready = since.plus(ERROR_BACKOFF);
             if ctx.now < ready {
@@ -1033,6 +1080,11 @@ fn finished_pinned(ctx: &Ctx) -> Dec {
 
 fn d20(ctx: &Ctx) -> Dec {
     let r = &ctx.report;
+    if let Some(until) = close_backoff_until(ctx.s) {
+        if ctx.now < until {
+            return observe(RuleId::D20, ObserveWhy::Backoff { until });
+        }
+    }
     if let Some(a) = guard::close_action(r, ctx.now) {
         return Dec::new(RuleId::D20, Consumer::Gating, a);
     }
