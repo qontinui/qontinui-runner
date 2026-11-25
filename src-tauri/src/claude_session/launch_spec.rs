@@ -1583,10 +1583,10 @@ mod tests {
                     .any(|a| a == "--session-id" || a.starts_with("--session-id=")),
                 "{template}: {argv:?}"
             );
+            let inline = format!("--resume={ID}");
             assert!(
-                argv.iter()
-                    .any(|a| a == "-r" || a == &format!("--resume={ID}")),
-                "{template}: {argv:?}"
+                value_after(&argv, "-r") == Some(ID) || argv.iter().any(|a| *a == inline),
+                "{template}: the pinned id must follow the kept resume flag: {argv:?}"
             );
         }
         for template in [

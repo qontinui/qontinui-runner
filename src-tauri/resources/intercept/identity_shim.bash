@@ -459,9 +459,9 @@ for a in "$@"; do
     --) break ;;
     --session-id|--session-id=*|--resume|--resume=*|-r|resume|--continue|-c)
       user_chose_session=1; break ;;
-    --name|-n|--model|--fallback-model|--permission-mode|--permission-prompt-tool|--append-system-prompt|--append-system-prompt-file|--system-prompt|--system-prompt-file|--output-format|--input-format|--settings|--setting-sources|--agent|--agents|--effort|--max-turns|--max-budget-usd|--json-schema|--plugin-dir)
+    --name|-n|--model|--fallback-model|--permission-mode|--permission-prompt-tool|--append-system-prompt|--append-system-prompt-file|--system-prompt|--system-prompt-file|--output-format|--input-format|--settings|--setting-sources|--agent|--agents|--effort|--max-turns|--max-budget-usd|--json-schema|--plugin-dir|--autocompact|--debug-file|--environment|--permission-prompts|--plugin-url|--remote-control-session-name-prefix|--system-prompt-snapshot)
       skip_values=1 ;;
-    --add-dir|--allowedTools|--allowed-tools|--disallowedTools|--disallowed-tools|--mcp-config|--tools|--betas)
+    --add-dir|--allowedTools|--allowed-tools|--disallowedTools|--disallowed-tools|--mcp-config|--tools|--betas|--file)
       skip_values=2 ;;
   esac
 done

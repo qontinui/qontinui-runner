@@ -119,7 +119,7 @@ pub fn claude_argv_chooses_session<S: AsRef<str>>(args: &[S]) -> bool {
         } else if CLAUDE_VARIADIC_FLAGS.contains(&a) {
             // Variadic options take every following token up to the next
             // option, i.e. one longer than `-` that starts with it
-            // (commander's `maybeOption`), so a `resume` or a lone `-` in that
+            // (commander 13.1.0 `maybeOption`, `lib/command.js`), so a `resume` or a lone `-` in that
             // run is a value. A `--` is an option by that test, so it ends the
             // run and is then read as the terminator.
             while tokens
@@ -160,6 +160,13 @@ pub const CLAUDE_VALUE_FLAGS: &[&str] = &[
     "--max-budget-usd",
     "--json-schema",
     "--plugin-dir",
+    "--autocompact",
+    "--debug-file",
+    "--environment",
+    "--permission-prompts",
+    "--plugin-url",
+    "--remote-control-session-name-prefix",
+    "--system-prompt-snapshot",
 ];
 
 /// Claude Code options that take one or more values: everything up to the
@@ -173,6 +180,7 @@ pub const CLAUDE_VARIADIC_FLAGS: &[&str] = &[
     "--mcp-config",
     "--tools",
     "--betas",
+    "--file",
 ];
 
 #[cfg(test)]
