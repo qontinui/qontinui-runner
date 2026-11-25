@@ -2447,6 +2447,35 @@ mod tests {
         ])));
     }
 
+    /// The VALUE of a Claude Code option is not a session choice, so the pin
+    /// is still appended: `claude --name resume` must not launch id-less
+    /// (review round 5, A2 of qontinui-runner#3149).
+    #[test]
+    fn an_option_value_named_like_a_session_choice_still_gets_the_pin() {
+        for argv in [
+            &["--name", "resume"][..],
+            &["-n", "-c"],
+            &["--model", "-r"],
+            &["--add-dir", "a", "resume"],
+        ] {
+            let orig = strs(argv);
+            let user_chose = user_chose_session(&orig);
+            assert!(!user_chose, "{argv:?} chooses no session");
+            let out = identity_argv(&orig, &[], &[], Some("pin-123"), user_chose);
+            assert_eq!(
+                out.iter().filter(|a| a.as_str() == "--session-id").count(),
+                1,
+                "{argv:?}: {out:?}"
+            );
+            let i = out.iter().position(|a| a == "--session-id").unwrap();
+            assert_eq!(
+                out.get(i + 1).map(String::as_str),
+                Some("pin-123"),
+                "{out:?}"
+            );
+        }
+    }
+
     #[test]
     fn identity_settings_args_only_for_claude_with_existing_file() {
         let tmp = tempfile::tempdir().unwrap();
