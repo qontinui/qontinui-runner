@@ -308,7 +308,8 @@ impl InputFunnel {
     /// Every writer class seen since the spawn, `None` when the funnel did not
     /// observe the pane from its spawn (UNKNOWN, never "nobody").
     pub fn writers_since_spawn(&self) -> Option<&BTreeSet<InputWriter>> {
-        self.observed_from_spawn.then_some(&self.writers_since_spawn)
+        self.observed_from_spawn
+            .then_some(&self.writers_since_spawn)
     }
 
     /// Has no one but the pane's creator written into it since the spawn?
@@ -334,7 +335,14 @@ impl InputFunnel {
     /// submitting CR, once that is on the wire, as an [`InputKind::Submit`] —
     /// so a CR that fails to write leaves the funnel reading `Draft`, which is
     /// what the composer then holds.
-    pub fn record(&mut self, caller: PtyWriteCaller, kind: InputKind, at: Instant, bytes: usize, data: &[u8]) {
+    pub fn record(
+        &mut self,
+        caller: PtyWriteCaller,
+        kind: InputKind,
+        at: Instant,
+        bytes: usize,
+        data: &[u8],
+    ) {
         let writer = InputWriter::of(&caller, kind);
         self.draft = self.fold_draft(&caller, kind, at, data);
         if self.observed_from_spawn {
@@ -600,7 +608,13 @@ mod tests {
     fn a_submit_clears_an_inserted_draft() {
         let mut f = spawned();
         f.record(PtyWriteCaller::ReviewNotes, InputKind::Insert, t(), 12, b"");
-        f.record(PtyWriteCaller::WorkerSession, InputKind::Submit, t(), 8, b"");
+        f.record(
+            PtyWriteCaller::WorkerSession,
+            InputKind::Submit,
+            t(),
+            8,
+            b"",
+        );
         assert_eq!(f.draft_state(), &PaneDraftState::NoDraft);
     }
 
@@ -619,7 +633,10 @@ mod tests {
         write(&mut f, PtyWriteCaller::TauriTerminalWrite, b"more");
         assert!(matches!(
             f.draft_state(),
-            PaneDraftState::Draft { source: DraftSource::Inserted, .. }
+            PaneDraftState::Draft {
+                source: DraftSource::Inserted,
+                ..
+            }
         ));
     }
 
@@ -629,7 +646,10 @@ mod tests {
         write(&mut f, PtyWriteCaller::TauriTerminalWrite, b"hello");
         assert!(matches!(
             f.draft_state(),
-            PaneDraftState::Draft { source: DraftSource::Typed, .. }
+            PaneDraftState::Draft {
+                source: DraftSource::Typed,
+                ..
+            }
         ));
         write(&mut f, PtyWriteCaller::TauriTerminalWrite, b" world\r");
         assert_eq!(f.draft_state(), &PaneDraftState::NoDraft);
@@ -645,9 +665,17 @@ mod tests {
     #[test]
     fn a_newline_inside_a_bracketed_paste_does_not_submit() {
         let mut f = spawned();
-        write(&mut f, PtyWriteCaller::TauriTerminalWrite, b"\x1b[200~a\nb\x1b[201~");
+        write(
+            &mut f,
+            PtyWriteCaller::TauriTerminalWrite,
+            b"\x1b[200~a\nb\x1b[201~",
+        );
         assert!(f.draft_state().is_draft(), "{:?}", f.draft_state());
-        write(&mut f, PtyWriteCaller::TauriTerminalWrite, b"\x1b[200~a\nb\x1b[201~\r");
+        write(
+            &mut f,
+            PtyWriteCaller::TauriTerminalWrite,
+            b"\x1b[200~a\nb\x1b[201~\r",
+        );
         assert_eq!(f.draft_state(), &PaneDraftState::NoDraft);
     }
 
@@ -696,7 +724,11 @@ mod tests {
                 "chunks {chunks:?}"
             );
             write(&mut f, PtyWriteCaller::TauriTerminalWrite, b"\r");
-            assert_eq!(f.draft_state(), &PaneDraftState::NoDraft, "chunks {chunks:?}");
+            assert_eq!(
+                f.draft_state(),
+                &PaneDraftState::NoDraft,
+                "chunks {chunks:?}"
+            );
         }
     }
 
@@ -724,7 +756,11 @@ mod tests {
             for c in chunks {
                 write(&mut f, PtyWriteCaller::HttpCreateInitialCommand, c);
             }
-            assert_eq!(f.draft_state(), &PaneDraftState::NoDraft, "chunks {chunks:?}");
+            assert_eq!(
+                f.draft_state(),
+                &PaneDraftState::NoDraft,
+                "chunks {chunks:?}"
+            );
         }
         // A second LF is a Ctrl-J again.
         let mut f = spawned();
@@ -792,19 +828,43 @@ mod tests {
     #[test]
     fn a_submit_whose_cr_never_landed_reads_draft() {
         let mut f = spawned();
-        f.record(PtyWriteCaller::WorkerSession, InputKind::Insert, t(), 9, b"");
+        f.record(
+            PtyWriteCaller::WorkerSession,
+            InputKind::Insert,
+            t(),
+            9,
+            b"",
+        );
         assert!(f.draft_state().is_draft());
-        f.record(PtyWriteCaller::WorkerSession, InputKind::Submit, t(), 1, b"");
+        f.record(
+            PtyWriteCaller::WorkerSession,
+            InputKind::Submit,
+            t(),
+            1,
+            b"",
+        );
         assert_eq!(f.draft_state(), &PaneDraftState::NoDraft);
     }
 
     #[test]
     fn a_control_response_changes_no_draft() {
         let mut f = spawned();
-        f.record(PtyWriteCaller::TauriTerminalWrite, InputKind::ControlResponse, t(), 3, b"\x1b[I");
+        f.record(
+            PtyWriteCaller::TauriTerminalWrite,
+            InputKind::ControlResponse,
+            t(),
+            3,
+            b"\x1b[I",
+        );
         assert_eq!(f.draft_state(), &PaneDraftState::NoDraft);
         f.record(PtyWriteCaller::ReviewNotes, InputKind::Insert, t(), 12, b"");
-        f.record(PtyWriteCaller::TauriTerminalWrite, InputKind::ControlResponse, t(), 3, b"\x1b[O");
+        f.record(
+            PtyWriteCaller::TauriTerminalWrite,
+            InputKind::ControlResponse,
+            t(),
+            3,
+            b"\x1b[O",
+        );
         assert!(f.draft_state().is_draft());
     }
 
@@ -821,8 +881,17 @@ mod tests {
             }
         );
         write(&mut f, PtyWriteCaller::TauriTerminalWrite, b"x");
-        assert!(f.draft_state().is_draft(), "text typed is a draft whatever came before");
-        f.record(PtyWriteCaller::WorkerSession, InputKind::Submit, t(), 4, b"");
+        assert!(
+            f.draft_state().is_draft(),
+            "text typed is a draft whatever came before"
+        );
+        f.record(
+            PtyWriteCaller::WorkerSession,
+            InputKind::Submit,
+            t(),
+            4,
+            b"",
+        );
         assert_eq!(f.draft_state(), &PaneDraftState::NoDraft);
     }
 
@@ -831,9 +900,23 @@ mod tests {
     #[test]
     fn the_creators_initial_command_and_control_responses_keep_creator_only() {
         let mut f = spawned();
-        assert_eq!(f.written_only_by_creator(), Some(true), "nothing written yet");
-        write(&mut f, PtyWriteCaller::HttpCreateInitialCommand, b"claude\r");
-        f.record(PtyWriteCaller::TauriTerminalWrite, InputKind::ControlResponse, t(), 3, b"\x1b[I");
+        assert_eq!(
+            f.written_only_by_creator(),
+            Some(true),
+            "nothing written yet"
+        );
+        write(
+            &mut f,
+            PtyWriteCaller::HttpCreateInitialCommand,
+            b"claude\r",
+        );
+        f.record(
+            PtyWriteCaller::TauriTerminalWrite,
+            InputKind::ControlResponse,
+            t(),
+            3,
+            b"\x1b[I",
+        );
         assert_eq!(f.written_only_by_creator(), Some(true));
         let writers: Vec<_> = f.writers_since_spawn().unwrap().iter().copied().collect();
         assert_eq!(writers, vec![InputWriter::Creator, InputWriter::NoOne]);
@@ -854,16 +937,28 @@ mod tests {
         ];
         for (caller, kind) in others {
             let mut f = spawned();
-            write(&mut f, PtyWriteCaller::HttpCreateInitialCommand, b"claude\r");
+            write(
+                &mut f,
+                PtyWriteCaller::HttpCreateInitialCommand,
+                b"claude\r",
+            );
             f.record(caller.clone(), kind, t(), 1, b"x");
-            assert_eq!(f.written_only_by_creator(), Some(false), "{caller:?} {kind:?}");
+            assert_eq!(
+                f.written_only_by_creator(),
+                Some(false),
+                "{caller:?} {kind:?}"
+            );
         }
     }
 
     #[test]
     fn a_pane_not_observed_from_its_spawn_has_unknown_writers() {
         let mut f = InputFunnel::default();
-        write(&mut f, PtyWriteCaller::HttpCreateInitialCommand, b"claude\r");
+        write(
+            &mut f,
+            PtyWriteCaller::HttpCreateInitialCommand,
+            b"claude\r",
+        );
         assert_eq!(f.writers_since_spawn(), None);
         assert_eq!(f.written_only_by_creator(), None);
         // Marking after input was recorded is refused: "from the spawn" would
@@ -900,10 +995,16 @@ mod tests {
             PtyWriteCaller::StewardLaunchCommand,
         ] {
             assert_eq!(InputWriter::of(&c, InputKind::Write), InputWriter::Creator);
-            assert_eq!(InputWriter::of(&c, InputKind::ControlResponse), InputWriter::NoOne);
+            assert_eq!(
+                InputWriter::of(&c, InputKind::ControlResponse),
+                InputWriter::NoOne
+            );
         }
         assert_eq!(
-            InputWriter::of(&PtyWriteCaller::TauriTerminalWrite, InputKind::ControlResponse),
+            InputWriter::of(
+                &PtyWriteCaller::TauriTerminalWrite,
+                InputKind::ControlResponse
+            ),
             InputWriter::NoOne
         );
         assert_eq!(

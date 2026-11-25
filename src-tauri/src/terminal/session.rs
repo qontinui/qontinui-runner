@@ -9194,11 +9194,19 @@ pub(crate) mod tests {
         let call = concat!("session.mark_input_funnel_", "observed_from_spawn();");
         // `spawn(` and `spawn_with_io(` cannot prefix-match each other.
         let spawn_at = src.find("    pub fn spawn(").expect("spawn");
-        let with_io_at = src.find("    pub fn spawn_with_io(").expect("spawn_with_io");
-        assert!(spawn_at < with_io_at, "spawn is defined before spawn_with_io");
+        let with_io_at = src
+            .find("    pub fn spawn_with_io(")
+            .expect("spawn_with_io");
+        assert!(
+            spawn_at < with_io_at,
+            "spawn is defined before spawn_with_io"
+        );
         // Production code only: fixtures below call the mark by hand.
         let tests_at = src.find("pub(crate) mod tests {").expect("tests module");
-        let hits: Vec<usize> = src[..tests_at].match_indices(call).map(|(i, _)| i).collect();
+        let hits: Vec<usize> = src[..tests_at]
+            .match_indices(call)
+            .map(|(i, _)| i)
+            .collect();
         assert_eq!(hits.len(), 1, "exactly one production mark call");
         assert!(
             hits[0] > spawn_at && hits[0] < with_io_at,
@@ -9228,7 +9236,10 @@ pub(crate) mod tests {
         session
             .write(b"x", PtyWriteCaller::TauriTerminalWrite)
             .expect("write failed");
-        assert_eq!(session.input_funnel().written_only_by_creator(), Some(false));
+        assert_eq!(
+            session.input_funnel().written_only_by_creator(),
+            Some(false)
+        );
     }
 
     /// The insert shares submit's liveness gate: nothing reaches a dead PTY.
