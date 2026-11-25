@@ -874,7 +874,7 @@ mod state_probe_tests {
     //!
     //! The regression these lock down: `disabled` / `ariaDisabled` were added
     //! to `ALLOWED_STATES` ahead of the bridge that emits them.
-    //! `@qontinui/ui-bridge@0.22.0` (this repo depends on `^0.22.0`) builds
+    //! `@qontinui/ui-bridge@0.22.0` (the bridge this fixture reproduces) builds
     //! element state as `visible` / `enabled` / `focused` only, so an
     //! absent-reads-as-`false` probe made both names permanently unmatchable
     //! — accepted at the door, then silently timed out.
