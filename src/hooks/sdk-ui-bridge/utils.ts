@@ -99,6 +99,7 @@ export function mapSdkElement(raw: Record<string, unknown>): ExternalElement {
     focused: (raw.focused as boolean) ?? false,
     value: raw.value as string | undefined,
     checked: raw.checked as boolean | undefined,
+    ariaBusy: typeof rawState?.ariaBusy === "boolean" ? rawState.ariaBusy : undefined,
     text: (raw.label as string) || (raw.text as string) || "",
     label: (raw.label as string) || "",
     parent: (raw.parent as string) || null,

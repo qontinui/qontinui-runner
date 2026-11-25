@@ -73,6 +73,12 @@ describe("isInteractiveElementRow", () => {
     expect(isInteractiveElementRow({ id: "g", type: "generic", actions: [] })).toBe(false);
   });
 
+  it("mapSdkElement carries state.ariaBusy and leaves it absent when the row has none", () => {
+    expect(mapSdkElement({ id: "b", state: { ariaBusy: true } }).ariaBusy).toBe(true);
+    expect(mapSdkElement({ id: "b", state: { ariaBusy: false } }).ariaBusy).toBe(false);
+    expect(mapSdkElement({ id: "b", state: {} }).ariaBusy).toBeUndefined();
+  });
+
   it("mapSdkElement carries the row's category", () => {
     expect(mapSdkElement({ id: "m", type: "image", category: "media" }).category).toBe("media");
     expect(mapSdkElement({ id: "x", type: "button", category: "bogus" }).category).toBeUndefined();
