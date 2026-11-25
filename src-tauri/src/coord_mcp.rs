@@ -21971,7 +21971,10 @@ mod tests {
         live_h.join().unwrap();
         booting_h.join().unwrap();
 
-        assert_eq!(reaped, 1, "only the never-answering port's config is reaped");
+        assert_eq!(
+            reaped, 1,
+            "only the never-answering port's config is reaped"
+        );
         assert!(!dead.exists(), "a connect-only liveness kept this");
         assert!(live.exists());
         assert!(booting.exists(), "a booting sibling is alive");

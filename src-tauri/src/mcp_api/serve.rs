@@ -248,10 +248,7 @@ struct EarlyApi {
 static EARLY_API: std::sync::Mutex<Option<EarlyApi>> = std::sync::Mutex::new(None);
 
 fn take_early_api() -> Option<EarlyApi> {
-    EARLY_API
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .take()
+    EARLY_API.lock().unwrap_or_else(|p| p.into_inner()).take()
 }
 
 /// When an `api` listener was inherited (socket activation, or a predecessor's
@@ -693,8 +690,7 @@ fn record_api_listener(
     let bind_latency_ms = crate::health_monitor::process_elapsed().as_millis() as u64;
     info!(
         port = bound_port,
-        bind_latency_ms,
-        "MCP API listener bound {bind_latency_ms} ms after process start"
+        bind_latency_ms, "MCP API listener bound {bind_latency_ms} ms after process start"
     );
 
     // Rotate this runner start's SAME-USER loopback handshake key at the BOUND
@@ -738,7 +734,8 @@ fn announce_api_ready(app_state: &AppState, emitter: &tauri::AppHandle, port: u1
             Some(name) => format!("Qontinui Runner — {} [:{}]", name, port),
             None => format!("Qontinui Runner [:{}]", port),
         };
-        if let Some(window) = emitter.get_webview_window(qontinui_runner_lib::get_main_window_label())
+        if let Some(window) =
+            emitter.get_webview_window(qontinui_runner_lib::get_main_window_label())
         {
             if let Err(e) = window.set_title(&title) {
                 warn!("Failed to set window title: {}", e);
@@ -821,7 +818,12 @@ pub async fn start_server(
         acquired.listener.local_addr().ok(),
     );
     announce_api_ready(&api_ready_flag, &emitter, bound_port);
-    await_api_serve(serve_on_dedicated_runtime(acquired.listener, router, bound_port)).await
+    await_api_serve(serve_on_dedicated_runtime(
+        acquired.listener,
+        router,
+        bound_port,
+    ))
+    .await
 }
 
 #[cfg(test)]
@@ -852,7 +854,10 @@ mod listener_adoption_tests {
         let mut env = HashMap::from([
             (ENV_LISTEN_PID.to_string(), "77".to_string()),
             (ENV_LISTEN_FDS.to_string(), "1".to_string()),
-            (ENV_LISTEN_FDNAMES.to_string(), API_LISTENER_NAME.to_string()),
+            (
+                ENV_LISTEN_FDNAMES.to_string(),
+                API_LISTENER_NAME.to_string(),
+            ),
         ]);
         let (store, _) = InheritedListeners::from_env(&mut env, 77, fd);
         assert!(env.is_empty(), "LISTEN_* must be cleared after adoption");
@@ -1001,7 +1006,10 @@ mod listener_adoption_tests {
         let (status, _, body) = get(&client, addr, "/livez").await;
         assert_eq!((status, body.as_str()), (200, "ok"));
         let (status, _, body) = get(&client, addr, "/no/such/route").await;
-        assert_eq!(status, 404, "the real router's own fallback answers: {body}");
+        assert_eq!(
+            status, 404,
+            "the real router's own fallback answers: {body}"
+        );
 
         served.abort();
     }
