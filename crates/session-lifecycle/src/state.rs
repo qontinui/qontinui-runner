@@ -160,7 +160,7 @@ impl Tri {
             (Tri::False, Tri::False) => Tri::False,
         }
     }
-    pub fn not(self) -> Tri {
+    pub fn negate(self) -> Tri {
         match self {
             Tri::True => Tri::False,
             Tri::False => Tri::True,
@@ -395,7 +395,9 @@ pub enum Hosting {
 pub enum Activity {
     Turn,
     /// `since_turn_end` carries the idle clock across the compaction (§2.3).
-    Compacting { since_turn_end: Option<Timestamp> },
+    Compacting {
+        since_turn_end: Option<Timestamp>,
+    },
     Delegated {
         agents: u32,
         workflows: u32,
@@ -973,7 +975,12 @@ fn apply(s: &mut SessionState, e: &Event) {
                 Activity::Compacting { since_turn_end } => *since_turn_end,
                 _ => None,
             };
-            s.activity = Observed::new(Activity::Compacting { since_turn_end: since }, at);
+            s.activity = Observed::new(
+                Activity::Compacting {
+                    since_turn_end: since,
+                },
+                at,
+            );
         }
         EventKind::CompactEnd => {
             // The idle clock is unchanged, the grace window restarts (§2.3).
@@ -998,7 +1005,10 @@ fn apply(s: &mut SessionState, e: &Event) {
             monitors,
             mcp_tasks,
         } => {
-            if matches!(s.activity.value, Activity::Turn | Activity::Compacting { .. }) {
+            if matches!(
+                s.activity.value,
+                Activity::Turn | Activity::Compacting { .. }
+            ) {
                 // A turn outranks background work; only the age moves.
                 s.activity.observed_at = at;
             } else if *agents > 0 || *workflows > 0 {
