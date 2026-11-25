@@ -255,10 +255,7 @@ impl InstanceManager {
         for (id, port) in &to_check {
             let port = *port;
             let alive = spawn_blocking_tracked(move || {
-                qontinui_runner_lib::listeners::loopback_runner_alive(
-                    port,
-                    REGISTERED_LIVEZ_BUDGET,
-                )
+                qontinui_runner_lib::listeners::loopback_runner_alive(port, REGISTERED_LIVEZ_BUDGET)
             })
             .await
             // A probe task that could not run decides nothing: keep the row.
