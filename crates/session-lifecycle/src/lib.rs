@@ -12,8 +12,11 @@
 //! passes all three in.
 
 pub mod classify_child;
+pub mod state;
 
 pub use classify_child::{
     classify_child, classify_session, Argv, ChildClass, ChildVerdict, Platform, ProcRow, ProcTable,
     SessionVerdict,
 };
+
+pub use state::*;
