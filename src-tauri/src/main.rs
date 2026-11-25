@@ -133,6 +133,9 @@ mod egress; // Plan 2026-10-10-spec-front-end-phase-9-generic-boundary Phase 7 �
 mod runner_close_sites;
 #[cfg(test)]
 mod runner_spawn_sites;
+// The runner upgrades itself: preflight, executor, rollback guard, probation
+// (plan 2026-11-24-runner-upgrades-itself-daily-keeping-sessions-alive-with-no-outage-and-automatic-rollback, Phase 5).
+mod runner_upgrade;
 // `embedded_pg` lives in the LIB crate as of P4 (lib-side consumers need it).
 // Re-bound here as `pub(crate)` so every existing `crate::embedded_pg::...`
 // path in this binary - including mcp_api.rs's /health reporting - keeps
@@ -1738,6 +1741,15 @@ fn main() {
         std::process::exit(code as i32);
     }
 
+    // The upgrade's headless doors (`--provenance`, `--upgrade-guard <record>`)
+    // — same posture and the same reason as the manifest above: before the
+    // single-instance plugin, so the guard and a candidate's identity read
+    // never reach a running GUI. A bare launch, a deep link and
+    // `--upgrade-successor` fall through.
+    if let Some(code) = runner_upgrade::cli::try_headless_upgrade_door() {
+        std::process::exit(code);
+    }
+
     // Pre-GUI CLI mode (Phase 1a — devenv enrollment). `qontinui-runner env
     // <sub> …` runs the enrollment CLI (enroll / capture / show) and exits
     // BEFORE any Tauri/GUI init, so the installed runner binary doubles as the
@@ -2794,6 +2806,20 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // Secondary instances (spawned by InstanceManager) must NOT use single-instance
     // plugin — it would prevent them from starting since they share the same binary.
     let is_secondary_instance = instance::is_secondary();
+
+    // A self-managed upgrade's successor (`--upgrade-successor <record>`)
+    // waits for its predecessor to exit BEFORE the single-instance plugin
+    // registers: while the predecessor lives, the plugin would forward this
+    // launch to it and exit (plan
+    // 2026-11-24-runner-upgrades-itself-daily-keeping-sessions-alive-with-no-outage-and-automatic-rollback, D1).
+    match runner_upgrade::cli::wait_for_predecessor_if_successor() {
+        Ok(true) => info!("runner upgrade: the predecessor has exited; this successor continues its boot"),
+        Ok(false) => {}
+        Err(e) => {
+            error!("runner upgrade: not starting as the successor: {e}");
+            std::process::exit(1);
+        }
+    }
 
     boot_stage::stamp(boot_stage::BootStage::TauriBuilder);
     let mut builder = tauri::Builder::default();
@@ -6174,6 +6200,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     Err(e) => error!("MCP API server error: {}", e),
                 }
             });
+
+            // Upgrade probation (plan 2026-11-24-runner-upgrades-itself-daily-
+            // keeping-sessions-alive-with-no-outage-and-automatic-rollback,
+            // Phase 5): when an in-flight upgrade names THIS build as its
+            // to-sha, prove it before the rollback guard fires; then report
+            // any concluded upgrade coord has not heard about. A no-op when
+            // no upgrade record exists.
+            runner_upgrade::probation::spawn_at_boot(app.handle().clone(), api_port);
 
             // The 3s `ui-bridge-ping` emitter, on its OWN OS thread — never a
             // tokio task. It used to be a `tokio::spawn` in

@@ -1,5 +1,13 @@
 //! `qontinui-pty-holder --pane-dir <abs> --pane-id <id> [--report]`
 //! `qontinui-pty-holder --adopt <abs snapshot path>` (Unix; plan Phase 8)
+//! `qontinui-pty-holder --protocol-versions`
+//!
+//! **`--protocol-versions`** prints [`PROTOCOL_VERSIONS`] as one JSON array
+//! line (`[1,2,3]`) and exits 0, touching nothing else. A runner about to
+//! upgrade to a candidate build runs the CANDIDATE's holder binary with it and
+//! checks that every live holder's negotiated version is still spoken (plan
+//! `2026-11-24-runner-upgrades-itself-daily-keeping-sessions-alive-with-no-outage-and-automatic-rollback`,
+//! Phase 5).
 //!
 //! **`--adopt`** is a holder upgrade's SUCCESSOR, started only by a running
 //! holder answering `prepare_upgrade` (`qontinui_pty_holder::handoff`). It
@@ -47,11 +55,12 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use qontinui_pty_holder::pane::PaneId;
+use qontinui_pty_holder::protocol::{render_protocol_versions, PROTOCOL_VERSIONS};
 use qontinui_pty_holder::pty::holder_exit_code;
 use qontinui_pty_holder::server::{Holder, StartError};
 use qontinui_pty_holder::startup;
 
-const USAGE: &str = "usage: qontinui-pty-holder --pane-dir <absolute dir> --pane-id <id> [--report] | --adopt <snapshot>";
+const USAGE: &str = "usage: qontinui-pty-holder --pane-dir <absolute dir> --pane-id <id> [--report] | --adopt <snapshot> | --protocol-versions";
 
 /// Where the one report line goes besides stdout: `Some` under `--report`.
 type ReportTo<'a> = Option<(&'a Path, &'a PaneId)>;
@@ -97,6 +106,7 @@ fn main() -> ExitCode {
     let mut pane_id: Option<String> = None;
     let mut to_file = false;
     let mut adopt: Option<PathBuf> = None;
+    let mut protocol_versions = false;
     let mut bad_usage = false;
     let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
@@ -105,12 +115,21 @@ fn main() -> ExitCode {
             Some("--pane-id") => pane_id = args.next().and_then(|v| v.into_string().ok()),
             Some("--report") => to_file = true,
             Some("--adopt") => adopt = args.next().map(PathBuf::from),
+            Some("--protocol-versions") => protocol_versions = true,
             Some("--help") | Some("-h") => {
                 println!("{USAGE}");
                 return ExitCode::SUCCESS;
             }
             _ => bad_usage = true,
         }
+    }
+    if protocol_versions {
+        if bad_usage || adopt.is_some() || pane_dir.is_some() || pane_id.is_some() || to_file {
+            return fail("usage", USAGE, 2, None);
+        }
+        println!("{}", render_protocol_versions(PROTOCOL_VERSIONS));
+        let _ = std::io::stdout().flush();
+        return ExitCode::SUCCESS;
     }
     if let Some(snapshot) = adopt {
         #[cfg(unix)]
