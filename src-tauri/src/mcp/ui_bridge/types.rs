@@ -372,8 +372,24 @@ pub enum UiBridgeErrorCode {
     ElementNotVisible,
     ElementNotEnabled,
     ElementStale,
+    /// The element is registered but has no DOM node to read — ui-bridge's
+    /// shared design runtime (`DesignRequestError`, code `NO_DOM_REFERENCE`)
+    /// refuses to answer design data for it rather than reading nothing. The
+    /// registry is out of step with the page, so the remedy is to resnapshot.
+    NoDomReference,
     // Action errors
     ActionFailed,
+    /// The frontend gave up waiting for a condition before it could act —
+    /// ui-bridge's canonical `UB-ACTION-TIMEOUT`, today the root-width lock a
+    /// responsive capture or a viewport constraint waits on (`budgetMs`) while
+    /// another capture holds it. Nothing was changed; the wait is retryable,
+    /// which is why the inner-failure status is 503, not 400.
+    ActionTimeout,
+    /// The frontend refused the action before running it — ui-bridge's
+    /// canonical `UB-ACTION-REJECTED`, today a root-width mutation asked for
+    /// while another runs synchronously. The request was well formed and the
+    /// page is in a conflicting state, hence 409.
+    ActionRejected,
     /// The requested action name is not in the element's advertised
     /// `actions` list. Issued pre-IPC by `ui_bridge_execute_action_handler`
     /// so the caller gets a flat HTTP 400 with the supported-action list in
@@ -868,6 +884,9 @@ pub fn recovery_hint_for(code: &UiBridgeErrorCode) -> RecoveryHint {
         UiBridgeErrorCode::ElementNotVisible => RecoveryHint::ScrollIntoView,
         UiBridgeErrorCode::ElementNotEnabled => RecoveryHint::WaitForEnabled,
         UiBridgeErrorCode::ElementStale => RecoveryHint::Resnapshot,
+        UiBridgeErrorCode::NoDomReference => RecoveryHint::Resnapshot,
+        UiBridgeErrorCode::ActionTimeout => RecoveryHint::RetryAfterMs(1000),
+        UiBridgeErrorCode::ActionRejected => RecoveryHint::RetryAfterMs(500),
         UiBridgeErrorCode::ActionFailed => RecoveryHint::Resnapshot,
         UiBridgeErrorCode::AssertionFailed => RecoveryHint::BroadenSelector,
         UiBridgeErrorCode::UnknownAssertionType => RecoveryHint::Unrecoverable,
@@ -906,10 +925,18 @@ pub fn recovery_hint_for(code: &UiBridgeErrorCode) -> RecoveryHint {
 /// documented position, and declines everything else to the existing
 /// heuristics.
 ///
-/// The strings are the wire spellings, which are also exactly what
-/// `UiBridgeErrorCode`'s `SCREAMING_SNAKE_CASE` serialization produces — so
-/// the code a caller reads back is the code the handler chose, character for
-/// character.
+/// The strings are the wire spellings. For the runner's own codes they are
+/// also exactly what `UiBridgeErrorCode`'s `SCREAMING_SNAKE_CASE`
+/// serialization produces, so the code a caller reads back is the code the
+/// handler chose, character for character. The two `UB-*` rows are ui-bridge's
+/// canonical vocabulary (`codes.json`), which the shared design runtime throws
+/// as-is; they are read back as the variant they name (`ACTION_TIMEOUT`,
+/// `ACTION_REJECTED`), the one place a row's name and its serialization differ.
+///
+/// The design rows (`INVALID_REQUEST` .. `UB-ACTION-REJECTED`) are the failure
+/// codes ui-bridge's shared design and quality runtime assigns
+/// (`designFailureCode` / `qualityFailureCode`), which `useDesignEvents` sends
+/// as the response's `code` field.
 const TYPED_FRONTEND_CODES: &[(&str, UiBridgeErrorCode)] = &[
     ("SEND_KEYS_INVALID", UiBridgeErrorCode::SendKeysInvalid),
     ("WRITE_TEXT_INVALID", UiBridgeErrorCode::WriteTextInvalid),
@@ -926,6 +953,11 @@ const TYPED_FRONTEND_CODES: &[(&str, UiBridgeErrorCode)] = &[
         "UPSTREAM_FETCH_FAILED",
         UiBridgeErrorCode::UpstreamFetchFailed,
     ),
+    ("INVALID_REQUEST", UiBridgeErrorCode::InvalidRequest),
+    ("ELEMENT_NOT_FOUND", UiBridgeErrorCode::ElementNotFound),
+    ("NO_DOM_REFERENCE", UiBridgeErrorCode::NoDomReference),
+    ("UB-ACTION-TIMEOUT", UiBridgeErrorCode::ActionTimeout),
+    ("UB-ACTION-REJECTED", UiBridgeErrorCode::ActionRejected),
 ];
 
 /// Look a handler's code up BY NAME — the STRUCTURED channel.
@@ -1372,6 +1404,95 @@ mod typed_frontend_code_tests {
         );
         assert_eq!(code_of("the request timed out"), "TIMEOUT");
         assert_eq!(code_of("circuit breaker is open"), "CIRCUIT_BREAKER_OPEN");
+    }
+}
+
+#[cfg(test)]
+mod design_runtime_code_tests {
+    //! The failure codes ui-bridge's shared design / quality runtime assigns
+    //! (`designFailureCode` / `qualityFailureCode`) reach the HTTP response as
+    //! typed codes, at the status their row picks. `useDesignEvents` answers a
+    //! refused request `{success:false, error, code}`; before these rows,
+    //! `wrap_ipc_result` declined every one of them to the prose classifier,
+    //! so `INVALID_REQUEST` on `/design/responsive` read back `INTERNAL_ERROR`
+    //! (plan `2026-11-15-runner-design-events-adopt-the-shared-ui-bridge-request-runtime`,
+    //! Phase 2).
+
+    use super::RecoveryHint;
+    use crate::mcp::ui_bridge::request::wrap_ipc_result;
+    use axum::http::StatusCode;
+    use serde_json::json;
+
+    /// `(status, code, recovery)` the runner answers for a frontend envelope
+    /// carrying `code`, with a message that does NOT name the code — so the
+    /// structured field, not the `"<CODE>: "` prefix reader, decides.
+    fn answer(code: &str) -> (StatusCode, String, Option<RecoveryHint>) {
+        let envelope = json!({
+            "success": false,
+            "error": "the shared design runtime refused this request",
+            "code": code,
+        });
+        let (status, body) = wrap_ipc_result(Ok(envelope)).expect_err("a refusal is never a 200");
+        let detail = body
+            .0
+            .error_detail
+            .clone()
+            .expect("a typed failure carries error_detail");
+        let wire = serde_json::to_value(detail.code).expect("serialize");
+        (
+            status,
+            wire.as_str().expect("string").to_string(),
+            detail.recovery,
+        )
+    }
+
+    #[test]
+    fn invalid_request_is_a_400_fix_the_request() {
+        let (status, code, recovery) = answer("INVALID_REQUEST");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(code, "INVALID_REQUEST");
+        assert!(matches!(recovery, Some(RecoveryHint::Unrecoverable)));
+    }
+
+    #[test]
+    fn element_not_found_is_a_400_resnapshot() {
+        let (status, code, recovery) = answer("ELEMENT_NOT_FOUND");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(code, "ELEMENT_NOT_FOUND");
+        assert!(matches!(recovery, Some(RecoveryHint::Resnapshot)));
+    }
+
+    #[test]
+    fn no_dom_reference_is_a_400_resnapshot() {
+        let (status, code, recovery) = answer("NO_DOM_REFERENCE");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(code, "NO_DOM_REFERENCE");
+        assert!(matches!(recovery, Some(RecoveryHint::Resnapshot)));
+    }
+
+    #[test]
+    fn ub_action_timeout_is_a_retryable_503() {
+        let (status, code, recovery) = answer("UB-ACTION-TIMEOUT");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(code, "ACTION_TIMEOUT");
+        assert!(matches!(recovery, Some(RecoveryHint::RetryAfterMs(1000))));
+    }
+
+    #[test]
+    fn ub_action_rejected_is_a_409() {
+        let (status, code, recovery) = answer("UB-ACTION-REJECTED");
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(code, "ACTION_REJECTED");
+        assert!(matches!(recovery, Some(RecoveryHint::RetryAfterMs(500))));
+    }
+
+    #[test]
+    fn a_route_code_outside_the_table_still_falls_to_the_classifier() {
+        // `designFailureCode` answers a non-request error with the route's own
+        // code; those are deliberately not typed, and keep their 400.
+        let (status, code, _) = answer("DESIGN_SNAPSHOT_ERROR");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(code, "INTERNAL_ERROR");
     }
 }
 

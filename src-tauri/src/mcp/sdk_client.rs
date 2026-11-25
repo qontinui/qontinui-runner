@@ -4953,6 +4953,50 @@ async fn handle_design_audit(
     }
 }
 
+/// POST /ui-bridge/sdk/design/style-guide/infer — Infer a draft style guide
+async fn handle_design_infer_style_guide(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<serde_json::Value>>,
+) -> Json<serde_json::Value> {
+    let body_inner = body.map(|b| b.0);
+    let ws_payload = body_inner.clone().unwrap_or(serde_json::json!({}));
+    match dispatch_app_request(
+        &state,
+        "inferStyleGuide",
+        ws_payload,
+        Method::POST,
+        "/design/style-guide/infer",
+        body_inner,
+    )
+    .await
+    {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/design/tokens/drift — Diff used values against declared tokens
+async fn handle_design_tokens_drift(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<serde_json::Value>>,
+) -> Json<serde_json::Value> {
+    let body_inner = body.map(|b| b.0);
+    let ws_payload = body_inner.clone().unwrap_or(serde_json::json!({}));
+    match dispatch_app_request(
+        &state,
+        "diffDesignTokens",
+        ws_payload,
+        Method::POST,
+        "/design/tokens/drift",
+        body_inner,
+    )
+    .await
+    {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
 /// POST /ui-bridge/sdk/design/style-guide/load — Load a style guide
 async fn handle_design_load_style_guide(
     State(state): State<Arc<ApiState>>,
@@ -7614,6 +7658,14 @@ pub fn routes() -> Router<Arc<ApiState>> {
             post(handle_design_responsive),
         )
         .route("/ui-bridge/sdk/design/audit", post(handle_design_audit))
+        .route(
+            "/ui-bridge/sdk/design/style-guide/infer",
+            post(handle_design_infer_style_guide),
+        )
+        .route(
+            "/ui-bridge/sdk/design/tokens/drift",
+            post(handle_design_tokens_drift),
+        )
         .route(
             "/ui-bridge/sdk/design/style-guide/load",
             post(handle_design_load_style_guide),

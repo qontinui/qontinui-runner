@@ -10,6 +10,10 @@
 //!
 //! The `/ai/design-audit` alias also lives here since it points at the
 //! design-audit handler defined below.
+//!
+//! Element styles, snapshot, responsive and audit send their request as
+//! `{params: <body>}` (see `params_payload`), the shape every route answered
+//! by ui-bridge's shared design runtime uses.
 
 use std::sync::Arc;
 
@@ -24,6 +28,20 @@ use crate::mcp::types::{ApiResponse, ApiState};
 
 use super::request::{ui_bridge_request_sync, wrap_ipc_result};
 
+/// The IPC payload for a request the frontend answers through ui-bridge's
+/// shared request runtime: the HTTP body under `params`, the same wrapping the
+/// `ipc_handler_post!` routes apply (`mod.rs`), so `useDesignEvents` reads a
+/// request's fields from `payload.params` and nowhere else. An absent body is
+/// `{}` — every one of these requests has defaults for all of its fields — so
+/// these routes stay body-optional where the macro's `Json` extractor would
+/// refuse a bodyless POST.
+fn params_payload(body: Option<Json<serde_json::Value>>) -> serde_json::Value {
+    let params = body
+        .map(|Json(b)| b)
+        .unwrap_or_else(|| serde_json::json!({}));
+    serde_json::json!({ "params": params })
+}
+
 /// Get extended computed styles for a single element.
 pub async fn ui_bridge_design_element_styles_handler(
     State(state): State<Arc<ApiState>>,
@@ -31,9 +49,7 @@ pub async fn ui_bridge_design_element_styles_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Design - get element styles for {}", id);
 
-    let payload = serde_json::json!({
-        "elementId": id
-    });
+    let payload = serde_json::json!({ "params": { "elementId": id } });
 
     wrap_ipc_result(ui_bridge_request_sync(&state, "design_get_element_styles", payload).await)
 }
@@ -68,19 +84,21 @@ pub async fn ui_bridge_design_snapshot_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Design - get design snapshot");
 
-    let payload = body.map(|Json(b)| b).unwrap_or(serde_json::json!({}));
-
-    wrap_ipc_result(ui_bridge_request_sync(&state, "design_get_snapshot", payload).await)
+    wrap_ipc_result(
+        ui_bridge_request_sync(&state, "design_get_snapshot", params_payload(body)).await,
+    )
 }
 
 /// Capture responsive snapshots at multiple viewport widths.
 pub async fn ui_bridge_design_responsive_handler(
     State(state): State<Arc<ApiState>>,
-    Json(body): Json<serde_json::Value>,
+    body: Option<Json<serde_json::Value>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Design - get responsive snapshots");
 
-    wrap_ipc_result(ui_bridge_request_sync(&state, "design_get_responsive", body).await)
+    wrap_ipc_result(
+        ui_bridge_request_sync(&state, "design_get_responsive", params_payload(body)).await,
+    )
 }
 
 /// Run a style audit against a loaded or provided style guide.
@@ -97,9 +115,7 @@ pub async fn ui_bridge_design_audit_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Design - run style audit");
 
-    let payload = body.map(|Json(b)| b).unwrap_or(serde_json::json!({}));
-
-    wrap_ipc_result(ui_bridge_request_sync(&state, "design_run_audit", payload).await)
+    wrap_ipc_result(ui_bridge_request_sync(&state, "design_run_audit", params_payload(body)).await)
 }
 
 /// Load a style guide for subsequent audits.
@@ -132,6 +148,35 @@ pub async fn ui_bridge_design_clear_style_guide_handler(
     let payload = serde_json::json!({});
 
     wrap_ipc_result(ui_bridge_request_sync(&state, "design_clear_style_guide", payload).await)
+}
+
+/// Infer a draft style guide and a ranked token inventory from the computed
+/// styles of the registered elements (SDK action `inferStyleGuide`,
+/// `POST /design/style-guide/infer`). A relay: the inference is ui-bridge's
+/// shared request runtime, run in the webview (`design_infer_style_guide`).
+pub async fn ui_bridge_design_infer_style_guide_handler(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<serde_json::Value>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Design - infer style guide");
+
+    wrap_ipc_result(
+        ui_bridge_request_sync(&state, "design_infer_style_guide", params_payload(body)).await,
+    )
+}
+
+/// Report drift between the values the registered elements use and the
+/// declared design tokens (SDK action `diffDesignTokens`,
+/// `POST /design/tokens/drift`). Same relay shape as the infer route.
+pub async fn ui_bridge_design_tokens_drift_handler(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<serde_json::Value>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Design - diff design tokens");
+
+    wrap_ipc_result(
+        ui_bridge_request_sync(&state, "design_diff_tokens", params_payload(body)).await,
+    )
 }
 
 /// Manual design-review routes (does not include the macro-generated
@@ -200,6 +245,14 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             post(ui_bridge_design_audit_handler),
         )
         .route(
+            "/ui-bridge/design/style-guide/infer",
+            post(ui_bridge_design_infer_style_guide_handler),
+        )
+        .route(
+            "/ui-bridge/design/tokens/drift",
+            post(ui_bridge_design_tokens_drift_handler),
+        )
+        .route(
             "/ui-bridge/design/style-guide/load",
             post(ui_bridge_design_load_style_guide_handler),
         )
@@ -233,6 +286,8 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("POST", "/ui-bridge/design/snapshot"),
         ("POST", "/ui-bridge/design/responsive"),
         ("POST", "/ui-bridge/design/audit"),
+        ("POST", "/ui-bridge/design/style-guide/infer"),
+        ("POST", "/ui-bridge/design/tokens/drift"),
         ("POST", "/ui-bridge/design/style-guide/load"),
         ("GET", "/ui-bridge/design/style-guide"),
         ("DELETE", "/ui-bridge/design/style-guide"),
@@ -242,6 +297,29 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
 // ============================================================================
 // Tests
 // ============================================================================
+
+#[cfg(test)]
+mod params_payload_tests {
+    //! The design routes answered by ui-bridge's shared runtime send their
+    //! body under `params` — the one place `useDesignEvents` reads a field —
+    //! so a caller's `viewports` on `/design/responsive` is no longer dropped.
+    use super::params_payload;
+    use axum::response::Json;
+    use serde_json::json;
+
+    #[test]
+    fn a_body_is_sent_under_params() {
+        assert_eq!(
+            params_payload(Some(Json(json!({ "viewports": [480] })))),
+            json!({ "params": { "viewports": [480] } })
+        );
+    }
+
+    #[test]
+    fn an_absent_body_is_empty_params() {
+        assert_eq!(params_payload(None), json!({ "params": {} }));
+    }
+}
 
 #[cfg(test)]
 mod design_audit_envelope_tests {

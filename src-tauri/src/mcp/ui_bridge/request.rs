@@ -1262,6 +1262,11 @@ pub(crate) fn extract_response_data(response: &serde_json::Value) -> serde_json:
 pub(crate) fn status_for_inner_failure(code: &UiBridgeErrorCode) -> StatusCode {
     match code {
         UiBridgeErrorCode::UpstreamFetchFailed => StatusCode::BAD_GATEWAY,
+        // A wait the frontend gave up on (the root-width lock): nothing was
+        // wrong with the request and nothing changed, so retry — not a 400.
+        UiBridgeErrorCode::ActionTimeout => StatusCode::SERVICE_UNAVAILABLE,
+        // A well-formed request refused because the page is mid-mutation.
+        UiBridgeErrorCode::ActionRejected => StatusCode::CONFLICT,
         _ => StatusCode::BAD_REQUEST,
     }
 }

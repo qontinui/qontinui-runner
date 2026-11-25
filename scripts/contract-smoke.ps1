@@ -289,6 +289,11 @@ $SKIP_ROUTES = @{
 # longer declares -- is refused before any probe, -DryRun included.
 # ---------------------------------------------------------------------------
 $SDK_AHEAD_ROUTES = @{
+    # ui-bridge 0.57.0 declares element/component capture; the runner has not
+    # wired either handler. Mirrors sdk_only_baseline in
+    # src-tauri/src/mcp/ui_bridge/mod.rs. Delete both when the handlers land.
+    "GET /control/element/:id/capture"       = "SDK declares it (0.57.0); the runner has not wired the handler"
+    "GET /control/component/:id/capture"     = "SDK declares it (0.57.0); the runner has not wired the handler"
 }
 
 # ---------------------------------------------------------------------------
@@ -388,9 +393,14 @@ $BODY_FIXTURES = @{
     "POST /control/error-baselines/capture"   = '{"name":"smoke"}'
     "POST /control/error-baselines/compare"   = '{"name":"smoke"}'
     "POST /design/element/:id/state-styles"   = '{"states":[]}'
-    "POST /design/responsive"                 = '{"viewports":[]}'
+    # `{}` takes the default viewports. An empty `viewports` list is refused by
+    # ui-bridge's shared design runtime with INVALID_REQUEST (HTTP 400), so it
+    # would probe only the refusal.
+    "POST /design/responsive"                 = '{}'
     "POST /control/viewport-constraints"      = '{"width":1024,"height":768}'
     "POST /design/style-guide/load"           = '{"guide":{}}'
+    "POST /design/style-guide/infer"          = '{}'
+    "POST /design/tokens/drift"               = '{"customProperties":{"--smoke":"1px"}}'
     "POST /control/fill"                      = '{"fields":{}}'
     "POST /control/forms/diff"                = '{}'
     "POST /control/clipboard"                 = '{"text":"smoke"}'
