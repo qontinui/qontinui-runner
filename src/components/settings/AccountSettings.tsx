@@ -41,7 +41,7 @@
  * `WebIntegrationSettings` panel.
  */
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
@@ -61,14 +61,24 @@ import {
 
 import { useRunnerTier } from "@/hooks/useRunnerTier";
 import { useAuth } from "@/components/AuthProvider";
+import {
+  NO_BROWSER_HINT,
+  PendingSignInNotice,
+  isSignInCancelled,
+} from "@/components/PendingSignInNotice";
+import {
+  signInBackendUrlFrom,
+  signInTargetExplanation,
+  type SavedBackendStatus,
+} from "@/lib/savedBackendUrl";
 import { SectionHeader } from "./SectionHeader";
 import type { LogFunction } from "./types";
 
 interface AccountSettingsProps {
   onLog: LogFunction;
+  /** Navigate to the Backend Connection tab, where the backend URL is edited. */
+  onOpenBackendConnection: () => void;
 }
-
-const DEFAULT_BACKEND_URL = "https://api.qontinui.io";
 
 // Wire shape of the `coord_doctor_run` Tauri command's `DoctorReport`
 // (serde-serialized snake_case from `qontinui_runner_lib::coord_doctor`).
@@ -87,7 +97,7 @@ interface DoctorReport {
   overall_ok: boolean;
 }
 
-export function AccountSettings({ onLog }: AccountSettingsProps) {
+export function AccountSettings({ onLog, onOpenBackendConnection }: AccountSettingsProps) {
   const { tier, loading: tierLoading, refresh: refreshTier } = useRunnerTier();
   const { authStatus, signOutFull, logout } = useAuth();
   const [flowError, setFlowError] = useState<string | null>(null);
@@ -95,10 +105,20 @@ export function AccountSettings({ onLog }: AccountSettingsProps) {
   const [loggingOut, setLoggingOut] = useState(false);
 
   // --- Cognito Hosted-UI sign-in (RFC 8252 PKCE) ----------------------------
-  // Backend URL the Cognito-bound device JWT is minted against. The legacy
-  // email/password pairing was removed (web backend is Cognito-only); Cognito
-  // sign-in (and browser SSO) are the only sign-in paths.
-  const [credBackendUrl, setCredBackendUrl] = useState(DEFAULT_BACKEND_URL);
+  // The `get_web_integration_status` read the sign-in target is decided from.
+  // The target is the SAVED Backend Connection URL when the one sign-in rule
+  // honours it on this "operator" surface (savedBackendUrl.ts), else
+  // production; the panel shows the EFFECTIVE target and, when it differs from
+  // the saved URL, why. `null` = not loaded yet (or the read failed): sign-in
+  // is disabled rather than guessing. A read that answers with a
+  // `settingsFault` is treated as a failed one: its `backendUrl` is a
+  // placeholder, not the saved choice, so the panel offers Retry. The legacy email/password pairing was
+  // removed (web backend is Cognito-only); Cognito sign-in (and browser SSO)
+  // are the only sign-in paths.
+  const [backendStatus, setBackendStatus] = useState<SavedBackendStatus | null>(null);
+  const [backendUrlLoadFailed, setBackendUrlLoadFailed] = useState(false);
+  // True while a Retry-triggered status re-read is in flight ("Reading…").
+  const [backendStatusRetrying, setBackendStatusRetrying] = useState(false);
   const [cognitoState, setCognitoState] = useState<"idle" | "signing-in">("idle");
 
   // --- Coord Doctor self-check (plan 2026-06-13 Phase 4) --------------------
@@ -201,12 +221,78 @@ export function AccountSettings({ onLog }: AccountSettingsProps) {
     };
   }, [refreshTier]);
 
+  // Issue order of status reads: reads overlap (mount + each
+  // `web-integration-changed`) and may settle out of order, so only the most
+  // recently ISSUED read may set state — the same guard the auth banner uses.
+  const backendStatusReadSeq = useRef(0);
+  // The live effect run's status read, so "Retry" can re-issue it outside the
+  // effect under the same `cancelled` + issue-order guards; null once unmounted.
+  // Resolves once that read has settled (never rejects).
+  const reloadBackendStatusRef = useRef<(() => Promise<void>) | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      // A superseded effect run's listener must not bump the shared counter
+      // and invalidate the current run's in-flight read.
+      if (cancelled) return;
+      const seq = ++backendStatusReadSeq.current;
+      const isLatest = () => !cancelled && seq === backendStatusReadSeq.current;
+      try {
+        const st = await invoke<SavedBackendStatus>("get_web_integration_status");
+        if (isLatest()) {
+          setBackendStatus(st);
+          setBackendUrlLoadFailed(false);
+        }
+      } catch (err) {
+        if (isLatest()) {
+          // A failed re-read drops the earlier status: the target is not
+          // decided from a stale read.
+          setBackendStatus(null);
+          setBackendUrlLoadFailed(true);
+          onLog("error", `Failed to load saved backend URL: ${err}`);
+        }
+      }
+    };
+    reloadBackendStatusRef.current = load;
+    void load();
+    const unlistenPromise = listen("web-integration-changed", () => void load());
+    return () => {
+      cancelled = true;
+      if (reloadBackendStatusRef.current === load) reloadBackendStatusRef.current = null;
+      void unlistenPromise.then((un) => un());
+    };
+  }, [onLog]);
+
+  // The saved settings are unreadable even though the read itself succeeded.
+  const backendSettingsFaulted = backendStatus !== null && backendStatus.settingsFault != null;
+  // The status the sign-in target is decided from: `null` while loading, after
+  // a failed read, or while the read reports a settings fault.
+  const usableBackendStatus = backendSettingsFaulted ? null : backendStatus;
+
   const handleCognitoSignIn = useCallback(async () => {
-    const backendUrl = credBackendUrl.trim();
-    if (!backendUrl) {
-      setFlowError("Backend URL is required.");
+    // An unknown target is never guessed as production (finalize_signed_in
+    // would write it over a saved backend). After a FAILED or FAULTED read the
+    // button is "Retry" and re-reads the status instead of signing in; while
+    // the first read (or a Retry's re-read) is pending the button is disabled
+    // and the handler refuses.
+    if (backendStatusRetrying) return;
+    if (usableBackendStatus === null) {
+      if (backendUrlLoadFailed || backendSettingsFaulted) {
+        setFlowError(null);
+        const reload = reloadBackendStatusRef.current;
+        if (!reload) return;
+        setBackendStatusRetrying(true);
+        try {
+          await reload();
+        } finally {
+          setBackendStatusRetrying(false);
+        }
+        return;
+      }
+      setFlowError("Waiting for the saved backend settings to load before signing in.");
       return;
     }
+    const backendUrl = signInBackendUrlFrom(usableBackendStatus, "operator");
     setCognitoState("signing-in");
     setFlowError(null);
     onLog("info", "Opening browser for Qontinui (Cognito) sign-in — complete the flow there");
@@ -227,12 +313,24 @@ export function AccountSettings({ onLog }: AccountSettingsProps) {
       );
     } catch (err) {
       const msg = typeof err === "string" ? err : String(err);
-      setFlowError(msg);
-      onLog("error", `Qontinui sign-in failed: ${msg}`);
+      // The user's own Cancel (from the pending-sign-in notice) is not a failure.
+      if (isSignInCancelled(err)) {
+        onLog("info", "Qontinui sign-in cancelled");
+      } else {
+        setFlowError(msg);
+        onLog("error", `Qontinui sign-in failed: ${msg}`);
+      }
     } finally {
       setCognitoState("idle");
     }
-  }, [credBackendUrl, onLog, refreshTier]);
+  }, [
+    usableBackendStatus,
+    backendUrlLoadFailed,
+    backendSettingsFaulted,
+    backendStatusRetrying,
+    onLog,
+    refreshTier,
+  ]);
 
   const handleSignOut = useCallback(async () => {
     setSigningOut(true);
@@ -473,6 +571,11 @@ export function AccountSettings({ onLog }: AccountSettingsProps) {
         )}
       </div>
 
+      <PendingSignInNotice
+        active={cognitoState === "signing-in"}
+        noBrowserHint={NO_BROWSER_HINT.settings}
+      />
+
       {flowError && (
         <div className="flex items-start gap-2 rounded border border-red-500/40 bg-red-500/10 p-3 text-sm text-red-200">
           <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
@@ -494,8 +597,15 @@ export function AccountSettings({ onLog }: AccountSettingsProps) {
         <SignedOutPanel
           cognitoSigningIn={cognitoState === "signing-in"}
           onCognitoSignIn={handleCognitoSignIn}
-          credBackendUrl={credBackendUrl}
-          onCredBackendUrlChange={setCredBackendUrl}
+          signInTarget={
+            usableBackendStatus ? signInBackendUrlFrom(usableBackendStatus, "operator") : null
+          }
+          signInTargetReason={
+            usableBackendStatus ? signInTargetExplanation(usableBackendStatus, "operator") : null
+          }
+          backendUrlLoadFailed={backendUrlLoadFailed || backendSettingsFaulted}
+          backendStatusRetrying={backendStatusRetrying}
+          onOpenBackendConnection={onOpenBackendConnection}
         />
       )}
     </div>
@@ -594,17 +704,38 @@ function SignedInPanel({
 interface SignedOutPanelProps {
   cognitoSigningIn: boolean;
   onCognitoSignIn: () => void;
-  credBackendUrl: string;
-  onCredBackendUrlChange: (v: string) => void;
+  /** The EFFECTIVE sign-in target (never the raw saved URL unless the rule
+   *  honours it); `null` while the status read has not landed, failed, or
+   *  reported a settings fault. */
+  signInTarget: string | null;
+  /** Why the target is not the saved URL; `null` when it is. */
+  signInTargetReason: string | null;
+  /** The latest status read failed OR reported a settings fault: the saved
+   *  settings could not be read, so the button offers Retry. */
+  backendUrlLoadFailed: boolean;
+  /** A Retry-triggered re-read is in flight. */
+  backendStatusRetrying: boolean;
+  onOpenBackendConnection: () => void;
 }
 
 function SignedOutPanel({
   cognitoSigningIn,
   onCognitoSignIn,
-  credBackendUrl,
-  onCredBackendUrlChange,
+  signInTarget,
+  signInTargetReason,
+  backendUrlLoadFailed,
+  backendStatusRetrying,
+  onOpenBackendConnection,
 }: SignedOutPanelProps) {
-  const cognitoDisabled = cognitoSigningIn || credBackendUrl.trim().length === 0;
+  // The target is never guessed (#3049). While the first read is loading the
+  // button is disabled; after a FAILED (or faulted) read it is "Retry" and
+  // re-reads the status (the handler does not sign in), reading "Reading…"
+  // and disabled while that re-read is in flight. Signing in wins over Retry.
+  const readingRetry = backendStatusRetrying && !cognitoSigningIn;
+  const retryRead =
+    signInTarget === null && backendUrlLoadFailed && !cognitoSigningIn && !readingRetry;
+  const cognitoDisabled =
+    cognitoSigningIn || readingRetry || (signInTarget === null && !backendUrlLoadFailed);
 
   return (
     <div className="space-y-5">
@@ -621,20 +752,24 @@ function SignedOutPanel({
           </div>
         </div>
 
-        <div className="space-y-1.5">
-          <label htmlFor="account-cred-backend" className="text-xs font-medium">
-            Backend URL
-          </label>
-          <input
-            id="account-cred-backend"
-            type="url"
-            autoComplete="off"
-            spellCheck={false}
-            value={credBackendUrl}
-            onChange={(e) => onCredBackendUrlChange(e.target.value)}
-            placeholder="https://api.qontinui.io"
-            className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-hidden focus:ring-1 focus:ring-primary/50"
-          />
+        <div className="text-xs">
+          <span className="font-medium">Signs in to </span>
+          <span id="account-saved-backend" className="font-mono break-all">
+            {signInTarget ??
+              (backendUrlLoadFailed ? "Could not read the saved backend URL" : "loading…")}
+          </span>{" "}
+          <button
+            type="button"
+            onClick={onOpenBackendConnection}
+            className="text-primary hover:underline"
+          >
+            Change on Backend Connection
+          </button>
+          {signInTargetReason && (
+            <div id="account-sign-in-target-reason" className="mt-1 text-muted-foreground">
+              {signInTargetReason}
+            </div>
+          )}
         </div>
 
         <button
@@ -648,8 +783,19 @@ function SignedOutPanel({
           ) : (
             <LogIn className="w-4 h-4" />
           )}
-          {cognitoSigningIn ? "Waiting for browser…" : "Sign in with Qontinui"}
+          {cognitoSigningIn
+            ? "Waiting for browser…"
+            : readingRetry
+              ? "Reading…"
+              : retryRead
+                ? "Retry"
+                : "Sign in with Qontinui"}
         </button>
+        {retryRead && (
+          <p id="account-sign-in-retry-reason" className="text-xs text-muted-foreground">
+            Retry reads the saved backend settings again before signing in.
+          </p>
+        )}
         {cognitoSigningIn && (
           <p className="text-xs text-muted-foreground">
             Complete the sign-in in your browser. This panel will update automatically when the

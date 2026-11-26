@@ -149,7 +149,15 @@ pub(crate) fn classify_host_kind(
     "host"
 }
 
+/// [`classify_host_kind`] for this process, read once: what the process runs
+/// on does not change under it, so the procfs read and the two marker stats
+/// are not repeated every tick.
 pub(crate) fn host_kind() -> &'static str {
+    static KIND: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    KIND.get_or_init(read_host_kind)
+}
+
+fn read_host_kind() -> &'static str {
     #[cfg(target_os = "linux")]
     {
         let osrelease = std::fs::read_to_string("/proc/sys/kernel/osrelease").ok();

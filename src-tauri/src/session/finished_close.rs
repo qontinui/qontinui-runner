@@ -9,7 +9,11 @@
 //! device drained. This arm closes a finished, idle TERMINAL session on any
 //! tick, drained or not, once `wind_down::eligibility` rates it `Eligible`
 //! AND `wind_down::custody_gate` says every worktree it touched is clean and
-//! pushed. Looping agents and stewards are never its candidates: their
+//! pushed AND `wind_down::obligations_gate` says every item coord attributes
+//! to it is watched. The last two are the LOCAL and REMOTE halves of
+//! `closeable` (plan
+//! `2026-10-18-a-finished-session-is-safe-to-close-when-nothing-lives-only-in-it-and-coord-owns-whether-its-watchers-work`,
+//! D1, Phase 6); an unreadable half is UNKNOWN and closes nothing. Looping agents and stewards are never its candidates: their
 //! supervisors respawn them, so closing one outside a drain is churn, not
 //! tidying (D1).
 //!
@@ -21,8 +25,10 @@
 //! still refuses any session whose `claude` holds a child process, and that
 //! count has no image or age filter, so the stdio MCP servers a session starts
 //! at boot (a fleet session holds `coord-mcp-shim.py`) keep it open. The
-//! boot-time MCP exemption in `tracking_health::child_signals_work` changes
-//! only the idleness reading; it does not reach that refusal.
+//! boot-time MCP exemption in `tracking_health::child_signals_work_in` —
+//! including its look-through of the `cmd.exe` Claude Code wraps a stdio MCP
+//! server in on Windows (`tracking_health::is_mcp_server_shell_wrapper`) —
+//! changes only the idleness reading; it does not reach that refusal.
 //!
 //! ## The switch (D3)
 //!
@@ -44,7 +50,9 @@ use crate::session::tracking_health::LiveClaudeProcess;
 use crate::session::wind_down_executor::{select_candidates, ClockVerdict, TICK};
 use crate::session::wind_down_observer::ObservedInputs;
 use crate::settings::FinishedSessionClose;
-use qontinui_runner_lib::wind_down::{CustodyVerdict, CustodyView, SessionKind};
+use qontinui_runner_lib::wind_down::{
+    CloseGuardView, CustodyVerdict, CustodyView, ObligationsVerdict, ObligationsView, SessionKind,
+};
 
 /// Machine kill switch: exactly `0` in the runner's spawn environment turns
 /// the arm off whatever the setting says. Absent, `1`, or anything else defers
@@ -221,6 +229,27 @@ pub fn publish_custody(verdicts: &[(String, CustodyVerdict)], judged_at_ms: i64)
     *map = next;
 }
 
+/// Attach each session's ledger-path resolutions to the view
+/// [`publish_custody`] just published for it (Phase 5 of plan
+/// `2026-11-22-wind-down-custody-probe-and-undelivered-guard-read-unknown-where-they-can-decide`).
+/// A session with no published view gets nothing.
+pub fn publish_custody_resolutions(
+    resolutions: &[(
+        String,
+        Vec<qontinui_runner_lib::wind_down::WorktreeResolution>,
+    )],
+) {
+    let mut map = match last_custody_map().lock() {
+        Ok(m) => m,
+        Err(e) => e.into_inner(),
+    };
+    for (session_id, worktrees) in resolutions {
+        if let Some(view) = map.get_mut(session_id) {
+            view.worktrees = worktrees.clone();
+        }
+    }
+}
+
 /// The arm's last custody view for a session, if its latest pass judged it.
 pub fn last_custody(claude_session_id: &str) -> Option<CustodyView> {
     let map = match last_custody_map().lock() {
@@ -240,6 +269,110 @@ pub fn attach_last_custody(processes: &mut [LiveClaudeProcess]) {
         if let Some(view) = process.wind_down.as_mut() {
             view.custody = last_custody(&session_id);
         }
+    }
+}
+
+/// `claude_session_id` → the obligations view the arm's most recent pass
+/// reached. Only a session whose custody was already clean is ever read here.
+fn last_obligations_map() -> &'static Mutex<HashMap<String, ObligationsView>> {
+    static MAP: OnceLock<Mutex<HashMap<String, ObligationsView>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Replace the published obligations verdicts with one pass's — REPLACED, not
+/// merged, for the same reason as [`publish_custody`].
+pub fn publish_obligations(verdicts: &[(String, ObligationsVerdict)], judged_at_ms: i64) {
+    let next: HashMap<String, ObligationsView> = verdicts
+        .iter()
+        .map(|(session_id, verdict)| {
+            (
+                session_id.clone(),
+                ObligationsView::from_verdict(verdict, judged_at_ms),
+            )
+        })
+        .collect();
+    let mut map = match last_obligations_map().lock() {
+        Ok(m) => m,
+        Err(e) => e.into_inner(),
+    };
+    *map = next;
+}
+
+/// The arm's last obligations view for a session, if its latest pass read it.
+pub fn last_obligations(claude_session_id: &str) -> Option<ObligationsView> {
+    let map = match last_obligations_map().lock() {
+        Ok(m) => m,
+        Err(e) => e.into_inner(),
+    };
+    map.get(claude_session_id).cloned()
+}
+
+/// Attach [`last_obligations`] to every top-level process carrying a `windDown`
+/// view — the readiness report's `windDown.obligations`.
+pub fn attach_last_obligations(processes: &mut [LiveClaudeProcess]) {
+    for process in processes.iter_mut() {
+        let Some(session_id) = process.session_id.clone() else {
+            continue;
+        };
+        if let Some(view) = process.wind_down.as_mut() {
+            view.obligations = last_obligations(&session_id);
+        }
+    }
+}
+
+/// `claude_session_id` → the close guard's verdict from the arm's most recent
+/// close batch (plan
+/// `2026-11-16-finished-close-mints-its-close-authority-from-the-served-close-conditions`,
+/// Phase 1).
+fn last_close_guard_map() -> &'static Mutex<HashMap<String, CloseGuardView>> {
+    static MAP: OnceLock<Mutex<HashMap<String, CloseGuardView>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Replace the published close-guard verdicts with one batch's — REPLACED, not
+/// merged, as [`publish_custody`]: a session the latest batch did not judge
+/// carries no verdict, never a stale `would_mint`. A pass that runs no batch
+/// publishes an empty set.
+pub fn publish_close_guards(views: &[(String, CloseGuardView)]) {
+    let next: HashMap<String, CloseGuardView> = views.iter().cloned().collect();
+    let mut map = match last_close_guard_map().lock() {
+        Ok(m) => m,
+        Err(e) => e.into_inner(),
+    };
+    *map = next;
+}
+
+/// The close guard's last verdict for a session, if its latest batch judged it.
+pub fn last_close_guard(claude_session_id: &str) -> Option<CloseGuardView> {
+    let map = match last_close_guard_map().lock() {
+        Ok(m) => m,
+        Err(e) => e.into_inner(),
+    };
+    map.get(claude_session_id).cloned()
+}
+
+/// Attach [`last_close_guard`] to every top-level process carrying a
+/// `windDown` view — the readiness report's `windDown.closeGuard`.
+pub fn attach_last_close_guard(processes: &mut [LiveClaudeProcess]) {
+    for process in processes.iter_mut() {
+        let Some(session_id) = process.session_id.clone() else {
+            continue;
+        };
+        if let Some(view) = process.wind_down.as_mut() {
+            view.close_guard = last_close_guard(&session_id);
+        }
+    }
+}
+
+/// One-line rendering of an obligations verdict for the arm's logs.
+pub fn describe_obligations(verdict: &ObligationsVerdict) -> String {
+    match verdict.detail() {
+        Some(detail) => format!(
+            "{} ({}): {detail}",
+            verdict.as_str(),
+            verdict.reason().unwrap_or("-")
+        ),
+        None => verdict.as_str().to_string(),
     }
 }
 
@@ -428,6 +561,25 @@ mod tests {
         );
         let b = last_custody("fc-b").unwrap();
         assert_eq!((b.verdict, b.judged_at), ("unknown", 8));
+        assert!(b.worktrees.is_empty(), "no resolution published yet");
+
+        // Phase 5: the roots tried and the resolved root ride on the view.
+        publish_custody_resolutions(&[
+            (
+                "fc-b".to_string(),
+                vec![qontinui_runner_lib::wind_down::WorktreeResolution {
+                    ledger_path: "agent-worktrees/a/repo".to_string(),
+                    roots_tried: vec![
+                        "/ws/agent-worktrees".to_string(),
+                        "/ws/qontinui-worktrees".to_string(),
+                    ],
+                    resolved: vec!["/ws/qontinui-worktrees/a/repo".to_string()],
+                    outcome: "found",
+                }],
+            ),
+            ("fc-never-judged".to_string(), Vec::new()),
+        ]);
+        assert!(last_custody("fc-never-judged").is_none());
 
         // ...and `/restart-readiness` attaches exactly that to `windDown`.
         // Kept in THIS test: the published map is process-global, and a
@@ -459,5 +611,122 @@ mod tests {
         );
         assert_eq!(json[1]["windDown"]["custody"]["verdict"], "unknown");
         assert_eq!(json[1]["windDown"]["custody"]["reason"], "no_session_dir");
+        let wt = &json[1]["windDown"]["custody"]["worktrees"][0];
+        assert_eq!(wt["ledgerPath"], "agent-worktrees/a/repo");
+        assert_eq!(wt["rootsTried"][1], "/ws/qontinui-worktrees");
+        assert_eq!(wt["resolved"][0], "/ws/qontinui-worktrees/a/repo");
+        assert_eq!(wt["outcome"], "found");
+    }
+
+    /// The obligations map is its own process-global, so this test keys on ids
+    /// no other test publishes.
+    #[test]
+    fn published_obligations_are_replaced_per_pass_and_attached_to_their_session() {
+        publish_obligations(
+            &[
+                (
+                    "ob-a".to_string(),
+                    ObligationsVerdict::Watched { judged: 2 },
+                ),
+                (
+                    "ob-b".to_string(),
+                    ObligationsVerdict::unreadable("operation timed out"),
+                ),
+            ],
+            11,
+        );
+        let a = last_obligations("ob-a").unwrap();
+        assert_eq!(
+            (a.verdict, a.items_judged, a.judged_at),
+            ("watched", Some(2), 11)
+        );
+        assert_eq!(
+            last_obligations("ob-b").unwrap().reason,
+            Some("obligations_unreadable")
+        );
+
+        publish_obligations(&[], 12);
+        assert!(
+            last_obligations("ob-a").is_none(),
+            "a session the latest pass did not judge carries no verdict"
+        );
+
+        publish_obligations(
+            &[(
+                "ob-b".to_string(),
+                ObligationsVerdict::Watched { judged: 0 },
+            )],
+            13,
+        );
+        let process = |sid: &str| LiveClaudeProcess {
+            pid: 1,
+            parent_pid: None,
+            image: Some("claude".to_string()),
+            age_s: Some(60),
+            cwd: None,
+            has_live_children: Some(false),
+            nested_under_claude: false,
+            session_id: Some(sid.to_string()),
+            session_status: Some("finished".to_string()),
+            session_status_since: None,
+            blocks_restart: false,
+            wind_down: Some(qontinui_runner_lib::wind_down::WindDownView::from_verdict(
+                &qontinui_runner_lib::wind_down::Eligibility::Eligible { since_ms: 1 },
+                SessionKind::Terminal,
+            )),
+            stray_wait_shells: 0,
+        };
+        let mut processes = vec![process("ob-a"), process("ob-b")];
+        attach_last_obligations(&mut processes);
+        let json = serde_json::to_value(&processes).unwrap();
+        assert!(
+            json[0]["windDown"].get("obligations").is_none(),
+            "not judged by the latest pass → no obligations key, never `watched`"
+        );
+        assert_eq!(json[1]["windDown"]["obligations"]["verdict"], "watched");
+    }
+
+    /// The close-guard map is its own process-global; ids no other test uses.
+    #[test]
+    fn published_close_guards_are_replaced_per_batch_and_attached_to_their_session() {
+        let guard = |verdict: &'static str| CloseGuardView {
+            verdict,
+            decided_by: None,
+            reason: None,
+            arms: Vec::new(),
+            judged_at: 5,
+        };
+        publish_close_guards(&[("cg-a".to_string(), guard("would_mint"))]);
+        assert_eq!(last_close_guard("cg-a").unwrap().verdict, "would_mint");
+        publish_close_guards(&[("cg-b".to_string(), guard("held"))]);
+        assert!(
+            last_close_guard("cg-a").is_none(),
+            "a session the latest batch did not judge carries no verdict"
+        );
+        let mut processes = vec![LiveClaudeProcess {
+            pid: 1,
+            parent_pid: None,
+            image: Some("claude".to_string()),
+            age_s: Some(60),
+            cwd: None,
+            has_live_children: Some(false),
+            nested_under_claude: false,
+            session_id: Some("cg-b".to_string()),
+            session_status: Some("finished".to_string()),
+            session_status_since: None,
+            blocks_restart: false,
+            wind_down: Some(qontinui_runner_lib::wind_down::WindDownView::from_verdict(
+                &qontinui_runner_lib::wind_down::Eligibility::Eligible { since_ms: 1 },
+                SessionKind::Terminal,
+            )),
+            stray_wait_shells: 0,
+        }];
+        attach_last_close_guard(&mut processes);
+        let json = serde_json::to_value(&processes).unwrap();
+        assert_eq!(json[0]["windDown"]["closeGuard"]["verdict"], "held");
+        publish_close_guards(&[]);
+        attach_last_close_guard(&mut processes);
+        let json = serde_json::to_value(&processes).unwrap();
+        assert!(json[0]["windDown"].get("closeGuard").is_none());
     }
 }

@@ -218,6 +218,41 @@ impl ChildTreeGuard {
         }
     }
 
+    /// Put the RUNNING process `pid` — one this process did not spawn itself,
+    /// such as a server a launcher started as a grandchild — and everything it
+    /// spawns from now on in a kill-on-close job, so it dies with this process
+    /// however this process ends (a normal exit, `ExitProcess`, a crash, a kill).
+    ///
+    /// What it does not cover: processes `pid` spawned BEFORE the assignment
+    /// stay outside the job. For a server whose workers exit when it does
+    /// (a PostgreSQL postmaster), killing it is enough.
+    ///
+    /// A process that cannot be opened (gone already, another user's) or
+    /// assigned attaches nothing — the same clean degrade as [`Self::attach`].
+    pub fn attach_pid(pid: u32) -> Self {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+        };
+        // SAFETY: `OpenProcess` has no preconditions; a null return (no such
+        // process, or access denied) is handled below.
+        let process = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid) };
+        if process.is_null() {
+            return Self(None);
+        }
+        let guard = Self::attach_raw(process);
+        // SAFETY: `process` is the handle opened above and owned here; the job
+        // holds its own reference to the process, so closing ours is sound.
+        unsafe { CloseHandle(process) };
+        guard
+    }
+
+    /// Whether a kill-on-close job is attached. False after a failed attach,
+    /// which degraded to killing nothing.
+    pub fn is_attached(&self) -> bool {
+        self.0.is_some()
+    }
+
     /// Post-spawn form for a command that went through [`Self::arm`]. On
     /// Windows that is exactly [`Self::attach`].
     pub fn attach_armed(child: &std::process::Child) -> Self {
@@ -316,6 +351,21 @@ impl ChildTreeGuard {
     /// caller compiles on every platform.
     pub fn attach_tokio(_child: &tokio::process::Child) -> Self {
         Self(None)
+    }
+
+    /// No-op: a process this one did not spawn cannot be moved into a process
+    /// group from outside (`setpgid` only works on the caller or its own
+    /// not-yet-exec'd children), so nothing is attached. A caller that needs
+    /// such a process gone at exit stops it itself; see the Windows form for
+    /// what this covers there.
+    pub fn attach_pid(_pid: u32) -> Self {
+        Self(None)
+    }
+
+    /// Whether a process group is attached — only for an [`Self::arm`]ed
+    /// command's child.
+    pub fn is_attached(&self) -> bool {
+        self.0.is_some()
     }
 
     /// Post-spawn form for an [`Self::arm`]ed command: the child *is* its
@@ -1731,15 +1781,77 @@ mod timeout_tests {
         }
     }
 
+    /// [`sleeper`] that first creates `marker`, so a test can tell WHEN the
+    /// child actually started. The budget clock inside `run_with_timeout` and
+    /// friends starts after the spawn, but a stopwatch taken before the call
+    /// also counts `reap_detached_children()` and process creation — which on a
+    /// loaded box took 12 s against a 400 ms budget. The marker lets a test
+    /// time only what the budget governs.
+    fn sleeper_marked(marker: &std::path::Path) -> std::process::Command {
+        #[cfg(target_os = "windows")]
+        {
+            let mut c = no_window("cmd.exe");
+            // `raw_arg`: Rust's own quoting would backslash-escape the quotes,
+            // which cmd.exe does not understand.
+            use std::os::windows::process::CommandExt;
+            c.raw_arg(format!(
+                "/C echo.>\"{}\" & ping -n 60 127.0.0.1",
+                marker.display()
+            ));
+            c
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let mut c = no_window("sh");
+            c.arg("-c")
+                .arg(format!("touch '{}'; sleep 60", marker.display()));
+            c
+        }
+    }
+
+    /// Run `f` (which must run a child that creates `marker` as its first act)
+    /// and return its result with the time from the moment the marker was
+    /// first seen to the moment `f` returned. The marker appears after the
+    /// spawn, so this excludes the spawn cost the budget does not cover; if
+    /// `f` returns without the marker ever appearing, the whole span is
+    /// reported (the strictest reading).
+    fn timed_after_child_start<R: Send>(
+        marker: &std::path::Path,
+        f: impl FnOnce() -> R + Send,
+    ) -> (R, Duration) {
+        let whole = Instant::now();
+        std::thread::scope(|scope| {
+            let handle = scope.spawn(f);
+            let mut seen: Option<Instant> = None;
+            while !handle.is_finished() {
+                if seen.is_none() && marker.exists() {
+                    seen = Some(Instant::now());
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let result = handle.join().expect("the timed call must not panic");
+            // Seen on the last poll's blind spot: the child ran, then the call
+            // returned inside one poll interval.
+            let start = seen.or_else(|| marker.exists().then(Instant::now));
+            let elapsed = match start {
+                Some(t) => t.elapsed(),
+                None => whole.elapsed(),
+            };
+            (result, elapsed)
+        })
+    }
+
     /// Item 1 core assertion: a child that never returns must NOT hold the
     /// calling thread. Without the timeout this test hangs for ~59s and the
     /// elapsed assertion fails.
     #[test]
     fn a_blocking_child_returns_within_the_budget_and_is_reaped() {
         let budget = Duration::from_millis(400);
-        let started = Instant::now();
-        let out = run_with_timeout(sleeper(), budget).expect("spawn");
-        let elapsed = started.elapsed();
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("started");
+        let (out, elapsed) = timed_after_child_start(&marker, || {
+            run_with_timeout(sleeper_marked(&marker), budget).expect("spawn")
+        });
 
         match out {
             TimedOutput::TimedOut { pid, reaped } => {
@@ -1770,9 +1882,11 @@ mod timeout_tests {
     #[test]
     fn run_probe_degrades_within_budget_and_reaps() {
         let budget = Duration::from_millis(300);
-        let started = Instant::now();
-        let outcome = run_probe(sleeper(), budget, "test: hung probe");
-        let elapsed = started.elapsed();
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("started");
+        let (outcome, elapsed) = timed_after_child_start(&marker, || {
+            run_probe(sleeper_marked(&marker), budget, "test: hung probe")
+        });
 
         match outcome {
             ProbeOutcome::Degraded(DegradeReason::TimedOut { pid, reaped }) => {
@@ -1908,16 +2022,19 @@ mod timeout_tests {
     #[test]
     fn output_with_timeout_reports_a_hang_as_an_io_timeout() {
         let budget = Duration::from_millis(300);
-        let started = Instant::now();
-        let err = output_with_timeout(sleeper(), budget)
-            .expect_err("a hung child must be Err, never Ok(Output)");
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("started");
+        let (err, elapsed) = timed_after_child_start(&marker, || {
+            output_with_timeout(sleeper_marked(&marker), budget)
+                .expect_err("a hung child must be Err, never Ok(Output)")
+        });
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
         let msg = err.to_string();
         assert!(
             msg.contains("pid=") && msg.contains("reaped=true"),
             "the error must name the killed pid and prove it was reaped; got {msg:?}"
         );
-        assert!(started.elapsed() < budget * 8 + KILLED_DRAIN_GRACE);
+        assert!(elapsed < budget * 8 + KILLED_DRAIN_GRACE);
     }
 
     // ── Credential-leak regression (2026-08-30 review, CRITICAL 4) ───────────
@@ -2053,9 +2170,12 @@ mod timeout_tests {
     /// *become* the second sleep, so killing "the child" is one `SIGKILL` on a
     /// process whose sibling still owns both write ends.
     #[cfg(unix)]
-    fn hung_with_surviving_grandchild() -> std::process::Command {
+    fn hung_with_surviving_grandchild(marker: &std::path::Path) -> std::process::Command {
         let mut c = no_window("sh");
-        c.args(["-c", "sleep 60 & exec sleep 60"]);
+        c.arg("-c").arg(format!(
+            "touch '{}'; sleep 60 & exec sleep 60",
+            marker.display()
+        ));
         c
     }
 
@@ -2129,9 +2249,11 @@ mod timeout_tests {
         let _serial = GAUGE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let before = live_pipe_readers();
         let budget = Duration::from_millis(300);
-        let started = Instant::now();
-        let out = run_with_timeout(hung_with_surviving_grandchild(), budget).expect("spawn");
-        let elapsed = started.elapsed();
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("started");
+        let (out, elapsed) = timed_after_child_start(&marker, || {
+            run_with_timeout(hung_with_surviving_grandchild(&marker), budget).expect("spawn")
+        });
 
         match out {
             TimedOutput::TimedOut { pid, reaped } => {
@@ -2902,8 +3024,8 @@ mod timeout_tests {
 /// The ONE code-only line lexer: comments removed, and string, raw-string and
 /// char literals emptied. Read by this file's source guards (through
 /// `source_scan`) and by the runner binary's own source-scan tests
-/// (`ci_node::executor`), which is why it is gated like
-/// `ambient::test_support`: `cargo test` builds this rlib for the binary's
+/// (`ci_node::executor`, `commands::project_logs`, `file_tail`), which is why it is
+/// gated like `ambient::test_support`: `cargo test` builds this rlib for the binary's
 /// tests WITH `debug_assertions` but without `cfg(test)`. A release build has
 /// neither and compiles none of this.
 #[cfg(any(test, debug_assertions))]
@@ -3161,8 +3283,8 @@ mod source_scan {
     /// lexer. Ending early reads some test code as production: a column-0
     /// line inside a multi-line string literal ends a skip. That happens in
     /// many files today; a reviewer's port counted 21, among them
-    /// `fleet.rs`, `check_executor/analyzers/*`, `env_write_lock_guard.rs`
-    /// and `orchestrator/planning.rs`, and the rules above newly made it
+    /// `fleet.rs`, `check_executor/analyzers/*` and
+    /// `env_write_lock_guard.rs`, and the rules above newly made it
     /// happen in `pair.rs` and `playwright/executor.rs`. Nothing in those
     /// spans trips a guard. Two shapes still end LATE and hide the
     /// production item after the test item:

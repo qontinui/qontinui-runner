@@ -203,6 +203,7 @@ For each language, check against knowledge-base/best-practices/:
 - [ ] Clear variable names (no x, tmp, data)
 - [ ] Single Responsibility Principle
 - [ ] DRY (Don't Repeat Yourself)
+- [ ] A name the diff adds to a body this repo distributes to other machines (a bundled command, skill or agent: a script path, a workspace path, a host) needs the repo's portability allowance for it, with a reason, and a regenerated portability census, in the same diff.
 
 #### Python Specific
 - [ ] Type hints on all functions

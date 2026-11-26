@@ -1,8 +1,17 @@
 //! The HTTP server's edges: the unmatched-route and caught-panic responders,
-//! and binding the listener. Moved verbatim out of `mcp_api.rs` (plan
+//! binding the listener, and serving it. Moved verbatim out of `mcp_api.rs` (plan
 //! `2026-10-04-runner-mcp-api-rs-holds-the-http-composition-root-health-and-five-proxies-in-one-file`
-//! Phase 2). `start_server` and the dedicated API runtime join this file once
-//! the open PRs touching them have landed (D8).
+//! Phase 2), together with the dedicated API runtime and `start_server`.
+
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+
+use tauri::{Emitter, Manager};
+use tracing::{info, warn};
+
+use super::create_router;
+use crate::commands::rag::RAGState;
+use crate::commands::AppState;
 
 /// Build the `NOT_FOUND` error message for an unmatched `(method, path)`.
 ///
@@ -379,4 +388,273 @@ mod panic_message_redaction_tests {
         let msg = "[envelope_audit] GET /ui-bridge/foo returned 500 with non-JSON Content-Type";
         assert_eq!(sanitize_panic_message(msg), msg);
     }
+}
+
+/// Worker threads on the dedicated local-API runtime.
+///
+/// Four, not one: the local API multiplexes the supervisor's health probes,
+/// the web frontend, Claude Code sessions and the coord-mcp proxy, and a
+/// single worker turns one slow handler into a total outage — the exact shape
+/// this runtime exists to prevent. Four is also small enough that the API can
+/// never crowd out the app runtime it was split away from.
+const API_RUNTIME_WORKER_THREADS: usize = 4;
+
+/// The dedicated local-API runtime, kept alive for the process's lifetime.
+///
+/// It MUST outlive [`serve_on_dedicated_runtime`]'s stack frame: dropping a
+/// `Runtime` shuts its workers down, which would stop the server we just
+/// started — and dropping one from inside an async context panics outright.
+#[expect(
+    clippy::disallowed_types,
+    reason = "process-lived OnceLock static, never dropped, so outside the drop-from-async panic class; plan 2026-09-12-residual-work-from-the-april-2026-plan-audit"
+)]
+static API_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+
+/// Serve the local API (`:9876`) on a tokio runtime of its **own**.
+///
+/// ## Why the API does not share the app runtime
+///
+/// Every other subsystem — the terminal bridge, the plan adapter, the backend
+/// relay, the session store, every Tauri command — runs on the single app
+/// runtime. One of them blocking its workers (a synchronous filesystem walk, a
+/// `std::sync::Mutex` held across an `.await`, a saturated channel) takes the
+/// HTTP API down WITH it, and takes it down in the worst possible way: the
+/// listening socket still exists, so the OS completes the TCP handshake and the
+/// connection sits in the accept backlog answering nothing. That is what the
+/// 2026-08 incident looked like from outside — a process alive for 14 hours,
+/// holding `:9876`, accepting connections, and returning zero bytes to three
+/// consecutive 30-second probes, including on `/web-integration/status`.
+///
+/// Every remedy for that failure has to travel over the API — `/health`,
+/// `/web-integration/status`, the supervisor's probes, `adb reverse` from the
+/// mobile app. So the API is precisely the subsystem that must keep answering
+/// while the rest of the process is sick, and it cannot do that from inside the
+/// pool that is sick. Its own runtime means its workers are scheduled by the OS
+/// independently of whatever the app runtime is stuck on.
+///
+/// This is not a claim that a wedge becomes harmless: a handler that blocks
+/// still burns an API worker. It is the narrower, checkable claim that a wedge
+/// **elsewhere** no longer silences the API — which is what turns a 14-hour
+/// blind outage into a diagnosable one.
+///
+/// ## Why a `std::net::TcpListener` crosses the boundary
+///
+/// A `tokio::net::TcpListener` is registered with the I/O driver of the runtime
+/// that created it. Building it here and moving it would leave it driven by the
+/// app runtime — reintroducing the coupling this function removes, and silently.
+/// So the *std* listener is what moves, and `from_std` runs on the far side.
+async fn serve_on_dedicated_runtime(
+    std_listener: std::net::TcpListener,
+    router: axum::Router,
+    port: u16,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(API_RUNTIME_WORKER_THREADS)
+        .enable_all()
+        .thread_name("mcp-api-rt")
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            // Fail OPEN. A degraded API that shares the app runtime is the
+            // behaviour that shipped for years; no API at all is strictly
+            // worse, and would make this hardening a new outage class.
+            warn!(
+                error = %e,
+                "MCP API server: could not build the dedicated API runtime — falling \
+                 back to the shared app runtime. The API will again go deaf if \
+                 any other subsystem blocks the app runtime's workers."
+            );
+            let listener = tokio::net::TcpListener::from_std(std_listener)?;
+            let listener =
+                qontinui_runner_lib::peer_user_guard::GuardedListener::wrap(listener, "local-api")?;
+            return axum::serve(listener, router).await.map_err(Into::into);
+        }
+    };
+
+    // `Runtime::spawn` schedules onto `rt`'s workers from this (app-runtime)
+    // thread, so no raw thread handoff is needed and there is no window in
+    // which the listener is owned by a thread that failed to start.
+    let served = rt.spawn(async move {
+        let listener = tokio::net::TcpListener::from_std(std_listener)?;
+        // Refuse every connection whose peer process runs as a different OS
+        // user (plan 2026-10-04-runner-loopback-api-refuses-other-local-users).
+        // Wrapped HERE, on the dedicated runtime, because the guard's accept
+        // task is spawned on the runtime that wraps it.
+        let listener =
+            qontinui_runner_lib::peer_user_guard::GuardedListener::wrap(listener, "local-api")?;
+        axum::serve(listener, router).await
+    });
+
+    // Park the runtime in a process-lifetime home. `set` can only fail if
+    // `start_server` ran twice; forgetting the loser is deliberate — dropping
+    // it here would shut down workers (and panic, since we are inside an async
+    // context) instead of leaking one runtime in a case that cannot occur once.
+    if let Err(loser) = API_RUNTIME.set(rt) {
+        std::mem::forget(loser);
+    }
+
+    info!(
+        port,
+        workers = API_RUNTIME_WORKER_THREADS,
+        "MCP API server: serving on a dedicated tokio runtime (isolated from the app runtime)"
+    );
+
+    match served.await {
+        Ok(r) => r.map_err(Into::into),
+        Err(e) => Err(Box::new(std::io::Error::other(format!(
+            "MCP API serve task ended abnormally: {e}"
+        )))),
+    }
+}
+
+/// Start the MCP API server
+pub async fn start_server(
+    app_state: Arc<AppState>,
+    rag_state: Arc<RAGState>,
+    app_handle: tauri::AppHandle,
+    port: u16,
+    instance_manager: Arc<crate::instance_manager::InstanceManager>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let emitter = app_handle.clone();
+    let api_ready_flag = app_state.clone();
+
+    // NOTE: this runner start's SAME-USER loopback handshake key is rotated in
+    // the bind-success arm below, NOT here — it is keyed on the port this
+    // runner ACTUALLY binds, which is unknown until the bind loop settles (a
+    // blocked primary port silently promotes the runner onto `port + 1`).
+
+    crate::boot_stage::stamp(crate::boot_stage::BootStage::ApiRouterBuild);
+    info!("MCP API server: building router via create_router...");
+    let router = create_router(app_state, rag_state, app_handle, instance_manager);
+    info!("MCP API server: create_router returned, entering bind loop");
+
+    // The PG circuit breaker's prober needs a process-lived runtime: this one.
+    // On a degraded boot (breaker Open, `cause=boot`) the prober starts now and
+    // reconnects + provisions, lifting the pg_guard 503 when PG returns; on a
+    // normal boot it starts on the first runtime trip.
+    if let Some(pg) = crate::database::pg::PgDb::try_global() {
+        if !crate::database::pg::pg_available() {
+            tracing::warn!("Runner booted DEGRADED (no PG); starting the PG breaker's prober");
+        }
+        pg.start_background(tokio::runtime::Handle::current());
+        crate::database::pg::health::spawn_health_refresher();
+    }
+
+    // Try the requested port first, then fallback ports if zombie connections are blocking
+    // This can happen on Windows when previous process crashes leave orphaned sockets
+    crate::boot_stage::stamp(crate::boot_stage::BootStage::ApiBindLoop);
+    let ports_to_try = crate::instance::api_ports_to_try(port);
+    let mut last_error = None;
+
+    for try_port in ports_to_try {
+        info!("MCP API server: try_bind_port({})...", try_port);
+        match try_bind_port(try_port) {
+            Ok(std_listener) => {
+                // Record whether the ACTUAL bound address is LAN-reachable
+                // (non-loopback). Read from the listener rather than assumed,
+                // so the heartbeat's `lan_reachable` advertisement stays
+                // honest if the bind strategy ever changes. Currently always
+                // false: `try_bind_port` binds 127.0.0.1 only (intentional —
+                // see the comment there).
+                let lan_bound = std_listener
+                    .local_addr()
+                    .map(|addr| lan_reachable_for_bound_addr(&addr))
+                    .unwrap_or(false);
+                api_ready_flag
+                    .api_lan_bound
+                    .store(lan_bound, Ordering::Relaxed);
+                if try_port != port {
+                    warn!(
+                        "Primary port {} was blocked, using fallback port {}. \
+                         Restart the app after zombie connections clear.",
+                        port, try_port
+                    );
+                }
+                info!("MCP API server listening on port {}", try_port);
+
+                // Store the actual bound port in AppState
+                api_ready_flag.api_port.store(try_port, Ordering::Relaxed);
+
+                // Mirror the bound port into the install-interception shim's
+                // process-global so the terminal env-seam (which has no
+                // `app_state`) injects the CORRECT loopback port for
+                // secondary/temp runners — plan §6's #1 live-verification
+                // footgun. Set HERE, the same place app_state.api_port lands.
+                crate::install_effects_producer::intercept::set_bound_port(try_port);
+                crate::boot_stage::stamp(crate::boot_stage::BootStage::ApiListenerBound);
+                // Bind latency from the process clock, logged on every start so
+                // the never-answered grace can be sized (and re-derived) from
+                // evidence, cold boots included.
+                let bind_latency_ms = crate::health_monitor::process_elapsed().as_millis() as u64;
+                info!(
+                    port = try_port,
+                    bind_latency_ms,
+                    "MCP API listener bound {bind_latency_ms} ms after process start"
+                );
+
+                // Rotate this runner start's SAME-USER loopback handshake key at
+                // the BOUND port's path (`~/.qontinui/runner-loopback-key-<port>`)
+                // and then advertise both the port and that path out-of-process
+                // in the breadcrumb record — the key BEFORE the record that
+                // names it, so a reader that sees the record can already read
+                // the key, and both BEFORE the socket is served, so any caller
+                // that can reach `/health` can already drive
+                // `POST /coord-mcp/provision-session`. Keying on the bound port
+                // is what stops a second runner on this box (which shares
+                // `~/.qontinui`) from clobbering this one's key (plan
+                // 2026-09-07-the-runner-loopback-handshake-key-is-box-global-
+                // and-a-second-runner-clobbers-it). Synchronous and cheap; it
+                // never fails the boot — a write failure yields `None`, the
+                // record says so, and the mint route denies every request
+                // (fail-closed), which is a closed door, not an outage.
+                let key_path = crate::coord_mcp::publish_loopback_handshake_key(try_port);
+                qontinui_runner_lib::runner_breadcrumb::publish(try_port, key_path);
+
+                // Port stored in api_ready_flag.api_port above; PG queries accept runner_port as parameter.
+
+                // Signal that the API is ready for requests
+                api_ready_flag.api_ready.store(true, Ordering::Relaxed);
+                // systemd `READY=1` half (plan 2026-10-19 Phase 2b); no-op
+                // without `NOTIFY_SOCKET`.
+                crate::sd_notify::mark_http_serving();
+                if let Err(e) = emitter.emit("api-ready", try_port) {
+                    warn!("Failed to emit api-ready event: {}", e);
+                } else {
+                    info!("Emitted api-ready event (port {})", try_port);
+                }
+
+                // Update window title if using non-default port or instance name
+                let default_port = crate::mcp::types::MCP_API_PORT;
+                let instance_name = crate::instance::instance_name();
+                let needs_title_update = try_port != default_port || instance_name.is_some();
+                if needs_title_update {
+                    let title = match instance_name {
+                        Some(name) => format!("Qontinui Runner — {} [:{}]", name, try_port),
+                        None => format!("Qontinui Runner [:{}]", try_port),
+                    };
+                    if let Some(window) =
+                        emitter.get_webview_window(qontinui_runner_lib::get_main_window_label())
+                    {
+                        if let Err(e) = window.set_title(&title) {
+                            warn!("Failed to set window title: {}", e);
+                        } else {
+                            info!("Window title set to: {}", title);
+                        }
+                    }
+                }
+
+                serve_on_dedicated_runtime(std_listener, router, try_port).await?;
+                return Ok(());
+            }
+            Err(e) => {
+                warn!("Failed to bind to port {}: {}", try_port, e);
+                last_error = Some(e);
+            }
+        }
+    }
+
+    Err(Box::new(last_error.unwrap_or_else(|| {
+        std::io::Error::other("All ports failed")
+    })))
 }

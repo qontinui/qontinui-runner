@@ -37,6 +37,10 @@ just to get it out of the prepare's way. Marking it finished means the bulk
 and the prepare's verdict counts a finished row as done
 rather than waiting for it. Mark it finished only when its work really is
 done. The prepare's state is the `restart_prep` block of `/restart-readiness`.
+The prepare arrives only once qontinui-runner#2796 lands. As of 2026-11-13 that
+PR is open and no build from `main` serves that block, so a body with no
+`restart_prep` field means the prepare has not landed on this build. That is
+not a reading of any prepare's state.
 
 ---
 
@@ -125,8 +129,9 @@ done < "$LEDGER"
 ```
 
 `HELD` rows printed ⇒ **do not finish.** Name them, say the session still
-holds live coord claims, and stop. `UNKNOWN` rows do not refuse (closeability
-UNKNOWN never blocks a finish, step 0.6): name them in the report and go on.
+holds live coord claims, and stop. `UNKNOWN` rows do not refuse (a claim the
+ledger cannot settle is not proof of a held one; in step 0.6 only a run that
+left no usable verdict blocks on an UNKNOWN): name them in the report and go on.
 A `stolen`, `lapsed` or `owner_gone` row is a claim the session no longer
 holds, and prints nothing. The legitimate closeouts (`/implement-plan` Step 6,
 `/vet-imp` Step 5) release every row before they reach any finish, so a genuinely
@@ -136,8 +141,10 @@ default reached by falling through.
 A `semantic_resource` row keyed `plan:<stem>` is released only by the closeout
 that took it (`/implement-plan` Step 6 item 5, after item 4a retires the net and
 before item 7 stops the loop; or `/vet-imp` Step 5),
-through `scripts/plan-reserve-release.sh release`, which withdraws that plan's
-open `implement→ship safety net` first (at most about 90 s). Never release it by hand to get past
+through `scripts/plan-reserve-release.sh release --repo <owner/name>`, which withdraws that plan's
+open `implement→ship safety net` first (at most about 90 s), under the tenant
+proven to own the repo, and WITHHOLDS the release (exit 7 `RELEASE_WITHHELD`) when
+it cannot. Never release it by hand to get past
 this check: a `/claims/release` with the net still open clears it, and coord
 dispatches a duplicate `/implement-plan` onto finished work.
 
@@ -153,7 +160,7 @@ Say in your report that the claim check was UNKNOWN. It does not refuse on its o
 because refusing on an absent file would make every such device unable to
 finish at all.
 
-**0.6. Refuse on a DEFINITE not-closeable; report an UNKNOWN one and finish anyway.**
+**0.6. Refuse on a DEFINITE not-closeable or on NO USABLE VERDICT; report any other UNKNOWN or a HELD one and finish anyway.**
 
 Finished and closeable are **separate axes**. `finished` (this command) says
 the work is done; `closeable` says closing the session would lose nothing, and
@@ -168,22 +175,50 @@ written at the end of a turn, so the git probes decide); no live claim
 sits in the step 0.5 ledger; and every owed item reads `landed` or `watched`.
 A primary checkout reads UNKNOWN, not not-closeable: peers' WIP in a shared tree
 is not this session's owed work.
+In a linked tree whose custody directory also holds another session's slot, a
+dirty path a peer could have written reads UNKNOWN for the same reason, and this
+session never commits or discards such a path. "This session's slot" is one under
+ANY id it is known by: the `SID` below, its environment's session ids and its
+current id in Claude Code's session registry, which a `/clear` or `/resume`
+moves while `$CLAUDE_CODE_SESSION_ID` stays the spawn id -- so the session's own
+dirt after a `/clear` refuses here like any other. `--no-worktrees` is checked
+the same way: a tree holding one of those slots is judged anyway. That includes
+a primary checkout the session ran in, which the custody recorder slots for the
+cwd every turn: it reads `UNKNOWN shared_checkout`, an ordinary UNKNOWN that
+lets the finish proceed (it once read CLOSEABLE).
 
-This step refuses a finish ONLY on a definite reason, because a definite reason
-means the work is not actually done. An UNKNOWN closeability does not block the
-finish: blocking on it would keep idle sessions alive, which is the opposite of
-what finishing is for. No closer reads this step's verdict. The runner's
-`finished_close` arm judges custody again at close time with its own gate and
-closes nothing that gate finds dirty or cannot read, while a missing custody
-slot or an unanswered obligations read, two of this step's UNKNOWN reasons, does
-not hold a session open there. `/close-finished-sessions` reads no closeability
-input at all.
+This step refuses a finish on a definite reason, because a definite reason
+means the work is not actually done. It also refuses when the script ran and
+left **no usable verdict** (plan
+`2026-11-17-port-session-closeable-hardening-onto-landed-2804` Phase 1): a
+timeout, a crash, a first line that is not the verdict its exit names, ANY
+failed git probe of a tree, no tree found or looked at, or a test seam honoured
+outside a test. Such a run shows less than any UNKNOWN reason does: a judge
+that dies cannot show that nothing of this session's is left. Only an ABSENT
+checker proceeds, with a WARNING: a `CCFG` that is a config checkout without
+the script means no checker exists on this box, a property of the deployment,
+and refusing on it would block every finish there. A `CCFG` that is no config
+checkout at all means the step did not run, and refuses.
+
+Any other UNKNOWN closeability does not block the finish: blocking on it would
+keep idle sessions alive, which is the opposite of what finishing is for. Nor
+does a HELD one (exit 4, a close hold): a pushed PR whose first CI verdict is
+all that is pending, behind a live `pr_merged` land watch, is finished work in
+served policy (`finished-criteria` `session-finished-at-green-not-at-merged`),
+and holding the close until that verdict is the product's job. The script reads
+that one shape itself only until coord serves it (qontinui-coord#3901); every
+other shape keeps coord's `not_watched`. A deliberately closed duplicate PR whose work is already on the default branch, and its `failed` `pr_merged` gate, read `retired` (which this step passes) on a coord carrying the plan `2026-11-21-a-session-that-closes-its-own-superseded-duplicates-cannot-be-finished` Phase 2 change; an old coord still answers `not_watched` for them, and then this step REFUSES (`NOT_CLOSEABLE owed_item`, exit 1): read which coord build answered before treating that as a defect in the guard. No closer reads this step's verdict. The runner's `finished_close` arm judges
+custody again at close time with its own gate and closes nothing that gate
+finds dirty or cannot read, while a missing custody slot or an unanswered
+obligations read, two of this step's UNKNOWN reasons, does not hold a session
+open there. `/close-finished-sessions` reads no closeability input at all.
 
 ```bash
 # SID: the same id step 0.5 used. Each --worktree: a tree this session
 # allocated or edited (omit them all and the script finds the trees holding
-# this session's custody slot; it reads finding none as UNKNOWN, so pass
-# --no-worktrees only when the session touched no repository tree at all).
+# this session's custody slot; finding none is UNKNOWN worktrees_unknown, which
+# REFUSES here, so set NO_TREES=1 -- --no-worktrees -- only when the session
+# touched no repository tree at all).
 # A non-empty list goes with --scan, so the list ADDS to that custody-slot
 # scan instead of replacing it: a list can miss the session's own tree.
 # --owed-items: what this session still owes, as a JSON list of
@@ -199,13 +234,55 @@ SID="${CLAUDE_CODE_SESSION_ID:-${QONTINUI_AGENT_SESSION_ID:-}}"
 CCFG=''          # the qontinui-claude-config checkout
 OWED_ITEMS=''    # the owed-items JSON file; empty = none passed (see below)
 TREES=()         # every tree this session allocated or edited
+NO_TREES=''      # 1 = this session touched no repository tree (--no-worktrees)
 CLOSEABLE_ARGS=()
+[ "$NO_TREES" != 1 ] || CLOSEABLE_ARGS+=(--no-worktrees)
 [ -z "$OWED_ITEMS" ] || CLOSEABLE_ARGS+=(--owed-items "$OWED_ITEMS")
 for t in "${TREES[@]}"; do CLOSEABLE_ARGS+=(--worktree "$t"); done
 [ ${#TREES[@]} -eq 0 ] || CLOSEABLE_ARGS+=(--scan)
-{ : "${SID:?no session id: step 0.6 did NOT run}"
-  bash "${CCFG:?fill CCFG with the qontinui-claude-config checkout: step 0.6 did NOT run}/scripts/session-closeable.sh" "$SID" "${CLOSEABLE_ARGS[@]}"
-  echo "session-closeable exit $?"; }
+{ : "${SID:?no session id: step 0.6 did NOT run}" "${CCFG:?fill CCFG with the qontinui-claude-config checkout: step 0.6 did NOT run}"
+  # The checker must be there. A CCFG that is a config checkout without it
+  # (an older tree) is "no checker on this box"; any other CCFG is a wrong
+  # path, so the step did not run. A config checkout is told by a file only
+  # that repo carries and that predates the checker (the probe below); a
+  # scripts/README.md is no proof, since other repos carry one too.
+  CHECKER_ABSENT=''; NO_VERDICT=''; CHECKER="$CCFG/scripts/session-closeable.sh"
+  if [ -f "$CHECKER" ]; then
+    CLOSEABLE_OUT="$(bash "$CHECKER" "$SID" "${CLOSEABLE_ARGS[@]}")"; CLOSEABLE_RC=$?
+  elif [ -f "$CCFG/scripts/install-guard-hooks.sh" ]; then
+    CLOSEABLE_OUT=''; CLOSEABLE_RC=127; CHECKER_ABSENT=1
+  else
+    CLOSEABLE_OUT=''; CLOSEABLE_RC=127; NO_VERDICT="CCFG $CCFG is not a config checkout: step 0.6 did NOT run"
+  fi
+  printf '%s\n' "$CLOSEABLE_OUT"
+  echo "session-closeable exit $CLOSEABLE_RC"
+  # ONE decision from the exit code and the lines together. Refused: a
+  # definite reason (exit 1 with a NOT_CLOSEABLE first line), a usage error,
+  # and a judge that ran but left no usable verdict (124, an exit outside 0-4,
+  # a first line that is not the verdict its exit names, ANY failed git probe
+  # of a tree, no tree found or looked at, a test seam honoured). Only an
+  # absent checker -- 127 under a real config checkout -- proceeds, with a
+  # WARNING.
+  DECISION=proceed
+  case "$CLOSEABLE_RC" in
+    0) case "$CLOSEABLE_OUT" in CLOSEABLE*) ;; *) NO_VERDICT="exit 0 without a CLOSEABLE line" ;; esac ;;
+    1) case "$CLOSEABLE_OUT" in NOT_CLOSEABLE*) DECISION=refuse ;; *) NO_VERDICT="exit 1 without a NOT_CLOSEABLE line" ;; esac ;;
+    2) DECISION=refuse ;;
+    3) case "$CLOSEABLE_OUT" in UNKNOWN*) ;; *) NO_VERDICT="exit 3 without an UNKNOWN line" ;; esac ;;
+    4) case "$CLOSEABLE_OUT" in HELD*) ;; *) NO_VERDICT="exit 4 without a HELD line" ;; esac ;;
+    127) if [ -n "$CHECKER_ABSENT" ]; then
+           echo "WARNING: $CCFG carries no checker script (no checker on this box): closeability is UNKNOWN"
+         else NO_VERDICT="${NO_VERDICT:-exit 127}"; fi ;;
+    *) NO_VERDICT="exit $CLOSEABLE_RC" ;;
+  esac
+  if printf '%s\n' "$CLOSEABLE_OUT" | grep -E '^UNKNOWN (probe_failed|worktrees_unknown|worktrees_unresolvable) ' >/dev/null; then
+    NO_VERDICT="${NO_VERDICT:-a tree was not probed or none was found, or the workspace root to scan did not resolve}"
+  fi
+  if printf '%s\n' "$CLOSEABLE_OUT" | grep -E '^NOTE [A-Z_]+ is honoured' >/dev/null; then
+    NO_VERDICT="${NO_VERDICT:-a test seam was honoured outside a test}"
+  fi
+  if [ -n "$NO_VERDICT" ]; then echo "NO USABLE VERDICT ($NO_VERDICT): do not finish"; DECISION=refuse; fi
+  echo "DECISION: $DECISION"; }
 ```
 
 The script also reads coord's own derivation, `coord_session_obligations`
@@ -213,17 +290,22 @@ The script also reads coord's own derivation, `coord_session_obligations`
 and judges it beside the `--owed-items` list. **An empty `OWED_ITEMS` passes no
 `--owed-items` at all, which leaves the owed check to coord alone** -- and
 while coord does not serve that tool, that check is UNKNOWN (so is the whole
-verdict). Read its exit code:
+verdict). **Act on the block's last line, `DECISION: refuse` or `DECISION:
+proceed`.** It already combines the exit code with the lines, so the table
+below only explains a decision; it never overrides one. No `DECISION` line at
+all means the step did not run.
 
-| Exit | First line | Action |
+| DECISION | What it rests on | Action |
 |---|---|---|
-| 0 | `CLOSEABLE ...` | proceed to step 1 |
-| 1, first line `NOT_CLOSEABLE ...`, and SID did NOT come from `$CLAUDE_CODE_SESSION_ID` (it came from `$QONTINUI_AGENT_SESSION_ID` or the box-global file, which step 1a treats as possibly a peer's) | `NOT_CLOSEABLE ...` | hold the verdict until step 1a has run. **If step 1a confirms the id is yours, the reasons are yours: apply the next row (do not finish).** If step 1a does not confirm the id (a peer's id, or an unproven one), step 1a's own refusal governs: the session is not finished, and these reasons are reported as UNKNOWN because they may be a peer's, not as your own not-closeable. A held claim was already refused by step 0.5 either way |
-| 1, first line `NOT_CLOSEABLE ...` | `NOT_CLOSEABLE ...` | **do not finish.** A definite reason: a dirty or untracked tree, a commit on no remote, a live claim (a ledger row still held -- `stolen` / `lapsed` / `owner_gone` rows are not), or an owed item that is `not_watched`, `owed` or `dropped`. Quote every `NOT_CLOSEABLE <reason> <detail>` line, fix it (commit and push, release the claim, get the item landed or watched), then re-run this step |
-| 3 | `UNKNOWN ...` | **proceed with the finish** and put in the report: `closeable: UNKNOWN (<the UNKNOWN reason lines>) — finished` |
-| no `session-closeable exit` line at all: the shell printed `SID: no session id: step 0.6 did NOT run` or `CCFG: fill CCFG ...: step 0.6 did NOT run` | — | **the step did not run.** Never proceed past it: fill `CCFG` (or resolve the session id) and re-run this step |
-| 2 | usage | the call was malformed (an empty `--owed-items` / `--worktree` value, a non-uuid id): fix it and re-run; do not proceed on a usage error |
-| 127 / `No such file or directory`, an exit 1 whose first line is NOT `NOT_CLOSEABLE` (the script crashed), or any other exit | — | the same as 3: proceed, and report `closeable: UNKNOWN (<what failed>) — finished` |
+| `refuse` | exit 1, first line `NOT_CLOSEABLE ...`, and SID did NOT come from `$CLAUDE_CODE_SESSION_ID` (it came from `$QONTINUI_AGENT_SESSION_ID` or the box-global file, which step 1a treats as possibly a peer's) | hold the verdict until step 1a has run. **If step 1a confirms the id is yours, the reasons are yours: apply the next row (do not finish).** If step 1a does not confirm the id (a peer's id, or an unproven one), step 1a's own refusal governs: the session is not finished, and these reasons are reported as UNKNOWN because they may be a peer's, not as your own not-closeable. A held claim was already refused by step 0.5 either way |
+| `refuse` | exit 1, first line `NOT_CLOSEABLE ...` | **do not finish.** A definite reason: a dirty or untracked tree, a commit on no remote, a live claim (a ledger row still held -- `stolen` / `lapsed` / `owner_gone` rows are not), or an owed item that is `not_watched`, `owed` or `dropped`. Quote every `NOT_CLOSEABLE <reason> <detail>` line, fix it (commit and push, release the claim, get the item landed or watched), then re-run this step. A line ending `-- first CI verdict pending, but no pr_merged gate on this PR's claim anchor or in this answer ...` is a PR whose CI is only still running with no land watch found: register a `pr_merged` gate on the PR's claim anchor (`claim_kind` `pr`, `resource_key` `<owner>/<repo>#<n>`), read it back, and re-run this step. When the line instead names a gate and what fails it (for example: muted, snoozed, archived, a `verdict_reason`, not freshly evaluated, a lost continuation, a missing field, a missing or mismatched `gate_id`, a bare repo name, a `pr_target` naming another PR) or a claim-anchor read that was refused (for example: it failed, the anchor-read budget or the run deadline ran out first, or its gate list cannot show it is whole), fix that gate or re-run once the read answers: a second `pr_merged` registration on the same anchor folds onto the first |
+| `refuse` | exit 2 (usage) | the call was malformed (an empty `--owed-items` / `--worktree` value, a non-uuid id): fix it and re-run; do not proceed on a usage error |
+| `refuse` | the block printed `NO USABLE VERDICT (<why>): do not finish`: the script left no verdict to act on -- exit 124 (a timeout), an exit outside 0-4 (127 included, unless the checker is absent: the `WARNING` row below), a first line that is not the verdict its exit names (`CLOSEABLE` for 0, `NOT_CLOSEABLE` for 1, `UNKNOWN` for 3, `HELD` for 4: a crash, or an exit 0 with nothing printed, as under `bash -t`, `bash -n` or a `SHELLOPTS` holding `onecmd` or `noexec`; re-run then from `env -u SHELLOPTS -u BASHOPTS bash ...`), ANY `UNKNOWN probe_failed` line (a git probe of a tree failed or warned -- rev-parse, status, unpushed, patch-landed, or either served-corpus `.claude/` listing), `UNKNOWN worktrees_unknown` (no tree found: fill `TREES`, or set `NO_TREES=1` when the session touched none), `UNKNOWN worktrees_unresolvable` (the workspace root to scan did not resolve, so a tree of this session's may be unseen), a `NOTE ... is honoured` line (a test seam took effect outside a test: unset `SESSION_CLOSEABLE_TEST_MODE`), or a `CCFG` that is not a config checkout | **do not finish.** Fix what it names and re-run this step (a timeout on a loaded box is retryable); `--force` is the deliberate override |
+| `proceed` | exit 0, `CLOSEABLE ...` | proceed to step 1 |
+| `proceed` | exit 3, first line `UNKNOWN ...`, and none of the lines above (`uncommitted_attributed_to_peer` and `custody_record_missing` are such UNKNOWNs) | **proceed with the finish** and put in the report: `closeable: UNKNOWN (<the UNKNOWN reason lines>) — finished`. When `HELD first_verdict_pending ...` lines follow the UNKNOWN ones (the default call above passes no `--owed-items`, so a hold exits 3 there), report `closeable: UNKNOWN (<the UNKNOWN reason lines>; HELD <the HELD lines>) — finished`, so the hold is not lost |
+| `proceed` | exit 4, first line `HELD ...`, and none of the refusing lines above | **proceed with the finish** and report `closeable: HELD (<the HELD lines>) — finished; first CI verdict pending on <each HELD line's PR at its head, as owner/repo#n at head sha7>; no closer enforces this hold yet`. A HELD verdict is a close hold, not a missing verdict: it is not `NO USABLE VERDICT` |
+| `proceed` | `CCFG` is a config checkout (it has the file the block probes, which only the config repo carries and which predates the checker; a `scripts/README.md` alone is another repo and refuses) that carries no checker script, and the block printed `WARNING: ... no checker on this box` | proceed, and report `closeable: UNKNOWN (no checker on this box) — finished`. A deployment property, not a failed judge: refusing here would block every finish on a box whose checkout predates the script |
+| none | no `DECISION` line: the shell printed `SID: no session id: step 0.6 did NOT run` or `CCFG: fill CCFG ...: step 0.6 did NOT run` | **the step did not run.** Never proceed past it: fill `CCFG` (or resolve the session id) and re-run this step |
 
 Report the closeable axis in exactly those words and nothing else: no
 paraphrase, and no sentence of your own about whether the session can be
@@ -233,7 +315,8 @@ message, as a veto of the whole message, and only that headline, when
 `/unattended` ran, states it.
 
 Report a refusal in these words: *"session NOT finished: not closeable"*,
-followed by the `NOT_CLOSEABLE` lines. `--force` overrides a refusal here as it
+followed by the `NOT_CLOSEABLE` lines, or by the `NO USABLE VERDICT` line and
+the lines it rests on. `--force` overrides a refusal here as it
 does step 0.5 — a deliberate act, never a fall-through — and the report must
 then quote the verdict line it overrode. An `--undo` skips this step: moving a
 row back to `working` closes nothing. A subagent never reaches this step (step
@@ -669,23 +752,58 @@ command's report, which names the subproject and the read-back verdict only.
 set (load them via `ToolSearch` if they are deferred names):
 
 1. call `coord_subproject_get` with no arguments (the id defaults to the
-   caller's own subproject), and keep its `subproject.next_steps_note_at`;
+   caller's own subproject), and keep its `subproject.next_steps_note_at` and
+   its `subproject.origin`. When `origin` is `scheduled`, stop here and write
+   nothing: report `next_steps_note NOT written: subproject_is_a_scheduler_bucket`
+   (the bucket arm, below). When `origin` is absent, or is not one of the six
+   origin words (`operator_prompt`, `autonomous`, `scheduled`,
+   `orphan_continuation`, `operator_created`, `backfill`), stop and write
+   nothing as well: report `next_steps_note NOT written: origin_unknown`. An
+   unreadable origin is never read as "not scheduled";
 2. compose the paragraph;
-3. call `coord_subproject_get` once more just before writing. If
+3. call `coord_subproject_get` once more just before writing, and stop as in
+   step 1 if its `origin` is `scheduled` or not an origin word: the update
+   carries no `id`, so it lands on the subproject THIS read names. If
    `next_steps_note_at` moved, another closer wrote in between: merge its note
    into yours once, then write without checking again;
-4. call `coord_subproject_update` with `{"next_steps_note": "<the paragraph>"}`
-   and no `id`;
+4. call `coord_subproject_update` with `{"next_steps_note": "<the paragraph>",
+   "if_note_at": "<the next_steps_note_at step 3 read, or "" when it was null>"}`
+   and no `id`. A `note_moved` answer (409) means another closer wrote after
+   that read: re-read, merge its note into yours, and write once more with the
+   new `if_note_at`. If coord refuses the argument itself (a build predating
+   plan `2026-11-22-subproject-next-steps-note-refuses-scheduled-buckets-and-keeps-history`
+   Phase 4: over MCP ``unknown argument `if_note_at` ``, over HTTP
+   `bad_request: unknown field`), send once without it and report the
+   precondition as UNKNOWN, never as a failure;
 5. call `coord_subproject_get` again and compare its
    `subproject.next_steps_note` with what you sent.
 
-coord's update takes no precondition yet (no expected `next_steps_note_at`), so
-the re-read narrows the window between two closers without closing it.
+With `if_note_at` served, coord compares it with the locked row and refuses a
+stale write (`note_moved`), so two closers can no longer silently race; every
+accepted write is also kept in coord's note ledger (`note_events` on
+`coord_subproject_get`), so an overwritten note is recoverable.
+
+**The bucket arm.** A `scheduled` subproject is a coord producer's standing
+`scheduled:<label>` bucket (`auto_pr_merged_gate`'s held about 1531 sessions on
+2026-11-22, as finding `6d031ecb-4090-4f64-b4e3-f64463b987c8` records it). Two `resolve.rs` rules put sessions there: rule 3 (a gate-continuation session coord finds no lineage for joins its producer's bucket) and rule 5 (runner loops, roles and task runs join their task's standing `scheduled:<task>` subproject). A gate-continuation session lands there when coord finds no lineage
+for it. The bucket is not one piece of work, so no member knows what its note
+should say, and a write would overwrite, unrecoverably, a note that belongs to
+nothing this session did (findings `f91fe800-ca40-41be-ba9d-14fd3429c8a0`,
+`4676a062-9d2b-4004-80db-26c66fdadd6d`, `6d031ecb-4090-4f64-b4e3-f64463b987c8`). coord
+will refuse the write itself with the same code once plan
+`2026-11-22-subproject-next-steps-note-refuses-scheduled-buckets-and-keeps-history`
+Phase 4 deploys; this pre-check holds until then, against any coord. The
+remainder this session would have written is still owed, and the bucket has no
+owner who would read it. Put it where `/unattended` Step 2 puts owed work: the
+plan's status block when the work belongs to a plan, or a gate with a
+continuation when it waits on an event. Do not drop it because the note was
+refused.
 
 Otherwise carry the same calls over the session's own nonce, substituting
 `<session-workdir>` as in step 1a. The verb uses the nearest `.mcp.json` at or
 above `$PWD`, and step 1b's note on which directory to run it from applies here
-too. The read, which also prints the `AT0=` line the write block takes:
+too. The read, which also prints the `AT0=` and `ORIGIN=` lines the write
+block takes:
 
 ```bash
 . <session-workdir>/.claude/skills/coord-revive/_scripts/lib/envelope.sh; R=$(mktemp -d)
@@ -694,13 +812,21 @@ echo "read door exit: $?"
 envelope_mcp_body coord_subproject_get "$R/g" > "$R/b"
 envelope_require coord_subproject_get subproject "$R/b"
 printf "AT0='%s'\n" "$(envelope_require coord_subproject_get subproject.next_steps_note_at "$R/b")"
+printf "ORIGIN='%s'\n" "$(envelope_require coord_subproject_get subproject.origin "$R/b")"
 rm -rf "$R"
 ```
 
+`ORIGIN=` prints a JSON value, so a bucket reads `ORIGIN='"scheduled"'`, with the
+quotes; the write block accepts the quoted and the bare spelling alike.
+
 Then the re-read, the write and its read-back, as one block so the note you
-compare is the note you sent. Paste the read's `AT0=` line over the
-placeholder, and keep `REMERGED=0` except on the one re-run a `NOTE MOVED`
-line asks for:
+compare is the note you sent. Paste the read's `AT0=` and `ORIGIN=` lines over
+the placeholders, and keep `REMERGED=0` except on the one re-run a `NOTE MOVED`
+line asks for. Nothing past the origin check runs unless `ORIGIN` is a
+non-`scheduled` origin word, so a bucket or an unread origin sends no update.
+The update carries no `id` and lands on whichever subproject the caller belongs
+to at that moment, so the block checks `origin` again on its own re-read, the
+read the write depends on, and refuses there too:
 
 ```bash
 NOTE=$(cat <<'EOF'
@@ -708,14 +834,46 @@ NOTE=$(cat <<'EOF'
 EOF
 )
 AT0='<the value from the AT0= line the read printed>'
+ORIGIN='<the value from the ORIGIN= line the read printed>'
 REMERGED=0
-ARGS="$(python3 -c 'import json,sys; print(json.dumps({"next_steps_note": sys.argv[1]}))' "$NOTE" 2>/dev/null \
-  || python -c 'import json,sys; print(json.dumps({"next_steps_note": sys.argv[1]}))' "$NOTE" 2>/dev/null)"
+case "$ORIGIN" in
+  '"scheduled"'|scheduled) OV=bucket ;;
+  '"operator_prompt"'|'"autonomous"'|'"orphan_continuation"'|'"operator_created"'|'"backfill"'|\
+  operator_prompt|autonomous|orphan_continuation|operator_created|backfill) OV=ok ;;
+  '<the value from the ORIGIN= line the read printed>') OV=placeholder ;;
+  *) OV=unknown ;;
+esac
+if [ "$OV" = bucket ]; then
+  echo "next_steps_note NOT written: subproject_is_a_scheduler_bucket"
+elif [ "$OV" = unknown ]; then
+  echo "next_steps_note NOT written: origin_unknown"
+elif [ "$OV" = placeholder ]; then
+  echo "PLACEHOLDER LEFT IN: paste the read's ORIGIN= line into ORIGIN, then run this block again (nothing was sent)"
+else
+IFAT="$(printf %s "$AT0" | tr -d '"')"; [ "$IFAT" = null ] && IFAT=""
+ARGS="$(python3 -c 'import json,sys; print(json.dumps({"next_steps_note": sys.argv[1], "if_note_at": sys.argv[2]}))' "$NOTE" "$IFAT" 2>/dev/null \
+  || python -c 'import json,sys; print(json.dumps({"next_steps_note": sys.argv[1], "if_note_at": sys.argv[2]}))' "$NOTE" "$IFAT" 2>/dev/null)"
 . <session-workdir>/.claude/skills/coord-revive/_scripts/lib/envelope.sh
 REVIVE=<session-workdir>/.claude/skills/coord-revive/coord-revive.sh; R=$(mktemp -d)
-bash "$REVIVE" call coord_subproject_get '{}' > "$R/p"; echo "re-read door exit: $?"
+bash "$REVIVE" call coord_subproject_get '{}' > "$R/p"; RX=$?; echo "re-read door exit: $RX"
 AT1=$(envelope_mcp_body coord_subproject_get "$R/p" | envelope_require coord_subproject_get subproject.next_steps_note_at -)
-if [ -z "$ARGS" ]; then
+O1=$(envelope_mcp_body coord_subproject_get "$R/p" | envelope_require coord_subproject_get subproject.origin -)
+case "$O1" in
+  '"scheduled"') OV1=bucket ;;
+  '"operator_prompt"'|'"autonomous"'|'"orphan_continuation"'|'"operator_created"'|'"backfill"') OV1=ok ;;
+  *) OV1=unknown ;;
+esac
+if [ "$RX" != 0 ] && grep -q METHOD_NOT_ALLOWED "$R/p" 2>/dev/null; then
+  echo "next_steps_note NOT written: tool not served: METHOD_NOT_ALLOWED"
+elif [ "$RX" = 3 ]; then
+  echo "next_steps_note NOT written: re-read refused (a JSON-RPC error; its code is in the re-read output)"
+elif [ "$RX" != 0 ]; then
+  echo "next_steps_note NOT written: transport: door exit 1 (on the re-read; the exact exit is the line above)"
+elif [ "$OV1" = bucket ]; then
+  echo "next_steps_note NOT written: subproject_is_a_scheduler_bucket (on the re-read)"
+elif [ "$OV1" != ok ]; then
+  echo "next_steps_note NOT written: origin_unknown (on the re-read)"
+elif echo "origin check: ok (read 1 and re-read)" && [ -z "$ARGS" ]; then
   echo "next_steps_note NOT written: no python"
 elif [ -z "$NOTE" ] || [ "$NOTE" = '<the paragraph>' ] || [ "$AT0" = '<the value from the AT0= line the read printed>' ]; then
   echo "PLACEHOLDER LEFT IN: paste the paragraph into NOTE and the read's AT0= line into AT0, then run this block again (nothing was sent)"
@@ -723,9 +881,20 @@ elif [ -n "$AT1" ] && [ "$AT1" != "$AT0" ] && [ "$REMERGED" = 0 ]; then
   echo "NOTE MOVED to $AT1: re-read it, merge it into yours, then run this block once more with AT0='$AT1' and REMERGED=1"
 else
   bash "$REVIVE" call coord_subproject_update "$ARGS" > "$R/u"; WX=$?; echo "write door exit: $WX"
+  if grep -q 'unknown argument .if_note_at\|unknown field .if_note_at' "$R/u" 2>/dev/null; then
+    echo "if_note_at UNKNOWN: this coord predates the precondition; sending without it"
+    ARGS="$(python3 -c 'import json,sys; print(json.dumps({"next_steps_note": sys.argv[1]}))' "$NOTE" 2>/dev/null \
+      || python -c 'import json,sys; print(json.dumps({"next_steps_note": sys.argv[1]}))' "$NOTE" 2>/dev/null)"
+    bash "$REVIVE" call coord_subproject_update "$ARGS" > "$R/u"; WX=$?; echo "write door exit (no precondition): $WX"
+  fi
+  if grep -q note_moved "$R/u" 2>/dev/null; then
+    echo "next_steps_note NOT written: note_moved"
+  fi
   # envelope-ok: the update's answer is not the verdict; the coord_subproject_get read-back below is
   envelope_mcp_body coord_subproject_update "$R/u" > /dev/null; EX=$?; echo "write envelope exit: $EX"
-  if [ "$WX" = 0 ] && [ "$EX" = 0 ]; then
+  if grep -q note_moved "$R/u" 2>/dev/null; then
+    echo "re-read, merge the newer note into yours, then run this block once more with AT0 set to the new next_steps_note_at and REMERGED=1"
+  elif [ "$WX" = 0 ] && [ "$EX" = 0 ]; then
     bash "$REVIVE" call coord_subproject_get '{}' > "$R/g"; echo "read door exit: $?"
     envelope_mcp_body coord_subproject_get "$R/g" > "$R/b"
     envelope_require coord_subproject_get subproject.id "$R/b"
@@ -735,6 +904,7 @@ else
   fi
 fi
 rm -rf "$R"
+fi
 ```
 
 **The runner's proxy may refuse these tools, and for now that is expected.**
@@ -760,6 +930,9 @@ note's text, and never a question mark.
 |---|---|
 | `write door exit: 0`, `write envelope exit: 0` (no UNKNOWN line) and `READ-BACK MATCH`. Natively: the update answered without an error, and the read-back's `subproject.next_steps_note` equals what you sent | `next_steps_note written — subproject <subproject.id>, read back` |
 | `METHOD_NOT_ALLOWED (cause=…)` from the runner's proxy (its `COORD_MCP_PROXY_METHOD_NOT_ALLOWED`, a JSON-RPC `-32601`), or an `unknown tool: <name>` tool error from coord. Natively the tool is then absent from the tool set, and the `call` fallback answers the same | `next_steps_note NOT written: tool not served: METHOD_NOT_ALLOWED`, with `unknown tool` in place of the code when coord itself answered it |
+| `subproject.origin` read `scheduled` (the pre-check after read 1, or the `NOT written` line the write block prints), or the update's answer names `subproject_is_a_scheduler_bucket` (coord's own refusal once it serves one) | `next_steps_note NOT written: subproject_is_a_scheduler_bucket`. Nothing was sent; the remainder goes to the plan's status block or a gate with a continuation (the bucket arm, above) |
+| the update answers `note_moved` (`if_note_at` stale: another closer wrote after the read) | `next_steps_note NOT written: note_moved`, after the one re-read, merge and re-write the step describes. Best-effort: report it and go on |
+| `subproject.origin` absent, unreadable, or not one of the six origin words | `next_steps_note NOT written: origin_unknown` (the write block's re-read arm adds `(on the re-read)`; the bucket row's line may carry it too). Nothing was sent: an unread origin is never taken for "not scheduled" |
 | the answer names `schema_migration_pending` | `next_steps_note NOT written: schema_migration_pending`. coord's subproject tables are not migrated on the serving database yet |
 | the answer names `caller_session_unproven` | `next_steps_note NOT written: caller_session_unproven`. The door carried no verified caller session, and no other agent door writes the note |
 | the answer names any other refusal: this session has no subproject yet (coord may still hold its membership pending), or is not a member of the one named | `next_steps_note NOT written: <coord's code>` |
@@ -771,8 +944,53 @@ When the first read is already refused, or no door carries it, end the step
 with that row's line and send no write: it would be refused for the same
 reason.
 
-**None of these outcomes holds the finish.** Go on to Part B whatever this
-step answered. The note is visibility, not correctness, which is the same
+**Then re-tag the subproject's topics** (same step, same skip rules). **First:
+proceed only when the note's origin check passed on BOTH its reads (read 1 and
+the re-read the write depends on) with a non-`scheduled` origin word: natively,
+both checks passed; in the bash block, it printed `origin check: ok (read 1 and
+re-read)`. Without that, send nothing here and report `topics re-tag: NOT
+written: <the note's code>`, or `origin_unchecked` when the block printed no
+origin verdict at all. The topics update carries no `id` either, so the topics
+step's own first read is a third check: stop the same way if its `origin` is
+`scheduled` or not an origin word**. A bucket's topics belong to no single piece
+of work, exactly as its note does. Topics
+group subprojects (plan
+`2026-11-16-subproject-topics-agents-and-coord-group-subprojects-into-topics-without-the-operator`,
+D3), and the closing session is the one that knows what its work was about.
+Over the same door as the note:
+
+1. **Read** the current topics: the `topics` of the `coord_subproject_get` read
+   above when the serving build carries that field, else `coord_topic_get
+   {"slug": …}` `members` per candidate topic. Unread membership blocks
+   removal only, not adding.
+2. **Confirm or add** with one `coord_subproject_update {"topics": ["<slug>", …]}`.
+   It ADDS (attach and confirm), never replaces. Take slugs from the
+   `topic_suggestions` that `coord_declare_intent` returned this session (a
+   `topic_suggestions_status` of `unavailable:…` is UNKNOWN, not "none"), else
+   from `coord_topic_list`. Reuse a served slug; coin one only through
+   `coord_topic_upsert` first.
+3. **Remove** a topic that is wrong for this work, and only one you READ as a
+   member, with `coord_topic_member {"action": "remove", "topic": "<slug>",
+   "subproject": "<subproject.id>", "reason": "<why>"}`.
+4. **Note** your contribution. The update carries no note, so per kept topic
+   send `coord_topic_member {"action": "confirm", …, "reason": "re-tag at
+   close", "note": "<one line: what this session did for it>"}`. Then read
+   back with `coord_topic_get {"slug": …}`: this subproject in `members` with
+   `state: confirmed` per kept topic, and absent per removed one.
+
+Report one line, `topics re-tag: <n> confirmed/added, <m> removed — read back`,
+when every call answered and every read-back held. Otherwise:
+`topics re-tag: UNKNOWN (<code>)` for a tool the serving build does not carry
+(`METHOD_NOT_ALLOWED`, `unknown tool`, absent natively) or a
+`schema_migration_pending`, never "no topics": an unread vocabulary is not an
+empty one; else `topics re-tag: NOT written: <code>`, the code being a refusal
+code, `transport: <exit or no output>` (presumed LOST) or `unverified`. On a
+partial result, put the counts that held first and the code of the first
+failure after them. When the note's first read was already refused, send
+nothing and report that read's code here, in whichever of the two forms fits.
+
+**None of these outcomes holds the finish**, the re-tag's included. Go on to
+Part B whatever this step answered. The note is visibility, not correctness, which is the same
 bookkeeping rule `/unattended` Step 5 applies to its own finish write. Do not
 raise a credential escalation for it, and do not revive a door for this step
 alone. When this closeout has already revived a door for another write,
@@ -1119,8 +1337,9 @@ and its read-back is what verifies the coord half.
 Then add Part A step 4's line, exactly as that step's table gives it:
 `next_steps_note written — subproject <id>, read back`, or
 `next_steps_note NOT written: <code>`, where the code is a refusal code or an
-exit and never the note's text. A run that skipped that step (`--undo`, or
-`/unattended` invoked this command) carries no such line.
+exit and never the note's text. Then its `topics re-tag:` line. A run that
+skipped that step (`--undo`, or `/unattended` invoked this command) carries
+neither line.
 
 If no rung landed, say so and say which of Part B Step 4's shapes you hit — a
 transport floor, an authorization verdict, or the runner-hosted `own row unbound`

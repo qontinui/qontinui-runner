@@ -522,6 +522,10 @@ pub fn export_all_schemas() -> Value {
     add!("TerminalInfo", qtm::TerminalInfo);
     add!("TerminalOutputEvent", qtm::TerminalOutputEvent);
     add!("TerminalExitEvent", qtm::TerminalExitEvent);
+    add!("TerminalLayout", qtm::TerminalLayout);
+    add!("TerminalLayoutRunner", qtm::TerminalLayoutRunner);
+    add!("TerminalLayoutPage", qtm::TerminalLayoutPage);
+    add!("TerminalLayoutSession", qtm::TerminalLayoutSession);
 
     // ── runner-local: findings (Tauri `finding_detected` / `finding_resolved`
     // payloads). Distinct from `qontinui_types::verification::Finding`
@@ -678,7 +682,6 @@ pub fn export_all_schemas() -> Value {
     add!("WorkerSignal", qv::WorkerSignal);
     add!("Finding", qv::Finding);
     add!("Confidence", qv::Confidence);
-    add!("VerificationAgentContext", qv::VerificationAgentContext);
     add!("ExtendIterationsRequest", qv::ExtendIterationsRequest);
     add!("CriterionOverride", qv::CriterionOverride);
     add!("OverrideCollection", qv::OverrideCollection);
@@ -1107,20 +1110,37 @@ mod tests {
         // verifier that alone filled them, plan
         // 2026-11-06-a-product-workflow-verification-with-nothing-to-check-never-reports-passed
         // Phase 6) = 620.
-        // The codegen's "Processing N top-level types" line should read 620 here.
-        assert_eq!(obj.len(), 620, "Expected 620 schema entries");
-        // Nothing in the product fills those four any more, so registering
-        // one again would export a verdict DTO that has no producer.
+        // - VerificationAgentContext (its only producer, the orchestrator
+        // verifier's context builder, went with the types above; coord
+        // finding 7c536351) = 619.
+        // + the 4 terminal-layout types (TerminalLayout, TerminalLayoutRunner,
+        // TerminalLayoutPage, TerminalLayoutSession — the GET /terminal-layout
+        // body, plan
+        // 2026-11-08-save-per-tab-runner-session-lists-on-sessions-page-kept-14-days
+        // Phase 1) = 623.
+        // The codegen's "Processing N top-level types" line should read 623 here.
+        assert_eq!(obj.len(), 623, "Expected 623 schema entries");
+        // Nothing in the product fills these any more, so registering one
+        // again would export a DTO that has no producer.
         for removed in [
             "DomainVerificationResult",
             "VerificationResult",
             "IterationVerificationResults",
             "TaskCompletionResult",
+            "VerificationAgentContext",
         ] {
             assert!(
                 !obj.contains_key(removed),
                 "{removed} was deleted with the orchestrator verifier and must not be exported"
             );
+        }
+        for layout in [
+            "TerminalLayout",
+            "TerminalLayoutRunner",
+            "TerminalLayoutPage",
+            "TerminalLayoutSession",
+        ] {
+            assert!(obj.contains_key(layout), "Missing {layout} schema");
         }
         for recurring in [
             "ManagedBy",

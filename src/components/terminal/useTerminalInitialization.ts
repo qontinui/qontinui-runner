@@ -1243,9 +1243,16 @@ export function resolveRestoreAccount(
   const recorded = rec.configDir?.trim();
   if (recorded) {
     const dir = resolveAccountDir(recorded, home);
-    return dir.kind === "resolved"
-      ? { kind: "resolved", recordDir: dir.recordDir, typedDir: dir.typedDir }
-      : { kind: "unknown", reason: dir.reason };
+    if (dir.kind === "resolved") {
+      return { kind: "resolved", recordDir: dir.recordDir, typedDir: dir.typedDir };
+    }
+    // A recorded default home that does not exist on this machine (the backend
+    // answers `home = null` for it) is a RETIRED account, not an unreadable
+    // one: fall through to the transcript evidence instead of asking, so a
+    // resume never lands on whatever account the shell happens to carry.
+    if (dir.reason !== "default-home-unknown") {
+      return { kind: "unknown", reason: dir.reason };
+    }
   }
   const holders = rec.transcriptConfigDirCount;
   if (holders === undefined) return { kind: "unknown", reason: "transcript-unprobed" };

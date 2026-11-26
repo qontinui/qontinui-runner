@@ -40,8 +40,8 @@
 #   scan
 #     Print one "M N" candidate per line, from both forms.
 #   decide <M> <N>
-#     Print ONE JSON object: FOLLOW / SKIP / UNKNOWN. Always exits 0; the caller
-#     counts UNKNOWNs.
+#     Print ONE JSON object: FOLLOW / SKIP / UNKNOWN / TRANSIENT. Always exits 0;
+#     the caller counts UNKNOWNs (red) and TRANSIENTs (warning, not red).
 #   merge-and-pin <runner-dir> <plan-item.json>
 #     Merge runner main into M's head, then move the pin to A unless the merge
 #     already contains it. Print MODE= and REASON=.
@@ -53,10 +53,25 @@
 #     claims, and push with --force-with-lease. Print RESULT=.
 #
 # Exit codes: 0 = a named outcome (FOLLOW / MERGE_ONLY / SKIP / ABORT / PUSHED / REFUSED);
-#             3 = UNKNOWN or refused (the lane goes red); 2 = usage.
+#             3 = UNKNOWN or refused (the lane goes red); 2 = usage;
+#             75 = TRANSIENT (`scan` only): a GitHub read still failed with a
+#                  transient class after every retry, so nothing was decided.
+#
+# TRANSIENT vs UNKNOWN. Every `gh api` read is retried (SPF_GH_ATTEMPTS tries,
+# exponential backoff from SPF_GH_BACKOFF_SECS) on HTTP 5xx, 429, a secondary
+# rate-limit 403, and network timeouts / resets. A 404, a 422 or any other 4xx is
+# never retried, nor is a primary rate limit, a DNS failure or connection-refused.
+# When the retries run out on a transient class, `decide` emits
+# TRANSIENT instead of UNKNOWN and `scan` exits 75 instead of 3: GitHub did not
+# answer, which says nothing about the candidate. An UNKNOWN is kept for state
+# that cannot be decided from reads that DID succeed (an unresolvable land
+# commit, a compare status we do not recognise, a claim read coord refused), and
+# it still turns the lane red. Finding ed052f9c (two 502-driven reds in ~30h).
 #
 # ENV
 #   SPF_FIXTURES             fixture root (gh/<name>, coord/<name>, writes.log); no network
+#   SPF_GH_ATTEMPTS          tries per gh api read (default 3)
+#   SPF_GH_BACKOFF_SECS      first retry delay in seconds, doubled per retry (default 2)
 #   SPF_KILL_SWITCH          repository variable SCHEMAS_PAIR_FOLLOW; 'off' disables
 #   COORD_CLAIMS_READ_TOKEN  optional bearer for coord claim reads (plan §7.7)
 #   SPF_COORD_URL            default https://coord.qontinui.io
@@ -89,7 +104,34 @@ is_num() { [[ "$1" =~ ^[0-9]+$ ]]; }
 form2_re() { printf '^coord:downstream-of=(qontinui/)?qontinui-schemas#%s$' "$1"; }
 
 # --- GitHub reads ----------------------------------------------------------
-# gh_get PATH -> body on stdout. rc 0 = ok, 44 = HTTP 404, 1 = any other failure.
+# rc a read returns when it failed on a transient class after every retry.
+RC_TRANSIENT=75
+
+# A per-process marker file: gh_get touches it when a read exhausts its retries
+# on a transient class. Reads run inside $(...) subshells, so a variable would
+# not survive; a file does. `decide` reads it to tell TRANSIENT from UNKNOWN.
+SPF_MARK_DIR="$(mktemp -d)"
+SPF_TRANSIENT_MARK="$SPF_MARK_DIR/transient"
+trap 'rm -rf "$SPF_MARK_DIR"' EXIT
+mark_transient() { : >"$SPF_TRANSIENT_MARK"; }
+saw_transient() { [ -e "$SPF_TRANSIENT_MARK" ]; }
+
+# is_transient_err FILE -> rc 0 when gh's stderr names a retryable, SHORT-LIVED
+# failure: HTTP 5xx, HTTP 429, a SECONDARY rate-limit 403, or a network timeout /
+# reset. Deliberately excluded, so they end UNKNOWN (red) rather than TRANSIENT
+# (a warning): a primary rate-limit 403 (it lasts until the hourly reset), DNS
+# failures and connection-refused (on a runner they mean misconfiguration), and
+# 404 / 422 / every other 4xx, which are deterministic answers.
+is_transient_err() {
+  # A primary rate limit can arrive as a 403 OR a 429; either way it is not short-lived.
+  grep -qi 'API rate limit exceeded' "$1" && return 1
+  grep -Eq 'HTTP 5[0-9][0-9]|HTTP 429' "$1" && return 0
+  grep -q 'HTTP 403' "$1" && grep -Eqi 'secondary rate limit' "$1" && return 0
+  grep -Eqi 'timeout|timed out|deadline exceeded|connection reset|unexpected EOF' "$1"
+}
+
+# gh_get PATH -> body on stdout. rc 0 = ok, 44 = HTTP 404,
+# 75 = transient after every retry (and the transient marker is set), 1 = any other failure.
 gh_get() {
   local path="$1"
   if [ -n "${SPF_FIXTURES:-}" ]; then
@@ -98,21 +140,38 @@ gh_get() {
     case "$(head -c 7 "$f")" in
       __404__) return 44 ;;
       __ERR__) err "fixture error for gh $path"; return 1 ;;
+      __TRN__) err "fixture transient for gh $path"; mark_transient; return "$RC_TRANSIENT" ;;
     esac
     cat "$f"
     return 0
   fi
-  local errf out
+  local errf out attempt=1 attempts="${SPF_GH_ATTEMPTS:-3}" delay="${SPF_GH_BACKOFF_SECS:-2}"
+  is_num "$attempts" && [ "$attempts" -ge 1 ] || attempts=3
+  is_num "$delay" || delay=2
   errf="$(mktemp)"
-  if out="$(gh api "$path" 2>"$errf")"; then
-    rm -f "$errf"
-    printf '%s' "$out"
-    return 0
-  fi
-  if grep -q 'HTTP 404' "$errf"; then rm -f "$errf"; return 44; fi
-  err "gh api $path failed: $(tr '\n' ' ' <"$errf")"
-  rm -f "$errf"
-  return 1
+  while :; do
+    if out="$(gh api "$path" 2>"$errf")"; then
+      rm -f "$errf"
+      printf '%s' "$out"
+      return 0
+    fi
+    if grep -q 'HTTP 404' "$errf"; then rm -f "$errf"; return 44; fi
+    if ! is_transient_err "$errf"; then
+      err "gh api $path failed: $(tr '\n' ' ' <"$errf")"
+      rm -f "$errf"
+      return 1
+    fi
+    if [ "$attempt" -ge "$attempts" ]; then
+      err "gh api $path failed TRANSIENTLY after $attempt attempt(s): $(tr '\n' ' ' <"$errf")"
+      rm -f "$errf"
+      mark_transient
+      return "$RC_TRANSIENT"
+    fi
+    err "gh api $path attempt $attempt/$attempts transient ($(tr '\n' ' ' <"$errf")); retrying in ${delay}s"
+    sleep "$delay"
+    delay=$((delay * 2))
+    attempt=$((attempt + 1))
+  done
 }
 
 # gh_write METHOD PATH [gh api field args...]
@@ -268,7 +327,12 @@ cmd_decide() {
         head_ref:$head_ref, main_sha:$main_sha, mode:$mode, label_present:$label_present}'
   }
   skip() { action=SKIP; reason="$1"; emit; }
-  unknown() { action=UNKNOWN; reason="$1"; emit; }
+  # A read that ran out of retries on a transient class is TRANSIENT, never
+  # UNKNOWN: GitHub did not answer, which says nothing about this candidate.
+  unknown() {
+    if saw_transient; then action=TRANSIENT; reason="GitHub transient: $1"; else action=UNKNOWN; reason="$1"; fi
+    emit
+  }
 
   is_num "$m" && is_num "$n" || { err "decide: M and N must be numbers"; exit 2; }
   if [ "${SPF_KILL_SWITCH:-}" = "off" ]; then skip kill-switch; return; fi
@@ -361,11 +425,18 @@ cmd_decide() {
 }
 
 # --- scan ------------------------------------------------------------------
+# scan_fail RC MESSAGE -> exit 75 when the read failed transiently, else 3.
+scan_fail() {
+  if [ "$1" -eq "$RC_TRANSIENT" ]; then err "$2 (TRANSIENT: GitHub did not answer after retries)"; exit "$RC_TRANSIENT"; fi
+  err "$2"
+  exit 3
+}
+
 cmd_scan() {
   if [ "${SPF_KILL_SWITCH:-}" = "off" ]; then err "kill switch SCHEMAS_PAIR_FOLLOW=off"; return 0; fi
   local page=1 open="[]" chunk
   while :; do
-    chunk="$(gh_get "repos/$RUNNER/pulls?state=open&per_page=100&page=$page")" || { err "list open runner PRs failed"; exit 3; }
+    chunk="$(gh_get "repos/$RUNNER/pulls?state=open&per_page=100&page=$page")" || scan_fail $? "list open runner PRs failed"
     # ACCUMULATE ON STDIN, NEVER ON argv. `--argjson c "$chunk"` passed a whole
     # page of open-PR JSON as ONE execve argument, and Linux caps a single
     # argument at MAX_ARG_STRLEN (128 KiB) independently of ARG_MAX (2 MiB) —
@@ -399,7 +470,7 @@ cmd_scan() {
     # (kill switch off at strip time, a 403, the workflow not yet on main).
     local m events
     for m in $numbers; do
-      events="$(gh_get "repos/$RUNNER/issues/$m/events?per_page=100")" || { err "read $RUNNER#$m events failed"; exit 3; }
+      events="$(gh_get "repos/$RUNNER/issues/$m/events?per_page=100")" || scan_fail $? "read $RUNNER#$m events failed"
       jq -r --arg bot "$COORD_BOT" --arg m "$m" '
         .[] | select(.event == "unlabeled" and (.actor.login // "") == $bot) | .label.name
         | capture("^coord:downstream-of=(qontinui/)?qontinui-schemas#(?<n>[0-9]+)$")? | "\($m) \(.n)"' <<<"$events"
@@ -409,7 +480,7 @@ cmd_scan() {
     # to the oldest open runner PR, not a fixed number of days.
     page=1
     while :; do
-      chunk="$(gh_get "repos/$SCHEMAS/pulls?state=closed&sort=updated&direction=desc&per_page=100&page=$page")" || { err "list closed schemas PRs failed"; exit 3; }
+      chunk="$(gh_get "repos/$SCHEMAS/pulls?state=closed&sort=updated&direction=desc&per_page=100&page=$page")" || scan_fail $? "list closed schemas PRs failed"
       jq -r --arg r "$RUNNER_NAME" --arg oldest "$oldest" '
         .[] | select(.updated_at >= $oldest) | .number as $n | .labels[]?.name
         | capture("^coord:upstream-of=(qontinui/)?" + $r + "#(?<m>[0-9]+)$")? | "\(.m) \($n)"' <<<"$chunk" |

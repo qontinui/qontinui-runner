@@ -29,6 +29,7 @@ use super::visibility::{
     ActivityDigestState, BackgroundHold, TerminalActivityWire, VisibilityState, VisibilityTier,
     ACTIVITY_DIGEST_LINES, ACTIVITY_EVENT,
 };
+use super::PYTHONUTF8_ENV;
 
 /// Shell integration scripts embedded at compile time.
 #[cfg(target_os = "windows")]
@@ -1506,6 +1507,11 @@ impl PaneExitFacts {
     }
 }
 
+/// Process-wide bind order for [`TerminalSession::coord_binding`]: every
+/// coord bind takes the next value, so "bound later" is a total order even
+/// between binds in the same clock tick.
+static COORD_BIND_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// A single PTY-backed terminal session.
 pub struct TerminalSession {
     /// Unique identifier for this terminal.
@@ -1620,6 +1626,19 @@ pub struct TerminalSession {
     /// terminal into the coordinator's session plane. `None` until wired;
     /// read by `terminal_close` so it can close the coord mirror.
     coord_session_id: Arc<Mutex<Option<uuid::Uuid>>>,
+    /// When `coord_session_id` was last bound, as a process-wide monotonic
+    /// sequence ([`COORD_BIND_SEQ`]); `0` until bound. Lets
+    /// `TerminalManager::coord_session_id_for_pinned` pick the most recently
+    /// bound of several live panes pinned to one harness id (a respawn or
+    /// account migration whose old pane has not closed yet).
+    coord_bound_seq: AtomicU64,
+    /// The wall-clock instant `coord_session_id` was last bound, in unix
+    /// MILLISECONDS (the unit of a lifecycle record's `finished_at`); `0`
+    /// until bound. Stamped beside [`Self::coord_bound_seq`] — the sequence
+    /// orders binds, this dates them — so the registrar's pane-row owner can
+    /// say when a pin's ownership of the row began (plan
+    /// `2026-11-12-transcript-autobind-adopts-a-previous-boot-row-that-a-live-pane-has-replaced`).
+    coord_bound_at_ms: std::sync::atomic::AtomicI64,
     /// The `claude --name` this session was spawned with (runner-spawned
     /// continuations only). Immutable once set; surfaced to the webview as the
     /// tab's `spawnName` (shared `TerminalInfo` is schema-owned and carries no
@@ -1965,9 +1984,17 @@ impl TerminalSession {
         // body this pane never got. A direct exec is skipped: its argv carrier
         // and its marker were settled together by the caller (`extra_env`),
         // after the inherited pair was scrubbed above.
+        //
+        // WHOSE body: the tenant the coord-mcp proxy decides for the nonce the
+        // seam above just provisioned for this terminal — the tenant every coord
+        // call of this pane's session acts as (plan
+        // `2026-11-13-runner-policy-injection-uses-the-device-default-tenant-not-the-sessions`
+        // Design §6). Bounded wait; an unresolved tenant composes no body.
         if is_shell_pane {
+            let policy_tenant =
+                crate::mcp::policy_tenant::resolve_shell_pane_policy_tenant(&id, &cwd);
             for (name, value) in
-                crate::session::spawn_prompt::shell_pane_prompt_env(&runner_context)
+                crate::session::spawn_prompt::shell_pane_prompt_env(&runner_context, policy_tenant)
             {
                 match value {
                     Some(v) => cmd.env(name, v),
@@ -2674,6 +2701,8 @@ impl TerminalSession {
             output_tx,
             grid,
             coord_session_id,
+            coord_bound_seq: AtomicU64::new(0),
+            coord_bound_at_ms: std::sync::atomic::AtomicI64::new(0),
             spawn_name: std::sync::OnceLock::new(),
             permission_request_hook: std::sync::OnceLock::new(),
             permission_request_nonce: std::sync::OnceLock::new(),
@@ -2692,8 +2721,9 @@ impl TerminalSession {
 
     /// The terminal-INVARIANT half of the PTY child's environment: the nested-
     /// session markers this seam strips, `TERM`, the runner-context markers and
-    /// port, the continuation-verdict forward, the runner briefing, and the
-    /// non-interactive git credential posture.
+    /// port, the continuation-verdict forward, the runner briefing, the
+    /// non-interactive git credential posture, and the Windows `PYTHONUTF8=1`
+    /// default.
     ///
     /// Runs FIRST, before the caller-supplied `extra_env`, so a caller can
     /// intentionally override any of it; the credential scrub in
@@ -2814,6 +2844,34 @@ impl TerminalSession {
         // `credential_helper::non_interactive_git_env` for the three layers,
         // the precedence rationale, and the named trade-off.
         crate::credential_helper::apply_non_interactive_git_env_pty(cmd);
+        Self::apply_python_utf8_default(cmd, cfg!(windows));
+    }
+
+    /// Python UTF-8 mode for the session's Python on Windows.
+    ///
+    /// Windows Python's text I/O defaults to the ANSI code page (e.g. cp1252),
+    /// so a session helper that prints a character outside it to a pipe
+    /// crashes. That has published corrupted input: an almost-empty PR body
+    /// that wiped coord's trailers (plan
+    /// `2026-11-08-plan-stamp-and-pr-body-publish-doors-trust-a-corrupted-input-file`,
+    /// Phase 3). `PYTHONUTF8=1` makes stdio and `open()` default to UTF-8.
+    /// It does NOT change newline translation: a text-mode write on Windows
+    /// still turns LF into CRLF, which the plan-stamp door's shape gate
+    /// (qontinui-claude-config `land-plan-stamp.sh`) refuses instead.
+    ///
+    /// Set only on Windows, and only when the variable is not already set
+    /// (inherited from the runner's own environment): an operator override,
+    /// including `PYTHONUTF8=0`, wins. It runs before the caller's
+    /// `extra_env`, so a caller can override it as well. This is the PTY seam;
+    /// the headless agent-session seams apply the same rule through
+    /// [`crate::terminal::apply_python_utf8_default_std`] /
+    /// [`crate::terminal::apply_python_utf8_default_tokio`]. The runner's own
+    /// Python subprocess is untouched.
+    /// `is_windows` is a parameter so the rule is testable on every host.
+    pub(crate) fn apply_python_utf8_default(cmd: &mut CommandBuilder, is_windows: bool) {
+        if is_windows && cmd.get_env(PYTHONUTF8_ENV).is_none() {
+            cmd.env(PYTHONUTF8_ENV, "1");
+        }
     }
 
     /// The `CLAUDE_CONFIG_DIR` a caller pinned onto this PTY through
@@ -3337,6 +3395,76 @@ impl TerminalSession {
         Some(t.to_string())
     }
 
+    /// What the identity seam does for a pane it could not put the identity
+    /// shim in front of: start it anyway (fail-open), and say so when that
+    /// costs the pane its argv session id.
+    ///
+    /// Env vars are still set, so a directly-invoked provider could still be
+    /// pinned by a future absolute-path wrapper, but this terminal gets no PATH
+    /// shim. The child PATH is still composed, with no own dir: an inherited
+    /// foreign shim dir must not reach this child either (plan
+    /// 2026-11-04-identity-shim-foreign-shim-ping-pong-…, Phase 2). A runner
+    /// with no PATH at all leaves the child's untouched.
+    ///
+    /// Not silent: a `claude` pane that would have taken its session id from
+    /// the shim ([`Self::pane_loses_shim_pin`]) now runs with none in argv, so
+    /// the session census can identify it only by Claude Code's own
+    /// `sessions/<pid>.json` record (plan
+    /// `2026-11-21-a-live-claude-session-loses-its-sessions-pid-json-record`,
+    /// Phase 2, route (c)) — one `warn!` names the pane. It returns `()`: this
+    /// path never refuses a terminal.
+    fn start_without_identity_shim(
+        cmd: &mut CommandBuilder,
+        terminal_id: &str,
+        title: &str,
+        pinned: &str,
+    ) {
+        if let Ok(current_path) = std::env::var("PATH") {
+            Self::set_child_path(cmd, &compose_child_path(Some(&current_path), &[]));
+        }
+        if Self::pane_loses_shim_pin(cmd) {
+            warn!(
+                terminal_id = %terminal_id,
+                title = %title,
+                pinned_session_id = %pinned,
+                "identity shim could not be materialized: this claude pane starts with no \
+                 --session-id in argv (the pinned id is in its env only)"
+            );
+        }
+    }
+
+    /// Would this PTY child have taken its session id from the identity shim?
+    /// True when argv's head is the BARE `claude` program name (resolved
+    /// through `PATH`, where the shim sits) and its arguments make no session
+    /// choice of their own — the exact case in which the shim appends
+    /// `--session-id $QONTINUI_PINNED_SESSION_ID`. The session-choice token set
+    /// is the Rust spelling the native shim also reads,
+    /// [`qontinui_runner_lib::claude_env::claude_argv_chooses_session`]; the
+    /// `.bash` / `.cmd` script shims still carry copies of it (plan-library
+    /// follow-up edge `2ce2a5a6-da43-4585-a372-d533fb50b7e7`).
+    ///
+    /// False for a `claude` named by a path: it never reaches the PATH shim, so
+    /// a missing shim changes nothing for it (that is route (d) of plan
+    /// `2026-11-21-a-live-claude-session-loses-its-sessions-pid-json-record`,
+    /// not route (c)). False for a shell pane: a `claude` typed in it later is
+    /// the shim's question, not this spawn's.
+    fn pane_loses_shim_pin(cmd: &CommandBuilder) -> bool {
+        let argv = cmd.get_argv();
+        let Some(head) = argv.first() else {
+            return false;
+        };
+        let head = head.to_string_lossy();
+        if head.contains(['/', '\\']) || !Self::argv_head_is_claude(argv) {
+            return false;
+        }
+        let args: Vec<String> = argv
+            .iter()
+            .skip(1)
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        !qontinui_runner_lib::claude_env::claude_argv_chooses_session(&args)
+    }
+
     /// True when argv's head names the claude CLI image (basename compare,
     /// tolerant of a path and a `.exe`/`.cmd`/`.bat` suffix).
     ///
@@ -3623,18 +3751,9 @@ impl TerminalSession {
                     "session-restore: always-on identity shim dir injected onto terminal PATH"
                 );
             }
-            None => {
-                // Fail-open: env vars are still set so a directly-invoked
-                // provider could still be pinned by a future absolute-path
-                // wrapper, but no PATH shim this terminal. The child PATH is
-                // still composed, with no own dir: an inherited foreign shim
-                // dir must not reach this child either (plan
-                // 2026-11-04-identity-shim-foreign-shim-ping-pong-…, Phase 2).
-                // A runner with no PATH at all leaves the child's untouched.
-                if let Ok(current_path) = std::env::var("PATH") {
-                    Self::set_child_path(cmd, &compose_child_path(Some(&current_path), &[]));
-                }
-            }
+            // Fail-open, and the whole arm is this one call: it returns `()`,
+            // so it has no way to refuse the pane.
+            None => Self::start_without_identity_shim(cmd, terminal_id, title, &pinned),
         }
 
         // 4. Record AUTHORITATIVELY at spawn (zero transcript race). The
@@ -4644,9 +4763,18 @@ impl TerminalSession {
 
     /// Set the coord-native session id after `register_external()` wires
     /// this terminal into the coordinator's session plane.
+    ///
+    /// Also stamps the bind order ([`Self::coord_binding`]), so the newest
+    /// bound pane wins among several pinned to one harness id.
     pub fn set_coord_session_id(&self, id: uuid::Uuid) {
         if let Ok(mut slot) = self.coord_session_id.lock() {
             *slot = Some(id);
+            self.coord_bound_seq.store(
+                COORD_BIND_SEQ.fetch_add(1, Ordering::Relaxed) + 1,
+                Ordering::Relaxed,
+            );
+            self.coord_bound_at_ms
+                .store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
         }
     }
 
@@ -4693,6 +4821,41 @@ impl TerminalSession {
     /// Read the coord-native session id, if one has been wired.
     pub fn coord_session_id(&self) -> Option<uuid::Uuid> {
         self.coord_session_id.lock().ok().and_then(|g| *g)
+    }
+
+    /// The coord-native session id together with its bind order (a
+    /// process-wide sequence; larger = bound later), if one has been wired.
+    /// Read under the slot lock, so the pair is never torn.
+    pub fn coord_binding(&self) -> Option<(uuid::Uuid, u64)> {
+        let slot = self.coord_session_id.lock().ok()?;
+        slot.map(|id| (id, self.coord_bound_seq.load(Ordering::Relaxed)))
+    }
+
+    /// The coord row, its bind instant (unix ms, the unit of a lifecycle
+    /// record's `finished_at`) and its bind sequence ([`Self::coord_binding`])
+    /// in one read under the slot lock: `Some(Some((row, at, seq)))` when
+    /// bound, `Some(None)` when not, and `None` when the slot's lock is
+    /// poisoned — UNKNOWN, never "not bound".
+    pub fn coord_row_with_bound_at(&self) -> Option<Option<(uuid::Uuid, i64, u64)>> {
+        let slot = self.coord_session_id.lock().ok()?;
+        Some(slot.map(|id| {
+            (
+                id,
+                self.coord_bound_at_ms.load(Ordering::Relaxed),
+                self.coord_bound_seq.load(Ordering::Relaxed),
+            )
+        }))
+    }
+
+    /// Test-only: poison this terminal's coord slot lock.
+    #[cfg(test)]
+    pub(crate) fn poison_coord_slot_for_test(&self) {
+        let slot = self.coord_session_id.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = slot.lock().unwrap();
+            panic!("poisoning the coord slot for a test");
+        })
+        .join();
     }
 
     /// This terminal's id (the [`super::manager::TerminalManager`] key, and
@@ -4848,6 +5011,7 @@ impl TerminalSession {
         let guard = grid.lock().unwrap_or_else(|e| e.into_inner());
         let snap = guard.text_snapshot();
         crate::terminal::graceful_exit::ScreenText {
+            cursor_row_dim: Some(guard.row_dim_mask(snap.cursor_row)),
             lines: snap.lines,
             cursor_row: snap.cursor_row,
             cursor_col: snap.cursor_col,
@@ -5639,6 +5803,59 @@ pub(crate) mod tests {
         );
     }
 
+    /// Plan 2026-11-08-plan-stamp-and-pr-body-publish-doors-trust-a-corrupted-input-file
+    /// Phase 3: a Windows PTY child gets `PYTHONUTF8=1` unless it already has a
+    /// value, and a non-Windows child is left alone.
+    #[test]
+    fn python_utf8_default_sets_on_windows_when_unset() {
+        let mut cmd = CommandBuilder::new("dummy");
+        cmd.env_remove(PYTHONUTF8_ENV);
+        TerminalSession::apply_python_utf8_default(&mut cmd, true);
+        assert_eq!(
+            cmd.get_env(PYTHONUTF8_ENV).and_then(|v| v.to_str()),
+            Some("1"),
+            "a Windows session must run Python in UTF-8 mode"
+        );
+    }
+
+    #[test]
+    fn python_utf8_default_keeps_an_operator_override() {
+        let mut cmd = CommandBuilder::new("dummy");
+        cmd.env(PYTHONUTF8_ENV, "0");
+        TerminalSession::apply_python_utf8_default(&mut cmd, true);
+        assert_eq!(
+            cmd.get_env(PYTHONUTF8_ENV).and_then(|v| v.to_str()),
+            Some("0"),
+            "an inherited PYTHONUTF8 must win"
+        );
+    }
+
+    #[test]
+    fn python_utf8_default_is_windows_only() {
+        let mut cmd = CommandBuilder::new("dummy");
+        cmd.env_remove(PYTHONUTF8_ENV);
+        TerminalSession::apply_python_utf8_default(&mut cmd, false);
+        assert!(
+            cmd.get_env(PYTHONUTF8_ENV).is_none(),
+            "a non-Windows session must not gain PYTHONUTF8"
+        );
+    }
+
+    /// The seam itself carries the default on this host's platform, so dropping
+    /// the call from `apply_base_child_env` reddens a test (on Windows CI).
+    #[test]
+    fn pty_apply_base_child_env_applies_python_utf8_default_per_platform() {
+        let mut cmd = CommandBuilder::new("dummy");
+        cmd.env_remove(PYTHONUTF8_ENV);
+        TerminalSession::apply_base_child_env(&mut cmd);
+        let got = cmd.get_env(PYTHONUTF8_ENV).and_then(|v| v.to_str());
+        if cfg!(windows) {
+            assert_eq!(got, Some("1"));
+        } else {
+            assert_eq!(got, None);
+        }
+    }
+
     /// The non-interactive git credential posture, asserted from the ONE shared
     /// list so this seam cannot drift from the other seven. Removing the
     /// `apply_non_interactive_git_env_*` call from the production function
@@ -5992,6 +6209,8 @@ pub(crate) mod tests {
             output_tx,
             grid: Arc::new(Mutex::new(Grid::new(80, 24))),
             coord_session_id: Arc::new(Mutex::new(None)),
+            coord_bound_seq: AtomicU64::new(0),
+            coord_bound_at_ms: std::sync::atomic::AtomicI64::new(0),
             spawn_name: std::sync::OnceLock::new(),
             permission_request_hook: std::sync::OnceLock::new(),
             permission_request_nonce: std::sync::OnceLock::new(),
@@ -7557,6 +7776,172 @@ pub(crate) mod tests {
         assert_eq!(TerminalSession::explicit_session_id_from(&cmd), None);
         let cmd = claude_argv(&["--resumeX", "abc-123"]);
         assert_eq!(TerminalSession::explicit_session_id_from(&cmd), None);
+    }
+
+    /// Plan `2026-11-21-a-live-claude-session-loses-its-sessions-pid-json-record`
+    /// Phase 2, route (c) — regression test only (measured 0 on nilan and
+    /// spaceship, coord finding `69c07716-f7f2-41ec-8f25-3c5e4c47c607`):
+    /// with no identity shim the pane still spawns, and the seam warns exactly
+    /// for the panes that would have taken their `--session-id` from the shim.
+    #[test]
+    fn pane_loses_shim_pin_only_for_a_claude_that_makes_no_session_choice() {
+        let loses = |cmd: &CommandBuilder| TerminalSession::pane_loses_shim_pin(cmd);
+
+        assert!(loses(&claude_argv(&[
+            "--permission-mode",
+            "bypassPermissions"
+        ])));
+        assert!(loses(&claude_argv(&[])));
+        // A bare `claude.exe` still resolves through PATH, where the shim sits.
+        assert!(loses(&TerminalSession::build_command_from(Some(vec![
+            "claude.exe".to_string(),
+            "--verbose".to_string(),
+        ]))));
+        // A session flag after `--` is positional; it chooses nothing.
+        assert!(loses(&claude_argv(&["--", "--continue"])));
+
+        // A claude named by a path never goes through the PATH shim, so a
+        // missing shim changes nothing for it (route (d), not (c)).
+        for path in [
+            "/home/u/.nvm/versions/node/v24.19.0/bin/claude",
+            "C:\\Users\\u\\.local\\bin\\claude.exe",
+            "./claude",
+        ] {
+            assert!(
+                !loses(&TerminalSession::build_command_from(Some(vec![
+                    path.to_string(),
+                    "--verbose".to_string(),
+                ]))),
+                "{path} is not resolved through the shim"
+            );
+        }
+
+        for chosen in [
+            vec!["--session-id", "7b97f1e8-35c0-4bec-992d-63e5a3dc55d7"],
+            vec!["--session-id=7b97f1e8-35c0-4bec-992d-63e5a3dc55d7"],
+            vec!["--resume", "52e88829-c137-421d-893a-b45feac50a00"],
+            vec!["-r", "52e88829-c137-421d-893a-b45feac50a00"],
+            vec!["--continue"],
+            vec!["-c"],
+            vec!["resume"],
+        ] {
+            assert!(!loses(&claude_argv(&chosen)), "{chosen:?} chose a session");
+        }
+        assert!(!loses(&TerminalSession::build_command_from(None)));
+        assert!(!loses(&TerminalSession::build_command_from(Some(vec![
+            "bash".to_string(),
+            "-l".to_string(),
+        ]))));
+    }
+
+    /// Route (c), what the seam DOES with no identity shim: the pane starts,
+    /// and exactly one `warn!` names a claude pane that loses its argv session
+    /// id — by terminal id and pinned id. A pane that loses nothing is silent.
+    #[test]
+    fn start_without_identity_shim_warns_once_for_a_pane_that_loses_its_pin() {
+        const PIN: &str = "7b97f1e8-35c0-4bec-992d-63e5a3dc55d7";
+        // Spelled out here, not read from the implementation, so a reworded or
+        // deleted warning reds this test.
+        const WARNING: &str = "identity shim could not be materialized";
+
+        let mut cmd = claude_argv(&["--permission-mode", "bypassPermissions"]);
+        let ((), logs) = crate::resource_guard::capture_logs(|| {
+            TerminalSession::start_without_identity_shim(&mut cmd, "term-noshim", "pane", PIN)
+        });
+        assert_eq!(logs.matches(WARNING).count(), 1, "logs: {logs}");
+        assert!(logs.contains("term-noshim"), "logs: {logs}");
+        assert!(logs.contains(PIN), "logs: {logs}");
+
+        for mut quiet in [
+            TerminalSession::build_command_from(None),
+            claude_argv(&["--session-id", PIN]),
+            claude_argv(&["--continue"]),
+            TerminalSession::build_command_from(Some(
+                vec!["/home/u/.local/bin/claude".to_string()],
+            )),
+        ] {
+            let ((), logs) = crate::resource_guard::capture_logs(|| {
+                TerminalSession::start_without_identity_shim(&mut quiet, "term-quiet", "pane", PIN)
+            });
+            assert!(!logs.contains(WARNING), "logs: {logs}");
+        }
+    }
+
+    /// The seam's no-shim arm is exactly the one call above, and nothing else.
+    /// That function returns `()`, so this is what keeps the arm from refusing
+    /// the pane: an added `return Err(..)`, an `Err::<_, _>(..)?`, or a dropped
+    /// call all change this line.
+    #[test]
+    fn the_no_shim_arm_is_only_the_fail_open_call() {
+        let src = include_str!("session.rs");
+        let seam_start = src
+            .find(&["fn apply_identity", "_seam("].concat())
+            .expect("the identity seam exists");
+        let seam = src
+            .get(seam_start..)
+            .expect("`find` returns a char boundary");
+        let match_at = seam
+            .find(&["match &", "identity {"].concat())
+            .expect("the seam matches on the materialized shim dir");
+        let after_match = seam
+            .get(match_at..)
+            .expect("`find` returns a char boundary");
+        let none_line = after_match
+            .lines()
+            .find(|l| l.trim_start().starts_with("None =>"))
+            .expect("the no-shim arm exists");
+        assert_eq!(
+            none_line.trim(),
+            [
+                "None => Self::start_without_identity_",
+                "shim(cmd, terminal_id, title, &pinned),"
+            ]
+            .concat(),
+            "the no-shim arm must be the single fail-open call"
+        );
+        // And the match closes right after it: no further arm or statement.
+        let mut rest = after_match
+            .lines()
+            .skip_while(|l| !l.trim_start().starts_with("None =>"))
+            .skip(1)
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with("//"));
+        assert_eq!(
+            rest.next(),
+            Some("}"),
+            "the match must end after the no-shim arm"
+        );
+    }
+
+    /// The seam's predicate and the identity shim read ONE session-choice token
+    /// set (`claude_env::claude_argv_chooses_session`): a token the shim treats
+    /// as the user's choice is one the seam does not warn about, and vice versa.
+    #[test]
+    fn pane_loses_shim_pin_agrees_with_the_shared_session_choice_set() {
+        for tokens in [
+            vec![],
+            vec!["--verbose"],
+            vec!["--session-id", "x"],
+            vec!["--session-id=x"],
+            vec!["--resume", "x"],
+            vec!["--resume=x"],
+            vec!["-r", "x"],
+            vec!["resume"],
+            vec!["--continue"],
+            vec!["-c"],
+            vec!["--CONTINUE"],
+            vec!["--continued"],
+            vec!["--session-id-ish"],
+            vec!["--", "--continue"],
+            vec!["-p", "resume the work"],
+        ] {
+            let chose = qontinui_runner_lib::claude_env::claude_argv_chooses_session(&tokens);
+            assert_eq!(
+                TerminalSession::pane_loses_shim_pin(&claude_argv(&tokens)),
+                !chose,
+                "{tokens:?}"
+            );
+        }
     }
 
     /// The id the seam hands back to the spawn — and so the id the coord row

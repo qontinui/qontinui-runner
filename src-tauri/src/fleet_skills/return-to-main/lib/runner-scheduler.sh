@@ -124,6 +124,12 @@
 #   3  the runner answered, but not with the asked-for state: more than one
 #      task named $TASK_NAME, or a write whose read-back does not match
 #   4  usage
+# --check's verdict on a PRESENT task is in its LINES, not its exit code:
+# `drift:`, `overdue:` / `waiting:`, and `failing:` (FAILING -- last N rows
+# failed (latest: <errorMessage>) | no -- <why> | UNKNOWN (<why>)), the last
+# read from GET /scheduler/tasks/<id>/history (see report_failing). An
+# unreadable history is `failing: UNKNOWN`, never `no`, and none of the three
+# moves the exit code off 0.
 #
 # Never writes an OS scheduler entry; never stops, restarts or rebuilds the
 # runner; never touches a task with any other name.
@@ -569,6 +575,104 @@ report_liveness() {
     fi
     printf '  overdue_cause:     %s; a coord device drain also holds AI tasks due with no record (GET /coord/fleet/drain)\n' "$why"
 }
+# ---- failing (plan 2026-11-13-devops-scheduled-remote-agent-relaunches-into-
+# an-exhausted-account, Phase 2) ----------------------------------------------
+# `--check` said PRESENT / drift: none while nawa's dev-ops-steward task failed
+# three hourly cycles in a row (each child hit an account limit and exited 1 in
+# ~6 s). Registered and on time is not working, so --check also reads the
+# task's OUTCOMES: GET /scheduler/tasks/<id>/history (mcp/scheduler.rs
+# get_task_history -- the {"success":true,"data":[...]} envelope over
+# TaskExecutionRecords, NEWEST FIRST, at most 50).
+# The walk: leading in-flight rows (running / pending) are skipped -- they have
+# not failed yet; then every consecutive `failed` / `launch_failed` row counts;
+# the first row of any other status (completed, skipped, cancelled,
+# missed_runner_down) ends the streak. RS_FAILING_AFTER or more counted rows is
+# FAILING. A row whose status cannot be read ends the walk too: with the
+# threshold already met the verdict stands, otherwise it is UNKNOWN. An
+# unanswered, non-200 or envelope-less history, or one whose rows could not be
+# split, is UNKNOWN -- never "not failing" (served verification-and-evidence
+# an-unknown-input-must-not-fire-a-detector). A line, not an exit code: exit 0
+# still means "the task exists", as with drift: and overdue:.
+# The doctor (capability-doctor.sh sched_failing_all) keeps the same rule and
+# the same constant.
+RS_FAILING_AFTER=1
+# rs_failing_judge <history body> -> RS_FAIL_STATE (FAILING | no | UNKNOWN),
+# RS_FAIL_N (consecutive failed rows from the newest finished one),
+# RS_FAIL_LATEST (the newest failed row's errorMessage, unescaped, one line),
+# RS_FAIL_WHY (the reason for `no` / UNKNOWN).
+rs_failing_judge() {
+    local body="$1" line st em rows seen=0 n=0 latest="" ended=""
+    RS_FAIL_STATE=UNKNOWN; RS_FAIL_N=0; RS_FAIL_LATEST=""; RS_FAIL_WHY=""
+    case "$body" in
+        *'"success":true'*'"data":['*) ;;
+        *) RS_FAIL_WHY="the history answered without the runner's {\"success\":true,\"data\":[...]} envelope: $(snip "$body")"; return 0 ;;
+    esac
+    rows="$(rs_tasks "$body")"
+    if [ -z "$rows" ]; then
+        case "$body" in
+            *'"data":[]'*) RS_FAIL_STATE=no; RS_FAIL_WHY="no run recorded yet"; return 0 ;;
+        esac
+        RS_FAIL_WHY="the history carries rows that could not be split"
+        return 0
+    fi
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        seen=$((seen + 1))
+        if ! st="$(jstr "$line" status)"; then
+            ended="row $seen carries no readable status"
+            break
+        fi
+        case "$st" in
+            running|pending)
+                [ "$n" -eq 0 ] && continue
+                ended="in flight"; break ;;
+            failed|launch_failed)
+                n=$((n + 1))
+                if [ "$n" -eq 1 ]; then
+                    em="$(jstr "$line" errorMessage)" && latest="$(junesc "$em")" || latest="<no errorMessage>"
+                fi ;;
+            *)
+                ended="status $st"; break ;;
+        esac
+    done <<<"$rows"
+    RS_FAIL_N=$n
+    RS_FAIL_LATEST="$(snip "$latest")"
+    if [ "$n" -ge "$RS_FAILING_AFTER" ]; then
+        RS_FAIL_STATE=FAILING
+    elif [ -n "$ended" ] && [ "${ended#row }" != "$ended" ]; then
+        RS_FAIL_WHY="$ended"
+    elif [ -n "$ended" ]; then
+        RS_FAIL_STATE=no; RS_FAIL_WHY="the latest finished run did not fail ($ended)"
+    else
+        RS_FAIL_STATE=no; RS_FAIL_WHY="no finished run recorded yet (only in-flight rows)"
+    fi
+}
+# report_failing <task id>: the `failing:` line of --check.
+report_failing() {
+    local id="$1"
+    if [ -z "$id" ] || [ "$id" = "?" ]; then
+        printf '  failing:           UNKNOWN (the task id is unreadable, so its history cannot be addressed) -- not "not failing"\n'
+        return 0
+    fi
+    if ! api GET "/scheduler/tasks/$id/history"; then
+        printf '  failing:           UNKNOWN (GET /scheduler/tasks/%s/history got no answer, curl exit %s) -- not "not failing"\n' "$id" "$API_RC"
+        return 0
+    fi
+    if [ "$API_CODE" != 200 ]; then
+        printf '  failing:           UNKNOWN (GET /scheduler/tasks/%s/history answered HTTP %s) -- not "not failing"\n' "$id" "$API_CODE"
+        return 0
+    fi
+    rs_failing_judge "$API_BODY"
+    case "$RS_FAIL_STATE" in
+        FAILING)
+            printf '  failing:           FAILING -- last %s rows failed (latest: %s); the task is registered but its runs do not work -- read the history in the runner Scheduler UI\n' \
+                "$RS_FAIL_N" "$RS_FAIL_LATEST" ;;
+        no)
+            printf '  failing:           no -- %s\n' "$RS_FAIL_WHY" ;;
+        *)
+            printf '  failing:           UNKNOWN (%s) -- not "not failing"\n' "$RS_FAIL_WHY" ;;
+    esac
+}
 # report_task <task json>: the --check body for one task.
 report_task() {
     local c="$1" id en prompt cron wd mt ts cp next lhm chm tz
@@ -617,6 +721,7 @@ report_task() {
         fi
     fi
     printf '  tz_check:          %s\n' "$tz"
+    report_failing "$id"
 }
 
 # ---- verbs ------------------------------------------------------------------

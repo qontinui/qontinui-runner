@@ -94,9 +94,20 @@ impl Machine {
         now: Instant,
         dispatches: impl Fn() -> DispatchCounts,
     ) -> (Snapshot, Option<CpuReport>) {
+        self.read_from(Some(&self.procfs), prev, now, dispatches)
+    }
+
+    /// A read with `procfs` as its `/proc` (`None`: no `/proc` at all).
+    fn read_from(
+        &self,
+        procfs: Option<&Path>,
+        prev: Option<&Snapshot>,
+        now: Instant,
+        dispatches: impl Fn() -> DispatchCounts,
+    ) -> (Snapshot, Option<CpuReport>) {
         measure(
             &self.root,
-            Some(&self.procfs),
+            procfs,
             self.ci_root.as_deref(),
             &self.memory_dirs(),
             dispatches,
@@ -122,14 +133,29 @@ impl Machine {
 
     /// Two reads 30 s apart, with `first` and then `second` written before each.
     fn two_reads(&self, first: &[(&str, u64)], second: &[(&str, u64)]) -> CpuReport {
+        self.two_reads_from(Some(&self.procfs), first, second)
+    }
+
+    /// As [`Machine::two_reads`], with `procfs` as each read's `/proc`.
+    fn two_reads_from(
+        &self,
+        procfs: Option<&Path>,
+        first: &[(&str, u64)],
+        second: &[(&str, u64)],
+    ) -> CpuReport {
         let t0 = Instant::now();
         self.usages(first);
-        let (s, r) = self.read(None, t0);
+        let (s, r) = self.read_from(procfs, None, t0, DispatchCounts::default);
         assert_eq!(r, None, "a first read has nothing to subtract");
         self.usages(second);
-        self.read(Some(&s), t0 + Duration::from_secs(30))
-            .1
-            .expect("a second read reports")
+        self.read_from(
+            procfs,
+            Some(&s),
+            t0 + Duration::from_secs(30),
+            DispatchCounts::default,
+        )
+        .1
+        .expect("a second read reports")
     }
 }
 
@@ -159,7 +185,7 @@ fn has_nul(v: &Value) -> bool {
 
 /// Puts a directory's mode back to `0o755` when dropped, panics included.
 #[cfg(unix)]
-struct RestoreMode(PathBuf);
+pub(super) struct RestoreMode(PathBuf);
 
 #[cfg(unix)]
 impl Drop for RestoreMode {
@@ -171,9 +197,10 @@ impl Drop for RestoreMode {
 
 /// Makes `dir` unlistable until the guard drops: mode `--x` lets its files and
 /// subdirectories be opened by name but not be listed. `None`, said on
-/// stderr, where permissions are not enforced (a test run as root).
+/// stderr, where permissions are not enforced (a test run as root). The
+/// memory split's tests use it too.
 #[cfg(unix)]
-fn unlistable(dir: &Path) -> Option<RestoreMode> {
+pub(super) fn unlistable(dir: &Path) -> Option<RestoreMode> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(dir, fs::Permissions::from_mode(0o100)).unwrap();
     let guard = RestoreMode(dir.to_path_buf());
@@ -1597,6 +1624,58 @@ fn a_dispatch_no_read_listed_withholds_what_its_time_is_part_of() {
     assert_eq!(r.attribution["withheld"], started_why);
 }
 
+/// A dispatch reason withholds nothing when every place such a dispatch's
+/// time could be is inside a named CI cgroup ([`Withheld::find`]'s `if` arm
+/// with [`Withheld::unlisted_dispatch`] false). A runner whose own cgroup is in
+/// `ci.slice` but is not a unit ([`parse_runner_unit`] reads none) makes its
+/// dispatch cgroups under that cgroup, so a dispatch no read listed is CI work
+/// that `ci.slice`'s time already holds: no reason is recorded, and `ci_usec`
+/// is all of `ci.slice`, the runner's own 15 s included. The control is the
+/// same machine with the runner's cgroup a unit, where the same dispatch
+/// reason does withhold.
+#[test]
+fn a_dispatch_reason_inside_a_named_ci_cgroup_withholds_nothing() {
+    let started = |n| DispatchCounts {
+        started: n,
+        ..DispatchCounts::default()
+    };
+    let reads = |own: &str| {
+        let m = Machine::new(Some(own));
+        m.usages(&[("", 0), ("user.slice", 0), ("ci.slice", 0), (own, 0)]);
+        let p = m.placement();
+        let t0 = Instant::now();
+        let (s, _) = m.read_counting(None, t0, move || started(3));
+        m.usages(&[
+            ("", 100_000_000),
+            ("user.slice", 60_000_000),
+            ("ci.slice", 20_000_000),
+            (own, 15_000_000),
+        ]);
+        let (_, r) = m.read_counting(Some(&s), t0 + Duration::from_secs(30), move || started(4));
+        (p, r.expect("a second read reports"))
+    };
+
+    let own = "ci.slice/runner-host";
+    assert_eq!(parse_runner_unit(&format!("0::/{own}\n")), None);
+    let (p, r) = reads(own);
+    assert_eq!(p.own.as_deref(), Some(own));
+    assert_eq!(p.runner_unit, None, "a cgroup that is not a unit");
+    assert_eq!(p.dispatch_parents, [own]);
+    assert!(
+        r.attribution.get("withheld").is_none(),
+        "a dispatch reason with nothing withheld records no reason: {:?}",
+        r.attribution
+    );
+    assert_eq!(usec(&r, "ci_usec"), Some(20_000_000));
+
+    // Control: the same reads with the runner's cgroup a unit.
+    let unit = "ci.slice/qontinui-runner.service";
+    let (p, r) = reads(unit);
+    assert_eq!(p.runner_unit.as_deref(), Some(unit));
+    assert_eq!(r.attribution["withheld"], json!(["dispatch_started"]));
+    assert_eq!(usec(&r, "ci_usec"), None, "withheld from the class totals");
+}
+
 /// A CI job `ci_node` could not contain runs in the runner's own cgroup, so
 /// while one runs, and for the read after it ends, neither class total can be
 /// split from the unit's time.
@@ -2234,6 +2313,50 @@ fn a_name_that_is_not_utf8_leaves_its_listing_unknown() {
     assert_eq!(usec(&r, "runner_unit_usec"), Some(5_000_000));
 }
 
+/// A `user-N.slice` that could not be listed, and whose name is not UTF-8 so
+/// cannot be named in a path here, still stands for a place a CI slice could
+/// be: it is taken as `user.slice` itself. With `ci-runners.slice` not found,
+/// the CI total (`ci.slice`'s, here), the `user.slice` remainder and
+/// `unattributed_usec` are withheld, while session work, which is looked for
+/// by name, is not.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_unlisted_user_directory_that_cannot_be_named_stands_for_user_slice() {
+    use std::os::unix::ffi::OsStrExt;
+    let u = unit();
+    let m = Machine::new(Some(&u));
+    let odd = m
+        .root
+        .join("user.slice")
+        .join(std::ffi::OsStr::from_bytes(b"user-\xff.slice"));
+    if let Err(e) = fs::create_dir_all(&odd) {
+        eprintln!("SKIPPED: this filesystem refuses a name that is not UTF-8: {e}");
+        return;
+    }
+    let Some(_restore) = unlistable(&odd) else {
+        return;
+    };
+    assert_eq!(m.placement().users_unlisted, ["user.slice"]);
+    let r = m.two_reads(
+        &[("", 0), ("user.slice", 0), ("ci.slice", 0), (u.as_str(), 0)],
+        &[
+            ("", 50_000_000),
+            ("user.slice", 40_000_000),
+            ("ci.slice", 5_000_000),
+            (u.as_str(), 10_000_000),
+        ],
+    );
+    assert_eq!(
+        usec(&r, "session_usec"),
+        Some(10_000_000),
+        "session work is found by name"
+    );
+    for key in ["ci_usec", "user_slice_remainder_usec", "unattributed_usec"] {
+        assert!(r.attribution.get(key).is_none(), "{key}");
+    }
+    assert_eq!(r.attribution["withheld"], json!(["user_slice_unlisted"]));
+}
+
 /// A session-class slice under another user's manager is that user's work,
 /// not this runner's: it keeps its own `cpu` object, and its time is in the
 /// `user.slice` remainder.
@@ -2625,6 +2748,140 @@ fn a_read_that_finds_no_unit_for_the_runner_publishes_no_session_total() {
     }
 }
 
+/// The runner's unit is named only when it is a cgroup under the root: a
+/// `self/cgroup` naming a unit with no cgroup under this root names none. No
+/// `runner_unit` key or session total is published, and the holder scopes are
+/// looked for under the manager of the user the runner runs as, not under the
+/// one that unit's path names.
+#[test]
+fn a_runner_unit_that_is_not_a_cgroup_under_the_root_is_not_named() {
+    let theirs = "user.slice/user-1001.slice/user@1001.service/app.slice/qontinui-runner.service";
+    let a = holder("a");
+    let m = Machine::new(Some(theirs));
+    let r = m.two_reads(
+        &[("", 0), ("user.slice", 0), (a.as_str(), 0)],
+        &[
+            ("", 50_000_000),
+            ("user.slice", 30_000_000),
+            (a.as_str(), 20_000_000),
+        ],
+    );
+    let placed = m.placement();
+    assert_eq!(placed.runner_unit, None);
+    assert_eq!(placed.manager.as_deref(), Some(MGR), "uid 1000's manager");
+    for key in ["runner_unit", "runner_unit_usec", "session_usec"] {
+        assert!(r.attribution.get(key).is_none(), "{key}");
+    }
+    assert_eq!(r.attribution["pty_holder_scopes_seen"], json!(1));
+    assert_eq!(usec(&r, "pty_holder_scopes_usec"), Some(20_000_000));
+    assert!(r.attribution.get("withheld").is_none(), "nothing withheld");
+}
+
+/// The keys a read that finds no runner unit and no holder scope publishes
+/// none of.
+const RUNNER_KEYS: [&str; 7] = [
+    "session_usec",
+    "runner_unit",
+    "runner_unit_usec",
+    "pty_holder_scopes_usec",
+    "pty_holder_scopes_seen",
+    "pty_holder_scopes_measured",
+    "pty_holder_scopes_ended",
+];
+
+/// Two reads of `m` 30 s apart with no `/proc` ([`measure`]'s `procfs` is
+/// `None`), so neither finds the runner's unit, its user or its own cgroup.
+fn two_reads_without_procfs(m: &Machine) -> CpuReport {
+    let (u, a) = (unit(), holder("a"));
+    let at = |k: u64| {
+        [
+            ("", 100_000_000 * k),
+            ("user.slice", 60_000_000 * k),
+            ("system.slice", 10_000_000 * k),
+            ("ci.slice", 20_000_000 * k),
+            (u.as_str(), 30_000_000 * k),
+            (a.as_str(), 10_000_000 * k),
+        ]
+    };
+    m.two_reads_from(None, &at(0), &at(1))
+}
+
+/// A read with no `/proc` finds no runner unit, holder scope or own cgroup:
+/// it publishes no session total and no runner or holder key. A dispatch
+/// cgroup could then be anywhere, so no CI total, remainder or
+/// `unattributed_usec` is published either.
+#[test]
+fn a_read_with_no_procfs_finds_no_runner_and_withholds_what_a_dispatch_could_be_part_of() {
+    let r = two_reads_without_procfs(&Machine::new(Some(&unit())));
+    let withheld = [
+        "ci_usec",
+        "unattributed_usec",
+        "user_slice_remainder_usec",
+        "system_slice_remainder_usec",
+    ];
+    for key in RUNNER_KEYS.iter().chain(&withheld) {
+        assert!(r.attribution.get(*key).is_none(), "{key}");
+    }
+    assert_eq!(usec(&r, "host_usec"), Some(100_000_000));
+    assert_eq!(r.attribution["withheld"], json!(["own_cgroup_unknown"]));
+}
+
+/// With no `/proc` but an operator's `QONTINUI_CI_CGROUP_ROOT` that is
+/// followed, every dispatch cgroup is where that root says, so the CI total,
+/// the remainders and `unattributed_usec` are published, and still no session
+/// total or runner or holder key.
+#[test]
+fn a_read_with_no_procfs_under_a_followed_ci_cgroup_root_publishes_all_but_session_work() {
+    let mut m = Machine::new(Some(&unit()));
+    m.ci_root = Some(m.root.join("ci.slice/dispatches"));
+    let r = two_reads_without_procfs(&m);
+    for key in RUNNER_KEYS {
+        assert!(r.attribution.get(key).is_none(), "{key}");
+    }
+    assert_eq!(usec(&r, "ci_usec"), Some(20_000_000));
+    assert_eq!(usec(&r, "unattributed_usec"), Some(80_000_000));
+    assert_eq!(usec(&r, "user_slice_remainder_usec"), Some(60_000_000));
+    assert_eq!(usec(&r, "system_slice_remainder_usec"), Some(10_000_000));
+    assert!(r.attribution.get("withheld").is_none(), "nothing withheld");
+}
+
+/// A `self/cgroup` that is read but names no own cgroup this module follows,
+/// one with no `0::` line (a cgroup v1 host) or one naming the path through
+/// `..`, leaves the runner's own cgroup unknown, as an unreadable one does: a
+/// dispatch cgroup beside it could be anywhere, so no value one could be part
+/// of is published.
+#[test]
+fn a_self_cgroup_naming_no_followed_own_cgroup_leaves_it_unknown() {
+    for body in ["12:pids:/user.slice\n", "0::/user.slice/../x.service\n"] {
+        let m = Machine::new(None);
+        write(&m.procfs, "self/cgroup", body);
+        assert_eq!(m.placement().own, None, "{body:?}");
+        let r = m.two_reads(
+            &[("", 0), ("user.slice", 0), ("ci.slice", 0)],
+            &[
+                ("", 50_000_000),
+                ("user.slice", 30_000_000),
+                ("ci.slice", 10_000_000),
+            ],
+        );
+        for key in [
+            "session_usec",
+            "runner_unit",
+            "ci_usec",
+            "unattributed_usec",
+            "user_slice_remainder_usec",
+        ] {
+            assert!(r.attribution.get(key).is_none(), "{key}: {body:?}");
+        }
+        assert_eq!(usec(&r, "host_usec"), Some(50_000_000), "{body:?}");
+        assert_eq!(
+            r.attribution["withheld"],
+            json!(["own_cgroup_unknown"]),
+            "{body:?}"
+        );
+    }
+}
+
 #[test]
 fn every_watched_slice_is_charged_to_a_class() {
     for slice in WATCHED_SLICES {
@@ -2654,7 +2911,7 @@ fn apply_adds_cpu_beside_memory_and_never_makes_an_entry() {
     );
 }
 
-/// coord#3567 (open; caps as of b461649cb) stores `cgroup_slices` only inside
+/// coord's `device_resource_slice_telemetry` stores `cgroup_slices` only inside
 /// its caps (16 top-level keys, 16 KiB, depth 8, no NUL), and the whole column
 /// as NULL otherwise, memory readings included. This also pins the
 /// attribution's key set.
@@ -2695,9 +2952,30 @@ fn the_published_map_stays_inside_coords_caps_on_a_crowded_machine() {
     let at =
         |k: u64| -> Vec<(&str, u64)> { cgroups.iter().map(|(c, v)| (c.as_str(), v * k)).collect() };
     let r = m.two_reads(&at(1), &at(2));
+    // Every session cgroup holds memory, so the memory split's object is
+    // published beside the CPU one, as large as it gets but for `withheld`.
+    write(&m.root, &format!("{u}/memory.current"), "1048576\n");
+    for i in 0..300 {
+        let pane = holder(&format!("p{i:03}"));
+        write(&m.root, &format!("{pane}/memory.current"), "1048576\n");
+    }
 
-    let mut slices = super::super::read_slice_reads(&m.root).memory;
+    let reads = super::super::read_slice_reads(&m.root);
+    let mut slices = reads.memory;
     apply(&r, &mut slices);
+    {
+        // `attach` reads `QONTINUI_CI_CGROUP_ROOT`: held unset.
+        let _g = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[CGROUP_ROOT_ENV]);
+        std::env::remove_var(CGROUP_ROOT_ENV);
+        super::memory::attach(
+            &m.root,
+            &m.procfs.join("pressure"),
+            &reads.dirs,
+            DispatchCounts::default,
+            &mut slices,
+        );
+    }
     let doc = Value::Object(slices);
     let bytes = serde_json::to_vec(&doc).unwrap();
     assert!(doc.as_object().unwrap().len() <= 16);
@@ -2705,10 +2983,25 @@ fn the_published_map_stays_inside_coords_caps_on_a_crowded_machine() {
     assert!(json_depth(&doc) <= 8);
     assert!(!has_nul(&doc));
     // The most a read that withholds can add is `withheld` with every reason
-    // in `Why::ALL`.
+    // in `Why::ALL`, in each of the two objects.
     let withheld = json!({"withheld": Why::ALL.map(Why::key)});
-    let most = bytes.len() + serde_json::to_vec(&withheld).unwrap().len();
-    assert!(most <= 16 * 1024, "{most} bytes with every reason");
+    let most = bytes.len() + 2 * serde_json::to_vec(&withheld).unwrap().len();
+    assert!(most <= 16 * 1024, "{most} bytes with every reason, twice");
+    let memory = doc["memory_attribution"]
+        .as_object()
+        .expect("the memory split is published");
+    let memory_keys: BTreeSet<&str> = memory.keys().map(String::as_str).collect();
+    assert_eq!(
+        memory_keys,
+        BTreeSet::from([
+            "session_bytes",
+            "runner_unit_bytes",
+            "pty_holder_scopes_bytes",
+            "pty_holder_scopes_measured",
+            "pty_holder_scopes_seen",
+        ])
+    );
+    assert_eq!(memory["pty_holder_scopes_seen"], json!(300));
     for w in [
         "ci-runners.slice",
         "agent-builds.slice",

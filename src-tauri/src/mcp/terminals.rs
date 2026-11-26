@@ -144,19 +144,28 @@ pub struct TerminalPageEntry {
     pub is_alive: bool,
 }
 
-/// A page and the live terminals parked on it.
+/// A page and the live terminals parked on it, with the tab label and
+/// left-to-right position the runner's webview registered for it.
 ///
-/// SCOPE (v1): membership only — `pageId` + the terminals on it. Human-readable
-/// tab labels ("Page 1…N") and left-to-right order are frontend-only state and
-/// are NOT known to the Rust backend (page metadata is never persisted
-/// server-side; only `page_id` strings are). A `label`/`order` field is a
-/// follow-up requiring the frontend to register page metadata to the backend
-/// (e.g. a future `PUT /terminal-pages/{id}` `{ label, order }`); do not invent
-/// a server-side label heuristic here.
+/// Labels and order are webview state. The webview registers its whole page
+/// list with this backend through the `terminal_pages_register` Tauri command
+/// (`commands::terminal_pages`, plan
+/// `2026-11-08-save-per-tab-runner-session-lists-on-sessions-page-kept-14-days`)
+/// whenever the list changes; both fields are read from that registration
+/// (`terminal::layout::page_labels`). Neither is ever guessed: a page the
+/// webview did not register serves `label: null, order: null`, and so does
+/// every page until the webview's first registration of this process
+/// (`labelsRegistered: false` on [`TerminalPagesResponse`]). There is no HTTP
+/// route that writes labels.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalPageGroup {
     pub page_id: String,
+    /// The registered tab label; `null` when none is registered.
+    pub label: Option<String>,
+    /// The registered left-to-right position (0 = leftmost); `null` when
+    /// unregistered.
+    pub order: Option<u32>,
     pub terminal_count: usize,
     pub terminals: Vec<TerminalPageEntry>,
 }
@@ -165,7 +174,39 @@ pub struct TerminalPageGroup {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalPagesResponse {
+    /// Whether the webview has registered its tab list since this runner
+    /// process started. `false` means every `label`/`order` is `null` because
+    /// nothing was registered yet, not because the tabs are unnamed.
+    pub labels_registered: bool,
+    /// When it last registered (RFC 3339); `null` before the first time.
+    pub labels_registered_at: Option<String>,
+    /// Pages with at least one terminal: registered pages first, in
+    /// registered order, then the rest by page id.
     pub pages: Vec<TerminalPageGroup>,
+}
+
+/// The `GET /terminal-pages` body for `grouped` live terminals and the
+/// current label registration. Pure, so the label/order rules are testable
+/// without a `TerminalManager`.
+fn terminal_pages_response(
+    grouped: BTreeMap<String, Vec<TerminalPageEntry>>,
+    labels: &crate::terminal::layout::PageLabels,
+) -> TerminalPagesResponse {
+    let pages = crate::terminal::layout::arrange_pages(grouped, labels, false)
+        .into_iter()
+        .map(|page| TerminalPageGroup {
+            page_id: page.page_id,
+            label: page.label,
+            order: page.order,
+            terminal_count: page.items.len(),
+            terminals: page.items,
+        })
+        .collect();
+    TerminalPagesResponse {
+        labels_registered: labels.registered(),
+        labels_registered_at: labels.registered_at().map(crate::terminal::layout::rfc3339),
+        pages,
+    }
 }
 
 /// Query params for `GET /terminals/{id}/buffer` (and its `/output` alias).
@@ -500,6 +541,10 @@ pub async fn create_terminal_handler(
         Some(extra_env_vec)
     };
 
+    // `create` consumes both; the post-create coord wiring reads them after.
+    let title_for_intent = request.title.clone();
+    let working_dir_for_wiring = working_dir.clone();
+
     // door-scan: spawn — the door's real spawn; the context is in hand until here.
     match terminal_manager.create(
         request.title,
@@ -527,12 +572,40 @@ pub async fn create_terminal_handler(
         crate::coord_drain_state::SpawnOrigin::Unknown,
     ) {
         Ok(info) => {
-            if let Some(ctx) = isolated_ctx {
-                if let Some(session) = terminal_manager.get(&info.id) {
-                    session.set_isolated_edit_ctx(ctx);
-                }
-            }
             info!("HTTP: Created terminal session: {}", info.id);
+
+            // The same post-create coord wiring the `terminal_create` Tauri
+            // command runs (`coord_wiring`): without it this pane had no
+            // `terminal_shell` coord row, `GET /terminals/{id}/coord-session`
+            // read `null`, and a remote end of it answered `not_found` (plan
+            // 2026-11-05-remote-session-end-reaches-the-target-but-cannot-end-a-real-session,
+            // Phase 4). Fresh, not pane-keyed: this door has no restore
+            // round-trip to key a pane by.
+            let intent = crate::commands::terminal::coord_wiring::terminal_shell_intent(
+                title_for_intent.as_deref(),
+                "HTTP terminal session",
+                request.intent_repo,
+                None,
+                None,
+                working_dir_for_wiring.as_deref(),
+                spawn_tenant,
+            );
+            let registry = state
+                .app_handle
+                .try_state::<Arc<crate::session::SessionRegistry>>()
+                .map(|r| r.inner().clone());
+            crate::commands::terminal::coord_wiring::finish_terminal_create(
+                &terminal_manager,
+                registry.as_ref(),
+                Some(&state.app_handle),
+                &info.id,
+                isolated_ctx,
+                intent,
+                crate::commands::terminal::coord_wiring::CoordRegistration::FreshPinned,
+                working_dir_for_wiring,
+                "http_post_terminals",
+            )
+            .await;
 
             // Send initial command after a short delay for shell initialization
             if let Some(cmd) = request.initial_command {
@@ -842,9 +915,10 @@ pub async fn move_terminal_handler(
 /// Reuses the exact data source as [`list_terminals_handler`] —
 /// `terminal_manager.list()` — and groups the entries by their `page_id`.
 /// Includes the literal `"default"` page group when any terminal is parked
-/// there (the orphaned-tab case that motivated this endpoint). A
-/// `BTreeMap<String, _>` keyed by page id yields deterministic (lexical)
-/// ordering across calls.
+/// there (the orphaned-tab case that motivated this endpoint). Each page
+/// carries the tab label and order the webview registered (see
+/// [`TerminalPageGroup`]); pages are served in registered order, then the
+/// unregistered ones by page id, so the order is deterministic across calls.
 pub async fn list_terminal_pages_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
@@ -863,17 +937,9 @@ pub async fn list_terminal_pages_handler(
             });
     }
 
-    let pages: Vec<TerminalPageGroup> = grouped
-        .into_iter()
-        .map(|(page_id, terminals)| TerminalPageGroup {
-            page_id,
-            terminal_count: terminals.len(),
-            terminals,
-        })
-        .collect();
-
+    let labels = crate::terminal::layout::page_labels().snapshot();
     Ok(Json(ApiResponse::success(serde_json::json!(
-        TerminalPagesResponse { pages }
+        terminal_pages_response(grouped, &labels)
     ))))
 }
 
@@ -1105,17 +1171,19 @@ async fn handle_ws_terminal(
 /// | `Some(Some(id))` | the terminal exists and carries a coord session id | `200`, `coord_session_id: "<uuid>"` |
 ///
 /// ⚠️ `Some(None)` is deliberately NOT a 404. A terminal with no coord mirror
-/// is a normal, transient state (the mirror is registered after the pane is
-/// created), and the caller — the `session-id-stamp.sh` SessionStart hook —
+/// is a normal, transient state (the mirror is registered just after the pane
+/// is created, by the post-create wiring every create door shares —
+/// `commands::terminal::coord_wiring` — or never, when that registration
+/// failed and was logged), and the caller — the `session-id-stamp.sh` SessionStart hook —
 /// shape-gates the answer against a strict UUID regex and SKIPS the bind when
 /// it does not match. A `null` is therefore a correct, honest answer that the
 /// client already handles; collapsing it into "terminal not found" would tell
 /// the caller something false about the terminal.
 ///
 /// Split out from the handler purely so the three arms are testable: the
-/// handler half needs an `ApiState`, which needs a live Tauri `AppHandle`, and
-/// a PTY-backed `TerminalSession` fixture — none of which a unit test in this
-/// crate can build.
+/// handler half needs an `ApiState`, which needs a live Tauri `AppHandle` a
+/// unit test in this crate cannot build. [`coord_session_for`] is the lookup
+/// half, against a bare manager.
 fn coord_session_response(
     id: &str,
     lookup: Option<Option<uuid::Uuid>>,
@@ -1176,12 +1244,21 @@ pub async fn get_coord_session_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let terminal_manager = get_terminal_manager(&state);
+    coord_session_for(&get_terminal_manager(&state), &id)
+}
+
+/// The lookup + response of `GET /terminals/{id}/coord-session` against a
+/// bare [`TerminalManager`] — the handler's whole body, callable from a test
+/// that has no `ApiState`.
+pub(crate) fn coord_session_for(
+    terminal_manager: &TerminalManager,
+    id: &str,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     // `map` (not `and_then`) on purpose: it keeps "no such terminal" and "no
     // coord session id on that terminal" distinguishable, which is the whole
     // difference between the 404 and the `null` arm.
-    let lookup = terminal_manager.get(&id).map(|s| s.coord_session_id());
-    coord_session_response(&id, lookup)
+    let lookup = terminal_manager.get(id).map(|s| s.coord_session_id());
+    coord_session_response(id, lookup)
 }
 
 /// GET /terminals/transport-stats — the terminal output transport counters
@@ -1286,6 +1363,88 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `GET /terminal-pages` serves the registered labels and order (plan
+    /// `2026-11-08-save-per-tab-runner-session-lists-on-sessions-page-kept-14-days`,
+    /// Phase 1 step 5): registered pages first, in registered order, then an
+    /// unregistered page with `label`/`order` null; a registered page with no
+    /// live terminal is not listed. Before any registration every page is
+    /// unlabelled and `labelsRegistered` is false.
+    #[test]
+    fn terminal_pages_serve_registered_labels_in_registered_order() {
+        use crate::terminal::layout::{PageLabels, RegisteredPage};
+        let entry = |id: &str| TerminalPageEntry {
+            id: id.to_string(),
+            title: format!("title {id}"),
+            is_alive: true,
+        };
+        let grouped = || -> BTreeMap<String, Vec<TerminalPageEntry>> {
+            [
+                ("p-a".to_string(), vec![entry("t1")]),
+                ("p-b".to_string(), vec![entry("t2"), entry("t3")]),
+                ("p-stray".to_string(), vec![entry("t4")]),
+            ]
+            .into()
+        };
+        let at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(1_794_128_400_000).unwrap();
+        let page = |id: &str, label: &str, order: u32| RegisteredPage {
+            page_id: id.to_string(),
+            label: Some(label.to_string()),
+            order,
+        };
+        let labels = PageLabels::new(
+            vec![
+                page("p-b", "Bravo", 0),
+                page("p-empty", "Empty", 1),
+                page("p-a", "Alpha", 2),
+            ],
+            at,
+        );
+
+        let body = serde_json::to_value(terminal_pages_response(grouped(), &labels)).unwrap();
+        assert_eq!(body["labelsRegistered"], true);
+        assert_eq!(body["labelsRegisteredAt"], "2026-11-08T09:00:00.000Z");
+        let pages: Vec<(String, serde_json::Value, serde_json::Value, u64)> = body["pages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| {
+                (
+                    p["pageId"].as_str().unwrap().to_string(),
+                    p["label"].clone(),
+                    p["order"].clone(),
+                    p["terminalCount"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        let expected: Vec<(String, serde_json::Value, serde_json::Value, u64)> = vec![
+            ("p-b".to_string(), "Bravo".into(), 0.into(), 2),
+            ("p-a".to_string(), "Alpha".into(), 2.into(), 1),
+            (
+                "p-stray".to_string(),
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                1,
+            ),
+        ];
+        assert_eq!(pages, expected);
+
+        let before =
+            serde_json::to_value(terminal_pages_response(grouped(), &PageLabels::default()))
+                .unwrap();
+        assert_eq!(before["labelsRegistered"], false);
+        assert!(before["labelsRegisteredAt"].is_null());
+        let ids: Vec<&str> = before["pages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| {
+                assert!(p["label"].is_null() && p["order"].is_null(), "{p}");
+                p["pageId"].as_str().unwrap()
+            })
+            .collect();
+        assert_eq!(ids, vec!["p-a", "p-b", "p-stray"]);
+    }
 
     /// `GET /terminals` rows: every `TerminalInfo` key unchanged, plus the
     /// camelCase `permissionRequestHook` — the contract

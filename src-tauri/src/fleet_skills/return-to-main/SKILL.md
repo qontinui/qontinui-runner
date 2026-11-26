@@ -587,27 +587,64 @@ What blocks a repo, as the check decides it (the class and reason are in each
   something keeps writing — a log nothing ignores — keeps R BUSY while such a
   session works. The tree is read by a `git status --untracked-files=all`
   that takes no optional lock and consults no file-system monitor
-  (`core.fsmonitor=false`). Residual: the `.git` internals are read by mtime
+  (`core.fsmonitor=false`) and never runs a configured clean filter: where a
+  `filter.<name>.clean|process` is configured AND an attributes source the
+  status reads (a `.gitattributes` in any directory with a tracked file, ignored
+  or not, `.git/info/attributes`, the global or system attributes file) names it as `filter=<name>` (or `attr.tree` / `GIT_ATTR_SOURCE` is set, so the attributes
+  come from a tree), R reads UNKNOWN (it blocks, and
+  the probes list says "a clean filter is configured; the probe will not run
+  it"); an unreadable attributes source counts as naming it; a configured filter
+  nothing names runs no filter, so the status runs. A status also runs a child
+  status in each initialized submodule under that submodule's own config and
+  attributes, so each is checked the same way (to 3 levels, deeper refused). Residual: the `.git` internals are read by mtime
   and entries only, so one rewritten with a preserved or backdated mtime and
   no log entry is not seen; a stash deleted outright (`git stash clear`, or a
   drop of its last entry) leaves nothing to read, and the sweep never touches
-  a stash; that `git status` runs any clean filter configured for a stat-dirty
-  tracked file (git-lfs's among them), which may write its own store (git-lfs
-  writes `.git/lfs/objects`); and a long-running READER of R that the
+  a stash; and a long-running READER of R that the
   ledger saw only through a `$` path no longer makes R BUSY (a read writes no
   ref record and no tracked change, so a fast-forward can change files under
   it). A ledger reader that serves no `specific_*` keeps the old rule (any
   unattributed touch in the window blocks every repo), and so does
-  `checkout-return`, unchanged;
+  `checkout-return`, unchanged (its window rule has no record of a branch
+  switch to lean on; its lifetime rule below does);
 - a build that reads R's working tree (sourced in R, or a path dependency lands
   in R), a fresh cargo-guard lock or supervisor slot for R, a git lock in R, a
-  runner AI session whose cwd or worktree names R;
+  runner AI session whose cwd or worktree names R. A path under
+  `agent-worktrees/<id>/<repo>` is attributed to `<repo>` by its SPELLING alone
+  (its `.git` is never read). Any other linked worktree -- the runner's
+  `qontinui-worktrees/<id>/<name>`, or one anywhere else -- is recognised by its
+  `.git` file, the admin directory's back-pointer (absolute or relative) and a
+  primary that is a direct child of the root; one that does not verify keeps the
+  old answer under the root (a build sourced there, or an AI session there, blocks every
+  repo), and outside the root blocks every repo too when a `.git` file sits above it
+  (a plain directory with no `.git` outside the root blocks nothing).
+  A build sourced in a verified worktree blocks the primaries its path
+  dependencies land in (one directly under the root reaches the primary siblings;
+  one under `qontinui-worktrees/<id>/` reaches co-allocated worktrees, so none).
+  A build whose source is unreadable and whose target dir is in a worktree blocks
+  every repo; a cargo lock under a worktree directly under the root blocks every repo (its
+  holder is not in the census and its path dependencies may reach any primary
+  sibling), one under `qontinui-worktrees/<id>/` blocks the primaries its path
+  dependencies land in, one in a primary's shared target dir blocks that primary;
 - **every agent of a family with no activity reader — Codex, pi, a node-hosted
   non-Claude agent (class `external_agent_no_idle_signal`) — blocks every repo;
   it is never judged idle**, because neither the activity axis nor the touch
   ledger can see it working;
 - for `checkout-return` only: a session not `finished` that ever touched R's
-  primary checkout (its next commit would land on the wrong branch).
+  primary checkout (its next commit would land on the wrong branch), and, when
+  its life holds a GENERIC unattributed line (a command naming no path, which
+  can hide a branch switch), each R the sweep would return (a branch other than
+  the default, or a DETACHED HEAD) whose HEAD log (`logs/HEAD`) records a move
+  at or after the session's first ledger line: a checkout into R's current
+  branch (any checkout, for a detached HEAD) or an entry of a kind that may have
+  re-pointed HEAD (an empty message from `git symbolic-ref`, a rebase start on a
+  detached HEAD). R on its default branch is not blocked by this arm; a default
+  branch (resolved as the sweep's classifier does), a HEAD log or a
+  ledger `specific_count` / `count` / `first_epoch` that cannot be read blocks
+  (UNKNOWN, never "not parked"). Residual: an entry carries the committer
+  date, so a switch made under an exported `GIT_COMMITTER_DATE` older than the
+  session's first ledger line reads as made before the session began. A SPECIFIC
+  unattributed line still blocks every return.
 
 Idle, waiting and stale sessions block no fast-forward, and a build of another
 repo blocks nothing here.

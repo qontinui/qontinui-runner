@@ -305,4 +305,16 @@ describe("registered actions — /layout is an operator's choice", () => {
     expect((await run("terminal.layout", { preset: "split" })).ok).toBe(true);
     expect(layoutRequests).toStrictEqual([["split", { source: "operator" }]]);
   });
+
+  /**
+   * The one exception, and only on request: the UI Bridge `select-layout`
+   * forwards `origin: "auto"` here, and it must reach the hook as
+   * `source: "auto"` or the page `/triage-sessions` just trimmed and handed to
+   * the runner is recorded as the operator's and never trims again.
+   */
+  it("passes source auto when the caller sends origin auto", async () => {
+    layoutRequests.length = 0;
+    expect((await run("terminal.layout", { preset: "split", origin: "auto" })).ok).toBe(true);
+    expect(layoutRequests).toStrictEqual([["split", { source: "auto" }]]);
+  });
 });

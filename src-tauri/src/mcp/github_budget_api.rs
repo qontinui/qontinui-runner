@@ -133,16 +133,10 @@ const WATCH_HEALTHY_RUN: Duration = Duration::from_secs(120);
 // Response types
 // ---------------------------------------------------------------------------
 
-/// `(entries, approximate bytes)` from [`github_budget::etag_cache_stats`],
-/// named so a reader does not have to count tuple positions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EtagCacheStats {
-    pub entries: usize,
-    /// Approximate by construction — it drives an eviction budget, not an
-    /// accounting ledger.
-    pub approx_bytes: usize,
-}
+/// The ETag cache's gauge from [`github_budget::etag_cache_stats`]: counts,
+/// both ceilings, and per-bound eviction totals. `null` when the cache lock is
+/// poisoned — UNKNOWN, never an empty cache.
+pub type EtagCacheStats = Option<github_budget::EtagCacheGauge>;
 
 /// What the `top` query parameter actually did.
 ///
@@ -302,16 +296,13 @@ pub async fn get_github_budget(
         None => github_budget::snapshot(),
     };
     let histogram = apply_top(&mut budget, requested_top);
-    let (entries, approx_bytes) = github_budget::etag_cache_stats();
+    let etag_cache = github_budget::etag_cache_stats();
 
     Ok(Json(ApiResponse::success(GithubBudgetReport {
         budget,
         low_headroom: github_budget::low_headroom(),
         low_fraction: github_budget::low_fraction(),
-        etag_cache: EtagCacheStats {
-            entries,
-            approx_bytes,
-        },
+        etag_cache,
         histogram,
         watch: watch_status(),
     })))
@@ -692,6 +683,7 @@ mod tests {
             not_modified,
             rate_limited: 0,
             transport_error: 0,
+            deferred: 0,
             cache_effectiveness: None,
         }
     }
@@ -1020,6 +1012,10 @@ mod tests {
         assert!(data["lowFraction"].is_f64());
         assert!(data["etagCache"]["entries"].is_u64());
         assert!(data["etagCache"]["approxBytes"].is_u64());
+        assert!(data["etagCache"]["maxEntries"].is_u64());
+        assert!(data["etagCache"]["maxBytes"].is_u64());
+        assert!(data["etagCache"]["evictedForEntries"].is_u64());
+        assert!(data["etagCache"]["evictedForBytes"].is_u64());
         assert!(data["histogram"]["servedRows"].is_u64());
         assert!(data["watch"]["intervalSeconds"].is_u64());
         assert!(data["watch"]["enabled"].is_boolean());

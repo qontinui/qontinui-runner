@@ -2734,3 +2734,104 @@ async fn pre_register_rejections_close_cleanly() {
         );
     }
 }
+
+/// Plan `2026-11-21-vision-capture-cannot-frame-a-websocket-transport-app`
+/// Phase 1 test (a) — the assumption probe for the vision WebSocket arm. A
+/// client registered with the `screenshot` capability answers `getScreenshot`
+/// with a 4 MiB+ base64 PNG `response` frame that REALLY crosses the socket
+/// (`tokio-tungstenite` against the served router), inside the relay's
+/// command timeout, and the capture decodes its width, height and HiDPI scale.
+/// If this fails the relay's payload ceiling is too low and the arm must set
+/// the limit explicitly — never lower the image quality silently.
+#[tokio::test]
+async fn a_capable_websocket_client_answers_a_4_mib_screenshot_over_the_socket() {
+    use crate::mcp::ui_bridge::vision_frame_source::ws_relay_source::capture_over_relay;
+    use crate::mcp::ui_bridge::vision_frame_source::{SCREENSHOT_ACTION, SCREENSHOT_CAPABILITY};
+    use base64::Engine as _;
+
+    // Incompressible pixels (xorshift noise), so the PNG stays as large as
+    // its raw RGBA: 1100×800×4 ≈ 3.4 MiB, ≈ 4.5 MiB once base64-encoded.
+    let (w, h) = (1100u32, 800u32);
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    let img = image::RgbaImage::from_fn(w, h, |_, _| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        let b = seed.to_le_bytes();
+        image::Rgba([b[0], b[1], b[2], 255])
+    });
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(img)
+        .write_to(&mut png, image::ImageFormat::Png)
+        .expect("encode png");
+    let b64 = base64::engine::general_purpose::STANDARD.encode(png.into_inner());
+    assert!(
+        b64.len() >= 4 * 1024 * 1024,
+        "the probe must carry at least 4 MiB of base64, got {} bytes",
+        b64.len()
+    );
+
+    let s = spawn(BindingConfig::default()).await;
+    let mut wrapper = s.ws_open_try(None).await.expect("upgrade");
+    wrapper
+        .send(json!({
+            "type": "register",
+            "transport": "websocket",
+            "appId": "shot-app",
+            "appName": "shot-app (test)",
+            "appType": "wrapper",
+            "capabilities": [SCREENSHOT_CAPABILITY],
+        }))
+        .await;
+    let ack = wrapper.recv_reply().await.expect("register ack");
+    assert_eq!(ack["type"], "registered", "{ack}");
+    let row = s
+        .relay
+        .app_registry
+        .get_live("shot-app")
+        .await
+        .expect("live row");
+    assert!(
+        row.app
+            .capabilities
+            .iter()
+            .any(|c| c == SCREENSHOT_CAPABILITY),
+        "the register frame's capability reaches the registry: {:?}",
+        row.app.capabilities
+    );
+
+    let dispatcher = s.relay.app_dispatcher.clone();
+    let registry = s.relay.app_registry.clone();
+    let capture =
+        tokio::spawn(async move { capture_over_relay(&dispatcher, &registry, "shot-app").await });
+
+    let command = loop {
+        let frame = wrapper
+            .recv()
+            .await
+            .expect("the wrapper receives the command");
+        if frame["type"] == "command" {
+            break frame;
+        }
+    };
+    assert_eq!(command["action"], SCREENSHOT_ACTION, "{command}");
+    let command_id = command["commandId"]
+        .as_str()
+        .expect("commandId")
+        .to_string();
+    // Reported CSS width is half the PNG's: a 2× HiDPI frame.
+    wrapper
+        .respond(
+            &command_id,
+            json!({ "screenshot": b64, "width": w / 2, "height": h / 2 }),
+        )
+        .await;
+
+    let frame = tokio::time::timeout(Duration::from_secs(30), capture)
+        .await
+        .expect("the capture settles inside the relay's 30 s command timeout")
+        .unwrap()
+        .expect("the 4 MiB frame crossed the socket and decoded");
+    assert_eq!((frame.width, frame.height), (w, h));
+    assert!((frame.source.scale_factor - 2.0).abs() < 1e-9);
+}

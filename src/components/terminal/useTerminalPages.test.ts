@@ -429,7 +429,13 @@ describe("page persistence round-trip (defaultWorkingDir)", () => {
 
   it("round-trips defaultWorkingDir through save → load unchanged", () => {
     const saved: TerminalPageConfig[] = [
-      { id: "op-a", name: "Pizzeria", createdAt: 100, defaultWorkingDir: "D:\\projects\\pizzeria" },
+      {
+        id: "op-a",
+        name: "Pizzeria",
+        createdAt: 100,
+        defaultWorkingDir: "D:\\projects\\pizzeria",
+        origin: "operator",
+      },
     ];
     instanceStorage.setJSON(PAGES_STORAGE_KEY, saved);
     expect(loadPages()).toEqual(saved);
@@ -439,7 +445,9 @@ describe("page persistence round-trip (defaultWorkingDir)", () => {
     const legacy = [{ id: "op-a", name: "My Work", createdAt: 100 }];
     instanceStorage.setJSON(PAGES_STORAGE_KEY, legacy);
     const loaded = loadPages();
-    expect(loaded).toEqual(legacy);
+    // Unchanged but for the legacy origin classification (plan 2026-11-05
+    // Phase 6): an operator-named page is `operator`.
+    expect(loaded).toEqual([{ ...legacy[0], origin: "operator" }]);
     expect(loaded[0].defaultWorkingDir).toBeUndefined();
     // …and a spawn on such a page behaves exactly as before the field existed.
     expect(resolveSpawnWorkingDir(undefined, loaded[0].defaultWorkingDir)).toBeNull();

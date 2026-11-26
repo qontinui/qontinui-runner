@@ -275,6 +275,7 @@ pub(crate) const PIN_SURFACES: &[PinSurface] = &[
         readers: &[
             "session/mod.rs::resolve_new_session_tenant",
             "session/mod.rs::resolve_new_session_tenant_in",
+            "session/mod.rs::resolve_new_session_tenant_settled_in",
         ],
         detail: "the tenant a NEW session is recorded under, read at its creation \
                  (also reached through claude_session/coord_register.rs, which calls this \
@@ -705,9 +706,16 @@ pub(crate) fn current_machine_pin() -> Option<String> {
 /// Returns `{ active_tenant_id, source, pin, candidates, credentials }`. The frontend
 /// treats `candidates.length <= 1` as "operator is in exactly one tenant" and
 /// elides the switcher accordingly.
+///
+/// The view is built on the blocking pool, off both the main thread and the
+/// async workers: it reads the credential store (and can reach the bounded
+/// keychain read), and the Fleet view re-reads it each time its list read
+/// settles. Same arrangement as the HTTP twin, `mcp::tenant`.
 #[tauri::command]
-pub fn get_active_tenant() -> Result<CommandResponse, String> {
-    let view = active_tenant_view()?;
+pub async fn get_active_tenant() -> Result<CommandResponse, String> {
+    let view = qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(active_tenant_view)
+        .await
+        .map_err(|e| format!("get_active_tenant task failed: {e}"))??;
     Ok(CommandResponse {
         success: true,
         message: None,

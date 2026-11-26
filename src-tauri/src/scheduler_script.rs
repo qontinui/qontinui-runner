@@ -50,6 +50,8 @@ pub(crate) fn classify_script_exit(
         error: Some(error),
         exit_code,
         timed_out,
+        // A script is no Claude session: it has no account to exhaust.
+        rate_limited: None,
     };
     if timed_out {
         return fail(
@@ -67,6 +69,7 @@ pub(crate) fn classify_script_exit(
             error: None,
             exit_code: Some(0),
             timed_out: false,
+            rate_limited: None,
         },
         Ok(Some(code)) => fail(
             format!("script exited with code {code}"),
