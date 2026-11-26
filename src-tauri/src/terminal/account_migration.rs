@@ -2555,6 +2555,7 @@ mod tests {
         let local = uuid::Uuid::new_v4();
         let carried = CarriedContinuation {
             anchor_key: None,
+            work_identity: None,
             gate_id: Some(gate),
             consuming_device_id: Some(claimer),
             shell_hosted: false,
@@ -2567,6 +2568,7 @@ mod tests {
         );
         let fresh = CarriedContinuation {
             anchor_key: None,
+            work_identity: None,
             gate_id: Some(gate),
             consuming_device_id: None,
             shell_hosted: false,
@@ -2578,6 +2580,7 @@ mod tests {
         assert!(super::carried_gate_identity_for(&fresh, None).is_none());
         let no_gate = CarriedContinuation {
             anchor_key: None,
+            work_identity: None,
             gate_id: None,
             consuming_device_id: Some(claimer),
             shell_hosted: false,

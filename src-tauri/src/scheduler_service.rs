@@ -3146,6 +3146,88 @@ pub async fn start_scheduler_service(pg_db: Arc<PgDb>, app_state: Arc<AppState>)
     });
 
     info!("Scheduler service started");
+
+    // The on-start arm of the unfinished-session sweep: once, after the boot
+    // restore completes.
+    tokio::spawn(run_post_boot_restore_trigger());
+}
+
+/// The scheduled task the post-boot-restore trigger fires: the every-30-minute
+/// unfinished-session sweep, registered by
+/// `qontinui-claude-config/scripts/schedule-sweep-unfinished.sh` under this name
+/// (its upsert key).
+pub const BOOT_RESTORE_TRIGGER_TASK: &str = "sweep-unfinished";
+
+/// How often the trigger polls the boot-restore latch, and how long it waits
+/// for it. A runner whose restore is withheld by a coord drain keeps waiting;
+/// the cap only ends the wait for a runner whose frontend never asks.
+const BOOT_RESTORE_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+const BOOT_RESTORE_WAIT_CAP: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+
+/// PURE: the task to fire after the boot restore - the ENABLED task of that
+/// name. A disabled or absent one is `None`: the trigger only ever runs what an
+/// operator registered and left on.
+fn select_boot_restore_task<'a>(
+    tasks: &'a [ScheduledTask],
+    name: &str,
+) -> Option<&'a ScheduledTask> {
+    tasks.iter().find(|t| t.enabled && t.name == name)
+}
+
+/// Fire [`BOOT_RESTORE_TRIGGER_TASK`] ONCE, as soon as this process's boot
+/// restore has run (plan
+/// `2026-10-06-closed-sessions-whose-work-is-unfinished-are-found-fleet-wide-and-resumed`
+/// Phase 6: "once after each boot restore completes"). The cron schedule alone
+/// only gives a catch-up run at the next slot; this is the on-start arm.
+///
+/// Spawned detached from `start_scheduler_service`; never fails the service.
+/// The launch goes through [`run_task_now`] under `SpawnOrigin::Scheduler`, so
+/// the coord device drain still holds it (the sweep itself also defers any
+/// resume while drained), and a run already in flight (the catch-up arm got
+/// there first) is a no-op, not an error worth more than a log line.
+async fn run_post_boot_restore_trigger() {
+    use crate::session::session_lifecycle_store::{boot_restore_phase, BootRestorePhase};
+    let waited_from = std::time::Instant::now();
+    while boot_restore_phase() != BootRestorePhase::Ran {
+        if waited_from.elapsed() >= BOOT_RESTORE_WAIT_CAP {
+            info!(
+                "scheduler: boot restore never reported complete in {:?}; \
+                 not firing '{BOOT_RESTORE_TRIGGER_TASK}' on boot",
+                BOOT_RESTORE_WAIT_CAP
+            );
+            return;
+        }
+        tokio::time::sleep(BOOT_RESTORE_POLL).await;
+    }
+    let Some(service) = get_scheduler_service().await else {
+        return;
+    };
+    let tasks = match service.pg().map(|pg| pg.get_all_scheduled_tasks()) {
+        Ok(fut) => match fut.await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("scheduler: post-boot-restore trigger could not list tasks: {e}");
+                return;
+            }
+        },
+        Err(e) => {
+            warn!("scheduler: post-boot-restore trigger has no task store: {e}");
+            return;
+        }
+    };
+    let Some(task) = select_boot_restore_task(&tasks, BOOT_RESTORE_TRIGGER_TASK) else {
+        debug!("scheduler: no enabled '{BOOT_RESTORE_TRIGGER_TASK}' task; nothing to fire on boot");
+        return;
+    };
+    match run_task_now(&task.id, crate::coord_drain_state::SpawnOrigin::Scheduler).await {
+        Ok(()) => info!(
+            "scheduler: boot restore complete - fired '{BOOT_RESTORE_TRIGGER_TASK}' ({})",
+            task.id
+        ),
+        Err(e) => {
+            info!("scheduler: boot restore complete - '{BOOT_RESTORE_TRIGGER_TASK}' not fired: {e}")
+        }
+    }
 }
 
 /// Stop the global scheduler service
@@ -3363,6 +3445,31 @@ mod tests {
     }
 
     use crate::test_env::{env_lock, EnvVarRestore};
+
+    #[test]
+    fn boot_restore_trigger_selects_only_an_enabled_task_of_that_name() {
+        let mk = |name: &str, enabled: bool| {
+            let mut t = ScheduledTask::new(
+                name.to_string(),
+                None,
+                crate::scheduler::schedule_expression_default(),
+                crate::scheduler::scheduled_task_type_default(),
+            );
+            t.enabled = enabled;
+            t
+        };
+        let tasks = vec![
+            mk("other", true),
+            mk(BOOT_RESTORE_TRIGGER_TASK, false),
+            mk("other-2", true),
+        ];
+        assert!(select_boot_restore_task(&tasks, BOOT_RESTORE_TRIGGER_TASK).is_none());
+        let mut tasks = tasks;
+        tasks.push(mk(BOOT_RESTORE_TRIGGER_TASK, true));
+        let hit = select_boot_restore_task(&tasks, BOOT_RESTORE_TRIGGER_TASK).unwrap();
+        assert!(hit.enabled && hit.name == BOOT_RESTORE_TRIGGER_TASK);
+        assert!(select_boot_restore_task(&[], BOOT_RESTORE_TRIGGER_TASK).is_none());
+    }
 
     #[tokio::test]
     async fn test_scheduler_service_creation() {

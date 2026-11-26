@@ -207,7 +207,7 @@ all that is pending, behind a live `pr_merged` land watch, is finished work in
 served policy (`finished-criteria` `session-finished-at-green-not-at-merged`),
 and holding the close until that verdict is the product's job. The script reads
 that one shape itself only until coord serves it (qontinui-coord#3901); every
-other shape keeps coord's `not_watched`. No closer reads this step's verdict. The runner's `finished_close` arm judges
+other shape keeps coord's `not_watched`. A deliberately closed duplicate PR whose work is already on the default branch, and its `failed` `pr_merged` gate, read `retired` (which this step passes) on a coord carrying the plan `2026-11-21-a-session-that-closes-its-own-superseded-duplicates-cannot-be-finished` Phase 2 change; an old coord still answers `not_watched` for them, and then this step REFUSES (`NOT_CLOSEABLE owed_item`, exit 1): read which coord build answered before treating that as a defect in the guard. No closer reads this step's verdict. The runner's `finished_close` arm judges
 custody again at close time with its own gate and closes nothing that gate
 finds dirty or cannot read, while a missing custody slot or an unanswered
 obligations read, two of this step's UNKNOWN reasons, does not hold a session
@@ -752,23 +752,58 @@ command's report, which names the subproject and the read-back verdict only.
 set (load them via `ToolSearch` if they are deferred names):
 
 1. call `coord_subproject_get` with no arguments (the id defaults to the
-   caller's own subproject), and keep its `subproject.next_steps_note_at`;
+   caller's own subproject), and keep its `subproject.next_steps_note_at` and
+   its `subproject.origin`. When `origin` is `scheduled`, stop here and write
+   nothing: report `next_steps_note NOT written: subproject_is_a_scheduler_bucket`
+   (the bucket arm, below). When `origin` is absent, or is not one of the six
+   origin words (`operator_prompt`, `autonomous`, `scheduled`,
+   `orphan_continuation`, `operator_created`, `backfill`), stop and write
+   nothing as well: report `next_steps_note NOT written: origin_unknown`. An
+   unreadable origin is never read as "not scheduled";
 2. compose the paragraph;
-3. call `coord_subproject_get` once more just before writing. If
+3. call `coord_subproject_get` once more just before writing, and stop as in
+   step 1 if its `origin` is `scheduled` or not an origin word: the update
+   carries no `id`, so it lands on the subproject THIS read names. If
    `next_steps_note_at` moved, another closer wrote in between: merge its note
    into yours once, then write without checking again;
-4. call `coord_subproject_update` with `{"next_steps_note": "<the paragraph>"}`
-   and no `id`;
+4. call `coord_subproject_update` with `{"next_steps_note": "<the paragraph>",
+   "if_note_at": "<the next_steps_note_at step 3 read, or "" when it was null>"}`
+   and no `id`. A `note_moved` answer (409) means another closer wrote after
+   that read: re-read, merge its note into yours, and write once more with the
+   new `if_note_at`. If coord refuses the argument itself (a build predating
+   plan `2026-11-22-subproject-next-steps-note-refuses-scheduled-buckets-and-keeps-history`
+   Phase 4: over MCP ``unknown argument `if_note_at` ``, over HTTP
+   `bad_request: unknown field`), send once without it and report the
+   precondition as UNKNOWN, never as a failure;
 5. call `coord_subproject_get` again and compare its
    `subproject.next_steps_note` with what you sent.
 
-coord's update takes no precondition yet (no expected `next_steps_note_at`), so
-the re-read narrows the window between two closers without closing it.
+With `if_note_at` served, coord compares it with the locked row and refuses a
+stale write (`note_moved`), so two closers can no longer silently race; every
+accepted write is also kept in coord's note ledger (`note_events` on
+`coord_subproject_get`), so an overwritten note is recoverable.
+
+**The bucket arm.** A `scheduled` subproject is a coord producer's standing
+`scheduled:<label>` bucket (`auto_pr_merged_gate`'s held about 1531 sessions on
+2026-11-22, as finding `6d031ecb-4090-4f64-b4e3-f64463b987c8` records it). Two `resolve.rs` rules put sessions there: rule 3 (a gate-continuation session coord finds no lineage for joins its producer's bucket) and rule 5 (runner loops, roles and task runs join their task's standing `scheduled:<task>` subproject). A gate-continuation session lands there when coord finds no lineage
+for it. The bucket is not one piece of work, so no member knows what its note
+should say, and a write would overwrite, unrecoverably, a note that belongs to
+nothing this session did (findings `f91fe800-ca40-41be-ba9d-14fd3429c8a0`,
+`4676a062-9d2b-4004-80db-26c66fdadd6d`, `6d031ecb-4090-4f64-b4e3-f64463b987c8`). coord
+will refuse the write itself with the same code once plan
+`2026-11-22-subproject-next-steps-note-refuses-scheduled-buckets-and-keeps-history`
+Phase 4 deploys; this pre-check holds until then, against any coord. The
+remainder this session would have written is still owed, and the bucket has no
+owner who would read it. Put it where `/unattended` Step 2 puts owed work: the
+plan's status block when the work belongs to a plan, or a gate with a
+continuation when it waits on an event. Do not drop it because the note was
+refused.
 
 Otherwise carry the same calls over the session's own nonce, substituting
 `<session-workdir>` as in step 1a. The verb uses the nearest `.mcp.json` at or
 above `$PWD`, and step 1b's note on which directory to run it from applies here
-too. The read, which also prints the `AT0=` line the write block takes:
+too. The read, which also prints the `AT0=` and `ORIGIN=` lines the write
+block takes:
 
 ```bash
 . <session-workdir>/.claude/skills/coord-revive/_scripts/lib/envelope.sh; R=$(mktemp -d)
@@ -777,13 +812,21 @@ echo "read door exit: $?"
 envelope_mcp_body coord_subproject_get "$R/g" > "$R/b"
 envelope_require coord_subproject_get subproject "$R/b"
 printf "AT0='%s'\n" "$(envelope_require coord_subproject_get subproject.next_steps_note_at "$R/b")"
+printf "ORIGIN='%s'\n" "$(envelope_require coord_subproject_get subproject.origin "$R/b")"
 rm -rf "$R"
 ```
 
+`ORIGIN=` prints a JSON value, so a bucket reads `ORIGIN='"scheduled"'`, with the
+quotes; the write block accepts the quoted and the bare spelling alike.
+
 Then the re-read, the write and its read-back, as one block so the note you
-compare is the note you sent. Paste the read's `AT0=` line over the
-placeholder, and keep `REMERGED=0` except on the one re-run a `NOTE MOVED`
-line asks for:
+compare is the note you sent. Paste the read's `AT0=` and `ORIGIN=` lines over
+the placeholders, and keep `REMERGED=0` except on the one re-run a `NOTE MOVED`
+line asks for. Nothing past the origin check runs unless `ORIGIN` is a
+non-`scheduled` origin word, so a bucket or an unread origin sends no update.
+The update carries no `id` and lands on whichever subproject the caller belongs
+to at that moment, so the block checks `origin` again on its own re-read, the
+read the write depends on, and refuses there too:
 
 ```bash
 NOTE=$(cat <<'EOF'
@@ -791,14 +834,46 @@ NOTE=$(cat <<'EOF'
 EOF
 )
 AT0='<the value from the AT0= line the read printed>'
+ORIGIN='<the value from the ORIGIN= line the read printed>'
 REMERGED=0
-ARGS="$(python3 -c 'import json,sys; print(json.dumps({"next_steps_note": sys.argv[1]}))' "$NOTE" 2>/dev/null \
-  || python -c 'import json,sys; print(json.dumps({"next_steps_note": sys.argv[1]}))' "$NOTE" 2>/dev/null)"
+case "$ORIGIN" in
+  '"scheduled"'|scheduled) OV=bucket ;;
+  '"operator_prompt"'|'"autonomous"'|'"orphan_continuation"'|'"operator_created"'|'"backfill"'|\
+  operator_prompt|autonomous|orphan_continuation|operator_created|backfill) OV=ok ;;
+  '<the value from the ORIGIN= line the read printed>') OV=placeholder ;;
+  *) OV=unknown ;;
+esac
+if [ "$OV" = bucket ]; then
+  echo "next_steps_note NOT written: subproject_is_a_scheduler_bucket"
+elif [ "$OV" = unknown ]; then
+  echo "next_steps_note NOT written: origin_unknown"
+elif [ "$OV" = placeholder ]; then
+  echo "PLACEHOLDER LEFT IN: paste the read's ORIGIN= line into ORIGIN, then run this block again (nothing was sent)"
+else
+IFAT="$(printf %s "$AT0" | tr -d '"')"; [ "$IFAT" = null ] && IFAT=""
+ARGS="$(python3 -c 'import json,sys; print(json.dumps({"next_steps_note": sys.argv[1], "if_note_at": sys.argv[2]}))' "$NOTE" "$IFAT" 2>/dev/null \
+  || python -c 'import json,sys; print(json.dumps({"next_steps_note": sys.argv[1], "if_note_at": sys.argv[2]}))' "$NOTE" "$IFAT" 2>/dev/null)"
 . <session-workdir>/.claude/skills/coord-revive/_scripts/lib/envelope.sh
 REVIVE=<session-workdir>/.claude/skills/coord-revive/coord-revive.sh; R=$(mktemp -d)
-bash "$REVIVE" call coord_subproject_get '{}' > "$R/p"; echo "re-read door exit: $?"
+bash "$REVIVE" call coord_subproject_get '{}' > "$R/p"; RX=$?; echo "re-read door exit: $RX"
 AT1=$(envelope_mcp_body coord_subproject_get "$R/p" | envelope_require coord_subproject_get subproject.next_steps_note_at -)
-if [ -z "$ARGS" ]; then
+O1=$(envelope_mcp_body coord_subproject_get "$R/p" | envelope_require coord_subproject_get subproject.origin -)
+case "$O1" in
+  '"scheduled"') OV1=bucket ;;
+  '"operator_prompt"'|'"autonomous"'|'"orphan_continuation"'|'"operator_created"'|'"backfill"') OV1=ok ;;
+  *) OV1=unknown ;;
+esac
+if [ "$RX" != 0 ] && grep -q METHOD_NOT_ALLOWED "$R/p" 2>/dev/null; then
+  echo "next_steps_note NOT written: tool not served: METHOD_NOT_ALLOWED"
+elif [ "$RX" = 3 ]; then
+  echo "next_steps_note NOT written: re-read refused (a JSON-RPC error; its code is in the re-read output)"
+elif [ "$RX" != 0 ]; then
+  echo "next_steps_note NOT written: transport: door exit 1 (on the re-read; the exact exit is the line above)"
+elif [ "$OV1" = bucket ]; then
+  echo "next_steps_note NOT written: subproject_is_a_scheduler_bucket (on the re-read)"
+elif [ "$OV1" != ok ]; then
+  echo "next_steps_note NOT written: origin_unknown (on the re-read)"
+elif echo "origin check: ok (read 1 and re-read)" && [ -z "$ARGS" ]; then
   echo "next_steps_note NOT written: no python"
 elif [ -z "$NOTE" ] || [ "$NOTE" = '<the paragraph>' ] || [ "$AT0" = '<the value from the AT0= line the read printed>' ]; then
   echo "PLACEHOLDER LEFT IN: paste the paragraph into NOTE and the read's AT0= line into AT0, then run this block again (nothing was sent)"
@@ -806,9 +881,20 @@ elif [ -n "$AT1" ] && [ "$AT1" != "$AT0" ] && [ "$REMERGED" = 0 ]; then
   echo "NOTE MOVED to $AT1: re-read it, merge it into yours, then run this block once more with AT0='$AT1' and REMERGED=1"
 else
   bash "$REVIVE" call coord_subproject_update "$ARGS" > "$R/u"; WX=$?; echo "write door exit: $WX"
+  if grep -q 'unknown argument .if_note_at\|unknown field .if_note_at' "$R/u" 2>/dev/null; then
+    echo "if_note_at UNKNOWN: this coord predates the precondition; sending without it"
+    ARGS="$(python3 -c 'import json,sys; print(json.dumps({"next_steps_note": sys.argv[1]}))' "$NOTE" 2>/dev/null \
+      || python -c 'import json,sys; print(json.dumps({"next_steps_note": sys.argv[1]}))' "$NOTE" 2>/dev/null)"
+    bash "$REVIVE" call coord_subproject_update "$ARGS" > "$R/u"; WX=$?; echo "write door exit (no precondition): $WX"
+  fi
+  if grep -q note_moved "$R/u" 2>/dev/null; then
+    echo "next_steps_note NOT written: note_moved"
+  fi
   # envelope-ok: the update's answer is not the verdict; the coord_subproject_get read-back below is
   envelope_mcp_body coord_subproject_update "$R/u" > /dev/null; EX=$?; echo "write envelope exit: $EX"
-  if [ "$WX" = 0 ] && [ "$EX" = 0 ]; then
+  if grep -q note_moved "$R/u" 2>/dev/null; then
+    echo "re-read, merge the newer note into yours, then run this block once more with AT0 set to the new next_steps_note_at and REMERGED=1"
+  elif [ "$WX" = 0 ] && [ "$EX" = 0 ]; then
     bash "$REVIVE" call coord_subproject_get '{}' > "$R/g"; echo "read door exit: $?"
     envelope_mcp_body coord_subproject_get "$R/g" > "$R/b"
     envelope_require coord_subproject_get subproject.id "$R/b"
@@ -818,6 +904,7 @@ else
   fi
 fi
 rm -rf "$R"
+fi
 ```
 
 **The runner's proxy may refuse these tools, and for now that is expected.**
@@ -843,6 +930,9 @@ note's text, and never a question mark.
 |---|---|
 | `write door exit: 0`, `write envelope exit: 0` (no UNKNOWN line) and `READ-BACK MATCH`. Natively: the update answered without an error, and the read-back's `subproject.next_steps_note` equals what you sent | `next_steps_note written — subproject <subproject.id>, read back` |
 | `METHOD_NOT_ALLOWED (cause=…)` from the runner's proxy (its `COORD_MCP_PROXY_METHOD_NOT_ALLOWED`, a JSON-RPC `-32601`), or an `unknown tool: <name>` tool error from coord. Natively the tool is then absent from the tool set, and the `call` fallback answers the same | `next_steps_note NOT written: tool not served: METHOD_NOT_ALLOWED`, with `unknown tool` in place of the code when coord itself answered it |
+| `subproject.origin` read `scheduled` (the pre-check after read 1, or the `NOT written` line the write block prints), or the update's answer names `subproject_is_a_scheduler_bucket` (coord's own refusal once it serves one) | `next_steps_note NOT written: subproject_is_a_scheduler_bucket`. Nothing was sent; the remainder goes to the plan's status block or a gate with a continuation (the bucket arm, above) |
+| the update answers `note_moved` (`if_note_at` stale: another closer wrote after the read) | `next_steps_note NOT written: note_moved`, after the one re-read, merge and re-write the step describes. Best-effort: report it and go on |
+| `subproject.origin` absent, unreadable, or not one of the six origin words | `next_steps_note NOT written: origin_unknown` (the write block's re-read arm adds `(on the re-read)`; the bucket row's line may carry it too). Nothing was sent: an unread origin is never taken for "not scheduled" |
 | the answer names `schema_migration_pending` | `next_steps_note NOT written: schema_migration_pending`. coord's subproject tables are not migrated on the serving database yet |
 | the answer names `caller_session_unproven` | `next_steps_note NOT written: caller_session_unproven`. The door carried no verified caller session, and no other agent door writes the note |
 | the answer names any other refusal: this session has no subproject yet (coord may still hold its membership pending), or is not a member of the one named | `next_steps_note NOT written: <coord's code>` |
@@ -854,7 +944,16 @@ When the first read is already refused, or no door carries it, end the step
 with that row's line and send no write: it would be refused for the same
 reason.
 
-**Then re-tag the subproject's topics** (same step, same skip rules). Topics
+**Then re-tag the subproject's topics** (same step, same skip rules). **First:
+proceed only when the note's origin check passed on BOTH its reads (read 1 and
+the re-read the write depends on) with a non-`scheduled` origin word: natively,
+both checks passed; in the bash block, it printed `origin check: ok (read 1 and
+re-read)`. Without that, send nothing here and report `topics re-tag: NOT
+written: <the note's code>`, or `origin_unchecked` when the block printed no
+origin verdict at all. The topics update carries no `id` either, so the topics
+step's own first read is a third check: stop the same way if its `origin` is
+`scheduled` or not an origin word**. A bucket's topics belong to no single piece
+of work, exactly as its note does. Topics
 group subprojects (plan
 `2026-11-16-subproject-topics-agents-and-coord-group-subprojects-into-topics-without-the-operator`,
 D3), and the closing session is the one that knows what its work was about.

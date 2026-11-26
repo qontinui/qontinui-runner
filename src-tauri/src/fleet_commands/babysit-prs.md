@@ -1320,6 +1320,7 @@ and `land_unknown`.
 | `proposal_voided{shadow}`, after `admitted` | A shadow-mode evaluation never served the PR, whatever row it left. The clause says so since its 2026-10-25 amendment (finding `018b7341`, settling the gap filed as `9bce99e6`). Step 6 applies unchanged and in parallel. Ask the door again once the switch is `on` if you still want the expedited path. A re-ask that goes live puts the PR back under the "Still live" row, so do not run Step 6's merge while it is live. |
 | `never`: `requester_unresolved`, `credential_lacks_possession` | Fix the request exactly as `refusal.body` tells you, for example by correcting the session header, and send it again. Do this only where the body says to. A resend with a corrected session id is a new request, not a retry: coord marks the code non-retryable only on the same transport and header. |
 | `never`: `author_unresolved` | Wait for the branch to be bound, as `refusal.body` says, then ask again. |
+| `never`: `author_unbounded` | Coord resolved the PR's author session only through an unknown input: the PR's first observation is not recorded yet, so the attribution is unbounded. Do not take Step 6's direct-merge path as the true author on that basis. Let coord's merge train land the PR, or ask again later once the first observation is recorded (`refusal.body` says the same). |
 | `never`: any other code (`disabled` included), `trigger_side`, `scope` | Not served. Step 6 applies unchanged. |
 | `coord_side`, `github_input` | The door served the PR. Coord retries the pre-admission codes itself, and opens a child request for `proposal_voided{coord_void}` and `proposal_failed{infra}`. Re-read the status, or the child's status, until it ends. |
 | `worker_unavailable` | Re-ask after `retry_after_secs`. |
@@ -1670,6 +1671,16 @@ Then:
    `.github/workflows/require-session-id-trailer.yml` documents the grammar;
    read the target repo's own workflow rather than assuming); do not
    rebase-to-stamp them.
+
+   **Closing a duplicate this session superseded: the order that never fails the gate** (plan `2026-11-21-a-session-that-closes-its-own-superseded-duplicates-cannot-be-finished` Phase 4; it adds no rule, the served `git-operations` clauses `an-adoption-must-re-anchor-the-gates-watching-what-it-supersedes`, `a-landed-adoption-closes-its-predecessor` and `a-predecessor's-gates-include-those-whose-predicate-names-it` already hold it). A `pr_merged` gate on a PR that closes with no land record goes `failed`, and `coord_withdraw_gate` refuses anything that is not `open`, so closing first leaves a gate nothing can clear. Do it in this order, only after the successor has LANDED:
+
+   (a) `coord_declare_supersession` {predecessor_repo, predecessor_pr, successor_repo, successor_pr}. Coord verifies server-side that the successor landed AND that the successor's own title or body references the predecessor; a successor that does not cannot be declared, so reference the predecessor in the successor's body first. Its read-back (`live: true`) is the evidence.
+   (b) On this session's own open `pr_merged` gate for the predecessor: `coord_cancel_continuation` if one is armed, then `coord_withdraw_gate`, and read the gate back (`withdrawn`). Coord's auto gate on every PR is withdrawable by another device in the tenant only through the supersession-discharge arm, which needs step 1's declaration first (cancel its armed continuation before withdrawing). A peer's gate is left to its registrant.
+   (c) Before step (d), read the predecessor's card back (`coord_pr_status`) and wait until its `superseded_by` entry carries a content verdict, or coord retires it through patch-id evidence. Coord records that verdict only in a sweep that probes an OPEN predecessor (30 min rest, doubling to 24 h), so declaring and closing within minutes leaves the PR reading `unknown`, not `retired`. If you must close sooner, expect `unknown` until the next sweep.
+   (d) Only then close the PR. `coord_declare_supersession` says it itself: it does NOT close the predecessor, "closing stays yours, after you move or retire the gates".
+
+   A gate already `failed` is not repaired (it cannot be withdrawn or re-pointed): record its discharge as a finding naming the dead `gate_id`. On a coord carrying the Phase 2 change, a closed superseded PR and its failed gate read `retired` when a landed declared successor's content verdict shows the PR's work carried, or when coord has patch-id land evidence for it; otherwise they keep reading `not_watched` or `unknown`.
+   For an adoption this is the closing half: once the adopting PR has landed, run it for the original PR (the adopting PR's body already references the original through `Adoption-Supersedes:`, which satisfies step 1's reference requirement).
 
 3. **Verify coord ingested the land** — within a few minutes the PR's
    `pr_state` should read `merged` (coord's phantom-open sweep and land-cause
