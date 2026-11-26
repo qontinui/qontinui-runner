@@ -287,7 +287,7 @@ command = [
 # in ci.yml's position (right after its rust-cache restore, before the
 # frontend install). This lane's persistent target dir is the case it exists
 # for: a postgresql_embedded OUT_DIR keeps whatever release was newest when it
-# was first built, even after the pin in src-tauri/.cargo/config.toml changes.
+# was first built, even after the pin in the repo-root .cargo/config.toml changes.
 # The script reads the CARGO_TARGET_DIR the executor exports. Node, not bash:
 # on Windows `bash` resolves to System32's WSL launcher, which sees neither
 # that variable nor the Windows paths.
