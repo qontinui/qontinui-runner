@@ -921,8 +921,7 @@ pub struct TerminalSessionRecord {
     ///
     /// **This is a runner-local ACK flag, not coord's state**: stamped only by
     /// the outbox drain on an observed ack or by the finish heal sweep. `false`
-    /// or absent is NOT evidence coord is unfinished (a heal sweep has flipped
-    /// it false then true with coord finished throughout); coord's row is the
+    /// or absent is NOT evidence coord is unfinished; coord's row is the
     /// authority — read it via `coord.observed` on `GET /sessions/{id}`.
     ///
     /// `false` on a finished record therefore means "coord write still owed".
