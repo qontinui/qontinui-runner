@@ -209,7 +209,7 @@ fn no_bearer_error(reason: BearerReason) -> AppError {
 pub(crate) async fn web_backend_user_bearer_classified(
     auth_manager: &AuthManager,
 ) -> Result<String, BearerReason> {
-    let (bearer, class) = refresh_cognito_bearer(auth_manager).await;
+    let (bearer, class) = refresh_cognito_bearer(auth_manager, false).await;
     bearer_reason_code(bearer.as_deref(), class)
 }
 

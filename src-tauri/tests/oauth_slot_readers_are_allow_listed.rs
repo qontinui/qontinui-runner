@@ -10,7 +10,7 @@
 //! the allow-list that mentions one of the tokens in code fails the test.
 //!
 //! Plan `2026-10-28-one-session-lifecycle-authority`, Phase 16 (b) / R0b-2a.
-//! The operator twin of Phase 16 (c) enters here as one new allow-listed reader.
+//! The operator twin of Phase 16 (c) (`commands/operator_remote_end.rs`) is that one new allow-listed reader.
 //!
 //! Lexical only: whole-word match on non-comment lines. A green run proves no
 //! scanned code line outside the list names the tokens; the printed counts and
@@ -36,6 +36,9 @@ const ALLOWED: &[&str] = &[
     "commands/auth.rs",
     "commands/setup_wizard.rs",
     "commands/new_project.rs",
+    // Phase 16 (c): the operator twin takes the Cognito access token through the
+    // bearer door (and its forced refresh) for its own user-session end only.
+    "commands/operator_remote_end.rs",
     "mcp/device_jwt_refresher.rs",
     "mcp/sdk_client.rs",
     "mcp/relay_routable.rs",

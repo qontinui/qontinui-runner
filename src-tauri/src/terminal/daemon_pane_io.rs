@@ -493,6 +493,9 @@ impl<P: PaneIo> PaneIo for WithNotice<P> {
     fn writer(&self) -> Result<Box<dyn Write + Send>, String> {
         self.inner.writer()
     }
+    fn note_writer(&self, tag: &str) {
+        self.inner.note_writer(tag)
+    }
     fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
         self.inner.resize(cols, rows)
     }

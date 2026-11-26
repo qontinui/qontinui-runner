@@ -508,7 +508,7 @@ export type RemoteSessionEndOutcome =
   | "not_found";
 
 /** Where the grant the end was sent under came from. */
-export type RemoteSessionEndGrantSource = "open_tab" | "minted" | "none";
+export type RemoteSessionEndGrantSource = "open_tab" | "minted" | "none" | "user_session";
 
 /**
  * What `remote_session_end` returns (Rust `RemoteSessionEndResult`, serde

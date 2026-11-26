@@ -91,10 +91,11 @@ mcp/backend_relay.rs | terminal_gone_after_confirm | exempt | closes the coord r
 
 # ── the source side of a relay end (the `remote_terminal_end` frame)
 mcp/remote_terminal.rs | end | helper | client().end(
-commands/remote_end.rs | end_remote_session | helper | end_remote_session(
+commands/remote_end.rs | end_over_device_socket | helper | client().end(
+commands/operator_remote_end.rs | operator_remote_session_end | operator | the operator twin `operator_remote_session_end` (Phase 16 (c)): `RemoteSessionEndFlow` alone calls it; its end goes through the web backend's user-session path under the operator's Cognito token and arrives at the target stamped `origin: user_session`; absent from the invoke allowlist, the tauri proxy list and the observe tier
 commands/remote_end.rs | remote_session_end | webview | the plain `remote_session_end` Tauri command (the single-session end flow and the bulk "Close all finished"); its end arrives at the target as a `relay` end (`handle_terminal_end`), where a graceful end is refused `no_close_authority` on a live claude
 commands/remote_create.rs | terminal_create_remote | webview | the plain `terminal_create_remote` Tauri command: on an attach-stage failure it sends one forced `remote_terminal_end` under the create grant it just spent (`EndGrant::Create`), closing the orphan it spawned; it arrives at the target as a `relay` end (`end_under_create_grant`), refused unless the tombstone binds that terminal and nothing ever attached
-mcp/tauri_proxy.rs | dispatch | agent | POST /ui-bridge/tauri/invoke, which any local process reaches: its `terminal_close` arm (`tm.close`) and its `remote_session_end` arm (`end_remote_session`, force passed through)
+mcp/tauri_proxy.rs | dispatch | agent | POST /ui-bridge/tauri/invoke, which any local process reaches: its `terminal_close` arm (`tm.close`) and its `remote_session_end` arm (`end_remote_session`, door HttpProxy: a graceful end only — `force: true` is refused `force_requires_operator` and nothing is sent)
 
 # ── local closes
 commands/terminal.rs | terminal_close | webview | the plain `terminal_close` Tauri command — every webview close today, gestures included, until R0b-1's `operator_terminal_close` twin splits off the operator's

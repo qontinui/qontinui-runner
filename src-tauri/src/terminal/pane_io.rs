@@ -99,6 +99,15 @@ pub trait PaneIo: Send + Sync {
     /// A writer into the pane's input. Called once per session.
     fn writer(&self) -> Result<Box<dyn Write + Send>, String>;
 
+    /// Name the producer ([`crate::terminal::session::PtyWriteCaller::tag`])
+    /// of the write the session funnel is about to make through this pane's
+    /// writer. Called by `TerminalSession::write` under the writer lock, just
+    /// before the bytes, so the tag is the one of the write that follows. A
+    /// pane that relays input off-box stamps it onto the frame as `writer`
+    /// (plan `2026-10-28-one-session-lifecycle-authority`, Phase 16 (c) step
+    /// 4) — diagnostic only, never authority. Local panes ignore it.
+    fn note_writer(&self, _tag: &str) {}
+
     /// Tell the source its viewport is now `cols` × `rows`.
     fn resize(&self, cols: u16, rows: u16) -> Result<(), String>;
 

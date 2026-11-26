@@ -259,6 +259,11 @@ struct InteractivityState {
     /// ever increments, under this lock, so seq is strictly increasing per
     /// grant (one pane == one grant) whichever writer sends.
     next_seq: u64,
+    /// The [`PtyWriteCaller`](crate::terminal::session::PtyWriteCaller) tag of
+    /// the write in flight (`PaneIo::note_writer`), stamped onto the frame as
+    /// `writer`. Diagnostic only. `None` for a write that did not come through
+    /// the session funnel.
+    writer_tag: Option<String>,
     snapshot: RemoteInteractivity,
 }
 
@@ -357,6 +362,7 @@ impl RemotePaneIo {
             history_start,
             interactivity: Arc::new(Mutex::new(InteractivityState {
                 next_seq: 1,
+                writer_tag: None,
                 snapshot: RemoteInteractivity {
                     attached_at_ms: now_epoch_ms(),
                     last_input_sent: None,
@@ -802,6 +808,23 @@ impl RemotePaneIo {
     }
 }
 
+/// One `remote_terminal_input` frame. `writer` is the producing
+/// `PtyWriteCaller` tag when the write came through the session funnel —
+/// diagnostic only (the draft's writer, metrics), never authority.
+fn input_frame(jti: &str, terminal_id: &str, buf: &[u8], seq: u64, writer: Option<&str>) -> Value {
+    let mut frame = json!({
+        "type": "remote_terminal_input",
+        "grant_jti": jti,
+        "terminal_id": terminal_id,
+        "data": STANDARD.encode(buf),
+        "seq": seq,
+    });
+    if let Some(w) = writer {
+        frame["writer"] = json!(w);
+    }
+    frame
+}
+
 /// `Write` that ships each write as one `remote_terminal_input` frame,
 /// stamped with the pane's next `seq`.
 struct FrameWriter {
@@ -824,15 +847,16 @@ impl Write for FrameWriter {
         let mut g = self.interactivity.lock().unwrap_or_else(|e| e.into_inner());
         let seq = g.next_seq;
         g.next_seq = g.next_seq.saturating_add(1);
-        self.sink
-            .send_frame(json!({
-                "type": "remote_terminal_input",
-                "grant_jti": self.ident.read().unwrap_or_else(|e| e.into_inner()).jti.clone(),
-                "terminal_id": self.terminal_id,
-                "data": STANDARD.encode(buf),
-                "seq": seq,
-            }))
-            .map_err(std::io::Error::other)?;
+        let jti = self
+            .ident
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .jti
+            .clone();
+        let frame = input_frame(&jti, &self.terminal_id, buf, seq, g.writer_tag.as_deref());
+        // One tag per write: a later write that skips the funnel is unstamped.
+        g.writer_tag = None;
+        self.sink.send_frame(frame).map_err(std::io::Error::other)?;
         g.snapshot.last_input_sent = Some(InputSent {
             seq,
             at_ms: now_epoch_ms(),
@@ -847,6 +871,11 @@ impl Write for FrameWriter {
 }
 
 impl PaneIo for RemotePaneIo {
+    fn note_writer(&self, tag: &str) {
+        let mut g = self.interactivity.lock().unwrap_or_else(|e| e.into_inner());
+        g.writer_tag = Some(tag.to_string());
+    }
+
     fn reader(&self) -> Result<Box<dyn Read + Send>, String> {
         self.out.take_reader()
     }
@@ -994,6 +1023,35 @@ pub(crate) mod tests {
         assert_eq!(frames[0]["grant_jti"], "jti-1");
         assert_eq!(frames[0]["terminal_id"], "term-9");
         assert_eq!(frames[0]["data"], STANDARD.encode(b"ls -la\r"));
+    }
+
+    /// Phase 16 (c) step 4: every relayed input frame carries the tag of the
+    /// `PtyWriteCaller` that produced it, one per write; a write that skipped
+    /// the funnel is unstamped.
+    #[test]
+    fn input_frames_are_stamped_with_the_writer_per_caller() {
+        use crate::terminal::session::PtyWriteCaller as C;
+        let sink = Arc::new(RecordingSink::default());
+        let pane = pane(&sink, AttachedRing::default());
+        let mut w = pane.writer().expect("writer");
+        let callers = [
+            C::TauriTerminalWrite,
+            C::TauriInvokeProxy,
+            C::HttpWrite,
+            C::WebSocketInput,
+            C::RemoteTerminalInput,
+        ];
+        for c in &callers {
+            pane.note_writer(&c.tag());
+            w.write_all(b"x").unwrap();
+        }
+        w.write_all(b"y").unwrap(); // no funnel
+        let frames = sink.frames();
+        assert_eq!(frames.len(), callers.len() + 1);
+        for (frame, c) in frames.iter().zip(&callers) {
+            assert_eq!(frame["writer"], c.tag().as_ref());
+        }
+        assert!(frames.last().unwrap().get("writer").is_none());
     }
 
     /// A1: every input frame carries a strictly increasing `seq` — across

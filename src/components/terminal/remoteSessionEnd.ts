@@ -26,3 +26,29 @@ export function remoteSessionEnd(
     tenant,
   });
 }
+
+/**
+ * END a session on another device AS THE OPERATOR (plan
+ * `2026-10-28-one-session-lifecycle-authority`, Phase 16 (c)): the twin that
+ * only `RemoteSessionEndFlow` calls. It goes through the web backend's
+ * user-session path under the operator's own sign-in; a `force` without that
+ * sign-in is refused `operator_sign_in_required`. `terminalId` is the target
+ * terminal the graceful answer reported (the force fallback's address), when
+ * known. The bulk "Close all finished" keeps calling {@link remoteSessionEnd}
+ * with `force: false`.
+ */
+export function operatorRemoteSessionEnd(
+  deviceId: string,
+  sessionId: string,
+  force = false,
+  tenant: string | null = null,
+  terminalId: string | null = null,
+): Promise<RemoteSessionEndResult> {
+  return invoke<RemoteSessionEndResult>("operator_remote_session_end", {
+    deviceId,
+    sessionId,
+    force,
+    tenant,
+    terminalId,
+  });
+}
