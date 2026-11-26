@@ -1005,8 +1005,13 @@ mod tests {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(body["success"], false);
         assert_eq!(body["code"], "INVALID_REQUEST");
-        let suggestions = body["suggestions"].as_array().expect("suggestions array");
-        assert!(!suggestions.is_empty(), "suggestions must not be empty");
+        assert_eq!(body["refusal"]["next_action"]["kind"], "fix_request");
+        assert!(
+            body["refusal"]["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains("Hints: ")),
+            "the type's hints must reach refusal.detail: {body}"
+        );
         let hint = &body["hint"];
         assert!(!hint.is_null(), "hint must carry allowedStatuses");
         let statuses = hint["allowedStatuses"]
@@ -1036,8 +1041,13 @@ mod tests {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(body["success"], false);
         assert_eq!(body["code"], "INVALID_REQUEST");
-        let suggestions = body["suggestions"].as_array().expect("suggestions array");
-        assert!(!suggestions.is_empty(), "suggestions must not be empty");
+        assert_eq!(body["refusal"]["next_action"]["kind"], "fix_request");
+        assert!(
+            body["refusal"]["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains("Hints: ")),
+            "the type's hints must reach refusal.detail: {body}"
+        );
         let hint = &body["hint"];
         assert!(!hint.is_null(), "hint must carry allowedBumpTypes");
         let bump_types = hint["allowedBumpTypes"]

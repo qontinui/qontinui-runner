@@ -130,7 +130,7 @@ pub async fn restart_executor(
                         error_detail: None,
                         hint: None,
                         code: None,
-                        suggestions: None,
+                        refusal: None,
                     }),
                 ));
             }
@@ -222,7 +222,7 @@ pub async fn restart_executor(
                 error_detail: None,
                 hint: None,
                 code: None,
-                suggestions: None,
+                refusal: None,
             }),
         ));
     }
@@ -309,7 +309,7 @@ pub async fn restart_executor(
                     error_detail: None,
                     hint: None,
                     code: None,
-                    suggestions: None,
+                    refusal: None,
                 }),
             ))
         }
