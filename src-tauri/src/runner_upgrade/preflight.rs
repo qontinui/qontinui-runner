@@ -372,14 +372,26 @@ pub fn evaluate(inputs: PreflightInputs<'_>, runner: &dyn CommandRunner) -> Pref
         }
         Ok(open) if open.iter().any(|u| !u.stranded) => Check::fail(
             NO_UPGRADE_IN_FLIGHT,
-            format!(
-                "upgrade(s) {} still open (in flight or probation failed); wait for its guard or probation to conclude",
-                open.iter()
-                    .filter(|u| !u.stranded)
-                    .map(|u| u.id.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
+            {
+                let ids = |stranded: bool| {
+                    open.iter()
+                        .filter(|u| u.stranded == stranded)
+                        .map(|u| if stranded { u.path.display().to_string() } else { u.id.clone() })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                let mut msg = format!(
+                    "upgrade(s) {} still open (in flight or probation failed); wait for its guard or probation to conclude",
+                    ids(false)
+                );
+                if open.iter().any(|u| u.stranded) {
+                    msg.push_str(&format!(
+                        "; also open well past their guard's deadline, to be set by hand: {}",
+                        ids(true)
+                    ));
+                }
+                msg
+            },
         ),
         // Every open record is past its guard's window: no guard will
         // conclude it, so waiting is not an answer. Whether it is safe to
@@ -1658,6 +1670,25 @@ pub(crate) mod tests {
             c.detail
         );
         assert_eq!(r.blocking, vec![names::NO_UPGRADE_IN_FLIGHT]);
+
+        // A fresh record beside a stranded one fails, and names both.
+        let mut i = inputs(&f, Ok(healthy_census()));
+        let mut stale = open(true);
+        stale.path = "/u/20261120T000000.000Z.json".into();
+        i.open_upgrades = Ok(vec![open(false), stale]);
+        let r = evaluate(i, &runner);
+        let c = r
+            .checks
+            .iter()
+            .find(|c| c.name == names::NO_UPGRADE_IN_FLIGHT)
+            .unwrap();
+        assert_eq!(c.verdict, Verdict::Fail);
+        assert!(c.detail.contains("20261124T220000.000Z"), "{}", c.detail);
+        assert!(
+            c.detail.contains("/u/20261120T000000.000Z.json"),
+            "{}",
+            c.detail
+        );
 
         let mut i = inputs(&f, Ok(healthy_census()));
         i.open_upgrades = Err("1 unreadable upgrade record(s)".into());

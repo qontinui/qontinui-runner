@@ -153,8 +153,16 @@ pub fn terminate(pid: u32, grace: Duration) -> Result<(), String> {
     }
     // SAFETY: as above.
     unsafe { libc::kill(p, libc::SIGKILL) };
-    reaped(p);
-    Ok(())
+    // SIGKILL is not instant: confirm the death (and reap our own child)
+    // before the caller acts as if the pid were gone.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        if reaped(p) || !super::sys::pid_alive(pid) {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Err(format!("{pid} is still alive 2 s after SIGKILL"))
 }
 
 /// Reap `pid` if it is this process's child and has exited. `false` for a
@@ -232,8 +240,14 @@ mod tests {
             "terminate waited {:?} on its own exited child",
             started.elapsed()
         );
-        assert!(!super::super::sys::pid_alive(pid));
+        // The pid is reaped and free now; signalling it again could reach an
+        // unrelated process that took the number. A gone pid is tolerated:
+        // one above pid_max can never exist (ESRCH).
         drop(child);
-        assert!(terminate(pid, Duration::from_millis(10)).is_ok());
+        let pid_max: u32 = std::fs::read_to_string("/proc/sys/kernel/pid_max")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(4_194_304);
+        assert!(terminate(pid_max + 1, Duration::from_millis(10)).is_ok());
     }
 }

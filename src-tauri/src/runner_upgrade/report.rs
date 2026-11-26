@@ -165,10 +165,26 @@ pub async fn report_record(path: &Path, rec: &mut UpgradeRecord) {
     }
     match post_outcome(rec).await {
         Ok(()) => {
-            rec.reported_state = Some(rec.state);
-            rec.reported_at = Some(record::rfc3339(chrono::Utc::now()));
-            if let Err(e) = record::write_record(path, rec) {
-                warn!(error = %e, "runner upgrade: reported, but the record could not be marked");
+            // Marked under the record's lock against the record as it now
+            // stands, never by writing this copy back: the POSTs can take
+            // ~20 s, and a guard may have concluded the record meanwhile.
+            let now = chrono::Utc::now();
+            let (p, state) = (path.to_path_buf(), rec.state);
+            match tokio::task::spawn_blocking(move || record::mark_reported(&p, state, now)).await {
+                Ok(Ok(true)) => {
+                    rec.reported_state = Some(rec.state);
+                    rec.reported_at = Some(record::rfc3339(now));
+                }
+                Ok(Ok(false)) => info!(
+                    id = %rec.id,
+                    "runner upgrade: the record moved on while its outcome was reported; its new state is reported in turn"
+                ),
+                Ok(Err(e)) => {
+                    warn!(error = %e, "runner upgrade: reported, but the record could not be marked")
+                }
+                Err(e) => {
+                    warn!(error = %e, "runner upgrade: reported, but the record could not be marked")
+                }
             }
             info!(id = %rec.id, state = rec.state.as_str(), "runner upgrade: outcome reported to coord");
         }
