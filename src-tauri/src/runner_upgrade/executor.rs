@@ -41,12 +41,21 @@ use super::sys::{self, CommandRunner};
 /// predecessor's exit (a self-managed successor waits up to
 /// [`super::cli::PREDECESSOR_WAIT`] for it), the successor's boot
 /// ([`SUCCESSOR_BOOT_ALLOWANCE`]) and probation's own worst case
-/// ([`super::probation::ProbationTiming::worst_case`], 180 s by default),
+/// ([`super::probation::ProbationTiming::worst_case`], 380 s by default),
 /// plus a margin. A shorter window rolls back a healthy but slow successor.
-pub const DEFAULT_GUARD_DELAY: Duration = Duration::from_secs(540);
+pub const DEFAULT_GUARD_DELAY: Duration = Duration::from_secs(720);
 
 /// How long a successor may take from exec to the start of probation.
 pub const SUCCESSOR_BOOT_ALLOWANCE: Duration = Duration::from_secs(120);
+
+/// The shortest guard window under which a healthy successor can still
+/// finish probation: the predecessor's exit, the successor's boot and
+/// probation's worst case, with no margin.
+pub fn min_guard_delay() -> Duration {
+    super::cli::PREDECESSOR_WAIT
+        + SUCCESSOR_BOOT_ALLOWANCE
+        + super::probation::ProbationTiming::default().worst_case()
+}
 
 /// The prefix of the transient guard unit's name.
 pub const GUARD_UNIT_PREFIX: &str = "qontinui-runner-upgrade-guard";
@@ -418,9 +427,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_default_guard_window_outlasts_exit_boot_and_probation() {
-        let needed = crate::runner_upgrade::cli::PREDECESSOR_WAIT
-            + SUCCESSOR_BOOT_ALLOWANCE
-            + crate::runner_upgrade::probation::ProbationTiming::default().worst_case();
+        let needed = min_guard_delay();
         assert!(
             DEFAULT_GUARD_DELAY >= needed + Duration::from_secs(60),
             "guard {DEFAULT_GUARD_DELAY:?} leaves under a minute's margin over {needed:?}"

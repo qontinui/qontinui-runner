@@ -129,7 +129,10 @@ pub fn spawn_successor(
     ))
 }
 
-/// End `pid`: SIGTERM, then SIGKILL once `grace` has passed.
+/// End `pid`: SIGTERM, then SIGKILL once `grace` has passed. When `pid` is
+/// this process's own child (an aborted upgrade's successor or guard) it is
+/// reaped as it exits: an unreaped child stays a zombie that reads as alive,
+/// and the wait would run its whole grace for nothing.
 #[cfg(unix)]
 pub fn terminate(pid: u32, grace: Duration) -> Result<(), String> {
     let p = i32::try_from(pid).map_err(|_| format!("pid {pid} out of range"))?;
@@ -143,14 +146,24 @@ pub fn terminate(pid: u32, grace: Duration) -> Result<(), String> {
     }
     let deadline = std::time::Instant::now() + grace;
     while std::time::Instant::now() < deadline {
-        if !super::sys::pid_alive(pid) {
+        if reaped(p) || !super::sys::pid_alive(pid) {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(200));
     }
     // SAFETY: as above.
     unsafe { libc::kill(p, libc::SIGKILL) };
+    reaped(p);
     Ok(())
+}
+
+/// Reap `pid` if it is this process's child and has exited. `false` for a
+/// running child and for any pid that is not our child (`ECHILD`).
+#[cfg(unix)]
+fn reaped(pid: i32) -> bool {
+    let mut status = 0;
+    // SAFETY: a non-blocking wait on one pid; `status` outlives the call.
+    unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) == pid }
 }
 
 #[cfg(not(unix))]
@@ -210,10 +223,17 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = child.id();
-        terminate(pid, Duration::from_secs(1)).unwrap();
-        let mut child = child;
-        let status = child.wait().unwrap();
-        assert!(!status.success());
+        // Our own child: reaped as it exits, so the call returns well inside
+        // its grace instead of waiting it out on a zombie.
+        let started = std::time::Instant::now();
+        terminate(pid, Duration::from_secs(10)).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "terminate waited {:?} on its own exited child",
+            started.elapsed()
+        );
+        assert!(!super::super::sys::pid_alive(pid));
+        drop(child);
         assert!(terminate(pid, Duration::from_millis(10)).is_ok());
     }
 }

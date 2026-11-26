@@ -69,9 +69,10 @@ struct UpgradeBody {
     guard_delay_secs: Option<u64>,
 }
 
-/// The bounds on a requested guard delay: long enough for a boot and its
-/// probation, short enough that a dead successor is not left serving nothing.
-const GUARD_DELAY_MIN: u64 = 30;
+/// The bounds on a requested guard delay. The floor is the time a healthy
+/// successor may need to finish probation ([`executor::min_guard_delay`]), so
+/// no request can pick a window that rolls a healthy upgrade back; the cap
+/// keeps a dead successor from being left serving nothing for long.
 const GUARD_DELAY_MAX: u64 = 1800;
 
 fn refusal(
@@ -144,10 +145,11 @@ async fn post_upgrade(
     let delay = req
         .guard_delay_secs
         .unwrap_or(executor::DEFAULT_GUARD_DELAY.as_secs());
-    if !(GUARD_DELAY_MIN..=GUARD_DELAY_MAX).contains(&delay) {
+    let guard_delay_min = executor::min_guard_delay().as_secs();
+    if !(guard_delay_min..=GUARD_DELAY_MAX).contains(&delay) {
         return Err(refusal(
             StatusCode::BAD_REQUEST,
-            format!("guardDelaySecs must be {GUARD_DELAY_MIN}..={GUARD_DELAY_MAX}"),
+            format!("guardDelaySecs must be {guard_delay_min}..={GUARD_DELAY_MAX}"),
             None,
         ));
     }
@@ -318,7 +320,7 @@ pub async fn gather(
     let systemd_unit = sys::own_systemd_user_unit();
     let self_managed_fds = super::listener_fds::registered().len();
     let checked_at = super::record::rfc3339(chrono::Utc::now());
-    let open_upgrades = super::record::open_upgrade_ids(&sys::upgrades_dir());
+    let open_upgrades = super::record::open_upgrades(&sys::upgrades_dir(), chrono::Utc::now());
     tokio::task::spawn_blocking(move || {
         preflight::evaluate(
             PreflightInputs {
@@ -345,7 +347,7 @@ pub async fn gather(
 /// This runner's own `/health` body, over loopback.
 pub async fn read_own_health(port: u16) -> Result<Value, String> {
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
+        .timeout(super::probation::HEALTH_READ_TIMEOUT)
         .no_proxy()
         .build()
         .map_err(|e| e.to_string())?;
@@ -431,14 +433,19 @@ impl UpgradeEffects for LiveUpgradeEffects {
                                 std::thread::sleep(EXIT_ESCALATE_AFTER);
                                 warn!(
                                     after_secs = EXIT_ESCALATE_AFTER.as_secs(),
-                                    "runner upgrade: the handoff close has not ended this process; forcing it"
+                                    "runner upgrade: the handoff close has not ended this process; requesting a forced close"
                                 );
-                                crate::mcp::ai_session::emergency_quit::request_force_close(
+                                let forced = crate::mcp::ai_session::emergency_quit::request_force_close(
                                     app,
                                     app_state,
                                     format!("{reason} (the window close did not exit)"),
                                     mode,
                                 );
+                                if forced {
+                                    warn!("runner upgrade: forced close started; its own budget ends the process");
+                                } else {
+                                    warn!("runner upgrade: no forced close started — a teardown already holds the latch, and its own watchdog bounds it");
+                                }
                             }
                             Err(e) => {
                                 drop(armed);
