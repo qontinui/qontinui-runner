@@ -211,8 +211,11 @@ impl BindGate {
 
 /// The transcript-sync refusal last REPORTED for each session. A closed gate
 /// is read again every [`ATTEMPT_WINDOW`], so without this a standing refusal
-/// would log the same INFO line for as long as the switch stays off. A bind
-/// forgets the session, so a later refusal is reported afresh.
+/// would log the same INFO line for as long as the switch stays off. An
+/// attempt that reads the gate OPEN forgets the session, whatever it then
+/// does, so a refusal after that is reported afresh. (A key bound through
+/// another door and later unbound keeps its entry until an attempt here reads
+/// the gate open; its next refusal is then logged at DEBUG.)
 static REFUSALS: Mutex<Option<HashMap<String, BindGate>>> = Mutex::new(None);
 
 /// Record `gate` as `key`'s standing refusal. `true` when it is NEW for `key`
@@ -286,6 +289,9 @@ pub(crate) fn apply_decision(
     decision: &Decision,
     gate: BindGate,
 ) -> Option<AutoBindKind> {
+    if gate.is_open() {
+        forget_refusal(&identity.claude_session_id);
+    }
     let adopt = match decision {
         Decision::Adopt(id) | Decision::AdoptLivePane { row: id, .. } => Some(*id),
         Decision::Mint(_) => None,
@@ -317,11 +323,7 @@ pub(crate) fn apply_decision(
     } else {
         AutoBindKind::Adopted
     };
-    let outcome = tailer.bind_and_replay(&identity.claude_session_id, path, req, gate.is_open());
-    if matches!(outcome, Ok(_) | Err(BindRefusal::Unreadable(_))) {
-        forget_refusal(&identity.claude_session_id);
-    }
-    match outcome {
+    match tailer.bind_and_replay(&identity.claude_session_id, path, req, gate.is_open()) {
         Ok(o) if o.already_bound => None,
         Ok(o) => {
             info!(
@@ -882,7 +884,9 @@ mod tests {
     #[tokio::test]
     async fn a_mint_registers_no_row_unless_the_minting_tenants_switch_is_on() {
         use crate::egress::test_support::pin_for;
-        use crate::egress::{Flow, Level, SessionScope, TranscriptGate};
+        use crate::egress::{
+            permit_session, Flow, Level, LevelSource, SessionScope, TranscriptGate,
+        };
         let started = |outbox: &OutboxWriter| {
             outbox
                 .pending()
@@ -901,26 +905,25 @@ mod tests {
             let csid = Uuid::new_v4().to_string();
             let path = transcript(dir.path(), &csid, "{\"type\":\"user\"}\n");
             let id = identity_from_path(&path).unwrap();
-            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            // `register_inner` is gated on an env var other suites toggle:
-            // retry the whole bind, as `apply_retrying` does.
-            let mut decision = None;
-            for _ in 0..100 {
-                decision = Some(
-                    bind_one_with(
-                        &t,
-                        id.clone(),
-                        &path,
-                        counting_resolver(calls.clone(), RowResolution::Unknown, || {}),
-                    )
-                    .await,
-                );
-                if level != Some(Level::On) || registrar.session_id_for(&csid).is_some() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+            // `register_inner` reads this variable, and every suite that sets it
+            // does so under the env lock `amb` now holds, so clearing it once
+            // (the fixture restores it) makes registration deterministic here.
+            std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+            let expected_source =
+                permit_session(Flow::TranscriptSync, SessionScope::Tenant(tenant)).source;
+            match level {
+                None => assert_eq!(expected_source, LevelSource::Unknown, "unpinned is UNKNOWN"),
+                Some(_) => assert_ne!(expected_source, LevelSource::Unknown, "{level:?} is pinned"),
             }
-            assert_eq!(decision, Some(Decision::Mint(tenant)), "{level:?}");
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let decision = bind_one_with(
+                &t,
+                id,
+                &path,
+                counting_resolver(calls, RowResolution::Unknown, || {}),
+            )
+            .await;
+            assert_eq!(decision, Decision::Mint(tenant), "{level:?}");
             if level == Some(Level::On) {
                 assert!(registrar.session_id_for(&csid).is_some(), "minted");
                 let rows = started(outbox.as_ref());
@@ -941,16 +944,23 @@ mod tests {
                 let refusal = standing_refusal(&csid).expect("the transcript gate refused it");
                 assert_eq!(refusal.gate, TranscriptGate::TenantSwitchOff, "{level:?}");
                 assert_eq!(refusal.scope, SessionScope::Tenant(tenant), "{level:?}");
+                assert_eq!(refusal.source, expected_source, "{level:?}");
             }
         }
     }
 
     /// A standing refusal is reported once: the same gate again is not new,
-    /// a different one is, and a bind forgets the session.
+    /// a different one is, and an attempt that reads the gate OPEN forgets
+    /// the session even when it binds nothing (here a coord-dark `Defer`), so
+    /// an on-then-off flip is reported afresh.
     #[test]
     fn a_standing_refusal_is_new_only_when_it_changes() {
         use crate::egress::{LevelSource, SessionScope, TranscriptGate};
+        let dir = tempfile::tempdir().unwrap();
+        let (t, _registrar, _outbox) = tailer(dir.path());
         let key = Uuid::new_v4().to_string();
+        let path = transcript(dir.path(), &key, "{\"type\":\"user\"}\n");
+        let id = identity_from_path(&path).unwrap();
         let off = BindGate {
             gate: TranscriptGate::TenantSwitchOff,
             scope: SessionScope::Unresolved,
@@ -963,9 +973,15 @@ mod tests {
             ..off
         };
         assert!(note_refusal(&key, other), "a different scope is new");
-        forget_refusal(&key);
-        assert_eq!(standing_refusal(&key), None);
-        assert!(note_refusal(&key, other), "reported afresh after a bind");
+        assert_eq!(
+            apply_decision(&t, &id, &path, &Decision::Defer("coord dark".into()), OPEN),
+            Some(AutoBindKind::Deferred)
+        );
+        assert_eq!(standing_refusal(&key), None, "the open gate forgot it");
+        assert!(
+            note_refusal(&key, other),
+            "reported afresh after the gate opened"
+        );
         forget_refusal(&key);
     }
 
