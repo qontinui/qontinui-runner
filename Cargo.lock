@@ -6606,7 +6606,7 @@ dependencies = [
 
 [[package]]
 name = "qontinui-runner"
-version = "1.0.12"
+version = "1.0.13"
 dependencies = [
  "adb_client",
  "aes-gcm",
