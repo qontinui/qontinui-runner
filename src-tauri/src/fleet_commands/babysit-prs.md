@@ -139,7 +139,7 @@ session's diff (send it to Step 3), and a textual conflict — `coord_pr_status`
 reads `rebase_block_disposition: author_acts` — which coord will not propose, so
 rebase and push once [policy: a-textual-conflict-is-owed-not-watched]. Every
 other head shape exits now (operator decision 2026-10-17, tightening [policy:
-pr-session-finished-when-prs-initially-green]: checks still running on the last
+pr-session-finished-at-push-closed-at-first-verdict]: checks still running on the last
 push no longer hold the session open):
 
 - Checks still `pending` — `pr-checks.sh` reports `queued` and `in_progress`
@@ -1629,6 +1629,17 @@ Then:
    `coord_adopt_pr` claim (no `pushed_head`, since you never push to the
    original) once your new PR reads back, together with the `adopt-wip:` release
    above. The two locks answer different questions, and an adoption holds both.
+   **Record the supersession once your new PR reads back.** Call
+   `coord_declare_supersession` for each original PR you adopted, naming the
+   original as predecessor and your new PR as successor (same repo), and read
+   `superseded_by_status` back off the original's `coord_pr_status` card. A
+   closed original with no recorded declaration reads `not_watched` in
+   `coord_session_obligations`, which keeps its authoring session from
+   passing `/finish-session` step 0.6 even after your PR lands. A recorded
+   declaration whose same-repo successor landed reads `landed`. The
+   `Adoption-Supersedes:` line in the PR body is disclosure, not a
+   declaration, and coord does not read it. (Plan
+   `2026-11-21-session-obligations-honor-a-landed-supersession-successor`.)
    The clause's bound is the original branch: never rebase it, never
    force-push it, never push to it at all. Take its content onto a fresh
    branch off current `origin/main` (cherry-pick or re-apply in a worktree —
