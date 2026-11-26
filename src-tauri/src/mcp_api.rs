@@ -2736,6 +2736,15 @@ async fn health(
         // the deferral stamp the pre-check would write. Read through the same
         // `resource_guard::lane_verdicts` the gate uses. There is no count cap.
         "spawnAdmission": crate::agent_runtime::spawn_admission_health_json(),
+        // Plan 2026-10-19-fleet-is-blind-to-kernel-object-leaks-and-os-process-
+        // creation-latency, Phase 4: kernel pool, kernel Token/Process objects,
+        // handles, live processes, boot instant, the top pool tags and the OS
+        // spawn-probe latency, as the `os-health` thread last read them. Served
+        // on EVERY instance (a temp runner included), read from the cell and
+        // never blocking on a fresh read. `readings: null` before the first
+        // tick is UNKNOWN, never healthy; a `null` reading named in
+        // `notApplicable` does not exist on this OS. Phase 5 adds `verdict`.
+        "osHealth": crate::os_health::health_json(),
         // Same plan, Phase 0: the transcript-tail population — live, parked,
         // started/ended since boot, and the last cohort wake (>25 tails woken
         // inside 250 ms), which is the log line Evidence 5 of that plan was
@@ -2776,6 +2785,12 @@ async fn health(
         // For "is this runner out of date", use `buildDrift` below — it is
         // the only field here that can change while the window is open.
         "buildId": env!("RUNNER_BUILD_ID"),
+        // The vision frame sources this BINARY can acquire pixels from, from
+        // the one const beside the resolver. `websocket_relay` means
+        // `/ui-bridge/vision/*` captures a WebSocket-transport app over its
+        // socket; a build that predates that arm serves no field at all (plan
+        // 2026-11-21-vision-capture-cannot-frame-a-websocket-transport-app, D5).
+        "visionFrameSources": crate::mcp::ui_bridge::vision_frame_source::VISION_FRAME_SOURCES,
         // Which cargo profile DIRECTORY this binary was built into (`debug`,
         // `release-checked`, …), read from the build's own `OUT_DIR`; `null`
         // when unmeasured, never a defaulted `"debug"`. The opt-level and the
@@ -3009,6 +3024,8 @@ async fn health(
         // the response root without descending into `data`. Same provenance
         // semantics — and same non-semantics — as `data.buildId` above.
         "buildId": env!("RUNNER_BUILD_ID"),
+        // Top-level mirror of `data.visionFrameSources`, for the same consumers.
+        "visionFrameSources": crate::mcp::ui_bridge::vision_frame_source::VISION_FRAME_SOURCES,
         // Top-level mirror of `data.buildProfile`, for the same consumers.
         "buildProfile": qontinui_runner_lib::build_provenance::build_profile_json(),
         // Top-level mirror of `data.provenance`, for the same consumers.
@@ -6204,6 +6221,36 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// an anonymously minted bootstrap credential on its own side. Forwarding it
 /// ahead of the coord half landing is harmless (coord answers an unknown tool).
 ///
+/// `coord_publish_prompt_document` and `coord_adopt_upstream_prompt_document`
+/// (plan `2026-11-23-agents-can-publish-a-prompt-document-and-adopt-an-equal-upstream-copy`
+/// Phase 3) are the MCP halves of two AGENT doors on coord,
+/// `POST /coord/agent-prompt-documents/:kind/:name/publish` and
+/// `POST /coord/agent-prompt-documents/:kind/:name/upstream-adopt` — the agent
+/// twins of the operator's `POST /coord/prompt-documents/:kind/:name/publish`
+/// and `.../upstream-adopt`. The coord half is the same plan's Phases 1-2, a
+/// separate qontinui-coord change; as of coord `origin/main` `499c2440b` (read
+/// 2026-11-23) neither tool exists there, and until that change deploys coord
+/// answers both as unknown tools, so forwarding them early is harmless. As
+/// that change is written it grants both on coord's `DEVICE_DEFAULT_TOOLS` and
+/// lists both on its `BOOTSTRAP_DENIED_TOOLS`; re-verify against coord
+/// `origin/main` when editing this paragraph.
+///
+/// Both WRITE, and the proxy's operation classifier
+/// (`session::coord_transport_rung::operation_for_call`) already answers WRITE
+/// for an unlisted tool. What a leaked proxy nonce reaches through them is the
+/// grant of the principal the nonce is bound to (the device's credential, or a
+/// bound agent's own JWT), narrowed by coord. As that change is written, the
+/// publish answers only the system tenant and refuses, among others, a stale
+/// `expected_version`, a `deny` tier, a refusing `policy_write` dial, a `never`
+/// mode, a held body without the exact acknowledged token set, and any call
+/// without a `notification_ref`; a publish it accepts reaches every tenant
+/// through coord's fan-out. The adopt takes only the latest publication into a
+/// copy whose body is already byte-identical to it. Neither is undone by a
+/// withdraw: a publication is immutable (coord has deliberately no withdraw
+/// route) and is corrected by publishing again; an adopt is one version
+/// snapshot, restorable from the document's history. A box rebuilt from a sha
+/// containing these entries forwards both the moment coord deploys.
+///
 /// **Landed is not delivered** (plan `2026-09-03-coord-mcp-403-names-its-own-cause`
 /// Phase 3). This list is compiled into the binary, so a PR that edits it is
 /// NOT in effect on any box until that box rebuilds from a sha containing the
@@ -6221,6 +6268,9 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_ack_message",
     "coord_adopt_pr",
+    // Plan 2026-11-23-agents-can-publish-a-prompt-document-and-adopt-an-equal-upstream-copy
+    // Phase 3: the agent upstream-adopt (identical body, latest publication only).
+    "coord_adopt_upstream_prompt_document",
     "coord_agent_registry_effective",
     "coord_alert_claim",
     "coord_alert_queue",
@@ -6392,6 +6442,9 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     // 2026-09-20-what-is-the-state-of-my-projects-and-what-needs-me-is-answerable-from-one-screen,
     // Phase 3) — read-only; without it a runner-proxied session is refused it.
     "coord_project_state",
+    // Plan 2026-11-23-agents-can-publish-a-prompt-document-and-adopt-an-equal-upstream-copy
+    // Phase 3: the agent publish of a system-tenant prompt document.
+    "coord_publish_prompt_document",
     // Plan 2026-09-20-trust-calibration-and-independent-verification-coverage-are-measured-continuously
     // Phase 4: the post-land re-verification lane's three coord tools. This one
     // is also covered by the `coord_query_` read-family prefix; it is named here
@@ -6474,6 +6527,15 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     // release / reclaim.
     "coord_unbind_repo_tenant",
     "coord_unmute_gate",
+    // Plan 2026-10-09-coord-knows-which-box-holds-which-credential Phase 3: the
+    // credential-probe catalogue AGENT write (twin `PUT
+    // /coord/agent-credential-probe-specs`, qontinui-coord#4484). coord's
+    // `agent_tool_access::DEVICE_DEFAULT_TOOLS` grants it; the handler's
+    // `credential_probes::authorize_agent_writer` (possession + tenant-admin
+    // user) is the authorization. This list only forwards. Without it, this
+    // proxy refused the seed the door exists for (coord-revive.sh read it as
+    // METHOD_NOT_ALLOWED cause=drift), forcing the HTTP twin.
+    "coord_upsert_credential_probe_spec",
     // Plan 2026-09-20-trust-calibration-… Phase 4: the lane's queue read.
     "coord_verification_queue",
     "coord_watch_verdict",
@@ -14050,6 +14112,7 @@ pub fn create_router(
         .merge(crate::mcp::auto_continue::routes())
         .merge(crate::mcp::backup_restore::routes())
         .merge(crate::mcp::playwright_collection::routes())
+        .merge(crate::mcp::model_gateway_read::routes())
         .merge(crate::mcp::models::routes())
         .merge(crate::mcp::monitors::routes())
         .merge(crate::mcp::orchestration_loop_api::routes())
@@ -14089,6 +14152,10 @@ pub fn create_router(
         .merge(crate::mcp::task_runs::routes())
         .merge(crate::mcp::tenant::routes())
         .merge(crate::mcp::terminals::routes())
+        // `GET /terminal-layout` — kept out of `terminals::routes()` because
+        // it is relayed (as a read only) and every route there is refused
+        // over the relay by construction; see the module docs.
+        .merge(crate::mcp::terminal_layout::routes())
         .merge(crate::mcp::steward::routes())
         .merge(crate::mcp::testing::routes())
         .merge(crate::mcp::triggers::routes())
@@ -17714,6 +17781,37 @@ mod coord_mcp_body_gate_tests {
         assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
     }
 
+    /// Plan `2026-10-09-coord-knows-which-box-holds-which-credential` Phase 3:
+    /// the catalogue's agent WRITE forwards too, in sorted position, so a
+    /// proxied session can seed a spec instead of falling back to the HTTP twin.
+    #[test]
+    fn coord_upsert_credential_probe_spec_is_allowed_and_parses_from_source() {
+        assert!(coord_mcp_tool_is_allowed(
+            "coord_upsert_credential_probe_spec"
+        ));
+        assert!(
+            COORD_MCP_ALLOWED_TOOLS
+                .binary_search(&"coord_upsert_credential_probe_spec")
+                .is_ok(),
+            "membership is a binary_search, so the entry must sit in sorted position"
+        );
+        assert!(
+            !COORD_MCP_DELIBERATE_EXCLUSIONS.contains(&"coord_upsert_credential_probe_spec"),
+            "a tool cannot be both forwarded and deliberately excluded"
+        );
+        let parsed = working_tree_tool_policy();
+        assert_eq!(
+            parsed
+                .allowed
+                .iter()
+                .filter(|t| t.as_str() == "coord_upsert_credential_probe_spec")
+                .count(),
+            1,
+            "the parser must read the entry exactly once: {:?}",
+            parsed.allowed
+        );
+    }
+
     /// Plan `2026-11-02-publishing-state-is-unreadable-to-agents-and-to-anchors`
     /// Phase 1: coord#4238 put `coord_auto_publish_status` on coord's device
     /// floor; without this entry every runner-proxied session got `-32601`.
@@ -17737,6 +17835,43 @@ mod coord_mcp_body_gate_tests {
             "the parser must read the entry exactly once: {:?}",
             parsed.allowed
         );
+        assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
+    }
+
+    /// Plan `2026-11-23-agents-can-publish-a-prompt-document-and-adopt-an-equal-upstream-copy`
+    /// Phase 3: the coord half of the same plan (not yet on coord main) grants
+    /// the agent publish and upstream-adopt tools on its device floor; without
+    /// these entries every runner-proxied session would get `-32601` for them.
+    /// Both are writes, and the proxy's classifier must say so (pinned below
+    /// through `operation_for_call`). Sorted ORDER is `allowlist_tables_are_sorted`'s
+    /// to pin: a `binary_search` over an unsorted slice is unspecified, so no
+    /// per-name assertion here can be relied on to catch a mis-sort.
+    #[test]
+    fn agent_publish_and_adopt_tools_are_allowed_and_parse_from_source() {
+        let parsed = working_tree_tool_policy();
+        for tool in [
+            "coord_publish_prompt_document",
+            "coord_adopt_upstream_prompt_document",
+        ] {
+            // Present at all (a linear scan, so a removed name is named as
+            // missing), then forwarded by the proxy's own membership check.
+            assert!(
+                COORD_MCP_ALLOWED_TOOLS.contains(&tool),
+                "{tool} is missing from COORD_MCP_ALLOWED_TOOLS"
+            );
+            assert!(coord_mcp_tool_is_allowed(tool), "{tool} must be forwarded");
+            assert_eq!(
+                crate::session::coord_transport_rung::operation_for_call("tools/call", Some(tool)),
+                crate::session::coord_transport_rung::OPERATION_WRITE,
+                "{tool} is a write and the proxy must classify it as one"
+            );
+            assert_eq!(
+                parsed.allowed.iter().filter(|t| t.as_str() == tool).count(),
+                1,
+                "the parser must read {tool} exactly once: {:?}",
+                parsed.allowed
+            );
+        }
         assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
     }
 
@@ -21351,6 +21486,25 @@ mod coord_provision_session_gate_tests {
         );
     }
 
+    /// Plan `2026-11-21-vision-capture-cannot-frame-a-websocket-transport-app`
+    /// Phase 1 (D5): `/health` carries `visionFrameSources` TWICE — under
+    /// `data` beside `buildId`, and at the root beside its mirror — both from
+    /// the frame-source module's one const, which names `websocket_relay`.
+    #[test]
+    fn the_health_handler_emits_vision_frame_sources_in_data_and_at_the_root() {
+        let region = crate::mcp_api::mcp_api_item_source("async fn health(")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let emit = "\"visionFrameSources\": crate::mcp::ui_bridge::vision_frame_source::VISION_FRAME_SOURCES";
+        assert_eq!(region.matches(emit).count(), 2, "{region}");
+        assert!(
+            crate::mcp::ui_bridge::vision_frame_source::VISION_FRAME_SOURCES
+                .contains(&"websocket_relay")
+        );
+    }
+
     /// Plan `2026-11-12-transcript-autobind-adopts-a-previous-boot-row-that-a-live-pane-has-replaced`
     /// Phase 1 (taken from qontinui-runner#2711): `/health` serves the
     /// finish-time repair count (same source-scan technique as the tests
@@ -21444,6 +21598,12 @@ mod coord_provision_session_gate_tests {
             region.contains(
                 "\"threadCeilings\": crate::resource_guard::thread_ceilings_health_json()"
             ),
+            "{region}"
+        );
+        // Plan 2026-10-19-fleet-is-blind-to-kernel-object-leaks-and-os-process-
+        // creation-latency, Phase 4: the os-health readings, from the cell.
+        assert!(
+            region.contains("\"osHealth\": crate::os_health::health_json()"),
             "{region}"
         );
     }
@@ -23601,6 +23761,678 @@ mod supervised_workers_health_tests {
             "create_router must not run a re-check pass outside the supervised loop"
         );
     }
+
+    /// Where a census row's needle sits in `create_router`.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Site {
+        /// The needle keys an inline spawn site (`tokio::spawn(` or a runtime
+        /// handle's `.spawn(`): it lies inside that spawn's body, and every
+        /// spawn site holds exactly one such needle.
+        Spawn,
+        /// The needle is a starter CALL (`::spawn_*(`, `::start_*(`,
+        /// `.spawn_*(`, `.start_*(`) whose task is started by the callee.
+        Call,
+    }
+
+    /// A census spawn site: `::spawn(` / `.spawn(` (tokio, `std::thread`, a
+    /// runtime `Handle`) or a word-boundary bare `spawn(` (a `use`-imported
+    /// spawn). `spawn_blocking(` and other `spawn_*(` starters do not match.
+    fn is_spawn_site(line: &str) -> bool {
+        line.contains("::spawn(")
+            || line.contains(".spawn(")
+            || line.match_indices("spawn(").any(|(at, _)| {
+                !line
+                    .get(..at)
+                    .unwrap_or_default()
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':' || c == '.')
+            })
+    }
+
+    /// The body of the first `fn <name>(` item in `text`, at any indent (an
+    /// item in an inline module is indented): from its declaration line to
+    /// the first later line that is `}` at the declaration's indent. Comment
+    /// lines are dropped.
+    fn fn_item_body(text: &str, name: &str) -> Option<String> {
+        let lines: Vec<&str> = text.lines().collect();
+        let decl = format!("fn {name}(");
+        let start = lines.iter().position(|l| {
+            let t = l.trim_start();
+            let t = t
+                .strip_prefix("pub(crate) ")
+                .or(t.strip_prefix("pub "))
+                .unwrap_or(t);
+            let t = t.strip_prefix("async ").unwrap_or(t);
+            t.starts_with(&decl)
+        })?;
+        let indent: String = lines[start]
+            .chars()
+            .take_while(|c| c.is_whitespace())
+            .collect();
+        let close = format!("{indent}}}");
+        let len = lines[start..].iter().position(|l| *l == close)?;
+        Some(
+            lines[start..=start + len]
+                .iter()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .copied()
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    }
+
+    /// The census of every task `create_router` starts (plan
+    /// `2026-11-12-runner-create-router-starts-six-long-lived-loops-unsupervised`
+    /// Phase 0). Plan `2026-09-03-coord-row-get-panic-class-closed-by-lint-and-supervisor`
+    /// supervised the loops `main.rs` starts and never counted these, so a
+    /// panic ended them silently while `/health` read them as never started.
+    ///
+    /// Closed tables, every row a needle with a reason: `SUPERVISED` (under
+    /// `worker_supervisor`, listed on `/health`), `TASK_SUPERVISED` (under
+    /// `mcp::task_supervisor`), `ONE_SHOT`, `PER_EVENT` and `DEFERRED` (a
+    /// long-lived loop still on a bare spawn). A later phase that supervises a
+    /// loop moves its row from `DEFERRED` to `SUPERVISED` — an inline row's
+    /// needle then becomes the `::spawn_<role>(` call that replaced the body.
+    ///
+    /// Closure: every spawn site in the region (`::spawn(` / `.spawn(` / a
+    /// word-boundary bare `spawn(` — `tokio::spawn`, `std::thread::spawn`, a
+    /// runtime `Handle`'s spawn, or a `use`-imported one) holds exactly one
+    /// `Site::Spawn` needle; every `::spawn_*(` / `::start_*(` / `.spawn_*(` /
+    /// `.start_*(` / `.start(` / `::start(` call (and an unqualified
+    /// `spawn_*(` / `start_*(`) is covered by as many rows as it has
+    /// occurrences; every needle is found exactly once (a moved or renamed
+    /// region goes red instead of passing with nothing counted); registry names
+    /// are unique.
+    ///
+    /// The census boundary — what this test does NOT see:
+    /// - a starter named some other way (not `spawn` / `start` / `spawn_*` /
+    ///   `start_*`, qualified or bare, and not a spawn written inline in the
+    ///   region);
+    /// - tasks a callee starts beneath a classified row:
+    ///   `WrapperState::new_default`'s `spawn_health_loop` / `spawn_idle_reaper`
+    ///   (`wrappers/manager.rs`), the trigger service's nested bridge loop
+    ///   (`trigger_system/service.rs`), and the browse `std::thread` that
+    ///   `MdnsScanner::start` (`mcp/discovery/mdns_scanner.rs`) spawns — that
+    ///   call itself IS counted, as the DEFERRED `mdns_scanner.browse_thread`
+    ///   row;
+    /// - the loops `main.rs` starts, classified by `worker_supervisor`'s own
+    ///   `every_phase4_entry_point_is_classified` (its DEFERRED set).
+    ///
+    /// When plan
+    /// `2026-10-04-runner-mcp-api-rs-holds-the-http-composition-root-health-and-five-proxies-in-one-file`
+    /// Phase 7b moves the boot spawns into `router/boot_tasks.rs`, this census
+    /// moves with them and reads `boot_tasks::spawn_all` instead.
+    #[test]
+    fn every_create_router_boot_task_is_classified() {
+        const PHASE1_2: &str = "migration target of plan \
+            2026-11-12-runner-create-router-starts-six-long-lived-loops-unsupervised Phase 1/2";
+
+        // (site, needle in create_router, file under src/, entry fn signature
+        // at column 0, worker_supervisor registry name).
+        const SUPERVISED: &[(Site, &str, &str, &str, &str)] = &[(
+            Site::Call,
+            "crate::mcp::sdk_client::spawn_stored_bearer_recheck(",
+            "mcp/sdk_client.rs",
+            "pub fn spawn_stored_bearer_recheck(",
+            "sdk_client.stored_bearer_recheck",
+        )];
+        // (site, needle, reason).
+        const TASK_SUPERVISED_REASON: &str =
+            "under mcp::task_supervisor — restarts on panic or return, no /health registry";
+        const TASK_SUPERVISED: &[(Site, &str, &str)] = &[
+            (
+                Site::Spawn,
+                "crate::mcp::backend_relay::commands::auto_start_cloud_relay(",
+                TASK_SUPERVISED_REASON,
+            ),
+            (
+                Site::Spawn,
+                "crate::mcp::device_jwt_refresher::commands::auto_start_device_jwt_refresher(",
+                TASK_SUPERVISED_REASON,
+            ),
+            (
+                Site::Spawn,
+                "crate::mcp::fleet_policy_poller::commands::auto_start_fleet_policy_poller(",
+                TASK_SUPERVISED_REASON,
+            ),
+            (
+                Site::Spawn,
+                "crate::mcp::session_message_poller::commands::auto_start_session_message_poller(",
+                TASK_SUPERVISED_REASON,
+            ),
+        ];
+        // (site, needle, reason). Each runs once at boot and ends.
+        const ONE_SHOT: &[(Site, &str, &str)] = &[
+            (
+                Site::Spawn,
+                "crate::wrappers::WrapperState::new_default()",
+                "one-shot WrapperState bootstrap into a OnceCell (its own loops are outside \
+                 the census boundary)",
+            ),
+            (
+                Site::Spawn,
+                "crate::ui_bridge_invoke_probe::probe_allowlist_wire_contracts(",
+                "one-shot UI Bridge invoke wire-contract probe after the frontend mounts",
+            ),
+            (
+                Site::Spawn,
+                "crate::unified_workflow_executor::resume_interrupted_workflows(",
+                "one pass over interrupted unified workflows; never supervise — a re-run \
+                 would resume a workflow twice",
+            ),
+            (
+                Site::Spawn,
+                "crate::commands::ai_session::resume_ai_sessions(",
+                "bounded retry; never supervise — resume is not idempotent",
+            ),
+            (
+                Site::Spawn,
+                "crate::coord_mcp::log_rotation_log_path_once()",
+                "one-shot coord-mcp nonce restore and session-config reconcile",
+            ),
+            (
+                Site::Call,
+                "tokio::task::spawn_blocking(crate::coord_mcp::warm_stdio_shim_probe)",
+                "one-shot blocking warm of the stdio-shim selftest cache",
+            ),
+            (
+                Site::Call,
+                "tokio::task::spawn_blocking(move || {",
+                "one-shot blocking census of on-disk .mcp.json configs, awaited by the restore",
+            ),
+            (
+                Site::Call,
+                "let reaped = spawn_blocking_tracked(",
+                "awaited blocking reap of stale session-restore configs (unqualified \
+                 wedge_diagnostics helper)",
+            ),
+            (
+                Site::Spawn,
+                "crate::mcp::web_backend_workflows::sync_workflows_from_backend(",
+                "one-shot workflow sync from the web backend",
+            ),
+            (
+                Site::Spawn,
+                "crate::agent_commands::publish_defaults::publish_embedded_defaults_once()",
+                "one-shot publish of the embedded command defaults",
+            ),
+            (
+                Site::Spawn,
+                ".cleanup_old_audit_events(",
+                "one-shot audit-event retention cleanup",
+            ),
+            (
+                Site::Call,
+                "crate::mcp::transport::pairing::spawn_token_fetch(",
+                "one-shot pairing-token fetch per newly admitted USB device (inside the USB \
+                 scanner's body)",
+            ),
+        ];
+        // (site, needle, reason). Spawned from a Tauri event listener per
+        // event, not at boot.
+        const PER_EVENT: &[(Site, &str, &str)] = &[
+            (
+                Site::Spawn,
+                "crate::mcp::ui_bridge::handle_ui_bridge_response(",
+                "per-response delivery task from the UI Bridge response listener",
+            ),
+            (
+                Site::Spawn,
+                "\"UI Bridge invoke: response for unknown request_id {} (likely timed out)\"",
+                "per-response delivery task from the invoke-proxy listener",
+            ),
+            (
+                Site::Spawn,
+                "store.deliver(&window_label, &request_id, response)",
+                "per-response delivery task from the page/evaluate listener",
+            ),
+            (
+                Site::Spawn,
+                "\"scenarios/current: response for unknown request_id {} (likely timed out)\"",
+                "per-response delivery task from the scenarios/current projection listener",
+            ),
+        ];
+        // (site, needle, planned registry name, reason). Long-lived loops
+        // still on a bare spawn: a panic ends them silently.
+        const DEFERRED: &[(Site, &str, &str, &str)] = &[
+            (
+                Site::Spawn,
+                "crate::helper_tasks::poller::run_forever()",
+                "helper_tasks.poller",
+                PHASE1_2,
+            ),
+            (
+                Site::Spawn,
+                "cleanup_registry.cleanup_stale(&cleanup_db)",
+                "file_registry.stale_sweep",
+                PHASE1_2,
+            ),
+            (
+                Site::Spawn,
+                "crate::mcp::transport::usb::UsbTransport::new()",
+                "usb.adb_scanner",
+                PHASE1_2,
+            ),
+            (
+                Site::Spawn,
+                ".start_health_monitor(",
+                "physical_device.health_monitor",
+                PHASE1_2,
+            ),
+            (
+                Site::Spawn,
+                "crate::mcp::transport::cloud::CloudTransport::new(",
+                "cloud_registry.poller",
+                PHASE1_2,
+            ),
+            (
+                Site::Spawn,
+                "crate::mcp::discovery::mdns_scanner::MdnsScanner::new()",
+                "mdns_scanner.events",
+                PHASE1_2,
+            ),
+            (
+                Site::Call,
+                "scanner.start(event_tx)",
+                "mdns_scanner.browse_thread",
+                "MdnsScanner::start spawns a bare std::thread that drains the mdns-sd browse \
+                 receiver into event_tx for the life of the process; a panic in it ends LAN \
+                 discovery silently (event_tx drops with it, so the mdns_scanner.events task \
+                 then returns too). \
+                 worker_supervisor supervises tokio tasks, not threads, so this needs its own \
+                 design — not one-shot, not supervised",
+            ),
+            (
+                Site::Call,
+                "crate::util::egress_context::spawn_baseline_logger()",
+                "egress_context.baseline_logger",
+                PHASE1_2,
+            ),
+            (
+                Site::Call,
+                "crate::mcp::app_registry::spawn_sweeper(",
+                "app_registry.sweeper",
+                PHASE1_2,
+            ),
+            (
+                Site::Call,
+                "crate::canonical_corpus::start_refresh_loop()",
+                "canonical_corpus.refresh_loop",
+                PHASE1_2,
+            ),
+            (
+                Site::Call,
+                "crate::coord_mcp::start_stale_breadcrumb_sweep(",
+                "coord_mcp.stale_breadcrumb_sweep",
+                PHASE1_2,
+            ),
+            (
+                Site::Call,
+                "crate::zombie_sweep::start_zombie_sweep(",
+                "zombie_sweep.task_run_sweep",
+                PHASE1_2,
+            ),
+            (
+                Site::Call,
+                "crate::mcp::cascade::start_buffer_task(",
+                "cascade.buffer",
+                PHASE1_2,
+            ),
+            (
+                Site::Spawn,
+                "crate::trigger_system::start_trigger_service(",
+                "trigger_system.service",
+                "needs its own restart-safety read: start() takes its event_rx once, the \
+                 TRIGGER_SERVICE latch makes a rebuilt start a no-op, and \
+                 register_all_watchers would register twice",
+            ),
+        ];
+
+        let region_text = crate::mcp_api::mcp_api_item_source("fn create_router(")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lines: Vec<&str> = region_text.lines().collect();
+
+        // Every row, flattened: (table, site, needle).
+        let mut rows: Vec<(&str, Site, &str)> = Vec::new();
+        rows.extend(SUPERVISED.iter().map(|r| ("SUPERVISED", r.0, r.1)));
+        rows.extend(
+            TASK_SUPERVISED
+                .iter()
+                .map(|r| ("TASK_SUPERVISED", r.0, r.1)),
+        );
+        rows.extend(ONE_SHOT.iter().map(|r| ("ONE_SHOT", r.0, r.1)));
+        rows.extend(PER_EVENT.iter().map(|r| ("PER_EVENT", r.0, r.1)));
+        rows.extend(DEFERRED.iter().map(|r| ("DEFERRED", r.0, r.1)));
+
+        let mut violations: Vec<String> = Vec::new();
+
+        // Non-vacuity: every needle sits exactly once in the region, on one line.
+        let mut needle_line: Vec<Option<usize>> = Vec::new();
+        for (table, _, needle) in &rows {
+            let count = region_text.matches(needle).count();
+            if count != 1 {
+                violations.push(format!(
+                    "{table} needle `{needle}` occurs {count} times in create_router (want \
+                     exactly 1) — re-classify the row"
+                ));
+            }
+            needle_line.push(lines.iter().position(|l| l.contains(needle)));
+        }
+
+        // Spawn sites: a line holding `::spawn(` or `.spawn(` (tokio, a
+        // std::thread, a runtime `Handle`) or a word-boundary bare `spawn(` (a
+        // `use`-imported one). Its body runs to the next line at the same
+        // indent that closes it (rustfmt shape); a site whose line ends in `;`
+        // is one line long.
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if !is_spawn_site(line) {
+                continue;
+            }
+            let indent = line.len() - line.trim_start().len();
+            let end = if line.trim_end().ends_with(';') {
+                i
+            } else {
+                lines
+                    .iter()
+                    .enumerate()
+                    .skip(i + 1)
+                    .find(|(_, l)| {
+                        let t = l.trim_start();
+                        l.len() - t.len() == indent && (t.starts_with('}') || t.starts_with(')'))
+                    })
+                    .map(|(j, _)| j)
+                    .unwrap_or(lines.len() - 1)
+            };
+            spans.push((i, end));
+        }
+        // Each Site::Spawn needle belongs to the innermost span holding it;
+        // each span must own exactly one.
+        let mut owned: Vec<Vec<&str>> = vec![Vec::new(); spans.len()];
+        for ((table, site, needle), at) in rows.iter().zip(&needle_line) {
+            if *site != Site::Spawn {
+                continue;
+            }
+            let Some(at) = *at else { continue };
+            match spans
+                .iter()
+                .enumerate()
+                .filter(|(_, (s, e))| *s <= at && at <= *e)
+                .max_by_key(|(_, (s, _))| *s)
+            {
+                Some((k, _)) => owned[k].push(needle),
+                None => violations.push(format!(
+                    "{table} needle `{needle}` is Site::Spawn but sits in no spawn body"
+                )),
+            }
+        }
+        for ((start, _), needles) in spans.iter().zip(&owned) {
+            if needles.len() != 1 {
+                violations.push(format!(
+                    "spawn site `{}` holds {} classified Site::Spawn needles {needles:?} (want \
+                     exactly 1) — classify it in a census table",
+                    lines[*start].trim(),
+                    needles.len()
+                ));
+            }
+        }
+        let spawn_rows = rows.iter().filter(|r| r.1 == Site::Spawn).count();
+        if spans.len() != spawn_rows {
+            violations.push(format!(
+                "create_router holds {} spawn sites ({} `tokio::spawn(`) but the census keys {} \
+                 Site::Spawn rows",
+                spans.len(),
+                region_text.matches("tokio::spawn(").count(),
+                spawn_rows
+            ));
+        }
+
+        // A `start` with no suffix is a starter too: `MdnsScanner::start`
+        // spawns a std::thread. Counted like the suffixed tokens below.
+        let mut tokens: std::collections::BTreeMap<String, usize> = Default::default();
+        for token in [".start(", "::start("] {
+            let count = region_text.matches(token).count();
+            if count > 0 {
+                tokens.insert(token.to_string(), count);
+            }
+        }
+
+        // Starter calls: each distinct `::spawn_x(` / `::start_x(` /
+        // `.spawn_x(` / `.start_x(` token is covered by as many rows as it
+        // occurs.
+        for prefix in ["::spawn_", "::start_", ".spawn_", ".start_"] {
+            for (at, _) in region_text.match_indices(prefix) {
+                let rest = region_text.get(at + prefix.len()..).unwrap_or_default();
+                let ident_len = rest
+                    .find(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'))
+                    .unwrap_or(rest.len());
+                if ident_len > 0 && rest.get(ident_len..).is_some_and(|r| r.starts_with('(')) {
+                    let token = format!("{prefix}{}(", rest.get(..ident_len).unwrap_or_default());
+                    *tokens.entry(token).or_default() += 1;
+                }
+            }
+        }
+        // Unqualified starter calls too — a `use`-imported `spawn_x(` /
+        // `start_x(` would otherwise start a task the census never counts.
+        // Keyed by the bare `spawn_x(` token; only a row whose needle names it
+        // unqualified covers it.
+        let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        let mut bare: std::collections::BTreeMap<String, usize> = Default::default();
+        for prefix in ["spawn_", "start_"] {
+            for (at, _) in region_text.match_indices(prefix) {
+                let before = region_text
+                    .get(..at)
+                    .unwrap_or_default()
+                    .chars()
+                    .next_back();
+                if before.is_some_and(|c| is_ident(c) || c == ':' || c == '.') {
+                    continue;
+                }
+                let rest = region_text.get(at + prefix.len()..).unwrap_or_default();
+                let ident_len = rest.find(|c: char| !is_ident(c)).unwrap_or(rest.len());
+                if ident_len > 0 && rest.get(ident_len..).is_some_and(|r| r.starts_with('(')) {
+                    let token = format!("{prefix}{}(", rest.get(..ident_len).unwrap_or_default());
+                    *bare.entry(token).or_default() += 1;
+                }
+            }
+        }
+        let names_bare = |needle: &str, token: &str| {
+            needle.match_indices(token).any(|(at, _)| {
+                !needle
+                    .get(..at)
+                    .unwrap_or_default()
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| is_ident(c) || c == ':' || c == '.')
+            })
+        };
+        for (token, count) in &bare {
+            let covered = rows.iter().filter(|r| names_bare(r.2, token)).count();
+            if covered != *count {
+                violations.push(format!(
+                    "unqualified starter call `{token}` occurs {count} times in create_router but \
+                     {covered} census rows name it — classify it"
+                ));
+            }
+        }
+        for (token, count) in &tokens {
+            let covered = rows.iter().filter(|r| r.2.contains(token.as_str())).count();
+            if covered != *count {
+                violations.push(format!(
+                    "starter call `{token}` occurs {count} times in create_router but {covered} \
+                     census rows name it — classify it"
+                ));
+            }
+        }
+
+        // SUPERVISED: the entry fn goes through worker_supervisor under its
+        // registry name and holds no bare spawn — by the same spawn-site
+        // predicate as the region scan, over every line of the entry fn
+        // (including a factory closure written inline in it). A factory or run
+        // body that lives in a SEPARATE fn the entry fn calls is outside this
+        // check.
+        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        for (_, needle, file, signature, name) in SUPERVISED {
+            let fn_name = signature
+                .trim_start_matches("pub fn ")
+                .split('(')
+                .next()
+                .unwrap_or_default();
+            if !needle.ends_with(&format!("{fn_name}(")) {
+                violations.push(format!(
+                    "SUPERVISED needle `{needle}` does not call the entry fn `{fn_name}`"
+                ));
+            }
+            let path = src_root.join(file);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            let file_lines: Vec<&str> = text.lines().collect();
+            let Some(start) = file_lines.iter().position(|l| l.starts_with(signature)) else {
+                violations.push(format!(
+                    "{file}: no column-0 line starts with `{signature}`"
+                ));
+                continue;
+            };
+            let Some(len) = file_lines[start..].iter().position(|l| *l == "}") else {
+                violations.push(format!("{file}: `{signature}` never closes at column 0"));
+                continue;
+            };
+            let entry = file_lines[start..=start + len]
+                .iter()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .copied()
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !entry.contains("spawn_supervised") {
+                violations.push(format!(
+                    "{file} `{signature}` does not go through worker_supervisor::spawn_supervised*"
+                ));
+            }
+            if let Some(site) = entry.lines().find(|l| is_spawn_site(l)) {
+                violations.push(format!(
+                    "{file} `{signature}` holds a bare spawn: `{}`",
+                    site.trim()
+                ));
+            }
+            // The name as a literal in the entry fn, or a `const X: &str =
+            // "<name>";` in the file whose X the entry fn uses.
+            let literal = format!("\"{name}\"");
+            let via_const = file_lines.iter().any(|l| {
+                let Some((head, tail)) = l.split_once(": &str = ") else {
+                    return false;
+                };
+                let Some(ident) = head.split_whitespace().last() else {
+                    return false;
+                };
+                head.split_whitespace().any(|w| w == "const")
+                    && tail.trim_end() == format!("{literal};")
+                    && entry.contains(ident)
+            });
+            if !entry.contains(&literal) && !via_const {
+                violations.push(format!(
+                    "{file} `{signature}` does not name registry worker {literal} (literally or \
+                     through a `const …: &str = {literal};` in the file)"
+                ));
+            }
+        }
+
+        // TASK_SUPERVISED: each row's `auto_start_*` fn (an indented item in
+        // the file's `commands` module) still calls its start fn, and that
+        // column-0 start fn still starts the worker through
+        // mcp::task_supervisor — read from the two extracted item bodies, not
+        // the whole file, so a row cannot go on claiming supervision after the
+        // path drops it while some other fn in the file keeps the call.
+        // (file, auto_start fn, start fn it calls).
+        const TASK_SUPERVISED_PATHS: &[(&str, &str, &str)] = &[
+            (
+                "mcp/backend_relay.rs",
+                "auto_start_cloud_relay",
+                "start_relay",
+            ),
+            (
+                "mcp/device_jwt_refresher.rs",
+                "auto_start_device_jwt_refresher",
+                "start_refresher",
+            ),
+            (
+                "mcp/fleet_policy_poller.rs",
+                "auto_start_fleet_policy_poller",
+                "start_poller",
+            ),
+            (
+                "mcp/session_message_poller.rs",
+                "auto_start_session_message_poller",
+                "start_poller",
+            ),
+        ];
+        for (_, needle, _) in TASK_SUPERVISED {
+            if !TASK_SUPERVISED_PATHS
+                .iter()
+                .any(|(_, auto_start, _)| needle.ends_with(&format!("::{auto_start}(")))
+            {
+                violations.push(format!(
+                    "TASK_SUPERVISED needle `{needle}` has no TASK_SUPERVISED_PATHS row"
+                ));
+            }
+        }
+        for (file, auto_start, start_fn) in TASK_SUPERVISED_PATHS {
+            let path = src_root.join(file);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            let Some(auto_body) = fn_item_body(&text, auto_start) else {
+                violations.push(format!("{file}: no `fn {auto_start}(` item"));
+                continue;
+            };
+            if !auto_body.contains(&format!(" {start_fn}(")) {
+                violations.push(format!(
+                    "{file} `{auto_start}` no longer calls `{start_fn}(` — its TASK_SUPERVISED \
+                     row is stale; re-classify it"
+                ));
+            }
+            match fn_item_body(&text, start_fn) {
+                Some(start_body) if start_body.contains("task_supervisor::spawn_supervised(") => {}
+                Some(_) => violations.push(format!(
+                    "{file} `{start_fn}` no longer calls task_supervisor::spawn_supervised — the \
+                     TASK_SUPERVISED row for `{auto_start}` is stale; re-classify it"
+                )),
+                None => violations.push(format!("{file}: no `fn {start_fn}(` item")),
+            }
+        }
+
+        // Registry names are unique: two loops on one key fold into one row.
+        let mut names: Vec<&str> = SUPERVISED
+            .iter()
+            .map(|r| r.4)
+            .chain(DEFERRED.iter().map(|r| r.2))
+            .collect();
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+        if names.len() != total {
+            violations.push("duplicate registry name across SUPERVISED/DEFERRED".to_string());
+        }
+        for (table, _, reason) in TASK_SUPERVISED
+            .iter()
+            .map(|r| ("TASK_SUPERVISED", r.1, r.2))
+            .chain(ONE_SHOT.iter().map(|r| ("ONE_SHOT", r.1, r.2)))
+            .chain(PER_EVENT.iter().map(|r| ("PER_EVENT", r.1, r.2)))
+            .chain(DEFERRED.iter().map(|r| ("DEFERRED", r.1, r.3)))
+        {
+            if reason.trim().is_empty() {
+                violations.push(format!("{table} row has no reason"));
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "create_router boot-task census drifted:\n{}",
+            violations.join("\n")
+        );
+    }
 }
 
 /// `/health` `uiBridgeBinding` (plan
@@ -24032,9 +24864,60 @@ mod provision_probe_tests {
 
     /// A home directory is not a git work tree, and `~/.claude/agents` holds the
     /// operator's own hand-authored definitions. The git guard cannot catch it.
+    ///
+    /// Hardened against env races (finding `70008d38`, plan
+    /// `2026-11-22-vision-capture-websocket-follow-ups` Phase 3). The test and
+    /// the handler each call `dirs::home_dir()`, and the test used to run
+    /// outside the env lock. On a target where `dirs` reads `HOME`, an
+    /// env-mutating sibling fixture could repoint it between the two reads.
+    /// Now the whole body holds `env_lock()` (through an `IsolatedAmbient`), so
+    /// no fixture can move it between them, and the test resolves the home
+    /// directory the way the handler does, under that lock, and probes exactly
+    /// that. This removes the one race the test itself could have. It is NOT a
+    /// confirmed cause of the recorded failure: that failure's panic named a
+    /// `qontinui-ambient-deflected` path, which is not a HOME value, and on
+    /// Windows `dirs` does not read the environment at all (below).
+    ///
+    /// Where `dirs::home_dir()` reads `HOME` (every non-Windows target), the
+    /// fixture also makes it a known, empty temp dir, and the test asserts that
+    /// as a precondition. On Windows it does NOT: `dirs` answers from the
+    /// `FOLDERID_Profile` known folder, which ignores the `USERPROFILE` the
+    /// fixture sets (measured 2026-11-23: it returned the real profile inside
+    /// the fixture). That answer does not come from the process environment, so
+    /// no sibling fixture can change it and it needs no lock.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_home_directory_is_refused() {
-        let Some(home) = dirs::home_dir() else { return };
+        let _lock = crate::test_env::env_lock();
+        // The fixture's home dir is a `tempfile::tempdir()`; the handler's git
+        // guard runs BEFORE its home guard, so that dir must sit outside every
+        // work tree or the refusal this test asserts is never reached.
+        let outside = tempdir_outside_any_work_tree();
+        let tmp_keys = crate::test_env::EnvVarRestore::capture(&["TMPDIR", "TMP", "TEMP"]);
+        for key in ["TMPDIR", "TMP", "TEMP"] {
+            std::env::set_var(key, outside.path());
+        }
+        let ambient = crate::test_env::IsolatedAmbient::new();
+        drop(tmp_keys);
+
+        // Resolved exactly as the handler resolves it, under the same lock.
+        let home = dirs::home_dir()
+            .and_then(|h| std::fs::canonicalize(h).ok())
+            .expect("a home directory resolves (the handler's guard needs one to run)");
+        #[cfg(not(windows))]
+        assert_eq!(
+            home,
+            std::fs::canonicalize(ambient.dir()).expect("the fixture's dir canonicalizes"),
+            "precondition: dirs::home_dir() must resolve to the fixture's HOME, or this \
+             test probes a home directory the fixture does not control"
+        );
+        #[cfg(windows)]
+        let _ = &ambient;
+        assert!(
+            enclosing_git_work_tree(&home).is_none(),
+            "precondition: the home directory {home:?} must sit outside any git work tree, \
+             or the handler's git guard answers before its home guard"
+        );
+
         let (status, body) = probe(&home.display().to_string()).await;
         assert_eq!(
             status,

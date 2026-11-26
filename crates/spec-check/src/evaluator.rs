@@ -117,7 +117,9 @@ pub fn evaluate_with_validation(
 /// serialization instead of the in-process sentinels.
 ///
 /// The supplied `content_sha256` populates `SpecCheckResult.snapshot_sha256`.
-/// Pass `String::new()` to omit it (serialized as null via skip_serializing_if).
+/// Pass `None` to omit it (serialized as null via skip_serializing_if) — the
+/// supplied-snapshot paths hash nothing, and a snapshot whose canonical hash
+/// was refused carries `None` rather than failing the fetch.
 ///
 /// In-process callers that want sentinel values (validator, distinctness
 /// checks, internal scoring) should keep using `evaluate()`.
@@ -126,7 +128,7 @@ pub fn evaluate_with_identity(
     spec: &IrPageSpec,
     fingerprint: BridgeFingerprint,
     snapshot_id: String,
-    content_sha256: String,
+    content_sha256: Option<String>,
 ) -> SpecCheckResult {
     evaluate_with_identity_and_validation(
         snapshot,
@@ -143,7 +145,7 @@ pub fn evaluate_with_identity_and_validation(
     spec: &IrPageSpec,
     fingerprint: BridgeFingerprint,
     snapshot_id: String,
-    content_sha256: String,
+    content_sha256: Option<String>,
     validation: Option<&SpecValidation>,
 ) -> SpecCheckResult {
     let mut result = evaluate_with_validation(snapshot, spec, validation);
@@ -168,9 +170,7 @@ pub fn evaluate_with_identity_and_validation(
         ..fingerprint
     };
     result.snapshot_id = snapshot_id;
-    if !content_sha256.is_empty() {
-        result.snapshot_sha256 = Some(content_sha256);
-    }
+    result.snapshot_sha256 = content_sha256;
     result
 }
 
@@ -958,8 +958,7 @@ mod tests {
     fn evaluate_with_identity_writes_caller_fingerprint() {
         let (s, spec) = identity_fixture();
         let fp = caller_fingerprint("qontinui-web", s.elements.len() as u32);
-        let result =
-            evaluate_with_identity(&s, &spec, fp, "scs_018f-abc".to_string(), String::new());
+        let result = evaluate_with_identity(&s, &spec, fp, "scs_018f-abc".to_string(), None);
         // Caller's app_id flows through; NOT the sentinel.
         assert_eq!(result.bridge_fingerprint.app_id, "qontinui-web");
         assert_ne!(result.bridge_fingerprint.app_id, "internal-evaluator");
@@ -979,8 +978,7 @@ mod tests {
     fn evaluate_with_identity_writes_caller_snapshot_id() {
         let (s, spec) = identity_fixture();
         let fp = caller_fingerprint("qontinui-web", s.elements.len() as u32);
-        let result =
-            evaluate_with_identity(&s, &spec, fp, "scs_018f-abc".to_string(), String::new());
+        let result = evaluate_with_identity(&s, &spec, fp, "scs_018f-abc".to_string(), None);
         assert_eq!(result.snapshot_id, "scs_018f-abc");
         assert_ne!(result.snapshot_id, "scs_internal_eval");
     }
@@ -996,13 +994,13 @@ mod tests {
             &spec,
             fp,
             "scs_x".to_string(),
-            "sha256-cafebabe".to_string(),
+            Some("sha256-cafebabe".to_string()),
         );
         assert_eq!(result.snapshot_sha256.as_deref(), Some("sha256-cafebabe"));
 
-        // Empty hash => None (serialized as null via skip_serializing_if).
+        // No hash => None (serialized as null via skip_serializing_if).
         let fp2 = caller_fingerprint("qontinui-web", s.elements.len() as u32);
-        let result2 = evaluate_with_identity(&s, &spec, fp2, "scs_x".to_string(), String::new());
+        let result2 = evaluate_with_identity(&s, &spec, fp2, "scs_x".to_string(), None);
         assert!(result2.snapshot_sha256.is_none());
     }
 
@@ -1011,8 +1009,13 @@ mod tests {
         let (s, spec) = identity_fixture();
         let plain = evaluate(&s, &spec);
         let fp = caller_fingerprint("qontinui-web", s.elements.len() as u32);
-        let identity =
-            evaluate_with_identity(&s, &spec, fp, "scs_x".to_string(), "sha256-abc".to_string());
+        let identity = evaluate_with_identity(
+            &s,
+            &spec,
+            fp,
+            "scs_x".to_string(),
+            Some("sha256-abc".to_string()),
+        );
         // The matching outcome must be identical regardless of entrypoint —
         // only the identity fields differ.
         assert_eq!(identity.summary.match_outcome, plain.summary.match_outcome);

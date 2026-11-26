@@ -163,6 +163,28 @@ pub struct ResumeParams {
     pub config_dir: Option<String>,
 }
 
+/// The `state_change` payload that carries an ADOPTED row's resume parameters
+/// to coord (`PATCH /sessions/:id` with `account_label` / `config_dir`), or
+/// `None` when there is nothing to send. PURE. Blank values are not sent.
+pub(crate) fn adopted_resume_patch(
+    session_id: Uuid,
+    resume: &ResumeParams,
+) -> Option<serde_json::Value> {
+    let label = resume.account_label.as_deref().filter(|a| !a.is_empty());
+    let dir = resume.config_dir.as_deref().filter(|c| !c.is_empty());
+    if label.is_none() && dir.is_none() {
+        return None;
+    }
+    let mut p = json!({ "id": session_id, "no_heartbeat": true });
+    if let Some(a) = label {
+        p["account_label"] = json!(a);
+    }
+    if let Some(c) = dir {
+        p["config_dir"] = json!(c);
+    }
+    Some(p)
+}
+
 /// See [`AiCoordRegistrar::recorded_row`] and
 /// [`AiCoordRegistrar::recorded_row_for_record`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1128,6 +1150,27 @@ impl AiCoordRegistrar {
         // worst overwrite the row's intent — skip it; the index insert below
         // is the whole binding.
         let started = if adopt_coord_session.is_some() {
+            // The create path is where coord stamps `account_label` /
+            // `config_dir`, and an adoption has none — so an adopted row would
+            // never carry them. Send them as a `state_change` PATCH instead
+            // (coord stamps them there under the caller's own tenant + device,
+            // with the create path's validation). Best-effort: a failed write
+            // never undoes the binding.
+            if let Some(payload) = adopted_resume_patch(session_id, &overrides.resume) {
+                let payload = self.stamp_tenant(session_id, payload);
+                if let Err(e) = self.inner.outbox.record(
+                    self.inner.machine_id,
+                    session_id,
+                    SessionEventKind::StateChange,
+                    payload,
+                ) {
+                    warn!(
+                        "ai_coord_register: resume-parameter write for adopted row {} failed \
+                         (best-effort): {}",
+                        session_id, e
+                    );
+                }
+            }
             Ok(())
         } else {
             self.inner
@@ -2784,6 +2827,38 @@ fn requeue_front(queue: &mut std::collections::VecDeque<LogEntry>, batch: Vec<Lo
     }
     while queue.len() > AGENT_LOG_QUEUE_CAP {
         queue.pop_front();
+    }
+}
+
+#[cfg(test)]
+mod adopted_resume_patch_tests {
+    use super::*;
+
+    #[test]
+    fn nothing_is_sent_without_a_resume_parameter() {
+        let id = Uuid::from_u128(1);
+        assert!(adopted_resume_patch(id, &ResumeParams::default()).is_none());
+        let blank = ResumeParams {
+            account_label: Some(String::new()),
+            config_dir: Some(String::new()),
+        };
+        assert!(adopted_resume_patch(id, &blank).is_none());
+    }
+
+    #[test]
+    fn present_parameters_are_sent_without_a_heartbeat() {
+        let id = Uuid::from_u128(1);
+        let p = adopted_resume_patch(
+            id,
+            &ResumeParams {
+                account_label: Some(".claude-x".into()),
+                config_dir: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(p["account_label"], ".claude-x");
+        assert!(p.get("config_dir").is_none());
+        assert_eq!(p["no_heartbeat"], true);
     }
 }
 
@@ -7163,6 +7238,18 @@ mod tests {
         let (stale, at) = rig.finished_on_stale(y);
         let r = Uuid::new_v4();
         rig.show_pane(y, r, 1_000);
+        // Belt and braces: the store already stamps a re-mark after an unmark
+        // past the cleared stamp (`restamp_at`). Waiting for the wall clock to
+        // pass `at` as well keeps this test about the re-offer race rather
+        // than about the store's stamping, which its own tests cover.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while chrono::Utc::now().timestamp_millis() <= at {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "wall clock did not pass the first mark's finished_at ({at}) within 5s"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         let store = rig.store.clone();
         race_after_decision(move || {
             store.set_finished(y, false, None).unwrap();

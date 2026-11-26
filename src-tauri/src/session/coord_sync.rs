@@ -721,8 +721,10 @@ impl CoordSync {
                     }
                     ResumeProbe::Found(tenant)
                 } else if status == StatusCode::NOT_FOUND || status == StatusCode::GONE {
+                    drain_body(resp).await;
                     ResumeProbe::NotFound
                 } else if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+                    drain_body(resp).await;
                     tracing::warn!(
                         session = %session_id,
                         %status,
@@ -730,6 +732,7 @@ impl CoordSync {
                     );
                     ResumeProbe::Refused(status.as_u16())
                 } else {
+                    drain_body(resp).await;
                     tracing::debug!(
                         session = %session_id,
                         %status,
@@ -1812,6 +1815,12 @@ struct TickResult {
     /// `heartbeats_dropped_on_failure` split by failure kind (non-zero kinds
     /// only) — this tick's share of [`HEARTBEATS_DROPPED_ON_FAILURE_BY_KIND`].
     heartbeats_dropped_on_failure_by_kind: BTreeMap<&'static str, u64>,
+    /// `finished` rows this tick dropped UNSTAMPED at the unconfirmed-answer
+    /// bound, counted only once the ACK landed — this tick's share of
+    /// [`super::coord_sync_finish_ack::FINISHED_UNCONFIRMED_DROPPED`]. Per
+    /// call, so a test can assert its own drops without racing a sibling
+    /// test that bumps the same process-global counter.
+    finished_unconfirmed_dropped: u64,
 }
 
 impl TickResult {
@@ -1823,6 +1832,7 @@ impl TickResult {
             heartbeats_superseded: 0,
             heartbeats_dropped_on_failure: 0,
             heartbeats_dropped_on_failure_by_kind: BTreeMap::new(),
+            finished_unconfirmed_dropped: 0,
         }
     }
 }
@@ -2254,6 +2264,7 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
     let mut heartbeats_superseded = 0;
     let mut heartbeats_dropped_on_failure = 0;
     let mut heartbeats_dropped_on_failure_by_kind: BTreeMap<&'static str, u64> = BTreeMap::new();
+    let mut finished_unconfirmed_dropped_acked = 0;
     if !succeeded.is_empty() {
         match inner.outbox.ack(&succeeded) {
             Ok(()) => {
@@ -2261,6 +2272,7 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
                     state.in_sidecar.remove(key);
                 }
                 heartbeats_superseded = superseded_count;
+                finished_unconfirmed_dropped_acked = finished_unconfirmed_dropped;
                 if finished_unconfirmed_dropped > 0 {
                     super::coord_sync_finish_ack::FINISHED_UNCONFIRMED_DROPPED
                         .fetch_add(finished_unconfirmed_dropped, Ordering::Relaxed);
@@ -2338,6 +2350,7 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         heartbeats_superseded,
         heartbeats_dropped_on_failure,
         heartbeats_dropped_on_failure_by_kind,
+        finished_unconfirmed_dropped: finished_unconfirmed_dropped_acked,
     }
 }
 
@@ -2924,6 +2937,7 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                         }
                     };
                 }
+                drain_body(resp).await;
                 // `landed` moves ONLY here — coord accepted the id.
                 if let Some(id) = rekey_id(rec) {
                     if let Some(source) =
@@ -2960,6 +2974,7 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                     StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
                 )
             {
+                drain_body(resp).await;
                 // Coord build without the session-events ingest route (the
                 // coord slice of Phase 4 ships it in parallel), or a
                 // `coord.sessions` row that has since been GC'd — the ingest
@@ -3117,6 +3132,8 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                         id,
                         super::coord_identity::DeclineKind::Rejected,
                     );
+                } else {
+                    drain_body(resp).await;
                 }
                 return PushOutcome::Acked;
             }
@@ -3150,6 +3167,17 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
         // TLS / DNS / timeout reason lives in `.source()`.
         Err(e) => PushOutcome::Transport(transport_error(&e)),
     }
+}
+
+/// Read a coord response body to its end and discard it, chunk by chunk (no
+/// buffering). Every response from the shared coord client must be consumed
+/// before it is dropped: an unread HTTP/2 body leaves DATA frames unconsumed
+/// on the connection, and coord answered that with `too_many_data_frames`
+/// GOAWAYs that quarantined sessions in the outbox (lifecycle plan Phase 85).
+/// A read error mid-body is ignored — the caller has already decided on the
+/// status, and there is nothing left to drain.
+pub(crate) async fn drain_body(mut resp: reqwest::Response) {
+    while let Ok(Some(_)) = resp.chunk().await {}
 }
 
 /// A reqwest transport failure rendered with its FULL source chain
@@ -3669,6 +3697,7 @@ async fn bootstrap_then_register(
                     format!("work-unit bootstrap upsert: {status}: {detail}"),
                 );
             }
+            drain_body(resp).await;
             tracing::info!(
                 session = %rec.session_id,
                 seq = rec.seq,
@@ -3820,10 +3849,24 @@ fn state_change_body(payload: &JsonValue) -> JsonValue {
     if let Some(ccsid) = payload.get("claude_code_session_id") {
         body.insert("claude_code_session_id".into(), ccsid.clone());
     }
+    // Unfinished-resume: an ADOPTED row's account / config dir (coord stamps
+    // them on PATCH under the caller's own tenant + device, with the create
+    // path's validation). Omitted when absent/null.
+    for key in ["account_label", "config_dir"] {
+        if let Some(v) = payload.get(key) {
+            if !v.is_null() {
+                body.insert(key.into(), v.clone());
+            }
+        }
+    }
     // Coord refreshes last_heartbeat_at on any PATCH — passing
     // heartbeat=true ensures the row gets a fresh stamp even when the
     // caller only changed metadata.
-    body.insert("heartbeat".into(), JsonValue::Bool(true));
+    // A resume-parameter-only PATCH (`no_heartbeat`) is metadata for a row
+    // that may be CLOSED: it must not stamp liveness on it.
+    if payload.get("no_heartbeat").and_then(JsonValue::as_bool) != Some(true) {
+        body.insert("heartbeat".into(), JsonValue::Bool(true));
+    }
     JsonValue::Object(body)
 }
 
@@ -4466,6 +4509,10 @@ async fn read_refusal_body(mut resp: reqwest::Response) -> Result<String, String
             Err(e) => return Err(e.to_string()),
         }
     }
+    // Past the cap: discard the rest unbuffered rather than drop it unread.
+    // Trade-off: the cap bounds memory; the drain still reads the rest on every poll, bounded
+    // in time by the client's 30 s timeout.
+    drain_body(resp).await;
     // Lossy rather than fatal: a cap can land mid-codepoint, and the result
     // is only ever JSON-parsed or counted. A body that is genuinely not UTF-8
     // fails the parse and is reported by shape, which is the right answer.
@@ -4680,6 +4727,7 @@ async fn fetch_session_coordination_flag(
                 reason,
             });
         }
+        drain_body(resp).await;
         return Err(FlagPollError::Other(format!("status {status}")));
     }
     let body: JsonValue = resp
@@ -9814,6 +9862,20 @@ mod tests {
         );
     }
 
+    /// An adopted row's resume parameters ride a PATCH that stamps NO liveness.
+    #[test]
+    fn state_change_body_forwards_resume_params_without_a_heartbeat() {
+        let body = state_change_body(&json!({
+            "account_label": ".claude-gmail",
+            "config_dir": "/home/u/.claude-gmail",
+            "no_heartbeat": true,
+        }));
+        assert_eq!(body["account_label"], ".claude-gmail");
+        assert_eq!(body["config_dir"], "/home/u/.claude-gmail");
+        assert!(body.get("heartbeat").is_none());
+        assert!(body.get("no_heartbeat").is_none());
+    }
+
     /// Phase 2b of plan
     /// `2026-09-02-coord-report-status-unscoped-write-hits-a-peer-session`: the
     /// confirmation event's own field reaches coord's `UpdateSessionRequest`.
@@ -12892,5 +12954,118 @@ pub(crate) mod egress_tests {
             "the output_chunk `if` must be the gate enclosing the check (it and \
              the `if let Some(flow)` around the call, nothing else)"
         );
+    }
+}
+
+/// Every response path on the shared coord client reads its body to the end
+/// (lifecycle plan Phase 85). Each test fails if the drain at its site is
+/// removed — see [`super::drain_probe`].
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+    use crate::session::drain_probe::{DrainProbe, Fixed};
+
+    fn coord_at(base: &str) -> (CoordSync, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = Arc::new(OutboxWriter::open(dir.path().join("outbox.jsonl")).unwrap());
+        let coord = CoordSync::new_for_test(
+            outbox,
+            base.to_string(),
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        (coord, dir)
+    }
+
+    fn rec(kind: &str, payload: JsonValue) -> OutboxRecord {
+        OutboxRecord {
+            machine_id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            seq: 1,
+            event_kind: kind.to_string(),
+            payload,
+            recorded_at: Utc::now(),
+            acked_at: None,
+        }
+    }
+
+    async fn push(status: u16, kind: &str) -> (PushOutcome, DrainProbe) {
+        let probe = DrainProbe::spawn(status).await;
+        let (coord, _dir) = coord_at(&probe.base);
+        let out = push_record(&coord.inner, &rec(kind, json!({}))).await;
+        (out, probe)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn push_2xx_reads_the_body() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (out, probe) = push(200, "heartbeat").await;
+        assert!(matches!(out, PushOutcome::Acked));
+        probe.assert_all_drained().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn push_mirror_404_405_reads_the_body() {
+        let _amb = crate::test_env::isolated_ambient();
+        for (status, kind) in [(404, "restore-record"), (405, "coord-transport-rung")] {
+            let (out, probe) = push(status, kind).await;
+            assert!(matches!(out, PushOutcome::Acked), "{kind} {status}");
+            probe.assert_all_drained().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn push_patch_409_reads_the_body() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (out, probe) = push(409, "heartbeat").await;
+        assert!(matches!(out, PushOutcome::Acked));
+        probe.assert_all_drained().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bootstrap_upsert_2xx_reads_the_body() {
+        let _amb = crate::test_env::isolated_ambient();
+        let probe = DrainProbe::spawn_with(
+            200,
+            vec![Fixed {
+                path: "/coord/work-units/wu-drain/register-gate".into(),
+                status: 404,
+                body: r#"{"error":"work_unit_not_found"}"#,
+            }],
+        )
+        .await;
+        let (coord, _dir) = coord_at(&probe.base);
+        let payload = json!({
+            "work_unit_slug": "wu-drain",
+            "predicate": {"kind": "manual"},
+            "work_unit_upsert": {"title": "t"},
+        });
+        // Upsert (probe body, 200) then the re-register (fixed 404).
+        let _ = push_record(&coord.inner, &rec("gate_registration", payload)).await;
+        probe.assert_all_drained().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resume_probe_non_2xx_reads_the_body() {
+        let _amb = crate::test_env::isolated_ambient();
+        for status in [404, 401, 500] {
+            let probe = DrainProbe::spawn(status).await;
+            let (coord, _dir) = coord_at(&probe.base);
+            let _ = coord.probe_resume(Uuid::new_v4(), None).await;
+            probe.assert_all_drained().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flag_poll_non_2xx_reads_the_body() {
+        let _amb = crate::test_env::isolated_ambient();
+        // 500: the generic arm. 403: the capped refusal read, past its cap.
+        for status in [500, 403] {
+            let probe = DrainProbe::spawn(status).await;
+            let (coord, _dir) = coord_at(&probe.base);
+            let r = fetch_session_coordination_flag(&coord.inner, Uuid::new_v4()).await;
+            assert!(r.is_err());
+            probe.assert_all_drained().await;
+        }
     }
 }

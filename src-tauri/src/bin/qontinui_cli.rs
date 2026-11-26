@@ -16,9 +16,18 @@
 //! ## Runner discovery (port + loopback auth)
 //! The loopback route requires the per-session coord-mcp proxy nonce
 //! (`Authorization: Bearer <nonce>`, or the legacy `X-Coord-Mcp-Proxy-Key` —
-//! both are read here and the runner accepts either), discovered by a
-//! **`.mcp.json` walk-up from cwd**.
-//! The runner provisions every session workdir with a `.mcp.json` whose
+//! both are read here and the runner accepts either), discovered in this order:
+//!
+//! 1. **`$QONTINUI_MCP_CONFIG`** — the session's OWN `--mcp-config` file, which
+//!    the runner (or the identity shim, for a config it self-provisions)
+//!    exports at spawn. When set and not blank it is authoritative:
+//!    a missing or credential-less file is an error, and the walk-up below is
+//!    NOT tried, because from a worktree with no `.mcp.json` the walk-up reaches
+//!    an ancestor's (another session's, possibly another tenant's) credential.
+//! 2. **A `.mcp.json` walk-up from cwd** — only when the variable is unset or
+//!    empty.
+//!
+//! The runner provisions session workdirs with a `.mcp.json` whose
 //! coord-mcp server entry yields BOTH the nonce header and a `/coord-mcp` URL
 //! on the ACTUALLY-BOUND API port (`coord_mcp::write_coord_mcp_proxy_config` /
 //! `write_coord_mcp_agent_proxy_config`; the reconciler rewrites it on port
@@ -38,10 +47,13 @@
 //! Borrowing an ANCESTOR directory's `.mcp.json` is intentional: nested
 //! worktrees/subdirs inside a provisioned session workdir inherit the session's
 //! credential, and because port + nonce travel together the borrowed entry
-//! still pairs the nonce with its issuing runner's port.
+//! still pairs the nonce with its issuing runner's port. That borrowing is the
+//! fallback arm only: a session that carries `$QONTINUI_MCP_CONFIG` never
+//! borrows, so a nested worktree with no file of its own cannot pick up the
+//! workspace root's credential instead of its own.
 //!
 //! `QONTINUI_RUNNER_API_PORT` is honored as an EXPLICIT operator override of
-//! the port only (the nonce still comes from `.mcp.json`).
+//! the port only (the nonce still comes from the discovered config file).
 //!
 //! Style: matches the sibling standalone bins (`qontinui_git_credential`) —
 //! hand-rolled arg parsing, no CLI crates; `reqwest::blocking` for HTTP (the
@@ -348,25 +360,17 @@ fn pr_create(args: &[String]) -> ExitCode {
 
     let base = parsed.base.clone().unwrap_or_else(|| "main".to_string());
 
-    // Session-credential discovery (see the module comment): the nonce AND the
-    // port come from the SAME `.mcp.json` entry, so the POST lands on the
-    // runner that issued the nonce.
+    // Session-credential discovery (see the module comment): the session's OWN
+    // `--mcp-config` file (`$QONTINUI_MCP_CONFIG`) first, the `.mcp.json`
+    // walk-up only when that variable is unset or empty. The nonce AND the port
+    // come from the SAME entry, so the POST lands on the runner that issued the
+    // nonce.
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let session = match find_session_mcp_config(&cwd) {
-        Some(s) => s,
-        None => {
-            eprintln!(
-                "qontinui-pr: no runner session credential found — no `.mcp.json` with a \
-                 coord-mcp nonce entry between {} and the filesystem root. A stdio \
-                 shim entry (`coord-mcp-shim.py`) whose `--credential` file is missing, \
-                 unreadable, or not a JSON `{{url, headers}}` object lands here too — \
-                 check the file it names. \
-                 Otherwise this session was not provisioned by the runner, or \
-                 provisioning is degraded (check for a `.coord-mcp-status` breadcrumb \
-                 in the session workdir). Fallback: `gh pr create` works where a \
-                 personal `gh auth login` exists.",
-                cwd.display()
-            );
+    let env_config = std::env::var_os(MCP_CONFIG_ENV);
+    let session = match discover_session_mcp_config(&cwd, env_config.as_deref()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("qontinui-pr: {e}");
             return ExitCode::from(1);
         }
     };
@@ -374,7 +378,7 @@ fn pr_create(args: &[String]) -> ExitCode {
         Some(p) => p,
         None => {
             eprintln!(
-                "qontinui-pr: the session `.mcp.json` coord-mcp URL carries no \
+                "qontinui-pr: the discovered session config's coord-mcp URL carries no \
                  port and ${RUNNER_PORT_ENV} is not set — cannot pair the nonce with \
                  its issuing runner. Fallback: `gh pr create` works where a personal \
                  `gh auth login` exists."
@@ -1530,6 +1534,101 @@ struct SessionMcpConfig {
     port: Option<u16>,
 }
 
+/// The env var the runner exports at spawn naming the session's OWN coord-mcp
+/// `--mcp-config` file. The literal is the runner's `coord_mcp::MCP_CONFIG_ENV`,
+/// which lives in the runner BIN crate (`main.rs`) and so cannot be imported
+/// here — the identity shim (`qontinui_shim.rs`) carries the same literal for
+/// the same reason.
+const MCP_CONFIG_ENV: &str = "QONTINUI_MCP_CONFIG";
+
+/// Why no session credential could be discovered.
+#[derive(Debug)]
+enum DiscoveryError {
+    /// `$QONTINUI_MCP_CONFIG` names a file that cannot be read.
+    EnvFileUnreadable { path: PathBuf, error: String },
+    /// `$QONTINUI_MCP_CONFIG` names a readable file holding no usable
+    /// coord-mcp nonce entry (unparseable JSON, no `coord-mcp`, a static
+    /// bearer, a shim entry whose credential file is missing).
+    EnvFileNoCredential { path: PathBuf },
+    /// The variable is unset/empty and no `.mcp.json` from `cwd` up holds one.
+    WalkUpFoundNothing { cwd: PathBuf },
+}
+
+impl std::fmt::Display for DiscoveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EnvFileUnreadable { path, error } => write!(
+                f,
+                "${MCP_CONFIG_ENV} names {} but it cannot be read ({error}) — \
+                 typically because the runner retired it or never wrote it, or \
+                 because it was the identity shim's self-provisioned temp config, \
+                 deleted when its `claude` exited — so \
+                 there is no session credential. The `.mcp.json` \
+                 walk-up is deliberately NOT tried: an ancestor's file belongs to a \
+                 different session and possibly a different tenant. Fallback: \
+                 `gh pr create` works where a personal `gh auth login` exists.",
+                path.display()
+            ),
+            Self::EnvFileNoCredential { path } => write!(
+                f,
+                "${MCP_CONFIG_ENV} names {} but it holds no usable coord-mcp nonce \
+                 entry (unparseable JSON, no `coord-mcp` server, a static bearer, or \
+                 a stdio shim whose `--credential` file is missing or unparseable). \
+                 The `.mcp.json` walk-up is deliberately NOT tried: an ancestor's \
+                 file belongs to a different session and possibly a different \
+                 tenant. Fallback: `gh pr create` works where a personal \
+                 `gh auth login` exists.",
+                path.display()
+            ),
+            Self::WalkUpFoundNothing { cwd } => write!(
+                f,
+                "no runner session credential found — ${MCP_CONFIG_ENV} is unset or blank and \
+                 no `.mcp.json` with a coord-mcp nonce entry lies between {} and the \
+                 filesystem root. A stdio shim entry (`coord-mcp-shim.py`) whose \
+                 `--credential` file is missing, unreadable, or not a JSON \
+                 `{{url, headers}}` object lands here too — check the file it names. \
+                 Otherwise this session was not provisioned by the runner, or \
+                 provisioning is degraded (check for a `.coord-mcp-status` breadcrumb \
+                 in the session workdir). Fallback: `gh pr create` works where a \
+                 personal `gh auth login` exists.",
+                cwd.display()
+            ),
+        }
+    }
+}
+
+/// Discover this session's credential.
+///
+/// `env_config` is the value of `$QONTINUI_MCP_CONFIG`. When it is set and
+/// non-empty it is AUTHORITATIVE: the file it names is parsed with the same
+/// [`parse_mcp_json`] the walk-up uses, and a missing or credential-less file
+/// is an ERROR — never a fall-through to the walk-up. The walk-up is the hazard
+/// this precedence exists to close: from a worktree with no `.mcp.json` of its
+/// own it reaches an ancestor's file (the workspace root's), whose nonce is a
+/// different session's and may act in a different tenant. A session the runner
+/// handed its own config must use that config or nothing.
+///
+/// Only an unset or empty variable (a session the runner did not provision
+/// through `--mcp-config`, or a hand-run shell) falls back to
+/// [`find_session_mcp_config`].
+fn discover_session_mcp_config(
+    cwd: &Path,
+    env_config: Option<&std::ffi::OsStr>,
+) -> Result<SessionMcpConfig, DiscoveryError> {
+    if let Some(raw) = env_config.filter(|v| !v.to_string_lossy().trim().is_empty()) {
+        let path = PathBuf::from(raw);
+        let text =
+            std::fs::read_to_string(&path).map_err(|e| DiscoveryError::EnvFileUnreadable {
+                path: path.clone(),
+                error: e.to_string(),
+            })?;
+        return parse_mcp_json(&text).ok_or(DiscoveryError::EnvFileNoCredential { path });
+    }
+    find_session_mcp_config(cwd).ok_or_else(|| DiscoveryError::WalkUpFoundNothing {
+        cwd: cwd.to_path_buf(),
+    })
+}
+
 /// Walk up from `start` looking for a `.mcp.json` with a coord-mcp proxy
 /// entry. First hit wins (the session workdir is the nearest ancestor).
 /// Borrowing an ancestor's config is intentional — nested worktrees/subdirs
@@ -2058,6 +2157,100 @@ mod tests {
         let cfg = find_session_mcp_config(&nested).unwrap();
         assert_eq!(cfg.nonce, "walkup");
         assert_eq!(cfg.port, Some(9878));
+    }
+
+    fn proxy_mcp_json(port: u16, nonce: &str) -> String {
+        format!(
+            r#"{{"mcpServers":{{"coord-mcp":{{"url":"http://127.0.0.1:{port}/coord-mcp","headers":{{"Authorization":"Bearer {nonce}"}}}}}}}}"#
+        )
+    }
+
+    /// The session's own `$QONTINUI_MCP_CONFIG` file wins over a `.mcp.json`
+    /// in the cwd itself (the NEAREST walk-up hit) — and over the ancestor one
+    /// the 9ab6bae0 hazard is about.
+    #[test]
+    fn discovery_prefers_the_env_config_over_a_nearer_mcp_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join(".mcp.json"), proxy_mcp_json(9876, "root-nonce")).unwrap();
+        let cwd = root.join("worktree");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(cwd.join(".mcp.json"), proxy_mcp_json(9877, "cwd-nonce")).unwrap();
+        let own = root.join("app-data").join("session.mcp.json");
+        std::fs::create_dir_all(own.parent().unwrap()).unwrap();
+        std::fs::write(&own, proxy_mcp_json(9881, "own-nonce")).unwrap();
+
+        let cfg = discover_session_mcp_config(&cwd, Some(own.as_os_str())).unwrap();
+        assert_eq!(cfg.nonce, "own-nonce");
+        assert_eq!(cfg.port, Some(9881), "the port comes from the same file");
+    }
+
+    /// Unset or empty (including whitespace-only) env: the walk-up runs
+    /// exactly as before, ancestor borrowing included.
+    #[test]
+    fn discovery_falls_back_to_the_walk_up_when_the_env_is_unset_or_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join(".mcp.json"), proxy_mcp_json(9878, "walkup")).unwrap();
+        let nested = root.join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+        for env in [None, Some(""), Some("   ")] {
+            let cfg = discover_session_mcp_config(&nested, env.map(std::ffi::OsStr::new))
+                .unwrap_or_else(|e| panic!("env {env:?}: {e}"));
+            assert_eq!(cfg.nonce, "walkup", "env {env:?}");
+            assert_eq!(cfg.port, Some(9878), "env {env:?}");
+        }
+        let empty = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            discover_session_mcp_config(empty.path(), None),
+            Err(DiscoveryError::WalkUpFoundNothing { .. })
+        ));
+    }
+
+    /// A set-but-missing env file is an error naming the path, and the
+    /// walk-up — which WOULD find a credential here — is not consulted.
+    #[test]
+    fn discovery_refuses_a_missing_env_file_without_walking_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join(".mcp.json"), proxy_mcp_json(9876, "root-nonce")).unwrap();
+        let missing = root.join("retired").join("session.mcp.json");
+
+        let err = discover_session_mcp_config(root, Some(missing.as_os_str())).unwrap_err();
+        assert!(
+            matches!(&err, DiscoveryError::EnvFileUnreadable { path, .. } if path == &missing),
+            "{err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains(&missing.display().to_string()), "{msg}");
+        assert!(msg.contains(MCP_CONFIG_ENV), "{msg}");
+        assert!(!msg.contains("root-nonce"), "{msg}");
+    }
+
+    /// A set env file that parses to no nonce entry (garbage, or a static
+    /// bearer) is the same refusal class: no walk-up.
+    #[test]
+    fn discovery_refuses_a_credential_less_env_file_without_walking_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join(".mcp.json"), proxy_mcp_json(9876, "root-nonce")).unwrap();
+        for (i, body) in [
+            "not json".to_string(),
+            r#"{"mcpServers":{}}"#.to_string(),
+            r#"{"mcpServers":{"coord-mcp":{"url":"https://coord.qontinui.io/coord-mcp","headers":{"Authorization":"Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2ln"}}}}"#.to_string(),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let own = root.join(format!("own-{i}.json"));
+            std::fs::write(&own, body).unwrap();
+            let err = discover_session_mcp_config(root, Some(own.as_os_str())).unwrap_err();
+            assert!(
+                matches!(&err, DiscoveryError::EnvFileNoCredential { path } if path == &own),
+                "body {body:?}: {err:?}"
+            );
+            assert!(err.to_string().contains(&own.display().to_string()));
+        }
     }
 
     /// Write a stdio-shim `.mcp.json` into `dir` in the shape
