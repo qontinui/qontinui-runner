@@ -1207,6 +1207,31 @@ pub fn cognito_cancel_sign_in(attempt_id: u64) -> bool {
     qontinui_runner_lib::cognito::cancel_pending_sign_in(attempt_id)
 }
 
+/// Refuse a sign-in `base` THIS build would never dial.
+///
+/// A release build drops a machine-local (loopback or bind-all `0.0.0.0`/`::`)
+/// persisted `backend_url` at read time —
+/// [`crate::api_config::persisted_backend_url_refused`] is the single
+/// expression of that rule, and this asks it rather than restating it. Signing
+/// in against such a base pairs the device with a backend the runner never
+/// dials, and `finalize_signed_in` would then write that base BACK into
+/// `web_integration.backend_url`, re-persisting the value the read path had
+/// been ignoring. Refusing here, before any browser opens or network call,
+/// closes that write-back for every caller.
+///
+/// `is_debug` is a parameter so both build settings are unit-testable; live
+/// callers pass `cfg!(debug_assertions)`.
+fn refuse_undialable_sign_in_base(base: &str, is_debug: bool) -> Result<(), AppError> {
+    if crate::api_config::persisted_backend_url_refused(base, is_debug) {
+        return Err(AppError::Raw(format!(
+            "Cannot sign in to {base}: this release build does not dial \
+             machine-local backends (loopback such as 127.0.0.1/localhost/::1, \
+             or bind-all 0.0.0.0/::). Use a remote backend URL."
+        )));
+    }
+    Ok(())
+}
+
 async fn cognito_sign_in_impl(
     backend_url: String,
     identity_provider: Option<String>,
@@ -1215,6 +1240,7 @@ async fn cognito_sign_in_impl(
     if base.is_empty() {
         return Err(AppError::Raw("backend_url is required".to_string()));
     }
+    refuse_undialable_sign_in_base(&base, cfg!(debug_assertions))?;
 
     // 1. RFC-8252 PKCE login (blocking — browser + loopback). Run on a
     //    worker thread so it doesn't block the tokio runtime.
@@ -1499,6 +1525,7 @@ async fn cognito_sign_in_password_impl(
     if base.is_empty() {
         return Err(AppError::Raw("backend_url is required".to_string()));
     }
+    refuse_undialable_sign_in_base(&base, cfg!(debug_assertions))?;
     let email = email.trim().to_string();
     if email.is_empty() {
         return Err(AppError::Raw("email is required".to_string()));
@@ -2270,6 +2297,36 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sign_in_refuses_machine_local_base_only_in_release() {
+        for local in [
+            "http://127.0.0.1:8000",
+            "http://localhost:8000",
+            "http://[::1]:8000",
+            "http://0.0.0.0:8000",
+            "http://[::]:8000",
+        ] {
+            let err = refuse_undialable_sign_in_base(local, false)
+                .expect_err("a release build must refuse a machine-local sign-in base");
+            let msg = err.to_string();
+            assert!(msg.contains(local), "error must name the URL: {msg}");
+            assert!(
+                msg.contains("release build"),
+                "error must state the rule: {msg}"
+            );
+            assert!(
+                refuse_undialable_sign_in_base(local, true).is_ok(),
+                "a debug build must accept {local}"
+            );
+        }
+        for is_debug in [false, true] {
+            assert!(
+                refuse_undialable_sign_in_base("https://api.example.com", is_debug).is_ok(),
+                "a remote base is accepted at is_debug={is_debug}"
+            );
+        }
+    }
 
     /// Every [`RefreshClass`], as an array the tests iterate.
     ///

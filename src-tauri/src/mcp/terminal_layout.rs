@@ -197,11 +197,13 @@ mod tests {
                     page_id: "p-shells".to_string(),
                     label: Some("Shells".to_string()),
                     order: 0,
+                    window: None,
                 },
                 RegisteredPage {
                     page_id: "p-work".to_string(),
                     label: Some("Work".to_string()),
                     order: 1,
+                    window: None,
                 },
             ],
             DateTime::<Utc>::from_timestamp_millis(1_794_128_400_000).unwrap(),

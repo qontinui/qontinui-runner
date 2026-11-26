@@ -158,10 +158,18 @@ impl FrameSourceError {
         Some(serde_json::json!({ "failure_origin": origin, "retryable": retryable }))
     }
 
-    /// The `(status, {success:false, error, code, hint?})` error a `Json`
-    /// vision route returns.
+    /// The `(status, {success:false, error, code, refusal, hint?})` error a
+    /// `Json` vision route returns.
     pub fn to_json_err(&self) -> (StatusCode, Json<ApiResponse<()>>) {
-        let mut body = ApiResponse::error_with_code(self.to_string(), self.code());
+        let message = self.to_string();
+        let refusal = crate::mcp::refusal_envelope::refusal_for_envelope(
+            self.code(),
+            self.status(),
+            Some(&message),
+            None,
+            None,
+        );
+        let mut body = ApiResponse::error_with_refusal(message, self.code(), refusal);
         body.hint = self.hint();
         (self.status(), Json(body))
     }

@@ -64,8 +64,11 @@
 //!   read yet, capacity data older than [`MODEL_STALE_AFTER`] (the read's own
 //!   age plus coord's cache age plus the sample's), an UNKNOWN row or
 //!   `slots.C1`, a row or an answer that does not say how old it is, a dial
-//!   never read in this process, or a dial that does not permit consumer
-//!   [`CONSUMER`] (D9).
+//!   never read in this process, a dial that does not permit consumer
+//!   [`CONSUMER`] (D9), or a dial and a row that are not from one coord (the
+//!   row's `coord_base` and the dial's differ, or either is unknown: a dial kept
+//!   from a coord this runner has left must not permit sizing from another
+//!   coord's row, [`answer_from`]).
 //! * **A failed refetch keeps the last KNOWN row** while it is younger than
 //!   [`MODEL_STALE_AFTER`] ([`read_to_size_from`]): one coord hiccup does not
 //!   drop the node to the static partition and back.

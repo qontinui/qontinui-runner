@@ -485,7 +485,7 @@ fn batch_execute_bad_request(error: &str, detail: &str) -> (StatusCode, Json<Api
             error_detail: None,
             hint: None,
             code: None,
-            suggestions: None,
+            refusal: None,
         }),
     )
 }
@@ -1402,7 +1402,7 @@ async fn ui_bridge_batch_handler_dispatch(
                 error_detail: None,
                 hint: None,
                 code: None,
-                suggestions: None,
+                refusal: None,
             }),
         ));
     }
@@ -1547,7 +1547,7 @@ async fn ui_bridge_control_batch_handler_dispatch(
                 error_detail: None,
                 hint: None,
                 code: None,
-                suggestions: None,
+                refusal: None,
             }),
         ));
     }
@@ -1652,7 +1652,7 @@ async fn ui_bridge_control_batch_handler_dispatch(
             error_detail: None,
             hint: None,
             code: None,
-            suggestions: None,
+            refusal: None,
         }))
     }
 }

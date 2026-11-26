@@ -400,7 +400,16 @@ pub(crate) async fn launch(
     // three are provisioned as before, each skipping a destination the
     // enclosing repo tracks.
     let coord_mcp = crate::coord_mcp::provision_coord_mcp_for_session(&workdir_s, bound_port, None);
-    crate::agent_worktree::isolated_edit::provision_fleet_for_cwd(&workdir_s);
+    // The fleet provisioning on the blocking pool: each pass joins a registry
+    // fetch and polls a `git ls-files` child (plan
+    // 2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap, D2).
+    {
+        let wd = workdir_s.clone();
+        crate::spawn_off_worker::run_provisioning_off_worker(&workdir_s, move || {
+            crate::agent_worktree::isolated_edit::provision_fleet_for_cwd(&wd);
+        })
+        .await;
+    }
 
     // Most-available account, so the child does not spawn under a
     // quota-exhausted default and die on its first request.
@@ -618,7 +627,7 @@ mod tests {
             .split_once("pub(crate) async fn launch(")
             .expect("launch");
         let (launch, _) = launch.split_once("\n}\n").expect("end of launch");
-        assert!(launch.contains("isolated_edit::provision_fleet_for_cwd(&workdir_s)"));
+        assert!(launch.contains("isolated_edit::provision_fleet_for_cwd(&wd)"));
         for ungated in [
             "provision_agent_definitions_recorded(",
             "provision_fleet_commands_for_session(",

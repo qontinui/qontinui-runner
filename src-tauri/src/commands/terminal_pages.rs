@@ -33,7 +33,7 @@ pub const MAX_LABEL_CHARS: usize = 256;
 /// What a truncated label ends with.
 pub const TRUNCATION_MARK: char = '\u{2026}';
 
-/// One page as the webview sends it: `{pageId, label, order}`.
+/// One page as the webview sends it: `{pageId, label, order, window}`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PageLabelInput {
@@ -46,6 +46,13 @@ pub struct PageLabelInput {
     /// fractional value does not deserialize, so the call is refused before it
     /// reaches the registry.
     pub order: u32,
+    /// The window the page is shown in: the pop-out window's label when the
+    /// page is detached into one, otherwise `"main"` (plan
+    /// `2026-11-16-runner-page-name-reaches-the-coord-session-identity-card`,
+    /// D8). Blank or absent (a webview predating D8) is kept as no window.
+    /// Capped like a label ([`truncate_label`]).
+    #[serde(default)]
+    pub window: Option<String>,
 }
 
 /// Validate one registration and put it in registered order: by `order`,
@@ -81,12 +88,20 @@ pub fn normalize_registration(pages: Vec<PageLabelInput>) -> Result<Vec<Register
             .label
             .map(|l| truncate_label(l.trim()))
             .filter(|l| !l.is_empty());
+        // A window label is an identifier, not display text: keep it verbatim
+        // or drop it. A cut one would name no real window (plan D8 "never
+        // guessed"), so a label over the cap is dropped, not truncated.
+        let window = page
+            .window
+            .map(|w| w.trim().to_string())
+            .filter(|w| !w.is_empty() && w.chars().count() <= MAX_LABEL_CHARS);
         ordered.push((
             position,
             RegisteredPage {
                 page_id: page.page_id,
                 label,
                 order: page.order,
+                window,
             },
         ));
     }
@@ -109,7 +124,7 @@ pub fn truncate_label(label: &str) -> String {
 }
 
 /// Replace this runner's tab-label registration with the webview's full page
-/// list, `{"pages": [{"pageId", "label", "order"}]}`.
+/// list, `{"pages": [{"pageId", "label", "order", "window"}]}`.
 ///
 /// Answers `{registered: <pages kept>, registeredAt: <rfc3339>}`; a refused
 /// list (see [`normalize_registration`]) is an error and changes nothing.
@@ -128,6 +143,9 @@ fn register_into(
     let pages = normalize_registration(pages)?;
     let count = pages.len();
     registry.replace(PageLabels::new(pages, at));
+    // A rename, reorder, page added/removed or pop-out (un)binding: post the
+    // session census early so coord's card follows within seconds (D7a).
+    crate::session_placement::request_census_post();
     Ok(CommandResponse {
         success: true,
         message: None,
@@ -152,6 +170,7 @@ mod tests {
             page_id: page_id.to_string(),
             label: label.map(str::to_string),
             order,
+            window: None,
         }
     }
 
@@ -213,6 +232,37 @@ mod tests {
         assert_eq!(
             served,
             vec![("p-b".to_string(), Some("Renamed".to_string()))]
+        );
+    }
+
+    /// The window travels with each page: a pop-out label is kept, a blank
+    /// or absent one is no window, and an over-long one is DROPPED (a cut
+    /// identifier would name no real window).
+    #[test]
+    fn each_page_keeps_the_window_it_is_shown_in() {
+        let long = "w".repeat(MAX_LABEL_CHARS + 10);
+        let pages: Vec<PageLabelInput> = serde_json::from_value(serde_json::json!([
+            {"pageId": "default", "label": "Terminal", "order": 0, "window": "main"},
+            {"pageId": "p-pop", "label": "Popped", "order": 1, "window": " terminal-popout-3 "},
+            {"pageId": "p-blank", "order": 2, "window": "  "},
+            {"pageId": "p-old", "order": 3},
+            {"pageId": "p-long", "order": 4, "window": long},
+        ]))
+        .expect("the webview's shape deserializes");
+        let windows: Vec<(String, Option<String>)> = normalize_registration(pages)
+            .unwrap()
+            .into_iter()
+            .map(|p| (p.page_id, p.window))
+            .collect();
+        assert_eq!(
+            windows,
+            vec![
+                ("default".to_string(), Some("main".to_string())),
+                ("p-pop".to_string(), Some("terminal-popout-3".to_string())),
+                ("p-blank".to_string(), None),
+                ("p-old".to_string(), None),
+                ("p-long".to_string(), None),
+            ]
         );
     }
 

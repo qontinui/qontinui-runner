@@ -229,6 +229,27 @@ pub fn publish_custody(verdicts: &[(String, CustodyVerdict)], judged_at_ms: i64)
     *map = next;
 }
 
+/// Attach each session's ledger-path resolutions to the view
+/// [`publish_custody`] just published for it (Phase 5 of plan
+/// `2026-11-22-wind-down-custody-probe-and-undelivered-guard-read-unknown-where-they-can-decide`).
+/// A session with no published view gets nothing.
+pub fn publish_custody_resolutions(
+    resolutions: &[(
+        String,
+        Vec<qontinui_runner_lib::wind_down::WorktreeResolution>,
+    )],
+) {
+    let mut map = match last_custody_map().lock() {
+        Ok(m) => m,
+        Err(e) => e.into_inner(),
+    };
+    for (session_id, worktrees) in resolutions {
+        if let Some(view) = map.get_mut(session_id) {
+            view.worktrees = worktrees.clone();
+        }
+    }
+}
+
 /// The arm's last custody view for a session, if its latest pass judged it.
 pub fn last_custody(claude_session_id: &str) -> Option<CustodyView> {
     let map = match last_custody_map().lock() {
@@ -540,6 +561,25 @@ mod tests {
         );
         let b = last_custody("fc-b").unwrap();
         assert_eq!((b.verdict, b.judged_at), ("unknown", 8));
+        assert!(b.worktrees.is_empty(), "no resolution published yet");
+
+        // Phase 5: the roots tried and the resolved root ride on the view.
+        publish_custody_resolutions(&[
+            (
+                "fc-b".to_string(),
+                vec![qontinui_runner_lib::wind_down::WorktreeResolution {
+                    ledger_path: "agent-worktrees/a/repo".to_string(),
+                    roots_tried: vec![
+                        "/ws/agent-worktrees".to_string(),
+                        "/ws/qontinui-worktrees".to_string(),
+                    ],
+                    resolved: vec!["/ws/qontinui-worktrees/a/repo".to_string()],
+                    outcome: "found",
+                }],
+            ),
+            ("fc-never-judged".to_string(), Vec::new()),
+        ]);
+        assert!(last_custody("fc-never-judged").is_none());
 
         // ...and `/restart-readiness` attaches exactly that to `windDown`.
         // Kept in THIS test: the published map is process-global, and a
@@ -571,6 +611,11 @@ mod tests {
         );
         assert_eq!(json[1]["windDown"]["custody"]["verdict"], "unknown");
         assert_eq!(json[1]["windDown"]["custody"]["reason"], "no_session_dir");
+        let wt = &json[1]["windDown"]["custody"]["worktrees"][0];
+        assert_eq!(wt["ledgerPath"], "agent-worktrees/a/repo");
+        assert_eq!(wt["rootsTried"][1], "/ws/qontinui-worktrees");
+        assert_eq!(wt["resolved"][0], "/ws/qontinui-worktrees/a/repo");
+        assert_eq!(wt["outcome"], "found");
     }
 
     /// The obligations map is its own process-global, so this test keys on ids
