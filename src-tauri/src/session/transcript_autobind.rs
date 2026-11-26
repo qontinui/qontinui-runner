@@ -230,7 +230,8 @@ fn note_refusal(key: &str, gate: BindGate) -> bool {
         != Some(gate)
 }
 
-/// `key` is bound: forget its standing refusal.
+/// `key`'s gate read open (whether or not it then bound): forget its
+/// standing refusal.
 fn forget_refusal(key: &str) {
     if let Some(m) = REFUSALS
         .lock()
@@ -973,6 +974,21 @@ mod tests {
             ..off
         };
         assert!(note_refusal(&key, other), "a different scope is new");
+        assert_eq!(
+            apply_decision(
+                &t,
+                &id,
+                &path,
+                &Decision::Defer("coord dark".into()),
+                CLOSED
+            ),
+            Some(AutoBindKind::Deferred)
+        );
+        assert_eq!(
+            standing_refusal(&key),
+            Some(other),
+            "a closed gate keeps it"
+        );
         assert_eq!(
             apply_decision(&t, &id, &path, &Decision::Defer("coord dark".into()), OPEN),
             Some(AutoBindKind::Deferred)
