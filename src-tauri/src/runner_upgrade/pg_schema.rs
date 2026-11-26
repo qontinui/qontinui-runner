@@ -22,7 +22,7 @@ const FINGERPRINT_SQL: &str = "SELECT count(*)::bigint, \
        || ':' || data_type::text, ',' ORDER BY table_schema, table_name, column_name)), '') \
      FROM information_schema.columns WHERE table_schema::text = ANY($1::text[])";
 
-const READ_TIMEOUT: Duration = Duration::from_secs(5);
+pub const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// `md5:<hex>/<column count>` for the running database, or why it could not be
 /// read (no database configured, a timeout, a query error). An `Err` is

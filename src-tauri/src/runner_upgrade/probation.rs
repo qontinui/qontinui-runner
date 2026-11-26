@@ -65,13 +65,17 @@ pub struct ProbationTiming {
 pub const SCHEMA_READ_ATTEMPTS: u32 = 10;
 pub const SCHEMA_READ_RETRY: Duration = Duration::from_secs(3);
 
+/// The longest one `/health` read over loopback may take.
+pub const HEALTH_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
 impl ProbationTiming {
     /// The longest probation can take with these timings, counting the
-    /// schema read that precedes it. Resumes are bounded separately and are
-    /// covered by the guard's margin.
+    /// schema read that precedes it and the time each read itself may take
+    /// (every attempt can run to its timeout before the retry wait). Resumes
+    /// are bounded separately and are covered by the guard's margin.
     pub fn worst_case(&self) -> Duration {
-        SCHEMA_READ_RETRY * SCHEMA_READ_ATTEMPTS
-            + self.health_interval * self.health_attempts.max(1)
+        (SCHEMA_READ_RETRY + super::pg_schema::READ_TIMEOUT) * SCHEMA_READ_ATTEMPTS
+            + (self.health_interval + HEALTH_READ_TIMEOUT) * self.health_attempts.max(1)
             + self.sweep_timeout
     }
 }
@@ -406,7 +410,7 @@ async fn successor_boot(app: &tauri::AppHandle, port: u16, path: &Path, mut rec:
     // Under the record lock: the guard may have acted while probation ran,
     // and must not act between this re-read and the conclusion.
     let lock_path = path.to_path_buf();
-    let _lock = match tokio::task::spawn_blocking(move || record::lock_record(&lock_path)).await {
+    let lock = match tokio::task::spawn_blocking(move || record::lock_record(&lock_path)).await {
         Ok(Ok(l)) => l,
         Ok(Err(e)) => {
             warn!(error = %e, "runner upgrade: the record lock was not taken; probation is not recorded and the guard decides");
@@ -440,6 +444,9 @@ async fn successor_boot(app: &tauri::AppHandle, port: u16, path: &Path, mut rec:
         warn!(error = %e, "runner upgrade: probation could not be recorded");
         return;
     }
+    // Release before reporting and waiting: on a failed probation the guard
+    // needs this lock at its deadline to roll back.
+    drop(lock);
     if passed {
         info!(id = %rec.id, "runner upgrade: probation passed; guard cancelled");
         return;

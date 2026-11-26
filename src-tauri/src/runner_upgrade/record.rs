@@ -362,12 +362,29 @@ pub fn latest_open_record(dir: &Path) -> Option<(PathBuf, UpgradeRecord)> {
         .find(|(_, r)| r.state.guard_should_act())
 }
 
-/// The ids of every upgrade still open (`in_flight` or `probation_failed`):
-/// a guard is armed for each, and a second upgrade armed beside it would race
-/// it for the `current` link. A missing directory is no upgrade yet. An
-/// unreadable directory or record is `Err`, because the open set is then
-/// UNKNOWN, never empty.
-pub fn open_upgrade_ids(dir: &Path) -> Result<Vec<String>, String> {
+/// How long past its guard's deadline an open record may sit before it is
+/// read as stranded: the guard has had its window and a margin, and acted on
+/// nothing.
+pub const STRANDED_AFTER: chrono::Duration = chrono::Duration::minutes(10);
+
+/// One upgrade still open (`in_flight` or `probation_failed`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenUpgrade {
+    pub id: String,
+    pub path: PathBuf,
+    /// Past its deadline by more than [`STRANDED_AFTER`], or with an
+    /// unparseable deadline: no guard can be expected to conclude it.
+    pub stranded: bool,
+}
+
+/// Every upgrade still open as of `now`: a guard is armed for each, and a
+/// second upgrade armed beside it would race it for the `current` link. A
+/// missing directory is no upgrade yet. An unreadable directory or record is
+/// `Err`, because the open set is then UNKNOWN, never empty.
+pub fn open_upgrades(
+    dir: &Path,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<OpenUpgrade>, String> {
     match std::fs::metadata(dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(format!("{}: {e}", dir.display())),
@@ -388,7 +405,16 @@ pub fn open_upgrade_ids(dir: &Path) -> Result<Vec<String>, String> {
     Ok(good
         .into_iter()
         .filter(|(_, r)| r.state.guard_should_act())
-        .map(|(_, r)| r.id)
+        .map(|(path, r)| {
+            let stranded = chrono::DateTime::parse_from_rfc3339(&r.deadline)
+                .map(|d| d.with_timezone(&chrono::Utc) + STRANDED_AFTER < now)
+                .unwrap_or(true);
+            OpenUpgrade {
+                id: r.id,
+                path,
+                stranded,
+            }
+        })
         .collect())
 }
 
@@ -499,20 +525,41 @@ mod tests {
     }
 
     #[test]
-    fn open_upgrade_ids_lists_open_records_and_an_unreadable_one_is_unknown() {
+    fn open_upgrades_lists_open_records_marks_stranded_ones_and_an_unreadable_one_is_unknown() {
         let d = tempfile::tempdir().unwrap();
-        assert_eq!(open_upgrade_ids(&d.path().join("absent")), Ok(Vec::new()));
-        assert_eq!(open_upgrade_ids(d.path()), Ok(Vec::new()));
+        // The sample's deadline is 2026-11-24T22:03:00Z.
+        let before = chrono::DateTime::parse_from_rfc3339("2026-11-24T22:05:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let after = before + chrono::Duration::minutes(30);
+        assert_eq!(
+            open_upgrades(&d.path().join("absent"), before),
+            Ok(Vec::new())
+        );
+        assert_eq!(open_upgrades(d.path(), before), Ok(Vec::new()));
         let mut done = sample_record(d.path());
         done.id = "20261123T000000.000Z".into();
         done.state = UpgradeState::ProbationPassed;
         write_record(&record_path(d.path(), &done.id), &done).unwrap();
-        assert_eq!(open_upgrade_ids(d.path()), Ok(Vec::new()));
+        assert_eq!(open_upgrades(d.path(), before), Ok(Vec::new()));
         let open = sample_record(d.path());
-        write_record(&record_path(d.path(), &open.id), &open).unwrap();
-        assert_eq!(open_upgrade_ids(d.path()), Ok(vec![open.id.clone()]));
+        let path = record_path(d.path(), &open.id);
+        write_record(&path, &open).unwrap();
+        let fresh = OpenUpgrade {
+            id: open.id.clone(),
+            path: path.clone(),
+            stranded: false,
+        };
+        assert_eq!(open_upgrades(d.path(), before), Ok(vec![fresh.clone()]));
+        assert_eq!(
+            open_upgrades(d.path(), after),
+            Ok(vec![OpenUpgrade {
+                stranded: true,
+                ..fresh
+            }])
+        );
         std::fs::write(d.path().join("20261125T000000.000Z.json"), "{not json").unwrap();
-        assert!(open_upgrade_ids(d.path()).is_err());
+        assert!(open_upgrades(d.path(), before).is_err());
     }
 
     #[cfg(unix)]

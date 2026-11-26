@@ -322,9 +322,9 @@ pub struct PreflightInputs<'a> {
     /// ([`super::listener_fds::registered`]).
     pub self_managed_fds: usize,
     pub pg_schema: Result<String, String>,
-    /// [`super::record::open_upgrade_ids`]: upgrades whose guard is still
+    /// [`super::record::open_upgrades`]: upgrades whose guard is still
     /// armed. `Err` when the upgrade records could not be read.
-    pub open_upgrades: Result<Vec<String>, String>,
+    pub open_upgrades: Result<Vec<super::record::OpenUpgrade>, String>,
     pub checked_at: String,
 }
 
@@ -367,14 +367,31 @@ pub fn evaluate(inputs: PreflightInputs<'_>, runner: &dyn CommandRunner) -> Pref
     // upgrade would arm another against the same `current` link.
     checks.push(match &inputs.open_upgrades {
         Err(e) => Check::unknown(NO_UPGRADE_IN_FLIGHT, e.clone()),
-        Ok(ids) if ids.is_empty() => {
+        Ok(open) if open.is_empty() => {
             Check::pass(NO_UPGRADE_IN_FLIGHT, "no upgrade is in flight or awaiting its guard")
         }
-        Ok(ids) => Check::fail(
+        Ok(open) if open.iter().any(|u| !u.stranded) => Check::fail(
             NO_UPGRADE_IN_FLIGHT,
             format!(
                 "upgrade(s) {} still open (in flight or probation failed); wait for its guard or probation to conclude",
-                ids.join(", ")
+                open.iter()
+                    .filter(|u| !u.stranded)
+                    .map(|u| u.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ),
+        // Every open record is past its guard's window: no guard will
+        // conclude it, so waiting is not an answer. Whether it is safe to
+        // start another is not established either.
+        Ok(open) => Check::unknown(
+            NO_UPGRADE_IN_FLIGHT,
+            format!(
+                "upgrade record(s) {} are still open well past their guard's deadline, so no guard concluded them; read each record, confirm which build `current` serves, and set its state by hand before upgrading again",
+                open.iter()
+                    .map(|u| u.path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
         ),
     });
@@ -1612,12 +1629,35 @@ pub(crate) mod tests {
         let f = fixture();
         let runner = healthy_runner(&f);
 
+        let open = |stranded| crate::runner_upgrade::record::OpenUpgrade {
+            id: "20261124T220000.000Z".into(),
+            path: "/u/20261124T220000.000Z.json".into(),
+            stranded,
+        };
         let mut i = inputs(&f, Ok(healthy_census()));
-        i.open_upgrades = Ok(vec!["20261124T220000.000Z".into()]);
+        i.open_upgrades = Ok(vec![open(false)]);
         let r = evaluate(i, &runner);
         assert_eq!(verdict_of(&r, names::NO_UPGRADE_IN_FLIGHT), Verdict::Fail);
         assert_eq!(r.blocking, vec![names::NO_UPGRADE_IN_FLIGHT]);
         assert!(!r.ok);
+
+        // Stranded past its guard's window: UNKNOWN naming the record, not
+        // "wait for its guard".
+        let mut i = inputs(&f, Ok(healthy_census()));
+        i.open_upgrades = Ok(vec![open(true)]);
+        let r = evaluate(i, &runner);
+        let c = r
+            .checks
+            .iter()
+            .find(|c| c.name == names::NO_UPGRADE_IN_FLIGHT)
+            .unwrap();
+        assert_eq!(c.verdict, Verdict::Unknown);
+        assert!(
+            c.detail.contains("/u/20261124T220000.000Z.json"),
+            "{}",
+            c.detail
+        );
+        assert_eq!(r.blocking, vec![names::NO_UPGRADE_IN_FLIGHT]);
 
         let mut i = inputs(&f, Ok(healthy_census()));
         i.open_upgrades = Err("1 unreadable upgrade record(s)".into());
