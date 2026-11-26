@@ -6003,6 +6003,39 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// title declaration. Without that door, when the title recorded nothing, only the
 /// gate's registrant could move it, and no operator twin of the re-point exists.
 ///
+/// `coord_attest_intent_carried` and its undo `coord_retract_intent_attestation`
+/// are IN beside it (plan
+/// `2026-11-26-a-closed-duplicate-whose-successor-carries-its-intent-with-different-content-can-be-finished`
+/// Phase 3). They cover the case the declaration above cannot settle: a PR closed
+/// unmerged whose landed successor carries the same intent with DIFFERENT content,
+/// so ancestry, patch-id and tree equality all fail. The tool records an
+/// independently reviewed attestation of that, as a `coord.pr_events` row on the
+/// predecessor. The row names both PRs, the duplicate head sha, the successor land
+/// sha, the reviewer's `independence` object, and the coord finding that holds the
+/// review. The retract writes a newer row, because the newest row per pair wins,
+/// so nothing is deleted. coord reads a live attestation as a fourth `ClosedWork`
+/// evidence form. It counts only when the cited finding still resolves, the
+/// attested head is the PR's CURRENT head, the successor's land is terminal, and
+/// the finding's body contains both full shas. Otherwise it contributes nothing.
+/// coord refuses the write when the PR is not closed-unlanded, the successor has
+/// not landed, the caller's tenant does not own both repos, the head does not
+/// match, the finding does not resolve or lacks a sha, or `independence` is
+/// missing or blank.
+///
+/// What a caller can do with it: turn a closed PR's `not_watched` verdict, and
+/// its `failed` `pr_merged` gate's, into `retired`. That is a FINISH input, so it
+/// is not a read. It lands nothing, closes nothing, and clears or moves no gate.
+/// What coord checks mechanically is that the review is bound to those two heads.
+/// The reviewer's independence is recorded, not proven: a session holding this
+/// proxy's nonce can also post the finding (`coord_post_finding` is forwarded
+/// here). coord's grant (`mcp/agent_tool_access.rs`, beside
+/// `coord_declare_supersession`) is the authority on who may call it, and this
+/// list only forwards. The coord half is the same plan's Phase 2 and was not on
+/// coord `origin/main` when these entries were written. Until it deploys, coord
+/// answers both names as unknown tools, so forwarding them early is harmless.
+/// Re-verify the tool names against coord `origin/main` when editing this
+/// paragraph.
+///
 /// `coord_correct_gate` is IN for the same gate-verb family's reason (plan
 /// `2026-09-21-a-cleared-gate-is-uncorrectable-and-every-repair-mints-another-false-green-row`
 /// Phase 8). It does NOT correct a gate's predicate or outcome: it records a
@@ -6277,6 +6310,12 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_answer_agent_question",
     "coord_ask_question",
     "coord_attest_gate",
+    // Plan 2026-11-26-a-closed-duplicate-whose-successor-carries-its-intent-with-different-content-can-be-finished
+    // Phase 3: the reviewed intent attestation for a closed duplicate whose
+    // landed successor carries its intent with different content. coord
+    // verifies every precondition and its grant is the authority; this list
+    // only forwards. Risk and limits: the doc comment above.
+    "coord_attest_intent_carried",
     // Plan 2026-11-02-publishing-state-is-unreadable-to-agents-and-to-anchors
     // Phase 1: the auto-publish status read (twin `GET
     // /coord/agent-prompt-documents/auto-publish/status`), served by
@@ -6479,6 +6518,9 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_resolve_origin",
     "coord_resolve_pr_author_session",
     "coord_resolve_session",
+    // Same plan/phase: the undo of `coord_attest_intent_carried`. It writes a
+    // retraction row (the newest row per pair wins) and never deletes one.
+    "coord_retract_intent_attestation",
     "coord_secret_presence",
     "coord_send_message",
     // Plan 2026-10-01-a-commit-author-session-is-unreachable-because-every-session-roster-is-per-account
@@ -17958,6 +18000,55 @@ mod coord_mcp_body_gate_tests {
                 1,
                 "the parser must read {tool} exactly once: {:?}",
                 parsed.allowed
+            );
+        }
+        assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
+    }
+
+    /// Plan `2026-11-26-a-closed-duplicate-whose-successor-carries-its-intent-with-different-content-can-be-finished`
+    /// Phase 3: coord's intent-attestation pair forwards. Each name sits in
+    /// sorted position, because membership is a `binary_search` and an
+    /// out-of-place entry would answer `-32601` while this list reads as if it
+    /// were open. Each passes the proxy's body gate as a `tools/call`, is not
+    /// also a deliberate exclusion, and is read back exactly once by the
+    /// source-text parser `build_drift` runs over this file. The comments above
+    /// the entries name the tools in backticks, so they must not add a phantom.
+    /// Both are WRITES: the transport-rung classifier must not file either
+    /// under its read set.
+    #[test]
+    fn intent_attestation_tools_are_allowed_and_parse_from_source() {
+        let parsed = working_tree_tool_policy();
+        for tool in [
+            "coord_attest_intent_carried",
+            "coord_retract_intent_attestation",
+        ] {
+            assert!(coord_mcp_tool_is_allowed(tool), "{tool} must forward");
+            assert!(
+                COORD_MCP_ALLOWED_TOOLS.binary_search(&tool).is_ok(),
+                "{tool} must sit in sorted position in COORD_MCP_ALLOWED_TOOLS"
+            );
+            assert!(
+                !coord_mcp_withholding_is_deliberate(tool),
+                "{tool} must not also be a deliberate exclusion"
+            );
+            assert!(
+                gate(serde_json::json!({
+                    "jsonrpc":"2.0","id":1,"method":"tools/call",
+                    "params":{"name":tool,"arguments":{}}
+                }))
+                .is_ok(),
+                "{tool} must be callable through the proxy"
+            );
+            assert_eq!(
+                parsed.allowed.iter().filter(|t| t.as_str() == tool).count(),
+                1,
+                "the parser must read {tool} exactly once: {:?}",
+                parsed.allowed
+            );
+            assert_eq!(
+                crate::session::coord_transport_rung::operation_for_call("tools/call", Some(tool)),
+                crate::session::coord_transport_rung::OPERATION_WRITE,
+                "{tool} writes a pr_events row and must classify as a write"
             );
         }
         assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
