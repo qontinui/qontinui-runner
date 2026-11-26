@@ -124,11 +124,31 @@ describe("applySessionBound", () => {
   });
 
   it("an agreeing bind is a no-op at every grade, provider-reported or not", () => {
-    const tabs = [{ id: "term-1", claudeSessionId: "sess-1" }];
+    const tabs = [
+      { id: "term-1", claudeSessionId: "sess-1", claudeConfigDir: "C:/claude/.claude-gmail" },
+    ];
     for (const origin of ["observed", "reconciled", "authoritative"]) {
       expect(applySessionBound(tabs, payload({ origin }))).toBeNull();
       expect(applySessionBound(tabs, payload({ origin, providerReported: true }))).toBeNull();
     }
+  });
+
+  it("a same-id payload with a different config dir re-stamps ONLY the config dir", () => {
+    const tabs = [
+      { id: "term-1", claudeSessionId: "sess-1", claudeConfigDir: "C:/claude/.claude" },
+    ];
+    // The runner's config-dir repair: inferred (not provider-reported), same id.
+    expect(applySessionBound(tabs, payload({ origin: "authoritative" }))).toEqual({
+      tabId: "term-1",
+      claudeSessionId: "sess-1",
+      claudeConfigDir: "C:/claude/.claude-gmail",
+    });
+    // An unknown ("") config dir is not a correction.
+    expect(applySessionBound(tabs, payload({ configDir: "" }))).toBeNull();
+    // A tab that knew no config dir learns it.
+    expect(
+      applySessionBound([{ id: "term-1", claudeSessionId: "sess-1" }], payload())?.claudeConfigDir,
+    ).toBe("C:/claude/.claude-gmail");
   });
 
   it("an UNBOUND tab is still stamped by any grade, provider-reported or not", () => {
@@ -155,5 +175,30 @@ describe("applySessionBound", () => {
     const tabs = [{ id: "term-1" }, { id: "" }];
     expect(applySessionBound(tabs, payload({ sessionId: "" }))).toBeNull();
     expect(applySessionBound(tabs, payload({ terminalId: "" }))).toBeNull();
+  });
+});
+
+describe("same-id config dir spelling variants", () => {
+  it("a respelling of the tab's own config dir does not re-stamp", () => {
+    const tabs = [
+      { id: "term-1", claudeSessionId: "sess-a", claudeConfigDir: "C:/claude/.claude-gmail" },
+    ];
+    for (const cd of ["C:\\claude\\.claude-gmail\\", "c:/claude/.claude-gmail/", " C:/claude/.claude-gmail "]) {
+      expect(
+        applySessionBound(tabs, payload({ terminalId: "term-1", sessionId: "sess-a", configDir: cd })),
+      ).toBeNull();
+    }
+  });
+
+  it("a genuinely different config dir still re-stamps", () => {
+    const tabs = [
+      { id: "term-1", claudeSessionId: "sess-a", claudeConfigDir: "C:/claude/.claude-gmail" },
+    ];
+    expect(
+      applySessionBound(
+        tabs,
+        payload({ terminalId: "term-1", sessionId: "sess-a", configDir: "C:/claude/.claude-paktis" }),
+      )?.claudeConfigDir,
+    ).toBe("C:/claude/.claude-paktis");
   });
 });

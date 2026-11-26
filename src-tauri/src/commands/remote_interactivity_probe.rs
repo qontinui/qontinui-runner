@@ -1183,7 +1183,7 @@ impl Drop for ProbePaneGuard<'_> {
         // sweep treats the pane as finished.
         let _ = self.pane.release(Duration::ZERO);
         let _ = self.pane.kill(Duration::ZERO);
-        self.doors.forget(self.pane.grant_jti());
+        self.doors.forget(&self.pane.grant_jti());
         warn!(
             grant_jti = %self.pane.grant_jti(),
             detach = ?self.pane.detach_outcome(),

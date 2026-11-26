@@ -528,8 +528,13 @@ mod tests {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(body["success"], false);
         assert_eq!(body["code"], "INVALID_REQUEST");
-        let suggestions = body["suggestions"].as_array().expect("suggestions array");
-        assert!(!suggestions.is_empty(), "suggestions must not be empty");
+        assert_eq!(body["refusal"]["next_action"]["kind"], "fix_request");
+        assert!(
+            body["refusal"]["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains("Hints: ")),
+            "the type's hints must reach refusal.detail: {body}"
+        );
         let hint = &body["hint"];
         assert!(!hint.is_null(), "hint must carry allowedModes");
         let modes = hint["allowedModes"].as_array().expect("allowedModes array");
@@ -548,17 +553,19 @@ mod tests {
         );
     }
 
-    /// Missing `user_prompt` field → 422 with suggestions (both fields are required).
+    /// Missing `user_prompt` field → 422 with hints (both fields are required).
     #[tokio::test]
     async fn generate_prompt_request_missing_user_prompt_gives_422() {
         let (status, body) = send_uib::<GeneratePromptRequest>(r#"{"mode": "generate"}"#).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(body["success"], false);
         assert_eq!(body["code"], "INVALID_REQUEST");
-        // suggestions and hint both populated by RequestHints impl
+        // hints (in refusal.detail) and hint both populated by RequestHints impl
         assert!(
-            !body["suggestions"].is_null(),
-            "suggestions must be present even when user_prompt is missing"
+            body["refusal"]["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains("Hints: ")),
+            "hints must be present even when user_prompt is missing: {body}"
         );
     }
 }

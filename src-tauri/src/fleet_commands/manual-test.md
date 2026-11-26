@@ -84,8 +84,9 @@ the endpoint, which is an UNKNOWN and not an idle reading.
 > ```bash
 > SPAWNER="${SPAWNER:-}"   # re-set in THIS block: your spawner's base URL (shell env does not persist between Bash calls)
 > : "${SPAWNER:?SPAWNER unset in this shell — re-set it if your deployment has a spawner; take the own-runner arm ONLY if your deployment has none}"
+> : "${TEST_PORT:?TEST_PORT unset in this shell -- re-set it from the spawn result}"
 > curl -fsS --max-time 20 "$SPAWNER/runners"               # every runner, not just yours
-> curl -fsS --max-time 25 http://127.0.0.1:$PORT/health     # the temp runner's own build
+> curl -fsS --max-time 25 "http://127.0.0.1:$TEST_PORT/health"   # the temp runner's own build
 > ```
 >
 > A temp runner built from current code that DOES serve the route settles the question
@@ -135,17 +136,35 @@ Lifecycle". Only the operator may restart an active runner.
 # BLOCKING by default — it holds the HTTP request open until a slot frees.
 SPAWNER="${SPAWNER:-}"   # re-set in THIS block: your spawner's base URL (shell env does not persist between Bash calls)
 : "${SPAWNER:?SPAWNER unset in this shell — re-set it if your deployment has a spawner; take the own-runner arm ONLY if your deployment has none}"
-curl -fsS -X POST "$SPAWNER/runners/spawn-test" \
+SPAWN_RESULT=$(curl -fsS -X POST "$SPAWNER/runners/spawn-test" \
   -H "Content-Type: application/json" \
-  -d '{"rebuild": true, "requester_id": "manual-test", "queue_timeout_secs": 600}'
-# Returns: {"id": "test-...", "port": 9877, "api_url": "http://localhost:9877", "ui_bridge_url": "..."}
+  -d '{"rebuild": true, "requester_id": "manual-test", "queue_timeout_secs": 600}') \
+  || { echo "ERROR: spawn-test failed -- there is no temp runner to test against" >&2; exit 1; }
+# Echo the response before parsing it, as Phase 0 does: if a parse below fails,
+# the runner's id is still in the transcript, and that id is what stops it.
+echo "$SPAWN_RESULT"
+# The response carries "id" and "port" (plus "api_url" / "ui_bridge_url", whose
+# host the supervisor may still spell `localhost` -- build the base from "port").
+TEST_PORT=$(echo "$SPAWN_RESULT" | python -c "import sys,json; print(json.load(sys.stdin)['port'])")
+TEST_ID=$(echo "$SPAWN_RESULT" | python -c "import sys,json; print(json.load(sys.stdin)['id'])")
+: "${TEST_PORT:?spawn response carried no port}" "${TEST_ID:?spawn response carried no id}"
 
 # Use the temp runner's port for all testing
-RUNNER_BASE="http://localhost:$PORT/ui-bridge"
+RUNNER_BASE="http://127.0.0.1:$TEST_PORT/ui-bridge"
+echo "Temp runner $TEST_ID on port $TEST_PORT"
+```
 
-# Stop when done (auto-removed). -f so a 404 (wrong/already-dead id) is a
-# non-zero exit rather than a silent leak of a build-pool slot.
-curl -fsS -X POST "$SPAWNER/runners/$ID/stop"
+Stop it when done (it is then auto-removed). That is a later Bash call, so
+re-set `SPAWNER` and `TEST_ID` in it -- the names Phase 0 and Step 3 use;
+Step 3's cleanup below is the full recipe.
+
+```bash
+# -f so a 404 (wrong/already-dead id) is a non-zero exit rather than a silent
+# leak of a build-pool slot; an unset SPAWNER or TEST_ID stops at the `:` line
+# instead of POSTing /runners//stop. The guard has a line of its own so the URL
+# below stays one token, the shape lint check #27 reads.
+: "${SPAWNER:?SPAWNER unset in this shell -- re-set it}" "${TEST_ID:?TEST_ID unset in this shell -- re-set it from the spawn result}"
+curl -fsS -X POST "$SPAWNER/runners/$TEST_ID/stop"
 ```
 
 ## Rebuilding & Restarting Non-Runner Services
@@ -442,12 +461,20 @@ Notes that matter, all of them measured:
 - **The transport is `ui-bridge-inject --exec-stdin`** — NDJSON, one
   `{"action":…,"payload":…}` per line. No relay, so neither relay auth nor LNA
   applies. Payload shape for element actions is `{id, request:{action, value?}}`
-  (`ui-bridge/packages/ui-bridge/src/react/commandHandlers.ts:1090`); sub-actions
-  include click, hoverClick, focus, blur, hover, scrollIntoView, scroll, toggle,
-  doubleClick, type, clear, setValue, select, check, uncheck, submit, reset,
-  sendKeys, drag, alongside top-level `clickByText`, `clickBySelector`,
-  `typeInto`, `readValue`, `sendKeysToPage`, `expectElement`, `find`, `discover`,
-  `getElementTree`. **Read `commandHandlers.ts` for the authoritative list —
+  (`ui-bridge/packages/ui-bridge/src/react/commandHandlers.ts`, the
+  `executeElementAction` handler); sub-actions include click, hoverClick, focus,
+  blur, hover, unhover, scrollIntoView, scroll, toggle, doubleClick, rightClick,
+  middleClick, type, clear, setValue, select, check, uncheck, submit, reset,
+  sendKeys, drag, autocomplete, alongside top-level `clickByText`,
+  `clickBySelector`, `typeInto`, `readValue`, `sendKeysToPage`,
+  `expectElement`, `find`, `discover`, `getElementTree`. Since
+  `@qontinui/ui-bridge` 0.38.0 `hover` forces the real CSS `:hover` state and
+  HOLDS it until `unhover`, the next `hover`/`hoverClick`, a dispatched
+  write-class action, or the TTL (`params.holdMs`, default 30000 ms, ceiling
+  300000), so a step after a `hover` runs against the hovered page only inside
+  that window — see "Reading a hover" in
+  `/ui-bridge`. **Read `commandHandlers.ts` (its `RELAY_ELEMENT_ACTIONS`) for
+  the authoritative list —
   and if the action you need is not there, that is a UI Bridge gap: fix it in the
   Bridge and report it. Never route around it with a Playwright locator.**
 - **An action that FAILS does not come back on the CLI's `error` key.** A Bridge
@@ -484,7 +511,7 @@ Notes that matter, all of them measured:
 
 ### Injected transport — driving a bare pre-auth page (`--transport=injected`)
 
-Some pages ship **zero UI Bridge code** — the sign-in / register / forgot-password pages on prod and staging are plain HTML with no instrumentation. The standard targets above all assume the page already embeds the SDK, so they cannot drive a bare login page. The **injected transport** closes that gap: a Node-side CLI (`ui-bridge-inject`, shipped in `@qontinui/ui-bridge-wrapper`) launches a Chromium tab, navigates to the bare page, injects the UI Bridge engine bundle into it, and (by default) registers that tab as a **relay tab against the qontinui-web relay on the target page's own origin** (`<origin>/api/ui-bridge` — prod `https://qontinui.io/api/ui-bridge`, local dev `http://localhost:<web-port>/api/ui-bridge`) — so the existing `/control/*` plane drives it exactly like any instrumented page.
+Some pages ship **zero UI Bridge code** — the sign-in / register / forgot-password pages on prod and staging are plain HTML with no instrumentation. The standard targets above all assume the page already embeds the SDK, so they cannot drive a bare login page. The **injected transport** closes that gap: a Node-side CLI (`ui-bridge-inject`, shipped in `@qontinui/ui-bridge-wrapper`) launches a Chromium tab, navigates to the bare page, injects the UI Bridge engine bundle into it, and (by default) registers that tab as a **relay tab against the qontinui-web relay on the target page's own origin** (`<origin>/api/ui-bridge` — prod `https://qontinui.io/api/ui-bridge`, local dev `http://localhost:<web-port>/api/ui-bridge`) — so the existing `/control/*` plane drives it exactly like any instrumented page. <!-- runner-localhost-ok: the local web dev server's placeholder port, not a runner's or the supervisor's; that server's bind is unmeasured -->
 
 > **A runner relay IS available now — this note used to say the opposite, and that was stale for ~3 months.** The blockquote here read *"Runners have **no relay-tab protocol**: `GET /ui-bridge/tabs` → 404 … `POST /ui-bridge/heartbeat` is an IPC forward … Registration against a runner can never succeed"*, with the protocol described as "planned … once it ships, re-point this section's `RELAY_BASE` at the temp runner". **It shipped ~7 hours after that sentence was written** — qontinui-runner **#560** (`f58602ff2`, 2026-06-13), the remediation plan's own item 6(a) — and the note was never re-pointed. All three 404 claims are false today. This is the re-point.
 >
@@ -517,7 +544,7 @@ Select it with:
 
 | `--target-url` scheme | Drive path |
 |---|---|
-| `http://` local dev (e.g. `http://localhost:<web-port>/login`, your local web dev server) | **Relay mode (Variant B, the default)** — inject + register the tab against the SAME-ORIGIN local web relay `http://localhost:<web-port>/api/ui-bridge`, drive via `/control/*`. No `--auth-token` needed while the local gate (`UI_BRIDGE_REQUIRE_AUTH`) is off. Full recipe: Phase 0 → Step 1.5. |
+| `http://` local dev (e.g. `http://localhost:<web-port>/login`, your local web dev server) | **Relay mode (Variant B, the default)** — inject + register the tab against the SAME-ORIGIN local web relay `http://localhost:<web-port>/api/ui-bridge`, drive via `/control/*`. No `--auth-token` needed while the local gate (`UI_BRIDGE_REQUIRE_AUTH`) is off. Full recipe: Phase 0 → Step 1.5. <!-- runner-localhost-ok: the local web dev server's placeholder port, not a runner's or the supervisor's; that server's bind is unmeasured --> |
 | `https://` prod/staging (e.g. `https://qontinui.io/login`) | **Relay mode against the SAME-ORIGIN prod web relay** `https://qontinui.io/api/ui-bridge`, **with `--auth-token <Cognito operator IdToken>`** — the prod relay is auth-gated (Bearer-only). LNA never fires on this path: the page fetches its own https origin, no loopback involved. For quick snapshot/find-level checks without a parked session, **Variant A** (`--exec` one-shots, end of Step 1.5) also works; when you need a full login + parked authed session driven by another agent, the **`ui-bridge-login-web` flow** (`/manual-test-coord` Phase 0.6, where your deployment provides that command) remains valid. |
 
 **One dead end remains here, and it is narrower than this section used to claim.** It listed two; the first is gone.
@@ -1132,7 +1159,7 @@ if [ -n "$RUNNER_TREE" ] && [ "$SPAWN_SOURCE" != "worktree_path" ]; then
   echo "ERROR: asked for $RUNNER_TREE but the supervisor answered source=$SPAWN_SOURCE" >&2
   exit 1
 fi
-RUNNER_BASE="http://localhost:${TEST_PORT}/ui-bridge"
+RUNNER_BASE="http://127.0.0.1:${TEST_PORT}/ui-bridge"
 # Bind $BASE HERE, after RUNNER_BASE has been re-pointed at the TEMP runner.
 # Taken any earlier it would snapshot the primary runner's :9876, which this
 # arm forbids touching.
@@ -1190,7 +1217,7 @@ Three verdicts, three responses, and the third is not one of the first two:
 Wait for the runner to be ready (poll health):
 ```bash
 for i in $(seq 1 40); do
-  result=$(curl -s -m 3 http://localhost:${TEST_PORT}/health 2>/dev/null)
+  result=$(curl -s -m 3 http://127.0.0.1:${TEST_PORT}/health 2>/dev/null)
   responsive=$(echo "$result" | python -c "import sys,json; print(json.load(sys.stdin).get('data',{}).get('responsive',False))" 2>/dev/null)
   if [ "$responsive" = "True" ]; then echo "Test runner ready!"; break; fi
   sleep 15
@@ -1203,7 +1230,7 @@ Skip this step unless `--transport=injected` was passed. **This recipe drives a 
 
 > **For a LOCAL or CI page, the temp runner IS a supported relay** — `--relay http://127.0.0.1:<TEST_PORT>/ui-bridge`, served since qontinui-runner #560 (see the note under "Injected transport" above). That is the per-runner-isolated path: no prod relay, no Cognito `--auth-token`, and the runner's heartbeat is lenient. Substitute that for `$RELAY_BASE` below and drop the `CURL_AUTH` header; everything else in the recipe is unchanged.
 
-**Scheme branch (from the decision point above): both schemes use relay mode — the scheme decides the relay origin and whether auth is needed.** `http://localhost:<web-port>` targets register against the local web relay with no token (local `UI_BRIDGE_REQUIRE_AUTH` gate is off); `https://` prod/staging targets register against the same-origin prod relay and REQUIRE `--auth-token` (the prod relay is Bearer-gated).
+**Scheme branch (from the decision point above): both schemes use relay mode — the scheme decides the relay origin and whether auth is needed.** `http://localhost:<web-port>` targets register against the local web relay with no token (local `UI_BRIDGE_REQUIRE_AUTH` gate is off); `https://` prod/staging targets register against the same-origin prod relay and REQUIRE `--auth-token` (the prod relay is Bearer-gated). <!-- runner-localhost-ok: the local web dev server's placeholder port, not a runner's or the supervisor's; that server's bind is unmeasured -->
 
 ```bash
 # REQUIRED precondition for injected mode: TARGET_URL (from --target-url).
@@ -1322,10 +1349,10 @@ Drive surface for the rest of the run (injected mode): every `snapshot` / `disco
 
 ```bash
 # Check temp Runner API health
-curl -s http://localhost:${TEST_PORT}/health
+curl -s http://127.0.0.1:${TEST_PORT}/health
 
 # Check temp Runner UI Bridge
-curl -s http://localhost:${TEST_PORT}/ui-bridge/control/snapshot
+curl -s http://127.0.0.1:${TEST_PORT}/ui-bridge/control/snapshot
 
 # Check Web frontend UI Bridge (if testing web)
 curl -s https://qontinui.io/api/ui-bridge/control/snapshot
@@ -1494,18 +1521,21 @@ Run on each page, before moving on:
 #    base. This endpoint answers about the surface it is SENT to, so pointing
 #    it at $WEB_BASE while $BASE is the runner or mobile does NOT rescue the
 #    check: it returns a healthy-looking 200 describing qontinui.io, a
-#    confident verdict about a different application. That is worse than the
-#    404 in the table below, because nothing in the response marks it as
-#    off-target.
-#    Only web surfaces serve the route. RUN THE PREDICATE — it derives that
-#    from $BASE itself, so there is no second variable to keep in agreement.
-#    The primary runner, a temp runner, mobile and an unbound $BASE all land
-#    in the skip arm — PROVIDED the bases above were defined. BOTH patterns
-#    carry a non-empty default for exactly that reason: `case` patterns are
+#    confident verdict about a different application. That is worse than a
+#    404, because nothing in the response marks it as off-target.
+#    Web surfaces and the runner serve the route (table below). RUN THE
+#    PREDICATE — it derives that from $BASE itself, so there is no second
+#    variable to keep in agreement. Mobile and an unbound $BASE land in the
+#    skip arm — PROVIDED the bases above were defined. EVERY pattern
+#    carries a non-empty default for exactly that reason: `case` patterns are
 #    literals, so with $BASE and $WEB_BASE both unbound, empty would match
 #    empty and the probe would fire on the one setup this section warns about.
 #    A web base you reached some other way belongs in $WEB_BASE or
-#    $RELAY_BASE — set one of those, rather than editing this predicate.
+#    $RELAY_BASE, and a temp runner's in $RUNNER_BASE — set one of those,
+#    rather than editing this predicate. On the read-only own-runner arm
+#    $RUNNER_BASE is your PRIMARY runner (127.0.0.1:9876); the probe runs
+#    there too, and that is safe: the visibility sweep is a read (a hit-test
+#    over the page), so it changes no runner state.
 #    Exit code settles TWO of the three UNVERIFIED outcomes: a skip and a 404
 #    are both non-zero on purpose. It does NOT settle the third —
 #    `unknown_empty_registry` is an HTTP 200, so read the `verdict` field too.
@@ -1513,12 +1543,12 @@ Run on each page, before moving on:
 #    add "${CURL_AUTH[@]}" and ?tabId=$INJECT_TAB_ID, or a shared relay may
 #    answer about whichever other tab it picked.
 case "${BASE:-}" in
-  "${WEB_BASE:-__no_web__}"|"${RELAY_BASE:-__no_relay__}")
+  "${WEB_BASE:-__no_web__}"|"${RELAY_BASE:-__no_relay__}"|"${RUNNER_BASE:-__no_runner__}")
     # -f so an HTTP error is a non-zero exit, -S so it still says why under -s.
     curl -fsS -X POST "$BASE/control/visibility" \
       -H 'Content-Type: application/json' -d '{"minRatio":0.02}' ;;
   *)
-    echo "step 1 SKIPPED — \$BASE is not a web surface: occlusion UNVERIFIED, use step 2" >&2
+    echo "step 1 SKIPPED — \$BASE is not a surface that serves the route: occlusion UNVERIFIED, use step 2" >&2
     false ;;
 esac
 ```
@@ -1528,13 +1558,14 @@ esac
 | Surface | Served? |
 |---|---|
 | Web SDK / qontinui-web relay (`$WEB_BASE`, `:3001/api/ui-bridge`) | **yes** — `@qontinui/ui-bridge` handler + relay twin. The relay variant uses the hit-test half only, so its findings are a SUBSET of the in-page endpoint's |
-| Runner `:9876` (`$RUNNER_BASE`, Tauri WebView) | **no — 404.** The runner serves its own **Rust** route table (`qontinui-runner/src-tauri/src/mcp/ui_bridge/routing.rs`); the frontend's `@qontinui/ui-bridge` npm dependency does not put routes on that port |
+| Runner `:9876` (`$RUNNER_BASE`, Tauri WebView) | **yes** — served (`screenshots.rs` `route_entries`, since 2026-08-30): the runner's own **Rust** twin, `ui_bridge_visibility_handler` in `qontinui-runner/src-tauri/src/mcp/ui_bridge/screenshots.rs`, not the frontend's `@qontinui/ui-bridge` npm dependency. A runner build older than 2026-08-30 404s it |
 | Mobile / React Native (`$MOBILE_BASE`, `@qontinui/ui-bridge-native`) | **no — 404**, pinned by `packages/ui-bridge-native/src/server/__tests__/http-status-mapping.test.ts` |
 
-The two `404` rows describe what those bases return **if you send the probe
-there anyway**. They are not an instruction to send it, and the fix for them is
-not to retarget at `$WEB_BASE` — that swaps a loud 404 for a quiet answer about
-the wrong application. On the runner and on mobile, step 1 is **skipped**.
+The `404` row describes what mobile returns **if you send the probe there
+anyway**. It is not an instruction to send it, and the fix for it is not to
+retarget at `$WEB_BASE` — that swaps a loud 404 for a quiet answer about the
+wrong application. On mobile, step 1 is **skipped**; on the runner it runs
+against `$RUNNER_BASE`.
 
 - `verdict: "occlusions_found"` → each entry names the occluder, the occluded,
   and the fraction covered. An entry with `hidesText: true` is a **FAIL**, not a
@@ -1580,8 +1611,8 @@ it runs this same chain through the shipped qontinui-web adapter and cannot
 drift from CI. The projection below is for the surfaces it cannot reach:
 the runner's own Tauri WebView, where `/ui-bridge/control/discover` is the
 only door to the element tree. Steps 2 and 3 below DO work against
-`$RUNNER_BASE` — only step 1 is web-only, and on the runner and on mobile it is
-**skipped**, never retargeted.
+`$RUNNER_BASE` — step 1 does too (the runner serves the route), and on mobile it
+is **skipped**, never retargeted.
 
 `verify-page-verdict.sh` covers the **step 2** analyzer chain. It produces no
 `/control/visibility` verdict — the string appears nowhere in it — so on a web

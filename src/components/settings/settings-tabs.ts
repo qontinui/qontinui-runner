@@ -103,9 +103,7 @@ export interface SettingsTabDef {
  * Canonical, ordered list of settings sub-tabs (drives the sub-nav).
  *
  * The runner ↔ web channel is a single outbound WebSocket driven by
- * `WebIntegrationSettings`. The panel id is `backend-connection` to
- * reflect the unified scope, but we still mount `WebIntegrationSettings`
- * underneath until the next UX pass.
+ * `WebIntegrationSettings`, mounted under the `backend-connection` panel id.
  *
  * The `requires` annotations keep the default Settings page proportional to
  * the default sidebar: a Terminal-first user gets account/connection/AI/MCP/

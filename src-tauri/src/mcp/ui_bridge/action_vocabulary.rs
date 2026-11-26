@@ -25,7 +25,7 @@
 
 use serde_json::{json, Value};
 
-use super::types::{RecoveryHint, UiBridgeError, UiBridgeErrorCode};
+use super::types::{UiBridgeError, UiBridgeErrorCode};
 
 /// A verb reduced to what spelling cannot change: ASCII lowercase, no `_` or
 /// `-`. `scroll_into_view`, `scroll-into-view` and `SCROLLINTOVIEW` all fold to
@@ -433,7 +433,9 @@ pub(crate) fn action_not_supported_error(
     UiBridgeError {
         code: UiBridgeErrorCode::ActionNotSupported,
         message,
-        recovery: Some(RecoveryHint::Unrecoverable),
+        recovery: Some(qontinui_types::refusal::NextAction::new(
+            qontinui_types::refusal::NextActionKind::FixRequest,
+        )),
         context: Some(context),
     }
 }

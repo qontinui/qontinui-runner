@@ -53,6 +53,8 @@ pub mod parsers;
 mod pm;
 mod registry_creds;
 pub mod registry_routes;
+#[cfg(test)]
+mod shim_beacon_route_tests;
 mod sibling_manifests;
 pub mod types;
 
@@ -2539,10 +2541,10 @@ mod tests {
             finish_reason: None,
             finish_synced: false,
             finish_coord_session_id: None,
+            finish_coord_readdressed: false,
             spawn_device_default: None,
             adopted_from: None,
             last_session_start_at: None,
-            last_alive_at: None,
             gate_id: None,
             gate_consuming_device_id: None,
             gate_bound_boot_ms: None,
@@ -3065,10 +3067,10 @@ mod tests {
             finish_reason: None,
             finish_synced: false,
             finish_coord_session_id: None,
+            finish_coord_readdressed: false,
             spawn_device_default: None,
             adopted_from: None,
             last_session_start_at: None,
-            last_alive_at: None,
             gate_id: None,
             gate_consuming_device_id: None,
             gate_bound_boot_ms: None,
@@ -3275,10 +3277,10 @@ mod tests {
                     finish_reason: None,
                     finish_synced: false,
                     finish_coord_session_id: None,
+                    finish_coord_readdressed: false,
                     spawn_device_default: None,
                     adopted_from: None,
                     last_session_start_at: None,
-                    last_alive_at: None,
                     gate_id: None,
                     gate_consuming_device_id: None,
                     gate_bound_boot_ms: None,
@@ -3378,10 +3380,10 @@ mod tests {
             finish_reason: None,
             finish_synced: false,
             finish_coord_session_id: None,
+            finish_coord_readdressed: false,
             spawn_device_default: None,
             adopted_from: None,
             last_session_start_at: None,
-            last_alive_at: None,
             gate_id: None,
             gate_consuming_device_id: None,
             gate_bound_boot_ms: None,
@@ -3472,10 +3474,10 @@ mod tests {
             finish_reason: None,
             finish_synced: false,
             finish_coord_session_id: None,
+            finish_coord_readdressed: false,
             spawn_device_default: None,
             adopted_from: None,
             last_session_start_at: None,
-            last_alive_at: None,
             gate_id: None,
             gate_consuming_device_id: None,
             gate_bound_boot_ms: None,

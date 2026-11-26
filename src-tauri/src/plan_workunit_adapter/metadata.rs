@@ -177,6 +177,47 @@ fn declares_any_phase(u: &ParsedWorkUnit) -> bool {
     !u.phases.is_empty() || !u.phase_labels.is_empty() || !u.phases_undeclared.is_empty()
 }
 
+/// The scan's phase declaration: the three keys `phases` (`[{"index",
+/// "name"}]`), `phase_labels` (`[{"label", "name"}]`) and `phases_undeclared`
+/// (`["Two"]`) as one JSON object, the empty ones as `[]` — or `None` when the
+/// plan declares nothing in any of them ([`AbsentRule::OmitJointlyWhenNothingDeclared`]).
+///
+/// The ONE place the declaration's wire shape is built: [`build_metadata`]
+/// writes exactly this object into every active-directory patch, and
+/// `qontinui-pr plan-phase-declaration` prints it, so a session that mints a
+/// plan work unit by hand sends the runner's own declaration rather than a
+/// re-derivation of it (plan
+/// `2026-11-17-a-session-minted-plan-work-unit-carries-no-phase-declaration`).
+pub fn phase_declaration(u: &ParsedWorkUnit) -> Option<Value> {
+    if !declares_any_phase(u) {
+        return None;
+    }
+    let mut d = Map::new();
+    d.insert(
+        "phases".to_string(),
+        Value::Array(
+            u.phases
+                .iter()
+                .map(|p| serde_json::json!({"index": p.index, "name": p.name}))
+                .collect(),
+        ),
+    );
+    d.insert(
+        "phase_labels".to_string(),
+        Value::Array(
+            u.phase_labels
+                .iter()
+                .map(|p| serde_json::json!({"label": p.label, "name": p.name}))
+                .collect(),
+        ),
+    );
+    d.insert(
+        "phases_undeclared".to_string(),
+        serde_json::json!(u.phases_undeclared),
+    );
+    Some(Value::Object(d))
+}
+
 /// The values the plan file supplies, keyed by roster name. A key the file
 /// does not supply is absent here, and [`active_dir_patch`] /
 /// [`archive_dir_patch`] apply its [`AbsentRule`].
@@ -187,30 +228,9 @@ fn build_metadata(u: &ParsedWorkUnit) -> Map<String, Value> {
         Value::String(u.source_path.clone()),
     );
     m.insert("depends_on".to_string(), serde_json::json!(u.depends_on));
-    if declares_any_phase(u) {
-        // AbsentRule::OmitJointlyWhenNothingDeclared: all three, empties as `[]`.
-        m.insert(
-            "phases".to_string(),
-            Value::Array(
-                u.phases
-                    .iter()
-                    .map(|p| serde_json::json!({"index": p.index, "name": p.name}))
-                    .collect(),
-            ),
-        );
-        m.insert(
-            "phase_labels".to_string(),
-            Value::Array(
-                u.phase_labels
-                    .iter()
-                    .map(|p| serde_json::json!({"label": p.label, "name": p.name}))
-                    .collect(),
-            ),
-        );
-        m.insert(
-            "phases_undeclared".to_string(),
-            serde_json::json!(u.phases_undeclared),
-        );
+    // AbsentRule::OmitJointlyWhenNothingDeclared: all three, or none.
+    if let Some(Value::Object(declaration)) = phase_declaration(u) {
+        m.extend(declaration);
     }
     if let Some(area) = &u.area {
         m.insert("area".to_string(), Value::String(area.clone()));
@@ -1396,5 +1416,192 @@ mod tests {
         assert_eq!(got, vec!["A", "B", "C", "D", "E", "F"], "{p}");
         assert_eq!(p["phase_labels"][0]["name"], "Phase A: one", "{p}");
         assert_eq!(p["phases_undeclared"], serde_json::json!([]), "{p}");
+    }
+
+    // ---- phase_declaration (plan
+    // `2026-11-17-a-session-minted-plan-work-unit-carries-no-phase-declaration`,
+    // Phase 1) -------------------------------------------------------------------
+
+    /// The `# `-headed bodies containing `Phase` in `parser.rs`'s test module as
+    /// of 2026-11-17, copied verbatim (the `format!` templates excluded);
+    /// nothing keeps this in sync, so a new parser case must be added here. Bodies that declare
+    /// nothing stay in: they prove the `None` arm.
+    const PARSER_TEST_PHASE_BODIES: &[&str] = &[
+        "# T\n\n> **Status: in progress 2026-06-19.** Implementing Phase 1 only; gate Phases 2-4.\n\n**Phase 1 — parser.** body\n\n## Phase 2: push client\n\nProse mentioning Phase 1 again should not count.\n",
+        "# T\n\n## Phases\n\n- **Phase 1 — schema.** body\n1. **Phase 2 — wiring** (~40 LOC)\n  - **Phase 9 — nested** indented\n",
+        "# T\n\n## 9. What this unblocks\n\n- **Phase 2 — the reaper** (another plan)\n- **Phase 3 — the dashboard**\n",
+        "# T\n\n## 4. Phases\n\n1. **Schema freeze** — author the schemas\n2. Rubric semantics\n   3. nested step\n\n## 5. Risks\n\n7. not a phase\n",
+        "# T\n\n## 5. Phases\n\n### Phase 1 — the guard\n\n1. hook\n2. prefilter\n3. message\n",
+        "# T\n\n| Phase | Deliverable |\n|---|---|\n| 1 | re-export forms |\n| **2** | basis |\n| Phase 3 | label |\n| ~~4~~ | gone |\n\n| # | Claim |\n|---|---|\n| 5 | not a phase |\n",
+        "# T\n\n## Phases\n\n0. probe\n1. ~~relay~~ gone\n2. migrate\n3. **~~relay two~~** gone\n",
+        "# T\n\n## Phases\n\n- **Phase 1 — schema**\n- **Phase 4 (not scheduled)** later\n- **Phase 6 — relay** (deferred)\n7. **Relay** — SPLIT to a follow-up plan\n\n| Phase | Work | State |\n|---|---|---|\n| 2 | wiring | open |\n| **3 — further instances (DELEGATED to their own plans)** | x | |\n| 5 | audit | Not built |\n| 8 | ~~gone~~ | |\n",
+        "# T\n\n> **Phase 4 is HELD**, not forgotten.\n\n```\n## Phase 7\n**Phase 8 — example**\n| Phase | x |\n|---|---|\n| 9 | y |\n```\n\n~~~\n- **Phase 6 — example**\n~~~\n",
+        "# T\n\n````md\n```\n## Phase 7\n```\n## Phase 8\n````\n\n```\n~~~\n## Phase 9\n```rust\n## Phase 10\n```\n\n## Phase 1\n",
+        "# T\n\n```md\nexample\n\n## Phase 3 — after a stray fence\n",
+        "# T\n\n## Phases\n\n**Phase 1 — the guard**\n\n1. hook\n2. prefilter\n3. message\n4. register\n",
+        "# T\n\n## Phases\n\n**Phase 0 is a gate, not a step.**\n\n0. probe\n1. build\n",
+        "# T\n\n## Phases\n\n1. build\n2. ship\n\nThen, once it lands:\n\n1. a\n2. b\n3. c\n",
+        "# T\n\n## 6. Phases\n\n**Definition of done, corrected**\n\n1. a\n2. b\n3. c\n",
+        "# T\n\n## Phases\n\n- **Phase 3's check could ossify** x\n- **Phase 2.2 automatic re-stamping narrows** y\n- **Phase 1.1 may queue rather than land**\n",
+        "# T\n\n## 5. Phase 0 — measure\n\n## 6. Phase 1 — build\n",
+        "# T\n\n| Phase | Status | Deliverable |\n|---|---|---|\n| 1 | SHIPPED | Foundation |\n| **2a — base theory doc** | open | x |\n| 3 | open | y |\n| 0.5 | open | sub-item |\n| 4 – 6 | open | range |\n| 5—6 | open | range |\n| 33 of 52 rustc units | open | timing |\n| 7(a) | open | sub-item |\n| 8 (coord) | open | z |\n\n### Phase 3 — the real name\n",
+        "# T\n\n| Phase | Outcome |\n|---|---|\n| 1 | built |\n| 4 | deferred |\n| 3b | x (deferred) |\n\n## Security\n\n| Phase | Touches credentials? |\n|---|---|\n| 3 | no |\n| 4 | yes |\n",
+        "# T\n\n| Phase | Outcome |\n|---|---|\n| 4 | deferred |\n\n## Phase 4 — the real heading\n",
+        "# T\n\n## Phases\n\n- **Phase 1 — ~~make it~~ ALREADY EXECUTED BY A PEER**\n- **Phase 2 — the remaining work**\n",
+        "# T\n\n## Phases\n\n1. build\n2. frontend. **NOT NEEDED**; do not open a web PR\n3. polish (optional, later)\n4. rollout — likely its own plan\n5. migration — MOOT\n",
+        "# T\n\n## Phases\n\nIn order:\n\n1. **Phase 1 — schema**\n2. wiring\n",
+        "# T\n\n## Phases\n\n> These phases describe Option A only. Under Option B, Phases 1-4 do not exist.\n\n- **Phase 1 — a**\n- **Phase 2 — b**\n",
+        "# T\n\n**Phase 4 gap, verified** in review.\n\n## Phase 4 — tests\n",
+        "# T\n\n## Phase 1 — a\n\nx\n\n**Phase 6**, near-verbatim. **Resolved 2026-09-26: deliver it here** (see \"Vet\nfindings\").\n\n## Phase 2 — b\n\ny\n\n## Phase 3 — c\n",
+        "# T\n\n## Phase 1 — a\n\n**Phase 2**.\n",
+        "# T\n\n## Phases\n\n**Phase 4** is deferred to a separate plan.\n\n| Phase | Work |\n|---|---|\n| 1 | schema |\n| 2 | wiring |\n",
+        "# T\n\n## Phases\n\nFor each object:\n\nLINE\n\n1. probe\n2. build\n",
+        "# T\n\n## Phases\n\n- **Phase 1 — a**\nLINE\n- **Phase 2 — b**\n3. c\n",
+        "# T\n\n```x` inline\n\n## Phase 1 — real\n\n```\n",
+        "# T\n\n## Phases\n\nDeferred to a follow-up plan.\n\n1. a\n2. b\n",
+        "# T\n\n## Phases\n\nThese phases were superseded.\n\n| Phase | Work |\n|---|---|\n| 1 | a |\n\n## Now\n\n| Phase | Work |\n|---|---|\n| 2 | b |\n",
+        "# T\n\n## Phases\n\n1. **(Layer 1 — shipping separately, prerequisite)**\n2. build\n3. **(separate)** scope TBD\n4. **Gates already exist.**\n",
+        "# T\n\n### A. Phase 1e: extend Phase 1d\n\n## 2. Phase 2 — real\n",
+        "# T\n\n### Phase 1e — x\n",
+        "# T\n\n## 3. Phase 2b — x\n",
+        "# T\n\n## Divergent design for B\n\n| Phase | Work |\n|---|---|\n| 1 | the design not taken |\n\n## Phases\n\n| Phase | Work |\n|---|---|\n| 1 | the real phase |\n\n- **Phase 2 — remove engineering**\n\n## Phase 2 execution record (2026-08-16)\n",
+        "# T\n\n## Phase 4 execution record\n\n| Phase | Outcome |\n|---|---|\n| 4 | deferred |\n",
+        "# T\n\n## Phase 4 execution record\n\n## Phases\n\n| Phase | Work |\n|---|---|\n| 4 | tests |\n\n## Later\n\n| Phase | Outcome |\n|---|---|\n| 4 | deferred |\n",
+        "# T\n\n## 4. Phases\n\n### Phase 0 (implementation session, read-only, ≤ 1 h): re-verify before building\n\nx\n\n### Phase A: presence history\n\n### Phase B: split the census\n\n### Phase C: device-relative freshness\n\n### Phase D: the reader\n\n### Phase E: the detector\n\n### Phase F: close out\n",
+        "# T\n\n### Phase C1 — first half\n\n### Phase C2: second half\n\n**Phase R2 — the bold one**\n\n## 5. Phase T3 — enumerated\n\n### Phase 1B — numeric sub-phase\n",
+        "# T\n\n### 6.7 Phase D.3 (the other plan's sub-phase)\n",
+        "# T\n\n### Phase D. The reader\n",
+        "# T\n\n### Phase A/B testing\n",
+        "# T\n\n## Phases\n\n1. schema\n  **Phase A is a gate**\n2. wiring\n",
+        "# T\n\n## Phase 1 — a\n\n### Phase Two — the second\n\n## Phase II: roman\n\n**Phase AB — two letters**\n\n### Phase Two — again\n\n### Phase Two is a sentence\n\n### Phase ordering\n\n**Phase Three**, cited in prose.\n",
+        "# T\n\n### Phase Two —\n",
+        "# T\n\n## Phases\n\n- **Phase A — schema**\n- **Phase B — wiring**\n\n| Phase | Work |\n|---|---|\n| A | x |\n| Phase C | y |\n\n> **Phase D — status narration**\n\n```\n### Phase E — example\n### Phase Two — example\n```\n",
+        "# T\n\n**Phase A gap, verified** in review.\n\n## Phase B — b\n\n## Phase A — tests\n\n### Phase A execution record\n",
+        "# The published-runner parity count comes from a run, not from reports\n\
+\n\
+> **Status: IN PROGRESS 2026-09-22.** Implementation started by session\n\
+> Depends-On: 2026-08-31-published-build-parity-check\n\
+>\n\
+> **Repo(s):** `qontinui-runner` (harness, workflow, scanner `Area:` parse, sweep),\n\
+> `qontinui-claude-config` (`/create-plan` header convention, knowledge-base page,\n\
+> capability-doctor cross-link), `qontinui-dev-notes` (plan stamps only). No\n\
+> `qontinui-coord` or `qontinui-web` change; no `coord.*` schema change.\n\
+> **Area:** `published-parity` (work-unit `metadata.area`, exactly that key — and see\n\
+> Phase 3: today this line reaches no work unit).\n\
+",
+    ];
+
+    /// Every `fixtures/*.md` plan.
+    const FIXTURE_PLANS: &[(&str, &str)] = &[
+        (
+            "plans/2026-06-18-coord-decommission-markdown-plan-ingest.md",
+            include_str!("fixtures/2026-06-18-coord-decommission-markdown-plan-ingest.md"),
+        ),
+        (
+            "plans/2026-06-18-coord-generic-work-unit-primitive.md",
+            include_str!("fixtures/2026-06-18-coord-generic-work-unit-primitive.md"),
+        ),
+        (
+            "plans/2026-06-18-coord-merge-scheduler-db-test-harness.md",
+            include_str!("fixtures/2026-06-18-coord-merge-scheduler-db-test-harness.md"),
+        ),
+        (
+            "plans/2026-06-18-coord-orchestration-generalize-off-plans.md",
+            include_str!("fixtures/2026-06-18-coord-orchestration-generalize-off-plans.md"),
+        ),
+        (
+            "plans/2026-06-18-harness-markdown-to-workunit-adapter.md",
+            include_str!("fixtures/2026-06-18-harness-markdown-to-workunit-adapter.md"),
+        ),
+        (
+            "plans/2026-09-04-coord-jetstream-durable-consumers-redis-subscriber-migration.md",
+            include_str!("fixtures/2026-09-04-coord-jetstream-durable-consumers-redis-subscriber-migration.md"),
+        ),
+    ];
+
+    /// The declaration a scan writes, derived from the parsed unit's fields
+    /// independently of `phase_declaration`, so a key the function drops or
+    /// reshapes cannot also vanish from the expectation.
+    fn expected_declaration(u: &ParsedWorkUnit) -> Value {
+        serde_json::json!({
+            "phases": u.phases.iter().map(|p| serde_json::json!({"index": p.index, "name": p.name})).collect::<Vec<_>>(),
+            "phase_labels": u.phase_labels.iter().map(|p| serde_json::json!({"label": p.label, "name": p.name})).collect::<Vec<_>>(),
+            "phases_undeclared": u.phases_undeclared,
+        })
+    }
+
+    /// Gate: for every phase-declaring body in the parser tests and the
+    /// fixtures, `phase_declaration` is exactly the three keys `build_metadata`
+    /// writes (and the field-derived expectation); for every body that declares
+    /// nothing it is `None` and `build_metadata` writes none of the three.
+    /// Fails if `phase_declaration` drops, adds or reshapes a key, or if
+    /// `build_metadata` stops writing what it returns.
+    #[test]
+    fn phase_declaration_is_the_three_keys_build_metadata_writes() {
+        use super::super::parser::{parse_work_unit, slug_from_filename, PlanConvention};
+        let conv = PlanConvention::operator_default();
+        let mut cases: Vec<(String, &str)> = PARSER_TEST_PHASE_BODIES
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (format!("parser-test-body-{i}"), *b))
+            .collect();
+        cases.extend(FIXTURE_PLANS.iter().map(|(p, b)| (p.to_string(), *b)));
+        let (mut declaring, mut with_labels, mut with_undeclared, mut fixtures_declaring) =
+            (0, 0, 0, 0);
+        for (name, body) in &cases {
+            let u = parse_work_unit(&slug_from_filename(name), name, body, &conv);
+            let written = build_metadata(&u);
+            let written_keys: Vec<&str> = ["phases", "phase_labels", "phases_undeclared"]
+                .into_iter()
+                .filter(|k| written.contains_key(*k))
+                .collect();
+            match phase_declaration(&u) {
+                None => {
+                    assert!(!declares_any_phase(&u), "{name}: declares but got None");
+                    assert!(written_keys.is_empty(), "{name}: {written_keys:?}");
+                }
+                Some(decl) => {
+                    declaring += 1;
+                    if name.starts_with("plans/") {
+                        fixtures_declaring += 1;
+                    }
+                    if !u.phase_labels.is_empty() {
+                        with_labels += 1;
+                    }
+                    if !u.phases_undeclared.is_empty() {
+                        with_undeclared += 1;
+                    }
+                    let obj = decl.as_object().expect("the declaration is an object");
+                    let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+                    keys.sort_unstable();
+                    assert_eq!(
+                        keys,
+                        vec!["phase_labels", "phases", "phases_undeclared"],
+                        "{name}: {decl}"
+                    );
+                    let from_patch: Map<String, Value> = written_keys
+                        .iter()
+                        .map(|k| (k.to_string(), written[*k].clone()))
+                        .collect();
+                    assert_eq!(decl, Value::Object(from_patch), "{name}");
+                    assert_eq!(decl, expected_declaration(&u), "{name}");
+                }
+            }
+        }
+        // The corpus must keep exercising every key, or the gate goes vacuous.
+        assert!(declaring >= 30, "declaring bodies shrank: {declaring}");
+        assert!(
+            with_labels >= 3,
+            "label-declaring bodies shrank: {with_labels}"
+        );
+        assert!(
+            with_undeclared >= 1,
+            "undeclared-reporting bodies: {with_undeclared}"
+        );
+        assert!(fixtures_declaring >= 1, "no fixture declares a phase");
+        assert!(
+            cases.len() - declaring >= 1,
+            "no non-declaring body left to prove the None arm"
+        );
     }
 }

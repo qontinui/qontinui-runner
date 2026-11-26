@@ -33,7 +33,7 @@
 //! ("enough for 2-3 messages"), which is right for a preview and wrong here. A
 //! bailing-out turn is characteristically a LONG prose turn — it summarizes real
 //! work before declining the rest — so it is precisely the turn that overruns a
-//! small window, and [`read_tail_bytes`] drops the leading partial line, meaning
+//! small window, and [`read_tail_lossy`] drops the leading partial line, meaning
 //! the record we most want to read is the one most likely to be discarded.
 //!
 //! Returning `Complete` in that case would be the worst available failure: the
@@ -48,17 +48,18 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
+use qontinui_runner_lib::file_tail::read_tail_lossy;
 use qontinui_runner_lib::looping_agent::turn_ending::{
     classify_turn_ending, TurnEnding, UnreadReason,
 };
 
 use crate::terminal::transcript::{
-    find_transcript_by_session_id, parse_assistant_record, read_tail_bytes, session_transcript_path,
+    find_transcript_by_session_id, parse_assistant_record, session_transcript_path,
 };
 
 /// How much of the transcript tail to read when classifying a turn ending.
 ///
-/// Sized for a whole final assistant turn rather than a preview. `read_tail_bytes`
+/// Sized for a whole final assistant turn rather than a preview. `read_tail_lossy`
 /// returns the entire file when it is smaller, so this only costs anything on
 /// long-running sessions.
 pub const DEFAULT_READ_CAP_BYTES: u64 = 256 * 1024;
@@ -150,7 +151,7 @@ pub fn read_turn_final_text_at(path: &Path, cap_bytes: u64) -> Result<FinalText,
         .map(|m| m.len() > cap_bytes)
         .unwrap_or(false);
 
-    let content = read_tail_bytes(path, cap_bytes).ok_or(UnreadReason::ReadError)?;
+    let content = read_tail_lossy(path, cap_bytes).ok_or(UnreadReason::ReadError)?;
 
     let mut last_assistant: Option<(String, String)> = None;
     let mut saw_any_record = false;
@@ -162,7 +163,7 @@ pub fn read_turn_final_text_at(path: &Path, cap_bytes: u64) -> Result<FinalText,
         }
         let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
             // A malformed line inside the window is noise, not a verdict — the
-            // leading PARTIAL line was already dropped by read_tail_bytes, so
+            // leading PARTIAL line was already dropped by read_tail_lossy, so
             // this is a genuinely bad record. Skip it, as session_digest does.
             continue;
         };
@@ -459,7 +460,7 @@ mod tests {
     }
 
     /// The §3.1.2 case: the final assistant record is longer than the read cap,
-    /// so `read_tail_bytes` drops it as a partial line. This MUST report
+    /// so `read_tail_lossy` drops it as a partial line. This MUST report
     /// `TruncatedAtCap`, never `Complete` — otherwise the shadow corpus looks
     /// clean because it was never read.
     #[test]

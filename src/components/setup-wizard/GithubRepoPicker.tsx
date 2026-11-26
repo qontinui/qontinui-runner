@@ -3,6 +3,12 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { resolveSignInBackendUrl } from "@/lib/savedBackendUrl";
+import {
+  NO_BROWSER_HINT,
+  PendingSignInNotice,
+  isSignInCancelled,
+} from "@/components/PendingSignInNotice";
 import {
   FolderOpen,
   Search,
@@ -17,11 +23,6 @@ import {
   ExternalLink,
   LogIn,
 } from "lucide-react";
-
-/** Web backend the Cognito-bound device JWT is minted against. Must match
- *  `LoginScreen`'s constant — the picker drives the SAME `cognito_sign_in`
- *  command, just from inside the wizard. */
-const DEFAULT_BACKEND_URL = "https://api.qontinui.io";
 
 /** `true` when a raw `github_list_repos` failure is an authentication failure the
  *  user can clear by signing in again (as opposed to a network/tenant/backend
@@ -354,11 +355,14 @@ export function GithubRepoPicker({ onProjectsCloned }: GithubRepoPickerProps) {
     setSigningIn(true);
     setSignInError(null);
     try {
-      await invoke("cognito_sign_in", { backendUrl: DEFAULT_BACKEND_URL });
+      // Same target LoginScreen uses (see savedBackendUrl.ts): the command
+      // writes the URL it signed in against back into settings.
+      await invoke("cognito_sign_in", { backendUrl: await resolveSignInBackendUrl("gate") });
       window.dispatchEvent(new CustomEvent("runner-tier-changed"));
       await loadRepos();
     } catch (err) {
-      setSignInError(`${err}`);
+      // The user's own Cancel (from the pending-sign-in notice) is not a failure.
+      if (!isSignInCancelled(err)) setSignInError(`${err}`);
     } finally {
       setSigningIn(false);
     }
@@ -460,6 +464,7 @@ export function GithubRepoPicker({ onProjectsCloned }: GithubRepoPickerProps) {
             <SignInButton signingIn={signingIn} onSignIn={signIn} />
           )}
         </div>
+        <PendingSignInNotice active={signingIn} noBrowserHint={NO_BROWSER_HINT.setupWizard} />
         {signInError && (
           <p className="text-xs text-red-300 break-words whitespace-pre-wrap">{signInError}</p>
         )}
@@ -481,6 +486,7 @@ export function GithubRepoPicker({ onProjectsCloned }: GithubRepoPickerProps) {
           </div>
         </div>
         <SignInButton signingIn={signingIn} onSignIn={signIn} />
+        <PendingSignInNotice active={signingIn} noBrowserHint={NO_BROWSER_HINT.setupWizard} />
         {signInError && (
           <p className="text-xs text-red-300 break-words whitespace-pre-wrap">{signInError}</p>
         )}

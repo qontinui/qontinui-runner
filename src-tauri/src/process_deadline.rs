@@ -665,14 +665,88 @@ mod tests {
         Ok(child)
     }
 
-    /// The race at the deadline, 200 times: every child is either handed to
-    /// the caller (and killed at the deadline) or killed by the helper; none
-    /// survives, whichever side won — and both sides are seen to win.
+    /// Gate for [`gated_spawner`]: the spawn does not start until the test
+    /// sends on the paired sender (or drops it). Serialised by `serial()`.
+    static SPAWN_GATE: Mutex<Option<std::sync::mpsc::Receiver<()>>> = Mutex::new(None);
+    fn gated_spawner(cmd: &mut Command) -> io::Result<Child> {
+        let gate = SPAWN_GATE.lock().unwrap().take();
+        if let Some(gate) = gate {
+            // Either a release or the sender being dropped ends the wait; the
+            // timeout only bounds a broken test.
+            let _ = gate.recv_timeout(Duration::from_secs(60));
+        }
+        let child = cmd.spawn()?;
+        RACE_CHILDREN.lock().unwrap().push(Watched::of(&child));
+        Ok(child)
+    }
+
+    /// The race at the deadline: every child is either handed to the caller
+    /// (and killed at the deadline) or killed by the helper; none survives,
+    /// whichever side won. Each side is FORCED rather than hoped for — the
+    /// old version relied on 100 ms of wall clock and, on a loaded box, every
+    /// spawn missed the deadline (`[0, 200]`) so the delivered side never ran.
+    /// Abandoned: the spawner is gated shut until the caller has returned, so
+    /// the deadline is certain to pass first. Delivered: the spawner is not
+    /// delayed and the budget is generous, so the spawn is certain to finish
+    /// first. The jittered spawner then races them with only the safety
+    /// property asserted.
     #[test]
     fn process_deadline_no_child_survives_a_race_at_the_deadline() {
         let _serial = serial();
-        let mut outcomes = [0usize; 2];
-        for _ in 0..200 {
+        const ABANDONED: usize = 20;
+        const DELIVERED: usize = 1;
+        const JITTERED: usize = 60;
+        let mut spawned_expected = 0usize;
+
+        // Side 1 (forced): the spawn is still pending at the deadline.
+        for _ in 0..ABANDONED {
+            let (release, gate) = std::sync::mpsc::channel::<()>();
+            *SPAWN_GATE.lock().unwrap() = Some(gate);
+            let run = run_with_deadline_spawner(
+                long_child(),
+                Instant::now() + RACE_BUDGET,
+                gated_spawner,
+            )
+            .unwrap();
+            assert!(
+                matches!(
+                    run.outcome,
+                    DeadlineOutcome::NotStarted(NotStarted::SpawnPending)
+                ),
+                "a spawn gated shut must be abandoned, got {run:?}"
+            );
+            // Now let the abandoned helper's spawn proceed: it must kill what
+            // it creates.
+            let _ = release.send(());
+            spawned_expected += 1;
+            // Wait until that helper has taken the gate and spawned before the
+            // next iteration reuses the single gate slot; otherwise a late
+            // helper could take (or drop) the next iteration's gate.
+            let end = Instant::now() + Duration::from_secs(60);
+            while RACE_CHILDREN.lock().unwrap().len() < spawned_expected {
+                assert!(Instant::now() < end, "an abandoned helper never spawned");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        // Side 2 (forced): the spawn finishes long before the deadline, so the
+        // caller owns the child and kills it at the deadline.
+        for _ in 0..DELIVERED {
+            let run = run_with_deadline_spawner(
+                long_child(),
+                Instant::now() + Duration::from_secs(15),
+                gated_spawner,
+            )
+            .unwrap();
+            assert!(
+                matches!(run.outcome, DeadlineOutcome::TimedOut { .. }),
+                "an ungated spawn with a 15 s budget must be delivered, got {run:?}"
+            );
+            spawned_expected += 1;
+        }
+
+        // The genuine race, with whichever side wins: only safety is asserted.
+        for _ in 0..JITTERED {
             let run = run_with_deadline_spawner(
                 long_child(),
                 Instant::now() + RACE_BUDGET,
@@ -680,19 +754,15 @@ mod tests {
             )
             .unwrap();
             match run.outcome {
-                DeadlineOutcome::TimedOut { .. } => outcomes[0] += 1,
-                DeadlineOutcome::NotStarted(NotStarted::SpawnPending) => outcomes[1] += 1,
+                DeadlineOutcome::TimedOut { .. }
+                | DeadlineOutcome::NotStarted(NotStarted::SpawnPending) => {}
                 other => panic!("unexpected {other:?}"),
             }
+            spawned_expected += 1;
         }
-        assert_eq!(outcomes[0] + outcomes[1], 200, "{outcomes:?}");
-        assert!(
-            outcomes[0] > 0 && outcomes[1] > 0,
-            "both sides of the race must be exercised: {outcomes:?}"
-        );
         // Let every abandoned helper's spawn return.
         let end = Instant::now() + Duration::from_secs(30);
-        while RACE_CHILDREN.lock().unwrap().len() < 200 {
+        while RACE_CHILDREN.lock().unwrap().len() < spawned_expected {
             assert!(Instant::now() < end, "a helper never returned");
             std::thread::sleep(Duration::from_millis(20));
         }
