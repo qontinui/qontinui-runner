@@ -1343,12 +1343,6 @@ fn bound_tenants() -> BoundSet {
     state().bound_set()
 }
 
-/// The tenants this device is bound to, as the poller last recorded them.
-/// Empty means none recorded (UNKNOWN, not "no tenants").
-pub(crate) fn bound_tenant_ids() -> Vec<Uuid> {
-    bound_tenants().tenants
-}
-
 /// The verdict for a session-keyed send of a CONTENT flow in `scope` —
 /// [`SessionScope::Unresolved`] is judged by the strictest verdict across the
 /// default scope and every bound tenant.
@@ -1368,9 +1362,19 @@ pub(crate) fn permit_or_count_session(flow: Flow, scope: SessionScope) -> bool {
 /// Transcript sync's gate for a session in `scope` ([`permit_session`] for the
 /// tenant half, AND the user's own toggle).
 pub(crate) fn transcript_sync_gate_session(scope: SessionScope) -> TranscriptGate {
-    transcript_gate_with(
-        permit_session(Flow::TranscriptSync, scope).allowed,
-        crate::settings::get_cloud_sync_enabled,
+    transcript_sync_gate_session_verdict(scope).0
+}
+
+/// [`transcript_sync_gate_session`] with the tenant half's verdict beside it,
+/// from the same single read, for a caller that names WHY the gate is closed
+/// (the verdict's `source`).
+pub(crate) fn transcript_sync_gate_session_verdict(
+    scope: SessionScope,
+) -> (TranscriptGate, EgressVerdict) {
+    let tenant = permit_session(Flow::TranscriptSync, scope);
+    (
+        transcript_gate_with(tenant.allowed, crate::settings::get_cloud_sync_enabled),
+        tenant,
     )
 }
 
