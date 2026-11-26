@@ -130,7 +130,8 @@ const R19: &str = "effect prediction; acts on nothing";
 const R20: &str = "dev control: swaps an image asset in place for a capture, then is undone (DELETE / TTL); alters rendering, activates no app affordance";
 const R21: &str = "dev control: hides every glyph for a capture, then restores exactly (hidden:false / TTL); alters rendering, activates no app affordance";
 const R22: &str = "vision analysis / assertion over the page; acts on nothing. With captureTextHidden it also hides the runner webview's text for one capture and restores it (R21), activating no app affordance";
-const R23: &str = "stores a caller-supplied component capture as a named baseline; reads and acts on no page";
+const R23: &str =
+    "stores a caller-supplied component capture as a named baseline; reads and acts on no page";
 
 /// POST routes that are not UI actions, each with the reason.
 const NOT_AN_ACTION: &[(&str, &str)] = &[
