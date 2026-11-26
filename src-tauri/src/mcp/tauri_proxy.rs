@@ -597,7 +597,12 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
             // and `run_detached` in the handler keeps the migration running
             // to its end if the caller's own HTTP timeout gives up first.
             command_response(
-                crate::commands::terminal::run_session_migration(&state.app_handle, plan).await,
+                crate::commands::terminal::run_session_migration(
+                    &state.app_handle,
+                    plan,
+                    PROXY_MIGRATION_ORIGIN,
+                )
+                .await,
             )
         }
 
@@ -817,6 +822,13 @@ pub(crate) fn proxy_session_record_open(
         Err(e) => TauriInvokeResponse::err(format!("bad args: {}", e)),
     }
 }
+
+/// The spawn origin the proxied migration's replacement pane carries. This is
+/// an HTTP door any local process reaches, so its caller's reason is
+/// unnamed, exactly as on the proxied `terminal_create`: `Unknown`, which is
+/// autonomous (fail closed), never the webview's `OperatorTerminal`.
+const PROXY_MIGRATION_ORIGIN: crate::coord_drain_state::SpawnOrigin =
+    crate::coord_drain_state::SpawnOrigin::Unknown;
 
 /// The arguments of the proxied `terminal_migrate_session_account` command.
 #[derive(Debug, Deserialize)]
@@ -1151,20 +1163,60 @@ mod session_migration_proxy_tests {
         let src = include_str!("tauri_proxy.rs");
         let dispatch_src = &src[src.find("async fn dispatch(").expect("dispatch")..];
         let dispatch_src = &dispatch_src[..dispatch_src.find("\n}\n").expect("end of dispatch")];
-        for (command, body) in [
+        // Each arm's text runs from its label to the NEXT arm label (or the
+        // end of `dispatch`), so a call in a later arm cannot satisfy it.
+        let next_arm = regex::Regex::new(r#"\n\s*(?:"[a-z_]+"|_) =>"#).expect("static pattern");
+        let arm_body = |command: &str| -> &str {
+            let label = format!("\"{command}\" =>");
+            let at = dispatch_src
+                .find(&label)
+                .unwrap_or_else(|| panic!("no dispatch arm for {command}"));
+            let rest = &dispatch_src[at + label.len()..];
+            let end = next_arm.find(rest).map_or(rest.len(), |m| m.start());
+            &rest[..end]
+        };
+        for (command, call) in [
             (RECORD_OPEN, "proxy_session_record_open("),
             (MIGRATE, "proxy_plan_session_migration("),
             (MIGRATE, "run_session_migration("),
+            (MIGRATE, "PROXY_MIGRATION_ORIGIN"),
         ] {
-            let arm = format!("\"{command}\" =>");
-            let at = dispatch_src
-                .find(&arm)
-                .unwrap_or_else(|| panic!("no dispatch arm for {command}"));
             assert!(
-                dispatch_src[at..].contains(body),
-                "{command}'s arm must call {body}"
+                arm_body(command).contains(call),
+                "{command}'s arm must use {call}"
             );
         }
+        assert!(
+            !arm_body(MIGRATE).contains("OperatorTerminal"),
+            "the proxied migration must not label its spawn an operator's"
+        );
+    }
+
+    /// Review finding 1: the proxied migration's replacement pane is not an
+    /// operator spawn — the focus coalescer, `intent.spawn_origin` and
+    /// `is_autonomous` all read this.
+    #[test]
+    fn the_proxied_migration_spawns_under_a_non_operator_origin() {
+        use crate::coord_drain_state::SpawnOrigin;
+        assert_eq!(PROXY_MIGRATION_ORIGIN, SpawnOrigin::Unknown);
+        assert!(PROXY_MIGRATION_ORIGIN.is_autonomous());
+        assert_ne!(PROXY_MIGRATION_ORIGIN, SpawnOrigin::OperatorTerminal);
+    }
+
+    /// Point the machine-global roster (`claude-accounts.json`) inside the
+    /// fixture. `IsolatedAmbient` does not capture `XDG_CONFIG_HOME`, so the
+    /// returned guard restores it; bind it AFTER the fixture so it drops first.
+    #[cfg(unix)]
+    fn pin_roster_inside(amb: &crate::test_env::IsolatedAmbient) -> crate::test_env::EnvVarRestore {
+        let restore = crate::test_env::EnvVarRestore::capture(&["XDG_CONFIG_HOME"]);
+        std::env::set_var("XDG_CONFIG_HOME", amb.dir().join("xdg-config"));
+        let roster = crate::claude_accounts::claude_accounts_file_path().expect("roster path");
+        assert!(
+            roster.starts_with(amb.dir()),
+            "the roster escaped the fixture: {}",
+            roster.display()
+        );
+        restore
     }
 
     #[test]
@@ -1284,9 +1336,11 @@ mod session_migration_proxy_tests {
     /// A row recorded through the proxy is the row the proxied migration finds:
     /// with an explicit target that is not a configured account, the refusal is
     /// the not-configured one, past the lookup.
+    #[cfg(unix)]
     #[test]
     fn a_proxied_migration_finds_the_proxied_row_and_refuses_an_unconfigured_target() {
-        let _amb = crate::test_env::isolated_ambient();
+        let amb = crate::test_env::isolated_ambient();
+        let _xdg = pin_roster_inside(&amb);
         let (dir, store) = store();
         record_open(&store, "csid-proxy-2", "/accounts/a");
         let unconfigured = dir.path().join("never-configured").display().to_string();
@@ -1313,13 +1367,7 @@ mod session_migration_proxy_tests {
     #[test]
     fn a_proxied_migration_onto_the_sessions_own_account_is_refused() {
         let amb = crate::test_env::isolated_ambient();
-        std::env::set_var("XDG_CONFIG_HOME", amb.dir().join("xdg-config"));
-        let roster = crate::claude_accounts::claude_accounts_file_path().expect("roster path");
-        assert!(
-            roster.starts_with(amb.dir()),
-            "the roster escaped the fixture: {}",
-            roster.display()
-        );
+        let _xdg = pin_roster_inside(&amb);
         let a = amb.dir().join("acct-a").display().to_string();
         let b = amb.dir().join("acct-b").display().to_string();
         let dirs = vec![a.clone(), b.clone()];

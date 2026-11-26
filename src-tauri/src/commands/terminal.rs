@@ -2396,22 +2396,32 @@ pub async fn terminal_migrate_session_account(
     claude_session_id: String,
     target_config_dir: Option<String>,
 ) -> Result<CommandResponse, String> {
-    migrate_session_account(&app, &store, &claude_session_id, target_config_dir).await
+    migrate_session_account(
+        &app,
+        &store,
+        &claude_session_id,
+        target_config_dir,
+        crate::coord_drain_state::SpawnOrigin::OperatorTerminal,
+    )
+    .await
 }
 
 /// [`terminal_migrate_session_account`]'s body, callable without
 /// `tauri::State` — the Tauri command and the tauri invoke proxy
 /// (`mcp::tauri_proxy`, `"terminal_migrate_session_account"`) both enter here,
 /// so a headless driver runs the operator migration, not a second path. Its
-/// duration is the command's (see there: up to ~17 minutes).
+/// duration is the command's (see there: up to ~17 minutes). `origin` is the
+/// caller's: the webview's command passes `OperatorTerminal`, the proxy
+/// `Unknown` (see [`run_session_migration`]).
 pub(crate) async fn migrate_session_account(
     app: &tauri::AppHandle,
     store: &SessionLifecycleStore,
     claude_session_id: &str,
     target_config_dir: Option<String>,
+    origin: crate::coord_drain_state::SpawnOrigin,
 ) -> Result<CommandResponse, String> {
     let plan = plan_session_migration(store, claude_session_id, target_config_dir)?;
-    run_session_migration(app, plan).await
+    run_session_migration(app, plan, origin).await
 }
 
 /// What [`plan_session_migration`] resolved: the session's row and the two
@@ -2469,9 +2479,25 @@ pub(crate) fn plan_session_migration(
 
 /// Carry out a resolved [`SessionMigrationPlan`]: record the handoff, migrate,
 /// and answer the command's payload.
+///
+/// `origin` labels the replacement pane's spawn (the focus coalescer,
+/// `intent.spawn_origin`, `is_autonomous`), so a caller passes its own: the
+/// webview's command `OperatorTerminal`, the invoke proxy `Unknown` — the same
+/// split the two `terminal_create` doors make.
+///
+/// No coord device-drain check, deliberately, on either door. A drain
+/// withholds NEW work from a device; a migration moves a session that is
+/// already live here onto another account and closes the old pane only once
+/// the new one is proven, so the device's session count does not grow. The
+/// automatic token-exhaustion migration (`account_migration::handle_usage_limit_hint`'s
+/// `migrate_session_off_runtime` call, `SpawnOrigin::Respawn`) is the precedent
+/// and is not drain-gated either; the doors that ARE (`session::respawn`,
+/// `session::resume_door`) start a session that is not running on this device.
+/// Deferring a migration would leave a token-exhausted session stuck instead.
 pub(crate) async fn run_session_migration(
     app: &tauri::AppHandle,
     plan: SessionMigrationPlan,
+    origin: crate::coord_drain_state::SpawnOrigin,
 ) -> Result<CommandResponse, String> {
     let SessionMigrationPlan {
         record,
@@ -2491,11 +2517,7 @@ pub(crate) async fn run_session_migration(
     // (the new pane closed), unless the old pane is read to host no CLI — then
     // the new pane keeps the session.
     let outcome = crate::terminal::account_migration::migrate_session_off_runtime(
-        app,
-        &record,
-        &src,
-        &dst,
-        crate::coord_drain_state::SpawnOrigin::OperatorTerminal,
+        app, &record, &src, &dst, origin,
     )
     .await
     .map_err(|e| {
