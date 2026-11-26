@@ -74,6 +74,31 @@ echo "bounded time. Use fewer nested aliases, or do not alias a large scalar"
 echo "many times."
 exit 1
 fi
+if grep -q '^!YAML11' <<< "${FINDINGS}"; then
+echo "::error::A gating file has scalars or line breaks that YAML 1.1 and 1.2 read differently at head:"
+grep '^!YAML11' <<< "${FINDINGS}" | cut -f2 | sed 's/^/  - /'
+echo "This check parses YAML 1.1 and GitHub Actions is assumed to parse YAML 1.2, so a key or"
+echo "value such as yes/no/on/off, 1:00, 074, 0b1, 6_0 or 1e3, an explicit or '!'"
+echo "tag on a non-string, a U+0085/U+2028/U+2029 line break, a mid-file U+FEFF, a"
+echo "%YAML directive or an over-long plain scalar means one thing"
+echo "here and another to Actions (the top-level 'on:' key is the one exemption)."
+echo "Write a form both read alike (true/false, 60, an untagged quoted string)."
+exit 1
+fi
+if grep -q '^!DUPKEY' <<< "${FINDINGS}"; then
+echo "::error::A gating file has two keys in one mapping that read as equal at head:"
+grep '^!DUPKEY' <<< "${FINDINGS}" | cut -f2 | sed 's/^/  - /'
+echo "This check keeps the LAST of two equal keys (and reads 'on', true, 1 and"
+echo "1.0 as equal) while Actions rejects a duplicate, so the digest is not what"
+echo "Actions runs. Remove the duplicate, or use a key that cannot collide."
+exit 1
+fi
+if grep -q '^!UTF8' <<< "${FINDINGS}"; then
+echo "::error::A gating file is not valid UTF-8 (the side that failed is named):"
+grep '^!UTF8' <<< "${FINDINGS}" | awk -F '\t' '{ print "  - " $2 " (at the " ($3 == "base" ? "merge base" : "PR head") ")" }'
+echo "It cannot be decoded exactly, so it cannot be verified. Save it as UTF-8."
+exit 1
+fi
 LABELS="$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/labels" --jq '.[].name')"
 DECLARED=""
 if grep -qxF 'ci:gate-change=declared'      <<< "${LABELS}"; then DECLARED="declared"; fi
@@ -163,4 +188,4 @@ cat "${RUNNER_TEMP}/notice.md" >> "${GITHUB_STEP_SUMMARY}"
 gh pr comment "${PR_NUMBER}" --repo "${REPO}" --body-file "${RUNNER_TEMP}/notice.md"
 echo ""
 echo "Gating change declared, verified and recorded — CI integrity intact."
-PY body sha256 3b0b6d7fd4b81fe38b7c68c4ddda4d3e59ef0df4ea3401e72717d55ba2a25616
+PY body sha256 30fbc1b9fbbacaf0e2df3f66c986458fc9b938ad7954cbd2df2aa8de013a4bb3

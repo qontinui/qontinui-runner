@@ -6,7 +6,7 @@
 # claims to detect reduces to "does the surface digest change?". A field
 # silently dropped from surface() is a bypass, so every field the header
 # advertises has a case here.
-import ast, hashlib, io, json, os, re, sys, textwrap, yaml
+import ast, base64, hashlib, io, json, os, re, subprocess, sys, textwrap, time, yaml
 
 WF = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
@@ -45,18 +45,28 @@ def lift_line(name):
 # rule there misroutes every author of the file it governs. Deleting token()'s
 # composite-action branch used to leave this suite green while telling every
 # action author to write `action#workflow`, which matches nothing.
-ns = {"yaml": yaml, "hashlib": hashlib, "json": json, "os": os}
+ns = {"yaml": yaml, "hashlib": hashlib, "json": json, "os": os, "base64": base64}
 exec(compile(lift("canon") + "\n\n" + lift("digest") + "\n\n"
              + lift("uses_yaml_merge_key") + "\n\n"
              + lift_line("ALIAS_EXPANSION_BUDGET") + "\n\n"
-             + lift("yaml_alias_expansion_exceeds") + "\n\n" + lift("surface") + "\n\n"
+             + lift("yaml_alias_expansion_exceeds") + "\n\n"
+             + lift_line("SCALAR_LENGTH_CAP") + "\n\n"
+             + lift("yaml11_divergences") + "\n\n"
+             + lift("yaml_duplicate_keys") + "\n\n" + lift("decode_blob") + "\n\n"
+             + lift("surface") + "\n\n"
              + lift("token") + "\n\n" + lift_line("WHOLE_FILE_GATES") + "\n\n"
-             + lift("file_findings") + "\n\n" + lift("path_findings"),
+             + lift("file_findings") + "\n\n" + lift("path_findings") + "\n\n"
+             + lift("findings_for"),
              "lifted", "exec"), ns)
 surface, digest, token = ns["surface"], ns["digest"], ns["token"]
 file_findings, path_findings = ns["file_findings"], ns["path_findings"]
 uses_yaml_merge_key = ns["uses_yaml_merge_key"]
 yaml_alias_expansion_exceeds = ns["yaml_alias_expansion_exceeds"]
+yaml11_divergences = ns["yaml11_divergences"]
+yaml_duplicate_keys = ns["yaml_duplicate_keys"]
+decode_blob = ns["decode_blob"]
+findings_for = ns["findings_for"]
+SCALAR_LENGTH_CAP = ns["SCALAR_LENGTH_CAP"]
 ALIAS_EXPANSION_BUDGET = ns["ALIAS_EXPANSION_BUDGET"]
 
 checks = failures = 0
@@ -543,6 +553,191 @@ eq("the live ci.yml is under the budget", False,
    yaml_alias_expansion_exceeds(io.open(CI_YML, encoding="utf-8").read()))
 eq("unparseable input is not an alias bomb (it is !PARSE)", False,
    yaml_alias_expansion_exceeds("jobs: [oops\n"))
+
+print("\n5c. YAML 1.1 respellings Actions (YAML 1.2) reads differently are REFUSED.")
+# PyYAML is YAML 1.1; Actions is YAML 1.2. A plain scalar the two resolve
+# differently lets a gate be respelled with an identical digest.
+CANON = """
+on:
+  push:
+jobs:
+  g:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    continue-on-error: false
+    steps:
+      - run: bash gate.sh
+"""
+eq("the canonical workflow (top-level `on:`, true/false, 60) passes", [],
+   yaml11_divergences(CANON))
+eq("...and path_findings certifies it unchanged", [],
+   path_findings(".github/workflows/x.yml", CANON, CANON))
+for spelling in ["yes", "Yes", "YES", "true", "True", "TRUE", "ON", "On", "!!bool on",
+                 "!!bool yes"]:
+    head = CANON.replace("\non:", "\n" + spelling + ":", 1)
+    eq("top-level `%s:` digests like `on:` under YAML 1.1 (hence the refusal)" % spelling,
+       True, digest(wf_of(head)) == digest(wf_of(CANON)))
+    eq("top-level `%s:` is refused as !YAML11" % spelling,
+       [("!YAML11", ".github/workflows/x.yml", "-")],
+       path_findings(".github/workflows/x.yml", CANON, head))
+for old, new_text, why in [
+        ("continue-on-error: false", "continue-on-error: no", "a yes/no bool"),
+        ("continue-on-error: false", "continue-on-error: off", "an on/off bool"),
+        ("timeout-minutes: 60", "timeout-minutes: 1:00", "a sexagesimal int"),
+        ("timeout-minutes: 60", "timeout-minutes: 074", "a leading-zero octal"),
+        ("timeout-minutes: 60", "timeout-minutes: 6_0", "an underscored int"),
+        ("timeout-minutes: 60", "timeout-minutes: 0b111100", "a binary int"),
+        ("timeout-minutes: 60", "timeout-minutes: 0o74", "a 1.2-only octal"),
+        ("timeout-minutes: 60", "timeout-minutes: 6e1", "a 1.2-only exponent float"),
+        ("timeout-minutes: 60", "timeout-minutes: 2026-11-26", "a 1.1 timestamp"),
+        ("continue-on-error: false", "continue-on-error: !!bool yes", "an explicit !!bool"),
+        ("    steps:", "    on: x\n    steps:", "a NESTED `on` key")]:
+    head = CANON.replace(old, new_text, 1)
+    assert head != CANON, why
+    eq("%s (`%s`) is refused as !YAML11" % (why, new_text.strip()),
+       [("!YAML11", ".github/workflows/x.yml", "-")],
+       path_findings(".github/workflows/x.yml", CANON, head))
+QUOTED = CANON.replace("continue-on-error: false", 'continue-on-error: "no"').replace(
+    "timeout-minutes: 60", "timeout-minutes: '1:00'")
+eq("quoted scalars are strings to both parsers and pass", [], yaml11_divergences(QUOTED))
+eq("an explicit !!str on a plain scalar passes", [],
+   yaml11_divergences(CANON.replace("timeout-minutes: 60", "timeout-minutes: !!str 074")))
+eq("a divergence is reported with its line, column and text", [(8, 24, "no")],
+   yaml11_divergences(CANON.replace("continue-on-error: false", "continue-on-error: no")))
+# PyYAML resolves no y/n bool, so `y:` is a different key to it, not a respelling.
+eq("top-level `y:` is NOT a respelling under PyYAML (it digests as changed)", False,
+   digest(wf_of(CANON.replace("\non:", "\ny:", 1))) == digest(wf_of(CANON)))
+eq("a quoted top-level \"on\" passes", [], yaml11_divergences(CANON.replace("\non:", '\n"on":', 1)))
+# Bypasses closed in review, each refused by name.
+REF = [("!YAML11", ".github/workflows/x.yml", "-")]
+for why, head in [
+        ("an anchored top-level `on` aliased into a value",
+         CANON.replace("\non:", "\n&x on:", 1).replace("    timeout-minutes: 60",
+                                                      "    timeout-minutes: 60\n    env: {STRICT: *x}", 1)),
+        ("a QUOTED value with an explicit !!bool", CANON.replace("continue-on-error: false",
+                                                                 'continue-on-error: !!bool "yes"')),
+        ("a quoted !!int", CANON.replace("timeout-minutes: 60", 'timeout-minutes: !!int "074"')),
+        ("a single-quoted !!int sexagesimal", CANON.replace("timeout-minutes: 60",
+                                                            "timeout-minutes: !!int '1:00'")),
+        ("a block-scalar !!int", CANON.replace("timeout-minutes: 60",
+                                               "timeout-minutes: !!int |-\n      074")),
+        ("a non-specific `!` tag on a quoted value", CANON.replace("continue-on-error: false",
+                                                                   'continue-on-error: ! "yes"')),
+        ("a non-specific `!` tag on a plain bool", CANON.replace("continue-on-error: false",
+                                                                 "continue-on-error: ! true")),
+        ("a non-specific `!` tag on a plain int", CANON.replace("timeout-minutes: 60",
+                                                                "timeout-minutes: ! 60")),
+        ("a decimal over Python's digit limit", CANON.replace("timeout-minutes: 60",
+                                                              "timeout-minutes: " + "9" * 5000)),
+        ("a U+2028 line break hiding a duplicate key in a comment", CANON.replace(
+            "    timeout-minutes: 60", "    timeout-minutes: 5 #\u2028    timeout-minutes: 60")),
+        ("a U+0085 anywhere", CANON + "# \u0085\n"),
+        ("a U+2029 anywhere", CANON + "# \u2029\n")]:
+    assert head != CANON, why
+    eq("%s is refused as !YAML11" % why, REF,
+       path_findings(".github/workflows/x.yml", CANON, head))
+eq("the U+2028 respelling DOES digest like 60 under YAML 1.1 (hence the refusal)", True,
+   digest(jobs_of(CANON.replace("    timeout-minutes: 60",
+                                "    timeout-minutes: 5 #\u2028    timeout-minutes: 60"))["g"])
+   == digest(jobs_of(CANON)["g"]))
+eq("a non-specific `!` tag on a plain string passes (a string to both)", [],
+   yaml11_divergences(CANON.replace("runs-on: ubuntu-latest", "runs-on: ! ubuntu-latest")))
+eq("an untagged quoted value passes", [],
+   yaml11_divergences(CANON.replace("continue-on-error: false", "continue-on-error: 'yes'")))
+# Keys of one mapping that build EQUAL (last-wins; True == 1 == 1.0 == 0x1).
+DUP = [("!DUPKEY", ".github/workflows/x.yml", "-")]
+NARROW = CANON.replace("on:\n  push:", "on:\n  workflow_dispatch:", 1)
+for why, head in [
+        ("`on:` narrowed plus `1:` with the original trigger", NARROW + "1:\n  push:\n"),
+        ("`on:` narrowed plus `1.0:`", NARROW + "1.0:\n  push:\n"),
+        ("`on:` narrowed plus `0x1:`", NARROW + "0x1:\n  push:\n"),
+        ("`on:` narrowed plus `01:`", NARROW + "01:\n  push:\n"),
+        ("a plain duplicate key", CANON.replace("    timeout-minutes: 60",
+                                                "    timeout-minutes: 1\n    timeout-minutes: 60")),
+        ("a non-scalar key", CANON.replace("    timeout-minutes: 60",
+                                           "    timeout-minutes: 60\n    ? [a]\n    : b"))]:
+    eq("%s is refused" % why, True,
+       path_findings(".github/workflows/x.yml", CANON, head) in (DUP, REF))
+    eq("...by yaml_duplicate_keys itself (%s)" % why, True, bool(yaml_duplicate_keys(head)))
+eq("`on:` narrowed + `1:` DOES digest like the original (hence the refusal)", True,
+   digest(wf_of(NARROW + "1:\n  push:\n")) == digest(wf_of(CANON)))
+eq("the `1:` collision is refused as !DUPKEY (it is not a 1.1/1.2 divergence)", DUP,
+   path_findings(".github/workflows/x.yml", CANON, NARROW + "1:\n  push:\n"))
+eq("distinct keys pass", [], yaml_duplicate_keys(CANON))
+# A long plain scalar is refused WITHOUT being built (sexagesimal ints build
+# in time quadratic in their length).
+LONG_SEXA = CANON.replace("timeout-minutes: 60", "timeout-minutes: " + ":".join(["1"] + ["59"] * 70000))
+# Counted, not timed: every construct_object call on a scalar over the cap.
+_real_construct = yaml.constructor.SafeConstructor.construct_object
+_overlong_built = []
+def _counting_construct(self, node, deep=False):
+    if isinstance(node, yaml.ScalarNode) and len(node.value) > SCALAR_LENGTH_CAP:
+        _overlong_built.append(len(node.value))
+    return _real_construct(self, node, deep=deep)
+yaml.constructor.SafeConstructor.construct_object = _counting_construct
+try:
+    _long_verdict = path_findings(".github/workflows/x.yml", CANON, LONG_SEXA)
+finally:
+    yaml.constructor.SafeConstructor.construct_object = _real_construct
+eq("a ~210 KB sexagesimal value is refused as !YAML11", REF, _long_verdict)
+eq("...and is never BUILT on the way (construct_object not called on it)", [], _overlong_built)
+eq("a plain scalar exactly at the cap is still checked normally", [],
+   yaml11_divergences(CANON.replace("runs-on: ubuntu-latest", "runs-on: " + "u" * SCALAR_LENGTH_CAP)))
+eq("a long QUOTED scalar is not capped (a string to both, built linearly)", [],
+   yaml11_divergences(CANON.replace("runs-on: ubuntu-latest", 'runs-on: "' + "u" * 20000 + '"')))
+for directive in ("%YAML 1.1", "%YAML 1.2"):
+    eq("a `%s` directive is refused as !YAML11" % directive, REF,
+       path_findings(".github/workflows/x.yml", CANON, directive + "\n---" + CANON))
+eq("a %TAG directive alone is not refused here (tags are resolved and checked)", [],
+   yaml11_divergences("%TAG !e! tag:example.com,2000:\n---" + CANON))
+eq("a U+FEFF mid-file is refused as !YAML11", REF,
+   path_findings(".github/workflows/x.yml", CANON, CANON + "# \ufeff\n"))
+eq("a U+FEFF as the very first character (a BOM) passes", [],
+   yaml11_divergences("\ufeff" + CANON))
+eq("decode_blob decodes valid UTF-8", "on: é",
+   decode_blob(base64.b64encode("on: é".encode("utf-8")).decode()))
+try:
+    decode_blob(base64.b64encode(b"on: \xff").decode())
+    strict = False
+except UnicodeDecodeError:
+    strict = True
+eq("decode_blob REFUSES invalid UTF-8 (no replacement characters)", True, strict)
+os.environ.setdefault("MERGE_BASE", "base"); os.environ.setdefault("HEAD_SHA", "head")
+BAD = base64.b64encode(b"on: \xff\n").decode()
+GOOD = base64.b64encode(CANON.encode("utf-8")).decode()
+eq("findings_for: invalid UTF-8 at HEAD is !UTF8, naming the head",
+   [("!UTF8", ".github/workflows/x.yml", "head")],
+   findings_for(".github/workflows/x.yml",
+                lambda p, ref: decode_blob(BAD if ref == os.environ["HEAD_SHA"] else GOOD)))
+eq("findings_for: invalid UTF-8 at the BASE is !UTF8, naming the base",
+   [("!UTF8", ".github/workflows/x.yml", "base")],
+   findings_for(".github/workflows/x.yml",
+                lambda p, ref: decode_blob(GOOD if ref == os.environ["HEAD_SHA"] else BAD)))
+eq("findings_for: valid UTF-8 on both sides goes through path_findings", [],
+   findings_for(".github/workflows/x.yml", lambda p, ref: decode_blob(GOOD)))
+eq("unparseable input is not a divergence (it is !PARSE)", [],
+   yaml11_divergences("jobs: [oops\n"))
+# No false positives on this repo's own gating files: every tracked
+# .github/**/*.y{a,}ml must pass, the live ci.yml among them.
+GH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", ".github")
+# TRACKED files only (an untracked scratch file must not decide this).
+tracked = sorted(os.path.join(GH, "..", f) for f in subprocess.run(
+    ["git", "-C", GH, "ls-files", "--full-name", "--", "."],
+    capture_output=True, text=True, check=True).stdout.split()
+    if f.endswith((".yml", ".yaml")))
+eq("this repo has gating YAML to check (the sweep is not vacuous)", True, len(tracked) >= 30)
+sweep = {}
+for f in tracked:
+    t = io.open(f, encoding="utf-8").read()
+    sweep[os.path.relpath(f, GH)] = (yaml11_divergences(t)[:3], yaml_duplicate_keys(t)[:3])
+eq("no tracked .github YAML file has a YAML 1.1 divergence", [],
+   [(f, d) for f, (d, _) in sweep.items() if d])
+eq("no tracked .github YAML file carries a %YAML directive", [],
+   [f for f in tracked if re.search(r"(?m)^%YAML", io.open(f, encoding="utf-8").read())])
+eq("no tracked .github YAML file has a duplicate key", [],
+   [(f, d) for f, (_, d) in sweep.items() if d])
+eq("the live ci.yml has no YAML 1.1 divergence", [],
+   yaml11_divergences(io.open(os.path.join(GH, "workflows", "ci.yml"), encoding="utf-8").read()))
 
 print("\n6. path_findings() -- routing, and the non-YAML gating script.")
 # The defect this closes: surface() YAML-parses its input, the script is
