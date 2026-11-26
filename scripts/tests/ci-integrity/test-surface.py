@@ -47,13 +47,17 @@ def lift_line(name):
 # action author to write `action#workflow`, which matches nothing.
 ns = {"yaml": yaml, "hashlib": hashlib, "json": json, "os": os}
 exec(compile(lift("canon") + "\n\n" + lift("digest") + "\n\n"
-             + lift("uses_yaml_aliases") + "\n\n" + lift("surface") + "\n\n"
+             + lift("uses_yaml_merge_key") + "\n\n"
+             + lift_line("ALIAS_EXPANSION_BUDGET") + "\n\n"
+             + lift("yaml_alias_expansion_exceeds") + "\n\n" + lift("surface") + "\n\n"
              + lift("token") + "\n\n" + lift_line("WHOLE_FILE_GATES") + "\n\n"
              + lift("file_findings") + "\n\n" + lift("path_findings"),
              "lifted", "exec"), ns)
 surface, digest, token = ns["surface"], ns["digest"], ns["token"]
 file_findings, path_findings = ns["file_findings"], ns["path_findings"]
-uses_yaml_aliases = ns["uses_yaml_aliases"]
+uses_yaml_merge_key = ns["uses_yaml_merge_key"]
+yaml_alias_expansion_exceeds = ns["yaml_alias_expansion_exceeds"]
+ALIAS_EXPANSION_BUDGET = ns["ALIAS_EXPANSION_BUDGET"]
 
 checks = failures = 0
 
@@ -355,12 +359,14 @@ removed = BASE.replace("""  test:
 """, "  other:\n    runs-on: x\n")
 eq("removing the job drops its key", False, "test" in jobs_of(removed))
 
-print("\n5. Anchors/aliases must be REFUSED, not silently resolved.")
-# PyYAML resolves anchors, aliases and merge keys; GitHub Actions does not
-# support them. So an anchored rewrite digests identically to the plain original
-# while the gate may stop running entirely — a weakening that would read here as
-# "no change at all". The guard therefore declines to certify such a file rather
-# than adjudicating whose parser is right.
+print("\n5. Merge keys must be REFUSED; anchors and aliases are digested as resolved.")
+# PyYAML resolves anchors, aliases and merge keys. GitHub Actions resolves
+# anchors and aliases too (since 2025-09-18); the merge key is not documented as
+# supported there.
+# So an anchored file digests to exactly what Actions runs, while a merge-key
+# rewrite digests identically to the plain original although Actions may refuse
+# the file -- a weakening that would read here as "no change at all". The guard
+# therefore declines to certify a merge key, and certifies anchors normally.
 PLAIN = """
 jobs:
   g:
@@ -369,11 +375,13 @@ jobs:
       - run: bash gate.sh
 """
 ANCHORED = """
-x: &s
-  - run: bash gate.sh
 jobs:
   g:
     runs-on: ubuntu-latest
+    steps: &s
+      - run: bash gate.sh
+  h:
+    runs-on: windows-latest
     steps: *s
 """
 MERGED = """
@@ -393,17 +401,148 @@ jobs:
       - run: bash gate.sh
 """
 
-eq("plain YAML is not flagged", False, uses_yaml_aliases(PLAIN))
-eq("an alias is flagged", True, uses_yaml_aliases(ANCHORED))
-eq("a merge key is flagged", True, uses_yaml_aliases(MERGED))
-eq("a bare anchor with no alias is flagged", True, uses_yaml_aliases(INLINE_ANCHOR))
+eq("plain YAML is not flagged", False, uses_yaml_merge_key(PLAIN))
+eq("an alias is not flagged", False, uses_yaml_merge_key(ANCHORED))
+eq("a bare anchor with no alias is not flagged", False, uses_yaml_merge_key(INLINE_ANCHOR))
+eq("a merge key is flagged", True, uses_yaml_merge_key(MERGED))
+# A key explicitly TAGGED as a merge key merges exactly like a plain `<<:`
+# (PyYAML's flatten_mapping keys on the tag), whatever its text, so it must be
+# refused too: inline, merging an aliased mapping, and an aliased plain `<<`.
+TAGGED_MERGE = """
+jobs:
+  g:
+    !!merge k: {runs-on: ubuntu-latest, steps: [{run: bash gate.sh}]}
+"""
+TAGGED_MERGE_ALIASED = """
+base: &b
+  runs-on: ubuntu-latest
+  steps:
+    - run: bash gate.sh
+jobs:
+  g:
+    !!merge k: *b
+"""
+ALIASED_MERGE_KEY = """
+m: &m <<
+base: &b
+  runs-on: ubuntu-latest
+  steps:
+    - run: bash gate.sh
+jobs:
+  g:
+    *m : *b
+"""
+eq("a !!merge-tagged key DOES digest like the plain job (hence the refusal)", True,
+   digest(jobs_of(TAGGED_MERGE)["g"]) == digest(jobs_of(PLAIN)["g"]))
+eq("an inline !!merge-tagged key is flagged", True, uses_yaml_merge_key(TAGGED_MERGE))
+eq("a !!merge-tagged key merging an alias is flagged", True,
+   uses_yaml_merge_key(TAGGED_MERGE_ALIASED))
+eq("an aliased plain `<<` key is flagged", True, uses_yaml_merge_key(ALIASED_MERGE_KEY))
+# flatten_mapping keys on the key NODE's tag, not on its kind, so a `!!merge`
+# SEQUENCE or MAPPING key merges too (complex `? key` syntax, block or flow).
+SEQ_MERGE_KEY = """
+jobs:
+  g:
+    ? !!merge [x]
+    : {runs-on: ubuntu-latest, steps: [{run: bash gate.sh}]}
+"""
+MAP_MERGE_KEY_FLOW = """
+jobs:
+  g: {? !!merge {} : {runs-on: ubuntu-latest, steps: [{run: bash gate.sh}]}}
+"""
+# The other spellings of the same tag: a %TAG shorthand and a verbatim tag.
+TAG_DIRECTIVE_MERGE = """%TAG !m! tag:yaml.org,2002:
+---
+jobs:
+  g:
+    !m!merge k: {runs-on: ubuntu-latest, steps: [{run: bash gate.sh}]}
+"""
+VERBATIM_MERGE = """
+jobs:
+  g:
+    !<tag:yaml.org,2002:merge> k: {runs-on: ubuntu-latest, steps: [{run: bash gate.sh}]}
+"""
+# A plain `<<` as a FLOW key resolves to the merge tag implicitly.
+FLOW_PLAIN_MERGE = """
+jobs:
+  g: {<<: {runs-on: ubuntu-latest, steps: [{run: bash gate.sh}]}}
+"""
+for name, text in [("a !!merge SEQUENCE key", SEQ_MERGE_KEY),
+                   ("a !!merge MAPPING key in flow style", MAP_MERGE_KEY_FLOW),
+                   ("a %TAG-shorthand merge key", TAG_DIRECTIVE_MERGE),
+                   ("a verbatim-tag merge key", VERBATIM_MERGE),
+                   ("a plain `<<` flow key", FLOW_PLAIN_MERGE)]:
+    eq(name + " DOES digest like the plain job (hence the refusal)", True,
+       digest(jobs_of(text)["g"]) == digest(jobs_of(PLAIN)["g"]))
+    eq(name + " is refused as !MERGE",
+       [("!MERGE", ".github/workflows/x.yml", "-")],
+       path_findings(".github/workflows/x.yml", PLAIN, text))
+eq("path_findings refuses a !!merge-tagged key as !MERGE",
+   [("!MERGE", ".github/workflows/x.yml", "-")],
+   path_findings(".github/workflows/x.yml", PLAIN, TAGGED_MERGE_ALIASED))
 eq("unparseable input does not crash the detector", False,
-   uses_yaml_aliases("jobs: [oops\n"))
+   uses_yaml_merge_key("jobs: [oops\n"))
 # The reason the refusal is needed at all: resolution really does hide the edit.
-eq("an anchored rewrite DOES digest identically (hence the refusal)", True,
-   digest(jobs_of(ANCHORED)["g"]) == digest(jobs_of(PLAIN)["g"]))
-eq("a merge-key rewrite DOES digest identically too", True,
+eq("a merge-key rewrite DOES digest identically (hence the refusal)", True,
    digest(jobs_of(MERGED)["g"]) == digest(jobs_of(PLAIN)["g"]))
+# Why an anchor is safe to certify: the alias is digested as what it resolves
+# to, so gutting the anchored block changes the digest of every job using it.
+GUTTED = ANCHORED.replace("bash gate.sh", "true")
+eq("an aliased job digests as the steps it resolves to", True,
+   digest(jobs_of(ANCHORED)["h"]["steps"]) == digest(jobs_of(PLAIN)["g"]["steps"]))
+eq("editing the anchored block changes the ALIASING job's digest", False,
+   digest(jobs_of(ANCHORED)["h"]) == digest(jobs_of(GUTTED)["h"]))
+eq("an anchored file at head is CHANGED per job, not refused", [
+   ("CHANGED", ".github/workflows/x.yml", "x#g"),
+   ("CHANGED", ".github/workflows/x.yml", "x#h"),
+], path_findings(".github/workflows/x.yml", ANCHORED, GUTTED))
+
+print("\n5b. An alias bomb is REFUSED by name before anything walks it.")
+# canon() walks aliases in full, so nested aliases cost 10^levels there. The
+# detector sums expanded sizes over the composed graph (shared nodes counted by
+# identity), which is linear in the file however large the expansion.
+def alias_bomb(levels, fan=10):
+    lines = ["x0: &a0 [\"lol\"]"]
+    for i in range(1, levels + 1):
+        lines.append("x%d: &a%d [%s]" % (i, i, ", ".join(["*a%d" % (i - 1)] * fan)))
+    return "\n".join(lines) + "\njobs:\n  g:\n    runs-on: ubuntu-latest\n    steps: *a%d\n" % levels
+BOMB = alias_bomb(9)
+eq("the bomb fixture is small (under 1 KiB)", True, len(BOMB) < 1024)
+import time
+t0 = time.monotonic()
+eq("a 9-level alias bomb is over the budget", True, yaml_alias_expansion_exceeds(BOMB))
+eq("...and detecting it takes under a second", True, time.monotonic() - t0 < 1.0)
+t0 = time.monotonic()
+eq("path_findings refuses it by name, without digesting it",
+   [("!ALIASBOMB", ".github/workflows/x.yml", "-")],
+   path_findings(".github/workflows/x.yml", PLAIN, BOMB))
+eq("...also in under a second", True, time.monotonic() - t0 < 1.0)
+eq("a recursive alias counts as over the budget", True,
+   yaml_alias_expansion_exceeds("a: &r [1, *r]\njobs: {}\n"))
+# The same attack in BYTES: one large scalar aliased many times. Few nodes,
+# but canon()/digest() copy the scalar at every occurrence, so each scalar is
+# charged 1 per 64 bytes of its text.
+BIG = "x" * 50000
+BYTE_BOMB = ("big: &s " + BIG + "\nrefs: &r [" + ", ".join(["*s"] * 2000)
+             + "]\njobs:\n  g:\n    runs-on: ubuntu-latest\n    steps: *r\n")
+eq("the byte-bomb fixture is small (under 70 KB)", True, len(BYTE_BOMB) < 70000)
+t0 = time.monotonic()
+eq("path_findings refuses an aliased large scalar as !ALIASBOMB",
+   [("!ALIASBOMB", ".github/workflows/x.yml", "-")],
+   path_findings(".github/workflows/x.yml", PLAIN, BYTE_BOMB))
+eq("...in under a second", True, time.monotonic() - t0 < 1.0)
+eq("the same large scalar used ONCE stays under the budget", False,
+   yaml_alias_expansion_exceeds("big: " + BIG + "\njobs: {}\n"))
+eq("a shallow alias (3 levels) stays under the budget", False,
+   yaml_alias_expansion_exceeds(alias_bomb(3)))
+eq("the ci.yml-shaped anchor fixture is under the budget", False,
+   yaml_alias_expansion_exceeds(ANCHORED))
+CI_YML = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                      "..", "..", "..", ".github", "workflows", "ci.yml")
+eq("the live ci.yml is under the budget", False,
+   yaml_alias_expansion_exceeds(io.open(CI_YML, encoding="utf-8").read()))
+eq("unparseable input is not an alias bomb (it is !PARSE)", False,
+   yaml_alias_expansion_exceeds("jobs: [oops\n"))
 
 print("\n6. path_findings() -- routing, and the non-YAML gating script.")
 # The defect this closes: surface() YAML-parses its input, the script is

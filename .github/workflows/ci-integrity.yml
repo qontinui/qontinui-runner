@@ -395,33 +395,119 @@ jobs:
 
           def digest(obj):
               return hashlib.sha256(repr(canon(obj)).encode()).hexdigest()[:12]
-          def uses_yaml_aliases(text):
-              """Does this document use anchors, aliases, or a merge key?
+          def uses_yaml_merge_key(text):
+              """Does this document use a YAML merge key (`<<:`, or a key tagged `!!merge`)?
 
               Digest equality only means "same gate" if OUR parser agrees with the one
-              GitHub Actions uses, and anchors are a known divergence point: PyYAML
-              RESOLVES them, so a gating file rewritten to use an anchor digests
-              identically to the plain original — while Actions, which does not support
-              them, may refuse the file outright and simply never run the gate. That is a
-              weakening that would read here as "no change at all". Verified: an
-              anchor/alias rewrite and a `<<:` merge rewrite both produced a job digest
-              identical to the plain form.
+              GitHub Actions uses. Anchors and aliases no longer diverge: Actions has
+              resolved them since 2025-09-18, as PyYAML does, so an anchored file
+              digests to exactly the jobs Actions runs, and an edit to an anchored
+              block changes the digest of EVERY job that aliases it. The merge key is
+              not documented as supported by Actions, and this guard's parser (PyYAML)
+              resolves it: if Actions does not, it may refuse the file outright and
+              never run the gate. That is a weakening that would read here as "no
+              change at all".
+              Verified: a `<<:` merge rewrite produced a job digest identical to the
+              plain form.
 
-              So we do not try to decide who is right — we refuse to certify. Checked on
-              HEAD only: base is what is already live, and tripping on it would wedge
-              every PR in the repo rather than the one proposing the change."""
+              So for a merge key we do not try to decide who is right; we refuse to
+              certify. Checked on HEAD only: base is what is already live, and
+              tripping on it would wedge every PR in the repo rather than the one
+              proposing the change."""
+              MERGE_TAG = "tag:yaml.org,2002:merge"
               try:
+                  # 1. The event stream: ANY node -- scalar, sequence or mapping --
+                  #    explicitly tagged as a merge (`!!merge`, a %TAG shorthand
+                  #    or a verbatim `!<tag:yaml.org,2002:merge>`; the parser
+                  #    expands each to the full tag), and every `<<` scalar in any
+                  #    style. An aliased merge key is caught at its anchored
+                  #    definition, which is one of these same events.
+                  node_events = (yaml.events.ScalarEvent, yaml.events.SequenceStartEvent,
+                                 yaml.events.MappingStartEvent)
                   for ev in yaml.parse(text, Loader=yaml.SafeLoader):
-                      if isinstance(ev, yaml.events.AliasEvent):
-                          return True
-                      if getattr(ev, "anchor", None):
+                      if not isinstance(ev, node_events):
+                          continue
+                      if ev.tag == MERGE_TAG:
                           return True
                       if isinstance(ev, yaml.events.ScalarEvent) and ev.value == "<<":
                           return True
+                  # 2. Exactly what PyYAML's flatten_mapping keys on: a mapping KEY
+                  #    node whose RESOLVED tag is the merge tag, whether explicit
+                  #    or implicit. Pass 1 already covers every way to get one;
+                  #    this pass checks the constructor's own predicate, so a
+                  #    resolver path pass 1 did not anticipate is still refused.
+                  root = yaml.compose(text, Loader=yaml.SafeLoader)
+                  seen, stack = set(), [root] if root is not None else []
+                  while stack:
+                      node = stack.pop()
+                      if id(node) in seen:
+                          continue
+                      seen.add(id(node))
+                      if isinstance(node, yaml.MappingNode):
+                          for k, v in node.value:
+                              if k.tag == MERGE_TAG:
+                                  return True
+                              stack.extend((k, v))
+                      elif isinstance(node, yaml.SequenceNode):
+                          stack.extend(node.value)
               except Exception:
                   # Unparseable is a separate verdict, reached below.
                   return False
               return False
+
+          # The expanded-cost budget for yaml_alias_expansion_exceeds. Aliases are
+          # resolved by REFERENCE when parsed but walked IN FULL by canon(), so a
+          # ~600-byte file of nested aliases (each level aliasing the one below ten
+          # times) costs 10^levels nodes there (measured 0.02 / 0.28 / 5.3 s at 4 /
+          # 5 / 6 levels), which runs this job into its timeout or out of memory.
+          # canon() and digest() also COPY every scalar they reach, so one large
+          # scalar aliased many times is the same attack in bytes (measured: 11k
+          # aliases of a 50 KB scalar, from a 51 KB file, cost 1.7 GB RSS and
+          # 9.4 s). So each node costs 1, plus 1 per 64 bytes of a scalar's text:
+          # the budget bounds nodes AND bytes walked (100,000 units is at most
+          # ~6.4 MB of expanded scalar text). The worst case is larger than that
+          # text: canon() keys on repr(), which escapes non-printable characters,
+          # and astral non-printables inflate ~11x (`\U000xxxxx` per character);
+          # measured near the budget at ~120 MB RSS and ~2.5 s, inside this job's
+          # limits. The largest gating workflow here, ci.yml with
+          # its one shared `test-steps` anchor, costs ~2,400 units (2026-11-26);
+          # 100,000 is ~40x that, and canon() walks it in well under a second.
+          ALIAS_EXPANSION_BUDGET = 100000
+          def yaml_alias_expansion_exceeds(text):
+              """Would walking this document with its aliases expanded exceed the budget?
+
+              Composes the node graph (linear: an alias is the SAME node object, not a
+              copy) and sums each node's expanded size once, memoised by identity, so
+              this costs the size of the file, not of its expansion. A scalar costs
+              1 + len(text) // 64, so a large aliased scalar is charged for the
+              bytes canon() would copy each time it is reached. A recursive alias
+              (a node that contains itself) has no finite expansion and counts as
+              exceeding. Unparseable is a separate verdict, reached below."""
+              try:
+                  root = yaml.compose(text, Loader=yaml.SafeLoader)
+              except Exception:
+                  return False
+              sizes, open_nodes = {}, set()
+              def size(node):
+                  key = id(node)
+                  if key in sizes:
+                      return sizes[key]
+                  if key in open_nodes:
+                      raise OverflowError("recursive alias")
+                  open_nodes.add(key)
+                  if isinstance(node, yaml.MappingNode):
+                      total = 1 + sum(size(k) + size(v) for k, v in node.value)
+                  elif isinstance(node, yaml.SequenceNode):
+                      total = 1 + sum(size(c) for c in node.value)
+                  else:
+                      total = 1 + len(node.value) // 64
+                  open_nodes.discard(key)
+                  sizes[key] = total
+                  return total
+              try:
+                  return root is not None and size(root) > ALIAS_EXPANSION_BUDGET
+              except (OverflowError, RecursionError):
+                  return True
 
           def surface(text):
               """(workflow_surface, {job_key: job_spec}) or None if unparseable.
@@ -557,8 +643,11 @@ jobs:
               clean = " ".join(str(path).split())
               if path in WHOLE_FILE_GATES:
                   return [(kind, clean, tok) for kind, tok in file_findings(path, base_text, head_text)]
-              if head_text is not None and uses_yaml_aliases(head_text):
-                  return [("!ALIAS", clean, "-")]
+              if head_text is not None and uses_yaml_merge_key(head_text):
+                  return [("!MERGE", clean, "-")]
+              # Before surface()/digest(), which would walk every alias in full.
+              if head_text is not None and yaml_alias_expansion_exceeds(head_text):
+                  return [("!ALIASBOMB", clean, "-")]
               b = surface(base_text)
               h = surface(head_text)
               if b is None or h is None:
@@ -599,15 +688,29 @@ jobs:
             exit 1
           fi
           
-          # Anchors/aliases/merge keys: our parser resolves them and Actions does not
-          # support them, so a rewritten-but-identical-looking file could be one this
-          # repo can no longer run. We do not adjudicate that -- we decline to certify.
-          if grep -q '^!ALIAS' <<< "${FINDINGS}"; then
-            echo "::error::A gating file uses YAML anchors, aliases or a merge key at head:"
-            grep '^!ALIAS' <<< "${FINDINGS}" | cut -f2 | sed 's/^/  - /'
-            echo "GitHub Actions does not support them, while this check RESOLVES them --"
-            echo "so an anchored rewrite can digest as unchanged while the gate stops"
-            echo "running. Write the file without anchors so it can be verified."
+          # Merge keys: our parser resolves them and Actions does not document
+          # support for them, so a rewritten-but-identical-looking file could be one
+          # this repo can no longer run. We do not adjudicate that -- we decline to
+          # certify.
+          if grep -q '^!MERGE' <<< "${FINDINGS}"; then
+            echo "::error::A gating file uses a YAML merge key (<<: or !!merge) at head:"
+            grep '^!MERGE' <<< "${FINDINGS}" | cut -f2 | sed 's/^/  - /'
+            echo "Merge keys are not documented as supported by GitHub Actions, and this"
+            echo "check RESOLVES them -- so a merge-key rewrite can digest as unchanged"
+            echo "while the gate stops running. Write the mapping out (anchors and"
+            echo "aliases are fine)."
+            exit 1
+          fi
+
+          # Alias expansion past the budget: digesting the file would walk every
+          # alias in full, which a small nested-alias file makes exponential.
+          if grep -q '^!ALIASBOMB' <<< "${FINDINGS}"; then
+            echo "::error::A gating file's YAML aliases expand past the guard's budget at head:"
+            grep '^!ALIASBOMB' <<< "${FINDINGS}" | cut -f2 | sed 's/^/  - /'
+            echo "Expanded, it exceeds the expansion budget (nodes plus scalar bytes,"
+            echo "ALIAS_EXPANSION_BUDGET) or aliases itself, so it cannot be digested in"
+            echo "bounded time. Use fewer nested aliases, or do not alias a large scalar"
+            echo "many times."
             exit 1
           fi
 
