@@ -41,7 +41,7 @@
 //! Consent: ONE gate, transcript sync's — the user's own toggle AND the
 //! tenant's `egress_transcript_sync` fleet-policy switch
 //! ([`crate::egress::transcript_sync_gate_session`]). Plan
-//! `2026-10-10-spec-front-end-phase-9-generic-boundary` Phase 7 retired coord's
+//! `2026-10-10-spec-front-end-phase-9-generic-boundary` Phase 6 retired coord's
 //! per-tenant `transcript_sync_enabled` column into that domain, so there is no
 //! second, tenant-policy licence to ask. The gate is read in the device default
 //! scope, inline, before any coord traffic ([`spawn_ensure_bound`]); then, once
@@ -52,7 +52,8 @@
 //! ([`crate::egress::SessionScope::Unresolved`]). `bind_and_replay` refuses on
 //! that verdict before it writes anything (no binding, no replay, no
 //! `config_dir` on a row), and the refusal is logged at INFO naming the scope
-//! and the verdict's source ([`BindGate`]). Attempts are throttled per session
+//! and the verdict's source ([`BindGate`]) when it is new for that session,
+//! at DEBUG while it stands ([`note_refusal`]). Attempts are throttled per session
 //! ([`AttemptLedger`]) so a coord outage costs one bounded probe per window,
 //! not one per append.
 
@@ -208,6 +209,46 @@ impl BindGate {
     }
 }
 
+/// The transcript-sync refusal last REPORTED for each session. A closed gate
+/// is read again every [`ATTEMPT_WINDOW`], so without this a standing refusal
+/// would log the same INFO line for as long as the switch stays off. A bind
+/// forgets the session, so a later refusal is reported afresh.
+static REFUSALS: Mutex<Option<HashMap<String, BindGate>>> = Mutex::new(None);
+
+/// Record `gate` as `key`'s standing refusal. `true` when it is NEW for `key`
+/// (its first refusal, or a different scope, gate half or source): the caller
+/// logs that at INFO, and a repeat at DEBUG.
+fn note_refusal(key: &str, gate: BindGate) -> bool {
+    REFUSALS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_or_insert_with(HashMap::new)
+        .insert(key.to_string(), gate)
+        != Some(gate)
+}
+
+/// `key` is bound: forget its standing refusal.
+fn forget_refusal(key: &str) {
+    if let Some(m) = REFUSALS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_mut()
+    {
+        m.remove(key);
+    }
+}
+
+/// The refusal standing for `key`, if any — a test's proof that the gate,
+/// and not some other refusal, is what kept a transcript unbound.
+#[cfg(test)]
+fn standing_refusal(key: &str) -> Option<BindGate> {
+    REFUSALS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .and_then(|m| m.get(key).copied())
+}
+
 /// Per-session attempt throttle.
 #[derive(Default)]
 pub struct AttemptLedger {
@@ -276,7 +317,11 @@ pub(crate) fn apply_decision(
     } else {
         AutoBindKind::Adopted
     };
-    match tailer.bind_and_replay(&identity.claude_session_id, path, req, gate.is_open()) {
+    let outcome = tailer.bind_and_replay(&identity.claude_session_id, path, req, gate.is_open());
+    if matches!(outcome, Ok(_) | Err(BindRefusal::Unreadable(_))) {
+        forget_refusal(&identity.claude_session_id);
+    }
+    match outcome {
         Ok(o) if o.already_bound => None,
         Ok(o) => {
             info!(
@@ -308,11 +353,19 @@ pub(crate) fn apply_decision(
             })
         }
         Err(BindRefusal::SyncDisabled) => {
-            info!(
-                "transcript_autobind: {} not bound: transcript sync is closed in scope {:?} \
-                 ({:?}; egress_transcript_sync source {:?}); nothing was written",
-                identity.claude_session_id, gate.scope, gate.gate, gate.source
-            );
+            if note_refusal(&identity.claude_session_id, gate) {
+                info!(
+                    "transcript_autobind: {} not bound: transcript sync is closed in scope {:?} \
+                     ({:?}; egress_transcript_sync source {:?}); nothing was written",
+                    identity.claude_session_id, gate.scope, gate.gate, gate.source
+                );
+            } else {
+                debug!(
+                    "transcript_autobind: {} still not bound: transcript sync still closed \
+                     in scope {:?} ({:?})",
+                    identity.claude_session_id, gate.scope, gate.gate
+                );
+            }
             Some(AutoBindKind::Deferred)
         }
         Err(e) => {
@@ -738,11 +791,13 @@ mod tests {
         for level in [Some(Level::Off), None] {
             let dir = tempfile::tempdir().unwrap();
             let (t, r, outbox) = tailer(dir.path());
-            let path = transcript(dir.path(), CSID, "{\"type\":\"user\"}\n");
+            let csid = Uuid::new_v4().to_string();
+            let path = transcript(dir.path(), &csid, "{\"type\":\"user\"}\n");
             let id = identity_from_path(&path).unwrap();
             let (pane_row, tenant) = (Uuid::new_v4(), Uuid::new_v4());
-            host_on_live_pane(
+            host_on_live_pane_for(
                 &r,
+                &csid,
                 Arc::new(Mutex::new(Some(pane_row))),
                 NewSessionTenant::Stated(tenant),
             );
@@ -764,7 +819,15 @@ mod tests {
                 ),
             )
             .await;
-            assert_eq!(r.session_id_for(CSID), None, "{level:?}: nothing was bound");
+            assert_eq!(
+                r.session_id_for(&csid),
+                None,
+                "{level:?}: nothing was bound"
+            );
+            let refusal = standing_refusal(&csid).expect("the transcript gate refused it");
+            assert_eq!(refusal.gate, crate::egress::TranscriptGate::TenantSwitchOff);
+            assert_eq!(refusal.scope, SessionScope::Tenant(tenant), "{level:?}");
+            assert_eq!(refusal.source, verdict.source, "{level:?}");
             let c = t.coverage();
             assert_eq!(c.autobind_adopted_live_pane, 0, "{level:?}");
             assert_eq!(
@@ -788,7 +851,8 @@ mod tests {
         use crate::egress::{Flow, Level};
         let dir = tempfile::tempdir().unwrap();
         let (t, registrar, outbox) = tailer(dir.path());
-        let path = transcript(dir.path(), CSID, "{\"type\":\"user\"}\n");
+        let csid = Uuid::new_v4().to_string();
+        let path = transcript(dir.path(), &csid, "{\"type\":\"user\"}\n");
         let id = identity_from_path(&path).unwrap();
         let (on, off) = (Uuid::new_v4(), Uuid::new_v4());
         let _on = pin_for(Flow::TranscriptSync, on, Level::On);
@@ -804,8 +868,105 @@ mod tests {
         )
         .await;
         assert_eq!(decision, Decision::Adopt(coords));
-        assert_eq!(registrar.session_id_for(CSID), None, "nothing was bound");
+        assert_eq!(registrar.session_id_for(&csid), None, "nothing was bound");
         assert!(outbox.pending().unwrap().is_empty(), "nothing was written");
+        let refusal = standing_refusal(&csid).expect("the transcript gate refused it");
+        assert_eq!(refusal.gate, crate::egress::TranscriptGate::TenantSwitchOff);
+        assert_eq!(refusal.scope, crate::egress::SessionScope::Unresolved);
+    }
+
+    /// A MINT is judged in the minting tenant's own scope by the one gate:
+    /// with that tenant's switch off, or unpinned (UNKNOWN), no row is
+    /// registered — no `Started`, so no `config_dir` leaves — and the refusal
+    /// is the gate's; with it on, the row is minted under that tenant.
+    #[tokio::test]
+    async fn a_mint_registers_no_row_unless_the_minting_tenants_switch_is_on() {
+        use crate::egress::test_support::pin_for;
+        use crate::egress::{Flow, Level, SessionScope, TranscriptGate};
+        let started = |outbox: &OutboxWriter| {
+            outbox
+                .pending()
+                .unwrap()
+                .into_iter()
+                .filter(|r| r.event_kind == SessionEventKind::Started.as_str())
+                .collect::<Vec<_>>()
+        };
+        for level in [Some(Level::Off), None, Some(Level::On)] {
+            let amb = crate::test_env::IsolatedAmbient::new();
+            let tenant = Uuid::new_v4();
+            amb.write_active_tenant_id(tenant);
+            let _pin = level.map(|l| pin_for(Flow::TranscriptSync, tenant, l));
+            let dir = tempfile::tempdir().unwrap();
+            let (t, registrar, outbox) = tailer(dir.path());
+            let csid = Uuid::new_v4().to_string();
+            let path = transcript(dir.path(), &csid, "{\"type\":\"user\"}\n");
+            let id = identity_from_path(&path).unwrap();
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            // `register_inner` is gated on an env var other suites toggle:
+            // retry the whole bind, as `apply_retrying` does.
+            let mut decision = None;
+            for _ in 0..100 {
+                decision = Some(
+                    bind_one_with(
+                        &t,
+                        id.clone(),
+                        &path,
+                        counting_resolver(calls.clone(), RowResolution::Unknown, || {}),
+                    )
+                    .await,
+                );
+                if level != Some(Level::On) || registrar.session_id_for(&csid).is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(decision, Some(Decision::Mint(tenant)), "{level:?}");
+            if level == Some(Level::On) {
+                assert!(registrar.session_id_for(&csid).is_some(), "minted");
+                let rows = started(outbox.as_ref());
+                assert_eq!(rows.len(), 1, "exactly one Started row");
+                assert_eq!(rows[0].payload["tenant_id"], tenant.to_string());
+                assert_eq!(standing_refusal(&csid), None, "nothing refused it");
+            } else {
+                assert_eq!(registrar.session_id_for(&csid), None, "{level:?}");
+                assert!(
+                    started(outbox.as_ref()).is_empty(),
+                    "{level:?}: no row, no config_dir"
+                );
+                assert!(
+                    outbox.pending().unwrap().is_empty(),
+                    "{level:?}: nothing written"
+                );
+                assert_eq!(t.coverage().autobind_deferred, 1, "{level:?}");
+                let refusal = standing_refusal(&csid).expect("the transcript gate refused it");
+                assert_eq!(refusal.gate, TranscriptGate::TenantSwitchOff, "{level:?}");
+                assert_eq!(refusal.scope, SessionScope::Tenant(tenant), "{level:?}");
+            }
+        }
+    }
+
+    /// A standing refusal is reported once: the same gate again is not new,
+    /// a different one is, and a bind forgets the session.
+    #[test]
+    fn a_standing_refusal_is_new_only_when_it_changes() {
+        use crate::egress::{LevelSource, SessionScope, TranscriptGate};
+        let key = Uuid::new_v4().to_string();
+        let off = BindGate {
+            gate: TranscriptGate::TenantSwitchOff,
+            scope: SessionScope::Unresolved,
+            source: LevelSource::Unknown,
+        };
+        assert!(note_refusal(&key, off), "first refusal");
+        assert!(!note_refusal(&key, off), "the same refusal, standing");
+        let other = BindGate {
+            scope: SessionScope::DeviceDefault,
+            ..off
+        };
+        assert!(note_refusal(&key, other), "a different scope is new");
+        forget_refusal(&key);
+        assert_eq!(standing_refusal(&key), None);
+        assert!(note_refusal(&key, other), "reported afresh after a bind");
+        forget_refusal(&key);
     }
 
     /// `mint_gate` answers WHO owns a minted row, never whether it may sync:
@@ -1121,9 +1282,20 @@ mod tests {
         row: Arc<Mutex<Option<Uuid>>>,
         tenant: NewSessionTenant,
     ) {
+        host_on_live_pane_for(r, CSID, row, tenant);
+    }
+
+    /// [`host_on_live_pane`] for the session `csid`.
+    fn host_on_live_pane_for(
+        r: &AiCoordRegistrar,
+        csid: &str,
+        row: Arc<Mutex<Option<Uuid>>>,
+        tenant: NewSessionTenant,
+    ) {
         let pin = row.clone();
+        let csid = csid.to_string();
         r.attach_terminal_coord_lookup(move |c| {
-            (c == CSID).then(|| *pin.lock().unwrap()).flatten()
+            (c == csid).then(|| *pin.lock().unwrap()).flatten()
         });
         r.attach_pane_row_tenant(move |q| {
             (*row.lock().unwrap() == Some(q)).then_some(
