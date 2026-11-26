@@ -461,12 +461,20 @@ Notes that matter, all of them measured:
 - **The transport is `ui-bridge-inject --exec-stdin`** — NDJSON, one
   `{"action":…,"payload":…}` per line. No relay, so neither relay auth nor LNA
   applies. Payload shape for element actions is `{id, request:{action, value?}}`
-  (`ui-bridge/packages/ui-bridge/src/react/commandHandlers.ts:1090`); sub-actions
-  include click, hoverClick, focus, blur, hover, scrollIntoView, scroll, toggle,
-  doubleClick, type, clear, setValue, select, check, uncheck, submit, reset,
-  sendKeys, drag, alongside top-level `clickByText`, `clickBySelector`,
-  `typeInto`, `readValue`, `sendKeysToPage`, `expectElement`, `find`, `discover`,
-  `getElementTree`. **Read `commandHandlers.ts` for the authoritative list —
+  (`ui-bridge/packages/ui-bridge/src/react/commandHandlers.ts`, the
+  `executeElementAction` handler); sub-actions include click, hoverClick, focus,
+  blur, hover, unhover, scrollIntoView, scroll, toggle, doubleClick, rightClick,
+  middleClick, type, clear, setValue, select, check, uncheck, submit, reset,
+  sendKeys, drag, autocomplete, alongside top-level `clickByText`,
+  `clickBySelector`, `typeInto`, `readValue`, `sendKeysToPage`,
+  `expectElement`, `find`, `discover`, `getElementTree`. Since
+  `@qontinui/ui-bridge` 0.38.0 `hover` forces the real CSS `:hover` state and
+  HOLDS it until `unhover`, the next `hover`/`hoverClick`, a dispatched
+  write-class action, or the TTL (`params.holdMs`, default 30000 ms, ceiling
+  300000), so a step after a `hover` runs against the hovered page only inside
+  that window — see "Reading a hover" in
+  `/ui-bridge`. **Read `commandHandlers.ts` (its `RELAY_ELEMENT_ACTIONS`) for
+  the authoritative list —
   and if the action you need is not there, that is a UI Bridge gap: fix it in the
   Bridge and report it. Never route around it with a Playwright locator.**
 - **An action that FAILS does not come back on the CLI's `error` key.** A Bridge
@@ -1513,18 +1521,21 @@ Run on each page, before moving on:
 #    base. This endpoint answers about the surface it is SENT to, so pointing
 #    it at $WEB_BASE while $BASE is the runner or mobile does NOT rescue the
 #    check: it returns a healthy-looking 200 describing qontinui.io, a
-#    confident verdict about a different application. That is worse than the
-#    404 in the table below, because nothing in the response marks it as
-#    off-target.
-#    Only web surfaces serve the route. RUN THE PREDICATE — it derives that
-#    from $BASE itself, so there is no second variable to keep in agreement.
-#    The primary runner, a temp runner, mobile and an unbound $BASE all land
-#    in the skip arm — PROVIDED the bases above were defined. BOTH patterns
-#    carry a non-empty default for exactly that reason: `case` patterns are
+#    confident verdict about a different application. That is worse than a
+#    404, because nothing in the response marks it as off-target.
+#    Web surfaces and the runner serve the route (table below). RUN THE
+#    PREDICATE — it derives that from $BASE itself, so there is no second
+#    variable to keep in agreement. Mobile and an unbound $BASE land in the
+#    skip arm — PROVIDED the bases above were defined. EVERY pattern
+#    carries a non-empty default for exactly that reason: `case` patterns are
 #    literals, so with $BASE and $WEB_BASE both unbound, empty would match
 #    empty and the probe would fire on the one setup this section warns about.
 #    A web base you reached some other way belongs in $WEB_BASE or
-#    $RELAY_BASE — set one of those, rather than editing this predicate.
+#    $RELAY_BASE, and a temp runner's in $RUNNER_BASE — set one of those,
+#    rather than editing this predicate. On the read-only own-runner arm
+#    $RUNNER_BASE is your PRIMARY runner (127.0.0.1:9876); the probe runs
+#    there too, and that is safe: the visibility sweep is a read (a hit-test
+#    over the page), so it changes no runner state.
 #    Exit code settles TWO of the three UNVERIFIED outcomes: a skip and a 404
 #    are both non-zero on purpose. It does NOT settle the third —
 #    `unknown_empty_registry` is an HTTP 200, so read the `verdict` field too.
@@ -1532,12 +1543,12 @@ Run on each page, before moving on:
 #    add "${CURL_AUTH[@]}" and ?tabId=$INJECT_TAB_ID, or a shared relay may
 #    answer about whichever other tab it picked.
 case "${BASE:-}" in
-  "${WEB_BASE:-__no_web__}"|"${RELAY_BASE:-__no_relay__}")
+  "${WEB_BASE:-__no_web__}"|"${RELAY_BASE:-__no_relay__}"|"${RUNNER_BASE:-__no_runner__}")
     # -f so an HTTP error is a non-zero exit, -S so it still says why under -s.
     curl -fsS -X POST "$BASE/control/visibility" \
       -H 'Content-Type: application/json' -d '{"minRatio":0.02}' ;;
   *)
-    echo "step 1 SKIPPED — \$BASE is not a web surface: occlusion UNVERIFIED, use step 2" >&2
+    echo "step 1 SKIPPED — \$BASE is not a surface that serves the route: occlusion UNVERIFIED, use step 2" >&2
     false ;;
 esac
 ```
@@ -1547,13 +1558,14 @@ esac
 | Surface | Served? |
 |---|---|
 | Web SDK / qontinui-web relay (`$WEB_BASE`, `:3001/api/ui-bridge`) | **yes** — `@qontinui/ui-bridge` handler + relay twin. The relay variant uses the hit-test half only, so its findings are a SUBSET of the in-page endpoint's |
-| Runner `:9876` (`$RUNNER_BASE`, Tauri WebView) | **no — 404.** The runner serves its own **Rust** route table (`qontinui-runner/src-tauri/src/mcp/ui_bridge/routing.rs`); the frontend's `@qontinui/ui-bridge` npm dependency does not put routes on that port |
+| Runner `:9876` (`$RUNNER_BASE`, Tauri WebView) | **yes** — served (`screenshots.rs` `route_entries`, since 2026-08-30): the runner's own **Rust** twin, `ui_bridge_visibility_handler` in `qontinui-runner/src-tauri/src/mcp/ui_bridge/screenshots.rs`, not the frontend's `@qontinui/ui-bridge` npm dependency. A runner build older than 2026-08-30 404s it |
 | Mobile / React Native (`$MOBILE_BASE`, `@qontinui/ui-bridge-native`) | **no — 404**, pinned by `packages/ui-bridge-native/src/server/__tests__/http-status-mapping.test.ts` |
 
-The two `404` rows describe what those bases return **if you send the probe
-there anyway**. They are not an instruction to send it, and the fix for them is
-not to retarget at `$WEB_BASE` — that swaps a loud 404 for a quiet answer about
-the wrong application. On the runner and on mobile, step 1 is **skipped**.
+The `404` row describes what mobile returns **if you send the probe there
+anyway**. It is not an instruction to send it, and the fix for it is not to
+retarget at `$WEB_BASE` — that swaps a loud 404 for a quiet answer about the
+wrong application. On mobile, step 1 is **skipped**; on the runner it runs
+against `$RUNNER_BASE`.
 
 - `verdict: "occlusions_found"` → each entry names the occluder, the occluded,
   and the fraction covered. An entry with `hidesText: true` is a **FAIL**, not a
@@ -1599,8 +1611,8 @@ it runs this same chain through the shipped qontinui-web adapter and cannot
 drift from CI. The projection below is for the surfaces it cannot reach:
 the runner's own Tauri WebView, where `/ui-bridge/control/discover` is the
 only door to the element tree. Steps 2 and 3 below DO work against
-`$RUNNER_BASE` — only step 1 is web-only, and on the runner and on mobile it is
-**skipped**, never retargeted.
+`$RUNNER_BASE` — step 1 does too (the runner serves the route), and on mobile it
+is **skipped**, never retargeted.
 
 `verify-page-verdict.sh` covers the **step 2** analyzer chain. It produces no
 `/control/visibility` verdict — the string appears nowhere in it — so on a web

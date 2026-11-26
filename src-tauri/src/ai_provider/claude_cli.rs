@@ -359,6 +359,7 @@ pub(crate) fn build_print_command(
     // is an infinite silent hang. One shared list, eight seams; see
     // `credential_helper::non_interactive_git_env`.
     crate::credential_helper::apply_non_interactive_git_env_std(&mut cmd);
+    crate::terminal::apply_python_utf8_default_std(&mut cmd);
     crate::terminal::scrub_credential_env_std(&mut cmd);
 
     Ok(cmd)
@@ -1005,6 +1006,7 @@ mod tests {
             &cmd,
             "build_scorer_command",
         );
+        crate::terminal::assert_python_utf8_default_std(&cmd, "build_scorer_command");
     }
 
     // =======================================================================

@@ -110,7 +110,7 @@ pub fn snapshot_history_path() -> PathBuf {
 }
 
 /// Closed records older than this are pruned (24h in millis).
-const CLOSED_RETENTION_MS: i64 = 86_400_000;
+pub(crate) const CLOSED_RETENTION_MS: i64 = 86_400_000;
 /// Open records not seen for this long are pruned (7d in millis).
 const OPEN_STALE_MS: i64 = 604_800_000;
 /// A record closed with reason `"pty-exit"` (its PTY died) is still restorable
@@ -239,6 +239,47 @@ fn normalize_origin(origin: Option<String>) -> Option<String> {
         _ => o,
     })
 }
+
+// ---------------------------------------------------------------------------
+// `close_reason` vocabulary — every value a runner writer records.
+//
+// The two FRONTEND reasons arrive through the `terminal_session_record_close`
+// Tauri command (`FrontendSessionCloseReason` in
+// `src/components/terminal/sessionRecordArgs.ts`); the rest are minted by the
+// backend alone. `crate::session::stop_reason` maps each of these to a stop
+// code, a next action and glossary terms, and renders any other string as
+// `unknown` with the raw value — so a writer that records a new reason must
+// add it here AND there, or it surfaces as `unknown`, never as a guess.
+// ---------------------------------------------------------------------------
+
+/// The operator closed the session's tab (frontend).
+pub const CLOSE_REASON_EXPLICIT: &str = "explicit";
+/// The session's process exited while its tab was live (frontend).
+pub const CLOSE_REASON_PTY_EXIT: &str = "pty-exit";
+/// The liveness poll found no agent in the terminal for the full debounce.
+pub const CLOSE_REASON_POLL_DEAD: &str = "poll-dead";
+/// A tile a restore brought back terminal-only idled out with no agent — see
+/// [`close_reason_for_dead_shell`].
+pub const CLOSE_REASON_TERMINAL_ONLY_IDLE: &str = "terminal-only-idle";
+/// A provisional record whose provider never started (a bare shell).
+pub const CLOSE_REASON_NEVER_STARTED: &str = "never-started";
+/// The record's terminal no longer exists (an orphan row).
+pub const CLOSE_REASON_NO_TERMINAL: &str = "no-terminal";
+/// An UNCONFIRMED record evicted when a new session bound its terminal.
+pub const CLOSE_REASON_SUPERSEDED: &str = "superseded";
+/// A CONFIRMED record retired because its terminal now hosts a newer
+/// confirmed session.
+pub const CLOSE_REASON_SUPERSEDED_TERMINAL_REUSE: &str = "superseded-terminal-reuse";
+/// The orchestration loop could not bind its worker and tore it down
+/// (`orchestration_loop::ai_session_executor::teardown_unbound_worker`).
+pub const CLOSE_REASON_WORKER_BIND_FAILED: &str =
+    "orchestration dispatch could not bind the worker";
+/// A death close (`poll-dead` / `pty-exit`) of a pane whose Claude CLI never
+/// launched, rewritten on positive evidence by
+/// `terminal::launch_failure::close_reason_for_launch` (plan
+/// `2026-11-10-migration-holds-for-missing-claude-cli`, D3). Restorable.
+/// `terminal::launch_failure::LAUNCH_FAILED` is this constant.
+pub const CLOSE_REASON_LAUNCH_FAILED: &str = "launch-failed";
 
 /// [`TerminalSessionRecord::wind_down_outcome`] — the graceful exit landed and
 /// the pane was closed.
@@ -458,16 +499,24 @@ fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|s| !s.trim().is_empty())
 }
 
-/// The `finished_at` a RESTAMP gets ([`SessionLifecycleStore::set_finished`]
-/// re-finishing an already-finished mark): `now`, unless that EQUALS the old
-/// stamp (two finishes inside one millisecond), in which case one past it.
+/// The `finished_at` a new mark gets when an earlier stamp of the same session
+/// exists — a RESTAMP ([`SessionLifecycleStore::set_finished`] re-finishing an
+/// already-finished mark) or a re-mark after an unmark. `prev` is the highest
+/// such stamp. The answer is `now`, unless `now` is at `prev` or less than one
+/// second behind it, in which case it is one past `prev`.
 ///
-/// The ACK matcher ([`SessionLifecycleStore::mark_finish_synced`]) needs the
-/// two stamps only to DIFFER, so a late ACK of the old row can never sync the
-/// new mark. Taking `now` otherwise — rather than `max(now, prev + 1)` — keeps
-/// a clock stepped backwards from dating the new finish in the future. Pure.
+/// The ACK matcher ([`SessionLifecycleStore::mark_finish_synced`]) compares
+/// stamps for equality, so a late ACK of an old mark must never match the
+/// new one. That needs every new stamp to clear EVERY earlier one, not only
+/// differ from the last: a rule that only avoided equality with `prev` let a
+/// burst inside one millisecond cycle t, t+1, t, so a late ACK of the first
+/// mark synced the third. The one-second bound keeps a clock stepped well
+/// backwards from dating the new finish in the future. The accepted cost: a
+/// stamp may run up to ~1 s ahead of the wall clock, which can put a pane bound
+/// inside that window on the wrong side of a `finished_at` comparison such as
+/// the re-offer's revival guard. Pure.
 fn restamp_at(prev: i64, now: i64) -> i64 {
-    if now == prev {
+    if now <= prev && prev - now < 1_000 {
         prev.saturating_add(1)
     } else {
         now
@@ -837,8 +886,10 @@ pub struct TerminalSessionRecord {
     /// different statement from "it tried and failed" and must not be collapsed
     /// into it.
     ///
-    /// Sticky, like every field around it. `#[serde(default)]`: every record
-    /// already on disk predates the field.
+    /// Sticky for the life of one run; cleared (with
+    /// [`Self::wind_down_at`]) when a CLOSED record re-opens, because a resumed
+    /// session is a new run. `#[serde(default)]`: every record already on disk
+    /// predates the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wind_down_outcome: Option<String>,
     /// Unix millis when [`Self::wind_down_outcome`] was recorded.
@@ -1319,6 +1370,14 @@ pub struct SessionLifecycleStore {
     /// this same lock, so a late delivery cannot land its `Finished` after a
     /// concurrent unmark's `working` either.
     finish_forward: Mutex<()>,
+    /// The highest `finished_at` an UNMARK cleared, per Claude session, so the
+    /// next mark of that session is stamped past it ([`restamp_at`]). Without
+    /// it an unmark and a re-mark inside one millisecond give the new mark the OLD stamp, and a late ACK of the old
+    /// mark (the ACK matcher compares `finished_at`) would sync the new one.
+    /// Consumed by the next mark. Process-local by design: it only needs to
+    /// outlive a sub-millisecond window. Taken only while the `map` lock is
+    /// held (lock order `map` then this).
+    unmarked_stamps: Mutex<HashMap<String, i64>>,
 }
 
 /// What [`SessionLifecycleStore::redirect_finish`] did.
@@ -1422,6 +1481,11 @@ pub enum SetFinishedError {
     /// [`Self::UnknownSession`]: the finish route answers `500`.
     Unavailable,
 }
+
+/// The registry could not be read (its lock is poisoned) — returned by the
+/// `_checked` readers so "unreadable" is never collapsed into "no record".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegistryUnavailable;
 
 /// The result of a [`SessionLifecycleStore::set_finished`] call on a KNOWN
 /// session: the record as it now stands, what changed, and whether coord was
@@ -1538,6 +1602,7 @@ impl SessionLifecycleStore {
             finish_observer: OnceLock::new(),
             boot_ms: AtomicI64::new(default_boot_ms()),
             finish_forward: Mutex::new(()),
+            unmarked_stamps: Mutex::new(HashMap::new()),
         };
         if replay.applied > 0 || replay.damaged {
             info!(
@@ -1986,6 +2051,16 @@ impl SessionLifecycleStore {
             if entry.spawn_device_default.is_none() {
                 entry.spawn_device_default = rec.spawn_device_default.or(inherited_spawn_default);
             }
+            // A CLOSED record re-opening (a resume under the same id) starts a
+            // new run: the previous run's wind-down outcome is not this run's,
+            // and leaving it would let a later close read as "wound down".
+            // An already-open record keeps it (`exit_stuck` / `not_attempted`
+            // are recorded on open records).
+            if entry.state == "closed" {
+                entry.wind_down_outcome = None;
+                entry.wind_down_at = None;
+                entry.wind_down_arm = None;
+            }
             entry.state = "open".to_string();
             entry.closed_at = None;
             entry.close_reason = None;
@@ -2051,7 +2126,7 @@ impl SessionLifecycleStore {
                     if other.confirmed_at.is_none() {
                         other.state = "closed".to_string();
                         other.closed_at = Some(now);
-                        other.close_reason = Some("superseded".to_string());
+                        other.close_reason = Some(CLOSE_REASON_SUPERSEDED.to_string());
                         // A closed record's restore can never be retried — see
                         // `reap_restore_marker_on_close`.
                         reap_restore_marker_on_close(other);
@@ -2065,7 +2140,8 @@ impl SessionLifecycleStore {
                     } else if new_is_confirmed {
                         other.state = "closed".to_string();
                         other.closed_at = Some(now);
-                        other.close_reason = Some("superseded-terminal-reuse".to_string());
+                        other.close_reason =
+                            Some(CLOSE_REASON_SUPERSEDED_TERMINAL_REUSE.to_string());
                         // A closed record's restore can never be retried — see
                         // `reap_restore_marker_on_close`.
                         reap_restore_marker_on_close(other);
@@ -3311,10 +3387,20 @@ impl SessionLifecycleStore {
         }
 
         if finished {
-            rec.finished_at = Some(match rec.finished_at {
-                None => now,
+            // The stamp a preceding unmark cleared, if any: a re-mark after an
+            // unmark must differ from it just as a restamp must.
+            let unmarked = self
+                .unmarked_stamps
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(claude_session_id);
+            rec.finished_at = Some(match (rec.finished_at, unmarked) {
+                (None, None) => now,
                 // A RESTAMP (a re-finish that carried a reason).
-                Some(prev) => restamp_at(prev, now),
+                (Some(prev), hwm) => restamp_at(hwm.map_or(prev, |h| h.max(prev)), now),
+                // A re-mark after an unmark: past every stamp an unmark of
+                // this session has cleared in this window.
+                (None, Some(hwm)) => restamp_at(hwm, now),
             });
             // A fresh or restamped mark is unsynced by definition — the outbox
             // owes coord a write, and the boot reconcile must not revert it
@@ -3327,6 +3413,16 @@ impl SessionLifecycleStore {
             // for ([`awaiting_account_hold`] also refuses a finished row).
             rec.awaiting_account_since = None;
         } else {
+            if let Some(prev) = rec.finished_at {
+                // Keep the HIGHEST cleared stamp, so two unmark/re-mark cycles
+                // in one millisecond (t, t+1, ...) never come back to t.
+                let mut stamps = self
+                    .unmarked_stamps
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let hwm = stamps.entry(claude_session_id.to_string()).or_insert(prev);
+                *hwm = (*hwm).max(prev);
+            }
             rec.finished_at = None;
             rec.finish_reason = None;
             rec.finish_synced = false;
@@ -4412,6 +4508,24 @@ impl SessionLifecycleStore {
         }
     }
 
+    /// [`Self::get`] for a caller that must tell "no record" from "the store
+    /// could not be read": `Err` when the lock is poisoned, where `get` answers
+    /// `None`. An authorization decision reads this one (`POST
+    /// /sessions/transcript-bind`'s hosting check), so an unreadable store
+    /// refuses instead of reading as "no terminal hosts this session".
+    pub fn try_get(
+        &self,
+        claude_session_id: &str,
+    ) -> Result<Option<TerminalSessionRecord>, &'static str> {
+        match self.map.lock() {
+            Ok(m) => Ok(m.get(claude_session_id).cloned()),
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on try_get");
+                Err("lifecycle_store_unreadable")
+            }
+        }
+    }
+
     /// Clone of every record whose `state == "open"`.
     pub fn open_records(&self) -> Vec<TerminalSessionRecord> {
         match self.map.lock() {
@@ -4436,6 +4550,32 @@ impl SessionLifecycleStore {
                 Vec::new()
             }
         }
+    }
+
+    /// [`Self::all_records`] for a reader that must not answer "not found"
+    /// from an unreadable registry: a poisoned lock is
+    /// `Err(RegistryUnavailable)`, never an empty `Vec`. `GET
+    /// /sessions/{id}/stop-reason` reads through this so a poisoned lock is a
+    /// 503, not a 404 for a session that may well exist.
+    pub fn all_records_checked(&self) -> Result<Vec<TerminalSessionRecord>, RegistryUnavailable> {
+        match self.map.lock() {
+            Ok(m) => Ok(m.values().cloned().collect()),
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on all_records_checked");
+                Err(RegistryUnavailable)
+            }
+        }
+    }
+
+    /// Poison the registry lock, for tests of a reader's unreadable-registry
+    /// arm.
+    #[cfg(test)]
+    pub(crate) fn poison_for_test(&self) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = self.map.lock();
+            panic!("poisoning the session lifecycle registry for a test");
+        }));
+        assert!(self.map.is_poisoned());
     }
 
     /// Run `f` over [`Self::unsynced_finished_records`] with `finish_forward`
@@ -4867,7 +5007,7 @@ impl SessionLifecycleStore {
                     if let Some(rec) = m.get_mut(id.as_str()) {
                         rec.state = "closed".to_string();
                         rec.closed_at = Some(now);
-                        rec.close_reason = Some("superseded-terminal-reuse".to_string());
+                        rec.close_reason = Some(CLOSE_REASON_SUPERSEDED_TERMINAL_REUSE.to_string());
                         // A closed record's restore can never be retried — see
                         // `reap_restore_marker_on_close`.
                         reap_restore_marker_on_close(rec);
@@ -5132,7 +5272,8 @@ pub struct HeldClose {
 
 /// The close reason the frontend sends when the USER closes a tab
 /// (`FrontendSessionCloseReason` in `sessionRecordArgs.ts`).
-pub const USER_CLOSE_REASON: &str = "explicit";
+/// The same string as [`CLOSE_REASON_EXPLICIT`], by construction.
+pub const USER_CLOSE_REASON: &str = CLOSE_REASON_EXPLICIT;
 
 impl HeldClose {
     /// The user closed the pane — not a child exit, not a poll.
@@ -6630,9 +6771,9 @@ pub fn poll_holds_unmatched_row(
 /// rewrites `"terminal-only-idle"`.
 pub fn close_reason_for_dead_shell(restore_tier: Option<&str>) -> &'static str {
     if restore_tier == Some(RESTORE_TIER_TERMINAL_ONLY) {
-        "terminal-only-idle"
+        CLOSE_REASON_TERMINAL_ONLY_IDLE
     } else {
-        "poll-dead"
+        CLOSE_REASON_POLL_DEAD
     }
 }
 
@@ -6945,6 +7086,42 @@ mod tests {
         let mut m: HashMap<String, TerminalSessionRecord> = serde_json::from_slice(&raw).unwrap();
         edit(&mut m);
         std::fs::write(path, serde_json::to_vec_pretty(&m).unwrap()).unwrap();
+    }
+
+    /// `try_get` keeps apart what `get` collapses: a record, no record, and a
+    /// store that cannot be read (a poisoned lock). The third is never
+    /// `Ok(None)`, so the transcript-bind door refuses on it rather than
+    /// reading the session as unhosted.
+    #[test]
+    fn try_get_tells_an_unreadable_store_from_a_missing_record() {
+        let dir = tempdir().unwrap();
+        let store = std::sync::Arc::new(
+            SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap(),
+        );
+        store.record_open(rec("present"));
+        assert_eq!(
+            store
+                .try_get("present")
+                .unwrap()
+                .map(|r| r.claude_session_id),
+            Some("present".to_string())
+        );
+        assert!(store.try_get("absent").unwrap().is_none());
+
+        let poisoner = store.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = poisoner.map.lock().unwrap();
+            panic!("poison the lifecycle map (test)");
+        })
+        .join();
+        assert_eq!(
+            store.try_get("present").unwrap_err(),
+            "lifecycle_store_unreadable"
+        );
+        assert!(
+            store.get("present").is_none(),
+            "get still collapses an unreadable store to None"
+        );
     }
 
     // ── Write-ahead log (Phase 6, B1) ───────────────────────────────────────
@@ -9054,6 +9231,35 @@ mod tests {
         assert_eq!(fired.load(Ordering::SeqCst), 2);
     }
 
+    /// A resume under the same id starts a new run: the previous run's
+    /// wind-down outcome is cleared when the CLOSED record re-opens, and kept
+    /// when an already-open record is re-recorded.
+    #[test]
+    fn reopening_a_closed_record_clears_its_wind_down_outcome() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        store.record_open(rec("sess-1"));
+        store.set_wind_down_outcome("sess-1", WIND_DOWN_EXIT_STUCK, WIND_DOWN_ARM_DRAIN, 1_000);
+        store.record_open(rec("sess-1"));
+        assert_eq!(
+            store.get("sess-1").unwrap().wind_down_outcome.as_deref(),
+            Some(WIND_DOWN_EXIT_STUCK)
+        );
+        store.set_wind_down_outcome(
+            "sess-1",
+            WIND_DOWN_CLOSED,
+            WIND_DOWN_ARM_FINISHED_CLOSE,
+            2_000,
+        );
+        store.record_close("sess-1", CLOSE_REASON_EXPLICIT);
+        store.record_open(rec("sess-1"));
+        let r = store.get("sess-1").unwrap();
+        assert_eq!(r.wind_down_outcome, None);
+        assert_eq!(r.wind_down_at, None);
+        assert_eq!(r.wind_down_arm, None);
+    }
+
     #[test]
     fn restorable_records_includes_open_and_in_grace_pty_exit_only() {
         let dir = tempdir().unwrap();
@@ -9298,6 +9504,48 @@ mod tests {
         );
     }
 
+    /// An unmark then a re-mark is stamped through `restamp_at` like a direct
+    /// re-finish, so the new mark never carries the stamp the unmark cleared.
+    #[test]
+    fn a_re_mark_after_an_unmark_never_reuses_the_cleared_stamp() {
+        // Back-to-back mark/unmark/re-mark lands inside one millisecond on most
+        // iterations, which is exactly the window where the re-mark used to
+        // take the cleared stamp again (CI, qontinui-runner#3139 run
+        // 44964663935). Many iterations make that window near-certain.
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        store.record_open(rec("s"));
+        // Every stamp, not only the previous one: two cycles in one
+        // millisecond must not come back to an earlier mark's stamp.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let at = store
+                .set_finished("s", true, None)
+                .unwrap()
+                .record
+                .finished_at
+                .unwrap();
+            assert!(seen.insert(at), "a re-mark reused an earlier stamp {at}");
+            store.set_finished("s", false, None).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_new_stamp_clears_every_earlier_one_and_never_runs_far_ahead() {
+        assert_eq!(restamp_at(1_000, 1_000), 1_001, "equal-now moves past it");
+        assert_eq!(restamp_at(1_001, 1_000), 1_002, "behind the high-water too");
+        assert_eq!(
+            restamp_at(1_000, 5_000),
+            5_000,
+            "a later clock is taken as-is"
+        );
+        assert_eq!(
+            restamp_at(10_000, 400),
+            400,
+            "a clock stepped far back is not dated into the future"
+        );
+    }
+
     /// Review round 2, L-a: every observer hand-off — a fresh mark, the
     /// no-op retry's snapshot, an unmark — runs with `finish_forward` held,
     /// so a concurrent unmark cannot enqueue between a snapshot and its
@@ -9359,12 +9607,12 @@ mod tests {
         );
     }
 
-    /// A restamp only has to DIFFER from the old stamp (that is all the ACK
-    /// matcher needs): two finishes inside one millisecond still differ, and a
-    /// clock stepped backwards dates the new finish at `now` rather than
-    /// pushing it past the old one into the future.
+    /// A restamp always clears the old stamp: two finishes inside one
+    /// millisecond, or a clock less than a second behind, give one past it;
+    /// a clock stepped back a second or more dates the new finish at `now`
+    /// rather than pushing it far into the future.
     #[test]
-    fn a_restamp_always_differs_and_never_runs_ahead_of_the_clock() {
+    fn a_restamp_always_differs_and_never_runs_far_ahead_of_the_clock() {
         assert_eq!(restamp_at(1_000, 1_000), 1_001, "equal-now still differs");
         assert_eq!(
             restamp_at(1_000, 5_000),
@@ -9373,8 +9621,13 @@ mod tests {
         );
         assert_eq!(
             restamp_at(1_000, 400),
+            1_001,
+            "a clock less than a second behind still clears the old stamp"
+        );
+        assert_eq!(
+            restamp_at(5_000, 400),
             400,
-            "a clock stepped back is not pushed into the future"
+            "a clock stepped far back is not pushed into the future"
         );
         for (prev, now) in [(1_000, 1_000), (1_000, 5_000), (1_000, 400)] {
             assert_ne!(restamp_at(prev, now), prev);

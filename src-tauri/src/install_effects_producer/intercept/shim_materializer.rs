@@ -2448,7 +2448,7 @@ const REAL_DIR_NAME: &str = "the-real-qontinui-identity-qontinui-shim-tool";
 mod resolve_wait_tests {
     use super::*;
     use crate::install_effects_producer::intercept::shim_test_support::{
-        bash, identity_cmd, write_exe, EXE_LOCK,
+        bash, exe_guard, identity_cmd, install_settled_stat, write_exe,
     };
     use std::process::Command;
     use std::time::{Duration, Instant};
@@ -2473,12 +2473,13 @@ mod resolve_wait_tests {
         if system_claude_present() {
             return;
         }
-        let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = exe_guard();
         let tmp = tempfile::tempdir().unwrap();
         let (shim_dir, real_dir) = (tmp.path().join("shim"), tmp.path().join("real"));
         std::fs::create_dir_all(&shim_dir).unwrap();
         std::fs::create_dir_all(&real_dir).unwrap();
         let marker = tmp.path().join("ran");
+        install_settled_stat(&real_dir);
         let cmd = identity_cmd(&shim_dir, &real_dir, "10");
 
         // The tool reappears ~1.5 s into the shim's wait, as after a reify.
@@ -2524,13 +2525,14 @@ mod resolve_wait_tests {
             eprintln!("SKIP: no /bin/sleep or /usr/bin/sleep for the fake sleep to exec");
             return;
         };
-        let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = exe_guard();
         let tmp = tempfile::tempdir().unwrap();
         let (shim_dir, real_dir) = (tmp.path().join("shim"), tmp.path().join("real"));
         std::fs::create_dir_all(&shim_dir).unwrap();
         std::fs::create_dir_all(&real_dir).unwrap();
         let marker = tmp.path().join("ran");
         let real = real_dir.join("claude");
+        install_settled_stat(&real_dir);
         write_exe(&real, NPM_STUB);
         // "postinstall": the real binary, staged beside the stub and renamed
         // over it on the wait loop's first `sleep`.
@@ -2567,7 +2569,7 @@ mod resolve_wait_tests {
         if system_claude_present() {
             return;
         }
-        let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = exe_guard();
         let tmp = tempfile::tempdir().unwrap();
         let (shim_dir, real_dir) = (tmp.path().join("shim"), tmp.path().join("real"));
         std::fs::create_dir_all(&shim_dir).unwrap();
@@ -2597,7 +2599,7 @@ mod resolve_wait_tests {
         if system_claude_present() {
             return;
         }
-        let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = exe_guard();
         let tmp = tempfile::tempdir().unwrap();
         let (shim_dir, real_dir) = (tmp.path().join("shim"), tmp.path().join("real"));
         std::fs::create_dir_all(&shim_dir).unwrap();
@@ -2630,12 +2632,13 @@ mod resolve_wait_tests {
     /// The argv the real tool receives when the shim is launched with `args`
     /// and the pin set, and with the settings and mcp-config env when `hook_env`.
     fn identity_argv_seen_by_real_tool(args: &[&str], hook_env: bool) -> Vec<String> {
-        let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = exe_guard();
         let tmp = tempfile::tempdir().unwrap();
         let (shim_dir, real_dir) = (tmp.path().join("shim"), tmp.path().join("real"));
         std::fs::create_dir_all(&shim_dir).unwrap();
         std::fs::create_dir_all(&real_dir).unwrap();
         let seen = tmp.path().join("argv");
+        install_settled_stat(&real_dir);
         write_exe(
             &real_dir.join("claude"),
             &format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n", seen.display()),
@@ -2740,17 +2743,21 @@ mod resolve_wait_tests {
         );
     }
 
+    /// A SETTLED hit never waits and adds nothing to stderr (TRANSPARENT). The
+    /// fake `stat` reports the freshly written fake `claude` as long settled;
+    /// `identity_shim_settle_tests` covers the changing arms.
     #[test]
     fn identity_shim_resolved_tool_never_waits_or_writes_stderr() {
         if system_claude_present() {
             return;
         }
-        let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = exe_guard();
         let tmp = tempfile::tempdir().unwrap();
         let (shim_dir, real_dir) = (tmp.path().join("shim"), tmp.path().join("real"));
         std::fs::create_dir_all(&shim_dir).unwrap();
         std::fs::create_dir_all(&real_dir).unwrap();
         let marker = tmp.path().join("ran");
+        install_settled_stat(&real_dir);
         write_exe(&real_dir.join("claude"), &fake_claude_body(&marker));
         let out = crate::process_helpers::output_with_timeout(
             identity_cmd(&shim_dir, &real_dir, "10"),
@@ -2761,7 +2768,7 @@ mod resolve_wait_tests {
         assert!(marker.exists());
         assert!(
             out.stderr.is_empty(),
-            "TRANSPARENT: a hit adds no output: {}",
+            "TRANSPARENT: a settled hit adds no output: {}",
             String::from_utf8_lossy(&out.stderr)
         );
     }
@@ -2773,7 +2780,7 @@ mod resolve_wait_tests {
         if system_claude_present() {
             return;
         }
-        let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = exe_guard();
         let tmp = tempfile::tempdir().unwrap();
         let (shim_dir, real_dir) = (tmp.path().join("shim"), tmp.path().join("real"));
         std::fs::create_dir_all(&shim_dir).unwrap();
@@ -2799,7 +2806,7 @@ mod resolve_wait_tests {
     /// fall-through, with the diagnostic, and propagates `not found` (127).
     #[test]
     fn install_shim_unresolved_tool_reports_and_exits_127() {
-        let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = exe_guard();
         let tmp = tempfile::tempdir().unwrap();
         let (shim_dir, empty_dir) = (tmp.path().join("shim"), tmp.path().join("empty"));
         std::fs::create_dir_all(&shim_dir).unwrap();
@@ -2865,7 +2872,7 @@ mod resolve_wait_tests {
         tool: &str,
         render_into: impl Fn(&Path) -> String,
     ) {
-        let _serial = EXE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = exe_guard();
         let tmp = tempfile::tempdir().unwrap();
         let dir_a = tmp.path().join(format!("{family_prefix}a"));
         let dir_b = tmp.path().join(format!("{family_prefix}b"));

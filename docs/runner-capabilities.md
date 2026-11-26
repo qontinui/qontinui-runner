@@ -2,7 +2,7 @@
 
 Several of the runner's assets are resolved through **rung-ordered resolvers that try a developer checkout before falling back**. On the author's machine the checkout rung answers; on an external operator's machine it does not, and the fallback either silently differs or is absent. This document is the roster of those capabilities; the running binary reports which rung actually answered for each, and comparing a development build's report with a published build's report is the parity check.
 
-<!-- GENERATED — do not edit by hand. Regenerate FROM BASH (Git Bash on Windows), from `src-tauri/`: `cargo run --quiet --bin qontinui-runner -- --capability-manifest-doc > ../docs/runner-capabilities.md`; against an installed binary the same flag works directly — `qontinui-runner --capability-manifest-doc > docs/runner-capabilities.md`. NOT from PowerShell, whose `>` writes UTF-16 or a BOM that `include_str!` cannot read at all. The source of truth is `CAPABILITY_SPECS` in `src-tauri/src/capability_manifest.rs`, and `.github/workflows/capability-manifest-fresh.yml` fails any PR whose checked-in copy differs from a fresh render. -->
+<!-- GENERATED — do not edit by hand. Regenerate FROM BASH (Git Bash on Windows), from `src-tauri/`: `cargo run --quiet --bin qontinui-runner -- --capability-manifest-doc > ../docs/runner-capabilities.md`; against an installed binary the same flag works directly — `qontinui-runner --capability-manifest-doc > docs/runner-capabilities.md`. NOT from PowerShell, whose `>` writes UTF-16 or a BOM that `include_str!` cannot read at all. The source of truth is `CAPABILITY_SPECS` in `src-tauri/src/capability_manifest.rs`, and the runner test `the_checked_in_capability_doc_matches_a_fresh_render` (in `src-tauri/src/main.rs`) fails any change whose checked-in copy differs from a fresh render. -->
 
 Manifest schema version: `1`.
 
@@ -101,7 +101,7 @@ The account-versioned override registry for the agent SKILLS: fetch `GET {base}/
 Import of `<workspace-root>/qontinui-claude-config/.claude/commands/*.md` as runner workflows. Purely a sibling-checkout scan with no embedded or bundled fallback of any kind, so on any device without that repo it returns `Err` and the workflows simply do not exist. The clearest instance of the class in the roster: it is not that this degrades on a published install, it is that it cannot run at all there.
 
 - Class: `session_provisioning`
-- Resolved by: `slash_commands::{find_commands_directory_reported, sync_slash_commands}`
+- Resolved by: `slash_commands::{find_commands_directory_reported, commands_directory_in, COMMANDS_SIBLING, sync_slash_commands}`
 - Expected rungs: operator_checkout, unresolved
 
 ### 11. `session_cli`
