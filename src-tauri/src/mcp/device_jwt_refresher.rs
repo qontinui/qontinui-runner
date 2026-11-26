@@ -3042,7 +3042,8 @@ pub(crate) struct GapAskRecord {
     pub first_seen: i64,
     /// True once the Phase 7 seed attempt for this tenant in this lapse has
     /// been RECORDED — written BEFORE the network call, so a crash mid-call
-    /// or a refusal can never produce a second attempt in the same lapse.
+    /// or a terminal refusal can never produce a second attempt in the same
+    /// lapse. A transient outcome re-arms it through `seed_retry_after`.
     #[serde(default)]
     pub seed_attempted: bool,
     /// What the seed attempt came to, in operator words; empty until the
