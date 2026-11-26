@@ -180,6 +180,16 @@ fn monotonic_now_ms() -> i64 {
     (MONOTONIC_EPOCH.elapsed().as_millis() as i64).saturating_add(1)
 }
 
+/// Elapsed since the process clock's epoch — the time base every boot-stage
+/// offset and the bind latency are measured on.
+///
+/// `MONOTONIC_EPOCH` is lazy; `main()` anchors it near its first line (through
+/// `boot_stage::stamp(ProcessStart)`), so in production this is "since process
+/// start" to within the few instructions before that stamp.
+pub(crate) fn process_elapsed() -> Duration {
+    MONOTONIC_EPOCH.elapsed()
+}
+
 /// How often the watchdog thread wakes to write its heartbeat.
 const WATCHDOG_TICK_SECS: u64 = 15;
 
@@ -1557,8 +1567,6 @@ fn start_wedge_watchdog() {
 /// Health metrics snapshot
 #[derive(Debug, Clone)]
 pub struct HealthMetrics {
-    /// Timestamp of the check
-    pub timestamp: chrono::DateTime<chrono::Utc>,
     /// Resident memory in bytes — `WorkingSetSize` on Windows, `statm`
     /// field 2 × page size on Linux (0 where `/proc` is absent, e.g. macOS).
     /// Both measuring arms report the same quantity.
@@ -1573,8 +1581,6 @@ pub struct HealthMetrics {
     pub agent_log_emitter_agents: usize,
     /// Process uptime in seconds
     pub uptime_secs: u64,
-    /// CPU usage percentage (0-100)
-    pub cpu_percent: Option<f32>,
 }
 
 impl HealthMetrics {
@@ -2022,12 +2028,10 @@ pub fn collect_metrics() -> HealthMetrics {
         .unwrap_or(0);
 
     HealthMetrics {
-        timestamp: chrono::Utc::now(),
         memory_bytes: get_memory_usage(),
         thread_count: get_thread_count(),
         agent_log_emitter_agents: crate::claude_session::coord_register::agent_log_emitter_agents(),
         uptime_secs: uptime,
-        cpu_percent: None, // CPU tracking requires more complex implementation
     }
 }
 
@@ -2280,12 +2284,10 @@ mod tests {
     fn the_memory_warning_reads_bytes_through_memory_mb() {
         const GIB: u64 = 1024 * 1024 * 1024;
         let at = |memory_bytes| HealthMetrics {
-            timestamp: chrono::Utc::now(),
             memory_bytes,
             thread_count: 0,
             agent_log_emitter_agents: 0,
             uptime_secs: 0,
-            cpu_percent: None,
         };
         assert!(!memory_exceeds_warning(
             at(8 * GIB + 1024 * 1024 - 1).memory_mb()

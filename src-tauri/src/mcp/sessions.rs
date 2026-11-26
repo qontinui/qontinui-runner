@@ -38,7 +38,7 @@ use tracing::{info, warn};
 
 use crate::database::CreateTaskRunInput;
 use crate::mcp::shared::AiSessionContext;
-use crate::mcp::types::ApiState;
+use crate::mcp::types::{ApiResponse, ApiState};
 use crate::terminal::transcript;
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
@@ -1392,6 +1392,168 @@ pub(crate) async fn transcript_bind_core(
 }
 
 // =============================================================================
+// /sessions/{id}/stop-reason
+// =============================================================================
+
+/// How long the lifecycle registry keeps a CLOSED record — stated in the 404
+/// so "unknown session" is not read as "never existed". Derived from the
+/// store's own retention so the two cannot drift.
+const CLOSED_RETENTION_HOURS: i64 =
+    crate::session::session_lifecycle_store::CLOSED_RETENTION_MS / 3_600_000;
+
+/// `GET /sessions/{id}/stop-reason` — why this session stopped, or that it
+/// has not: `{code, glossary_terms, next_action, observed_at, source, …}`,
+/// derived by [`crate::session::stop_reason::stop_reason`] from the session's
+/// lifecycle record alone (plan
+/// `2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists`
+/// C5).
+///
+/// `{id}` is the provider session id, or — for a caller that only knows the
+/// terminal it drove — a terminal id (see [`latest_record_for_terminal`]).
+///
+/// `404` for an id the registry does not hold — never a default reason. The
+/// registry keeps closed records for [`CLOSED_RETENTION_HOURS`] hours; older
+/// sessions are listed by `GET /sessions/history`, which carries no work axis and so cannot back an
+/// honest next action here. `503` when the registry is unreadable (a
+/// poisoned lock): whether the session exists is then itself unknown.
+///
+/// Read-only; no coord round-trip, so it answers on an offline, unpaired box.
+async fn get_stop_reason(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Result<Json<crate::session::stop_reason::StopReason>, (StatusCode, Json<ApiResponse<()>>)> {
+    let store = state
+        .app_handle
+        .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>();
+    stop_reason_response(
+        store.as_ref().map(|s| s.inner().as_ref()),
+        &id,
+        crate::session::stop_reason::probe_resume,
+    )
+}
+
+/// A stop-reason error body with its typed refusal: the runner `code`
+/// beside the shared [`Refusal`](qontinui_types::refusal::Refusal) built for
+/// it, so the route answers no free-text error.
+fn stop_reason_refusal(
+    status: StatusCode,
+    code: &str,
+    message: impl Into<String>,
+) -> Json<ApiResponse<()>> {
+    let message = message.into();
+    let refusal = crate::mcp::refusal_envelope::refusal_for_envelope(
+        code,
+        status,
+        Some(&message),
+        None,
+        None,
+    );
+    Json(ApiResponse::error_with_refusal(message, code, refusal))
+}
+
+/// The whole of [`get_stop_reason`] after state extraction: `None` (the
+/// lifecycle store is not managed — a runner still booting) is a 503, else
+/// [`stop_reason_for`]. Split out so the route can be driven over HTTP in a
+/// test, which cannot build the `AppHandle` an `ApiState` carries.
+#[allow(clippy::result_large_err)]
+fn stop_reason_response(
+    store: Option<&crate::session::session_lifecycle_store::SessionLifecycleStore>,
+    id: &str,
+    probe: impl Fn(
+        &crate::session::session_lifecycle_store::TerminalSessionRecord,
+    ) -> crate::session::stop_reason::ResumeProbe,
+) -> Result<Json<crate::session::stop_reason::StopReason>, (StatusCode, Json<ApiResponse<()>>)> {
+    let store = store.ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            stop_reason_refusal(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "SERVICE_UNAVAILABLE",
+                "session lifecycle store unavailable, so why this session stopped is UNKNOWN \
+                 — not absent. Retry once the runner has finished starting",
+            ),
+        )
+    })?;
+    stop_reason_for(store, id, probe).map(Json)
+}
+
+/// The record a TERMINAL id names: a caller that drove a session through
+/// `GET /terminals` knows the terminal, not the provider's session id. A
+/// terminal can have hosted several records over time (a provisional row it
+/// superseded, an earlier session it was reused from), so the choice is
+/// stated, not arbitrary: the open record if there is one, else a confirmed
+/// record over an unconfirmed one, else the most recently opened. The chosen
+/// record's id is echoed as `session_id` in the answer.
+fn latest_record_for_terminal(
+    records: &[crate::session::session_lifecycle_store::TerminalSessionRecord],
+    terminal_id: &str,
+) -> Option<crate::session::session_lifecycle_store::TerminalSessionRecord> {
+    records
+        .iter()
+        .filter(|r| r.terminal_id == terminal_id)
+        // The session id is the last key so equal `opened_at`s resolve the
+        // same way every time (the registry is a HashMap).
+        .max_by(|a, b| {
+            (a.state == "open", a.confirmed_at.is_some(), a.opened_at)
+                .cmp(&(b.state == "open", b.confirmed_at.is_some(), b.opened_at))
+                .then_with(|| a.claude_session_id.cmp(&b.claude_session_id))
+        })
+        .cloned()
+}
+
+/// The handler's logic over a store, separated so it is testable without an
+/// `AppHandle`. `id` is a session id first; failing that, a terminal id
+/// ([`latest_record_for_terminal`]).
+// The Err IS the handler's response tuple; boxing it would only move the
+// unbox into the caller.
+#[allow(clippy::result_large_err)]
+fn stop_reason_for(
+    store: &crate::session::session_lifecycle_store::SessionLifecycleStore,
+    id: &str,
+    probe: impl Fn(
+        &crate::session::session_lifecycle_store::TerminalSessionRecord,
+    ) -> crate::session::stop_reason::ResumeProbe,
+) -> Result<crate::session::stop_reason::StopReason, (StatusCode, Json<ApiResponse<()>>)> {
+    // One checked read: a poisoned registry lock is a 503 (the answer is
+    // UNKNOWN), never a 404 claiming the session does not exist.
+    let records = store.all_records_checked().map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            stop_reason_refusal(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "SERVICE_UNAVAILABLE",
+                "the session lifecycle registry is unreadable (its lock is poisoned), so why \
+                 this session stopped is UNKNOWN — not absent. Retry; if it persists the \
+                 runner has a defect worth reporting",
+            ),
+        )
+    })?;
+    match records
+        .iter()
+        .find(|r| r.claude_session_id == id)
+        .cloned()
+        .or_else(|| latest_record_for_terminal(&records, id))
+    {
+        Some(rec) => Ok(crate::session::stop_reason::stop_reason(&rec, &probe(&rec))),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            stop_reason_refusal(
+                StatusCode::NOT_FOUND,
+                "SESSION_NOT_FOUND",
+                format!(
+                    "no terminal session or terminal `{id}` in the lifecycle registry. Closed \
+                     terminal sessions are kept {CLOSED_RETENTION_HOURS} hours (older ones are \
+                     listed by GET /sessions/history). A task run started by POST /sessions/spawn \
+                     is not a terminal session and this route does not cover it, except an \
+                     orchestration-loop worker, whose record is keyed by its task_run_id — \
+                     pass that id"
+                ),
+            ),
+        )),
+    }
+}
+
+// =============================================================================
 // /sessions/tree-resets
 // =============================================================================
 
@@ -2737,6 +2899,184 @@ mod tests {
         let req: SpawnSessionRequest = serde_json::from_str(r#"{"task_name":"t"}"#).unwrap();
         assert!(req.cwd.is_none());
     }
+
+    // ── /sessions/{id}/stop-reason ──────────────────────────────────────
+
+    /// A store holding one closed record, written as the registry persists it.
+    fn store_with_closed(
+        reason: &str,
+    ) -> (
+        tempfile::TempDir,
+        crate::session::session_lifecycle_store::SessionLifecycleStore,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let map = serde_json::json!({
+            "known": {
+                "claudeSessionId": "known",
+                "pageId": "default",
+                "zoneIndex": 0,
+                "terminalId": "term-known",
+                "openedAt": 1_000,
+                "lastSeenAt": 2_000,
+                "state": "closed",
+                "closedAt": 3_000,
+                "closeReason": reason,
+                "confirmedAt": 1_500
+            }
+        });
+        std::fs::write(&path, serde_json::to_vec(&map).unwrap()).unwrap();
+        let store =
+            crate::session::session_lifecycle_store::SessionLifecycleStore::open(&path).unwrap();
+        (dir, store)
+    }
+
+    /// A resume line as `session_ledger::resume_command_for` renders one.
+    const KNOWN_RESUME_LINE: &str = "cd \"/repo\" && claude --resume known";
+
+    fn resumable(
+        _: &crate::session::session_lifecycle_store::TerminalSessionRecord,
+    ) -> crate::session::stop_reason::ResumeProbe {
+        crate::session::stop_reason::ResumeProbe {
+            transcript_exists: true,
+            resume_command: Some(KNOWN_RESUME_LINE.to_string()),
+        }
+    }
+
+    fn no_transcript(
+        _: &crate::session::session_lifecycle_store::TerminalSessionRecord,
+    ) -> crate::session::stop_reason::ResumeProbe {
+        crate::session::stop_reason::ResumeProbe::default()
+    }
+
+    #[test]
+    fn stop_reason_reads_the_recorded_close() {
+        let (_dir, store) = store_with_closed("pty-exit");
+        let r = stop_reason_for(&store, "known", resumable).unwrap();
+        assert_eq!(r.code, crate::session::stop_reason::StopCode::ProcessExited);
+        assert_eq!(r.next_action.target.as_deref(), Some(KNOWN_RESUME_LINE));
+    }
+
+    #[test]
+    fn stop_reason_renders_an_unenumerated_reason_as_unknown() {
+        let (_dir, store) = store_with_closed("closed by the cat");
+        let r = stop_reason_for(&store, "known", resumable).unwrap();
+        assert_eq!(r.code, crate::session::stop_reason::StopCode::Unknown);
+        assert_eq!(r.detail.as_deref(), Some("closed by the cat"));
+    }
+
+    /// No transcript on disk: the recorded close is still reported, but no
+    /// resume is offered.
+    #[test]
+    fn stop_reason_without_a_transcript_offers_no_resume() {
+        let (_dir, store) = store_with_closed("pty-exit");
+        let r = stop_reason_for(&store, "known", no_transcript).unwrap();
+        assert_eq!(r.code, crate::session::stop_reason::StopCode::ProcessExited);
+        assert_eq!(
+            r.next_action.kind,
+            qontinui_types::refusal::NextActionKind::NoneTerminal
+        );
+    }
+
+    /// A caller that knows only the terminal it drove gets that terminal's
+    /// session, and the answer names which session it chose.
+    #[test]
+    fn stop_reason_resolves_a_terminal_id() {
+        let (_dir, store) = store_with_closed("pty-exit");
+        let r = stop_reason_for(&store, "term-known", resumable).unwrap();
+        assert_eq!(r.session_id, "known");
+        assert_eq!(r.code, crate::session::stop_reason::StopCode::ProcessExited);
+    }
+
+    /// A poisoned registry lock is a 503 — the answer is UNKNOWN, and a 404
+    /// would claim the session does not exist.
+    #[test]
+    fn stop_reason_from_a_poisoned_registry_is_a_503_not_a_404() {
+        let (_dir, store) = store_with_closed("pty-exit");
+        store.poison_for_test();
+        let (status, Json(body)) = stop_reason_for(&store, "known", resumable).unwrap_err();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let v = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["code"], "SERVICE_UNAVAILABLE");
+        assert!(v["error"].as_str().unwrap().contains("UNKNOWN"));
+    }
+
+    /// An id the registry does not hold is a 404 — never a default reason.
+    #[test]
+    fn stop_reason_for_an_unknown_session_is_a_404() {
+        let (_dir, store) = store_with_closed("pty-exit");
+        let (status, Json(body)) = stop_reason_for(&store, "nobody", resumable).unwrap_err();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let v = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["success"], false);
+        assert_eq!(v["code"], "SESSION_NOT_FOUND");
+        assert!(v["error"].as_str().unwrap().contains("nobody"));
+    }
+
+    /// The route over HTTP, on its REAL path, through [`stop_reason_response`]
+    /// — everything `get_stop_reason` does after extracting its state (a test
+    /// cannot build the `AppHandle` an `ApiState` carries; that the real
+    /// handler is what `routes()` mounts there is pinned by
+    /// `both_routes_are_registered_by_routes`). A found session answers 200
+    /// with the typed body, an unknown id 404, and an unmanaged store — the
+    /// `try_state` miss — 503.
+    #[tokio::test]
+    async fn the_stop_reason_route_answers_found_404_and_503_over_http() {
+        use axum::body::Body;
+        use axum::extract::Path as AxPath;
+        use axum::http::Request;
+        use tower::ServiceExt as _;
+
+        const ROUTE: &str = "/sessions/{id}/stop-reason";
+        async fn get_json(app: Router, uri: &str) -> (StatusCode, serde_json::Value) {
+            let resp = app
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, serde_json::from_slice(&bytes).unwrap())
+        }
+
+        let (_dir, store) = store_with_closed("pty-exit");
+        let store = Arc::new(store);
+        let mounted = {
+            let store = store.clone();
+            Router::new().route(
+                ROUTE,
+                get(move |AxPath(id): AxPath<String>| {
+                    let store = store.clone();
+                    async move { stop_reason_response(Some(store.as_ref()), &id, resumable) }
+                }),
+            )
+        };
+        let (status, body) = get_json(mounted.clone(), "/sessions/known/stop-reason").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["code"], "process_exited");
+        assert_eq!(body["next_action"]["kind"], "run_command");
+        assert_eq!(body["next_action"]["target"], KNOWN_RESUME_LINE);
+        assert_eq!(body["source"], "runner_lifecycle_registry");
+        assert!(body["observed_at"].is_string());
+        assert!(body["glossary_terms"].is_array());
+
+        let (status, body) = get_json(mounted, "/sessions/nobody/stop-reason").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["code"], "SESSION_NOT_FOUND");
+
+        let unmanaged =
+            Router::new().route(
+                ROUTE,
+                get(|AxPath(id): AxPath<String>| async move {
+                    stop_reason_response(None, &id, resumable)
+                }),
+            );
+        let (status, body) = get_json(unmanaged, "/sessions/known/stop-reason").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["code"], "SERVICE_UNAVAILABLE");
+        assert!(body["error"].as_str().unwrap().contains("UNKNOWN"));
+    }
 }
 
 // =============================================================================
@@ -2863,6 +3203,8 @@ pub fn routes() -> Router<Arc<ApiState>> {
             "/permission-prompts/snapshot",
             get(permission_prompts_snapshot),
         )
+        // Why a session stopped (or that it has not) — read-only, local.
+        .route("/sessions/{id}/stop-reason", get(get_stop_reason))
 }
 
 /// Permission-prompt capture through the routes the population uses (plan
@@ -3658,6 +4000,7 @@ mod permission_prompt_capture_route_tests {
                 "\"/permission-prompts/snapshot\"",
                 "get(permission_prompts_snapshot)",
             ),
+            ("\"/sessions/{id}/stop-reason\"", "get(get_stop_reason)"),
         ] {
             let (_, tail) = body
                 .split_once(path)

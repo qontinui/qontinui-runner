@@ -94,6 +94,7 @@ use base64::Engine;
 use serde::Deserialize;
 use uuid::Uuid;
 
+use super::coord_sync::drain_body;
 use super::handoff::HandoffError;
 use super::session_lifecycle_store::SessionLifecycleStore;
 use super::SessionRegistry;
@@ -798,6 +799,7 @@ async fn fetch_transcript_tier(
             session = %session_id,
             "session respawn: transcript fetch rejected"
         );
+        drain_body(resp).await;
         return Vec::new();
     }
     let body: serde_json::Value = match resp.json().await {
@@ -2261,5 +2263,24 @@ mod tests {
             ),
             "{res:?}"
         );
+    }
+}
+
+/// The transcript fetch reads a rejection's body to the end (lifecycle plan
+/// Phase 85) — fails if that drain is removed.
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+    use crate::session::drain_probe::DrainProbe;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transcript_fetch_rejection_reads_the_body() {
+        let _amb = crate::test_env::isolated_ambient();
+        let probe = DrainProbe::spawn(500).await;
+        let bytes =
+            fetch_transcript_tier(&reqwest::Client::new(), &probe.base, Uuid::new_v4(), "warm")
+                .await;
+        assert!(bytes.is_empty());
+        probe.assert_all_drained().await;
     }
 }

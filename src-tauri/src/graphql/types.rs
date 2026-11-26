@@ -127,16 +127,22 @@ pub struct SnapshotChunk {
 /// re-export makes that drift unrepresentable.
 pub use crate::mcp::ui_bridge::types::UiBridgeErrorCode;
 
-/// Structured error detail with recovery hint.
+/// Structured error detail with its typed next action.
 #[derive(SimpleObject, Clone, Debug)]
 pub struct UiBridgeErrorDetail {
     /// Machine-readable error code.
     pub code: UiBridgeErrorCode,
     /// Human-readable error message.
     pub message: String,
-    /// Suggested recovery action, in the serde wire spelling of `RecoveryHint`
-    /// (e.g. `"RESNAPSHOT"`, or `{"RETRY_AFTER_MS":1000}` for a data-carrying hint).
+    /// What the caller does next: the shared refusal vocabulary's
+    /// `NextActionKind` in its snake_case wire spelling (`"resnapshot"`,
+    /// `"retry_later"`, `"fix_request"`, `"none_terminal"`, …) — the same
+    /// value an HTTP caller reads at `error_detail.recovery.kind`.
     pub recovery: Option<String>,
+    /// For `recovery: "retry_later"`: the earliest useful retry, in whole
+    /// seconds (rounded up, so never 0 for a sub-second delay). Absent when no
+    /// delay is known.
+    pub recovery_retry_after_s: Option<i32>,
     /// Additional context as JSON.
     pub context: Option<Json<serde_json::Value>>,
 }

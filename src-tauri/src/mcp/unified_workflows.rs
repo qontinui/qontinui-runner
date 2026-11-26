@@ -2906,7 +2906,9 @@ async fn update_example_status_handler(
 // Slash Command Sync
 // ============================================================================
 
-/// POST /slash-commands/sync — re-sync slash commands from disk
+/// POST /slash-commands/sync — re-sync slash commands from disk. A device with
+/// no `qontinui-claude-config` checkout gets the typed `422` refusal of
+/// [`crate::slash_commands::SyncError::into_response`], never a `500`.
 async fn sync_slash_commands_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<crate::slash_commands::SyncResult>>, (StatusCode, Json<ApiResponse<()>>)>
@@ -2930,15 +2932,21 @@ async fn sync_slash_commands_handler(
                 error_detail: None,
                 hint: None,
                 code: None,
-                suggestions: None,
+                refusal: None,
             }))
         }
         Err(e) => {
-            error!("Slash command sync failed: {}", e);
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Slash command sync failed: {}", e))),
-            ))
+            // An absent checkout is the normal state of an installed runner:
+            // a typed 422 refusal, logged below error level. Only a genuine
+            // fault is a 500.
+            match &e {
+                crate::slash_commands::SyncError::Failed(_) => {
+                    error!("Slash command sync failed: {}", e)
+                }
+                _ => info!("Slash command sync refused: {}", e),
+            }
+            let (status, body) = e.into_response();
+            Err((status, Json(body)))
         }
     }
 }

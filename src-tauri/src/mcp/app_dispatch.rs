@@ -148,8 +148,16 @@ pub enum DispatchError {
 /// the message, and the wrapper's object shape `{code, message, retryable}`
 /// gives its message, code and retry verdict. A top-level `code` (else
 /// `errorCode`) wins over the object's, and a top-level boolean `retryable`
-/// wins over the object's.
-fn app_answered_failure(url: &str, status: u16, json: &serde_json::Value) -> Option<DispatchError> {
+/// wins over the object's. A top-level code is read only as a non-blank
+/// STRING, per key ([`top_level_code`]): `{"code":"","errorCode":"X"}` reads
+/// `X`, a numeric top-level `code` is skipped, and a blank or non-string
+/// top-level code never shadows the object's own. (`from_wire` is broader
+/// inside an object `error`: it also reads a numeric code there.)
+pub(crate) fn app_answered_failure(
+    url: &str,
+    status: u16,
+    json: &serde_json::Value,
+) -> Option<DispatchError> {
     if json.get("success").and_then(|v| v.as_bool()) != Some(false) {
         return None;
     }
@@ -157,10 +165,7 @@ fn app_answered_failure(url: &str, status: u16, json: &serde_json::Value) -> Opt
         .get("error")
         .cloned()
         .and_then(WrapperFailure::from_wire);
-    let top_code = ["code", "errorCode"]
-        .into_iter()
-        .find_map(|k| json.get(k).and_then(|v| v.as_str()))
-        .map(String::from);
+    let top_code = top_level_code(json);
     let (error, code, retryable) = match failure {
         Some(failure) => (
             failure.message,
@@ -179,6 +184,22 @@ fn app_answered_failure(url: &str, status: u16, json: &serde_json::Value) -> Opt
             .and_then(serde_json::Value::as_bool)
             .or(retryable),
     })
+}
+
+/// A body's top-level machine-readable code: `code`, else `errorCode`, each
+/// read ONLY as a non-blank string. A blank string, a number (e.g. a proxy
+/// echoing its HTTP status) or any other value is skipped per key — never a
+/// code of `""`, and never a status mistaken for an app code. The one
+/// top-level reader [`app_answered_failure`] and the vision device arm share.
+pub(crate) fn top_level_code(json: &serde_json::Value) -> Option<String> {
+    ["code", "errorCode"]
+        .into_iter()
+        .find_map(|k| {
+            json.get(k)
+                .and_then(|v| v.as_str())
+                .filter(|c| !c.trim().is_empty())
+        })
+        .map(String::from)
 }
 
 impl DispatchError {
@@ -247,7 +268,10 @@ impl AppDispatcher {
         let payload = payload.for_transport(entry.transport);
 
         match entry.transport {
-            AppTransport::Websocket => self.websocket_arm(app_id, action, &entry, payload).await,
+            AppTransport::Websocket => {
+                self.websocket_arm(app_id, action, &entry, None, payload)
+                    .await
+            }
             AppTransport::Http => {
                 let base = entry.app.url.trim_end_matches('/');
                 let base_path = entry.app.base_path.trim_end_matches('/');
@@ -300,11 +324,16 @@ impl AppDispatcher {
 
     /// The WebSocket arm of [`Self::dispatch`], for an `entry` already read
     /// as WebSocket-registered.
+    ///
+    /// `pinned` is the connection the caller must reach and no other (see
+    /// [`Self::dispatch_websocket_pinned`]); `None` routes to whichever
+    /// connection holds `app_id` at send time.
     async fn websocket_arm(
         &self,
         app_id: &str,
         action: &str,
         entry: &RegisteredApp,
+        pinned: Option<u64>,
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, DispatchError> {
         debug!(
@@ -354,7 +383,14 @@ impl AppDispatcher {
             .registry
             .touch(app_id, entry.websocket_conn_id, &entry.principal)
             .await;
-        let response = self.command_relay.dispatch(app_id, action, payload).await?;
+        let response = match pinned {
+            Some(conn_id) => {
+                self.command_relay
+                    .dispatch_to_conn(app_id, conn_id, action, payload)
+                    .await?
+            }
+            None => self.command_relay.dispatch(app_id, action, payload).await?,
+        };
         Ok(response.result.unwrap_or(serde_json::Value::Null))
     }
 
@@ -380,7 +416,53 @@ impl AppDispatcher {
         if entry.transport != AppTransport::Websocket {
             return Err(DispatchError::NotWebsocket(app_id.to_string()));
         }
-        self.websocket_arm(app_id, action, &entry, payload).await
+        self.websocket_arm(app_id, action, &entry, None, payload)
+            .await
+    }
+
+    /// [`Self::dispatch_websocket`], pinned to connection `conn_id`: the
+    /// command reaches that connection or nothing.
+    ///
+    /// For a caller that read a property of ONE connection — the capabilities
+    /// its register frame advertised — and must not have the command land on
+    /// a replacement that never advertised it. Refused with
+    /// [`CommandRelayError::Displaced`] when the app's row already names
+    /// another connection, or when the relay's routing slot has moved by the
+    /// time of the send ([`CommandRelay::dispatch_to_conn`] checks and sends
+    /// under one lock). The enqueue-time liveness refresh of
+    /// [`Self::websocket_arm`] is kept, guarded on `conn_id`.
+    ///
+    /// `Displaced` does NOT always mean nothing was sent. A command already in
+    /// flight when its connection is replaced is also answered `Displaced`
+    /// (the relay rejects that connection's pending commands), and the wrapper
+    /// may have run it. A caller that retries on `Displaced` must therefore
+    /// only send idempotent actions.
+    pub async fn dispatch_websocket_pinned(
+        &self,
+        app_id: &str,
+        conn_id: u64,
+        action: &str,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, DispatchError> {
+        let entry = self
+            .registry
+            .get_live(app_id)
+            .await
+            .ok_or_else(|| DispatchError::NotRegistered(app_id.to_string()))?;
+        if entry.transport != AppTransport::Websocket {
+            return Err(DispatchError::NotWebsocket(app_id.to_string()));
+        }
+        if entry.websocket_conn_id != Some(conn_id) {
+            return Err(DispatchError::WebSocket(CommandRelayError::Displaced(
+                format!(
+                    "app '{app_id}' is now registered on connection {:?}, not the pinned \
+                     connection {conn_id}",
+                    entry.websocket_conn_id
+                ),
+            )));
+        }
+        self.websocket_arm(app_id, action, &entry, Some(conn_id), payload)
+            .await
     }
 
     /// HTTP-only variant of `dispatch_active` for proxy handlers that hit a
@@ -1180,6 +1262,44 @@ mod tests {
         // `code` wins when both are present.
         let both = answered(json!({"success": false, "error": "x", "code": "A", "errorCode": "B"}));
         assert_eq!(both.and_then(|(_, c)| c), Some("A".to_string()));
+    }
+
+    /// A blank code is no code, per key: a blank `code` falls through to
+    /// `errorCode`, and a blank top-level code does not shadow the object's.
+    #[test]
+    fn app_answered_failure_skips_a_blank_code_per_key() {
+        assert_eq!(
+            answered(json!({"success": false, "error": "x", "code": "", "errorCode": "X"}))
+                .and_then(|(_, c)| c),
+            Some("X".to_string())
+        );
+        assert_eq!(
+            answered(json!({"success": false, "code": "  ",
+                            "error": {"code": "INNER", "message": "m"}}))
+            .and_then(|(_, c)| c),
+            Some("INNER".to_string())
+        );
+        assert_eq!(
+            answered(json!({"success": false, "error": "x", "code": ""})).and_then(|(_, c)| c),
+            None
+        );
+    }
+
+    /// A top-level code is read only as a non-blank STRING: a numeric
+    /// `code` (a proxy echoing its status) is skipped per key, so a string
+    /// `errorCode` beside it is the code.
+    #[test]
+    fn app_answered_failure_skips_a_numeric_top_level_code() {
+        assert_eq!(
+            answered(json!({"success": false, "code": 0, "errorCode": "PAIRING_UNAVAILABLE"}))
+                .and_then(|(_, c)| c),
+            Some("PAIRING_UNAVAILABLE".to_string())
+        );
+        assert_eq!(
+            answered(json!({"success": false, "error": "bad gateway", "code": 502}))
+                .and_then(|(_, c)| c),
+            None
+        );
     }
 
     #[test]

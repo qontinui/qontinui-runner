@@ -28,6 +28,7 @@ use crate::mcp::shared::{emit_ai_output, AiSessionContext, FindingContext, Progr
 use crate::workflow_state::{ParsedProgress, ProgressParser};
 
 use super::dispatcher;
+use super::runner::{cli_session_pin, stream_json_launch_spec, CliPin};
 use super::state::{SessionState, SessionStateTracker};
 use super::writer::StdinWriter;
 
@@ -332,24 +333,20 @@ impl ClaudeSession {
         // losslessly from that transcript. The chat path passes the runner's
         // own `session_id` (== task_run_id) as the CLI id so resume is
         // deterministic without persisting a separate Claude-internal id.
-        // `None` preserves today's behavior (CLI generates a random id).
-        let (session_id_pin, resume_id_pin) = match cli_session_ctx {
-            Some(ctx) if ctx.is_resume => {
-                info!(
-                    "Resuming Claude CLI session {} for interactive session {}",
-                    ctx.cli_session_id, session_id
-                );
-                (None, Some(ctx.cli_session_id.clone()))
-            }
-            Some(ctx) => {
-                info!(
-                    "Pinning Claude CLI session id {} for interactive session {}",
-                    ctx.cli_session_id, session_id
-                );
-                (Some(ctx.cli_session_id.clone()), None)
-            }
-            None => (None, None),
-        };
+        // `None` mints a fresh id here instead of letting the CLI pick one, so
+        // the id is in argv where the session census reads it (see
+        // `runner::CliPin`).
+        let cli_pin = cli_session_pin(cli_session_ctx);
+        match &cli_pin {
+            CliPin::Resume(id) => info!(
+                "Resuming Claude CLI session {} for interactive session {}",
+                id, session_id
+            ),
+            CliPin::New(id) => info!(
+                "Pinning Claude CLI session id {} for interactive session {}",
+                id, session_id
+            ),
+        }
 
         // Model override (e.g., from per-stage config) is fed to the seam below
         // as `spec.model` so it wins over any template `--model`.
@@ -403,14 +400,7 @@ impl ClaudeSession {
         // The operator's global template + per-account command layer in here;
         // with no operator config the composed tail is byte-identical to the
         // historical hand-built argv.
-        let spec = crate::claude_session::launch_spec::LaunchSpec {
-            permission: crate::claude_session::launch_spec::PermissionMode::BypassPermissions,
-            session_id: session_id_pin,
-            resume_id: resume_id_pin,
-            model: model_override.map(|m| m.to_string()),
-            extra_required,
-            ..Default::default()
-        };
+        let spec = stream_json_launch_spec(cli_pin, model_override, extra_required);
         let launch_cfg = crate::claude_session::launch_spec::LaunchConfig::from_settings(
             effective_config_dir.as_deref(),
         );
@@ -2251,6 +2241,7 @@ impl ClaudeSession {
         // is an infinite silent hang. One shared list, eight seams; see
         // `credential_helper::non_interactive_git_env`.
         crate::credential_helper::apply_non_interactive_git_env_std(cmd);
+        crate::terminal::apply_python_utf8_default_std(cmd);
         crate::terminal::scrub_credential_env_std(cmd);
     }
 
@@ -2386,6 +2377,7 @@ mod tests {
             &cmd,
             "ClaudeSession::finalize_child_env",
         );
+        crate::terminal::assert_python_utf8_default_std(&cmd, "ClaudeSession::finalize_child_env");
     }
 
     /// The `isolated_edit_ctx` slot on `ClaudeSession` is the worktree-isolation

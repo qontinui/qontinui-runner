@@ -74,7 +74,21 @@ printf '%s' "${HIT_PATHS}" | sed 's/^/  - /'
 echo ""
 echo "Declare it, then RE-RUN this job — applying a label does not"
 echo "re-trigger this workflow on its own:"
+if [ -n "${FINDINGS}" ]; then
+echo "  gh pr edit ${PR_NUMBER} --add-label 'ci:gate-change=alters-a-gate'"
+echo ""
+echo "and add exactly these line(s) to the PR body:"
+while IFS=$'\t' read -r kind path tok; do
+[ -z "${tok:-}" ] && continue
+case "${kind}" in
+REMOVED) echo "  Gate-Removal: ${tok}" ;;
+*)       echo "  Gate-Change: ${tok}"  ;;
+esac
+done <<< "${FINDINGS}"
+echo ""
+else
 echo "  gh pr edit ${PR_NUMBER} --add-label 'ci:gate-change=declared'"
+fi
 echo "An agent applies this itself with gh; no operator and no coord call is needed."
 exit 1
 fi

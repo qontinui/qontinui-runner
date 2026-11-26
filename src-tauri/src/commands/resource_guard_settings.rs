@@ -290,8 +290,9 @@ fn host_suggestion_json(cap: crate::ci_node::host_sizing::HostCapacity) -> serde
     // capacity model's Lane B total when it answers, else the static
     // suggestion above — labelled, with why the model did not answer. Read
     // even when the node is off or capped explicitly, deliberately: the panel
-    // shows what clearing the cap WOULD give, and it is an operator-opened
-    // read, not a periodic one, so its D9 record is one line per open.
+    // shows what clearing the cap WOULD give. It shares the D9 record with
+    // the periodic reads, which logs an answer only when it changes, so an
+    // open adds a line only when it reads a different answer.
     let (effective, source) = crate::ci_node::host_sizing::suggested_concurrent_builds_now(cap);
     let effective = match &source {
         crate::ci_node::host_sizing::ConcurrencySource::Model {

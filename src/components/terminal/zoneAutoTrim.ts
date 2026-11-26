@@ -155,13 +155,15 @@ export function reportLayoutOrigin(origin: LayoutOrigin | undefined): ReportedLa
  * ends `auto` whoever asked — an operator's quad over six sessions is a
  * runner-grown six-pack, and it trims when they close
  * (`useZoneLayout.autoTrim.test.ts`, "auto-grow turns an operator page into
- * an auto one").
+ * an auto one"). It is required, not defaulted to the request: a default
+ * reproduces the very misreport it exists to prevent for any caller that
+ * forgets the grow.
  */
 export function predictLayoutOrigin(
   current: { layoutId: string; layoutOrigin?: LayoutOrigin },
   requestedId: string,
   source: LayoutOrigin,
-  settledId: string = requestedId,
+  settledId: string,
 ): ReportedLayoutOrigin {
   if (settledId !== requestedId) return "auto";
   if (source === "operator") return "operator";

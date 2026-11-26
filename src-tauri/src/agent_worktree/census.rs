@@ -1048,14 +1048,30 @@ pub struct WorktreeCensus {
     pub nm_present: bool,
     pub nm_is_junction: bool,
     /// Real (non-junction) bytes of `node_modules`. 0 when junctioned or
-    /// absent.
+    /// absent. APPARENT size: a file hardlinked from the pnpm store counts in
+    /// full here though removing the tree frees none of it.
     pub nm_bytes: u64,
+    /// The bytes removing `node_modules` frees: each inode once, and an inode
+    /// still linked from outside the tree (the pnpm content-addressed store)
+    /// not at all. `Some(0)` when junctioned or absent. `None` = UNKNOWN —
+    /// off unix (no link count in the directory record), or the tree could
+    /// not be read in full.
+    /// Additive on the wire: coord's `WorktreeItem` ignores unknown keys, and
+    /// any coord adoption must be `#[serde(default)]` reading a missing value
+    /// as UNKNOWN. Plan
+    /// `2026-11-22-worktree-census-counts-hardlinked-pnpm-store-bytes-as-reclaimable`.
+    pub nm_exclusive_bytes: Option<u64>,
 
     pub target_present: bool,
     pub target_is_junction: bool,
     /// Real (non-junction) bytes of the build `target` dir. 0 when
-    /// junctioned or absent.
+    /// junctioned or absent. APPARENT size: an in-tree hardlink pair (a cargo
+    /// uplift) counts twice.
     pub target_bytes: u64,
+    /// The bytes removing the build `target` dir frees, measured as
+    /// [`nm_exclusive_bytes`](Self::nm_exclusive_bytes) is: an in-tree
+    /// hardlink pair counts once. Same `Some(0)` / `None` reading.
+    pub target_exclusive_bytes: Option<u64>,
 
     /// Run-provenance (plan `2026-08-16-plan-corpus-authority-and-run-
     /// provenance`, Phase 1): the **effective** cargo target directory this
@@ -1083,10 +1099,43 @@ pub struct WorktreeCensus {
     /// the wire.
     pub build_slot: Option<String>,
 
+    /// [`build_target_dir`](Self::build_target_dir) with every symlink and
+    /// junction in its existing prefix resolved ([`resolved_volume_path`]):
+    /// the path the build's bytes actually land under, from which coord
+    /// derives the volume to CHARGE a build to. `build_target_dir` itself
+    /// stays unresolved — it is the identity other consumers compare against.
+    ///
+    /// `None` when `build_target_dir` is `None`, or when no ancestor of it
+    /// could be canonicalised — NOT OBSERVED, never "on the root volume".
+    /// Persisted as `build_target_volume_path TEXT NULL` on the three coord
+    /// census tables (web migration `wtcensus_volpath_01_resolved_volume_paths`).
+    /// Always serialized, like `build_target_dir`; an old coord ignores it.
+    pub build_target_volume_path: Option<String>,
+
+    /// [`path`](Self::path) resolved the same way: the path this checkout's
+    /// bytes actually live under (a symlinked `agent-worktrees/<id>` resolves
+    /// to its target, e.g. under `/data`). `path` itself stays unresolved.
+    /// `None` = NOT OBSERVED. Persisted as `worktree_volume_path TEXT NULL`.
+    pub worktree_volume_path: Option<String>,
+
     /// RFC3339 mtime of the worktree dir itself, `None` if unreadable.
     pub last_access_mtime: Option<String>,
-    /// Sum of the non-junction real bytes attributable to this worktree
-    /// (`nm_bytes + target_bytes`). A junctioned dir contributes 0.
+    /// The bytes the operator gets back by removing this worktree's
+    /// `node_modules` and `target`: per dir, its EXCLUSIVE bytes where
+    /// measured ([`nm_exclusive_bytes`](Self::nm_exclusive_bytes),
+    /// [`target_exclusive_bytes`](Self::target_exclusive_bytes)), else its
+    /// apparent bytes (`nm_bytes` / `target_bytes`) where exclusivity is
+    /// `None` (off unix, or a walk that could not read every sub-directory).
+    /// An apparent fallback still counts store-hardlinked bytes in full, so it
+    /// can OVERSTATE what removal frees. A junctioned dir contributes 0. A pnpm tree
+    /// hardlinked from the store therefore contributes only its unshared
+    /// bytes, not its apparent size. Each dir is measured on its own, so an
+    /// inode linked from BOTH `node_modules` and `target`, or from several
+    /// worktrees once the store copy is pruned, counts 0 in each: summed
+    /// across rows whose exclusivity was measured, this is a lower bound on
+    /// what removing them all frees. A runner predating the exclusive fields
+    /// sent the apparent figure here; a row carrying `nm_exclusive_bytes` (even
+    /// as `null`) is from a runner that computes it this way.
     pub attributable_bytes: u64,
 
     /// G2 "work landed" — whether this worktree's HEAD is already
@@ -1406,14 +1455,16 @@ pub(crate) fn remove_link(path: &Path) -> std::io::Result<()> {
 }
 
 /// Measure one candidate dir (`node_modules` / `target`):
-/// `(present, is_junction, bytes)`. A junction reports
-/// `(true, true, 0)` and is never walked.
-fn measure_dir(dir: &Path) -> (bool, bool, u64) {
+/// `(present, is_junction, bytes, exclusive_bytes)`. `bytes` is the apparent
+/// size; `exclusive_bytes` is what removing the dir frees, `None` when
+/// UNKNOWN (off unix, or the tree could not be read). A junction reports
+/// `(true, true, 0, Some(0))` and is never walked.
+fn measure_dir(dir: &Path) -> (bool, bool, u64, Option<u64>) {
     if !dir.exists() {
-        return (false, false, 0);
+        return (false, false, 0, Some(0));
     }
     if is_junction(dir) {
-        return (true, true, 0);
+        return (true, true, 0, Some(0));
     }
     // `present` and `is_junction` above are read live every time (one stat
     // each), so a removal or a junction swap shows at once; only the byte total
@@ -1421,10 +1472,26 @@ fn measure_dir(dir: &Path) -> (bool, bool, u64) {
     // census walk is now paced from its end and would otherwise size the same
     // trees several times as often as before (plan
     // `2026-10-24-runner-git-probes-spawn-40-processes-per-second-and-fetch-into-empty-dirs` Phase 3).
-    let bytes = super::census_size_memo::bytes_or_measure(dir, || {
-        super::orphan_target_reaper::measure_dir_size(dir).map(|m| m.bytes)
-    });
-    (true, false, bytes)
+    // An unreadable tree reads 0 apparent bytes, as before, and UNKNOWN
+    // exclusivity — never a fabricated `Some(0)`.
+    let (bytes, exclusive) = super::census_size_memo::size_or_measure(dir, || {
+        super::orphan_target_reaper::measure_dir_size(dir).map(|m| (m.bytes, m.exclusive_bytes))
+    })
+    .unwrap_or((0, None));
+    (true, false, bytes, exclusive)
+}
+
+/// [`WorktreeCensus::attributable_bytes`]: per dir, the exclusive bytes where
+/// measured, else the apparent bytes.
+fn reclaimable_footprint(
+    nm_bytes: u64,
+    nm_exclusive_bytes: Option<u64>,
+    target_bytes: u64,
+    target_exclusive_bytes: Option<u64>,
+) -> u64 {
+    nm_exclusive_bytes
+        .unwrap_or(nm_bytes)
+        .saturating_add(target_exclusive_bytes.unwrap_or(target_bytes))
 }
 
 /// [`is_junction`]'s test applied to metadata already in hand — a directory
@@ -1491,6 +1558,11 @@ pub(super) fn target_dir_for(worktree: &Path) -> PathBuf {
 pub(crate) struct BuildTarget {
     pub dir: Option<String>,
     pub slot: Option<String>,
+    /// [`dir`](Self::dir) with every symlink and junction in its existing
+    /// prefix resolved ([`resolved_volume_path`]) — the path the build's bytes
+    /// actually land under. `None` whenever `dir` is, or when no ancestor of
+    /// it could be canonicalised.
+    pub volume_path: Option<String>,
 }
 
 /// The directory a `cargo` invocation for this worktree runs FROM, which is
@@ -1731,7 +1803,30 @@ pub(crate) fn resolve_build_target(worktree: &Path, env_target_dir: Option<&str>
     BuildTarget {
         dir: Some(normalize_path_str(&dir)),
         slot: build_slot_for(&dir),
+        volume_path: resolved_volume_path(&dir),
     }
+}
+
+/// `path` resolved through its nearest EXISTING ancestor
+/// ([`crate::util::existing_ancestor::resolve_through_existing_ancestor`]),
+/// in the census's forward-slashed form with a Windows verbatim prefix
+/// stripped ([`comparable_path`]) — the path coord derives a VOLUME from.
+///
+/// This is the deliberate counterpart of [`lexical_normalize`]: the IDENTITY
+/// fields (`path`, `build_target_dir`) stay unresolved because other consumers
+/// compare against them, while this one answers "which disk do the bytes land
+/// on". On a box where `agent-worktrees/<id>` is a symlink into
+/// `/data/qontinui/agent-worktrees/<id>`, the unresolved path prefix-matches
+/// `/` while the bytes are on `/data` (plan
+/// `2026-11-22-coord-charges-a-build-in-a-symlinked-agent-worktree-to-root`).
+/// The target dir may not exist yet, hence the nearest-existing-ancestor walk
+/// rather than `canonicalize`. `None` = NOT OBSERVED (no ancestor exists, it
+/// could not be canonicalised, or a component is a symlink that cannot be
+/// followed, e.g. a dangling one); coord then falls back to the unresolved path.
+pub(crate) fn resolved_volume_path(path: &Path) -> Option<String> {
+    crate::util::existing_ancestor::resolve_through_existing_ancestor(path)
+        .ok()
+        .map(|resolved| comparable_path(&resolved))
 }
 
 /// [`resolve_build_target`] against the live process environment.
@@ -2394,6 +2489,20 @@ fn compute_canonical_base_divergence(canonical: &Path) -> Option<String> {
 
 /// Build the census row for a single worktree dir.
 fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
+    // Run provenance: WHICH dir this worktree's builds write to, and whether
+    // that dir is a shared pool slot. Filesystem-only + cheap (a couple of
+    // `is_file` probes plus at most one small TOML parse) — no git spawn.
+    capture_worktree_with_build_target(repo, worktree, resolve_build_target_live(worktree))
+}
+
+/// [`capture_worktree`] with the build target already resolved, so a test can
+/// drive the whole row builder without the live `CARGO_TARGET_DIR` (which a
+/// `cargo-guard.sh` test run sets for itself) leaking into the row.
+fn capture_worktree_with_build_target(
+    repo: &str,
+    worktree: &Path,
+    build_target: BuildTarget,
+) -> WorktreeCensus {
     let branch =
         git_capture(worktree, &["symbolic-ref", "--short", "HEAD"]).filter(|s| !s.is_empty());
     let head_sha = git_capture(worktree, &["rev-parse", "HEAD"]).filter(|s| !s.is_empty());
@@ -2466,13 +2575,10 @@ fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
     let is_dirty = dirty_verdict.as_conservative_bool();
     let is_dirty_known = dirty_verdict.is_known();
 
-    let (nm_present, nm_is_junction, nm_bytes) = measure_dir(&worktree.join("node_modules"));
-    let (target_present, target_is_junction, target_bytes) = measure_dir(&target_dir_for(worktree));
-
-    // Run provenance: WHICH dir this worktree's builds write to, and whether
-    // that dir is a shared pool slot. Filesystem-only + cheap (a couple of
-    // `is_file` probes plus at most one small TOML parse) — no git spawn.
-    let build_target = resolve_build_target_live(worktree);
+    let (nm_present, nm_is_junction, nm_bytes, nm_exclusive_bytes) =
+        measure_dir(&worktree.join("node_modules"));
+    let (target_present, target_is_junction, target_bytes, target_exclusive_bytes) =
+        measure_dir(&target_dir_for(worktree));
 
     // WIP custody (Phase 3). Two bounded FILE READS on the hit path, ONE on
     // the miss path, and no subprocess at any point — `$GIT_DIR` comes from
@@ -2490,7 +2596,12 @@ fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
         .and_then(|m| m.modified().ok())
         .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339());
 
-    let attributable_bytes = nm_bytes.saturating_add(target_bytes);
+    let attributable_bytes = reclaimable_footprint(
+        nm_bytes,
+        nm_exclusive_bytes,
+        target_bytes,
+        target_exclusive_bytes,
+    );
 
     // G2: ancestry/patch-id "landed in the repo's trunk" — local git only,
     // None when undeterminable (unresolvable trunk, git failure).
@@ -2526,11 +2637,15 @@ fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
         nm_present,
         nm_is_junction,
         nm_bytes,
+        nm_exclusive_bytes,
         target_present,
         target_is_junction,
         target_bytes,
+        target_exclusive_bytes,
         build_target_dir: build_target.dir,
         build_slot: build_target.slot,
+        build_target_volume_path: build_target.volume_path,
+        worktree_volume_path: resolved_volume_path(worktree),
         last_access_mtime,
         attributable_bytes,
         landed_in_main,
@@ -2875,13 +2990,37 @@ fn volume_holding<'a>(volumes: &'a [VolumeReport], path: &Path) -> Option<&'a Vo
 }
 
 /// `path` in the separator-normalized form [`volume_key`] produces, with a
-/// Windows verbatim prefix (`\\?\`) dropped so a canonicalized path still
-/// compares against the plain drive-letter key.
+/// Windows verbatim prefix dropped so a canonicalized path still compares
+/// against the plain key ([`strip_verbatim_prefix`]).
 fn comparable_path(path: &Path) -> String {
-    let normalized = normalize_path_str(path);
+    strip_verbatim_prefix(&normalize_path_str(path))
+}
+
+/// Drop a Windows verbatim prefix from an already forward-slashed path.
+///
+/// `canonicalize` on Windows yields `\\?\D:\...` for a drive path and
+/// `\\?\UNC\srv\share\...` for a UNC share. (What it yields for a mapped
+/// network drive is unverified here.)
+/// Forward-slashed, those are `//?/D:/...` -> `D:/...`, and `//?/UNC/srv/share/...`
+/// -> `//srv/share/...` — the proper UNC form, which is how [`volume_key`]
+/// spells a share's mount. Stripping only `//?/` from the UNC form would leave
+/// `UNC/srv/share/...`, a relative-looking string that matches no volume key
+/// and that coord would still prefer over the lexical path. The `UNC` marker
+/// is matched case-insensitively, as Windows treats it.
+fn strip_verbatim_prefix(normalized: &str) -> String {
+    const VERBATIM_UNC: &str = "//?/UNC/";
+    let split = (
+        normalized.get(..VERBATIM_UNC.len()),
+        normalized.get(VERBATIM_UNC.len()..),
+    );
+    if let (Some(head), Some(rest)) = split {
+        if head.eq_ignore_ascii_case(VERBATIM_UNC) {
+            return format!("//{rest}");
+        }
+    }
     match normalized.strip_prefix("//?/") {
         Some(rest) => rest.to_string(),
-        None => normalized,
+        None => normalized.to_string(),
     }
 }
 
@@ -3029,12 +3168,22 @@ fn essential_paths() -> Vec<PathBuf> {
 /// effective cargo target dir (`build_target_dir`). A `CARGO_TARGET_DIR` on a
 /// removable volume makes that volume the runner's even when no worktree is on
 /// it.
+///
+/// Each row contributes its symlink-RESOLVED path when the census observed one
+/// (`worktree_volume_path` / `build_target_volume_path`), because that is the
+/// volume the bytes are on; the unresolved path is the fallback.
 fn in_use_paths(root: Option<PathBuf>, snapshot: Option<&WorktreeCensusReq>) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = root.into_iter().collect();
     if let Some(req) = snapshot {
         for w in &req.worktrees {
-            paths.push(PathBuf::from(&w.path));
-            if let Some(dir) = &w.build_target_dir {
+            paths.push(PathBuf::from(
+                w.worktree_volume_path.as_ref().unwrap_or(&w.path),
+            ));
+            if let Some(dir) = w
+                .build_target_volume_path
+                .as_ref()
+                .or(w.build_target_dir.as_ref())
+            {
                 paths.push(PathBuf::from(dir));
             }
         }
@@ -4284,14 +4433,25 @@ mod tests {",
         assert!(!is_junction(dir.path()));
     }
 
+    /// The exclusive bytes a hardlink-free tree of `n` bytes measures: all of
+    /// them on unix, UNKNOWN elsewhere.
+    fn ex(n: u64) -> Option<u64> {
+        if cfg!(unix) {
+            Some(n)
+        } else {
+            None
+        }
+    }
+
     #[test]
     fn missing_dir_measures_as_absent() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("node_modules");
-        let (present, is_junction, bytes) = measure_dir(&missing);
+        let (present, is_junction, bytes, exclusive) = measure_dir(&missing);
         assert!(!present);
         assert!(!is_junction);
         assert_eq!(bytes, 0);
+        assert_eq!(exclusive, Some(0), "an absent dir frees nothing, known");
     }
 
     #[test]
@@ -4301,10 +4461,12 @@ mod tests {",
         std::fs::create_dir(&sub).unwrap();
         std::fs::write(dir.path().join("a.bin"), vec![0u8; 100]).unwrap();
         std::fs::write(sub.join("b.bin"), vec![0u8; 250]).unwrap();
-        let total = super::super::orphan_target_reaper::measure_dir_size(dir.path())
-            .unwrap()
-            .bytes;
-        assert_eq!(total, 350, "should sum nested real files");
+        let m = super::super::orphan_target_reaper::measure_dir_size(dir.path()).unwrap();
+        assert_eq!(m.bytes, 350, "should sum nested real files");
+        #[cfg(unix)]
+        assert_eq!(m.exclusive_bytes, Some(350), "no hardlinks: all exclusive");
+        #[cfg(not(unix))]
+        assert_eq!(m.exclusive_bytes, None);
     }
 
     #[test]
@@ -4315,9 +4477,9 @@ mod tests {",
         let nm = dir.path().join("node_modules");
         std::fs::create_dir(&nm).unwrap();
         std::fs::write(nm.join("pkg.json"), vec![0u8; 42]).unwrap();
-        assert_eq!(measure_dir(&nm), (true, false, 42));
+        assert_eq!(measure_dir(&nm), (true, false, 42, ex(42)));
         std::fs::remove_dir_all(&nm).unwrap();
-        assert_eq!(measure_dir(&nm), (false, false, 0));
+        assert_eq!(measure_dir(&nm), (false, false, 0, Some(0)));
     }
 
     #[test]
@@ -4329,12 +4491,12 @@ mod tests {",
         let t = dir.path().join("target");
         std::fs::create_dir(&t).unwrap();
         std::fs::write(t.join("old.bin"), vec![0u8; 42]).unwrap();
-        assert_eq!(measure_dir(&t), (true, false, 42));
+        assert_eq!(measure_dir(&t), (true, false, 42, ex(42)));
         std::fs::remove_dir_all(&t).unwrap();
         std::thread::sleep(Duration::from_millis(50));
         std::fs::create_dir(&t).unwrap();
         std::fs::write(t.join("new.bin"), vec![0u8; 9]).unwrap();
-        assert_eq!(measure_dir(&t), (true, false, 9));
+        assert_eq!(measure_dir(&t), (true, false, 9, ex(9)));
     }
 
     #[cfg(windows)]
@@ -4344,7 +4506,7 @@ mod tests {",
         let nm = dir.path().join("node_modules");
         std::fs::create_dir(&nm).unwrap();
         std::fs::write(nm.join("pkg.json"), vec![0u8; 42]).unwrap();
-        assert_eq!(measure_dir(&nm), (true, false, 42));
+        assert_eq!(measure_dir(&nm), (true, false, 42, ex(42)));
         std::fs::remove_dir_all(&nm).unwrap();
         let elsewhere = dir.path().join("elsewhere");
         std::fs::create_dir(&elsewhere).unwrap();
@@ -4362,7 +4524,7 @@ mod tests {",
         }
         assert_eq!(
             measure_dir(&nm),
-            (true, true, 0),
+            (true, true, 0, Some(0)),
             "the junction is read live"
         );
     }
@@ -4373,10 +4535,11 @@ mod tests {",
         let nm = dir.path().join("node_modules");
         std::fs::create_dir(&nm).unwrap();
         std::fs::write(nm.join("pkg.json"), vec![0u8; 42]).unwrap();
-        let (present, is_junction, bytes) = measure_dir(&nm);
+        let (present, is_junction, bytes, exclusive) = measure_dir(&nm);
         assert!(present);
         assert!(!is_junction);
         assert_eq!(bytes, 42);
+        assert_eq!(exclusive, ex(42));
     }
 
     #[test]
@@ -4457,6 +4620,176 @@ mod tests {",
         std::fs::create_dir_all(dir.path().join("src-tauri")).unwrap();
         std::fs::write(dir.path().join("src-tauri").join("Cargo.toml"), "[package]").unwrap();
         dir
+    }
+
+    // --- symlink-resolved volume paths (plan
+    // `2026-11-22-coord-charges-a-build-in-a-symlinked-agent-worktree-to-root`).
+
+    /// A symlinked worktree dir resolves to its TARGET's path, while the
+    /// identity field stays the unresolved link path.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_worktree_resolves_to_the_link_targets_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("data").join("agent-worktrees").join("01a");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = tmp.path().join("agent-worktrees-01a");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let canon_real = std::fs::canonicalize(&real).unwrap();
+
+        assert_eq!(
+            resolved_volume_path(&link).as_deref(),
+            Some(comparable_path(&canon_real).as_str())
+        );
+        assert_ne!(resolved_volume_path(&link), Some(normalize_path_str(&link)));
+    }
+
+    /// The census case the plan is about: a cargo worktree reached through a
+    /// symlinked parent, whose in-tree `target/` does NOT exist yet. The
+    /// target resolves through its nearest existing ancestor (the repo dir,
+    /// under the link) to the link target's volume, and `dir` stays
+    /// unresolved.
+    #[cfg(unix)]
+    #[test]
+    fn a_not_yet_built_target_under_a_symlinked_parent_resolves_through_the_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real_id = tmp.path().join("data").join("01a");
+        let real_repo = real_id.join("qontinui-runner");
+        std::fs::create_dir_all(real_repo.join("src-tauri")).unwrap();
+        std::fs::write(real_repo.join("src-tauri").join("Cargo.toml"), "[package]").unwrap();
+        let link_id = tmp.path().join("agent-worktrees").join("01a");
+        std::fs::create_dir_all(link_id.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&real_id, &link_id).unwrap();
+        let worktree = link_id.join("qontinui-runner");
+
+        let bt = resolve_build_target(&worktree, None);
+        let unresolved_target = lexical_normalize(&target_dir_for(&worktree));
+        assert!(!unresolved_target.exists(), "the target must not exist yet");
+        assert_eq!(
+            bt.dir.as_deref(),
+            Some(normalize_path_str(&unresolved_target).as_str())
+        );
+
+        let canon_repo = std::fs::canonicalize(&real_repo).unwrap();
+        let rel = unresolved_target.strip_prefix(&worktree).unwrap();
+        let expect = comparable_path(&canon_repo.join(rel));
+        assert_eq!(bt.volume_path.as_deref(), Some(expect.as_str()));
+        let canon_data = comparable_path(&std::fs::canonicalize(tmp.path().join("data")).unwrap());
+        assert!(
+            bt.volume_path.as_deref().unwrap().starts_with(&canon_data),
+            "{:?} is not under the link target {canon_data}",
+            bt.volume_path
+        );
+    }
+
+    /// A plain (non-symlinked) dir is unchanged, modulo canonicalisation of
+    /// the temp root itself (macOS `/var` -> `/private/var`).
+    #[test]
+    fn a_plain_dir_resolves_to_itself() {
+        let wt = tauri_worktree();
+        let canon = std::fs::canonicalize(wt.path()).unwrap();
+        assert_eq!(
+            resolved_volume_path(wt.path()).as_deref(),
+            Some(comparable_path(&canon).as_str())
+        );
+        let bt = resolve_build_target(wt.path(), None);
+        let rel = lexical_normalize(&target_dir_for(wt.path()));
+        let rel = rel.strip_prefix(wt.path()).unwrap();
+        assert_eq!(
+            bt.volume_path.as_deref(),
+            Some(comparable_path(&canon.join(rel)).as_str())
+        );
+    }
+
+    /// No build target, no resolved build-target path.
+    #[test]
+    fn a_non_cargo_worktree_has_no_build_target_volume_path() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_build_target(dir.path(), None),
+            BuildTarget::default()
+        );
+    }
+
+    /// ARMING test for the plan: the production row builder
+    /// ([`capture_worktree_with_build_target`], which `capture_worktree` calls
+    /// with the live `CARGO_TARGET_DIR`) run on a cargo worktree reached
+    /// through a symlinked `agent-worktrees/<id>`. BOTH volume fields must land
+    /// under the symlink TARGET, while the identity fields (`path`,
+    /// `build_target_dir`) stay spelled through the link.
+    #[cfg(unix)]
+    #[test]
+    fn capture_worktree_on_a_symlinked_worktree_reports_both_volume_paths_under_the_link_target() {
+        let _amb = crate::test_env::isolated_ambient();
+        let tmp = tempfile::tempdir().unwrap();
+        let real_id = tmp.path().join("data").join("01a");
+        let real_repo = real_id.join("qontinui-runner");
+        std::fs::create_dir_all(real_repo.join("src-tauri")).unwrap();
+        std::fs::write(real_repo.join("src-tauri").join("Cargo.toml"), "[package]").unwrap();
+        let link_id = tmp.path().join("agent-worktrees").join("01a");
+        std::fs::create_dir_all(link_id.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&real_id, &link_id).unwrap();
+        let worktree = link_id.join("qontinui-runner");
+
+        let row = capture_worktree_with_build_target(
+            "qontinui-runner",
+            &worktree,
+            resolve_build_target(&worktree, None),
+        );
+
+        let canon_data = comparable_path(&std::fs::canonicalize(tmp.path().join("data")).unwrap());
+        let link_prefix = normalize_path_str(&link_id);
+
+        // Identity fields: unresolved, through the link.
+        assert_eq!(row.path, normalize_path_str(&worktree));
+        let target_dir = row
+            .build_target_dir
+            .as_deref()
+            .expect("a cargo worktree has a target");
+        assert!(
+            target_dir.starts_with(&link_prefix),
+            "{target_dir} not via the link"
+        );
+
+        // Volume fields: resolved, under the link target.
+        let wt_vol = row
+            .worktree_volume_path
+            .as_deref()
+            .expect("worktree volume observed");
+        assert_eq!(
+            wt_vol,
+            comparable_path(&std::fs::canonicalize(&real_repo).unwrap())
+        );
+        assert!(
+            wt_vol.starts_with(&canon_data),
+            "{wt_vol} not under {canon_data}"
+        );
+        let bt_vol = row
+            .build_target_volume_path
+            .as_deref()
+            .expect("build target volume observed");
+        assert!(
+            bt_vol.starts_with(&canon_data),
+            "{bt_vol} not under {canon_data}"
+        );
+        assert!(
+            !bt_vol.starts_with(&link_prefix),
+            "{bt_vol} still via the link"
+        );
+    }
+
+    /// A10 at the census: a worktree reached through a DANGLING symlink has no
+    /// observed volume path — coord falls back to the lexical path rather than
+    /// being handed the link's parent joined with the link's name as
+    /// "resolved".
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlinked_worktree_has_no_volume_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let link = tmp.path().join("agent-worktrees-01a");
+        std::os::unix::fs::symlink(tmp.path().join("gone"), &link).unwrap();
+        assert_eq!(resolved_volume_path(&link), None);
+        assert_eq!(resolved_volume_path(&link.join("qontinui-runner")), None);
     }
 
     /// Rule 1 — an ABSOLUTE `CARGO_TARGET_DIR` wins over everything, and a
@@ -5409,6 +5742,25 @@ mod tests {",
         );
     }
 
+    /// A row's symlink-RESOLVED paths, when observed, are what put a volume
+    /// in use: the bytes are on the link target's volume, not the link's.
+    #[test]
+    fn in_use_paths_prefers_the_resolved_volume_paths() {
+        let mut resolved = row_building_into("/home/w/a", Some("/home/w/a/target"));
+        resolved.worktree_volume_path = Some("/data/w/a".to_string());
+        resolved.build_target_volume_path = Some("/data/w/a/target".to_string());
+        let snapshot = snapshot_of(vec![resolved, row_building_into("/home/w/b", Some("/t/b"))]);
+        assert_eq!(
+            in_use_paths(None, Some(snapshot.req.as_ref())),
+            vec![
+                PathBuf::from("/data/w/a"),
+                PathBuf::from("/data/w/a/target"),
+                PathBuf::from("/home/w/b"),
+                PathBuf::from("/t/b"),
+            ]
+        );
+    }
+
     /// W2: the publisher probe hands on the root, the snapshot's rows and
     /// build dirs, and the caller's external mount, once a removable volume is
     /// under a floor.
@@ -5688,6 +6040,33 @@ mod tests {",
             "E:/scratch",
             "a canonicalized (verbatim) path compares against the plain key"
         );
+    }
+
+    /// A2: a verbatim UNC path (a share, as
+    /// `canonicalize` returns it on Windows) becomes the proper `//srv/share`
+    /// form, never the relative-looking `UNC/srv/share`. Pure string
+    /// transform, so it runs on any OS.
+    #[test]
+    fn a_verbatim_unc_path_becomes_a_proper_unc_path() {
+        assert_eq!(
+            strip_verbatim_prefix("//?/UNC/srv/share/agent-worktrees/01a"),
+            "//srv/share/agent-worktrees/01a"
+        );
+        assert_eq!(strip_verbatim_prefix("//?/unc/srv/share"), "//srv/share");
+        assert_eq!(strip_verbatim_prefix("//?/E:/scratch"), "E:/scratch");
+        assert_eq!(strip_verbatim_prefix("//srv/share/x"), "//srv/share/x");
+        assert_eq!(strip_verbatim_prefix("/home/x"), "/home/x");
+        // The backslashed spelling, through the full comparable form.
+        assert_eq!(
+            comparable_path(Path::new(r"\\?\UNC\srv\share\wt")),
+            "//srv/share/wt"
+        );
+        // And it is held by the share's volume key, as `volume_key` spells it.
+        let key = volume_key(Path::new(r"\\srv\share"));
+        assert!(volume_key_holds(
+            &key,
+            &comparable_path(Path::new(r"\\?\UNC\srv\share\wt"))
+        ));
     }
 
     /// `removable` flows from the mount reading into the report, and rides the
@@ -6641,11 +7020,15 @@ mod tests {",
             nm_present: false,
             nm_is_junction: false,
             nm_bytes: 0,
-            target_present: false,
+            nm_exclusive_bytes: Some(0),
+            target_present: bytes > 0,
             target_is_junction: false,
-            target_bytes: 0,
+            target_bytes: bytes,
+            target_exclusive_bytes: Some(bytes),
             build_target_dir: None,
             build_slot: None,
+            build_target_volume_path: None,
+            worktree_volume_path: None,
             last_access_mtime: None,
             attributable_bytes: bytes,
             landed_in_main: None,
@@ -6891,6 +7274,79 @@ mod tests {",
         assert_eq!(row.nm_bytes, 10);
         assert_eq!(row.target_bytes, 20);
         assert_eq!(row.attributable_bytes, 30);
+    }
+
+    /// An own `node_modules` holding a file hardlinked from outside it (a pnpm
+    /// tree imported from the store): the file counts in `nm_bytes`, the
+    /// apparent size, and not in `attributable_bytes`, since removing the
+    /// worktree frees none of it. Plan
+    /// `2026-11-22-worktree-census-counts-hardlinked-pnpm-store-bytes-as-reclaimable`.
+    #[cfg(unix)]
+    #[test]
+    fn attributable_bytes_exclude_a_store_hardlinked_node_modules_file() {
+        let _amb = crate::test_env::isolated_ambient();
+        let store = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let nm = dir.path().join("node_modules");
+        std::fs::create_dir(&nm).unwrap();
+        let stored = store.path().join("pkg.js");
+        std::fs::write(&stored, vec![0u8; 5000]).unwrap();
+        std::fs::hard_link(&stored, nm.join("pkg.js")).unwrap();
+        std::fs::write(nm.join("own.json"), vec![0u8; 12]).unwrap();
+        let row = capture_worktree("qontinui-web", dir.path());
+        assert_eq!(row.nm_bytes, 5012, "apparent size counts the store file");
+        assert_eq!(row.nm_exclusive_bytes, Some(12));
+        assert_eq!(
+            row.attributable_bytes, 12,
+            "only the unshared bytes are reclaimable"
+        );
+    }
+
+    /// The same property, entered the way the census population is: the
+    /// workspace walk (`enumerate_worktrees_with`) that `spawn_census`'s feed
+    /// runs, over a canonical `qontinui-*` checkout whose own `node_modules`
+    /// is hardlinked to a store outside it.
+    #[cfg(unix)]
+    #[test]
+    fn the_census_walk_reports_store_hardlinked_node_modules_as_unreclaimable() {
+        let _amb = crate::test_env::isolated_ambient();
+        let store = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("qontinui-web");
+        std::fs::create_dir(&repo).unwrap();
+        // A real (empty) repo, so git's discovery stops here instead of
+        // walking up into whatever repo TMPDIR may sit inside.
+        let init = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .expect("git runs");
+        assert!(init.success(), "git init succeeds");
+        let nm = repo.join("node_modules");
+        std::fs::create_dir(&nm).unwrap();
+        let stored = store.path().join("pkg.js");
+        std::fs::write(&stored, vec![0u8; 5000]).unwrap();
+        std::fs::hard_link(&stored, nm.join("pkg.js")).unwrap();
+        std::fs::write(nm.join("own.json"), vec![0u8; 12]).unwrap();
+
+        let mut rows = Vec::new();
+        enumerate_worktrees_with(root.path(), &mut |row| rows.push(row));
+        let row = rows
+            .iter()
+            .find(|r| std::fs::canonicalize(&r.path).ok() == std::fs::canonicalize(&repo).ok())
+            .expect("the canonical checkout is reported");
+        assert_eq!(row.nm_bytes, 5012, "apparent size counts the store file");
+        assert_eq!(
+            row.attributable_bytes, 12,
+            "the walk reports only the unshared bytes as reclaimable"
+        );
+    }
+
+    #[test]
+    fn reclaimable_footprint_falls_back_to_apparent_where_exclusivity_is_unknown() {
+        assert_eq!(reclaimable_footprint(10, None, 20, None), 30);
+        assert_eq!(reclaimable_footprint(10, Some(1), 20, None), 21);
+        assert_eq!(reclaimable_footprint(10, Some(1), 20, Some(2)), 3);
     }
 
     // ── CRITICAL-2 regression: a wedged git must not publish "clean" ────────

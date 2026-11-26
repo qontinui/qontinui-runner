@@ -19,6 +19,7 @@ use tauri::{AppHandle, Emitter};
 use crate::terminal::agent_status_sideband::ObservedAgentState;
 use tracing::{debug, info, warn};
 
+use super::child_path::{child_base_path, compose_child_path};
 use super::exit_notice::{ExitNoticeSink, TauriExitSink};
 use super::grid::{Grid, GridPerformer, GridSnapshot};
 use super::interceptor::OutputInterceptor;
@@ -29,6 +30,7 @@ use super::visibility::{
     ActivityDigestState, BackgroundHold, TerminalActivityWire, VisibilityState, VisibilityTier,
     ACTIVITY_DIGEST_LINES, ACTIVITY_EVENT,
 };
+use super::PYTHONUTF8_ENV;
 
 /// Shell integration scripts embedded at compile time.
 #[cfg(target_os = "windows")]
@@ -1397,63 +1399,6 @@ fn consume_input_bytes(buf: &mut String, data: &[u8]) -> Vec<String> {
     completed
 }
 
-/// The PATH a PTY child gets: `runner_path` with every qontinui shim dir
-/// ([`is_qontinui_shim_dir`]) removed, then `own_dirs` prepended in order.
-///
-/// Two defects this closes (plan
-/// `2026-11-04-identity-shim-foreign-shim-ping-pong-and-secondary-runner-pty-socket-overflow`,
-/// Phase 2):
-///
-/// 1. A runner started from inside another runner's session (a supervisor
-///    launched there, then a temp runner) INHERITS that session's
-///    `qontinui-identity-*` dir. Passed through, it reached every pane's PATH,
-///    where two identity shims could dispatch to each other for ever.
-/// 2. The install-intercept seam rebuilt the child PATH from the runner's own
-///    and discarded the identity seam's prepend. Both seams now build through
-///    here, the install seam passing `[identity_dir, install_dir]`.
-///
-/// An entry equal to one of `own_dirs` is dropped from the tail as well, since
-/// it is already at the head. Every other entry keeps its position and its
-/// spelling, empty entries included. The separator is the platform's.
-///
-/// [`is_qontinui_shim_dir`]: crate::install_effects_producer::intercept::shim_materializer::is_qontinui_shim_dir
-pub(crate) fn compose_child_path(
-    runner_path: Option<&str>,
-    own_dirs: &[&std::path::Path],
-) -> String {
-    use crate::install_effects_producer::intercept::shim_materializer::is_qontinui_shim_dir;
-
-    let sep = if cfg!(windows) { ';' } else { ':' };
-    let trim = |s: &str| s.trim_end_matches(['/', '\\']).to_string();
-    let own: Vec<String> = own_dirs
-        .iter()
-        .map(|d| d.to_string_lossy().into_owned())
-        .collect();
-    let own_trimmed: Vec<String> = own.iter().map(|d| trim(d)).collect();
-    let is_own = |entry: &str| {
-        let entry = trim(entry);
-        own_trimmed.iter().any(|o| {
-            if cfg!(windows) {
-                o.eq_ignore_ascii_case(&entry)
-            } else {
-                *o == entry
-            }
-        })
-    };
-    let mut parts: Vec<&str> = own.iter().map(String::as_str).collect();
-    if let Some(path) = runner_path.filter(|p| !p.is_empty()) {
-        for entry in path.split(sep) {
-            if !entry.is_empty()
-                && (is_own(entry) || is_qontinui_shim_dir(std::path::Path::new(entry)))
-            {
-                continue;
-            }
-            parts.push(entry);
-        }
-    }
-    parts.join(&sep.to_string())
-}
-
 /// What [`TerminalSession::apply_identity_seam`] settled for one PTY child.
 ///
 /// A named struct rather than a bare tuple: the second field is a THREE-state
@@ -1730,10 +1675,6 @@ pub struct IdleQuiescence {
     /// unread field is the defect class this change exists to remove.
     pub lines: Vec<String>,
 }
-
-/// The variable that turns on Python UTF-8 mode; see
-/// [`TerminalSession::apply_python_utf8_default`].
-pub(crate) const PYTHONUTF8_ENV: &str = "PYTHONUTF8";
 
 impl TerminalSession {
     /// Spawn a new terminal session with a shell process.
@@ -2017,7 +1958,12 @@ impl TerminalSession {
         // PATH + set the loopback port/mode so an agent that types `npm install …`
         // is transparently declared/observed. Fail-open: any materialize failure
         // injects nothing.
-        Self::apply_install_intercept_env(&mut cmd, &id, seam.identity_dir.as_deref());
+        Self::apply_install_intercept_env(
+            &mut cmd,
+            &id,
+            seam.identity_dir.as_deref(),
+            &std::env::temp_dir(),
+        );
 
         // The LAST env mutations before the spawn — account pin, then the
         // credential scrub. Extracted so the ordering is unit-testable; see the
@@ -2865,8 +2811,11 @@ impl TerminalSession {
     /// Set only on Windows, and only when the variable is not already set
     /// (inherited from the runner's own environment): an operator override,
     /// including `PYTHONUTF8=0`, wins. It runs before the caller's
-    /// `extra_env`, so a caller can override it as well. Scope is the PTY
-    /// child — the runner's own Python subprocess is untouched.
+    /// `extra_env`, so a caller can override it as well. This is the PTY seam;
+    /// the headless agent-session seams apply the same rule through
+    /// [`crate::terminal::apply_python_utf8_default_std`] /
+    /// [`crate::terminal::apply_python_utf8_default_tokio`]. The runner's own
+    /// Python subprocess is untouched.
     /// `is_windows` is a parameter so the rule is testable on every host.
     pub(crate) fn apply_python_utf8_default(cmd: &mut CommandBuilder, is_windows: bool) {
         if is_windows && cmd.get_env(PYTHONUTF8_ENV).is_none() {
@@ -3271,8 +3220,10 @@ impl TerminalSession {
         cmd: &mut CommandBuilder,
         identity_dir: &std::path::Path,
     ) {
-        let current_path = std::env::var("PATH").ok();
-        let new_path = compose_child_path(current_path.as_deref(), &[identity_dir]);
+        // The base carries the user's toolchain dirs after the runner's own
+        // entries (plan 2026-11-12-runner-hosted-linux-session-has-no-cargo-on-path).
+        let base = child_base_path();
+        let new_path = compose_child_path(base.as_deref(), &[identity_dir]);
         Self::set_child_path(cmd, &new_path);
         // The identity shim reads this to skip its own dir in the
         // real-tool scan (reusing the install shim's env contract).
@@ -3280,6 +3231,15 @@ impl TerminalSession {
             "QONTINUI_INSTALL_INTERCEPT_SHIM_DIR",
             identity_dir.to_string_lossy().as_ref(),
         );
+    }
+
+    /// The identity seam's fail-open PATH: no own dir prepended, foreign shim
+    /// dirs still stripped, and the toolchain dirs [`child_base_path`] appends
+    /// still carried. A runner with no PATH at all leaves the child's untouched.
+    fn apply_fail_open_child_path(cmd: &mut CommandBuilder) {
+        if let Some(base) = child_base_path() {
+            Self::set_child_path(cmd, &compose_child_path(Some(&base), &[]));
+        }
     }
 
     /// Extract the explicit session id a built PTY child command's argv NAMES,
@@ -3395,6 +3355,77 @@ impl TerminalSession {
         Some(t.to_string())
     }
 
+    /// What the identity seam does for a pane it could not put the identity
+    /// shim in front of: start it anyway (fail-open), and say so when that
+    /// costs the pane its argv session id.
+    ///
+    /// Env vars are still set, so a directly-invoked provider could still be
+    /// pinned by a future absolute-path wrapper, but this terminal gets no PATH
+    /// shim. The child PATH is still composed, with no own dir: an inherited
+    /// foreign shim dir must not reach this child either (plan
+    /// 2026-11-04-identity-shim-foreign-shim-ping-pong-…, Phase 2). A runner
+    /// with no PATH at all leaves the child's untouched.
+    ///
+    /// Not silent: a `claude` pane that would have taken its session id from
+    /// the shim ([`Self::pane_loses_shim_pin`]) now runs with none in argv, so
+    /// the session census can identify it only by Claude Code's own
+    /// `sessions/<pid>.json` record (plan
+    /// `2026-11-21-a-live-claude-session-loses-its-sessions-pid-json-record`,
+    /// Phase 2, route (c)) — one `warn!` names the pane. It returns `()`: this
+    /// path never refuses a terminal.
+    fn start_without_identity_shim(
+        cmd: &mut CommandBuilder,
+        terminal_id: &str,
+        title: &str,
+        pinned: &str,
+    ) {
+        // No own dir; foreign shim dirs stripped; the toolchain dirs
+        // `child_base_path` appends still carried. A runner with no PATH at
+        // all leaves the child's untouched.
+        Self::apply_fail_open_child_path(cmd);
+        if Self::pane_loses_shim_pin(cmd) {
+            warn!(
+                terminal_id = %terminal_id,
+                title = %title,
+                pinned_session_id = %pinned,
+                "identity shim could not be materialized: this claude pane starts with no \
+                 --session-id in argv (the pinned id is in its env only)"
+            );
+        }
+    }
+
+    /// Would this PTY child have taken its session id from the identity shim?
+    /// True when argv's head is the BARE `claude` program name (resolved
+    /// through `PATH`, where the shim sits) and its arguments make no session
+    /// choice of their own — the exact case in which the shim appends
+    /// `--session-id $QONTINUI_PINNED_SESSION_ID`. The session-choice token set
+    /// is the Rust spelling the native shim also reads,
+    /// [`qontinui_runner_lib::claude_env::claude_argv_chooses_session`]; the
+    /// `.bash` / `.cmd` script shims still carry copies of it (plan-library
+    /// follow-up edge `2ce2a5a6-da43-4585-a372-d533fb50b7e7`).
+    ///
+    /// False for a `claude` named by a path: it never reaches the PATH shim, so
+    /// a missing shim changes nothing for it (that is route (d) of plan
+    /// `2026-11-21-a-live-claude-session-loses-its-sessions-pid-json-record`,
+    /// not route (c)). False for a shell pane: a `claude` typed in it later is
+    /// the shim's question, not this spawn's.
+    fn pane_loses_shim_pin(cmd: &CommandBuilder) -> bool {
+        let argv = cmd.get_argv();
+        let Some(head) = argv.first() else {
+            return false;
+        };
+        let head = head.to_string_lossy();
+        if head.contains(['/', '\\']) || !Self::argv_head_is_claude(argv) {
+            return false;
+        }
+        let args: Vec<String> = argv
+            .iter()
+            .skip(1)
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        !qontinui_runner_lib::claude_env::claude_argv_chooses_session(&args)
+    }
+
     /// True when argv's head names the claude CLI image (basename compare,
     /// tolerant of a path and a `.exe`/`.cmd`/`.bat` suffix).
     ///
@@ -3443,33 +3474,37 @@ impl TerminalSession {
     /// `2026-11-04-identity-shim-foreign-shim-ping-pong-and-secondary-runner-pty-socket-overflow`
     /// Phase 2 this seam re-read the runner's PATH and silently DROPPED the
     /// identity prepend whenever interception was on.
+    ///
+    /// `base_dir` is where the per-terminal shim dir is materialized (and stale
+    /// ones swept): production passes `std::env::temp_dir()`, a test its own
+    /// fixture dir so it never has to repoint the process's temp dir.
     fn apply_install_intercept_env(
         cmd: &mut CommandBuilder,
         terminal_id: &str,
         identity_dir: Option<&std::path::Path>,
+        base_dir: &std::path::Path,
     ) {
         use crate::install_effects_producer::intercept::shim_materializer;
 
         if !shim_materializer::intercept_enabled() {
             return; // ships dark — byte-identical child env
         }
-        let base_dir = std::env::temp_dir();
         let port = crate::install_effects_producer::intercept::bound_port();
         // The MODE the terminal gets is resolved from the runner's OWN env
         // (`QONTINUI_INSTALL_INTERCEPT_MODE`; default observe, `gate` enables
         // Phase-3 gating, anything else fails open to observe — plan §3 step 3).
         let mode = shim_materializer::resolve_mode();
-        let seam = match shim_materializer::materialize(&base_dir, terminal_id, port, mode) {
+        let seam = match shim_materializer::materialize(base_dir, terminal_id, port, mode) {
             Some(s) => s,
             None => return, // fail-open: couldn't write shims ⇒ inject nothing
         };
 
-        let current_path = std::env::var("PATH").ok();
+        let base = child_base_path();
         let own_dirs: Vec<&std::path::Path> = identity_dir
             .into_iter()
             .chain(std::iter::once(seam.shim_dir.as_path()))
             .collect();
-        let new_path = compose_child_path(current_path.as_deref(), &own_dirs);
+        let new_path = compose_child_path(base.as_deref(), &own_dirs);
         Self::set_child_path(cmd, &new_path);
         cmd.env(shim_materializer::PORT_ENV, seam.port.to_string());
         cmd.env(shim_materializer::MODE_ENV, &seam.mode);
@@ -3681,18 +3716,9 @@ impl TerminalSession {
                     "session-restore: always-on identity shim dir injected onto terminal PATH"
                 );
             }
-            None => {
-                // Fail-open: env vars are still set so a directly-invoked
-                // provider could still be pinned by a future absolute-path
-                // wrapper, but no PATH shim this terminal. The child PATH is
-                // still composed, with no own dir: an inherited foreign shim
-                // dir must not reach this child either (plan
-                // 2026-11-04-identity-shim-foreign-shim-ping-pong-…, Phase 2).
-                // A runner with no PATH at all leaves the child's untouched.
-                if let Ok(current_path) = std::env::var("PATH") {
-                    Self::set_child_path(cmd, &compose_child_path(Some(&current_path), &[]));
-                }
-            }
+            // Fail-open, and the whole arm is this one call: it returns `()`,
+            // so it has no way to refuse the pane.
+            None => Self::start_without_identity_shim(cmd, terminal_id, title, &pinned),
         }
 
         // 4. Record AUTHORITATIVELY at spawn (zero transcript race). The
@@ -7486,6 +7512,10 @@ pub(crate) mod tests {
             format!("{}/", identity.display()), // our own, already inherited
             marked.to_string_lossy().into_owned(),
             p("usr-bin"),
+            // A toolchain dir `child_base_path` appended after the runner's own
+            // entries (plan 2026-11-12-runner-hosted-linux-session-has-no-cargo-on-path):
+            // it must survive both seams and the fail-open composition, last.
+            p("toolchain-appended"),
         ]
         .join(sep);
 
@@ -7497,6 +7527,7 @@ pub(crate) mod tests {
             String::new(),
             p("node-bin"),
             p("usr-bin"),
+            p("toolchain-appended"),
         ]
         .join(sep);
         assert_eq!(got, want);
@@ -7504,6 +7535,7 @@ pub(crate) mod tests {
         // The identity seam alone, and a runner with no PATH at all.
         let only_identity = compose_child_path(Some(&runner_path), &[&identity]);
         assert!(only_identity.starts_with(&*identity.to_string_lossy()));
+        assert!(only_identity.ends_with(&p("toolchain-appended")));
         assert!(!only_identity.contains("qontinui-shim-xyz"));
         assert!(!only_identity.contains("qontinui-identity-abc"));
         assert_eq!(
@@ -7518,8 +7550,163 @@ pub(crate) mod tests {
         // No own dir (the identity seam failed open): the foreign dirs are
         // still stripped and nothing is prepended.
         let bare = compose_child_path(Some(&runner_path), &[]);
-        let want_bare = [p("cargo-bin"), String::new(), p("node-bin"), p("usr-bin")].join(sep);
+        let want_bare = [
+            p("cargo-bin"),
+            String::new(),
+            p("node-bin"),
+            p("usr-bin"),
+            p("toolchain-appended"),
+        ]
+        .join(sep);
         assert_eq!(bare, want_bare);
+    }
+
+    /// The child PATH a `CommandBuilder` carries, split on the platform's
+    /// separator.
+    fn child_path_entries(cmd: &CommandBuilder) -> Vec<String> {
+        let sep = if cfg!(windows) { ';' } else { ':' };
+        cmd.get_env(TerminalSession::PATH_ENV_KEY)
+            .map(|v| v.to_string_lossy().split(sep).map(str::to_string).collect())
+            .unwrap_or_default()
+    }
+
+    /// The fixture every toolchain-PATH test runs under: the env-isolation
+    /// guard, the login-shell read OFF, `CARGO_HOME` unset and `HOME` at the
+    /// fixture dir, whose `.cargo/bin` exists. Returns the fixture, the env
+    /// restore guard and that dir. The restore guard is declared after the
+    /// fixture so it drops first, while the env lock is still held.
+    fn toolchain_fixture(
+        extra_keys: &[&'static str],
+    ) -> (
+        crate::test_env::IsolatedAmbient,
+        crate::test_env::EnvVarRestore,
+        String,
+    ) {
+        let amb = crate::test_env::isolated_ambient();
+        let mut keys = vec!["CARGO_HOME", "QONTINUI_CHILD_PATH_SHELL_READ"];
+        keys.extend_from_slice(extra_keys);
+        let restore = crate::test_env::EnvVarRestore::capture(&keys);
+        std::env::set_var("QONTINUI_CHILD_PATH_SHELL_READ", "0");
+        std::env::remove_var("CARGO_HOME");
+        let cargo_bin = amb.dir().join(".cargo").join("bin");
+        std::fs::create_dir_all(&cargo_bin).unwrap();
+        let cargo_bin = cargo_bin.to_string_lossy().into_owned();
+        (amb, restore, cargo_bin)
+    }
+
+    /// The Phase 1 arming test (plan
+    /// `2026-11-12-runner-hosted-linux-session-has-no-cargo-on-path`): a hosted
+    /// child's PATH — direct-exec terminal pane and headless spawn alike —
+    /// carries `$HOME/.cargo/bin` after the runner's own entries. Enters ONLY
+    /// through the two production seams, so deleting the wiring at either one
+    /// reddens it.
+    #[test]
+    fn hosted_child_path_carries_the_user_toolchain_after_the_runner_entries() {
+        let (amb, _restore, cargo_bin) = toolchain_fixture(&[]);
+        let runner_path = std::env::var("PATH").expect("the test process has a PATH");
+        let sep = if cfg!(windows) { ';' } else { ':' };
+        // The runner's own entries a child keeps (foreign shim dirs are
+        // stripped by design, and a test hosted by a runner inherits one).
+        let kept: Vec<String> = runner_path
+            .split(sep)
+            .filter(|e| {
+                e.is_empty()
+                    || !crate::install_effects_producer::intercept::shim_materializer::is_qontinui_shim_dir(
+                        std::path::Path::new(e),
+                    )
+            })
+            .map(str::to_string)
+            .collect();
+
+        // PTY plane: the identity seam. Its dir stays first.
+        let identity = amb.dir().join("qontinui-identity-armtest");
+        let mut cmd = CommandBuilder::new("dummy");
+        TerminalSession::apply_identity_path_shim(&mut cmd, &identity);
+        let pty = child_path_entries(&cmd);
+        assert_eq!(
+            pty.first().map(String::as_str),
+            Some(&*identity.to_string_lossy())
+        );
+        assert_eq!(
+            &pty[1..pty.len() - 1],
+            kept.as_slice(),
+            "runner entries keep their order"
+        );
+        assert_eq!(
+            pty.last(),
+            Some(&cargo_bin),
+            "toolchain dir appended last: {pty:?}"
+        );
+
+        // Headless plane.
+        let mut headless = tokio::process::Command::new("dummy");
+        crate::agent_runtime::finalize_headless_child_env(
+            &mut headless,
+            crate::coord_mcp::CoordMcpDelivery::Unprovisioned,
+            &crate::served_corpus::ServedCorpus::unknown("test"),
+        );
+        let path = headless
+            .as_std()
+            .get_envs()
+            .find(|(k, _)| k.eq_ignore_ascii_case("PATH"))
+            .and_then(|(_, v)| v)
+            .map(|v| v.to_string_lossy().into_owned())
+            .expect("the headless seam sets PATH");
+        let entries: Vec<String> = path.split(sep).map(str::to_string).collect();
+        assert_eq!(&entries[..entries.len() - 1], kept.as_slice());
+        assert_eq!(entries.last(), Some(&cargo_bin), "{entries:?}");
+    }
+
+    #[test]
+    fn install_intercept_seam_keeps_the_appended_toolchain_dirs() {
+        use crate::install_effects_producer::intercept::shim_materializer::ENABLE_FLAG;
+        let (amb, _restore, cargo_bin) = toolchain_fixture(&[ENABLE_FLAG]);
+        std::env::set_var(ENABLE_FLAG, "1");
+        // The shim materializer writes — and sweeps — in the fixture, never in
+        // the box's shared temp dir.
+        let shim_base = amb.dir().join("tmp");
+        std::fs::create_dir_all(&shim_base).unwrap();
+
+        let identity = amb.dir().join("qontinui-identity-armtest");
+        let mut cmd = CommandBuilder::new("dummy");
+        TerminalSession::apply_install_intercept_env(
+            &mut cmd,
+            "term-toolchain",
+            Some(&identity),
+            &shim_base,
+        );
+        let got = child_path_entries(&cmd);
+        assert_eq!(
+            got.first().map(String::as_str),
+            Some(&*identity.to_string_lossy()),
+            "{got:?}"
+        );
+        assert!(
+            got.get(1)
+                .is_some_and(|d| d.contains("qontinui-shim-term-toolchain")),
+            "the install shim dir is second: {got:?}"
+        );
+        assert_eq!(got.last(), Some(&cargo_bin), "{got:?}");
+    }
+
+    #[test]
+    fn identity_fail_open_branch_keeps_the_appended_toolchain_dirs() {
+        let (_amb, _restore, cargo_bin) = toolchain_fixture(&[]);
+        let mut cmd = CommandBuilder::new("dummy");
+        // The `None` arm's own helper, not `apply_fail_open_child_path`
+        // alone: a helper that went back to reading the raw runner PATH
+        // would drop the appended toolchain dirs and red this test.
+        TerminalSession::start_without_identity_shim(&mut cmd, "term-failopen", "pane", "");
+        let got = child_path_entries(&cmd);
+        assert!(
+            !got.is_empty(),
+            "the fail-open branch still composes a PATH"
+        );
+        assert!(
+            !got.iter().any(|d| d.contains("qontinui-identity-armtest")),
+            "no own dir is prepended"
+        );
+        assert_eq!(got.last(), Some(&cargo_bin), "{got:?}");
     }
 
     #[test]
@@ -7715,6 +7902,172 @@ pub(crate) mod tests {
         assert_eq!(TerminalSession::explicit_session_id_from(&cmd), None);
         let cmd = claude_argv(&["--resumeX", "abc-123"]);
         assert_eq!(TerminalSession::explicit_session_id_from(&cmd), None);
+    }
+
+    /// Plan `2026-11-21-a-live-claude-session-loses-its-sessions-pid-json-record`
+    /// Phase 2, route (c) — regression test only (measured 0 on nilan and
+    /// spaceship, coord finding `69c07716-f7f2-41ec-8f25-3c5e4c47c607`):
+    /// with no identity shim the pane still spawns, and the seam warns exactly
+    /// for the panes that would have taken their `--session-id` from the shim.
+    #[test]
+    fn pane_loses_shim_pin_only_for_a_claude_that_makes_no_session_choice() {
+        let loses = |cmd: &CommandBuilder| TerminalSession::pane_loses_shim_pin(cmd);
+
+        assert!(loses(&claude_argv(&[
+            "--permission-mode",
+            "bypassPermissions"
+        ])));
+        assert!(loses(&claude_argv(&[])));
+        // A bare `claude.exe` still resolves through PATH, where the shim sits.
+        assert!(loses(&TerminalSession::build_command_from(Some(vec![
+            "claude.exe".to_string(),
+            "--verbose".to_string(),
+        ]))));
+        // A session flag after `--` is positional; it chooses nothing.
+        assert!(loses(&claude_argv(&["--", "--continue"])));
+
+        // A claude named by a path never goes through the PATH shim, so a
+        // missing shim changes nothing for it (route (d), not (c)).
+        for path in [
+            "/home/u/.nvm/versions/node/v24.19.0/bin/claude",
+            "C:\\Users\\u\\.local\\bin\\claude.exe",
+            "./claude",
+        ] {
+            assert!(
+                !loses(&TerminalSession::build_command_from(Some(vec![
+                    path.to_string(),
+                    "--verbose".to_string(),
+                ]))),
+                "{path} is not resolved through the shim"
+            );
+        }
+
+        for chosen in [
+            vec!["--session-id", "7b97f1e8-35c0-4bec-992d-63e5a3dc55d7"],
+            vec!["--session-id=7b97f1e8-35c0-4bec-992d-63e5a3dc55d7"],
+            vec!["--resume", "52e88829-c137-421d-893a-b45feac50a00"],
+            vec!["-r", "52e88829-c137-421d-893a-b45feac50a00"],
+            vec!["--continue"],
+            vec!["-c"],
+            vec!["resume"],
+        ] {
+            assert!(!loses(&claude_argv(&chosen)), "{chosen:?} chose a session");
+        }
+        assert!(!loses(&TerminalSession::build_command_from(None)));
+        assert!(!loses(&TerminalSession::build_command_from(Some(vec![
+            "bash".to_string(),
+            "-l".to_string(),
+        ]))));
+    }
+
+    /// Route (c), what the seam DOES with no identity shim: the pane starts,
+    /// and exactly one `warn!` names a claude pane that loses its argv session
+    /// id — by terminal id and pinned id. A pane that loses nothing is silent.
+    #[test]
+    fn start_without_identity_shim_warns_once_for_a_pane_that_loses_its_pin() {
+        const PIN: &str = "7b97f1e8-35c0-4bec-992d-63e5a3dc55d7";
+        // Spelled out here, not read from the implementation, so a reworded or
+        // deleted warning reds this test.
+        const WARNING: &str = "identity shim could not be materialized";
+
+        let mut cmd = claude_argv(&["--permission-mode", "bypassPermissions"]);
+        let ((), logs) = crate::resource_guard::capture_logs(|| {
+            TerminalSession::start_without_identity_shim(&mut cmd, "term-noshim", "pane", PIN)
+        });
+        assert_eq!(logs.matches(WARNING).count(), 1, "logs: {logs}");
+        assert!(logs.contains("term-noshim"), "logs: {logs}");
+        assert!(logs.contains(PIN), "logs: {logs}");
+
+        for mut quiet in [
+            TerminalSession::build_command_from(None),
+            claude_argv(&["--session-id", PIN]),
+            claude_argv(&["--continue"]),
+            TerminalSession::build_command_from(Some(
+                vec!["/home/u/.local/bin/claude".to_string()],
+            )),
+        ] {
+            let ((), logs) = crate::resource_guard::capture_logs(|| {
+                TerminalSession::start_without_identity_shim(&mut quiet, "term-quiet", "pane", PIN)
+            });
+            assert!(!logs.contains(WARNING), "logs: {logs}");
+        }
+    }
+
+    /// The seam's no-shim arm is exactly the one call above, and nothing else.
+    /// That function returns `()`, so this is what keeps the arm from refusing
+    /// the pane: an added `return Err(..)`, an `Err::<_, _>(..)?`, or a dropped
+    /// call all change this line.
+    #[test]
+    fn the_no_shim_arm_is_only_the_fail_open_call() {
+        let src = include_str!("session.rs");
+        let seam_start = src
+            .find(&["fn apply_identity", "_seam("].concat())
+            .expect("the identity seam exists");
+        let seam = src
+            .get(seam_start..)
+            .expect("`find` returns a char boundary");
+        let match_at = seam
+            .find(&["match &", "identity {"].concat())
+            .expect("the seam matches on the materialized shim dir");
+        let after_match = seam
+            .get(match_at..)
+            .expect("`find` returns a char boundary");
+        let none_line = after_match
+            .lines()
+            .find(|l| l.trim_start().starts_with("None =>"))
+            .expect("the no-shim arm exists");
+        assert_eq!(
+            none_line.trim(),
+            [
+                "None => Self::start_without_identity_",
+                "shim(cmd, terminal_id, title, &pinned),"
+            ]
+            .concat(),
+            "the no-shim arm must be the single fail-open call"
+        );
+        // And the match closes right after it: no further arm or statement.
+        let mut rest = after_match
+            .lines()
+            .skip_while(|l| !l.trim_start().starts_with("None =>"))
+            .skip(1)
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with("//"));
+        assert_eq!(
+            rest.next(),
+            Some("}"),
+            "the match must end after the no-shim arm"
+        );
+    }
+
+    /// The seam's predicate and the identity shim read ONE session-choice token
+    /// set (`claude_env::claude_argv_chooses_session`): a token the shim treats
+    /// as the user's choice is one the seam does not warn about, and vice versa.
+    #[test]
+    fn pane_loses_shim_pin_agrees_with_the_shared_session_choice_set() {
+        for tokens in [
+            vec![],
+            vec!["--verbose"],
+            vec!["--session-id", "x"],
+            vec!["--session-id=x"],
+            vec!["--resume", "x"],
+            vec!["--resume=x"],
+            vec!["-r", "x"],
+            vec!["resume"],
+            vec!["--continue"],
+            vec!["-c"],
+            vec!["--CONTINUE"],
+            vec!["--continued"],
+            vec!["--session-id-ish"],
+            vec!["--", "--continue"],
+            vec!["-p", "resume the work"],
+        ] {
+            let chose = qontinui_runner_lib::claude_env::claude_argv_chooses_session(&tokens);
+            assert_eq!(
+                TerminalSession::pane_loses_shim_pin(&claude_argv(&tokens)),
+                !chose,
+                "{tokens:?}"
+            );
+        }
     }
 
     /// The id the seam hands back to the spawn — and so the id the coord row

@@ -246,7 +246,7 @@ pub async fn write_config(
     Json(body): Json<WriteConfigRequest>,
 ) -> Result<Json<ApiResponse<WriteConfigResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     // No project_path and no workspace root: the shared typed refusal — the same
-    // `error`/`code` as `/api-surface/scan`; `hint` carries the full Refusal
+    // `error`/`code` as `/api-surface/scan`; `refusal` carries the full Refusal
     // envelope.
     let project_dir = resolve_project_path(
         body.project_path,

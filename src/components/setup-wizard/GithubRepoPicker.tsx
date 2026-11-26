@@ -357,7 +357,7 @@ export function GithubRepoPicker({ onProjectsCloned }: GithubRepoPickerProps) {
     try {
       // Same target LoginScreen uses (see savedBackendUrl.ts): the command
       // writes the URL it signed in against back into settings.
-      await invoke("cognito_sign_in", { backendUrl: await resolveSignInBackendUrl() });
+      await invoke("cognito_sign_in", { backendUrl: await resolveSignInBackendUrl("gate") });
       window.dispatchEvent(new CustomEvent("runner-tier-changed"));
       await loadRepos();
     } catch (err) {
