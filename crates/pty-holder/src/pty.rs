@@ -387,18 +387,14 @@ fn other(e: impl std::fmt::Display) -> io::Error {
 
 /// The child's command. The environment is CLEARED and replaced by exactly
 /// `spec.env` (plan D6: nothing of the holder's own environment reaches the
-/// pane). `program`, when `Some`, replaces `argv[0]`: it is the path
-/// [`resolve_program`] found for THIS attempt (portable-pty execs the resolved
-/// path with `argv[0]` set to it either way, so the child sees no difference).
-fn build_command(spec: &ChildSpec, program: Option<std::ffi::OsString>) -> CommandBuilder {
+/// pane). `argv[0]` is passed as given: portable-pty resolves it the way
+/// [`resolve_program`] just did and keeps the original name as the child's
+/// `argv[0]`.
+fn build_command(spec: &ChildSpec) -> CommandBuilder {
     let mut cmd = if spec.argv.is_empty() {
         CommandBuilder::new_default_prog()
     } else {
-        let mut argv = spec.argv.clone();
-        if let Some(program) = program {
-            argv[0] = program;
-        }
-        CommandBuilder::from_argv(argv)
+        CommandBuilder::from_argv(spec.argv.clone())
     };
     cmd.env_clear();
     for (k, v) in &spec.env {
@@ -432,9 +428,11 @@ pub(crate) fn spawn_child_with_retry(
     retry_transient_sync(
         delays,
         || {
-            let program = resolve_program(spec)?;
+            // The typed existence check the retry classifies; portable-pty
+            // then does the same lookup itself.
+            resolve_program(spec)?;
             slave
-                .spawn_command(build_command(spec, program))
+                .spawn_command(build_command(spec))
                 .map_err(|e| match e.downcast::<io::Error>() {
                     // A failed exec (`ENOENT` / `ETXTBSY` / `ENOEXEC`, reported
                     // through std's exec-error pipe — the vendored
@@ -1829,7 +1827,10 @@ mod tests {
         // At least the first back-off was taken (a concurrent test's fork can
         // hold the fresh file open for writing — ETXTBSY — which is itself a
         // transient kind and costs one more).
-        assert_eq!(slept.first(), Some(&crate::transient::SPAWN_RETRY_DELAYS[0]));
+        assert_eq!(
+            slept.first(),
+            Some(&crate::transient::SPAWN_RETRY_DELAYS[0])
+        );
         let _ = child.wait();
 
         // A program that never comes back: every attempt is made, and the

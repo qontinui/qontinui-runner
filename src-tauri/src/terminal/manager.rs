@@ -778,10 +778,13 @@ impl TerminalManager {
         );
         let (title, cwd) = pane.session_identity();
         let (cols, rows) = pane.dims();
-        // A pane that was adopted survived a runner exit already, so its
-        // holder is outside the runner's cgroup: an unprotected one dies with
-        // the unit. Upgrade-safe.
-        let holder_state = super::daemon_pane_io::HolderState::holder(pane.unprotected());
+        // Adoption measured the holder's cgroup against this runner's unit
+        // (`DaemonPaneIo::attach_existing`). One whose cgroup could not be
+        // read is NOT upgrade-safe: surviving a runner exit says nothing,
+        // since a self-managed upgrade replaces the runner without stopping
+        // its unit.
+        let holder_state =
+            super::daemon_pane_io::HolderState::adopted(pane.unprotected(), pane.cgroup_measured());
         let io: Arc<dyn super::pane_io::PaneIo> = pane.clone();
         self.insert_with_io(
             terminal_id.to_string(),
@@ -1273,17 +1276,42 @@ impl TerminalManager {
             }
         };
 
-        let mut rows: Vec<_> = sessions
-            .values()
-            .map(|s| (s.info(), s.permission_request_hook()))
+        hook_rows(&sessions)
+    }
+
+    /// [`Self::list_with_permission_request_hooks`] and [`Self::holder_states`]
+    /// read under ONE registry lock, so every listed row has its holder state
+    /// and no pane inserted between two reads is served without one. `Err` on
+    /// a poisoned registry, as for [`Self::holder_states`].
+    #[allow(clippy::type_complexity)]
+    pub fn list_with_permission_request_hooks_and_holder_states(
+        &self,
+    ) -> Result<
+        (
+            Vec<(
+                TerminalInfo,
+                crate::session::claude_hook::PermissionRequestHook,
+            )>,
+            std::collections::HashMap<String, Option<super::daemon_pane_io::HolderState>>,
+        ),
+        String,
+    > {
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|e| format!("terminal registry lock poisoned: {e}"))?;
+        let rows = hook_rows(&sessions);
+        let states = sessions
+            .iter()
+            .map(|(id, s)| (id.clone(), live_holder_state(s)))
             .collect();
-        rows.sort_by_key(|(info, _)| info.created_at);
-        rows
+        Ok((rows, states))
     }
 
     /// Every open terminal's [`HolderState`](super::daemon_pane_io::HolderState)
     /// by id, `None` for a pane with no local holder question (a remote
-    /// mirror). For `GET /terminals`, the `terminal_holder_states` command and
+    /// mirror, or a pane whose process has exited and so has nothing left for
+    /// a restart to lose). For `GET /terminals`, the `terminal_holder_states` command and
     /// `/restart-readiness` (plan
     /// `2026-11-24-runner-upgrades-itself-daily-keeping-sessions-alive-with-no-outage-and-automatic-rollback`
     /// D7).
@@ -1300,7 +1328,7 @@ impl TerminalManager {
             .map_err(|e| format!("terminal registry lock poisoned: {e}"))?;
         Ok(sessions
             .iter()
-            .map(|(id, s)| (id.clone(), s.holder_state().cloned()))
+            .map(|(id, s)| (id.clone(), live_holder_state(s)))
             .collect())
     }
 
@@ -1460,6 +1488,44 @@ pub(crate) fn command_implies_bypass_permissions(argv: &[String]) -> bool {
         || joined.contains("--permission-mode=bypassPermissions")
 }
 
+/// A session's holder state while its process lives; an exited pane has
+/// nothing left for a restart to lose, so it carries none (and drops out of
+/// `/restart-readiness` `notUpgradeSafePanes` and the tab badge).
+fn live_holder_state(
+    s: &super::session::TerminalSession,
+) -> Option<super::daemon_pane_io::HolderState> {
+    holder_state_unless_exited(s.holder_state(), s.exit_snapshot().map(|(f, _)| f))
+}
+
+/// A pane's holder state, or `None` once its child is PROVEN gone (the
+/// waiter recorded an exit code). A failed wait (`code: None`, which for a
+/// holder pane can be a lost link) or a close in progress proves nothing,
+/// so the pane keeps its state.
+fn holder_state_unless_exited(
+    state: Option<&super::daemon_pane_io::HolderState>,
+    exit: Option<super::session::PaneExitFacts>,
+) -> Option<super::daemon_pane_io::HolderState> {
+    match exit {
+        Some(super::session::PaneExitFacts { code: Some(_), .. }) => None,
+        _ => state.cloned(),
+    }
+}
+
+/// The listing rows (oldest first), read from a held registry.
+fn hook_rows(
+    sessions: &HashMap<TerminalId, Arc<TerminalSession>>,
+) -> Vec<(
+    TerminalInfo,
+    crate::session::claude_hook::PermissionRequestHook,
+)> {
+    let mut rows: Vec<_> = sessions
+        .values()
+        .map(|s| (s.info(), s.permission_request_hook()))
+        .collect();
+    rows.sort_by_key(|(info, _)| info.created_at);
+    rows
+}
+
 #[cfg(test)]
 mod tests {
     /// The `terminal-created` wire shape the frontend reads: `surface` sits
@@ -1493,6 +1559,57 @@ mod tests {
     }
 
     use super::{apply_trust_arm, command_implies_bypass_permissions, TerminalManager, TrustArm};
+
+    #[test]
+    fn a_pane_loses_its_holder_state_only_on_a_proven_exit() {
+        use crate::terminal::daemon_pane_io::{HolderState, NotUpgradeSafe};
+        use crate::terminal::session::PaneExitFacts;
+        let st = HolderState::in_process(NotUpgradeSafe::HolderDisabled);
+        assert_eq!(
+            super::holder_state_unless_exited(Some(&st), None),
+            Some(st.clone())
+        );
+        let exited = PaneExitFacts {
+            code: Some(0),
+            close_requested: false,
+        };
+        assert_eq!(
+            super::holder_state_unless_exited(Some(&st), Some(exited)),
+            None
+        );
+        // A failed wait is not an exit: the child may still run.
+        let wait_failed = PaneExitFacts {
+            code: None,
+            close_requested: false,
+        };
+        assert_eq!(
+            super::holder_state_unless_exited(Some(&st), Some(wait_failed)),
+            Some(st)
+        );
+    }
+
+    #[test]
+    fn the_combined_listing_serves_every_row_with_its_holder_state() {
+        use crate::terminal::daemon_pane_io::{HolderState, NotUpgradeSafe};
+        let tm = TerminalManager::new();
+        let s = std::sync::Arc::new(crate::terminal::session::tests::make_test_session(
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        ));
+        s.set_holder_state(HolderState::in_process(NotUpgradeSafe::HolderDisabled));
+        tm.insert_for_test("term-a", s.clone());
+        let (rows, states) = tm
+            .list_with_permission_request_hooks_and_holder_states()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            states.get("term-a"),
+            Some(&Some(HolderState::in_process(
+                NotUpgradeSafe::HolderDisabled
+            )))
+        );
+        assert_eq!(states, tm.holder_states().unwrap());
+        assert_eq!(rows.len(), tm.list_with_permission_request_hooks().len());
+    }
 
     /// Review (adoption) M1: the late-delivery wiring end to end on a REAL
     /// manager. `bind_coord_session` must fire the observer with the
