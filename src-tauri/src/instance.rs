@@ -770,10 +770,16 @@ mod tests {
     fn the_mcp_api_bind_loop_takes_its_ports_from_api_ports_to_try() {
         // The whole `mcp_api` module (root plus `mcp_api/**`): the bind loop
         // lives in `mcp_api/serve.rs` since the split, and a scan of the root
-        // alone could no longer see a regression there.
-        let src = crate::mcp_api::mcp_api_sources();
+        // alone could no longer see a regression there. PRODUCTION text only:
+        // a test that drives the bind loop with an explicit port list (the
+        // listener-adoption tests in `serve.rs`) is not a fallback in the loop.
+        let src: String = crate::mcp_api::production_files(&crate::mcp_api::mcp_api_source_files())
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
-            src.contains("let ports_to_try = crate::instance::api_ports_to_try(port);"),
+            src.contains("&crate::instance::api_ports_to_try(port),"),
             "the bind loop no longer asks instance::api_ports_to_try for its ports"
         );
         assert!(

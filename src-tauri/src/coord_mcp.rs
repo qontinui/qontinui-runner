@@ -22053,10 +22053,13 @@ mod tests {
 
     /// The reaper's REAL liveness probe asks `/livez`, not a TCP connect
     /// (plan 2026-11-24-runner-upgrades-itself-daily-..., D1): a port that
-    /// accepts the connect and never answers — a socket unit holding a dead
-    /// runner's port — has its config reaped, while a sibling answering
-    /// `/livez` (or booting with `503 RUNNER_BOOTING`) keeps its own. The
-    /// connect-only probe this replaced kept the dead one.
+    /// accepts the connect and answers as something OTHER than a runner has
+    /// its config reaped — the connect-only probe this replaced kept it —
+    /// while a sibling answering `/livez` (or booting with
+    /// `503 RUNNER_BOOTING`) keeps its own. A port that accepts the connect
+    /// and stays SILENT is kept too (`LivezVerdict::may_be_alive`): a live
+    /// runner too loaded to answer looks the same, and the owner of a
+    /// socket-unit port reaps its own leftovers when it comes back.
     #[test]
     fn reaper_liveness_is_a_livez_answer_not_a_connect() {
         use std::io::{Read, Write};
@@ -22091,25 +22094,29 @@ mod tests {
         let (booting_port, booting_h) = serve_once(
             "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 2\r\nConnection: close\r\n\r\n{\"success\":false,\"code\":\"RUNNER_BOOTING\"}",
         );
+        // Accepts the connect and answers HTTP, but not as a runner.
+        let (other_port, other_h) =
+            serve_once("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
 
-        let dead = dir.join("silent.json");
-        std::fs::write(&dead, cfg_body(silent_port)).unwrap();
+        let quiet = dir.join("silent.json");
+        std::fs::write(&quiet, cfg_body(silent_port)).unwrap();
         let live = dir.join("live.json");
         std::fs::write(&live, cfg_body(live_port)).unwrap();
         let booting = dir.join("booting.json");
         std::fs::write(&booting, cfg_body(booting_port)).unwrap();
+        let other = dir.join("other.json");
+        std::fs::write(&other, cfg_body(other_port)).unwrap();
 
         let reaped = reap_stale_session_restore_configs_in(&dir, 9876, &loopback_port_alive);
         live_h.join().unwrap();
         booting_h.join().unwrap();
+        other_h.join().unwrap();
 
-        assert_eq!(
-            reaped, 1,
-            "only the never-answering port's config is reaped"
-        );
-        assert!(!dead.exists(), "a connect-only liveness kept this");
+        assert_eq!(reaped, 1, "only the non-runner port's config is reaped");
+        assert!(!other.exists(), "a connect-only liveness kept this");
         assert!(live.exists());
         assert!(booting.exists(), "a booting sibling is alive");
+        assert!(quiet.exists(), "a silent port may be a loaded live runner");
         drop(silent);
         let _ = std::fs::remove_dir_all(&dir);
     }
