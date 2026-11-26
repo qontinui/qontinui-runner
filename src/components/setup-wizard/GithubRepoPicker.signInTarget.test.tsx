@@ -131,7 +131,7 @@ describe("GithubRepoPicker sign-in target (gate surface)", () => {
     expect(q("#signin-fallback-notice")).not.toBeNull();
     expect(q("#signin-fallback-production")!.textContent).toBe("Sign in to api.qontinui.io");
     expect(q("#signin-fallback-effect")!.textContent).toBe(
-      "This sets the runner's backend to production.",
+      "This signs in to production and, if the runner's settings are readable, sets its backend to production.",
     );
     expect(q("#signin-fallback-retry")!.textContent).toBe("Retry and sign in");
     // `signingIn` was cleared on the withhold arm.

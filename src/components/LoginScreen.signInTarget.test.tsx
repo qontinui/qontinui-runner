@@ -184,7 +184,7 @@ describe("LoginScreen unbounded sign-in target (gate surface)", () => {
     );
     expect(q("#signin-fallback-production")!.textContent).toBe("Sign in to api.qontinui.io");
     expect(q("#signin-fallback-effect")!.textContent).toBe(
-      "This sets the runner's backend to production.",
+      "This signs in to production and, if the runner's settings are readable, sets its backend to production.",
     );
     expect(q("#signin-fallback-retry")!.textContent).toBe("Retry and sign in");
     // `loading` / `pending` were cleared: no spinner, no pending-sign-in notice.
@@ -215,6 +215,17 @@ describe("LoginScreen unbounded sign-in target (gate surface)", () => {
     // The explicit choice issues no further status read.
     expect(calls("get_web_integration_status")).toHaveLength(2);
     expect(q("#signin-fallback-notice")).toBeNull();
+  });
+
+  it("editing the email or password while a password sign-in is held drops the held sign-in, so stale credentials are never sent", async () => {
+    statusReplies = [new Error("ipc down"), new Error("ipc down")];
+    await render();
+    await submitPassword("op@example.test", "hunter2");
+    expect(q("#signin-fallback-notice")).not.toBeNull();
+    typeInto("#password", "hunter3");
+    await settle();
+    expect(q("#signin-fallback-notice")).toBeNull();
+    expect(calls("cognito_sign_in_password")).toHaveLength(0);
   });
 
   it("the password path's held action keeps its email and password", async () => {

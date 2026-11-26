@@ -412,7 +412,10 @@ export function LoginScreen({ storeUnreadable = false }: { storeUnreadable?: boo
                 type="email"
                 autoComplete="username"
                 value={email}
-                onChange={(e) => setEmail(e.target.value)}
+                onChange={(e) => {
+                  setEmail(e.target.value);
+                  if (fallback.fallback?.action.kind === "password") fallback.clear();
+                }}
                 disabled={pwLoading}
                 className="w-full px-3 py-2 rounded-lg bg-background border border-border/60 text-foreground focus:outline-none focus:border-primary"
                 placeholder="you@example.com"
@@ -428,7 +431,10 @@ export function LoginScreen({ storeUnreadable = false }: { storeUnreadable?: boo
                 type="password"
                 autoComplete="current-password"
                 value={password}
-                onChange={(e) => setPassword(e.target.value)}
+                onChange={(e) => {
+                  setPassword(e.target.value);
+                  if (fallback.fallback?.action.kind === "password") fallback.clear();
+                }}
                 disabled={pwLoading}
                 className="w-full px-3 py-2 rounded-lg bg-background border border-border/60 text-foreground focus:outline-none focus:border-primary"
                 placeholder="••••••••"

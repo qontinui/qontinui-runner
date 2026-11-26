@@ -41,11 +41,15 @@ export const FALLBACK_READING_LABEL = "Reading…";
  * What the production sign-in does to the saved backend on `decision`'s arm —
  * true on the arm it is shown on. `finalize_signed_in` writes the URL through
  * `update_settings`, which refuses while a `settingsFault` persists, so under
- * `settings_fault` the saved backend is NOT replaced.
+ * `settings_fault` the saved backend is NOT replaced. Under `read_rejected` the
+ * settings state is unknown, so the line is conditional.
  */
 export function fallbackEffectLine(decision: SignInDecision): string {
   if (decision.arm === "settings_fault") {
     return "This signs in to production. The runner's saved backend can't be changed while its settings are unreadable.";
+  }
+  if (decision.arm === "read_rejected") {
+    return "This signs in to production and, if the runner's settings are readable, sets its backend to production.";
   }
   return "This sets the runner's backend to production.";
 }

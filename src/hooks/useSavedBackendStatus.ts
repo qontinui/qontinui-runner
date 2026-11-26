@@ -79,14 +79,13 @@ export function useSavedBackendStatus<T extends SavedBackendStatus = SavedBacken
 } = {}): SavedBackendStatusState<T> {
   const [lastStatus, setLastStatus] = useState<T | null>(null);
   const [latestFailed, setLatestFailed] = useState(false);
-  // Set by `retry()`; cleared when the latest-issued read settles. While it is
-  // set, `settledSeq < issuedSeq` holds, so `reading` is exactly "a Retry was
-  // made and the latest-issued read has not settled".
+  // Set by `retry()`; cleared only when the latest-issued read settles, so
+  // `reading` is exactly "a Retry was made and the latest-issued read has not
+  // settled" — a superseding read keeps it set until THAT read settles.
   const [retryArmed, setRetryArmed] = useState(false);
   // Issue order of reads (mount + each `web-integration-changed` + Retry). Reads
   // overlap and may settle out of order; only the latest-issued may set state.
   const issuedSeq = useRef(0);
-  const settledSeq = useRef(0);
   // The live effect run's read, so `retry()` can issue one under the same
   // `cancelled` + issue-order guards; null once unmounted.
   const issueReadRef = useRef<(() => void) | null>(null);
@@ -106,14 +105,12 @@ export function useSavedBackendStatus<T extends SavedBackendStatus = SavedBacken
       invoke<T>("get_web_integration_status").then(
         (next) => {
           if (!isLatest()) return;
-          settledSeq.current = seq;
           setLastStatus(next);
           setLatestFailed(false);
           setRetryArmed(false);
         },
         (err: unknown) => {
           if (!isLatest()) return;
-          settledSeq.current = seq;
           setLatestFailed(true);
           setRetryArmed(false);
           onReadErrorRef.current?.(err);
