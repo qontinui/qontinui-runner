@@ -1232,7 +1232,7 @@ pub(crate) mod tests {
         assert_eq!(r.verdict, "pass");
         assert_eq!(r.checks.len(), 12);
         assert!(r.checks.iter().all(|c| c.verdict == Verdict::Pass));
-        assert_eq!(r.candidate_sha.as_deref(), Some(&CANDIDATE_SHA[..12]));
+        assert_eq!(r.candidate_sha.as_deref(), CANDIDATE_SHA.get(..12));
         assert!(runner.called("merge-base --is-ancestor 4d524e71bcc3 9f00aa11bb22"));
     }
 
