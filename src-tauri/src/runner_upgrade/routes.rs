@@ -75,6 +75,17 @@ struct UpgradeBody {
 /// keeps a dead successor from being left serving nothing for long.
 const GUARD_DELAY_MAX: u64 = 1800;
 
+/// A requested guard window: at least [`executor::min_guard_delay`], at most
+/// [`GUARD_DELAY_MAX`].
+fn check_guard_delay(delay: u64) -> Result<(), String> {
+    let min = executor::min_guard_delay().as_secs();
+    if (min..=GUARD_DELAY_MAX).contains(&delay) {
+        Ok(())
+    } else {
+        Err(format!("guardDelaySecs must be {min}..={GUARD_DELAY_MAX}"))
+    }
+}
+
 fn refusal(
     status: StatusCode,
     msg: impl Into<String>,
@@ -145,13 +156,8 @@ async fn post_upgrade(
     let delay = req
         .guard_delay_secs
         .unwrap_or(executor::DEFAULT_GUARD_DELAY.as_secs());
-    let guard_delay_min = executor::min_guard_delay().as_secs();
-    if !(guard_delay_min..=GUARD_DELAY_MAX).contains(&delay) {
-        return Err(refusal(
-            StatusCode::BAD_REQUEST,
-            format!("guardDelaySecs must be {guard_delay_min}..={GUARD_DELAY_MAX}"),
-            None,
-        ));
+    if let Err(e) = check_guard_delay(delay) {
+        return Err(refusal(StatusCode::BAD_REQUEST, e, None));
     }
     if let Some(u) = &req.guard_unit {
         if !executor::valid_unit_name(u) {
@@ -461,5 +467,20 @@ impl UpgradeEffects for LiveUpgradeEffects {
             })
             .map(|_| ())
             .map_err(|e| format!("could not start the exit thread: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_guard_window_below_the_floor_or_above_the_cap_is_refused() {
+        let min = executor::min_guard_delay().as_secs();
+        assert!(check_guard_delay(min - 1).is_err());
+        assert!(check_guard_delay(min).is_ok());
+        assert!(check_guard_delay(executor::DEFAULT_GUARD_DELAY.as_secs()).is_ok());
+        assert!(check_guard_delay(GUARD_DELAY_MAX).is_ok());
+        assert!(check_guard_delay(GUARD_DELAY_MAX + 1).is_err());
     }
 }

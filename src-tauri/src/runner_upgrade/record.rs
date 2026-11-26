@@ -302,6 +302,29 @@ pub fn lock_record(path: &Path) -> io::Result<RecordLock> {
     Ok(RecordLock { _file: file })
 }
 
+/// Mark the record at `path` reported in `reported` state, under its lock and
+/// against the record as it now stands: a conclusion another holder of the
+/// lock wrote since the caller's copy was read (a guard's refused or failed
+/// rollback) is kept, and only marked when it IS the state that was reported.
+/// `Ok(false)` when the record moved on and was left as found.
+pub fn mark_reported(
+    path: &Path,
+    reported: UpgradeState,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<bool, String> {
+    let _lock =
+        lock_record(path).map_err(|e| format!("lock upgrade record {}: {e}", path.display()))?;
+    let mut fresh = read_record(path)?;
+    if fresh.state != reported {
+        return Ok(false);
+    }
+    fresh.reported_state = Some(reported);
+    fresh.reported_at = Some(rfc3339(at));
+    write_record(path, &fresh)
+        .map_err(|e| format!("write upgrade record {}: {e}", path.display()))?;
+    Ok(true)
+}
+
 pub fn read_record(path: &Path) -> Result<UpgradeRecord, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read upgrade record {}: {e}", path.display()))?;
@@ -522,6 +545,30 @@ mod tests {
         let (p, r) = latest_open_record(d.path()).unwrap();
         assert_eq!(r, open);
         assert_eq!(p, record_path(d.path(), &open.id));
+    }
+
+    #[test]
+    fn marking_reported_keeps_a_conclusion_written_since_the_copy_was_read() {
+        let d = tempfile::tempdir().unwrap();
+        let mut rec = sample_record(d.path());
+        rec.state = UpgradeState::ProbationFailed;
+        let path = record_path(d.path(), &rec.id);
+        write_record(&path, &rec).unwrap();
+        // The guard concludes while probation's report is in flight.
+        let mut concluded = rec.clone();
+        concluded.state = UpgradeState::RollbackRefused;
+        write_record(&path, &concluded).unwrap();
+        let now = chrono::Utc::now();
+        assert!(!mark_reported(&path, UpgradeState::ProbationFailed, now).unwrap());
+        let on_disk = read_record(&path).unwrap();
+        assert_eq!(on_disk.state, UpgradeState::RollbackRefused);
+        assert_eq!(on_disk.reported_state, None);
+        // Reporting the state the record holds marks it.
+        assert!(mark_reported(&path, UpgradeState::RollbackRefused, now).unwrap());
+        assert_eq!(
+            read_record(&path).unwrap().reported_state,
+            Some(UpgradeState::RollbackRefused)
+        );
     }
 
     #[test]

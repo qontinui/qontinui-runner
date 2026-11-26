@@ -48,13 +48,19 @@ pub const DEFAULT_GUARD_DELAY: Duration = Duration::from_secs(720);
 /// How long a successor may take from exec to the start of probation.
 pub const SUCCESSOR_BOOT_ALLOWANCE: Duration = Duration::from_secs(120);
 
-/// The shortest guard window under which a healthy successor can still
-/// finish probation: the predecessor's exit, the successor's boot and
-/// probation's worst case, with no margin.
+/// Headroom for the steps between arming and a concluded probation that no
+/// constant times: the dying sessions' resumes, the per-holder liveness
+/// reads, the record-lock waits and the exit delay.
+pub const GUARD_MARGIN: Duration = Duration::from_secs(60);
+
+/// The shortest guard window a request may choose: the predecessor's exit,
+/// the successor's boot, probation's worst case and [`GUARD_MARGIN`] (680 s
+/// by default). Below it a healthy but slow successor can be rolled back.
 pub fn min_guard_delay() -> Duration {
     super::cli::PREDECESSOR_WAIT
         + SUCCESSOR_BOOT_ALLOWANCE
         + super::probation::ProbationTiming::default().worst_case()
+        + GUARD_MARGIN
 }
 
 /// The prefix of the transient guard unit's name.
@@ -428,9 +434,10 @@ pub(crate) mod tests {
     #[test]
     fn the_default_guard_window_outlasts_exit_boot_and_probation() {
         let needed = min_guard_delay();
+        assert_eq!(needed, Duration::from_secs(680));
         assert!(
-            DEFAULT_GUARD_DELAY >= needed + Duration::from_secs(60),
-            "guard {DEFAULT_GUARD_DELAY:?} leaves under a minute's margin over {needed:?}"
+            DEFAULT_GUARD_DELAY >= needed,
+            "guard {DEFAULT_GUARD_DELAY:?} is under the floor {needed:?}"
         );
     }
     use crate::runner_upgrade::preflight::evaluate;
