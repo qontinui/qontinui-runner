@@ -6219,6 +6219,36 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// an anonymously minted bootstrap credential on its own side. Forwarding it
 /// ahead of the coord half landing is harmless (coord answers an unknown tool).
 ///
+/// `coord_publish_prompt_document` and `coord_adopt_upstream_prompt_document`
+/// (plan `2026-11-23-agents-can-publish-a-prompt-document-and-adopt-an-equal-upstream-copy`
+/// Phase 3) are the MCP halves of two AGENT doors on coord,
+/// `POST /coord/agent-prompt-documents/:kind/:name/publish` and
+/// `POST /coord/agent-prompt-documents/:kind/:name/upstream-adopt` — the agent
+/// twins of the operator's `POST /coord/prompt-documents/:kind/:name/publish`
+/// and `.../upstream-adopt`. The coord half is the same plan's Phases 1-2, a
+/// separate qontinui-coord change; as of coord `origin/main` `499c2440b` (read
+/// 2026-11-23) neither tool exists there, and until that change deploys coord
+/// answers both as unknown tools, so forwarding them early is harmless. As
+/// that change is written it grants both on coord's `DEVICE_DEFAULT_TOOLS` and
+/// lists both on its `BOOTSTRAP_DENIED_TOOLS`; re-verify against coord
+/// `origin/main` when editing this paragraph.
+///
+/// Both WRITE, and the proxy's operation classifier
+/// (`session::coord_transport_rung::operation_for_call`) already answers WRITE
+/// for an unlisted tool. What a leaked proxy nonce reaches through them is the
+/// grant of the principal the nonce is bound to (the device's credential, or a
+/// bound agent's own JWT), narrowed by coord. As that change is written, the
+/// publish answers only the system tenant and refuses, among others, a stale
+/// `expected_version`, a `deny` tier, a refusing `policy_write` dial, a `never`
+/// mode, a held body without the exact acknowledged token set, and any call
+/// without a `notification_ref`; a publish it accepts reaches every tenant
+/// through coord's fan-out. The adopt takes only the latest publication into a
+/// copy whose body is already byte-identical to it. Neither is undone by a
+/// withdraw: a publication is immutable (coord has deliberately no withdraw
+/// route) and is corrected by publishing again; an adopt is one version
+/// snapshot, restorable from the document's history. A box rebuilt from a sha
+/// containing these entries forwards both the moment coord deploys.
+///
 /// **Landed is not delivered** (plan `2026-09-03-coord-mcp-403-names-its-own-cause`
 /// Phase 3). This list is compiled into the binary, so a PR that edits it is
 /// NOT in effect on any box until that box rebuilds from a sha containing the
@@ -6236,6 +6266,9 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_ack_message",
     "coord_adopt_pr",
+    // Plan 2026-11-23-agents-can-publish-a-prompt-document-and-adopt-an-equal-upstream-copy
+    // Phase 3: the agent upstream-adopt (identical body, latest publication only).
+    "coord_adopt_upstream_prompt_document",
     "coord_agent_registry_effective",
     "coord_alert_claim",
     "coord_alert_queue",
@@ -6407,6 +6440,9 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     // 2026-09-20-what-is-the-state-of-my-projects-and-what-needs-me-is-answerable-from-one-screen,
     // Phase 3) — read-only; without it a runner-proxied session is refused it.
     "coord_project_state",
+    // Plan 2026-11-23-agents-can-publish-a-prompt-document-and-adopt-an-equal-upstream-copy
+    // Phase 3: the agent publish of a system-tenant prompt document.
+    "coord_publish_prompt_document",
     // Plan 2026-09-20-trust-calibration-and-independent-verification-coverage-are-measured-continuously
     // Phase 4: the post-land re-verification lane's three coord tools. This one
     // is also covered by the `coord_query_` read-family prefix; it is named here
@@ -6489,6 +6525,15 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     // release / reclaim.
     "coord_unbind_repo_tenant",
     "coord_unmute_gate",
+    // Plan 2026-10-09-coord-knows-which-box-holds-which-credential Phase 3: the
+    // credential-probe catalogue AGENT write (twin `PUT
+    // /coord/agent-credential-probe-specs`, qontinui-coord#4484). coord's
+    // `agent_tool_access::DEVICE_DEFAULT_TOOLS` grants it; the handler's
+    // `credential_probes::authorize_agent_writer` (possession + tenant-admin
+    // user) is the authorization. This list only forwards. Without it, this
+    // proxy refused the seed the door exists for (coord-revive.sh read it as
+    // METHOD_NOT_ALLOWED cause=drift), forcing the HTTP twin.
+    "coord_upsert_credential_probe_spec",
     // Plan 2026-09-20-trust-calibration-… Phase 4: the lane's queue read.
     "coord_verification_queue",
     "coord_watch_verdict",
@@ -17734,6 +17779,37 @@ mod coord_mcp_body_gate_tests {
         assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
     }
 
+    /// Plan `2026-10-09-coord-knows-which-box-holds-which-credential` Phase 3:
+    /// the catalogue's agent WRITE forwards too, in sorted position, so a
+    /// proxied session can seed a spec instead of falling back to the HTTP twin.
+    #[test]
+    fn coord_upsert_credential_probe_spec_is_allowed_and_parses_from_source() {
+        assert!(coord_mcp_tool_is_allowed(
+            "coord_upsert_credential_probe_spec"
+        ));
+        assert!(
+            COORD_MCP_ALLOWED_TOOLS
+                .binary_search(&"coord_upsert_credential_probe_spec")
+                .is_ok(),
+            "membership is a binary_search, so the entry must sit in sorted position"
+        );
+        assert!(
+            !COORD_MCP_DELIBERATE_EXCLUSIONS.contains(&"coord_upsert_credential_probe_spec"),
+            "a tool cannot be both forwarded and deliberately excluded"
+        );
+        let parsed = working_tree_tool_policy();
+        assert_eq!(
+            parsed
+                .allowed
+                .iter()
+                .filter(|t| t.as_str() == "coord_upsert_credential_probe_spec")
+                .count(),
+            1,
+            "the parser must read the entry exactly once: {:?}",
+            parsed.allowed
+        );
+    }
+
     /// Plan `2026-11-02-publishing-state-is-unreadable-to-agents-and-to-anchors`
     /// Phase 1: coord#4238 put `coord_auto_publish_status` on coord's device
     /// floor; without this entry every runner-proxied session got `-32601`.
@@ -17757,6 +17833,43 @@ mod coord_mcp_body_gate_tests {
             "the parser must read the entry exactly once: {:?}",
             parsed.allowed
         );
+        assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
+    }
+
+    /// Plan `2026-11-23-agents-can-publish-a-prompt-document-and-adopt-an-equal-upstream-copy`
+    /// Phase 3: the coord half of the same plan (not yet on coord main) grants
+    /// the agent publish and upstream-adopt tools on its device floor; without
+    /// these entries every runner-proxied session would get `-32601` for them.
+    /// Both are writes, and the proxy's classifier must say so (pinned below
+    /// through `operation_for_call`). Sorted ORDER is `allowlist_tables_are_sorted`'s
+    /// to pin: a `binary_search` over an unsorted slice is unspecified, so no
+    /// per-name assertion here can be relied on to catch a mis-sort.
+    #[test]
+    fn agent_publish_and_adopt_tools_are_allowed_and_parse_from_source() {
+        let parsed = working_tree_tool_policy();
+        for tool in [
+            "coord_publish_prompt_document",
+            "coord_adopt_upstream_prompt_document",
+        ] {
+            // Present at all (a linear scan, so a removed name is named as
+            // missing), then forwarded by the proxy's own membership check.
+            assert!(
+                COORD_MCP_ALLOWED_TOOLS.contains(&tool),
+                "{tool} is missing from COORD_MCP_ALLOWED_TOOLS"
+            );
+            assert!(coord_mcp_tool_is_allowed(tool), "{tool} must be forwarded");
+            assert_eq!(
+                crate::session::coord_transport_rung::operation_for_call("tools/call", Some(tool)),
+                crate::session::coord_transport_rung::OPERATION_WRITE,
+                "{tool} is a write and the proxy must classify it as one"
+            );
+            assert_eq!(
+                parsed.allowed.iter().filter(|t| t.as_str() == tool).count(),
+                1,
+                "the parser must read {tool} exactly once: {:?}",
+                parsed.allowed
+            );
+        }
         assert_eq!(parsed.allowed.len(), COORD_MCP_ALLOWED_TOOLS.len());
     }
 

@@ -4936,6 +4936,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         let open = poll_lifecycle_store.open_records();
                         let live = poll_tm.list();
 
+                        // Remember what this boot has seen come back (and
+                        // each row's finished / closed-by-user reading)
+                        // before `prune` can delete the row a day after it
+                        // closes — the since-restart report reads through
+                        // this memory (plan
+                        // 2026-11-20-since-restart-back-sessions-turn-missing-when-registry-rows-prune).
+                        session::session_ledger::observe_tick(&poll_lifecycle_store, live.iter().cloned());
+
                         // Keep the SHARED always-on identity shim dir alive
                         // while any terminal is running. Materializing it is the
                         // only other liveness source, and that only fires on a
