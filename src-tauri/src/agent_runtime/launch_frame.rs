@@ -239,14 +239,13 @@ impl AppliedLaunch {
             Some(v) => format!("{v}({})", src.unwrap_or("unknown")),
             None => "none(unresolved)".to_string(),
         };
-        let line = format!(
+        format!(
             "launch: spawn_type={} model={} effort={} seam={}",
             self.spawn_type.as_deref().unwrap_or("none"),
             field(self.model, self.model_source.as_deref()),
             field(self.effort, self.effort_source.as_deref()),
             seam.as_str(),
-        );
-        line
+        )
     }
 
     /// Emit the per-spawn line, and one warning per dropped key.
