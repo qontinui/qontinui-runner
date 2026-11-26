@@ -9878,8 +9878,9 @@ mod sdk_capture_answer_tests {
     fn a_non_capture_answer_is_a_502() {
         let stray = sdk_capture_answer(Ok(serde_json::json!({"ok": true})));
         assert_eq!(status(&stray), 502);
-        let envelope_stray =
-            sdk_capture_answer(Ok(serde_json::json!({"success": true, "data": {"ok": true}})));
+        let envelope_stray = sdk_capture_answer(Ok(
+            serde_json::json!({"success": true, "data": {"ok": true}}),
+        ));
         assert_eq!(status(&envelope_stray), 502);
         let envelope = sdk_capture_answer(Ok(serde_json::json!({
             "success": true, "data": {"schemaVersion": 1, "nodes": []}
