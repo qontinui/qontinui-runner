@@ -82,6 +82,7 @@ DELETE /ui-bridge/sdk/render-log handle_clear_render_log
 DELETE /unified-workflows/{id} delete_unified_workflow
 DELETE /wrappers/{id} uninstall_wrapper
 DELETE /wrappers/{id}/credentials/{name} delete_credential
+FALLBACK <closure>
 FALLBACK not_found_handler
 GET /__debug/wedge-ui-thread wedge_status_handler
 GET /action-log/view get_action_log_view_endpoint
