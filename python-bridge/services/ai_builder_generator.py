@@ -467,7 +467,7 @@ Create a Python script that uses the UI Bridge HTTP API to automate the browser.
 - `fail(message)` - Mark the test as failed with a message
 
 **The script must:**
-- Use the UI Bridge HTTP API on http://localhost:9876 to interact with browser elements
+- Use the UI Bridge HTTP API on http://127.0.0.1:9876 to interact with browser elements
 - Use element IDs from the UI Bridge registry to identify elements
 - Use `assertion()` calls instead of Python `assert` statements
 - Include appropriate waits for dynamic content
@@ -477,7 +477,7 @@ Create a Python script that uses the UI Bridge HTTP API to automate the browser.
 The test uses the `/extension/command` endpoint to send commands to the browser extension.
 The extension must be connected to the runner and have a tab selected for automation.
 
-- Base URL: http://localhost:9876
+- Base URL: http://127.0.0.1:9876
 - GET /extension/status - Check if extension is connected
 - POST /extension/command - Send commands to the extension
 
@@ -500,7 +500,7 @@ If `get_elements()` returns 0 elements, the extension is NOT connected.
 import requests
 import time
 
-BASE_URL = "http://localhost:9876"
+BASE_URL = "http://127.0.0.1:9876"
 
 def check_extension():
     resp = requests.get(f"{{BASE_URL}}/extension/status")
@@ -603,7 +603,7 @@ The agentic step prompt MUST include this context at the top:
 ```
 ## Test Technology
 This verification test uses the **UI Bridge HTTP API** (NOT Playwright).
-- The test calls HTTP endpoints on localhost:9876 to interact with browser elements
+- The test calls HTTP endpoints on 127.0.0.1:9876 to interact with browser elements
 - UI Bridge requires the browser extension to be connected
 - "Found 0 elements" means the UI Bridge extension is not connected to a browser tab
 - This is NOT a Playwright test - do not debug as if it were Playwright
@@ -642,7 +642,7 @@ Fix the state extraction logic in qontinui/extraction.py. The current implementa
 Return a JSON object with exactly these fields:
 ```json
 {{
-  "verification_test": "import requests\\nimport time\\n\\nBASE_URL = 'http://localhost:9876'\\n\\ndef send_command(action, params=None):\\n    resp = requests.post(f'{{BASE_URL}}/extension/command', json={{'action': action, 'params': params or {{}}}}, timeout=30)\\n    result = resp.json()\\n    if not result.get('success'): raise Exception(result.get('error', 'Command failed'))\\n    return result.get('data', {{}})\\n\\ndef click_element(elem_id):\\n    return send_command('executeAction', {{'elementId': elem_id, 'action': 'click', 'params': {{}}}})\\n\\n# IMPORTANT: Replace element IDs below with ACTUAL IDs from the page analysis!\\ntry:\\n    # Use actual element IDs from the list provided above\\n    click_element('ACTUAL_ELEMENT_ID_FROM_LIST')\\n    time.sleep(1)\\n    # ... add your test logic using real element IDs\\n    assertion('test_completed', True, 'Test completed successfully')\\nexcept Exception as e:\\n    fail(f'Test failed: {{e}}')",
+  "verification_test": "import requests\\nimport time\\n\\nBASE_URL = 'http://127.0.0.1:9876'\\n\\ndef send_command(action, params=None):\\n    resp = requests.post(f'{{BASE_URL}}/extension/command', json={{'action': action, 'params': params or {{}}}}, timeout=30)\\n    result = resp.json()\\n    if not result.get('success'): raise Exception(result.get('error', 'Command failed'))\\n    return result.get('data', {{}})\\n\\ndef click_element(elem_id):\\n    return send_command('executeAction', {{'elementId': elem_id, 'action': 'click', 'params': {{}}}})\\n\\n# IMPORTANT: Replace element IDs below with ACTUAL IDs from the page analysis!\\ntry:\\n    # Use actual element IDs from the list provided above\\n    click_element('ACTUAL_ELEMENT_ID_FROM_LIST')\\n    time.sleep(1)\\n    # ... add your test logic using real element IDs\\n    assertion('test_completed', True, 'Test completed successfully')\\nexcept Exception as e:\\n    fail(f'Test failed: {{e}}')",
   "agentic_step": "## Test Technology\\nThis test uses UI Bridge HTTP API via browser extension (NOT Playwright). If 'Found 0 elements' appears, check extension connection.\\n\\n## Task\\nFix the [specific component] in [file path].\\n\\n## Problem\\nDescribe the bug or issue that needs code changes.\\n\\n## Solution\\nExplain what code modifications to make.\\n\\n## Files to Modify\\n- path/to/file.py: Description of changes",
   "test_name": "test_descriptive_name",
   "agentic_name": "Fix Component Bug"
@@ -657,7 +657,7 @@ Return a JSON object with exactly these fields:
 **CRITICAL - Test Format Rules:**
 - DO NOT use `import pytest` or Playwright
 - DO NOT use pytest-style function definitions
-- DO use `import requests` and call UI Bridge HTTP API on localhost:9876
+- DO use `import requests` and call UI Bridge HTTP API on 127.0.0.1:9876
 - DO use `assertion(name, passed, message)` instead of Python `assert` statements
 - DO use element IDs from the UI Bridge registry (these are the registered element IDs)
 - The test runs as a standalone script, not under pytest

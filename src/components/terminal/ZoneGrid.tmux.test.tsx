@@ -156,7 +156,10 @@ vi.mock("./useSessionReview", () => ({
   useSessionReview: () => ({ changes: null, review: null }),
 }));
 vi.mock("./sessionReviewView", () => ({ reviewBadgeState: () => null }));
-vi.mock("./TenantBadge", () => ({ TenantBadge: () => null }));
+vi.mock("./TenantBadge", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./TenantBadge")>()),
+  TenantBadge: () => null,
+}));
 vi.mock("./RemoteTabControls", () => ({ RemoteTabControls: () => null }));
 vi.mock("./useTerminalWindowActions", () => ({
   useTerminalWindowActions: () => ({ popOutTab: () => Promise.resolve() }),
@@ -202,6 +205,7 @@ function renderGridPage(
     layout,
     layoutId: layout.id,
     assignments,
+    gridView: { layoutId: layout.id, assignments, focusedZone: maximizedZone ?? 0 },
     focusedZone: maximizedZone ?? 0,
     maximizedZone,
     isMultiZone: true,
@@ -218,7 +222,14 @@ function renderGridPage(
   };
   const onZoneClick = () => {};
   act(() => {
-    root.render(createElement(ZoneGrid, { onZoneClick, onZoneDoubleClick: noop, onExit: noop }));
+    root.render(
+      createElement(ZoneGrid, {
+        onZoneClick,
+        onZoneDoubleClick: noop,
+        onExit: noop,
+        tenantSwitcherShown: false,
+      }),
+    );
   });
 }
 
@@ -227,6 +238,9 @@ function renderGridPage(
  * the hook's most-recently-shown list (shown first); by default every tab, so
  * every one is warm.
  */
+/** The grid tmux would return to; these tests do not exercise it. */
+const TMUX_GRID_ASSIGNMENTS: Record<number, string> = {};
+
 function renderTmuxPage(
   tabs: TerminalTab[],
   shown: string,
@@ -237,6 +251,7 @@ function renderTmuxPage(
     layout: { id: "single", name: "Single", columns: 1, rows: 1, zones: [{ col: "1", row: "1" }] },
     layoutId: "single",
     assignments: { 0: shown },
+    gridView: { layoutId: "single", assignments: TMUX_GRID_ASSIGNMENTS, focusedZone: 0 },
     focusedZone: 0,
     maximizedZone: null,
     isMultiZone: false,
@@ -256,7 +271,14 @@ function renderTmuxPage(
   // re-renders it through the real context in the product).
   const onZoneClick = () => {};
   act(() => {
-    root.render(createElement(ZoneGrid, { onZoneClick, onZoneDoubleClick: noop, onExit: noop }));
+    root.render(
+      createElement(ZoneGrid, {
+        onZoneClick,
+        onZoneDoubleClick: noop,
+        onExit: noop,
+        tenantSwitcherShown: false,
+      }),
+    );
   });
 }
 

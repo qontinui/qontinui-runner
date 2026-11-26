@@ -57,16 +57,6 @@
       "reason": "One-shot macOS `security find-generic-password` attribute query on the OAuth-refresh decision path, not a timer. It is a local Keychain read with no -w/-g, so it never prompts and never waits on a network or a lock."
     },
     {
-      "site": "src-tauri/src/ai_provider/pi_cli.rs::kill_child_tree",
-      "waits": [
-        "taskkill"
-      ],
-      "reason_covers_waits": [
-        "taskkill"
-      ],
-      "reason": "Teardown path: `taskkill /F /T` against a pid we are already killing. It runs once per pi child at end-of-session, and blocking here is bounded by the OS's own terminate call rather than by the dead child."
-    },
-    {
       "site": "src-tauri/src/ai_provider/process.rs::spawn_and_wait_with_doctor",
       "waits": [
         "?",
@@ -89,14 +79,14 @@
       "reason": "Standalone CLI binary (`qontinui_cli`), not the runner: one `git` plumbing read. It has no tokio runtime and therefore no blocking pool to exhaust; the process is one command and exits."
     },
     {
-      "site": "src-tauri/src/bin/qontinui_shim.rs::exec_real_child_env",
+      "site": "src-tauri/src/bin/qontinui_shim.rs::run_real_child_env",
       "waits": [
         "dyn:p"
       ],
       "reason_covers_waits": [
         "dyn:p"
       ],
-      "reason": "The PATH shim's whole job is to become the real tool: it must inherit stdio and wait for exactly as long as the real `git`/`cargo`/`claude` takes. A timeout here would truncate the very command the caller asked for. Separate binary (`qontinui_shim`), no tokio runtime and therefore no blocking pool to exhaust; the process runs exactly one child and exits. This is the SAME terminal exec-and-wait that used to be spelled `exec_real_child` — that function is now a thin delegator with no wait of its own, and the `env_remove` parameter this one gained only strips inherited variables (the identity straddle's policy-marker rule) before the same one-shot `status()`."
+      "reason": "The PATH shim's whole job is to become the real tool: it must inherit stdio and wait for exactly as long as the real `git`/`cargo`/`claude` takes. A timeout here would truncate the very command the caller asked for. Separate binary (`qontinui_shim`), no tokio runtime and therefore no blocking pool to exhaust; the process runs exactly one child and exits. This is the SAME terminal exec-and-wait that used to be spelled `exec_real_child` — that function is now a thin delegator with no wait of its own, and the `env_remove` parameter this one gained only strips inherited variables (the identity straddle's policy-marker rule) before the same one-shot `status()`. The wait itself now lives in `run_real_child_env`, which returns a spawn failure as `Err` so the identity straddle can report `exec-failed` to the runner; `exec_real_child_env` is a thin delegator that folds that `Err` back into the command-not-found surrogate, with no wait of its own."
     },
     {
       "site": "src-tauri/src/check_executor/mod.rs::execute_check",
@@ -129,16 +119,6 @@
       "reason": "One-shot macOS Keychain attribute query (`security find-generic-password`) inside `coord doctor`, an operator-invoked diagnostic. Attribute-only (no -w/-g), so it never prompts."
     },
     {
-      "site": "src-tauri/src/doctor/commands.rs::stop_process_by_pid",
-      "waits": [
-        "taskkill"
-      ],
-      "reason_covers_waits": [
-        "taskkill"
-      ],
-      "reason": "Tauri command: the operator clicked 'force stop' on a specific pid. `taskkill /F /T` on a named pid, once per click."
-    },
-    {
       "site": "src-tauri/src/drain.rs::output_with_timeout",
       "waits": [
         "?"
@@ -146,29 +126,17 @@
       "reason_covers_waits": [
         "?"
       ],
-      "reason": "This IS a bounded wrapper — the shutdown path's counterpart to process_helpers::run_with_timeout, and the seam every drain/taskkill caller was routed through. Its `.wait_with_output()` runs only on the branch where `try_wait()` has ALREADY reported the child exited, so it drains pipes on a dead child and cannot block on the child's lifetime; the deadline branch kills and reaps instead. Baselined rather than whole-file skipped because a file-level skip is what let a fourth non-wrapper hide beside the real ones in process_helpers.rs — a new raw wait added to drain.rs still surfaces as a separate site with an empty reason."
+      "reason": "This IS a bounded wrapper — the shutdown path's counterpart to process_helpers::run_with_timeout, and the seam every drain caller is routed through. Its `.wait_with_output()` runs only on the branch where `try_wait()` has ALREADY reported the child exited, so it drains pipes on a dead child and cannot block on the child's lifetime; the deadline branch kills and reaps instead. Baselined rather than whole-file skipped because a file-level skip is what let a fourth non-wrapper hide beside the real ones in process_helpers.rs — a new raw wait added to drain.rs still surfaces as a separate site with an empty reason."
     },
     {
       "site": "src-tauri/src/graphql/mutation.rs::MutationRoot::stop_task_run",
       "waits": [
-        "kill",
-        "taskkill"
+        "kill"
       ],
       "reason_covers_waits": [
-        "kill",
-        "taskkill"
+        "kill"
       ],
-      "reason": "User-requested stop of a task run, once per tracked AI pid on the stop path only: `taskkill /F /T /PID` on Windows and `kill -9` on the `#[cfg(not(windows))]` arm. Both are one-shot terminations of a named pid, bounded by the OS's own terminate call."
-    },
-    {
-      "site": "src-tauri/src/mcp/ai_session.rs::stop_ai_analysis",
-      "waits": [
-        "taskkill"
-      ],
-      "reason_covers_waits": [
-        "taskkill"
-      ],
-      "reason": "User/agent-requested stop of an AI analysis: `taskkill /F /T` once per tracked pid, on the stop path only."
+      "reason": "User-requested stop of a task run, once per tracked AI pid on the stop path only: `kill -9` on the `#[cfg(not(windows))]` arm (Windows ends the tree in-process, spawning nothing). A one-shot termination of a named pid, bounded by the OS's own terminate call."
     },
     {
       "site": "src-tauri/src/mcp/code_semantics/cargo_check.rs::probe_cargo",
@@ -203,26 +171,6 @@
       "reason": "`tsc --version` resolution for a typecheck scope. Runs on the operator/agent-initiated typecheck path, not a timer, and only after `find_tsc` has already located the binary on disk."
     },
     {
-      "site": "src-tauri/src/mcp/headless_browser.rs::spawn_headless",
-      "waits": [
-        "taskkill"
-      ],
-      "reason_covers_waits": [
-        "taskkill"
-      ],
-      "reason": "Failure path only: the headless browser did not connect within its own timeout, so we `taskkill` the pid we just spawned. Reached once per failed spawn, on an agent-initiated request."
-    },
-    {
-      "site": "src-tauri/src/mcp/task_runs.rs::stop_task_run",
-      "waits": [
-        "taskkill"
-      ],
-      "reason_covers_waits": [
-        "taskkill"
-      ],
-      "reason": "User/agent-requested stop of a task run: `taskkill /F /T` once per tracked AI pid, on the stop path only."
-    },
-    {
       "site": "src-tauri/src/mcp/trace_verification.rs::extract_video_frames",
       "waits": [
         "ffmpeg"
@@ -233,20 +181,6 @@
       "reason": "One ffmpeg frame-extraction pass per verification request, bounded by `-frames:v`. Agent-initiated, never on a timer; a transcode of a long trace legitimately takes minutes."
     },
     {
-      "site": "src-tauri/src/mcp/trace_verification.rs::run_deterministic_verification",
-      "waits": [
-        "cargo",
-        "cmd",
-        "sh"
-      ],
-      "reason_covers_waits": [
-        "cargo",
-        "cmd",
-        "sh"
-      ],
-      "reason": "Runs the workspace's own build — `npm run build` via `cmd /C` on Windows and `sh -c` elsewhere, plus `cargo check` when a Cargo.toml is present. Unbounded by nature, and the point of the check is to let it finish. One pass per agent-initiated verification request."
-    },
-    {
       "site": "src-tauri/src/orchestrator/hooks.rs::HookExecutor::execute_command",
       "waits": [
         "cmd"
@@ -255,20 +189,6 @@
         "cmd"
       ],
       "reason": "Executes a user-authored orchestrator hook command through `cmd /C`. Its runtime is whatever the operator's script does; a blanket budget here would silently truncate hooks. Fires per task-run lifecycle event, not on a timer."
-    },
-    {
-      "site": "src-tauri/src/orchestrator/verification.rs::DeterministicVerifier::run_command",
-      "waits": [
-        "cmd",
-        "dyn:bash_path",
-        "sh"
-      ],
-      "reason_covers_waits": [
-        "cmd",
-        "dyn:bash_path",
-        "sh"
-      ],
-      "reason": "Executes a user-authored verification command (build/test/lint) through whichever shell the platform resolves to — a discovered `bash_path`, `cmd /C`, or `sh -c` — with a runtime that is legitimately unbounded. Budget belongs to the verification step's own config. One pass per orchestrator iteration, driven by task progress rather than a clock."
     },
     {
       "site": "src-tauri/src/playwright/executor.rs::run_script",

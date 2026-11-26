@@ -85,7 +85,16 @@ mod tests {
             // 536 -> 535: task_run_events.rs `count_task_run_table` deleted —
             // the per-run log pages carry a window count (plan
             // 2026-09-05-every-bounded-read-is-a-page-that-reads-as-a-corpus, 5b).
-            baseline: 535,
+            // 535 -> 533: pr_watch_ops.rs `upsert_pr_watch_state` and
+            // `get_pr_watch_token_for_task` deleted with the plaintext PR-watch
+            // token slot (coord finding e871ac27).
+            // 533 -> 531: `get_active_pr_watches` and `has_review_subtask_for_pr`
+            // deleted with the PR-watch chain, which had no writer left.
+            // 531 -> 530: reflection.rs `evaluate_pending_fixes` reads its
+            // exposure counts with try_get (plan
+            // 2026-11-06-a-product-workflow-verification-with-nothing-to-check-never-reports-passed,
+            // Phase 4).
+            baseline: 530,
             gate_wiring: &[
                 ("clippy.toml", "disallowed-methods"),
                 ("clippy.toml", "tokio_postgres::Row::get"),
@@ -115,7 +124,26 @@ mod tests {
             // 435 -> 434: graphql `task_run_output` moved to char-boundary
             // `str::get` slicing in `graphql::output_page` (plan
             // 2026-09-05-every-bounded-read-is-a-page-that-reads-as-a-corpus, 5b).
-            baseline: 434,
+            // 434 -> 428: pr_watcher.rs `poll_active_prs` and review_subtask.rs
+            // `process_review_outcome` lost their only slices when the per-watch
+            // token and the GitHub review post were deleted (coord finding
+            // e871ac27), 430 -> 428 measured. The other 4 were slack left when
+            // 93a2ca093 pinned 434 against a measured 430.
+            // 428 -> 424: the PR-watch chain deleted, which took 2 attributes;
+            // the other 2 were slack, 426 measured before the deletion.
+            // 424 -> 423: the dead playbook loader (`skills/playbook_parser.rs`)
+            // deleted with its 2 attributes; `split_frontmatter`'s moved into
+            // prompt_library.rs (plan
+            // 2026-11-06-what-the-fleet-records-and-advertises-matches-what-actually-ran, 7).
+            // 423 -> 417: #2857 deleted the orchestrator verifier with 3
+            // attributes (orchestrator/verification.rs 2, output.rs 1) and left
+            // the baseline; the other 3 were slack. 417 measured by this test.
+            // 417 -> 414: `terminal::transcript::read_tail_bytes` and
+            // `session_compliance::read_transcript_tail` lost their only slices
+            // to the one bounded tail reader, `file_tail::read_tail_lossy` (plan
+            // 2026-11-11-runner-glibc-arena-retention-and-whole-log-tail); the
+            // other 1 was slack, 416 measured before the change, 414 after.
+            baseline: 414,
             gate_wiring: &[
                 ("src-tauri/Cargo.toml", "string_slice = { level = \"deny\""),
                 (
@@ -144,7 +172,7 @@ mod tests {
         Ratchet {
             lint: "clippy::disallowed_types",
             expect_needle: "#[expect(clippy::disallowed_types",
-            baseline: 10,
+            baseline: 9,
             gate_wiring: &[
                 ("clippy.toml", "disallowed-types"),
                 ("clippy.toml", "tokio::runtime::Runtime"),

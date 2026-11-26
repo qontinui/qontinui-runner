@@ -264,6 +264,17 @@ export async function readWithOneRetry(
   return { ...second, attempts: 2, firstFailure: first };
 }
 
+/**
+ * The first attempt's failure, as a clause for the run's FINAL log line, or
+ * "" when the read was not retried. The retry warning is printed minutes
+ * before the verdict, so without this a read that failed twice reports only
+ * its second cause, and one that recovered reports nothing about the first.
+ */
+export function describeFirstFailure(read) {
+  if (!read?.firstFailure) return "";
+  return `; first attempt: ${describeReadFailure(read.firstFailure)}`;
+}
+
 /** One line naming why a read failed, for the retry warning. */
 export function describeReadFailure(read) {
   if (read?.error !== undefined) return read.error;
@@ -906,24 +917,26 @@ async function main(argv) {
     });
     readAt = new Date().toISOString();
     const attempts = `${read.attempts} attempt(s)`;
+    const firstCause = describeFirstFailure(read);
+    const last = firstCause ? "last attempt: " : "";
     if (read.error) {
       error(
-        `flakiness read UNKNOWN after ${attempts} — ${read.error}. Filing nothing: an unreadable ` +
-          `rail is not a clean one.`,
+        `flakiness read UNKNOWN after ${attempts} — ${last}${read.error}${firstCause}. Filing ` +
+          `nothing: an unreadable rail is not a clean one.`,
       );
       return 1;
     }
     verdict = classifyFlakinessResponse(read.body);
     info(
       `POST ${base}${FLAKINESS_PATH} (repo=${repo}) -> ${verdict.kind} in ${read.ms}ms ` +
-        `(${attempts}) ` +
+        `(${attempts}${firstCause}) ` +
         `(${verdict.reason}; ${Object.keys(verdict.priors).length} scored test(s), ` +
         `min_k=${verdict.minK ?? "?"}, window=${verdict.window ?? "?"})`,
     );
     if (verdict.kind === "failed") {
       error(
         `coord could not serve a flake history for ${repo} after ${read.ms}ms on the last of ` +
-          `${attempts} — ${verdict.reason}. ` +
+          `${attempts} — ${last}${verdict.reason}${firstCause}. ` +
           `Filing nothing: this is UNKNOWN, not "no flaky tests". A read that fails server-side ` +
           `is a coord-side condition (see the header of scripts/ci-flake-escalate.mjs, and plan ` +
           `2026-09-28-coord-test-flakiness-history-read-still-hits-the-statement-timeout in ` +

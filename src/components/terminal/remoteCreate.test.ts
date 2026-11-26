@@ -2,6 +2,8 @@ import { describe, it, expect } from "vitest";
 import {
   createButtonState,
   describeRemoteCreateFailure,
+  EMPTY_CREATE_NO_TENANT_REASON,
+  emptyCreateTargets,
   fleetDeviceCreateId,
   type RemoteCreateErrorWire,
 } from "./remoteCreate";
@@ -217,6 +219,21 @@ describe("describeRemoteCreateFailure", () => {
     expect(r.strandedTerminalId).toBeNull();
   });
 
+  /**
+   * A dispatch role closing the agent lane is neither the create dial nor a
+   * drain. The relay does not list the code by name yet, so it may arrive
+   * prefixed `target_said_`; both spellings name the role.
+   */
+  it("names a role-closed target under both relay spellings", () => {
+    for (const code of ["role_closes_agent_lane", "target_said_role_closes_agent_lane"]) {
+      const r = describeRemoteCreateFailure({ stage: "create", code, message: "refused" });
+      expect(r.headline, code).toMatch(/dispatch role closes the agent lane/);
+      const remedy = r.remedy.join("\n");
+      expect(remedy, code).toMatch(/Nothing was spawned/);
+      expect(remedy, code).toMatch(/not a drain/);
+    }
+  });
+
   it("keeps an unreadable drain state apart from a drained one", () => {
     const r = describeRemoteCreateFailure({
       stage: "create",
@@ -267,5 +284,56 @@ describe("createButtonState", () => {
 describe("fleetDeviceCreateId", () => {
   it("is per-device so two groups are not one control", () => {
     expect(fleetDeviceCreateId("a")).not.toBe(fleetDeviceCreateId("b"));
+  });
+});
+
+describe("emptyCreateTargets — a merged empty state never creates under an unchosen tenant", () => {
+  const A = "aaaaaaaa-0000-4000-8000-00000000000a";
+  const B = "bbbbbbbb-0000-4000-8000-00000000000b";
+  const short = (t: string) => t.slice(0, 8);
+
+  it("offers ONE create under the tenant a single-tenant read presented, as before", () => {
+    expect(
+      emptyCreateTargets({
+        merged: false,
+        singleTenant: A,
+        answeredTenants: [A],
+        shortTenant: short,
+      }),
+    ).toEqual({ targets: [{ tenant: A, tenantLabel: null }], disabledReason: null });
+    expect(
+      emptyCreateTargets({
+        merged: false,
+        singleTenant: null,
+        answeredTenants: [],
+        shortTenant: short,
+      }).targets,
+    ).toEqual([{ tenant: null, tenantLabel: null }]);
+  });
+
+  it("offers one create PER answered tenant in a merged read, each naming its tenant", () => {
+    const out = emptyCreateTargets({
+      merged: true,
+      singleTenant: A,
+      answeredTenants: [A, B, A],
+      shortTenant: short,
+    });
+    expect(out.targets).toEqual([
+      { tenant: A, tenantLabel: "aaaaaaaa" },
+      { tenant: B, tenantLabel: "bbbbbbbb" },
+    ]);
+    expect(out.disabledReason).toBeNull();
+  });
+
+  it("never sends null in a merged read — an unnamed or absent tenant is skipped, then disabled with a reason", () => {
+    const out = emptyCreateTargets({
+      merged: true,
+      singleTenant: null,
+      answeredTenants: [null, "  "],
+      shortTenant: short,
+    });
+    expect(out.targets).toEqual([]);
+    expect(out.disabledReason).toBe(EMPTY_CREATE_NO_TENANT_REASON);
+    expect(out.disabledReason).toMatch(/^choose a tenant to create in/);
   });
 });

@@ -97,3 +97,58 @@ describe("SessionInfoDropdown addressability across mount sites", () => {
     expect(ZONE_CELL).toContain("{!showCompactCard && showLabels && (");
   });
 });
+
+/**
+ * The tenant badge renders wherever the dropdown renders (plan
+ * `2026-11-08-tenant-badge-parity-and-oracle-fixtures` D2), under the SAME
+ * zone's id (D1): a mount file whose badge is missing, or keyed off a
+ * different zone expression than its dropdown, either hides the tenant in one
+ * layout or registers a badge id against the wrong zone.
+ */
+describe("TenantBadge mount sites mirror the SessionInfoDropdown mount sites", () => {
+  /** The `zoneIndex={…}` expression of every `<Tag …>` mount, in source order. */
+  function zoneExprs(source: string, tag: string): string[] {
+    const re = new RegExp(`<${tag}\\b[^>]*?\\bzoneIndex=\\{([^}]+)\\}`, "g");
+    return [...source.matchAll(re)].map((m) => m[1]);
+  }
+
+  const SITES: [string, string][] = [
+    ["ZoneLabel.tsx", ZONE_LABEL],
+    ["MaximizedHeader.tsx", MAXIMIZED_HEADER],
+    ["ZoneCell.tsx", ZONE_CELL],
+    ["CompactZoneCard.tsx", COMPACT],
+  ];
+
+  it.each(SITES)("%s mounts <TenantBadge with its dropdown's zone expression", (_file, source) => {
+    const dropdownZones = zoneExprs(source, "SessionInfoDropdown");
+    expect(dropdownZones.length).toBeGreaterThan(0);
+    expect(source).toContain("<TenantBadge");
+    expect(zoneExprs(source, "TenantBadge")).toEqual(dropdownZones);
+  });
+
+  it("every <TenantBadge mount passes a zoneIndex (no shared id can come back)", () => {
+    for (const [, source] of SITES) {
+      const mounts = source.match(/<TenantBadge\b/g) ?? [];
+      expect(zoneExprs(source, "TenantBadge")).toHaveLength(mounts.length);
+    }
+  });
+});
+
+/**
+ * `ZoneCell` is memoized per tab and must stay context-free: the tenant
+ * switcher flag reaches it as the `tenantSwitcherShown` prop (plan
+ * `2026-11-08-tenant-badge-parity-and-oracle-fixtures` D2). A context read in
+ * the cell would re-render every zone on each tenant-context change.
+ */
+describe("ZoneCell stays context-free for the tenant flag", () => {
+  it("reads neither useTenant nor TenantContext", () => {
+    // Code lines only: the prop's docstring names `useTenant()` to say why not.
+    const code = ZONE_CELL.split("\n")
+      .filter((line) => !/^\s*(\*|\/\/|\/\*)/.test(line))
+      .join("\n");
+    expect(code).not.toMatch(/\buseTenant\s*\(/);
+    expect(code).not.toMatch(/\bTenantContext\b/);
+    expect(code).not.toMatch(/\buseContext\s*\(/);
+    expect(ZONE_CELL).toContain("tenantSwitcherShown");
+  });
+});

@@ -10,11 +10,11 @@
 //!
 //! Two callers read the verdict, and they are not the same:
 //! `GET /restart-readiness` REPORTS it, whatever the drain state; the Phase 4
-//! wind-down executor (`session::wind_down_executor`) ACTS on it, and only
-//! while coord holds this device drained. Since that phase landed, an
-//! [`Eligibility::Eligible`] on a drained runner is a session that will be
-//! graceful-`/exit`ed — so read the rules below as the authorisation they are,
-//! not as a report.
+//! wind-down executor (`session::wind_down_executor`) ACTS on it. Its drain
+//! arm closes any `Eligible` session while coord holds this device drained;
+//! its `finished_close` arm closes an `Eligible` TERMINAL session on any tick,
+//! drained or not, once [`custody_gate`] also answers `Clean`. So read the
+//! rules below as the authorisation they are, not as a report.
 //!
 //! ## The rules (D4, D6)
 //!
@@ -45,6 +45,21 @@
 //!    declaration was made; before that, [`Eligibility::NotYet`] with the
 //!    instant it would become eligible. When coord serves no transition time
 //!    the declaration does not bound the window.
+//!
+//! ## The custody gate is a SECOND verdict, not a sixth input
+//!
+//! Since plan `2026-10-03-finished-runner-sessions-close-their-window-without-a-drain`
+//! the executor has a second arm, `finished_close`, that closes finished
+//! terminal sessions on every tick, drained or not. Outside a drain a session
+//! may have declared itself finished while still holding uncommitted or
+//! unpushed work, so that arm additionally requires [`custody_gate`] to answer
+//! [`CustodyVerdict::Clean`] for every worktree the session touched (D2).
+//!
+//! It is deliberately NOT folded into [`eligibility`] (D2a): `GET
+//! /restart-readiness` evaluates `eligibility` for every session on every Stop
+//! turn under a 2 s client timeout, and the custody inputs need git probes.
+//! The executor gathers them only for sessions `eligibility` already rated
+//! `Eligible`, and the drain arm's verdict stays exactly what it was.
 //!
 //! ## A sideband that never reported is not an unknown
 //!
@@ -205,8 +220,10 @@ impl UnknownReason {
     }
 }
 
-/// The verdict. Only [`Eligibility::Eligible`] authorises a close, and since
-/// Phase 4 the wind-down executor acts on exactly that — while drained.
+/// The verdict. Only [`Eligibility::Eligible`] authorises a close: the
+/// executor's drain arm acts on exactly that while drained, and its
+/// `finished_close` arm acts on it for terminal sessions whose custody is
+/// also [`CustodyVerdict::Clean`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Eligibility {
     /// Every condition has held since `since_ms`, for at least the grace
@@ -332,6 +349,61 @@ pub struct WindDownView {
     /// Why, for `ineligible` and `unknown`.
     pub reason: Option<&'static str>,
     pub kind: SessionKind,
+    /// The `finished_close` arm's custody verdict for this session, from the
+    /// arm's most recent pass — present ONLY when that arm ran on it. Absent
+    /// is "the arm did not judge this session", never "clean".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custody: Option<CustodyView>,
+    /// The `finished_close` arm's obligations verdict (the REMOTE half of
+    /// `closeable`) for this session, from the arm's most recent pass. Present
+    /// ONLY when that arm read coord for it — which it does only for a session
+    /// whose custody was already clean. Absent is "not judged", never
+    /// "watched".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub obligations: Option<ObligationsView>,
+    /// The `finished_close` arm's close guard for this session, from the arm's
+    /// most recent close batch (plan
+    /// `2026-11-16-finished-close-mints-its-close-authority-from-the-served-close-conditions`,
+    /// Phase 1). Present ONLY when the guard judged the session; absent is
+    /// "not judged", never "would close".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub close_guard: Option<CloseGuardView>,
+    /// coord's finish time for the session (unix ms) as the pass that built
+    /// this view read it — the stamp the close guard's revival arm judges
+    /// against. Not served: `sessionStatusSince` already carries it.
+    #[serde(skip)]
+    pub finished_at_ms: Option<i64>,
+}
+
+/// One input of the close guard, as `windDown.closeGuard.arms[]` serves it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloseGuardArmView {
+    /// `eligibility` | `custody` | `obligations` | `first_verdict` | `revival`
+    /// | `undelivered_messages`.
+    pub arm: &'static str,
+    /// `ok` | `held` | `unknown`.
+    pub verdict: &'static str,
+    /// The reason code, for `held` and `unknown`.
+    pub reason: Option<&'static str>,
+    /// What was found.
+    pub detail: Option<String>,
+}
+
+/// The close guard's verdict for one session — `windDown.closeGuard`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloseGuardView {
+    /// `would_mint` | `held` | `unknown`.
+    pub verdict: &'static str,
+    /// The input that decided a `held` or `unknown` verdict.
+    pub decided_by: Option<&'static str>,
+    /// Its reason code.
+    pub reason: Option<&'static str>,
+    /// Every input, in the order the guard evaluates them.
+    pub arms: Vec<CloseGuardArmView>,
+    /// When the guard judged it (unix millis).
+    pub judged_at: i64,
 }
 
 impl WindDownView {
@@ -348,11 +420,756 @@ impl WindDownView {
             until,
             reason,
             kind,
+            custody: None,
+            obligations: None,
+            close_guard: None,
+            finished_at_ms: None,
         }
     }
 
     pub fn is_eligible(&self) -> bool {
         self.eligibility == "eligible"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The custody gate (plan
+// `2026-10-03-finished-runner-sessions-close-their-window-without-a-drain`,
+// D2a and D2c)
+// ---------------------------------------------------------------------------
+
+/// The custody-slot `wip_state` values that mean the session's own record says
+/// its work was NOT left clean: snapshotted (`captured`), not snapshotted yet
+/// (`deferred`), a snapshot attempt that failed (`stash_create_failed`), or a
+/// record the hook could not make consistent (`inconsistent`). A cross-check
+/// only — the git probes are the source.
+pub const DIRTY_WIP_STATES: [&str; 4] = [
+    "captured",
+    "deferred",
+    "stash_create_failed",
+    "inconsistent",
+];
+
+/// What probing ONE worktree found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemberState {
+    /// `.git` is a directory: a primary checkout, whose working tree mixes
+    /// peers' state, so its cleanliness is not this session's to judge.
+    PrimaryCheckout,
+    /// A linked worktree whose probes all answered.
+    Probed {
+        /// `git status --porcelain` printed anything, untracked files included.
+        dirty: bool,
+        /// Commits reachable from `HEAD` that are not pushed. With an upstream:
+        /// `rev-list --count @{upstream}..HEAD`. With none (including a
+        /// detached `HEAD`): `rev-list --count HEAD --not --remotes` — commits
+        /// on NO remote-tracking ref. So a freshly allocated worktree that made
+        /// no commits, sitting on `origin/main`'s commit with no upstream, is
+        /// `0`: nothing of its own exists to lose.
+        ahead: u64,
+    },
+    /// A probe could not be completed — it failed, timed out, or the path is
+    /// not a worktree at all.
+    ProbeFailed(String),
+    /// A LIVE ledger row whose path exists under none of the worktree roots it
+    /// was resolved against, every one of those roots being readable. Not
+    /// "reaped": a WIP custody ref snapshots tracked changes only, so a tree
+    /// that vanished may have taken untracked work with it. UNKNOWN, with the
+    /// roots named so an operator can act.
+    AbsentFromEveryRoot { roots_tried: Vec<String> },
+}
+
+/// How one coord ledger `worktree_path` was resolved to a place on disk
+/// (plan `2026-11-22-wind-down-custody-probe-and-undelivered-guard-read-unknown-where-they-can-decide`,
+/// Phase 5). Serialised into `windDown.custody.worktrees` so an operator reads
+/// WHERE the probe looked, not only that it failed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeResolution {
+    /// The ledger string exactly as coord served it.
+    pub ledger_path: String,
+    /// The worktree roots the path was resolved against, in order. Empty for
+    /// an absolute ledger path (nothing to resolve).
+    pub roots_tried: Vec<String>,
+    /// The candidate paths that exist: one is `found`, two is `ambiguous`.
+    pub resolved: Vec<String>,
+    /// `absolute` | `found` | `ambiguous` | `absent_from_every_root` |
+    /// `reaped_retired` | `root_unreadable` | `probe_error`.
+    pub outcome: &'static str,
+}
+
+/// One worktree the session touched, as probed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustodyMember {
+    pub path: String,
+    pub state: MemberState,
+    /// `wip_state` of THIS session's own custody slot in that worktree
+    /// (`qontinui-custody.d/<id>.json` with a matching `session_id` — never
+    /// the mirror, which may name a peer). `None` when no such slot exists.
+    pub slot_wip_state: Option<String>,
+}
+
+/// Everything [`custody_gate`] reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustodyInputs {
+    /// The session's directory (its lifecycle record's `working_dir`, else
+    /// the process cwd). `None` when neither is known.
+    pub session_dir: Option<String>,
+    /// Whether the worktrees attributed to the session could be read. `Err`
+    /// carries why not.
+    pub ownership: Result<(), String>,
+    /// Every distinct worktree in the session's set: the repo holding its
+    /// directory (absent when the directory is in no repo, e.g. the workspace
+    /// root), its coord-attributed worktrees, and its isolated-edit context's
+    /// materialized worktrees.
+    pub members: Vec<CustodyMember>,
+    /// Every worktree path the gather COVERED: each attributed path it was
+    /// handed (a reaped one included, since the gather positively saw it
+    /// gone), each isolated-edit worktree, and each member root it probed. The
+    /// obligations cross-check reads it: a worktree coord's obligations read
+    /// attributes to the session that is not covered here was never probed,
+    /// so its state is UNKNOWN (see `ObligationsUnknown::WorktreeNotProbed`).
+    /// Empty when the gather stopped before probing anything.
+    pub covered: Vec<String>,
+    /// How each coord ledger path was resolved (empty when the gather stopped
+    /// before resolving anything). Reporting only: the verdict never reads it.
+    pub resolutions: Vec<WorktreeResolution>,
+}
+
+/// Why custody rules a session out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CustodyDirty {
+    /// A member is a primary checkout.
+    SharedCheckout { path: String },
+    /// A member has uncommitted changes or untracked files.
+    Uncommitted { path: String },
+    /// A member has commits its upstream does not — or, with no upstream,
+    /// commits that are on no remote-tracking ref at all.
+    Unpushed { path: String, ahead: u64 },
+    /// The session's own custody slot says its work was not left clean.
+    WipSlot { path: String, wip_state: String },
+}
+
+/// Which custody input could not be determined.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CustodyUnknown {
+    /// No directory is known for the session.
+    NoSessionDir,
+    /// The attributed-worktree read failed.
+    OwnershipUnreadable { detail: String },
+    /// A member's probe failed or timed out.
+    ProbeFailed { path: String, detail: String },
+    /// A live ledger row exists under none of the (readable) worktree roots.
+    WorktreeAbsentFromEveryRoot {
+        path: String,
+        roots_tried: Vec<String>,
+    },
+}
+
+/// The custody verdict. Only [`CustodyVerdict::Clean`] lets the
+/// `finished_close` arm close a session; `Dirty` and `Unknown` never do —
+/// served policy `verification-and-evidence`
+/// `unknown-must-not-render-as-a-default`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CustodyVerdict {
+    Clean,
+    Dirty(CustodyDirty),
+    Unknown(CustodyUnknown),
+}
+
+impl CustodyDirty {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::SharedCheckout { .. } => "shared_checkout",
+            Self::Uncommitted { .. } => "uncommitted",
+            Self::Unpushed { .. } => "unpushed",
+            Self::WipSlot { .. } => "wip_slot",
+        }
+    }
+
+    /// One human-readable line naming the worktree and what was found.
+    pub fn detail(&self) -> String {
+        match self {
+            Self::SharedCheckout { path } => format!("{path} is a primary checkout"),
+            Self::Uncommitted { path } => {
+                format!("{path} has uncommitted changes or untracked files")
+            }
+            Self::Unpushed { path, ahead } => {
+                format!("{path} has {ahead} commit(s) that are not pushed")
+            }
+            Self::WipSlot { path, wip_state } => {
+                format!("this session's custody slot in {path} reads wip_state={wip_state}")
+            }
+        }
+    }
+}
+
+impl CustodyUnknown {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::NoSessionDir => "no_session_dir",
+            Self::OwnershipUnreadable { .. } => "ownership_unreadable",
+            Self::ProbeFailed { .. } => "probe_failed",
+            Self::WorktreeAbsentFromEveryRoot { .. } => "worktree_absent_from_every_root",
+        }
+    }
+
+    /// One human-readable line naming what could not be read.
+    pub fn detail(&self) -> String {
+        match self {
+            Self::NoSessionDir => {
+                "neither the lifecycle record nor the process names a directory".to_string()
+            }
+            Self::OwnershipUnreadable { detail } => {
+                format!("the session's attributed worktrees could not be read: {detail}")
+            }
+            Self::ProbeFailed { path, detail } => format!("{path}: {detail}"),
+            Self::WorktreeAbsentFromEveryRoot { path, roots_tried } if roots_tried.is_empty() => {
+                format!(
+                    "{path} is a live ledger row with an absolute path that does not exist; \
+                     it is not treated as reaped, because untracked work in a vanished tree \
+                     is not preserved"
+                )
+            }
+            Self::WorktreeAbsentFromEveryRoot { path, roots_tried } => format!(
+                "{path} is a live ledger row but exists under none of the worktree roots tried \
+                 ({}); it is not treated as reaped, because untracked work in a vanished tree \
+                 is not preserved",
+                roots_tried.join(", ")
+            ),
+        }
+    }
+}
+
+impl CustodyVerdict {
+    pub fn is_clean(&self) -> bool {
+        matches!(self, Self::Clean)
+    }
+
+    /// The wire word: `clean` | `dirty` | `unknown`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Clean => "clean",
+            Self::Dirty(_) => "dirty",
+            Self::Unknown(_) => "unknown",
+        }
+    }
+
+    /// The reason code, for `dirty` and `unknown`.
+    pub fn reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Clean => None,
+            Self::Dirty(d) => Some(d.as_str()),
+            Self::Unknown(u) => Some(u.as_str()),
+        }
+    }
+
+    /// The human-readable detail, for `dirty` and `unknown`.
+    pub fn detail(&self) -> Option<String> {
+        match self {
+            Self::Clean => None,
+            Self::Dirty(d) => Some(d.detail()),
+            Self::Unknown(u) => Some(u.detail()),
+        }
+    }
+}
+
+/// Decide custody. Pure.
+///
+/// Evaluated in this fixed order:
+///
+/// 1. **No session directory → `Unknown`.** Without it the session's own
+///    repo cannot even be named.
+/// 2. **An unreadable ownership read → `Unknown`.** The attributed worktrees
+///    are the part of the set the directory cannot reveal.
+/// 3. **Any member that is definitely not clean → `Dirty`**, in member
+///    order: a primary checkout, then uncommitted changes, the session's own
+///    custody slot, and unpushed commits. Dirty outranks a sibling's unknown
+///    because it is the more useful thing to report, and neither closes.
+/// 4. **Any member that could not be judged → `Unknown`**: a probe that
+///    failed or timed out. A branch with no upstream is NOT one — the probe
+///    then counts the commits on no remote-tracking ref (see
+///    [`MemberState::Probed::ahead`]), which is a definite answer.
+/// 5. Otherwise **`Clean`** — including a session with NO members at all,
+///    which is a session sitting outside any repo (the workspace root) that
+///    no worktree is attributed to.
+pub fn custody_gate(inputs: &CustodyInputs) -> CustodyVerdict {
+    if inputs.session_dir.is_none() {
+        return CustodyVerdict::Unknown(CustodyUnknown::NoSessionDir);
+    }
+    if let Err(detail) = &inputs.ownership {
+        return CustodyVerdict::Unknown(CustodyUnknown::OwnershipUnreadable {
+            detail: detail.clone(),
+        });
+    }
+    for member in &inputs.members {
+        let path = member.path.clone();
+        match &member.state {
+            MemberState::PrimaryCheckout => {
+                return CustodyVerdict::Dirty(CustodyDirty::SharedCheckout { path })
+            }
+            MemberState::Probed { dirty: true, .. } => {
+                return CustodyVerdict::Dirty(CustodyDirty::Uncommitted { path })
+            }
+            MemberState::Probed { .. }
+            | MemberState::ProbeFailed(_)
+            | MemberState::AbsentFromEveryRoot { .. } => {}
+        }
+        if let Some(state) = member
+            .slot_wip_state
+            .as_deref()
+            .filter(|s| DIRTY_WIP_STATES.contains(s))
+        {
+            return CustodyVerdict::Dirty(CustodyDirty::WipSlot {
+                path,
+                wip_state: state.to_string(),
+            });
+        }
+        if let MemberState::Probed { ahead, .. } = member.state {
+            if ahead > 0 {
+                return CustodyVerdict::Dirty(CustodyDirty::Unpushed { path, ahead });
+            }
+        }
+    }
+    for member in &inputs.members {
+        match &member.state {
+            MemberState::ProbeFailed(detail) => {
+                return CustodyVerdict::Unknown(CustodyUnknown::ProbeFailed {
+                    path: member.path.clone(),
+                    detail: detail.clone(),
+                })
+            }
+            MemberState::AbsentFromEveryRoot { roots_tried } => {
+                return CustodyVerdict::Unknown(CustodyUnknown::WorktreeAbsentFromEveryRoot {
+                    path: member.path.clone(),
+                    roots_tried: roots_tried.clone(),
+                })
+            }
+            MemberState::Probed { .. } | MemberState::PrimaryCheckout => {}
+        }
+    }
+    CustodyVerdict::Clean
+}
+
+/// The `windDown.custody` block `GET /restart-readiness` attaches when the
+/// `finished_close` arm judged a session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustodyView {
+    /// `clean` | `dirty` | `unknown`.
+    pub verdict: &'static str,
+    /// The reason code, for `dirty` and `unknown`.
+    pub reason: Option<&'static str>,
+    /// What was found, naming the worktree.
+    pub detail: Option<String>,
+    /// When the arm judged it (unix millis).
+    pub judged_at: i64,
+    /// How each coord ledger path was resolved: the roots tried and the paths
+    /// that exist. Omitted when the pass resolved no ledger path.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub worktrees: Vec<WorktreeResolution>,
+}
+
+impl CustodyView {
+    pub fn from_verdict(verdict: &CustodyVerdict, judged_at_ms: i64) -> Self {
+        Self {
+            verdict: verdict.as_str(),
+            reason: verdict.reason(),
+            detail: verdict.detail(),
+            judged_at: judged_at_ms,
+            worktrees: Vec::new(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The obligations gate — the REMOTE half of `closeable` (plan
+// `2026-10-18-a-finished-session-is-safe-to-close-when-nothing-lives-only-in-it-and-coord-owns-whether-its-watchers-work`,
+// D1/D2 and Phase 6)
+// ---------------------------------------------------------------------------
+
+/// The verdict words of coord's `coord_session_obligations` read that let a
+/// session close. `landed` and `watched` are the two the plan names; `retired`
+/// is coord's word for a gate that reached a terminal state "leaving nothing
+/// owed on it" (a cleared gate whose continuation reported `work_completed`, a
+/// withdrawn gate whose object is still held) — nothing is owed, so nothing
+/// lives only in the session. Leaving it out would make every session that ever
+/// had a gate clear read Unknown, and the arm would close nothing.
+/// `scripts/session-closeable.sh` passes `retired` as well, so the two agree
+/// on that word.
+pub const WATCHED_OBLIGATION_VERDICTS: [&str; 3] = ["landed", "watched", "retired"];
+
+/// The source blocks of coord's obligations read whose items ALL carry a
+/// verdict. Each must be present, read, and free of a verdict-less item: a body
+/// that omits one has not said the session owes nothing there.
+pub const VERDICT_SOURCES: [&str; 2] = ["prs", "gates"];
+
+/// A tracked obligation coord says nothing watches (`not_watched`) — work the
+/// session owes that would be lost if it closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObligationsUnwatched {
+    /// The coord source block the item came from (`prs`, `gates`, …).
+    pub source: String,
+    /// The item, as coord served it, compactly rendered.
+    pub item: String,
+    /// The reasons coord gave, joined; empty when it gave none.
+    pub reasons: String,
+}
+
+/// Which obligations input could not be determined.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObligationsUnknown {
+    /// The read itself failed — no coord base, transport error, timeout,
+    /// non-2xx, or an undecodable body.
+    Unreadable { detail: String },
+    /// The answer is not the shape coord's read serves.
+    Malformed { detail: String },
+    /// `all_tracked_sources_read` was not `true`: a source was degraded or
+    /// truncated, and its list is "NOT evidence of absence" (coord's own
+    /// words).
+    SourcesNotRead { reported: String },
+    /// `session_proven_in_tenant` was not `true`: no tenant-scoped source puts
+    /// this session in the tenant the read ran as, so an empty answer is the
+    /// absence of a session, not of obligations. This is what a read made with
+    /// the wrong tenant's credential looks like.
+    SessionNotProven { reported: String },
+    /// A source block with `items` whose `coverage` is not `read`.
+    SourceNotRead { source: String, coverage: String },
+    /// An item whose verdict is `unknown`, a word this gate does not know, or
+    /// a `not_watched` whose attribution to this session is `uncertain`.
+    ItemUnknown {
+        source: String,
+        item: String,
+        verdict: String,
+        uncertain: bool,
+    },
+    /// A worktree coord attributes to the session (its `worktrees` block)
+    /// that the custody gate did not cover: no probe looked at it, so whether
+    /// it holds unpushed or uncommitted work is UNKNOWN. A `worktree_path`
+    /// coord served as null is the same, spelled `<absent>`.
+    WorktreeNotProbed { worktree: String },
+    /// Not read on this pass: the pass's obligations-read budget was spent
+    /// (`OBLIGATIONS_READS_PER_PASS` in the executor). UNKNOWN, never watched.
+    Deferred { detail: String },
+}
+
+/// The obligations verdict. Only [`ObligationsVerdict::Watched`] lets the
+/// `finished_close` arm close a session; `Unwatched` and `Unknown` never do —
+/// served policy `verification-and-evidence` `unknown-must-not-render-as-a-default`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObligationsVerdict {
+    /// Every tracked item that carries a verdict reads [`WATCHED_OBLIGATION_VERDICTS`]
+    /// and every tracked source was read. `judged` counts the items judged.
+    Watched {
+        judged: usize,
+    },
+    Unwatched(ObligationsUnwatched),
+    Unknown(ObligationsUnknown),
+}
+
+impl ObligationsUnknown {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Unreadable { .. } => "obligations_unreadable",
+            Self::Malformed { .. } => "malformed",
+            Self::SourcesNotRead { .. } => "sources_not_read",
+            Self::SessionNotProven { .. } => "session_not_proven",
+            Self::SourceNotRead { .. } => "source_not_read",
+            Self::ItemUnknown { .. } => "item_unknown",
+            Self::WorktreeNotProbed { .. } => "worktree_not_probed",
+            Self::Deferred { .. } => "obligations_deferred",
+        }
+    }
+
+    pub fn detail(&self) -> String {
+        match self {
+            Self::Unreadable { detail } => {
+                format!("coord's obligations read could not be completed: {detail}")
+            }
+            Self::Malformed { detail } => {
+                format!("coord's obligations answer is not the expected shape: {detail}")
+            }
+            Self::SourcesNotRead { reported } => format!(
+                "all_tracked_sources_read is {reported}: a degraded or truncated source is not \
+                 evidence of absence"
+            ),
+            Self::SessionNotProven { reported } => format!(
+                "session_proven_in_tenant is {reported}: coord cannot place this session in the \
+                 tenant the read ran as, so an empty answer proves nothing"
+            ),
+            Self::SourceNotRead { source, coverage } => {
+                format!("source `{source}` has coverage `{coverage}`, not `read`")
+            }
+            Self::ItemUnknown {
+                source,
+                item,
+                verdict,
+                uncertain,
+            } => {
+                let uncertain = if *uncertain {
+                    " (attribution uncertain: coord cannot say it is this session's)"
+                } else {
+                    ""
+                };
+                format!("{source} item {item} reads `{verdict}`, which is not a watched verdict{uncertain}")
+            }
+            Self::WorktreeNotProbed { worktree } => format!(
+                "coord attributes worktree {worktree} to the session, but the custody gate never probed it, so its state is unknown"
+            ),
+            Self::Deferred { detail } => format!("not read this pass: {detail}"),
+        }
+    }
+}
+
+impl ObligationsVerdict {
+    pub fn is_watched(&self) -> bool {
+        matches!(self, Self::Watched { .. })
+    }
+
+    /// The wire word: `watched` | `unwatched` | `unknown`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Watched { .. } => "watched",
+            Self::Unwatched(_) => "unwatched",
+            Self::Unknown(_) => "unknown",
+        }
+    }
+
+    /// The reason code, for `unwatched` and `unknown`.
+    pub fn reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Watched { .. } => None,
+            Self::Unwatched(_) => Some("not_watched"),
+            Self::Unknown(u) => Some(u.as_str()),
+        }
+    }
+
+    /// The human-readable detail, for `unwatched` and `unknown`.
+    pub fn detail(&self) -> Option<String> {
+        match self {
+            Self::Watched { .. } => None,
+            Self::Unwatched(u) => Some(if u.reasons.is_empty() {
+                format!("{} item {} reads `not_watched`", u.source, u.item)
+            } else {
+                format!(
+                    "{} item {} reads `not_watched`: {}",
+                    u.source, u.item, u.reasons
+                )
+            }),
+            Self::Unknown(u) => Some(u.detail()),
+        }
+    }
+
+    /// An `Unknown` for a read that failed — the single spelling every
+    /// transport failure takes, so none can be mistaken for an answer.
+    pub fn unreadable(detail: impl Into<String>) -> Self {
+        Self::Unknown(ObligationsUnknown::Unreadable {
+            detail: detail.into(),
+        })
+    }
+}
+
+/// Decide whether every obligation coord attributes to a session is watched.
+/// Pure over the decoded body of `coord_session_obligations` (or its HTTP twin
+/// `GET /coord/overlord/session-obligations/:id`). It accepts the same passing
+/// words as `scripts/session-closeable.sh`'s coord judge. The two differ on one
+/// case: a non-passing item whose `attribution` is `uncertain` is Unknown here,
+/// while the script notes some such items without letting them move its
+/// verdict. This gate is the stricter of the two.
+///
+/// Evaluated in this order:
+///
+/// 1. **A failed read → `Unknown`.** Never a default: a timeout is not "no
+///    obligations".
+/// 2. **A body that is not an object → `Unknown`.**
+/// 3. **`all_tracked_sources_read` anything but `true` → `Unknown`.**
+/// 4. **`session_proven_in_tenant` anything but `true` → `Unknown`.** The
+///    runner reads as its default tenant's credential; a session of another
+///    tenant answers with every list empty, which must not read as "owes
+///    nothing".
+/// 5. **Every source block that carries an `items` list** (`prs`, `gates`,
+///    `worktrees`, `work_units`, `findings`, …): its `coverage` must be `read`,
+///    except that an EMPTY block coord declares `not_tracked`
+///    (`spawned_followup` — coord holds no store for it, and it is outside
+///    `all_tracked_sources_read`) says nothing and is skipped. Anything else is
+///    `Unknown`. Items with no `verdict` (worktrees, work units, findings carry
+///    none) are not judged here; the worktree half is the custody gate's.
+/// 6. **An item whose verdict is `not_watched` → `Unwatched`**, unless coord
+///    marks its attribution `uncertain` (then `Unknown`: it may be a peer's).
+///    Any other non-watched word, including `unknown`, is `Unknown`.
+///    `Unwatched` outranks `Unknown`, as `Dirty` outranks `Unknown` in
+///    [`custody_gate`]; neither closes.
+/// 7. **`prs` and `gates` must each be present with `coverage: read`**, and an
+///    item in either with no verdict is `Unknown`; a body that omits them is
+///    `Unknown` however clean the rest looks.
+/// 8. **No source block read at all → `Unknown`**: an answer with nothing in it
+///    is not evidence of an empty session.
+pub fn obligations_gate(read: &Result<serde_json::Value, String>) -> ObligationsVerdict {
+    use serde_json::Value;
+    let doc = match read {
+        Ok(doc) => doc,
+        Err(detail) => return ObligationsVerdict::unreadable(detail.clone()),
+    };
+    let Some(root) = doc.as_object() else {
+        return ObligationsVerdict::Unknown(ObligationsUnknown::Malformed {
+            detail: "the body is not a JSON object".to_string(),
+        });
+    };
+    if root.get("all_tracked_sources_read") != Some(&Value::Bool(true)) {
+        let reported = root
+            .get("all_tracked_sources_read")
+            .map_or_else(|| "absent".to_string(), Value::to_string);
+        return ObligationsVerdict::Unknown(ObligationsUnknown::SourcesNotRead { reported });
+    }
+    if root.get("session_proven_in_tenant") != Some(&Value::Bool(true)) {
+        let reported = root
+            .get("session_proven_in_tenant")
+            .map_or_else(|| "absent".to_string(), Value::to_string);
+        return ObligationsVerdict::Unknown(ObligationsUnknown::SessionNotProven { reported });
+    }
+    let mut judged = 0usize;
+    let mut blocks_read = 0usize;
+    let mut verdict_sources_read = 0usize;
+    let mut unwatched: Option<ObligationsUnwatched> = None;
+    let mut unknown: Option<ObligationsUnknown> = None;
+    for (source, block) in root {
+        let Some(block) = block.as_object() else {
+            continue;
+        };
+        let coverage = block.get("coverage").and_then(Value::as_str);
+        let Some(items) = block.get("items").and_then(Value::as_array) else {
+            if block.contains_key("coverage") {
+                unknown.get_or_insert(ObligationsUnknown::SourceNotRead {
+                    source: source.clone(),
+                    coverage: coverage.unwrap_or("?").to_string(),
+                });
+            }
+            continue;
+        };
+        match coverage {
+            Some("read") => blocks_read += 1,
+            Some("not_tracked") if items.is_empty() => continue,
+            other => {
+                unknown.get_or_insert(ObligationsUnknown::SourceNotRead {
+                    source: source.clone(),
+                    coverage: other.unwrap_or("?").to_string(),
+                });
+                continue;
+            }
+        }
+        if VERDICT_SOURCES.contains(&source.as_str()) {
+            verdict_sources_read += 1;
+        }
+        for entry in items {
+            let Some(verdict) = entry.get("verdict") else {
+                // `prs` and `gates` items always carry one; elsewhere
+                // (worktrees, work units, findings) none is expected.
+                if VERDICT_SOURCES.contains(&source.as_str()) {
+                    unknown.get_or_insert(ObligationsUnknown::ItemUnknown {
+                        source: source.clone(),
+                        item: entry.to_string().chars().take(200).collect(),
+                        verdict: "<absent>".to_string(),
+                        uncertain: false,
+                    });
+                }
+                continue;
+            };
+            judged += 1;
+            let word = verdict.as_str();
+            if word.is_some_and(|w| WATCHED_OBLIGATION_VERDICTS.contains(&w)) {
+                continue;
+            }
+            let item = entry
+                .get("item")
+                .map_or_else(|| "-".to_string(), Value::to_string);
+            let uncertain = entry.get("attribution").and_then(Value::as_str) == Some("uncertain");
+            if word == Some("not_watched") && !uncertain {
+                let reasons = match entry.get("reasons") {
+                    Some(Value::Array(rs)) => rs
+                        .iter()
+                        .map(|r| r.as_str().map_or_else(|| r.to_string(), str::to_string))
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                    Some(Value::String(r)) => r.clone(),
+                    _ => String::new(),
+                };
+                unwatched.get_or_insert(ObligationsUnwatched {
+                    source: source.clone(),
+                    item,
+                    reasons: reasons.chars().take(300).collect(),
+                });
+            } else {
+                unknown.get_or_insert(ObligationsUnknown::ItemUnknown {
+                    source: source.clone(),
+                    item,
+                    verdict: word.map_or_else(|| verdict.to_string(), str::to_string),
+                    uncertain,
+                });
+            }
+        }
+    }
+    if let Some(u) = unwatched {
+        return ObligationsVerdict::Unwatched(u);
+    }
+    if let Some(u) = unknown {
+        return ObligationsVerdict::Unknown(u);
+    }
+    if blocks_read == 0 {
+        return ObligationsVerdict::Unknown(ObligationsUnknown::Malformed {
+            detail: "all_tracked_sources_read is true but no source block with items was read"
+                .to_string(),
+        });
+    }
+    if verdict_sources_read != VERDICT_SOURCES.len() {
+        let missing: Vec<&str> = VERDICT_SOURCES
+            .iter()
+            .copied()
+            .filter(|name| {
+                root.get(*name)
+                    .and_then(|b| b.get("coverage"))
+                    .and_then(Value::as_str)
+                    != Some("read")
+            })
+            .collect();
+        return ObligationsVerdict::Unknown(ObligationsUnknown::Malformed {
+            detail: format!(
+                "the source block(s) {} are absent or not read, so the answer says nothing about them",
+                missing.join(", ")
+            ),
+        });
+    }
+    ObligationsVerdict::Watched { judged }
+}
+
+/// The `windDown.obligations` block `GET /restart-readiness` attaches when the
+/// `finished_close` arm read a session's obligations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ObligationsView {
+    /// `watched` | `unwatched` | `unknown`.
+    pub verdict: &'static str,
+    /// The reason code, for `unwatched` and `unknown`.
+    pub reason: Option<&'static str>,
+    /// What was found, naming the item.
+    pub detail: Option<String>,
+    /// How many verdict-carrying items a `watched` verdict rests on.
+    pub items_judged: Option<usize>,
+    /// When the arm judged it (unix millis).
+    pub judged_at: i64,
+}
+
+impl ObligationsView {
+    pub fn from_verdict(verdict: &ObligationsVerdict, judged_at_ms: i64) -> Self {
+        Self {
+            verdict: verdict.as_str(),
+            reason: verdict.reason(),
+            detail: verdict.detail(),
+            items_judged: match verdict {
+                ObligationsVerdict::Watched { judged } => Some(*judged),
+                _ => None,
+            },
+            judged_at: judged_at_ms,
+        }
     }
 }
 
@@ -843,6 +1660,216 @@ mod tests {
         );
     }
 
+    // ---- the custody gate (D2) ---------------------------------------------
+
+    fn clean_member(path: &str) -> CustodyMember {
+        CustodyMember {
+            path: path.to_string(),
+            state: MemberState::Probed {
+                dirty: false,
+                ahead: 0,
+            },
+            slot_wip_state: Some("clean".to_string()),
+        }
+    }
+
+    fn custody(members: Vec<CustodyMember>) -> CustodyInputs {
+        CustodyInputs {
+            session_dir: Some("/ws/agent-worktrees/a/repo".to_string()),
+            ownership: Ok(()),
+            members,
+            covered: Vec::new(),
+            resolutions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_clean_pushed_worktree_is_clean() {
+        let v = custody_gate(&custody(vec![clean_member("/ws/a")]));
+        assert_eq!(v, CustodyVerdict::Clean);
+        assert!(v.is_clean());
+        assert_eq!((v.as_str(), v.reason()), ("clean", None));
+    }
+
+    #[test]
+    fn an_untracked_or_uncommitted_change_is_dirty() {
+        let mut m = clean_member("/ws/a");
+        m.state = MemberState::Probed {
+            dirty: true,
+            ahead: 0,
+        };
+        assert_eq!(
+            custody_gate(&custody(vec![m])),
+            CustodyVerdict::Dirty(CustodyDirty::Uncommitted {
+                path: "/ws/a".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn an_unpushed_commit_is_dirty() {
+        let mut m = clean_member("/ws/a");
+        m.state = MemberState::Probed {
+            dirty: false,
+            ahead: 2,
+        };
+        let v = custody_gate(&custody(vec![m]));
+        assert_eq!(
+            v,
+            CustodyVerdict::Dirty(CustodyDirty::Unpushed {
+                path: "/ws/a".to_string(),
+                ahead: 2
+            })
+        );
+        assert_eq!(v.reason(), Some("unpushed"));
+    }
+
+    #[test]
+    fn a_failed_probe_is_unknown() {
+        let mut m = clean_member("/ws/a");
+        m.state = MemberState::ProbeFailed("git status timed out".to_string());
+        let v = custody_gate(&custody(vec![m]));
+        assert_eq!(v.as_str(), "unknown");
+        assert_eq!(v.reason(), Some("probe_failed"));
+    }
+
+    #[test]
+    fn a_failed_ownership_read_is_unknown_even_with_a_clean_directory() {
+        let mut i = custody(vec![clean_member("/ws/a")]);
+        i.ownership = Err("coord returned 503".to_string());
+        assert_eq!(
+            custody_gate(&i),
+            CustodyVerdict::Unknown(CustodyUnknown::OwnershipUnreadable {
+                detail: "coord returned 503".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn no_known_directory_is_unknown() {
+        let mut i = custody(vec![]);
+        i.session_dir = None;
+        assert_eq!(
+            custody_gate(&i),
+            CustodyVerdict::Unknown(CustodyUnknown::NoSessionDir)
+        );
+    }
+
+    #[test]
+    fn a_primary_checkout_is_dirty_whatever_its_status() {
+        let m = CustodyMember {
+            path: "/ws/qontinui-runner".to_string(),
+            state: MemberState::PrimaryCheckout,
+            slot_wip_state: None,
+        };
+        assert_eq!(
+            custody_gate(&custody(vec![m])),
+            CustodyVerdict::Dirty(CustodyDirty::SharedCheckout {
+                path: "/ws/qontinui-runner".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn a_captured_deferred_or_failed_custody_slot_is_dirty() {
+        for state in DIRTY_WIP_STATES {
+            let mut m = clean_member("/ws/a");
+            m.slot_wip_state = Some(state.to_string());
+            assert_eq!(
+                custody_gate(&custody(vec![m])),
+                CustodyVerdict::Dirty(CustodyDirty::WipSlot {
+                    path: "/ws/a".to_string(),
+                    wip_state: state.to_string()
+                }),
+                "{state}"
+            );
+        }
+        // `clean`, `unchanged` and an absent slot are not refusals on their
+        // own — the git probes are the source.
+        for state in [Some("clean"), Some("unchanged"), None] {
+            let mut m = clean_member("/ws/a");
+            m.slot_wip_state = state.map(str::to_string);
+            assert!(custody_gate(&custody(vec![m])).is_clean(), "{state:?}");
+        }
+    }
+
+    #[test]
+    fn a_workspace_root_session_is_judged_by_its_attributed_worktrees_alone() {
+        // No member for the directory itself: it is in no repo.
+        let none = custody(vec![]);
+        assert!(custody_gate(&none).is_clean(), "nothing attributed → clean");
+
+        let mut dirty = clean_member("/ws/agent-worktrees/x/repo");
+        dirty.state = MemberState::Probed {
+            dirty: true,
+            ahead: 0,
+        };
+        assert_eq!(custody_gate(&custody(vec![dirty])).as_str(), "dirty");
+    }
+
+    #[test]
+    fn one_dirty_sibling_rules_out_a_multi_worktree_session() {
+        let mut sibling = clean_member("/ws/b");
+        sibling.state = MemberState::Probed {
+            dirty: false,
+            ahead: 1,
+        };
+        let v = custody_gate(&custody(vec![
+            clean_member("/ws/a"),
+            sibling,
+            clean_member("/ws/c"),
+        ]));
+        assert_eq!(
+            v,
+            CustodyVerdict::Dirty(CustodyDirty::Unpushed {
+                path: "/ws/b".to_string(),
+                ahead: 1
+            })
+        );
+    }
+
+    #[test]
+    fn a_dirty_member_is_reported_ahead_of_a_siblings_unknown() {
+        let mut unknown = clean_member("/ws/a");
+        unknown.state = MemberState::ProbeFailed("timed out".to_string());
+        let mut dirty = clean_member("/ws/b");
+        dirty.state = MemberState::Probed {
+            dirty: true,
+            ahead: 0,
+        };
+        assert_eq!(
+            custody_gate(&custody(vec![unknown, dirty])).as_str(),
+            "dirty"
+        );
+    }
+
+    #[test]
+    fn the_custody_view_carries_the_verdict_and_is_omitted_when_absent() {
+        let v = CustodyView::from_verdict(
+            &CustodyVerdict::Unknown(CustodyUnknown::ProbeFailed {
+                path: "/ws/a".to_string(),
+                detail: "git status timed out".to_string(),
+            }),
+            42,
+        );
+        assert_eq!(
+            serde_json::to_value(&v).unwrap(),
+            serde_json::json!({
+                "verdict": "unknown", "reason": "probe_failed",
+                "detail": "/ws/a: git status timed out", "judgedAt": 42
+            })
+        );
+        // A view the arm never judged serialises with no `custody` key at all.
+        let plain = WindDownView::from_verdict(
+            &Eligibility::Eligible { since_ms: 1 },
+            SessionKind::Terminal,
+        );
+        assert!(serde_json::to_value(&plain)
+            .unwrap()
+            .get("custody")
+            .is_none());
+    }
+
     // ---- GridIdleTracker ---------------------------------------------------
 
     #[test]
@@ -965,5 +1992,223 @@ mod tests {
             i.finished_at_ms = Some(900_000);
             assert!(eligibility(&i, 1_000 + GRACE_MS).is_eligible(), "{kind:?}");
         }
+    }
+
+    // ── The obligations gate ─────────────────────────────────────────────
+
+    /// A coord answer shaped like `session_obligations_core`'s: tracked
+    /// sources `read`, `spawned_followup` always `not_tracked`.
+    fn obligations(prs: serde_json::Value, gates: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "claude_code_session_id": "11111111-1111-1111-1111-111111111111",
+            "all_tracked_sources_read": true,
+            "session_proven_in_tenant": true,
+            "prs": {"coverage": "read", "items": prs, "count": 0, "truncated": false},
+            "gates": {"coverage": "read", "items": gates, "count": 0, "truncated": false},
+            "worktrees": {"coverage": "read", "items": [], "truncated": false},
+            "work_units": {"coverage": "read", "items": [{"id": "wu-1"}], "truncated": false},
+            "findings": {"coverage": "read", "items": [], "truncated": false},
+            "spawned_followup": {"coverage": "not_tracked", "note": "n", "items": []},
+            "note": "n",
+        })
+    }
+
+    fn gate_item(verdict: &str) -> serde_json::Value {
+        serde_json::json!({
+            "item": {"gate_id": "g-1"}, "verdict": verdict,
+            "reasons": ["why"], "attribution": "proven",
+        })
+    }
+
+    fn judge(doc: serde_json::Value) -> ObligationsVerdict {
+        obligations_gate(&Ok(doc))
+    }
+
+    #[test]
+    fn every_item_landed_watched_or_retired_is_watched() {
+        let doc = obligations(
+            serde_json::json!([gate_item("landed")]),
+            serde_json::json!([gate_item("watched"), gate_item("retired")]),
+        );
+        assert_eq!(judge(doc), ObligationsVerdict::Watched { judged: 3 });
+    }
+
+    /// A session that owes nothing is closeable: tracked sources read, empty.
+    #[test]
+    fn a_session_with_no_obligations_at_all_is_watched() {
+        let doc = obligations(serde_json::json!([]), serde_json::json!([]));
+        assert_eq!(judge(doc), ObligationsVerdict::Watched { judged: 0 });
+    }
+
+    #[test]
+    fn a_not_watched_item_is_unwatched_and_names_the_item() {
+        let doc = obligations(
+            serde_json::json!([]),
+            serde_json::json!([gate_item("watched"), gate_item("not_watched")]),
+        );
+        let ObligationsVerdict::Unwatched(u) = judge(doc) else {
+            panic!("a not_watched item must not read watched");
+        };
+        assert_eq!(u.source, "gates");
+        assert!(u.item.contains("g-1"), "{u:?}");
+        assert_eq!(u.reasons, "why");
+    }
+
+    /// Unwatched outranks an Unknown elsewhere — the more useful thing to
+    /// report, and neither closes.
+    #[test]
+    fn unwatched_outranks_unknown() {
+        let doc = obligations(
+            serde_json::json!([gate_item("unknown")]),
+            serde_json::json!([gate_item("not_watched")]),
+        );
+        assert_eq!(judge(doc).as_str(), "unwatched");
+    }
+
+    #[test]
+    fn an_unknown_or_unrecognised_item_verdict_is_unknown_never_watched() {
+        for word in ["unknown", "recorded", "owed", "WATCHED", ""] {
+            let doc = obligations(serde_json::json!([gate_item(word)]), serde_json::json!([]));
+            let v = judge(doc);
+            assert_eq!(v.as_str(), "unknown", "{word:?}");
+            assert_eq!(v.reason(), Some("item_unknown"), "{word:?}");
+        }
+        // A verdict that is not a string at all.
+        let doc = obligations(
+            serde_json::json!([{"item": {}, "verdict": null}]),
+            serde_json::json!([]),
+        );
+        assert_eq!(judge(doc).as_str(), "unknown");
+    }
+
+    /// An uncertain attribution may be a peer's gate: even `not_watched` is
+    /// then Unknown, never a definite owed word.
+    #[test]
+    fn an_uncertain_not_watched_item_is_unknown() {
+        let mut item = gate_item("not_watched");
+        item["attribution"] = serde_json::json!("uncertain");
+        let v = judge(obligations(
+            serde_json::json!([]),
+            serde_json::json!([item]),
+        ));
+        assert_eq!(v.reason(), Some("item_unknown"));
+        assert!(v.detail().unwrap().contains("attribution uncertain"));
+    }
+
+    /// (c) An unreadable read is UNKNOWN — a timeout, a 503, a decode failure
+    /// all arrive here as `Err` and none is ever "nothing owed".
+    #[test]
+    fn an_unreadable_read_is_unknown_not_watched() {
+        let v = obligations_gate(&Err("GET …: operation timed out".to_string()));
+        assert_eq!(v.as_str(), "unknown");
+        assert_eq!(v.reason(), Some("obligations_unreadable"));
+        assert!(!v.is_watched());
+        assert!(v.detail().unwrap().contains("timed out"));
+    }
+
+    #[test]
+    fn a_degraded_or_truncated_answer_is_unknown_even_with_clean_items() {
+        for reported in [
+            serde_json::json!(false),
+            serde_json::json!("true"),
+            serde_json::Value::Null,
+        ] {
+            let mut doc = obligations(serde_json::json!([]), serde_json::json!([]));
+            doc["all_tracked_sources_read"] = reported;
+            assert_eq!(judge(doc).reason(), Some("sources_not_read"));
+        }
+        // The key absent altogether (a coord predating it) is not "true".
+        let mut doc = obligations(serde_json::json!([]), serde_json::json!([]));
+        doc.as_object_mut()
+            .unwrap()
+            .remove("all_tracked_sources_read");
+        assert_eq!(judge(doc).reason(), Some("sources_not_read"));
+    }
+
+    /// A read made as the wrong tenant answers with empty lists and
+    /// `session_proven_in_tenant: false`; that is not "owes nothing".
+    #[test]
+    fn a_session_coord_cannot_place_in_the_tenant_is_unknown() {
+        for reported in [serde_json::json!(false), serde_json::Value::Null] {
+            let mut doc = obligations(serde_json::json!([]), serde_json::json!([]));
+            doc["session_proven_in_tenant"] = reported;
+            assert_eq!(judge(doc).reason(), Some("session_not_proven"));
+        }
+        let mut doc = obligations(serde_json::json!([]), serde_json::json!([]));
+        doc.as_object_mut()
+            .unwrap()
+            .remove("session_proven_in_tenant");
+        assert_eq!(judge(doc).reason(), Some("session_not_proven"));
+    }
+
+    /// A body with both flags true and only a non-verdict block read says
+    /// nothing about PRs or gates; neither does a verdict-less PR or gate item.
+    #[test]
+    fn missing_prs_or_gates_and_verdictless_items_there_are_unknown() {
+        for drop in ["prs", "gates"] {
+            let mut doc = obligations(serde_json::json!([]), serde_json::json!([]));
+            doc.as_object_mut().unwrap().remove(drop);
+            let v = judge(doc);
+            assert_eq!(v.reason(), Some("malformed"), "{drop}");
+            assert!(v.detail().unwrap().contains(drop), "{drop}");
+        }
+        let doc = serde_json::json!({
+            "all_tracked_sources_read": true, "session_proven_in_tenant": true,
+            "findings": {"coverage": "read", "items": []},
+        });
+        assert_eq!(judge(doc).reason(), Some("malformed"));
+        for bare in [
+            serde_json::json!({"item": {"gate_id": "g"}}),
+            serde_json::json!("g"),
+        ] {
+            let v = judge(obligations(
+                serde_json::json!([]),
+                serde_json::json!([bare]),
+            ));
+            assert_eq!(v.reason(), Some("item_unknown"));
+        }
+    }
+
+    #[test]
+    fn a_source_with_items_that_is_not_read_is_unknown() {
+        let mut doc = obligations(serde_json::json!([]), serde_json::json!([]));
+        doc["gates"]["coverage"] = serde_json::json!("degraded");
+        assert_eq!(judge(doc).reason(), Some("source_not_read"));
+        // `not_tracked` with items in it is not the declared-empty shape.
+        let mut doc = obligations(serde_json::json!([]), serde_json::json!([]));
+        doc["spawned_followup"]["items"] = serde_json::json!([gate_item("watched")]);
+        assert_eq!(judge(doc).reason(), Some("source_not_read"));
+    }
+
+    #[test]
+    fn a_body_that_is_not_the_shape_is_unknown() {
+        for doc in [
+            serde_json::json!([]),
+            serde_json::json!("ok"),
+            serde_json::json!({"all_tracked_sources_read": true}),
+            serde_json::json!({"all_tracked_sources_read": true, "session_proven_in_tenant": true, "note": "no blocks"}),
+        ] {
+            let v = judge(doc.clone());
+            assert!(!v.is_watched(), "{doc}");
+        }
+        assert_eq!(
+            judge(serde_json::json!({"all_tracked_sources_read": true, "session_proven_in_tenant": true}))
+                .reason(),
+            Some("malformed")
+        );
+    }
+
+    #[test]
+    fn the_obligations_view_serialises_the_verdict_and_its_basis() {
+        let watched = ObligationsView::from_verdict(&ObligationsVerdict::Watched { judged: 2 }, 9);
+        let json = serde_json::to_value(&watched).unwrap();
+        assert_eq!(json["verdict"], "watched");
+        assert_eq!(json["itemsJudged"], 2);
+        assert_eq!(json["judgedAt"], 9);
+        let unknown = ObligationsView::from_verdict(&ObligationsVerdict::unreadable("boom"), 9);
+        let json = serde_json::to_value(&unknown).unwrap();
+        assert_eq!(json["verdict"], "unknown");
+        assert_eq!(json["reason"], "obligations_unreadable");
+        assert!(json["itemsJudged"].is_null());
     }
 }

@@ -28,13 +28,20 @@ const LAUNCHER_BIN: &str = if cfg!(windows) {
 
 /// Stable per-user path that AI client configs reference.
 pub fn launcher_path() -> PathBuf {
-    qontinui_runner_lib::instance_env::platform_dir(
+    launcher_path_in(qontinui_runner_lib::instance_env::platform_dir(
         qontinui_runner_lib::instance_env::PlatformDir::DataLocal,
-    )
-    .unwrap_or_else(|| PathBuf::from("."))
-    .join("qontinui-runner")
-    .join("bin")
-    .join(LAUNCHER_BIN)
+    ))
+}
+
+/// [`launcher_path`] over an explicit per-user data dir, so the layout is
+/// testable without reading the machine's real one. `None` (no resolvable
+/// data dir) falls back to the current directory, exactly as before.
+fn launcher_path_in(local_data: Option<PathBuf>) -> PathBuf {
+    local_data
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("qontinui-runner")
+        .join("bin")
+        .join(LAUNCHER_BIN)
 }
 
 /// Copy the bundled launcher into the stable path if missing or stale.
@@ -163,18 +170,32 @@ mod tests {
     use std::thread::sleep;
     use std::time::Duration;
 
+    /// Pure over the data dir it is handed. It used to read the per-user data
+    /// dir itself, which made the verdict depend on the process environment: on Windows that resolves LocalAppData through the
+    /// known-folder API, which answers `None` while a sibling test's
+    /// `IsolatedAmbient` has `USERPROFILE` pointed at an empty tempdir — so it
+    /// passed alone and failed beside any fixture test. Plan
+    /// `2026-10-05-four-runner-unit-tests-read-the-machine-they-run-on`.
     #[test]
     fn launcher_path_is_under_local_data() {
-        // `launcher_path` reads `QONTINUI_INSTANCE_ROOT`; a sibling test's
-        // subject launch must not race it.
-        let _lock = crate::test_env::env_lock();
-        let p = launcher_path();
-        let expected_parent = dirs::data_local_dir()
-            .unwrap()
-            .join("qontinui-runner")
-            .join("bin");
-        assert_eq!(p.parent().unwrap(), expected_parent);
+        let base = PathBuf::from("local-data-root");
+        let p = launcher_path_in(Some(base.clone()));
+        assert_eq!(
+            p.parent().unwrap(),
+            base.join("qontinui-runner").join("bin")
+        );
         assert_eq!(p.file_name().unwrap().to_string_lossy(), LAUNCHER_BIN);
+    }
+
+    #[test]
+    fn launcher_path_without_local_data_falls_back_to_cwd() {
+        assert_eq!(
+            launcher_path_in(None),
+            PathBuf::from(".")
+                .join("qontinui-runner")
+                .join("bin")
+                .join(LAUNCHER_BIN)
+        );
     }
 
     fn install_with_sources(source: &Path, target: &Path) -> io::Result<()> {

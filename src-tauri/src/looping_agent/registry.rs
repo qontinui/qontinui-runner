@@ -20,12 +20,13 @@
 //! counters) that lets a runner restart re-attach to a still-live tab instead
 //! of spawning a duplicate.
 //!
-//! ## No-surprise default
+//! ## Default posture
 //!
-//! The built-in Merge Shepherd is seeded `enabled=false` /
-//! `desired_state=stopped`: a runner upgrade must NEVER start spawning
-//! autonomous terminals by itself — the operator flips it on explicitly via
-//! the `looping_agent_set_enabled` command.
+//! The built-in Merge Shepherd is seeded `enabled=true` /
+//! `desired_state=running` (operator decision 2026-10-30). The seed only
+//! inserts a row that is ABSENT, so a runner whose registry already holds a
+//! Merge Shepherd row keeps the operator's choice; an operator turns it off
+//! with the `looping_agent_set_enabled` command.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -146,7 +147,7 @@ pub struct LoopingAgentRecord {
 /// The built-in Merge Shepherd definition (Tier-1 playbook bundled in the
 /// runner — see `playbook.rs`). `journal_path` is caller-supplied because the
 /// pure lib can't resolve the home dir consistently with the bin's
-/// port-namespacing rules. Seeded DISABLED (see module doc).
+/// port-namespacing rules. Seeded ENABLED (see module doc).
 pub fn builtin_merge_shepherd(journal_path: String) -> LoopingAgentDef {
     LoopingAgentDef {
         id: MERGE_SHEPHERD_ID.to_string(),
@@ -158,8 +159,8 @@ pub fn builtin_merge_shepherd(journal_path: String) -> LoopingAgentDef {
         repos: Vec::new(),
         journal_path,
         lifecycle_policy: LifecyclePolicy::default(),
-        enabled: false,
-        desired_state: DesiredState::Stopped,
+        enabled: true,
+        desired_state: DesiredState::Running,
     }
 }
 
@@ -334,17 +335,16 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn seed_is_disabled_and_stopped_by_default() {
+    fn seed_is_enabled_and_running_by_default() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("looping-agents.json");
         let reg = LoopingAgentRegistry::open(&path).unwrap();
 
         assert!(reg.seed_merge_shepherd("C:/j/journal.jsonl".to_string()));
         let rec = reg.get(MERGE_SHEPHERD_ID).expect("seeded");
-        // UX no-surprise rule: a new autonomous agent must NOT start spawning
-        // terminals on upgrade — it ships off.
-        assert!(!rec.def.enabled, "built-in must seed disabled");
-        assert_eq!(rec.def.desired_state, DesiredState::Stopped);
+        // Operator decision 2026-10-30: the built-in ships on.
+        assert!(rec.def.enabled, "built-in must seed enabled");
+        assert_eq!(rec.def.desired_state, DesiredState::Running);
         assert_eq!(rec.def.cadence_secs, 300);
         assert_eq!(rec.def.lifecycle_policy.relaunch_every_cycles, 8);
         assert_eq!(rec.def.journal_path, "C:/j/journal.jsonl");
@@ -367,14 +367,14 @@ mod tests {
         {
             let reg = LoopingAgentRegistry::open(&path).unwrap();
             reg.seed_merge_shepherd("C:/j.jsonl".to_string());
-            reg.set_enabled(MERGE_SHEPHERD_ID, true).unwrap();
+            reg.set_enabled(MERGE_SHEPHERD_ID, false).unwrap();
         }
         // "Upgrade + reboot": reopen and reseed.
         let reg = LoopingAgentRegistry::open(&path).unwrap();
         assert!(!reg.seed_merge_shepherd("C:/j.jsonl".to_string()));
         let rec = reg.get(MERGE_SHEPHERD_ID).unwrap();
-        assert!(rec.def.enabled, "operator enable survives reseed");
-        assert_eq!(rec.def.desired_state, DesiredState::Running);
+        assert!(!rec.def.enabled, "operator disable survives reseed");
+        assert_eq!(rec.def.desired_state, DesiredState::Stopped);
     }
 
     #[test]

@@ -50,8 +50,10 @@
 #   - curl must be installed; JSON is parsed with jq, else a working python.
 #   - $COORD_AGENT_JWT set to a live agent/device JWT.
 #
-# Exit codes: 0 ok; 2 no agent JWT; 3 coord mint failed; 127 missing curl or
-#             no working JSON reader (jq / python).
+# Exit codes: 0 ok; 2 no agent JWT; 3 coord mint failed; 4 coord refused the
+#             PRESENTER (only a paired device JWT or an allocated-authenticated
+#             agent token is admitted -- /gate Step 4b still registers); 127 missing
+#             curl or no working JSON reader (jq / python).
 
 set -u
 
@@ -157,6 +159,18 @@ print(d.get("token","") or "")' 2>/dev/null
   fi
 }
 
+# read_code — reads a coord error body on STDIN, prints .code (empty if absent).
+read_code() {
+  if [ "$JSON_READER" = jq ]; then
+    jq -r '.code // ""' 2>/dev/null
+  else
+    "$JSON_READER" -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: print(""); sys.exit(0)
+print((d.get("code","") or "") if isinstance(d,dict) else "")' 2>/dev/null
+  fi
+}
+
 # ── Resolve the agent/device JWT — $COORD_AGENT_JWT is the ONLY source ───────
 # Strip whitespace so an all-whitespace export reads as unset instead of
 # minting with a garbage bearer.
@@ -230,8 +244,15 @@ echo "coord-acting-bearer: credential from $jwt_source" >&2
 # cmdlines are world-readable on this multi-session machine, so a bearer on
 # argv leaks to every peer session (same hazard class coord-revive.sh closed;
 # flake-remediation Phase 2 review residual, fixed 2026-07-27).
+# Both tempfile names are initialised and the ONE combined EXIT trap is
+# installed before either mktemp, so no exit path between the two can leave a
+# token-bearing file behind. EXIT alone: bash runs it when a signal ends the
+# script too, and a trap on the signals themselves would let the script
+# CONTINUE past an interrupt.
+auth_hdr=""
+body_file=""
+trap 'rm -f ${auth_hdr:+"$auth_hdr"} ${body_file:+"$body_file"}' EXIT
 auth_hdr=$(mktemp) || { echo "coord-acting-bearer: ERROR: mktemp failed." >&2; exit 3; }
-trap 'rm -f "$auth_hdr"' EXIT
 printf 'Authorization: Bearer %s\n' "$jwt" > "$auth_hdr"
 # Native curl.exe cannot open mktemp's POSIX path when MSYS pathconv is off
 # (MSYS_NO_PATHCONV=1 sessions): hand it the Windows path explicitly. curl
@@ -239,16 +260,52 @@ printf 'Authorization: Bearer %s\n' "$jwt" > "$auth_hdr"
 # must not masquerade as "coord down".
 hdr_path=$auth_hdr
 command -v cygpath >/dev/null 2>&1 && hdr_path=$(cygpath -w "$auth_hdr")
-resp=$(curl -fsS -X POST "$COORD/coord/auth/acting-user-service-token" \
+# Status and body are read separately (no `curl -f`): coord's typed refusal
+# lives in the BODY, and `-f` would throw it away and leave every 4xx reading
+# as "coord down".
+body_file=$(mktemp) || { echo "coord-acting-bearer: ERROR: mktemp failed." >&2; exit 3; }
+body_path=$body_file
+command -v cygpath >/dev/null 2>&1 && body_path=$(cygpath -w "$body_file")
+http_code=$(curl -sS -o "$body_path" -w '%{http_code}' -X POST "$COORD/coord/auth/acting-user-service-token" \
   -H @"$hdr_path" \
-  -H "Content-Type: application/json") || {
-  echo "coord-acting-bearer: ERROR: mint request to $COORD failed (device unknown / no bound user / coord down?)." >&2
+  -H "Content-Type: application/json"); curl_rc=$?
+# A curl failure AFTER a 2xx started (partial transfer, timeout mid-body) has
+# already written part of a token-bearing body: say what failed, never echo it.
+if [ "$curl_rc" -ne 0 ]; then
+  echo "coord-acting-bearer: ERROR: mint request to $COORD failed (curl exit $curl_rc, HTTP ${http_code:-000}; body not echoed)." >&2
   exit 3
-}
+fi
+resp=$(cat "$body_file" 2>/dev/null)
 
-token=$(printf '%s' "$resp" | read_token)
+if [ "$http_code" = "403" ]; then
+  # Exit 4: coord refused the PRESENTER, not the device. Both codes mean the
+  # token is not one coord accepts as proof of possession -- only a paired
+  # device JWT or an allocated-authenticated agent token is. Coord's refusal
+  # deliberately names no alternative door; this helper names the ones that
+  # still answer, locally. Plan
+  # 2026-10-03-acting-user-service-token-exchange-admits-an-unproven-presenter.
+  # `tr -d '\r'`: a native Windows python appends CR, which would make the
+  # code never match and turn exit 4 back into exit 3.
+  case "$(printf '%s' "$resp" | read_code | tr -d '\r')" in
+    presenter_not_admitted|bootstrap_credential_scope)
+      echo "coord-acting-bearer: ERROR: coord refused to exchange \$COORD_AGENT_JWT for an acting-user token: it is not a proven presenter (only a paired device JWT or an allocated-authenticated agent token may speak for the operator). PRESENTER_NOT_ADMITTED." >&2
+      echo "coord-acting-bearer: to REGISTER a gate, fall through to /gate Step 4b (it mints its own bootstrap credential and spends it on the two REST registration routes only; never an /agents/allocate token). To attest or withdraw, use a door carrying a paired device JWT or the proxy nonce (/gate Steps 1-4), or re-run this helper with a paired device JWT exported as \$COORD_AGENT_JWT." >&2
+      exit 4 ;;
+  esac
+fi
+case "$http_code" in
+  2??) ;;
+  *)
+    # The body is echoed only on a non-2xx, which carries no token.
+    echo "coord-acting-bearer: ERROR: mint request to $COORD answered HTTP $http_code: $(printf '%s' "$resp" | tr -d '\r\n' | cut -c1-200)" >&2
+    exit 3 ;;
+esac
+
+token=$(printf '%s' "$resp" | read_token | tr -d '\r')
 if [ -z "$token" ] || [ "$token" = "null" ]; then
-  echo "coord-acting-bearer: ERROR: coord response carried no token: $resp" >&2
+  # Never echo a 2xx body: it may hold the minted token under a name, or in a
+  # shape, the reader did not parse. Its size says enough to diagnose.
+  echo "coord-acting-bearer: ERROR: coord's HTTP $http_code response carried no readable .token (${#resp} bytes, not echoed)." >&2
   exit 3
 fi
 

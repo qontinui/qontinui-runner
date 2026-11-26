@@ -1184,6 +1184,54 @@ pub async fn cognito_sign_in(
         .map_err(String::from)
 }
 
+/// The Hosted-UI sign-in currently waiting for its browser callback, if any:
+/// its authorize URL and, when the system browser could not be opened, why.
+///
+/// The UI polls this while a [`cognito_sign_in`] is in flight so a box with no
+/// browser launcher can show the URL with a copy control instead of waiting
+/// five silent minutes (plan
+/// `2026-11-15-headless-runner-recovers-its-coord-credential-without-a-human`
+/// P1.1).
+#[tauri::command]
+pub fn cognito_pending_sign_in() -> Option<qontinui_runner_lib::cognito::PendingSignIn> {
+    qontinui_runner_lib::cognito::pending_sign_in()
+}
+
+/// Cancel the pending Hosted-UI sign-in `attempt_id` (from
+/// [`cognito_pending_sign_in`]), releasing the callback port. Returns whether
+/// it was cancelled; a stale id cancels nothing. The cancelled
+/// [`cognito_sign_in`] call returns
+/// [`qontinui_runner_lib::cognito::SIGN_IN_CANCELLED`].
+#[tauri::command]
+pub fn cognito_cancel_sign_in(attempt_id: u64) -> bool {
+    qontinui_runner_lib::cognito::cancel_pending_sign_in(attempt_id)
+}
+
+/// Refuse a sign-in `base` THIS build would never dial.
+///
+/// A release build drops a machine-local (loopback or bind-all `0.0.0.0`/`::`)
+/// persisted `backend_url` at read time —
+/// [`crate::api_config::persisted_backend_url_refused`] is the single
+/// expression of that rule, and this asks it rather than restating it. Signing
+/// in against such a base pairs the device with a backend the runner never
+/// dials, and `finalize_signed_in` would then write that base BACK into
+/// `web_integration.backend_url`, re-persisting the value the read path had
+/// been ignoring. Refusing here, before any browser opens or network call,
+/// closes that write-back for every caller.
+///
+/// `is_debug` is a parameter so both build settings are unit-testable; live
+/// callers pass `cfg!(debug_assertions)`.
+fn refuse_undialable_sign_in_base(base: &str, is_debug: bool) -> Result<(), AppError> {
+    if crate::api_config::persisted_backend_url_refused(base, is_debug) {
+        return Err(AppError::Raw(format!(
+            "Cannot sign in to {base}: this release build does not dial \
+             machine-local backends (loopback such as 127.0.0.1/localhost/::1, \
+             or bind-all 0.0.0.0/::). Use a remote backend URL."
+        )));
+    }
+    Ok(())
+}
+
 async fn cognito_sign_in_impl(
     backend_url: String,
     identity_provider: Option<String>,
@@ -1192,6 +1240,7 @@ async fn cognito_sign_in_impl(
     if base.is_empty() {
         return Err(AppError::Raw("backend_url is required".to_string()));
     }
+    refuse_undialable_sign_in_base(&base, cfg!(debug_assertions))?;
 
     // 1. RFC-8252 PKCE login (blocking — browser + loopback). Run on a
     //    worker thread so it doesn't block the tokio runtime.
@@ -1207,7 +1256,15 @@ async fn cognito_sign_in_impl(
     .map_err(|e| {
         // Most common cause: a prior sign-in leaked the fixed loopback port
         // (BUG 1, now fixed) so the bind fails with os error 10048.
-        error!("cognito_sign_in: PKCE login failed at step 1 (pkce_login): {e}");
+        // A user's Cancel, or a newer attempt superseding this one, is not a
+        // failure: keep it out of the error log.
+        if e == qontinui_runner_lib::cognito::SIGN_IN_CANCELLED
+            || e == qontinui_runner_lib::cognito::SIGN_IN_SUPERSEDED
+        {
+            info!("cognito_sign_in: {e}");
+        } else {
+            error!("cognito_sign_in: PKCE login failed at step 1 (pkce_login): {e}");
+        }
         AppError::Raw(e)
     })?;
 
@@ -1338,6 +1395,7 @@ async fn finalize_signed_in(
             );
             AppError::Raw(format!("persist pairing: {e}"))
         })?;
+    crate::commands::web_integration::notify_tenant_bindings_changed();
 
     // 5a. A NEW credential is in `tenant_id`'s slot (and in the legacy slot when
     //     that tenant is the default), so every rejection coord recorded
@@ -1467,6 +1525,7 @@ async fn cognito_sign_in_password_impl(
     if base.is_empty() {
         return Err(AppError::Raw("backend_url is required".to_string()));
     }
+    refuse_undialable_sign_in_base(&base, cfg!(debug_assertions))?;
     let email = email.trim().to_string();
     if email.is_empty() {
         return Err(AppError::Raw("email is required".to_string()));
@@ -2221,6 +2280,8 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             set_runner_tier,
             cognito_sign_in,
             cognito_sign_in_password,
+            cognito_pending_sign_in,
+            cognito_cancel_sign_in,
             qontinui_sign_out,
             sign_out_full,
             reset_credential_store,
@@ -2236,6 +2297,36 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sign_in_refuses_machine_local_base_only_in_release() {
+        for local in [
+            "http://127.0.0.1:8000",
+            "http://localhost:8000",
+            "http://[::1]:8000",
+            "http://0.0.0.0:8000",
+            "http://[::]:8000",
+        ] {
+            let err = refuse_undialable_sign_in_base(local, false)
+                .expect_err("a release build must refuse a machine-local sign-in base");
+            let msg = err.to_string();
+            assert!(msg.contains(local), "error must name the URL: {msg}");
+            assert!(
+                msg.contains("release build"),
+                "error must state the rule: {msg}"
+            );
+            assert!(
+                refuse_undialable_sign_in_base(local, true).is_ok(),
+                "a debug build must accept {local}"
+            );
+        }
+        for is_debug in [false, true] {
+            assert!(
+                refuse_undialable_sign_in_base("https://api.example.com", is_debug).is_ok(),
+                "a remote base is accepted at is_debug={is_debug}"
+            );
+        }
+    }
 
     /// Every [`RefreshClass`], as an array the tests iterate.
     ///
@@ -2536,9 +2627,11 @@ mod device_token_door_tests {
     /// tests would overwrite the runner's own keychain backup, the documented
     /// recovery when the `.enc` store will not decrypt. On Linux the keyring
     /// call fails and is swallowed as `debug!`, which is why it stays invisible
-    /// until Windows. `isolated_ambient` captures the key but sets neither it
-    /// nor a removal, so the guard belongs here; it is safe inside the fixture,
-    /// which holds `env_lock` and has already captured the key for restore.
+    /// until Windows. `isolated_ambient` now sets the key itself
+    /// (`ambient::test_support::KEYS_SET_TO_ONE`), so this `set_var` is
+    /// redundant belt-and-braces. Call this ONLY while a fixture is held: the
+    /// fixture holds `env_lock` and has captured the key for restore, and
+    /// outside one this write would leak to every later test.
     ///
     /// Every `AuthManager` in this module comes from here, so the ordering
     /// (guard BEFORE the first `store_tokens`) is enforced rather than

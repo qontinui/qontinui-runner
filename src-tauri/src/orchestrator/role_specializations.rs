@@ -159,7 +159,7 @@ pub fn planner_role() -> AgentRole {
 /// Create an Executor role — carries out planned actions precisely.
 ///
 /// Has write/execution tools: workflow execution, Python execution,
-/// state transitions, AWAS automation, GUI capture, config loading,
+/// state transitions, AWAS automation, GUI config build, config loading,
 /// and sub-agent spawning.
 pub fn executor_role() -> AgentRole {
     AgentRole::new("executor", "Executor", "Execute actions and make changes")
@@ -185,9 +185,7 @@ pub fn executor_role() -> AgentRole {
             // AWAS automation
             "awas_discover".to_string(),
             "awas_execute".to_string(),
-            // GUI config capture & build
-            "capture_gui_elements".to_string(),
-            "capture_multi_state_gui_config".to_string(),
+            // GUI config build (the capture tools were deleted: #2242, qontinui-mcp#10)
             "build_gui_config".to_string(),
             // Sub-agent orchestration
             "spawn_sub_agent".to_string(),

@@ -446,8 +446,17 @@ fn is_metadata_endpoint(domain: &str) -> bool {
     metadata_addresses.contains(&domain)
 }
 
+/// The loopback spellings of ONE host. A policy entry naming any of them
+/// matches the others, so respelling a URL from `localhost` to `127.0.0.1`
+/// (plan 2026-10-25-runner-self-calls-dial-localhost-and-pay-a-doomed-ipv6-connect)
+/// neither escapes a deny list nor falls out of an allow list.
+fn is_loopback_name(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
+}
+
 /// Check if a domain matches any pattern in a list.
-/// Supports exact match and wildcard prefix (e.g., `*.example.com`).
+/// Supports exact match, wildcard prefix (e.g., `*.example.com`), and treats
+/// the loopback spellings (`localhost`, `127.0.0.1`, `::1`) as one host.
 #[expect(
     clippy::string_slice,
     reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
@@ -462,7 +471,8 @@ fn domain_matches_list(domain: &str, patterns: &[String]) -> bool {
             if domain_lower.ends_with(suffix) || domain_lower == pat[2..] {
                 return true;
             }
-        } else if domain_lower == pat {
+        } else if domain_lower == pat || (is_loopback_name(&domain_lower) && is_loopback_name(&pat))
+        {
             return true;
         }
     }
@@ -873,6 +883,18 @@ mod tests {
             "evil.anthropic.com",
             &["api.anthropic.com".to_string()]
         ));
+    }
+
+    #[test]
+    fn test_loopback_spellings_match_each_other() {
+        let localhost = ["localhost".to_string()];
+        let ipv4 = ["127.0.0.1".to_string()];
+        assert!(domain_matches_list("127.0.0.1", &localhost));
+        assert!(domain_matches_list("LOCALHOST", &ipv4));
+        assert!(domain_matches_list("::1", &localhost));
+        assert!(!domain_matches_list("127.0.0.2", &localhost));
+        assert!(!domain_matches_list("localhost.example.com", &localhost));
+        assert!(!domain_matches_list("example.com", &ipv4));
     }
 
     #[test]

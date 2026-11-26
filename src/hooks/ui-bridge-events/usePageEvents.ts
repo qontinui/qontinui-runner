@@ -1,5 +1,5 @@
 import { useCallback } from "react";
-import { getApiPort } from "@/lib/runner-api";
+import { getApiBase } from "@/lib/runner-api";
 import type { UIBridgeRequestPayload, UIBridgeEventContext, PageEventTypes } from "./types";
 import { createLogger } from "@/lib/logger";
 import {
@@ -26,6 +26,8 @@ import {
   describeEvaluateBudget,
 } from "./utils";
 import { describeThrown } from "@/lib/utils";
+import { runTextVisibilityRequest } from "./textVisibilityRequest";
+import { runReadValueRequest } from "./readValueRequest";
 
 const logger = createLogger("UIBridgePageEvents");
 
@@ -58,6 +60,7 @@ const PAGE_EVENT_TYPES: ReadonlySet<PageEventTypes> = new Set<PageEventTypes>([
   "delete_network_stub",
   "clear_network_stubs",
   "verify_network_stub",
+  "text_visibility",
 ]);
 
 function isPageEventType(type: string): type is PageEventTypes {
@@ -227,7 +230,7 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
             });
 
             try {
-              fetch(`http://localhost:${getApiPort()}/ui-bridge/control/render-log`, {
+              fetch(`${getApiBase()}/ui-bridge/control/render-log`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
@@ -723,111 +726,13 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
 
         case "read_value": {
           try {
-            const params = (payload.params || {}) as {
-              selector?: string;
-              index?: number;
-              all?: unknown;
-            };
-            const { selector, index } = params;
-            if (!selector) {
-              await sendResponse({
-                requestId,
-                type,
-                success: false,
-                error: "selector is required",
-                timestamp: Date.now(),
-              });
-              return true;
-            }
-            // `all` used to be accepted and silently DROPPED here — this relay
-            // case is a THIRD independent implementation of `readValue`
-            // (alongside the Rust JS-injection handler and the SDK primitive),
-            // so honouring `all` in `@qontinui/ui-bridge` (PR #156) did nothing
-            // for a caller whose request reached the webview through the relay.
-            // Validated and rejected BY NAME rather than reinterpreted, exactly
-            // as the SDK and the Rust handler do.
-            const all = params.all;
-            if (all !== undefined && all !== null && typeof all !== "boolean") {
-              await sendResponse({
-                requestId,
-                type,
-                success: false,
-                error: `'all' must be a boolean (got ${typeof all})`,
-                timestamp: Date.now(),
-              });
-              return true;
-            }
-            if (all === true && index !== undefined && index !== null) {
-              await sendResponse({
-                requestId,
-                type,
-                success: false,
-                error:
-                  "'all' and 'index' are mutually exclusive — 'all' returns every match, 'index' selects one. Drop one of them.",
-                timestamp: Date.now(),
-              });
-              return true;
-            }
-
-            const matches = Array.from(document.querySelectorAll<HTMLElement>(selector));
-            const readOne = (el: HTMLElement): string | null =>
-              "value" in el ? (el as HTMLInputElement).value : (el.textContent ?? null);
-
-            if (matches.length === 0) {
-              await sendResponse({
-                requestId,
-                type,
-                success: false,
-                error: `No element found for "${selector}"`,
-                timestamp: Date.now(),
-              });
-              return true;
-            }
-
-            if (all === true) {
-              const values = matches.map((el, i) => {
-                const v = readOne(el);
-                return { index: i, value: v, length: v?.length ?? 0 };
-              });
-              await sendResponse({
-                requestId,
-                type,
-                success: true,
-                data: {
-                  value: values[0].value,
-                  length: values[0].length,
-                  totalMatches: matches.length,
-                  values,
-                },
-                timestamp: Date.now(),
-              });
-              return true;
-            }
-
-            const el = matches[index ?? 0];
-            if (!el) {
-              await sendResponse({
-                requestId,
-                type,
-                success: false,
-                error: `Index out of range (found ${matches.length})`,
-                timestamp: Date.now(),
-              });
-              return true;
-            }
-            const value = readOne(el);
-            // `totalMatches` is always reported: a caller that read one value
-            // out of N deserves to know that rather than inferring completeness
-            // from a shape that cannot express it.
+            const outcome = runReadValueRequest(
+              (payload.params || {}) as { selector?: string; index?: number | null; all?: unknown },
+            );
             await sendResponse({
               requestId,
               type,
-              success: true,
-              data: {
-                value,
-                length: value?.length ?? 0,
-                totalMatches: matches.length,
-              },
+              ...outcome,
               timestamp: Date.now(),
             });
           } catch (err) {
@@ -1407,6 +1312,24 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
               type,
               success: false,
               error: String(err),
+              timestamp: Date.now(),
+            });
+          }
+          return true;
+        }
+
+        case "text_visibility": {
+          // Dev control (Phase 16): hide or restore every glyph, behind the
+          // SDK's dev-controls gate. See ./textVisibilityRequest.ts.
+          try {
+            const reply = await runTextVisibilityRequest(payload);
+            await sendResponse({ requestId, type, ...reply, timestamp: Date.now() });
+          } catch (e) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: describeThrown(e, "Text visibility failed"),
               timestamp: Date.now(),
             });
           }

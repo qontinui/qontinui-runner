@@ -112,6 +112,7 @@ mod tests {
             rejected: matches!(state, TokenState::Rejected),
             consecutive_failures: streak,
             retry_in_secs: 0,
+            last_refusal: None,
             state,
         }
     }

@@ -7,6 +7,7 @@
 
 import { GitMerge, ChevronRight } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
+import { getApiBase } from "@/lib/runner-api";
 
 interface GraphPathNode {
   key: string;
@@ -59,7 +60,7 @@ export function FailureChainViewer({ elementId }: FailureChainViewerProps) {
     queryKey: ["graph-analytics", "ui-failure-chain", elementId],
     queryFn: async () => {
       const res = await fetch(
-        `http://localhost:9876/graph/ui-failure-chain?element_id=${encodeURIComponent(elementId)}`,
+        `${getApiBase()}/graph/ui-failure-chain?element_id=${encodeURIComponent(elementId)}`,
       );
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const json = await res.json();

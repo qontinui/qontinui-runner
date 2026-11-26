@@ -257,33 +257,23 @@ The enforcer maintains per-key state:
     {
       id: "phase-timeouts",
       title: "Phase Timeouts",
-      content: `Each phase of a workflow has a configurable **timeout deadline**. If a phase exceeds its timeout, the workflow is stopped with a \`PhaseTimeout\` reason.
+      content: `A workflow can set a **timeout for its agentic (execution) phase**. If that phase runs past it, the workflow is stopped with a \`PhaseTimeout\` reason.
 
-**Default timeouts:**
-- **Setup** — 5 minutes
-- **Execution** (agentic) — 30 minutes
-- **Verification** — 10 minutes
-- **Completion** — 5 minutes
-- **AI Summary** — 3 minutes
-
-You can override these per-workflow in the Flow Control settings panel.`,
+There is no default: a workflow with no execution timeout is not time-limited. A workflow's stored timeouts can also name the setup, verification and completion phases, but only the execution timeout is enforced.`,
       details: `**How timeouts are enforced:**
 
-1. \`TaskOrchestrator.state_entered_at\` records when each phase starts (ISO-8601 timestamp)
-2. \`check_timeout()\` computes elapsed time vs the phase's configured timeout
-3. \`loop_handlers.rs\` calls \`check_timeout()\` in \`handle_check_preconditions()\` every iteration
-4. If exceeded, the loop completes with \`CompletionReason::PhaseTimeout\`
-
-The timeout config is stored as \`phase_timeouts_json\` on the workflow and parsed into \`PhaseTimeouts\` in \`LoopConfig::from_workflow()\`.
+1. The timeout config is stored as \`phase_timeouts_json\` on the workflow and parsed into \`PhaseTimeouts\` in \`LoopConfig::from_workflow()\`, which keeps \`execution_ms\` as the loop's \`phase_timeout_ms\`
+2. \`handle_check_preconditions()\` in \`loop_handlers.rs\` compares the time since the agentic phase started against \`phase_timeout_ms\` every iteration
+3. If exceeded, the loop completes with \`CompletionReason::PhaseTimeout\`
 
 **Source files:**
-- \`src-tauri/src/orchestrator/state.rs\` (PhaseTimeouts struct + check_timeout)
+- \`src-tauri/src/orchestrator/state.rs\` (PhaseTimeouts struct)
 - \`src-tauri/src/unified_workflow_executor/loop_handlers.rs\` (enforcement)
 - \`src-tauri/src/unified_workflow_executor/types.rs\` (parsing from DB)`,
       estimatedDuration: 1,
       tips: [
-        "The execution phase timeout is the most impactful — it governs the main AI work loop",
-        "Timeouts use chrono for clock-safe comparison with .max(0) to handle clock skew",
+        "The execution phase timeout is the only one enforced — it governs the main AI work loop",
+        "Elapsed time is measured with a monotonic clock (Instant), so a wall-clock change cannot trip or hide a timeout",
       ],
     },
 

@@ -71,7 +71,7 @@ mcp/task_runs.rs | resume_task_run | autonomous | resume_task_run
 # scheduler's entry points gate on the device drain before execute_task (tick's
 # partition_for_drain, reconcile_task's drain_gate_for_work, run_task_now's drain_gate);
 # the chain below names the periodic one.
-scheduler_remote_agent.rs | launch | autonomous | scheduler_service.rs::tick_pass > scheduler_service.rs::execute_task > scheduler_service.rs::execute_task_with_context > scheduler_service.rs::launch_and_await_remote_agent > launch
+scheduler_remote_agent.rs | launch | autonomous | scheduler_service.rs::tick_pass > scheduler_service.rs::try_start_due_task > scheduler_service.rs::execute_task > scheduler_service.rs::execute_task_with_context > scheduler_service.rs::launch_and_await_remote_agent > launch
 mcp/tauri_proxy.rs | dispatch | autonomous | dispatch
 mcp/terminals.rs | create_terminal_handler | autonomous | create_terminal_handler
 mcp/unified_workflows.rs | execute_inline_workflow | autonomous | execute_inline_workflow
@@ -91,15 +91,21 @@ session/mod.rs | start | helper | .start(intent)
 session/mod.rs | start_inner | helper | .start_inner(
 session/mod.rs | start_with_parent | helper | .start_with_parent(
 session/respawn.rs | materialize | autonomous | materialize
+session/respawn.rs | spawn_next | helper | .spawn_next(
 session/resume_door.rs | resume_one | autonomous | resume_one
+session/resume_door.rs | spawn_next | helper | .spawn_next(
 session/transport/claude_cli.rs | start | helper | transport.start(
 session/transport/pty.rs | start | helper | transport.start(
 step_executor/handlers/mod.rs | execute_with_tools | exempt | a step of a workflow run that is already running; every workflow START is a gated row here
 terminal/account_migration.rs | handle_usage_limit_hint | exempt | moves a live session that hit its usage limit onto another account — the work is already running
-terminal/account_migration.rs | migrate_session | helper | migrate_session(
+terminal/account_migration.rs | migrate_session_off_runtime | helper | migrate_session_off_runtime(
+terminal/account_migration.rs | confirm_migration | helper | confirm_migration(
 terminal/account_migration.rs | spawn_resumed_pane | helper | spawn_resumed_pane(
+terminal/account_migration.rs | spawn_next | helper | .spawn_next(
+# confirm_respawn drives each caller's own `spawn_next` (the first spawn and every retry after a
+# resumed CLI died) — plan 2026-10-20-account-migration-respawn-dies-during-cli-reinstall-churn Phase 4.
+terminal/respawn_liveness.rs | confirm_respawn | helper | confirm_respawn(
 trigger_system/executor.rs | execute_triggered_workflow | autonomous | execute_triggered_workflow
 unified_ai_session.rs | execute | exempt | a phase of a unified-workflow run that is already running; every workflow START is a gated row here
 unified_workflow_executor/auto_run.rs | launch_workflow_by_id | autonomous | launch_workflow_by_id
-unified_workflow_executor/review_subtask.rs | execute_review_subtask | autonomous | execute_review_subtask
 unified_workflow_executor/startup_resume.rs | resume_interrupted_workflows | autonomous | resume_interrupted_workflows

@@ -16,11 +16,22 @@
 //! The point is that decisions become unit-testable with plain fixtures — no
 //! Postgres, no SDK, no tokio runtime.
 //!
-//! Handlers already covered:
-//!   - `handle_check_preconditions`     → `decide_preconditions`
-//!   - `handle_evaluate_verification`   → `decide_evaluate_verification`
+//! WIRED: production branches on these decisions, so a change here changes runs.
+//!   - `handle_evaluate_verification` (`evaluate_verification.rs`)
+//!                                      → `decide_evaluate_verification`,
+//!                                        `required_step_count`
 //!   - `handle_check_post_agentic_signals` → `decide_post_agentic_signals`
-//!   - `handle_approval_gate`           → `decide_approval_mode`, `decide_approval_response`
+//!   - `run_loop_state_machine`'s post-loop compensation → `compensation_applies`
+//!   - `LoopController::run_multi_agent_fix` → `targeted_group_fixed`
+//!
+//! NOT WIRED: tests are the only callers. Each of these handlers still has
+//! its own inline branching, so changing one of these functions changes no
+//! run until its handler calls it.
+//!   - `handle_check_preconditions`     ↛ `decide_preconditions`
+//!   - `handle_approval_gate`           ↛ `decide_approval_mode`, `decide_approval_response`
+//!
+//! `dead_code` is allowed crate-wide, so nothing reports an unwired decision:
+//! read the call sites, not the compiler, before trusting this list.
 //!
 //! Handlers deliberately *not* extracted:
 //!   - `handle_check_environment`: the branches are side-effect-only (log env
@@ -36,7 +47,10 @@
 //!     with multi-second tokio::select loops. Splitting it would require
 //!     threading the approval response out of async; not a win.
 
+use crate::step_executor::{StepExecutionResult, VerificationPhaseResult};
+
 use super::loop_state_machine::CompletionReason;
+use super::types::{LoopResult, RollbackPolicy};
 
 // =============================================================================
 // 1. CheckPreconditions
@@ -147,8 +161,18 @@ pub fn decide_preconditions(snap: &PreconditionsSnapshot) -> PreconditionDecisio
 /// returns, so the decision speaks only about the branch taken.
 #[derive(Debug, Clone)]
 pub struct VerificationEvalSnapshot {
-    /// All verification steps passed.
+    /// The producer's `all_passed`: every REQUIRED step passed. Never read
+    /// alone: `required_steps` is tested first. The shared fold
+    /// (`step_executor/verification_execution.rs`) reports `false` over a set
+    /// with no required step, so that order is defense in depth against a
+    /// producer that reports `true` there, as every producer did before plan
+    /// 2026-11-06-a-product-workflow-verification-with-nothing-to-check-never-reports-passed.
     pub all_passed: bool,
+    /// How many step results are required, counted by `required_step_count`.
+    /// Zero means nothing was checked: an empty step list, every step
+    /// filtered out, or only `required: false` steps. Nothing checked is never
+    /// a pass.
+    pub required_steps: usize,
     /// One of the verification steps flagged a critical (infra) failure.
     pub critical_failure: bool,
     /// Current iteration's passed step count (used for fix-progress tracking).
@@ -174,6 +198,11 @@ pub enum FixProgressUpdate {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum VerificationEvalDecision {
+    /// No required step produced a result, so nothing was checked. Record an
+    /// iteration result and Complete with `NoVerificationSteps`. That is not a
+    /// pass. It is not a failure an agentic fix could change either, so no fix
+    /// iteration runs.
+    NoVerificationSteps,
     /// Verification passed — record an iteration result and Complete.
     VerificationPassed,
     /// Critical failure — record an iteration result and Complete with error.
@@ -187,10 +216,16 @@ pub enum VerificationEvalDecision {
 /// Pure evaluation of the verification result. Returns which LoopState the
 /// handler should produce and what fix-progress bookkeeping to apply first.
 ///
-/// Note: the pass/critical branches short-circuit *before* fix-progress
-/// bookkeeping runs in the original handler, so we don't attach a
+/// Note: the nothing-checked, pass and critical branches short-circuit
+/// *before* fix-progress bookkeeping, so we don't attach a
 /// `FixProgressUpdate` to them — they're terminal regardless.
 pub fn decide_evaluate_verification(snap: &VerificationEvalSnapshot) -> VerificationEvalDecision {
+    // Before `all_passed`: a producer that reports `all_passed` over a set
+    // with no required step (every producer did, before this plan) would
+    // otherwise turn "nothing was checked" into a pass.
+    if snap.required_steps == 0 {
+        return VerificationEvalDecision::NoVerificationSteps;
+    }
     if snap.all_passed {
         return VerificationEvalDecision::VerificationPassed;
     }
@@ -219,6 +254,44 @@ pub fn decide_evaluate_verification(snap: &VerificationEvalSnapshot) -> Verifica
     }
 
     VerificationEvalDecision::ContinueToFix { progress }
+}
+
+/// How many of `step_results` are REQUIRED: `required` is not `Some(false)`.
+///
+/// This is the shared fold's own default (`required.unwrap_or(true)` in
+/// `step_executor/verification_execution.rs`), so a step that does not say
+/// counts as required. It is the one count behind both
+/// `VerificationEvalSnapshot::required_steps` and `targeted_group_fixed`, so
+/// "nothing was checked" has a single definition.
+pub fn required_step_count(step_results: &[StepExecutionResult]) -> usize {
+    step_results
+        .iter()
+        .filter(|r| r.required != Some(false))
+        .count()
+}
+
+/// Whether a multi-agent fix group's targeted verification shows the group
+/// FIXED: at least one required step ran, and every required step passed.
+///
+/// A targeted run whose step indices selected nothing, or selected only
+/// `required: false` steps, checked nothing. That is no evidence the fix
+/// worked, so the group is not credited.
+pub fn targeted_group_fixed(result: &VerificationPhaseResult) -> bool {
+    required_step_count(&result.step_results) > 0 && result.all_passed
+}
+
+/// Whether `run_loop_state_machine`'s post-loop compensation applies: first the
+/// rollback under the configured `RollbackPolicy`, then the worktree finalizer.
+///
+/// Both undo work, so both need a REFUTED run: a policy is configured, the
+/// loop did not pass, and nobody stopped it. A `no_verification_steps` exit
+/// refuted nothing because nothing was checked. So a `last_good` or `clean`
+/// policy never reverts or removes work on such an exit.
+pub fn compensation_applies(result: &LoopResult, policy: &RollbackPolicy) -> bool {
+    !matches!(policy, RollbackPolicy::None)
+        && !result.verification_passed
+        && !result.was_stopped
+        && !result.no_verification_steps
 }
 
 // =============================================================================
@@ -472,6 +545,7 @@ mod tests {
     fn eval_snap() -> VerificationEvalSnapshot {
         VerificationEvalSnapshot {
             all_passed: false,
+            required_steps: 3,
             critical_failure: false,
             passed_steps: 3,
             best_passed_checks: 3,
@@ -541,6 +615,84 @@ mod tests {
             decide_evaluate_verification(&snap),
             VerificationEvalDecision::ContinueToFix { .. }
         ));
+    }
+
+    /// The predecessor plan's vacuous-green trap, pinned. An empty set, fed the
+    /// `all_passed: true` the old producers reported for it, still ends
+    /// `NoVerificationSteps`: a producer that says "all passed" over nothing
+    /// cannot manufacture a pass.
+    #[test]
+    fn eval_empty_set_fed_all_passed_ends_no_verification_steps() {
+        let snap = VerificationEvalSnapshot {
+            all_passed: true,
+            required_steps: 0,
+            critical_failure: false,
+            passed_steps: 0,
+            best_passed_checks: 0,
+            fix_attempts: 0,
+            max_fix_attempts: 3,
+        };
+        assert_eq!(
+            decide_evaluate_verification(&snap),
+            VerificationEvalDecision::NoVerificationSteps
+        );
+    }
+
+    /// Two informational steps that both passed: the shared fold says
+    /// `all_passed`, but no required step ran, so nothing was checked.
+    #[test]
+    fn eval_all_informational_set_fed_all_passed_ends_no_verification_steps() {
+        let snap = VerificationEvalSnapshot {
+            all_passed: true,
+            required_steps: 0,
+            critical_failure: false,
+            passed_steps: 2,
+            best_passed_checks: 0,
+            fix_attempts: 0,
+            max_fix_attempts: 3,
+        };
+        assert_eq!(
+            decide_evaluate_verification(&snap),
+            VerificationEvalDecision::NoVerificationSteps
+        );
+    }
+
+    /// The smallest verification that checked something: one required step,
+    /// passed. That is a pass, so the new branch takes nothing from it.
+    #[test]
+    fn eval_one_required_step_passing_is_verification_passed() {
+        let snap = VerificationEvalSnapshot {
+            all_passed: true,
+            required_steps: 1,
+            critical_failure: false,
+            passed_steps: 1,
+            best_passed_checks: 0,
+            fix_attempts: 0,
+            max_fix_attempts: 3,
+        };
+        assert_eq!(
+            decide_evaluate_verification(&snap),
+            VerificationEvalDecision::VerificationPassed
+        );
+    }
+
+    /// Nothing checked is decided first, before `all_passed` and before a
+    /// critical flag: with no required step there is no failure to attribute.
+    #[test]
+    fn eval_nothing_checked_is_decided_before_critical_failure() {
+        let snap = VerificationEvalSnapshot {
+            all_passed: false,
+            required_steps: 0,
+            critical_failure: true,
+            passed_steps: 0,
+            best_passed_checks: 0,
+            fix_attempts: 0,
+            max_fix_attempts: 3,
+        };
+        assert_eq!(
+            decide_evaluate_verification(&snap),
+            VerificationEvalDecision::NoVerificationSteps
+        );
     }
 
     // ---- PostAgenticSignals ----
@@ -674,5 +826,179 @@ mod tests {
             approved: false,
         });
         assert_eq!(d, ApprovalResponseDecision::Rejected);
+    }
+}
+
+// The pure helpers behind the nothing-checked verdict: the required-step
+// count, the targeted-group credit and the compensation gate.
+#[cfg(test)]
+mod nothing_checked_decision_tests {
+    use super::*;
+
+    fn step(required: Option<bool>, success: bool) -> StepExecutionResult {
+        StepExecutionResult {
+            step_index: 0,
+            step_type: "command".to_string(),
+            step_name: "check".to_string(),
+            step_id: None,
+            success,
+            error: None,
+            screenshot_path: None,
+            started_at: None,
+            ended_at: None,
+            duration_ms: 0,
+            config: Default::default(),
+            verification_details: None,
+            output_data: None,
+            required,
+            resolved_inputs: None,
+            extracted_values: None,
+            failure_category: None,
+            interrupted: None,
+        }
+    }
+
+    fn phase_result(
+        step_results: Vec<StepExecutionResult>,
+        all_passed: bool,
+    ) -> VerificationPhaseResult {
+        VerificationPhaseResult {
+            iteration: 1,
+            all_passed,
+            total_steps: step_results.len(),
+            passed_steps: step_results.iter().filter(|s| s.success).count(),
+            failed_steps: step_results.iter().filter(|s| !s.success).count(),
+            skipped_steps: 0,
+            total_duration_ms: 0,
+            step_results,
+            critical_failure: false,
+            console_errors: None,
+            app_health: None,
+            browser_events: None,
+            network_failures: None,
+        }
+    }
+
+    /// `required` absent counts as required (the shared fold's default);
+    /// `Some(false)` does not.
+    #[test]
+    fn required_step_count_counts_zero_one_and_many() {
+        assert_eq!(required_step_count(&[]), 0);
+        assert_eq!(required_step_count(&[step(Some(false), true)]), 0);
+        assert_eq!(
+            required_step_count(&[step(Some(false), true), step(None, true)]),
+            1
+        );
+        assert_eq!(
+            required_step_count(&[
+                step(Some(true), false),
+                step(None, true),
+                step(Some(false), false),
+            ]),
+            2
+        );
+    }
+
+    /// A fix group whose targeted run selected zero steps is not credited as
+    /// fixed. This is the result the old empty arm returned:
+    /// `all_passed: true` over nothing.
+    #[test]
+    fn a_zero_step_targeted_group_is_not_fixed() {
+        assert!(!targeted_group_fixed(&phase_result(Vec::new(), true)));
+    }
+
+    #[test]
+    fn an_informational_only_targeted_group_is_not_fixed() {
+        assert!(!targeted_group_fixed(&phase_result(
+            vec![step(Some(false), true)],
+            true
+        )));
+    }
+
+    #[test]
+    fn a_targeted_group_whose_required_steps_pass_is_fixed() {
+        assert!(targeted_group_fixed(&phase_result(
+            vec![step(None, true)],
+            true
+        )));
+        assert!(targeted_group_fixed(&phase_result(
+            vec![
+                step(Some(true), true),
+                step(None, true),
+                step(Some(false), false),
+            ],
+            true
+        )));
+    }
+
+    #[test]
+    fn a_targeted_group_with_a_failing_required_step_is_not_fixed() {
+        assert!(!targeted_group_fixed(&phase_result(
+            vec![step(None, false)],
+            false
+        )));
+    }
+
+    fn loop_exit(
+        verification_passed: bool,
+        was_stopped: bool,
+        no_verification_steps: bool,
+    ) -> LoopResult {
+        LoopResult {
+            iterations_run: 1,
+            verification_passed,
+            max_iterations_reached: false,
+            critical_failure: false,
+            was_stopped,
+            unfixable_errors: false,
+            iteration_results: Vec::new(),
+            total_tokens: None,
+            total_cost_usd: None,
+            fix_attempts_exhausted: false,
+            no_verification_steps,
+            files_modified: Vec::new(),
+            fix_attempts: 0,
+            ci_auto_resumes: 0,
+            node_rollups: Vec::new(),
+        }
+    }
+
+    /// A `no_verification_steps` exit under `rollback_policy: clean` (or
+    /// `last_good`) leaves the worktree and its commits alone. Neither the
+    /// rollback nor the worktree finalizer runs, because nothing refuted the
+    /// work.
+    #[test]
+    fn a_no_verification_steps_exit_under_a_rollback_policy_compensates_nothing() {
+        let nothing_checked = loop_exit(false, false, true);
+        assert!(!compensation_applies(
+            &nothing_checked,
+            &RollbackPolicy::Clean
+        ));
+        assert!(!compensation_applies(
+            &nothing_checked,
+            &RollbackPolicy::LastGood
+        ));
+    }
+
+    /// The control: a refuted run does compensate under either policy, and
+    /// does not when no policy is configured.
+    #[test]
+    fn a_failed_exit_under_a_rollback_policy_compensates() {
+        let failed = loop_exit(false, false, false);
+        assert!(compensation_applies(&failed, &RollbackPolicy::Clean));
+        assert!(compensation_applies(&failed, &RollbackPolicy::LastGood));
+        assert!(!compensation_applies(&failed, &RollbackPolicy::None));
+    }
+
+    #[test]
+    fn a_passed_or_stopped_exit_compensates_nothing() {
+        assert!(!compensation_applies(
+            &loop_exit(true, false, false),
+            &RollbackPolicy::Clean
+        ));
+        assert!(!compensation_applies(
+            &loop_exit(false, true, false),
+            &RollbackPolicy::Clean
+        ));
     }
 }

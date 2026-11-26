@@ -241,7 +241,8 @@ mod tests {
             .observe(&key, seen(), Default::default(), now)
             .expect("closed");
         let binds =
-            crate::journey::capture::edge_insert(&crate::journey::capture::finalize(edge)).unwrap();
+            crate::journey::capture::edge_insert(&crate::journey::capture::finalize(edge), None)
+                .unwrap();
         assert_eq!(binds.from_node_key, batch.node_key);
         assert_eq!(
             binds.target_fingerprint.as_ref(),

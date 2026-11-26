@@ -69,12 +69,13 @@ do not re-derive it from a summary elsewhere.
 | coord `GET /coord/sessions/worktrees` | `{tenantId, sessions, reapStatusCounts, count, limit, nextCursor}` | `require_collection(p, "sessions")` (camelCase door) reads ONE PAGE, never the whole index: re-GET with `?limit=500&cursor=<nextCursor>` until `nextCursor` is null (an ABSENT key = a pre-cursor coord, one final page); a session can recur across pages, so merge by `sessionId`; `count`/`reapStatusCounts` are per-page; a walk you stop early must say it read a partial index |
 | coord `GET /coord/alerts` | `{alerts, total_count, count}` | `require_collection(p, "alerts")`; `total_count` is the unpaged total |
 | coord MCP `tools/call` (JSON-RPC) | `{jsonrpc, id, result}` or `{jsonrpc, id, error}` | `require_key(p, "error")` first — its presence IS the answer; then `require_key(p, "result")` |
-| `coord-revive.sh call <tool> '<json>'` stdout (the MCP `result`) | `{content: [{type, text: "<the tool's body as a JSON STRING>"}], isError?}` | `unwrap_mcp_text(p, door)` (CLI `--mcp-text`, bash `envelope_mcp_body`) FIRST — the tool's own `{hits, count, …}` sits one JSON decode deeper; `isError: true` and a non-JSON `text` are UNKNOWN. Then read the tool's row below |
+| `coord-revive.sh call <tool> '<json>'` stdout (the MCP `result`) | `{content: [{type, text: "<the tool's body as a JSON STRING>"}], isError?}` | `unwrap_mcp_text(p, door)` (CLI `--mcp-text`, bash `envelope_mcp_body`) FIRST — the tool's own `{hits, count, …}` sits one JSON decode deeper; `isError: true` and a non-JSON `text` are UNKNOWN; a second item is UNKNOWN unless it is the runner proxy's `TENANT UNVERIFIED:` notice (dropped) — a `TENANT MISMATCH:` one is UNKNOWN. Then read the tool's row below |
 | coord `coord_memory_search` | `{hits, vector_arm, live_row_count, query_echo, anchored_hits, anchored_hit_count, …}` — **no `count`** (measured live 2026-09-26; web `MemoryQueryResponse` declares none) | `require_key(p, "hits")` — NOT `require_collection`, which would answer UNKNOWN on the absent `count` every time. Beside a zero read `live_row_count` (this response's own tenant-wide denominator) and `vector_arm` (`skipped_no_embedding` is the normal case); a zero against `live_row_count > 0` is still a hypothesis until a control query returns rows |
 | coord `coord_memory_overview` | `{row_count, corpus_complete, facets: {live_row_count, by_kind, by_scope} or null, …}` | `require_key(p, "facets.live_row_count")` — NESTED under `facets` (a top-level `live_row_count` read is the wrong-key defect); `facets: null` beside `corpus_complete: false` is UNKNOWN |
 | web `GET /api/v1/memory/records` | `{records, next_cursor, count}` | `require_collection(p, "records")` |
-| web `GET /api/v1/plan-library` | `{items, total, offset, limit, count}` | `require_collection(p, "items")`; `total` is the UNPAGED total |
-| web `/plan-library/candidates`, `/open-followups` | `{items, total, count}` | `require_collection(p, "items")` |
+| web `GET /api/v1/plan-library` | `{items, count, limit, shown, total, truncated, bound_kind, next_cursor, …}` (shared `BoundedReadMeta`) | `require_collection(p, "items")`; `total` counts from THIS page's start; walk `next_cursor` (sent back as `cursor`) |
+| web `/plan-library/candidates`, `/followups` | `{items, total, count, truncated, bound_kind, next_cursor, …}` | `require_collection(p, "items")`; keyset, no `offset` |
+| web `/plan-library/reconciliation` | `{items, total, count, truncated, bound_kind, next_cursor, …}` (`BoundedReadMeta`) | `require_collection(p, "items")`; follow `next_cursor` until null — page 1 is never the corpus |
 
 `count` is REQUIRED by `require_collection`: absent is an `EnvelopeUnknown`
 (the backend predates the phase that added it — that is unknown, not zero),
@@ -350,6 +351,24 @@ def unwrap_mcp_text(
         string holding JSON, else UNKNOWN naming which half failed. A second
         item is refused rather than ignored: coord answers one text item, and
         a body spread over two is not one this reader can vouch for;
+      * ...with ONE exception, the runner's own tenant notice. The coord-mcp
+        proxy's tenant check (qontinui-runner `coord_mcp_tenant.rs`, plan
+        2026-09-20-a-sessions-tenant-follows-its-repo-and-every-coord-answer-names-its-tenant)
+        appends one text item after coord's body, the same text it also
+        writes into `structuredContent` as `io.qontinui/tenant_notice`. It is
+        read off that ITEM, so exactly two items are required and the second
+        must open with the notice's own prefix:
+          - `TENANT UNVERIFIED:` the item is dropped and item 0 is read exactly
+            as a one-item result is, so a list body stays a list. The proxy
+            appends this notice only on a nonce's first call and on identity
+            tools (`coord_orient` among them), so most answers in such a
+            session already carry none; before this the `/finish-session`
+            step 1a ownership read of `coord_orient` was UNKNOWN on every
+            such box (measured 2026-11-11 through the proxy);
+          - `TENANT MISMATCH:` UNKNOWN, quoting the notice. The runner labels
+            the answer another project's data, and this reader refused it
+            before this rule existed and still does;
+          - any other second item, or a third, keeps the refusal above;
       * no `content` at all: the object itself falls through unchanged (a
         body that was never wrapped), so a later `require_*` still names the
         key it could not find.
@@ -375,6 +394,16 @@ def unwrap_mcp_text(
     if "content" not in cur:
         return cur
     content = cur["content"]
+    if (isinstance(content, list) and len(content) == 2 and isinstance(content[1], dict)
+            and isinstance(content[1].get("text"), str)):
+        notice = content[1]["text"]
+        if notice.startswith("TENANT MISMATCH:"):
+            raise EnvelopeUnknown(door, "content.1.text", _present_keys(cur), prov,
+                                  "the runner's tenant check names this answer another project's data: "
+                                  f"{notice[:300]!r}", state="is a TENANT MISMATCH notice")
+        if notice.startswith("TENANT UNVERIFIED:"):
+            cur = dict(cur, content=content[:1])
+            content = cur["content"]
     if isinstance(content, list) and len(content) > 1:
         raise EnvelopeUnknown(door, "content", _present_keys(cur), prov,
                               f"an MCP result carrying {len(content)} content items; exactly one is read",

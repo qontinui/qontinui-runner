@@ -83,7 +83,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::process_helpers::{run_probe, run_probe_quiet, DegradeReason, ProbeOutcome};
@@ -115,6 +115,7 @@ use uuid::Uuid;
 use qontinui_runner_lib::profiles::connected_coord_base;
 
 use super::canonical_paths::default_canonical_path;
+use crate::ci_node::admission::MountReading;
 // The trunk resolver used to live here, private. It now backs four call sites
 // across the binary (this census, the reclaim-safety probe, the fleet tree
 // publisher, the build-drift baseline), so it lives in one module instead.
@@ -641,7 +642,7 @@ impl ChunkPoster {
     /// lesson applied to the walk: a rule keyed in one place gets missed by the
     /// next mechanism that needs it.
     fn resolve_dest(device_id: Uuid) -> Option<(reqwest::Client, String)> {
-        if !crate::fleet::machine_state_publish_allowed(crate::instance::owns_shared_root_state()) {
+        if !runs_machine_census() {
             debug!(
                 "worktree_census: SECONDARY instance — walking for the local snapshot only, \
                  not POSTing the machine's inventory (see `fleet::machine_state_publish_allowed`)"
@@ -877,6 +878,11 @@ pub(super) async fn build_and_publish() -> Result<BuildOutcome, String> {
 /// `true` when a new walk was started, `false` when one was already running.
 /// Never awaits the walk — the caller must stay bounded.
 pub(super) fn spawn_census_rebuild() -> bool {
+    // An explicit refresh asks for fresh numbers, so no memoised size may
+    // answer it — cleared BEFORE the active-walk check, because a refresh that
+    // joins a walk already running is answered by that walk's snapshot. Rows
+    // that walk had already sized keep the sizes it gave them.
+    super::census_size_memo::clear();
     if census_build_active() {
         return false;
     }
@@ -962,6 +968,26 @@ pub struct VolumeReport {
     pub drive_letter: Option<String>,
     pub total_bytes: u64,
     pub free_bytes: u64,
+    /// `sysinfo::Disk::is_removable()` for the volume — per-OS, see
+    /// [`MountReading::removable`] (on Linux a USB SSD counts). The low-disk
+    /// alarm skips a removable volume the runner does not use; see
+    /// [`low_disk_alarms`].
+    ///
+    /// Skipped on the wire when `false`, so a body with no removable volume is
+    /// byte-identical to the pre-existing contract; coord's `VolumeItem`
+    /// ignores unknown fields until it learns to read this one.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub removable: bool,
+    /// `sysinfo::Disk::is_read_only()` for the volume — see
+    /// [`MountReading::read_only`]. The low-disk alarm never speaks for a
+    /// read-only volume; see [`low_disk_alarms`].
+    ///
+    /// ALWAYS serialized, `false` included — unlike `removable`. Coord reads
+    /// this as three-valued: an ABSENT key means a runner build that does not
+    /// publish it, so "unknown", never "writable" (plan
+    /// `2026-11-03-devops-headroom-grades-read-only-and-esp-volumes-against-the-disk-floor`
+    /// D3). Skipping `false` would make every writable volume read unknown.
+    pub read_only: bool,
 }
 
 /// Census row for one worktree.
@@ -1022,14 +1048,30 @@ pub struct WorktreeCensus {
     pub nm_present: bool,
     pub nm_is_junction: bool,
     /// Real (non-junction) bytes of `node_modules`. 0 when junctioned or
-    /// absent.
+    /// absent. APPARENT size: a file hardlinked from the pnpm store counts in
+    /// full here though removing the tree frees none of it.
     pub nm_bytes: u64,
+    /// The bytes removing `node_modules` frees: each inode once, and an inode
+    /// still linked from outside the tree (the pnpm content-addressed store)
+    /// not at all. `Some(0)` when junctioned or absent. `None` = UNKNOWN —
+    /// off unix (no link count in the directory record), or the tree could
+    /// not be read in full.
+    /// Additive on the wire: coord's `WorktreeItem` ignores unknown keys, and
+    /// any coord adoption must be `#[serde(default)]` reading a missing value
+    /// as UNKNOWN. Plan
+    /// `2026-11-22-worktree-census-counts-hardlinked-pnpm-store-bytes-as-reclaimable`.
+    pub nm_exclusive_bytes: Option<u64>,
 
     pub target_present: bool,
     pub target_is_junction: bool,
     /// Real (non-junction) bytes of the build `target` dir. 0 when
-    /// junctioned or absent.
+    /// junctioned or absent. APPARENT size: an in-tree hardlink pair (a cargo
+    /// uplift) counts twice.
     pub target_bytes: u64,
+    /// The bytes removing the build `target` dir frees, measured as
+    /// [`nm_exclusive_bytes`](Self::nm_exclusive_bytes) is: an in-tree
+    /// hardlink pair counts once. Same `Some(0)` / `None` reading.
+    pub target_exclusive_bytes: Option<u64>,
 
     /// Run-provenance (plan `2026-08-16-plan-corpus-authority-and-run-
     /// provenance`, Phase 1): the **effective** cargo target directory this
@@ -1057,10 +1099,43 @@ pub struct WorktreeCensus {
     /// the wire.
     pub build_slot: Option<String>,
 
+    /// [`build_target_dir`](Self::build_target_dir) with every symlink and
+    /// junction in its existing prefix resolved ([`resolved_volume_path`]):
+    /// the path the build's bytes actually land under, from which coord
+    /// derives the volume to CHARGE a build to. `build_target_dir` itself
+    /// stays unresolved — it is the identity other consumers compare against.
+    ///
+    /// `None` when `build_target_dir` is `None`, or when no ancestor of it
+    /// could be canonicalised — NOT OBSERVED, never "on the root volume".
+    /// Persisted as `build_target_volume_path TEXT NULL` on the three coord
+    /// census tables (web migration `wtcensus_volpath_01_resolved_volume_paths`).
+    /// Always serialized, like `build_target_dir`; an old coord ignores it.
+    pub build_target_volume_path: Option<String>,
+
+    /// [`path`](Self::path) resolved the same way: the path this checkout's
+    /// bytes actually live under (a symlinked `agent-worktrees/<id>` resolves
+    /// to its target, e.g. under `/data`). `path` itself stays unresolved.
+    /// `None` = NOT OBSERVED. Persisted as `worktree_volume_path TEXT NULL`.
+    pub worktree_volume_path: Option<String>,
+
     /// RFC3339 mtime of the worktree dir itself, `None` if unreadable.
     pub last_access_mtime: Option<String>,
-    /// Sum of the non-junction real bytes attributable to this worktree
-    /// (`nm_bytes + target_bytes`). A junctioned dir contributes 0.
+    /// The bytes the operator gets back by removing this worktree's
+    /// `node_modules` and `target`: per dir, its EXCLUSIVE bytes where
+    /// measured ([`nm_exclusive_bytes`](Self::nm_exclusive_bytes),
+    /// [`target_exclusive_bytes`](Self::target_exclusive_bytes)), else its
+    /// apparent bytes (`nm_bytes` / `target_bytes`) where exclusivity is
+    /// `None` (off unix, or a walk that could not read every sub-directory).
+    /// An apparent fallback still counts store-hardlinked bytes in full, so it
+    /// can OVERSTATE what removal frees. A junctioned dir contributes 0. A pnpm tree
+    /// hardlinked from the store therefore contributes only its unshared
+    /// bytes, not its apparent size. Each dir is measured on its own, so an
+    /// inode linked from BOTH `node_modules` and `target`, or from several
+    /// worktrees once the store copy is pruned, counts 0 in each: summed
+    /// across rows whose exclusivity was measured, this is a lower bound on
+    /// what removing them all frees. A runner predating the exclusive fields
+    /// sent the apparent figure here; a row carrying `nm_exclusive_bytes` (even
+    /// as `null`) is from a runner that computes it this way.
     pub attributable_bytes: u64,
 
     /// G2 "work landed" — whether this worktree's HEAD is already
@@ -1379,54 +1454,60 @@ pub(crate) fn remove_link(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Recursive byte size of `dir`, summing real file sizes. SKIPS any
-/// directory that is a reparse point (junction): it contributes 0 and is
-/// never traversed. The top-level `dir` is assumed already checked by
-/// the caller (we never even call this for a junctioned top-level dir),
-/// but nested junctions inside the tree are also skipped defensively so
-/// a junction buried under a real dir can't cause a 165 GB traversal.
-fn dir_size_skipping_junctions(dir: &Path) -> u64 {
-    let mut total: u64 = 0;
-    let read = match std::fs::read_dir(dir) {
-        Ok(r) => r,
-        Err(_) => return 0,
-    };
-    for entry in read.flatten() {
-        let path = entry.path();
-        // symlink_metadata: never follow a link/junction.
-        let meta = match std::fs::symlink_metadata(&path) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        let file_type = meta.file_type();
-        if file_type.is_symlink() {
-            // A symlink (file or dir) — skip, do not follow.
-            continue;
-        }
-        if file_type.is_dir() {
-            if is_junction(&path) {
-                // Reparse point — never traverse.
-                continue;
-            }
-            total = total.saturating_add(dir_size_skipping_junctions(&path));
-        } else if file_type.is_file() {
-            total = total.saturating_add(meta.len());
-        }
-    }
-    total
-}
-
 /// Measure one candidate dir (`node_modules` / `target`):
-/// `(present, is_junction, bytes)`. A junction reports
-/// `(true, true, 0)` and is never walked.
-fn measure_dir(dir: &Path) -> (bool, bool, u64) {
+/// `(present, is_junction, bytes, exclusive_bytes)`. `bytes` is the apparent
+/// size; `exclusive_bytes` is what removing the dir frees, `None` when
+/// UNKNOWN (off unix, or the tree could not be read). A junction reports
+/// `(true, true, 0, Some(0))` and is never walked.
+fn measure_dir(dir: &Path) -> (bool, bool, u64, Option<u64>) {
     if !dir.exists() {
-        return (false, false, 0);
+        return (false, false, 0, Some(0));
     }
     if is_junction(dir) {
-        return (true, true, 0);
+        return (true, true, 0, Some(0));
     }
-    (true, false, dir_size_skipping_junctions(dir))
+    // `present` and `is_junction` above are read live every time (one stat
+    // each), so a removal or a junction swap shows at once; only the byte total
+    // — a full walk of a `node_modules` or `target` — is memoised, because the
+    // census walk is now paced from its end and would otherwise size the same
+    // trees several times as often as before (plan
+    // `2026-10-24-runner-git-probes-spawn-40-processes-per-second-and-fetch-into-empty-dirs` Phase 3).
+    // An unreadable tree reads 0 apparent bytes, as before, and UNKNOWN
+    // exclusivity — never a fabricated `Some(0)`.
+    let (bytes, exclusive) = super::census_size_memo::size_or_measure(dir, || {
+        super::orphan_target_reaper::measure_dir_size(dir).map(|m| (m.bytes, m.exclusive_bytes))
+    })
+    .unwrap_or((0, None));
+    (true, false, bytes, exclusive)
+}
+
+/// [`WorktreeCensus::attributable_bytes`]: per dir, the exclusive bytes where
+/// measured, else the apparent bytes.
+fn reclaimable_footprint(
+    nm_bytes: u64,
+    nm_exclusive_bytes: Option<u64>,
+    target_bytes: u64,
+    target_exclusive_bytes: Option<u64>,
+) -> u64 {
+    nm_exclusive_bytes
+        .unwrap_or(nm_bytes)
+        .saturating_add(target_exclusive_bytes.unwrap_or(target_bytes))
+}
+
+/// [`is_junction`]'s test applied to metadata already in hand — a directory
+/// RECORD (`DirEntry::metadata`), which on Windows carries the attributes
+/// without opening the entry: `FILE_ATTRIBUTE_REPARSE_POINT` there, a symlink
+/// elsewhere.
+pub(crate) fn metadata_is_reparse_point(meta: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        meta.file_type().is_symlink()
+    }
 }
 
 /// Pick the build `target` dir to MEASURE for a worktree, keyed on the
@@ -1477,6 +1558,11 @@ pub(super) fn target_dir_for(worktree: &Path) -> PathBuf {
 pub(crate) struct BuildTarget {
     pub dir: Option<String>,
     pub slot: Option<String>,
+    /// [`dir`](Self::dir) with every symlink and junction in its existing
+    /// prefix resolved ([`resolved_volume_path`]) — the path the build's bytes
+    /// actually land under. `None` whenever `dir` is, or when no ancestor of
+    /// it could be canonicalised.
+    pub volume_path: Option<String>,
 }
 
 /// The directory a `cargo` invocation for this worktree runs FROM, which is
@@ -1717,7 +1803,30 @@ pub(crate) fn resolve_build_target(worktree: &Path, env_target_dir: Option<&str>
     BuildTarget {
         dir: Some(normalize_path_str(&dir)),
         slot: build_slot_for(&dir),
+        volume_path: resolved_volume_path(&dir),
     }
+}
+
+/// `path` resolved through its nearest EXISTING ancestor
+/// ([`crate::util::existing_ancestor::resolve_through_existing_ancestor`]),
+/// in the census's forward-slashed form with a Windows verbatim prefix
+/// stripped ([`comparable_path`]) — the path coord derives a VOLUME from.
+///
+/// This is the deliberate counterpart of [`lexical_normalize`]: the IDENTITY
+/// fields (`path`, `build_target_dir`) stay unresolved because other consumers
+/// compare against them, while this one answers "which disk do the bytes land
+/// on". On a box where `agent-worktrees/<id>` is a symlink into
+/// `/data/qontinui/agent-worktrees/<id>`, the unresolved path prefix-matches
+/// `/` while the bytes are on `/data` (plan
+/// `2026-11-22-coord-charges-a-build-in-a-symlinked-agent-worktree-to-root`).
+/// The target dir may not exist yet, hence the nearest-existing-ancestor walk
+/// rather than `canonicalize`. `None` = NOT OBSERVED (no ancestor exists, it
+/// could not be canonicalised, or a component is a symlink that cannot be
+/// followed, e.g. a dangling one); coord then falls back to the unresolved path.
+pub(crate) fn resolved_volume_path(path: &Path) -> Option<String> {
+    crate::util::existing_ancestor::resolve_through_existing_ancestor(path)
+        .ok()
+        .map(|resolved| comparable_path(&resolved))
 }
 
 /// [`resolve_build_target`] against the live process environment.
@@ -1742,7 +1851,10 @@ fn resolve_build_target_live(worktree: &Path) -> BuildTarget {
 /// low-disk alarm on that path should not fire for an unrelated mount the
 /// runner never writes to. The product question — "how much disk is left,
 /// anywhere?" — is [`collect_all_volumes`], sampled on its own tick.
-fn collect_volumes(worktree_paths: &[PathBuf]) -> Vec<VolumeReport> {
+///
+/// PURE over `mounts`, so the walk enumerates `sysinfo::Disks` ONCE and
+/// derives both its wire volumes and its alarm's volumes from that reading.
+fn collect_volumes(mounts: &[MountReading], worktree_paths: &[PathBuf]) -> Vec<VolumeReport> {
     // Distinct drive letters (uppercased, with colon) among the paths.
     let mut wanted: HashSet<String> = HashSet::new();
     for p in worktree_paths {
@@ -1753,7 +1865,7 @@ fn collect_volumes(worktree_paths: &[PathBuf]) -> Vec<VolumeReport> {
     if wanted.is_empty() {
         return Vec::new();
     }
-    volumes_from_mounts(&mounts(), Some(&wanted))
+    volumes_from_mounts(mounts, Some(&wanted))
 }
 
 /// Build a [`VolumeReport`] for **every mounted volume**, whether or not a
@@ -1775,19 +1887,19 @@ pub(crate) fn collect_all_volumes() -> Vec<VolumeReport> {
     volumes_from_mounts(&mounts(), None)
 }
 
-/// Every mounted volume as `(mount_point, total_bytes, available_bytes)`.
+/// Every mounted volume as a [`MountReading`].
 ///
 /// Delegates to [`crate::ci_node::admission::enumerate_mounts`] — the runner's
 /// single `sysinfo::Disks` enumeration site — so the free-space number this
 /// module publishes and the one the CI-node admission floor trips on are
 /// literally the same reading.
-fn mounts() -> Vec<(PathBuf, u64, u64)> {
+fn mounts() -> Vec<MountReading> {
     crate::ci_node::admission::enumerate_mounts()
 }
 
-/// PURE mapping of `(mount_point, total_bytes, free_bytes)` mounts into
-/// [`VolumeReport`]s, optionally filtered to a set of volume keys. Split out
-/// so both collectors are unit-testable without touching a real disk.
+/// PURE mapping of [`MountReading`]s into [`VolumeReport`]s, optionally
+/// filtered to a set of volume keys. Split out so both collectors are
+/// unit-testable without touching a real disk.
 ///
 /// Two entries mapping to the same key keep the FIRST (deterministic via the
 /// `BTreeMap`), and a mount reporting `total_bytes == 0` is DROPPED: an empty
@@ -1807,11 +1919,18 @@ fn mounts() -> Vec<(PathBuf, u64, u64)> {
 /// volume that actually holds those worktrees in the census's attribution set
 /// instead of silently reporting only the letter's root volume.
 fn volumes_from_mounts(
-    mounts: &[(PathBuf, u64, u64)],
+    mounts: &[MountReading],
     wanted: Option<&HashSet<String>>,
 ) -> Vec<VolumeReport> {
     let mut out: BTreeMap<String, VolumeReport> = BTreeMap::new();
-    for (mount, total, free) in mounts {
+    for MountReading {
+        mount,
+        total,
+        available: free,
+        removable,
+        read_only,
+    } in mounts
+    {
         if *total == 0 {
             continue;
         }
@@ -1832,6 +1951,8 @@ fn volumes_from_mounts(
                 drive_letter,
                 total_bytes: *total,
                 free_bytes: *free,
+                removable: *removable,
+                read_only: *read_only,
             });
     }
     out.into_values().collect()
@@ -2318,12 +2439,14 @@ pub(crate) fn compute_canonical_branch(canonical: &Path) -> Option<String> {
 }
 
 /// Ξ_Worktree P7.3 — dirty bit of the canonical checkout
-/// (`git status --porcelain` non-empty). `Some(true)` when there are
+/// (`git status --porcelain --untracked-files=all` non-empty — an untracked
+/// file hidden by `status.showUntrackedFiles=no` still counts). `Some(true)` when there are
 /// uncommitted changes, `Some(false)` when clean, `None` on a git failure
 /// (fail-OPEN to `None` is fine: coord reads `None` as unsafe). This is the
 /// P1-clean precondition input for SharedBranch.
 pub(crate) fn compute_canonical_is_dirty(canonical: &Path) -> Option<bool> {
-    git_capture(canonical, &["status", "--porcelain"]).map(|s| !s.trim().is_empty())
+    git_capture(canonical, super::dirty::STATUS_PORCELAIN_ALL_UNTRACKED)
+        .map(|s| !s.trim().is_empty())
 }
 
 /// Ξ_Worktree P7.3 — advisory base-divergence summary for the canonical
@@ -2366,6 +2489,20 @@ fn compute_canonical_base_divergence(canonical: &Path) -> Option<String> {
 
 /// Build the census row for a single worktree dir.
 fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
+    // Run provenance: WHICH dir this worktree's builds write to, and whether
+    // that dir is a shared pool slot. Filesystem-only + cheap (a couple of
+    // `is_file` probes plus at most one small TOML parse) — no git spawn.
+    capture_worktree_with_build_target(repo, worktree, resolve_build_target_live(worktree))
+}
+
+/// [`capture_worktree`] with the build target already resolved, so a test can
+/// drive the whole row builder without the live `CARGO_TARGET_DIR` (which a
+/// `cargo-guard.sh` test run sets for itself) leaking into the row.
+fn capture_worktree_with_build_target(
+    repo: &str,
+    worktree: &Path,
+    build_target: BuildTarget,
+) -> WorktreeCensus {
     let branch =
         git_capture(worktree, &["symbolic-ref", "--short", "HEAD"]).filter(|s| !s.is_empty());
     let head_sha = git_capture(worktree, &["rev-parse", "HEAD"]).filter(|s| !s.is_empty());
@@ -2438,13 +2575,10 @@ fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
     let is_dirty = dirty_verdict.as_conservative_bool();
     let is_dirty_known = dirty_verdict.is_known();
 
-    let (nm_present, nm_is_junction, nm_bytes) = measure_dir(&worktree.join("node_modules"));
-    let (target_present, target_is_junction, target_bytes) = measure_dir(&target_dir_for(worktree));
-
-    // Run provenance: WHICH dir this worktree's builds write to, and whether
-    // that dir is a shared pool slot. Filesystem-only + cheap (a couple of
-    // `is_file` probes plus at most one small TOML parse) — no git spawn.
-    let build_target = resolve_build_target_live(worktree);
+    let (nm_present, nm_is_junction, nm_bytes, nm_exclusive_bytes) =
+        measure_dir(&worktree.join("node_modules"));
+    let (target_present, target_is_junction, target_bytes, target_exclusive_bytes) =
+        measure_dir(&target_dir_for(worktree));
 
     // WIP custody (Phase 3). Two bounded FILE READS on the hit path, ONE on
     // the miss path, and no subprocess at any point — `$GIT_DIR` comes from
@@ -2462,7 +2596,12 @@ fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
         .and_then(|m| m.modified().ok())
         .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339());
 
-    let attributable_bytes = nm_bytes.saturating_add(target_bytes);
+    let attributable_bytes = reclaimable_footprint(
+        nm_bytes,
+        nm_exclusive_bytes,
+        target_bytes,
+        target_exclusive_bytes,
+    );
 
     // G2: ancestry/patch-id "landed in the repo's trunk" — local git only,
     // None when undeterminable (unresolvable trunk, git failure).
@@ -2498,11 +2637,15 @@ fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
         nm_present,
         nm_is_junction,
         nm_bytes,
+        nm_exclusive_bytes,
         target_present,
         target_is_junction,
         target_bytes,
+        target_exclusive_bytes,
         build_target_dir: build_target.dir,
         build_slot: build_target.slot,
+        build_target_volume_path: build_target.volume_path,
+        worktree_volume_path: resolved_volume_path(worktree),
         last_access_mtime,
         attributable_bytes,
         landed_in_main,
@@ -2625,22 +2768,30 @@ fn build_census_chunked(
     });
 
     let paths: Vec<PathBuf> = worktrees.iter().map(|w| PathBuf::from(&w.path)).collect();
-    let volumes = collect_volumes(&paths);
-    // Low-free-space alarm — a LEADING signal so low disk surfaces here rather
-    // than as phantom cargo build failures (`os error 112`). Runs on every
-    // completed walk regardless of coord reachability. Read-only. The walk is
-    // multi-hour, so it is UNTHROTTLED — only the 60 s publisher needs a rate
-    // limit — and the "did it emit" answer is therefore unused here.
-    let _emitted = warn_on_low_disk(&volumes);
+    // ONE `sysinfo::Disks` enumeration per walk: the wire volumes and the
+    // low-disk alarm's volumes are both derived from this reading.
+    let mounts = mounts();
+    let volumes = collect_volumes(&mounts, &paths);
     emitter.finish(volumes.clone());
 
-    WorktreeCensusReq {
+    let req = WorktreeCensusReq {
         device_id,
         tenant_id,
         volumes,
         worktrees,
         cargo_locks: None,
-    }
+    };
+    // Low-free-space alarm — a LEADING signal so low disk surfaces here rather
+    // than as phantom cargo build failures (`os error 112`). Runs on every
+    // completed walk regardless of coord reachability. Read-only.
+    let _alarms = warn_on_walked_low_disk(
+        &mounts,
+        &req,
+        declared_external_mount().as_deref(),
+        &essential_paths(),
+        LowDiskFloors::from_env(),
+    );
+    req
 }
 
 /// Env override (bytes) for the low-disk WARN floor. Default ~100 GB.
@@ -2657,47 +2808,428 @@ fn env_bytes(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-/// Emit a `warn!`/`error!` per volume whose free space is under the floor. A
-/// leading signal for the disk-full condition that otherwise only manifests as
+/// Which floor a volume's free space is under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LowDiskLevel {
+    /// Under the critical floor ([`LOW_DISK_CRIT_BYTES_ENV`]).
+    Critical,
+    /// Under the warn floor ([`LOW_DISK_WARN_BYTES_ENV`]), above the critical one.
+    Warn,
+}
+
+/// The two low-disk floors, read ONCE per alarm pass
+/// ([`LowDiskFloors::from_env`]) and handed to every decision made on them.
+/// The publisher's "look for in-use paths?" gate and the verdict that uses
+/// those paths therefore cannot read two different pairs of floors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LowDiskFloors {
+    warn: u64,
+    crit: u64,
+}
+
+impl LowDiskFloors {
+    /// From the environment overrides, or the defaults.
+    fn from_env() -> Self {
+        Self {
+            warn: env_bytes(LOW_DISK_WARN_BYTES_ENV, DEFAULT_LOW_DISK_WARN_BYTES),
+            crit: env_bytes(LOW_DISK_CRIT_BYTES_ENV, DEFAULT_LOW_DISK_CRIT_BYTES),
+        }
+    }
+
+    /// Does the in-use rule govern `v`? True for a removable volume, and for
+    /// a fixed one whose total is at or below the critical floor: such a
+    /// volume (an EFI system partition, a small boot partition) is under the
+    /// critical floor however empty it is, so an absolute-floor alarm on it
+    /// carries no information unless the runner uses it.
+    ///
+    /// Never for the POSIX root `/`: a full root disk breaks the box whether
+    /// or not a worktree is on it, so a small fixed `/` (a VM with `/home` on
+    /// another disk) alarms like any large fixed volume. The Windows system
+    /// drive and the runner's own config, data and log dirs are kept in use
+    /// by [`essential_paths`] at the alarm's edges instead, because naming
+    /// them takes the environment.
+    fn in_use_rule_applies(&self, v: &VolumeReport) -> bool {
+        v.removable || (v.total_bytes <= self.crit && v.volume != "/")
+    }
+
+    /// The floor `free_bytes` is under, or `None` when it is above both.
+    ///
+    /// Critical is tested first, and the overrides do not enforce an order: a
+    /// critical floor set ABOVE the warn floor still makes everything under
+    /// it Critical. So "under a floor" means under `max(warn, crit)`, and
+    /// every gate on it must use this method rather than the warn floor alone.
+    fn level(&self, free_bytes: u64) -> Option<LowDiskLevel> {
+        if free_bytes < self.crit {
+            Some(LowDiskLevel::Critical)
+        } else if free_bytes < self.warn {
+            Some(LowDiskLevel::Warn)
+        } else {
+            None
+        }
+    }
+}
+
+/// What [`low_disk_alarms`] decided for one set of volumes.
+#[derive(Debug, Default)]
+struct LowDiskVerdict<'a> {
+    /// Volumes under a floor that the alarm speaks for, each with its level.
+    alarms: Vec<(&'a VolumeReport, LowDiskLevel)>,
+    /// Volumes under a floor the alarm does not speak for, each with why.
+    /// Silenced; [`log_low_disk_verdict`] logs each once per process so a
+    /// missing alarm can be explained.
+    suppressed: Vec<(&'a VolumeReport, LowDiskSuppression)>,
+}
+
+/// Why [`low_disk_alarms`] silenced a volume under a floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LowDiskSuppression {
+    /// Read-only: its free space is not a capacity question.
+    ReadOnly,
+    /// Removable, or fixed but no larger than the critical floor, and nothing
+    /// the runner uses is on it.
+    NotInUse,
+}
+
+/// PURE: which volumes under a floor the low-disk alarm speaks for.
+///
+/// A volume under a floor alarms, unless it is REMOVABLE and nothing the
+/// runner uses is on it. The floors are absolute (25 GiB / 100 GiB by
+/// default), so a small thumb drive is under the critical floor however empty
+/// it is. On 2026-10-27 spaceship logged `CRITICAL low disk on E: — 3.7 GB
+/// free (98.0%)` 228 times in twenty hours, for a ~3.8 GiB stick holding BIOS
+/// files that no worktree path ever referenced (plan
+/// `2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap`
+/// Phase 7). An alarm that fires on a stick the runner never writes to trains
+/// the reader to ignore the line that matters.
+///
+/// `in_use` is what decides "in use" for a removable volume:
+///
+/// * `Some(paths)` — the volume is in use when one of `paths` (see
+///   [`in_use_paths`]) or the declared external volume's mount
+///   (`external_mount`) resolves to it through [`volume_holding`].
+/// * `None` — UNKNOWN: the runner does not yet know where its worktrees are
+///   (a primary with no census snapshot since start; see
+///   [`publisher_probe_from`]). Every removable volume under a floor then
+///   alarms. An unknown is not evidence the volume is unused.
+///
+/// A READ-ONLY volume never alarms: it reads 0 free by construction (nawa's
+/// `/mnt/winiso` ISO), nothing can consume it, and a full one is its normal
+/// state (plan
+/// `2026-11-03-devops-headroom-grades-read-only-and-esp-volumes-against-the-disk-floor`
+/// Phase 4).
+///
+/// A FIXED volume whose total is at or below the critical floor follows the
+/// same in-use rule as a removable one ([`LowDiskFloors::in_use_rule_applies`]):
+/// a 1 GB EFI system partition is "under the 25 GiB floor" however empty it
+/// is, so the alarm speaks for it only when the runner uses it.
+///
+/// Any other FIXED volume is never filtered. "How much disk is left,
+/// anywhere?" is the publisher's question, and an internal disk filling up is
+/// the runner's problem whether or not a worktree is on it.
+fn low_disk_alarms<'a>(
+    volumes: &'a [VolumeReport],
+    in_use: Option<&[PathBuf]>,
+    external_mount: Option<&Path>,
+    floors: LowDiskFloors,
+) -> LowDiskVerdict<'a> {
+    // Resolved only once a volume the in-use rule governs is under a floor,
+    // so a box with only large fixed volumes never walks the paths.
+    let mut held: Option<HashSet<&str>> = None;
+    let mut verdict = LowDiskVerdict::default();
+    for v in volumes {
+        let Some(level) = floors.level(v.free_bytes) else {
+            continue;
+        };
+        if v.read_only {
+            verdict.suppressed.push((v, LowDiskSuppression::ReadOnly));
+            continue;
+        }
+        if let (true, Some(paths)) = (floors.in_use_rule_applies(v), in_use) {
+            let held = held.get_or_insert_with(|| volumes_in_use(volumes, paths, external_mount));
+            if !held.contains(v.volume.as_str()) {
+                verdict.suppressed.push((v, LowDiskSuppression::NotInUse));
+                continue;
+            }
+        }
+        verdict.alarms.push((v, level));
+    }
+    verdict
+}
+
+/// The keys of the volumes in `volumes` that hold one of `paths` or the
+/// declared external volume's mount.
+fn volumes_in_use<'a>(
+    volumes: &'a [VolumeReport],
+    paths: &[PathBuf],
+    external_mount: Option<&Path>,
+) -> HashSet<&'a str> {
+    paths
+        .iter()
+        .map(PathBuf::as_path)
+        .chain(external_mount)
+        .filter_map(|p| volume_holding(volumes, p))
+        .map(|v| v.volume.as_str())
+        .collect()
+}
+
+/// The volume in `volumes` that holds `path`: of the volumes whose key holds
+/// it ([`volume_key_holds`]), the one with the longest key.
+///
+/// The same longest-mount preference as
+/// [`crate::ci_node::admission::pick_volume`], but NOT the same matcher:
+/// `pick_volume` compares raw mount paths with `Path::starts_with`, while this
+/// compares the separator-normalized [`volume_key`] strings — case-insensitive
+/// for a drive-lettered key, with a `\\?\` prefix dropped. The two can
+/// disagree on an unusual spelling of the same path.
+fn volume_holding<'a>(volumes: &'a [VolumeReport], path: &Path) -> Option<&'a VolumeReport> {
+    let path = comparable_path(path);
+    volumes
+        .iter()
+        .filter(|v| volume_key_holds(&v.volume, &path))
+        .max_by_key(|v| v.volume.trim_end_matches('/').len())
+}
+
+/// `path` in the separator-normalized form [`volume_key`] produces, with a
+/// Windows verbatim prefix dropped so a canonicalized path still compares
+/// against the plain key ([`strip_verbatim_prefix`]).
+fn comparable_path(path: &Path) -> String {
+    strip_verbatim_prefix(&normalize_path_str(path))
+}
+
+/// Drop a Windows verbatim prefix from an already forward-slashed path.
+///
+/// `canonicalize` on Windows yields `\\?\D:\...` for a drive path and
+/// `\\?\UNC\srv\share\...` for a UNC share. (What it yields for a mapped
+/// network drive is unverified here.)
+/// Forward-slashed, those are `//?/D:/...` -> `D:/...`, and `//?/UNC/srv/share/...`
+/// -> `//srv/share/...` — the proper UNC form, which is how [`volume_key`]
+/// spells a share's mount. Stripping only `//?/` from the UNC form would leave
+/// `UNC/srv/share/...`, a relative-looking string that matches no volume key
+/// and that coord would still prefer over the lexical path. The `UNC` marker
+/// is matched case-insensitively, as Windows treats it.
+fn strip_verbatim_prefix(normalized: &str) -> String {
+    const VERBATIM_UNC: &str = "//?/UNC/";
+    let split = (
+        normalized.get(..VERBATIM_UNC.len()),
+        normalized.get(VERBATIM_UNC.len()..),
+    );
+    if let (Some(head), Some(rest)) = split {
+        if head.eq_ignore_ascii_case(VERBATIM_UNC) {
+            return format!("//{rest}");
+        }
+    }
+    match normalized.strip_prefix("//?/") {
+        Some(rest) => rest.to_string(),
+        None => normalized.to_string(),
+    }
+}
+
+/// Does the mount a volume is keyed under ([`volume_key`]) hold `path`, which
+/// is already [`comparable_path`]-normalized? A prefix match on a component
+/// boundary (`D:/data` holds `D:/data/x`, not `D:/database`), case-insensitive
+/// for a drive-lettered key because Windows paths are.
+fn volume_key_holds(key: &str, path: &str) -> bool {
+    let key = key.trim_end_matches('/');
+    if key.is_empty() {
+        // The POSIX root `/` holds every absolute POSIX path.
+        return path.starts_with('/');
+    }
+    let (key, path) = if drive_letter_of(Path::new(key)).is_some() {
+        (key.to_lowercase(), path.to_lowercase())
+    } else {
+        (key.to_string(), path.to_string())
+    };
+    path == key
+        || path
+            .strip_prefix(key.as_str())
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Volume keys whose low-disk suppression has already been logged this process.
+static LOW_DISK_SUPPRESSED_LOGGED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+/// True the FIRST time `key` is offered to `seen`, false on every repeat.
+/// Cell-parametrized so the once-per-key rule is testable without the global.
+fn first_low_disk_suppression(seen: &Mutex<HashSet<String>>, key: &str) -> bool {
+    seen.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key.to_string())
+}
+
+/// Emit an `error!`/`warn!` per volume [`low_disk_alarms`] names. A leading
+/// signal for the disk-full condition that otherwise only manifests as
 /// phantom cargo build failures. Read-only; best-effort logging only.
 ///
-/// Returns whether it ACTUALLY emitted anything. The throttled wrapper needs
-/// that answer: stamping the throttle epoch on a healthy (silent) tick lets a
-/// routine 60 s sample consume the alarm's budget and suppress the FIRST
-/// CRITICAL line of a real emergency — see
-/// [`warn_on_low_disk_throttled`].
+/// Every input is passed straight to [`low_disk_alarms`]. The callers read
+/// the declared external volume ([`declared_external_mount`]) and the floors
+/// ([`LowDiskFloors::from_env`]) at their edge, so this function reads nothing
+/// from the environment.
+///
+/// Returns whether it ACTUALLY emitted an alarm — see
+/// [`log_low_disk_verdict`]. The throttled wrapper needs that answer:
+/// stamping the throttle epoch on a healthy (silent) tick lets a routine 60 s
+/// sample consume the alarm's budget and suppress the FIRST CRITICAL line of a
+/// real emergency — see [`warn_on_low_disk_throttled`].
 #[must_use]
-fn warn_on_low_disk(volumes: &[VolumeReport]) -> bool {
-    let warn_floor = env_bytes(LOW_DISK_WARN_BYTES_ENV, DEFAULT_LOW_DISK_WARN_BYTES);
-    let crit_floor = env_bytes(LOW_DISK_CRIT_BYTES_ENV, DEFAULT_LOW_DISK_CRIT_BYTES);
+fn warn_on_low_disk(
+    volumes: &[VolumeReport],
+    in_use: Option<&[PathBuf]>,
+    external_mount: Option<&Path>,
+    floors: LowDiskFloors,
+) -> bool {
+    log_low_disk_verdict(&low_disk_alarms(volumes, in_use, external_mount, floors))
+}
+
+/// Log one verdict: an `error!`/`warn!` per alarm, and ONE `info!` per
+/// process for each removable volume it silenced, so a missing alarm can be
+/// explained from the log. Returns whether an alarm was emitted (the
+/// suppression `info!` does not count).
+fn log_low_disk_verdict(verdict: &LowDiskVerdict<'_>) -> bool {
     const GB: f64 = 1_073_741_824.0;
-    let mut emitted = false;
-    for v in volumes {
+    let seen = LOW_DISK_SUPPRESSED_LOGGED.get_or_init(|| Mutex::new(HashSet::new()));
+    for (v, why) in &verdict.suppressed {
+        if first_low_disk_suppression(seen, &v.volume) {
+            let reason = match why {
+                LowDiskSuppression::ReadOnly => "read-only",
+                LowDiskSuppression::NotInUse if v.removable => {
+                    "removable, under floor, not in use by this instance"
+                }
+                LowDiskSuppression::NotInUse => {
+                    "small fixed volume (no larger than the critical floor), \
+                     not in use by this instance"
+                }
+            };
+            info!(
+                "worktree_census: {} {reason}; low-disk alarm suppressed ({:.1} GB free). \
+                 Logged once per process.",
+                v.volume,
+                v.free_bytes as f64 / GB
+            );
+        }
+    }
+    for (v, level) in &verdict.alarms {
         let free_gb = v.free_bytes as f64 / GB;
         let pct = if v.total_bytes > 0 {
             v.free_bytes as f64 / v.total_bytes as f64 * 100.0
         } else {
             100.0
         };
-        if v.free_bytes < crit_floor {
-            tracing::error!(
+        match level {
+            LowDiskLevel::Critical => tracing::error!(
                 "worktree_census: CRITICAL low disk on {} — {:.1} GB free ({:.1}%). \
                  Builds will manufacture phantom failures (os error 112). Arm \
                  COORD_ORPHAN_TARGET_REAP_ENABLED and/or reclaim target dirs.",
                 v.volume,
                 free_gb,
                 pct
-            );
-            emitted = true;
-        } else if v.free_bytes < warn_floor {
-            warn!(
+            ),
+            LowDiskLevel::Warn => warn!(
                 "worktree_census: low disk on {} — {:.1} GB free ({:.1}%).",
                 v.volume, free_gb, pct
-            );
-            emitted = true;
+            ),
         }
     }
-    emitted
+    !verdict.alarms.is_empty()
+}
+
+/// The declared external volume's mount ([`crate::external_volume::declared`]),
+/// read at the alarm's two edges — the census walk and the publisher probe —
+/// and handed down from there.
+fn declared_external_mount() -> Option<PathBuf> {
+    crate::external_volume::declared().map(|v| v.mount)
+}
+
+/// The paths that keep a volume in use whatever the census holds: the
+/// system root (`/`, or `%SystemDrive%\` on Windows) and the runner's own
+/// config, data and log dirs. Read at the alarm's two edges and appended to
+/// the in-use paths, so a small fixed volume holding one of them alarms
+/// rather than being treated like an unused EFI partition (see
+/// [`LowDiskFloors::in_use_rule_applies`]).
+fn essential_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if cfg!(windows) {
+        if let Some(drive) = std::env::var_os("SystemDrive").filter(|d| !d.is_empty()) {
+            let mut root = PathBuf::from(drive);
+            root.push("\\");
+            paths.push(root);
+        }
+    } else {
+        paths.push(PathBuf::from("/"));
+    }
+    paths.extend(qontinui_runner_lib::instance_env::runner_config_dir().map(|(d, _)| d));
+    paths.extend(qontinui_runner_lib::instance_env::runner_data_local_base());
+    paths.extend(qontinui_runner_lib::instance_env::runner_app_data_dir());
+    paths.push(crate::startup_panic::resolve_log_dir());
+    paths
+}
+
+/// PURE: the paths that put a removable volume in use. That is the workspace
+/// root when known, and for every census row its worktree path and its
+/// effective cargo target dir (`build_target_dir`). A `CARGO_TARGET_DIR` on a
+/// removable volume makes that volume the runner's even when no worktree is on
+/// it.
+///
+/// Each row contributes its symlink-RESOLVED path when the census observed one
+/// (`worktree_volume_path` / `build_target_volume_path`), because that is the
+/// volume the bytes are on; the unresolved path is the fallback.
+fn in_use_paths(root: Option<PathBuf>, snapshot: Option<&WorktreeCensusReq>) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = root.into_iter().collect();
+    if let Some(req) = snapshot {
+        for w in &req.worktrees {
+            paths.push(PathBuf::from(
+                w.worktree_volume_path.as_ref().unwrap_or(&w.path),
+            ));
+            if let Some(dir) = w
+                .build_target_volume_path
+                .as_ref()
+                .or(w.build_target_dir.as_ref())
+            {
+                paths.push(PathBuf::from(dir));
+            }
+        }
+    }
+    paths
+}
+
+/// The census walk's low-disk alarm, run once per COMPLETED walk.
+///
+/// Its volume set is path-scoped: the volumes under the drive letters of the
+/// walked rows' worktree paths and build target dirs. That has two limits, and
+/// the 60 s publisher ([`sample_and_publish_volumes`]) is the alarm that
+/// covers removable media in use, not this one:
+///
+/// * [`collect_volumes`] keys on drive letters, so on POSIX it returns nothing
+///   and this alarm never fires there.
+/// * It fires once per completed walk, which on a large Windows box is hours
+///   apart.
+///
+/// The wire `volumes` stay worktree-scoped ([`collect_volumes`] over the
+/// worktree paths alone); this alarm derives its own set from the SAME
+/// `mounts` reading. The walk passes no root: its in-use list is the walked
+/// rows' worktree paths and build target dirs.
+///
+/// Unthrottled: the walk is multi-hour, so only the 60 s publisher needs a
+/// rate limit. Returns the alarms it raised as `(volume key, level)`, which
+/// the walk ignores and the tests pin.
+fn warn_on_walked_low_disk(
+    mounts: &[MountReading],
+    req: &WorktreeCensusReq,
+    external_mount: Option<&Path>,
+    essential: &[PathBuf],
+    floors: LowDiskFloors,
+) -> Vec<(String, LowDiskLevel)> {
+    let mut in_use = in_use_paths(None, Some(req));
+    // The volume SET stays scoped to the walked rows; only the in-use test
+    // also counts the essential paths.
+    let volumes = collect_volumes(mounts, &in_use);
+    in_use.extend_from_slice(essential);
+    let verdict = low_disk_alarms(&volumes, Some(&in_use), external_mount, floors);
+    log_low_disk_verdict(&verdict);
+    verdict
+        .alarms
+        .iter()
+        .map(|(v, level)| (v.volume.clone(), *level))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -2810,12 +3342,17 @@ pub(super) fn emit_throttled(
 /// The alarm is a leading signal, not a heartbeat: at the publisher's 60 s
 /// cadence an unthrottled `error!` would bury the very logs used to diagnose
 /// the disk emergency it is announcing.
-fn warn_on_low_disk_throttled(volumes: &[VolumeReport]) {
+fn warn_on_low_disk_throttled(
+    volumes: &[VolumeReport],
+    in_use: Option<&[PathBuf]>,
+    external_mount: Option<&Path>,
+    floors: LowDiskFloors,
+) {
     emit_throttled(
         &LAST_LOW_DISK_LOG_EPOCH,
         now_epoch_secs(),
         LOW_DISK_LOG_THROTTLE_SECS,
-        || warn_on_low_disk(volumes),
+        || warn_on_low_disk(volumes, in_use, external_mount, floors),
     );
 }
 
@@ -2852,23 +3389,139 @@ pub(crate) async fn sample_and_publish_volumes() -> Option<VolumeSample> {
     // sysinfo's enumeration is a syscall per mount and can block on an
     // unresponsive network drive, so it never runs on the shared publishers
     // runtime's single async worker.
-    let volumes = match spawn_blocking_tracked(collect_all_volumes).await {
-        Ok(v) => v,
+    let probe = match spawn_blocking_tracked(probe_volumes_for_publisher).await {
+        Ok(p) => p,
         Err(e) => {
             warn!("worktree_census: volume probe task failed: {e} — keeping the previous sample");
             return None;
         }
     };
-    if volumes.is_empty() {
+    if probe.volumes.is_empty() {
         // Throttled: on a machine with no readable mounts this is a standing
         // condition, and the publisher ticks every 60 s forever.
         warn_on_empty_probe_throttled();
         return None;
     }
+    let PublisherProbe {
+        volumes,
+        in_use,
+        external_mount,
+        floors,
+    } = probe;
     let sample = publish_volume_sample(volumes);
-    warn_on_low_disk_throttled(&sample.volumes);
+    warn_on_low_disk_throttled(
+        &sample.volumes,
+        in_use.as_deref(),
+        external_mount.as_deref(),
+        floors,
+    );
     post_volumes_to_coord(sample.volumes.clone()).await;
     Some(sample)
+}
+
+/// What the publisher's blocking half hands the 60 s low-disk alarm.
+#[derive(Debug)]
+struct PublisherProbe {
+    volumes: Vec<VolumeReport>,
+    /// The paths that put a removable volume in use ([`in_use_paths`]).
+    /// `None` is UNKNOWN: a primary with no census snapshot yet, so a
+    /// removable volume under a floor alarms (see [`publisher_probe_from`]).
+    in_use: Option<Vec<PathBuf>>,
+    /// The declared external volume's mount, read at this edge.
+    external_mount: Option<PathBuf>,
+    /// The floors, read ONCE for this tick: the same pair gated the in-use
+    /// paths here and judges the volumes in [`warn_on_low_disk`].
+    floors: LowDiskFloors,
+}
+
+/// The publisher's blocking half: every mounted volume, and what decides
+/// whether the low-disk alarm speaks for a removable one. On the blocking pool
+/// because the mount enumeration and the settings read may both touch the
+/// filesystem.
+///
+/// The workspace root comes through the READ-ONLY door
+/// ([`crate::workspace_paths::runner_workspace_root_readonly`]), not
+/// [`qontinui_root`]: this runs every 60 s, and the full settings loader
+/// behind [`qontinui_root`] can write `settings.json` and reaches the OS
+/// keyring. A rejected root candidate is not re-logged here; the census walk
+/// already reports it.
+///
+/// "Secondary" is `!`[`runs_machine_census`], the predicate [`spawn_census`]
+/// gates on, so it is true exactly where no periodic census runs. A
+/// secondary's own build output is this process's `CARGO_TARGET_DIR`; a
+/// relative value resolves to no volume and so changes nothing.
+fn probe_volumes_for_publisher() -> PublisherProbe {
+    let mut probe = publisher_probe_from(
+        collect_all_volumes(),
+        LowDiskFloors::from_env(),
+        || !runs_machine_census(),
+        || crate::workspace_paths::runner_workspace_root_readonly().into_root(),
+        latest_census,
+        declared_external_mount(),
+        || std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from),
+    );
+    // A KNOWN in-use list also counts the essential paths; an UNKNOWN one
+    // (`None`) already alarms on every volume the in-use rule governs.
+    if let Some(paths) = probe.in_use.as_mut() {
+        paths.extend(essential_paths());
+    }
+    probe
+}
+
+/// PURE core of [`probe_volumes_for_publisher`], with every live source
+/// injected.
+///
+/// The in-use paths are built only when a writable volume the in-use rule
+/// governs ([`LowDiskFloors::in_use_rule_applies`]: removable, or no larger
+/// than the critical floor) is under a floor ([`LowDiskFloors::level`], so a
+/// critical floor set above the warn floor counts), which is the only case in
+/// which [`low_disk_alarms`] reads them.
+/// Otherwise they are an empty, KNOWN list. When such a volume is present:
+///
+/// * On a SECONDARY instance (`is_secondary`), which runs no census, they are
+///   KNOWN as this instance's own paths: its root, and its own cargo target
+///   dir (`secondary_target_dir`) when it has one. The machine-wide removable
+///   alarm belongs to the primary, which has the census; without this a
+///   secondary's in-use set would be UNKNOWN for its whole life and it would
+///   alarm on every stick. The residual: on a box where no primary runs, no
+///   instance covers removable media holding paths outside a secondary's own
+///   root and target dir.
+/// * On a primary with no census snapshot yet (`snapshot` answers `None`) they
+///   are UNKNOWN (`None`), and that volume alarms. That covers the time before
+///   the first chunk of the first walk, and a census the resource guard is
+///   shedding.
+/// * Once a snapshot exists they are [`in_use_paths`] over the root and the
+///   snapshot's rows. A snapshot mid-walk holds only the rows walked so far,
+///   so a removable volume holding only not-yet-walked worktrees outside the
+///   root stays suppressed until the walk reaches them (first walk after start
+///   only; chunk merges never drop rows).
+fn publisher_probe_from(
+    volumes: Vec<VolumeReport>,
+    floors: LowDiskFloors,
+    is_secondary: impl FnOnce() -> bool,
+    root: impl FnOnce() -> Option<PathBuf>,
+    snapshot: impl FnOnce() -> Option<CensusSnapshot>,
+    external_mount: Option<PathBuf>,
+    secondary_target_dir: impl FnOnce() -> Option<PathBuf>,
+) -> PublisherProbe {
+    let needs_paths = volumes.iter().any(|v| {
+        !v.read_only && floors.in_use_rule_applies(v) && floors.level(v.free_bytes).is_some()
+    });
+    let in_use = if !needs_paths {
+        Some(Vec::new())
+    } else if is_secondary() {
+        let mut own = in_use_paths(root(), None);
+        own.extend(secondary_target_dir());
+        Some(own)
+    } else {
+        snapshot().map(|s| in_use_paths(root(), Some(s.req.as_ref())))
+    };
+    PublisherProbe {
+        volumes,
+        in_use,
+        external_mount,
+        floors,
+    }
 }
 
 /// What a cached [`ChunkPoster`] was built against. A change in ANY component
@@ -3099,6 +3752,18 @@ pub fn spawn_volume_publisher() {
     });
 }
 
+/// Whether THIS instance runs the machine-wide census: the primary does, a
+/// secondary does not (`fleet::machine_state_publish_allowed` over
+/// `instance::owns_shared_root_state`).
+///
+/// The one spelling of that rule in this module. The periodic walk spawn
+/// ([`spawn_census`]), the POST chokepoint (`ChunkPoster::resolve_dest`) and
+/// the volume probe's secondary rule ([`probe_volumes_for_publisher`]) all
+/// ask it, so they cannot drift apart.
+fn runs_machine_census() -> bool {
+    crate::fleet::machine_state_publish_allowed(crate::instance::owns_shared_root_state())
+}
+
 /// Spawn the periodic census task on the ambient tokio runtime.
 ///
 /// Interval read from `QONTINUI_WORKTREE_CENSUS_INTERVAL_SECS` (default
@@ -3124,7 +3789,7 @@ pub fn spawn_census() {
     // `ChunkPoster::resolve_dest`, because this is not the only walk trigger
     // (`spawn_census_rebuild` reaches `build_and_publish` directly) and a guard
     // that only covers the periodic tick can be routed around.
-    if !crate::fleet::machine_state_publish_allowed(crate::instance::owns_shared_root_state()) {
+    if !runs_machine_census() {
         return;
     }
     let secs: u64 = std::env::var("QONTINUI_WORKTREE_CENSUS_INTERVAL_SECS")
@@ -3501,11 +4166,62 @@ mod tests {",
         let squeezed: String = body.chars().filter(|c| !c.is_whitespace()).collect();
 
         assert!(
-            squeezed.contains(GUARD),
+            squeezed.contains("if!runs_machine_census()"),
             "the census POST destination is resolved without consulting \
-             `fleet::machine_state_publish_allowed`. Every walk trigger routes through here \
+             `runs_machine_census`. Every walk trigger routes through here \
              (the periodic tick AND `spawn_census_rebuild`), so a guard anywhere else can be \
              routed around by a caller that reaches `build_and_publish` directly."
+        );
+        assert!(
+            squeezed_prod_fn("fn runs_machine_census(").contains(GUARD),
+            "`runs_machine_census` must be the `fleet::machine_state_publish_allowed` \
+             instance rule"
+        );
+    }
+
+    /// The whitespace-free body of the top-level PRODUCTION fn whose
+    /// signature starts with `sig`, up to its closing brace at column 0.
+    fn squeezed_prod_fn(sig: &str) -> String {
+        const SRC: &str = include_str!("census.rs");
+        let prod = SRC
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map(|(before, _)| before)
+            .unwrap_or(SRC);
+        let after = prod
+            .split_once(sig)
+            .map(|(_, after)| after)
+            .unwrap_or_else(|| panic!("`{sig}` not found in production census.rs"));
+        let body = after.split_once("\n}\n").map(|(b, _)| b).unwrap_or(after);
+        body.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// Nit 1: the instance rule is spelled ONCE, in `runs_machine_census`, and
+    /// the walk spawn and the volume probe's secondary rule both ask it.
+    /// Source-level for the reason the chokepoint pin above is: the predicate
+    /// reads `QONTINUI_PORT`, which other harness threads mutate.
+    #[test]
+    fn the_walk_spawn_and_the_volume_probe_ask_runs_machine_census() {
+        assert!(
+            squeezed_prod_fn("fn probe_volumes_for_publisher(")
+                .contains("||!runs_machine_census(),"),
+            "the volume probe must decide secondary-ness through `runs_machine_census`"
+        );
+        assert!(
+            squeezed_prod_fn("pub fn spawn_census(").contains("if!runs_machine_census(){return;}"),
+            "the periodic walk spawn must gate on `runs_machine_census`"
+        );
+        const SRC: &str = include_str!("census.rs");
+        let prod = SRC
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map(|(before, _)| before)
+            .unwrap_or(SRC);
+        let squeezed: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(
+            squeezed
+                .matches("machine_state_publish_allowed(crate::instance::owns_shared_root_state())")
+                .count(),
+            1,
+            "the instance rule must be spelled once, in `runs_machine_census`"
         );
     }
 
@@ -3717,14 +4433,25 @@ mod tests {",
         assert!(!is_junction(dir.path()));
     }
 
+    /// The exclusive bytes a hardlink-free tree of `n` bytes measures: all of
+    /// them on unix, UNKNOWN elsewhere.
+    fn ex(n: u64) -> Option<u64> {
+        if cfg!(unix) {
+            Some(n)
+        } else {
+            None
+        }
+    }
+
     #[test]
     fn missing_dir_measures_as_absent() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("node_modules");
-        let (present, is_junction, bytes) = measure_dir(&missing);
+        let (present, is_junction, bytes, exclusive) = measure_dir(&missing);
         assert!(!present);
         assert!(!is_junction);
         assert_eq!(bytes, 0);
+        assert_eq!(exclusive, Some(0), "an absent dir frees nothing, known");
     }
 
     #[test]
@@ -3734,8 +4461,72 @@ mod tests {",
         std::fs::create_dir(&sub).unwrap();
         std::fs::write(dir.path().join("a.bin"), vec![0u8; 100]).unwrap();
         std::fs::write(sub.join("b.bin"), vec![0u8; 250]).unwrap();
-        let total = dir_size_skipping_junctions(dir.path());
-        assert_eq!(total, 350, "should sum nested real files");
+        let m = super::super::orphan_target_reaper::measure_dir_size(dir.path()).unwrap();
+        assert_eq!(m.bytes, 350, "should sum nested real files");
+        #[cfg(unix)]
+        assert_eq!(m.exclusive_bytes, Some(350), "no hardlinks: all exclusive");
+        #[cfg(not(unix))]
+        assert_eq!(m.exclusive_bytes, None);
+    }
+
+    #[test]
+    fn a_memoised_size_never_hides_a_removed_dir() {
+        // Only the BYTE total is memoised: presence is read live, so a tree
+        // that was sized and then removed reads absent at once.
+        let dir = tempfile::tempdir().unwrap();
+        let nm = dir.path().join("node_modules");
+        std::fs::create_dir(&nm).unwrap();
+        std::fs::write(nm.join("pkg.json"), vec![0u8; 42]).unwrap();
+        assert_eq!(measure_dir(&nm), (true, false, 42, ex(42)));
+        std::fs::remove_dir_all(&nm).unwrap();
+        assert_eq!(measure_dir(&nm), (false, false, 0, Some(0)));
+    }
+
+    #[test]
+    fn a_rebuilt_dir_is_sized_again_not_served_from_the_memo() {
+        // Sized, removed, recreated with different contents inside the TTL
+        // (a `cargo clean` + rebuild): the dir's own mtime moved, so the memo
+        // must not answer with the old total.
+        let dir = tempfile::tempdir().unwrap();
+        let t = dir.path().join("target");
+        std::fs::create_dir(&t).unwrap();
+        std::fs::write(t.join("old.bin"), vec![0u8; 42]).unwrap();
+        assert_eq!(measure_dir(&t), (true, false, 42, ex(42)));
+        std::fs::remove_dir_all(&t).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        std::fs::create_dir(&t).unwrap();
+        std::fs::write(t.join("new.bin"), vec![0u8; 9]).unwrap();
+        assert_eq!(measure_dir(&t), (true, false, 9, ex(9)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_sized_dir_swapped_for_a_junction_reads_as_a_junction() {
+        let dir = tempfile::tempdir().unwrap();
+        let nm = dir.path().join("node_modules");
+        std::fs::create_dir(&nm).unwrap();
+        std::fs::write(nm.join("pkg.json"), vec![0u8; 42]).unwrap();
+        assert_eq!(measure_dir(&nm), (true, false, 42, ex(42)));
+        std::fs::remove_dir_all(&nm).unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("big.bin"), vec![0u8; 5000]).unwrap();
+        let made = Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&nm)
+            .arg(&elsewhere)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !made {
+            eprintln!("skipping: mklink /J unavailable on this host");
+            return;
+        }
+        assert_eq!(
+            measure_dir(&nm),
+            (true, true, 0, Some(0)),
+            "the junction is read live"
+        );
     }
 
     #[test]
@@ -3744,10 +4535,11 @@ mod tests {",
         let nm = dir.path().join("node_modules");
         std::fs::create_dir(&nm).unwrap();
         std::fs::write(nm.join("pkg.json"), vec![0u8; 42]).unwrap();
-        let (present, is_junction, bytes) = measure_dir(&nm);
+        let (present, is_junction, bytes, exclusive) = measure_dir(&nm);
         assert!(present);
         assert!(!is_junction);
         assert_eq!(bytes, 42);
+        assert_eq!(exclusive, ex(42));
     }
 
     #[test]
@@ -3828,6 +4620,176 @@ mod tests {",
         std::fs::create_dir_all(dir.path().join("src-tauri")).unwrap();
         std::fs::write(dir.path().join("src-tauri").join("Cargo.toml"), "[package]").unwrap();
         dir
+    }
+
+    // --- symlink-resolved volume paths (plan
+    // `2026-11-22-coord-charges-a-build-in-a-symlinked-agent-worktree-to-root`).
+
+    /// A symlinked worktree dir resolves to its TARGET's path, while the
+    /// identity field stays the unresolved link path.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_worktree_resolves_to_the_link_targets_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("data").join("agent-worktrees").join("01a");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = tmp.path().join("agent-worktrees-01a");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let canon_real = std::fs::canonicalize(&real).unwrap();
+
+        assert_eq!(
+            resolved_volume_path(&link).as_deref(),
+            Some(comparable_path(&canon_real).as_str())
+        );
+        assert_ne!(resolved_volume_path(&link), Some(normalize_path_str(&link)));
+    }
+
+    /// The census case the plan is about: a cargo worktree reached through a
+    /// symlinked parent, whose in-tree `target/` does NOT exist yet. The
+    /// target resolves through its nearest existing ancestor (the repo dir,
+    /// under the link) to the link target's volume, and `dir` stays
+    /// unresolved.
+    #[cfg(unix)]
+    #[test]
+    fn a_not_yet_built_target_under_a_symlinked_parent_resolves_through_the_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real_id = tmp.path().join("data").join("01a");
+        let real_repo = real_id.join("qontinui-runner");
+        std::fs::create_dir_all(real_repo.join("src-tauri")).unwrap();
+        std::fs::write(real_repo.join("src-tauri").join("Cargo.toml"), "[package]").unwrap();
+        let link_id = tmp.path().join("agent-worktrees").join("01a");
+        std::fs::create_dir_all(link_id.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&real_id, &link_id).unwrap();
+        let worktree = link_id.join("qontinui-runner");
+
+        let bt = resolve_build_target(&worktree, None);
+        let unresolved_target = lexical_normalize(&target_dir_for(&worktree));
+        assert!(!unresolved_target.exists(), "the target must not exist yet");
+        assert_eq!(
+            bt.dir.as_deref(),
+            Some(normalize_path_str(&unresolved_target).as_str())
+        );
+
+        let canon_repo = std::fs::canonicalize(&real_repo).unwrap();
+        let rel = unresolved_target.strip_prefix(&worktree).unwrap();
+        let expect = comparable_path(&canon_repo.join(rel));
+        assert_eq!(bt.volume_path.as_deref(), Some(expect.as_str()));
+        let canon_data = comparable_path(&std::fs::canonicalize(tmp.path().join("data")).unwrap());
+        assert!(
+            bt.volume_path.as_deref().unwrap().starts_with(&canon_data),
+            "{:?} is not under the link target {canon_data}",
+            bt.volume_path
+        );
+    }
+
+    /// A plain (non-symlinked) dir is unchanged, modulo canonicalisation of
+    /// the temp root itself (macOS `/var` -> `/private/var`).
+    #[test]
+    fn a_plain_dir_resolves_to_itself() {
+        let wt = tauri_worktree();
+        let canon = std::fs::canonicalize(wt.path()).unwrap();
+        assert_eq!(
+            resolved_volume_path(wt.path()).as_deref(),
+            Some(comparable_path(&canon).as_str())
+        );
+        let bt = resolve_build_target(wt.path(), None);
+        let rel = lexical_normalize(&target_dir_for(wt.path()));
+        let rel = rel.strip_prefix(wt.path()).unwrap();
+        assert_eq!(
+            bt.volume_path.as_deref(),
+            Some(comparable_path(&canon.join(rel)).as_str())
+        );
+    }
+
+    /// No build target, no resolved build-target path.
+    #[test]
+    fn a_non_cargo_worktree_has_no_build_target_volume_path() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_build_target(dir.path(), None),
+            BuildTarget::default()
+        );
+    }
+
+    /// ARMING test for the plan: the production row builder
+    /// ([`capture_worktree_with_build_target`], which `capture_worktree` calls
+    /// with the live `CARGO_TARGET_DIR`) run on a cargo worktree reached
+    /// through a symlinked `agent-worktrees/<id>`. BOTH volume fields must land
+    /// under the symlink TARGET, while the identity fields (`path`,
+    /// `build_target_dir`) stay spelled through the link.
+    #[cfg(unix)]
+    #[test]
+    fn capture_worktree_on_a_symlinked_worktree_reports_both_volume_paths_under_the_link_target() {
+        let _amb = crate::test_env::isolated_ambient();
+        let tmp = tempfile::tempdir().unwrap();
+        let real_id = tmp.path().join("data").join("01a");
+        let real_repo = real_id.join("qontinui-runner");
+        std::fs::create_dir_all(real_repo.join("src-tauri")).unwrap();
+        std::fs::write(real_repo.join("src-tauri").join("Cargo.toml"), "[package]").unwrap();
+        let link_id = tmp.path().join("agent-worktrees").join("01a");
+        std::fs::create_dir_all(link_id.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&real_id, &link_id).unwrap();
+        let worktree = link_id.join("qontinui-runner");
+
+        let row = capture_worktree_with_build_target(
+            "qontinui-runner",
+            &worktree,
+            resolve_build_target(&worktree, None),
+        );
+
+        let canon_data = comparable_path(&std::fs::canonicalize(tmp.path().join("data")).unwrap());
+        let link_prefix = normalize_path_str(&link_id);
+
+        // Identity fields: unresolved, through the link.
+        assert_eq!(row.path, normalize_path_str(&worktree));
+        let target_dir = row
+            .build_target_dir
+            .as_deref()
+            .expect("a cargo worktree has a target");
+        assert!(
+            target_dir.starts_with(&link_prefix),
+            "{target_dir} not via the link"
+        );
+
+        // Volume fields: resolved, under the link target.
+        let wt_vol = row
+            .worktree_volume_path
+            .as_deref()
+            .expect("worktree volume observed");
+        assert_eq!(
+            wt_vol,
+            comparable_path(&std::fs::canonicalize(&real_repo).unwrap())
+        );
+        assert!(
+            wt_vol.starts_with(&canon_data),
+            "{wt_vol} not under {canon_data}"
+        );
+        let bt_vol = row
+            .build_target_volume_path
+            .as_deref()
+            .expect("build target volume observed");
+        assert!(
+            bt_vol.starts_with(&canon_data),
+            "{bt_vol} not under {canon_data}"
+        );
+        assert!(
+            !bt_vol.starts_with(&link_prefix),
+            "{bt_vol} still via the link"
+        );
+    }
+
+    /// A10 at the census: a worktree reached through a DANGLING symlink has no
+    /// observed volume path — coord falls back to the lexical path rather than
+    /// being handed the link's parent joined with the link's name as
+    /// "resolved".
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlinked_worktree_has_no_volume_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let link = tmp.path().join("agent-worktrees-01a");
+        std::os::unix::fs::symlink(tmp.path().join("gone"), &link).unwrap();
+        assert_eq!(resolved_volume_path(&link), None);
+        assert_eq!(resolved_volume_path(&link.join("qontinui-runner")), None);
     }
 
     /// Rule 1 — an ABSOLUTE `CARGO_TARGET_DIR` wins over everything, and a
@@ -4087,27 +5049,46 @@ mod tests {",
         // POSIX-style paths have no drive letter → no volume rows (so CI
         // on linux gets a deterministic empty result).
         let paths = vec![PathBuf::from("/tmp/x"), PathBuf::from("/home/y")];
-        assert!(collect_volumes(&paths).is_empty());
+        assert!(collect_volumes(&sample_mounts(), &paths).is_empty());
     }
 
     /// Mount list used by the pure volume-mapping tests: two Windows drives,
     /// a case-differing duplicate of one of them, a volume mounted into a
     /// FOLDER on one of them, a POSIX mount, and an empty optical drive.
-    fn sample_mounts() -> Vec<(PathBuf, u64, u64)> {
+    fn sample_mounts() -> Vec<MountReading> {
         vec![
-            (PathBuf::from(r"C:\"), 500, 100),
-            (PathBuf::from(r"D:\"), 4_000, 93),
+            fixed_mount(r"C:\", 500, 100),
+            fixed_mount(r"D:\", 4_000, 93),
             // The SAME volume reported twice, differing only in case (Windows
             // paths are case-insensitive) — a genuine duplicate, must collapse.
-            (PathBuf::from(r"d:\"), 4_000, 93),
+            fixed_mount(r"d:\", 4_000, 93),
             // A DIFFERENT volume that merely borrows D:'s letter — the normal
             // Windows way to attach a large data disk. Must NOT collapse into
             // `D:\`; keying on the drive letter used to drop it silently.
-            (PathBuf::from(r"D:\data"), 8_000, 7_000),
-            (PathBuf::from("/mnt/data"), 900, 800),
+            fixed_mount(r"D:\data", 8_000, 7_000),
+            fixed_mount("/mnt/data", 900, 800),
             // No media in the drive: total 0. NOT a volume with no space.
-            (PathBuf::from(r"E:\"), 0, 0),
+            fixed_mount(r"E:\", 0, 0),
         ]
+    }
+
+    /// A non-removable [`MountReading`] for the pure volume-mapping tests.
+    fn fixed_mount(path: &str, total: u64, available: u64) -> MountReading {
+        MountReading {
+            mount: PathBuf::from(path),
+            total,
+            available,
+            removable: false,
+            read_only: false,
+        }
+    }
+
+    /// A removable [`MountReading`].
+    fn removable_mount(path: &str, total: u64, available: u64) -> MountReading {
+        MountReading {
+            removable: true,
+            ..fixed_mount(path, total, available)
+        }
     }
 
     /// THE Phase-1 step-2 property: a volume with no worktree on it is still
@@ -4247,6 +5228,908 @@ mod tests {",
         }
     }
 
+    // -----------------------------------------------------------------
+    // Low-disk alarm vs removable media — plan
+    // `2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap`
+    // Phase 7. The incident: a ~3.8 GiB removable thumb drive (E:) holding
+    // BIOS files logged `CRITICAL low disk on E: — 3.7 GB free (98.0%)` 228
+    // times in twenty hours.
+    // -----------------------------------------------------------------
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// The floors with no environment override (warn 100 GiB, crit 25 GiB).
+    const DEFAULT_FLOORS: LowDiskFloors = LowDiskFloors {
+        warn: DEFAULT_LOW_DISK_WARN_BYTES,
+        crit: DEFAULT_LOW_DISK_CRIT_BYTES,
+    };
+
+    /// A 16 GiB removable stick with ~3.7 GB free: under the 25 GiB critical
+    /// floor however empty it is. (Larger than the incident's ~3.8 GiB stick;
+    /// what matters is that it is under the floor.)
+    fn removable_stick() -> VolumeReport {
+        VolumeReport {
+            volume: "E:".to_string(),
+            drive_letter: Some("E:".to_string()),
+            total_bytes: 16 * GIB,
+            free_bytes: 3_700_000_000,
+            removable: true,
+            read_only: false,
+        }
+    }
+
+    /// A healthy internal drive holding the workspace.
+    fn healthy_internal() -> VolumeReport {
+        VolumeReport {
+            volume: "D:".to_string(),
+            drive_letter: Some("D:".to_string()),
+            total_bytes: 4_000 * GIB,
+            free_bytes: 2_000 * GIB,
+            removable: false,
+            read_only: false,
+        }
+    }
+
+    /// A verdict's alarms as `(volume key, level)` pairs.
+    fn alarm_keys(verdict: &LowDiskVerdict<'_>) -> Vec<(String, LowDiskLevel)> {
+        verdict
+            .alarms
+            .iter()
+            .map(|(v, level)| (v.volume.clone(), *level))
+            .collect()
+    }
+
+    /// The low-disk alarms for `volumes` at the default floors, with the
+    /// in-use set KNOWN to be `in_use`.
+    fn alarms_for(
+        volumes: &[VolumeReport],
+        in_use: &[&str],
+        external_mount: Option<&str>,
+    ) -> Vec<(String, LowDiskLevel)> {
+        let paths: Vec<PathBuf> = in_use.iter().map(PathBuf::from).collect();
+        alarm_keys(&low_disk_alarms(
+            volumes,
+            Some(&paths),
+            external_mount.map(Path::new),
+            DEFAULT_FLOORS,
+        ))
+    }
+
+    /// A census snapshot holding `rows`, as `latest_census` would return it.
+    fn snapshot_of(rows: Vec<WorktreeCensus>) -> CensusSnapshot {
+        CensusSnapshot {
+            req: Arc::new(WorktreeCensusReq {
+                device_id: Uuid::nil(),
+                tenant_id: None,
+                volumes: vec![],
+                worktrees: rows,
+                cargo_locks: None,
+            }),
+            taken_at: chrono::Utc::now(),
+            build_ms: 0,
+        }
+    }
+
+    /// A census row whose worktree is at `path` and whose builds land in
+    /// `build_target_dir`.
+    fn row_building_into(path: &str, build_target_dir: Option<&str>) -> WorktreeCensus {
+        let mut r = row("qontinui-runner", path, 0);
+        r.build_target_dir = build_target_dir.map(str::to_string);
+        r
+    }
+
+    /// The publisher's whole pure path on a PRIMARY at the default floors.
+    fn publisher_alarms(
+        volumes: Vec<VolumeReport>,
+        root: Option<&str>,
+        snapshot: Option<CensusSnapshot>,
+        external_mount: Option<&str>,
+    ) -> Vec<(String, LowDiskLevel)> {
+        publisher_alarms_with(
+            volumes,
+            DEFAULT_FLOORS,
+            false,
+            root,
+            snapshot,
+            external_mount,
+        )
+    }
+
+    /// The publisher's whole pure path: [`publisher_probe_from`] with the
+    /// given sources, then [`low_disk_alarms`] over what it handed on,
+    /// including the floors the probe carried.
+    fn publisher_alarms_with(
+        volumes: Vec<VolumeReport>,
+        floors: LowDiskFloors,
+        secondary: bool,
+        root: Option<&str>,
+        snapshot: Option<CensusSnapshot>,
+        external_mount: Option<&str>,
+    ) -> Vec<(String, LowDiskLevel)> {
+        let probe = publisher_probe_from(
+            volumes,
+            floors,
+            || secondary,
+            || root.map(PathBuf::from),
+            || snapshot,
+            external_mount.map(PathBuf::from),
+            || None,
+        );
+        alarm_keys(&low_disk_alarms(
+            &probe.volumes,
+            probe.in_use.as_deref(),
+            probe.external_mount.as_deref(),
+            probe.floors,
+        ))
+    }
+
+    /// THE Phase 7 property: a removable volume nothing the runner uses is on
+    /// raises no alarm, even far under the critical floor.
+    #[test]
+    fn a_removable_volume_holding_no_worktree_raises_no_low_disk_alarm() {
+        let volumes = vec![healthy_internal(), removable_stick()];
+        assert_eq!(
+            alarms_for(
+                &volumes,
+                &[
+                    r"D:\qontinui-root\qontinui-runner",
+                    "D:/qontinui-root/agent-worktrees/x"
+                ],
+                None,
+            ),
+            vec![],
+            "a stick holding no worktree must not alarm"
+        );
+    }
+
+    /// Removable media the runner IS using alarms exactly as before — a
+    /// worktree on a stick that fills up is a real emergency.
+    #[test]
+    fn a_removable_volume_holding_a_worktree_path_raises_critical() {
+        let volumes = vec![healthy_internal(), removable_stick()];
+        assert_eq!(
+            alarms_for(
+                &volumes,
+                &[
+                    r"D:\qontinui-root\qontinui-runner",
+                    r"e:\scratch\qontinui-coord"
+                ],
+                None,
+            ),
+            vec![("E:".to_string(), LowDiskLevel::Critical)],
+            "a worktree path on the stick (any case, any separator) puts it in use"
+        );
+    }
+
+    /// The filter is removable-only: a FIXED volume under the floor alarms
+    /// with no worktree on it at all, exactly as before Phase 7.
+    #[test]
+    fn a_fixed_volume_under_the_floor_still_raises_critical() {
+        let full_internal = VolumeReport {
+            volume: "C:".to_string(),
+            drive_letter: Some("C:".to_string()),
+            total_bytes: 500 * GIB,
+            free_bytes: 10 * GIB,
+            removable: false,
+            read_only: false,
+        };
+        let nearly_full = VolumeReport {
+            volume: "/mnt/data".to_string(),
+            drive_letter: None,
+            total_bytes: 1_000 * GIB,
+            free_bytes: 60 * GIB,
+            removable: false,
+            read_only: false,
+        };
+        assert_eq!(
+            alarms_for(&[full_internal, nearly_full], &[], None),
+            vec![
+                ("C:".to_string(), LowDiskLevel::Critical),
+                ("/mnt/data".to_string(), LowDiskLevel::Warn),
+            ]
+        );
+    }
+
+    /// nawa's ESP, measured 2026-11-03: a 1.02 GB fixed `/boot/efi` with
+    /// 1.01 GB free. It cannot hold the 25 GiB critical floor even empty, so
+    /// it follows the in-use rule a removable stick does: silent while nothing
+    /// the runner uses is on it, Critical once something is (plan
+    /// `2026-11-03-devops-headroom-grades-read-only-and-esp-volumes-against-the-disk-floor`
+    /// Phase 4).
+    #[test]
+    fn a_fixed_volume_too_small_for_the_critical_floor_follows_the_in_use_rule() {
+        let root = VolumeReport {
+            volume: "/".to_string(),
+            drive_letter: None,
+            total_bytes: 500 * GIB,
+            free_bytes: 200 * GIB,
+            removable: false,
+            read_only: false,
+        };
+        let esp = VolumeReport {
+            volume: "/boot/efi".to_string(),
+            drive_letter: None,
+            total_bytes: 1_020_000_000,
+            free_bytes: 1_010_000_000,
+            removable: false,
+            read_only: false,
+        };
+        let volumes = vec![root, esp];
+        assert_eq!(
+            alarms_for(&volumes, &["/home/u/qontinui-root/qontinui-runner"], None),
+            vec![],
+            "an ESP holding no in-use path must not alarm"
+        );
+        assert_eq!(
+            alarms_for(&volumes, &["/boot/efi/scratch"], None),
+            vec![("/boot/efi".to_string(), LowDiskLevel::Critical)],
+            "a small fixed volume the runner uses alarms as before"
+        );
+        // UNKNOWN in-use set: it alarms, exactly as an unknown stick does.
+        assert_eq!(
+            alarm_keys(&low_disk_alarms(&volumes, None, None, DEFAULT_FLOORS)),
+            vec![("/boot/efi".to_string(), LowDiskLevel::Critical)]
+        );
+        // The boundary is inclusive: total == crit is small; crit + 1 is not.
+        let at_floor = VolumeReport {
+            volume: "/var".to_string(),
+            drive_letter: None,
+            total_bytes: DEFAULT_LOW_DISK_CRIT_BYTES,
+            free_bytes: GIB,
+            removable: false,
+            read_only: false,
+        };
+        let above_floor = VolumeReport {
+            volume: "/srv".to_string(),
+            total_bytes: DEFAULT_LOW_DISK_CRIT_BYTES + 1,
+            ..at_floor.clone()
+        };
+        assert_eq!(
+            alarms_for(&[at_floor, above_floor], &[], None),
+            vec![("/srv".to_string(), LowDiskLevel::Critical)],
+            "a fixed volume above the critical floor alarms with nothing on it"
+        );
+    }
+
+    /// A small fixed ROOT disk (a 20 GB `/` on a VM whose `/home` is on
+    /// another disk) alarms with no worktree on it, while a small fixed
+    /// `/boot/efi` holding nothing stays quiet.
+    #[test]
+    fn a_small_fixed_root_volume_still_alarms_with_nothing_in_use_on_it() {
+        let small_root = VolumeReport {
+            volume: "/".to_string(),
+            drive_letter: None,
+            total_bytes: 20_000_000_000,
+            free_bytes: 500_000_000,
+            removable: false,
+            read_only: false,
+        };
+        let home = VolumeReport {
+            volume: "/home".to_string(),
+            total_bytes: 2_000 * GIB,
+            free_bytes: 1_000 * GIB,
+            ..small_root.clone()
+        };
+        let esp = VolumeReport {
+            volume: "/boot/efi".to_string(),
+            total_bytes: 1_020_000_000,
+            free_bytes: 1_010_000_000,
+            ..small_root.clone()
+        };
+        assert_eq!(
+            alarms_for(&[small_root, home, esp], &["/home/u/qontinui-root/w"], None),
+            vec![("/".to_string(), LowDiskLevel::Critical)]
+        );
+    }
+
+    /// The essential paths keep a small fixed volume in use: a small Windows
+    /// system drive, or a small volume holding the runner's data dir, alarms
+    /// with no worktree on it once [`essential_paths`]' entries are in the
+    /// in-use list, as both edges put them.
+    #[test]
+    fn an_essential_path_keeps_a_small_fixed_volume_in_use() {
+        let system = VolumeReport {
+            volume: "C:".to_string(),
+            drive_letter: Some("C:".to_string()),
+            total_bytes: 20_000_000_000,
+            free_bytes: 500_000_000,
+            removable: false,
+            read_only: false,
+        };
+        let data = VolumeReport {
+            volume: "/var/lib/qontinui".to_string(),
+            drive_letter: None,
+            ..system.clone()
+        };
+        let volumes = vec![system, data];
+        assert_eq!(alarms_for(&volumes, &[], None), vec![]);
+        assert_eq!(
+            alarms_for(
+                &volumes,
+                &[r"C:\", "/var/lib/qontinui/com.qontinui.runner"],
+                None
+            ),
+            vec![
+                ("C:".to_string(), LowDiskLevel::Critical),
+                ("/var/lib/qontinui".to_string(), LowDiskLevel::Critical),
+            ]
+        );
+        assert!(
+            essential_paths().iter().any(|p| p.is_absolute()),
+            "the edge must name at least one absolute path"
+        );
+    }
+
+    /// A read-only mount (nawa's `/mnt/winiso`, 0 free by construction) is
+    /// not a capacity question: it never alarms, whatever is on it.
+    #[test]
+    fn a_read_only_volume_never_raises_a_low_disk_alarm() {
+        let iso = VolumeReport {
+            volume: "/mnt/winiso".to_string(),
+            drive_letter: None,
+            total_bytes: 8_150_000_000,
+            free_bytes: 0,
+            removable: false,
+            read_only: true,
+        };
+        let big_full_ro = VolumeReport {
+            volume: "/mnt/archive".to_string(),
+            total_bytes: 2_000 * GIB,
+            ..iso.clone()
+        };
+        let volumes = vec![iso, big_full_ro];
+        for in_use in [None, Some(vec![PathBuf::from("/mnt/winiso/x")])] {
+            let verdict = low_disk_alarms(&volumes, in_use.as_deref(), None, DEFAULT_FLOORS);
+            assert_eq!(alarm_keys(&verdict), vec![], "in_use = {in_use:?}");
+            assert_eq!(
+                verdict
+                    .suppressed
+                    .iter()
+                    .map(|(v, why)| (v.volume.as_str(), *why))
+                    .collect::<Vec<_>>(),
+                vec![
+                    ("/mnt/winiso", LowDiskSuppression::ReadOnly),
+                    ("/mnt/archive", LowDiskSuppression::ReadOnly),
+                ]
+            );
+        }
+        // The publisher needs no in-use paths for a read-only volume.
+        let probe = publisher_probe_from(
+            volumes,
+            DEFAULT_FLOORS,
+            || panic!("the instance role must not be read"),
+            || panic!("the root must not be read"),
+            || panic!("the census must not be read"),
+            None,
+            || panic!("the target dir must not be read"),
+        );
+        assert_eq!(probe.in_use, Some(vec![]));
+    }
+
+    /// The publisher looks up in-use paths for a small fixed volume, because
+    /// the alarm now reads them for one.
+    #[test]
+    fn the_publisher_probe_reads_paths_for_a_small_fixed_volume() {
+        let esp = VolumeReport {
+            volume: "/boot/efi".to_string(),
+            drive_letter: None,
+            total_bytes: 1_020_000_000,
+            free_bytes: 1_010_000_000,
+            removable: false,
+            read_only: false,
+        };
+        assert_eq!(
+            publisher_alarms(
+                vec![esp.clone()],
+                Some("/home/u/qontinui-root"),
+                Some(snapshot_of(vec![])),
+                None,
+            ),
+            vec![]
+        );
+        assert_eq!(
+            publisher_alarms(vec![esp], Some("/home/u/qontinui-root"), None, None),
+            vec![("/boot/efi".to_string(), LowDiskLevel::Critical)],
+            "no snapshot yet: in-use is UNKNOWN, so it alarms"
+        );
+    }
+
+    /// A removable volume declared as the external volume
+    /// (`crate::external_volume`) is in use by declaration, worktree or not.
+    /// It is bound into a folder (`D:\qontinui-ext`), so this also pins the
+    /// longest-mount resolution: the mount resolves to the folder-mounted
+    /// volume, not to the `D:` it sits on.
+    #[test]
+    fn a_removable_volume_declared_external_alarms() {
+        let external = VolumeReport {
+            volume: "D:/qontinui-ext".to_string(),
+            drive_letter: Some("D:".to_string()),
+            total_bytes: 16 * GIB,
+            free_bytes: 2 * GIB,
+            removable: true,
+            read_only: false,
+        };
+        let volumes = vec![healthy_internal(), external];
+        assert_eq!(
+            alarms_for(&volumes, &[], Some(r"D:\qontinui-ext")),
+            vec![("D:/qontinui-ext".to_string(), LowDiskLevel::Critical)]
+        );
+        assert_eq!(
+            alarms_for(&volumes, &[], None),
+            vec![],
+            "undeclared and holding no worktree, the same volume is silent"
+        );
+    }
+
+    /// The external mount a CALLER passes reaches the verdict: the edge reads
+    /// `external_volume::declared()`, and `warn_on_low_disk` must not drop
+    /// what it was handed.
+    #[test]
+    fn warn_on_low_disk_honours_the_callers_external_mount() {
+        let volumes = vec![healthy_internal(), removable_stick()];
+        let none_in_use: Vec<PathBuf> = vec![];
+        assert!(
+            warn_on_low_disk(
+                &volumes,
+                Some(&none_in_use),
+                Some(Path::new(r"E:\")),
+                DEFAULT_FLOORS
+            ),
+            "a stick the caller declares external must alarm"
+        );
+        assert!(
+            !warn_on_low_disk(&volumes, Some(&none_in_use), None, DEFAULT_FLOORS),
+            "the same stick, undeclared and unused, must not"
+        );
+    }
+
+    /// W1: a `CARGO_TARGET_DIR` on a removable volume makes it the runner's
+    /// even with no worktree on it — through the publisher's whole pure path
+    /// and through the in-use list the census walk builds.
+    #[test]
+    fn a_removable_volume_holding_only_a_build_target_dir_alarms() {
+        let snapshot = snapshot_of(vec![row_building_into(
+            "D:/qontinui-root/qontinui-runner",
+            Some("E:/cargo-target"),
+        )]);
+        assert_eq!(
+            publisher_alarms(
+                vec![healthy_internal(), removable_stick()],
+                Some(r"D:\qontinui-root"),
+                Some(snapshot.clone()),
+                None,
+            ),
+            vec![("E:".to_string(), LowDiskLevel::Critical)],
+            "the publisher must count the build target dir as in use"
+        );
+
+        let walked = in_use_paths(None, Some(snapshot.req.as_ref()));
+        assert_eq!(
+            alarms_for(
+                &[healthy_internal(), removable_stick()],
+                &walked
+                    .iter()
+                    .map(|p| p.to_str().unwrap())
+                    .collect::<Vec<_>>(),
+                None,
+            ),
+            vec![("E:".to_string(), LowDiskLevel::Critical)],
+            "the census walk's in-use list must carry the build target dir"
+        );
+    }
+
+    /// W2: the in-use list is the root, every row's worktree path, and every
+    /// row's build target dir (a row with none contributes only its path).
+    #[test]
+    fn in_use_paths_covers_the_root_every_row_and_every_build_target_dir() {
+        let snapshot = snapshot_of(vec![
+            row_building_into("D:/w/a", Some("E:/target-a")),
+            row_building_into("D:/w/b", None),
+        ]);
+        assert_eq!(
+            in_use_paths(Some(PathBuf::from("D:/root")), Some(snapshot.req.as_ref())),
+            vec![
+                PathBuf::from("D:/root"),
+                PathBuf::from("D:/w/a"),
+                PathBuf::from("E:/target-a"),
+                PathBuf::from("D:/w/b"),
+            ]
+        );
+        assert_eq!(
+            in_use_paths(None, None),
+            Vec::<PathBuf>::new(),
+            "no root and no snapshot: nothing"
+        );
+    }
+
+    /// A row's symlink-RESOLVED paths, when observed, are what put a volume
+    /// in use: the bytes are on the link target's volume, not the link's.
+    #[test]
+    fn in_use_paths_prefers_the_resolved_volume_paths() {
+        let mut resolved = row_building_into("/home/w/a", Some("/home/w/a/target"));
+        resolved.worktree_volume_path = Some("/data/w/a".to_string());
+        resolved.build_target_volume_path = Some("/data/w/a/target".to_string());
+        let snapshot = snapshot_of(vec![resolved, row_building_into("/home/w/b", Some("/t/b"))]);
+        assert_eq!(
+            in_use_paths(None, Some(snapshot.req.as_ref())),
+            vec![
+                PathBuf::from("/data/w/a"),
+                PathBuf::from("/data/w/a/target"),
+                PathBuf::from("/home/w/b"),
+                PathBuf::from("/t/b"),
+            ]
+        );
+    }
+
+    /// W2: the publisher probe hands on the root, the snapshot's rows and
+    /// build dirs, and the caller's external mount, once a removable volume is
+    /// under a floor.
+    #[test]
+    fn the_publisher_probe_carries_root_rows_build_dirs_and_external() {
+        let probe = publisher_probe_from(
+            vec![healthy_internal(), removable_stick()],
+            DEFAULT_FLOORS,
+            || false,
+            || Some(PathBuf::from("D:/root")),
+            || {
+                Some(snapshot_of(vec![row_building_into(
+                    "D:/w/a",
+                    Some("E:/target-a"),
+                )]))
+            },
+            Some(PathBuf::from("F:/ext")),
+            || None,
+        );
+        assert_eq!(
+            probe.in_use,
+            Some(vec![
+                PathBuf::from("D:/root"),
+                PathBuf::from("D:/w/a"),
+                PathBuf::from("E:/target-a"),
+            ])
+        );
+        assert_eq!(probe.external_mount, Some(PathBuf::from("F:/ext")));
+
+        // A stick that holds only the workspace root alarms through the
+        // publisher's path.
+        assert_eq!(
+            publisher_alarms(
+                vec![healthy_internal(), removable_stick()],
+                Some("E:/qontinui-root"),
+                Some(snapshot_of(vec![])),
+                None,
+            ),
+            vec![("E:".to_string(), LowDiskLevel::Critical)]
+        );
+        // …and through it, an external mount the caller declared.
+        assert_eq!(
+            publisher_alarms(
+                vec![healthy_internal(), removable_stick()],
+                None,
+                Some(snapshot_of(vec![])),
+                Some(r"E:\"),
+            ),
+            vec![("E:".to_string(), LowDiskLevel::Critical)]
+        );
+    }
+
+    /// N1: the in-use paths are built only when a removable volume is UNDER
+    /// the warn floor. A removable volume above it, or a fixed volume under
+    /// it, never reads the root or the census.
+    #[test]
+    fn the_publisher_probe_reads_paths_only_for_a_removable_volume_under_a_floor() {
+        let roomy_stick = VolumeReport {
+            free_bytes: 500 * GIB,
+            total_bytes: 512 * GIB,
+            ..removable_stick()
+        };
+        let full_fixed = VolumeReport {
+            free_bytes: GIB,
+            ..healthy_internal()
+        };
+        for volumes in [vec![roomy_stick], vec![full_fixed]] {
+            let probe = publisher_probe_from(
+                volumes,
+                DEFAULT_FLOORS,
+                || panic!("the instance role must not be read"),
+                || panic!("the root must not be read"),
+                || panic!("the census must not be read"),
+                None,
+                || panic!("the target dir must not be read"),
+            );
+            assert_eq!(probe.in_use, Some(vec![]));
+        }
+    }
+
+    /// W3: before the first census snapshot since start, where the worktrees
+    /// are is UNKNOWN — a removable volume under a floor alarms rather than
+    /// being silenced on a guess.
+    #[test]
+    fn before_the_first_census_snapshot_a_removable_volume_under_a_floor_alarms() {
+        let probe = publisher_probe_from(
+            vec![healthy_internal(), removable_stick()],
+            DEFAULT_FLOORS,
+            || false,
+            || Some(PathBuf::from("D:/root")),
+            || None,
+            None,
+            || None,
+        );
+        assert_eq!(probe.in_use, None, "no snapshot: in-use is UNKNOWN");
+        assert_eq!(
+            publisher_alarms(
+                vec![healthy_internal(), removable_stick()],
+                Some(r"D:\qontinui-root"),
+                None,
+                None,
+            ),
+            vec![("E:".to_string(), LowDiskLevel::Critical)]
+        );
+        // Once a snapshot exists and nothing in it is on the stick, it goes
+        // quiet.
+        assert_eq!(
+            publisher_alarms(
+                vec![healthy_internal(), removable_stick()],
+                Some(r"D:\qontinui-root"),
+                Some(snapshot_of(vec![row_building_into("D:/w/a", None)])),
+                None,
+            ),
+            vec![]
+        );
+    }
+
+    /// N4: a silenced volume is reported, and reported once.
+    #[test]
+    fn a_suppressed_volume_is_named_in_the_verdict_and_logged_once_per_key() {
+        let volumes = [healthy_internal(), removable_stick()];
+        let verdict = low_disk_alarms(&volumes, Some(&[]), None, DEFAULT_FLOORS);
+        assert_eq!(
+            verdict
+                .suppressed
+                .iter()
+                .map(|(v, why)| (v.volume.as_str(), *why))
+                .collect::<Vec<_>>(),
+            vec![("E:", LowDiskSuppression::NotInUse)]
+        );
+
+        let seen = Mutex::new(HashSet::new());
+        assert!(first_low_disk_suppression(&seen, "E:"));
+        assert!(!first_low_disk_suppression(&seen, "E:"));
+        assert!(first_low_disk_suppression(&seen, "F:"));
+    }
+
+    /// W-A: the overrides do not enforce `crit <= warn`. With the critical
+    /// floor set ABOVE the warn floor, a removable volume holding the root
+    /// with free space between the two is Critical, and the publisher must
+    /// still look up its in-use paths rather than call it unused.
+    #[test]
+    fn reversed_floors_still_alarm_critical_for_a_removable_root_volume_between_them() {
+        let reversed = LowDiskFloors {
+            warn: 100 * GIB,
+            crit: 150 * GIB,
+        };
+        let stick = VolumeReport {
+            total_bytes: 512 * GIB,
+            free_bytes: 120 * GIB,
+            ..removable_stick()
+        };
+        assert_eq!(
+            publisher_alarms_with(
+                vec![healthy_internal(), stick],
+                reversed,
+                false,
+                Some("E:/qontinui-root"),
+                Some(snapshot_of(vec![])),
+                None,
+            ),
+            vec![("E:".to_string(), LowDiskLevel::Critical)]
+        );
+    }
+
+    /// W-B: a secondary instance runs no census, so its in-use set is KNOWN as
+    /// its own root alone instead of UNKNOWN for its whole life. A stick
+    /// holding none of its paths is suppressed; one holding its root alarms.
+    #[test]
+    fn a_secondary_instance_knows_its_own_root_and_never_waits_for_a_census() {
+        let probe = publisher_probe_from(
+            vec![healthy_internal(), removable_stick()],
+            DEFAULT_FLOORS,
+            || true,
+            || Some(PathBuf::from("D:/secondary-root")),
+            || panic!("a secondary must not wait on a census snapshot"),
+            None,
+            || None,
+        );
+        assert_eq!(probe.in_use, Some(vec![PathBuf::from("D:/secondary-root")]));
+        assert_eq!(
+            publisher_alarms_with(
+                vec![healthy_internal(), removable_stick()],
+                DEFAULT_FLOORS,
+                true,
+                Some("D:/secondary-root"),
+                None,
+                None,
+            ),
+            vec![],
+            "a stick holding none of the secondary's paths is suppressed"
+        );
+        assert_eq!(
+            publisher_alarms_with(
+                vec![healthy_internal(), removable_stick()],
+                DEFAULT_FLOORS,
+                true,
+                Some("E:/secondary-root"),
+                None,
+                None,
+            ),
+            vec![("E:".to_string(), LowDiskLevel::Critical)],
+            "a stick holding the secondary's root alarms"
+        );
+    }
+
+    /// Nit 2: a secondary's own cargo target dir is part of its KNOWN in-use
+    /// set, so a stick holding only that build output alarms. Injected, never
+    /// read from the process environment.
+    #[test]
+    fn a_secondary_counts_its_own_cargo_target_dir_as_in_use() {
+        let probe = publisher_probe_from(
+            vec![healthy_internal(), removable_stick()],
+            DEFAULT_FLOORS,
+            || true,
+            || Some(PathBuf::from("D:/secondary-root")),
+            || panic!("a secondary must not wait on a census snapshot"),
+            None,
+            || Some(PathBuf::from("E:/cargo-target")),
+        );
+        assert_eq!(
+            probe.in_use,
+            Some(vec![
+                PathBuf::from("D:/secondary-root"),
+                PathBuf::from("E:/cargo-target"),
+            ])
+        );
+        assert_eq!(
+            alarm_keys(&low_disk_alarms(
+                &probe.volumes,
+                probe.in_use.as_deref(),
+                probe.external_mount.as_deref(),
+                probe.floors,
+            )),
+            vec![("E:".to_string(), LowDiskLevel::Critical)]
+        );
+    }
+
+    /// N-1: the census walk's alarm reaches `low_disk_alarms` with a KNOWN
+    /// in-use list (the walked rows' worktree paths AND build target dirs),
+    /// derived from one mount reading. `E:` holds only a build target dir and
+    /// alarms. `D:\stick` is removable, under the floor and shares the walked
+    /// row's drive letter, but holds none of its paths, so it is suppressed.
+    #[test]
+    fn the_walk_alarm_carries_build_dirs_and_its_known_in_use_list() {
+        let mounts = vec![
+            fixed_mount(r"D:\", 4_000 * GIB, 2_000 * GIB),
+            removable_mount(r"D:\stick", 16 * GIB, GIB),
+            removable_mount(r"E:\", 16 * GIB, GIB),
+        ];
+        let walked = snapshot_of(vec![row_building_into(r"D:\w\a", Some("E:/target"))]);
+        assert_eq!(
+            warn_on_walked_low_disk(&mounts, &walked.req, None, &[], DEFAULT_FLOORS),
+            vec![("E:".to_string(), LowDiskLevel::Critical)]
+        );
+    }
+
+    /// A path in a sibling folder that merely shares the mount's prefix
+    /// (`D:/qontinui-extra` vs `D:/qontinui-ext`) is not on that volume.
+    #[test]
+    fn a_volume_holds_a_path_only_on_a_component_boundary() {
+        assert!(volume_key_holds(
+            "D:/qontinui-ext",
+            "D:/qontinui-ext/targets"
+        ));
+        assert!(volume_key_holds("D:/qontinui-ext/", "d:/QONTINUI-EXT"));
+        assert!(!volume_key_holds("D:/qontinui-ext", "D:/qontinui-extra/x"));
+        assert!(volume_key_holds("E:", "E:/x"));
+        assert!(!volume_key_holds("E:", "F:/x"));
+        assert!(volume_key_holds("/", "/home/x"));
+        assert!(
+            !volume_key_holds("/mnt/Data", "/mnt/data/x"),
+            "POSIX is case-sensitive"
+        );
+        assert_eq!(
+            comparable_path(Path::new(r"\\?\E:\scratch")),
+            "E:/scratch",
+            "a canonicalized (verbatim) path compares against the plain key"
+        );
+    }
+
+    /// A2: a verbatim UNC path (a share, as
+    /// `canonicalize` returns it on Windows) becomes the proper `//srv/share`
+    /// form, never the relative-looking `UNC/srv/share`. Pure string
+    /// transform, so it runs on any OS.
+    #[test]
+    fn a_verbatim_unc_path_becomes_a_proper_unc_path() {
+        assert_eq!(
+            strip_verbatim_prefix("//?/UNC/srv/share/agent-worktrees/01a"),
+            "//srv/share/agent-worktrees/01a"
+        );
+        assert_eq!(strip_verbatim_prefix("//?/unc/srv/share"), "//srv/share");
+        assert_eq!(strip_verbatim_prefix("//?/E:/scratch"), "E:/scratch");
+        assert_eq!(strip_verbatim_prefix("//srv/share/x"), "//srv/share/x");
+        assert_eq!(strip_verbatim_prefix("/home/x"), "/home/x");
+        // The backslashed spelling, through the full comparable form.
+        assert_eq!(
+            comparable_path(Path::new(r"\\?\UNC\srv\share\wt")),
+            "//srv/share/wt"
+        );
+        // And it is held by the share's volume key, as `volume_key` spells it.
+        let key = volume_key(Path::new(r"\\srv\share"));
+        assert!(volume_key_holds(
+            &key,
+            &comparable_path(Path::new(r"\\?\UNC\srv\share\wt"))
+        ));
+    }
+
+    /// `removable` flows from the mount reading into the report, and rides the
+    /// wire only when true — a body with no removable volume is byte-identical
+    /// to the pre-Phase-7 contract.
+    #[test]
+    fn removable_flows_into_the_report_and_is_skipped_on_the_wire_when_false() {
+        let mut mounts = sample_mounts();
+        mounts.push(MountReading {
+            mount: PathBuf::from(r"F:\"),
+            total: 16 * GIB,
+            available: GIB,
+            removable: true,
+            read_only: false,
+        });
+        let all = volumes_from_mounts(&mounts, None);
+        let stick = all.iter().find(|v| v.volume == "F:").expect("F: reported");
+        assert!(stick.removable);
+        assert!(all
+            .iter()
+            .filter(|v| v.volume != "F:")
+            .all(|v| !v.removable));
+
+        let fixed = serde_json::to_value(healthy_internal()).unwrap();
+        assert!(
+            fixed.get("removable").is_none(),
+            "a fixed volume must not carry the key: {fixed}"
+        );
+        let removable = serde_json::to_value(removable_stick()).unwrap();
+        assert_eq!(removable.get("removable"), Some(&serde_json::json!(true)));
+    }
+
+    /// `read_only` is ALWAYS on the wire: `false` for a writable mount, `true`
+    /// for a read-only one. Coord reads an absent key as UNKNOWN (an older
+    /// runner build), so skipping `false` the way `removable` does would turn
+    /// every writable volume into an unknown one.
+    #[test]
+    fn read_only_is_on_the_wire_for_writable_and_read_only_volumes() {
+        let mut ro = fixed_mount("/mnt/winiso", 8_150_000_000, 0);
+        ro.read_only = true;
+        let mounts = vec![fixed_mount("/", 500 * GIB, 200 * GIB), ro];
+        let all = volumes_from_mounts(&mounts, None);
+        let wire: Vec<serde_json::Value> = all
+            .iter()
+            .map(|v| serde_json::to_value(v).unwrap())
+            .collect();
+        let by_key = |key: &str| {
+            wire.iter()
+                .find(|v| v["volume"] == key)
+                .unwrap_or_else(|| panic!("{key} reported: {wire:?}"))
+                .clone()
+        };
+        assert_eq!(
+            by_key("/").get("read_only"),
+            Some(&serde_json::json!(false)),
+            "a writable volume must carry read_only: false"
+        );
+        assert_eq!(
+            by_key("/mnt/winiso").get("read_only"),
+            Some(&serde_json::json!(true))
+        );
+    }
+
     /// Before the first sample the reading is ABSENT, and absence is the
     /// UNKNOWN state — there is no zero-filled placeholder to mistake for a
     /// measurement. After a publish it is readable without touching disk,
@@ -4265,6 +6148,8 @@ mod tests {",
             drive_letter: Some("D:".to_string()),
             total_bytes: 4_000,
             free_bytes: 93,
+            removable: false,
+            read_only: false,
         }]);
         assert_eq!(published.volumes.len(), 1);
         let read_back = latest_volume_sample().expect("a published sample must be readable");
@@ -5016,6 +6901,14 @@ mod tests {",
         assert!(div.starts_with("on:feature-x"), "got: {div}");
     }
 
+    /// Edge 9171555e: the SharedBranch P1-clean input must see an untracked
+    /// file that `status.showUntrackedFiles=no` hides from plain porcelain.
+    #[test]
+    fn canonical_is_dirty_sees_an_untracked_file_hidden_by_show_untracked_no() {
+        let repo = super::super::dirty::repo_with_hidden_untracked_file();
+        assert_eq!(compute_canonical_is_dirty(repo.path()), Some(true));
+    }
+
     /// End-to-end at the census layer: a worktree holding ONLY the runner's
     /// own untracked scaffolding must report `is_dirty: false`, while genuine
     /// uncommitted work must still report `true`.
@@ -5127,11 +7020,15 @@ mod tests {",
             nm_present: false,
             nm_is_junction: false,
             nm_bytes: 0,
-            target_present: false,
+            nm_exclusive_bytes: Some(0),
+            target_present: bytes > 0,
             target_is_junction: false,
-            target_bytes: 0,
+            target_bytes: bytes,
+            target_exclusive_bytes: Some(bytes),
             build_target_dir: None,
             build_slot: None,
+            build_target_volume_path: None,
+            worktree_volume_path: None,
             last_access_mtime: None,
             attributable_bytes: bytes,
             landed_in_main: None,
@@ -5211,6 +7108,8 @@ mod tests {",
             drive_letter: Some("D:".to_string()),
             total_bytes: 100,
             free_bytes: 40,
+            removable: false,
+            read_only: false,
         }]);
 
         let mut chunks = Vec::new();
@@ -5244,6 +7143,8 @@ mod tests {",
                     drive_letter: Some("D:".to_string()),
                     total_bytes: 100,
                     free_bytes: 50,
+                    removable: false,
+                    read_only: false,
                 }],
                 worktrees: vec![
                     row("qontinui-runner", "D:/x/a", 10),
@@ -5373,6 +7274,79 @@ mod tests {",
         assert_eq!(row.nm_bytes, 10);
         assert_eq!(row.target_bytes, 20);
         assert_eq!(row.attributable_bytes, 30);
+    }
+
+    /// An own `node_modules` holding a file hardlinked from outside it (a pnpm
+    /// tree imported from the store): the file counts in `nm_bytes`, the
+    /// apparent size, and not in `attributable_bytes`, since removing the
+    /// worktree frees none of it. Plan
+    /// `2026-11-22-worktree-census-counts-hardlinked-pnpm-store-bytes-as-reclaimable`.
+    #[cfg(unix)]
+    #[test]
+    fn attributable_bytes_exclude_a_store_hardlinked_node_modules_file() {
+        let _amb = crate::test_env::isolated_ambient();
+        let store = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let nm = dir.path().join("node_modules");
+        std::fs::create_dir(&nm).unwrap();
+        let stored = store.path().join("pkg.js");
+        std::fs::write(&stored, vec![0u8; 5000]).unwrap();
+        std::fs::hard_link(&stored, nm.join("pkg.js")).unwrap();
+        std::fs::write(nm.join("own.json"), vec![0u8; 12]).unwrap();
+        let row = capture_worktree("qontinui-web", dir.path());
+        assert_eq!(row.nm_bytes, 5012, "apparent size counts the store file");
+        assert_eq!(row.nm_exclusive_bytes, Some(12));
+        assert_eq!(
+            row.attributable_bytes, 12,
+            "only the unshared bytes are reclaimable"
+        );
+    }
+
+    /// The same property, entered the way the census population is: the
+    /// workspace walk (`enumerate_worktrees_with`) that `spawn_census`'s feed
+    /// runs, over a canonical `qontinui-*` checkout whose own `node_modules`
+    /// is hardlinked to a store outside it.
+    #[cfg(unix)]
+    #[test]
+    fn the_census_walk_reports_store_hardlinked_node_modules_as_unreclaimable() {
+        let _amb = crate::test_env::isolated_ambient();
+        let store = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("qontinui-web");
+        std::fs::create_dir(&repo).unwrap();
+        // A real (empty) repo, so git's discovery stops here instead of
+        // walking up into whatever repo TMPDIR may sit inside.
+        let init = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .expect("git runs");
+        assert!(init.success(), "git init succeeds");
+        let nm = repo.join("node_modules");
+        std::fs::create_dir(&nm).unwrap();
+        let stored = store.path().join("pkg.js");
+        std::fs::write(&stored, vec![0u8; 5000]).unwrap();
+        std::fs::hard_link(&stored, nm.join("pkg.js")).unwrap();
+        std::fs::write(nm.join("own.json"), vec![0u8; 12]).unwrap();
+
+        let mut rows = Vec::new();
+        enumerate_worktrees_with(root.path(), &mut |row| rows.push(row));
+        let row = rows
+            .iter()
+            .find(|r| std::fs::canonicalize(&r.path).ok() == std::fs::canonicalize(&repo).ok())
+            .expect("the canonical checkout is reported");
+        assert_eq!(row.nm_bytes, 5012, "apparent size counts the store file");
+        assert_eq!(
+            row.attributable_bytes, 12,
+            "the walk reports only the unshared bytes as reclaimable"
+        );
+    }
+
+    #[test]
+    fn reclaimable_footprint_falls_back_to_apparent_where_exclusivity_is_unknown() {
+        assert_eq!(reclaimable_footprint(10, None, 20, None), 30);
+        assert_eq!(reclaimable_footprint(10, Some(1), 20, None), 21);
+        assert_eq!(reclaimable_footprint(10, Some(1), 20, Some(2)), 3);
     }
 
     // ── CRITICAL-2 regression: a wedged git must not publish "clean" ────────

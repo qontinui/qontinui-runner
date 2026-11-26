@@ -70,8 +70,11 @@ export function ClaudeCliSection({
   // actually applies, which a fleet policy overrides on an unpinned machine.
   // The selector buttons and the custom-dir chooser keep editing the LOCAL
   // mode (`settings.claude_cli.account_selection_mode`).
-  const { mode: effectiveSelectionMode, fleetManaged: selectionFleetManaged } =
-    displayedAccountSelection(settings);
+  const {
+    mode: effectiveSelectionMode,
+    fleetManaged: selectionFleetManaged,
+    fleetUnread: selectionFleetUnread,
+  } = displayedAccountSelection(settings);
 
   const [checkingUsage, setCheckingUsage] = useState(false);
   const [detectingDirs, setDetectingDirs] = useState(false);
@@ -744,6 +747,15 @@ export function ClaudeCliSection({
                     Managed by fleet policy: {accountSelectionModeLabel(effectiveSelectionMode)}
                   </span>
                 )}
+                {selectionFleetUnread && (
+                  <span
+                    data-testid="account-selection-fleet-unread"
+                    className="text-[10px] px-1.5 py-0.5 rounded-full bg-muted text-muted-foreground font-medium"
+                    title="This runner has not yet heard from coord whether the fleet sets an account selection mode. The mode chosen here applies until it does; pin it to keep it either way."
+                  >
+                    Fleet policy not read yet
+                  </span>
+                )}
               </div>
               <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
                 {SELECTION_MODE_OPTIONS.map((option) => (
@@ -803,6 +815,39 @@ export function ClaudeCliSection({
             </label>
           </div>
 
+          <div className="space-y-2 pt-2">
+            <span className="text-[10px] font-medium text-muted-foreground uppercase tracking-wide">
+              Usage-Limit Reset
+            </span>
+            <label className="flex items-start gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                data-testid="auto-continue-after-limit-reset"
+                checked={settings.claude_cli.auto_continue_after_limit_reset ?? true}
+                onChange={(e) =>
+                  setSettings((prev) => ({
+                    ...prev,
+                    claude_cli: {
+                      ...prev.claude_cli,
+                      auto_continue_after_limit_reset: e.target.checked,
+                    },
+                  }))
+                }
+                className="mt-0.5 accent-primary"
+              />
+              <span>
+                <span className="text-xs font-medium block">
+                  Continue sessions after a limit reset
+                </span>
+                <span className="text-[10px] text-muted-foreground block">
+                  When a session stopped at its account&apos;s usage limit and that limit has reset,
+                  prompt it once to pick its task back up on the same account. Until the reset it
+                  stays parked.
+                </span>
+              </span>
+            </label>
+          </div>
+
           {claudeConfigDirs.length > 1 && (
             <div className="space-y-2 pt-2">
               <span className="text-[10px] font-medium text-muted-foreground uppercase tracking-wide">
@@ -856,6 +901,38 @@ export function ClaudeCliSection({
               </label>
             </div>
           )}
+
+          <div className="space-y-2 pt-2">
+            <span className="text-[10px] font-medium text-muted-foreground uppercase tracking-wide">
+              CLI Updates
+            </span>
+            <label className="flex items-start gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={settings.claude_cli.runner_manages_cli_updates ?? true}
+                onChange={(e) =>
+                  setSettings((prev) => ({
+                    ...prev,
+                    claude_cli: {
+                      ...prev.claude_cli,
+                      runner_manages_cli_updates: e.target.checked,
+                    },
+                  }))
+                }
+                className="mt-0.5 accent-primary"
+              />
+              <span>
+                <span className="text-xs font-medium block">Runner manages Claude CLI updates</span>
+                <span className="text-[10px] text-muted-foreground block">
+                  For an npm-global Claude Code install on Linux or macOS, the runner installs each
+                  new release once, when it is published. Sessions the runner starts never update
+                  themselves, so with this off, or on any other install, they stay on the installed
+                  version until you run claude update. Your own opt-outs (DISABLE_AUTOUPDATER,
+                  DISABLE_UPDATES, autoUpdates: false) always win.
+                </span>
+              </span>
+            </label>
+          </div>
 
           {settings.claude_cli.account_selection_mode === "manual" && (
             <div className="space-y-1">

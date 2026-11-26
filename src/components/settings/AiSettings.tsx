@@ -1,5 +1,8 @@
 import { useState, useEffect, useCallback, useReducer } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { useUIComponent } from "@qontinui/ui-bridge";
+import { guardedHandler } from "@/lib/ui-bridge/guardedHandler";
+import { textArg } from "@/components/terminal/commands/parse";
 import { listen } from "@tauri-apps/api/event";
 import { Bot, Check, X, Play, Video, MessageSquare } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
@@ -28,9 +31,16 @@ import { GeminiApiSection } from "./ai-settings/GeminiApiSection";
 import { ProviderHealthStatus } from "./ai-settings/ProviderHealthStatus";
 import { ModelRoutingSection } from "./ai-settings/ModelRoutingSection";
 
+/** How often the page re-reads the account-selection view while the runner
+ * reports that coord has not yet answered the fleet domain. */
+const FLEET_SELECTION_REFRESH_MS = 5000;
+
 interface AiSettingsProps {
   onLog: LogFunction;
 }
+
+/** Param schema of the `set-runner-manages-cli-updates` UI Bridge action. */
+const CLI_UPDATES_SCHEMA = { enabled: 'string ("on" or "off")' } as const;
 
 /** The READ-ONLY account-selection view fields of a `get_ai_settings`
  * response (the mode that governs, why, and the raw fleet value). Display-only:
@@ -39,12 +49,16 @@ function selectionViewFrom(
   data: AiSettingsType,
 ): Pick<
   AiSettingsType,
-  "effective_account_selection_mode" | "account_selection_source" | "fleet_account_selection_mode"
+  | "effective_account_selection_mode"
+  | "account_selection_source"
+  | "fleet_account_selection_mode"
+  | "fleet_account_selection_answered"
 > {
   return {
     effective_account_selection_mode: data.effective_account_selection_mode,
     account_selection_source: data.account_selection_source,
     fleet_account_selection_mode: data.fleet_account_selection_mode,
+    fleet_account_selection_answered: data.fleet_account_selection_answered,
   };
 }
 
@@ -117,7 +131,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
    * form's own state alone. A failed read keeps the last view: the page then
    * still describes the current form state through
    * `displayedAccountSelection`, which re-applies the runner's rule. */
-  const refreshSelectionView = async () => {
+  const refreshSelectionView = useCallback(async () => {
     try {
       const result = await invoke<TauriResult<AiSettingsType>>("get_ai_settings");
       if (result?.success && result.data) {
@@ -127,7 +141,20 @@ export function AiSettings({ onLog }: AiSettingsProps) {
     } catch (err) {
       console.error("Failed to refresh account-selection view:", err);
     }
-  };
+  }, []);
+
+  // Until coord has answered the fleet account-selection domain, the view's
+  // `null` fleet mode means "not yet asked" and the page says so. Re-read the
+  // view until the runner reports an answer, so the page picks up the fleet's
+  // value (or its "no opinion") without a save or a remount.
+  const fleetSelectionUnanswered = settings.fleet_account_selection_answered === false;
+  useEffect(() => {
+    if (!fleetSelectionUnanswered) return;
+    const timer = setInterval(() => {
+      void refreshSelectionView();
+    }, FLEET_SELECTION_REFRESH_MS);
+    return () => clearInterval(timer);
+  }, [fleetSelectionUnanswered, refreshSelectionView]);
 
   const loadSettings = async () => {
     try {
@@ -159,6 +186,9 @@ export function AiSettings({ onLog }: AiSettingsProps) {
               result.data.claude_cli?.auto_migrate_on_token_exhaustion ?? true,
             auto_continue_after_migration:
               result.data.claude_cli?.auto_continue_after_migration ?? true,
+            auto_continue_after_limit_reset:
+              result.data.claude_cli?.auto_continue_after_limit_reset ?? true,
+            runner_manages_cli_updates: result.data.claude_cli?.runner_manages_cli_updates ?? true,
           },
           claude_api: {
             model: result.data.claude_api?.model || DEFAULT_AI_SETTINGS.claude_api.model,
@@ -284,6 +314,8 @@ export function AiSettings({ onLog }: AiSettingsProps) {
         accountSelectionPinned: settings.claude_cli.account_selection_pinned,
         autoMigrateOnTokenExhaustion: settings.claude_cli.auto_migrate_on_token_exhaustion ?? true,
         autoContinueAfterMigration: settings.claude_cli.auto_continue_after_migration ?? true,
+        autoContinueAfterLimitReset: settings.claude_cli.auto_continue_after_limit_reset ?? true,
+        runnerManagesCliUpdates: settings.claude_cli.runner_manages_cli_updates ?? true,
         model: settings.claude_api.model,
         maxTokens: settings.claude_api.max_tokens,
         autoRefineVideoAfterIterations: settings.auto_refine_video_after_iterations,
@@ -464,6 +496,42 @@ export function AiSettings({ onLog }: AiSettingsProps) {
       setTesting(false);
     }
   };
+
+  // UI Bridge: the CLI-updates toggle (plan
+  // `2026-10-20-account-migration-respawn-dies-during-cli-reinstall-churn`,
+  // Phase 2). Declared before the `loading` early return so the hook order is
+  // stable.
+  useUIComponent({
+    id: "ai-settings-panel",
+    name: "AI Settings Panel",
+    description: "AI provider settings, including the Claude CLI account and update options",
+    actions: [
+      {
+        id: "set-runner-manages-cli-updates",
+        label: "Set runner-managed Claude CLI updates",
+        description:
+          'Set the "Runner manages Claude CLI updates" toggle in the form ("on" or "off"). ' +
+          "Does NOT persist on its own — the panel's Save button writes " +
+          "claude_cli.runner_manages_cli_updates.",
+        paramSchema: CLI_UPDATES_SCHEMA,
+        // `write` — changes form state that Save persists as a setting; reversible
+        // by setting it back. Nothing is installed by this action.
+        effect: "write",
+        handler: guardedHandler("set-runner-manages-cli-updates", CLI_UPDATES_SCHEMA, (args) => {
+          const value = textArg(args, "enabled");
+          if (value !== "on" && value !== "off") {
+            throw new Error('set-runner-manages-cli-updates requires { enabled: "on" | "off" }');
+          }
+          const enabled = value === "on";
+          setSettings((prev) => ({
+            ...prev,
+            claude_cli: { ...prev.claude_cli, runner_manages_cli_updates: enabled },
+          }));
+          return { runner_manages_cli_updates: enabled, persisted: false };
+        }),
+      },
+    ],
+  });
 
   if (loading) {
     return (

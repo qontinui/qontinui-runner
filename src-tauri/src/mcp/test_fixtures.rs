@@ -1267,12 +1267,18 @@ async fn clear_injected_handler() -> Json<ClearSessionsResponse> {
     // would let a gate tear down its sessions and silently leave error rows
     // overlaying the next test's `/error-monitor` page.
     let cleared_errors = clear_all_errors();
+    // Stub transcripts a `seed-lifecycle-store` `writeTranscript` wrote. The
+    // lifecycle ROWS themselves go with `/clear-lifecycle-store`.
+    let cleared_transcripts = clear_seed_transcripts();
     // The `identityEvidence` override is a fixture too, and it is PROCESS-GLOBAL
     // and sticky — a gate that forgot to clear it would otherwise leave every
     // later session-info read lying about its provenance. Teardown clears it
     // with the same one call that drops the injected fakes.
     crate::commands::session_info::set_forced_identity_evidence(None);
-    emit_injected_changed("clear", cleared_count + cleared_errors);
+    emit_injected_changed(
+        "clear",
+        cleared_count + cleared_errors + cleared_transcripts,
+    );
     Json(ClearSessionsResponse {
         success: true,
         cleared_count,
@@ -1739,6 +1745,114 @@ pub struct SeedLifecycleRecord {
     /// so a bound-but-dirless row reaches the tab and still cannot drive them.
     #[serde(default)]
     pub config_dir: Option<String>,
+    /// Also write a minimal stub transcript for the row at
+    /// `<configDir>/projects/<encoded workingDir>/<sessionId>.jsonl` (when none
+    /// exists), so a seeded CLOSED row passes `POST /control/sessions/resume`'s
+    /// transcript precondition. Requires BOTH `configDir` and `workingDir`
+    /// (an existing directory) — the defaults would name a path that cannot
+    /// resolve. A file this call writes is removed by
+    /// `POST /ui-bridge/test/clear-injected`; a pre-existing one is never
+    /// touched or removed.
+    #[serde(default)]
+    pub write_transcript: bool,
+}
+
+/// Transcript files this module wrote (and so may remove on teardown).
+static SEEDED_TRANSCRIPTS: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Write the stub transcripts a seed asked for. A pre-existing file is left
+/// alone and not tracked. Returns the paths written. Validation happens BEFORE
+/// any write, so a bad record writes nothing.
+fn write_seed_transcripts(req: &SeedLifecycleRequest) -> Result<Vec<std::path::PathBuf>, String> {
+    let mut planned = Vec::new();
+    for r in req.records.iter().filter(|r| r.write_transcript) {
+        // The id becomes a file name: only a well-formed session id (the same
+        // predicate the resume door applies) may.
+        if !crate::session::session_id::is_valid_session_id(&r.session_id) {
+            return Err(format!(
+                "record {:?}: writeTranscript needs a well-formed UUID sessionId",
+                r.session_id
+            ));
+        }
+        let (Some(cfg), Some(cwd)) = (r.config_dir.as_deref(), r.working_dir.as_deref()) else {
+            return Err(format!(
+                "record {} sets writeTranscript but not both configDir and workingDir",
+                r.session_id
+            ));
+        };
+        if !Path::new(cwd).is_dir() {
+            return Err(format!(
+                "record {}: workingDir {cwd:?} is not an existing directory",
+                r.session_id
+            ));
+        }
+        let path = crate::terminal::transcript::session_transcript_path(
+            Path::new(cfg),
+            cwd,
+            &r.session_id,
+        );
+        planned.push((path, r.session_id.clone(), cwd.to_string()));
+    }
+    let mut written: Vec<std::path::PathBuf> = Vec::new();
+    // Track as each file lands, so a failure part-way leaves nothing untracked.
+    let track = |paths: &[std::path::PathBuf]| {
+        SEEDED_TRANSCRIPTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(paths.iter().cloned());
+    };
+    for (path, id, cwd) in planned {
+        if path.exists() {
+            continue;
+        }
+        if let Some(dir) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                track(&written);
+                return Err(format!("create {}: {e}", dir.display()));
+            }
+        }
+        let ts = chrono::Utc::now().to_rfc3339();
+        let line = serde_json::json!({
+            "type": "user",
+            "uuid": uuid::Uuid::new_v4().to_string(),
+            "sessionId": id,
+            "cwd": cwd,
+            "timestamp": ts,
+            "message": { "role": "user", "content": "test-fixture seed" },
+        });
+        if let Err(e) = std::fs::write(&path, format!("{line}\n")) {
+            track(&written);
+            return Err(format!("write {}: {e}", path.display()));
+        }
+        written.push(path);
+    }
+    track(&written);
+    Ok(written)
+}
+
+/// Remove exactly `paths` (a seed call's own writes) and forget them.
+fn rollback_seed_transcripts(paths: &[std::path::PathBuf]) {
+    for p in paths {
+        let _ = std::fs::remove_file(p);
+    }
+    SEEDED_TRANSCRIPTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|t| !paths.contains(t));
+}
+
+/// Remove every transcript [`write_seed_transcripts`] wrote. Returns the count.
+fn clear_seed_transcripts() -> usize {
+    let paths = std::mem::take(
+        &mut *SEEDED_TRANSCRIPTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    paths
+        .iter()
+        .filter(|p| std::fs::remove_file(p).is_ok())
+        .count()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1908,6 +2022,7 @@ fn record_from_seed(
         // age without knowing the wall clock. Absent means absent; these are
         // no longer hardcoded to `None`.
         restore_pending_at: seed.restore_pending_at.map(|off| now_ms + off),
+        awaiting_account_since: None,
         confirmed_at: seed.confirmed_at.map(|off| now_ms + off),
         handle: None,
         account_label: None,
@@ -1922,10 +2037,17 @@ fn record_from_seed(
         finished_at: None,
         wind_down_outcome: None,
         wind_down_at: None,
+        wind_down_arm: None,
         finish_reason: None,
         finish_synced: false,
+        finish_coord_session_id: None,
+        finish_coord_readdressed: false,
         spawn_device_default: None,
         adopted_from: None,
+        last_session_start_at: None,
+        gate_id: None,
+        gate_consuming_device_id: None,
+        gate_bound_boot_ms: None,
     })
 }
 
@@ -2095,16 +2217,32 @@ async fn seed_lifecycle_store_handler(
     // self-scoped path (no port arg needed once the port is no longer the key).
     let path = crate::session::session_lifecycle_store::store_path();
     let now_ms = chrono::Utc::now().timestamp_millis();
+    // Transcripts first: a bad `writeTranscript` record must leave the store
+    // untouched, so nothing is half-seeded.
+    let written = match write_seed_transcripts(&req) {
+        Ok(w) => w,
+        Err(error) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(InjectSessionError {
+                    success: false,
+                    error,
+                }),
+            ))
+        }
+    };
     let seeded = match seed_lifecycle_store_at(&path, &req, now_ms) {
         Ok(seeded) => seeded,
         Err((code, error)) => {
+            // Only THIS call's writes: earlier seeds' rows are still in the store.
+            rollback_seed_transcripts(&written);
             return Err((
                 code,
                 Json(InjectSessionError {
                     success: false,
                     error,
                 }),
-            ))
+            ));
         }
     };
     // Hand the seed to the RUNNING store. Without this the file is authoritative
@@ -2391,7 +2529,7 @@ async fn agent_token_view_handler(
 //
 // [`crate::terminal::transcript::read_user_prompts`] builds
 // `<config_dir>/projects/<encoded(project_path)>/<session_id>.jsonl`, where the
-// encoding is `encode_project_path` — a PRIVATE fn. The public handle onto the
+// encoding is `encode_project_path` (crate-private). The public handle onto the
 // same construction is [`crate::terminal::transcript::session_transcript_path`],
 // which this route calls. Nothing here reimplements the encoding, so a change
 // to it cannot silently split the writer from the reader.
@@ -4379,6 +4517,7 @@ mod tests {
                     origin: None,
                     terminal_id: None,
                     config_dir: None,
+                    write_transcript: false,
                 },
                 SeedLifecycleRecord {
                     session_id: "open-b".to_string(),
@@ -4396,6 +4535,7 @@ mod tests {
                     origin: None,
                     terminal_id: None,
                     config_dir: None,
+                    write_transcript: false,
                 },
                 SeedLifecycleRecord {
                     session_id: "open-c".to_string(),
@@ -4413,6 +4553,7 @@ mod tests {
                     origin: None,
                     terminal_id: None,
                     config_dir: None,
+                    write_transcript: false,
                 },
                 // A ghost open row aged far into the past — still `state==open`,
                 // so list_open returns it (open_records is strict-open; the
@@ -4433,6 +4574,7 @@ mod tests {
                     origin: None,
                     terminal_id: None,
                     config_dir: None,
+                    write_transcript: false,
                 },
                 // A closed row — must NOT appear in list_open.
                 SeedLifecycleRecord {
@@ -4451,6 +4593,7 @@ mod tests {
                     origin: None,
                     terminal_id: None,
                     config_dir: None,
+                    write_transcript: false,
                 },
             ],
         };
@@ -4507,6 +4650,68 @@ mod tests {
         );
     }
 
+    /// `writeTranscript` writes a resolvable stub, never clobbers an existing
+    /// transcript, refuses a record with no dirs, and leaves nothing on a bad
+    /// request. (Teardown removes only files this module wrote.)
+    #[test]
+    fn write_transcript_seeds_a_resolvable_stub_and_tears_down() {
+        const OK_ID: &str = "7e0b5d6a-9b8e-4f2c-a3d1-c1d9f0e7a2b5";
+        const BAD_ID: &str = "7e0b5d6a-9b8e-4f2c-a3d1-c1d9f0e7a2b6";
+        let cfg = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let rec = |id: &str, with_dirs: bool| SeedLifecycleRecord {
+            session_id: id.to_string(),
+            state: "closed".to_string(),
+            last_seen_offset_ms: -1_000,
+            closed_at_offset_ms: None,
+            close_reason: Some("seed".into()),
+            page_id: None,
+            zone_index: None,
+            title: None,
+            working_dir: with_dirs.then(|| cwd.path().display().to_string()),
+            confirmed_at: None,
+            restore_pending_at: None,
+            restore_tier: None,
+            origin: None,
+            terminal_id: None,
+            config_dir: with_dirs.then(|| cfg.path().display().to_string()),
+            write_transcript: true,
+        };
+        // Missing dirs: refused, nothing written.
+        let bad = SeedLifecycleRequest {
+            records: vec![rec(OK_ID, true), rec(BAD_ID, false)],
+        };
+        assert!(write_seed_transcripts(&bad).is_err());
+        let path = |id: &str| {
+            crate::terminal::transcript::session_transcript_path(
+                cfg.path(),
+                &cwd.path().display().to_string(),
+                id,
+            )
+        };
+        assert!(!path(OK_ID).exists(), "a bad request writes nothing");
+        // A traversal-shaped id is refused before any write.
+        let mut evil = rec(OK_ID, true);
+        evil.session_id = "../../escape".to_string();
+        assert!(write_seed_transcripts(&SeedLifecycleRequest {
+            records: vec![evil]
+        })
+        .is_err());
+
+        let good = SeedLifecycleRequest {
+            records: vec![rec(OK_ID, true)],
+        };
+        let before = SEEDED_TRANSCRIPTS.lock().unwrap().len();
+        let written = write_seed_transcripts(&good).unwrap();
+        assert_eq!(written, vec![path(OK_ID)]);
+        assert!(path(OK_ID).is_file());
+        // A second seed leaves the existing file alone and does not track it.
+        assert!(write_seed_transcripts(&good).unwrap().is_empty());
+        assert_eq!(SEEDED_TRANSCRIPTS.lock().unwrap().len(), before + 1);
+        assert!(clear_seed_transcripts() >= 1);
+        assert!(!path(OK_ID).exists());
+    }
+
     /// A malformed seed body (empty records / bad state) is a 400.
     #[test]
     fn seed_lifecycle_store_rejects_malformed_body() {
@@ -4537,6 +4742,7 @@ mod tests {
                 origin: None,
                 terminal_id: None,
                 config_dir: None,
+                write_transcript: false,
             }],
         };
         let err = seed_lifecycle_store_at(&path, &bad_state, now).expect_err("bad state rejected");
@@ -4687,6 +4893,7 @@ mod tests {
                 origin: None,
                 terminal_id: None,
                 config_dir: None,
+                write_transcript: false,
             },
             chrono::Utc::now().timestamp_millis(),
         )
@@ -4714,6 +4921,7 @@ mod tests {
                     origin: None,
                     terminal_id: None,
                     config_dir: None,
+                    write_transcript: false,
                 })
                 .collect(),
         }
@@ -4765,6 +4973,7 @@ mod tests {
                 origin: None,
                 terminal_id: None,
                 config_dir: None,
+                write_transcript: false,
             }],
         };
         seed_lifecycle_store_at(&path, &req, now).expect("seed should succeed");
@@ -4805,6 +5014,7 @@ mod tests {
                 origin: None,
                 terminal_id: None,
                 config_dir: None,
+                write_transcript: false,
             }],
         };
         seed_lifecycle_store_at(&path, &req, now).expect("seed should succeed");
@@ -4863,6 +5073,7 @@ mod tests {
                 origin: None,
                 terminal_id: None,
                 config_dir: None,
+                write_transcript: false,
             }],
         };
         seed_lifecycle_store_at(&path, &req, chrono::Utc::now().timestamp_millis()).unwrap();
@@ -5082,6 +5293,7 @@ mod tests {
                 origin: Some("authoritative".to_string()),
                 terminal_id: None,
                 config_dir: None,
+                write_transcript: false,
             },
             now,
         )
@@ -5139,6 +5351,7 @@ mod tests {
                     origin: None,
                     terminal_id: None,
                     config_dir: None,
+                    write_transcript: false,
                 },
                 now,
             )
@@ -5195,6 +5408,7 @@ mod tests {
                 origin: None,
                 terminal_id: None,
                 config_dir: None,
+                write_transcript: false,
             },
             now,
         )
@@ -5698,6 +5912,7 @@ mod tests {
                 origin: Some("authoritative".to_string()),
                 terminal_id: Some("terminal-live-7".to_string()),
                 config_dir: Some("C:/claude/.claude-work".to_string()),
+                write_transcript: false,
             },
             1_700_000_000_000,
         )
@@ -5747,6 +5962,7 @@ mod tests {
             origin: Some("authoritative".to_string()),
             terminal_id: terminal_id.map(str::to_string),
             config_dir: Some("C:/claude/.claude-work".to_string()),
+            write_transcript: false,
         };
 
         let req = SeedLifecycleRequest {
@@ -5822,6 +6038,7 @@ mod tests {
                     origin: Some("authoritative".to_string()),
                     terminal_id: Some("terminal-live-7".to_string()),
                     config_dir: Some("C:/claude/.claude-work".to_string()),
+                    write_transcript: false,
                 },
                 // The same row minus the confirmation: OPEN, so it is in the id
                 // list, but NOT bound — the distinction the id list alone
@@ -5842,6 +6059,7 @@ mod tests {
                     origin: None,
                     terminal_id: Some("terminal-live-8".to_string()),
                     config_dir: None,
+                    write_transcript: false,
                 },
             ],
         };
@@ -5910,6 +6128,7 @@ mod tests {
                 origin: None,
                 terminal_id: None,
                 config_dir: None,
+                write_transcript: false,
             }],
         };
         seed_lifecycle_store_at(&path, &req, now).expect("seed should succeed");
@@ -5950,6 +6169,7 @@ mod tests {
             origin: None,
             terminal_id: None,
             config_dir: None,
+            write_transcript: false,
         };
         let req = SeedLifecycleRequest {
             records: vec![row("open-c"), row("open-a"), row("open-b")],
@@ -6043,6 +6263,7 @@ mod tests {
             origin: None,
             terminal_id: Some("   ".to_string()),
             config_dir: None,
+            write_transcript: false,
         };
         let err = record_from_seed(&seed, 1_700_000_000_000)
             .expect_err("a blank terminalId must not be accepted");
@@ -6080,6 +6301,7 @@ mod tests {
             origin: None,
             terminal_id: None,
             config_dir: Some(String::new()),
+            write_transcript: false,
         };
         let err = record_from_seed(&seed, 1_700_000_000_000)
             .expect_err("a blank configDir must not be accepted");
@@ -6117,6 +6339,7 @@ mod tests {
                 origin: None,
                 terminal_id: Some(String::new()),
                 config_dir: None,
+                write_transcript: false,
             }],
         };
         let (status, message) =

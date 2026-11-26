@@ -1,12 +1,9 @@
-//! State machine navigation commands
+//! Action log commands
 //!
-//! This module handles state navigation and action log operations:
-//! - Navigating to a single state
-//! - Action log viewing and management
+//! This module handles action log operations: viewing and clearing the log.
 
-use crate::commands::compartments::{BridgeCompartment, StorageCompartment};
+use crate::commands::compartments::StorageCompartment;
 use crate::error::AppError;
-use crate::executor::{require_running_bridge_compartment, with_default_bridge_compartment};
 use crate::safe_eprintln;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::Runtime;
@@ -14,42 +11,6 @@ use tauri::State;
 use tracing::{error, info};
 
 use super::CommandResponse;
-
-/// Navigate to a specific state in the state machine.
-///
-/// Sends a command to the Python executor to directly navigate to a target state.
-/// This bypasses normal transition logic and forces the state machine into the specified state.
-///
-/// # Arguments
-/// * `state` - The application state containing the Python bridge
-/// * `state_id` - The unique identifier of the state to navigate to
-///
-/// # Returns
-/// * `Ok(CommandResponse)` - Success with optional response data from Python
-/// * `Err(String)` - Error message if the executor is not running or command fails
-#[tauri::command]
-pub async fn navigate_to_state(
-    bridge: State<'_, BridgeCompartment>,
-    state_id: String,
-) -> Result<CommandResponse, String> {
-    info!("Navigating to state: {}", state_id);
-
-    require_running_bridge_compartment(&bridge)?;
-
-    let params = serde_json::json!({
-        "state_id": state_id
-    });
-
-    with_default_bridge_compartment(&bridge, |bridge| {
-        bridge.send_command("navigate_to_state", Some(params))
-    })??;
-
-    Ok(CommandResponse {
-        success: true,
-        message: Some(format!("Navigate to state {} command sent", state_id)),
-        data: None,
-    })
-}
 
 /// Get action log view data from the display processor.
 ///
@@ -124,7 +85,6 @@ pub async fn clear_action_log(
 pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
     PluginBuilder::new("qontinui_state_machine")
         .invoke_handler(tauri::generate_handler![
-            navigate_to_state,
             get_action_log_view,
             clear_action_log,
         ])

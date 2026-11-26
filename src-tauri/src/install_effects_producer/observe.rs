@@ -194,7 +194,7 @@ pub fn observe_audit(pm: PackageManager, repo_path: &Path, env: &RegistryEnv) ->
 
 /// Run the per-affected-file typecheck loopback against the runner's OWN
 /// `/code-semantics/typecheck` endpoint at `loopback_base` (e.g.
-/// `http://localhost:9876`). Returns `(results, ran)` where `ran` is true iff
+/// `http://127.0.0.1:9876`). Returns `(results, ran)` where `ran` is true iff
 /// the loop executed ≥1 file. Capped at [`MAX_TYPECHECK_FILES`].
 ///
 /// `escalation_overridden` ⇒ each result's `provenance` is suffixed with

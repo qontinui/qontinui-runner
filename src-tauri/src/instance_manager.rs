@@ -748,6 +748,6 @@ async fn probe_instance_api(port: u16) -> bool {
         Err(_) => return false,
     };
 
-    let url = format!("http://localhost:{}/status", port);
+    let url = format!("{}/status", crate::mcp::types::runner_loopback_base(port));
     client.get(&url).send().await.is_ok()
 }

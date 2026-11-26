@@ -1,0 +1,3 @@
+   Compiling qontinui-runner v1.0.11 (D:\a\qontinui-runner\qontinui-runner\src-tauri)
+note: the sidecar log said: process didn't exit successfully: `qontinui_profile.exe` (exit code: 0xc0000017, STATUS_NO_MEMORY)
+error: could not compile `qontinui-runner` (lib test)

@@ -36,17 +36,27 @@ import {
   mayClaimRecordedZone,
   claimInitForPage,
   buildResumeCmd,
+  resumeGateEnv,
   runVerifiedResume,
   classifyRestoreAction,
+  resolveRestoreAccount,
+  restoreTabName,
   recordBelongsToRestore,
   reportTreeReset,
   decideReconnectOutcome,
   decideColdResume,
+  reconnectedTabFor,
   decideDrainSkipDisposition,
   applyDrainSkip,
+  holdNeedsAccountIfNotLive,
+  applyNeedsAccountNote,
+  type NeedsAccountRecord,
 } from "./useTerminalInitialization";
 import type { TerminalSessionRecord } from "./types";
 import type { SessionOpenArgs } from "./sessionRecordArgs";
+
+/** The default Claude home the account rule is judged against. */
+const HOME = "/home/u/.claude";
 
 const rec = (overrides: Partial<TerminalSessionRecord>): TerminalSessionRecord => ({
   claudeSessionId: "sid",
@@ -237,6 +247,7 @@ describe("recordBelongsToRestore (orphan-page adoption)", () => {
       pageId: page,
       origin: "authoritative",
       confirmedAt: 123,
+      configDir: "/home/u/.claude-x",
     });
 
   it("matching page always restores (no adoption involved)", () => {
@@ -253,6 +264,12 @@ describe("recordBelongsToRestore (orphan-page adoption)", () => {
     expect(recordBelongsToRestore(confirmed("default"), "page-a", ["page-a"], true)).toBe(true);
     // A deleted page's id is just as orphaned as "default".
     expect(recordBelongsToRestore(confirmed("gone-page"), "page-a", ["page-a"], true)).toBe(true);
+  });
+
+  it("an orphan whose ACCOUNT is unknown (needs-account) is adopted too, so it gets asked about", () => {
+    const needsAccount = { ...confirmed("gone-page"), configDir: undefined };
+    expect(classifyRestoreAction(needsAccount, HOME)).toBe("needs-account");
+    expect(recordBelongsToRestore(needsAccount, "page-a", ["page-a"], true)).toBe(true);
   });
 
   it("orphan is NOT adopted by a non-adopter page (one adopter per boot)", () => {
@@ -424,6 +441,35 @@ describe("runVerifiedResume", () => {
     );
   });
 
+  it("never asks for the DEFAULT home as CLAUDE_CONFIG_DIR — any other account is asked for", async () => {
+    // The backend renders the typed command (`build_ai_resume_command`), so the
+    // frontend's half of the rule is the dir it ASKS for: the default home goes
+    // as `null` (no CLAUDE_CONFIG_DIR), any other account verbatim.
+    const askedDir = async (configDir: string) => {
+      mockInvoke.mockClear();
+      const writes: string[] = [];
+      await runVerifiedResume({
+        terminalRefs: refsWithHandle(writes),
+        tabId: "tab-1",
+        claudeSessionId: "sess-1",
+        configDir,
+        updateTab: vi.fn(),
+        defaultConfigHome: async () => "/home/u/.claude",
+        verifyOptions: {
+          settleMs: 1,
+          timeoutMs: 50,
+          intervalMs: 1,
+          readTail: async () => CLAUDE_UI,
+        },
+      });
+      expect(writes.some((w) => w.includes("--resume sess-1"))).toBe(true);
+      const call = mockInvoke.mock.calls.find(([cmd]) => cmd === "build_ai_resume_command");
+      return (call?.[1] as { configDir?: string | null } | undefined)?.configDir;
+    };
+    expect(await askedDir("/home/u/.claude/")).toBeNull();
+    expect(await askedDir("/home/u/.claude-x")).toBe("/home/u/.claude-x");
+  });
+
   it("verified handshake → clears isReconnecting AND the backend restore-pending marker", async () => {
     const writes: string[] = [];
     const updateTab = vi.fn();
@@ -578,48 +624,322 @@ describe("runVerifiedResume", () => {
 describe("classifyRestoreAction (Phase 4 confirmed-authoritative auto-resume gate)", () => {
   it("CONFIRMED authoritative binding auto-resumes with no operator click", () => {
     expect(
-      classifyRestoreAction({
-        claudeSessionId: "sess-1",
-        origin: "authoritative",
-        confirmedAt: 1_700_000_000_000,
-      }),
+      classifyRestoreAction(
+        {
+          claudeSessionId: "sess-1",
+          origin: "authoritative",
+          confirmedAt: 1_700_000_000_000,
+          configDir: "/home/u/.claude-x",
+        },
+        HOME,
+      ),
     ).toBe("auto-resume");
   });
 
   it("authoritative-but-PROVISIONAL (no confirmedAt) is a phantom shell ⇒ terminal-only (no resume, no banner)", () => {
-    expect(classifyRestoreAction({ claudeSessionId: "sess-1", origin: "authoritative" })).toBe(
-      "terminal-only",
-    );
+    expect(
+      classifyRestoreAction({ claudeSessionId: "sess-1", origin: "authoritative" }, HOME),
+    ).toBe("terminal-only");
   });
 
   it("reconciled binding restores terminal-only (backstop guess can name a foreign session, too weak to act on)", () => {
-    expect(classifyRestoreAction({ claudeSessionId: "sess-1", origin: "reconciled" })).toBe(
+    expect(classifyRestoreAction({ claudeSessionId: "sess-1", origin: "reconciled" }, HOME)).toBe(
       "terminal-only",
     );
   });
 
   it("a confirmed RECONCILED row is still terminal-only (confirmation upgrades only authoritative/observed rows)", () => {
     expect(
-      classifyRestoreAction({
-        claudeSessionId: "sess-1",
-        origin: "reconciled",
-        confirmedAt: 1_700_000_000_000,
-      }),
+      classifyRestoreAction(
+        {
+          claudeSessionId: "sess-1",
+          origin: "reconciled",
+          confirmedAt: 1_700_000_000_000,
+        },
+        HOME,
+      ),
     ).toBe("terminal-only");
   });
 
   it("absent origin (pre-field record) reads as reconciled ⇒ terminal-only", () => {
-    expect(classifyRestoreAction({ claudeSessionId: "sess-1" })).toBe("terminal-only");
+    expect(classifyRestoreAction({ claudeSessionId: "sess-1" }, HOME)).toBe("terminal-only");
   });
 
   it("shell-unsafe session ids are skipped outright, never typed", () => {
     expect(
-      classifyRestoreAction({
-        claudeSessionId: "bad; rm -rf /",
-        origin: "authoritative",
-        confirmedAt: 1,
-      }),
+      classifyRestoreAction(
+        {
+          claudeSessionId: "bad; rm -rf /",
+          origin: "authoritative",
+          confirmedAt: 1,
+        },
+        HOME,
+      ),
     ).toBe("skip-invalid");
+  });
+});
+
+// Plan 2026-10-04-runner-session-roster-restore-picker, Phase 3: a restore
+// never resumes under a GUESSED account. The recorded configDir wins; with none,
+// a UNIQUE transcript holder is evidence; zero / several holders, or a rejected
+// dir, make the record `needs-account` — Claude only.
+describe("classifyRestoreAction — needs-account (no silent default account)", () => {
+  const CONFIRMED_CLAUDE = {
+    claudeSessionId: "sess-1",
+    origin: "authoritative",
+    confirmedAt: 1,
+    provider: "claude",
+    transcriptExists: true,
+  } as const;
+
+  it("a recorded configDir auto-resumes whatever the transcript evidence says", () => {
+    expect(
+      classifyRestoreAction(
+        {
+          ...CONFIRMED_CLAUDE,
+          configDir: "/home/u/.claude-x",
+          transcriptConfigDirCount: 2,
+        },
+        HOME,
+      ),
+    ).toBe("auto-resume");
+  });
+
+  it("a recorded configDir rejected by sanitizeConfigDir is needs-account, never the default", () => {
+    expect(classifyRestoreAction({ ...CONFIRMED_CLAUDE, configDir: "/x/$(evil)" }, HOME)).toBe(
+      "needs-account",
+    );
+  });
+
+  it("no recorded dir + a UNIQUE transcript holder auto-resumes (evidence, not a guess)", () => {
+    expect(
+      classifyRestoreAction(
+        {
+          ...CONFIRMED_CLAUDE,
+          transcriptConfigDirCount: 1,
+          transcriptConfigDir: "/home/u/.claude-niklas",
+          transcriptConfigDirIsDefault: false,
+        },
+        HOME,
+      ),
+    ).toBe("auto-resume");
+  });
+
+  it("no recorded dir + SEVERAL transcript holders is needs-account", () => {
+    expect(classifyRestoreAction({ ...CONFIRMED_CLAUDE, transcriptConfigDirCount: 2 }, HOME)).toBe(
+      "needs-account",
+    );
+  });
+
+  it("no recorded dir + ZERO transcript holders is needs-account", () => {
+    expect(
+      classifyRestoreAction(
+        {
+          ...CONFIRMED_CLAUDE,
+          transcriptExists: undefined,
+          transcriptConfigDirCount: 0,
+        },
+        HOME,
+      ),
+    ).toBe("needs-account");
+  });
+
+  it("no recorded dir and an UNPROBED location is needs-account, never a default-account resume", () => {
+    expect(classifyRestoreAction(CONFIRMED_CLAUDE, HOME)).toBe("needs-account");
+  });
+
+  it("applies only to a would-be auto-resume: a provisional row stays terminal-only", () => {
+    expect(
+      classifyRestoreAction(
+        {
+          ...CONFIRMED_CLAUDE,
+          confirmedAt: undefined,
+          transcriptConfigDirCount: 2,
+        },
+        HOME,
+      ),
+    ).toBe("terminal-only");
+  });
+});
+
+describe("resolveRestoreAccount", () => {
+  it("a recorded default home that does not exist falls through to the transcript holder", () => {
+    // home = null is what the backend answers for a retired default home.
+    expect(
+      resolveRestoreAccount(
+        {
+          configDir: "/a/.claude",
+          transcriptConfigDirCount: 1,
+          transcriptConfigDir: "/a/.claude-gmail",
+          transcriptConfigDirIsDefault: false,
+        },
+        null,
+      ),
+    ).toEqual({ kind: "resolved", recordDir: "/a/.claude-gmail", typedDir: "/a/.claude-gmail" });
+    expect(
+      resolveRestoreAccount({ configDir: "/a/.claude", transcriptConfigDirCount: 0 }, null),
+    ).toEqual({ kind: "unknown", reason: "no-transcript-holder" });
+    expect(
+      resolveRestoreAccount({ configDir: "/a/.claude", transcriptConfigDirCount: 2 }, null),
+    ).toEqual({ kind: "unknown", reason: "ambiguous-transcript" });
+    expect(
+      resolveRestoreAccount(
+        {
+          configDir: "/a/.claude",
+          transcriptConfigDirCount: 1,
+          transcriptConfigDir: "/a/.claude",
+          transcriptConfigDirIsDefault: true,
+        },
+        null,
+      ),
+    ).toEqual({ kind: "resolved", recordDir: "/a/.claude", typedDir: undefined });
+  });
+
+  it("takes the recorded dir first", () => {
+    expect(
+      resolveRestoreAccount({ configDir: "/a/.claude-x", transcriptConfigDirCount: 2 }, HOME),
+    ).toEqual({ kind: "resolved", recordDir: "/a/.claude-x", typedDir: "/a/.claude-x" });
+  });
+
+  it("a blank recorded dir counts as absent", () => {
+    expect(
+      resolveRestoreAccount(
+        {
+          configDir: "  ",
+          transcriptConfigDirCount: 1,
+          transcriptConfigDir: "/a/.claude-y",
+          transcriptConfigDirIsDefault: false,
+        },
+        HOME,
+      ),
+    ).toEqual({ kind: "resolved", recordDir: "/a/.claude-y", typedDir: "/a/.claude-y" });
+  });
+
+  it("the DEFAULT home types NO CLAUDE_CONFIG_DIR, and only the record keeps its path", () => {
+    expect(
+      resolveRestoreAccount(
+        {
+          transcriptConfigDirCount: 1,
+          transcriptConfigDir: "/home/u/.claude",
+          transcriptConfigDirIsDefault: true,
+        },
+        HOME,
+      ),
+    ).toEqual({ kind: "resolved", recordDir: "/home/u/.claude", typedDir: undefined });
+    expect(resolveRestoreAccount({ configDir: "/home/u/.claude/" }, HOME)).toEqual({
+      kind: "resolved",
+      recordDir: "/home/u/.claude/",
+      typedDir: undefined,
+    });
+  });
+
+  it("a default home that is not shell-safe still resumes — it is never typed", () => {
+    const home = "/home/Zoë O'Brien/.claude";
+    expect(resolveRestoreAccount({ configDir: home }, home)).toEqual({
+      kind: "resolved",
+      recordDir: home,
+      typedDir: undefined,
+    });
+    expect(
+      classifyRestoreAction(
+        {
+          claudeSessionId: "sess-1",
+          origin: "authoritative",
+          confirmedAt: 1,
+          provider: "claude",
+          transcriptExists: true,
+          configDir: home,
+        },
+        home,
+      ),
+    ).toBe("auto-resume");
+  });
+
+  it("with the default home unreadable, a dir that may be it is needs-account, never typed", () => {
+    // No transcript evidence either: still needs-account, never typed on a guess.
+    expect(resolveRestoreAccount({ configDir: "/home/u/.claude" }, null)).toEqual({
+      kind: "unknown",
+      reason: "transcript-unprobed",
+    });
+    // Any other account is still typed as itself.
+    expect(resolveRestoreAccount({ configDir: "/home/u/.claude-x" }, null)).toEqual({
+      kind: "resolved",
+      recordDir: "/home/u/.claude-x",
+      typedDir: "/home/u/.claude-x",
+    });
+  });
+
+  it("names the reason when the account is unknown", () => {
+    expect(resolveRestoreAccount({ configDir: "C:/a`b`" }, HOME)).toEqual({
+      kind: "unknown",
+      reason: "config-dir-rejected",
+    });
+    expect(resolveRestoreAccount({ transcriptConfigDirCount: 0 }, HOME)).toEqual({
+      kind: "unknown",
+      reason: "no-transcript-holder",
+    });
+    expect(resolveRestoreAccount({ transcriptConfigDirCount: 3 }, HOME)).toEqual({
+      kind: "unknown",
+      reason: "ambiguous-transcript",
+    });
+    expect(
+      resolveRestoreAccount(
+        {
+          transcriptConfigDirCount: 1,
+          transcriptConfigDir: "/x/$HOME",
+          transcriptConfigDirIsDefault: false,
+        },
+        HOME,
+      ),
+    ).toEqual({ kind: "unknown", reason: "config-dir-rejected" });
+  });
+
+  it("no recorded dir and no probe is unknown — nothing names the account", () => {
+    expect(resolveRestoreAccount({}, HOME)).toEqual({
+      kind: "unknown",
+      reason: "transcript-unprobed",
+    });
+  });
+});
+
+// The restored tab is named by THE display-name rule (`displayNameOf`), not
+// the bare tab `title` (just "claude" in about half of all rows).
+describe("restoreTabName (display-name rule)", () => {
+  const base = { claudeSessionId: "0123456789abcdef" };
+
+  it("an operator-chosen name wins over the title", () => {
+    expect(restoreTabName({ ...base, sessionName: "fix the bug", title: "claude" })).toBe(
+      "fix the bug",
+    );
+    expect(
+      restoreTabName({
+        ...base,
+        sessionName: "fix the bug",
+        nameSource: "operator",
+        title: "claude",
+      }),
+    ).toBe("fix the bug");
+  });
+
+  it("a DERIVED auto-name falls back to the title", () => {
+    expect(
+      restoreTabName({
+        ...base,
+        sessionName: "qontinui-coord-c7",
+        nameSource: "derived",
+        title: "runner work",
+      }),
+    ).toBe("runner work");
+  });
+
+  it("a derived name is still used when there is no title", () => {
+    expect(
+      restoreTabName({ ...base, sessionName: "qontinui-coord-c7", nameSource: "derived" }),
+    ).toBe("qontinui-coord-c7");
+  });
+
+  it("with neither, the id prefix", () => {
+    expect(restoreTabName(base)).toBe("claude 01234567");
   });
 });
 
@@ -629,7 +949,27 @@ describe("classifyRestoreAction (Phase 4 confirmed-authoritative auto-resume gat
 // renderer `commands::config::render_ai_resume_command`; these pin the
 // frontend half — what is asked for, and that nothing is typed on a refusal.
 describe("buildResumeCmd (backend-rendered resume)", () => {
-  beforeEach(() => mockInvoke.mockReset());
+  // `isWindows` comes from `navigator.platform`, and Node has a real global
+  // `navigator` that reports the HOST — so without a pin these expectations
+  // passed on Linux CI and failed on every Windows dev box.
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    vi.stubGlobal("navigator", { platform: "Linux x86_64" });
+  });
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("tells the backend the host is Windows when the platform says so", async () => {
+    vi.stubGlobal("navigator", { platform: "Win32" });
+    mockInvoke.mockResolvedValueOnce({ success: true, message: null, data: { command: "W" } });
+    await buildResumeCmd("sess-1", undefined, "summary");
+    expect(mockInvoke).toHaveBeenCalledWith("build_ai_resume_command", {
+      sessionId: "sess-1",
+      provider: "claude",
+      configDir: null,
+      isWindows: true,
+      fullResume: false,
+    });
+  });
 
   it("asks the backend with the recorded dir and the full-resume policy, then appends Enter", async () => {
     mockInvoke.mockResolvedValueOnce({
@@ -704,6 +1044,52 @@ describe("buildResumeCmd (backend-rendered resume)", () => {
     expect(out).toBe("failed");
     expect(writes).toEqual([]);
     expect(updateTab).toHaveBeenCalledWith("tab-1", { isReconnecting: false, resumeFailed: true });
+  });
+});
+
+// Plan 2026-10-03 D3 — a resumed gate continuation keeps its gate identity, so
+// the session can still report its own work outcome after a runner restart.
+describe("buildResumeCmd (gate continuation identity)", () => {
+  const GATE = "7252781b-c49c-4a83-bdc2-4fec9c3dcd91";
+  const DEVICE = "eb2155ed-0000-4000-8000-000000000001";
+
+  // Pin the host the way the backend-rendered block above does: `isWindows`
+  // reads `navigator.platform`, which in Node reports the real host.
+  beforeEach(() => {
+    mockInvoke.mockReset();
+    mockInvoke.mockResolvedValue({ success: true, message: null, data: { command: "R" } });
+    vi.stubGlobal("navigator", { platform: "Linux x86_64" });
+  });
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("asks the backend to re-inject the gate identity when both halves are present", async () => {
+    await buildResumeCmd("sess-1", undefined, "summary", undefined, {
+      gateId: GATE,
+      gateConsumingDeviceId: DEVICE,
+    });
+    expect(mockInvoke).toHaveBeenCalledWith("build_ai_resume_command", {
+      sessionId: "sess-1",
+      provider: "claude",
+      configDir: null,
+      isWindows: false,
+      fullResume: false,
+      gateId: GATE,
+      gateDeviceId: DEVICE,
+    });
+  });
+
+  it("sends neither half when one is missing or malformed (never interpolates junk)", async () => {
+    expect(resumeGateEnv({ gateId: GATE })).toEqual([]);
+    expect(resumeGateEnv({ gateId: GATE, gateConsumingDeviceId: "x; rm -rf /" })).toEqual([]);
+    expect(resumeGateEnv(undefined)).toEqual([]);
+    await buildResumeCmd("sess-1", undefined, "summary", undefined, { gateId: GATE });
+    expect(mockInvoke).toHaveBeenCalledWith("build_ai_resume_command", {
+      sessionId: "sess-1",
+      provider: "claude",
+      configDir: null,
+      isWindows: false,
+      fullResume: false,
+    });
   });
 });
 
@@ -863,17 +1249,28 @@ describe("fetchRestoreSet — coord device drain", () => {
 
 describe("mayClaimRecordedZone — drain re-run merges with existing tabs", () => {
   it("lets a first restore claim any recorded zone", () => {
-    expect(mayClaimRecordedZone(false, 2, "t-new", { 2: "t-operator" })).toBe(true);
+    expect(mayClaimRecordedZone(false, 2, "t-new", { 2: "t-operator" }, 4)).toBe(true);
   });
 
   it("never lets a drain re-run take a zone an operator tab holds", () => {
-    expect(mayClaimRecordedZone(true, 2, "t-new", { 2: "t-operator" })).toBe(false);
-    expect(mayClaimRecordedZone(true, 2, "t-new", {})).toBe(true);
-    expect(mayClaimRecordedZone(true, 2, "t-same", { 2: "t-same" })).toBe(true);
+    expect(mayClaimRecordedZone(true, 2, "t-new", { 2: "t-operator" }, 4)).toBe(false);
+    expect(mayClaimRecordedZone(true, 2, "t-new", {}, 4)).toBe(true);
+    expect(mayClaimRecordedZone(true, 2, "t-same", { 2: "t-same" }, 4)).toBe(true);
+  });
+
+  it("never lets a drain re-run place a tab past the grid it finds", () => {
+    expect(mayClaimRecordedZone(true, 5, "t-new", {}, 4)).toBe(false);
+    expect(mayClaimRecordedZone(true, 4, "t-new", {}, 4)).toBe(false);
+    expect(mayClaimRecordedZone(true, 3, "t-new", {}, 4)).toBe(true);
+    expect(mayClaimRecordedZone(true, 12, "t-new", {}, Number.POSITIVE_INFINITY)).toBe(true);
+  });
+
+  it("lets a first restore claim past the zone count: the saved layout may yet grow", () => {
+    expect(mayClaimRecordedZone(false, 5, "t-new", {}, 4)).toBe(true);
   });
 
   it("never claims an unzoned record", () => {
-    expect(mayClaimRecordedZone(false, -1, "t", {})).toBe(false);
+    expect(mayClaimRecordedZone(false, -1, "t", {}, 4)).toBe(false);
   });
 });
 
@@ -921,6 +1318,18 @@ describe("waitForHolderSweep — PTY-holder boot sweep before the restore", () =
   });
 });
 
+/** A registry read that could not see everything: one dir was unlistable. */
+const partialLiveRead = {
+  success: true,
+  message: null,
+  data: {
+    sessions: [{ sessionId: "visible-live", pid: 7 }],
+    unlistable: ["/home/u/.claude-x/sessions (Permission denied)"],
+    unreadableRecords: [],
+  },
+};
+const settledSweep = { success: true, message: null, data: { settled: true } };
+
 describe("recheckRefusedAfterSweep — sessions refused as live before the sweep settled", () => {
   beforeEach(() => {
     mockInvoke.mockReset();
@@ -937,6 +1346,17 @@ describe("recheckRefusedAfterSweep — sessions refused as live before the sweep
     ).resolves.toEqual(["reaped-by-sweep"]);
     expect(mockInvoke).toHaveBeenCalledTimes(2);
     expect(live).toHaveBeenCalledTimes(1);
+  });
+
+  it("by default resumes nothing a PARTIAL registry read does not show", async () => {
+    // Pins the DEFAULT: a caller that omits `liveIds` gets the STRICT
+    // oracle, because "hidden" may be live in the dir that could not be
+    // listed — resuming it would fork it.
+    mockInvoke.mockImplementation(async (cmd: unknown) =>
+      cmd === "terminal_claude_session_list_live" ? partialLiveRead : settledSweep,
+    );
+    await expect(recheckRefusedAfterSweep(["hidden"])).resolves.toEqual([]);
+    expect(mockInvoke).toHaveBeenCalledWith("terminal_claude_session_list_live");
   });
 
   it("resumes nothing when the sweep never settles", async () => {
@@ -1046,6 +1466,21 @@ describe("onHolderSessionReleased — a deferred holder died before adoption", (
     const live = vi.fn().mockResolvedValue(new Set<string>());
     await onHolderSessionReleased({ ...payload, pageId: null }, schedule, live);
     expect(schedule).toHaveBeenCalledWith("default", ["sess-1"]);
+  });
+
+  it("by default schedules nothing on a PARTIAL registry read that does not show the session", async () => {
+    // The production caller passes no `liveIds`, so the STRICT oracle must be
+    // the default: a session missing from a partial read may sit in the dir
+    // that could not be listed, and re-running its restore would fork it.
+    mockInvoke.mockImplementation(async (cmd: unknown) =>
+      cmd === "terminal_claude_session_list_live" ? partialLiveRead : settledSweep,
+    );
+    const schedule = vi.fn();
+    await expect(onHolderSessionReleased(payload, schedule)).resolves.toBe(false);
+    expect(schedule).not.toHaveBeenCalled();
+    // The registry WAS read: the refusal came from the strict oracle seeing a
+    // partial read, not from a read that never happened.
+    expect(mockInvoke).toHaveBeenCalledWith("terminal_claude_session_list_live");
   });
 });
 
@@ -1369,6 +1804,133 @@ describe("ownsReleasedPage — one window handles a released session (review rou
         ownsReleasedPage(page, pinned, bindings),
       );
       expect(owners).toHaveLength(1);
+    }
+  });
+});
+
+describe("reconnectedTabFor (restore branch (a))", () => {
+  const live = new Set(["tab-1"]);
+
+  it("reconnects an ordinary record to its live tab", () => {
+    expect(reconnectedTabFor(rec({ terminalId: "tab-1" }), live)).toBe("tab-1");
+  });
+
+  it("never reconnects a held record into a live tab, even on its old terminal id", () => {
+    // The held record's old terminal id now hosts another session's live tab;
+    // reconnecting would stamp that tab with the held session's id.
+    const held = rec({ terminalId: "tab-1", awaitingAccountSince: 1_000 });
+    expect(reconnectedTabFor(held, live)).toBeNull();
+  });
+
+  it("never reconnects an unbound record", () => {
+    expect(reconnectedTabFor(rec({ terminalId: "" }), new Set([""]))).toBeNull();
+  });
+
+  it("does not reconnect a record whose terminal is not live", () => {
+    expect(reconnectedTabFor(rec({ terminalId: "tab-9" }), live)).toBeNull();
+  });
+});
+
+describe("holdNeedsAccountIfNotLive (never hold or detach a live session)", () => {
+  const entry = {
+    record: rec({ claudeSessionId: "held-1" }),
+    reason: "no-transcript-holder" as const,
+  };
+  const run = async (live: ReadonlySet<string> | null) => {
+    const note = vi.fn();
+    const decision = await holdNeedsAccountIfNotLive({
+      entry,
+      getLiveSessionIds: async () => live,
+      noteNeedsAccount: note,
+    });
+    return { decision, note };
+  };
+
+  it("a session a live process hosts is NOT held (no mark, no detach)", async () => {
+    const { decision, note } = await run(new Set(["held-1"]));
+    expect(decision).toBe("skip-alive");
+    expect(note).not.toHaveBeenCalled();
+  });
+
+  it("an unreadable live registry surfaces the record for a choice but does NOT re-mark it", async () => {
+    const { decision, note } = await run(null);
+    expect(decision).toBe("skip-unknown");
+    expect(note).toHaveBeenCalledTimes(1);
+    expect(note).toHaveBeenCalledWith(entry, { mark: false });
+  });
+
+  it("a session no live process hosts IS held", async () => {
+    const { decision, note } = await run(new Set(["other"]));
+    expect(decision).toBe("respawn");
+    expect(note).toHaveBeenCalledTimes(1);
+    expect(note).toHaveBeenCalledWith(entry, { mark: true });
+  });
+});
+
+describe("applyNeedsAccountNote (mark: false never touches the registry row)", () => {
+  const entry = {
+    record: rec({ claudeSessionId: "held-2" }),
+    reason: "no-transcript-holder" as const,
+  };
+  const run = (mark: boolean, prior: NeedsAccountRecord[] = []) => {
+    let records = prior;
+    const invoke = vi.fn().mockResolvedValue(undefined);
+    applyNeedsAccountNote(
+      entry,
+      { mark },
+      {
+        setRecords: (update) => {
+          records = update(records);
+        },
+        invoke,
+      },
+    );
+    return { records, invoke };
+  };
+
+  it("mark: false lists the record but never invokes the mark (no stamp, no detach)", () => {
+    const { records, invoke } = run(false);
+    expect(records).toEqual([entry]);
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("mark: true lists the record AND holds the row", () => {
+    const { records, invoke } = run(true);
+    expect(records).toEqual([entry]);
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenCalledWith("terminal_session_mark_awaiting_account", {
+      claudeSessionId: "held-2",
+    });
+  });
+
+  it("replaces an earlier entry for the same session and keeps the others", () => {
+    const older = {
+      record: rec({ claudeSessionId: "held-2" }),
+      reason: "ambiguous-transcript" as const,
+    };
+    const other = {
+      record: rec({ claudeSessionId: "other" }),
+      reason: "no-transcript-holder" as const,
+    };
+    const { records } = run(false, [older, other]);
+    expect(records).toEqual([other, entry]);
+  });
+
+  it("a rejected mark is logged, never thrown", async () => {
+    const invoke = vi.fn().mockRejectedValue(new Error("boom"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect(() =>
+        applyNeedsAccountNote(entry, { mark: true }, { setRecords: () => {}, invoke }),
+      ).not.toThrow();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining("held-2"),
+        expect.objectContaining({ message: "boom" }),
+      );
+    } finally {
+      warn.mockRestore();
     }
   });
 });

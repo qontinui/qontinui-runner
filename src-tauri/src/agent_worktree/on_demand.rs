@@ -2056,20 +2056,17 @@ pub fn build_wip_orphans(survey: &Survey, now: chrono::DateTime<chrono::Utc>) ->
             // DELIBERATELY still offered: it is the one line that answers the
             // question the row is actually asking.
             let dirtiness_measured = item.is_dirty_known;
-            let resume_command = match (
-                item.session_id.as_deref(),
-                item.config_dir.as_deref(),
-                quoted_path.as_deref(),
-            ) {
-                (Some(id), Some(dir), Some(path))
-                    if dirtiness_measured && custody::is_shell_safe_token(id) =>
-                {
-                    custody::shell_quote_path(dir).map(|dir| {
-                        format!("cd \"{path}\" && CLAUDE_CONFIG_DIR=\"{dir}\" claude --resume {id}")
-                    })
+            // The shared resume line (`session_ledger::resume_command_for`):
+            // `None` for a ghost, or an id whose account root we could not
+            // establish — NEVER guessed, see the field docs.
+            let resume_command = match item.session_id.as_deref() {
+                Some(id) if dirtiness_measured && quoted_path.is_some() => {
+                    crate::session::session_ledger::resume_command_for(
+                        Some(&item.worktree_path),
+                        item.config_dir.as_deref(),
+                        id,
+                    )
                 }
-                // A ghost, or an id whose account root we could not establish.
-                // NEVER guessed — see the field docs.
                 _ => None,
             };
             // GATED ON `captured`, not on the commit merely existing. A record
@@ -2468,11 +2465,15 @@ mod tests {
             nm_present: true,
             nm_is_junction: true,
             nm_bytes: 0,
+            nm_exclusive_bytes: Some(0),
             target_present: true,
             target_is_junction: false,
             target_bytes: 4096,
+            target_exclusive_bytes: Some(4096),
             build_target_dir: None,
             build_slot: None,
+            build_target_volume_path: None,
+            worktree_volume_path: None,
             last_access_mtime: None,
             attributable_bytes: 4096,
             landed_in_main: Some(true),
@@ -2875,12 +2876,16 @@ mod tests {
                     drive_letter: Some("C:".to_string()),
                     total_bytes: 1_000,
                     free_bytes: 400,
+                    removable: false,
+                    read_only: false,
                 },
                 census::VolumeReport {
                     volume: "D:".to_string(),
                     drive_letter: Some("D:".to_string()),
                     total_bytes: 4_000,
                     free_bytes: 93,
+                    removable: false,
+                    read_only: false,
                 },
             ],
             taken_at: now - age,

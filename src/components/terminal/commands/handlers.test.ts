@@ -41,7 +41,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { beforeAll, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { canonicalArgs, run } from "./pipeline.testkit";
 import { ARM_VARIANTS, loadRealRegistry, type RealRegistryHarness } from "./realRegistry.testkit";
@@ -352,6 +352,202 @@ describe("handlers — the no-ops that used to render as effects", () => {
       ["zone.setLayoutId", ["quad", { source: "operator" }]],
     ]);
     expect(reportOf(o.value).affected).toBe(0);
+  });
+
+  /**
+   * `/layout --page` sets the page it names, and every part of the verdict is
+   * read off THAT page. The session on screen is a two-tab quad in grid mode, so
+   * a handler that read the wrong page's `tabs`, `layoutId` or `workMode` reports
+   * something different from each of these.
+   */
+  describe("`/layout --page`", () => {
+    afterEach(() => h.setOtherPages());
+
+    const layout = async (input: string) => {
+      h.reset();
+      return run(input, (id) => h.byId(id));
+    };
+
+    it("sets the named page and leaves the page on screen alone", async () => {
+      h.setOtherPages({ "page-2": { layoutId: "single", tabCount: 3 } });
+      const o = await layout("/layout 4 --page page-2");
+      expect(o.verdict).toBe("ok");
+      expect(h.calls.map((c) => [c.name, c.args])).toEqual([
+        ["page.page-2.setLayoutId", ["quad", { source: "operator" }]],
+      ]);
+      expect(reportOf(o.value).affected).toBe(1);
+    });
+
+    it("predicts auto-grow from the named page's tabs", async () => {
+      h.setOtherPages({ "page-2": { layoutId: "single", tabCount: 7 } });
+      const o = await layout("/layout split --page page-2");
+      expect(reportOf(o.value).detail).toBe(
+        "grew to full-grid — 7 sessions do not fit split; runner-owned (auto-trims)",
+      );
+    });
+
+    it("compares against the named page's layout, not the one on screen", async () => {
+      h.setOtherPages({ "page-2": { layoutId: "split", tabCount: 2 } });
+      expect(reportOf((await layout("/layout split --page page-2")).value).affected).toBe(0);
+      expect(reportOf((await layout("/layout quad --page page-2")).value).affected).toBe(1);
+    });
+
+    it("reports the named page leaving tmux mode", async () => {
+      h.setOtherPages({ "page-2": { layoutId: "single", tabCount: 2, workMode: "tmux" } });
+      const o = await layout("/layout split --page page-2");
+      expect(reportOf(o.value).detail).toBe("left tmux mode — split");
+      expect(reportOf(o.value).affected).toBe(1);
+    });
+
+    it("treats the page on screen's own id as the page on screen", async () => {
+      const o = await layout("/layout split --page page-1");
+      expect(o.verdict).toBe("ok");
+      expect(h.callNames()).toEqual(["zone.setLayoutId"]);
+    });
+
+    it("refuses a page with no scope and sets nothing", async () => {
+      const o = await layout("/layout quad --page nope");
+      expect(o.verdict).toBe("error:no-page");
+      expect(h.calls).toEqual([]);
+    });
+
+    it("refuses a blank page rather than falling back to the page on screen", async () => {
+      h.reset();
+      const result = await h.byId("terminal.layout").handler({ preset: "quad", page: "  " }, {
+        source: "direct",
+      } as never);
+      expect(result).toMatchObject({ ok: false, code: "no-page" });
+      expect(h.calls).toEqual([]);
+    });
+  });
+
+  /**
+   * `--origin` decides the layout's origin (`zoneAutoTrim.ts`): absent is an
+   * operator choice auto-trim never undoes; `auto` hands the page to the
+   * runner. `/triage-sessions` sends `auto` when it trims a `legacy` page, so a
+   * dropped or mis-mapped origin either strands that page untrimmable or lets
+   * the runner shrink a grid the operator picked.
+   */
+  describe("`/layout --origin`", () => {
+    afterEach(() => h.setOtherPages());
+
+    const layout = async (input: string) => {
+      h.reset();
+      return run(input, (id) => h.byId(id));
+    };
+
+    it("maps auto to source auto and says the page is now the runner's", async () => {
+      h.setOtherPages({ "page-2": { layoutId: "six-pack", tabCount: 2 } });
+      const o = await layout("/layout split --page page-2 --origin auto");
+      expect(o.verdict).toBe("ok");
+      expect(h.calls.map((c) => [c.name, c.args])).toEqual([
+        ["page.page-2.setLayoutId", ["split", { source: "auto" }]],
+      ]);
+      expect(reportOf(o.value).detail).toBe("split; runner-owned (auto-trims)");
+    });
+
+    /**
+     * The hook records an `auto` origin only for a layout id it CHANGES, so
+     * re-asserting a page's own layout cannot hand it to the trim. The verdict
+     * has to say so rather than claim a hand-over that did not happen.
+     */
+    it("says the origin was kept when an auto request leaves the layout id unchanged", async () => {
+      h.setOtherPages({ "page-2": { layoutId: "quad", tabCount: 3 } });
+      const o = await layout("/layout quad --page page-2 --origin auto");
+      expect(o.verdict).toBe("ok");
+      expect(reportOf(o.value).detail).toBe(
+        "already quad; re-applied; origin kept (legacy) — an auto request does not take a layout it leaves unchanged",
+      );
+      expect(reportOf(o.value).affected).toBe(0);
+    });
+
+    it("counts a hand-over as a change even when auto-grow keeps the page's preset", async () => {
+      h.setOtherPages({
+        "page-2": { layoutId: "full-grid", tabCount: 8, layoutOrigin: "operator" },
+      });
+      const o = await layout("/layout quad --page page-2 --origin auto");
+      expect(reportOf(o.value).detail).toBe(
+        "grew to full-grid — 8 sessions do not fit quad; runner-owned (auto-trims)",
+      );
+      expect(reportOf(o.value).affected).toBe(1);
+    });
+
+    it("names and counts an operator request taking back an auto page's own layout", async () => {
+      h.setOtherPages({ "page-2": { layoutId: "quad", tabCount: 3, layoutOrigin: "auto" } });
+      const o = await layout("/layout quad --page page-2");
+      expect(reportOf(o.value).detail).toBe(
+        "already quad; re-applied; origin operator (no longer auto-trims)",
+      );
+      expect(reportOf(o.value).affected).toBe(1);
+    });
+
+    it("says an operator request auto-grow overrides leaves the page the runner's", async () => {
+      h.setOtherPages({
+        "page-2": { layoutId: "full-grid", tabCount: 8, layoutOrigin: "operator" },
+      });
+      const o = await layout("/layout quad --page page-2");
+      expect(reportOf(o.value).detail).toBe(
+        "grew to full-grid — 8 sessions do not fit quad; runner-owned (auto-trims)",
+      );
+      // The preset held, but the page changed hands: that is a change.
+      expect(reportOf(o.value).affected).toBe(1);
+    });
+
+    it("keeps an already-auto page's verdict at zero when an auto request re-asserts it", async () => {
+      h.setOtherPages({ "page-2": { layoutId: "quad", tabCount: 3, layoutOrigin: "auto" } });
+      const o = await layout("/layout quad --page page-2 --origin auto");
+      expect(reportOf(o.value).detail).toBe("already quad; re-applied; runner-owned (auto-trims)");
+      expect(reportOf(o.value).affected).toBe(0);
+    });
+
+    it("accepts the origin in any case and with surrounding space", async () => {
+      h.reset();
+      const result = await h
+        .byId("terminal.layout")
+        .handler({ preset: "split", origin: " AUTO " }, { source: "direct" } as never);
+      expect(result).toMatchObject({ ok: true });
+      expect(h.calls.map((c) => c.args)).toEqual([["split", { source: "auto" }]]);
+    });
+
+    it("accepts an explicit operator origin", async () => {
+      const o = await layout("/layout quad --origin operator");
+      expect(o.verdict).toBe("ok");
+      expect(h.calls.map((c) => [c.name, c.args])).toEqual([
+        ["zone.setLayoutId", ["quad", { source: "operator" }]],
+      ]);
+    });
+
+    it("refuses an origin that names neither, and sets nothing", async () => {
+      const o = await layout("/layout quad --origin restore");
+      expect(o.verdict).toBe("error:invalid-origin");
+      expect(h.calls).toEqual([]);
+    });
+
+    it("refuses an auto request on a tmux page instead of reporting a move that cannot happen", async () => {
+      h.setOtherPages({ "page-2": { layoutId: "single", tabCount: 2, workMode: "tmux" } });
+      const o = await layout("/layout split --page page-2 --origin auto");
+      expect(o.verdict).toBe("error:tmux-mode");
+      expect(h.calls).toEqual([]);
+    });
+  });
+
+  /**
+   * The typed form accepts what `/layout` accepts. `layout 3` already resolves
+   * to `triptych`, so a `layout triptych` that fell through to the fuzzy tier
+   * would be the command refusing its own answer. Walks `LAYOUT_IDS`, so a new
+   * preset fails here until the patterns name it.
+   */
+  it("every layout id has both typed forms", async () => {
+    const { LAYOUT_IDS } = await import("./useTerminalCommands");
+    const { patterns } = h.byId("terminal.layout");
+    for (const id of LAYOUT_IDS) {
+      expect(patterns?.some((p) => p.test(`layout ${id}`))).toBe(true);
+      expect(patterns?.some((p) => p.test(`${id} layout`))).toBe(true);
+    }
+    h.reset();
+    const o = await run("layout 1-plus-4", (id) => h.byId(id));
+    expect(o.verdict).toBe("ok");
+    expect(h.calls.map((c) => c.args[0])).toEqual(["1-plus-4"]);
   });
 
   /**
