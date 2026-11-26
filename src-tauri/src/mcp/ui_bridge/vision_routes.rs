@@ -1031,11 +1031,8 @@ async fn do_capture(
 
     let provider = resolve_frame_provider(state, &req.target)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
-    let frame = provider
-        .frame(state)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+        .map_err(|e| e.to_json_err())?;
+    let frame = provider.frame(state).await.map_err(|e| e.to_json_err())?;
 
     let capture_backend = capture_backend_label(&frame);
 
@@ -1254,11 +1251,8 @@ async fn do_multi_capture(
     // against a clone of the same Frame.
     let provider = resolve_frame_provider(state, target)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
-    let frame = provider
-        .frame(state)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+        .map_err(|e| e.to_json_err())?;
+    let frame = provider.frame(state).await.map_err(|e| e.to_json_err())?;
     let frame_w = frame.width;
     let frame_h = frame.height;
     let capture_backend = capture_backend_label(&frame);
@@ -1502,11 +1496,8 @@ async fn produce_intermediate_frame(
 
     let provider = resolve_frame_provider(state, &req.target)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
-    let frame = provider
-        .frame(state)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+        .map_err(|e| e.to_json_err())?;
+    let frame = provider.frame(state).await.map_err(|e| e.to_json_err())?;
 
     let crop = resolve_crop_region(state, &req.region, &req.element, frame.width, frame.height)
         .await
@@ -1702,11 +1693,8 @@ async fn vision_raw_handler(
 
     let provider = resolve_frame_provider(&state, &req.target)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
-    let frame = provider
-        .frame(&state)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+        .map_err(|e| e.to_json_err())?;
+    let frame = provider.frame(&state).await.map_err(|e| e.to_json_err())?;
 
     let capture_backend = capture_backend_label(&frame);
 
@@ -1816,9 +1804,7 @@ async fn vision_extract_handler(
 
     // Miss → capture + encode + call OCR.
     let (png_bytes, capture_backend) =
-        capture_and_encode_png(&state, &req.region, &req.element, &req.target)
-            .await
-            .map_err(|(code, msg)| (code, Json(api_error(msg))))?;
+        capture_and_encode_png(&state, &req.region, &req.element, &req.target).await?;
     let (blocks, aggregate_text) = client
         .extract(&png_bytes, "image/png", min_conf)
         .await
@@ -1914,9 +1900,7 @@ async fn vision_describe_handler(
     // describe/ has no captureBackend field in its response; the backend label
     // is intentionally ignored here.
     let (png_bytes, _capture_backend) =
-        capture_and_encode_png(&state, &req.region, &req.element, &req.target)
-            .await
-            .map_err(|(code, msg)| (code, Json(api_error(msg))))?;
+        capture_and_encode_png(&state, &req.region, &req.element, &req.target).await?;
     let vlm = client
         .describe(&png_bytes, "image/png", req.prompt.as_deref(), max_tokens)
         .await
@@ -1958,17 +1942,15 @@ async fn capture_and_encode_png(
     region_req: &Option<RegionRequest>,
     element_id: &Option<String>,
     target: &Option<String>,
-) -> Result<(Vec<u8>, Option<String>), (StatusCode, String)> {
+) -> Result<(Vec<u8>, Option<String>), (StatusCode, Json<ApiResponse<()>>)> {
     let provider = resolve_frame_provider(state, target)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let frame = provider
-        .frame(state)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(|e| e.to_json_err())?;
+    let frame = provider.frame(state).await.map_err(|e| e.to_json_err())?;
     let capture_backend = capture_backend_label(&frame);
-    let crop =
-        resolve_crop_region(state, region_req, element_id, frame.width, frame.height).await?;
+    let crop = resolve_crop_region(state, region_req, element_id, frame.width, frame.height)
+        .await
+        .map_err(|(code, msg)| (code, Json(api_error(msg))))?;
     // PNG-only pipeline. No alpha policy here — we want lossless bytes to
     // feed the model; the model handles its own preprocessing.
     let mut pipeline = qontinui_vision_core::Pipeline::new();
@@ -1979,7 +1961,7 @@ async fn capture_and_encode_png(
     let bytes = pipeline.run(frame).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("pipeline: {}", e),
+            Json(api_error(format!("pipeline: {}", e))),
         )
     })?;
     Ok((bytes, capture_backend))
@@ -2126,6 +2108,22 @@ pub struct BaselineRegistryEntry {
     /// snapshot. See [`qontinui_vision_core::BaselineEntry::snapshot_id`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_id: Option<String>,
+}
+
+/// The element boxes a baseline records: vision-core's own
+/// [`qontinui_vision_core::BaselineEntry::from_snapshot`] projection, so the
+/// rounding is the one `no_layout_shift_since` compares against.
+///
+/// `Element::bbox` is the producer's unrounded measurement
+/// (`Option<ElementRect>`); the layout-shift check reads each element's
+/// `region()` (its pixel-grid rounding). Recording anything else here — an
+/// `as i32` / `as u32` truncation in particular — would report up to 1px of
+/// phantom shift on every fractional box. Elements with no bbox are skipped,
+/// as vision-core skips them, rather than failing the whole baseline.
+fn baseline_element_bboxes(
+    snapshot: &qontinui_vision_core::ElementSnapshot,
+) -> std::collections::HashMap<String, qontinui_vision_core::Region> {
+    qontinui_vision_core::BaselineEntry::from_snapshot(snapshot).element_bboxes
 }
 
 impl From<&BaselineRegistryEntry> for qontinui_vision_core::BaselineEntry {
@@ -2516,7 +2514,9 @@ async fn capture_frames(
     let frame_result = match resolve_frame_provider(state, target).await {
         Ok(provider) => provider.frame(state).await,
         Err(e) => Err(e),
-    };
+    }
+    // Soft-fail, but keep the typed code: `CODE: message`.
+    .map_err(|e| e.to_frame_error());
     let (frame, frame_error) = match frame_result {
         Ok(f) => (Some(f), None),
         Err(e) => {
@@ -3188,7 +3188,11 @@ impl RequestHints for AssertRequest {
              contrast_meets_wcag, image_palette_within, no_near_duplicate_images, \
              no_placeholder_images, image_focal_visible, transparent_image_legible, \
              salience_order, image_sharpness_at_least, image_blockiness_within, \
-             settled_within, state_entered_within, text_over_image_contrast."
+             image_loaded, image_resolution_sufficient, image_not_distorted, \
+             image_dims_reserved, lcp_image_prioritized, image_has_text_alternative, \
+             image_not_oversized, image_weight_within, offscreen_image_lazy, \
+             no_duplicate_images, settled_within, state_entered_within, \
+             text_over_image_contrast."
                 .to_string(),
             "Optional top-level fields: `snapshot` (ElementSnapshot from /discover), \
              `ocr_blocks` (from /vision/extract), `target` (device/app id), \
@@ -3228,6 +3232,16 @@ impl RequestHints for AssertRequest {
                 "salience_order",
                 "image_sharpness_at_least",
                 "image_blockiness_within",
+                "image_loaded",
+                "image_resolution_sufficient",
+                "image_not_distorted",
+                "image_dims_reserved",
+                "lcp_image_prioritized",
+                "image_has_text_alternative",
+                "image_not_oversized",
+                "image_weight_within",
+                "offscreen_image_lazy",
+                "no_duplicate_images",
                 "settled_within",
                 "state_entered_within",
                 "text_over_image_contrast"
@@ -3837,11 +3851,8 @@ async fn vision_baseline_handler(
     // captured from a paired device rather than the runner window.
     let provider = resolve_frame_provider(&state, &req.target)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
-    let frame = provider
-        .frame(&state)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+        .map_err(|e| e.to_json_err())?;
+    let frame = provider.frame(&state).await.map_err(|e| e.to_json_err())?;
 
     // Encode for storage. Use PNG-strict so the baseline is lossless.
     let capture_req: CaptureRequest = match req.capture {
@@ -3891,15 +3902,7 @@ async fn vision_baseline_handler(
             )
         })?;
 
-    let element_bboxes: std::collections::HashMap<String, qontinui_vision_core::Region> = req
-        .snapshot
-        .elements
-        .iter()
-        // `bbox` is now `Option<Region>` — only elements with a measured bbox
-        // can participate in layout-shift baselines; skip bbox-less (hidden/
-        // unmeasured) elements rather than failing the whole baseline.
-        .filter_map(|e| e.bbox.map(|b| (e.id.clone(), b)))
-        .collect();
+    let element_bboxes = baseline_element_bboxes(&req.snapshot);
     let registered_at_unix_ms = chrono::Utc::now().timestamp_millis();
     let entry = BaselineRegistryEntry {
         name: req.name.clone(),
@@ -4041,6 +4044,16 @@ mod tests {
             A::SalienceOrder { .. } => "salience_order",
             A::ImageSharpnessAtLeast { .. } => "image_sharpness_at_least",
             A::ImageBlockinessWithin { .. } => "image_blockiness_within",
+            A::ImageLoaded { .. } => "image_loaded",
+            A::ImageResolutionSufficient { .. } => "image_resolution_sufficient",
+            A::ImageNotDistorted { .. } => "image_not_distorted",
+            A::ImageDimsReserved { .. } => "image_dims_reserved",
+            A::LcpImagePrioritized { .. } => "lcp_image_prioritized",
+            A::ImageHasTextAlternative { .. } => "image_has_text_alternative",
+            A::ImageNotOversized { .. } => "image_not_oversized",
+            A::ImageWeightWithin { .. } => "image_weight_within",
+            A::OffscreenImageLazy { .. } => "offscreen_image_lazy",
+            A::NoDuplicateImages { .. } => "no_duplicate_images",
             A::SettledWithin { .. } => "settled_within",
             A::StateEnteredWithin { .. } => "state_entered_within",
             A::TextOverImageContrast { .. } => "text_over_image_contrast",
@@ -4049,7 +4062,7 @@ mod tests {
 
     /// Every name [`assertion_wire_name`] returns, in its arm order. Keep the
     /// two together: an arm added there belongs here too.
-    const ASSERTION_WIRE_NAMES: [&str; 23] = [
+    const ASSERTION_WIRE_NAMES: [&str; 33] = [
         "no_overlap",
         "element_above",
         "contains_text",
@@ -4070,6 +4083,16 @@ mod tests {
         "salience_order",
         "image_sharpness_at_least",
         "image_blockiness_within",
+        "image_loaded",
+        "image_resolution_sufficient",
+        "image_not_distorted",
+        "image_dims_reserved",
+        "lcp_image_prioritized",
+        "image_has_text_alternative",
+        "image_not_oversized",
+        "image_weight_within",
+        "offscreen_image_lazy",
+        "no_duplicate_images",
         "settled_within",
         "state_entered_within",
         "text_over_image_contrast",
@@ -4103,6 +4126,16 @@ mod tests {
                 {"type":"salience_order","cta_id":"cta"},
                 {"type":"image_sharpness_at_least","element":"hero","min_sharpness":50.0},
                 {"type":"image_blockiness_within","element":"hero","max_blockiness":1.5},
+                {"type":"image_loaded"},
+                {"type":"image_resolution_sufficient","element":"hero","min_effective":1.0},
+                {"type":"image_not_distorted","max_aspect_delta":0.05},
+                {"type":"image_dims_reserved"},
+                {"type":"lcp_image_prioritized"},
+                {"type":"image_has_text_alternative"},
+                {"type":"image_not_oversized","max_effective":2.0},
+                {"type":"image_weight_within","max_bytes":512000},
+                {"type":"offscreen_image_lazy"},
+                {"type":"no_duplicate_images"},
                 {"type":"settled_within","ms":500},
                 {"type":"state_entered_within","state":"checkout","ms":500},
                 {"type":"text_over_image_contrast","min_ratio":4.5,"percentile":5.0}
@@ -4270,7 +4303,8 @@ mod tests {
     /// Adding `element_above` (U3) took the list from 11 to 12, and the L1
     /// image assertions (image plan Phase 15) from 12 to 20, the timeline
     /// assertions (plan 2026-09-20 Phase 4) to 22, and
-    /// `text_over_image_contrast` (image plan Phase 16) to 23; without a pin,
+    /// `text_over_image_contrast` (image plan Phase 16) to 23, and the L0 image
+    /// assertions (image plan Phase 8) to 33; without a pin,
     /// a variant added upstream stays undiscoverable while
     /// `evaluate_assertion` (which is variant-agnostic) handles it fine.
     ///
@@ -4287,7 +4321,7 @@ mod tests {
     /// the same list, so both are checked here.
     #[test]
     fn assert_request_hint_advertises_the_full_assertion_vocabulary() {
-        const EXPECTED: [&str; 23] = [
+        const EXPECTED: [&str; 33] = [
             "no_overlap",
             "element_above",
             "contains_text",
@@ -4308,6 +4342,16 @@ mod tests {
             "salience_order",
             "image_sharpness_at_least",
             "image_blockiness_within",
+            "image_loaded",
+            "image_resolution_sufficient",
+            "image_not_distorted",
+            "image_dims_reserved",
+            "lcp_image_prioritized",
+            "image_has_text_alternative",
+            "image_not_oversized",
+            "image_weight_within",
+            "offscreen_image_lazy",
+            "no_duplicate_images",
             "settled_within",
             "state_entered_within",
             "text_over_image_contrast",
@@ -4674,6 +4718,93 @@ mod tests {
         assert_eq!(v["snapshotAttribution"]["state"], "absent");
     }
 
+    /// A baseline registered from a snapshot with a FRACTIONAL bbox must not
+    /// report a shift when the same snapshot is checked against it at zero
+    /// tolerance. `no_layout_shift_since` compares each element's `region()`
+    /// (edge-rounded) with what the baseline recorded, so the baseline has to
+    /// record `region()` too: a truncating `as i32` / `as u32` projection of
+    /// this box records `{10, 20, 30, 40}` against a current `{11, 20, 30, 41}`
+    /// and reads 1px of phantom shift.
+    #[test]
+    fn a_fractional_bbox_baseline_reads_no_shift_against_its_own_snapshot() {
+        let rect = qontinui_vision_core::ElementRect {
+            x: 10.6,
+            y: 20.4,
+            w: 30.5,
+            h: 40.7,
+        };
+        let snapshot = qontinui_vision_core::ElementSnapshot {
+            elements: vec![
+                qontinui_vision_core::Element {
+                    id: "card".to_string(),
+                    bbox: Some(rect),
+                    ..Default::default()
+                },
+                // Unmeasured: skipped by the baseline, not an error.
+                qontinui_vision_core::Element {
+                    id: "hidden".to_string(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let bboxes = baseline_element_bboxes(&snapshot);
+        assert_eq!(bboxes.len(), 1, "the bbox-less element is skipped");
+        let recorded = bboxes["card"];
+        assert_eq!(recorded, snapshot.elements[0].region().unwrap());
+        assert_eq!(
+            recorded,
+            Region {
+                x: 11,
+                y: 20,
+                w: 30,
+                h: 41
+            }
+        );
+        let truncated = Region {
+            x: rect.x as i32,
+            y: rect.y as i32,
+            w: rect.w as u32,
+            h: rect.h as u32,
+        };
+        assert_ne!(
+            recorded, truncated,
+            "the fixture must be one where truncation and region() disagree"
+        );
+
+        let entry = BaselineRegistryEntry {
+            name: "fractional".to_string(),
+            sha256: String::new(),
+            width: 100,
+            height: 100,
+            registered_at_unix_ms: 0,
+            element_bboxes: bboxes,
+            snapshot_id: None,
+        };
+        let baselines: std::collections::HashMap<String, qontinui_vision_core::BaselineEntry> = [(
+            entry.name.clone(),
+            qontinui_vision_core::BaselineEntry::from(&entry),
+        )]
+        .into();
+        let result = qontinui_vision_core::evaluate_assertion(
+            &qontinui_vision_core::Assertion::NoLayoutShiftSince {
+                baseline: "fractional".to_string(),
+                tolerance_px: Some(0),
+            },
+            &qontinui_vision_core::EvalContext {
+                snapshot: Some(&snapshot),
+                baselines: Some(&baselines),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            result.outcome,
+            qontinui_vision_core::AssertionOutcome::Passed,
+            "{result:?}"
+        );
+    }
+
     /// Phase 2 of the vision-provenance plan. The assert path holds the same
     /// snapshot the analyze path counts, and counting it is a pure O(n) pass
     /// — an assert-only consumer had no answer at all to "what did this
@@ -4687,12 +4818,15 @@ mod tests {
         let snapshot = qontinui_vision_core::ElementSnapshot {
             elements: vec![qontinui_vision_core::Element {
                 id: "a".to_string(),
-                bbox: Some(Region {
-                    x: 0,
-                    y: 0,
-                    w: 10,
-                    h: 10,
-                }),
+                bbox: Some(
+                    Region {
+                        x: 0,
+                        y: 0,
+                        w: 10,
+                        h: 10,
+                    }
+                    .into(),
+                ),
                 ..Default::default()
             }],
             ..Default::default()
@@ -6162,7 +6296,7 @@ mod text_hidden_tests {
             elements: vec![
                 Element {
                     id: "hero".into(),
-                    bbox: Some(region(0, 0, 200, 100)),
+                    bbox: Some(region(0, 0, 200, 100).into()),
                     media: Some(ElementMedia {
                         object_fit: Some(ObjectFit::Fill),
                         ..ElementMedia::new(MediaKind::Img)
@@ -6171,7 +6305,7 @@ mod text_hidden_tests {
                 },
                 Element {
                     id: "heading".into(),
-                    bbox: Some(region(20, 30, 160, 40)),
+                    bbox: Some(region(20, 30, 160, 40).into()),
                     text: Some("Measured on real pixels".into()),
                     fg_color: Some(Rgb::new(255, 255, 255)),
                     ..Default::default()

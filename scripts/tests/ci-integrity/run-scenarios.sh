@@ -79,7 +79,7 @@ STUB
 chmod +x "$HERE/bin/python3"
 
 run_case () {
-  local name="$1" want_rc="$2" want_comment="$3" want_text="${4:-}"
+  local name="$1" want_rc="$2" want_comment="$3" want_text="${4:-}" forbid_text="${5:-}"
   rm -f "$FIXTURE/comment.log"
   export RUNNER_TEMP="$FIXTURE/tmp"; mkdir -p "$RUNNER_TEMP"
   export GITHUB_STEP_SUMMARY="$FIXTURE/summary.md"; : > "$GITHUB_STEP_SUMMARY"
@@ -99,6 +99,9 @@ run_case () {
 $(cat "$GITHUB_STEP_SUMMARY" 2>/dev/null)"
   if [ -n "$want_text" ] && ! grep -qF -- "$want_text" <<< "$out"; then
     ok=0; why="$why; missing text '$want_text'"
+  fi
+  if [ -n "$forbid_text" ] && grep -qF -- "$forbid_text" <<< "$out"; then
+    ok=0; why="$why; forbidden text '$forbid_text' present"
   fi
   if [ "$ok" -eq 1 ]; then
     echo "  PASS  $name"; PASS=$((PASS+1))
@@ -171,6 +174,36 @@ run_case "D additive change, undeclared -> RED" 1 no "without declaring it"
 
 printf 'ci:gate-change=declared\n' > "$FIXTURE/labels.txt"
 run_case "E additive change, declared -> green + notification" 0 yes "purely additive"
+
+# --- the undeclared remedy must be the one that will actually pass ------------
+# qontinui-runner#2485: an undeclared PR altering a composite action's `runs:`
+# was told to apply `declared`. That remedy can only produce a second red.
+new_fixture
+printf '.github/workflows/ci.yml\n' > "$FIXTURE/files.txt"
+run_case "D1 undeclared + additive -> remedy is the weak label" 1 no \
+  "--add-label 'ci:gate-change=declared'" "alters-a-gate"
+
+finding CHANGED ".github/workflows/ci.yml" "ci#security"
+run_case "D2 undeclared + altered -> remedy is the strong label" 1 no \
+  "--add-label 'ci:gate-change=alters-a-gate'" "--add-label 'ci:gate-change=declared'"
+run_case "D3 undeclared + altered -> remedy names the body line" 1 no \
+  "Gate-Change: ci#security"
+
+finding REMOVED ".github/workflows/ci.yml" "ci#seam-gate"
+run_case "D4 undeclared + removal -> remedy names Gate-Removal" 1 no \
+  "Gate-Removal: ci#seam-gate"
+
+new_fixture
+printf '.github/workflows/ci.yml\n' > "$FIXTURE/files.txt"
+printf 'ci:gate-change=declared\n' > "$FIXTURE/labels.txt"
+finding CHANGED ".github/workflows/ci.yml" "ci#security"
+printf 'Gate-Change: ci#security\n' > "$FIXTURE/body.txt"
+run_case "D5 following the printed body line without the strong label stays RED" 1 no \
+  "alters an existing gate"
+
+new_fixture
+printf '.github/workflows/ci.yml\n' > "$FIXTURE/files.txt"
+printf 'ci:gate-change=declared\n' > "$FIXTURE/labels.txt"
 
 # --- altered-surface path ----------------------------------------------------
 finding CHANGED ".github/workflows/ci.yml" "ci#security"

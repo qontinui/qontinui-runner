@@ -99,6 +99,7 @@ import {
   tenantDraftsAreDirty,
   tenantDraftsFrom,
   tenantIdsForField,
+  workspaceRootOrder,
   type PathDrafts,
   type PathField,
   type PathSettings,
@@ -143,8 +144,7 @@ const FIELD_COPY: Record<PathField, PathFieldCopy> = {
   workspace_root: {
     label: "Workspace root",
     does: "The directory holding the repo checkouts side by side. Worktrees, build coordination and the scripts a session runs all resolve from it.",
-    whenUnset:
-      "Unset means it is resolved from $QONTINUI_ROOT, then $QONTINUI_WORKSPACE_ROOT, then an ancestor walk from the runner executable.",
+    whenUnset: `Unset means it is resolved from ${workspaceRootOrder({ runnerWide: false })}.`,
     placeholder: "e.g. /home/you/qontinui-root",
   },
   dev_logs_dir: {
@@ -973,7 +973,7 @@ function InEffect({ field, kind, configured, resolved }: InEffectProps) {
   const reason = {
     fallback:
       field === "workspace_root"
-        ? "Nothing is configured, so the runner resolved it from $QONTINUI_ROOT / $QONTINUI_WORKSPACE_ROOT or the ancestor walk from the executable."
+        ? `Nothing is configured, so the runner resolved it from the first of ${workspaceRootOrder({ runnerWide: true })} that answered. A session opened on a repository also tries the folder holding that repository, just before <home>/qontinui-root.`
         : "Nothing is configured, so the runner is using its platform default.",
     override:
       "$QONTINUI_ROOT / $QONTINUI_WORKSPACE_ROOT in the runner's environment override this setting. That precedence is deliberate; to change what is in effect, change the environment the runner was started with.",

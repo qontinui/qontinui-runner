@@ -14,7 +14,11 @@ vi.mock("@tauri-apps/api/core", () => ({
   // Every backend read fails: reconcile is best-effort and adds nothing.
   invoke: vi.fn(() => Promise.reject(new Error("no backend in test"))),
 }));
-vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(() => Promise.resolve(() => {})) }));
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn(() => Promise.resolve(() => {})),
+  // The roster-saved broadcast after each save (`terminalPagesSync`).
+  emit: vi.fn(() => Promise.resolve()),
+}));
 
 import { instanceStorage } from "@/lib/instance-storage";
 import { setPageBindings } from "@/lib/pageBindings";
@@ -180,6 +184,31 @@ describe("rename", () => {
     expect(container.querySelector('input[aria-label="Page name"]')).toBeNull();
     expect(container.querySelector('[role="alert"]')).toBeNull();
     expect(persisted().map((p) => p.name)).toEqual(["Page 1", "resumes"]);
+  });
+
+  it("opening the editor on an auto page and clicking away keeps it auto", () => {
+    seed(roster);
+    const { hook } = mount();
+    expect(hook().allPages.find((p) => p.id === "b")?.origin).toBe("auto");
+    const tab = [...container.querySelectorAll<HTMLButtonElement>('[role="tab"]')].find(
+      (b) => b.textContent === "Page 2",
+    )!;
+    act(() => {
+      tab.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+    });
+    const input = container.querySelector<HTMLInputElement>('input[aria-label="Page name"]')!;
+    expect(input.value).toBe("Page 2");
+    // The tab bar commits on blur: with the name unchanged that is not a rename.
+    act(() => {
+      input.dispatchEvent(new FocusEvent("focusout", { bubbles: true }));
+    });
+
+    expect(container.querySelector('input[aria-label="Page name"]')).toBeNull();
+    expect(hook().allPages.find((p) => p.id === "b")).toMatchObject({
+      name: "Page 2",
+      origin: "auto",
+    });
+    expect(persisted()).toEqual(roster);
   });
 
   it("stores the trimmed name it checked", () => {

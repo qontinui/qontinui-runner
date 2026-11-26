@@ -60,6 +60,7 @@ import { useStateMachineRegistration } from "./hooks/useStateMachineRegistration
 import { ToastContainer } from "./components/ToastContainer";
 import { ResourceGuardDialog } from "./components/ResourceGuardDialog";
 import { ResourceGuardGrantBanner } from "./components/ResourceGuardGrantBanner";
+import { OsHealthBanner } from "./components/OsHealthBanner";
 import { AutoUpdateChecker } from "./components/AutoUpdateChecker";
 import { ConflictModal } from "./components/ConflictModal";
 import { StolenBanner } from "./components/StolenBanner";
@@ -845,6 +846,8 @@ function AppContent() {
                       onReorganize={() => setShowReorganize(true)}
                       onCloseEmptyPages={terminalPages.closeEmptyPages}
                       emptyPageCount={terminalPages.emptyPageCount}
+                      pruneNotice={terminalPages.pruneNotice}
+                      onUndoPrune={terminalPages.undoPrune}
                       isPinned={terminalPages.isPinned}
                       onPopOut={() => {
                         // Open a new pop-out OS window (same process) that hosts its
@@ -1015,6 +1018,9 @@ function AppContent() {
             {/* The live "Start anyway" grant, if any — its countdown and Revoke.
               An override the operator cannot see is a surprise. */}
             <ResourceGuardGrantBanner />
+            {/* This machine's OS is degraded (kernel token / pool leak, slow process
+              creation) — shown after `osHealth.verdict = breach` has held 10 min. */}
+            <OsHealthBanner />
             {/* Surfaces incoming cross-machine session handoffs as toasts.
               Listens for `session-event` with kind=handoff_request — PR #258. */}
             <IncomingHandoffToastBridge />

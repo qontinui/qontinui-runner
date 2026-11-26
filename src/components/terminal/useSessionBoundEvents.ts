@@ -66,9 +66,12 @@ export function useSessionBoundEvents(params: {
         claudeConfigDir: update.claudeConfigDir,
       });
       rememberSessionId(update.tabId, update.claudeSessionId, update.claudeConfigDir);
-      const what = previousId
-        ? `corrected ${previousId} → ${update.claudeSessionId}`
-        : `stamped ${update.claudeSessionId}`;
+      const what =
+        previousId === update.claudeSessionId
+          ? `re-stamped config dir ${update.claudeConfigDir ?? "<none>"} for ${previousId}`
+          : previousId
+            ? `corrected ${previousId} → ${update.claudeSessionId}`
+            : `stamped ${update.claudeSessionId}`;
       logger.info(
         `session-bound: ${what} onto tab ${update.tabId} ` +
           `(origin ${event.payload.origin}, confirmed ${event.payload.confirmed}, ` +

@@ -32,7 +32,7 @@ use super::types::{classify_transport_error, UiBridgeError};
 
 /// Request for a structured UI assertion.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StructuredAssertRequest {
     /// CSS selector or text to search for
     pub query: String,
@@ -124,7 +124,7 @@ fn build_structured_assert_expression(request: &StructuredAssertRequest) -> Resu
                 .expected
                 .as_ref()
                 .and_then(|v| v.as_i64())
-                .unwrap_or(0);
+                .ok_or_else(|| "assertion 'count' requires an integer `expected`".to_string())?;
             format!(
                 r#"return JSON.stringify({{ found: ({}).length, passed: ({}).length === {}, expected: {} }})"#,
                 query_js, query_js, expected, expected
@@ -141,9 +141,9 @@ fn build_structured_assert_expression(request: &StructuredAssertRequest) -> Resu
                 .expected
                 .as_ref()
                 .and_then(|v| v.as_str())
-                .unwrap_or("");
+                .ok_or_else(|| "assertion 'hasText' requires a string `expected`".to_string())?;
             format!(
-                r#"(() => {{ var els = {}; var texts = Array.from(els).map(el => el.textContent.trim()); var found = texts.some(t => t.includes({})); return JSON.stringify({{ found: els.length, texts: texts.slice(0, 3), passed: found }}); }})()"#,
+                r#"var els = {}; var texts = Array.from(els).map(el => el.textContent.trim()); var found = texts.some(t => t.includes({})); return JSON.stringify({{ found: els.length, texts: texts.slice(0, 3), passed: found }})"#,
                 query_js,
                 js_string_literal(expected_text)
             )
@@ -153,15 +153,18 @@ fn build_structured_assert_expression(request: &StructuredAssertRequest) -> Resu
                 .expected
                 .as_ref()
                 .and_then(|v| v.as_str())
-                .unwrap_or("");
+                .ok_or_else(|| "assertion 'hasClass' requires a string `expected`".to_string())?;
             format!(
-                r#"(() => {{ var els = {}; var found = Array.from(els).some(el => el.classList.contains({})); var classes = Array.from(els).slice(0, 3).map(el => Array.from(el.classList).join(' ')); return JSON.stringify({{ found: els.length, classes: classes, passed: found }}); }})()"#,
+                r#"var els = {}; var found = Array.from(els).some(el => el.classList.contains({})); var classes = Array.from(els).slice(0, 3).map(el => Array.from(el.classList).join(' ')); return JSON.stringify({{ found: els.length, classes: classes, passed: found }})"#,
                 query_js,
                 js_string_literal(expected_class)
             )
         }
         "hasAttribute" => {
-            let attr = request.attribute.as_deref().unwrap_or("title");
+            let attr = request
+                .attribute
+                .as_deref()
+                .ok_or_else(|| "assertion 'hasAttribute' requires `attribute`".to_string())?;
             let expected_val = request.expected.as_ref().and_then(|v| v.as_str());
             let check = if let Some(val) = expected_val {
                 format!(
@@ -173,7 +176,7 @@ fn build_structured_assert_expression(request: &StructuredAssertRequest) -> Resu
                 format!("el.hasAttribute({})", js_string_literal(attr))
             };
             format!(
-                r#"(() => {{ var els = {}; var found = Array.from(els).some(el => {}); return JSON.stringify({{ found: els.length, passed: found }}); }})()"#,
+                r#"var els = {}; var found = Array.from(els).some(el => {}); return JSON.stringify({{ found: els.length, passed: found }})"#,
                 query_js, check
             )
         }
@@ -185,6 +188,11 @@ fn build_structured_assert_expression(request: &StructuredAssertRequest) -> Resu
         }
     };
 
+    // Every arm is a statement list ending in a top-level `return`: this
+    // wrapper's value is what the page hands back. An arm that wraps itself in
+    // its own IIFE computes the result and discards it, so the page returns
+    // `undefined` and the route reports `passed: false` for an element that
+    // matches (coord finding edfbb26a: hasText, hasClass and hasAttribute).
     Ok(format!("(() => {{ {assertion_js} }})()"))
 }
 
@@ -210,17 +218,27 @@ pub async fn ui_bridge_structured_assert_handler(
 
     match ui_bridge_request_sync(&state, "page_evaluate", payload).await {
         Ok(data) => {
+            // No verdict is an ERROR, never `passed: false`: a script that
+            // produced no JSON string with a boolean `passed` says nothing
+            // about the UI under test.
+            let no_verdict = |why: &str| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(format!(
+                        "Assertion '{}' produced no verdict: {}",
+                        request.assertion, why
+                    ))),
+                )
+            };
             let result_str = super::helpers::evaluate_ipc_value(&data)
                 .and_then(|v| v.as_str())
-                .unwrap_or("{}");
-
-            let parsed: serde_json::Value =
-                serde_json::from_str(result_str).unwrap_or(serde_json::json!({"passed": false}));
-
+                .ok_or_else(|| no_verdict("the page returned no string value"))?;
+            let parsed: serde_json::Value = serde_json::from_str(result_str)
+                .map_err(|e| no_verdict(&format!("unparseable result ({})", e)))?;
             let passed = parsed
                 .get("passed")
                 .and_then(|p| p.as_bool())
-                .unwrap_or(false);
+                .ok_or_else(|| no_verdict("result has no boolean `passed`"))?;
 
             let result = AssertResult {
                 passed,
@@ -244,15 +262,11 @@ pub async fn ui_bridge_structured_assert_handler(
             Ok(Json(ApiResponse::success(result)))
         }
         Err(e) => {
-            let result = AssertResult {
-                passed: false,
-                assertion: request.assertion,
-                query: request.query,
-                actual: serde_json::Value::Null,
-                expected: request.expected.unwrap_or(serde_json::Value::Null),
-                message: format!("Evaluation failed: {}", e),
-            };
-            Ok(Json(ApiResponse::success(result)))
+            error!("UI Bridge API: structured assert evaluation failed: {}", e);
+            match super::request::wrap_ipc_result(Err(e)) {
+                Err(status_body) => Err(status_body),
+                Ok(_) => unreachable!("wrap_ipc_result(Err) is always an error"),
+            }
         }
     }
 }
@@ -2236,5 +2250,133 @@ mod structured_assert_script_tests {
             r#"el.getAttribute("title") === "#,
             ");",
         );
+    }
+}
+
+#[cfg(test)]
+mod structured_assert_result_tests {
+    //! The assert route returns the value of its outer
+    //! `(() => { … })()` wrapper. Each arm must therefore END in a top-level
+    //! `return`; an arm that is itself an IIFE has its result discarded, the
+    //! page returns `undefined`, and the route reports `passed: false` even
+    //! when the element matches. Coord finding edfbb26a: hasText, hasClass and
+    //! hasAttribute were each such an IIFE, so they could never pass.
+
+    use super::{build_structured_assert_expression, StructuredAssertRequest};
+    use serde_json::json;
+
+    const WRAPPER_OPEN: &str = "(() => { ";
+    const WRAPPER_CLOSE: &str = " })()";
+
+    /// Every assertion the route accepts, as a caller would send it.
+    fn every_assertion() -> Vec<(&'static str, serde_json::Value)> {
+        vec![
+            ("exists", json!({ "query": ".x", "assertion": "exists" })),
+            (
+                "notExists",
+                json!({ "query": ".x", "assertion": "notExists" }),
+            ),
+            (
+                "count",
+                json!({ "query": ".x", "assertion": "count", "expected": 2 }),
+            ),
+            (
+                "isVisible",
+                json!({ "query": ".x", "assertion": "isVisible" }),
+            ),
+            (
+                "hasText",
+                json!({ "query": ".x", "assertion": "hasText", "expected": "Save" }),
+            ),
+            (
+                "hasClass",
+                json!({ "query": ".x", "assertion": "hasClass", "expected": "active" }),
+            ),
+            (
+                "hasAttribute",
+                json!({ "query": ".x", "assertion": "hasAttribute", "attribute": "title" }),
+            ),
+            (
+                "hasAttribute with a value",
+                json!({ "query": ".x", "assertion": "hasAttribute", "attribute": "title", "expected": "Tip" }),
+            ),
+        ]
+    }
+
+    #[test]
+    fn every_assertion_arm_returns_its_result_from_the_outer_wrapper() {
+        let mut failures = Vec::new();
+        for (name, body) in every_assertion() {
+            let request: StructuredAssertRequest =
+                serde_json::from_value(body).expect("the request body deserializes");
+            let script = build_structured_assert_expression(&request)
+                .expect("a known query type and assertion");
+            let Some(arm) = script
+                .strip_prefix(WRAPPER_OPEN)
+                .and_then(|rest| rest.strip_suffix(WRAPPER_CLOSE))
+            else {
+                failures.push(format!(
+                    "{name}: not wrapped in `(() => {{ … }})()`: {script}"
+                ));
+                continue;
+            };
+            // An arm that opens with `(` is an expression statement, typically
+            // its own IIFE, whose value the wrapper throws away.
+            if arm.trim_start().starts_with('(') {
+                failures.push(format!(
+                    "{name}: the arm is an expression whose value is discarded: {arm}"
+                ));
+            }
+            // The arm's last statement is the `return` the wrapper hands back.
+            let last_statement = arm
+                .trim_end()
+                .trim_end_matches(';')
+                .rsplit("; ")
+                .next()
+                .unwrap_or("");
+            if !last_statement.starts_with("return JSON.stringify(") {
+                failures.push(format!(
+                    "{name}: the arm does not end in `return JSON.stringify(…)`: {arm}"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn a_missing_required_field_is_refused_not_defaulted() {
+        for (name, body) in [
+            (
+                "hasText no expected",
+                json!({ "query": ".x", "assertion": "hasText" }),
+            ),
+            (
+                "hasClass no expected",
+                json!({ "query": ".x", "assertion": "hasClass" }),
+            ),
+            (
+                "count non-integer",
+                json!({ "query": ".x", "assertion": "count", "expected": "2" }),
+            ),
+            (
+                "hasAttribute no attribute",
+                json!({ "query": ".x", "assertion": "hasAttribute" }),
+            ),
+        ] {
+            let request: StructuredAssertRequest =
+                serde_json::from_value(body).expect("deserializes");
+            assert!(
+                build_structured_assert_expression(&request).is_err(),
+                "{name} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_misspelled_key_is_refused_by_deserialization() {
+        let r = serde_json::from_value::<StructuredAssertRequest>(
+            json!({ "query": ".x", "assertion": "exists", "queryTyp": "text" }),
+        );
+        assert!(r.is_err());
     }
 }

@@ -298,27 +298,41 @@ async fn a_clone_root_is_kept() {
 /// Conjunct 2 (provenance), the vet's Why #4 shape: a `shared_branch` context
 /// whose "worktree" is the canonical checkout — here a clean LINKED worktree
 /// at `parent_sha`, laid out as an allocation root, so every OTHER conjunct
-/// passes. It is never removed.
+/// passes. It is never removed: the shared-branch arm hands it to the
+/// checkout restore instead, which here switched nothing (the checkout was
+/// already on the agent branch) and so leaves it exactly where it is.
 #[tokio::test]
 async fn a_shared_branch_context_is_kept_even_when_every_other_check_passes() {
     let fx = Fixture::new();
     let id = agent();
     let tree = fx.allocate(&id, "canon");
+    let branch = format!("agent/{id}-canon");
     let base = UnspawnedBase {
-        provenance: TreeProvenance::SharedBranch,
+        provenance: TreeProvenance::SharedBranch {
+            branch: branch.clone(),
+            prior_ref: branch.clone(),
+            switched_to_sha: fx.parent_sha.clone(),
+        },
         ..fx.fresh(&tree)
     };
 
     let report = run(&fx, &id, vec![base], false).await;
 
-    assert!(
-        matches!(
-            only_outcome(&report),
-            TreeOutcome::Kept(KeepReason::NotFresh(why)) if why.contains("shared_branch")
-        ),
+    assert_eq!(
+        only_outcome(&report),
+        &TreeOutcome::Kept(KeepReason::SharedBranchCheckout(
+            crate::agent_worktree::shared_branch_restore::RestoreOutcome::Kept(
+                crate::agent_worktree::shared_branch_restore::RestoreKeep::NothingSwitched
+            )
+        )),
         "{report:?}"
     );
     assert!(tree.exists());
+    assert_eq!(
+        git(&tree, &["symbolic-ref", "--short", "HEAD"]),
+        branch,
+        "nothing was switched, so nothing is undone"
+    );
     // Unrecorded provenance is kept the same way.
     let base = UnspawnedBase {
         provenance: TreeProvenance::Unrecorded,
@@ -794,6 +808,64 @@ async fn an_ignored_scaffolding_entry_is_deleted_and_the_tree_removed() {
     let report = run(&fx, &id, vec![fx.fresh(&tree)], false).await;
 
     assert_eq!(only_outcome(&report), &TreeOutcome::Removed);
+}
+
+/// The breadcrumb's crash-left temp file, under the managed exclude glob that
+/// `fleet::MANAGED_REPO_EXCLUDES` writes, reaches reclaim as an `!!` entry:
+/// it is runner scaffolding, so it is deleted and the tree goes.
+#[tokio::test]
+async fn a_crash_left_breadcrumb_temp_file_is_deleted_and_the_tree_removed() {
+    let fx = Fixture::new();
+    let id = agent();
+    let tree = fx.allocate(&id, "canon");
+    std::fs::create_dir_all(fx.canonical.join(".git/info")).unwrap();
+    std::fs::write(
+        fx.canonical.join(".git/info/exclude"),
+        ".coord-mcp-status.tmp-*\n",
+    )
+    .unwrap();
+    provision_scaffolding(&tree);
+    let name = crate::coord_mcp::breadcrumb_tmp_name();
+    std::fs::write(tree.join(&name), "degraded\n").unwrap();
+    assert!(git(&tree, &["status", "--porcelain", "--ignored"]).contains(&format!("!! {name}")));
+
+    let report = run(&fx, &id, vec![fx.fresh(&tree)], false).await;
+
+    assert_eq!(only_outcome(&report), &TreeOutcome::Removed);
+}
+
+/// A DIRECTORY carrying the temp file's name is not the runner's: its content
+/// keeps the tree, as ignored non-scaffolding content, rather than being
+/// deleted. (Under `-uall` git lists the files inside it; the collapsed
+/// `name/` spelling is pinned by `dirty`'s unit tests.)
+#[tokio::test]
+async fn a_directory_named_like_the_breadcrumb_temp_keeps_the_tree() {
+    let fx = Fixture::new();
+    let id = agent();
+    let tree = fx.allocate(&id, "canon");
+    std::fs::create_dir_all(fx.canonical.join(".git/info")).unwrap();
+    std::fs::write(
+        fx.canonical.join(".git/info/exclude"),
+        ".coord-mcp-status.tmp-*\n",
+    )
+    .unwrap();
+    provision_scaffolding(&tree);
+    let dir = tree.join(".coord-mcp-status.tmp-1");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("notes.txt"), "operator work\n").unwrap();
+
+    let report = run(&fx, &id, vec![fx.fresh(&tree)], false).await;
+
+    assert!(
+        matches!(
+            only_outcome(&report),
+            TreeOutcome::Kept(KeepReason::IgnoredContent(p))
+                if p.starts_with(".coord-mcp-status.tmp-1")
+        ),
+        "{:?}",
+        only_outcome(&report)
+    );
+    assert!(dir.join("notes.txt").exists());
 }
 
 /// Review A5: an install past the bound is aborted (it was at an await

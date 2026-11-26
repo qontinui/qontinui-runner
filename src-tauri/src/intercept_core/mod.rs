@@ -40,5 +40,6 @@
 pub mod classify;
 pub mod gate;
 pub mod npm_placeholder;
+pub mod settled;
 pub mod shim_dir;
 pub mod types;

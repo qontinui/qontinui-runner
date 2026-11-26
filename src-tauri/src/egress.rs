@@ -1343,6 +1343,12 @@ fn bound_tenants() -> BoundSet {
     state().bound_set()
 }
 
+/// The tenants this device is bound to, as the poller last recorded them.
+/// Empty means none recorded (UNKNOWN, not "no tenants").
+pub(crate) fn bound_tenant_ids() -> Vec<Uuid> {
+    bound_tenants().tenants
+}
+
 /// The verdict for a session-keyed send of a CONTENT flow in `scope` —
 /// [`SessionScope::Unresolved`] is judged by the strictest verdict across the
 /// default scope and every bound tenant.

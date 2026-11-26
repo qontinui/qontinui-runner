@@ -44,9 +44,9 @@
 //! map is tiny (one entry per live pane), so we read+rewrite the whole
 //! file per mutation rather than appending.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use tracing::warn;
 use uuid::Uuid;
@@ -149,6 +149,32 @@ impl PaneKey {
 pub struct PaneSessionStore {
     path: PathBuf,
     map: Mutex<HashMap<String, Uuid>>,
+    /// Coord rows a create is resuming RIGHT NOW (in memory only). The
+    /// "is anyone bound to this row?" check in `wire_coord_session` and the
+    /// bind that follows it are split by the `resume_external` await, so two
+    /// concurrent same-key creates could both pass the check; the claim closes
+    /// that window. See [`PaneSessionStore::claim_resume`].
+    resuming: Arc<Mutex<HashSet<Uuid>>>,
+}
+
+/// An exclusive in-process reservation of one coord row for resuming, held
+/// from before the bound-row check until after the pane is bound to the row.
+/// Dropping it releases the row.
+#[derive(Debug)]
+#[must_use = "the reservation is released as soon as the claim is dropped"]
+pub struct ResumeClaim {
+    resuming: Arc<Mutex<HashSet<Uuid>>>,
+    id: Uuid,
+}
+
+impl Drop for ResumeClaim {
+    fn drop(&mut self) {
+        // A poisoned set is left as is: every later claim on it reads UNKNOWN
+        // and registers fresh, which never shares a row.
+        if let Ok(mut set) = self.resuming.lock() {
+            set.remove(&self.id);
+        }
+    }
 }
 
 impl PaneSessionStore {
@@ -162,6 +188,7 @@ impl PaneSessionStore {
         Ok(Self {
             path,
             map: Mutex::new(map),
+            resuming: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -171,6 +198,19 @@ impl PaneSessionStore {
             .lock()
             .ok()
             .and_then(|m| m.get(key.as_str()).copied())
+    }
+
+    /// Reserve coord row `id` for one create to resume. `None` when another
+    /// create in this process already holds it, or when the reservation set
+    /// is unreadable (a poisoned lock). That second case is UNKNOWN, and the
+    /// caller treats both the same way: it registers a fresh row, because a
+    /// spare row can be cleaned up and a shared row cannot.
+    pub fn claim_resume(&self, id: Uuid) -> Option<ResumeClaim> {
+        let mut set = self.resuming.lock().ok()?;
+        set.insert(id).then(|| ResumeClaim {
+            resuming: self.resuming.clone(),
+            id,
+        })
     }
 
     /// Persist (or overwrite) the coord session id for a pane and flush to
@@ -255,6 +295,19 @@ fn write_map(path: &Path, map: &HashMap<String, Uuid>) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn a_resume_claim_is_exclusive_until_dropped() {
+        let dir = tempdir().unwrap();
+        let store = PaneSessionStore::open(dir.path().join("panes.json")).unwrap();
+        let row = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let held = store.claim_resume(row).expect("first claim");
+        assert!(store.claim_resume(row).is_none(), "held: refused");
+        let _other = store.claim_resume(other).expect("a different row is free");
+        drop(held);
+        assert!(store.claim_resume(row).is_some(), "released on drop");
+    }
 
     #[test]
     fn pane_key_is_stable_for_same_triple() {

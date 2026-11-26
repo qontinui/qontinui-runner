@@ -138,7 +138,12 @@ mod tests {
             // 423 -> 417: #2857 deleted the orchestrator verifier with 3
             // attributes (orchestrator/verification.rs 2, output.rs 1) and left
             // the baseline; the other 3 were slack. 417 measured by this test.
-            baseline: 417,
+            // 417 -> 414: `terminal::transcript::read_tail_bytes` and
+            // `session_compliance::read_transcript_tail` lost their only slices
+            // to the one bounded tail reader, `file_tail::read_tail_lossy` (plan
+            // 2026-11-11-runner-glibc-arena-retention-and-whole-log-tail); the
+            // other 1 was slack, 416 measured before the change, 414 after.
+            baseline: 414,
             gate_wiring: &[
                 ("src-tauri/Cargo.toml", "string_slice = { level = \"deny\""),
                 (

@@ -91,6 +91,37 @@
 //! stamped before the field existed whose session no live plane knows — is
 //! left as `mark_row_unknown`: UNKNOWN, never guessed onto coord's newest row
 //! for the harness id, which could be a later revival on another device.
+//!
+//! ## A finish written to a different row (re-address)
+//!
+//! Plan
+//! `2026-11-07-a-runner-finish-is-addressed-to-a-stale-coord-row-after-a-pane-respawn`,
+//! Phase 4. After a pane respawn (account migration, the resume door) the
+//! finish could land on the session's OLD, closed row while coord's
+//! work-status — which since that plan's Phase 3 names the ACTIVE row first —
+//! names the live one. That is no longer only `different_row`: the finish is
+//! re-addressed to the row coord OBSERVED when all of these hold:
+//!
+//! - the observed row's `state` is `active` (`different_row_not_active`, or
+//!   `different_row_state_unknown` when coord served none);
+//! - its `session_status` is NULL (`different_row_status_not_null`);
+//! - its `since` is null or earlier than the mark's `finishedAt`
+//!   (`different_row_revived`; an unparseable one is `since_unreadable`);
+//! - coord's served `started_at` shows the row existed BEFORE the finish
+//!   (`different_row_started_after_finish`; absent or unparseable is
+//!   `different_row_started_unknown`). A row registered after the finish is a
+//!   later revival, never the row the finish belonged on.
+//!
+//! The re-send is the same two-step door as above, addressed to the OBSERVED
+//! row (at boot the registrar map is empty and a finished session has no
+//! terminal, so no in-process resolver could name it). For an unsynced mark
+//! the outbox is checked for a pending `Finished` row to EITHER row first
+//! (`finish_still_queued`). Before the re-send, the target is recorded on the
+//! mark as re-addressed (`note_finish_readdressed`), so the mark's own row is
+//! the live one from then on, and while the mark is unsynced the registrar's
+//! retry door sends its finish there, never back to the stale row. When the drain's ack confirms the observed row
+//! reads `finished`, its observer stamps that row as the mark's own
+//! (`mark_finish_synced_on`), so a later sweep reads `coord_finished`.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
@@ -125,8 +156,21 @@ pub enum HealSkip {
     CoordUnreadable,
     /// coord served no row for this session.
     NoCoordRow,
-    /// coord's row is not the mark's own (or names none).
+    /// coord's row names no (parseable) coord id, so it is not the mark's own.
     DifferentRow,
+    /// coord names a different row that is not `active`.
+    DifferentRowNotActive,
+    /// coord names a different row and served no `state` — UNKNOWN.
+    DifferentRowStateUnknown,
+    /// coord names a different active row whose work axis is set.
+    DifferentRowStatusNotNull,
+    /// coord names a different row whose `since` is at or after the finish.
+    DifferentRowRevived,
+    /// coord names a different row registered at or after the finish.
+    DifferentRowStartedAfterFinish,
+    /// coord names a different row and its `started_at` is absent or
+    /// unparseable — whether it predates the finish is UNKNOWN.
+    DifferentRowStartedUnknown,
     /// coord's own row reads `finished` — the healthy case.
     CoordFinished,
     /// coord's own row reads `working`: a revival `since` cannot rule out.
@@ -153,6 +197,12 @@ impl HealSkip {
             Self::CoordUnreadable => "coord_unreadable",
             Self::NoCoordRow => "no_coord_row",
             Self::DifferentRow => "different_row",
+            Self::DifferentRowNotActive => "different_row_not_active",
+            Self::DifferentRowStateUnknown => "different_row_state_unknown",
+            Self::DifferentRowStatusNotNull => "different_row_status_not_null",
+            Self::DifferentRowRevived => "different_row_revived",
+            Self::DifferentRowStartedAfterFinish => "different_row_started_after_finish",
+            Self::DifferentRowStartedUnknown => "different_row_started_unknown",
             Self::CoordFinished => "coord_finished",
             Self::WorkingRevivalUnprovable => "working_revival_unprovable",
             Self::StatusNotNull => "status_not_null",
@@ -169,6 +219,9 @@ impl HealSkip {
 pub enum HealDecision {
     /// coord's own row reads NULL with no later revival: re-send to `row`.
     Resend { row: Uuid },
+    /// coord names a DIFFERENT row, active and NULL, that predates the finish
+    /// with no later revival: re-send the finish to that observed `row`.
+    Readdress { row: Uuid },
     /// Change nothing, for this reason.
     Leave(HealSkip),
 }
@@ -206,8 +259,10 @@ pub fn heal_decision(
         .coord_session_id
         .as_deref()
         .and_then(|s| Uuid::parse_str(s.trim()).ok());
-    if answered != Some(own) {
-        return HealDecision::Leave(HealSkip::DifferentRow);
+    match answered {
+        None => return HealDecision::Leave(HealSkip::DifferentRow),
+        Some(other) if other != own => return readdress_decision(finished_at, other, row),
+        Some(_) => {}
     }
     match row.session_status.as_deref().map(SessionWorkStatus::parse) {
         Some(SessionWorkStatus::Finished) => return HealDecision::Leave(HealSkip::CoordFinished),
@@ -223,6 +278,38 @@ pub fn heal_decision(
             HealDecision::Leave(HealSkip::RevivedAfterFinish)
         }
         _ => HealDecision::Resend { row: own },
+    }
+}
+
+/// Phase 4 of plan
+/// `2026-11-07-a-runner-finish-is-addressed-to-a-stale-coord-row-after-a-pane-respawn`,
+/// pure: coord names `other`, not the mark's own row. Re-address the finish
+/// to it only when it is active, NULL, not revived after the finish, and
+/// registered before it; every other case is left and counted.
+fn readdress_decision(finished_at: i64, other: Uuid, row: &ObservedRow) -> HealDecision {
+    match row.state.as_deref().map(str::trim) {
+        None => return HealDecision::Leave(HealSkip::DifferentRowStateUnknown),
+        Some(s) if !s.eq_ignore_ascii_case("active") => {
+            return HealDecision::Leave(HealSkip::DifferentRowNotActive)
+        }
+        Some(_) => {}
+    }
+    if row.session_status.is_some() {
+        return HealDecision::Leave(HealSkip::DifferentRowStatusNotNull);
+    }
+    match (row.since.as_deref(), row.since_ms) {
+        (Some(_), None) => return HealDecision::Leave(HealSkip::SinceUnreadable),
+        (_, Some(since)) if since >= finished_at => {
+            return HealDecision::Leave(HealSkip::DifferentRowRevived)
+        }
+        _ => {}
+    }
+    match row.started_at_ms {
+        None => HealDecision::Leave(HealSkip::DifferentRowStartedUnknown),
+        Some(started) if started >= finished_at => {
+            HealDecision::Leave(HealSkip::DifferentRowStartedAfterFinish)
+        }
+        Some(_) => HealDecision::Readdress { row: other },
     }
 }
 
@@ -262,6 +349,9 @@ pub enum HealOutcome {
     Resent { row: Uuid },
     /// An UNSYNCED mark's finish was re-offered to `row` (boot sweep only).
     Reoffered { row: Uuid },
+    /// The finish was re-sent to `row`, a DIFFERENT row than the mark's own
+    /// (`from`) that coord names as the session's live one.
+    Readdressed { from: Uuid, row: Uuid },
     /// The stamp was withdrawn (or the mark was already unsynced) but the
     /// re-send stayed local-only; the retry door re-offers it.
     NotQueued { row: Uuid, reason: &'static str },
@@ -277,6 +367,7 @@ impl HealOutcome {
         match self {
             Self::Resent { .. } => "resent",
             Self::Reoffered { .. } => "reoffered",
+            Self::Readdressed { .. } => "readdressed",
             Self::NotQueued { .. } => "not_queued",
             Self::MarkChanged => "mark_changed",
             Self::Left(skip) => skip.as_str(),
@@ -376,11 +467,27 @@ pub fn apply_heal_observed(
         }
         let own_row = port.and_then(|p| p.own_row(rec));
         let decision = heal_decision(at, own_row, obs.get(&rec.claude_session_id), now_ms);
-        let outcome = match (decision, rec.finish_synced) {
+        let plan = match decision {
+            HealDecision::Leave(_) => None,
+            HealDecision::Resend { row } if rec.finish_synced => Some((row, Resend::Resent)),
+            HealDecision::Resend { row } => Some((row, Resend::Reoffered)),
+            // A Readdress needs an own row, so `own_row` is always Some here.
+            HealDecision::Readdress { row } => {
+                own_row.map(|from| (row, Resend::Readdressed { from }))
+            }
+        };
+        let outcome = match (decision, plan) {
             (HealDecision::Leave(skip), _) => HealOutcome::Left(skip),
-            (HealDecision::Resend { row }, true) => {
-                match (store.clear_finish_synced(&rec.claude_session_id, at), port) {
-                    (true, Some(p)) => redelivered(p, rec, at, row, false),
+            (_, None) => HealOutcome::Left(HealSkip::MarkRowUnknown),
+            (_, Some((row, kind))) if rec.finish_synced => {
+                // A re-address withdraws the stamp and records its target in
+                // ONE step (`note_finish_readdressed`, inside `resend`).
+                let cleared = match kind {
+                    Resend::Readdressed { .. } => true,
+                    _ => store.clear_finish_synced(&rec.claude_session_id, at),
+                };
+                match (cleared, port) {
+                    (true, Some(p)) => resend(store, p, rec, at, row, kind),
                     // Unreachable (a Resend needs an own row, which needs a
                     // port) — and never a send without the serialized door.
                     (true, None) => HealOutcome::NotQueued {
@@ -393,9 +500,13 @@ pub fn apply_heal_observed(
             // An UNSYNCED mark whose own `Finished` row is still in the
             // outbox is not lost — the drain still owes it — so the boot
             // sweep does not queue a second one beside it (review A6).
-            (HealDecision::Resend { row }, false) => match port {
-                Some(p) => match p.finish_queued(&rec.claude_session_id, at, row) {
-                    Some(false) => redelivered(p, rec, at, row, true),
+            //
+            // A re-address checks the mark's OWN row too: a `Finished` row
+            // still pending to the old row will be delivered there and its
+            // ack would stamp that row, so the next sweep decides afresh.
+            (_, Some((row, kind))) => match port {
+                Some(p) => match pending_finish(p, rec, at, row, kind) {
+                    Some(false) => resend(store, p, rec, at, row, kind),
                     Some(true) => HealOutcome::Left(HealSkip::FinishStillQueued),
                     None => HealOutcome::Left(HealSkip::OutboxUnreadable),
                 },
@@ -406,6 +517,15 @@ pub fn apply_heal_observed(
             },
         };
         match &outcome {
+            HealOutcome::Readdressed { from, row } => info!(
+                claude_session_id = %rec.claude_session_id,
+                from_coord_session_id = %from,
+                coord_session_id = %row,
+                outcome = outcome.reason(),
+                "finish_heal: coord names a different, active, NULL row that predates the \
+                 finish — the finish is re-addressed to it through the serialized \
+                 late-delivery door"
+            ),
             HealOutcome::Resent { row } | HealOutcome::Reoffered { row } => info!(
                 claude_session_id = %rec.claude_session_id,
                 coord_session_id = %row,
@@ -427,20 +547,83 @@ pub fn apply_heal_observed(
     out
 }
 
+/// Which re-send a decision asked for, so the outcome names it.
+#[derive(Debug, Clone, Copy)]
+enum Resend {
+    /// A synced mark over its own NULL row.
+    Resent,
+    /// An unsynced mark over its own NULL row (boot sweep only).
+    Reoffered,
+    /// A mark re-addressed from its own row `from` to the observed row.
+    Readdressed { from: Uuid },
+}
+
+/// Whether a `Finished` row for this mark is still pending to `row` — or, on
+/// a re-address, to the mark's own row as well. `None` when unreadable.
+fn pending_finish(
+    p: &dyn HealPort,
+    rec: &TerminalSessionRecord,
+    at: i64,
+    row: Uuid,
+    kind: Resend,
+) -> Option<bool> {
+    let to_row = p.finish_queued(&rec.claude_session_id, at, row)?;
+    match kind {
+        Resend::Readdressed { from } if !to_row => {
+            p.finish_queued(&rec.claude_session_id, at, from)
+        }
+        _ => Some(to_row),
+    }
+}
+
+/// [`redelivered`], first recording a re-address target on the mark
+/// ([`SessionLifecycleStore::note_finish_readdressed`]) so the mark's own row
+/// is the live one from here on: later sweeps judge that row, and the retry
+/// door (`forward_finish_change`) sends there rather than to the stale row
+/// the in-process resolvers may still name (review A1/A4). Recorded BEFORE
+/// the send, so no finish in between can go to the stale row.
+fn resend(
+    store: &SessionLifecycleStore,
+    p: &dyn HealPort,
+    rec: &TerminalSessionRecord,
+    at: i64,
+    row: Uuid,
+    kind: Resend,
+) -> HealOutcome {
+    if matches!(kind, Resend::Readdressed { .. })
+        && !store.note_finish_readdressed(
+            &rec.claude_session_id,
+            at,
+            row,
+            rec.finish_synced,
+            rec.finish_coord_session_id,
+        )
+    {
+        return HealOutcome::MarkChanged;
+    }
+    redelivered(p, rec, at, row, kind)
+}
+
 /// Re-send `rec`'s mark through the port's serialized door.
 fn redelivered(
     p: &dyn HealPort,
     rec: &TerminalSessionRecord,
     at: i64,
     row: Uuid,
-    reoffer: bool,
+    kind: Resend,
 ) -> HealOutcome {
     match p.redeliver(&rec.claude_session_id, at, row) {
-        Some(FinishSync::Queued { coord_session_id }) if reoffer => HealOutcome::Reoffered {
-            row: coord_session_id,
-        },
-        Some(FinishSync::Queued { coord_session_id }) => HealOutcome::Resent {
-            row: coord_session_id,
+        Some(FinishSync::Queued { coord_session_id }) => match kind {
+            Resend::Resent => HealOutcome::Resent {
+                row: coord_session_id,
+            },
+            Resend::Reoffered => HealOutcome::Reoffered {
+                row: coord_session_id,
+            },
+            Resend::Readdressed { from } => HealOutcome::Readdressed {
+                from,
+                row: coord_session_id,
+            },
         },
         Some(FinishSync::LocalOnly(r)) => HealOutcome::NotQueued {
             row,
@@ -519,7 +702,9 @@ pub fn spawn_boot_sweep(
             .filter(|(_, o)| {
                 matches!(
                     o,
-                    HealOutcome::Resent { .. } | HealOutcome::Reoffered { .. }
+                    HealOutcome::Resent { .. }
+                        | HealOutcome::Reoffered { .. }
+                        | HealOutcome::Readdressed { .. }
                 )
             })
             .count();
@@ -624,6 +809,8 @@ pub fn decorate_read_back(
             "sessionStatus": row.session_status,
             "since": row.since,
             "coordSessionId": row.coord_session_id,
+            "state": row.state,
+            "startedAt": row.started_at,
             "observedAt": rb.observed_at,
         })
     });
@@ -668,7 +855,7 @@ pub fn decorate_read_back(
             .map(|o| json!({ "outcome": o.reason() }))
             .unwrap_or(JsonValue::Null),
     );
-    if let Some(HealOutcome::Resent { row }) = &rb.heal {
+    if let Some(HealOutcome::Resent { row } | HealOutcome::Readdressed { row, .. }) = &rb.heal {
         // The heal re-queued the finish: the read-back now reports that write.
         coord.insert("queued".to_string(), JsonValue::Bool(true));
         coord.insert(

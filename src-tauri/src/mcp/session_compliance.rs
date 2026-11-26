@@ -135,7 +135,6 @@
 //! this module does nothing — see [`Applicability::nudge_allowed`].
 
 use std::collections::HashMap;
-use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant};
@@ -146,6 +145,7 @@ use tracing::{debug, info};
 
 use super::continuation_verdict::{coord_client_parts, http_client};
 use crate::session::session_lifecycle_store::SessionLifecycleStore;
+use qontinui_runner_lib::file_tail::read_tail_lossy;
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 // ===========================================================================
@@ -484,37 +484,10 @@ pub fn scan_transcript(slice: &str) -> Option<Value> {
 }
 
 /// Read the last [`TRANSCRIPT_TAIL_BYTES`] of a transcript, dropping the
-/// (probably truncated) first line when the file was larger than the window.
-#[expect(
-    clippy::string_slice,
-    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
-)]
+/// (probably truncated) first line when the file was larger than the window —
+/// the runner's one bounded tail reader, [`read_tail_lossy`].
 fn read_transcript_tail(path: &Path) -> Option<String> {
-    let mut f = std::fs::File::open(path).ok()?;
-    let len = f.metadata().ok()?.len();
-    let truncated = len > TRANSCRIPT_TAIL_BYTES;
-    let start = if truncated {
-        len - TRANSCRIPT_TAIL_BYTES
-    } else {
-        0
-    };
-    f.seek(SeekFrom::Start(start)).ok()?;
-    let mut buf = Vec::with_capacity((len - start) as usize);
-    f.read_to_end(&mut buf).ok()?;
-    // Take the buffer by value on the (overwhelmingly common) valid-UTF-8 path
-    // — `from_utf8_lossy(&buf).into_owned()` would copy the whole window a
-    // second time, and the window is megabytes.
-    let text = match String::from_utf8(buf) {
-        Ok(s) => s,
-        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
-    };
-    if !truncated {
-        return Some(text);
-    }
-    Some(match text.find('\n') {
-        Some(i) => text[i + 1..].to_string(),
-        None => String::new(),
-    })
+    read_tail_lossy(path, TRANSCRIPT_TAIL_BYTES)
 }
 
 // ===========================================================================

@@ -1,11 +1,15 @@
-//! The shared harness for tests that RUN a rendered bash shim template —
-//! `shim_materializer`'s `resolve_wait_tests` and
-//! `identity_shim_launch_failure_tests`.
+//! The shared harness for tests that RUN a rendered bash shim template.
 //!
-//! One module, so there is ONE [`EXE_LOCK`]: writing an executable while
-//! another test thread forks can leave the write fd open in the child and make
-//! that child's exec fail `ETXTBSY`, and two locks would not serialize against
-//! each other.
+//! One module, so there is ONE [`EXE_LOCK`], taken only through
+//! [`exe_guard`]: writing an executable while another test thread forks can
+//! leave the write fd open in the child and make that child's exec fail
+//! `ETXTBSY`, and two locks would not serialize against each other. Its
+//! holders, every test in the crate that writes an executable and then forks
+//! one:
+//! - `shim_materializer`'s `resolve_wait_tests`;
+//! - `identity_shim_launch_failure_tests`;
+//! - `identity_shim_settle_tests`;
+//! - `session::spawn_prompt`'s `script_tests`.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -37,8 +41,29 @@ fn rendered_identity_shim(shim_dir: &Path) -> String {
     }
 }
 
-/// Held by every test that writes an executable and then forks.
+/// The literal beacon bodies the bash identity shim POSTs to
+/// `/control/shim-beacon` for a resume-shaped launch on terminal `term-launch`:
+/// asserted verbatim on what the shim SENDS (`identity_shim_launch_failure_tests`)
+/// and fed to what the runner RECORDS (`terminal::launch_failure`'s tests).
+pub(crate) const INVOKED_BODY: &str = r#"{"terminal_id":"term-launch","tool":"claude","event":"invoked","detail":"user_session_id=true settings=true mcp_config=false pinned=true"}"#;
+pub(crate) const RESOLVE_FAILED_BODY: &str = r#"{"terminal_id":"term-launch","tool":"claude","event":"resolve-failed","detail":"waited=1 stub=false settings=true user_session_id=true"}"#;
+pub(crate) const EXEC_FAILED_BODY: &str = r#"{"terminal_id":"term-launch","tool":"claude","event":"exec-failed","detail":"status=126 waited=1 settings=true user_session_id=true"}"#;
+/// The same two beacons from a shim that delivers NO SessionStart hook.
+pub(crate) const INVOKED_NO_HOOK_BODY: &str = r#"{"terminal_id":"term-launch","tool":"claude","event":"invoked","detail":"user_session_id=true settings=false mcp_config=false pinned=true"}"#;
+pub(crate) const RESOLVE_FAILED_NO_HOOK_BODY: &str = r#"{"terminal_id":"term-launch","tool":"claude","event":"resolve-failed","detail":"waited=1 stub=false settings=false user_session_id=true"}"#;
+
+/// Held by every test that writes an executable and then forks; take it only
+/// through [`exe_guard`].
 pub(crate) static EXE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take [`EXE_LOCK`] as a CHILD of the test-lock hierarchy: `env_lock` first,
+/// then this lock, both held until the guard drops (poison-recovering, so one
+/// failing test reports its own assertion instead of cascading). Its holders
+/// live in four other files, which a standalone lock's audit would not reach;
+/// as a child, `env_test_lock_hierarchy_guard` covers every one of them.
+pub(crate) fn exe_guard() -> crate::test_env::TestLockGuard {
+    crate::test_env::hierarchy_lock(&EXE_LOCK)
+}
 
 /// Write `body` as an executable at `path`, atomically (temp + rename) so a
 /// concurrently scanning shim never sees a half-written file.
@@ -89,4 +114,16 @@ pub(crate) fn identity_cmd(shim_dir: &Path, real_dir: &Path, wait: &str) -> Comm
         ),
         wait,
     )
+}
+
+/// Install a fake `stat` in `dir` that reports every target as changed at epoch
+/// second 1 — long settled. The identity shim waits for a resolved `claude`
+/// whose target changed under ~3 s ago (whole seconds) (plan
+/// `2026-11-10-shim-settle-wait-and-in-memory-launch-liveness` Phase 3), and a
+/// change time cannot be backdated (`touch -d` moves only mtime), so a test
+/// that launches a freshly written fake `claude` with the real `stat` on PATH
+/// would pay that wait and see its line on stderr. Put `dir` on PATH ahead of
+/// the system dirs. Call it under the caller's executable-writing lock.
+pub(crate) fn install_settled_stat(dir: &Path) {
+    write_exe(&dir.join("stat"), "#!/bin/sh\necho 1\n");
 }

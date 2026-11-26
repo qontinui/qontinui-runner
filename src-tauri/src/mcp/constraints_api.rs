@@ -104,7 +104,7 @@ pub async fn get_active_constraints(
     State(_state): State<Arc<ApiState>>,
     Query(query): Query<ActiveConstraintsQuery>,
 ) -> Json<ApiResponse<Vec<Constraint>>> {
-    let project_path = resolve_project_path(query.project_path);
+    let project_path = resolve_project_path(query.project_path, read_fallback).ok();
 
     let engine = match &project_path {
         Some(path) => {
@@ -168,13 +168,28 @@ pub async fn get_constraint_results(
 }
 
 /// Resolve project path from an optional query/body parameter, falling back to
-/// the workspace root detected from the executable location.
-fn resolve_project_path(explicit: Option<String>) -> Option<std::path::PathBuf> {
-    explicit.map(std::path::PathBuf::from).or_else(|| {
-        crate::mcp::shared::get_workspace_paths_internal()
-            .ok()
-            .map(|(root, _, _)| root)
-    })
+/// the runner's workspace root — the one resolver, so a miss is its typed
+/// `WorkspaceRootUnresolved` rather than a sentence of this module's own.
+///
+/// `fallback` is the disposition: the READ handlers pass
+/// [`read_fallback`] (non-logging — they degrade to builtins on a miss and are
+/// polled, so a `warn!` per request would flood the log), and the WRITE handler
+/// passes [`crate::workspace_paths::require_workspace_root`], which logs the
+/// rejection detail its typed refusal cannot carry.
+fn resolve_project_path(
+    explicit: Option<String>,
+    fallback: fn() -> Result<std::path::PathBuf, qontinui_types::paths::WorkspaceRootUnresolved>,
+) -> Result<std::path::PathBuf, qontinui_types::paths::WorkspaceRootUnresolved> {
+    match explicit {
+        Some(path) => Ok(std::path::PathBuf::from(path)),
+        None => fallback(),
+    }
+}
+
+/// The READ handlers' workspace-root fallback: the same resolution as
+/// [`crate::workspace_paths::require_workspace_root`], without its logging.
+fn read_fallback() -> Result<std::path::PathBuf, qontinui_types::paths::WorkspaceRootUnresolved> {
+    crate::workspace_paths::runner_workspace_root().require()
 }
 
 /// GET /constraints/config
@@ -185,7 +200,7 @@ pub async fn get_config(
     State(_state): State<Arc<ApiState>>,
     Query(query): Query<ReadConfigQuery>,
 ) -> Json<ApiResponse<ReadConfigResponse>> {
-    let project_path = resolve_project_path(query.project_path);
+    let project_path = resolve_project_path(query.project_path, read_fallback).ok();
 
     let (toml_content, file_path) = match &project_path {
         Some(path) => {
@@ -229,13 +244,18 @@ pub async fn get_config(
 pub async fn write_config(
     State(_state): State<Arc<ApiState>>,
     Json(body): Json<WriteConfigRequest>,
-) -> Result<Json<ApiResponse<WriteConfigResponse>>, (StatusCode, String)> {
-    let project_path = resolve_project_path(body.project_path);
-
-    let project_dir = project_path.ok_or_else(|| {
+) -> Result<Json<ApiResponse<WriteConfigResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // No project_path and no workspace root: the shared typed refusal — the same
+    // `error`/`code` as `/api-surface/scan`; `hint` carries the full Refusal
+    // envelope.
+    let project_dir = resolve_project_path(
+        body.project_path,
+        crate::workspace_paths::require_workspace_root,
+    )
+    .map_err(|unresolved| {
         (
-            StatusCode::BAD_REQUEST,
-            "No project_path provided and no workspace root could be detected".to_string(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(ApiResponse::workspace_root_unresolved(&unresolved)),
         )
     })?;
 
@@ -268,7 +288,11 @@ pub async fn write_config(
         std::fs::create_dir_all(parent).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to create directory {}: {}", parent.display(), e),
+                Json(ApiResponse::error(format!(
+                    "Failed to create directory {}: {}",
+                    parent.display(),
+                    e
+                ))),
             )
         })?;
     }
@@ -277,7 +301,11 @@ pub async fn write_config(
     std::fs::write(&write_path, &body.toml).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to write {}: {}", write_path.display(), e),
+            Json(ApiResponse::error(format!(
+                "Failed to write {}: {}",
+                write_path.display(),
+                e
+            ))),
         )
     })?;
 

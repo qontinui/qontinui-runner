@@ -7,9 +7,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
+use std::path::{Path, PathBuf};
 use tracing::{error, info, warn};
 
 use crate::error::AppError;
@@ -397,8 +395,11 @@ fn get_file_modified_time(path: &PathBuf) -> Option<String> {
 /// resolves the newest matching dated sibling, so a source pointed at the
 /// stable basename reads the current rotation instead of reporting "File does
 /// not exist". A literal path that exists always wins.
-fn resolve_source_file(configured: &str) -> PathBuf {
-    let path = PathBuf::from(configured);
+///
+/// `pub(crate)` for the `/debug/app/errors` scan, which reads the same
+/// configured sources and must resolve them the same way.
+pub(crate) fn resolve_source_file(configured: impl AsRef<Path>) -> PathBuf {
+    let path = configured.as_ref().to_path_buf();
     if !path.exists() {
         if let (Some(dir), Some(prefix)) =
             (path.parent(), path.file_name().and_then(|n| n.to_str()))
@@ -777,26 +778,9 @@ pub fn append_project_log(
     }
 }
 
-/// Build the Tauri plugin that registers this module's command handlers.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_project_logs")
-        .invoke_handler(tauri::generate_handler![
-            get_project_log_config,
-            save_project_log_config,
-            list_project_configs,
-            delete_project_config,
-            read_log_source,
-            read_project_logs,
-            get_project_directories,
-            append_project_log,
-        ])
-        .build()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     /// A source with every unset field at its serde default — the shape the
     /// global settings file stores.

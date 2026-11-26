@@ -80,6 +80,7 @@ pub mod reclaim;
 pub(crate) mod remove_unspawned;
 pub(crate) mod retire_abandoned;
 pub mod session_env;
+pub(crate) mod shared_branch_restore;
 pub(crate) mod sibling_store;
 #[cfg(test)]
 mod test_coord;
@@ -1202,6 +1203,16 @@ pub struct SharedBranchRepo {
     pub push_ref: String,
     #[serde(flatten)]
     pub parent_sha_provenance: ParentShaProvenance,
+    /// The ref the canonical checkout was on BEFORE this allocation switched
+    /// it: a branch name, or the commit sha when HEAD was detached. Equal to
+    /// `branch` when the checkout was already on the agent branch and no
+    /// switch happened. What a refused spawn's restore
+    /// ([`shared_branch_restore`]) switches back to.
+    pub prior_ref: String,
+    /// `git rev-parse HEAD` read right after the switch succeeded — the commit
+    /// the restore requires HEAD to still be at, so a commit made on the agent
+    /// branch since is never switched away from.
+    pub switched_to_sha: String,
 }
 
 /// The leading token of a session refused because it got no worktree of its
@@ -2877,11 +2888,18 @@ fn shared_branch_rows(worktrees: &[CoordAllocatedWorktree]) -> Vec<&CoordAllocat
 fn checkout_shared_branches(
     targets: &[(&CoordAllocatedWorktree, &PathBuf)],
 ) -> Result<Vec<SharedBranchRepo>, AllocateError> {
-    // (checkout, prior ref, agent branch this call created, if any)
-    let mut switched: Vec<(&PathBuf, String, Option<&str>)> = Vec::with_capacity(targets.len());
+    // (checkout, prior ref, agent branch, whether this call created it)
+    let mut switched: Vec<(&PathBuf, String, &str, bool)> = Vec::with_capacity(targets.len());
     let mut branches: Vec<SharedBranchRepo> = Vec::with_capacity(targets.len());
-    let rollback = |switched: &[(&PathBuf, String, Option<&str>)]| {
-        for (path, prior, created) in switched.iter().rev() {
+    let rollback = |switched: &[(&PathBuf, String, &str, bool)]| {
+        for (path, prior, branch, created) in switched.iter().rev() {
+            // The allocation is failing: its `.claude/` exclude block goes
+            // with it, whether or not the checkout can be put back. Only one
+            // that actually switched added a block; a checkout that was
+            // already on the branch may carry a LIVE allocation's block.
+            if prior.as_str() != *branch {
+                shared_branch_restore::remove_allocation_excludes(path, branch);
+            }
             if let Err(e) = run_git_command(path, &["checkout", prior]) {
                 warn!(
                     "shared_branch rollback: could not return {} to '{prior}': {e}",
@@ -2889,7 +2907,7 @@ fn checkout_shared_branches(
                 );
                 continue;
             }
-            if let Some(branch) = created {
+            if *created {
                 if let Err(e) = run_git_command(path, &["branch", "-D", branch]) {
                     warn!(
                         "shared_branch rollback: could not delete '{branch}' in {}: {e}",
@@ -2917,13 +2935,39 @@ fn checkout_shared_branches(
         // from a separate probe: a failed probe must not read as "absent" and
         // license force-deleting a branch that already existed.
         let created = match checkout_shared_branch(canonical, &w.branch, &w.parent_sha) {
-            Ok(created) => created.then_some(w.branch.as_str()),
+            Ok(created) => created,
             Err(e) => {
                 rollback(&switched);
                 return Err(fail(e));
             }
         };
-        switched.push((canonical, prior, created));
+        switched.push((canonical, prior.clone(), w.branch.as_str(), created));
+        // The post-switch HEAD is what a refused spawn's restore proves it is
+        // still at. Unreadable means that restore could never act, so the
+        // switch is put back now instead, like a checkout whose prior ref
+        // could not be read.
+        let switched_to_sha = match run_git_command(canonical, &["rev-parse", "HEAD"])
+            .map(|s| s.trim().to_string())
+        {
+            Ok(sha) if !sha.is_empty() => sha,
+            Ok(_) => {
+                rollback(&switched);
+                return Err(fail(
+                    "`git rev-parse HEAD` printed nothing after the switch".into(),
+                ));
+            }
+            Err(e) => {
+                rollback(&switched);
+                return Err(fail(format!(
+                    "cannot read HEAD after the switch, so a refused spawn could not restore \
+                     it: {e}"
+                )));
+            }
+        };
+        // The session provisioned into this checkout writes `.mcp.json`,
+        // `.coord-mcp-status` and the fleet `.claude/` bundle into it; exclude
+        // exactly those here so a refused spawn's restore finds it clean.
+        shared_branch_restore::prepare_canonical_excludes(canonical, &prior, &w.branch);
         let push_ref = if w.push_ref.is_empty() {
             remote_agent_ref(&w.branch)
         } else {
@@ -2936,6 +2980,8 @@ fn checkout_shared_branches(
             checkout_path: (*canonical).clone(),
             push_ref,
             parent_sha_provenance: w.parent_sha_provenance.clone(),
+            prior_ref: prior,
+            switched_to_sha,
         });
     }
     Ok(branches)

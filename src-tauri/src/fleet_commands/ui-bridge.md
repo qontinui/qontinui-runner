@@ -184,11 +184,18 @@ curl -s -X POST $BASE/control/element/<id>/action -H "Content-Type: application/
 # Type text (with optional clear-first and keystroke delay)
 curl -s -X POST $BASE/control/element/<id>/action -H "Content-Type: application/json" -d '{"action": "type", "params": {"text": "value", "clear": true}}'
 
-# Clear / Focus / Blur / Hover
+# Clear / Focus / Blur
 curl -s -X POST $BASE/control/element/<id>/action -H "Content-Type: application/json" -d '{"action": "clear"}'
 curl -s -X POST $BASE/control/element/<id>/action -H "Content-Type: application/json" -d '{"action": "focus"}'
 curl -s -X POST $BASE/control/element/<id>/action -H "Content-Type: application/json" -d '{"action": "blur"}'
+
+# Hover: forces the real CSS :hover state (group-hover / hover: rules apply) and HOLDS it
+# until unhover, the next hover/hoverClick, a dispatched write-class action, or the TTL
+# (params.holdMs, default 30000, ceiling 300000).
 curl -s -X POST $BASE/control/element/<id>/action -H "Content-Type: application/json" -d '{"action": "hover"}'
+curl -s -X POST $BASE/control/element/<id>/action -H "Content-Type: application/json" -d '{"action": "hover", "params": {"holdMs": 5000}}'
+# Unhover: releases the page's one forced hover, whichever element it names (a no-op success when none is held)
+curl -s -X POST $BASE/control/element/<id>/action -H "Content-Type: application/json" -d '{"action": "unhover"}'
 
 # Select dropdown option
 curl -s -X POST $BASE/control/element/<id>/action -H "Content-Type: application/json" -d '{"action": "select", "params": {"value": "option1"}}'
@@ -211,6 +218,24 @@ curl -s -X POST $BASE/control/element/<id>/action -H "Content-Type: application/
 # Send keyboard events (works with xterm.js terminals, canvas elements, etc.)
 curl -s -X POST $BASE/control/element/<id>/action -H "Content-Type: application/json" -d '{"action": "sendKeys", "params": {"keys": [{"key": "a"}, {"key": "Enter"}, {"key": "v", "modifiers": {"ctrl": true}}]}}'
 ```
+
+**Reading a hover.** `hover`, `hoverClick` and `unhover` (`@qontinui/ui-bridge`
+0.38.0 and later) answer with a `forcedHover` report. `forcedHover.applied`
+says what the hover forced. `revealed` lists the registered elements whose
+`opacity`, `visibility`, `display` or `pointer-events` changed, before and
+after, so it tells you which controls the hover uncovered. `settled` is `true`,
+`false` (the settle timed out) or `"frame-only"`. When `unreadableSheets` is
+above 0, or `complete` is `false`, some `:hover` rules could not be forced, so
+the reveal is UNKNOWN-complete, not clean. `forcedHover.released` says what a
+release did. Its `restore` is `verified` when every revealed element reads its
+before-hover values again and no rewritten selector was changed. It is
+`restored_with_drift` when one does not (see `drift`) or the app changed a
+rewritten selector during the hold (see `selectorDrift`), and `nothing_held`
+for an `unhover` with nothing to release. A held hover
+lets a `click` on a revealed control pass the pointer-events check, and that
+click then releases the hover. Read-only actions (`scroll`, `scrollIntoView`,
+`focus`, `blur`) keep it held. App JavaScript that reads `el.matches(':hover')`
+still sees `false`.
 
 ### JavaScript Evaluation
 
@@ -358,7 +383,7 @@ Each element in the snapshot contains:
 | `id` | Element identifier (used in `/element/<id>/action`) |
 | `element_type` | button, input, link, select, checkbox, etc. |
 | `label` | Human-readable label |
-| `actions` | Available actions: click, type, focus, clear, hover |
+| `actions` | Available actions, e.g. click, type, focus, clear, hover, unhover |
 | `state.visible` | Whether element is visible |
 | `state.enabled` | Whether element is enabled/interactive |
 | `state.value` | Current input value |

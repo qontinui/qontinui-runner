@@ -224,7 +224,13 @@ const EXPECTED_EXEMPTIONS: &[(&str, &str, usize)] = &[
     // POST arm, one of which executes — spelled as two builder calls rather
     // than `client.request(method, url)` precisely so this scan can still see
     // them.
-    ("mcp_api.rs", "forwarder", 5),
+    //
+    // 5 -> 4 + 1 with the mcp_api split (plan
+    // `2026-10-04-runner-mcp-api-rs-holds-the-http-composition-root-health-and-five-proxies-in-one-file`
+    // Phase 2): the VCS-PR forwarder moved verbatim into `mcp_api/vcs_pr.rs`.
+    // Relocated, not added: the total stays 5.
+    ("mcp_api.rs", "forwarder", 4),
+    ("mcp_api/vcs_pr.rs", "forwarder", 1),
     ("memory/memory_synthesis.rs", "not-coord", 2),
     ("memory/tenant_sync.rs", "not-coord", 1),
     (
@@ -235,6 +241,13 @@ const EXPECTED_EXEMPTIONS: &[(&str, &str, usize)] = &[
     ("orchestration_loop/coord_gate.rs", "device-jwt-required", 1),
     ("pair.rs", "bootstrap", 1),
     ("pair.rs", "not-coord", 2),
+    // The session census's whole-device snapshot POST (plan
+    // `2026-10-01-a-commit-author-session-is-unreachable-because-every-session-roster-is-per-account`
+    // Phase 2). It presents the paired-device JWT it resolved itself via
+    // `device_bearer_scoped(TenantScope::Device)` and returns before the POST
+    // when there is none: coord's ingest 403s any other credential, so the
+    // fail-soft defaulting helper (which would send anonymously) is wrong here.
+    ("session/census.rs", "device-jwt-required", 1),
     // The session-identity reporter's POST to coord's
     // /coord/session-identity/:device_id (plan
     // `2026-10-19-session-lookup-by-name-shows-claude-account-in-web` Phase 2).

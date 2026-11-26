@@ -226,6 +226,17 @@ pub struct ClaudeCliSettings {
     /// of sitting idle at the input box. Manual migrations honor it too.
     #[serde(default = "default_auto_continue_after_migration")]
     pub auto_continue_after_migration: bool,
+    /// Continue a terminal Claude session in place once the usage limit it
+    /// stopped at has reset: a session whose transcript ends at a usage-limit
+    /// stop, on an account a fresh probe says is no longer exhausted, gets one
+    /// continue prompt (once its CLI is idle) instead of sitting idle. A stop
+    /// whose reset is still ahead is parked until then. Independent of
+    /// `auto_migrate_on_token_exhaustion`, and works with a single account
+    /// (`terminal::limit_reset`; plan
+    /// 2026-11-05-runner-terminal-pages-collide-crowd-and-overfill-and-limit-stalled-sessions-never-resume
+    /// Phase 2).
+    #[serde(default = "default_auto_continue_after_limit_reset")]
+    pub auto_continue_after_limit_reset: bool,
     /// Let the runner install Claude Code CLI updates on this machine
     /// (`crate::claude_cli_update`): one runner-side updater installs a newly
     /// published release once, when it is newer than the installed one. Every
@@ -246,6 +257,10 @@ fn default_auto_continue_after_migration() -> bool {
     true
 }
 
+fn default_auto_continue_after_limit_reset() -> bool {
+    true
+}
+
 fn default_runner_manages_cli_updates() -> bool {
     true
 }
@@ -261,6 +276,7 @@ impl Default for ClaudeCliSettings {
             account_selection_pinned: false,
             auto_migrate_on_token_exhaustion: default_auto_migrate_on_token_exhaustion(),
             auto_continue_after_migration: default_auto_continue_after_migration(),
+            auto_continue_after_limit_reset: default_auto_continue_after_limit_reset(),
             runner_manages_cli_updates: default_runner_manages_cli_updates(),
         }
     }
@@ -2592,9 +2608,14 @@ mod ci_node_tests {
             cpus: 48,
         };
         let mut ci = CiNodeSettings::default();
-        assert_eq!(ci.configured_or_suggested_builds(big), 12);
-        assert_eq!(ci.effective_max_concurrent_builds_for(big), 12);
+        // Unset: the suggestion it is handed (pure — no process-global read).
+        let suggested = crate::ci_node::host_sizing::suggested_concurrent_builds(big);
+        assert_eq!(suggested, 12);
+        assert_eq!(ci.configured_or(suggested), 12);
+        assert_eq!(ci.effective_max_concurrent_builds_with(suggested), 12);
+        assert_eq!(ci.effective_max_concurrent_builds_with(0), 1);
         ci.max_concurrent_builds = Some(3);
+        assert_eq!(ci.configured_or(suggested), 3);
         assert_eq!(ci.configured_or_suggested_builds(big), 3);
         assert_eq!(ci.effective_max_concurrent_builds_for(big), 3);
         assert_eq!(ci.effective_max_concurrent_builds(), 3);
@@ -2604,6 +2625,27 @@ mod ci_node_tests {
         assert_eq!(ci.effective_max_concurrent_builds(), 1);
         ci.max_concurrent_builds = None;
         assert!(ci.effective_max_concurrent_builds() >= 1);
+    }
+
+    /// Plan 2026-11-05 Phase 7: the model's admitted total falls below the
+    /// static suggestion on a busy box and never rises above it, so one
+    /// dispatch's host share stays a static slot's — and an explicit value is
+    /// still the operator's lever for fewer, fatter builds.
+    #[test]
+    fn a_dispatch_share_is_the_static_partition_unless_the_operator_says_so() {
+        use crate::ci_node::host_sizing::HostCapacity;
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let big = HostCapacity {
+            mem_bytes: Some(368 * GIB),
+            cpus: 48,
+        };
+        let mut ci = CiNodeSettings::default();
+        // Static suggestion 12: every unset dispatch is sized as a 1/12 share.
+        assert_eq!(ci.dispatch_share_for(big), 12);
+        ci.max_concurrent_builds = Some(3);
+        assert_eq!(ci.dispatch_share_for(big), 3);
+        ci.max_concurrent_builds = Some(0);
+        assert_eq!(ci.dispatch_share_for(big), 1);
     }
 }
 
@@ -3043,12 +3085,14 @@ pub struct CiNodeSettings {
     /// advertised via the device budget POST when enabled.
     ///
     /// `None` (the default, and what a missing key loads as) means "never
-    /// configured — use the host's suggestion"
-    /// ([`crate::ci_node::host_sizing::suggested_concurrent_builds`]).
+    /// configured — use the host's suggestion": the capacity model's answer
+    /// for this device when it answers, else the static formula
+    /// ([`crate::ci_node::host_sizing::suggested_concurrent_builds_now`]).
     /// `Some(n)` is an explicit operator value and always wins; an existing
-    /// settings.json carrying a number stays explicit. Read it through
-    /// [`CiNodeSettings::effective_max_concurrent_builds`], never directly, so
-    /// the advertised and admitted numbers cannot diverge.
+    /// settings.json carrying a number stays explicit. Read it through the
+    /// accessors on [`CiNodeSettings`], never directly: the number the budget
+    /// publish advertises and the number admission admits both resolve through
+    /// [`CiNodeSettings::configured_or`].
     ///
     /// `None` is OMITTED on disk rather than written as `null`: an older runner
     /// build reading this file (a rollback) treats a missing key as its own
@@ -3088,24 +3132,55 @@ fn default_ci_node_min_free_disk_gb() -> u64 {
 }
 
 impl CiNodeSettings {
-    /// The CI slot count this node ADVERTISES for `host`: the explicit value
-    /// verbatim (including a deliberate `0`, an opinion the budget publish must
-    /// carry), else the host suggestion. Pure — `fleet::build_budget_request`
-    /// reads this.
+    /// The explicit value verbatim (including a deliberate `0`, an opinion the
+    /// budget publish must carry), else `suggested`. PURE.
+    pub(crate) fn configured_or(&self, suggested: u32) -> u32 {
+        self.max_concurrent_builds.unwrap_or(suggested)
+    }
+
+    /// The CI slot count this node ADVERTISES and admits for `host` now: the
+    /// explicit value, else the suggestion — the capacity model's Lane B total
+    /// when it answers, else the static host formula
+    /// ([`crate::ci_node::host_sizing::suggested_concurrent_builds_now`], plan
+    /// `2026-11-05-one-free-resource-model-places-sessions-builds-and-ci`
+    /// Phase 7). NOT pure: an unset value reads the cached capacity row and
+    /// dial and the CI node's running set (`ci_state`'s lock, so never call it
+    /// holding that lock); an explicit one reads nothing.
     pub(crate) fn configured_or_suggested_builds(
         &self,
         host: crate::ci_node::host_sizing::HostCapacity,
     ) -> u32 {
         match self.max_concurrent_builds {
             Some(n) => n,
-            None => crate::ci_node::host_sizing::suggested_concurrent_builds(host),
+            None => crate::ci_node::host_sizing::suggested_concurrent_builds_now(host).0,
         }
     }
 
-    /// The concurrency the executor ADMITS against for `host` — the same
-    /// number as [`Self::configured_or_suggested_builds`], floored at 1 exactly
-    /// as admission always has been (and as coord's `ci_dispatch` floors it).
-    /// Pure.
+    /// The N of equal host shares the executor sizes ONE dispatch's cargo jobs
+    /// and test threads from (`host_sizing::share`): the explicit value, the
+    /// operator's lever for fewer, fatter builds, else the static host
+    /// suggestion — the partition the capacity model's admitted total never
+    /// exceeds, so N shares never oversubscribe the host. PURE.
+    pub(crate) fn dispatch_share_for(
+        &self,
+        host: crate::ci_node::host_sizing::HostCapacity,
+    ) -> u32 {
+        match self.max_concurrent_builds {
+            Some(n) => n.max(1),
+            None => crate::ci_node::host_sizing::suggested_concurrent_builds(host).max(1),
+        }
+    }
+
+    /// The concurrency the executor ADMITS against, given the resolved
+    /// `suggested` count: [`Self::configured_or`] floored at 1 exactly as
+    /// admission always has been (and as coord's `ci_dispatch` floors it). PURE.
+    pub(crate) fn effective_max_concurrent_builds_with(&self, suggested: u32) -> u32 {
+        self.configured_or(suggested).max(1)
+    }
+
+    /// [`Self::effective_max_concurrent_builds_with`] the suggestion for `host`
+    /// now ([`Self::configured_or_suggested_builds`]) — NOT pure, the same
+    /// reads.
     pub(crate) fn effective_max_concurrent_builds_for(
         &self,
         host: crate::ci_node::host_sizing::HostCapacity,
@@ -3114,7 +3189,9 @@ impl CiNodeSettings {
     }
 
     /// [`Self::effective_max_concurrent_builds_for`] against the live host.
-    /// An explicit value never touches the host; only `None` probes it.
+    /// An explicit value never touches the host; only `None` probes it — and
+    /// then also reads the cached capacity model and takes the CI node's
+    /// `ci_state` lock (NOT pure; never call it holding that lock).
     pub fn effective_max_concurrent_builds(&self) -> u32 {
         match self.max_concurrent_builds {
             Some(n) => n.max(1),
@@ -4194,6 +4271,13 @@ pub struct PerformanceSettings {
     /// throttle or refuse a spawn, and nothing may (plan §5).
     #[serde(default = "default_max_sessions_warn")]
     pub max_sessions_warn: u32,
+    /// Let the terminal page strip remove EMPTY pages the runner created on
+    /// its own (`origin: "auto"`) once restore has settled (plan
+    /// `2026-11-05-runner-terminal-pages-collide-crowd-and-overfill-and-limit-stalled-sessions-never-resume`
+    /// Phase 6). Read only by the webview (`useTerminalPages`); operator-made
+    /// pages are never pruned whatever this says. Default `true`.
+    #[serde(default = "default_prune_empty_auto_pages")]
+    pub prune_empty_auto_pages: bool,
 }
 
 /// Floor for [`PerformanceSettings::grid_scan_interval_ms`]. Mirrors the
@@ -4232,6 +4316,10 @@ fn default_share_terminal_output() -> bool {
 
 fn default_max_sessions_warn() -> u32 {
     30
+}
+
+fn default_prune_empty_auto_pages() -> bool {
+    true
 }
 
 impl Default for PerformanceSettings {
@@ -4619,7 +4707,15 @@ pub(crate) fn resolve_settings_path() -> Result<PathBuf, String> {
 
 /// [`resolve_settings_path`] **plus** the `create_dir_all` of its parent — for
 /// callers about to write the file ([`save_settings`]).
+///
+/// In a test binary a thread holding no `env_lock` is refused here, BEFORE the
+/// `create_dir_all`, so a refused write creates nothing
+/// ([`qontinui_runner_lib::env_write_gate`]).
 pub(crate) fn get_settings_path() -> Result<PathBuf, String> {
+    qontinui_runner_lib::env_write_gate::check(
+        "settings::get_settings_path",
+        resolve_settings_path().ok().as_deref(),
+    )?;
     let (dir, _config_dir_source) = get_config_dir()?;
     Ok(dir.join(SETTINGS_FILE))
 }
@@ -5269,7 +5365,16 @@ pub fn load_settings_full() -> LoadedSettings {
             );
         }
     }
-    if should_persist_migration(needs_persist, is_secondary, provenance) {
+    // The env-write gate beside the pure predicate: in a test binary, a thread
+    // holding no `env_lock` skips the persist quietly (the gate reports it), so
+    // a FreshInstall load cannot write into another test's fixture.
+    if should_persist_migration(needs_persist, is_secondary, provenance)
+        && qontinui_runner_lib::env_write_gate::check(
+            "settings::load_settings_full",
+            resolve_settings_path().ok().as_deref(),
+        )
+        .is_ok()
+    {
         let to_persist = document_to_persist(&on_disk, &settings, tier_migration);
         if let Err(e) = save_settings(&to_persist) {
             error!("Failed to persist tier/local_user_id migration: {}", e);
@@ -5361,6 +5466,12 @@ pub fn update_settings<F>(mutate: F) -> Result<(), String>
 where
     F: FnOnce(&mut Settings),
 {
+    // Gated before the read, so a refused update neither reads nor writes
+    // ([`qontinui_runner_lib::env_write_gate`]).
+    qontinui_runner_lib::env_write_gate::check(
+        "settings::update_settings",
+        resolve_settings_path().ok().as_deref(),
+    )?;
     let loaded = read_settings_from_disk();
     if !loaded.is_authoritative() {
         let msg = loaded.unreadable_message();
@@ -7173,6 +7284,7 @@ mod performance_settings_tests {
             "None keeps redaction following share_output, as before"
         );
         assert_eq!(p.max_sessions_warn, 30);
+        assert!(p.prune_empty_auto_pages, "the prune ships enabled");
     }
 
     /// A settings.json written before this key existed must load with every
@@ -7216,6 +7328,7 @@ mod performance_settings_tests {
             share_terminal_output: false,
             redact_terminal_secrets: Some(true),
             max_sessions_warn: 50,
+            prune_empty_auto_pages: false,
         };
         let json = serde_json::to_string(&original).expect("serialize");
         let back: PerformanceSettings = serde_json::from_str(&json).expect("deserialize");
