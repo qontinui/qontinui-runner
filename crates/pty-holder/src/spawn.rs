@@ -184,6 +184,47 @@ pub fn cgroup_is_in_systemd_unit(cgroup_file: &str) -> bool {
     })
 }
 
+/// Whether a holder whose `/proc/<pid>/cgroup` reads `holder_cgroup` is inside
+/// the systemd unit cgroup the runner (`runner_cgroup`) is in, and so dies
+/// when that unit stops: the holder's path is the unit's own path or below it
+/// (a unit's stop kills its whole subtree, a leaf the runner moved itself
+/// into included). A runner outside any unit has no unit to share. The
+/// comparison is on the unified (`0::`) line's path, falling back to the
+/// whole file when there is none.
+pub fn shares_runner_unit_cgroup(runner_cgroup: &str, holder_cgroup: &str) -> bool {
+    fn path(c: &str) -> &str {
+        c.lines()
+            .find_map(|l| l.strip_prefix("0::"))
+            .unwrap_or(c)
+            .trim()
+    }
+    if !cgroup_is_in_systemd_unit(runner_cgroup) {
+        return false;
+    }
+    let runner = path(runner_cgroup);
+    // The runner's unit: its path cut after the deepest unit component.
+    let parts: Vec<&str> = runner.split('/').collect();
+    let Some(last_unit) = parts
+        .iter()
+        .rposition(|c| c.ends_with(".service") || c.ends_with(".scope"))
+    else {
+        return false;
+    };
+    let unit = parts[..=last_unit].join("/");
+    let holder = path(holder_cgroup);
+    holder == unit || holder.starts_with(&format!("{unit}/"))
+}
+
+/// Read [`shares_runner_unit_cgroup`] for a live holder `holder_pid` against
+/// this process. `None` when either cgroup file cannot be read (not Linux, or
+/// the holder is gone): UNKNOWN, which the caller must not report as safe
+/// on its own authority.
+pub fn holder_shares_runner_unit_cgroup(holder_pid: u32) -> Option<bool> {
+    let own = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let holder = std::fs::read_to_string(format!("/proc/{holder_pid}/cgroup")).ok()?;
+    Some(shares_runner_unit_cgroup(&own, &holder))
+}
+
 /// `systemd-run` on `$PATH`, if any.
 pub fn find_systemd_run() -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
@@ -1364,6 +1405,37 @@ mod tests {
         ));
         assert!(!cgroup_is_in_systemd_unit("0::/\n"));
         assert!(!cgroup_is_in_systemd_unit(""));
+    }
+
+    #[test]
+    fn pty_holder_spawn_a_holder_shares_the_runner_unit_only_in_the_same_unit_cgroup() {
+        let runner =
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/qontinui-runner.service\n";
+        // A plain spawn inside the runner's unit: dies with it.
+        assert!(shares_runner_unit_cgroup(runner, runner));
+        // Its own transient scope: survives the unit.
+        assert!(!shares_runner_unit_cgroup(
+            runner,
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/qontinui-pty-holder-p1.scope\n"
+        ));
+        // Below the unit (a sub-cgroup of it), or the runner in a leaf of its
+        // own unit beside the holder: the unit's stop kills both.
+        assert!(shares_runner_unit_cgroup(
+            runner,
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/qontinui-runner.service/x\n"
+        ));
+        assert!(shares_runner_unit_cgroup(
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/qontinui-runner.service/main\n",
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/qontinui-runner.service/other\n"
+        ));
+        // A name that only starts like the unit is another unit.
+        assert!(!shares_runner_unit_cgroup(
+            runner,
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/qontinui-runner.service2\n"
+        ));
+        // A runner outside any unit (a login shell) has no unit to share.
+        let shell = "0::/user.slice/user-1000.slice/session-3.scope\n";
+        assert!(!shares_runner_unit_cgroup(shell, shell));
     }
 
     #[test]

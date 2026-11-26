@@ -9,8 +9,9 @@
 //! D7 / Phase 5b moved it HERE, because the holder's child spawn hit the same
 //! reinstall window (10 of the 11 nawa in-process fallbacks of
 //! 2026-11-13..23 were `Unable to spawn .../bin/claude because it doesn't
-//! exist`) and this crate cannot depend on the runner crate. One definition,
-//! two spawners: the runner re-exports [`transient_kind`].
+//! exist`, measured in that plan's "Silent holder fallback to an
+//! in-process PTY" finding) and this crate cannot depend on the runner crate.
+//! One definition, two spawners: the runner re-exports [`transient_kind`].
 //!
 //! The Claude Code CLI's auto-updater, on an npm-global install, renames
 //! `bin/claude` and the package dir aside before reinstalling them, so for

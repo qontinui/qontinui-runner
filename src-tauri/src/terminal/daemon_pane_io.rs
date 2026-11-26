@@ -104,8 +104,8 @@ use qontinui_pty_holder::frame::SyntheticPart;
 use qontinui_pty_holder::protocol::{ExitReply, Reply, Request, RestoreMeta};
 use qontinui_pty_holder::terminate::{terminate_verified_holder, Termination};
 use qontinui_runner_lib::pty_holder::spawn::{
-    pane_dir_in, resolve_holder_exe, spawn_pane_holder, PaneId, SpawnError, Unprotected,
-    NEW_TAB_SPAWN_BUDGET,
+    holder_shares_runner_unit_cgroup, pane_dir_in, resolve_holder_exe, spawn_pane_holder, PaneId,
+    SpawnError, Unprotected, NEW_TAB_SPAWN_BUDGET,
 };
 use tracing::{debug, info, warn};
 
@@ -216,16 +216,21 @@ pub enum NotUpgradeSafe {
     /// A holder owns the PTY, but it shares the runner's systemd unit cgroup
     /// and dies when that unit stops or restarts.
     UnprotectedCgroup { detail: String },
+    /// A holder owns the PTY, but this runner adopted it and could not read
+    /// its cgroup, so whether it dies with the runner's unit is UNKNOWN --
+    /// never reported as safe.
+    CgroupUnknown { detail: String },
 }
 
 impl NotUpgradeSafe {
     /// The reason as one token (`holder_disabled`, `holder_spawn_failed`,
-    /// `unprotected_cgroup`), for counts.
+    /// `unprotected_cgroup`, `cgroup_unknown`), for counts.
     pub fn as_str(&self) -> &'static str {
         match self {
             NotUpgradeSafe::HolderDisabled => "holder_disabled",
             NotUpgradeSafe::HolderSpawnFailed { .. } => "holder_spawn_failed",
             NotUpgradeSafe::UnprotectedCgroup { .. } => "unprotected_cgroup",
+            NotUpgradeSafe::CgroupUnknown { .. } => "cgroup_unknown",
         }
     }
 }
@@ -258,6 +263,24 @@ impl HolderState {
             upgrade_safe: why.is_none(),
             not_upgrade_safe: why,
         }
+    }
+
+    /// An ADOPTED holder pane: `shares` is the cgroup measurement
+    /// ([`holder_shares_runner_unit_cgroup`]) taken at adoption. `None` (the
+    /// cgroup could not be read) is not upgrade-safe: unknown, not safe.
+    pub fn adopted(unprotected: Option<&Unprotected>, cgroup_measured: bool) -> Self {
+        if unprotected.is_none() && !cgroup_measured {
+            return HolderState {
+                holder: true,
+                upgrade_safe: false,
+                not_upgrade_safe: Some(NotUpgradeSafe::CgroupUnknown {
+                    detail: "the adopted holder's cgroup could not be read, so whether it dies \
+                             with the runner's unit is unknown"
+                        .to_string(),
+                }),
+            };
+        }
+        Self::holder(unprotected)
     }
 
     /// An in-process pane, for `why`.
@@ -1181,6 +1204,9 @@ pub struct DaemonPaneIo {
     /// connection starts unpaused).
     paused: Arc<AtomicBool>,
     unprotected: Option<Unprotected>,
+    /// `false` when this pane was adopted ([`Self::attach_existing`]) and its
+    /// holder's cgroup could not be read; `true` otherwise.
+    cgroup_measured: bool,
     /// The holder's restore metadata, when this pane attached with a restore
     /// ([`Self::attach_existing`]) and the holder could answer one.
     restored: Option<RestoreMeta>,
@@ -1373,7 +1399,28 @@ impl DaemonPaneIo {
             Some((cols, rows)) => RestoreAt::Fitted(cols, rows),
             None => RestoreAt::PtySize,
         };
-        Self::attach(pane_dir, pane_id, from_offset, None, Some(restore))
+        let mut io = Self::attach(pane_dir, pane_id, from_offset, None, Some(restore))?;
+        // This side did not see the spawn's route, so measure it: a holder
+        // still in the runner's own unit cgroup (a self-managed upgrade
+        // replaces the runner without stopping the unit) dies when the unit
+        // stops, exactly as a fresh plain spawn would.
+        match holder_shares_runner_unit_cgroup(io.holder_pid()) {
+            Some(true) => {
+                io.unprotected = Some(Unprotected::Cgroup {
+                    fallback_reason: None,
+                })
+            }
+            Some(false) => {}
+            None => {
+                warn!(
+                    pane = %pane_id,
+                    holder_pid = io.holder_pid(),
+                    "terminal: an adopted holder's cgroup could not be read; it is reported not upgrade-safe (unknown)"
+                );
+                io.cgroup_measured = false;
+            }
+        }
+        Ok(io)
     }
 
     /// `restore_at`: `Some` for a fresh consumer — ask for the restore
@@ -1503,6 +1550,7 @@ impl DaemonPaneIo {
             rows,
             paused,
             unprotected,
+            cgroup_measured: true,
             restored: info.restore,
             kill_settle: KILL_SETTLE_MAX,
         })
@@ -1532,6 +1580,11 @@ impl DaemonPaneIo {
     /// it survives (the holder shares the runner's systemd unit cgroup).
     pub fn unprotected(&self) -> Option<&Unprotected> {
         self.unprotected.as_ref()
+    }
+
+    /// `false` when this adopted pane's holder cgroup could not be read.
+    pub fn cgroup_measured(&self) -> bool {
+        self.cgroup_measured
     }
 
     /// The holder's restore metadata (`cwd`, `title`), when this pane was
@@ -2261,6 +2314,30 @@ pub fn kill_failed_notice(holder_pid: u32, child_pid: u32) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_adopted_holder_whose_cgroup_was_not_read_is_not_upgrade_safe() {
+        let unknown = HolderState::adopted(None, false);
+        assert!(unknown.holder);
+        assert!(!unknown.upgrade_safe);
+        assert_eq!(
+            unknown
+                .not_upgrade_safe
+                .as_ref()
+                .map(NotUpgradeSafe::as_str),
+            Some("cgroup_unknown")
+        );
+        // Measured outside the unit: safe. Measured inside: unprotected.
+        assert!(HolderState::adopted(None, true).upgrade_safe);
+        let inside = Unprotected::Cgroup {
+            fallback_reason: None,
+        };
+        let st = HolderState::adopted(Some(&inside), true);
+        assert_eq!(
+            st.not_upgrade_safe.as_ref().map(NotUpgradeSafe::as_str),
+            Some("unprotected_cgroup")
+        );
+    }
+
     use super::*;
 
     /// Records everything a pane sends.
@@ -2368,6 +2445,7 @@ mod tests {
             rows: Arc::new(AtomicU16::new(24)),
             paused: Arc::new(AtomicBool::new(false)),
             unprotected: None,
+            cgroup_measured: true,
             restored: None,
             kill_settle: KILL_SETTLE_MAX,
         }

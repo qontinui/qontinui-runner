@@ -12,7 +12,8 @@
 export type NotUpgradeSafe =
   | { reason: "holder_disabled" }
   | { reason: "holder_spawn_failed"; kind: string; detail: string }
-  | { reason: "unprotected_cgroup"; detail: string };
+  | { reason: "unprotected_cgroup"; detail: string }
+  | { reason: "cgroup_unknown"; detail: string };
 
 /** The runner's `HolderState` for one pane. */
 export interface HolderState {
@@ -52,6 +53,11 @@ export function notUpgradeSafeTooltip(state: HolderState | null | undefined): st
       return (
         "This pane's PTY holder shares the runner's systemd unit: stopping or " +
         `restarting that unit ends it (${why.detail}).`
+      );
+    case "cgroup_unknown":
+      return (
+        "This pane's PTY holder was adopted, but its cgroup could not be read: whether " +
+        "a runner upgrade or restart ends it is unknown."
       );
   }
 }

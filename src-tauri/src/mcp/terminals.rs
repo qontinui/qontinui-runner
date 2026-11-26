@@ -279,8 +279,9 @@ pub(crate) fn get_terminal_manager(state: &ApiState) -> Arc<TerminalManager> {
 /// `upgradeSafe` and `notUpgradeSafe` (plan
 /// `2026-11-24-runner-upgrades-itself-daily-keeping-sessions-alive-with-no-outage-and-automatic-rollback`
 /// D7): `holder: false` names, machine-readably, why the pane runs inside the
-/// runner (`holder_disabled`, `holder_spawn_failed` with its `kind`) and
-/// `unprotected_cgroup` a holder that dies with the runner's unit. A remote
+/// runner (`holder_disabled`, `holder_spawn_failed` with its `kind`),
+/// `unprotected_cgroup` a holder that dies with the runner's unit, and
+/// `cgroup_unknown` an adopted holder whose cgroup could not be read. A remote
 /// mirror carries none of the three keys.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -317,13 +318,10 @@ pub async fn list_terminals_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let terminal_manager = get_terminal_manager(&state);
-    let holder_states = terminal_manager
-        .holder_states()
+    let (rows, holder_states) = terminal_manager
+        .list_with_permission_request_hooks_and_holder_states()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
-    let terminals = terminal_list_entries(
-        terminal_manager.list_with_permission_request_hooks(),
-        &holder_states,
-    );
+    let terminals = terminal_list_entries(rows, &holder_states);
 
     Ok(Json(ApiResponse::success(serde_json::json!({
         "terminals": terminals
@@ -1594,7 +1592,7 @@ mod tests {
             .unwrap()
             .0;
         assert!(
-            body.contains("list_with_permission_request_hooks()"),
+            body.contains("list_with_permission_request_hooks_and_holder_states()"),
             "{body}"
         );
     }

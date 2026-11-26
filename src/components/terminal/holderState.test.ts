@@ -38,4 +38,14 @@ describe("notUpgradeSafeTooltip", () => {
       }),
     ).toContain("systemd unit");
   });
+
+  it("marks an adopted holder whose cgroup could not be read as unknown, not safe", () => {
+    expect(
+      notUpgradeSafeTooltip({
+        holder: true,
+        upgradeSafe: false,
+        notUpgradeSafe: { reason: "cgroup_unknown", detail: "unread" },
+      }),
+    ).toContain("unknown");
+  });
 });

@@ -47,6 +47,8 @@ const GUARDED: &[(&str, &str)] = &[
     ("sweep.rs", include_str!("sweep.rs")),
     // Phase 8: the holder upgrade carries the ring and the held input.
     ("handoff.rs", include_str!("handoff.rs")),
+    // Runner-upgrades Phase 5b: a child spawn that rides out a CLI reinstall.
+    ("transient.rs", include_str!("transient.rs")),
 ];
 
 /// Files deliberately outside the guard: this file (it must spell the banned

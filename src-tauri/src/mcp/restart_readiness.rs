@@ -587,7 +587,7 @@ pub struct NotUpgradeSafePanes {
     /// PTYs, by configuration or by fallback.
     pub non_holder_count: usize,
     /// `count` split by reason token (`holder_disabled`,
-    /// `holder_spawn_failed`, `unprotected_cgroup`).
+    /// `holder_spawn_failed`, `unprotected_cgroup`, `cgroup_unknown`).
     pub by_reason: std::collections::BTreeMap<&'static str, usize>,
     /// Per pane, ordered by terminal id.
     pub panes: Vec<NotUpgradeSafePane>,
