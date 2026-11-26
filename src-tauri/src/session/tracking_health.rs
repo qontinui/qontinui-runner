@@ -4048,6 +4048,7 @@ mod tests {
             class,
             chain: None,
             reason: String::new(),
+            stray: None,
         }
     }
 
@@ -4065,6 +4066,7 @@ mod tests {
                 admit,
                 children,
                 refusal: None,
+                pinned_by_strays: false,
             },
         )
     }

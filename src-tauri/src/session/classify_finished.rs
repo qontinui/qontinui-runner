@@ -604,6 +604,7 @@ mod tests {
             admit,
             children: Vec::new(),
             refusal: None,
+            pinned_by_strays: false,
         };
         let judged = vec![("a".to_string(), v(true)), ("b".to_string(), v(false))];
         let (log, next) = changed(&HashMap::new(), &judged);
@@ -622,6 +623,7 @@ mod tests {
             class,
             chain: None,
             reason: String::new(),
+            stray: None,
         }
     }
 
@@ -640,6 +642,7 @@ mod tests {
                 child(14, ChildClass::ShimOrPump),
             ],
             refusal: None,
+            pinned_by_strays: false,
         };
         assert_eq!(shim_pids(&verdict, &[11, 12, 13]), vec![11]);
         assert!(shim_pids(&verdict, &[12, 13]).is_empty());
@@ -649,6 +652,7 @@ mod tests {
             admit: false,
             children: Vec::new(),
             refusal: Some("claude 10 is missing from a table".to_string()),
+            pinned_by_strays: false,
         };
         assert!(shim_pids(&unbound, &[11]).is_empty());
     }
@@ -671,6 +675,7 @@ mod tests {
             class,
             chain: None,
             reason: String::new(),
+            stray: None,
         };
         let session = |children: Vec<ChildVerdict>, refusal: Option<&str>| {
             let admit =
@@ -680,6 +685,7 @@ mod tests {
                 admit,
                 children,
                 refusal: refusal.map(str::to_string),
+                pinned_by_strays: false,
             }
         };
         let judged = vec![
