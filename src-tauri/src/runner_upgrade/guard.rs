@@ -107,10 +107,8 @@ pub fn run_guard(record_path: &Path, fx: &dyn GuardEffects) -> Result<GuardOutco
     };
 
     if let Err(e) = fx.swap_link(&rec.current_link, &rec.from_dir) {
-        return fail(
-            &mut rec,
-            format!("re-point {}: {e}", rec.current_link.display()),
-        );
+        let msg = format!("re-point {}: {e}", rec.current_link.display());
+        return fail(&mut rec, msg);
     }
     match rec.restart.clone() {
         RestartTarget::SystemdUnit { unit } => {
