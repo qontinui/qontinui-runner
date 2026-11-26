@@ -274,6 +274,30 @@ pub fn pid_runs_with(pid: u32, flag: &str, value: &str) -> bool {
     }
 }
 
+/// `true` when `/proc/<pid>/stat` names a zombie (`Z`) or a dying (`X`)
+/// process. The state is the first field after the LAST `)`, since `comm`
+/// may itself contain `)`. An unreadable or unparsable stat is `false`
+/// (not proven dead), as is every pid off Linux.
+pub fn is_zombie(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                let rest = stat.get(stat.rfind(')')? + 1..)?;
+                rest.split_whitespace()
+                    .next()
+                    .map(|st| st == "Z" || st == "X")
+            })
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 /// `true` when the NUL-separated `cmdline` carries `flag` immediately followed
 /// by `value`.
 pub fn cmdline_has_pair(cmdline: &[u8], flag: &str, value: &str) -> bool {
@@ -283,8 +307,12 @@ pub fn cmdline_has_pair(cmdline: &[u8], flag: &str, value: &str) -> bool {
 }
 
 /// Is `pid` a live process? `kill(pid, 0)`: success, or `EPERM` (alive, not
-/// ours). Off Unix: `false` is never claimed — the caller gets `true` so it
-/// waits rather than racing a live process.
+/// ours). On Linux a zombie (`Z`, or `X` while it is torn down) is NOT alive:
+/// `kill(pid, 0)` succeeds on one until its parent reaps it, but it holds no
+/// socket and runs no code, so a process that has died waiting on a slow
+/// (or absent) reaper is dead to every caller here. Off Unix: `false` is
+/// never claimed — the caller gets `true` so it waits rather than racing a
+/// live process.
 pub fn pid_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
@@ -293,7 +321,8 @@ pub fn pid_alive(pid: u32) -> bool {
         };
         // SAFETY: signal 0 performs only the existence/permission check.
         let rc = unsafe { libc::kill(p, 0) };
-        rc == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        let exists = rc == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        exists && !is_zombie(pid)
     }
     #[cfg(not(unix))]
     {
@@ -305,6 +334,26 @@ pub fn pid_alive(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An exited child its parent has not reaped is a zombie: `kill(pid, 0)`
+    /// still succeeds on it, and `pid_alive` must still say dead.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unreaped_zombie_is_not_alive() {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !is_zombie(pid) {
+            assert!(Instant::now() < deadline, "{pid} never became a zombie");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // SAFETY: signal 0 only; the zombie still answers it.
+        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, 0);
+        assert!(!pid_alive(pid));
+        assert!(pid_alive(std::process::id()));
+        assert!(!is_zombie(std::process::id()));
+        child.wait().unwrap();
+    }
 
     #[test]
     fn a_pid_is_ours_only_when_its_command_line_carries_the_flag_and_record() {

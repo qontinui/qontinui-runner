@@ -177,7 +177,7 @@ pub async fn report_record(path: &Path, rec: &mut UpgradeRecord) {
                 }
                 Ok(Ok(false)) => info!(
                     id = %rec.id,
-                    "runner upgrade: the record moved on while its outcome was reported; its new state is reported in turn"
+                    "runner upgrade: the record moved on while its outcome was reported; its new state is reported on a later pass (a later report_pending retry, probation's re-read, or the next boot on this api port)"
                 ),
                 Ok(Err(e)) => {
                     warn!(error = %e, "runner upgrade: reported, but the record could not be marked")

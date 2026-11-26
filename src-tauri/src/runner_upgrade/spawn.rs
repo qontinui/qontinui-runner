@@ -250,4 +250,39 @@ mod tests {
             .unwrap_or(4_194_304);
         assert!(terminate(pid_max + 1, Duration::from_millis(10)).is_ok());
     }
+
+    /// A process that ignores SIGTERM outlives the grace, takes SIGKILL, and
+    /// `terminate` confirms that death before returning `Ok`.
+    #[test]
+    fn terminate_escalates_to_sigkill_and_confirms_the_death() {
+        // `trap "" TERM` sets SIGTERM to ignored, which `exec` keeps.
+        let child = std::process::Command::new("sh")
+            .args(["-c", "trap '' TERM; exec sleep 30"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        // Let the shell install the trap and exec before the signal lands.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .map(|c| c.trim() != "sleep")
+            .unwrap_or(false)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{pid} never exec'd sleep"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let started = std::time::Instant::now();
+        terminate(pid, Duration::from_millis(500)).unwrap();
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(500),
+            "SIGTERM was not ignored ({took:?})"
+        );
+        assert!(took < Duration::from_secs(5), "terminate took {took:?}");
+        // `terminate` reaped its own child, so the pid is free now and is
+        // deliberately not probed again (it could name a new process).
+        drop(child);
+    }
 }
