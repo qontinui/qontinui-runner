@@ -114,7 +114,7 @@ pub fn notification_body(rec: &UpgradeRecord) -> Value {
 
 /// Post one record's outcome; `Ok` only when BOTH writes were accepted.
 pub async fn post_outcome(rec: &UpgradeRecord) -> Result<(), String> {
-    let base = crate::profiles::connected_coord_base()
+    let base = qontinui_runner_lib::profiles::connected_coord_base()
         .ok_or_else(|| "no coord base configured".to_string())?;
     let client =
         crate::coord_http::coord_client().ok_or_else(|| "no coord HTTP client".to_string())?;

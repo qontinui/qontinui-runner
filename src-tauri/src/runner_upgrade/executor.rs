@@ -281,11 +281,8 @@ pub fn execute(p: ExecuteParams<'_>, fx: &dyn UpgradeEffects) -> Result<Executed
 
     // 3. Swap `current` to the candidate.
     if let Err(e) = fx.swap_link(&rec.current_link, &to_dir) {
-        return Err(abort(
-            &mut rec,
-            &undo,
-            format!("swap {}: {e}", rec.current_link.display()),
-        ));
+        let msg = format!("swap {}: {e}", rec.current_link.display());
+        return Err(abort(&mut rec, &undo, msg));
     }
     undo.link_back_to = Some(from_dir.clone());
 
