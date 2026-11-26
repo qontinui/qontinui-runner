@@ -181,12 +181,14 @@ jobs:
   # (14 runs of this repo sat queued for it on 2026-11-03), and a ubuntu leg
   # that ran in 41 min COLD on the pool (52-86 hosted), so it is not the next
   # bottleneck once the windows leg gets faster. The cost, under `auto` only:
-  # the windows leg waits for this job, which itself needs a hosted runner —
-  # ~13 s when hosted runners are free, but on 2026-11-03, with the org's
-  # hosted queue saturated, run 41646964958's `route` sat queued 10 m 40 s
-  # while the pool idled, and the windows leg then queued another 7 m 22 s,
-  # starting 18 min after the run was created. A forced lane skips this job
-  # entirely (below). `hosted` costs nothing. `self-hosted` adds no latency
+  # the ubuntu leg waits for this job. On 2026-11-03, when it still ran on a
+  # hosted runner and the org's hosted queue was saturated, run 41646964958's
+  # `route` sat queued 10 m 40 s while the pool idled (and the windows leg,
+  # then a matrix sibling of the ubuntu leg, queued another 7 m 22 s behind
+  # it). Since plan 2026-11-25-shard-runner-candidate-ci-after-moving-it-off-the-hosted-queue
+  # the windows leg is its own job, `test-windows`, waiting on `route-windows`
+  # only, and both route jobs run on the light self-hosted lane (below). A
+  # forced lane skips this job entirely (below). `hosted` costs nothing. `self-hosted` adds no latency
   # but gives up ALL of the router's overflow (pool down, stalled, saturated):
   # `timeout-minutes` does not count time spent queued, so a dead or full pool
   # holds the leg until a pool runner comes online or GitHub cancels a
@@ -264,14 +266,40 @@ jobs:
   # PRs on the pool it is the setting under which a PR burst can delay a
   # candidate: prefer `auto` while PR traffic is high.
   #
-  # This job stays HOSTED although it queued 10 m 40 s on 2026-11-03: both
-  # required `test (…)` legs need it, and `timeout-minutes` does not count
-  # queue time, so on a self-hosted label a down or saturated nawa would hold
-  # BOTH legs pending for up to 24 h with no fallback. Its hosted wait shrinks
-  # as the light guard workflows leave the hosted queue (RUNNER_CI_LIGHT_LANE).
+  # WHERE THIS JOB RUNS: the light self-hosted lane, as `frontend-tests`,
+  # `seam-gate` and `security` do (RUNNER_CI_LIGHT_LANE, override
+  # RUNNER_CI_LANE_CI), with the hosted `ubuntu-latest` fallback when that lane
+  # is not `self-hosted`. It used to stay hosted, and queued 10 m 40 s there on
+  # 2026-11-03 in front of a leg whose pool idled: a hosted route job
+  # re-imposes exactly the hosted queue that routing to the pool exists to
+  # remove (the candidate queue wait is measured in plan
+  # 2026-11-25-shard-runner-candidate-ci-after-moving-it-off-the-hosted-queue:
+  # 15 merge-candidate ci.yml runs, 45300645569..45607983048). The trade-off accepted: `timeout-minutes` does not count queue
+  # time, so a down or saturated light pool holds this job, and the leg that
+  # needs it, pending (up to GitHub's 24 h). That is the failure mode the
+  # required light-lane jobs above already accept, and the lane variable is the
+  # one switch that sends all of them back to hosted. ram-2g: a sparse checkout
+  # and one Python script, the class `seam-gate` declares.
+  #
+  # PER-EVENT THRESHOLDS. The router reads <prefix>_MAX_QUEUE_DEPTH and
+  # <prefix>_STALL_MINUTES from its env (route-ci-lane.py main(); unset, empty
+  # or non-positive falls back to its defaults, depth 4 and stall 10 min).
+  # They are set per event instead of left at the defaults:
+  #   - push (merge-candidate*/** and main): TOLERANT, depth 8 / stall 20 min,
+  #     both twice the default. A candidate is on the merge path, and the
+  #     alternative to waiting behind up to 7 queued pool legs is the hosted
+  #     queue (measured in the plan named above); it still falls to hosted once the
+  #     pool is SATURATED (>= 8 queued) or STALLED (a job queued >= 20 min),
+  #     so it never waits on a dead pool;
+  #   - pull_request: STRICT, depth 1 / stall 10 min. PR feedback is
+  #     advisory and hosted is free on this public repo, so a PR takes the pool
+  #     only when nothing is queued there, and leaves the slots to candidates.
+  # Explicit numbers in both arms, never '' (which would mean "the default").
+  # The router is a verbatim copy of ccfg's and is not edited for this.
   route:
     if: ${{ vars.RUNNER_CI_LINUX_LANE == 'auto' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
-    runs-on: ubuntu-latest
+    # coord-pools: [self-hosted, Linux, X64, qontinui-host-nawa, qontinui, ram-2g] | [ubuntu-latest]
+    runs-on: ${{ fromJSON(((vars.RUNNER_CI_LANE_CI || vars.RUNNER_CI_LIGHT_LANE) == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && '["self-hosted","Linux","X64","qontinui-host-nawa","qontinui","ram-2g"]' || '"ubuntu-latest"') }}
     timeout-minutes: 5
     permissions:
       contents: read
@@ -294,6 +322,9 @@ jobs:
           RUNNER_CI_LINUX_LANE_SOURCE: repo variable RUNNER_CI_LINUX_LANE
           RUNNER_CI_LINUX_HOSTED_LABEL: ubuntu-22.04
           RUNNER_CI_LINUX_RUN_ATTEMPT: ${{ github.run_attempt }}
+          # Per-event thresholds (see above): pull_request strict, push tolerant.
+          RUNNER_CI_LINUX_MAX_QUEUE_DEPTH: ${{ github.event_name == 'pull_request' && '1' || '8' }}
+          RUNNER_CI_LINUX_STALL_MINUTES: ${{ github.event_name == 'pull_request' && '10' || '20' }}
         run: >-
           python3 -B .github/scripts/route-ci-lane.py
           --self-hosted-labels self-hosted,Linux,X64,qontinui-runner-ci,ram-40g
@@ -338,7 +369,10 @@ jobs:
   # src-tauri/tests/ci_rust_test_steps_split.rs pins them equal.
   route-windows:
     if: ${{ github.event_name != 'pull_request' && vars.RUNNER_CI_WINDOWS_LANE == 'auto' }}
-    runs-on: ubuntu-latest
+    # Light self-hosted lane with the ubuntu-latest fallback, exactly as `route`
+    # (see "WHERE THIS JOB RUNS" there).
+    # coord-pools: [self-hosted, Linux, X64, qontinui-host-nawa, qontinui, ram-2g] | [ubuntu-latest]
+    runs-on: ${{ fromJSON(((vars.RUNNER_CI_LANE_CI || vars.RUNNER_CI_LIGHT_LANE) == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && '["self-hosted","Linux","X64","qontinui-host-nawa","qontinui","ram-2g"]' || '"ubuntu-latest"') }}
     timeout-minutes: 5
     permissions:
       contents: read
@@ -361,6 +395,12 @@ jobs:
           RUNNER_CI_WINDOWS_LANE_SOURCE: repo variable RUNNER_CI_WINDOWS_LANE
           RUNNER_CI_WINDOWS_HOSTED_LABEL: windows-latest
           RUNNER_CI_WINDOWS_RUN_ATTEMPT: ${{ github.run_attempt }}
+          # Per-event thresholds, the same pair as `route`'s. This job never
+          # runs on a pull_request (its `if:`), so only the push arm is live
+          # today; the strict arm keeps a PR off a tolerant threshold if that
+          # filter is ever lifted.
+          RUNNER_CI_WINDOWS_MAX_QUEUE_DEPTH: ${{ github.event_name == 'pull_request' && '1' || '8' }}
+          RUNNER_CI_WINDOWS_STALL_MINUTES: ${{ github.event_name == 'pull_request' && '10' || '20' }}
         run: >-
           python3 -B .github/scripts/route-ci-lane.py
           --self-hosted-labels self-hosted,Windows,X64,qontinui-runner-ci-windows,ram-40g
@@ -369,14 +409,30 @@ jobs:
           --default-lane hosted
           --hosted-on-rerun
 
+  # The Rust/Tauri test legs: `test` is the ubuntu leg and `test-windows`
+  # (after this job) the windows leg. They were one matrix job; a job's
+  # `needs:` cannot vary per matrix entry, so the windows leg waited on
+  # `route`, the ubuntu leg's router, as well as on its own `route-windows`.
+  # Split (plan 2026-11-25-shard-runner-candidate-ci-after-moving-it-off-the-hosted-queue,
+  # Phase 2), each leg waits only on its own router. The two jobs share ONE
+  # step list through the YAML anchor `test-steps` (GitHub Actions resolves
+  # anchors and aliases; ci-integrity.yml certifies them and refuses the merge
+  # key, which is not documented as supported by Actions and is refused because
+  # the guard's parser resolves it, plus alias expansions past its budget).
+  # Step-level `matrix.platform` /
+  # `runner.os` conditions keep working because each job still has a
+  # one-entry `platform` matrix. The required contexts stay
+  # `test (ubuntu-22.04)` and `test (windows-latest)`: both jobs are named
+  # `test (${{ matrix.platform }})`. ci_rust_test_steps_split.rs pins the
+  # split (needs, matrices, names, identical steps and job-level keys).
   test:
-    # `route` decides the ubuntu leg's pool and `route-windows` the windows
-    # leg's (see above). `!cancelled()` is load-bearing: `route` is SKIPPED on a
-    # fork PR or a non-`auto` lane, `route-windows` on every pull_request or a
-    # non-`auto` lane, and without it a job that needs a skipped job is skipped
-    # too, which would turn both required `test (…)` contexts into `skipped`
-    # (= passing to coord) on every PR.
-    needs: [route, route-windows]
+    name: test (${{ matrix.platform }})
+    # `route` decides this leg's pool (see above). `!cancelled()` is
+    # load-bearing: `route` is SKIPPED on a fork PR or a non-`auto` lane, and
+    # without it a job that needs a skipped job is skipped too, which would
+    # turn the required `test (ubuntu-22.04)` context into `skipped` (= passing
+    # to coord) on every PR.
+    needs: [route]
     if: ${{ !cancelled() }}
     strategy:
       # Surface platform-specific failures independently. Default fail-fast
@@ -388,30 +444,27 @@ jobs:
         # macOS temporarily disabled — PR cycle time was bottlenecked at
         # ~90 min p90 by the mac leg (see step-level timeout discussion
         # below). Joshua does not develop on macOS; re-add `macos-latest`
-        # when cross-platform demos / mac users matter.
-        platform: [ubuntu-22.04, windows-latest]
+        # when cross-platform demos / mac users matter. The windows leg is
+        # `test-windows` (below).
+        platform: [ubuntu-22.04]
 
-    # Each leg routes the same way through its own lane. On a FIRST attempt it
-    # goes to its pool when the lane is forced `self-hosted`, or where its route
-    # job said under `auto` (the `labels` output): `route` /
-    # RUNNER_CI_LINUX_LANE for the ubuntu leg, `route-windows` /
-    # RUNNER_CI_WINDOWS_LANE for the windows leg. The ubuntu leg routes
-    # same-repo pull_requests like pushes (decision record v4) and keeps only a
-    # FORK pull_request on the floor; the windows leg still keeps every
-    # pull_request on the floor. Everything else is the hosted floor too: any
-    # re-run, the `hosted`/unset lane, and a route job that produced nothing.
-    # The check names stay `test (ubuntu-22.04)` / `test (windows-latest)`:
-    # they come from the matrix value, not from the pool, and both are
-    # required contexts. Each pool's label set is spelled twice (here and in
-    # its route job's --self-hosted-labels); change both together.
-    # coord-pools: [self-hosted, Linux, X64, qontinui-runner-ci, ram-40g] | [ubuntu-22.04] | [self-hosted, Windows, X64, qontinui-runner-ci-windows, ram-40g] | [windows-latest]
-    runs-on: ${{ fromJSON(matrix.platform == 'windows-latest' && ((github.run_attempt == 1 && github.event_name != 'pull_request' && vars.RUNNER_CI_WINDOWS_LANE == 'self-hosted' && '["self-hosted","Windows","X64","qontinui-runner-ci-windows","ram-40g"]') || (github.run_attempt == 1 && needs['route-windows'].outputs.labels) || '["windows-latest"]') || (github.run_attempt == 1 && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.RUNNER_CI_LINUX_LANE == 'self-hosted' && '["self-hosted","Linux","X64","qontinui-runner-ci","ram-40g"]') || (github.run_attempt == 1 && needs.route.outputs.labels) || '["ubuntu-22.04"]') }}
+    # On a FIRST attempt this leg goes to the Linux pool when the lane is
+    # forced `self-hosted`, or where `route` said under `auto` (its `labels`
+    # output; RUNNER_CI_LINUX_LANE). Same-repo pull_requests route like pushes
+    # (decision record v4); a FORK pull_request stays on the floor.
+    # Everything else is the hosted floor too: any re-run, the `hosted`/unset
+    # lane, and a route job that produced nothing. The check name stays
+    # `test (ubuntu-22.04)`: it comes from the matrix value, not from the pool.
+    # The pool's label set is spelled twice (here and in `route`'s
+    # --self-hosted-labels); change both together.
+    # coord-pools: [self-hosted, Linux, X64, qontinui-runner-ci, ram-40g] | [ubuntu-22.04]
+    runs-on: ${{ fromJSON((github.run_attempt == 1 && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.RUNNER_CI_LINUX_LANE == 'self-hosted' && '["self-hosted","Linux","X64","qontinui-runner-ci","ram-40g"]') || (github.run_attempt == 1 && needs.route.outputs.labels) || '["ubuntu-22.04"]') }}
 
     # Backstop cap for any step in this job that is not individually bounded.
     # This job previously had NO job-level timeout, so the 4h24m apt hang above
     # was burning toward GitHub's *default* 360-minute ceiling — a value this
-    # repo never chose. One cap covers both matrix legs, so it is sized off the
-    # slower one. 90 sampled successful job runs, 2026-08-08..08-20: ubuntu
+    # repo never chose. One cap covers both legs (`test-windows` carries the
+    # same value, pinned equal), so it is sized off the slower one. 90 sampled successful job runs, 2026-08-08..08-20: ubuntu
     # p50 52.8m / p90 62.5m / max 112.0m; windows p50 73.8m / p90 87.2m /
     # p95 93.4m / max 110.6m. 150 min = windows p90 + ~60 min headroom, and
     # 1.34x the worst observed success across either leg — well clear of normal
@@ -450,7 +503,7 @@ jobs:
     # future change to either step bound has to move this line too.
     timeout-minutes: 180
 
-    steps:
+    steps: &test-steps
       # Full history, blobless: workspace_assumptions_are_enumerated.rs takes its
       # swap-rule base from `merge-base HEAD origin/main`, which a depth-1 clone
       # cannot compute (it would print SWAP RULE UNKNOWN and enforce nothing).
@@ -958,6 +1011,16 @@ jobs:
           # PRs still RESTORE main's cache (restore is unrestricted); their
           # refs are one-shot, so a per-ref save buys nothing.
           save-if: ${{ github.ref == 'refs/heads/main' }}
+          # The key segment rust-cache would otherwise take from the job id
+          # (`github.job`). These steps run as `test` AND `test-windows`, so
+          # without it the windows leg would save under `test-windows` and go
+          # cold on the first main run after the split, and so would
+          # published-parity.yml, which restores this cache by
+          # `shared-key: "test"` (and asserts this line is still here). The OS
+          # is already part of rust-cache's key, so the two legs never share
+          # an entry. `test` was the job id before the split, so the ubuntu
+          # key is unchanged too.
+          shared-key: "test"
 
       # The restore above can return a `postgresql_embedded` build unit whose
       # OUT_DIR embeds a different PostgreSQL release than the pin in
@@ -2188,7 +2251,35 @@ jobs:
             --anon-state-dir "$RUNNER_TEMP/qontinui-resource-report" \
             --disk-path "$GITHUB_WORKSPACE"
 
-  # Windows clippy, split OUT of the matrix `test` job so it no longer sits on
+  # The windows leg of the Rust/Tauri tests: the same steps as `test` (the
+  # `test-steps` anchor), with its own router and pool. See the comment above
+  # `test`. It waits on `route-windows` ONLY, never on `route`, so the longest
+  # required leg no longer queues behind the ubuntu leg's router.
+  test-windows:
+    name: test (${{ matrix.platform }})
+    # `!cancelled()` is load-bearing: `route-windows` is SKIPPED on every
+    # pull_request or a non-`auto` lane, and a job that needs a skipped job is
+    # skipped too, which would turn the required `test (windows-latest)`
+    # context into `skipped` (= passing to coord).
+    needs: [route-windows]
+    if: ${{ !cancelled() }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [windows-latest]
+    # Routed like `clippy-windows` and `holder-crates`: on a FIRST attempt of a
+    # non-pull_request run, the Windows pool when RUNNER_CI_WINDOWS_LANE is
+    # forced `self-hosted`, or where `route-windows` said under `auto`;
+    # otherwise (any pull_request, any re-run, the `hosted`/unset lane, a route
+    # job that produced nothing) the hosted `windows-latest` floor.
+    # coord-pools: [self-hosted, Windows, X64, qontinui-runner-ci-windows, ram-40g] | [windows-latest]
+    runs-on: ${{ fromJSON((github.run_attempt == 1 && github.event_name != 'pull_request' && vars.RUNNER_CI_WINDOWS_LANE == 'self-hosted' && '["self-hosted","Windows","X64","qontinui-runner-ci-windows","ram-40g"]') || (github.run_attempt == 1 && needs['route-windows'].outputs.labels) || '["windows-latest"]') }}
+    # The same cap as `test`, derived there (pinned equal).
+    timeout-minutes: 180
+    steps: *test-steps
+
+  # Windows clippy, split OUT of what was then the matrix `test` job (its
+  # windows leg is now `test-windows`) so it no longer sits on
   # the windows `test` critical path (~12 min saved there — clippy was the 3rd
   # full compile on that leg). It runs in PARALLEL with `test`, and since it
   # only compiles-to-lint (no test run, no tauri build) it finishes well before

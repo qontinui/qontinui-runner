@@ -265,21 +265,27 @@ jobs:
 
       # FIRST, before any compile: the rust-cache `shared-key` coupling this
       # job depends on for its warmth. The `Swatinem/rust-cache@v2` step below
-      # reads by `shared-key: "test"` -- ci.yml's `test` job's own cache key,
-      # not a key this job earns itself (it is read-only here, `save-if:
-      # "false"`) -- so the value is a silent, load-bearing assumption about a
-      # DIFFERENT workflow file. If `test` is ever renamed, this job goes cold
+      # reads by `shared-key: "test"` -- the key ci.yml's test legs (`test` and
+      # `test-windows`, one shared step list) save under on main, not a key
+      # this job earns itself (it is read-only here, `save-if: "false"`) -- so
+      # the value is a silent, load-bearing assumption about a DIFFERENT
+      # workflow file. It used to be ci.yml's job id, and this step asserted
+      # the job `test` still existed; since the windows leg became its own job
+      # (`test-windows`, plan
+      # 2026-11-25-shard-runner-candidate-ci-after-moving-it-off-the-hosted-queue)
+      # the key is pinned explicitly in ci.yml, and a job name no longer says
+      # anything about it. If that line goes or changes, this job goes cold
       # every night with no error, exactly as it did before `shared-key` was
       # added ("No cache found." on every run). Fail loudly at the door
-      # instead: assert ci.yml still declares a job with that id.
-      - name: Assert ci.yml still has a job named "test" (the rust-cache shared-key)
+      # instead: assert ci.yml still declares that shared-key.
+      - name: Assert ci.yml still saves the rust-cache under shared-key "test"
         shell: bash
         run: |
-          if ! grep -qE '^  test:' .github/workflows/ci.yml; then
-            echo "::error::ci.yml no longer declares a job named 'test'. This job's Swatinem/rust-cache step reads shared-key: \"test\" -- ci.yml's job id -- to get main's warm cache. If that job was renamed, rename the shared-key here to match, or this workflow silently runs cold every night."
+          if ! grep -qE '^          shared-key: "test"$' .github/workflows/ci.yml; then
+            echo "::error::ci.yml no longer declares 'shared-key: \"test\"' on its test legs' Swatinem/rust-cache step. This job's rust-cache step reads that key to get main's warm cache. If the key was changed, change the shared-key here to match, or this workflow silently runs cold every night."
             exit 1
           fi
-          echo "ci.yml still declares job 'test' -- shared-key coupling holds."
+          echo "ci.yml still saves under shared-key \"test\" -- the coupling holds."
 
       # FIRST, before any compile: the classifier's own unit test. It needs no
       # binary, no install and no network and runs in ~1s, so a broken harness
@@ -472,8 +478,9 @@ jobs:
           # job-id segment, so this reads exactly the key ci.yml's `test` job
           # writes on main, restore-keys prefix included (a Cargo.lock change
           # since main's last save still restores the nearest prefix match).
-          # COUPLING: the value is ci.yml's job id. If that job is renamed,
-          # rename this too, or the nightly silently goes cold again.
+          # COUPLING: the value is the `shared-key` ci.yml's test legs pin on
+          # their own rust-cache step (asserted at the top of this job). If it
+          # changes there, change it here too, or the nightly goes cold again.
           shared-key: "test"
           # Read-only. This job is not on the merge path, and a ~2.6 GB save per
           # nightly run under this workflow's own ref would add another consumer
@@ -1073,21 +1080,27 @@ jobs:
 
       # FIRST, before any compile: the rust-cache `shared-key` coupling this
       # job depends on for its warmth. The `Swatinem/rust-cache@v2` step below
-      # reads by `shared-key: "test"` -- ci.yml's `test` job's own cache key,
-      # not a key this job earns itself (it is read-only here, `save-if:
-      # "false"`) -- so the value is a silent, load-bearing assumption about a
-      # DIFFERENT workflow file. If `test` is ever renamed, this job goes cold
+      # reads by `shared-key: "test"` -- the key ci.yml's test legs (`test` and
+      # `test-windows`, one shared step list) save under on main, not a key
+      # this job earns itself (it is read-only here, `save-if: "false"`) -- so
+      # the value is a silent, load-bearing assumption about a DIFFERENT
+      # workflow file. It used to be ci.yml's job id, and this step asserted
+      # the job `test` still existed; since the windows leg became its own job
+      # (`test-windows`, plan
+      # 2026-11-25-shard-runner-candidate-ci-after-moving-it-off-the-hosted-queue)
+      # the key is pinned explicitly in ci.yml, and a job name no longer says
+      # anything about it. If that line goes or changes, this job goes cold
       # every night with no error, exactly as it did before `shared-key` was
       # added ("No cache found." on every run). Fail loudly at the door
-      # instead: assert ci.yml still declares a job with that id.
-      - name: Assert ci.yml still has a job named "test" (the rust-cache shared-key)
+      # instead: assert ci.yml still declares that shared-key.
+      - name: Assert ci.yml still saves the rust-cache under shared-key "test"
         shell: bash
         run: |
-          if ! grep -qE '^  test:' .github/workflows/ci.yml; then
-            echo "::error::ci.yml no longer declares a job named 'test'. This job's Swatinem/rust-cache step reads shared-key: \"test\" -- ci.yml's job id -- to get main's warm cache. If that job was renamed, rename the shared-key here to match, or this workflow silently runs cold every night."
+          if ! grep -qE '^          shared-key: "test"$' .github/workflows/ci.yml; then
+            echo "::error::ci.yml no longer declares 'shared-key: \"test\"' on its test legs' Swatinem/rust-cache step. This job's rust-cache step reads that key to get main's warm cache. If the key was changed, change the shared-key here to match, or this workflow silently runs cold every night."
             exit 1
           fi
-          echo "ci.yml still declares job 'test' -- shared-key coupling holds."
+          echo "ci.yml still saves under shared-key \"test\" -- the coupling holds."
 
       # FIRST, before any compile: the classifier's own unit test. It needs no
       # binary, no install and no network and runs in ~1s, so a broken harness
@@ -1280,8 +1293,9 @@ jobs:
           # job-id segment, so this reads exactly the key ci.yml's `test` job
           # writes on main, restore-keys prefix included (a Cargo.lock change
           # since main's last save still restores the nearest prefix match).
-          # COUPLING: the value is ci.yml's job id. If that job is renamed,
-          # rename this too, or the nightly silently goes cold again.
+          # COUPLING: the value is the `shared-key` ci.yml's test legs pin on
+          # their own rust-cache step (asserted at the top of this job). If it
+          # changes there, change it here too, or the nightly goes cold again.
           shared-key: "test"
           # Read-only. This job is not on the merge path, and a ~2.6 GB save per
           # nightly run under this workflow's own ref would add another consumer
