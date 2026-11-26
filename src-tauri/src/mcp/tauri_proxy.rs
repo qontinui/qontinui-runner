@@ -1161,19 +1161,19 @@ mod session_migration_proxy_tests {
     #[test]
     fn dispatch_routes_each_command_to_its_arm_body() {
         let src = include_str!("tauri_proxy.rs");
-        let dispatch_src = &src[src.find("async fn dispatch(").expect("dispatch")..];
-        let dispatch_src = &dispatch_src[..dispatch_src.find("\n}\n").expect("end of dispatch")];
+        let (_, dispatch_src) = src.split_once("async fn dispatch(").expect("dispatch");
+        let (dispatch_src, _) = dispatch_src.split_once("\n}\n").expect("end of dispatch");
         // Each arm's text runs from its label to the NEXT arm label (or the
         // end of `dispatch`), so a call in a later arm cannot satisfy it.
         let next_arm = regex::Regex::new(r#"\n\s*(?:"[a-z_]+"|_) =>"#).expect("static pattern");
         let arm_body = |command: &str| -> &str {
             let label = format!("\"{command}\" =>");
-            let at = dispatch_src
-                .find(&label)
+            let (_, rest) = dispatch_src
+                .split_once(&label)
                 .unwrap_or_else(|| panic!("no dispatch arm for {command}"));
-            let rest = &dispatch_src[at + label.len()..];
             let end = next_arm.find(rest).map_or(rest.len(), |m| m.start());
-            &rest[..end]
+            rest.get(..end)
+                .expect("a regex match ends on a char boundary")
         };
         for (command, call) in [
             (RECORD_OPEN, "proxy_session_record_open("),
