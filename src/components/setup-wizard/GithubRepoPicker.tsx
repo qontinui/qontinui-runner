@@ -3,7 +3,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { resolveSignInBackendUrl } from "@/lib/savedBackendUrl";
+import { resolveSignInDecision } from "@/lib/savedBackendUrl";
+import { useGateSignInFallback, type GateSignInFallbackState } from "@/hooks/useGateSignInFallback";
+import { SignInFallbackNotice } from "@/components/SignInFallbackNotice";
 import {
   NO_BROWSER_HINT,
   PendingSignInNotice,
@@ -351,22 +353,45 @@ export function GithubRepoPicker({ onProjectsCloned }: GithubRepoPickerProps) {
    * `runner-tier-changed` so AuthProvider re-checks, then re-load the repo list
    * so the picker advances to not_connected / connected on its own.
    */
+  const signInTo = useCallback(
+    async (_action: null, backendUrl: string) => {
+      setSigningIn(true);
+      setSignInError(null);
+      try {
+        await invoke("cognito_sign_in", { backendUrl });
+        window.dispatchEvent(new CustomEvent("runner-tier-changed"));
+        await loadRepos();
+      } catch (err) {
+        // The user's own Cancel (from the pending-sign-in notice) is not a failure.
+        if (!isSignInCancelled(err)) setSignInError(`${err}`);
+      } finally {
+        setSigningIn(false);
+      }
+    },
+    [loadRepos],
+  );
+
+  // An unbounded sign-in target (the saved settings could not be read, even
+  // after one re-read) starts no sign-in; SignInButton renders the choice.
+  const fallback = useGateSignInFallback<null>(signInTo);
+  const { withhold: withholdSignIn, clear: clearSignInFallback } = fallback;
+
   const signIn = useCallback(async () => {
     setSigningIn(true);
     setSignInError(null);
-    try {
-      // Same target LoginScreen uses (see savedBackendUrl.ts): the command
-      // writes the URL it signed in against back into settings.
-      await invoke("cognito_sign_in", { backendUrl: await resolveSignInBackendUrl("gate") });
-      window.dispatchEvent(new CustomEvent("runner-tier-changed"));
-      await loadRepos();
-    } catch (err) {
-      // The user's own Cancel (from the pending-sign-in notice) is not a failure.
-      if (!isSignInCancelled(err)) setSignInError(`${err}`);
-    } finally {
+    clearSignInFallback();
+    // Same target LoginScreen uses (see savedBackendUrl.ts): the command
+    // writes the URL it signed in against back into settings. Never rejects.
+    const decision = await resolveSignInDecision("gate");
+    if (!decision.bounded) {
+      // No sign-in is in flight: "Opening browser…" and PendingSignInNotice
+      // both read `signingIn`.
       setSigningIn(false);
+      withholdSignIn(decision, null);
+      return;
     }
-  }, [loadRepos]);
+    await signInTo(null, decision.target);
+  }, [signInTo, withholdSignIn, clearSignInFallback]);
 
   const cloneSelected = useCallback(async () => {
     if (selectedRepos.length === 0 || !destParent) return;
@@ -461,7 +486,7 @@ export function GithubRepoPicker({ onProjectsCloned }: GithubRepoPickerProps) {
               Same reason as the signed_out view: "Settings → Account" does not
               exist yet while the wizard owns the viewport. */}
           {isAuthLoadError(loadError ?? "") && (
-            <SignInButton signingIn={signingIn} onSignIn={signIn} />
+            <SignInButton signingIn={signingIn} onSignIn={signIn} fallback={fallback} />
           )}
         </div>
         <PendingSignInNotice active={signingIn} noBrowserHint={NO_BROWSER_HINT.setupWizard} />
@@ -485,7 +510,7 @@ export function GithubRepoPicker({ onProjectsCloned }: GithubRepoPickerProps) {
             </p>
           </div>
         </div>
-        <SignInButton signingIn={signingIn} onSignIn={signIn} />
+        <SignInButton signingIn={signingIn} onSignIn={signIn} fallback={fallback} />
         <PendingSignInNotice active={signingIn} noBrowserHint={NO_BROWSER_HINT.setupWizard} />
         {signInError && (
           <p className="text-xs text-red-300 break-words whitespace-pre-wrap">{signInError}</p>
@@ -660,33 +685,47 @@ export function GithubRepoPicker({ onProjectsCloned }: GithubRepoPickerProps) {
 }
 
 /** The wizard's in-place "Sign in to Qontinui" CTA, shared by the signed_out and
- *  expired-session views so both offer the identical affordance. */
+ *  expired-session views so both offer the identical affordance — including
+ *  the unbounded-target notice, rendered here so both views get it from one
+ *  place. */
 function SignInButton({
   signingIn,
   onSignIn,
+  fallback,
 }: {
   signingIn: boolean;
   onSignIn: () => Promise<void>;
+  fallback: GateSignInFallbackState<null>;
 }) {
   return (
-    <button
-      type="button"
-      className="btn-primary flex items-center gap-2 self-start"
-      onClick={() => void onSignIn()}
-      disabled={signingIn}
-      data-testid="wizard-github-sign-in"
-    >
-      {signingIn ? (
-        <>
-          <Loader2 className="w-4 h-4 animate-spin" />
-          Opening browser…
-        </>
-      ) : (
-        <>
-          <LogIn className="w-4 h-4" />
-          Sign in to Qontinui
-        </>
+    <div className="flex flex-col gap-2 min-w-0">
+      <button
+        type="button"
+        className="btn-primary flex items-center gap-2 self-start"
+        onClick={() => void onSignIn()}
+        disabled={signingIn || fallback.reading}
+        data-testid="wizard-github-sign-in"
+      >
+        {signingIn ? (
+          <>
+            <Loader2 className="w-4 h-4 animate-spin" />
+            Opening browser…
+          </>
+        ) : (
+          <>
+            <LogIn className="w-4 h-4" />
+            Sign in to Qontinui
+          </>
+        )}
+      </button>
+      {fallback.fallback && (
+        <SignInFallbackNotice
+          decision={fallback.fallback.decision}
+          reading={fallback.reading}
+          onSignInToProduction={() => void fallback.signInToProduction()}
+          onRetry={() => void fallback.retry()}
+        />
       )}
-    </button>
+    </div>
   );
 }

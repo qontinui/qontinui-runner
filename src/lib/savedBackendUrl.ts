@@ -57,23 +57,85 @@ export interface SavedBackendStatus {
   backendUrlRefused?: boolean;
 }
 
-interface SignInDecision {
+/**
+ * Which arm of the one sign-in rule answered. The first five are BOUNDED: the
+ * rule had every input it reads, so the target is its answer. The last three
+ * are UNBOUNDED: the answer is production only because an input was unknown.
+ *
+ * - `saved` — the saved URL is the target.
+ * - `no_saved_url` / `not_http` — nothing usable is saved (rule 2).
+ * - `refused_by_build` — this build will not dial the saved URL (rule 3).
+ * - `machine_local_on_gate` — a machine-local URL on a first-run screen (rule 4).
+ * - `read_rejected` — the `get_web_integration_status` read itself failed.
+ * - `settings_fault` — the read answered with a non-null `settingsFault`, so its
+ *   `backendUrl` is a placeholder default, not the operator's saved choice.
+ * - `verdict_missing` — the read answered without a boolean
+ *   `backendUrlRefused` / `backendUrlMachineLocal` verdict (needs build skew).
+ */
+export type SignInArm =
+  | "saved"
+  | "no_saved_url"
+  | "not_http"
+  | "refused_by_build"
+  | "machine_local_on_gate"
+  | "read_rejected"
+  | "settings_fault"
+  | "verdict_missing";
+
+/**
+ * The one sign-in rule's answer, with whether it is BOUNDED.
+ *
+ * `bounded: false` is the definition of "couldn't read this runner's saved
+ * backend settings" — audience question `signin-gate.external-operator.2`
+ * (status: PROPOSED in `audience_profile/external-operator` v3, an assumption
+ * until an operator confirms it): a rejected status read, a non-null
+ * `settingsFault`, or a missing build / machine-local verdict. The target is
+ * then production, but only as a placeholder: a consumer that would WRITE it
+ * (every gate surface — `finalize_signed_in` saves the URL it signed in
+ * against) must not act on it silently.
+ */
+export interface SignInDecision {
   target: string;
   /** `null` when the target is the saved URL. */
   reason: string | null;
+  bounded: boolean;
+  arm: SignInArm;
 }
 
-function production(reason: string): SignInDecision {
-  return { target: PRODUCTION_BACKEND_URL, reason };
+/** The unbounded arms a status RE-READ can fix: a transient read failure, or a
+ *  `settingsFault` that self-heals once settings.json is readable again. A
+ *  `verdict_missing` answer needs build skew, which no re-read changes. */
+export function isRereadableArm(arm: SignInArm): boolean {
+  return arm === "read_rejected" || arm === "settings_fault";
+}
+
+/** The arms whose production answer rests on an unknown input. */
+const UNBOUNDED_ARMS: ReadonlySet<SignInArm> = new Set<SignInArm>([
+  "read_rejected",
+  "settings_fault",
+  "verdict_missing",
+]);
+
+function production(arm: Exclude<SignInArm, "saved">, reason: string): SignInDecision {
+  return { target: PRODUCTION_BACKEND_URL, reason, bounded: !UNBOUNDED_ARMS.has(arm), arm };
 }
 
 function decide(status: SavedBackendStatus | null, surface: SignInSurface): SignInDecision {
   // (1) settings authoritative
-  if (!status || status.settingsFault != null) {
-    return production("The runner's settings could not be read, so the saved URL is not used.");
+  if (!status) {
+    return production(
+      "read_rejected",
+      "The runner's status could not be read, so the saved URL is not used.",
+    );
+  }
+  if (status.settingsFault != null) {
+    return production(
+      "settings_fault",
+      "The runner's settings could not be read, so the saved URL is not used.",
+    );
   }
   const saved = typeof status.backendUrl === "string" ? status.backendUrl.trim() : "";
-  if (!saved) return production("No backend URL is saved.");
+  if (!saved) return production("no_saved_url", "No backend URL is saved.");
   // (2) absolute http(s) URL
   let proto: string;
   try {
@@ -82,30 +144,45 @@ function decide(status: SavedBackendStatus | null, surface: SignInSurface): Sign
     proto = "";
   }
   if (proto !== "https:" && proto !== "http:") {
-    return production("The saved backend URL is not an absolute http(s) URL.");
+    return production("not_http", "The saved backend URL is not an absolute http(s) URL.");
   }
   // (3) the build would dial it
   if (status.backendUrlRefused === true) {
     return production(
+      "refused_by_build",
       "The saved backend URL is machine-local, and this release build does not dial machine-local backends.",
     );
   }
   if (status.backendUrlRefused !== false) {
-    return production("The runner did not report a build verdict for the saved URL.");
+    return production(
+      "verdict_missing",
+      "The runner did not report a build verdict for the saved URL.",
+    );
   }
   // (4) machine-local only on an operator surface
   if (status.backendUrlMachineLocal === true) {
-    if (surface === "operator") return { target: saved, reason: null };
+    if (surface === "operator") return { target: saved, reason: null, bounded: true, arm: "saved" };
     return production(
+      "machine_local_on_gate",
       "The saved backend URL is machine-local, and this first-run sign-in screen does not use machine-local backends.",
     );
   }
   if (status.backendUrlMachineLocal !== false) {
     return production(
+      "verdict_missing",
       "The runner did not report whether the saved URL is machine-local (verdict missing).",
     );
   }
-  return { target: saved, reason: null };
+  return { target: saved, reason: null, bounded: true, arm: "saved" };
+}
+
+/** Pure decision for `surface`, given the status read (`null` when the read
+ *  failed). The two projections below read this same decision. */
+export function signInDecisionFrom(
+  status: SavedBackendStatus | null,
+  surface: SignInSurface,
+): SignInDecision {
+  return decide(status, surface);
 }
 
 /** Pure decision: which backend a sign-in from `surface` targets, given the
@@ -126,33 +203,36 @@ export function signInTargetExplanation(
   return decide(status, surface).reason;
 }
 
-/** Read the saved status and decide. A failed read targets production.
- *
- *  KNOWN RESIDUAL — GATE surfaces only (LoginScreen, GithubRepoPicker, the
- *  callers of this function): an unusable status read still targets
- *  production, by either of two routes — a REJECTED read, or a read that
- *  succeeds with a non-null `settingsFault` (its `backendUrl` is a placeholder
- *  default). That is the plan's "unusable → production" rule, kept so
- *  first-run sign-in is never blocked by an unreadable settings file. The Rust
- *  `finalize_signed_in` then writes production into `web_integration
- *  .backend_url`, which can overwrite a backend URL saved before the first
- *  sign-in. `update_settings` refuses writes while settings are not
- *  authoritative, so the window is narrow: a fault that CLEARS between the
- *  status read and that write. The operator surfaces (auth banner, Settings →
- *  Account) refuse both routes — they never sign in on a rejected or faulted
- *  read, and offer "Retry" (re-read) instead. A third route reaches production
- *  on EVERY surface: a status missing the runner's verdict fields (UNKNOWN →
- *  production, rule 3/4). The frontend and the Rust command ship in one
- *  binary and Rust always serializes both fields, so it needs build skew.
- *  Tracked as a follow-up on plan
- *  2026-11-21-unify-runner-sign-in-backend-url-helper. */
-export async function resolveSignInBackendUrl(surface: SignInSurface): Promise<string> {
+/** ONE `get_web_integration_status` read, decided. A rejected read is the
+ *  `read_rejected` arm; this never rejects. */
+export async function readSignInDecision(surface: SignInSurface): Promise<SignInDecision> {
+  let status: SavedBackendStatus | null;
   try {
-    return signInBackendUrlFrom(
-      await invoke<SavedBackendStatus>("get_web_integration_status"),
-      surface,
-    );
+    status = await invoke<SavedBackendStatus>("get_web_integration_status");
   } catch {
-    return signInBackendUrlFrom(null, surface);
+    status = null;
   }
+  return signInDecisionFrom(status, surface);
+}
+
+/** Read the saved status and decide, re-reading ONCE when the first answer is
+ *  an unbounded arm a re-read can fix ({@link isRereadableArm}); the second
+ *  answer is returned as-is. A `verdict_missing` answer is returned without a
+ *  re-read. Never rejects.
+ *
+ *  An unbounded answer is REPORTED, never resolved to a silent production
+ *  sign-in. The gate surfaces (LoginScreen, GithubRepoPicker) withhold on
+ *  `bounded: false`: they start no sign-in, and offer the operator an explicit
+ *  "Sign in to api.qontinui.io" that says what it does to the saved backend,
+ *  beside "Retry and sign in" on the re-readable arms (`SignInFallbackNotice`).
+ *  So `finalize_signed_in`, which writes the URL it signed in against into
+ *  `web_integration.backend_url`, replaces a saved backend only by the
+ *  operator's visible choice. The operator surfaces (auth banner, Settings →
+ *  Account, via `useSavedBackendStatus`) never sign in on a rejected or faulted
+ *  read and offer Retry; on `verdict_missing` they name the reason beside the
+ *  effective target before the click. */
+export async function resolveSignInDecision(surface: SignInSurface): Promise<SignInDecision> {
+  const first = await readSignInDecision(surface);
+  if (!isRereadableArm(first.arm)) return first;
+  return readSignInDecision(surface);
 }
