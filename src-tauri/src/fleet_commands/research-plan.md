@@ -406,7 +406,15 @@ waste yours.
   `main`, so the prompt is on `origin` and invisible to every `origin/main`
   reader (9 plan stems were pushed and never proposed on 2026-09-02). Publish
   the file with
-  `bash <workspace-root>/qontinui-claude-config/scripts/land-plan-stamp.sh "<plans-repo-root>" "<repo-relative path>" "<local file>" "<commit subject>"`;
+
+  ```bash
+  bash <workspace-root>/qontinui-claude-config/scripts/land-plan-stamp.sh --based-on "<new | the blob you read>" \
+    "<plans-repo-root>" "<repo-relative path>" "<local file>" "<commit subject>"
+  ```
+
+  — `new` for a file you are creating, else the blob of `origin/main:<path>`
+  you read before editing (exit 7: origin moved since that read — re-read it
+  before publishing again);
   its ruleset probe of the default branch decides whether a PR is needed — no
   command asserts that in prose. It prints `LANDED <commit|unchanged> <blob>`
   on the direct arm, or cuts a fresh branch, opens a new PR with `gh pr create`

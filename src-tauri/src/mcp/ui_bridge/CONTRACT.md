@@ -471,9 +471,10 @@ Two thread-through styles, mirroring the `tabId` split:
   produced, including `undefined` from a swallowed exception.
 
 > **Still open (deliberately, on this family):** a *resolved miss* —
-> `click-by-text` / `click-by-selector` finding no match, `read-value` matching
-> no selector — is still an HTTP 200 whose payload says `clicked: false` /
-> `found: false`. `type-into` alone reports a miss as HTTP 400. Aligning the
+> `click-by-text` / `click-by-selector` finding no match — is still an HTTP 200
+> whose payload says `clicked: false`. `type-into` and `read-value` report a
+> miss as HTTP 400 (`read-value` delegates to the SDK's `readValuePrimitive`,
+> whose `ELEMENT_NOT_FOUND` the IPC envelope maps to 400). Aligning the
 > other three is a breaking change to an automation surface with cross-repo
 > consumers (`@qontinui/ui-bridge`, `scripts/contract-smoke.ps1`,
 > `UI-BRIDGE-AUTOMATION.md`), so it needs its own change and a `contract-smoke`
@@ -523,16 +524,30 @@ API router is built: the panic is logged and the HTTP API never comes up, but
 the runner process itself keeps running. `tmp_vision_cache/` is only ever written by runner builds that
 predate this.
 
-### 404 discriminator: empty body vs structured envelope
-A 404 from a route with a `:param`/`{name}` segment is ambiguous on its own, so
-the runner makes it discriminable by body: a **route-matched, resource-not-found**
-404 carries a **structured JSON error envelope** (`{success:false, error, …}` —
-e.g. `ELEMENT_NOT_FOUND`, "Component not found"), whereas a **genuinely
-unregistered** route falls through to **axum's default 404 with an empty body**.
+### 404 discriminator: route fallback vs resource not found
+Both kinds of 404 carry a structured JSON envelope, so the body's presence
+discriminates nothing; its `code` and `error` do.
+
+- A **genuinely unregistered** route is answered by the router fallback
+  (`mcp_api::not_found_handler`) with
+  `{success:false, code:"NOT_FOUND", error:"No route for <METHOD> <path>…"}`.
+  For a `/ui-bridge/*` path the message appends a discovery hint
+  (`GET /ui-bridge/_routes`, `GET /ui-bridge/commands`). For a route the UI
+  Bridge deliberately deleted (`mcp/ui_bridge/removed_routes.rs`,
+  `REMOVED_UI_BRIDGE_ROUTES` — the old screenshot / element-image /
+  stuck-screen / `/ai/media/*` and `/sdk/ai/media/*` family), the message first says the route was
+  removed and names the replacement, `POST /ui-bridge/vision/capture` (bytes at
+  `GET /ui-bridge/vision/cache/{sha256}`). Status stays 404 and code stays
+  `NOT_FOUND` either way.
+- A **route-matched, resource-not-found** 404 from a `:param`/`{name}` route
+  comes from the handler itself and never begins its `error` with
+  `No route for` (e.g. `ELEMENT_NOT_FOUND`, "Component not found").
+
 Consumers (and `scripts/contract-smoke.ps1`'s walk classifier) treat
-"`:param` route + structured envelope = route reachable" and "empty body =
-unregistered". New not-found handlers should always return a structured envelope
-so this stays a reliable signal.
+"`code == NOT_FOUND` and `error` starts with `No route for`" as unregistered,
+and any other structured envelope on a `:param` route as route reachable. New
+not-found handlers must return a structured envelope and must not phrase their
+`error` as `No route for …`, so this stays a reliable signal.
 
 ## Element-id discovery
 
@@ -595,8 +610,19 @@ there. To answer "did my panel render?":
   the whole page's `document.body.innerText`, trimmed and capped at 8000 chars
   (`page.rs::ui_bridge_page_summary_handler`) — alongside the structured
   headings/buttons/inputs/links digest. One call, no hand-rolled evaluate.
-- **`POST /ui-bridge/control/page/read-value`** (`elements.rs:3336`) reads one
-  selector's `textContent`/`value`.
+- **`POST /ui-bridge/control/page/read-value`** (`elements.rs`,
+  `ui_bridge_read_value_handler`) reads one selector's `textContent`/`value`
+  by dispatching the `read_value` IPC request to the SDK's `readValuePrimitive`
+  (`src/hooks/ui-bridge-events/readValueRequest.ts`), the same implementation
+  the relay `/sdk/page/read-value` serves. The SDK owns the §4.6 verdict: a
+  password input or anything inside `data-bridge-redact="true"` reads back
+  `[REDACTED]` (length 0), never the raw value. Redaction is judged on the
+  selected element and its ancestors: selecting a NON-redacted container whose
+  descendant sits inside a boundary still returns that descendant's text (an
+  SDK limit). The route no longer has the direct-WebView fallback: it needs the
+  live frontend IPC listener, like the relay door. Response shape is
+  `{value, length, totalMatches, values?}`; the older `found/tag/type/
+  placeholder/disabled/readOnly` fields are gone.
 - **`find-by-text`** (`elements.rs:3158`) locates elements by visible text.
 
 ### `page/evaluate` result envelope: ONE discriminated shape, always

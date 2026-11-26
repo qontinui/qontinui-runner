@@ -567,7 +567,7 @@ describe("a walked list shows when each row was last observed", () => {
 
   it("renders nothing at all when coord served no parseable timestamp", () => {
     // Null is UNKNOWN. A placeholder would look like an answer coord never gave.
-    expect(SOURCE).toContain("if (free.length === 0 && !activity) return null;");
+    expect(SOURCE).toContain("if (free.length === 0 && !activity && !moved) return null;");
   });
 
   it("projects the exact instant for a driver, not only the locale prose", () => {
@@ -575,6 +575,12 @@ describe("a walked list shows when each row was last observed", () => {
     // clock-dependent and the span is `truncate`d, so it is not a contract.
     expect(SOURCE).toContain("data-session-activity={activity.iso}");
     expect(SOURCE).toContain("data-session-activity-kind={activity.verb}");
+  });
+
+  it("shows how long ago the work axis moved, with the exact instant for a driver", () => {
+    expect(SOURCE).toContain("const moved = workStatusMoved(s);");
+    expect(SOURCE).toContain("data-session-status-since={moved.iso}");
+    expect(SOURCE).toContain("{moved.label}");
   });
 
   it("keeps the relative label moving while the panel sits open", () => {
@@ -641,6 +647,27 @@ describe("the tenant selector reads, and attaches, the tenant it names", () => {
     for (const effect of callsOf(code, "useEffect(")) {
       expect(effect).not.toContain("setFleetTenantPick");
     }
+  });
+
+  it("re-reads only the selector's credential notes, whenever the list's read settles", () => {
+    const code = codeOf(SOURCE);
+    const effects = callsOf(code, "useEffect(").filter((e) =>
+      e.includes("refreshTenantCredentials()"),
+    );
+    expect(effects).toHaveLength(1);
+    // `loadingMore` too: a load-more page never moves `loading`.
+    expect(effects[0]).toContain("if (loading || loadingMore) {");
+    expect(effects[0]).toContain("listReadInFlight.current = true;");
+    // Once per read, never on the idle first snapshot: a settle consumes the mark.
+    expect(effects[0]).toContain("if (!listReadInFlight.current) return;");
+    expect(effects[0]).toContain("listReadInFlight.current = false;");
+    // With one binding no note can render, so no re-read is paid for.
+    expect(effects[0]).toContain("if (!showSwitcher) return;");
+    // A dependency on the notes or candidates would loop: each re-read sets them.
+    expect(effects[0]).toContain("[loading, loadingMore, showSwitcher, refreshTenantCredentials]");
+    // Never the full `refresh`: it also takes the candidates, and those read empty
+    // on a transient failure, which would flip the view.
+    expect(code).toContain("refreshCredentials: refreshTenantCredentials,");
   });
 
   it("projects the requested tenant beside the one(s) that answered", () => {

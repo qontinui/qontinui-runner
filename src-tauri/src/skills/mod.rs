@@ -9,9 +9,8 @@
 //! - A registry that loads built-in skills from embedded JSON
 //! - Search and lookup functionality
 //! - Skill instantiation (template → concrete step configs)
-//! - Playbook parsing (markdown with YAML frontmatter for domain knowledge)
-
-pub mod playbook_parser;
+//! - The typed refusal an intake door (import, sync pull) gives a skill whose
+//!   template is of the retired `playbook` kind ([`refuse_retired_template`])
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -176,32 +175,79 @@ pub enum SkillTemplate {
     MultiStep { steps: Vec<HashMap<String, Value>> },
     #[serde(rename = "composition")]
     Composition { skill_refs: Vec<SkillRef> },
-    /// Markdown playbook with domain knowledge (TuriX-CUA inspired).
-    ///
-    /// Playbooks are human-editable markdown files with YAML frontmatter that
-    /// provide LLM context about how to interact with specific applications.
-    /// Unlike other templates that generate workflow steps, playbooks inject
-    /// domain knowledge into AI prompts.
-    #[serde(rename = "playbook")]
-    Playbook {
-        /// Full markdown content (the body after frontmatter).
-        content: String,
-        /// Trigger conditions for when this playbook should be included.
-        #[serde(default)]
-        triggers: Vec<PlaybookTrigger>,
+}
+
+// =============================================================================
+// Retired template kinds
+// =============================================================================
+
+/// The template `kind` this runner no longer has. A `playbook` template held
+/// markdown domain knowledge that a loader was meant to inject into AI
+/// prompts; the injection was removed in 06e5d225e and the variant, its
+/// loader and its trigger type were deleted by plan
+/// `2026-11-06-what-the-fleet-records-and-advertises-matches-what-actually-ran`
+/// Phase 7. Project knowledge goes in `.qontinui/contexts/*.md` instead.
+const RETIRED_PLAYBOOK_TEMPLATE_KIND: &str = "playbook";
+
+/// Why an intake door (skill import, org sync pull) refused a skill
+/// definition. Typed rather than left to serde: without the variant, serde
+/// would answer an `unknown variant` that names no reason and no replacement.
+///
+/// Serializes as `{"code": "PLAYBOOK_TEMPLATE_RETIRED", "skill": "<slug>"}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, thiserror::Error)]
+#[serde(tag = "code", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SkillIntakeRefusal {
+    /// The template's `kind` is `playbook`, which nothing loads, injects or
+    /// instantiates any more.
+    #[error(
+        "skill `{skill}` has a `playbook` template, a kind this runner no longer has: \
+         nothing loads or runs playbook skills. Put the knowledge in a \
+         `.qontinui/contexts/*.md` file instead."
+    )]
+    PlaybookTemplateRetired {
+        /// The refused definition's slug, else its name, else `unknown`.
+        skill: String,
     },
 }
 
-/// Trigger condition for a playbook.
+impl SkillIntakeRefusal {
+    /// The machine-readable code: the same string the variant serializes to.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::PlaybookTemplateRetired { .. } => "PLAYBOOK_TEMPLATE_RETIRED",
+        }
+    }
+
+    /// The refused skill's label (slug, else name, else `unknown`).
+    pub fn skill(&self) -> &str {
+        match self {
+            Self::PlaybookTemplateRetired { skill } => skill,
+        }
+    }
+}
+
+/// Refuse a skill definition whose template is of the retired `playbook`
+/// kind. Reads the RAW JSON, before typed deserialization, so the refusal is
+/// this typed answer rather than serde's `unknown variant`.
 ///
-/// Determines when a playbook should be automatically included in AI prompts
-/// based on the current automation context (app name, URL pattern, etc.).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PlaybookTrigger {
-    /// Type of trigger: "app_name", "url_pattern", "tag".
-    pub trigger_type: String,
-    /// Value to match against (exact match for app_name, glob for url_pattern).
-    pub value: String,
+/// `None` for every other definition, including one with no template or a
+/// malformed one: those are typed deserialization's to reject.
+pub fn refuse_retired_template(skill: &Value) -> Option<SkillIntakeRefusal> {
+    let kind = skill.get("template")?.get("kind")?.as_str()?;
+    if kind != RETIRED_PLAYBOOK_TEMPLATE_KIND {
+        return None;
+    }
+    let named = |key: &str| {
+        skill
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
+    let label = named("slug").or_else(|| named("name")).unwrap_or("unknown");
+    Some(SkillIntakeRefusal::PlaybookTemplateRetired {
+        skill: label.to_string(),
+    })
 }
 
 /// Where a [`SkillDefinition`] came from.
@@ -356,6 +402,45 @@ pub struct SkillExportManifest {
 pub struct SkillExport {
     pub manifest: SkillExportManifest,
     pub skills: Vec<SkillDefinition>,
+    /// Stored skills the export left out because their stored template does
+    /// not parse: exporting the served fallback would hand an empty skill on
+    /// as if it were the stored one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub withheld: Vec<WithheldSkill>,
+}
+
+/// A stored skill an outbound door (export, sync push) left out, with why.
+///
+/// Serializes as `{"skill_id": "...", "code": "STORED_SKILL_TEMPLATE_UNPARSEABLE",
+/// "error": "<the parse error>", "stored_template": "<the stored column>"}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WithheldSkill {
+    pub skill_id: String,
+    pub code: String,
+    pub error: String,
+    /// The stored `template` column, verbatim. No other door returns it: a
+    /// read serves the empty `single_step` fallback and a rewrite is refused,
+    /// so an export is how the stored text (a retired `playbook` body, say) is
+    /// recovered before the skill is deleted.
+    #[serde(default)]
+    pub stored_template: String,
+}
+
+/// The code on a [`WithheldSkill`], and on the refusal of a rewrite, of a
+/// stored skill whose template does not parse.
+pub const STORED_SKILL_TEMPLATE_UNPARSEABLE: &str = "STORED_SKILL_TEMPLATE_UNPARSEABLE";
+
+impl WithheldSkill {
+    /// A stored skill withheld because its stored template does not parse,
+    /// carrying that stored template as it is.
+    pub fn unparseable(skill_id: &str, stored_template: &str, error: impl ToString) -> Self {
+        Self {
+            skill_id: skill_id.to_string(),
+            code: STORED_SKILL_TEMPLATE_UNPARSEABLE.to_string(),
+            error: error.to_string(),
+            stored_template: stored_template.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -366,6 +451,9 @@ pub struct SkillImportResult {
     pub errors: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// Skills refused before import, each with its typed reason (a template of
+    /// the retired `playbook` kind). The rest of the request still imports.
+    pub refused: Vec<SkillIntakeRefusal>,
 }
 
 /// Compute a SHA-256 checksum of a skill's content for integrity verification.
@@ -400,6 +488,25 @@ pub fn compute_export_checksum(skills: &[SkillDefinition]) -> String {
         hasher.update(compute_skill_checksum(skill).as_bytes());
     }
     format!("{:x}", hasher.finalize())
+}
+
+/// The semver a version bump writes: `major` and `minor` reset the lower
+/// parts, anything else bumps the patch. A version that does not parse is
+/// read as `1.0.0`.
+pub fn bump_semver(version: &str, bump_type: &str) -> String {
+    let parts: Vec<u32> = version.split('.').filter_map(|p| p.parse().ok()).collect();
+    let (major, minor, patch) = match parts.as_slice() {
+        [ma, mi, pa, ..] => (*ma, *mi, *pa),
+        [ma, mi] => (*ma, *mi, 0),
+        [ma] => (*ma, 0, 0),
+        _ => (1, 0, 0),
+    };
+
+    match bump_type {
+        "major" => format!("{}.0.0", major + 1),
+        "minor" => format!("{}.{}.0", major, minor + 1),
+        _ => format!("{}.{}.{}", major, minor, patch + 1),
+    }
 }
 
 // =============================================================================
@@ -777,13 +884,28 @@ pub fn instantiate_skill(
                 skill.name
             ));
         }
-        SkillTemplate::Playbook { .. } => {
-            return Err(format!(
-                "Skill \"{}\" is a playbook and cannot be directly instantiated as workflow steps",
-                skill.name
-            ));
-        }
     };
+
+    // A step with no `type` is nothing a workflow can run. It is also the
+    // shape a stored template that does not parse is served as (an empty
+    // `single_step`), so instantiating it would hand back a typeless step as if
+    // it were the skill.
+    if let Some(i) = template_steps
+        .iter()
+        .position(|step| !step.get("type").is_some_and(Value::is_string))
+    {
+        return Err(format!(
+            "Skill \"{}\" ({}) has a template step with no `type` (step {} of {}), so there is \
+             nothing to instantiate. If its stored template does not parse, it is served as an \
+             empty single_step: export the skill to recover the stored template (the export \
+             lists it under `withheld`), then delete it. Otherwise, update the template so every \
+             step has a string `type`.",
+            skill.name,
+            skill.id,
+            i + 1,
+            template_steps.len()
+        ));
+    }
 
     let total = template_steps.len();
     let mut result = Vec::with_capacity(total);
@@ -912,7 +1034,6 @@ fn step_matches_skill(step: &Value, skill: &SkillDefinition) -> bool {
         SkillTemplate::SingleStep { step } => step,
         SkillTemplate::MultiStep { .. } => return false, // skip multi-step skills
         SkillTemplate::Composition { .. } => return false, // skip composition skills
-        SkillTemplate::Playbook { .. } => return false,  // skip playbook skills
     };
 
     let step_obj = match step.as_object() {
@@ -958,7 +1079,6 @@ fn extract_params_from_step(step: &Value, skill: &SkillDefinition) -> HashMap<St
         SkillTemplate::SingleStep { step } => step,
         SkillTemplate::MultiStep { .. } => return HashMap::new(),
         SkillTemplate::Composition { .. } => return HashMap::new(),
-        SkillTemplate::Playbook { .. } => return HashMap::new(),
     };
 
     let step_obj = match step.as_object() {
@@ -1633,5 +1753,144 @@ mod tests {
         // Same skill should produce same checksum
         let checksum2 = compute_skill_checksum(skill);
         assert_eq!(checksum, checksum2);
+    }
+
+    // ── The retired `playbook` template kind ─────────────────────────────
+
+    /// Every arm of the intake refusal. A `playbook` template is refused and
+    /// labelled by slug, else name, else `unknown`. Every other kind, a missing
+    /// template, a template with no `kind`, a non-string `kind` and a
+    /// non-object value are not this refusal's to make.
+    #[test]
+    fn refuse_retired_template_refuses_only_the_playbook_kind() {
+        use serde_json::json;
+        let retired = |skill: &str| {
+            Some(SkillIntakeRefusal::PlaybookTemplateRetired {
+                skill: skill.to_string(),
+            })
+        };
+        let playbook = json!({"kind": "playbook", "content": "x"});
+
+        assert_eq!(
+            refuse_retired_template(
+                &json!({"slug": "sf-login", "name": "SF", "template": playbook})
+            ),
+            retired("sf-login"),
+            "the slug labels the refusal"
+        );
+        assert_eq!(
+            refuse_retired_template(&json!({"slug": " ", "name": "SF", "template": playbook})),
+            retired("SF"),
+            "a blank slug falls back to the name"
+        );
+        assert_eq!(
+            refuse_retired_template(&json!({"template": playbook})),
+            retired("unknown"),
+            "neither slug nor name: still refused, labelled unknown"
+        );
+
+        for not_retired in [
+            json!({"slug": "a", "template": {"kind": "single_step", "step": {}}}),
+            json!({"slug": "a", "template": {"kind": "multi_step", "steps": []}}),
+            json!({"slug": "a", "template": {"kind": "composition", "skill_refs": []}}),
+            json!({"slug": "a"}),
+            json!({"slug": "a", "template": {"content": "x"}}),
+            json!({"slug": "a", "template": {"kind": 7}}),
+            json!("playbook"),
+        ] {
+            assert_eq!(
+                refuse_retired_template(&not_retired),
+                None,
+                "not refused: {not_retired}"
+            );
+        }
+    }
+
+    /// The refusal's wire shape and its `code()` agree, and its message names
+    /// the live replacement rather than only the retired kind.
+    #[test]
+    fn skill_intake_refusal_serializes_its_code_and_names_the_replacement() {
+        let refusal = SkillIntakeRefusal::PlaybookTemplateRetired {
+            skill: "sf-login".to_string(),
+        };
+        assert_eq!(refusal.code(), "PLAYBOOK_TEMPLATE_RETIRED");
+        assert_eq!(
+            serde_json::to_value(&refusal).unwrap(),
+            serde_json::json!({"code": "PLAYBOOK_TEMPLATE_RETIRED", "skill": "sf-login"})
+        );
+        let message = refusal.to_string();
+        assert!(message.contains("`sf-login`"), "{message}");
+        assert!(message.contains(".qontinui/contexts/"), "{message}");
+    }
+
+    /// A template step with no `type` (the empty `single_step` a stored
+    /// template that does not parse is served as, or an untyped step of a
+    /// multi_step) is refused, naming the skill; a typed step still
+    /// instantiates through the same call.
+    #[test]
+    fn instantiate_refuses_a_template_step_with_no_type() {
+        let skill_with = |template: SkillTemplate| SkillDefinition {
+            id: "user:sf-login".into(),
+            name: "Salesforce login".into(),
+            slug: "sf-login".into(),
+            description: String::new(),
+            category: "custom".into(),
+            tags: vec![],
+            icon: "puzzle".into(),
+            color: "gray".into(),
+            allowed_phases: vec!["setup".into()],
+            parameters: vec![],
+            template,
+            source: SkillSource::User,
+            version: None,
+            author: None,
+            checksum: None,
+            depends_on: None,
+            usage_count: None,
+            approval_status: None,
+            forked_from: None,
+        };
+        let typed = || HashMap::from([("type".to_string(), Value::String("command".into()))]);
+        let untyped_templates = [
+            SkillTemplate::SingleStep {
+                step: HashMap::new(),
+            },
+            SkillTemplate::MultiStep {
+                steps: vec![typed(), HashMap::from([("type".to_string(), Value::Null)])],
+            },
+        ];
+        for template in untyped_templates {
+            let err = instantiate_skill(&skill_with(template), "setup", &HashMap::new())
+                .expect_err("an untyped step is refused");
+            assert!(err.contains("user:sf-login"), "{err}");
+            assert!(err.contains("no `type`"), "{err}");
+        }
+        let steps = instantiate_skill(
+            &skill_with(SkillTemplate::SingleStep { step: typed() }),
+            "setup",
+            &HashMap::new(),
+        )
+        .expect("a typed step instantiates");
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0]["type"], "command");
+    }
+
+    /// With the variant deleted a `playbook` template no longer deserializes,
+    /// which is why the intake doors refuse it BEFORE typed deserialization.
+    #[test]
+    fn a_playbook_template_no_longer_deserializes() {
+        let err = serde_json::from_value::<SkillTemplate>(
+            serde_json::json!({"kind": "playbook", "content": "x"}),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("unknown variant `playbook`"),
+            "{err}"
+        );
+        // Control: a live kind still deserializes through the same call.
+        assert!(serde_json::from_value::<SkillTemplate>(
+            serde_json::json!({"kind": "single_step", "step": {}})
+        )
+        .is_ok());
     }
 }

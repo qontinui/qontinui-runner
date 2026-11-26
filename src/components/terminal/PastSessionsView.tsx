@@ -7,6 +7,7 @@ import {
 } from "./useLiveClaudeSessionNames";
 import { instanceStorage } from "@/lib/instance-storage";
 import { SinceRestartSection } from "./SinceRestartSection";
+import { UnfinishedSessionsSection } from "./UnfinishedSessionsSection";
 import { useSinceRestart } from "./SinceRestartContext";
 import { finishButtonModel, pastSessionFinishId, type FinishOp } from "./sinceRestart";
 import { useFinishOps } from "./useFinishOps";
@@ -73,6 +74,24 @@ export const PAST_SESSIONS_EMPTY_SHOW_FINISHED_ID = "terminal.past-sessions-empt
  * box must not share a view preference.
  */
 const SHOW_FINISHED_KEY = "terminal.past-sessions.show-finished";
+
+/**
+ * Close reasons that need words for an operator. A reason with no entry
+ * renders as the backend wrote it.
+ */
+const CLOSE_REASON_LABELS: ReadonlyMap<string, string> = new Map([
+  // The Claude CLI never launched in its pane (the identity shim gave up on
+  // it), so the row is restorable, unlike a reason that names a death.
+  ["launch-failed", "launch failed — the Claude CLI could not be started"],
+]);
+
+/**
+ * What a card shows for `reason`. Every rendered close reason goes through
+ * here, so a reason that needs words gets them in one place.
+ */
+export function closeReasonLabel(reason: string): string {
+  return CLOSE_REASON_LABELS.get(reason) ?? reason;
+}
 
 /** Why a card shows no resume line (`resumeCommand === null`). */
 const NO_RESUME_LINE_TITLE =
@@ -367,7 +386,9 @@ function PastSessionCard({
           className="w-2 h-2 rounded-full shrink-0"
           style={{ backgroundColor: closed ? "#565f89" : "#9ece6a" }}
           title={
-            closed ? `closed${session.closeReason ? ` — ${session.closeReason}` : ""}` : "open"
+            closed
+              ? `closed${session.closeReason ? ` — ${closeReasonLabel(session.closeReason)}` : ""}`
+              : "open"
           }
         />
         <span
@@ -401,7 +422,9 @@ function PastSessionCard({
             closed ? "bg-[#565f89]/15 text-[#565f89]" : "bg-[#9ece6a]/15 text-[#9ece6a]"
           }`}
         >
-          {closed ? `closed${session.closeReason ? ` · ${session.closeReason}` : ""}` : "open"}
+          {closed
+            ? `closed${session.closeReason ? ` · ${closeReasonLabel(session.closeReason)}` : ""}`
+            : "open"}
         </span>
         {restoreBadge && (
           <span
@@ -490,7 +513,7 @@ function PastSessionCard({
  * its own `usePastSessions` hook.
  */
 export function PastSessionsView({ onResumePastSession }: PastSessionsViewProps) {
-  const { sessions, loading, error, refresh: refreshSessions } = usePastSessions();
+  const { sessions, loading, loaded, error, refresh: refreshSessions } = usePastSessions();
   // The "Since restart" roster (null outside a `SinceRestartProvider`).
   const roster = useSinceRestart();
   const refreshRoster = roster?.refresh;
@@ -598,6 +621,12 @@ export function PastSessionsView({ onResumePastSession }: PastSessionsViewProps)
         {/* "Before the last restart" / the pre-rebuild preview — first, so
             the strip's Review lands on it. */}
         <SinceRestartSection />
+        <UnfinishedSessionsSection
+          sessions={sessions}
+          loaded={loaded}
+          error={error}
+          onSettled={onFinishSettled}
+        />
         {loading && sessions.length === 0 ? (
           <div className="flex items-center justify-center py-8 text-[#565f89] text-xs">
             <div className="w-3 h-3 border-2 border-[#565f89] border-t-transparent rounded-full animate-spin mr-2" />

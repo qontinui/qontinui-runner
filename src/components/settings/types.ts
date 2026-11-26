@@ -128,6 +128,17 @@ export interface ClaudeCliSettings {
   /** After a migration respawn, nudge the resumed session to continue its
    * task once the CLI is idle. Runner default: true. */
   auto_continue_after_migration?: boolean;
+  /** Continue a session in place once the usage limit it stopped at has
+   * reset (a park until then when the reset is still ahead). Independent of
+   * auto-migration; works with one account. Runner default: true. */
+  auto_continue_after_limit_reset?: boolean;
+  /** Let the runner install Claude Code CLI updates on this machine: one
+   * runner-side updater installs a newly published release once, when it is
+   * newer than the installed one. Runner-spawned sessions never update
+   * themselves (the runner sets `DISABLE_AUTOUPDATER=1` for them), so off means
+   * they stay on the installed version until `claude update` is run by hand.
+   * Runner default: true. */
+  runner_manages_cli_updates?: boolean;
 }
 
 /** One per-model scoped weekly limit (e.g. the Fable-only cap). */
@@ -415,9 +426,12 @@ export function compareForAccountSelectionMode(
 
 /** Whether a mode picks one predictable account, so the UI may mark it as the
  * auto-selected one. `manual` names its account explicitly; `weighted_random`
- * draws a new account on each pick. */
+ * draws a new account on each pick. An UNKNOWN mode (`undefined` — the
+ * settings load failed, so the form carries no mode) is not deterministic
+ * either: the page cannot know which account the runner will use, and the
+ * likeliest real mode, the runner's default, draws. */
 export function hasDeterministicPick(mode: AccountSelectionMode | undefined): boolean {
-  return mode !== "manual" && mode !== "weighted_random";
+  return mode !== undefined && mode !== "manual" && mode !== "weighted_random";
 }
 
 export interface ClaudeApiSettings {

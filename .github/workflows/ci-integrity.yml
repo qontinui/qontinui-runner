@@ -31,7 +31,8 @@
 # NOT DETECTED, and no claim is made otherwise:
 #   * anything a gate SHELLS OUT TO. A step is compared by its `run:` TEXT, so
 #     `run: bash scripts/foo.sh` is unchanged when `scripts/foo.sh` is gutted,
-#     and files outside the two trigger globs never reach this job at all.
+#     and files the trigger does not name (its two globs and its one exact path)
+#     never reach this job at all.
 #   * `.github/CODEOWNERS`, a merge gate under the ruleset that lives in
 #     `.github/` but NOT under `workflows/` or `actions/`, so it does not even
 #     trigger this workflow.
@@ -172,7 +173,11 @@ on:
       # guard would never even run. Listed explicitly rather than globbing
       # scripts/**, which is full of non-gating tooling. The scope filter in the
       # job body carries the same path as a `case` arm — a `paths:` entry alone
-      # would trigger the run and then be silently dropped by that filter.
+      # would trigger the run and then be silently dropped by that filter — and
+      # WHOLE_FILE_GATES names it too, or a non-YAML path can never pass. Add a path
+      # to all three, keeping that table on one line because the suite lifts it as
+      # one: scripts/tests/ci-integrity/test-surface.py section 7 fails when they
+      # disagree, and it compares the globs above the same way.
       - 'scripts/check_untimed_subprocess.py'
 
 permissions:
@@ -192,9 +197,7 @@ permissions:
 # interpolating only `github.event_name` / `github.ref` and collapsing every
 # other expression to "" (qontinui-coord ci_observer.rs resolve_group_template),
 # and run_is_reaper_at_risk never matches an empty group, so no push run here is
-# modelled as reapable by a land. (KNOWN coord gap: the budget-cancel candidate
-# scan in stuck_pr_watcher.rs compares groups with `=`, so every "" group
-# matches every other one and suppresses its auto re-run; fix belongs in coord.)
+# modelled as reapable by a land.
 # RESIDUAL: two pushes seconds apart can have
 # their runs CREATED out of order, so the older head's run cancels the newer
 # head's; the next push (or a close+reopen) heals it.
@@ -222,7 +225,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Paths under the trigger globs that are NOT gate logic. Every entry
+          # Paths under the trigger that are NOT gate logic. Every entry
           # needs a justification, because anything listed here is invisible to
           # this guard. Empty is the correct default: a file earns a place only
           # once someone can say why weakening it could not affect a merge.
@@ -271,7 +274,7 @@ jobs:
             exit 1
           fi
 
-          # Scope = the trigger globs, minus NON_GATING.
+          # Scope = the trigger's paths, minus NON_GATING.
           #
           # NO PIPE into `grep -q` anywhere in this job, deliberately.
           # `printf ... | grep -q` is a silent fail-OPEN under `set -o pipefail`:
@@ -620,7 +623,24 @@ jobs:
             echo ""
             echo "Declare it, then RE-RUN this job — applying a label does not"
             echo "re-trigger this workflow on its own:"
-            echo "  gh pr edit ${PR_NUMBER} --add-label 'ci:gate-change=declared'"
+            # The findings are already computed, so name the declaration that will
+            # pass. Printing the weak label for an altered surface only earns a second
+            # red (qontinui-runner#2485).
+            if [ -n "${FINDINGS}" ]; then
+              echo "  gh pr edit ${PR_NUMBER} --add-label 'ci:gate-change=alters-a-gate'"
+              echo ""
+              echo "and add exactly these line(s) to the PR body:"
+              while IFS=$'\t' read -r kind path tok; do
+                [ -z "${tok:-}" ] && continue
+                case "${kind}" in
+                  REMOVED) echo "  Gate-Removal: ${tok}" ;;
+                  *)       echo "  Gate-Change: ${tok}"  ;;
+                esac
+              done <<< "${FINDINGS}"
+              echo ""
+            else
+              echo "  gh pr edit ${PR_NUMBER} --add-label 'ci:gate-change=declared'"
+            fi
             echo "An agent applies this itself with gh; no operator and no coord call is needed."
             exit 1
           fi

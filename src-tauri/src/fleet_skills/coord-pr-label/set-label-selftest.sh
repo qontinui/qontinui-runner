@@ -86,6 +86,7 @@ chmod +x "$STUBDIR/gh"
 PATH="$STUBDIR:$PATH"
 export PATH
 export QONTINUI_AGENT_ID="selftest-dummy"
+export COORD_PR_LABEL_READBACK_RETRY_SECS=0   # the read-back retry waits for GitHub, not for a stub
 export COORD_URL="http://127.0.0.1:1"
 cleanup() { rm -rf "$STUBDIR"; }
 trap cleanup EXIT
@@ -254,6 +255,19 @@ for _cr in "coord:clears-red=some-repo" "coord:clears-red=acme/some-repo" \
   expect_reject "$_cr" "labels[]=coord:clears-red=<repo>"
   expect_absent "$_cr" "unknown coord:* label key"
 done
+# `destructive-attested` is GitHub-applied only too (coord's
+# DESTRUCTIVE_ATTESTED_LABEL_ERR): every spelling, well-formed or not, gets the
+# error naming the route -- never the generic fallthroughs.
+for _da in "coord:destructive-attested=0123456789ab" "coord:destructive-attested=not-a-digest" \
+           "coord:destructive-attested" "coord:destructive-attested="; do
+  expect_reject "$_da" "coord:destructive-attested=<digest12> must be set on the PR itself"
+  expect_reject "$_da" "labels[]=coord:destructive-attested=<digest12>"
+  expect_absent "$_da" "unknown coord:* label key"
+  expect_absent "$_da" 'parameterised labels need "=value"'
+done
+# The arm is exact: a near-miss key is NOT this refusal. Widening it to
+# `destructive-attested*` would pass every assertion above.
+expect_reject "coord:destructive-attestedx=0123456789ab" "unknown coord:* label key"
 
 # ----- an accepted dry run states what it did NOT check -----------------------
 # `--dry-run` clears the grammar and the ceiling, which closes cause 2 of
@@ -303,6 +317,17 @@ expect_reject "coord:state=open"              "coord-set label"
 expect_reject "coord:blocked-by=x"            "coord-set label"
 expect_reject "coord:operator-review"         "retired label"
 expect_reject "coord:version-bump=1"          "retired label"
+# The coord hold is served, so every retired-hold refusal names it and none still
+# offers the draft fallback coord's RETIRED_HOLD_LABEL_ERR dropped.
+for _rh in "coord:blocked" "coord:experimental" "coord:operator-review" "coord:version-bump=1"; do
+  expect_reject "$_rh" "coord_set_pr_hold"
+  # A coord hold holds nothing on this repo: auto-merge.yml does not read it.
+  expect_reject "$_rh" "auto-merge:hold"
+  # Removing the label alone lands nothing: auto-merge.yml is edge-triggered.
+  expect_reject "$_rh" "then re-fire the PR's lint"
+  expect_absent "$_rh" "gh pr ready"
+  expect_absent "$_rh" "once coord serves"
+done
 expect_reject "coord:bogus=1"                 "unknown coord:* label key"
 expect_reject "not-a-coord-label"             "must start with"
 expect_reject "coord:downstream-of=repo#abc"  "must be int"
@@ -346,6 +371,8 @@ expect_reject "coord:requires-tag="           'value after "=" cannot be empty'
 # that carries the fix, so a reworded preamble does not silently un-pin it.
 expect_reject "coord:priority"                "must be set on the PR itself"
 expect_reject "coord:priority=1"              "must be set on the PR itself"
+expect_reject "coord:destructive-attested"              "must be set on the PR itself"
+expect_reject "coord:destructive-attested=abcdef123456" "must be set on the PR itself"
 
 # `coord:red-main-fix` is rejected by coord with the GENERIC message -- coord
 # has no bespoke arm for it, so this mirror must not invent one. This case pins
@@ -419,13 +446,65 @@ SENTINEL2="$STUBDIR2/gh-was-called"
 GH_STUB_MSG_FILE="$STUBDIR2/message"
 GH_STUB_RC_FILE="$STUBDIR2/rc"
 GH_STUB_STDOUT="STDOUT-MARKER https://github.com/o/r/pull/1"
-{
-  echo '#!/usr/bin/env bash'
-  echo 'echo "gh $*" >> "$(dirname "$0")/gh-was-called"'
-  echo 'echo "STDOUT-MARKER https://github.com/o/r/pull/1"'
-  echo 'cat "$(dirname "$0")/message" >&2'
-  echo 'exit "$(cat "$(dirname "$0")/rc")"'
-} > "$STUBDIR2/gh"
+cat > "$STUBDIR2/gh" <<'GHSTUB'
+#!/usr/bin/env bash
+# The label ADD (`-X POST`) and `gh label create` get the fixed response from
+# the `message`/`rc` files. A successful add records the label in `added`, and
+# the READS model GitHub from fixture files (all optional):
+#   labels_rc      a failing labels read (the GitHub read-back UNKNOWN arm)
+#   strip_after K  labels reads after the K-th list nothing (coord's strip)
+#   pull.N / pull  the N-th pulls read / any pulls read: `state|merged_at|landed`
+#   pull_rc        a failing pulls read
+#   events         `id<TAB>created_at<TAB>labeled|unlabeled<TAB>actor<TAB>label` lines
+#                  read after the POST; events_pre / labels_pre are what the
+#                  pre-add mark reads BEFORE it (events_pre_fail fails it); events_rc
+#   labels_list    the label names GitHub lists, verbatim (else `added`)
+D="$(dirname "$0")"
+echo "gh $*" >> "$D/gh-was-called"
+bump() { local n; n=$(( $(cat "$D/$1" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$D/$1"; echo "$n"; }
+case "$*" in
+  *"-X POST"*|"label create"*) ;;
+  *"/pulls/"*)
+    n="$(bump pull-reads)"
+    if [ -r "$D/pull_rc" ]; then exit "$(cat "$D/pull_rc")"; fi
+    if [ -r "$D/pull.$n" ]; then cat "$D/pull.$n"; elif [ -r "$D/pull" ]; then cat "$D/pull"; else echo "open||false"; fi
+    exit 0 ;;
+  *"/events"*)
+    # Before the first successful POST (no `posted` marker) this is the
+    # pre-add mark: it sees `events_pre`; after it, `events`. events_rc fails
+    # both; events_rc_post fails only the reads after the POST.
+    if [ -r "$D/events_rc" ]; then exit "$(cat "$D/events_rc")"; fi
+    if [ -e "$D/posted" ] && [ -r "$D/events_rc_post" ]; then exit 1; fi
+    if [ ! -e "$D/posted" ]; then
+      if [ -r "$D/events_pre_fail" ]; then exit 1; fi
+      cat "$D/events_pre" 2>/dev/null; exit 0
+    fi
+    cat "$D/events" 2>/dev/null; exit 0 ;;
+  *"/labels"*)
+    if [ -r "$D/labels_rc" ]; then exit "$(cat "$D/labels_rc")"; fi
+    # Before the first successful POST this is the pre-add read: GitHub lists
+    # only what was already there (labels_pre), and the read is not counted.
+    if [ ! -e "$D/posted" ]; then
+      if [ -r "$D/labels_pre_fail" ]; then exit 1; fi
+      cat "$D/labels_pre" 2>/dev/null; exit 0
+    fi
+    n="$(bump label-reads)"
+    if [ -r "$D/labels_rc_after_1" ] && [ "$n" -gt 1 ]; then exit 1; fi
+    if [ -r "$D/first_labels_empty" ] && [ "$n" -eq 1 ]; then exit 0; fi
+    if [ -r "$D/strip_after" ] && [ "$n" -gt "$(cat "$D/strip_after")" ]; then exit 0; fi
+    # GitHub lists what was there before the POST plus what it added.
+    # (case-insensitively, as GitHub dedupes label names)
+    if [ -r "$D/labels_list" ]; then cat "$D/labels_list"; else cat "$D/labels_pre" "$D/added" 2>/dev/null | sort -uf; fi; exit 0 ;;
+esac
+echo "STDOUT-MARKER https://github.com/o/r/pull/1"
+cat "$D/message" >&2
+rc="$(cat "$D/rc")"
+if [ "$rc" = 0 ]; then
+  for a in "$@"; do case "$a" in "labels[]="*) printf '%s\n' "${a#*=}" >> "$D/added" ;; esac; done
+  : > "$D/posted"
+fi
+exit "$rc"
+GHSTUB
 chmod +x "$STUBDIR2/gh"
 PATH="$STUBDIR2:$PATH"
 export PATH
@@ -445,6 +524,7 @@ ok
 
 # run_gh <exit code> <stderr line> -- sets RC and OUT.
 run_gh() {
+  rm -f "$STUBDIR2/posted" "$STUBDIR2/added" "$STUBDIR2/label-reads"
   printf '%s\n' "$2" > "$GH_STUB_MSG_FILE"
   printf '%s\n' "$1" > "$GH_STUB_RC_FILE"
   : > "$SENTINEL2"
@@ -534,6 +614,10 @@ echo 0 > "$CALL_COUNT"
 {
   echo '#!/usr/bin/env bash'
   echo 'DIR="$(dirname "$0")"'
+  # The GitHub reads (the pre-add events mark, the label READ-BACK after the
+  # retried add) are answered before the call count: GitHub carries the label.
+  # The label is on the PR only once the retried POST (call 3) has run.
+  echo 'case "$*" in *"-X POST"*|"label create"*) ;; *"/events"*) exit 0 ;; *"/labels"*) [ "$(cat "$DIR/call-count")" -ge 3 ] && echo coord:credibility-override; exit 0 ;; esac'
   echo 'N=$(($(cat "$DIR/call-count") + 1)); echo "$N" > "$DIR/call-count"'
   echo 'echo "gh $*" >> "$DIR/gh-was-called"'
   echo 'if [[ "$N" == "1" ]]; then echo "Label does not exist" >&2; exit 1; fi'
@@ -709,6 +793,8 @@ stub() { printf '%s\n' "$2" > "$STUBDIR3/$1.code"; printf '%s' "${3:-}" > "$STUB
 # run_coord <label> -> RC, OUT; resets the call log.
 run_coord() {
   : > "$STUBDIR3/calls"; : > "$STUBDIR3/bearers"
+  # Every run starts before its own POST: no `posted`, nothing `added`.
+  rm -f "$STUBDIR2/posted" "$STUBDIR2/added" "$STUBDIR2/label-reads"
   OUT="$(HOME="$FAKEHOME" bash "$SCRIPT" --repo "$REPO" --pr 7 --label "$1" 2>&1)"; RC=$?
 }
 calls_of() { grep -c "^$1 " "$STUBDIR3/calls" 2>/dev/null || true; }
@@ -736,7 +822,7 @@ run_coord "coord:stacked-on=#6"
 expect_rc 0 "T1 proven"
 expect_out "owner check: proven: tenant $T_OWN owns $REPO" "T1 proven"
 expect_out "coord recorded label" "T1 proven"
-expect_out "(read back: present, source=coord_skill)" "T1 proven"
+expect_out "(read back: present, source=coord_skill; on GitHub: present)" "T1 proven"
 expect_calls probe 1 "T1"; expect_calls door 1 "T1"; expect_calls post 1 "T1"
 expect_calls read 1 "T1 (read-back)"
 # The read asked about THIS PR as a GET (`-G`: without it curl would POST the
@@ -762,7 +848,7 @@ run_coord "coord:upstream-of=qontinui-runner#1705"
 expect_rc 5 "T2 refuted"
 expect_out "WITHHELD" "T2 refuted"
 expect_out "does NOT own $REPO" "T2 refuted"
-expect_out "gh-side label add succeeded" "T2 refuted"
+expect_out "the GitHub label read back present at step 1" "T2 refuted"
 expect_calls post 0 "T2 (no wrong-tenant row)"
 expect_calls read 0 "T2 (withheld: nothing written, nothing to read back)"
 
@@ -1004,9 +1090,332 @@ expect_out "is not usable" "T17"
 expect_calls post 0 "T17"
 rm -rf "$_t17"
 
+# ----- no success claim rests on gh's exit code: the label is READ from GitHub -
+# The 2026-11-17 incident (qontinui/qontinui-coord#4227): `coord:downstream-of=
+# qontinui/qontinui-web#2281` was accepted by GitHub, then stripped two seconds
+# later by coord because web#2281 had already landed. The script printed
+# `ok: gh added label`, and the missing coord row then read as a CONTRADICTION.
+# The gh stub above models GitHub's reads (labels, events, the upstream PR), so
+# each arm is driven by what GitHub would SAY, not by gh's exit code.
+gh_fx_reset() {
+  rm -f "$STUBDIR2"/label-reads "$STUBDIR2"/pull-reads "$STUBDIR2"/strip_after "$STUBDIR2"/pull "$STUBDIR2"/pull.* \
+    "$STUBDIR2"/pull_rc "$STUBDIR2"/events "$STUBDIR2"/events_pre "$STUBDIR2"/first_labels_empty "$STUBDIR2"/labels_rc_after_1 "$STUBDIR2"/events_rc "$STUBDIR2"/events_pre_fail "$STUBDIR2"/posted "$STUBDIR2"/labels_pre "$STUBDIR2"/labels_pre_fail "$STUBDIR2"/events_rc_post "$STUBDIR2"/labels_rc "$STUBDIR2"/labels_list "$STUBDIR2"/added
+  : > "$SENTINEL2"
+}
+gh_calls() { cat "$SENTINEL2"; }
+no_gh_ok() { if [[ "$OUT" == *"ok: gh added label"* || "$OUT" == *"was already on"* ]]; then fail "$1: claimed the label is on the PR :: $OUT"; else ok; fi; }
+no_post() { if grep -q -- "-X POST" "$SENTINEL2"; then fail "$1: the label add was sent :: $(gh_calls)"; else ok; fi; }
+stub probe 200 "{\"tenant_id\":\"$T_OWN\",\"written\":0,\"deleted\":0,\"rejected\":[]}"
+stub mint 200 "{\"token\":\"$(mkjwt "$T_OWN")\"}"
+stub door 200 "{\"repo\":\"$REPO\",\"pr\":7,\"resolved\":false}"
+stub post 200 "$OK_POST"
+DEP="coord:downstream-of=qontinui/qontinui-web#2281"
+BARE="coord:downstream-of=qontinui-web#2281"
+STRIP_EVENT="$(printf '201\t2099-01-01T00:00:01Z\tlabeled\tjspinak\t%s\n202\t2099-01-01T00:00:03Z\tunlabeled\tqontinui-merge-orchestrator\t%s' "$DEP" "$DEP")"
+
+# --- G0: the ordinary ok names BOTH read-backs, and the upstream was read at
+# the right coordinates (a bare repo takes the PR's owner; `#<n>` is this repo).
+gh_fx_reset
+stub read 200 "$(rb_body "coord:stacked-on=#6")"
+run_coord "coord:stacked-on=#6"
+expect_rc 0 "G0 ok"
+expect_out "(read back on GitHub: present)" "G0 step-1 read-back"
+expect_out "source=coord_skill; on GitHub: present)" "G0 final read-back"
+if grep -q "repos/$REPO/pulls/6" "$SENTINEL2"; then ok; else fail "G0: stacked-on=#6 did not read repos/$REPO/pulls/6 :: $(gh_calls)"; fi
+if [[ "$(grep -c "issues/7/labels --paginate" "$SENTINEL2")" == 3 ]]; then ok; else fail "G0: expected 3 GitHub label reads (pre-add, step 1, final) :: $(gh_calls)"; fi
+gh_fx_reset
+stub read 200 "$(rb_body "coord:downstream-of=qontinui/qontinui-web#2281")"
+run_coord "$BARE"
+expect_rc 0 "G0b bare-repo dep label"
+expect_out "owner is not stated" "G0b"
+if grep -q "/pulls/" "$SENTINEL2"; then fail "G0b: a bare repo's owner was guessed for the pre-flight :: $(gh_calls)"; else ok; fi
+
+# --- G1: the upstream has ALREADY landed -> NOT-SENT before anything is
+# sent: no label add, no coord call, and never an ok. Both land shapes count --
+# GitHub's merge, and coord's rebase-ff land (closed, merged_at null, coord:landed).
+for pull in "closed||true" "closed|2026-11-17T09:25:43Z|true"; do
+  gh_fx_reset; printf '%s\n' "$pull" > "$STUBDIR2/pull"
+  run_coord "$DEP"
+  expect_rc 7 "G1 upstream landed [$pull]"
+  expect_out "NOT-SENT" "G1 [$pull]"
+  expect_out "Nothing was sent" "G1 [$pull]"
+  if [[ "$OUT" == *STRIPPED-STALE* || "$OUT" == *"is not on"* ]]; then fail "G1 [$pull]: claimed a strip / a label state it never read :: $OUT"; else ok; fi
+  no_post "G1 [$pull]"; no_gh_ok "G1 [$pull]"; no_ok "G1 [$pull]"
+  if [[ -s "$STUBDIR3/calls" ]]; then fail "G1 [$pull]: coord was called :: $(cat "$STUBDIR3/calls")"; else ok; fi
+done
+# ...but a CLOSED upstream that never landed is not satisfied: the add goes out.
+gh_fx_reset; printf 'closed||false\n' > "$STUBDIR2/pull"
+run_coord "$DEP"
+if [[ $RC -eq 7 ]]; then fail "G1c: a closed-unlanded upstream was called stale :: $OUT"; else ok; fi
+if grep -q -- "-X POST" "$SENTINEL2"; then ok; else fail "G1c: the add was not sent :: $(gh_calls)"; fi
+
+# --- G2: the incident, step 1 arm. The upstream reads open at the pre-flight,
+# GitHub accepts the add, coord strips it before the read-back. Exit 7, no gh
+# ok, and coord is never written (a row coord would delete again).
+gh_fx_reset
+printf 'open||false\n' > "$STUBDIR2/pull.1"; printf 'closed||true\n' > "$STUBDIR2/pull"
+printf '0\n' > "$STUBDIR2/strip_after"; printf '%s\n' "$STRIP_EVENT" > "$STUBDIR2/events"
+run_coord "$DEP"
+expect_rc 7 "G2 stripped right after the add"
+expect_out "removed by qontinui-merge-orchestrator at 2099-01-01T00:00:03Z" "G2"
+no_gh_ok "G2"; no_ok "G2"
+expect_calls post 0 "G2 (no coord write for a stripped label)"
+if [[ "$OUT" == *CONTRADICTION* ]]; then fail "G2: reported as a contradiction :: $OUT"; else ok; fi
+
+# --- G3: the incident, coord arm. GitHub reads present at step 1, then coord
+# strips it and drops its own row: coord answers written=1, its read door lists
+# nothing. That is the strip, not a CONTRADICTION -- exit 7.
+gh_fx_reset
+printf 'open||false\n' > "$STUBDIR2/pull.1"; printf 'closed||true\n' > "$STUBDIR2/pull"
+printf '1\n' > "$STUBDIR2/strip_after"; printf '%s\n' "$STRIP_EVENT" > "$STUBDIR2/events"
+stub read 200 "$(rb_body)"
+run_coord "$DEP"
+expect_rc 7 "G3 coord row gone because coord stripped the label"
+expect_out "STRIPPED-STALE" "G3"
+if [[ "$OUT" == *CONTRADICTION* ]]; then fail "G3: reported as a contradiction :: $OUT"; else ok; fi
+no_ok "G3"
+# G3b: coord still lists its row, GitHub no longer carries the label: the final
+# GitHub read refuses the ok.
+gh_fx_reset
+printf 'open||false\n' > "$STUBDIR2/pull.1"; printf 'closed||true\n' > "$STUBDIR2/pull"
+printf '1\n' > "$STUBDIR2/strip_after"; printf '%s\n' "$STRIP_EVENT" > "$STUBDIR2/events"
+stub read 200 "$(rb_body "coord:downstream-of=qontinui/qontinui-web#2281")"
+run_coord "$DEP"
+expect_rc 7 "G3b stripped after the coord read-back"
+no_ok "G3b"
+expect_out "coord DOES carry a coord_skill row" "G3b (the row left behind is named)"
+# G3c: a missing coord row while the label IS still on GitHub stays a CONTRADICTION.
+gh_fx_reset
+stub read 200 "$(rb_body)"
+run_coord "$DEP"
+expect_rc 4 "G3c real contradiction"
+expect_out "CONTRADICTION" "G3c"
+expect_out "reads present on a fresh read" "G3c"
+
+# --- G4: not a stale strip -> an error, never ok, never STRIPPED-STALE.
+# (a) the add changed nothing (no removal recorded); (b) a person removed it and
+# the upstream is still open; (c) the PR's events cannot be read.
+gh_fx_reset; printf '0\n' > "$STUBDIR2/strip_after"
+run_coord "coord:merge-strategy=squash"
+expect_rc 3 "G4a absent, no removal recorded"
+expect_out "records no removal" "G4a"; no_gh_ok "G4a"; expect_calls post 0 "G4a"
+gh_fx_reset; printf '0\n' > "$STUBDIR2/strip_after"
+printf '201\t2099-01-01T00:00:01Z\tlabeled\tjspinak\t%s\n202\t2099-01-01T00:00:03Z\tunlabeled\tsomebody\t%s\n' "$DEP" "$DEP" > "$STUBDIR2/events"
+run_coord "$DEP"
+expect_rc 3 "G4b removed by a person, upstream open"
+expect_out "removed by somebody" "G4b"
+if [[ "$OUT" == *STRIPPED-STALE* ]]; then fail "G4b: called stale with an open upstream :: $OUT"; else ok; fi
+gh_fx_reset; printf '0\n' > "$STUBDIR2/strip_after"; printf '1\n' > "$STUBDIR2/events_rc"
+printf 'closed||true\n' > "$STUBDIR2/pull"; printf 'open||false\n' > "$STUBDIR2/pull.1"
+run_coord "$DEP"
+expect_rc 3 "G4c events unreadable"
+expect_out "UNKNOWN" "G4c"
+if [[ "$OUT" == *STRIPPED-STALE* ]]; then fail "G4c: stale claimed without a recorded removal :: $OUT"; else ok; fi
+# G4c-b: the mark succeeded and only the post-POST events read fails -- the
+# message must name THAT, not the mark.
+gh_fx_reset; printf '0\n' > "$STUBDIR2/strip_after"; printf '1\n' > "$STUBDIR2/events_rc_post"
+printf 'closed||true\n' > "$STUBDIR2/pull"; printf 'open||false\n' > "$STUBDIR2/pull.1"
+run_coord "$DEP"
+expect_rc 3 "G4c-b post-POST events unreadable"
+expect_out "the PR's events could not be read)" "G4c-b"
+if [[ "$OUT" == *"before the POST"* ]]; then fail "G4c-b: blamed the pre-POST mark, which succeeded :: $OUT"; else ok; fi
+if [[ "$OUT" == *STRIPPED-STALE* ]]; then fail "G4c-b: stale claimed without a readable removal :: $OUT"; else ok; fi
+
+# --- G5: the GitHub read-back itself fails -> exit 8, UNKNOWN, nothing to coord.
+gh_fx_reset; printf '1\n' > "$STUBDIR2/labels_rc"
+run_coord "coord:stacked-on=#6"
+expect_rc 8 "G5 GitHub read-back unreadable"
+no_gh_ok "G5"; expect_calls post 0 "G5"; expect_calls probe 0 "G5"
+
+# --- G6: an unreadable upstream does not stop the add; it is named UNKNOWN.
+gh_fx_reset; printf '1\n' > "$STUBDIR2/pull_rc"
+stub read 200 "$(rb_body "coord:stacked-on=#6")"
+run_coord "coord:stacked-on=#6"
+expect_rc 0 "G6 upstream unreadable at the pre-flight"
+expect_out "has landed is UNKNOWN" "G6"
+
+# --- G7: (G7b and G7f are what pin the event-id mark itself; here a mark of 0
+# would read two new adds and exit 3 as well.)
+# a removal OLDER than the newest add is not this add's removal, so a
+# landed upstream does not make it STRIPPED-STALE: the cause is UNKNOWN, exit 3.
+gh_fx_reset
+printf 'open||false\n' > "$STUBDIR2/pull.1"; printf 'closed||true\n' > "$STUBDIR2/pull"
+printf '0\n' > "$STUBDIR2/strip_after"
+printf '101\t2026-11-16T01:00:00Z\tlabeled\tjspinak\t%s\n102\t2026-11-16T01:00:02Z\tunlabeled\tqontinui-merge-orchestrator\t%s\n' "$DEP" "$DEP" > "$STUBDIR2/events_pre"
+printf '101\t2026-11-16T01:00:00Z\tlabeled\tjspinak\t%s\n102\t2026-11-16T01:00:02Z\tunlabeled\tqontinui-merge-orchestrator\t%s\n201\t2099-01-01T00:00:01Z\tlabeled\tjspinak\t%s\n' "$DEP" "$DEP" "$DEP" > "$STUBDIR2/events"
+run_coord "$DEP"
+expect_rc 3 "G7 only an older removal is recorded"
+expect_out "no removal of THIS add" "G7"
+if [[ "$OUT" == *STRIPPED-STALE* ]]; then fail "G7: an older removal was credited to this add :: $OUT"; else ok; fi
+
+# --- G7b: the new `labeled` event has not appeared yet (events lag), so the
+# newest VISIBLE add is an old one, with its old removal after it. That removal
+# predates this run's add, so it is not this add's: exit 3, and the landed
+# upstream is still NAMED in the message.
+gh_fx_reset
+printf 'open||false\n' > "$STUBDIR2/pull.1"; printf 'closed||true\n' > "$STUBDIR2/pull"
+printf '0\n' > "$STUBDIR2/strip_after"
+printf '101\t2026-11-16T01:00:00Z\tlabeled\tjspinak\t%s\n102\t2026-11-16T01:00:02Z\tunlabeled\tqontinui-merge-orchestrator\t%s\n' "$DEP" "$DEP" > "$STUBDIR2/events_pre"; cp "$STUBDIR2/events_pre" "$STUBDIR2/events"
+run_coord "$DEP"
+expect_rc 3 "G7b lagging labeled event, old removal visible"
+if [[ "$OUT" == *STRIPPED-STALE* ]]; then fail "G7b: an old removal was credited to this add :: $OUT"; else ok; fi
+expect_out "reads: closed with coord:landed" "G7b (the landed upstream is named)"
+
+# --- G7c: events out of time order are sorted before they are read -- a newer
+# removal listed first must still be found.
+gh_fx_reset
+printf 'open||false\n' > "$STUBDIR2/pull.1"; printf 'closed||true\n' > "$STUBDIR2/pull"
+printf '0\n' > "$STUBDIR2/strip_after"
+printf '202\t2099-01-01T00:00:03Z\tunlabeled\tqontinui-merge-orchestrator\t%s\n201\t2099-01-01T00:00:01Z\tlabeled\tjspinak\t%s\n' "$DEP" "$DEP" > "$STUBDIR2/events"
+run_coord "$DEP"
+expect_rc 7 "G7c events listed newest-first"
+
+# --- G7f: an earlier add MINUTES ago (a retry or a peer) with its removal is
+# visible before the POST; this run's own labeled event has not appeared yet.
+# Its removal is not this add's, whatever the clock says: exit 3.
+gh_fx_reset
+printf 'open||false\n' > "$STUBDIR2/pull.1"; printf 'closed||true\n' > "$STUBDIR2/pull"
+printf '0\n' > "$STUBDIR2/strip_after"
+printf '301\t2099-01-01T00:00:00Z\tlabeled\tpeer\t%s\n302\t2099-01-01T00:00:02Z\tunlabeled\tqontinui-merge-orchestrator\t%s\n' "$DEP" "$DEP" > "$STUBDIR2/events_pre"
+cp "$STUBDIR2/events_pre" "$STUBDIR2/events"
+run_coord "$DEP"
+expect_rc 3 "G7f a recent earlier add's removal"
+if [[ "$OUT" == *STRIPPED-STALE* ]]; then fail "G7f: an earlier add's removal was credited to this run :: $OUT"; else ok; fi
+
+# --- G7i: ids of different widths sort NUMERICALLY (98 < 99 < 100). A lexical
+# sort reads 100 (the removal) before 99 (this run's add), so the removal would
+# not follow the add and the credit would be lost.
+gh_fx_reset
+printf 'open||false\n' > "$STUBDIR2/pull.1"; printf 'closed||true\n' > "$STUBDIR2/pull"
+printf '0\n' > "$STUBDIR2/strip_after"
+printf '98\t2099-01-01T00:00:00Z\tlabeled\told\t%s\n' "$DEP" > "$STUBDIR2/events_pre"
+printf '98\t2099-01-01T00:00:00Z\tlabeled\told\t%s\n99\t2099-01-01T00:00:01Z\tlabeled\tjspinak\t%s\n100\t2099-01-01T00:00:03Z\tunlabeled\tqontinui-merge-orchestrator\t%s\n' "$DEP" "$DEP" "$DEP" > "$STUBDIR2/events"
+run_coord "$DEP"
+expect_rc 7 "G7i numeric id sort"
+
+# --- G7j: the label is ALREADY on the PR before the POST, so this run's add is
+# a no-op that records no event; a new add + removal is someone else's: exit 3.
+gh_fx_reset
+printf 'open||false\n' > "$STUBDIR2/pull.1"; printf 'closed||true\n' > "$STUBDIR2/pull"
+printf '%s\n' "$DEP" > "$STUBDIR2/labels_pre"
+printf '201\t2099-01-01T00:00:01Z\tlabeled\tpeer\t%s\n202\t2099-01-01T00:00:03Z\tunlabeled\tqontinui-merge-orchestrator\t%s\n' "$DEP" "$DEP" > "$STUBDIR2/events"
+printf '0\n' > "$STUBDIR2/strip_after"
+run_coord "$DEP"
+expect_rc 3 "G7j label already present before the POST"
+expect_out "already on the PR before this run's POST" "G7j (the real reason is named)"
+if [[ "$OUT" == *STRIPPED-STALE* ]]; then fail "G7j: a peer's add was credited to a no-op add :: $OUT"; else ok; fi
+
+# --- G7k: the label was ALREADY on the PR and stays there: an ok that says the
+# add changed nothing, never "gh added label".
+gh_fx_reset
+printf '%s\n' "coord:stacked-on=#6" > "$STUBDIR2/labels_pre"
+stub read 200 "$(rb_body "coord:stacked-on=#6")"
+run_coord "coord:stacked-on=#6"
+expect_rc 0 "G7k label already present, still present"
+expect_out "was already on $REPO#7" "G7k"
+if [[ "$OUT" == *"ok: gh added label"* ]]; then fail "G7k: claimed an add that changed nothing :: $OUT"; else ok; fi
+
+# --- G7k-b: already present, and the first post-POST read lags: the retry's
+# ok still says the add changed nothing.
+gh_fx_reset
+printf '%s\n' "coord:stacked-on=#6" > "$STUBDIR2/labels_pre"
+printf 'x\n' > "$STUBDIR2/first_labels_empty"
+stub read 200 "$(rb_body "coord:stacked-on=#6")"
+run_coord "coord:stacked-on=#6"
+expect_rc 0 "G7k-b"
+expect_out "it read present before the POST and absent after it" "G7k-b"
+if [[ "$OUT" == *"changed nothing"* ]]; then fail "G7k-b: claimed the add changed nothing after reading it absent :: $OUT"; else ok; fi
+if [[ "$OUT" == *"ok: gh added label"* ]]; then fail "G7k-b: claimed an add :: $OUT"; else ok; fi
+
+# --- G7l: the pre-POST labels read FAILS: the ok names presence only, never
+# "gh added label", and no removal could be tied to this run.
+gh_fx_reset
+printf 'x\n' > "$STUBDIR2/labels_pre_fail"
+stub read 200 "$(rb_body "coord:stacked-on=#6")"
+run_coord "coord:stacked-on=#6"
+expect_rc 0 "G7l pre-POST labels read failed"
+expect_out "whether this run's add changed it is UNKNOWN" "G7l"
+if [[ "$OUT" == *"ok: gh added label"* ]]; then fail "G7l: claimed an add nothing read back :: $OUT"; else ok; fi
+
+# --- G7g: TWO new labeled events after the mark (a peer added it too): which
+# one is this run's cannot be told, so nothing is credited -- exit 3.
+gh_fx_reset
+printf 'open||false\n' > "$STUBDIR2/pull.1"; printf 'closed||true\n' > "$STUBDIR2/pull"
+printf '0\n' > "$STUBDIR2/strip_after"
+printf '201\t2099-01-01T00:00:01Z\tlabeled\tjspinak\t%s\n202\t2099-01-01T00:00:02Z\tlabeled\tpeer\t%s\n203\t2099-01-01T00:00:03Z\tunlabeled\tqontinui-merge-orchestrator\t%s\n' "$DEP" "$DEP" "$DEP" > "$STUBDIR2/events"
+run_coord "$DEP"
+expect_rc 3 "G7g two new adds"
+
+# --- G7h: the pre-add mark could not be read -> nothing is ours: fail closed.
+gh_fx_reset
+printf 'open||false\n' > "$STUBDIR2/pull.1"; printf 'closed||true\n' > "$STUBDIR2/pull"
+printf '0\n' > "$STUBDIR2/strip_after"; printf '%s\n' "$STRIP_EVENT" > "$STUBDIR2/events"
+printf 'x\n' > "$STUBDIR2/events_pre_fail"
+run_coord "$DEP"
+expect_rc 3 "G7h pre-add mark unreadable"
+rm -f "$STUBDIR2/events_pre_fail"
+
+# --- G7d: upstream-of=X makes THIS PR the upstream, so the pre-flight reads it.
+gh_fx_reset
+printf 'closed||true\n' > "$STUBDIR2/pull"
+run_coord "coord:upstream-of=qontinui-runner#1705"
+expect_rc 7 "G7d upstream-of on a landed PR"
+if grep -q "repos/$REPO/pulls/7 " "$SENTINEL2"; then ok; else fail "G7d: the pre-flight did not read this PR :: $(gh_calls)"; fi
+
+# --- G7e: one lagging read right after the add is retried, not an exit 3.
+gh_fx_reset
+printf 'x\n' > "$STUBDIR2/first_labels_empty"
+stub read 200 "$(rb_body "coord:stacked-on=#6")"
+run_coord "coord:stacked-on=#6"
+expect_rc 0 "G7e a lagging first read is retried"
+expect_out "on a second read" "G7e"
+rm -f "$STUBDIR2/first_labels_empty"
+
+# --- G8: GitHub label names are case-insensitive; an existing label in another
+# case is what the add attaches, and it reads present.
+gh_fx_reset
+printf 'Coord:Merge-Strategy=Squash\n' > "$STUBDIR2/labels_list"
+stub read 200 "$(rb_body "coord:merge-strategy=squash")"
+run_coord "coord:merge-strategy=squash"
+expect_rc 0 "G8 differently-cased label reads present"
+
+# --- G9: coord's row is missing AND GitHub cannot be re-read: strip vs lost
+# write is UNKNOWN (exit 8), not a CONTRADICTION.
+gh_fx_reset
+stub read 200 "$(rb_body)"
+# the first labels read (step 1) succeeds; every later one fails
+run_coord_g9() {
+  : > "$STUBDIR3/calls"; : > "$STUBDIR3/bearers"; gh_fx_reset
+  printf 'x\n' > "$STUBDIR2/labels_rc_after_1"
+  OUT="$(HOME="$FAKEHOME" bash "$SCRIPT" --repo "$REPO" --pr 7 --label "$1" 2>&1)"; RC=$?
+}
+run_coord_g9 "$DEP"
+expect_rc 8 "G9 row missing, GitHub unreadable"
+if [[ "$OUT" == *CONTRADICTION* ]]; then fail "G9: reported a contradiction without the GitHub read :: $OUT"; else ok; fi
+expect_out "UNKNOWN" "G9"
+rm -f "$STUBDIR2/labels_rc_after_1"
+
+# --- G10: the two jq programs the script hands gh run against GitHub-shaped
+# JSON. The stub above returns pre-shaped output, so without this a broken
+# expression would stay green.
+if command -v jq >/dev/null 2>&1; then
+  eval "$(grep -E '^(PL_PULL_JQ|GR_EVENTS_JQ)=' "$SCRIPT")"
+  got="$(printf '%s' '{"state":"closed","merged_at":null,"labels":[{"name":"x"},{"name":"coord:landed"}]}' | jq -r "$PL_PULL_JQ" | tr -d '\r')"
+  [[ "$got" == "closed||true" ]] && ok || fail "G10: PL_PULL_JQ on a rebase-ff land gave [$got]"
+  got="$(printf '%s' '{"state":"closed","merged_at":"2026-11-17T09:25:43Z","labels":[]}' | jq -r "$PL_PULL_JQ" | tr -d '\r')"
+  [[ "$got" == "closed|2026-11-17T09:25:43Z|false" ]] && ok || fail "G10: PL_PULL_JQ on a merge gave [$got]"
+  got="$(printf '%s' '[{"id":11,"event":"labeled","created_at":"T1","actor":{"login":"a"},"label":{"name":"L"}},{"id":12,"event":"commented","created_at":"T2"},{"id":13,"event":"unlabeled","created_at":"T3","actor":null,"label":{"name":"L"}}]' | jq -r "$GR_EVENTS_JQ" | tr -d '\r')"
+  [[ "$got" == "$(printf '11\tT1\tlabeled\ta\tL\n13\tT3\tunlabeled\t?\tL')" ]] && ok || fail "G10: GR_EVENTS_JQ gave [$got]"
+elif [[ "${SET_LABEL_SELFTEST_NO_JQ:-}" == 1 ]]; then
+  echo "note: SET_LABEL_SELFTEST_NO_JQ=1 -- G10 (the jq programs against GitHub-shaped JSON) skipped" >&2
+else
+  fail "G10: jq is not on PATH, so the jq programs the script hands gh are untested (SET_LABEL_SELFTEST_NO_JQ=1 to skip deliberately)"
+fi
+gh_fx_reset
+
 # ----- report -----------------------------------------------------------------
 if [[ $FAILURES -ne 0 ]]; then
   echo "set-label self-test: $FAILURES failure(s) across $((CHECKS + FAILURES)) assertion(s)" >&2
   exit 1
 fi
-echo "set-label self-test: $CHECKS assertion(s) classified correctly (ceiling, short-form suggestion, grammar, no-send, dry-run existence caveat, gh success + failure diagnosis, owner-tenant proof before the coord write, read-back after it)"
+echo "set-label self-test: $CHECKS assertion(s) classified correctly (ceiling, short-form suggestion, grammar, no-send, dry-run existence caveat, gh success + failure diagnosis, GitHub label read-back + stale-dep strip, owner-tenant proof before the coord write, read-back after it)"

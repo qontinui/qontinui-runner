@@ -59,32 +59,94 @@ export interface RelayVerdict {
   outcome: ActionOutcome["kind"];
 }
 
+/** Error text for an envelope whose nested action result (`data.success`)
+ * is present but not a boolean. Same `INDETERMINATE:` prefix. */
+export const INDETERMINATE_NESTED_ACTION_ERROR =
+  "INDETERMINATE: nested action result `data.success` is not a boolean";
+
+/**
+ * Strictly read an `APIResponse` ENVELOPE (`{ success, data, error }`) whose
+ * `data` may itself be an action result carrying its own `success`.
+ *
+ * The SDK's in-process/HTTP `aiExecute` handler answers
+ * `success(nlActionResponse)` — outer `success: true` even when the nested
+ * `NLActionResponse.success` is `false` — so the outer flag alone reports a
+ * refused action as done. The verdict is therefore strict on BOTH levels:
+ *
+ * - outer not `true` → the outer {@link actionOutcome} (failed / indeterminate);
+ * - outer `true`, `data` an object with NO `success` key (the relay's bare,
+ *   already-lifted shape, or any non-action payload) → governed by the outer;
+ * - outer `true`, `data.success === true` → succeeded;
+ * - outer `true`, `data.success === false` → failed with the INNER error
+ *   (`data.error`, else `data.failureInfo.message` — `NLActionResponse`'s
+ *   structured field);
+ * - outer `true`, `data.success` present but non-boolean → indeterminate.
+ *
+ * Plan: 2026-09-27-ui-bridge-action-failures-still-masked-after-the-strict-success-readers (Case 3)
+ */
+export function envelopeOutcome(body: unknown): ActionOutcome {
+  const outer = actionOutcome(body);
+  if (outer.kind !== "succeeded") return outer;
+  const data = (body as { data?: unknown }).data;
+  if (data === null || typeof data !== "object" || Array.isArray(data)) return outer;
+  if (!Object.prototype.hasOwnProperty.call(data, "success")) return outer;
+  const inner = data as { success?: unknown; error?: unknown; failureInfo?: unknown };
+  if (inner.success === true) return { kind: "succeeded" };
+  if (inner.success === false) return { kind: "failed", error: nestedError(inner) };
+  return { kind: "indeterminate" };
+}
+
+/** The inner action result's error: `error`, else `failureInfo.message`. */
+function nestedError(inner: { error?: unknown; failureInfo?: unknown }): string | null {
+  if (typeof inner.error === "string" && inner.error.length > 0) return inner.error;
+  const info = inner.failureInfo;
+  if (info !== null && typeof info === "object") {
+    const message = (info as { message?: unknown }).message;
+    if (typeof message === "string" && message.length > 0) return message;
+  }
+  return null;
+}
+
 /**
  * Verdict for a runner HTTP relay reply (`useCommands` `executeAction` /
- * `sendCommand`). Success needs BOTH a 2xx and an explicit `success: true`;
- * a body without the key is indeterminate — reported as a failure with the
- * `INDETERMINATE:` error, or with the HTTP status when the reply was non-2xx.
+ * `sendCommand`). Success needs a 2xx AND an explicit outer `success: true`
+ * AND — when `data` nests an action result — an inner `success: true`
+ * ({@link envelopeOutcome}). A body without the key is indeterminate —
+ * reported as a failure with the `INDETERMINATE:` error, or with the HTTP
+ * status when the reply was non-2xx.
  */
 export function relayVerdict(body: unknown, resp: { ok: boolean; status: number }): RelayVerdict {
-  const outcome = actionOutcome(body);
+  const outer = actionOutcome(body);
   const bodyError =
     body !== null &&
     typeof body === "object" &&
     typeof (body as { error?: unknown }).error === "string"
       ? (body as { error: string }).error
       : undefined;
-  if (outcome.kind === "succeeded") {
-    if (resp.ok) return { success: true, error: bodyError, outcome: outcome.kind };
+  if (!resp.ok && outer.kind !== "failed") {
     return { success: false, error: bodyError ?? `HTTP ${resp.status}`, outcome: "failed" };
   }
-  if (outcome.kind === "indeterminate" && !resp.ok) {
-    return { success: false, error: bodyError ?? `HTTP ${resp.status}`, outcome: "failed" };
+  if (outer.kind !== "succeeded") {
+    return {
+      success: false,
+      error: actionOutcomeError(outer, "action reported success: false"),
+      outcome: outer.kind,
+    };
   }
-  return {
-    success: false,
-    error: actionOutcomeError(outcome, "action reported success: false"),
-    outcome: outcome.kind,
-  };
+  // 2xx + outer success: the nested action result, when present, decides.
+  const outcome = envelopeOutcome(body);
+  switch (outcome.kind) {
+    case "succeeded":
+      return { success: true, error: bodyError, outcome: outcome.kind };
+    case "failed":
+      return {
+        success: false,
+        error: outcome.error ?? bodyError ?? "nested action reported success: false",
+        outcome: outcome.kind,
+      };
+    case "indeterminate":
+      return { success: false, error: INDETERMINATE_NESTED_ACTION_ERROR, outcome: outcome.kind };
+  }
 }
 
 /**

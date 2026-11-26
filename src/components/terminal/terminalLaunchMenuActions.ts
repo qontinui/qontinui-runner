@@ -45,6 +45,13 @@ import { guardedHandler } from "@/lib/ui-bridge/guardedHandler";
 import { textArg } from "./commands/parse";
 import { buildAiSessionSpawnEnvelope, type AiSessionSpawnEnvelope } from "./aiSessionSpawnEnvelope";
 import { describeThrown } from "@/lib/utils";
+import type { EffectSignature } from "@qontinui/ui-bridge";
+import {
+  LAUNCH_CREATE_AI_SESSION_SIGNATURE,
+  LAUNCH_CREATE_BEST_ACCOUNT_SIGNATURE,
+  LAUNCH_CREATE_PLAIN_SIGNATURE,
+  LAUNCH_CREATE_WITH_COMMAND_SIGNATURE,
+} from "./terminalPageSignatures";
 
 /**
  * `paramSchema`s hoisted so the registration and the guard read ONE
@@ -99,6 +106,12 @@ export interface LaunchMenuActionDef {
   description: string;
   paramSchema: Readonly<Record<string, string>>;
   effect: "read" | "write" | "destructive";
+  /**
+   * Effect-calculus prediction (`ComponentAction.signature`). Declared on all
+   * four — see `./terminalPageSignatures.ts`. Declaring it opts the action
+   * into post-execution verification.
+   */
+  signature?: EffectSignature;
   handler: (params?: unknown) => Promise<SpawnResult>;
 }
 
@@ -125,6 +138,7 @@ export function buildTerminalLaunchMenuActions(effects: LaunchMenuEffects): Laun
       // `write` — N blank shells, no command typed. Same reasoning as
       // `terminal-page.create-terminal`.
       effect: "write",
+      signature: LAUNCH_CREATE_PLAIN_SIGNATURE,
       handler: guardedHandler("create-plain", CREATE_PLAIN_SCHEMA, async (args) => {
         const count = readCount(args);
         if (count === null) {
@@ -145,6 +159,7 @@ export function buildTerminalLaunchMenuActions(effects: LaunchMenuEffects): Laun
       // operator's repositories and spends account budget; dim 1: those edits and that
       // spend are not undone by closing the tab.
       effect: "destructive",
+      signature: LAUNCH_CREATE_AI_SESSION_SIGNATURE,
       handler: guardedHandler("create-ai-session", CREATE_AI_SESSION_SCHEMA, async (args) => {
         const count = readCount(args);
         // `textArg` for the two text fields, exactly as the registry's
@@ -178,6 +193,7 @@ export function buildTerminalLaunchMenuActions(effects: LaunchMenuEffects): Laun
       // `destructive` — `create-ai-session` with account selection done for you. Same
       // score, and it additionally consumes the least-utilized account without asking.
       effect: "destructive",
+      signature: LAUNCH_CREATE_BEST_ACCOUNT_SIGNATURE,
       handler: guardedHandler("create-best-account", CREATE_BEST_ACCOUNT_SCHEMA, async (args) => {
         const count = readCount(args);
         const context = textArg(args, "context") || undefined;
@@ -214,6 +230,7 @@ export function buildTerminalLaunchMenuActions(effects: LaunchMenuEffects): Laun
       // the parameter's, not the action's: unclassifiable at the call site, and the
       // rubric's fail-closed rule makes unclassifiable destructive.
       effect: "destructive",
+      signature: LAUNCH_CREATE_WITH_COMMAND_SIGNATURE,
       handler: guardedHandler("create-with-command", CREATE_WITH_COMMAND_SCHEMA, async (args) => {
         const count = readCount(args);
         const command = textArg(args, "command");

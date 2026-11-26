@@ -176,11 +176,10 @@ pub fn get_stage_display_name(stage: &str) -> String {
     .to_string()
 }
 
-/// Map TaskState names (from orchestrator) to UI stage names.
+/// Map recorded state names to UI stage names.
 ///
-/// Handles both:
-/// - TaskState enum names (e.g., "execution", "deterministic_verification")
-/// - Direct stage names from transitions (e.g., "setup", "verification", "agentic")
+/// Handles direct stage names from transitions (e.g., "setup", "verification",
+/// "agentic") and the plan executor's states.
 pub fn map_state_to_stage(state: &str) -> Option<&'static str> {
     match state {
         // Direct stage names (from stage transitions)
@@ -188,12 +187,6 @@ pub fn map_state_to_stage(state: &str) -> Option<&'static str> {
         "verification" => Some("verification"),
         "agentic" => Some("agentic"),
         "completion" => Some("completion"),
-        // TaskState enum mappings (legacy)
-        "planning" => Some("setup"),
-        "execution" => Some("agentic"),
-        "deterministic_verification" => Some("verification"),
-        "ai_verification" => Some("verification"),
-        "ai_summary" => Some("completion"),
         // Plan executor states
         "phase_running" | "phase_complete" => Some("agentic"),
         "sweep_running" | "sweep_complete" => Some("completion"),

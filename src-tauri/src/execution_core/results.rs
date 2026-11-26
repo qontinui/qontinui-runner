@@ -110,44 +110,6 @@ impl IntoStepResult for Result<serde_json::Value, String> {
     }
 }
 
-/// Result of a batch execution (multiple steps).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BatchExecutionResult {
-    /// Results from each step.
-    pub step_results: Vec<StepExecutionResult>,
-    /// Overall success (all steps succeeded).
-    pub success: bool,
-    /// Total duration in milliseconds.
-    pub total_duration_ms: u64,
-    /// Error summary if any steps failed.
-    pub error_summary: Option<String>,
-}
-
-impl BatchExecutionResult {
-    /// Create a new batch result from step results.
-    pub fn from_results(results: Vec<StepExecutionResult>) -> Self {
-        let success = results.iter().all(|r| r.success);
-        let total_duration_ms = results.iter().map(|r| r.duration_ms).sum();
-        let error_summary = if success {
-            None
-        } else {
-            let errors: Vec<String> = results
-                .iter()
-                .filter(|r| !r.success)
-                .filter_map(|r| r.error.clone())
-                .collect();
-            Some(errors.join("; "))
-        };
-
-        Self {
-            step_results: results,
-            success,
-            total_duration_ms,
-            error_summary,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,30 +146,5 @@ mod tests {
 
         let success = StepExecutionResult::success("step1", None);
         assert!(!success.should_retry(3, 0));
-    }
-
-    #[test]
-    fn test_batch_result() {
-        let results = vec![
-            StepExecutionResult::success("step1", None).with_duration(100),
-            StepExecutionResult::success("step2", None).with_duration(200),
-        ];
-
-        let batch = BatchExecutionResult::from_results(results);
-        assert!(batch.success);
-        assert_eq!(batch.total_duration_ms, 300);
-        assert!(batch.error_summary.is_none());
-    }
-
-    #[test]
-    fn test_batch_result_with_failure() {
-        let results = vec![
-            StepExecutionResult::success("step1", None),
-            StepExecutionResult::failure("step2", "Failed"),
-        ];
-
-        let batch = BatchExecutionResult::from_results(results);
-        assert!(!batch.success);
-        assert!(batch.error_summary.is_some());
     }
 }

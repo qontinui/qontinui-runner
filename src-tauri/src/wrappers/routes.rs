@@ -93,6 +93,14 @@ pub fn router() -> Router<Arc<ApiState>> {
         // newly-installed wrappers surface as MCP tools without an AI
         // session restart.
         .route("/wrappers/events", get(events_stream))
+        // While a condition-check session holds a secret, a `{{secret:<ref>}}`
+        // placeholder sent here is refused before the handler runs: `dispatch`, which sends its `params` verbatim to the wrapper, never
+        // substitutes, so it would reach the app as literal text
+        // (`crate::condition_secrets`). LAST, because `Router::layer` wraps
+        // only the routes registered before it.
+        .layer(axum::middleware::from_fn(
+            crate::condition_secrets::refuse_unsubstituted_placeholders,
+        ))
 }
 
 // ---------------------------------------------------------------------------

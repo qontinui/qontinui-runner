@@ -12,7 +12,7 @@ on:
       # (three, all 2026-07-06) failed for exactly that reason — see the
       # "Resolve release version" step below.
       version:
-        description: "Version to release, without the leading v (e.g. 1.0.8). The tag v<version> is created at the dispatched ref if it does not exist."
+        description: "Version to release, without the leading v (e.g. 1.0.8). Dispatch from main only — any other ref is refused. The tag v<version> is created at the dispatched commit if it does not exist."
         type: string
         required: true
       include_bundled_python:
@@ -38,12 +38,132 @@ env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
+  # RELEASE PROVENANCE GUARD — runs before anything is built or created.
+  #
+  # Installed runners auto-offer whatever this workflow publishes (through
+  # releases/latest/download/latest.json), so a release must be a commit that
+  # has already landed on main (served policy git-operations package-publish).
+  # Before this job existed the workflow trusted its caller: a workflow_dispatch
+  # started from any branch tagged and shipped that branch's github.sha, i.e.
+  # code that never landed.
+  #
+  # - workflow_dispatch: refused unless dispatched from refs/heads/main, whose
+  #   github.sha is main's own commit by construction. Also refused when the
+  #   tag v<version> already exists at any other commit: create-release would
+  #   attach the release to that existing tag (ignoring its commitish), so the
+  #   release would name a commit other than the one this run builds.
+  # - v* tag push: refused unless the tagged commit is an ancestor of
+  #   origin/main. A release tag is placed on a commit of main, so ancestry is
+  #   the exact property. Every release tag v1.0.5-v1.0.12 satisfied it when
+  #   this guard was added. v1.0.1-v1.0.4 (2026-07) did not: they were tagged
+  #   on commits outside main's history (a version-bump commit off main, or a
+  #   rebased twin of a main commit), and this guard would now refuse them.
+  # - any other event: refused, since neither proof applies to it.
+  #
+  # Every other job needs this one, directly (create-release,
+  # build-python-executor) or through create-release, whose `success` result
+  # gates build, publish-update-json and dispatch-parity. A refusal here
+  # therefore skips the whole release.
+  #
+  # LIMIT: GitHub runs the copy of this file AT the ref being released, so the
+  # guard binds only refs that contain it. A branch cut before it landed, or one
+  # that edits it out, is not bound by it. Closing that needs the signing
+  # secrets moved into a deployment environment that only main and protected v*
+  # tags may use — a repository-settings change, not something this file can do.
+  require-landed-on-main:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # Full commit history, because merge-base cannot answer across a shallow
+      # boundary. blob:none skips historical file contents, which ancestry does
+      # not need. Not tree:0: the checkout would then fetch the ~600 directory
+      # trees lazily, on demand, instead of in the one initial pack.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          filter: blob:none
+
+      - name: Refuse a release whose commit is not on main
+        env:
+          # Bound through env rather than spliced in with ${{ }}: a dispatch
+          # input is caller-supplied text (same reasoning as create-release's
+          # "Resolve release version" step).
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          refuse() {
+            echo "::error::release refused: $*"
+            exit 1
+          }
+
+          case "${GITHUB_EVENT_NAME}" in
+            workflow_dispatch)
+              if [[ "${GITHUB_REF}" != "refs/heads/main" ]]; then
+                refuse "${GITHUB_REF} (${GITHUB_SHA}) is not on main. A manual release tags and ships the commit it was dispatched from, so it must be dispatched from main — a published version must already be landed on the default branch."
+              fi
+
+              version="${INPUT_VERSION#v}"
+              if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+                refuse "cannot tell which commit the release tag names: the version input '${INPUT_VERSION}' is not of the form X.Y.Z."
+              fi
+              tag="v${version}"
+
+              rc=0
+              git ls-remote --exit-code --tags origin "refs/tags/${tag}" > /dev/null || rc=$?
+              case "${rc}" in
+                2)
+                  echo "Dispatched from refs/heads/main at ${GITHUB_SHA}; ${tag} does not exist yet and will be created there: releasing a landed commit."
+                  ;;
+                0)
+                  git fetch --no-tags origin "+refs/tags/${tag}:refs/tags/${tag}" \
+                    || refuse "${tag} exists but could not be fetched, so the commit it names is not proven to be ${GITHUB_SHA} on main."
+                  tagged="$(git rev-parse --verify --quiet "refs/tags/${tag}^{commit}")" \
+                    || refuse "${tag} exists but does not resolve to a commit, so it is not proven to be ${GITHUB_SHA} on main."
+                  if [[ "${tagged}" != "${GITHUB_SHA}" ]]; then
+                    refuse "${tag} already exists at ${tagged}, not at the dispatched main commit ${GITHUB_SHA}. The release would attach to that existing tag, so it would name a commit other than the one this run builds. Release ${tag} by re-running its tag-push run, or bump to a new version."
+                  fi
+                  echo "Dispatched from refs/heads/main at ${GITHUB_SHA}; ${tag} already points there: releasing a landed commit."
+                  ;;
+                *)
+                  refuse "${GITHUB_REF} (${GITHUB_SHA}): could not check whether ${tag} already exists (git ls-remote exited ${rc}), so the commit the release names is not proven to be on main."
+                  ;;
+              esac
+              ;;
+
+            push)
+              git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main \
+                || refuse "${GITHUB_REF} (${GITHUB_SHA}) is not proven to be on main — origin/main could not be fetched."
+              rc=0
+              git merge-base --is-ancestor "${GITHUB_SHA}^{commit}" origin/main || rc=$?
+              case "${rc}" in
+                0)
+                  echo "${GITHUB_REF} (${GITHUB_SHA}) is an ancestor of origin/main ($(git rev-parse origin/main)): releasing a landed commit."
+                  ;;
+                1)
+                  refuse "${GITHUB_REF} (${GITHUB_SHA}) is not on main. The tagged commit is not an ancestor of origin/main, so it would publish code that never landed on the default branch. Tag a commit of main instead."
+                  ;;
+                *)
+                  # Fail closed: an ancestry check that could not run is not a pass.
+                  refuse "${GITHUB_REF} (${GITHUB_SHA}) is not proven to be on main — git merge-base --is-ancestor exited ${rc}, so ancestry could not be established."
+                  ;;
+              esac
+              ;;
+
+            *)
+              refuse "${GITHUB_REF} (${GITHUB_SHA}) is not proven to be on main — event '${GITHUB_EVENT_NAME}' is neither a v* tag push nor a workflow_dispatch from main."
+              ;;
+          esac
+
   # Build Python executor for bundling (optional). Opt-in via workflow_dispatch
   # only — tag releases skip it to cut build-failure surface (the macOS Python
   # dependency install is flaky and the bundled executor is optional; the runner
   # falls back to a system Python). The `build` job already tolerates its absence
   # via the conditional "Download Python executor" step.
   build-python-executor:
+    needs: [require-landed-on-main]
+    # No status function in this expression, so success() is implied: a refused
+    # release skips this build too.
     if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.include_bundled_python != 'false' }}
     uses: ./.github/workflows/build-python-executor.yml
     with:
@@ -52,6 +172,7 @@ jobs:
     secrets: inherit
 
   create-release:
+    needs: [require-landed-on-main]
     runs-on: ubuntu-latest
     outputs:
       release_id: ${{ steps.create-release.outputs.id }}
@@ -127,14 +248,16 @@ jobs:
         with:
           # Derived from the resolved version, never from github.ref. On a tag
           # push this is the tag that triggered the run; on workflow_dispatch
-          # the tag is created at the dispatched ref. Either way it agrees with
+          # the tag is created at the dispatched commit (main's, as
+          # require-landed-on-main enforces). Either way it agrees with
           # release_version, which publish-update-json looks the release up by.
           tag_name: ${{ steps.get_version.outputs.tag }}
           # Without an explicit commitish the Releases API defaults
-          # target_commitish to the repository's DEFAULT branch, so a dispatch
-          # from any other branch would tag main's HEAD while the build job
-          # builds the dispatched ref — tag and shipped code silently diverge.
-          # Pin it to the ref this run is actually building.
+          # target_commitish to the repository's DEFAULT branch HEAD at the time
+          # of this call, which can have moved past the commit the build job
+          # builds — tag and shipped code would silently diverge. Pin it to the
+          # commit this run is actually building. github.sha is on main:
+          # require-landed-on-main refuses the run otherwise.
           commitish: ${{ github.sha }}
           release_name: Qontinui Runner v${{ steps.get_version.outputs.version }} (Beta)
           draft: true

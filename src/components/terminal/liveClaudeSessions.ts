@@ -186,23 +186,46 @@ export function registryNamesBySessionId(
 }
 
 /**
- * Read the set of session ids that some LIVE Claude Code process is already
- * hosting, via `terminal_claude_session_list_live` (each entry is PID-verified
- * against the live process table on the Rust side —
- * `session::claude_session_registry::read_live_sessions`).
+ * What one read of the live registry saw.
  *
- * The restore path consults this BEFORE typing `claude --resume <id>` for a
- * cold-restored record: an id in this set is already alive, and resuming it
- * again forks the session — a second live process on the same transcript
- * (measured 2026-07-23: 22 of 80 live ids had >1 live process).
- *
- * Returns `null` when the registry could not be read (invoke failed,
- * unsuccessful response, or missing payload). Callers MUST treat `null` as
- * indeterminate and FAIL CLOSED toward not-respawning — never as "nothing
- * alive". A missing tab is recoverable; a duplicate live session corrupts the
- * transcript.
+ * `ids` is every session id a live Claude Code process hosts, from every
+ * `sessions/` dir the runner could read. `partial` is true when the read could
+ * not see everything — a `sessions/` dir exists and could not be listed, or a
+ * live process's record could not be read (the command's `unlistable` and
+ * `unreadableRecords`). While it is, an id MISSING from `ids` may still be
+ * live; an id PRESENT in it is live either way.
  */
-export async function fetchLiveClaudeSessionIds(): Promise<ReadonlySet<string> | null> {
+export interface LiveSessionRead {
+  ids: ReadonlySet<string>;
+  partial: boolean;
+}
+
+/**
+ * Does the command's `data` say the read was incomplete? A runner binary
+ * predating the two keys sends neither, and is read as complete, exactly as it
+ * was before. A key that is present but not an array is a shape we do not
+ * understand, so it reads as incomplete.
+ */
+function readIsPartial(data: unknown): boolean {
+  if (!data || typeof data !== "object" || Array.isArray(data)) return false;
+  const gaps = data as { unlistable?: unknown; unreadableRecords?: unknown };
+  return [gaps.unlistable, gaps.unreadableRecords].some(
+    (gap) => gap !== undefined && (!Array.isArray(gap) || gap.length > 0),
+  );
+}
+
+/**
+ * Read the live registry once through `terminal_claude_session_list_live`
+ * (each entry is PID-verified against the live process table on the Rust side
+ * — `session::claude_session_registry::read_live_sessions`).
+ *
+ * Returns `null` when the registry could not be read at all (invoke failed,
+ * unsuccessful response, missing or unrecognized payload). A read that
+ * succeeded but could not see everything is NOT `null`: it is `partial`, and
+ * each caller decides what that means for it — see
+ * {@link fetchLiveClaudeSessionIds} and {@link fetchVisibleLiveClaudeSessionIds}.
+ */
+export async function fetchLiveClaudeSessionRead(): Promise<LiveSessionRead | null> {
   let resp: CommandResponse;
   try {
     resp = await invoke<CommandResponse>("terminal_claude_session_list_live");
@@ -228,5 +251,48 @@ export async function fetchLiveClaudeSessionIds(): Promise<ReadonlySet<string> |
   for (const s of sessions) {
     if (s && typeof s.sessionId === "string" && s.sessionId) ids.add(s.sessionId);
   }
-  return ids;
+  return { ids, partial: readIsPartial(resp.data) };
+}
+
+/**
+ * The STRICT liveness oracle: the set of session ids some live Claude Code
+ * process is already hosting, or `null` when that cannot be known in full.
+ *
+ * The unattended restore paths (the cold-restore drain, the sweep recheck, the
+ * profile resume) consult this BEFORE typing `claude --resume <id>`: an id in
+ * this set is already alive, and resuming it again forks the session — a
+ * second live process on the same transcript (measured 2026-07-23: 22 of 80
+ * live ids had >1 live process). They decide "not live" from an id's ABSENCE,
+ * so a PARTIAL read is `null` here too — the missing id may sit in the dir that
+ * could not be read.
+ *
+ * Callers MUST treat `null` as indeterminate and FAIL CLOSED toward
+ * not-respawning — never as "nothing alive". A missing tab is recoverable; a
+ * duplicate live session corrupts the transcript.
+ */
+export async function fetchLiveClaudeSessionIds(): Promise<ReadonlySet<string> | null> {
+  const read = await fetchLiveClaudeSessionRead();
+  if (!read || read.partial) {
+    if (read) {
+      console.warn(
+        "[liveClaudeSessions] the live-session registry could not be read in full — treating liveness as indeterminate",
+      );
+    }
+    return null;
+  }
+  return read.ids;
+}
+
+/**
+ * Every session id the registry could SEE live, even when the read was
+ * partial; `null` only when it could not be read at all.
+ *
+ * For an operator's click (Resume in a new tab, Resume unfinished): those
+ * paths refuse an id that is visibly live and otherwise leave the decision to
+ * the resume door, so a partial read must still refuse every session it shows
+ * live rather than collapse to `null`, which they read as "go ahead".
+ */
+export async function fetchVisibleLiveClaudeSessionIds(): Promise<ReadonlySet<string> | null> {
+  const read = await fetchLiveClaudeSessionRead();
+  return read?.ids ?? null;
 }

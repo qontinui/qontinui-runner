@@ -33,9 +33,7 @@ env:
 # interpolating only `github.event_name` / `github.ref` and collapsing every
 # other expression to "" (qontinui-coord ci_observer.rs resolve_group_template),
 # and run_is_reaper_at_risk never matches an empty group, so no push run here is
-# modelled as reapable by a land. (KNOWN coord gap: the budget-cancel candidate
-# scan in stuck_pr_watcher.rs compares groups with `=`, so every "" group
-# matches every other one and suppresses its auto re-run; fix belongs in coord.)
+# modelled as reapable by a land.
 # RESIDUAL: two pushes seconds apart can have
 # their runs CREATED out of order, so the older head's run cancels the newer
 # head's; the next push (or a close+reopen) heals it.
@@ -224,13 +222,20 @@ jobs:
       pull-requests: write
       checks: write
 
+    # Every step before the `clippy` (reviewdog) step needs an `id`, a matching
+    # `O_*` env entry and a `pick` line in the final "Declare a setup death"
+    # step -- a setup step without them fails silently (no annotation).
     steps:
-      - uses: actions/checkout@v5
+      - name: Checkout
+        id: checkout
+        uses: actions/checkout@v5
 
       - name: Check out sibling qontinui-schemas
+        id: sibling_schemas
         uses: ./.github/actions/checkout-sibling
 
       - name: Checkout sibling repos
+        id: sibling_repos
         run: |
           cd "$GITHUB_WORKSPACE/.."
           git clone --depth 1 https://github.com/qontinui/qontinui-web.git
@@ -238,11 +243,13 @@ jobs:
         shell: bash
 
       - name: Setup pnpm
+        id: setup_pnpm
         uses: pnpm/action-setup@v4
         with:
           version: 10.33.2
 
       - name: Setup Node.js
+        id: setup_node
         uses: actions/setup-node@v5
         with:
           node-version: "20"
@@ -250,15 +257,22 @@ jobs:
           cache-dependency-path: pnpm-lock.yaml
 
       - name: Setup Rust
+        id: setup_rust
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.95.0"
           components: rustfmt, clippy
 
+      # Pinned, not `latest`: the orphan-completion step below reads
+      # reviewdog's stderr for `failed to create check` / `failed to post` /
+      # `check-runs/<id>`, wording checked against v0.21.2 (the version
+      # qontinui-coord's ci.yml pins). Re-check that wording, and
+      # complete-orphaned-check-runs.sh's markers, on any bump.
       - name: Setup reviewdog
-        uses: reviewdog/action-setup@v1
+        id: setup_reviewdog
+        uses: reviewdog/action-setup@d8a7baabd7f3e8544ee4dbde3ee41d0011c3a93f # v1
         with:
-          reviewdog_version: latest
+          reviewdog_version: v0.21.2
 
       # Bounded against a job-time apt hang — see the rationale on the same
       # step in .github/workflows/ci.yml.
@@ -268,6 +282,7 @@ jobs:
       # 10 min = ~13x the healthy p90, matching ci.yml's bound on the identical
       # package list.
       - name: Install dependencies (Ubuntu)
+        id: apt
         timeout-minutes: 10
         run: |
           sudo apt-get update
@@ -285,6 +300,7 @@ jobs:
             at-spi2-core
 
       - name: Free disk space (Ubuntu)
+        id: free_disk
         uses: jlumbroso/free-disk-space@main
         with:
           tool-cache: false
@@ -296,6 +312,7 @@ jobs:
           swap-storage: false
 
       - name: Add swapfile (Ubuntu — guard against link-time OOM)
+        id: swapfile
         run: |
           sudo swapoff -a || true
           sudo fallocate -l 12G /swapfile
@@ -310,6 +327,7 @@ jobs:
       # so this job never adds a save against the 10 GB repo cache cap. That is
       # PR #792's policy applied here: restore unrestricted, save from main only.
       - name: Cache Rust dependencies
+        id: rust_cache
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
@@ -318,29 +336,348 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install frontend dependencies
+        id: pnpm_install
         run: pnpm install --frozen-lockfile
 
       - name: Build frontend
+        id: pnpm_build
         run: pnpm run build
 
       - name: Clippy diff-scoped via reviewdog
-        # Capture clippy JSON to a file first so cargo's non-zero exit (a deny
-        # lint) does NOT abort the step under `set -eo pipefail` before
+        id: clippy
+        # Capture clippy's diagnostics to a file first so cargo's non-zero exit
+        # (a deny lint) does NOT abort the step under `set -eo pipefail` before
         # reviewdog runs — reviewdog owns the pass/fail decision here, scoped to
         # the diff. `-filter-mode=diff_context` = fail only on findings on
         # changed lines; `-fail-on-error=true` makes those diff findings fail
         # THIS (advisory, non-required) check only.
+        #
+        # The capture is `--message-format=short` on cargo's STDERR, because
+        # `-f=clippy` is reviewdog's errorformat `%f:%l:%c: %m`
+        # (reviewdog/errorformat fmts/rust.go), the short format's shape,
+        # anchored at the line start. Until 2026-11-22 this step fed it
+        # `--message-format=json` on stdout, no line of which has that shape,
+        # so reviewdog parsed ZERO diagnostics on every PR and this lint
+        # inspected nothing (plan
+        # 2026-11-22-reviewdog-diff-and-parse-infra-exits-read-as-lint-findings,
+        # Phase 0). `-q` keeps cargo's progress lines out of the capture;
+        # its `generated N warnings` summaries match no errorformat line and
+        # are skipped. Nothing else in this job reads the capture, so clippy
+        # runs once, in the format reviewdog reads. The format alone is not
+        # enough: cargo's paths are WORKSPACE-root-relative (src-tauri/src/...),
+        # so reviewdog must run from the git root (see the `cd ..` below) or
+        # its github-pr-check path prefixing doubles src-tauri and diff_context
+        # drops every finding.
+        #
+        # reviewdog v0.21.2 exits 1 for EVERY error, not only for diff
+        # findings (cmd/reviewdog/main.go prints each as `reviewdog: <err>`).
+        # So reviewdog runs through `rso_run_retrying`, which classifies a
+        # failed attempt by a POSITIVE marker in that attempt's stderr into one
+        # of three no-verdict classes (the helper's header is the contract):
+        #   post        it did not finish its check run (`failed to create
+        #               check` / `failed to post` / `check-runs/<id>`, the
+        #               completion step's own markers): GitHub has answered the
+        #               PATCH of a run created seconds earlier with `404 Not
+        #               Found` (job 135103311891 of run 44389597385 on
+        #               qontinui-runner#3025, coord finding
+        #               2f3d3b96-7bd6-420e-aff3-f20d29544b74;
+        #               c58cd00f-7651-4dde-bd3d-d69fcc59f291 on
+        #               qontinui-coord#4159), and that red parked #3025 ~45 h
+        #               exactly as a lint finding would. RETRIED.
+        #   diff-fetch  a line beginning `reviewdog: fail to get diff: `: the PR
+        #               diff fetch failed. RETRIED (a 5xx or a rate limit can
+        #               clear).
+        #   diff-parse  a line beginning `reviewdog: fail to parse diff: `: the
+        #               fetched diff did not parse. NOT retried: the same bytes
+        #               parse the same way again.
+        # `reviewdog: parse error:` (reading stdin) has no class: an
+        # errorformat parser such as `-f=clippy` cannot return it in v0.21.2,
+        # so a class for it would be code no test could make fail. An exit
+        # matching no marker -- a findings exit however it is worded -- is the
+        # verdict and is never retried. A retried class re-runs reviewdog from
+        # the same clippy-report.txt (no recompile), at most twice, 5 s then
+        # 10 s apart. Whenever a retry happens, a `retry outcome:` notice in
+        # this job's annotations names the class and says whether it
+        # recovered. When the LAST attempt ended in a no-verdict class, the job
+        # stays red -- reviewdog's last rc -- and says, in the `(not a verdict
+        # on this PR)` phrase coord's repair classifier (author_feedback.rs
+        # is_no_verdict_annotation) matches in the title, that this red is not
+        # the diff's; the message names the class and whether a re-run can
+        # help. The marker literals were captured from v0.21.2: re-check them
+        # on a version bump (a reworded line falls back to "finding").
+        #
+        # Outputs whenever this shell exits (a normal end, a death under
+        # `set -e`, a SIGTERM/SIGINT from a cancel; not a SIGKILL or a runner
+        # death, which write nothing and read as unknown, while a helper that
+        # cannot be sourced writes rc=not-run-source-failed, and a cargo clippy
+        # that exits non-zero with no src-tauri diagnostic line -- it died
+        # before linting -- writes rc=not-run-clippy-failed and reds the job
+        # with a not-a-verdict annotation instead of letting reviewdog read an
+        # empty capture as clean), for the completion step below: `rc`
+        # (reviewdog's exit status; `unknown` when the step dies before
+        # reviewdog returns), `started_at` / `ended_at` (the window a
+        # `clippy-diff` run of this job's reviewdog must have STARTED in, on
+        # GitHub's clock; a run outside it belongs to another workflow run on
+        # the same head -- a re-run gets its own concurrency group here),
+        # `clock` and `stderr_log` (reviewdog's stderr, whose `failed to post`
+        # / `check-runs/<id>` lines say whether it finished its run). Written
+        # by the sourced helper .github/scripts/reviewdog-step-outputs.sh,
+        # whose header is the contract and whose test checks every output read
+        # below; it is vendored from qontinui-coord and pinned with the other
+        # copies (see the completion step). The step exits with the LAST
+        # reviewdog attempt's status: a failed post that a retry recovers
+        # passes, and a diff finding still fails.
         env:
           CARGO_BUILD_JOBS: 1
           REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # A helper that cannot be sourced writes no trap, so say so here:
+          # rc=not-run-source-failed tells the completion step reviewdog never
+          # ran. Exit 1 as before -- the failure is real and must be seen.
+          source .github/scripts/reviewdog-step-outputs.sh || {
+            echo "rc=not-run-source-failed" >> "$GITHUB_OUTPUT"
+            echo "::warning title=reviewdog-step-outputs::.github/scripts/reviewdog-step-outputs.sh could not be sourced; reviewdog did not run"
+            exit 1
+          }
+          rso_begin "${RUNNER_TEMP}/reviewdog-clippy-diff.stderr"
           cd src-tauri
-          cargo clippy --message-format=json > clippy-report.json 2>/dev/null || true
-          reviewdog \
+          # cargo's own exit status is kept, not discarded. A non-zero status
+          # with a WORKSPACE ERROR line (`<relative path>:<line>:<col>: error`,
+          # src-tauri/... or any crates/... member src-tauri path-depends on;
+          # a deny lint prints `error:`, a compile error `error[E0425]:`) is
+          # a lint or compile verdict on the workspace's code, so it goes on to
+          # reviewdog, whose diff_context filter decides whether it is this
+          # PR's (an off-diff error, e.g. a broken main, is filtered out; the
+          # required clippy gate, not this advisory step, owns that case). A
+          # non-zero status with no such line is not-a-verdict:
+          # cargo failed for another reason (a build.rs failure, a dependency
+          # outside the workspace -- an absolute or ../ path), and any
+          # warnings it printed before failing are not a lint of src-tauri.
+          # So is cargo ITSELF killed by a signal (exit above 128), when even
+          # the lines it printed are a partial capture; a killed rustc child
+          # makes cargo exit 101 and is judged by the error-line rule. reviewdog
+          # would read any of these as zero findings and exit 0, green having
+          # inspected nothing, so it is not run: rc=not-run-clippy-failed (the
+          # completion step reads any not-run-* as "reviewdog never ran"), one
+          # not-a-verdict ::error, a non-zero exit.
+          cargo_rc=0
+          cargo clippy -q --message-format=short 2> clippy-report.txt || cargo_rc=$?
+          ws_err=0
+          if awk '/^[^ ]+:[0-9]+:[0-9]+: error(\[E[0-9]+\])?: / && !/^(\/|\.\.\/|[A-Za-z]:)/ { f = 1 } END { exit !f }' clippy-report.txt; then
+            ws_err=1
+          fi
+          if [ "$cargo_rc" -gt 128 ] || { [ "$cargo_rc" -ne 0 ] && [ "$ws_err" -eq 0 ]; }; then
+            rc=not-run-clippy-failed
+            echo "::error title=Clippy diff-scoped (advisory): clippy did not lint (not a verdict on this PR)::cargo clippy exited ${cargo_rc} without a workspace error line explaining it (cargo killed by a signal, or a failure outside the lint), so reviewdog was not run. No lint verdict reached this diff: see this job's log for cargo's build failure."
+            exit 1
+          fi
+          # Back to the git root for reviewdog. cargo prints paths relative to
+          # the WORKSPACE root (the repo root: src-tauri/src/...) even from
+          # here, and github-pr-check prepends reviewdog's own git-relative
+          # workdir to every path, so run from src-tauri every path would read
+          # src-tauri/src-tauri/... and diff_context would drop every finding.
+          cd ..
+          # rso_run_retrying marks the window's start ONCE, before the first
+          # attempt, appends every attempt's stderr to the log the completion
+          # step reads (so each failed attempt's `check-runs/<id>` reaches it)
+          # and replays each attempt's stderr into this log once it returns,
+          # and sets rc only once the last attempt has returned -- a cancel
+          # mid-attempt or mid-retry leaves `unknown`, never a pass.
+          rso_run_retrying src-tauri/clippy-report.txt reviewdog \
             -f=clippy \
             -name="clippy-diff" \
             -filter-mode=diff_context \
             -reporter=github-pr-check \
-            -fail-on-error=true \
-            < clippy-report.json
+            -fail-on-error=true
+          # RSO_NO_VERDICT: the LAST attempt's no-verdict class, empty for a
+          # verdict. One message line per class; no newline (it would end the
+          # workflow command) and no percent sign.
+          if [ -n "${RSO_NO_VERDICT:-}" ]; then
+            case "$RSO_NO_VERDICT" in
+              post) nv_why="reviewdog reported a failed check create or post. That is a GitHub API failure, not a clippy finding: re-run this job." ;;
+              diff-fetch) nv_why="reviewdog could not fetch this PR's diff from GitHub. That is a GitHub API or git fetch failure, not a clippy finding: re-run this job." ;;
+              diff-parse) nv_why="reviewdog could not parse this PR's diff. A re-run will not help: the PR diff is unparseable by reviewdog v0.21.2, so investigate this job's log (the reviewdog: fail to parse diff line) rather than the code." ;;
+              *) nv_why="see .github/scripts/reviewdog-step-outputs.sh for this class." ;;
+            esac
+            echo "::error title=Clippy diff-scoped (advisory): reviewdog could not deliver a verdict (not a verdict on this PR)::no-verdict class ${RSO_NO_VERDICT} after ${RSO_ATTEMPTS} attempt(s), last exit ${rc}, so no lint verdict reached this diff. ${nv_why}"
+          fi
+          exit "$rc"
         shell: bash
+
+      # reviewdog CREATES the `clippy-diff` check run through the API and
+      # completes it with a later PATCH. When that PATCH fails, the run stays
+      # `in_progress` for good: nothing else ever completes it, and the PR's
+      # check page says CI is still running when nothing is. On
+      # qontinui-coord#4159, rust-ci job 132648536974 logged `reviewdog:
+      # failed to post result: PATCH .../check-runs/132651515896: 404 Not
+      # Found` at 01:06:21.105Z, about 1 s after the step started at
+      # 01:06:20.22Z (log line 4367; verified by an independent reviewer's
+      # read of that job's log on 2026-11-17, and recorded in coord finding
+      # c58cd00f-7651-4dde-bd3d-d69fcc59f291; likely cause: read-after-write
+      # lag at GitHub, a hypothesis). That finding also records that coord
+      # held qontinui-coord#4159 and #4053 at block_reason_code ci-pending
+      # with the orphan as the only non-terminal check (plan
+      # 2026-11-16-finish-session-refuses-a-finish-whose-only-owed-pr-is-ci-pending,
+      # Phase 2b). Here a reviewdog failure already reds THIS job, so this step
+      # only completes the orphaned run as `neutral` -- with a summary naming
+      # reviewdog's rc and this job -- and leaves the job's own red to report
+      # the failure. Since the step above retries a failed post, the job can
+      # be GREEN while an earlier attempt's run is still `in_progress`: the
+      # stderr log holds every attempt, so that run's id is still read here,
+      # and when a later attempt may have left a run no line names (a failed
+      # create, or a cancel mid-attempt) the script lists the window as well
+      # (its header, WHICH RUNS 1). It acts only when reviewdog itself reported that it did
+      # not finish its run (`failed to create check` / `failed to post` /
+      # `check-runs/<id>` in its stderr), or when the step ended before
+      # reviewdog returned: a clean reviewdog exit -- 0, or 1 for diff
+      # findings -- and a skipped step make no API call at all. It aims at
+      # the run THIS job's reviewdog created: the id
+      # in reviewdog's own failure line when there is one, otherwise a listing
+      # limited to `github-actions` runs that started inside reviewdog's
+      # window, read from GitHub's clock. A concurrent run on the same head
+      # whose reviewdog overlapped that window can still be a candidate; the
+      # window narrows that case, it does not exclude it (the script's header
+      # states exactly what is guaranteed, and what happens when a bound is
+      # unknown). Each run is read again before every PATCH; a run completed
+      # as of that re-read (by reviewdog, pass or fail) is not PATCHed, though
+      # one a concurrent job completes between the re-read and the PATCH can
+      # still be overwritten. Advisory:
+      # the script retries a 404, a 5xx, a secondary rate limit and a
+      # connection-class failure with a bounded backoff and otherwise warns
+      # and exits 0, and `continue-on-error` covers a failure in the script
+      # itself. It needs the checkout, so it runs only when that succeeded.
+      #
+      # This script, reviewdog-step-outputs.sh (sourced by the reviewdog step
+      # above) and their two tests are VENDORED byte-identical from
+      # qontinui-coord (canonical copies: qontinui-coord .github/scripts/, same
+      # names), the way secret-scan.yml vendors fetch-gitleaks.sh. Their sha256s live in
+      # ONE file, .github/scripts/complete-orphaned-check-runs.sha256, which this
+      # step and the test step below both check; update it with the copies.
+      # That pin catches only an edit to a copy made without updating the pin.
+      # It is NOT a drift or security control against coord's canonical copy:
+      # a copy that falls behind coord, with the pin updated alongside, passes.
+      # A scheduled drift check against coord is out of scope here. A mismatch
+      # in this step only skips the completion (with a warning); the test step
+      # below is the one that reds on it.
+      - name: Complete an orphaned clippy-diff check run
+        if: always() && github.event_name == 'pull_request' && steps.checkout.outcome == 'success'
+        continue-on-error: true
+        # The script bounds itself: each gh call is capped at 25 s (20 s plus
+        # a 5 s kill), retry sleeps share a 30 s budget, and -- since the
+        # calls are not capped by that budget -- it starts no new API call
+        # after 180 s of wall clock, warns and exits 0, so it ends in about
+        # 215 s at most. This timeout is a backstop that should never fire.
+        timeout-minutes: 4
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          STEP_RC: ${{ steps.clippy.outputs.rc }}
+          STEP_OUTCOME: ${{ steps.clippy.outcome }}
+          REVIEWDOG_STARTED_AT: ${{ steps.clippy.outputs.started_at }}
+          REVIEWDOG_ENDED_AT: ${{ steps.clippy.outputs.ended_at }}
+          REVIEWDOG_CLOCK: ${{ steps.clippy.outputs.clock }}
+          REVIEWDOG_STDERR_LOG: ${{ steps.clippy.outputs.stderr_log }}
+          JOB_CHECK_RUN_ID: ${{ job.check_run_id }}
+        run: |
+          if ! sha256sum -c --quiet .github/scripts/complete-orphaned-check-runs.sha256; then
+            echo "::warning title=complete-orphaned-check-runs does not match its sha256 pin::a vendored copy was changed without updating .github/scripts/complete-orphaned-check-runs.sha256, so no orphaned clippy-diff run was completed."
+            exit 0
+          fi
+          # Which API client the script will use: gh where it is installed,
+          # else curl with GH_TOKEN. Printed so a run's log shows it.
+          if command -v gh >/dev/null 2>&1; then
+            gh --version | head -n 1
+          else
+            echo "gh is not on PATH on this runner; complete-orphaned-check-runs.sh falls back to curl with GH_TOKEN"
+          fi
+          bash .github/scripts/complete-orphaned-check-runs.sh \
+            "$GITHUB_REPOSITORY" "$HEAD_SHA" "clippy-diff" \
+            "the reviewdog step ended with outcome '${STEP_OUTCOME:-unknown}'"
+        shell: bash
+
+      # The vendored scripts' own fixture tests, byte-identical to coord's
+      # (canonical: qontinui-coord .github/scripts/test-complete-orphaned-check-runs.sh
+      # and test-reviewdog-step-outputs.sh; the second also checks that every
+      # steps.clippy.outputs.* read in this file is one the helper writes),
+      # then this repo's own test-clippy-diff-step.sh (NOT vendored or
+      # pinned), which runs the `clippy` step's `run:` block above with stub
+      # cargo/reviewdog/curl: a failed post or diff fetch then success is
+      # green, a finding (however worded) is red, and a post or diff fetch
+      # that keeps failing, a diff that does not parse, or a clippy that died
+      # before linting, is red and says it is not a verdict.
+      # Hermetic (a stub gh and curl, an injected sleep), seconds on this
+      # existing hosted job. All four files are checked against
+      # complete-orphaned-check-runs.sha256 (see the step above for what that
+      # pin does and does not catch); a mismatch reds this advisory check, as
+      # secret-scan.yml's pin does for fetch-gitleaks.sh. `!cancelled()` so
+      # its verdict stands even when clippy or a setup step failed; it needs
+      # only the checkout. A failure here is a verdict on this PR (the
+      # vendored copy or its pin), so it is deliberately NOT one of the setup
+      # steps the next step names.
+      - name: Orphaned check-run completion tests
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        shell: bash
+        run: |
+          sha256sum -c --quiet .github/scripts/complete-orphaned-check-runs.sha256 \
+            || { echo "::error title=complete-orphaned-check-runs pin mismatch::a vendored copy was changed without updating .github/scripts/complete-orphaned-check-runs.sha256; copy the files from qontinui-coord and regenerate that file."; exit 1; }
+          bash .github/scripts/test-complete-orphaned-check-runs.sh
+          bash .github/scripts/test-reviewdog-step-outputs.sh
+          bash .github/scripts/test-clippy-diff-step.sh
+
+      # A setup death is NOT a verdict on this PR (plan
+      # 2026-11-05-repair-classifier-reads-why-a-check-failed, Phase 3). When a
+      # step BEFORE clippy fails (an apt hang, a sibling clone, a pnpm build),
+      # the check goes red without clippy ever reading the diff. Name the first
+      # failed setup step in an annotation whose title carries the literal
+      # phrase "(not a verdict on this PR)" -- coord's repair classifier
+      # (author_feedback.rs is_no_verdict_annotation) matches it byte-exact and
+      # re-runs instead of blaming the PR's code. Emits nothing when the
+      # reviewdog step itself failed (a diff finding IS a verdict; a
+      # no-verdict class -- post, diff-fetch, diff-parse, or a clippy that
+      # did not lint -- declares itself not one, in that step) or no setup
+      # step did.
+      # Outcomes arrive via env only; step names below are static literals.
+      - name: Declare a setup death (not a verdict on this PR)
+        if: failure()
+        env:
+          O_CHECKOUT: ${{ steps.checkout.outcome }}
+          O_SIBLING_SCHEMAS: ${{ steps.sibling_schemas.outcome }}
+          O_SIBLING_REPOS: ${{ steps.sibling_repos.outcome }}
+          O_SETUP_PNPM: ${{ steps.setup_pnpm.outcome }}
+          O_SETUP_NODE: ${{ steps.setup_node.outcome }}
+          O_SETUP_RUST: ${{ steps.setup_rust.outcome }}
+          O_SETUP_REVIEWDOG: ${{ steps.setup_reviewdog.outcome }}
+          O_APT: ${{ steps.apt.outcome }}
+          O_FREE_DISK: ${{ steps.free_disk.outcome }}
+          O_SWAPFILE: ${{ steps.swapfile.outcome }}
+          O_RUST_CACHE: ${{ steps.rust_cache.outcome }}
+          O_PNPM_INSTALL: ${{ steps.pnpm_install.outcome }}
+          O_PNPM_BUILD: ${{ steps.pnpm_build.outcome }}
+          O_CLIPPY: ${{ steps.clippy.outcome }}
+        shell: bash
+        run: |
+          if [ "$O_CLIPPY" = "failure" ]; then
+            exit 0
+          fi
+          first=""
+          pick() {
+            if [ -z "$first" ] && [ "$2" = "failure" ]; then
+              first="$1"
+            fi
+          }
+          pick 'Checkout' "$O_CHECKOUT"
+          pick 'Check out sibling qontinui-schemas' "$O_SIBLING_SCHEMAS"
+          pick 'Checkout sibling repos' "$O_SIBLING_REPOS"
+          pick 'Setup pnpm' "$O_SETUP_PNPM"
+          pick 'Setup Node.js' "$O_SETUP_NODE"
+          pick 'Setup Rust' "$O_SETUP_RUST"
+          pick 'Setup reviewdog' "$O_SETUP_REVIEWDOG"
+          pick 'Install dependencies (Ubuntu)' "$O_APT"
+          pick 'Free disk space (Ubuntu)' "$O_FREE_DISK"
+          pick 'Add swapfile (Ubuntu — guard against link-time OOM)' "$O_SWAPFILE"
+          pick 'Cache Rust dependencies' "$O_RUST_CACHE"
+          pick 'Install frontend dependencies' "$O_PNPM_INSTALL"
+          pick 'Build frontend' "$O_PNPM_BUILD"
+          if [ -n "$first" ]; then
+            echo "::error title=Clippy diff-scoped (advisory) SETUP FAILED (not a verdict on this PR)::step '${first}' failed before clippy ran"
+          fi

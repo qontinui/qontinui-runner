@@ -23,12 +23,14 @@ use crate::step_registry::StepEventLogger;
 use crate::str_utils::truncate_str;
 
 use super::compensation;
-use super::convergence::{ConvergenceAction, ConvergencePattern, ConvergenceReport};
+use super::convergence::{ConvergenceAction, ConvergenceReport};
+use super::evaluate_verification::handle_evaluate_verification;
+use super::loop_handlers_decisions::compensation_applies;
 use super::loop_state_machine::{CompletionReason, LoopContext, LoopState};
 use super::states::UnifiedWorkflowState;
 use super::types::{
     get_parent_task_id, step_execution_to_record, AgenticOutcome, IterationResult, LoopConfig,
-    LoopResult, NodeTelemetry, PhaseResult, RollbackPolicy, StepResultRecord,
+    LoopResult, NodeTelemetry, PhaseResult, StepResultRecord,
 };
 
 use super::loop_controller::{emit_and_persist_phase_result, LoopController};
@@ -115,8 +117,7 @@ impl LoopController {
                 LoopState::EvaluateVerification {
                     verification_result,
                 } => {
-                    self.handle_evaluate_verification(&mut ctx, config, verification_result)
-                        .await
+                    handle_evaluate_verification(self, &mut ctx, config, verification_result).await
                 }
 
                 LoopState::BuildFailureContext {
@@ -205,12 +206,13 @@ impl LoopController {
         // =====================================================================
 
         // Conductor-inspired compensation: execute rollback if the workflow failed
-        // and a rollback policy is configured. Only runs for non-success exits
-        // (critical failure, max iterations, unfixable errors).
-        if !loop_result.verification_passed
-            && !loop_result.was_stopped
-            && !matches!(config.rollback_policy, RollbackPolicy::None)
-        {
+        // and a rollback policy is configured. Only runs for REFUTED exits
+        // (critical failure, max iterations, unfixable errors) — never for a
+        // pass, a stop, or a `no_verification_steps` exit, which checked nothing
+        // and so refuted nothing. One predicate gates the rollback and the
+        // worktree finalizer below.
+        let compensate = compensation_applies(&loop_result, &config.rollback_policy);
+        if compensate {
             if let Some(wd) = config.project_path.as_deref().map(std::path::Path::new) {
                 let source_commit = ctx.initial_source_commit.as_deref();
                 match ctx
@@ -270,15 +272,13 @@ impl LoopController {
             }
         }
 
-        // Worktree finalizer: drained AFTER the stack has executed, unconditional
-        // when a rollback policy is active. Keeping worktree removal out-of-stack
+        // Worktree finalizer: drained AFTER the stack has executed, whenever the
+        // compensation runs (`compensate`: a rollback policy is active and the
+        // exit refuted the work). Keeping worktree removal out-of-stack
         // avoids two failure modes: (1) LastGood leaking the worktree by only
         // running the per-iteration resets, and (2) crash-resume trying to
         // git-reset a path that was already removed.
-        if !matches!(config.rollback_policy, RollbackPolicy::None)
-            && !loop_result.verification_passed
-            && !loop_result.was_stopped
-        {
+        if compensate {
             if let Some(finalizer) = ctx.worktree_finalizer.take() {
                 let worktree_path = finalizer.worktree_path.to_string_lossy().to_string();
                 if let Err(e) = compensation::execute_worktree_remove(
@@ -871,405 +871,6 @@ impl LoopController {
 
         LoopState::EvaluateVerification {
             verification_result,
-        }
-    }
-
-    // =========================================================================
-    // Handler: EvaluateVerification
-    // =========================================================================
-
-    /// Convergence analysis, resource limits, handle verification_passed / critical_failure,
-    /// record knowledge.
-    ///
-    /// Original lines: 2557-2852
-    async fn handle_evaluate_verification(
-        &self,
-        ctx: &mut LoopContext,
-        config: &mut LoopConfig,
-        verification_result: VerificationPhaseResult,
-    ) -> LoopState {
-        // Log verification results to output_log so the summary AI has context
-        {
-            let status = if verification_result.all_passed {
-                "PASSED"
-            } else if verification_result.critical_failure {
-                "CRITICAL FAILURE"
-            } else {
-                "FAILED"
-            };
-            let summary_line = format!(
-                "\n--- Verification (Iteration {}): {} ({} passed, {} failed, {} total) ---\n",
-                ctx.iteration,
-                status,
-                verification_result.passed_steps,
-                verification_result.failed_steps,
-                verification_result.total_steps,
-            );
-
-            // Include brief details of failed steps
-            let mut details = String::new();
-            for sr in &verification_result.step_results {
-                if !sr.success {
-                    let err = sr.error.as_deref().unwrap_or("unknown error");
-                    // Truncate long error messages
-                    let truncated = truncate_str(err, 200);
-                    details.push_str(&format!("  - {} [FAILED]: {}\n", sr.step_name, truncated));
-                }
-            }
-
-            let _ = self
-                .app_state
-                .pg_db
-                .append_task_output_ex(
-                    &config.execution_id,
-                    &format!("{}{}", summary_line, details),
-                    false,
-                    false,
-                )
-                .await;
-        }
-
-        // Store verification result in database for Recap page
-        // Use parent task ID for workflow sequences (same remapping as step checkpoints)
-        if let Ok(result_json) = serde_json::to_value(&verification_result) {
-            let parent_id = get_parent_task_id(&config.execution_id);
-            let _ = self
-                .app_state
-                .pg_db
-                .store_verification_phase_result(&parent_id, ctx.iteration, &result_json)
-                .await;
-
-            // Sync to web backend (best-effort, non-blocking)
-            let parent_id_clone = parent_id.clone();
-            let result_json_clone = result_json.clone();
-            let iteration = ctx.iteration;
-            tokio::spawn(async move {
-                let sync_service = crate::commands::task_sync::AITaskSyncService::new();
-                if let Err(e) = sync_service
-                    .sync_verification_result(&parent_id_clone, iteration, &result_json_clone)
-                    .await
-                {
-                    warn!("Failed to sync verification result to backend: {}", e);
-                }
-            });
-        }
-
-        // Emit state snapshot for replay
-        {
-            let snapshot_summary = format!(
-                "Verification iteration {} {}: {}/{} passed",
-                ctx.iteration,
-                if verification_result.all_passed {
-                    "PASSED"
-                } else {
-                    "FAILED"
-                },
-                verification_result.passed_steps,
-                verification_result.total_steps,
-            );
-            let context = serde_json::json!({
-                "type": "verification_result",
-                "iteration": ctx.iteration,
-                "all_passed": verification_result.all_passed,
-                "passed_steps": verification_result.passed_steps,
-                "failed_steps": verification_result.failed_steps,
-                "total_steps": verification_result.total_steps,
-                "critical_failure": verification_result.critical_failure,
-            });
-            let ts = chrono::Utc::now().to_rfc3339();
-            let _ = self
-                .app_state
-                .pg_db
-                .record_state_snapshot(
-                    &config.execution_id,
-                    "",
-                    &ts,
-                    "verification_result",
-                    Some(&snapshot_summary),
-                    Some(&context.to_string()),
-                )
-                .await;
-        }
-
-        // Emit canvas panel for verification completion
-        self.canvas_manager
-            .lock()
-            .await
-            .on_verification_complete(
-                ctx.iteration,
-                &verification_result,
-                &config.verification_history,
-            )
-            .await;
-
-        // Persist workflow state: VerificationComplete
-        self.persist_workflow_state(
-            &config.execution_id,
-            &UnifiedWorkflowState::verification_complete(
-                ctx.iteration,
-                verification_result.all_passed,
-                config.stage_index,
-                ctx.prior_stages_passed,
-            ),
-        );
-        {
-            let ts = chrono::Utc::now().to_rfc3339();
-            let _ = self
-                .app_state
-                .pg_db
-                .record_state_snapshot(
-                    &config.execution_id,
-                    "",
-                    &ts,
-                    "phase_transition",
-                    Some(&format!(
-                        "Entered verification_complete phase, iteration {}",
-                        ctx.iteration
-                    )),
-                    None,
-                )
-                .await;
-        }
-
-        // Run convergence detector and emit metrics for the frontend dashboard
-        let convergence_report = {
-            let failed_count = verification_result.failed_steps as u32;
-            let passed_count = verification_result.passed_steps as u32;
-            let skipped_count = verification_result.skipped_steps as u32;
-
-            // Compute current failed step names
-            let current_failed_names: std::collections::HashSet<String> = verification_result
-                .step_results
-                .iter()
-                .filter(|sr| !sr.success)
-                .map(|sr| sr.step_name.clone())
-                .collect();
-
-            // Run the convergence detector
-            let report = ctx.convergence_detector.analyze(
-                ctx.iteration,
-                &config.verification_history,
-                current_failed_names.clone(),
-                failed_count,
-                passed_count,
-            );
-
-            // Derive new/repeated from the detector's snapshot history for
-            // backward-compatible metrics emission.
-            let new_failures = current_failed_names.len() as u32;
-            let repeated_failures = 0u32;
-            let is_stalled = !report.is_healthy;
-
-            let broadcaster = EventBroadcaster::new(self.app_handle.clone());
-            broadcaster.iteration_metrics(
-                &config.execution_id,
-                ctx.iteration,
-                failed_count,
-                passed_count,
-                skipped_count,
-                new_failures,
-                repeated_failures,
-                is_stalled,
-            );
-
-            // Log convergence status
-            if report.has_concerns() {
-                let pattern_names: Vec<&str> = report
-                    .patterns
-                    .iter()
-                    .map(|p| match p {
-                        ConvergencePattern::Stuck { .. } => "stuck",
-                        ConvergencePattern::Diverging { .. } => "diverging",
-                        ConvergencePattern::Oscillating { .. } => "oscillating",
-                        ConvergencePattern::Plateau { .. } => "plateau",
-                        ConvergencePattern::Converging => "converging",
-                    })
-                    .collect();
-                warn!(
-                    "CONVERGENCE: iteration={}, failed={}, passed={}, patterns={:?}, actions={}",
-                    ctx.iteration,
-                    failed_count,
-                    passed_count,
-                    pattern_names,
-                    report.actions.len(),
-                );
-            } else {
-                info!(
-                    "CONVERGENCE: iteration={}, failed={}, passed={}, healthy=true",
-                    ctx.iteration, failed_count, passed_count,
-                );
-            }
-
-            // Increment cumulative verification failures for routing context
-            if !verification_result.all_passed {
-                ctx.verification_failures += 1;
-            }
-
-            // If escalation was recommended, bump verification_failures to trigger
-            // routing rules that use the verification_failures threshold
-            if report.should_escalate_model() {
-                info!(
-                    "CONVERGENCE-ESCALATE: Bumping verification_failures for routing (was {})",
-                    ctx.verification_failures
-                );
-                // Ensure it's at least 3 so routing rules like
-                // "verification_failures >= 3 → use opus" fire
-                if ctx.verification_failures < 3 {
-                    ctx.verification_failures = 3;
-                }
-            }
-
-            // Check resource limits and merge any actions into the report.
-            // Resource actions use the same ConvergenceAction type so the loop
-            // controller handles them uniformly with convergence pattern actions.
-            let resource_actions = ctx.resource_tracker.check_limits(ctx.iteration);
-            if !resource_actions.is_empty() {
-                // Merge resource actions into the report
-                let mut merged = report;
-                merged.is_healthy = false;
-                for action in &resource_actions {
-                    if let ConvergenceAction::InjectContext { context, .. } = action {
-                        if merged.context_injection.is_empty() {
-                            merged
-                                .context_injection
-                                .push_str("\n## Resource Constraints\n\n");
-                        }
-                        merged.context_injection.push_str(context);
-                        merged.context_injection.push('\n');
-                    }
-                }
-                merged.actions.extend(resource_actions);
-                merged
-            } else {
-                report
-            }
-        };
-
-        // Store current iteration's verification counts for PostAgentic
-        ctx.current_passed_checks = verification_result.passed_steps;
-        ctx.current_failed_checks = verification_result.failed_steps;
-
-        // Check verification outcome
-        if verification_result.all_passed {
-            info!("*** VERIFICATION PASSED on iteration {} ***", ctx.iteration);
-
-            // Resolve all unresolved knowledge entries — the issues they describe
-            // have been addressed since verification now passes.
-            {
-                let parent_id = get_parent_task_id(&config.execution_id);
-                match self.knowledge_base.get_all_knowledge(&parent_id).await {
-                    Ok(entries) => {
-                        let unresolved: Vec<_> =
-                            entries.iter().filter(|k| !k.is_resolved).collect();
-                        if !unresolved.is_empty() {
-                            info!(
-                                "Resolving {} unresolved knowledge entries after verification pass",
-                                unresolved.len()
-                            );
-                            for entry in &unresolved {
-                                if let Err(e) = self
-                                    .knowledge_base
-                                    .resolve_finding(
-                                        &entry.id,
-                                        Some("Resolved: verification passed"),
-                                    )
-                                    .await
-                                {
-                                    warn!("Failed to resolve knowledge entry {}: {}", entry.id, e);
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Failed to fetch knowledge entries for resolution: {}", e);
-                    }
-                }
-            }
-
-            let iter_result = IterationResult {
-                iteration: ctx.iteration,
-                verification_passed: true,
-                critical_failure: false,
-                passed_checks: verification_result.passed_steps,
-                failed_checks: verification_result.failed_steps,
-                failure_context: String::new(),
-                agentic_phase_ran: false,
-                agentic_phase_success: None,
-                blame_json: None,
-                contingent_on: Vec::new(),
-                node_rollups: Vec::new(),
-            };
-            ctx.iteration_results.push(iter_result);
-
-            return LoopState::Complete {
-                reason: CompletionReason::VerificationPassed,
-            };
-        }
-
-        // Check for critical failure
-        if verification_result.critical_failure {
-            error!(
-                "*** CRITICAL FAILURE on iteration {} - stopping loop ***",
-                ctx.iteration
-            );
-
-            let iter_result = IterationResult {
-                iteration: ctx.iteration,
-                verification_passed: false,
-                critical_failure: true,
-                passed_checks: verification_result.passed_steps,
-                failed_checks: verification_result.failed_steps,
-                failure_context: verification_result.build_failure_context(),
-                agentic_phase_ran: false,
-                agentic_phase_success: None,
-                blame_json: None,
-                contingent_on: Vec::new(),
-                node_rollups: Vec::new(),
-            };
-            ctx.iteration_results.push(iter_result);
-
-            return LoopState::Complete {
-                reason: CompletionReason::CriticalFailure {
-                    error: verification_result.build_failure_context(),
-                },
-            };
-        }
-
-        // --- Fix attempt tracking (Phase 1: Bounded Fix Loop) ---
-        let current_passed = verification_result.passed_steps;
-        if current_passed > ctx.best_passed_checks {
-            // Progress detected — reset fix counter
-            ctx.best_passed_checks = current_passed;
-            ctx.fix_attempts = 0;
-            ctx.last_progress_iteration = ctx.iteration;
-            info!(
-                "Fix loop: progress detected (passed {} > previous best), reset fix_attempts",
-                current_passed,
-            );
-        } else {
-            ctx.fix_attempts += 1;
-            info!(
-                "Fix loop: no progress (passed {} <= best {}), fix_attempts = {}/{}",
-                current_passed, ctx.best_passed_checks, ctx.fix_attempts, config.max_fix_attempts
-            );
-        }
-
-        // Check if fix attempts exhausted
-        if config.max_fix_attempts > 0 && ctx.fix_attempts >= config.max_fix_attempts {
-            warn!(
-                "Fix loop: {} consecutive non-improving iterations (max {}), escalating",
-                ctx.fix_attempts, config.max_fix_attempts
-            );
-            return LoopState::FixEscalation {
-                verification_result,
-                convergence_report,
-            };
-        }
-
-        // Verification failed (non-critical) — continue to build failure context
-        LoopState::BuildFailureContext {
-            verification_result,
-            convergence_report,
         }
     }
 

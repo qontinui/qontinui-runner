@@ -15,6 +15,10 @@ import type { LogFunction } from "./types";
  * on the user's behalf, its off switch lives here and not only in the
  * environment. The transcript survives the close.
  *
+ * `eligibility` is not the close: `terminal/graceful_exit.rs` still refuses any
+ * session whose `claude` holds a child process, its MCP servers included, so
+ * the `on` text below must not promise a close for such a session.
+ *
  * `QONTINUI_FINISHED_SESSION_CLOSE=0` in the runner's environment is a machine
  * kill switch that wins over this value; the panel shows when it is engaged.
  */
@@ -32,17 +36,19 @@ export const FINISHED_SESSION_CLOSE_OPTIONS: ReadonlyArray<{
     value: "on",
     label: "On",
     explain:
-      "A finished session idle past the grace period, with every attributable worktree clean and pushed, is closed — the default.",
+      "A finished session idle past the grace period, holding no child process (an MCP server counts), with every attributable worktree clean, pushed and outside a primary checkout, is closed.",
   },
   {
     value: "shadow",
     label: "Shadow",
-    explain: "Every check runs and the runner logs which sessions it would close, but closes none.",
+    explain:
+      "The runner logs the finished sessions that pass the idleness and custody checks and closes none; one whose only children are MCP servers it started directly at boot is logged, though On would not close it.",
   },
   {
     value: "off",
     label: "Off",
-    explain: "Finished sessions stay open until you close them, or until a drain winds them down.",
+    explain:
+      "Finished sessions stay open until you close them, or until a drain winds down one holding no child process.",
   },
 ];
 
@@ -137,9 +143,12 @@ export function FinishedSessionCloseSettings({ onLog }: { onLog: LogFunction }) 
         When a session is marked finished and sits idle past the grace period, the runner checks
         every worktree it can attribute to the session: the repository its directory is in, the
         worktrees coord allocated to it, and the worktrees its isolated-edit context created. If all
-        of them are committed and pushed, the runner exits the session with <code>/exit</code> and
-        closes its window. A session with uncommitted, untracked or unpushed work in any of them —
-        or one whose state cannot be read — is never closed. The transcript is kept.
+        of them are committed and pushed, none is a primary checkout and the session holds no child
+        process, the runner exits it with <code>/exit</code> and closes its window. This setting
+        never closes a session holding any child process (an MCP server counts), with uncommitted,
+        untracked or unpushed work in any of them, or whose state cannot be read. A drain does not
+        check worktrees, but it does refuse a session holding a child process. The transcript is
+        kept.
       </p>
       {loadError && (
         <p

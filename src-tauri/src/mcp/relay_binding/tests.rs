@@ -1894,23 +1894,26 @@ async fn untargeted_dispatch_not_captured_during_reconnect() {
     );
     assert_eq!(status, 409, "{body}");
     assert_eq!(code(&body), Some("AMBIGUOUS_TAB"), "{body}");
-    // The candidates are a structured field, not prose: `suggestions` carries
-    // one `retry with {"tabId": "…"}` entry per candidate. Each candidate gains
-    // its `verifiedOrigin` in Phase 3 — assert that when it lands.
-    let suggestions: Vec<String> = body["suggestions"]
+    // The candidates are a structured field, not prose: `hint.candidates`
+    // carries one `{tabId, verifiedOrigin}` entry per candidate, and the
+    // refusal names the field to correct.
+    let candidates: Vec<String> = body["hint"]["candidates"]
         .as_array()
-        .expect("AmbiguousTab lists its candidates in `suggestions`")
+        .expect("AmbiguousTab lists its candidates in `hint.candidates`")
         .iter()
-        .map(|v| v.as_str().unwrap_or_default().to_string())
+        .map(|v| v["tabId"].as_str().unwrap_or_default().to_string())
         .collect();
     for tab in ["t1", "t9"] {
         assert!(
-            suggestions
-                .iter()
-                .any(|s| s.contains(&format!("\"tabId\": \"{tab}\""))),
-            "{tab} is not among the candidates: {suggestions:?}"
+            candidates.iter().any(|c| c == tab),
+            "{tab} is not among the candidates: {candidates:?}"
         );
     }
+    assert_eq!(
+        body["refusal"]["next_action"]["kind"], "fix_request",
+        "{body}"
+    );
+    assert_eq!(body["refusal"]["next_action"]["target"], "tabId", "{body}");
 }
 
 /// R9.
@@ -2690,4 +2693,148 @@ async fn an_http_apps_object_error_answers_the_agent_with_its_code_and_retry_ver
             .is_some_and(|e| e.contains("The app is busy rendering")),
         "{body}"
     );
+}
+
+/// The two refusals that fire BEFORE any binding rule runs -- a first frame
+/// that is not a register frame, and a register frame declaring a transport
+/// other than `websocket` -- both end in a WebSocket Close frame through the
+/// same bounded close path as a refused claim (`close_gracefully`), and
+/// register nothing.
+///
+/// What this pins is the clean-close CONTRACT (a Close frame, not EOF or a
+/// transport error). It does not reproduce the Windows RST that motivated
+/// the shared drain: on loopback the refused frame and anything after it are
+/// already in tungstenite's userspace buffer, so no unread kernel data is
+/// left to trigger one. That mechanism is exercised only by
+/// `concurrent_claims_single_winner` on the Windows CI job.
+#[tokio::test]
+async fn pre_register_rejections_close_cleanly() {
+    let s = spawn(BindingConfig::default()).await;
+    let wrong_transport = json!({
+        "type": "register",
+        "transport": "sse",
+        "appId": "app",
+        "appName": "app (test)",
+        "appType": "wrapper",
+        "origin": GOOD,
+        "pageUrl": format!("{GOOD}/page"),
+    });
+    let not_register = json!({ "type": "hello", "appId": "app" });
+    for (case, first) in [
+        ("wrong transport", wrong_transport),
+        ("not a register frame", not_register),
+    ] {
+        let mut ws = s.ws_open_try(Some(GOOD)).await.expect("upgrade");
+        ws.send(first).await;
+        let seen = tokio::time::timeout(PROMPT, ws.stream.next()).await;
+        assert!(
+            matches!(seen, Ok(Some(Ok(WsMessage::Close(_))))),
+            "{case}: a refused first frame must end in a Close frame, got {seen:?}"
+        );
+        assert!(
+            s.registered("app").await.is_none(),
+            "{case}: a refused first frame must not register the app"
+        );
+    }
+}
+
+/// Plan `2026-11-21-vision-capture-cannot-frame-a-websocket-transport-app`
+/// Phase 1 test (a) — the assumption probe for the vision WebSocket arm. A
+/// client registered with the `screenshot` capability answers `getScreenshot`
+/// with a 4 MiB+ base64 PNG `response` frame that REALLY crosses the socket
+/// (`tokio-tungstenite` against the served router), inside the relay's
+/// command timeout, and the capture decodes its width, height and HiDPI scale.
+/// If this fails the relay's payload ceiling is too low and the arm must set
+/// the limit explicitly — never lower the image quality silently.
+#[tokio::test]
+async fn a_capable_websocket_client_answers_a_4_mib_screenshot_over_the_socket() {
+    use crate::mcp::ui_bridge::vision_frame_source::ws_relay_source::capture_over_relay;
+    use crate::mcp::ui_bridge::vision_frame_source::{SCREENSHOT_ACTION, SCREENSHOT_CAPABILITY};
+    use base64::Engine as _;
+
+    // Incompressible pixels (xorshift noise), so the PNG stays as large as
+    // its raw RGBA: 1100×800×4 ≈ 3.4 MiB, ≈ 4.5 MiB once base64-encoded.
+    let (w, h) = (1100u32, 800u32);
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    let img = image::RgbaImage::from_fn(w, h, |_, _| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        let b = seed.to_le_bytes();
+        image::Rgba([b[0], b[1], b[2], 255])
+    });
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(img)
+        .write_to(&mut png, image::ImageFormat::Png)
+        .expect("encode png");
+    let b64 = base64::engine::general_purpose::STANDARD.encode(png.into_inner());
+    assert!(
+        b64.len() >= 4 * 1024 * 1024,
+        "the probe must carry at least 4 MiB of base64, got {} bytes",
+        b64.len()
+    );
+
+    let s = spawn(BindingConfig::default()).await;
+    let mut wrapper = s.ws_open_try(None).await.expect("upgrade");
+    wrapper
+        .send(json!({
+            "type": "register",
+            "transport": "websocket",
+            "appId": "shot-app",
+            "appName": "shot-app (test)",
+            "appType": "wrapper",
+            "capabilities": [SCREENSHOT_CAPABILITY],
+        }))
+        .await;
+    let ack = wrapper.recv_reply().await.expect("register ack");
+    assert_eq!(ack["type"], "registered", "{ack}");
+    let row = s
+        .relay
+        .app_registry
+        .get_live("shot-app")
+        .await
+        .expect("live row");
+    assert!(
+        row.app
+            .capabilities
+            .iter()
+            .any(|c| c == SCREENSHOT_CAPABILITY),
+        "the register frame's capability reaches the registry: {:?}",
+        row.app.capabilities
+    );
+
+    let dispatcher = s.relay.app_dispatcher.clone();
+    let registry = s.relay.app_registry.clone();
+    let capture =
+        tokio::spawn(async move { capture_over_relay(&dispatcher, &registry, "shot-app").await });
+
+    let command = loop {
+        let frame = wrapper
+            .recv()
+            .await
+            .expect("the wrapper receives the command");
+        if frame["type"] == "command" {
+            break frame;
+        }
+    };
+    assert_eq!(command["action"], SCREENSHOT_ACTION, "{command}");
+    let command_id = command["commandId"]
+        .as_str()
+        .expect("commandId")
+        .to_string();
+    // Reported CSS width is half the PNG's: a 2× HiDPI frame.
+    wrapper
+        .respond(
+            &command_id,
+            json!({ "screenshot": b64, "width": w / 2, "height": h / 2 }),
+        )
+        .await;
+
+    let frame = tokio::time::timeout(Duration::from_secs(30), capture)
+        .await
+        .expect("the capture settles inside the relay's 30 s command timeout")
+        .unwrap()
+        .expect("the 4 MiB frame crossed the socket and decoded");
+    assert_eq!((frame.width, frame.height), (w, h));
+    assert!((frame.source.scale_factor - 2.0).abs() < 1e-9);
 }

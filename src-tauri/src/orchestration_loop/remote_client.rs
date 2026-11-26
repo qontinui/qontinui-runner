@@ -24,8 +24,11 @@ struct ApiResponse<T> {
 
 impl RunnerClient {
     pub fn new(port: u16) -> Self {
+        // The base URL is always the loopback runner, so an `HTTP_PROXY` in
+        // the environment must not route these requests away from it.
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
+            .no_proxy()
             .build()
             .expect("Failed to create HTTP client");
 
@@ -552,28 +555,51 @@ impl RunnerClient {
     }
 
     /// Run assertions against the current UI state via UI Bridge.
+    ///
+    /// `POST /ui-bridge/control/assert` takes ONE assertion per request — a
+    /// `StructuredAssertRequest` body (`query`, `queryType`, `assertion`,
+    /// `expected`, `attribute`) — so each configured assertion is posted on its
+    /// own, as `DiagnosePhaseConfig::assertions` documents. Coord finding
+    /// 0181f3d4: this used to post `{"assertions": [...]}` in one request,
+    /// which the route rejects at deserialization, so every configured
+    /// assertion read as failed.
+    ///
+    /// Returns one result per assertion, in order. A transport error, a non-2xx
+    /// status or an unparseable body becomes that assertion's
+    /// `{"passed": false, "error": …, "assertion": <the request>}` entry, so a
+    /// refused assertion is reported as refused rather than as a failed check.
     pub async fn run_assertions(
         &self,
         assertions: &[serde_json::Value],
     ) -> Result<Vec<serde_json::Value>, String> {
         let url = format!("{}/ui-bridge/control/assert", self.base_url);
-        let resp = self
-            .client
-            .post(&url)
-            .json(&serde_json::json!({ "assertions": assertions }))
-            .send()
-            .await
-            .map_err(|e| format!("Failed to run assertions: {}", e))?;
-        let body: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("Failed to parse assertion response: {}", e))?;
-        let data = if body.get("success").is_some() {
-            body.get("data").cloned().unwrap_or(body.clone())
-        } else {
-            body
+        let mut results = Vec::with_capacity(assertions.len());
+        for assertion in assertions {
+            results.push(self.run_one_assertion(&url, assertion).await);
+        }
+        Ok(results)
+    }
+
+    async fn run_one_assertion(
+        &self,
+        url: &str,
+        assertion: &serde_json::Value,
+    ) -> serde_json::Value {
+        let resp = match self.client.post(url).json(assertion).send().await {
+            Ok(resp) => resp,
+            Err(e) => return assertion_error(assertion, format!("Failed to run assertion: {}", e)),
         };
-        Ok(data.as_array().cloned().unwrap_or_else(|| vec![data]))
+        let status = resp.status();
+        let text = match resp.text().await {
+            Ok(text) => text,
+            Err(e) => {
+                return assertion_error(
+                    assertion,
+                    format!("Failed to read assertion response (HTTP {}): {}", status, e),
+                )
+            }
+        };
+        assertion_result_from_response(assertion, status.as_u16(), &text)
     }
 
     /// Wait for the runner to become healthy.
@@ -643,5 +669,150 @@ impl SupervisorClient {
         }
 
         Ok(())
+    }
+}
+
+/// One assertion's entry for a request that produced no route verdict.
+fn assertion_error(assertion: &serde_json::Value, error: String) -> serde_json::Value {
+    serde_json::json!({ "passed": false, "error": error, "assertion": assertion })
+}
+
+/// Read one `POST /ui-bridge/control/assert` response into that assertion's
+/// result: the `data` of a success envelope (an `AssertResult`), else an
+/// error entry naming the status and the body the route sent.
+fn assertion_result_from_response(
+    assertion: &serde_json::Value,
+    status: u16,
+    body: &str,
+) -> serde_json::Value {
+    let parsed: Option<serde_json::Value> = serde_json::from_str(body).ok();
+    if (200..300).contains(&status) {
+        if let Some(data) = parsed
+            .as_ref()
+            .filter(|b| b.get("success").and_then(|v| v.as_bool()) == Some(true))
+            .and_then(|b| b.get("data"))
+            .filter(|d| d.is_object())
+        {
+            return data.clone();
+        }
+    }
+    let detail = parsed
+        .as_ref()
+        .and_then(|b| b.get("error"))
+        .map(|e| {
+            e.as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| e.to_string())
+        })
+        .unwrap_or_else(|| body.trim().to_owned());
+    assertion_error(
+        assertion,
+        format!("Assertion request refused (HTTP {}): {}", status, detail),
+    )
+}
+
+#[cfg(test)]
+mod run_assertions_tests {
+    //! Coord finding 0181f3d4: `run_assertions` posted every configured
+    //! assertion in one `{"assertions": [...]}` body, which
+    //! `POST /ui-bridge/control/assert` rejects at deserialization, so every
+    //! diagnose-phase assertion read as failed. These serve a stub route that
+    //! deserializes the route's OWN request type, so the shape is checked
+    //! against what the real route accepts.
+
+    use super::{assertion_result_from_response, RunnerClient};
+    use crate::mcp::ui_bridge::capabilities::StructuredAssertRequest;
+    use axum::{routing::post, Json, Router};
+    use serde_json::json;
+
+    async fn serve_stub_assert_route() -> u16 {
+        // The stub passes `query == "#ok"` and fails anything else, so the
+        // test can tell results apart and see their order.
+        let app = Router::new().route(
+            "/ui-bridge/control/assert",
+            post(|Json(request): Json<StructuredAssertRequest>| async move {
+                let passed = request.query == "#ok";
+                Json(json!({
+                    "success": true,
+                    "data": {
+                        "passed": passed,
+                        "assertion": request.assertion,
+                        "query": request.query,
+                        "actual": {},
+                        "expected": null,
+                        "message": "stub",
+                    }
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let port = listener.local_addr().expect("a bound address").port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("the stub serves");
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn each_assertion_is_posted_as_its_own_request_the_route_accepts() {
+        let port = serve_stub_assert_route().await;
+        let assertions = vec![
+            json!({ "query": "#ok", "assertion": "exists" }),
+            json!({ "query": "#missing", "queryType": "css", "assertion": "exists" }),
+            // Not a StructuredAssertRequest: the route refuses it.
+            json!({ "type": "visible", "role": "tab" }),
+        ];
+        let results = RunnerClient::new(port)
+            .run_assertions(&assertions)
+            .await
+            .expect("run_assertions answers");
+
+        assert_eq!(results.len(), 3, "one result per assertion: {results:?}");
+        assert_eq!(results[0]["passed"], json!(true), "{results:?}");
+        assert_eq!(results[0]["query"], json!("#ok"), "{results:?}");
+        assert_eq!(results[1]["passed"], json!(false), "{results:?}");
+        assert_eq!(results[1]["query"], json!("#missing"), "{results:?}");
+        assert!(
+            results[1].get("error").is_none(),
+            "a failed check is not a refusal: {results:?}"
+        );
+        assert_eq!(results[2]["passed"], json!(false), "{results:?}");
+        let error = results[2]["error"].as_str().unwrap_or("");
+        assert!(
+            error.contains("HTTP 422"),
+            "a refused assertion names the refusal: {error}"
+        );
+        assert_eq!(
+            results[2]["assertion"], assertions[2],
+            "the refused request is echoed"
+        );
+    }
+
+    #[test]
+    fn a_failure_envelope_becomes_an_error_entry_naming_its_message() {
+        let assertion = json!({ "query": "x", "assertion": "bogus" });
+        let result = assertion_result_from_response(
+            &assertion,
+            400,
+            r#"{"success":false,"data":null,"error":"Invalid assertion 'bogus'"}"#,
+        );
+        assert_eq!(result["passed"], json!(false));
+        assert_eq!(
+            result["error"],
+            json!("Assertion request refused (HTTP 400): Invalid assertion 'bogus'")
+        );
+    }
+
+    #[test]
+    fn a_success_envelope_yields_its_assert_result() {
+        let assertion = json!({ "query": "x", "assertion": "exists" });
+        let result = assertion_result_from_response(
+            &assertion,
+            200,
+            r#"{"success":true,"data":{"passed":true,"query":"x"}}"#,
+        );
+        assert_eq!(result, json!({ "passed": true, "query": "x" }));
     }
 }

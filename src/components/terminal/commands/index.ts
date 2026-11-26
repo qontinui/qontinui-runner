@@ -51,6 +51,7 @@ export {
   coerceToken,
   extractFlags,
   parseArgs,
+  readTextArg,
   tokenize,
   textArg,
   tokenizeRich,

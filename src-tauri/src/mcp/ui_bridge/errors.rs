@@ -550,7 +550,7 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
 // The variant itself has to live in `types.rs` beside the enum it belongs to;
 // everything about *this* condition lives here.
 
-use super::types::{RecoveryHint, UiBridgeError, UiBridgeErrorCode};
+use super::types::{UiBridgeError, UiBridgeErrorCode};
 
 impl UiBridgeError {
     /// Body for a route that cannot honour a request because the native event
@@ -576,7 +576,7 @@ impl UiBridgeError {
                  refusing rather than reporting a success it cannot confirm"
                     .to_string()
             },
-            recovery: Some(RecoveryHint::WaitForRecovery),
+            recovery: Some(qontinui_types::refusal::NextAction::retry_later(None)),
             context: Some(serde_json::json!({
                 "code": "EVENT_LOOP_UNRESPONSIVE",
                 "reason": reason,
@@ -597,7 +597,8 @@ mod event_loop_unresponsive_tests {
     //! The wire contract of the coded 503 the close door returns during a
     //! native-event-loop hang.
 
-    use super::super::types::{recovery_hint_for, RecoveryHint, UiBridgeError, UiBridgeErrorCode};
+    use super::super::types::{next_action_for, UiBridgeError, UiBridgeErrorCode};
+    use qontinui_types::refusal::NextAction;
 
     /// The whole reason for a new variant rather than reusing
     /// `FRONTEND_NOT_READY` is that an agent must be able to discriminate on
@@ -649,16 +650,16 @@ mod event_loop_unresponsive_tests {
         );
     }
 
-    /// NOT `RetryAfterMs`: a fixed backoff cannot clear a wedge, and each retry
-    /// re-enqueues onto the same blocked queue. NOT `Unrecoverable` either: a
-    /// long synchronous handler does eventually return.
+    /// `retry_later` with NO delay: a fixed backoff cannot clear a wedge, and
+    /// each retry re-enqueues onto the same blocked queue. NOT `none_terminal`
+    /// either: a long synchronous handler does eventually return.
     #[test]
-    fn recovery_hint_is_wait_for_recovery() {
-        assert!(matches!(
-            recovery_hint_for(&UiBridgeErrorCode::EventLoopUnresponsive),
-            RecoveryHint::WaitForRecovery
-        ));
+    fn next_action_is_retry_later_without_a_delay() {
+        assert_eq!(
+            next_action_for(&UiBridgeErrorCode::EventLoopUnresponsive),
+            NextAction::retry_later(None)
+        );
         let err = UiBridgeError::event_loop_unresponsive("wedge_detector_latched", true);
-        assert!(matches!(err.recovery, Some(RecoveryHint::WaitForRecovery)));
+        assert_eq!(err.recovery, Some(NextAction::retry_later(None)));
     }
 }

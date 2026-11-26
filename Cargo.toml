@@ -18,6 +18,11 @@ members = [
     # decided 2026-09-28): a dedicated minimal binary plus the frame protocol
     # and transport library both it and the runner link.
     "crates/pty-holder",
+    # The session-lifecycle kernel (plan 2026-10-28-one-session-lifecycle-authority,
+    # Phase 37): pure evaluators, no Tauri and no runner-lib dependency. First
+    # slice: classify_child (plan
+    # 2026-11-04-runner-finished-close-closes-nothing-on-any-box, Phase 2a).
+    "crates/session-lifecycle",
 ]
 resolver = "2"
 

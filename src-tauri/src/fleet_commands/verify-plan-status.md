@@ -180,7 +180,10 @@ A plan declares its state with a status block at the top:
 > **Status: SHIPPED <YYYY-MM-DD>.** <summary + commit SHAs>.
 ```
 
-or `Status: PARTIAL` / `Status: SUPERSEDED by <other-plan>` / `Status: OBSOLETE`.
+or `Status: SUPERSEDED by <other-plan>` / `Status: OBSOLETE`, or a partial /
+not-started verdict appended to a lifecycle word (`Status: VETTED <date> —
+partial: …`, `Status: DRAFT <date> — not started …`; §5 has the templates).
+The lead word is always a lifecycle word — never `PARTIAL` or `NOT STARTED`.
 
 ## Instructions
 
@@ -265,7 +268,9 @@ chain](#plan-stem-resolution-chain) below. Capture each dep's status — the
 the lifecycle word of the dep file's first body stamp (a frontmatter
 `status:` only when there is none) read by hand — one of `DRAFT`, `VETTED`,
 `IN PROGRESS`, `SHIPPED`, `PARTIAL`, `NOT STARTED`, `SUPERSEDED`,
-`OBSOLETE`. If the dep file can't be found in either
+`OBSOLETE` (`PARTIAL` / `NOT STARTED` are legacy lead words — no writer emits
+them now, but other plan directories may still carry them; a dep stamped
+`VETTED <date> — partial: …` reads as `VETTED`). If the dep file can't be found in either
 directory, record the dep as `MISSING (no plan file)` and surface it as a
 drifted-status item in the final report.
 
@@ -335,7 +340,8 @@ in the current branch's history with `git merge-base --is-ancestor 879c36bb4 HEA
 >   `GET /coord/agent-work-units/<stem>/citations`, device or agent JWT). It is
 >   coord's own delivery reduction over the plan's PR citations: `shipped`,
 >   `evidence_complete`, `evidence_gaps`, `phases_declared_indices`,
->   `phases_delivered` and `phases_remaining`, with each citation's merged-state
+>   `phases_delivered`, `phases_attested`, `phase_attestations`,
+>   `phases_complete_scope` and `phases_remaining`, with each citation's merged-state
 >   observed against **origin**. Read it through `/vet-plan` §0.25's arm table,
 >   in that table's order (4, 3, 2, 1, 5, then 6). §5 "Settling case 1" below
 >   says which arm lets this skill write. When it reads arm 2 because
@@ -384,11 +390,33 @@ Based on the verification, place each plan in one of:
   and `SHIPPED — UNCONFIRMED (<claim ids>)`.
 - **PARTIAL** — some claims verified, some missing. Note which.
 - **NOT STARTED** — zero claims verified. The plan is still aspirational.
+
+  `PARTIAL` and `NOT STARTED` are verdict *names* only — neither is ever
+  stamped as the lead word of a status block. §5 appends them to a lifecycle
+  word (`VETTED` or `DRAFT`, by the `<LW>` rule there).
 - **SUPERSEDED** — the plan's body says it's superseded by another plan, OR
   the work is in main but not via the path the plan describes (a different
   approach landed). Cite the superseding artifact.
 - **OBSOLETE** — the work is no longer applicable (technology removed,
   feature cancelled, etc.). The body usually says so explicitly.
+
+  A plan whose route-around `History:` line owes work, or names an OPEN PR
+  in any of its `work products:`, `owed for`, `route-around opened as` or
+  `superseded successors:` segments, cannot take either terminal word until
+  status-guard rule 6 releases it.
+  This skill is the ONE executor of rule 6's two exits for these verdicts:
+  **inherit** for a `SUPERSEDED` plan whose superseding plan is non-terminal
+  (every open PR the line names moves to it as `owed for`, and this plan's
+  line names them in `route-around transferred to <stem>: …`), and **close** for `OBSOLETE`, or
+  for `SUPERSEDED` by landed work (a merged PR or a `SHIPPED` plan) with no
+  non-terminal plan to inherit the line, under
+  `git-operations` `an-obsolete-plans-owed-predecessor-is-closed`. Rule 6's
+  discharge and reclassify exits run first, and when a non-terminal inheritor
+  exists, inherit is the only exit and nothing is closed. Every other
+  writer, `/implement-plan` included, only holds and reports
+  `rule-6 exit available: run /verify-plan-status <stem>`. If neither exit
+  completes, write the `— partial` verdict stamp (the PARTIAL form in §5) and
+  report the hold.
 - **IN FLIGHT — guard held** — the plan is stamped `IN PROGRESS` and §5's
   conditional guard refused the overwrite (case 3, a live peer; or the
   unidentified default). This is a **refusal, not a verdict**: you did not
@@ -411,20 +439,41 @@ the H1:
 <rest of plan body unchanged>
 ```
 
-For PARTIAL:
+For a PARTIAL verdict:
 ```markdown
-> **Status: PARTIAL <YYYY-MM-DD>.** Phases <X>, <Y> shipped (commits <sha>,
-> <sha>). Phase <Z> open: <one-sentence reason>. <Followup ptr if any.>
+> **Status: <LW> <YYYY-MM-DD> — partial: Phase <Z> open (<one-sentence reason>); Phases <X>, <Y> shipped (commits <sha>, <sha>) (verified <YYYY-MM-DD>).** <Followup ptr if any.>
 ```
 
-For NOT STARTED:
+For a NOT STARTED verdict:
 ```markdown
-> **Status: NOT STARTED (verified <YYYY-MM-DD>).** No source-code evidence
-> of any acceptance criterion. <Why it might still be worth doing OR why it's
-> stale — one sentence either way.>
+> **Status: <LW> <YYYY-MM-DD> — not started (verified <YYYY-MM-DD>).** No
+> source-code evidence of any acceptance criterion. <Why it might still be
+> worth doing OR why it's stale — one sentence either way.>
 ```
 
-For SUPERSEDED / OBSOLETE: cite the replacement or the reason.
+**The verdict is appended to a lifecycle word, never used as one.** `PARTIAL`
+and `NOT STARTED` are not in `plan-discipline`'s vocabulary: the runner's plan
+adapter pushes the stamp's first token to coord, where both land as
+off-vocabulary statuses. The `<LW>` (lifecycle word) rule:
+
+- **`<LW>` is `VETTED` ONLY when the stamp being replaced led with `VETTED`;
+  otherwise it is `DRAFT`.** `vetted` is an Attested status in coord, and an
+  adapter push coord refuses with a 403 retires the slug for the whole runner
+  process. The legacy `PARTIAL` / `NOT STARTED` lead words were Free, so
+  writing `VETTED` over an `IN PROGRESS`, a `SHIPPED` over-claim, a `DRAFT`, a
+  legacy `PARTIAL` or an unstamped plan would add an attested push the old
+  spelling never made. Never upgrade the lifecycle word.
+- **When `<LW>` is `VETTED`, carry the replaced block's `> Vetted-by:` …
+  `> Independence:` lines verbatim** as the last lines of the new block, after
+  any `History:` line (where `/vet-plan` §5 and `/implement-plan` Step 0.5 put
+  them; Step 0.5 reads them).
+- **Never write "in progress" in the headline.** `/vet-imp-sweep` reads any
+  `IN PROGRESS` in the headline as ownership by a live session. Say "open" or
+  "remains" instead.
+- The `IN PROGRESS` guard below is unchanged: a guarded `IN PROGRESS` is never
+  overwritten by either form.
+
+For SUPERSEDED / OBSOLETE: cite the replacement or the reason, and, when the block still owes route-around work, the rule 6 exit you took (the inheritor stem, or the PRs you closed) or the hold you kept.
 
 **A SHIPPED verdict reads the plan's `## Done when` before it is written**
 (roster rule: `.claude/commands/_status-writers.md` → "The `Done when` rule").
@@ -450,7 +499,7 @@ from the served `claims[]` (`coord_get_prompt_document`):
 
 An existing `SHIPPED — UNCONFIRMED (…)` stamp is rewritten to bare `SHIPPED`
 only when every named claim now reads `confirmed`; the claims alone never move
-it to `PARTIAL` or `NOT STARTED` — the code landed. The runner normalises the
+it to a partial or not-started verdict — the code landed. The runner normalises the
 qualified stamp to `shipped`; the qualifier is for the human reader.
 
 #### Single-stamp invariant — read before stamping
@@ -465,7 +514,22 @@ and the body. Before writing your stamp:
    above the first sub-H1 heading, and the difficulty rubric reads it only
    there — moving or deleting it silently reverts the plan to its computed
    rating.)
-1. Read the top of the plan. Identify EVERY top-of-file blockquote that
+1. Read the top of the plan **from `origin/main`, not from the local file**,
+   when the plan directory is inside a git repo:
+   `TOP="$(git -C "$QONTINUI_PLANS_DIR" rev-parse --show-toplevel)"`, then
+   `git -C "$TOP" fetch -q origin +refs/heads/main:refs/remotes/origin/main`
+   (exit status read unpiped — a failed fetch is a STOP for this plan), then
+   record `BASED_ON=$(git -C "$TOP" rev-parse -q --verify
+   "refs/remotes/origin/main:<repo-relative path>")` for this path and read the block from
+   `git -C "$TOP" cat-file -p "$BASED_ON"`. `$QONTINUI_PLANS_DIR` usually names
+   a shared checkout that can be thousands of commits behind, and a guard run
+   against its copy never sees a peer's newer `IN PROGRESS`. Make your edits on
+   a private scratch copy of that blob (`mktemp -d`), never over the shared
+   checkout's file, which may hold a peer's uncommitted edit [policy:
+   `git-operations` `shared-checkout-route-around`]; Step 6 publishes the
+   scratch copy with `--based-on "$BASED_ON"`. Record one line per plan —
+   `<repo-relative path> <BASED_ON> <scratch copy>` — in a private list file
+   (`new` in place of the blob for a path origin does not hold). Identify EVERY top-of-file blockquote that
    asserts a status, lifecycle state, or verification date — lines
    starting `> **Status:`, `> **Edit YYYY-MM-DD —`, or `> **Update:`
    all count. **Record verbatim any block reading `IN PROGRESS`** — its
@@ -481,16 +545,56 @@ and the body. Before writing your stamp:
 3. Then `Edit` again to insert your single new `> **Status:` block.
 4. If folding in history is useful (e.g., the plan was previously
    stamped `VETTED` and your verify pass found it still
-   `NOT STARTED`), include that in **one trailing line inside your
+   not started), include that in **one trailing line inside your
    new block**, prefixed `History:` or `Previously:`. Never as a
-   sibling blockquote.
+   sibling blockquote. The route-around `History:` line that item 4b carries is the one permitted
+   second `History:` line: keep it verbatim beside your trailing line (a
+   takeover trail included), never merged into it.
+4b. **Carry every route-around `History:` line verbatim**, whatever its head
+   (`adopted from …; work products: …; route-around owed`, `[adopted from …;
+   ][work products: …; ]route-around opened as <owner/repo>#P`, `inherited from <source stem>`,
+   `route-around discharged: …` or `route-around transferred to <stem>: …`)
+   and every segment it carries (`work products:`, `owed for`, `superseded successors:`,
+   `inherited from`, `route-around discharged:`, `prior art:`, `gates:`),
+   whatever
+   lifecycle word you write. A plan carries at most one such line: an
+   adopting run takes an inherited line as its own, and rule 6's inherit exit
+   inserts its segments into a line already there, each at its place in the
+   segment order (`/implement-plan` Step 4.5b item 5). It is the case-2c hand-off `/implement-plan`
+   Step 0.5's route-around check reads, so folding history is NOT optional
+   for it: dropping it strands the route-around. It is changed only by `/implement-plan` (its route-around check, and Step 4.5b item 5's transition, which rewrites the head and keeps every other segment, and Step 6), by this skill taking status-guard rule 6's exits (it is their one executor), or retired by status-guard rule 6.
+5. **Carry the `**Area:**`, `Initiative-Item:` and `Depends-On:`
+   declarations.** If any block you are replacing (item 2 deletes every
+   status-adjacent blockquote, not only the Status one) carries an
+   `Area:` declaration (`` > **Area:** `<area>` ``, or a line-leading plain
+   `Area:`), an `Initiative-Item:` line or a
+   `Depends-On:` declaration, carry each verbatim into your new block —
+   `Depends-On:` as the suffix of your new `> **Status:` line, with its stems
+   on the same physical line as the key (the scanner reads only the rest of
+   that line, so a re-wrap that pushes them onto the next `>` line drops
+   them), and `**Area:**` / `Initiative-Item:` each as a `>` line
+   (conventionally directly under the Status line). Each must sit on or
+   below the `> **Status:` line inside that same blockquote, with no blank
+   line or non-`>` line in between — a `>` line above the Status line is not
+   read — and never in a sibling blockquote. The runner's plan scanner reads
+   all three only from this status blockquote, into `metadata.area`,
+   `metadata.initiative_item` and `metadata.depends_on`, and its next push
+   writes what it parsed (every active-directory push is a `metadata` merge
+   patch in which an undeclared `area` or `initiative_item` is sent as
+   `null`, a delete, and an undeclared `depends_on` as `[]`), so a stamp
+   that drops any of them erases it from the work unit's `metadata` on the
+   next scan. For `Depends-On:` that is worse than a clean erase: the runner
+   skips the dependency-edge write for an empty set, so edge rows written
+   earlier survive and coord goes on enforcing a dependency the plan no
+   longer shows.
 
 When `/verify-plan-status` finds existing stamps that disagree with
 what you'd verify (e.g. a plan stamped `VETTED` whose acceptance
-criteria still aren't shipped), consolidate: keep the more useful
-lifecycle indicator in the heading (`Status: VETTED — implementation
-not started.` or `Status: NOT STARTED.`) and put the orthogonal
-finding in the body. Don't leave both.
+criteria still aren't shipped), consolidate: keep the lifecycle word in the heading and append the
+verdict, using the §5 template and its `<LW>` rule (`Status: VETTED
+<date> — not started (verified <date>).` when the replaced stamp led with
+`VETTED`, else `Status: DRAFT <date> — not started …`), and put the
+orthogonal finding in the body. Don't leave both.
 
 #### Lifecycle states this skill writes
 
@@ -498,16 +602,20 @@ finding in the body. Don't leave both.
 |---|---|
 | SHIPPED | every claim verified live in code, and every `## Done when` claim reads `confirmed` (or the plan took the escape / predates the section) |
 | SHIPPED — UNCONFIRMED (<claim ids>) | every claim verified live in code, but the named `## Done when` claims do not read `confirmed` |
-| PARTIAL | some phases shipped, others open |
-| NOT STARTED | zero source evidence of any claim |
-| SUPERSEDED | a different approach landed; cite the replacement |
-| OBSOLETE | the work no longer applies |
+| VETTED/DRAFT — partial | some phases shipped, others open (lead word by the `<LW>` rule in §5) |
+| VETTED/DRAFT — not started | zero source evidence of any claim (lead word by the `<LW>` rule in §5) |
+| DRAFT — brainstorm | too vague to verify (## Rules) |
+| SUPERSEDED | a different approach landed; cite the replacement (owed route-around work: rule 6's inherit or close exit first) |
+| OBSOLETE | the work no longer applies (owed route-around work: rule 6's close exit first) |
 
-This skill does NOT write `DRAFT`, `VETTED`, or `IN PROGRESS` — those
-are owned by `/vet-plan` and `/implement-plan`. If `/verify-plan-status`
-discovers a plan whose existing `VETTED` stamp disagrees with reality,
-write the more accurate state (`NOT STARTED`, `PARTIAL`, `SHIPPED`) and
-capture the prior state in the History line. **`IN PROGRESS` is the one
+This skill writes `VETTED` or `DRAFT` only as the carried lifecycle word
+of a partial / not-started verdict (and `DRAFT` for a brainstorm one; the `<LW>` rule in §5) — it never
+upgrades a plan to `VETTED`, which `/vet-plan` owns — and never writes
+`IN PROGRESS`, which `/implement-plan` owns. It never writes `PARTIAL` or
+`NOT STARTED` as a lead word. If `/verify-plan-status` discovers a plan
+whose existing `VETTED` stamp disagrees with reality, write the more
+accurate state (`VETTED <date> — not started …`, `VETTED <date> —
+partial: …`, `SHIPPED`) and capture the prior state in the History line. **`IN PROGRESS` is the one
 exception: that stamp is CONDITIONALLY overwritable, never freely, and the
 next subsection governs when.**
 
@@ -524,7 +632,7 @@ the subsection after it is this skill's own disposition.
 > arm table and its evaluation order: `/vet-plan`, "`IN PROGRESS` is
 > CONDITIONALLY overwritable".)* Before this command writes, replaces,
 > downgrades or re-dates a plan's lifecycle stamp, read the stamp already there
-> and apply these five rules.
+> and apply these six rules.
 >
 > 1. **An `IN PROGRESS` stamp is a conditional STOP, not a value to replace.**
 >    It protects a live peer's in-flight work. Read the whole HEADLINE, not only
@@ -535,11 +643,24 @@ the subsection after it is this skill's own disposition.
 > 2. **The discriminator is the SESSION MARKER, not the token.** A marker that
 >    IS your own current session id is a resume: refresh the date and keep the
 >    trail, never take over. A marker that is a different session id is a LIVE
->    PEER unless you can positively verify that session died with zero work
->    products — transcript tail shows death, its worktrees clean and 0 ahead of
->    `origin/main`, and no PRs and no branches for the plan — **or that it
->    delegated the plan to a hold gate whose continuation you are (the arm
->    table's case 2b)**. Only then adopt it and append your own marker.
+>    PEER unless you can positively verify that session died — transcript
+>    tail shows death (a death read on THIS device also
+>    needs `bash <workspace-root>/qontinui-claude-config/scripts/lib/claude-successor.sh <sid>`
+>    to answer 1, and a 0 or 2 is a STOP; across machines, `/vet-plan`'s "Case
+>    2 across machines" decides) — and that either **case 2** holds (its
+>    worktrees clean and 0 ahead of `origin/main` — a worktree that is not
+>    is a STOP that names it and `/adopt-wip` — and no PRs and no branches
+>    for the plan) or **case 2c, adopt by route-around**, holds (PRs or
+>    pushed branches exist, and every case-2c conjunct in `/vet-plan`'s arm
+>    table holds, among them: every open PR and bare pushed branch among them
+>    is that session's, or another session's whose death reads by the same
+>    test (a phase subagent is no exemption; a closed PR is prior art,
+>    whoever wrote it), no `WIP` / `UNPUSHED`
+>    checkout of that session holds work only on disk, and no open gate with
+>    an armed continuation holds the plan beyond conjunct 3's named
+>    exceptions) — **or that it delegated the plan to a hold gate whose
+>    continuation you are (the arm table's case 2b)**. Only then adopt it and
+>    append your own marker.
 > 3. **No marker, or one you cannot positively attribute, is the UNIDENTIFIED
 >    DEFAULT: STOP.** Not an overwrite, and not an adoption. Adoption is the
 >    earned branch; stopping is the fallback.
@@ -552,6 +673,98 @@ the subsection after it is this skill's own disposition.
 >    non-2xx, unparseable or carrying `merged_degraded_reason` leaves the
 >    stamp's meaning unestablished. Fall through to STOP, never to overwrite,
 >    and say the read was inconclusive.
+> 6. **Owed route-around work blocks a terminal word.** While the block
+>    carries a `route-around owed` or `… owed for …` `History:` line, never
+>    write `SHIPPED`, `SUPERSEDED` or `OBSOLETE`: write the non-terminal word
+>    your own rules allow (for `/verify-plan-status`, its `— partial` verdict
+>    stamp), keep the line verbatim, and report it. Two exits, each on evidence, and each
+>    rewrites ONLY the owed token, keeping the line's `adopted from …`,
+>    `prior art:` and `gates:` parts: a predecessor that is MERGED, or CLOSED
+>    after a successor carrying its content merged, is discharged (the token
+>    becomes `route-around discharged: <evidence>` once none is left owed);
+>    one that is CLOSED with no merged successor is reclassified from
+>    `owed for` into `prior art: <owner/repo>#N (closed)` and removed from
+>    `work products:`. Once nothing is left owed, the owed token is replaced
+>    by `route-around discharged: <evidence>` if any predecessor was
+>    discharged, and otherwise deleted; a discharged record that is not the
+>    line's head stands in the slot `/implement-plan` Step 4.5b item 5's one
+>    segment order fixes for it. **The PRs a route-around line names**
+>    are those in its `work products:`, `owed for`, `route-around opened as`
+>    and `superseded successors:` segments, never those in `prior art:` or a
+>    `route-around transferred to …` token. A line that owes nothing still
+>    holds one word: while any PR it names is OPEN, never write `SUPERSEDED`
+>    or `OBSOLETE`, because that open PR can still land the work the word
+>    calls dead. Two more exits release both holds for a plan whose verdict
+>    is `SUPERSEDED` or `OBSOLETE`. `/verify-plan-status` is the ONE writer
+>    that takes them; every other writer, `/implement-plan` included, keeps
+>    the hold and reports `rule-6 exit available: run /verify-plan-status <stem>`.
+>    Before either, run the two exits above over every PR the line names, so
+>    each merged or closed one is recorded as `route-around discharged:` or
+>    `prior art:` before any segment moves. Inherit comes first: when a
+>    non-terminal plan supersedes this one, Inherit is the only exit and
+>    nothing is closed, and if Inherit cannot finish, the hold stands.
+>    - **Inherit** (`SUPERSEDED`, with a non-terminal inheritor). The
+>      superseding plan must be non-terminal, must cite this plan, and must
+>      not be held `IN PROGRESS` by a LIVE or UNKNOWN other session (if it is,
+>      STOP and `coord_send_message` the holder naming the open PRs). Under
+>      `git-operations` `an-obsolete-plans-owed-predecessor-is-closed`, then
+>      re-check, exactly as Close does, that every OPEN PR the line names has
+>      no live owner: a LIVE or UNKNOWN owner on any of them, other than the
+>      session running this exit, means the hold stands, nothing moves, and
+>      the owner is named. Every
+>      OPEN PR the line names moves to it as `owed for`. If it carries no
+>      route-around line, land `History: inherited from <this stem>; owed for
+>      <owner/repo>#N[, …]` on it. If it already carries one, add only the
+>      moved PRs that line names in no segment yet (`work products:`, `owed
+>      for`, `route-around opened as`, `superseded successors:`) (or insert `; owed
+>      for <owner/repo>#N[, …]` right after its head) and, unless the line
+>      already carries it, insert `; inherited from <this stem>` after
+>      any `superseded successors:` segment. Both go before any `route-around
+>      discharged:` segment, `prior art:` and `gates:`, in the one segment
+>      order `/implement-plan` Step 4.5b item 5 fixes; never add a second line.
+>      Land it with `land-plan-stamp.sh --based-on <blob>` and read it back off
+>      `origin/main`. Only then rewrite this plan's line: every segment that
+>      names a moved PR, and the `route-around owed` token, are replaced by one
+>      token, `route-around transferred to <stem>: <owner/repo>#N[, …]`, where
+>      the first of them stood. Every other segment is kept (`adopted from …`,
+>      `inherited from …`, `route-around discharged: …`, `prior art:`,
+>      `gates:`), so the line no longer carries an owed token. If any step
+>      fails, the hold stands. A retry after a failed rewrite of this plan's
+>      line re-runs this exit only against the plan that already carries
+>      `inherited from <this stem>`, and only while that plan still meets
+>      every precondition above; its add step adds only the moved PRs that
+>      line names in no segment yet, so nothing is added twice. Otherwise
+>      the hold stands and is reported as above: while any plan carries
+>      `inherited from <this stem>`, neither Close nor an inherit to a
+>      different plan is taken, because that plan, or a plan it passed them
+>      to, may still owe the moved PRs.
+>    - **Close** (`OBSOLETE`, or `SUPERSEDED` by landed work — a merged PR or a
+>      `SHIPPED` plan — and no non-terminal plan inherits the line). Under `git-operations`
+>      `an-obsolete-plans-owed-predecessor-is-closed`, re-check at close time
+>      that every OPEN PR the line names has no live owner. A LIVE or UNKNOWN
+>      owner on any of them means the hold stands and nothing is closed.
+>      That includes a live adopter's own successor (`route-around opened as
+>      <owner/repo>#P`, owned by the session running this exit or by another
+>      LIVE session): the hold is intended, not stuck, and that adopter closes
+>      or finishes its own PR first.
+>      Otherwise close each with a comment naming the evidence and the death
+>      evidence and saying its branch is left untouched, and leave every
+>      branch untouched. Then dispose of every open gate anchored to a closed
+>      PR or whose predicate names one, `case-2c-close-predecessor` gates and
+>      the `pr_merged` gates they ride included: withdraw each that this
+>      session or a verified-dead author registered; for any other, or one
+>      whose withdraw is refused, cancel its continuation
+>      (`coord_cancel_continuation`); read every one back. The exit above then
+>      moves each closed owed PR into `prior art: <owner/repo>#N (closed)`; a
+>      closed PR in another segment stays as written and no longer holds. If
+>      any step fails before the first close, the hold stands. A close that
+>      is refused leaves that PR open, so the hold stands for it: record a
+>      finding, and still dispose of the gates of the PRs that did close.
+>      Once any PR is closed the hold can no longer be restored, so a gate
+>      that is neither withdrawn nor cancelled is not left silent: record a
+>      finding (`coord_post_finding`) naming its gate ids, and report those
+>      gates in the closeout as unretired, as `/implement-plan` Step 4.5b
+>      item 7 does.
 <!-- status-guard:end -->
 
 `IN PROGRESS` is the only lifecycle token whose overwrite is **load-bearing in
@@ -559,9 +772,9 @@ another command**. `/vet-plan` §5 ("`IN PROGRESS` is CONDITIONALLY
 overwritable") and `/implement-plan` Step 0.5 both treat it as a conditional
 **STOP**: a stamp whose session marker is not positively attributable to the
 reading session is a live peer, or an unattributable stamp, and both stop the
-run. Those same two commands declare `PARTIAL` and `NOT STARTED` **freely**
-overwritable — `/vet-plan` §5: "`PARTIAL` and `NOT STARTED` are fine to
-overwrite"; `/implement-plan` Step 0.5: "replace it with the IN PROGRESS
+run. Those same two commands declare the partial / not-started stamps **freely**
+overwritable — `/vet-plan` §5: "the partial / not-started forms … and the
+legacy `PARTIAL` and `NOT STARTED` are fine to overwrite"; `/implement-plan` Step 0.5: "replace it with the IN PROGRESS
 block".
 
 So a verify pass that rewrites a peer's `IN PROGRESS` to `NOT STARTED` does not
@@ -595,10 +808,11 @@ The cases map onto this skill's verbs:
 |---|---|
 | 0 — the marker **is your own** current session id | **Reachable, and not rare** — the marker names a *session*, not a command, and one session routinely runs `/implement-plan` (which stamps it) and later `/verify-plan-status`, directly or through `/pvi` or `/vet-imp`. There is no peer to protect here: **write the verified state freely**, naming the prior stamp as your own in the `History:` line. Evaluate this row FIRST — it is a positively attributed marker, so it must never fall to the unidentified default, which is defined by the absence of exactly that attribution. |
 | 1 — the work has **landed** (delivery arm 1) | The plan is closed in substance. Write **`SHIPPED`** — a state this skill owns — when your own evidence scan agrees. If it does **not** agree, that disagreement IS the finding (coord's delivery read says landed and your evidence scan does not; on the operator door, a `delivery:` drift subclass): report it and leave the block alone. Never resolve it by writing `NOT STARTED` or `PARTIAL` over the marker. **Deliberate divergence, do not "restore consistency":** `/vet-plan` case 1 says *refuse and route to closeout* because `/vet-plan` writes only `VETTED`. Writing `SHIPPED` here IS that closeout — §5's own closeout paragraph assigns the plan-file terminal status to whoever can write it ("always yours to write"), and `SHIPPED` is this skill's state. Flipping this row to "refuse" would delete the only path by which a landed plan ever gets closed. |
-| 2 — the stamping session is **dead with zero work products** (its transcript tail shows death, **and** its worktrees are clean and 0 ahead of `origin/main`, **and** no PRs and no branches exist for the plan) | Free to write the verified state. Name both the prior marker and the death evidence in the `History:` line. |
+| 2 — the stamping session is **dead with zero work products** (its transcript tail shows death, **and**, for a death read on this device, no live successor carries its id — `/vet-plan`'s successor void rule: `claude-successor.sh <sid>` answers 1, and a 0 or 2 is case 3 — **and** its worktrees are clean and 0 ahead of `origin/main` — one that is not is a STOP naming it and `/adopt-wip` — **and** no PRs and no branches exist for the plan) | Free to write the verified state. Name both the prior marker and the death evidence in the `History:` line. |
 | 2b — **gate-delegated**: you are the cleared continuation of the hold gate G that the block's last `Held behind gate <full gate_id> (<predicate>; anchor <work_unit_id>)` line names (every `/vet-plan` case-2b conjunct read; the `anchor` token is parsed from the right) | Free to write the verified state. Name G and the prior marker, REPLACING the `Held behind gate` line with `History: adopted from <prior session id> via consumed hold <G full id>` — never keep it. |
-| 3 — a **live peer** (marker ≠ yours and neither case 2's nor case 2b's checks hold) | **Do not overwrite.** Leave `IN PROGRESS` standing and report the plan as *in flight — not verifiable this pass*. |
-| — **unidentified default**: no marker at all, or one you cannot positively attribute | **Do not overwrite**, exactly as case 3. An absent marker cannot reach case 2, because case 2's probes are keyed on a session id and there is none to probe. |
+| 2c — the stamping session is **dead and left pushed work products**: `/vet-plan`'s case 2c holds in full — every conjunct its arm table lists, read there rather than from a summary here (case 2's death test, PRs or pushed branches, and conjuncts 2-5) | Free to write the verified state, whatever lifecycle word it carries, subject to status-guard rule 6 (no terminal word over an owed line), and its `History:` line in `/vet-plan`'s exact grammar: `History: adopted from <prior sid> (case 2c, <death evidence>); work products: <owner/repo>#N[, …]; route-around owed[; prior art: <owner/repo>#N (closed) | <repo>:<branch>@<sha>[, …]]` (open PRs only after `work products:`; a closed-unmerged PR or a bare branch only after `prior art:`; with no open PR, no `route-around owed`). When the block already carries a route-around `History:` line (whole-list, partial, finished or inherited), write no second line: insert the newly found open PRs into THAT line as `; owed for <owner/repo>#N[, …]` at their slot in the one segment order (`/implement-plan` Step 4.5b item 5; a PR the line already names in any segment is not added again), and record `adopted from <prior sid> (case 2c, <death evidence>)` in the takeover trail line (single-stamp item 4) only. The `route-around owed` token is what `/implement-plan` Step 0.5's route-around check reads, under any lifecycle word. This skill implements nothing: it does not open, park or close any PR, and does not run `/implement-plan`'s "Case 2c route-around duties". |
+| 3 — a **live peer** (marker ≠ yours and neither case 2's, 2b's nor 2c's checks hold) | **Do not overwrite.** Leave `IN PROGRESS` standing and report the plan as *in flight — not verifiable this pass*. |
+| — **unidentified default**: no marker at all, or one you cannot positively attribute | **Do not overwrite**, exactly as case 3. An absent marker cannot reach case 2 or 2c, because their probes are keyed on a session id and there is none to probe. |
 
 **Settling case 1.** Case 1 is settled by the delivery read §3 names,
 `coord_work_unit_list_citations(<stem>).delivery`, for every principal. Read
@@ -646,8 +860,18 @@ branches, not three**:
 **Name the arm in the `History:` line when you write `SHIPPED` over an
 `IN PROGRESS` stamp**, for example `case 1: list_citations arm 1, tenant <id>
 (shipped, evidence_complete, phases_remaining [] corroborated by non-empty
-phases_declared_indices ⊆ phases_delivered, no NO PHASE ATTRIBUTION gap)`.
-Then a later reader can check the verdict without re-deriving it.
+phases_declared_indices covered by phases_delivered, no NO PHASE ATTRIBUTION gap)`;
+when a declared phase was covered by a resolved attestation instead, name it:
+`… covered by phases_delivered [1] + phases_attested [0] (attestation phase 0 →
+<evidence_kind> <evidence_ref>, resolution resolved), …` — the fields a
+`phase_attestations` row carries; the delivery read serves no attestation id.
+When `phases_complete_scope` was the literal `true` instead, name the citation
+that carried it. The bool names no citation, so read it off the cited PRs (the
+citations list names them): the landed one whose body carries a
+`Plan: … delivers: complete` marker. If you cannot identify it, write the line
+without the parenthetical rather than guess: `… phases_remaining [] corroborated by phases_complete_scope
+true (landed complete-scoped citation <repo>#<n>), no NO PHASE ATTRIBUTION
+gap)`. Then a later reader can check the verdict without re-deriving it.
 
 **UNKNOWN lands on the unidentified default (do not overwrite), never on "not
 started"** — `verification-and-evidence` `unknown-must-not-render-as-a-default`.
@@ -667,7 +891,9 @@ unexitable-looking guard is exactly the condition under which
 [[feedback_plan_already_stamped_by_other_session_is_live_peer]] was talked
 past, at the cost of a full wasted implementation (PR #479 against PR #468).
 
-`DRAFT`, `VETTED`, `PARTIAL` and `NOT STARTED` get none of this treatment —
+`DRAFT`, `VETTED` (including the `VETTED/DRAFT <date> — partial` / `— not
+started` forms this skill writes) and the legacy `PARTIAL` / `NOT STARTED`
+lead words get none of this treatment —
 nothing downstream reads them as a peer-liveness signal. This subsection is
 scoped to `IN PROGRESS` alone.
 
@@ -726,13 +952,19 @@ have landed, where the stamp goes `DIRTY` and the first PR is left unobserved
 ```bash
 if git -C "$QONTINUI_PLANS_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   TOP="$(git -C "$QONTINUI_PLANS_DIR" rev-parse --show-toplevel)"
-  for P in <stamped paths>; do          # absolute paths of the stamped .md files
-    bash <workspace-root>/qontinui-claude-config/scripts/land-plan-stamp.sh \
-      "$TOP" "${P#"$TOP"/}" "$P" \
-      "docs(plans): status-stamp $(basename "$P" .md) — verified against source <date>"
-  done
+  # One line per stamped plan, from sub-step 1: <repo-relative path> <blob it read> <scratch copy>
+  while read -r REL BASED_ON COPY; do
+    bash <workspace-root>/qontinui-claude-config/scripts/land-plan-stamp.sh --based-on "$BASED_ON" \
+      "$TOP" "$REL" "$COPY" \
+      "docs(plans): status-stamp $(basename "$REL" .md) — verified against source <date>"
+  done < "<the stamp list sub-step 1 wrote>"
 fi
 ```
+
+**Exit 7 (STALE BASE)** means origin no longer holds the blob sub-step 1 read:
+re-read that plan from origin, re-run the single-stamp invariant and the
+`IN PROGRESS` guard against it, then re-stamp with the new blob — or report it
+unstamped (`_status-writers.md` → "Publishing a stamp — the compare-and-swap").
 
 Each call prints exactly one verdict line — `LANDED <commit|unchanged> <blob>` or
 `PROPOSED <pr-url|branch> <branch>` — and that line is the evidence the stamp is
@@ -741,7 +973,8 @@ path rather than counting it in the final report's totals.
 
 If the check fails, the plan directory is a plain folder: the stamped files on disk
 are the record, there is nothing to commit or push, and you must not create a repo to
-hold them. (Closeout push authority covers docs/plans diffs wherever a repo exists.)
+hold them. That arm does not call `land-plan-stamp.sh` at all, so it has no
+`--based-on` and no compare: a plain folder has no origin to race. (Closeout push authority covers docs/plans diffs wherever a repo exists.)
 
 ### 7. Final report
 
@@ -822,9 +1055,12 @@ status" item in the report so the user can correct it.
   **And never `mv`/`git mv` a plan file at all** — plans are stamped in place
   (§6); there is no in-progress → completed migration.
 - **Don't touch in-progress plans you can't verify.** If a plan's claims are
-  too vague to check (e.g. a brainstorm doc), stamp it `Status: BRAINSTORM
-  (verified <date>) — no concrete acceptance criteria; not actionable as-is`
-  and leave it where it is.
+  too vague to check (e.g. a brainstorm doc), stamp it `> **Status: DRAFT
+  <YYYY-MM-DD> — brainstorm (verified <YYYY-MM-DD>): no concrete acceptance
+  criteria; not actionable as-is.**` and leave it where it is. The lead word is
+  `DRAFT`, never `BRAINSTORM` (off-vocabulary, rejected by the plan-status
+  contract gate), and it is always `DRAFT` — a plan too vague to verify is not
+  carried as `VETTED`.
 
 ## Implementation Notes
 

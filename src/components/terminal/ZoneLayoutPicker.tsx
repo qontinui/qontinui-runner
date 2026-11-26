@@ -8,9 +8,21 @@ import {
   type LayoutPreset,
 } from "./useZoneLayout";
 import { useUIComponent, UIBridgeComponentScope } from "@qontinui/ui-bridge";
-import { callRegistry, textArg } from "./commands";
+import { callRegistry, readTextArg, textArg } from "./commands";
 import { guardedHandler } from "@/lib/ui-bridge/guardedHandler";
 import { usePageSessionGetter, useTerminalSession } from "./contexts";
+import { useLiveRef } from "./useLiveRef";
+import {
+  GET_PAGE_LAYOUT_SIGNATURE,
+  LIST_LAYOUTS_SIGNATURE,
+  selectLayoutSignature,
+} from "./zonePickerSignatures";
+import {
+  parseLayoutOriginArg,
+  predictLayoutOrigin,
+  readAutoTrimEnabled,
+  reportLayoutOrigin,
+} from "./zoneAutoTrim";
 
 /** Hoisted so the registration and its guarded handler read one declaration. */
 const SELECT_LAYOUT_SCHEMA = {
@@ -18,12 +30,47 @@ const SELECT_LAYOUT_SCHEMA = {
     'string — a preset id (use list-layouts to enumerate them), or a window count such as "4"',
   pageId:
     "string (optional terminal page id from GET /terminal-pages; defaults to the active page)",
+  origin:
+    'string (optional; "operator" (default): a layout the runner never auto-trims; "auto": ' +
+    "the runner owns the page from now on and shrinks its grid when tabs close)",
 } as const;
 
 const GET_PAGE_LAYOUT_SCHEMA = {
   pageId:
     "string (optional terminal page id from GET /terminal-pages; defaults to the active page)",
 } as const;
+
+/**
+ * The `origin` a `select-layout` call was given: `operator` when absent, the
+ * named origin when it is one, and a refusal for anything else — a misspelled
+ * `"Auto "` is forgiven, but a value that names neither must not quietly
+ * become the operator choice that auto-trim never undoes.
+ */
+function readOriginArg(args: Record<string, unknown>): "operator" | "auto" {
+  const read = readTextArg(args, "origin");
+  if (read.kind === "absent") return "operator";
+  const origin = read.kind === "text" ? parseLayoutOriginArg(read.text) : null;
+  if (origin === null) {
+    throw new Error(
+      `select-layout: origin must be "operator" or "auto" (got ${JSON.stringify(args.origin)})`,
+    );
+  }
+  return origin;
+}
+
+/**
+ * The `pageId` a bridge action was given, or `null` when it was not given.
+ *
+ * An absent `pageId` means the page on screen, so one that was SUPPLIED and
+ * names nothing (`""`, a blank shell variable) must not read as absent: it would
+ * re-grid the page the operator is looking at instead of the page the caller
+ * failed to name. `/layout --page` refuses the same input for the same reason.
+ */
+function readPageIdArg(action: string, args: Record<string, unknown>): string | null {
+  const read = readTextArg(args, "pageId");
+  if (read.kind === "invalid") throw new Error(`${action}: pageId needs a page id`);
+  return read.kind === "text" ? read.text : null;
+}
 
 interface ZoneLayoutPickerProps {
   currentLayoutId: string;
@@ -84,6 +131,8 @@ export function ZoneLayoutPicker({
   const getPageSession = usePageSessionGetter();
   const { pageId: activePageId } = useTerminalSession();
   const dropdownRef = useRef<HTMLDivElement>(null);
+  // Read by `select-layout`'s signature when `predict` runs (see `useLiveRef`).
+  const tabCountRef = useLiveRef(tabCount);
 
   useEffect(() => {
     if (!open) return;
@@ -119,12 +168,19 @@ export function ZoneLayoutPicker({
           "Switch a page's terminal grid to a layout preset, named or by window count " +
           "(1 single, 2 split, 3 triptych, 4 quad, 5-6 six-pack, 7-9 full-grid, 10+ flow-grid). " +
           "Returns the layout the grid settles at, which is larger than requested when the " +
-          "page holds more sessions than the preset has zones.",
+          "page holds more sessions than the preset has zones, and leftTmux: true when the " +
+          "request took the page out of tmux work mode. origin (default operator) records who " +
+          'chose the layout: "auto" hands the page to the runner, which then trims its grid ' +
+          "when tabs close, but only when the request changes the page's layout id; an auto " +
+          "request on a tmux-mode page is refused, because it would not leave tmux. Returns " +
+          "layoutOrigin, the origin the page holds afterwards (as get-page-layout reports it): " +
+          '"auto" whenever the grid grows past the request, since the runner chose that grid.',
         paramSchema: SELECT_LAYOUT_SCHEMA,
         // `write` — switches the grid preset and redistributes zone assignments. No
         // terminal is ended: `applyLayout` preserves in-range assignments and only
         // compacts out-of-range ones, and auto-grow re-expands to fit live tabs.
         effect: "write",
+        signature: selectLayoutSignature(tabCountRef),
         // `{layoutId: {}}` is truthy, so it passed `if (!layoutId)` and was
         // stringified into the operator-facing sentence as
         // `Unknown layoutId: "[object Object]"`; `{layoutId: []}` rendered the
@@ -145,39 +201,69 @@ export function ZoneLayoutPicker({
                 `${[...LAYOUT_PRESETS.map((l) => l.id), FLOW_GRID_ID].join(", ")}, or a window count of 1 or more`,
             );
           }
-          const pageId = textArg(args, "pageId");
+          const pageId = readPageIdArg("select-layout", args);
+          const origin = readOriginArg(args);
+          // Read before the request: `/layout` exits tmux mode, so afterwards
+          // the page no longer says it was in it.
+          const target = getPageSession(pageId ?? activePageId);
+          const leftTmux = target?.zoneLayout.workMode === "tmux";
+          // The registry's verdict is prose; a caller trimming a grid needs
+          // the id the grid SETTLES at. Auto-grow keeps every live tab in a
+          // zone, so it is the same pure rule the registry reports with. A
+          // `/layout` request exits tmux mode, so the settle is predicted for
+          // grid mode, as `terminal.layout` does.
+          const tabs = target?.tabs.length ?? tabCount;
+          const settled = computeAutoGrowLayoutId(requested, tabs, "grid") ?? requested;
+          // Who the page belongs to afterwards, by the hook's own rule, not the
+          // origin that was asked for: an auto request re-asserting the page's
+          // own layout takes nothing, and a request auto-grow overrides leaves
+          // the page the runner's whoever sent it. Unknown when the page could
+          // not be read.
+          const layoutOrigin = target
+            ? predictLayoutOrigin(target.zoneLayout, requested, origin, settled)
+            : null;
           // Phase 1c — delegates to registry `terminal.layout`. The
           // registry handler calls the same `zoneLayout.setLayoutId`
           // closure that `onSelectLayout` does (both source from
           // TerminalPage's session context), so behavior is identical
           // — but a future change to layout semantics now has one
           // landing point instead of two. It refuses an unknown page.
-          await callRegistry(
-            "terminal.layout",
-            pageId ? { preset: layoutId, page: pageId } : { preset: layoutId },
-          );
+          // `origin` is sent only when it is not the default, so an operator
+          // request reads exactly as it did before the field existed.
+          await callRegistry("terminal.layout", {
+            preset: layoutId,
+            ...(pageId !== null ? { page: pageId } : {}),
+            ...(origin === "auto" ? { origin } : {}),
+          });
           setOpen(false);
-          // The registry's verdict is prose; a caller trimming a grid needs
-          // the id the grid SETTLES at. Auto-grow keeps every live tab in a
-          // zone, so it is the same pure rule the registry reports with. A
-          // `/layout` request exits tmux mode, so the settle is predicted for
-          // grid mode, as `terminal.layout` does.
-          const tabs = pageId ? (getPageSession(pageId)?.tabs.length ?? tabCount) : tabCount;
-          const settled = computeAutoGrowLayoutId(requested, tabs, "grid") ?? requested;
-          return { requested, layoutId: settled, pageId: pageId || activePageId, tabCount: tabs };
+          return {
+            requested,
+            layoutId: settled,
+            pageId: pageId ?? activePageId,
+            tabCount: tabs,
+            leftTmux,
+            layoutOrigin,
+          };
         }),
       },
       {
         id: "get-page-layout",
         label: "Get Page Layout",
         description:
-          "Return {pageId, layoutId, zoneCount, tabCount, maximizedZone} for one terminal page, " +
-          "whether or not it is the page on screen; with no pageId, for the page on screen.",
+          "Return {pageId, layoutId, zoneCount, tabCount, maximizedZone, workMode, layoutOrigin, " +
+          "autoTrim} for one terminal page, whether or not it is the page on screen; with no " +
+          'pageId, for the page on screen. A page with workMode "tmux" shows one session, so it ' +
+          "reads as a one-zone single layout whatever its tab count, and select-layout takes it " +
+          'back to a grid. layoutOrigin says who chose the layout: "auto" (the runner; it trims ' +
+          'the grid itself when tabs close, while autoTrim is true), "operator" (never trimmed), ' +
+          'or "legacy" (the page predates the field; never trimmed by the runner). autoTrim is ' +
+          "this runner instance's shrink-the-grid-when-tabs-close preference.",
         paramSchema: GET_PAGE_LAYOUT_SCHEMA,
         // `read` — reports one page's grid state; changes nothing.
         effect: "read",
+        signature: GET_PAGE_LAYOUT_SIGNATURE,
         handler: guardedHandler("get-page-layout", GET_PAGE_LAYOUT_SCHEMA, (args) => {
-          const pageId = textArg(args, "pageId") || activePageId;
+          const pageId = readPageIdArg("get-page-layout", args) ?? activePageId;
           const page = getPageSession(pageId);
           if (!page) throw new Error(`No terminal page with id "${pageId}"`);
           return {
@@ -186,6 +272,9 @@ export function ZoneLayoutPicker({
             zoneCount: page.zoneLayout.layout.zones.length,
             tabCount: page.tabs.length,
             maximizedZone: page.zoneLayout.maximizedZone,
+            workMode: page.zoneLayout.workMode,
+            layoutOrigin: reportLayoutOrigin(page.zoneLayout.layoutOrigin),
+            autoTrim: readAutoTrimEnabled(),
           };
         }),
       },
@@ -195,6 +284,7 @@ export function ZoneLayoutPicker({
         description: "Return [{id, name, zones, shortcutKey}] for every built-in layout preset.",
         // `read` — enumerates the built-in presets. A query over constants.
         effect: "read",
+        signature: LIST_LAYOUTS_SIGNATURE,
         handler: () =>
           LAYOUT_PRESETS.map((l) => ({
             id: l.id,

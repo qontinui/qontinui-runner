@@ -754,10 +754,13 @@ pub const CAPABILITY_SPECS: &[CapabilitySpec] = &[
                       `<workspace-root>/qontinui-claude-config/.claude/agents/*.md` off \
                       the operator's disk. It outranks the embedded floor, so on a box \
                       that has that sibling repo this row — not `fleet_agents` — decides \
-                      what a session actually gets. Two sources for one asset, with \
-                      nothing asserting they agree; when the root does not resolve the \
-                      copy is a no-op that logs \"no qontinui-root resolved; skipping \
-                      .claude/agents\" and continues.",
+                      what a session actually gets. Two sources for one asset; \
+                      qontinui-claude-config's hourly `fleet-agents-parity` gate \
+                      (`agent-bundle-parity.sh`) checks that the two repositories' \
+                      default branches agree, not this disk against this binary. When \
+                      the root does not resolve, the checkout copy is skipped while the \
+                      embedded floor is still written, and this row is `unresolved` with \
+                      the workspace-root-unresolved refusal as its reason.",
         expected_rungs: &[Rung::OperatorCheckout, Rung::Unresolved],
         anchor: "agent_runtime::provision_agent_definitions_from_root",
     },
@@ -802,7 +805,7 @@ pub const CAPABILITY_SPECS: &[CapabilitySpec] = &[
                       this degrades on a published install, it is that it cannot run at \
                       all there.",
         expected_rungs: &[Rung::OperatorCheckout, Rung::Unresolved],
-        anchor: "slash_commands::{find_commands_directory_reported, sync_slash_commands}",
+        anchor: "slash_commands::{find_commands_directory_reported, commands_directory_in, COMMANDS_SIBLING, sync_slash_commands}",
     },
     CapabilitySpec {
         id: "session_cli",
@@ -997,6 +1000,14 @@ pub enum SkipReason {
     /// `fleet_skills` applies it per skill (a skill without `SKILL.md` is
     /// written whole, so this reason never lands on one of its files).
     ProbeUnknownInRepo,
+    /// The destination is ABSENT and untracked, and the enclosing repository
+    /// tracks at least one path under the provisioned tree root — it versions
+    /// that tree, so a path missing from it is one its own history has not
+    /// delivered yet. Writing it would leave an untracked file at a path
+    /// upstream adds, which wedges the checkout's fast-forward. See
+    /// [`crate::provision_guard`]'s "A checkout that versions the provisioned
+    /// tree" section.
+    RootVersioned,
     /// The write itself failed. Fail-soft: the pass continues and the spawn
     /// proceeds; the session simply lacks this unit.
     WriteFailed(String),
@@ -1026,6 +1037,27 @@ pub enum SkipReason {
     /// git could not be started for want of a machine resource, and the skip
     /// was taken to avoid clobbering files it could not see.
     RepoAuthored,
+    /// An EXISTING destination was kept because nothing shows this runner
+    /// wrote it: an operator-authored file whose bytes are no copy this runner
+    /// ships or shipped, a symbolic link (never written through), a destination
+    /// that is not a regular file or could not be inspected or read, or one
+    /// whose ownership probe did not answer (UNKNOWN, kept on the safe side).
+    /// The detail says which.
+    ///
+    /// Distinct from [`SkipReason::Rejected`] on purpose: that one says the
+    /// provisioner's validation REFUSED the content it was handed, while this
+    /// one says the content was fine and the file already on disk is not this
+    /// runner's to replace. A deliberate keep, like [`SkipReason::GitTracked`].
+    OperatorAuthored(String),
+    /// The destination IS the overlay source file (a hard link to it, or the
+    /// same file through another path), so the checkout's own copy is what the
+    /// session reads, served in place, and there was nothing to copy.
+    ///
+    /// Distinct from [`SkipReason::OperatorAuthored`] on purpose: nothing here
+    /// is an operator's file kept against this runner; the unit is the
+    /// checkout's own definition and the session has it. The pass still
+    /// records it, so a reader can see the unit was not freshly written.
+    ServedInPlace,
 }
 
 impl SkipReason {
@@ -1035,10 +1067,13 @@ impl SkipReason {
         match self {
             SkipReason::GitTracked => "git_tracked",
             SkipReason::ProbeUnknownInRepo => "probe_unknown_in_repo",
+            SkipReason::RootVersioned => "root_versioned",
             SkipReason::WriteFailed(_) => "write_failed",
             SkipReason::Unresolved(_) => "unresolved",
             SkipReason::Rejected(_) => "rejected",
             SkipReason::RepoAuthored => "repo_authored",
+            SkipReason::OperatorAuthored(_) => "operator_authored",
+            SkipReason::ServedInPlace => "served_in_place",
         }
     }
 
@@ -1052,6 +1087,9 @@ impl SkipReason {
             SkipReason::ProbeUnknownInRepo => "kept: inside a git repository whose tracked-file \
                  probe could not answer, so what is already on disk was not overwritten"
                 .to_string(),
+            SkipReason::RootVersioned => "not created: absent and untracked in a checkout that \
+                 versions the provisioned tree, so its own history delivers it"
+                .to_string(),
             SkipReason::WriteFailed(why) => format!("write failed: {why}"),
             SkipReason::Unresolved(why) => format!("source rung did not resolve: {why}"),
             SkipReason::Rejected(why) => format!("refused by validation: {why}"),
@@ -1060,6 +1098,10 @@ impl SkipReason {
                  for the whole tree"
                     .to_string()
             }
+            SkipReason::OperatorAuthored(why) => format!("kept: {why}"),
+            SkipReason::ServedInPlace => "served in place: the destination is the checkout's \
+                 own source file, so there was nothing to copy"
+                .to_string(),
         }
     }
 }
@@ -1076,6 +1118,110 @@ pub struct SkippedUnit {
     /// Why it was not written.
     #[serde(flatten)]
     pub reason: SkipReason,
+}
+
+/// One unit a provisioning pass REMOVED from its destination, with the blob that
+/// made the removal safe.
+///
+/// Only the subagent provisioner removes anything: a definition this binary
+/// retired (`fleet_agents::RETIRED_AGENTS`) whose copy on disk is a blob that
+/// definition shipped as. Recording the blob lets a reader confirm the file was
+/// the binary's own copy and not somebody's edit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RemovedUnit {
+    /// The unit's name as the provisioner addresses it (a file name).
+    pub unit: String,
+    /// The git blob id the removed copy matched.
+    pub blob: String,
+}
+
+/// Why a retired unit a pass found on disk is still there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "reason", content = "detail", rename_all = "snake_case")]
+pub enum RetainedReason {
+    /// Its blob is not one the definition shipped as, so somebody edited it and
+    /// it is kept deliberately (the own-files-only rule). The blob is the copy's.
+    LocallyModified(String),
+    /// The tracked-file guard kept it: the detail is the [`SkipReason::wire`]
+    /// it decided. `git_tracked` (the repository tracks it) is deliberate;
+    /// `probe_unknown_in_repo` (inside a repository whose probe could not
+    /// answer) is a fail-safe keep that degrades the pass, as it degrades both
+    /// provisioning layers.
+    KeptByRepository(String),
+    /// The copy could not be read, so its blob could not be compared.
+    ReadFailed(String),
+    /// The copy is a shipped blob, but removing it failed.
+    RemoveFailed(String),
+    /// The copy is a shipped blob, but `.claude/agents` is reached through a
+    /// symlink, so the file is not this workdir's own and is not removed. The
+    /// detail is where the directory resolves to.
+    LinkedElsewhere(String),
+}
+
+impl RetainedReason {
+    /// True for the arms that degrade the pass: the copy could not be read, a
+    /// shipped copy could not be removed or sits behind a symlink, or the
+    /// tracked-file probe could not answer. A deliberate keep (locally modified,
+    /// or tracked) is not one.
+    #[must_use]
+    pub fn is_failure(&self) -> bool {
+        match self {
+            RetainedReason::LocallyModified(_) => false,
+            RetainedReason::KeptByRepository(why) => why != SkipReason::GitTracked.wire(),
+            RetainedReason::ReadFailed(_)
+            | RetainedReason::RemoveFailed(_)
+            | RetainedReason::LinkedElsewhere(_) => true,
+        }
+    }
+
+    /// Stable snake_case wire string, matching the `serde` tag.
+    #[must_use]
+    pub fn wire(&self) -> &'static str {
+        match self {
+            RetainedReason::LocallyModified(_) => "locally_modified",
+            RetainedReason::KeptByRepository(_) => "kept_by_repository",
+            RetainedReason::ReadFailed(_) => "read_failed",
+            RetainedReason::RemoveFailed(_) => "remove_failed",
+            RetainedReason::LinkedElsewhere(_) => "linked_elsewhere",
+        }
+    }
+
+    /// One line naming the reason, for the log summary and the manifest.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            RetainedReason::LocallyModified(blob) => {
+                format!("locally modified (blob {blob} is not one it shipped as), kept")
+            }
+            RetainedReason::KeptByRepository(why) => {
+                format!("kept by the tracked-file guard ({why})")
+            }
+            RetainedReason::ReadFailed(why) => {
+                format!("could not be read to compare its blob: {why}")
+            }
+            RetainedReason::RemoveFailed(why) => format!("removal failed: {why}"),
+            RetainedReason::LinkedElsewhere(at) => {
+                format!("not removed: .claude/agents is reached through a symlink, to {at}")
+            }
+        }
+    }
+}
+
+/// A RETIRED unit a pass found on disk and left there, so the retired
+/// definition may still resolve in that workdir.
+///
+/// Kept apart from [`SkippedUnit`] on purpose: a skip says the session did not
+/// get something it should have, while this says the session still HAS
+/// something it should not. Reporting a failed removal as a "write failed" skip
+/// would state the opposite of what is on disk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RetainedRetiredUnit {
+    /// The unit's name as the provisioner addresses it (a file name).
+    pub unit: String,
+    /// Why it is still there. Flattened, as [`SkippedUnit::reason`] is, so both
+    /// lists serialize as `{unit, reason, detail}`.
+    #[serde(flatten)]
+    pub reason: RetainedReason,
 }
 
 /// What one `provision_*` pass actually delivered.
@@ -1099,6 +1245,16 @@ pub struct ProvisionReport {
     pub written: usize,
     /// Every unit that was not written, WITH its reason.
     pub skipped: Vec<SkippedUnit>,
+    /// Every unit the pass REMOVED, with the blob it matched. A removal is not a
+    /// skip, because the session lost nothing it should have, so it moves
+    /// neither `written` nor [`Self::is_complete`].
+    pub removed: Vec<RemovedUnit>,
+    /// Every RETIRED unit the pass found and left on disk, with why. A failed
+    /// read or removal, a shipped copy behind a symlink, and a copy kept because
+    /// the tracked-file probe could not answer degrade the pass
+    /// ([`Self::is_complete`], [`RetainedReason::is_failure`]); a copy kept on
+    /// purpose (locally modified, or tracked) does not, but is still named.
+    pub retained_retired: Vec<RetainedRetiredUnit>,
     /// Which rung supplied what was written. [`Rung::Unresolved`] when the pass
     /// delivered nothing at all.
     pub rung: Rung,
@@ -1123,6 +1279,8 @@ impl ProvisionReport {
             expected,
             written: 0,
             skipped: Vec::new(),
+            removed: Vec::new(),
+            retained_retired: Vec::new(),
             rung,
             destination: None,
             detail: None,
@@ -1176,26 +1334,47 @@ impl ProvisionReport {
         });
     }
 
+    /// Record one unit this pass removed, with the blob it matched.
+    pub fn record_removed(&mut self, unit: impl Into<String>, blob: impl Into<String>) {
+        self.removed.push(RemovedUnit {
+            unit: unit.into(),
+            blob: blob.into(),
+        });
+    }
+
+    /// Record one retired unit this pass found and left on disk, with why.
+    pub fn record_retained_retired(&mut self, unit: impl Into<String>, reason: RetainedReason) {
+        self.retained_retired.push(RetainedRetiredUnit {
+            unit: unit.into(),
+            reason,
+        });
+    }
+
     /// Pin the rung after the fact — used where the rung is only knowable once
     /// the pass has run (nothing written at all is [`Rung::Unresolved`]).
     pub fn set_rung(&mut self, rung: Rung) {
         self.rung = rung;
     }
 
-    /// True when every expected unit was written and nothing was skipped.
+    /// True when every expected unit was written, nothing was skipped, and no
+    /// retired unit the pass meant to remove is still on disk.
     #[must_use]
     pub fn is_complete(&self) -> bool {
-        self.skipped.is_empty() && self.written == self.expected
+        self.skipped.is_empty()
+            && self.written == self.expected
+            && !self.retained_retired.iter().any(|r| r.reason.is_failure())
     }
 
-    /// True when this pass delivered less than its roster — the state that used
-    /// to be invisible.
+    /// True when this pass delivered less than its roster, or left a retired
+    /// unit on disk that it meant to remove — the states that used to be
+    /// invisible.
     #[must_use]
     pub fn is_degraded(&self) -> bool {
         !self.is_complete()
     }
 
-    /// One log line: counts first, then every skipped unit with its reason.
+    /// One log line: counts first, then every removed unit, every retired unit
+    /// left on disk, and every skipped unit, each with its reason.
     ///
     /// Deliberately states the reasons rather than a count of them — a "3
     /// skipped" line is the same unreadable signal this type replaces.
@@ -1214,6 +1393,21 @@ impl ProvisionReport {
         if let Some(detail) = &self.detail {
             out.push_str(&format!(" ({detail})"));
         }
+        if !self.removed.is_empty() {
+            out.push_str(&format!("; {} removed:", self.removed.len()));
+            for removed in &self.removed {
+                out.push_str(&format!(" [{} — blob {}]", removed.unit, removed.blob));
+            }
+        }
+        if !self.retained_retired.is_empty() {
+            out.push_str(&format!(
+                "; {} retired unit(s) still present:",
+                self.retained_retired.len()
+            ));
+            for kept in &self.retained_retired {
+                out.push_str(&format!(" [{} — {}]", kept.unit, kept.reason.describe()));
+            }
+        }
         if self.skipped.is_empty() {
             return out;
         }
@@ -1229,17 +1423,40 @@ impl ProvisionReport {
     /// The skipped units land in [`CapabilityObservation::note`] WITH their
     /// reasons, so a manifest read on an operator's machine states what the
     /// session did not get and why — which is the entire deliverable of this
-    /// phase.
+    /// phase. A retired unit the pass meant to remove and could not lands in the
+    /// note too; removed units and deliberate keeps land in the detail.
     #[must_use]
     pub fn observation(&self) -> CapabilityObservation {
         let mut detail = format!("wrote {}/{} unit(s)", self.written, self.expected);
         if let Some(extra) = &self.detail {
             detail.push_str(&format!("; {extra}"));
         }
+        if !self.removed.is_empty() {
+            let names = self
+                .removed
+                .iter()
+                .map(|r| r.unit.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            detail.push_str(&format!("; removed {names}"));
+        }
+        let kept_on_purpose = self
+            .retained_retired
+            .iter()
+            .filter(|r| !r.reason.is_failure())
+            .map(|r| format!("{} ({})", r.unit, r.reason.describe()))
+            .collect::<Vec<_>>();
+        if !kept_on_purpose.is_empty() {
+            detail.push_str(&format!(
+                "; retired but kept: {}",
+                kept_on_purpose.join(", ")
+            ));
+        }
         let mut obs = CapabilityObservation::new(self.rung).with_detail(detail);
         if let Some(dest) = &self.destination {
             obs = obs.with_resolved_path(dest.clone());
         }
+        let mut notes = Vec::new();
         if !self.skipped.is_empty() {
             let reasons = self
                 .skipped
@@ -1247,11 +1464,28 @@ impl ProvisionReport {
                 .map(|s| format!("{} ({})", s.unit, s.reason.describe()))
                 .collect::<Vec<_>>()
                 .join("; ");
-            obs = obs.with_note(format!(
+            notes.push(format!(
                 "{} unit(s) not provisioned — the spawn continued regardless (fail-soft \
                  by contract): {reasons}",
                 self.skipped.len()
             ));
+        }
+        let stuck = self
+            .retained_retired
+            .iter()
+            .filter(|r| r.reason.is_failure())
+            .map(|r| format!("{} ({})", r.unit, r.reason.describe()))
+            .collect::<Vec<_>>();
+        if !stuck.is_empty() {
+            notes.push(format!(
+                "{} retired unit(s) the pass could not remove, which may still resolve — \
+                 the spawn continued regardless (fail-soft by contract): {}",
+                stuck.len(),
+                stuck.join("; ")
+            ));
+        }
+        if !notes.is_empty() {
+            obs = obs.with_note(notes.join(". "));
         }
         obs
     }
@@ -1929,9 +2163,9 @@ pub fn render_manifest_doc() -> String {
          --capability-manifest-doc > docs/runner-capabilities.md`. NOT from PowerShell, \
          whose `>` writes UTF-16 or a BOM that `include_str!` cannot read at all. The \
          source of truth is `CAPABILITY_SPECS` in \
-         `src-tauri/src/capability_manifest.rs`, and \
-         `.github/workflows/capability-manifest-fresh.yml` fails any PR whose checked-in \
-         copy differs from a fresh render. -->\n\n",
+         `src-tauri/src/capability_manifest.rs`, and the runner test \
+         `the_checked_in_capability_doc_matches_a_fresh_render` (in `src-tauri/src/main.rs`) \
+         fails any change whose checked-in copy differs from a fresh render. -->\n\n",
     );
     out.push_str(&format!("Manifest schema version: `{SCHEMA_VERSION}`.\n\n"));
 
@@ -1983,6 +2217,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn probe_unknown_in_repo_is_its_own_skip_reason() {
+        assert_eq!(
+            SkipReason::ProbeUnknownInRepo.wire(),
+            "probe_unknown_in_repo"
+        );
+        assert_ne!(SkipReason::ProbeUnknownInRepo, SkipReason::GitTracked);
+        let json = serde_json::to_value(SkipReason::ProbeUnknownInRepo).unwrap();
+        assert_eq!(json["reason"], "probe_unknown_in_repo");
+    }
+
+    #[test]
     fn repo_authored_is_its_own_skip_reason() {
         assert_eq!(SkipReason::RepoAuthored.wire(), "repo_authored");
         assert_ne!(SkipReason::RepoAuthored, SkipReason::GitTracked);
@@ -1991,6 +2236,17 @@ mod tests {
             .contains("authored by its repository"));
         let json = serde_json::to_value(SkipReason::RepoAuthored).unwrap();
         assert_eq!(json["reason"], "repo_authored");
+    }
+
+    #[test]
+    fn operator_authored_is_its_own_skip_reason() {
+        let reason = SkipReason::OperatorAuthored("a symbolic link".to_string());
+        assert_eq!(reason.wire(), "operator_authored");
+        assert_ne!(reason, SkipReason::Rejected("a symbolic link".to_string()));
+        assert_eq!(reason.describe(), "kept: a symbolic link");
+        let json = serde_json::to_value(&reason).unwrap();
+        assert_eq!(json["reason"], "operator_authored");
+        assert_eq!(json["detail"], "a symbolic link");
     }
 
     #[test]
@@ -2413,6 +2669,119 @@ mod tests {
         let obs = report.observation();
         assert!(obs.note.is_none());
         assert_eq!(obs.detail.as_deref(), Some("wrote 3/3 unit(s)"));
+    }
+
+    /// A removal is recorded with its blob, named in the log line, the manifest
+    /// detail and the serialized report, and does not degrade the pass: the
+    /// session lost nothing it should have had.
+    #[test]
+    fn a_removal_is_recorded_with_its_blob_and_does_not_degrade_the_pass() {
+        let mut report = ProvisionReport::new("agent_definitions", 1, Rung::OperatorCheckout);
+        report.record_written();
+        report.record_removed("retired.md", "3908f6b9811fea0b8f7bc68f7d0bf9022015a537");
+
+        assert!(report.is_complete(), "a removal is not a skip");
+        assert_eq!(report.written, 1, "a removal moves no write count");
+        assert_eq!(
+            report.removed,
+            vec![RemovedUnit {
+                unit: "retired.md".to_string(),
+                blob: "3908f6b9811fea0b8f7bc68f7d0bf9022015a537".to_string(),
+            }]
+        );
+        let summary = report.summary();
+        assert!(
+            summary.contains(
+                "1 removed: [retired.md — blob 3908f6b9811fea0b8f7bc68f7d0bf9022015a537]"
+            ),
+            "{summary}"
+        );
+        let obs = report.observation();
+        assert!(
+            obs.note.is_none(),
+            "a clean pass with a removal is still clean"
+        );
+        assert_eq!(
+            obs.detail.as_deref(),
+            Some("wrote 1/1 unit(s); removed retired.md")
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["removed"][0]["unit"], "retired.md");
+        assert_eq!(
+            json["removed"][0]["blob"],
+            "3908f6b9811fea0b8f7bc68f7d0bf9022015a537"
+        );
+    }
+
+    /// A retired unit left on disk serializes in the skip shape (`{unit,
+    /// reason, detail}`), is named in the summary, puts a deliberate keep in the
+    /// detail and a failed removal in the note, and only the failure degrades.
+    #[test]
+    fn a_retained_retired_unit_is_named_and_only_a_failure_degrades() {
+        let mut report = ProvisionReport::new("agent_definitions", 0, Rung::OperatorCheckout);
+        report.record_retained_retired(
+            "edited.md",
+            RetainedReason::LocallyModified("aaaa".to_string()),
+        );
+        assert!(report.is_complete(), "a deliberate keep does not degrade");
+        let obs = report.observation();
+        assert_eq!(
+            obs.detail.as_deref(),
+            Some(
+                "wrote 0/0 unit(s); retired but kept: edited.md (locally modified (blob \
+                 aaaa is not one it shipped as), kept)"
+            )
+        );
+        assert!(obs.note.is_none(), "{:?}", obs.note);
+
+        report.record_retained_retired(
+            "stuck.md",
+            RetainedReason::RemoveFailed("permission denied".to_string()),
+        );
+        assert!(!report.is_complete(), "a failed removal degrades");
+        assert_eq!(
+            report.observation().note.as_deref(),
+            Some(
+                "1 retired unit(s) the pass could not remove, which may still resolve — the \
+                 spawn continued regardless (fail-soft by contract): stuck.md (removal \
+                 failed: permission denied)"
+            )
+        );
+        let summary = report.summary();
+        assert!(
+            summary.contains(
+                "; 2 retired unit(s) still present: [edited.md — locally modified (blob aaaa \
+                 is not one it shipped as), kept] [stuck.md — removal failed: permission \
+                 denied]"
+            ),
+            "{summary}"
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            json["retained_retired"],
+            serde_json::json!([
+                {"unit": "edited.md", "reason": "locally_modified", "detail": "aaaa"},
+                {"unit": "stuck.md", "reason": "remove_failed", "detail": "permission denied"}
+            ])
+        );
+        for reason in [
+            RetainedReason::LocallyModified("a".to_string()),
+            RetainedReason::KeptByRepository("git_tracked".to_string()),
+            RetainedReason::ReadFailed("b".to_string()),
+            RetainedReason::RemoveFailed("c".to_string()),
+            RetainedReason::LinkedElsewhere("d".to_string()),
+        ] {
+            assert_eq!(json_reason(&reason), reason.wire());
+        }
+        assert!(!RetainedReason::KeptByRepository("git_tracked".to_string()).is_failure());
+        assert!(RetainedReason::KeptByRepository("probe_unknown_in_repo".to_string()).is_failure());
+    }
+
+    fn json_reason(reason: &RetainedReason) -> String {
+        serde_json::to_value(reason).unwrap()["reason"]
+            .as_str()
+            .unwrap()
+            .to_string()
     }
 
     /// The `unresolved` constructor is the shape that replaces a lone `warn!` on
@@ -2996,15 +3365,39 @@ mod tests {
             );
         }
 
-        // Everything the driver cannot observe from here stays `unknown` AND
-        // names its anchor. With an empty ledger that is the other seven rows;
-        // nothing outside this module's own tests records them, so they are
-        // deterministic.
+        // The four session-provisioning rows are conditional for the same
+        // reason: other modules' tests record them without this module's store
+        // lock (e.g. `agent_runtime`'s subagent tests, `mcp_api`'s provision
+        // probe, `agent_worktree::isolated_edit`'s and `served_corpus`'s command
+        // and skill tests; the list is not exhaustive), so a
+        // parallel run can leave a real arm. Either way unknown NAMES the anchor
+        // and anything else is a rung the provisioner can emit.
         for id in [
             "fleet_commands",
             "fleet_skills",
             "fleet_agents",
             "agent_definitions",
+        ] {
+            let row = manifest.row(id).expect("row present");
+            if row.rung == Rung::Unknown {
+                assert!(
+                    row.note
+                        .as_deref()
+                        .is_some_and(|n| n.contains(capability(id).anchor)),
+                    "{id}'s unknown note must name its owning symbol"
+                );
+            } else {
+                assert!(
+                    capability(id).expected_rungs.contains(&row.rung),
+                    "{id} reported {:?}, a rung its provisioner cannot emit",
+                    row.rung.wire()
+                );
+            }
+        }
+
+        // Everything else the driver cannot observe from here stays `unknown`
+        // AND names its anchor.
+        for id in [
             "agent_commands_registry",
             "agent_skills_registry",
             "slash_commands",

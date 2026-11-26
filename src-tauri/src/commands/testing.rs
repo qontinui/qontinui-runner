@@ -963,6 +963,16 @@ pub struct PageAnalysisResponse {
     pub error: Option<String>,
 }
 
+/// The `CommandResponse` an analyze command answers when its blocking task
+/// itself failed (panicked or was cancelled).
+fn bridge_task_failure(e: String) -> CommandResponse {
+    CommandResponse {
+        success: false,
+        message: Some(e),
+        data: None,
+    }
+}
+
 /// Analyze a page via Playwright CDP for AI test generation.
 ///
 /// Connects to an existing browser via Chrome DevTools Protocol,
@@ -972,15 +982,33 @@ pub struct PageAnalysisResponse {
 /// # Arguments
 /// * `cdp_port` - CDP port number (default: 9222)
 /// * `state` - Application state containing the Python bridge
+///
+/// `async` with a blocking body: it waits up to its Python timeout, and a sync
+/// command would wait on the main thread (plan
+/// `2026-11-04-runner-wedge-detector-reads-a-boot-as-a-wedge-and-never-bound-is-silent`
+/// Phase 3). Always `Ok`, so the JS contract (a resolved `CommandResponse`)
+/// is unchanged.
 #[tauri::command]
-pub fn analyze_page_playwright(
+pub async fn analyze_page_playwright(
     cdp_port: Option<u16>,
     bridge: State<'_, BridgeCompartment>,
+) -> Result<CommandResponse, String> {
+    let bridge = bridge.inner().clone();
+    Ok(crate::executor::run_bridge_blocking(move || {
+        analyze_page_playwright_blocking(cdp_port, &bridge)
+    })
+    .await
+    .unwrap_or_else(bridge_task_failure))
+}
+
+fn analyze_page_playwright_blocking(
+    cdp_port: Option<u16>,
+    bridge: &BridgeCompartment,
 ) -> CommandResponse {
     let port = cdp_port.unwrap_or(9222);
     info!("Analyzing page via Playwright CDP on port {}", port);
 
-    if !is_default_bridge_running_compartment(&bridge) {
+    if !is_default_bridge_running_compartment(bridge) {
         return CommandResponse {
             success: false,
             message: Some(
@@ -995,7 +1023,7 @@ pub fn analyze_page_playwright(
     });
 
     // Use send_command_and_wait for synchronous response
-    let result = with_default_bridge_compartment(&bridge, |bridge| {
+    let result = with_default_bridge_compartment(bridge, |bridge| {
         bridge.send_command_and_wait(
             "analyze_page_playwright",
             Some(params),
@@ -1045,17 +1073,35 @@ pub fn analyze_page_playwright(
 /// # Arguments
 /// * `script` - Playwright TypeScript/JavaScript code to navigate to the page
 /// * `state` - Application state containing the Python bridge
+///
+/// `async` with a blocking body: it waits up to its Python timeout, and a sync
+/// command would wait on the main thread (plan
+/// `2026-11-04-runner-wedge-detector-reads-a-boot-as-a-wedge-and-never-bound-is-silent`
+/// Phase 3). Always `Ok`, so the JS contract (a resolved `CommandResponse`)
+/// is unchanged.
 #[tauri::command]
-pub fn analyze_page_playwright_script(
+pub async fn analyze_page_playwright_script(
     script: String,
     bridge: State<'_, BridgeCompartment>,
+) -> Result<CommandResponse, String> {
+    let bridge = bridge.inner().clone();
+    Ok(crate::executor::run_bridge_blocking(move || {
+        analyze_page_playwright_script_blocking(script, &bridge)
+    })
+    .await
+    .unwrap_or_else(bridge_task_failure))
+}
+
+fn analyze_page_playwright_script_blocking(
+    script: String,
+    bridge: &BridgeCompartment,
 ) -> CommandResponse {
     info!(
         "Analyzing page via Playwright script ({} chars)",
         script.len()
     );
 
-    if !is_default_bridge_running_compartment(&bridge) {
+    if !is_default_bridge_running_compartment(bridge) {
         return CommandResponse {
             success: false,
             message: Some(
@@ -1070,7 +1116,7 @@ pub fn analyze_page_playwright_script(
     });
 
     // Use longer timeout for script execution (may include navigation, waiting, etc.)
-    let result = with_default_bridge_compartment(&bridge, |bridge| {
+    let result = with_default_bridge_compartment(bridge, |bridge| {
         bridge.send_command_and_wait(
             "analyze_page_playwright_script",
             Some(params),
@@ -1119,15 +1165,33 @@ pub fn analyze_page_playwright_script(
 /// # Arguments
 /// * `monitor_index` - Monitor index to capture (default: 0)
 /// * `state` - Application state containing the Python bridge
+///
+/// `async` with a blocking body: it waits up to its Python timeout, and a sync
+/// command would wait on the main thread (plan
+/// `2026-11-04-runner-wedge-detector-reads-a-boot-as-a-wedge-and-never-bound-is-silent`
+/// Phase 3). Always `Ok`, so the JS contract (a resolved `CommandResponse`)
+/// is unchanged.
 #[tauri::command]
-pub fn analyze_page_vision(
+pub async fn analyze_page_vision(
     monitor_index: Option<i32>,
     bridge: State<'_, BridgeCompartment>,
+) -> Result<CommandResponse, String> {
+    let bridge = bridge.inner().clone();
+    Ok(crate::executor::run_bridge_blocking(move || {
+        analyze_page_vision_blocking(monitor_index, &bridge)
+    })
+    .await
+    .unwrap_or_else(bridge_task_failure))
+}
+
+fn analyze_page_vision_blocking(
+    monitor_index: Option<i32>,
+    bridge: &BridgeCompartment,
 ) -> CommandResponse {
     let monitor = monitor_index.unwrap_or(0);
     info!("Analyzing page via Vision on monitor {}", monitor);
 
-    if !is_default_bridge_running_compartment(&bridge) {
+    if !is_default_bridge_running_compartment(bridge) {
         return CommandResponse {
             success: false,
             message: Some(
@@ -1142,7 +1206,7 @@ pub fn analyze_page_vision(
     });
 
     // Use send_command_and_wait for synchronous response
-    let result = with_default_bridge_compartment(&bridge, |bridge| {
+    let result = with_default_bridge_compartment(bridge, |bridge| {
         bridge.send_command_and_wait(
             "analyze_page_vision",
             Some(params),

@@ -12,9 +12,10 @@
 # `git apply --check` on head_sha, `git diff -w` empty for a format repair,
 # size cap) and only THEN authors the commit through its own audited push seam.
 #
-# IT PUSHES NOTHING, COMMENTS NOTHING, LABELS NOTHING. `contents: read` is the
-# whole grant and both checkouts drop the credential. A repair that could
-# write from here would be a second writer beside coord's one fenced seam.
+# IT PUSHES NOTHING, COMMENTS NOTHING, LABELS NOTHING. `contents: read` plus the
+# job's `pull-requests: read` is the whole grant, and both checkouts drop the
+# credential. A repair that could write from here would be a second writer
+# beside coord's one fenced seam.
 #
 # WHAT DECIDES THE REPAIR: the DEFAULT branch's .qontinui/ci.toml, checked out
 # to `trusted/` — never the PR's, so a PR cannot declare its own repair. The
@@ -89,10 +90,9 @@ jobs:
     # comment), unlike the tag pins elsewhere in this repo: this workflow runs
     # PR-head code by design, so it takes no mutable reference on top of that.
     runs-on: ubuntu-22.04
-    # Read-only, both. `pull-requests: read` is for the regen's sibling
-    # checkout, which reads the PR's coord dep-edge labels and the named
-    # sibling PR (ci.yml grants the same for the same action); nothing here
-    # can write.
+    # Read-only, both. `pull-requests: read` is for the sibling checkout, which
+    # reads the PR's coord dep-edge labels and the named sibling PR (ci.yml
+    # grants the same for the same action); nothing here can write.
     permissions:
       contents: read
       pull-requests: read
@@ -163,12 +163,13 @@ jobs:
           toolchain: "1.95.0"
           components: rustfmt
 
-      # --- regen only: what compiling the crate needs (ci.yml `test` job) ---
-
       # src-tauri/Cargo.toml path-depends on ../../qontinui-schemas/rust, i.e.
-      # a sibling of the repo root — beside work/, at the PR head's pin.
-      - name: "Regen: check out sibling qontinui-schemas"
-        if: inputs.kind == 'regen'
+      # a sibling of the repo root — beside work/, at the PR head's pin. Both
+      # kinds need it: `cargo fmt` compiles nothing but still runs `cargo
+      # metadata`, which loads every path dependency's manifest, so without the
+      # sibling a format repair's `cargo fmt -- --check` exits 1 whatever the
+      # patch says (measured on run 41486053962).
+      - name: Check out sibling qontinui-schemas
         uses: ./trusted/.github/actions/checkout-sibling
         with:
           path: ${{ github.workspace }}/qontinui-schemas
@@ -176,6 +177,8 @@ jobs:
           # Not a pull_request event, so name the PR: a declared adaptation
           # PR then resolves exactly as it does in ci.yml.
           pr-number: ${{ inputs.pr }}
+
+      # --- regen only: what compiling the crate needs (ci.yml `test` job) ---
 
       - name: "Regen: install dependencies (Ubuntu)"
         if: inputs.kind == 'regen'

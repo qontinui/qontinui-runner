@@ -410,6 +410,13 @@ impl AgentCommandRegistry {
             .or_else(|| self.builtin.iter().find(|c| c.name == name))
     }
 
+    /// True iff `name` is a builtin command — one this binary embeds, so the
+    /// repository that vendors it can add the same path upstream. An
+    /// account-only command is not, and `provision_guard` never withholds it.
+    pub fn is_builtin(&self, name: &str) -> bool {
+        self.builtin.iter().any(|b| b.name == name)
+    }
+
     /// How many defaults are embedded in this binary.
     pub fn builtin_count(&self) -> usize {
         self.builtin.len()
@@ -575,9 +582,12 @@ pub(crate) enum FetchOutcome {
 /// runtime.
 ///
 /// Callers reach this from `provision_fleet_commands_for_session`, which is a
-/// *sync* function invoked from *async* spawn paths. `Handle::block_on` panics
-/// when called from inside a runtime worker, so the work is moved onto its own
-/// thread instead.
+/// *sync* function. Its async spawn paths now run it on the blocking pool
+/// (`spawn_off_worker::run_provisioning_off_worker`, plan
+/// `2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap`
+/// D2). The fetch still keeps its own thread and runtime, so it works from any
+/// caller's context. `Handle::block_on` would panic on a runtime worker, should
+/// a new caller ever reach this from one.
 ///
 /// The join is bounded by the reqwest client's own [`FETCH_TIMEOUT`], which
 /// covers connect + read for the single request this makes; everything else on

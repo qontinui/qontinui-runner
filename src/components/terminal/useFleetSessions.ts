@@ -79,6 +79,13 @@ export interface FleetSession {
    * read `workAxisColumnsPresent`.
    */
   sessionStatus: string | null;
+  /**
+   * When `sessionStatus` last moved. For a finished row, its LATEST finish: a
+   * re-finish restamps it. Optional because an older coord omits it. Absent or
+   * null is UNKNOWN, never "no finish time". A `stalled` row keeps the clock of
+   * the status it stalled in, so this is not when it stalled.
+   */
+  sessionStatusSince?: string | null;
   workUnitSlug: string | null;
   repo: string | null;
   branch: string | null;

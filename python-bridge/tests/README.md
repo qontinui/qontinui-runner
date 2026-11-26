@@ -4,9 +4,9 @@ This directory contains comprehensive unit tests for the unified data architectu
 
 ## Test Coverage
 
-The test suite includes **162 tests** across 4 main test modules:
+The test suite includes **111 tests** across these 3 main test modules (the whole suite collects more):
 
-### 1. test_action_execution_record.py (37 tests)
+### 1. test_action_execution_record.py (36 tests)
 
 Tests for the immutable `ActionExecutionRecord` dataclass:
 
@@ -14,9 +14,9 @@ Tests for the immutable `ActionExecutionRecord` dataclass:
   - Minimal fields
   - All fields populated
 
-- **Immutability** (5 tests)
+- **Immutability** (6 tests)
   - Cannot modify action_id, action_type, success, active_states
-  - Config dict defensive copying
+  - Config and metadata dict defensive copying
 
 - **Computed Properties** (13 tests)
   - duration_seconds calculation
@@ -42,7 +42,7 @@ Tests for the immutable `ActionExecutionRecord` dataclass:
   - Complex state sets
   - Partial state changes
 
-### 2. test_unified_data_collector.py (41 tests)
+### 2. test_unified_data_collector.py (35 tests)
 
 Tests for the `UnifiedDataCollector` service:
 
@@ -56,7 +56,7 @@ Tests for the `UnifiedDataCollector` service:
   - Nested hierarchy
   - Without state memory
 
-- **Runtime Data Recording** (12 tests)
+- **Runtime Data Recording** (14 tests)
   - record_text_typed()
   - record_match_result() with/without screenshots
   - record_click()
@@ -81,7 +81,7 @@ Tests for the `UnifiedDataCollector` service:
   - Concurrent click recording
   - Sequential action creation
 
-### 3. test_screenshot_service.py (47 tests)
+### 3. test_screenshot_service.py (40 tests)
 
 Tests for the `ScreenshotService`:
 
@@ -124,7 +124,7 @@ Tests for the `ScreenshotService`:
   - Leading/trailing hyphen removal
   - Length limiting
 
-- **Sequential Numbering** (4 tests)
+- **Sequential Numbering** (5 tests)
   - Screenshot number calculation
   - Debug visual number calculation
   - Gap handling
@@ -132,64 +132,6 @@ Tests for the `ScreenshotService`:
 - **Disabled Mode** (5 tests)
   - All methods return None or 0
   - No filesystem operations
-
-### 4. test_tree_view_layer.py (37 tests)
-
-Tests for the `TreeViewLayer` service:
-
-- **TreeNode Serialization** (3 tests)
-  - Basic to_dict()
-  - With children
-  - Deep nesting
-
-- **Execution Tree View** (5 tests)
-  - Empty list handling
-  - Single action
-  - Parent-child relationships
-  - Multiple workflows
-  - Metadata inclusion
-
-- **Action-Only Tree View** (4 tests)
-  - Flattening hierarchy
-  - Chronological ordering
-  - Parent ID metadata
-
-- **State Transition Tree View** (5 tests)
-  - Entered states grouping
-  - Exited states grouping
-  - No change grouping
-  - Multiple actions per state
-
-- **Timeline Tree View** (4 tests)
-  - Relative timestamps
-  - Timestamp formatting in labels
-  - Hierarchy maintenance
-
-- **State Grouped Tree View** (5 tests)
-  - Grouping by active state sets
-  - Empty state sets
-  - Time-based sorting
-  - State change data
-
-- **Label Formatting** (6 tests)
-  - Success/failed/running indicators
-  - State change indicators
-  - Duration display
-  - No duration/no state change
-
-- **Timeline Label Formatting** (3 tests)
-  - Zero time
-  - Non-zero time
-  - Full action label inclusion
-
-- **State Change Formatting** (4 tests)
-  - With changes
-  - No changes
-  - Only entered/exited
-
-- **Complex Scenarios** (2 tests)
-  - Complex workflow hierarchy
-  - Multiple view transformations
 
 ## Test Infrastructure
 
@@ -206,7 +148,7 @@ Provides shared fixtures and utilities:
   - `sample_failed_action_record`: Failed action
   - `sample_running_action_record`: Incomplete action
   - `action_record_builder`: Function to create custom records
-  - `mock_screenshot_service`: Mock service with predefined responses
+  - `mock_screenshot_service`: Mock service with predefined responses and a real `storage_dir`
   - `sample_png_bytes`: Minimal valid PNG for testing
 
 ## Running Tests
@@ -291,7 +233,6 @@ Target coverage: **95%+** for all modules:
 - `models/action_execution_record.py`
 - `services/unified_data_collector.py`
 - `services/screenshot_service.py`
-- `services/tree_view_layer.py`
 
 ## Adding New Tests
 

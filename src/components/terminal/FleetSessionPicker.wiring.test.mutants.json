@@ -350,16 +350,16 @@
         {
           "label": "fsp-wiring-retired-flag-gone-discovery-dot-truncated",
           "file": "src/components/terminal/fleetDiscovery.ts",
-          "anchor": "  return JSON.stringify([scope.deviceId, scope.state, scope.includeClosed, scope.tenantId]);",
-          "replace": "  void (scope as { truncated?: boolean }).truncated;\n  return JSON.stringify([scope.deviceId, scope.state, scope.includeClosed, scope.tenantId]);",
+          "anchor": "  return JSON.stringify([\n    scope.deviceId,",
+          "replace": "  void (scope as { truncated?: boolean }).truncated;\n  return JSON.stringify([\n    scope.deviceId,",
           "expect_count": 1,
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'no fleet module reads, declares or fakes'"
         },
         {
           "label": "fsp-wiring-retired-flag-gone-discovery-field-decl",
           "file": "src/components/terminal/fleetDiscovery.ts",
-          "anchor": "  return JSON.stringify([scope.deviceId, scope.state, scope.includeClosed, scope.tenantId]);",
-          "replace": "  type Retired = {\n    truncated?: boolean;\n  };\n  return JSON.stringify([scope.deviceId, scope.state, scope.includeClosed, scope.tenantId]);",
+          "anchor": "  return JSON.stringify([\n    scope.deviceId,",
+          "replace": "  type Retired = {\n    truncated?: boolean;\n  };\n  return JSON.stringify([\n    scope.deviceId,",
           "expect_count": 1,
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'no fleet module reads, declares or fakes'"
         },
@@ -397,8 +397,8 @@
         {
           "label": "fsp-wiring-page-ladder-deleted-discovery-at-ceiling",
           "file": "src/components/terminal/fleetDiscovery.ts",
-          "anchor": "  return JSON.stringify([scope.deviceId, scope.state, scope.includeClosed, scope.tenantId]);",
-          "replace": "  void \"at-ceiling\";\n  return JSON.stringify([scope.deviceId, scope.state, scope.includeClosed, scope.tenantId]);",
+          "anchor": "  return JSON.stringify([\n    scope.deviceId,",
+          "replace": "  void \"at-ceiling\";\n  return JSON.stringify([\n    scope.deviceId,",
           "expect_count": 1,
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'the page ladder is deleted'"
         },
@@ -875,8 +875,8 @@
         {
           "label": "fsp-wiring-scope-fingerprint-omits-limit-limit-in-key",
           "file": "src/components/terminal/fleetDiscovery.ts",
-          "anchor": "  return JSON.stringify([scope.deviceId, scope.state, scope.includeClosed, scope.tenantId]);",
-          "replace": "  return JSON.stringify([scope.deviceId, scope.state, scope.includeClosed, scope.tenantId, scope.limit]);",
+          "anchor": "    scope.sessionStatus ?? null,\n  ]);",
+          "replace": "    scope.sessionStatus ?? null,\n    scope.limit,\n  ]);",
           "expect_count": 1,
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'out of the scope fingerprint itself'"
         }
@@ -913,8 +913,8 @@
         {
           "label": "fsp-wiring-row-activity-null-is-unknown-placeholder",
           "file": "src/components/terminal/FleetSessionPicker.tsx",
-          "anchor": "if (free.length === 0 && !activity) return null;",
-          "replace": "if (free.length === 0) return null;",
+          "anchor": "if (free.length === 0 && !activity && !moved) return null;",
+          "replace": "if (free.length === 0 && !moved) return null;",
           "expect_count": 1,
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'renders nothing at all when coord served no parseable'"
         }
@@ -940,6 +940,37 @@
           "replace": "data-session-activity-verb={activity.verb}",
           "expect_count": 1,
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'projects the exact instant for a driver'"
+        }
+      ]
+    },
+    {
+      "id": "FleetSessionPicker.wiring:row-work-status-moved",
+      "kind": "vitest-it",
+      "test_file": "src/components/terminal/FleetSessionPicker.wiring.test.ts",
+      "mutants": [
+        {
+          "label": "fsp-wiring-row-work-status-moved-read-gone",
+          "file": "src/components/terminal/FleetSessionPicker.tsx",
+          "anchor": "const moved = workStatusMoved(s);",
+          "replace": "const moved = null as ReturnType<typeof workStatusMoved>;",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'shows how long ago the work axis moved'"
+        },
+        {
+          "label": "fsp-wiring-row-work-status-moved-iso-attr-gone",
+          "file": "src/components/terminal/FleetSessionPicker.tsx",
+          "anchor": "data-session-status-since={moved.iso}",
+          "replace": "data-session-status-since-x={moved.iso}",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'shows how long ago the work axis moved'"
+        },
+        {
+          "label": "fsp-wiring-row-work-status-moved-label-gone",
+          "file": "src/components/terminal/FleetSessionPicker.tsx",
+          "anchor": "{moved.label}",
+          "replace": "{moved.iso}",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'shows how long ago the work axis moved'"
         }
       ]
     },
@@ -1074,16 +1105,16 @@
         {
           "label": "fsp-wiring-mint-under-served-tenant-attach-under-selection",
           "file": "src/components/terminal/FleetSessionPicker.tsx",
-          "anchor": "tenant: s.mintTenantId ?? null,",
-          "replace": "tenant: fleetTenant ?? null,",
+          "anchor": "as before the selector.\n          tenant: s.mintTenantId ?? null,",
+          "replace": "as before the selector.\n          tenant: fleetTenant ?? null,",
           "expect_count": 1,
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'own walk presented'"
         },
         {
           "label": "fsp-wiring-mint-under-served-tenant-attach-under-envelope",
           "file": "src/components/terminal/FleetSessionPicker.tsx",
-          "anchor": "tenant: s.mintTenantId ?? null,",
-          "replace": "tenant: s.servedTenantId ?? null,",
+          "anchor": "as before the selector.\n          tenant: s.mintTenantId ?? null,",
+          "replace": "as before the selector.\n          tenant: s.servedTenantId ?? null,",
           "expect_count": 1,
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'own walk presented'"
         },
@@ -1168,8 +1199,8 @@
         {
           "label": "fsp-wiring-merged-groups-by-tenant-group-by-device-only",
           "file": "src/components/terminal/FleetSessionPicker.tsx",
-          "anchor": "groupByDevice(visible, { byTenant: merged })",
-          "replace": "groupByDevice(visible, { byTenant: false })",
+          "anchor": "{ byTenant: merged },",
+          "replace": "{ byTenant: false },",
           "expect_count": 1,
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'groups a merged read by device AND tenant'"
         }
@@ -1183,8 +1214,8 @@
         {
           "label": "fsp-wiring-row-own-envelope-first-envelope",
           "file": "src/components/terminal/FleetSessionPicker.tsx",
-          "anchor": "envelopes.get(s.servedTenantId ?? null)?.deviceIdentityColumnsPresent",
-          "replace": "response?.deviceIdentityColumnsPresent",
+          "anchor": "const rowColumnsPresent = envelopes.get(\n                      s.servedTenantId ?? null,\n                    )?.deviceIdentityColumnsPresent;",
+          "replace": "const rowColumnsPresent = response?.deviceIdentityColumnsPresent;",
           "expect_count": 1,
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'degraded flags off its OWN tenant'"
         }
@@ -1217,6 +1248,77 @@
           "replace": "tenants: undefined,",
           "expect_count": 1,
           "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t 'counts devices, not groups, and names the tenant count'"
+        }
+      ]
+    },
+    {
+      "id": "FleetSessionPicker.wiring:credential-notes-reread",
+      "kind": "vitest-it",
+      "test_file": "src/components/terminal/FleetSessionPicker.wiring.test.ts",
+      "mutants": [
+        {
+          "label": "fsp-wiring-credential-notes-reread-gone",
+          "file": "src/components/terminal/FleetSessionPicker.tsx",
+          "anchor": "    void refreshTenantCredentials();\n",
+          "replace": "",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t \"re-reads only the selector's credential notes\""
+        },
+        {
+          "label": "fsp-wiring-credential-notes-reread-while-loading",
+          "file": "src/components/terminal/FleetSessionPicker.tsx",
+          "anchor": "    if (loading || loadingMore) {\n      listReadInFlight.current = true;\n      return;\n    }\n",
+          "replace": "    listReadInFlight.current = true;\n",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t \"re-reads only the selector's credential notes\""
+        },
+        {
+          "label": "fsp-wiring-credential-notes-reread-skips-load-more",
+          "file": "src/components/terminal/FleetSessionPicker.tsx",
+          "anchor": "    if (loading || loadingMore) {\n",
+          "replace": "    if (loading) {\n",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t \"re-reads only the selector's credential notes\""
+        },
+        {
+          "label": "fsp-wiring-credential-notes-reread-on-first-snapshot",
+          "file": "src/components/terminal/FleetSessionPicker.tsx",
+          "anchor": "    if (!listReadInFlight.current) return;\n",
+          "replace": "",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t \"re-reads only the selector's credential notes\""
+        },
+        {
+          "label": "fsp-wiring-credential-notes-reread-every-render-after-first",
+          "file": "src/components/terminal/FleetSessionPicker.tsx",
+          "anchor": "    listReadInFlight.current = false;\n",
+          "replace": "",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t \"re-reads only the selector's credential notes\""
+        },
+        {
+          "label": "fsp-wiring-credential-notes-reread-single-tenant",
+          "file": "src/components/terminal/FleetSessionPicker.tsx",
+          "anchor": "    if (!showSwitcher) return;\n",
+          "replace": "",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t \"re-reads only the selector's credential notes\""
+        },
+        {
+          "label": "fsp-wiring-credential-notes-reread-loops-on-notes",
+          "file": "src/components/terminal/FleetSessionPicker.tsx",
+          "anchor": "  }, [loading, loadingMore, showSwitcher, refreshTenantCredentials]);",
+          "replace": "  }, [loading, loadingMore, showSwitcher, refreshTenantCredentials, tenantCredentials]);",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t \"re-reads only the selector's credential notes\""
+        },
+        {
+          "label": "fsp-wiring-credential-notes-full-refresh",
+          "file": "src/components/terminal/FleetSessionPicker.tsx",
+          "anchor": "    refreshCredentials: refreshTenantCredentials,\n",
+          "replace": "    refresh: refreshTenantCredentials,\n",
+          "expect_count": 1,
+          "rerun": "pnpm vitest run src/components/terminal/FleetSessionPicker.wiring.test.ts -t \"re-reads only the selector's credential notes\""
         }
       ]
     }

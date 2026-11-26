@@ -5,6 +5,8 @@
  * instead of embedding their own copies.
  */
 
+import { formatBytes } from "@/lib/formatting";
+
 /**
  * Project-specific log configuration (slim — references global sources)
  */
@@ -44,13 +46,21 @@ export interface LogSourceContent {
   /** Source name for display */
   sourceName: string;
 
-  /** The log lines */
+  /** The file's last lines, oldest first */
   lines: string[];
 
-  /** Total line count in the file */
-  totalLines: number;
+  /**
+   * The file's line count — known only when the read covered the whole file.
+   * `null` for a tail of a larger file: the runner reads at most a few MiB
+   * from a log's end and never counts the whole of it (a day log reaches
+   * 2.9 GB). `null` is "not counted", never zero.
+   */
+  totalLines: number | null;
 
-  /** File path that was read */
+  /** The file's size in bytes when it was read; `null` when it was not read */
+  fileBytes: number | null;
+
+  /** File path that was read (a dated rotation of the configured path, when that is absent) */
   filePath: string;
 
   /** Last modified time of the file */
@@ -58,6 +68,21 @@ export interface LogSourceContent {
 
   /** Any error that occurred while reading */
   error?: string;
+}
+
+/**
+ * The figure shown beside a log source's name: its line count when the read
+ * covered the whole file, otherwise the file's size. The runner reads only a
+ * bounded tail of a large log and never counts it, so the size stands in —
+ * the number of lines the tail happened to hold would understate the file.
+ * `null` when neither is known (the file was not read).
+ */
+export function sourceSizeLabel(
+  source: Pick<LogSourceContent, "totalLines" | "fileBytes">,
+): string | null {
+  if (source.totalLines != null) return `${source.totalLines} lines`;
+  if (source.fileBytes != null) return formatBytes(source.fileBytes);
+  return null;
 }
 
 /**

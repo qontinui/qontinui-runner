@@ -106,7 +106,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 /// Wall-clock bound on ALL the `git` spawns one probe runs, together. The
-/// same 5 s class as `provision_guard::PROBE_BUDGET`: generous for a few local
+/// same 5 s class as `provision_guard::PROBE_TIMEOUT`: generous for a few local
 /// reads, tight for a spawn an operator is waiting on.
 pub(crate) const PROBE_BUDGET: Duration = Duration::from_secs(5);
 
@@ -403,10 +403,13 @@ pub(crate) struct PassSummary {
 pub(crate) struct Provisioned {
     commands: Probe<PassSummary>,
     skills: Probe<PassSummary>,
+    /// The agent-definitions pass (ledger capability `agent_definitions`). It
+    /// alone can skip a unit as `operator-authored` or `served-in-place`.
+    agents: Probe<PassSummary>,
 }
 
 impl Provisioned {
-    /// `commands written=<w>/<e> skipped-<reason>=<n>… as-of=<ts>; skills …`.
+    /// `commands written=<w>/<e> skipped-<reason>=<n>… as-of=<ts>; skills …; agents …`.
     fn render(&self) -> String {
         let one = |label: &str, p: &Probe<PassSummary>| match p {
             Probe::Measured(s) => {
@@ -420,9 +423,10 @@ impl Provisioned {
             Probe::Unknown(r) => format!("{label} {}", unknown_text(r)),
         };
         format!(
-            "{}; {}",
+            "{}; {}; {}",
             one("commands", &self.commands),
-            one("skills", &self.skills)
+            one("skills", &self.skills),
+            one("agents", &self.agents)
         )
     }
 }
@@ -468,6 +472,7 @@ fn provisioned_for(workdir: &Path) -> Probe<Provisioned> {
     Probe::Measured(Provisioned {
         commands: latest("fleet_commands"),
         skills: latest("fleet_skills"),
+        agents: latest("agent_definitions"),
     })
 }
 
@@ -1709,11 +1714,13 @@ impl<'a> Git<'a> {
         // ONE absolute deadline, process creation included: the clock does
         // not wait for `spawn()` to return (plan
         // `2026-10-19-served-corpus-probe-budget-excludes-process-creation`).
-        use crate::process_deadline::{DeadlineOutcome, NotStarted};
+        use crate::process_deadline::{DeadlineOutcome, DeadlineRun, NotStarted};
         let span = tracing::debug_span!(
             "served_corpus.git_run",
             spawn_ms = tracing::field::Empty,
-            outcome = tracing::field::Empty
+            outcome = tracing::field::Empty,
+            killed_pid = tracing::field::Empty,
+            reaped = tracing::field::Empty
         )
         .entered();
         let result =
@@ -1728,6 +1735,17 @@ impl<'a> Git<'a> {
             },
         };
         span.record("outcome", outcome);
+        // A killed git: its pid, and whether it exited inside the kill grace.
+        // `reaped=false` means it was PARKED for the detached-child reaper
+        // rather than waited on, so this is the pid to look for there.
+        if let Ok(DeadlineRun {
+            outcome: DeadlineOutcome::TimedOut { pid, reaped },
+            ..
+        }) = &result
+        {
+            span.record("killed_pid", *pid);
+            span.record("reaped", *reaped);
+        }
         if let Some(d) = result.as_ref().ok().and_then(|r| r.spawn_elapsed) {
             span.record("spawn_ms", u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
             #[cfg(test)]
@@ -2009,6 +2027,10 @@ mod tests {
                 "; skills written=0/{s_n} skipped-git-tracked={s_n} as-of="
             )),
             "{line}"
+        );
+        assert!(
+            line.contains("; agents UNKNOWN (no pass recorded)"),
+            "an agent-definitions pass nobody recorded is UNKNOWN, not absent: {line}"
         );
         assert_eq!(
             c_n + s_n,

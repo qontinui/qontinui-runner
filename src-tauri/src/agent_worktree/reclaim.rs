@@ -623,7 +623,7 @@ pub(super) fn remove_worktree(path: &Path) -> Result<(), String> {
 ///
 /// Best-effort by construction: every failure is expected traffic (non-empty,
 /// already gone, or held), so nothing here can fail a reclaim.
-fn prune_empty_session_parent(worktree: &Path) {
+pub(super) fn prune_empty_session_parent(worktree: &Path) {
     let Some(parent) = worktree.parent() else {
         return;
     };

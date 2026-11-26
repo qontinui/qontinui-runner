@@ -53,9 +53,13 @@ use super::types::ApiState;
 /// WS-only wrappers (which expose no HTTP server) need an entry there too.
 /// The scheme makes WS-only entries unambiguous in logs and prevents
 /// collision with real HTTP `/sdk/connect` URLs.
-fn ws_synthetic_url(app_id: &str) -> String {
-    format!("ws-app://{}", app_id)
+pub(crate) fn ws_synthetic_url(app_id: &str) -> String {
+    format!("{WS_SYNTHETIC_URL_PREFIX}{app_id}")
 }
+
+/// The prefix of every [`ws_synthetic_url`]: an active connection whose URL
+/// starts with it is a WebSocket app, whose origin is not in its URL.
+pub(crate) const WS_SYNTHETIC_URL_PREFIX: &str = "ws-app://";
 
 /// Mirror the WS-registered app into `sdk_connection` so `try_ws_dispatch`
 /// can resolve `app_id` from `active_connection()`. Returns the previous
@@ -90,11 +94,12 @@ async fn install_ws_sdk_connection(
         app_url: synthetic_url.clone(),
         base_path: String::new(),
         app_info,
-        client: reqwest::Client::new(),
+        client: crate::mcp::sdk_http::SdkHttpClient::unsigned(reqwest::Client::new()),
         connected_at: chrono::Utc::now().timestamp_millis(),
         transport_kind: None,
         physical_device_id: None,
         activated_by: (!principal.is_operator_trust()).then(|| principal.clone()),
+        bearer: crate::mcp::sdk_client::ConnectionBearer::Absent,
     };
     // The liveness of the CURRENT active connection is read before the manager
     // lock is taken, so the two locks are never held together. A `ws-app://`
@@ -188,6 +193,18 @@ pub enum WsOutboundError {
     NotConnected,
     /// The mpsc send failed (receiver dropped). Treated the same as
     /// `NotConnected` by callers but kept distinct for logging.
+    Send,
+}
+
+/// Why [`WsConnectionManager::send_text_if_current`] delivered nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinnedSendError {
+    /// `app_id` holds no routing slot, or the pinned connection is gone.
+    NotConnected,
+    /// `app_id`'s routing slot belongs to `current`, not to the pinned
+    /// connection: a newer connection replaced it (last-tab-wins).
+    Displaced { current: u64 },
+    /// The pinned connection's outbound channel is closed.
     Send,
 }
 
@@ -311,6 +328,50 @@ impl WsConnectionManager {
                 .ok_or(WsOutboundError::NotConnected)?
         };
         sender.send(text).await.map_err(|_| WsOutboundError::Send)
+    }
+
+    /// Send a text frame to `conn_id` ONLY while it still holds `app_id`'s
+    /// routing slot.
+    ///
+    /// The slot check and the enqueue happen under ONE inner-lock
+    /// acquisition, so no register can move the slot between them — unlike
+    /// [`Self::conn_for_app`] followed by [`Self::send_text`], which take the
+    /// lock twice. A caller that read a property of a specific connection
+    /// (its advertised capabilities) uses this so the frame can only ever
+    /// reach that connection.
+    ///
+    /// The enqueue under the lock is a `try_send`, so the lock is never held
+    /// across a wait. Only when the channel is FULL does the send continue
+    /// outside the lock, on the same connection's own sender: the slot check
+    /// already passed, and that sender delivers to no other connection, so a
+    /// replacement that lands during that wait still cannot receive the frame
+    /// (the displacement path rejects the caller's pending command instead).
+    pub async fn send_text_if_current(
+        &self,
+        app_id: &str,
+        conn_id: u64,
+        text: String,
+    ) -> Result<(), PinnedSendError> {
+        let (sender, text) = {
+            let inner = self.inner.lock().await;
+            match inner.by_app.get(app_id) {
+                None => return Err(PinnedSendError::NotConnected),
+                Some(&current) if current != conn_id => {
+                    return Err(PinnedSendError::Displaced { current })
+                }
+                Some(_) => {}
+            }
+            let entry = inner
+                .by_conn
+                .get(&conn_id)
+                .ok_or(PinnedSendError::NotConnected)?;
+            match entry.outbound.try_send(text) {
+                Ok(()) => return Ok(()),
+                Err(mpsc::error::TrySendError::Closed(_)) => return Err(PinnedSendError::Send),
+                Err(mpsc::error::TrySendError::Full(text)) => (entry.outbound.clone(), text),
+            }
+        };
+        sender.send(text).await.map_err(|_| PinnedSendError::Send)
     }
 
     /// Test helper: register a fake outbound channel so unit tests can
@@ -453,7 +514,7 @@ async fn drive_connection(
         Ok(r) => r,
         Err(reason) => {
             warn!("[ws-relay] rejected handshake: {}", reason);
-            let _ = sink.send(Message::Close(None)).await;
+            close_gracefully(sink, &mut stream).await;
             return;
         }
     };
@@ -464,7 +525,7 @@ async fn drive_connection(
                 "[ws-relay] rejected handshake: transport '{}' != 'websocket'",
                 declared
             );
-            let _ = sink.send(Message::Close(None)).await;
+            close_gracefully(sink, &mut stream).await;
             return;
         }
     }
@@ -755,14 +816,30 @@ async fn refuse_handshake(
     if let Ok(frame) = serde_json::to_string(&refusal.ws_ack()) {
         let _ = sink.send(Message::Text(frame.into())).await;
     }
-    let _ = sink.send(Message::Close(None)).await;
-    // Finish the close handshake before dropping the socket. Dropping it the
-    // instant our Close is queued closes the TCP socket while the peer's own
-    // Close reply (or any frame it already sent) is still unread; on Windows
-    // that sends an RST, and the peer's stack discards its receive buffer --
-    // including the refusal ack we just wrote. Bounded, so a peer that never
-    // answers cannot hold the task.
-    let _ = tokio::time::timeout(Duration::from_secs(1), async {
+    close_gracefully(sink, stream).await;
+}
+
+/// Bound on how long a refusing close waits for the peer's Close reply.
+const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Send our Close and finish the close handshake before dropping the socket.
+///
+/// Dropping it the instant our Close is queued closes the TCP socket while the
+/// peer's own Close reply (or any frame it already sent) is still unread; on
+/// Windows that sends an RST, and the peer's stack discards its receive buffer
+/// -- including any refusal ack written just before. Every pre-registration
+/// refusal goes through here so none of them turns a clean close into a
+/// `ConnectionReset`. The send AND the drain are bounded together by
+/// [`CLOSE_DRAIN_TIMEOUT`], so a peer that never answers, or has stopped
+/// reading, cannot hold the task. A stream that has already ended (the peer
+/// closed first) returns at once; when the peer's Close arrived first, the
+/// drain's poll is what flushes the auto-queued Close reply.
+async fn close_gracefully(
+    mut sink: futures_util::stream::SplitSink<WebSocket, Message>,
+    stream: &mut futures_util::stream::SplitStream<WebSocket>,
+) {
+    let _ = tokio::time::timeout(CLOSE_DRAIN_TIMEOUT, async {
+        let _ = sink.send(Message::Close(None)).await;
         while let Some(Ok(msg)) = stream.next().await {
             if matches!(msg, Message::Close(_)) {
                 break;
@@ -884,14 +961,27 @@ async fn handle_inbound_text(
         }
         Ok(InboundFrame::ChangeEvent { event }) => {
             // Phase 1: log and discard. Phase 2 will wire this into the
-            // existing change-event subscriber machinery.
-            debug!("[ws-relay] changeEvent from '{}': {:?}", app_id, event);
+            // existing change-event subscriber machinery. The event is app
+            // content, so it can carry what a condition check just typed: a
+            // held condition-check secret is scrubbed from the line.
+            debug!(
+                "[ws-relay] changeEvent from '{}': {}",
+                app_id,
+                crate::condition_secrets::debug_scrubbed(&event)
+            );
         }
         Ok(InboundFrame::Other) => {
             debug!("[ws-relay] ignoring unknown frame type from '{}'", app_id);
         }
         Err(e) => {
-            warn!("[ws-relay] invalid inbound frame from '{}': {}", app_id, e);
+            // serde's error for a mistyped field quotes the value it could not
+            // read, and that value can be a condition-check secret the app
+            // echoes: scrub it before it is logged or settles a command.
+            let detail = crate::condition_secrets::scrub_text(&e.to_string()).into_owned();
+            warn!(
+                "[ws-relay] invalid inbound frame from '{}': {}",
+                app_id, detail
+            );
             // A response frame that names its command still ANSWERS it, even
             // when another field is unreadable: settle that command now
             // instead of leaving it to the 30 s timeout, which would report an
@@ -900,7 +990,7 @@ async fn handle_inbound_text(
             // the app's own failure, since what the app reported is unknown.
             if let Some(command_id) = unreadable_response_command_id(text) {
                 let outcome = relay
-                    .resolve_unreadable(conn_id, mode, &command_id, e.to_string())
+                    .resolve_unreadable(conn_id, mode, &command_id, detail)
                     .await;
                 meter_resolve_outcome(app_id, mode, principal, binding, &command_id, outcome);
             }
@@ -1007,6 +1097,70 @@ mod tests {
         let app_id = m.remove(c2).await;
         assert_eq!(app_id.as_deref(), Some("app"));
         assert_eq!(m.conn_for_app("app").await, None);
+    }
+
+    /// A pinned send reaches only the connection it names, and only while
+    /// that connection holds the app's routing slot: a replaced connection
+    /// and its replacement both receive nothing.
+    #[tokio::test]
+    async fn send_text_if_current_sends_nothing_to_a_mismatched_conn() {
+        let m = WsConnectionManager::new();
+        let (old, mut old_rx) = m.test_register("app").await;
+        let (new, mut new_rx) = m.test_register("app").await;
+
+        let err = m
+            .send_text_if_current("app", old, "stale".into())
+            .await
+            .unwrap_err();
+        assert_eq!(err, PinnedSendError::Displaced { current: new });
+        assert!(old_rx.try_recv().is_err(), "the replaced conn got a frame");
+        assert!(new_rx.try_recv().is_err(), "the replacement got a frame");
+
+        assert_eq!(
+            m.send_text_if_current("other", old, "x".into()).await,
+            Err(PinnedSendError::NotConnected)
+        );
+
+        m.send_text_if_current("app", new, "current".into())
+            .await
+            .expect("the current conn is sent to");
+        assert_eq!(new_rx.try_recv().unwrap(), "current");
+        assert!(old_rx.try_recv().is_err());
+    }
+
+    /// A full channel does not lose the frame: it is delivered to the pinned
+    /// connection once room frees up.
+    #[tokio::test]
+    async fn send_text_if_current_waits_on_a_full_channel() {
+        let m = WsConnectionManager::new();
+        let (conn, mut rx) = m.test_register("app").await;
+        for i in 0..16 {
+            m.send_text_if_current("app", conn, format!("{i}"))
+                .await
+                .unwrap();
+        }
+        let m2 = m.clone();
+        let pending =
+            tokio::spawn(async move { m2.send_text_if_current("app", conn, "last".into()).await });
+        // Yield BEFORE draining so the spawned send runs while the channel is
+        // full: on this single-threaded runtime the yields hand it the thread,
+        // and it then takes the `TrySendError::Full` arm. Draining first would
+        // let it take the `try_send` Ok path instead. The two assertions below
+        // show it has not completed or enqueued; they cannot by themselves
+        // prove it was polled.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !pending.is_finished(),
+            "the 17th send must wait on the full channel"
+        );
+        assert_eq!(rx.len(), 16, "the parked send must not have enqueued yet");
+        for i in 0..16 {
+            assert_eq!(rx.recv().await.unwrap(), format!("{i}"));
+        }
+        pending.await.unwrap().expect("sent once room freed");
+        assert_eq!(rx.recv().await.unwrap(), "last");
     }
 
     #[tokio::test]
@@ -1280,5 +1434,109 @@ mod tests {
         ] {
             assert_eq!(unreadable_response_command_id(text), None, "{text}");
         }
+    }
+
+    /// A change event is app content, so it can carry what a condition check
+    /// just typed (plan
+    /// 2026-11-06-a-regression-test-run-is-judged-by-what-it-covered-and-a-silent-run-reads-unknown
+    /// Phase 13). Fed through the REAL inbound parser while a session holds a
+    /// secret, its debug line carries the mask, never the value.
+    #[tokio::test]
+    async fn condition_secrets_a_change_event_debug_line_never_carries_a_held_value() {
+        const SECRET: &str = "relay-change-event-secret-Rl1";
+        let held = serde_json::from_value(serde_json::json!({ "cs-relay-pw": SECRET }))
+            .expect("a secrets map");
+        let _held = crate::condition_secrets::register(
+            "run-relay-change-event",
+            "http://localhost:3001",
+            &held,
+        )
+        .expect("held");
+        let logs = crate::condition_secrets::test_support::LogCapture::start();
+        let ws = WsConnectionManager::new();
+        let (conn_id, _outbound_rx) = ws.test_register("wrapper").await;
+        let relay = CommandRelay::with_timeout(ws.clone(), RELAY_TIMEOUT);
+        let frame = serde_json::json!({
+            "type": "changeEvent",
+            "event": {"kind": "input", "elementId": "password-field", "value": SECRET},
+        });
+
+        handle_inbound_text(
+            "wrapper",
+            conn_id,
+            BindingMode::Enforce,
+            &Principal::OperatorTrust {
+                class: crate::mcp::origin_guard::OriginClass::NonBrowser,
+            },
+            &RelayBinding::new(BindingConfig::default()),
+            &relay,
+            &frame.to_string(),
+        )
+        .await;
+
+        let lines = logs.text();
+        assert!(
+            lines.contains("changeEvent from 'wrapper'"),
+            "anti-vacuity: the change event was logged: {lines}"
+        );
+        assert!(
+            lines.contains(crate::condition_secrets::REDACTED) && !lines.contains("cs-relay-pw"),
+            "{lines}"
+        );
+        assert!(
+            !lines.contains(SECRET),
+            "a log line carries the held value: {lines}"
+        );
+    }
+
+    /// serde's error for a mistyped field quotes the value it could not read,
+    /// so an app that echoes a condition-check secret into such a field would
+    /// put it in the relay's warning, and in the detail that settles the
+    /// command. Fed through the REAL inbound parser while a session holds the
+    /// secret, the warning carries the mask, never the value.
+    #[tokio::test]
+    async fn condition_secrets_an_invalid_frame_warning_never_carries_a_held_value() {
+        const SECRET: &str = "relay-invalid-frame-secret-Rl2";
+        let held = serde_json::from_value(serde_json::json!({ "cs-relay-bad": SECRET }))
+            .expect("a secrets map");
+        let _held = crate::condition_secrets::register(
+            "run-relay-invalid-frame",
+            "http://localhost:3001",
+            &held,
+        )
+        .expect("held");
+        let logs = crate::condition_secrets::test_support::LogCapture::start();
+        let ws = WsConnectionManager::new();
+        let (conn_id, _outbound_rx) = ws.test_register("wrapper").await;
+        let relay = CommandRelay::with_timeout(ws.clone(), RELAY_TIMEOUT);
+        let frame = serde_json::json!({
+            "type": "response",
+            "commandId": "c-invalid-1",
+            "success": SECRET,
+        });
+
+        handle_inbound_text(
+            "wrapper",
+            conn_id,
+            BindingMode::Enforce,
+            &Principal::OperatorTrust {
+                class: crate::mcp::origin_guard::OriginClass::NonBrowser,
+            },
+            &RelayBinding::new(BindingConfig::default()),
+            &relay,
+            &frame.to_string(),
+        )
+        .await;
+
+        let lines = logs.text();
+        assert!(
+            lines.contains("invalid inbound frame from 'wrapper'")
+                && lines.contains(crate::condition_secrets::REDACTED),
+            "anti-vacuity: the frame was refused and its quoted value masked: {lines}"
+        );
+        assert!(
+            !lines.contains(SECRET),
+            "a log line carries the held value: {lines}"
+        );
     }
 }

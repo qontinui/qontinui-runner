@@ -35,12 +35,25 @@
 //! # How the list was derived
 //!
 //! Not from what looks safe — from what real clients measurably call over
-//! THIS arm. There is exactly one sender: qontinui-web's
-//! `/api/v1/device-bridge/runner-proxy/{path:path}` route
-//! (`backend/app/api/v1/endpoints/device_bridge_ws.py`), which takes the
-//! relay arm when the request carries an `X-Qontinui-Device-Id` header and
-//! forwards the caller's method and path VERBATIM. Its callers, measured
-//! 2026-09-12:
+//! THIS arm. Two qontinui-web paths send it:
+//!
+//! 1. The `/api/v1/device-bridge/runner-proxy/{path:path}` route
+//!    (`backend/app/api/v1/endpoints/device_bridge_ws.py`), which takes the
+//!    relay arm when the request carries an `X-Qontinui-Device-Id` header and
+//!    forwards the caller's method and path VERBATIM.
+//! 2. The saved-session-lists capture behind `POST /api/v1/saved-session-lists`
+//!    (plan `2026-11-08-save-per-tab-runner-session-lists-on-sessions-page-kept-14-days`,
+//!    Phase 2). It goes through `backend/app/services/runner_relay.py`, the
+//!    relay core that phase extracts from the proxy route's
+//!    `_runner_proxy_relay`, so both senders share one implementation. It
+//!    sends exactly one fixed frame, `GET /terminal-layout`, server-side; no
+//!    caller chooses its method or path. That is its INTENDED caller, not its
+//!    only one: sender 1's relay arm can send the same frame for a device
+//!    owner, and the relayed response is redacted the same way whichever
+//!    sender asked. (Sender 1's co-located admin arm never reaches this
+//!    policy: it calls the loopback API directly, as a local caller.)
+//!
+//! The proxy route's callers, measured 2026-09-12:
 //!
 //! * **qontinui-mobile in remote (proxy) mode.** Round 3's note that mobile
 //!   drives terminals over the TYPED `remote_terminal_*` frames is correct,
@@ -68,15 +81,16 @@
 //!   `fetchRunnerComponents` (`GET /ui-bridge/control/components`, through
 //!   `runnerProxyGet`) and `fetchRunnerPageHealth`
 //!   (`POST /ui-bridge/control/page-health`, through `runnerProxyPost`, the
-//!   POST twin beside `runnerProxyGet` in the same `runner-relay.ts`), the two
-//!   entries listed for it; and `fetchRunnerVisibility`
-//!   (`POST /ui-bridge/control/visibility`, the occlusion sweep), which this
-//!   arm also answers 403. The dashboard renders that 403 as a labelled
-//!   UNKNOWN, and `the_dashboard_reads_open_nothing_beside_them` pins the
-//!   refusal. The "Two web calls" paragraph below says why `GET /apps` and
-//!   the sweep are refused.
+//!   POST twin beside `runnerProxyGet` in the same `runner-relay.ts`); and
+//!   `fetchRunnerVisibility` (`POST /ui-bridge/control/visibility`, the
+//!   occlusion sweep, through `runnerProxyPost`), the three entries listed for
+//!   it. A runner build that predates an entry answers its call 403, which
+//!   the dashboard renders as a labelled UNKNOWN. The "One web call"
+//!   paragraph below says why `GET /apps` is refused.
 //!
-//! Nothing else in the workspace sends an `http_request` frame.
+//! Nothing else in the workspace sends an `http_request` frame: the proxy
+//! route with these callers, and the saved-session-lists capture with its one
+//! read, are the whole sender set.
 //!
 //! Three client calls are deliberately NOT listed, because the runner
 //! registers no such route and they 404 today: mobile's `/ai/analyze`,
@@ -87,34 +101,24 @@
 //! this module's own registration tripwire, and refusing a 404 with a 403
 //! changes nothing a client can observe. Add the entry WITH the route.
 //!
-//! Two web calls to routes the runner DOES register are refused as well, each
-//! for a reason of its own:
+//! One web call to a route the runner DOES register is refused as well:
 //!
 //! * `GET /apps` (`useRunnerApps`) answers with whole `App` records
 //!   (`qontinui_types::apps::App`): each registered app's `repo_root` and
 //!   `ui_bridge_url`, and its `build_command` and `start_command`. Phase 6
-//!   was briefed to add the two dashboard entries above, and the plan's app
+//!   was briefed to add the first two dashboard entries above, and the plan's app
 //!   registry is the web's own `/api/v1/fleet/apps`, which needs no relay. So
 //!   opening `GET /apps` was not Phase 6's decision to make.
 //!   qontinui-runner#2178 (plan `2026-10-12-digital-twin-runner-panels-end-to-end`)
 //!   proposes the entry, together with its reasoning about that exposure.
-//! * `POST /ui-bridge/control/visibility` (`fetchRunnerVisibility`, the
-//!   occlusion sweep) was also outside Phase 6's brief, and it is not ready to
-//!   list. Its report quotes webview text, as page health's findings do: each
-//!   occlusion entry carries the covered element's label and text
-//!   (`screenshots::occlusion_entry`). Before it can be listed, it needs the
-//!   two things page health's entry came with. The first is an end-to-end
-//!   review of `screenshots::ui_bridge_visibility_handler` that establishes
-//!   it is read-only and bounded. The second is an arm in
-//!   `backend_relay::http_request_egress_refusal` that gives it the
-//!   snapshot's and page health's gate (terminal stream, strictest bound
-//!   tenant, refuse). The sweep is also the only route that serves
-//!   `occlusionDataObserved`: page health's report has no occlusion field. So
-//!   until this entry lands, the occlusion row that the plan's Phase 6 asks
-//!   the dashboard for reads UNKNOWN on every runner.
 //!
-//! `the_web_calls_the_docs_name_as_refused_stay_refused` pins both refusals,
-//! so an entry that opens either one fails that test until this paragraph and
+//! The occlusion sweep was refused here until its entry landed, after an
+//! end-to-end review of `screenshots::ui_bridge_visibility_handler` and an
+//! egress arm (coord finding `99796499`); its entry says what the review
+//! established.
+//!
+//! `the_web_calls_the_docs_name_as_refused_stay_refused` pins the refusal, so
+//! an entry that opens `GET /apps` fails that test until this paragraph and
 //! the bullet above are updated with it.
 //!
 //! # What a relayed request looks like to the local API
@@ -125,9 +129,11 @@
 //! own: [`RELAYED_REQUEST_HEADER`]. It is inserted after the frame's headers are
 //! copied, so every relayed request carries it and no frame can strip or
 //! replace it. A handler that must answer a REMOTE caller more narrowly
-//! than a local one reads it through [`is_relayed_request`]. One does today:
+//! than a local one reads it through [`is_relayed_request`]. Two do today:
 //! the component read (`ui_bridge::elements::ComponentSources`), which keeps
-//! a relayed read to the runner's own registry.
+//! a relayed read to the runner's own registry, and the occlusion sweep
+//! (`ui_bridge::screenshots::disclose_occlusion_text`), which drops every
+//! occlusion entry's ids, label and text from a relayed report.
 //!
 //! # The drift tripwire
 //!
@@ -221,6 +227,41 @@ pub const RELAY_ALLOWED: &[(&str, &str)] = &[
     // findings quote webview text, so its response takes the snapshot's
     // egress gate (`backend_relay::http_request_egress_refusal`).
     ("POST", "/ui-bridge/control/page-health"),
+    // `fetchRunnerVisibility` (through `runnerProxyPost`), the dashboard's
+    // occlusion row and the only route that serves `occlusionDataObserved`.
+    // Reviewed end to end (coord finding `99796499`): it changes no settings,
+    // sessions, files or app state. It range-checks `minRatio` to [0, 1]
+    // before any IPC, then sends the runner's own webview two IPCs
+    // concurrently, both through the UI Bridge IPC layer's semaphore and
+    // timeout: one `discover` with a constant payload (the same cache
+    // rebuild side effect as page health's), and one `get_modal_context`,
+    // which only reads the bridge registry's modal stack
+    // (`useDiscoveryEvents.ts` `readModalContext`). The analysis is one pass
+    // over the discovered elements. A RELAYED report names and quotes nothing
+    // from the webview: `screenshots::disclose_occlusion_text`, keyed on
+    // [`RELAYED_REQUEST_HEADER`], drops each entry's `label` and `text` and
+    // its `element` and `occludedBy` ids (the SDK commonly slugifies an
+    // element's label or heading text into its id), and says
+    // `occlusionText: "withheld"`. As defence in depth the response still
+    // takes the snapshot's egress gate
+    // (`backend_relay::http_request_egress_refusal`).
+    ("POST", "/ui-bridge/control/visibility"),
+    // -- qontinui-web: saved session lists (`/sessions`) -----------------
+    // The capture service, `backend/app/services/runner_relay.py` (called by
+    // `POST /api/v1/saved-session-lists`), relays this one read server-side
+    // and keeps the body as a saved tab list for 14 days (plan
+    // `2026-11-08-save-per-tab-runner-session-lists-on-sessions-page-kept-14-days`;
+    // the security-surface decision is coord finding `0cc656c7`). It is
+    // `mcp::terminal_layout`, a read that changes nothing: the tab labels the
+    // webview registered, and per terminal its ids, account, names, zone and
+    // finished marker. Each row's `title` is set by the program in the
+    // terminal (OSC 0/2), so the response takes a per-row egress gate:
+    // `backend_relay::redact_relay_content` withholds a row's title when its
+    // session's tenant has terminal streaming off. Every other method on the
+    // path stays refused, and so does every `mcp::terminals` route,
+    // `/terminal-pages` included: the labels are written only by a Tauri
+    // command, never over HTTP.
+    ("GET", "/terminal-layout"),
     // -- mobile: task runs, chat, workflow control ---------------------
     ("GET", "/task-runs"),
     ("GET", "/task-runs/running"),
@@ -709,6 +750,7 @@ pub(crate) mod tests {
             ("GET", "/apps/qontinui-web/spec/graph"),
             ("GET", "/ui-bridge/control/snapshot"),
             ("POST", "/prompt-home/plan"),
+            ("GET", "/terminal-layout"),
             ("GET", "/task-runs"),
             ("GET", "/task-runs/running"),
             ("GET", "/task-runs/abc-123"),
@@ -769,7 +811,7 @@ pub(crate) mod tests {
     }
 
     // ------------------------------------------------------------------
-    // The UI Bridge dashboard's two reads (plan
+    // The UI Bridge dashboard's three reads (plan
     // 2026-10-23-console-presentation-spaces, Phase 6): each allowance is as
     // wide as its one client call, and no wider
     // ------------------------------------------------------------------
@@ -799,6 +841,42 @@ pub(crate) mod tests {
                     relay_path_verdict(method, path),
                     RelayPathVerdict::NotAllowed,
                     "{method} {path}: the component allowance is a read only"
+                );
+            }
+        }
+    }
+
+    /// Spellings of the occlusion sweep's path that normalise to it. Shared
+    /// with `backend_relay`'s egress test, which refuses each one, so the
+    /// allow-list and the egress gate are pinned to the same set.
+    pub(crate) const VISIBILITY_SPELLINGS: &[&str] = &[
+        "/ui-bridge/control/visibility",
+        "ui-bridge/control/visibility",
+        "/UI-Bridge/Control/Visibility",
+        "/ui-bridge/control/visibilit%79",
+        "/ui-bridge/./control//visibility/",
+        "\\ui-bridge\\control\\visibility",
+        "/ui-bridge/control/visibility?minRatio=0.5#top",
+    ];
+
+    /// `fetchRunnerVisibility`: the occlusion sweep relays as a POST, the
+    /// method its route is registered with, in every spelling that normalises
+    /// to it, and under no other method.
+    #[test]
+    fn the_dashboard_occlusion_sweep_relays_as_a_post_only() {
+        for path in VISIBILITY_SPELLINGS {
+            for method in ["POST", "post"] {
+                assert_eq!(
+                    relay_path_verdict(method, path),
+                    RelayPathVerdict::Allow,
+                    "{method} {path} is the dashboard's occlusion sweep"
+                );
+            }
+            for method in ["GET", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] {
+                assert_eq!(
+                    relay_path_verdict(method, path),
+                    RelayPathVerdict::NotAllowed,
+                    "{method} {path}: the sweep is allowed as the POST it is registered as"
                 );
             }
         }
@@ -834,10 +912,11 @@ pub(crate) mod tests {
         }
     }
 
-    /// Nothing beside the two dashboard reads opens with them: a path one
+    /// Nothing beside the three dashboard reads opens with them: a path one
     /// segment deeper, the singular component routes and the action
     /// invocation the component read advertises, page health's siblings
-    /// (`/control/health`, `/control/visibility`, `/control/discover`,
+    /// (`/control/health`, `/control/discover`, a path below
+    /// `/control/visibility`,
     /// `/control/page/*`), and re-cased or percent-encoded spellings that
     /// normalise to any of those. Traversal out of an allowed path is refused
     /// as malformed, never resolved into the route it names.
@@ -854,7 +933,7 @@ pub(crate) mod tests {
             "/ui-bridge/control/page-health/x1",
             "/ui-bridge/control/health",
             "/ui-bridge/control/health-signals",
-            "/ui-bridge/control/visibility",
+            "/ui-bridge/control/visibility/x1",
             "/ui-bridge/control/discover",
             "/ui-bridge/control/elements",
             "/ui-bridge/control/page",
@@ -891,24 +970,106 @@ pub(crate) mod tests {
         }
     }
 
-    /// The module docs name two web calls to REGISTERED routes that this arm
-    /// refuses, and say why: `useRunnerApps`'s `GET /apps`, and the
-    /// dashboard's occlusion sweep, `POST /ui-bridge/control/visibility`. This
-    /// pins both, so the prose cannot outlive the fact it states. An entry that
-    /// opens either one turns it red, including an entry a rebase carries in
-    /// (qontinui-runner#2178 proposes one for `GET /apps`). Whoever adds such an
-    /// entry updates the docs' qontinui-web bullet and their "Two web calls"
-    /// paragraph together with this list. For the sweep, that paragraph also
-    /// names the review and the egress arm its entry needs first.
+    // ------------------------------------------------------------------
+    // The saved-session-lists read (plan
+    // 2026-11-08-save-per-tab-runner-session-lists-on-sessions-page-kept-14-days,
+    // Phase 1): one GET of the layout, and nothing else of the terminal
+    // surface
+    // ------------------------------------------------------------------
+
+    /// `GET /terminal-layout` relays as a GET in every spelling that
+    /// normalises to it, and under no other method.
+    #[test]
+    fn the_saved_session_list_read_relays_as_a_get_only() {
+        for path in [
+            "/terminal-layout",
+            "terminal-layout",
+            "//terminal-layout",
+            "/Terminal-Layout",
+            "/TERMINAL-LAYOUT",
+            "/terminal%2Dlayout",
+            "\\terminal-layout",
+            "/./terminal-layout/",
+            "/terminal-layout?x=1#top",
+        ] {
+            for method in ["GET", "get"] {
+                assert_eq!(
+                    relay_path_verdict(method, path),
+                    RelayPathVerdict::Allow,
+                    "{method} {path} is the saved-session-lists capture's read"
+                );
+            }
+            for method in ["POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE"] {
+                assert_eq!(
+                    relay_path_verdict(method, path),
+                    RelayPathVerdict::NotAllowed,
+                    "{method} {path}: the layout allowance is a read only"
+                );
+            }
+        }
+    }
+
+    /// The layout allowance opens nothing beside it: no path one segment
+    /// deeper, no near-miss spelling, and `/terminal-pages` under NO method —
+    /// the page roster stays closed, and the tab labels have no HTTP writer at
+    /// all. Traversal out of the allowed path is refused as malformed, never
+    /// resolved into the route it names.
+    #[test]
+    fn the_saved_session_list_read_opens_nothing_beside_it() {
+        for path in [
+            "/terminal-layout/x1",
+            "/terminal-layout/labels",
+            "/terminal-layout%2Fx1",
+            "/terminal-layouts",
+            "/terminal-layout-x",
+            "/terminal",
+            "/terminal-pages",
+            "terminal-pages",
+            "/Terminal-Pages",
+            "/terminal%2Dpages",
+            "/terminal-pages/x1",
+            "/terminal-pages?x=1",
+        ] {
+            for method in [
+                "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE",
+            ] {
+                assert_eq!(
+                    relay_path_verdict(method, path),
+                    RelayPathVerdict::NotAllowed,
+                    "{method} {path} must not be relayable"
+                );
+            }
+        }
+        for path in [
+            "/terminal-layout/../terminal-pages",
+            "/terminal-layout/%2e%2e/terminals",
+        ] {
+            for method in ["GET", "POST"] {
+                assert_eq!(
+                    relay_path_verdict(method, path),
+                    RelayPathVerdict::Malformed,
+                    "{method} {path}: traversal is refused, never resolved"
+                );
+            }
+        }
+    }
+
+    /// The module docs name one web call to a REGISTERED route that this arm
+    /// refuses, and say why: `useRunnerApps`'s `GET /apps`. This pins it, so
+    /// the prose cannot outlive the fact it states. An entry that opens it
+    /// turns this red, including an entry a rebase carries in
+    /// (qontinui-runner#2178 proposes one). Whoever adds such an entry updates
+    /// the docs' qontinui-web bullet and their "One web call" paragraph
+    /// together with this list.
     #[test]
     fn the_web_calls_the_docs_name_as_refused_stay_refused() {
-        for (method, path) in [("GET", "/apps"), ("POST", "/ui-bridge/control/visibility")] {
+        for (method, path) in [("GET", "/apps")] {
             assert_eq!(
                 relay_path_verdict(method, path),
                 RelayPathVerdict::NotAllowed,
                 "{method} {path} is relayable now, so the module docs that call it \
-                 refused are wrong: update the qontinui-web bullet and the \"Two web \
-                 calls\" paragraph, then this list"
+                 refused are wrong: update the qontinui-web bullet and the \"One web \
+                 call\" paragraph, then this list"
             );
         }
     }
@@ -2831,12 +2992,13 @@ fn e2e_mock() -> Router {
         }
     }
 
-    /// **The UI Bridge family relays exactly three reads.** The runner
+    /// **The UI Bridge family relays exactly four reads.** The runner
     /// registers hundreds of routes under `/ui-bridge/`: `page/evaluate`,
     /// `page/close-request`, element and component actions, the SDK and
     /// invoke proxies. Every path the two enumerations below find is asked
     /// under every method, both as registered and with its placeholders
-    /// filled. Only the snapshot, the component registry and page health may
+    /// filled. Only the snapshot, the component registry, page health and the
+    /// occlusion sweep may
     /// answer `Allow`, each under its one method, so a wildcard or an extra
     /// method that reaches this family fails here and names the route.
     /// Widening the family on purpose means adding its pair to `RELAYED`, with
@@ -2860,11 +3022,12 @@ fn e2e_mock() -> Router {
     /// literal, or an `add_dual!`. A registration in any other form, such as a
     /// path from a constant, is invisible to both sources, and so to this test.
     #[test]
-    fn the_ui_bridge_family_relays_exactly_the_three_named_reads() {
+    fn the_ui_bridge_family_relays_exactly_the_four_named_reads() {
         const RELAYED: &[(&str, &str)] = &[
             ("GET", "/ui-bridge/control/snapshot"),
             ("GET", "/ui-bridge/control/components"),
             ("POST", "/ui-bridge/control/page-health"),
+            ("POST", "/ui-bridge/control/visibility"),
         ];
         for (method, path) in RELAYED {
             assert_eq!(

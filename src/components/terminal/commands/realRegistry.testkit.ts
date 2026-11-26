@@ -234,6 +234,22 @@ export interface RealRegistryHarness {
   setArms(next: Partial<EffectArms>): void;
   /** Restore {@link DEFAULT_ARMS}. Call in a `finally`, or the next spec inherits. */
   resetArms(): void;
+  /**
+   * The pages `usePageSessionGetter` finds besides the session's own `page-1`.
+   * Each one's `setLayoutId` records as `page.<id>.setLayoutId`, so a spec can
+   * tell a set on that page from a set on the page on screen. Replaces whatever
+   * was there; call with no argument in a `finally`, or the next spec inherits.
+   */
+  setOtherPages(pages?: Record<string, OtherPageFixture>): void;
+}
+
+/** What `/layout --page` reads off a page other than the one on screen. */
+export interface OtherPageFixture {
+  layoutId: string;
+  tabCount: number;
+  workMode?: "grid" | "tmux";
+  /** Who chose the layout; absent is a page that predates the field. */
+  layoutOrigin?: "auto" | "operator";
 }
 
 let cached: Promise<RealRegistryHarness> | null = null;
@@ -439,8 +455,9 @@ async function build(): Promise<RealRegistryHarness> {
   // over plain data and run fine under `environment: "node"`
   // (`result-card/builders.test.tsx` already does exactly that), so the
   // handlers now build real specs from the `cards` arm's data.
+  const otherPages = new Map<string, unknown>();
   vi.doMock("../contexts", () => ({
-    usePageSessionGetter: () => () => null,
+    usePageSessionGetter: () => (id: string) => otherPages.get(id) ?? null,
     useTerminalSession: () => ({
       tabs: [{ id: "tab-a" }, { id: "tab-b" }],
       activeId: "tab-a",
@@ -705,6 +722,20 @@ async function build(): Promise<RealRegistryHarness> {
       calls.length = 0;
     },
     arms,
+    setOtherPages(pages: Record<string, OtherPageFixture> = {}): void {
+      otherPages.clear();
+      for (const [id, page] of Object.entries(pages)) {
+        otherPages.set(id, {
+          tabs: Array.from({ length: page.tabCount }, (_, i) => ({ id: `${id}-tab-${i}` })),
+          zoneLayout: {
+            layoutId: page.layoutId,
+            workMode: page.workMode ?? "grid",
+            layoutOrigin: page.layoutOrigin,
+            setLayoutId: rec(`page.${id}.setLayoutId`, undefined),
+          },
+        });
+      }
+    },
     setArms(next: Partial<EffectArms>): void {
       Object.assign(arms, next);
       syncTerminalRefs();

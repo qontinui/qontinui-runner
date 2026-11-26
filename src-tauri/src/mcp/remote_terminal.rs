@@ -28,6 +28,7 @@
 //! live pane's grant and splices the returned ring from the last byte seen.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -38,6 +39,9 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::mcp::remote_create_reaper::{
+    ClosingUnderCreateGrant, CreateCloseClaim, RemoteCreateReaper,
+};
 use crate::settings::{AcceptRemoteAttach, AcceptRemoteCreate};
 use crate::terminal::remote_pane_io::{AttachedRing, RemoteFrameSink, RemotePaneIo};
 
@@ -74,6 +78,10 @@ pub enum AttachRefusal {
     /// The tenant's `egress_terminal_stream` switch is off (plan
     /// 2026-10-10-spec-front-end-phase-9-generic-boundary, Phase 7).
     EgressOff,
+    /// The terminal's own create grant has been admitted to close it
+    /// ([`admit_create_grant_end`]); binding an attach now would hand the
+    /// source a terminal that is about to be killed.
+    TerminalClosing,
 }
 
 impl AttachRefusal {
@@ -81,13 +89,14 @@ impl AttachRefusal {
     /// here too — `admit_terminal_attach`'s frame-shape invariant test walks
     /// this list, and the exhaustive match it drives each variant through
     /// will not compile until the new one is handled.
-    pub const ALL: [AttachRefusal; 6] = [
+    pub const ALL: [AttachRefusal; 7] = [
         AttachRefusal::GrantUnknown,
         AttachRefusal::GrantExpired,
         AttachRefusal::TerminalMismatch,
         AttachRefusal::Disabled,
         AttachRefusal::SessionNotLocal,
         AttachRefusal::EgressOff,
+        AttachRefusal::TerminalClosing,
     ];
 
     pub fn code(self) -> &'static str {
@@ -98,6 +107,7 @@ impl AttachRefusal {
             AttachRefusal::Disabled => "remote_attach_disabled",
             AttachRefusal::SessionNotLocal => "session_not_local",
             AttachRefusal::EgressOff => "egress_off",
+            AttachRefusal::TerminalClosing => "attach_terminal_closing",
         }
     }
 
@@ -111,6 +121,9 @@ impl AttachRefusal {
             AttachRefusal::Disabled => "this device does not accept remote attach",
             AttachRefusal::SessionNotLocal => "no local terminal hosts that coord session",
             AttachRefusal::EgressOff => "Terminal streaming is off for this project",
+            AttachRefusal::TerminalClosing => {
+                "the terminal is being closed by the create grant that spawned it"
+            }
         }
     }
 }
@@ -288,6 +301,16 @@ impl RemoteAttachGrants {
             .unwrap_or(false)
     }
 
+    /// [`Self::contains`] that FAILS CLOSED: `Err` when the table cannot be read
+    /// (a poisoned lock), instead of answering "not an attach grant". For
+    /// [`admit_create_grant_end`] only, which must refuse rather than guess.
+    pub fn try_contains(&self, grant_jti: &str) -> Result<bool, ()> {
+        self.inner
+            .lock()
+            .map(|map| map.contains_key(grant_jti))
+            .map_err(|_| ())
+    }
+
     /// Clear a grant's terminal binding, keeping the row until it expires.
     /// This is what `terminal_detach` does rather than [`Self::remove`]: the
     /// backend tears the attachment down on every SOURCE socket drop — a
@@ -345,6 +368,30 @@ impl RemoteAttachGrants {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Is any unexpired grant bound to `terminal_id`? [`Self::grants_bound_to`]
+    /// that FAILS CLOSED: `Err` when the table cannot be read, rather than the
+    /// empty answer that would read as "not bound". For
+    /// [`admit_create_grant_end`] only.
+    pub fn try_any_bound_to(&self, terminal_id: &str, now: u64) -> Result<bool, ()> {
+        self.inner
+            .lock()
+            .map(|map| {
+                map.values()
+                    .any(|g| g.expires_at > now && g.terminal_id.as_deref() == Some(terminal_id))
+            })
+            .map_err(|_| ())
+    }
+
+    /// Poison this table's lock — what a panic while holding it does. Tests
+    /// only: the fail-closed reads above need a way to meet a poisoned lock.
+    #[cfg(test)]
+    pub fn poison_for_test(&self) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = self.inner.lock();
+            panic!("poisoning the attach-grant table for a test");
+        }));
     }
 
     pub fn len(&self) -> usize {
@@ -405,9 +452,10 @@ pub struct CreateGrant {
 }
 
 /// The in-memory create-grant table (target role). The twin of
-/// [`RemoteAttachGrants`], minus everything a create has no room for: no
-/// terminal binding (the terminal is what the grant will create) and no
-/// session (none exists yet).
+/// [`RemoteAttachGrants`], minus everything a create has no room for: a LIVE row
+/// has no terminal binding (the terminal is what the grant will create) and no
+/// session (none exists yet). The terminal is recorded on the row's TOMBSTONE,
+/// once the spend has produced one ([`SpentCreateGrant`]).
 ///
 /// **Single-use, and single-use against the FEED as well as against a replay.**
 /// [`Self::consume`] removes the row it returns: a create grant buys ONE spawn.
@@ -426,10 +474,24 @@ pub struct CreateGrant {
 #[derive(Default)]
 pub struct RemoteCreateGrants {
     inner: Mutex<HashMap<String, CreateGrant>>,
-    /// jtis this process has already spent, and their `expires_at`. Kept until
-    /// the grant's own expiry — past that coord will not serve it either, so
-    /// the tombstone has nothing left to guard and is purged with the rest.
-    spent: Mutex<HashMap<String, u64>>,
+    /// jtis this process has already spent. Kept until the grant's own expiry —
+    /// past that coord will not serve it either, so the tombstone has nothing
+    /// left to guard and is purged with the rest.
+    spent: Mutex<HashMap<String, SpentCreateGrant>>,
+}
+
+/// The tombstone of a spent create grant — single-use authority, and the ONLY
+/// authority a create grant keeps after its spawn: closing the one terminal it
+/// created ([`admit_create_grant_end`]), before anyone attaches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpentCreateGrant {
+    /// Unix seconds, copied from the grant.
+    pub expires_at: u64,
+    pub source_device_id: String,
+    pub source_user_id: String,
+    /// The terminal the spend produced. `None` until the create has spawned it
+    /// and forever if the spawn failed; such a tombstone closes nothing.
+    pub terminal_id: Option<String>,
 }
 
 impl RemoteCreateGrants {
@@ -607,14 +669,83 @@ impl RemoteCreateGrants {
         let Ok(mut spent) = self.spent.lock() else {
             return true;
         };
-        spent.retain(|_, exp| *exp > now);
+        spent.retain(|_, tombstone| tombstone.expires_at > now);
         spent.contains_key(grant_jti)
     }
 
     fn mark_spent(&self, grant: &CreateGrant, now: u64) {
         if let Ok(mut spent) = self.spent.lock() {
-            spent.retain(|_, exp| *exp > now);
-            spent.insert(grant.grant_jti.clone(), grant.expires_at);
+            spent.retain(|_, tombstone| tombstone.expires_at > now);
+            spent.insert(
+                grant.grant_jti.clone(),
+                SpentCreateGrant {
+                    expires_at: grant.expires_at,
+                    source_device_id: grant.source_device_id.clone(),
+                    source_user_id: grant.source_user_id.clone(),
+                    terminal_id: None,
+                },
+            );
+        }
+    }
+
+    /// Record the terminal `grant_jti`'s spend produced. First bind wins: one
+    /// grant buys one spawn, so a second, different terminal is never recorded.
+    /// `false` when there is no tombstone to bind (it expired during the
+    /// create), the lock is poisoned, or a different terminal is already bound;
+    /// the close is then refused and the attach-deadline reaper is the backstop.
+    pub fn bind_spent_terminal(&self, grant_jti: &str, terminal_id: &str) -> bool {
+        let Ok(mut spent) = self.spent.lock() else {
+            return false;
+        };
+        let Some(tombstone) = spent.get_mut(grant_jti) else {
+            return false;
+        };
+        match tombstone.terminal_id.as_deref() {
+            None => {
+                tombstone.terminal_id = Some(terminal_id.to_string());
+                true
+            }
+            Some(bound) => bound == terminal_id,
+        }
+    }
+
+    /// The tombstone of `grant_jti`, only while it is unexpired AND the frame's
+    /// source device is the one the grant was minted for. The source binding is
+    /// REQUIRED on both sides and a zero clock is refused, exactly as in
+    /// [`Self::resolve`], whose comments give the reasons. `None` covers every
+    /// refusal so a wrong-source frame learns nothing about the jti.
+    pub fn spent_for_close(
+        &self,
+        grant_jti: &str,
+        source_device_id: Option<&str>,
+        now: u64,
+    ) -> Option<SpentCreateGrant> {
+        if now == 0 {
+            warn!(
+                grant_jti,
+                "remote create: close refused — this device cannot read its clock, so no \
+                 grant's expiry can be evaluated"
+            );
+            return None;
+        }
+        let mut spent = self.spent.lock().ok()?;
+        spent.retain(|_, tombstone| tombstone.expires_at > now);
+        let tombstone = spent.get(grant_jti)?;
+        let expected = tombstone.source_device_id.trim();
+        match source_device_id.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(claimed) if !expected.is_empty() && expected.eq_ignore_ascii_case(claimed) => {
+                Some(tombstone.clone())
+            }
+            claimed => {
+                warn!(
+                    grant_jti,
+                    granted_source = expected,
+                    frame_source = claimed.unwrap_or("<absent>"),
+                    "remote create: a close's source device is not the one the grant was minted \
+                     for (or either side names none at all) — refused as unknown"
+                );
+                None
+            }
         }
     }
 
@@ -641,7 +772,7 @@ impl RemoteCreateGrants {
             map.retain(|_, g| g.expires_at > now);
         }
         if let Ok(mut spent) = self.spent.lock() {
-            spent.retain(|_, exp| *exp > now);
+            spent.retain(|_, tombstone| tombstone.expires_at > now);
         }
     }
 
@@ -651,7 +782,7 @@ impl RemoteCreateGrants {
         self.spent
             .lock()
             .map(|mut s| {
-                s.retain(|_, exp| *exp > now);
+                s.retain(|_, tombstone| tombstone.expires_at > now);
                 s.len()
             })
             .unwrap_or(0)
@@ -1079,8 +1210,14 @@ where
 /// through `resolve_terminal`, and binds the grant to it. `Ok` carries the
 /// block, the grant, and whatever the resolver returned for the terminal;
 /// `Err` is the exact frame to send back.
+///
+/// The bind goes through `reaper` ([`RemoteCreateReaper::bind_attach`]), which
+/// binds and marks the terminal ever-attached under the lock a create grant's
+/// close admission takes. A terminal whose create grant was already admitted to
+/// close it is refused `attach_terminal_closing` and nothing is bound.
 pub fn admit_terminal_attach<T, P, R>(
     grants: &RemoteAttachGrants,
+    reaper: &RemoteCreateReaper,
     preference: P,
     data: &Value,
     now: u64,
@@ -1128,13 +1265,32 @@ where
         return Err(refusal_frame(AttachRefusal::EgressOff, data, None));
     }
 
-    // Bind at first use; a re-attach must land on the same terminal.
-    if !grants.bind(&block.grant_jti, &terminal_id) {
-        return Err(refusal_frame(
-            AttachRefusal::TerminalMismatch,
-            data,
-            Some(&terminal_id),
-        ));
+    // Bind at first use; a re-attach must land on the same terminal. Atomic
+    // with the reaper's ever-attached mark and against a create grant's close.
+    match reaper.bind_attach(&terminal_id, tokio::time::Instant::now(), || {
+        grants.bind(&block.grant_jti, &terminal_id)
+    }) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(refusal_frame(
+                AttachRefusal::TerminalMismatch,
+                data,
+                Some(&terminal_id),
+            ))
+        }
+        Err(ClosingUnderCreateGrant) => {
+            warn!(
+                grant_jti = %block.grant_jti,
+                terminal_id = %terminal_id,
+                "remote attach: refused — the terminal's create grant was already admitted to \
+                 close it"
+            );
+            return Err(refusal_frame(
+                AttachRefusal::TerminalClosing,
+                data,
+                Some(&terminal_id),
+            ));
+        }
     }
     Ok((block, grant, terminal_id, terminal))
 }
@@ -1249,6 +1405,108 @@ where
     })
 }
 
+/// The decision half of `terminal_end` under a CREATE grant (target role): the
+/// source closes the terminal its own grant spawned when the attach stage then
+/// failed, without waiting for the attach-deadline reaper.
+///
+/// **An authorization rule, and deliberately narrow.** Coord cannot mint an
+/// attach grant for a session it does not hold, which is the failure this
+/// serves, so the authority is the spent grant's tombstone. It closes exactly
+/// one terminal, and only until someone has attached to it:
+///
+/// - the terminal comes from the TOMBSTONE, never the wire. A terminal the frame
+///   names is only compared; the top-level `terminal_id` is REQUIRED so a
+///   source that lost track of its terminal cannot close one by default;
+/// - no live tombstone, a different source device, or a spawn that never bound a
+///   terminal all answer `remote_create_grant_unknown`, the same answer as
+///   [`RemoteCreateGrants::lookup`], so a wrong-source frame learns nothing about the jti;
+/// - a terminal anyone has EVER attached to is refused: it belongs to whoever
+///   attached, and a create grant is not an attach grant. The check is
+///   [`RemoteCreateReaper::claim_create_close`]: the reaper's fail-closed
+///   ever-attached read (no row reads as attached) plus a live attach-table
+///   read, and on admission it COUNTS the close in, all under the reaper's
+///   lock. `admit_terminal_attach` binds under that same lock and refuses a
+///   terminal with any admitted close in flight (or one a close already ended)
+///   `attach_terminal_closing`, so an attach can never bind between this
+///   admission and the close that follows it — the loser of that race is
+///   refused cleanly whichever side it is;
+/// - an attach table that cannot be read (a poisoned lock) refuses: neither
+///   "not an attach jti" nor "not bound" can then be proven.
+///
+/// Refusals touch nothing. An admission binds and consumes nothing; its one
+/// effect is the returned [`CreateCloseClaim`], which keeps the terminal
+/// unattachable until the caller drops it (settled through
+/// [`run_create_close`](crate::mcp::remote_create_reaper::run_create_close)),
+/// so a retry after an `unknown` reply is admitted again and answered
+/// `not_found` if the terminal has gone.
+pub fn admit_create_grant_end<'r, P, U>(
+    attach_grants: &RemoteAttachGrants,
+    create_grants: &RemoteCreateGrants,
+    reaper: &'r RemoteCreateReaper,
+    preference: P,
+    local_user_id: U,
+    data: &Value,
+    now: u64,
+) -> Result<(RemoteBlock, CreateCloseClaim<'r>), Value>
+where
+    P: FnOnce() -> AcceptRemoteCreate,
+    U: FnOnce() -> Option<String>,
+{
+    let refuse = |refusal: CreateRefusal| {
+        warn!(
+            grant_jti = data
+                .pointer("/remote/grant_jti")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            code = refusal.code(),
+            "remote create: close under a create grant refused"
+        );
+        create_refusal_frame(refusal, data, None)
+    };
+    let block = match parse_remote_block(data) {
+        Some(Ok(block)) if block.kind == RemoteGrantKind::Create => block,
+        _ => return Err(refuse(CreateRefusal::GrantRequired)),
+    };
+    let preference = preference();
+    if preference == AcceptRemoteCreate::Off {
+        return Err(refuse(CreateRefusal::Disabled));
+    }
+    match attach_grants.try_contains(&block.grant_jti) {
+        Ok(false) => {}
+        Ok(true) => return Err(refuse(CreateRefusal::GrantRequired)),
+        // Unreadable: whether this jti is an attach grant cannot be proven.
+        Err(()) => return Err(refuse(CreateRefusal::GrantUnknown)),
+    }
+    let tombstone = create_grants
+        .spent_for_close(&block.grant_jti, block.source_device_id.as_deref(), now)
+        .ok_or_else(|| refuse(CreateRefusal::GrantUnknown))?;
+    let terminal_id = tombstone
+        .terminal_id
+        .clone()
+        .ok_or_else(|| refuse(CreateRefusal::GrantUnknown))?;
+    if preference == AcceptRemoteCreate::SameUser
+        && !source_user_matches(&tombstone.source_user_id, local_user_id().as_deref())
+    {
+        return Err(refuse(CreateRefusal::SourceUserNotAllowed));
+    }
+    let named_top = data
+        .get("terminal_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim);
+    let named_block = block.terminal_id.as_deref().map(str::trim);
+    if named_top != Some(terminal_id.as_str())
+        || named_block.is_some_and(|named| named != terminal_id)
+    {
+        return Err(refuse(CreateRefusal::CloseTerminalMismatch));
+    }
+    let Some(claim) = reaper.claim_create_close(&terminal_id, || {
+        attach_grants.try_any_bound_to(&terminal_id, now)
+    }) else {
+        return Err(refuse(CreateRefusal::CloseAttached));
+    };
+    Ok((block, claim))
+}
+
 /// The outcome vocabulary of a remote end — the wire spelling on
 /// `terminal_ended` / `remote_terminal_ended`, and the source command's typed
 /// result. `Unknown` is never rendered as ended: a timeout, a transport
@@ -1355,6 +1613,16 @@ pub fn graceful_end_step(
             )),
         )),
         Ok(G::Refused { reason, .. }) => refused(format!("refused: {reason}")),
+        // R0a: a live `claude` is in the pane and a relay end carries no close
+        // authority (only the lifecycle Closer will mint one), so the primitive
+        // refused before typing anything. NOT `CloseBareShell`: the pane holds
+        // a live session, so the bare-shell close must never follow.
+        Ok(G::NoCloseAuthority { claude_pids }) => refused(format!(
+            "no_close_authority: a graceful end needs a close authority, which only the \
+             lifecycle Closer will mint (plan Phase 93); the session was left running (live \
+             claude pids {}, nothing typed)",
+            pids(claude_pids)
+        )),
         Ok(G::CloseRefused { reason, .. }) => refused(format!("close_refused: {reason}")),
         Ok(G::WriteFailed { error, .. }) => refused(format!("write_failed: {error}")),
         Ok(G::ProbeUnavailable { detail }) => refused(format!("probe_unavailable: {detail}")),
@@ -1630,6 +1898,12 @@ pub enum CreateRefusal {
     /// from not-`off`, so an operator narrowing `tenant` -> `same_user` while
     /// coord was unreachable changed nothing this device enforced.
     SourceUserNotAllowed,
+    /// A close under a create grant, for a terminal someone has attached to.
+    /// The create grant's authority over its terminal ends at the first attach.
+    CloseAttached,
+    /// A close under a create grant whose frame names no terminal, or one other
+    /// than the terminal this jti created.
+    CloseTerminalMismatch,
 }
 
 impl CreateRefusal {
@@ -1644,6 +1918,8 @@ impl CreateRefusal {
             CreateRefusal::IntentRepoNotAllowed => "remote_create_intent_repo_not_allowed",
             CreateRefusal::EditSiblingNotAllowed => "remote_create_edit_sibling_not_allowed",
             CreateRefusal::SourceUserNotAllowed => "remote_create_source_user_not_allowed",
+            CreateRefusal::CloseAttached => "remote_create_close_attached",
+            CreateRefusal::CloseTerminalMismatch => "remote_create_close_terminal_mismatch",
         }
     }
 
@@ -1688,6 +1964,14 @@ impl CreateRefusal {
                 "this device accepts remote terminal creation only from its OWN user \
                  (`remote_create.accept_remote_create` is `same_user`), and the grant behind \
                  this frame was not minted for that user — or names no user at all"
+            }
+            CreateRefusal::CloseAttached => {
+                "this terminal has been attached, so its create grant can no longer close it — \
+                 ending it takes an attach grant"
+            }
+            CreateRefusal::CloseTerminalMismatch => {
+                "a create grant closes only the terminal it created, and this frame names no \
+                 terminal or a different one"
             }
         }
     }
@@ -2012,6 +2296,14 @@ pub fn create_refusal_frame(
     frame
 }
 
+/// The `same_user` arm of `accept_remote_create`. An unknown on either side is a
+/// refusal rather than a skip: an unknowable identity is not a matching one.
+fn source_user_matches(granted: &str, local: Option<&str>) -> bool {
+    let granted = granted.trim();
+    let local = local.unwrap_or_default().trim();
+    !granted.is_empty() && !local.is_empty() && granted.eq_ignore_ascii_case(local)
+}
+
 /// Gate one inbound `terminal_create`.
 ///
 /// `Ok(None)` — the frame carries no `remote` block: the operator-web / mobile
@@ -2142,14 +2434,12 @@ where
     // device that cannot say which user it is paired to, are both refusals
     // rather than skips — an unknowable identity is not a matching one.
     if preference == AcceptRemoteCreate::SameUser {
-        let granted = grant.source_user_id.trim().to_string();
-        let local = local_user_id().unwrap_or_default();
-        let local = local.trim();
-        if granted.is_empty() || local.is_empty() || !granted.eq_ignore_ascii_case(local) {
+        let local = local_user_id();
+        if !source_user_matches(&grant.source_user_id, local.as_deref()) {
             warn!(
                 grant_jti = %block.grant_jti,
-                granted_user = %if granted.is_empty() { "<absent>" } else { granted.as_str() },
-                local_user = %if local.is_empty() { "<unknown>" } else { local },
+                granted_user = %grant.source_user_id.trim(),
+                local_user = %local.as_deref().unwrap_or("<unknown>"),
                 "remote create: refused — this device accepts creates only from its own user"
             );
             return Err(create_refusal_frame(
@@ -2681,6 +2971,8 @@ const FATAL_REMOTE_ERROR_CODES: &[&str] = &[
     "session_not_local",
     "remote_attach_disabled",
     "listener_lost",
+    // The target's create grant is closing the terminal: it will not come back.
+    "attach_terminal_closing",
 ];
 
 fn is_fatal_remote_error(code: &str) -> bool {
@@ -2890,7 +3182,7 @@ impl EndReply {
     }
 }
 
-/// Which grant a `remote_terminal_end` is sent under — the two relay paths.
+/// Which grant a `remote_terminal_end` is sent under — the three relay paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndGrant<'a> {
     /// An open tab's grant, already attached on this relay socket: sent as
@@ -2901,6 +3193,12 @@ pub enum EndGrant<'a> {
     },
     /// A grant minted for this end: sent as the `grant` JWT.
     Fresh { grant: &'a str },
+    /// The CREATE grant whose spawn this end closes: sent as the `create_grant`
+    /// JWT with the target terminal it created. See [`admit_create_grant_end`].
+    Create {
+        grant: &'a str,
+        terminal_id: &'a str,
+    },
 }
 
 /// Parse a `remote_terminal_ended` frame. The outcome is REQUIRED: a frame
@@ -2949,6 +3247,148 @@ pub struct RemoteAttachClient {
     /// fell behind the target's, so the next reattach splice skipped the
     /// wrong prefix.
     pending_output: Mutex<HashMap<String, PendingOutput>>,
+    /// The reattach supervisor's waiter per pane, keyed by the jti the
+    /// `reattach:<jti>` frame carried. The splice itself stays on the inbound
+    /// thread (wire order); this only REPORTS the outcome to the supervisor.
+    reattach_waiters: Mutex<HashMap<String, ReattachWaiter>>,
+    /// Panes a sync path decided need a reattach supervisor. Drained and
+    /// spawned by the module-level wrappers the relay calls
+    /// ([`relay_connected`], [`route_inbound`]), which hold the `'static`
+    /// client a spawned task needs.
+    reattach_requests: Mutex<Vec<ReattachRequest>>,
+    /// Woken on every relay (re)connect, so a supervisor sleeping out a
+    /// backoff retries at once.
+    reconnected: tokio::sync::Notify,
+    /// Mints a fresh grant for a pane's session when its own has expired.
+    /// Registered by the commands layer, which owns coord access.
+    renewer: Mutex<Option<Arc<dyn GrantRenewer>>>,
+    /// Numbers every reattach attempt, so a late reply to an attempt that
+    /// already timed out cannot settle the attempt sent after it.
+    reattach_seq: AtomicU64,
+    /// Bumped on every relay (re)connect. A supervisor whose reply arrives
+    /// after a reconnect it did not present on presents again.
+    reconnect_gen: AtomicU64,
+}
+
+/// A reattach supervisor's wait for one ATTEMPT: the full request id the
+/// frame carried (`reattach:<jti>#<n>`) and where to report its outcome.
+struct ReattachWaiter {
+    rid: String,
+    tx: oneshot::Sender<Result<(), AttachError>>,
+}
+
+/// A pane that needs a reattach supervisor, with the reply receiver for a
+/// reattach frame already sent (`None`: the supervisor sends the first one).
+pub struct ReattachRequest {
+    pub pane: Arc<RemotePaneIo>,
+    pub first: Option<oneshot::Receiver<Result<(), AttachError>>>,
+    /// The "remote machine is not connected" notice is already in the pane.
+    pub announced_target_down: bool,
+    /// The relay generation `first` was sent on (meaningless without one).
+    pub sent_generation: u64,
+}
+
+/// A grant minted to replace a pane's expired one.
+#[derive(Debug, Clone)]
+pub struct RenewedGrant {
+    pub grant: String,
+    pub grant_jti: String,
+}
+
+/// Mints a fresh attach grant for a coord session. A trait so the supervisor
+/// is testable without coord; production is coord's
+/// `POST /coord/sessions/{id}/attach-grants`, the mint the picker uses.
+pub trait GrantRenewer: Send + Sync {
+    /// `target_device_id` is the device the pane was attached to; a renewal
+    /// coord now places on a DIFFERENT device must be refused, exactly as a
+    /// fresh attach refuses one.
+    fn renew<'a>(
+        &'a self,
+        session_id: &'a str,
+        target_device_id: Option<&'a str>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<RenewedGrant, String>> + Send + 'a>,
+    >;
+}
+
+/// The backend's answer when the TARGET device has no relay socket.
+pub const TARGET_NOT_CONNECTED: &str = "target_not_connected";
+
+/// How long the source keeps re-presenting the SAME grant while the target has
+/// not recorded it yet.
+///
+/// **Sized against the TARGET's catch-up poll, which is a property of the
+/// target's BUILD and therefore not shortenable from here.** A target learns a
+/// grant from a push on `qontinui.sessions.<tenant>.<device>.attach_request`
+/// or from its catch-up `GET /sessions/attach-requests`; a target whose runner
+/// predates the on-demand re-read has only those two, so a dropped push leaves
+/// the poll as the only feed. That poll is 15 s on a runner carrying
+/// [`crate::session::attach::POLL_INTERVAL`] as it now stands, and **60 s on
+/// every build that predates it** — which is the population this window exists
+/// for. 80 s covers one whole 60 s tick plus the catch-up GET's own budget and
+/// clock skew, against a grant coord gives 900 s of life, so the wait spends a
+/// small fraction of the capability it is waiting on.
+///
+/// It bounds the RE-PRESENTATION schedule, not the wall clock: each
+/// presentation carries its own [`ATTACH_TIMEOUT`] (20 s), so a final attempt
+/// that times out can carry the total to ~100 s. Used by the picker's first
+/// attach (`commands::remote_attach::present_grant_until_target_records_it`)
+/// and by the reattach supervisor after a grant renewal — one constant, so the
+/// two cannot drift.
+pub const GRANT_LEARN_WINDOW: Duration = Duration::from_secs(80);
+
+/// While THIS runner's relay is down nothing can reach the target, so a
+/// supervisor waits for the reconnect instead of spending its window; this is
+/// only how often it looks up to notice the tab was closed meanwhile.
+const RELAY_DOWN_RECHECK: Duration = Duration::from_secs(30);
+
+/// How long a pane keeps trying to reattach before it closes with a notice.
+/// Counted only while THIS runner's relay is connected — a drop of our own
+/// relay restarts it when the relay returns, because the target could not be
+/// asked in that time. A backend-side drop disconnects BOTH runners and the target is routinely a
+/// few seconds behind; ten minutes covers a target runner restart too, and
+/// bounds how long a tab can sit on "retrying" against a machine that is gone.
+pub const REATTACH_WINDOW: Duration = Duration::from_secs(600);
+
+/// How the reattach supervisor paces itself. See [`supervise_reattach`].
+#[derive(Debug, Clone)]
+pub struct ReattachPolicy {
+    /// Total time a supervisor keeps trying before it closes the pane.
+    pub window: Duration,
+    /// Bound on one reattach frame's reply.
+    pub reply_timeout: Duration,
+    /// After a renewal, `attach_grant_unknown` within this long is the target
+    /// still learning the new grant (retry the SAME grant), not a lost one.
+    pub learn_window: Duration,
+    /// Renewals allowed per supervision.
+    pub max_renewals: u32,
+    /// Delay before retry N (1-based); the last entry repeats.
+    pub backoff: Vec<Duration>,
+}
+
+impl Default for ReattachPolicy {
+    fn default() -> Self {
+        Self {
+            window: REATTACH_WINDOW,
+            reply_timeout: ATTACH_TIMEOUT,
+            learn_window: GRANT_LEARN_WINDOW,
+            max_renewals: 3,
+            backoff: [1, 2, 4, 8, 15, 30]
+                .into_iter()
+                .map(Duration::from_secs)
+                .collect(),
+        }
+    }
+}
+
+impl ReattachPolicy {
+    fn delay(&self, attempt: u32) -> Duration {
+        let i = (attempt.max(1) as usize - 1).min(self.backoff.len().saturating_sub(1));
+        self.backoff
+            .get(i)
+            .copied()
+            .unwrap_or(Duration::from_secs(1))
+    }
 }
 
 /// One relay connection's hold on the outbound queue, from
@@ -3066,6 +3506,142 @@ impl RemoteAttachClient {
             pending_create: Mutex::new(HashMap::new()),
             pending_end: Mutex::new(HashMap::new()),
             pending_output: Mutex::new(HashMap::new()),
+            reattach_waiters: Mutex::new(HashMap::new()),
+            reattach_requests: Mutex::new(Vec::new()),
+            reconnected: tokio::sync::Notify::new(),
+            renewer: Mutex::new(None),
+            reattach_seq: AtomicU64::new(0),
+            reconnect_gen: AtomicU64::new(0),
+        }
+    }
+
+    /// Register the grant renewer (first registration wins; later calls are
+    /// no-ops, so every tab open may call it).
+    pub fn set_grant_renewer(&self, renewer: Arc<dyn GrantRenewer>) {
+        if let Ok(mut slot) = self.renewer.lock() {
+            if slot.is_none() {
+                *slot = Some(renewer);
+            }
+        }
+    }
+
+    fn grant_renewer(&self) -> Option<Arc<dyn GrantRenewer>> {
+        self.renewer.lock().ok()?.clone()
+    }
+
+    /// Queue `remote_terminal_attach` for `pane` under `reattach:<jti>#<n>`
+    /// (one `n` per attempt) and return the receiver its outcome is reported
+    /// on. Does NOT check the pump — the caller decides whether sending now
+    /// is meaningful. Refuses a pane that has already finished: a reattach
+    /// queued behind a closed tab's detach would re-bind the target terminal
+    /// to a tab that no longer exists.
+    pub fn send_reattach(
+        &self,
+        pane: &RemotePaneIo,
+    ) -> Result<oneshot::Receiver<Result<(), AttachError>>, AttachError> {
+        if pane.is_finished() {
+            return Err(AttachError {
+                code: "pane_closed".to_string(),
+                message: "the tab closed before the reattach was sent".to_string(),
+            });
+        }
+        let jti = pane.grant_jti();
+        let seq = self.reattach_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let rid = format!("{REATTACH_PREFIX}{jti}#{seq}");
+        let (tx, rx) = oneshot::channel();
+        if let Ok(mut w) = self.reattach_waiters.lock() {
+            w.insert(
+                jti.clone(),
+                ReattachWaiter {
+                    rid: rid.clone(),
+                    tx,
+                },
+            );
+        }
+        if let Err(e) = self.send(pane.reattach_frame(&rid)) {
+            self.take_reattach_waiter(&jti);
+            return Err(AttachError {
+                code: "relay_unavailable".to_string(),
+                message: e,
+            });
+        }
+        Ok(rx)
+    }
+
+    /// The pane's pending reattach waiter, whatever attempt it belongs to.
+    fn take_reattach_waiter(&self, jti: &str) -> Option<oneshot::Sender<Result<(), AttachError>>> {
+        self.reattach_waiters.lock().ok()?.remove(jti).map(|w| w.tx)
+    }
+
+    /// The pane's reattach waiter, ONLY when it belongs to the attempt `rid`
+    /// names. A reply to an earlier, timed-out attempt resolves nothing.
+    fn take_reattach_waiter_for(
+        &self,
+        jti: &str,
+        rid: &str,
+    ) -> Option<oneshot::Sender<Result<(), AttachError>>> {
+        let mut w = self.reattach_waiters.lock().ok()?;
+        if w.get(jti).is_some_and(|waiter| waiter.rid == rid) {
+            w.remove(jti).map(|waiter| waiter.tx)
+        } else {
+            None
+        }
+    }
+
+    fn queue_reattach(&self, req: ReattachRequest) {
+        if let Ok(mut q) = self.reattach_requests.lock() {
+            q.push(req);
+        }
+    }
+
+    /// Panes waiting for a supervisor to be started.
+    pub fn take_reattach_requests(&self) -> Vec<ReattachRequest> {
+        self.reattach_requests
+            .lock()
+            .map(|mut q| std::mem::take(&mut *q))
+            .unwrap_or_default()
+    }
+
+    /// Swap a renewed grant into `pane` and re-key the routing table, so
+    /// inbound frames for the NEW jti reach it and the old jti routes nowhere.
+    pub fn swap_grant(&self, pane: &Arc<RemotePaneIo>, renewed: &RenewedGrant) {
+        let old = pane.set_grant(renewed.grant_jti.clone(), renewed.grant.clone());
+        self.take_reattach_waiter(&old);
+        if let Ok(mut panes) = self.panes.lock() {
+            panes.remove(&old);
+            panes.insert(renewed.grant_jti.clone(), pane.clone());
+        }
+        info!(
+            old_grant_jti = %old,
+            grant_jti = %renewed.grant_jti,
+            terminal_id = %pane.terminal_id(),
+            "remote attach: renewed the pane's expired grant"
+        );
+    }
+
+    /// Wait for a reattach outcome, bounded by `timeout`.
+    async fn await_reattach(
+        &self,
+        pane: &RemotePaneIo,
+        rx: oneshot::Receiver<Result<(), AttachError>>,
+        timeout: Duration,
+    ) -> Result<(), AttachError> {
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_canceled)) => Err(AttachError {
+                code: "attach_canceled".to_string(),
+                message: "the reattach waiter was dropped before a reply arrived".to_string(),
+            }),
+            Err(_elapsed) => {
+                self.take_reattach_waiter(&pane.grant_jti());
+                Err(AttachError {
+                    code: "timeout".to_string(),
+                    message: format!(
+                        "no remote_terminal_attached for the reattach within {}s",
+                        timeout.as_secs()
+                    ),
+                })
+            }
         }
     }
 
@@ -3292,7 +3868,7 @@ impl RemoteAttachClient {
 
     /// END a session on another device (plan
     /// `2026-09-30-close-remote-sessions-from-the-local-runner`, Phase 3):
-    /// send `remote_terminal_end` under an attach grant and wait for the
+    /// send `remote_terminal_end` under the given grant and wait for the
     /// relay's `remote_terminal_ended`.
     ///
     /// The relay distinguishes its two paths by what the frame carries (the
@@ -3301,7 +3877,8 @@ impl RemoteAttachClient {
     /// grant is carried as the `grant` JWT itself, exactly as
     /// `remote_terminal_attach` carries it, and is never attached first. The
     /// target resolves the terminal from the grant's session either way and
-    /// only compares a named one.
+    /// only compares a named one. A CREATE grant closes the terminal it spawned
+    /// ([`EndGrant::Create`]), resolved from the target's tombstone.
     ///
     /// Never fails: every non-answer is an [`EndReply`] with outcome
     /// `unknown` — a timeout is not an end.
@@ -3344,6 +3921,10 @@ impl RemoteAttachClient {
             }
             EndGrant::Fresh { grant } => {
                 frame["grant"] = json!(grant);
+            }
+            EndGrant::Create { grant, terminal_id } => {
+                frame["create_grant"] = json!(grant);
+                frame["terminal_id"] = json!(terminal_id);
             }
         }
         if let Err(e) = self.send(frame) {
@@ -3558,6 +4139,20 @@ impl RemoteAttachClient {
                 message: message.to_string(),
             }));
         }
+        // A reattach in flight cannot be answered on the next connection
+        // either; its supervisor retries once the relay returns.
+        let stranded_reattaches: Vec<oneshot::Sender<Result<(), AttachError>>> = self
+            .reattach_waiters
+            .lock()
+            .map(|mut w| w.drain().map(|(_, waiter)| waiter.tx).collect())
+            .unwrap_or_default();
+        for tx in stranded_reattaches {
+            let _ = tx.send(Err(AttachError {
+                code: "relay_disconnected".to_string(),
+                message: "the relay connection dropped before the target answered the reattach"
+                    .to_string(),
+            }));
+        }
         let panes: Vec<Arc<RemotePaneIo>> = self
             .panes
             .lock()
@@ -3676,14 +4271,53 @@ impl RemoteAttachClient {
                 };
                 match request_id {
                     Some(rid) if rid.starts_with(REATTACH_PREFIX) => {
-                        if let Some(pane) = self.pane(&reply.grant_jti) {
-                            pane.note_reattached();
-                            pane.splice_replay(&reply.ring);
-                            info!(
-                                grant_jti = %reply.grant_jti,
-                                terminal_id = %reply.terminal_id,
-                                "remote attach: reattached after relay reconnect"
-                            );
+                        let waiter = self.take_reattach_waiter_for(&reply.grant_jti, rid);
+                        match self.pane(&reply.grant_jti) {
+                            // A renewed grant names the session, not the
+                            // terminal: if the target bound it to a different
+                            // terminal (the session's terminal was replaced),
+                            // splicing that ring would interleave two streams.
+                            Some(pane) if pane.terminal_id() != reply.terminal_id => {
+                                warn!(
+                                    grant_jti = %reply.grant_jti,
+                                    pane_terminal = %pane.terminal_id(),
+                                    reply_terminal = %reply.terminal_id,
+                                    "remote attach: reattach bound a different remote terminal — not spliced"
+                                );
+                                // Closed HERE, before the next inbound frame:
+                                // the target now streams the OTHER terminal
+                                // under this jti, and none of it may reach
+                                // this pane.
+                                let message = format!(
+                                    "the session's remote terminal is now {}, not {} — the \
+                                     terminal this tab showed is gone",
+                                    reply.terminal_id,
+                                    pane.terminal_id()
+                                );
+                                pane.mark_error("attach_terminal_mismatch", &message);
+                                self.drop_pane(&reply.grant_jti);
+                                if let Some(tx) = waiter {
+                                    let _ = tx.send(Err(AttachError {
+                                        code: "attach_terminal_mismatch".to_string(),
+                                        message,
+                                    }));
+                                }
+                            }
+                            Some(pane) => {
+                                // Spliced HERE, on the inbound loop, so it lands
+                                // in wire order ahead of any later output frame.
+                                pane.note_reattached();
+                                pane.splice_replay(&reply.ring);
+                                info!(
+                                    grant_jti = %reply.grant_jti,
+                                    terminal_id = %reply.terminal_id,
+                                    "remote attach: reattached after relay reconnect"
+                                );
+                                if let Some(tx) = waiter {
+                                    let _ = tx.send(Ok(()));
+                                }
+                            }
+                            None => {}
                         }
                     }
                     Some(rid) => match self.take_pending(rid) {
@@ -3890,10 +4524,10 @@ impl RemoteAttachClient {
                     return true;
                 }
                 // A refused RE-attach names the pane in its request id.
-                let jti = grant_jti
-                    .or_else(|| request_id.and_then(|rid| rid.strip_prefix(REATTACH_PREFIX)));
+                let reattach_rid = request_id.filter(|r| r.starts_with(REATTACH_PREFIX));
+                let jti = grant_jti.or_else(|| reattach_rid.and_then(reattach_jti));
                 if let Some(jti) = jti {
-                    self.settle_pane_error(jti, &code, &message);
+                    self.settle_pane_error(jti, &code, &message, reattach_rid);
                 }
                 true
             }
@@ -3904,10 +4538,12 @@ impl RemoteAttachClient {
                 // (`reattach:<jti>`) has no pending slot: the pane it names is
                 // closed with the typed code rather than left hanging with a
                 // target that no longer routes to it.
-                if let Some(jti) = request_id.and_then(|rid| rid.strip_prefix(REATTACH_PREFIX)) {
-                    let code = data.get("code").and_then(|v| v.as_str()).unwrap_or("error");
-                    let message = data.get("message").and_then(|v| v.as_str()).unwrap_or("");
-                    self.settle_pane_error(jti, code, message);
+                if let Some(rid) = request_id.filter(|r| r.starts_with(REATTACH_PREFIX)) {
+                    if let Some(jti) = reattach_jti(rid) {
+                        let code = data.get("code").and_then(|v| v.as_str()).unwrap_or("error");
+                        let message = data.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                        self.settle_pane_error(jti, code, message, Some(rid));
+                    }
                     return true;
                 }
                 let code = data
@@ -3949,7 +4585,63 @@ impl RemoteAttachClient {
     /// (see [`FATAL_REMOTE_ERROR_CODES`]); otherwise keep it — one refused
     /// stale frame after a reconnect, or an `attach_terminal_mismatch`
     /// during a re-bind window, must not close a live tab with exit 1.
-    fn settle_pane_error(&self, jti: &str, code: &str, message: &str) {
+    ///
+    /// A reattach supervisor waiting on this pane gets the error instead: it
+    /// decides whether to retry, renew the grant, or close. And a
+    /// `target_not_connected` for a live pane with no supervisor — the
+    /// TARGET's socket dropped while ours stayed up, so no reconnect of ours
+    /// will ever reattach it — queues one.
+    ///
+    /// Only a reply to the CURRENT attempt's `reattach:<jti>#<n>` frame (or,
+    /// for a frame carrying no reattach id, a `target_not_connected`, which is
+    /// retry-class whatever it answered) resolves the waiter: a refused stale
+    /// INPUT frame answered `attach_terminal_mismatch`, or a late reply to an
+    /// attempt that already timed out, must not be read as this attempt's
+    /// verdict. And while a supervisor owns the
+    /// pane, no other refusal closes it — the supervisor's next presentation
+    /// gets the target's real answer and can renew an expired grant, which a
+    /// close here would pre-empt.
+    fn settle_pane_error(&self, jti: &str, code: &str, message: &str, reattach_rid: Option<&str>) {
+        let waiter = match reattach_rid {
+            Some(rid) => self.take_reattach_waiter_for(jti, rid),
+            None if code == TARGET_NOT_CONNECTED => self.take_reattach_waiter(jti),
+            None => None,
+        };
+        if let Some(tx) = waiter {
+            let _ = tx.send(Err(AttachError {
+                code: code.to_string(),
+                message: message.to_string(),
+            }));
+            return;
+        }
+        if self.pane(jti).is_some_and(|p| p.is_reattaching()) {
+            warn!(
+                grant_jti = jti,
+                code,
+                message,
+                "remote attach: refusal while a reattach supervisor owns the pane — left to it"
+            );
+            return;
+        }
+        if code == TARGET_NOT_CONNECTED {
+            if let Some(pane) = self.pane(jti).filter(|p| !p.is_finished()) {
+                if pane.try_begin_reattach() {
+                    warn!(
+                        grant_jti = jti,
+                        message,
+                        "remote attach: the target is not connected to the relay — reattaching when it returns"
+                    );
+                    pane.note_target_not_connected();
+                    self.queue_reattach(ReattachRequest {
+                        pane,
+                        first: None,
+                        announced_target_down: true,
+                        sent_generation: self.reconnect_gen.load(Ordering::Acquire),
+                    });
+                    return;
+                }
+            }
+        }
         if is_fatal_remote_error(code) {
             if let Some(pane) = self.pane(jti) {
                 pane.mark_error(code, message);
@@ -3983,6 +4675,10 @@ impl RemoteAttachClient {
     /// target re-binds and returns its ring, which
     /// [`Self::handle_inbound`] splices from the last byte seen.
     pub fn on_relay_connected(&self) {
+        // Before any frame: a supervisor that sees this generation move after
+        // it sent its attempt knows that attempt went out on the OLD
+        // connection and presents again.
+        let generation = self.reconnect_gen.fetch_add(1, Ordering::AcqRel) + 1;
         let panes: Vec<Arc<RemotePaneIo>> = self
             .panes
             .lock()
@@ -3996,14 +4692,292 @@ impl RemoteAttachClient {
             "remote attach: relay connected — re-presenting grants for live remote panes"
         );
         for pane in panes {
-            let rid = format!("{REATTACH_PREFIX}{}", pane.grant_jti());
-            if let Err(e) = self.send(pane.reattach_frame(&rid)) {
-                warn!(
+            // A pane whose supervisor is already running is woken by the
+            // notify below and retries itself; a second frame here would race
+            // it for the same waiter slot.
+            if !pane.try_begin_reattach() {
+                continue;
+            }
+            let first = match self.send_reattach(&pane) {
+                Ok(rx) => Some(rx),
+                Err(e) => {
+                    warn!(
+                        grant_jti = %pane.grant_jti(),
+                        terminal_id = %pane.terminal_id(),
+                        error = %e,
+                        "remote attach: reattach frame not queued"
+                    );
+                    None
+                }
+            };
+            self.queue_reattach(ReattachRequest {
+                pane,
+                first,
+                announced_target_down: false,
+                sent_generation: generation,
+            });
+        }
+        self.reconnected.notify_waiters();
+    }
+}
+
+/// What the reattach supervisor does with one refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReattachStep {
+    Retry,
+    Renew,
+    Fatal,
+}
+
+/// Pure: classify a reattach refusal. `just_renewed` = a renewal happened
+/// within the policy's learn window, so `attach_grant_unknown` is the target
+/// still learning the new grant rather than a grant it lost.
+fn classify_reattach_error(code: &str, just_renewed: bool) -> ReattachStep {
+    match code {
+        "attach_grant_expired" => ReattachStep::Renew,
+        "attach_grant_unknown" if just_renewed => ReattachStep::Retry,
+        "attach_grant_unknown" => ReattachStep::Renew,
+        "attach_terminal_mismatch" => ReattachStep::Fatal,
+        c if is_fatal_remote_error(c) => ReattachStep::Fatal,
+        // target_not_connected, relay_disconnected / relay_unavailable,
+        // timeout, attach_canceled, and anything this build does not know.
+        _ => ReattachStep::Retry,
+    }
+}
+
+/// Drive one pane back to attached — plan
+/// `2026-10-02-remote-tab-that-loses-its-relay-never-reattaches`.
+///
+/// Re-presents the pane's grant (with `have_offset`) until the target
+/// answers, retrying the transient refusals on `policy.backoff` (woken early
+/// by a relay reconnect), renewing an expired grant through the registered
+/// [`GrantRenewer`], and closing the pane WITH a notice on a settled refusal
+/// or once `policy.window` is spent. Before this, a reattach was one frame
+/// per SOURCE reconnect: a target a few seconds behind, or a grant past its
+/// 15 minutes, left the tab on "relay connection lost" for good.
+///
+/// The window counts only time this runner's relay was connected: while it
+/// is down the supervisor waits for the reconnect and the window is PAUSED
+/// (not restarted — a relay that flaps does not buy a dead target unlimited
+/// retries), so an outage on OUR side never closes a tab whose target is
+/// fine. An attempt whose reply lands after a reconnect it was not sent on is
+/// presented again on the new connection — and so is a pane whose reconnect
+/// landed between this supervisor's success and its release (that reconnect
+/// found the pane claimed and skipped it), in this same task.
+pub async fn supervise_reattach(
+    client: &RemoteAttachClient,
+    req: ReattachRequest,
+    policy: ReattachPolicy,
+) {
+    let ReattachRequest {
+        pane,
+        first,
+        announced_target_down,
+        sent_generation,
+    } = req;
+    let mut first = first.map(|rx| (rx, sent_generation));
+    let mut announced = announced_target_down;
+    loop {
+        let (outcome, presented_generation) =
+            supervise_once(client, &pane, first.take(), announced, &policy).await;
+        announced = false;
+        let succeeded = matches!(outcome, Some(Ok(())));
+        if let Some(Err(e)) = outcome {
+            if !pane.is_finished() {
+                pane.mark_error(&e.code, &e.message);
+            }
+            client.drop_pane(&pane.grant_jti());
+        }
+        pane.end_reattach();
+        // A reconnect that landed between the success and the release just
+        // now found the pane still claimed and skipped it, so nothing has
+        // presented on the new connection. Take the pane back and go again;
+        // the next round checks the pump before it sends anything.
+        let missed_a_reconnect =
+            client.reconnect_gen.load(Ordering::Acquire) != presented_generation;
+        if !(succeeded && missed_a_reconnect && !pane.is_finished() && pane.try_begin_reattach()) {
+            return;
+        }
+        debug!(
+            grant_jti = %pane.grant_jti(),
+            "remote attach: a reconnect landed as the reattach finished — presenting again"
+        );
+    }
+}
+
+/// One supervision round of [`supervise_reattach`]: the outcome (`None` when
+/// the pane closed under it) and the relay generation a successful attempt
+/// was presented on. `first` is a reattach already sent, with the generation
+/// it was sent on.
+async fn supervise_once(
+    client: &RemoteAttachClient,
+    pane: &Arc<RemotePaneIo>,
+    mut first: Option<(oneshot::Receiver<Result<(), AttachError>>, u64)>,
+    announced_target_down: bool,
+    policy: &ReattachPolicy,
+) -> (Option<Result<(), AttachError>>, u64) {
+    let mut started = tokio::time::Instant::now();
+    // When our relay went down, if it is down now: that span is added back
+    // to `started` when it returns, pausing the window.
+    let mut relay_down_since: Option<tokio::time::Instant> = None;
+    let mut announced = announced_target_down;
+    let mut attempt: u32 = 0;
+    let mut renewals: u32 = 0;
+    let mut renewed_at: Option<tokio::time::Instant> = None;
+    loop {
+        if pane.is_finished() {
+            return (None, 0);
+        }
+        // Armed BEFORE the pump check and the attempt, so a reconnect that
+        // lands anywhere after this point still wakes this supervisor.
+        let reconnected = client.reconnected.notified();
+        tokio::pin!(reconnected);
+        reconnected.as_mut().enable();
+        if first.is_none() && !client.outbound_pump_state().0 {
+            // Our own relay is down: nothing reaches the target, so wait for
+            // it to return without spending the window (looking up now and
+            // then only to notice a closed tab).
+            relay_down_since.get_or_insert_with(tokio::time::Instant::now);
+            tokio::select! {
+                _ = &mut reconnected => {}
+                _ = tokio::time::sleep(RELAY_DOWN_RECHECK) => {}
+            }
+            continue;
+        }
+        if let Some(down) = relay_down_since.take() {
+            started += down.elapsed();
+        }
+        // The generation this attempt goes out on: for a frame sent before
+        // this supervisor ran, the one it was SENT on, not the current one.
+        let (sent, generation) = match first.take() {
+            Some((rx, generation)) => (Ok(rx), generation),
+            None => {
+                let generation = client.reconnect_gen.load(Ordering::Acquire);
+                (client.send_reattach(pane), generation)
+            }
+        };
+        let result = match sent {
+            Ok(rx) => {
+                let outcome = tokio::select! {
+                    // A reply that is already in wins over a reconnect that
+                    // is also in; the generation check below handles it.
+                    biased;
+                    r = client.await_reattach(pane, rx, policy.reply_timeout) => Some(r),
+                    _ = &mut reconnected => None,
+                };
+                match outcome {
+                    Some(r) => r,
+                    // The relay reconnected while this attempt waited: it
+                    // went out on the old connection, so present again on the
+                    // new one now rather than waiting out the reply timeout.
+                    None => {
+                        client.take_reattach_waiter(&pane.grant_jti());
+                        continue;
+                    }
+                }
+            }
+            Err(e) => Err(e),
+        };
+        let err = match result {
+            // A reconnect landed after this attempt was sent: the target may
+            // have re-bound on the OLD connection only, so present again.
+            Ok(()) if client.reconnect_gen.load(Ordering::Acquire) != generation => continue,
+            Ok(()) => {
+                info!(
                     grant_jti = %pane.grant_jti(),
-                    terminal_id = %pane.terminal_id(),
-                    error = %e,
-                    "remote attach: reattach frame not queued"
+                    attempts = attempt + 1,
+                    renewals,
+                    "remote attach: reattach supervisor done — pane live"
                 );
+                return (Some(Ok(())), generation);
+            }
+            Err(e) => e,
+        };
+        if pane.is_finished() {
+            return (None, 0);
+        }
+        let just_renewed = renewed_at.is_some_and(|t| t.elapsed() < policy.learn_window);
+        match classify_reattach_error(&err.code, just_renewed) {
+            ReattachStep::Retry => {}
+            ReattachStep::Fatal => return (Some(Err(err)), 0),
+            ReattachStep::Renew => {
+                if renewals >= policy.max_renewals {
+                    return (Some(Err(err)), 0);
+                }
+                let (Some(renewer), Some(session)) = (
+                    client.grant_renewer(),
+                    pane.session_id().map(str::to_string),
+                ) else {
+                    return (Some(Err(err)), 0);
+                };
+                let target = pane.target_device_id().map(str::to_string);
+                match renewer.renew(&session, target.as_deref()).await {
+                    Ok(_) if pane.is_finished() => return (None, 0),
+                    Ok(renewed) => {
+                        client.swap_grant(pane, &renewed);
+                        renewals += 1;
+                        renewed_at = Some(tokio::time::Instant::now());
+                        continue;
+                    }
+                    Err(e) => {
+                        return (
+                            Some(Err(AttachError {
+                                code: "attach_grant_renew_failed".to_string(),
+                                message: format!(
+                                    "{} — renewing the grant failed: {e}",
+                                    err.message
+                                ),
+                            })),
+                            0,
+                        )
+                    }
+                }
+            }
+        }
+        if err.code == TARGET_NOT_CONNECTED && !announced {
+            announced = true;
+            pane.note_target_not_connected();
+        }
+        attempt += 1;
+        if started.elapsed() >= policy.window {
+            return (
+                Some(Err(AttachError {
+                    code: "reattach_gave_up".to_string(),
+                    message: format!(
+                        "no reattach after {}s and {attempt} attempts; last answer {} ({})",
+                        policy.window.as_secs(),
+                        err.code,
+                        err.message
+                    ),
+                })),
+                0,
+            );
+        }
+        debug!(
+            grant_jti = %pane.grant_jti(),
+            attempt,
+            code = %err.code,
+            "remote attach: reattach refused — retrying"
+        );
+        tokio::select! {
+            _ = tokio::time::sleep(policy.delay(attempt)) => {}
+            _ = &mut reconnected => {}
+        }
+    }
+}
+
+/// Start a supervisor for every queued reattach request on the process-wide
+/// client. Needs a tokio runtime; without one the claim is released so a
+/// later reconnect can try again.
+fn spawn_reattach_tasks(c: &'static RemoteAttachClient) {
+    for req in c.take_reattach_requests() {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(supervise_reattach(c, req, ReattachPolicy::default()));
+            }
+            Err(_) => {
+                warn!("remote attach: no tokio runtime — reattach supervisor not started");
+                req.pane.end_reattach();
             }
         }
     }
@@ -4080,7 +5054,31 @@ fn end_error_reply(frame: EndErrorFrame, code: &str, message: &str) -> EndReply 
 /// `pending_end` TTL (75 s).
 pub const END_REPLY_TIMEOUT_CODE: &str = "end_reply_timeout";
 
+/// What the relay calls on every `connected`: re-present every live pane and
+/// start their supervisors.
+pub fn relay_connected() {
+    let c = client();
+    c.on_relay_connected();
+    spawn_reattach_tasks(c);
+}
+
+/// What the relay calls for every inbound remote-terminal frame: route it,
+/// then start any supervisor routing decided a pane needs.
+pub fn route_inbound(msg_type: &str, data: &Value) -> bool {
+    let c = client();
+    let consumed = c.handle_inbound(msg_type, data);
+    spawn_reattach_tasks(c);
+    consumed
+}
+
 const REATTACH_PREFIX: &str = "reattach:";
+
+/// The jti a `reattach:<jti>#<n>` request id names (`#<n>` optional).
+fn reattach_jti(rid: &str) -> Option<&str> {
+    let rest = rid.strip_prefix(REATTACH_PREFIX)?;
+    let jti = rest.split('#').next().unwrap_or(rest);
+    (!jti.is_empty()).then_some(jti)
+}
 const HISTORY_PREFIX: &str = "history:";
 
 /// Parse the shared shape of `remote_terminal_attached` / `remote_terminal_buffer`.
@@ -4115,6 +5113,10 @@ fn parse_attached(data: &Value) -> Option<AttachedReply> {
 mod tests {
     use super::*;
     use crate::terminal::pane_io::PaneIo;
+    use crate::terminal::remote_pane_io::{
+        REATTACHED_MARKER, RELAY_LOST_MARKER, TARGET_NOT_CONNECTED_MARKER,
+    };
+    use std::io::Write as _;
     use std::sync::Mutex as StdMutex;
 
     /// Plan 2026-09-16 Phase 1: the pump state reads "attached" exactly while
@@ -5052,6 +6054,7 @@ mod tests {
         // No remote block.
         let err = admit_terminal_attach(
             &table,
+            &RemoteCreateReaper::default(),
             || AcceptRemoteAttach::Tenant,
             &attach_frame(None),
             NOW,
@@ -5065,6 +6068,7 @@ mod tests {
         // Unknown grant.
         let err = admit_terminal_attach(
             &table,
+            &RemoteCreateReaper::default(),
             || AcceptRemoteAttach::Tenant,
             &attach_frame(Some(json!({"grant_jti": "ghost"}))),
             NOW,
@@ -5076,6 +6080,7 @@ mod tests {
         // Wrong source device: unknown, and the grant stays unbound.
         let err = admit_terminal_attach(
             &table,
+            &RemoteCreateReaper::default(),
             || AcceptRemoteAttach::Tenant,
             &attach_frame(Some(
                 json!({"grant_jti": "j1", "source_device_id": "intruder"}),
@@ -5090,6 +6095,7 @@ mod tests {
         // No local terminal hosts the session.
         let err = admit_terminal_attach(
             &table,
+            &RemoteCreateReaper::default(),
             || AcceptRemoteAttach::Tenant,
             &attach_frame(Some(
                 json!({"grant_jti": "j1", "source_device_id": "src-device"}),
@@ -5106,6 +6112,7 @@ mod tests {
         // Success binds to the resolved terminal.
         let (block, admitted, terminal_id, ()) = admit_terminal_attach(
             &table,
+            &RemoteCreateReaper::default(),
             || AcceptRemoteAttach::Tenant,
             &attach_frame(Some(
                 json!({"grant_jti": "j1", "source_device_id": "src-device"}),
@@ -5122,6 +6129,7 @@ mod tests {
         // Re-attach resolving to another terminal: bind mismatch.
         let err = admit_terminal_attach(
             &table,
+            &RemoteCreateReaper::default(),
             || AcceptRemoteAttach::Tenant,
             &attach_frame(Some(json!({"grant_jti": "j1"}))),
             NOW,
@@ -5133,6 +6141,7 @@ mod tests {
         // Same terminal is idempotent.
         assert!(admit_terminal_attach(
             &table,
+            &RemoteCreateReaper::default(),
             || AcceptRemoteAttach::Tenant,
             &attach_frame(Some(json!({"grant_jti": "j1"}))),
             NOW,
@@ -5142,6 +6151,7 @@ mod tests {
         // Preference off refuses before anything else.
         let err = admit_terminal_attach(
             &table,
+            &RemoteCreateReaper::default(),
             || AcceptRemoteAttach::Off,
             &attach_frame(Some(json!({"grant_jti": "j1"}))),
             NOW,
@@ -5182,6 +6192,7 @@ mod tests {
             match refusal {
                 AttachRefusal::GrantUnknown => admit_terminal_attach(
                     &table,
+                    &RemoteCreateReaper::default(),
                     || AcceptRemoteAttach::Tenant,
                     &attach_frame(Some(json!({"grant_jti": "ghost"}))),
                     NOW,
@@ -5191,6 +6202,7 @@ mod tests {
                     table.insert(grant("j-exp", None, NOW + 600), NOW);
                     admit_terminal_attach(
                         &table,
+                        &RemoteCreateReaper::default(),
                         || AcceptRemoteAttach::Tenant,
                         &attach_frame(Some(json!({"grant_jti": "j-exp"}))),
                         NOW + 601,
@@ -5201,6 +6213,7 @@ mod tests {
                     table.insert(grant("j-bound", Some("term-A"), NOW + 600), NOW);
                     admit_terminal_attach(
                         &table,
+                        &RemoteCreateReaper::default(),
                         || AcceptRemoteAttach::Tenant,
                         &attach_frame(Some(json!({"grant_jti": "j-bound"}))),
                         NOW,
@@ -5211,6 +6224,7 @@ mod tests {
                     table.insert(grant("j-off", None, NOW + 600), NOW);
                     admit_terminal_attach(
                         &table,
+                        &RemoteCreateReaper::default(),
                         || AcceptRemoteAttach::Off,
                         &attach_frame(Some(json!({"grant_jti": "j-off"}))),
                         NOW,
@@ -5221,10 +6235,27 @@ mod tests {
                     table.insert(grant("j-nolocal", None, NOW + 600), NOW);
                     admit_terminal_attach(
                         &table,
+                        &RemoteCreateReaper::default(),
                         || AcceptRemoteAttach::Tenant,
                         &attach_frame(Some(json!({"grant_jti": "j-nolocal"}))),
                         NOW,
                         none,
+                    )
+                }
+                AttachRefusal::TerminalClosing => {
+                    table.insert(grant("j-closing", None, NOW + 600), NOW);
+                    let reaper = RemoteCreateReaper::default();
+                    reaper.arm("term-A", None, tokio::time::Instant::now());
+                    let _closing = reaper
+                        .claim_create_close("term-A", || Ok(false))
+                        .expect("an admitted close is in flight");
+                    admit_terminal_attach(
+                        &table,
+                        &reaper,
+                        || AcceptRemoteAttach::Tenant,
+                        &attach_frame(Some(json!({"grant_jti": "j-closing"}))),
+                        NOW,
+                        resolves_to("term-A"),
                     )
                 }
                 AttachRefusal::EgressOff => {
@@ -5235,6 +6266,7 @@ mod tests {
                     );
                     admit_terminal_attach(
                         &table,
+                        &RemoteCreateReaper::default(),
                         || AcceptRemoteAttach::Tenant,
                         &attach_frame(Some(json!({"grant_jti": "j-egress"}))),
                         NOW,
@@ -5269,6 +6301,7 @@ mod tests {
         let empty = RemoteAttachGrants::new();
         let err = admit_terminal_attach(
             &empty,
+            &RemoteCreateReaper::default(),
             || AcceptRemoteAttach::Tenant,
             &attach_frame(None),
             NOW,
@@ -5552,6 +6585,9 @@ mod tests {
                 claude_pids: vec![1],
             },
             G::NoLiveClaude,
+            G::NoCloseAuthority {
+                claude_pids: vec![7],
+            },
             G::ProbeUnavailable {
                 detail: "ps failed".to_string(),
             },
@@ -5579,6 +6615,11 @@ mod tests {
                 G::Refused { .. } => {
                     Some((EndOutcome::Refused, None, Some("refused: unsent draft")))
                 }
+                G::NoCloseAuthority { .. } => Some((
+                    EndOutcome::Refused,
+                    None,
+                    Some("no_close_authority: a graceful end needs a close authority"),
+                )),
                 G::CloseRefused { .. } => {
                     Some((EndOutcome::Refused, None, Some("close_refused: relaunched")))
                 }
@@ -5670,6 +6711,38 @@ mod tests {
             fx.close_calls.load(SeqCst),
             0,
             "a refusal must not close the PTY"
+        );
+    }
+
+    /// R0a: the close-authority refusal is a refusal like any other. It is
+    /// answered `refused` with its reason, and above all it never takes the
+    /// bare-shell close, because a live `claude` is in that pane.
+    #[tokio::test]
+    async fn a_no_close_authority_refusal_never_reaches_the_bare_shell_close() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let fx = EndEffects::default();
+        let v = run_end(
+            &fx,
+            false,
+            Ok(
+                crate::terminal::graceful_exit::GracefulExitOutcome::NoCloseAuthority {
+                    claude_pids: vec![42],
+                },
+            ),
+            Ok(()),
+        )
+        .await;
+        assert_eq!(v.outcome, EndOutcome::Refused);
+        assert!(
+            v.reason
+                .as_deref()
+                .is_some_and(|r| r.starts_with("no_close_authority")),
+            "{v:?}"
+        );
+        assert_eq!(
+            fx.close_calls.load(SeqCst),
+            0,
+            "a live claude's pane must not be closed"
         );
     }
 
@@ -6447,12 +7520,12 @@ mod tests {
         client.on_relay_connected();
         let frame = client.lock_outbound().await.try_recv().unwrap();
         assert_eq!(frame["type"], "remote_terminal_attach");
-        assert_eq!(frame["request_id"], "reattach:jti-1");
+        assert!(rid_of(&frame).starts_with("reattach:jti-1#"), "{frame}");
         assert_eq!(frame["grant"], "grant.jwt");
 
         assert!(client.handle_inbound(
             "remote_terminal_attached",
-            &attached_frame("reattach:jti-1", "jti-1", b"56789ABCDE", 5)
+            &attached_frame(rid_of(&frame), "jti-1", b"56789ABCDE", 5)
         ));
         pane.mark_exit(0);
         let bytes = tokio::task::spawn_blocking(move || {
@@ -6753,15 +7826,22 @@ mod tests {
             client.register_pane(pane.clone());
             client.on_relay_connected();
             let frame = client.lock_outbound().await.try_recv().unwrap();
-            assert_eq!(frame["request_id"], "reattach:jti-1");
+            assert!(rid_of(&frame).starts_with("reattach:jti-1#"), "{frame}");
 
             assert!(
                 client.handle_inbound(
                     msg_type,
-                    &json!({"type": msg_type, "request_id": "reattach:jti-1", "code": code, "message": "gone"})
+                    &json!({"type": msg_type, "request_id": rid_of(&frame), "code": code, "message": "gone"})
                 ),
                 "{msg_type} for a reattach id is consumed"
             );
+            // The refusal went to the reattach supervisor's waiter; the
+            // supervisor settles it (no renewer here, so expiry is final too).
+            let reqs = client.take_reattach_requests();
+            assert_eq!(reqs.len(), 1, "{msg_type}: one supervisor queued");
+            for req in reqs {
+                supervise_reattach(&client, req, ReattachPolicy::default()).await;
+            }
             assert!(pane.is_finished(), "{msg_type}: pane closed");
             assert_eq!(
                 pane.wait(),
@@ -6769,6 +7849,473 @@ mod tests {
             );
             assert!(client.pane("jti-1").is_none(), "{msg_type}: pane dropped");
         }
+    }
+
+    // ---- reattach supervisor (plan 2026-10-02) ------------------------------
+
+    struct FixedRenewer {
+        calls: StdMutex<Vec<(String, Option<String>)>>,
+        next: StdMutex<Vec<RenewedGrant>>,
+    }
+
+    impl FixedRenewer {
+        fn new(grants: &[(&str, &str)]) -> Arc<Self> {
+            Arc::new(Self {
+                calls: StdMutex::new(Vec::new()),
+                next: StdMutex::new(
+                    grants
+                        .iter()
+                        .rev()
+                        .map(|(jti, grant)| RenewedGrant {
+                            grant_jti: jti.to_string(),
+                            grant: grant.to_string(),
+                        })
+                        .collect(),
+                ),
+            })
+        }
+    }
+
+    impl GrantRenewer for FixedRenewer {
+        fn renew<'a>(
+            &'a self,
+            session_id: &'a str,
+            target_device_id: Option<&'a str>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<RenewedGrant, String>> + Send + 'a>,
+        > {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((session_id.to_string(), target_device_id.map(str::to_string)));
+            let next = self.next.lock().unwrap().pop();
+            Box::pin(async move { next.ok_or_else(|| "coord refused".to_string()) })
+        }
+    }
+
+    /// A process-lifetime client, so a supervisor can be SPAWNED against it
+    /// the way production spawns one against `client()`.
+    fn leaked_client() -> &'static RemoteAttachClient {
+        Box::leak(Box::new(RemoteAttachClient::new()))
+    }
+
+    /// The request id a reattach frame went out with — what the target echoes.
+    fn rid_of(frame: &Value) -> &str {
+        frame["request_id"]
+            .as_str()
+            .expect("a reattach frame carries a request id")
+    }
+
+    /// The relay's refusal of the reattach attempt `frame` carried.
+    fn reattach_refusal(frame: &Value, code: &str) -> Value {
+        json!({"type": "error", "request_id": rid_of(frame), "code": code, "message": "m"})
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[test]
+    fn reattach_refusals_are_classified() {
+        use ReattachStep::*;
+        for (code, just_renewed, want) in [
+            ("target_not_connected", false, Retry),
+            ("relay_disconnected", false, Retry),
+            ("relay_unavailable", false, Retry),
+            ("timeout", false, Retry),
+            ("something_new", false, Retry),
+            ("attach_grant_expired", false, Renew),
+            ("attach_grant_expired", true, Renew),
+            ("attach_grant_unknown", false, Renew),
+            ("attach_grant_unknown", true, Retry),
+            ("attach_terminal_mismatch", false, Fatal),
+            ("session_not_local", false, Fatal),
+            ("attach_grant_wrong_source", false, Fatal),
+        ] {
+            assert_eq!(
+                classify_reattach_error(code, just_renewed),
+                want,
+                "{code} just_renewed={just_renewed}"
+            );
+        }
+    }
+
+    /// D1, the 2026-10-02 incident: both runners dropped in one backend
+    /// event; ours reconnected first and the reattach was refused
+    /// `target_not_connected`. The supervisor keeps re-presenting until the
+    /// target answers, and the pane says what happened at each step.
+    #[tokio::test(start_paused = true)]
+    async fn target_not_connected_is_retried_until_the_target_answers() {
+        let client = leaked_client();
+        let mut pump = client.lock_outbound().await;
+        let pane = new_pane(client, "jti-1", AttachedRing::default());
+        client.register_pane(pane.clone());
+        client.on_relay_disconnected();
+        client.on_relay_connected();
+        let mut reqs = client.take_reattach_requests();
+        assert_eq!(reqs.len(), 1);
+        let sup = tokio::spawn(supervise_reattach(
+            client,
+            reqs.pop().unwrap(),
+            ReattachPolicy::default(),
+        ));
+
+        for _ in 0..3 {
+            let f = pump.recv().await.unwrap();
+            assert!(rid_of(&f).starts_with("reattach:jti-1#"), "{f}");
+            assert!(client.handle_inbound("error", &reattach_refusal(&f, "target_not_connected")));
+        }
+        let f = pump.recv().await.unwrap();
+        assert!(rid_of(&f).starts_with("reattach:jti-1#"), "{f}");
+        assert!(client.handle_inbound(
+            "remote_terminal_attached",
+            &attached_frame(rid_of(&f), "jti-1", b"back", 0)
+        ));
+        sup.await.unwrap();
+
+        assert!(!pane.is_finished(), "the tab is live again");
+        assert!(!pane.is_reattaching(), "the supervisor released its claim");
+        assert!(client.pane("jti-1").is_some());
+        pane.mark_exit(0);
+        let out = read_all(&pane);
+        let mut want = RELAY_LOST_MARKER.to_vec();
+        want.extend_from_slice(TARGET_NOT_CONNECTED_MARKER);
+        want.extend_from_slice(REATTACHED_MARKER);
+        want.extend_from_slice(b"back");
+        assert_eq!(out, want, "{}", String::from_utf8_lossy(&out));
+    }
+
+    /// D2: a reattach past the grant's 15 minutes renews it for the pane's
+    /// session, re-keys the routing table, and re-presents the NEW grant;
+    /// keystrokes afterwards carry the new jti.
+    #[tokio::test(start_paused = true)]
+    async fn an_expired_grant_is_renewed_and_the_pane_rekeyed() {
+        let client = leaked_client();
+        let renewer = FixedRenewer::new(&[("jti-2", "grant-2.jwt")]);
+        client.set_grant_renewer(renewer.clone());
+        let mut pump = client.lock_outbound().await;
+        let pane = Arc::new(
+            RemotePaneIo::new(
+                "jti-1",
+                "remote-term",
+                "grant.jwt",
+                client.sink(),
+                80,
+                24,
+                AttachedRing::default(),
+            )
+            .with_session_id("session-uuid")
+            .with_target_device_id("target-device"),
+        );
+        client.register_pane(pane.clone());
+        client.on_relay_connected();
+        let sup = tokio::spawn(supervise_reattach(
+            client,
+            client.take_reattach_requests().pop().unwrap(),
+            ReattachPolicy::default(),
+        ));
+
+        let f = pump.recv().await.unwrap();
+        assert_eq!(f["grant"], "grant.jwt");
+        assert!(client.handle_inbound("error", &reattach_refusal(&f, "attach_grant_expired")));
+        // Renewed, then re-presented at once (no backoff after a renewal).
+        let f = pump.recv().await.unwrap();
+        assert!(rid_of(&f).starts_with("reattach:jti-2#"), "{f}");
+        assert_eq!(f["grant"], "grant-2.jwt");
+        // The target has not learned the new grant yet: the SAME new grant
+        // is presented again, not a third one minted.
+        assert!(client.handle_inbound("error", &reattach_refusal(&f, "attach_grant_unknown")));
+        let f = pump.recv().await.unwrap();
+        assert_eq!(f["grant"], "grant-2.jwt");
+        assert!(client.handle_inbound(
+            "remote_terminal_attached",
+            &attached_frame(rid_of(&f), "jti-2", b"", 0)
+        ));
+        sup.await.unwrap();
+
+        assert_eq!(
+            renewer.calls.lock().unwrap().as_slice(),
+            [(
+                "session-uuid".to_string(),
+                Some("target-device".to_string())
+            )]
+        );
+        assert!(!pane.is_finished());
+        assert_eq!(pane.grant_jti(), "jti-2");
+        assert!(client.pane("jti-1").is_none(), "the old jti routes nowhere");
+        assert!(client.pane("jti-2").is_some());
+        let mut w = pane.writer().unwrap();
+        w.write_all(b"ls\r").unwrap();
+        assert_eq!(pump.recv().await.unwrap()["grant_jti"], "jti-2");
+    }
+
+    /// D1 bound + D3: a target that never returns does not leave the tab on
+    /// "retrying" forever — the window closes it, and the pane says so.
+    #[tokio::test(start_paused = true)]
+    async fn the_reattach_window_closes_the_pane_with_a_notice() {
+        let client = leaked_client();
+        let mut pump = client.lock_outbound().await;
+        let pane = new_pane(client, "jti-1", AttachedRing::default());
+        client.register_pane(pane.clone());
+        client.on_relay_connected();
+        let policy = ReattachPolicy {
+            window: Duration::from_secs(20),
+            ..ReattachPolicy::default()
+        };
+        let sup = tokio::spawn(supervise_reattach(
+            client,
+            client.take_reattach_requests().pop().unwrap(),
+            policy,
+        ));
+        while !sup.is_finished() {
+            tokio::select! {
+                f = pump.recv() => {
+                    let f = f.unwrap();
+                    assert!(client.handle_inbound("error", &reattach_refusal(&f, "target_not_connected")), "{f}");
+                }
+                _ = tokio::time::sleep(Duration::from_secs(60)) => {}
+            }
+        }
+        sup.await.unwrap();
+        assert!(pane.is_finished());
+        assert_eq!(
+            pane.wait(),
+            Ok(crate::terminal::remote_pane_io::ERROR_EXIT_CODE)
+        );
+        assert!(client.pane("jti-1").is_none());
+        let out = read_all(&pane);
+        assert!(
+            contains(&out, b"remote tab closed (reattach_gave_up)"),
+            "{}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    /// A reattach answered for a DIFFERENT remote terminal (the session's
+    /// terminal was replaced) is never spliced into this pane.
+    #[tokio::test(start_paused = true)]
+    async fn a_reattach_bound_to_another_terminal_closes_the_pane_unspliced() {
+        let client = leaked_client();
+        let mut pump = client.lock_outbound().await;
+        let pane = new_pane(client, "jti-1", AttachedRing::default());
+        client.register_pane(pane.clone());
+        client.on_relay_connected();
+        let sup = tokio::spawn(supervise_reattach(
+            client,
+            client.take_reattach_requests().pop().unwrap(),
+            ReattachPolicy::default(),
+        ));
+        let f = pump.recv().await.unwrap();
+        let mut reply = attached_frame(rid_of(&f), "jti-1", b"OTHER", 0);
+        reply["terminal_id"] = json!("a-new-terminal");
+        assert!(client.handle_inbound("remote_terminal_attached", &reply));
+        sup.await.unwrap();
+        assert!(pane.is_finished());
+        let out = read_all(&pane);
+        assert!(
+            !contains(&out, b"OTHER"),
+            "{}",
+            String::from_utf8_lossy(&out)
+        );
+        assert!(contains(&out, b"attach_terminal_mismatch"));
+    }
+
+    /// Review round 1: while a supervisor owns the pane, a refusal that is
+    /// NOT the reattach's reply — a stale input frame refused
+    /// `attach_terminal_mismatch`, or a late `attach_grant_expired` arriving
+    /// between attempts — neither resolves the reattach waiter nor closes the
+    /// pane; the reattach's own reply still settles it.
+    #[tokio::test]
+    async fn refusals_of_other_frames_during_a_reattach_are_left_to_the_supervisor() {
+        let client = RemoteAttachClient::new();
+        let pane = new_pane(&client, "jti-1", AttachedRing::default());
+        client.register_pane(pane.clone());
+        client.on_relay_connected();
+        for code in ["attach_terminal_mismatch", "attach_grant_expired"] {
+            assert!(client.handle_inbound(
+                "remote_terminal_error",
+                &json!({"type": "remote_terminal_error", "grant_jti": "jti-1", "code": code, "message": "m"})
+            ));
+            assert!(
+                !pane.is_finished(),
+                "{code} closed a pane a supervisor owns"
+            );
+        }
+        let rid = client.reattach_waiters.lock().unwrap()["jti-1"].rid.clone();
+        assert!(client.handle_inbound(
+            "remote_terminal_attached",
+            &attached_frame(&rid, "jti-1", b"", 0)
+        ));
+        let req = client.take_reattach_requests().pop().unwrap();
+        supervise_reattach(&client, req, ReattachPolicy::default()).await;
+        assert!(!pane.is_finished());
+        assert!(!pane.is_reattaching());
+    }
+
+    /// Review round 2, finding 1: an outage of OUR OWN relay does not spend
+    /// the reattach window. A supervisor whose relay is down for far longer
+    /// than the window keeps the tab, and presents as soon as the relay
+    /// returns.
+    #[tokio::test(start_paused = true)]
+    async fn our_own_relay_outage_does_not_spend_the_reattach_window() {
+        let client = leaked_client();
+        let pane = new_pane(client, "jti-1", AttachedRing::default());
+        client.register_pane(pane.clone());
+        // The target dropped while our relay was up: a supervisor is queued…
+        assert!(client.handle_inbound(
+            "remote_terminal_error",
+            &json!({"type": "remote_terminal_error", "grant_jti": "jti-1",
+                    "code": "target_not_connected", "message": "m"})
+        ));
+        let policy = ReattachPolicy {
+            window: Duration::from_secs(20),
+            ..ReattachPolicy::default()
+        };
+        // …and our own relay is down (nobody holds the pump) for 10 minutes.
+        let sup = tokio::spawn(supervise_reattach(
+            client,
+            client.take_reattach_requests().pop().unwrap(),
+            policy,
+        ));
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        assert!(
+            !pane.is_finished(),
+            "our outage closed a tab whose target is fine"
+        );
+        assert!(!sup.is_finished());
+
+        // The relay returns: the supervisor presents on the new connection.
+        let mut pump = client.lock_outbound().await;
+        client.on_relay_connected();
+        let f = pump.recv().await.unwrap();
+        assert!(rid_of(&f).starts_with("reattach:jti-1#"), "{f}");
+        assert!(client.handle_inbound(
+            "remote_terminal_attached",
+            &attached_frame(rid_of(&f), "jti-1", b"", 0)
+        ));
+        sup.await.unwrap();
+        assert!(!pane.is_finished());
+        assert!(!pane.is_reattaching());
+    }
+
+    /// Review round 2, finding 2: a reconnect that lands while an attempt is
+    /// in flight (or right after its reply) is presented on again — the
+    /// attempt went out on the old connection, and leaving it would keep the
+    /// tab on the relay-lost notice.
+    #[tokio::test(start_paused = true)]
+    async fn a_reconnect_during_an_attempt_presents_again() {
+        let client = leaked_client();
+        let mut pump = client.lock_outbound().await;
+        let pane = new_pane(client, "jti-1", AttachedRing::default());
+        client.register_pane(pane.clone());
+        client.on_relay_connected();
+        let sup = tokio::spawn(supervise_reattach(
+            client,
+            client.take_reattach_requests().pop().unwrap(),
+            ReattachPolicy::default(),
+        ));
+        let f1 = pump.recv().await.unwrap();
+        // Let the supervisor reach its wait on the reply.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        // The reply and a second reconnect both land before the supervisor
+        // runs again.
+        assert!(client.handle_inbound(
+            "remote_terminal_attached",
+            &attached_frame(rid_of(&f1), "jti-1", b"", 0)
+        ));
+        client.on_relay_connected();
+        assert!(
+            client.take_reattach_requests().is_empty(),
+            "the owned pane is not given a second supervisor"
+        );
+        let f2 = pump.recv().await.unwrap();
+        assert_ne!(
+            rid_of(&f1),
+            rid_of(&f2),
+            "presented again on the new connection"
+        );
+        assert!(client.handle_inbound(
+            "remote_terminal_attached",
+            &attached_frame(rid_of(&f2), "jti-1", b"", 0)
+        ));
+        sup.await.unwrap();
+        assert!(!pane.is_finished());
+        assert!(!pane.is_reattaching());
+    }
+
+    /// Review round 2, finding 3: a late reply to an EARLIER attempt does not
+    /// settle the attempt in flight; only the current attempt's reply does.
+    #[tokio::test]
+    async fn a_late_reply_to_an_earlier_attempt_settles_nothing() {
+        let client = RemoteAttachClient::new();
+        let mut pump = client.lock_outbound().await;
+        let pane = new_pane(&client, "jti-1", AttachedRing::default());
+        client.register_pane(pane.clone());
+        assert!(pane.try_begin_reattach());
+        let first = client.send_reattach(&pane).unwrap();
+        let f1 = pump.recv().await.unwrap();
+        // The first attempt timed out; a second goes out.
+        client.take_reattach_waiter("jti-1");
+        drop(first);
+        let mut second = client.send_reattach(&pane).unwrap();
+        let f2 = pump.recv().await.unwrap();
+        assert_ne!(rid_of(&f1), rid_of(&f2));
+        // The first attempt's late refusal arrives: nothing is settled and the
+        // pane, owned by a supervisor, stays open.
+        assert!(client.handle_inbound("error", &reattach_refusal(&f1, "attach_grant_expired")));
+        assert!(
+            second.try_recv().is_err(),
+            "a stale reply settled the current attempt"
+        );
+        assert!(!pane.is_finished());
+        // The current attempt's own reply settles it.
+        assert!(client.handle_inbound("error", &reattach_refusal(&f2, "target_not_connected")));
+        assert_eq!(
+            second.try_recv().unwrap().unwrap_err().code,
+            "target_not_connected"
+        );
+    }
+
+    /// Review round 2, finding 5: a tab closed before the reattach goes out
+    /// sends no reattach — it would re-bind the target terminal to a tab that
+    /// no longer exists.
+    #[tokio::test]
+    async fn a_closed_pane_sends_no_reattach() {
+        let client = RemoteAttachClient::new();
+        let mut pump = client.lock_outbound().await;
+        let pane = new_pane(&client, "jti-1", AttachedRing::default());
+        pane.mark_exit(0);
+        assert_eq!(client.send_reattach(&pane).unwrap_err().code, "pane_closed");
+        assert!(pump.try_recv().is_err());
+    }
+
+    /// The 2026-10-01 arm: the TARGET's socket dropped while ours stayed up,
+    /// so no reconnect of ours will ever reattach. A `target_not_connected`
+    /// for a live pane queues a supervisor (once) and tells the pane.
+    #[test]
+    fn a_target_drop_with_our_relay_up_queues_one_supervisor() {
+        let client = RemoteAttachClient::new();
+        let pane = new_pane(&client, "jti-1", AttachedRing::default());
+        client.register_pane(pane.clone());
+        let frame = json!({
+            "type": "remote_terminal_error",
+            "grant_jti": "jti-1",
+            "code": "target_not_connected",
+            "message": "target device's relay socket disconnected",
+        });
+        assert!(client.handle_inbound("remote_terminal_error", &frame));
+        assert!(client.handle_inbound("remote_terminal_error", &frame));
+        let reqs = client.take_reattach_requests();
+        assert_eq!(
+            reqs.len(),
+            1,
+            "a second refusal does not start a second supervisor"
+        );
+        assert!(reqs[0].announced_target_down);
+        assert!(reqs[0].first.is_none());
+        assert!(!pane.is_finished());
+        pane.mark_exit(0);
+        assert_eq!(read_all(&pane), TARGET_NOT_CONNECTED_MARKER);
     }
 
     fn new_pane(client: &RemoteAttachClient, jti: &str, seed: AttachedRing) -> Arc<RemotePaneIo> {
@@ -7042,7 +8589,10 @@ mod tests {
         client.on_relay_connected();
         let first = rx.try_recv().expect("the reattach frame");
         assert_eq!(first["type"], "remote_terminal_attach");
-        assert_eq!(first["request_id"], "reattach:jti-1");
+        assert!(first["request_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("reattach:jti-1#"));
         assert!(rx.try_recv().is_err(), "nothing stale follows");
         // Frames queued on the live connection flow as normal.
         client
@@ -7834,6 +9384,8 @@ mod grant_gate_tests {
             CreateRefusal::WorkingDirNotAllowed,
             CreateRefusal::IntentRepoNotAllowed,
             CreateRefusal::EditSiblingNotAllowed,
+            CreateRefusal::CloseAttached,
+            CreateRefusal::CloseTerminalMismatch,
         ] {
             assert!(
                 !refusal_warrants_a_coord_reread(GrantFamily::Create, final_refusal.code()),
@@ -7981,7 +9533,7 @@ mod grant_gate_tests {
 
         // The cooldown is sized against the directive race (milliseconds), not
         // against the grant's 900 s life.
-        assert!(GRANT_REREAD_COOLDOWN_SECS > 0 && GRANT_REREAD_COOLDOWN_SECS < 60);
+        const { assert!(GRANT_REREAD_COOLDOWN_SECS > 0 && GRANT_REREAD_COOLDOWN_SECS < 60) };
 
         // --- and the cooldown must bound the STALL, not merely how often one
         // --- STARTS (review finding 5). In the SAME test, not a second one:
@@ -8950,6 +10502,7 @@ mod egress_tests {
         });
         let err = admit_terminal_attach(
             &table,
+            &RemoteCreateReaper::default(),
             || AcceptRemoteAttach::Tenant,
             &frame,
             1,
@@ -8995,5 +10548,930 @@ mod egress_tests {
             .await
             .unwrap_err();
         assert_eq!(err.code, "egress_off");
+    }
+}
+
+#[cfg(test)]
+mod create_grant_end_tests {
+    //! Plan `2026-09-23-remote-create-residuals-after-coord-registration-confirm`,
+    //! Phase 2: a create grant closes the one terminal it created, before anyone
+    //! attaches, and nothing else. Every refusal asserts the code AND that the
+    //! grant still admits the rightful frame, because "refused and untouched" is
+    //! the property: the verdict decides whether the driver ever runs.
+
+    use super::*;
+    use crate::mcp::remote_create_reaper::RemoteCreateReaper;
+    use serde_json::json;
+
+    const NOW: u64 = 1_700_000_000;
+    const JTI: &str = "jti-create-1";
+    const SOURCE: &str = "dev-source";
+    const TERMINAL: &str = "term-created";
+    const USER: &str = "11111111-1111-4111-8111-111111111111";
+    const OTHER_USER: &str = "22222222-2222-4222-8222-222222222222";
+
+    fn spent_table_for_user(user: &str, bound: Option<&str>) -> RemoteCreateGrants {
+        let table = RemoteCreateGrants::new();
+        assert!(table.insert(
+            CreateGrant {
+                grant_jti: JTI.to_string(),
+                source_device_id: SOURCE.to_string(),
+                source_user_id: user.to_string(),
+                expires_at: NOW + 900,
+            },
+            NOW,
+        ));
+        table.consume(JTI, Some(SOURCE), NOW).expect("spend");
+        if let Some(terminal) = bound {
+            assert!(table.bind_spent_terminal(JTI, terminal));
+        }
+        table
+    }
+
+    fn spent_table() -> RemoteCreateGrants {
+        spent_table_for_user(USER, Some(TERMINAL))
+    }
+
+    /// A reaper holding `TERMINAL` armed and never attached — the state a remote
+    /// create leaves behind until a source attaches.
+    fn armed() -> RemoteCreateReaper {
+        let reaper = RemoteCreateReaper::new(Duration::from_secs(1200));
+        reaper.arm(TERMINAL, None, tokio::time::Instant::now());
+        reaper
+    }
+
+    fn frame() -> Value {
+        json!({
+            "type": "terminal_end",
+            "request_id": "req-1",
+            "force": true,
+            "terminal_id": TERMINAL,
+            "remote": { "source_device_id": SOURCE, "grant_jti": JTI, "kind": "create" },
+        })
+    }
+
+    /// [`admit_create_grant_end`] with the claim dropped on the spot, answering
+    /// the admitted terminal: for the tests about WHETHER a close is admitted.
+    /// The tests about what an admitted close holds use [`end`] below.
+    #[allow(clippy::too_many_arguments)]
+    fn admit_with<P, U>(
+        attach_grants: &RemoteAttachGrants,
+        create_grants: &RemoteCreateGrants,
+        reaper: &RemoteCreateReaper,
+        preference: P,
+        local_user_id: U,
+        data: &Value,
+        now: u64,
+    ) -> Result<(RemoteBlock, String), Value>
+    where
+        P: FnOnce() -> AcceptRemoteCreate,
+        U: FnOnce() -> Option<String>,
+    {
+        admit_create_grant_end(
+            attach_grants,
+            create_grants,
+            reaper,
+            preference,
+            local_user_id,
+            data,
+            now,
+        )
+        .map(|(block, claim)| (block, claim.terminal_id().to_string()))
+    }
+
+    fn admit(table: &RemoteCreateGrants, data: &Value) -> Result<(RemoteBlock, String), Value> {
+        admit_with(
+            &RemoteAttachGrants::new(),
+            table,
+            &armed(),
+            || AcceptRemoteCreate::Tenant,
+            || Some(USER.to_string()),
+            data,
+            NOW,
+        )
+    }
+
+    fn assert_refused<T: std::fmt::Debug>(result: Result<T, Value>, code: &str, why: &str) {
+        let frame = result.expect_err(why);
+        assert_eq!(frame["type"], "error", "{why}");
+        assert_eq!(frame["code"], code, "{why}");
+        assert_eq!(
+            frame["request_id"], "req-1",
+            "{why}: the source correlates on this"
+        );
+        assert!(frame.get("terminal_id").is_none(), "{why}");
+    }
+
+    #[test]
+    fn a_close_under_the_matching_jti_is_admitted_with_the_tombstones_terminal() {
+        let table = spent_table();
+        let (block, terminal) = admit(&table, &frame()).expect("admitted");
+        assert_eq!(terminal, TERMINAL);
+        assert_eq!(block.grant_jti, JTI);
+        assert_eq!(block.kind, RemoteGrantKind::Create);
+        // It consumes nothing: a retry after an `unknown` reply is admitted too.
+        assert!(admit(&table, &frame()).is_ok());
+    }
+
+    #[test]
+    fn a_different_create_jti_is_refused() {
+        let mut other = frame();
+        other["remote"]["grant_jti"] = json!("jti-create-2");
+        let table = spent_table();
+        assert_refused(
+            admit(&table, &other),
+            "remote_create_grant_unknown",
+            "other jti",
+        );
+        assert!(admit(&table, &frame()).is_ok());
+    }
+
+    #[test]
+    fn an_expired_tombstone_is_refused() {
+        let table = spent_table();
+        let result = admit_with(
+            &RemoteAttachGrants::new(),
+            &table,
+            &armed(),
+            || AcceptRemoteCreate::Tenant,
+            || None,
+            &frame(),
+            NOW + 900,
+        );
+        assert_refused(result, "remote_create_grant_unknown", "expired");
+    }
+
+    #[test]
+    fn a_different_source_device_is_refused_as_unknown() {
+        let mut other = frame();
+        other["remote"]["source_device_id"] = json!("dev-elsewhere");
+        let table = spent_table();
+        assert_refused(
+            admit(&table, &other),
+            "remote_create_grant_unknown",
+            "wrong source",
+        );
+        assert!(admit(&table, &frame()).is_ok());
+    }
+
+    /// REQUIRED, not "checked when offered": the relay stamps this field, so an
+    /// opt-out rule would be opt-out by the party this check defends against.
+    #[test]
+    fn an_absent_or_blank_source_device_is_refused() {
+        let table = spent_table();
+        for strip in [json!(null), json!(""), json!("   ")] {
+            let mut other = frame();
+            other["remote"]["source_device_id"] = strip.clone();
+            assert_refused(
+                admit(&table, &other),
+                "remote_create_grant_unknown",
+                "no source",
+            );
+        }
+        let mut absent = frame();
+        absent["remote"]
+            .as_object_mut()
+            .unwrap()
+            .remove("source_device_id");
+        assert_refused(
+            admit(&table, &absent),
+            "remote_create_grant_unknown",
+            "absent source",
+        );
+        assert!(admit(&table, &frame()).is_ok());
+    }
+
+    #[test]
+    fn a_tombstone_naming_no_source_refuses_rather_than_skips() {
+        let table = RemoteCreateGrants::new();
+        table.mark_spent(
+            &CreateGrant {
+                grant_jti: JTI.to_string(),
+                source_device_id: "  ".to_string(),
+                source_user_id: USER.to_string(),
+                expires_at: NOW + 900,
+            },
+            NOW,
+        );
+        assert!(table.bind_spent_terminal(JTI, TERMINAL));
+        assert_refused(
+            admit(&table, &frame()),
+            "remote_create_grant_unknown",
+            "no row source",
+        );
+    }
+
+    #[test]
+    fn a_terminal_other_than_the_one_this_jti_created_is_refused() {
+        let table = spent_table();
+        let mut top = frame();
+        top["terminal_id"] = json!("term-someone-elses");
+        assert_refused(
+            admit(&table, &top),
+            "remote_create_close_terminal_mismatch",
+            "top",
+        );
+        let mut block = frame();
+        block["remote"]["terminal_id"] = json!("term-someone-elses");
+        assert_refused(
+            admit(&table, &block),
+            "remote_create_close_terminal_mismatch",
+            "block",
+        );
+        let mut agreeing = frame();
+        agreeing["remote"]["terminal_id"] = json!(TERMINAL);
+        assert!(admit(&table, &agreeing).is_ok());
+    }
+
+    #[test]
+    fn a_missing_terminal_id_is_refused() {
+        let table = spent_table();
+        let mut other = frame();
+        other.as_object_mut().unwrap().remove("terminal_id");
+        assert_refused(
+            admit(&table, &other),
+            "remote_create_close_terminal_mismatch",
+            "missing",
+        );
+        // The block's own copy does not stand in for the required one.
+        other["remote"]["terminal_id"] = json!(TERMINAL);
+        assert_refused(
+            admit(&table, &other),
+            "remote_create_close_terminal_mismatch",
+            "block only",
+        );
+    }
+
+    fn attach_table() -> RemoteAttachGrants {
+        let attach = RemoteAttachGrants::new();
+        assert!(attach.insert(
+            AttachGrant {
+                grant_jti: "jti-attach".to_string(),
+                session_id: Uuid::nil(),
+                source_device_id: SOURCE.to_string(),
+                terminal_id: None,
+                expires_at: NOW + 900,
+            },
+            NOW,
+        ));
+        attach
+    }
+
+    /// An attach grant, whether labelled as one or forged into a create block,
+    /// buys no close here: this path only ever honours a spent create grant.
+    #[test]
+    fn an_attach_grant_for_another_session_is_refused() {
+        let attach = attach_table();
+        let table = spent_table();
+        let run = |data: &Value| {
+            admit_with(
+                &attach,
+                &table,
+                &armed(),
+                || AcceptRemoteCreate::Tenant,
+                || None,
+                data,
+                NOW,
+            )
+        };
+        let mut labelled = frame();
+        labelled["remote"] = json!({ "source_device_id": SOURCE, "grant_jti": "jti-attach" });
+        assert_refused(
+            run(&labelled),
+            "remote_create_grant_required",
+            "attach kind",
+        );
+        let mut forged = frame();
+        forged["remote"]["grant_jti"] = json!("jti-attach");
+        assert_refused(run(&forged), "remote_create_grant_required", "forged kind");
+    }
+
+    #[test]
+    fn an_absent_or_malformed_block_is_refused() {
+        let table = spent_table();
+        let mut none = frame();
+        none.as_object_mut().unwrap().remove("remote");
+        assert_refused(
+            admit(&table, &none),
+            "remote_create_grant_required",
+            "no block",
+        );
+        let mut malformed = frame();
+        malformed["remote"] = json!({ "grant_jti": "", "kind": "create" });
+        assert_refused(
+            admit(&table, &malformed),
+            "remote_create_grant_required",
+            "malformed",
+        );
+    }
+
+    #[test]
+    fn a_spent_grant_whose_terminal_never_bound_is_refused() {
+        let table = spent_table_for_user(USER, None);
+        assert_refused(
+            admit(&table, &frame()),
+            "remote_create_grant_unknown",
+            "unbound",
+        );
+    }
+
+    /// Retention guard: deleting the ever-attached refusal fails this.
+    #[test]
+    fn an_ever_attached_terminal_is_refused() {
+        let table = spent_table();
+        let reaper = armed();
+        reaper.mark_attached(TERMINAL, tokio::time::Instant::now());
+        let result = admit_with(
+            &RemoteAttachGrants::new(),
+            &table,
+            &reaper,
+            || AcceptRemoteCreate::Tenant,
+            || None,
+            &frame(),
+            NOW,
+        );
+        assert_refused(result, "remote_create_close_attached", "ever attached");
+        assert!(
+            !reaper.is_closing_under_create(TERMINAL),
+            "refusal marks nothing"
+        );
+    }
+
+    /// The real reaper as the read: an armed never-attached terminal may close;
+    /// the same terminal once attached, or disarmed, or never armed may not.
+    #[test]
+    fn the_reapers_read_decides_the_ever_attached_refusal() {
+        let reaper = RemoteCreateReaper::new(Duration::from_secs(1200));
+        let t0 = tokio::time::Instant::now();
+        let table = spent_table();
+        let run = |reaper: &RemoteCreateReaper| {
+            admit_with(
+                &RemoteAttachGrants::new(),
+                &table,
+                reaper,
+                || AcceptRemoteCreate::Tenant,
+                || None,
+                &frame(),
+                NOW,
+            )
+        };
+        assert_refused(run(&reaper), "remote_create_close_attached", "no row");
+        reaper.arm(TERMINAL, None, t0);
+        assert!(run(&reaper).is_ok(), "armed and never attached");
+        // That claim was dropped with the result, so an attach may now bind.
+        assert!(!reaper.is_closing_under_create(TERMINAL));
+        reaper.mark_attached(TERMINAL, t0);
+        assert_refused(run(&reaper), "remote_create_close_attached", "attached");
+        assert!(reaper.take_due(t0 + Duration::from_secs(1300)).is_empty());
+        assert_refused(run(&reaper), "remote_create_close_attached", "disarmed");
+    }
+
+    /// Belt to the reaper's flag: a live binding that did not go through the
+    /// reaper (an armed, never-marked row) still refuses.
+    #[test]
+    fn a_grant_currently_bound_to_the_terminal_is_refused() {
+        let attach = attach_table();
+        assert!(attach.bind("jti-attach", TERMINAL));
+        let table = spent_table();
+        let reaper = armed();
+        let result = admit_with(
+            &attach,
+            &table,
+            &reaper,
+            || AcceptRemoteCreate::Tenant,
+            || None,
+            &frame(),
+            NOW,
+        );
+        assert_refused(result, "remote_create_close_attached", "bound now");
+        assert!(!reaper.is_closing_under_create(TERMINAL));
+    }
+
+    // ---- review finding 1: admission and the close are atomic against an attach ----
+
+    fn attach_frame_for_session() -> Value {
+        json!({
+            "type": "terminal_attach",
+            "request_id": "att-1",
+            "remote": { "source_device_id": SOURCE, "grant_jti": "jti-attach" },
+        })
+    }
+
+    fn attach(
+        grants: &RemoteAttachGrants,
+        reaper: &RemoteCreateReaper,
+    ) -> Result<(RemoteBlock, AttachGrant, String, ()), Value> {
+        admit_terminal_attach(
+            grants,
+            reaper,
+            || AcceptRemoteAttach::Tenant,
+            &attach_frame_for_session(),
+            NOW,
+            |_session| Some((TERMINAL.to_string(), ())),
+        )
+    }
+
+    fn end<'r>(
+        grants: &RemoteAttachGrants,
+        table: &RemoteCreateGrants,
+        reaper: &'r RemoteCreateReaper,
+    ) -> Result<(RemoteBlock, CreateCloseClaim<'r>), Value> {
+        admit_create_grant_end(
+            grants,
+            table,
+            reaper,
+            || AcceptRemoteCreate::Tenant,
+            || None,
+            &frame(),
+            NOW,
+        )
+    }
+
+    /// End first: once the create grant's close is ADMITTED, the attach that
+    /// arrives before the close runs is refused `attach_terminal_closing`, binds
+    /// nothing, and marks nothing — so the close that follows kills no attached
+    /// terminal. The same real tables both handlers use.
+    #[test]
+    fn an_attach_after_the_close_is_admitted_is_refused_and_binds_nothing() {
+        let grants = attach_table();
+        let table = spent_table();
+        let reaper = armed();
+
+        let (_, claim) = end(&grants, &table, &reaper).expect("close admitted");
+        assert_eq!(claim.terminal_id(), TERMINAL);
+        assert!(reaper.is_closing_under_create(TERMINAL));
+
+        let refused = attach(&grants, &reaper).expect_err("the attach loses");
+        assert_eq!(refused["type"], "error");
+        assert_eq!(refused["code"], "attach_terminal_closing");
+        assert_eq!(
+            grants.get("jti-attach").and_then(|g| g.terminal_id),
+            None,
+            "the losing attach bound nothing"
+        );
+        assert!(
+            !reaper.was_ever_attached(TERMINAL),
+            "the losing attach marked nothing"
+        );
+        // A retry of the admitted close is still admitted, and counted apart.
+        let retry = end(&grants, &table, &reaper).expect("retry admitted");
+        assert_eq!(reaper.create_closes_in_flight(TERMINAL), 2);
+        drop(retry);
+        assert!(
+            reaper.is_closing_under_create(TERMINAL),
+            "the first is still in flight"
+        );
+
+        // The close ending without closing it (dropped unsettled) ends the
+        // claim: the terminal is attachable again, and from then on the create
+        // grant cannot close it.
+        drop(claim);
+        assert_eq!(reaper.create_closes_in_flight(TERMINAL), 0);
+        attach(&grants, &reaper).expect("attachable once no close is in flight");
+        assert_refused(
+            end(&grants, &table, &reaper),
+            "remote_create_close_attached",
+            "attached after release",
+        );
+    }
+
+    /// Attach first: the bind and the ever-attached mark land together, so the
+    /// create grant's close that follows is refused `remote_create_close_attached`
+    /// and leaves no closing mark behind.
+    #[test]
+    fn a_close_after_an_attach_bound_is_refused() {
+        let grants = attach_table();
+        let table = spent_table();
+        let reaper = armed();
+
+        let (_, _, bound, ()) = attach(&grants, &reaper).expect("attach admitted");
+        assert_eq!(bound, TERMINAL);
+        assert!(reaper.was_ever_attached(TERMINAL), "marked with the bind");
+        assert_eq!(
+            grants
+                .get("jti-attach")
+                .and_then(|g| g.terminal_id)
+                .as_deref(),
+            Some(TERMINAL)
+        );
+
+        assert_refused(
+            end(&grants, &table, &reaper),
+            "remote_create_close_attached",
+            "the end loses",
+        );
+        assert!(!reaper.is_closing_under_create(TERMINAL));
+        // And a re-attach of the owned terminal is unaffected.
+        assert!(attach(&grants, &reaper).is_ok());
+    }
+
+    /// The two sides really are serialised by ONE lock: the claim runs its
+    /// attach-table read while holding the reaper's lock, so a bind racing it
+    /// from another thread is decided strictly before or strictly after. Run
+    /// many rounds; every round must end in exactly one winner, never both.
+    #[test]
+    fn concurrent_close_and_attach_never_both_win() {
+        for round in 0..200 {
+            let grants = std::sync::Arc::new(attach_table());
+            let table = std::sync::Arc::new(spent_table());
+            let reaper = std::sync::Arc::new(armed());
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let closer = {
+                let (grants, table, reaper, barrier) = (
+                    grants.clone(),
+                    table.clone(),
+                    reaper.clone(),
+                    barrier.clone(),
+                );
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    match end(&grants, &table, &reaper) {
+                        // As if the close then ended the terminal: sticky.
+                        Ok((_, claim)) => {
+                            claim.settle(true);
+                            true
+                        }
+                        Err(_) => false,
+                    }
+                })
+            };
+            let attacher = {
+                let (grants, reaper, barrier) = (grants.clone(), reaper.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    attach(&grants, &reaper).is_ok()
+                })
+            };
+            let closed = closer.join().unwrap();
+            let attached = attacher.join().unwrap();
+            assert!(
+                closed ^ attached,
+                "round {round}: closed={closed} attached={attached}"
+            );
+            assert_eq!(reaper.is_closing_under_create(TERMINAL), closed);
+            assert_eq!(reaper.was_ever_attached(TERMINAL), attached);
+        }
+    }
+
+    // ---- review finding 3: an unreadable attach table refuses the close ----
+
+    #[test]
+    fn a_poisoned_attach_table_refuses_the_close_and_marks_nothing() {
+        let grants = attach_table();
+        grants.poison_for_test();
+        assert!(grants.try_contains("jti-attach").is_err());
+        assert!(grants.try_any_bound_to(TERMINAL, NOW).is_err());
+        // The infallible reads still answer as before for their other callers.
+        assert!(!grants.contains("jti-attach"));
+        assert!(grants.grants_bound_to(TERMINAL, NOW).is_empty());
+
+        let table = spent_table();
+        let reaper = armed();
+        assert_refused(
+            end(&grants, &table, &reaper),
+            "remote_create_grant_unknown",
+            "poisoned attach table",
+        );
+        assert!(!reaper.is_closing_under_create(TERMINAL));
+    }
+
+    /// The bound-read half alone: an unreadable live-binding read refuses
+    /// `remote_create_close_attached` even with an armed, never-attached row.
+    #[test]
+    fn an_unreadable_binding_read_refuses_the_claim() {
+        let reaper = armed();
+        assert!(reaper.claim_create_close(TERMINAL, || Err(())).is_none());
+        assert!(reaper.claim_create_close(TERMINAL, || Ok(true)).is_none());
+        assert!(!reaper.is_closing_under_create(TERMINAL));
+        let claim = reaper.claim_create_close(TERMINAL, || Ok(false));
+        assert!(claim.is_some());
+        assert!(reaper.is_closing_under_create(TERMINAL));
+    }
+
+    // ---- re-review findings 1a/1b/1c: the in-flight count ----
+
+    fn verdict(outcome: EndOutcome, reason: &str) -> EndVerdict {
+        EndVerdict::new(outcome, None, Some(reason.to_string()))
+    }
+
+    /// 1a. An attach-grant end E holds the terminal's single-flight slot. A
+    /// create close C is admitted, is refused `end_already_running` by the REAL
+    /// single-flight, and E then fails. Nothing is left to clear a mark, so the
+    /// count must already be back to zero: a later attach is admitted.
+    #[tokio::test]
+    async fn a_create_close_refused_already_running_strands_nothing() {
+        let grants = attach_table();
+        let table = spent_table();
+        let reaper = armed();
+        let slots = EndSlots::default();
+
+        let e_slot = slots.try_acquire(TERMINAL).expect("E holds the slot");
+        let (_, claim) = end(&grants, &table, &reaper).expect("C admitted");
+        assert!(reaper.is_closing_under_create(TERMINAL));
+        let c = crate::mcp::remote_create_reaper::run_create_close(claim, || {
+            // Were C's driver to run, it would answer `ended`: the `refused`
+            // below is the proof it did not.
+            single_flight_end(&slots, TERMINAL, || async {
+                verdict(EndOutcome::Ended, "C drove while E held the slot")
+            })
+        })
+        .await;
+        assert_eq!(c.outcome, EndOutcome::Refused);
+        assert!(c
+            .reason
+            .as_deref()
+            .unwrap()
+            .starts_with(END_ALREADY_RUNNING));
+        assert_eq!(reaper.create_closes_in_flight(TERMINAL), 0);
+
+        // E fails (e.g. no_close_authority) and frees its slot without ever
+        // touching the reaper.
+        drop(e_slot);
+        assert!(!reaper.is_closing_under_create(TERMINAL));
+        attach(&grants, &reaper).expect("a later attach is admitted");
+    }
+
+    /// 1b. Two admitted create closes: A answers `still_running` while B has
+    /// not run yet. A's outcome must not reopen the terminal under B: an attach
+    /// is still refused until B finishes, and B's `ended` makes it permanent.
+    #[tokio::test]
+    async fn one_closes_outcome_does_not_reopen_the_terminal_under_another() {
+        use crate::mcp::remote_create_reaper::run_create_close;
+        let grants = attach_table();
+        let table = spent_table();
+        let reaper = armed();
+
+        let (_, a) = end(&grants, &table, &reaper).expect("A admitted");
+        let (_, b) = end(&grants, &table, &reaper).expect("B admitted");
+        assert_eq!(reaper.create_closes_in_flight(TERMINAL), 2);
+
+        let a = run_create_close(a, || async {
+            verdict(EndOutcome::StillRunning, "exit_stuck")
+        })
+        .await;
+        assert_eq!(a.outcome, EndOutcome::StillRunning);
+        assert_eq!(reaper.create_closes_in_flight(TERMINAL), 1);
+        let refused = attach(&grants, &reaper).expect_err("B is still in flight");
+        assert_eq!(refused["code"], "attach_terminal_closing");
+        assert_eq!(grants.get("jti-attach").and_then(|g| g.terminal_id), None);
+
+        let b = run_create_close(b, || async { verdict(EndOutcome::Ended, "force") }).await;
+        assert_eq!(b.outcome, EndOutcome::Ended);
+        assert_eq!(reaper.create_closes_in_flight(TERMINAL), 0);
+        assert!(reaper.is_closing_under_create(TERMINAL), "closed is sticky");
+        let refused = attach(&grants, &reaper).expect_err("closed for good");
+        assert_eq!(refused["code"], "attach_terminal_closing");
+    }
+
+    /// Only `ended` and `not_found` are sticky; every other outcome just ends
+    /// the claim, `unknown` and a non-already-running refusal included.
+    #[tokio::test]
+    async fn only_ended_and_not_found_close_the_terminal_for_good() {
+        use crate::mcp::remote_create_reaper::run_create_close;
+        for (outcome, sticky) in [
+            (EndOutcome::Ended, true),
+            (EndOutcome::NotFound, true),
+            (EndOutcome::Unknown, false),
+            (EndOutcome::Refused, false),
+            (EndOutcome::StillRunning, false),
+        ] {
+            let grants = attach_table();
+            let table = spent_table();
+            let reaper = armed();
+            let (_, claim) = end(&grants, &table, &reaper).expect("admitted");
+            run_create_close(claim, || async { verdict(outcome, "x") }).await;
+            assert_eq!(reaper.create_closes_in_flight(TERMINAL), 0, "{outcome:?}");
+            assert_eq!(
+                reaper.is_closing_under_create(TERMINAL),
+                sticky,
+                "{outcome:?}"
+            );
+            assert_eq!(attach(&grants, &reaper).is_ok(), !sticky, "{outcome:?}");
+        }
+    }
+
+    /// 1c. A close whose task is cancelled mid-drive (its future dropped while
+    /// the driver is still pending) still decrements the count.
+    #[tokio::test]
+    async fn a_cancelled_close_decrements_the_count() {
+        use crate::mcp::remote_create_reaper::run_create_close;
+        let grants = attach_table();
+        let table = spent_table();
+        let reaper = armed();
+
+        let (_, claim) = end(&grants, &table, &reaper).expect("admitted");
+        let drive = run_create_close(claim, std::future::pending::<EndVerdict>);
+        let cancelled = tokio::time::timeout(Duration::from_millis(20), drive).await;
+        assert!(cancelled.is_err(), "the driver never answered");
+        assert_eq!(reaper.create_closes_in_flight(TERMINAL), 0);
+        assert!(!reaper.is_closing_under_create(TERMINAL));
+        attach(&grants, &reaper).expect("attachable after the cancelled close");
+
+        // And a claim dropped with no close at all (a panic before the driver).
+        let grants = attach_table();
+        let reaper = armed();
+        let (_, claim) = end(&grants, &table, &reaper).expect("admitted");
+        drop(claim);
+        assert_eq!(reaper.create_closes_in_flight(TERMINAL), 0);
+    }
+
+    #[test]
+    fn the_dial_off_refuses_before_any_table_is_read() {
+        let table = spent_table();
+        let reaper = armed();
+        let result = admit_with(
+            &RemoteAttachGrants::new(),
+            &table,
+            &reaper,
+            || AcceptRemoteCreate::Off,
+            || panic!("the user is not read when the dial is off"),
+            &frame(),
+            NOW,
+        );
+        assert_refused(result, "remote_create_disabled", "dial off");
+        assert!(
+            !reaper.is_closing_under_create(TERMINAL),
+            "a refusal before the claim marks nothing"
+        );
+    }
+
+    #[test]
+    fn same_user_fails_closed_on_every_mismatch_and_unknown() {
+        let run = |granted: &str, local: Option<&str>| {
+            let table = spent_table_for_user(granted, Some(TERMINAL));
+            let local = local.map(str::to_string);
+            admit_with(
+                &RemoteAttachGrants::new(),
+                &table,
+                &armed(),
+                || AcceptRemoteCreate::SameUser,
+                move || local,
+                &frame(),
+                NOW,
+            )
+        };
+        for (granted, local) in [
+            (OTHER_USER, Some(USER)),
+            ("", Some(USER)),
+            (USER, None),
+            (USER, Some("  ")),
+        ] {
+            assert_refused(
+                run(granted, local),
+                "remote_create_source_user_not_allowed",
+                "same_user",
+            );
+        }
+        assert!(run(USER, Some(USER)).is_ok());
+    }
+
+    #[test]
+    fn a_zero_clock_is_refused() {
+        let table = spent_table();
+        let result = admit_with(
+            &RemoteAttachGrants::new(),
+            &table,
+            &armed(),
+            || AcceptRemoteCreate::Tenant,
+            || None,
+            &frame(),
+            0,
+        );
+        assert_refused(result, "remote_create_grant_unknown", "zero clock");
+        assert!(table.spent_for_close(JTI, Some(SOURCE), 0).is_none());
+    }
+
+    /// Retention guard: the bind is what makes a close admissible, and the first
+    /// terminal bound is the only one that ever can be.
+    #[test]
+    fn the_tombstone_keeps_the_first_terminal_bound() {
+        let table = spent_table_for_user(USER, None);
+        assert!(table.bind_spent_terminal(JTI, TERMINAL));
+        assert!(table.bind_spent_terminal(JTI, TERMINAL), "idempotent");
+        assert!(!table.bind_spent_terminal(JTI, "term-second"));
+        let tombstone = table.spent_for_close(JTI, Some(SOURCE), NOW).unwrap();
+        assert_eq!(tombstone.terminal_id.as_deref(), Some(TERMINAL));
+        assert_eq!(tombstone.source_user_id, USER);
+        assert!(!table.bind_spent_terminal("jti-never-spent", TERMINAL));
+    }
+
+    /// Widening the tombstone left its first job alone: a spent jti still cannot
+    /// be re-recorded by the feed, bound or not, until it expires.
+    #[test]
+    fn a_bound_tombstone_still_refuses_resurrection_and_purges_at_expiry() {
+        let table = spent_table();
+        let again = CreateGrant {
+            grant_jti: JTI.to_string(),
+            source_device_id: SOURCE.to_string(),
+            source_user_id: USER.to_string(),
+            expires_at: NOW + 900,
+        };
+        assert!(!table.insert(again, NOW));
+        assert_eq!(table.spent_len(NOW), 1);
+        table.purge_expired(NOW + 900);
+        assert_eq!(table.spent_len(NOW), 0);
+    }
+
+    #[tokio::test]
+    async fn the_create_grant_end_frame_carries_the_contract_fields() {
+        let client = Arc::new(RemoteAttachClient::new());
+        let mut pump = client.lock_outbound().await;
+        let c = client.clone();
+        let task = tokio::spawn(async move {
+            c.end(
+                EndGrant::Create {
+                    grant: "create-jwt",
+                    terminal_id: TERMINAL,
+                },
+                true,
+                Duration::from_secs(5),
+            )
+            .await
+        });
+        let sent = pump.recv().await.expect("frame sent");
+        let keys: std::collections::BTreeSet<_> = sent
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from([
+                "create_grant",
+                "force",
+                "request_id",
+                "terminal_id",
+                "type"
+            ])
+        );
+        assert_eq!(sent["type"], "remote_terminal_end");
+        assert_eq!(sent["create_grant"], "create-jwt");
+        assert_eq!(sent["terminal_id"], TERMINAL);
+        assert_eq!(sent["force"], true);
+        assert!(client.handle_inbound(
+            "remote_terminal_ended",
+            &json!({
+                "type": "remote_terminal_ended",
+                "request_id": sent["request_id"],
+                "session_id": null,
+                "terminal_id": TERMINAL,
+                "outcome": "ended",
+                "via": "force",
+            }),
+        ));
+        let reply = task.await.unwrap();
+        assert_eq!(reply.outcome, EndOutcome::Ended);
+        assert_eq!(reply.session_id, None);
+    }
+
+    /// The two new codes reach the source's waiter as `refused`, code first, on
+    /// the frame the relay translates a target refusal to. They do not join
+    /// [`END_FORWARDED_UNANSWERED_CODES`], which would read them as `unknown`.
+    #[tokio::test]
+    async fn the_new_refusal_codes_land_as_refused_with_the_code_as_reason() {
+        for refusal in [
+            CreateRefusal::CloseAttached,
+            CreateRefusal::CloseTerminalMismatch,
+        ] {
+            let client = Arc::new(RemoteAttachClient::new());
+            let mut pump = client.lock_outbound().await;
+            let c = client.clone();
+            let task = tokio::spawn(async move {
+                c.end(
+                    EndGrant::Create {
+                        grant: "g",
+                        terminal_id: TERMINAL,
+                    },
+                    true,
+                    Duration::from_secs(5),
+                )
+                .await
+            });
+            let sent = pump.recv().await.expect("frame sent");
+            assert!(client.handle_inbound(
+                "remote_terminal_error",
+                &json!({
+                    "type": "remote_terminal_error",
+                    "request_id": sent["request_id"],
+                    "code": refusal.code(),
+                    "message": refusal.message(),
+                }),
+            ));
+            let reply = task.await.unwrap();
+            assert_eq!(reply.outcome, EndOutcome::Refused);
+            assert!(reply.reason.unwrap().starts_with(refusal.code()));
+        }
+    }
+
+    #[test]
+    fn a_not_found_end_frame_may_carry_no_session() {
+        let verdict = EndVerdict::new(EndOutcome::NotFound, None, Some("gone".to_string()));
+        let reply = terminal_ended_frame(&frame(), None, Some(TERMINAL), &verdict);
+        assert_eq!(reply["type"], "terminal_ended");
+        assert_eq!(reply["session_id"], Value::Null);
+        assert_eq!(reply["terminal_id"], TERMINAL);
+        assert_eq!(reply["outcome"], "not_found");
+        assert_eq!(reply["grant_jti"], JTI);
     }
 }
