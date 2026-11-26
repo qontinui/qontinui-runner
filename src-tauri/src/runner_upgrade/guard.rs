@@ -34,7 +34,9 @@ use super::sys::{self, CommandRunner};
 pub trait GuardEffects {
     fn commands(&self) -> &dyn CommandRunner;
     fn swap_link(&self, link: &Path, target: &Path) -> Result<(), String>;
-    fn pid_alive(&self, pid: u32) -> bool;
+    /// Is `pid` still the process started with `flag <value>`
+    /// ([`sys::pid_runs_with`])? A reused pid answers false.
+    fn pid_runs_with(&self, pid: u32, flag: &str, value: &str) -> bool;
     /// End `pid` (SIGTERM, then SIGKILL after a grace).
     fn terminate(&self, pid: u32) -> Result<(), String>;
     fn spawn_detached(&self, exe: &Path, args: &[String]) -> Result<u32, String>;
@@ -63,6 +65,10 @@ impl GuardOutcome {
 
 /// Fire the guard for the record at `record_path`.
 pub fn run_guard(record_path: &Path, fx: &dyn GuardEffects) -> Result<GuardOutcome, String> {
+    // Held for the whole run: probation cannot conclude (or cancel this
+    // guard's unit) between the state read below and the rollback.
+    let _lock = record::lock_record(record_path)
+        .map_err(|e| format!("lock {}: {e}", record_path.display()))?;
     let mut rec = record::read_record(record_path)?;
     let dir = record_path.parent().unwrap_or(Path::new("."));
     let now = || record::rfc3339(chrono::Utc::now());
@@ -106,6 +112,16 @@ pub fn run_guard(record_path: &Path, fx: &dyn GuardEffects) -> Result<GuardOutco
         Ok(GuardOutcome::RollbackFailed(reason))
     };
 
+    // A pruned rollback target would leave `current` dangling, which no
+    // restart can serve: refuse before touching the link.
+    if !rec.from_dir.is_dir() {
+        let msg = format!(
+            "the rollback target {} no longer exists; `current` is left on {}",
+            rec.from_dir.display(),
+            rec.to_sha
+        );
+        return fail(&mut rec, msg);
+    }
     if let Err(e) = fx.swap_link(&rec.current_link, &rec.from_dir) {
         let msg = format!("re-point {}: {e}", rec.current_link.display());
         return fail(&mut rec, msg);
@@ -127,7 +143,10 @@ pub fn run_guard(record_path: &Path, fx: &dyn GuardEffects) -> Result<GuardOutco
             from_exe,
             successor_pid,
         } => {
-            if let Some(pid) = successor_pid.filter(|p| fx.pid_alive(*p)) {
+            let record_arg = record_path.display().to_string();
+            if let Some(pid) =
+                successor_pid.filter(|p| fx.pid_runs_with(*p, "--upgrade-successor", &record_arg))
+            {
                 if let Err(e) = fx.terminate(pid) {
                     return fail(&mut rec, format!("end the successor {pid}: {e}"));
                 }
@@ -162,8 +181,8 @@ impl GuardEffects for RealGuardEffects {
     fn swap_link(&self, link: &Path, target: &Path) -> Result<(), String> {
         sys::swap_link_atomically(link, target).map_err(|e| e.to_string())
     }
-    fn pid_alive(&self, pid: u32) -> bool {
-        sys::pid_alive(pid)
+    fn pid_runs_with(&self, pid: u32, flag: &str, value: &str) -> bool {
+        sys::pid_runs_with(pid, flag, value)
     }
     fn terminate(&self, pid: u32) -> Result<(), String> {
         super::spawn::terminate(pid, Duration::from_secs(30))
@@ -230,8 +249,8 @@ mod tests {
                 .push(format!("swap -> {}", target.display()));
             sys::swap_link_atomically(link, target).map_err(|e| e.to_string())
         }
-        fn pid_alive(&self, pid: u32) -> bool {
-            self.alive.contains(&pid)
+        fn pid_runs_with(&self, pid: u32, flag: &str, _value: &str) -> bool {
+            flag == "--upgrade-successor" && self.alive.contains(&pid)
         }
         fn terminate(&self, pid: u32) -> Result<(), String> {
             self.log.lock().unwrap().push(format!("terminate {pid}"));

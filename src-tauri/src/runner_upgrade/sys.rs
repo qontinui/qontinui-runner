@@ -253,6 +253,35 @@ fn same_dir(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// Is `pid` still the process this upgrade started — alive AND running with
+/// `flag` immediately followed by `value` on its command line? A recorded pid
+/// is only a number: by the time a guard or probation reads it back the
+/// process may have exited and the number been reused, and signalling it then
+/// ends an unrelated process. Linux reads `/proc/<pid>/cmdline`. Elsewhere the
+/// command line is not read, and only liveness is checked.
+pub fn pid_runs_with(pid: u32, flag: &str, value: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            return false;
+        };
+        cmdline_has_pair(&raw, flag, value)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (flag, value);
+        pid_alive(pid)
+    }
+}
+
+/// `true` when the NUL-separated `cmdline` carries `flag` immediately followed
+/// by `value`.
+pub fn cmdline_has_pair(cmdline: &[u8], flag: &str, value: &str) -> bool {
+    let args: Vec<&[u8]> = cmdline.split(|b| *b == 0).collect();
+    args.windows(2)
+        .any(|w| w[0] == flag.as_bytes() && w[1] == value.as_bytes())
+}
+
 /// Is `pid` a live process? `kill(pid, 0)`: success, or `EPERM` (alive, not
 /// ours). Off Unix: `false` is never claimed — the caller gets `true` so it
 /// waits rather than racing a live process.
@@ -276,6 +305,29 @@ pub fn pid_alive(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pid_is_ours_only_when_its_command_line_carries_the_flag_and_record() {
+        let line = b"/opt/r/qontinui-runner\0--upgrade-successor\0/u/rec.json\0";
+        assert!(cmdline_has_pair(line, "--upgrade-successor", "/u/rec.json"));
+        assert!(!cmdline_has_pair(
+            line,
+            "--upgrade-successor",
+            "/u/other.json"
+        ));
+        assert!(!cmdline_has_pair(line, "--upgrade-guard", "/u/rec.json"));
+        assert!(!cmdline_has_pair(
+            b"/u/rec.json\0--upgrade-successor\0",
+            "--upgrade-successor",
+            "/u/rec.json"
+        ));
+        // This test process was not started with the flag.
+        assert!(!pid_runs_with(
+            std::process::id(),
+            "--upgrade-successor",
+            "/u/rec.json"
+        ));
+    }
 
     #[test]
     fn unit_is_read_from_the_user_manager_cgroup_only() {

@@ -94,6 +94,7 @@ pub mod names {
     pub const RESTART_MECHANISM: &str = "restart_mechanism";
     pub const ROLLBACK_GUARD: &str = "rollback_guard";
     pub const PG_SCHEMA: &str = "pg_schema";
+    pub const NO_UPGRADE_IN_FLIGHT: &str = "no_upgrade_in_flight";
 }
 
 /// How the successor will be started.
@@ -173,8 +174,9 @@ pub struct CensusFacts {
     pub unresolved_panes: usize,
     /// Sessions not in a holder, that a restart would end.
     pub dies_with_runner: Vec<ResumeSpec>,
-    /// `live_claude.undecided`.
-    pub undecided: usize,
+    /// `live_claude.undecided`; `None` when the verdict carries no
+    /// `live_claude` block (UNKNOWN, never zero).
+    pub undecided: Option<usize>,
 }
 
 /// Map the restart-readiness verdict. `config_dir_of(session_id)` supplies a
@@ -200,7 +202,7 @@ pub fn census_facts(
         live_holders: live_holders_from(hp, t),
         unresolved_panes: hp.unresolved_panes,
         dies_with_runner: dies_with_runner_from(t, h, hp, a, config_dir_of),
-        undecided: v.live_claude.as_ref().map(|l| l.undecided).unwrap_or(0),
+        undecided: v.live_claude.as_ref().map(|l| l.undecided),
     })
 }
 
@@ -320,6 +322,9 @@ pub struct PreflightInputs<'a> {
     /// ([`super::listener_fds::registered`]).
     pub self_managed_fds: usize,
     pub pg_schema: Result<String, String>,
+    /// [`super::record::open_upgrade_ids`]: upgrades whose guard is still
+    /// armed. `Err` when the upgrade records could not be read.
+    pub open_upgrades: Result<Vec<String>, String>,
     pub checked_at: String,
 }
 
@@ -357,6 +362,23 @@ pub fn evaluate(inputs: PreflightInputs<'_>, runner: &dyn CommandRunner) -> Pref
         None => RestartPath::SelfManaged,
     };
 
+    // ── No other upgrade is open ───────────────────────────────────────────
+    // A successor still in probation has its own guard armed; a second
+    // upgrade would arm another against the same `current` link.
+    checks.push(match &inputs.open_upgrades {
+        Err(e) => Check::unknown(NO_UPGRADE_IN_FLIGHT, e.clone()),
+        Ok(ids) if ids.is_empty() => {
+            Check::pass(NO_UPGRADE_IN_FLIGHT, "no upgrade is in flight or awaiting its guard")
+        }
+        Ok(ids) => Check::fail(
+            NO_UPGRADE_IN_FLIGHT,
+            format!(
+                "upgrade(s) {} still open (in flight or probation failed); wait for its guard or probation to conclude",
+                ids.join(", ")
+            ),
+        ),
+    });
+
     // ── The census (restart-readiness) ─────────────────────────────────────
     let census = inputs.census.as_ref();
     checks.push(match census {
@@ -383,7 +405,9 @@ pub fn evaluate(inputs: PreflightInputs<'_>, runner: &dyn CommandRunner) -> Pref
                 HANDOFF_AVAILABLE,
                 format!(
                     "safe_with_handoff: false ({} unresolved pane(s), {} undecided process(es)): {}",
-                    c.unresolved_panes, c.undecided, c.reason
+                    c.unresolved_panes,
+                    c.undecided.map_or_else(|| "an unknown number of".to_string(), |n| n.to_string()),
+                    c.reason
                 ),
             ),
         },
@@ -526,6 +550,18 @@ fn non_holder_check(census: Result<&CensusFacts, &String>, rehome: &RehomeOutcom
                     .map(|(s, why)| format!("{s} ({why})"))
                     .collect::<Vec<_>>()
                     .join(", ")
+            ),
+        ),
+        // The census here is the one re-read after the rehome: a session
+        // still outside a holder was missed by it, and is UNKNOWN, never
+        // passed for a report that does not name it.
+        RehomeOutcome::Report(r) if !c.dies_with_runner.is_empty() => Check::unknown(
+            N,
+            format!(
+                "after the rehome ({} rehomed), {} session(s) are still outside a holder: {}",
+                r.rehomed.len(),
+                c.dies_with_runner.len(),
+                c.dies_with_runner.iter().map(name).collect::<Vec<_>>().join(", ")
             ),
         ),
         RehomeOutcome::Report(r) => Check::pass(
@@ -1162,7 +1198,7 @@ pub(crate) mod tests {
             }],
             unresolved_panes: 0,
             dies_with_runner: vec![],
-            undecided: 0,
+            undecided: Some(0),
         }
     }
 
@@ -1210,6 +1246,7 @@ pub(crate) mod tests {
             systemd_unit: Some("qontinui-runner.service".into()),
             self_managed_fds: 0,
             pg_schema: Ok("md5:abc/10".into()),
+            open_upgrades: Ok(Vec::new()),
             checked_at: "2026-11-24T22:00:00Z".into(),
         }
     }
@@ -1230,7 +1267,7 @@ pub(crate) mod tests {
         let r = evaluate(inputs(&f, Ok(healthy_census())), &runner);
         assert!(r.ok, "{:#?}", r.checks);
         assert_eq!(r.verdict, "pass");
-        assert_eq!(r.checks.len(), 12);
+        assert_eq!(r.checks.len(), 13);
         assert!(r.checks.iter().all(|c| c.verdict == Verdict::Pass));
         assert_eq!(r.candidate_sha.as_deref(), CANDIDATE_SHA.get(..12));
         assert!(runner.called("merge-base --is-ancestor 4d524e71bcc3 9f00aa11bb22"));
@@ -1315,11 +1352,22 @@ pub(crate) mod tests {
         let r = evaluate(i, &healthy_runner(&f));
         assert_eq!(verdict_of(&r, names::NON_HOLDER_SESSIONS), Verdict::Unknown);
 
+        let rehomed = || {
+            RehomeOutcome::Report(RehomeReport {
+                rehomed: vec!["22222222-2222-2222-2222-222222222222".into()],
+                ..Default::default()
+            })
+        };
+        // The census re-read after the rehome still lists a session outside
+        // a holder: the report did not cover it, so UNKNOWN.
         let mut i = inputs(&f, Ok(c));
-        i.rehome = RehomeOutcome::Report(RehomeReport {
-            rehomed: vec!["22222222-2222-2222-2222-222222222222".into()],
-            ..Default::default()
-        });
+        i.rehome = rehomed();
+        let r = evaluate(i, &healthy_runner(&f));
+        assert_eq!(verdict_of(&r, names::NON_HOLDER_SESSIONS), Verdict::Unknown);
+
+        // The re-read census is clear: every session is now holder-backed.
+        let mut i = inputs(&f, Ok(healthy_census()));
+        i.rehome = rehomed();
         let r = evaluate(i, &healthy_runner(&f));
         assert_eq!(verdict_of(&r, names::NON_HOLDER_SESSIONS), Verdict::Pass);
     }
@@ -1556,6 +1604,32 @@ pub(crate) mod tests {
             restart_mechanism(&unit, &f.layout, &FakeRunner::default()).verdict,
             Verdict::Fail
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_open_upgrade_blocks_and_an_unreadable_one_is_unknown() {
+        let f = fixture();
+        let runner = healthy_runner(&f);
+
+        let mut i = inputs(&f, Ok(healthy_census()));
+        i.open_upgrades = Ok(vec!["20261124T220000.000Z".into()]);
+        let r = evaluate(i, &runner);
+        assert_eq!(verdict_of(&r, names::NO_UPGRADE_IN_FLIGHT), Verdict::Fail);
+        assert_eq!(r.blocking, vec![names::NO_UPGRADE_IN_FLIGHT]);
+        assert!(!r.ok);
+
+        let mut i = inputs(&f, Ok(healthy_census()));
+        i.open_upgrades = Err("1 unreadable upgrade record(s)".into());
+        let r = evaluate(i, &runner);
+        assert_eq!(
+            verdict_of(&r, names::NO_UPGRADE_IN_FLIGHT),
+            Verdict::Unknown
+        );
+        assert_eq!(r.blocking, vec![names::NO_UPGRADE_IN_FLIGHT]);
+
+        let r = evaluate(inputs(&f, Ok(healthy_census())), &runner);
+        assert_eq!(verdict_of(&r, names::NO_UPGRADE_IN_FLIGHT), Verdict::Pass);
     }
 
     #[cfg(unix)]

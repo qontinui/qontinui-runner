@@ -1886,6 +1886,25 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // monitor's `allocator` line carries the arena count that shows it holds.
     qontinui_runner_lib::malloc_tuning::log_startup_attempt();
 
+    // A self-managed upgrade's successor (`--upgrade-successor <record>`)
+    // waits for its predecessor to exit BEFORE it adopts the inherited API
+    // listener (two processes accepting on one socket would split clients
+    // between a booting successor and a runner that may yet abort the
+    // upgrade) and BEFORE the single-instance plugin registers: while the
+    // predecessor lives, the plugin would forward this launch to it and exit
+    // (plan
+    // 2026-11-24-runner-upgrades-itself-daily-keeping-sessions-alive-with-no-outage-and-automatic-rollback, D1).
+    match runner_upgrade::cli::wait_for_predecessor_if_successor() {
+        Ok(true) => {
+            info!("runner upgrade: the predecessor has exited; this successor continues its boot")
+        }
+        Ok(false) => {}
+        Err(e) => {
+            error!("runner upgrade: not starting as the successor: {e}");
+            std::process::exit(1);
+        }
+    }
+
     // What `main` took from LISTEN_FDS before logging existed, then — when an
     // `api` listener was inherited — start answering it NOW, on the dedicated
     // API runtime, with 503 RUNNER_BOOTING until `mcp_api::start_server`
@@ -2789,22 +2808,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // Secondary instances (spawned by InstanceManager) must NOT use single-instance
     // plugin — it would prevent them from starting since they share the same binary.
     let is_secondary_instance = instance::is_secondary();
-
-    // A self-managed upgrade's successor (`--upgrade-successor <record>`)
-    // waits for its predecessor to exit BEFORE the single-instance plugin
-    // registers: while the predecessor lives, the plugin would forward this
-    // launch to it and exit (plan
-    // 2026-11-24-runner-upgrades-itself-daily-keeping-sessions-alive-with-no-outage-and-automatic-rollback, D1).
-    match runner_upgrade::cli::wait_for_predecessor_if_successor() {
-        Ok(true) => {
-            info!("runner upgrade: the predecessor has exited; this successor continues its boot")
-        }
-        Ok(false) => {}
-        Err(e) => {
-            error!("runner upgrade: not starting as the successor: {e}");
-            std::process::exit(1);
-        }
-    }
 
     boot_stage::stamp(boot_stage::BootStage::TauriBuilder);
     let mut builder = tauri::Builder::default();
