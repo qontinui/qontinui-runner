@@ -723,7 +723,7 @@ export function backfillClaudeSessionIds(
  * monotonic max (`noteTabTotalBytes`), so a stale or lower reading is harmless
  * and a missing / non-finite value is skipped rather than recorded.
  */
-export function seedTotalBytesFromList(store: TerminalHotStore, terminals: TerminalInfo[]): void {
+export function seedTotalBytesFromList(store: TerminalHotStore, terminals: readonly TerminalInfo[]): void {
   for (const t of terminals) {
     const total = (t as { totalBytesProduced?: unknown }).totalBytesProduced;
     if (typeof total !== "number" || !Number.isFinite(total)) continue;
