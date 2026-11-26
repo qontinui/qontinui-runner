@@ -662,19 +662,16 @@ fn error_detail_from(
     super::types::UiBridgeErrorDetail {
         code: classified.code,
         message,
-        recovery: classified.recovery.as_ref().map(recovery_hint_wire),
+        recovery: classified
+            .recovery
+            .as_ref()
+            .map(|next| next.kind.as_str().to_string()),
+        recovery_retry_after_s: classified
+            .recovery
+            .as_ref()
+            .and_then(|next| next.retry_after_s)
+            .map(|s| i32::try_from(s).unwrap_or(i32::MAX)),
         context: classified.context.map(Json),
-    }
-}
-
-/// The recovery hint's serde wire spelling as a string: `"RESNAPSHOT"` for a
-/// unit hint, the compact JSON (`{"RETRY_AFTER_MS":1000}`) for a data-carrying
-/// one — the same value an HTTP caller reads under `recovery`.
-fn recovery_hint_wire(hint: &ui_bridge::RecoveryHint) -> String {
-    match serde_json::to_value(hint) {
-        Ok(serde_json::Value::String(s)) => s,
-        Ok(other) => other.to_string(),
-        Err(e) => format!("UNSERIALIZABLE_RECOVERY_HINT: {e}"),
     }
 }
 
@@ -701,7 +698,8 @@ mod tests {
         assert!(!out.success);
         let detail = out.error.expect("failure carries a detail");
         assert_eq!(detail.code, UiBridgeErrorCode::SendKeysInvalid);
-        assert_eq!(detail.recovery.as_deref(), Some("FIX_REQUEST"));
+        assert_eq!(detail.recovery.as_deref(), Some("fix_request"));
+        assert_eq!(detail.recovery_retry_after_s, None);
         assert_eq!(
             detail.message,
             "SEND_KEYS_INVALID: 'modifiers' must be an array"
@@ -742,15 +740,13 @@ mod tests {
     }
 
     #[test]
-    fn transport_timeout_renders_data_carrying_hint_as_json() {
+    fn transport_timeout_carries_retry_later_with_its_delay() {
         let out = run(Err("UI Bridge request timed out after 5000ms".into()));
         assert!(!out.success);
         let detail = out.error.unwrap();
         assert_eq!(detail.code, UiBridgeErrorCode::Timeout);
-        assert_eq!(
-            detail.recovery.as_deref(),
-            Some(r#"{"RETRY_AFTER_MS":1000}"#)
-        );
+        assert_eq!(detail.recovery.as_deref(), Some("retry_later"));
+        assert_eq!(detail.recovery_retry_after_s, Some(1));
     }
 
     /// The exact string `request.rs` returns when the permit wait times out.
@@ -780,9 +776,7 @@ mod tests {
         let detail = out.error.unwrap();
         assert_eq!(detail.code, UiBridgeErrorCode::FrontendNotReady);
         assert_eq!(detail.context.map(|j| j.0), Some(body));
-        assert_eq!(
-            detail.recovery.as_deref(),
-            Some(r#"{"RETRY_AFTER_MS":2000}"#)
-        );
+        assert_eq!(detail.recovery.as_deref(), Some("retry_later"));
+        assert_eq!(detail.recovery_retry_after_s, Some(2));
     }
 }

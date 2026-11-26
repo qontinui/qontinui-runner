@@ -102,8 +102,8 @@ describe("pageLabelRegistration", () => {
       ]),
     ).toEqual({
       pages: [
-        { pageId: "default", label: "Terminal", order: 0 },
-        { pageId: "p-1", label: "Work", order: 1 },
+        { pageId: "default", label: "Terminal", order: 0, window: "main" },
+        { pageId: "p-1", label: "Work", order: 1, window: "main" },
       ],
     });
   });
@@ -115,9 +115,9 @@ describe("the main window registers its page list", () => {
     await mount();
     expect(registrations()).toEqual([
       [
-        { pageId: "p-alpha", label: "Alpha", order: 0 },
-        { pageId: "p-beta", label: "Beta", order: 1 },
-        { pageId: "p-popped", label: "Popped", order: 2 },
+        { pageId: "p-alpha", label: "Alpha", order: 0, window: "main" },
+        { pageId: "p-beta", label: "Beta", order: 1, window: "main" },
+        { pageId: "p-popped", label: "Popped", order: 2, window: "terminal-popout-1" },
       ],
     ]);
   });
@@ -130,9 +130,9 @@ describe("the main window registers its page list", () => {
     });
     expect(registrations()).toHaveLength(before + 1);
     expect(registrations().at(-1)).toEqual([
-      { pageId: "p-alpha", label: "Alpha", order: 0 },
-      { pageId: "p-beta", label: "Bravo", order: 1 },
-      { pageId: "p-popped", label: "Popped", order: 2 },
+      { pageId: "p-alpha", label: "Alpha", order: 0, window: "main" },
+      { pageId: "p-beta", label: "Bravo", order: 1, window: "main" },
+      { pageId: "p-popped", label: "Popped", order: 2, window: "main" },
     ]);
   });
 
@@ -144,9 +144,9 @@ describe("the main window registers its page list", () => {
     });
     expect(registrations()).toHaveLength(before + 1);
     expect(registrations().at(-1)).toEqual([
-      { pageId: "p-popped", label: "Popped", order: 0 },
-      { pageId: "p-alpha", label: "Alpha", order: 1 },
-      { pageId: "p-beta", label: "Beta", order: 2 },
+      { pageId: "p-popped", label: "Popped", order: 0, window: "main" },
+      { pageId: "p-alpha", label: "Alpha", order: 1, window: "main" },
+      { pageId: "p-beta", label: "Beta", order: 2, window: "main" },
     ]);
   });
 
@@ -154,10 +154,52 @@ describe("the main window registers its page list", () => {
     backend.terminalPageIds = ["p-minted"];
     await mount();
     expect(registrations().at(-1)).toEqual([
-      { pageId: "p-alpha", label: "Alpha", order: 0 },
-      { pageId: "p-beta", label: "Beta", order: 1 },
-      { pageId: "p-popped", label: "Popped", order: 2 },
-      { pageId: "p-minted", label: "Page 1", order: 3 },
+      { pageId: "p-alpha", label: "Alpha", order: 0, window: "main" },
+      { pageId: "p-beta", label: "Beta", order: 1, window: "main" },
+      { pageId: "p-popped", label: "Popped", order: 2, window: "main" },
+      { pageId: "p-minted", label: "Page 1", order: 3, window: "main" },
+    ]);
+  });
+});
+
+describe("the window a page is shown in", () => {
+  it("is named per page from the pop-out bindings, and \"main\" otherwise", () => {
+    expect(
+      pageLabelRegistration(
+        [
+          { id: "default", name: "Terminal", createdAt: 0 },
+          { id: "p-1", name: "Work", createdAt: 1 },
+        ],
+        { "p-1": "terminal-popout-7" },
+      ),
+    ).toEqual({
+      pages: [
+        { pageId: "default", label: "Terminal", order: 0, window: "main" },
+        { pageId: "p-1", label: "Work", order: 1, window: "terminal-popout-7" },
+      ],
+    });
+  });
+
+  it("re-registers when a page is popped out and again when it comes back", async () => {
+    await mount();
+    const before = registrations().length;
+    await act(async () => {
+      setPageBindings({ "p-beta": "terminal-popout-2" });
+    });
+    expect(registrations()).toHaveLength(before + 1);
+    expect(registrations().at(-1)).toEqual([
+      { pageId: "p-alpha", label: "Alpha", order: 0, window: "main" },
+      { pageId: "p-beta", label: "Beta", order: 1, window: "terminal-popout-2" },
+      { pageId: "p-popped", label: "Popped", order: 2, window: "main" },
+    ]);
+    await act(async () => {
+      setPageBindings({});
+    });
+    expect(registrations()).toHaveLength(before + 2);
+    expect(registrations().at(-1)).toEqual([
+      { pageId: "p-alpha", label: "Alpha", order: 0, window: "main" },
+      { pageId: "p-beta", label: "Beta", order: 1, window: "main" },
+      { pageId: "p-popped", label: "Popped", order: 2, window: "main" },
     ]);
   });
 });

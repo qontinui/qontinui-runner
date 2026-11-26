@@ -58,7 +58,7 @@ pub async fn set_auto_continue_setting(
             error_detail: None,
             hint: None,
             code: None,
-            suggestions: None,
+            refusal: None,
         }),
     }
 }
@@ -116,7 +116,7 @@ pub async fn set_workflow_auto_continue(
             error_detail: None,
             hint: None,
             code: None,
-            suggestions: None,
+            refusal: None,
         }),
     }
 }
@@ -353,7 +353,7 @@ async fn get_supervisor_observation() -> Json<ApiResponse<SupervisorObservation>
             error_detail: None,
             hint: None,
             code: None,
-            suggestions: None,
+            refusal: None,
         }),
     }
 }

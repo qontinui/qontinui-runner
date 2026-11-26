@@ -1894,23 +1894,26 @@ async fn untargeted_dispatch_not_captured_during_reconnect() {
     );
     assert_eq!(status, 409, "{body}");
     assert_eq!(code(&body), Some("AMBIGUOUS_TAB"), "{body}");
-    // The candidates are a structured field, not prose: `suggestions` carries
-    // one `retry with {"tabId": "…"}` entry per candidate. Each candidate gains
-    // its `verifiedOrigin` in Phase 3 — assert that when it lands.
-    let suggestions: Vec<String> = body["suggestions"]
+    // The candidates are a structured field, not prose: `hint.candidates`
+    // carries one `{tabId, verifiedOrigin}` entry per candidate, and the
+    // refusal names the field to correct.
+    let candidates: Vec<String> = body["hint"]["candidates"]
         .as_array()
-        .expect("AmbiguousTab lists its candidates in `suggestions`")
+        .expect("AmbiguousTab lists its candidates in `hint.candidates`")
         .iter()
-        .map(|v| v.as_str().unwrap_or_default().to_string())
+        .map(|v| v["tabId"].as_str().unwrap_or_default().to_string())
         .collect();
     for tab in ["t1", "t9"] {
         assert!(
-            suggestions
-                .iter()
-                .any(|s| s.contains(&format!("\"tabId\": \"{tab}\""))),
-            "{tab} is not among the candidates: {suggestions:?}"
+            candidates.iter().any(|c| c == tab),
+            "{tab} is not among the candidates: {candidates:?}"
         );
     }
+    assert_eq!(
+        body["refusal"]["next_action"]["kind"], "fix_request",
+        "{body}"
+    );
+    assert_eq!(body["refusal"]["next_action"]["target"], "tabId", "{body}");
 }
 
 /// R9.

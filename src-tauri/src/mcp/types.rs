@@ -415,10 +415,18 @@ pub struct ApiResponse<T: Serialize> {
     /// envelope plan.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
-    /// Optional human-readable recovery suggestions surfaced to callers
-    /// alongside `code`. Absent when no actionable guidance is available.
+    /// The shared refusal envelope (`qontinui_types::refusal::Refusal`):
+    /// the refusal class, the runner code as its discriminator, the typed
+    /// next action and the diagnostic detail — under the same top-level
+    /// `refusal` key qontinui-web nests it in. Additive: `code` and
+    /// `error_detail` are kept beside it (only `error_detail.recovery`
+    /// changed shape, to the same `NextAction` object). A constructor that knows more than
+    /// the code (a typed workspace-root miss, a request type's shape hints)
+    /// sets it; every other error has it stamped by the envelope middleware
+    /// (`crate::mcp::refusal_envelope`), so no enveloped error leaves the
+    /// runner without one. Absent on success responses.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub suggestions: Option<Vec<String>>,
+    pub refusal: Option<qontinui_types::refusal::Refusal>,
 }
 
 impl<T: Serialize> ApiResponse<T> {
@@ -430,7 +438,7 @@ impl<T: Serialize> ApiResponse<T> {
             error_detail: None,
             hint: None,
             code: None,
-            suggestions: None,
+            refusal: None,
         }
     }
 
@@ -442,7 +450,7 @@ impl<T: Serialize> ApiResponse<T> {
             error_detail: None,
             hint: None,
             code: None,
-            suggestions: None,
+            refusal: None,
         }
     }
 
@@ -457,7 +465,7 @@ impl<T: Serialize> ApiResponse<T> {
             error_detail: Some(detail),
             hint: None,
             code: None,
-            suggestions: None,
+            refusal: None,
         }
     }
 
@@ -473,18 +481,37 @@ impl<T: Serialize> ApiResponse<T> {
             error_detail: None,
             hint: None,
             code: Some(code.into()),
-            suggestions: None,
+            refusal: None,
+        }
+    }
+
+    /// An error with a canonical `code` AND the shared refusal a producer
+    /// built because it knows more than the code (a typed next action, a
+    /// target, folded hints). Not a free-text constructor: the refusal is the
+    /// structured half `expect_ratchet.rs`'s free-text count exists to grow.
+    pub fn error_with_refusal(
+        message: impl Into<String>,
+        code: impl Into<String>,
+        refusal: qontinui_types::refusal::Refusal,
+    ) -> Self {
+        Self {
+            success: false,
+            data: None,
+            error: Some(message.into()),
+            error_detail: None,
+            hint: None,
+            code: Some(code.into()),
+            refusal: Some(refusal),
         }
     }
 
     /// The error envelope for a surface that needed the workspace root and got
     /// the typed [`WorkspaceRootUnresolved`](qontinui_types::paths::WorkspaceRootUnresolved)
-    /// instead — the same `error`/`code` as `/api-surface/scan`; `hint` carries
-    /// the full Refusal envelope. `error` is the error's one operator sentence
-    /// (never a re-wording), `code` is `workspace_root_unresolved`, and `hint`
-    /// is the shared refusal envelope (discriminator, next action, the
-    /// probe-order detail) for a reader that renders refusals itself — where
-    /// `/api-surface/scan` puts a plain string. Pair it with `422`.
+    /// instead — the same `error`/`code` as `/api-surface/scan`. `error` is the
+    /// error's one operator sentence (never a re-wording), `code` is
+    /// `workspace_root_unresolved`, and `refusal` is the shared refusal
+    /// envelope (discriminator, next action, the probe-order detail) for a
+    /// reader that renders refusals itself. Pair it with `422`.
     pub fn workspace_root_unresolved(
         unresolved: &qontinui_types::paths::WorkspaceRootUnresolved,
     ) -> Self {
@@ -497,27 +524,9 @@ impl<T: Serialize> ApiResponse<T> {
             data: None,
             error: Some(unresolved.to_string()),
             error_detail: None,
-            hint: serde_json::to_value(&refusal).ok(),
-            code: Some(refusal.code.as_str().to_string()),
-            suggestions: None,
-        }
-    }
-
-    /// Like `error_with_code` but also attaches a list of human-readable
-    /// recovery suggestions surfaced to callers alongside the `code`.
-    pub fn error_with_code_and_suggestions(
-        message: impl Into<String>,
-        code: impl Into<String>,
-        suggestions: Vec<String>,
-    ) -> Self {
-        Self {
-            success: false,
-            data: None,
-            error: Some(message.into()),
-            error_detail: None,
             hint: None,
-            code: Some(code.into()),
-            suggestions: Some(suggestions),
+            code: Some(refusal.code.as_str().to_string()),
+            refusal: Some(refusal),
         }
     }
 }
@@ -531,7 +540,7 @@ pub fn api_error(message: impl Into<String>) -> ApiResponse<()> {
         error_detail: None,
         hint: None,
         code: None,
-        suggestions: None,
+        refusal: None,
     }
 }
 
@@ -547,7 +556,7 @@ pub fn api_error_detailed(
         error_detail: Some(detail),
         hint: None,
         code: None,
-        suggestions: None,
+        refusal: None,
     }
 }
 
@@ -569,7 +578,7 @@ pub fn api_error_with_hint(
         error_detail: Some(detail),
         hint: Some(hint),
         code: None,
-        suggestions: None,
+        refusal: None,
     }
 }
 
@@ -1077,5 +1086,78 @@ mod loopback_base_url_tests {
             crate::api_config::get_ipc_response_url(),
             "http://127.0.0.1:9877/ui-bridge/ipc-response"
         );
+    }
+}
+
+#[cfg(test)]
+mod api_response_shape_tests {
+    //! The wire shape of the error envelope: `refusal` is additive beside
+    //! `code` / `error_detail`, nested under the top-level `refusal` key
+    //! (qontinui-web's `REFUSAL_KEY`), and the retired free-text
+    //! `suggestions` field is gone.
+    use super::*;
+    use qontinui_types::refusal::{
+        NextAction, NextActionKind, Refusal, RefusalCode, RefusalSource,
+    };
+
+    #[test]
+    fn success_carries_no_error_fields() {
+        let v = serde_json::to_value(ApiResponse::success(1)).unwrap();
+        assert_eq!(v, serde_json::json!({"success": true, "data": 1}));
+    }
+
+    #[test]
+    fn refusal_rides_beside_code_and_error_detail() {
+        let detail = crate::mcp::ui_bridge::UiBridgeError::element_not_found("#x");
+        let refusal = Refusal::new(
+            RefusalCode::NotFound,
+            NextAction::new(NextActionKind::Resnapshot),
+            RefusalSource::Runner,
+            "2026-11-21T00:00:00Z",
+        )
+        .with_discriminator("ELEMENT_NOT_FOUND");
+        let mut resp = api_error_detailed("No element found", detail);
+        resp.refusal = Some(refusal);
+        resp.code = Some("ELEMENT_NOT_FOUND".to_string());
+        let v = serde_json::to_value(&resp).unwrap();
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted,
+            ["code", "error", "error_detail", "refusal", "success"]
+        );
+        assert_eq!(v["error_detail"]["code"], "ELEMENT_NOT_FOUND");
+        assert_eq!(
+            v["error_detail"]["recovery"],
+            serde_json::json!({"kind": "resnapshot"})
+        );
+        assert_eq!(v["error_detail"]["context"]["selector"], "#x");
+        assert_eq!(v["refusal"]["code"], "not_found");
+        assert_eq!(v["refusal"]["discriminator"], "ELEMENT_NOT_FOUND");
+        assert_eq!(v["refusal"]["next_action"]["kind"], "resnapshot");
+        assert_eq!(v["refusal"]["glossary_terms"], serde_json::json!([]));
+        assert_eq!(v["refusal"]["source"], "runner");
+        assert!(v.get("suggestions").is_none());
+    }
+
+    #[test]
+    fn workspace_root_refusal_is_on_the_refusal_key_not_hint() {
+        use qontinui_types::paths::{
+            RejectedRoot, RootRejection, RootSource, WorkspaceRootUnresolved,
+        };
+        let unresolved = WorkspaceRootUnresolved {
+            rejected: RejectedRoot {
+                source: RootSource::Probes,
+                reason: RootRejection::NothingConfigured,
+            },
+        };
+        let v = serde_json::to_value(ApiResponse::<()>::workspace_root_unresolved(&unresolved))
+            .unwrap();
+        assert!(v.get("hint").is_none(), "{v}");
+        assert_eq!(v["code"], "workspace_root_unresolved");
+        assert_eq!(v["refusal"]["code"], "workspace_root_unresolved");
+        let refusal: Refusal = serde_json::from_value(v["refusal"].clone()).unwrap();
+        assert!(!refusal.render().is_empty());
     }
 }

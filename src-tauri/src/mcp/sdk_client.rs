@@ -4141,7 +4141,7 @@ async fn handle_page_navigate_dispatch(
                             "error_detail": {
                                 "code": "INVALID_REQUEST",
                                 "message": message,
-                                "recovery": "UNRECOVERABLE",
+                                "recovery": {"kind": "fix_request"},
                                 "context": {
                                     "code": "INVALID_REQUEST",
                                     "url": url,

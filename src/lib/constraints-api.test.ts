@@ -1,6 +1,6 @@
 /**
  * `saveConstraintConfig`'s failure message: the backend refuses with JSON
- * `{error, code, hint}`, and the thrown message carries `error` rather than the
+ * `{error, code, refusal}`, and the thrown message carries `error` rather than the
  * raw JSON body; a non-JSON body still surfaces as text.
  */
 
@@ -24,7 +24,10 @@ describe("saveConstraintConfig", () => {
           success: false,
           error: "the workspace root did not resolve",
           code: "workspace_root_unresolved",
-          hint: { code: "workspace_root_unresolved", next_action: "set the Workspace root" },
+          refusal: {
+            code: "workspace_root_unresolved",
+            next_action: { kind: "set_setting", target: "Workspace root" },
+          },
         }),
         { status: 422, headers: { "Content-Type": "application/json" } },
       ),

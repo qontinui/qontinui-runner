@@ -10,7 +10,7 @@ use crate::str_utils::truncate_str;
 use crate::unified_workflows::CreateUnifiedWorkflowRequest;
 use axum::http::StatusCode;
 use qontinui_types::paths::{SiblingCheckoutAbsent, SiblingFallback, WorkspaceRootUnresolved};
-use qontinui_types::refusal::RefusalSource;
+use qontinui_types::refusal::{RefusalCode, RefusalSource};
 use regex::Regex;
 use serde::Serialize;
 use serde_json::json;
@@ -79,7 +79,7 @@ impl SyncError {
     }
 
     /// The HTTP status and error body for this failure. The two absent-checkout
-    /// arms answer `422` with the schemas `Refusal` in `hint` and its code in
+    /// arms answer `422` with the schemas `Refusal` in `refusal` and its code in
     /// `code` (the shape of [`ApiResponse::workspace_root_unresolved`]); a
     /// genuine fault stays a `500`.
     pub fn into_response(self) -> (StatusCode, ApiResponse<()>) {
@@ -102,15 +102,26 @@ impl SyncError {
                         error: Some(absent.to_string()),
                         error_detail: None,
                         code: refusal.as_ref().map(|r| r.code.as_str().to_string()),
-                        hint: refusal.and_then(|r| serde_json::to_value(r).ok()),
-                        suggestions: None,
+                        hint: None,
+                        refusal,
                     },
                 )
             }
-            SyncError::Failed(why) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ApiResponse::error(format!("Slash command sync failed: {why}")),
-            ),
+            SyncError::Failed(why) => {
+                let message = format!("Slash command sync failed: {why}");
+                let code = RefusalCode::InternalError.as_str();
+                let refusal = crate::mcp::refusal_envelope::refusal_for_envelope(
+                    code,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Some(&message),
+                    None,
+                    None,
+                );
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ApiResponse::error_with_refusal(message, code, refusal),
+                )
+            }
         }
     }
 }
@@ -726,10 +737,10 @@ mod tests {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert!(!body.success);
         assert_eq!(body.code.as_deref(), Some("sibling_checkout_absent"));
-        let hint = body.hint.expect("the Refusal travels in hint");
-        assert_eq!(hint["code"], "sibling_checkout_absent");
-        assert_eq!(hint["discriminator"], COMMANDS_SIBLING);
-        assert_eq!(hint["next_action"]["kind"], "none_terminal");
+        let refusal = body.refusal.expect("the Refusal travels in refusal");
+        assert_eq!(refusal.code.as_str(), "sibling_checkout_absent");
+        assert_eq!(refusal.discriminator.as_deref(), Some(COMMANDS_SIBLING));
+        assert_eq!(refusal.next_action.kind.as_str(), "none_terminal");
         assert!(!body.error.unwrap_or_default().is_empty());
     }
 
@@ -749,12 +760,12 @@ mod tests {
         let (status, body) = resolved.expect_err("no root, no sync").into_response();
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(body.code.as_deref(), Some("workspace_root_unresolved"));
-        let hint = body.hint.expect("the Refusal travels in hint");
-        assert_eq!(hint["code"], "workspace_root_unresolved");
-        assert_eq!(hint["next_action"]["kind"], "set_setting");
+        let refusal = body.refusal.expect("the Refusal travels in refusal");
+        assert_eq!(refusal.code.as_str(), "workspace_root_unresolved");
+        assert_eq!(refusal.next_action.kind.as_str(), "set_setting");
         assert_eq!(
-            hint["next_action"]["target"],
-            qontinui_types::paths::WORKSPACE_ROOT_SETTING
+            refusal.next_action.target.as_deref(),
+            Some(qontinui_types::paths::WORKSPACE_ROOT_SETTING)
         );
     }
 

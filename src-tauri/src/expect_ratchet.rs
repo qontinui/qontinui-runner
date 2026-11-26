@@ -581,4 +581,133 @@ struct A;
             );
         }
     }
+
+    // ── Free-text error constructors (plan 2026-09-20-the-published-product-
+    //    works-without-knowing-a-development-environment-exists, Phase D4) ──
+    //
+    // The runner's half of the refusal ratchet: a STATIC count of the error
+    // constructors that take only a sentence — no typed code, no refusal — in
+    // `src-tauri/src`. The envelope middleware stamps a status-derived refusal
+    // on each of them at runtime, but a status is a guess about the cause; a
+    // producer that names its own code and next action is the goal, so this
+    // count may fall and may not rise. It is deliberately NOT the `/health`
+    // `envelopeCodeStamping` counters: those are cumulative runtime traffic,
+    // reset on restart, and a ratchet must be deterministic in CI.
+    //
+    // The structured constructors (`error_detailed`, `api_error_detailed`,
+    // `api_error_with_hint`, `error_with_refusal`, `workspace_root_unresolved`)
+    // are what a site migrates TO, and are not counted.
+
+    /// One free-text constructor and its ceiling.
+    struct FreeTextConstructor {
+        /// The call needle, matched only where the preceding character is not
+        /// part of an identifier (so `foo_api_error(` is not `api_error(`).
+        needle: &'static str,
+        /// The exact count when this ratchet landed. Lower it when you migrate
+        /// a site; never raise it.
+        baseline: usize,
+    }
+
+    const FREE_TEXT_CONSTRUCTORS: [FreeTextConstructor; 4] = [
+        FreeTextConstructor {
+            needle: "api_error(",
+            baseline: 1245,
+        },
+        FreeTextConstructor {
+            needle: "ApiResponse::error(",
+            baseline: 130,
+        },
+        FreeTextConstructor {
+            needle: "ApiResponse::<()>::error(",
+            baseline: 11,
+        },
+        FreeTextConstructor {
+            needle: "error_with_code(",
+            baseline: 29,
+        },
+    ];
+
+    /// Occurrences of `needle` in `text`'s non-comment lines, each preceded by
+    /// a non-identifier character (or the line start).
+    fn count_calls(text: &str, needle: &str) -> usize {
+        text.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .map(|line| {
+                line.match_indices(needle)
+                    .filter(|(i, _)| {
+                        line.get(..*i)
+                            .and_then(|before| before.chars().next_back())
+                            .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
+                    })
+                    .count()
+            })
+            .sum()
+    }
+
+    #[test]
+    fn free_text_error_constructors_only_fall() {
+        let src_root = repo_root().join("src-tauri").join("src");
+        let sources: Vec<(PathBuf, String)> = walk_sources()
+            .into_iter()
+            .filter(|(p, _)| p.starts_with(&src_root))
+            .collect();
+        assert!(
+            sources.len() >= MIN_FILES_WALKED,
+            "walked only {} .rs files under src-tauri/src — the walker lost the tree",
+            sources.len()
+        );
+        for ctor in &FREE_TEXT_CONSTRUCTORS {
+            let mut per_file: Vec<(String, usize)> = Vec::new();
+            let mut total = 0usize;
+            for (path, text) in &sources {
+                let n = count_calls(text, ctor.needle);
+                if n > 0 {
+                    per_file.push((path.display().to_string(), n));
+                    total += n;
+                }
+            }
+            let (needle, baseline) = (ctor.needle, ctor.baseline);
+            assert!(
+                total > 0,
+                "`{needle}`: baseline is {baseline} but the walk found none — the walker or \
+                 the needle is wrong"
+            );
+            per_file.sort_by(|a, b| b.1.cmp(&a.1));
+            per_file.truncate(15);
+            assert!(
+                total <= baseline,
+                "`{needle}`: free-text error constructors may fall, never rise. Found {total}, \
+                 baseline {baseline}. Build the error with a typed code and its refusal \
+                 (`ApiResponse::error_with_refusal`, `api_error_detailed` with a \
+                 `UiBridgeError`) instead. Busiest files: {per_file:?}"
+            );
+            if total < baseline {
+                eprintln!(
+                    "expect_ratchet: `{needle}`: {total} < baseline {baseline} — lower that \
+                     entry's baseline in src-tauri/src/expect_ratchet.rs to {total}"
+                );
+            }
+        }
+    }
+
+    /// The counter's own edges, pinned: an identifier prefix is not a call, a
+    /// comment is not a call, and two calls on one line are two.
+    #[test]
+    fn count_calls_matches_whole_calls_in_code_only() {
+        let src = "let a = api_error(\"x\");\n\
+                   let b = ui_bridge_api_error(\"y\");\n\
+                   // api_error(\"in a comment\")\n\
+                   /// api_error(\"in a doc comment\")\n\
+                   f(api_error(\"p\"), crate::mcp::types::api_error(\"q\"));\n";
+        assert_eq!(count_calls(src, "api_error("), 3);
+        assert_eq!(
+            count_calls("ApiResponse::<()>::error(m)", "ApiResponse::error("),
+            0,
+            "the turbofish spelling is its own entry"
+        );
+        assert_eq!(
+            count_calls("x.error_with_code_and_more(m)", "error_with_code("),
+            0
+        );
+    }
 }
