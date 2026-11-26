@@ -18,19 +18,24 @@
  * Everything here is pure, so the tests assert the rules without React.
  */
 
-import type { ZoneAssignments } from "./useZoneLayout";
+import type { ZoneAssignments } from "./zoneLayoutPresets";
 import { MAX_WEBGL_PANES } from "./backends/webglContextLru";
 
 export type TerminalWorkMode = "grid" | "tmux";
 
 /**
  * Who asked for a layout change. In tmux mode only an `operator` request means
- * "give me a grid" (and exits the mode); `spawn` (a new terminal growing the
- * grid to fit) and `restore` (mount re-applying the saved preset) are
- * system-initiated and are no-ops there, or the mode would end on every spawn
- * and every reload.
+ * "give me a grid" (and exits the mode); `auto` (a layout the runner chose: a
+ * spawn, quick or AI launch growing the grid to fit) and `restore` (mount
+ * re-applying the saved preset) are system-initiated and are no-ops there, or
+ * the mode would end on every spawn and every reload.
+ *
+ * In grid mode the source also records the layout's origin
+ * (`zoneAutoTrim.ts` `LayoutOrigin`): `operator` and `auto` record themselves,
+ * `restore` keeps the stored origin. Only an `auto` layout is trimmed when
+ * tabs close.
  */
-export type LayoutRequestSource = "operator" | "spawn" | "restore";
+export type LayoutRequestSource = "operator" | "auto" | "restore";
 
 /**
  * Read a persisted work mode. An ABSENT value is grid — the page predates the

@@ -23,7 +23,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::step_executor::{StepExecutionResult, VerificationPhaseResult};
+use crate::step_executor::StepExecutionResult;
 use crate::str_utils::{truncate_str, truncate_str_ellipsis};
 
 // =============================================================================
@@ -91,40 +91,6 @@ pub struct TriageResult {
     /// Execution order (group IDs in the order they should be fixed).
     pub execution_order: Vec<String>,
     /// Summary of the triage analysis.
-    pub summary: String,
-}
-
-/// Result of a single fix agent's attempt.
-#[derive(Debug, Clone)]
-pub struct FixAgentResult {
-    /// Which group was being fixed.
-    pub group_id: String,
-    /// Whether the AI session succeeded.
-    pub session_success: bool,
-    /// Whether targeted verification passed after the fix.
-    pub verification_passed: bool,
-    /// Number of steps that now pass.
-    pub steps_passed: usize,
-    /// Number of steps that still fail.
-    pub steps_failed: usize,
-    /// AI session output (for logging).
-    pub output: String,
-    /// Duration of the fix attempt in milliseconds.
-    pub duration_ms: u64,
-}
-
-/// Overall result of the multi-agent fix cycle.
-#[derive(Debug, Clone)]
-pub struct MultiAgentFixResult {
-    /// Individual fix agent results.
-    pub fix_results: Vec<FixAgentResult>,
-    /// Whether all verification steps pass after all fixes.
-    pub all_passed: bool,
-    /// Final verification result (full regression check).
-    pub final_verification: Option<VerificationPhaseResult>,
-    /// Total duration of the multi-agent cycle.
-    pub total_duration_ms: u64,
-    /// Summary of what was fixed.
     pub summary: String,
 }
 

@@ -3,6 +3,7 @@
 //! Follows the same HashMap-based manager pattern as `claude_session::SessionManager`.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use tauri::{AppHandle, Emitter};
@@ -10,7 +11,35 @@ use tracing::{debug, error, info, warn};
 
 use super::interceptor::OutputInterceptor;
 use super::session::TerminalSession;
+use super::spawn_refusal::SpawnFailure;
 use super::types::{TerminalId, TerminalInfo};
+use crate::coord_drain_state::SpawnOrigin;
+
+/// The `terminal-created` event payload: the session's [`TerminalInfo`] plus
+/// the runner-local `surface` hint (plan
+/// `2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap`,
+/// D3). `surface` says whether the frontend should SELECT the new tab; it is
+/// [`super::focus_coalescer::decide_for_create`]'s verdict for the spawn's
+/// origin — always `true` for an operator-created tab; for unattended ones
+/// coalesced per window (one window shared by the view-switching origins, a
+/// separate one for the tab-only origins). Flattened beside the info rather than added to
+/// `TerminalInfo`, which is the cross-repo wire schema (`qontinui-schemas`,
+/// `deny_unknown_fields`) — the same reasoning that keeps the bypass hint a
+/// separate event.
+#[derive(serde::Serialize)]
+pub(crate) struct TerminalCreatedEvent<'a> {
+    #[serde(flatten)]
+    pub(crate) info: &'a TerminalInfo,
+    pub(crate) surface: bool,
+}
+
+/// Emit `terminal-created` for `info`, deciding its `surface` for `origin`.
+fn emit_terminal_created(emitter: &AppHandle, info: &TerminalInfo, origin: SpawnOrigin) {
+    let surface = super::focus_coalescer::decide_for_create(origin, &info.id);
+    if let Err(e) = emitter.emit("terminal-created", &TerminalCreatedEvent { info, surface }) {
+        error!("Failed to emit terminal-created: {}", e);
+    }
+}
 use crate::claude_session::SessionManager;
 
 /// Manages all active terminal sessions.
@@ -44,6 +73,18 @@ pub struct TerminalManager {
     /// build can insert over another (orphaning a session, unlisted but
     /// running), and the boot sweep skips them.
     in_flight: Mutex<HashSet<String>>,
+    /// The runner-shutdown latch: set at the top of [`Self::close_all`],
+    /// before anything is drained or killed. While set,
+    /// `terminal_session_record_close` refuses a `pty-exit` close, so a
+    /// lifecycle row's state after a runner shutdown is decided HERE — by the
+    /// backend — and never by whether the webview could still service an
+    /// `invoke` (plan `2026-10-28-force-exited-runner-restore-set-follow-ups`,
+    /// Phase 6).
+    ///
+    /// It is never cleared: `close_all` runs only on the way to process exit.
+    /// The known cost is that a PTY the user ends during the teardown window
+    /// also leaves its row `open`, which restores it — the safe direction.
+    shutting_down: AtomicBool,
 }
 
 /// Why [`TerminalManager::adopt_holder_pane`] adopted nothing.
@@ -247,9 +288,16 @@ fn is_within(dir: &str, root: &str) -> bool {
 }
 
 /// The rule behind [`TerminalManager::coord_session_id_for_pinned`], over
-/// `(pinned harness id, coord session id)` for every live terminal — pure so
-/// the production rule is unit-testable without a PTY: the coord row of a live
-/// terminal PINNED to `claude_session_id` that has one.
+/// `(pinned harness id, (coord session id, bind order))` for every live
+/// terminal — pure so the production rule is unit-testable without a PTY: the
+/// coord row of a live terminal PINNED to `claude_session_id` that has one.
+///
+/// When several live terminals are pinned to the id (a respawn or account
+/// migration whose old pane has not closed yet), the MOST RECENTLY BOUND one
+/// wins (largest bind order, [`super::session::TerminalSession::coord_binding`]):
+/// every pane spawn mints a fresh coord row, and the newest is the live one.
+/// The iteration order of the manager's map never decides it (plan
+/// `2026-11-07-a-runner-finish-is-addressed-to-a-stale-coord-row-after-a-pane-respawn`).
 ///
 /// It resolves by pinned id ONLY. A session the provider adopted onto a
 /// terminal (`/clear`) resolves through its predecessor's id instead
@@ -257,12 +305,14 @@ fn is_within(dir: &str, root: &str) -> bool {
 /// happens to name: a typed `claude --resume X` names a pane pinned to some
 /// other id, and that pane's row is not X's.
 pub(crate) fn resolve_pinned_coord<'a>(
-    terminals: impl Iterator<Item = (&'a str, Option<uuid::Uuid>)>,
+    terminals: impl Iterator<Item = (&'a str, Option<(uuid::Uuid, u64)>)>,
     claude_session_id: &str,
 ) -> Option<uuid::Uuid> {
     terminals
         .filter(|(pinned, _)| *pinned == claude_session_id)
-        .find_map(|(_, coord)| coord)
+        .filter_map(|(_, binding)| binding)
+        .max_by_key(|(_, bound_seq)| *bound_seq)
+        .map(|(coord, _)| coord)
 }
 
 impl TerminalManager {
@@ -275,6 +325,7 @@ impl TerminalManager {
             remote_panes: Mutex::new(HashMap::new()),
             coord_bind_observer: OnceLock::new(),
             in_flight: Mutex::new(HashSet::new()),
+            shutting_down: AtomicBool::new(false),
         }
     }
 
@@ -314,9 +365,39 @@ impl TerminalManager {
         resolve_pinned_coord(
             sessions
                 .values()
-                .map(|s| (s.pinned_session_id(), s.coord_session_id())),
+                .map(|s| (s.pinned_session_id(), s.coord_binding())),
             pinned_session_id,
         )
+    }
+
+    /// When the live terminal holding coord row `row` was bound to it, as
+    /// `(unix milliseconds, bind sequence)`: `Some(Some((at, seq)))`;
+    /// `Some(None)` when no live terminal
+    /// holds the row; `None` when the terminal map, or any terminal's coord
+    /// slot, could not be read (a poisoned lock) and no readable terminal
+    /// holds the row — UNKNOWN, never "gone". The newest bind by SEQUENCE
+    /// (never by the wall clock) wins if several hold the row. Read by the registrar's live-pane-row lookup
+    /// (plan `2026-11-12-transcript-autobind-adopts-a-previous-boot-row-that-a-live-pane-has-replaced`).
+    pub fn coord_row_bound_at(&self, row: uuid::Uuid) -> Option<Option<(i64, u64)>> {
+        let sessions = self.sessions.lock().ok()?;
+        let mut unreadable = false;
+        let mut newest: Option<(i64, u64)> = None;
+        for s in sessions.values() {
+            match s.coord_row_with_bound_at() {
+                None => unreadable = true,
+                Some(Some((r, at, seq))) if r == row => {
+                    if newest.is_none_or(|(_, n)| seq > n) {
+                        newest = Some((at, seq));
+                    }
+                }
+                Some(_) => {}
+            }
+        }
+        match (newest, unreadable) {
+            (Some(binding), _) => Some(Some(binding)),
+            (None, true) => None,
+            (None, false) => Some(None),
+        }
     }
 
     /// Record the pane behind a remote tab (see `remote_panes`).
@@ -382,6 +463,13 @@ impl TerminalManager {
     /// to [`TerminalSession::spawn`], whose identity seam issues the session's
     /// coord-mcp credential for it or refuses the spawn. `None` — every surface
     /// that does not offer a tenant choice — keeps the machine pin.
+    ///
+    /// `origin` is why this terminal is being spawned. It decides whether the
+    /// frontend selects the new tab (`terminal-created` `surface`): operator
+    /// origins always do, unattended ones are coalesced
+    /// ([`super::focus_coalescer`]). Required for the same reason
+    /// `resource_override` is: a default would answer for a surface nobody
+    /// asked.
     #[allow(clippy::too_many_arguments)]
     pub fn create(
         &self,
@@ -396,11 +484,14 @@ impl TerminalManager {
         resource_override: bool,
         trust: TrustArm,
         spawn_tenant: Option<uuid::Uuid>,
-    ) -> Result<TerminalInfo, String> {
+        origin: SpawnOrigin,
+    ) -> Result<TerminalInfo, SpawnFailure> {
         let id = uuid::Uuid::new_v4().to_string();
         // Claimed until the session is inserted (the claim drops at return):
         // the boot sweep never probes or adopts this pane meanwhile.
-        let _building = self.claim_in_flight(&id)?;
+        let _building = self
+            .claim_in_flight(&id)
+            .map_err(SpawnFailure::before_child)?;
         let title = title.unwrap_or_else(|| format!("Terminal {}", self.count() + 1));
         let working_dir = working_dir
             .filter(|d| !d.is_empty())
@@ -443,7 +534,8 @@ impl TerminalManager {
                     &working_dir,
                     &trust,
                     TerminalSession::caller_pinned_config_dir(extra_env.as_deref()),
-                )?;
+                )
+                .map_err(SpawnFailure::before_child)?;
             }
             // Never silent: a skipped trust write on a backend spawn is an
             // interactive `claude` that will raise the trust dialog with nobody
@@ -465,7 +557,10 @@ impl TerminalManager {
             },
         }
 
-        let page_id = page_id.unwrap_or_else(|| "default".to_string());
+        let page_id = self.resolve_page_id(
+            page_id,
+            super::page_placement::lifecycle_store(&app_handle).as_deref(),
+        );
         let cols = cols.unwrap_or(120);
         let rows = rows.unwrap_or(30);
 
@@ -510,16 +605,17 @@ impl TerminalManager {
         let info = session.info();
         let session = Arc::new(session);
 
+        // AFTER a successful spawn: the child is running, and a `LocalPty` has
+        // no kill on drop, so it can outlive this failure (plan
+        // `2026-11-08-…-leaves-the-tree-on-disk`, Why #5).
         let mut sessions = self
             .sessions
             .lock()
-            .map_err(|e| format!("Sessions lock poisoned: {}", e))?;
+            .map_err(|e| SpawnFailure::after_child(format!("Sessions lock poisoned: {}", e)))?;
         sessions.insert(id, session);
 
         // Notify frontend so externally-created terminals get a UI tab
-        if let Err(e) = emitter.emit("terminal-created", &info) {
-            error!("Failed to emit terminal-created: {}", e);
-        }
+        emit_terminal_created(&emitter, &info, origin);
 
         // D1: the same bypass fact, made DURABLE on the session's lifecycle
         // record. The event below is process-lifetime UI state; the record has
@@ -625,6 +721,7 @@ impl TerminalManager {
         app_handle: AppHandle,
         io: Arc<dyn super::pane_io::PaneIo>,
         pinned_session_id: String,
+        origin: SpawnOrigin,
     ) -> Result<TerminalInfo, String> {
         self.insert_with_io(
             uuid::Uuid::new_v4().to_string(),
@@ -636,6 +733,7 @@ impl TerminalManager {
             app_handle,
             io,
             pinned_session_id,
+            origin,
         )
     }
 
@@ -689,6 +787,9 @@ impl TerminalManager {
             app_handle,
             io,
             pinned_session_id,
+            // A holder pane re-adopted at boot: coalesced like any other
+            // boot-time resume, so a sweep of N panes selects at most one.
+            SpawnOrigin::BootResume,
         )
         .map_err(|e| {
             // The session could not be built around the attached pane. DETACH
@@ -762,6 +863,7 @@ impl TerminalManager {
         app_handle: AppHandle,
         io: Arc<dyn super::pane_io::PaneIo>,
         pinned_session_id: String,
+        origin: SpawnOrigin,
     ) -> Result<TerminalInfo, String> {
         let page_id = page_id.unwrap_or_else(|| "default".to_string());
 
@@ -789,9 +891,7 @@ impl TerminalManager {
         sessions.insert(id, session);
         drop(sessions);
 
-        if let Err(e) = emitter.emit("terminal-created", &info) {
-            error!("Failed to emit terminal-created: {}", e);
-        }
+        emit_terminal_created(&emitter, &info, origin);
 
         Ok(info)
     }
@@ -799,6 +899,39 @@ impl TerminalManager {
     /// Get a terminal session by ID.
     pub fn get(&self, id: &str) -> Option<Arc<TerminalSession>> {
         self.sessions.lock().ok().and_then(|s| s.get(id).cloned())
+    }
+
+    /// The page [`Self::create`] puts a new terminal on: the caller's page when
+    /// it names one, else the one page-capacity rule
+    /// ([`super::page_placement::pick_page_for_new_session`]) over this
+    /// manager's live terminals and `store`'s rows awaiting restore. So no
+    /// unpaged caller — `POST /terminals` without `pageId`, the tauri_proxy
+    /// create, the web-relay create, stewards, the SessionRegistry transports — can pile onto
+    /// `default` past the ceiling. `None` here always means "place
+    /// automatically": the operator-attended `terminal_create` command maps
+    /// the webview's null-for-default to `"default"` first
+    /// ([`super::page_placement::operator_page`]). Adoption (`insert_with_io`)
+    /// keeps the recorded page and never comes here.
+    pub(crate) fn resolve_page_id(
+        &self,
+        page_id: Option<String>,
+        store: Option<&crate::session::session_lifecycle_store::SessionLifecycleStore>,
+    ) -> String {
+        page_id.unwrap_or_else(|| super::page_placement::pick_page_for_new_session(self, store))
+    }
+
+    /// The grid page the LIVE pane `id` sits on right now, or `None` when no
+    /// such pane is held or its process has exited.
+    ///
+    /// This is the page `GET /terminals` reports, and the one a lifecycle
+    /// record bound to the pane must carry: a rebind or a SessionStart hook
+    /// that keeps a prior record's page instead leaves `/sessions/history`
+    /// naming a page the pane is not on. A dead pane answers `None` so callers
+    /// fall back to what they knew before rather than trusting a corpse.
+    pub fn live_page_of(&self, id: &str) -> Option<String> {
+        self.get(id)
+            .filter(|session| session.is_alive())
+            .map(|session| session.page_id())
     }
 
     /// Test seam: mark `id` as being built, as `create` does for the length
@@ -954,10 +1087,33 @@ impl TerminalManager {
     /// after the driver's last probe is not killed. That answers
     /// `CloseRefused`, never a false `Exited` — see
     /// `crate::terminal::graceful_exit::CloseTabResult`.
+    ///
+    /// **`authority`** (plan `2026-10-28-one-session-lifecycle-authority`,
+    /// Phase 14 / R0a): once the probe has found a live `claude`, and before any
+    /// byte is typed into it, a call presenting `None` is refused
+    /// `NoCloseAuthority`, with nothing typed and nothing closed. Nothing in
+    /// production can mint a [`CloseAuthority`] until the lifecycle Closer does
+    /// (Phase 93), so every caller passes `None` today and is refused on any
+    /// pane holding a live `claude`. A bare shell pane still answers
+    /// `NoLiveClaude`, as before. See [`crate::terminal::close_authority`].
+    ///
+    /// **`exempt`** (plan
+    /// `2026-11-08-wind-down-exempts-proven-strays-from-graceful-exit-child-refusal`):
+    /// the child-gate policy. A direct child of the `claude` it admits — today
+    /// only a recorded stray wait loop re-proven stray at the probe — is not
+    /// counted against the close. It never moves the check above, and every
+    /// caller but the wind-down `finished_close` arm passes
+    /// [`ChildExemptions::none`]. The close-time re-probe below counts nothing
+    /// and takes none.
+    ///
+    /// [`CloseAuthority`]: crate::terminal::close_authority::CloseAuthority
+    /// [`ChildExemptions::none`]: crate::terminal::graceful_exit::ChildExemptions::none
     pub async fn graceful_exit(
         self: &std::sync::Arc<Self>,
         id: &str,
         deadline: std::time::Duration,
+        authority: Option<crate::terminal::close_authority::CloseAuthority>,
+        exempt: crate::terminal::graceful_exit::ChildExemptions,
     ) -> Result<crate::terminal::graceful_exit::GracefulExitOutcome, String> {
         let session = self
             .get(id)
@@ -986,7 +1142,7 @@ impl TerminalManager {
                 // NARROWER than the driver's own gone-gate on purpose: that
                 // gate requires `subtree_claude.is_empty() &&
                 // tracked_alive.is_empty()`, this one re-proves only the
-                // subtree (the tracked set lives inside `drive` and is not
+                // subtree (the tracked set lives inside `drive_graceful_exit` and is not
                 // reachable here). The scope is right for what this guard
                 // protects — `close_inner`'s kill reaches the PANE's process
                 // and nothing else, so a tracked `claude` that has drifted out
@@ -1039,7 +1195,10 @@ impl TerminalManager {
                         }
                     }
                 }
-            })
+                },
+                authority,
+                exempt,
+            )
             .await)
     }
 
@@ -1075,7 +1234,26 @@ impl TerminalManager {
     }
 
     /// List all terminal sessions with their info, sorted by creation time.
+    /// Derived from [`Self::list_with_permission_request_hooks`], so the two
+    /// listings cannot disagree on membership or order.
     pub fn list(&self) -> Vec<TerminalInfo> {
+        self.list_with_permission_request_hooks()
+            .into_iter()
+            .map(|(info, _)| info)
+            .collect()
+    }
+
+    /// [`Self::list`] with each terminal's `permissionRequestHook` beside its
+    /// info, same order — for `GET /terminals` (plan
+    /// `2026-10-23-runner-sessions-stop-at-permission-dialogs-so-accept-them-by-default-with-a-tenant-switch`
+    /// D7). Beside, not inside: `TerminalInfo` is the cross-repo wire schema and
+    /// gains no runner-local field.
+    pub fn list_with_permission_request_hooks(
+        &self,
+    ) -> Vec<(
+        TerminalInfo,
+        crate::session::claude_hook::PermissionRequestHook,
+    )> {
         let sessions = match self.sessions.lock() {
             Ok(s) => s,
             Err(e) => {
@@ -1084,9 +1262,12 @@ impl TerminalManager {
             }
         };
 
-        let mut infos: Vec<TerminalInfo> = sessions.values().map(|s| s.info()).collect();
-        infos.sort_by_key(|info| info.created_at);
-        infos
+        let mut rows: Vec<_> = sessions
+            .values()
+            .map(|s| (s.info(), s.permission_request_hook()))
+            .collect();
+        rows.sort_by_key(|(info, _)| info.created_at);
+        rows
     }
 
     /// Get the number of active sessions, with a poisoned lock rendered as `0`.
@@ -1141,6 +1322,11 @@ impl TerminalManager {
         pairs
     }
 
+    /// Whether [`Self::close_all`] has begun. Monotonic: once true it stays true.
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::SeqCst)
+    }
+
     /// Close all terminal sessions, under a GLOBAL deadline. Called on app
     /// shutdown.
     ///
@@ -1164,6 +1350,9 @@ impl TerminalManager {
     /// Phase 3).
     #[must_use = "the result says whether the teardown finished; the shutdown marker records it"]
     pub fn close_all(&self, deadline: std::time::Instant) -> bool {
+        // Before anything is drained or killed, so no `pty-exit` caused by
+        // this teardown can reach the lifecycle store as a close.
+        self.shutting_down.store(true, Ordering::SeqCst);
         let sessions: Vec<Arc<TerminalSession>> = {
             match self.sessions.lock() {
                 Ok(mut s) => s.drain().map(|(_, v)| v).collect(),
@@ -1239,6 +1428,36 @@ pub(crate) fn command_implies_bypass_permissions(argv: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// The `terminal-created` wire shape the frontend reads: `surface` sits
+    /// beside the flattened `TerminalInfo` fields, never nested under an `info`
+    /// key. Losing the flatten or renaming `surface` would stay green elsewhere
+    /// and silently end auto-select for every tab.
+    #[test]
+    fn terminal_created_event_flattens_the_info_beside_surface() {
+        let info = crate::terminal::types::TerminalInfo {
+            id: "t-1".to_string(),
+            title: "Terminal 1".to_string(),
+            pid: Some(42),
+            cols: 80,
+            rows: 24,
+            working_dir: "/w".to_string(),
+            is_alive: true,
+            exit_code: None,
+            created_at: 1,
+            total_bytes_produced: 7,
+            page_id: "default".to_string(),
+        };
+        let v = serde_json::to_value(super::TerminalCreatedEvent {
+            info: &info,
+            surface: false,
+        })
+        .unwrap();
+        assert_eq!(v["surface"], serde_json::json!(false));
+        assert_eq!(v["id"], serde_json::json!("t-1"));
+        assert_eq!(v["isAlive"], serde_json::json!(true));
+        assert!(v.get("info").is_none(), "{v}");
+    }
+
     use super::{apply_trust_arm, command_implies_bypass_permissions, TerminalManager, TrustArm};
 
     /// Review (adoption) M1: the late-delivery wiring end to end on a REAL
@@ -1317,12 +1536,12 @@ mod tests {
         let (c1, c2) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
         let live = || {
             vec![
-                ("pinned-1", Some(c1)),
-                ("pinned-2", Some(c2)),
+                ("pinned-1", Some((c1, 1))),
+                ("pinned-2", Some((c2, 2))),
                 ("pinned-3", None),
                 // A second terminal pinned to the same id (a re-spawn) — the
                 // one with a row wins over the one without.
-                ("pinned-3", Some(c2)),
+                ("pinned-3", Some((c2, 3))),
                 ("pinned-4", None),
             ]
             .into_iter()
@@ -1340,6 +1559,69 @@ mod tests {
             None,
             "an id no terminal is pinned to never resolves by terminal"
         );
+    }
+
+    /// Review 3, A5: a terminal whose coord slot lock is poisoned makes a row
+    /// no readable terminal holds UNKNOWN (`None`), never "gone", so the
+    /// registrar's sweep keeps its entry.
+    #[test]
+    fn a_poisoned_coord_slot_reads_as_unknown_not_gone() {
+        use std::sync::{Arc, Mutex};
+        let pane = || {
+            Arc::new(crate::terminal::session::tests::make_test_session(
+                Arc::new(Mutex::new(Vec::new())),
+            ))
+        };
+        let (a, b) = (pane(), pane());
+        let tm = TerminalManager::new();
+        tm.insert_for_test("term-a", a.clone());
+        tm.insert_for_test("term-b", b.clone());
+        let (row_a, other) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        tm.bind_coord_session(&a, row_a);
+        assert!(matches!(tm.coord_row_bound_at(row_a), Some(Some(_))));
+        assert_eq!(tm.coord_row_bound_at(other), Some(None), "read: gone");
+
+        b.poison_coord_slot_for_test();
+        assert_eq!(tm.coord_row_bound_at(other), None, "unreadable: unknown");
+        assert!(
+            matches!(tm.coord_row_bound_at(row_a), Some(Some(_))),
+            "a readable holder still answers live"
+        );
+    }
+
+    /// Plan `2026-11-07-a-runner-finish-is-addressed-to-a-stale-coord-row-after-a-pane-respawn`
+    /// Phase 1: two live panes pinned to one harness id (a respawn or
+    /// migration whose old pane is still up) resolve to the row bound LAST,
+    /// whatever order the manager's map yields them in.
+    #[test]
+    fn two_panes_pinned_to_one_id_resolve_to_the_newest_bound() {
+        use super::resolve_pinned_coord;
+        let (old, new) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let forward = [("p", Some((old, 10))), ("p", Some((new, 11)))];
+        let backward = [("p", Some((new, 11))), ("p", Some((old, 10)))];
+        assert_eq!(resolve_pinned_coord(forward.into_iter(), "p"), Some(new));
+        assert_eq!(resolve_pinned_coord(backward.into_iter(), "p"), Some(new));
+
+        // And through the production door: two live panes pinned to the same
+        // id in the manager's map; `bind_coord_session` stamps the order.
+        use std::sync::{Arc, Mutex};
+        let pane = || {
+            Arc::new(crate::terminal::session::tests::make_test_session(
+                Arc::new(Mutex::new(Vec::new())),
+            ))
+        };
+        let (a, b) = (pane(), pane());
+        let pinned = a.pinned_session_id().to_string();
+        assert_eq!(b.pinned_session_id(), pinned, "precondition: one pinned id");
+        let tm = TerminalManager::new();
+        tm.insert_for_test("term-a", a.clone());
+        tm.insert_for_test("term-b", b.clone());
+        tm.bind_coord_session(&a, old);
+        tm.bind_coord_session(&b, new);
+        assert_eq!(tm.coord_session_id_for_pinned(&pinned), Some(new));
+        // Re-binding the other pane makes IT the newest.
+        tm.bind_coord_session(&a, old);
+        assert_eq!(tm.coord_session_id_for_pinned(&pinned), Some(old));
     }
 
     /// Every close path clears BOTH remote maps. `close` and `close_all`
@@ -1414,6 +1696,38 @@ mod tests {
         assert!(tm.remote_pane("close-all-tab").is_none());
     }
 
+    /// `close_all` latches shutdown on every call, even an empty teardown, and
+    /// the latch is monotonic.
+    #[test]
+    fn close_all_latches_on_any_call_and_never_unlatches() {
+        let tm = TerminalManager::new();
+        assert!(!tm.is_shutting_down());
+        let _ = tm.close_all(std::time::Instant::now());
+        assert!(tm.is_shutting_down(), "even an empty teardown latches");
+        let _ = tm.close_all(std::time::Instant::now());
+        assert!(tm.is_shutting_down(), "monotonic: nothing un-latches it");
+    }
+
+    /// The latch is set BEFORE the sessions map is read: even a `close_all`
+    /// that bails on a poisoned lock, draining and killing nothing, has
+    /// latched. A latch moved below the drain would miss this case.
+    #[test]
+    fn close_all_latches_before_reading_the_sessions_map() {
+        let tm = std::sync::Arc::new(TerminalManager::new());
+        let poisoner = std::sync::Arc::clone(&tm);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.sessions.lock().unwrap();
+            panic!("poison the sessions lock");
+        })
+        .join();
+        assert!(tm.sessions.is_poisoned());
+        assert!(
+            !tm.close_all(std::time::Instant::now()),
+            "poisoned teardown reports unfinished"
+        );
+        assert!(tm.is_shutting_down(), "latched before the poisoned read");
+    }
+
     /// `close_all` reports whether the teardown FINISHED, which `run_teardown`
     /// records as the shutdown marker's `teardown_complete` (plan
     /// `2026-10-28-force-exited-runner-strands-open-sessions-out-of-the-restore-set`,
@@ -1452,6 +1766,139 @@ mod tests {
             "a kill-only fallback is a degraded teardown"
         );
         assert_eq!(exhausted.count_checked(), Some(0));
+    }
+
+    /// R0a through the manager: a registered pane holding one live `claude`
+    /// with zero children, at an empty prompt that would accept `/exit`.
+    /// `graceful_exit` with no authority answers `NoCloseAuthority`. Nothing
+    /// is typed, nothing is killed, and the pane stays registered.
+    #[tokio::test(start_paused = true)]
+    async fn graceful_exit_without_an_authority_leaves_a_live_claude_pane_registered() {
+        use crate::terminal::graceful_exit::GracefulExitOutcome;
+        use std::sync::Arc;
+
+        let tm = Arc::new(TerminalManager::new());
+        let pane = crate::terminal::session::tests::live_claude_pane();
+        tm.insert_for_test("live-claude", pane.session.clone());
+
+        let outcome = tm
+            .graceful_exit(
+                "live-claude",
+                std::time::Duration::from_secs(60),
+                None,
+                crate::terminal::graceful_exit::ChildExemptions::none(),
+            )
+            .await
+            .expect("the pane is registered");
+
+        assert_eq!(
+            outcome,
+            GracefulExitOutcome::NoCloseAuthority {
+                claude_pids: pane.claude_pids.clone()
+            }
+        );
+        assert!(pane.typed().is_empty(), "typed into a live claude");
+        assert_eq!(pane.kills(), 0);
+        assert!(
+            tm.get("live-claude").is_some(),
+            "a refused close must leave the pane registered"
+        );
+    }
+
+    /// The child-gate policy survives `TerminalManager::graceful_exit` →
+    /// `graceful_exit_then` → the probe (plan
+    /// `2026-11-08-wind-down-exempts-proven-strays-from-graceful-exit-child-refusal`).
+    /// A pane whose `claude` has ONE direct child, presented an authority: with
+    /// that child admitted it gets past the child gate (and, since the scripted
+    /// `claude` never leaves, `/exit` is typed and the exit is stuck, nothing
+    /// killed); with no exemptions it is refused for the child, nothing typed.
+    #[tokio::test(start_paused = true)]
+    async fn graceful_exit_forwards_child_exemptions_to_the_child_gate() {
+        use crate::terminal::close_authority::CloseAuthority;
+        use crate::terminal::graceful_exit::{ChildExemptions, GracefulExitOutcome};
+        use std::sync::Arc;
+
+        const CHILD: u32 = 5151;
+
+        let tm = Arc::new(TerminalManager::new());
+        let admitted = crate::terminal::session::tests::live_claude_pane_with_child(CHILD);
+        tm.insert_for_test("admitted", admitted.session.clone());
+        let outcome = tm
+            .graceful_exit(
+                "admitted",
+                std::time::Duration::from_secs(60),
+                Some(CloseAuthority::for_test()),
+                ChildExemptions::admit_for_test(CHILD),
+            )
+            .await
+            .expect("the pane is registered");
+        assert!(
+            matches!(outcome, GracefulExitOutcome::ExitStuck { .. }),
+            "an admitted only child must pass the child gate: {outcome:?}"
+        );
+        assert_eq!(admitted.typed(), b"/exit\r");
+        assert_eq!(admitted.kills(), 0);
+        assert!(tm.get("admitted").is_some());
+
+        let counted = crate::terminal::session::tests::live_claude_pane_with_child(CHILD);
+        tm.insert_for_test("counted", counted.session.clone());
+        let outcome = tm
+            .graceful_exit(
+                "counted",
+                std::time::Duration::from_secs(60),
+                Some(CloseAuthority::for_test()),
+                ChildExemptions::none(),
+            )
+            .await
+            .expect("the pane is registered");
+        match &outcome {
+            GracefulExitOutcome::Refused { reason, .. } => assert_eq!(
+                reason, "the claude process has 1 child process(es) attached",
+                "no exemption: the child counts and nothing is named"
+            ),
+            other => panic!("expected the child refusal, got {other:?}"),
+        }
+        assert!(counted.typed().is_empty(), "typed into a live claude");
+        assert_eq!(counted.kills(), 0);
+        assert!(tm.get("counted").is_some());
+    }
+
+    /// R0c-2 through the manager: a registered pane whose shell runs an
+    /// npm-installed `claude` — a `node` process its Claude Code registry
+    /// record names. Its image alone read as a bare shell, so `graceful_exit`
+    /// answered `NoLiveClaude`, and every caller that closes on that answer
+    /// kill-closed a live session. Now it is the live `claude` it is: with no
+    /// authority, `NoCloseAuthority` naming the `node` pid. Nothing typed,
+    /// nothing killed, the pane still registered.
+    #[tokio::test(start_paused = true)]
+    async fn graceful_exit_reads_a_registry_named_node_pane_as_a_live_claude() {
+        use crate::terminal::graceful_exit::GracefulExitOutcome;
+        use std::sync::Arc;
+
+        let tm = Arc::new(TerminalManager::new());
+        let pane = crate::terminal::session::tests::npm_claude_pane();
+        tm.insert_for_test("npm-claude", pane.session.clone());
+
+        let outcome = tm
+            .graceful_exit(
+                "npm-claude",
+                std::time::Duration::from_secs(60),
+                None,
+                crate::terminal::graceful_exit::ChildExemptions::none(),
+            )
+            .await
+            .expect("the pane is registered");
+
+        assert_eq!(
+            outcome,
+            GracefulExitOutcome::NoCloseAuthority {
+                claude_pids: vec![crate::terminal::session::tests::NPM_CLAUDE_PID]
+            },
+            "a registry-named `node` pane must not read NoLiveClaude"
+        );
+        assert!(pane.typed().is_empty(), "typed into a live claude");
+        assert_eq!(pane.kills(), 0);
+        assert!(tm.get("npm-claude").is_some());
     }
 
     fn account_with(projects: serde_json::Value) -> tempfile::TempDir {

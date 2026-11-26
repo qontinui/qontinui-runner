@@ -649,6 +649,27 @@ describe("the tenant selector reads, and attaches, the tenant it names", () => {
     }
   });
 
+  it("re-reads only the selector's credential notes, whenever the list's read settles", () => {
+    const code = codeOf(SOURCE);
+    const effects = callsOf(code, "useEffect(").filter((e) =>
+      e.includes("refreshTenantCredentials()"),
+    );
+    expect(effects).toHaveLength(1);
+    // `loadingMore` too: a load-more page never moves `loading`.
+    expect(effects[0]).toContain("if (loading || loadingMore) {");
+    expect(effects[0]).toContain("listReadInFlight.current = true;");
+    // Once per read, never on the idle first snapshot: a settle consumes the mark.
+    expect(effects[0]).toContain("if (!listReadInFlight.current) return;");
+    expect(effects[0]).toContain("listReadInFlight.current = false;");
+    // With one binding no note can render, so no re-read is paid for.
+    expect(effects[0]).toContain("if (!showSwitcher) return;");
+    // A dependency on the notes or candidates would loop: each re-read sets them.
+    expect(effects[0]).toContain("[loading, loadingMore, showSwitcher, refreshTenantCredentials]");
+    // Never the full `refresh`: it also takes the candidates, and those read empty
+    // on a transient failure, which would flip the view.
+    expect(code).toContain("refreshCredentials: refreshTenantCredentials,");
+  });
+
   it("projects the requested tenant beside the one(s) that answered", () => {
     expect(SOURCE).toContain('data-fleet-tenant={servedTenants.join(",")}');
     expect(SOURCE).toContain(

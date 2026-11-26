@@ -24,9 +24,10 @@
 use crate::commands::AppState;
 use crate::database::pg::PgDb;
 use crate::scheduler::{
-    compute_next_run, condition_status_default, CatchUpPolicy, ConditionStatus, RepositoryWatch,
-    ScheduleExpression, ScheduleZone, ScheduledTask, ScheduledTaskExt, ScheduledTaskStatus,
-    ScheduledTaskType, TaskExecutionRecord, TaskExecutionRecordExt,
+    compute_task_next_run, condition_status_default, task_next_run_rfc3339, CatchUpPolicy,
+    ConditionStatus, RepositoryWatch, ScheduleExpression, ScheduleZone, ScheduledTask,
+    ScheduledTaskExt, ScheduledTaskStatus, ScheduledTaskType, TaskExecutionRecord,
+    TaskExecutionRecordExt,
 };
 use chrono::{DateTime, Utc};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -117,6 +118,28 @@ fn task_is_due(task: &ScheduledTask, now: DateTime<Utc>) -> bool {
         .as_deref()
         .and_then(|next_run| chrono::DateTime::parse_from_rfc3339(next_run).ok())
         .is_some_and(|next_dt| next_dt.with_timezone(&chrono::Utc) <= now)
+}
+
+/// The order a tick offers due tasks for a start slot: tasks parked on their
+/// conditions first (longest-waiting first), then the rest by `next_run`.
+///
+/// Waiters lead so a task whose condition has just passed takes the first slot
+/// rather than queueing behind newly due work. That ordering is only safe
+/// because [`start_due_tasks`] spends a slot on a START, not on an inspection: a
+/// waiter whose condition still fails costs the tasks behind it nothing.
+fn due_task_order(a: &ScheduledTask, b: &ScheduledTask) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (&a.condition_status, &b.condition_status) {
+        (Some(a_status), Some(b_status)) => a_status.waiting_since.cmp(&b_status.waiting_since),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => match (&a.next_run, &b.next_run) {
+            (Some(a_time), Some(b_time)) => a_time.cmp(b_time),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        },
+    }
 }
 
 /// Offer `due` to `try_start` in order until `slots` of them have started.
@@ -223,6 +246,24 @@ pub struct SchedulerService {
     /// and two concurrent passes would each evaluate — and could each fire —
     /// the same due task.
     pass_lock: tokio::sync::Mutex<()>,
+    /// Cool / roster / relaunch for a `RemoteAgent` run that died on an
+    /// account limit (plan
+    /// `2026-11-13-devops-scheduled-remote-agent-relaunches-into-an-exhausted-account`).
+    /// The production probe, picker and spawn; a fake in tests.
+    limit_recovery: Arc<dyn crate::scheduler_limit_relaunch::LimitRecovery>,
+}
+
+/// What one settled slot did — every history row it wrote, in order, and the
+/// `next_run` it set when every account was exhausted. The detached settle
+/// task drops it; tests await it.
+#[derive(Debug, Default)]
+pub(crate) struct Settlement {
+    pub rows: Vec<TaskExecutionRecord>,
+    /// The decision that ended a limited slot without a relaunch; it is what
+    /// [`next_run_after_limit`] reads to choose the stored `next_run`.
+    pub decision: Option<crate::scheduler_limit_relaunch::RelaunchDecision>,
+    /// The config dirs cooled, in order.
+    pub cooled: Vec<String>,
 }
 
 impl SchedulerService {
@@ -236,6 +277,7 @@ impl SchedulerService {
             check_interval_secs: 60, // Check every minute
             probe_gate: crate::scheduler_probe::ProbeGate::new(),
             pass_lock: tokio::sync::Mutex::new(()),
+            limit_recovery: Arc::new(crate::scheduler_limit_relaunch::ProductionLimitRecovery),
         }
     }
 
@@ -249,6 +291,7 @@ impl SchedulerService {
             check_interval_secs: 60,
             probe_gate: crate::scheduler_probe::ProbeGate::new(),
             pass_lock: tokio::sync::Mutex::new(()),
+            limit_recovery: Arc::new(crate::scheduler_limit_relaunch::ProductionLimitRecovery),
         }
     }
 
@@ -373,7 +416,7 @@ impl SchedulerService {
 
         for task in &tasks {
             let next = if task.enabled {
-                compute_next_run(&task.schedule, now, zone).map(|dt| dt.to_rfc3339())
+                task_next_run_rfc3339(task, now, zone)
             } else {
                 None
             };
@@ -460,23 +503,7 @@ impl SchedulerService {
             .filter(|task| task_is_due(task, now))
             .collect();
 
-        // Sort by: waiting tasks first (by waiting_since), then by next_run time
-        due_tasks.sort_by(|a, b| {
-            // Waiting tasks come first
-            match (&a.condition_status, &b.condition_status) {
-                (Some(a_status), Some(b_status)) => {
-                    a_status.waiting_since.cmp(&b_status.waiting_since)
-                }
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => match (&a.next_run, &b.next_run) {
-                    (Some(a_time), Some(b_time)) => a_time.cmp(b_time),
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => std::cmp::Ordering::Equal,
-                },
-            }
-        });
+        due_tasks.sort_by(due_task_order);
 
         // Coord device drain (plan `2026-09-13-drained-runner-never-reaches-idle`,
         // Phase 3): tasks that spawn an AI session are held while autonomous
@@ -1061,8 +1088,19 @@ impl SchedulerService {
 
         let now = Utc::now();
         let zone = self.schedule_zone().await;
-        let normal_next = compute_next_run(&task.schedule, now, zone);
-        let next_run = compute_launch_failed_next_run(normal_next, backoff, now);
+        // An unusable task zone stores NO next run at all — not now+backoff:
+        // the task must not fire again until its timezone is corrected (the
+        // same rule every other next_run site applies).
+        let next_run = match compute_task_next_run(&task, now, zone) {
+            Ok(normal_next) => compute_launch_failed_next_run(normal_next, backoff, now),
+            Err(e) => {
+                error!(
+                    "apply_launch_failure_backoff: task {task_id} has an unusable {e}; \
+                     storing no next run (no backoff retry) until it is corrected"
+                );
+                None
+            }
+        };
         let backoff_seconds = backoff.map(|d| d.num_seconds()).unwrap_or(0);
         warn!(
             task_id = %task_id,
@@ -1292,6 +1330,11 @@ impl SchedulerService {
             .as_ref()
             .map(|s| crate::mcp::types::runner_api_port(s));
 
+        let relaunch = crate::scheduler_limit_relaunch::RelaunchCtx {
+            spec: spec.clone(),
+            bound_port,
+            catch_up,
+        };
         let launched = crate::scheduler_remote_agent::launch(spec, bound_port).await;
         self.settle_launched_child(
             "RemoteAgent",
@@ -1300,6 +1343,7 @@ impl SchedulerService {
             auto_fix_on_failure,
             record,
             launched,
+            Some(relaunch),
         )
         .await;
     }
@@ -1330,6 +1374,7 @@ impl SchedulerService {
             auto_fix_on_failure,
             record,
             launched,
+            None,
         )
         .await;
     }
@@ -1337,7 +1382,12 @@ impl SchedulerService {
     /// Shared tail of the in-binary child launchers (`RemoteAgent`, `Script`):
     /// record the `Running` row the moment the child exists, clear the
     /// launch-failure streak, and settle the row from the child's outcome via
-    /// [`Self::finalize_async_execution`]. A launch `Err` is a LaunchFailed.
+    /// [`Self::settle_attempts`]. A launch `Err` is a LaunchFailed.
+    ///
+    /// `relaunch` is `Some` for a `RemoteAgent` run: what a limit-hit relaunch
+    /// needs. Returns the detached settle task's handle (the scheduler drops
+    /// it; tests await it), `None` on a launch failure.
+    #[allow(clippy::too_many_arguments)]
     async fn settle_launched_child(
         self: Arc<Self>,
         kind: &'static str,
@@ -1346,64 +1396,374 @@ impl SchedulerService {
         auto_fix_on_failure: bool,
         mut record: TaskExecutionRecord,
         launched: Result<crate::scheduler_remote_agent::RemoteAgentLaunch, String>,
-    ) {
-        let execution_id = record.execution_id.clone();
+        relaunch: Option<crate::scheduler_limit_relaunch::RelaunchCtx>,
+    ) -> Option<tokio::task::JoinHandle<Settlement>> {
         match launched {
             Ok(launch) => {
-                if !launch.session_id.is_empty() {
-                    record.session_id = Some(launch.session_id.clone());
-                }
-                info!(
-                    "Scheduler: launched {} task '{}' in-binary (session_id={:?}, cwd={}, log={:?})",
-                    kind, task_name, launch.session_id, launch.workdir, launch.log_path
-                );
-
-                if let Ok(pg) = self.pg() {
-                    if let Err(e) = pg.insert_execution_record(&task_id, &record).await {
-                        error!("Failed to insert initial running execution record: {}", e);
-                    }
-                    if let Err(e) = pg
-                        .update_task_last_run(&task_id, Some(&record.execution_id))
-                        .await
-                    {
-                        error!("Failed to update task last_run: {}", e);
-                    }
-                }
-
-                // The child exists — that is "first successful start".
-                self.clear_launch_failure_counter(&task_id).await;
-
+                self.record_child_started(
+                    kind,
+                    &task_id,
+                    &task_name,
+                    &mut record,
+                    &launch.session_id,
+                    &launch.workdir,
+                    launch.log_path.as_deref(),
+                )
+                .await;
                 let service = self.clone();
-                let completion = launch.completion;
-                tokio::spawn(async move {
-                    let started = tokio::time::Instant::now();
-                    let outcome = completion.await;
-                    info!(
-                        "Scheduler: {} task '{}' child ended (success={}, exit_code={:?}, timed_out={}, took {:?})",
-                        kind,
-                        task_name,
-                        outcome.success,
-                        outcome.exit_code,
-                        outcome.timed_out,
-                        started.elapsed()
-                    );
+                Some(tokio::spawn(async move {
                     service
-                        .finalize_async_execution(
+                        .settle_attempts(
+                            kind,
                             task_id,
                             task_name,
-                            execution_id,
-                            record,
-                            outcome.success,
-                            outcome.error,
                             auto_fix_on_failure,
+                            record,
+                            launch,
+                            relaunch,
                         )
-                        .await;
-                });
+                        .await
+                }))
             }
             Err(e) => {
                 self.record_launch_failure(&task_id, &task_name, record, auto_fix_on_failure, e)
                     .await;
+                None
             }
+        }
+    }
+
+    /// The child exists: insert its `Running` row, stamp `last_run`, and clear
+    /// the launch-failure streak ("first successful start").
+    async fn record_child_started(
+        &self,
+        kind: &'static str,
+        task_id: &str,
+        task_name: &str,
+        record: &mut TaskExecutionRecord,
+        // The launch's identity, by its fields: a `&RemoteAgentLaunch` held
+        // across an await would make the settle task non-`Send` (its
+        // completion future is `Send` but not `Sync`).
+        session_id: &str,
+        workdir: &str,
+        log_path: Option<&std::path::Path>,
+    ) {
+        if !session_id.is_empty() {
+            record.session_id = Some(session_id.to_string());
+        }
+        info!(
+            "Scheduler: launched {} task '{}' in-binary (session_id={:?}, cwd={}, log={:?})",
+            kind, task_name, session_id, workdir, log_path
+        );
+
+        if let Ok(pg) = self.pg() {
+            if let Err(e) = pg.insert_execution_record(task_id, record).await {
+                error!("Failed to insert initial running execution record: {}", e);
+            }
+            if let Err(e) = pg
+                .update_task_last_run(task_id, Some(&record.execution_id))
+                .await
+            {
+                error!("Failed to update task last_run: {}", e);
+            }
+        }
+
+        self.clear_launch_failure_counter(task_id).await;
+    }
+
+    /// Await the child and settle its row. A `RemoteAgent` attempt that died
+    /// on a CONFIRMED account limit (`outcome.rate_limited`, and a cooldown
+    /// the probe, a banner reset or a specific banner vouches for) is NOT
+    /// handed to [`Self::finalize_async_execution`]: its account is cooled
+    /// until its reset, its row is closed with the limit error, and the slot
+    /// is relaunched as a NEW execution (own row, own log) under a fresh pick
+    /// — or, when no account remains, the row also says why
+    /// ([`RelaunchDecision::message`]) and `next_run` moves only to a KNOWN
+    /// reset ([`next_run_after_limit`]). A limited attempt never launches an
+    /// auto-fix session: auto-fix would spawn into the same exhausted pool.
+    ///
+    /// A catch-all limit phrase nothing confirms is a plain failure: nothing
+    /// cooled, nothing relaunched, and the row says the phrase was seen.
+    ///
+    /// [`RelaunchDecision::message`]: crate::scheduler_limit_relaunch::RelaunchDecision::message
+    #[allow(clippy::too_many_arguments)]
+    async fn settle_attempts(
+        self: Arc<Self>,
+        kind: &'static str,
+        task_id: String,
+        task_name: String,
+        auto_fix_on_failure: bool,
+        mut record: TaskExecutionRecord,
+        mut launch: crate::scheduler_remote_agent::RemoteAgentLaunch,
+        relaunch: Option<crate::scheduler_limit_relaunch::RelaunchCtx>,
+    ) -> Settlement {
+        use crate::scheduler_limit_relaunch::{decide, RelaunchDecision};
+
+        let mut settlement = Settlement::default();
+        let mut tried: Vec<String> = Vec::new();
+        let mut known_resets: std::collections::HashMap<String, DateTime<Utc>> =
+            std::collections::HashMap::new();
+        let mut attempts = 0usize;
+        loop {
+            attempts += 1;
+            let started = tokio::time::Instant::now();
+            let outcome = launch.completion.await;
+            info!(
+                "Scheduler: {} task '{}' child ended (success={}, exit_code={:?}, timed_out={}, rate_limited={}, took {:?})",
+                kind,
+                task_name,
+                outcome.success,
+                outcome.exit_code,
+                outcome.timed_out,
+                outcome.rate_limited.is_some(),
+                started.elapsed()
+            );
+            let execution_id = record.execution_id.clone();
+
+            let Some(limited) = outcome.rate_limited.clone() else {
+                let row = self
+                    .finalize_async_execution(
+                        task_id,
+                        task_name,
+                        execution_id,
+                        record,
+                        outcome.success,
+                        outcome.error,
+                        auto_fix_on_failure,
+                    )
+                    .await;
+                settlement.rows.push(row);
+                return settlement;
+            };
+
+            // Cool the account THIS child ran under, until its real reset.
+            let cooled = match limited.account.as_deref() {
+                Some(dir) => Some(self.limit_recovery.cool(dir, &limited.hit).await),
+                None => None,
+            };
+            let confirmed = match &cooled {
+                Some(c) => c.cooling.is_some(),
+                // Nothing to probe: only the banner itself can confirm.
+                None => limited.hit.is_specific() || limited.hit.banner_reset.is_some(),
+            };
+            if !confirmed {
+                let error = format!(
+                    "scheduled session exited with code {} (the usage-limit phrase '{}' appeared \
+                     in its log, but neither the usage probe nor a banner reset confirmed it)",
+                    outcome
+                        .exit_code
+                        .map_or_else(|| "UNKNOWN".to_string(), |c| c.to_string()),
+                    limited.hit.pattern
+                );
+                let row = self
+                    .finalize_async_execution(
+                        task_id,
+                        task_name,
+                        execution_id,
+                        record,
+                        false,
+                        Some(error),
+                        auto_fix_on_failure,
+                    )
+                    .await;
+                settlement.rows.push(row);
+                return settlement;
+            }
+            let known = cooled
+                .as_ref()
+                .and_then(|c| c.cooling.as_ref())
+                .and_then(|c| c.known_reset());
+            if let Some(dir) = limited.account.as_deref() {
+                settlement.cooled.push(dir.to_string());
+                if !tried.iter().any(|t| t == dir) {
+                    tried.push(dir.to_string());
+                }
+                if let Some(t) = known {
+                    known_resets.insert(dir.to_string(), t);
+                }
+            }
+            let mut error = crate::scheduler_remote_agent::limit_error(
+                limited.account.as_deref(),
+                known.or(limited.hit.banner_reset),
+            );
+
+            let (ctx, probe, dir) = match (&relaunch, cooled, limited.account.as_deref()) {
+                (Some(ctx), Some(cooled), Some(dir)) => (ctx, cooled.probe, dir),
+                // An ambient-account child cooled nothing, so a relaunch
+                // would land on the same account: the slot ends here, on its
+                // cron cadence (no known reset to schedule against).
+                _ => {
+                    let row = self
+                        .finalize_limited_execution(&task_id, &execution_id, record, error, None)
+                        .await;
+                    settlement.rows.push(row);
+                    return settlement;
+                }
+            };
+
+            let roster = self.limit_recovery.roster(&probe, &tried);
+            let decision = decide(&roster, &tried, attempts, &known_resets, Utc::now());
+            if decision == RelaunchDecision::Relaunch {
+                // The tick's drain-gate and enabled checks ran before attempt 1,
+                // possibly long ago. A drain, a disable or a delete that landed
+                // since must still stop a NEW session, exactly as at the tick:
+                // the slot ends here on its cron cadence.
+                if let Some(hold) = self.relaunch_hold(&task_id).await {
+                    error.push_str("; relaunch held: ");
+                    error.push_str(&hold);
+                    warn!("Scheduler: {} task '{}': {}", kind, task_name, error);
+                    let row = self
+                        .finalize_limited_execution(&task_id, &execution_id, record, error, None)
+                        .await;
+                    settlement.rows.push(row);
+                    return settlement;
+                }
+                record.complete(false, Some(error));
+                self.write_completed_row(&execution_id, &record).await;
+                settlement.rows.push(record);
+
+                let mut next = <TaskExecutionRecord as TaskExecutionRecordExt>::new();
+                if let Some(ref c) = ctx.catch_up {
+                    c.apply(&mut next);
+                }
+                let mut spec = ctx.spec.clone();
+                spec.execution_id = next.execution_id.clone();
+                info!(
+                    "Scheduler: {} task '{}' hit an account limit; relaunching the slot (attempt {}, tried: {:?})",
+                    kind,
+                    task_name,
+                    attempts + 1,
+                    tried
+                );
+                match self.limit_recovery.relaunch(spec, ctx.bound_port).await {
+                    Ok(l) => {
+                        self.record_child_started(
+                            kind,
+                            &task_id,
+                            &task_name,
+                            &mut next,
+                            &l.session_id,
+                            &l.workdir,
+                            l.log_path.as_deref(),
+                        )
+                        .await;
+                        record = next;
+                        launch = l;
+                        continue;
+                    }
+                    Err(e) => {
+                        // A relaunch that cannot start is a LaunchFailed,
+                        // backed off as any other. No auto-fix: the cause is a
+                        // starved account pool, not a code defect.
+                        let mut failed = next.clone();
+                        failed.mark_launch_failed(Some(e.clone()));
+                        settlement.rows.push(failed);
+                        self.record_launch_failure(&task_id, &task_name, next, false, e)
+                            .await;
+                        return settlement;
+                    }
+                }
+            }
+
+            if let Some(suffix) = decision.message(dir) {
+                error.push_str("; ");
+                error.push_str(&suffix);
+            }
+            warn!("Scheduler: {} task '{}': {}", kind, task_name, error);
+            let row = self
+                .finalize_limited_execution(&task_id, &execution_id, record, error, Some(&decision))
+                .await;
+            settlement.rows.push(row);
+            settlement.decision = Some(decision);
+            return settlement;
+        }
+    }
+
+    /// Why a limited slot must NOT be relaunched now, re-read at the moment of
+    /// the relaunch: the coord drain gate stopped allowing autonomous spawns,
+    /// or the task was disabled or deleted while its attempt ran. `None` lets
+    /// the relaunch proceed. A task row that cannot be read (no PG, a read
+    /// error) does not hold it: the tick already admitted this slot, and the
+    /// relaunch is bounded by the roster size.
+    async fn relaunch_hold(&self, task_id: &str) -> Option<String> {
+        if let Some(hold) = self.limit_recovery.drain_hold(task_id) {
+            return Some(hold);
+        }
+        let pg = self.pg().ok()?;
+        match pg.get_scheduled_task(task_id).await {
+            Ok(Some(t)) if !t.enabled => Some("the task was disabled".to_string()),
+            Ok(None) => Some("the task was deleted".to_string()),
+            Ok(Some(_)) => None,
+            Err(e) => {
+                warn!("relaunch_hold: could not re-read task {task_id}: {e}");
+                None
+            }
+        }
+    }
+
+    /// UPDATE a settled row (no-op without PG).
+    async fn write_completed_row(&self, execution_id: &str, record: &TaskExecutionRecord) {
+        if let Ok(pg) = self.pg() {
+            if let Err(e) = pg.update_execution_record(execution_id, record).await {
+                error!("Failed to update execution record on completion: {}", e);
+            }
+        }
+    }
+
+    /// Close the LAST attempt of a limited slot: the row as a failure with
+    /// `error`, no auto-fix, `next_run` per [`next_run_after_limit`], and the
+    /// running slot released.
+    async fn finalize_limited_execution(
+        &self,
+        task_id: &str,
+        execution_id: &str,
+        mut record: TaskExecutionRecord,
+        error: String,
+        decision: Option<&crate::scheduler_limit_relaunch::RelaunchDecision>,
+    ) -> TaskExecutionRecord {
+        record.complete(false, Some(error));
+        self.write_completed_row(execution_id, &record).await;
+        self.write_next_run_after_limit(task_id, decision).await;
+        let mut running = self.running_tasks.write().await;
+        running.retain(|id| id != task_id);
+        record
+    }
+
+    /// Store [`next_run_after_limit`]'s value as the task's `next_run`
+    /// (conditional on the task's `modified_at`, like every other next_run
+    /// write).
+    async fn write_next_run_after_limit(
+        &self,
+        task_id: &str,
+        decision: Option<&crate::scheduler_limit_relaunch::RelaunchDecision>,
+    ) {
+        let pg = match self.pg() {
+            Ok(pg) => pg,
+            Err(e) => {
+                error!("write_next_run_after_limit: {}", e);
+                return;
+            }
+        };
+        let task = match pg.get_scheduled_task(task_id).await {
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                error!("Task not found for next_run update: {}", task_id);
+                return;
+            }
+            Err(e) => {
+                error!("Failed to load task for next_run update: {}", e);
+                return;
+            }
+        };
+        let zone = self.schedule_zone().await;
+        let next = next_run_after_limit(&task, decision, Utc::now(), zone);
+        match pg
+            .update_task_next_run(task_id, next.as_deref(), &task.modified_at)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => debug!("next_run for task {task_id} left to a concurrent edit"),
+            Err(e) => error!("Failed to update task next_run: {}", e),
         }
     }
 
@@ -1528,7 +1888,7 @@ impl SchedulerService {
         success: bool,
         error_message: Option<String>,
         auto_fix_on_failure: bool,
-    ) {
+    ) -> TaskExecutionRecord {
         record.complete(success, error_message);
 
         if !success && auto_fix_on_failure {
@@ -1545,16 +1905,13 @@ impl SchedulerService {
             }
         }
 
-        if let Ok(pg) = self.pg() {
-            if let Err(e) = pg.update_execution_record(&execution_id, &record).await {
-                error!("Failed to update execution record on completion: {}", e);
-            }
-        }
+        self.write_completed_row(&execution_id, &record).await;
 
         self.update_task_next_run_db(&task_id).await;
 
         let mut running = self.running_tasks.write().await;
         running.retain(|id| id != &task_id);
+        record
     }
 
     /// Update the next_run time for a task (DB-backed)
@@ -1580,7 +1937,7 @@ impl SchedulerService {
 
         let now = chrono::Utc::now();
         let zone = self.schedule_zone().await;
-        let next = compute_next_run(&task.schedule, now, zone).map(|dt| dt.to_rfc3339());
+        let next = task_next_run_rfc3339(&task, now, zone);
 
         match pg
             .update_task_next_run(task_id, next.as_deref(), &task.modified_at)
@@ -1953,6 +2310,41 @@ After making fixes, run tests if applicable to verify the fixes work."#
     // ========================================================================
 }
 
+/// The `next_run` a limited slot that was not relaunched stores — the value
+/// [`SchedulerService::write_next_run_after_limit`] hands verbatim to
+/// `update_task_next_run`. A KNOWN reset from the decision overrides the cron
+/// slot ([`crate::scheduler_limit_relaunch::NextAttempt::override_for`]);
+/// otherwise the cron slot stands. Never a guessed cooldown expiry.
+///
+/// Known gap: neither this override nor the account cooldowns survive a runner
+/// restart. Startup recomputes every `next_run` from the schedule, and the
+/// cooldowns are in memory, so the first tick after a restart may try the
+/// exhausted pool again. That is bounded (each attempt re-cools its account,
+/// the startup usage probe, `refresh_account_usage_snapshot` in `main.rs`'s
+/// setup, re-derives the weekly / 5 h exclusion) and no
+/// worse than before this change; only a spend-cap cooldown is re-learned by
+/// one lost attempt.
+fn next_run_after_limit(
+    task: &ScheduledTask,
+    decision: Option<&crate::scheduler_limit_relaunch::RelaunchDecision>,
+    now: DateTime<Utc>,
+    zone: ScheduleZone,
+) -> Option<String> {
+    // A task the scheduler deliberately gives no next_run (its schedule does
+    // not evaluate) gets none here either: a known reset is no licence to
+    // schedule it.
+    // That covers both an unusable zone (`Err`) and a schedule with no
+    // future slot (`Ok(None)`: a spent `Once`, a cron that does not parse).
+    let cron = match compute_task_next_run(task, now, zone) {
+        Ok(Some(cron)) => Some(cron),
+        Ok(None) | Err(_) => return task_next_run_rfc3339(task, now, zone),
+    };
+    match decision.and_then(|d| d.next_run_override(cron)) {
+        Some(at) => Some(at.to_rfc3339()),
+        None => task_next_run_rfc3339(task, now, zone),
+    }
+}
+
 /// Combine the schedule's natural next-run time with a launch-failure
 /// backoff, returning whichever is *later* (Phase C).
 ///
@@ -2301,7 +2693,7 @@ fn plan_catch_up_actions(
 /// - `Cron`: uses [`cron::Schedule::after(&from)`] to seek strictly past
 ///   `from`, then takes while `t <= to`, evaluating the expression in
 ///   `zone` (see [`ScheduleZone`]). Times are returned in `Utc`, matching
-///   the runner's convention (see [`compute_next_run`]).
+///   the runner's convention (see [`compute_next_run`](crate::scheduler::compute_next_run)).
 /// - `Interval(secs)`: synthesises slots at `from + secs`, `from + 2*secs`,
 ///   …, while each is `<= to`.
 /// - `Once(iso)`: returns the single parsed timestamp if it lies in
@@ -2449,7 +2841,20 @@ impl SchedulerService {
                 continue;
             }
 
-            if let Err(e) = self.clone().reconcile_task(&task, now, zone).await {
+            // The task's own zone ahead of the scheduler's (plan 2026-10-29
+            // D5). An unusable one skips the catch-up for this task rather
+            // than walking its slots in a zone it was not declared in.
+            let task_zone = match ScheduleZone::for_task(task.timezone.as_deref(), zone) {
+                Ok(z) => z,
+                Err(e) => {
+                    error!(
+                        "Scheduler reconciler: task '{}' (id={}) has an unusable {}; not reconciled",
+                        task.name, task.id, e
+                    );
+                    continue;
+                }
+            };
+            if let Err(e) = self.clone().reconcile_task(&task, now, task_zone).await {
                 error!(
                     "Scheduler reconciler: task '{}' (id={}) failed: {}",
                     task.name, task.id, e
@@ -2741,6 +3146,88 @@ pub async fn start_scheduler_service(pg_db: Arc<PgDb>, app_state: Arc<AppState>)
     });
 
     info!("Scheduler service started");
+
+    // The on-start arm of the unfinished-session sweep: once, after the boot
+    // restore completes.
+    tokio::spawn(run_post_boot_restore_trigger());
+}
+
+/// The scheduled task the post-boot-restore trigger fires: the every-30-minute
+/// unfinished-session sweep, registered by
+/// `qontinui-claude-config/scripts/schedule-sweep-unfinished.sh` under this name
+/// (its upsert key).
+pub const BOOT_RESTORE_TRIGGER_TASK: &str = "sweep-unfinished";
+
+/// How often the trigger polls the boot-restore latch, and how long it waits
+/// for it. A runner whose restore is withheld by a coord drain keeps waiting;
+/// the cap only ends the wait for a runner whose frontend never asks.
+const BOOT_RESTORE_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+const BOOT_RESTORE_WAIT_CAP: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+
+/// PURE: the task to fire after the boot restore - the ENABLED task of that
+/// name. A disabled or absent one is `None`: the trigger only ever runs what an
+/// operator registered and left on.
+fn select_boot_restore_task<'a>(
+    tasks: &'a [ScheduledTask],
+    name: &str,
+) -> Option<&'a ScheduledTask> {
+    tasks.iter().find(|t| t.enabled && t.name == name)
+}
+
+/// Fire [`BOOT_RESTORE_TRIGGER_TASK`] ONCE, as soon as this process's boot
+/// restore has run (plan
+/// `2026-10-06-closed-sessions-whose-work-is-unfinished-are-found-fleet-wide-and-resumed`
+/// Phase 6: "once after each boot restore completes"). The cron schedule alone
+/// only gives a catch-up run at the next slot; this is the on-start arm.
+///
+/// Spawned detached from `start_scheduler_service`; never fails the service.
+/// The launch goes through [`run_task_now`] under `SpawnOrigin::Scheduler`, so
+/// the coord device drain still holds it (the sweep itself also defers any
+/// resume while drained), and a run already in flight (the catch-up arm got
+/// there first) is a no-op, not an error worth more than a log line.
+async fn run_post_boot_restore_trigger() {
+    use crate::session::session_lifecycle_store::{boot_restore_phase, BootRestorePhase};
+    let waited_from = std::time::Instant::now();
+    while boot_restore_phase() != BootRestorePhase::Ran {
+        if waited_from.elapsed() >= BOOT_RESTORE_WAIT_CAP {
+            info!(
+                "scheduler: boot restore never reported complete in {:?}; \
+                 not firing '{BOOT_RESTORE_TRIGGER_TASK}' on boot",
+                BOOT_RESTORE_WAIT_CAP
+            );
+            return;
+        }
+        tokio::time::sleep(BOOT_RESTORE_POLL).await;
+    }
+    let Some(service) = get_scheduler_service().await else {
+        return;
+    };
+    let tasks = match service.pg().map(|pg| pg.get_all_scheduled_tasks()) {
+        Ok(fut) => match fut.await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("scheduler: post-boot-restore trigger could not list tasks: {e}");
+                return;
+            }
+        },
+        Err(e) => {
+            warn!("scheduler: post-boot-restore trigger has no task store: {e}");
+            return;
+        }
+    };
+    let Some(task) = select_boot_restore_task(&tasks, BOOT_RESTORE_TRIGGER_TASK) else {
+        debug!("scheduler: no enabled '{BOOT_RESTORE_TRIGGER_TASK}' task; nothing to fire on boot");
+        return;
+    };
+    match run_task_now(&task.id, crate::coord_drain_state::SpawnOrigin::Scheduler).await {
+        Ok(()) => info!(
+            "scheduler: boot restore complete - fired '{BOOT_RESTORE_TRIGGER_TASK}' ({})",
+            task.id
+        ),
+        Err(e) => {
+            info!("scheduler: boot restore complete - '{BOOT_RESTORE_TRIGGER_TASK}' not fired: {e}")
+        }
+    }
 }
 
 /// Stop the global scheduler service
@@ -2958,6 +3445,31 @@ mod tests {
     }
 
     use crate::test_env::{env_lock, EnvVarRestore};
+
+    #[test]
+    fn boot_restore_trigger_selects_only_an_enabled_task_of_that_name() {
+        let mk = |name: &str, enabled: bool| {
+            let mut t = ScheduledTask::new(
+                name.to_string(),
+                None,
+                crate::scheduler::schedule_expression_default(),
+                crate::scheduler::scheduled_task_type_default(),
+            );
+            t.enabled = enabled;
+            t
+        };
+        let tasks = vec![
+            mk("other", true),
+            mk(BOOT_RESTORE_TRIGGER_TASK, false),
+            mk("other-2", true),
+        ];
+        assert!(select_boot_restore_task(&tasks, BOOT_RESTORE_TRIGGER_TASK).is_none());
+        let mut tasks = tasks;
+        tasks.push(mk(BOOT_RESTORE_TRIGGER_TASK, true));
+        let hit = select_boot_restore_task(&tasks, BOOT_RESTORE_TRIGGER_TASK).unwrap();
+        assert!(hit.enabled && hit.name == BOOT_RESTORE_TRIGGER_TASK);
+        assert!(select_boot_restore_task(&[], BOOT_RESTORE_TRIGGER_TASK).is_none());
+    }
 
     #[tokio::test]
     async fn test_scheduler_service_creation() {
@@ -3513,7 +4025,9 @@ mod tests {
     // policy and are unit-tested here without a database.
     // ========================================================================
 
-    use crate::scheduler::{schedule_expression_default, scheduled_task_type_default};
+    use crate::scheduler::{
+        compute_next_run, schedule_expression_default, scheduled_task_type_default,
+    };
 
     fn fixture_task(base_backoff: u32) -> ScheduledTask {
         let mut task = ScheduledTask::new(
@@ -4209,6 +4723,68 @@ mod tests {
         assert!(started.is_empty());
     }
 
+    fn ordered_task(name: &str, next_run: &str, waiting_since: Option<&str>) -> ScheduledTask {
+        use crate::scheduler::{schedule_expression_default, scheduled_task_type_default};
+        let mut task = ScheduledTask::new(
+            name.to_string(),
+            None,
+            schedule_expression_default(),
+            scheduled_task_type_default(),
+        );
+        task.next_run = Some(next_run.to_string());
+        task.condition_status = waiting_since.map(|since| {
+            let mut status = condition_status_default();
+            status.waiting_since = since.to_string();
+            status
+        });
+        task
+    }
+
+    /// A task parked on its conditions is offered ahead of an overdue cron
+    /// task, even one due long before it started waiting, so a waiter whose
+    /// condition has just passed takes the first slot.
+    #[test]
+    fn a_waiting_task_sorts_ahead_of_an_overdue_cron_task() {
+        let mut due = vec![
+            ordered_task("overdue-cron", "2026-10-28T02:47:00Z", None),
+            ordered_task("later-cron", "2026-10-29T02:47:00Z", None),
+            ordered_task(
+                "parked-late",
+                "2026-10-30T00:00:00Z",
+                Some("2026-10-30T00:00:00Z"),
+            ),
+            ordered_task(
+                "parked-early",
+                "2026-10-30T00:00:00Z",
+                Some("2026-10-29T00:00:00Z"),
+            ),
+        ];
+        due.sort_by(due_task_order);
+        let names: Vec<&str> = due.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["parked-early", "parked-late", "overdue-cron", "later-cron"]
+        );
+    }
+
+    /// `tick_pass` orders its candidates with [`due_task_order`] and nothing
+    /// else, so the order the test above pins is the order a tick uses.
+    #[test]
+    fn the_tick_orders_due_tasks_with_due_task_order() {
+        let src = include_str!("scheduler_service.rs");
+        let (_, tick) = src.split_once("async fn tick_pass(").expect("tick_pass");
+        let (tick, _) = tick
+            .split_once("async fn try_start_due_task(")
+            .expect("try_start_due_task follows tick_pass");
+        assert_eq!(tick.matches(".sort_by(").count(), 1);
+        assert!(tick.contains("due_tasks.sort_by(due_task_order);"));
+        let sort_at = tick.find("due_tasks.sort_by(due_task_order);").unwrap();
+        let walk_at = tick
+            .find("start_due_tasks(due_tasks, available_slots,")
+            .unwrap();
+        assert!(sort_at < walk_at, "the sort must precede the slot walk");
+    }
+
     /// `tick_pass` goes through the slot walk, and only a started task reports
     /// true, so a skip or a condition wait never spends a slot.
     #[test]
@@ -4268,6 +4844,40 @@ mod tests {
         );
     }
 
+    /// A limited slot's relaunch re-reads the drain gate and the task row
+    /// (`relaunch_hold`) before it starts a new session, and a hold ends the
+    /// slot instead of relaunching it.
+    #[test]
+    fn a_relaunch_rereads_the_drain_gate_and_the_task_before_it_spawns() {
+        let src = include_str!("scheduler_service.rs");
+        let (_, body) = src
+            .split_once("async fn settle_attempts(")
+            .expect("settle_attempts");
+        let (_, relaunch) = body
+            .split_once("if decision == RelaunchDecision::Relaunch {")
+            .expect("the relaunch branch");
+        let (before_spawn, _) = relaunch
+            .split_once("self.limit_recovery.relaunch(")
+            .expect("the relaunch spawn");
+        let (_, held) = before_spawn
+            .split_once("if let Some(hold) = self.relaunch_hold(&task_id).await {")
+            .expect("relaunch_hold is consulted before the spawn");
+        let (held, _) = held
+            .split_once("let mut next =")
+            .expect("the hold precedes the new execution");
+        assert!(
+            held.contains("return settlement;"),
+            "a hold must end the slot"
+        );
+
+        let (_, hold_fn) = src
+            .split_once("async fn relaunch_hold(")
+            .expect("relaunch_hold");
+        let (hold_fn, _) = hold_fn.split_once("\n    }\n").expect("fn ends");
+        assert!(hold_fn.contains("self.limit_recovery.drain_hold(task_id)"));
+        assert!(hold_fn.contains("!t.enabled"));
+    }
+
     /// `execute_task_with_context` starts only through the atomic mark.
     #[test]
     fn execute_task_starts_only_through_the_atomic_mark() {
@@ -4304,5 +4914,544 @@ mod tests {
             lost_race.contains("return;"),
             "a lost race must record nothing"
         );
+    }
+
+    // ========================================================================
+    // Plan `2026-11-13-devops-scheduled-remote-agent-relaunches-into-an-exhausted-account`:
+    // a RemoteAgent attempt that dies on an account limit cools the account
+    // it ran under and relaunches the slot, through the real settle path
+    // (`settle_launched_child` → `settle_attempts`) with a fake
+    // `LimitRecovery` in place of the probe, picker and spawn. Outcomes are
+    // built by the real `classify_exit` from a real banner tail.
+    // ========================================================================
+
+    mod limit_relaunch {
+        use super::*;
+        use crate::ai_provider::limit_hit::{CoolOutcome, Cooling, LimitHit, ResetSource};
+        use crate::commands::ai_settings::AccountUsageInfo;
+        use crate::scheduler_limit_relaunch::{
+            AccountAvailability, LimitRecovery, RelaunchCtx, Roster,
+        };
+        use crate::scheduler_remote_agent::{
+            classify_exit, RemoteAgentLaunch, RemoteAgentOutcome, RemoteAgentSpec,
+        };
+        use chrono::TimeZone;
+        use std::collections::VecDeque;
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        const PAKTIS: &str = "/h/.claude-paktis";
+        const BEN: &str = "/h/.claude-ben";
+
+        fn weekly_reset() -> DateTime<Utc> {
+            Utc.with_ymd_and_hms(2099, 11, 18, 21, 0, 0).unwrap()
+        }
+
+        /// The outcome the real `classify_exit` makes of a child that exited 1
+        /// on a weekly-limit banner, run under `dir`.
+        fn limited(dir: &str) -> RemoteAgentOutcome {
+            let out = classify_exit(
+                Ok(Some(1)),
+                false,
+                Duration::from_secs(600),
+                Some("You've hit your weekly limit \u{b7} resets Nov 18, 10pm (Europe/Berlin)\n"),
+                Some(dir),
+            );
+            assert!(
+                out.rate_limited.is_some(),
+                "fixture must classify as limited"
+            );
+            out
+        }
+
+        fn plain_failure() -> RemoteAgentOutcome {
+            classify_exit(
+                Ok(Some(1)),
+                false,
+                Duration::from_secs(600),
+                Some("error: something unrelated broke\n"),
+                Some(PAKTIS),
+            )
+        }
+
+        fn success() -> RemoteAgentOutcome {
+            classify_exit(Ok(Some(0)), false, Duration::from_secs(600), None, None)
+        }
+
+        fn launch_of(outcome: RemoteAgentOutcome) -> RemoteAgentLaunch {
+            RemoteAgentLaunch {
+                session_id: uuid::Uuid::new_v4().to_string(),
+                workdir: "/tmp".into(),
+                log_path: None,
+                completion: Box::pin(async move { outcome }),
+            }
+        }
+
+        fn spec() -> RemoteAgentSpec {
+            RemoteAgentSpec {
+                task_name: "dev-ops-steward".into(),
+                execution_id: String::new(),
+                prompt: "/dev-ops-steward --scheduled".into(),
+                working_directory: None,
+                model: None,
+                allowed_tools: vec![],
+                mcp_connections: vec![],
+                max_turns: 50,
+                timeout: Duration::from_secs(600),
+            }
+        }
+
+        /// A roster of accounts that start usable unless named exhausted
+        /// (with a probe reset); `cool` marks the dir cooled until
+        /// `weekly_reset()`; `relaunch` replays queued outcomes.
+        struct Fake {
+            dirs: Vec<&'static str>,
+            probe_exhausted: Vec<(&'static str, DateTime<Utc>)>,
+            /// `false`: the probe confirms nothing, so `cool` cools nothing.
+            confirms: bool,
+            cool_calls: Mutex<Vec<String>>,
+            cooled: Mutex<Vec<String>>,
+            relaunched: Mutex<Vec<RemoteAgentSpec>>,
+            queued: Mutex<VecDeque<RemoteAgentOutcome>>,
+            /// `true`: a relaunch fails to START (a launch `Err`).
+            fail_relaunch: bool,
+            /// `Some`: the drain gate holds every relaunch.
+            drain: Option<&'static str>,
+        }
+
+        impl Fake {
+            fn new(dirs: Vec<&'static str>) -> Self {
+                Self {
+                    dirs,
+                    probe_exhausted: vec![],
+                    confirms: true,
+                    cool_calls: Mutex::new(vec![]),
+                    cooled: Mutex::new(vec![]),
+                    relaunched: Mutex::new(vec![]),
+                    queued: Mutex::new(VecDeque::new()),
+                    fail_relaunch: false,
+                    drain: None,
+                }
+            }
+        }
+
+        impl LimitRecovery for Fake {
+            fn cool<'a>(
+                &'a self,
+                dir: &'a str,
+                _hit: &'a LimitHit,
+            ) -> futures::future::BoxFuture<'a, CoolOutcome> {
+                self.cool_calls.lock().unwrap().push(dir.to_string());
+                let until = weekly_reset();
+                let cooling = self.confirms.then(|| {
+                    self.cooled.lock().unwrap().push(dir.to_string());
+                    Cooling {
+                        duration: (until - Utc::now()).to_std().unwrap(),
+                        until,
+                        source: ResetSource::SevenDayProbe,
+                    }
+                });
+                Box::pin(async move {
+                    CoolOutcome {
+                        cooling,
+                        probe: Vec::<AccountUsageInfo>::new(),
+                    }
+                })
+            }
+
+            fn drain_hold(&self, _task_id: &str) -> Option<String> {
+                self.drain.map(str::to_string)
+            }
+
+            fn roster(&self, _probe: &[AccountUsageInfo], _tried: &[String]) -> Roster {
+                let cooled = self.cooled.lock().unwrap().clone();
+                Roster {
+                    accounts: self
+                        .dirs
+                        .iter()
+                        .map(|d| {
+                            let probe_reset = self
+                                .probe_exhausted
+                                .iter()
+                                .find(|(x, _)| x == d)
+                                .map(|(_, t)| *t);
+                            AccountAvailability {
+                                dir: d.to_string(),
+                                valid_credentials: true,
+                                cooled_for: cooled
+                                    .iter()
+                                    .any(|c| c == d)
+                                    .then(|| (weekly_reset() - Utc::now()).to_std().unwrap()),
+                                known_exhausted: probe_reset.is_some(),
+                                probe_failed: false,
+                                known_reset: probe_reset,
+                            }
+                        })
+                        .collect(),
+                    picker_block: None,
+                }
+            }
+
+            fn relaunch(
+                &self,
+                spec: RemoteAgentSpec,
+                _bound_port: Option<u16>,
+            ) -> futures::future::BoxFuture<'static, Result<RemoteAgentLaunch, String>>
+            {
+                self.relaunched.lock().unwrap().push(spec);
+                if self.fail_relaunch {
+                    return Box::pin(async { Err("no account could be resolved".to_string()) });
+                }
+                let next = self
+                    .queued
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("a relaunch nobody queued an outcome for");
+                Box::pin(async move { Ok(launch_of(next)) })
+            }
+        }
+
+        async fn settle(
+            fake: Arc<Fake>,
+            first: RemoteAgentOutcome,
+            auto_fix_on_failure: bool,
+        ) -> Settlement {
+            let mut service = SchedulerService::new(None);
+            service.limit_recovery = fake;
+            let service = Arc::new(service);
+            assert!(service.try_mark_running("task-1").await);
+            let record = <TaskExecutionRecord as TaskExecutionRecordExt>::new();
+            let handle = service
+                .clone()
+                .settle_launched_child(
+                    "RemoteAgent",
+                    "task-1".into(),
+                    "dev-ops-steward".into(),
+                    auto_fix_on_failure,
+                    record,
+                    Ok(launch_of(first)),
+                    Some(RelaunchCtx {
+                        spec: spec(),
+                        bound_port: None,
+                        catch_up: None,
+                    }),
+                )
+                .await
+                .expect("a launched child is settled by a detached task");
+            let settlement = handle.await.expect("settle task panicked");
+            assert!(
+                !service.is_task_running("task-1").await,
+                "the slot is released once settled"
+            );
+            settlement
+        }
+
+        /// THE ARMING TEST: red against `main`, where a limited child is just
+        /// "exited with code 1", nothing is cooled and nothing relaunched.
+        #[tokio::test]
+        async fn a_limited_attempt_cools_its_own_dir_and_relaunches_the_slot_elsewhere() {
+            let fake = Arc::new(Fake::new(vec![PAKTIS, BEN]));
+            fake.queued.lock().unwrap().push_back(success());
+            let s = settle(fake.clone(), limited(PAKTIS), false).await;
+
+            // (d) the dir cooled is the one the CHILD ran under — carried on
+            // its outcome from its own spawn preconditions, not the global.
+            assert_eq!(*fake.cooled.lock().unwrap(), vec![PAKTIS.to_string()]);
+            assert_eq!(s.cooled, vec![PAKTIS.to_string()]);
+
+            // One relaunch, as a NEW execution with its own row.
+            let relaunched = fake.relaunched.lock().unwrap().clone();
+            assert_eq!(relaunched.len(), 1);
+            assert_eq!(s.rows.len(), 2);
+            assert_ne!(s.rows[0].execution_id, s.rows[1].execution_id);
+            assert_eq!(relaunched[0].execution_id, s.rows[1].execution_id);
+
+            assert!(!s.rows[0].success);
+            assert_eq!(
+                s.rows[0].error_message.as_deref(),
+                Some("scheduled session hit the usage limit of /h/.claude-paktis (resets 2099-11-18T21:00:00Z)")
+            );
+            assert!(s.rows[1].success);
+            assert_eq!(s.decision, None, "a relaunched slot moves no next_run");
+        }
+
+        /// A drain that landed while attempt 1 ran holds the relaunch: no new
+        /// session, the slot ends on its cron cadence, and the row says why.
+        #[tokio::test]
+        async fn a_drain_landing_mid_slot_holds_the_relaunch() {
+            let mut fake = Fake::new(vec![PAKTIS, BEN]);
+            fake.drain = Some("device drained");
+            let fake = Arc::new(fake);
+            let s = settle(fake.clone(), limited(PAKTIS), true).await;
+            assert_eq!(*fake.cooled.lock().unwrap(), vec![PAKTIS.to_string()]);
+            assert!(fake.relaunched.lock().unwrap().is_empty());
+            assert_eq!(s.rows.len(), 1);
+            assert!(!s.rows[0].success);
+            assert!(s.rows[0].auto_fix_session_id.is_none());
+            let err = s.rows[0].error_message.as_deref().unwrap();
+            assert!(err.contains("relaunch held: device drained"), "{err}");
+            assert_eq!(s.decision, None);
+        }
+
+        /// A relaunch that cannot START is a LaunchFailed row: the slot is
+        /// released (asserted by `settle`), and no auto-fix is launched even
+        /// with `auto_fix_on_failure` set.
+        #[tokio::test]
+        async fn a_relaunch_that_cannot_start_releases_the_slot_without_auto_fix() {
+            let mut fake = Fake::new(vec![PAKTIS, BEN]);
+            fake.fail_relaunch = true;
+            let fake = Arc::new(fake);
+            let s = settle(fake.clone(), limited(PAKTIS), true).await;
+            assert_eq!(fake.relaunched.lock().unwrap().len(), 1);
+            assert_eq!(s.rows.len(), 2);
+            assert!(!s.rows[0].success);
+            assert!(!s.rows[1].success);
+            assert_eq!(
+                s.rows[1].error_message.as_deref(),
+                Some("no account could be resolved")
+            );
+            assert_eq!(s.decision, None);
+        }
+
+        /// (c) Relaunch excludes the cooled dir; when the relaunch ALSO hits
+        /// a limit, no account remains and the slot waits for the soonest reset.
+        #[tokio::test]
+        async fn every_account_limited_stops_with_all_n_exhausted_and_the_soonest_reset() {
+            let fake = Arc::new(Fake::new(vec![PAKTIS, BEN]));
+            fake.queued.lock().unwrap().push_back(limited(BEN));
+            let s = settle(fake.clone(), limited(PAKTIS), false).await;
+
+            assert_eq!(
+                *fake.cooled.lock().unwrap(),
+                vec![PAKTIS.to_string(), BEN.to_string()]
+            );
+            assert_eq!(
+                fake.relaunched.lock().unwrap().len(),
+                1,
+                "bounded: no third attempt"
+            );
+            assert_eq!(s.rows.len(), 2);
+            let last = s.rows[1].error_message.as_deref().unwrap();
+            assert!(
+                last.ends_with(
+                    "; all 2 accounts exhausted (tried: .claude-paktis, .claude-ben); next attempt at 2099-11-18T21:00:00Z"
+                ),
+                "{last}"
+            );
+            let decision = s.decision.expect("the slot ended on a decision");
+            assert_eq!(
+                decision.next_run_override(Some(Utc::now())),
+                Some(weekly_reset()),
+                "next_run moves to the soonest KNOWN reset, even past the cron slot"
+            );
+        }
+
+        /// Phase 0 (nawa): a pool the probe already shows exhausted is not
+        /// relaunched into at all — the record goes straight to "all N
+        /// accounts exhausted", next_run at the soonest PROBE reset.
+        #[tokio::test]
+        async fn a_probe_exhausted_pool_is_not_relaunched_and_waits_for_its_soonest_reset() {
+            let ben_reset = Utc.with_ymd_and_hms(2099, 11, 14, 20, 0, 0).unwrap();
+            let mut fake = Fake::new(vec![PAKTIS, BEN]);
+            fake.probe_exhausted = vec![(BEN, ben_reset)];
+            let fake = Arc::new(fake);
+            let s = settle(fake.clone(), limited(PAKTIS), false).await;
+
+            assert!(fake.relaunched.lock().unwrap().is_empty());
+            assert_eq!(s.rows.len(), 1);
+            assert!(s.rows[0]
+                .error_message
+                .as_deref()
+                .unwrap()
+                .ends_with("; all 2 accounts exhausted (tried: .claude-paktis); next attempt at 2099-11-14T20:00:00Z"));
+            assert_eq!(
+                s.decision.unwrap().next_run_override(Some(Utc::now())),
+                Some(ben_reset)
+            );
+        }
+
+        /// (b) A plain non-zero exit is settled as before: unchanged message,
+        /// nothing cooled, nothing relaunched.
+        #[tokio::test]
+        async fn a_plain_failure_is_unchanged_and_neither_cools_nor_relaunches() {
+            let fake = Arc::new(Fake::new(vec![PAKTIS, BEN]));
+            let s = settle(fake.clone(), plain_failure(), false).await;
+            assert!(fake.cooled.lock().unwrap().is_empty());
+            assert!(fake.relaunched.lock().unwrap().is_empty());
+            assert_eq!(s.rows.len(), 1);
+            assert_eq!(
+                s.rows[0].error_message.as_deref(),
+                Some("scheduled session exited with code 1")
+            );
+        }
+
+        /// A1: a catch-all phrase ("limit reached") in an unrelated failure's
+        /// stderr that the probe does not confirm and that states no reset is
+        /// a plain failure: nothing cooled, nothing relaunched.
+        #[tokio::test]
+        async fn an_unconfirmed_catch_all_phrase_neither_cools_nor_relaunches() {
+            let out = classify_exit(
+                Ok(Some(1)),
+                false,
+                Duration::from_secs(600),
+                Some("error: retry limit reached while fetching origin\n"),
+                Some(PAKTIS),
+            );
+            assert_eq!(
+                out.rate_limited.as_ref().unwrap().hit.pattern,
+                "limit reached"
+            );
+            let mut fake = Fake::new(vec![PAKTIS, BEN]);
+            fake.confirms = false;
+            let fake = Arc::new(fake);
+            fake.queued.lock().unwrap().push_back(success());
+            let s = settle(fake.clone(), out, false).await;
+
+            assert_eq!(*fake.cool_calls.lock().unwrap(), vec![PAKTIS.to_string()]);
+            assert!(fake.cooled.lock().unwrap().is_empty(), "nothing cooled");
+            assert!(s.cooled.is_empty());
+            assert!(
+                fake.relaunched.lock().unwrap().is_empty(),
+                "nothing relaunched"
+            );
+            assert_eq!(s.rows.len(), 1);
+            assert_eq!(
+                s.rows[0].error_message.as_deref(),
+                Some(
+                    "scheduled session exited with code 1 (the usage-limit phrase 'limit reached' \
+                     appeared in its log, but neither the usage probe nor a banner reset confirmed it)"
+                )
+            );
+            assert_eq!(s.decision, None);
+        }
+
+        /// (e) A limited outcome never launches auto-fix, even with
+        /// `auto_fix_on_failure` set; a plain failure still does (control).
+        /// The auto-fix door is the real `/prompts/run`, mocked.
+        #[tokio::test]
+        async fn a_limited_outcome_never_launches_auto_fix() {
+            let _env_lock = env_lock();
+            let _env = restore_port();
+
+            let envelope = serde_json::to_value(crate::mcp::types::ApiResponse::success(
+                serde_json::json!({ "session_id": "sid-fix" }),
+            ))
+            .unwrap();
+            let (port, captured) = spawn_prompts_run_mock(ok_response(envelope.clone())).await;
+            std::env::set_var("QONTINUI_PORT", port.to_string());
+
+            // Pool exhausted after the first limit: the slot ends here.
+            let mut fake = Fake::new(vec![PAKTIS]);
+            fake.probe_exhausted = vec![];
+            let s = settle(Arc::new(fake), limited(PAKTIS), true).await;
+            assert!(
+                captured.lock().await.is_none(),
+                "auto-fix was launched for a limit hit"
+            );
+            assert!(s.rows[0].auto_fix_session_id.is_none());
+
+            // Control: the same task failing for a non-limit reason does.
+            let (port, captured) = spawn_prompts_run_mock(ok_response(envelope)).await;
+            std::env::set_var("QONTINUI_PORT", port.to_string());
+            let s = settle(Arc::new(Fake::new(vec![PAKTIS])), plain_failure(), true).await;
+            assert!(
+                captured.lock().await.is_some(),
+                "control: a plain failure fires auto-fix"
+            );
+            assert_eq!(s.rows[0].auto_fix_session_id.as_deref(), Some("sid-fix"));
+        }
+
+        /// A2/A3/A8: the value the limited slot's writer hands verbatim to
+        /// `update_task_next_run`. A known reset overrides the cron slot; a
+        /// guess never does; a partly-known pool keeps only an earlier reset.
+        #[test]
+        fn the_next_run_written_after_a_limit_is_a_known_reset_or_the_cron_slot() {
+            use crate::scheduler_limit_relaunch::{NextAttempt, RelaunchDecision};
+            let mut task = fixture_task(0);
+            task.schedule = ScheduleExpression::Interval(3600);
+            let now = Utc::now();
+            let zone = ScheduleZone::Utc;
+            let cron = compute_task_next_run(&task, now, zone)
+                .unwrap()
+                .expect("an interval task has a next run");
+            let exhausted = |soonest_known, unknown_for: Vec<String>| RelaunchDecision::Exhausted {
+                exhausted: vec!["/a".into()],
+                tried: vec!["/a".into()],
+                probe_failed: vec![],
+                next_attempt: NextAttempt {
+                    soonest_known,
+                    unknown_for,
+                },
+                bound_reached: false,
+            };
+            let cron_s = Some(cron.to_rfc3339());
+
+            // Every return known: the known reset, even days past the cron slot.
+            let later = cron + chrono::Duration::days(4);
+            assert_eq!(
+                next_run_after_limit(&task, Some(&exhausted(Some(later), vec![])), now, zone),
+                Some(later.to_rfc3339())
+            );
+            // Nothing known (a floor or unrelated cooldown): the cron slot.
+            assert_eq!(
+                next_run_after_limit(&task, Some(&exhausted(None, vec!["/a".into()])), now, zone),
+                cron_s
+            );
+            // Partly known: only an EARLIER-than-cron known reset is kept.
+            let earlier = cron - chrono::Duration::minutes(10);
+            assert_eq!(
+                next_run_after_limit(
+                    &task,
+                    Some(&exhausted(Some(earlier), vec!["/b".into()])),
+                    now,
+                    zone
+                ),
+                Some(earlier.to_rfc3339())
+            );
+            assert_eq!(
+                next_run_after_limit(
+                    &task,
+                    Some(&exhausted(Some(later), vec!["/b".into()])),
+                    now,
+                    zone
+                ),
+                cron_s
+            );
+            // No decision (an ambient-account hit): the cron slot.
+            assert_eq!(next_run_after_limit(&task, None, now, zone), cron_s);
+
+            // A schedule with no future slot (a spent `Once`) is not re-armed
+            // at the reset: no next run stays no next run.
+            let mut spent = fixture_task(0);
+            spent.schedule =
+                ScheduleExpression::Once((now - chrono::Duration::hours(1)).to_rfc3339());
+            assert_eq!(compute_task_next_run(&spent, now, zone).unwrap(), None);
+            assert_eq!(
+                next_run_after_limit(&spent, Some(&exhausted(Some(later), vec![])), now, zone),
+                None
+            );
+        }
+
+        /// A8: the limited slot's DB path is `write_next_run_after_limit`,
+        /// which writes exactly `next_run_after_limit`'s value. Pinned at the
+        /// source so a refactor cannot route the settle path past it.
+        #[test]
+        fn the_limited_settle_path_writes_next_run_through_next_run_after_limit() {
+            let src = include_str!("scheduler_service.rs");
+            let (_, writer) = src
+                .split_once("async fn write_next_run_after_limit(")
+                .expect("writer");
+            let writer = writer.split_once("\n    }\n").expect("writer body").0;
+            assert!(writer
+                .contains("let next = next_run_after_limit(&task, decision, Utc::now(), zone);"));
+            assert!(writer
+                .contains(".update_task_next_run(task_id, next.as_deref(), &task.modified_at)"));
+            let (_, fin) = src
+                .split_once("async fn finalize_limited_execution(")
+                .expect("finalize");
+            let fin = fin.split_once("\n    }\n").expect("finalize body").0;
+            assert!(fin.contains("self.write_next_run_after_limit(task_id, decision).await;"));
+        }
     }
 }

@@ -1044,7 +1044,7 @@ pub fn install_identity_shim_on_user_path() -> Result<CliPathOutcome, String> {
         // PREPEND — the shim's `claude` shadow must be resolved BEFORE the real
         // `claude` that is already on an earlier PATH entry, or this whole opt-in
         // is a silent no-op (the real tool keeps winning). Mirrors the per-PTY
-        // path's `shim_materializer::prepend_path`.
+        // path's `terminal::session::compose_child_path`.
         Placement::Prepend,
         "Already enabled — new terminals already get coord identity.",
         "Enabled. Open a NEW terminal; `claude` there will now request coord device identity \

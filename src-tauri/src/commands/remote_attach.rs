@@ -1,17 +1,17 @@
-//! Remote session tabs — the operator-facing commands (plan
+//! Remote session tabs â€” the operator-facing commands (plan
 //! `2026-08-31-remote-session-tabs-in-runner-terminal`, Phase 3c).
 //!
-//! - `remote_attach_preference_get` / `remote_attach_preference_set` — the
+//! - `remote_attach_preference_get` / `remote_attach_preference_set` â€” the
 //!   `accept_remote_attach` preference (`same_user` | `tenant` | `off`),
 //!   persisted in runner settings and mirrored to coord's device row with
 //!   `PUT /coord/devices/me/attach-preference` on every change and once per
 //!   relay connect (best-effort, logged). The preference is the OFF switch;
-//!   the per-attach grant is the safeguard — they are separate mechanisms.
-//! - `terminal_attach_remote {device_id, session_id}` — the SOURCE-role attach
+//!   the per-attach grant is the safeguard â€” they are separate mechanisms.
+//! - `terminal_attach_remote {device_id, session_id}` â€” the SOURCE-role attach
 //!   flow: mint a grant from coord with the device JWT, present it through the
 //!   backend socket, wait for the target's ring, and open an ordinary
 //!   `TerminalSession` around a [`RemotePaneIo`]. The returned `TerminalInfo`
-//!   is what the frontend opens as a tab — no new terminal backend.
+//!   is what the frontend opens as a tab â€” no new terminal backend.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,7 +23,7 @@ use tracing::{info, warn};
 
 use super::CommandResponse;
 use crate::mcp::remote_terminal::{
-    client, AttachError, AttachRefusal, AttachedReply, ATTACH_TIMEOUT,
+    client, AttachError, AttachRefusal, AttachedReply, GrantRenewer, RenewedGrant, ATTACH_TIMEOUT,
 };
 use crate::session::SessionRegistry;
 use crate::settings::AcceptRemoteAttach;
@@ -152,7 +152,7 @@ pub async fn remote_attach_preference_set(
 pub(crate) struct AttachGrantResponse {
     pub grant: String,
     pub grant_jti: String,
-    /// The device coord minted this grant TO — the principal it verified, i.e.
+    /// The device coord minted this grant TO â€” the principal it verified, i.e.
     /// this device as coord knows it. The interactivity reporter files it as
     /// `source_device_id`, so a source report agrees with the grant row coord
     /// checks it against. Absent from a coord that predates the field; the
@@ -188,8 +188,8 @@ pub(crate) struct TargetRunner {
     pub served_sha: Option<String>,
     /// Whether the target is known to ACKNOWLEDGE remote input (plan
     /// `2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold`,
-    /// the `RemoteCapability::InputAck` floor). Coord does not serve this yet —
-    /// the floor is a deferred coord follow-up — so it is absent today, which
+    /// the `RemoteCapability::InputAck` floor). Coord does not serve this yet â€”
+    /// the floor is a deferred coord follow-up â€” so it is absent today, which
     /// reads as UNKNOWN: the probe sweep then sends no write probe. Same
     /// `{state, reason}` shape as the block it sits in.
     #[serde(default)]
@@ -210,7 +210,7 @@ pub(crate) struct CapabilityReadiness {
 ///
 /// A request made while this runner's relay is down just waits out its window
 /// (`RemoteTerminalHub::send` only enqueues), so without this input a timeout
-/// blames the PEER for a failure that never left this machine — the incident
+/// blames the PEER for a failure that never left this machine â€” the incident
 /// in plan `2026-09-25-runner-loses-its-relay-and-announces-it-under-a-false-cause-or-not-at-all`
 /// (S6). Sampled at TIMEOUT, never used to refuse at send time: a relay that
 /// reconnects inside the window drains the queue and must still succeed.
@@ -221,7 +221,7 @@ pub(crate) enum SourceRelay {
     /// The relay reports its websocket NOT connected; `last_error` is its
     /// latest registration / connection error when it recorded one.
     Down { last_error: Option<String> },
-    /// No `AppState` to read — nothing is established about this runner's
+    /// No `AppState` to read â€” nothing is established about this runner's
     /// relay either way. (A readable `AppState` with NO server mode is `Down`:
     /// web integration is not running, so there is no relay at all.)
     Unknown,
@@ -240,7 +240,7 @@ impl SourceRelay {
         Self::of(server_mode.as_ref()).await
     }
 
-    /// [`Self::sample`] over the `ServerModeState` it reads — the same pair
+    /// [`Self::sample`] over the `ServerModeState` it reads â€” the same pair
     /// `backend_relay::web_integration_status_for` reports, which also reads
     /// an absent server mode as `ws_connected: false`.
     pub(crate) async fn of(server_mode: Option<&crate::server_mode::ServerModeState>) -> Self {
@@ -260,7 +260,7 @@ impl SourceRelay {
     }
 }
 
-/// Explain a relay timeout — the target never answered — with what is actually
+/// Explain a relay timeout â€” the target never answered â€” with what is actually
 /// known, instead of guessing "relay disconnected or target offline".
 ///
 /// The SOURCE's own relay is consulted first: when it is down the request may
@@ -283,7 +283,7 @@ pub(crate) fn explain_relay_timeout(
     with_source_relay(&head, source_relay, || match target_runner {
         Some(tr) if tr.state == "supports" => format!(
             "{head}. Coord observed that device serving a runner build{} that carries the \
-             handler, so the target runner is wedged or offline, or the relay lost the frame — \
+             handler, so the target runner is wedged or offline, or the relay lost the frame â€” \
              its own runner log says which.",
             tr.served_sha
                 .as_deref()
@@ -304,13 +304,13 @@ pub(crate) fn explain_relay_timeout(
         ),
         _ => format!(
             "{head}. Coord did not report the target's runner build. The target may be offline, \
-             or running a runner too old to answer — such a runner ignores the request silently."
+             or running a runner too old to answer â€” such a runner ignores the request silently."
         ),
     })
 }
 
 /// [`explain_relay_timeout`] for a HISTORY request, which mints no grant and so
-/// never asks coord about the target's runner build — its target text must not
+/// never asks coord about the target's runner build â€” its target text must not
 /// claim coord was silent about something it was never asked.
 pub(crate) fn explain_history_timeout(
     target_device_id: &str,
@@ -338,7 +338,7 @@ fn with_source_relay(
     match source_relay {
         SourceRelay::Down { last_error } => format!(
             "{head}. THIS runner's own backend relay is down{}, so the request may never have \
-             reached the relay — this failure says nothing about the target device. Restore \
+             reached the relay â€” this failure says nothing about the target device. Restore \
              this runner's relay first (its web-integration status says why it is down).",
             last_error
                 .as_deref()
@@ -358,12 +358,12 @@ fn with_source_relay(
 /// call that registered it, so a session registered microseconds ago is not yet
 /// a row coord's mint can resolve. A remote create hits exactly that window:
 /// the target registers, answers `terminal_created`, and the source mints
-/// against an id coord has not drained yet — a `404 session_not_found` that is
+/// against an id coord has not drained yet â€” a `404 session_not_found` that is
 /// a RACE, not an absence. Retried for this long before it is reported.
 const SESSION_VISIBILITY_RETRY: Duration = Duration::from_millis(750);
 const SESSION_VISIBILITY_ATTEMPTS: u32 = 10;
 
-/// [`mint_attach_grant`], retrying ONLY a `session_not_found` — the one
+/// [`mint_attach_grant`], retrying ONLY a `session_not_found` â€” the one
 /// refusal that can become an admission by waiting. Every other refusal
 /// (`attach_forbidden`, a credential answer, a transport failure) is returned
 /// on the first attempt: retrying those would turn one honest refusal into a
@@ -374,7 +374,7 @@ const SESSION_VISIBILITY_ATTEMPTS: u32 = 10;
 /// [`present_grant_until_target_records_it`], under the very same rule: retry
 /// exactly the refusal that waiting can turn into an admission
 /// (`attach_grant_unknown`), return every settled one at once. The two stages
-/// are separate functions because the remedies are opposites — the mint race
+/// are separate functions because the remedies are opposites â€” the mint race
 /// is fixed by asking AGAIN, the presentation race by presenting the SAME
 /// grant again. Minting a second grant to cure an `attach_grant_unknown` is
 /// the defect, not the fix: it is what made the failure permanent.
@@ -404,8 +404,8 @@ pub(crate) async fn mint_attach_grant_awaiting_session(
 
 /// `POST /coord/sessions/{id}/attach-grants`, presenting `scope`'s credential.
 ///
-/// coord resolves the session WITHIN the presented principal's tenant — a
-/// session in another tenant is `404 session_not_found` — so the scope must be
+/// coord resolves the session WITHIN the presented principal's tenant â€” a
+/// session in another tenant is `404 session_not_found` â€” so the scope must be
 /// the tenant the row was LISTED under. Callers resolve it with
 /// [`super::fleet_sessions::fleet_scope`], the same rule the Fleet read uses.
 pub(crate) async fn mint_attach_grant(
@@ -442,7 +442,7 @@ pub(crate) async fn mint_attach_grant(
 /// Pure: the typed error string for a non-2xx attach-grant mint.
 ///
 /// Shape `remote_attach:<error>[:<reason>]: [<hint> ](coord answered <status>
-/// for POST <url>)` — the picker's `attachErrorMessage` lifts the code out of
+/// for POST <url>)` â€” the picker's `attachErrorMessage` lifts the code out of
 /// it. Coord's `hint` (e.g. which runner build the target serves and which it
 /// needs) leads the detail when present. `reason` is only folded into the code
 /// when it is a bare `[a-z_]+` token, because the picker's pattern admits
@@ -494,7 +494,7 @@ pub const REMOTE_IDENTITY_EVENT: &str = "terminal-remote-identity";
 ///
 /// `device_id` / `session_id` are the picker row (`fleet_sessions_list`);
 /// `device_label`, `session_label` and `working_dir` are the row's display
-/// values, used only for the tab title and the info's working dir — the
+/// values, used only for the tab title and the info's working dir â€” the
 /// authority for WHERE the session lives is coord's answer to the mint, and
 /// a disagreement with `device_id` is refused rather than followed.
 ///
@@ -533,7 +533,7 @@ pub async fn terminal_attach_remote(
         let asked = device_id.trim();
         return Err(format!(
             "remote_attach:target_mismatch: coord places session {session_uuid} on device \
-             {target}, not {asked} — refresh the fleet list"
+             {target}, not {asked} â€” refresh the fleet list"
         ));
     }
     info!(
@@ -564,8 +564,8 @@ pub async fn terminal_attach_remote(
 }
 
 /// The tenant a grant mint presents, decided by
-/// [`super::fleet_sessions::fleet_scope`] — the rule the Fleet read that listed
-/// the row used — off the async runtime (it reads machine.json and the
+/// [`super::fleet_sessions::fleet_scope`] â€” the rule the Fleet read that listed
+/// the row used â€” off the async runtime (it reads machine.json and the
 /// credential store). Refusals keep `fleet_scope`'s `<code>: <detail>` shape
 /// with the `fleet_sessions:` prefix stripped, so each caller re-prefixes them
 /// in its own voice.
@@ -593,30 +593,13 @@ pub(crate) async fn grant_scope(
 }
 
 // ---------------------------------------------------------------------------
-// The target-side grant race — re-presenting the SAME grant
+// The target-side grant race â€” re-presenting the SAME grant
 // ---------------------------------------------------------------------------
 
 /// How long the source keeps re-presenting the SAME grant while the target has
-/// not recorded it yet.
-///
-/// **Sized against the TARGET's catch-up poll, which is a property of the
-/// target's BUILD and therefore not shortenable from here.** A target learns a
-/// grant from a push on `qontinui.sessions.<tenant>.<device>.attach_request`
-/// or from its catch-up `GET /sessions/attach-requests`; a target whose runner
-/// predates the on-demand re-read has only those two, so a dropped push leaves
-/// the poll as the only feed. That poll is 15 s on a runner carrying
-/// [`crate::session::attach::POLL_INTERVAL`] as it now stands, and **60 s on
-/// every build that predates it** — which is the population this window exists
-/// for. 80 s covers one whole 60 s tick plus the catch-up GET's own budget and
-/// clock skew, against a grant coord gives 900 s of life, so the wait spends a
-/// small fraction of the capability it is waiting on.
-///
-/// It bounds the RE-PRESENTATION schedule, not the wall clock: each
-/// presentation carries its own [`ATTACH_TIMEOUT`] (20 s), so a final attempt
-/// that times out can carry the total to ~100 s. A timeout is a settled stop
-/// (see [`present_grant_until_target_records_it`]), so that happens at most
-/// once and never compounds.
-pub(crate) const GRANT_LEARN_WINDOW: Duration = Duration::from_secs(80);
+/// not recorded it yet. Defined beside the reattach supervisor, which uses the
+/// same window after a grant renewal, so the two cannot drift; see its doc.
+pub(crate) use crate::mcp::remote_terminal::GRANT_LEARN_WINDOW;
 
 /// Gap between two presentations of the same grant. Short enough that a 15 s
 /// poll is caught within a tick of recording the row, long enough that the
@@ -671,7 +654,7 @@ pub(crate) trait AttachWaitObserver: Sync {
 
 /// Emits [`REMOTE_ATTACH_WAITING_EVENT`] on the app handle, and remembers
 /// whether it ever did so the wait can be closed out exactly when it was
-/// opened — a `waiting: false` for a wait the frontend never saw would leave a
+/// opened â€” a `waiting: false` for a wait the frontend never saw would leave a
 /// stale key behind, and a missing one would leave a spinner forever.
 pub(crate) struct TauriWaitObserver {
     app: tauri::AppHandle,
@@ -706,7 +689,7 @@ impl TauriWaitObserver {
         }
     }
 
-    /// Close the waiting state out — called however the attach settled.
+    /// Close the waiting state out â€” called however the attach settled.
     pub(crate) fn settle(&self, elapsed: Duration, window: Duration) {
         let attempts = self.announced.load(std::sync::atomic::Ordering::Relaxed);
         if attempts > 0 {
@@ -724,7 +707,7 @@ impl AttachWaitObserver for TauriWaitObserver {
             session = %self.session_id,
             attempt,
             elapsed_ms = elapsed.as_millis() as u64,
-            "remote attach: target has not recorded the grant yet — re-presenting the same grant"
+            "remote attach: target has not recorded the grant yet â€” re-presenting the same grant"
         );
         self.emit(true, attempt, elapsed, window);
     }
@@ -738,8 +721,8 @@ impl AttachWaitObserver for TauriWaitObserver {
 /// a trick: `RemoteAttachGrants::unbind` documents same-grant re-presentation
 /// as the intended path for exactly this reason (the backend tears the
 /// attachment down on every source-socket drop and the source re-presents on
-/// reconnect). Minting a FRESH grant per attempt — what the picker's retry
-/// button did — is what made the failure permanent instead of flaky: the
+/// reconnect). Minting a FRESH grant per attempt â€” what the picker's retry
+/// button did â€” is what made the failure permanent instead of flaky: the
 /// target's catch-up poll can only ever record the jtis coord published before
 /// the tick, never the one the next frame is about to present.
 ///
@@ -750,24 +733,24 @@ impl AttachWaitObserver for TauriWaitObserver {
 /// final: `attach_grant_expired`, `attach_grant_wrong_source`,
 /// `attach_terminal_mismatch` (the grant is bound to another terminal),
 /// `remote_attach_disabled`, `session_not_local`, `relay_unavailable`,
-/// `relay_disconnected` — and `timeout`, which means the target answered
+/// `relay_disconnected` â€” and `timeout`, which means the target answered
 /// nothing at all. A timeout is not the race this covers: it is a wedged,
 /// offline or pre-feature target, which [`explain_relay_timeout`] already
 /// diagnoses, and re-presenting into it would spend the window 20 s at a time
 /// to reach the same conclusion.
 ///
 /// **Bounds this respects, stated because they are easy to trip:**
-/// - `MAX_GRANTS` (256) capacity eviction — re-presenting inserts nothing into
+/// - `MAX_GRANTS` (256) capacity eviction â€” re-presenting inserts nothing into
 ///   the target's table (only coord's push and the target's own catch-up do),
 ///   so this adds no capacity pressure. A target whose table is full of live
 ///   bindings refuses the insert, which looks like the race and is not one;
 ///   the window runs out and the error says so.
-/// - `admit`'s `TerminalMismatch` on an already-bound grant — a re-present
+/// - `admit`'s `TerminalMismatch` on an already-bound grant â€” a re-present
 ///   names no terminal, so it goes through `lookup` + `bind` rather than
 ///   `admit`'s binding check, and re-binds to the SAME terminal. A grant bound
 ///   elsewhere answers `attach_terminal_mismatch`, which is settled and stops
 ///   the loop at once.
-/// - [`ATTACH_TIMEOUT`] — it bounds each PRESENTATION, not this window. The
+/// - [`ATTACH_TIMEOUT`] â€” it bounds each PRESENTATION, not this window. The
 ///   window schedules attempts; a presentation that times out ends the loop.
 ///
 /// **How this composes with the RELAY's own one-shot re-present.** The relay
@@ -780,7 +763,7 @@ impl AttachWaitObserver for TauriWaitObserver {
 ///    logged. So the relay's extra frame can settle an attempt but never
 ///    produce a second `AttachedReply`.
 /// 2. **One `Ok` ends the loop.** This function returns on the first success,
-///    so exactly one pane is ever registered — the duplicate-tab shape needs
+///    so exactly one pane is ever registered â€” the duplicate-tab shape needs
 ///    two successes, which cannot happen.
 /// 3. **Re-binding is idempotent.** If a presentation succeeded on the target
 ///    while its reply was lost, the grant is already bound to that terminal;
@@ -830,11 +813,11 @@ fn grant_never_recorded(
     window: Duration,
 ) -> AttachError {
     e.message = format!(
-        "{} — the SAME grant was presented {attempts} times over {:.0}s (bounded at {:.0}s) and \
+        "{} â€” the SAME grant was presented {attempts} times over {:.0}s (bounded at {:.0}s) and \
          the target never recorded it. A target whose runner predates the on-demand grant \
          re-read learns a grant only from coord's push or its own catch-up poll, so this is \
          either a lost push against a poll slower than that window, a grant table already full \
-         of live bindings, or a directive coord never published — the TARGET's runner log says \
+         of live bindings, or a directive coord never published â€” the TARGET's runner log says \
          which.",
         e.message,
         elapsed.as_secs_f32(),
@@ -858,7 +841,7 @@ pub(crate) struct OpenRemoteTab {
     pub device_label: Option<String>,
     pub session_label: Option<String>,
     pub working_dir: Option<String>,
-    /// The tenant the grant was minted under, when one was STATED (`None` ⇒
+    /// The tenant the grant was minted under, when one was STATED (`None` â‡’
     /// the authority order chose). Carried on the tab's identity so a reattach
     /// mints under the same tenant rather than the device default.
     pub tenant: Option<String>,
@@ -866,7 +849,7 @@ pub(crate) struct OpenRemoteTab {
 
 /// Present a minted ATTACH grant through the relay and open the tab around the
 /// resulting [`RemotePaneIo`]. The single implementation of "a remote tab is
-/// opened this way" — the create path composes over it rather than growing a
+/// opened this way" â€” the create path composes over it rather than growing a
 /// second one.
 pub(crate) async fn open_remote_tab(
     terminal_manager: &Arc<TerminalManager>,
@@ -887,7 +870,7 @@ pub(crate) async fn open_remote_tab(
     } = req;
     let session_id = session_uuid.to_string();
     // The target learns this grant from coord's push or its own catch-up poll,
-    // and a lost push leaves only the poll — so the FIRST presentation of a
+    // and a lost push leaves only the poll â€” so the FIRST presentation of a
     // freshly minted grant loses that race whenever the tick has not come
     // round yet. Re-present the SAME grant across a whole tick rather than
     // abandoning it; a fresh mint per attempt is what made this permanent.
@@ -906,7 +889,7 @@ pub(crate) async fn open_remote_tab(
     waiting.settle(started.elapsed(), GRANT_LEARN_WINDOW);
     // What this SOURCE measures about the session (plan
     // `2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold`,
-    // A2). `None` when an id is not a UUID — coord would refuse the report.
+    // A2). `None` when an id is not a UUID â€” coord would refuse the report.
     let report_ctx = crate::mcp::remote_interactivity::SourceReportContext::parse(
         &session_id,
         &minted.grant_jti,
@@ -929,7 +912,7 @@ pub(crate) async fn open_remote_tab(
         Ok(attached) => attached,
         Err(mut e) => {
             if e.code == "timeout" {
-                // Sampled NOW, when the timeout fired — not at send time.
+                // Sampled NOW, when the timeout fired â€” not at send time.
                 let source_relay = SourceRelay::sample(app_handle).await;
                 e.message = explain_relay_timeout(
                     "remote_terminal_attached",
@@ -953,27 +936,40 @@ pub(crate) async fn open_remote_tab(
         ));
     }
 
-    let pane = Arc::new(RemotePaneIo::new(
-        minted.grant_jti.clone(),
-        attached.terminal_id.clone(),
-        minted.grant.clone(),
-        client().sink(),
-        cols,
-        rows,
-        attached.ring,
-    ));
+    let target_id = minted
+        .target_device_id
+        .clone()
+        .unwrap_or_else(|| device_id.clone());
+    let pane = Arc::new(
+        RemotePaneIo::new(
+            minted.grant_jti.clone(),
+            attached.terminal_id.clone(),
+            minted.grant.clone(),
+            client().sink(),
+            cols,
+            rows,
+            attached.ring,
+        )
+        .with_session_id(session_uuid.to_string())
+        .with_target_device_id(target_id.clone()),
+    );
     // The report context goes on BEFORE the pane is routable, so no frame
     // routed to it (buffered output flushed by `register_pane`, or the first
     // live chunk) can be spliced before the read half is being measured.
     if let Some(ctx) = report_ctx {
         pane.attach_report_context(ctx);
     }
+    // So a reattach that finds this grant expired can mint the next one, under
+    // the tenant this grant was minted in.
+    renewal_tenants()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(session_id.clone(), tenant.clone());
+    client().set_grant_renewer(Arc::new(CoordGrantRenewer {
+        app: app_handle.clone(),
+    }));
     client().register_pane(pane.clone());
 
-    let target_id = minted
-        .target_device_id
-        .clone()
-        .unwrap_or_else(|| device_id.clone());
     let device_label = non_blank(device_label).unwrap_or_else(|| short_id(&target_id));
     let title = format!(
         "{}: {}",
@@ -1006,6 +1002,8 @@ pub(crate) async fn open_remote_tab(
             spawn_app,
             io,
             pinned,
+            // An operator attaching to (or creating) a remote session.
+            crate::coord_drain_state::SpawnOrigin::OperatorTerminal,
         )
     })
     .await
@@ -1050,8 +1048,95 @@ pub(crate) async fn open_remote_tab(
     }
 }
 
+/// Renews an expired attach grant for a live remote tab â€” plan
+/// `2026-10-02-remote-tab-that-loses-its-relay-never-reattaches` (D2).
+///
+/// The same mint the picker uses, so the same issuance policy applies: a
+/// session coord no longer places in this tenant, or a device that stopped
+/// accepting remote attach, is refused here exactly as a fresh attach would
+/// be, and the reattach supervisor closes the tab with that refusal. The
+/// placement check a fresh attach makes (`coord_places_session_on`) is made
+/// here too: a session coord now places on a different device is refused with
+/// that reason, rather than surfacing later as a terminal mismatch.
+struct CoordGrantRenewer {
+    app: tauri::AppHandle,
+}
+
+/// The tenant each open remote tab's grant was minted under, by session id, so
+/// a renewal presents the SAME tenant's credential rather than the device
+/// default (a session in another tenant is `404 session_not_found`). One
+/// process-wide renewer serves every tab, so the tenant cannot live on it.
+fn renewal_tenants() -> &'static std::sync::Mutex<std::collections::HashMap<String, Option<String>>>
+{
+    static MAP: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, Option<String>>>,
+    > = std::sync::OnceLock::new();
+    MAP.get_or_init(Default::default)
+}
+
+impl GrantRenewer for CoordGrantRenewer {
+    fn renew<'a>(
+        &'a self,
+        session_id: &'a str,
+        target_device_id: Option<&'a str>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<RenewedGrant, String>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let session = uuid::Uuid::parse_str(session_id)
+                .map_err(|e| format!("remote_attach:invalid_session_id: {session_id:?}: {e}"))?;
+            let tenant = renewal_tenants()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(session_id)
+                .cloned()
+                .flatten();
+            let scope = grant_scope(tenant).await?;
+            let minted = mint_attach_grant(&coord_base_for(&self.app), session, scope).await?;
+            if let Some(refusal) = renewal_placement_refusal(
+                &session.to_string(),
+                target_device_id,
+                minted.target_device_id.as_deref(),
+            ) {
+                return Err(refusal);
+            }
+            info!(
+                session = %session,
+                grant_jti = %minted.grant_jti,
+                expires_at = ?minted.expires_at,
+                "remote attach: grant renewed for a reattach"
+            );
+            Ok(RenewedGrant {
+                grant: minted.grant,
+                grant_jti: minted.grant_jti,
+            })
+        })
+    }
+}
+
+/// Why a renewed grant must be refused, or `None` when it may be used: the
+/// pane was attached to `attached_to`, and coord now places the session on
+/// `minted_target`. The same `coord_places_session_on` rule a fresh attach
+/// applies — an unreported placement is refused too. A pane that recorded no
+/// device (`None`) is not checked.
+pub(crate) fn renewal_placement_refusal(
+    session: &str,
+    attached_to: Option<&str>,
+    minted_target: Option<&str>,
+) -> Option<String> {
+    let attached_to = attached_to?;
+    if coord_places_session_on(attached_to, minted_target) {
+        return None;
+    }
+    let now_on = minted_target.unwrap_or("<unreported>");
+    Some(format!(
+        "remote_attach:target_mismatch: coord now places session {session} on device \
+         {now_on}, not {attached_to} — the session moved"
+    ))
+}
+
 /// What closing a remote tab did about the relay's `(target, terminal)`
-/// binding — plan
+/// binding â€” plan
 /// `2026-09-16-remote-tab-cannot-be-released-so-the-target-terminal-stays-claimed`,
 /// Phase 1.
 ///
@@ -1059,7 +1144,7 @@ pub(crate) async fn open_remote_tab(
 /// whether or not its `remote_terminal_detach` was ever queued, so an
 /// operator (or a headless harness) could not tell "detach sent" from
 /// "closed locally, binding still held until the grant expires". Capture the
-/// probe BEFORE the close — the close removes the identity and the pane — and
+/// probe BEFORE the close â€” the close removes the identity and the pane â€” and
 /// render it after.
 pub(crate) struct RemoteCloseProbe {
     identity: RemoteTabIdentity,
@@ -1108,13 +1193,13 @@ impl RemoteCloseProbe {
 
 /// Whether a relay connection held the outbound pump across the whole close:
 /// `Some(attached)` when the before/after readings agree, `None` when the
-/// connection changed in between — a frame queued in that window may have
+/// connection changed in between â€” a frame queued in that window may have
 /// been drained by the old connection, the new one, or discarded.
 pub(crate) fn stable_pump(before: (bool, u64), after: (bool, u64)) -> Option<bool> {
     (before == after).then_some(before.0)
 }
 
-/// Pure rendering, unit-tested per outcome × pump state. `outcome` is `None`
+/// Pure rendering, unit-tested per outcome Ã— pump state. `outcome` is `None`
 /// when no pane could be found for the tab, which is UNKNOWN. Nothing here is
 /// ever reported as released: the relay's handling of the frame is not
 /// observable from this runner, and only a re-attach of the same terminal
@@ -1203,7 +1288,7 @@ pub(crate) fn render_remote_close(
     }
 }
 
-/// Every live remote tab's identity keyed by LOCAL terminal id — what a
+/// Every live remote tab's identity keyed by LOCAL terminal id â€” what a
 /// reconnecting webview reads after `terminal_list`, whose shared-schema
 /// `TerminalInfo` cannot carry the remote identity.
 #[tauri::command]
@@ -1219,7 +1304,7 @@ pub fn terminal_remote_identities(
 }
 
 /// What the remote tab `terminal_id` has observed about its session's
-/// interactivity — the read receipt (`lastFrameReceived`), the last input
+/// interactivity â€” the read receipt (`lastFrameReceived`), the last input
 /// queued (`lastInputSent`) and the target's last answer to one
 /// (`lastInputAcked`, `acksReceived`). Plan
 /// `2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold`,
@@ -1238,6 +1323,25 @@ pub fn terminal_remote_interactivity(
     })
 }
 
+/// The grant jti a remote tab's pane presents RIGHT NOW.
+///
+/// The tab identity records the jti the tab was opened with, but the reattach
+/// supervisor renews an expired grant and re-keys the client's routing table
+/// under the new jti (plan
+/// `2026-10-02-remote-tab-that-loses-its-relay-never-reattaches`, D2). The
+/// manager-held pane carries the current one, so resolve through it and fall
+/// back to the identity's only when the manager holds no pane.
+fn current_grant_jti(
+    terminal_manager: &TerminalManager,
+    terminal_id: &str,
+    identity: &RemoteTabIdentity,
+) -> String {
+    terminal_manager
+        .remote_pane(terminal_id)
+        .map(|pane| pane.grant_jti())
+        .unwrap_or_else(|| identity.grant_jti.clone())
+}
+
 /// The body of [`terminal_remote_interactivity`], with the live-pane lookup
 /// injected so it is testable without the process-wide client.
 pub(crate) fn remote_interactivity_response(
@@ -1250,7 +1354,7 @@ pub(crate) fn remote_interactivity_response(
             "remote_attach:not_remote: terminal {terminal_id} is not a remote tab"
         ));
     };
-    let Some(pane) = live_pane(&identity.grant_jti) else {
+    let Some(pane) = live_pane(&current_grant_jti(terminal_manager, terminal_id, &identity)) else {
         return Ok(CommandResponse {
             success: false,
             message: Some("the remote pane behind this tab is closed".to_string()),
@@ -1267,16 +1371,16 @@ pub(crate) fn remote_interactivity_response(
 /// Probe the interactivity of every not-fresh remote session on `device_id`
 /// and report what was measured to coord (plan
 /// `2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold`,
-/// A3). Mint → probe-only attach (no tab) → empty-range read probe → a
-/// zero-byte write probe only against a target known to acknowledge input →
-/// honest detach → report, one row at a time.
+/// A3). Mint â†’ probe-only attach (no tab) â†’ empty-range read probe â†’ a
+/// zero-byte write probe only against a target known to acknowledge input â†’
+/// honest detach â†’ report, one row at a time.
 ///
-/// `trigger` is `fleet_view` (the Fleet view loading that device — also
+/// `trigger` is `fleet_view` (the Fleet view loading that device â€” also
 /// stamps the device so the runner's scheduler keeps sweeping it for seven
 /// days), `scheduler`, `manual` (an explicit request: bypasses the per-session
 /// attempt memory), or absent (`unspecified`, which does not). Returns the per-row outcome
 /// list plus the fleet flags the sweep read; `Err` names the door that failed
-/// (`remote_interactivity_probe:<door>: …`). Proxied for headless agents
+/// (`remote_interactivity_probe:<door>: â€¦`). Proxied for headless agents
 /// (`mcp/tauri_proxy.rs`).
 #[tauri::command]
 pub async fn remote_interactivity_probe(
@@ -1316,7 +1420,8 @@ pub async fn terminal_remote_history_load(
             "remote_attach:not_remote: terminal {terminal_id} is not a remote tab"
         ));
     };
-    let Some(pane) = client().pane(&identity.grant_jti) else {
+    let grant_jti = current_grant_jti(&terminal_manager, &terminal_id, &identity);
+    let Some(pane) = client().pane(&grant_jti) else {
         return Err(format!(
             "remote_attach:pane_gone: the remote pane behind terminal {terminal_id} is closed"
         ));
@@ -1325,7 +1430,7 @@ pub async fn terminal_remote_history_load(
         return Ok(CommandResponse {
             success: false,
             message: Some(
-                "The attach already delivered everything the remote ring holds — there is no \
+                "The attach already delivered everything the remote ring holds â€” there is no \
                  earlier output to load"
                     .to_string(),
             ),
@@ -1353,7 +1458,7 @@ pub async fn terminal_remote_history_load(
     let end = start.saturating_add(reply.ring.buffer.len() as u64);
     info!(
         terminal_id = %terminal_id,
-        grant_jti = %identity.grant_jti,
+        grant_jti = %grant_jti,
         requested_from = from,
         requested_to = to,
         got_from = start,
@@ -1381,24 +1486,24 @@ pub async fn terminal_remote_history_load(
 /// **The authority for WHERE a session lives is coord's answer to the mint, not
 /// the device id the caller carried.** `terminal_attach_remote` has always
 /// refused a disagreement; the create-then-attach path called the same mint,
-/// read the same field, and DISCARDED it — on the path where the session id
+/// read the same field, and DISCARDED it â€” on the path where the session id
 /// arrived over the untrusted relay (review finding 3). One predicate now, so
 /// the two cannot drift again.
 ///
 /// **Every arm fails CLOSED.** An unreported placement is not an agreement: the
 /// question this predicate asks is *which session may this caller address*, and
-/// device authentication answers *who is asking* — a different question, so it
+/// device authentication answers *who is asking* â€” a different question, so it
 /// is no justification for taking silence as a yes. Against a coord that omits
 /// `target_device_id`, create-then-attach is exactly as unbound as it was
 /// before the check existed, which is the whole defect (review round 2, finding
 /// 5). Coord's `AttachGrantResponse.target_device_id` is a non-`Option` `Uuid`
-/// today, so nothing reaches the permissive arm — and the field being
+/// today, so nothing reaches the permissive arm â€” and the field being
 /// `Option<String>` here is only wire tolerance, not a supported coord that
 /// omits it. An `asked` this device could not name is refused for the same
 /// reason: nothing was claimed, so nothing is confirmed.
 ///
 /// Both refusals surface as the caller's existing `target_mismatch`, which
-/// names `<unreported>` when coord said nothing — so the operator sees the
+/// names `<unreported>` when coord said nothing â€” so the operator sees the
 /// unanswered question rather than a silent bind.
 pub(crate) fn coord_places_session_on(asked: &str, coord_placed: Option<&str>) -> bool {
     let asked = asked.trim();
@@ -1451,7 +1556,7 @@ mod relay_timeout_tests {
         }
     }
 
-    /// The two replies whose timeout [`explain_relay_timeout`] explains —
+    /// The two replies whose timeout [`explain_relay_timeout`] explains â€”
     /// attach and create. History has its own explainer and its own test.
     const WHATS: [&str; 2] = ["remote_terminal_attached", "remote_terminal_created"];
 
@@ -1478,7 +1583,7 @@ mod relay_timeout_tests {
     /// S6 (plan `2026-09-25-runner-loses-its-relay-and-announces-it-under-a-false-cause-or-not-at-all`):
     /// when THIS runner's relay is down, the timeout names the local relay and
     /// its last error, and says nothing about the target being offline or
-    /// wedged — whatever coord reported about the target.
+    /// wedged â€” whatever coord reported about the target.
     #[test]
     fn a_down_source_relay_names_the_local_relay_and_never_blames_the_target() {
         for what in WHATS {
@@ -1530,7 +1635,7 @@ mod relay_timeout_tests {
     }
 
     /// UNKNOWN keeps the target-based text but does not assert the local
-    /// relay is fine — nor that it is down.
+    /// relay is fine â€” nor that it is down.
     #[test]
     fn an_unknown_source_relay_keeps_the_target_text_and_leaves_the_local_relay_open() {
         for what in WHATS {
@@ -1558,8 +1663,8 @@ mod relay_timeout_tests {
         );
     }
 
-    /// The history explainer never claims coord was asked about the target —
-    /// history mints no grant — and shares the source-relay framing.
+    /// The history explainer never claims coord was asked about the target â€”
+    /// history mints no grant â€” and shares the source-relay framing.
     #[test]
     fn a_history_timeout_never_claims_coord_reported_on_the_target() {
         for relay in [
@@ -1743,7 +1848,7 @@ mod placement_tests {
     /// Review finding 3. The scenario: the operator clicks New terminal on B, a
     /// relay rewrites `coord_session_id` on `remote_terminal_created` to a
     /// session living on C, and the source mints an attach grant for C's
-    /// session while labelling the tab B — so the operator types into C's live
+    /// session while labelling the tab B â€” so the operator types into C's live
     /// agent session. Coord's placement is the only thing that catches it, and
     /// the create path was throwing it away.
     #[test]
@@ -1762,7 +1867,7 @@ mod placement_tests {
     /// Review round 2, finding 5. An unanswered question is not a yes.
     ///
     /// The permissive arm was justified as "safe because the mint is
-    /// device-authenticated" — but device auth establishes WHO is asking, not
+    /// device-authenticated" â€” but device auth establishes WHO is asking, not
     /// WHICH session they may address. Against a coord that omits the field,
     /// create-then-attach was exactly as unbound as before the check.
     #[test]
@@ -1770,7 +1875,7 @@ mod placement_tests {
         assert!(!coord_places_session_on("device-b", None));
         assert!(!coord_places_session_on("device-b", Some("")));
         assert!(!coord_places_session_on("device-b", Some("   ")));
-        // …and a caller that named no device confirms nothing either.
+        // â€¦and a caller that named no device confirms nothing either.
         assert!(!coord_places_session_on("", Some("device-c")));
         assert!(!coord_places_session_on("   ", Some("device-c")));
         assert!(!coord_places_session_on("", None));
@@ -1811,7 +1916,7 @@ mod remote_close_tests {
             .collect()
     }
 
-    /// Plan 2026-09-16 Phase 1, R2/R3: every outcome × pump state names the
+    /// Plan 2026-09-16 Phase 1, R2/R3: every outcome Ã— pump state names the
     /// outcome it actually got, never claims a release, and never leaks the
     /// grant jti (`RemoteTabIdentity` withholds it from the frontend too).
     #[test]
@@ -1870,7 +1975,7 @@ mod remote_close_tests {
 
         // With no connection draining the queue, a failed queue must not
         // claim the relay still holds the binding "until the connection
-        // drops" — that connection is already gone.
+        // drops" â€” that connection is already gone.
         let r = render_remote_close(&id, failed, Some(false));
         assert_eq!(r.remote_detach["outcome"], "failed");
         assert!(!r.message.contains("keeps the binding"), "{}", r.message);
@@ -1889,8 +1994,8 @@ mod remote_close_tests {
         assert!(r.message.contains("unknown"), "{}", r.message);
     }
 
-    /// A reconnect during the close — either half of the pump reading moving
-    /// — makes the pump state unknown rather than whichever end was read.
+    /// A reconnect during the close â€” either half of the pump reading moving
+    /// â€” makes the pump state unknown rather than whichever end was read.
     #[test]
     fn a_pump_that_changed_during_the_close_is_unknown() {
         assert_eq!(stable_pump((true, 3), (true, 3)), Some(true));
@@ -1902,7 +2007,7 @@ mod remote_close_tests {
 
     /// Review round 2, nit B: a DEAD tab's pane is gone from the attach
     /// client's routing table (it is dropped on `remote_terminal_exit`), but
-    /// the manager still holds it — the probe must read the manager's copy
+    /// the manager still holds it â€” the probe must read the manager's copy
     /// and report the detach the close queued, not "unknown".
     #[test]
     fn a_dead_tab_still_reports_the_detach_its_close_queued() {
@@ -1977,7 +2082,7 @@ mod represent_tests {
     }
 
     /// A presenter that answers from a script and records every grant string it
-    /// was handed — which is what proves the SAME grant is re-presented.
+    /// was handed â€” which is what proves the SAME grant is re-presented.
     struct Scripted {
         replies: Mutex<VecDeque<Result<AttachedReply, AttachError>>>,
         presented: Mutex<Vec<String>>,
@@ -2071,7 +2176,7 @@ mod represent_tests {
 
     /// A settled no is answered at once. Making the operator wait out the whole
     /// window for a verdict that is already final would be its own defect, so
-    /// every refusal but `attach_grant_unknown` returns on the first attempt —
+    /// every refusal but `attach_grant_unknown` returns on the first attempt â€”
     /// including the `timeout` that means the target said nothing at all.
     #[tokio::test(start_paused = true)]
     async fn a_settled_refusal_aborts_without_waiting_out_the_window() {
@@ -2149,8 +2254,8 @@ mod represent_tests {
     }
 
     /// The window has to cover a whole catch-up tick of a target whose build
-    /// predates the shortened poll (60 s), plus margin — and stay inside the
-    /// ~70–90 s band a human will sit through. Each presentation carries its
+    /// predates the shortened poll (60 s), plus margin â€” and stay inside the
+    /// ~70â€“90 s band a human will sit through. Each presentation carries its
     /// own `ATTACH_TIMEOUT`, which is a per-attempt bound, not this one.
     #[test]
     fn the_window_covers_a_pre_change_targets_whole_poll_tick() {
@@ -2234,5 +2339,54 @@ mod interactivity_command_tests {
         ] {
             assert!(d.get(key).is_some(), "missing {key} in {d}");
         }
+    }
+
+    /// Plan 2026-10-02, review round 2: a renewal coord now places on another
+    /// device (or does not place at all) is refused; the same device passes.
+    #[test]
+    fn a_renewal_placed_on_another_device_is_refused() {
+        use super::renewal_placement_refusal;
+        assert_eq!(
+            renewal_placement_refusal("s", Some("dev-a"), Some("DEV-A")),
+            None
+        );
+        let moved = renewal_placement_refusal("s", Some("dev-a"), Some("dev-b")).unwrap();
+        assert!(
+            moved.starts_with("remote_attach:target_mismatch"),
+            "{moved}"
+        );
+        assert!(
+            moved.contains("dev-b") && moved.contains("dev-a"),
+            "{moved}"
+        );
+        assert!(renewal_placement_refusal("s", Some("dev-a"), None).is_some());
+        assert_eq!(renewal_placement_refusal("s", None, Some("dev-b")), None);
+    }
+
+    /// Plan 2026-10-02 (vet): after the reattach supervisor renews the grant,
+    /// the routing table knows the pane only by the NEW jti while the tab
+    /// identity still names the old one. The lookup must follow the pane, or a
+    /// live, renewed tab reports itself closed.
+    #[test]
+    fn a_renewed_pane_is_found_by_its_current_jti() {
+        let tm = TerminalManager::new();
+        tm.set_remote_identity("tab-1", identity());
+        let sink: Arc<dyn RemoteFrameSink> = Arc::new(RecordingSink::default());
+        let pane = Arc::new(RemotePaneIo::new(
+            "jti-1",
+            "rt-1",
+            "g",
+            sink,
+            80,
+            24,
+            AttachedRing::default(),
+        ));
+        tm.set_remote_pane("tab-1", pane.clone());
+        pane.set_grant("jti-2", "g2");
+        let r = remote_interactivity_response(&tm, "tab-1", |jti| {
+            (jti == "jti-2").then(|| pane.clone())
+        })
+        .unwrap();
+        assert!(r.success, "a renewed pane was reported closed");
     }
 }

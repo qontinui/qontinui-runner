@@ -27,6 +27,12 @@ pub mod accessibility;
 // fails an unguarded test read by NAME instead of by assertion mismatch.
 // Plan `2026-09-03-runner-tests-read-ambient-machine-state`.
 pub mod ambient;
+// The test-binary gate on env-resolved settings writes: a thread holding no
+// `env_lock` may not write a settings file into whatever directory the process
+// environment names — another test's fixture. Compiled to `Ok(())` outside a
+// test binary. Plan
+// `2026-11-11-unguarded-test-threads-write-settings-json-into-a-live-fixtures-config-dir`.
+pub mod env_write_gate;
 // Pure install-interception core (classify + gate + wire types), shared by the
 // `qontinui-runner` bin (via `install_effects_producer::intercept`) AND the
 // standalone `qontinui-shim` Windows `.exe` shadow stub. Lifted into the lib
@@ -74,6 +80,13 @@ pub mod tauri_event_payloads;
 // corrupt (which, with the fail-closed sign-out marker, reads as a logout the
 // operator never performed).
 pub mod fs_atomic;
+
+// Bounded reads of a file's END — the one tail reader (`read_tail_lossy` for
+// transcript scans, `tail_lines` for log views). In the lib so its core can be
+// tested against a synthetic source, and so every reader of a log's end shares
+// one bound instead of growing another whole-file read. Plan
+// `2026-11-11-runner-glibc-arena-retention-and-whole-log-tail`, Phase 2.
+pub mod file_tail;
 
 // Runner instance identity from the process env (`QONTINUI_INSTANCE_NAME`) —
 // the ONE primary/secondary predicate. In the lib for the same reason as
@@ -130,8 +143,13 @@ pub mod mcp_spill;
 // the `qontinui_profile env` CLI and the Tauri runner GUI share one code path.
 // Moved out of the binary crate at P4: the bundled cluster is now the runner's
 // ONLY database, so the lib-side consumers (env_agent's db_schema pool, the
-// `qontinui-specs` CLI) must be able to address it. It has no `crate::`
-// dependencies, so the move is mechanical.
+// `qontinui-specs` CLI) must be able to address it. It had no `crate::`
+// dependencies then, so the move was mechanical; it has gained three since:
+// `crate::instance_env` (its default data root) and, in its test harness,
+// `crate::process_helpers` and `crate::runner_breadcrumb`.
+// The one predicate for "this directory is a cargo target dir", shared by the
+// embedded-PG test harness here and the bin crate's orphan-target reaper.
+pub mod cargo_target_marker;
 pub mod embedded_pg;
 pub mod env_agent;
 
@@ -177,6 +195,14 @@ pub mod util {
 // handle; only the runner bin registers the allocator.
 pub mod alloc_breadcrumb;
 
+// glibc malloc tuning (plan
+// `2026-11-11-runner-glibc-arena-retention-and-whole-log-tail`, Phases 1 and
+// 3): the arena cap `main()` applies as its first statement, the allocator
+// reading the health monitor takes every tick, and the hourly `malloc_trim(0)`.
+// In the LIB so the `arena_cap_holds` integration test applies and measures
+// the same cap the runner does. A no-op that says `unsupported` off linux-gnu.
+pub mod malloc_tuning;
+
 // Per-local-user connection guard for every runner TCP listener (plan
 // `2026-10-04-runner-loopback-api-refuses-other-local-users`): refuses a
 // loopback connection whose peer process runs as a different OS user. In the
@@ -203,6 +229,10 @@ pub mod cognito;
 // the marker names so the spawn-site strips, the startup warning and the
 // `coord doctor` check can never disagree on the spelling.
 pub mod claude_env;
+/// Long-lived Claude OAuth tokens (`claude setup-token`) stored per account in
+/// `<config dir>/settings.json` — the one reader account selection, the usage
+/// probe, the warm path and the doctor share.
+pub mod claude_oauth_token;
 
 // `coord doctor` self-check (plan 2026-06-13 Phase 4). Lifted into the lib so
 // BOTH the standalone `coord_doctor` bin and the in-app Tauri command
@@ -312,6 +342,12 @@ pub mod session_archive;
 /// `2026-08-29-runner-work-scoped-writes-default-tenant-credential`). In the
 /// lib crate because the plan adapter above is its principal consumer.
 pub mod repo_tenant;
+
+/// The context-size reading of a Claude Code `Stop` event (plan
+/// `2026-10-28-one-session-lifecycle-authority` Phase 82, folding
+/// qontinui-claude-config#1915). Pure; the `/lifecycle/hook` route (Phase 83)
+/// is its consumer.
+pub mod stop_context;
 
 // ============================================================================
 // Test-only: shared process-wide env lock

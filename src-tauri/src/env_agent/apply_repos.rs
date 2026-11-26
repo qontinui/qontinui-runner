@@ -38,6 +38,13 @@ use super::pull::{Change, SectionPlan};
 /// The section name this module owns.
 pub const REPOS_SECTION: &str = "repos";
 
+/// The next action for an unresolved workspace root in a standalone CLI run,
+/// which cannot read the "Workspace root" setting (see
+/// [`collectors::workspace_root_reads_setting`]).
+const CLI_UNRESOLVED_ROOT_NOTE: &str =
+    "This command does not read the runner's \"Workspace root\" setting. Set \
+     $QONTINUI_ROOT to the folder that holds the repo checkouts, then re-run.";
+
 /// Free space, in GB, below which this module refuses to clone.
 ///
 /// Deliberately the SAME number the supervisor refuses builds under
@@ -256,11 +263,19 @@ pub fn apply_section_with(section: &SectionPlan, clone: Cloner<'_>, confirm: boo
                 REPOS_SECTION,
                 SectionStatus::blocked_precondition(format!("no workspace root resolved — {why}")),
             );
-            out.notes.push(
-                "Set $QONTINUI_ROOT, or the runner's `paths.workspace_root` setting, to the \
-                 directory holding the repo checkouts; then re-run."
-                    .to_string(),
-            );
+            // The shared sentence's next action is the "Workspace root"
+            // setting, which only a booted runner reads. A standalone
+            // `env apply` exits before the settings door is published, so
+            // there the lever that works is the environment variable.
+            if collectors::workspace_root_reads_setting() {
+                // `require` on the arm where `root` is `None` is always the
+                // typed refusal.
+                if let Err(unresolved) = resolved.require() {
+                    out.notes.push(unresolved.to_string());
+                }
+            } else {
+                out.notes.push(CLI_UNRESOLVED_ROOT_NOTE.to_string());
+            }
             return out;
         }
     };
@@ -455,7 +470,7 @@ mod tests {
     }
 
     #[test]
-    fn dest_name_is_the_last_segment_of_the_PATH_never_the_host() {
+    fn dest_name_is_the_last_segment_of_the_path_never_the_host() {
         assert_eq!(
             dest_name("https://github.com/qontinui/qontinui-stack").as_deref(),
             Some("qontinui-stack")

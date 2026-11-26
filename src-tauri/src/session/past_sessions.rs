@@ -79,7 +79,10 @@ pub struct PastSession {
     pub page_id: String,
     /// Grid zone index (-1 = unassigned).
     pub zone_index: i32,
-    /// `"open"` | `"closed"`.
+    /// `"open"` | `"closed"` — the registry record's terminal-hosting
+    /// lifecycle (`TerminalSessionRecord::state`): NOT the work axis
+    /// (`finished` / `finished_at`, which can be set on an `open` row) and NOT
+    /// liveness — use `GET /restart-readiness` for a live census.
     pub state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub close_reason: Option<String>,
@@ -237,7 +240,7 @@ fn resume_config_dir(
     working_dir: Option<&str>,
     session_id: &str,
 ) -> Option<String> {
-    let has_recorded = recorded.is_some_and(|d| !d.trim().is_empty());
+    let has_recorded = crate::session::session_ledger::has_usable_recorded_config_dir(recorded);
     let holders: Option<Vec<PathBuf>> = if has_recorded {
         None
     } else {
@@ -249,6 +252,29 @@ fn resume_config_dir(
         })
     };
     crate::session::session_ledger::resolve_config_dir(recorded, holders.as_deref())
+}
+
+/// THE resume line for one session, derived exactly as [`build_enriched`]
+/// derives Previous sessions' — the resolved account
+/// ([`resume_config_dir`]), the resume directory
+/// ([`crate::session::session_ledger::resume_dir_of`] over the launch dir and
+/// its worktree root), and
+/// [`crate::session::session_ledger::resume_command_for`]. `None` whenever
+/// that builder yields no line (an unknown account, an unsafe token).
+pub(crate) fn resume_command_for_record(
+    config_dir: Option<&str>,
+    working_dir: Option<&str>,
+    session_id: &str,
+) -> Option<String> {
+    let resolved_config_dir = resume_config_dir(config_dir, working_dir, session_id);
+    let worktree = working_dir
+        .and_then(crate::session::session_ledger::worktree_root_of)
+        .map(|p| p.to_string_lossy().replace('\\', "/"));
+    crate::session::session_ledger::resume_command_for(
+        crate::session::session_ledger::resume_dir_of(working_dir, worktree.as_deref()),
+        resolved_config_dir.as_deref(),
+        session_id,
+    )
 }
 
 /// Format a unix-millis timestamp into a short human date for the `"Session
@@ -409,11 +435,11 @@ fn past_from_snapshot(s: &SnapshotSession) -> PastSession {
         // never a guessed tier.
         None,
         None,
-        // Nor any finish marker: the snapshot predates it. `None` renders
-        // `finished: false`, i.e. "no finish was ever recorded" — the honest
-        // statement about a snapshot row, and the same posture the two
-        // arguments above take.
-        None,
+        // The finish marker as of the snapshot (unfinished-resume phase 2).
+        // Lines written before the field existed deserialize to `None`, which
+        // renders `finished: false` — "no finish was recorded" — the honest
+        // statement for them.
+        s.finished_at.map(|at| (at, s.finish_reason.clone())),
     )
 }
 
@@ -700,5 +726,29 @@ mod tests {
         // Exactly two distinct cohorts.
         let distinct: std::collections::HashSet<_> = sessions.iter().map(|s| s.cohort_id).collect();
         assert_eq!(distinct.len(), 2);
+    }
+
+    #[test]
+    fn a_snapshot_row_older_than_the_registry_keeps_its_finish_mark() {
+        let snap: SnapshotSession = serde_json::from_value(serde_json::json!({
+            "claudeSessionId": "s", "provider": "claude", "pageId": "default",
+            "zoneIndex": 0, "state": "closed", "confirmed": true, "openedAt": 1,
+            "finishedAt": 9_000, "finishReason": "dismissed",
+        }))
+        .unwrap();
+        let p = past_from_snapshot(&snap);
+        assert!(
+            p.finished,
+            "a >24h finished session must not read as unfinished"
+        );
+        assert_eq!(p.finished_at, Some(9_000));
+        assert_eq!(p.finish_reason.as_deref(), Some("dismissed"));
+
+        let legacy: SnapshotSession = serde_json::from_value(serde_json::json!({
+            "claudeSessionId": "s", "provider": "claude", "pageId": "default",
+            "zoneIndex": 0, "state": "closed", "confirmed": true, "openedAt": 1,
+        }))
+        .unwrap();
+        assert!(!past_from_snapshot(&legacy).finished);
     }
 }

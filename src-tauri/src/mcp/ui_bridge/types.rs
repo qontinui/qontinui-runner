@@ -47,12 +47,7 @@ impl RequestHints for UIBridgeActionRequest {
     }
     fn shape_error_data() -> Option<serde_json::Value> {
         Some(serde_json::json!({
-            "allowedActions": [
-                "click", "doubleClick", "double_click", "double", "right", "middle",
-                "type", "sendKeys", "clear", "select", "focus", "blur", "hover",
-                "scroll", "scrollIntoView", "scroll_into_view", "check", "uncheck",
-                "toggle", "drag", "setValue", "submit", "reset", "autocomplete"
-            ]
+            "allowedActions": crate::mcp::ui_bridge::elements::SUPPORTED_ACTION_NAMES
         }))
     }
 }
@@ -587,6 +582,7 @@ impl UiBridgeError {
         element_id: &str,
         accepted: &[S],
         requested_params: Option<&serde_json::Value>,
+        keyboard_entry: bool,
     ) -> Self {
         let names: Vec<&str> = accepted.iter().map(AsRef::as_ref).collect();
         let mut message = if names.is_empty() {
@@ -607,9 +603,12 @@ impl UiBridgeError {
             "elementId": element_id,
             "supportedActions": names,
         });
-        if let Some(suggestion) =
-            super::action_vocabulary::ActionSuggestion::resolve(unknown, accepted, requested_params)
-        {
+        if let Some(suggestion) = super::action_vocabulary::ActionSuggestion::resolve(
+            unknown,
+            accepted,
+            requested_params,
+            keyboard_entry,
+        ) {
             message.push_str(&suggestion.message_suffix());
             suggestion.attach_to(&mut context);
         }
@@ -1416,5 +1415,21 @@ mod readiness_classification_tests {
                 "{msg} must not classify as FRONTEND_NOT_READY"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod allowed_actions_tests {
+    use super::*;
+
+    /// The shape-error `allowedActions` list is derived from the route's own
+    /// allowlist, so it cannot drift from what `is_builtin_action` accepts.
+    #[test]
+    fn action_request_allowed_actions_equal_supported_action_names() {
+        let data = UIBridgeActionRequest::shape_error_data().expect("data");
+        assert_eq!(
+            data["allowedActions"],
+            serde_json::json!(crate::mcp::ui_bridge::elements::SUPPORTED_ACTION_NAMES)
+        );
     }
 }

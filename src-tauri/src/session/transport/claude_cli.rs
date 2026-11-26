@@ -113,8 +113,10 @@ impl Transport for ClaudeCliTransport {
                         crate::terminal::TrustArm::AccountChosenLater,
                         // No tenant choice on this transport.
                         None,
+                        // `SessionIntent` carries no spawn origin.
+                        crate::coord_drain_state::SpawnOrigin::Unknown,
                     )
-                    .map_err(TransportError::Runtime)?;
+                    .map_err(|e| TransportError::Runtime(e.message))?;
 
                 Ok(TransportHandle::Pty {
                     terminal_id: info.id,

@@ -844,6 +844,17 @@ impl LedgerRead {
         self.counts_non_nominal.saturating_sub(self.listed_rows)
     }
 
+    /// True when this read's dead list can be trusted to be COMPLETE: not
+    /// truncated past what it named, nothing this build could not classify,
+    /// and no counted-but-unlisted rows. The three ways a dead row can go
+    /// missing from a read without the worker having recovered.
+    ///
+    /// A clear is a claim of recovery, so it needs this; a death is still
+    /// reported on an unsettled read.
+    pub fn dead_settled(&self) -> bool {
+        !self.dead_is_underread() && !self.classification_is_underread() && self.rows_absent() == 0
+    }
+
     /// The unclassified labels, bounded for a headline — see
     /// [`UNCLASSIFIED_IN_SUMMARY`]. The remainder is COUNTED rather than
     /// dropped, so the summary never understates the blind spot, and
@@ -1520,15 +1531,21 @@ impl ObserverState {
             .map(|w| w.name.as_str())
             .chain(read.rolled_off_excluded.iter().map(String::as_str))
             .collect();
-        // Re-arm anything that recovered, so a second death pages again.
-        let had_dead = !self.dead_notified.is_empty();
-        self.dead_notified
-            .retain(|n| still_judged.contains(n.as_str()));
-        // Every reported death recovered: the card's code is clear. (One
-        // `error_code` covers every worker, so it clears only when none of
-        // the reported workers is still judged dead.)
-        if had_dead && self.dead_notified.is_empty() {
-            self.cleared.push(FaultClass::WorkerDead);
+        // Re-arm anything that recovered, so a second death pages again — but
+        // only on a read that could have SEEN the row: a truncated,
+        // unclassifiable or short list losing a worker is an absent
+        // observation, not a recovery, and must neither retract the card nor
+        // drop the latch (the flap back would re-page).
+        if read.dead_settled() {
+            let had_dead = !self.dead_notified.is_empty();
+            self.dead_notified
+                .retain(|n| still_judged.contains(n.as_str()));
+            // Every reported death recovered: the card's code is clear. (One
+            // `error_code` covers every worker, so it clears only when none of
+            // the reported workers is still judged dead.)
+            if had_dead && self.dead_notified.is_empty() {
+                self.cleared.push(FaultClass::WorkerDead);
+            }
         }
 
         let mut out = Vec::new();
@@ -1807,8 +1824,9 @@ pub async fn probe_door(client: &reqwest::Client, url: &str, scope: TenantScope)
 ///
 /// * the **`"error"` Tauri channel** carrying a
 ///   [`crate::error::UserFacingError`], which `StatusIndicator` renders
-///   app-level as a severity-coloured, dismissible card with the raw read in
-///   its collapsed "Technical Details" `<pre>`. It is the only surface in this
+///   app-level as a severity-coloured in-flow banner with the raw read in
+///   its collapsed "Technical Details" `<pre>` (dismissing it leaves a residual
+///   chip until [`surface_cleared`] reports the episode over). It is the only surface in this
 ///   app whose contract is already title + message + raw body + suggested
 ///   action, which is exactly what "a notification titled for the class and
 ///   carrying the raw read" needs;
@@ -1844,9 +1862,10 @@ fn surface(app: Option<&tauri::AppHandle>, report: &Report) {
         message: report.summary.clone(),
         details: Some(report.raw.clone()),
         error_code: report.class.error_code().to_string(),
-        // Warning, not Error: `StatusIndicator` auto-hides `info` after 5s and
-        // keeps everything else until dismissed, and an operator must not miss
-        // this one. It is not `Critical` — nothing on this runner is lost or
+        // Warning, not Info: `StatusIndicator` auto-hides `info` after 5s,
+        // while a fault stays (as a banner, or a residual once dismissed) until
+        // `surface_cleared` emits `error-cleared` for its code, and an operator
+        // must not miss this one. It is not `Critical` — nothing on this runner is lost or
         // at risk; coord coordination is.
         severity: crate::error::ErrorSeverity::Warning,
         // The condition clears itself the moment coord recovers, and the
@@ -3202,6 +3221,103 @@ mod tests {
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].class, FaultClass::WorkerDead);
         assert_eq!(reports[0].worker.as_deref(), Some("gate_evaluation_sweep"));
+    }
+
+    fn dead_dispatch() -> JsonValue {
+        dead_row("merge_scheduler.dispatch", true, false)
+    }
+
+    #[test]
+    fn a_truncated_read_missing_the_dead_row_neither_clears_nor_re_reports() {
+        let dead = ledger_body(1, json!([dead_dispatch()]));
+        let capped = truncated_ledger_body(1, json!([]));
+        let clean = ledger_body(0, json!([]));
+        let mut state = ObserverState::default();
+        assert_eq!(state.observe(&classify_ledger(&dead)).len(), 1);
+        state.take_cleared();
+        assert!(state.observe(&classify_ledger(&capped)).is_empty());
+        assert_eq!(state.take_cleared(), Vec::<FaultClass>::new());
+        // The latch survived: the row coming back does not page again.
+        assert!(state.observe(&classify_ledger(&dead)).is_empty());
+        state.observe(&classify_ledger(&clean));
+        assert_eq!(state.take_cleared(), vec![FaultClass::WorkerDead]);
+    }
+
+    #[test]
+    fn an_untruncated_list_shorter_than_non_nominal_does_not_clear() {
+        let dead = ledger_body(1, json!([dead_dispatch()]));
+        let mut short = ledger_body(0, json!([]));
+        short["components"]["counts"]["non_nominal"] = json!(2);
+        let ProbeOutcome::Read(read) = classify_ledger(&short) else {
+            panic!("expected a Read");
+        };
+        assert_eq!(read.rows_absent(), 2);
+        let mut state = ObserverState::default();
+        state.observe(&classify_ledger(&dead));
+        state.take_cleared();
+        state.observe(&ProbeOutcome::Read(read));
+        assert_eq!(state.take_cleared(), Vec::<FaultClass>::new());
+    }
+
+    #[test]
+    fn an_untruncated_clean_read_after_a_dead_row_yields_exactly_one_clear() {
+        let dead = ledger_body(1, json!([dead_dispatch()]));
+        let clean = ledger_body(0, json!([]));
+        let mut state = ObserverState::default();
+        state.observe(&classify_ledger(&dead));
+        state.take_cleared();
+        state.observe(&classify_ledger(&clean));
+        assert_eq!(state.take_cleared(), vec![FaultClass::WorkerDead]);
+        state.observe(&classify_ledger(&clean));
+        assert_eq!(state.take_cleared(), Vec::<FaultClass>::new());
+    }
+
+    #[test]
+    fn a_truncated_read_naming_a_new_death_pages_it_without_clearing_the_old_one() {
+        let a_dead = ledger_body(1, json!([dead_dispatch()]));
+        let b_only =
+            truncated_ledger_body(2, json!([dead_row("gate_evaluation_sweep", true, false)]));
+        let mut state = ObserverState::default();
+        state.observe(&classify_ledger(&a_dead));
+        state.take_cleared();
+        let reports = state.observe(&classify_ledger(&b_only));
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].worker.as_deref(), Some("gate_evaluation_sweep"));
+        assert_eq!(state.take_cleared(), Vec::<FaultClass>::new());
+    }
+
+    #[test]
+    fn two_notified_dead_workers_clear_only_once_both_have_recovered() {
+        let both = ledger_body(
+            2,
+            json!([
+                dead_dispatch(),
+                dead_row("gate_evaluation_sweep", true, false)
+            ]),
+        );
+        let one = ledger_body(1, json!([dead_row("gate_evaluation_sweep", true, false)]));
+        let clean = ledger_body(0, json!([]));
+        let mut state = ObserverState::default();
+        state.observe(&classify_ledger(&both));
+        state.take_cleared();
+        state.observe(&classify_ledger(&one));
+        assert_eq!(state.take_cleared(), Vec::<FaultClass>::new());
+        state.observe(&classify_ledger(&clean));
+        assert_eq!(state.take_cleared(), vec![FaultClass::WorkerDead]);
+    }
+
+    #[test]
+    fn a_capped_read_clears_no_leader_only_when_not_leader_here_is_zero() {
+        let dark = truncated_leaderless_body(1, json!([]));
+        let mut state = ObserverState::default();
+        for _ in 0..3 {
+            state.observe(&classify_ledger(&dark));
+        }
+        state.take_cleared();
+        state.observe(&classify_ledger(&dark));
+        assert_eq!(state.take_cleared(), Vec::<FaultClass>::new());
+        state.observe(&classify_ledger(&truncated_leaderless_body(0, json!([]))));
+        assert_eq!(state.take_cleared(), vec![FaultClass::NoLeader]);
     }
 
     #[test]

@@ -32,9 +32,9 @@ pub const WEB_FRONTEND_BASE_ENV: &str = "QONTINUI_WEB_FRONTEND_BASE";
 /// other host — localhost dev, a bare IP, or a unified deployment where one
 /// origin serves both — the backend URL is returned unchanged (the
 /// long-standing "same origin serves the SPA" fallback). Callers with their
-/// own frontend override (the `web_base_url` setting, or
-/// `$QONTINUI_WEB_FRONTEND_BASE` via [`resolve_web_frontend_base`]) apply it
-/// before falling back to this derivation.
+/// frontend override should go through [`resolve_web_frontend_base`], which
+/// applies `$QONTINUI_WEB_FRONTEND_BASE` and the `web_base_url` setting before
+/// falling back to this derivation.
 ///
 /// The returned value has no trailing slash and no path.
 pub fn derive_web_base_url(backend_url: &str) -> String {
@@ -71,6 +71,9 @@ pub fn derive_web_base_url(backend_url: &str) -> String {
 pub enum WebFrontendSource {
     /// `$QONTINUI_WEB_FRONTEND_BASE` was set to a non-blank value.
     EnvOverride,
+    /// The runner's persisted `web_integration.web_base_url` setting was set
+    /// to a non-blank value (the GUI's Web Integration "web frontend" field).
+    SettingOverride,
     /// Derived from the web API base by [`derive_web_base_url`]. Carries the
     /// API base it was derived from, so a wrong origin can be traced back to
     /// the API rung that chose it.
@@ -81,18 +84,30 @@ pub enum WebFrontendSource {
 ///
 /// 1. `env` (`$QONTINUI_WEB_FRONTEND_BASE`) — an explicit override; blank or
 ///    slash-only counts as unset.
-/// 2. Otherwise [`derive_web_base_url`] applied to `api_base` — the already
+/// 2. `setting` (the runner's `web_integration.web_base_url`) — the persisted
+///    operator override; blank or slash-only counts as unset. Callers with no
+///    runner settings (the `qontinui_profile` CLI) pass `None`.
+/// 3. Otherwise [`derive_web_base_url`] applied to `api_base` — the already
 ///    resolved API base, so every existing API-base knob (`$QONTINUI_WEB_BASE`,
 ///    a profile `api_url`, the production default) still steers the page too:
 ///    `https://api.qontinui.io` → `https://qontinui.io`.
 ///
 /// Pure: the caller reads the environment and owns the output surface.
-pub fn resolve_web_frontend_base(env: Option<&str>, api_base: &str) -> (String, WebFrontendSource) {
-    if let Some(explicit) = env
-        .map(|s| s.trim().trim_end_matches('/').to_string())
-        .filter(|s| !s.is_empty())
-    {
-        return (explicit, WebFrontendSource::EnvOverride);
+pub fn resolve_web_frontend_base(
+    env: Option<&str>,
+    setting: Option<&str>,
+    api_base: &str,
+) -> (String, WebFrontendSource) {
+    fn explicit(value: Option<&str>) -> Option<String> {
+        value
+            .map(|s| s.trim().trim_end_matches('/').to_string())
+            .filter(|s| !s.is_empty())
+    }
+    if let Some(origin) = explicit(env) {
+        return (origin, WebFrontendSource::EnvOverride);
+    }
+    if let Some(origin) = explicit(setting) {
+        return (origin, WebFrontendSource::SettingOverride);
     }
     (
         derive_web_base_url(api_base),
@@ -162,7 +177,7 @@ mod tests {
         // https://api.qontinui.io/connect-runner, which 404s. With nothing
         // configured the page must open on the frontend origin.
         assert_eq!(
-            resolve_web_frontend_base(None, "https://api.qontinui.io"),
+            resolve_web_frontend_base(None, None, "https://api.qontinui.io"),
             (
                 "https://qontinui.io".to_string(),
                 WebFrontendSource::DerivedFromApiBase {
@@ -175,7 +190,11 @@ mod tests {
     #[test]
     fn frontend_base_env_override_wins_and_is_normalized() {
         assert_eq!(
-            resolve_web_frontend_base(Some(" http://localhost:3001/ "), "http://127.0.0.1:8000"),
+            resolve_web_frontend_base(
+                Some(" http://localhost:3001/ "),
+                Some("http://setting.example"),
+                "http://127.0.0.1:8000"
+            ),
             (
                 "http://localhost:3001".to_string(),
                 WebFrontendSource::EnvOverride
@@ -184,10 +203,31 @@ mod tests {
     }
 
     #[test]
+    fn frontend_base_setting_override_applies_when_env_is_unset() {
+        // Split local dev configured through the GUI: backend :8000, Next.js
+        // :3001 saved as `web_integration.web_base_url`. Deriving from the
+        // backend would open the page on :8000, which serves no pages.
+        for env in [None, Some("  ")] {
+            assert_eq!(
+                resolve_web_frontend_base(
+                    env,
+                    Some("http://localhost:3001/"),
+                    "http://127.0.0.1:8000"
+                ),
+                (
+                    "http://localhost:3001".to_string(),
+                    WebFrontendSource::SettingOverride
+                ),
+                "env {env:?} must not shadow the setting"
+            );
+        }
+    }
+
+    #[test]
     fn frontend_base_ignores_a_blank_or_slash_only_override() {
         for blank in ["", "   ", "/", " // "] {
             assert_eq!(
-                resolve_web_frontend_base(Some(blank), "https://api.staging.example/"),
+                resolve_web_frontend_base(Some(blank), Some(blank), "https://api.staging.example/"),
                 (
                     "https://staging.example".to_string(),
                     WebFrontendSource::DerivedFromApiBase {
@@ -204,7 +244,7 @@ mod tests {
         // A unified deployment (one origin serves pages and API) keeps working:
         // there is no `api.` label to strip.
         assert_eq!(
-            resolve_web_frontend_base(None, "http://127.0.0.1:8000").0,
+            resolve_web_frontend_base(None, None, "http://127.0.0.1:8000").0,
             "http://127.0.0.1:8000"
         );
     }

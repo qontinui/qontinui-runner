@@ -371,9 +371,10 @@ export interface PlaybookTransitionRecord {
  */
 export interface ExecutePlaybookStepOutput extends BaseStepOutput {
   step_type: "execute_playbook";
-  /** Path to the playbook file, if one was used. */
-  playbook_path?: string;
-  /** Inline playbook markdown content, if provided. */
+  /**
+   * The playbook markdown the step ran. The executor reads only this inline
+   * body (wire field `content`), never a file path.
+   */
   content?: string;
   /** Ordered record of the transitions the playbook drove. */
   transitions: PlaybookTransitionRecord[];

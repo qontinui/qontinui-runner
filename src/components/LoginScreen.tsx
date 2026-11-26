@@ -15,11 +15,14 @@ import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { LogIn, AlertCircle, Loader2, RotateCcw } from "lucide-react";
 import { createLogger } from "@/lib/logger";
+import { resolveSignInBackendUrl } from "@/lib/savedBackendUrl";
+import {
+  NO_BROWSER_HINT,
+  PendingSignInNotice,
+  isSignInCancelled,
+} from "@/components/PendingSignInNotice";
 
 const log = createLogger("LoginScreen");
-
-/** Web backend the Cognito-bound device JWT is minted against. */
-const DEFAULT_BACKEND_URL = "https://api.qontinui.io";
 
 type CognitoSignInResponse = {
   userId: string;
@@ -70,8 +73,12 @@ export function LoginScreen({ storeUnreadable = false }: { storeUnreadable?: boo
     setError("");
 
     try {
+      // The saved backend when the one sign-in rule honours it on a first-run
+      // ("gate") screen, else production (see savedBackendUrl.ts): the command
+      // writes the URL it signed in against back into settings.
+      const backendUrl = await resolveSignInBackendUrl("gate");
       await invoke<CognitoSignInResponse>("cognito_sign_in", {
-        backendUrl: DEFAULT_BACKEND_URL,
+        backendUrl,
         identityProvider: provider,
       });
       log.debug("Cognito sign-in completed — runner promoted to Tier 2");
@@ -79,8 +86,11 @@ export function LoginScreen({ storeUnreadable = false }: { storeUnreadable?: boo
       // (notably AuthProvider) so the gate re-evaluates without a poll cycle.
       window.dispatchEvent(new CustomEvent("runner-tier-changed"));
     } catch (err) {
-      log.error("Cognito sign-in failed:", err);
-      setError(typeof err === "string" ? err : String(err));
+      // The user's own Cancel (from the pending-sign-in notice) is not a failure.
+      if (!isSignInCancelled(err)) {
+        log.error("Cognito sign-in failed:", err);
+        setError(typeof err === "string" ? err : String(err));
+      }
     } finally {
       setLoading(false);
       setPending(null);
@@ -93,10 +103,11 @@ export function LoginScreen({ storeUnreadable = false }: { storeUnreadable?: boo
     setError("");
 
     try {
+      const backendUrl = await resolveSignInBackendUrl("gate");
       await invoke<CognitoSignInResponse>("cognito_sign_in_password", {
         email,
         password,
-        backendUrl: DEFAULT_BACKEND_URL,
+        backendUrl,
       });
       log.debug("Password sign-in completed — runner promoted to Tier 2");
       // Same as the hosted-UI path: the command already promoted to Tier 2,
@@ -216,6 +227,12 @@ export function LoginScreen({ storeUnreadable = false }: { storeUnreadable?: boo
               <p className="text-sm text-destructive">{error}</p>
             </div>
           )}
+
+          {/* The authorize URL, when the runner could not open a browser. */}
+          <PendingSignInNotice
+            active={pending !== null}
+            noBrowserHint={NO_BROWSER_HINT.loginScreen}
+          />
 
           {/* Federated social sign-in (Cognito Hosted UI per IdP). Labels,
               ordering, and provider names match the web auth UI verbatim. */}

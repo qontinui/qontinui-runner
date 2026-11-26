@@ -170,7 +170,14 @@ const EXPECTED_EXEMPTIONS: &[(&str, &str, usize)] = &[
     ("agent_runtime.rs", "capability-token", 1),
     ("agent_token/mod.rs", "agent-jwt", 1),
     ("bin/qontinui_cli.rs", "not-coord", 1),
-    ("ci_node/reporting.rs", "device-jwt-required", 2),
+    // ops lane (plan 2026-10-19 Phase 4): the result POST is authorised by the
+    // device JWT the subscriber already holds; see the annotation at the call site.
+    ("ci_node/ops.rs", "device-jwt-required", 1),
+    // The progress flusher, `post_result`, and the queued-lease heartbeat
+    // (`post_queued_heartbeat`): all three send the device JWT from the
+    // remint-awaiting resolver, and coord authorises each against the
+    // dispatch's assignee, so none may go anonymous.
+    ("ci_node/reporting.rs", "device-jwt-required", 3),
     // Shrank 3 -> 1 (plan 2026-10-09-spec-front-end-of-the-software-factory
     // Phase 9): the Claude connection test and the usage probe now build their
     // requests through `model_gateway::ModelCall`, which has no `.post(` here and
@@ -181,6 +188,11 @@ const EXPECTED_EXEMPTIONS: &[(&str, &str, usize)] = &[
     ("credential_helper.rs", "device-jwt-required", 1),
     ("dirty_poller/mod.rs", "agent-jwt", 1),
     ("env_agent/enroll.rs", "not-coord", 1),
+    // Plan 2026-09-30-the-fleet-machine-is-not-a-first-class-coord-entity…:
+    // `POST /coord/computers/report`, the resource sample's sibling — same
+    // device-JWT-or-skip shape (`read_usable_device_jwt`, early return
+    // without one), so it is never sent anonymously.
+    ("fleet/computer/mod.rs", "device-jwt-required", 1),
     ("fleet/resource_sample.rs", "device-jwt-required", 1),
     // Relocated, not added: this is the same single loopback POST telling the
     // PRIMARY instance that a secondary is stopping. It moved out of `main.rs`
@@ -212,7 +224,13 @@ const EXPECTED_EXEMPTIONS: &[(&str, &str, usize)] = &[
     // POST arm, one of which executes — spelled as two builder calls rather
     // than `client.request(method, url)` precisely so this scan can still see
     // them.
-    ("mcp_api.rs", "forwarder", 5),
+    //
+    // 5 -> 4 + 1 with the mcp_api split (plan
+    // `2026-10-04-runner-mcp-api-rs-holds-the-http-composition-root-health-and-five-proxies-in-one-file`
+    // Phase 2): the VCS-PR forwarder moved verbatim into `mcp_api/vcs_pr.rs`.
+    // Relocated, not added: the total stays 5.
+    ("mcp_api.rs", "forwarder", 4),
+    ("mcp_api/vcs_pr.rs", "forwarder", 1),
     ("memory/memory_synthesis.rs", "not-coord", 2),
     ("memory/tenant_sync.rs", "not-coord", 1),
     (
@@ -223,6 +241,13 @@ const EXPECTED_EXEMPTIONS: &[(&str, &str, usize)] = &[
     ("orchestration_loop/coord_gate.rs", "device-jwt-required", 1),
     ("pair.rs", "bootstrap", 1),
     ("pair.rs", "not-coord", 2),
+    // The session census's whole-device snapshot POST (plan
+    // `2026-10-01-a-commit-author-session-is-unreachable-because-every-session-roster-is-per-account`
+    // Phase 2). It presents the paired-device JWT it resolved itself via
+    // `device_bearer_scoped(TenantScope::Device)` and returns before the POST
+    // when there is none: coord's ingest 403s any other credential, so the
+    // fail-soft defaulting helper (which would send anonymously) is wrong here.
+    ("session/census.rs", "device-jwt-required", 1),
     // The session-identity reporter's POST to coord's
     // /coord/session-identity/:device_id (plan
     // `2026-10-19-session-lookup-by-name-shows-claude-account-in-web` Phase 2).
@@ -816,7 +841,8 @@ const TENANT_SCOPE_KINDS: &[(&str, &str)] = &[
         "work-scoped and session-less: the tenant is a property of an artifact \
          (a plan, a work unit, a repo), so there is no session to ask. Phase 6 \
          resolved every COORD site in this class from the artifact's repo; the \
-         four that remain talk to qontinui-web, whose axis is organization_id \
+         ones that remain (the work-owed row of EXPECTED_TENANT_SCOPE_TOTALS) \
+         all talk to qontinui-web, whose axis is organization_id \
          derived from the authenticated principal, and whose coord-tenant to \
          web-organization mapping is escalation E3 — unresolved, and not \
          something a credential choice can settle.",
@@ -867,10 +893,14 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
     ("fleet.rs", "device", 4),
     ("looping_agent_coord.rs", "device", 5),
     ("mcp/plan_library.rs", "work-owed", 5),
+    // The plan-library door's follow-up family (plan
+    // `2026-10-10-small-followups-are-recorded-but-nothing-burns-them-down`
+    // Phase 4): ONE shared forward for its five qontinui-web routes, with the
+    // same session-less posture and E3 question as its parent's forwards.
+    ("mcp/plan_library/followups.rs", "work-owed", 1),
     ("mcp/probe_executor.rs", "device", 1),
     ("repo_tenant.rs", "device", 2),
     ("plan_workunit_adapter/body_push.rs", "work-owed", 3),
-    ("session/handoff.rs", "escalated", 1),
 ];
 
 /// Totals across the whole table, asserted independently of the per-file rows
@@ -932,6 +962,12 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
 /// whose tenant is the plan's repo. When Phase 6 resolves that upsert's
 /// tenant, this site moves with it. So `work-owed` 16 -> 17.
 ///
+/// Plan `2026-09-13-coord-publishes-agent-jwts-on-a-redis-channel-fronted-by-an-unauthenticated-ws-firehose`
+/// Phase 3 adds one: `agent_runtime`'s credential-door fetch
+/// (`fetch_agent_credential`). It is `session-noop`: the path `agent_id` is the
+/// whole key, and coord compares the bearer's `device_id` to the agent row, so
+/// there is no tenant for a credential choice to move. So `session-noop` 9 -> 10.
+///
 /// Plan `2026-09-13-drained-runner-never-reaches-idle` Phase 3 adds one:
 /// `coord_drain_state.rs`'s `GET /coord/devices/me/drain`. It is `device` and
 /// not an owed class — `me` resolves to the device its own JWT was minted for,
@@ -956,11 +992,14 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
 /// call. It also ADDED one `device` site: the canonical-repo READ that backs the
 /// whole resolution (`repo_tenant::fetch_registered_repos`), which cannot itself
 /// be tenant-scoped without circularity. So `device` 22 -> 23 and `work-owed`
-/// 19 -> 8, leaving 23 + 10 + 8 + 2 = 43. The `work-owed` sites that remain post to **qontinui-web**, which
+/// 19 -> 8, leaving 23 + 10 + 8 + 2 = 43. The `work-owed` sites that remain talk to **qontinui-web**, which
 /// derives `organization_id` from the authenticated principal — lowering them
 /// waits on escalation E3, not on another credential-threading phase. (The two
 /// Phase-5 `mcp/plan_library.rs` forwards are among those that remain: they are
 /// qontinui-web-bound, so Phase 6's coord-side seam does not reach them.)
+///
+/// Phase 7 then moved `fleet.rs`'s tenant-declaring wire body
+/// (`request_and_apply_pull`) onto the stating seam, so `device` 23 -> 22.
 ///
 /// Plan `2026-09-29-vanished-paired-user-json-leaves-a-live-jwt-with-no-coord-credential`
 /// (review finding 1) then moved `fleet.rs`'s register heartbeat onto the
@@ -973,12 +1012,36 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
 /// `GET /coord/repos/tenants` read. It is `device` by the route's contract:
 /// coord answers it over the caller DEVICE's own `tenant_devices` bindings and
 /// refuses any principal that does not prove a device. So `device` 21 -> 22.
+///
+/// Plan `2026-09-30-session-attribution-is-too-sparse-to-derive-a-terminal-state`
+/// Phase 4 then added `agent_runtime::report_session_launched`
+/// (`POST /agents/{agent_id}/session`). It is `session-noop`: the agent id in
+/// the path is the whole key, coord resolves the tenant from the allocation's
+/// own rows and verifies the default binding's device JWT speaks for that
+/// allocation, so there is no tenant for a credential choice to move. So
+/// `session-noop` 10 -> 11.
+///
+/// Plan `2026-10-10-remote-create-residuals-followups` Phase 4 then retired
+/// `session/handoff.rs`'s `escalated` site: `close_source` no longer sends the
+/// operator-admin `DELETE /sessions/:id` but coord's device-authed
+/// `POST /sessions/:id/handoff/complete`, presenting the SOURCE session's
+/// tenant slot through `attach_device_auth_for` — the call was what was wrong,
+/// so it moved onto the stating seam and is no longer scanned. So `escalated`
+/// 2 -> 1.
+///
+/// Plan `2026-10-10-small-followups-are-recorded-but-nothing-burns-them-down`
+/// Phase 4 adds one: the plan-library door's follow-up family
+/// (`mcp/plan_library/followups.rs`) forwards its five routes to
+/// **qontinui-web** through a single `forward`, with the same session-less,
+/// artifact-keyed posture as its parent's forwards and the same E3 open
+/// question — web derives `organization_id` from the device principal. So
+/// `work-owed` 8 -> 9.
 const EXPECTED_TENANT_SCOPE_TOTALS: &[(&str, usize)] = &[
     ("device", 22),
     ("session-noop", 11),
     ("session-owed", 0),
-    ("work-owed", 8),
-    ("escalated", 2),
+    ("work-owed", 9),
+    ("escalated", 1),
 ];
 
 /// Extract the kind from `coord-tenant-scope(<kind>):`.
@@ -1189,7 +1252,16 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
          bindings and refuses any principal that does not prove a device): 41 + 1 = 42. Plan \
          2026-09-30-session-attribution-is-too-sparse-to-derive-a-terminal-state Phase 4 then \
          added agent_runtime's report_session_launched (POST /agents/{{agent_id}}/session, \
-         session-noop): 42 to 43. Found {sites}. A change here \
+         session-noop): 42 to 43. Plan \
+         2026-10-10-remote-create-residuals-followups Phase 4 then moved session/handoff.rs's \
+         escalated close_source onto the stating seam (coord's device-authed handoff-complete \
+         door under the source session's tenant slot, replacing the operator-admin DELETE): \
+         43 - 1 = 42. Plan \
+         2026-10-10-small-followups-are-recorded-but-nothing-burns-them-down Phase 4 then \
+         added mcp/plan_library/followups.rs's single `forward` (work-owed: the follow-up \
+         family's five qontinui-web routes, the same session-less posture as its parent's \
+         forwards): 42 + 1 = 43. \
+         Found {sites}. A change here \
          is fine — it just has \
          to be deliberate. It goes DOWN when a site adopts \
          `attach_device_auth_for(.., TenantScope)`, and UP only when someone adds a new \

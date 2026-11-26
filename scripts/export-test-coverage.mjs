@@ -48,9 +48,18 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { readFileSync, existsSync, mkdtempSync, readdirSync, statSync } from "node:fs";
+import {
+  readFileSync,
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  statSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, sep, posix } from "node:path";
+import { pathToFileURL } from "node:url";
 
 // MUST be the "owner/name" webhook form — coord's join keys on it verbatim
 // (`score_for_head` / `flakiness_priors` select `WHERE repo = $1`, and
@@ -147,6 +156,70 @@ function normalizeSourcePath(absOrRel) {
   if (/\.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs|mts|cts)$/.test(rel)) return null;
   if (!rel.startsWith("src/")) return null;
   return rel;
+}
+
+/**
+ * How old a `covprod-*` dir must be before the startup sweep removes it. One
+ * dir lives for one vitest run of one test file (seconds), so an hour-old one
+ * belongs to no live producer.
+ */
+export const STALE_SCRATCH_DIR_MS = 60 * 60 * 1000;
+
+/**
+ * Remove `covprod-*` dirs under the OS tmpdir whose mtime is older than
+ * `maxAgeMs`. withScratchDir's `finally` does not run when the job is
+ * cancelled mid-file -- a superseded run (concurrency cancel-in-progress) or
+ * one that hits its timeout gets SIGINT/SIGTERM and then SIGKILL, and node's
+ * default signal handling exits without unwinding -- so each such run leaves
+ * the in-flight dir behind (measured on nawa 2026-11-12: four cancelled post-fix runs, four
+ * leftover dirs). The next run on the same runner removes them here, which
+ * bounds the leftovers to the last killed run's one dir per runner unit.
+ * Best-effort: any error is swallowed, the producer never fails on it.
+ * @param {number} [maxAgeMs]
+ * @param {number} [now]
+ * @returns {number} how many dirs were removed
+ */
+export function sweepStaleScratchDirs(maxAgeMs = STALE_SCRATCH_DIR_MS, now = Date.now()) {
+  let removed = 0;
+  let names = [];
+  try {
+    names = readdirSync(tmpdir());
+  } catch {
+    return 0;
+  }
+  for (const name of names) {
+    if (!name.startsWith("covprod-")) continue;
+    const p = join(tmpdir(), name);
+    try {
+      const st = statSync(p);
+      if (!st.isDirectory() || now - st.mtimeMs < maxAgeMs) continue;
+      rmSync(p, { recursive: true, force: true });
+      removed++;
+    } catch {
+      // Raced with another remover, or not ours to remove -- skip it.
+    }
+  }
+  return removed;
+}
+
+/**
+ * Run `fn` with a fresh `covprod-*` dir under the OS tmpdir, and remove that
+ * dir afterwards, also when `fn` throws. `fn` must read everything it needs out
+ * of the dir before returning. Without the removal every test file leaves a
+ * ~24 MB dir behind, and on a CI runner whose /tmp is a RAM-backed PrivateTmp
+ * that is RAM held for the life of the runner unit (plan
+ * 2026-11-10-devops-coverage-producer-leaves-a-covprod-dir-per-test-file-in-ram-tmp).
+ * @template T
+ * @param {(dir: string) => T} fn
+ * @returns {T}
+ */
+export function withScratchDir(fn) {
+  const dir = mkdtempSync(join(tmpdir(), "covprod-"));
+  try {
+    return fn(dir);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 /**
@@ -289,10 +362,14 @@ async function main() {
   /** @type {string[]} */
   const junitDocs = [];
 
+  const swept = sweepStaleScratchDirs();
+  if (swept > 0) info(`removed ${swept} stale covprod-* dir(s) left by a killed run`);
+
   for (const testFileRel of testFiles) {
-    const outDir = mkdtempSync(join(tmpdir(), "covprod-"));
     info(`running ${testFileRel}`);
-    const { filesTouched, junitXml } = runOneFile(testFileRel, outDir);
+    const { filesTouched, junitXml } = withScratchDir((outDir) =>
+      runOneFile(testFileRel, outDir),
+    );
 
     const testId = toRepoRelTestId(testFileRel);
     observations.push({
@@ -350,10 +427,17 @@ async function main() {
   return 0;
 }
 
-main()
-  .then((code) => process.exit(code))
-  .catch((e) => {
-    // Top-level guard: never fail the lane.
-    warn(`unexpected error: ${e} — exiting 0 (best-effort)`);
-    process.exit(0);
-  });
+// Run only when executed directly, so a test can import withScratchDir.
+// import.meta.url names the real path, so compare against argv[1]'s real path.
+if (
+  process.argv[1] &&
+  import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href
+) {
+  main()
+    .then((code) => process.exit(code))
+    .catch((e) => {
+      // Top-level guard: never fail the lane.
+      warn(`unexpected error: ${e} — exiting 0 (best-effort)`);
+      process.exit(0);
+    });
+}

@@ -503,6 +503,10 @@ EXPECTED_SCAN_ROOTS: tuple[str, ...] = (
     "crates/pty-holder/src",
     "crates/runner-stats/src",
     "crates/runner-win32/src",
+    # Linked since plan 2026-11-04-runner-finished-close-closes-nothing-on-any-box
+    # Phase 2a: the runner calls `session_lifecycle::classify_session` (a pure
+    # crate — it spawns nothing, so the scan is expected to stay empty).
+    "crates/session-lifecycle/src",
     "crates/spec-check/src",
     "src-tauri/clorinde/src",
     "src-tauri/src",

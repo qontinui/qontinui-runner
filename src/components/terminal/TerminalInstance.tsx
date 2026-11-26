@@ -21,9 +21,10 @@ import { TerminalFindBar } from "./TerminalFindBar";
 import { paintGrid, type GridSnapshot } from "./paintGrid";
 import { getTerminalDebug, recordPaintGrid } from "./terminalDebug";
 import { instanceStorage } from "@/lib/instance-storage";
-import { writeClipboard } from "@/lib/clipboard";
+import { readClipboard, writeClipboard } from "@/lib/clipboard";
 import { consumeInputChunk } from "./consumeInputChunk";
 import { preparePasteData } from "./preparePaste";
+import { claimPasteChord } from "./pasteChord";
 import { attachBridgeInputRegistration } from "./bridgeInputRegistration";
 import { registerMountedTerminalView } from "./mountedTerminalViews";
 import { toPtySequence } from "./terminalKeySequence";
@@ -528,7 +529,6 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
       let quietTitleTimer: ReturnType<typeof setInterval> | null = null;
       let observer: ResizeObserver | null = null;
       let paneTierDeclaration: ReturnType<typeof declarePaneTier> | null = null;
-      let blockNativePaste: ((e: Event) => void) | null = null;
       let wheelScrollOverride: ((e: WheelEvent) => void) | null = null;
       let contextMenuCopyPaste: ((e: MouseEvent) => void) | null = null;
       // Ensure the dev instrumentation hook (window.__qontinuiTerminal) exists
@@ -1028,9 +1028,9 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
           }),
         );
 
-        // Handle Ctrl+C copy (when text is selected) and Ctrl+V paste.
-        // Tauri's webview doesn't fire the browser clipboard events that xterm.js
-        // relies on, so we intercept the keys and use the clipboard API manually.
+        // Handle Ctrl+C copy (when text is selected) and Ctrl+V paste through
+        // the clipboard API manually rather than relying on the webview's
+        // clipboard events reaching xterm.js.
         backend.attachCustomKeyEventHandler((event) => {
           // Ctrl+C: copy selected text, or pass through as SIGINT when nothing selected
           if (event.type === "keydown" && event.key === "c" && event.ctrlKey && !event.shiftKey) {
@@ -1060,23 +1060,19 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
             return false;
           }
 
-          if (
-            event.type === "keydown" &&
-            event.key === "v" &&
-            (event.ctrlKey || event.metaKey) &&
-            !event.shiftKey
-          ) {
-            navigator.clipboard
-              .readText()
+          // Ctrl/Cmd+V: `claimPasteChord` cancels the keystroke's default action
+          // so the webview fires no native `paste` event — xterm's own textarea
+          // listener would otherwise write the same text a second time (see
+          // `pasteChord.ts`).
+          if (claimPasteChord(event)) {
+            readClipboard()
               .then((text) => {
                 if (text) {
-                  // Write directly to PTY instead of paste to avoid double
-                  // paste when WebView2 also fires a native paste event. Run
-                  // the clipboard text through the same bracketed-paste +
-                  // newline normalization xterm's own paste would apply — a raw
-                  // write breaks multi-line paste into TUIs that enable
-                  // bracketed paste mode (Claude Code, vim, fzf). See
-                  // `preparePaste.ts`.
+                  // Write directly to PTY. Run the clipboard text through the
+                  // same bracketed-paste + newline normalization xterm's own
+                  // paste would apply — a raw write breaks multi-line paste
+                  // into TUIs that enable bracketed paste mode (Claude Code,
+                  // vim, fzf). See `preparePaste.ts`.
                   const prepared = preparePasteData(text, backend.bracketedPasteMode);
                   const bytes = encoder.encode(prepared);
                   invoke("terminal_write", { terminalId, data: uint8ToBase64(bytes) }).catch(
@@ -1084,7 +1080,11 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
                   );
                 }
               })
-              .catch(() => {});
+              .catch((err: unknown) => {
+                // The keystroke was cancelled, so no native paste follows: a
+                // rejected read is a paste that did not happen. Say so.
+                console.warn("[terminal] Ctrl+V clipboard read failed; nothing pasted", err);
+              });
             return false; // prevent terminal default handling
           }
 
@@ -1157,17 +1157,6 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
           return true;
         });
 
-        // Block native paste events from reaching the terminal — we handle paste
-        // manually in the custom key handler above.  Without this, WebView2
-        // fires a native "paste" event that the terminal processes via onData(),
-        // causing the pasted text to be written to the PTY a second time.
-        const inputEl = backend.getInputElement();
-        blockNativePaste = (e: Event) => {
-          e.preventDefault();
-          e.stopPropagation();
-        };
-        inputEl?.addEventListener("paste", blockNativePaste, true);
-
         // Right-click copy/paste (VS Code `terminal.integrated.rightClickBehavior:
         // "copyPaste"` parity): with a selection, right-click copies it (and
         // clears the highlight as feedback); with no selection, it pastes the
@@ -1194,15 +1183,18 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
           }
           // No selection → paste, mirroring the Ctrl+V path (bracketed-paste +
           // newline normalization; see `preparePaste.ts`).
-          navigator.clipboard
-            .readText()
+          readClipboard()
             .then((text) => {
               if (!text) return;
               const prepared = preparePasteData(text, b.bracketedPasteMode);
               const bytes = encoder.encode(prepared);
               invoke("terminal_write", { terminalId, data: uint8ToBase64(bytes) }).catch(() => {});
             })
-            .catch(() => {});
+            .catch((err: unknown) => {
+              // contextmenu is preventDefaulted above, so no native paste
+              // follows: a rejected read is a paste that did not happen.
+              console.warn("[terminal] right-click clipboard read failed; nothing pasted", err);
+            });
         };
         container.addEventListener("contextmenu", contextMenuCopyPaste);
 
@@ -1591,10 +1583,6 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
           container.removeEventListener("contextmenu", contextMenuCopyPaste);
         }
         for (const d of disposables) d.dispose();
-        const inputEl = backendRef.current?.getInputElement();
-        if (inputEl && blockNativePaste) {
-          inputEl.removeEventListener("paste", blockNativePaste, true);
-        }
         outputUnsub?.();
         exitUnsub?.();
         // Hand consumption over to the per-page tap: this pane's render-acks

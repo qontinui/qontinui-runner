@@ -10,7 +10,10 @@
  * mistaken for a broken one.
  *
  * Renders nothing when the drain is clear, or when this runner is not a coord
- * device at all (no drain can apply).
+ * device at all (no drain can apply) — unless coord's dispatch role for this
+ * machine (`bench` / `ci_node`) closes the agent lane, which keeps autonomous
+ * spawns off with the drain clear, and says so — or that role is UNKNOWN (never
+ * served to this runner, none persisted), which keeps them off too.
  */
 
 import { useState } from "react";
@@ -20,6 +23,8 @@ import { AdvisorySlot } from "./AdvisoryStack";
 import { useCoordDrainState, type CoordDrainSnapshot } from "@/hooks/useCoordDrainState";
 
 export interface DrainBannerModel {
+  /** What holds autonomous spawns: a drain, an unknown drain, or a dispatch role. */
+  kind: "drained" | "unknown" | "role_closed";
   status: "warning" | "error";
   heading: string;
   /** Until / reason (drained) or cause (unknown). */
@@ -48,6 +53,9 @@ export interface DrainBannerModel {
 /** The copy the UNKNOWN state must carry, verbatim (plan Phase 3). */
 export const UNKNOWN_HEADING = "drain state unknown — autonomous spawns paused";
 
+/** The heading while the drain is clear but the dispatch role is unknown. */
+export const ROLE_UNKNOWN_HEADING = "dispatch role unknown — autonomous spawns paused";
+
 /**
  * Review N3. While the drain holds, `terminal_session_list_open` withholds the
  * RESTORABLE set, so a page whose only tabs are unrestored sessions shows no
@@ -58,6 +66,13 @@ export const UNKNOWN_HEADING = "drain state unknown — autonomous spawns paused
  */
 export const RESTORE_NOTE =
   "saved session tabs are not restored while this holds — they come back when it lifts, nothing is lost";
+
+/**
+ * The restore note while a dispatch role (not a drain) holds. A role is a
+ * standing operator choice, not a window, so it does not promise a lift.
+ */
+export const ROLE_RESTORE_NOTE =
+  "saved session tabs are not restored on this machine while its role holds — nothing is lost, and they come back if the role changes";
 
 export function deferredLabel(count: number, capped = false): string | null {
   if (count <= 0) return null;
@@ -80,11 +95,14 @@ export function drainBannerModel(s: CoordDrainSnapshot | null): DrainBannerModel
     if (s.until) parts.push(`until ${formatUntil(s.until)}`);
     if (s.reason) parts.push(s.reason);
     return {
+      kind: "drained",
       status: "warning",
       heading: "Runner drained by coord — autonomous spawns deferred",
       detail: parts.length > 0 ? parts.join(" · ") : null,
       deferredLabel: deferredLabel(s.deferredCount, s.deferredCapped ?? false),
-      restoreNote: RESTORE_NOTE,
+      // Lifting the drain does not lift a closing dispatch role, so do not
+      // promise that it does.
+      restoreNote: s.agentLaneClosedByRole === true ? ROLE_RESTORE_NOTE : RESTORE_NOTE,
       episodeKey: `drained|${s.until ?? ""}`,
     };
   }
@@ -93,12 +111,48 @@ export function drainBannerModel(s: CoordDrainSnapshot | null): DrainBannerModel
   if (s.state === "unknown" && s.bootReadPending) return null;
   if (s.state === "unknown") {
     return {
+      kind: "unknown",
       status: "error",
       heading: UNKNOWN_HEADING,
       detail: s.cause,
       deferredLabel: deferredLabel(s.deferredCount, s.deferredCapped ?? false),
-      restoreNote: RESTORE_NOTE,
+      // A readable drain does not lift a closing dispatch role either.
+      restoreNote: s.agentLaneClosedByRole === true ? ROLE_RESTORE_NOTE : RESTORE_NOTE,
       episodeKey: `unknown|${s.since ?? ""}`,
+    };
+  }
+  // The drain is clear (or this is no coord device), but coord's dispatch role
+  // for this machine closes the agent lane, so autonomous spawns stay off.
+  if (s.agentLaneClosedByRole === true) {
+    return {
+      kind: "role_closed",
+      status: "warning",
+      heading: `Dispatch role ${s.dispatchRole ?? "unknown"} — autonomous spawns off on this machine`,
+      // A role carried over from before this runner started, which coord has
+      // not re-served since, says so rather than reading as fresh.
+      detail:
+        s.dispatchRoleSource === "persisted"
+          ? `as coord last served it${
+              s.dispatchRoleObservedAt ? ` (${formatUntil(s.dispatchRoleObservedAt)})` : ""
+            }, before this runner started — not re-confirmed yet`
+          : null,
+      deferredLabel: deferredLabel(s.deferredCount, s.deferredCapped ?? false),
+      restoreNote: ROLE_RESTORE_NOTE,
+      episodeKey: `role_closed|${s.dispatchRole ?? ""}`,
+    };
+  }
+  // The drain is clear, but coord has never served this machine's dispatch
+  // role and none was persisted: the runner fails closed, as coord itself does
+  // on an unreadable role.
+  if (s.dispatchRoleSource === "unknown" && s.state === "clear" && !s.autonomousSpawnsAllowed) {
+    return {
+      kind: "unknown",
+      status: "error",
+      heading: ROLE_UNKNOWN_HEADING,
+      detail: "coord has not served this machine's dispatch role since the runner started",
+      deferredLabel: deferredLabel(s.deferredCount, s.deferredCapped ?? false),
+      restoreNote: RESTORE_NOTE,
+      episodeKey: "role_unknown",
     };
   }
   return null;

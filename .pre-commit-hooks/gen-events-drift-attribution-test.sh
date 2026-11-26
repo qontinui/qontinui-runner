@@ -367,6 +367,7 @@ CODEGEN_INPUT_PINS=(
     src-tauri/scripts/generate_types.sh Cargo.toml Cargo.lock
     rust-toolchain.toml src-tauri/clorinde/src/lib.rs crates/spec-check/Cargo.toml
     crates/runner-stats/src/lib.rs crates/runner-win32/src/lib.rs crates/pty-holder/src/lib.rs
+    crates/session-lifecycle/src/lib.rs
     vendor/tao-0.35.0/src/lib.rs vendor/portable-pty-0.8.1/src/lib.rs
     src-tauri/.cargo/config.toml .cargo/config.toml src-tauri/.cargo/config .cargo/config
     rust-toolchain src-tauri/rust-toolchain.toml src-tauri/rust-toolchain
@@ -459,6 +460,61 @@ commit_change "src-tauri/src/lib.rs" "// mine"
 decide
 check "with neither, origin/main is the base" "origin/main" "$ATTRIBUTION_BASE_REF"
 check "and the verdict still holds" "mine" "$ATTRIBUTION_STATE"
+
+# A REBASED branch keeps its upstream at the PRE-rebase head, whose merge-base
+# is the OLD fork point. Measured from there, every main commit the rebase
+# pulled in reads as the push's own. That is findings 8d16b76e and 79415d3d:
+# a frontend-only branch, rebased onto a main that had touched src-tauri/,
+# was blamed for main's codegen drift. The default branch is the base, so
+# only the branch's own change counts.
+fixture
+git -C "$WORK" checkout --quiet -b feature
+commit_change "src/app.ts" "// the branch's own, frontend-only, change"
+git -C "$WORK" push --quiet -u origin feature 2>/dev/null
+seed_main_only() {
+    mkdir -p "$UPSTREAM/$(dirname "$1")"
+    printf '%s\n' "$2" >> "$UPSTREAM/$1"
+    git -C "$UPSTREAM" add -A >/dev/null
+    git -C "$UPSTREAM" commit --quiet -m "main: $1"
+    git -C "$WORK" fetch --quiet origin
+}
+seed_main_only "src-tauri/src/lib.rs" "// a peer's codegen-input change, landed on main"
+git -C "$WORK" rebase --quiet origin/main >/dev/null 2>&1
+check "the rebased branch still has its pre-rebase upstream" "origin/feature" \
+    "$(git -C "$WORK" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null)"
+decide
+check "a rebased push is measured from the default branch, not its upstream" "origin/main" "$ATTRIBUTION_BASE_REF"
+check "  so main's own commits are not the push's: PRE-EXISTING" "pre-existing" "$ATTRIBUTION_STATE"
+check "  and nothing is listed as touched" "" "$ATTRIBUTION_TOUCHED"
+
+# The default branch is resolved by FULL refname. A short `origin/main`
+# resolves refs/heads/origin/main before refs/remotes/origin/main, so a
+# local branch named `origin/main` would otherwise become the base. Pointed at
+# the root commit here, it would make main's later codegen change read as the
+# push's.
+fixture
+seed_main_only "src-tauri/src/lib.rs" "// main moved after the root"
+git -C "$WORK" reset --hard --quiet origin/main
+# No origin/HEAD, so the cascade reaches its literal origin/main candidate:
+# the one a short refname would let the local branch shadow.
+git -C "$WORK" symbolic-ref --delete refs/remotes/origin/HEAD >/dev/null 2>&1
+git -C "$WORK" branch --quiet origin/main "$(git -C "$WORK" rev-list --max-parents=0 HEAD)" 2>/dev/null
+commit_change "src/app.ts" "// frontend only"
+decide
+check "a local branch named origin/main does not shadow the remote one" "pre-existing" "$ATTRIBUTION_STATE"
+check "  and the base reads origin/main" "origin/main" "$ATTRIBUTION_BASE_REF"
+check "  measured at the real remote-tracking ref" \
+    "$(git -C "$WORK" merge-base HEAD refs/remotes/origin/main)" "$ATTRIBUTION_BASE_SHA"
+
+# The upstream is still the LAST resort: no origin/HEAD and no origin/main.
+fixture
+git -C "$WORK" checkout --quiet -b feature
+commit_change "src/app.ts" "// ui"
+git -C "$WORK" push --quiet -u origin feature 2>/dev/null
+git -C "$WORK" symbolic-ref --delete refs/remotes/origin/HEAD >/dev/null 2>&1
+git -C "$WORK" update-ref -d refs/remotes/origin/main
+decide
+check "with no default branch at all, the upstream is the base" "origin/feature" "$ATTRIBUTION_BASE_REF"
 
 echo "  -- a hook environment must not redirect the fixtures --"
 
@@ -1369,9 +1425,24 @@ index_hook_fixture() {
     fi
     # git puts its own exec-path first on a hook's PATH, so a shim on the
     # committer's PATH never reaches the hook; HOOK_PATH_PREFIX re-adds one.
+    #
+    # On Windows the value does not arrive as it was set. Git for Windows is a
+    # native program, and Git Bash rewrites a path-looking environment value on
+    # the way into one (`/tmp/x` -> `C:/Users/.../Temp/x`). Prepended as-is, the
+    # drive letter's colon splits PATH into `C` and `/Users/...`, the shim is
+    # never found, and a case that needs it reads as if the code under test
+    # were wrong (coord finding 34148bb3). `cygpath -u` turns it back.
     cat > "$hooks/pre-commit" <<HOOK
 #!/usr/bin/env bash
-[ -z "\${HOOK_PATH_PREFIX:-}" ] || PATH="\$HOOK_PATH_PREFIX:\$PATH"
+if [ -n "\${HOOK_PATH_PREFIX:-}" ]; then
+    case "\$HOOK_PATH_PREFIX" in
+        [A-Za-z]:[/\\\\]*)
+            if command -v cygpath >/dev/null 2>&1; then
+                HOOK_PATH_PREFIX="\$(cygpath -u "\$HOOK_PATH_PREFIX")"
+            fi ;;
+    esac
+    PATH="\$HOOK_PATH_PREFIX:\$PATH"
+fi
 . "$SCRIPT_DIR/lib/gen-events-attribution.sh"
 gen_events_clear_inherited_git_env
 printf '%s\n' "\$GEN_EVENTS_HOOK_INDEX_FILE" > "$WORK/.hook-index"
@@ -1533,30 +1604,63 @@ echo "  -- odd file names are shown as themselves --"
 
 # git C-quotes non-ASCII, `"` and `\` without `-z`, and the label would then
 # name a file that does not exist.
+#
+# Where the filesystem cannot hold the name, the path goes into the INDEX
+# instead, which holds any byte string on every OS. Windows is the case: NTFS
+# forbids `"` and TAB, and Git Bash does not refuse the write — Cygwin/MSYS
+# stores the name with those characters mapped into the Unicode private-use
+# area (`"` -> U+F022, TAB -> U+F009), so the write succeeds while git, a
+# native program, sees a DIFFERENT name. A `printf > file` probe therefore
+# cannot tell "the filesystem took it" from "the filesystem renamed it"; only
+# asking git can. The property under test — that a `-z` name reaches the label
+# byte-for-byte, never C-quoted — is the same through either source, so the
+# case still runs instead of being skipped (coord finding 34148bb3).
+#
+# Prints the source label the path will carry: `untracked` when git sees the
+# file by its real name, `staged` when it had to go through the index.
+odd_path() {
+    local rel="$1" body="$2" blob listing=""
+    # The same listing the library's `untracked` source makes
+    # (`--exclude-standard`), captured whole rather than piped into `grep -q`,
+    # whose early exit could fail the pipeline under pipefail.
+    if printf '%s\n' "$body" > "$WORK/$rel" 2>/dev/null; then
+        listing="$(git -C "$WORK" ls-files --others --exclude-standard -z -- 'src-tauri/src' 2>/dev/null | tr '\0' '\n')"
+    fi
+    if grep -qxF -- "$rel" <<<"$listing"; then
+        printf 'untracked'
+        return 0
+    fi
+    # Whatever the filesystem did store is not the name under test; remove it
+    # (the same spelling maps to the same stored name) so git cannot report it
+    # as an extra untracked input.
+    rm -f "$WORK/$rel" 2>/dev/null || true
+    blob="$(printf '%s\n' "$body" | git -C "$WORK" hash-object -w --stdin)" || return 1
+    # Git for Windows refuses such a path into the index too ("Invalid path")
+    # under its default core.protectNTFS, which guards CHECKOUTS from names
+    # NTFS cannot hold. Nothing is ever checked out here, so lift it for this
+    # one call; the reads the library makes accept the entry as-is.
+    git -C "$WORK" -c core.protectNTFS=false update-index --add --cacheinfo "100644,$blob,$rel" || return 1
+    printf 'staged'
+}
+
 fixture
 ODD_E='src-tauri/src/é b.rs'
 ODD_Q='src-tauri/src/q"t.rs'
+ODD_T="src-tauri/src/a"$'\t'"b.rs"
 printf '// e\n' > "$WORK/$ODD_E"
-printf '// q\n' > "$WORK/$ODD_Q"
-ODD_T=""
-if printf '// t\n' > "$WORK/src-tauri/src/a"$'\t'"b.rs" 2>/dev/null; then
-    ODD_T="src-tauri/src/a"$'\t'"b.rs"
-fi
+ODD_Q_SRC="$(odd_path "$ODD_Q" '// q')"
+ODD_T_SRC="$(odd_path "$ODD_T" '// t')"
 decide
 check "odd names are MINE" "mine" "$ATTRIBUTION_STATE"
 check "  é b.rs is labelled by its real name" yes \
     "$(grep -qxF "$ODD_E"$'\t'"untracked" <<< "$ATTRIBUTION_TOUCHED_DETAIL" && echo yes || echo no)"
-check "  q\"t.rs is labelled by its real name" yes \
-    "$(grep -qxF "$ODD_Q"$'\t'"untracked" <<< "$ATTRIBUTION_TOUCHED_DETAIL" && echo yes || echo no)"
-if [ -n "$ODD_T" ]; then
-    ODD_T_SHOWN="$(printf '%q' "$ODD_T")"
-    check "  a tab-named file is kept, in its %q form" yes \
-        "$(grep -qxF "$ODD_T_SHOWN"$'\t'"untracked" <<< "$ATTRIBUTION_TOUCHED_DETAIL" && echo yes || echo no)"
-    check "  and counted in the flat list" yes \
-        "$(grep -qxF "$ODD_T_SHOWN" <<< "$ATTRIBUTION_TOUCHED" && echo yes || echo no)"
-else
-    skip_note "tab-named file: this filesystem refuses a tab in a file name"
-fi
+check "  q\"t.rs is labelled by its real name ($ODD_Q_SRC)" yes \
+    "$(grep -qxF "$ODD_Q"$'\t'"${ODD_Q_SRC:-none}" <<< "$ATTRIBUTION_TOUCHED_DETAIL" && echo yes || echo no)"
+ODD_T_SHOWN="$(printf '%q' "$ODD_T")"
+check "  a tab-named file is kept, in its %q form ($ODD_T_SRC)" yes \
+    "$(grep -qxF "$ODD_T_SHOWN"$'\t'"${ODD_T_SRC:-none}" <<< "$ATTRIBUTION_TOUCHED_DETAIL" && echo yes || echo no)"
+check "  and counted in the flat list" yes \
+    "$(grep -qxF "$ODD_T_SHOWN" <<< "$ATTRIBUTION_TOUCHED" && echo yes || echo no)"
 RENDERED="$(gen_events_render_mine)"
 check "  the message shows é b.rs raw" yes \
     "$(grep -qF "    $ODD_E  (untracked" <<< "$RENDERED" && echo yes || echo no)"

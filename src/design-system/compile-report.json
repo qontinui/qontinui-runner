@@ -1,0 +1,604 @@
+{
+  "schema": 1,
+  "name": "qontinui-runner",
+  "groups": {
+    "color": {
+      "state": "resolved",
+      "leaves": 52,
+      "counts": {
+        "declared": 0,
+        "resolved": 52,
+        "authored": 0,
+        "derived": 0,
+        "undeclared": 0
+      }
+    },
+    "type": {
+      "state": "mixed",
+      "leaves": 28,
+      "counts": {
+        "declared": 0,
+        "resolved": 6,
+        "authored": 21,
+        "derived": 0,
+        "undeclared": 1
+      }
+    },
+    "space": {
+      "state": "authored",
+      "leaves": 20,
+      "counts": {
+        "declared": 0,
+        "resolved": 0,
+        "authored": 13,
+        "derived": 7,
+        "undeclared": 0
+      }
+    },
+    "layout": {
+      "state": "authored",
+      "leaves": 5,
+      "counts": {
+        "declared": 0,
+        "resolved": 0,
+        "authored": 5,
+        "derived": 0,
+        "undeclared": 0
+      }
+    },
+    "motion": {
+      "state": "resolved",
+      "leaves": 15,
+      "counts": {
+        "declared": 0,
+        "resolved": 15,
+        "authored": 0,
+        "derived": 0,
+        "undeclared": 0
+      }
+    },
+    "states": {
+      "state": "authored",
+      "leaves": 1,
+      "counts": {
+        "declared": 0,
+        "resolved": 0,
+        "authored": 1,
+        "derived": 0,
+        "undeclared": 0
+      }
+    },
+    "budgets": {
+      "state": "authored",
+      "leaves": 2,
+      "counts": {
+        "declared": 0,
+        "resolved": 0,
+        "authored": 2,
+        "derived": 0,
+        "undeclared": 0
+      }
+    },
+    "thresholds": {
+      "state": "undeclared",
+      "leaves": 0,
+      "counts": {
+        "declared": 0,
+        "resolved": 0,
+        "authored": 0,
+        "derived": 0,
+        "undeclared": 0
+      }
+    },
+    "imagery": {
+      "state": "undeclared",
+      "leaves": 0,
+      "counts": {
+        "declared": 0,
+        "resolved": 0,
+        "authored": 0,
+        "derived": 0,
+        "undeclared": 0
+      }
+    },
+    "exceptions": {
+      "state": "undeclared",
+      "leaves": 0,
+      "counts": {
+        "declared": 0,
+        "resolved": 0,
+        "authored": 0,
+        "derived": 0,
+        "undeclared": 0
+      }
+    }
+  },
+  "identity": {
+    "state": "undeclared",
+    "system_fallbacks": [
+      "color.role.accent",
+      "color.role.accent-active",
+      "color.role.accent-hover",
+      "color.role.accent-text",
+      "color.role.border",
+      "color.role.control",
+      "color.role.control-active",
+      "color.role.control-hover",
+      "color.role.control-text",
+      "color.role.field",
+      "color.role.field-text",
+      "color.role.link",
+      "color.role.muted",
+      "color.role.surface",
+      "color.role.surface-active",
+      "color.role.surface-hover",
+      "color.role.text",
+      "type.family.mono",
+      "type.family.sans"
+    ]
+  },
+  "undeclared": [
+    {
+      "path": "color.role.accent",
+      "reason": "identity role not stated or imported; renders as a platform keyword"
+    },
+    {
+      "path": "color.role.accent-text",
+      "reason": "identity role not stated or imported; renders as a platform keyword"
+    },
+    {
+      "path": "color.role.border",
+      "reason": "identity role not stated or imported; renders as a platform keyword"
+    },
+    {
+      "path": "color.role.control",
+      "reason": "identity role not stated or imported; renders as a platform keyword"
+    },
+    {
+      "path": "color.role.control-text",
+      "reason": "identity role not stated or imported; renders as a platform keyword"
+    },
+    {
+      "path": "color.role.field",
+      "reason": "identity role not stated or imported; renders as a platform keyword"
+    },
+    {
+      "path": "color.role.field-text",
+      "reason": "identity role not stated or imported; renders as a platform keyword"
+    },
+    {
+      "path": "color.role.link",
+      "reason": "identity role not stated or imported; renders as a platform keyword"
+    },
+    {
+      "path": "color.role.muted",
+      "reason": "identity role not stated or imported; renders as a platform keyword"
+    },
+    {
+      "path": "color.role.surface",
+      "reason": "identity role not stated or imported; renders as a platform keyword"
+    },
+    {
+      "path": "color.role.text",
+      "reason": "identity role not stated or imported; renders as a platform keyword"
+    },
+    {
+      "path": "type.family.mono",
+      "reason": "identity role not stated or imported; renders as a platform keyword"
+    },
+    {
+      "path": "type.family.sans",
+      "reason": "stated undeclared in the source"
+    }
+  ],
+  "unverified_provenance": [],
+  "resolved_from": [
+    {
+      "package": "@qontinui/design-tokens",
+      "ref": "415be4535ac4deae2201ed4601084b4a948eef10",
+      "version": "1.3.0",
+      "sha": "415be4535ac4deae2201ed4601084b4a948eef10",
+      "label": "@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10"
+    }
+  ],
+  "resolved_leaves": [
+    {
+      "path": "color.attention.attention.accent",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.attention.attention.bg",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.attention.attention.border",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.attention.attention.fg",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.attention.done.bg",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.attention.done.border",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.attention.done.fg",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.attention.done.subtleBg",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.attention.done.subtleBorder",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.attention.done.subtleFg",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.attention.inert.bg",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.attention.inert.border",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.attention.inert.fg",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.attention.landing.bg",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.attention.landing.border",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.attention.landing.fg",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.attention.running.bg",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.attention.running.border",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.attention.running.fg",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.attention.testing.bg",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.attention.testing.border",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.attention.testing.fg",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.attention.waiting.accent",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.attention.waiting.bg",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.attention.waiting.border",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.attention.waiting.fg",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.border.default",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.border.interactive",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.border.strong",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.border.subtle",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.brand.primary",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.brand.secondary",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.brand.success",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.glow.primary",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.glow.secondary",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.glow.success",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.semantic.error",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.semantic.errorMuted",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.semantic.info",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.semantic.infoMuted",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.semantic.success",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.semantic.successMuted",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.semantic.warning",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.semantic.warningMuted",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.surface.active",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.surface.canvas",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.surface.hover",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.surface.raised",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.text.inverse",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.text.muted",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.text.primary",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "color.text.secondary",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "motion.duration.base",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "motion.duration.deliberate",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "motion.duration.fast",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "motion.duration.instant",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "motion.duration.slow",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "motion.easing.enter",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "motion.easing.exit",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "motion.easing.linear",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "motion.easing.standard",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "motion.reduced.autoplay",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "motion.reduced.cssDuration",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "motion.reduced.duration",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "motion.reduced.mediaQuery",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "motion.reduced.playControl",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "motion.reduced.showPosterFrame",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "type.scale.body",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "type.scale.caption",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "type.scale.counter",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "type.scale.display",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "type.scale.label",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    },
+    {
+      "path": "type.scale.title",
+      "source": "resolved(@qontinui/design-tokens@415be4535ac4deae2201ed4601084b4a948eef10)"
+    }
+  ],
+  "derived": [
+    {
+      "path": "space.scale.lg",
+      "rule": "spacing-multiple",
+      "inputs": {
+        "rule": "spacing-multiple",
+        "base": 4,
+        "multiple": 4,
+        "unit": "px"
+      }
+    },
+    {
+      "path": "space.scale.md",
+      "rule": "spacing-multiple",
+      "inputs": {
+        "rule": "spacing-multiple",
+        "base": 4,
+        "multiple": 3,
+        "unit": "px"
+      }
+    },
+    {
+      "path": "space.scale.sm",
+      "rule": "spacing-multiple",
+      "inputs": {
+        "rule": "spacing-multiple",
+        "base": 4,
+        "multiple": 2,
+        "unit": "px"
+      }
+    },
+    {
+      "path": "space.scale.xl",
+      "rule": "spacing-multiple",
+      "inputs": {
+        "rule": "spacing-multiple",
+        "base": 4,
+        "multiple": 6,
+        "unit": "px"
+      }
+    },
+    {
+      "path": "space.scale.xs",
+      "rule": "spacing-multiple",
+      "inputs": {
+        "rule": "spacing-multiple",
+        "base": 4,
+        "multiple": 1,
+        "unit": "px"
+      }
+    },
+    {
+      "path": "space.scale.xxl",
+      "rule": "spacing-multiple",
+      "inputs": {
+        "rule": "spacing-multiple",
+        "base": 4,
+        "multiple": 8,
+        "unit": "px"
+      }
+    },
+    {
+      "path": "space.scale.xxxl",
+      "rule": "spacing-multiple",
+      "inputs": {
+        "rule": "spacing-multiple",
+        "base": 4,
+        "multiple": 12,
+        "unit": "px"
+      }
+    }
+  ],
+  "imports_shadowed": [],
+  "out_of_band": [
+    {
+      "path": "motion.duration.deliberate",
+      "check": "motion-duration",
+      "value": 900,
+      "band": "100..300 ms"
+    },
+    {
+      "path": "motion.duration.slow",
+      "check": "motion-duration",
+      "value": 600,
+      "band": "100..300 ms"
+    },
+    {
+      "path": "type.leading.body",
+      "check": "line-height",
+      "value": 1.5,
+      "band": "1.2..1.45 ratio"
+    },
+    {
+      "path": "type.leading.none",
+      "check": "line-height",
+      "value": 1,
+      "band": "1.2..1.45 ratio"
+    },
+    {
+      "path": "type.leading.relaxed",
+      "check": "line-height",
+      "value": 1.625,
+      "band": "1.2..1.45 ratio"
+    }
+  ],
+  "next_undeclared_group": "thresholds"
+}

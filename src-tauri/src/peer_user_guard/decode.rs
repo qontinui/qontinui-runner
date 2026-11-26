@@ -135,6 +135,44 @@ pub struct WinRow {
 /// `MIB_TCP_STATE_TIME_WAIT`.
 pub const WIN_STATE_TIME_WAIT: u32 = 11;
 
+/// `MIB_TCP_STATE_LISTEN`.
+pub const WIN_STATE_LISTEN: u32 = 2;
+
+/// The PID owning a LISTENING socket on local `port` among `rows` (a
+/// listener-class table read), skipping rows with no owning process. Used by
+/// the runner's process table for a managed process's health-port owner.
+pub fn listener_owner_pid<I: IntoIterator<Item = WinRow>>(rows: I, port: u16) -> Option<u32> {
+    rows.into_iter()
+        .find(|r| r.state == WIN_STATE_LISTEN && r.local.port() == port && r.pid > 0)
+        .map(|r| r.pid)
+}
+
+/// A LISTENING socket's owning pid and the socket's own creation time, as the
+/// owner-MODULE table class reports it (`liCreateTimestamp`, a FILETIME in the
+/// same domain as a process's creation time; `0` = not reported).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListenerOwner {
+    pub pid: u32,
+    pub bind_ft: u64,
+}
+
+/// [`listener_owner_pid`] over owner-MODULE rows, which also carry the
+/// socket's creation time: the same row selection, with `bind_ft` from the
+/// row (a negative `liCreateTimestamp` reads as `0`, not reported). Used by
+/// the runner's port kill to prove that the process now holding the owner
+/// pid existed when the socket was created.
+pub fn listener_owner<I: IntoIterator<Item = (WinRow, i64)>>(
+    rows: I,
+    port: u16,
+) -> Option<ListenerOwner> {
+    rows.into_iter()
+        .find(|(r, _)| r.state == WIN_STATE_LISTEN && r.local.port() == port && r.pid > 0)
+        .map(|(r, created)| ListenerOwner {
+            pid: r.pid,
+            bind_ft: u64::try_from(created).unwrap_or(0),
+        })
+}
+
 /// The PID owning the peer end of `peer → local` among `rows`.
 pub fn owner_pid<I: IntoIterator<Item = WinRow>>(
     rows: I,

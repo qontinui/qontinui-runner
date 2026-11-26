@@ -89,12 +89,19 @@ pub struct VerificationIteration {
     pub passed: u32,
     pub failed: u32,
     pub total: u32,
-    /// `"PASSED"` or `"FAILED"` — the literal status from the marker line.
-    /// None if we found a `=== Verification-Agentic Loop: Iteration N ===`
-    /// header but never the corresponding `--- Verification (Iteration N): ...`
-    /// summary (e.g. iteration is still in flight).
+    /// The literal verdict word from the summary line: `"PASSED"`, `"FAILED"`,
+    /// `"CRITICAL FAILURE"` or `"NOTHING CHECKED (no required verification
+    /// step)"` (`evaluate_verification::verdict_label`). None if we found a
+    /// `=== Verification-Agentic Loop: Iteration N ===` header but never the
+    /// corresponding `--- Verification (Iteration N): ...` summary (e.g. the
+    /// iteration is still in flight).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<String>,
+    /// How many step results counted toward the verdict (the line's
+    /// `N required`). Zero means nothing was checked. None for a summary line
+    /// written before the count existed, or when no summary was found.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required: Option<u32>,
 }
 
 /// Top-level structured-output response body.
@@ -142,9 +149,13 @@ static RE_VERIFICATION_HEADER: Lazy<Regex> = Lazy::new(|| {
         .expect("verification header regex compiles")
 });
 
+/// Every summary line `evaluate_verification::verification_summary_line`
+/// writes, whatever its verdict word, and the shape older runs recorded (no
+/// `N required`). Group 1: iteration, 2: verdict word, 3-5: passed, failed,
+/// total, 6: required (absent on an older line).
 static RE_VERIFICATION_SUMMARY: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r"--- Verification \(Iteration (\d+)\): (PASSED|FAILED) \((\d+) passed, (\d+) failed, (\d+) total\) ---",
+        r"--- Verification \(Iteration (\d+)\): (.+?) \((\d+) passed, (\d+) failed, (\d+) total(?:, (\d+) required)?\) ---",
     )
     .expect("verification summary regex compiles")
 });
@@ -223,6 +234,7 @@ pub fn parse_structured_output(raw: &str) -> StructuredOutput {
             failed: 0,
             total: 0,
             details: None,
+            required: None,
         });
     }
 
@@ -246,6 +258,7 @@ pub fn parse_structured_output(raw: &str) -> StructuredOutput {
             .get(5)
             .and_then(|m| m.as_str().parse::<u32>().ok())
             .unwrap_or(0);
+        let required = cap.get(6).and_then(|m| m.as_str().parse::<u32>().ok());
 
         if let Some(it) = verification_iterations
             .iter_mut()
@@ -255,6 +268,7 @@ pub fn parse_structured_output(raw: &str) -> StructuredOutput {
             it.failed = failed;
             it.total = total;
             it.details = status;
+            it.required = required;
         } else {
             // Summary without a header — surface anyway so callers see it.
             verification_iterations.push(VerificationIteration {
@@ -263,6 +277,7 @@ pub fn parse_structured_output(raw: &str) -> StructuredOutput {
                 failed,
                 total,
                 details: status,
+                required,
             });
         }
     }
@@ -562,7 +577,8 @@ mod tests {
         //  - loop_controller.rs:970   "\n--- Stage {} Setup ---\nSteps: {}\nSuccess: {}\n"
         //  - loop_controller.rs:977   "  [{}] {} - {} ({}ms)\n"
         //  - loop_handlers.rs:491     "\n\n=== Verification-Agentic Loop: Iteration {} ===\n"
-        //  - loop_handlers.rs:887     "\n--- Verification (Iteration {}): {} ({} passed, {} failed, {} total) ---\n"
+        //  - the summary line comes from the emitter itself,
+        //    evaluate_verification::verification_summary_line
         let raw = "\n\n============================================================\n\
             === STAGE 1/1: \"Use the test-wrapper\" ===\n\
             ============================================================\n\
@@ -572,10 +588,11 @@ mod tests {
             Steps: 1\n\
             Success: true\n\
             \x20\x20[OK] prompt - Use the test-wrapper (1234ms)\n\
-            \n\n=== Verification-Agentic Loop: Iteration 1 ===\n\
-            \n--- Verification (Iteration 1): PASSED (3 passed, 0 failed, 3 total) ---\n";
+            \n\n=== Verification-Agentic Loop: Iteration 1 ===\n"
+            .to_string()
+            + &crate::unified_workflow_executor::verification_summary_line(1, "PASSED", 3, 0, 3, 3);
 
-        let parsed = parse_structured_output(raw);
+        let parsed = parse_structured_output(&raw);
         assert_eq!(
             parsed.stages.len(),
             1,
@@ -610,6 +627,46 @@ mod tests {
         assert_eq!(it.failed, 0);
         assert_eq!(it.total, 3);
         assert_eq!(it.details.as_deref(), Some("PASSED"));
+        assert_eq!(it.required, Some(3));
+    }
+
+    /// Every verdict the handler writes parses back, the nothing-checked one
+    /// included: the fixture is the emitter's own line for each verdict word.
+    #[test]
+    fn every_summary_line_the_handler_writes_parses_back() {
+        use crate::unified_workflow_executor::{every_verdict_label, verification_summary_line};
+        let labels = every_verdict_label();
+        assert!(labels.contains(&"NOTHING CHECKED (no required verification step)"));
+        assert!(labels.contains(&"CRITICAL FAILURE"));
+        for (i, label) in labels.iter().enumerate() {
+            let iteration = i as u32 + 1;
+            let raw = format!(
+                "\n\n=== Verification-Agentic Loop: Iteration {iteration} ===\n{}",
+                verification_summary_line(iteration, label, 2, 1, 4, 3)
+            );
+            let parsed = parse_structured_output(&raw);
+            assert_eq!(parsed.verification_iterations.len(), 1, "{label}");
+            let it = &parsed.verification_iterations[0];
+            assert_eq!(
+                (it.iteration, it.passed, it.failed, it.total, it.required),
+                (iteration, 2, 1, 4, Some(3)),
+                "{label}"
+            );
+            assert_eq!(it.details.as_deref(), Some(*label));
+        }
+    }
+
+    /// A run recorded before the summary line carried its required count still
+    /// parses, with the count absent rather than zero.
+    #[test]
+    fn a_summary_line_without_a_required_count_still_parses() {
+        let raw = "\n--- Verification (Iteration 2): FAILED (1 passed, 2 failed, 3 total) ---\n";
+        let parsed = parse_structured_output(raw);
+        assert_eq!(parsed.verification_iterations.len(), 1);
+        let it = &parsed.verification_iterations[0];
+        assert_eq!((it.iteration, it.passed, it.failed, it.total), (2, 1, 2, 3));
+        assert_eq!(it.details.as_deref(), Some("FAILED"));
+        assert_eq!(it.required, None);
     }
 
     /// Issue 1, test (3): malformed JSON inside the AI Setup Output body
