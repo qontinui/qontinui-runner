@@ -66,16 +66,13 @@ fn hit(line: &str) -> Option<&'static str> {
     let code = line.split("//").next().unwrap_or(line);
     let bytes = code.as_bytes();
     for tok in TOKENS {
-        let mut from = 0;
-        while let Some(i) = code[from..].find(tok) {
-            let s = from + i;
+        for (s, _) in code.match_indices(tok) {
             let e = s + tok.len();
             let before = s == 0 || !is_ident(bytes[s - 1]);
             let after = e >= bytes.len() || !is_ident(bytes[e]);
             if before && after {
                 return Some(tok);
             }
-            from = e;
         }
     }
     None
