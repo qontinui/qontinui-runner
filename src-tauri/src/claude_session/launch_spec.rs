@@ -1710,16 +1710,15 @@ mod tests {
         assert_eq!(argv.iter().filter(|a| *a == "--model").count(), 1);
     }
 
-    /// The attached spelling is the template's model too: dropped under a spec
-    /// model (never a second, last-wins `--model=`), kept as the model when
-    /// the spec names none.
     /// A spec effort renders exactly one `--effort`, dropping a template's in
     /// either spelling; with no spec effort the template's stands.
     #[test]
     fn spec_effort_beats_a_template_effort_in_either_spelling() {
         for template in ["claude --effort low", "claude --effort=low"] {
-            let mut s = LaunchSpec::default();
-            s.effort = Some("high".to_string());
+            let s = LaunchSpec {
+                effort: Some("high".to_string()),
+                ..Default::default()
+            };
             let argv = render_argv(&s, &tmpl(template), "claude");
             assert_eq!(value_after(&argv, "--effort"), Some("high"));
             assert_eq!(argv.iter().filter(|a| a.starts_with("--effort")).count(), 1);
@@ -1731,6 +1730,10 @@ mod tests {
         );
         assert_eq!(value_after(&argv, "--effort"), Some("low"));
     }
+
+    /// The attached spelling is the template's model too: dropped under a spec
+    /// model (never a second, last-wins `--model=`), kept as the model when
+    /// the spec names none.
 
     #[test]
     fn spec_model_beats_an_attached_template_model() {
