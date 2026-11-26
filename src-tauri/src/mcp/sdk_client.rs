@@ -4014,7 +4014,7 @@ async fn handle_page_navigate_dispatch(
                             "error_detail": {
                                 "code": "INVALID_REQUEST",
                                 "message": message,
-                                "recovery": "UNRECOVERABLE",
+                                "recovery": {"kind": "fix_request"},
                                 "context": {
                                     "code": "INVALID_REQUEST",
                                     "url": url,
@@ -4818,7 +4818,7 @@ async fn handle_delete_cached_specs(
 // Design Review Handlers
 // =============================================================================
 
-/// GET /ui-bridge/sdk/design/element/:id/styles — Extended computed styles for one element
+/// GET /ui-bridge/sdk/design/element/:id/styles — `ElementDesignData` for one element: extended computed styles, its own custom properties, token scopes, per-property token attribution (`tokenMatches`: `derived` / `overridden` / `unverified` / `matches` / `inherited`), pseudo-elements, plus the page's root tokens (`tokens`), `scopes` and `tokenCoverage`
 async fn handle_design_element_styles(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
@@ -4868,7 +4868,7 @@ async fn handle_design_element_state_styles(
     }
 }
 
-/// POST /ui-bridge/sdk/design/snapshot — Design data for all/filtered elements
+/// POST /ui-bridge/sdk/design/snapshot — Design data for all/filtered elements, bounded by `limit` (default 250) and reported (`totalElements`, `returned`, `truncated`); the page's root design tokens and theme scopes once (`tokens`, `scopes`), per element only `tokenScopes` and `tokenMatches`
 async fn handle_design_snapshot(
     State(state): State<Arc<ApiState>>,
     body: Option<Json<serde_json::Value>>,
@@ -4890,7 +4890,7 @@ async fn handle_design_snapshot(
     }
 }
 
-/// POST /ui-bridge/sdk/design/responsive — Snapshots at multiple viewports
+/// POST /ui-bridge/sdk/design/responsive — Snapshots at constrained root widths; `method: 'document-width-constraint'`, `mediaQueriesReevaluated: false` (`@media` width queries do not switch)
 async fn handle_design_responsive(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
@@ -4931,7 +4931,7 @@ async fn handle_set_viewport_constraints(
     }
 }
 
-/// POST /ui-bridge/sdk/design/audit — Run style audit against style guide
+/// POST /ui-bridge/sdk/design/audit — Style audit against the provided or loaded guide (`mode: 'style-guide'`), else built-in heuristics (`mode: 'heuristic'`)
 async fn handle_design_audit(
     State(state): State<Arc<ApiState>>,
     body: Option<Json<serde_json::Value>>,

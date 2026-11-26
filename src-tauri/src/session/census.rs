@@ -66,7 +66,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use tracing::{debug, info, warn};
 
@@ -106,6 +106,13 @@ pub struct CensusRow {
     /// ancestor? `None` = not read (non-Linux) or unreadable mid-walk.
     #[serde(skip)]
     pub runner_ancestor: Option<bool>,
+    /// Where THIS runner shows the session — `terminal_id`, `page_id`,
+    /// `page_name`, `page_window`, flattened into the row — for a
+    /// `runner_hosted` row whose terminal is here; absent otherwise
+    /// ([`crate::session_placement`], plan
+    /// `2026-11-16-runner-page-name-reaches-the-coord-session-identity-card`).
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<crate::session_placement::Placement>,
 }
 
 /// The whole-device snapshot body.
@@ -122,16 +129,10 @@ pub struct CensusSnapshot {
 /// implementation, shared with the session-identity reporter.
 pub use super::identity_stamp::{account_label, is_uuid_shaped};
 
-/// Epoch milliseconds → RFC 3339, `None` for a non-positive or out-of-range
-/// value (a registry row that omitted the field parses as `0`).
-fn ms_to_rfc3339(ms: i64) -> Option<String> {
-    if ms <= 0 {
-        return None;
-    }
-    Utc.timestamp_millis_opt(ms)
-        .single()
-        .map(|t| t.to_rfc3339())
-}
+// The timestamp spelling (RFC 3339, millis, `Z`) — shared with the
+// session-identity reporter so the two producers of coord's session rows
+// never disagree on the same instant.
+use super::identity_stamp::{ms_to_rfc3339, rfc3339};
 
 // ===========================================================================
 // last_acted_at — the last turn line's own timestamp
@@ -452,10 +453,13 @@ fn row_from(config_dir: &Path, s: &LiveClaudeSession, probes: &Probes<'_>) -> Ce
         // `statusUpdatedAt` (weaker — it moves on status changes only); else
         // null.
         last_acted_at: last_acted_at(config_dir, &s.session_id)
-            .map(|t| t.to_rfc3339())
+            .map(rfc3339)
             .or_else(|| s.status_updated_at.and_then(ms_to_rfc3339)),
         runner_hosted: (probes.is_runner_hosted)(&s.session_id) || runner_ancestor == Some(true),
         runner_ancestor,
+        // Filled after the build, from the terminal layout
+        // (`session_placement::apply_placements`).
+        placement: None,
     }
 }
 
@@ -507,7 +511,7 @@ pub fn build_snapshot(
     // the (session_id, pid) primary key on coord's side must never collide.
     sessions.dedup_by(|a, b| a.session_id == b.session_id && a.pid == b.pid);
     Ok(CensusSnapshot {
-        observed_at: observed_at.to_rfc3339(),
+        observed_at: rfc3339(observed_at),
         runner_build,
         account_homes: config_dirs.len(),
         sessions,
@@ -658,8 +662,17 @@ async fn publisher_loop(app: tauri::AppHandle) {
     let mut last: Option<PostState> = None;
     let mut ticker = tokio::time::interval(CENSUS_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let early = crate::session_placement::early_post();
     loop {
-        ticker.tick().await;
+        // The interval, or an early post a rename / move / pop-out / bind /
+        // close asked for (debounced; `session_placement`). Posts run one at a
+        // time here, which is what makes early posts single-flight.
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = early.wait() => {}
+        }
+        // Whichever arm won, this post answers every request made so far.
+        early.clear();
         let state = tick(&app, client.as_ref()).await;
         if last.as_ref() != Some(&state) {
             log_transition(&state);
@@ -714,6 +727,7 @@ struct HostedSubstrate {
     sessions: Option<Arc<crate::claude_session::SessionManager>>,
     registrar: Option<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>,
     lifecycle: Option<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>,
+    terminals: Option<Arc<crate::terminal::TerminalManager>>,
 }
 
 impl HostedSubstrate {
@@ -729,7 +743,28 @@ impl HostedSubstrate {
             lifecycle: app
                 .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
                 .map(|s| s.inner().clone()),
+            terminals: app
+                .try_state::<Arc<crate::terminal::TerminalManager>>()
+                .map(|s| s.inner().clone()),
         }
+    }
+
+    /// Every confirmed session's placement on THIS runner, through the layout
+    /// join (`session_placement::placements_by_session`). Empty before the
+    /// terminal manager is up.
+    fn placements(&self) -> std::collections::HashMap<String, crate::session_placement::Placement> {
+        let Some(terminals) = &self.terminals else {
+            return std::collections::HashMap::new();
+        };
+        let joined = crate::terminal::layout::join_terminals(
+            terminals.list(),
+            self.lifecycle.as_deref(),
+            |_| None,
+        );
+        crate::session_placement::placements_by_session(
+            joined,
+            &crate::terminal::layout::page_labels().snapshot(),
+        )
     }
 
     fn hosts(&self, id: &str) -> bool {
@@ -765,7 +800,7 @@ async fn tick(app: &tauri::AppHandle, client: Option<&reqwest::Client>) -> PostS
     let built = qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
         let hosted = |id: &str| substrate.hosts(id);
         let may_host = super::claude_session_registry::may_host_claude(&snap);
-        build_snapshot(
+        let mut built = build_snapshot(
             &crate::terminal::transcript::find_claude_config_dirs(),
             &live_pids,
             Utc::now(),
@@ -776,7 +811,14 @@ async fn tick(app: &tauri::AppHandle, client: Option<&reqwest::Client>) -> PostS
                 is_runner_hosted: &hosted,
                 may_host_claude: &may_host,
             },
-        )
+        );
+        if let Ok(snapshot) = built.as_mut() {
+            crate::session_placement::apply_placements(
+                &mut snapshot.sessions,
+                &substrate.placements(),
+            );
+        }
+        built
     })
     .await;
     let snapshot = match built {
@@ -793,6 +835,9 @@ async fn tick(app: &tauri::AppHandle, client: Option<&reqwest::Client>) -> PostS
         }
     };
     remember(&snapshot, taken);
+    // A complete read ends any incomplete-read episode, so a recurrence of
+    // the same detail is named again rather than swallowed by the de-dupe.
+    reset_incomplete_log();
     debug!(
         rows = snapshot.sessions.len(),
         homes = snapshot.account_homes,
@@ -872,22 +917,37 @@ fn is_quiet(state: &PostState) -> bool {
     )
 }
 
+/// The last incomplete-read detail logged; `None` once a complete read ends
+/// the episode ([`reset_incomplete_log`]).
+static LAST_INCOMPLETE: Mutex<Option<String>> = Mutex::new(None);
+
 /// Log an incomplete registry read's detail at info, once per distinct detail
-/// — so a record that stays unreadable is named without a line every tick.
-fn log_incomplete_once(why: &str) {
-    static LAST: Mutex<Option<String>> = Mutex::new(None);
-    let Ok(mut last) = LAST.lock() else {
-        return;
+/// within an episode — so a record that stays unreadable is named without a
+/// line every tick. Returns whether it logged.
+fn log_incomplete_once(why: &str) -> bool {
+    let Ok(mut last) = LAST_INCOMPLETE.lock() else {
+        return false;
     };
-    if last.as_deref() != Some(why) {
-        info!("session census: {why}");
-        *last = Some(why.to_string());
+    if last.as_deref() == Some(why) {
+        return false;
+    }
+    info!("session census: {why}");
+    *last = Some(why.to_string());
+    true
+}
+
+/// End the incomplete-read episode: the next incomplete read is logged even
+/// when its detail matches the one before the recovery.
+fn reset_incomplete_log() {
+    if let Ok(mut last) = LAST_INCOMPLETE.lock() {
+        *last = None;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use std::fs;
 
     const SID_A: &str = "11111111-1111-4111-8111-111111111111";
@@ -1017,7 +1077,12 @@ mod tests {
 
         assert_eq!(snap.account_homes, 2);
         assert_eq!(snap.runner_build.as_deref(), Some("build-1"));
-        assert_eq!(snap.observed_at, observed.to_rfc3339());
+        assert_eq!(snap.observed_at, rfc3339(observed));
+        assert!(
+            snap.observed_at.ends_with('Z'),
+            "Z-suffixed: {}",
+            snap.observed_at
+        );
         let ids: Vec<&str> = snap
             .sessions
             .iter()
@@ -1043,7 +1108,7 @@ mod tests {
         assert_eq!(ra.tmux_pane.as_deref(), Some("%9"));
         assert_eq!(
             ra.last_acted_at.as_deref(),
-            Some("2026-10-01T06:04:00+00:00"),
+            Some("2026-10-01T06:04:00.000Z"),
             "last turn line's timestamp, never the later summary line"
         );
         assert!(!ra.runner_hosted);
@@ -1109,6 +1174,33 @@ mod tests {
         let live: HashSet<u32> = [100].into_iter().collect();
         let snap = build_snapshot(&[a], &live, Utc::now(), None, &no_probes()).unwrap();
         assert_eq!(snap.sessions[0].last_acted_at, ms_to_rfc3339(1790832214000));
+    }
+
+    #[test]
+    fn census_timestamps_use_the_identity_reporters_spelling() {
+        // Millisecond precision and a `Z` suffix, as identity_stamp posts.
+        assert_eq!(
+            ms_to_rfc3339(1_790_832_214_123).as_deref(),
+            Some("2026-10-01T05:23:34.123Z")
+        );
+        assert_eq!(ms_to_rfc3339(0), None);
+    }
+
+    #[test]
+    fn a_recovered_read_re_arms_the_incomplete_read_log() {
+        // Sole user of LAST_INCOMPLETE in the test binary (tick is not run here).
+        reset_incomplete_log();
+        assert!(log_incomplete_once("registry read incomplete: x"));
+        assert!(
+            !log_incomplete_once("registry read incomplete: x"),
+            "de-duped within an episode"
+        );
+        reset_incomplete_log();
+        assert!(
+            log_incomplete_once("registry read incomplete: x"),
+            "named again after recovery"
+        );
+        reset_incomplete_log();
     }
 
     #[test]
@@ -1495,6 +1587,7 @@ mod tests {
                 last_acted_at: None,
                 runner_hosted: false,
                 runner_ancestor: Some(true),
+                placement: None,
             }],
         };
         let v = serde_json::to_value(&snap).unwrap();

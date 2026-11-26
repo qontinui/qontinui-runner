@@ -32,6 +32,9 @@ vi.mock("@tauri-apps/api/event", () => ({
     listeners.set(event, cb);
     return Promise.resolve(() => {});
   }),
+  // The roster-saved broadcast after each save (`terminalPagesSync`); the
+  // cross-window resync has its own tests (`useTerminalPages.resync.test.tsx`).
+  emit: vi.fn(() => Promise.resolve()),
 }));
 
 import { instanceStorage } from "@/lib/instance-storage";

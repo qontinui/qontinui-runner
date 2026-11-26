@@ -60,8 +60,21 @@
 # guaranteed is narrower, and is exactly this:
 #   1. EXACT ID. When REVIEWDOG_STDERR_LOG names a file holding reviewdog's
 #      stderr and a line there names `check-runs/<id>` (the failing call), only
-#      those ids are candidates, and no listing is made.
-#   2. LISTING, when no id parses: runs named <check_name> on <head_sha>
+#      those ids are candidates, and no listing is made -- unless that stderr
+#      ALSO reports a failed check create, or reviewdog started and did not
+#      return a clean exit status (STEP_RC `unknown` or empty after a start
+#      time, or 128 or more). Either can leave a run whose id no line names: a
+#      posting step that ran reviewdog more than once (rso_run_retrying in
+#      reviewdog-step-outputs.sh) appends every attempt's stderr to one log, so
+#      one attempt's named id can sit beside a LATER attempt that was killed
+#      mid-run, or whose create failed after GitHub had made the run anyway
+#      (a create failure's line carries no id). Then the named runs are
+#      completed FIRST, so their re-reads get the shared sleep budget before
+#      any wait spends it, and the listing below runs as well: it waits, on
+#      what is left of that budget, only for a candidate that is NOT a named
+#      id, and when none appears, or the listing fails, it says so and the
+#      named runs stay completed.
+#   2. LISTING, when no id parses (or as well, as just said): runs named <check_name> on <head_sha>
 #      (`filter=all`, paginated) that belong to app `github-actions` and whose
 #      `started_at` lies in [REVIEWDOG_STARTED_AT - skew, REVIEWDOG_ENDED_AT +
 #      skew]. A run outside that window cannot be this job's. A run INSIDE it
@@ -459,17 +472,176 @@ fi
 
 # --- 1. exact ids from reviewdog's own error lines ---------------------------
 found_by=""
+also_list=""
 : >"$work/runs"
+: >"$work/exact"
 if [ -n "${REVIEWDOG_STDERR_LOG:-}" ] && [ -f "$REVIEWDOG_STDERR_LOG" ]; then
   grep -oE 'check-runs/[0-9]+' "$REVIEWDOG_STDERR_LOG" | cut -d/ -f2 | sort -u \
-    | sed 's/$/ unknown/' >"$work/runs"
+    | sed 's/$/ unknown/' >"$work/exact"
 fi
-if [ -s "$work/runs" ]; then
+if [ -s "$work/exact" ]; then
   found_by="reviewdog's own error output names this run"
-  echo "reviewdog's stderr names check run(s) $(cut -d' ' -f1 "$work/runs" | tr '\n' ' ')- completing only those"
+  named="$(cut -d' ' -f1 "$work/exact" | tr '\n' ' ')"
+  named="${named% }"
+  # A run no line names can sit beside the named ones (see WHICH RUNS, 1).
+  if grep -qF 'failed to create check' "$REVIEWDOG_STDERR_LOG"; then
+    also_list="reviewdog's stderr also reports a failed check create, whose line names no run"
+  elif [ -n "${REVIEWDOG_STARTED_AT:-}" ]; then
+    case "${STEP_RC:-}" in
+      '' | unknown) also_list="reviewdog started and did not return an exit status (${rc_text})" ;;
+      *[!0-9]*) ;;
+      *) [ "$STEP_RC" -lt 128 ] || also_list="reviewdog started and ended ${rc_text}" ;;
+    esac
+  fi
+  if [ -n "$also_list" ]; then
+    echo "reviewdog's stderr names check run(s) ${named} - completing those, and listing as well, because ${also_list}"
+  else
+    echo "reviewdog's stderr names check run(s) ${named} - completing only those"
+  fi
 fi
 
-# --- 2. otherwise, the bounded listing ---------------------------------------
+# --- the completion, used by both lists below ---------------------------------
+# build_body <found by>: write the PATCH body for runs found that way.
+build_body() {
+  python3 - "$work/body.json" "$check_name" "$reason" "$rc_text" "$job_url" "$1" <<'PY'
+import json
+import sys
+
+out, name, reason, rc_text, job_url, found_by = sys.argv[1:7]
+summary = (
+    f"This `{name}` check run was left `in_progress` by the step that posts it, "
+    f"and nothing is running for it any more.\n\n"
+    f"- Why: {reason}\n"
+    f"- The posting step's final reviewdog exit: {rc_text}\n"
+    f"- Job: {job_url}\n"
+    f"- Found by: {found_by}\n\n"
+    "It was completed as `neutral` by `.github/scripts/complete-orphaned-check-runs.sh`, "
+    "so it no longer reads as still running. "
+    "It carries no verdict about this diff; the job itself reports any failure. "
+    "If the posting step ran reviewdog more than once, a later run of this name on this head "
+    "may carry the verdict; otherwise re-run the job, or push a commit, to get this check's annotations."
+)
+body = {
+    "status": "completed",
+    "conclusion": "neutral",
+    "output": {"title": "reviewdog did not finish this check", "summary": summary},
+}
+with open(out, "w", encoding="utf-8") as fh:
+    json.dump(body, fh)
+PY
+}
+
+# complete_run <id>: read the run, and PATCH it only if that read shows it is
+# this check's, from this app, on this head, and not completed. Every PATCH
+# attempt, the first included, follows a fresh successful read; a failed read
+# or PATCH is retried on the shared schedule. Returns 0 when the run ends
+# completed or is deliberately left alone, 1 (reason in PATCH_ERR) otherwise.
+complete_run() {
+  local id="$1" n=0 verdict
+  while :; do
+    if ! api_once "$work/one" -X GET "repos/${repo}/check-runs/${id}"; then
+      n=$((n + 1))
+      if retryable && backoff "$n" "re-reading check run ${id} failed (HTTP ${HTTP_CODE:-none})"; then
+        continue
+      fi
+      PATCH_ERR="re-reading check run ${id} failed ($(describe_err)), so it was not PATCHed."
+      return 1
+    fi
+    verdict="$(python3 - "$work/one" "$check_name" "$APP_SLUG" "$head_sha" <<'PY' 2>/dev/null
+import json
+import sys
+
+path, name, app_slug, head = sys.argv[1:5]
+try:
+    with open(path, encoding="utf-8") as fh:
+        run = json.load(fh)
+except (OSError, ValueError):
+    print("unreadable")
+    sys.exit(0)
+if not isinstance(run, dict):
+    print("unreadable")
+elif run.get("status") == "completed":
+    print("completed")
+elif run.get("name") != name:
+    print(f"foreign its name is '{run.get('name')}'")
+elif (run.get("app") or {}).get("slug") != app_slug:
+    print(f"foreign it belongs to app '{(run.get('app') or {}).get('slug')}'")
+elif run.get("head_sha") != head:
+    print(f"foreign it is on head '{run.get('head_sha')}'")
+else:
+    print("open")
+PY
+    )"
+    case "$verdict" in
+      completed)
+        echo "check run ${id} is completed; left as it is"
+        return 0
+        ;;
+      foreign*)
+        echo "check run ${id} skipped: ${verdict#foreign }, not the expected '${check_name}' from ${APP_SLUG} on ${head_sha}"
+        return 0
+        ;;
+      open) ;;
+      *)
+        PATCH_ERR="re-reading check run ${id} returned a body that could not be read, so it was not PATCHed."
+        return 1
+        ;;
+    esac
+    if api_once "$work/patched" -X PATCH "repos/${repo}/check-runs/${id}" --input "$work/body.json"; then
+      echo "completed check run ${id} ('${check_name}') as neutral"
+      return 0
+    fi
+    n=$((n + 1))
+    if retryable && backoff "$n" "PATCH of check run ${id} failed (HTTP ${HTTP_CODE:-none})"; then
+      continue
+    fi
+    PATCH_ERR="completing check run ${id} failed ($(describe_err))."
+    return 1
+  done
+}
+
+# complete_list <file>: complete each "<id> <status>" line of <file> not handled
+# already (a run both lists hold is read once).
+declare -A done_ids=()
+failed=0
+complete_list() {
+  local id status
+  while read -r -u 3 id status; do
+    [ -n "${id:-}" ] || continue
+    if ! [[ "$id" =~ ^[0-9]+$ ]]; then
+      warn "skipping a '${check_name}' run with an unreadable id '${id}'."
+      continue
+    fi
+    [ -z "${done_ids[$id]:-}" ] || continue
+    done_ids[$id]=1
+    if [ "$status" = "completed" ]; then
+      echo "check run ${id} is already completed; left as it is"
+      continue
+    fi
+    PATCH_ERR=""
+    if ! complete_run "$id"; then
+      warn "${PATCH_ERR} This step is advisory: nothing failed, but that run may still read as in progress."
+      failed=1
+    fi
+  done 3<"$1"
+}
+
+# finish: say whether any run was left, and end (advisory: always 0).
+finish() {
+  [ "$failed" -eq 0 ] || echo "one or more '${check_name}' runs were not completed (see the warnings above)"
+  exit 0
+}
+
+# The named runs are completed FIRST: their ids need no listing, and their
+# re-reads (where a 404 is what this script's first call can meet) then get
+# the shared sleep budget before any wait for a run no line names spends it.
+if [ -s "$work/exact" ]; then
+  build_body "$found_by" || give_up "could not build the PATCH body."
+  complete_list "$work/exact"
+  [ -n "$also_list" ] || finish
+fi
+
+# --- 2. otherwise, or as well, the bounded listing ---------------------------
 enc_name="$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$check_name")" \
   || give_up "could not URL-encode the check name '${check_name}'."
 
@@ -559,28 +731,40 @@ PY
   done
 }
 
-if [ -z "$found_by" ]; then
+if [ ! -s "$work/exact" ] || [ -n "$also_list" ]; then
   guard_off=""
   [ -n "$start_epoch" ] || guard_off="the lower bound (when reviewdog started: '${REVIEWDOG_STARTED_AT:-}')"
   if [ -z "$end_epoch" ]; then
     guard_off="${guard_off:+${guard_off} and }the upper bound (when reviewdog ended: '${REVIEWDOG_ENDED_AT:-}')"
   fi
   if [ -z "$guard_off" ]; then
-    found_by="listing '${check_name}' runs on this head that started inside this job's reviewdog window (${REVIEWDOG_STARTED_AT} to ${REVIEWDOG_ENDED_AT}, +/- ${skew} s, ${clock_text})"
+    listed_by="listing '${check_name}' runs on this head that started inside this job's reviewdog window (${REVIEWDOG_STARTED_AT} to ${REVIEWDOG_ENDED_AT}, +/- ${skew} s, ${clock_text})"
   else
-    found_by="listing '${check_name}' runs on this head WITHOUT ${guard_off}, which is absent or unparseable, so a concurrent run on this head on that side cannot be told apart"
+    listed_by="listing '${check_name}' runs on this head WITHOUT ${guard_off}, which is absent or unparseable, so a concurrent run on this head on that side cannot be told apart"
     warn "the time guard is OFF for ${guard_off}, which is absent or unparseable: every non-completed '${check_name}' run from ${APP_SLUG} on ${head_sha} on that side of the window is a candidate, including one a concurrent workflow run may still be posting."
   fi
+  [ -z "$also_list" ] || listed_by="${listed_by}, because ${also_list}"
   absent_n=0
   while :; do
-    list_runs || give_up "$LIST_ERR"
-    # Only a non-completed candidate ends the wait: a completed one (an
-    # earlier attempt's, say) is left alone and is not this job's orphan.
-    if awk '$2 != "completed" { found = 1 } END { exit !found }' "$work/runs"; then
+    if ! list_runs; then
+      [ -n "$also_list" ] || give_up "$LIST_ERR"
+      warn "${LIST_ERR} Only the run(s) reviewdog's stderr names (${named}) were handled, above."
+      : >"$work/runs"
       break
     fi
-    if [ -s "$work/runs" ]; then
-      echo "$(wc -l <"$work/runs" | tr -d ' ') '${check_name}' run(s) on ${head_sha} are already completed and are left as they are"
+    # Only a non-completed candidate ends the wait: a completed one (an
+    # earlier attempt's, say) is left alone and is not this job's orphan,
+    # and a named id was handled above, so it does not end the wait for
+    # the run no line names.
+    if awk 'FILENAME == ARGV[1] { named[$1] = 1; next }
+      $2 != "completed" && !($1 in named) { found = 1 }
+      END { exit !found }' "$work/exact" "$work/runs"; then
+      break
+    fi
+    # Every run listed here is completed, a named one aside (handled above).
+    n_done="$(awk 'FILENAME == ARGV[1] { named[$1] = 1; next } !($1 in named)' "$work/exact" "$work/runs" | wc -l | tr -d ' ')"
+    if [ "$n_done" -gt 0 ]; then
+      echo "${n_done} '${check_name}' run(s) on ${head_sha} are already completed and are left as they are"
     fi
     skipped=0
     [ ! -s "$work/skips" ] || skipped="$(wc -l <"$work/skips" | tr -d ' ')"
@@ -590,6 +774,10 @@ if [ -z "$found_by" ]; then
       absent_n=$((absent_n + 1))
       if backoff "$absent_n" "no candidate '${check_name}' run is visible on ${head_sha} yet (the posting step ended ${rc_text}; ${skipped} run(s) skipped by the guard)"; then
         continue
+      fi
+      if [ -n "$also_list" ]; then
+        echo "no '${check_name}' run beyond the named one(s) (${named}) became visible on ${head_sha}; ${skipped} run(s) were skipped by the guard. The named run(s) were handled above."
+        break
       fi
       give_up "no candidate check run named '${check_name}' is visible on ${head_sha}, although the posting step ended ${rc_text}; ${skipped} run(s) were skipped by the guard as not this job's (listed above). Either it failed before creating one, or GitHub has not shown it yet."
     fi
@@ -602,121 +790,6 @@ if [ -z "$found_by" ]; then
   done
 fi
 
-python3 - "$work/body.json" "$check_name" "$reason" "$rc_text" "$job_url" "$found_by" <<'PY' || give_up "could not build the PATCH body."
-import json
-import sys
-
-out, name, reason, rc_text, job_url, found_by = sys.argv[1:7]
-summary = (
-    f"This `{name}` check run was left `in_progress` by the step that posts it, "
-    f"and nothing is running for it any more.\n\n"
-    f"- Why: {reason}\n"
-    f"- The posting step (reviewdog): {rc_text}\n"
-    f"- Job: {job_url}\n"
-    f"- Found by: {found_by}\n\n"
-    "It was completed as `neutral` by `.github/scripts/complete-orphaned-check-runs.sh`, "
-    "so it no longer reads as still running. "
-    "It carries no verdict about this diff; the job itself reports any failure. "
-    "Re-run the job, or push a commit, to get this check's annotations."
-)
-body = {
-    "status": "completed",
-    "conclusion": "neutral",
-    "output": {"title": "reviewdog did not finish this check", "summary": summary},
-}
-with open(out, "w", encoding="utf-8") as fh:
-    json.dump(body, fh)
-PY
-
-# complete_run <id>: read the run, and PATCH it only if that read shows it is
-# this check's, from this app, on this head, and not completed. Every PATCH
-# attempt, the first included, follows a fresh successful read; a failed read
-# or PATCH is retried on the shared schedule. Returns 0 when the run ends
-# completed or is deliberately left alone, 1 (reason in PATCH_ERR) otherwise.
-complete_run() {
-  local id="$1" n=0 verdict
-  while :; do
-    if ! api_once "$work/one" -X GET "repos/${repo}/check-runs/${id}"; then
-      n=$((n + 1))
-      if retryable && backoff "$n" "re-reading check run ${id} failed (HTTP ${HTTP_CODE:-none})"; then
-        continue
-      fi
-      PATCH_ERR="re-reading check run ${id} failed ($(describe_err)), so it was not PATCHed."
-      return 1
-    fi
-    verdict="$(python3 - "$work/one" "$check_name" "$APP_SLUG" "$head_sha" <<'PY' 2>/dev/null
-import json
-import sys
-
-path, name, app_slug, head = sys.argv[1:5]
-try:
-    with open(path, encoding="utf-8") as fh:
-        run = json.load(fh)
-except (OSError, ValueError):
-    print("unreadable")
-    sys.exit(0)
-if not isinstance(run, dict):
-    print("unreadable")
-elif run.get("status") == "completed":
-    print("completed")
-elif run.get("name") != name:
-    print(f"foreign its name is '{run.get('name')}'")
-elif (run.get("app") or {}).get("slug") != app_slug:
-    print(f"foreign it belongs to app '{(run.get('app') or {}).get('slug')}'")
-elif run.get("head_sha") != head:
-    print(f"foreign it is on head '{run.get('head_sha')}'")
-else:
-    print("open")
-PY
-    )"
-    case "$verdict" in
-      completed)
-        echo "check run ${id} is completed; left as it is"
-        return 0
-        ;;
-      foreign*)
-        echo "check run ${id} skipped: ${verdict#foreign }, not the expected '${check_name}' from ${APP_SLUG} on ${head_sha}"
-        return 0
-        ;;
-      open) ;;
-      *)
-        PATCH_ERR="re-reading check run ${id} returned a body that could not be read, so it was not PATCHed."
-        return 1
-        ;;
-    esac
-    if api_once "$work/patched" -X PATCH "repos/${repo}/check-runs/${id}" --input "$work/body.json"; then
-      echo "completed check run ${id} ('${check_name}') as neutral"
-      return 0
-    fi
-    n=$((n + 1))
-    if retryable && backoff "$n" "PATCH of check run ${id} failed (HTTP ${HTTP_CODE:-none})"; then
-      continue
-    fi
-    PATCH_ERR="completing check run ${id} failed ($(describe_err))."
-    return 1
-  done
-}
-
-declare -A done_ids=()
-failed=0
-while read -r -u 3 id status; do
-  [ -n "${id:-}" ] || continue
-  if ! [[ "$id" =~ ^[0-9]+$ ]]; then
-    warn "skipping a '${check_name}' run with an unreadable id '${id}'."
-    continue
-  fi
-  [ -z "${done_ids[$id]:-}" ] || continue
-  done_ids[$id]=1
-  if [ "$status" = "completed" ]; then
-    echo "check run ${id} is already completed; left as it is"
-    continue
-  fi
-  PATCH_ERR=""
-  if ! complete_run "$id"; then
-    warn "${PATCH_ERR} This step is advisory: nothing failed, but that run may still read as in progress."
-    failed=1
-  fi
-done 3<"$work/runs"
-
-[ "$failed" -eq 0 ] || echo "one or more '${check_name}' runs were not completed (see the warnings above)"
-exit 0
+build_body "$listed_by" || give_up "could not build the PATCH body."
+complete_list "$work/runs"
+finish

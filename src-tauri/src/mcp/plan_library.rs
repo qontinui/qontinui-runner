@@ -804,7 +804,7 @@ fn read_failure(
             error_detail: e.error_detail,
             hint: e.hint,
             code: e.code,
-            suggestions: e.suggestions,
+            refusal: e.refusal,
         }),
     )
 }

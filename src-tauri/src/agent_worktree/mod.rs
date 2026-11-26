@@ -74,6 +74,8 @@ pub mod fs_backstop;
 pub mod fs_observer;
 pub mod isolated_edit;
 pub mod maintenance_executor;
+mod materialize_serial;
+use materialize_serial::checkout_materialize_lock;
 pub mod on_demand;
 pub mod orphan_target_reaper;
 pub mod reclaim;
@@ -1308,7 +1310,7 @@ struct CoordCargoConfig {
     contents: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct CoordAllocatedWorktree {
     repo: String,
     branch: String,
@@ -1680,6 +1682,19 @@ fn allocate_tenant_scope(
         (scope, _) => scope,
     }
 }
+
+/// How long `POST /agents/allocate` may take, from connect to the end of the
+/// response body, before the allocate fails. This route runs git on coord's
+/// side, and an allocate that fails here sends the session to its fallback cwd
+/// with no isolation, so a bound a busy coord can exceed would trade a hang for
+/// unisolated work. 80 s leaves room for that work. It also ends under the 90 s
+/// TTL of a `file_glob` claim taken before this POST, though the materialisation
+/// that follows can still outlast that TTL. Short under test, where the bound's
+/// effect is what is pinned.
+#[cfg(not(test))]
+const ALLOCATE_REQUEST_TIMEOUT: Duration = Duration::from_secs(80);
+#[cfg(test)]
+const ALLOCATE_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Call coord's `/agents/allocate` and then `git worktree add` for each
 /// returned row.
@@ -2065,7 +2080,26 @@ async fn materialize_allocation(
         // All or nothing: a failed switch (a dirty tree, say) puts back every
         // checkout already switched, and every claim, including the leases
         // just taken, is released rather than left to expire.
-        let branches = match checkout_shared_branches(&targets) {
+        // Git on each checkout, so off the async workers like the worktree arm.
+        let owned_targets: Vec<(CoordAllocatedWorktree, PathBuf)> = targets
+            .iter()
+            .map(|(row, checkout)| ((*row).clone(), (*checkout).clone()))
+            .collect();
+        let switched = qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+            let targets: Vec<(&CoordAllocatedWorktree, &PathBuf)> = owned_targets
+                .iter()
+                .map(|(row, checkout)| (row, checkout))
+                .collect();
+            checkout_shared_branches(&targets)
+        })
+        .await
+        .unwrap_or_else(|e| {
+            Err(AllocateError::Other(format!(
+                "shared-branch checkout did not complete (which checkouts it switched is \
+                 unknown): {e}"
+            )))
+        });
+        let branches = match switched {
             Ok(b) => b,
             Err(e) => {
                 release_all_claims_best_effort(coord_http_base, machine_id, &active_claims).await;
@@ -2142,10 +2176,11 @@ async fn materialize_allocation(
         // serialized in-process rather than racing on its ref and worktree locks.
         // In-process only: a second runner instance on the box can still race
         // this checkout, and git's own ref/worktree locks then fail it loudly.
-        let checkout_lock = checkout_materialize_lock(&row.canonical);
-        let serialized = checkout_lock.lock().await;
-        let outcome = materialize_one_worktree(row, target_mode);
-        drop(serialized);
+        // The git work runs on the blocking pool with the checkout's lock moved
+        // into it, so neither the work nor its waiters hold an async worker
+        // (plan 2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap,
+        // D2; see `materialize_serial`).
+        let outcome = materialize_serial::materialize_row(row, target_mode).await;
         match outcome {
             Ok(m) => materialized.push(m),
             Err(e) => {
@@ -2334,10 +2369,14 @@ fn with_optional_timeout(
 /// final), and a 5xx. Final: a `repo_not_registered` 409, any other non-2xx,
 /// and an unparseable body.
 ///
-/// With no budget (`timeout == None`) the request is exactly today's — a
-/// fresh client, no request timeout. With a budget it goes through the shared
-/// coord client bounded by the attempt's timeout, because a hung send never
-/// returns and would escape the deadline.
+/// Every attempt goes through the shared coord client and is bounded: with a
+/// budget, by the attempt's timeout, because a hung send never returns and
+/// would escape the deadline; with no budget (`timeout == None`), by
+/// [`ALLOCATE_REQUEST_TIMEOUT`], because a coord that accepts the connection
+/// and never answers must fail this allocate rather than hold it for good
+/// (plan 2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap,
+/// D2). A timeout is transient like any other transport failure, and its
+/// message names the bound.
 async fn post_allocate_once(
     url: &str,
     body: &serde_json::Value,
@@ -2348,14 +2387,12 @@ async fn post_allocate_once(
     // The client is chosen first so the `.post(` stays inside the
     // `attach_device_auth_for(` statement (the coord-auth pin test reads it
     // there).
-    let client = match timeout {
-        None => reqwest::Client::new(),
-        Some(_) => crate::coord_http::coord_client()
-            .cloned()
-            .unwrap_or_else(reqwest::Client::new),
-    };
+    let bound = timeout.unwrap_or(ALLOCATE_REQUEST_TIMEOUT);
+    let client = crate::coord_http::coord_client()
+        .cloned()
+        .unwrap_or_else(reqwest::Client::new);
     let resp = match crate::auth::attach_device_auth_for(
-        with_optional_timeout(client.post(url).json(body), timeout),
+        with_optional_timeout(client.post(url).json(body), Some(bound)),
         scope,
     )
     .send()
@@ -2363,10 +2400,15 @@ async fn post_allocate_once(
     {
         Ok(r) => r,
         Err(e) => {
+            let timed_out = if e.is_timeout() {
+                format!("timed out after {}s: ", bound.as_secs())
+            } else {
+                String::new()
+            };
             return Attempt::Transient(format!(
-                "POST {url}: {}",
+                "POST {url}: {timed_out}{}",
                 acquire_retry::describe_reqwest_error(&e)
-            ))
+            ));
         }
     };
     let status = resp.status();
@@ -2697,19 +2739,6 @@ fn cargo_override_is_backed(write_path: &str, contents: &str) -> bool {
             false
         }
     }
-}
-
-/// The in-process lock serializing worktree materialization against one shared
-/// checkout (see the `worktree` arm of [`allocate_and_materialize_with_claim`]).
-fn checkout_materialize_lock(canonical: &Path) -> std::sync::Arc<tokio::sync::Mutex<()>> {
-    static LOCKS: once_cell::sync::Lazy<
-        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
-    > = once_cell::sync::Lazy::new(Default::default);
-    let mut locks = LOCKS.lock().unwrap_or_else(|e| e.into_inner());
-    locks
-        .entry(worktree_resource_key(canonical))
-        .or_default()
-        .clone()
 }
 
 /// The `kind=worktree` claim for each planned row: keyed on the row's TARGET,
@@ -4566,5 +4595,96 @@ mod tests {
             }
             CanonicalLeasePlan::Proceed { .. } => panic!("expected Bail when a lease is Held"),
         }
+    }
+
+    /// D2 of plan
+    /// `2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap`:
+    /// `/agents/allocate` is bounded. The REAL allocate is driven against a
+    /// listener that takes the connection and never answers. It must fail after
+    /// `ALLOCATE_REQUEST_TIMEOUT` (3 s under test), with the timeout named in the
+    /// error, rather than hold its caller indefinitely. On 2026-10-27 the
+    /// continuation coord POSTs failed 32 to 39 minutes after dispatch.
+    ///
+    /// Driven with NO retry budget, the arm that used to send with no timeout
+    /// (interactive and worker allocates). A budgeted caller — the gate
+    /// continuation — is bounded per attempt by `acquire_retry`'s
+    /// `PER_ATTEMPT_TIMEOUT` instead, which this bound does not change.
+    ///
+    /// Mutation check: in `post_allocate_once`, pass `timeout` (not
+    /// `Some(bound)`) to `with_optional_timeout`. Then the allocate is still
+    /// waiting when the test's own 30 s bound fires, and this test fails.
+    #[tokio::test]
+    async fn allocate_times_out_against_a_coord_that_never_answers() {
+        assert_eq!(ALLOCATE_REQUEST_TIMEOUT, Duration::from_secs(3));
+        let _amb = crate::test_env::isolated_ambient();
+        // Bound and never accepted: the OS completes the handshake into the
+        // backlog, takes the request bytes, and no response ever comes.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let repos = vec![RepoRequest {
+            repo: "qontinui-runner".to_string(),
+            parent_sha: None,
+        }];
+        let canonical: std::collections::HashMap<String, PathBuf> = [(
+            "qontinui-runner".to_string(),
+            PathBuf::from("D:/allocate-timeout-test/qontinui-runner"),
+        )]
+        .into();
+
+        let started = std::time::Instant::now();
+        let out = tokio::time::timeout(
+            Duration::from_secs(30),
+            allocate_and_materialize_with_claim(
+                &base,
+                &uuid::Uuid::nil(),
+                None,
+                &repos,
+                None,
+                None,
+                &canonical,
+                None,
+                None,
+                None,
+                SharedBranchPolicy::Honor,
+                &[],
+                acquire_retry::RetryDeadline::none(),
+            ),
+        )
+        .await
+        .expect("the allocate was still waiting after 30 s: /agents/allocate has no timeout");
+        let elapsed = started.elapsed();
+        drop(listener);
+
+        let msg = match out {
+            Err(AllocateError::Other(msg)) => msg,
+            Err(other) => panic!("expected AllocateError::Other, got {other:?}"),
+            Ok(_) => panic!("a coord that never answered produced an allocation"),
+        };
+        assert!(
+            msg.starts_with(&format!(
+                "POST {base}/agents/allocate: timed out after 3s: "
+            )),
+            "{msg}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(2_500) && elapsed < Duration::from_secs(20),
+            "the allocate gave up after {elapsed:?}, not at its 3 s bound"
+        );
+    }
+
+    /// The production bound stays above what coord's own git work can take: at
+    /// 10 s, one slow `ls-tree` on coord's side would send a continuation to the
+    /// fallback cwd with no isolation. The literal is built here so this test
+    /// cannot match its own source.
+    #[test]
+    fn the_production_allocate_bound_leaves_room_for_coords_git_work() {
+        let declared = format!(
+            "const ALLOCATE_REQUEST_TIMEOUT: Duration = Duration::from_secs({});",
+            60 + 20
+        );
+        assert!(
+            include_str!("mod.rs").contains(&declared),
+            "the production allocate bound moved: expected `{declared}`"
+        );
     }
 }

@@ -35,6 +35,11 @@
 //!   install tools) before the fail-open fall-through, which then names the
 //!   tool and the `PATH` searched on stderr. A resolved tool never waits; see
 //!   [`resolve_real_waiting`].
+//! - **Settle wait (identity only).** An identity launch also waits, inside the
+//!   SAME bound, for a resolved `claude`/`gemini` whose target changed under
+//!   [`SETTLE_MIN_AGE`] ago — an install may still be writing it — and launches
+//!   it anyway at the bound, after one stderr line. A long-settled tool pays
+//!   one `stat` and no wait; see [`resolve_real_settled_waiting`].
 //!
 //! Registry creds: like the rest of interception, the stub injects NO registry
 //! secrets — the agent's shell already carries the operator's registry config.
@@ -59,11 +64,12 @@ use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use qontinui_runner_lib::intercept_core::classify::{self, Classification, ShimTool};
 use qontinui_runner_lib::intercept_core::gate::{should_block, InterceptMode};
 use qontinui_runner_lib::intercept_core::npm_placeholder::is_npm_placeholder;
+use qontinui_runner_lib::intercept_core::settled::{settle_of, Settle, SETTLE_MIN_AGE};
 use qontinui_runner_lib::intercept_core::shim_dir::is_qontinui_shim_dir;
 use qontinui_runner_lib::intercept_core::types::PackageSpecInput;
 
@@ -287,16 +293,12 @@ pub fn detect_identity_tool(argv0: Option<&str>) -> Option<IdentityTool> {
 /// `identity_shim.cmd`; plus the `--session-id=…`/`--resume=…` inline forms the
 /// bash identity shim also honors. A merely-prefixed token
 /// (`--session-id-ish`) does NOT match, and neither does anything after a `--`,
-/// which is positional.
+/// which is positional. The token set itself is the Rust spelling
+/// `qontinui_runner_lib::claude_env::claude_argv_chooses_session`, shared with
+/// the runner's terminal seam; the `.bash` / `.cmd` script shims still carry
+/// copies (plan-library follow-up edge `2ce2a5a6-da43-4585-a372-d533fb50b7e7`).
 pub fn user_chose_session(args: &[String]) -> bool {
-    args.iter().take_while(|a| *a != "--").any(|a| {
-        let t = a.to_ascii_lowercase();
-        matches!(
-            t.as_str(),
-            "--session-id" | "--resume" | "-r" | "resume" | "--continue" | "-c"
-        ) || t.starts_with("--session-id=")
-            || t.starts_with("--resume=")
-    })
+    qontinui_runner_lib::claude_env::claude_argv_chooses_session(args)
 }
 
 /// The claude SessionStart-hook `--settings` args: tool==claude AND the env
@@ -378,6 +380,23 @@ pub fn identity_mcp_config_args(tool: IdentityTool, mcp_config_path: Option<&str
         }
         _ => Vec::new(),
     }
+}
+
+/// The value to re-export as [`MCP_CONFIG_ENV`] after a self-provisioned mint,
+/// or `None` to leave the inherited value untouched. Only a mint that
+/// [`identity_mcp_config_args`] would actually pass to `claude` (claude, an
+/// existing file, a UTF-8 path) is exported, so every consumer of the variable
+/// in the child tree reads the config `claude` was given. `qontinui-pr` takes
+/// the variable as authoritative and refuses a set-but-missing file rather than
+/// walking up to an ancestor `.mcp.json`; without this export a self-provisioned
+/// session would have a working coord-mcp while its `qontinui-pr` refused (or
+/// read a stale value). A failed mint changes nothing.
+fn minted_mcp_config_export(tool: IdentityTool, minted: Option<&Path>) -> Option<String> {
+    let path = minted?.to_str()?;
+    if identity_mcp_config_args(tool, Some(path)).is_empty() {
+        return None;
+    }
+    Some(path.to_string())
 }
 
 /// Does the per-machine opt-in marker (`~/.qontinui/allow-session-coord-identity`)
@@ -588,7 +607,7 @@ pub fn identity_argv(
 /// [`post_launch_failure`]).
 fn run_identity(tool: IdentityTool, args: &[String]) -> Option<i32> {
     let own_dirs = own_shim_dirs();
-    let real = resolve_real_waiting(tool.program(), &own_dirs, IDENTITY_RESOLVE_WAIT);
+    let real = resolve_real_settled_waiting(tool.program(), &own_dirs, IDENTITY_RESOLVE_WAIT);
 
     // Recursion guard: a nested invocation never re-pins — pure passthrough.
     // Nor does it report a launch failure: a nested `claude` must never mark
@@ -625,6 +644,9 @@ fn run_identity(tool: IdentityTool, args: &[String]) -> Option<i32> {
     };
     if let Some(path) = minted_config.as_ref() {
         mcp_config = identity_mcp_config_args(tool, path.to_str());
+    }
+    if let Some(export) = minted_mcp_config_export(tool, minted_config.as_deref()) {
+        env::set_var(MCP_CONFIG_ENV, export);
     }
 
     // Fire-and-forget DIAGNOSTIC beacon on EVERY (non-nested) invocation —
@@ -1205,10 +1227,8 @@ fn resolve_real_waiting(
                 announced = true;
                 let _ = writeln!(
                     std::io::stderr(),
-                    "qontinui-shim: {name} not found on PATH (excluding the shim dirs); waiting up \
-                     to {}s for it to reappear (a package-manager reinstall briefly removes it, or \
-                     leaves the npm placeholder stub in its place)",
-                    wait.as_secs()
+                    "{}",
+                    wait_line(name, &WaitNote::Missing, wait)
                 );
             }
             std::thread::sleep(d);
@@ -1223,6 +1243,182 @@ fn resolve_real_waiting(
         );
     }
     found
+}
+
+/// [`resolve_real_waiting`] for the IDENTITY path, which also waits for the
+/// resolved tool to SETTLE (plan
+/// `2026-11-10-shim-settle-wait-and-in-memory-launch-liveness` Phase 3, D3).
+///
+/// npm writes the 340 MB native `claude` behind a `bin/claude` it has already
+/// re-linked, so the first hit can be an executable, non-stub image that is
+/// still being written (finding `18ee5471`). A candidate whose target changed
+/// under [`SETTLE_MIN_AGE`] ago is re-probed inside the SAME bound as a miss;
+/// at the bound it is launched anyway, after one stderr line, because something
+/// launchable did resolve (FAIL-OPEN) — an exec that then fails is still
+/// reported as `exec-failed`. An unreadable change time counts as settled. A
+/// final miss prints the same give-up line as [`resolve_real_waiting`] and
+/// returns `None`, so the caller's `resolve-failed` beacon is unchanged.
+fn resolve_real_settled_waiting(
+    name: &str,
+    own_dirs: &[PathBuf],
+    default_wait: Duration,
+) -> Option<PathBuf> {
+    let wait = resolve_wait_from(env::var(RESOLVE_WAIT_ENV).ok().as_deref(), default_wait);
+    let resolved = resolve_settled_with_wait(
+        || settle_probe(resolve_real(name, own_dirs), SystemTime::now()),
+        wait,
+        RESOLVE_POLL,
+        std::thread::sleep,
+        |note| {
+            let _ = writeln!(std::io::stderr(), "{}", wait_line(name, &note, wait));
+        },
+    );
+    match resolved {
+        Resolved::Settled(path) => Some(path),
+        Resolved::Unsettled(path) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "qontinui-shim: {} has not settled after {}s; launching it anyway",
+                path.display(),
+                wait.as_secs()
+            );
+            Some(path)
+        }
+        Resolved::Missed => {
+            let path_var = env::var_os("PATH").unwrap_or_default();
+            let _ = writeln!(
+                std::io::stderr(),
+                "{}",
+                unresolved_message(name, own_dirs, wait, &path_var)
+            );
+            None
+        }
+    }
+}
+
+/// One probe of [`resolve_real_settled_waiting`]: the resolved candidate, if
+/// any, judged by the shared predicate at `now`.
+///
+/// A candidate whose change time could not be read AND that no longer exists
+/// is a MISS (`None`), not [`Settle::Unknown`]: npm's reify renames
+/// `bin/claude` aside between the scan and the read, which is the window this
+/// wait exists for, and an unknown would launch the vanished path at once.
+/// `Unknown` stays for a path that exists with no readable change time.
+///
+/// On Windows the candidate is npm's wrapper, not the image, and the time is a
+/// stand-in that can read a long write's start, so coverage there is
+/// incidental (`intercept_core::settled`, "Windows limits").
+fn settle_probe(found: Option<PathBuf>, now: SystemTime) -> Option<(PathBuf, Settle)> {
+    let path = found?;
+    let settle = settle_of(&path, now);
+    if settle == Settle::Unknown && !path.exists() {
+        return None;
+    }
+    Some((path, settle))
+}
+
+/// The one stderr line each kind of wait announces, once.
+fn wait_line(name: &str, note: &WaitNote, wait: Duration) -> String {
+    match note {
+        WaitNote::Missing => format!(
+            "qontinui-shim: {name} not found on PATH (excluding the shim dirs); waiting up to \
+             {}s for it to reappear (a package-manager reinstall briefly removes it, or leaves \
+             the npm placeholder stub in its place)",
+            wait.as_secs()
+        ),
+        WaitNote::Changing { path, age } => format!(
+            "qontinui-shim: {} changed {}s ago (an install may still be writing it); waiting up \
+             to {}s for it to settle",
+            path.display(),
+            age.as_secs(),
+            wait.as_secs()
+        ),
+    }
+}
+
+/// What [`resolve_settled_with_wait`] concluded.
+#[derive(Debug, PartialEq, Eq)]
+enum Resolved {
+    /// A candidate that is settled, or whose settledness is unknown — launch it.
+    Settled(PathBuf),
+    /// The last candidate seen was still changing when the bound ran out —
+    /// launch it anyway (fail-open), after saying so.
+    Unsettled(PathBuf),
+    /// Nothing launchable resolved within the bound.
+    Missed,
+}
+
+/// Why [`resolve_settled_with_wait`] is waiting; each is announced at most once.
+#[derive(Debug, PartialEq, Eq)]
+enum WaitNote {
+    /// No candidate on `PATH` (or only npm's placeholder stub).
+    Missing,
+    /// A candidate whose target changed `age` ago, under the minimum.
+    Changing { path: PathBuf, age: Duration },
+}
+
+/// The pure core of [`resolve_real_settled_waiting`]: one bound over both
+/// waits. `probe` returns the current candidate and its [`Settle`]; a
+/// `Settled` or `Unknown` candidate is taken at once, a miss or a `Changing`
+/// candidate is re-probed every `poll` until `wait` worth of polls are spent.
+/// At the bound, the last probe's `Changing` candidate is
+/// [`Resolved::Unsettled`]; a last probe that missed is [`Resolved::Missed`].
+/// A zero `wait` disables both waits: the first candidate is taken as found.
+/// Bounded by attempt COUNT like [`resolve_with_wait`], so tests drive it with
+/// a recording `sleep` and no real time passes.
+fn resolve_settled_with_wait<P, S, A>(
+    mut probe: P,
+    wait: Duration,
+    poll: Duration,
+    mut sleep: S,
+    mut announce: A,
+) -> Resolved
+where
+    P: FnMut() -> Option<(PathBuf, Settle)>,
+    S: FnMut(Duration),
+    A: FnMut(WaitNote),
+{
+    let first = probe();
+    if wait.is_zero() {
+        return first.map_or(Resolved::Missed, |(path, _)| Resolved::Settled(path));
+    }
+    let (mut said_missing, mut said_changing) = (false, false);
+    let mut last: Option<PathBuf> = None;
+    let mut observe = |seen: Option<(PathBuf, Settle)>, last: &mut Option<PathBuf>| {
+        match seen {
+            Some((path, Settle::Settled | Settle::Unknown)) => return Some(path),
+            Some((path, Settle::Changing { age })) => {
+                if !said_changing {
+                    said_changing = true;
+                    announce(WaitNote::Changing {
+                        path: path.clone(),
+                        age,
+                    });
+                }
+                *last = Some(path);
+            }
+            None => {
+                if !said_missing {
+                    said_missing = true;
+                    announce(WaitNote::Missing);
+                }
+                *last = None;
+            }
+        }
+        None
+    };
+    if let Some(path) = observe(first, &mut last) {
+        return Resolved::Settled(path);
+    }
+    let poll_ms = poll.as_millis().max(1);
+    let retries = wait.as_millis().div_ceil(poll_ms);
+    for _ in 0..retries {
+        sleep(poll);
+        if let Some(path) = observe(probe(), &mut last) {
+            return Resolved::Settled(path);
+        }
+    }
+    last.map_or(Resolved::Missed, Resolved::Unsettled)
 }
 
 /// The give-up line [`resolve_real_waiting`] prints. When what IS on `PATH` is
@@ -1736,6 +1932,269 @@ mod tests {
         assert_eq!(calls, 1);
     }
 
+    /// A scripted probe for [`resolve_settled_with_wait`]: each call returns the
+    /// next step, and the last step repeats.
+    fn scripted(steps: Vec<Option<Settle>>) -> impl FnMut() -> Option<(PathBuf, Settle)> {
+        let mut i = 0;
+        move || {
+            let step = steps[i.min(steps.len() - 1)];
+            i += 1;
+            step.map(|settle| (PathBuf::from("/real/claude"), settle))
+        }
+    }
+
+    fn changing(ms: u64) -> Option<Settle> {
+        Some(Settle::Changing {
+            age: Duration::from_millis(ms),
+        })
+    }
+
+    #[test]
+    fn resolve_settled_with_wait_takes_a_settled_hit_without_sleeping() {
+        for first in [Settle::Settled, Settle::Unknown] {
+            let (mut sleeps, mut notes) = (0, Vec::new());
+            let got = resolve_settled_with_wait(
+                scripted(vec![Some(first)]),
+                Duration::from_secs(10),
+                Duration::from_millis(250),
+                |_| sleeps += 1,
+                |n| notes.push(n),
+            );
+            assert_eq!(
+                got,
+                Resolved::Settled(PathBuf::from("/real/claude")),
+                "{first:?}"
+            );
+            assert_eq!(sleeps, 0, "{first:?}: a settled hit never waits");
+            assert!(notes.is_empty(), "{first:?}: and announces nothing");
+        }
+    }
+
+    #[test]
+    fn resolve_settled_with_wait_announces_a_changing_tool_once_then_takes_it_settled() {
+        let (mut sleeps, mut notes) = (0, Vec::new());
+        let got = resolve_settled_with_wait(
+            scripted(vec![
+                changing(100),
+                changing(350),
+                changing(600),
+                Some(Settle::Settled),
+            ]),
+            Duration::from_secs(10),
+            Duration::from_millis(250),
+            |_| sleeps += 1,
+            |n| notes.push(n),
+        );
+        assert_eq!(got, Resolved::Settled(PathBuf::from("/real/claude")));
+        assert_eq!(sleeps, 3);
+        assert_eq!(
+            notes,
+            [WaitNote::Changing {
+                path: PathBuf::from("/real/claude"),
+                age: Duration::from_millis(100),
+            }],
+            "one announcement, for the first changing probe"
+        );
+    }
+
+    #[test]
+    fn resolve_settled_with_wait_launches_a_still_changing_tool_at_the_bound() {
+        let mut calls = 0;
+        let got = resolve_settled_with_wait(
+            || {
+                calls += 1;
+                Some((
+                    PathBuf::from("/real/claude"),
+                    Settle::Changing {
+                        age: Duration::ZERO,
+                    },
+                ))
+            },
+            Duration::from_secs(1),
+            Duration::from_millis(250),
+            |_| {},
+            |_| {},
+        );
+        assert_eq!(got, Resolved::Unsettled(PathBuf::from("/real/claude")));
+        assert_eq!(calls, 5, "1 initial probe + 1s / 250ms re-probes, no more");
+    }
+
+    #[test]
+    fn resolve_settled_with_wait_shares_one_bound_across_a_miss_and_a_change() {
+        let (mut sleeps, mut notes) = (0, Vec::new());
+        let got = resolve_settled_with_wait(
+            scripted(vec![
+                None,
+                None,
+                changing(0),
+                changing(250),
+                Some(Settle::Settled),
+            ]),
+            Duration::from_secs(2),
+            Duration::from_millis(250),
+            |_| sleeps += 1,
+            |n| notes.push(n),
+        );
+        assert_eq!(got, Resolved::Settled(PathBuf::from("/real/claude")));
+        assert_eq!(sleeps, 4);
+        assert_eq!(
+            notes,
+            [
+                WaitNote::Missing,
+                WaitNote::Changing {
+                    path: PathBuf::from("/real/claude"),
+                    age: Duration::ZERO,
+                },
+            ]
+        );
+
+        // The same shape with a bound too short to see it settle: still one
+        // bound, so the changing candidate goes out unsettled at it.
+        let got = resolve_settled_with_wait(
+            scripted(vec![None, None, changing(0)]),
+            Duration::from_millis(500),
+            Duration::from_millis(250),
+            |_| {},
+            |_| {},
+        );
+        assert_eq!(got, Resolved::Unsettled(PathBuf::from("/real/claude")));
+
+        // A candidate that vanishes on the last probe is a miss, not a launch
+        // of a path that is no longer there.
+        let got = resolve_settled_with_wait(
+            scripted(vec![changing(0), None]),
+            Duration::from_millis(500),
+            Duration::from_millis(250),
+            |_| {},
+            |_| {},
+        );
+        assert_eq!(got, Resolved::Missed);
+    }
+
+    #[test]
+    fn resolve_settled_with_wait_zero_takes_the_first_candidate_without_sleeping() {
+        for first in [changing(0), Some(Settle::Settled), None] {
+            let got = resolve_settled_with_wait(
+                scripted(vec![first]),
+                Duration::ZERO,
+                Duration::from_millis(250),
+                |_| panic!("a zero wait must never sleep"),
+                |_| panic!("a zero wait must never announce"),
+            );
+            let want = match first {
+                Some(_) => Resolved::Settled(PathBuf::from("/real/claude")),
+                None => Resolved::Missed,
+            };
+            assert_eq!(got, want, "{first:?}");
+        }
+    }
+
+    /// The file's own change time, as `intercept_core::settled` reads it, so
+    /// the probe is judged against the file rather than a wall clock a
+    /// saturated box could run ahead of.
+    fn own_change_time(path: &Path) -> SystemTime {
+        let meta = std::fs::metadata(path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            SystemTime::UNIX_EPOCH
+                + Duration::new(
+                    u64::try_from(meta.ctime()).unwrap(),
+                    u32::try_from(meta.ctime_nsec()).unwrap(),
+                )
+        }
+        #[cfg(not(unix))]
+        {
+            match (meta.created().ok(), meta.modified().ok()) {
+                (Some(c), Some(m)) => c.max(m),
+                (one, other) => one.or(other).unwrap(),
+            }
+        }
+    }
+
+    /// The probe the identity path runs judges the candidate with the shared
+    /// predicate: a file written just now is changing, and settled once its
+    /// own change time is 3 s old. A probe that stopped calling `settle_of`
+    /// would read every candidate as unknown, and launch it at once.
+    #[test]
+    fn settle_probe_judges_the_resolved_candidate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("claude");
+        std::fs::write(&file, b"image").unwrap();
+        let changed = own_change_time(&file);
+
+        let (path, settle) =
+            settle_probe(Some(file.clone()), changed + Duration::from_millis(500)).unwrap();
+        assert_eq!(path, file);
+        assert_eq!(
+            settle,
+            Settle::Changing {
+                age: Duration::from_millis(500)
+            }
+        );
+        assert_eq!(
+            settle_probe(Some(file.clone()), changed + Duration::from_secs(3)),
+            Some((file, Settle::Settled))
+        );
+        assert_eq!(settle_probe(None, changed), None, "a miss stays a miss");
+    }
+
+    /// A candidate the scan resolved that is gone by the time its change time
+    /// is read (npm's reify renamed it aside) is a miss, not an unknown.
+    #[test]
+    fn settle_probe_reads_a_candidate_that_vanished_as_a_miss() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gone = tmp.path().join("claude");
+        assert_eq!(settle_probe(Some(gone), SystemTime::now()), None);
+    }
+
+    /// Scripted: a candidate that vanishes mid-wait (the probe now reads it as
+    /// a miss) and comes back settled is waited out within one bound, never
+    /// launched while gone.
+    #[test]
+    fn resolve_settled_with_wait_waits_out_a_candidate_that_vanishes() {
+        let (mut sleeps, mut notes) = (0, Vec::new());
+        let got = resolve_settled_with_wait(
+            scripted(vec![changing(0), None, Some(Settle::Settled)]),
+            Duration::from_secs(10),
+            Duration::from_millis(250),
+            |_| sleeps += 1,
+            |n| notes.push(n),
+        );
+        assert_eq!(got, Resolved::Settled(PathBuf::from("/real/claude")));
+        assert_eq!(sleeps, 2);
+        assert_eq!(
+            notes,
+            [
+                WaitNote::Changing {
+                    path: PathBuf::from("/real/claude"),
+                    age: Duration::ZERO,
+                },
+                WaitNote::Missing,
+            ]
+        );
+    }
+
+    #[test]
+    fn the_settle_wait_line_names_the_path_age_and_bound() {
+        assert_eq!(
+            wait_line(
+                "claude",
+                &WaitNote::Changing {
+                    path: PathBuf::from("/npm/bin/claude"),
+                    age: Duration::from_millis(1_400),
+                },
+                Duration::from_secs(10),
+            ),
+            "qontinui-shim: /npm/bin/claude changed 1s ago (an install may still be writing \
+             it); waiting up to 10s for it to settle"
+        );
+        assert!(
+            wait_line("claude", &WaitNote::Missing, Duration::from_secs(10))
+                .starts_with("qontinui-shim: claude not found on PATH")
+        );
+    }
+
     #[test]
     fn resolve_wait_env_parses_seconds_and_fails_open_to_the_default() {
         let d = Duration::from_secs(10);
@@ -2165,6 +2624,30 @@ mod tests {
         assert!(identity_mcp_config_args(IdentityTool::Claude, Some("")).is_empty());
         assert!(identity_mcp_config_args(IdentityTool::Claude, Some("  ")).is_empty());
         assert!(identity_mcp_config_args(IdentityTool::Claude, None).is_empty());
+    }
+
+    /// The self-provisioned config is re-exported only when `claude` is given
+    /// it; a failed mint (no path, a missing file) or gemini leaves the
+    /// inherited variable alone.
+    #[test]
+    fn minted_mcp_config_export_only_for_a_config_claude_is_given() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("minted.json");
+        std::fs::write(&file, b"{}").unwrap();
+        assert_eq!(
+            minted_mcp_config_export(IdentityTool::Claude, Some(&file)),
+            Some(file.to_string_lossy().into_owned())
+        );
+        assert_eq!(minted_mcp_config_export(IdentityTool::Claude, None), None);
+        let missing = tmp.path().join("gone.json");
+        assert_eq!(
+            minted_mcp_config_export(IdentityTool::Claude, Some(&missing)),
+            None
+        );
+        assert_eq!(
+            minted_mcp_config_export(IdentityTool::Gemini, Some(&file)),
+            None
+        );
     }
 
     /// §5 fail-open: gemini has no `--mcp-config` flag, so the fallback must

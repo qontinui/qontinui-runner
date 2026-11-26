@@ -136,6 +136,9 @@ observes = [
 [[targets]]
 # Holder crates (ubuntu-latest + windows-latest): cargo test -p
 # qontinui-pty-holder -p qontinui-runner-win32; clippy -p qontinui-pty-holder.
+# ALSO READ BY CI: ci.yml `holder-changes` runs the windows-latest arm only
+# when a changed file matches `global` or this list, so a path missing here
+# now skips a Windows run, not only a coord verdict. Keep it a superset.
 name = "holder-crates"
 observes = [
   "crates/pty-holder/**",
@@ -191,6 +194,23 @@ observes = [".github/scripts/route-ci-lane.py"]
 # route-windows: Windows pool routing (merge-candidate push only).
 name = "route-windows"
 observes = [".github/scripts/route-ci-lane.py"]
+
+[[targets]]
+# design-guide: `design-kit compile --root . --check` over the design-language
+# source against the committed src/design-system/ outputs, then validate-guide
+# over the two fixtures. The kit is installed from design/kit/ outside the
+# app's pnpm tree, so no app manifest is read.
+name = "design-guide"
+observes = [
+  "design/**",
+  "src/design-system/**",
+]
+
+[[targets]]
+# holder-changes: picks holder-crates' matrix by matching the change's files
+# against THIS map's `global` + `holder-crates` lists (git + python only).
+name = "holder-changes"
+observes = [".qontinui/ci-targets.toml"]
 
 # ---------------------------------------------------------------------------
 # Unfiltered companion workflows

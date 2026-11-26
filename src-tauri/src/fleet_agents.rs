@@ -400,7 +400,7 @@ pub(crate) fn remove_retired_agents(
 pub(crate) const SHIPPED_AGENTS: &[&str] = &[
     "code-reviewer.md 193662af813333047cb0fefcb0e17f3f81e6ad7f 519fd1ab38bc53a7514bbbe20f60ae01957abcb0 624b3b339ebc4ae13850c124e3992d162b788e49 6b6e6f08312a2e5a581c139415a81b3c5d5ce3f4 959d627662996f8bde590a13a6c84ad22f3a8529 b28243932fb683f13285c11a6f190c69b89d2949 d895a90a12c5480816fed332958bc009a9ae88ad",
     "debugging-specialist.md 1d1851df238088b5d0b646470bdc0a54b48d9593 4197dd492b8e9ead49ae1486e49ea670122ee7bf a9e6b6e25535c13ad85e50dccafa4b2178e1e20e d10848df68d3731545f0f740ef8979d2e7fd5a7c f8d86dae7e6e5b1bcd9e995678f30f3c01ed6e06",
-    "merge-specialist.md 2c2c6b8f16c8c6d802031bd633a07a2bb1c39c06 34d940fae8d8dea82c2edb6f71d935b49d67927e 61496d273875945aa0d978c6c1acf3bf8d087e56 647e942b3b9e31ac2ce85c24202d4ad3db75e8b9 cbced9b9855b4f21dc3310872ad1a6ec54640b82 ce8ecbe3210ce14497b5a57d47fd6a3dff78c2cd d22a06aa0b0313d77091d910313cf30d11995bff e094d49328098d0198a210b4901a224904081f78 e5ce959417a0ea4fd89c3d5c3ed4739f22181312 f35d49a5fddc93fbf6d3090106c6b3d0a5e6069f",
+    "merge-specialist.md 2c2c6b8f16c8c6d802031bd633a07a2bb1c39c06 34d940fae8d8dea82c2edb6f71d935b49d67927e 61496d273875945aa0d978c6c1acf3bf8d087e56 647e942b3b9e31ac2ce85c24202d4ad3db75e8b9 8f7de9f8c71b0aac0a8025c32d9e0b6b7c571169 cbced9b9855b4f21dc3310872ad1a6ec54640b82 ce8ecbe3210ce14497b5a57d47fd6a3dff78c2cd d22a06aa0b0313d77091d910313cf30d11995bff e094d49328098d0198a210b4901a224904081f78 e5ce959417a0ea4fd89c3d5c3ed4739f22181312 f35d49a5fddc93fbf6d3090106c6b3d0a5e6069f",
     "repo-auditor.md 45954e716979d2d6e6c6ecc7d1616db1ff19f58e 5781f39d5c0a2f7abe9455b661fd72cde6784a8e 64764a4119d9277a1ce58a09ad7e683cd2111367 6e3b88232bd59f0569aa8ab459d8f6396a025b1e a877ff7aa55ec01b3a29ed08250aa0f32b85c7c6 aba1edddfec2c7f0806685ba9cc184f2439b0df3 e5ec73ffb9ab0389102e6f737ac10ea288f9571d",
 ];
 
@@ -698,7 +698,38 @@ pub(crate) fn write_atomically(
             }
         }
     }
-    tmp.persist(dst).map(|_| ()).map_err(|e| e.error)
+    persist_with_retry(tmp, dst)
+}
+
+/// How many times a rename blocked by a transient Windows sharing violation is
+/// retried, and how long to wait between tries (total bounded at ~1 s).
+const PERSIST_RETRIES: u32 = 10;
+const PERSIST_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Whether `e` is the transient Windows error for a destination another
+/// process (an antivirus scan, an editor, a reader that opened without
+/// `FILE_SHARE_DELETE`) briefly holds open: `ERROR_ACCESS_DENIED` (5) or
+/// `ERROR_SHARING_VIOLATION` (32). Always false off Windows.
+fn is_transient_sharing_error(e: &std::io::Error) -> bool {
+    cfg!(windows) && matches!(e.raw_os_error(), Some(5) | Some(32))
+}
+
+/// `tmp.persist(dst)`, retried a bounded number of times while the failure is a
+/// Windows sharing violation. Any other error, or the last violation, is
+/// returned and the temporary file is dropped (deleted) with the error.
+fn persist_with_retry(mut tmp: tempfile::NamedTempFile, dst: &Path) -> std::io::Result<()> {
+    let mut attempt = 0;
+    loop {
+        match tmp.persist(dst) {
+            Ok(_) => return Ok(()),
+            Err(e) if attempt < PERSIST_RETRIES && is_transient_sharing_error(&e.error) => {
+                attempt += 1;
+                tmp = e.file;
+                std::thread::sleep(PERSIST_RETRY_DELAY);
+            }
+            Err(e) => return Err(e.error),
+        }
+    }
 }
 
 /// The blob in `shipped` that `bytes` is, as they are or with CRLF folded to

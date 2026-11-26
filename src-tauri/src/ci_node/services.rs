@@ -100,6 +100,16 @@
 //!   auto-sweep: a runner cannot tell another live dispatch's container from an
 //!   orphan, and killing a peer's database mid-build would be a worse bug than
 //!   the leak it cleans up.
+//!   Beside it, every container also carries the fleet's ephemeral-container
+//!   label contract — `qontinui.ephemeral=1`,
+//!   `qontinui.ephemeral.owner=runner-ci-node` and
+//!   `qontinui.owner=ci:runner-ci-node` — the one contract every fleet
+//!   test-container producer is being moved onto (plan
+//!   `2026-11-23-cleanup-steward-class-15-leaked-test-containers-successor`
+//!   Phase 1b). They mark the container as a TEST container
+//!   and name this lane as its owner, so a fleet sweeper (the cleanup steward's
+//!   class 15, that plan's Phase 3) will delegate it to this module's own teardown instead of
+//!   judging it by another harness's liveness rule. They authorise nothing.
 //! * A dispatch removes only containers whose names it minted from its OWN
 //!   dispatch id. Nothing else on the machine is ever touched — the developer's
 //!   own Postgres, and a peer dispatch's containers, are outside the blast
@@ -217,6 +227,21 @@ const LOG_TAIL_LINES: &str = "50";
 /// Label every container carries, so survivors of a killed runner are
 /// identifiable. See the module docs on what this does and does not buy.
 pub(crate) const DISPATCH_LABEL: &str = "qontinui.ci.dispatch";
+/// The fleet's TEST-container marker key, stamped `=1`. The same key
+/// `ephemeral-db.sh` stamps, so a sweeper reads one contract for every harness
+/// that starts a throwaway database. It marks; it authorises nothing.
+pub(crate) const EPHEMERAL_LABEL: &str = "qontinui.ephemeral";
+/// Which harness owns an ephemeral container, and therefore whose liveness rule
+/// applies to it. The cleanup steward's class-15 owner resolver (planned, not
+/// yet shipped) will read it first.
+pub(crate) const EPHEMERAL_OWNER_LABEL: &str = "qontinui.ephemeral.owner";
+/// The value this module writes under [`EPHEMERAL_OWNER_LABEL`].
+pub(crate) const EPHEMERAL_OWNER: &str = "runner-ci-node";
+/// The fleet-wide `<kind>:<name>` owner key — that planned resolver's fallback when
+/// [`EPHEMERAL_OWNER_LABEL`] is absent, shared with the network owner labels.
+pub(crate) const OWNER_LABEL: &str = "qontinui.owner";
+/// The value this module writes under [`OWNER_LABEL`].
+pub(crate) const OWNER: &str = "ci:runner-ci-node";
 /// Host address services are published on, and the address the exported env
 /// spells. IPv4 loopback explicitly — never `localhost`.
 const LOOPBACK: &str = "127.0.0.1";
@@ -503,6 +528,14 @@ pub(crate) fn run_argv(
         name.to_string(),
         "--label".to_string(),
         format!("{DISPATCH_LABEL}={dispatch_id}"),
+        // The fleet-wide ephemeral label contract (see the module docs): marks
+        // this as a TEST container and names this lane as its owner.
+        "--label".to_string(),
+        format!("{EPHEMERAL_LABEL}=1"),
+        "--label".to_string(),
+        format!("{EPHEMERAL_OWNER_LABEL}={EPHEMERAL_OWNER}"),
+        "--label".to_string(),
+        format!("{OWNER_LABEL}={OWNER}"),
         // Loopback ONLY. `-p 5432:5432` would publish on every interface.
         "-p".to_string(),
         format!("{LOOPBACK}:{host_port}:{}", spec.container_port),
@@ -1498,6 +1531,33 @@ mod tests {
         assert!(argv.contains(&"--cpus".to_string()));
         // The image is the last token.
         assert_eq!(argv.last().unwrap(), "pgvector/pgvector:pg16");
+    }
+
+    /// The ephemeral owner label contract: every service container carries the
+    /// dispatch label plus all three fleet labels, each as its own `--label`
+    /// value, with the literal strings the cleanup steward keys on.
+    #[test]
+    fn run_argv_stamps_the_ephemeral_owner_label_contract() {
+        for entry in ["postgres", "postgres-pgvector", "redis"] {
+            let spec = lookup(entry).unwrap();
+            let argv = run_argv(spec, "img:1", "c", "d-123", 51999);
+            let labels: Vec<&str> = argv
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i > 0 && argv[i - 1] == "--label")
+                .map(|(_, a)| a.as_str())
+                .collect();
+            assert_eq!(
+                labels,
+                [
+                    "qontinui.ci.dispatch=d-123",
+                    "qontinui.ephemeral=1",
+                    "qontinui.ephemeral.owner=runner-ci-node",
+                    "qontinui.owner=ci:runner-ci-node",
+                ],
+                "{entry}: label set drifted: {argv:?}"
+            );
+        }
     }
 
     /// THE CREDENTIAL NEVER TOUCHES AN ARGV.

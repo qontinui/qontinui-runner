@@ -35,7 +35,7 @@ interface TerminalPageTabBarProps {
   onReorderPage?: (sourceId: string, targetId: string | null) => void;
   onReorganize?: () => void;
   /** Close every page that hosts no terminals. Resolves to how many were closed. */
-  onCloseEmptyPages?: () => Promise<number>;
+  onCloseEmptyPages?: () => Promise<number | null>;
   /** Last-known count of tabs the button would close; 0 disables it. Omitted = unknown, stays enabled. */
   emptyPageCount?: number;
   /**
@@ -86,7 +86,11 @@ export function TerminalPageTabBar({
     setClosingEmpty(true);
     try {
       const n = await onCloseEmptyPages();
-      setCloseEmptyNote(n > 0 ? `Closed ${n} empty` : "No empty tabs");
+      // null = occupancy could not be fully read (a source failed, or coord's
+      // drain withheld the restorable set): UNKNOWN, never "no empty tabs".
+      setCloseEmptyNote(
+        n === null ? "Couldn't verify which tabs are empty" : n > 0 ? `Closed ${n} empty` : "No empty tabs",
+      );
     } catch {
       setCloseEmptyNote("Couldn't close empty tabs");
     } finally {
