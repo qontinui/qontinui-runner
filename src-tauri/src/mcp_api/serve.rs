@@ -837,9 +837,9 @@ pub async fn start_server(
     .await
 }
 
-#[cfg(test)]
 // Adoption is unix-only, so the adoption tests (and what they import) are too.
 #[cfg_attr(not(unix), allow(unused_imports))]
+#[cfg(test)]
 mod listener_adoption_tests {
     use super::{
         acquire_api_listener_with, booting_gate, booting_response, serve_on_dedicated_runtime,
