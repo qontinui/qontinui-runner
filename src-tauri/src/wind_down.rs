@@ -471,6 +471,31 @@ pub enum MemberState {
     /// A probe could not be completed — it failed, timed out, or the path is
     /// not a worktree at all.
     ProbeFailed(String),
+    /// A LIVE ledger row whose path exists under none of the worktree roots it
+    /// was resolved against, every one of those roots being readable. Not
+    /// "reaped": a WIP custody ref snapshots tracked changes only, so a tree
+    /// that vanished may have taken untracked work with it. UNKNOWN, with the
+    /// roots named so an operator can act.
+    AbsentFromEveryRoot { roots_tried: Vec<String> },
+}
+
+/// How one coord ledger `worktree_path` was resolved to a place on disk
+/// (plan `2026-11-22-wind-down-custody-probe-and-undelivered-guard-read-unknown-where-they-can-decide`,
+/// Phase 5). Serialised into `windDown.custody.worktrees` so an operator reads
+/// WHERE the probe looked, not only that it failed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeResolution {
+    /// The ledger string exactly as coord served it.
+    pub ledger_path: String,
+    /// The worktree roots the path was resolved against, in order. Empty for
+    /// an absolute ledger path (nothing to resolve).
+    pub roots_tried: Vec<String>,
+    /// The candidate paths that exist: one is `found`, two is `ambiguous`.
+    pub resolved: Vec<String>,
+    /// `absolute` | `found` | `ambiguous` | `absent_from_every_root` |
+    /// `reaped_retired` | `root_unreadable` | `probe_error`.
+    pub outcome: &'static str,
 }
 
 /// One worktree the session touched, as probed.
@@ -506,6 +531,9 @@ pub struct CustodyInputs {
     /// so its state is UNKNOWN (see `ObligationsUnknown::WorktreeNotProbed`).
     /// Empty when the gather stopped before probing anything.
     pub covered: Vec<String>,
+    /// How each coord ledger path was resolved (empty when the gather stopped
+    /// before resolving anything). Reporting only: the verdict never reads it.
+    pub resolutions: Vec<WorktreeResolution>,
 }
 
 /// Why custody rules a session out.
@@ -531,6 +559,11 @@ pub enum CustodyUnknown {
     OwnershipUnreadable { detail: String },
     /// A member's probe failed or timed out.
     ProbeFailed { path: String, detail: String },
+    /// A live ledger row exists under none of the (readable) worktree roots.
+    WorktreeAbsentFromEveryRoot {
+        path: String,
+        roots_tried: Vec<String>,
+    },
 }
 
 /// The custody verdict. Only [`CustodyVerdict::Clean`] lets the
@@ -577,6 +610,7 @@ impl CustodyUnknown {
             Self::NoSessionDir => "no_session_dir",
             Self::OwnershipUnreadable { .. } => "ownership_unreadable",
             Self::ProbeFailed { .. } => "probe_failed",
+            Self::WorktreeAbsentFromEveryRoot { .. } => "worktree_absent_from_every_root",
         }
     }
 
@@ -590,6 +624,19 @@ impl CustodyUnknown {
                 format!("the session's attributed worktrees could not be read: {detail}")
             }
             Self::ProbeFailed { path, detail } => format!("{path}: {detail}"),
+            Self::WorktreeAbsentFromEveryRoot { path, roots_tried } if roots_tried.is_empty() => {
+                format!(
+                    "{path} is a live ledger row with an absolute path that does not exist; \
+                     it is not treated as reaped, because untracked work in a vanished tree \
+                     is not preserved"
+                )
+            }
+            Self::WorktreeAbsentFromEveryRoot { path, roots_tried } => format!(
+                "{path} is a live ledger row but exists under none of the worktree roots tried \
+                 ({}); it is not treated as reaped, because untracked work in a vanished tree \
+                 is not preserved",
+                roots_tried.join(", ")
+            ),
         }
     }
 }
@@ -664,7 +711,9 @@ pub fn custody_gate(inputs: &CustodyInputs) -> CustodyVerdict {
             MemberState::Probed { dirty: true, .. } => {
                 return CustodyVerdict::Dirty(CustodyDirty::Uncommitted { path })
             }
-            MemberState::Probed { .. } | MemberState::ProbeFailed(_) => {}
+            MemberState::Probed { .. }
+            | MemberState::ProbeFailed(_)
+            | MemberState::AbsentFromEveryRoot { .. } => {}
         }
         if let Some(state) = member
             .slot_wip_state
@@ -690,6 +739,12 @@ pub fn custody_gate(inputs: &CustodyInputs) -> CustodyVerdict {
                     detail: detail.clone(),
                 })
             }
+            MemberState::AbsentFromEveryRoot { roots_tried } => {
+                return CustodyVerdict::Unknown(CustodyUnknown::WorktreeAbsentFromEveryRoot {
+                    path: member.path.clone(),
+                    roots_tried: roots_tried.clone(),
+                })
+            }
             MemberState::Probed { .. } | MemberState::PrimaryCheckout => {}
         }
     }
@@ -709,6 +764,10 @@ pub struct CustodyView {
     pub detail: Option<String>,
     /// When the arm judged it (unix millis).
     pub judged_at: i64,
+    /// How each coord ledger path was resolved: the roots tried and the paths
+    /// that exist. Omitted when the pass resolved no ledger path.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub worktrees: Vec<WorktreeResolution>,
 }
 
 impl CustodyView {
@@ -718,6 +777,7 @@ impl CustodyView {
             reason: verdict.reason(),
             detail: verdict.detail(),
             judged_at: judged_at_ms,
+            worktrees: Vec::new(),
         }
     }
 }
@@ -1619,6 +1679,7 @@ mod tests {
             ownership: Ok(()),
             members,
             covered: Vec::new(),
+            resolutions: Vec::new(),
         }
     }
 

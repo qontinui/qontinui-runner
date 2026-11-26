@@ -3451,18 +3451,14 @@ mod usage_report_scope_tests {
     /// Assert `path` lies under `root`, comparing the two as the filesystem
     /// resolves them rather than as spelled (macOS spells its temp dir through
     /// the `/var` -> `/private/var` link). `path` may not exist yet, so its
-    /// nearest existing ancestor is resolved and the rest re-joined lexically.
+    /// nearest existing PATH — the leaf file itself when it exists, so a
+    /// symlinked file pointing outside the fixture is caught — is resolved and
+    /// the rest re-joined lexically. An unfollowable (dangling) link panics.
     /// Nothing is created, so a path that did escape is not touched.
     fn assert_inside(path: &std::path::Path, root: &std::path::Path, what: &str) {
         let root = std::fs::canonicalize(root).expect("canonicalize the fixture root");
-        let mut existing = path;
-        let mut rest = Vec::new();
-        while !existing.exists() {
-            rest.push(existing.file_name().expect("a path under a root has names"));
-            existing = existing.parent().expect("a path under a root has a parent");
-        }
-        let mut resolved = std::fs::canonicalize(existing).expect("canonicalize the ancestor");
-        resolved.extend(rest.into_iter().rev());
+        let resolved = crate::util::existing_ancestor::resolve_through_existing_path(path)
+            .expect("resolve the path through its nearest existing path");
         assert!(
             resolved.starts_with(&root),
             "{what}: {} (resolved {}) is not under {}",

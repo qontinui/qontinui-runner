@@ -92,7 +92,7 @@ async fn handle_diff(
         error_detail: None,
         hint: None,
         code: None,
-        suggestions: None,
+        refusal: None,
     }))
 }
 
@@ -116,7 +116,7 @@ async fn handle_save_snapshot(
                 error_detail: None,
                 hint: None,
                 code: None,
-                suggestions: None,
+                refusal: None,
             }),
         )
     })?;
@@ -137,7 +137,7 @@ async fn handle_save_snapshot(
                 error_detail: None,
                 hint: None,
                 code: None,
-                suggestions: None,
+                refusal: None,
             }),
         )
     })?;
@@ -168,7 +168,7 @@ async fn handle_save_snapshot(
                     error_detail: None,
                     hint: None,
                     code: None,
-                    suggestions: None,
+                    refusal: None,
                 }),
             )
         })?;
@@ -194,7 +194,7 @@ async fn handle_save_snapshot(
         error_detail: None,
         hint: None,
         code: None,
-        suggestions: None,
+        refusal: None,
     }))
 }
 
@@ -219,7 +219,7 @@ async fn handle_list_snapshots(
                 error_detail: None,
                 hint: None,
                 code: None,
-                suggestions: None,
+                refusal: None,
             }),
         )
     })?;
@@ -241,7 +241,7 @@ async fn handle_list_snapshots(
                     error_detail: None,
                     hint: None,
                     code: None,
-                    suggestions: None,
+                    refusal: None,
                 }),
             )
         })?;
@@ -264,7 +264,7 @@ async fn handle_list_snapshots(
         error_detail: None,
         hint: None,
         code: None,
-        suggestions: None,
+        refusal: None,
     }))
 }
 

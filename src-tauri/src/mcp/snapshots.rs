@@ -258,27 +258,11 @@ impl BaseBlobs {
                 Some((full.parent()?.to_path_buf(), PathBuf::from(name)))
             }) {
             Some(split) => split,
-            None => {
-                // The file — and its directory — may be gone (a session that
-                // deleted them), so discovery starts from the nearest
-                // directory that exists.
-                let mut dir = path.parent();
-                while let Some(d) = dir {
-                    if d.is_dir() {
-                        break;
-                    }
-                    dir = d.parent();
-                }
-                let dir =
-                    dir.ok_or_else(|| format!("no existing ancestor of {}", path.display()))?;
-                let rest = path
-                    .strip_prefix(dir)
-                    .map_err(|e| format!("{}: {e}", path.display()))?
-                    .to_path_buf();
-                let canon_dir = std::fs::canonicalize(dir)
-                    .map_err(|e| format!("canonicalize {}: {e}", dir.display()))?;
-                (canon_dir, rest)
-            }
+            // The file — and its directory — may be gone (a session that
+            // deleted them), so discovery starts from the nearest directory
+            // that exists. The walk starts at the PARENT: a symlinked leaf is
+            // recorded in the tree under its own name and must not be followed.
+            None => crate::util::existing_ancestor::split_at_canonical_dir(path, path.parent())?,
         };
 
         let workdir = self

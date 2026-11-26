@@ -107,11 +107,13 @@ pub const QONTINUI_HOME_ENV: &str = "QONTINUI_HOME";
 ///   is absent, on unix and Windows respectively.
 /// - `QONTINUI_ROOT` / `QONTINUI_WORKSPACE_ROOT` — workspace discovery.
 /// - `QONTINUI_PLANS_DIR` — the plan corpus authoring directory.
-/// - `QONTINUI_DISABLE_KEYCHAIN` — flips the credential store to a file
-///   backend. Captured and restored, but NOT set or removed by the fixture:
-///   CI sets it to `1` on purpose (the test step in `.github/workflows/ci.yml`),
-///   and removing it would re-arm the macOS keychain hang for every fixture
-///   test that does not set it again.
+/// - `QONTINUI_DISABLE_KEYCHAIN` — stops the credential store falling back to
+///   the OS keychain. The fixture SETS it to `1` (see `KEYS_SET_TO_ONE`), as
+///   CI does (the test step in `.github/workflows/ci.yml`, and
+///   `ci_node/manifest.rs`): with it unset, any `AuthManager` reading an empty
+///   fixture store falls through to the operator's real keychain entry. It is
+///   captured and restored, and never REMOVED, since removing it would re-arm
+///   the macOS keychain hang for every fixture test that does not set it again.
 /// - `DATABASE_URL` — set on a developer box and in DB-gated CI, unset
 ///   elsewhere.
 /// - `CLAUDE_CONFIG_DIR` — the Claude account in force on this box. A runner
@@ -176,6 +178,8 @@ pub const AMBIENT_ENV_KEYS: &[&str] = &[
     "QONTINUI_CENSUS_CHUNK_ROWS",
     "QONTINUI_CENSUS_CHUNK_SECS",
     "QONTINUI_CENSUS_POST_TIMEOUT_SECS",
+    // Read through `terminal::child_path::SHELL_READ_ENV`.
+    "QONTINUI_CHILD_PATH_SHELL_READ",
     // Read through `ci_node::cgroup::CGROUP_ROOT_ENV`, by `ci_node` and by the
     // slice telemetry's CPU attribution (`fleet::slice_telemetry::cpu`).
     "QONTINUI_CI_CGROUP_ROOT",
@@ -851,6 +855,21 @@ pub mod test_support {
         keys
     }
 
+    /// Keys the fixture sets to `"1"`.
+    ///
+    /// `QONTINUI_DISABLE_KEYCHAIN`: `AuthManager::get_access_token` falls back
+    /// to the OS keychain under the fixed service name `com.qontinui.runner`
+    /// whenever the `.enc` store is absent — and the fixture's store is
+    /// always absent. On a paired Windows box that fallback returns the
+    /// operator's LIVE device token, so a fixture test reads the box's real
+    /// tenant (measured on `spaceship`: the tenancy-report test resolved the
+    /// operator's tenant instead of refusing). CI sets this key for the whole
+    /// run (`ci_node/manifest.rs`), so setting it here makes a local run
+    /// answer as CI does. A test that genuinely exercises the keychain uses
+    /// `AuthManager::with_storage_force_keychain`, which ignores the variable.
+    /// Plan `2026-10-05-four-runner-unit-tests-read-the-machine-they-run-on`.
+    pub const KEYS_SET_TO_ONE: &[&str] = &["QONTINUI_DISABLE_KEYCHAIN"];
+
     /// A single process-wide lock that serializes every test which reads or
     /// mutates a `std::env` variable.
     ///
@@ -1167,6 +1186,8 @@ pub mod test_support {
     ///   exports and a clean CI runner does not, and every
     ///   [`root_confined_keys_removed`] key, which a session a subject runner
     ///   hosts inherits;
+    /// - sets every [`KEYS_SET_TO_ONE`] key to `"1"` — today the keychain
+    ///   kill-switch, so no fixture test can reach the OS keychain;
     /// - sets `QONTINUI_ENV` to [`NO_SUCH_PROFILE`], so the profile arm of the
     ///   coord-base resolver misses deterministically;
     /// - clears the process-global runtime tier override
@@ -1231,6 +1252,9 @@ pub mod test_support {
                 .chain(root_confined_keys_removed())
             {
                 std::env::remove_var(key);
+            }
+            for key in KEYS_SET_TO_ONE {
+                std::env::set_var(key, "1");
             }
             std::env::set_var("QONTINUI_ENV", NO_SUCH_PROFILE);
             crate::profiles::set_runtime_tier_override(None);
@@ -1671,6 +1695,7 @@ mod tests {
         KEYS_SET_TO_DIR
             .iter()
             .chain(KEYS_REMOVED)
+            .chain(KEYS_SET_TO_ONE)
             .chain(&["QONTINUI_ROOT", "QONTINUI_ENV", QONTINUI_HOME_ENV])
             .copied()
             .chain(root_confined_keys_removed())
@@ -1709,6 +1734,12 @@ mod tests {
                 } else if KEYS_REMOVED.contains(k) || root_confined_keys_removed().any(|r| r == *k)
                 {
                     assert_eq!(got, None, "{k} must be removed");
+                } else if KEYS_SET_TO_ONE.contains(k) {
+                    assert_eq!(
+                        got.as_deref(),
+                        Some(std::ffi::OsStr::new("1")),
+                        "{k} must be set to 1"
+                    );
                 } else if *k == "QONTINUI_ROOT" {
                     assert_eq!(got.as_deref(), Some(amb.root().as_os_str()));
                 } else if *k == "QONTINUI_ENV" {

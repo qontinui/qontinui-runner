@@ -58,8 +58,13 @@
 # attributing it to them is not. So the verdict is split (see
 # `lib/gen-events-attribution.sh`):
 #
-#   pusher-caused — this push's own commits or working tree touch something
-#                   that feeds schemas.json. Hard failure, exactly as before.
+#   pusher-caused — the branch's own commits (measured from its merge-base
+#                   with the default branch: origin/HEAD, else origin/main,
+#                   else the upstream) or its working tree touch something
+#                   that feeds schemas.json. Blocking, unless the per-file
+#                   refinement below clears every drifted file. Under STRICT
+#                   it blocks either way, and the refinement changes only
+#                   the message.
 #   pre-existing  — they touch nothing that feeds it, so the inputs behind the
 #                   diff are already upstream and the drift predates the push.
 #                   Reported in full, as an informational note, and not
@@ -173,7 +178,8 @@ fi
 . "$ATTRIBUTION_LIB"
 
 # The per-file refinement. Same guarded-source shape. A missing copy of this
-# library cannot clear anyone: without it the whole-push verdict stands.
+# library cannot clear anyone: without it the hook refuses outright, before
+# any check runs.
 FILE_ATTRIBUTION_LIB="$SCRIPT_DIR/lib/gen-events-file-attribution.sh"
 if [ ! -f "$FILE_ATTRIBUTION_LIB" ]; then
     fail "ERROR: missing $FILE_ATTRIBUTION_LIB"

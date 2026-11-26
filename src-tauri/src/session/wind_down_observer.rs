@@ -62,7 +62,7 @@ use crate::terminal::agent_status_sideband::ObservedAgentState;
 use crate::terminal::TerminalManager;
 use qontinui_runner_lib::wind_down::{
     self, CustodyInputs, CustodyMember, EligibilityInputs, GridIdle, MemberState, SessionKind,
-    Sideband, SidebandState, WindDownView, WorkStatus,
+    Sideband, SidebandState, WindDownView, WorkStatus, WorktreeResolution,
 };
 
 /// The cause recorded when the terminal-session plane cannot be counted
@@ -716,17 +716,29 @@ pub fn first_uncovered_coord_worktree(
 /// "no undelivered message" input) — the delivery poller's own bound.
 pub const PENDING_MESSAGES_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// coord's undelivered, unacked, unexpired messages for this device — `GET
-/// /coord/session-messages/pending`, the door the delivery poller pulls — as
-/// `(message_id, to_session)` pairs. `?live=` names the session when its id is
-/// a UUID, which ranks its oldest row onto the page (coord's round-robin puts
-/// a `live` recipient's first row ahead of every other recipient's). `Err`
-/// when there is no coord base, no shared client, no device credential (coord
-/// refuses an anonymous read), the read fails, or the body is not the shape
-/// coord serves: the close guard reads every `Err` as UNKNOWN.
-pub async fn fetch_pending_messages(
-    claude_session_id: &str,
-) -> Result<Vec<(String, String)>, String> {
+/// One read of coord's pending-message page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingPage {
+    /// `(message_id, to_session)` per row.
+    pub rows: Vec<(String, String)>,
+    /// coord echoed `session_filter_applied: true`: the rows are ONLY the
+    /// requested session's. `false` when the runner sent no `session`, or the
+    /// response did not echo the filter (a coord that predates it ignores the
+    /// parameter, so the page is the whole DEVICE's).
+    pub session_filter_applied: bool,
+}
+
+/// coord's undelivered, unacked, unexpired messages - `GET
+/// /coord/session-messages/pending`, the door the delivery poller pulls.
+/// A UUID-shaped Claude session id is sent as `?session=` (coord's
+/// `to_session` is the agent_sessions id, which in production IS the Claude
+/// session UUID; NOT `coord.sessions.id`, a different id space) so coord
+/// returns only that session's rows, and as `?live=`. A non-UUID id sends
+/// neither, so the page stays the device's. `Err` when there is no coord base, no shared client,
+/// no device credential (coord refuses an anonymous read), the read fails, or
+/// the body is not the shape coord serves: the close guard reads every `Err`
+/// as UNKNOWN.
+pub async fn fetch_pending_messages(claude_session_id: &str) -> Result<PendingPage, String> {
     let Some(base) = qontinui_runner_lib::profiles::connected_coord_base() else {
         return Err("no coord base is configured, so pending messages cannot be read".to_string());
     };
@@ -739,20 +751,45 @@ pub async fn fetch_pending_messages(
                 .to_string(),
         );
     }
-    let mut url = format!(
-        "{}/coord/session-messages/pending",
-        base.trim_end_matches('/')
-    );
-    if let Ok(uuid) = claude_session_id.trim().parse::<uuid::Uuid>() {
-        url.push_str(&format!("?live={uuid}"));
-    }
+    let url = pending_url(&base, claude_session_id);
     let body = read_obligations(
         crate::coord_http::coord_get(client, &url),
         &url,
         PENDING_MESSAGES_TIMEOUT,
     )
     .await?;
-    pending_message_rows(&body)
+    pending_page(
+        &body,
+        claude_session_id.trim().parse::<uuid::Uuid>().is_ok(),
+    )
+}
+
+/// PURE: the pending-messages URL.
+pub fn pending_url(base: &str, claude_session_id: &str) -> String {
+    let mut url = format!(
+        "{}/coord/session-messages/pending",
+        base.trim_end_matches('/')
+    );
+    if let Ok(uuid) = claude_session_id.trim().parse::<uuid::Uuid>() {
+        url.push_str(&format!("?session={uuid}&live={uuid}"));
+    }
+    url
+}
+
+/// PURE: a pending-message body as a [`PendingPage`]. The filter counts as
+/// applied only when the runner SENT one AND the body echoes
+/// `session_filter_applied: true` - an absent or false echo is an older coord
+/// that ignored the parameter.
+pub fn pending_page(body: &serde_json::Value, sent_session: bool) -> Result<PendingPage, String> {
+    let rows = pending_message_rows(body)?;
+    let echoed = body
+        .get("session_filter_applied")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    Ok(PendingPage {
+        rows,
+        session_filter_applied: sent_session && echoed,
+    })
 }
 
 /// The `(message_id, to_session)` rows of a pending-message body. A body with
@@ -843,14 +880,98 @@ pub fn session_dir_from(record_dir: Option<&str>, process_cwd: Option<&str>) -> 
 /// worktree's branch merged, or the allocation was abandoned.
 pub const RETIRED_LEDGER_STATUSES: [&str; 2] = ["merged", "abandoned"];
 
+/// One place a relative ledger path may live: the worktree root it was tried
+/// against and the full candidate path under it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootedCandidate {
+    pub root: PathBuf,
+    pub path: PathBuf,
+}
+
 /// One worktree coord attributes to the session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttributedWorktree {
+    /// The first candidate for a relative ledger path, else the absolute path.
     pub path: PathBuf,
     /// The ledger says its work is over ([`RETIRED_LEDGER_STATUSES`]). Such a
     /// row whose path is already gone was reaped, and has nothing left to
     /// lose; a LIVE row whose path is gone is still an unknown.
     pub retired: bool,
+    /// The ledger string exactly as coord served it. Pushed into `covered` so
+    /// the obligations cross-check ([`first_uncovered_coord_worktree`]) keeps
+    /// matching coord's own spelling after the path is resolved elsewhere.
+    pub ledger_path: Option<String>,
+    /// Every root a RELATIVE ledger path is tried against (plan
+    /// `2026-11-22-wind-down-custody-probe-and-undelivered-guard-read-unknown-where-they-can-decide`,
+    /// D1). Empty for an absolute ledger path. `candidates[0].path == path`.
+    pub candidates: Vec<RootedCandidate>,
+}
+
+impl AttributedWorktree {
+    /// A worktree at a single known path (an absolute ledger path).
+    pub fn at(path: impl Into<PathBuf>, retired: bool) -> Self {
+        Self {
+            path: path.into(),
+            retired,
+            ledger_path: None,
+            candidates: Vec::new(),
+        }
+    }
+}
+
+/// PURE (D1): the places a coord ledger path may live. `Ok(vec![])` for an
+/// absolute path (nothing to resolve). A path under the host-neutral
+/// `agent-worktrees/` prefix has that segment STRIPPED and the remainder
+/// (`<id>/<repo>`) tried under BOTH worktree roots — the script layout
+/// (`<workspace>/agent-worktrees`) and the runner's own
+/// (`worktree_root`, `qontinui-worktrees` unless overridden); joining the whole
+/// ledger string under the second root would name a path that never exists.
+/// Any other relative path is tried under the workspace root only.
+fn candidate_paths(
+    ledger_path: &str,
+    workspace_root: Option<&Path>,
+    worktree_root: Option<&Path>,
+) -> Result<Vec<RootedCandidate>, String> {
+    let raw = PathBuf::from(ledger_path);
+    if raw.is_absolute() {
+        return Ok(Vec::new());
+    }
+    let Some(workspace) = workspace_root else {
+        return Err(format!(
+            "coord's ledger path {ledger_path} is relative and the workspace root does not resolve"
+        ));
+    };
+    let normalized = ledger_path.replace(std::path::MAIN_SEPARATOR, "/");
+    let prefix = format!(
+        "{}/",
+        crate::agent_worktree::canonical_paths::SCRIPT_WORKTREE_ROOT_DIRNAME
+    );
+    let Some(rest) = normalized
+        .strip_prefix(prefix.as_str())
+        .filter(|r| !r.is_empty())
+    else {
+        return Ok(vec![RootedCandidate {
+            root: workspace.to_path_buf(),
+            path: workspace.join(&raw),
+        }]);
+    };
+    let script_root =
+        workspace.join(crate::agent_worktree::canonical_paths::SCRIPT_WORKTREE_ROOT_DIRNAME);
+    let mut roots = vec![script_root];
+    if let Some(second) = worktree_root {
+        if !roots.iter().any(|r| {
+            custody::norm(&r.to_string_lossy()) == custody::norm(&second.to_string_lossy())
+        }) {
+            roots.push(second.to_path_buf());
+        }
+    }
+    Ok(roots
+        .into_iter()
+        .map(|root| RootedCandidate {
+            path: root.join(rest),
+            root,
+        })
+        .collect())
 }
 
 /// PURE: the worktrees coord attributes to the session, as absolute paths.
@@ -871,6 +992,30 @@ pub fn attributed_worktrees(
     claude_session_id: &str,
     workspace_root: Option<&Path>,
 ) -> Result<Vec<AttributedWorktree>, String> {
+    // The runner's own root, with its env override. The synthetic child gives
+    // `agent_worktree_root` the same canonical shape `allocated_worktree_for_path`
+    // uses.
+    let worktree_root = workspace_root.map(|ws| {
+        crate::agent_worktree::canonical_paths::agent_worktree_root(
+            &ws.join(crate::agent_worktree::canonical_paths::WORKTREE_ROOT_DIRNAME),
+        )
+    });
+    attributed_worktrees_in(
+        ownership,
+        claude_session_id,
+        workspace_root,
+        worktree_root.as_deref(),
+    )
+}
+
+/// [`attributed_worktrees`] with the runner's worktree root injected, so a test
+/// does not depend on the process environment.
+pub fn attributed_worktrees_in(
+    ownership: &OwnershipRead,
+    claude_session_id: &str,
+    workspace_root: Option<&Path>,
+    worktree_root: Option<&Path>,
+) -> Result<Vec<AttributedWorktree>, String> {
     let index = ownership.as_ref().map_err(String::clone)?;
     if let Some(why) = index.unanswered_reason(claude_session_id) {
         return Err(format!(
@@ -888,22 +1033,20 @@ pub fn attributed_worktrees(
         .worktrees_for_session(session_id)
         .into_iter()
         .map(|row| {
-            let raw = PathBuf::from(&row.worktree_path);
-            let path = if raw.is_absolute() {
-                raw
-            } else {
-                workspace_root.map(|root| root.join(&raw)).ok_or_else(|| {
-                    format!(
-                        "coord's ledger path {} is relative and the workspace root does not resolve",
-                        row.worktree_path
-                    )
-                })?
-            };
+            let candidates = candidate_paths(&row.worktree_path, workspace_root, worktree_root)?;
+            let path = candidates
+                .first()
+                .map_or_else(|| PathBuf::from(&row.worktree_path), |c| c.path.clone());
             let retired = row
                 .ledger_status
                 .as_deref()
                 .is_some_and(|s| RETIRED_LEDGER_STATUSES.contains(&s));
-            Ok(AttributedWorktree { path, retired })
+            Ok(AttributedWorktree {
+                path,
+                retired,
+                ledger_path: Some(row.worktree_path.clone()),
+                candidates,
+            })
         })
         .collect()
 }
@@ -931,9 +1074,11 @@ pub trait CustodyProbe: Send + Sync {
 /// root and probed ONCE however many sources named it. A directory in no
 /// repository contributes no member, so a session at the workspace root is
 /// judged by its attributed worktrees alone. An attributed worktree whose
-/// ledger row is retired (merged or abandoned) and whose path no longer
-/// exists was reaped and is skipped; every other missing path is a failed
-/// probe.
+/// ledger row is retired (merged or abandoned) and whose path is absent from
+/// EVERY readable worktree root was reaped and is skipped. A live row absent
+/// from every readable root is the typed UNKNOWN
+/// `worktree_absent_from_every_root`; an unreadable root or directory is a
+/// failed probe. See [`resolve_attributed`].
 ///
 /// When the verdict is already decided — no directory, or an unreadable
 /// attribution (the ownership read, or the isolated-edit context), both
@@ -964,38 +1109,40 @@ pub async fn gather_custody<P: CustodyProbe + ?Sized>(
             ownership,
             members: Vec::new(),
             covered: Vec::new(),
+            resolutions: Vec::new(),
         };
     };
 
     let mut members: Vec<CustodyMember> = Vec::new();
+    let mut resolutions: Vec<WorktreeResolution> = Vec::new();
+    let mut attributed_found: Vec<PathBuf> = Vec::new();
+    for worktree in &attributed {
+        let resolved = resolve_attributed(probe, worktree).await;
+        members.extend(resolved.failure);
+        attributed_found.extend(resolved.found);
+        resolutions.push(resolved.resolution);
+    }
     // Every path this gather looked at — what the obligations cross-check
     // holds coord's `worktrees` block against. An attributed path is covered
     // whatever its probe found (a failed probe is already this gate's own
     // Unknown, and a reaped one was positively seen gone).
+    // The ORIGINAL ledger string is covered too: the resolved path may live
+    // under a root coord's relative `agent-worktrees/<id>/<repo>` never
+    // suffix-matches, and without it the obligations cross-check would read
+    // `WorktreeNotProbed` for a tree custody just judged.
     let mut covered: Vec<String> = attributed
         .iter()
-        .map(|w| w.path.display().to_string())
+        .flat_map(|w| {
+            w.ledger_path
+                .iter()
+                .cloned()
+                .chain(std::iter::once(w.path.display().to_string()))
+                .chain(w.candidates.iter().map(|c| c.path.display().to_string()))
+        })
         .chain(isolated.iter().map(|p| p.display().to_string()))
         .collect();
     let mut named: Vec<(&Path, bool)> = vec![(dir.as_path(), true)];
-    for worktree in &attributed {
-        if worktree.retired {
-            match probe.exists(&worktree.path).await {
-                // Reaped: its work is over and nothing is left to lose.
-                Ok(false) => continue,
-                Ok(true) => {}
-                Err(e) => {
-                    members.push(CustodyMember {
-                        path: worktree.path.display().to_string(),
-                        state: MemberState::ProbeFailed(e),
-                        slot_wip_state: None,
-                    });
-                    continue;
-                }
-            }
-        }
-        named.push((worktree.path.as_path(), false));
-    }
+    named.extend(attributed_found.iter().map(|p| (p.as_path(), false)));
     named.extend(isolated.iter().map(|p| (p.as_path(), false)));
 
     let mut roots: Vec<PathBuf> = Vec::new();
@@ -1039,7 +1186,140 @@ pub async fn gather_custody<P: CustodyProbe + ?Sized>(
         ownership,
         members,
         covered,
+        resolutions,
     }
+}
+
+/// What resolving one attributed worktree established.
+struct ResolvedWorktree {
+    /// Candidate paths that exist and must be probed (two = ambiguous: both
+    /// are probed and both must be clean).
+    found: Vec<PathBuf>,
+    /// A member standing for a resolution that is itself UNKNOWN.
+    failure: Option<CustodyMember>,
+    resolution: WorktreeResolution,
+}
+
+/// Is `root` a readable place to look for worktrees? A root that exists is.
+/// One that does not is merely unused on this box when its PARENT exists; when
+/// the parent is missing too the volume may be unmounted, which reads every
+/// path under it NotFound — so it is unreadable, never "reaped". `Err` carries
+/// why.
+async fn root_readable<P: CustodyProbe + ?Sized>(probe: &P, root: &Path) -> Result<(), String> {
+    match probe.exists(root).await? {
+        true => Ok(()),
+        false => match root.parent() {
+            Some(parent) if probe.exists(parent).await? => Ok(()),
+            _ => Err(format!(
+                "{} and its parent are both missing (an unmounted volume reads this way)",
+                root.display()
+            )),
+        },
+    }
+}
+
+/// Resolve one attributed worktree (D1, D2 of plan
+/// `2026-11-22-wind-down-custody-probe-and-undelivered-guard-read-unknown-where-they-can-decide`).
+async fn resolve_attributed<P: CustodyProbe + ?Sized>(
+    probe: &P,
+    worktree: &AttributedWorktree,
+) -> ResolvedWorktree {
+    let ledger = worktree
+        .ledger_path
+        .clone()
+        .unwrap_or_else(|| worktree.path.display().to_string());
+    let roots_tried: Vec<String> = worktree
+        .candidates
+        .iter()
+        .map(|c| c.root.display().to_string())
+        .collect();
+    let finish = |found: Vec<PathBuf>, failure: Option<CustodyMember>, outcome: &'static str| {
+        ResolvedWorktree {
+            resolution: WorktreeResolution {
+                ledger_path: ledger.clone(),
+                roots_tried: roots_tried.clone(),
+                resolved: found.iter().map(|p| p.display().to_string()).collect(),
+                outcome,
+            },
+            found,
+            failure,
+        }
+    };
+    let failed = |path: &Path, detail: String| CustodyMember {
+        path: path.display().to_string(),
+        state: MemberState::ProbeFailed(detail),
+        slot_wip_state: None,
+    };
+
+    // An absolute ledger path has no root to resolve against: it either
+    // exists or it does not. A retired row that is positively gone was reaped;
+    // a LIVE row that is gone is the typed UNKNOWN, never "reaped".
+    if worktree.candidates.is_empty() {
+        return match probe.exists(&worktree.path).await {
+            Ok(true) => finish(vec![worktree.path.clone()], None, "absolute"),
+            Ok(false) if worktree.retired => finish(Vec::new(), None, "reaped_retired"),
+            Ok(false) => finish(
+                Vec::new(),
+                Some(CustodyMember {
+                    path: ledger.clone(),
+                    state: MemberState::AbsentFromEveryRoot {
+                        roots_tried: Vec::new(),
+                    },
+                    slot_wip_state: None,
+                }),
+                "absent_from_every_root",
+            ),
+            Err(e) => finish(Vec::new(), Some(failed(&worktree.path, e)), "probe_error"),
+        };
+    }
+
+    let mut found: Vec<PathBuf> = Vec::new();
+    let mut failure: Option<CustodyMember> = None;
+    for candidate in &worktree.candidates {
+        match probe.exists(&candidate.path).await {
+            Ok(true) => found.push(candidate.path.clone()),
+            Ok(false) => {}
+            Err(e) => {
+                failure.get_or_insert_with(|| failed(&candidate.path, e));
+            }
+        }
+    }
+    if failure.is_some() {
+        return finish(found, failure, "probe_error");
+    }
+    match found.len() {
+        0 => {}
+        1 => return finish(found, None, "found"),
+        _ => return finish(found, None, "ambiguous"),
+    }
+    // Absent under every candidate. That is only a statement about the
+    // filesystem when every root could actually be read.
+    for candidate in &worktree.candidates {
+        if let Err(e) = root_readable(probe, &candidate.root).await {
+            return finish(
+                Vec::new(),
+                Some(failed(
+                    &worktree.path,
+                    format!("not found under any root, but a root is unreadable: {e}"),
+                )),
+                "root_unreadable",
+            );
+        }
+    }
+    if worktree.retired {
+        return finish(Vec::new(), None, "reaped_retired");
+    }
+    finish(
+        Vec::new(),
+        Some(CustodyMember {
+            path: ledger.clone(),
+            state: MemberState::AbsentFromEveryRoot {
+                roots_tried: roots_tried.clone(),
+            },
+            slot_wip_state: None,
+        }),
+        "absent_from_every_root",
+    )
 }
 
 /// The shipped [`CustodyProbe`]: a filesystem walk for the root, git for the
@@ -1459,10 +1739,7 @@ mod tests {
 
     /// A live attributed worktree.
     fn live(path: &str) -> AttributedWorktree {
-        AttributedWorktree {
-            path: PathBuf::from(path),
-            retired: false,
-        }
+        AttributedWorktree::at(path, false)
     }
 
     #[tokio::test]
@@ -1588,18 +1865,23 @@ mod tests {
     }
 
     /// Review item 7b: a RETIRED ledger row (merged or abandoned) whose path
-    /// is gone was reaped and is skipped; a LIVE row whose path is gone, and a
-    /// retired row whose path still exists, are both still judged.
+    /// is gone was reaped and is skipped; a retired row whose path still
+    /// exists is still judged.
+    ///
+    /// The PIN MOVED (plan `2026-11-22-wind-down-custody-probe-and-undelivered-guard-read-unknown-where-they-can-decide`,
+    /// D2): a LIVE row whose path is gone used to read the untyped
+    /// `probe_failed`, which an operator cannot tell from an unreadable
+    /// directory. It is now the typed UNKNOWN `worktree_absent_from_every_root`
+    /// — still UNKNOWN, never "reaped" (a WIP ref snapshots tracked files only,
+    /// so a vanished tree may have taken untracked work with it) — while a
+    /// path that exists but cannot be read stays `probe_failed`.
     #[tokio::test]
     async fn a_reaped_retired_worktree_is_skipped_and_a_missing_live_one_is_unknown() {
         let mut probe = FakeProbe::default().root("/ws/kept", "/ws/kept");
         probe.missing.insert(PathBuf::from("/ws/reaped"));
         probe.missing.insert(PathBuf::from("/ws/lost"));
         probe.unreadable.insert(PathBuf::from("/ws/lost"));
-        let retired = |p: &str| AttributedWorktree {
-            path: PathBuf::from(p),
-            retired: true,
-        };
+        let retired = |p: &str| AttributedWorktree::at(p, true);
 
         let reaped = gather_custody(
             &probe,
@@ -1638,7 +1920,197 @@ mod tests {
             "s",
         )
         .await;
-        assert_eq!(custody_gate(&lost).reason(), Some("probe_failed"));
+        assert_eq!(
+            custody_gate(&lost).reason(),
+            Some("worktree_absent_from_every_root")
+        );
+
+        // Present but unreadable stays a failed probe.
+        probe.unreadable.insert(PathBuf::from("/ws/locked"));
+        let locked = gather_custody(
+            &probe,
+            &context(Some("/ws"), &[]),
+            Ok(vec![live("/ws/locked")]),
+            "s",
+        )
+        .await;
+        assert_eq!(custody_gate(&locked).reason(), Some("probe_failed"));
+    }
+
+    /// An attributed row `agent-worktrees/a/repo` with both candidate roots in
+    /// a FakeProbe layout: `script` / `second` say whether the tree exists
+    /// under each.
+    async fn gather_relative(
+        mut probe: FakeProbe,
+        script: bool,
+        second: bool,
+        retired: bool,
+    ) -> (CustodyInputs, FakeProbe) {
+        let own = keyed_ownership(
+            &["claude-x"],
+            &format!(
+                r#"[{{"sessionId":"c-1","claudeCodeSessionId":"claude-x","worktrees":[
+                {{"worktreePath":"agent-worktrees/a/repo","repo":"repo","ledgerStatus":"{}"}}]}}]"#,
+                if retired { "merged" } else { "active" }
+            ),
+            &[],
+        );
+        let attributed = attributed_worktrees_in(
+            &own,
+            "claude-x",
+            Some(Path::new("/ws")),
+            Some(Path::new("/ws/qontinui-worktrees")),
+        );
+        for (present, path) in [
+            (script, PathBuf::from("/ws/agent-worktrees").join("a/repo")),
+            (
+                second,
+                PathBuf::from("/ws/qontinui-worktrees").join("a/repo"),
+            ),
+        ] {
+            if !present {
+                probe.missing.insert(path);
+            }
+        }
+        let inputs = gather_custody(&probe, &context(Some("/ws"), &[]), attributed, "s").await;
+        (inputs, probe)
+    }
+
+    /// D2: absent from every root, every root readable: a LIVE row is the typed
+    /// UNKNOWN naming the roots; a RETIRED row was reaped and is skipped.
+    #[tokio::test]
+    async fn a_row_absent_from_every_readable_root_is_typed_unknown_when_live() {
+        let (live_row, _) = gather_relative(FakeProbe::default(), false, false, false).await;
+        let verdict = custody_gate(&live_row);
+        assert_eq!(verdict.reason(), Some("worktree_absent_from_every_root"));
+        assert!(
+            verdict.detail().unwrap().contains("qontinui-worktrees"),
+            "the roots tried are named: {verdict:?}"
+        );
+        assert_eq!(live_row.resolutions[0].outcome, "absent_from_every_root");
+        assert_eq!(live_row.resolutions[0].roots_tried.len(), 2);
+
+        let (retired, _) = gather_relative(FakeProbe::default(), false, false, true).await;
+        assert!(custody_gate(&retired).is_clean(), "{retired:?}");
+        assert_eq!(retired.resolutions[0].outcome, "reaped_retired");
+    }
+
+    /// D2: an UNREADABLE root (here a volume gone: the root AND its parent are
+    /// missing, and another root denies access) is never "reaped".
+    #[tokio::test]
+    async fn an_unreadable_root_keeps_an_absent_row_unknown_even_when_retired() {
+        let mut probe = FakeProbe::default();
+        probe
+            .exists_unreadable
+            .insert(PathBuf::from("/ws/qontinui-worktrees"));
+        let (denied, _) = gather_relative(probe, false, false, true).await;
+        assert_eq!(custody_gate(&denied).reason(), Some("probe_failed"));
+        assert_eq!(denied.resolutions[0].outcome, "root_unreadable");
+
+        let mut probe = FakeProbe::default();
+        probe
+            .missing
+            .insert(PathBuf::from("/ws/qontinui-worktrees"));
+        probe.missing.insert(PathBuf::from("/ws"));
+        probe.missing.insert(PathBuf::from("/ws/agent-worktrees"));
+        let (unmounted, _) = gather_relative(probe, false, false, false).await;
+        assert_eq!(custody_gate(&unmounted).reason(), Some("probe_failed"));
+    }
+
+    /// D1: a path under BOTH roots is probed in BOTH and both must be clean.
+    #[tokio::test]
+    async fn an_ambiguous_row_requires_both_trees_clean() {
+        let script = "/ws/agent-worktrees";
+        let second = "/ws/qontinui-worktrees";
+        let tree = |root: &str| PathBuf::from(root).join("a/repo").display().to_string();
+        let mut probe = FakeProbe::default();
+        for root in [script, second] {
+            let t = tree(root);
+            probe = probe.root(&t, &t);
+        }
+        let dirty = tree(second);
+        probe = probe.state(
+            &dirty,
+            MemberState::Probed {
+                dirty: true,
+                ahead: 0,
+            },
+        );
+        let (inputs, probe) = gather_relative(probe, true, true, false).await;
+        assert_eq!(inputs.resolutions[0].outcome, "ambiguous");
+        assert_eq!(inputs.resolutions[0].resolved.len(), 2);
+        assert_eq!(
+            probe
+                .calls()
+                .iter()
+                .filter(|c| c.starts_with("probe:"))
+                .count(),
+            2,
+            "both trees are probed: {:?}",
+            probe.calls()
+        );
+        assert_eq!(
+            custody_gate(&inputs).as_str(),
+            "dirty",
+            "one dirty copy is enough"
+        );
+    }
+
+    /// Phase 2: `covered` carries coord's ORIGINAL ledger string, so the
+    /// obligations cross-check still matches a tree resolved under the second
+    /// root; and the Phase 5 resolution names the root it resolved under.
+    #[tokio::test]
+    async fn covered_keeps_the_ledger_string_and_the_resolution_names_the_root() {
+        let t = PathBuf::from("/ws/qontinui-worktrees").join("a/repo");
+        let probe = FakeProbe::default().root(&t.display().to_string(), &t.display().to_string());
+        let (inputs, _) = gather_relative(probe, false, true, false).await;
+        assert!(custody_gate(&inputs).is_clean(), "{inputs:?}");
+        let doc = serde_json::json!({"worktrees": {"items": [
+            {"worktree_path": "agent-worktrees/a/repo"}]}});
+        assert_eq!(
+            first_uncovered_coord_worktree(&doc, &inputs.covered),
+            None,
+            "covered: {:?}",
+            inputs.covered
+        );
+        let r = &inputs.resolutions[0];
+        assert_eq!(r.outcome, "found");
+        assert_eq!(r.ledger_path, "agent-worktrees/a/repo");
+        assert_eq!(r.resolved, vec![t.display().to_string()]);
+        assert_eq!(r.roots_tried.len(), 2);
+    }
+
+    /// Plan `2026-11-22-wind-down-custody-probe-and-undelivered-guard-read-unknown-where-they-can-decide`
+    /// Phase 1 — the observed defect. coord's ledger path for a LIVE row is the
+    /// host-neutral `agent-worktrees/<id>/<repo>`, but the runner materialised
+    /// the tree under `qontinui-worktrees/<id>/<repo>`; resolving the ledger
+    /// path against the one workspace root read `probe_failed`.
+    #[tokio::test]
+    async fn a_live_row_that_exists_only_under_the_second_root_is_probed_there() {
+        let own = keyed_ownership(
+            &["claude-x"],
+            r#"[{"sessionId":"c-1","claudeCodeSessionId":"claude-x","worktrees":[
+                {"worktreePath":"agent-worktrees/a/repo","repo":"repo","ledgerStatus":"active"}]}]"#,
+            &[],
+        );
+        let attributed = attributed_worktrees(&own, "claude-x", Some(Path::new("/ws")));
+        let mut probe = FakeProbe::default().root(
+            "/ws/qontinui-worktrees/a/repo",
+            "/ws/qontinui-worktrees/a/repo",
+        );
+        // Nothing lives under `<ws>/agent-worktrees/` for this session.
+        probe
+            .missing
+            .insert(PathBuf::from("/ws/agent-worktrees/a/repo"));
+        probe
+            .unreadable
+            .insert(PathBuf::from("/ws/agent-worktrees/a/repo"));
+        let inputs = gather_custody(&probe, &context(Some("/ws"), &[]), attributed, "s").await;
+        assert_eq!(
+            custody_gate(&inputs),
+            CustodyVerdict::Clean,
+            "the tree exists and is clean under the runner's own root: {inputs:?}"
+        );
     }
 
     /// Review item 8: an isolated-edit context that cannot be READ is not "no
@@ -1711,29 +2183,67 @@ mod tests {
                 "ownerSessionState":"closed","worktrees":[]}]"#,
             &[],
         );
+        let ws = Path::new("/ws");
+        let second = Path::new("/ws/qontinui-worktrees");
+        let abs = |p: &str, retired: bool| AttributedWorktree {
+            ledger_path: Some(p.to_string()),
+            ..AttributedWorktree::at(p, retired)
+        };
+        let got = attributed_worktrees_in(&own, "claude-x", Some(ws), Some(second)).unwrap();
+        // D1: the leading `agent-worktrees/` is STRIPPED and `<id>/<repo>` is
+        // tried under BOTH roots (never `qontinui-worktrees/agent-worktrees/...`).
         assert_eq!(
-            attributed_worktrees(&own, "claude-x", Some(Path::new("/ws"))).unwrap(),
-            vec![
-                live("/ws/agent-worktrees/a/repo"),
-                AttributedWorktree {
-                    path: PathBuf::from("/abs/wt"),
-                    retired: true
-                },
-                AttributedWorktree {
-                    path: PathBuf::from("/abs/old"),
-                    retired: true
-                },
-                // No ledger status is not "retired".
-                live("/abs/new"),
-            ]
+            got[0],
+            AttributedWorktree {
+                path: PathBuf::from("/ws/agent-worktrees").join("a/repo"),
+                retired: false,
+                ledger_path: Some("agent-worktrees/a/repo".to_string()),
+                candidates: vec![
+                    RootedCandidate {
+                        root: PathBuf::from("/ws/agent-worktrees"),
+                        path: PathBuf::from("/ws/agent-worktrees").join("a/repo"),
+                    },
+                    RootedCandidate {
+                        root: PathBuf::from("/ws/qontinui-worktrees"),
+                        path: PathBuf::from("/ws/qontinui-worktrees").join("a/repo"),
+                    },
+                ],
+            }
         );
+        // `/abs/...` is only absolute on a Unix host, so compare what is
+        // platform-independent: the path, the retired flag and the ledger string.
+        assert_eq!(
+            got[1..]
+                .iter()
+                .map(|w| (w.path.clone(), w.retired, w.ledger_path.clone()))
+                .collect::<Vec<_>>(),
+            [
+                abs("/abs/wt", true),
+                abs("/abs/old", true),
+                // No ledger status is not "retired".
+                abs("/abs/new", false),
+            ]
+            .iter()
+            .map(|w| (w.path.clone(), w.retired, w.ledger_path.clone()))
+            .collect::<Vec<_>>()
+        );
+        // Any other relative prefix stays workspace-root-relative, one root.
+        let other = keyed_ownership(
+            &["claude-o"],
+            r#"[{"sessionId":"c-o","claudeCodeSessionId":"claude-o",
+                "worktrees":[{"worktreePath":"elsewhere/x","repo":"r"}]}]"#,
+            &[],
+        );
+        let got = attributed_worktrees_in(&other, "claude-o", Some(ws), Some(second)).unwrap();
+        assert_eq!(got[0].candidates.len(), 1);
+        assert_eq!(got[0].path, ws.join("elsewhere/x"));
         let err = attributed_worktrees(&own, "claude-x", None).unwrap_err();
         assert!(
             err.contains("is relative") && err.contains("workspace root"),
             "a relative ledger path with no root to anchor it is not guessed: {err}"
         );
         assert_eq!(
-            attributed_worktrees(&own, "CLAUDE-X", Some(Path::new("/ws")))
+            attributed_worktrees_in(&own, "CLAUDE-X", Some(ws), Some(second))
                 .unwrap()
                 .len(),
             4,
@@ -1782,7 +2292,12 @@ mod tests {
             &[],
         );
         let attributed = attributed_worktrees(&own, "claude-x", Some(Path::new("/ws")));
-        assert_eq!(attributed, Ok(vec![live("/ws/wt/dirty")]));
+        assert_eq!(
+            attributed
+                .as_ref()
+                .map(|v| v.iter().map(|w| w.path.clone()).collect::<Vec<_>>()),
+            Ok(vec![PathBuf::from("/ws/wt/dirty")])
+        );
         let probe = FakeProbe::default()
             .root("/ws/wt/a", "/ws/wt/a")
             .root("/ws/wt/dirty", "/ws/wt/dirty")
@@ -2013,6 +2528,31 @@ mod tests {
         // And outside any repository there is no root at all.
         let outside = tempfile::tempdir().unwrap();
         assert_eq!(probe.worktree_root(outside.path()).await.unwrap(), None);
+    }
+
+    #[test]
+    fn the_pending_page_counts_the_filter_only_when_sent_and_echoed() {
+        let echoed = serde_json::json!({"session_filter_applied": true, "messages": []});
+        let silent = serde_json::json!({"messages": []});
+        let denied = serde_json::json!({"session_filter_applied": false, "messages": []});
+        assert!(pending_page(&echoed, true).unwrap().session_filter_applied);
+        assert!(
+            !pending_page(&echoed, false).unwrap().session_filter_applied,
+            "an echo we did not ask for proves nothing"
+        );
+        assert!(!pending_page(&silent, true).unwrap().session_filter_applied);
+        assert!(!pending_page(&denied, true).unwrap().session_filter_applied);
+        let id = "0192aaaa-0000-7000-8000-000000000001";
+        assert_eq!(
+            pending_url("http://h/", id),
+            format!("http://h/coord/session-messages/pending?session={id}&live={id}"),
+            "the Claude session UUID itself is the filter"
+        );
+        assert_eq!(
+            pending_url("http://h", "not-a-uuid"),
+            "http://h/coord/session-messages/pending",
+            "a non-UUID id sends no `session` (no 400 risk; the page stays unfiltered)"
+        );
     }
 
     #[test]

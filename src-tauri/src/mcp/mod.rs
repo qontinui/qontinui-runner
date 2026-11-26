@@ -133,6 +133,7 @@ pub mod queue;
 pub mod rag;
 pub mod recordings;
 pub mod reflection_api;
+pub mod refusal_envelope;
 pub mod relay_binding; // UI Bridge relay registrant principal binding (plan 2026-09-17-ui-bridge-relay-registration-is-unauthenticated)
 pub mod relay_path_policy; // The closed allowlist of local API paths `backend_relay`'s `http_request` arm may reach (review round 2 finding 1; inverted to an allowlist in round 4)
 pub mod relay_routable;
@@ -186,6 +187,7 @@ pub mod task_runs;
 pub mod task_supervisor;
 pub mod tauri_proxy;
 pub mod tenant; // GET/PUT /tenant/active — headless door to the device tenant pin
+pub mod terminal_layout; // GET /terminal-layout — per-tab session snapshot, relayed as a read (plan 2026-11-08-save-per-tab-runner-session-lists-on-sessions-page-kept-14-days)
 pub mod terminals;
 pub mod testing;
 // Phase 5.1 of the UI Bridge discoverability/effectiveness plan:

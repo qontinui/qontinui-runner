@@ -73,9 +73,10 @@ export function LoginScreen({ storeUnreadable = false }: { storeUnreadable?: boo
     setError("");
 
     try {
-      // A saved custom remote backend, else production (see savedBackendUrl.ts):
-      // the command writes the URL it signed in against back into settings.
-      const backendUrl = await resolveSignInBackendUrl();
+      // The saved backend when the one sign-in rule honours it on a first-run
+      // ("gate") screen, else production (see savedBackendUrl.ts): the command
+      // writes the URL it signed in against back into settings.
+      const backendUrl = await resolveSignInBackendUrl("gate");
       await invoke<CognitoSignInResponse>("cognito_sign_in", {
         backendUrl,
         identityProvider: provider,
@@ -102,7 +103,7 @@ export function LoginScreen({ storeUnreadable = false }: { storeUnreadable?: boo
     setError("");
 
     try {
-      const backendUrl = await resolveSignInBackendUrl();
+      const backendUrl = await resolveSignInBackendUrl("gate");
       await invoke<CognitoSignInResponse>("cognito_sign_in_password", {
         email,
         password,

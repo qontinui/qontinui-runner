@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <!-- Served from a directory holding this file and the COMPILED src/design-system/tokens.css (design-kit validate-guide serves a file from its own directory); ci.yml (job design-guide) stages both. -->
+    <meta charset="utf-8" />
+    <title>design-guide fixture: seeded violation</title>
+    <link rel="stylesheet" href="tokens.css" />
+    <style>
+      html,
+      body {
+        margin: 0;
+        font-size: var(--dk-type-scale-body);
+        color: var(--dk-color-text-primary);
+        background: var(--dk-color-surface-canvas);
+      }
+      .card {
+        padding: var(--dk-space-scale-lg);
+        background: var(--dk-color-surface-raised);
+        border-radius: var(--dk-space-radius-lg);
+      }
+      h1 {
+        font-size: var(--dk-type-scale-title);
+        margin: 0;
+      }
+      a {
+        color: var(--dk-color-brand-primary);
+        font-size: var(--dk-type-scale-body);
+      }
+      p {
+        font-size: var(--dk-type-scale-body);
+        margin: 0;
+        color: var(--dk-color-text-secondary);
+      }
+    </style>
+  </head>
+  <body>
+    <main class="card">
+      <h1>Workflows</h1>
+      <p
+        class="seeded"
+        style="color: #ff0000; background: #00ff00; font-size: 13px; border-radius: 7px"
+      >
+        A seeded violation: an off-palette colour and background, an off-scale font size and a
+        literal radius.
+      </p>
+      <a href="#workflows" class="link">Open workflows</a>
+    </main>
+  </body>
+</html>
