@@ -645,7 +645,7 @@ async fn publisher_loop(app: tauri::AppHandle) {
     );
     // One client for the loop's life, reused every tick. A build failure
     // leaves `None`, which each tick reports as `Transport`.
-    let client = reqwest::Client::builder()
+    let client = qontinui_runner_lib::outbound_net::client_builder()
         .timeout(Duration::from_secs(15))
         .build()
         .ok();

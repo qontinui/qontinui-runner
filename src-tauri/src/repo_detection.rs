@@ -115,7 +115,7 @@ pub async fn register_repo_with_coord(repo: String) -> Result<serde_json::Value,
     let base = base.trim_end_matches('/');
     let url = format!("{base}/coord/canonical-repos");
 
-    let client = reqwest::Client::builder()
+    let client = qontinui_runner_lib::outbound_net::client_builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| format!("build http client: {e}"))?;

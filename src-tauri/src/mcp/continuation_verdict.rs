@@ -485,7 +485,7 @@ pub(crate) fn coord_client_parts() -> Result<(String, String), String> {
 /// [`crate::mcp::session_compliance`] — a turn-end hook must never hang on a
 /// slow coord.
 pub(crate) fn http_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
+    qontinui_runner_lib::outbound_net::client_builder()
         .timeout(Duration::from_secs(4))
         .build()
         .map_err(|e| format!("client build: {e}"))

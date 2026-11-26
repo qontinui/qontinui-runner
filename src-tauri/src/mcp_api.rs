@@ -742,7 +742,7 @@ async fn embedding_service_health() -> serde_json::Value {
     {
         // Status endpoint is at the same base minus the last path segment.
         let status_url = url.replace("/compute-text", "/status");
-        let ok = match reqwest::Client::builder()
+        let ok = match qontinui_runner_lib::outbound_net::client_builder()
             .timeout(std::time::Duration::from_secs(3))
             .build()
         {
@@ -7834,7 +7834,7 @@ async fn post_coord_mcp_drift_finding(coord_base: String, bearer: String, drifte
         "topic": "coord-mcp",
         "resource_keys": ["qontinui-runner/src-tauri/src/mcp_api.rs"],
     });
-    let client = match reqwest::Client::builder()
+    let client = match qontinui_runner_lib::outbound_net::client_builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
     {
@@ -9020,7 +9020,7 @@ async fn coord_mcp_proxy_handler(
     // tool calls can legitimately run long).
     static COORD_PROXY_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     let client = COORD_PROXY_CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
+        qontinui_runner_lib::outbound_net::client_builder()
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(300))
             .build()
@@ -10231,7 +10231,7 @@ async fn forward_coord_get(
     static COORD_CLAIMS_PROXY_CLIENT: std::sync::OnceLock<reqwest::Client> =
         std::sync::OnceLock::new();
     let client = COORD_CLAIMS_PROXY_CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
+        qontinui_runner_lib::outbound_net::client_builder()
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(30))
             .build()
@@ -11410,7 +11410,7 @@ async fn forward_coord_write(
     static COORD_WRITE_PROXY_CLIENT: std::sync::OnceLock<reqwest::Client> =
         std::sync::OnceLock::new();
     let client = COORD_WRITE_PROXY_CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
+        qontinui_runner_lib::outbound_net::client_builder()
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(30))
             .build()
@@ -13415,11 +13415,11 @@ pub fn create_router(
                     {
                         Ok(local_port) => {
                             // Quick health check, direct: the port is this machine's.
-                            let client = reqwest::Client::builder()
+                            let client = qontinui_runner_lib::outbound_net::client_builder()
                                 .no_proxy()
                                 .timeout(std::time::Duration::from_secs(2))
                                 .build()
-                                .unwrap_or_else(|_| reqwest::Client::new());
+                                .unwrap_or_else(|_| qontinui_runner_lib::outbound_net::client());
                             let base_url = format!("http://127.0.0.1:{}", local_port);
                             let url = format!("{base_url}/ui-bridge/health");
                             if let Ok(resp) = client.get(&url).send().await {
@@ -13540,10 +13540,10 @@ pub fn create_router(
             // Wait for USB scanner to do its first pass
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
 
-            let client = reqwest::Client::builder()
+            let client = qontinui_runner_lib::outbound_net::client_builder()
                 .timeout(std::time::Duration::from_secs(2))
                 .build()
-                .unwrap_or_else(|_| reqwest::Client::new());
+                .unwrap_or_else(|_| qontinui_runner_lib::outbound_net::client());
 
             let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
             // Intentionally leaked — monitor runs for the entire app lifetime
@@ -19706,7 +19706,7 @@ mod coord_mcp_tool_policy_tests {
         // 127.0.0.1 literal, never `localhost`: Windows resolves `localhost`
         // to ::1 first and pays a doomed IPv6 connect before the socket that
         // answers.
-        let resp = reqwest::Client::new()
+        let resp = qontinui_runner_lib::outbound_net::client()
             .get(format!("http://{addr}/coord-mcp/tool-policy"))
             .send()
             .await

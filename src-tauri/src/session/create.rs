@@ -695,7 +695,7 @@ mod drain_tests {
         let _amb = crate::test_env::isolated_ambient();
         for status in [200, 403] {
             let probe = DrainProbe::spawn(status).await;
-            post_consumed(&reqwest::Client::new(), &probe.base, "jti-drain").await;
+            post_consumed(&qontinui_runner_lib::outbound_net::client(), &probe.base, "jti-drain").await;
             probe.assert_all_drained().await;
         }
     }

@@ -615,7 +615,7 @@ impl ShellCommandHandler {
             "{}/state-machine/status",
             crate::mcp::types::runner_loopback_base(port)
         );
-        let client = reqwest::Client::builder()
+        let client = qontinui_runner_lib::outbound_net::client_builder()
             .timeout(std::time::Duration::from_secs(3))
             .build()
             .map_err(|e| format!("client build: {}", e))?;

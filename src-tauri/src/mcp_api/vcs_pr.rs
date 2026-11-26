@@ -323,7 +323,7 @@ async fn forward_vcs_pr_post(
 
     static VCS_PR_PROXY_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     let client = VCS_PR_PROXY_CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
+        qontinui_runner_lib::outbound_net::client_builder()
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(10))
             .build()

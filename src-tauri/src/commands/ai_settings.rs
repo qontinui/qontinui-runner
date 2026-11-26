@@ -597,7 +597,7 @@ async fn test_claude_api_connection(settings: &ClaudeApiSettings) -> Result<Stri
     );
 
     // Make a minimal API request to test the connection
-    let client = reqwest::Client::new();
+    let client = qontinui_runner_lib::outbound_net::client();
     // Not a coord write: Anthropic's API or the operator's declared model
     // gateway, built by `ModelCall` (which never attaches a coord bearer — that
     // would be a credential leak to a third party).
@@ -811,7 +811,7 @@ async fn test_gemini_api_connection(settings: &GeminiApiSettings) -> Result<Stri
 
     // Make a minimal API request to test the connection
     // Using the Gemini API generateContent endpoint
-    let client = reqwest::Client::new();
+    let client = qontinui_runner_lib::outbound_net::client();
     let url = format!(
         "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
         settings.model, api_key
@@ -867,7 +867,7 @@ async fn test_gemini_api_connection(settings: &GeminiApiSettings) -> Result<Stri
 async fn test_ollama_connection(settings: &OllamaSettings) -> Result<String, String> {
     let url = format!("{}/api/tags", settings.base_url.trim_end_matches('/'));
     info!("Testing Ollama connection: GET {}", url);
-    let client = reqwest::Client::builder()
+    let client = qontinui_runner_lib::outbound_net::client_builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .map_err(|e| String::from(AppError::NetworkError(e.to_string())))?;
@@ -900,7 +900,7 @@ async fn test_openai_compatible_connection(
     let url = format!("{}/models", settings.base_url.trim_end_matches('/'));
     info!("Testing OpenAI-compatible: GET {}", url);
     let api_key = get_ai_api_key("openai_compatible").ok().flatten();
-    let client = reqwest::Client::builder()
+    let client = qontinui_runner_lib::outbound_net::client_builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .map_err(|e| String::from(AppError::NetworkError(e.to_string())))?;
@@ -1469,7 +1469,7 @@ async fn probe_account_usage_uncached(config_dir: String) -> AccountUsageInfo {
     // OAuth tokens (`sk-ant-oat*`) must go via `Authorization: Bearer` +
     // `anthropic-beta: oauth-2025-04-20`; API keys (`sk-ant-api*`) go via
     // `x-api-key`. `anthropic_auth::apply_async` dispatches on token prefix.
-    let client = reqwest::Client::new();
+    let client = qontinui_runner_lib::outbound_net::client();
     // Not a coord write: Anthropic's API, authenticated by the operator's own
     // OAuth/API credential via `anthropic_auth::apply_async`.
     // Always the vendor route: this measures a subscription account's own quota,
@@ -2104,7 +2104,7 @@ mod usage_twin_report {
         // was dropped for a non-bare label, an empty body must not claim the
         // whole roster.
         body.roster_complete = body.roster_complete && !body.accounts.is_empty();
-        let client = match reqwest::Client::builder()
+        let client = match qontinui_runner_lib::outbound_net::client_builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()
         {
@@ -3180,7 +3180,7 @@ pub async fn test_wsv_connection(endpoint: String) -> Result<WsvConnectionTestRe
     let url = format!("{}/v1/models", endpoint.trim().trim_end_matches('/'));
     info!("Testing WSV connection: GET {}", url);
 
-    let client = reqwest::Client::builder()
+    let client = qontinui_runner_lib::outbound_net::client_builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .map_err(|e| String::from(AppError::NetworkError(e.to_string())))?;

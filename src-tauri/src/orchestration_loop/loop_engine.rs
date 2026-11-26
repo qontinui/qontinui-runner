@@ -1321,7 +1321,7 @@ async fn run_loop(
                 let port = config.target_runner_port.unwrap_or(9876);
                 let health_url =
                     format!("http://127.0.0.1:{}/ui-bridge/control/health-signals", port);
-                match reqwest::Client::new()
+                match qontinui_runner_lib::outbound_net::client()
                     .get(&health_url)
                     .timeout(std::time::Duration::from_secs(3))
                     .send()

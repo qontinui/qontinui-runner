@@ -289,7 +289,7 @@ mod tests {
                 capabilities: Vec::new(),
                 port: 0,
             },
-            client: crate::mcp::sdk_http::SdkHttpClient::unsigned(reqwest::Client::new()),
+            client: crate::mcp::sdk_http::SdkHttpClient::unsigned(qontinui_runner_lib::outbound_net::client()),
             connected_at: 0,
             transport_kind: None,
             physical_device_id: None,

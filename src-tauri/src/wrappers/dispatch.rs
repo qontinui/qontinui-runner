@@ -296,11 +296,11 @@ impl DispatchContext {
         // via tokio::time::timeout so the header override is exact.
         // Loopback only (the wrapper's own port): never through a configured
         // HTTP proxy.
-        let http = reqwest::Client::builder()
+        let http = qontinui_runner_lib::outbound_net::client_builder()
             .no_proxy()
             .pool_max_idle_per_host(4)
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .unwrap_or_else(|_| qontinui_runner_lib::outbound_net::client());
         Arc::new(Self {
             registry,
             manager,

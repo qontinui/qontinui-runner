@@ -374,7 +374,7 @@ pub(crate) mod egress_tests {
     async fn flush_once(level: Level) -> (usize, bool) {
         let counter = ConnCounter::start();
         let url = format!("{}/sessions/{}/output", counter.http_base(), Uuid::nil());
-        let http = reqwest::Client::builder()
+        let http = qontinui_runner_lib::outbound_net::client_builder()
             .timeout(Duration::from_secs(5))
             .no_proxy()
             .build()
@@ -427,7 +427,7 @@ mod drain_tests {
         let _amb = crate::test_env::isolated_ambient();
         for status in [200, 500] {
             let probe = DrainProbe::spawn(status).await;
-            let http = reqwest::Client::new();
+            let http = qontinui_runner_lib::outbound_net::client();
             let url = format!("{}/sessions/{}/output", probe.base, Uuid::new_v4());
             let mut buffer = b"hello".to_vec();
             let mut offset = 0;

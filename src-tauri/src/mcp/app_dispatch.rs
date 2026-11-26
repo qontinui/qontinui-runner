@@ -224,11 +224,11 @@ pub struct AppDispatcher {
 
 impl AppDispatcher {
     pub fn new(registry: Arc<AppRegistry>, command_relay: Arc<CommandRelay>) -> Arc<Self> {
-        let http = reqwest::Client::builder()
+        let http = qontinui_runner_lib::outbound_net::client_builder()
             .timeout(HTTP_DISPATCH_TIMEOUT)
             .pool_max_idle_per_host(4)
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .unwrap_or_else(|_| qontinui_runner_lib::outbound_net::client());
         Arc::new(Self {
             registry,
             command_relay,
@@ -768,7 +768,7 @@ pub(crate) mod test_support {
             app_url: url.to_string(),
             base_path: base_path.to_string(),
             app_info: info,
-            client: crate::mcp::sdk_http::SdkHttpClient::unsigned(reqwest::Client::new()),
+            client: crate::mcp::sdk_http::SdkHttpClient::unsigned(qontinui_runner_lib::outbound_net::client()),
             connected_at: 0,
             transport_kind: None,
             physical_device_id: None,

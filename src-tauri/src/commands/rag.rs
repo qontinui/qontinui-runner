@@ -163,7 +163,7 @@ async fn send_embeddings_to_web_impl(project_id: &str) -> Result<(), AppError> {
         successful, endpoint
     );
 
-    let client = reqwest::Client::new();
+    let client = qontinui_runner_lib::outbound_net::client();
     let response = client
         .post(&endpoint)
         .header("Authorization", format!("Bearer {}", access_token))

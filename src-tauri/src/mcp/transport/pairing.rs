@@ -536,7 +536,7 @@ pub struct Paired {
 /// A client for the phone's open routes: no `Authorization`, no `Origin`, no
 /// redirects, and direct rather than through a configured proxy.
 fn open_route_client(timeout: Duration) -> Result<reqwest::Client, PairError> {
-    reqwest::Client::builder()
+    qontinui_runner_lib::outbound_net::client_builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(timeout)

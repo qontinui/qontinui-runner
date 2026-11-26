@@ -31,10 +31,10 @@ impl WebBackendWorkflowClient {
     pub fn new() -> Self {
         Self {
             auth_manager: AuthManager::new(),
-            client: reqwest::Client::builder()
+            client: qontinui_runner_lib::outbound_net::client_builder()
                 .timeout(std::time::Duration::from_secs(15))
                 .build()
-                .unwrap_or_default(),
+                .unwrap_or_else(|_| qontinui_runner_lib::outbound_net::client()),
         }
     }
 

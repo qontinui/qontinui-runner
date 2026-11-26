@@ -269,7 +269,7 @@ fn one_line(s: &str) -> String {
 async fn retire_once(url: &str, body: &serde_json::Value) -> Attempt<RetireOutcome, String> {
     let client = crate::coord_http::coord_client()
         .cloned()
-        .unwrap_or_else(reqwest::Client::new);
+        .unwrap_or_else(qontinui_runner_lib::outbound_net::client);
     // The retire door is keyed by device alone, which is what `Device` scope
     // presents.
     let resp = match crate::auth::attach_device_auth_for(

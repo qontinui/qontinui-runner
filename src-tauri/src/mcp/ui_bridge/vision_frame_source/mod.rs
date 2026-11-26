@@ -253,7 +253,7 @@ impl DeviceScreenshotSource {
                 retryable,
             };
 
-        let client = reqwest::Client::builder()
+        let client = qontinui_runner_lib::outbound_net::client_builder()
             .timeout(SCREENSHOT_HTTP_TIMEOUT)
             // A short connect timeout so a dead/unreachable host fails fast
             // instead of stalling the whole vision call on the (longer) total

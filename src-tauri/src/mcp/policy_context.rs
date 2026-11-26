@@ -2327,7 +2327,7 @@ mod tests {
     /// arms ARE the "never fabricate an id" rule.
     #[test]
     fn the_caller_session_header_is_set_only_when_there_is_a_session() {
-        let client = reqwest::Client::new();
+        let client = qontinui_runner_lib::outbound_net::client();
         let id = uuid::Uuid::new_v4();
 
         let with = attach_attribution(client.get("http://127.0.0.1/x"), Some(id))
@@ -2509,7 +2509,7 @@ mod tests {
     /// per-run dir); the read is read-only either way.
     #[test]
     fn no_policy_request_is_built_for_a_tenant_with_no_usable_credential() {
-        let client = reqwest::Client::new();
+        let client = qontinui_runner_lib::outbound_net::client();
         let t = uuid::Uuid::new_v4();
         let target = crate::mcp::policy_tenant::PolicyTarget {
             scope: crate::auth::TenantScope::Owned(t),

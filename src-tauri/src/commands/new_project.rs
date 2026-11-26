@@ -442,7 +442,7 @@ async fn proxy_post(
     path: &str,
     body: Value,
 ) -> Result<(reqwest::StatusCode, Value), NewProjectError> {
-    let resp = reqwest::Client::new()
+    let resp = qontinui_runner_lib::outbound_net::client()
         .post(api_url(path))
         .bearer_auth(bearer)
         .json(&body)
@@ -606,7 +606,7 @@ pub async fn github_oauth_status(owner: String) -> Result<GithubOauthStatusResul
         "/api/v1/operations/github/oauth-status?owner={}",
         urlencoding::encode(owner.trim())
     ));
-    let resp = reqwest::Client::new()
+    let resp = qontinui_runner_lib::outbound_net::client()
         .get(&url)
         .bearer_auth(&bearer)
         .send()

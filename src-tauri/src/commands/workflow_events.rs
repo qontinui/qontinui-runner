@@ -94,10 +94,10 @@ pub async fn post_workflow_event(event: WorkflowEventPayload) {
         event_type_str, event.device_id, event.run_id
     );
 
-    let client = reqwest::Client::builder()
+    let client = qontinui_runner_lib::outbound_net::client_builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+        .unwrap_or_else(|_| qontinui_runner_lib::outbound_net::client());
 
     match client
         .post(format!("{}/api/v1/events/workflow", api_url))

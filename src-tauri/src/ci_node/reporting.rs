@@ -291,7 +291,7 @@ async fn flusher_loop(
         coord_base.trim_end_matches('/'),
         dispatch_id
     );
-    let client = reqwest::Client::builder()
+    let client = qontinui_runner_lib::outbound_net::client_builder()
         .timeout(Duration::from_secs(10))
         .build()
         .ok();
@@ -560,7 +560,7 @@ pub(crate) async fn post_result(
             body["test_results"] = v;
         }
     }
-    let Ok(client) = reqwest::Client::builder()
+    let Ok(client) = qontinui_runner_lib::outbound_net::client_builder()
         .timeout(Duration::from_secs(15))
         .build()
     else {
@@ -766,7 +766,7 @@ fn queue_heartbeat_client() -> Option<&'static reqwest::Client> {
     static CLIENT: std::sync::OnceLock<Option<reqwest::Client>> = std::sync::OnceLock::new();
     CLIENT
         .get_or_init(|| {
-            reqwest::Client::builder()
+            qontinui_runner_lib::outbound_net::client_builder()
                 .timeout(Duration::from_secs(10))
                 .pool_idle_timeout(Duration::from_secs(45))
                 .build()

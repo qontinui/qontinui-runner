@@ -2606,7 +2606,7 @@ mod tests {
     }
 
     fn plain_client() -> reqwest::Client {
-        reqwest::Client::builder().no_proxy().build().unwrap()
+        qontinui_runner_lib::outbound_net::client_builder().no_proxy().build().unwrap()
     }
 
     /// Serve one canned HTTP response on a loopback port; return its URL.

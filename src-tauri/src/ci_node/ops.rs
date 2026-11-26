@@ -666,7 +666,7 @@ async fn post_result(id: &str, state: &str, exit_code: Option<i32>, log: &str) -
         "exit_code": exit_code,
         "log_tail": tail_str(log, LOG_TAIL_MAX_BYTES),
     });
-    let Ok(client) = reqwest::Client::builder()
+    let Ok(client) = qontinui_runner_lib::outbound_net::client_builder()
         .timeout(Duration::from_secs(15))
         .build()
     else {

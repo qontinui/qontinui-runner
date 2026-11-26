@@ -102,7 +102,7 @@ async fn spawn_routed(
     Server {
         port,
         relay,
-        http: reqwest::Client::builder()
+        http: qontinui_runner_lib::outbound_net::client_builder()
             .pool_max_idle_per_host(0)
             .build()
             .unwrap(),
