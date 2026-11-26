@@ -110,7 +110,7 @@ const LABEL_RELEASE_POLL_MS: u64 = 50;
 /// The calibration is borrowed rather than invented:
 /// [`crate::ui_error::UI_STALE_AFTER_MS`] is already this codebase's answer to
 /// "a live UI has checked in within this long", and Rust emits `ui-bridge-ping`
-/// unconditionally every 3s, so this is ten consecutive missed pings.
+/// unconditionally every 3s (`ui_ping.rs`), so this is ten consecutive missed pings.
 pub const RECREATE_PONG_DEADLINE_MS: u64 = crate::ui_error::UI_STALE_AFTER_MS;
 
 /// How long a reloaded main webview has to prove it is running a UI again, by
@@ -266,7 +266,7 @@ pub fn is_server_mode() -> bool {
 #[derive(Debug, Clone)]
 pub struct MainWindowSpec {
     /// Isolated WebView2 profile directory (temp/secondary runners). `None`
-    /// on non-Windows and for the default profile.
+    /// for the default profile, and off Windows except under an instance root.
     pub data_dir: Option<std::path::PathBuf>,
     /// Logical inner size the builder is seeded with.
     pub initial_size: (f64, f64),
@@ -444,9 +444,10 @@ pub(crate) struct WebviewEnvOptions {
 pub(crate) fn webview_env_options(spec: Option<&MainWindowSpec>) -> WebviewEnvOptions {
     match spec {
         Some(spec) => WebviewEnvOptions {
-            // `None` off-Windows and for the default profile
-            // (`instance::webview2_data_dir` returns `None` on non-Windows),
-            // which makes the whole propagation a no-op there.
+            // `None` for the default profile, and off Windows for every
+            // runner but a subject under an instance root
+            // (`instance::webview2_data_dir`) — `None` makes the whole
+            // propagation a no-op.
             data_dir: spec.data_dir.clone(),
             browser_args: Some(MAIN_WINDOW_BROWSER_ARGS),
         },
@@ -3800,6 +3801,14 @@ mod tests {
             false,
             Some((10, 10)),
             Some((0, 0)),
+            &fb
+        )));
+        // So does a non-zero sliver below the shared minimum, off the sentinel.
+        assert!(is_fallback(placement_from_snapshot(
+            false,
+            false,
+            Some((10, 10)),
+            Some((160, 28)),
             &fb
         )));
         assert!(is_fallback(placement_from_snapshot(

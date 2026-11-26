@@ -716,7 +716,7 @@ pub struct ConfigReportInputs {
     /// Resolved in the bin by `config_report_cmd::coord_prompt_documents_reading`;
     /// `prompt_library` is a bin-only module.
     pub coord_prompt_documents: Option<LayerReading>,
-    /// Layer 10 (`fleet_policy_dial`): the four process-global caches one
+    /// Layer 10 (`fleet_policy_dial`): the five process-global caches one
     /// supervised poll loop refreshes, as they stand right now. TIME-VARYING
     /// with no restart of anything — the layer this module's per-reading
     /// `captured_at` was put there for. Resolved in the bin by
@@ -997,9 +997,10 @@ fn resolve_settings_json_second_reader(now: DateTime<Utc>) -> LayerReading {
     let (path, source) = crate::profiles::settings_json_path();
     match path {
         Some(p) => LayerReading::known(p.display().to_string(), source.as_str(), now),
-        // `Unresolvable` — `dirs::config_dir()` yielded nothing, so there is no
-        // path. UNKNOWN, not a guessed default: this reader has no fallback and
-        // inventing one here would be reporting a file nobody read.
+        // `Unresolvable` — the platform config dir yielded nothing (possible
+        // only without an instance root), so there is no path. UNKNOWN, not a
+        // guessed default: this reader has no fallback and inventing one here
+        // would be reporting a file nobody read.
         None => LayerReading::unknown(
             format!(
                 "the lib-side settings.json reader could not resolve a path \

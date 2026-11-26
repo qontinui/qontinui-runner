@@ -119,13 +119,21 @@ function computeRows(): FixtureRow[] {
       for (const confirmed of CONFIRMED)
         for (const transcript of TRANSCRIPTS)
           for (const { providerTier, provider } of PROVIDERS) {
-            const action = classifyRestoreAction({
-              claudeSessionId: sessionId,
-              origin,
-              confirmedAt: confirmed ? 1 : undefined,
-              provider,
-              transcriptExists: transcriptExists(transcript),
-            });
+            const action = classifyRestoreAction(
+              {
+                claudeSessionId: sessionId,
+                origin,
+                confirmedAt: confirmed ? 1 : undefined,
+                provider,
+                transcriptExists: transcriptExists(transcript),
+                // The table is about the restore TIER (can the conversation be
+                // brought back at all), which the emitter mirrors. Which ACCOUNT
+                // resumes it is a separate gate (`needs-account`), so every row
+                // carries a recorded one and that gate stays out of the tier.
+                configDir: "/home/u/.claude-x",
+              },
+              "/home/u/.claude",
+            );
             rows.push({
               idKind,
               sessionId,

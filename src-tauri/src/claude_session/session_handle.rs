@@ -291,6 +291,10 @@ pub fn spawn_register(store: Arc<SessionLifecycleStore>, req: HandleRegisterRequ
         .spawn(move || {
             if let Some(handle) = register_blocking(&req) {
                 store.set_handle(&req.claude_session_id, &handle);
+                // A handle bound or rebound: post the census early so coord's
+                // card can join the session's placement (plan
+                // 2026-11-16-runner-page-name-reaches-the-coord-session-identity-card, D7c).
+                crate::session_placement::request_census_post();
             }
         });
     if let Err(e) = spawned {

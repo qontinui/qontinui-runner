@@ -41,6 +41,13 @@ pub enum FederationSkipReason {
     /// No `paired_user.json::tenant_id` and no claim in the cached
     /// device-token JWT — the runner isn't paired to a tenant.
     TenantUnresolved,
+    /// The session's tenant decision stated no tenant because its workspace or
+    /// repo stated something this device cannot act on (a tenant it holds no
+    /// credential for, an unreadable declaration, several owners none the
+    /// default) or because that could not be established now (an unreadable
+    /// credential store) — federating the device default instead would push
+    /// this session's activity into another project's pool.
+    TenantRefused,
     /// `~/.qontinui/machine.json` is missing or unparseable.
     DeviceIdMissing,
     /// No effective Claude config dir could be resolved.
@@ -52,6 +59,7 @@ impl FederationSkipReason {
     pub fn as_str(&self) -> &'static str {
         match self {
             FederationSkipReason::TenantUnresolved => "tenant-unresolved",
+            FederationSkipReason::TenantRefused => "tenant-refused",
             FederationSkipReason::DeviceIdMissing => "device-id-missing",
             FederationSkipReason::NoConfigDir => "no-config-dir",
         }
@@ -110,8 +118,22 @@ pub fn build_federation_ctx(
     session_id: &str,
     working_dir: &str,
     cli_settings: &ClaudeCliSettings,
-    session_tenant: Option<Uuid>,
+    session_tenant: crate::session::NewSessionTenant,
 ) -> Result<SessionContext, FederationSkipReason> {
+    let session_tenant = match session_tenant {
+        crate::session::NewSessionTenant::Stated(t) => Some(t),
+        crate::session::NewSessionTenant::Unstated => None,
+        crate::session::NewSessionTenant::Refused
+        | crate::session::NewSessionTenant::Undetermined => {
+            warn!(
+                "claude_session::federation: the session's tenant decision stated no tenant \
+                 ({session_tenant:?}: its workspace or repo states something this device \
+                 cannot act on, or that could not be established); skipping federation for \
+                 session {session_id} rather than federating the device default"
+            );
+            return Err(FederationSkipReason::TenantRefused);
+        }
+    };
     let tenant_id = match resolve_session_context_tenant(session_tenant) {
         Some(t) => t,
         None => {
@@ -190,10 +212,11 @@ pub fn log_bridge_report(category: &str, ctx: &SessionContext, report: Result<Re
 /// that populates [`SessionContext::tenant_id`] (B2). The session's
 /// RECORDED tenant wins (`session_tenant`, threaded by the spawn site from
 /// `coord_register::federation_session_tenant` — the tenant `AiCoordRegistrar`
-/// stamped the coord record and JWT slot with, else the registrar's own
-/// resolver `session::resolve_new_session_tenant`), so the coord record + JWT
-/// slot + federated pool agree. Only when no tenant
-/// resolved (an unresolvable or unpaired machine) does this fall back to
+/// stamped the coord record and JWT slot with, else the spawn's own
+/// `session::resolve_new_session_tenant_in` for its working directory), so the
+/// coord record + JWT slot + federated pool agree. A REFUSED decision never
+/// reaches here ([`build_federation_ctx`] skips federation). Only when no
+/// tenant was stated (an unresolvable or unpaired machine) does this fall back to
 /// [`resolve_tenant_id`] (paired file, then the OAuth claim). Split out so the B2 precedence is
 /// hermetically testable without the file/home-dir reads the rest of
 /// identity resolution needs.

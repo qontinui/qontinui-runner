@@ -3,7 +3,8 @@
  *
  * vitest runs `environment: "node"` with no DOM and no React test renderer, so
  * a test drives a hook by mocking `react` with this harness's slot-indexed
- * `useState` / `useRef` / `useEffect` (and an identity `useCallback`). Setters
+ * `useState` / `useRef` / `useEffect` (and an identity `useCallback`, and a
+ * `useMemo` that recomputes on every render — correct, just not cached). Setters
  * really update state, and each effect runs after the render that queued it
  * when its deps changed. So a hook's effects act on a fixture as they would in
  * React. `renderSettled` re-renders until state stops changing, which is what
@@ -93,6 +94,7 @@ function createHooksHarness() {
     reactMock: {
       useState,
       useCallback: <F>(fn: F) => fn,
+      useMemo: <T>(compute: () => T) => compute(),
       useRef,
       useEffect,
     },

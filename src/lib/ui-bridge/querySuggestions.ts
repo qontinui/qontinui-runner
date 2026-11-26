@@ -410,12 +410,16 @@ export function generateQuerySuggestions(
 
     let suggestion: QuerySuggestion | null = null;
 
-    // Generate suggestion based on element type
+    // Generate suggestion based on element type. `@qontinui/ui-bridge` 0.46
+    // kinds an ARIA textbox or contenteditable `textbox`, and a combobox or
+    // listbox `combobox` / `listbox` — the registry used to report them as
+    // `input` and `select` — so each reaches the generator of the field it is.
     switch (element.type) {
       case "button":
         suggestion = generateButtonSuggestion(element);
         break;
       case "input":
+      case "textbox":
         suggestion = generateInputSuggestion(element);
         break;
       case "checkbox":
@@ -428,6 +432,8 @@ export function generateQuerySuggestions(
         }
         break;
       case "select":
+      case "combobox":
+      case "listbox":
         suggestion = generateSelectSuggestion(element);
         break;
       default:

@@ -40,6 +40,16 @@
 //! climb. It is a reporting surface, not a detector; it renders counts and
 //! draws no conclusion from them.
 //!
+//! ## The shared refusal (`refusal`)
+//!
+//! Both passes also attach the cross-repo `qontinui_types::refusal::Refusal`
+//! under the top-level `refusal` key (rule 6 of the JSON pass; built in
+//! `crate::mcp::refusal_envelope`), so every enveloped runner error names its
+//! refusal class and a typed next action whichever constructor built it. The
+//! `envelopeCodeStamping` counters stay the runtime evidence that the pass
+//! runs; the source-count ratchet on free-text error constructors is
+//! `expect_ratchet.rs`'s `free_text_error_constructors_only_fall`.
+//!
 //! ## GraphQL
 //!
 //! This used to read: *"async-graphql emits `application/json` for its own
@@ -85,8 +95,8 @@ use crate::mcp::types::ApiResponse;
 /// `impl RequestHints for T {}` (empty body = all defaults) for request
 /// types that genuinely have no useful hint.
 pub trait RequestHints {
-    /// Human-readable recovery suggestions surfaced in `suggestions` on a
-    /// shape error (e.g. missing field, wrong type).
+    /// Human-readable recovery hints folded into the response's
+    /// `refusal.detail` on a shape error (e.g. missing field, wrong type).
     fn shape_error_suggestions() -> Option<Vec<String>> {
         None
     }
@@ -101,6 +111,10 @@ pub trait RequestHints {
 
 const CODE_UNSUPPORTED_MEDIA_TYPE: &str = "UNSUPPORTED_MEDIA_TYPE";
 const CODE_INVALID_JSON: &str = "INVALID_JSON";
+/// A 400 whose body was not UTF-8 at all — distinct from [`CODE_INVALID_JSON`]
+/// because the remedy is the CLIENT'S ENCODING, not its JSON. See
+/// [`invalid_utf8_message`].
+pub(crate) const CODE_INVALID_UTF8: &str = "INVALID_UTF8";
 const CODE_INVALID_REQUEST: &str = "INVALID_REQUEST";
 const CODE_PAYLOAD_TOO_LARGE: &str = "PAYLOAD_TOO_LARGE";
 const CODE_BAD_REQUEST: &str = "BAD_REQUEST";
@@ -139,6 +153,55 @@ pub fn envelope_400(msg: impl Into<String>) -> (StatusCode, Json<ApiResponse<()>
     (
         StatusCode::BAD_REQUEST,
         Json(ApiResponse::<()>::error_with_code(msg, CODE_INVALID_JSON)),
+    )
+}
+
+/// The marker serde_json's `Display` writes for `ErrorCode::InvalidUnicodeCodePoint`.
+///
+/// In serde_json 1.0.149 (locked) through 1.0.154 every site that raises that
+/// code is a `str::from_utf8`
+/// failure on the raw body slice (`read.rs` `as_str`, and the raw-buffering
+/// paths behind `RawValue`); a `\u` escape names a surrogate problem in its own
+/// words ("lone leading surrogate…", "unexpected end of hex escape"). So the marker means "these bytes are not
+/// UTF-8". Pinned by `serde_json_still_words_invalid_utf8_this_way`, so a
+/// serde_json rewording fails the build instead of silently reverting to the
+/// generic message.
+const SERDE_INVALID_UTF8_MARKER: &str = "invalid unicode code point";
+
+/// How axum-core words a `JsonSyntaxError` rejection (its `Display` prefix,
+/// followed by `": "` and the serde error). Pinned by
+/// `non_utf8_body_gives_400_invalid_utf8_not_invalid_json`, which goes through
+/// the real extractor.
+const AXUM_JSON_SYNTAX_PREFIX: &str = "Failed to parse the request body as JSON";
+
+/// When a JSON rejection's text says the body was not UTF-8, the message to
+/// answer instead — `None` for every other rejection.
+///
+/// Why this exists: a Windows Git Bash `curl -d '{"reason":"a — b"}'` hands the
+/// native curl an argv in the ANSI code page, so the em dash goes out as the
+/// single byte `0x97` (measured 2026-10-17 against a local echo:
+/// `…226120972062…`). axum then answered `INVALID_JSON: … invalid unicode code
+/// point`, which reads as "your JSON is malformed" and sends the caller hunting
+/// for a syntax error in a body that has none. The same text sent as UTF-8
+/// (`e2 80 94`) is accepted.
+pub(crate) fn invalid_utf8_message(rejection_text: &str) -> Option<String> {
+    if !rejection_text.contains(SERDE_INVALID_UTF8_MARKER) {
+        return None;
+    }
+    Some(format!(
+        "request body is not valid UTF-8 ({rejection_text}). JSON must be sent as UTF-8 \
+         bytes. A common cause: Git Bash / MSYS curl on Windows passes a non-ASCII `-d` \
+         argument (an em dash, a curly quote) through the ANSI code page — write the body \
+         to a UTF-8 file and send it with `--data-binary @file`, or escape the character \
+         in the JSON (`\\u2014`)."
+    ))
+}
+
+/// Build a 400 envelope for a body that is not UTF-8 (see [`invalid_utf8_message`]).
+pub(crate) fn envelope_400_invalid_utf8(msg: String) -> (StatusCode, Json<ApiResponse<()>>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ApiResponse::<()>::error_with_code(msg, CODE_INVALID_UTF8)),
     )
 }
 
@@ -210,6 +273,10 @@ fn map_json_rejection_with_hints<T: RequestHints>(
     match rejection {
         JsonRejection::MissingJsonContentType(_) => envelope_415(),
         JsonRejection::JsonSyntaxError(e) => {
+            // Not-UTF-8 is an encoding problem, not a syntax one: say so.
+            if let Some(msg) = invalid_utf8_message(&e.to_string()) {
+                return envelope_400_invalid_utf8(msg);
+            }
             // Syntax errors (e.g. truncated JSON, bad escape) benefit from
             // shape hints too — a caller who sends `{action:"click"}` with
             // bad JSON likely still wants the allowed-values list.
@@ -240,6 +307,33 @@ fn map_json_rejection_with_hints<T: RequestHints>(
     }
 }
 
+/// The refusal for a body-shape rejection: always `fix_request` (the caller
+/// corrects the body and re-sends), with the request type's
+/// [`RequestHints::shape_error_suggestions`] folded into `detail` after the
+/// rejection text — one structured envelope instead of a parallel free-text
+/// list.
+fn shape_error_refusal(
+    code: &str,
+    status: StatusCode,
+    msg: &str,
+    suggestions: &[String],
+) -> qontinui_types::refusal::Refusal {
+    let detail = if suggestions.is_empty() {
+        msg.to_string()
+    } else {
+        format!("{msg} Hints: {}", suggestions.join(" | "))
+    };
+    crate::mcp::refusal_envelope::refusal_for_envelope(
+        code,
+        status,
+        Some(&detail),
+        Some(qontinui_types::refusal::NextAction::new(
+            qontinui_types::refusal::NextActionKind::FixRequest,
+        )),
+        None,
+    )
+}
+
 /// Build a 400 envelope optionally enriched with type-level hints.
 fn envelope_400_with_hints<T: RequestHints>(
     msg: impl Into<String>,
@@ -247,22 +341,18 @@ fn envelope_400_with_hints<T: RequestHints>(
     let msg = msg.into();
     match T::shape_error_suggestions() {
         Some(suggestions) if !suggestions.is_empty() => {
-            let mut resp = ApiResponse::<()>::error_with_code_and_suggestions(
-                &msg,
+            let refusal = shape_error_refusal(
                 CODE_INVALID_JSON,
-                suggestions,
+                StatusCode::BAD_REQUEST,
+                &msg,
+                &suggestions,
             );
-            resp.data = T::shape_error_data().map(|_| ());
+            let mut resp = ApiResponse::<()>::error_with_refusal(msg, CODE_INVALID_JSON, refusal);
             // Can't attach arbitrary data to `ApiResponse<()>` — surface the
             // allowed-values payload in the `hint` field instead so no info
             // is lost (hint is a `serde_json::Value`, not typed by T).
-            let mut base_resp = ApiResponse::<()>::error_with_code_and_suggestions(
-                msg,
-                CODE_INVALID_JSON,
-                T::shape_error_suggestions().unwrap_or_default(),
-            );
-            base_resp.hint = T::shape_error_data();
-            (StatusCode::BAD_REQUEST, Json(base_resp))
+            resp.hint = T::shape_error_data();
+            (StatusCode::BAD_REQUEST, Json(resp))
         }
         _ => envelope_400(msg),
     }
@@ -279,12 +369,14 @@ fn envelope_422_with_hints<T: RequestHints>(
     match (suggestions, data) {
         (None, None) => envelope_422(msg),
         (suggestions, data) => {
-            let mut resp = match suggestions {
-                Some(s) if !s.is_empty() => {
-                    ApiResponse::<()>::error_with_code_and_suggestions(msg, CODE_INVALID_REQUEST, s)
-                }
-                _ => ApiResponse::<()>::error_with_code(msg, CODE_INVALID_REQUEST),
-            };
+            let refusal = shape_error_refusal(
+                CODE_INVALID_REQUEST,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &msg,
+                suggestions.as_deref().unwrap_or_default(),
+            );
+            let mut resp =
+                ApiResponse::<()>::error_with_refusal(msg, CODE_INVALID_REQUEST, refusal);
             // Surface the allowed-values payload in `hint` (a
             // `serde_json::Value` free field) so structured data like
             // `{"allowedModes":["hard","soft"]}` reaches the caller.
@@ -434,8 +526,24 @@ pub async fn envelope_rewrite_middleware(req: Request, next: Next) -> Response {
     // The code half lives in `code_for_status` so the JSON stamping pass
     // below answers `BAD_GATEWAY` for a 502 whichever shape the handler
     // happened to emit — one mapping, not two that can drift apart.
-    let code = code_for_status(status);
-    let message: String = if original_msg.is_empty() {
+    let mut code = code_for_status(status);
+    // axum's plain `Json<T>` rejection for a non-UTF-8 body is a 400 whose
+    // text says "invalid unicode code point" — answer `INVALID_UTF8` with the
+    // encoding remedy rather than `INVALID_JSON` (see `invalid_utf8_message`).
+    // Keyed on axum's `JsonSyntaxError` prefix too, so a handler's own 400 that
+    // happens to quote a serde error about OTHER bytes is not relabelled.
+    let utf8_message =
+        if status == StatusCode::BAD_REQUEST && original_msg.starts_with(AXUM_JSON_SYNTAX_PREFIX) {
+            invalid_utf8_message(&original_msg)
+        } else {
+            None
+        };
+    if utf8_message.is_some() {
+        code = CODE_INVALID_UTF8;
+    }
+    let message: String = if let Some(m) = utf8_message {
+        m
+    } else if original_msg.is_empty() {
         default_message_for_status(status)
     } else {
         // ─── 5xx ──────────────────────────────────────────────────────────
@@ -445,7 +553,14 @@ pub async fn envelope_rewrite_middleware(req: Request, next: Next) -> Response {
         original_msg.into_owned()
     };
 
-    let envelope = ApiResponse::<()>::error_with_code(message, code);
+    let refusal = crate::mcp::refusal_envelope::refusal_for_envelope(
+        code,
+        status,
+        Some(&message),
+        None,
+        crate::mcp::refusal_envelope::retry_after_seconds(parts.headers.get(header::RETRY_AFTER)),
+    );
+    let envelope = ApiResponse::<()>::error_with_refusal(message, code, refusal);
     let mut response = (parts.status, Json(envelope)).into_response();
 
     // Preserve any non-Content-Type headers from the original response that
@@ -586,6 +701,10 @@ fn default_message_for_status(status: StatusCode) -> String {
 /// | 2a | `code`, no/disagreeing `error_detail` | reconcile | the handler's own string, mirrored — never replaced by a coarser guess |
 /// | 4 | `error_detail.code`, no `code` | **promote** | the only channel by which a typed code reaches a consumer reading `code` |
 /// | 5 | neither | derive both from the status | the two fields are populated together, never one alone |
+/// | 6 | (after 2–5) no `refusal` object | stamp the shared refusal from the final `code` | every enveloped error carries a typed next action (`refusal_envelope`) |
+///
+/// Rule 2's pass-through therefore needs the refusal as well: a body whose
+/// codes agree but which carries no `refusal` is stamped by rule 6 alone.
 ///
 /// **Rule 2a mirrors the handler's string VERBATIM** rather than mapping it
 /// onto a `UiBridgeErrorCode` variant. `relay.rs` alone emits eight top-level
@@ -605,7 +724,11 @@ fn default_message_for_status(status: StatusCode) -> String {
 /// *not* a handler's choice and must not read like one, the synthesised detail
 /// carries `context.code_source: "status_derived"`; a caller can tell a
 /// middleware guess from a handler's decision without parsing prose.
-fn stamp_code_on_json_envelope(bytes: &[u8], status: StatusCode) -> StampOutcome {
+fn stamp_code_on_json_envelope(
+    bytes: &[u8],
+    status: StatusCode,
+    retry_after_s: Option<u32>,
+) -> StampOutcome {
     use serde_json::{json, Value};
 
     let Ok(mut value) = serde_json::from_slice::<Value>(bytes) else {
@@ -633,10 +756,20 @@ fn stamp_code_on_json_envelope(bytes: &[u8], status: StatusCode) -> StampOutcome
         .map(str::to_owned)
         .unwrap_or_else(|| default_message_for_status(status));
 
+    let has_refusal = obj.get("refusal").is_some_and(Value::is_object);
+
     match (top_code, detail_code) {
-        // Rule 2 — both present and agreeing. Nothing to do, and touching it
-        // would re-serialize a body that is already correct.
-        (Some(t), Some(d)) if t == d => StampOutcome::AlreadyTyped,
+        // Rule 2 — both present and agreeing, and the refusal already there.
+        // Nothing to do, and touching it would re-serialize a body that is
+        // already correct.
+        (Some(t), Some(d)) if t == d && has_refusal => StampOutcome::AlreadyTyped,
+
+        // Rule 2, refusal-less arm: the codes agree but no refusal was
+        // attached — stamp only the refusal.
+        (Some(t), Some(d)) if t == d => {
+            stamp_refusal(obj, status, retry_after_s);
+            reserialize(&value)
+        }
 
         // Rule 2a, disagreement arm. The handler set both and they differ:
         // `error_detail.code` is the typed choice and wins, but the top-level
@@ -644,6 +777,7 @@ fn stamp_code_on_json_envelope(bytes: &[u8], status: StatusCode) -> StampOutcome
         (Some(t), Some(d)) => {
             obj.insert("code".to_string(), json!(d));
             set_detail_context(obj, "displaced_top_level_code", json!(t));
+            stamp_refusal(obj, status, retry_after_s);
             reserialize(&value)
         }
 
@@ -655,6 +789,7 @@ fn stamp_code_on_json_envelope(bytes: &[u8], status: StatusCode) -> StampOutcome
         // be this plan's own defect committed by its own fix.
         (Some(t), None) => {
             fill_detail(obj, &t, &message, "top_level_code");
+            stamp_refusal(obj, status, retry_after_s);
             reserialize(&value)
         }
 
@@ -664,6 +799,7 @@ fn stamp_code_on_json_envelope(bytes: &[u8], status: StatusCode) -> StampOutcome
         // edit to `elements.rs`.
         (None, Some(d)) => {
             obj.insert("code".to_string(), json!(d));
+            stamp_refusal(obj, status, retry_after_s);
             reserialize(&value)
         }
 
@@ -673,8 +809,51 @@ fn stamp_code_on_json_envelope(bytes: &[u8], status: StatusCode) -> StampOutcome
             let code = code_for_status(status);
             obj.insert("code".to_string(), json!(code));
             fill_detail(obj, code, &message, "status_derived");
+            stamp_refusal(obj, status, retry_after_s);
             reserialize(&value)
         }
+    }
+}
+
+/// Attach the shared refusal to a reconciled envelope that lacks one — rule 6
+/// of the reconciliation. Called AFTER the code rules, so it projects the
+/// final top-level `code`; the handler's `error_detail.recovery` (a typed
+/// `NextAction`) is its next action when present, and the `error` sentence is
+/// its detail. A body that already carries an object `refusal` is left alone:
+/// a constructor that knew more (a typed workspace-root miss, shape hints)
+/// chose it.
+fn stamp_refusal(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    status: StatusCode,
+    retry_after_s: Option<u32>,
+) {
+    if obj.get("refusal").is_some_and(serde_json::Value::is_object) {
+        return;
+    }
+    let code = obj
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| code_for_status(status))
+        .to_string();
+    let message = obj
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let recovery = obj
+        .get("error_detail")
+        .and_then(|d| d.get("recovery"))
+        .and_then(|r| {
+            serde_json::from_value::<qontinui_types::refusal::NextAction>(r.clone()).ok()
+        });
+    let refusal = crate::mcp::refusal_envelope::refusal_for_envelope(
+        &code,
+        status,
+        message.as_deref(),
+        recovery,
+        retry_after_s,
+    );
+    if let Ok(v) = serde_json::to_value(&refusal) {
+        obj.insert("refusal".to_string(), v);
     }
 }
 
@@ -715,9 +894,13 @@ fn reserialize(value: &serde_json::Value) -> StampOutcome {
 /// is passed through deliberately), not errors.
 #[derive(Debug)]
 enum StampOutcome {
-    /// Rules 2a / 4 / 5 — the envelope was reconciled; carries the new body.
+    /// Rules 2a / 4 / 5 / 6 — the envelope was reconciled (or, under rule 6
+    /// alone, only given its refusal); carries the new body. Since rule 6, a
+    /// body with agreeing codes but no `refusal` is counted here, not under
+    /// `AlreadyTyped`.
     Stamped(Vec<u8>),
-    /// Rule 2 — both code fields were present and agreed. Already correct.
+    /// Rule 2 — both code fields were present and agreed AND a `refusal` was
+    /// already attached. Already correct.
     AlreadyTyped,
     /// Rule 1 — not an `ApiResponse` failure body, so not ours to edit.
     Foreign,
@@ -960,17 +1143,28 @@ async fn stamp_json_error_code(response: Response) -> Response {
         // cannot be handed back — emit a valid envelope rather than a
         // bodyless 5xx.
         record_stamp(B_BODY_UNREADABLE);
+        let message = default_message_for_status(status);
+        let refusal = crate::mcp::refusal_envelope::refusal_for_envelope(
+            code_for_status(status),
+            status,
+            Some(&message),
+            None,
+            None,
+        );
         return (
             parts.status,
-            Json(ApiResponse::<()>::error_with_code(
-                default_message_for_status(status),
+            Json(ApiResponse::<()>::error_with_refusal(
+                message,
                 code_for_status(status),
+                refusal,
             )),
         )
             .into_response();
     };
 
-    let outcome = stamp_code_on_json_envelope(&bytes, status);
+    let retry_after_s =
+        crate::mcp::refusal_envelope::retry_after_seconds(parts.headers.get(header::RETRY_AFTER));
+    let outcome = stamp_code_on_json_envelope(&bytes, status, retry_after_s);
     record_stamp(outcome.bucket());
     let StampOutcome::Stamped(patched) = outcome else {
         return Response::from_parts(parts, axum::body::Body::from(bytes));
@@ -1054,6 +1248,96 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["success"], false);
         assert_eq!(body["code"], "INVALID_JSON");
+    }
+
+    /// Raw-bytes twin of [`send`], for bodies that are deliberately NOT UTF-8.
+    async fn send_bytes(app: Router, body: &'static [u8]) -> (StatusCode, serde_json::Value) {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/probe")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// 400 INVALID_UTF8 — the exact bytes Windows Git Bash curl sent for an em
+    /// dash (`0x97`, CP1252) on 2026-10-17. Not "malformed JSON".
+    #[tokio::test]
+    async fn non_utf8_body_gives_400_invalid_utf8_not_invalid_json() {
+        let (status, body) = send_bytes(test_router(), b"{\"value\":\"a \x97 b\"}").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "INVALID_UTF8");
+        let msg = body["error"].as_str().unwrap();
+        assert!(msg.starts_with("request body is not valid UTF-8"), "{msg}");
+        assert!(msg.contains("--data-binary"), "{msg}");
+        assert!(
+            msg.contains("`\\u2014`"),
+            "the JSON escape advice is literal: {msg}"
+        );
+    }
+
+    /// A handler's OWN 400 that quotes a serde error about some other bytes
+    /// keeps `INVALID_JSON`: only axum's body-parse rejection is relabelled.
+    #[tokio::test]
+    async fn handler_400_quoting_serde_text_is_not_relabelled() {
+        async fn h() -> (StatusCode, String) {
+            (
+                StatusCode::BAD_REQUEST,
+                "config file: invalid unicode code point at line 1 column 3".to_string(),
+            )
+        }
+        let app = Router::new()
+            .route("/probe", post(h))
+            .layer(middleware::from_fn(envelope_rewrite_middleware));
+        let (status, body) = send_bytes(app, b"{}").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "INVALID_JSON");
+    }
+
+    /// The same text sent as UTF-8 (`e2 80 94`) is accepted — the runner never
+    /// rejected valid UTF-8; the em dash was only ever an encoding problem.
+    #[tokio::test]
+    async fn utf8_em_dash_is_accepted() {
+        let (status, body) = send_bytes(test_router(), b"{\"value\":\"a \xe2\x80\x94 b\"}").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"], "a \u{2014} b");
+    }
+
+    /// The `UiBridgeJson` extractor's syntax arm says the same thing.
+    #[tokio::test]
+    async fn ui_bridge_json_extractor_also_names_invalid_utf8() {
+        async fn h(UiBridgeJson(b): UiBridgeJson<Probe>) -> Json<ApiResponse<String>> {
+            Json(ApiResponse::success(b.value))
+        }
+        let app = Router::new().route("/probe", post(h));
+        let (status, body) = send_bytes(app, b"{\"value\":\"\xff\"}").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "INVALID_UTF8");
+    }
+
+    /// Pins the marker [`invalid_utf8_message`] keys on to serde_json's real
+    /// wording, and shows a genuine syntax error does NOT trip it.
+    #[test]
+    fn serde_json_still_words_invalid_utf8_this_way() {
+        let err = serde_json::from_slice::<serde_json::Value>(b"{\"v\":\"\x97\"}").unwrap_err();
+        assert!(
+            invalid_utf8_message(&err.to_string()).is_some(),
+            "serde_json reworded its invalid-UTF-8 error ({err}); update SERDE_INVALID_UTF8_MARKER"
+        );
+        let syntax = serde_json::from_slice::<serde_json::Value>(b"not-valid-json{").unwrap_err();
+        assert!(invalid_utf8_message(&syntax.to_string()).is_none());
+        let surrogate =
+            serde_json::from_slice::<serde_json::Value>(br#"{"v":"\ud800"}"#).unwrap_err();
+        assert!(
+            invalid_utf8_message(&surrogate.to_string()).is_none(),
+            "{surrogate}"
+        );
     }
 
     /// 422 INVALID_REQUEST — syntactically valid JSON but missing required field.
@@ -1302,6 +1586,178 @@ mod tests {
         assert_eq!(body["error"], "explicit handler 500");
     }
 
+    /// Every enveloped error leaves the middleware carrying a `refusal` that
+    /// decodes as the shared envelope and renders a non-empty sentence —
+    /// whichever constructor built the body (plain-text handler arm, bare
+    /// router 405, `api_error`, `error_with_code`, `api_error_detailed` with a
+    /// typed UI Bridge error, a 429 with `Retry-After`), and a refusal a
+    /// constructor already chose is kept verbatim.
+    #[tokio::test]
+    async fn every_enveloped_error_carries_a_rendered_refusal() {
+        use crate::mcp::types::api_error_detailed;
+        use crate::mcp::ui_bridge::UiBridgeError;
+
+        async fn plain_500() -> (StatusCode, String) {
+            (StatusCode::INTERNAL_SERVER_ERROR, "db exploded".to_string())
+        }
+        async fn json_404() -> impl IntoResponse {
+            // The shape `api_error(..)` serializes to.
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"success": false, "error": "session not found"})),
+            )
+        }
+        async fn coded_409() -> impl IntoResponse {
+            (
+                StatusCode::CONFLICT,
+                Json(ApiResponse::<()>::error_with_code("busy", "SESSION_BUSY")),
+            )
+        }
+        async fn typed_400() -> impl IntoResponse {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(api_error_detailed(
+                    "No element found matching criteria #x",
+                    UiBridgeError::element_not_found("#x"),
+                )),
+            )
+        }
+        async fn limited_429() -> impl IntoResponse {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(header::RETRY_AFTER, "7")],
+                Json(serde_json::json!({"success": false, "error": "slow down"})),
+            )
+        }
+        async fn workspace_422() -> impl IntoResponse {
+            use qontinui_types::paths::{
+                RejectedRoot, RootRejection, RootSource, WorkspaceRootUnresolved,
+            };
+            let unresolved = WorkspaceRootUnresolved {
+                rejected: RejectedRoot {
+                    source: RootSource::Probes,
+                    reason: RootRejection::NothingConfigured,
+                },
+            };
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(ApiResponse::<()>::workspace_root_unresolved(&unresolved)),
+            )
+        }
+
+        let app = Router::new()
+            .route("/plain-500", axum::routing::get(plain_500))
+            .route("/json-404", axum::routing::get(json_404))
+            .route("/coded-409", axum::routing::get(coded_409))
+            .route("/typed-400", axum::routing::get(typed_400))
+            .route("/limited-429", axum::routing::get(limited_429))
+            .route("/workspace-422", axum::routing::get(workspace_422))
+            .route("/post-only", post(|| async { "ok" }))
+            .layer(middleware::from_fn(envelope_rewrite_middleware));
+
+        let cases: &[(&str, &str, &str, &str, &str)] = &[
+            // (method, path, refusal.code, discriminator, next_action.kind)
+            (
+                "GET",
+                "/plain-500",
+                "internal_error",
+                "INTERNAL_ERROR",
+                "report_defect",
+            ),
+            ("GET", "/json-404", "not_found", "NOT_FOUND", "fix_request"),
+            (
+                "GET",
+                "/coded-409",
+                "conflict",
+                "SESSION_BUSY",
+                "retry_later",
+            ),
+            (
+                "GET",
+                "/typed-400",
+                "not_found",
+                "ELEMENT_NOT_FOUND",
+                "resnapshot",
+            ),
+            (
+                "GET",
+                "/limited-429",
+                "rate_limited",
+                "TOO_MANY_REQUESTS",
+                "retry_later",
+            ),
+            (
+                "GET",
+                "/post-only",
+                "invalid_request",
+                "METHOD_NOT_ALLOWED",
+                "fix_request",
+            ),
+        ];
+        for (method, path, code, discriminator, kind) in cases {
+            let req = Request::builder()
+                .method(*method)
+                .uri(*path)
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let refusal: qontinui_types::refusal::Refusal =
+                serde_json::from_value(body["refusal"].clone())
+                    .unwrap_or_else(|e| panic!("{path}: no decodable refusal ({e}): {body}"));
+            assert!(!refusal.render().trim().is_empty(), "{path}");
+            assert_eq!(refusal.code.as_str(), *code, "{path}: {body}");
+            assert_eq!(
+                refusal.discriminator.as_deref(),
+                Some(*discriminator),
+                "{path}"
+            );
+            assert_eq!(refusal.next_action.kind.as_str(), *kind, "{path}: {body}");
+            assert_eq!(
+                body["code"], *discriminator,
+                "{path}: code is kept beside it"
+            );
+        }
+
+        // The 429's Retry-After reaches the next action.
+        let req = Request::builder()
+            .uri("/limited-429")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["refusal"]["next_action"]["retry_after_s"], 7, "{body}");
+
+        // A constructor's own refusal survives the pass untouched.
+        let req = Request::builder()
+            .uri("/workspace-422")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["refusal"]["code"], "workspace_root_unresolved",
+            "{body}"
+        );
+        assert_eq!(
+            body["refusal"]["next_action"]["kind"], "set_setting",
+            "{body}"
+        );
+        assert!(
+            body["hint"].is_null(),
+            "the refusal moved off `hint`: {body}"
+        );
+    }
+
     /// Read one bucket of the process-global stamping counters.
     fn stamp_bucket(name: &str) -> u64 {
         super::json_stamp_stats()[name].as_u64().unwrap_or(0)
@@ -1532,8 +1988,13 @@ mod tests {
             body["code"], "INVALID_REQUEST",
             "code must be INVALID_REQUEST on shape error"
         );
-        let suggestions = body["suggestions"].as_array().expect("suggestions array");
-        assert!(!suggestions.is_empty(), "suggestions must not be empty");
+        assert_eq!(body["refusal"]["next_action"]["kind"], "fix_request");
+        assert!(
+            body["refusal"]["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains("Hints: ")),
+            "the type's hints must reach refusal.detail: {body}"
+        );
         let hint = &body["hint"];
         assert!(
             !hint.is_null(),
@@ -1552,32 +2013,24 @@ mod tests {
 
     // ── AssertRequestStub: allowedAssertionTypes in hint ─────────────────────
 
+    use crate::mcp::ui_bridge::vision_routes;
+
     #[derive(Debug, serde::Deserialize)]
     struct AssertRequestStub {
         #[allow(dead_code)]
         assertions: Vec<serde_json::Value>,
     }
 
+    /// DELEGATES to the real `AssertRequest` hint rather than copying it, so
+    /// the envelope carries exactly what the route advertises and a DSL
+    /// variant is typed in once (`vision_routes` pins that list itself). The
+    /// stub exists only for its trivially-deserializable shape.
     impl RequestHints for AssertRequestStub {
         fn shape_error_suggestions() -> Option<Vec<String>> {
-            Some(vec![
-                "Required field: `assertions` (array of Assertion objects).".to_string(),
-                "Assertion `type` values: no_overlap, element_above, contains_text, \
-                 text_fits_container, aligned_horizontally, aligned_vertically, \
-                 color_within, typography_consistent, no_layout_shift_since, \
-                 no_clipping, animation_settled, contrast_meets_wcag."
-                    .to_string(),
-            ])
+            <vision_routes::AssertRequest as RequestHints>::shape_error_suggestions()
         }
         fn shape_error_data() -> Option<serde_json::Value> {
-            Some(serde_json::json!({
-                "allowedAssertionTypes": [
-                    "no_overlap", "element_above", "contains_text", "text_fits_container",
-                    "aligned_horizontally", "aligned_vertically", "color_within",
-                    "typography_consistent", "no_layout_shift_since", "no_clipping",
-                    "animation_settled", "contrast_meets_wcag"
-                ]
-            }))
+            <vision_routes::AssertRequest as RequestHints>::shape_error_data()
         }
     }
 
@@ -1604,12 +2057,17 @@ mod tests {
                 .any(|t| t.as_str() == Some("contrast_meets_wcag")),
             "contrast_meets_wcag must be in allowed types"
         );
-        // This stub DUPLICATES `AssertRequest`'s hint rather than deriving
-        // from it, so a variant added to the DSL has to be typed in twice.
-        // Pinning the newest one is what makes the duplication survivable.
+        // The stub delegates to `AssertRequest`'s hint, so the newest DSL
+        // variants reach the envelope with no second copy to update.
         assert!(
             types.iter().any(|t| t.as_str() == Some("element_above")),
             "element_above must be in allowed types"
+        );
+        assert!(
+            types
+                .iter()
+                .any(|t| t.as_str() == Some("image_blockiness_within")),
+            "the L1 image assertions must reach the envelope hint"
         );
     }
 
@@ -1621,18 +2079,14 @@ mod tests {
         analyzer: String,
     }
 
+    /// DELEGATES to the real `AnalyzeRequest` hint, for the same reason as
+    /// `AssertRequestStub` above.
     impl RequestHints for AnalyzeRequestStub {
         fn shape_error_suggestions() -> Option<Vec<String>> {
-            Some(vec![
-                "Required field: `analyzer` (one of: \"layout\", \"typography\", \
-                 \"color\", \"dynamic\", \"elements\")."
-                    .to_string(),
-            ])
+            <vision_routes::AnalyzeRequest as RequestHints>::shape_error_suggestions()
         }
         fn shape_error_data() -> Option<serde_json::Value> {
-            Some(serde_json::json!({
-                "allowedAnalyzers": ["layout", "typography", "color", "dynamic", "elements"]
-            }))
+            <vision_routes::AnalyzeRequest as RequestHints>::shape_error_data()
         }
     }
 
@@ -1649,10 +2103,14 @@ mod tests {
         let analyzers = hint["allowedAnalyzers"]
             .as_array()
             .expect("allowedAnalyzers");
-        assert_eq!(analyzers.len(), 5, "should expose all 5 analyzers");
+        assert_eq!(analyzers.len(), 6, "should expose all 6 analyzers");
         assert!(
             analyzers.iter().any(|a| a.as_str() == Some("layout")),
             "layout must be listed"
+        );
+        assert!(
+            analyzers.iter().any(|a| a.as_str() == Some("image")),
+            "image must be listed"
         );
     }
 
@@ -1692,7 +2150,7 @@ mod tests {
         );
     }
 
-    // ── Hint-less request: no suggestions or hint fields ─────────────────────
+    // ── Hint-less request: no hints, no hint field ───────────────────────────
 
     #[derive(Debug, serde::Deserialize)]
     struct NakedRequest {
@@ -1702,16 +2160,20 @@ mod tests {
 
     impl RequestHints for NakedRequest {}
 
-    /// A type with no hints produces the baseline 422 envelope without
-    /// `suggestions` or `hint` fields.
+    /// A type with no hints produces the baseline 422 envelope: no `hint`, and
+    /// no constructor-built refusal (the middleware stamps the status-derived
+    /// one on the wire).
     #[tokio::test]
-    async fn naked_request_422_has_no_hint_or_suggestions() {
+    async fn naked_request_422_has_no_hint_or_hints() {
         let (status, body) = send_uib::<NakedRequest>(r#"{"other": "oops"}"#).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(body["success"], false);
         assert_eq!(body["code"], "INVALID_REQUEST");
         // No hints provided — these fields must be absent (null in serde_json::Value terms).
-        assert!(body["suggestions"].is_null(), "suggestions must be absent");
+        assert!(
+            body["refusal"].is_null(),
+            "no hints means no constructor refusal"
+        );
         assert!(body["hint"].is_null(), "hint must be absent");
     }
 
@@ -1804,7 +2266,7 @@ mod json_error_code_reconciliation_tests {
     /// `None` when it was passed through for any reason. The tests that care
     /// WHICH pass-through happened match on `StampOutcome` directly.
     fn stamp(bytes: &[u8], status: super::StatusCode) -> Option<Vec<u8>> {
-        match stamp_code_on_json_envelope(bytes, status) {
+        match stamp_code_on_json_envelope(bytes, status, None) {
             StampOutcome::Stamped(b) => Some(b),
             _ => None,
         }
@@ -1826,7 +2288,7 @@ mod json_error_code_reconciliation_tests {
                        "error":"SEND_KEYS_INVALID: 'modifiers' for key 'c' must be an object",
                        "error_detail":{"code":"SEND_KEYS_INVALID",
                                        "message":"SEND_KEYS_INVALID: …",
-                                       "recovery":"FIX_REQUEST"}}"#;
+                                       "recovery":{"kind":"fix_request"}}}"#;
         let out = stamp(body.as_bytes(), StatusCode::BAD_REQUEST).expect("rule 4 promotes");
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["code"], serde_json::json!("SEND_KEYS_INVALID"));
@@ -1945,14 +2407,105 @@ mod json_error_code_reconciliation_tests {
         assert_eq!(v["error_detail"]["context"]["element_id"], "btn");
     }
 
-    /// Rule 2 — a fully-typed, agreeing envelope is left byte-for-byte alone.
+    /// Rule 2 — a fully-typed, agreeing envelope that already carries its
+    /// refusal is left byte-for-byte alone.
     #[test]
     fn a_fully_typed_agreeing_envelope_is_untouched() {
         assert!(stamp(
-            r#"{"success":false,"error":"x","code":"ACTION_FAILED","error_detail":{"code":"ACTION_FAILED","message":"x"}}"#.as_bytes(),
+            r#"{"success":false,"error":"x","code":"ACTION_FAILED","error_detail":{"code":"ACTION_FAILED","message":"x"},"refusal":{"code":"conflict","discriminator":"ACTION_FAILED","next_action":{"kind":"resnapshot"},"glossary_terms":[],"observed_at":"2026-11-21T00:00:00Z","source":"runner"}}"#.as_bytes(),
             StatusCode::BAD_REQUEST
         )
         .is_none());
+    }
+
+    /// Rule 6 alone — agreeing codes with no refusal get ONLY the refusal; the
+    /// handler's `error_detail.recovery` is its next action and the codes are
+    /// not touched.
+    #[test]
+    fn agreeing_codes_without_a_refusal_get_only_the_refusal() {
+        let out = stamp(
+            r#"{"success":false,"error":"x","code":"ACTION_FAILED","error_detail":{"code":"ACTION_FAILED","message":"x","recovery":{"kind":"broaden_selector"}}}"#.as_bytes(),
+            StatusCode::BAD_REQUEST,
+        )
+        .expect("rule 6 stamps the refusal");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["code"], "ACTION_FAILED");
+        assert_eq!(v["error_detail"]["code"], "ACTION_FAILED");
+        assert!(
+            v["error_detail"]["context"].is_null(),
+            "codes untouched: {v}"
+        );
+        assert_eq!(v["refusal"]["code"], "conflict");
+        assert_eq!(v["refusal"]["discriminator"], "ACTION_FAILED");
+        assert_eq!(v["refusal"]["next_action"]["kind"], "broaden_selector");
+        assert_eq!(v["refusal"]["detail"], "x");
+        assert_eq!(v["refusal"]["source"], "runner");
+    }
+
+    /// Every arm that reconciles also stamps the refusal, and its sentence
+    /// renders non-empty — whichever rule fired.
+    #[test]
+    fn every_reconciled_envelope_carries_a_rendered_refusal() {
+        let cases: &[(&str, StatusCode)] = &[
+            // rule 5 — neither code
+            (
+                r#"{"success":false,"error":"Python executor not running"}"#,
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                r#"{"success":false,"error":"session not found"}"#,
+                StatusCode::NOT_FOUND,
+            ),
+            // rule 4 — detail code only
+            (
+                r#"{"success":false,"error":"x","error_detail":{"code":"ELEMENT_NOT_FOUND","message":"x"}}"#,
+                StatusCode::NOT_FOUND,
+            ),
+            // rule 2a — top-level only (a relay code)
+            (
+                r#"{"success":false,"error":"x","code":"NO_TAB_CONNECTED"}"#,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            // rule 2a — disagreement
+            (
+                r#"{"success":false,"error":"x","code":"TIMEOUT","error_detail":{"code":"ACTION_FAILED"}}"#,
+                StatusCode::BAD_REQUEST,
+            ),
+            // rule 2 without a refusal
+            (
+                r#"{"success":false,"code":"INVALID_JSON","error_detail":{"code":"INVALID_JSON"}}"#,
+                StatusCode::BAD_REQUEST,
+            ),
+        ];
+        for (body, status) in cases {
+            let out =
+                stamp(body.as_bytes(), *status).unwrap_or_else(|| panic!("{body} not stamped"));
+            let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            let refusal: qontinui_types::refusal::Refusal =
+                serde_json::from_value(v["refusal"].clone())
+                    .unwrap_or_else(|e| panic!("{body}: refusal does not decode: {e} — {v}"));
+            assert!(!refusal.render().trim().is_empty(), "{body}");
+            assert_eq!(
+                refusal.discriminator.as_deref(),
+                v["code"].as_str(),
+                "the discriminator is the final top-level code: {v}"
+            );
+        }
+    }
+
+    /// The `Retry-After` header reaches a status-derived `retry_later`.
+    #[test]
+    fn retry_after_reaches_the_stamped_refusal() {
+        let StampOutcome::Stamped(out) = stamp_code_on_json_envelope(
+            r#"{"success":false,"error":"slow down"}"#.as_bytes(),
+            StatusCode::TOO_MANY_REQUESTS,
+            Some(12),
+        ) else {
+            panic!("should stamp");
+        };
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["refusal"]["next_action"]["kind"], "retry_later");
+        assert_eq!(v["refusal"]["next_action"]["retry_after_s"], 12);
     }
 
     /// Rule 2a, disagreement arm: the typed choice wins and the displaced
@@ -2123,24 +2676,30 @@ mod json_error_code_reconciliation_tests {
     #[test]
     fn pass_through_outcomes_are_distinguishable() {
         let already = stamp_code_on_json_envelope(
-            r#"{"success":false,"error":"x","code":"A","error_detail":{"code":"A"}}"#.as_bytes(),
+            r#"{"success":false,"error":"x","code":"ACTION_FAILED","error_detail":{"code":"ACTION_FAILED"},"refusal":{"code":"conflict","discriminator":"ACTION_FAILED","next_action":{"kind":"resnapshot"},"glossary_terms":[],"observed_at":"2026-11-21T00:00:00Z","source":"runner"}}"#.as_bytes(),
             StatusCode::INTERNAL_SERVER_ERROR,
+            None,
         );
         assert_eq!(already.bucket(), "already_typed");
 
         let foreign = stamp_code_on_json_envelope(
             r#"{"data":{"errors":[]}}"#.as_bytes(),
             StatusCode::INTERNAL_SERVER_ERROR,
+            None,
         );
         assert_eq!(foreign.bucket(), "foreign_body");
 
-        let junk =
-            stamp_code_on_json_envelope(b"not json at all", StatusCode::INTERNAL_SERVER_ERROR);
+        let junk = stamp_code_on_json_envelope(
+            b"not json at all",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            None,
+        );
         assert_eq!(junk.bucket(), "unparseable_body");
 
         let stamped = stamp_code_on_json_envelope(
             r#"{"success":false,"error":"x"}"#.as_bytes(),
             StatusCode::INTERNAL_SERVER_ERROR,
+            None,
         );
         assert_eq!(stamped.bucket(), "stamped");
     }

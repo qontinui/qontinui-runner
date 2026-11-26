@@ -25,7 +25,23 @@
 //! with no `task_run_id`, anchored on `claude_code_session_id`. And
 //! `AiCoordRegistrar::session_id_for` is keyed on `claude_session_id` for BOTH
 //! planes. So `emit(<claude_code_session_id>, …)` resolves through the
-//! existing R4 index and this module adds no registrar work whatsoever.
+//! existing R4 index and this module adds no registrar LINKAGE work. Its one
+//! registrar call is the liveness heartbeat below.
+//!
+//! ## Transcript activity is liveness
+//!
+//! A registrar-bound row (sniffed, `transcript-bind`, or auto-bind) gets a
+//! coord heartbeat only from [`AiCoordRegistrar::heartbeat_on_interaction`],
+//! whose two callers until then (`send_user_message`, `drain.rs`) a
+//! terminal-hosted session never reaches — so its row went `stale` at 10 min and `closed` at
+//! 30 min while its transcript kept growing (plan
+//! `2026-10-11-a-live-runner-sessions-coord-row-once-reaped-stays-closed-under-its-own-heartbeats`
+//! Phase 3). [`SessionTranscriptTailer::admit`] therefore heartbeats every
+//! BOUND key on a non-empty append, at most once per
+//! [`TRANSCRIPT_HEARTBEAT_INTERVAL`] per key, **whatever Gate 1 says**: a
+//! liveness heartbeat carries no transcript content, so transcript consent does
+//! not govern it. An idle transcript does not grow, so an idle session still
+//! ages to `stale` as before.
 //!
 //! ## Coverage is the thing to watch, not liveness
 //!
@@ -145,7 +161,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, TryLockError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -180,6 +196,17 @@ const OWNERSHIP_SCAN_LINES: usize = 200;
 /// covered by several samples.
 const COVERAGE_REPORT_INTERVAL: Duration = Duration::from_secs(60);
 
+/// At most one transcript-activity heartbeat per bound session key per this
+/// interval (module header, "Transcript activity is liveness"). Coord's stale
+/// threshold is 10 min, so a minute is ample — and it bounds a chatty
+/// transcript to one outbox row a minute rather than one per append.
+pub(crate) const TRANSCRIPT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Past this many keys the heartbeat throttle map drops every entry whose
+/// window has already elapsed (an expired entry carries no information), so
+/// it stays bounded by the sessions active within one interval.
+const HEARTBEAT_THROTTLE_PRUNE_AT: usize = 256;
+
 /// Cap on unbound session ids named in one summary line. A coverage hole is
 /// actionable from a handful of ids; the count carries the magnitude.
 const MAX_REPORTED_UNBOUND: usize = 16;
@@ -204,6 +231,9 @@ pub struct SessionTranscriptTailer {
     identities: Mutex<HashMap<PathBuf, String>>,
     /// [`PREFIX_REPLAY_CAP_BYTES`]; a field so tests can shrink it.
     prefix_cap: u64,
+    /// Session key → when [`Self::admit`] last heartbeated it. Bounded: see
+    /// [`HEARTBEAT_THROTTLE_PRUNE_AT`].
+    heartbeat_at: Mutex<HashMap<String, Instant>>,
 }
 
 /// [`SessionTranscriptTailer::admit`]'s verdict on one batch.
@@ -229,6 +259,12 @@ pub struct BindRequest {
     /// Account / config dir stamped on a FRESHLY minted coord row (an adopted
     /// row already exists, so nothing is written for it).
     pub resume: ResumeParams,
+    /// `adopt` is a LIVE pane's own row that this session owns (transcript
+    /// auto-bind's live-pane adoption): bind through
+    /// [`AiCoordRegistrar::bind_transcript_session_on_live_pane`], stamping
+    /// the row with this tenant decision (plan D3) and taking the row from the
+    /// pane's pin. Ignored without `adopt`.
+    pub live_pane_tenant: Option<crate::session::NewSessionTenant>,
 }
 
 /// What a successful [`SessionTranscriptTailer::bind_and_replay`] did.
@@ -263,7 +299,8 @@ pub struct BindOutcome {
 /// parse prose to decide whether to retry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BindRefusal {
-    /// Gate 1 (`Settings.cloud_sync_enabled`) is off. Nothing was written —
+    /// Transcript sync's gate is closed (the user's toggle or the tenant's
+    /// `egress_transcript_sync`). Nothing was written —
     /// not the binding, not a byte.
     SyncDisabled,
     /// The registrar declined to bind (`QONTINUI_SESSION_AUTOMATION_REGISTER`
@@ -503,9 +540,10 @@ struct ReplayPass {
 /// `.`/`..` and — on macOS — `/private/var` aliases resolved), falling back to
 /// the path as given when it cannot be canonicalized, and lowercased on
 /// Windows like [`normalize_dir`]. The watcher reaches one file by two
-/// spellings (startup discovery builds it from `encode_for_lookup`, a notify
-/// event carries the OS's own path, the route takes the `read_dir` name), and
-/// a second spelling must not read as a fresh file with mark 0.
+/// spellings (startup discovery builds it from
+/// `transcript::session_transcript_path`, a notify event carries the OS's own
+/// path, the route takes the `read_dir` name), and a second spelling must not
+/// read as a fresh file with mark 0.
 fn file_identity(path: &Path) -> String {
     let p = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let s = p.display().to_string();
@@ -567,26 +605,33 @@ struct Coverage {
     autobind_adopted: u64,
     autobind_minted: u64,
     autobind_deferred: u64,
-    /// Gate 1 as observed at the last append. `None` until an append is seen —
+    /// Sessions bound by adopting the LIVE pane's own row, without asking
+    /// coord (plan `2026-11-12-transcript-autobind-adopts-a-previous-boot-row-that-a-live-pane-has-replaced` D1).
+    autobind_adopted_live_pane: u64,
+    /// Transcript sync's gate (the user's toggle AND the tenant's
+    /// `egress_transcript_sync`) as observed at the last append. `None` until
+    /// an append is seen —
     /// which is why the report models it as an option: "no data yet" and
     /// "consent withheld" are different answers and a bare `false` conflates
     /// them.
-    cloud_sync_enabled: Option<bool>,
+    transcript_sync_permitted: Option<bool>,
     /// Counters at the last summary, so the reporter can stay quiet on an
     /// idle fleet without losing the ability to say "still nothing bound".
     /// Compared field by field, not as a sum: a held batch moves one count
     /// from `appends_emitted` to `held_batches`, which a sum cannot see.
-    last_reported: [u64; 8],
+    last_reported: [u64; 9],
 }
 
 /// Point-in-time coverage snapshot. `Serialize` so a health/diagnostic surface
 /// can serve it without reformatting.
 #[derive(Debug, Clone, Serialize)]
 pub struct CoverageReport {
-    /// Gate 1 as observed at the last append; `None` before the first one. A
+    /// Transcript sync's gate (the user's toggle AND the tenant's
+    /// `egress_transcript_sync`) as observed at the last append; `None` before
+    /// the first one. A
     /// zero-everything report means something different in each of the three
     /// states.
-    pub cloud_sync_enabled: Option<bool>,
+    pub transcript_sync_permitted: Option<bool>,
     /// Distinct sessions whose appends reached the outbox.
     pub sessions_tailed: usize,
     /// Distinct sessions currently missing a coord binding.
@@ -610,12 +655,19 @@ pub struct CoverageReport {
     /// Auto-bind attempts that did not bind (coord unreadable / unresolved,
     /// Gate 1 off, registrar refusal). Retried on the next throttle window.
     pub autobind_deferred: u64,
+    /// Transcripts the watcher bound by adopting the row of the LIVE pane
+    /// that hosts the session, without asking coord. Counted apart from
+    /// `autobind_adopted` (coord's pick), so the two adoption sources stay
+    /// measurable.
+    pub autobind_adopted_live_pane: u64,
 }
 
 /// How an auto-bind attempt ended, for the coverage counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutoBindKind {
     Adopted,
+    /// Adopted the live pane's own row (no coord round trip).
+    AdoptedLivePane,
     Minted,
     Deferred,
 }
@@ -630,6 +682,15 @@ impl SessionTranscriptTailer {
     /// (see [`AiCoordRegistrar::pending_started_session_for`]). Blocking.
     pub fn pending_started_row(&self, session_key: &str) -> Option<Uuid> {
         self.registrar.pending_started_session_for(session_key)
+    }
+
+    /// The live pane row that hosts `session_key`, by the registrar's
+    /// pane-row owner rule ([`AiCoordRegistrar::live_terminal_row`]).
+    pub(crate) fn live_pane_row(
+        &self,
+        session_key: &str,
+    ) -> Option<crate::claude_session::pane_row_owner::LivePaneRow> {
+        self.registrar.live_terminal_row(session_key)
     }
 
     /// Record that the watcher SAW `session_key` and it has no binding, so the
@@ -648,6 +709,7 @@ impl SessionTranscriptTailer {
         let mut cov = self.lock_coverage();
         match kind {
             AutoBindKind::Adopted => cov.autobind_adopted += 1,
+            AutoBindKind::AdoptedLivePane => cov.autobind_adopted_live_pane += 1,
             AutoBindKind::Minted => cov.autobind_minted += 1,
             AutoBindKind::Deferred => cov.autobind_deferred += 1,
         }
@@ -665,6 +727,7 @@ impl SessionTranscriptTailer {
             marks,
             identities: Mutex::new(HashMap::new()),
             prefix_cap: PREFIX_REPLAY_CAP_BYTES,
+            heartbeat_at: Mutex::new(HashMap::new()),
         }
     }
 
@@ -693,7 +756,7 @@ impl SessionTranscriptTailer {
             file_start,
             appended,
             truncated,
-            crate::settings::get_cloud_sync_enabled(),
+            self.transcript_sync_open(session_key),
         );
     }
 
@@ -707,9 +770,9 @@ impl SessionTranscriptTailer {
         file_start: u64,
         appended: &str,
         truncated: bool,
-        cloud_sync_enabled: bool,
+        transcript_sync_permitted: bool,
     ) {
-        match self.admit(session_key, appended.len(), cloud_sync_enabled) {
+        match self.admit(session_key, appended.len(), transcript_sync_permitted) {
             Admit::Emit => self.emit_batch(session_key, path, file_start, appended, truncated),
             Admit::Withheld => {
                 self.withhold_batch(session_key, path, file_start, appended.len());
@@ -718,34 +781,69 @@ impl SessionTranscriptTailer {
         }
     }
 
+    /// Transcript sync's gate for `session_key`, asked in the tenant the
+    /// registrar recorded for that session — the strictest bound tenant when
+    /// it recorded none (e.g. a session this process has not registered since
+    /// a restart): the tenant's `egress_transcript_sync` AND the user's own
+    /// toggle.
+    pub(crate) fn transcript_sync_open(&self, session_key: &str) -> bool {
+        crate::egress::transcript_sync_gate_session(crate::egress::SessionScope::from_lookup(
+            self.registrar.recorded_tenant(session_key),
+        ))
+        .is_open()
+    }
+
     /// Gate 1 and the binding, with the coverage bookkeeping. `true` = this
     /// batch should be emitted (then call [`Self::try_emit_batch`] or
     /// [`Self::emit_batch`]); `false` = drop it. Never blocks on a session
     /// lock.
     ///
-    /// Gate 1 (`Settings.cloud_sync_enabled`) is resolved by the caller rather
+    /// The gate ([`crate::egress::transcript_sync_permitted`]: the user's
+    /// `Settings.cloud_sync_enabled` AND the tenant's `egress_transcript_sync`)
+    /// is resolved by the caller rather
     /// than inside the emitter because the coverage summary needs its value —
     /// "off" and "on but reaching nobody" are different diagnoses. The emit
     /// path then calls `emit_inner`, which by contract does NOT re-check it.
-    pub fn admit(&self, session_key: &str, len: usize, cloud_sync_enabled: bool) -> Admit {
+    ///
+    /// A non-empty append on a BOUND key also heartbeats its coord row (at most
+    /// once per [`TRANSCRIPT_HEARTBEAT_INTERVAL`]), before and regardless of
+    /// Gate 1 — module header, "Transcript activity is liveness".
+    pub fn admit(&self, session_key: &str, len: usize, transcript_sync_permitted: bool) -> Admit {
+        self.admit_at(session_key, len, transcript_sync_permitted, Instant::now())
+    }
+
+    /// [`Self::admit`] with the clock supplied, so tests can step the
+    /// heartbeat throttle window without sleeping.
+    pub(crate) fn admit_at(
+        &self,
+        session_key: &str,
+        len: usize,
+        transcript_sync_permitted: bool,
+        now: Instant,
+    ) -> Admit {
         if len == 0 {
             return Admit::Drop;
-        }
-        if !cloud_sync_enabled {
-            let mut cov = self.lock_coverage();
-            cov.cloud_sync_enabled = Some(false);
-            cov.appends_skipped_gate_off += 1;
-            return Admit::Withheld;
         }
 
         // Resolve the binding HERE as well as inside the emitter. The
         // duplicate lookup is the price of coverage: the emitter's own skip is
         // a once-per-session debug line, which cannot answer "is every live
-        // pane being tailed right now".
+        // pane being tailed right now". Resolved BEFORE Gate 1 because the
+        // liveness heartbeat does not depend on transcript consent.
         let bound = self.registrar.session_id_for(session_key).is_some();
+        if bound && self.heartbeat_due(session_key, now) {
+            self.registrar.heartbeat_on_interaction(session_key);
+        }
+
+        if !transcript_sync_permitted {
+            let mut cov = self.lock_coverage();
+            cov.transcript_sync_permitted = Some(false);
+            cov.appends_skipped_gate_off += 1;
+            return Admit::Withheld;
+        }
 
         let mut cov = self.lock_coverage();
-        cov.cloud_sync_enabled = Some(true);
+        cov.transcript_sync_permitted = Some(true);
         if bound {
             cov.tailed.insert(session_key.to_string());
             cov.unbound.remove(session_key);
@@ -760,6 +858,28 @@ impl SessionTranscriptTailer {
         } else {
             Admit::Drop
         }
+    }
+
+    /// Claim the heartbeat slot for `session_key` at `now`: `true` (and the
+    /// slot is stamped) when no heartbeat went out for it within
+    /// [`TRANSCRIPT_HEARTBEAT_INTERVAL`].
+    fn heartbeat_due(&self, session_key: &str, now: Instant) -> bool {
+        let mut map = self
+            .heartbeat_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if map.get(session_key).is_some_and(|last| {
+            now.saturating_duration_since(*last) < TRANSCRIPT_HEARTBEAT_INTERVAL
+        }) {
+            return false;
+        }
+        if map.len() >= HEARTBEAT_THROTTLE_PRUNE_AT {
+            map.retain(|_, last| {
+                now.saturating_duration_since(*last) < TRANSCRIPT_HEARTBEAT_INTERVAL
+            });
+        }
+        map.insert(session_key.to_string(), now);
+        true
     }
 
     /// A batch appended while Gate 1 was OFF: consent was withheld for these
@@ -1224,9 +1344,9 @@ impl SessionTranscriptTailer {
         session_key: &str,
         path: &Path,
         req: BindRequest,
-        cloud_sync_enabled: bool,
+        transcript_sync_permitted: bool,
     ) -> Result<BindOutcome, BindRefusal> {
-        if !cloud_sync_enabled {
+        if !transcript_sync_permitted {
             return Err(BindRefusal::SyncDisabled);
         }
         let lock = self.session_lock(session_key);
@@ -1250,15 +1370,28 @@ impl SessionTranscriptTailer {
                 requested => (id, requested == Some(id)),
             },
             None => {
-                let id = self
-                    .registrar
-                    .bind_transcript_session(session_key, req.adopt, req.tenant, req.resume.clone())
-                    .map_err(|e| match e {
-                        TranscriptBindRefusal::RegistrationDisabled => {
-                            BindRefusal::RegistrationDisabled
-                        }
-                        TranscriptBindRefusal::CoordSessionInUse => BindRefusal::CoordSessionInUse,
-                    })?;
+                let bound = match (req.adopt, req.live_pane_tenant) {
+                    (Some(row), Some(tenant)) => {
+                        self.registrar.bind_transcript_session_on_live_pane(
+                            session_key,
+                            row,
+                            tenant,
+                            req.resume.clone(),
+                        )
+                    }
+                    _ => self.registrar.bind_transcript_session(
+                        session_key,
+                        req.adopt,
+                        req.tenant,
+                        req.resume.clone(),
+                    ),
+                };
+                let id = bound.map_err(|e| match e {
+                    TranscriptBindRefusal::RegistrationDisabled => {
+                        BindRefusal::RegistrationDisabled
+                    }
+                    TranscriptBindRefusal::CoordSessionInUse => BindRefusal::CoordSessionInUse,
+                })?;
                 (id, req.adopt == Some(id))
             }
         };
@@ -1464,7 +1597,7 @@ impl SessionTranscriptTailer {
     pub fn coverage(&self) -> CoverageReport {
         let cov = self.lock_coverage();
         CoverageReport {
-            cloud_sync_enabled: cov.cloud_sync_enabled,
+            transcript_sync_permitted: cov.transcript_sync_permitted,
             sessions_tailed: cov.tailed.len(),
             sessions_unbound: cov.unbound.len(),
             unbound_session_ids: cov
@@ -1482,6 +1615,7 @@ impl SessionTranscriptTailer {
             autobind_adopted: cov.autobind_adopted,
             autobind_minted: cov.autobind_minted,
             autobind_deferred: cov.autobind_deferred,
+            autobind_adopted_live_pane: cov.autobind_adopted_live_pane,
         }
     }
 
@@ -1520,6 +1654,7 @@ impl SessionTranscriptTailer {
             report.autobind_adopted,
             report.autobind_minted,
             report.autobind_deferred,
+            report.autobind_adopted_live_pane,
         ];
 
         let mut cov = self.lock_coverage();
@@ -1534,7 +1669,7 @@ impl SessionTranscriptTailer {
 
         if blind {
             tracing::warn!(
-                cloud_sync_enabled = ?report.cloud_sync_enabled,
+                transcript_sync_permitted = ?report.transcript_sync_permitted,
                 sessions_unbound = report.sessions_unbound,
                 unbound_session_ids = %report.unbound_session_ids.join(","),
                 appends_skipped_unbound = report.appends_skipped_unbound,
@@ -1550,7 +1685,7 @@ impl SessionTranscriptTailer {
             );
         } else {
             tracing::info!(
-                cloud_sync_enabled = ?report.cloud_sync_enabled,
+                transcript_sync_permitted = ?report.transcript_sync_permitted,
                 sessions_tailed = report.sessions_tailed,
                 sessions_unbound = report.sessions_unbound,
                 unbound_session_ids = %report.unbound_session_ids.join(","),
@@ -1561,6 +1696,7 @@ impl SessionTranscriptTailer {
                 transcript_holes = report.transcript_holes,
                 held_batches = report.held_batches,
                 autobind_adopted = report.autobind_adopted,
+                autobind_adopted_live_pane = report.autobind_adopted_live_pane,
                 autobind_minted = report.autobind_minted,
                 autobind_deferred = report.autobind_deferred,
                 "session_transcript_tailer: coverage"
@@ -1733,11 +1869,152 @@ mod tests {
 
         assert!(transcript_offsets(&outbox).is_empty());
         let r = t.coverage();
-        assert_eq!(r.cloud_sync_enabled, Some(false));
+        assert_eq!(r.transcript_sync_permitted, Some(false));
         assert_eq!(r.appends_skipped_gate_off, 1);
         assert_eq!(r.appends_skipped_unbound, 0);
         assert_eq!(r.sessions_tailed, 0);
         assert_eq!(r.sessions_unbound, 0);
+    }
+
+    /// Heartbeat outbox rows written for coord session `coord`.
+    fn heartbeats_for(outbox: &OutboxWriter, coord: Uuid) -> usize {
+        outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .filter(|r| {
+                r.event_kind == SessionEventKind::Heartbeat.as_str() && r.session_id == coord
+            })
+            .count()
+    }
+
+    fn all_heartbeats(outbox: &OutboxWriter) -> usize {
+        outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.event_kind == SessionEventKind::Heartbeat.as_str())
+            .count()
+    }
+
+    /// Phase 3 of plan
+    /// `2026-10-11-a-live-runner-sessions-coord-row-once-reaped-stays-closed-under-its-own-heartbeats`:
+    /// a bound session's growing transcript heartbeats its coord row — once per
+    /// throttle window however many appends land in it, and again in the next.
+    #[test]
+    fn transcript_activity_heartbeats_a_bound_row_once_per_window() {
+        let dir = tempdir().unwrap();
+        let (t, registrar, outbox) = tailer(dir.path());
+        let csid = Uuid::new_v4().to_string();
+        let coord = sniff_register(&registrar, &csid);
+        let before = heartbeats_for(&outbox, coord);
+
+        let t0 = Instant::now();
+        for i in 0..10u64 {
+            let at = t0 + Duration::from_secs(i * 5);
+            assert_eq!(t.admit_at(&csid, 8, true, at), Admit::Emit);
+        }
+        assert_eq!(
+            heartbeats_for(&outbox, coord) - before,
+            1,
+            "N appends inside one window must record exactly one Heartbeat row"
+        );
+
+        // A second burst after the window records another.
+        let later = t0 + TRANSCRIPT_HEARTBEAT_INTERVAL + Duration::from_secs(1);
+        for i in 0..5u64 {
+            t.admit_at(&csid, 8, true, later + Duration::from_secs(i));
+        }
+        assert_eq!(heartbeats_for(&outbox, coord) - before, 2);
+
+        // An empty append is not activity.
+        let much_later = later + TRANSCRIPT_HEARTBEAT_INTERVAL * 2;
+        assert_eq!(t.admit_at(&csid, 0, true, much_later), Admit::Drop);
+        assert_eq!(heartbeats_for(&outbox, coord) - before, 2);
+    }
+
+    /// An unbound session has no row to heartbeat — and must not get one. Nor
+    /// may its unbound appends spend the throttle window: the first append
+    /// after the key is bound heartbeats at once, not up to 60 s later.
+    #[test]
+    fn transcript_activity_on_an_unbound_key_heartbeats_nothing() {
+        let dir = tempdir().unwrap();
+        let (t, registrar, outbox) = tailer(dir.path());
+        let csid = Uuid::new_v4().to_string();
+        let t0 = Instant::now();
+        for i in 0..3u64 {
+            assert_eq!(
+                t.admit_at(&csid, 8, true, t0 + Duration::from_secs(i)),
+                Admit::Drop
+            );
+        }
+        assert_eq!(t.admit_at(&csid, 8, false, t0), Admit::Withheld);
+        assert_eq!(all_heartbeats(&outbox), 0);
+
+        // Bound inside what would have been the throttle window.
+        let coord = sniff_register(&registrar, &csid);
+        let before = heartbeats_for(&outbox, coord);
+        t.admit_at(&csid, 8, false, t0 + Duration::from_secs(5));
+        assert_eq!(
+            heartbeats_for(&outbox, coord) - before,
+            1,
+            "the unbound appends did not claim the throttle slot"
+        );
+    }
+
+    /// Gate 1 governs transcript CONTENT, not liveness: with consent off a
+    /// bound session still heartbeats (once per window), and no chunk leaves.
+    #[test]
+    fn transcript_activity_heartbeats_even_with_gate_1_off() {
+        let dir = tempdir().unwrap();
+        let (t, registrar, outbox) = tailer(dir.path());
+        let csid = Uuid::new_v4().to_string();
+        let coord = sniff_register(&registrar, &csid);
+        let before = heartbeats_for(&outbox, coord);
+
+        let t0 = Instant::now();
+        for i in 0..4u64 {
+            assert_eq!(
+                t.admit_at(&csid, 8, false, t0 + Duration::from_secs(i)),
+                Admit::Withheld
+            );
+        }
+        assert_eq!(heartbeats_for(&outbox, coord) - before, 1);
+        assert!(transcript_offsets(&outbox).is_empty(), "no content left");
+    }
+
+    /// The entry the transcript watcher calls (`admit`, on the wall clock)
+    /// heartbeats a bound row too — whatever the sync gate says — and throttles
+    /// a burst to one row.
+    #[test]
+    fn the_watcher_entry_heartbeats_a_bound_row_with_sync_withheld() {
+        let dir = tempdir().unwrap();
+        let (t, registrar, outbox) = tailer(dir.path());
+        let csid = Uuid::new_v4().to_string();
+        let coord = sniff_register(&registrar, &csid);
+        let before = heartbeats_for(&outbox, coord);
+
+        for _ in 0..3 {
+            assert_eq!(t.admit(&csid, 8, false), Admit::Withheld);
+        }
+        assert_eq!(heartbeats_for(&outbox, coord) - before, 1);
+    }
+
+    /// The throttle map is bounded: once it reaches the prune threshold, keys
+    /// whose window has elapsed are forgotten.
+    #[test]
+    fn the_heartbeat_throttle_map_prunes_expired_keys() {
+        let dir = tempdir().unwrap();
+        let (t, _registrar, _outbox) = tailer(dir.path());
+        let t0 = Instant::now();
+        for i in 0..HEARTBEAT_THROTTLE_PRUNE_AT {
+            assert!(t.heartbeat_due(&format!("k{i}"), t0));
+        }
+        let later = t0 + TRANSCRIPT_HEARTBEAT_INTERVAL;
+        assert!(t.heartbeat_due("fresh", later));
+        let map = t.heartbeat_at.lock().unwrap();
+        assert_eq!(map.len(), 1, "every expired key was pruned");
+        assert!(map.contains_key("fresh"));
     }
 
     /// A bound pane's appends land as transcript chunks with the emitter's
@@ -1756,7 +2033,7 @@ mod tests {
         let r = t.coverage();
         assert_eq!(r.appends_emitted, 2);
         assert_eq!(r.bytes_emitted, 6);
-        assert_eq!(r.cloud_sync_enabled, Some(true));
+        assert_eq!(r.transcript_sync_permitted, Some(true));
     }
 
     /// **Restart mid-session** — the Phase 2(a) case. A pane is tailed, the

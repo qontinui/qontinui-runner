@@ -533,6 +533,21 @@ pub async fn dispatch_subtask(
         run_id, subtask.task_id, task_run_id, subtask.repo
     );
 
+    // Resolve managed state up-front so a missing dependency fails loud before
+    // we spawn a CLI we can't track — and before the worktree allocation below,
+    // so this refusal never strands a fresh tree (plan
+    // `2026-11-08-a-spawn-refused-after-its-worktree-allocation-leaves-the-tree-on-disk`,
+    // Phase 3).
+    let session_mgr = app_handle
+        .try_state::<Arc<SessionManager>>()
+        .ok_or_else(|| {
+            DispatchError::Failed(
+                "dispatch_subtask: SessionManager state not available".to_string(),
+            )
+        })?
+        .inner()
+        .clone();
+
     // 1. Worktree allocation. A subtask that declares a `repo` gets an isolated
     //    worktree or is NOT dispatched: unlike an operator's terminal, a worker
     //    never falls back to the shared checkout (plan
@@ -549,7 +564,10 @@ pub async fn dispatch_subtask(
                 .unwrap_or_else(|_| ".".to_string());
             // Still provisioned, as `acquire_for_terminal` did for this arm:
             // the cwd `.mcp.json` is how a worker reaches the coord-mcp proxy.
-            crate::agent_worktree::isolated_edit::provision_session_cwd(&cwd, false, None);
+            crate::agent_worktree::isolated_edit::provision_session_cwd_off_worker(
+                &cwd, false, None,
+            )
+            .await;
             (cwd, None)
         }
         Some(repo) => {
@@ -596,6 +614,7 @@ pub async fn dispatch_subtask(
                             refusal.error.clone(),
                         );
                     }
+                    // door-scan: keep(nothing-allocated) the acquire itself failed
                     return Err(refusal.error);
                 }
             }
@@ -607,17 +626,6 @@ pub async fn dispatch_subtask(
     //    mirrors `agent_runtime`'s call site.
     crate::ai_provider::account_usage::pick_best_account();
 
-    // Resolve managed state up-front so a missing dependency fails loud before
-    // we spawn a CLI we can't track.
-    let session_mgr = app_handle
-        .try_state::<Arc<SessionManager>>()
-        .ok_or_else(|| {
-            DispatchError::Failed(
-                "dispatch_subtask: SessionManager state not available".to_string(),
-            )
-        })?
-        .inner()
-        .clone();
     let registrar = app_handle
         .try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>()
         .map(|s| s.inner().clone());
@@ -643,7 +651,7 @@ pub async fn dispatch_subtask(
     // carries the run id too for at-a-glance triage in coord + logs.
     let task_name = format!("worker:{} [run {}]", subtask.task_id, run_id);
     let wd = working_dir.clone();
-    let spawn_result: Result<(), String> = spawn_blocking_tracked(move || {
+    let joined = spawn_blocking_tracked(move || -> Result<(), WorkerSpawnFailure> {
         // AiSessionContext tags this worker's output events with the
         // task_run_id so the tab + transcript bind to this worker. Mirrors
         // `create_ai_session`'s `AiSessionContext::setup`.
@@ -656,7 +664,7 @@ pub async fn dispatch_subtask(
             is_resume: false,
         };
 
-        let session = crate::claude_session::ClaudeSession::spawn(
+        let spawned = crate::claude_session::ClaudeSession::spawn(
             &wd,
             &trid,
             &handle,
@@ -669,8 +677,21 @@ pub async fn dispatch_subtask(
             None, // tool_policy
             Some(&cli_session_ctx),
             None, // agent_log_emitter — orchestration path, no coord agent_logs
-        )?;
-        let session = Arc::new(session);
+        );
+        let session = match spawned {
+            Ok(session) => Arc::new(session),
+            Err(failure) => {
+                // door-scan: keep(handed-back) the failure carries the context to settle_worker_spawn
+                return Err(WorkerSpawnFailure {
+                    // `ClaudeSession::spawn`'s typed failure: a refusal before
+                    // the CLI process existed lets the remover take a fresh,
+                    // empty tree back; one after it keeps the tree (reported).
+                    child_started: failure.child_started,
+                    message: failure.message,
+                    ctx: isolated_ctx.map(Box::new),
+                });
+            }
+        };
 
         // Park the isolated edit context on the session so its claim heartbeat
         // lives for the worker's lifetime and RELEASES on Drop (NOT leaked).
@@ -681,28 +702,46 @@ pub async fn dispatch_subtask(
         // From here the CLI is LIVE. Every failure below tears it down before
         // returning: a `?` here used to leave a running Claude process the
         // ledger has no row for, which the conductor's retry then duplicated.
+        // A failure here is post-child: the context is taken back off the
+        // session BEFORE the close (which would otherwise drop it unreported)
+        // and handed to the remover with `child_started = true` — kept, and
+        // the allocation reported.
         if let Err(e) = session_mgr.register(&trid, session.clone()) {
+            let ctx = session.take_isolated_edit_ctx();
             let _ = session.close();
-            return Err(format!(
-                "dispatch_subtask: register session: {e} (the spawned CLI was closed)"
-            ));
+            // door-scan: keep(handed-back) the failure carries the context to settle_worker_spawn
+            return Err(WorkerSpawnFailure {
+                message: format!(
+                    "dispatch_subtask: register session: {e} (the spawned CLI was closed)"
+                ),
+                child_started: true,
+                ctx: ctx.map(Box::new),
+            });
         }
 
         // 5. Submit the brief + report contract as the worker's first message.
         if let Err(e) = session.send_user_message(&first_message) {
             session_mgr.remove(&trid);
+            let ctx = session.take_isolated_edit_ctx();
             let _ = session.close();
-            return Err(format!(
-                "dispatch_subtask: send brief: {e} (the spawned CLI was closed and unregistered)"
-            ));
+            // door-scan: keep(handed-back) the failure carries the context to settle_worker_spawn
+            return Err(WorkerSpawnFailure {
+                message: format!(
+                    "dispatch_subtask: send brief: {e} (the spawned CLI was closed and \
+                     unregistered)"
+                ),
+                child_started: true,
+                ctx: ctx.map(Box::new),
+            });
         }
 
         Ok(())
     })
-    .await
-    .map_err(|e| DispatchError::Failed(format!("dispatch_subtask: spawn join error: {e}")))?;
-
-    spawn_result.map_err(DispatchError::Failed)?;
+    .await;
+    settle_worker_spawn(joined, |ctx, child_started, message| {
+        ctx.remove_unspawned(WORKER_DOOR, child_started, message)
+    })
+    .map_err(DispatchError::Failed)?;
 
     // 3b (Phase 5 carry-forward — VISIBLE GRID). Durably record the worker as
     // a terminal-session lifecycle row tagged with `page_id = run_id`, keyed by
@@ -743,6 +782,7 @@ pub async fn dispatch_subtask(
                     crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE.to_string(),
                 ),
                 restore_pending_at: None,
+                awaiting_account_since: None,
                 confirmed_at: None,
                 handle: None,
                 account_label: None,
@@ -762,10 +802,17 @@ pub async fn dispatch_subtask(
                 finished_at: None,
                 wind_down_outcome: None,
                 wind_down_at: None,
+                wind_down_arm: None,
                 finish_reason: None,
                 finish_synced: false,
+                finish_coord_session_id: None,
+                finish_coord_readdressed: false,
                 spawn_device_default: None,
                 adopted_from: None,
+                last_session_start_at: None,
+                gate_id: None,
+                gate_consuming_device_id: None,
+                gate_bound_boot_ms: None,
             },
         );
         info!(
@@ -786,11 +833,16 @@ pub async fn dispatch_subtask(
         // task_run_id ↔ session_id identity binding (mirrors create_ai_session).
         // The run association (page_id = run_id) is encoded in the purpose so the
         // coord session plane can group workers by their run.
-        registrar.register_session(
-            &task_run_id.to_string(),
-            &format!("orchestration worker {} (run {})", subtask.task_id, run_id),
-            subtask.repo.clone(),
-        );
+        // The worker's tenant follows the workspace + repo it runs in, not
+        // the machine default (plan 2026-09-20 Phase 5).
+        registrar
+            .register_session_in(
+                &task_run_id.to_string(),
+                &format!("orchestration worker {} (run {})", subtask.task_id, run_id),
+                subtask.repo.clone(),
+                Some(std::path::Path::new(&working_dir)),
+            )
+            .await;
     } else {
         warn!("dispatch_subtask: AiCoordRegistrar not available; skipping coord identity binding");
     }
@@ -809,6 +861,7 @@ pub async fn dispatch_subtask(
         // about it. It would hold a worktree claim and a CLI process until the
         // runner exits, while the next tick spawns its replacement.
         let torn = teardown_unbound_worker(app_handle, task_run_id);
+        // door-scan: keep(post-child) the live worker was torn down
         return Err(DispatchError::Failed(format!(
             "dispatch_subtask: persist task_run_id/Working: {e} — the live worker was torn \
              down ({torn}), so a retry re-dispatches rather than duplicating it"
@@ -855,7 +908,10 @@ fn teardown_unbound_worker(app_handle: &tauri::AppHandle, task_run_id: Uuid) -> 
     if let Some(store) = app_handle
         .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
     {
-        store.record_close(&trid, "orchestration dispatch could not bind the worker");
+        store.record_close(
+            &trid,
+            crate::session::session_lifecycle_store::CLOSE_REASON_WORKER_BIND_FAILED,
+        );
         closed.push("lifecycle record");
     }
     if let Some(registrar) =
@@ -869,6 +925,49 @@ fn teardown_unbound_worker(app_handle: &tauri::AppHandle, task_run_id: Uuid) -> 
         "nothing was registered yet".to_string()
     } else {
         format!("closed: {}", closed.join(", "))
+    }
+}
+
+/// The door name the orchestration worker's removal logs and reports under.
+const WORKER_DOOR: &str = "orchestration worker";
+
+/// A worker spawn that failed inside the blocking closure: the failure text,
+/// whether a child may have run in the tree, and the worker's isolated edit
+/// context (handed back so the failure arm can give it to the remover, rather
+/// than letting it drop unreported inside the closure).
+struct WorkerSpawnFailure {
+    message: String,
+    child_started: bool,
+    /// Boxed: the context is large and rides only the failure arm.
+    ctx: Option<Box<crate::agent_worktree::isolated_edit::IsolatedEditContext>>,
+}
+
+/// Settle a worker's blocking spawn (plan
+/// `2026-11-08-a-spawn-refused-after-its-worktree-allocation-leaves-the-tree-on-disk`,
+/// Phase 3).
+///
+/// - A **spawn failure** hands the context it carries to `remove` with its
+///   `child_started` — the remover removes a fresh, empty tree only on
+///   `false`, and reports the allocation spawn-failed either way.
+/// - A **join error** is a panic inside the closure, which may come after the
+///   CLI went live; the context died with the closure, so nothing is removed
+///   or reported, and the error is answered as before.
+///
+/// `remove` is the seam the tests drive; the dispatch passes
+/// `IsolatedEditContext::remove_unspawned`.
+fn settle_worker_spawn(
+    joined: Result<Result<(), WorkerSpawnFailure>, tokio::task::JoinError>,
+    remove: impl FnOnce(crate::agent_worktree::isolated_edit::IsolatedEditContext, bool, &str),
+) -> Result<(), String> {
+    match joined {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(failure)) => {
+            if let Some(ctx) = failure.ctx {
+                remove(*ctx, failure.child_started, &failure.message);
+            }
+            Err(failure.message)
+        }
+        Err(join) => Err(format!("dispatch_subtask: spawn join error: {join}")),
     }
 }
 
@@ -1227,5 +1326,68 @@ mod tests {
             1,
             "exactly one mint, or the one below the check is not the only one"
         );
+    }
+}
+
+/// Plan `2026-11-08-a-spawn-refused-after-its-worktree-allocation-leaves-the-tree-on-disk`
+/// Phase 3: a spawn failure hands its context to the remover with its own
+/// `child_started`; a failure carrying no context, and a join error, hand
+/// over nothing.
+#[cfg(test)]
+mod worker_unspawned_tests {
+    use super::*;
+    use crate::agent_worktree::isolated_edit::IsolatedEditContext;
+
+    fn ctx() -> Option<IsolatedEditContext> {
+        Some(IsolatedEditContext::for_test_with_agent_id(
+            "6f1c2a7e-0000-4000-8000-00000000beef".to_string(),
+            Vec::new(),
+            Vec::new(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn a_spawn_failure_hands_its_context_to_the_remover_with_its_child_flag() {
+        for child_started in [false, true] {
+            let mut handed = Vec::new();
+            let joined = Ok(Err(WorkerSpawnFailure {
+                message: "spawn failed: boom".to_string(),
+                child_started,
+                ctx: ctx().map(Box::new),
+            }));
+            let out = settle_worker_spawn(joined, |c, started, msg| {
+                handed.push((c.agent_id.clone(), started, msg.to_string()))
+            });
+            assert_eq!(
+                out,
+                Err("spawn failed: boom".to_string()),
+                "the failure text is answered"
+            );
+            assert_eq!(
+                handed,
+                vec![(
+                    "6f1c2a7e-0000-4000-8000-00000000beef".to_string(),
+                    child_started,
+                    "spawn failed: boom".to_string()
+                )]
+            );
+        }
+
+        let mut calls = 0;
+        let joined = Ok(Err(WorkerSpawnFailure {
+            message: "no ctx".to_string(),
+            child_started: false,
+            ctx: None,
+        }));
+        let _ = settle_worker_spawn(joined, |_, _, _| calls += 1);
+        assert_eq!(calls, 0, "no context, nothing to hand over");
+
+        let join = tokio::spawn(async { panic!("panicked after the CLI went live") })
+            .await
+            .expect_err("a panicking task is a join error");
+        let mut calls = 0;
+        let out = settle_worker_spawn(Err(join), |_, _, _| calls += 1);
+        assert!(out.is_err());
+        assert_eq!(calls, 0, "a join error hands nothing over");
     }
 }

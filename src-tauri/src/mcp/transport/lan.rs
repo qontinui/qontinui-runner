@@ -111,7 +111,8 @@ impl LanTransport {
     /// `127.0.0.1:0` to the remote `address`.
     ///
     /// Returns `(local_port, join_handle)`.  The join handle runs the accept
-    /// loop; dropping it or awaiting it ends the proxy.
+    /// loop. Dropping it detaches the task, which keeps accepting; aborting it
+    /// ends the proxy.
     pub async fn create_proxy(
         &self,
         address: SocketAddr,
@@ -124,6 +125,7 @@ impl LanTransport {
             .local_addr()
             .map_err(|e| TransportError::ProxyBindFailed(e.to_string()))?
             .port();
+        super::mark_off_machine_forwarder(local_port);
 
         info!(
             local_port,

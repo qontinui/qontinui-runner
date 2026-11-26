@@ -52,7 +52,12 @@ pub struct CreateTerminalRequest {
     pub cols: Option<u16>,
     #[serde(default)]
     pub rows: Option<u16>,
-    /// Which terminal page this session belongs to.
+    /// Which terminal page this session belongs to. Absent means AUTOMATIC
+    /// placement, not `"default"`: the page-capacity rule
+    /// (`terminal::page_placement::pick_page_for_new_session`) picks `default`
+    /// while it has room, then the emptiest page under the ceiling, else a
+    /// freshly minted page. Send `"default"` to pin the session there. The
+    /// response's `pageId` is the page actually chosen.
     #[serde(default, alias = "page_id")]
     pub page_id: Option<String>,
     /// Optional command to execute immediately after shell initialization.
@@ -84,7 +89,10 @@ pub struct CreateTerminalRequest {
     /// machine default, a malformed uuid is a 400, and a tenant this runner
     /// holds no coord credential for is refused (plan
     /// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential`).
-    #[serde(default, alias = "tenant_id")]
+    /// `tenant` is `POST /coord-mcp/provision-session`'s spelling of the same
+    /// selector; this struct drops unknown keys, so without the alias it would
+    /// silently spawn on the machine default.
+    #[serde(default, alias = "tenant_id", alias = "tenant")]
     pub tenant_id: Option<String>,
     /// Repos the session will EDIT beside `intentRepo` (bare or `owner/name`),
     /// taken off the sibling-store cargo override so its edits reach its build
@@ -136,19 +144,28 @@ pub struct TerminalPageEntry {
     pub is_alive: bool,
 }
 
-/// A page and the live terminals parked on it.
+/// A page and the live terminals parked on it, with the tab label and
+/// left-to-right position the runner's webview registered for it.
 ///
-/// SCOPE (v1): membership only — `pageId` + the terminals on it. Human-readable
-/// tab labels ("Page 1…N") and left-to-right order are frontend-only state and
-/// are NOT known to the Rust backend (page metadata is never persisted
-/// server-side; only `page_id` strings are). A `label`/`order` field is a
-/// follow-up requiring the frontend to register page metadata to the backend
-/// (e.g. a future `PUT /terminal-pages/{id}` `{ label, order }`); do not invent
-/// a server-side label heuristic here.
+/// Labels and order are webview state. The webview registers its whole page
+/// list with this backend through the `terminal_pages_register` Tauri command
+/// (`commands::terminal_pages`, plan
+/// `2026-11-08-save-per-tab-runner-session-lists-on-sessions-page-kept-14-days`)
+/// whenever the list changes; both fields are read from that registration
+/// (`terminal::layout::page_labels`). Neither is ever guessed: a page the
+/// webview did not register serves `label: null, order: null`, and so does
+/// every page until the webview's first registration of this process
+/// (`labelsRegistered: false` on [`TerminalPagesResponse`]). There is no HTTP
+/// route that writes labels.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalPageGroup {
     pub page_id: String,
+    /// The registered tab label; `null` when none is registered.
+    pub label: Option<String>,
+    /// The registered left-to-right position (0 = leftmost); `null` when
+    /// unregistered.
+    pub order: Option<u32>,
     pub terminal_count: usize,
     pub terminals: Vec<TerminalPageEntry>,
 }
@@ -157,7 +174,39 @@ pub struct TerminalPageGroup {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalPagesResponse {
+    /// Whether the webview has registered its tab list since this runner
+    /// process started. `false` means every `label`/`order` is `null` because
+    /// nothing was registered yet, not because the tabs are unnamed.
+    pub labels_registered: bool,
+    /// When it last registered (RFC 3339); `null` before the first time.
+    pub labels_registered_at: Option<String>,
+    /// Pages with at least one terminal: registered pages first, in
+    /// registered order, then the rest by page id.
     pub pages: Vec<TerminalPageGroup>,
+}
+
+/// The `GET /terminal-pages` body for `grouped` live terminals and the
+/// current label registration. Pure, so the label/order rules are testable
+/// without a `TerminalManager`.
+fn terminal_pages_response(
+    grouped: BTreeMap<String, Vec<TerminalPageEntry>>,
+    labels: &crate::terminal::layout::PageLabels,
+) -> TerminalPagesResponse {
+    let pages = crate::terminal::layout::arrange_pages(grouped, labels, false)
+        .into_iter()
+        .map(|page| TerminalPageGroup {
+            page_id: page.page_id,
+            label: page.label,
+            order: page.order,
+            terminal_count: page.items.len(),
+            terminals: page.items,
+        })
+        .collect();
+    TerminalPagesResponse {
+        labels_registered: labels.registered(),
+        labels_registered_at: labels.registered_at().map(crate::terminal::layout::rfc3339),
+        pages,
+    }
 }
 
 /// Query params for `GET /terminals/{id}/buffer` (and its `/output` alias).
@@ -215,24 +264,108 @@ pub(crate) fn get_terminal_manager(state: &ApiState) -> Arc<TerminalManager> {
 // Handlers
 // ============================================================================
 
+/// One row of `GET /terminals`: the shared-schema [`TerminalInfo`] flattened,
+/// plus the runner-local `permissionRequestHook` (`"registered"` | `"absent"`,
+/// plan `2026-10-23-runner-sessions-stop-at-permission-dialogs-so-accept-them-by-default-with-a-tenant-switch`
+/// D7). The extra key rides BESIDE the schema type, exactly as
+/// `RemoteTerminalInfo` does, because `TerminalInfo` is the cross-repo wire
+/// schema; every reader of the old keys keeps working unchanged.
+///
+/// The field NAME is a contract: `qontinui-claude-config`'s
+/// `/triage-sessions` reads it to decide whether a non-bypass session can be
+/// typed into without answering a dialog.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TerminalListEntry {
+    #[serde(flatten)]
+    pub info: crate::terminal::types::TerminalInfo,
+    pub permission_request_hook: &'static str,
+}
+
+/// Build the listing rows. PURE.
+pub(crate) fn terminal_list_entries(
+    rows: Vec<(
+        crate::terminal::types::TerminalInfo,
+        crate::session::claude_hook::PermissionRequestHook,
+    )>,
+) -> Vec<TerminalListEntry> {
+    rows.into_iter()
+        .map(|(info, hook)| TerminalListEntry {
+            info,
+            permission_request_hook: hook.as_str(),
+        })
+        .collect()
+}
+
 /// List all terminal sessions.
 pub async fn list_terminals_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let terminal_manager = get_terminal_manager(&state);
-    let terminals = terminal_manager.list();
+    let terminals = terminal_list_entries(terminal_manager.list_with_permission_request_hooks());
 
     Ok(Json(ApiResponse::success(serde_json::json!({
         "terminals": terminals
     }))))
 }
 
-/// `POST /terminals`' answer to a refused spawn tenant: a 400 naming the
-/// refusal, since a malformed or unpaired tenant is the caller's to fix. The
-/// refusal itself is the shared [`crate::commands::terminal::admit_spawn_tenant`].
-fn spawn_tenant_bad_request(refusal: String) -> (StatusCode, Json<ApiResponse<()>>) {
+/// `POST /terminals`' answer to a refused spawn tenant. A refusal comes from
+/// one of two places, and both texts open with the same stable
+/// `terminal:tenant_<kind>:` prefix: the shared
+/// [`crate::commands::terminal::admit_spawn_tenant`] precheck, and the identity
+/// seam in [`crate::terminal::session::TerminalSession::spawn`], which is the
+/// only one that can judge a cwd declaring another tenant — see
+/// [`terminal_spawn_failed`].
+///
+/// That prefix is lifted into the envelope's top-level `code`
+/// (`TERMINAL_TENANT_<KIND>`) so a client can branch on it. Without one, the
+/// envelope derived the code from the status and a live refusal read
+/// `"code": "INVALID_JSON"` (coord finding `9f2a0a0d`), which is a lie about
+/// what failed. The code and status rule are shared with the proxied
+/// `terminal_create` and the backend-relay create —
+/// [`crate::terminal::spawn_refusal::spawn_tenant_refusal_code`].
+fn spawn_tenant_refused(refusal: String) -> (StatusCode, Json<ApiResponse<()>>) {
     warn!("HTTP: rejecting terminal create — {refusal}");
-    (StatusCode::BAD_REQUEST, Json(api_error(refusal)))
+    let Some((status, code)) = crate::terminal::spawn_refusal::spawn_tenant_refusal_code(&refusal)
+    else {
+        // Not a spawn-tenant refusal text; keep the untyped 400 rather than
+        // inventing a code for it.
+        return (StatusCode::BAD_REQUEST, Json(api_error(refusal)));
+    };
+    (status, Json(ApiResponse::error_with_code(refusal, code)))
+}
+
+/// `POST /terminals`' answer to a refused spawn — the resource-guard precheck
+/// before the allocation, and a failed `terminal_manager.create` after it.
+///
+/// The spawn-tenant precheck runs before the worktree allocation and cannot see
+/// the final cwd, so `WorkdirDeclaresOtherTenant` is only ever decided inside the spawn,
+/// and it comes back through here as plain `Err` text. Taking every `Err` for a
+/// runner fault answered that refusal `500 INTERNAL_ERROR`, telling the caller
+/// to retry a request that cannot succeed until it changes its cwd or tenant.
+/// The resource guard's CRITICAL verdict and the trust gate's block reach here
+/// the same way; every recognised family is classified by
+/// [`crate::terminal::spawn_refusal::spawn_refusal_code`], the one rule this
+/// door shares with the proxy and the relay. Anything else stays the runner's
+/// fault, an untyped 500.
+///
+/// The tests cover this function, not the handler's `Err` arm that calls it:
+/// driving `create_terminal` needs an `AppHandle`. Putting that arm back to an
+/// inline 500 would still pass every test here, and would show up only as a
+/// dead-code warning on this function in a non-test build.
+fn terminal_spawn_failed(error: String) -> (StatusCode, Json<ApiResponse<()>>) {
+    if crate::terminal::spawn_refusal::spawn_tenant_refusal_kind(&error).is_some() {
+        return spawn_tenant_refused(error);
+    }
+    if let Some((status, code)) = crate::terminal::spawn_refusal::spawn_refusal_code(&error) {
+        warn!("HTTP: terminal create refused — {error}");
+        return (status, Json(ApiResponse::error_with_code(error, code)));
+    }
+    error!("HTTP: Failed to create terminal session: {}", error);
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(api_error(format!("Failed to create terminal: {}", error))),
+    )
 }
 
 /// A refused `editSiblings` input → the typed 400 `invalid_edit_sibling`,
@@ -246,10 +379,48 @@ pub(crate) fn edit_sibling_bad_request(
     (StatusCode::BAD_REQUEST, Json(body))
 }
 
+/// Resolve `POST /terminals`' optional account pin into the PTY trust arm and
+/// the `CLAUDE_CONFIG_DIR` to seed — or the typed refusal (400 not in the
+/// roster, 409 logged out). Pure of the allocation, so the handler runs it
+/// before `acquire_for_terminal`: a refusal must never strand a fresh tree.
+// The refusal is this module's standard handler error, kept as-is so `?`
+// returns it from the handler unchanged.
+#[allow(clippy::result_large_err)]
+fn resolve_account_pin(
+    account: Option<&str>,
+) -> Result<(crate::terminal::TrustArm, Option<String>), (StatusCode, Json<ApiResponse<()>>)> {
+    let Some(account) = account.filter(|a| !a.is_empty()) else {
+        return Ok((crate::terminal::TrustArm::AccountChosenLater, None));
+    };
+    match crate::ai_provider::resolve_requested_account(account) {
+        Ok(resolved) => Ok((
+            crate::terminal::TrustArm::Pinned(Some(resolved.config_dir.clone())),
+            Some(resolved.config_dir),
+        )),
+        Err(e @ crate::ai_provider::AccountSelectError::NotInRoster { .. }) => {
+            Err((StatusCode::BAD_REQUEST, Json(api_error(e.message()))))
+        }
+        Err(e @ crate::ai_provider::AccountSelectError::NotLoggedIn { .. }) => {
+            Err((StatusCode::CONFLICT, Json(api_error(e.message()))))
+        }
+    }
+}
+
 /// Create a new terminal session.
-pub async fn create_terminal_handler(
+pub async fn create_terminal_detached(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<CreateTerminalRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // Detached, so a client that disconnects while the create runs off-worker
+    // cannot drop this request after the PTY opened: its isolated context would
+    // release its claims under the new terminal, and its initial command would
+    // never be typed.
+    crate::spawn_off_worker::run_detached(create_terminal_handler(state, request)).await
+}
+
+async fn create_terminal_handler(
+    state: Arc<ApiState>,
+    request: CreateTerminalRequest,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let terminal_manager = get_terminal_manager(&state);
     let app_handle = state.app_handle.clone();
@@ -301,9 +472,10 @@ pub async fn create_terminal_handler(
 
     // The spawn tenant is judged BEFORE the worktree allocation below, which a
     // refusal would otherwise leak. A malformed or unpaired tenant is the
-    // caller's to fix, so both are a 400 naming the heal.
+    // caller's to fix (a typed 400 naming the heal); an unreadable credential
+    // store is UNKNOWN, so a 503 — see `spawn_tenant_refused`.
     let spawn_tenant = crate::commands::terminal::admit_spawn_tenant(request.tenant_id.as_deref())
-        .map_err(spawn_tenant_bad_request)?;
+        .map_err(spawn_tenant_refused)?;
 
     // The declared edit siblings are judged here too, before the allocation a
     // refusal would otherwise leak — and before `acquire_for_terminal`'s
@@ -313,6 +485,29 @@ pub async fn create_terminal_handler(
         &request.edit_siblings,
     )
     .map_err(edit_sibling_bad_request)?;
+
+    // The resource guard's CRITICAL verdict, judged before the allocation for
+    // the same reason as `commands::terminal::terminal_create` judges it: the
+    // seam's `admit_spawn` decides it only after `acquire_for_terminal` has run
+    // a `git worktree add`, and a refusal there leaves that worktree on disk.
+    // This door answers that refusal with a retryable 503, so without this
+    // check every retry against a box at CRITICAL would leave one more tree.
+    // `false`: this door never overrides the floor (see the create call below).
+    crate::resource_guard::precheck_spawn("terminal session", false)
+        .map_err(terminal_spawn_failed)?;
+
+    // Per-request account pin: resolve → validate, BEFORE the allocation below —
+    // a refusal here used to come after `acquire_for_terminal` and drop its
+    // context, leaving a fresh tree on disk with no spawn-failed report.
+    // Bogus name → 400, logged-out → 409 — same contract as /sessions/spawn.
+    // The trust arm follows the pin: a resolved account means workspace trust is
+    // DERIVED for that one account at the PTY seam (and the dial is warmed here,
+    // the async side, so the seam's sync gate does not decide on a cold cache);
+    // no account means it is chosen by whatever the caller types.
+    let (trust_arm, pinned_config_dir) = resolve_account_pin(request.account.as_deref())?;
+    if pinned_config_dir.is_some() {
+        crate::claude_session::trust_gate::warm_dial().await;
+    }
 
     // Phase 2 round 2 — route through the shared `acquire_for_terminal`
     // helper so this entry point matches the other five
@@ -345,28 +540,10 @@ pub async fn create_terminal_handler(
         )
         .unwrap_or_default();
 
-    // Per-request account pin: resolve → validate → pre-seed CLAUDE_CONFIG_DIR
-    // onto the PTY env (merged with the session env above, not replacing it).
-    // Bogus name → 400, logged-out → 409 — same contract as /sessions/spawn.
-    // The trust arm follows the pin: a resolved account means workspace trust is
-    // DERIVED for that one account at the PTY seam (and the dial is warmed here,
-    // the async side, so the seam's sync gate does not decide on a cold cache);
-    // no account means it is chosen by whatever the caller types.
-    let mut trust_arm = crate::terminal::TrustArm::AccountChosenLater;
-    if let Some(account) = request.account.as_deref().filter(|a| !a.is_empty()) {
-        match crate::ai_provider::resolve_requested_account(account) {
-            Ok(resolved) => {
-                trust_arm = crate::terminal::TrustArm::Pinned(Some(resolved.config_dir.clone()));
-                extra_env_vec.push(("CLAUDE_CONFIG_DIR".to_string(), resolved.config_dir));
-                crate::claude_session::trust_gate::warm_dial().await;
-            }
-            Err(e @ crate::ai_provider::AccountSelectError::NotInRoster { .. }) => {
-                return Err((StatusCode::BAD_REQUEST, Json(api_error(e.message()))));
-            }
-            Err(e @ crate::ai_provider::AccountSelectError::NotLoggedIn { .. }) => {
-                return Err((StatusCode::CONFLICT, Json(api_error(e.message()))));
-            }
-        }
+    // The account pin resolved BEFORE the allocation (above); its config dir
+    // joins the session env here, merged rather than replacing it.
+    if let Some(dir) = pinned_config_dir {
+        extra_env_vec.push(("CLAUDE_CONFIG_DIR".to_string(), dir));
     }
 
     let extra_env = if extra_env_vec.is_empty() {
@@ -375,36 +552,80 @@ pub async fn create_terminal_handler(
         Some(extra_env_vec)
     };
 
-    match terminal_manager.create(
-        request.title,
-        working_dir,
-        request.page_id,
-        request.cols,
-        request.rows,
-        app_handle,
-        None,
-        extra_env,
-        // UNATTENDED spawn — respect the critical floor. This is the runner's
-        // HTTP `POST /terminals` door: the caller is a script, an MCP tool or a
-        // peer runner, and there is no dialog to show it. The refusal is not
-        // silent — it comes back as the request's error body with the lane, the
-        // live headroom and the floor in it, so the caller can retry when the
-        // box has room. A door that quietly overrode the floor would let any
-        // remote caller undo the machine owner's own protection.
-        false,
-        // With `account` the caller resolved the account and pinned it above, so
-        // trust is derived for that one account; without it the account is chosen
-        // by whatever the caller types into the shell.
-        trust_arm,
-        spawn_tenant,
-    ) {
+    // `create` consumes both; the post-create coord wiring reads them after.
+    let title_for_intent = request.title.clone();
+    let working_dir_for_wiring = working_dir.clone();
+
+    // Off the API runtime's workers: this create can block for seconds to
+    // minutes (see `spawn_off_worker`).
+    let created = {
+        let terminal_manager = terminal_manager.clone();
+        crate::spawn_off_worker::run_terminal_create_off_worker(move || {
+            // door-scan: spawn — the door's real spawn; the context is in hand until here.
+            terminal_manager.create(
+                request.title,
+                working_dir,
+                request.page_id,
+                request.cols,
+                request.rows,
+                app_handle,
+                None,
+                extra_env,
+                // UNATTENDED spawn — respect the critical floor. This is the runner's
+                // HTTP `POST /terminals` door: the caller is a script, an MCP tool or a
+                // peer runner, and there is no dialog to show it. The refusal is not
+                // silent — it comes back as the request's error body with the lane, the
+                // live headroom and the floor in it, so the caller can retry when the
+                // box has room. A door that quietly overrode the floor would let any
+                // remote caller undo the machine owner's own protection.
+                false,
+                // With `account` the caller resolved the account and pinned it above, so
+                // trust is derived for that one account; without it the account is chosen
+                // by whatever the caller types into the shell.
+                trust_arm,
+                spawn_tenant,
+                // The HTTP `POST /terminals` door cannot name its caller's reason.
+                crate::coord_drain_state::SpawnOrigin::Unknown,
+            )
+        })
+        .await
+    };
+    match created {
         Ok(info) => {
-            if let Some(ctx) = isolated_ctx {
-                if let Some(session) = terminal_manager.get(&info.id) {
-                    session.set_isolated_edit_ctx(ctx);
-                }
-            }
             info!("HTTP: Created terminal session: {}", info.id);
+
+            // The same post-create coord wiring the `terminal_create` Tauri
+            // command runs (`coord_wiring`): without it this pane had no
+            // `terminal_shell` coord row, `GET /terminals/{id}/coord-session`
+            // read `null`, and a remote end of it answered `not_found` (plan
+            // 2026-11-05-remote-session-end-reaches-the-target-but-cannot-end-a-real-session,
+            // Phase 4). Fresh, not pane-keyed: this door has no restore
+            // round-trip to key a pane by.
+            let intent = crate::commands::terminal::coord_wiring::terminal_shell_intent(
+                title_for_intent.as_deref(),
+                "HTTP terminal session",
+                request.intent_repo,
+                None,
+                None,
+                working_dir_for_wiring.as_deref(),
+                spawn_tenant,
+            );
+            let registry = state
+                .app_handle
+                .try_state::<Arc<crate::session::SessionRegistry>>()
+                .map(|r| r.inner().clone());
+            crate::commands::terminal::coord_wiring::finish_terminal_create(
+                &terminal_manager,
+                registry.as_ref(),
+                Some(&state.app_handle),
+                &info.id,
+                isolated_ctx,
+                intent,
+                crate::commands::terminal::coord_wiring::CoordRegistration::FreshPinned,
+                working_dir_for_wiring,
+                "http_post_terminals",
+            )
+            .await;
 
             // Send initial command after a short delay for shell initialization
             if let Some(cmd) = request.initial_command {
@@ -425,11 +646,16 @@ pub async fn create_terminal_handler(
             Ok(Json(ApiResponse::success(serde_json::json!(info))))
         }
         Err(e) => {
-            error!("HTTP: Failed to create terminal session: {}", e);
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to create terminal: {}", e))),
-            ))
+            // A context exists only when this call allocated (the reuse arm of
+            // `acquire_for_terminal` returns none). `remove_unspawned` removes
+            // the fresh tree from disk when no child started and it holds
+            // nothing, then reports the allocation spawn-failed once, which moves
+            // it out of `allocated` in coord's ledger; the context's Drop
+            // releases the claims. See `IsolatedEditContext::remove_unspawned`.
+            if let Some(ctx) = isolated_ctx {
+                ctx.remove_unspawned("HTTP POST /terminals", e.child_started, &e.message);
+            }
+            Err(terminal_spawn_failed(e.message))
         }
     }
 }
@@ -446,7 +672,9 @@ fn terminal_exited_response(id: &str, message: &str, bytes_dropped: usize) -> Ap
         crate::mcp::ui_bridge::UiBridgeError {
             code: crate::mcp::ui_bridge::types::UiBridgeErrorCode::ActionFailed,
             message: message.to_string(),
-            recovery: Some(crate::mcp::ui_bridge::types::RecoveryHint::Unrecoverable),
+            recovery: Some(qontinui_types::refusal::NextAction::new(
+                qontinui_types::refusal::NextActionKind::NoneTerminal,
+            )),
             context: Some(serde_json::json!({
                 "terminal_id": id,
                 "reason": crate::terminal::session::TERMINAL_EXITED,
@@ -709,9 +937,10 @@ pub async fn move_terminal_handler(
 /// Reuses the exact data source as [`list_terminals_handler`] —
 /// `terminal_manager.list()` — and groups the entries by their `page_id`.
 /// Includes the literal `"default"` page group when any terminal is parked
-/// there (the orphaned-tab case that motivated this endpoint). A
-/// `BTreeMap<String, _>` keyed by page id yields deterministic (lexical)
-/// ordering across calls.
+/// there (the orphaned-tab case that motivated this endpoint). Each page
+/// carries the tab label and order the webview registered (see
+/// [`TerminalPageGroup`]); pages are served in registered order, then the
+/// unregistered ones by page id, so the order is deterministic across calls.
 pub async fn list_terminal_pages_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
@@ -730,17 +959,9 @@ pub async fn list_terminal_pages_handler(
             });
     }
 
-    let pages: Vec<TerminalPageGroup> = grouped
-        .into_iter()
-        .map(|(page_id, terminals)| TerminalPageGroup {
-            page_id,
-            terminal_count: terminals.len(),
-            terminals,
-        })
-        .collect();
-
+    let labels = crate::terminal::layout::page_labels().snapshot();
     Ok(Json(ApiResponse::success(serde_json::json!(
-        TerminalPagesResponse { pages }
+        terminal_pages_response(grouped, &labels)
     ))))
 }
 
@@ -972,17 +1193,19 @@ async fn handle_ws_terminal(
 /// | `Some(Some(id))` | the terminal exists and carries a coord session id | `200`, `coord_session_id: "<uuid>"` |
 ///
 /// ⚠️ `Some(None)` is deliberately NOT a 404. A terminal with no coord mirror
-/// is a normal, transient state (the mirror is registered after the pane is
-/// created), and the caller — the `session-id-stamp.sh` SessionStart hook —
+/// is a normal, transient state (the mirror is registered just after the pane
+/// is created, by the post-create wiring every create door shares —
+/// `commands::terminal::coord_wiring` — or never, when that registration
+/// failed and was logged), and the caller — the `session-id-stamp.sh` SessionStart hook —
 /// shape-gates the answer against a strict UUID regex and SKIPS the bind when
 /// it does not match. A `null` is therefore a correct, honest answer that the
 /// client already handles; collapsing it into "terminal not found" would tell
 /// the caller something false about the terminal.
 ///
 /// Split out from the handler purely so the three arms are testable: the
-/// handler half needs an `ApiState`, which needs a live Tauri `AppHandle`, and
-/// a PTY-backed `TerminalSession` fixture — none of which a unit test in this
-/// crate can build.
+/// handler half needs an `ApiState`, which needs a live Tauri `AppHandle` a
+/// unit test in this crate cannot build. [`coord_session_for`] is the lookup
+/// half, against a bare manager.
 fn coord_session_response(
     id: &str,
     lookup: Option<Option<uuid::Uuid>>,
@@ -1043,12 +1266,21 @@ pub async fn get_coord_session_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let terminal_manager = get_terminal_manager(&state);
+    coord_session_for(&get_terminal_manager(&state), &id)
+}
+
+/// The lookup + response of `GET /terminals/{id}/coord-session` against a
+/// bare [`TerminalManager`] — the handler's whole body, callable from a test
+/// that has no `ApiState`.
+pub(crate) fn coord_session_for(
+    terminal_manager: &TerminalManager,
+    id: &str,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     // `map` (not `and_then`) on purpose: it keeps "no such terminal" and "no
     // coord session id on that terminal" distinguishable, which is the whole
     // difference between the 404 and the `null` arm.
-    let lookup = terminal_manager.get(&id).map(|s| s.coord_session_id());
-    coord_session_response(&id, lookup)
+    let lookup = terminal_manager.get(id).map(|s| s.coord_session_id());
+    coord_session_response(id, lookup)
 }
 
 /// GET /terminals/transport-stats — the terminal output transport counters
@@ -1083,7 +1315,7 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
     axum::Router::new()
         .route(
             "/terminals",
-            get(list_terminals_handler).post(create_terminal_handler),
+            get(list_terminals_handler).post(create_terminal_detached),
         )
         // Page-centric grouping of live terminals (which sessions on which page).
         .route("/terminal-pages", get(list_terminal_pages_handler))
@@ -1154,6 +1386,145 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
 mod tests {
     use super::*;
 
+    /// `GET /terminal-pages` serves the registered labels and order (plan
+    /// `2026-11-08-save-per-tab-runner-session-lists-on-sessions-page-kept-14-days`,
+    /// Phase 1 step 5): registered pages first, in registered order, then an
+    /// unregistered page with `label`/`order` null; a registered page with no
+    /// live terminal is not listed. Before any registration every page is
+    /// unlabelled and `labelsRegistered` is false.
+    #[test]
+    fn terminal_pages_serve_registered_labels_in_registered_order() {
+        use crate::terminal::layout::{PageLabels, RegisteredPage};
+        let entry = |id: &str| TerminalPageEntry {
+            id: id.to_string(),
+            title: format!("title {id}"),
+            is_alive: true,
+        };
+        let grouped = || -> BTreeMap<String, Vec<TerminalPageEntry>> {
+            [
+                ("p-a".to_string(), vec![entry("t1")]),
+                ("p-b".to_string(), vec![entry("t2"), entry("t3")]),
+                ("p-stray".to_string(), vec![entry("t4")]),
+            ]
+            .into()
+        };
+        let at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(1_794_128_400_000).unwrap();
+        let page = |id: &str, label: &str, order: u32| RegisteredPage {
+            page_id: id.to_string(),
+            label: Some(label.to_string()),
+            order,
+            window: None,
+        };
+        let labels = PageLabels::new(
+            vec![
+                page("p-b", "Bravo", 0),
+                page("p-empty", "Empty", 1),
+                page("p-a", "Alpha", 2),
+            ],
+            at,
+        );
+
+        let body = serde_json::to_value(terminal_pages_response(grouped(), &labels)).unwrap();
+        assert_eq!(body["labelsRegistered"], true);
+        assert_eq!(body["labelsRegisteredAt"], "2026-11-08T09:00:00.000Z");
+        let pages: Vec<(String, serde_json::Value, serde_json::Value, u64)> = body["pages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| {
+                (
+                    p["pageId"].as_str().unwrap().to_string(),
+                    p["label"].clone(),
+                    p["order"].clone(),
+                    p["terminalCount"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        let expected: Vec<(String, serde_json::Value, serde_json::Value, u64)> = vec![
+            ("p-b".to_string(), "Bravo".into(), 0.into(), 2),
+            ("p-a".to_string(), "Alpha".into(), 2.into(), 1),
+            (
+                "p-stray".to_string(),
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                1,
+            ),
+        ];
+        assert_eq!(pages, expected);
+
+        let before =
+            serde_json::to_value(terminal_pages_response(grouped(), &PageLabels::default()))
+                .unwrap();
+        assert_eq!(before["labelsRegistered"], false);
+        assert!(before["labelsRegisteredAt"].is_null());
+        let ids: Vec<&str> = before["pages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| {
+                assert!(p["label"].is_null() && p["order"].is_null(), "{p}");
+                p["pageId"].as_str().unwrap()
+            })
+            .collect();
+        assert_eq!(ids, vec!["p-a", "p-b", "p-stray"]);
+    }
+
+    /// `GET /terminals` rows: every `TerminalInfo` key unchanged, plus the
+    /// camelCase `permissionRequestHook` — the contract
+    /// `qontinui-claude-config` reads.
+    #[test]
+    fn terminal_list_rows_carry_permission_request_hook_beside_the_schema_keys() {
+        use crate::session::claude_hook::PermissionRequestHook;
+        let info = |id: &str, created_at: u64| crate::terminal::types::TerminalInfo {
+            id: id.to_string(),
+            title: "Terminal 1".to_string(),
+            pid: Some(42),
+            cols: 80,
+            rows: 24,
+            working_dir: "/w".to_string(),
+            is_alive: true,
+            exit_code: None,
+            created_at,
+            total_bytes_produced: 7,
+            page_id: "default".to_string(),
+        };
+        let rows = terminal_list_entries(vec![
+            (info("t-reg", 1), PermissionRequestHook::Registered),
+            (info("t-abs", 2), PermissionRequestHook::Absent),
+        ]);
+        let v = serde_json::to_value(&rows).unwrap();
+        assert_eq!(v[0]["permissionRequestHook"], "registered");
+        assert_eq!(v[1]["permissionRequestHook"], "absent");
+        // The shared schema's own keys are flattened in, unchanged.
+        let plain = serde_json::to_value(info("t-reg", 1)).unwrap();
+        for (key, value) in plain.as_object().unwrap() {
+            assert_eq!(&v[0][key], value, "{key}");
+        }
+        assert_eq!(
+            v[0].as_object().unwrap().len(),
+            plain.as_object().unwrap().len() + 1,
+            "exactly one key added"
+        );
+    }
+
+    /// The handler serves the rows from the hook-aware listing, not the bare
+    /// `list()` (which a rename could silently revert to).
+    #[test]
+    fn the_list_handler_serves_the_hook_aware_rows() {
+        let src = include_str!("terminals.rs");
+        let body = src
+            .split_once("pub async fn list_terminals_handler(")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        assert!(
+            body.contains("list_with_permission_request_hooks()"),
+            "{body}"
+        );
+    }
+
     /// N4 (review of plan 2026-09-10). `POST /terminals` answers a tenant this
     /// runner holds no credential for with a 400 naming the pairing command —
     /// before any allocation — and a malformed one with a 400 too.
@@ -1167,10 +1538,12 @@ mod tests {
             .unwrap();
 
         let admit = |raw: Option<&str>| {
-            crate::commands::terminal::admit_spawn_tenant(raw).map_err(spawn_tenant_bad_request)
+            crate::commands::terminal::admit_spawn_tenant(raw).map_err(spawn_tenant_refused)
         };
         let (status, Json(body)) = admit(Some(&b.to_string())).expect_err("unpaired → refused");
         assert_eq!(status, StatusCode::BAD_REQUEST);
+        // Finding 9f2a0a0d: the code is the refusal's own, not status-derived.
+        assert_eq!(body.code.as_deref(), Some("TERMINAL_TENANT_NOT_PAIRED"));
         let text = serde_json::to_string(&body).unwrap();
         assert!(text.contains("terminal:tenant_not_paired"), "{text}");
         assert!(
@@ -1178,8 +1551,9 @@ mod tests {
             "{text}"
         );
 
-        let (status, _) = admit(Some("not-a-uuid")).unwrap_err();
+        let (status, Json(body)) = admit(Some("not-a-uuid")).unwrap_err();
         assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.code.as_deref(), Some("TERMINAL_TENANT_INVALID"));
         assert_eq!(admit(Some(&a.to_string())).ok(), Some(Some(a)));
         assert_eq!(admit(None).ok(), Some(None));
     }
@@ -1229,6 +1603,166 @@ mod tests {
         let (status, Json(body)) = edit_sibling_bad_request(refusal);
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body.code.as_deref(), Some("invalid_edit_sibling"));
+    }
+
+    /// Finding 9f2a0a0d, the other arms: an unreadable credential store is
+    /// UNKNOWN, so 503 with its own code, and a text outside the
+    /// `terminal:tenant_` family keeps the untyped 400 rather than a made-up code.
+    #[test]
+    fn spawn_tenant_refusal_code_and_status_follow_the_refusal_kind() {
+        let (status, Json(body)) = spawn_tenant_refused(
+            "terminal:tenant_credential_store_unreadable: tenant x: io error".to_string(),
+        );
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body.code.as_deref(),
+            Some("TERMINAL_TENANT_CREDENTIAL_STORE_UNREADABLE")
+        );
+
+        let (status, Json(body)) = spawn_tenant_refused(
+            "terminal:tenant_workdir_declares_other_tenant: /w/.mcp.json".to_string(),
+        );
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body.code.as_deref(),
+            Some("TERMINAL_TENANT_WORKDIR_DECLARES_OTHER_TENANT")
+        );
+
+        let (status, Json(body)) = spawn_tenant_refused("something else".to_string());
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.code, None);
+    }
+
+    /// The precheck cannot judge a cwd, so `WorkdirDeclaresOtherTenant` only
+    /// ever reaches this door as a failed `terminal_manager.create`. Every text
+    /// here is the real refusal's `Display`, the same string the identity seam
+    /// returns, so the typed answer cannot drift from what the seam says.
+    #[test]
+    fn a_refusal_from_the_spawn_keeps_its_typed_answer() {
+        use crate::coord_mcp::{DeclaredWorkdirKey, SpawnTenantRefusal};
+        let tenant = uuid::Uuid::from_u128(0xE7E7_0000_0000_4000_8000_0000_0000_00E7);
+
+        let refusal = SpawnTenantRefusal::WorkdirDeclaresOtherTenant {
+            tenant,
+            declared_file: std::path::PathBuf::from("/w/.mcp.json"),
+            declared: DeclaredWorkdirKey::NotLive,
+        };
+        let text = refusal.to_string();
+        let (status, Json(body)) = terminal_spawn_failed(text.clone());
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body.code.as_deref(),
+            Some("TERMINAL_TENANT_WORKDIR_DECLARES_OTHER_TENANT")
+        );
+        assert_eq!(
+            body.error.as_deref(),
+            Some(text.as_str()),
+            "the refusal names its own heal, unwrapped"
+        );
+
+        let refusal = SpawnTenantRefusal::NotPaired { tenant };
+        let (status, Json(body)) = terminal_spawn_failed(refusal.to_string());
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.code.as_deref(), Some("TERMINAL_TENANT_NOT_PAIRED"));
+
+        let refusal = SpawnTenantRefusal::CredentialStoreUnreadable {
+            tenant,
+            error: "io error".to_string(),
+        };
+        let (status, Json(body)) = terminal_spawn_failed(refusal.to_string());
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body.code.as_deref(),
+            Some("TERMINAL_TENANT_CREDENTIAL_STORE_UNREADABLE")
+        );
+    }
+
+    /// The resource guard's and the trust gate's refusals reach this door as
+    /// plain text too. Each case below is built by its real producer's format
+    /// (the guard's prefix, the gate's own `refusal()`), so a reworded producer
+    /// cannot drift away from the answer silently.
+    #[test]
+    fn a_resource_guard_or_trust_gate_refusal_keeps_a_typed_answer() {
+        use crate::claude_session::trust_gate::{
+            annotate_unread_dial, DialResolution, TrustGateDecision,
+        };
+        let blocked = || TrustGateDecision::SpawnBlocked {
+            rule: "ask-first",
+            failed: vec!["coord_worktree_row=failed".to_string()],
+        };
+        let guard = format!(
+            "{}thread_count: Not starting a new terminal session: over the ceiling.",
+            crate::resource_guard::CRITICAL_REFUSAL_PREFIX
+        );
+        let standing = blocked().refusal().expect("a block renders a refusal");
+        let unread = annotate_unread_dial(
+            blocked(),
+            &DialResolution::Unresolved {
+                error: "coord timed out".to_string(),
+            },
+        )
+        .refusal()
+        .expect("a block renders a refusal");
+
+        for (text, status, code) in [
+            (
+                guard,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "RESOURCE_GUARD_CRITICAL",
+            ),
+            (standing, StatusCode::CONFLICT, "SPAWN_BLOCKED"),
+            (
+                unread,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "SPAWN_BLOCKED_DIAL_UNREAD",
+            ),
+        ] {
+            let (got, Json(body)) = terminal_spawn_failed(text.clone());
+            assert_eq!(got, status, "{text}");
+            assert_eq!(body.code.as_deref(), Some(code), "{text}");
+            assert_eq!(body.error.as_deref(), Some(text.as_str()));
+        }
+    }
+
+    /// A create failure outside the refusal family is still the runner's fault,
+    /// and a text merely mentioning the family mid-string is not a refusal.
+    #[test]
+    fn any_other_spawn_failure_stays_an_untyped_500() {
+        for text in [
+            "Failed to open PTY: out of ptys",
+            "wrapped: terminal:tenant_not_paired: elsewhere",
+            "wrapped: resource_guard:critical:thread_count: elsewhere",
+            "wrapped: spawn_blocked (ask-first): elsewhere",
+        ] {
+            let (status, Json(body)) = terminal_spawn_failed(text.to_string());
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(body.code, None);
+            assert_eq!(
+                body.error,
+                Some(format!("Failed to create terminal: {text}"))
+            );
+        }
+    }
+
+    /// Finding 659b574a's defect class on this door: a `tenant` key the struct
+    /// did not know was dropped, spawning on the machine default.
+    /// provision-session takes the same spelling, so a caller moving between
+    /// the two doors selects the tenant on both.
+    #[test]
+    fn create_terminal_request_selects_the_tenant_under_every_spelling() {
+        for key in ["tenantId", "tenant_id", "tenant"] {
+            let req: CreateTerminalRequest =
+                serde_json::from_value(serde_json::json!({ key: "t-1" })).unwrap();
+            assert_eq!(req.tenant_id.as_deref(), Some("t-1"), "{key}");
+        }
+        assert!(
+            serde_json::from_value::<CreateTerminalRequest>(serde_json::json!({
+                "tenantId": "t-1",
+                "tenant": "t-2",
+            }))
+            .is_err(),
+            "two spellings at once is a duplicate field, never a silent pick"
+        );
     }
 
     #[test]

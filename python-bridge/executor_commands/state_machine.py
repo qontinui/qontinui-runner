@@ -7,6 +7,7 @@ and still read executor state through ``self``. ``COMMANDS`` maps each command
 name to its handler method.
 """
 
+import dataclasses
 import sys
 from typing import Any, ClassVar
 
@@ -358,11 +359,32 @@ class StateMachineCommands(ExecutorHost):
 
         try:
             result = self._ui_bridge_runtime.execute_transition(transition_id)
-            return {
-                "success": True,
-                "transition_id": transition_id,
-                "result": result if isinstance(result, dict) else {"completed": True},
-            }
+            # The runtime reports a failed transition (an unregistered id, a
+            # failed action) by RETURNING a result whose ``success`` is false,
+            # not by raising; reporting that as success made every caller read
+            # a failed transition as passed.
+            if isinstance(result, dict):
+                ok = result.get("success") is True
+                error = result.get("error")
+                payload: Any = result
+            else:
+                ok = getattr(result, "success", None) is True
+                error = getattr(result, "error", None)
+                payload = (
+                    dataclasses.asdict(result)
+                    if dataclasses.is_dataclass(result) and not isinstance(result, type)
+                    else {"completed": ok}
+                )
+                if result is None:
+                    error = "runtime returned no result"
+            if not ok:
+                return {
+                    "success": False,
+                    "transition_id": transition_id,
+                    "error": error or f"Transition {transition_id} failed",
+                    "result": payload,
+                }
+            return {"success": True, "transition_id": transition_id, "result": payload}
         except Exception as e:
             self.event_manager.emit_log(
                 "error", f"Failed to execute transition {transition_id}: {e}"

@@ -39,12 +39,11 @@ name: schema.pg.sql.generated nightly freshness
 # blocking a runner PR that lands a stale dump beside a `src-tauri/queries/**`
 # change. And do not fold this file's logic INTO it — `schema-pg-sql-fresh.yml`
 # is inside `ci-integrity.yml`'s scope — which is its trigger
-# (`.github/workflows/**`) minus an empty NON_GATING list, NOT the
+# (which covers `.github/workflows/**`) minus an empty NON_GATING list, NOT the
 # `GATING_WORKFLOWS` allowlist this line used to name; that allowlist is gone,
 # and with it any notion of a workflow file being excluded by an allowlist entry.
-# Every workflow file is in scope ON A PR BASED ON `main` — the guard is
-# `pull_request_target: branches: [main]`, so a STACKED PR editing a workflow
-# fires no ci-integrity run at all. On a main-based PR even a comment-only edit
+# Every workflow file is in scope on a PR with any base: the guard has carried no
+# base-branch filter since qontinui-runner#1253. Even a comment-only edit
 # reds the guard until the PR is declared. WHICH declaration is decided PER-PR,
 # not per-edit: `ci:gate-change=declared` when nothing in the whole PR moves a
 # surface, and `alters-a-gate` plus a `Gate-Change:` body line per altered item
@@ -170,9 +169,6 @@ concurrency:
   # a per-PR group instead, so a newer push reaps an older head's PENDING
   # selftest; schedule/dispatch/re-runs keep the per-ref serialisation above.
   # One expression, so coord models it as "" (never reaper-at-risk).
-  # KNOWN coord gap: the budget-cancel candidate scan in stuck_pr_watcher.rs
-  # compares groups with `=`, so every "" group matches every other one and
-  # suppresses its auto re-run; the fix belongs in coord.
   group: ${{ (github.event_name == 'pull_request' && github.run_attempt == 1) && format('{0}-pr-{1}', github.workflow, github.event.pull_request.number) || format('schema-pg-sql-freshness-nightly-{0}', github.ref) }}
   cancel-in-progress: false
 
@@ -183,7 +179,8 @@ jobs:
   # unexercised self-heal and it failed on nine consecutive nights.
   selftest:
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    # coord-pools: [self-hosted, Linux, X64, qontinui-host-nawa, qontinui, ram-2g] | [ubuntu-latest]
+    runs-on: ${{ fromJSON(((vars.RUNNER_CI_LANE_SCHEMA_PG_SQL_FRESHNESS_NIGHTLY || vars.RUNNER_CI_LIGHT_LANE) == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && '["self-hosted","Linux","X64","qontinui-host-nawa","qontinui","ram-2g"]' || '"ubuntu-latest"') }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
@@ -289,27 +286,39 @@ jobs:
         timeout-minutes: 10
         run: bash atlas/scripts/apply_to.sh postgresql://qontinui_user:qontinui_dev_password@localhost:5433/qontinui_db
 
-      # Bounded against a job-time apt hang, same 10-minute bound and same
-      # rationale as the identical step in schema-pg-sql-fresh.yml and
-      # ci.yml: a 9-second download sample cannot size a bound
-      # that must also cover `apt-get update` on a congested mirror.
-      - name: Install Postgres client (for pg_dump)
-        timeout-minutes: 10
+      # pg_dump runs INSIDE the postgres service container, the same way and
+      # for the same reasons as schema-pg-sql-fresh.yml's regenerate step: the
+      # client is the server's own binary, so its major and minor match by
+      # construction. That matters doubly here, because a skewed client's dump
+      # is not just a red night: this job would self-heal it into a refresh PR.
+      # The host `apt-get install -y postgresql-client-16` this replaced fails
+      # on an Ubuntu 26.04 runner image, which ubuntu-latest has been moving to
+      # and which ships only postgresql-client-18; the scheduled runs from
+      # 2026-11-12 went red at that step (coord finding
+      # 8a344609-11e9-467b-bb95-04923f20a7d3). This step refuses an empty
+      # container id up front, because fresh_check below would otherwise fall
+      # back to a host pg_dump of unknown version, and it logs which pg_dump
+      # the dump is taken with.
+      - name: Resolve pg_dump (the postgres service container's own)
+        env:
+          PG_CONTAINER: ${{ job.services.postgres.id }}
         run: |
-          sudo apt-get update
-          sudo apt-get install -y postgresql-client-16
+          if [ -z "$PG_CONTAINER" ]; then
+            echo "::error::job.services.postgres.id is empty; refusing to fall back to a host pg_dump of unknown version."
+            exit 1
+          fi
+          docker exec "$PG_CONTAINER" pg_dump --version
 
       - name: Check schema.pg.sql.generated is fresh
         id: fresh_check
         working-directory: qontinui-runner
         shell: bash
         env:
-          # Empty CLORINDE_PG_CONTAINER selects the regen script's NATIVE
-          # pg_dump path (the `-` default, not `:-`, honours the empty string).
-          CLORINDE_PG_CONTAINER: ""
-          CLORINDE_PG_HOST: localhost
-          CLORINDE_PG_PORT: "5433"
-          PGPASSWORD: qontinui_dev_password
+          # A non-empty CLORINDE_PG_CONTAINER selects the regen script's
+          # docker-exec path: pg_dump runs inside the service container over
+          # its local socket, so no host, port or password is passed. The
+          # step above has already refused an empty id.
+          CLORINDE_PG_CONTAINER: ${{ job.services.postgres.id }}
           # Atlas was applied by the step above; do not apply it twice.
           REGEN_SKIP_ATLAS: "1"
           # Single source of truth for the trigger predicate. Re-published as a
@@ -375,8 +384,9 @@ jobs:
 
           # Strip the pg_dump version banner before comparing: it records the OS
           # vendor string of whichever client produced the file, which differs
-          # between a contributor's Docker setup and CI's apt client. Pure
-          # environmental noise that would otherwise ratchet the artifact.
+          # between regen environments (a container's Debian build, a distro's
+          # apt client). Pure environmental noise that would otherwise ratchet
+          # the artifact.
           # Both inputs are known non-empty by the guards above, so the bare
           # `grep -v` cannot exit 1 here.
           strip() { grep -v '^-- Dumped by pg_dump version' "$1" > "$2"; }

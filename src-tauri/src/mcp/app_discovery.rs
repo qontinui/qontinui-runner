@@ -587,6 +587,10 @@ pub struct ForwardDeviceResponse {
     pub local_port: u16,
     pub device_id: String,
     pub remote_port: u16,
+    /// Whether this runner fetched the phone's pairing token over the new forward,
+    /// which is what lets it reach the same phone over Wi-Fi later. Never the
+    /// token itself.
+    pub pairing: crate::mcp::transport::pairing::LocalPairing,
 }
 
 /// Set up persistent ADB port forwarding for a mobile device.
@@ -621,11 +625,16 @@ async fn forward_device(
         "Persistent port forward: device {} remote {} -> local {}",
         req.device_id, req.remote_port, local_port
     );
+    let pairing = crate::mcp::transport::pairing::pair_over_local_forward(&format!(
+        "http://127.0.0.1:{local_port}"
+    ))
+    .await;
 
     Ok(Json(ApiResponse::success(ForwardDeviceResponse {
         local_port,
         device_id: req.device_id,
         remote_port: req.remote_port,
+        pairing,
     })))
 }
 
@@ -647,11 +656,18 @@ async fn ios_forward(
         .forward_port(&req.udid, req.device_port)
         .await
     {
-        Ok(local_port) => Ok(Json(ApiResponse::success(ForwardDeviceResponse {
-            local_port,
-            device_id: req.udid,
-            remote_port: req.device_port,
-        }))),
+        Ok(local_port) => {
+            let pairing = crate::mcp::transport::pairing::pair_over_local_forward(&format!(
+                "http://127.0.0.1:{local_port}"
+            ))
+            .await;
+            Ok(Json(ApiResponse::success(ForwardDeviceResponse {
+                local_port,
+                device_id: req.udid,
+                remote_port: req.device_port,
+                pairing,
+            })))
+        }
         Err(e) => Ok(Json(ApiResponse::error(format!("iOS forward: {e}")))),
     }
 }
@@ -1132,22 +1148,17 @@ pub struct AppDispatchRequest {
     pub params: serde_json::Value,
 }
 
-/// Build the dispatch payload for the transport-agnostic endpoint.
-///
-/// Extracted from `dispatch_to_app` so unit tests can verify the
-/// payload shape without spinning up a full `ApiState`. WebSocket-transport
-/// apps receive the user's `params` verbatim (the wrapper SDK's relay
-/// already forwards `action` separately in the command frame); HTTP apps
-/// receive an `{action, params}` envelope so the wrapper sees the same
-/// shape on both transports.
-fn build_dispatch_payload(
-    transport: crate::mcp::app_registry::AppTransport,
+/// The `/dispatch` route's body per arm: a WebSocket wrapper is sent the
+/// caller's params verbatim, an HTTP wrapper's `/dispatch` endpoint the
+/// `{action, params}` envelope. The dispatcher picks one on the registry read
+/// that routes (`ArmPayloads`).
+fn dispatch_payloads(
     action: &str,
     params: &serde_json::Value,
-) -> serde_json::Value {
-    match transport {
-        crate::mcp::app_registry::AppTransport::Websocket => params.clone(),
-        crate::mcp::app_registry::AppTransport::Http => serde_json::json!({
+) -> crate::mcp::app_dispatch::ArmPayloads {
+    crate::mcp::app_dispatch::ArmPayloads::PerArm {
+        websocket: params.clone(),
+        http: serde_json::json!({
             "action": action,
             "params": params,
         }),
@@ -1166,17 +1177,17 @@ async fn dispatch_to_app_inner(
     // `get_live`: a reservation-only row is not dispatchable, and answering
     // 404 here is the same status `dispatch`'s `NotRegistered` maps to —
     // reached truthfully instead of after building a payload from a dead row.
-    let entry = match registry.get_live(app_id).await {
-        Some(e) => e,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                ApiResponse::error("app not registered"),
-            );
-        }
-    };
+    //
+    // That read answers the 404 and nothing else: which arm's body is sent is
+    // decided by `dispatch`, on the read that routes.
+    if registry.get_live(app_id).await.is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            ApiResponse::error("app not registered"),
+        );
+    }
 
-    let payload = build_dispatch_payload(entry.transport, &req.action, &req.params);
+    let payload = dispatch_payloads(&req.action, &req.params);
 
     match dispatcher
         .dispatch(app_id, &req.action, Method::POST, "/dispatch", payload)
@@ -1187,11 +1198,52 @@ async fn dispatch_to_app_inner(
             StatusCode::NOT_FOUND,
             ApiResponse::error("app not registered"),
         ),
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            ApiResponse::error(e.to_user_message()),
-        ),
+        Err(e) => (StatusCode::BAD_GATEWAY, app_failure_response(&e)),
     }
+}
+
+/// The `{success:false}` body for a dispatch that failed after it was routed
+/// to the app (coord finding `fb3fb468`).
+///
+/// - `code` is the APP's own machine-readable code — a WebSocket wrapper's
+///   structured failure frame, or an HTTP app's `{success:false, code}` —
+///   so a caller can branch on `NO_HANDLER` instead of parsing prose. Nothing
+///   else ever lands in it.
+/// - `hint.failure_origin` is `"app"` when the app itself reported the
+///   failure and `"transport"` for everything else: a timeout, a disconnect,
+///   a displacement, an unreachable HTTP app, and a response frame the relay
+///   could not read, whose outcome is unknown.
+/// - `hint.retryable` is the wrapper's own retry verdict when it sent one,
+///   else `null`: UNKNOWN, never `false`.
+///
+/// The field NAMES and VALUES are the SDK proxy's
+/// (`sdk_client::ipc_fallback_refusal`), so one failure carries the same
+/// `code`, `failure_origin` and `retryable` through either door. Their PLACE
+/// differs: this door answers in the `ApiResponse` envelope, so
+/// `failure_origin` and `retryable` sit under `hint`, while the SDK proxy's
+/// refusal is a bare JSON body with both at its top level. A reader that
+/// handles both doors reads `hint.failure_origin` here and `failure_origin`
+/// there.
+fn app_failure_response(err: &DispatchError) -> ApiResponse<serde_json::Value> {
+    use crate::mcp::command_relay::CommandRelayError;
+    let (origin, code, retryable) = match err {
+        DispatchError::WebSocket(CommandRelayError::WrapperError(failure)) => {
+            ("app", failure.code.clone(), failure.retryable)
+        }
+        DispatchError::AppAnswered {
+            code, retryable, ..
+        } => ("app", code.clone(), *retryable),
+        _ => ("transport", None, None),
+    };
+    let mut body = match code {
+        Some(code) => ApiResponse::error_with_code(err.to_user_message(), code),
+        None => ApiResponse::error(err.to_user_message()),
+    };
+    body.hint = Some(serde_json::json!({
+        "failure_origin": origin,
+        "retryable": retryable,
+    }));
+    body
 }
 
 /// `POST /ui-bridge/apps/:appId/dispatch` — transport-agnostic dispatch.
@@ -1251,6 +1303,24 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/ui-bridge/apps/forward-device", post(forward_device))
         .route("/ui-bridge/ios/forward", post(ios_forward))
         .route("/ui-bridge/control/wait-for-app", post(wait_for_app))
+        // `dispatch` answers with the app's own response, so while a
+        // condition-check session holds a secret no response here carries it
+        // (`crate::condition_secrets`, plan
+        // 2026-11-06-a-regression-test-run-is-judged-by-what-it-covered-and-a-silent-run-reads-unknown
+        // Phase 13). LAST, because `Router::layer` wraps only the routes
+        // registered before it.
+        .layer(axum::middleware::from_fn(
+            crate::condition_secrets::scrub_sdk_responses,
+        ))
+        // `dispatch` sends its `params` verbatim to the app and never
+        // substitutes, so while a condition-check session holds a secret a
+        // `{{secret:<ref>}}` placeholder in its request is refused before the
+        // handler runs rather than typed into the app as literal text. It
+        // also checks `control/wait-for-app` (a `/ui-bridge/control/*`
+        // route); every other sibling passes through untouched.
+        .layer(axum::middleware::from_fn(
+            crate::condition_secrets::refuse_unsubstituted_placeholders,
+        ))
 }
 
 // ============================================================================
@@ -1556,9 +1626,9 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[test]
-    fn build_dispatch_payload_websocket_returns_params_verbatim() {
+    fn dispatch_payloads_send_a_websocket_wrapper_the_params_verbatim() {
         let params = serde_json::json!({"x": 1, "y": "two"});
-        let payload = build_dispatch_payload(AppTransport::Websocket, "doThing", &params);
+        let payload = dispatch_payloads("doThing", &params).for_transport(AppTransport::Websocket);
         assert_eq!(
             payload, params,
             "WS-transport apps must receive the user's params verbatim"
@@ -1566,9 +1636,9 @@ mod tests {
     }
 
     #[test]
-    fn build_dispatch_payload_http_wraps_action_and_params() {
+    fn dispatch_payloads_send_an_http_wrapper_the_action_and_params_envelope() {
         let params = serde_json::json!({"x": 1});
-        let payload = build_dispatch_payload(AppTransport::Http, "doThing", &params);
+        let payload = dispatch_payloads("doThing", &params).for_transport(AppTransport::Http);
         assert_eq!(payload["action"], "doThing");
         assert_eq!(payload["params"]["x"], 1);
         // The HTTP envelope must have *exactly* the two keys.
@@ -1660,6 +1730,114 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(body.success);
         assert_eq!(body.data, Some(serde_json::json!({"ok": true})));
+    }
+
+    /// A WebSocket wrapper's structured refusal reaches the HTTP caller with
+    /// the wrapper's own `code` and retry verdict (coord finding `fb3fb468`);
+    /// a bare-string refusal keeps the message alone, with retryability
+    /// `null`; and a response frame the relay could not read is NOT the
+    /// app's failure — no app code, `failure_origin: "transport"`.
+    #[tokio::test]
+    async fn dispatch_to_app_inner_hands_on_the_wrappers_failure_code() {
+        use crate::mcp::app_dispatch::AppDispatcher;
+        use crate::mcp::command_relay::{CommandRelay, CommandResponse, WrapperFailure};
+        use crate::mcp::relay_binding::BindingMode;
+        use crate::mcp::ws_relay::WsConnectionManager;
+        use std::time::Duration;
+
+        /// How the wrapper settles the command.
+        enum Answer {
+            Failed(WrapperFailure),
+            Unreadable(&'static str),
+        }
+        for (answer, want_code, want_hint, want_in_error) in [
+            (
+                Answer::Failed(WrapperFailure {
+                    code: Some("NO_HANDLER".into()),
+                    message: "No handler registered for action 'doThing'".into(),
+                    retryable: Some(false),
+                }),
+                Some("NO_HANDLER"),
+                serde_json::json!({ "failure_origin": "app", "retryable": false }),
+                "No handler registered for action 'doThing'",
+            ),
+            (
+                Answer::Failed(WrapperFailure::message_only("boom")),
+                None,
+                serde_json::json!({ "failure_origin": "app", "retryable": null }),
+                "boom",
+            ),
+            (
+                Answer::Unreadable("invalid type: string \"no\", expected a boolean"),
+                None,
+                serde_json::json!({ "failure_origin": "transport", "retryable": null }),
+                "could not be read",
+            ),
+        ] {
+            let registry = AppRegistry::new();
+            let ws = WsConnectionManager::new();
+            let (conn_id, mut outbound_rx) = ws.test_register("wapp").await;
+            registry
+                .upsert(
+                    sample_app("wapp"),
+                    None,
+                    AppTransport::Websocket,
+                    Some(1),
+                    None,
+                )
+                .await;
+            let relay = CommandRelay::with_timeout(ws.clone(), Duration::from_secs(20));
+            let dispatcher = AppDispatcher::new(registry.clone(), relay.clone());
+            let req = AppDispatchRequest {
+                action: "doThing".into(),
+                params: serde_json::json!({}),
+            };
+            let registry_for_task = registry.clone();
+            let dispatcher_for_task = dispatcher.clone();
+            let handle = tokio::spawn(async move {
+                dispatch_to_app_inner(&registry_for_task, &dispatcher_for_task, "wapp", &req).await
+            });
+            let frame: serde_json::Value =
+                serde_json::from_str(&outbound_rx.recv().await.expect("outbound frame")).unwrap();
+            let command_id = frame["commandId"].as_str().unwrap().to_string();
+            match answer {
+                Answer::Failed(failure) => {
+                    relay
+                        .resolve(
+                            conn_id,
+                            BindingMode::Enforce,
+                            CommandResponse {
+                                command_id,
+                                success: false,
+                                result: None,
+                                error: Some(failure),
+                            },
+                        )
+                        .await;
+                }
+                Answer::Unreadable(detail) => {
+                    relay
+                        .resolve_unreadable(
+                            conn_id,
+                            BindingMode::Enforce,
+                            &command_id,
+                            detail.to_string(),
+                        )
+                        .await;
+                }
+            }
+
+            let (status, body) = tokio::time::timeout(Duration::from_secs(5), handle)
+                .await
+                .expect("answered at once, not at the relay timeout")
+                .unwrap();
+            assert_eq!(status, StatusCode::BAD_GATEWAY);
+            assert!(!body.success);
+            assert_eq!(body.code.as_deref(), want_code, "{want_in_error}");
+            assert_eq!(body.hint, Some(want_hint), "{want_in_error}");
+            let error = body.error.as_deref().unwrap_or_default();
+            assert!(error.contains(want_in_error), "{error}");
+        }
     }
 
     #[tokio::test]

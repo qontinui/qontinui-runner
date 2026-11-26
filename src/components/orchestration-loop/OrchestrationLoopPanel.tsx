@@ -15,6 +15,7 @@ import {
   ChevronRight,
 } from "lucide-react";
 import { MultiLoopPanel } from "./MultiLoopPanel";
+import { runnerBaseForPort } from "@/lib/runner-api";
 
 // --- Types matching the Rust backend ---
 
@@ -358,7 +359,7 @@ export function OrchestrationLoopPanel() {
     // target picker.
     try {
       const portStr = supervisorPort.trim() || "9875";
-      const resp = await fetch(`http://localhost:${portStr}/runners`);
+      const resp = await fetch(`${runnerBaseForPort(portStr)}/runners`);
       if (!resp.ok) throw new Error(`supervisor /runners: HTTP ${resp.status}`);
       const all: SupervisorRunner[] = await resp.json();
       const ownPort = ownPortRef.current;
@@ -1116,7 +1117,7 @@ export function OrchestrationLoopPanel() {
                             value={diagnoseAssertions}
                             onChange={(e) => setDiagnoseAssertions(e.target.value)}
                             placeholder={
-                              '[\n  { "type": "visible", "role": "tab", "name": "Transitions" },\n  { "type": "count", "role": "row", "min": 1 }\n]'
+                              '[\n  { "query": "Transitions", "queryType": "text", "assertion": "isVisible" },\n  { "query": "[role=row]", "assertion": "count", "expected": 3 }\n]'
                             }
                             rows={6}
                             className={cn(textareaCls, "font-mono text-[0.7rem]")}

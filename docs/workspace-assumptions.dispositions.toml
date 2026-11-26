@@ -23,7 +23,58 @@
 # 237 -> 239 (rebase onto main eefa3a189): main re-split plans_dir_migration's
 # seed log lines into `outcome_message` (3 rows replacing 1), +2 unreviewed
 # plans_dir rows landed by main, not by this PR. Exact count, not a loosening.
-unreviewed_ceiling = 238
+# 238 -> 229 (plan 2026-10-19-served-corpus-probe-budget-excludes-process-creation
+# Phase 4): the nine unreviewed `os_bound_tooling` taskkill rows in
+# mcp/ai_session.rs, mcp/headless_browser.rs and mcp/task_runs.rs are gone with
+# the taskkill spawns they named. A fall, held.
+# 229 -> 227 (plan 2026-11-06-what-the-fleet-records-and-advertises-matches-what-actually-ran
+# Phase 6): the agent-definition provisioning split moved three unreviewed
+# repo_layout rows onto new keys (provision_agent_definitions_with_root,
+# provision_agent_definitions_retiring) and added one under the existing
+# `const CAPABILITY_SPECS` key. The three moved rows are now reviewed
+# (fallback_correct, below); the CAPABILITY_SPECS prose row stays unreviewed
+# with its key's siblings. 230 rendered - 3 reviewed = 227. A fall, held.
+# 227 -> 221 (qontinui-schemas#269 follow-up): seven unreviewed `repo_layout`
+# rows, each a hand-written "Set $QONTINUI_ROOT" sentence, are gone. Five sites
+# (database/pg/apps.rs, env_agent/apply_repos.rs's in-runner arm, main.rs,
+# mcp/task_runs.rs, planning_bridge.rs's unresolved-root warning) render the
+# shared `WorkspaceRootUnresolved` sentence; mcp/api_surface.rs renders it or
+# `SiblingCheckoutAbsent`; planning_bridge.rs's per-tree warning names a clone
+# or an install instead. One row is NEW and deliberately left unreviewed:
+# env_agent/apply_repos.rs `const CLI_UNRESOLVED_ROOT_NOTE`, because a
+# standalone `env apply` cannot read the "Workspace root" setting, so
+# $QONTINUI_ROOT is the true next action there. Whether `env apply` is a
+# dev-only surface is a disposition call this change does not make. Net -6.
+# 221 -> 212, applied on top of the 227 -> 221 above (qontinui-runner#2776,
+# rebased onto it as the second lander; ceiling read off the regenerated
+# roster, not summed from the two PRs' deltas). #2776 alone was 227 -> 219 (plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists
+# Phase B3, the runner half): eight unreviewed rows are gone with the refusal
+# and log text that now renders the shared workspace-root sentence or names
+# the Workspace root setting (continuation_fallback_workdir,
+# run_condition_check_terminal, survey, start_build,
+# persist_resolved_workspace_root, two in publish_tree_state), and
+# runner_workspace_root's canary label is now reviewed. The new rows
+# (session_workspace_root's canary label, overlay_absent_statement's sibling
+# name, the no-root arm moving back to provision_agent_definitions) are
+# reviewed below. provision_agent_definitions_with_root, named in the line
+# above, is gone. The rebase also converts fleet.rs
+# spawn_skill_parity_pass_if_due's no-root report ("set QONTINUI_ROOT or the
+# runner's paths.workspace_root") to name the Workspace root setting, so the
+# runner_text_never_says_set_qontinui_root guard can hold. A fall, held.
+# 212 -> 210 (runner#2978, plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists
+# B3 remaining): the unreviewed session_recap.rs analyze_handler row ("Cannot
+# find qontinui-root") and the unreviewed `const CAPABILITY_SPECS` prose row are
+# gone with the text they named; coord_mcp.rs probe_stdio_shim's unreviewed row
+# is re-keyed onto the typed WorkspaceRootUnresolved render (still unreviewed);
+# the no-root arm of provision_agent_definitions now writes the embedded floor
+# and its overlay moved to provision_agent_definitions_layers, both re-reviewed
+# below as fallback_correct. 212 - 2 = 210. A fall, held.
+# 210 -> 207 (qontinui-runner#3129, plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists,
+# finding 3dad3856): the three unreviewed slash_commands.rs
+# find_commands_directory_reported rows moved to commands_directory_in and
+# `const COMMANDS_SIBLING` when that import's absent checkout became a typed
+# 422 refusal instead of a 500; reviewed below as fallback_correct. A fall, held.
+unreviewed_ceiling = 207
 
 # First triage pass (plan 2026-09-20-published-runner-parity-count-comes-from-a-run-not-from-reports Phase 4):
 # every supervisor_dependency, tenant_literal and machine_path key. The
@@ -31,13 +82,23 @@ unreviewed_ceiling = 238
 # (src-tauri/src/webview_recovery.rs module doc).
 
 [[disposition]]
+class = "repo_layout"
+file = "src/ci_node/ops.rs"
+symbol = "const DEFAULT_OPS_REPO"
+disposition = "fallback_correct"
+note = "Default repo for the D4 ops-lane script allowlist; overridden by OPS_REPO_ENV, and the lane is dark unless coord enables it."
+reviewed = [
+    "const DEFAULT_OPS_REPO: &str = \"qontinui/qontinui-claude-config\";",
+]
+
+[[disposition]]
 class = "machine_path"
 file = "src/commands/setup_wizard.rs"
-symbol = "discover_claude_config_dirs"
+symbol = "const WINDOWS_MULTI_ACCOUNT_ROOT"
 disposition = "fallback_correct"
-note = "Probes the fleet's C:\\claude multi-account convention behind is_dir(); absent everywhere else, where CLAUDE_CONFIG_DIR and ~/.claude still apply."
+note = "Probes the fleet's C:\\claude multi-account convention, read only on the Windows discovery layout (DiscoveryLayout); an absent dir reads as no accounts. Elsewhere the configured roster, CLAUDE_CONFIG_DIR and ~/.claude apply. Moved from the discover_claude_config_dirs key when the literal became this const (qontinui-runner#2544); same disposition."
 reviewed = [
-    "let claude_root = std::path::Path::new(\"C:\\\\claude\");",
+    "const WINDOWS_MULTI_ACCOUNT_ROOT: &str = \"C:\\\\claude\";",
 ]
 
 [[disposition]]
@@ -63,11 +124,11 @@ reviewed = [
 [[disposition]]
 class = "machine_path"
 file = "src/session_archive/discovery.rs"
-symbol = "discover_account_homes_from_env"
+symbol = "claude_root_for"
 disposition = "fallback_correct"
-note = "Probes C:/claude behind is_dir() on every platform, per its own doc comment; false everywhere else."
+note = "The Windows arm of the account-home scan root (the fleet's C:/claude layout); every other OS scans $HOME instead (plan 2026-10-01-a-commit-author-session-is-unreachable-because-every-session-roster-is-per-account Phase 1)."
 reviewed = [
-    "Some(PathBuf::from(\"C:\\\\claude\")),",
+    "Some(PathBuf::from(\"C:\\\\claude\"))",
 ]
 
 [[disposition]]
@@ -284,6 +345,26 @@ reviewed = [
 ]
 
 [[disposition]]
+class = "dev_ports"
+file = "src/mcp/origin_guard.rs"
+symbol = "const GRACE_ORIGINS"
+disposition = "dev_only_surface"
+note = "The transitional dev-origin grace: only the qontinui-web dev frontend on :3001 is admitted at TRUSTED_DOOR_GRACE doors. A dev-only surface that no published build serves from that origin; plan 2026-09-17-retire-the-runner-origin-guard-dev-grace retires it (Phase 6 deletes the constant)."
+reviewed = [
+    "pub const GRACE_ORIGINS: &[&str] = &[\"http://localhost:3001\", \"http://127.0.0.1:3001\"];",
+]
+
+[[disposition]]
+class = "dev_ports"
+file = "src/pair.rs"
+symbol = "BrowserPairPage::provenance"
+disposition = "dev_only_surface"
+note = "Operator-facing provenance text for `device pair --browser`: it names the qontinui-web dev frontend on :3001 only as an example value for $QONTINUI_WEB_FRONTEND_BASE when the page origin was derived from the API base. Nothing dials it; the page URL comes from the env override or the API-base derivation (runner#2287)."
+reviewed = [
+    "to override (local dev: http://localhost:3001)\",",
+]
+
+[[disposition]]
 class = "supervisor_dependency"
 file = "src/mcp/session_briefing.rs"
 symbol = "session_briefing_handler"
@@ -441,6 +522,26 @@ note = "Surfaced by fleet-nouns.toml (A6); not yet triaged."
 
 [[disposition]]
 class = "repo_layout"
+file = "src/agent_runtime.rs"
+symbol = "provision_agent_definitions"
+disposition = "fallback_correct"
+note = "The no-root arm of agent-definition provisioning: with no qontinui-root it warns, records a capability_manifest Rung::Unresolved `agent_definitions` row naming what was skipped (the normal state on a published install), still runs the retirement pass, and lets the spawn proceed. The embedded fleet_agents floor supplies the definitions there. Reviewed when these rows moved off the provision_agent_definitions key (plan 2026-11-06-what-the-fleet-records-and-advertises-matches-what-actually-ran Phase 6), and again when they moved back: the arm now takes the session's WorkspaceRoot, names the rejected input, and calls the outcome the normal published-install state only when no explicit input was at fault (plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists B3). Re-reviewed when the no-root arm stopped skipping and started writing the embedded floor (and running the retirement pass) without the qontinui-claude-config overlay, its warning rendering the typed WorkspaceRootUnresolved (runner#2978)."
+reviewed = [
+    '{worktree_cwd} without the qontinui-claude-config overlay ({})",',
+]
+
+[[disposition]]
+class = "repo_layout"
+file = "src/agent_runtime.rs"
+symbol = "provision_agent_definitions_layers"
+disposition = "fallback_correct"
+note = "The checkout OVERLAY of agent definitions, read from <root>/qontinui-claude-config/.claude/agents only when a root resolved (overlay_root is Ok). With no root, or a missing dir, the overlay contributes nothing; the embedded fleet_agents floor beneath it still provisions, and both layers report rows to the capability manifest. Reviewed when this row moved off the provision_agent_definitions_from_root key (same plan, Phase 6), and again when it moved from provision_agent_definitions_retiring to provision_agent_definitions_layers, which both the rooted and the no-root arm now share (runner#2978)."
+reviewed = [
+    'root.join("qontinui-claude-config")',
+]
+
+[[disposition]]
+class = "repo_layout"
 file = "src/agent_skills/self_path.rs"
 symbol = "self_path_hit"
 disposition = "unreviewed"
@@ -511,13 +612,6 @@ note = "Surfaced by fleet-nouns.toml (A6); not yet triaged."
 
 [[disposition]]
 class = "repo_layout"
-file = "src/mcp/session_recap.rs"
-symbol = "analyze_handler"
-disposition = "unreviewed"
-note = "Surfaced by fleet-nouns.toml (A6); not yet triaged."
-
-[[disposition]]
-class = "repo_layout"
 file = "src/reflection/workflow.rs"
 symbol = "build_ui_bridge_completion_steps"
 disposition = "unreviewed"
@@ -581,4 +675,233 @@ disposition = "fallback_correct"
 note = "A caveat string attached to the Canonical rung explaining it is the runner's per-body git mirror rather than an account-layer arm — descriptive text in the capability manifest, never a path resolved on disk."
 reviewed = [
     "qontinui-claude-config origin/main), not an account-layer arm\",",
+]
+
+# qontinui-runner#2426 (plan 2026-10-28-finished-gate-continuations-never-free-a-slot-so-the-box-deadlocks-at-the-continuation-cap
+# Phase 3, the #1987 re-land): the boot-time MCP-child rule's always-work image list.
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/session/tracking_health.rs"
+symbol = "const WORK_CHILD_IMAGES"
+disposition = "fallback_correct"
+note = "Process-IMAGE names compared against a session's direct children on every OS, never launched or required: a pwsh/powershell direct child (a shell a tool runs under) counts as WORK. On a box without PowerShell nothing matches, and the rest of child_signals_work decides as before."
+reviewed = [
+    "\"powershell\",",
+    "\"pwsh\",",
+]
+
+# Plan 2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap
+# Phase 5: the PowerShell/WMI process-table reads became the FALLBACK behind the
+# in-process provider (src/process_capture/process_table.rs), whose platform
+# halves give every caller a non-Windows path. The fallback bodies themselves
+# are PowerShell by definition and only ever reached on Windows.
+
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/process_capture/process_tree.rs"
+symbol = "powershell_snapshot"
+disposition = "fallback_correct"
+note = "The Windows-only PowerShell/WMI snapshot, reached only through process_table's circuit when the in-process sysinfo walk fails. Unix reads /proc in-process and has no external snapshot fallback."
+reviewed = [
+    "cfg(windows)-only fn `powershell_snapshot` has no cfg(not(windows)) sibling in this file",
+]
+
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/process_capture/process_tree.rs"
+symbol = "command_lines_for_pids_powershell"
+disposition = "fallback_correct"
+note = "The Windows-only WMI command-line query, reached only through process_table's circuit when the in-process sysinfo cmd() read fails. Unix reads /proc/<pid>/cmdline in-process."
+reviewed = [
+    "cfg(windows)-only fn `command_lines_for_pids_powershell` has no cfg(not(windows)) sibling in this file",
+]
+
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/fleet/computer/services.rs"
+symbol = "sc"
+disposition = "fallback_correct"
+note = "The Windows service watcher's `sc query`/`sc qc` probe, inside `mod windows` and called only from cfg(windows) code. On Linux the systemd collector in the same file watches the units; other non-Windows targets report no service scan (units unknown, nothing deleted)."
+reviewed = [
+    "cfg(windows)-only fn `sc` has no cfg(not(windows)) sibling in this file",
+]
+
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/process_capture/process_tree.rs"
+symbol = "port_owner_pid_powershell"
+disposition = "fallback_correct"
+note = "The Windows-only Get-NetTCPConnection query, reached only through process_table's circuit when the in-process GetExtendedTcpTable listener read fails. Unix keeps its own lsof port_owner_pid."
+reviewed = [
+    "cfg(windows)-only fn `port_owner_pid_powershell` has no cfg(not(windows)) sibling in this file",
+]
+
+# qontinui-runner#2376 (plan 2026-10-23-runner-sessions-stop-at-permission-dialogs-so-accept-them-by-default-with-a-tenant-switch
+# Phase 2): the PermissionRequest hook carrier's shell-program list.
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/session/claude_hook.rs"
+symbol = "const SHELL_PROGRAMS"
+disposition = "fallback_correct"
+note = "Shell-name stems compared against the argv[0] of a spawn on every OS, never launched or required: the env-var carrier applies only where an interactive shell resolves `claude` through the identity shim. pwsh/powershell are two entries among ten (bash, sh, zsh, fish, dash, ksh, cmd, nu); on a box without PowerShell they match nothing and the rest decide as before."
+reviewed = [
+    "\"powershell\",",
+    "\"pwsh\",",
+]
+# qontinui-schemas#269 follow-up: the standalone-CLI arm of the repos apply.
+[[disposition]]
+class = "repo_layout"
+file = "src/env_agent/apply_repos.rs"
+symbol = "const CLI_UNRESOLVED_ROOT_NOTE"
+disposition = "unreviewed"
+note = "Acknowledged, not triaged. A standalone `env apply --section repos` exits before the runner publishes its settings door (collectors::workspace_root_reads_setting), so it cannot read the Workspace root setting and $QONTINUI_ROOT is the true next action there; the in-runner arm renders the shared WorkspaceRootUnresolved sentence instead. Left unreviewed because whether `env apply` is a dev_only_surface is a disposition call this change does not make."
+
+[[disposition]]
+class = "repo_layout"
+file = "src/workspace_paths.rs"
+symbol = "runner_workspace_root"
+disposition = "dev_only_surface"
+note = "The label passed to ambient::canary, which reads it only while the canary is armed (cfg(test), an explicit arm, or a test binary running from cargo's deps directory; a release build compiles canary to Proceed and never reads it): it names the inputs an unguarded test reached, in the deflection message. An installed runner never shows it to an operator; the resolver it guards reads its inputs through the shared qontinui_types::paths rungs and degrades to Unresolved. Plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists B3."
+reviewed = [
+    "\"env QONTINUI_ROOT / QONTINUI_WORKSPACE_ROOT / settings paths.workspace_root (runner_workspace_root)\",",
+]
+
+[[disposition]]
+class = "repo_layout"
+file = "src/workspace_paths.rs"
+symbol = "session_workspace_root"
+disposition = "dev_only_surface"
+note = "The label passed to ambient::canary, which reads it only while the canary is armed (cfg(test), an explicit arm, or a test binary running from cargo's deps directory; a release build compiles canary to Proceed and never reads it): it names the inputs an unguarded test reached, in the deflection message. An installed runner never shows it to an operator; the resolver it guards reads its inputs through the shared qontinui_types::paths rungs and degrades to Unresolved. Plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists B3."
+reviewed = [
+    "\"env QONTINUI_ROOT / QONTINUI_WORKSPACE_ROOT / settings paths.workspace_root (session_workspace_root)\",",
+]
+
+[[disposition]]
+class = "repo_layout"
+file = "src/agent_runtime.rs"
+symbol = "overlay_absent_statement"
+disposition = "fallback_correct"
+note = "The sibling repository NAME the agent_definitions row's sibling_checkout_absent statement carries as its discriminator. It is rendered only after the overlay was found absent, together with what serves instead (the built-in copy, the repository's own tracked definitions, a named write failure, or unsupported), so it is the statement of a fallback, never a path the runner resolves. Plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists B3."
+reviewed = [
+    "const SIBLING: &str = \"qontinui-claude-config\";",
+]
+
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/fleet/computer/wsl_guest.rs"
+symbol = "collect"
+disposition = "fallback_correct"
+note = "Probes the WSL2 guests of a Windows host; its only caller (fleet/computer/mod.rs) is cfg(windows). A WSL guest exists only under a Windows host, and a Linux box reports itself through the host collector."
+reviewed = [
+    "cfg(windows)-only fn `collect` has no cfg(not(windows)) sibling in this file",
+]
+
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/fleet/computer/wsl_guest.rs"
+symbol = "running"
+disposition = "fallback_correct"
+note = "Lists running WSL distros for `collect` (`wsl --list --running`); Windows-only by nature, reached only through the cfg(windows) caller of `collect`."
+reviewed = [
+    "cfg(windows)-only fn `running` has no cfg(not(windows)) sibling in this file",
+]
+
+# qontinui-runner#2952 (plan 2026-11-09-runner-postgres-backed-tests-never-run-so-hand-verified-sql-is-unretained
+# Phase 1): the PG test harness's Windows held-handle teardown. Test-harness code
+# only (embedded_pg::test_harness is #[doc(hidden)] and reached by no product path).
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/embedded_pg/test_harness.rs"
+symbol = "ProcessHandle::created"
+disposition = "fallback_correct"
+note = "Reads the held process handle's creation time (GetProcessTimes) to tie the harness's identity proof to that handle. Windows arm of embedded_pg::test_harness::end_postmaster; Linux makes its sysinfo identity proof while holding a pidfd; other Unix falls back to pid signalling."
+reviewed = [
+    "cfg(windows)-only fn `created` has no cfg(not(windows)) sibling in this file",
+]
+
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/embedded_pg/test_harness.rs"
+symbol = "ProcessHandle::drop"
+disposition = "fallback_correct"
+note = "Closes the held process handle. Windows arm of the test harness's held-handle teardown; Linux closes its pidfd, other Unix holds nothing."
+reviewed = [
+    "cfg(windows)-only fn `drop` has no cfg(not(windows)) sibling in this file",
+]
+
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/embedded_pg/test_harness.rs"
+symbol = "ProcessHandle::image"
+disposition = "fallback_correct"
+note = "Reads the held handle's image path (QueryFullProcessImageNameW) as the second identity check. Windows arm of the test harness's end_postmaster; Linux makes its sysinfo identity proof while holding a pidfd."
+reviewed = [
+    "cfg(windows)-only fn `image` has no cfg(not(windows)) sibling in this file",
+]
+
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/embedded_pg/test_harness.rs"
+symbol = "ProcessHandle::terminate"
+disposition = "fallback_correct"
+note = "TerminateProcess + WaitForSingleObject on the same held handle. Windows arm of end_postmaster; Linux sends SIGQUIT then SIGKILL through a pidfd, other Unix through the pid."
+reviewed = [
+    "cfg(windows)-only fn `terminate` has no cfg(not(windows)) sibling in this file",
+]
+
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/embedded_pg/test_harness.rs"
+symbol = "unix_seconds_of_filetime"
+disposition = "fallback_correct"
+note = "Converts a Windows FILETIME (100 ns ticks since 1601) to Unix seconds so the owner record's start time compares with sysinfo's. Linux reads /proc/<pid>/stat starttime instead."
+reviewed = [
+    "cfg(windows)-only fn `unix_seconds_of_filetime` has no cfg(not(windows)) sibling in this file",
+]
+
+[[disposition]]
+class = "repo_layout"
+file = "src/slash_commands.rs"
+symbol = "commands_directory_in"
+disposition = "fallback_correct"
+note = "The slash-command import scans <root>/qontinui-claude-config/.claude/commands and has no embedded copy. With no root, or no such checkout, it records an unresolved capability-manifest row and the route answers the typed 422 refusal (workspace_root_unresolved / sibling_checkout_absent, next action in the schemas Refusal) without touching the database — never a 500, never a deletion (runner#3129, finding 3dad3856)."
+reviewed = [
+    '"<workspace-root>/qontinui-claude-config/.claude/commands",',
+    '"this device has no qontinui-claude-config checkout, and this import has \',
+]
+
+[[disposition]]
+class = "repo_layout"
+file = "src/slash_commands.rs"
+symbol = "const COMMANDS_SIBLING"
+disposition = "fallback_correct"
+note = "The sibling checkout name the slash-command import reads from and names in its sibling_checkout_absent refusal; its absence is handled by commands_directory_in's typed refusal (runner#3129)."
+reviewed = [
+    'const COMMANDS_SIBLING: &str = "qontinui-claude-config";',
+]
+
+# qontinui-runner#2563 (plan 2026-11-04-runner-wedge-detector-reads-a-boot-as-a-wedge-and-never-bound-is-silent
+# Phase 1): the UI thread's identity in wedge diagnostics. Both fns read a Win32
+# thread (GetWindowThreadProcessId / NtQuerySystemInformation); their only
+# callers are themselves cfg(windows), and off Windows the record's `ui_thread`
+# field reads "unsupported_platform" (capture_ui_thread_state's non-Windows arm),
+# so no non-Windows sibling is owed.
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/ui_thread_probe.rs"
+symbol = "publish_ui_thread_of"
+disposition = "fallback_correct"
+note = "Captures the main window's owning thread id via GetWindowThreadProcessId when the HWND is cached; called only from the cfg(windows) HWND-cache path, and off Windows there is no HWND, and the record's `ui_thread` field reads \"unsupported_platform\"."
+reviewed = [
+    "cfg(windows)-only fn `publish_ui_thread_of` has no cfg(not(windows)) sibling in this file",
+]
+
+[[disposition]]
+class = "os_bound_tooling"
+file = "src/wedge_diagnostics.rs"
+symbol = "thread_state"
+disposition = "fallback_correct"
+note = "Reads one thread's kernel state and wait reason for the wedge-diagnostics `ui_thread` field; called only from the cfg(windows) arm of capture_ui_thread_state; off Windows that arm answers \"unsupported_platform\" instead."
+reviewed = [
+    "cfg(windows)-only fn `thread_state` has no cfg(not(windows)) sibling in this file",
 ]

@@ -227,27 +227,32 @@ pub async fn stop_task_run(
         pids_copy
     };
 
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut killed_count = 0;
     for pid in &pids_to_kill {
         info!("Killing AI process PID {} for task {}", pid, id);
-        let result = crate::process_helpers::no_window("taskkill")
-            .args(["/F", "/T", "/PID", &pid.to_string()])
-            .output();
-
-        match result {
-            Ok(output) => {
-                if output.status.success() {
-                    info!("Successfully killed process tree for PID {}", pid);
-                    killed_count += 1;
-                } else {
-                    // Process may have already exited
-                    killed_count += 1;
-                }
+        // In-process tree kill: no `taskkill` is spawned to do it.
+        #[cfg(windows)]
+        match crate::tree_kill::kill_tree_by_pid_async(*pid, std::time::Duration::from_secs(5))
+            .await
+        {
+            Ok(_) => {
+                info!("Successfully killed process tree for PID {}", pid);
+                killed_count += 1;
             }
             Err(e) => {
-                error!("Failed to execute taskkill for PID {}: {}", pid, e);
+                // Process may have already exited.
+                info!("Tree kill for PID {}: {}", pid, e);
+                killed_count += 1;
             }
         }
+        // Unchanged off Windows: this path never killed anything there (it
+        // spawned `taskkill`, which does not exist). A separate defect.
+        #[cfg(not(windows))]
+        error!(
+            "No process-tree kill on this platform; PID {} was not signalled",
+            pid
+        );
     }
 
     // Mark as stopped in database
@@ -734,7 +739,6 @@ pub async fn resume_task_run(
         phase_timeout_ms: None,
         max_fix_attempts: workflow.max_fix_attempts,
         max_ci_auto_resumes: workflow.max_ci_auto_resumes,
-        ci_failure_context: None,
         htn_config: crate::planning_bridge::HtnConfig::default(),
     };
 
@@ -1983,7 +1987,7 @@ fn dev_logs_dir_in(root: &std::path::Path) -> std::path::PathBuf {
 pub async fn migrate_task_run_logs(
     State(state): State<Arc<ApiState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiResponse<()>>)> {
     use tracing::info;
 
     info!("Migrating JSONL logs for task run: {}", id);
@@ -1994,17 +1998,25 @@ pub async fn migrate_task_run_logs(
         .pg_db
         .get_task_run(&id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error(e)),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ApiResponse::error(format!("Task run not found: {}", id))),
+            )
+        })?;
 
-    // Get the dev-logs directory path
-    let workspace_root = crate::workspace_paths::workspace_root().ok_or_else(|| {
+    // Get the dev-logs directory path. An unresolved root is the shared typed
+    // refusal (code `workspace_root_unresolved`), not a re-worded 500.
+    let workspace_root = crate::workspace_paths::require_workspace_root().map_err(|why| {
         (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to resolve .dev-logs path: no Qontinui workspace root resolved. \
-             Set $QONTINUI_ROOT (or the `paths.workspace_root` setting) to the \
-             directory holding the repo checkouts."
-                .to_string(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(ApiResponse::workspace_root_unresolved(&why)),
         )
     })?;
     let dev_logs_dir = dev_logs_dir_in(&workspace_root);
@@ -2014,7 +2026,9 @@ pub async fn migrate_task_run_logs(
     let _dev_logs_dir = dev_logs_dir;
     Err((
         StatusCode::INTERNAL_SERVER_ERROR,
-        "Log migration to PostgreSQL is not yet implemented".to_string(),
+        Json(ApiResponse::error(
+            "Log migration to PostgreSQL is not yet implemented",
+        )),
     ))
 }
 

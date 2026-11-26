@@ -37,6 +37,7 @@ pub(crate) fn prepare_ai_child_env(cmd: &mut Command) {
     // is an infinite silent hang. One shared list, eight seams; see
     // `credential_helper::non_interactive_git_env`.
     crate::credential_helper::apply_non_interactive_git_env_std(cmd);
+    crate::terminal::apply_python_utf8_default_std(cmd);
     crate::terminal::scrub_credential_env_std(cmd);
 }
 
@@ -102,6 +103,13 @@ mod tests {
 
     #[test]
     fn ai_child_env_preamble_scrubs_credential_values() {
+        // The scrub applies the LIVE model-gateway plan, which reads the
+        // runner config dir. A sibling test's `IsolatedAmbient` rewrites the
+        // process env (on Windows, `USERPROFILE` too, which can make the
+        // platform config dir unresolvable mid-test); an unresolvable dir is
+        // an unresolved gateway that pins `CLAUDE_CONFIG_DIR` away. Hold the
+        // fixture so this test reads a known, gateway-free config dir.
+        let _amb = crate::test_env::isolated_ambient();
         let mut cmd = Command::new("dummy");
         // As the caller / inherited process env would have supplied them.
         for name in crate::terminal::CREDENTIAL_VALUE_ENV_VARS {
@@ -153,5 +161,6 @@ mod tests {
             &cmd,
             "prepare_ai_child_env",
         );
+        crate::terminal::assert_python_utf8_default_std(&cmd, "prepare_ai_child_env");
     }
 }

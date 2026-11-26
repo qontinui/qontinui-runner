@@ -70,7 +70,10 @@ pub fn start_instance_health_monitor(pg_db: Arc<PgDb>, instance_manager: Arc<Ins
                     if inst.status != "unhealthy" || inst.is_primary {
                         continue;
                     }
-                    let url = format!("http://localhost:{}/health", inst.port);
+                    let url = format!(
+                        "{}/health",
+                        crate::mcp::types::runner_loopback_base(inst.port)
+                    );
                     match client.get(&url).send().await {
                         Ok(resp) if resp.status().is_success() => {
                             // Instance recovered — mark healthy
@@ -129,7 +132,10 @@ pub async fn purge_stale_instances(pg_db: &PgDb, instance_manager: &InstanceMana
             if inst.status != "unhealthy" || inst.is_primary {
                 continue;
             }
-            let url = format!("http://localhost:{}/health", inst.port);
+            let url = format!(
+                "{}/health",
+                crate::mcp::types::runner_loopback_base(inst.port)
+            );
             if let Ok(resp) = client.get(&url).send().await {
                 if resp.status().is_success() {
                     let _ = pg_db
@@ -171,7 +177,10 @@ pub async fn startup_cleanup(pg_db: &PgDb) {
         if inst.is_primary {
             continue;
         }
-        let url = format!("http://localhost:{}/health", inst.port);
+        let url = format!(
+            "{}/health",
+            crate::mcp::types::runner_loopback_base(inst.port)
+        );
         let alive = client
             .get(&url)
             .send()

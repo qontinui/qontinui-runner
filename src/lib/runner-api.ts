@@ -3,7 +3,7 @@
  *
  * At startup, the actual port is read from the Tauri backend via the
  * `get_api_port` command. All API calls should use these getters instead
- * of hardcoding "http://localhost:9876".
+ * of hardcoding a runner URL.
  *
  * Components that need the *current* port reactively (so a late-arriving
  * `setApiPort` causes a re-render) should call `useApiBase()` /
@@ -39,17 +39,43 @@ function injectedApiPort(): number {
   return 9876;
 }
 
+/**
+ * The ONE host the runner's HTTP API listens on: the IPv4 loopback
+ * (`RUNNER_API_BIND_IP` in `src-tauri/src/mcp/types.rs`, which `try_bind_port`
+ * binds). Never `localhost`: Windows resolves it to `::1` first, where nothing
+ * listens, so a client without happy-eyeballs pays a failed IPv6 connect on
+ * every new connection. Plan
+ * `2026-10-25-runner-self-calls-dial-localhost-and-pay-a-doomed-ipv6-connect`.
+ */
+export const RUNNER_API_HOST = "127.0.0.1";
+
+/**
+ * The HTTP base of the runner API listening on `port` — this runner's or a
+ * sibling instance's (every runner binds {@link RUNNER_API_HOST}), e.g.
+ * `"http://127.0.0.1:9877"`. Use it where the port is EXPLICIT (a multi-port
+ * probe, a sibling-instance fetch, a per-port pong); use `getApiBase()` /
+ * `useApiBase()` for this runner's own bound port.
+ */
+export function runnerBaseForPort(port: number | string): string {
+  return `http://${RUNNER_API_HOST}:${port}`;
+}
+
+/** The WebSocket twin of {@link runnerBaseForPort}. */
+export function runnerWsBaseForPort(port: number | string): string {
+  return `ws://${RUNNER_API_HOST}:${port}`;
+}
+
 let _apiPort: number = injectedApiPort();
-let _apiBase: string = `http://localhost:${_apiPort}`;
-let _wsBase: string = `ws://localhost:${_apiPort}`;
+let _apiBase: string = runnerBaseForPort(_apiPort);
+let _wsBase: string = runnerWsBaseForPort(_apiPort);
 
 const portChangeListeners = new Set<() => void>();
 
 export function setApiPort(port: number) {
   if (port === _apiPort) return;
   _apiPort = port;
-  _apiBase = `http://localhost:${port}`;
-  _wsBase = `ws://localhost:${port}`;
+  _apiBase = runnerBaseForPort(port);
+  _wsBase = runnerWsBaseForPort(port);
   for (const listener of portChangeListeners) {
     try {
       listener();

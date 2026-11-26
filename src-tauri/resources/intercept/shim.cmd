@@ -63,7 +63,8 @@ for %%X in (cmd exe bat) do (
     for %%D in ("%PATH:;=" "%") do (
       if not defined REAL (
         set "DENTRY=%%~D"
-        if /I not "!DENTRY!"=="%SHIM_DIR%" (
+        call :is_qontinui_shim_dir
+        if "!DSKIP!"=="0" (
           if exist "!DENTRY!\%TOOL%.%%X" set "REAL=!DENTRY!\%TOOL%.%%X"
         )
       )
@@ -88,6 +89,8 @@ if "%QONTINUI_INSTALL_INTERCEPT_GUARD%"=="1" (
   exit /b 127
 )
 :resolved
+rem The PATH-walk scratch variables must not reach the real tool's env.
+for %%V in (DENTRY DTRIM DNAME DSKIP) do set "%%V="
 
 rem ---- recursion guard -----------------------------------------------------
 if "%QONTINUI_INSTALL_INTERCEPT_GUARD%"=="1" goto :passthrough
@@ -195,3 +198,43 @@ if defined REAL (
   call %TOOL% %*
 )
 endlocal & exit /b %ERRORLEVEL%
+
+rem ---- is_qontinui_shim_dir: DSKIP=1 when DENTRY is ANY qontinui shim dir ---
+rem Not only our own SHIM_DIR: a PATH inherited from another runner session
+rem carries THAT session's qontinui-identity-*/qontinui-shim-* dir too, and
+rem resolving its shim as the "real" tool made two shims dispatch to each other
+rem for ever (plan 2026-11-04-identity-shim-foreign-shim-ping-pong-and-
+rem secondary-runner-pty-socket-overflow, Phase 1). The same predicate as
+rem intercept_core::shim_dir::is_qontinui_shim_dir: the dir's final name starts
+rem with qontinui-identity- or qontinui-shim-, or it holds the identity-build
+rem marker. Trailing separators are ignored. An EMPTY entry (a doubled or
+rem trailing `;`) is skipped, as the bash templates and the native stub skip
+rem it: probing it would test `\<tool>.cmd` at the root of the current drive.
+:is_qontinui_shim_dir
+set "DSKIP=0"
+if not defined DENTRY (
+  set "DSKIP=1"
+  exit /b 0
+)
+if /I "!DENTRY!"=="%SHIM_DIR%" set "DSKIP=1"
+set "DTRIM=!DENTRY!"
+:is_qontinui_shim_dir_trim
+if not defined DTRIM exit /b 0
+if "!DTRIM:~-1!"=="\" (
+  set "DTRIM=!DTRIM:~0,-1!"
+  goto :is_qontinui_shim_dir_trim
+)
+if "!DTRIM:~-1!"=="/" (
+  set "DTRIM=!DTRIM:~0,-1!"
+  goto :is_qontinui_shim_dir_trim
+)
+rem A drive root (C:\ trimmed to C:) has no final name; %%~nx of C: would
+rem name the CURRENT directory on that drive instead.
+if "!DTRIM:~1!"==":" goto :is_qontinui_shim_dir_marker
+set "DNAME="
+for %%N in ("!DTRIM!") do set "DNAME=%%~nxN"
+if /I "!DNAME:~0,18!"=="qontinui-identity-" set "DSKIP=1"
+if /I "!DNAME:~0,14!"=="qontinui-shim-" set "DSKIP=1"
+:is_qontinui_shim_dir_marker
+if exist "!DTRIM!\.qontinui-identity-build" set "DSKIP=1"
+exit /b 0

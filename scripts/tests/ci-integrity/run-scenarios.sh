@@ -79,7 +79,7 @@ STUB
 chmod +x "$HERE/bin/python3"
 
 run_case () {
-  local name="$1" want_rc="$2" want_comment="$3" want_text="${4:-}"
+  local name="$1" want_rc="$2" want_comment="$3" want_text="${4:-}" forbid_text="${5:-}"
   rm -f "$FIXTURE/comment.log"
   export RUNNER_TEMP="$FIXTURE/tmp"; mkdir -p "$RUNNER_TEMP"
   export GITHUB_STEP_SUMMARY="$FIXTURE/summary.md"; : > "$GITHUB_STEP_SUMMARY"
@@ -99,6 +99,9 @@ run_case () {
 $(cat "$GITHUB_STEP_SUMMARY" 2>/dev/null)"
   if [ -n "$want_text" ] && ! grep -qF -- "$want_text" <<< "$out"; then
     ok=0; why="$why; missing text '$want_text'"
+  fi
+  if [ -n "$forbid_text" ] && grep -qF -- "$forbid_text" <<< "$out"; then
+    ok=0; why="$why; forbidden text '$forbid_text' present"
   fi
   if [ "$ok" -eq 1 ]; then
     echo "  PASS  $name"; PASS=$((PASS+1))
@@ -136,6 +139,34 @@ new_fixture
 printf '.github/actions/some-new-action/action.yml\n' > "$FIXTURE/files.txt"
 run_case "C a brand-new composite action is guarded" 1 no "without declaring it"
 
+# The trigger's one exact path, end to end through the shell. A `paths:` entry
+# with no `case` arm fires the run and then drops the path, which reads as green.
+# test-surface.py section 7 compares the two lists; this proves the arm that is
+# there actually lets the path through. The findings are stubbed like every other
+# scenario, so the token is asserted as the shell handles it, not as it is derived.
+new_fixture
+printf 'scripts/check_untimed_subprocess.py\n' > "$FIXTURE/files.txt"
+run_case "S1 the exact gating script alone is guarded" 1 no "without declaring it"
+
+new_fixture
+printf 'scripts/check_untimed_subprocess.py\n' > "$FIXTURE/files.txt"
+finding CHANGED scripts/check_untimed_subprocess.py check_untimed_subprocess#file
+printf 'ci:gate-change=declared\n' > "$FIXTURE/labels.txt"
+printf 'Gate-Change: check_untimed_subprocess#file\n' > "$FIXTURE/body.txt"
+run_case "S2 naming it does not excuse the weak label" 1 no "--add-label 'ci:gate-change=alters-a-gate'"
+
+new_fixture
+printf 'scripts/check_untimed_subprocess.py\n' > "$FIXTURE/files.txt"
+finding CHANGED scripts/check_untimed_subprocess.py check_untimed_subprocess#file
+printf 'ci:gate-change=alters-a-gate\n' > "$FIXTURE/labels.txt"
+printf 'Gate-Change: check_untimed_subprocess#file\n' > "$FIXTURE/body.txt"
+run_case "S3 ...and passes once it is declared and named" 0 yes "check_untimed_subprocess#file"
+
+# Matched exactly: a neighbour of the gating script is not a gate.
+new_fixture
+printf 'scripts/check_untimed_subprocess.py.bak\nscripts/check_untimed_subprocess_helper.py\n' > "$FIXTURE/files.txt"
+run_case "S4 a lookalike of the exact path is not a hit" 0 no "No gating workflow modified"
+
 # --- additive path -----------------------------------------------------------
 new_fixture
 printf '.github/workflows/ci.yml\n' > "$FIXTURE/files.txt"
@@ -143,6 +174,36 @@ run_case "D additive change, undeclared -> RED" 1 no "without declaring it"
 
 printf 'ci:gate-change=declared\n' > "$FIXTURE/labels.txt"
 run_case "E additive change, declared -> green + notification" 0 yes "purely additive"
+
+# --- the undeclared remedy must be the one that will actually pass ------------
+# qontinui-runner#2485: an undeclared PR altering a composite action's `runs:`
+# was told to apply `declared`. That remedy can only produce a second red.
+new_fixture
+printf '.github/workflows/ci.yml\n' > "$FIXTURE/files.txt"
+run_case "D1 undeclared + additive -> remedy is the weak label" 1 no \
+  "--add-label 'ci:gate-change=declared'" "alters-a-gate"
+
+finding CHANGED ".github/workflows/ci.yml" "ci#security"
+run_case "D2 undeclared + altered -> remedy is the strong label" 1 no \
+  "--add-label 'ci:gate-change=alters-a-gate'" "--add-label 'ci:gate-change=declared'"
+run_case "D3 undeclared + altered -> remedy names the body line" 1 no \
+  "Gate-Change: ci#security"
+
+finding REMOVED ".github/workflows/ci.yml" "ci#seam-gate"
+run_case "D4 undeclared + removal -> remedy names Gate-Removal" 1 no \
+  "Gate-Removal: ci#seam-gate"
+
+new_fixture
+printf '.github/workflows/ci.yml\n' > "$FIXTURE/files.txt"
+printf 'ci:gate-change=declared\n' > "$FIXTURE/labels.txt"
+finding CHANGED ".github/workflows/ci.yml" "ci#security"
+printf 'Gate-Change: ci#security\n' > "$FIXTURE/body.txt"
+run_case "D5 following the printed body line without the strong label stays RED" 1 no \
+  "alters an existing gate"
+
+new_fixture
+printf '.github/workflows/ci.yml\n' > "$FIXTURE/files.txt"
+printf 'ci:gate-change=declared\n' > "$FIXTURE/labels.txt"
 
 # --- altered-surface path ----------------------------------------------------
 finding CHANGED ".github/workflows/ci.yml" "ci#security"
@@ -335,7 +396,9 @@ run_case "X9 an unreadable file count is a hard error, not a skip" 1 no "certifi
 # mechanism being added elsewhere in the run block, and it equally cannot catch
 # the FIRST one being narrowed -- tightening the `case "${f}" in
 # .github/workflows/*|.github/actions/*)` scope filter to a subdirectory would
-# un-watch paths with NON_GATING still empty and this still green.
+# un-watch paths with NON_GATING still empty and this still green. That half is
+# test-surface.py section 7's, which compares the filter's arms to the trigger and
+# rejects any arm that can drop a path before the default.
 NON_GATING_AWK='/^read -r -d .. NON_GATING <</{f=1;next} /^NONGATING$/{f=0} f'
 if [ ! -s "$BLOCK" ]; then
   echo "  FAIL  N1a NON_GATING is measurable -- the run-block did not extract, so nothing was measured"; FAIL=$((FAIL+1))

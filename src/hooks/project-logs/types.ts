@@ -50,7 +50,10 @@ export interface RawLogContent {
   source_id: string;
   source_name: string;
   lines: string[];
-  total_lines: number;
+  /** `null` unless the read covered the whole file (Rust `Option<u64>`) */
+  total_lines: number | null;
+  /** `null` when the file was not read (Rust `Option<u64>`) */
+  file_bytes: number | null;
   file_path: string;
   last_modified?: string;
   error?: string;
@@ -151,7 +154,9 @@ export function convertRawContentToTypescript(raw: RawLogContent): LogSourceCont
     sourceId: raw.source_id,
     sourceName: raw.source_name,
     lines: raw.lines,
-    totalLines: raw.total_lines,
+    // `?? null`: an absent field is unknown, and must not read as a count.
+    totalLines: raw.total_lines ?? null,
+    fileBytes: raw.file_bytes ?? null,
     filePath: raw.file_path,
     lastModified: raw.last_modified,
     error: raw.error,

@@ -1354,88 +1354,88 @@ pub async fn build_iteration_context_with_compression(
             .push_str("The runner database contains detailed execution data. Access via HTTP:\n\n");
         context.push_str("**Verification & Testing:**\n");
         context.push_str(&format!(
-            "- `curl http://localhost:9876/task-runs/{}/verification-results` - Full test results (issues, observations, raw output)\n",
+            "- `curl http://127.0.0.1:9876/task-runs/{}/verification-results` - Full test results (issues, observations, raw output)\n",
             task_run_id
         ));
         context.push_str(&format!(
-            "- `curl http://localhost:9876/task-runs/{}/verification-results?failed_only=true` - Only failed checks\n",
+            "- `curl http://127.0.0.1:9876/task-runs/{}/verification-results?failed_only=true` - Only failed checks\n",
             task_run_id
         ));
         context.push_str(&format!(
-            "- `curl http://localhost:9876/task-runs/{}/playwright-results` - Playwright test results (status, console, snapshots)\n",
+            "- `curl http://127.0.0.1:9876/task-runs/{}/playwright-results` - Playwright test results (status, console, snapshots)\n",
             task_run_id
         ));
         context.push_str(&format!(
-            "- `curl http://localhost:9876/task-runs/{}/playwright-results?status=failed` - Only failed Playwright tests\n\n",
+            "- `curl http://127.0.0.1:9876/task-runs/{}/playwright-results?status=failed` - Only failed Playwright tests\n\n",
             task_run_id
         ));
         context.push_str("**Execution History:**\n");
         context.push_str(&format!(
-            "- `curl http://localhost:9876/task-runs/{}/events` - All execution events (general, action, state changes)\n",
+            "- `curl http://127.0.0.1:9876/task-runs/{}/events` - All execution events (general, action, state changes)\n",
             task_run_id
         ));
         context.push_str(&format!(
-            "- `curl http://localhost:9876/task-runs/{}/checkpoints` - Step completion checkpoints\n",
+            "- `curl http://127.0.0.1:9876/task-runs/{}/checkpoints` - Step completion checkpoints\n",
             task_run_id
         ));
         context.push_str(&format!(
-            "- `curl http://localhost:9876/task-runs/{}/screenshots` - Screenshot paths from execution\n\n",
+            "- `curl http://127.0.0.1:9876/task-runs/{}/screenshots` - Screenshot paths from execution\n\n",
             task_run_id
         ));
         context.push_str("**Tool Calls & Integrations:**\n");
         context.push_str(&format!(
-            "- `curl http://localhost:9876/task-runs/{}/mcp-calls` - MCP tool calls (server, tool, args, response)\n",
+            "- `curl http://127.0.0.1:9876/task-runs/{}/mcp-calls` - MCP tool calls (server, tool, args, response)\n",
             task_run_id
         ));
         context.push_str(&format!(
-            "- `curl http://localhost:9876/task-runs/{}/mcp-calls?success=false` - Only failed MCP calls\n",
+            "- `curl http://127.0.0.1:9876/task-runs/{}/mcp-calls?success=false` - Only failed MCP calls\n",
             task_run_id
         ));
         context.push_str(&format!(
-            "- `curl http://localhost:9876/task-runs/{}/api-requests` - HTTP API requests made\n",
+            "- `curl http://127.0.0.1:9876/task-runs/{}/api-requests` - HTTP API requests made\n",
             task_run_id
         ));
         context.push_str(&format!(
-            "- `curl http://localhost:9876/task-runs/{}/awas-steps` - AWAS web automation steps\n\n",
+            "- `curl http://127.0.0.1:9876/task-runs/{}/awas-steps` - AWAS web automation steps\n\n",
             task_run_id
         ));
         context.push_str("**Knowledge & Findings:**\n");
         context.push_str(&format!(
-            "- `curl http://localhost:9876/task-runs/{}/knowledge` - All findings, observations, solutions\n",
+            "- `curl http://127.0.0.1:9876/task-runs/{}/knowledge` - All findings, observations, solutions\n",
             task_run_id
         ));
         context.push_str(&format!(
-            "- `curl http://localhost:9876/task-runs/{}/knowledge?category=finding` - Only findings/bugs\n",
+            "- `curl http://127.0.0.1:9876/task-runs/{}/knowledge?category=finding` - Only findings/bugs\n",
             task_run_id
         ));
         context.push_str(&format!(
-            "- `curl http://localhost:9876/task-runs/{}/knowledge?unresolved_only=true` - Unresolved issues\n\n",
+            "- `curl http://127.0.0.1:9876/task-runs/{}/knowledge?unresolved_only=true` - Unresolved issues\n\n",
             task_run_id
         ));
         context.push_str("**Task Run Info:**\n");
         context.push_str(&format!(
-            "- `curl http://localhost:9876/task-runs/{}` - Task run metadata and status\n",
+            "- `curl http://127.0.0.1:9876/task-runs/{}` - Task run metadata and status\n",
             task_run_id
         ));
         context.push_str(&format!(
-            "- `curl http://localhost:9876/task-runs/{}/output` - Full AI output log\n",
+            "- `curl http://127.0.0.1:9876/task-runs/{}/output` - Full AI output log\n",
             task_run_id
         ));
         context.push_str(&format!(
-            "- `curl http://localhost:9876/task-runs/{}/full-state` - Complete workflow state\n\n",
+            "- `curl http://127.0.0.1:9876/task-runs/{}/full-state` - Complete workflow state\n\n",
             task_run_id
         ));
         context.push_str("**Tracing & Performance:**\n");
         context.push_str(&format!(
-            "- `curl http://localhost:9876/execution-spans?execution_id={}` - Execution traces (timing, hierarchy)\n",
+            "- `curl http://127.0.0.1:9876/execution-spans?execution_id={}` - Execution traces (timing, hierarchy)\n",
             task_run_id
         ));
         context.push_str(&format!(
-            "- `curl \"http://localhost:9876/execution-spans?execution_id={}&name_pattern=workflow.%\"` - Workflow phase spans\n",
+            "- `curl \"http://127.0.0.1:9876/execution-spans?execution_id={}&name_pattern=workflow.%\"` - Workflow phase spans\n",
             task_run_id
         ));
         context.push_str(&format!(
-            "- `curl \"http://localhost:9876/execution-spans?execution_id={}&min_duration_ms=5000\"` - Slow operations (>5s)\n\n",
+            "- `curl \"http://127.0.0.1:9876/execution-spans?execution_id={}&min_duration_ms=5000\"` - Slow operations (>5s)\n\n",
             task_run_id
         ));
         context.push_str(

@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  MAXIMIZE_IN_TMUX_ERROR,
   parseZoneIndex,
   planMaximizeZone,
   planToggleMaximizeZone,
@@ -97,5 +98,27 @@ describe("buildMaximizeResult", () => {
       zoneCount: 4,
       changed: true,
     });
+  });
+});
+
+describe("maximize in tmux work mode", () => {
+  // tmux mode shows one session at full size and `useZoneLayout` ignores
+  // every maximize request there: reporting `changed: true` would be a lie.
+  it("maximize-zone is refused by name, not reported as a change", () => {
+    expect(planMaximizeZone(0, 1, "tmux")).toEqual({ ok: false, error: MAXIMIZE_IN_TMUX_ERROR });
+    expect(MAXIMIZE_IN_TMUX_ERROR).toContain("tmux work mode");
+    expect(MAXIMIZE_IN_TMUX_ERROR).toContain("set-terminal-work-mode");
+  });
+
+  it("toggle-maximize-zone is refused the same way", () => {
+    expect(planToggleMaximizeZone(0, 1, null, "tmux")).toEqual({
+      ok: false,
+      error: MAXIMIZE_IN_TMUX_ERROR,
+    });
+  });
+
+  it("grid mode plans as before", () => {
+    expect(planMaximizeZone(1, 4, "grid")).toEqual({ ok: true, next: 1 });
+    expect(planToggleMaximizeZone(1, 4, 1, "grid")).toEqual({ ok: true, next: null });
   });
 });

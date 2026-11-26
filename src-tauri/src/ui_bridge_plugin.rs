@@ -1,168 +1,22 @@
 //! Tauri plugin: `ui-bridge`
 //!
-//! Exposes IPC commands consumed by the UI Bridge SDK's `IpcLayerExecutor`:
-//!   - `plugin:ui-bridge|fs_assert`  – filesystem assertions
-//!   - `plugin:ui-bridge|db_assert`  – database (SQLite) assertions
+//! Exposes the artifact IPC commands consumed by the UI Bridge SDK's
+//! `IpcArtifactStore` (`plugin:ui-bridge|save_artifact`, `get_artifact`,
+//! `query_artifacts`, `verify_artifact` and `count_artifacts`).
 //!
 //! These commands run entirely on the Rust side so the React frontend
-//! never needs direct access to the filesystem or database.
+//! never needs direct access to the database.
 
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tauri::{
     plugin::{Builder, TauriPlugin},
     Runtime,
 };
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::commands::AppState;
 use crate::database::types::{Artifact, ArtifactCountQuery, ArtifactQuery};
-
-// ---------------------------------------------------------------------------
-// fs_assert
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FsAssertResult {
-    pub passed: bool,
-    pub exists: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub size: Option<u64>,
-}
-
-#[tauri::command]
-async fn fs_assert(
-    path: String,
-    check: String,
-    expected: Option<serde_json::Value>,
-) -> Result<FsAssertResult, String> {
-    info!("ui-bridge plugin: fs_assert path={path} check={check}");
-
-    let p = std::path::Path::new(&path);
-    let file_exists = p.exists();
-
-    match check.as_str() {
-        "exists" => Ok(FsAssertResult {
-            passed: file_exists,
-            exists: file_exists,
-            content: None,
-            size: None,
-        }),
-
-        "notExists" => Ok(FsAssertResult {
-            passed: !file_exists,
-            exists: file_exists,
-            content: None,
-            size: None,
-        }),
-
-        "contentContains" => {
-            if !file_exists {
-                return Ok(FsAssertResult {
-                    passed: false,
-                    exists: false,
-                    content: None,
-                    size: None,
-                });
-            }
-            let content =
-                std::fs::read_to_string(&path).map_err(|e| format!("Failed to read file: {e}"))?;
-            let needle = expected.as_ref().and_then(|v| v.as_str()).unwrap_or("");
-            let passed = content.contains(needle);
-            Ok(FsAssertResult {
-                passed,
-                exists: true,
-                content: Some(content),
-                size: None,
-            })
-        }
-
-        "contentEquals" => {
-            if !file_exists {
-                return Ok(FsAssertResult {
-                    passed: false,
-                    exists: false,
-                    content: None,
-                    size: None,
-                });
-            }
-            let content =
-                std::fs::read_to_string(&path).map_err(|e| format!("Failed to read file: {e}"))?;
-            let expected_str = expected.as_ref().and_then(|v| v.as_str()).unwrap_or("");
-            let passed = content == expected_str;
-            Ok(FsAssertResult {
-                passed,
-                exists: true,
-                content: Some(content),
-                size: None,
-            })
-        }
-
-        "sizeGreaterThan" => {
-            if !file_exists {
-                return Ok(FsAssertResult {
-                    passed: false,
-                    exists: false,
-                    content: None,
-                    size: None,
-                });
-            }
-            let meta = std::fs::metadata(&path)
-                .map_err(|e| format!("Failed to get file metadata: {e}"))?;
-            let size = meta.len();
-            let threshold: u64 = expected.as_ref().and_then(|v| v.as_u64()).unwrap_or(0);
-            let passed = size > threshold;
-            Ok(FsAssertResult {
-                passed,
-                exists: true,
-                content: None,
-                size: Some(size),
-            })
-        }
-
-        other => Err(format!("Unknown fs_assert check type: {other}")),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// db_assert
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DbAssertResult {
-    pub passed: bool,
-    pub row_count: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rows: Option<Vec<serde_json::Value>>,
-}
-
-#[tauri::command]
-async fn db_assert(
-    state: tauri::State<'_, Arc<AppState>>,
-    query: String,
-    connection_ref: Option<String>,
-    expected_rows: Option<i64>,
-    expected_values: Option<Vec<serde_json::Value>>,
-) -> Result<DbAssertResult, String> {
-    info!("ui-bridge plugin: db_assert query={query} connection_ref={connection_ref:?}");
-
-    if let Some(ref cref) = connection_ref {
-        warn!("db_assert: connection_ref '{cref}' ignored – using runner's checkpoint DB");
-    }
-
-    // db_assert: SQLite-based assertions removed. Return an error indicating
-    // this feature needs PG migration.
-    let _ = (state, expected_rows, expected_values);
-    Err(format!(
-        "db_assert not supported: SQLite checkpoint DB removed. Query: {}",
-        query
-    ))
-}
 
 // ---------------------------------------------------------------------------
 // Artifact commands (IpcArtifactStore)
@@ -298,8 +152,6 @@ async fn count_artifacts(
 pub fn init<R: Runtime>() -> TauriPlugin<R> {
     Builder::new("ui-bridge")
         .invoke_handler(tauri::generate_handler![
-            fs_assert,
-            db_assert,
             save_artifact,
             get_artifact,
             query_artifacts,

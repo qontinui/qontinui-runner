@@ -39,6 +39,18 @@ export interface SessionBoundPayload {
   providerReported?: boolean;
 }
 
+/**
+ * The form two spellings of one config dir share, mirroring Rust's
+ * `config_dir_compare_key` (`session_archive/discovery.rs`): trimmed,
+ * backslashes folded to `/`, trailing slashes dropped, and lowercased only for
+ * a Windows-style drive path (the frontend has no platform flag; a drive
+ * letter is the same evidence). Compare-only, never a path to open.
+ */
+export function configDirCompareKey(configDir: string): string {
+  const p = configDir.trim().replace(/\\/g, "/").replace(/\/+$/, "");
+  return /^[a-z]:(\/|$)/i.test(p) ? p.toLowerCase() : p;
+}
+
 /** The tab update a `session-bound` event resolves to. */
 export interface SessionBoundUpdate {
   tabId: string;
@@ -55,10 +67,19 @@ export interface SessionBoundUpdate {
  *
  * Returns `null` (no-op) when:
  *  - no tab matches the payload's terminal id (tab closed / other window),
- *  - the tab already holds the SAME id (nothing to change), or
+ *  - the tab already holds the SAME id and the payload carries no config dir,
+ *    or the one the tab already holds (nothing to change), or
  *  - the tab holds a DIFFERENT id and the bind is not provider-reported — the
  *    launch-menu pin / resume path stays put, and no runner INFERENCE may
  *    overwrite it.
+ *
+ * A payload for the SAME id with a non-empty config dir that differs from the
+ * tab's re-stamps ONLY the config dir (the session id is returned unchanged).
+ * That is the runner's config-dir repair (`reconcile/config_dir_repair.rs`):
+ * the record's account was corrected from the pane's own provider row, and the
+ * tab must follow it, or the next restore types the wrong account's wrapper.
+ * It is runner-inferred, so it is not gated on `providerReported`; it moves no
+ * session id, which is what that gate protects.
  *
  * It DOES re-stamp when the tab holds a different id and the provider itself
  * reported the new one. The previous rule bailed on the mere PRESENCE of a
@@ -92,7 +113,20 @@ export function applySessionBound(
   if (!payload.terminalId || !payload.sessionId) return null;
   const tab = tabs.find((t) => t.id === payload.terminalId);
   if (!tab) return null;
-  if (tab.claudeSessionId === payload.sessionId) return null;
+  if (tab.claudeSessionId === payload.sessionId) {
+    if (!payload.configDir) return null;
+    if (
+      tab.claudeConfigDir &&
+      configDirCompareKey(payload.configDir) === configDirCompareKey(tab.claudeConfigDir)
+    ) {
+      return null;
+    }
+    return {
+      tabId: tab.id,
+      claudeSessionId: tab.claudeSessionId,
+      claudeConfigDir: payload.configDir,
+    };
+  }
   if (tab.claudeSessionId && payload.providerReported !== true) return null;
   return {
     tabId: tab.id,

@@ -246,8 +246,8 @@ const MODIFIER_FIELD_ROSTER: Record<string, string> = {
     "F3 / Shift+F3 pick the find direction. Shift-only, and `matchesChord` cannot " +
     "express a shift-only chord — see keyClaimScan.ts::CONTROL_TAGS.",
   "components/terminal/TerminalInstance.tsx":
-    "xterm `attachCustomKeyEventHandler` — clipboard + find, PTY-scoped. Inventoried " +
-    "in KNOWN_KEY_CLAIMS.",
+    "xterm `attachCustomKeyEventHandler` — clipboard + find, PTY-scoped (the paste " +
+    "chord's test is delegated to pasteChord.ts). Inventoried in KNOWN_KEY_CLAIMS.",
   "components/terminal/TerminalPageTabBar.tsx":
     "Alt+←/→ reorders the FOCUSED page tab — the non-drag alternative WCAG 2.5.7 " +
     "requires for drag-to-reorder. An ELEMENT-scoped `onKeyDown` on the tab button, " +
@@ -259,6 +259,10 @@ const MODIFIER_FIELD_ROSTER: Record<string, string> = {
   "components/terminal/ZoneControlPanel.tsx": "textarea: Enter submits, Shift+Enter newlines",
   "components/terminal/ZoneGrid.tsx":
     "Ctrl/Cmd+CLICK multi-selects a zone. A pointer modifier, not a key chord.",
+  "components/terminal/pasteChord.ts":
+    "the Ctrl/Cmd+V paste chord, consumed by TerminalInstance's xterm handler, which " +
+    "cancels the keystroke so no second, native paste follows. Inventoried in " +
+    "KNOWN_KEY_CLAIMS.",
   "components/terminal/scrollKeys.ts":
     "VS Code-parity scrollback navigation, consumed by TerminalInstance's xterm " +
     "handler. Eight ELEMENT-scoped claims, inventoried in KNOWN_KEY_CLAIMS.",
@@ -333,6 +337,7 @@ const KEY_FIELD_ROSTER: readonly string[] = [
   "components/activity-timeline/ActivityTimelinePanel.tsx",
   "components/api-request-builder/AiApiRequestGenerator.tsx",
   "components/architecture-view/ArchitectureView.tsx",
+  "components/connection-wizard/VerificationStep.tsx",
   "components/contexts/ContextCard.tsx",
   "components/contexts/ContextEditor.tsx",
   "components/contexts/ContextList.tsx",
@@ -385,6 +390,7 @@ const KEY_FIELD_ROSTER: readonly string[] = [
   "components/settings/DiscoverySettings.tsx",
   "components/settings/McpSettings.tsx",
   "components/settings/NotificationSettings.tsx",
+  "components/settings/PhysicalDeviceManager.tsx",
   "components/settings/RunnerInstancesSettings.tsx",
   "components/settings/WsvCalibrationSection.tsx",
   "components/settings/performanceCapsConfig.test.ts",
@@ -446,12 +452,14 @@ const KEY_FIELD_ROSTER: readonly string[] = [
   "components/terminal/terminalTextPayload.ts",
   "components/terminal/terminalWriteResult.test.ts",
   "components/terminal/terminalWriteResult.ts",
+  "components/terminal/useFleetSessions.ts",
   "components/terminal/useKeyboardShortcuts.ts",
   "components/terminal/useMidSessionProbe.ts",
   "components/terminal/useSessionInfo.test.ts",
   "components/terminal/writePtyById.test.ts",
   "components/terminal/writeWhenReady.test.ts",
   "components/terminal/zone-grid/CompactZoneCard.tsx",
+  "components/terminal/zone-grid/ZoneCell.tsx",
   "components/terminal/zone-grid/ZoneContextMenu.tsx",
   "components/terminal/zone-grid/ZoneLabel.tsx",
   "components/triggers/TriggerHistory.tsx",
@@ -504,6 +512,7 @@ const KEY_FIELD_ROSTER: readonly string[] = [
   "components/workflow-builder/StageSelector.tsx",
   "components/workflow-builder/StepItem.tsx",
   "components/workflow-builder/WorkflowBuilderTab.tsx",
+  "components/workflow-builder/skillTransferNotice.ts",
   "components/workflow-builder/step-config/CommandConfig.tsx",
   "components/workflow-builder/step-config/DataFlowSection.tsx",
   "components/workflow-versions/WorkflowVersionLineage.tsx",
@@ -528,6 +537,7 @@ const KEY_FIELD_ROSTER: readonly string[] = [
   "lib/ui-bridge/guardedHandler.ts",
   "lib/ui-bridge/use-discovered-specs.ts",
   "lib/utils.ts",
+  "lib/vision-api.ts",
   "lib/workflow-builder/buildSpecWorkflow.ts",
   "pages/specs/ApiOverview.tsx",
   "pages/specs/ConnectionBar.tsx",
@@ -562,6 +572,9 @@ const NON_DOM_CHORD_ROSTER: Record<string, string> = {
   "components/terminal/KeyboardShortcutsOverlay.tsx":
     "the shortcut cheat-sheet — 37 chord spellings rendered as help text. Documentation " +
     "of the table, not a second claimant of it.",
+  "components/terminal/pasteChord.test.ts":
+    "unit test for pasteChord.ts — constructs the Ctrl/Cmd+V KeyboardEvents it asserts " +
+    "on. Claims nothing.",
   "lib/globalChords.enforcement.test.ts":
     "THIS FILE. Its allowlists spell chords (`ctrl+shift+g`, `shift+pageup`) as the " +
     "inventory it pins. Scanned rather than exempted, for the same reason it is on the " +
@@ -690,7 +703,9 @@ const KNOWN_KEY_CLAIMS: Record<string, string[]> = {
   "components/scheduler/AiScheduleBuilder.tsx": ["ctrl+enter"],
   // xterm `attachCustomKeyEventHandler` — clipboard + find, PTY-scoped.
   // Bare F3 / Shift+F3 also handled there; a bare key is not a chord claim.
-  "components/terminal/TerminalInstance.tsx": ["ctrl+c", "ctrl+f", "ctrl+shift+c", "ctrl+v"],
+  "components/terminal/TerminalInstance.tsx": ["ctrl+c", "ctrl+f", "ctrl+shift+c"],
+  // The Ctrl/Cmd+V paste chord, consumed by `TerminalInstance`'s xterm handler.
+  "components/terminal/pasteChord.ts": ["ctrl+v"],
   // Alt+←/→ reorders the focused page tab (WCAG 2.5.7 non-drag alternative).
   // Element-scoped: fires only while that tab button has focus.
   "components/terminal/TerminalPageTabBar.tsx": ["alt+arrowleft", "alt+arrowright"],

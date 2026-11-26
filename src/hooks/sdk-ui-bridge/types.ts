@@ -29,18 +29,50 @@ export interface SdkAppInfo {
   appId: string;
   appName: string;
   appType: string;
-  framework?: string;
-  version?: string;
+  /** `null` from the runner when unknown; may be omitted in a connect request. */
+  framework?: string | null;
+  version?: string | null;
   capabilities: string[];
   port: number;
 }
 
-/** Information about a single SDK connection */
+/**
+ * What a stored connection's client does with the operator's bearer
+ * (`ConnectionBearer` in `src-tauri/src/mcp/sdk_client.rs`). Decided at the
+ * handshake, or settled by the runner's later bearer re-check. It is the
+ * decision, never the token.
+ */
+export type SdkConnectionBearer =
+  | "sent"
+  | "withheld_from_target"
+  | "withheld_list_unreadable"
+  | "absent";
+
+/**
+ * One entry of `GET /ui-bridge/sdk/status` `allConnections` and of
+ * `GET /ui-bridge/sdk/connections` — the runner's `ConnectionInfo`.
+ */
 export interface SdkConnectionInfo {
   url: string;
   app: SdkAppInfo;
   connectedAt: number;
+  /**
+   * Whether a dispatch would use this connection. The stored active connection
+   * reads `false` while its client would send the operator's bearer off this
+   * machine.
+   */
   isActive: boolean;
+  /** The origin the activating registration was verified at, if any. */
+  verifiedOrigin: string | null;
+  /** The activating principal's class (`operator_trust` when none recorded). */
+  principalClass: string;
+  /** Explains a device's 401, or a refused switch to this connection. */
+  bearer: SdkConnectionBearer;
+  /**
+   * Whether this client would send the operator's bearer to a port that now
+   * forwards off this machine. Such a connection is never used, active or not.
+   */
+  sendsBearerOffMachine: boolean;
 }
 
 export interface CommandHistoryEntry {

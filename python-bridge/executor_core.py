@@ -403,20 +403,6 @@ class ExecutorCore:
 
     def _initialize_executors(self):
         """Initialize StateExecutor and ActionExecutor."""
-        # DEBUG: Log to file
-        import os
-        import tempfile
-
-        debug_log_path = os.path.join(tempfile.gettempdir(), "qontinui_init_executors_debug.log")
-        try:
-            with open(debug_log_path, "a") as f:
-                from datetime import datetime
-
-                f.write(f"\n=== _INITIALIZE_EXECUTORS DEBUG {datetime.now()} ===\n")
-                f.flush()
-        except Exception:
-            pass
-
         try:
             # Parse JSON config into QontinuiConfig object
             config_parser = ConfigParser()
@@ -445,14 +431,6 @@ class ExecutorCore:
         except Exception as e:
             self.emit_log("error", f"Failed to initialize StateExecutor: {e}")
             self.emit_log("debug", f"Traceback: {traceback.format_exc()}")
-            # DEBUG: Write error to file
-            try:
-                with open(debug_log_path, "a") as f:
-                    f.write(f"EXCEPTION: {e}\n")
-                    f.write(f"TRACEBACK:\n{traceback.format_exc()}\n")
-                    f.flush()
-            except Exception:
-                pass
             self.action_executor = None
             self.state_executor = None
 

@@ -65,6 +65,20 @@ pub enum UnifiedWorkflowState {
         /// already produces for that resume.
         #[serde(default)]
         any_passed: bool,
+        /// Whether a stage of this run before this write ended
+        /// `NoVerificationSteps`, i.e. its verification checked nothing. This is
+        /// the run's latch (`LoopController::stages_checked_nothing`): it keeps
+        /// the workflow from reporting passed, whatever the other stages did.
+        ///
+        /// It is not a constructor parameter. Every constructor writes `false`,
+        /// and `persist_workflow_state`, the one writer of this row, stamps the
+        /// run's value through [`UnifiedWorkflowState::with_checked_nothing`].
+        /// So no call site can forget it, the same guarantee the required
+        /// `any_passed` parameter gives that accumulator. A resume reads it back
+        /// (`ResumeManager::prior_stages_checked_nothing`). `#[serde(default)]`:
+        /// a row written before the field existed reads `false`.
+        #[serde(default)]
+        any_checked_nothing: bool,
     },
 
     /// Setup phase completed successfully.
@@ -84,6 +98,10 @@ pub enum UnifiedWorkflowState {
         /// stage, and what `#[serde(default)]` does and does not guarantee.
         #[serde(default)]
         any_passed: bool,
+        /// The run's `NoVerificationSteps` latch as of this write. See
+        /// [`UnifiedWorkflowState::SetupRunning::any_checked_nothing`].
+        #[serde(default)]
+        any_checked_nothing: bool,
     },
 
     /// Verification phase completed for this iteration.
@@ -105,6 +123,10 @@ pub enum UnifiedWorkflowState {
         /// stage, and what `#[serde(default)]` does and does not guarantee.
         #[serde(default)]
         any_passed: bool,
+        /// The run's `NoVerificationSteps` latch as of this write. See
+        /// [`UnifiedWorkflowState::SetupRunning::any_checked_nothing`].
+        #[serde(default)]
+        any_checked_nothing: bool,
     },
 
     /// Agentic phase is running (AI fixing issues).
@@ -121,6 +143,10 @@ pub enum UnifiedWorkflowState {
         /// stage, and what `#[serde(default)]` does and does not guarantee.
         #[serde(default)]
         any_passed: bool,
+        /// The run's `NoVerificationSteps` latch as of this write. See
+        /// [`UnifiedWorkflowState::SetupRunning::any_checked_nothing`].
+        #[serde(default)]
+        any_checked_nothing: bool,
     },
 
     /// Agentic phase completed for this iteration.
@@ -137,6 +163,10 @@ pub enum UnifiedWorkflowState {
         /// stage, and what `#[serde(default)]` does and does not guarantee.
         #[serde(default)]
         any_passed: bool,
+        /// The run's `NoVerificationSteps` latch as of this write. See
+        /// [`UnifiedWorkflowState::SetupRunning::any_checked_nothing`].
+        #[serde(default)]
+        any_checked_nothing: bool,
     },
 
     /// A stage completed in a multi-stage workflow.
@@ -164,6 +194,10 @@ pub enum UnifiedWorkflowState {
         /// tell a resumed run that earlier stages passed.
         #[serde(default)]
         any_passed: bool,
+        /// The run's `NoVerificationSteps` latch as of this write. See
+        /// [`UnifiedWorkflowState::SetupRunning::any_checked_nothing`].
+        #[serde(default)]
+        any_checked_nothing: bool,
     },
 
     /// Waiting for human approval before proceeding.
@@ -184,6 +218,10 @@ pub enum UnifiedWorkflowState {
         /// stage, and what `#[serde(default)]` does and does not guarantee.
         #[serde(default)]
         any_passed: bool,
+        /// The run's `NoVerificationSteps` latch as of this write. See
+        /// [`UnifiedWorkflowState::SetupRunning::any_checked_nothing`].
+        #[serde(default)]
+        any_checked_nothing: bool,
     },
 
     /// Completion phase is running.
@@ -212,6 +250,10 @@ pub enum UnifiedWorkflowState {
         /// arm.
         #[serde(default)]
         any_passed: bool,
+        /// The run's `NoVerificationSteps` latch as of this write. See
+        /// [`UnifiedWorkflowState::SetupRunning::any_checked_nothing`].
+        #[serde(default)]
+        any_checked_nothing: bool,
     },
 
     /// Completion phase finished (workflow done).
@@ -341,6 +383,7 @@ impl UnifiedWorkflowState {
         UnifiedWorkflowState::SetupRunning {
             stage_index,
             any_passed,
+            any_checked_nothing: false,
         }
     }
 
@@ -365,6 +408,7 @@ impl UnifiedWorkflowState {
             iteration,
             stage_index,
             any_passed,
+            any_checked_nothing: false,
         }
     }
 
@@ -388,6 +432,7 @@ impl UnifiedWorkflowState {
             passed,
             stage_index,
             any_passed,
+            any_checked_nothing: false,
         }
     }
 
@@ -403,6 +448,7 @@ impl UnifiedWorkflowState {
             iteration,
             stage_index,
             any_passed,
+            any_checked_nothing: false,
         }
     }
 
@@ -418,6 +464,7 @@ impl UnifiedWorkflowState {
             iteration,
             stage_index,
             any_passed,
+            any_checked_nothing: false,
         }
     }
 
@@ -429,6 +476,7 @@ impl UnifiedWorkflowState {
         UnifiedWorkflowState::StageComplete {
             stage_index,
             any_passed,
+            any_checked_nothing: false,
         }
     }
 
@@ -446,12 +494,16 @@ impl UnifiedWorkflowState {
             approval_id: approval_id.into(),
             prompt: prompt.into(),
             any_passed,
+            any_checked_nothing: false,
         }
     }
 
     /// Create a CompletionRunning state.
     pub fn completion_running(any_passed: bool) -> Self {
-        UnifiedWorkflowState::CompletionRunning { any_passed }
+        UnifiedWorkflowState::CompletionRunning {
+            any_passed,
+            any_checked_nothing: false,
+        }
     }
 
     /// Create a CompletionComplete state.
@@ -495,6 +547,57 @@ impl UnifiedWorkflowState {
             phase: Some(phase.into()),
             iteration,
         }
+    }
+
+    /// Stamp the run's `NoVerificationSteps` latch on a state that carries the
+    /// run's accumulators. Every other state is returned unchanged.
+    ///
+    /// `persist_workflow_state`, the one writer of the state row, calls this on
+    /// every state it writes, so the latch outlives the row a later write
+    /// overwrites. See [`UnifiedWorkflowState::SetupRunning::any_checked_nothing`].
+    /// The match is exhaustive on purpose: a new variant must say whether it
+    /// carries the latch.
+    pub fn with_checked_nothing(mut self, latched: bool) -> Self {
+        match &mut self {
+            UnifiedWorkflowState::SetupRunning {
+                any_checked_nothing,
+                ..
+            }
+            | UnifiedWorkflowState::VerificationRunning {
+                any_checked_nothing,
+                ..
+            }
+            | UnifiedWorkflowState::VerificationComplete {
+                any_checked_nothing,
+                ..
+            }
+            | UnifiedWorkflowState::AgenticRunning {
+                any_checked_nothing,
+                ..
+            }
+            | UnifiedWorkflowState::AgenticComplete {
+                any_checked_nothing,
+                ..
+            }
+            | UnifiedWorkflowState::StageComplete {
+                any_checked_nothing,
+                ..
+            }
+            | UnifiedWorkflowState::ApprovalPending {
+                any_checked_nothing,
+                ..
+            }
+            | UnifiedWorkflowState::CompletionRunning {
+                any_checked_nothing,
+                ..
+            } => *any_checked_nothing = latched,
+            UnifiedWorkflowState::Created
+            | UnifiedWorkflowState::SetupComplete
+            | UnifiedWorkflowState::CompletionComplete
+            | UnifiedWorkflowState::Failed { .. }
+            | UnifiedWorkflowState::Stopped { .. } => {}
+        }
+        self
     }
 
     /// Check if the workflow is in a "complete" state (passed verification and ran completion).
@@ -590,6 +693,7 @@ impl std::fmt::Display for UnifiedWorkflowState {
             UnifiedWorkflowState::StageComplete {
                 stage_index,
                 any_passed,
+                ..
             } => {
                 write!(
                     f,
@@ -640,11 +744,7 @@ mod tests {
     fn test_state_names() {
         assert_eq!(UnifiedWorkflowState::Created.name(), "created");
         assert_eq!(
-            UnifiedWorkflowState::SetupRunning {
-                stage_index: None,
-                any_passed: false
-            }
-            .name(),
+            UnifiedWorkflowState::setup_running(None, false).name(),
             "setup_running"
         );
         assert_eq!(
@@ -657,11 +757,7 @@ mod tests {
     #[test]
     fn test_terminal_states() {
         assert!(!UnifiedWorkflowState::Created.is_terminal());
-        assert!(!UnifiedWorkflowState::SetupRunning {
-            stage_index: None,
-            any_passed: false
-        }
-        .is_terminal());
+        assert!(!UnifiedWorkflowState::setup_running(None, false).is_terminal());
         assert!(!UnifiedWorkflowState::verification_running(1, None, false).is_terminal());
         assert!(UnifiedWorkflowState::CompletionComplete.is_terminal());
         assert!(UnifiedWorkflowState::failed("error").is_terminal());
@@ -671,14 +767,10 @@ mod tests {
     #[test]
     fn test_resumable_states() {
         assert!(!UnifiedWorkflowState::Created.is_resumable());
-        assert!(UnifiedWorkflowState::SetupRunning {
-            stage_index: None,
-            any_passed: false
-        }
-        .is_resumable());
+        assert!(UnifiedWorkflowState::setup_running(None, false).is_resumable());
         assert!(UnifiedWorkflowState::verification_running(1, None, false).is_resumable());
         assert!(UnifiedWorkflowState::agentic_running(1, None, false).is_resumable());
-        assert!(UnifiedWorkflowState::CompletionRunning { any_passed: true }.is_resumable());
+        assert!(UnifiedWorkflowState::completion_running(true).is_resumable());
         assert!(!UnifiedWorkflowState::CompletionComplete.is_resumable());
         assert!(!UnifiedWorkflowState::failed("error").is_resumable());
     }
@@ -687,11 +779,7 @@ mod tests {
     fn test_phase_and_iteration() {
         assert_eq!(UnifiedWorkflowState::Created.phase(), None);
         assert_eq!(
-            UnifiedWorkflowState::SetupRunning {
-                stage_index: None,
-                any_passed: false
-            }
-            .phase(),
+            UnifiedWorkflowState::setup_running(None, false).phase(),
             Some("setup")
         );
         assert_eq!(
@@ -727,12 +815,64 @@ mod tests {
     fn test_stage_complete_without_any_passed_still_deserializes() {
         let legacy = r#"{"type":"stage_complete","stage_index":1}"#;
         let parsed: UnifiedWorkflowState = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed, UnifiedWorkflowState::stage_complete(1, false));
+    }
+
+    /// Every state that carries the run's accumulators carries the latch once
+    /// stamped, and serializes it, so a resume can read it back.
+    #[test]
+    fn with_checked_nothing_stamps_every_state_that_carries_the_accumulators() {
+        let carriers = vec![
+            UnifiedWorkflowState::setup_running(Some(1), true),
+            UnifiedWorkflowState::verification_running(2, Some(1), true),
+            UnifiedWorkflowState::verification_complete(2, true, Some(1), true),
+            UnifiedWorkflowState::agentic_running(2, Some(1), true),
+            UnifiedWorkflowState::agentic_complete(2, Some(1), true),
+            UnifiedWorkflowState::stage_complete(1, true),
+            UnifiedWorkflowState::approval_pending(2, Some(1), "a-1", "ok?", true),
+            UnifiedWorkflowState::completion_running(true),
+        ];
+        assert_eq!(carriers.len(), 8);
+        for state in carriers {
+            let unstamped = serde_json::to_string(&state).unwrap();
+            assert!(
+                unstamped.contains("\"any_checked_nothing\":false"),
+                "a constructor writes false: {}",
+                unstamped
+            );
+            let stamped = serde_json::to_string(&state.with_checked_nothing(true)).unwrap();
+            assert!(
+                stamped.contains("\"any_checked_nothing\":true"),
+                "stamped row lost the latch: {}",
+                stamped
+            );
+            assert!(stamped.contains("\"any_passed\":true"), "{}", stamped);
+        }
+    }
+
+    /// States that carry no accumulator are returned unchanged.
+    #[test]
+    fn with_checked_nothing_leaves_other_states_alone() {
+        for state in [
+            UnifiedWorkflowState::Created,
+            UnifiedWorkflowState::setup_complete(),
+            UnifiedWorkflowState::completion_complete(),
+            UnifiedWorkflowState::failed_in_phase("boom", "verification", Some(1)),
+            UnifiedWorkflowState::stopped(),
+        ] {
+            assert_eq!(state.clone().with_checked_nothing(true), state);
+        }
+    }
+
+    /// A row written before the latch existed deserializes, reading `false`.
+    #[test]
+    fn a_row_without_the_latch_reads_false() {
+        let legacy =
+            r#"{"type":"verification_running","iteration":2,"stage_index":1,"any_passed":true}"#;
+        let parsed: UnifiedWorkflowState = serde_json::from_str(legacy).unwrap();
         assert_eq!(
             parsed,
-            UnifiedWorkflowState::StageComplete {
-                stage_index: 1,
-                any_passed: false,
-            }
+            UnifiedWorkflowState::verification_running(2, Some(1), true)
         );
     }
 

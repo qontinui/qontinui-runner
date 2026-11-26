@@ -148,7 +148,7 @@ impl ProcessManager {
         }
 
         // Set the model cache directory for lazy loading
-        if let Ok(app_data_dir) = self.app_handle.path().app_data_dir() {
+        if let Some(app_data_dir) = qontinui_runner_lib::instance_env::runner_app_data_dir() {
             let models_dir = app_data_dir.join("models");
             cmd.env(
                 "QONTINUI_MODELS_DIR",
@@ -203,7 +203,7 @@ impl ProcessManager {
         }
 
         // Set the model cache directory for lazy loading
-        if let Ok(app_data_dir) = self.app_handle.path().app_data_dir() {
+        if let Some(app_data_dir) = qontinui_runner_lib::instance_env::runner_app_data_dir() {
             let models_dir = app_data_dir.join("models");
             cmd.env(
                 "QONTINUI_MODELS_DIR",

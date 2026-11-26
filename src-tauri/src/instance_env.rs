@@ -249,7 +249,8 @@ pub const INSTANCE_ROOT_REFUSAL_EXIT: i32 = 78;
 
 /// The location overrides that, under an instance root, may only point INSIDE
 /// it — the runner-read `*_DIR` keys of `ambient::AMBIENT_ENV_KEYS`, plus
-/// `QONTINUI_HOME` and the WebView2 profile folder. Refused rather than clamped
+/// `QONTINUI_HOME`, the WebView2 profile folder and the child-only
+/// [`QONTINUI_HOME_CHILD_DIRS`] (D5). Refused rather than clamped
 /// (plan D1): a silent clamp would hide the launcher bug that set them.
 pub const ROOT_CONFINED_ENV_KEYS: &[&str] = &[
     "QONTINUI_CAPABILITY_STATE_DIR",
@@ -261,7 +262,18 @@ pub const ROOT_CONFINED_ENV_KEYS: &[&str] = &[
     "QONTINUI_RUNNER_LOG_DIR",
     "QONTINUI_SECURE_STORAGE_DIR",
     "QONTINUI_SESSION_NAMES_DIR",
+    "QONTINUI_TOUCH_LEDGER_DIR",
     "WEBVIEW2_USER_DATA_FOLDER",
+];
+
+/// The per-store `*_DIR` variables a subject exports under its `QONTINUI_HOME`
+/// (D5), with each store's leaf — the same leaf the runner's own reader
+/// (`agent_worktree::custody`, `fleet`) and the fleet scripts default to under
+/// `~/.qontinui`.
+pub const QONTINUI_HOME_CHILD_DIRS: &[(&str, &str)] = &[
+    ("QONTINUI_SESSION_NAMES_DIR", "session-names"),
+    ("QONTINUI_CAPABILITY_STATE_DIR", "capability"),
+    ("QONTINUI_TOUCH_LEDGER_DIR", "touch-ledger"),
 ];
 
 /// Whether the launch contract checks `QONTINUI_PORT`.
@@ -402,10 +414,10 @@ pub fn rooted_instance_id_with(root: &Path, case_insensitive: bool) -> String {
 /// that is one of them, or an ancestor of one, would put the harness's own
 /// state inside the subject's root.
 pub fn machine_global_dirs() -> Vec<PathBuf> {
-    let home = dirs::home_dir();
+    let home = PlatformDir::Home.machine_dir();
     [
-        dirs::data_local_dir(),
-        dirs::config_dir(),
+        PlatformDir::DataLocal.machine_dir(),
+        PlatformDir::Config.machine_dir(),
         crate::ambient::qontinui_dir_from(None, home.clone()),
         home,
     ]
@@ -545,6 +557,7 @@ pub struct InstanceRootDefault {
 /// - `QONTINUI_EMBEDDED_PG_DIR` → `<root>/embedded-pg` (a private cluster)
 /// - `QONTINUI_RUNNER_LOG_DIR`, `QONTINUI_PANIC_LOG_DIR` → `<root>/logs`
 /// - `WEBVIEW2_USER_DATA_FOLDER` → `<root>/webview`
+/// - [`QONTINUI_HOME_CHILD_DIRS`] → `<QONTINUI_HOME>/<leaf>` (D5)
 /// - `QONTINUI_DISABLE_KEYCHAIN` → `1`: `auth`'s own keychain switch
 ///   (`keychain_enabled_env` reads only it). [`os_keychain_allowed`] covers the
 ///   other stores; exporting the switch carries `auth`'s half to this process
@@ -575,6 +588,25 @@ pub fn instance_root_defaults(
             is_dir: true,
         })
         .collect();
+    // D5: the `~/.qontinui` stores a subject's CHILDREN (Claude sessions,
+    // bundled fleet scripts) find by their own `*_DIR` variable — scripts
+    // default each to `$HOME/.qontinui/<leaf>`, which is the HARNESS's tree.
+    // Exported under the subject's effective `QONTINUI_HOME` (the launcher's,
+    // else `<root>/home`), where the runner's own readers already resolve them.
+    let home = current("QONTINUI_HOME")
+        .filter(|v| !is_blank(Some(v)))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join(INSTANCE_ROOT_HOME_SUBDIR));
+    out.extend(
+        QONTINUI_HOME_CHILD_DIRS
+            .iter()
+            .filter(|(key, _)| is_blank(current(key).as_ref()))
+            .map(|(key, leaf)| InstanceRootDefault {
+                key,
+                value: home.join(leaf).into_os_string(),
+                is_dir: true,
+            }),
+    );
     if current("QONTINUI_DISABLE_KEYCHAIN").is_none() {
         out.push(InstanceRootDefault {
             key: "QONTINUI_DISABLE_KEYCHAIN",
@@ -712,9 +744,256 @@ fn write_refusal_log(root: &Path, line: &str) {
     }
 }
 
+// ============================================================================
+// The machine-global directory seam (plan
+// `2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-runner`
+// Phase 1 / D1)
+// ============================================================================
+//
+// Every runner-owned location the runner used to build from a platform
+// directory (`dirs::config_dir()`, `data_local_dir()`, `data_dir()`,
+// `home_dir()`, Tauri's `app_data_dir()`) resolves through [`platform_dir`]. With
+// no instance root that IS the platform directory — nothing moves. Under a
+// root it is `<root>/data/<kind>`, so a subject's state can never land in, or
+// be read from, the harness's tree. Genuinely user-global locations (the
+// user's repos, another tool's config, Claude's own `~/.claude`) keep calling
+// `dirs::` directly and are enumerated, with a reason, in `ambient.rs`'s
+// `USER_GLOBAL_DIRS_ALLOWLIST`; the drift guard
+// `no_machine_global_dir_outside_the_seams` fails on any call site that is in
+// neither.
+
+/// The Tauri bundle identifier, which every runner-owned platform directory is
+/// named after (`<config_dir>/com.qontinui.runner`, Tauri's `app_data_dir()`).
+pub const RUNNER_BUNDLE_ID: &str = "com.qontinui.runner";
+
+/// `<root>/data` — the parent of every re-rooted platform directory.
+pub const INSTANCE_ROOT_DATA_SUBDIR: &str = "data";
+
+/// A platform directory a runner-owned location is built from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlatformDir {
+    /// `dirs::config_dir()` — under a root, `<root>/data/config`.
+    Config,
+    /// `dirs::data_local_dir()` — under a root, `<root>/data/local`.
+    DataLocal,
+    /// `dirs::data_dir()` (Tauri's `app_data_dir()` parent) — under a root,
+    /// `<root>/data/roaming`.
+    Data,
+    /// `dirs::home_dir()`, for runner OUTPUT the runner keeps under the user's
+    /// home (`~/qontinui/screenshots`) — under a root, `<root>/data/user-home`.
+    /// Not `<root>/home`, which is the `~/.qontinui` seam (`QONTINUI_HOME`).
+    Home,
+    /// `dirs::video_dir()`, where screen recordings land — under a root,
+    /// `<root>/data/videos`.
+    Videos,
+}
+
+impl PlatformDir {
+    /// The leaf under `<root>/data` this kind re-roots to. Distinct per kind,
+    /// so two kinds that coincide on one OS (`data_dir` and `data_local_dir`
+    /// on Linux) cannot collide under a root either way.
+    pub fn instance_root_leaf(self) -> &'static str {
+        match self {
+            PlatformDir::Config => "config",
+            PlatformDir::DataLocal => "local",
+            PlatformDir::Data => "roaming",
+            PlatformDir::Home => "user-home",
+            PlatformDir::Videos => "videos",
+        }
+    }
+
+    /// The machine-global directory this kind names — the ONE place outside
+    /// [`machine_global_dirs`] that asks `dirs` for it.
+    pub fn machine_dir(self) -> Option<PathBuf> {
+        match self {
+            PlatformDir::Config => dirs::config_dir(),
+            PlatformDir::DataLocal => dirs::data_local_dir(),
+            PlatformDir::Data => dirs::data_dir(),
+            PlatformDir::Home => dirs::home_dir(),
+            PlatformDir::Videos => dirs::video_dir(),
+        }
+    }
+}
+
+/// The platform directory a runner-owned location is built from: the machine's
+/// own without an instance root (unchanged behaviour), `<root>/data/<leaf>`
+/// under one. Creates nothing.
+pub fn platform_dir(kind: PlatformDir) -> Option<PathBuf> {
+    platform_dir_from(kind, instance_root().as_deref(), || kind.machine_dir())
+}
+
+/// Env-free core of [`platform_dir`]. Under a root the machine directory is
+/// never consulted — not even to fail.
+pub fn platform_dir_from(
+    kind: PlatformDir,
+    instance_root: Option<&Path>,
+    machine_dir: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    match instance_root {
+        Some(root) => Some(
+            root.join(INSTANCE_ROOT_DATA_SUBDIR)
+                .join(kind.instance_root_leaf()),
+        ),
+        None => machine_dir(),
+    }
+}
+
+/// `<config_dir>/com.qontinui.runner` through [`platform_dir`] — the
+/// unscoped base of the per-instance config stores (prompts, contexts,
+/// playwright, caches) and of the machine-wide `claude-accounts.json` /
+/// `active_instances.json`. NOT the `settings.json` directory, which
+/// `QONTINUI_CONFIG_DIR` can move ([`runner_config_dir`]).
+pub fn runner_config_base() -> Option<PathBuf> {
+    platform_dir(PlatformDir::Config).map(|d| d.join(RUNNER_BUNDLE_ID))
+}
+
+/// `<data_local_dir>/com.qontinui.runner` through [`platform_dir`].
+pub fn runner_data_local_base() -> Option<PathBuf> {
+    platform_dir(PlatformDir::DataLocal).map(|d| d.join(RUNNER_BUNDLE_ID))
+}
+
+/// Tauri's `app_data_dir()` — `<data_dir>/com.qontinui.runner` — through
+/// [`platform_dir`]. Use this instead of `app.path().app_data_dir()`, which
+/// knows nothing of an instance root.
+pub fn runner_app_data_dir() -> Option<PathBuf> {
+    platform_dir(PlatformDir::Data).map(|d| d.join(RUNNER_BUNDLE_ID))
+}
+
+/// The directory holding `settings.json`, and whether `QONTINUI_CONFIG_DIR`
+/// supplied it: a non-empty override verbatim, else [`runner_config_base`].
+/// The ONE rule `settings::resolve_config_dir` (bin) and
+/// `profiles::settings_json_path` (lib) both apply. Creates nothing.
+pub fn runner_config_dir() -> Option<(PathBuf, bool)> {
+    runner_config_dir_from(
+        std::env::var("QONTINUI_CONFIG_DIR").ok(),
+        platform_dir(PlatformDir::Config),
+    )
+}
+
+/// Env-free core of [`runner_config_dir`]; `platform_config_dir` is
+/// [`platform_dir`]`(Config)`.
+pub fn runner_config_dir_from(
+    env_config_dir: Option<String>,
+    platform_config_dir: Option<PathBuf>,
+) -> Option<(PathBuf, bool)> {
+    env_config_dir
+        .filter(|s| !s.is_empty())
+        .map(|s| (PathBuf::from(s), true))
+        .or_else(|| platform_config_dir.map(|d| (d.join(RUNNER_BUNDLE_ID), false)))
+}
+
+/// The secure-storage directory (`auth_tokens.enc`, `paired_user.json`): a
+/// non-empty `QONTINUI_SECURE_STORAGE_DIR`, else `<root>/secure` under an
+/// instance root, else `<data_local_dir>/com.qontinui.runner`. The ONE rule
+/// `secure_storage`, `pair` and `auth` used to spell four times. Creates
+/// nothing.
+pub fn secure_storage_dir() -> Option<PathBuf> {
+    secure_storage_dir_from(
+        std::env::var("QONTINUI_SECURE_STORAGE_DIR").ok(),
+        instance_root().as_deref(),
+        || PlatformDir::DataLocal.machine_dir(),
+    )
+}
+
+/// Env-free core of [`secure_storage_dir`]. `override_dir` is the raw
+/// `QONTINUI_SECURE_STORAGE_DIR`; unset and empty both fall through.
+pub fn secure_storage_dir_from(
+    override_dir: Option<String>,
+    instance_root: Option<&Path>,
+    machine_data_local: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    override_dir
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| match instance_root {
+            Some(root) => Some(root.join(INSTANCE_ROOT_SECURE_SUBDIR)),
+            None => machine_data_local().map(|d| d.join(RUNNER_BUNDLE_ID)),
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- the machine-global directory seam ----
+
+    #[test]
+    fn without_a_root_the_platform_dir_is_the_machine_dir() {
+        let machine = PathBuf::from("/machine/config");
+        for kind in [
+            PlatformDir::Config,
+            PlatformDir::DataLocal,
+            PlatformDir::Data,
+            PlatformDir::Home,
+            PlatformDir::Videos,
+        ] {
+            assert_eq!(
+                platform_dir_from(kind, None, || Some(machine.clone())),
+                Some(machine.clone())
+            );
+            assert_eq!(platform_dir_from(kind, None, || None), None);
+        }
+    }
+
+    #[test]
+    fn under_a_root_every_platform_dir_is_a_distinct_dir_inside_it() {
+        let root = abs("subject-platform");
+        let mut seen = std::collections::BTreeSet::new();
+        for kind in [
+            PlatformDir::Config,
+            PlatformDir::DataLocal,
+            PlatformDir::Data,
+            PlatformDir::Home,
+            PlatformDir::Videos,
+        ] {
+            let got = platform_dir_from(kind, Some(&root), || {
+                panic!("the machine dir must not be consulted under a root")
+            })
+            .expect("a root always resolves");
+            assert!(
+                got.starts_with(root.join(INSTANCE_ROOT_DATA_SUBDIR)),
+                "{got:?}"
+            );
+            assert!(seen.insert(got), "two kinds collide under a root");
+        }
+    }
+
+    #[test]
+    fn the_config_dir_rule_is_override_then_platform_base() {
+        let platform = PathBuf::from("/machine/config");
+        assert_eq!(
+            runner_config_dir_from(Some("/x/cfg".into()), Some(platform.clone())),
+            Some((PathBuf::from("/x/cfg"), true))
+        );
+        for blank in [None, Some(String::new())] {
+            assert_eq!(
+                runner_config_dir_from(blank, Some(platform.clone())),
+                Some((platform.join(RUNNER_BUNDLE_ID), false))
+            );
+        }
+        assert_eq!(runner_config_dir_from(None, None), None);
+    }
+
+    #[test]
+    fn the_secure_storage_rule_is_override_then_root_then_machine() {
+        let machine = PathBuf::from("/machine/local");
+        let root = abs("subject-secure");
+        assert_eq!(
+            secure_storage_dir_from(Some("/x/sec".into()), Some(&root), || Some(machine.clone())),
+            Some(PathBuf::from("/x/sec"))
+        );
+        assert_eq!(
+            secure_storage_dir_from(Some(String::new()), Some(&root), || {
+                panic!("a subject never falls back to the machine store")
+            }),
+            Some(root.join(INSTANCE_ROOT_SECURE_SUBDIR))
+        );
+        assert_eq!(
+            secure_storage_dir_from(None, None, || Some(machine.clone())),
+            Some(machine.join(RUNNER_BUNDLE_ID))
+        );
+        assert_eq!(secure_storage_dir_from(None, None, || None), None);
+    }
 
     #[test]
     fn instance_root_is_absent_when_unset_or_blank() {
@@ -1153,6 +1432,21 @@ mod tests {
                 ("QONTINUI_RUNNER_LOG_DIR", dir("logs"), true),
                 ("QONTINUI_PANIC_LOG_DIR", dir("logs"), true),
                 ("WEBVIEW2_USER_DATA_FOLDER", dir("webview"), true),
+                (
+                    "QONTINUI_SESSION_NAMES_DIR",
+                    root.join("home").join("session-names").into_os_string(),
+                    true
+                ),
+                (
+                    "QONTINUI_CAPABILITY_STATE_DIR",
+                    root.join("home").join("capability").into_os_string(),
+                    true
+                ),
+                (
+                    "QONTINUI_TOUCH_LEDGER_DIR",
+                    root.join("home").join("touch-ledger").into_os_string(),
+                    true
+                ),
                 ("QONTINUI_DISABLE_KEYCHAIN", OsString::from("1"), false),
             ]
         );
@@ -1186,6 +1480,27 @@ mod tests {
     }
 
     #[test]
+    fn the_child_store_dirs_follow_the_launchers_qontinui_home() {
+        let root = abs("subject-child-dirs");
+        let home = root.join("my-home").into_os_string();
+        let got = instance_root_defaults(&root, &|key| match key {
+            "QONTINUI_HOME" => Some(home.clone()),
+            "QONTINUI_TOUCH_LEDGER_DIR" => Some(root.join("ledger").into_os_string()),
+            _ => None,
+        });
+        let value = |k: &str| got.iter().find(|d| d.key == k).map(|d| d.value.clone());
+        assert_eq!(
+            value("QONTINUI_SESSION_NAMES_DIR"),
+            Some(root.join("my-home").join("session-names").into_os_string())
+        );
+        assert_eq!(
+            value("QONTINUI_TOUCH_LEDGER_DIR"),
+            None,
+            "the launcher's value wins"
+        );
+    }
+
+    #[test]
     fn the_rooted_instance_id_ignores_trailing_separators_and_dots() {
         let root = abs("subject-id");
         let id = rooted_instance_id(&root);
@@ -1205,34 +1520,24 @@ mod tests {
 
     // -- through the real entry points (process env, isolated fixture) ----
 
-    /// The fixture points these at its own dir — OUTSIDE a subject root — so a
-    /// subject test clears them and lets the root defaults fill them.
-    const FIXTURE_DIR_KEYS: [&str; 3] = [
-        "QONTINUI_HOME",
-        "QONTINUI_CONFIG_DIR",
-        "QONTINUI_SECURE_STORAGE_DIR",
-    ];
-
-    /// Enter a subject launch: fixture env, a root at `<fixture>/subject`, the
-    /// fixture's own dir keys cleared, and `WEBVIEW2_USER_DATA_FOLDER` (not an
-    /// ambient key) captured for restore.
-    fn subject_env(
-        amb: &crate::test_env::IsolatedAmbient,
-    ) -> (PathBuf, crate::test_env::EnvVarRestore) {
-        let restore = crate::test_env::EnvVarRestore::capture(&["WEBVIEW2_USER_DATA_FOLDER"]);
-        std::env::remove_var("WEBVIEW2_USER_DATA_FOLDER");
-        for key in FIXTURE_DIR_KEYS {
+    /// Enter a subject launch: fixture env (which has already removed every
+    /// other root-confined key, and captures them all for restore), a root at
+    /// `<fixture>/subject`, and the root-confined keys the fixture points at its
+    /// own dir (OUTSIDE a subject root) cleared, which the root defaults then
+    /// fill.
+    fn subject_env(amb: &crate::test_env::IsolatedAmbient) -> PathBuf {
+        for key in crate::test_env::root_confined_keys_set_to_dir() {
             std::env::remove_var(key);
         }
         let root = amb.dir().join("subject");
         std::env::set_var("QONTINUI_INSTANCE_ROOT", &root);
-        (root, restore)
+        root
     }
 
     #[test]
     fn apply_exports_every_default_and_creates_the_dirs() {
         let amb = crate::test_env::isolated_ambient();
-        let (root, _restore) = subject_env(&amb);
+        let root = subject_env(&amb);
         std::env::set_var("QONTINUI_PORT", "9881");
         std::env::remove_var("QONTINUI_DISABLE_KEYCHAIN");
 
@@ -1263,7 +1568,7 @@ mod tests {
     #[test]
     fn apply_refuses_the_primary_port_and_writes_nothing() {
         let amb = crate::test_env::isolated_ambient();
-        let (root, _restore) = subject_env(&amb);
+        let root = subject_env(&amb);
         std::env::set_var(
             "QONTINUI_PORT",
             crate::runner_breadcrumb::PRIMARY_PORT.to_string(),
@@ -1283,6 +1588,51 @@ mod tests {
 
         // A CLI bin under the same root does not care about the port.
         assert_eq!(apply_instance_root_env(false), Ok(Some(root)));
+    }
+
+    /// A session a SUBJECT runner hosts (a supervisor temp or named runner)
+    /// inherits that runner's whole instance-root family and its identity, and
+    /// a test binary it runs inherits them in turn. The fixture must start from
+    /// none of them: every confined location set OUTSIDE the subject root, and
+    /// the instance name and primary port set, before the fixture is built
+    /// (coord finding e0834743; plan
+    /// 2026-10-24-runner-tests-inherit-the-hosting-runners-env-through-cargo-guard).
+    /// Two host-injected keys are deliberately NOT cleared by the fixture and
+    /// so are not covered here: `QONTINUI_PORT` (tests set it around their
+    /// fixtures; the plan's D4) and `QONTINUI_DISABLE_KEYCHAIN` (CI sets it).
+    #[test]
+    fn a_subject_hosted_session_leaks_no_instance_family_into_the_fixture() {
+        let _lock = crate::test_env::env_lock();
+        let host = tempfile::tempdir().expect("the hosting runner's own root");
+        let mut keys: Vec<&'static str> = ROOT_CONFINED_ENV_KEYS.to_vec();
+        keys.extend([
+            "QONTINUI_INSTANCE_NAME",
+            "QONTINUI_PRIMARY_PORT",
+            "QONTINUI_INSTANCE_ROOT",
+            "QONTINUI_PORT",
+        ]);
+        let _outer = crate::test_env::EnvVarRestore::capture(&keys);
+        for key in ROOT_CONFINED_ENV_KEYS {
+            std::env::set_var(key, host.path().join(key));
+        }
+        std::env::set_var("QONTINUI_INSTANCE_NAME", "test-host-subject");
+        // Not the default 9876, which an unset key also resolves to.
+        std::env::set_var("QONTINUI_PRIMARY_PORT", "9878");
+
+        let amb = crate::test_env::isolated_ambient();
+        assert!(
+            !is_secondary(),
+            "an inherited instance name must not make the fixture read secondary"
+        );
+        assert_eq!(
+            std::env::var_os("QONTINUI_PRIMARY_PORT"),
+            None,
+            "an inherited primary port must not reach the fixture"
+        );
+        let root = subject_env(&amb);
+        std::env::set_var("QONTINUI_PORT", "9881");
+        assert_eq!(apply_instance_root_env(true), Ok(Some(root)));
+        assert!(!shares_primary_settings());
     }
 
     #[test]

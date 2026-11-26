@@ -17,6 +17,7 @@ import { SessionProvider } from "./contexts/SessionContext";
 import { ContextualTutorial } from "./components/tutorial";
 import { DemoVisualOverlay } from "./components/demo-video/DemoVisualOverlay";
 import { getGraphQLClient } from "./lib/graphql-client";
+import { RUNNER_AUTO_REGISTER_OPTIONS } from "./lib/ui-bridge/autoRegisterOptions";
 
 import {
   UIBridgeProvider,
@@ -59,6 +60,7 @@ import { useStateMachineRegistration } from "./hooks/useStateMachineRegistration
 import { ToastContainer } from "./components/ToastContainer";
 import { ResourceGuardDialog } from "./components/ResourceGuardDialog";
 import { ResourceGuardGrantBanner } from "./components/ResourceGuardGrantBanner";
+import { OsHealthBanner } from "./components/OsHealthBanner";
 import { AutoUpdateChecker } from "./components/AutoUpdateChecker";
 import { ConflictModal } from "./components/ConflictModal";
 import { StolenBanner } from "./components/StolenBanner";
@@ -80,6 +82,10 @@ import { LogSourcePicker } from "./components/LogSourcePicker";
 import { Sidebar } from "./components/navigation";
 import { TerminalPage } from "./components/terminal";
 import { TerminalPageTabBar } from "./components/terminal/TerminalPageTabBar";
+import {
+  TerminalPagesBridge,
+  shouldServePageRoster,
+} from "./components/terminal/TerminalPagesBridge";
 import { SessionRecoveryBanner } from "./components/terminal/SessionRecoveryBanner";
 import { AdvisoryStackProvider } from "./components/terminal/AdvisoryStack";
 import { RunnerDrainBanner } from "./components/terminal/RunnerDrainBanner";
@@ -287,6 +293,9 @@ function AppContent() {
   } = useAppNavigation();
 
   const terminalPages = useTerminalPages();
+  // Main window only, decided once: both inputs are fixed for the window's
+  // lifetime (same `useState` initializer pattern as WindowAssignmentsProvider).
+  const [servePageRoster] = useState(() => shouldServePageRoster(terminalPages.isPinned));
   // Projects-dashboard §7.2 steps 1–3: bind an activated project to its
   // Terminal page, pin that page's cwd to the project root, and reinstate its
   // zone profile. Mounted HERE — not in the Projects tab — because the page
@@ -313,6 +322,9 @@ function AppContent() {
       const pageNameToId = new Map(terminalPages.pages.map((p) => [p.name, p.id]));
       for (const group of plan.pages) {
         if (!pageNameToId.has(group.name)) {
+          // `addPage` makes the name unique against the FULL roster (a
+          // detached page may already carry it), so the page may be called
+          // "<name> 2"; routing below is by the id, not the name.
           const newId = terminalPages.addPage(group.name);
           pageNameToId.set(group.name, newId);
         }
@@ -361,14 +373,6 @@ function AppContent() {
           } catch {
             console.warn(`Failed to create terminal on page ${group.name}`);
           }
-        }
-      }
-
-      // Rename existing pages to match the proposal
-      for (const group of plan.pages) {
-        const pageId = pageNameToId.get(group.name);
-        if (pageId) {
-          terminalPages.renamePage(pageId, group.name);
         }
       }
 
@@ -840,6 +844,10 @@ function AppContent() {
                       onRenamePage={terminalPages.renamePage}
                       onReorderPage={terminalPages.reorderPage}
                       onReorganize={() => setShowReorganize(true)}
+                      onCloseEmptyPages={terminalPages.closeEmptyPages}
+                      emptyPageCount={terminalPages.emptyPageCount}
+                      pruneNotice={terminalPages.pruneNotice}
+                      onUndoPrune={terminalPages.undoPrune}
                       isPinned={terminalPages.isPinned}
                       onPopOut={() => {
                         // Open a new pop-out OS window (same process) that hosts its
@@ -858,6 +866,19 @@ function AppContent() {
                         );
                       }}
                     />
+                    {/*
+                  `list-pages` UI Bridge read over the FULL persisted page roster
+                  (pop-out pages and the empty default included). Main window
+                  only: a pop-out knows one page and must not serve that as the
+                  roster under the same component id.
+                */}
+                    {servePageRoster && (
+                      <TerminalPagesBridge
+                        allPages={terminalPages.allPages}
+                        boundPages={terminalPages.boundPages}
+                        activePageId={terminalPages.activePageId}
+                      />
+                    )}
                     {/*
                   Phase 4 — startup session-recovery banner. Subscribes to the
                   one-shot `session-recovery-summary` event emitted after
@@ -997,6 +1018,9 @@ function AppContent() {
             {/* The live "Start anyway" grant, if any — its countdown and Revoke.
               An override the operator cannot see is a surprise. */}
             <ResourceGuardGrantBanner />
+            {/* This machine's OS is degraded (kernel token / pool leak, slow process
+              creation) — shown after `osHealth.verdict = breach` has held 10 min. */}
+            <OsHealthBanner />
             {/* Surfaces incoming cross-machine session handoffs as toasts.
               Listens for `session-event` with kind=handoff_request — PR #258. */}
             <IncomingHandoffToastBridge />
@@ -1320,7 +1344,14 @@ export default function App() {
           release on startup. Renders nothing; fail-open. */}
       <AutoUpdateChecker />
       <UIBridgeProvider
-        features={{ renderLog: true, control: true, debug: true }}
+        // devControls: the page-altering dev controls (the media override,
+        // /ui-bridge/control/media/override) answer only when
+        // import.meta.env.DEV, i.e. under a Vite dev server. Every runner —
+        // published, dev and temp alike — is an exe-mode build, so here they
+        // always refuse. Not a security boundary: they add nothing beyond the
+        // existing page_evaluate/eval surface (plan
+        // 2026-10-13-image-generation-and-visual-judgment, Phase 18).
+        features={{ renderLog: true, control: true, debug: true, devControls: import.meta.env.DEV }}
         browserCaptureConfig={{
           // Capture errors/warnings only. The runner's error-monitor consumes
           // console errors, resource errors, WS disconnects, and React error
@@ -1367,16 +1398,9 @@ export default function App() {
           Auto-register every interactive element in the runner app so that
           GET /ui-bridge/control/elements and snapshot reflect the live DOM,
           not just elements wired up through explicit useUIElement hooks.
-          This was previously gated on `import.meta.env.DEV`, which silently
-          disabled the registry in production builds (the temp-runner build
-          and the embedded primary-runner build) — making the entire
-          UI Bridge element-discovery API return near-empty results.
-
-          Cost: a debounced MutationObserver scan (100ms debounce). The
-          runner is a power-user tool with a tight UI Bridge automation
-          loop, so the registry has to work in every shipped build, not
-          just dev. Use [data-no-register] on any element you want to opt
-          out individually.
+          The options, and why each is set as it is, live in
+          `lib/ui-bridge/autoRegisterOptions.ts` so a test can mount the SDK
+          exactly this way.
         */}
         {/*
           Phase 0 of plans/2026-06-03-runner-popout-terminal-windows.md.
@@ -1386,13 +1410,7 @@ export default function App() {
           identical to before; pop-out windows (Phase 1) supply "term-N".
         */}
         <UIBridgeWindowProvider windowLabel={getCurrentWindow().label}>
-          <AutoRegisterProvider
-            enabled
-            idStrategy="prefer-existing"
-            debounceMs={100}
-            excludeSelectors={["[data-no-register]"]}
-            contentDiscovery={{ enabled: true, maxContentElements: 200 }}
-          >
+          <AutoRegisterProvider {...RUNNER_AUTO_REGISTER_OPTIONS}>
             <AuthProvider>
               {/*
               CoordModeProvider — plan

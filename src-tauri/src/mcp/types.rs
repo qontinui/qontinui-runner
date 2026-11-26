@@ -68,13 +68,43 @@ pub fn get_mcp_api_port() -> u16 {
         .unwrap_or(MCP_API_PORT)
 }
 
-/// Returns the base URL for this runner instance (e.g., "http://localhost:9877").
+/// The ONE address the runner's HTTP API listens on: the IPv4 loopback.
+///
+/// `mcp_api::try_bind_port` binds exactly this address, and every URL the
+/// runner builds for its own API (or a sibling runner's) names it through
+/// [`runner_loopback_base`] — so the address a self-call dials IS the address
+/// the listener binds, and the two cannot drift apart.
+///
+/// Why not `localhost`: Windows resolves `localhost` to `::1` FIRST, and
+/// nothing listens there, so every NEW connection to `http://localhost:<port>`
+/// first attempts a doomed IPv6 connect. Measured 2026-10-25 against a live
+/// runner's `GET /health`: a fresh `reqwest::Client` (most self-calls build
+/// one per call) paid ~+305 ms (hyper's 300 ms happy-eyeballs fallback), curl
+/// ~+205 ms, Python `urllib` and PowerShell 5.1 ~+2 s (no fallback at all).
+/// Plan `2026-10-25-runner-self-calls-dial-localhost-and-pay-a-doomed-ipv6-connect`;
+/// `src-tauri/tests/runner_self_urls_use_ipv4_loopback.rs` keeps new call
+/// sites from spelling `localhost` again.
+pub const RUNNER_API_BIND_IP: std::net::Ipv4Addr = std::net::Ipv4Addr::LOCALHOST;
+
+/// The base URL of the runner HTTP API listening on `port` — this runner's or a
+/// sibling instance's (every runner binds [`RUNNER_API_BIND_IP`]), e.g.
+/// `"http://127.0.0.1:9877"`. No trailing slash.
+///
+/// Prefer [`get_self_base_url`] (the actually-bound port of THIS runner) when an
+/// `AppState` is in scope; use this when the port comes from elsewhere (a
+/// sibling instance's record, a parsed command, a config value).
+///
+/// Takes any `Display` port because the callers hold it as `u16` (the bound
+/// port), `i32` (a `runner_instances` row) or `String` (a parsed command), and
+/// the URL is the same text either way.
+pub fn runner_loopback_base(port: impl std::fmt::Display) -> String {
+    format!("http://{}:{}", RUNNER_API_BIND_IP, port)
+}
+
+/// Returns the base URL for this runner instance (e.g. `"http://127.0.0.1:9877"`).
 /// Reads the actual bound port from AppState.
 pub fn get_self_base_url(app_state: &crate::commands::AppState) -> String {
-    let port = app_state
-        .api_port
-        .load(std::sync::atomic::Ordering::Relaxed);
-    format!("http://localhost:{}", port)
+    runner_loopback_base(runner_api_port(app_state))
 }
 
 /// Returns just the actually-bound API port for this runner instance.
@@ -122,8 +152,8 @@ impl UiBridgeFamily {
 }
 
 /// Returns the base URL for a UI Bridge endpoint family on this runner
-/// instance, e.g. `"http://localhost:9877/ui-bridge/control"` or
-/// `"http://localhost:9877/ui-bridge/sdk"`.
+/// instance, e.g. `"http://127.0.0.1:9877/ui-bridge/control"` or
+/// `"http://127.0.0.1:9877/ui-bridge/sdk"`.
 ///
 /// Reads the actually-bound port from `app_state.api_port` (same source
 /// as [`get_self_base_url`]), so secondary/temp runners on non-default
@@ -132,12 +162,9 @@ pub fn runner_ui_bridge_base(
     app_state: &crate::commands::AppState,
     family: UiBridgeFamily,
 ) -> String {
-    let port = app_state
-        .api_port
-        .load(std::sync::atomic::Ordering::Relaxed);
     format!(
-        "http://localhost:{}/ui-bridge/{}",
-        port,
+        "{}/ui-bridge/{}",
+        runner_loopback_base(runner_api_port(app_state)),
         family.as_path_segment()
     )
 }
@@ -147,7 +174,50 @@ pub fn runner_ui_bridge_base(
 /// For code paths that do have AppState, prefer `get_self_base_url` which
 /// uses the actual bound port and works correctly with multi-instance runners.
 pub fn get_self_base_url_from_env() -> String {
-    format!("http://localhost:{}", get_mcp_api_port())
+    runner_loopback_base(get_mcp_api_port())
+}
+
+/// Rewrite a URL whose HOST is `localhost` (any case) to name
+/// [`RUNNER_API_BIND_IP`] instead; every other URL is returned unchanged.
+///
+/// An explicit `[::1]` is left alone on purpose: it is a deliberate choice of
+/// the IPv6 loopback (some dev servers bind only `::1`), and dialing it at the
+/// IPv4 address would break a connect that works today.
+///
+/// Two jobs, one function:
+/// - **No doomed IPv6 connect.** Windows resolves `localhost` to `::1` first;
+///   an IPv4-only listener (this runner's API, and most dev servers) is then
+///   reached only after that connect fails.
+/// - **One key per listener.** Code that KEYS on a URL string (the per-URL
+///   workflow lock, the UI Bridge failure tracker, the SDK connection map) must
+///   not see `http://localhost:9876/ui-bridge` and
+///   `http://127.0.0.1:9876/ui-bridge` as two resources — persisted steps and
+///   skills still carry the `localhost` spelling.
+///
+/// Only the authority's host is touched (`http://localhost.example` and a
+/// `localhost` in the path or query are left alone).
+pub fn canonical_loopback_url(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let host_start = scheme_end + 3;
+    let rest = url.get(host_start..).unwrap_or("");
+    let host_len = if rest.starts_with('[') {
+        rest.find(']').map(|i| i + 1).unwrap_or(rest.len())
+    } else {
+        rest.find([':', '/', '?', '#']).unwrap_or(rest.len())
+    };
+    let host = rest.get(..host_len).unwrap_or("");
+    if host.eq_ignore_ascii_case("localhost") {
+        format!(
+            "{}{}{}",
+            url.get(..host_start).unwrap_or(""),
+            RUNNER_API_BIND_IP,
+            rest.get(host_len..).unwrap_or("")
+        )
+    } else {
+        url.to_string()
+    }
 }
 
 /// Shared state for the API server (authoritative definition)
@@ -248,8 +318,6 @@ pub struct ApiState {
     /// `RelayState` extracted from this state). Plan
     /// `2026-09-17-ui-bridge-relay-registration-is-unauthenticated`.
     pub relay_binding: Arc<crate::mcp::relay_binding::RelayBinding>,
-    /// Pairing manager for LAN and Cloud device authentication
-    pub pairing_manager: Arc<crate::mcp::transport::pairing::PairingManager>,
     /// Rathole tunnel client (Plan 1B). Singleton — only one tunnel active.
     pub tunnel_client: Arc<crate::tunnel::RatholeClient>,
     /// iOS transport sidecar (Plan 2). Started lazily on first iOS request.
@@ -277,7 +345,8 @@ pub struct ApiState {
     /// Phase 3 vision pipeline: content-addressed disk cache for encoded
     /// capture bytes. Key = SHA-256 of (window_handle, scale, mutation_id,
     /// pipeline_hash); value = the verified bytes from `Pipeline::run`.
-    /// Persisted under `tmp_vision_cache/` (scratch-file whitelisted).
+    /// Persisted under the instance-scoped DataLocal dir
+    /// (`mcp::ui_bridge::vision_capture_access::vision_cache_root_from`).
     pub vision_cache: Arc<qontinui_vision_core::VisionCache>,
     /// Phase 3 vision pipeline: bounded permits around the xcap
     /// `spawn_blocking` capture. xcap is GDI-bound on Windows and exhibits
@@ -337,16 +406,27 @@ pub struct ApiResponse<T: Serialize> {
     /// suggestions or workaround guidance to callers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<serde_json::Value>,
-    /// Canonical SCREAMING_SNAKE_CASE error code for transport-layer and
-    /// handler-level rejections (e.g. `INVALID_JSON`, `INVALID_REQUEST`,
-    /// `UNSUPPORTED_MEDIA_TYPE`, `PAYLOAD_TOO_LARGE`). Absent on success
-    /// responses and on legacy error paths that predate the envelope plan.
+    /// Machine-readable error code. Transport-layer and handler-level
+    /// rejections use SCREAMING_SNAKE_CASE (e.g. `INVALID_JSON`,
+    /// `INVALID_REQUEST`, `UNSUPPORTED_MEDIA_TYPE`, `PAYLOAD_TOO_LARGE`); a
+    /// shared refusal from `qontinui_types::refusal` carries its snake_case
+    /// wire form (`RefusalCode::as_str`, e.g. `workspace_root_unresolved`).
+    /// Absent on success responses and on legacy error paths that predate the
+    /// envelope plan.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
-    /// Optional human-readable recovery suggestions surfaced to callers
-    /// alongside `code`. Absent when no actionable guidance is available.
+    /// The shared refusal envelope (`qontinui_types::refusal::Refusal`):
+    /// the refusal class, the runner code as its discriminator, the typed
+    /// next action and the diagnostic detail — under the same top-level
+    /// `refusal` key qontinui-web nests it in. Additive: `code` and
+    /// `error_detail` are kept beside it (only `error_detail.recovery`
+    /// changed shape, to the same `NextAction` object). A constructor that knows more than
+    /// the code (a typed workspace-root miss, a request type's shape hints)
+    /// sets it; every other error has it stamped by the envelope middleware
+    /// (`crate::mcp::refusal_envelope`), so no enveloped error leaves the
+    /// runner without one. Absent on success responses.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub suggestions: Option<Vec<String>>,
+    pub refusal: Option<qontinui_types::refusal::Refusal>,
 }
 
 impl<T: Serialize> ApiResponse<T> {
@@ -358,7 +438,7 @@ impl<T: Serialize> ApiResponse<T> {
             error_detail: None,
             hint: None,
             code: None,
-            suggestions: None,
+            refusal: None,
         }
     }
 
@@ -370,7 +450,7 @@ impl<T: Serialize> ApiResponse<T> {
             error_detail: None,
             hint: None,
             code: None,
-            suggestions: None,
+            refusal: None,
         }
     }
 
@@ -385,7 +465,7 @@ impl<T: Serialize> ApiResponse<T> {
             error_detail: Some(detail),
             hint: None,
             code: None,
-            suggestions: None,
+            refusal: None,
         }
     }
 
@@ -401,16 +481,18 @@ impl<T: Serialize> ApiResponse<T> {
             error_detail: None,
             hint: None,
             code: Some(code.into()),
-            suggestions: None,
+            refusal: None,
         }
     }
 
-    /// Like `error_with_code` but also attaches a list of human-readable
-    /// recovery suggestions surfaced to callers alongside the `code`.
-    pub fn error_with_code_and_suggestions(
+    /// An error with a canonical `code` AND the shared refusal a producer
+    /// built because it knows more than the code (a typed next action, a
+    /// target, folded hints). Not a free-text constructor: the refusal is the
+    /// structured half `expect_ratchet.rs`'s free-text count exists to grow.
+    pub fn error_with_refusal(
         message: impl Into<String>,
         code: impl Into<String>,
-        suggestions: Vec<String>,
+        refusal: qontinui_types::refusal::Refusal,
     ) -> Self {
         Self {
             success: false,
@@ -419,7 +501,32 @@ impl<T: Serialize> ApiResponse<T> {
             error_detail: None,
             hint: None,
             code: Some(code.into()),
-            suggestions: Some(suggestions),
+            refusal: Some(refusal),
+        }
+    }
+
+    /// The error envelope for a surface that needed the workspace root and got
+    /// the typed [`WorkspaceRootUnresolved`](qontinui_types::paths::WorkspaceRootUnresolved)
+    /// instead — the same `error`/`code` as `/api-surface/scan`. `error` is the
+    /// error's one operator sentence (never a re-wording), `code` is
+    /// `workspace_root_unresolved`, and `refusal` is the shared refusal
+    /// envelope (discriminator, next action, the probe-order detail) for a
+    /// reader that renders refusals itself. Pair it with `422`.
+    pub fn workspace_root_unresolved(
+        unresolved: &qontinui_types::paths::WorkspaceRootUnresolved,
+    ) -> Self {
+        let refusal = unresolved.refusal(
+            qontinui_types::refusal::RefusalSource::Runner,
+            chrono::Utc::now().to_rfc3339(),
+        );
+        Self {
+            success: false,
+            data: None,
+            error: Some(unresolved.to_string()),
+            error_detail: None,
+            hint: None,
+            code: Some(refusal.code.as_str().to_string()),
+            refusal: Some(refusal),
         }
     }
 }
@@ -433,7 +540,7 @@ pub fn api_error(message: impl Into<String>) -> ApiResponse<()> {
         error_detail: None,
         hint: None,
         code: None,
-        suggestions: None,
+        refusal: None,
     }
 }
 
@@ -449,7 +556,7 @@ pub fn api_error_detailed(
         error_detail: Some(detail),
         hint: None,
         code: None,
-        suggestions: None,
+        refusal: None,
     }
 }
 
@@ -471,7 +578,7 @@ pub fn api_error_with_hint(
         error_detail: Some(detail),
         hint: Some(hint),
         code: None,
-        suggestions: None,
+        refusal: None,
     }
 }
 
@@ -902,4 +1009,155 @@ pub struct TaskOutputQuery {
 #[derive(Debug, Deserialize)]
 pub struct SetTaskAutoContinueRequest {
     pub auto_continue: bool,
+}
+
+#[cfg(test)]
+mod loopback_base_url_tests {
+    //! Plan `2026-10-25-runner-self-calls-dial-localhost-and-pay-a-doomed-ipv6-connect`:
+    //! every self-URL names the address the listener binds. Literal
+    //! expectations, so a regression to `localhost` (or to any other host)
+    //! reds these rather than moving with a shared constant.
+    use super::*;
+
+    #[test]
+    fn bind_ip_is_the_ipv4_loopback() {
+        assert_eq!(RUNNER_API_BIND_IP.to_string(), "127.0.0.1");
+    }
+
+    #[test]
+    fn loopback_base_names_127_0_0_1_and_the_given_port() {
+        assert_eq!(runner_loopback_base(9876), "http://127.0.0.1:9876");
+        assert_eq!(runner_loopback_base(9899), "http://127.0.0.1:9899");
+    }
+
+    #[test]
+    fn canonical_loopback_url_rewrites_only_a_loopback_host() {
+        for (input, want) in [
+            (
+                "http://localhost:9876/ui-bridge",
+                "http://127.0.0.1:9876/ui-bridge",
+            ),
+            (
+                "http://LocalHost:3000/path?q=localhost",
+                "http://127.0.0.1:3000/path?q=localhost",
+            ),
+            ("http://localhost", "http://127.0.0.1"),
+            ("http://localhost/", "http://127.0.0.1/"),
+            ("ws://localhost:9877", "ws://127.0.0.1:9877"),
+            ("http://[::1]:9876/health", "http://[::1]:9876/health"),
+            (
+                "http://localhost:8080/api/v1?key=val",
+                "http://127.0.0.1:8080/api/v1?key=val",
+            ),
+            // Unchanged: already canonical, not loopback, or only LOOKS like it.
+            ("http://127.0.0.1:5000", "http://127.0.0.1:5000"),
+            (
+                "http://192.168.1.10:3000/api",
+                "http://192.168.1.10:3000/api",
+            ),
+            (
+                "http://localhost.example:80/",
+                "http://localhost.example:80/",
+            ),
+            (
+                "http://example.com/localhost:9876",
+                "http://example.com/localhost:9876",
+            ),
+            ("localhost:9876", "localhost:9876"),
+        ] {
+            assert_eq!(canonical_loopback_url(input), want, "input {input}");
+        }
+    }
+
+    #[test]
+    fn env_base_url_names_127_0_0_1_and_the_env_port() {
+        let _lock = crate::test_env::env_lock();
+        let _env =
+            crate::test_env::EnvVarRestore::capture(&["QONTINUI_PORT", "QONTINUI_RUNNER_API_URL"]);
+        std::env::set_var("QONTINUI_PORT", "9877");
+        std::env::remove_var("QONTINUI_RUNNER_API_URL");
+
+        assert_eq!(get_self_base_url_from_env(), "http://127.0.0.1:9877");
+        assert_eq!(
+            crate::api_config::get_runner_api_url(),
+            "http://127.0.0.1:9877"
+        );
+        assert_eq!(
+            crate::api_config::get_ipc_response_url(),
+            "http://127.0.0.1:9877/ui-bridge/ipc-response"
+        );
+    }
+}
+
+#[cfg(test)]
+mod api_response_shape_tests {
+    //! The wire shape of the error envelope: `refusal` is additive beside
+    //! `code` / `error_detail`, nested under the top-level `refusal` key
+    //! (qontinui-web's `REFUSAL_KEY`), and the retired free-text
+    //! `suggestions` field is gone.
+    use super::*;
+    use qontinui_types::refusal::{
+        NextAction, NextActionKind, Refusal, RefusalCode, RefusalSource,
+    };
+
+    #[test]
+    fn success_carries_no_error_fields() {
+        let v = serde_json::to_value(ApiResponse::success(1)).unwrap();
+        assert_eq!(v, serde_json::json!({"success": true, "data": 1}));
+    }
+
+    #[test]
+    fn refusal_rides_beside_code_and_error_detail() {
+        let detail = crate::mcp::ui_bridge::UiBridgeError::element_not_found("#x");
+        let refusal = Refusal::new(
+            RefusalCode::NotFound,
+            NextAction::new(NextActionKind::Resnapshot),
+            RefusalSource::Runner,
+            "2026-11-21T00:00:00Z",
+        )
+        .with_discriminator("ELEMENT_NOT_FOUND");
+        let mut resp = api_error_detailed("No element found", detail);
+        resp.refusal = Some(refusal);
+        resp.code = Some("ELEMENT_NOT_FOUND".to_string());
+        let v = serde_json::to_value(&resp).unwrap();
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted,
+            ["code", "error", "error_detail", "refusal", "success"]
+        );
+        assert_eq!(v["error_detail"]["code"], "ELEMENT_NOT_FOUND");
+        assert_eq!(
+            v["error_detail"]["recovery"],
+            serde_json::json!({"kind": "resnapshot"})
+        );
+        assert_eq!(v["error_detail"]["context"]["selector"], "#x");
+        assert_eq!(v["refusal"]["code"], "not_found");
+        assert_eq!(v["refusal"]["discriminator"], "ELEMENT_NOT_FOUND");
+        assert_eq!(v["refusal"]["next_action"]["kind"], "resnapshot");
+        assert_eq!(v["refusal"]["glossary_terms"], serde_json::json!([]));
+        assert_eq!(v["refusal"]["source"], "runner");
+        assert!(v.get("suggestions").is_none());
+    }
+
+    #[test]
+    fn workspace_root_refusal_is_on_the_refusal_key_not_hint() {
+        use qontinui_types::paths::{
+            RejectedRoot, RootRejection, RootSource, WorkspaceRootUnresolved,
+        };
+        let unresolved = WorkspaceRootUnresolved {
+            rejected: RejectedRoot {
+                source: RootSource::Probes,
+                reason: RootRejection::NothingConfigured,
+            },
+        };
+        let v = serde_json::to_value(ApiResponse::<()>::workspace_root_unresolved(&unresolved))
+            .unwrap();
+        assert!(v.get("hint").is_none(), "{v}");
+        assert_eq!(v["code"], "workspace_root_unresolved");
+        assert_eq!(v["refusal"]["code"], "workspace_root_unresolved");
+        let refusal: Refusal = serde_json::from_value(v["refusal"].clone()).unwrap();
+        assert!(!refusal.render().is_empty());
+    }
 }

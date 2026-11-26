@@ -10,7 +10,7 @@
 //! so it is never zero. A `len` of zero or above [`MAX_FRAME_LEN`] is a protocol
 //! error, not a frame.
 //!
-//! Three kinds are defined:
+//! Four kinds are defined:
 //!
 //! - [`KIND_CONTROL`] — the payload is one JSON object (see `protocol`).
 //! - [`KIND_DATA`] — the payload is RAW BYTES, carried as-is. Never re-encoded
@@ -25,6 +25,13 @@
 //!   The offset is the pane's stream position since the child started, the
 //!   same coordinate the runner's `remote_offset` / `AttachedRing` arithmetic
 //!   works in, so a reconnect can resume exactly where it stopped.
+//! - [`KIND_SYNTHETIC`] (protocol version 3, plan D14) — holder → runner bytes
+//!   the holder SYNTHESIZED for an attach that asked for a restore: a 1-byte
+//!   [`SyntheticPart`], the 8-byte big-endian absolute offset the bytes belong
+//!   AT (the anchor), then the raw bytes. They are display bytes but not
+//!   stream bytes: a consumer writes them where the anchor says and never
+//!   advances its stream offset by them, so offset arithmetic and gap
+//!   reporting are untouched.
 //!
 //! The frame layer does not interpret `kind`: it round-trips every tag value,
 //! and the SERVER decides which tags it accepts (a positive allowlist,
@@ -41,6 +48,57 @@ pub const KIND_CONTROL: u8 = 0x01;
 pub const KIND_DATA: u8 = 0x02;
 /// An output frame: `u64` BE absolute offset, then raw bytes (protocol v2).
 pub const KIND_OUTPUT: u8 = 0x03;
+
+/// A synthetic frame (protocol v3): [`SyntheticPart`], `u64` BE anchor
+/// offset, then raw bytes.
+pub const KIND_SYNTHETIC: u8 = 0x04;
+
+/// Which synthesized string a [`KIND_SYNTHETIC`] frame carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyntheticPart {
+    /// Before the replayed tail: screen buffer and title.
+    Preamble,
+    /// At the attach-time end of the stream: input modes and cursor visibility.
+    Postamble,
+}
+
+impl SyntheticPart {
+    fn tag(self) -> u8 {
+        match self {
+            SyntheticPart::Preamble => 1,
+            SyntheticPart::Postamble => 2,
+        }
+    }
+
+    fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            1 => Some(SyntheticPart::Preamble),
+            2 => Some(SyntheticPart::Postamble),
+            _ => None,
+        }
+    }
+}
+
+/// Length of [`KIND_SYNTHETIC`]'s header: part tag + anchor offset.
+pub const SYNTHETIC_HEADER_LEN: usize = 1 + OUTPUT_OFFSET_LEN;
+
+/// The payload of a [`KIND_SYNTHETIC`] frame.
+pub fn synthetic_payload(part: SyntheticPart, anchor: u64, bytes: &[u8]) -> Vec<u8> {
+    let mut p = Vec::with_capacity(SYNTHETIC_HEADER_LEN + bytes.len());
+    p.push(part.tag());
+    p.extend_from_slice(&anchor.to_be_bytes());
+    p.extend_from_slice(bytes);
+    p
+}
+
+/// Split a [`KIND_SYNTHETIC`] payload into `(part, anchor, bytes)`. `None`
+/// when the header is short or the part tag unknown — a malformed frame.
+pub fn parse_synthetic(payload: &[u8]) -> Option<(SyntheticPart, u64, &[u8])> {
+    let (&tag, rest) = payload.split_first()?;
+    let part = SyntheticPart::from_tag(tag)?;
+    let (anchor, bytes) = parse_output(rest)?;
+    Some((part, anchor, bytes))
+}
 
 /// Length of [`KIND_OUTPUT`]'s offset header.
 pub const OUTPUT_OFFSET_LEN: usize = 8;
@@ -300,6 +358,33 @@ mod tests {
         assert_eq!(b, &all_256()[..]);
         assert_eq!(parse_output(&output_payload(7, &[])), Some((7, &[][..])));
         assert_eq!(parse_output(&[0u8; 7]), None, "short header is malformed");
+    }
+
+    /// WIRE SHAPE of the v3 synthetic frame: prefix, kind 0x04, part tag,
+    /// 8-byte BE anchor, raw bytes.
+    #[test]
+    fn pty_holder_attach_wire_shape_synthetic_frame() {
+        let bytes = encode_frame(
+            KIND_SYNTHETIC,
+            &synthetic_payload(SyntheticPart::Postamble, 0x0102, b"\x1b="),
+        )
+        .unwrap();
+        assert_eq!(
+            bytes,
+            vec![0, 0, 0, 12, 0x04, 2, 0, 0, 0, 0, 0, 0, 0x01, 0x02, 0x1b, b'=']
+        );
+        let p = synthetic_payload(SyntheticPart::Preamble, 9, &all_256());
+        assert_eq!(
+            parse_synthetic(&p),
+            Some((SyntheticPart::Preamble, 9, &all_256()[..]))
+        );
+        assert_eq!(parse_synthetic(&[1, 0, 0]), None, "short header");
+        assert_eq!(
+            parse_synthetic(&[3, 0, 0, 0, 0, 0, 0, 0, 0]),
+            None,
+            "unknown part"
+        );
+        assert_eq!(parse_synthetic(&[]), None);
     }
 
     #[test]

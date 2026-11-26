@@ -8,8 +8,16 @@
 
 import { describe, expect, it } from "vitest";
 
-import { repoExpectedText, tenantBadgeLabel } from "./TenantBadge";
-import type { SessionTenancy, TenancyRepoExpected } from "./useSessionInfo";
+import {
+  badgeBoundSetText,
+  repoExpectedText,
+  tenantBadgeDisplayAttrs,
+  tenantBadgeElementId,
+  tenantBadgeLabel,
+  tenantBadgeRendersWithoutSession,
+} from "./TenantBadge";
+import { tenantBoundMembership } from "./useSessionInfo";
+import type { SessionTenancy, TenancyRepoExpected, TenantDisplay } from "./useSessionInfo";
 import {
   explicitSpawnTenant,
   pickSpawnTenant,
@@ -21,6 +29,44 @@ import {
 
 const A = "6b1f4b0e-1111-4000-8000-000000000001";
 const B = "91ffaa20-2222-4000-8000-000000000002";
+const C = "a7c0ffee-3333-4000-8000-000000000003";
+/** A measured two-tenant set that does NOT hold `A` — the only list the Rust
+ * producer pairs with `actingInBoundSet: false` for tenant `A`. */
+const WITHOUT_A = { status: "measured" as const, tenantIds: [B, C], reason: null };
+
+describe("tenantBadgeElementId (plan 2026-11-08-tenant-badge-parity-and-oracle-fixtures D1)", () => {
+  it("is one id per zone, in the per-zone family's shape", () => {
+    expect(tenantBadgeElementId(0)).toBe("terminal-tenant-badge-0");
+    expect(tenantBadgeElementId(7)).toBe("terminal-tenant-badge-7");
+  });
+});
+
+describe("tenantBadgeRendersWithoutSession (D2)", () => {
+  it("is true only for a stamped tab on a multi-bound device", () => {
+    expect(tenantBadgeRendersWithoutSession(true, A)).toBe(true);
+  });
+
+  it("is false on a single-binding device, stamped or not", () => {
+    expect(tenantBadgeRendersWithoutSession(false, A)).toBe(false);
+    expect(tenantBadgeRendersWithoutSession(false, undefined)).toBe(false);
+  });
+
+  it("is false with no stamp, a null stamp, or a blank stamp", () => {
+    expect(tenantBadgeRendersWithoutSession(true, undefined)).toBe(false);
+    expect(tenantBadgeRendersWithoutSession(true, null)).toBe(false);
+    expect(tenantBadgeRendersWithoutSession(true, "   ")).toBe(false);
+  });
+
+  it("agrees with tenantBadgeLabel's no-session arm", () => {
+    for (const showSwitcher of [true, false]) {
+      for (const tenantId of [A, undefined, null, "  "]) {
+        expect(tenantBadgeRendersWithoutSession(showSwitcher, tenantId)).toBe(
+          tenantBadgeLabel(tenantId, showSwitcher, null) !== null,
+        );
+      }
+    }
+  });
+});
 
 describe("tenantBadgeLabel", () => {
   it("renders nothing on a single-tenant device (D12 no-clutter rule)", () => {
@@ -62,6 +108,8 @@ function tenancy(overrides: {
   divergence?: SessionTenancy["divergence"];
   spawnDefault?: { status: string; tenantId?: string | null; reason?: string | null };
   repoExpected?: TenancyRepoExpected | null;
+  display?: TenantDisplay | null;
+  coordRow?: SessionTenancy["coordRow"];
 }): SessionTenancy {
   return {
     row: {
@@ -84,6 +132,8 @@ function tenancy(overrides: {
       posture: { status: "unknown", value: null, canAnswer: null, reason: "no_posture_published" },
     },
     repoExpected: overrides.repoExpected ?? null,
+    coordRow: overrides.coordRow ?? null,
+    display: overrides.display ?? null,
     diverged: overrides.diverged,
     divergence: overrides.divergence ?? (overrides.diverged ? "diverged" : "agree"),
   };
@@ -140,7 +190,7 @@ describe("the fourth tenancy leg (plan 2026-09-20 Phase 2)", () => {
     expect(repoExpectedText(null)).toContain("unknown");
     expect(repoExpectedText(repoLeg({ status: "no_repo" }))).toContain("no repo");
     expect(repoExpectedText(repoLeg({ status: "repo_unregistered", repo: "acme/x" }))).toContain(
-      "acme/x has no owning tenant",
+      "acme/x is owned by no tenant this device is paired to",
     );
     expect(
       repoExpectedText(repoLeg({ status: "several", repo: "acme/s", tenantIds: [A, B] })),
@@ -479,5 +529,594 @@ describe("spawnTenantPickerModel (the picker shows what it sends — re-review P
     expect(model.value).toBe(B);
     expect(model.published).toBe(B);
     expect(pickSpawnTenant({ spawnTenantId: model.published })).toBe(B);
+  });
+});
+
+/** A display block as the runner serves it (Rust `TenantDisplay`). */
+function shownAs(overrides: Partial<TenantDisplay> = {}): TenantDisplay {
+  return {
+    status: "resolved",
+    tenantId: A,
+    tenantSlug: null,
+    source: "credential",
+    reason: null,
+    conflicts: [],
+    conflictDetail: null,
+    bound: { status: "measured", tenantIds: [A, B], reason: null },
+    multiBound: true,
+    actingInBoundSet: true,
+    ...overrides,
+  };
+}
+
+describe("tenantBadgeDisplayAttrs — what a UI Bridge read sees", () => {
+  it("names the acting tenant, status and source on a no-stamp chip", () => {
+    expect(
+      tenantBadgeDisplayAttrs(
+        tenancy({ credential: A, dataPlane: A, diverged: false, display: shownAs() }),
+      ),
+    ).toEqual({
+      "data-tenant-acting": A,
+      "data-tenant-display-status": "resolved",
+      "data-tenant-display-source": "credential",
+      "data-tenant-bound-membership": "in",
+    });
+  });
+
+  it("keeps the status of a display with no acting tenant, and sets no tenant", () => {
+    expect(
+      tenantBadgeDisplayAttrs(
+        tenancy({
+          credential: null,
+          dataPlane: null,
+          diverged: false,
+          display: shownAs({ status: "unknown", tenantId: null, source: null }),
+        }),
+      ),
+    ).toEqual({
+      "data-tenant-acting": undefined,
+      "data-tenant-display-status": "unknown",
+      "data-tenant-display-source": undefined,
+      // A measured set, but no display tenant to place in it.
+      "data-tenant-bound-membership": undefined,
+    });
+  });
+
+  it("never names a spawn stamp as the acting tenant", () => {
+    expect(
+      tenantBadgeDisplayAttrs(
+        tenancy({
+          row: A,
+          diverged: false,
+          display: shownAs({ status: "stamp_only", source: "row_stamp" }),
+        }),
+      ),
+    ).toEqual({
+      "data-tenant-acting": undefined,
+      "data-tenant-display-status": "stamp_only",
+      "data-tenant-display-source": "row_stamp",
+      "data-tenant-bound-membership": "in",
+    });
+  });
+
+  it("withholds a stamp-sourced tenant under a mismatch too", () => {
+    expect(
+      tenantBadgeDisplayAttrs(
+        tenancy({
+          row: A,
+          diverged: true,
+          display: shownAs({ status: "mismatch", source: "row_stamp" }),
+        }),
+      ),
+    ).toEqual({
+      "data-tenant-acting": undefined,
+      "data-tenant-display-status": "mismatch",
+      "data-tenant-display-source": "row_stamp",
+      "data-tenant-bound-membership": "in",
+    });
+  });
+
+  it("names the acting tenant of a mismatch, whose conflict is listed beside it", () => {
+    expect(
+      tenantBadgeDisplayAttrs(
+        tenancy({ credential: A, diverged: true, display: shownAs({ status: "mismatch" }) }),
+      )["data-tenant-acting"],
+    ).toBe(A);
+  });
+
+  it("states the display tenant's membership in the row's terms", () => {
+    const attr = (display: TenantDisplay) =>
+      tenantBadgeDisplayAttrs(tenancy({ credential: A, diverged: false, display }))[
+        "data-tenant-bound-membership"
+      ];
+    expect(attr(shownAs({ bound: WITHOUT_A, actingInBoundSet: false }))).toBe("out");
+    expect(attr(shownAs({ actingInBoundSet: null }))).toBe("unknown");
+    expect(
+      attr(
+        shownAs({
+          bound: { status: "measured", tenantIds: [], reason: null },
+          multiBound: false,
+          actingInBoundSet: false,
+        }),
+      ),
+    ).toBe("no-bound-tenants");
+    expect(
+      attr(
+        shownAs({
+          bound: { status: "unknown", tenantIds: [], reason: "paired_user_unreadable" },
+          multiBound: null,
+          actingInBoundSet: null,
+        }),
+      ),
+    ).toBe("set-unread");
+  });
+
+  it("is the row's classification: attribute, tone and title agree with tenantBoundMembership", () => {
+    const cases: TenantDisplay[] = [
+      shownAs(),
+      shownAs({ bound: WITHOUT_A, actingInBoundSet: false }),
+      shownAs({ actingInBoundSet: null }),
+      shownAs({
+        bound: { status: "measured", tenantIds: [], reason: null },
+        multiBound: false,
+        actingInBoundSet: false,
+      }),
+      shownAs({
+        bound: { status: "unknown", tenantIds: [], reason: "paired_user_unreadable" },
+        multiBound: null,
+        actingInBoundSet: null,
+      }),
+      // Unread beside a confident flag (the normalizer would null it): the
+      // badge must still not claim membership, in the classifier's order.
+      ...[true, false].map((actingInBoundSet) =>
+        shownAs({
+          bound: { status: "unknown", tenantIds: [], reason: "paired_user_unreadable" },
+          multiBound: null,
+          actingInBoundSet,
+        }),
+      ),
+      shownAs({ status: "unknown", tenantId: null, source: null, actingInBoundSet: false }),
+    ];
+    // The title's arm for each classification, on the acting (no-stamp) chip.
+    const titleArm: Record<string, RegExp> = {
+      in: /Tenant 6b1f4b0e is 1 of the 2 tenants/,
+      out: /Tenant 6b1f4b0e is NOT among the 2 tenants/,
+      unknown: /Whether tenant 6b1f4b0e is among the 2 tenants .* is unknown/,
+      "no-bound-tenants": /This runner has no bound tenants\./,
+      "set-unread": /could not be read \(paired_user_unreadable\)/,
+    };
+    for (const display of cases) {
+      const membership = tenantBoundMembership(display);
+      const t = tenancy({ credential: A, diverged: false, display });
+      expect(tenantBadgeDisplayAttrs(t)["data-tenant-bound-membership"]).toBe(
+        membership ?? undefined,
+      );
+      const label = tenantBadgeLabel(undefined, true, t);
+      if (display.status !== "resolved") {
+        // Nothing names a tenant: the badge does not render at all.
+        expect(label).toBeNull();
+        continue;
+      }
+      expect(label?.outsideBoundSet).toBe(membership === "out");
+      expect(label?.title).toMatch(titleArm[membership as string]);
+    }
+  });
+
+  it("claims nothing when the runner sent no display", () => {
+    const none = {
+      "data-tenant-acting": undefined,
+      "data-tenant-display-status": undefined,
+      "data-tenant-display-source": undefined,
+      "data-tenant-bound-membership": undefined,
+    };
+    expect(tenantBadgeDisplayAttrs(null)).toEqual(none);
+    expect(
+      tenantBadgeDisplayAttrs(tenancy({ credential: A, dataPlane: A, diverged: false })),
+    ).toEqual(none);
+  });
+});
+
+describe("tenantBadgeLabel — the acting tenant when no tenant was stamped (plan 2026-10-17)", () => {
+  it("shows the ACTING tenant for a no-stamp session whose credential resolved", () => {
+    const label = tenantBadgeLabel(
+      undefined,
+      true,
+      tenancy({
+        credential: A,
+        dataPlane: A,
+        diverged: false,
+        display: shownAs({ tenantSlug: "acme" }),
+      }),
+    );
+    expect(label?.text).toBe("6b1f4b0e");
+    expect(label?.diverged).toBe(false);
+    expect(label?.title).toBe(
+      `This session acts as tenant ${A} (acme) via its coord credential. Its spawn chose no ` +
+        `tenant (device default). Tenant 6b1f4b0e is 1 of the 2 tenants this runner is bound ` +
+        `to. A session's tenant is fixed at spawn — switching the active tenant only affects ` +
+        `future sessions.`,
+    );
+  });
+
+  it("names a default-slot credential as the device default binding", () => {
+    const label = tenantBadgeLabel(
+      null,
+      true,
+      tenancy({
+        credential: A,
+        diverged: false,
+        display: shownAs({ source: "credential_default_slot" }),
+      }),
+    );
+    expect(label?.title).toContain("via its default-slot credential (the device default binding)");
+  });
+
+  it("still hides when nothing resolved and nothing is stamped", () => {
+    expect(
+      tenantBadgeLabel(
+        undefined,
+        true,
+        tenancy({
+          credentialStatus: "unknown",
+          credentialReason: "no_session_nonce",
+          diverged: false,
+          divergence: "unknown",
+          display: shownAs({
+            status: "unknown",
+            tenantId: null,
+            source: null,
+            reason: "no_session_nonce",
+          }),
+        }),
+      ),
+    ).toBeNull();
+  });
+
+  it("still hides on a single-tenant device (D12)", () => {
+    expect(
+      tenantBadgeLabel(
+        undefined,
+        false,
+        tenancy({ credential: A, diverged: false, display: shownAs() }),
+      ),
+    ).toBeNull();
+  });
+
+  it("says an unknown comparison is unknown on the acting-tenant arm", () => {
+    const label = tenantBadgeLabel(
+      undefined,
+      true,
+      tenancy({ credential: A, diverged: false, divergence: "unknown", display: shownAs() }),
+    );
+    expect(label?.title).toContain("Whether every leg agrees could not be compared.");
+  });
+
+  it("names every conflicting tenant the runner listed, including coord's own row", () => {
+    const label = tenantBadgeLabel(
+      undefined,
+      true,
+      tenancy({
+        credential: A,
+        dataPlane: A,
+        diverged: true,
+        coordRow: { status: "registered", tenantId: B, source: "registrar", reason: null },
+        display: shownAs({
+          status: "mismatch",
+          conflicts: [
+            { leg: "credential", tenantId: A },
+            { leg: "data_plane", tenantId: A },
+            { leg: "coord_row", tenantId: B },
+          ],
+        }),
+      }),
+    );
+    expect(label?.text).toBe("6b1f4b0e≠91ffaa20");
+    expect(label?.diverged).toBe(true);
+    expect(label?.title).toContain(`Coord session row: ${B} (as registered by this runner)`);
+  });
+
+  it("flags a data-plane answer beside an UNKNOWN credential instead of a confident stem", () => {
+    for (const source of ["data_plane", "data_plane_device"]) {
+      const label = tenantBadgeLabel(
+        undefined,
+        true,
+        tenancy({
+          dataPlane: A,
+          credentialStatus: "unknown",
+          credentialReason: "nonce_not_live",
+          diverged: false,
+          divergence: "unknown",
+          display: shownAs({ source, reason: "nonce_not_live" }),
+        }),
+      );
+      expect(label?.text, source).toBe("6b1f4b0e?");
+      expect(label?.credentialUnknown, source).toBe(true);
+      expect(label?.diverged, source).toBe(false);
+      expect(label?.title, source).toContain(
+        "The tenant its coord-mcp writes go to is UNKNOWN (nonce_not_live).",
+      );
+    }
+  });
+
+  it("keeps the confident stem when the credential resolved", () => {
+    const label = tenantBadgeLabel(
+      undefined,
+      true,
+      tenancy({ credential: A, dataPlane: A, diverged: false, display: shownAs() }),
+    );
+    expect(label?.text).toBe("6b1f4b0e");
+    expect(label?.credentialUnknown).toBe(false);
+    expect(label?.title).not.toContain("UNKNOWN");
+  });
+
+  it("describes a not-applicable coord row (terminal-hosted) as such, not as unknown", () => {
+    const label = tenantBadgeLabel(
+      undefined,
+      true,
+      tenancy({
+        credential: A,
+        dataPlane: B,
+        diverged: true,
+        coordRow: {
+          status: "not_applicable",
+          tenantId: null,
+          source: null,
+          reason: "terminal_plane_row_is_the_data_plane_leg",
+        },
+        display: shownAs({
+          status: "mismatch",
+          conflicts: [
+            { leg: "credential", tenantId: A },
+            { leg: "data_plane", tenantId: B },
+          ],
+        }),
+      }),
+    );
+    expect(label?.title).toContain(
+      "Coord session row: terminal-hosted — its tenant is what the runner writes under (above)",
+    );
+    expect(label?.title).not.toContain("terminal_plane_row_is_the_data_plane_leg");
+  });
+});
+
+/**
+ * The bound-set half of `tenancy.display` on the badge — the same fact the
+ * session-info Tenant row states in its suffix (`· not among N bound`,
+ * `· N bound, membership unknown`, `· this runner has no bound tenants`). Before
+ * this, the badge read the display's tenant and ignored its membership, so a
+ * tenant measured OUTSIDE the runner's bound set rendered as the plain label.
+ */
+describe("badgeBoundSetText — every arm is stated, none by silence", () => {
+  it("says nothing only when the runner sent no display", () => {
+    expect(badgeBoundSetText(null, A)).toBeNull();
+    expect(badgeBoundSetText(undefined, A)).toBeNull();
+  });
+
+  it("an unread set says so with its reason", () => {
+    expect(
+      badgeBoundSetText(
+        shownAs({
+          bound: { status: "unknown", tenantIds: [], reason: "paired_user_unreadable" },
+          multiBound: null,
+          actingInBoundSet: null,
+        }),
+        A,
+      ),
+    ).toBe("The tenants this runner is bound to could not be read (paired_user_unreadable).");
+  });
+
+  // `true` beside an empty list is not something the Rust producer emits; it
+  // is here because the badge must not trust the flag over the empty set.
+  it("an empty measured set holds nothing, whatever membership claims", () => {
+    const empty = { status: "measured" as const, tenantIds: [], reason: null };
+    for (const actingInBoundSet of [true, false, null]) {
+      expect(
+        badgeBoundSetText(shownAs({ bound: empty, multiBound: false, actingInBoundSet }), A),
+      ).toBe("This runner has no bound tenants.");
+    }
+  });
+
+  it("measured in, out and unknown, on a multi-tenant set", () => {
+    expect(badgeBoundSetText(shownAs(), A)).toBe(
+      "Tenant 6b1f4b0e is 1 of the 2 tenants this runner is bound to.",
+    );
+    expect(badgeBoundSetText(shownAs({ bound: WITHOUT_A, actingInBoundSet: false }), A)).toBe(
+      "Tenant 6b1f4b0e is NOT among the 2 tenants this runner is bound to.",
+    );
+    expect(badgeBoundSetText(shownAs({ actingInBoundSet: null }), A)).toBe(
+      "Whether tenant 6b1f4b0e is among the 2 tenants this runner is bound to is unknown.",
+    );
+  });
+
+  it("a single binding is not a plural, and outside it is still said", () => {
+    const onlyA = { status: "measured" as const, tenantIds: [A], reason: null };
+    const onlyB = { status: "measured" as const, tenantIds: [B], reason: null };
+    expect(badgeBoundSetText(shownAs({ bound: onlyA, multiBound: false }), A)).toBe(
+      "Tenant 6b1f4b0e is the one tenant this runner is bound to.",
+    );
+    expect(
+      badgeBoundSetText(shownAs({ bound: onlyB, multiBound: false, actingInBoundSet: false }), A),
+    ).toBe("Tenant 6b1f4b0e is NOT the one tenant this runner is bound to.");
+    // A partial payload: the normalizer keeps a measured set and drops the flag.
+    expect(
+      badgeBoundSetText(shownAs({ bound: onlyA, multiBound: false, actingInBoundSet: null }), A),
+    ).toBe("Whether tenant 6b1f4b0e is the one tenant this runner is bound to is unknown.");
+  });
+
+  it("claims no membership for a tenant that is not the display's own", () => {
+    // `actingInBoundSet` is about `display.tenantId`; a badge naming another
+    // tenant (or none) gets the set's size, not someone else's membership.
+    expect(badgeBoundSetText(shownAs({ bound: WITHOUT_A, actingInBoundSet: false }), B)).toBe(
+      "This runner is bound to 2 tenants.",
+    );
+    expect(badgeBoundSetText(shownAs({ tenantId: null, actingInBoundSet: null }), null)).toBe(
+      "This runner is bound to 2 tenants.",
+    );
+  });
+
+  it("matches the named tenant to the display's without regard to case", () => {
+    expect(
+      badgeBoundSetText(shownAs({ bound: WITHOUT_A, actingInBoundSet: false }), A.toUpperCase()),
+    ).toBe("Tenant 6B1F4B0E is NOT among the 2 tenants this runner is bound to.");
+  });
+});
+
+describe("tenantBadgeLabel — outsideBoundSet on every arm that names a tenant", () => {
+  it("the acting arm (no stamp)", () => {
+    const out = tenantBadgeLabel(
+      undefined,
+      true,
+      tenancy({
+        credential: A,
+        diverged: false,
+        display: shownAs({ bound: WITHOUT_A, actingInBoundSet: false }),
+      }),
+    );
+    expect(out?.outsideBoundSet).toBe(true);
+    expect(out?.title).toContain(
+      "Its spawn chose no tenant (device default). Tenant 6b1f4b0e is NOT among the 2 tenants",
+    );
+    const inSet = tenantBadgeLabel(
+      undefined,
+      true,
+      tenancy({ credential: A, diverged: false, display: shownAs() }),
+    );
+    expect(inSet?.outsideBoundSet).toBe(false);
+  });
+
+  it("the stamped arm", () => {
+    const label = tenantBadgeLabel(
+      A,
+      true,
+      tenancy({
+        row: A,
+        credential: A,
+        dataPlane: A,
+        diverged: false,
+        display: shownAs({ bound: WITHOUT_A, actingInBoundSet: false }),
+      }),
+    );
+    expect(label?.outsideBoundSet).toBe(true);
+    expect(label?.credentialUnknown).toBe(false);
+    expect(label?.title).toContain(
+      "Tenant 6b1f4b0e is NOT among the 2 tenants this runner is bound to. A session's tenant",
+    );
+  });
+
+  it("the stamped arm with an unknown credential", () => {
+    const label = tenantBadgeLabel(
+      A,
+      true,
+      tenancy({
+        row: A,
+        dataPlane: A,
+        credentialStatus: "unknown",
+        credentialReason: "no_session_nonce",
+        diverged: false,
+        divergence: "unknown",
+        display: shownAs({ source: "data_plane", bound: WITHOUT_A, actingInBoundSet: false }),
+      }),
+    );
+    expect(label?.text).toBe("6b1f4b0e?");
+    expect(label?.outsideBoundSet).toBe(true);
+    expect(label?.title).toContain(
+      "is UNKNOWN (no_session_nonce). Tenant 6b1f4b0e is NOT among the 2 tenants",
+    );
+  });
+
+  it("the mismatch arm lists the set as its own line", () => {
+    const label = tenantBadgeLabel(
+      B,
+      true,
+      tenancy({
+        row: B,
+        credential: A,
+        dataPlane: A,
+        diverged: true,
+        display: shownAs({ status: "mismatch", bound: WITHOUT_A, actingInBoundSet: false }),
+      }),
+    );
+    expect(label?.diverged).toBe(true);
+    expect(label?.outsideBoundSet).toBe(true);
+    expect(label?.title.split("\n")).toContain(
+      "Bound set (acting tenant): Tenant 6b1f4b0e is NOT among the 2 tenants this runner is bound to.",
+    );
+  });
+
+  it("a mismatch with no acting tenant states the set alone, unattributed", () => {
+    const label = tenantBadgeLabel(
+      B,
+      true,
+      tenancy({
+        row: B,
+        credential: A,
+        dataPlane: A,
+        diverged: true,
+        display: shownAs({
+          status: "mismatch",
+          tenantId: null,
+          source: null,
+          reason: "no_leg_resolved",
+          actingInBoundSet: null,
+        }),
+      }),
+    );
+    expect(label?.diverged).toBe(true);
+    expect(label?.outsideBoundSet).toBe(false);
+    expect(label?.title.split("\n")).toContain("Bound set: This runner is bound to 2 tenants.");
+  });
+
+  it("no display: nothing about the set, and never outside it", () => {
+    const label = tenantBadgeLabel(A, true, tenancy({ row: A, credential: A, diverged: false }));
+    expect(label?.outsideBoundSet).toBe(false);
+    expect(label?.title).not.toContain("bound to");
+    expect(tenantBadgeLabel(A, true)?.outsideBoundSet).toBe(false);
+  });
+
+  it("never turns on another tenant's membership", () => {
+    // The tab names B; the display (and its membership flag) is about A.
+    const label = tenantBadgeLabel(
+      B,
+      true,
+      tenancy({
+        row: B,
+        credential: B,
+        dataPlane: B,
+        diverged: false,
+        display: shownAs({ bound: WITHOUT_A, actingInBoundSet: false }),
+      }),
+    );
+    expect(label?.text).toBe("91ffaa20");
+    expect(label?.outsideBoundSet).toBe(false);
+    expect(label?.title).toContain("This runner is bound to 2 tenants.");
+  });
+
+  it("an unknown set or membership is not outside it", () => {
+    for (const display of [
+      // Not a payload the normalizer passes through (it empties the list and
+      // nulls the flag on an unread set); the badge must still not read the
+      // flag, or a stale list, past the set's own status.
+      shownAs({
+        bound: { status: "unknown", tenantIds: [B, C], reason: "paired_user_unreadable" },
+        multiBound: null,
+        actingInBoundSet: false,
+      }),
+      shownAs({ actingInBoundSet: null }),
+      shownAs({
+        bound: { status: "unknown", tenantIds: [], reason: "paired_user_unreadable" },
+        multiBound: null,
+        actingInBoundSet: null,
+      }),
+      shownAs({
+        bound: { status: "measured", tenantIds: [], reason: null },
+        multiBound: false,
+        actingInBoundSet: false,
+      }),
+    ]) {
+      expect(
+        tenantBadgeLabel(undefined, true, tenancy({ credential: A, diverged: false, display }))
+          ?.outsideBoundSet,
+      ).toBe(false);
+    }
   });
 });

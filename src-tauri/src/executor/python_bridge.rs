@@ -322,14 +322,27 @@ impl PythonBridge {
             let _ = lifecycle.shutdown().await;
         }
 
-        if let Some(mut process) = self.process.take() {
+        // INVARIANT: the child stays in `self.process` across every `.await` in
+        // this function, and is taken only once no await remains before
+        // `kill()`. A `std::process::Child` does NOT kill its process on drop,
+        // and callers cancel this future (`POST /executor/restart` wraps the
+        // stop in a 3 s timeout; the bridge manager's take guard then puts this
+        // bridge back). Taking the child before the awaits meant a cancel
+        // dropped it un-killed, put back a bridge with `process == None`, and
+        // the next start spawned a second Python beside the untracked first.
+        // Kept here, a cancelled stop leaves the process recorded, so the next
+        // `stop()` (or `Drop`'s `stop_sync`) kills it, and `start()` refuses
+        // ("already running") instead of spawning a duplicate.
+        if self.process.is_some() {
             // Send stop command
             let _ = self.send_command_async("stop", None).await;
 
             // Wait a bit for graceful shutdown
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
 
-            // Kill the process if still running
+        if let Some(mut process) = self.process.take() {
+            // Kill the process if still running (no await from here on)
             process.kill().map_err(|e| e.to_string())?;
             process.wait().map_err(|e| e.to_string())?;
         }

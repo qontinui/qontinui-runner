@@ -21,6 +21,9 @@
  * used to be a `return null` (G5).
  */
 
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+
 import { describe, it, expect, vi } from "vitest";
 
 const invokeMock = vi.hoisted(() =>
@@ -28,6 +31,7 @@ const invokeMock = vi.hoisted(() =>
 );
 vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 import {
+  coordRowSourceText,
   deriveTrigger,
   formatEpochMs,
   formatRecordedZone,
@@ -35,6 +39,13 @@ import {
   PROVISIONAL_SUFFIX,
   normalizeSessionInfo,
   normalizeTenancy,
+  normalizeTenantDisplay,
+  spawnStampRow,
+  tenantBoundMembership,
+  tenantRow,
+  TENANT_DISPLAY_ABSENT_TEXT,
+  type TenantBoundMembership,
+  type TenantDisplay,
   LOADING_STATE,
   sessionInfoSnapshot,
   sessionInfoSubscriptionCount,
@@ -57,8 +68,17 @@ import {
   type SessionInfoBody,
   type SessionInfoState,
   type SessionPrOpened,
-  type SessionPrs,
 } from "./useSessionInfo";
+import {
+  BAUHAUS,
+  body,
+  display,
+  MERYTS,
+  PIZZERIA,
+  prs,
+  QONTINUI,
+  tenancyWith,
+} from "./useSessionInfo.testkit";
 
 function opened(
   overrides: Partial<SessionPrOpened> & Pick<SessionPrOpened, "prNumber">,
@@ -68,63 +88,6 @@ function opened(
     branch: "feat/x",
     openedAt: null,
     prState: "open",
-    ...overrides,
-  };
-}
-
-function prs(overrides: Partial<SessionPrs> = {}): SessionPrs {
-  const base: SessionPrs = {
-    status: "ok",
-    reason: null,
-    opened: [],
-    landed: [],
-    unknown: [],
-    openCount: 0,
-    landedCount: 0,
-    unknownCount: 0,
-    // Default to SCANNED: the fixtures below are about the ledger's contents,
-    // and the not-scanned case has its own dedicated tests.
-    scanned: true,
-    scannedRepos: ["D:/qontinui-root/qontinui-runner"],
-  };
-  const merged = { ...base, ...overrides };
-  return {
-    ...merged,
-    openCount: overrides.openCount ?? merged.opened.length,
-    landedCount: overrides.landedCount ?? merged.landed.length,
-    unknownCount: overrides.unknownCount ?? merged.unknown.length,
-  };
-}
-
-function body(overrides: Partial<SessionInfoBody> = {}): SessionInfoBody {
-  return {
-    identity: {
-      claudeSessionId: "8b45800b-4b65-4c15-afd4-d0feaa0cb0d4",
-      terminalId: "term-1",
-      fleetSessionHandle: "fsh_abc",
-      tenantId: null,
-      taskRunId: null,
-    },
-    name: { value: "runner dropdown", source: "operator" },
-    account: { label: "paktis", wrapper: "clp", configDir: "C:/Users/x/.claude-paktis" },
-    placement: { pageId: "default", zoneIndex: 3, workingDir: "C:/qontinui-root/qontinui-runner" },
-    lifecycle: {
-      state: "open",
-      provider: "claude",
-      origin: "authoritative",
-      openedAt: 1_700_000_000_000,
-      lastSeenAt: 1_700_000_100_000,
-      closedAt: null,
-      closeReason: null,
-      confirmed: true,
-      transcriptExists: true,
-      restorable: true,
-      restoredFromBootAt: null,
-      restoreTier: null,
-      bypassPermissions: false,
-    },
-    prs: prs(),
-    tenancy: null,
     ...overrides,
   };
 }
@@ -545,7 +508,7 @@ describe("sessionInfoElementId", () => {
 });
 
 describe("sessionInfoRows", () => {
-  it("emits all seventeen fields, in the D5 order, all four ids among them (D2)", () => {
+  it("emits all eighteen fields, in the D5 order, all four ids among them (D2)", () => {
     expect(sessionInfoRows(body()).map((r) => r.field)).toEqual([
       "account",
       "name",
@@ -553,6 +516,7 @@ describe("sessionInfoRows", () => {
       "claude-session-id",
       "fleet-handle",
       "tenant",
+      "spawn-stamp",
       "task-run",
       "working-dir",
       "recorded-page",
@@ -592,11 +556,16 @@ describe("sessionInfoRows", () => {
         },
       }),
     );
-    for (const field of ["account", "name", "fleet-handle", "tenant", "task-run"] as const) {
+    for (const field of ["account", "name", "fleet-handle", "spawn-stamp", "task-run"] as const) {
       const row = rows.find((r) => r.field === field);
       expect(row?.value, field).toBeNull();
       expect(row?.display, field).toBe(UNKNOWN_TEXT);
     }
+    // The Tenant row says WHY it cannot name a tenant, rather than a bare
+    // `unknown`.
+    const tenant = rows.find((r) => r.field === "tenant");
+    expect(tenant?.value).toBeNull();
+    expect(tenant?.display).toBe("unknown — runner predates tenancy.display");
     // Present values are untouched by the unknown rendering.
     expect(rows.find((r) => r.field === "claude-session-id")?.value).toBe("sid");
   });
@@ -646,6 +615,7 @@ describe("sessionInfoRows", () => {
       "claude-session-id",
       "fleet-handle",
       "tenant",
+      "spawn-stamp",
       "task-run",
       "working-dir",
       "recorded-page",
@@ -1074,5 +1044,609 @@ describe("shared session-info poll — a zone switched to another session", () =
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The Tenant row reads `tenancy.display` (plan
+// 2026-10-17-session-info-tenant-row-renders-unknown-for-a-resolved-tenant)
+// ---------------------------------------------------------------------------
+
+describe("tenantRow — the acting tenant, never the spawn stamp", () => {
+  it("2026-10-17 regression: no stamp + resolved credential + 4 bindings names the tenant", () => {
+    const row = tenantRow(tenancyWith(display({ tenantSlug: "qontinui" })));
+    expect(row.value).toBe(QONTINUI);
+    expect(row.display).toBe("qontinui (c231d9da) · via credential · 1 of 4 bound");
+  });
+
+  it("shows the short id alone when coord has given no slug", () => {
+    expect(tenantRow(tenancyWith(display())).display).toBe(
+      "c231d9da · via credential · 1 of 4 bound",
+    );
+  });
+
+  it("withholds the bound marker on a single binding", () => {
+    const row = tenantRow(
+      tenancyWith(
+        display({
+          bound: { status: "measured", tenantIds: [QONTINUI], reason: null },
+          multiBound: false,
+        }),
+      ),
+    );
+    expect(row.display).toBe("c231d9da · via credential");
+  });
+
+  it("says the bound set is unknown rather than staying silent", () => {
+    const row = tenantRow(
+      tenancyWith(
+        display({
+          bound: { status: "unknown", tenantIds: [], reason: "paired_user_unreadable" },
+          multiBound: null,
+          actingInBoundSet: null,
+        }),
+      ),
+    );
+    expect(row.display).toBe(
+      "c231d9da · via credential · bound set unknown — paired_user_unreadable",
+    );
+  });
+
+  it("does not claim membership on a multi-bound device when it is unknown", () => {
+    const row = tenantRow(tenancyWith(display({ actingInBoundSet: null })));
+    expect(row.display).toBe("c231d9da · via credential · 4 bound, membership unknown");
+  });
+
+  it("does not let a single binding's withheld marker claim an unknown membership", () => {
+    const row = tenantRow(
+      tenancyWith(
+        display({
+          bound: { status: "measured", tenantIds: [QONTINUI], reason: null },
+          multiBound: false,
+          actingInBoundSet: null,
+        }),
+      ),
+    );
+    expect(row.display).toBe("c231d9da · via credential · 1 bound, membership unknown");
+  });
+
+  it("names an empty binding store whatever membership claims", () => {
+    const row = tenantRow(
+      tenancyWith(
+        display({
+          bound: { status: "measured", tenantIds: [], reason: null },
+          multiBound: false,
+          actingInBoundSet: null,
+        }),
+      ),
+    );
+    expect(row.display).toBe("c231d9da · via credential · this runner has no bound tenants");
+  });
+
+  it("says when the acting tenant is outside the bound set", () => {
+    const row = tenantRow(tenancyWith(display({ actingInBoundSet: false })));
+    expect(row.display).toBe("c231d9da · via credential · not among 4 bound");
+  });
+
+  it("says so on a single binding too, where nothing else marks the row", () => {
+    const row = tenantRow(
+      tenancyWith(
+        display({
+          bound: { status: "measured", tenantIds: [MERYTS], reason: null },
+          multiBound: false,
+          actingInBoundSet: false,
+        }),
+      ),
+    );
+    expect(row.display).toBe("c231d9da · via credential · not among 1 bound");
+  });
+
+  it("names an empty binding store as that, not as a membership fault", () => {
+    const row = tenantRow(
+      tenancyWith(
+        display({
+          bound: { status: "measured", tenantIds: [], reason: null },
+          multiBound: false,
+          actingInBoundSet: false,
+        }),
+      ),
+    );
+    expect(row.display).toBe("c231d9da · via credential · this runner has no bound tenants");
+  });
+
+  it("says a stamp-only tenant is outside a single binding, still labelled as a stamp", () => {
+    const row = tenantRow(
+      tenancyWith(
+        display({
+          status: "stamp_only",
+          source: "row_stamp",
+          reason: "nonce_not_live",
+          bound: { status: "measured", tenantIds: [MERYTS], reason: null },
+          multiBound: false,
+          actingInBoundSet: false,
+        }),
+        QONTINUI,
+      ),
+    );
+    expect(row.display).toBe(
+      "c231d9da · spawn stamp only — acting tenant not observed · not among 1 bound",
+    );
+  });
+
+  it("labels a default-slot credential as the device default binding", () => {
+    const row = tenantRow(tenancyWith(display({ source: "credential_default_slot" })));
+    expect(row.display).toBe(
+      "c231d9da · via default-slot credential (device default binding) · 1 of 4 bound",
+    );
+  });
+
+  it("labels the data-plane sources", () => {
+    expect(tenantRow(tenancyWith(display({ source: "data_plane" }))).display).toBe(
+      "c231d9da · via runner data plane · 1 of 4 bound",
+    );
+    expect(tenantRow(tenancyWith(display({ source: "data_plane_device" }))).display).toBe(
+      "c231d9da · via runner data plane (device default binding) · 1 of 4 bound",
+    );
+  });
+
+  it("labels a stamp-only tenant as a stamp, not an observation", () => {
+    const row = tenantRow(
+      tenancyWith(
+        display({ status: "stamp_only", source: "row_stamp", reason: "nonce_not_live" }),
+        QONTINUI,
+      ),
+    );
+    expect(row.value).toBe(QONTINUI);
+    expect(row.display).toBe(
+      "c231d9da · spawn stamp only — acting tenant not observed · 1 of 4 bound",
+    );
+    expect(row.title).toContain("the acting tenant is unknown (nonce_not_live)");
+  });
+
+  it("renders unknown WITH its reason, and carries no value", () => {
+    const row = tenantRow(
+      tenancyWith(
+        display({ status: "unknown", tenantId: null, source: null, reason: "no_session_nonce" }),
+      ),
+    );
+    expect(row.value).toBeNull();
+    expect(row.display).toBe("unknown — no_session_nonce");
+  });
+
+  it("renders an absent display as the older-runner unknown", () => {
+    expect(tenantRow(tenancyWith(null))).toEqual({
+      value: null,
+      display: "unknown — runner predates tenancy.display",
+    });
+    expect(TENANT_DISPLAY_ABSENT_TEXT).toBe("unknown — runner predates tenancy.display");
+    expect(tenantRow(null).display).toBe("unknown — runner predates tenancy.display");
+  });
+
+  it("renders a mismatch grouped by tenant, every conflicting leg named", () => {
+    const row = tenantRow(
+      tenancyWith(
+        display({
+          status: "mismatch",
+          conflicts: [
+            { leg: "credential", tenantId: QONTINUI },
+            { leg: "data_plane", tenantId: QONTINUI },
+            { leg: "coord_row", tenantId: PIZZERIA },
+          ],
+        }),
+      ),
+    );
+    expect(row.value).toBe(QONTINUI);
+    expect(row.display).toBe("MISMATCH c231d9da (credential, data_plane) ≠ 33333333 (coord_row)");
+    expect(row.title).toContain(`Conflict — coord_row: ${PIZZERIA}`);
+  });
+
+  it("renders a mismatch with NO acting tenant as a mismatch, with the reason", () => {
+    const row = tenantRow(
+      tenancyWith(
+        display({
+          status: "mismatch",
+          tenantId: null,
+          source: null,
+          reason: "no_session_nonce",
+          conflicts: [
+            { leg: "spawn_device_default", tenantId: QONTINUI },
+            { leg: "coord_row", tenantId: PIZZERIA },
+          ],
+        }),
+      ),
+    );
+    expect(row.value).toBeNull();
+    expect(row.display).toBe(
+      "MISMATCH c231d9da (spawn_device_default) ≠ 33333333 (coord_row) — acting tenant unknown — no_session_nonce",
+    );
+    expect(row.display).not.toContain("no reason given");
+    expect(row.title).toContain("Acting tenant: unknown — no_session_nonce");
+  });
+
+  it("says the credential is unknown beside a data-plane answer", () => {
+    for (const [source, via] of [
+      ["data_plane", "via runner data plane"],
+      ["data_plane_device", "via runner data plane (device default binding)"],
+    ]) {
+      const row = tenantRow(tenancyWith(display({ source, reason: "nonce_not_live" })));
+      expect(row.display, source).toBe(
+        `c231d9da · ${via} · credential unknown — nonce_not_live · 1 of 4 bound`,
+      );
+      expect(row.title, source).toContain("Credential: unknown — nonce_not_live");
+    }
+  });
+
+  it("describes a terminal-hosted (not_applicable) coord row without a warning", () => {
+    const t = tenancyWith(display());
+    t.coordRow = {
+      status: "not_applicable",
+      tenantId: null,
+      source: null,
+      reason: "terminal_plane_row_is_the_data_plane_leg",
+    };
+    const title = tenantRow(t).title ?? "";
+    expect(title).toContain(
+      "Coord session row: terminal-hosted — its tenant is the data-plane leg above",
+    );
+    expect(title).not.toContain("Coord session row: unknown");
+  });
+
+  it("shows a verdict-only mismatch's detail inline", () => {
+    const row = tenantRow(
+      tenancyWith(
+        display({
+          status: "mismatch",
+          conflicts: [{ leg: "credential", tenantId: QONTINUI }],
+          conflictDetail: "answered by pizzeria",
+        }),
+      ),
+    );
+    expect(row.display).toBe("MISMATCH c231d9da (credential) — answered by pizzeria");
+    expect(row.title).toContain("Detail: answered by pizzeria");
+  });
+
+  it("carries the full acting id, the full bound set and coord's row in the title", () => {
+    const title = tenantRow(tenancyWith(display({ tenantSlug: "qontinui" }))).title ?? "";
+    expect(title.split("\n")).toEqual([
+      `Acting tenant: ${QONTINUI} (qontinui) — source credential`,
+      `Bound tenants (4): ${MERYTS}, ${QONTINUI}, ${BAUHAUS}, ${PIZZERIA}`,
+      `Coord session row: ${QONTINUI} (as registered by this runner)`,
+    ]);
+  });
+
+  it("is what sessionInfoRows renders for the tenant field, copyable", () => {
+    const rows = sessionInfoRows(body({ tenancy: tenancyWith(display()) }));
+    const tenant = rows.find((r) => r.field === "tenant");
+    expect(tenant?.label).toBe("Tenant");
+    expect(tenant?.display).toBe("c231d9da · via credential · 1 of 4 bound");
+    expect(tenant?.copyable).toBe(true);
+  });
+});
+
+describe("tenantBoundMembership — the one bound-set classification", () => {
+  const EMPTY = { status: "measured" as const, tenantIds: [], reason: null };
+  const UNREAD = { status: "unknown" as const, tenantIds: [], reason: "paired_user_unreadable" };
+
+  it("classifies each measured membership", () => {
+    expect(tenantBoundMembership(display())).toBe("in");
+    expect(
+      tenantBoundMembership(
+        display({
+          bound: { status: "measured", tenantIds: [MERYTS], reason: null },
+          actingInBoundSet: false,
+        }),
+      ),
+    ).toBe("out");
+    expect(tenantBoundMembership(display({ actingInBoundSet: null }))).toBe("unknown");
+  });
+
+  it("never claims membership of a set it could not read", () => {
+    // Even a confident flag beside an unread set: the normalizer nulls it, and
+    // the classifier does not depend on that.
+    expect(tenantBoundMembership(display({ bound: UNREAD, actingInBoundSet: true }))).toBe(
+      "set-unread",
+    );
+    expect(tenantBoundMembership(display({ bound: UNREAD, actingInBoundSet: false }))).toBe(
+      "set-unread",
+    );
+  });
+
+  it("reads a measured empty set as no bound tenants, whatever membership claims", () => {
+    for (const actingInBoundSet of [true, false, null]) {
+      expect(tenantBoundMembership(display({ bound: EMPTY, actingInBoundSet }))).toBe(
+        "no-bound-tenants",
+      );
+    }
+  });
+
+  it("places nothing in a non-empty set when the display names no tenant", () => {
+    expect(
+      tenantBoundMembership(
+        display({ status: "unknown", tenantId: null, actingInBoundSet: false }),
+      ),
+    ).toBeNull();
+    expect(tenantBoundMembership(display({ tenantId: "   ", actingInBoundSet: false }))).toBeNull();
+  });
+
+  it("gives the row no tenant, and so no membership, for a blank display id", () => {
+    // Before, a whitespace id reached the suffix and read `· not among 1 bound`
+    // while the badge stated no membership for it.
+    const row = tenantRow(
+      tenancyWith(
+        display({
+          tenantId: "   ",
+          bound: { status: "measured", tenantIds: [MERYTS], reason: null },
+          actingInBoundSet: false,
+        }),
+      ),
+    );
+    expect(row.value).toBeNull();
+    expect(row.display).toBe("unknown — no reason given");
+  });
+
+  it("is the classification the Tenant row's suffix switches on, arm for arm", () => {
+    const suffix: Record<TenantBoundMembership, string> = {
+      in: " · 1 of 4 bound",
+      out: " · not among 1 bound",
+      unknown: " · 4 bound, membership unknown",
+      "no-bound-tenants": " · this runner has no bound tenants",
+      "set-unread": " · bound set unknown — paired_user_unreadable",
+    };
+    const cases: TenantDisplay[] = [
+      display(),
+      display({
+        bound: { status: "measured", tenantIds: [MERYTS], reason: null },
+        actingInBoundSet: false,
+      }),
+      display({ actingInBoundSet: null }),
+      display({ bound: EMPTY, multiBound: false, actingInBoundSet: false }),
+      display({ bound: UNREAD, multiBound: null, actingInBoundSet: null }),
+      // Unread beside a confident flag, which the normalizer would null: the
+      // row must still not claim membership, so it holds the classifier's order.
+      display({ bound: UNREAD, multiBound: null, actingInBoundSet: true }),
+      display({ bound: UNREAD, multiBound: null, actingInBoundSet: false }),
+    ];
+    const seen = new Set<TenantBoundMembership>();
+    for (const d of cases) {
+      const membership = tenantBoundMembership(d);
+      expect(membership).not.toBeNull();
+      seen.add(membership as TenantBoundMembership);
+      expect(tenantRow(tenancyWith(d)).display).toBe(
+        `c231d9da · via credential${suffix[membership as TenantBoundMembership]}`,
+      );
+    }
+    // Every arm in `suffix` was exercised. A NEW arm is caught by the compiler
+    // instead: `boundSuffix`'s switch is exhaustive (test files are not
+    // typechecked, so this table cannot catch one).
+    expect([...seen].sort()).toEqual(Object.keys(suffix).sort());
+  });
+});
+
+describe("spawnStampRow — the spawn stamp on its own row", () => {
+  it("shows the stamp when the spawn chose a tenant", () => {
+    expect(spawnStampRow(tenancyWith(display(), BAUHAUS))).toEqual({
+      value: BAUHAUS,
+      display: BAUHAUS,
+    });
+  });
+
+  it("names the recorded device default when the spawn chose none", () => {
+    expect(spawnStampRow(tenancyWith(display()))).toEqual({
+      value: null,
+      display: `none — device default at spawn: ${QONTINUI}`,
+    });
+  });
+
+  it("says not recorded, with the reason, when the default was not recorded", () => {
+    const t = tenancyWith(display());
+    t.row.spawnDeviceDefaultStatus = "unknown";
+    t.row.spawnDeviceDefaultReason = "not_recorded";
+    expect(spawnStampRow(t).display).toBe("not recorded (not_recorded)");
+  });
+
+  it("is labelled Spawned for in the row set", () => {
+    const row = sessionInfoRows(body({ tenancy: tenancyWith(display()) })).find(
+      (r) => r.field === "spawn-stamp",
+    );
+    expect(row?.label).toBe("Spawned for");
+  });
+});
+
+describe("normalizeTenantDisplay", () => {
+  it("trims the display tenant once, so a blank id names no tenant to any reader", () => {
+    expect(normalizeTenantDisplay({ ...display(), tenantId: "   " })?.tenantId).toBeNull();
+    expect(normalizeTenantDisplay({ ...display(), tenantId: ` ${QONTINUI} ` })?.tenantId).toBe(
+      QONTINUI,
+    );
+    const blank = normalizeTenantDisplay({ ...display(), tenantId: "   " });
+    expect(blank).not.toBeNull();
+    expect(tenantBoundMembership(blank as TenantDisplay)).toBeNull();
+  });
+
+  it("rejects an unrecognised status rather than guessing one", () => {
+    expect(normalizeTenantDisplay({ ...display(), status: "maybe" })).toBeNull();
+    expect(normalizeTenantDisplay(null)).toBeNull();
+  });
+
+  it("never turns an unknown bound set into a confident false", () => {
+    const d = normalizeTenantDisplay({
+      ...display(),
+      bound: { status: "unknown", tenantIds: [QONTINUI], reason: "x" },
+      multiBound: false,
+    });
+    expect(d?.multiBound).toBeNull();
+    expect(d?.bound.tenantIds).toEqual([]);
+  });
+
+  it("keeps the display when the bound set is missing or malformed, the set alone unknown", () => {
+    for (const bound of [undefined, null, "x", 7, []]) {
+      const d = normalizeTenantDisplay({ ...display(), bound });
+      expect(d, String(bound)).not.toBeNull();
+      expect(d?.tenantId).toBe(QONTINUI);
+      expect(d?.status).toBe("resolved");
+      expect(d?.bound).toEqual({ status: "unknown", tenantIds: [], reason: "malformed" });
+      expect(d?.multiBound).toBeNull();
+      expect(d?.actingInBoundSet).toBeNull();
+    }
+    const row = tenantRow(tenancyWith(normalizeTenantDisplay({ ...display(), bound: undefined })));
+    expect(row.display).toBe("c231d9da · via credential · bound set unknown — malformed");
+    expect(row.display).not.toContain("predates");
+  });
+
+  it("gives an unknown bound set with no reason the reason_missing reason", () => {
+    const d = normalizeTenantDisplay({ ...display(), bound: { status: "unknown" } });
+    expect(d?.bound).toEqual({ status: "unknown", tenantIds: [], reason: "reason_missing" });
+    const kept = normalizeTenantDisplay({
+      ...display(),
+      bound: { status: "unknown", reason: "paired_user_unreadable" },
+    });
+    expect(kept?.bound.reason).toBe("paired_user_unreadable");
+  });
+
+  it("drops conflict entries missing a leg or a tenant", () => {
+    const d = normalizeTenantDisplay({
+      ...display(),
+      conflicts: [{ leg: "credential", tenantId: QONTINUI }, { leg: "x" }, 7],
+    });
+    expect(d?.conflicts).toEqual([{ leg: "credential", tenantId: QONTINUI }]);
+  });
+});
+
+/**
+ * The cross-language contract: every case in the fixture is EXACTLY what
+ * `commands/session_tenant_display.rs` serializes (its own test pins that
+ * side), and this side renders it — so a rename on either side fails a test.
+ */
+describe("tenancy.display Rust-fixture contract", () => {
+  const fixture = JSON.parse(
+    readFileSync(
+      fileURLToPath(new URL("./__fixtures__/session-tenancy-display.json", import.meta.url)),
+      "utf8",
+    ),
+  ) as { name: string; tenancy: unknown }[];
+  const byName = Object.fromEntries(fixture.map((c) => [c.name, normalizeTenancy(c.tenancy)]));
+
+  it("normalizes every Rust case without dropping the display", () => {
+    expect(fixture.map((c) => c.name)).toEqual([
+      "regression_2026_10_17",
+      "adopted_terminal_row",
+      "resumed_unconfirmed_terminal_row",
+      "resumed_observed_same_terminal_row",
+      "resumed_observed_other_terminal_row",
+      "adopted_non_terminal_row",
+      "coord_row_mismatch",
+      "unknown_no_nonce",
+      "mismatch_no_acting_tenant",
+      "data_plane_credential_unknown",
+    ]);
+    for (const c of fixture) {
+      expect(byName[c.name]?.display, c.name).not.toBeNull();
+      expect(byName[c.name]?.coordRow, c.name).not.toBeNull();
+    }
+  });
+
+  it("renders the 2026-10-17 regression case as the acting tenant", () => {
+    expect(tenantRow(byName.regression_2026_10_17).display).toBe(
+      "qontinui (c231d9da) · via credential · 1 of 4 bound",
+    );
+    // The real terminal shape: the coord-row leg is not applicable, and the
+    // comparison still AGREES.
+    expect(byName.regression_2026_10_17?.coordRow?.status).toBe("not_applicable");
+    expect(byName.regression_2026_10_17?.divergence).toBe("agree");
+    expect(spawnStampRow(byName.regression_2026_10_17).display).toBe(
+      `none — device default at spawn: ${QONTINUI}`,
+    );
+  });
+
+  it("keeps agreement when auto-bind adopted the terminal's own row", () => {
+    const t = byName.adopted_terminal_row;
+    expect(t?.coordRow?.status).toBe("not_applicable");
+    expect(t?.coordRow?.reason).toBe("terminal_plane_row_is_the_data_plane_leg");
+    expect(t?.divergence).toBe("agree");
+    expect(tenantRow(t).display).toBe("qontinui (c231d9da) · via credential · 1 of 4 bound");
+  });
+
+  it("leaves a resumed pane's unconfirmed terminal row unknown, not agree", () => {
+    const t = byName.resumed_unconfirmed_terminal_row;
+    expect(t?.coordRow?.status).toBe("unknown");
+    expect(t?.coordRow?.reason).toBe("terminal_row_resume_unconfirmed");
+    expect(t?.divergence).toBe("unknown");
+    expect(tenantRow(t).display).toBe("qontinui (c231d9da) · via credential · 1 of 4 bound");
+    expect(tenantRow(t).title ?? "").toContain(
+      "Coord session row: unknown — terminal_row_resume_unconfirmed",
+    );
+  });
+
+  it("keeps agreement when the resume probe's answer names the acting tenant", () => {
+    const t = byName.resumed_observed_same_terminal_row;
+    expect(t?.coordRow?.status).toBe("not_applicable");
+    expect(t?.coordRow?.reason).toBe("terminal_plane_row_is_the_data_plane_leg");
+    expect(t?.divergence).toBe("agree");
+    expect(tenantRow(t).display).toBe("qontinui (c231d9da) · via credential · 1 of 4 bound");
+  });
+
+  it("shows the mismatch when the resume probe's answer names another tenant", () => {
+    const t = byName.resumed_observed_other_terminal_row;
+    expect(t?.coordRow?.status).toBe("registered");
+    expect(t?.coordRow?.tenantId).toBe(PIZZERIA);
+    expect(t?.coordRow?.source).toBe("resume_probe");
+    expect(t?.diverged).toBe(true);
+    expect(t?.divergence).toBe("diverged");
+    expect(tenantRow(t).display).toBe(
+      "MISMATCH c231d9da (credential, data_plane) ≠ 33333333 (coord_row)",
+    );
+    const title = tenantRow(t).title ?? "";
+    expect(title).toContain(`Conflict — coord_row: ${PIZZERIA}`);
+    expect(title).toContain(
+      `Coord session row: ${PIZZERIA} (as coord answered this runner's resume probe)`,
+    );
+  });
+
+  it("leaves an adopted row that is not the terminal's unknown", () => {
+    const t = byName.adopted_non_terminal_row;
+    expect(t?.coordRow?.status).toBe("unknown");
+    expect(t?.coordRow?.reason).toBe("adopted_row_tenant_not_observed");
+    expect(t?.divergence).toBe("unknown");
+    expect(tenantRow(t).title ?? "").toContain(
+      "Coord session row: unknown — adopted_row_tenant_not_observed",
+    );
+  });
+
+  it("renders the coord-row mismatch case as MISMATCH", () => {
+    expect(tenantRow(byName.coord_row_mismatch).display).toBe(
+      "MISMATCH c231d9da (credential, data_plane) ≠ 33333333 (coord_row)",
+    );
+  });
+
+  it("renders the unknown case with its reason and the bound set withheld", () => {
+    const t = byName.unknown_no_nonce;
+    expect(tenantRow(t).display).toBe("unknown — no_session_nonce");
+    expect(t?.display?.multiBound).toBeNull();
+    expect(t?.coordRow?.reason).toBe("not_registered_by_this_process");
+    expect(t?.divergence).toBe("unknown");
+  });
+
+  it("renders the no-acting-tenant mismatch with its conflicts and reason", () => {
+    expect(tenantRow(byName.mismatch_no_acting_tenant).display).toBe(
+      "MISMATCH c231d9da (spawn_device_default) ≠ 33333333 (coord_row) — acting tenant unknown — no_session_nonce",
+    );
+  });
+
+  it("renders a data-plane answer beside an unknown credential", () => {
+    expect(tenantRow(byName.data_plane_credential_unknown).display).toBe(
+      "c231d9da · via runner data plane · credential unknown — nonce_not_live · 1 of 4 bound",
+    );
+  });
+});
+
+describe("coordRowSourceText", () => {
+  it("names the two known provenances", () => {
+    expect(coordRowSourceText("registrar")).toBe("as registered by this runner");
+    expect(coordRowSourceText("resume_probe")).toBe("as coord answered this runner's resume probe");
+  });
+
+  it("never gives an unknown or absent source a provenance", () => {
+    expect(coordRowSourceText("something_new")).toBe("source something_new");
+    expect(coordRowSourceText(null)).toBe("source unstated");
   });
 });

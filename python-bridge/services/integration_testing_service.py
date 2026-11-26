@@ -49,6 +49,8 @@ class TestStatus(Enum):
     FAILED = "failed"
     SKIPPED = "skipped"
     ERROR = "error"
+    # Nothing was recorded that could decide the run; never read as passed.
+    UNKNOWN = "unknown"
 
 
 class MockMode(Enum):
@@ -742,93 +744,6 @@ class IntegrationTestingService:
             },
         }
 
-    def run_test_case(self, test_case: dict[str, Any]) -> dict[str, Any]:
-        """
-        Run a complete test case.
-
-        Args:
-            test_case: Dictionary with test case definition
-
-        Returns:
-            Dictionary with test result
-        """
-        test_id = test_case.get("test_id", str(uuid.uuid4())[:8])
-        test_name = test_case.get("name", "Unnamed Test")
-
-        result = TestResult(
-            test_id=test_id,
-            test_name=test_name,
-            status=TestStatus.RUNNING,
-            assertions=[],
-            start_time=datetime.utcnow(),
-        )
-
-        self.emit_log("info", f"Running test: {test_name}")
-
-        try:
-            # Run setup actions
-            for action in test_case.get("setup_actions", []):
-                self._execute_test_action(action)
-
-            # Run assertions
-            all_passed = True
-            for assertion_def in test_case.get("assertions", []):
-                assertion_result = self.run_assertion(
-                    assertion_type=assertion_def.get("type"),
-                    target=assertion_def.get("target"),
-                    expected=assertion_def.get("expected"),
-                    timeout_seconds=assertion_def.get("timeout_seconds", 30.0),
-                )
-
-                if assertion_result.get("success"):
-                    assertion_data = assertion_result.get("assertion", {})
-                    assertion = TestAssertion(
-                        assertion_id=assertion_data.get("assertion_id", ""),
-                        assertion_type=AssertionType(assertion_data.get("type", "state_reached")),
-                        target=assertion_data.get("target", ""),
-                        passed=assertion_data.get("passed", False),
-                        error_message=assertion_data.get("error_message"),
-                        actual_value=assertion_data.get("actual_value"),
-                    )
-                    result.assertions.append(assertion)
-                    if not assertion.passed:
-                        all_passed = False
-
-            # Run teardown actions
-            for action in test_case.get("teardown_actions", []):
-                self._execute_test_action(action)
-
-            result.status = TestStatus.PASSED if all_passed else TestStatus.FAILED
-
-        except Exception as e:
-            result.status = TestStatus.ERROR
-            result.error_message = str(e)
-            self.emit_log("error", f"Test {test_name} failed with error: {e}")
-
-        result.end_time = datetime.utcnow()
-        result.duration_ms = (result.end_time - result.start_time).total_seconds() * 1000
-        result.mocked_actions = list(self._mocked_actions)
-
-        # Add to current run
-        if self._current_run_id and self._current_run_id in self._test_runs:
-            self._test_runs[self._current_run_id].test_results.append(result)
-
-        return {"success": True, "result": result.to_dict()}
-
-    def _execute_test_action(self, action: dict[str, Any]) -> None:
-        """Execute a test setup/teardown action."""
-        action_type = action.get("type", "")
-
-        if action_type == "go_to_state":
-            self.traverse_to_state(action.get("state", ""), execute=True)
-        elif action_type == "wait":
-            time.sleep(action.get("seconds", 1))
-        elif action_type == "reset_navigation":
-            if QONTINUI_AVAILABLE:
-                navigation_api.reset_to_initial_state()
-        elif action_type == "set_mock_mode":
-            self.set_mock_mode(action.get("mode", "disabled"))
-
     def end_test_run(self) -> dict[str, Any]:
         """
         End the current test run.
@@ -842,8 +757,12 @@ class IntegrationTestingService:
         run = self._test_runs[self._current_run_id]
         run.end_time = datetime.utcnow()
 
-        # Determine overall status
-        if any(r.status == TestStatus.ERROR for r in run.test_results):
+        # Determine overall status. A run that recorded no test result checked
+        # nothing, so it is UNKNOWN, never PASSED: the all() below is True over
+        # an empty list (served policy verification-and-evidence/silent-empty-is-unknown).
+        if not run.test_results:
+            run.status = TestStatus.UNKNOWN
+        elif any(r.status == TestStatus.ERROR for r in run.test_results):
             run.status = TestStatus.ERROR
         elif any(r.status == TestStatus.FAILED for r in run.test_results):
             run.status = TestStatus.FAILED

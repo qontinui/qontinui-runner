@@ -98,6 +98,15 @@ pub struct Grid {
     /// see [`Grid::sync_output`].
     sync_output_opened_at: Option<Instant>,
     alt_screen: bool,
+    /// Exclusive end, in the session's absolute output stream, of the bytes this
+    /// grid has absorbed (`ring` / `terminal-output` offsets), taken at the
+    /// last point where no escape sequence or UTF-8 character was open.
+    /// Surfaced in the snapshot so a frontend that paints it knows which stream
+    /// bytes the paint already contains, and can feed the rest to a fresh
+    /// parser from a clean boundary. Set via [`Grid::absorb_stream`].
+    stream_end: u64,
+    /// Tracks whether the absorbed stream is at a sequence boundary.
+    stream_boundary: SequenceBoundary,
     /// DEC private mode 2004 — bracketed paste. Tracked here because it is the
     /// only place in the runner that sees EVERY output byte of a session and
     /// already parses DEC private modes; the frontend's copy lives inside a
@@ -181,6 +190,8 @@ impl Grid {
             sync_output: false,
             sync_output_opened_at: None,
             alt_screen: false,
+            stream_end: 0,
+            stream_boundary: SequenceBoundary::default(),
             bracketed_paste: false,
             dirty: false,
             agent_status_sideband: None,
@@ -349,6 +360,25 @@ impl Grid {
         trimmed
     }
 
+    /// The DIM attribute of each cell of `row`, indexed as [`Self::row_text`]'s
+    /// characters are (wide-glyph right halves skipped, NOT trimmed), so entry
+    /// `i` belongs to `row_text(row).chars().nth(i)`. Empty for a row off the
+    /// grid. Claude Code paints its prompt ghost text (a suggestion, the
+    /// placeholder) DIM and typed input normal, so this tells them apart where
+    /// the text alone cannot.
+    pub fn row_dim_mask(&self, row: u16) -> Vec<bool> {
+        if row >= self.rows {
+            return Vec::new();
+        }
+        let start = (row as usize) * (self.cols as usize);
+        let end = start + self.cols as usize;
+        self.cells[start..end]
+            .iter()
+            .filter(|cell| cell.attrs & ATTR_WIDE_RIGHT == 0)
+            .map(|cell| cell.attrs & ATTR_DIM != 0)
+            .collect()
+    }
+
     pub fn lines(&self) -> Vec<String> {
         (0..self.rows).map(|r| self.row_text(r)).collect()
     }
@@ -360,8 +390,27 @@ impl Grid {
             cursor: self.cursor,
             title: self.title.clone(),
             alt_screen: self.alt_screen,
+            stream_offset: self.stream_boundary.resumable().then_some(self.stream_end),
             cells: self.cells.clone(),
         }
+    }
+
+    /// Record that the grid has absorbed `data`, which starts at absolute stream
+    /// offset `start`. The stream end advances to the last byte boundary in
+    /// `data` where no escape sequence or UTF-8 character is open, so the
+    /// snapshot's `stream_offset` never falls inside one: a read boundary can
+    /// split `ESC [ 3 8 ; 5 ;` from `1 9 6 m`, and a fresh xterm fed from the
+    /// middle would print `196m` as text.
+    pub fn absorb_stream(&mut self, start: u64, data: &[u8]) {
+        if let Some(boundary) = self.stream_boundary.scan(data) {
+            self.set_stream_end(start + boundary as u64);
+        }
+    }
+
+    /// Advance the stream end to `end` (exclusive). Monotonic: an older offset
+    /// never moves it back.
+    fn set_stream_end(&mut self, end: u64) {
+        self.stream_end = self.stream_end.max(end);
     }
 
     /// Convenience: feed bytes through a parser into this grid.
@@ -515,16 +564,30 @@ impl Grid {
             self.reset_pen();
             return;
         }
-        let flat: Vec<u16> = params.iter().flatten().copied().collect();
+        // One entry per `;`-separated parameter, each holding its `:` sub-
+        // parameters. A colon group is ONE attribute (`4:2` is double
+        // underline, `38:2::R:G:B` one colour) and its sub-parameters are
+        // never read as SGR codes of their own: flattening them would turn a
+        // trailing `2` into DIM — and DIM on the input row is how ghost text
+        // is told from typed text.
+        let groups: Vec<&[u16]> = params.iter().collect();
         let mut i = 0;
-        while i < flat.len() {
-            let p = flat[i];
+        while i < groups.len() {
+            let group = groups[i];
+            let p = group.first().copied().unwrap_or(0);
             match p {
                 0 => self.reset_pen(),
                 1 => self.cur_attrs |= ATTR_BOLD,
                 2 => self.cur_attrs |= ATTR_DIM,
                 3 => self.cur_attrs |= ATTR_ITALIC,
-                4 => self.cur_attrs |= ATTR_UNDERLINE,
+                // `4:0` is "no underline"; any other `4:n` style underlines.
+                4 => {
+                    if group.get(1) == Some(&0) {
+                        self.cur_attrs &= !ATTR_UNDERLINE;
+                    } else {
+                        self.cur_attrs |= ATTR_UNDERLINE;
+                    }
+                }
                 7 => self.cur_attrs |= ATTR_INVERSE,
                 9 => self.cur_attrs |= ATTR_STRIKE,
                 22 => self.cur_attrs &= !(ATTR_BOLD | ATTR_DIM),
@@ -538,37 +601,53 @@ impl Grid {
                 40..=47 => self.cur_bg = ansi_color_16(p as u8 - 40, false),
                 100..=107 => self.cur_bg = ansi_color_16(p as u8 - 100, true),
                 49 => self.cur_bg = COLOR_DEFAULT,
-                38 | 48 => {
-                    let is_fg = p == 38;
-                    if i + 1 < flat.len() {
-                        match flat[i + 1] {
+                // 58 is the underline colour: the grid does not keep it, but
+                // its parameters must be consumed like 38/48's, or a stray `2`
+                // in `58;2;R;G;B` reads as DIM.
+                38 | 48 | 58 => {
+                    let color = if group.len() > 1 {
+                        // Colon form, self-contained: `38:5:n`, `38:2:R:G:B`,
+                        // or the ITU `38:2:CS:R:G:B` with a colour-space slot.
+                        match group[1] {
+                            5 => group.get(2).map(|&n| palette_256(n as u8)),
                             2 => {
-                                if i + 4 < flat.len() {
-                                    let r = flat[i + 2] as u8;
-                                    let g = flat[i + 3] as u8;
-                                    let b = flat[i + 4] as u8;
-                                    let c = pack_rgb(r, g, b);
-                                    if is_fg {
-                                        self.cur_fg = c;
-                                    } else {
-                                        self.cur_bg = c;
-                                    }
-                                    i += 4;
-                                }
+                                let rgb = if group.len() >= 6 {
+                                    &group[3..6]
+                                } else {
+                                    group.get(2..5).unwrap_or(&[])
+                                };
+                                (rgb.len() == 3)
+                                    .then(|| pack_rgb(rgb[0] as u8, rgb[1] as u8, rgb[2] as u8))
                             }
-                            5 => {
-                                if i + 2 < flat.len() {
-                                    let n = flat[i + 2] as u8;
-                                    let c = palette_256(n);
-                                    if is_fg {
-                                        self.cur_fg = c;
-                                    } else {
-                                        self.cur_bg = c;
-                                    }
-                                    i += 2;
-                                }
+                            _ => None,
+                        }
+                    } else {
+                        // Semicolon form: the selector and values are the
+                        // following parameters, consumed here.
+                        let next = |k: usize| groups.get(i + k).and_then(|g| g.first()).copied();
+                        match next(1) {
+                            Some(5) if i + 2 < groups.len() => {
+                                let n = next(2).unwrap_or(0) as u8;
+                                i += 2;
+                                Some(palette_256(n))
                             }
-                            _ => {}
+                            Some(2) if i + 4 < groups.len() => {
+                                let (r, g, b) = (
+                                    next(2).unwrap_or(0) as u8,
+                                    next(3).unwrap_or(0) as u8,
+                                    next(4).unwrap_or(0) as u8,
+                                );
+                                i += 4;
+                                Some(pack_rgb(r, g, b))
+                            }
+                            _ => None,
+                        }
+                    };
+                    if let Some(c) = color {
+                        if p == 38 {
+                            self.cur_fg = c;
+                        } else if p == 48 {
+                            self.cur_bg = c;
                         }
                     }
                 }
@@ -582,6 +661,152 @@ impl Grid {
         self.cur_fg = COLOR_DEFAULT;
         self.cur_bg = COLOR_DEFAULT;
         self.cur_attrs = 0;
+    }
+}
+
+// ---- Sequence boundary ---------------------------------------------------
+
+/// Where an escape sequence or UTF-8 character open across a read would leave
+/// a parser. A coarse model of the VT500 state machine `vte` 0.15 implements
+/// (whose own state is private): enough to tell "between sequences" from
+/// "inside one", which is all [`Grid::absorb_stream`] needs. It follows vte
+/// where vte and the frontend's parser could disagree on where a sequence
+/// ends: a raw 0x9C (8-bit ST) ends a DCS, as in vte's passthrough, but not
+/// SOS / PM / APC, which vte ends only on ESC, CAN or SUB.
+///
+/// Known divergence, between the parsers rather than in this tracker: vte
+/// decodes UTF-8 in ground, so a UTF-8-encoded C1 (`C2 9C`, U+009C) is a
+/// character to it, while a parser that honours C1 controls in UTF-8 may act
+/// on it. This tracker sides with vte, which drew the grid being painted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SeqState {
+    #[default]
+    Ground,
+    Escape,
+    EscapeIntermediate,
+    Csi,
+    /// OSC: ends at BEL, or at ST (`ESC \`, via `Escape`).
+    Osc,
+    /// DCS: ends at ST (via `Escape`) or a raw 0x9C.
+    Dcs,
+    /// SOS, PM, APC: end at ST (via `Escape`).
+    SosPmApc,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SequenceBoundary {
+    state: SeqState,
+    /// UTF-8 continuation bytes still owed by the character in progress.
+    utf8_left: u8,
+    /// The open sequence has had a C0 control EXECUTED inside it (vte, like
+    /// xterm, executes C0 in ESC and CSI states). The grid already shows its
+    /// effect, so resuming a fresh parser from before the sequence would apply
+    /// it twice: while this holds, no clean resume point exists.
+    executed_c0: bool,
+}
+
+impl SequenceBoundary {
+    fn at_boundary(&self) -> bool {
+        self.state == SeqState::Ground && self.utf8_left == 0
+    }
+
+    /// Whether the last boundary is still a faithful resume point: nothing past
+    /// it has already changed the grid.
+    fn resumable(&self) -> bool {
+        !self.executed_c0
+    }
+
+    /// Feed `data`; return the index just past the last byte after which the
+    /// stream was at a boundary (`Some(0)` when only the start was), or `None`
+    /// when no point in `data` was.
+    fn scan(&mut self, data: &[u8]) -> Option<usize> {
+        let mut last = self.at_boundary().then_some(0);
+        for (i, &b) in data.iter().enumerate() {
+            self.step(b);
+            if self.at_boundary() {
+                last = Some(i + 1);
+            }
+        }
+        last
+    }
+
+    fn step(&mut self, b: u8) {
+        if self.state != SeqState::Ground {
+            // "Anywhere" transitions: CAN and SUB abort a sequence, ESC starts
+            // one. BEL ends an OSC; a raw 0x9C ends a DCS.
+            let next = match (b, self.state) {
+                (0x18 | 0x1A, _) => Some(SeqState::Ground),
+                (0x1B, _) => Some(SeqState::Escape),
+                (0x07, SeqState::Osc) | (0x9C, SeqState::Dcs) => Some(SeqState::Ground),
+                _ => None,
+            };
+            if let Some(next) = next {
+                self.state = next;
+                self.executed_c0 &= next != SeqState::Ground;
+                return;
+            }
+            if matches!(b, 0x00..=0x17 | 0x19 | 0x1C..=0x1F)
+                && matches!(
+                    self.state,
+                    SeqState::Escape | SeqState::EscapeIntermediate | SeqState::Csi
+                )
+            {
+                self.executed_c0 = true;
+                return;
+            }
+        }
+        self.state = match self.state {
+            SeqState::Ground => {
+                if self.utf8_left > 0 {
+                    if (0x80..=0xBF).contains(&b) {
+                        self.utf8_left -= 1;
+                        return;
+                    }
+                    // Invalid continuation: the character is abandoned, and
+                    // this byte starts afresh.
+                    self.utf8_left = 0;
+                }
+                match b {
+                    0x1B => SeqState::Escape,
+                    0xC2..=0xDF => {
+                        self.utf8_left = 1;
+                        SeqState::Ground
+                    }
+                    0xE0..=0xEF => {
+                        self.utf8_left = 2;
+                        SeqState::Ground
+                    }
+                    0xF0..=0xF4 => {
+                        self.utf8_left = 3;
+                        SeqState::Ground
+                    }
+                    // ASCII, C0, and bytes that cannot start UTF-8 (0x80..=0xC1,
+                    // 0xF5..=0xFF), which a decoder replaces on the spot.
+                    _ => SeqState::Ground,
+                }
+            }
+            SeqState::Escape => match b {
+                0x20..=0x2F => SeqState::EscapeIntermediate,
+                b'[' => SeqState::Csi,
+                b']' => SeqState::Osc,
+                b'P' => SeqState::Dcs,
+                b'X' | b'^' | b'_' => SeqState::SosPmApc,
+                0x30..=0x7E => SeqState::Ground,
+                _ => SeqState::Escape,
+            },
+            SeqState::EscapeIntermediate => match b {
+                0x30..=0x7E => SeqState::Ground,
+                _ => SeqState::EscapeIntermediate,
+            },
+            SeqState::Csi => match b {
+                0x40..=0x7E => SeqState::Ground,
+                _ => SeqState::Csi,
+            },
+            state @ (SeqState::Osc | SeqState::Dcs | SeqState::SosPmApc) => state,
+        };
+        if self.state == SeqState::Ground {
+            self.executed_c0 = false;
+        }
     }
 }
 
@@ -600,6 +825,17 @@ pub struct GridSnapshot {
     /// hard-skips in that case rather than overlay alt content onto a fresh
     /// xterm. See `paintGrid.ts` / `TerminalInstance.tsx`.
     pub alt_screen: bool,
+    /// Exclusive end, in the absolute output stream, of the bytes this
+    /// snapshot reflects. A pane that paints the snapshot already shows every
+    /// stream byte before this offset, so it must not replay them on top of the
+    /// paint (`TerminalInstance.tsx`, the reconnect path).
+    ///
+    /// `None` while the stream is inside an escape sequence that has already
+    /// changed the grid (a C0 control executed inside a CSI): resuming from
+    /// before it would apply that control twice, so there is no faithful
+    /// resume point, and the reconnect path replays from the ring instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_offset: Option<u64>,
     pub cells: Vec<Cell>,
 }
 
@@ -925,6 +1161,21 @@ impl<'a> Perform for GridPerformer<'a> {
                 let n = first_param(params, 1);
                 self.grid.cursor.col = self.grid.cursor.col.saturating_sub(n);
             }
+            // CHA / HPA — cursor to an absolute column (1-based), row kept.
+            // Claude Code's diff renderer leans on CHA to skip cells it
+            // believes unchanged (`SAFE\x1b[8GTO`); ignoring it shifted every
+            // later glyph left, so the grid dropped blanks and letters
+            // (`✻Brewed for 1m 16s ·dne 9:09 AM`) and the idle predicate's
+            // finished-turn matcher could not read the line.
+            'G' | '`' => {
+                let col = first_param(params, 1).saturating_sub(1);
+                self.grid.cursor.col = col.min(self.grid.cols.saturating_sub(1));
+            }
+            // VPA — cursor to an absolute row (1-based), column kept.
+            'd' => {
+                let row = first_param(params, 1).saturating_sub(1);
+                self.grid.cursor.row = row.min(self.grid.rows.saturating_sub(1));
+            }
             'J' => {
                 let mode = first_param_default_zero(params, 0);
                 let cols = self.grid.cols;
@@ -1051,6 +1302,125 @@ impl<'a> Perform for GridPerformer<'a> {
 mod tests {
     use super::*;
 
+    /// Feed `reads` as the session reader would, from stream offset 0, and
+    /// return the snapshot's `stream_offset` after each.
+    fn offsets_after(reads: &[&[u8]]) -> Vec<u64> {
+        let mut grid = Grid::new(80, 24);
+        let mut parser = vte::Parser::new();
+        let mut start = 0u64;
+        reads
+            .iter()
+            .map(|r| {
+                grid.feed(&mut parser, r);
+                grid.absorb_stream(start, r);
+                start += r.len() as u64;
+                grid.snapshot().stream_offset.expect("a resumable boundary")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn stream_offset_tracks_absorbed_bytes() {
+        assert_eq!(Grid::new(80, 24).snapshot().stream_offset, Some(0));
+        assert_eq!(offsets_after(&[&b"hello"[..], &b" world"[..]]), vec![5, 11]);
+    }
+
+    #[test]
+    fn stream_offset_stops_before_an_sgr_split_across_reads() {
+        // `hello` then ESC [ 38;5; | 196m world: the offset after the first
+        // read must be before the ESC, so a fresh parser fed from it gets the
+        // whole sequence, not `196m` as text.
+        let first: &[u8] = b"hello\x1b[38;5;";
+        let second: &[u8] = b"196mworld";
+        assert_eq!(offsets_after(&[first, second]), vec![5, 21]);
+    }
+
+    #[test]
+    fn stream_offset_stops_before_a_split_utf8_character() {
+        // "é" is C3 A9.
+        assert_eq!(offsets_after(&[&b"ab\xC3"[..], &b"\xA9c"[..]]), vec![2, 5]);
+    }
+
+    #[test]
+    fn stream_offset_spans_osc_dcs_and_aborted_sequences() {
+        // An OSC title ended by BEL, then one ended by ST, split mid-string.
+        assert_eq!(
+            offsets_after(&[
+                &b"x\x1b]0;ti"[..],
+                &b"tle\x07y\x1b]2;a\x1b"[..],
+                &b"\\z"[..]
+            ]),
+            vec![1, 12, 20]
+        );
+        // A CSI aborted by CAN, and a DCS ended by ST.
+        assert_eq!(
+            offsets_after(&[&b"\x1b[3\x18q\x1bPq#0"[..], &b"\x1b\\r"[..]]),
+            vec![5, 13]
+        );
+        // A whole read inside a sequence leaves the offset where it was.
+        assert_eq!(
+            offsets_after(&[&b"ok\x1b]0;"[..], &b"long title"[..], &b"\x07"[..]]),
+            vec![2, 2, 17]
+        );
+    }
+
+    #[test]
+    fn stream_offset_handles_charset_sos_pm_apc_and_esc_esc() {
+        // ESC ( B (designate G0) split after the intermediate.
+        assert_eq!(offsets_after(&[&b"a\x1b("[..], &b"Bc"[..]]), vec![1, 5]);
+        // SOS, PM and APC each end only at ST, not at a raw 0x9C.
+        assert_eq!(
+            offsets_after(&[
+                &b"\x1bXs\x9c"[..],
+                &b"\x1b\\"[..],
+                &b"\x1b^p\x1b\\\x1b_a"[..],
+                &b"\x1b\\!"[..]
+            ]),
+            vec![0, 6, 11, 17]
+        );
+        // ESC ESC restarts the escape: the sequence is still open after it.
+        assert_eq!(offsets_after(&[&b"x\x1b\x1b"[..], &b"7y"[..]]), vec![1, 5]);
+    }
+
+    #[test]
+    fn stream_offset_ends_a_dcs_on_a_raw_st_byte() {
+        assert_eq!(
+            offsets_after(&[&b"\x1bPq#0"[..], &b"\x9cz"[..]]),
+            vec![0, 7]
+        );
+    }
+
+    #[test]
+    fn stream_offset_treats_invalid_utf8_as_complete() {
+        // Bytes that cannot start UTF-8, and a lead abandoned by a non-continuation.
+        assert_eq!(
+            offsets_after(&[&b"a\xff\x80\xc0"[..], &b"\xc3A"[..]]),
+            vec![4, 6]
+        );
+    }
+
+    #[test]
+    fn stream_offset_withheld_while_a_csi_has_executed_a_c0() {
+        // ESC [ 3 LF ... : vte executes the LF inside the CSI, so the grid has
+        // moved. Resuming before the ESC would apply it twice: no offset.
+        let mut grid = Grid::new(80, 24);
+        let mut parser = vte::Parser::new();
+        let first: &[u8] = b"hi\x1b[3\n";
+        grid.feed(&mut parser, first);
+        grid.absorb_stream(0, first);
+        assert_eq!(grid.snapshot().stream_offset, None);
+        // Once the sequence ends, the boundary after it is clean again.
+        let second: &[u8] = b"8mok";
+        grid.feed(&mut parser, second);
+        grid.absorb_stream(first.len() as u64, second);
+        assert_eq!(grid.snapshot().stream_offset, Some(10));
+        // A C0 inside an OSC is ignored, not executed: the offset stands.
+        let third: &[u8] = b"\x1b]0;a\nb";
+        grid.feed(&mut parser, third);
+        grid.absorb_stream(10, third);
+        assert_eq!(grid.snapshot().stream_offset, Some(10));
+    }
+
     fn feed(grid: &mut Grid, bytes: &[u8]) {
         let mut parser = vte::Parser::new();
         grid.feed(&mut parser, bytes);
@@ -1081,6 +1451,67 @@ mod tests {
         assert_eq!(cells[4].ch, 'o');
         assert_eq!(grid.cursor().col, 5);
         assert_eq!(grid.cursor().row, 0);
+    }
+
+    #[test]
+    fn cha_and_hpa_move_to_an_absolute_column() {
+        // Claude Code's diff renderer skips cells it believes unchanged with
+        // CHA (`ESC[nG`). Before CHA was handled, both writes below landed
+        // back to back and the row read `SAFETO`.
+        let mut grid = Grid::new(40, 4);
+        feed(&mut grid, b"\x1b[2CSAFE\x1b[8GTO\x1b[11GCLOSE");
+        assert_eq!(grid.row_text(0), "  SAFE TO CLOSE");
+        // The 1-based column is clamped to the grid; 0 and no param mean 1.
+        feed(&mut grid, b"\r\n\x1b[99Gx\r\n\x1b[5`y\x1b[0Gz\r\n\x1b[Gw");
+        assert_eq!(grid.row_text(1), format!("{}x", " ".repeat(39)));
+        assert_eq!(grid.row_text(2), "z   y");
+        assert_eq!(grid.row_text(3), "w");
+    }
+
+    #[test]
+    fn vpa_moves_to_an_absolute_row_keeping_the_column() {
+        let mut grid = Grid::new(20, 6);
+        feed(&mut grid, b"\x1b[4Ca\x1b[3db\x1b[99dc");
+        assert_eq!(grid.row_text(0), "    a");
+        assert_eq!(grid.row_text(2), "     b");
+        assert_eq!(grid.row_text(5), "      c");
+    }
+
+    #[test]
+    fn underline_colour_params_do_not_leak_into_the_pen() {
+        let mut grid = Grid::new(20, 2);
+        feed(&mut grid, b"\x1b[58;2;255;100;50mA\x1b[58;5;2mB");
+        let cells = &grid.snapshot().cells;
+        for cell in &cells[..2] {
+            assert_eq!(cell.attrs & ATTR_DIM, 0, "{cell:?}");
+            assert_eq!(cell.fg, COLOR_DEFAULT);
+            assert_eq!(cell.bg, COLOR_DEFAULT);
+        }
+    }
+
+    /// A colon group is one attribute: its sub-parameters never read as SGR
+    /// codes, so a trailing `2` (ITU colour-space form, double underline) is
+    /// not DIM, and colon colours land on the right channel.
+    #[test]
+    fn colon_subparameters_are_one_attribute_never_dim() {
+        let mut grid = Grid::new(20, 2);
+        feed(
+            &mut grid,
+            b"[58:2::0:0:2mA[4:2mB[38:2::1:2:2mC[48:2:3:4:2mD[38:5:2mE[4:0mF",
+        );
+        let cells = &grid.snapshot().cells;
+        for cell in &cells[..6] {
+            assert_eq!(cell.attrs & ATTR_DIM, 0, "{cell:?}");
+        }
+        assert_ne!(cells[1].attrs & ATTR_UNDERLINE, 0, "4:2 underlines");
+        assert_eq!(
+            cells[2].fg,
+            pack_rgb(1, 2, 2),
+            "ITU form skips the colour space"
+        );
+        assert_eq!(cells[3].bg, pack_rgb(3, 4, 2), "plain colon truecolour");
+        assert_eq!(cells[4].fg, palette_256(2));
+        assert_eq!(cells[5].attrs & ATTR_UNDERLINE, 0, "4:0 is no underline");
     }
 
     #[test]

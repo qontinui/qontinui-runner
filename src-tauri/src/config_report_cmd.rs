@@ -687,7 +687,8 @@ fn tokio_seam(
 /// duplicated between the two would let the claim and the check drift apart.
 const G3_DESCRIBES: &str = "what a PTY child spawned RIGHT NOW inherits: the portable-pty base \
      env + `session::TerminalSession::apply_base_child_env` (the marker strips, TERM, the runner \
-     markers/port, the continuation-verdict forward, the non-interactive git posture) + the \
+     markers/port, the continuation-verdict forward, the non-interactive git posture, the Windows \
+     `PYTHONUTF8=1` default) + the \
      briefing, rendered here at the session-independent `CoordMcpDelivery::Unknown` because this \
      report provisions nothing and so cannot know what a real session would be given + the \
      identity-shim PATH prepend + `finalize_child_env` (account pin + credential scrub). NOT \
@@ -714,6 +715,31 @@ const G3_FRESHNESS_NO_SHIM: &str =
      identity-shim dir for this runner build is not materialized yet, and the real spawn seam \
      MATERIALIZES it (this report refuses to), so a real child's PATH would carry one extra \
      leading entry — unless that materialize fails, which the seam handles fail-open";
+
+/// The sentence G3's freshness line ends with: which toolchain dirs a real
+/// child's base PATH appends after the runner's own entries, and where the
+/// login-shell read stands (plan
+/// `2026-11-12-runner-hosted-linux-session-has-no-cargo-on-path`, Phase 1).
+/// The dirs are in this capture's PATH only when the identity shim is
+/// materialized (the composed path); otherwise a real child adds them.
+fn g3_toolchain_freshness(
+    appended: &[std::path::PathBuf],
+    shell_read: crate::terminal::child_path::LoginShellRead,
+) -> String {
+    let dirs = if appended.is_empty() {
+        "none (each is already on the runner's PATH, or absent)".to_string()
+    } else {
+        appended
+            .iter()
+            .map(|d| d.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        ". Toolchain dirs a hosted child's PATH appends after the runner's own entries: {dirs} \
+         (login-shell read: {shell_read:?})"
+    )
+}
 
 /// Build the throwaway `CommandBuilder` that G3 reads, by CALLING the
 /// production spawn seam's own extracted env functions in the production order.
@@ -895,6 +921,7 @@ fn seam_reports(fp: &EnvFingerprinter, config_dir: Option<&str>) -> Vec<SeamEnvR
             &crate::orchestration_loop::fix_agent::build_fix_agent_command(
                 "(config-report probe)",
                 "(config-report probe)",
+                "(config-report probe)",
             ),
         ),
         tokio_seam(
@@ -1010,7 +1037,7 @@ pub(crate) fn env_generations_section(
     };
 
     let (pty, identity_shim) = pty_child_command(config_dir);
-    let g3 = EnvGeneration::capture(
+    let mut g3 = EnvGeneration::capture(
         &fp,
         EnvGenerationSpec {
             id: "G3",
@@ -1028,6 +1055,10 @@ pub(crate) fn env_generations_section(
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect::<Vec<_>>(),
     );
+    g3.freshness.push_str(&g3_toolchain_freshness(
+        &crate::terminal::child_path::appended_toolchain_dirs(),
+        crate::terminal::child_path::login_shell_read_state(),
+    ));
 
     let divergence = diff_generations(
         &g1,
@@ -1265,9 +1296,9 @@ pub(crate) fn coord_prompt_documents_reading(
 ///
 /// # The freshness asymmetry, reported rather than smoothed over
 ///
-/// Four caches sit behind one poll loop and they do not agree about what they
+/// Five caches sit behind one poll loop and they do not agree about what they
 /// can tell you. The session-briefing cache carries `fetched_at` +
-/// `provenance` per document, so this row prints them. The other three are a
+/// `provenance` per document, so this row prints them. The other four are a
 /// bare `RwLock<T>` holding a value and nothing else, so their last-refresh
 /// time is genuinely unavailable — and the row says `UNKNOWN` for it rather
 /// than substituting `captured_at`. Substituting would make every dial look
@@ -1350,8 +1381,8 @@ pub(crate) fn fleet_policy_dial_reading(
     let value = format!(
         "install_interception={}{} | session floors host warn={} crit={}, wsl warn={} crit={}, \
          thread ceilings warn={} crit={} | \
-         plan_capture={}{} (armed at {:?}; {}) | briefings: {} | poll interval {} ms | last refresh of \
-         the first three caches: {}",
+         plan_capture={}{} (armed at {:?}; {}) | account_selection_mode={} | briefings: {} | poll \
+         interval {} ms | last refresh of the value-only caches (all but the briefings): {}",
         dial.install_intercept_mode,
         ambiguous(&dial.install_intercept_mode, dial.install_intercept_default),
         floor(dial.host_warn_free_bytes),
@@ -1369,6 +1400,11 @@ pub(crate) fn fleet_policy_dial_reading(
             "coord has NOT answered this process — the level is the unconfirmed default and \
              plan-capture writes are held"
         },
+        // `None` is NO fleet opinion (the machine's local mode governs) — it
+        // must never render as a mode, or the row would claim a fleet value
+        // that is not there.
+        dial.account_selection_mode
+            .unwrap_or("(no fleet opinion — the local mode governs)"),
         briefings,
         dial.poll_interval_ms,
         if dial.caches_expose_refresh_time {
@@ -1380,7 +1416,7 @@ pub(crate) fn fleet_policy_dial_reading(
     );
     LayerReading::known(
         value,
-        "mcp::fleet_policy_poller::dial_snapshot (four process-global caches, one poll loop — \
+        "mcp::fleet_policy_poller::dial_snapshot (five process-global caches, one poll loop — \
          TIME-VARYING with no restart)",
         captured_at,
     )
@@ -1452,7 +1488,11 @@ pub(crate) fn claude_settings_carrier_reading(
              `claude` directly with no shim in the chain. BOTH append `--settings` ONLY when \
              that file exists (fail-open), so a `false` here means spawned sessions get NO \
              hook: no SessionStart confirmation, no SessionStart policy injection, no \
-             PreCompact, and no Stop. {}",
+             PreCompact, and no Stop. A GATE continuation (the `dispatch_gate_continuation` \
+             spawn and its account-migration respawn) does NOT follow this variant: it is \
+             Stop-armed unless the flag is explicitly `off` \
+             (`claude_hook::spawn_settings_args(true)`), so on a box where this reads \
+             `omitted` its gate continuations still append the `registered` carrier. {}",
             path.display(),
             exists,
             reg.as_str(),
@@ -1460,7 +1500,9 @@ pub(crate) fn claude_settings_carrier_reading(
         ),
         format!(
             "session::claude_hook::settings_path(session_restore_dir(), \
-             StopHookRegistration::from_env()) — variant read live from env {}",
+             StopHookRegistration::from_env(), LifecycleHooks::from_env()) — the Stop variant \
+             read live from env {}; the lifecycle variant from LIFECYCLE_HOOK_ROUTE_SERVED and \
+             the bound API port",
             crate::mcp::continuation_verdict::FLAG_ENV
         ),
         captured_at,
@@ -1747,9 +1789,9 @@ pub(crate) struct SettingsDerivedInputs {
 ///   `load_with_migration()`, which runs the one-shot seed migration and WRITES
 ///   `claude-accounts.json`. The overlay itself is
 ///   `claude_accounts::apply_roster_overlay`, unchanged, because it overwrites
-///   `ai.claude_cli.{account_selection_mode, config_dir}` UNCONDITIONALLY when
-///   the roster exists and the per-instance copies in settings.json are stale
-///   shadows.
+///   `ai.claude_cli.{account_selection_mode, account_selection_pinned, config_dir}`
+///   UNCONDITIONALLY when the roster exists and the per-instance copies in
+///   settings.json are stale shadows.
 ///
 /// Layer 11's cost of taking the read variant is stated in
 /// [`claude_config_dir_reading`]: on a machine where the seed has NOT run, this
@@ -1825,6 +1867,7 @@ pub(crate) fn config_report_inputs() -> ConfigReportInputs {
     let hook_path = crate::session::claude_hook::settings_path(
         &crate::session::claude_hook::session_restore_dir(),
         hook_reg,
+        crate::session::claude_hook::LifecycleHooks::from_env(),
     );
     let hook_exists = hook_path.is_file();
     let hook_env = std::env::var(crate::session::claude_hook::CLAUDE_SETTINGS_ENV).ok();
@@ -1901,6 +1944,23 @@ pub fn config_report_text() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn g3_toolchain_freshness_names_the_appended_dirs_and_the_read_state() {
+        use crate::terminal::child_path::LoginShellRead;
+        let line = g3_toolchain_freshness(
+            &[
+                std::path::PathBuf::from("/h/.cargo/bin"),
+                std::path::PathBuf::from("/h/.local/bin"),
+            ],
+            LoginShellRead::Answered,
+        );
+        assert!(line.contains("/h/.cargo/bin, /h/.local/bin"), "{line}");
+        assert!(line.contains("login-shell read: Answered"), "{line}");
+        let none = g3_toolchain_freshness(&[], LoginShellRead::Pending);
+        assert!(none.contains(": none ("), "{none}");
+        assert!(none.contains("login-shell read: Pending"), "{none}");
+    }
     use qontinui_runner_lib::config_report::LayerSpec;
 
     fn fixed_stamp() -> DateTime<Utc> {
@@ -2029,7 +2089,9 @@ mod tests {
     /// Three assertions, and the middle one is the non-vacuity control.
     #[test]
     fn config_report_never_reaches_the_settings_writer() {
-        let _amb = crate::test_env::isolated_ambient();
+        // The report reaches `get_effective_config_dir` (the fleet term and
+        // `RESOLVED_CONFIG_DIR`): ambient THEN fleet pin, via the one helper.
+        let _amb = crate::mcp::fleet_policy_poller::isolated_ambient_with_fleet_pin();
         use crate::settings::settings_full_load_count;
 
         // (1) CONTROL — the instrument fires. Without this the whole test could
@@ -2406,6 +2468,14 @@ mod tests {
                 "C:/claude/acct-d",
                 "request_override",
             ),
+            (
+                (
+                    Some("C:/q/model-gateway/claude-config".to_string()),
+                    ClaudeConfigDirSource::ModelGateway,
+                ),
+                "C:/q/model-gateway/claude-config",
+                "model_gateway",
+            ),
             // An account IS configured and its credentials are dead …
             (
                 (None, ClaudeConfigDirSource::RejectedNoCredentials),
@@ -2436,7 +2506,9 @@ mod tests {
     /// only shows up here.
     #[test]
     fn config_report_live_command_injects_every_bin_layer() {
-        let _amb = crate::test_env::isolated_ambient();
+        // The report reaches `get_effective_config_dir` (the fleet term and
+        // `RESOLVED_CONFIG_DIR`): ambient THEN fleet pin, via the one helper.
+        let _amb = crate::mcp::fleet_policy_poller::isolated_ambient_with_fleet_pin();
         let report = config_report_run();
         let specs: Vec<&LayerSpec> = report.rows.iter().map(|r| r.spec).collect();
         assert_eq!(specs.len(), 17, "every layer gets a row");
@@ -3204,6 +3276,7 @@ mod tests {
             plan_capture_default: "record",
             plan_capture_record_level: "record",
             plan_capture_answered: true,
+            account_selection_mode: None,
             briefings,
             caches_expose_refresh_time: false,
         }
@@ -3260,8 +3333,9 @@ mod tests {
 
         assert!(
             value.contains(
-                "last refresh of the first three caches: UNKNOWN — those caches hold a value \
-                 and no stamp; the report REFUSES to substitute its own read time"
+                "last refresh of the value-only caches (all but the briefings): UNKNOWN — those \
+                 caches hold a value and no stamp; the report REFUSES to substitute its own read \
+                 time"
             ),
             "the row must refuse to invent a refresh time: {value}"
         );
@@ -3328,6 +3402,26 @@ mod tests {
             "a non-default level (an explicit off row) must not be annotated as ambiguous: \
              {value}"
         );
+
+        // The fleet account-selection mode: `None` is NO fleet opinion and
+        // must never render as a mode; a named one renders its wire spelling.
+        assert!(
+            value.contains("account_selection_mode=(no fleet opinion — the local mode governs)"),
+            "got {value}"
+        );
+        let mut named = d.clone();
+        named.account_selection_mode = Some("highest_expected_usage");
+        let LayerReading::Known {
+            value: named_value, ..
+        } = fleet_policy_dial_reading(&named, fixed_stamp())
+        else {
+            panic!("the runner app always resolves layer 10");
+        };
+        assert!(
+            named_value.contains("account_selection_mode=highest_expected_usage |"),
+            "got {named_value}"
+        );
+
         assert!(
             source.contains("TIME-VARYING with no restart"),
             "got {source}"
@@ -3664,7 +3758,9 @@ mod tests {
     /// only here.
     #[test]
     fn config_report_live_command_injects_every_phase_4_layer() {
-        let _amb = crate::test_env::isolated_ambient();
+        // The report reaches `get_effective_config_dir` (the fleet term and
+        // `RESOLVED_CONFIG_DIR`): ambient THEN fleet pin, via the one helper.
+        let _amb = crate::mcp::fleet_policy_poller::isolated_ambient_with_fleet_pin();
         let report = config_report_run();
 
         for (name, expected_source_fragment) in [
@@ -3914,7 +4010,9 @@ mod tests {
     /// list). Guards the wiring the pure tests above bypass.
     #[test]
     fn config_report_live_command_injects_the_settings_struct_layer() {
-        let _amb = crate::test_env::isolated_ambient();
+        // The report reaches `get_effective_config_dir` (the fleet term and
+        // `RESOLVED_CONFIG_DIR`): ambient THEN fleet pin, via the one helper.
+        let _amb = crate::mcp::fleet_policy_poller::isolated_ambient_with_fleet_pin();
         let report = config_report_run();
         match &report.row("settings_struct").expect("row present").reading {
             LayerReading::Known { value, source, .. } => {
@@ -3952,7 +4050,9 @@ mod tests {
     /// this test, would catch.
     #[test]
     fn config_report_live_render_carries_no_settings_field_value() {
-        let _amb = crate::test_env::isolated_ambient();
+        // The report reaches `get_effective_config_dir` (the fleet term and
+        // `RESOLVED_CONFIG_DIR`): ambient THEN fleet pin, via the one helper.
+        let _amb = crate::mcp::fleet_policy_poller::isolated_ambient_with_fleet_pin();
         // The NON-MUTATING reader, deliberately: this test used to call
         // `load_settings_full`, which mints a `local_user_id` and persists it —
         // a test that writes the operator's settings.json to check that the
@@ -4060,10 +4160,18 @@ mod tests {
                  it is the whole answer to \"why does a pane resolve `claude` to the shim?\": \
                  {names:?}"
             );
-            assert_eq!(g3.freshness, G3_FRESHNESS_WITH_SHIM);
+            assert!(
+                g3.freshness.starts_with(G3_FRESHNESS_WITH_SHIM),
+                "{}",
+                g3.freshness
+            );
             assert!(g3.freshness.contains("SHIM-PREPENDED"), "{}", g3.freshness);
         } else {
-            assert_eq!(g3.freshness, G3_FRESHNESS_NO_SHIM);
+            assert!(
+                g3.freshness.starts_with(G3_FRESHNESS_NO_SHIM),
+                "{}",
+                g3.freshness
+            );
             assert!(
                 g3.freshness.contains("UN-SHIMMED"),
                 "an un-shimmed capture must say so rather than letting the reader assume the \
@@ -4071,6 +4179,14 @@ mod tests {
                 g3.freshness
             );
         }
+        // Either way the line names the toolchain dirs a real child appends.
+        assert!(
+            g3.freshness.contains(
+                "Toolchain dirs a hosted child's PATH appends after the runner's own entries: "
+            ),
+            "{}",
+            g3.freshness
+        );
 
         // …and the bounded claim. Each of these is a seam step this report
         // refuses to reproduce because reproducing it WRITES.
@@ -4275,6 +4391,119 @@ mod tests {
         );
     }
 
+    /// One entry of a directory's print: `(name, len, mtime)`.
+    type EntryPrint = (String, Option<u64>, Option<std::time::SystemTime>);
+
+    /// What a watched path looked like to
+    /// [`config_report_live_command_writes_nothing_it_reports_on`]: absent, a
+    /// file's `(len, mtime)`, or a directory's OWN mtime plus its sorted
+    /// entries.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum PathPrint {
+        Absent,
+        File {
+            len: u64,
+            mtime: Option<std::time::SystemTime>,
+        },
+        Dir {
+            mtime: Option<std::time::SystemTime>,
+            entries: Vec<EntryPrint>,
+        },
+    }
+
+    fn path_print(path: &std::path::Path) -> PathPrint {
+        let Ok(md) = std::fs::metadata(path) else {
+            return PathPrint::Absent;
+        };
+        if !md.is_dir() {
+            return PathPrint::File {
+                len: md.len(),
+                mtime: md.modified().ok(),
+            };
+        }
+        let mut entries: Vec<EntryPrint> = std::fs::read_dir(path)
+            .map(|dir| {
+                dir.filter_map(Result::ok)
+                    .map(|e| {
+                        let name = e.file_name().to_string_lossy().into_owned();
+                        match e.metadata() {
+                            Ok(m) => (name, Some(m.len()), m.modified().ok()),
+                            Err(_) => (name, None, None),
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        entries.sort();
+        PathPrint::Dir {
+            mtime: md.modified().ok(),
+            entries,
+        }
+    }
+
+    /// Name what differs between two prints of one path: for a directory, the
+    /// entries that appeared, vanished or changed, and its own mtime.
+    fn describe_print_change(before: &PathPrint, after: &PathPrint) -> String {
+        let (
+            PathPrint::Dir {
+                mtime: dir_mtime_before,
+                entries: entries_before,
+            },
+            PathPrint::Dir {
+                mtime: dir_mtime_after,
+                entries: entries_after,
+            },
+        ) = (before, after)
+        else {
+            return format!("{before:?} -> {after:?}");
+        };
+        let names = |entries: &[EntryPrint]| -> Vec<String> {
+            entries.iter().map(|(name, _, _)| name.clone()).collect()
+        };
+        let (names_before, names_after) = (names(entries_before), names(entries_after));
+        let appeared: Vec<&String> = names_after
+            .iter()
+            .filter(|name| !names_before.contains(name))
+            .collect();
+        let vanished: Vec<&String> = names_before
+            .iter()
+            .filter(|name| !names_after.contains(name))
+            .collect();
+        let changed: Vec<String> = entries_before
+            .iter()
+            .filter_map(|(name, len, mtime)| {
+                entries_after
+                    .iter()
+                    .find(|(other, _, _)| other == name)
+                    .filter(|(_, l, m)| (l, m) != (len, mtime))
+                    .map(|(_, l, m)| format!("{name} ({len:?}, {mtime:?}) -> ({l:?}, {m:?})"))
+            })
+            .collect();
+        format!(
+            "entries appeared {appeared:?}, vanished {vanished:?}, changed {changed:?}; \
+             dir mtime {dir_mtime_before:?} -> {dir_mtime_after:?}"
+        )
+    }
+
+    /// The victim's instrument can fail: an entry planted in a watched
+    /// directory changes its print, and the description names the entry.
+    #[test]
+    fn the_config_report_watch_names_an_entry_planted_in_a_watched_dir() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let before = path_print(dir.path());
+        std::fs::write(dir.path().join("planted.json"), b"{}").expect("plant a file");
+        let after = path_print(dir.path());
+        assert_ne!(
+            before, after,
+            "a planted entry must change the directory's print"
+        );
+        let described = describe_print_change(&before, &after);
+        assert!(
+            described.contains(r#"appeared ["planted.json"]"#),
+            "the mismatch must name the planted entry: {described}"
+        );
+    }
+
     /// **F5 regression.** Running the live report writes none of the files it
     /// reports on — **with one bounded, named exception, below.**
     ///
@@ -4337,6 +4566,35 @@ mod tests {
     ///    row below is honestly asserting — while the disclosed refresh write
     ///    stays out of reach of this suite entirely.
     ///
+    /// # The config dir is a DEDICATED subdir, and a directory's print names entries
+    ///
+    /// The fixture's ROOT is what five process-global keys alias
+    /// (`QONTINUI_HOME`, `QONTINUI_CONFIG_DIR`, `QONTINUI_SECURE_STORAGE_DIR`,
+    /// `HOME`, `USERPROFILE`), so watching it watched every sibling test's write
+    /// under `$HOME` as well: on 2026-09-21 this test went red with that root's
+    /// mtime 4 ms later and `settings.json` unchanged. So the test re-points
+    /// `QONTINUI_CONFIG_DIR`, under the fixture's own `env_lock`, at
+    /// `<fixture>/config-under-test`, which nothing else aliases, and derives every
+    /// watched path after that override. A directory's print is its own mtime PLUS
+    /// its sorted entries `(name, len, mtime)` (keeping the mtime is safe now that
+    /// nothing else aliases the dir), and a mismatch names the entries that
+    /// appeared, vanished or changed.
+    ///
+    /// # Foreign settings writes are refused rather than watched for
+    ///
+    /// The 2026-11-11 red (coord finding `47c0445a`) was a whole default
+    /// `settings.json`, 8780 bytes, written into this fixture by a SIBLING test's
+    /// thread that held no `env_lock`: `load_settings_full`'s FreshInstall persist,
+    /// reached through `workspace_root()` and its kin. The env-write gate
+    /// (`qontinui_runner_lib::env_write_gate`) now refuses every such write in a
+    /// test binary, so no sibling can put a settings file here. The residual trade
+    /// (plan Risks R2): a report write moved onto a WORKER thread would be refused
+    /// by that gate, which prints its door, path and thread, rather than caught by
+    /// this test. `config_report_cmd.rs` itself spawns no thread or task, so
+    /// every write it makes runs on this test's guarded thread and is still
+    /// caught; a callee that spawns one is outside that check. Plan
+    /// `2026-11-11-unguarded-test-threads-write-settings-json-into-a-live-fixtures-config-dir`.
+    ///
     /// This fingerprints every file the readers could write, runs the full
     /// report, and re-fingerprints. Two halves are pinned elsewhere because they
     /// cannot fail here: non-creation of the config dir by
@@ -4347,15 +4605,19 @@ mod tests {
     /// boot has already consumed the one-shot migration.
     #[test]
     fn config_report_live_command_writes_nothing_it_reports_on() {
-        let _amb = crate::test_env::isolated_ambient();
-        fn fingerprint(
-            path: &std::path::Path,
-        ) -> (bool, Option<u64>, Option<std::time::SystemTime>) {
-            match std::fs::metadata(path) {
-                Ok(md) => (true, Some(md.len()), md.modified().ok()),
-                Err(_) => (false, None, None),
-            }
-        }
+        // The report reaches `get_effective_config_dir` (the fleet term and
+        // `RESOLVED_CONFIG_DIR`): ambient THEN fleet pin, via the one helper.
+        // Bound as the TUPLE, whose fields drop pin-then-ambient: the reverse
+        // of acquisition.
+        let fixture = crate::mcp::fleet_policy_poller::isolated_ambient_with_fleet_pin();
+        // Nested under the fixture's own lock (`env_lock` is reentrant), and
+        // the name `env_write_lock_guard` credits for the override below.
+        let _env = crate::test_env::env_lock();
+        // Declared after `_env`, so it drops first: restore → `_env` → fixture.
+        let _config_dir = crate::test_env::EnvVarRestore::capture(&["QONTINUI_CONFIG_DIR"]);
+        let config_under_test = fixture.1.dir().join("config-under-test");
+        std::fs::create_dir_all(&config_under_test).expect("the dedicated config dir");
+        std::env::set_var("QONTINUI_CONFIG_DIR", &config_under_test);
 
         let watched: Vec<std::path::PathBuf> = [
             crate::settings::resolve_settings_path().ok(),
@@ -4378,18 +4640,42 @@ mod tests {
             !watched.is_empty(),
             "the test must actually be watching something"
         );
+        // The override took: both config-dir resolvers answer the dedicated
+        // subdir, so the watch no longer aliases the fixture root (and `HOME`).
+        for (what, resolved) in [
+            (
+                "settings::resolve_settings_path()",
+                crate::settings::resolve_settings_path().ok(),
+            ),
+            (
+                "settings::resolve_config_dir()",
+                crate::settings::resolve_config_dir().ok().map(|(d, _)| d),
+            ),
+        ] {
+            let resolved = resolved.unwrap_or_else(|| panic!("{what} must resolve"));
+            assert!(
+                resolved.starts_with(&config_under_test),
+                "{what} resolved {} outside the dedicated {} — the override never took",
+                resolved.display(),
+                config_under_test.display()
+            );
+        }
+        assert!(
+            !watched.iter().any(|p| p == fixture.1.dir()),
+            "the fixture ROOT must not be watched — five process-global keys alias it: {watched:?}"
+        );
 
-        let before: Vec<_> = watched.iter().map(|p| fingerprint(p)).collect();
+        let before: Vec<_> = watched.iter().map(|p| path_print(p)).collect();
         let report = config_report_run();
-        let after: Vec<_> = watched.iter().map(|p| fingerprint(p)).collect();
+        let after: Vec<_> = watched.iter().map(|p| path_print(p)).collect();
 
         for (i, path) in watched.iter().enumerate() {
-            assert_eq!(
-                before[i],
-                after[i],
-                "running the config report changed {} — a diagnostic that materializes the thing \
-                 it is describing changes the answer by asking the question",
-                path.display()
+            assert!(
+                before[i] == after[i],
+                "running the config report changed {}: {} — a diagnostic that materializes the \
+                 thing it is describing changes the answer by asking the question",
+                path.display(),
+                describe_print_change(&before[i], &after[i])
             );
         }
 
@@ -4446,7 +4732,9 @@ mod tests {
     /// failed.
     #[test]
     fn config_report_live_full_render_leaks_no_credential_value() {
-        let _amb = crate::test_env::isolated_ambient();
+        // The report reaches `get_effective_config_dir` (the fleet term and
+        // `RESOLVED_CONFIG_DIR`): ambient THEN fleet pin, via the one helper.
+        let _amb = crate::mcp::fleet_policy_poller::isolated_ambient_with_fleet_pin();
         let rendered = config_report_run().render();
         let mut checked = 0usize;
         // `vars_os` + lossy, not `vars()`: the leak check must not itself
@@ -4543,7 +4831,9 @@ mod tests {
     ///    absence assertion trivially.
     #[test]
     fn config_report_planted_credential_urls_never_reach_the_render() {
-        let _amb = crate::test_env::isolated_ambient();
+        // The report reaches `get_effective_config_dir` (the fleet term and
+        // `RESOLVED_CONFIG_DIR`): ambient THEN fleet pin, via the one helper.
+        let _amb = crate::mcp::fleet_policy_poller::isolated_ambient_with_fleet_pin();
         use qontinui_runner_lib::env_generations::{classify_env_var, WithholdReason};
 
         // (name, value, the substring that must not survive anywhere)

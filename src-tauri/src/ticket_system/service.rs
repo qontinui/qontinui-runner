@@ -152,10 +152,9 @@ async fn poll_and_sync(
                 );
 
                 // Mark ticket as in-progress so the source reflects that work has started.
-                if let Err(e) = provider
-                    .update_state(&ticket.external_id, TicketState::InProgress, config)
-                    .await
-                {
+                // Background spend: deferred rather than slept on, so a dry
+                // budget never stalls this serial loop.
+                if let Err(e) = provider.mark_in_progress(&ticket.external_id, config).await {
                     tracing::warn!(
                         "Ticket sync: failed to mark ticket {}/{} as in-progress: {}",
                         config.source.as_str(),

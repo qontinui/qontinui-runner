@@ -1,0 +1,1 @@
+MEMPEAK name=D:\pagefile.sys alloc_mb=32768 peak_mb=32767 current_mb=492 free_phys_kb=13852176 build=failure run=skipped

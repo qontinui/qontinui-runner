@@ -321,6 +321,18 @@ pub fn build_outcome_alert(
                 sessions,
             ),
         )
+    } else if result.no_verification_steps {
+        // Nothing was checked. That is unknown, not a failed check, so it
+        // renders as a warning and is named from `summary()`.
+        (
+            "warning",
+            result.summary(),
+            format!(
+                "Duration: {} · {} AI session(s)",
+                format_duration(duration),
+                sessions
+            ),
+        )
     } else if result.was_stopped {
         (
             "warning",
@@ -795,4 +807,63 @@ fn format_duration(d: std::time::Duration) -> String {
 /// Public wrapper for format_duration (used by mod.rs).
 pub fn format_duration_pub(d: std::time::Duration) -> String {
     format_duration(d)
+}
+
+#[cfg(test)]
+mod outcome_alert_tests {
+    use super::build_outcome_alert;
+    use crate::unified_workflow_executor::types::LoopResult;
+
+    fn loop_exit(verification_passed: bool, no_verification_steps: bool) -> LoopResult {
+        LoopResult {
+            iterations_run: 1,
+            verification_passed,
+            max_iterations_reached: false,
+            critical_failure: false,
+            was_stopped: false,
+            unfixable_errors: false,
+            iteration_results: Vec::new(),
+            total_tokens: None,
+            total_cost_usd: None,
+            fix_attempts_exhausted: false,
+            no_verification_steps,
+            files_modified: Vec::new(),
+            fix_attempts: 0,
+            ci_auto_resumes: 0,
+            node_rollups: Vec::new(),
+        }
+    }
+
+    /// A run that checked nothing is not announced as a failed check: the
+    /// alert is a warning that names the cause from `summary()`.
+    #[test]
+    fn a_no_verification_steps_exit_is_not_announced_as_failed() {
+        let alert = build_outcome_alert(
+            &loop_exit(false, true),
+            std::time::Duration::from_secs(5),
+            0,
+        );
+        let message = alert["message"].as_str().unwrap();
+        assert!(!message.contains("Verification Failed"), "{}", message);
+        assert_eq!(
+            message,
+            "NOTHING VERIFIED after 1 iteration(s) - no required verification step ran, so the result is unknown, not passed"
+        );
+        assert_eq!(alert["severity"], "warning");
+    }
+
+    /// The control: a run that failed its checks still says so.
+    #[test]
+    fn a_failed_exit_is_still_announced_as_failed() {
+        let alert = build_outcome_alert(
+            &loop_exit(false, false),
+            std::time::Duration::from_secs(5),
+            0,
+        );
+        assert!(alert["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("Verification Failed"));
+        assert_eq!(alert["severity"], "error");
+    }
 }

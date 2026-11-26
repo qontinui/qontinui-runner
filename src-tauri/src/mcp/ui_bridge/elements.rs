@@ -30,7 +30,7 @@ use reqwest::Method;
 use serde::Deserialize;
 use tracing::{debug, error, info, warn};
 
-use crate::mcp::app_dispatch::AppDispatcher;
+use crate::mcp::app_dispatch::{AppDispatcher, DispatchError};
 use crate::mcp::app_registry::{AppRegistry, AppTransport};
 use crate::mcp::envelope::UiBridgeJson;
 use crate::mcp::types::{api_error, api_error_detailed, ApiResponse, ApiState};
@@ -648,20 +648,24 @@ pub async fn ui_bridge_batch_actions_handler(
 /// for autonomous loops (verified empirically 2026-05-21 with
 /// `action:"press"`).
 ///
-/// Includes both `camelCase` and `snake_case` aliases for the multi-token
-/// names because the SDK accepts either (e.g. `scrollIntoView` vs
-/// `scroll_into_view`, see `recovery_executor::execute_recovery_command`).
-const SUPPORTED_ACTION_NAMES: &[&str] = &[
+/// Exactly the SDK's built-in verbs, in its order: `SUPPORTED_ACTIONS` in
+/// `@qontinui/ui-bridge` `packages/ui-bridge/src/control/action-executor.ts`
+/// (0.46.0, ui-bridge `9f373a12`), which the SDK checks with an exact
+/// `Set.has` before dispatching anything. This is also the `allowedActions`
+/// list the shape-error hints serve (`types.rs`, `page.rs`), so every name in
+/// it must be one the SDK actually performs —
+/// `supported_action_names_are_the_sdk_verbs` pins it against a literal of the
+/// SDK's set. Names a caller may send that are NOT SDK verbs live in
+/// [`SUPPORTED_ACTION_ALIASES`], never here.
+pub(crate) const SUPPORTED_ACTION_NAMES: &[&str] = &[
     "click",
     // Reveal a hover-gated control (`pointer-events:none` until `:hover`/
     // `group-hover`) then click it, in one dispatch. Handled SDK-side by
     // `@qontinui/ui-bridge` >= 0.16.0; the runner just forwards it.
     "hoverClick",
     "doubleClick",
-    "double_click",
-    "double",
-    "right",
-    "middle",
+    "rightClick",
+    "middleClick",
     "type",
     "sendKeys",
     "clear",
@@ -669,9 +673,15 @@ const SUPPORTED_ACTION_NAMES: &[&str] = &[
     "focus",
     "blur",
     "hover",
+    // Release a forced hover (`hover` puts the target into its CSS `:hover`
+    // appearance by rewriting `:hover` selectors in place to
+    // `:is(:hover,[data-ui-bridge-pseudo-hover])` and marking the target's
+    // ancestor chain). Added SDK-side in `@qontinui/ui-bridge` 0.38.0
+    // (ui-bridge#280, plan 2026-10-22-ui-bridge-hover-forces-the-css-hover-state);
+    // forwarded as-is.
+    "unhover",
     "scroll",
     "scrollIntoView",
-    "scroll_into_view",
     "check",
     "uncheck",
     "toggle",
@@ -682,28 +692,43 @@ const SUPPORTED_ACTION_NAMES: &[&str] = &[
     "autocomplete",
 ];
 
-/// Validate a user-supplied action name against [`SUPPORTED_ACTION_NAMES`].
+/// Spellings callers send that are NOT SDK verbs, each with the verb it means.
 ///
-/// Returns the canonical action name on success (currently the input
-/// unchanged — case-sensitive match — but the indirection keeps the
-/// future option of accepting a kebab-case alias open without churning
-/// every caller).
+/// The SDK accepts none of them: it matches the verb exactly, and its own
+/// vocabulary lists `double` / `right` / `middle` only as "the runner's built-in
+/// aliases. Not SDK verbs" (`control/actionVocabulary.ts`), while the runner
+/// forwards the name verbatim. They used to sit in [`SUPPORTED_ACTION_NAMES`]
+/// — `scroll_into_view` on the belief that the SDK takes snake_case too, which
+/// it does not (the recovery command of that name is a separate vocabulary,
+/// `recovery_executor::execute_recovery_command`) — so the `allowedActions`
+/// hint advertised five names no element accepts and omitted `rightClick` and
+/// `middleClick`.
 ///
-/// On failure returns a structured [`UiBridgeError`] with
-/// `code = INVALID_REQUEST` and the full supported list in
-/// `context.supportedActions`, so the handler can build a 400 envelope
-/// that mirrors the `tab/activate` -> `knownTabs` prior art.
+/// They stay CLASSIFIED as built-in ([`is_builtin_action`]) so the flow
+/// `action_vocabulary` documents still holds: an alias passes the unknown-verb
+/// gate and stops at the pre-IPC `ACTION_NOT_SUPPORTED`, whose "did you mean"
+/// names the canonical verb (elements advertise only canonical names).
+pub(crate) const SUPPORTED_ACTION_ALIASES: &[(&str, &str)] = &[
+    ("double_click", "doubleClick"),
+    ("double", "doubleClick"),
+    ("right", "rightClick"),
+    ("middle", "middleClick"),
+    ("scroll_into_view", "scrollIntoView"),
+];
+
+/// True when `raw` names a built-in action: a member of
+/// [`SUPPORTED_ACTION_NAMES`] or an alias in [`SUPPORTED_ACTION_ALIASES`],
+/// after trimming and matched case-sensitively.
 ///
-/// Split out from the handler as a pure helper so it's unit-testable
-/// without spinning up an `axum::Router` — see `validate_action_name_tests`
-/// below. This matches the seam established for
-/// `validate_wait_for_element_state_request` / `validate_tab_id`.
-pub(crate) fn validate_action_name(raw: &str) -> Result<&str, UiBridgeError> {
-    let trimmed = raw.trim();
-    if !trimmed.is_empty() && SUPPORTED_ACTION_NAMES.contains(&trimmed) {
-        return Ok(trimmed);
-    }
-    Err(UiBridgeError::invalid_action(raw, SUPPORTED_ACTION_NAMES))
+/// This only classifies the verb. Rejecting one needs the element's own list,
+/// so the 400 is built by the deferred gate in `execute_action_dispatch`
+/// (`action_vocabulary::deferred_unknown_action_error`).
+pub(crate) fn is_builtin_action(raw: &str) -> bool {
+    let name = raw.trim();
+    SUPPORTED_ACTION_NAMES.contains(&name)
+        || SUPPORTED_ACTION_ALIASES
+            .iter()
+            .any(|(alias, _)| *alias == name)
 }
 
 /// True when a `get_element` IPC reply is the frontend's "there is no such
@@ -930,22 +955,28 @@ fn advertise_custom_actions_in_element_response(data: &mut serde_json::Value) {
 /// `false` (don't accuse — degrade gracefully).
 ///
 /// Match semantics mirror `SUPPORTED_ACTION_NAMES` membership in
-/// `validate_action_name`: exact (case-sensitive) string equality. The SDK
-/// emits canonical camelCase names in element metadata; aliases like
-/// `scroll_into_view` -> `scrollIntoView` are normalized SDK-side before the
-/// `actions` list is built, so an additional alias-fold here would be a
-/// distortion not a feature.
+/// `is_builtin_action`: case-sensitive string equality, here untrimmed. The SDK
+/// emits only canonical camelCase verbs in element metadata, and it does not
+/// accept an alias (`SUPPORTED_ACTION_ALIASES`) as a verb either, so folding
+/// `scroll_into_view` onto `scrollIntoView` here would pass a name the SDK then
+/// refuses — the refusal belongs here, where it can name the canonical verb.
 pub(crate) fn is_action_advertised(action: &str, supported: &Option<Vec<String>>) -> bool {
     match supported {
         Some(list) => {
             list.iter().any(|s| s == action)
                 // `hoverClick` is a click-variant — it reveals a hover-gated
-                // control then clicks it. Any element that advertises `click`
-                // can be hover-clicked, even when the SDK's inferActions didn't
-                // enumerate `hoverClick` explicitly on this element. Without
-                // this, hover-revealed toolbar buttons (which advertise `click`
-                // but not `hoverClick`) would be rejected here pre-IPC.
+                // control then clicks it, so any element that advertises
+                // `click` can be hover-clicked. Since `@qontinui/ui-bridge`
+                // 0.46 every INFERRED list carries `hoverClick` (the
+                // every-element row of `core/element-kind.ts`), so this arm
+                // now serves a list a registration DECLARED — the runner's own
+                // `useUIElement({ actions: ["click"] })` hover-revealed toolbar
+                // buttons among them — and one served by a pre-0.46 SDK.
                 || (action == "hoverClick" && list.iter().any(|s| s == "click"))
+                // `unhover` releases what `hover` forced, so it is allowed
+                // wherever `hover` is advertised: an inferred 0.46 list carries
+                // both, a declared or pre-0.46 list may carry only `hover`.
+                || (action == "unhover" && list.iter().any(|s| s == "hover"))
         }
         // Unknown supported list (fetch failed or element didn't advertise
         // any) — assume yes, so we don't manufacture false ACTION_NOT_SUPPORTED.
@@ -954,14 +985,21 @@ pub(crate) fn is_action_advertised(action: &str, supported: &Option<Vec<String>>
 }
 
 /// True only for a recovery that actually did something and worked: a command
-/// was chosen AND the original action succeeded on the retry.
+/// was chosen AND the original action's retry read `succeeded`.
 ///
 /// `recovered:true` with `command_chosen:None` is the shape the LLM fallback
 /// used to produce — it asserted a recovery while admitting no recovery step
 /// was selected. That is not a recovery, so the caller must see the ORIGINAL
 /// failure, not a synthesized verdict about it.
+///
+/// `retry_outcome` is read beside `recovered` instead of trusting the two to
+/// agree. `RecoveryOutcome::record_retry` keeps them in step in production,
+/// but both are `pub` fields that a struct literal can set apart, and a
+/// `recovered: true` beside an `indeterminate` retry must not answer HTTP 200.
 pub(crate) fn recovery_is_genuine(recovery: &super::recovery_executor::RecoveryOutcome) -> bool {
-    recovery.recovered && recovery.command_chosen.is_some()
+    recovery.recovered
+        && recovery.retry_outcome == super::recovery_executor::RetryOutcome::Succeeded
+        && recovery.command_chosen.is_some()
 }
 
 /// Alias for the `execute_action` handler's own return type — the value that
@@ -1020,7 +1058,9 @@ pub(crate) fn as_action_failure(
                         UiBridgeError {
                             code: super::types::UiBridgeErrorCode::ActionFailed,
                             message: d.message,
-                            recovery: Some(super::types::RecoveryHint::Resnapshot),
+                            recovery: Some(qontinui_types::refusal::NextAction::new(
+                                qontinui_types::refusal::NextActionKind::Resnapshot,
+                            )),
                             context: Some(attach(d.context)),
                         }
                     }
@@ -1031,7 +1071,9 @@ pub(crate) fn as_action_failure(
                     None => UiBridgeError {
                         code: super::types::UiBridgeErrorCode::ActionFailed,
                         message: message.clone(),
-                        recovery: Some(super::types::RecoveryHint::Resnapshot),
+                        recovery: Some(qontinui_types::refusal::NextAction::new(
+                            qontinui_types::refusal::NextActionKind::Resnapshot,
+                        )),
                         context: Some(attach(None)),
                     },
                 };
@@ -1086,7 +1128,7 @@ pub(crate) enum TypeParamError {
 /// NOT flow through `relay-handlers.ts::executeElementAction`, so the
 /// SDK-side gate alone is insufficient. Without this helper a malformed
 /// `{action:"type", params:{value:"foo"}}` request fell through the
-/// `validate_action_name` whitelist (`"type"` is a known action), reached
+/// `is_builtin_action` whitelist (`"type"` is a known action), reached
 /// `execute_action`, IPC-failed because the frontend's type handler needs
 /// `params.text`, then hit the Phase 5 `RecoveryExecutor::llm_fallback`
 /// which synthesized a non-null `commandChosen` and returned HTTP 200
@@ -1420,7 +1462,7 @@ async fn execute_action_dispatch(
     // -> RecoveryExecutor::llm_fallback, which synthesized a click on a
     // random "Active" button and returned HTTP 200 `success:true`
     // (verified empirically 2026-05-21). Mirrors the `tab/activate`
-    // -> `knownTabs` 400 envelope shape; see `validate_action_name`.
+    // -> `knownTabs` 400 envelope shape.
     //
     // BUT: `SUPPORTED_ACTION_NAMES` only enumerates the built-in dispatcher
     // vocabulary — it cannot know about app-registered **custom actions**
@@ -1433,7 +1475,7 @@ async fn execute_action_dispatch(
     // the element's `customActions` and rejects ("Unknown action") only when
     // the name is neither a built-in nor a registered custom action on THIS
     // element. Built-in behavior is unchanged.
-    let action_is_builtin = validate_action_name(&request.action).is_ok();
+    let action_is_builtin = is_builtin_action(&request.action);
 
     // ── Type-action param-shape gate ────────────────────────────────────
     // Reject `{action:"type", params:{value:"foo"}}` and `{action:"type",
@@ -1640,7 +1682,7 @@ async fn execute_action_dispatch(
                     error_detail: None,
                     hint: None,
                     code: None,
-                    suggestions: None,
+                    refusal: None,
                 }));
             }
 
@@ -1679,18 +1721,29 @@ async fn execute_action_dispatch(
     // metadata we couldn't fetch (`element_supported_actions == None`) is
     // allowed through to IPC: we never manufacture a rejection from a failed
     // probe (mirrors the permissive `None` semantics of `is_action_advertised`).
-    if !action_is_builtin && !action_is_registered_custom && element_supported_actions.is_some() {
-        let detail = validate_action_name(&request.action)
-            .err()
-            .unwrap_or_else(|| {
-                UiBridgeError::invalid_action(&request.action, SUPPORTED_ACTION_NAMES)
-            });
+    //
+    // The 400 names THIS element's accepted verbs and a "did you mean" the
+    // element accepts (`press` → `sendKeys` on a terminal input), and a verb
+    // the element itself advertises is accepted here — see
+    // `action_vocabulary::deferred_unknown_action_error`.
+    //
+    // The suggestion reads the element's kind as well as its list: an SDK
+    // `textbox` (ARIA textbox, contenteditable) takes keys but no `type`, so
+    // `press` there suggests `sendKeys`, not `click` (D4,
+    // `action_vocabulary::suggest_action`).
+    let keyboard_entry = super::action_vocabulary::keyboard_entry_of(element_probe.as_ref());
+    if let Some(detail) = super::action_vocabulary::deferred_unknown_action_error(
+        &request.action,
+        &id,
+        action_is_builtin,
+        action_is_registered_custom,
+        element_supported_actions.as_deref(),
+        merged_params.as_ref(),
+        keyboard_entry,
+    ) {
         warn!(
-            "execute_action: rejecting unknown action '{}' on element {} — \
-             not a built-in and not a registered custom action (built-ins: {})",
-            request.action,
-            id,
-            SUPPORTED_ACTION_NAMES.join(", ")
+            "execute_action: rejecting unknown action '{}' on element {}: {}",
+            request.action, id, detail.message
         );
         let msg = detail.message.clone();
         return Err((
@@ -1707,7 +1760,7 @@ async fn execute_action_dispatch(
     //
     // Without this gate, e.g. `scrollIntoView` against a `<button>` whose
     // actions are `["click", "focus", "blur"]` would:
-    //   1. pass the `validate_action_name` whitelist (scrollIntoView is a
+    //   1. pass the `is_builtin_action` whitelist (scrollIntoView is a
     //      runner-known action name),
     //   2. dispatch to IPC,
     //   3. IPC fail with whatever shape the SDK emits for "this element
@@ -1754,20 +1807,13 @@ async fn execute_action_dispatch(
         // `supported_actions` — by then the action WAS advertised, so the
         // list would say nothing. `supported_actions` is unique to this
         // pre-IPC body.
-        let detail = UiBridgeError {
-            code: super::types::UiBridgeErrorCode::ActionNotSupported,
-            message: format!(
-                "Action '{}' is not supported by element '{}'. \
-                 Element advertises: {:?}",
-                action_name, id, supported
-            ),
-            recovery: Some(super::types::RecoveryHint::Unrecoverable),
-            context: Some(serde_json::json!({
-                "code": "ACTION_NOT_SUPPORTED",
-                "supported_actions": supported,
-                "requested_action": action_name,
-            })),
-        };
+        let detail = super::action_vocabulary::action_not_supported_error(
+            &action_name,
+            &id,
+            &supported,
+            merged_params.as_ref(),
+            keyboard_entry,
+        );
         let msg = detail.message.clone();
         return Err((
             StatusCode::BAD_REQUEST,
@@ -2082,6 +2128,7 @@ async fn execute_action_dispatch(
                 result = Ok(Json(ok));
             } else {
                 warn!(
+                    retry_outcome = ?recovery.retry_outcome,
                     "execute_action: RecoveryExecutor could not recover element {} \
                      (code={:?}, recovered={}, command={:?}) — surfacing the original failure",
                     id, recovery.error_code, recovery.recovered, recovery.command_chosen
@@ -2297,21 +2344,104 @@ pub(crate) async fn try_ws_dispatch_for_app(
         return None;
     }
     debug!(
-        "[ui-bridge/elements] {} via WS → app_id='{}' (path={})",
-        action, app_id, http_path
+        "[ui-bridge/elements] {} via WS → app_id='{}' (http equivalent: {} {})",
+        action, app_id, http_method, http_path
     );
-    Some(
-        dispatcher
-            .dispatch(app_id, action, http_method, http_path, payload)
-            .await
-            .map_err(|e| e.to_user_message()),
-    )
+    ws_route_outcome(dispatcher.dispatch_websocket(app_id, action, payload).await)
+}
+
+/// A WebSocket-only dispatch's result in [`try_ws_dispatch_for_app`]'s terms.
+/// A registration that turned HTTP since the caller's read is refused
+/// (`NotWebsocket`) rather than sent down the HTTP arm, and reads as "no WS
+/// entry" — the caller falls through, as it would had its read seen HTTP.
+fn ws_route_outcome(
+    result: Result<serde_json::Value, DispatchError>,
+) -> Option<Result<serde_json::Value, String>> {
+    match result {
+        Err(DispatchError::NotWebsocket(_)) => None,
+        result => Some(result.map_err(|e| e.to_user_message())),
+    }
+}
+
+/// Whose components a `GET /ui-bridge/control/components` read returns.
+///
+/// A LOCAL read returns two sources, merged: the runner's own webview
+/// registry, and the `getComponents` reply of every live WebSocket-transport
+/// registered app (a wrapper). A read that came over the backend relay's
+/// `http_request` arm returns the runner's own registry only, for two reasons:
+///
+/// - **Time.** [`ws_collect_components`] asks each live wrapper in turn, and
+///   each dispatch may wait the command relay's full 30 s. The relay awaits
+///   every `http_request` inline on its WebSocket read loop, and that loop
+///   has to answer the server's PING inside 20 s. So a registrant that never
+///   answers can park that loop past the PING window, and the server then
+///   drops the device's whole relay. Any browser page can be such a
+///   registrant: `GET /ui-bridge/ws` is on the origin guard's
+///   `FOREIGN_ROUTES`, reachable from every origin. Without the fan-out, a
+///   relayed read is bounded by the UI Bridge IPC layer alone, as the relayed
+///   snapshot is.
+/// - **Content.** A wrapper's reply is whatever its author's handler returns,
+///   from a page under an arbitrary origin. It is appended unvalidated, and
+///   nothing in the merged list says which app sent it. Over the relay it
+///   would reach a remote caller as if it were the runner's own registry.
+///
+/// The relay's marker is [`relay_path_policy::RELAYED_REQUEST_HEADER`]. It
+/// only narrows the read, so a local caller that sends it gets the runner-only
+/// list and loses nothing it could not have by leaving it out.
+///
+/// [`relay_path_policy::RELAYED_REQUEST_HEADER`]: crate::mcp::relay_path_policy::RELAYED_REQUEST_HEADER
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComponentSources {
+    /// A local read: the runner's own registry, then every live wrapper's.
+    RunnerAndWrappers,
+    /// A relayed read: the runner's own registry, and no wrapper is asked.
+    RunnerOnly,
+}
+
+impl ComponentSources {
+    /// The sources a request is answered from, decided by whether the relay
+    /// forwarded it. Its one production caller is [`components_read`], so a
+    /// component read's sources come from that request's own headers. No code
+    /// outside this module can select them another way, and the compiler
+    /// holds that: this type, [`ws_components_for`] and [`components_envelope`]
+    /// are private to the module. Outside it, the one way to run the component
+    /// read is [`components_read`], which takes headers, not a choice of
+    /// sources.
+    fn for_request(headers: &HeaderMap) -> Self {
+        if crate::mcp::relay_path_policy::is_relayed_request(headers) {
+            Self::RunnerOnly
+        } else {
+            Self::RunnerAndWrappers
+        }
+    }
+
+    /// What the response's `data.wrapperComponents` says about the wrappers'
+    /// half, so a reader can tell "none registered" from "not asked".
+    fn wrapper_disclosure(self) -> &'static str {
+        match self {
+            Self::RunnerAndWrappers => "included",
+            Self::RunnerOnly => "withheld",
+        }
+    }
+}
+
+/// The wrappers' half of a component read. For a relayed read it is empty and
+/// no wrapper is dispatched to, so none can hold the read.
+async fn ws_components_for(
+    sources: ComponentSources,
+    registry: &AppRegistry,
+    dispatcher: &AppDispatcher,
+) -> Vec<serde_json::Value> {
+    match sources {
+        ComponentSources::RunnerAndWrappers => ws_collect_components(registry, dispatcher).await,
+        ComponentSources::RunnerOnly => Vec::new(),
+    }
 }
 
 /// Iterate every live WS-transport app and ask each for its components list.
 /// Errors from any individual app are logged but not propagated, so a single
 /// flaky wrapper cannot abort the merged response. Used by the LIST endpoint
-/// only.
+/// only, through [`ws_components_for`].
 async fn ws_collect_components(
     registry: &AppRegistry,
     dispatcher: &AppDispatcher,
@@ -2323,14 +2453,10 @@ async fn ws_collect_components(
             continue;
         }
         let app_id = entry.app.app_id.clone();
+        // WebSocket ONLY: an app that turned HTTP since `list_live` is refused,
+        // not sent a WebSocket command down the HTTP arm.
         match dispatcher
-            .dispatch(
-                &app_id,
-                "getComponents",
-                Method::GET,
-                "/ui-bridge/control/components",
-                serde_json::json!({}),
-            )
+            .dispatch_websocket(&app_id, "getComponents", serde_json::json!({}))
             .await
         {
             Ok(value) => {
@@ -2347,6 +2473,13 @@ async fn ws_collect_components(
                     // Single-component object — push as-is.
                     out.push(value);
                 }
+            }
+            // Expected, not a failure: the app turned HTTP mid fan-out.
+            Err(DispatchError::NotWebsocket(_)) => {
+                debug!(
+                    "[ui-bridge/elements] getComponents skipped '{}': no longer WS-registered",
+                    app_id
+                );
             }
             Err(e) => {
                 warn!(
@@ -2372,31 +2505,59 @@ fn ws_dispatch_error_response(error_msg: String) -> (StatusCode, Json<ApiRespons
 
 /// Get all registered components.
 ///
-/// Phase A1 merge behavior: returns the IPC component list (runner-internal
-/// React components) concatenated with the components reported by every live
-/// WebSocket-transport registered app (wrappers). IPC entries come first;
-/// per-wrapper errors during the WS fan-out are logged but never abort the
-/// merged response, so a flaky wrapper degrades gracefully. Both bare-array
-/// and `{data: [...]}` / `{components: [...]}` shapes from wrappers are
-/// accepted and unwrapped.
+/// Phase A1 merge behavior: a local read returns the IPC component list
+/// (runner-internal React components) concatenated with the components
+/// reported by every live WebSocket-transport registered app (wrappers). IPC
+/// entries come first; per-wrapper errors during the WS fan-out are logged but
+/// never abort the merged response, so a flaky wrapper degrades gracefully.
+/// Both bare-array and `{data: [...]}` / `{components: [...]}` shapes from
+/// wrappers are accepted and unwrapped.
 ///
-/// F2 (Direction B) envelope shape:
-/// - `data` is `{components: [...]}` (object-shaped, matches every other
-///   rich endpoint convention and aligns with the SDK relay).
-/// - A **deprecated** top-level `components` field mirrors the array so
-///   pre-Direction-B callers keep working. Slated for removal one release
-///   after Direction B lands — read from `data.components` instead.
+/// A read the backend relay forwarded returns the IPC list alone, and asks no
+/// wrapper; [`ComponentSources`] says why.
+///
+/// F2 (Direction B) envelope shape: `data` is `{components: [...],
+/// wrapperComponents}` (object-shaped, matches every other rich endpoint
+/// convention and aligns with the SDK relay); see [`components_envelope`].
+///
+/// The handler only extracts: it hands the request's own headers to
+/// [`components_read`], which decides the sources from them. A test cannot
+/// build the `ApiState` this needs, so
+/// `the_component_handler_hands_its_request_headers_to_the_read_core` pins
+/// this body by scraping it.
 pub async fn ui_bridge_get_components_handler(
     State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("UI Bridge API: Getting all components");
+    components_read(
+        &headers,
+        &state.app_registry,
+        &state.app_dispatcher,
+        ui_bridge_request_sync(&state, "get_components", serde_json::json!({})),
+    )
+    .await
+}
+
+/// [`ui_bridge_get_components_handler`] past its extractors: `headers` are the
+/// request's own, `registry` and `dispatcher` reach the WebSocket wrappers,
+/// and `ipc` is the read of the runner's own registry. The sources are chosen
+/// here, from `headers` ([`ComponentSources`]). The IPC read runs alongside the
+/// wrappers' half that choice selects, and the two are merged. Split out so a
+/// test can drive the whole read (source selection from the headers, fan-out,
+/// merge and envelope) against a registry and dispatcher of its own, which an
+/// `ApiState` cannot be built around.
+pub(crate) async fn components_read(
+    headers: &HeaderMap,
+    registry: &AppRegistry,
+    dispatcher: &AppDispatcher,
+    ipc: impl std::future::Future<Output = Result<serde_json::Value, String>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiResponse<()>>)> {
+    let sources = ComponentSources::for_request(headers);
+    info!("UI Bridge API: Getting all components ({sources:?})");
 
     // Fan out to WS-transport wrappers in parallel with the IPC call.
-    let registry = state.app_registry.clone();
-    let dispatcher = state.app_dispatcher.clone();
-    let ws_future = async move { ws_collect_components(&registry, &dispatcher).await };
-    let ipc_future = ui_bridge_request_sync(&state, "get_components", serde_json::json!({}));
-    let (ipc_result, mut ws_components) = tokio::join!(ipc_future, ws_future);
+    let (ipc_result, mut ws_components) =
+        tokio::join!(ipc, ws_components_for(sources, registry, dispatcher));
 
     // Surface IPC transport errors normally — but if IPC is broken AND we
     // do have WS components, prefer to return the WS list rather than 5xx,
@@ -2449,20 +2610,34 @@ pub async fn ui_bridge_get_components_handler(
     };
 
     merged.append(&mut ws_components);
-    let components_array = serde_json::Value::Array(merged);
-    // F2 (Direction B): emit `{success, data:{components:[...]}}` — the
-    // canonical wrapper-SDK envelope shape.
-    //
-    // Loop B Item B: the previous emission also carried a top-level
-    // `components` field as a deprecated back-compat mirror, but it
-    // duplicated `data.components` byte-for-byte and confused callers
-    // about which key was authoritative. The mirror has been dropped;
-    // `data.components` is the single source of truth and the regression
-    // test `components_envelope_omits_top_level_mirror` locks it in.
-    Ok(Json(serde_json::json!({
+    Ok(Json(components_envelope(merged, sources)))
+}
+
+/// The component read's body: `{success, data: {components, wrapperComponents}}`.
+///
+/// F2 (Direction B): `{success, data:{components:[...]}}` is the canonical
+/// wrapper-SDK envelope shape. `data.wrapperComponents` is `"included"` when
+/// the live wrappers were asked and `"withheld"` when they were not (a
+/// relayed read, [`ComponentSources`]). Without it, a list with no wrapper
+/// entries could mean either "none is registered" or "none was asked".
+///
+/// Loop B Item B: the previous emission also carried a top-level
+/// `components` field as a deprecated back-compat mirror, but it duplicated
+/// `data.components` byte-for-byte and confused callers about which key was
+/// authoritative. The mirror has been dropped; `data.components` is the
+/// single source of truth and the regression test
+/// `components_envelope_omits_top_level_mirror` locks it in.
+fn components_envelope(
+    components: Vec<serde_json::Value>,
+    sources: ComponentSources,
+) -> serde_json::Value {
+    serde_json::json!({
         "success": true,
-        "data": { "components": components_array },
-    })))
+        "data": {
+            "components": components,
+            "wrapperComponents": sources.wrapper_disclosure(),
+        },
+    })
 }
 
 /// Get a specific component by ID.
@@ -2559,15 +2734,10 @@ pub async fn ui_bridge_execute_component_action_handler(
     Path((id, action_id)): Path<(String, String)>,
     request: UiBridgeJson<UIBridgeComponentActionRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    // Which app the action lands on: a WS wrapper registered under the
-    // component id owns it (see `component_action_dispatch`); otherwise the
-    // runner's own webview does. Read before dispatch, from the same registry
-    // lookup the dispatch makes.
-    let app_id = match state.app_registry.get_live(&id).await {
-        Some(entry) if entry.transport == AppTransport::Websocket => id.clone(),
-        _ => crate::spec_api::storage::RUNNER_APP_ID.to_string(),
-    };
-    let result = component_action_dispatch(
+    // Which app the action landed on — a WS wrapper registered under the
+    // component id, else the runner's own webview — as the dispatch itself
+    // routed it, not from a second registry read that could disagree.
+    let (app_id, result) = component_action_dispatch(
         State(Arc::clone(&state)),
         Path((id.clone(), action_id.clone())),
         request,
@@ -2589,13 +2759,17 @@ pub async fn ui_bridge_execute_component_action_handler(
     result
 }
 
+type ComponentActionResult =
+    Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)>;
+
 /// The body of [`ui_bridge_execute_component_action_handler`], split out so
-/// the journey capture sees every exit in one place.
+/// the journey capture sees every exit in one place. Returns the app the
+/// action was routed to beside its result.
 async fn component_action_dispatch(
     State(state): State<Arc<ApiState>>,
     Path((id, action_id)): Path<(String, String)>,
     UiBridgeJson(request): UiBridgeJson<UIBridgeComponentActionRequest>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> (String, ComponentActionResult) {
     info!(
         "UI Bridge API: Executing action {} on component {}",
         action_id, id
@@ -2623,12 +2797,25 @@ async fn component_action_dispatch(
     )
     .await
     {
-        return match ws_outcome {
+        let result = match ws_outcome {
             Ok(value) => Ok(Json(ApiResponse::success(value))),
             Err(e) => Err(ws_dispatch_error_response(e)),
         };
+        return (id, result);
     }
+    (
+        crate::spec_api::storage::RUNNER_APP_ID.to_string(),
+        component_action_ipc(&state, &id, &action_id, payload).await,
+    )
+}
 
+/// [`component_action_dispatch`]'s IPC arm: the runner's own webview.
+async fn component_action_ipc(
+    state: &Arc<ApiState>,
+    id: &str,
+    action_id: &str,
+    payload: serde_json::Value,
+) -> ComponentActionResult {
     // Iter-3 item 4 — detect "component not found" / "action not found"
     // inner-failure shapes BEFORE wrap_ipc_result flattens them to the
     // default INTERNAL_ERROR envelope. The frontend's
@@ -2639,7 +2826,7 @@ async fn component_action_dispatch(
     // `ELEMENT_NOT_FOUND` taxonomy entry (the closest available — the
     // canonical schema has no `UB-COMPONENT-NOT-AVAILABLE` yet) instead
     // of being misclassified as a transport-level INTERNAL_ERROR.
-    let ipc_result = ui_bridge_request_sync(&state, "execute_component_action", payload).await;
+    let ipc_result = ui_bridge_request_sync(state, "execute_component_action", payload).await;
     if let Ok(ref data) = ipc_result {
         if data.get("success").and_then(|v| v.as_bool()) == Some(false) {
             let error_msg = data.get("error").and_then(|v| v.as_str()).unwrap_or("");
@@ -2651,7 +2838,7 @@ async fn component_action_dispatch(
                 && (error_msg.to_lowercase().contains("not found")
                     || error_msg.to_lowercase().contains("unknown"));
             if is_component_missing {
-                let detail = UiBridgeError::element_not_found(&id);
+                let detail = UiBridgeError::element_not_found(id);
                 let message = format!("Component not found: {}", id);
                 return Err((
                     StatusCode::NOT_FOUND,
@@ -2662,7 +2849,9 @@ async fn component_action_dispatch(
                 let detail = UiBridgeError {
                     code: super::types::UiBridgeErrorCode::ActionNotSupported,
                     message: error_msg.to_string(),
-                    recovery: Some(super::types::RecoveryHint::Unrecoverable),
+                    recovery: Some(qontinui_types::refusal::NextAction::new(
+                        qontinui_types::refusal::NextActionKind::FixRequest,
+                    )),
                     context: Some(serde_json::json!({
                         "componentId": id,
                         "actionId": action_id,
@@ -3476,7 +3665,7 @@ fn api_error_to_value(message: impl Into<String>) -> ApiResponse<serde_json::Val
         error_detail: None,
         hint: None,
         code: None,
-        suggestions: None,
+        refusal: None,
     }
 }
 
@@ -3715,7 +3904,7 @@ fn apply_strict_timeout_reshape(
                 error_detail: err.error_detail,
                 hint: err.hint,
                 code: err.code,
-                suggestions: err.suggestions,
+                refusal: err.refusal,
             };
             Err((status, Json(widened)))
         }
@@ -3888,6 +4077,99 @@ pub async fn ui_bridge_find_handler(
 // Convenience endpoints — app-agnostic DOM interaction helpers
 // =========================================================================
 
+/// The script `page/find-by-text` evaluates: the visible `tag` elements whose
+/// trimmed text equals `text` case-sensitively (`exact`), or else contains it
+/// case-insensitively, as a JSON array. Both caller values enter the script
+/// only as single-quoted string data, `\` and `'` escaped, so neither can close
+/// its literal and splice code. That is the invariant the unguarded fallback
+/// of `evaluate_js_expression` (helpers.rs) relies on.
+fn find_by_text_js(text: &str, tag: &str, exact: bool) -> String {
+    let escaped_text = text.replace('\\', "\\\\").replace('\'', "\\'");
+    let escaped_tag = tag.replace('\\', "\\\\").replace('\'', "\\'");
+    let match_expr = if exact {
+        format!("el.textContent.trim() === '{}'", escaped_text)
+    } else {
+        format!(
+            "el.textContent.trim().toLowerCase().includes('{}')",
+            escaped_text.to_lowercase()
+        )
+    };
+
+    format!(
+        r#"JSON.stringify(Array.from(document.querySelectorAll('{tag}'))
+            .filter(el => el.offsetParent !== null && {match_expr})
+            .map((el, i) => ({{
+                index: i,
+                tag: el.tagName,
+                text: el.textContent.trim().slice(0, 100),
+                id: el.id || null,
+                disabled: el.disabled || false,
+                visible: el.offsetParent !== null,
+                rect: (() => {{ const r = el.getBoundingClientRect(); return {{ x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height) }}; }})()
+            }})))"#,
+        tag = escaped_tag,
+        match_expr = match_expr
+    )
+}
+
+#[cfg(test)]
+mod find_by_text_js_tests {
+    use super::find_by_text_js;
+
+    /// A caller's `tag` enters the script as escaped string data, exactly as
+    /// `text` does. A tag that tries to close its `querySelectorAll('...')`
+    /// literal and call `fetch` stays inside the literal. So does one that
+    /// puts a backslash before that quote, which only the backslash doubling
+    /// catches: without it, `\'` becomes `\\'`, an escaped backslash and then
+    /// a quote that closes the literal. And so does a trailing backslash that
+    /// would otherwise escape the closing quote.
+    #[test]
+    fn a_hostile_tag_stays_inside_its_string_literal() {
+        for exact in [true, false] {
+            let js = find_by_text_js(
+                "Submit",
+                "*'),fetch('/x'),document.querySelectorAll('*",
+                exact,
+            );
+            assert!(
+                js.contains(
+                    r"querySelectorAll('*\'),fetch(\'/x\'),document.querySelectorAll(\'*')"
+                ),
+                "the tag must sit escaped inside its literal, got: {js}"
+            );
+            assert!(
+                !js.contains("'),fetch('"),
+                "the tag must not close its literal and splice a call, got: {js}"
+            );
+
+            // The absence check is anchored at the literal's opening quote:
+            // the bare `\\'),fetch(` also occurs inside the correctly escaped
+            // `*\\\'),fetch(`.
+            let js = find_by_text_js(
+                "Submit",
+                r"*\'),fetch('/x'),document.querySelectorAll('*",
+                exact,
+            );
+            assert!(
+                js.contains(
+                    r"querySelectorAll('*\\\'),fetch(\'/x\'),document.querySelectorAll(\'*')"
+                ),
+                "a backslash before the quote must be escaped too, got: {js}"
+            );
+            assert!(
+                !js.contains(r"querySelectorAll('*\\'),fetch("),
+                "a backslash before the quote must not let the quote close its literal, got: {js}"
+            );
+
+            let js = find_by_text_js("Submit", r"button\", exact);
+            assert!(
+                js.contains(r"querySelectorAll('button\\')"),
+                "a trailing backslash in the tag must be escaped, got: {js}"
+            );
+        }
+    }
+}
+
 /// Find elements by visible text content.
 /// POST /ui-bridge/control/page/find-by-text
 /// Body: { "text": "Submit", "tag": "button", "exact": true }
@@ -3906,31 +4188,7 @@ pub async fn ui_bridge_find_by_text_handler(
         ));
     }
 
-    let escaped_text = text.replace('\\', "\\\\").replace('\'', "\\'");
-    let match_expr = if exact {
-        format!("el.textContent.trim() === '{}'", escaped_text)
-    } else {
-        format!(
-            "el.textContent.trim().toLowerCase().includes('{}')",
-            escaped_text.to_lowercase()
-        )
-    };
-
-    let js = format!(
-        r#"JSON.stringify(Array.from(document.querySelectorAll('{tag}'))
-            .filter(el => el.offsetParent !== null && {match_expr})
-            .map((el, i) => ({{
-                index: i,
-                tag: el.tagName,
-                text: el.textContent.trim().slice(0, 100),
-                id: el.id || null,
-                disabled: el.disabled || false,
-                visible: el.offsetParent !== null,
-                rect: (() => {{ const r = el.getBoundingClientRect(); return {{ x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height) }}; }})()
-            }})))"#,
-        tag = tag,
-        match_expr = match_expr
-    );
+    let js = find_by_text_js(text, tag, exact);
 
     // Optional `windowLabel` scopes the read to a pop-out window (Phase 4 of
     // plan 2026-06-07-multi-window-sdk-automation); omit -> main window.
@@ -4102,47 +4360,20 @@ async fn ui_bridge_click_by_selector_handler_dispatch(
     }
 }
 
-/// Validate the `all` parameter of `read-value`.
-///
-/// Returns the effective boolean, or a 400 message naming the offending
-/// parameter(s). Mirrors `readValuePrimitive` in `@qontinui/ui-bridge`
-/// (`server/page-primitives.ts`) so the direct HTTP path and the SDK path
-/// reject the same bodies with the same reasons — the whole point of this fix
-/// is that the two paths stopped agreeing about `all`.
-///
-/// Pure + unit-tested: the validation is the part worth pinning, and it needs
-/// neither a router nor a webview.
-pub fn validate_read_value_all(body: &serde_json::Value) -> Result<bool, String> {
-    let Some(raw) = body.get("all") else {
-        return Ok(false);
-    };
-    if raw.is_null() {
-        return Ok(false);
+/// Build the `read_value` IPC payload. `windowLabel` must ride at the TOP
+/// level: `ui_bridge_request_sync` strips it there to pick the window, while
+/// the frontend reads `payload.params`.
+pub(crate) fn read_value_ipc_payload(body: &serde_json::Value) -> serde_json::Value {
+    let mut params = serde_json::Map::new();
+    for key in ["selector", "index", "all"] {
+        if let Some(v) = body.get(key) {
+            params.insert(key.to_string(), v.clone());
+        }
     }
-    let Some(all) = raw.as_bool() else {
-        return Err(format!(
-            "'all' must be a boolean (got {})",
-            json_type_name(raw)
-        ));
-    };
-    if all && body.get("index").is_some_and(|v| !v.is_null()) {
-        return Err(
-            "'all' and 'index' are mutually exclusive — 'all' returns every match, 'index' selects one. Drop one of them.".to_string(),
-        );
-    }
-    Ok(all)
-}
-
-/// JSON type name for a validation message ("string", "number", …).
-fn json_type_name(v: &serde_json::Value) -> &'static str {
-    match v {
-        serde_json::Value::Null => "null",
-        serde_json::Value::Bool(_) => "boolean",
-        serde_json::Value::Number(_) => "number",
-        serde_json::Value::String(_) => "string",
-        serde_json::Value::Array(_) => "array",
-        serde_json::Value::Object(_) => "object",
-    }
+    serde_json::json!({
+        "windowLabel": read_window_label(body),
+        "params": params,
+    })
 }
 
 /// Read the value of a form element by CSS selector.
@@ -4150,25 +4381,25 @@ fn json_type_name(v: &serde_json::Value) -> &'static str {
 /// Body: { "selector": "textarea", "index": 0 }
 /// Or:   { "selector": "input.row", "all": true }
 ///
-/// `all: true` returns EVERY match in `values[]` (document order). This handler
-/// is an INDEPENDENT JS-injection implementation of the SDK's `readValue` — it
-/// reads only `selector`/`index` — so honouring `all` in `@qontinui/ui-bridge`
-/// (PR #156) did nothing for a caller reaching the runner over the direct HTTP
-/// path: it asked for 14 values, got 1, and nothing in the response said the
-/// parameter had been dropped. `all` and the singular `index` are mutually
-/// exclusive and a body carrying both is REJECTED by name (matching the SDK's
-/// wording) rather than one of them being silently reinterpreted; a non-boolean
-/// `all` is likewise rejected by name.
+/// Dispatches the same `read_value` IPC request the relay fallback
+/// (`/ui-bridge/sdk/page/read-value`) serves, so every door shares ONE
+/// implementation: the SDK's `readValuePrimitive`, which owns the §4.6
+/// redaction verdict (a password input, or anything inside a
+/// `data-bridge-redact="true"` boundary, reads back `[REDACTED]`) and the
+/// `all` / `index` validation. This handler used to inject its own JS that read
+/// `el.value` raw and served stored secrets in cleartext.
 ///
-/// `totalMatches` was already computed and returned in both modes, so a 1-of-N
-/// read has always been able to say so.
+/// Response shape is the primitive's: `{ value, length, totalMatches,
+/// values? }`. A selector matching nothing is an error (400), like the
+/// primitive's `ELEMENT_NOT_FOUND`, not HTTP 200 `found:false`.
+///
+/// Optional `windowLabel` scopes the read to a pop-out window (plan
+/// 2026-06-07-multi-window-sdk-automation Phase 4); omit -> main window.
 pub async fn ui_bridge_read_value_handler(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let selector = body.get("selector").and_then(|v| v.as_str()).unwrap_or("");
-    let index = body.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
-
     if selector.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -4176,56 +4407,8 @@ pub async fn ui_bridge_read_value_handler(
         ));
     }
 
-    let all = match validate_read_value_all(&body) {
-        Ok(v) => v,
-        Err(msg) => return Err((StatusCode::BAD_REQUEST, Json(api_error(msg)))),
-    };
-
-    let escaped_selector = selector.replace('\\', "\\\\").replace('\'', "\\'");
-
-    let js = format!(
-        r#"(() => {{
-            const readOne = (el, i) => ({{
-                index: i,
-                tag: el.tagName,
-                type: el.type || null,
-                value: el.value || el.textContent?.trim() || '',
-                length: (el.value || el.textContent || '').length,
-                placeholder: el.placeholder || null,
-                disabled: el.disabled || false,
-                readOnly: el.readOnly || false
-            }});
-            const matches = Array.from(document.querySelectorAll('{selector}'));
-            if (matches.length === 0) return JSON.stringify({{ found: false, error: 'No elements match selector', totalMatches: 0 }});
-            if ({all}) {{
-                const values = matches.map(readOne);
-                return JSON.stringify(Object.assign({{ found: true }}, values[0], {{
-                    totalMatches: matches.length,
-                    values: values
-                }}));
-            }}
-            const idx = {index};
-            if (idx >= matches.length) return JSON.stringify({{ found: false, error: 'Index out of range', totalMatches: matches.length }});
-            return JSON.stringify(Object.assign({{ found: true }}, readOne(matches[idx], idx), {{
-                totalMatches: matches.length
-            }}));
-        }})()"#,
-        selector = escaped_selector,
-        index = index,
-        all = all
-    );
-
-    // Optional `windowLabel` scopes the read to a pop-out window (Phase 4 of
-    // plan 2026-06-07-multi-window-sdk-automation); omit -> main window.
-    let window_label = read_window_label(&body);
-    match evaluate_js_expression_in_window(&state, &js, window_label).await {
-        Ok(result) => Ok(Json(ApiResponse::success(parse_eval_result(
-            "read-value",
-            "read result",
-            &result,
-        )?))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
-    }
+    let payload = read_value_ipc_payload(&body);
+    wrap_ipc_result(ui_bridge_request_sync(&state, "read_value", payload).await)
 }
 
 /// Build the element-RESOLUTION expression for `type-into`.
@@ -4765,7 +4948,7 @@ pub async fn ui_bridge_expect_element_handler(
                 error_detail: None,
                 hint: Some(envelope.data.unwrap_or(serde_json::Value::Null)),
                 code: None,
-                suggestions: None,
+                refusal: None,
             }),
         ))
     }
@@ -4931,6 +5114,15 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             "/ui-bridge/control/page/type-into",
             post(ui_bridge_type_into_handler),
         )
+        // The WebSocket-app branches answer with the app's own content, so
+        // while a condition-check session holds a secret no response here
+        // carries it (`crate::condition_secrets`, plan
+        // 2026-11-06-a-regression-test-run-is-judged-by-what-it-covered-and-a-silent-run-reads-unknown
+        // Phase 13). LAST, because `Router::layer` wraps only the routes
+        // registered before it.
+        .layer(axum::middleware::from_fn(
+            crate::condition_secrets::scrub_sdk_responses,
+        ))
 }
 
 /// Static (method, path) tuples corresponding to every route registered
@@ -5420,7 +5612,8 @@ mod type_into_tests {
 
 /// F2 — direct `/ui-bridge/control/components` envelope shape (Direction B).
 /// Verifies the response carries `data.components` AS THE ONLY components
-/// field. Pure unit test against the literal shape the handler emits; an
+/// field, beside the `data.wrapperComponents` disclosure. Pure unit tests of
+/// [`components_envelope`], the function the handler's read ends in; an
 /// axum-router-level integration test would need a fully constructed
 /// `ApiState`.
 ///
@@ -5431,17 +5624,27 @@ mod type_into_tests {
 /// review.
 #[cfg(test)]
 mod components_envelope_tests {
+    use super::{components_envelope, ComponentSources};
     use serde_json::json;
 
-    /// Mirrors the literal at the bottom of `ui_bridge_get_components_handler`.
-    /// Update in lock-step if the handler's `Ok(Json(serde_json::json!(...)))`
-    /// payload changes.
     fn components_response(components: Vec<serde_json::Value>) -> serde_json::Value {
-        let components_array = serde_json::Value::Array(components);
-        json!({
-            "success": true,
-            "data": { "components": components_array },
-        })
+        components_envelope(components, ComponentSources::RunnerAndWrappers)
+    }
+
+    /// The disclosure names which half was asked, so an empty wrapper half is
+    /// never ambiguous: `included` for a local read, `withheld` for a relayed
+    /// one. Spelled as literals, so renaming a value fails here.
+    #[test]
+    fn the_envelope_says_whether_wrappers_were_asked() {
+        let local = components_envelope(vec![], ComponentSources::RunnerAndWrappers);
+        assert_eq!(local["data"]["wrapperComponents"], json!("included"));
+        let relayed = components_envelope(vec![], ComponentSources::RunnerOnly);
+        assert_eq!(relayed["data"]["wrapperComponents"], json!("withheld"));
+        assert_eq!(
+            relayed["data"]["components"],
+            json!([]),
+            "the disclosure sits beside the list, it does not replace it"
+        );
     }
 
     #[test]
@@ -5522,15 +5725,27 @@ mod components_envelope_tests {
 // ============================================================================
 #[cfg(test)]
 mod ws_dispatch_selection_tests {
-    use super::{try_ws_dispatch_for_app, ws_collect_components};
+    use super::{
+        components_read, try_ws_dispatch_for_app, ws_collect_components, ws_components_for,
+        ws_route_outcome, ComponentSources,
+    };
     use crate::mcp::app_discovery::DiscoveredApp;
-    use crate::mcp::app_dispatch::AppDispatcher;
+    use crate::mcp::app_dispatch::{AppDispatcher, DispatchError};
     use crate::mcp::app_registry::{AppRegistry, AppTransport};
     use crate::mcp::command_relay::{CommandRelay, CommandResponse};
     use crate::mcp::ws_relay::WsConnectionManager;
     use reqwest::Method;
     use serde_json::json;
     use std::time::Duration;
+
+    #[test]
+    fn a_route_that_is_no_longer_websocket_falls_through() {
+        let flipped = ws_route_outcome(Err(DispatchError::NotWebsocket("w".into())));
+        assert_eq!(flipped, None);
+        let failed = ws_route_outcome(Err(DispatchError::NotRegistered("w".into())));
+        assert!(matches!(failed, Some(Err(_))), "{failed:?}");
+        assert_eq!(ws_route_outcome(Ok(json!(1))), Some(Ok(json!(1))));
+    }
 
     /// m8: a dispatch REFRESHES the row it dispatches to.
     ///
@@ -6000,96 +6215,435 @@ mod ws_dispatch_selection_tests {
             .collect();
         assert_eq!(ids, expected, "merged ids must contain every WS component");
     }
+
+    /// Plan 2026-10-23-console-presentation-spaces Phase 6, review round 1:
+    /// the relay's marker header, and only that header, selects the
+    /// runner-only read. Presence is the signal, so an empty value or a
+    /// re-cased name still marks the request. The header name is spelled
+    /// here as a literal, so renaming the constant fails this test.
+    #[test]
+    fn the_relay_marker_selects_the_runner_only_read() {
+        use axum::http::{HeaderMap, HeaderName, HeaderValue};
+        assert_eq!(
+            ComponentSources::for_request(&HeaderMap::new()),
+            ComponentSources::RunnerAndWrappers,
+            "a local read asks the wrappers"
+        );
+        let marked = |name: &[u8], value: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                HeaderName::from_bytes(name).unwrap(),
+                HeaderValue::from_static(value),
+            );
+            ComponentSources::for_request(&headers)
+        };
+        assert_eq!(
+            marked(b"x-qontinui-relayed", "http_request"),
+            ComponentSources::RunnerOnly
+        );
+        assert_eq!(
+            marked(b"X-Qontinui-Relayed", ""),
+            ComponentSources::RunnerOnly
+        );
+        assert_eq!(
+            marked(b"x-qontinui-relay", "http_request"),
+            ComponentSources::RunnerAndWrappers,
+            "a header that is not the marker selects nothing"
+        );
+    }
+
+    /// A live wrapper that never answers, and a dispatcher at the PRODUCTION
+    /// command timeout, so any dispatch made waits its full 30 s.
+    async fn hung_wrapper() -> (
+        std::sync::Arc<AppRegistry>,
+        std::sync::Arc<AppDispatcher>,
+        std::sync::Arc<CommandRelay>,
+        u64,
+        tokio::sync::mpsc::Receiver<String>,
+    ) {
+        let registry = AppRegistry::new();
+        let ws = WsConnectionManager::new();
+        let (conn, rx) = ws.test_register("hung-wrapper").await;
+        registry
+            .upsert(
+                sample_app("hung-wrapper"),
+                None,
+                AppTransport::Websocket,
+                Some(conn),
+                None,
+            )
+            .await;
+        let relay = CommandRelay::new(ws);
+        let dispatcher = AppDispatcher::new(registry.clone(), relay.clone());
+        (registry, dispatcher, relay, conn, rx)
+    }
+
+    /// A relayed read asks no wrapper at all, so a wrapper that never answers
+    /// cannot hold it. The local read beside it DOES send that wrapper a
+    /// `getComponents` command, which is what makes the first half
+    /// discriminating: the wrapper is live and dispatchable, and the
+    /// runner-only read leaves it alone anyway.
+    #[tokio::test]
+    async fn a_runner_only_read_dispatches_to_no_wrapper() {
+        let (registry, dispatcher, relay, conn, mut rx) = hung_wrapper().await;
+
+        let withheld = tokio::time::timeout(
+            Duration::from_secs(2),
+            ws_components_for(ComponentSources::RunnerOnly, &registry, &dispatcher),
+        )
+        .await
+        .expect("a runner-only read must not wait on a wrapper");
+        assert!(withheld.is_empty(), "{withheld:?}");
+        assert!(
+            rx.try_recv().is_err(),
+            "a runner-only read sent the wrapper a command"
+        );
+
+        let (registry_h, dispatcher_h) = (registry.clone(), dispatcher.clone());
+        let local = tokio::spawn(async move {
+            ws_components_for(
+                ComponentSources::RunnerAndWrappers,
+                &registry_h,
+                &dispatcher_h,
+            )
+            .await
+        });
+        let frame = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a local read asks the live wrapper")
+            .expect("the wrapper's command channel is open");
+        let command: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(command["action"], "getComponents");
+        relay
+            .resolve(
+                conn,
+                crate::mcp::relay_binding::BindingMode::Enforce,
+                CommandResponse {
+                    command_id: command["commandId"].as_str().unwrap().to_string(),
+                    success: true,
+                    result: Some(json!([{ "id": "wrapper-1" }])),
+                    error: None,
+                },
+            )
+            .await;
+        assert_eq!(local.await.unwrap(), vec![json!({ "id": "wrapper-1" })]);
+    }
+
+    /// Request headers carrying the relay's marker, the way
+    /// `backend_relay::relay_http_to_base` stamps every forwarded request. The
+    /// name is spelled as a literal, as in
+    /// `the_relay_marker_selects_the_runner_only_read`.
+    fn relayed_headers() -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::HeaderName::from_static("x-qontinui-relayed"),
+            axum::http::HeaderValue::from_static("http_request"),
+        );
+        headers
+    }
+
+    /// The read core chooses its sources from the request headers it is
+    /// handed, with the runner's own registry stubbed. A request bearing the
+    /// relay's marker returns the runner's entries alone, says the wrappers
+    /// were withheld, and returns at once although a live wrapper never
+    /// answers. When the runner's own read fails, a relayed read is an ERROR:
+    /// with no wrapper half to fall back to, an empty list would claim the
+    /// runner registers nothing.
+    #[tokio::test]
+    async fn a_relayed_read_returns_the_runners_registry_or_its_error() {
+        let (registry, dispatcher, _relay, _conn, mut rx) = hung_wrapper().await;
+
+        let body = tokio::time::timeout(
+            Duration::from_secs(5),
+            components_read(&relayed_headers(), &registry, &dispatcher, async {
+                Ok::<_, String>(json!([{ "id": "runner-1" }]))
+            }),
+        )
+        .await
+        .expect("a relayed read must not wait on a wrapper")
+        .expect("the runner's own registry answered")
+        .0;
+        assert_eq!(body["data"]["components"], json!([{ "id": "runner-1" }]));
+        assert_eq!(body["data"]["wrapperComponents"], json!("withheld"));
+
+        let failed = tokio::time::timeout(
+            Duration::from_secs(5),
+            components_read(&relayed_headers(), &registry, &dispatcher, async {
+                Err::<serde_json::Value, _>("UI Bridge request timed out".to_string())
+            }),
+        )
+        .await
+        .expect("a relayed read must not wait on a wrapper");
+        let (status, _) = failed.expect_err("a failed runner read is not an empty list");
+        assert!(status.is_server_error(), "{status}");
+        assert!(rx.try_recv().is_err(), "no wrapper was asked either time");
+    }
+
+    /// The other half of the read core's selection: handed headers WITHOUT the
+    /// marker, the same core asks the live wrapper, merges its reply after the
+    /// runner's own entries, and says the wrappers were included. This is what
+    /// makes the relayed half above discriminating: the wrapper is live and
+    /// dispatchable, and a marked request leaves it alone anyway.
+    #[tokio::test]
+    async fn an_unmarked_read_asks_the_wrappers_and_says_so() {
+        let (registry, dispatcher, relay, conn, mut rx) = hung_wrapper().await;
+
+        let (registry_h, dispatcher_h) = (registry.clone(), dispatcher.clone());
+        let local = tokio::spawn(async move {
+            components_read(
+                &axum::http::HeaderMap::new(),
+                &registry_h,
+                &dispatcher_h,
+                async { Ok::<_, String>(json!([{ "id": "runner-1" }])) },
+            )
+            .await
+            .map(|body| body.0)
+        });
+        let frame = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("an unmarked read asks the live wrapper")
+            .expect("the wrapper's command channel is open");
+        let command: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(command["action"], "getComponents");
+        relay
+            .resolve(
+                conn,
+                crate::mcp::relay_binding::BindingMode::Enforce,
+                CommandResponse {
+                    command_id: command["commandId"].as_str().unwrap().to_string(),
+                    success: true,
+                    result: Some(json!([{ "id": "wrapper-1" }])),
+                    error: None,
+                },
+            )
+            .await;
+        let body = local
+            .await
+            .unwrap()
+            .expect("the runner's own registry answered");
+        assert_eq!(
+            body["data"]["components"],
+            json!([{ "id": "runner-1" }, { "id": "wrapper-1" }])
+        );
+        assert_eq!(body["data"]["wrapperComponents"], json!("included"));
+    }
+
+    /// `ui_bridge_get_components_handler` extracts an `ApiState`, which no test
+    /// can build (it owns a `tauri::AppHandle`), so no test runs it. Its body
+    /// is the one place a request's own headers reach [`components_read`],
+    /// where the sources are chosen, and every test of that core supplies
+    /// headers of its own. So the body is pinned by scraping it, as
+    /// `every_element_read_handler_advertises_custom_actions` does. A handler
+    /// that passed `components_read` any other `HeaderMap` (an empty one, a
+    /// rebuilt or edited copy) would send every relayed read to the WebSocket
+    /// wrappers again while all of those tests stayed green.
+    ///
+    /// The handler must take `headers: HeaderMap` and use it exactly once, as
+    /// `components_read`'s first argument. It must name no `ComponentSources`
+    /// and build no `HeaderMap` of its own. Whitespace is ignored, so a
+    /// `cargo fmt` reflow does not trip the pin.
+    #[test]
+    fn the_component_handler_hands_its_request_headers_to_the_read_core() {
+        let src = include_str!("elements.rs").replace("\r\n", "\n");
+        let (_, after) = src
+            .split_once("pub async fn ui_bridge_get_components_handler(")
+            .expect("ui_bridge_get_components_handler not found in elements.rs");
+        // A handler ends at its first column-0 closing brace.
+        let (body, _) = after
+            .split_once("\n}\n")
+            .expect("ui_bridge_get_components_handler has no column-0 closing brace");
+        let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            compact.contains("headers:HeaderMap,"),
+            "the handler must extract the request's headers: {body}"
+        );
+        assert!(
+            compact.contains("components_read(&headers,"),
+            "the handler must hand its own `headers` to `components_read`: {body}"
+        );
+        assert_eq!(
+            compact.matches("headers").count(),
+            2,
+            "`headers` must be bound once (the extractor) and used once (the \
+             `components_read` argument), so nothing rebinds or edits it: {body}"
+        );
+        for chosen_elsewhere in ["ComponentSources", "HeaderMap::", "HeaderMap{"] {
+            assert!(
+                !compact.contains(chosen_elsewhere),
+                "the handler must leave source selection to `components_read`, \
+                 but it contains `{chosen_elsewhere}`: {body}"
+            );
+        }
+    }
+
+    /// The pin above holds the handler's BODY. This one holds its BINDING: the
+    /// component route is registered exactly once in this file, and that
+    /// registration routes GET, and no other method, to
+    /// `ui_bridge_get_components_handler`. Bound to another handler, the route
+    /// would be served by a body the pin above never reads, and every test
+    /// above would stay green. A rebind, a second method chained onto the
+    /// registration, or a move to another file turns this red, so whoever
+    /// moves the registration moves this pin with it. Whitespace is ignored,
+    /// as above.
+    #[test]
+    fn the_component_route_is_bound_to_that_handler() {
+        const PATH: &str = "/ui-bridge/control/components";
+        const BINDING: &str = "get(ui_bridge_get_components_handler)";
+        let compact: String = include_str!("elements.rs")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        // Built at run time, so this test's own source never matches it.
+        let registration = format!(".route(\"{PATH}\",");
+        let bound: Vec<&str> = compact.split(registration.as_str()).skip(1).collect();
+        assert_eq!(
+            bound.len(),
+            1,
+            "`{PATH}` must be registered exactly once in elements.rs, but {} registrations \
+             were found",
+            bound.len()
+        );
+        let rest = bound[0].strip_prefix(BINDING).unwrap_or_else(|| {
+            panic!(
+                "`{PATH}` must be routed to `{BINDING}`, but its registration reads `{}`",
+                bound[0].chars().take(80).collect::<String>()
+            )
+        });
+        assert!(
+            rest.starts_with(')') || rest.starts_with(",)"),
+            "`{PATH}` must route GET alone to the handler, but `{BINDING}` is followed by `{}`",
+            rest.chars().take(80).collect::<String>()
+        );
+    }
 }
 
 #[cfg(test)]
-mod validate_action_name_tests {
-    //! Validation seam for the invalid-action gate that lives at the top of
-    //! `ui_bridge_execute_action_handler`. Exercises the pure helper so we
-    //! don't need an axum router / live IPC harness — matches the precedent
-    //! set by `validate_wait_for_element_state_request` /
-    //! `validate_tab_id`. Locks down both the accept-list (every known
-    //! action round-trips) and the reject-shape (`INVALID_REQUEST` code +
-    //! `supportedActions` context payload) so a future rename can't
-    //! silently let `press` through to the RecoveryExecutor again.
-    use super::{validate_action_name, SUPPORTED_ACTION_NAMES};
-    use crate::mcp::ui_bridge::types::UiBridgeErrorCode;
+mod is_builtin_action_tests {
+    //! The verb classifier behind the invalid-action gate in
+    //! `ui_bridge_execute_action_handler`. Locks down the accept-list so a
+    //! future rename can't silently let `press` through to the
+    //! RecoveryExecutor again. The 400 a non-built-in verb gets is the deferred
+    //! gate's, tested in `action_vocabulary`.
+    use super::{is_builtin_action, SUPPORTED_ACTION_ALIASES, SUPPORTED_ACTION_NAMES};
+
+    /// `SUPPORTED_ACTIONS` in `@qontinui/ui-bridge`
+    /// `packages/ui-bridge/src/control/action-executor.ts` at ui-bridge
+    /// `9f373a12` (0.46.0), in its order — the verbs the SDK accepts, checked
+    /// with an exact `Set.has` before any dispatch. A literal, so a change on
+    /// either side fails here rather than passing a tautology.
+    const SDK_SUPPORTED_ACTIONS_0_46: &[&str] = &[
+        "click",
+        "hoverClick",
+        "doubleClick",
+        "rightClick",
+        "middleClick",
+        "type",
+        "sendKeys",
+        "clear",
+        "select",
+        "focus",
+        "blur",
+        "hover",
+        "unhover",
+        "scroll",
+        "scrollIntoView",
+        "check",
+        "uncheck",
+        "toggle",
+        "drag",
+        "setValue",
+        "submit",
+        "reset",
+        "autocomplete",
+    ];
 
     #[test]
-    fn every_supported_action_is_accepted() {
-        for name in SUPPORTED_ACTION_NAMES {
-            let got = validate_action_name(name)
-                .unwrap_or_else(|_| panic!("expected {name} to validate"));
-            assert_eq!(got, *name, "validator must return the canonical name");
+    fn supported_action_names_are_the_sdk_verbs() {
+        // The `allowedActions` hint serves this list, so it must name exactly
+        // what the SDK performs: no alias it refuses, no verb it is missing.
+        assert_eq!(SUPPORTED_ACTION_NAMES, SDK_SUPPORTED_ACTIONS_0_46);
+    }
+
+    #[test]
+    fn every_alias_is_classified_builtin_but_is_not_an_sdk_verb() {
+        for (alias, canonical) in SUPPORTED_ACTION_ALIASES {
+            assert!(
+                is_builtin_action(alias),
+                "{alias} must pass the unknown-verb gate"
+            );
+            assert!(
+                !SDK_SUPPORTED_ACTIONS_0_46.contains(alias),
+                "{alias} is an SDK verb, so it belongs in SUPPORTED_ACTION_NAMES"
+            );
+            assert!(
+                SDK_SUPPORTED_ACTIONS_0_46.contains(canonical),
+                "{alias} must mean an SDK verb, not {canonical}"
+            );
+        }
+        // The spellings that used to be listed as verbs, every one kept.
+        let aliases: Vec<&str> = SUPPORTED_ACTION_ALIASES.iter().map(|(a, _)| *a).collect();
+        for kept in [
+            "double_click",
+            "double",
+            "right",
+            "middle",
+            "scroll_into_view",
+        ] {
+            assert!(aliases.contains(&kept), "{kept}");
+        }
+    }
+
+    /// Literal names, so a rename in `SUPPORTED_ACTION_NAMES` fails here.
+    #[test]
+    fn the_core_verbs_are_builtin() {
+        for name in [
+            "click",
+            "hoverClick",
+            "doubleClick",
+            "rightClick",
+            "middleClick",
+            "type",
+            "sendKeys",
+            "focus",
+            "hover",
+            "scrollIntoView",
+            "scroll_into_view",
+        ] {
+            assert!(is_builtin_action(name), "expected {name} to be built-in");
         }
     }
 
     #[test]
-    fn canonical_click_round_trips() {
-        // Sanity check the click path explicitly — it's the dominant call
-        // site and the one most likely to regress under refactor.
-        assert_eq!(validate_action_name("click").unwrap(), "click");
+    fn surrounding_whitespace_is_trimmed() {
+        assert!(is_builtin_action("  click "));
     }
 
     #[test]
-    fn unknown_action_is_rejected_with_invalid_request_code() {
-        let err = validate_action_name("press").expect_err("press must not be accepted");
-        assert!(
-            matches!(err.code, UiBridgeErrorCode::InvalidRequest),
-            "expected INVALID_REQUEST code, got {:?}",
-            err.code
-        );
-        assert!(
-            err.message.contains("press"),
-            "message must surface the rejected name, got: {}",
-            err.message
-        );
+    fn unhover_is_a_supported_action_name() {
+        // Added SDK-side with forced hover; without it the route 400s
+        // before IPC and the forced hover can never be released.
+        assert!(is_builtin_action("unhover"));
     }
 
     #[test]
-    fn unknown_action_carries_supported_list_in_context() {
-        let err = validate_action_name("slap").expect_err("slap must not be accepted");
-        let ctx = err.context.as_ref().expect("context must be present");
-        let supported = ctx
-            .get("supportedActions")
-            .and_then(|v| v.as_array())
-            .expect("supportedActions must be an array");
-        let names: Vec<&str> = supported.iter().filter_map(|v| v.as_str()).collect();
-        // Spot-check a couple of canonical names — full equality with
-        // SUPPORTED_ACTION_NAMES is locked down by
-        // `every_supported_action_is_accepted` above.
-        assert!(names.contains(&"click"), "supportedActions must list click");
-        assert!(names.contains(&"type"), "supportedActions must list type");
-        assert!(
-            names.contains(&"scrollIntoView"),
-            "supportedActions must list scrollIntoView"
-        );
-        // And the offending name is echoed back so callers don't have to
-        // remember what they sent.
-        assert_eq!(ctx.get("action").and_then(|v| v.as_str()), Some("slap"));
+    fn unknown_action_is_not_builtin() {
+        assert!(!is_builtin_action("press"));
+        assert!(!is_builtin_action("slap"));
     }
 
     #[test]
-    fn empty_action_is_rejected() {
-        let err = validate_action_name("").expect_err("empty action must be rejected");
-        assert!(matches!(err.code, UiBridgeErrorCode::InvalidRequest));
-    }
-
-    #[test]
-    fn whitespace_only_action_is_rejected() {
-        // Trim-then-check semantics: a body whose `action` field is `"   "`
-        // is the same misuse as an empty string.
-        let err = validate_action_name("   ").expect_err("whitespace-only action must be rejected");
-        assert!(matches!(err.code, UiBridgeErrorCode::InvalidRequest));
+    fn empty_and_whitespace_only_actions_are_not_builtin() {
+        // A body whose `action` field is `"   "` is the same misuse as `""`.
+        assert!(!is_builtin_action(""));
+        assert!(!is_builtin_action("   "));
     }
 
     #[test]
     fn case_sensitive_match_is_enforced() {
-        // `Click` (capital C) is NOT in the SDK vocabulary; rejecting it
-        // here matches what the wrapper SDK's relay-handlers.ts would do
+        // `Click` (capital C) is NOT in the SDK vocabulary; not classifying it
+        // as built-in matches what the wrapper SDK's relay-handlers.ts would do
         // and prevents downstream "no handler" silent failures.
-        let err = validate_action_name("Click").expect_err("Click must not be accepted");
-        assert!(matches!(err.code, UiBridgeErrorCode::InvalidRequest));
+        assert!(!is_builtin_action("Click"));
     }
 }
 
@@ -6217,7 +6771,7 @@ mod action_not_supported_tests {
         recovery_is_genuine, ActionResult, Json, StatusCode, UiBridgeError,
     };
     use crate::mcp::types::ApiResponse;
-    use crate::mcp::ui_bridge::recovery_executor::{RecoveryOutcome, RecoveryVia};
+    use crate::mcp::ui_bridge::recovery_executor::{RecoveryOutcome, RecoveryVia, RetryOutcome};
     use serde_json::json;
 
     #[test]
@@ -6283,9 +6837,72 @@ mod action_not_supported_tests {
     }
 
     #[test]
+    fn is_action_advertised_allows_unhover_where_hover_is_listed() {
+        let supported = Some(vec!["click".to_string(), "hover".to_string()]);
+        assert!(is_action_advertised("unhover", &supported));
+    }
+
+    #[test]
+    fn is_action_advertised_rejects_unhover_without_hover() {
+        let supported = Some(vec!["click".to_string(), "focus".to_string()]);
+        assert!(!is_action_advertised("unhover", &supported));
+    }
+
+    #[test]
     fn is_action_advertised_unknown_supported_list_is_permissive() {
         // None → we don't know what the element supports; never accuse.
         assert!(is_action_advertised("setValue", &None));
+    }
+
+    #[test]
+    fn a_0_46_text_input_passes_the_pre_ipc_gate_for_set_value() {
+        // Plan 2026-11-09-an-elements-advertised-verbs-depend-on-which-path-found-it,
+        // Phase 5's gate: before 0.46 an auto-registered `<input>` advertised
+        // `focus, blur, type, clear, click` (measured on 0.38.0) — no
+        // `setValue`, no `sendKeys` — so this gate answered
+        // ACTION_NOT_SUPPORTED for them.
+        let supported = Some(crate::mcp::ui_bridge::element_kind::served_actions_0_46(
+            "autoRegisteredTextInput",
+        ));
+        for verb in [
+            "setValue",
+            "sendKeys",
+            "type",
+            "clear",
+            "autocomplete",
+            "hoverClick",
+        ] {
+            assert!(is_action_advertised(verb, &supported), "{verb}");
+        }
+        // The table still withholds what a text input does not perform.
+        for verb in ["select", "check", "uncheck", "toggle", "submit", "reset"] {
+            assert!(!is_action_advertised(verb, &supported), "{verb}");
+        }
+    }
+
+    #[test]
+    fn a_0_46_content_row_advertises_nothing_and_the_gate_refuses_every_verb() {
+        // Which runner gate governs `[]`: two per-element gates read it
+        // oppositely. THIS one (`is_action_advertised`, pre-IPC in
+        // `execute_action_dispatch`, reading the `get_element` reply) treats
+        // `Some([])` as refuse-all and only `None` as permissive; the
+        // frontend's `isElementActionAllowed` (`useControlEvents.ts`, registered
+        // elements only) treats `[]` as permissive. `POST
+        // /control/element/{id}/action` passes this gate first, so here `[]`
+        // refuses every built-in verb; every other door that sends the
+        // `execute_action` IPC (the batch routes, action-plan,
+        // navigate-and-wait, the SDK route's IPC fallback, the Tauri command,
+        // GraphQL) meets only the frontend gate, where `[]` lets the SDK
+        // dispatcher decide. Since 0.46 `[]` is carried only by content rows
+        // (`registerContentElement`, the executor's content find row) and by
+        // registrations that declare it (the terminal proxy pane, which also
+        // registers custom actions, so neither gate sees an empty list there).
+        let elem = json!({ "id": "heading-title", "category": "content", "actions": [] });
+        let supported = extract_supported_actions(&elem);
+        assert_eq!(supported, Some(vec![]));
+        for verb in ["click", "sendKeys", "scrollIntoView", "focus"] {
+            assert!(!is_action_advertised(verb, &supported), "{verb}");
+        }
     }
 
     // ── Custom-action reachability via the /control/ route ──────────────
@@ -6649,6 +7266,11 @@ mod action_not_supported_tests {
     fn only_a_command_backed_recovery_counts_as_recovered() {
         let mk = |recovered: bool, cmd: Option<&str>| RecoveryOutcome {
             recovered,
+            retry_outcome: if recovered {
+                RetryOutcome::Succeeded
+            } else {
+                RetryOutcome::Failed
+            },
             via: RecoveryVia::LlmFallback,
             command_chosen: cmd.map(str::to_string),
             error_code: None,
@@ -6661,6 +7283,32 @@ mod action_not_supported_tests {
         );
         assert!(!recovery_is_genuine(&mk(false, Some("scroll_into_view"))));
         assert!(!recovery_is_genuine(&mk(false, None)));
+    }
+
+    /// `recovered` alone is not trusted. A `recovered: true` beside a retry
+    /// that did not read `succeeded` (the two fields set apart, as a struct
+    /// literal can) is not a recovery, so the route surfaces the original
+    /// failure instead of answering HTTP 200.
+    #[test]
+    fn recovered_beside_a_retry_that_did_not_succeed_is_not_a_recovery() {
+        for retry_outcome in [
+            RetryOutcome::Failed,
+            RetryOutcome::Indeterminate,
+            RetryOutcome::NotRetried,
+        ] {
+            let outcome = RecoveryOutcome {
+                recovered: true,
+                retry_outcome,
+                via: RecoveryVia::StructuredCommand,
+                command_chosen: Some("scroll_into_view".to_string()),
+                error_code: None,
+                result: None,
+            };
+            assert!(
+                !recovery_is_genuine(&outcome),
+                "recovered:true beside retryOutcome {retry_outcome:?} must not count as a recovery"
+            );
+        }
     }
 
     /// THE iteration-9 defect: a genuine post-dispatch FAILURE was relabelled
@@ -6679,6 +7327,7 @@ mod action_not_supported_tests {
         ));
         let recovery = serde_json::to_value(RecoveryOutcome {
             recovered: false,
+            retry_outcome: RetryOutcome::NotRetried,
             via: RecoveryVia::None,
             command_chosen: None,
             error_code: None,
@@ -6752,11 +7401,11 @@ mod action_not_supported_tests {
     #[test]
     fn typed_terminal_codes_survive_dispatch() {
         for (code, expected_recovery) in [
-            ("SEND_KEYS_INVALID", "FIX_REQUEST"),
-            ("WRITE_TEXT_INVALID", "FIX_REQUEST"),
-            ("PASTE_TEXT_INVALID", "FIX_REQUEST"),
-            ("SCROLLBACK_MAX_LINES_INVALID", "FIX_REQUEST"),
-            ("TERMINAL_NO_MOUNTED_VIEW", "SCROLL_INTO_VIEW"),
+            ("SEND_KEYS_INVALID", "fix_request"),
+            ("WRITE_TEXT_INVALID", "fix_request"),
+            ("PASTE_TEXT_INVALID", "fix_request"),
+            ("SCROLLBACK_MAX_LINES_INVALID", "fix_request"),
+            ("TERMINAL_NO_MOUNTED_VIEW", "scroll_into_view"),
         ] {
             let msg = format!("{code}: the handler's own diagnosis, verbatim");
             let failure: ActionResult = Err((
@@ -6776,7 +7425,7 @@ mod action_not_supported_tests {
                 "the handler's typed code must not be re-coded: {wire}"
             );
             assert_eq!(
-                wire.pointer("/error_detail/recovery")
+                wire.pointer("/error_detail/recovery/kind")
                     .and_then(|v| v.as_str()),
                 Some(expected_recovery),
                 "RESNAPSHOT is wrong advice for {code}: {wire}"
@@ -6835,7 +7484,9 @@ mod action_not_supported_tests {
                  Element advertises: {:?}",
                 action_name, supported
             ),
-            recovery: Some(crate::mcp::ui_bridge::types::RecoveryHint::Unrecoverable),
+            recovery: Some(qontinui_types::refusal::NextAction::new(
+                qontinui_types::refusal::NextActionKind::FixRequest,
+            )),
             context: Some(json!({
                 "code": "ACTION_NOT_SUPPORTED",
                 "supported_actions": supported,
@@ -6849,7 +7500,7 @@ mod action_not_supported_tests {
             error_detail: Some(detail),
             hint: None,
             code: None,
-            suggestions: None,
+            refusal: None,
         };
         let env_json = serde_json::to_value(&envelope).unwrap();
         assert_eq!(
@@ -6902,7 +7553,10 @@ mod type_action_param_validation_tests {
     //! The handler-side wiring (`api_error_detailed(msg, detail)` + HTTP
     //! 400) is too IPC-coupled for a pure unit test, so the helper-level
     //! tests act as the regression guard for the envelope shape.
-    use super::{api_error_detailed, validate_type_action_params, TypeParamError, UiBridgeError};
+    use super::{
+        api_error_detailed, validate_type_action_params, TypeParamError, UiBridgeError,
+        SUPPORTED_ACTION_NAMES,
+    };
     use crate::mcp::ui_bridge::types::UiBridgeErrorCode;
     use serde_json::{json, Map};
 
@@ -7008,31 +7662,7 @@ mod type_action_param_validation_tests {
         // 400 for them. Pass-through verified for every other action
         // name in the supported list.
         let params = Some(json!({ "value": "foo" }));
-        for action in &[
-            "setValue",
-            "select",
-            "click",
-            "doubleClick",
-            "double_click",
-            "double",
-            "right",
-            "middle",
-            "sendKeys",
-            "clear",
-            "focus",
-            "blur",
-            "hover",
-            "scroll",
-            "scrollIntoView",
-            "scroll_into_view",
-            "check",
-            "uncheck",
-            "toggle",
-            "drag",
-            "submit",
-            "reset",
-            "autocomplete",
-        ] {
+        for action in SUPPORTED_ACTION_NAMES.iter().filter(|a| **a != "type") {
             assert_eq!(
                 validate_type_action_params(action, &params, &empty_extra()),
                 Ok(()),
@@ -7158,52 +7788,24 @@ mod type_action_param_validation_tests {
 }
 
 #[cfg(test)]
-mod read_value_tests {
-    //! Validation seam for `read-value`'s `all`, the half of
-    //! `@qontinui/ui-bridge` PR #156 the runner still had to grow. It is pure,
-    //! so it needs neither a router nor a webview.
-    //!
-    //! The `send-keys` key/target grammar is deliberately NOT here: that route
-    //! and its vocabulary live in `mcp/ui_bridge/keyboard.rs`, which owns the
-    //! single copy. A second implementation in this module registered the same
-    //! axum path and would have panicked the router at startup.
-
-    use super::validate_read_value_all;
+mod read_value_payload_tests {
+    use super::read_value_ipc_payload;
     use serde_json::json;
 
-    // ---- read-value `all` -------------------------------------------------
-
     #[test]
-    fn all_defaults_to_false_when_absent_or_null() {
-        assert!(!validate_read_value_all(&json!({ "selector": "input" })).unwrap());
-        assert!(!validate_read_value_all(&json!({ "selector": "input", "all": null })).unwrap());
-    }
-
-    #[test]
-    fn all_true_is_honoured() {
-        assert!(validate_read_value_all(&json!({ "selector": "input", "all": true })).unwrap());
-    }
-
-    #[test]
-    fn a_non_boolean_all_is_rejected_by_name() {
-        let msg = validate_read_value_all(&json!({ "selector": "i", "all": "yes" })).unwrap_err();
-        assert!(msg.contains("'all'"), "{msg}");
-        assert!(msg.contains("string"), "{msg}");
-    }
-
-    #[test]
-    fn all_and_index_together_are_rejected_naming_both() {
-        let msg = validate_read_value_all(&json!({ "selector": "i", "all": true, "index": 2 }))
-            .unwrap_err();
-        assert!(msg.contains("'all'") && msg.contains("'index'"), "{msg}");
-    }
-
-    #[test]
-    fn all_false_with_index_is_fine() {
-        // Only `all: true` conflicts — `all:false` is the default spelled out.
-        assert!(
-            !validate_read_value_all(&json!({ "selector": "i", "all": false, "index": 2 }))
-                .unwrap()
+    fn window_label_is_hoisted_and_only_read_params_are_forwarded() {
+        let p = read_value_ipc_payload(
+            &json!({"selector":"#a","index":2,"all":null,"windowLabel":"pop","junk":1}),
         );
+        assert_eq!(p["windowLabel"], "pop");
+        assert_eq!(p["params"], json!({"selector":"#a","index":2,"all":null}));
+        assert!(p["params"].get("windowLabel").is_none());
+    }
+
+    #[test]
+    fn absent_window_label_is_empty_for_the_main_window() {
+        let p = read_value_ipc_payload(&json!({"selector":"#a"}));
+        assert_eq!(p["windowLabel"], "");
+        assert_eq!(p["params"], json!({"selector":"#a"}));
     }
 }

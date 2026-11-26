@@ -271,19 +271,31 @@ pub fn newest_mtime_secs_ago(root: &Path, now: SystemTime) -> Option<i64> {
 }
 
 /// Runner-wide claude liveness: does this runner's own process subtree contain
-/// a live `claude*` process? Coarse-but-honest (never falsely dooms a specific
+/// a live `claude`? Coarse-but-honest (never falsely dooms a specific
 /// session — only reports dead when the WHOLE device is claude-free). PR 6
 /// tightens this to a session-scoped root pid.
 async fn runner_claude_alive() -> Option<bool> {
-    let snapshot = crate::process_capture::process_tree::snapshot_process_table_public().await;
     let runner_pid = std::process::id();
+    // A fresh walk, never the memo: this reports ABSENCE (`false`) to coord.
+    let look = crate::terminal::graceful_exit::PaneLook::take_fresh(&[runner_pid]).await;
+    claude_alive_under(&look, runner_pid)
+}
+
+/// [`runner_claude_alive`] over one look. A `claude` is a pid whose image is
+/// `claude` or one Claude Code's session registry names, whatever its image —
+/// an npm-installed one runs as `node … cli.js`. `None` (UNKNOWN, never
+/// "claude-free") for an unreadable or stale table, and for a subtree holding
+/// no proven `claude` but a process the registry could not settle.
+fn claude_alive_under(
+    look: &crate::terminal::graceful_exit::PaneLook,
+    runner_pid: u32,
+) -> Option<bool> {
+    if look.snapshot().is_unknown() {
+        return None;
+    }
     // reference=0 disables the PID-reuse skew guard (we check the live runner
     // itself, whose pid cannot have been reused under it).
-    Some(
-        crate::process_capture::process_tree::claude_present_in_inclusive_subtree(
-            runner_pid, &snapshot, 0,
-        ),
-    )
+    look.claude_present(runner_pid, 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -848,5 +860,31 @@ mod tests {
             ))
         ));
         assert_eq!(branch_exists_from(&outcome), None);
+    }
+
+    /// `process_alive` reported to coord: an npm-installed `claude` the
+    /// registry names is alive; with the witness dropped it reads `false`
+    /// (the regression); unsettled it is `None` (UNKNOWN), never `false`.
+    #[test]
+    fn an_npm_claude_is_alive_and_an_unsettled_one_is_unknown() {
+        use crate::process_capture::process_tree::ProcessSnapshot;
+        use crate::terminal::graceful_exit::{PaneLook, RegistryWitness};
+        let mut snap = ProcessSnapshot {
+            stale: false,
+            ..ProcessSnapshot::default()
+        };
+        snap.parent_map.insert(1, vec![5]);
+        snap.parent_map.insert(5, vec![50]);
+        for (pid, name) in [(1, "runner"), (5, "bash"), (50, "node")] {
+            snap.names.insert(pid, name.to_string());
+            snap.creation_times.insert(pid, 100);
+        }
+        let alive = |w| claude_alive_under(&PaneLook::over_whole_table(snap.clone(), w), 1);
+        assert_eq!(alive(RegistryWitness::naming(&[50])), Some(true));
+        assert_eq!(alive(RegistryWitness::naming(&[])), Some(false));
+        assert_eq!(alive(RegistryWitness::unreadable("test")), None);
+        let unknown_table =
+            PaneLook::over_whole_table(ProcessSnapshot::default(), RegistryWitness::naming(&[50]));
+        assert_eq!(claude_alive_under(&unknown_table, 1), None);
     }
 }

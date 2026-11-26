@@ -6,7 +6,7 @@
 //! Extracted modules:
 //! - `ai_session` - AI session management (stop/restart/run_prompt)
 //! - `playwright_collection` - Playwright state collector
-//! - `trace_verification` - Trace extraction & deterministic verification
+//! - `trace_verification` - Trace and video extraction
 //! - `backup_restore` - Backup/restore endpoints
 //! - `auto_continue` - Auto-continue settings & supervisor checks
 
@@ -16,10 +16,12 @@ use std::sync::Arc;
 use tauri::Emitter;
 use tracing::{error, info, warn};
 
+use crate::commands::project_logs::resolve_source_file;
 use crate::executor::with_default_bridge;
 use crate::findings::{FindingCategoryExt, FindingSeverityExt, FindingStatusExt};
 use crate::mcp::shared::emit_ai_output;
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
+use qontinui_runner_lib::file_tail;
 use regex::Regex;
 
 // Re-export handlers from extracted submodules for backward compatibility
@@ -244,12 +246,16 @@ pub struct DebugError {
 /// Summary of errors by category
 #[derive(Debug, Clone, Serialize)]
 pub struct DebugErrorSummary {
-    /// Total errors found
+    /// Total errors found in the scanned windows (see `tail_only_services`)
     total: usize,
     /// Errors by service
     by_service: std::collections::HashMap<String, usize>,
     /// Errors by level
     by_level: std::collections::HashMap<String, usize>,
+    /// Services whose log is larger than the window scanned. Each was read
+    /// over at most its last [`file_tail::LOG_TAIL_CAP`] bytes, so its counts
+    /// cover that window, not the whole file.
+    tail_only_services: Vec<String>,
 }
 
 /// Response from /debug/app/errors endpoint
@@ -274,27 +280,43 @@ pub struct DebugErrorsQuery {
 
 /// Get application errors from dev-logs
 ///
-/// Parses log files from .dev-logs/ and returns structured error information.
+/// Scans each enabled global log source — or, when none is configured, a
+/// fallback list under `.dev-logs/` — for error and warning lines, and returns
+/// them most recent first.
+///
+/// Each source is read by [`scan_source_errors`]: its last
+/// [`file_tail::LOG_TAIL_CAP`] bytes, never the whole file, because a day log
+/// reaches 2.9 GB (plan
+/// `2026-11-11-runner-glibc-arena-retention-and-whole-log-tail`). The scan runs
+/// on the blocking pool, off the async executor.
 pub async fn get_debug_errors(
     axum::extract::Query(query): axum::extract::Query<DebugErrorsQuery>,
 ) -> Json<ApiResponse<DebugErrorsResponse>> {
-    use std::io::{BufRead, BufReader};
+    match spawn_blocking_tracked(move || collect_debug_errors(&query)).await {
+        Ok(response) => Json(ApiResponse::success(response)),
+        Err(e) => Json(ApiResponse::error(format!("Debug error scan failed: {e}"))),
+    }
+}
 
+/// The blocking body of [`get_debug_errors`].
+fn collect_debug_errors(query: &DebugErrorsQuery) -> DebugErrorsResponse {
     let dev_logs_path = crate::paths::get_dev_logs_dir();
 
     if !dev_logs_path.exists() {
-        return Json(ApiResponse::success(DebugErrorsResponse {
+        return DebugErrorsResponse {
             summary: DebugErrorSummary {
                 total: 0,
                 by_service: std::collections::HashMap::new(),
                 by_level: std::collections::HashMap::new(),
+                tail_only_services: Vec::new(),
             },
             errors: vec![],
-        }));
+        };
     }
 
     let limit = query.limit.unwrap_or(50);
     let mut all_errors: Vec<DebugError> = Vec::new();
+    let mut tail_only_services: Vec<String> = Vec::new();
 
     // Build log file list from global settings
     let global_settings = crate::settings::get_global_log_source_settings();
@@ -322,6 +344,80 @@ pub async fn get_debug_errors(
             .collect()
     };
 
+    for (filename, service) in &log_files {
+        // Apply service filter if specified
+        if let Some(ref svc_filter) = query.service {
+            if !service.eq_ignore_ascii_case(svc_filter) {
+                continue;
+            }
+        }
+
+        // If the path is absolute, use it directly; otherwise join with dev_logs_path
+        let source_path = std::path::Path::new(filename);
+        let file_path = if source_path.is_absolute() {
+            source_path.to_path_buf()
+        } else {
+            dev_logs_path.join(filename)
+        };
+
+        if let Some(scan) = scan_source_errors(&file_path, service, query.level.as_deref()) {
+            if !scan.covered_whole_file && !tail_only_services.contains(service) {
+                tail_only_services.push(service.clone());
+            }
+            all_errors.extend(scan.errors);
+        }
+    }
+
+    // Sort by timestamp (most recent first)
+    all_errors.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+
+    // Build summary before truncating
+    let mut by_service: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut by_level: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
+    for err in &all_errors {
+        *by_service.entry(err.service.clone()).or_insert(0) += 1;
+        *by_level.entry(err.level.clone()).or_insert(0) += 1;
+    }
+
+    let total = all_errors.len();
+
+    // Truncate to limit
+    all_errors.truncate(limit);
+
+    DebugErrorsResponse {
+        summary: DebugErrorSummary {
+            total,
+            by_service,
+            by_level,
+            tail_only_services,
+        },
+        errors: all_errors,
+    }
+}
+
+/// One log source's scan by [`scan_source_errors`].
+struct SourceScan {
+    /// The error and warning lines found, newest first
+    errors: Vec<DebugError>,
+    /// Whether the scanned window was the whole file, so `errors` is all of
+    /// them; otherwise at most the file's last [`file_tail::LOG_TAIL_CAP`]
+    /// bytes were scanned
+    covered_whole_file: bool,
+}
+
+/// Scan one source's log for error and warning lines, newest first, each with
+/// up to 9 following lines of context (a stack trace).
+///
+/// The file is the configured path, or its newest dated rotation when that
+/// path is absent ([`resolve_source_file`], the resolution the project-logs
+/// view uses). Only its last [`file_tail::LOG_TAIL_CAP`] bytes are read.
+/// `None` when it does not exist or cannot be read.
+fn scan_source_errors(
+    configured: &std::path::Path,
+    service: &str,
+    level_filter: Option<&str>,
+) -> Option<SourceScan> {
     // Regex patterns for error detection (compiled once)
     static RE_ERROR_1: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     static RE_ERROR_2: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
@@ -347,115 +443,76 @@ pub async fn get_debug_errors(
         (re_warning, "warning"),
     ];
 
-    for (filename, service) in &log_files {
-        // Apply service filter if specified
-        if let Some(ref svc_filter) = query.service {
-            if !service.eq_ignore_ascii_case(svc_filter) {
-                continue;
+    let file_path = resolve_source_file(configured);
+    // `usize::MAX`: every line the capped window holds.
+    let tail = file_tail::tail_lines(&file_path, usize::MAX, file_tail::LOG_TAIL_CAP).ok()?;
+    let covered_whole_file = tail.covered_whole_file();
+    let lines = tail.lines;
+    let mut errors = Vec::new();
+
+    // Process from end (most recent) to beginning
+    let mut i = lines.len();
+    while i > 0 {
+        i -= 1;
+        let line = &lines[i];
+
+        // Determine log level
+        let mut level = None;
+        for (re, lvl) in error_patterns {
+            if re.is_match(line) {
+                level = Some(*lvl);
+                break;
             }
         }
 
-        // If the path is absolute, use it directly; otherwise join with dev_logs_path
-        let source_path = std::path::Path::new(filename);
-        let file_path = if source_path.is_absolute() {
-            source_path.to_path_buf()
-        } else {
-            dev_logs_path.join(filename)
-        };
-        if !file_path.exists() {
-            continue;
-        }
-
-        if let Ok(file) = std::fs::File::open(&file_path) {
-            let reader = BufReader::new(file);
-            let lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
-
-            // Process from end (most recent) to beginning
-            let mut i = lines.len();
-            while i > 0 {
-                i -= 1;
-                let line = &lines[i];
-
-                // Determine log level
-                let mut level = None;
-                for (re, lvl) in error_patterns {
-                    if re.is_match(line) {
-                        level = Some(*lvl);
-                        break;
-                    }
-                }
-
-                if let Some(lvl) = level {
-                    // Apply level filter if specified
-                    if let Some(ref lvl_filter) = query.level {
-                        if !lvl.eq_ignore_ascii_case(lvl_filter) {
-                            continue;
-                        }
-                    }
-
-                    // Extract timestamp if present (various formats)
-                    let timestamp = re_timestamp
-                        .captures(line)
-                        .and_then(|c| c.get(1))
-                        .map(|m| m.as_str().to_string())
-                        .unwrap_or_default();
-
-                    // Collect context (surrounding lines for stack traces)
-                    let mut context_lines = Vec::new();
-                    let mut j = i + 1;
-                    while j < lines.len() && j < i + 10 {
-                        let ctx_line = &lines[j];
-                        // Stop at next log entry (has timestamp or is empty)
-                        if ctx_line.is_empty() || re_date_prefix.is_match(ctx_line) {
-                            break;
-                        }
-                        context_lines.push(ctx_line.clone());
-                        j += 1;
-                    }
-
-                    let context = if context_lines.is_empty() {
-                        None
-                    } else {
-                        Some(context_lines.join("\n"))
-                    };
-
-                    all_errors.push(DebugError {
-                        timestamp,
-                        service: service.to_string(),
-                        level: lvl.to_string(),
-                        message: line.clone(),
-                        context,
-                    });
+        if let Some(lvl) = level {
+            // Apply level filter if specified
+            if let Some(want) = level_filter {
+                if !lvl.eq_ignore_ascii_case(want) {
+                    continue;
                 }
             }
+
+            // Extract timestamp if present (various formats)
+            let timestamp = re_timestamp
+                .captures(line)
+                .and_then(|c| c.get(1))
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default();
+
+            // Collect context (surrounding lines for stack traces)
+            let mut context_lines = Vec::new();
+            let mut j = i + 1;
+            while j < lines.len() && j < i + 10 {
+                let ctx_line = &lines[j];
+                // Stop at next log entry (has timestamp or is empty)
+                if ctx_line.is_empty() || re_date_prefix.is_match(ctx_line) {
+                    break;
+                }
+                context_lines.push(ctx_line.clone());
+                j += 1;
+            }
+
+            let context = if context_lines.is_empty() {
+                None
+            } else {
+                Some(context_lines.join("\n"))
+            };
+
+            errors.push(DebugError {
+                timestamp,
+                service: service.to_string(),
+                level: lvl.to_string(),
+                message: line.clone(),
+                context,
+            });
         }
     }
 
-    // Sort by timestamp (most recent first)
-    all_errors.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-
-    // Build summary before truncating
-    let mut by_service: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut by_level: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-
-    for err in &all_errors {
-        *by_service.entry(err.service.clone()).or_insert(0) += 1;
-        *by_level.entry(err.level.clone()).or_insert(0) += 1;
-    }
-
-    let total = all_errors.len();
-
-    // Truncate to limit
-    all_errors.truncate(limit);
-
-    Json(ApiResponse::success(DebugErrorsResponse {
-        summary: DebugErrorSummary {
-            total,
-            by_service,
-            by_level,
-        },
-        errors: all_errors,
-    }))
+    Some(SourceScan {
+        errors,
+        covered_whole_file,
+    })
 }
 
 /// Get findings summary from database
@@ -596,7 +653,7 @@ pub async fn launch_debug_chrome() -> Json<ApiResponse<String>> {
                         error_detail: None,
                         hint: None,
                         code: None,
-                        suggestions: None,
+                        refusal: None,
                     })
                 }
             }
@@ -610,7 +667,7 @@ pub async fn launch_debug_chrome() -> Json<ApiResponse<String>> {
                 error_detail: None,
                 hint: None,
                 code: None,
-                suggestions: None,
+                refusal: None,
             })
         }
     }
@@ -737,7 +794,10 @@ pub async fn get_instances(
             continue;
         }
         let reachable = if let Some(ref client) = client {
-            let url = format!("http://localhost:{}/health", config.port);
+            let url = format!(
+                "{}/health",
+                crate::mcp::types::runner_loopback_base(config.port)
+            );
             client.get(&url).send().await.is_ok()
         } else {
             false
@@ -758,7 +818,10 @@ pub async fn get_instances(
             continue;
         }
         let reachable = if let Some(ref client) = client {
-            let url = format!("http://localhost:{}/health", reg.port);
+            let url = format!(
+                "{}/health",
+                crate::mcp::types::runner_loopback_base(reg.port)
+            );
             client.get(&url).send().await.is_ok()
         } else {
             false
@@ -780,7 +843,7 @@ pub async fn get_instances(
                 continue; // already listed from another source
             }
             let reachable = if let Some(ref client) = client {
-                let url = format!("http://localhost:{}/health", port);
+                let url = format!("{}/health", crate::mcp::types::runner_loopback_base(port));
                 client.get(&url).send().await.is_ok()
             } else {
                 false
@@ -1508,8 +1571,7 @@ if __name__ == "__main__":
 
 // Backup/restore handlers moved to crate::mcp::backup_restore
 
-// Trace, verification, and media utilities moved to crate::mcp::trace_verification
-// Trace, verification, and media utilities moved to crate::mcp::trace_verification
+// Trace and media utilities moved to crate::mcp::trace_verification
 
 /// Information about a single active session
 #[derive(Debug, Clone, Serialize)]
@@ -2320,4 +2382,62 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         )
         .route("/render-log/path", get(get_render_log_path))
         .route("/navigate", post(navigate_to_page))
+}
+
+#[cfg(test)]
+mod debug_errors_tests {
+    use super::*;
+
+    fn set_mtime(path: &std::path::Path, unix_secs: i64) {
+        filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(unix_secs, 0)).unwrap();
+    }
+
+    /// A log larger than the scan window is scanned over its last
+    /// `LOG_TAIL_CAP` bytes only — never read whole — and says so: an error
+    /// before the window is not found, the newest one is.
+    #[test]
+    fn a_log_larger_than_the_window_is_scanned_over_its_tail_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.log");
+        let mut text = String::from("2026-11-01 00:00:00 ERROR before the window\n");
+        while (text.len() as u64) <= file_tail::LOG_TAIL_CAP {
+            text.push_str("2026-11-01 00:00:01 INFO routine line\n");
+        }
+        text.push_str("2026-11-16 00:00:00 ERROR inside the window\n");
+        std::fs::write(&path, &text).unwrap();
+
+        let scan = scan_source_errors(&path, "runner", None).expect("the log is read");
+        assert!(!scan.covered_whole_file, "a tail, not the whole file");
+        let messages: Vec<&str> = scan.errors.iter().map(|e| e.message.as_str()).collect();
+        assert_eq!(messages, ["2026-11-16 00:00:00 ERROR inside the window"]);
+    }
+
+    /// A configured basename that does not exist scans its newest dated
+    /// rotation. The runner's own day-log source is seeded at its basename,
+    /// which a rolling sink never writes, so this scan used to skip it.
+    #[test]
+    fn a_rolling_basename_scans_its_newest_dated_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let older = dir.path().join("app.log.2026-11-10");
+        let newer = dir.path().join("app.log.2026-11-11");
+        std::fs::write(&older, "2026-11-10 09:00:00 ERROR old day\n").unwrap();
+        std::fs::write(&newer, "2026-11-11 09:00:00 ERROR new day\n    at frame\n").unwrap();
+        set_mtime(&older, 1_790_000_000);
+        set_mtime(&newer, 1_790_086_400);
+
+        let scan = scan_source_errors(&dir.path().join("app.log"), "app", Some("error"))
+            .expect("the rotation is read");
+        assert!(scan.covered_whole_file);
+        assert_eq!(scan.errors.len(), 1);
+        let error = &scan.errors[0];
+        assert_eq!(error.message, "2026-11-11 09:00:00 ERROR new day");
+        assert_eq!(error.timestamp, "2026-11-11 09:00:00");
+        assert_eq!(error.context.as_deref(), Some("    at frame"));
+    }
+
+    #[test]
+    fn a_missing_source_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(scan_source_errors(&dir.path().join("absent.log"), "app", None).is_none());
+    }
 }

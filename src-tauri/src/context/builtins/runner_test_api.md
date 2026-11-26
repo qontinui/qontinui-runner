@@ -5,7 +5,7 @@ This document provides accurate context for generating Python tests that interac
 ### Base Configuration
 
 ```python
-BASE_URL = "http://localhost:9876"
+BASE_URL = "http://127.0.0.1:9876"
 ```
 
 ### Navigation API
@@ -178,7 +178,7 @@ import time
 import json
 from typing import Any, Optional
 
-BASE_URL = "http://localhost:9876"
+BASE_URL = "http://127.0.0.1:9876"
 _results = {"passed": [], "failed": [], "logs": []}
 
 def log(message: str) -> None:

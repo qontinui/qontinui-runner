@@ -30,3 +30,39 @@ DOM-search primitive can't reach it.
 ## Spec maintenance
 
 - Removed spec state `term-plan-cli-script` (2026-06-02): it asserted on plan-CLI *script output*, not page elements — a category error for a UI-Bridge page spec. The behavior it nominally covered is exercised by the Rust integration test `src-tauri/src/flywheel_e2e_tests.rs`.
+
+## tmux work mode (plan `2026-10-11-runner-terminal-tmux-work-mode`)
+
+States `tmux-one-session-on-screen` and `tmux-session-manager-navigator`,
+transitions `enter-tmux-work-mode`, `tmux-swap-session` and
+`exit-tmux-work-mode`.
+
+- **Read the mode from the component, not the DOM.** `POST
+  /ui-bridge/control/component/terminal-page/action/get-terminal-work-mode`
+  returns `{mode, shownTabId, sidebarOpen}`; `set-terminal-work-mode` takes
+  `{mode?: "grid" | "tmux"}` (omit to toggle). `get-zone-view-state` reads
+  `layoutId: "single"` in tmux mode.
+- **"Exactly one pane visible"** is observable per tab: only the shown tab's
+  `terminal-input-<tabId>` and `terminal.close-session-<tabId>` have a
+  non-zero rect, and there is no `terminal-zone-header-1`. The most recently
+  shown off-screen panes stay mounted — up to `TMUX_WARM_TAB_LIMIT` (8, the
+  WebGL context cap) besides the shown one; their `terminal-input-<tabId>` is
+  registered with a 0×0 rect, so `registeredAt` is unchanged across a swap
+  between them. A colder session has no `terminal-input-<tabId>` at all until
+  it is shown, when it mounts and replays its scrollback ring.
+- **Maximize is refused in tmux mode.** `maximize-zone` and
+  `toggle-maximize-zone` fail with an error naming the mode rather than
+  reporting `changed: true` for a view tmux already is.
+- **A session manager row closes its session** through
+  `terminal.session-card-close-<sessionId>` (a row with a live tab in this
+  window only) — the way to close an off-screen session without showing it.
+- **Output continuity** is checked by comparing the revealed pane's xterm
+  buffer (`getScrollback` custom action on `terminal-input-<tabId>`) with the
+  server grid (`GET /ui-bridge/sdk/terminal/sessions/<id>/text`), not by a
+  DOM text search.
+- **`GET /ui-bridge/control/snapshot` can time out in this state.** tmux
+  mode opens the session manager, and with a large transcript corpus its
+  Live view registers thousands of elements; measured 2026-10-11 on a temp
+  runner, the snapshot exceeded its 10 s budget (5,596 registered elements)
+  while `POST /ui-bridge/control/find` answered in ~2.4 s and
+  `GET /ui-bridge/control/element/<id>` in < 100 ms. Use those two.

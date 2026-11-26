@@ -46,19 +46,26 @@
 //! - **Liveness is re-checked here.** A crashed process cannot clean up after
 //!   itself, so an entry whose PID is absent from the live process table is
 //!   dropped rather than reported as open.
+//! - **An unlistable account is reported, not skipped.** A
+//!   `<config_dir>/sessions` that exists and cannot be listed hides live
+//!   sessions, so [`read_live_sessions`] names it ([`LiveSessions::unlistable`])
+//!   and a caller that reads a missing row as "not live" refuses the read
+//!   ([`LiveSessions::complete`]). Only an ABSENT dir is an account with
+//!   nothing open.
 
 use std::collections::HashSet;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use super::claude_activity::{list_sessions_dir, SessionsListing, UnlistableSessionsDir};
 use super::past_sessions::{account_from_config_dir, PastSessionAccount};
 
 /// Raw on-disk shape of `<config_dir>/sessions/<pid>.json`.
 ///
 /// Only the fields this reader needs are modelled; Claude Code adds others
-/// (`version`, `peerProtocol`, `entrypoint`, `statusUpdatedAt`) that are
-/// deliberately ignored so a new key in a future CLI release cannot break
+/// (`version`, `peerProtocol`, `peerFeatures`, `messagingSocketPath`, …) that
+/// are deliberately ignored so a new key in a future CLI release cannot break
 /// deserialization.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -90,6 +97,54 @@ struct RegistryFile {
     started_at: Option<i64>,
     #[serde(default)]
     updated_at: Option<i64>,
+    /// When `status` last changed (epoch ms). NOT a liveness clock: it moves
+    /// on status changes only. The session census takes liveness from the last
+    /// turn line's own timestamp instead — not even from transcript mtime,
+    /// which coord finding `124c0ce9` measured moving without turns. Carried
+    /// for the session census only.
+    ///
+    /// The four census-only fields below are LENIENT ([`lenient_ms`],
+    /// [`lenient_string`]): a type the CLI changes in a future release reads
+    /// as `None` for that field, never as a parse failure — which would drop
+    /// the WHOLE row from every registry reader, the restore path's liveness
+    /// oracle included.
+    #[serde(default, deserialize_with = "lenient_ms")]
+    status_updated_at: Option<i64>,
+    /// Process start token (a string: `/proc/<pid>/stat` field 22 on Linux),
+    /// the pid-reuse discriminator beside `pid`.
+    #[serde(default, deserialize_with = "lenient_string")]
+    proc_start: Option<String>,
+    /// `cli`, `sdk-ts`, … — how the process was launched.
+    #[serde(default, deserialize_with = "lenient_string")]
+    entrypoint: Option<String>,
+    /// `<tmux session>:@<window>.%<pane>` when the CLI runs inside tmux.
+    #[serde(default, deserialize_with = "lenient_string")]
+    tmux: Option<String>,
+}
+
+/// String, or a number rendered as one; any other JSON type is `None`.
+fn lenient_string<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::String(s) => Some(s),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    })
+}
+
+/// Epoch ms as an integer, a float (truncated) or a numeric string; any other
+/// value is `None`.
+fn lenient_ms<'de, D>(d: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Number(n) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
+        serde_json::Value::String(s) => s.trim().parse::<i64>().ok(),
+        _ => None,
+    })
 }
 
 /// One live Claude Code process, as the operator sees it.
@@ -128,11 +183,29 @@ pub struct LiveClaudeSession {
     pub kind: String,
     pub started_at: i64,
     pub updated_at: i64,
-    /// Ready-to-run: `cd '<dir>' && <wrapper> --resume <id>`.
+    /// Registry `statusUpdatedAt` (epoch ms), when present. See
+    /// `RegistryFile::status_updated_at` — never a liveness clock.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_updated_at: Option<i64>,
+    /// Registry `procStart`, verbatim, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proc_start: Option<String>,
+    /// Registry `entrypoint`, verbatim, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entrypoint: Option<String>,
+    /// Registry `tmux` locator, verbatim, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tmux: Option<String>,
+    /// Ready-to-run, from the shared
+    /// [`crate::session::session_ledger::resume_command_for`]:
+    /// `cd "<dir>" && CLAUDE_CONFIG_DIR="<config>" claude --resume <id>`, the
+    /// config dir being the one this registry file lives under.
     ///
-    /// The `cd` is **not** cosmetic — Claude Code scopes sessions by project
-    /// directory, so resuming from the wrong cwd does not find the session.
-    pub resume_command: String,
+    /// `None` when the row carries no `cwd` (or a path that cannot be quoted
+    /// safely): the `cd` is **not** cosmetic — Claude Code scopes sessions by
+    /// project directory, so a resume from the wrong cwd does not find the
+    /// session — and the line is omitted rather than guessed.
+    pub resume_command: Option<String>,
 }
 
 impl LiveClaudeSession {
@@ -180,14 +253,11 @@ fn parse_registry_file(bytes: &str, config_dir: &Path) -> Option<LiveClaudeSessi
     // Normalize separators so the emitted `cd` works verbatim in the POSIX-ish
     // shells the operator pastes into (Git Bash, the runner's own PTY).
     let working_dir = raw.cwd.unwrap_or_default().replace('\\', "/");
-    let resume_command = if working_dir.is_empty() {
-        format!("{} --resume {}", account.wrapper, raw.session_id)
-    } else {
-        format!(
-            "cd '{}' && {} --resume {}",
-            working_dir, account.wrapper, raw.session_id
-        )
-    };
+    let resume_command = crate::session::session_ledger::resume_command_for(
+        Some(working_dir.as_str()),
+        config_dir.to_str(),
+        &raw.session_id,
+    );
     Some(LiveClaudeSession {
         session_id: raw.session_id,
         name,
@@ -199,6 +269,10 @@ fn parse_registry_file(bytes: &str, config_dir: &Path) -> Option<LiveClaudeSessi
         kind: raw.kind.unwrap_or_else(|| "interactive".to_string()),
         started_at: raw.started_at.unwrap_or(0),
         updated_at: raw.updated_at.unwrap_or(0),
+        status_updated_at: raw.status_updated_at,
+        proc_start: raw.proc_start,
+        entrypoint: raw.entrypoint,
+        tmux: raw.tmux,
         resume_command,
     })
 }
@@ -224,36 +298,169 @@ pub fn live_pids_from_snapshot(
                 .to_string(),
         );
     }
+    if snapshot.stale {
+        return Err(
+            "process-table snapshot is stale (the last good table, served after a failed read) \
+             — session liveness is indeterminate"
+                .to_string(),
+        );
+    }
     Ok(snapshot.names.keys().copied().collect())
+}
+
+/// A `<pid>.json` named for a live pid whose image could host Claude Code
+/// ([`may_host_claude`]) that could not be read or parsed. The session that pid
+/// hosts is then UNKNOWN. Claude Code rewrites the file on every status
+/// change, so this may be a write caught mid-way and gone on the next read.
+/// Nothing here reads it again. A caller that polls (the lifecycle poll's
+/// identity refresh, the identity reporter) reads it on its next tick, but a
+/// caller that reads once — the cold-restore drain, the profile resume —
+/// fails that restore closed on one torn read: it skips the sessions it
+/// cannot prove are not live rather than risk forking one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreadableRecord {
+    pub path: std::path::PathBuf,
+    pub error: String,
+}
+
+impl std::fmt::Display for UnreadableRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.path.display(), self.error)
+    }
+}
+
+/// What one [`read_live_sessions`] saw.
+#[derive(Debug, Default)]
+pub struct LiveSessions {
+    /// The live rows found in every `sessions/` dir that could be listed,
+    /// sorted by account, then name, then pid.
+    pub sessions: Vec<LiveClaudeSession>,
+    /// Every `<config_dir>/sessions` that exists but could not be listed. While
+    /// this is non-empty, a session MISSING from [`Self::sessions`] may still
+    /// be live — its record is in a dir nobody could read.
+    pub unlistable: Vec<UnlistableSessionsDir>,
+    /// Every record named for a live pid that could host Claude Code and that
+    /// could not be read or parsed. While this is non-empty, the session that
+    /// pid hosts is missing from [`Self::sessions`] and may well be live.
+    pub unreadable_records: Vec<UnreadableRecord>,
+}
+
+impl LiveSessions {
+    /// Did every dir list and every live pid's record read?
+    pub fn is_complete(&self) -> bool {
+        self.unlistable.is_empty() && self.unreadable_records.is_empty()
+    }
+
+    /// The rows, for a caller that reads a MISSING row as "not live" — the
+    /// restore path's liveness oracle, the identity reporter's `live` bit.
+    /// `Err` when any dir could not be listed or any live pid's record could
+    /// not be read: such a caller must treat the whole read as indeterminate,
+    /// never as an account with nothing open.
+    pub fn complete(self) -> Result<Vec<LiveClaudeSession>, String> {
+        if self.is_complete() {
+            return Ok(self.sessions);
+        }
+        let gaps: Vec<String> = self
+            .unlistable
+            .iter()
+            .map(ToString::to_string)
+            .chain(self.unreadable_records.iter().map(ToString::to_string))
+            .collect();
+        Err(format!(
+            "Claude Code's session registry could not be read in full ({}) — a session \
+             recorded there may be live, so liveness is indeterminate",
+            gaps.join("; ")
+        ))
+    }
+}
+
+/// Could the live process `pid` in `snapshot` be a Claude Code — a `claude`
+/// image, or one a JS-runtime Claude Code runs as (`node`, `bun`, or an image
+/// the snapshot could not read)? Only such a pid's unreadable record leaves a
+/// session UNKNOWN: a `<pid>.json` named for a live `bash` or `conhost` is a
+/// stale record from a crashed `claude` whose pid was reused, and counting it
+/// would keep every strict read incomplete for as long as the file stays.
+pub fn may_host_claude(
+    snapshot: &crate::process_capture::process_tree::ProcessSnapshot,
+) -> impl Fn(u32) -> bool + '_ {
+    use crate::process_capture::process_tree::{is_countable_claude, may_be_js_runtime_claude};
+    move |pid| is_countable_claude(pid, snapshot) || may_be_js_runtime_claude(pid, snapshot)
+}
+
+/// One attempt to read and parse a registry file.
+enum RecordRead {
+    Parsed(LiveClaudeSession),
+    /// Deleted before it could be read: its process exited.
+    Gone,
+    /// It exists and could not be read, or did not parse; why.
+    Failed(String),
+}
+
+fn read_record_file(path: &Path, config_dir: &Path) -> RecordRead {
+    match std::fs::read_to_string(path) {
+        Ok(bytes) => match parse_registry_file(&bytes, config_dir) {
+            Some(session) => RecordRead::Parsed(session),
+            None => RecordRead::Failed("does not parse as a session record".to_string()),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => RecordRead::Gone,
+        Err(e) => RecordRead::Failed(e.to_string()),
+    }
+}
+
+/// The pid a registry file is named for (`<pid>.json`), if its name is one.
+fn pid_of_record_path(path: &Path) -> Option<u32> {
+    path.file_stem()?.to_str()?.parse().ok()
 }
 
 /// Read every `<config_dir>/sessions/*.json`, keeping only entries whose PID is
 /// in `live_pids`.
 ///
-/// Fail-open per file: an unreadable or malformed entry is skipped rather than
-/// failing the whole listing — one corrupt file must not hide 118 good ones.
+/// Per FILE, one corrupt file never hides the others: every readable row is
+/// still returned. A READABLE record is reported when the pid it names is
+/// live, whatever that pid's image, as before — dropping one by image would
+/// read a `claude` under a runtime nobody listed (`deno`, `node22`) as closed,
+/// and the strict oracle would then fork it. An UNREADABLE one is weighed by
+/// the pid its file name gives: for a pid that is not live, or for a live pid
+/// whose image could not host Claude Code (`may_host_claude` says no — a
+/// reused pid), it is a stale record and is skipped; for a live pid that could
+/// host Claude Code it is reported in [`LiveSessions::unreadable_records`]
+/// rather than dropped, since dropping it would read that live session as
+/// closed. Per DIR, a `sessions/` dir that exists and cannot be listed is
+/// reported in [`LiveSessions::unlistable`] rather than read as an account
+/// with no live session ([`list_sessions_dir`]).
 /// Results are sorted by account then name so the output is stable between
 /// calls (PID iteration order is not).
 pub fn read_live_sessions(
     config_dirs: &[std::path::PathBuf],
     live_pids: &HashSet<u32>,
-) -> Vec<LiveClaudeSession> {
+    may_host_claude: &dyn Fn(u32) -> bool,
+) -> LiveSessions {
     let mut out = Vec::new();
+    let mut unlistable = Vec::new();
+    let mut unreadable_records = Vec::new();
     for dir in config_dirs {
-        let sessions_dir = dir.join("sessions");
-        let Ok(entries) = std::fs::read_dir(&sessions_dir) else {
-            continue; // no sessions dir on this account — normal
+        let paths = match list_sessions_dir(dir) {
+            SessionsListing::Listed(paths) => paths,
+            SessionsListing::Absent => continue, // no sessions dir on this account — normal
+            SessionsListing::Unlistable(why) => {
+                unlistable.push(why);
+                continue;
+            }
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
+        for path in paths {
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            let Ok(bytes) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            let Some(session) = parse_registry_file(&bytes, dir) else {
-                continue;
+            let names_a_live_claude = pid_of_record_path(&path)
+                .is_some_and(|pid| live_pids.contains(&pid) && may_host_claude(pid));
+            let session = match read_record_file(&path, dir) {
+                RecordRead::Parsed(session) => session,
+                RecordRead::Gone => continue, // its process exited
+                RecordRead::Failed(_) if !names_a_live_claude => continue, // a stale file
+                RecordRead::Failed(error) => {
+                    unreadable_records.push(UnreadableRecord { path, error });
+                    continue;
+                }
             };
             if !live_pids.contains(&session.pid) {
                 continue; // stale file left by a crashed process
@@ -268,7 +475,11 @@ pub fn read_live_sessions(
             .then_with(|| a.name.cmp(&b.name))
             .then_with(|| a.pid.cmp(&b.pid))
     });
-    out
+    LiveSessions {
+        sessions: out,
+        unlistable,
+        unreadable_records,
+    }
 }
 
 /// Find the live-registry row for ONE session id, WITHOUT taking a
@@ -290,7 +501,10 @@ pub fn read_live_sessions(
 /// Returns `None` when no file names the id — the common case at startup, since
 /// Claude Code may not have written its registry file by the time the
 /// SessionStart hook fires. `None` means UNKNOWN: callers must leave the stored
-/// value alone (the sticky rule), never blank it.
+/// value alone (the sticky rule), never blank it. That is also why a
+/// `sessions/` dir that cannot be listed needs no answer of its own here: it
+/// costs only that dir's rows, and a row it hid reads `None` — already UNKNOWN
+/// to every caller, which is an identity stamp and never a liveness decision.
 ///
 /// When several files name the same id (22 of 80 did on the operator's box),
 /// an OPERATOR-named row wins over a `nameSource: "derived"` one — a `/rename`
@@ -302,11 +516,12 @@ pub fn find_live_session_by_id(
 ) -> Option<LiveClaudeSession> {
     let mut best: Option<LiveClaudeSession> = None;
     for dir in config_dirs {
-        let Ok(entries) = std::fs::read_dir(dir.join("sessions")) else {
-            continue; // no sessions dir on this account — normal
+        let SessionsListing::Listed(paths) = list_sessions_dir(dir) else {
+            // Absent (normal) or unlistable: either way this dir names no row,
+            // and a missing row is `None` — UNKNOWN — to every caller.
+            continue;
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
+        for path in paths {
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
@@ -340,6 +555,12 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    /// Every live pid could host Claude Code — the predicate for a test about
+    /// something else.
+    fn every_pid(_: u32) -> bool {
+        true
+    }
+
     fn tmpdir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("claude-reg-test-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
@@ -366,9 +587,48 @@ mod tests {
         assert_eq!(s.working_dir, "D:/qontinui-root");
         assert_eq!(s.status, "idle");
         assert_eq!(
-            s.resume_command,
-            "cd 'D:/qontinui-root' && clp --resume b770ae37-1ffa-4888-a5d1-89d058307adf"
+            s.resume_command.as_deref(),
+            Some(
+                "cd \"D:/qontinui-root\" && CLAUDE_CONFIG_DIR=\"C:/claude/.claude-paktis\" \
+                 claude --resume b770ae37-1ffa-4888-a5d1-89d058307adf"
+            )
         );
+    }
+
+    #[test]
+    fn a_retyped_census_field_never_drops_the_row() {
+        // procStart as a NUMBER and statusUpdatedAt as a non-numeric STRING:
+        // the row must still parse, with the odd values degraded per field.
+        let row = r#"{"pid":7,"sessionId":"7f7e6038-d85c-426f-b930-bc429fe62c58","procStart":123,"statusUpdatedAt":"x","entrypoint":["cli"],"tmux":null,"name":"n"}"#;
+        let s = parse_registry_file(row, Path::new("/home/x/.claude-a")).unwrap();
+        assert_eq!(s.pid, 7);
+        assert_eq!(s.proc_start.as_deref(), Some("123"));
+        assert_eq!(s.status_updated_at, None);
+        assert_eq!(s.entrypoint, None);
+        assert_eq!(s.tmux, None);
+        let numeric = r#"{"pid":8,"sessionId":"s","statusUpdatedAt":"1790832214000"}"#;
+        assert_eq!(
+            parse_registry_file(numeric, Path::new("/x/.claude-a"))
+                .unwrap()
+                .status_updated_at,
+            Some(1790832214000)
+        );
+    }
+
+    #[test]
+    fn census_fields_are_carried_through_verbatim() {
+        // A 2026-10 Linux row: `procStart` is a STRING, `tmux` a locator.
+        let row = r#"{"pid":1060775,"sessionId":"7f7e6038-d85c-426f-b930-bc429fe62c58","cwd":"/home/x/p","startedAt":1790794061417,"procStart":"285826587","kind":"interactive","entrypoint":"cli","tmux":"t-sess:@650.%652","name":"n","nameSource":"user","status":"idle","updatedAt":1790832214533,"statusUpdatedAt":1790832214000}"#;
+        let s = parse_registry_file(row, Path::new("/home/x/.claude-tiohorst")).unwrap();
+        assert_eq!(s.proc_start.as_deref(), Some("285826587"));
+        assert_eq!(s.entrypoint.as_deref(), Some("cli"));
+        assert_eq!(s.tmux.as_deref(), Some("t-sess:@650.%652"));
+        assert_eq!(s.status_updated_at, Some(1790832214000));
+        // The ground-truth row has no procStart/tmux: absent stays absent.
+        let old = parse_registry_file(SAMPLE, Path::new("C:/claude/.claude-paktis")).unwrap();
+        assert_eq!(old.proc_start, None);
+        assert_eq!(old.tmux, None);
+        assert_eq!(old.status_updated_at, Some(1784770342016));
     }
 
     #[test]
@@ -507,7 +767,9 @@ mod tests {
         )
         .unwrap();
         let live: HashSet<u32> = [42].into_iter().collect();
-        let got = read_live_sessions(&[acct], &live);
+        let got = read_live_sessions(&[acct], &live, &every_pid)
+            .complete()
+            .unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].name_source.as_deref(), Some("derived"));
         let _ = fs::remove_dir_all(&root);
@@ -535,7 +797,10 @@ mod tests {
         let s = parse_registry_file(nameless, Path::new(".claude-gmail")).unwrap();
         assert_eq!(s.session_id, "s");
         assert_eq!(s.name, "");
-        assert_eq!(s.resume_command, "cd '/x' && clg --resume s");
+        assert_eq!(
+            s.resume_command.as_deref(),
+            Some("cd \"/x\" && CLAUDE_CONFIG_DIR=\".claude-gmail\" claude --resume s")
+        );
     }
 
     #[test]
@@ -549,7 +814,9 @@ mod tests {
         .unwrap();
 
         let live: HashSet<u32> = [42].into_iter().collect();
-        let got = read_live_sessions(&[acct], &live);
+        let got = read_live_sessions(&[acct], &live, &every_pid)
+            .complete()
+            .unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].session_id, "live-id");
         assert_eq!(got[0].name, "");
@@ -567,16 +834,41 @@ mod tests {
 
         let mut ok = ProcessSnapshot::default();
         ok.names.insert(1234, "claude.exe".to_string());
+        // Built from `Default`, it is still stale: a full but stale table is
+        // the last good one, not a live read.
+        assert!(live_pids_from_snapshot(&ok).is_err());
+        ok.stale = false;
         let pids = live_pids_from_snapshot(&ok).unwrap();
         assert!(pids.contains(&1234));
         assert_eq!(pids.len(), 1);
     }
 
+    /// No `cwd` ⇒ no resume line: a resume from the wrong directory cannot
+    /// find the session, so the line is omitted rather than guessed. The row
+    /// itself is kept — it still proves liveness.
     #[test]
-    fn omits_cd_when_cwd_is_absent() {
+    fn omits_the_resume_line_when_cwd_is_absent() {
         let json = r#"{"pid":7,"sessionId":"abc","name":"n"}"#;
         let s = parse_registry_file(json, Path::new(".claude-gmail")).unwrap();
-        assert_eq!(s.resume_command, "clg --resume abc");
+        assert_eq!(s.session_id, "abc");
+        assert_eq!(s.resume_command, None);
+    }
+
+    /// An account outside the five the wrapper table knew resumes under its
+    /// own config dir — the wrapper table gave it a bare `claude`, i.e. the
+    /// DEFAULT account.
+    #[test]
+    fn an_account_outside_the_wrapper_table_resumes_under_its_own_dir() {
+        let s = parse_registry_file(SAMPLE, Path::new("C:/claude/.claude-niklas")).unwrap();
+        assert_eq!(s.account.label, "niklas");
+        assert_eq!(s.account.wrapper, "claude");
+        assert_eq!(
+            s.resume_command.as_deref(),
+            Some(
+                "cd \"D:/qontinui-root\" && CLAUDE_CONFIG_DIR=\"C:/claude/.claude-niklas\" \
+                 claude --resume b770ae37-1ffa-4888-a5d1-89d058307adf"
+            )
+        );
     }
 
     #[test]
@@ -586,10 +878,19 @@ mod tests {
         fs::write(acct.join("sessions").join("2804.json"), SAMPLE).unwrap();
 
         let none: HashSet<u32> = HashSet::new();
-        assert!(read_live_sessions(&[acct.clone()], &none).is_empty());
+        assert!(read_live_sessions(&[acct.clone()], &none, &every_pid)
+            .complete()
+            .unwrap()
+            .is_empty());
 
         let live: HashSet<u32> = [2804].into_iter().collect();
-        assert_eq!(read_live_sessions(&[acct], &live).len(), 1);
+        assert_eq!(
+            read_live_sessions(&[acct], &live, &every_pid)
+                .complete()
+                .unwrap()
+                .len(),
+            1
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -603,9 +904,67 @@ mod tests {
         fs::write(sdir.join("notes.txt"), SAMPLE).unwrap(); // non-json ignored
 
         let live: HashSet<u32> = [2804, 9999].into_iter().collect();
-        let got = read_live_sessions(&[acct], &live);
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].name, "per-agent coord-mcp proxy");
+        let read = read_live_sessions(&[acct], &live, &every_pid);
+        assert_eq!(read.sessions.len(), 1);
+        assert_eq!(read.sessions[0].name, "per-agent coord-mcp proxy");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A LIVE pid's record that cannot be parsed leaves the session that pid
+    /// hosts unknown: the read reports the file
+    /// and `complete()` refuses, so no caller reads that live session as
+    /// closed. A corrupt file for a pid that is NOT live is a stale record and
+    /// leaves the read complete.
+    #[test]
+    fn a_live_pids_unreadable_record_makes_the_read_indeterminate() {
+        let root = tmpdir("torn");
+        let acct = root.join(".claude-paktis");
+        let sdir = acct.join("sessions");
+        fs::write(sdir.join("2804.json"), SAMPLE).unwrap();
+        fs::write(sdir.join("9999.json"), r#"{"pid":9999,"sessionId":"torn"#).unwrap();
+
+        let stale_only: HashSet<u32> = [2804].into_iter().collect();
+        assert_eq!(
+            read_live_sessions(&[acct.clone()], &stale_only, &every_pid)
+                .complete()
+                .unwrap()
+                .len(),
+            1,
+            "a corrupt file for a dead pid is a stale record"
+        );
+
+        let live: HashSet<u32> = [2804, 9999].into_iter().collect();
+        let read = read_live_sessions(&[acct], &live, &every_pid);
+        assert_eq!(read.sessions.len(), 1, "the readable row is kept");
+        assert_eq!(read.unreadable_records.len(), 1);
+        assert_eq!(read.unreadable_records[0].path, sdir.join("9999.json"));
+        let err = read
+            .complete()
+            .expect_err("a live pid's unreadable record is indeterminate");
+        assert!(err.contains("9999.json"), "{err}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A torn record named for a live pid whose image could NOT host Claude
+    /// Code — a crashed `claude`'s leftover whose pid a `bash` or `conhost`
+    /// now holds — is a stale record: it leaves the read complete, so it
+    /// cannot keep every strict read incomplete for as long as the file stays.
+    #[test]
+    fn a_torn_record_named_for_a_live_shell_leaves_the_read_complete() {
+        let root = tmpdir("reused");
+        let acct = root.join(".claude-paktis");
+        let sdir = acct.join("sessions");
+        fs::write(sdir.join("2804.json"), SAMPLE).unwrap();
+        fs::write(sdir.join("9999.json"), r#"{"pid":9999,"sessionId":"torn"#).unwrap();
+        let live: HashSet<u32> = [2804, 9999].into_iter().collect();
+        let only_2804_hosts_claude = |pid: u32| pid == 2804;
+        let read = read_live_sessions(&[acct], &live, &only_2804_hosts_claude);
+        assert!(
+            read.unreadable_records.is_empty(),
+            "{:?}",
+            read.unreadable_records
+        );
+        assert_eq!(read.complete().unwrap().len(), 1);
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -615,7 +974,12 @@ mod tests {
         let bare = root.join(".claude-hotmail");
         fs::create_dir_all(&bare).unwrap();
         let live: HashSet<u32> = [1].into_iter().collect();
-        assert!(read_live_sessions(&[bare], &live).is_empty());
+        // An ABSENT sessions dir is an account with nothing open: a complete
+        // read, not an indeterminate one.
+        assert!(read_live_sessions(&[bare], &live, &every_pid)
+            .complete()
+            .unwrap()
+            .is_empty());
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -644,9 +1008,50 @@ mod tests {
         .unwrap();
 
         let live: HashSet<u32> = [10, 11].into_iter().collect();
-        let got = read_live_sessions(&[acct], &live);
+        let got = read_live_sessions(&[acct], &live, &every_pid)
+            .complete()
+            .unwrap();
         assert_eq!(got.len(), 2);
         assert_eq!(got.iter().filter(|s| s.session_id == "same-id").count(), 2);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The restore path's liveness oracle must not read a `sessions/` dir it
+    /// cannot list as an account with nothing open: the live session recorded
+    /// there would read "not live", and the restore would type `claude
+    /// --resume` for it — a fork. The read reports the dir, `complete()`
+    /// refuses, and a row from a dir that WAS listed is still returned beside
+    /// it for the callers that can use a partial read.
+    #[cfg(unix)]
+    #[test]
+    fn an_unlistable_sessions_dir_makes_the_read_indeterminate() {
+        let root = tmpdir("unlistable");
+        let readable = root.join(".claude-paktis");
+        fs::write(readable.join("sessions").join("2804.json"), SAMPLE).unwrap();
+        let hidden = root.join(".claude-gmail");
+        fs::create_dir_all(hidden.join("sessions")).unwrap();
+        fs::write(
+            hidden.join("sessions").join("77.json"),
+            r#"{"pid":77,"sessionId":"hidden-live","name":"n","cwd":"/w"}"#,
+        )
+        .unwrap();
+        let Some(restore) =
+            crate::session::claude_activity::unlistable_fixture::unreadable_sessions_dir(&hidden)
+        else {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        };
+
+        let live: HashSet<u32> = [2804, 77].into_iter().collect();
+        let read = read_live_sessions(&[readable, hidden.clone()], &live, &every_pid);
+        assert_eq!(read.sessions.len(), 1, "the listable dir's row is kept");
+        assert_eq!(read.unlistable.len(), 1);
+        assert_eq!(read.unlistable[0].sessions_dir, hidden.join("sessions"));
+        let err = read
+            .complete()
+            .expect_err("an unlistable dir is indeterminate");
+        assert!(err.contains("indeterminate"), "{err}");
+        drop(restore);
         let _ = fs::remove_dir_all(&root);
     }
 }

@@ -255,7 +255,10 @@ already uses to restart it (its dev script, `docker compose restart <service>`,
 its process manager). This command does not ship a restart script: how services
 are started is a property of your project, not of Qontinui.
 
-After a runner restart, restore the loaded config, workflow and monitor.
+After a runner restart, reload the last config the runner saved. The runner's
+`POST /load-last-config` reloads that config and reports the workflow and
+monitor it saved, but selects neither: Phase 5 takes `workflow_name` and
+`monitor` from `execution.json` and passes them to `mcp__qontinui__run_workflow`.
 `qontinui-http.py` is carried by the `command-scripts` skill and needs Python 3
 with the `qontinui-mcp` package (it imports `qontinui_mcp.client`, which brings
 `httpx`). `qontinui-mcp` is not on PyPI: install it from source with

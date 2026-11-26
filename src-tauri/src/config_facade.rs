@@ -682,12 +682,6 @@ pub fn get_interactive_sessions_enabled() -> bool {
     load_settings().ai.interactive_sessions_enabled
 }
 
-/// Save the interactive sessions enabled setting.
-pub fn save_interactive_sessions_enabled(enabled: bool) -> Result<(), String> {
-    info!("Saving interactive sessions enabled setting: {}", enabled);
-    update_settings(|settings| settings.ai.interactive_sessions_enabled = enabled)
-}
-
 /// Get the user-configured custom UI Bridge discovery ports.
 /// These are merged with the hardcoded `DESKTOP_APP_PORTS` at scan time.
 pub fn get_discovery_ports() -> Vec<u16> {
@@ -722,6 +716,20 @@ pub fn save_claude_config_dirs(dirs: Vec<String>) -> Result<(), String> {
         dirs.len()
     );
     crate::claude_accounts::update(move |roster| roster.claude_config_dirs = dirs)
+}
+
+/// ADD Claude Code config directories to the machine-global roster, never
+/// removing one (`crate::claude_accounts::append_config_dirs`). Returns how
+/// many were added. The first-run setup wizard uses this; the Settings page's
+/// replace-style [`save_claude_config_dirs`] stays the only way to remove one.
+pub fn append_claude_config_dirs(dirs: &[String]) -> Result<usize, String> {
+    let added = crate::claude_accounts::append_config_dirs(dirs)?;
+    info!(
+        "Added {} of {} Claude config dirs (machine-global claude-accounts.json, add-only)",
+        added,
+        dirs.len()
+    );
+    Ok(added)
 }
 
 /// Get custom launch commands per account config directory.
@@ -887,8 +895,9 @@ pub fn seed_default_log_sources_if_empty() {
             category: LogSourceCategory::Runner,
             source_type: "file".to_string(),
             // The runner writes its tracing to `<dev_logs>/qontinui-runner.log.<date>`
-            // (see crate::logging). Point at the stable basename — read_single_source
-            // resolves the newest dated rotation. NOT `runner-tauri.log`, which is the
+            // (see crate::logging). Point at the stable basename —
+            // commands::project_logs::resolve_source_file resolves the newest
+            // dated rotation. NOT `runner-tauri.log`, which is the
             // supervisor's captured stdout, not the runner's own tracing.
             path: format!(
                 "{}/{}",

@@ -20,6 +20,7 @@ import {
   TITLE_PREFIX,
   applyAction,
   classifyFlakinessResponse,
+  describeFirstFailure,
   describeReadFailure,
   isRetryableRead,
   readWithOneRetry,
@@ -988,4 +989,29 @@ test("a success, a thin read, or a client error is not retried", async () => {
 test("the retry warning names the SQLSTATE or the transport error", () => {
   assert.match(describeReadFailure(FAILED_READ), /60961ms.*57014/);
   assert.equal(describeReadFailure({ error: "HTTP 502 from coord" }), "HTTP 502 from coord");
+});
+
+test("the final log line carries the FIRST attempt's cause when the read was retried", async () => {
+  const transport = { error: "request to coord ABORTED by the client after 120000ms", retryable: true };
+  const twice = await readWithOneRetry(
+    (() => {
+      const reads = [transport, FAILED_READ];
+      return async () => reads.shift();
+    })(),
+    { sleep: async () => {} },
+  );
+  assert.equal(
+    describeFirstFailure(twice),
+    "; first attempt: request to coord ABORTED by the client after 120000ms",
+  );
+  const recovered = await readWithOneRetry(
+    (() => {
+      const reads = [FAILED_READ, OK_READ];
+      return async () => reads.shift();
+    })(),
+    { sleep: async () => {} },
+  );
+  assert.match(describeFirstFailure(recovered), /^; first attempt: history_read=failed after 60961ms \(pg_code 57014\)$/);
+  const once = await readWithOneRetry(async () => OK_READ, { sleep: async () => {} });
+  assert.equal(describeFirstFailure(once), "", "an unretried read adds nothing");
 });

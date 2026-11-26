@@ -2,7 +2,7 @@
 //!
 //! Macro-generated handlers that proxy AI-side operations (analysis of
 //! tabular/region/structured data, cross-app comparison, recovery attempts,
-//! semantic search, semantic diff, media compare, pixel-accurate image diff)
+//! semantic search, semantic diff, pixel-accurate image diff)
 //! to the webview SDK via `ui_bridge_request_sync`.
 //!
 //! Namespace note: most handlers sit under `/ai/*`; `image-diff` also has a
@@ -12,11 +12,12 @@
 use std::sync::Arc;
 
 use axum::{extract::State, http::StatusCode, response::Json};
+use tracing::warn;
 
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 
 use super::request::ui_bridge_request_sync;
-use super::types::{recovery_hint_for, UiBridgeError, UiBridgeErrorCode};
+use super::types::{next_action_for, UiBridgeError, UiBridgeErrorCode};
 use super::{ipc_handler_get, ipc_handler_post};
 
 // Semantic search & diff
@@ -43,6 +44,15 @@ type BridgeResult =
 /// carried no machine-readable one of its own. Mirrors `RECOVERY_FAILED` in
 /// `src/hooks/ui-bridge-events/recoveryScope.ts`.
 const RECOVERY_FAILED: &str = "RECOVERY_FAILED";
+
+/// Code for a 2xx `ai_recovery_attempt` reply that states NO verdict: its
+/// [`ATTEMPT_SUCCEEDED`] is absent, `null` or not a boolean
+/// ([`AttemptVerdict::Unstated`]). The runner mints it; no frontend arm sends
+/// it, because every arm writes the field. Seeing it means the producer did not
+/// answer the question (an older bundle, an early return, a future arm, or a
+/// success envelope with no `data`), so whether the scoped attempt acted is
+/// unknown. See [`verdict_missing_failure`].
+const RECOVERY_VERDICT_MISSING: &str = "RECOVERY_VERDICT_MISSING";
 
 /// Read the leading `CODE:` token out of a typed refusal message.
 ///
@@ -86,6 +96,15 @@ fn recovery_error_code(code: &str) -> UiBridgeErrorCode {
         // The addressed element is not in the tree — the very condition the
         // element routes already report as `ELEMENT_NOT_FOUND`.
         "RECOVERY_TARGET_MISSING" => UiBridgeErrorCode::ElementNotFound,
+        // The reply stated no verdict, so whether the attempt acted is
+        // UNKNOWN. This arm keeps the token out of the fallthrough below,
+        // which says the attempt RAN. Under envelope rule 2a this code becomes
+        // the wire's top-level `code`, so without the arm the token would reach
+        // a caller as `ACTION_FAILED`, the same answer as `RECOVERY_FAILED`.
+        // `INTERNAL_ERROR` is the true class (the reply came from the runner's
+        // own frontend bundle), and its `report_defect` next action tells a
+        // caller not to re-run an attempt whose effect is unknown.
+        RECOVERY_VERDICT_MISSING => UiBridgeErrorCode::InternalError,
         // `RECOVERY_FAILED` and any future token: recovery RAN against the
         // addressed element and did not recover it. That is an action failure.
         _ => UiBridgeErrorCode::ActionFailed,
@@ -101,7 +120,7 @@ fn recovery_error_detail(
     prior_context: Option<serde_json::Value>,
 ) -> UiBridgeError {
     let mapped = recovery_error_code(code);
-    let recovery = Some(recovery_hint_for(&mapped));
+    let recovery = Some(next_action_for(&mapped));
     let mut obj = match prior_context {
         Some(serde_json::Value::Object(m)) => m,
         _ => serde_json::Map::new(),
@@ -122,7 +141,138 @@ fn recovery_error_detail(
 /// (`RecoveryVerdict.attemptSucceeded` in
 /// `src/hooks/ui-bridge-events/recoveryScope.ts`). Distinct from the runner's
 /// outer `RecoveryOutcome.recovered` on purpose — see [`as_recovery_failure`].
+///
+/// The field has two readers: [`as_recovery_failure`] here, which decides the
+/// HTTP answer of `/ai/recovery/attempt`, and
+/// `recovery_executor::scoped_attempt_verdict`, which decides whether the LLM
+/// fallback retries the original action. Both read it strictly, through the
+/// one function [`attempt_verdict`], so they cannot disagree about a missing
+/// value. Only `true` counts as success. An absent, `null` or non-boolean value
+/// is [`AttemptVerdict::Unstated`], never a pass.
 pub(crate) const ATTEMPT_SUCCEEDED: &str = "attemptSucceeded";
+
+/// What a reply to the scoped recovery attempt (`ai_recovery_attempt`) says
+/// about whether the attempt acted on the addressed element. Three states, not
+/// two, because a missing verdict is not a `true` one; the same pattern as
+/// [`super::request::ActionOutcome`] for an action's `success`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AttemptVerdict {
+    /// [`ATTEMPT_SUCCEEDED`] is `true`: the scoped executor acted on the
+    /// addressed element. This says nothing about whether the ORIGINAL action
+    /// now succeeds; the retry answers that.
+    Acted,
+    /// [`ATTEMPT_SUCCEEDED`] is `false`, or the reply carries an explicit
+    /// `success: false` (a refusal the dispatcher stamped onto `data`),
+    /// whatever else it says.
+    DidNotAct,
+    /// The reply states no verdict: [`ATTEMPT_SUCCEEDED`] is absent, `null` or
+    /// not a boolean. Whether the attempt acted is unknown, so this is never a
+    /// success.
+    Unstated,
+}
+
+/// Read a scoped-attempt reply's verdict. This is the one reader of
+/// [`ATTEMPT_SUCCEEDED`]; both of its consumers call it (see that constant).
+///
+/// An explicit `success: false` is [`AttemptVerdict::DidNotAct`] whatever else
+/// the reply says. Otherwise `attemptSucceeded: true` is
+/// [`AttemptVerdict::Acted`], `false` is [`AttemptVerdict::DidNotAct`], and
+/// anything else is [`AttemptVerdict::Unstated`]: a missing key, `null`, a
+/// string, a number, or a reply that is not an object at all.
+///
+/// Deliberately NOT [`super::request::action_outcome`]. The frontend's success
+/// reply carries no `success` key, because the dispatcher forwards the bare
+/// `data`. Reading `success` strictly would call every successful attempt
+/// indeterminate.
+pub(crate) fn attempt_verdict(reply: &serde_json::Value) -> AttemptVerdict {
+    if reply.get("success").and_then(|v| v.as_bool()) == Some(false) {
+        return AttemptVerdict::DidNotAct;
+    }
+    match reply.get(ATTEMPT_SUCCEEDED).and_then(|v| v.as_bool()) {
+        Some(true) => AttemptVerdict::Acted,
+        Some(false) => AttemptVerdict::DidNotAct,
+        None => AttemptVerdict::Unstated,
+    }
+}
+
+/// The maximum number of a verdict-less reply's top-level key names that
+/// [`verdict_missing_failure`] reports. Enough to identify the producer.
+const PAYLOAD_KEYS_LIMIT: usize = 32;
+
+/// The maximum length, in characters, of each reported key name. With
+/// [`PAYLOAD_KEYS_LIMIT`] this bounds the reported names to 2,048 characters
+/// (at most 8 KiB of UTF-8), so an arbitrary payload cannot inflate the error
+/// body or the log line (and cannot push the body past the envelope
+/// middleware's JSON pass, which would change the wire shape).
+const PAYLOAD_KEY_CHARS_LIMIT: usize = 64;
+
+/// The HTTP 500 for a 2xx reply that stated no verdict
+/// ([`AttemptVerdict::Unstated`]). `payload` is the reply's `data`, or `None`
+/// when the envelope carried none.
+///
+/// The handler sets `code: RECOVERY_VERDICT_MISSING` and `error_detail.code:
+/// INTERNAL_ERROR` (through [`recovery_error_code`]), with the token in
+/// `error_detail.context.code`. The handler's two codes disagree, so the
+/// envelope middleware's rule 2a (`crate::mcp::envelope`) rewrites the
+/// top-level `code` to `INTERNAL_ERROR`: on the wire both codes read
+/// `INTERNAL_ERROR`, and the token stays in `error_detail.context.code` and
+/// `error_detail.context.displaced_top_level_code`. A caller therefore keys on
+/// `error_detail.context.code`. The context also describes the reply's shape,
+/// because a reply that does not answer the question is identified by what it
+/// did carry:
+///
+/// - `payload_type`: its JSON type, or `absent`;
+/// - `payload_keys`: up to [`PAYLOAD_KEYS_LIMIT`] of its top-level key names,
+///   each cut to [`PAYLOAD_KEY_CHARS_LIMIT`] characters;
+/// - `payload_key_count`: how many keys it had, so a cut list shows the cut.
+///
+/// Only key names are reported, never values.
+fn verdict_missing_failure(
+    payload: Option<&serde_json::Value>,
+) -> (StatusCode, Json<ApiResponse<()>>) {
+    let payload_type = match payload {
+        None => "absent",
+        Some(serde_json::Value::Null) => "null",
+        Some(serde_json::Value::Bool(_)) => "boolean",
+        Some(serde_json::Value::Number(_)) => "number",
+        Some(serde_json::Value::String(_)) => "string",
+        Some(serde_json::Value::Array(_)) => "array",
+        Some(serde_json::Value::Object(_)) => "object",
+    };
+    let keys: Vec<&str> = payload
+        .and_then(serde_json::Value::as_object)
+        .map(|obj| obj.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    let shown: Vec<String> = keys
+        .iter()
+        .take(PAYLOAD_KEYS_LIMIT)
+        .map(|k| k.chars().take(PAYLOAD_KEY_CHARS_LIMIT).collect())
+        .collect();
+    let message = format!(
+        "{RECOVERY_VERDICT_MISSING}: the frontend's ai_recovery_attempt reply carried no \
+         boolean `{ATTEMPT_SUCCEEDED}`; whether the scoped attempt acted is unknown"
+    );
+    warn!(
+        payload_type,
+        payload_key_count = keys.len(),
+        payload_keys = ?shown,
+        "ui_bridge /ai/recovery/attempt: {RECOVERY_VERDICT_MISSING}: a 2xx reply carried \
+         no boolean {ATTEMPT_SUCCEEDED}; answering HTTP 500, not success"
+    );
+    let context = serde_json::json!({
+        "payload_type": payload_type,
+        "payload_keys": shown,
+        "payload_key_count": keys.len(),
+    });
+    let mut body = api_error(message.clone());
+    body.error_detail = Some(recovery_error_detail(
+        RECOVERY_VERDICT_MISSING,
+        message,
+        Some(context),
+    ));
+    body.code = Some(RECOVERY_VERDICT_MISSING.to_string());
+    (StatusCode::INTERNAL_SERVER_ERROR, Json(body))
+}
 
 /// Stop `/ai/recovery/attempt` from laundering a typed refusal into a success.
 ///
@@ -142,20 +292,42 @@ pub(crate) const ATTEMPT_SUCCEEDED: &str = "attemptSucceeded";
 /// handler, so `recoveryFailureData` no longer has to mirror the refusal into
 /// `data` by hand and no longer takes a `message` to mirror.
 ///
-/// This function is still load-bearing, for a case the seam cannot see: a
-/// frontend that answers `{success: true, data: {attemptSucceeded: false}}` —
-/// an HONEST envelope reporting that the scoped attempt ran and did not act on
-/// the addressed element. Turning that verdict into an HTTP 400 is this
-/// boundary's own job, exactly as [`super::elements::as_action_failure`] does
-/// for `execute_action`:
+/// This function is still load-bearing, for the cases the seam cannot see. It
+/// reads a 2xx reply's verdict through [`attempt_verdict`], the same reader
+/// `recovery_executor::scoped_attempt_verdict` uses, and handles every arm:
 ///
-/// - a 200 whose payload says `attemptSucceeded: false` becomes an HTTP 400
-///   carrying the payload's own `error` text and a machine-readable `code`;
-/// - a 400 that arrived without a `code` gets one derived from its message.
+/// - [`AttemptVerdict::Acted`] (`attemptSucceeded: true`) passes through
+///   untouched as the 200.
+/// - [`AttemptVerdict::DidNotAct`] becomes an HTTP 400 carrying the payload's
+///   own `error` text and a machine-readable `code`. The case is a frontend
+///   that answers `{success: true, data: {attemptSucceeded: false}}`, an HONEST
+///   envelope reporting that the scoped attempt ran and did not act on the
+///   addressed element. It is defensive, a case the seam cannot see: today's
+///   bundle sends every did-not-act reply with envelope `success: false`, which
+///   `wrap_ipc_result` turns into a 400 before this arm runs. Turning that verdict into a 400 is this
+///   boundary's own job, exactly as [`super::elements::as_action_failure`] does
+///   for `execute_action`.
+/// - [`AttemptVerdict::Unstated`] becomes an HTTP 500 whose
+///   `error_detail.code` is `INTERNAL_ERROR` and whose
+///   `error_detail.context.code` is `RECOVERY_VERDICT_MISSING`
+///   ([`verdict_missing_failure`]; on the wire the top-level `code` is
+///   `INTERNAL_ERROR` too, by envelope rule 2a). This is a 2xx whose `attemptSucceeded` is
+///   absent, `null` or not a boolean, or that carries no `data` at all: the
+///   producer did not say whether the attempt acted. Passing it through would
+///   read an absence as a pass, which is what this function did until plan
+///   `2026-11-10-the-recovery-attempt-route-never-reads-a-missing-verdict-as-success`.
+///   `RECOVERY_FAILED` would be wrong too, because it says the attempt ran.
+///   The status is a 5xx because the caller's request was fine, and because
+///   the journey ledger records no edge for a 4xx, which would erase an
+///   attempt that may have acted. The edge it keeps records the outcome
+///   `error`, not "unknown": the ledger's outcome vocabulary has no
+///   indeterminate value, so that edge asserts a failure the runner cannot
+///   prove. It is 500 rather than 502 because the code is `INTERNAL_ERROR`,
+///   and the status and the code must name one event.
 ///
-/// `attemptSucceeded: true` and transport-level failures (500 / 503 — the
-/// frontend never answered) pass through untouched: those are not attempt
-/// verdicts.
+/// On the error side, a 400 that arrived without a `code` gets one derived from
+/// its message. Transport-level failures (500 / 503: the frontend never
+/// answered) pass through untouched, because they are not attempt verdicts.
 ///
 /// **The HTTP status of `/ai/recovery/attempt` therefore reflects the SCOPED
 /// ATTEMPT, not the ORIGINAL action.** A 200 means the scoped executor acted on
@@ -168,7 +340,7 @@ pub(crate) const ATTEMPT_SUCCEEDED: &str = "attemptSucceeded";
 /// `recovered` until plan `2026-08-23-single-source-derived-facts` item 8,
 /// which is exactly how one word came to answer two questions.
 ///
-/// Both refusal arms also build a TYPED `error_detail` ([`recovery_error_code`]).
+/// Every failure arm also builds a TYPED `error_detail` ([`recovery_error_code`]).
 /// Stamping only the top-level `code` left the token laundered one layer down:
 /// `api_error` leaves `error_detail: None`, and `classify_transport_error` has
 /// no pattern for `RECOVERY_*: …`, so the structured half of the very same body
@@ -192,14 +364,16 @@ pub(crate) fn as_recovery_failure(result: BridgeResult) -> BridgeResult {
 
     match result {
         Ok(Json(resp)) => {
-            let attempt_failed = resp
-                .data
-                .as_ref()
-                .and_then(|d| d.get(ATTEMPT_SUCCEEDED))
-                .and_then(|v| v.as_bool())
-                == Some(false);
-            if !attempt_failed {
-                return Ok(Json(resp));
+            // A success envelope with no `data` at all states no verdict
+            // either, so it is read as a `null` reply.
+            let verdict = attempt_verdict(resp.data.as_ref().unwrap_or(&serde_json::Value::Null));
+            match verdict {
+                AttemptVerdict::Acted => return Ok(Json(resp)),
+                AttemptVerdict::Unstated => {
+                    return Err(verdict_missing_failure(resp.data.as_ref()));
+                }
+                // The attempt ran and did not act: the 400 below.
+                AttemptVerdict::DidNotAct => {}
             }
             let payload = resp.data.clone().unwrap_or(serde_json::Value::Null);
             let code = code_of(&payload, None);
@@ -356,6 +530,11 @@ mod recovery_failure_tests {
     //! dispatcher whenever a handler supplies `data`, so `wrap_ipc_result` saw
     //! a bare `{recovered:false}` and had nothing to flatten. These pin the
     //! boundary that closes it — and that it does NOT 400 a genuine recovery.
+    //!
+    //! They also pin the strict verdict read (plan
+    //! `2026-11-10-the-recovery-attempt-route-never-reads-a-missing-verdict-as-success`):
+    //! a 2xx reply that states no `attemptSucceeded` is an HTTP 500
+    //! `RECOVERY_VERDICT_MISSING`, not a success.
 
     use super::*;
     use serde_json::json;
@@ -452,12 +631,220 @@ mod recovery_failure_tests {
         assert_eq!(body.data, Some(payload));
     }
 
-    /// A response with no recovery verdict at all is not this boundary's
-    /// business — pass it through untouched.
+    /// A 2xx reply that states NO verdict (`attemptSucceeded` absent, `null`
+    /// or not a boolean) is not a success. It used to pass through as
+    /// `{"success": true}`, and the test this replaces pinned that: an absence
+    /// read as a pass. It now answers HTTP 500 `RECOVERY_VERDICT_MISSING`,
+    /// typed `INTERNAL_ERROR`, naming the reply's own keys.
     #[test]
-    fn an_unrelated_payload_passes_through() {
-        let out = as_recovery_failure(ok(json!({ "something": "else" })));
-        assert!(out.is_ok());
+    fn a_reply_that_states_no_verdict_is_a_500_not_a_success() {
+        for reply in [
+            json!({}),
+            json!({ "something": "else" }),
+            json!({ "attemptSucceeded": "yes" }),
+            json!({ "attemptSucceeded": null }),
+        ] {
+            let (status, Json(body)) = as_recovery_failure(ok(reply.clone()))
+                .expect_err("a reply that states no verdict is not a success");
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{reply}");
+            assert!(!body.success, "{reply}");
+            assert_eq!(
+                body.code.as_deref(),
+                Some("RECOVERY_VERDICT_MISSING"),
+                "{reply}"
+            );
+            assert_eq!(detail_code(&body), "INTERNAL_ERROR", "{reply}");
+            assert_eq!(
+                detail_context_code(&body),
+                "RECOVERY_VERDICT_MISSING",
+                "{reply}"
+            );
+            let mut expected_keys: Vec<String> = reply
+                .as_object()
+                .expect("an object reply")
+                .keys()
+                .cloned()
+                .collect();
+            expected_keys.sort();
+            assert_eq!(context_payload_keys(&body), expected_keys, "{reply}");
+        }
+    }
+
+    /// THE LIVE SHAPE, through the real seam. A success envelope with no
+    /// `data` is forwarded WHOLE by the dispatcher (`extract_response_data`'s
+    /// no-`data` arm), so `wrap_ipc_result` reads `success: true` and answers
+    /// 200, yet nothing in it says whether the attempt acted. It must not
+    /// leave this boundary as a success.
+    #[test]
+    fn a_success_envelope_with_no_data_through_the_seam_is_a_500() {
+        use super::super::request::{extract_response_data, wrap_ipc_result};
+
+        let envelope = json!({
+            "requestId": "r",
+            "type": "ai_recovery_attempt",
+            "success": true,
+            "timestamp": 1,
+        });
+        let wrapped = wrap_ipc_result(Ok(extract_response_data(&envelope)));
+        assert!(
+            wrapped.is_ok(),
+            "precondition: the seam forwards a data-less success envelope as a 200"
+        );
+        let (status, Json(body)) = as_recovery_failure(wrapped)
+            .expect_err("an envelope that states no verdict is not a success");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body.code.as_deref(), Some("RECOVERY_VERDICT_MISSING"));
+        assert_eq!(detail_code(&body), "INTERNAL_ERROR");
+        assert_eq!(detail_context_code(&body), "RECOVERY_VERDICT_MISSING");
+        assert_eq!(
+            context_payload_keys(&body),
+            ["requestId", "success", "timestamp", "type"]
+        );
+    }
+
+    /// An `ApiResponse` success that carries no `data` at all states no
+    /// verdict either.
+    #[test]
+    fn a_success_with_no_data_at_all_is_a_500() {
+        let mut resp = ApiResponse::success(serde_json::Value::Null);
+        resp.data = None;
+        let (status, Json(body)) =
+            as_recovery_failure(Ok(Json(resp))).expect_err("no data is no verdict");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(detail_code(&body), "INTERNAL_ERROR");
+        assert_eq!(detail_context_code(&body), "RECOVERY_VERDICT_MISSING");
+        let wire = serde_json::to_value(&body).unwrap();
+        assert_eq!(
+            wire["error_detail"]["context"]["payload_type"],
+            json!("absent")
+        );
+        assert_eq!(
+            wire["error_detail"]["context"]["payload_key_count"],
+            json!(0)
+        );
+    }
+
+    /// Every non-object `data` is Unstated too, and the context names its JSON
+    /// type, so each `payload_type` arm is pinned.
+    #[test]
+    fn a_non_object_reply_names_its_json_type() {
+        for (reply, expected) in [
+            (json!(null), "null"),
+            (json!(true), "boolean"),
+            (json!(1), "number"),
+            (json!("x"), "string"),
+            (json!([1, 2]), "array"),
+            (json!({}), "object"),
+        ] {
+            let (status, Json(body)) = as_recovery_failure(ok(reply.clone()))
+                .expect_err("a non-object reply states no verdict");
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{reply}");
+            let wire = serde_json::to_value(&body).unwrap();
+            let context = &wire["error_detail"]["context"];
+            assert_eq!(context["payload_type"], json!(expected), "{reply}");
+            assert_eq!(
+                context["code"],
+                json!("RECOVERY_VERDICT_MISSING"),
+                "{reply}"
+            );
+        }
+    }
+
+    /// Each reported key name is cut to 64 characters, so a long key cannot
+    /// inflate the body.
+    #[test]
+    fn each_reported_key_name_is_bounded_in_length() {
+        let long = "k".repeat(10_000);
+        let mut obj = serde_json::Map::new();
+        obj.insert(long, json!(1));
+        let (_, Json(body)) = as_recovery_failure(ok(serde_json::Value::Object(obj))).unwrap_err();
+        let wire = serde_json::to_value(&body).unwrap();
+        let name = wire["error_detail"]["context"]["payload_keys"][0]
+            .as_str()
+            .expect("the cut key name is reported");
+        // A literal, not `PAYLOAD_KEY_CHARS_LIMIT`, so changing the bound reddens it.
+        assert_eq!(name.chars().count(), 64);
+
+        // A multi-byte key: byte 64 falls inside a character, so a byte slice
+        // would panic here; the cut must count characters.
+        let mut obj = serde_json::Map::new();
+        obj.insert("€".repeat(100), json!(1));
+        let (_, Json(body)) = as_recovery_failure(ok(serde_json::Value::Object(obj))).unwrap_err();
+        let wire = serde_json::to_value(&body).unwrap();
+        assert_eq!(
+            wire["error_detail"]["context"]["payload_keys"][0],
+            json!("€".repeat(64))
+        );
+    }
+
+    /// The reported key names are bounded, and the count shows the cut.
+    #[test]
+    fn the_reported_payload_keys_are_bounded() {
+        let wide: serde_json::Map<String, serde_json::Value> =
+            (0..100).map(|i| (format!("k{i:03}"), json!(i))).collect();
+        let (_, Json(body)) = as_recovery_failure(ok(serde_json::Value::Object(wide))).unwrap_err();
+        let wire = serde_json::to_value(&body).unwrap();
+        let context = &wire["error_detail"]["context"];
+        assert_eq!(context["payload_type"], json!("object"));
+        // A literal, not `PAYLOAD_KEYS_LIMIT`, so changing the bound reddens it.
+        assert_eq!(context["payload_keys"].as_array().map(Vec::len), Some(32));
+        assert_eq!(context["payload_key_count"], json!(100));
+    }
+
+    // ------------------------------------------------------------------
+    // `attempt_verdict`, the one reader of `attemptSucceeded`, arm by arm.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn attempt_verdict_reads_true_as_acted() {
+        for reply in [
+            json!({ "attemptSucceeded": true }),
+            json!({ "attemptSucceeded": true, "success": true, "elementId": "btn-1" }),
+        ] {
+            assert_eq!(attempt_verdict(&reply), AttemptVerdict::Acted, "{reply}");
+        }
+    }
+
+    /// `attemptSucceeded: false` did not act, and an explicit
+    /// `success: false` overrides everything else in the reply.
+    #[test]
+    fn attempt_verdict_reads_false_or_an_explicit_refusal_as_did_not_act() {
+        for reply in [
+            json!({ "attemptSucceeded": false }),
+            json!({ "success": false }),
+            json!({ "success": false, "attemptSucceeded": true }),
+            json!({
+                "success": false,
+                "error": "RECOVERY_UNSCOPED: no elementId",
+                "attemptSucceeded": false,
+            }),
+        ] {
+            assert_eq!(
+                attempt_verdict(&reply),
+                AttemptVerdict::DidNotAct,
+                "{reply}"
+            );
+        }
+    }
+
+    /// Anything that is not a boolean `attemptSucceeded` states no verdict,
+    /// including a reply whose envelope `success: true` survived the seam.
+    #[test]
+    fn attempt_verdict_reads_anything_else_as_unstated() {
+        for reply in [
+            json!({}),
+            json!({ "something": "else" }),
+            json!({ "success": true }),
+            json!({ "attemptSucceeded": null }),
+            json!({ "attemptSucceeded": "yes" }),
+            json!({ "attemptSucceeded": "true" }),
+            json!({ "attemptSucceeded": 1 }),
+            json!(null),
+            json!("attemptSucceeded"),
+            json!([true]),
+        ] {
+            assert_eq!(attempt_verdict(&reply), AttemptVerdict::Unstated, "{reply}");
+        }
     }
 
     /// Transport-level failures (the frontend never answered) are not recovery
@@ -498,24 +885,65 @@ mod recovery_failure_tests {
             .to_string()
     }
 
-    /// All three mapped codes, on the 200-with-`attemptSucceeded:false` arm.
+    /// `error_detail.context.payload_keys`, sorted, so the assertion does not
+    /// depend on the JSON map's key order.
+    fn context_payload_keys(body: &ApiResponse<()>) -> Vec<String> {
+        let mut keys: Vec<String> = serde_json::to_value(body).unwrap()["error_detail"]["context"]
+            ["payload_keys"]
+            .as_array()
+            .expect("error_detail.context.payload_keys must be present")
+            .iter()
+            .map(|k| k.as_str().expect("a key name").to_string())
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    /// Every token [`recovery_error_code`] names, each on the arm that produces
+    /// it. The three refusal tokens come from the 200-with-
+    /// `attemptSucceeded:false` arm at HTTP 400, and are never
+    /// `INTERNAL_ERROR`: a caller-caused refusal is not a runner defect.
+    /// `RECOVERY_VERDICT_MISSING` comes from a 2xx reply that states no verdict,
+    /// at HTTP 500, and must be `INTERNAL_ERROR`. The `ACTION_FAILED`
+    /// fallthrough would claim the attempt ran.
     #[test]
     fn each_recovery_token_gets_its_own_typed_inner_code() {
-        for (token, expected) in [
-            ("RECOVERY_UNSCOPED", "INVALID_REQUEST"),
-            ("RECOVERY_TARGET_MISSING", "ELEMENT_NOT_FOUND"),
-            ("RECOVERY_FAILED", "ACTION_FAILED"),
+        for (token, expected, expected_status) in [
+            (
+                "RECOVERY_UNSCOPED",
+                "INVALID_REQUEST",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "RECOVERY_TARGET_MISSING",
+                "ELEMENT_NOT_FOUND",
+                StatusCode::BAD_REQUEST,
+            ),
+            ("RECOVERY_FAILED", "ACTION_FAILED", StatusCode::BAD_REQUEST),
+            (
+                "RECOVERY_VERDICT_MISSING",
+                "INTERNAL_ERROR",
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
         ] {
-            let out = as_recovery_failure(ok(json!({
-                "success": false,
-                "error": format!("{token}: refused"),
-                "code": token,
-                "attemptSucceeded": false,
-            })));
-            let (status, Json(body)) = out.unwrap_err();
-            assert_eq!(status, StatusCode::BAD_REQUEST, "{token}");
+            let reply = if expected_status == StatusCode::BAD_REQUEST {
+                json!({
+                    "success": false,
+                    "error": format!("{token}: refused"),
+                    "code": token,
+                    "attemptSucceeded": false,
+                })
+            } else {
+                // The runner mints this token itself. The reply names no
+                // code; it just states no verdict.
+                json!({ "elementId": "btn-1" })
+            };
+            let (status, Json(body)) = as_recovery_failure(ok(reply)).unwrap_err();
+            assert_eq!(status, expected_status, "{token}");
             assert_eq!(body.code.as_deref(), Some(token), "{token}");
-            assert_ne!(detail_code(&body), "INTERNAL_ERROR", "{token}");
+            if expected_status == StatusCode::BAD_REQUEST {
+                assert_ne!(detail_code(&body), "INTERNAL_ERROR", "{token}");
+            }
             assert_eq!(detail_code(&body), expected, "{token}");
             // The token itself survives the coarse mapping.
             assert_eq!(detail_context_code(&body), token, "{token}");

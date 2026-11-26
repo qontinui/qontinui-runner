@@ -109,11 +109,30 @@ pub trait TicketProvider: Send + Sync {
         config: &TicketProviderConfig,
     ) -> Result<(), String>;
 
-    /// Update ticket state.
+    /// Update ticket state. Used for the completion write-back, which nothing
+    /// retries — a provider must not defer it for budget.
     async fn update_state(
         &self,
         ticket_id: &str,
         state: TicketState,
         config: &TicketProviderConfig,
     ) -> Result<(), String>;
+
+    /// Mark a ticket in progress from the serial sync loop. BEST-EFFORT.
+    ///
+    /// Unlike [`Self::update_state`] this must never block the loop on a
+    /// rate-limit budget: a provider with one may DEFER the write (not send
+    /// it) rather than sleep. A deferred write is not retried, and it is
+    /// reported the way that provider reports any failed state change — the
+    /// GitHub provider logs a warning and returns `Ok(())`. The caller must
+    /// write its ticket→task mapping regardless, since that mapping is what
+    /// prevents a duplicate task. Defaults to `update_state(InProgress)`.
+    async fn mark_in_progress(
+        &self,
+        ticket_id: &str,
+        config: &TicketProviderConfig,
+    ) -> Result<(), String> {
+        self.update_state(ticket_id, TicketState::InProgress, config)
+            .await
+    }
 }

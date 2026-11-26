@@ -1830,6 +1830,7 @@ async fn handle_integrate(
                     status: "active".to_string(),
                     target_url: analysis
                         .dev_server_port
+                        // runner-localhost-ok: the target app's dev server, not a runner port.
                         .map(|p| format!("http://localhost:{}", p)),
                     last_health_check: Some(now),
                     element_count: None,

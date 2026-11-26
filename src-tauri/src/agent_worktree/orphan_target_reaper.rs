@@ -54,7 +54,7 @@
 //! |---|---|---|
 //! | basename `target` at ANY depth inside a checkout/worktree (`<wt>/target`, `<wt>/src-tauri/target`, `_wt/<slug>/target`) | worktree reclaim ([`super::reclaim`]) | [`SkipReason::OwnedByWorktreeReclaim`] — never a candidate |
 //! | basename `target` with NO enclosing checkout at all (`D:/scratch/target`) | nobody — `super::reclaim` only ever removes `<worktree>/target` for a worktree in its census | falls through to the ordinary gates; a genuine orphan keeps a verb |
-//! | anything under `target-pool/`, or basename `target-agent`, ANYWHERE | the build system / `cargo-guard` | [`SkipReason::OwnedByBuildPool`] — never a candidate |
+//! | anything under `target-pool/`, or basename `target-agent` / `target-arming`, ANYWHERE | the build system / `cargo-guard` | [`SkipReason::OwnedByBuildPool`] — never a candidate |
 //! | any root inside a **canonical checkout** (`.git` is a dir) | nobody yet — v1 defers the verb | [`SkipReason::ReportOnly`] — measured and reported, never removed |
 //! | a root whose enclosing dir's `.git` could not be READ | UNKNOWN | [`SkipReason::OwnershipUnknown`] — never a candidate |
 //! | a **renamed** in-worktree build dir in a linked worktree (`target-<slug>`, `target-sessrestore`, …) | THIS reaper | subject to G-dirty + the five gates |
@@ -115,7 +115,7 @@
 //!     directory) has no v1 verb. Reported with its bytes; never removed, not
 //!     even when armed.
 //!   * **G-owner** — a root another engine owns by path (basename `target`
-//!     inside a checkout/worktree, `target-agent`, or anything under
+//!     inside a checkout/worktree, `target-agent`, `target-arming`, or anything under
 //!     `target-pool/`) is never a candidate here, so the two engines cannot race
 //!     on one path. Matched on the basename at any DEPTH — never on a path
 //!     relative to a resolved checkout root, which a failed `.git` read would
@@ -529,10 +529,15 @@ const NEVER_DESCEND: &[&str] = &[
 const WORKTREE_RECLAIM_BASENAME: &str = "target";
 
 /// Build directories inside a checkout/worktree that belong to the **build
-/// system** (`cargo-guard`'s shared agent dir and the supervisor's build pool).
-/// `target-agent` is matched on the basename; `target-pool` on any path
-/// component, so `target-pool/slot-0` and `target-pool/lkg` are both covered.
-const BUILD_POOL_BASENAME: &str = "target-agent";
+/// system**: `cargo-guard`'s shared agent dir (`target-agent`), the arming
+/// prove's persistent per-repo target (`target-arming`, qontinui-claude-config
+/// `scripts/lib/arming_runs.py`; plan
+/// `2026-11-06-arming-prove-shared-target-lock-starvation` D1 keeps it WARM on
+/// purpose, so reaping it would turn every prove back into a cold build) and
+/// the supervisor's build pool. The named dirs are matched on the basename;
+/// `target-pool` on any path component, so `target-pool/slot-0` and
+/// `target-pool/lkg` are both covered.
+const BUILD_POOL_BASENAMES: &[&str] = &["target-agent", "target-arming"];
 const BUILD_POOL_COMPONENT: &str = "target-pool";
 
 /// True iff `COORD_ORPHAN_TARGET_REAP_ENABLED` is truthy. Default OFF (dry-run).
@@ -556,8 +561,8 @@ fn pressure_pct() -> f64 {
 
 /// Who owns an enumerated path, relative to the account this process runs as.
 ///
-/// Captured during the walk from the `symlink_metadata` it already performs, so
-/// it costs no extra syscall. It exists because enumeration root 2 lives under
+/// Captured during the walk from the directory record it already reads, so it
+/// costs no extra syscall. It exists because enumeration root 2 lives under
 /// a **sticky, world-writable** `<tmp>`: unlike the workspace root, a path found
 /// there may belong to another account entirely.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -608,21 +613,17 @@ fn grace() -> Duration {
     Duration::from_secs(secs)
 }
 
-/// True iff `dir` carries a co-authoritative cargo target marker: a
-/// `CACHEDIR.TAG` (newer cargo) OR a `.rustc_info.json` (present in every cargo
-/// target root, including the many on this machine that predate / lack the tag —
-/// e.g. `_cargo-targets/<slug>`, `_targets/<slug>`, `.wt-targets/<slug>`,
-/// `cargo-target-coord-wt-<slug>` all have `.rustc_info.json + debug/` but NO
-/// tag). Either marker positively identifies a cargo build dir; a dir with
-/// neither (a real source/data dir) is never a target root.
-fn has_cargo_marker(dir: &Path) -> bool {
-    std::fs::symlink_metadata(dir.join("CACHEDIR.TAG")).is_ok()
-        || std::fs::symlink_metadata(dir.join(".rustc_info.json")).is_ok()
-}
+// `has_cargo_marker`: true iff `dir` carries a co-authoritative cargo target
+// marker (`CACHEDIR.TAG` OR `.rustc_info.json`); the shared predicate's doc
+// comment says why either marker counts.
+use crate::cargo_target_marker::has_cargo_marker;
 
 /// A cargo target root is a non-junction dir carrying a cargo marker
 /// ([`has_cargo_marker`]). `symlink_metadata` (via `is_junction`) so we never
-/// follow into a junctioned dir.
+/// follow into a junctioned dir. The walk tests the reparse bit from the entry's
+/// directory record and calls [`has_cargo_marker`] directly, so only tests use
+/// this whole-path form.
+#[cfg(test)]
 fn is_target_root(dir: &Path) -> bool {
     if is_junction(dir) {
         return false;
@@ -935,7 +936,13 @@ fn walk(dir: &Path, depth: u32, max_depth: u32, ctx: &WalkCtx, e: &mut Enumerati
             }
         };
         let path = entry.path();
-        let meta = match std::fs::symlink_metadata(&path) {
+        // The directory RECORD, not the file: `DirEntry::metadata` never
+        // follows a link (it is `lstat` on Unix) and on Windows is read from
+        // the `FindNextFile` record with no further system call. The
+        // `symlink_metadata(path)` + `is_junction(path)` it replaces opened
+        // every entry of a ~180k-directory walk twice, every 15 minutes (plan
+        // `2026-10-24-runner-git-probes-spawn-40-processes-per-second-and-fetch-into-empty-dirs` Phase 3).
+        let meta = match entry.metadata() {
             Ok(m) => m,
             Err(_) => {
                 e.entry_errors += 1;
@@ -943,11 +950,11 @@ fn walk(dir: &Path, depth: u32, max_depth: u32, ctx: &WalkCtx, e: &mut Enumerati
             }
         };
         let ft = meta.file_type();
-        if ft.is_symlink() || is_junction(&path) {
+        if ft.is_symlink() || super::census::metadata_is_reparse_point(&meta) {
             // Never followed — a junctioned target root would double-count the
             // tree behind it — but never silent either. Counted only when it
             // resolves to a DIRECTORY (`is_dir` follows the link, unlike the
-            // `symlink_metadata` above), i.e. only when it is a branch the walk
+            // directory record above), i.e. only when it is a branch the walk
             // would otherwise have descended into.
             if path.is_dir() {
                 e.reparse_dirs_skipped += 1;
@@ -967,13 +974,16 @@ fn walk(dir: &Path, depth: u32, max_depth: u32, ctx: &WalkCtx, e: &mut Enumerati
         e.dirs_visited += 1;
 
         // A target root terminates the branch — we never walk inside one.
-        if is_target_root(&path) {
+        // The entry is already proven not to be a reparse point (above), so
+        // only the cargo marker is left to read: `is_target_root` would
+        // re-open the entry to ask `is_junction` again.
+        if has_cargo_marker(&path) {
             e.candidates.push(Candidate {
                 path,
                 class: ctx.class(),
                 repo_root: ctx.repo_root(),
                 enclosing_git_unreadable: ctx.git_unreadable(),
-                // Free: `meta` is the `symlink_metadata` this loop already took.
+                // Free: `meta` is the directory record this loop already read.
                 owner: owner_of(&meta),
             });
             continue;
@@ -1154,16 +1164,72 @@ pub(super) fn newest_artifact_age(target_root: &Path) -> Option<Duration> {
 /// this; the reaper's own logging keeps the scalar form.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SizeMeasurement {
+    /// APPARENT size: the sum of every regular file's length, a hardlinked
+    /// file counted once per link (directory entries and symlinks are not
+    /// counted, so this is close to, not equal to, `du --apparent-size
+    /// --count-links`; plain `du` counts each inode once).
     pub bytes: u64,
     /// Sub-directories whose `read_dir` failed. `> 0` ⇒ `bytes` is a LOWER
     /// BOUND, and the caller must say so rather than present it as exact.
     pub unreadable_dirs: usize,
+    /// The bytes that REMOVING the directory would free: each inode counted
+    /// once, and an inode that is still linked from outside the directory
+    /// counted not at all (a pnpm `node_modules` hardlinks its packages from
+    /// the content-addressed store, so its apparent size is mostly the
+    /// store's). `None` = UNKNOWN: off unix the directory record carries no
+    /// link count and the walk does not open files to read one,
+    /// and a walk that hit an unreadable sub-directory (`unreadable_dirs > 0`)
+    /// cannot tell an outside link from one hidden in the unread part.
+    /// It is exclusive by LENGTH: a reflink/CoW clone (pnpm's `clone` import
+    /// on btrfs or APFS) has one link yet shares its extents, and a sparse
+    /// file's length exceeds its blocks, so on such files it can overstate
+    /// what removal frees.
+    /// Plan `2026-11-22-worktree-census-counts-hardlinked-pnpm-store-bytes-as-reclaimable`.
+    pub exclusive_bytes: Option<u64>,
 }
+
+/// Inodes seen with `nlink > 1`, keyed by `(dev, ino)`: `(len, nlink, seen)`.
+#[cfg(unix)]
+type SharedInodes = std::collections::HashMap<(u64, u64), (u64, u64, u64)>;
 
 /// Measure `dir` recursively, junction-safe. `None` iff `dir` itself could not
 /// be read at all — an UNKNOWN size, never a zero.
 pub(super) fn measure_dir_size(dir: &Path) -> Option<SizeMeasurement> {
-    let read = std::fs::read_dir(dir).ok()?;
+    #[cfg(unix)]
+    {
+        let mut shared = SharedInodes::new();
+        let mut unique_bytes = 0u64;
+        let mut m = measure_dir_size_walk(dir, &mut shared, &mut unique_bytes).ok()?;
+        // An inode whose every link was seen inside the tree goes with it;
+        // one with links elsewhere survives the removal and frees nothing.
+        let shared_freed = shared
+            .values()
+            .filter(|(_, nlink, seen)| seen >= nlink)
+            .fold(0u64, |acc, (len, _, _)| acc.saturating_add(*len));
+        // A partial walk cannot tell an outside link from one in the unread
+        // part, so its figure is not exact: UNKNOWN, never a lower bound
+        // presented as a measurement.
+        m.exclusive_bytes =
+            (m.unreadable_dirs == 0).then(|| unique_bytes.saturating_add(shared_freed));
+        Some(m)
+    }
+    #[cfg(not(unix))]
+    {
+        measure_dir_size_walk(dir).ok()
+    }
+}
+
+/// The recursive walk behind [`measure_dir_size`]. On unix it records each
+/// regular file's identity so the caller can compute exclusive bytes; the
+/// returned measurement's `exclusive_bytes` is left `None` for the caller.
+/// `Err` carries `dir`'s own `read_dir` failure, so a parent can tell a
+/// sub-directory that vanished from one it could not read.
+fn measure_dir_size_walk(
+    dir: &Path,
+    #[cfg(unix)] shared: &mut SharedInodes,
+    #[cfg(unix)] unique_bytes: &mut u64,
+) -> std::io::Result<SizeMeasurement> {
+    let read = std::fs::read_dir(dir)?;
     let mut m = SizeMeasurement::default();
     for entry in read {
         // An entry that errors after a successful open would otherwise be
@@ -1172,9 +1238,19 @@ pub(super) fn measure_dir_size(dir: &Path) -> Option<SizeMeasurement> {
             m.unreadable_dirs += 1;
             continue;
         };
-        let path = entry.path();
-        let meta = match std::fs::symlink_metadata(&path) {
+        // The directory record, not the file (see `walk`): this sizes every
+        // file of every candidate target and used to open each one. On Windows
+        // a record's size can lag a file that is open for writing (NTFS updates
+        // the directory entry lazily), so a target mid-build can read a little
+        // low. Sizes here feed reports, never a reap decision. On unix this is
+        // an lstat, which already carries dev/ino/nlink — no extra syscall.
+        let meta = match entry.metadata() {
             Ok(meta) => meta,
+            // Removed between `readdir` and `lstat` (a `target/` mid-build,
+            // an install in progress): it is no longer there to free, and
+            // counting it unreadable would make the whole tree's exclusivity
+            // UNKNOWN for a file that does not exist.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(_) => {
                 m.unreadable_dirs += 1;
                 continue;
@@ -1185,21 +1261,47 @@ pub(super) fn measure_dir_size(dir: &Path) -> Option<SizeMeasurement> {
             continue;
         }
         if ft.is_dir() {
-            if is_junction(&path) {
+            // Only a DIRECTORY is tested for the reparse bit, as before: a
+            // regular file can carry a non-link reparse tag (WOF compression,
+            // dedup, a cloud placeholder) and its bytes still count.
+            if super::census::metadata_is_reparse_point(&meta) {
                 continue;
             }
-            match measure_dir_size(&path) {
-                Some(child) => {
+            let path = entry.path();
+            #[cfg(unix)]
+            let child = measure_dir_size_walk(&path, shared, unique_bytes);
+            #[cfg(not(unix))]
+            let child = measure_dir_size_walk(&path);
+            match child {
+                Ok(child) => {
                     m.bytes = m.bytes.saturating_add(child.bytes);
                     m.unreadable_dirs += child.unreadable_dirs;
                 }
-                None => m.unreadable_dirs += 1,
+                // A sub-directory removed between this readdir and its own
+                // (a cargo incremental session dir mid-build) is gone, not
+                // unreadable: skip it as the lstat arm skips a vanished file.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => m.unreadable_dirs += 1,
             }
         } else if ft.is_file() {
             m.bytes = m.bytes.saturating_add(meta.len());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if meta.nlink() <= 1 {
+                    *unique_bytes = unique_bytes.saturating_add(meta.len());
+                } else {
+                    let e = shared.entry((meta.dev(), meta.ino())).or_insert((
+                        meta.len(),
+                        meta.nlink(),
+                        0,
+                    ));
+                    e.2 += 1;
+                }
+            }
         }
     }
-    Some(m)
+    Ok(m)
 }
 
 /// The reason a candidate was NOT reaped this tick (for shadow-mode logging and
@@ -1218,8 +1320,8 @@ pub enum SkipReason {
     /// **G-owner** — the worktree reclaim engine owns this path
     /// (`<worktree>/target`, `<worktree>/src-tauri/target`).
     OwnedByWorktreeReclaim,
-    /// **G-owner** — the build system owns this path (`target-agent`, or
-    /// anything under `target-pool/`).
+    /// **G-owner** — the build system owns this path (`target-agent`,
+    /// `target-arming`, or anything under `target-pool/`).
     OwnedByBuildPool,
     /// **G-ownership-unknown** — the enclosing directory's `.git` entry could
     /// not be read, so which engine (if any) owns this path is UNKNOWN. Refused,
@@ -1343,8 +1445,9 @@ impl SkipReason {
                  so the two engines cannot race."
             }
             SkipReason::OwnedByBuildPool => {
-                "The build system owns this name (`target-agent` / anything under \
-                 `target-pool/`) — the shared agent build dir or a supervisor pool slot, not \
+                "The build system owns this name (`target-agent` / `target-arming` / anything \
+                 under `target-pool/`) — the shared agent build dir, the arming prove's warm \
+                 target or a supervisor pool slot, not \
                  garbage. Matched on the path alone, so the pool is protected by what it IS \
                  rather than by where it currently happens to live."
             }
@@ -1540,7 +1643,8 @@ pub fn worktree_is_dirty(path: &Path) -> DirtyProbe {
         return DirtyProbe::Unknown;
     };
     let mut child = match crate::process_helpers::no_window("git")
-        .args(["-C", path_str, "status", "--porcelain"])
+        .args(["-C", path_str])
+        .args(super::dirty::STATUS_PORCELAIN_ALL_UNTRACKED)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -1660,7 +1764,7 @@ fn boundary_verdict(c: &Candidate, opts: &ClassifyOptions) -> Result<(), SkipRea
 
     // G-owner (build pool), evaluated on the PATH alone — the pool is protected
     // by what it IS, so no read failure anywhere can dissolve this boundary.
-    if basename == BUILD_POOL_BASENAME
+    if BUILD_POOL_BASENAMES.contains(&basename)
         || c.path
             .components()
             .any(|comp| comp.as_os_str() == BUILD_POOL_COMPONENT)
@@ -3317,6 +3421,7 @@ mod tests {
         // relied on: the gate must hold on the path alone.
         mk_target_root(&root.join("target-pool/slot-0"));
         mk_target_root(&root.join("target-agent"));
+        mk_target_root(&wt.join("target-arming"));
 
         let opts = ClassifyOptions::with_probe(Duration::ZERO, |_| DirtyProbe::Clean);
         let verdict = |name: &str| {
@@ -3332,6 +3437,11 @@ mod tests {
             "<worktree>/target belongs to the worktree reclaim engine"
         );
         assert_eq!(verdict("target-agent"), Err(SkipReason::OwnedByBuildPool));
+        assert_eq!(
+            verdict("target-arming"),
+            Err(SkipReason::OwnedByBuildPool),
+            "the arming prove's warm target is the build system's, not a renamed orphan"
+        );
         assert_eq!(
             verdict("slot-0"),
             Err(SkipReason::OwnedByBuildPool),
@@ -3369,6 +3479,10 @@ mod tests {
         let opts = ClassifyOptions::with_probe(Duration::ZERO, |_| DirtyProbe::Clean);
         assert_eq!(
             classify_candidate(&demoted(Path::new("/ws/repo-wt-x/target-agent")), &opts),
+            Err(SkipReason::OwnedByBuildPool)
+        );
+        assert_eq!(
+            classify_candidate(&demoted(Path::new("/ws/repo-wt-x/target-arming")), &opts),
             Err(SkipReason::OwnedByBuildPool)
         );
         assert_eq!(
@@ -4010,6 +4124,14 @@ mod tests {
         }
     }
 
+    /// Edge 9171555e: `status.showUntrackedFiles=no` must not blind the
+    /// reaper's dirty probe.
+    #[test]
+    fn the_production_dirty_probe_sees_an_untracked_file_hidden_by_show_untracked_no() {
+        let repo = super::super::dirty::repo_with_hidden_untracked_file();
+        assert_eq!(worktree_is_dirty(repo.path()), DirtyProbe::Dirty);
+    }
+
     /// The PRODUCTION dirty probe fails closed to `Unknown`, never to `Clean`.
     /// A directory that is not a git worktree makes `git status` exit non-zero
     /// (and a box with no `git` on PATH makes it fail to spawn) — both must land
@@ -4318,11 +4440,13 @@ mod tests {",
         let partial = render_size(Some(SizeMeasurement {
             bytes: 1_073_741_824,
             unreadable_dirs: 3,
+            exclusive_bytes: None,
         }));
         assert!(partial.contains("LOWER BOUND"), "{partial}");
         let exact = render_size(Some(SizeMeasurement {
             bytes: 2_147_483_648,
             unreadable_dirs: 0,
+            exclusive_bytes: None,
         }));
         assert_eq!(exact, "2.00 GB");
     }
@@ -5346,5 +5470,212 @@ mod tests {",
              `inode_pressure_fires_while_the_byte_axis_reads_healthy`.\n\
              --- fixture stderr ---\n{stderr}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Plan 2026-10-24-runner-git-probes-spawn-40-processes-per-second-and-
+    // fetch-into-empty-dirs, Phase 3: the walkers read the directory record.
+    // The candidates are the same by construction and the bytes differ only
+    // where a directory record lags the file, so a behaviour test cannot fail
+    // on a revert — these pin the SOURCE instead (mutation: restore a per-entry
+    // `symlink_metadata(` or `is_junction(` call and they go red).
+    // -----------------------------------------------------------------
+
+    /// The CODE of `fn <name>(` in this file's production half, with `//`
+    /// comments stripped so prose naming the old calls neither trips nor
+    /// satisfies a pin. Only `//` comments: a `/* */` comment, or a `//`
+    /// inside a string literal, is not handled — neither occurs in these
+    /// bodies today.
+    fn prod_fn_code(name: &str) -> String {
+        const SRC: &str = include_str!("orphan_target_reaper.rs");
+        let prod = SRC
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map(|(before, _)| before)
+            .unwrap_or(SRC);
+        let start = prod
+            .split_once(&format!("fn {name}("))
+            .map(|(_, after)| after)
+            .unwrap_or_else(|| panic!("fn {name} must exist; move this pin if it is renamed"));
+        let body = start.split_once("\n}\n").map(|(b, _)| b).unwrap_or(start);
+        body.lines()
+            .map(|l| l.split("//").next().unwrap_or(l))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_enumeration_walk_reads_directory_records_not_files() {
+        let code = prod_fn_code("walk");
+        assert!(
+            code.contains("entry.metadata()"),
+            "the walk must read each entry's directory record"
+        );
+        for opened in ["symlink_metadata(", "is_junction(", "is_target_root("] {
+            assert!(
+                !code.contains(opened),
+                "`{opened}` re-opens every entry of a ~180k-directory walk; read the record instead"
+            );
+        }
+    }
+
+    #[test]
+    fn the_size_walk_reads_directory_records_not_files() {
+        let walk = prod_fn_code("measure_dir_size_walk");
+        assert!(walk.contains("entry.metadata()"));
+        let entry = prod_fn_code("measure_dir_size");
+        for code in [&walk, &entry] {
+            for opened in ["symlink_metadata(", "is_junction(", "fs::metadata("] {
+                assert!(
+                    !code.contains(opened),
+                    "`{opened}` opens every file of every candidate target it sizes"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sizing_counts_files_and_skips_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.bin"), vec![0u8; 100]).unwrap();
+        std::fs::create_dir_all(root.join("sub").join("deep")).unwrap();
+        std::fs::write(root.join("sub").join("b.bin"), vec![0u8; 250]).unwrap();
+        std::fs::write(root.join("sub").join("deep").join("c.bin"), vec![0u8; 7]).unwrap();
+        // A link to a sizeable tree outside: must contribute 0.
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("big.bin"), vec![0u8; 5000]).unwrap();
+        let link = root.join("link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        #[cfg(windows)]
+        if !mklink_junction(&link, outside.path()) {
+            eprintln!("skipping: mklink /J unavailable on this host");
+            return;
+        }
+        assert!(
+            std::fs::symlink_metadata(&link).is_ok(),
+            "the link must exist, or the test proves nothing about skipping it"
+        );
+        let m = measure_dir_size(root).expect("root is readable");
+        assert_eq!(
+            m.bytes, 357,
+            "100 + 250 + 7; the linked tree is never counted"
+        );
+        assert_eq!(m.unreadable_dirs, 0);
+        #[cfg(unix)]
+        assert_eq!(
+            m.exclusive_bytes,
+            Some(357),
+            "no hardlinks: every byte is freed by removing the tree"
+        );
+        #[cfg(not(unix))]
+        assert_eq!(m.exclusive_bytes, None, "no link count off unix: UNKNOWN");
+    }
+
+    /// A walk that could not read a sub-directory reports exclusivity as
+    /// UNKNOWN: the hidden part may hold the other link of an inode it saw.
+    #[cfg(unix)]
+    #[test]
+    fn a_partial_walk_reports_exclusive_bytes_as_unknown() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("seen.bin"), vec![0u8; 10]).unwrap();
+        let locked = root.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::hard_link(root.join("seen.bin"), locked.join("other.bin")).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let readable_anyway = std::fs::read_dir(&locked).is_ok();
+        let m = measure_dir_size(root);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if readable_anyway {
+            // Running as root: permissions do not bind, nothing to observe.
+            eprintln!("SKIP a_partial_walk_reports_exclusive_bytes_as_unknown: permissions do not bind for this user");
+            return;
+        }
+        let m = m.expect("root is readable");
+        assert_eq!(m.unreadable_dirs, 1);
+        assert_eq!(
+            m.exclusive_bytes, None,
+            "a lower bound is not a measurement"
+        );
+        let full = measure_dir_size(root).expect("readable again");
+        assert_eq!(
+            full.exclusive_bytes,
+            Some(10),
+            "both links in-tree: freed once"
+        );
+    }
+
+    /// Exclusive bytes count each inode once and drop an inode still linked
+    /// from outside the tree — the shape of a pnpm `node_modules` whose
+    /// packages are hardlinked from the content-addressed store. Unlinking
+    /// the outside copy must move the figure, so a hardcoded value fails.
+    #[cfg(unix)]
+    #[test]
+    fn exclusive_bytes_dedupe_inodes_and_drop_outside_linked_files() {
+        let outside = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Linked from outside: 1000 apparent bytes, 0 freed while the store
+        // copy lives.
+        let store_copy = outside.path().join("store.bin");
+        std::fs::write(&store_copy, vec![0u8; 1000]).unwrap();
+        std::fs::create_dir(root.join("pkg")).unwrap();
+        std::fs::hard_link(&store_copy, root.join("pkg").join("store.bin")).unwrap();
+        // Unique: 30 bytes.
+        std::fs::write(root.join("unique.bin"), vec![0u8; 30]).unwrap();
+        // An in-tree pair (a cargo uplift): 200 apparent twice, freed once.
+        std::fs::write(root.join("pair-a.bin"), vec![0u8; 200]).unwrap();
+        std::fs::hard_link(root.join("pair-a.bin"), root.join("pkg").join("pair-b.bin")).unwrap();
+
+        let m = measure_dir_size(root).expect("root is readable");
+        assert_eq!(m.bytes, 1000 + 30 + 200 + 200, "apparent size, per link");
+        assert_eq!(m.exclusive_bytes, Some(30 + 200));
+
+        std::fs::remove_file(&store_copy).unwrap();
+        let m = measure_dir_size(root).expect("root is readable");
+        assert_eq!(m.bytes, 1430, "apparent size does not move");
+        assert_eq!(
+            m.exclusive_bytes,
+            Some(1000 + 30 + 200),
+            "with the outside link gone, removing the tree frees that file"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn exclusive_bytes_are_unknown_on_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.bin"), vec![0u8; 10]).unwrap();
+        let m = measure_dir_size(dir.path()).expect("root is readable");
+        assert_eq!(m.bytes, 10);
+        assert_eq!(m.exclusive_bytes, None);
+    }
+
+    /// The reparse test the walkers now apply to a directory RECORD answers
+    /// true for a junction read through `read_dir`, and false for a plain dir.
+    #[cfg(windows)]
+    #[test]
+    fn a_junctions_directory_record_carries_the_reparse_bit() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target-dir");
+        std::fs::create_dir(&target).unwrap();
+        let link = dir.path().join("jn");
+        if !mklink_junction(&link, &target) {
+            eprintln!("skipping: mklink /J unavailable on this host");
+            return;
+        }
+        let mut seen = std::collections::HashMap::new();
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let entry = entry.unwrap();
+            let meta = entry.metadata().unwrap();
+            seen.insert(
+                entry.file_name().to_string_lossy().into_owned(),
+                super::super::census::metadata_is_reparse_point(&meta),
+            );
+        }
+        assert_eq!(seen.get("jn"), Some(&true));
+        assert_eq!(seen.get("target-dir"), Some(&false));
     }
 }

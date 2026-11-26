@@ -650,6 +650,49 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
     // this door works on a windowed runner only. Step failures come back as
     // `ok: false` in the result, never as an invoke error, so read `ok` /
     // `failedStep` rather than `success`.
+    // ---- Remote-session interactivity read/resize doors (plan
+    // 2026-09-20-remote-session-interactivity-is-a-query-and-both-halves-hold,
+    // Phase C) ----
+    //
+    // The Phase C live sweep drives the remote-attach picker and a remote tab
+    // over the UI Bridge. These three commands are already registered in Tauri
+    // (`commands/fleet_sessions.rs`, `commands/remote_attach.rs`,
+    // `commands/terminal.rs`); this block only allowlists them over HTTP. All
+    // three take Tauri-managed state or run a coord round-trip through the
+    // webview's `invoke()`, so they are `Dispatch::Frontend` (a headless
+    // `QONTINUI_SERVER_MODE` runner answers 503 `SERVER_MODE_NO_WEBVIEW`). None
+    // is a PTY spawn site and none takes a path or a PTY handle other than the
+    // caller's own `terminalId`.
+    ProxyableCommand {
+        name: "fleet_sessions_list",
+        dispatch: Dispatch::Frontend,
+        description: "List the tenant's coord sessions across devices (wrapper around coord's `GET /coord/sessions/fleet`; already registered in Tauri, this entry only allowlists it over HTTP). Returns coord's body verbatim. A transport failure or non-200 from coord is an invoke error carrying the status and body, never an empty list. `args` is required (may be `{}`): all filters optional -- `deviceId`, `state`, `sessionStatus` (the work-axis status; a coord that cannot filter on it refuses with 503 `work_axis_columns_absent` or `work_axis_columns_unknown`, and an older coord may serve it unfiltered, so re-check each row's `sessionStatus`), `includeClosed` (default false), `limit`, `tenant`, and `cursor`, an OPAQUE `nextCursor` from a previous page of the SAME scope, tenant included (forwarded unchanged; coord answers 400 `cursor_scope_mismatch` otherwise). `tenant` is the tenant whose fleet to read, as a UUID: it selects the credential the read presents, because coord takes no tenant argument. A malformed tenant is refused as `fleet_sessions:tenant_invalid`, and one this device holds no credential for, or whose credential store cannot be read, as `fleet_sessions:tenant_refused`; neither sends a request. A tenant whose credential has expired is sent with none, and coord refuses it with 403 `auth_required`. A read never falls back to another tenant's credential. Omitted or blank, the runner's own authority order decides (`$QONTINUI_TENANT_ID`, then the machine pin, then the default slot when unpinned; an unresolvable pin falls back to the device JWT's tenant claim), and that order can refuse too, as `fleet_sessions:<code>`. Coord refuses a malformed or unknown filter with 400 and a stable `error` code (`unknown_state`, `unknown_session_status`, `device_id_malformed`, `limit_malformed`, `limit_not_positive`, `cursor_malformed`, `cursor_version_unsupported`), and clamps `limit` to 500, echoing the applied value. The body's `tenantId` names the tenant that answered. Default order is `started_at DESC`, not activity recency.",
+        args_schema: r#"{"type":"object","required":["args"],"properties":{"args":{"type":"object","properties":{"deviceId":{"type":["string","null"]},"state":{"type":["string","null"]},"sessionStatus":{"type":["string","null"]},"includeClosed":{"type":"boolean"},"limit":{"type":["integer","null"]},"cursor":{"type":["string","null"]},"tenant":{"type":["string","null"]}}}}}"#,
+        response_schema: r#"{"type":"object","description":"coord's /coord/sessions/fleet body, verbatim (rows plus `nextCursor` and the effective `limit`)"}"#,
+        // A real coord round-trip on every call; the startup probe would add a
+        // boot-time network read for no schema-drift benefit.
+        probe_with_empty_args: false,
+        observe_projection: None,
+    },
+    ProxyableCommand {
+        name: "terminal_remote_identities",
+        dispatch: Dispatch::Frontend,
+        description: "Return the remote identity (target device / session) of every remote-attached terminal tab, keyed by terminal id (already registered in Tauri; this entry only allowlists it over HTTP). READ-ONLY. A terminal absent from `data` is a local tab, or one that never attached remotely. This exists because `terminal_list`'s shared-schema `TerminalInfo` cannot carry the remote identity.",
+        args_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
+        response_schema: r#"{"type":"object","required":["success"],"properties":{"success":{"type":"boolean"},"message":{"type":["string","null"]},"data":{"type":"object","description":"map of terminalId -> remote identity"}}}"#,
+        probe_with_empty_args: true,
+        observe_projection: None,
+    },
+    ProxyableCommand {
+        name: "terminal_resize",
+        dispatch: Dispatch::Frontend,
+        description: "Resize an existing terminal's PTY to `cols` x `rows` (already registered in Tauri; this entry only allowlists it over HTTP). Errors with `Terminal not found: <id>` for an unknown `terminalId`. Does not create, attach or close anything.",
+        args_schema: r#"{"type":"object","required":["terminalId","cols","rows"],"properties":{"terminalId":{"type":"string"},"cols":{"type":"integer","minimum":1,"maximum":65535},"rows":{"type":"integer","minimum":1,"maximum":65535}}}"#,
+        response_schema: r#"{"type":"object","required":["success"],"properties":{"success":{"type":"boolean"},"message":{"type":["string","null"]},"data":{"type":["object","null"]}}}"#,
+        // Required args and it mutates a live PTY -- never probe it.
+        probe_with_empty_args: false,
+        observe_projection: None,
+    },
     ProxyableCommand {
         name: "create_new_project",
         dispatch: Dispatch::Frontend,
@@ -925,6 +968,70 @@ mod tests {
         assert!(!entry.probe_with_empty_args);
         let args: serde_json::Value = serde_json::from_str(entry.args_schema).unwrap();
         assert_eq!(args["required"], serde_json::json!(["req"]));
+    }
+
+    #[test]
+    fn is_allowlisted_recognizes_remote_session_interactivity_commands() {
+        for name in [
+            "fleet_sessions_list",
+            "terminal_remote_identities",
+            "terminal_resize",
+        ] {
+            assert!(is_allowlisted(name), "{name} must be allowlisted");
+            assert_eq!(dispatch_for(name), Some(Dispatch::Frontend), "{name}");
+        }
+    }
+
+    /// The published `fleet_sessions_list` schema names exactly the fields the
+    /// command reads. Nothing enforces this at the door: `FleetSessionsArgs`
+    /// ignores what it does not know, so a driver that reads the catalog would
+    /// simply never learn a field the schema omits. That is how `tenant` and
+    /// `sessionStatus` went unpublished, and without `tenant` a driver cannot
+    /// read any tenant but the device's default.
+    #[test]
+    fn fleet_sessions_list_schema_names_every_args_field() {
+        let source = include_str!("commands/fleet_sessions.rs");
+        let after = source
+            .split("pub struct FleetSessionsArgs {")
+            .nth(1)
+            .expect("FleetSessionsArgs is declared in fleet_sessions.rs");
+        let body = after.split("\n}").next().expect("struct body closes");
+        let mut fields: Vec<String> = body
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("pub "))
+            .filter_map(|l| l.split(':').next())
+            .map(|snake| {
+                let mut parts = snake.trim().split('_');
+                let head = parts.next().unwrap_or_default().to_string();
+                parts.fold(head, |acc, p| {
+                    let mut chars = p.chars();
+                    match chars.next() {
+                        Some(c) => format!("{acc}{}{}", c.to_uppercase(), chars.as_str()),
+                        None => acc,
+                    }
+                })
+            })
+            .collect();
+        fields.sort();
+        assert!(
+            fields.iter().any(|f| f == "tenant"),
+            "the field scan found nothing usable: {fields:?}"
+        );
+
+        let cmd = UI_BRIDGE_COMMANDS
+            .iter()
+            .find(|c| c.name == "fleet_sessions_list")
+            .expect("fleet_sessions_list is allowlisted");
+        let schema: serde_json::Value =
+            serde_json::from_str(cmd.args_schema).expect("args_schema is JSON");
+        let mut published: Vec<String> = schema["properties"]["args"]["properties"]
+            .as_object()
+            .expect("args.properties is an object")
+            .keys()
+            .cloned()
+            .collect();
+        published.sort();
+        assert_eq!(published, fields);
     }
 
     #[test]

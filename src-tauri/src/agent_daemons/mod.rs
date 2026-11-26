@@ -235,6 +235,7 @@ mod tests {
             token_jti: Uuid::nil(),
             token_exp: chrono::Utc::now().timestamp() + 4 * 3600,
             active_claims: Vec::new(),
+            sibling_notes: Vec::new(),
         }
     }
 
