@@ -91,6 +91,8 @@ export function externalToDiscovered(ext: ExternalElement): DiscoveredElement {
       // destroyed that distinction before it reached the runner, and inventing
       // it back would be a fabrication.
       ariaDisabled: ext.accessibility?.ariaDisabled ?? false,
+      // `aria-busy` is not on the external wire; WAI-ARIA's default is `false`.
+      ariaBusy: false,
       disabled: !ext.enabled && !(ext.accessibility?.ariaDisabled ?? false),
       focused: ext.focused,
       textContent: asScrubbed(ext.text || ext.accessibleName || ext.accessibility?.accessibleName),

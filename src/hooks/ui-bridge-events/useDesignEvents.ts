@@ -4,6 +4,7 @@ import {
   captureResponsiveSnapshots,
   captureStateVariations,
   runStyleAudit,
+  designAuditOf,
 } from "@qontinui/ui-bridge";
 import type {
   ElementDesignData,
@@ -14,13 +15,14 @@ import type {
 import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
 import type { RegisteredElement } from "./types";
 import { createLogger } from "@/lib/logger";
+import { describeThrown } from "@/lib/utils";
 
 const logger = createLogger("UIBridgeDesignEvents");
 
 /**
  * Iterates over bridge elements, resolves their DOM nodes, and collects
  * design data for each one. Shared by design_get_snapshot, design_evaluate,
- * design_evaluate_baseline, design_evaluate_diff, and design_run_audit.
+ * design_evaluate_baseline, and design_evaluate_diff.
  */
 function collectDesignData(
   elements: readonly RegisteredElement[],
@@ -235,42 +237,37 @@ export function useDesignEvents(
         }
 
         case "design_run_audit": {
-          const auditElements = currentBridge.elements;
-          const auditTargetIds =
-            payload.elementIds ?? (payload.params?.elementIds as string[] | undefined);
-
-          if (auditElements.length === 0) {
-            logger.debug("design_run_audit: no registered elements in bridge");
-          }
-
-          const auditDesignData = collectDesignData(auditElements, {
-            targetIds: auditTargetIds,
-          });
-
-          const guide =
-            payload.guide ??
-            (payload.params?.guide as StyleGuideConfig | undefined) ??
-            loadedStyleGuideRef.current;
-          if (!guide) {
+          // Answered by the SDK's shared audit (the same one the web and
+          // native transports run), so the report carries `mode`,
+          // `heuristicCoverage` and `notMeasured` like theirs. The request
+          // body is handed over untouched; the loaded guide is the fallback.
+          const auditRequest = {
+            ...(payload.params ?? {}),
+            ...(payload.elementIds ? { elementIds: payload.elementIds } : {}),
+            ...(payload.guide ? { guide: payload.guide } : {}),
+          };
+          try {
+            const report = designAuditOf(
+              currentBridge.elements,
+              auditRequest,
+              loadedStyleGuideRef.current,
+            );
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: report,
+              timestamp: Date.now(),
+            });
+          } catch (err) {
             await sendResponse({
               requestId,
               type,
               success: false,
-              error:
-                "No style guide provided or loaded. Load one with design_load_style_guide first, or pass a guide in the request.",
+              error: describeThrown(err, "design_run_audit failed"),
               timestamp: Date.now(),
             });
-            return true;
           }
-
-          const report = runStyleAudit(auditDesignData, guide);
-          await sendResponse({
-            requestId,
-            type,
-            success: true,
-            data: report,
-            timestamp: Date.now(),
-          });
           return true;
         }
 
