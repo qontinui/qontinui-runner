@@ -1415,9 +1415,10 @@ pub fn parse_line_for_agent_log(line: &str) -> Vec<AgentLogObs> {
     extract_agent_log_obs_from_assistant_record(&record)
 }
 
-/// Test-only re-export of `is_workflow_session` so the `transcript_watcher`
-/// module can apply the same first-5-lines filter without duplicating the
-/// logic. The function itself stays private to this module.
+/// Crate-visible re-export of `is_workflow_session`, so other modules apply
+/// the same first-5-lines filter without duplicating the logic: the
+/// transcript watcher's head sniff and its in-task re-check, and the session
+/// transcript tailer. The function itself stays private to this module.
 pub(crate) fn is_workflow_session_marker(content: &str) -> bool {
     is_workflow_session(content)
 }
@@ -1584,15 +1585,23 @@ pub fn get_latest_session_id(
 /// Check if a JSONL transcript belongs to a workflow-spawned session.
 ///
 /// Runner-spawned sessions (workflow generation, summarization, auto-debug) are
-/// identified by two markers:
-/// 1. A `queue-operation` record in the first line (all runner one-shot sessions)
-/// 2. `permissionMode: "bypassPermissions"` in the first user message (supervisor sessions)
+/// identified by one marker: a `queue-operation` record within the first five
+/// lines (all runner one-shot sessions).
 ///
-/// Interactive sessions never have either marker.
+/// Interactive sessions never have it in their first five records. They do
+/// write it later: an interactive transcript appends `queue-operation` records
+/// mid-file (an `enqueue`, later a `remove` or `dequeue`) for queued prompts
+/// and task notifications, so only the first five lines are evidence.
+///
+/// `permissionMode: "bypassPermissions"` is NOT a marker, though supervisor
+/// sessions carry it: an interactive session run with
+/// `--dangerously-skip-permissions` carries it too (see the body).
 fn is_workflow_session(content: &str) -> bool {
     for line in content.lines().take(5) {
         // queue-operation is the only reliable signal — runner-spawned one-shot
-        // sessions always start with this record; interactive sessions never have it.
+        // sessions always start with this record; interactive sessions never
+        // have it in their first five records (they append `queue-operation`
+        // records mid-file for queued prompts and task notifications).
         // Do NOT filter on bypassPermissions: users running Claude with
         // --dangerously-skip-permissions also have that in their permission-mode
         // record, and excluding them hides every interactive session.

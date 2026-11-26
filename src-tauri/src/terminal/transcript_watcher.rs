@@ -131,8 +131,15 @@ pub(crate) enum TailStep {
     /// Fully-terminated lines appended past the cursor, in file order, each
     /// still carrying its `\n`. Never empty. `truncated` says the file shrank
     /// since the previous step and the cursor restarted at 0 before this read
-    /// — the consumer resets any per-file prefix state.
-    Appended { bytes: String, truncated: bool },
+    /// — the consumer resets any per-file prefix state. `file_start` is the
+    /// FILE offset `bytes` begins at: the cursor this read started from,
+    /// after any truncation reset, so 0 exactly when `bytes` is the file's
+    /// head.
+    Appended {
+        bytes: String,
+        truncated: bool,
+        file_start: u64,
+    },
     /// The reader is finished; nothing more will be delivered.
     Exit(TailExit),
 }
@@ -790,10 +797,23 @@ async fn run_orchestrator(
                         }
                         ModifyAction::Revive { cursor } => {
                             // No `path_looks_like_workflow_session` sniff: the
-                            // tail passed the in-task re-check before it
-                            // parked. The cursor is carried OUT from under the
-                            // lock: if the retention sweep or a `Remove` drops
-                            // the parked entry between this decision and
+                            // file's head was judged from offset 0 before this
+                            // tail's chain began (by the `Create` / `Fresh`
+                            // sniff, startup discovery's `list_sessions`
+                            // filter, or step 6 on the chain's offset-0
+                            // batch), and a revived tail never re-judges a
+                            // mid-file batch (`HeadWorkflowCheck`). One
+                            // exception: `schedule_tail`'s moved-path arm, a
+                            // parked entry under a DIFFERENT path, opens the
+                            // event's path at EOF with no sniff, so that
+                            // path's head is judged by no one (plan
+                            // `2026-11-24-a-restarted-transcript-tail-tears-down-a-terminal-session-as-a-workflow-session`,
+                            // Risks: "One opening is judged by no one, under
+                            // A").
+                            //
+                            // The cursor is carried OUT from under the lock:
+                            // if the retention sweep or a `Remove` drops the
+                            // parked entry between this decision and
                             // `schedule_tail` re-taking the lock, the `None`
                             // arm still starts at the parked cursor rather
                             // than at EOF, so the append that woke us is not
@@ -930,6 +950,38 @@ impl SidechainTail {
     }
 }
 
+/// Step 6 of [`tail_session`]: which appended batches the workflow-session
+/// re-check judges. Exactly the batches that begin at FILE offset 0 — the
+/// file's head — whatever batch of the tail they are and however the tail
+/// started: the first batch of a tail from `TailStart::Start`, or from
+/// `TailStart::Eof` on an empty file, and the first batch after a truncation,
+/// which restarts the cursor at 0. A batch that begins anywhere else is never
+/// judged, because a mid-file record says nothing about the file.
+///
+/// Stateless: an offset-0 batch recurs only after a truncation, because the
+/// cursor otherwise only grows and an empty batch is never delivered, so the
+/// offset rule needs no judged-once latch and no truncation re-arm. The
+/// struct, `judge`'s `&mut self` and its unread `truncated` are a mutation
+/// seam (a latch, a re-arm or a start-keyed rule drops in without touching a
+/// call site), and carry no state today.
+#[derive(Debug, Default)]
+struct HeadWorkflowCheck {}
+
+impl HeadWorkflowCheck {
+    /// `true` = tear the tail down: `bytes`, one appended batch beginning at
+    /// FILE offset `file_start`, is the file's head, and its first five lines
+    /// carry the workflow marker ([`is_workflow_session_marker`] reads only
+    /// those). `truncated` (the file shrank and the cursor restarted at 0
+    /// before this batch) needs no handling of its own: such a batch begins
+    /// at offset 0, so it is judged.
+    fn judge(&mut self, file_start: u64, bytes: &str, truncated: bool) -> bool {
+        if file_start != 0 {
+            return false;
+        }
+        is_workflow_session_marker(bytes)
+    }
+}
+
 /// Cheap sniff for `is_workflow_session` without re-loading via
 /// `list_sessions`. Reads up to the first 5 lines of the file and returns true
 /// only when they carry the workflow marker. A file that cannot be opened yet
@@ -937,8 +989,8 @@ impl SidechainTail {
 /// NOT a workflow session, and both callers depend on that:
 ///
 /// - the dispatcher then schedules the tail, and the in-task re-check (step 6
-///   of [`tail_session`]) tears it down if the marker shows up after the
-///   first wake;
+///   of [`tail_session`]) tears it down if the marker shows up in the batch
+///   that begins at offset 0;
 /// - [`SidechainTail::resolve`] reads the PARENT through this function, so an
 ///   unreadable parent must not read as workflow: if it did, a parent that was
 ///   briefly unreadable at a sidechain's tail start would stop that sidechain
@@ -948,7 +1000,8 @@ fn path_looks_like_workflow_session(path: &Path) -> bool {
     let f = match std::fs::File::open(path) {
         Ok(f) => f,
         // File not yet readable → treat as not-workflow; the in-task re-check
-        // will tear down if the marker shows up later.
+        // tears down if the marker shows up in the batch that begins at
+        // offset 0.
         Err(_) => return false,
     };
     let reader = BufReader::new(f);
@@ -994,7 +1047,9 @@ async fn schedule_tail(
             if parked_path != &path {
                 // Same session id, different file (a moved transcript): the
                 // parked cursor is meaningless for the new path, so start
-                // from its end as a never-seen file would.
+                // from its end as a never-seen file would. Reached from the
+                // dispatcher's `Revive` arm, which runs no head sniff, this
+                // path's head is judged by no one (see that arm's comment).
                 debug!(
                     "transcript_watcher: parked tail for {} was at {} but the revive names {}; starting at EOF",
                     session_id,
@@ -1349,6 +1404,9 @@ impl TailReader {
                 self.file = tokio::fs::File::open(&self.path).await?;
                 continue;
             }
+            // The batch's FILE offset: where this read starts, after any
+            // truncation reset above.
+            let file_start = self.cursor;
             let mut reader = BufReader::new(&mut self.file);
             let mut bytes = String::new();
             let mut bytes_read: u64 = 0;
@@ -1385,7 +1443,11 @@ impl TailReader {
                 continue; // Only a partial line so far.
             }
             let truncated = std::mem::take(&mut self.truncated_pending);
-            return Ok(TailStep::Appended { bytes, truncated });
+            return Ok(TailStep::Appended {
+                bytes,
+                truncated,
+                file_start,
+            });
         }
     }
 }
@@ -1418,9 +1480,8 @@ async fn tail_session(
     )
     .await?;
 
-    // Buffered prefix used for the workflow-session re-check on first wake.
-    let mut workflow_check_buf = String::new();
-    let mut did_workflow_recheck = false;
+    // Which batches step 6's workflow-session re-check judges.
+    let mut head_check = HeadWorkflowCheck::default();
 
     // ── Interactive-agent log emitter (Phase 2) ───────────────────────────────
     //
@@ -1489,24 +1550,19 @@ async fn tail_session(
 
     loop {
         // ── 2–4. Wait, poll, read appended complete lines ─────────────────
-        let (bytes, truncated) = match reader.next_step().await? {
+        let (bytes, truncated, file_start) = match reader.next_step().await? {
             TailStep::Exit(exit) => return Ok(exit),
-            TailStep::Appended { bytes, truncated } => (bytes, truncated),
+            TailStep::Appended {
+                bytes,
+                truncated,
+                file_start,
+            } => (bytes, truncated, file_start),
         };
-        if truncated {
-            workflow_check_buf.clear();
-            did_workflow_recheck = false;
-        }
         let mut rows_landed = 0usize;
         // Session-repository Phase 2: the tailer gets the whole batch this
         // wake consumed (`bytes`) — ONE outbox append, one durable offset
         // reservation per wake instead of one per line.
         for line in bytes.split_inclusive('\n') {
-            // Buffer the first 5 lines for the workflow re-check.
-            if !did_workflow_recheck && workflow_check_buf.lines().count() < 5 {
-                workflow_check_buf.push_str(line);
-            }
-
             match parse_line_for_touched_files(&session_id, line) {
                 Ok(touched) => {
                     for tf in touched {
@@ -1609,72 +1665,105 @@ async fn tail_session(
             );
         }
 
-        // ── 6. Workflow-session re-check on first complete wake ───────────
-        //
-        // Creation-time discovery may race the writer: the file existed at
-        // `Create` but the `queue-operation` marker hadn't landed yet.
-        // After the first read pass we have the buffered prefix; if the
-        // marker is there, this is a workflow session — log and tear down.
-        if !did_workflow_recheck && !workflow_check_buf.is_empty() {
-            did_workflow_recheck = true;
-            if is_workflow_session_marker(&workflow_check_buf) {
-                info!(
-                    "transcript_watcher: tearing down tail for workflow session {} (detected post-creation)",
-                    session_id
-                );
-                return Ok(TailExit::WorkflowTornDown);
-            }
-        }
-
-        // ── 7. Session-repository transcript tail (Phase 2) ───────────────
-        //
-        // Deliberately AFTER the workflow re-check above: a workflow session
-        // discovered post-creation returns without ever handing bytes to the
-        // tailer, so the runner's own workflow transcripts keep exactly one
-        // emitter (the executor's `TranscriptEmitter::emit` call sites) rather
-        // than gaining a second, differently-chunked one here.
-        //
-        // The session id is the JSONL stem — the pane's
-        // `claude_code_session_id`, which is exactly the key the registrar's
-        // R4 index resolves for the `terminal_claude` plane. Best-effort and
-        // synchronous: the tailer's whole write path is a bounded local append
-        // that swallows its own errors, so it cannot fail or stall this loop.
-        //
-        // The batch's FILE offset rides along (the reader's cursor has already
-        // advanced past exactly `bytes`), so the tailer can place it against
-        // the session's file mark and never re-emit bytes a
-        // `POST /sessions/transcript-bind` replay already carried.
-        //
-        // Two-step so this async loop never blocks on the tailer's session
-        // lock: `try_emit_batch` handles the common case (lock free, batch at
-        // the mark) inline — the same bounded local append this loop has
-        // always done synchronously — and returns false having done NOTHING
-        // otherwise. Only then does the batch go to a blocking thread, and it
-        // is AWAITED, so this tail's batches stay in file order and none is
-        // dropped for contention. The fallback runs only while a
-        // `/sessions/transcript-bind` replay holds the lock or a gap/rewrite
-        // needs the file read, so it adds no steady-state blocking-pool load
-        // (the per-wake fan-out that `commit_report`'s bounded queue exists to
-        // prevent).
-        if let Some(t) = tailer.as_ref() {
-            let file_start = reader.cursor().saturating_sub(bytes.len() as u64);
-            hand_batch_to_tailer(
-                t,
-                &session_id,
-                &path,
-                sidechain.as_ref(),
-                file_start,
-                &bytes,
-                truncated,
-            )
-            .await;
+        // ── 6–7. Workflow re-check, then the session-repository tail ──────
+        if let Some(exit) = settle_batch(
+            &mut head_check,
+            tailer.as_ref(),
+            &session_id,
+            &path,
+            sidechain.as_ref(),
+            file_start,
+            &bytes,
+            truncated,
+        )
+        .await
+        {
+            return Ok(exit);
         }
     }
 }
 
-/// Step 7 of [`tail_session`]: hand one appended batch of `path` (keyed
-/// `session_id`, starting at FILE offset `file_start`) to the session tailer,
-/// then the emit / withhold two-step. For a session transcript that is the
+/// Steps 6 and 7 of [`tail_session`] for one appended batch of `path` (keyed
+/// `session_id`, starting at FILE offset `file_start`): the workflow-session
+/// re-check, then the hand-off to the session tailer. `Some(exit)` = the tail
+/// returns it. ONE function because the ORDER is the contract — a batch the
+/// re-check tears down never reaches the tailer, and a batch it keeps always
+/// does — so a test drives both steps together, on a batch a real
+/// [`TailReader`] read, without the `AppHandle` / `PgDb` the rest of the loop
+/// needs.
+#[allow(clippy::too_many_arguments)]
+async fn settle_batch(
+    check: &mut HeadWorkflowCheck,
+    tailer: Option<&Arc<SessionTranscriptTailer>>,
+    session_id: &str,
+    path: &Path,
+    sidechain: Option<&SidechainTail>,
+    file_start: u64,
+    bytes: &str,
+    truncated: bool,
+) -> Option<TailExit> {
+    // ── 6. Workflow-session re-check of the file's head ───────────────────
+    //
+    // Creation-time discovery may race the writer: the file existed at
+    // `Create` but the `queue-operation` marker hadn't landed yet, and the
+    // tail started at offset 0. So a batch that begins at FILE offset 0 — the
+    // file's head — is judged here: if its first lines carry the marker, this
+    // is a workflow session; log and tear down. A batch that begins anywhere
+    // else is never judged. A mid-file record says nothing about the file: an
+    // interactive transcript appends `queue-operation` records mid-file (an
+    // `enqueue`, later a `remove` or `dequeue`) for queued prompts and task
+    // notifications. And a tail that opens mid-file (revived at its parked
+    // cursor, or started at EOF) had the head judged from offset 0 by
+    // whatever scheduled it — except `schedule_tail`'s moved-path arm, a
+    // revive onto a different path for the same session id, which opens at
+    // EOF with no sniff, so that path's head is judged by no one (the plan's
+    // Risks; see the dispatcher's `Revive` arm).
+    if check.judge(file_start, bytes, truncated) {
+        info!(
+            "transcript_watcher: tearing down tail for workflow session {} (detected post-creation)",
+            session_id
+        );
+        return Some(TailExit::WorkflowTornDown);
+    }
+
+    // ── 7. Session-repository transcript tail (Phase 2) ───────────────────
+    //
+    // Deliberately AFTER the workflow re-check above: a workflow session
+    // discovered post-creation returns without ever handing bytes to the
+    // tailer, so the runner's own workflow transcripts keep exactly one
+    // emitter (the executor's `TranscriptEmitter::emit` call sites) rather
+    // than gaining a second, differently-chunked one here.
+    //
+    // The session id is the JSONL stem — the pane's
+    // `claude_code_session_id`, which is exactly the key the registrar's
+    // R4 index resolves for the `terminal_claude` plane. Best-effort and
+    // synchronous: the tailer's whole write path is a bounded local append
+    // that swallows its own errors, so it cannot fail or stall this loop.
+    //
+    // The batch's FILE offset rides along, so the tailer can place it against
+    // the session's file mark and never re-emit bytes a
+    // `POST /sessions/transcript-bind` replay already carried.
+    //
+    // Two-step so this async loop never blocks on the tailer's session
+    // lock: `try_emit_batch` handles the common case (lock free, batch at
+    // the mark) inline — the same bounded local append this loop has
+    // always done synchronously — and returns false having done NOTHING
+    // otherwise. Only then does the batch go to a blocking thread, and it
+    // is AWAITED, so this tail's batches stay in file order and none is
+    // dropped for contention. The fallback runs only while a
+    // `/sessions/transcript-bind` replay holds the lock or a gap/rewrite
+    // needs the file read, so it adds no steady-state blocking-pool load
+    // (the per-wake fan-out that `commit_report`'s bounded queue exists to
+    // prevent).
+    if let Some(t) = tailer {
+        hand_batch_to_tailer(t, session_id, path, sidechain, file_start, bytes, truncated).await;
+    }
+    None
+}
+
+/// Step 7 of [`tail_session`], run by [`settle_batch`]: hand one appended
+/// batch of `path` (keyed `session_id`, starting at FILE offset `file_start`)
+/// to the session tailer, then the emit / withhold two-step. For a session transcript that is the
 /// bind retry and `admit` (liveness heartbeat + Gate 1 + coverage). For a
 /// subagent `sidechain` it is the PARENT's bind retry and liveness note, then
 /// `admit_sidechain` under the sidechain's own key. Its own function so the
@@ -2168,6 +2257,7 @@ mod tests {
             TailStep::Appended {
                 bytes: ASSISTANT_LINE.to_string(),
                 truncated: false,
+                file_start: initial_len,
             },
             "exactly the appended line: not re-read from 0, not skipped past"
         );
@@ -2188,6 +2278,8 @@ mod tests {
     struct SidechainFixture {
         _dir: tempfile::TempDir,
         parent: String,
+        /// The parent session's own transcript, `<cwd>/<parent>.jsonl`.
+        parent_path: PathBuf,
         sidechain: PathBuf,
         tailer: Arc<SessionTranscriptTailer>,
         registrar: Arc<AiCoordRegistrar>,
@@ -2203,11 +2295,8 @@ mod tests {
         let parent = uuid::Uuid::new_v4().to_string();
         let cwd = dir.path().join(".claude/projects/-home-u-proj");
         std::fs::create_dir_all(cwd.join(&parent).join("subagents")).unwrap();
-        std::fs::write(
-            cwd.join(format!("{parent}.jsonl")),
-            format!("{parent_first_line}{USER_LINE}"),
-        )
-        .unwrap();
+        let parent_path = cwd.join(format!("{parent}.jsonl"));
+        std::fs::write(&parent_path, format!("{parent_first_line}{USER_LINE}")).unwrap();
         let sidechain = cwd.join(&parent).join("subagents/agent-x.jsonl");
         std::fs::write(&sidechain, USER_LINE).unwrap();
         let outbox = Arc::new(OutboxWriter::open(dir.path().join("outbox.jsonl")).unwrap());
@@ -2226,6 +2315,7 @@ mod tests {
         SidechainFixture {
             _dir: dir,
             parent,
+            parent_path,
             sidechain,
             tailer,
             registrar,
@@ -2259,25 +2349,38 @@ mod tests {
             .count()
     }
 
-    /// Append one line to `path` and read it back through a `TailReader`
-    /// opened the way `tail_session` opens it: `(bytes, truncated, file_start)`.
-    async fn tailed_append(path: &Path) -> (String, bool, u64) {
-        let mut reader = open_reader(path, TailStart::Eof, Duration::ZERO).await;
-        {
-            use std::io::Write;
-            let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
-            f.write_all(ASSISTANT_LINE.as_bytes()).unwrap();
-            f.flush().unwrap();
-        }
+    /// Append `text` to `path` in one write.
+    fn append(path: &Path, text: &str) {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        f.write_all(text.as_bytes()).unwrap();
+        f.flush().unwrap();
+    }
+
+    /// The reader's next batch, exactly as `tail_session` takes it from the
+    /// step: `(bytes, truncated, file_start)`.
+    async fn next_batch(reader: &mut TailReader) -> (String, bool, u64) {
         let step = tokio::time::timeout(Duration::from_secs(3), reader.next_step())
             .await
-            .expect("the sidechain tail must deliver within 3 s")
+            .expect("the tail must deliver within 3 s")
             .unwrap();
-        let TailStep::Appended { bytes, truncated } = step else {
+        let TailStep::Appended {
+            bytes,
+            truncated,
+            file_start,
+        } = step
+        else {
             panic!("expected an append, got {step:?}");
         };
-        let file_start = reader.cursor().saturating_sub(bytes.len() as u64);
         (bytes, truncated, file_start)
+    }
+
+    /// Open a `TailReader` on `path` at `start` the way `schedule_tail` would,
+    /// append `line`, and read it back: `(bytes, truncated, file_start)`.
+    async fn tailed_append(path: &Path, start: TailStart, line: &str) -> (String, bool, u64) {
+        let mut reader = open_reader(path, start, Duration::ZERO).await;
+        append(path, line);
+        next_batch(&mut reader).await
     }
 
     /// The dispatcher delivers a subagent sidechain to a tail keyed by its
@@ -2336,7 +2439,8 @@ mod tests {
         let key = tail_key_for_event_path(&fx.sidechain).expect("dispatcher key");
         let sidechain = SidechainTail::resolve(&fx.sidechain);
         assert!(sidechain.is_some(), "the tail recognises its sidechain");
-        let (bytes, truncated, file_start) = tailed_append(&fx.sidechain).await;
+        let (bytes, truncated, file_start) =
+            tailed_append(&fx.sidechain, TailStart::Eof, ASSISTANT_LINE).await;
         for _ in 0..2 {
             // Two batches inside one window: one heartbeat.
             hand_batch_to_tailer(
@@ -2387,7 +2491,8 @@ mod tests {
         let fx = sidechain_fixture("");
         let key = "agent-x"; // the dispatcher's key: see the dispatcher test
         let sidechain = SidechainTail::resolve(&fx.sidechain);
-        let (bytes, truncated, file_start) = tailed_append(&fx.sidechain).await;
+        let (bytes, truncated, file_start) =
+            tailed_append(&fx.sidechain, TailStart::Eof, ASSISTANT_LINE).await;
         hand_batch_to_tailer(
             &fx.tailer,
             key,
@@ -2439,7 +2544,8 @@ mod tests {
 
         let key = "agent-x"; // the dispatcher's key: see the dispatcher test
         let sidechain = SidechainTail::resolve(&fx.sidechain);
-        let (bytes, truncated, file_start) = tailed_append(&fx.sidechain).await;
+        let (bytes, truncated, file_start) =
+            tailed_append(&fx.sidechain, TailStart::Eof, ASSISTANT_LINE).await;
         hand_batch_to_tailer(
             &fx.tailer,
             key,
@@ -2458,6 +2564,324 @@ mod tests {
         );
         assert_eq!(fx.tailer.coverage().sidechain_heartbeats, 0);
         assert!(sidechain.is_some_and(|sc| sc.owner_is_workflow));
+    }
+
+    // ── Step 6 judges the file's head, not a restarted tail's first batch
+    // (plan `2026-11-24-a-restarted-transcript-tail-tears-down-a-terminal-session-as-a-workflow-session`)
+
+    /// A task-notification `queue-operation` record of session `sid`, as
+    /// Claude Code appends one MID-FILE to an interactive transcript while the
+    /// session waits on a background task (an `enqueue`, later a `remove` or
+    /// `dequeue`).
+    fn queue_operation(sid: &str, operation: &str, timestamp: &str) -> String {
+        let mut line = format!(
+            r#"{{"type":"queue-operation","operation":"{operation}","timestamp":"{timestamp}","sessionId":"{sid}","content":"<task-notification>\n<task-id>b0</task-id>\n</task-notification>"}}"#
+        );
+        line.push('\n');
+        line
+    }
+
+    /// Settle one batch of the fixture's PARENT transcript as `tail_session`
+    /// does: `settle_batch` under the dispatcher's key for the path, with the
+    /// sidechain resolution the tail makes (none, for a session transcript).
+    async fn settle_parent(
+        fx: &SidechainFixture,
+        check: &mut HeadWorkflowCheck,
+        batch: &(String, bool, u64),
+    ) -> Option<TailExit> {
+        let (bytes, truncated, file_start) = batch;
+        let key = tail_key_for_event_path(&fx.parent_path).expect("dispatcher key");
+        let sidechain = SidechainTail::resolve(&fx.parent_path);
+        settle_batch(
+            check,
+            Some(&fx.tailer),
+            &key,
+            &fx.parent_path,
+            sidechain.as_ref(),
+            *file_start,
+            bytes,
+            *truncated,
+        )
+        .await
+    }
+
+    /// The parent's Heartbeat rows for its bound coord id.
+    fn heartbeats(fx: &SidechainFixture, coord: uuid::Uuid) -> usize {
+        rows_for(
+            &fx.outbox,
+            coord,
+            crate::session::SessionEventKind::Heartbeat,
+        )
+    }
+
+    /// Batches the session tailer admitted for emission (a bound key, Gate 1
+    /// open), counted per batch with no throttle — unlike the heartbeat, which
+    /// a key sends at most once per 60 s.
+    fn admitted(fx: &SidechainFixture) -> u64 {
+        fx.tailer.coverage().appends_emitted
+    }
+
+    /// A tail revived from its parked cursor (`TailStart::At`, the start
+    /// `schedule_tail` gives a `Revive`) whose first batch is a task
+    /// notification's `enqueue` record. The file's head is interactive, so
+    /// the batch is kept and its append heartbeats the bound session.
+    #[tokio::test]
+    async fn a_revived_tail_whose_first_line_is_a_queue_operation_enqueue_is_not_torn_down_and_heartbeats(
+    ) {
+        use crate::egress::test_support::pin;
+        use crate::egress::{Flow, Level};
+        let _ambient = crate::test_env::isolated_ambient();
+        let _sync_on = pin(Flow::TranscriptSync, Level::On);
+        let fx = sidechain_fixture(""); // the head is `USER_LINE`: interactive
+        let coord = registered(|| {
+            fx.registrar
+                .register_sniffed_session(&fx.parent, "Terminal 1", None)
+        });
+        let before = heartbeats(&fx, coord);
+
+        let parked = std::fs::metadata(&fx.parent_path).unwrap().len();
+        let enqueue = queue_operation(&fx.parent, "enqueue", "2026-11-23T11:12:11.848Z");
+        let batch = tailed_append(&fx.parent_path, TailStart::At(parked), &enqueue).await;
+        assert_eq!(
+            batch,
+            (enqueue.clone(), false, parked),
+            "the revived tail's first batch is the append alone, mid-file"
+        );
+
+        let mut check = HeadWorkflowCheck::default();
+        assert_eq!(
+            settle_parent(&fx, &mut check, &batch).await,
+            None,
+            "a mid-file queue-operation says nothing about the file's head"
+        );
+        assert_eq!(
+            heartbeats(&fx, coord) - before,
+            1,
+            "the kept append heartbeats the bound session"
+        );
+    }
+
+    /// The same for a tail started at EOF (startup discovery and the
+    /// dispatcher's `Fresh` arm), whose first batch is a `remove` record.
+    #[tokio::test]
+    async fn an_eof_started_tail_whose_first_line_is_a_queue_operation_remove_is_not_torn_down_and_heartbeats(
+    ) {
+        use crate::egress::test_support::pin;
+        use crate::egress::{Flow, Level};
+        let _ambient = crate::test_env::isolated_ambient();
+        let _sync_on = pin(Flow::TranscriptSync, Level::On);
+        let fx = sidechain_fixture(""); // the head is `USER_LINE`: interactive
+        let coord = registered(|| {
+            fx.registrar
+                .register_sniffed_session(&fx.parent, "Terminal 1", None)
+        });
+        let before = heartbeats(&fx, coord);
+
+        let eof = std::fs::metadata(&fx.parent_path).unwrap().len();
+        let remove = queue_operation(&fx.parent, "remove", "2026-11-23T11:13:43.497Z");
+        let batch = tailed_append(&fx.parent_path, TailStart::Eof, &remove).await;
+        assert_eq!(
+            batch,
+            (remove.clone(), false, eof),
+            "the EOF-started tail's first batch is the append alone, mid-file"
+        );
+
+        let mut check = HeadWorkflowCheck::default();
+        assert_eq!(
+            settle_parent(&fx, &mut check, &batch).await,
+            None,
+            "a mid-file queue-operation says nothing about the file's head"
+        );
+        assert_eq!(
+            heartbeats(&fx, coord) - before,
+            1,
+            "the kept append heartbeats the bound session"
+        );
+    }
+
+    /// The creation race step 6 exists for: the `Create` sniff found the file
+    /// empty, the tail started at offset 0, and the writer then flushed a
+    /// workflow head. That batch is torn down before it reaches the tailer,
+    /// so even a bound key gets no heartbeat from it.
+    #[tokio::test]
+    async fn a_tail_from_offset_zero_whose_head_carries_the_marker_is_still_torn_down() {
+        use crate::egress::test_support::pin;
+        use crate::egress::{Flow, Level};
+        let _ambient = crate::test_env::isolated_ambient();
+        let _sync_on = pin(Flow::TranscriptSync, Level::On);
+        let fx = sidechain_fixture("");
+        std::fs::write(&fx.parent_path, "").unwrap(); // the file as `Create` saw it
+        let coord = registered(|| {
+            fx.registrar
+                .register_sniffed_session(&fx.parent, "Terminal 1", None)
+        });
+        let before = heartbeats(&fx, coord);
+
+        let head = format!(
+            "{}{USER_LINE}",
+            queue_operation(&fx.parent, "enqueue", "2026-11-23T11:00:00.000Z")
+        );
+        let batch = tailed_append(&fx.parent_path, TailStart::Start, &head).await;
+        assert_eq!(batch, (head.clone(), false, 0), "the head, at offset 0");
+
+        let mut check = HeadWorkflowCheck::default();
+        assert_eq!(
+            settle_parent(&fx, &mut check, &batch).await,
+            Some(TailExit::WorkflowTornDown),
+            "a workflow head read from offset 0 is torn down"
+        );
+        assert_eq!(
+            heartbeats(&fx, coord) - before,
+            0,
+            "a torn-down batch never reaches the tailer, though the key is bound"
+        );
+    }
+
+    /// A tail that judged an interactive head from offset 0, whose file is
+    /// then rewritten (shorter) to a workflow head: the truncation restarts
+    /// the cursor at 0, and that batch is judged and torn down.
+    #[tokio::test]
+    async fn a_tail_whose_file_is_rewritten_to_a_workflow_head_is_torn_down() {
+        use crate::egress::test_support::pin;
+        use crate::egress::{Flow, Level};
+        let _ambient = crate::test_env::isolated_ambient();
+        let _sync_on = pin(Flow::TranscriptSync, Level::On);
+        let fx = sidechain_fixture("");
+        std::fs::write(&fx.parent_path, "").unwrap();
+        let _coord = registered(|| {
+            fx.registrar
+                .register_sniffed_session(&fx.parent, "Terminal 1", None)
+        });
+
+        let mut reader = open_reader(&fx.parent_path, TailStart::Start, Duration::ZERO).await;
+        let head = format!("{USER_LINE}{ASSISTANT_LINE}");
+        append(&fx.parent_path, &head);
+        let first = next_batch(&mut reader).await;
+        assert_eq!(first, (head.clone(), false, 0), "the interactive head");
+        let mut check = HeadWorkflowCheck::default();
+        assert_eq!(
+            settle_parent(&fx, &mut check, &first).await,
+            None,
+            "an interactive head read from offset 0 is judged and kept"
+        );
+
+        let rewritten = queue_operation(&fx.parent, "enqueue", "2026-11-23T11:12:11.848Z");
+        assert!(
+            (rewritten.len() as u64) < reader.cursor(),
+            "precondition: the rewrite ({} bytes) is shorter than what was read ({}), so the reader sees a truncation",
+            rewritten.len(),
+            reader.cursor()
+        );
+        std::fs::write(&fx.parent_path, &rewritten).unwrap();
+        let second = next_batch(&mut reader).await;
+        assert_eq!(
+            second,
+            (rewritten.clone(), true, 0),
+            "the next step reports a truncation, at offset 0"
+        );
+        assert_eq!(
+            settle_parent(&fx, &mut check, &second).await,
+            Some(TailExit::WorkflowTornDown),
+            "the rewritten file's head carries the marker"
+        );
+    }
+
+    /// `HeadWorkflowCheck` on its own: only a batch that begins at FILE
+    /// offset 0 is the file's head, whatever batch of the tail it is.
+    #[test]
+    fn head_workflow_check_judges_only_an_offset_zero_batch() {
+        let sid = "7e0b5d6a-9b8e-4f2c-a3d1-c1d9f0e7a2b4";
+        let interactive = format!("{USER_LINE}{ASSISTANT_LINE}");
+        let enqueue = queue_operation(sid, "enqueue", "2026-11-23T11:12:11.848Z");
+        let workflow_head = format!("{enqueue}{USER_LINE}");
+
+        let mut check = HeadWorkflowCheck::default();
+        assert!(
+            !check.judge(0, &interactive, false),
+            "an interactive head at offset 0"
+        );
+        assert!(
+            !check.judge(900, &enqueue, false),
+            "a later enqueue at offset 900"
+        );
+
+        let mut fresh = HeadWorkflowCheck::default();
+        assert!(
+            !fresh.judge(900, &enqueue, false),
+            "a fresh check's first batch, an enqueue at offset 900"
+        );
+        assert!(
+            fresh.judge(0, &workflow_head, true),
+            "a truncation's offset-0 batch carrying the marker"
+        );
+    }
+
+    /// A tail revived from its parked cursor whose file is then rewritten
+    /// (shorter) to a workflow head: its first batch was mid-file, and the
+    /// truncation's batch begins at offset 0, so it is judged and torn down.
+    /// A rule keyed on `TailStart::Start` would never judge this tail.
+    #[tokio::test]
+    async fn a_revived_tail_whose_file_is_rewritten_to_a_workflow_head_is_torn_down() {
+        use crate::egress::test_support::pin;
+        use crate::egress::{Flow, Level};
+        let _ambient = crate::test_env::isolated_ambient();
+        let _sync_on = pin(Flow::TranscriptSync, Level::On);
+        let fx = sidechain_fixture(""); // the head is `USER_LINE`: interactive
+        let _coord = registered(|| {
+            fx.registrar
+                .register_sniffed_session(&fx.parent, "Terminal 1", None)
+        });
+
+        let parked = std::fs::metadata(&fx.parent_path).unwrap().len();
+        let mut reader = open_reader(&fx.parent_path, TailStart::At(parked), Duration::ZERO).await;
+        append(&fx.parent_path, ASSISTANT_LINE);
+        let first = next_batch(&mut reader).await;
+        assert_eq!(
+            first,
+            (ASSISTANT_LINE.to_string(), false, parked),
+            "an interactive append, mid-file"
+        );
+        let mut check = HeadWorkflowCheck::default();
+        let before = admitted(&fx);
+        assert_eq!(
+            settle_parent(&fx, &mut check, &first).await,
+            None,
+            "an interactive append is kept"
+        );
+        assert_eq!(
+            admitted(&fx) - before,
+            1,
+            "a kept batch is admitted to the tailer, so the count read below moves for a batch that reaches it"
+        );
+
+        let rewritten = queue_operation(&fx.parent, "enqueue", "2026-11-23T11:12:11.848Z");
+        assert!(
+            (rewritten.len() as u64) < reader.cursor(),
+            "precondition: the rewrite ({} bytes) is shorter than what was read ({}), so the reader sees a truncation",
+            rewritten.len(),
+            reader.cursor()
+        );
+        std::fs::write(&fx.parent_path, &rewritten).unwrap();
+        let second = next_batch(&mut reader).await;
+        assert_eq!(
+            second,
+            (rewritten.clone(), true, 0),
+            "the next step reports a truncation, at offset 0"
+        );
+        // Not the heartbeat: the kept first batch already took the parent's
+        // 60 s heartbeat slot, so a batch wrongly handed to the tailer would
+        // record none either. The admitted-batch count is not throttled.
+        let before = admitted(&fx);
+        assert_eq!(
+            settle_parent(&fx, &mut check, &second).await,
+            Some(TailExit::WorkflowTornDown),
+            "the rewritten file's head carries the marker"
+        );
+        assert_eq!(
+            admitted(&fx) - before,
+            0,
+            "a torn-down batch never reaches the tailer"
+        );
     }
 
     #[tokio::test]
@@ -2507,7 +2931,8 @@ mod tests {
             step,
             TailStep::Appended {
                 bytes: ASSISTANT_LINE.to_string(),
-                truncated: false
+                truncated: false,
+                file_start: USER_LINE.len() as u64,
             }
         );
         assert!(
@@ -2555,7 +2980,8 @@ mod tests {
             step,
             TailStep::Appended {
                 bytes: USER_LINE.to_string(),
-                truncated: false
+                truncated: false,
+                file_start: 0,
             },
             "only the fully-terminated line is delivered"
         );
@@ -2680,7 +3106,8 @@ mod tests {
             step,
             TailStep::Appended {
                 bytes: USER_LINE.to_string(),
-                truncated: true
+                truncated: true,
+                file_start: 0,
             }
         );
         assert_eq!(reader.cursor(), USER_LINE.len() as u64);
