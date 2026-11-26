@@ -142,7 +142,10 @@ fn runner_by_name_spawn_keys_match_the_contract_in_both_directions() {
 #[test]
 fn the_scan_sees_the_known_sites() {
     let sources = load_sources();
-    let literals: BTreeSet<String> = literal_sites(&sources).into_iter().map(|(_, k)| k).collect();
+    let literals: BTreeSet<String> = literal_sites(&sources)
+        .into_iter()
+        .map(|(_, k)| k)
+        .collect();
     assert!(literals.contains("runner-instance"), "{literals:?}");
     assert!(literals.contains("orchestration-fix-agent"), "{literals:?}");
     assert_eq!(
