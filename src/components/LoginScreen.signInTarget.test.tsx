@@ -333,4 +333,31 @@ describe("LoginScreen unbounded sign-in target (gate surface)", () => {
     await settle();
     expect(calls("cognito_sign_in")).toHaveLength(1);
   });
+  it("editing the password while 'Retry and sign in' is reading drops the retry's result: the stale credentials are never sent", async () => {
+    let resolveRead!: (v: unknown) => void;
+    statusReplies = [
+      new Error("ipc down"),
+      new Error("ipc down"),
+      new Promise((r) => {
+        resolveRead = r;
+      }),
+    ];
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "get_web_integration_status") {
+        const reply = statusReplies.shift();
+        if (reply instanceof Promise) return reply;
+        return reply instanceof Error ? Promise.reject(reply) : Promise.resolve(reply ?? REMOTE);
+      }
+      return Promise.resolve(null);
+    });
+    await render();
+    await submitPassword("op@example.test", "hunter2");
+    await click("#signin-fallback-retry");
+    expect(q("#signin-fallback-retry")!.textContent).toBe("Reading…");
+    typeInto("#password", "hunter3");
+    await act(async () => resolveRead(REMOTE));
+    await settle();
+    expect(calls("cognito_sign_in_password")).toHaveLength(0);
+    expect(q("#signin-fallback-notice")).toBeNull();
+  });
 });

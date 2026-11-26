@@ -15,7 +15,7 @@
  *     new decision's reason.
  */
 
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 
 import {
   PRODUCTION_BACKEND_URL,
@@ -44,12 +44,20 @@ export function useGateSignInFallback<A>(
 ): GateSignInFallbackState<A> {
   const [fallback, setFallback] = useState<GateSignInFallback<A> | null>(null);
   const [reading, setReading] = useState(false);
+  // Bumped by every withhold/clear. A retry whose read straddles a bump (the
+  // operator edited the held credentials, or a new sign-in replaced the held
+  // one) drops its result instead of running a stale action.
+  const generation = useRef(0);
 
   const withhold = useCallback((decision: SignInDecision, action: A) => {
+    generation.current += 1;
     setFallback({ decision, action });
   }, []);
 
-  const clear = useCallback(() => setFallback(null), []);
+  const clear = useCallback(() => {
+    generation.current += 1;
+    setFallback(null);
+  }, []);
 
   const signInToProduction = useCallback(async () => {
     if (fallback === null || reading) return;
@@ -60,6 +68,7 @@ export function useGateSignInFallback<A>(
   const retry = useCallback(async () => {
     if (fallback === null || reading) return;
     const { action } = fallback;
+    const issuedAt = generation.current;
     setReading(true);
     let decision: SignInDecision;
     try {
@@ -67,6 +76,7 @@ export function useGateSignInFallback<A>(
     } finally {
       setReading(false);
     }
+    if (generation.current !== issuedAt) return;
     if (!decision.bounded) {
       setFallback({ decision, action });
       return;
