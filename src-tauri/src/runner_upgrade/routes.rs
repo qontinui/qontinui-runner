@@ -3,9 +3,10 @@
 //! Phase 5):
 //!
 //! - `GET /runner/upgrade/preflight?candidate=<abs dir>[&rollback=true]` —
-//!   the verdict, every check with its detail. Always `200` with the verdict
-//!   in the body (`ok`, `verdict`, `blocking`); `400` only for a request that
-//!   names no candidate. It RUNS the candidate's binaries (`--provenance`,
+//!   the verdict, every check with its detail. `200` with the verdict in the
+//!   body (`ok`, `verdict`, `blocking`) whenever one was reached; `400` for a
+//!   request that names no candidate, `503` when the facts the verdict needs
+//!   could not be gathered. It never rehomes a session (the POST does). It RUNS the candidate's binaries (`--provenance`,
 //!   `--protocol-versions`), so it is a credential door.
 //! - `POST /runner/upgrade {"candidate", "rollback"?, "guardUnit"?,
 //!   "guardDelaySecs"?}` — re-runs the preflight and refuses with `409` and the
@@ -103,6 +104,7 @@ async fn get_preflight(
         &state,
         PathBuf::from(candidate),
         q.rollback.unwrap_or(false),
+        false,
     )
     .await
     .map_err(|e| refusal(StatusCode::SERVICE_UNAVAILABLE, e, None))?;
@@ -181,6 +183,7 @@ async fn run_upgrade(
         state,
         PathBuf::from(&req.candidate),
         req.rollback.unwrap_or(false),
+        true,
     )
     .await
     .map_err(|e| refusal(StatusCode::SERVICE_UNAVAILABLE, e, None))?;
@@ -260,10 +263,14 @@ async fn run_upgrade(
 }
 
 /// Gather every input and run the preflight.
+/// Gather the preflight's facts and evaluate them. `rehome` runs the rehome
+/// step (Phase 5b ends and resumes sessions there), so only the upgrade POST
+/// passes `true`; the GET preflight reports what a rehome WOULD face instead.
 pub async fn gather(
     state: &Arc<ApiState>,
     candidate: PathBuf,
     rollback: bool,
+    rehome: bool,
 ) -> Result<PreflightReport, String> {
     use tauri::Manager;
     let layout = Layout::resolve()?;
@@ -281,6 +288,13 @@ pub async fn gather(
     let readiness = crate::mcp::restart_readiness::compute_restart_readiness(state).await;
     let mut census = preflight::census_facts(&readiness, &config_dir_of);
     let rehome = match &census {
+        Ok(c) if !rehome && !c.dies_with_runner.is_empty() => RehomeOutcome::Unavailable {
+            reason: format!(
+                "{} session(s) outside a holder; the read-only preflight does not rehome them (the upgrade POST does)",
+                c.dies_with_runner.len()
+            ),
+        },
+        Ok(_) if !rehome => RehomeOutcome::NothingToRehome,
         Ok(c) => rehome::rehome(rehome::active_rehomer().as_ref(), &c.dies_with_runner).await,
         Err(_) => RehomeOutcome::NothingToRehome,
     };
@@ -304,6 +318,7 @@ pub async fn gather(
     let systemd_unit = sys::own_systemd_user_unit();
     let self_managed_fds = super::listener_fds::registered().len();
     let checked_at = super::record::rfc3339(chrono::Utc::now());
+    let open_upgrades = super::record::open_upgrade_ids(&sys::upgrades_dir());
     tokio::task::spawn_blocking(move || {
         preflight::evaluate(
             PreflightInputs {
@@ -317,6 +332,7 @@ pub async fn gather(
                 systemd_unit,
                 self_managed_fds,
                 pg_schema,
+                open_upgrades,
                 checked_at,
             },
             &RealCommandRunner,
@@ -346,6 +362,10 @@ pub async fn read_own_health(port: u16) -> Result<Value, String> {
         .map_err(|e| format!("GET /health body: {e}"))
 }
 
+/// How long a window close may take to end this process before the upgrade
+/// forces the handoff close.
+const EXIT_ESCALATE_AFTER: Duration = Duration::from_secs(60);
+
 /// The real executor effects of this process.
 struct LiveUpgradeEffects {
     runner: RealCommandRunner,
@@ -371,6 +391,13 @@ impl UpgradeEffects for LiveUpgradeEffects {
     fn swap_link(&self, link: &Path, target: &Path) -> Result<(), String> {
         sys::swap_link_atomically(link, target).map_err(|e| e.to_string())
     }
+    fn end_started_process(&self, pid: u32, flag: &str, record_arg: &str) -> Result<(), String> {
+        if sys::pid_runs_with(pid, flag, record_arg) {
+            super::spawn::terminate(pid, Duration::from_secs(10))
+        } else {
+            Ok(())
+        }
+    }
     /// Stage `CloseMode::Handoff` in `AppState::pending_close_mode` and close
     /// the main window — the same in-process sequence the close-request door
     /// runs, without calling that door. Scheduled a moment later so the
@@ -391,7 +418,28 @@ impl UpgradeEffects for LiveUpgradeEffects {
                     Some(window) => {
                         let armed = app_state.pending_close_mode.arm(mode);
                         match window.close() {
-                            Ok(()) => armed.commit(),
+                            Ok(()) => {
+                                armed.commit();
+                                // A close can be vetoed or stall after this
+                                // point, and the caller already has its 202.
+                                // The link already names the candidate and the
+                                // guard is armed, so a runner left standing
+                                // here is the one outcome nothing else
+                                // recovers. Still alive after the bound:
+                                // force the handoff close, whose own budget
+                                // ends the process.
+                                std::thread::sleep(EXIT_ESCALATE_AFTER);
+                                warn!(
+                                    after_secs = EXIT_ESCALATE_AFTER.as_secs(),
+                                    "runner upgrade: the handoff close has not ended this process; forcing it"
+                                );
+                                crate::mcp::ai_session::emergency_quit::request_force_close(
+                                    app,
+                                    app_state,
+                                    format!("{reason} (the window close did not exit)"),
+                                    mode,
+                                );
+                            }
                             Err(e) => {
                                 drop(armed);
                                 warn!(error = %e, "runner upgrade: window close failed; force-closing with the handoff");

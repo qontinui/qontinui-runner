@@ -22,7 +22,7 @@
 //! yet heard about (a rolled-back runner reports its own rollback), and
 //! withdraws a marker no open upgrade stands behind.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -58,6 +58,22 @@ pub struct ProbationTiming {
     pub health_attempts: u32,
     pub health_interval: Duration,
     pub sweep_timeout: Duration,
+}
+
+/// How often, and how far apart, a successor tries to read its embedded-PG
+/// schema before probation starts.
+pub const SCHEMA_READ_ATTEMPTS: u32 = 10;
+pub const SCHEMA_READ_RETRY: Duration = Duration::from_secs(3);
+
+impl ProbationTiming {
+    /// The longest probation can take with these timings, counting the
+    /// schema read that precedes it. Resumes are bounded separately and are
+    /// covered by the guard's margin.
+    pub fn worst_case(&self) -> Duration {
+        SCHEMA_READ_RETRY * SCHEMA_READ_ATTEMPTS
+            + self.health_interval * self.health_attempts.max(1)
+            + self.sweep_timeout
+    }
 }
 
 impl Default for ProbationTiming {
@@ -225,7 +241,8 @@ pub fn conclude(
             }
         }
         if let Some(pid) = rec.guard_pid {
-            if sys::pid_alive(pid) {
+            // Only the guard this upgrade started: a reused pid is left alone.
+            if sys::pid_runs_with(pid, "--upgrade-guard", &path.display().to_string()) {
                 let _ = super::spawn::terminate(pid, Duration::from_secs(5));
             }
         }
@@ -341,23 +358,43 @@ pub fn spawn_at_boot(app: tauri::AppHandle, port: u16) {
     });
 }
 
-async fn successor_boot(app: &tauri::AppHandle, port: u16, path: &PathBuf, mut rec: UpgradeRecord) {
+/// Write the successor's schema into the record as it now stands, under the
+/// record lock. A record the guard already concluded is left alone: the
+/// schema matters only to a guard that has not acted yet.
+fn record_successor_schema(path: &Path, fingerprint: String) -> Result<(), String> {
+    let _lock = record::lock_record(path).map_err(|e| format!("lock {}: {e}", path.display()))?;
+    let mut fresh = record::read_record(path)?;
+    if fresh.state != UpgradeState::InFlight {
+        return Ok(());
+    }
+    fresh.to_pg_schema = Some(fingerprint);
+    record::write_record(path, &fresh).map_err(|e| e.to_string())
+}
+
+async fn successor_boot(app: &tauri::AppHandle, port: u16, path: &Path, mut rec: UpgradeRecord) {
     info!(id = %rec.id, from = %rec.from_sha, to = %rec.to_sha, "runner upgrade: this boot is the successor — probation starts");
     // 1. The schema this build booted against, before anything else can
     //    change it further.
-    for attempt in 0..10 {
+    for attempt in 0..SCHEMA_READ_ATTEMPTS {
         match super::pg_schema::fingerprint().await {
             Ok(fp) => {
-                rec.to_pg_schema = Some(fp);
-                if let Err(e) = record::write_record(path, &rec) {
-                    warn!(error = %e, "runner upgrade: could not record the successor's schema");
+                rec.to_pg_schema = Some(fp.clone());
+                let (p, f) = (path.to_path_buf(), fp);
+                match tokio::task::spawn_blocking(move || record_successor_schema(&p, f)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        warn!(error = %e, "runner upgrade: could not record the successor's schema")
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "runner upgrade: could not record the successor's schema")
+                    }
                 }
                 break;
             }
-            Err(e) if attempt == 9 => {
+            Err(e) if attempt + 1 == SCHEMA_READ_ATTEMPTS => {
                 warn!(error = %e, "runner upgrade: the successor's schema was not read")
             }
-            Err(_) => tokio::time::sleep(Duration::from_secs(3)).await,
+            Err(_) => tokio::time::sleep(SCHEMA_READ_RETRY).await,
         }
     }
     let env = LiveProbationEnv {
@@ -366,7 +403,20 @@ async fn successor_boot(app: &tauri::AppHandle, port: u16, path: &PathBuf, mut r
     };
     let report = run_probation(&rec, &env, ProbationTiming::default()).await;
     let passed = report.passed;
-    // Re-read: the guard may have acted while probation ran.
+    // Under the record lock: the guard may have acted while probation ran,
+    // and must not act between this re-read and the conclusion.
+    let lock_path = path.to_path_buf();
+    let _lock = match tokio::task::spawn_blocking(move || record::lock_record(&lock_path)).await {
+        Ok(Ok(l)) => l,
+        Ok(Err(e)) => {
+            warn!(error = %e, "runner upgrade: the record lock was not taken; probation is not recorded and the guard decides");
+            return;
+        }
+        Err(e) => {
+            warn!(error = %e, "runner upgrade: the record lock task failed; probation is not recorded and the guard decides");
+            return;
+        }
+    };
     match record::read_record(path) {
         Ok(fresh) if fresh.state != UpgradeState::InFlight => {
             warn!(
@@ -381,7 +431,10 @@ async fn successor_boot(app: &tauri::AppHandle, port: u16, path: &PathBuf, mut r
                 ..fresh
             }
         }
-        Err(e) => warn!(error = %e, "runner upgrade: re-reading the record failed"),
+        Err(e) => {
+            warn!(error = %e, "runner upgrade: re-reading the record failed; probation is not recorded and the guard decides");
+            return;
+        }
     }
     if let Err(e) = conclude(path, &mut rec, report, &sys::RealCommandRunner) {
         warn!(error = %e, "runner upgrade: probation could not be recorded");

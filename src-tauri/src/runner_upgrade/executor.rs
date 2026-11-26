@@ -37,7 +37,16 @@ use super::record::{
 use super::sys::{self, CommandRunner};
 
 /// The guard fires this long after the exit unless the successor cancels it.
-pub const DEFAULT_GUARD_DELAY: Duration = Duration::from_secs(180);
+/// It must outlast everything between arming and a passed probation: the
+/// predecessor's exit (a self-managed successor waits up to
+/// [`super::cli::PREDECESSOR_WAIT`] for it), the successor's boot
+/// ([`SUCCESSOR_BOOT_ALLOWANCE`]) and probation's own worst case
+/// ([`super::probation::ProbationTiming::worst_case`], 180 s by default),
+/// plus a margin. A shorter window rolls back a healthy but slow successor.
+pub const DEFAULT_GUARD_DELAY: Duration = Duration::from_secs(540);
+
+/// How long a successor may take from exec to the start of probation.
+pub const SUCCESSOR_BOOT_ALLOWANCE: Duration = Duration::from_secs(120);
 
 /// The prefix of the transient guard unit's name.
 pub const GUARD_UNIT_PREFIX: &str = "qontinui-runner-upgrade-guard";
@@ -59,6 +68,10 @@ pub trait UpgradeEffects: Send + Sync {
     fn swap_link(&self, link: &Path, target: &Path) -> Result<(), String>;
     /// Stage `CloseMode::Handoff` and begin this process's exit.
     fn stage_handoff_exit(&self) -> Result<(), String>;
+    /// End `pid` if it is still the process this upgrade started with
+    /// `flag <record_arg>` ([`sys::pid_runs_with`]); a gone or reused pid is
+    /// left alone and is not an error.
+    fn end_started_process(&self, pid: u32, flag: &str, record_arg: &str) -> Result<(), String>;
 }
 
 /// What the executor needs beyond the passing preflight.
@@ -187,7 +200,10 @@ pub fn execute(p: ExecuteParams<'_>, fx: &dyn UpgradeEffects) -> Result<Executed
     record::write_record(&record_path, &rec).map_err(|e| {
         ExecuteError::before_record(format!("write {}: {e}", record_path.display()))
     })?;
-    let mut undo = Undo::default();
+    let mut undo = Undo {
+        record_arg: record_path.display().to_string(),
+        ..Undo::default()
+    };
     let abort = |rec: &mut UpgradeRecord, undo: &Undo, why: String| -> ExecuteError {
         undo.run(fx, rec, p.upgrades_dir);
         rec.conclude(
@@ -195,7 +211,16 @@ pub fn execute(p: ExecuteParams<'_>, fx: &dyn UpgradeEffects) -> Result<Executed
             why.clone(),
             &record::rfc3339(chrono::Utc::now()),
         );
-        let _ = record::write_record(&record_path, rec);
+        if let Err(e) = record::write_record(&record_path, rec) {
+            // The guard decides by the record's state. Left `in_flight`, a
+            // guard that survived the undo would roll back a runner that
+            // never exited; say so where an operator will look.
+            tracing::error!(
+                record = %record_path.display(),
+                error = %e,
+                "runner upgrade abort: the record could not be marked aborted; a surviving guard will act on it as in flight"
+            );
+        }
         ExecuteError {
             record_path: Some(record_path.clone()),
             message: why,
@@ -264,6 +289,7 @@ pub fn execute(p: ExecuteParams<'_>, fx: &dyn UpgradeEffects) -> Result<Executed
             match fx.spawn_detached(&from_exe, &args) {
                 Ok(pid) => {
                     rec.guard_pid = Some(pid);
+                    undo.guard_pid = Some(pid);
                     if let Err(e) = record::write_record(&record_path, &rec) {
                         return Err(abort(&mut rec, &undo, format!("record the guard pid: {e}")));
                     }
@@ -295,6 +321,7 @@ pub fn execute(p: ExecuteParams<'_>, fx: &dyn UpgradeEffects) -> Result<Executed
         ];
         match fx.spawn_successor(&runner_binary_in(&to_dir), &args, &p.listener_fds) {
             Ok(pid) => {
+                undo.successor_pid = Some(pid);
                 rec.restart = RestartTarget::SelfManaged {
                     from_exe,
                     successor_pid: Some(pid),
@@ -334,6 +361,13 @@ pub fn execute(p: ExecuteParams<'_>, fx: &dyn UpgradeEffects) -> Result<Executed
 struct Undo {
     marker: bool,
     guard_unit: Option<String>,
+    /// A detached guard process (no systemd): ended on abort, so it cannot
+    /// fire later against a runner that never exited.
+    guard_pid: Option<u32>,
+    /// A self-managed successor waiting for this process's exit.
+    successor_pid: Option<u32>,
+    /// The record path both were started with, to tell them from a reused pid.
+    record_arg: String,
     link_back_to: Option<PathBuf>,
 }
 
@@ -346,6 +380,16 @@ impl Undo {
         }
         if let Some(unit) = &self.guard_unit {
             let _ = cancel_guard_unit(fx.commands(), unit);
+        }
+        if let Some(pid) = self.successor_pid {
+            if let Err(e) = fx.end_started_process(pid, "--upgrade-successor", &self.record_arg) {
+                tracing::error!(pid, error = %e, "runner upgrade abort: could not end the successor");
+            }
+        }
+        if let Some(pid) = self.guard_pid {
+            if let Err(e) = fx.end_started_process(pid, "--upgrade-guard", &self.record_arg) {
+                tracing::error!(pid, error = %e, "runner upgrade abort: could not end the guard process");
+            }
         }
         if self.marker {
             let _ = record::remove_marker(dir);
@@ -371,6 +415,17 @@ pub fn cancel_guard_unit(runner: &dyn CommandRunner, unit: &str) -> Result<(), S
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn the_default_guard_window_outlasts_exit_boot_and_probation() {
+        let needed = crate::runner_upgrade::cli::PREDECESSOR_WAIT
+            + SUCCESSOR_BOOT_ALLOWANCE
+            + crate::runner_upgrade::probation::ProbationTiming::default().worst_case();
+        assert!(
+            DEFAULT_GUARD_DELAY >= needed + Duration::from_secs(60),
+            "guard {DEFAULT_GUARD_DELAY:?} leaves under a minute's margin over {needed:?}"
+        );
+    }
     use crate::runner_upgrade::preflight::evaluate;
     use crate::runner_upgrade::preflight::tests::{
         fixture, healthy_census, healthy_runner, inputs, FakeRunner,
@@ -425,6 +480,15 @@ pub(crate) mod tests {
         fn swap_link(&self, link: &Path, target: &Path) -> Result<(), String> {
             self.log(format!("swap -> {}", target.display()));
             sys::swap_link_atomically(link, target).map_err(|e| e.to_string())
+        }
+        fn end_started_process(
+            &self,
+            pid: u32,
+            flag: &str,
+            _record_arg: &str,
+        ) -> Result<(), String> {
+            self.log(format!("end {pid} {flag}"));
+            Ok(())
         }
         fn stage_handoff_exit(&self) -> Result<(), String> {
             self.log("handoff-exit".into());
@@ -635,6 +699,55 @@ pub(crate) mod tests {
             }
         );
         assert!(rec.guard_unit.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_self_managed_abort_ends_the_successor_and_the_guard_it_started() {
+        let f = fixture();
+        let mut i = inputs(&f, Ok(healthy_census()));
+        i.systemd_unit = None;
+        i.self_managed_fds = 1;
+        let report = evaluate(i, &healthy_runner(&f));
+        assert!(report.ok, "{:#?}", report.checks);
+        let mut fx = FakeEffects::new(FakeRunner::default());
+        fx.fail_exit = true;
+        let dir = tempfile::tempdir().unwrap();
+        let err = execute(
+            ExecuteParams {
+                report: &report,
+                upgrades_dir: dir.path(),
+                api_port: 9911,
+                from_pid: 4242,
+                guard_unit: None,
+                guard_delay: Duration::from_secs(60),
+                listener_fds: vec![("api".into(), 12)],
+                now: chrono::Utc::now(),
+            },
+            &fx,
+        )
+        .unwrap_err();
+        let log = fx.logged();
+        let exit = log.iter().position(|l| l == "handoff-exit").unwrap();
+        let tail = &log[exit + 1..];
+        assert!(
+            tail.contains(&"end 7002 --upgrade-successor".to_string()),
+            "{log:#?}"
+        );
+        assert!(
+            tail.contains(&"end 7001 --upgrade-guard".to_string()),
+            "{log:#?}"
+        );
+        assert_eq!(
+            sys::link_target(&f.layout.current_link).unwrap(),
+            f.layout.serving_dir
+        );
+        assert_eq!(
+            record::read_record(err.record_path.as_ref().unwrap())
+                .unwrap()
+                .state,
+            UpgradeState::Aborted
+        );
     }
 
     #[test]

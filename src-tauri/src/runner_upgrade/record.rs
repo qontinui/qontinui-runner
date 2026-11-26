@@ -266,6 +266,42 @@ pub fn write_record(path: &Path, r: &UpgradeRecord) -> io::Result<()> {
     write_atomic(path, &text)
 }
 
+/// An exclusive advisory lock on one upgrade record (`<record>.lock`), held
+/// until dropped. The guard holds it for its whole run, and probation holds it
+/// while it re-reads and concludes. Each side therefore acts on the record as
+/// the other last left it, never on a copy read before the other wrote. Off
+/// Unix it locks nothing.
+pub struct RecordLock {
+    _file: std::fs::File,
+}
+
+pub fn lock_record(path: &Path) -> io::Result<RecordLock> {
+    let mut lock = path.as_os_str().to_owned();
+    lock.push(".lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(PathBuf::from(lock))?;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        loop {
+            // SAFETY: flock on an fd this function owns; released when the
+            // file is closed on drop.
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+            if rc == 0 {
+                break;
+            }
+            let e = io::Error::last_os_error();
+            if e.kind() != io::ErrorKind::Interrupted {
+                return Err(e);
+            }
+        }
+    }
+    Ok(RecordLock { _file: file })
+}
+
 pub fn read_record(path: &Path) -> Result<UpgradeRecord, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read upgrade record {}: {e}", path.display()))?;
@@ -324,6 +360,36 @@ pub fn latest_open_record(dir: &Path) -> Option<(PathBuf, UpgradeRecord)> {
         .into_iter()
         .rev()
         .find(|(_, r)| r.state.guard_should_act())
+}
+
+/// The ids of every upgrade still open (`in_flight` or `probation_failed`):
+/// a guard is armed for each, and a second upgrade armed beside it would race
+/// it for the `current` link. A missing directory is no upgrade yet. An
+/// unreadable directory or record is `Err`, because the open set is then
+/// UNKNOWN, never empty.
+pub fn open_upgrade_ids(dir: &Path) -> Result<Vec<String>, String> {
+    match std::fs::metadata(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("{}: {e}", dir.display())),
+        Ok(_) => {}
+    }
+    if let Err(e) = std::fs::read_dir(dir) {
+        return Err(format!("{}: {e}", dir.display()));
+    }
+    let (good, bad) = all_records(dir);
+    if !bad.is_empty() {
+        return Err(format!(
+            "{} unreadable upgrade record(s) in {}: {}",
+            bad.len(),
+            dir.display(),
+            bad.join("; ")
+        ));
+    }
+    Ok(good
+        .into_iter()
+        .filter(|(_, r)| r.state.guard_should_act())
+        .map(|(_, r)| r.id)
+        .collect())
 }
 
 /// A sortable, file-name-safe upgrade id: `20261124T221500.123Z`.
@@ -430,6 +496,50 @@ mod tests {
         let (p, r) = latest_open_record(d.path()).unwrap();
         assert_eq!(r, open);
         assert_eq!(p, record_path(d.path(), &open.id));
+    }
+
+    #[test]
+    fn open_upgrade_ids_lists_open_records_and_an_unreadable_one_is_unknown() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(open_upgrade_ids(&d.path().join("absent")), Ok(Vec::new()));
+        assert_eq!(open_upgrade_ids(d.path()), Ok(Vec::new()));
+        let mut done = sample_record(d.path());
+        done.id = "20261123T000000.000Z".into();
+        done.state = UpgradeState::ProbationPassed;
+        write_record(&record_path(d.path(), &done.id), &done).unwrap();
+        assert_eq!(open_upgrade_ids(d.path()), Ok(Vec::new()));
+        let open = sample_record(d.path());
+        write_record(&record_path(d.path(), &open.id), &open).unwrap();
+        assert_eq!(open_upgrade_ids(d.path()), Ok(vec![open.id.clone()]));
+        std::fs::write(d.path().join("20261125T000000.000Z.json"), "{not json").unwrap();
+        assert!(open_upgrade_ids(d.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_record_lock_excludes_a_second_holder_until_dropped() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let d = tempfile::tempdir().unwrap();
+        let p = record_path(d.path(), "20261124T220000.000Z");
+        let first = lock_record(&p).unwrap();
+        let got = Arc::new(AtomicBool::new(false));
+        let (p2, got2) = (p.clone(), got.clone());
+        let t = std::thread::spawn(move || {
+            let _second = lock_record(&p2).unwrap();
+            got2.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            !got.load(Ordering::SeqCst),
+            "the second holder got the lock while the first held it"
+        );
+        drop(first);
+        t.join().unwrap();
+        assert!(got.load(Ordering::SeqCst));
+        // The lock file is not a record.
+        assert_eq!(all_records(d.path()).0.len(), 0);
+        assert!(all_records(d.path()).1.is_empty());
     }
 
     #[test]
