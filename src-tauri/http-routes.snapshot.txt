@@ -403,6 +403,7 @@ GET /restart-readiness restart_readiness_handler
 GET /restate/health restate_health
 GET /restate/workflows/{execution_id}/state get_restate_workflow_state
 GET /reviews/recent get_recent_reviews
+GET /runner/upgrade/preflight get_preflight
 GET /runners list_runners
 GET /runs list_automation_runs
 GET /runs/{id} get_automation_run
@@ -982,6 +983,7 @@ MERGE restate_api::routes
 MERGE resume_door::routes
 MERGE reviews::routes
 MERGE routes::router
+MERGE routes::routes
 MERGE saved_api_requests::routes
 MERGE scenarios::routes
 MERGE scheduler::routes
@@ -1273,6 +1275,7 @@ POST /restate/workflows/{execution_id}/stop stop_restate_workflow
 POST /restore restore_backup_handler
 POST /reviews post_review
 POST /run-workflow run_workflow
+POST /runner/upgrade post_upgrade
 POST /saved-api-requests create_saved_api_request
 POST /saved-api-requests/{id}/duplicate duplicate_saved_api_request
 POST /scheduler/reconcile-now reconcile_now
