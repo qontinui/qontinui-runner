@@ -180,6 +180,16 @@ fn monotonic_now_ms() -> i64 {
     (MONOTONIC_EPOCH.elapsed().as_millis() as i64).saturating_add(1)
 }
 
+/// Elapsed since the process clock's epoch — the time base every boot-stage
+/// offset and the bind latency are measured on.
+///
+/// `MONOTONIC_EPOCH` is lazy; `main()` anchors it near its first line (through
+/// `boot_stage::stamp(ProcessStart)`), so in production this is "since process
+/// start" to within the few instructions before that stamp.
+pub(crate) fn process_elapsed() -> Duration {
+    MONOTONIC_EPOCH.elapsed()
+}
+
 /// How often the watchdog thread wakes to write its heartbeat.
 const WATCHDOG_TICK_SECS: u64 = 15;
 

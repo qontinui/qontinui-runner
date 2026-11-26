@@ -896,6 +896,7 @@ fn seam_reports(fp: &EnvFingerprinter, config_dir: Option<&str>) -> Vec<SeamEnvR
             &crate::orchestration_loop::fix_agent::build_fix_agent_command(
                 "(config-report probe)",
                 "(config-report probe)",
+                "(config-report probe)",
             ),
         ),
         tokio_seam(

@@ -1144,7 +1144,8 @@ states that legitimately stop the lifecycle must stop it here too:
   **unidentified default**
   (an `IN PROGRESS` stamp with no session marker, or one that cannot be
   positively attributed at all, is a STOP, not an overwrite; a marker naming a
-  probed-dead peer is case 2, adopt, or the hold gate's own continuation is
+  probed-dead peer is case 2, adopt; a probed-dead peer that left pushed work
+  is case 2c, adopt by route-around; or the hold gate's own continuation is
   case 2b, adopt), before it rewrote the stamp.
 
   **Conjunct 3 is carried explicitly even though that arm order already
@@ -1309,7 +1310,8 @@ states that legitimately stop the lifecycle must stop it here too:
   > and here the stamp is the `VETTED` this chain's own Step 2 just wrote. A
   > `SHIPPED`, `SUPERSEDED` or `OBSOLETE` stamp, or a foreign `IN PROGRESS`
   > whose session left PRs (unless `/vet-plan` case 2b adopts it — the stamp
-  > is gate-delegated and this run is that hold gate's continuation),
+  > is gate-delegated and this run is that hold gate's continuation — or case
+  > 2c adopts a verified-dead owner's pushed work by route-around),
   > still stops at `/vet-plan`'s pre-edit capture; a
   > complete plan still stamped `VETTED` or `DRAFT` (or legacy `PARTIAL` /
   > `NOT STARTED`) is re-vetted and re-implemented, and the only remaining MECHANICAL

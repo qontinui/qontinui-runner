@@ -226,6 +226,17 @@ pub struct ClaudeCliSettings {
     /// of sitting idle at the input box. Manual migrations honor it too.
     #[serde(default = "default_auto_continue_after_migration")]
     pub auto_continue_after_migration: bool,
+    /// Continue a terminal Claude session in place once the usage limit it
+    /// stopped at has reset: a session whose transcript ends at a usage-limit
+    /// stop, on an account a fresh probe says is no longer exhausted, gets one
+    /// continue prompt (once its CLI is idle) instead of sitting idle. A stop
+    /// whose reset is still ahead is parked until then. Independent of
+    /// `auto_migrate_on_token_exhaustion`, and works with a single account
+    /// (`terminal::limit_reset`; plan
+    /// 2026-11-05-runner-terminal-pages-collide-crowd-and-overfill-and-limit-stalled-sessions-never-resume
+    /// Phase 2).
+    #[serde(default = "default_auto_continue_after_limit_reset")]
+    pub auto_continue_after_limit_reset: bool,
     /// Let the runner install Claude Code CLI updates on this machine
     /// (`crate::claude_cli_update`): one runner-side updater installs a newly
     /// published release once, when it is newer than the installed one. Every
@@ -246,6 +257,10 @@ fn default_auto_continue_after_migration() -> bool {
     true
 }
 
+fn default_auto_continue_after_limit_reset() -> bool {
+    true
+}
+
 fn default_runner_manages_cli_updates() -> bool {
     true
 }
@@ -261,6 +276,7 @@ impl Default for ClaudeCliSettings {
             account_selection_pinned: false,
             auto_migrate_on_token_exhaustion: default_auto_migrate_on_token_exhaustion(),
             auto_continue_after_migration: default_auto_continue_after_migration(),
+            auto_continue_after_limit_reset: default_auto_continue_after_limit_reset(),
             runner_manages_cli_updates: default_runner_manages_cli_updates(),
         }
     }

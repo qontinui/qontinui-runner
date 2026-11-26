@@ -69,6 +69,8 @@ pub mod coord_sync;
 pub(crate) mod coord_sync_finish_ack; // What a coord answer to the runner's `finished` PATCH proves — finish_synced is stamped only on an observed `finished` row (plan 2026-11-05-finish-synced-is-stamped-on-a-2xx-that-did-not-move-session-status, Phase 4)
 pub mod coord_transport_rung; // WHICH transport rung carried a coord call — the producer for `coord-transport-rung` session events (plan 2026-09-07-no-per-session-record-of-which-transport-rung-carried-a-coord-read, Phase 1)
 pub mod create; // Remote-CREATE grants: the `create_request` directive arm + device-bound catch-up poll — the attach twin, so the target verifies a create grant itself instead of trusting the relay (plan 2026-09-11-headless-runner-parity-from-a-headed-runner, Phase 3b)
+#[cfg(test)]
+pub(crate) mod drain_probe; // Loopback coord that fails a test when a response body is left unread (lifecycle plan Phase 85)
 pub mod dual_write;
 pub mod handoff;
 pub mod identity_stamp; // Reports every session id this machine can resolve (account root + names, live or ended) to coord's POST /coord/session-identity/:device_id (plan 2026-10-19-session-lookup-by-name-shows-claude-account-in-web, Phase 2)
@@ -106,6 +108,7 @@ pub mod finished_close_guard; // The finished_close arm's close guard: every ser
 pub mod spawn_report_spool; // Undelivered `spawn-failed` reports spooled to the session outbox and replayed by the CoordSync drain (plan 2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling, Phase 6)
 pub mod stop_reason; // "Why did my session stop?" — the typed answer behind GET /sessions/{id}/stop-reason (plan 2026-09-20-the-published-product-works-without-knowing-a-development-environment-exists, C5)
 pub mod stray_wait; // Tells a wait loop that can never end from work, so a finished session it holds can close (plan 2026-10-23-finished-sessions-stay-busy-behind-background-wait-loops-that-can-never-exit, Phase 4)
+pub mod terminal_door_key; // Door-scoped keys derived from a terminal's per-spawn secret (beside permission_accept's grant registry): how a loopback request proves WHICH terminal it comes from (plan 2026-11-05-transcript-bind-refuses-a-hosted-session-whose-only-key-is-the-workdir-nonce, Phase 2)
 pub mod tracking_health;
 pub mod transcript_autobind; // The watcher binds EVERY transcript it sees to a coord session (plan 2026-10-06-closed-sessions-whose-work-is-unfinished-are-found-fleet-wide-and-resumed, Phase 1)
 pub mod transcript_emitter;

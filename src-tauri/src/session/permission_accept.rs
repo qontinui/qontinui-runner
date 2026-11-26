@@ -47,6 +47,14 @@
 //!   learns only the request key, from which it cannot produce the nonce, and
 //!   a loopback caller that does not hold the request key can never harvest a
 //!   nonce (or inflate the accept count) by posting a well-formed payload.
+//!
+//!   The same per-spawn nonce also seeds the DOOR KEYS other loopback doors
+//!   use to prove which terminal a request comes from
+//!   ([`crate::session::terminal_door_key`]; `POST /sessions/transcript-bind`
+//!   is the first). It is still never sent: a door key is a one-way
+//!   derivation under its own label with the door's name hashed in, and it is
+//!   NOT the request key, so a proof harvested at another door cannot be
+//!   replayed here to obtain the nonce echo.
 //! - **Same tenant.** The dial is polled under the runner's DEFAULT device
 //!   credential, so it is that tenant's dial. A terminal spawned for a
 //!   DIFFERENT tenant (an explicit spawn tenant) is answered `none`; a terminal
@@ -294,6 +302,13 @@ fn terminal_grant(terminal_id: &str) -> Option<TerminalGrant> {
         .unwrap_or_else(|p| p.into_inner())
         .get(terminal_id)
         .map(|(_, g)| g.clone())
+}
+
+/// The per-spawn nonce of `terminal_id`'s grant, for the door-key derivation
+/// ([`crate::session::terminal_door_key`]); `None` for a terminal this process
+/// holds no grant for. The caller derives from it and never sends it.
+pub(crate) fn terminal_grant_nonce(terminal_id: &str) -> Option<String> {
+    terminal_grant(terminal_id).map(|g| g.nonce)
 }
 
 // ---------------------------------------------------------------------------

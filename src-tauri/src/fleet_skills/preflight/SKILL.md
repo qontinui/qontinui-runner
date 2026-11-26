@@ -428,7 +428,8 @@ answers `MATCH`.
 tenant this device is NOT bound to is invisible to all of this. That is why a
 clear here licenses starting work, never adopting someone else's — adoption
 needs `/vet-plan`'s positive dead-or-done signal ("Case 2 across machines"),
-IN ADDITION to that case's worktree, PR and branch checks, never instead of them.
+IN ADDITION to that case's worktree check and its PR/branch checks (or case
+2c's per-product ownership checks), never instead of them.
 
 ### 1. Durable cross-time check (catches already-merged work)
 
@@ -763,11 +764,29 @@ bash qontinui-claude-config/scripts/custody-intent-write.sh <this worktree> \
     `unknown`. A same-device row that recorded scope and does not overlap
     your globs changes nothing.
 
+  The routing readers count a same-device sibling too (the plan's Phase 4,
+  serving since coord `7fc365cc3`). They take your session from the
+  runner-injected caller-session header only, because these tools take no
+  session argument:
+  - *`resource:` routing's intent arm* delivers each overlapping row to the
+    session that declared it, a same-device sibling included, and never to
+    you. A same-device row coord cannot attribute is skipped and counted in
+    the receipt's `unattributed_same_device_rows_skipped`. Without the header,
+    every same-device row is skipped this way, siblings included. A non-zero
+    count means a sibling may not have received the message.
+  - *`coord_push_to_branch`'s concurrent-editor check* sees a sibling's
+    overlapping intent. When coord cannot prove your session, an
+    unattributable overlapping same-device row counts as a concurrent editor,
+    so the push fails closed. `acknowledge_concurrent_editors` is still the
+    way past it, once you have checked that the row is yours or coordinated.
+  - *`coord_request_handoff`* to a same-device sibling is queued to that
+    session's own mailbox and returns `request_id: null`. No device wait-for
+    edge is recorded for it. Read `queued`: it is `false`, with a note, when
+    the holder is not promptable (waiting on a human, finished or closed) or
+    coord's mailbox table is not provisioned.
+
   Limits that remain, each with its own end marker (plan
-  `2026-11-11-intent-overlap-excludes-the-callers-whole-device` Phases 4-6):
-  - *The `coord_push_to_branch` concurrent-editor check and `resource:`
-    routing's intent arm still exclude your whole device* until the plan's
-    Phase 4 is serving.
+  `2026-11-11-intent-overlap-excludes-the-callers-whole-device` Phases 5-6):
   - *`coord_orient`'s `you` list is device-grain* until it returns a
     `same_device_sessions` list: it shows every live intent row on this
     device, a sibling's included, with no session attached.

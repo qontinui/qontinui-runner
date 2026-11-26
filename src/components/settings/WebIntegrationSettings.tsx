@@ -48,6 +48,7 @@ import { deriveStatusBanner } from "./webIntegrationBanner";
 import { EgressPrivacyPanel } from "./EgressPrivacyPanel";
 import type { LogFunction } from "./types";
 import type { SetRunnerTierResult } from "@/hooks/useRunnerTier";
+import { PRODUCTION_BACKEND_URL } from "@/lib/savedBackendUrl";
 import {
   usePerfCaps,
   loadPerfCaps,
@@ -88,6 +89,13 @@ export interface WebIntegrationStatus {
     error: string;
     detectedAtUnix: number;
   } | null;
+  /**
+   * Runner verdicts on the saved `backendUrl` (see `@/lib/savedBackendUrl`).
+   * Type parity only: this tab's Connect button signs in to the typed form
+   * URL, not through the sign-in rule.
+   */
+  backendUrlMachineLocal?: boolean;
+  backendUrlRefused?: boolean;
 }
 
 /**
@@ -251,7 +259,7 @@ function deriveWebAppUrl(backendUrl: string): string | null {
 // Component
 // ---------------------------------------------------------------------------
 
-const PLACEHOLDER_BACKEND_URL = "https://api.qontinui.io";
+const PLACEHOLDER_BACKEND_URL = PRODUCTION_BACKEND_URL;
 
 /**
  * The connection-state banner. Renders from `deriveStatusBanner`, so every

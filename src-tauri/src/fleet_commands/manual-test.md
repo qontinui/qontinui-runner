@@ -461,12 +461,20 @@ Notes that matter, all of them measured:
 - **The transport is `ui-bridge-inject --exec-stdin`** — NDJSON, one
   `{"action":…,"payload":…}` per line. No relay, so neither relay auth nor LNA
   applies. Payload shape for element actions is `{id, request:{action, value?}}`
-  (`ui-bridge/packages/ui-bridge/src/react/commandHandlers.ts:1090`); sub-actions
-  include click, hoverClick, focus, blur, hover, scrollIntoView, scroll, toggle,
-  doubleClick, type, clear, setValue, select, check, uncheck, submit, reset,
-  sendKeys, drag, alongside top-level `clickByText`, `clickBySelector`,
-  `typeInto`, `readValue`, `sendKeysToPage`, `expectElement`, `find`, `discover`,
-  `getElementTree`. **Read `commandHandlers.ts` for the authoritative list —
+  (`ui-bridge/packages/ui-bridge/src/react/commandHandlers.ts`, the
+  `executeElementAction` handler); sub-actions include click, hoverClick, focus,
+  blur, hover, unhover, scrollIntoView, scroll, toggle, doubleClick, rightClick,
+  middleClick, type, clear, setValue, select, check, uncheck, submit, reset,
+  sendKeys, drag, autocomplete, alongside top-level `clickByText`,
+  `clickBySelector`, `typeInto`, `readValue`, `sendKeysToPage`,
+  `expectElement`, `find`, `discover`, `getElementTree`. Since
+  `@qontinui/ui-bridge` 0.38.0 `hover` forces the real CSS `:hover` state and
+  HOLDS it until `unhover`, the next `hover`/`hoverClick`, a dispatched
+  write-class action, or the TTL (`params.holdMs`, default 30000 ms, ceiling
+  300000), so a step after a `hover` runs against the hovered page only inside
+  that window — see "Reading a hover" in
+  `/ui-bridge`. **Read `commandHandlers.ts` (its `RELAY_ELEMENT_ACTIONS`) for
+  the authoritative list —
   and if the action you need is not there, that is a UI Bridge gap: fix it in the
   Bridge and report it. Never route around it with a Playwright locator.**
 - **An action that FAILS does not come back on the CLI's `error` key.** A Bridge

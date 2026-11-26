@@ -270,6 +270,23 @@ pub const CREDENTIAL_DOORS: &[&str] = &[
     // transcript above. Bounded per file / per report, but a bound on volume is
     // not a bound on who may read it.
     "GET /sessions/{id}/file-changes",
+    // The per-tab session snapshot (`mcp::terminal_layout`): terminal titles,
+    // which are PTY-derived session content, plus session ids, accounts and
+    // the device id. No browser page needs it. Its intended caller is
+    // qontinui-web's saved-session-lists capture over the backend relay. Two
+    // other callers can reach it through qontinui-web's device-bridge runner
+    // proxy (`/api/v1/device-bridge/runner-proxy/terminal-layout`): a device
+    // owner through its relay arm (with `X-Qontinui-Device-Id`), which rides
+    // the same relay and gets the same per-tenant title redaction; and a
+    // platform admin through its co-located arm (no device header), which
+    // calls this loopback API directly and so, like any local caller, gets
+    // the titles unredacted (see `mcp::terminal_layout`). A relayed request
+    // reaches this API with no `Origin` and no `Sec-Fetch-*`:
+    // qontinui-web's `runner_relay` drops them and
+    // `backend_relay::RELAY_SKIP_REQUEST_HEADERS` drops `origin` and
+    // `sec-fetch-site` again. So it classifies NonBrowser and is admitted (plan
+    // `2026-11-08-save-per-tab-runner-session-lists-on-sessions-page-kept-14-days`).
+    "GET /terminal-layout",
     // Reads a local Claude Code transcript and queues it for coord: it decides
     // whose conversation leaves the machine. Authorized on the coord-mcp proxy
     // nonce in the handler; no browser caller has any business here.
@@ -388,6 +405,13 @@ pub const CREDENTIAL_DOORS: &[&str] = &[
     // 2026-11-05-one-free-resource-model-places-sessions-builds-and-ci,
     // Phase 6): its callers are local tools and agents, never a browser
     "GET /fleet/capacity",
+    // this install's model-gateway state (`mcp::model_gateway_read`): no
+    // secret, but under the default `EnforceDoors` a non-door route is only
+    // SHADOW-refused, so a visited web page could read whether this install
+    // routes model calls through a gateway. Its caller is qontinui-studio's
+    // local CLI (NonBrowser, admitted before this list is read); no browser
+    // origin needs it
+    "GET /model-gateway",
     // a browser origin must never be able to widen browser trust
     "/settings/api/allowed-origins",
     // re-points which tenant this device's new sessions, device-level surfaces
