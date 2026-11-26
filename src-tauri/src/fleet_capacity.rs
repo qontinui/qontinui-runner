@@ -31,6 +31,12 @@
 //!   (`no_plan_yet`), or coord refused (`device_not_in_plan` for a device the
 //!   tenant's newest plan does not carry).
 //!
+//! Every read names `coord_base`, the coord it asked (or would have asked):
+//! the base [`qontinui_runner_lib::profiles::connected_coord_base`] resolved
+//! when the read was prepared, `null` only when none resolved (the runner is
+//! not connected). Whatever serves the read beside something another coord
+//! answered (the D9 dial) compares the two rather than implying they agree.
+//!
 //! Beside the row: `coord`, the rest of coord's answer (`model_version`,
 //! `plan`, `thresholds`, `cadence_secs`, `coverage`, `note`, coord's own
 //! `cache_age_secs`), whenever coord answered 2xx. The D9 dial is NOT part of
@@ -66,12 +72,16 @@
 //! include coord's own cache: coord may answer from a read up to 15 s old,
 //! and says how old in `coord.cache_age_secs`.
 //!
-//! A fetch has one deadline, [`FETCH_DEADLINE`], over its asynchronous part
-//! (the credential read, which runs on the blocking pool, and the HTTP round
-//! trip), so a stalled credential store cannot hold every caller behind the
-//! single-flight lock: past it the read is `unknown`, kept for
-//! [`UNKNOWN_TTL`]. The coord base and the device file are small synchronous
-//! file reads inside it, which a timeout cannot interrupt.
+//! A fetch has two stages ([`Prepared`]). The synchronous one resolves the
+//! coord base and the device from small file reads, and either settles the
+//! read there (no base, no usable device) or hands over the device and the
+//! asynchronous rest. That rest (the credential read, which runs on the
+//! blocking pool, and the HTTP round trip) runs under one deadline,
+//! [`FETCH_DEADLINE`], so a stalled credential store cannot hold every caller
+//! behind the single-flight lock: past it the read is `unknown`, kept for
+//! [`UNKNOWN_TTL`], and still names the device it was asking about. The
+//! synchronous reads sit outside the deadline, which could not interrupt
+//! them anyway.
 //!
 //! [`current`] runs the read on its own task ([`get_detached`]), so a caller
 //! that is dropped while a fetch is in flight (a loopback client that gave up
@@ -170,6 +180,27 @@ impl Fetched {
     }
 }
 
+/// The synchronous stage of a fetch: either the read is already settled
+/// (no coord base, no usable device), or the device is known and `fut` is the
+/// asynchronous rest. Only `fut` runs under the fetch's deadline, so the
+/// deadline's `unknown` still names `device_id`. Both carry the coord base
+/// the preparation resolved, which the read serves as `coord_base`.
+pub(crate) enum Prepared<Fut> {
+    /// Settled without awaiting anything. `coord_base` is `None` only when no
+    /// connected base resolved.
+    Done {
+        coord_base: Option<String>,
+        fetched: Fetched,
+    },
+    /// The base and the device are resolved; `fut` reads the credential and
+    /// asks the coord at `coord_base`.
+    Fetch {
+        coord_base: String,
+        device_id: Uuid,
+        fut: Fut,
+    },
+}
+
 /// One read of this device's capacity: served as-is on the loopback, and
 /// returned to an in-process caller.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -178,6 +209,9 @@ pub(crate) struct CapacityRead {
     pub(crate) state: &'static str,
     /// The device asked about, once it was resolved.
     pub(crate) device_id: Option<String>,
+    /// The coord this read asked (or would have asked), as
+    /// `connected_coord_base` resolved it; `None` only when none resolved.
+    pub(crate) coord_base: Option<String>,
     /// This device's row exactly as coord served it; only when `known`.
     pub(crate) row: Option<Value>,
     /// coord's answer without its `devices` list, whenever coord answered 2xx.
@@ -188,7 +222,9 @@ pub(crate) struct CapacityRead {
     pub(crate) fetched_at: String,
     /// Seconds since the runner asked coord.
     pub(crate) cache_age_secs: f64,
-    /// How long this read is kept before coord is asked again.
+    /// How long this read is kept before coord is asked again; `0` when this
+    /// read is not kept at all (the read's task failed, so nothing was
+    /// stored and the next caller asks again). A kept read's TTL is never 0.
     pub(crate) cache_ttl_secs: u64,
 }
 
@@ -293,7 +329,18 @@ struct Entry {
     /// kept as long as a quick one.
     done: Instant,
     fetched_at: DateTime<Utc>,
+    /// The coord base the preparation resolved; `None` when none did.
+    coord_base: Option<String>,
     fetched: Fetched,
+}
+
+/// Whether `next` is a change worth one log line against the last kept entry:
+/// its outcome (state and reason) or the coord it asked differs. The coord is
+/// part of the key because the same outcome from another coord is a different
+/// fact about this device.
+fn read_changed(last: Option<&Entry>, next: &Entry) -> bool {
+    last.map(|e| (e.fetched.outcome(), e.coord_base.as_deref()))
+        != Some((next.fetched.outcome(), next.coord_base.as_deref()))
 }
 
 impl Entry {
@@ -301,7 +348,17 @@ impl Entry {
         now.saturating_duration_since(self.done) < self.fetched.ttl()
     }
 
+    /// This entry as a kept read: its TTL is the one it is kept for.
     fn read_at(&self, now: Instant) -> CapacityRead {
+        self.read_kept_for(now, self.fetched.ttl().as_secs())
+    }
+
+    /// This entry as a read that is never kept: `cache_ttl_secs` is 0.
+    fn unkept_read_at(&self, now: Instant) -> CapacityRead {
+        self.read_kept_for(now, 0)
+    }
+
+    fn read_kept_for(&self, now: Instant, ttl_secs: u64) -> CapacityRead {
         let (state, device_id, row, coord, reason) = match &self.fetched {
             Fetched::Known {
                 device_id,
@@ -332,12 +389,13 @@ impl Entry {
         CapacityRead {
             state,
             device_id: device_id.map(|d| d.to_string()),
+            coord_base: self.coord_base.clone(),
             row,
             coord,
             reason,
             fetched_at: self.fetched_at.to_rfc3339_opts(SecondsFormat::Millis, true),
             cache_age_secs: now.saturating_duration_since(self.at).as_secs_f64(),
-            cache_ttl_secs: self.fetched.ttl().as_secs(),
+            cache_ttl_secs: ttl_secs,
         }
     }
 }
@@ -371,22 +429,25 @@ impl CapacityCache {
             .map(|e| e.read_at(now))
     }
 
-    /// The kept read when it is fresh; otherwise `fetch`'s, kept and returned.
+    /// The kept read when it is fresh; otherwise a new one, kept and
+    /// returned: `prepare` runs once, and a [`Prepared::Done`] is the read
+    /// while a [`Prepared::Fetch`]'s future is awaited for it.
     /// `clock` tells the instant and wall time whenever it is asked: a read
     /// this call fetches is stamped with the moment its fetch began, and every
     /// read it returns, kept or fetched, is aged at the moment it is returned
     /// — so the fetch's own time, and any wait for a fetch in flight, are in
-    /// the age, which never reads younger than the runner's ask. A fetch that
-    /// has not answered within [`FETCH_DEADLINE`] is `unknown`.
+    /// the age, which never reads younger than the runner's ask. A fetch whose
+    /// future has not answered within [`FETCH_DEADLINE`] is `unknown`, naming
+    /// the device it was preparing to ask about.
     pub(crate) async fn get<Fut>(
         &self,
         clock: impl Fn() -> (Instant, DateTime<Utc>),
-        fetch: impl FnOnce() -> Fut,
+        prepare: impl FnOnce() -> Prepared<Fut>,
     ) -> CapacityRead
     where
         Fut: Future<Output = Fetched>,
     {
-        self.get_within(FETCH_DEADLINE, clock, fetch).await
+        self.get_within(FETCH_DEADLINE, clock, prepare).await
     }
 
     /// [`CapacityCache::get`] with the fetch's deadline given.
@@ -394,7 +455,7 @@ impl CapacityCache {
         &self,
         deadline: Duration,
         clock: impl Fn() -> (Instant, DateTime<Utc>),
-        fetch: impl FnOnce() -> Fut,
+        prepare: impl FnOnce() -> Prepared<Fut>,
     ) -> CapacityRead
     where
         Fut: Future<Output = Fetched>,
@@ -409,33 +470,47 @@ impl CapacityCache {
             return read;
         }
         let (at, fetched_at) = clock();
-        let fetched = tokio::time::timeout(deadline, fetch())
-            .await
-            .unwrap_or_else(|_| {
-                Fetched::unknown(
-                    None,
-                    format!(
-                        "the capacity fetch did not finish within {} s (the device file, the \
-                         credential read or coord stalled)",
-                        deadline.as_secs_f64()
-                    ),
-                )
-            });
+        let (coord_base, fetched) = match prepare() {
+            Prepared::Done {
+                coord_base,
+                fetched,
+            } => (coord_base, fetched),
+            Prepared::Fetch {
+                coord_base,
+                device_id,
+                fut,
+            } => (
+                Some(coord_base),
+                tokio::time::timeout(deadline, fut)
+                    .await
+                    .unwrap_or_else(|_| {
+                        Fetched::unknown(
+                            Some(device_id),
+                            format!(
+                                "the capacity fetch did not finish within {} s (the credential \
+                             read or coord stalled)",
+                                deadline.as_secs_f64()
+                            ),
+                        )
+                    }),
+            ),
+        };
         let done = clock().0;
         let entry = Entry {
             at,
             done,
             fetched_at,
+            coord_base,
             fetched,
         };
         let read = entry.read_at(done);
         let mut last = self.last_guard();
-        let changed = last.as_ref().map(|e| e.fetched.outcome()) != Some(entry.fetched.outcome());
-        if changed {
+        if read_changed(last.as_ref(), &entry) {
             // The bearer never reaches a reason, so a reason is safe to log.
             tracing::info!(
                 state = read.state,
                 reason = read.reason.as_deref().unwrap_or(""),
+                coord_base = read.coord_base.as_deref().unwrap_or(""),
                 "fleet capacity: this device's read changed"
             );
         }
@@ -457,25 +532,29 @@ fn cache() -> &'static CapacityCache {
 /// This device's capacity: the kept read while it is fresh, otherwise a new
 /// read of coord's capacity door.
 pub(crate) async fn current() -> CapacityRead {
-    get_detached(cache(), fetch_live).await
+    get_detached(cache(), prepare_live).await
 }
 
-/// `cache.get(fetch)` on a task of its own, so dropping the caller does not
-/// drop a fetch in flight. A task that panicked is an `unknown` read.
-async fn get_detached<F, Fut>(cache: &'static CapacityCache, fetch: F) -> CapacityRead
+/// `cache.get(prepare)` on a task of its own, so dropping the caller does not
+/// drop a fetch in flight. A task that panicked is an `unknown` read that is
+/// not kept (`cache_ttl_secs: 0`): nothing was stored, so the next caller asks
+/// again.
+async fn get_detached<P, Fut>(cache: &'static CapacityCache, prepare: P) -> CapacityRead
 where
-    F: FnOnce() -> Fut + Send + 'static,
+    P: FnOnce() -> Prepared<Fut> + Send + 'static,
     Fut: Future<Output = Fetched> + Send + 'static,
 {
-    match tokio::spawn(cache.get(|| (Instant::now(), Utc::now()), fetch)).await {
+    match tokio::spawn(cache.get(|| (Instant::now(), Utc::now()), prepare)).await {
         Ok(read) => read,
         Err(e) => Entry {
             at: Instant::now(),
             done: Instant::now(),
             fetched_at: Utc::now(),
+            // The task that would have said which coord it asked is gone.
+            coord_base: None,
             fetched: Fetched::unknown(None, format!("the capacity read's task failed: {e}")),
         }
-        .read_at(Instant::now()),
+        .unkept_read_at(Instant::now()),
     }
 }
 
@@ -486,31 +565,97 @@ pub(crate) fn cached() -> Option<CapacityRead> {
     cache().last(Instant::now())
 }
 
-/// One live read of coord's capacity door for this device.
+/// The synchronous stage of one live read of coord's capacity door for this
+/// device: the coord base and the device file, then the asynchronous rest
+/// ([`fetch_live`]) to run under the deadline.
 ///
 /// The coord base is resolved first. A test that holds no isolated ambient is
 /// deflected to "not connected" there (`ambient::canary`); one that holds
 /// `isolated_ambient` resolves against its own empty fixture, which configures
 /// no coord base. Either way a test read never reaches the operator's device
 /// file or credential store.
-async fn fetch_live() -> Fetched {
+fn prepare_live() -> Prepared<impl Future<Output = Fetched> + Send + 'static> {
     let Some(base) = qontinui_runner_lib::profiles::connected_coord_base() else {
-        return Fetched::unknown(
-            None,
-            "no coord base is configured: this runner is not connected to coord",
-        );
+        return Prepared::Done {
+            coord_base: None,
+            fetched: Fetched::unknown(
+                None,
+                "no coord base is configured: this runner is not connected to coord",
+            ),
+        };
     };
     // The file the sample publisher reads: a device with no samples has no row.
-    let Some(device) = crate::fleet::load_device_file() else {
-        return Fetched::unknown(
-            None,
-            "~/.qontinui/machine.json names no device_id and hostname, so this runner has no \
-             device to ask about",
-        );
+    let device_id = match device_from(qontinui_runner_lib::ambient::try_read_machine_json()) {
+        Ok(device_id) => device_id,
+        Err(reason) => {
+            return Prepared::Done {
+                coord_base: Some(base),
+                fetched: Fetched::unknown(None, reason),
+            }
+        }
     };
-    let Ok(device_id) = Uuid::parse_str(device.device_id.trim()) else {
-        return Fetched::unknown(None, "~/.qontinui/machine.json's device_id is not a UUID");
+    Prepared::Fetch {
+        coord_base: base.clone(),
+        device_id,
+        fut: fetch_live(base, device_id),
+    }
+}
+
+/// The device a read of `machine.json` names, or why it names none. PURE.
+///
+/// The requirements are the sample publisher's (`fleet::load_device_file`):
+/// a `device_id` AND a `hostname`, since a device the publisher skips has no
+/// samples and so no row in coord's model. Each way the file can fail them
+/// has its own reason, naming the path whenever one resolved.
+fn device_from(
+    read: Result<
+        qontinui_runner_lib::ambient::MachineJson,
+        qontinui_runner_lib::ambient::MachineJsonError,
+    >,
+) -> Result<Uuid, String> {
+    use qontinui_runner_lib::ambient::MachineJsonError;
+    const FILE: &str = "~/.qontinui/machine.json";
+    let machine = match read {
+        Ok(machine) => machine,
+        Err(e) => {
+            let path = e
+                .path()
+                .map_or_else(|| FILE.to_string(), |p| p.display().to_string());
+            return Err(match e {
+                MachineJsonError::NoHomeDir => format!(
+                    "no home directory resolved (no QONTINUI_HOME, no home), so there is no \
+                     {FILE} to name this runner's device"
+                ),
+                ref missing if missing.is_missing() => {
+                    format!("{path} does not exist, so this runner has no device to ask about")
+                }
+                MachineJsonError::Read { source, .. } => {
+                    format!("{path} could not be read ({source}), so this runner has no device")
+                }
+                MachineJsonError::Parse { source, .. } => format!(
+                    "{path} is not a valid machine.json ({source}), so this runner has no device"
+                ),
+            });
+        }
     };
+    let Some(device_id) = machine.device_id.as_deref() else {
+        return Err(format!(
+            "{FILE} names no device_id, so this runner has no device to ask about"
+        ));
+    };
+    if machine.hostname.is_none() {
+        return Err(format!(
+            "{FILE} names no hostname: the sample publisher skips a device with no hostname, \
+             so coord holds no row for it"
+        ));
+    }
+    Uuid::parse_str(device_id.trim())
+        .map_err(|_| format!("{FILE}'s device_id {device_id:?} is not a UUID"))
+}
+
+/// The asynchronous stage of a live read, once [`prepare_live`] resolved the
+/// base and the device: the credential read, then [`fetch_from`].
+async fn fetch_live(base: String, device_id: Uuid) -> Fetched {
     let Some(bearer) = crate::coord_mcp::read_usable_device_jwt().await else {
         return Fetched::unknown(
             Some(device_id),
@@ -578,12 +723,23 @@ async fn read_body(mut resp: reqwest::Response, limit: usize) -> Result<Vec<u8>,
     }
 }
 
+/// Whether two coord bases name the same coord, ignoring a trailing `/`;
+/// `None` when either is absent. A difference in spelling alone (host case,
+/// an explicit default port) reads as `false`, so a join is refused rather
+/// than wrongly allowed. PURE.
+pub(crate) fn same_coord_base(a: Option<&str>, b: Option<&str>) -> Option<bool> {
+    Some(a?.trim_end_matches('/') == b?.trim_end_matches('/'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    /// The coord base the test preparations resolve.
+    const COORD_BASE: &str = "https://coord.qontinui.io";
 
     fn device() -> Uuid {
         Uuid::from_u128(0x0bcf_4751_acd2_4000_8000_0000_0000_0001)
@@ -648,8 +804,34 @@ mod tests {
             at,
             done: at,
             fetched_at: Utc::now(),
+            coord_base: Some(COORD_BASE.to_string()),
             fetched,
         }
+    }
+
+    /// The change-log key is (outcome, coord_base): the same outcome from a
+    /// different coord logs again, and the same pair does not.
+    #[test]
+    fn a_coord_base_change_with_the_same_outcome_is_logged_again() {
+        let t = Instant::now();
+        let first = entry_at(t, known());
+        assert!(read_changed(None, &first), "the first read is a change");
+        assert!(
+            !read_changed(Some(&first), &entry_at(t, known())),
+            "same outcome, same coord: not logged again"
+        );
+        let mut elsewhere = entry_at(t, known());
+        elsewhere.coord_base = Some("https://other.example".to_string());
+        assert!(
+            read_changed(Some(&first), &elsewhere),
+            "same outcome, another coord: logged again"
+        );
+        let mut unresolved = entry_at(t, known());
+        unresolved.coord_base = None;
+        assert!(
+            read_changed(Some(&first), &unresolved),
+            "same outcome, no coord resolved: logged again"
+        );
     }
 
     /// A clock that stands at `t` (and at this moment's wall time).
@@ -767,6 +949,15 @@ mod tests {
         assert!(reason.contains("unrecognised state"), "{reason}");
     }
 
+    /// A preparation that resolved [`device`] and hands over `fut`.
+    fn prepared<Fut>(fut: Fut) -> Prepared<Fut> {
+        Prepared::Fetch {
+            coord_base: COORD_BASE.to_string(),
+            device_id: device(),
+            fut,
+        }
+    }
+
     /// A fetch that counts its calls and answers `answer`.
     fn counting(calls: &AtomicUsize, answer: Fetched) -> impl Future<Output = Fetched> + '_ {
         calls.fetch_add(1, Ordering::SeqCst);
@@ -780,13 +971,15 @@ mod tests {
         let cache = CapacityCache::new();
         let calls = AtomicUsize::new(0);
         let t0 = Instant::now();
-        let first = cache.get(at(t0), || counting(&calls, known())).await;
+        let first = cache
+            .get(at(t0), || prepared(counting(&calls, known())))
+            .await;
         assert_eq!(first.state, "known");
         assert_eq!(first.cache_age_secs, 0.0);
         let later = t0 + Duration::from_secs(59);
         let second = cache
             .get(at(later), || {
-                counting(&calls, Fetched::unknown(None, "must not run"))
+                prepared(counting(&calls, Fetched::unknown(None, "must not run")))
             })
             .await;
         assert_eq!(calls.load(Ordering::SeqCst), 1, "coord was asked once");
@@ -797,25 +990,76 @@ mod tests {
         assert_eq!(second.cache_ttl_secs, 60);
     }
 
-    /// A fetch that never answers (a stalled credential store) is cut off at
-    /// the deadline: the read is UNKNOWN naming it, with no row, and kept for
-    /// the short TTL, so the callers behind the single-flight lock are freed.
+    /// A fetch whose future never answers (a stalled credential store) is cut
+    /// off at the deadline: the read is UNKNOWN naming it, with no row, kept
+    /// for the short TTL so the callers behind the single-flight lock are
+    /// freed — and it still names the device the preparation resolved, since
+    /// that was known before the deadline began.
     #[tokio::test(start_paused = true)]
     async fn a_fetch_past_its_deadline_is_unknown() {
         let cache = CapacityCache::new();
         let t0 = Instant::now();
         let read = cache
-            .get_within(
-                Duration::from_secs(15),
-                at(t0),
-                std::future::pending::<Fetched>,
-            )
+            .get_within(Duration::from_secs(15), at(t0), || Prepared::Fetch {
+                coord_base: COORD_BASE.to_string(),
+                device_id: Uuid::parse_str("0bcf4751-acd2-4000-8000-000000000001").unwrap(),
+                fut: std::future::pending::<Fetched>(),
+            })
             .await;
         assert_eq!(read.state, "unknown");
         assert!(read.row.is_none());
+        assert_eq!(
+            read.device_id.as_deref(),
+            Some("0bcf4751-acd2-4000-8000-000000000001"),
+            "the timed-out read keeps the device it was asking about"
+        );
+        assert_eq!(
+            read.coord_base.as_deref(),
+            Some("https://coord.qontinui.io"),
+            "and the coord it was asking"
+        );
         let reason = read.reason.as_deref().unwrap_or_default();
         assert!(reason.contains("did not finish within 15 s"), "{reason}");
+        assert!(!reason.contains("device file"), "{reason}");
         assert_eq!(read.cache_ttl_secs, UNKNOWN_TTL.as_secs());
+    }
+
+    /// A future that counts how often it is polled, and never answers.
+    struct CountingPending(Arc<AtomicUsize>);
+
+    impl Future for CountingPending {
+        type Output = Fetched;
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Fetched> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            std::task::Poll::Pending
+        }
+    }
+
+    /// A settled preparation is the read: no future is polled and no deadline
+    /// runs, even a zero one, so its reason is its own and not the timeout's.
+    #[tokio::test(start_paused = true)]
+    async fn a_done_preparation_never_polls_a_future() {
+        let cache = CapacityCache::new();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let never = CountingPending(polls.clone());
+        let read = cache
+            .get_within(Duration::ZERO, at(Instant::now()), move || {
+                // The future exists, but a `Done` drops it unpolled.
+                drop(never);
+                Prepared::<CountingPending>::Done {
+                    coord_base: None,
+                    fetched: Fetched::unknown(None, "no coord base"),
+                }
+            })
+            .await;
+        assert_eq!(polls.load(Ordering::SeqCst), 0, "no future was polled");
+        assert_eq!(read.state, "unknown");
+        assert_eq!(read.reason.as_deref(), Some("no coord base"));
+        assert_eq!(read.device_id, None);
+        assert_eq!(read.coord_base, None, "no base resolved, none served");
     }
 
     /// A slow failure is kept its full TTL from when it FINISHED: a fetch that
@@ -836,7 +1080,7 @@ mod tests {
                 calls.fetch_add(1, Ordering::SeqCst);
                 // The fetch took 15 s, past the 10 s TTL of what it returns.
                 *now.lock().unwrap() += Duration::from_secs(15);
-                std::future::ready(Fetched::unknown(None, "timed out"))
+                prepared(std::future::ready(Fetched::unknown(None, "timed out")))
             })
             .await;
         assert_eq!(slow.state, "unknown");
@@ -844,7 +1088,7 @@ mod tests {
         *now.lock().unwrap() += Duration::from_secs(9);
         let next = cache
             .get(clock.clone(), || {
-                counting(&calls, Fetched::unknown(None, "must not run"))
+                prepared(counting(&calls, Fetched::unknown(None, "must not run")))
             })
             .await;
         assert_eq!(calls.load(Ordering::SeqCst), 1, "kept, not refetched");
@@ -852,7 +1096,9 @@ mod tests {
         assert_eq!(next.cache_age_secs, 24.0);
         *now.lock().unwrap() += Duration::from_secs(1);
         cache
-            .get(clock, || counting(&calls, Fetched::unknown(None, "again")))
+            .get(clock, || {
+                prepared(counting(&calls, Fetched::unknown(None, "again")))
+            })
             .await;
         assert_eq!(calls.load(Ordering::SeqCst), 2, "10 s after it finished");
     }
@@ -868,11 +1114,13 @@ mod tests {
         let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
         let first = {
             let calls = calls.clone();
-            tokio::spawn(get_detached(cache, move || async move {
-                calls.fetch_add(1, Ordering::SeqCst);
-                let _ = gate.await;
-                let _ = done_tx.send(());
-                known()
+            tokio::spawn(get_detached(cache, move || {
+                prepared(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let _ = gate.await;
+                    let _ = done_tx.send(());
+                    known()
+                })
             }))
         };
         while calls.load(Ordering::SeqCst) == 0 {
@@ -888,14 +1136,33 @@ mod tests {
         }
         let again = {
             let calls = calls.clone();
-            get_detached(cache, move || async move {
-                calls.fetch_add(1, Ordering::SeqCst);
-                Fetched::unknown(None, "must not run")
+            get_detached(cache, move || {
+                prepared(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Fetched::unknown(None, "must not run")
+                })
             })
             .await
         };
         assert_eq!(calls.load(Ordering::SeqCst), 1, "coord was asked once");
         assert_eq!(again.state, "known");
+    }
+
+    /// A read whose task failed (here, a preparation that panics) is UNKNOWN
+    /// naming the failure, and says it is not kept: its TTL is 0 and the
+    /// cache holds nothing after it.
+    #[tokio::test]
+    async fn a_failed_task_is_an_unkept_unknown_read() {
+        let cache: &'static CapacityCache = Box::leak(Box::new(CapacityCache::new()));
+        let read = get_detached(cache, || -> Prepared<std::future::Ready<Fetched>> {
+            panic!("the preparation failed")
+        })
+        .await;
+        assert_eq!(read.state, "unknown");
+        let reason = read.reason.as_deref().unwrap_or_default();
+        assert!(reason.contains("task failed"), "{reason}");
+        assert_eq!(read.cache_ttl_secs, 0, "a read that is not kept says 0");
+        assert!(cache.last(Instant::now()).is_none(), "nothing was kept");
     }
 
     /// Once the read is a minute old coord is asked again, and the new
@@ -905,13 +1172,15 @@ mod tests {
         let cache = CapacityCache::new();
         let calls = AtomicUsize::new(0);
         let t0 = Instant::now();
-        cache.get(at(t0), || counting(&calls, known())).await;
+        cache
+            .get(at(t0), || prepared(counting(&calls, known())))
+            .await;
         let refetched = cache
             .get(at(t0 + CACHE_TTL), || {
-                counting(
+                prepared(counting(
                     &calls,
                     Fetched::unknown(Some(device()), "coord unreachable: timed out"),
-                )
+                ))
             })
             .await;
         assert_eq!(
@@ -938,7 +1207,9 @@ mod tests {
             Some(device()),
             "coord unreachable: error sending request: connection refused",
         );
-        let read = cache.get(at(t0), || counting(&calls, down.clone())).await;
+        let read = cache
+            .get(at(t0), || prepared(counting(&calls, down.clone())))
+            .await;
         assert_eq!(read.state, "unknown");
         assert_eq!(read.row, None);
         assert_eq!(read.coord, None);
@@ -954,7 +1225,7 @@ mod tests {
 
         let held = cache
             .get(at(t0 + Duration::from_secs(9)), || {
-                counting(&calls, known())
+                prepared(counting(&calls, known()))
             })
             .await;
         assert_eq!(
@@ -965,7 +1236,7 @@ mod tests {
         assert_eq!(held.state, "unknown");
 
         let retried = cache
-            .get(at(t0 + UNKNOWN_TTL), || counting(&calls, known()))
+            .get(at(t0 + UNKNOWN_TTL), || prepared(counting(&calls, known())))
             .await;
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(retried.state, "known");
@@ -983,10 +1254,12 @@ mod tests {
             let (cache, calls) = (cache.clone(), calls.clone());
             tokio::spawn(async move {
                 cache
-                    .get(at(t0), || async move {
-                        calls.fetch_add(1, Ordering::SeqCst);
-                        let _ = gate.await;
-                        known()
+                    .get(at(t0), || {
+                        prepared(async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            let _ = gate.await;
+                            known()
+                        })
                     })
                     .await
             })
@@ -999,9 +1272,11 @@ mod tests {
             let (cache, calls) = (cache.clone(), calls.clone());
             tokio::spawn(async move {
                 cache
-                    .get(at(t0), || async move {
-                        calls.fetch_add(1, Ordering::SeqCst);
-                        Fetched::unknown(None, "must not run")
+                    .get(at(t0), || {
+                        prepared(async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            Fetched::unknown(None, "must not run")
+                        })
                     })
                     .await
             })
@@ -1037,12 +1312,14 @@ mod tests {
                 (cache.clone(), clock.clone(), now.clone(), started.clone());
             tokio::spawn(async move {
                 cache
-                    .get(clock, || async move {
-                        started.fetch_add(1, Ordering::SeqCst);
-                        let _ = gate.await;
-                        // The fetch took 4 s.
-                        *now.lock().unwrap() += Duration::from_secs(4);
-                        known()
+                    .get(clock, || {
+                        prepared(async move {
+                            started.fetch_add(1, Ordering::SeqCst);
+                            let _ = gate.await;
+                            // The fetch took 4 s.
+                            *now.lock().unwrap() += Duration::from_secs(4);
+                            known()
+                        })
                     })
                     .await
             })
@@ -1054,7 +1331,9 @@ mod tests {
             let (cache, clock) = (cache.clone(), clock.clone());
             tokio::spawn(async move {
                 cache
-                    .get(clock, || async { Fetched::unknown(None, "must not run") })
+                    .get(clock, || {
+                        prepared(async { Fetched::unknown(None, "must not run") })
+                    })
                     .await
             })
         };
@@ -1082,7 +1361,9 @@ mod tests {
             "no read yet is no read, not an empty one"
         );
         let calls = AtomicUsize::new(0);
-        cache.get(at(t0), || counting(&calls, known())).await;
+        cache
+            .get(at(t0), || prepared(counting(&calls, known())))
+            .await;
         let stale = cache
             .last(t0 + Duration::from_secs(90))
             .expect("the last read");
@@ -1241,6 +1522,118 @@ mod tests {
         );
     }
 
+    /// A parsed `machine.json` from `doc`.
+    fn machine(
+        doc: Value,
+    ) -> Result<
+        qontinui_runner_lib::ambient::MachineJson,
+        qontinui_runner_lib::ambient::MachineJsonError,
+    > {
+        Ok(
+            qontinui_runner_lib::ambient::try_parse_machine_json(
+                &serde_json::to_vec(&doc).unwrap(),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn device_reason(
+        read: Result<
+            qontinui_runner_lib::ambient::MachineJson,
+            qontinui_runner_lib::ambient::MachineJsonError,
+        >,
+    ) -> String {
+        device_from(read).expect_err("names no device")
+    }
+
+    #[test]
+    fn device_from_a_complete_file_is_its_device() {
+        let read = machine(json!({"device_id": device().to_string(), "hostname": "nawa"}));
+        assert_eq!(device_from(read), Ok(device()));
+    }
+
+    #[test]
+    fn device_from_no_home_dir_says_so() {
+        let reason = device_reason(Err(
+            qontinui_runner_lib::ambient::MachineJsonError::NoHomeDir,
+        ));
+        assert!(reason.contains("no home directory resolved"), "{reason}");
+    }
+
+    #[test]
+    fn device_from_a_missing_file_says_it_does_not_exist() {
+        let reason = device_reason(Err(qontinui_runner_lib::ambient::MachineJsonError::Read {
+            path: "/h/.qontinui/machine.json".into(),
+            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+        }));
+        assert!(
+            reason.contains("/h/.qontinui/machine.json does not exist"),
+            "{reason}"
+        );
+        assert!(!reason.contains("names no"), "{reason}");
+    }
+
+    #[test]
+    fn device_from_an_unreadable_file_names_the_io_error() {
+        let reason = device_reason(Err(qontinui_runner_lib::ambient::MachineJsonError::Read {
+            path: "/h/.qontinui/machine.json".into(),
+            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "access denied"),
+        }));
+        assert!(
+            reason.contains("/h/.qontinui/machine.json could not be read (access denied)"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn device_from_an_unparseable_file_names_the_parse_error() {
+        let source = serde_json::from_slice::<Value>(b"{not json").unwrap_err();
+        let detail = source.to_string();
+        let reason = device_reason(Err(qontinui_runner_lib::ambient::MachineJsonError::Parse {
+            path: "/h/.qontinui/machine.json".into(),
+            source,
+        }));
+        assert!(
+            reason.contains("/h/.qontinui/machine.json is not a valid machine.json"),
+            "{reason}"
+        );
+        assert!(reason.contains(&detail), "{reason}");
+    }
+
+    #[test]
+    fn device_from_a_file_without_device_id_says_only_that() {
+        let reason = device_reason(machine(json!({"hostname": "nawa"})));
+        assert!(reason.contains("names no device_id"), "{reason}");
+        assert!(!reason.contains("hostname"), "{reason}");
+    }
+
+    #[test]
+    fn device_from_a_file_without_hostname_says_coord_holds_no_row() {
+        let reason = device_reason(machine(json!({"device_id": device().to_string()})));
+        assert!(reason.contains("names no hostname"), "{reason}");
+        assert!(
+            reason.contains("the sample publisher skips a device with no hostname"),
+            "{reason}"
+        );
+        assert!(reason.contains("coord holds no row for it"), "{reason}");
+    }
+
+    #[test]
+    fn device_from_a_device_id_that_is_not_a_uuid_says_so() {
+        let reason = device_reason(machine(json!({"device_id": "nawa-1", "hostname": "nawa"})));
+        assert!(reason.contains("\"nawa-1\" is not a UUID"), "{reason}");
+    }
+
+    /// On an isolated machine the real reader finds no file, and the reason
+    /// says the file is missing (not that it names nothing).
+    #[test]
+    fn device_from_the_isolated_machine_says_the_file_is_missing() {
+        let _amb = crate::test_env::isolated_ambient();
+        let reason = device_reason(qontinui_runner_lib::ambient::try_read_machine_json());
+        assert!(reason.contains("does not exist"), "{reason}");
+        assert!(reason.contains("machine.json"), "{reason}");
+    }
+
     /// The fields a local tool reads are a contract: each is present (null
     /// when absent), and the row's own fields keep coord's spelling.
     #[test]
@@ -1250,6 +1643,7 @@ mod tests {
         for key in [
             "state",
             "device_id",
+            "coord_base",
             "row",
             "coord",
             "reason",
@@ -1264,6 +1658,7 @@ mod tests {
         }
         assert_eq!(wire["state"], "known");
         assert_eq!(wire["device_id"], device().to_string());
+        assert_eq!(wire["coord_base"], "https://coord.qontinui.io");
         assert_eq!(wire["row"]["slots"]["C3"]["value"], 10);
         assert_eq!(wire["row"]["c3_cpu_cores"]["value"], 40.0);
         assert!(

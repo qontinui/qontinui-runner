@@ -2954,10 +2954,13 @@ pub(crate) fn binding_gaps() -> BindingGapReport {
 //
 // Tauri `emit` has no replay and nothing guarantees a listener at emit time,
 // so an ask that exists only as an event is spent on nobody. The persisted
-// lapse record (`binding_gap_asks.json`) IS the ask: it carries the reason,
-// [`open_binding_gap_asks`] serves it to the UI by pull
-// (`get_binding_gap_asks`), and [`AUTONOMY_BINDING_GAP_EVENT`] is only a
-// nudge to re-read.
+// lapse record (`binding_gap_asks.json`, a [`GapAskRecord`] per tenant in an
+// open lapse) IS the ask: [`open_binding_gap_asks`] serves the opened asks
+// that still hold to the UI by pull (`get_binding_gap_asks`), and
+// [`AUTONOMY_BINDING_GAP_EVENT`] is only a nudge to re-read. Of the ask's
+// reason, the record holds only the seed attempt's outcome sentence, when
+// there was one. [`binding_gap_ask_reason`] builds the reason from today's
+// [`BINDING_GAP_ASK_REASON`] and that sentence each time the ask is served.
 //
 // ## And never on UNKNOWN, nor on a sidecar too stale to act on
 //
@@ -2999,8 +3002,10 @@ pub(crate) const BINDING_GAP_PAIR_CAVEAT: &str = "pairing binds this tenant to t
 
 /// The ask's operator-facing reason: today's [`BINDING_GAP_ASK_REASON`],
 /// plus what this lapse's seed attempt came to when there was one. Built each
-/// time the ask is shown rather than stored, so correcting the text corrects
-/// asks that are already open.
+/// time the ask is shown rather than stored, so correcting
+/// [`BINDING_GAP_ASK_REASON`] corrects asks that are already open. The
+/// `seed_outcome` sentence is stored on the record, so it keeps the wording of
+/// the build that ran the seed.
 pub(crate) fn binding_gap_ask_reason(seed_outcome: &str) -> String {
     if seed_outcome.is_empty() {
         BINDING_GAP_ASK_REASON.to_string()
@@ -3021,8 +3026,10 @@ pub(crate) fn binding_gap_ask_reason(seed_outcome: &str) -> String {
 ///
 /// Unknown fields are ignored on read, so a record written by an older build
 /// (which also carried `mint_attempted`, or a stored `reason`) still loads.
-/// The reason is not stored: [`binding_gap_ask_reason`] builds it when the
-/// ask is shown, so an ask opened by an older build shows today's text.
+/// The full reason is not stored: [`binding_gap_ask_reason`] builds it when
+/// the ask is shown, so an ask opened by an older build shows today's
+/// [`BINDING_GAP_ASK_REASON`], followed by its stored `seed_outcome` when it
+/// has one.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct GapAskRecord {
     /// True once the ask for this tenant in this lapse has been RECORDED —
@@ -4733,11 +4740,14 @@ pub struct CoordCredentialStatus {
     pub pinned_tenant: bool,
     /// The state-specific WHY the sentence ([`Self::composed_reason`] or the
     /// posture's fixed [`CoordCredentialPosture::message`]) cannot carry, or
-    /// `None`. Set in two shapes: on `Dark(NoDefaultBinding)`, the heal's
+    /// `None`. Set in four shapes: on `Dark(NoDefaultBinding)`, the heal's
     /// refusal reason, which names the guard that refused — so a state that
-    /// outlives one tick says which guard, as the plan asks; and on an
+    /// outlives one tick says which guard, as the plan asks; on an
     /// ANSWERING posture, the note that no default binding exists while the
-    /// legacy slot still serves unpinned sessions (review finding 3).
+    /// legacy slot still serves unpinned sessions (review finding 3); and,
+    /// when no arm set one, [`recovery_detail`]'s text — the missing
+    /// recoveries on `unrefreshable`, and on an answering posture the warning
+    /// that no automatic recovery is left.
     pub detail: Option<String>,
 }
 
@@ -5147,7 +5157,13 @@ pub(crate) fn derive_and_publish_posture(
     pins: PosturePinInputs,
     now: i64,
 ) -> Option<PostureTransition> {
-    derive_and_publish_posture_with(observations, pins, &default_binding_verdict(), now)
+    derive_and_publish_posture_core(
+        observations,
+        pins,
+        &default_binding_verdict(),
+        &recovery_inventory(),
+        now,
+    )
 }
 
 /// [`derive_and_publish_posture`] with the default-binding verdict supplied
@@ -5156,6 +5172,24 @@ pub(crate) fn derive_and_publish_posture_with(
     observations: &[SlotObservation],
     pins: PosturePinInputs,
     default_binding: &DefaultBindingVerdict,
+    now: i64,
+) -> Option<PostureTransition> {
+    derive_and_publish_posture_core(
+        observations,
+        pins,
+        default_binding,
+        &RecoveryInventory::UNKNOWN,
+        now,
+    )
+}
+
+/// [`derive_and_publish_posture_with`] with the [`RecoveryInventory`] supplied
+/// too: the inventory fills `detail` when no arm set one ([`recovery_detail`]).
+pub(crate) fn derive_and_publish_posture_core(
+    observations: &[SlotObservation],
+    pins: PosturePinInputs,
+    default_binding: &DefaultBindingVerdict,
+    inventory: &RecoveryInventory,
     now: i64,
 ) -> Option<PostureTransition> {
     /// One entry in the `worst` fold, carrying everything the publish needs.
@@ -5266,6 +5300,11 @@ pub(crate) fn derive_and_publish_posture_with(
             // cause.
             if c.detail.is_none() && c.posture.can_answer() {
                 c.detail = binding_note.clone();
+            }
+            // What recovery is missing (P2.1 on `unrefreshable`; P2.3 as a
+            // warning on an answering posture), when nothing above said more.
+            if c.detail.is_none() {
+                c.detail = recovery_detail(c.posture, inventory);
             }
             c
         });
@@ -5411,7 +5450,12 @@ fn derive_and_publish_legacy_posture(
     pins: PosturePinInputs,
     app: Option<&tauri::AppHandle>,
 ) {
-    let obs = legacy_slot_observation(auth_manager.probe_access_token());
+    let read = auth_manager.probe_access_token();
+    // A runner holding no credential at all (never paired, a guest tier) has
+    // nothing an outage can take away, so it is not warned about one.
+    let holds_credential = matches!(read, crate::secure_storage::StoredTokenRead::Present(_));
+    record_recovery_inventory(RecoveryInventory::read(auth_manager), holds_credential);
+    let obs = legacy_slot_observation(read);
     if let Some(transition) =
         derive_and_publish_posture(&[obs], pins, chrono::Utc::now().timestamp())
     {
@@ -5616,6 +5660,10 @@ pub(crate) async fn refresh_tenant_slots(
     if tenants.is_empty() {
         return outcomes;
     }
+    // Before either posture publish below reads it, so the boot publish
+    // already carries a missing-recovery warning (P2.3).
+    // Tenant slots exist, so this runner holds (or held) a credential.
+    record_recovery_inventory(RecoveryInventory::read(auth_manager), true);
     let mut health: Vec<TenantSlotHealthRow> = Vec::with_capacity(tenants.len());
     // Phase 1 of the coord-credential-posture plan: what each slot HELD when
     // this pass looked at it — `(tenant, exp, present, unknown)`, pushed
@@ -5913,6 +5961,133 @@ pub(crate) async fn refresh_tenant_slots(
     outcomes
 }
 
+/// The refusal a failed `machine-credential/exchange` names, read from web's
+/// 4xx body.
+///
+/// Since qontinui-web#2156 web keeps its own `code` (`coord_mint_rejected` when
+/// coord refused the mint) and adds coord's refusal as `coord_code` and
+/// `coord_reason`. Web's deployed error handler spreads those `detail` fields
+/// to the TOP level of the body. A FastAPI app without that handler nests them
+/// under `detail`. Both shapes are read, the top level first.
+///
+/// Only a code-shaped value (`[a-z][a-z0-9_]{0,63}`) is kept, so an upstream
+/// sentence or a proxy's HTML page never reaches the log as a code.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct ExchangeRefusal {
+    /// Web's own refusal code (`coord_mint_rejected`, `device_credential_revoked`,
+    /// ...), from `code`, else from `error`.
+    pub(crate) code: Option<String>,
+    /// Coord's refusal code, when web relayed one (`owner_not_member`, ...).
+    pub(crate) coord_code: Option<String>,
+    /// Coord's refusal reason, when web relayed one (`no_membership`, ...).
+    pub(crate) coord_reason: Option<String>,
+}
+
+/// A body larger than this is not a refusal envelope; it is not parsed.
+const EXCHANGE_REFUSAL_BODY_MAX: usize = 16 * 1024;
+
+fn is_refusal_code(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 64
+        && bytes[0].is_ascii_lowercase()
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_')
+}
+
+/// Read an [`ExchangeRefusal`] from a failed exchange's body. A body that is
+/// not JSON, too large, or carries no code-shaped field yields the default
+/// (every field `None`), never an error.
+pub(crate) fn parse_exchange_refusal(body: &str) -> ExchangeRefusal {
+    if body.len() > EXCHANGE_REFUSAL_BODY_MAX {
+        return ExchangeRefusal::default();
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return ExchangeRefusal::default();
+    };
+    let objects: Vec<&serde_json::Map<String, serde_json::Value>> = [
+        value.as_object(),
+        value.get("detail").and_then(|d| d.as_object()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let field = |name: &str| {
+        objects.iter().find_map(|o| {
+            o.get(name)
+                .and_then(|v| v.as_str())
+                .filter(|v| is_refusal_code(v))
+                .map(str::to_owned)
+        })
+    };
+    ExchangeRefusal {
+        // `error` carries the same code on every web refusal; a body whose
+        // `detail` was a plain string (a 503) has only `error`.
+        code: field("code").or_else(|| field("error")),
+        coord_code: field("coord_code"),
+        coord_reason: field("coord_reason"),
+    }
+}
+
+/// The log line for a failed exchange: `(is_warning, message)`.
+///
+/// `owner_not_member` is a WARNING with its remedy, because it cannot be
+/// repaired from this device: coord refuses to mint for a device whose owner
+/// is no longer a member of its tenant. Every other refusal is INFO, as
+/// before, with whichever codes the body named.
+pub(crate) fn exchange_refusal_log(
+    status: reqwest::StatusCode,
+    refusal: &ExchangeRefusal,
+) -> (bool, String) {
+    let shown = |v: &Option<String>| v.clone().unwrap_or_else(|| "-".to_owned());
+    if refusal.coord_code.as_deref() == Some("owner_not_member") {
+        (
+            true,
+            format!(
+                "device_jwt_refresher: dmk exchange got HTTP {status} (code={}, \
+                 coord_code=owner_not_member, coord_reason={}) — the device owner is no \
+                 longer a member of this device's tenant; a tenant admin must restore that \
+                 membership (existing JWT preserved)",
+                shown(&refusal.code),
+                shown(&refusal.coord_reason),
+            ),
+        )
+    } else {
+        (
+            false,
+            format!(
+                "device_jwt_refresher: dmk exchange got HTTP {status} (code={}, coord_code={}, \
+                 coord_reason={}) — no recovery this path (existing JWT preserved)",
+                shown(&refusal.code),
+                shown(&refusal.coord_code),
+                shown(&refusal.coord_reason),
+            ),
+        )
+    }
+}
+
+/// Read a failed exchange's body, at most [`EXCHANGE_REFUSAL_BODY_MAX`] + 1
+/// bytes, so a misbehaving upstream cannot make the runner buffer an
+/// unbounded body. An over-cap or unreadable body comes back as `""`, which
+/// [`parse_exchange_refusal`] reads as no refusal codes.
+async fn read_exchange_refusal_body(mut resp: reqwest::Response) -> String {
+    if resp
+        .content_length()
+        .is_some_and(|n| n > EXCHANGE_REFUSAL_BODY_MAX as u64)
+    {
+        return String::new();
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    while let Ok(Some(chunk)) = resp.chunk().await {
+        buf.extend_from_slice(&chunk);
+        if buf.len() > EXCHANGE_REFUSAL_BODY_MAX {
+            return String::new();
+        }
+    }
+    String::from_utf8(buf).unwrap_or_default()
+}
+
 /// `POST {web_base}/api/v1/devices/{device_id}/machine-credential/exchange`
 /// (header `X-Device-Machine-Key: <dmk_>`, no body). This is what lets a
 /// runner offline longer than BOTH the device-JWT TTL (so 4a self-refresh is
@@ -5992,12 +6167,15 @@ pub(crate) async fn try_device_machine_key_exchange(
     if !resp.status().is_success() {
         // 401/403 (revoked/expired/mismatch), 503 (web COORD_ADMIN_SECRET
         // unset), anything else → no recovery this path. REPLACE-not-REVOKE:
-        // the existing JWT is left untouched.
-        info!(
-            "device_jwt_refresher: dmk exchange got HTTP {} — no recovery this path \
-             (existing JWT preserved)",
-            resp.status()
-        );
+        // the existing JWT is left untouched. The body names WHICH refusal it
+        // was (web's `code`, and coord's `coord_code` / `coord_reason` when
+        // coord refused the mint), and the remedies differ, so log them.
+        let status = resp.status();
+        let refusal = parse_exchange_refusal(&read_exchange_refusal_body(resp).await);
+        match exchange_refusal_log(status, &refusal) {
+            (true, line) => warn!("{line}"),
+            (false, line) => info!("{line}"),
+        }
         return None;
     }
     let body: DeviceRefreshResponse = match resp.json().await {
@@ -6306,6 +6484,168 @@ pub(crate) fn unpaired_bail_progress(verdict: &DefaultBindingVerdict) -> PairPro
 
 static DEFAULT_BINDING_VERDICT: std::sync::Mutex<Option<DefaultBindingVerdict>> =
     std::sync::Mutex::new(None);
+
+// ============================================================================
+// Recovery inventory — which no-human recoveries this runner holds.
+// ============================================================================
+
+/// `/health` `coordCredential.detail` token: no Cognito session is stored, so
+/// the refresher cannot re-mint a device JWT through `pair-cli`.
+pub(crate) const MISSING_COGNITO_SESSION: &str = "no_cognito_session";
+/// `/health` `coordCredential.detail` token: no device machine key (`dmk_`) is
+/// stored, so the cold-start exchange cannot run.
+pub(crate) const MISSING_DEVICE_MACHINE_KEY: &str = "no_device_machine_key";
+/// Which automatic (no-human) recoveries this runner holds, read from secure
+/// storage at the start of each slot pass. `None` on a field is UNKNOWN: the
+/// store could not be read. An UNKNOWN never produces a token.
+///
+/// Whether a browser can be opened is deliberately NOT probed here: a launcher
+/// on PATH does not prove a browser will open (on a display with no registered
+/// browser it fails anyway), so the signal is the launch result itself, which
+/// the pending sign-in records (`cognito::pending_sign_in`).
+///
+/// Plan 2026-11-15-headless-runner-recovers-its-coord-credential-without-a-human,
+/// P2.1 (the tokens on `unrefreshable`) and P2.3 (the warning while the
+/// credential still answers).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct RecoveryInventory {
+    pub cognito_session: Option<bool>,
+    pub device_machine_key: Option<bool>,
+}
+
+impl RecoveryInventory {
+    /// Nothing known: what a process that has not run a slot pass reports.
+    pub(crate) const UNKNOWN: RecoveryInventory = RecoveryInventory {
+        cognito_session: None,
+        device_machine_key: None,
+    };
+
+    /// Read the inventory from `auth_manager`'s store.
+    pub(crate) fn read(auth_manager: &crate::auth::AuthManager) -> Self {
+        // One store load: an unreadable store is UNKNOWN for both, never absent.
+        match auth_manager.recovery_holdings() {
+            Ok((cognito_session, device_machine_key)) => Self {
+                cognito_session: Some(cognito_session),
+                device_machine_key: Some(device_machine_key),
+            },
+            Err(_) => Self::UNKNOWN,
+        }
+    }
+
+    /// The tokens naming each recovery this runner is KNOWN to lack, in a
+    /// fixed order. Empty when nothing is known to be missing.
+    pub(crate) fn missing(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.cognito_session == Some(false) {
+            out.push(MISSING_COGNITO_SESSION);
+        }
+        if self.device_machine_key == Some(false) {
+            out.push(MISSING_DEVICE_MACHINE_KEY);
+        }
+        out
+    }
+
+    /// `true` when BOTH automatic recoveries are known to be absent: once the
+    /// device JWT expires, only a human sign-in brings the credential back.
+    pub(crate) fn needs_a_human_after_expiry(&self) -> bool {
+        self.cognito_session == Some(false) && self.device_machine_key == Some(false)
+    }
+}
+
+/// The `detail` for a posture, from the recovery inventory, when no arm set
+/// one. On `unrefreshable` it names every recovery known to be missing (P2.1);
+/// on an ANSWERING posture it warns only when both automatic recoveries are
+/// absent, so the operator hears it before the outage rather than during it
+/// (P2.3). Every other posture, and an inventory with nothing known missing,
+/// gets `None`.
+pub(crate) fn recovery_detail(
+    posture: CoordCredentialPosture,
+    inventory: &RecoveryInventory,
+) -> Option<String> {
+    let missing = inventory.missing();
+    if missing.is_empty() {
+        return None;
+    }
+    let tokens = missing.join(", ");
+    if posture == CoordCredentialPosture::Unrefreshable {
+        return Some(format!("missing recoveries: {tokens}"));
+    }
+    if posture.can_answer() && inventory.needs_a_human_after_expiry() {
+        return Some(format!(
+            "missing recoveries: {tokens} — the next outage longer than the device-JWT \
+             lifetime (~4 h) needs a human sign-in"
+        ));
+    }
+    None
+}
+
+/// The recorded inventory. Process-wide in a build; per THREAD under test, so
+/// one test's pass cannot colour another test's posture. The cost of that
+/// split: a `multi_thread` tokio test that records on one worker and publishes
+/// from another reads UNKNOWN where production would read the recorded value,
+/// so a test of the recorded path must stay on one thread (`#[tokio::test]`'s
+/// default current-thread runtime) or call `derive_and_publish_posture_core`.
+#[cfg(not(test))]
+static RECOVERY_INVENTORY: std::sync::Mutex<Option<(RecoveryInventory, bool)>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+thread_local! {
+    static RECOVERY_INVENTORY: std::cell::Cell<Option<(RecoveryInventory, bool)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Swap the recorded `(inventory, holds_credential)`, returning the previous pair.
+fn replace_recovery_inventory(
+    inventory: (RecoveryInventory, bool),
+) -> Option<(RecoveryInventory, bool)> {
+    #[cfg(not(test))]
+    {
+        RECOVERY_INVENTORY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(inventory)
+    }
+    #[cfg(test)]
+    {
+        RECOVERY_INVENTORY.with(|cell| cell.replace(Some(inventory)))
+    }
+}
+
+/// The inventory the latest slot pass recorded, or
+/// [`RecoveryInventory::UNKNOWN`] before the first.
+pub(crate) fn recovery_inventory() -> RecoveryInventory {
+    #[cfg(not(test))]
+    let recorded = *RECOVERY_INVENTORY.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(test)]
+    let recorded = RECOVERY_INVENTORY.with(std::cell::Cell::get);
+    recorded.map_or(RecoveryInventory::UNKNOWN, |(inventory, _)| inventory)
+}
+
+/// Record `inventory`, logging a warning when a runner that holds a credential
+/// first shows, or newly shows, that no automatic recovery is left (P2.3: a
+/// boot-time warning, not only an outage-time error). The dedupe is on the
+/// PAIR, so a runner first seen unpaired that then pairs with no recovery is
+/// still warned. Returns whether it warned.
+pub(crate) fn record_recovery_inventory(
+    inventory: RecoveryInventory,
+    holds_credential: bool,
+) -> bool {
+    let previous = replace_recovery_inventory((inventory, holds_credential));
+    if previous == Some((inventory, holds_credential)) {
+        return false;
+    }
+    let warn_now = holds_credential && inventory.needs_a_human_after_expiry();
+    if warn_now {
+        warn!(
+            "device_jwt_refresher: this runner holds neither a Cognito session nor a device \
+             machine key ({}); the next outage longer than the device-JWT lifetime (~4 h) \
+             needs a human sign-in",
+            inventory.missing().join(", ")
+        );
+    }
+    warn_now
+}
 
 /// The most recent MEASURED verdict, or `Unknown` before any tick measured one.
 /// Read by [`derive_and_publish_posture`].
@@ -13370,7 +13710,8 @@ mod tenant_slot_refresh_tests {
     /// The lapse record round-trips, a corrupt one fails SOFT toward "nobody
     /// asked yet", and a record written by an older build (one that carried
     /// `mint_attempted`, or a stored `reason` with since-corrected text) still
-    /// loads and serves TODAY's reason.
+    /// loads and serves TODAY's [`BINDING_GAP_ASK_REASON`] in place of that
+    /// stored `reason`, followed by the record's own `seed_outcome`.
     #[test]
     fn a_corrupt_or_legacy_lapse_record_fails_soft() {
         let path = gap_state_path("corrupt");
@@ -13412,7 +13753,8 @@ mod tenant_slot_refresh_tests {
         assert_eq!(
             open[0]["reason"],
             serde_json::json!(binding_gap_ask_reason("refused")),
-            "an open ask shows today's reason, not the text stored by the build that opened it"
+            "an open ask shows today's BINDING_GAP_ASK_REASON, not the reason stored by the \
+             build that opened it"
         );
     }
 
@@ -14100,6 +14442,157 @@ mod device_machine_key_exchange_tests {
             mgr.get_access_token().unwrap(),
             existing,
             "REPLACE-not-REVOKE: existing JWT must be UNCHANGED after a 403"
+        );
+    }
+
+    #[tokio::test]
+    async fn exchange_owner_not_member_returns_none_and_preserves_jwt() {
+        // qontinui-web#2156: coord's `owner_not_member` refusal reaches the
+        // runner in the body. The exchange still fails closed: None, and the
+        // existing JWT is untouched. The body is in web's deployed shape, with
+        // the `detail` fields spread to the top level.
+        let existing = synth_jwt(chrono::Utc::now().timestamp() + 30 * 60);
+        let mgr = setup("dmk_owner_not_member", Some("dmk_live"), Some(&existing));
+        let body = serde_json::json!({
+            "error": "coord_mint_rejected",
+            "code": "coord_mint_rejected",
+            "coord_code": "owner_not_member",
+            "coord_reason": "no_membership",
+            "message": "The device owner is not a member of the device's tenant.",
+        })
+        .to_string();
+        let (base, cap, _shutdown) = spawn_mock(StatusCode::FORBIDDEN, body);
+
+        let got = try_device_machine_key_exchange(&mgr, &base, DID, None).await;
+        assert!(got.is_none(), "owner_not_member → None");
+        assert_eq!(*cap.hits.lock().unwrap(), 1, "attempted exactly once");
+        assert_eq!(
+            mgr.get_access_token().unwrap(),
+            existing,
+            "REPLACE-not-REVOKE: existing JWT must be UNCHANGED after owner_not_member"
+        );
+    }
+
+    #[test]
+    fn refusal_reads_web_spread_top_level_shape() {
+        let body = r#"{"error":"coord_mint_rejected","code":"coord_mint_rejected","coord_code":"owner_not_member","coord_reason":"no_membership","message":"x","timestamp":1.0,"path":"/p"}"#;
+        assert_eq!(
+            parse_exchange_refusal(body),
+            ExchangeRefusal {
+                code: Some("coord_mint_rejected".into()),
+                coord_code: Some("owner_not_member".into()),
+                coord_reason: Some("no_membership".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn refusal_reads_nested_detail_shape() {
+        let body = r#"{"detail":{"error":"coord_mint_rejected","code":"coord_mint_rejected","coord_code":"revoked"}}"#;
+        assert_eq!(
+            parse_exchange_refusal(body),
+            ExchangeRefusal {
+                code: Some("coord_mint_rejected".into()),
+                coord_code: Some("revoked".into()),
+                coord_reason: None,
+            }
+        );
+    }
+
+    #[test]
+    fn refusal_reads_web_own_code_without_coord_fields() {
+        let body = r#"{"error":"device_credential_revoked","code":"device_credential_revoked","message":"Revoked."}"#;
+        assert_eq!(
+            parse_exchange_refusal(body),
+            ExchangeRefusal {
+                code: Some("device_credential_revoked".into()),
+                coord_code: None,
+                coord_reason: None,
+            }
+        );
+    }
+
+    #[test]
+    fn refusal_drops_values_that_are_not_code_shaped() {
+        // A sentence, an upper-case token, an over-long token and a non-string
+        // are never logged as a code.
+        let long = "a".repeat(65);
+        let body = serde_json::json!({
+            "code": "Coord rejected the mint.",
+            "coord_code": long,
+            "coord_reason": 42,
+            "detail": { "coord_code": "NOT_A_CODE" },
+        })
+        .to_string();
+        assert_eq!(parse_exchange_refusal(&body), ExchangeRefusal::default());
+    }
+
+    #[test]
+    fn refusal_of_a_non_json_or_oversized_body_is_empty() {
+        assert_eq!(
+            parse_exchange_refusal("<html>502 Bad Gateway</html>"),
+            ExchangeRefusal::default()
+        );
+        assert_eq!(parse_exchange_refusal(""), ExchangeRefusal::default());
+        let oversized = format!(
+            r#"{{"code":"coord_mint_rejected","pad":"{}"}}"#,
+            "x".repeat(EXCHANGE_REFUSAL_BODY_MAX)
+        );
+        assert_eq!(
+            parse_exchange_refusal(&oversized),
+            ExchangeRefusal::default()
+        );
+    }
+
+    #[test]
+    fn owner_not_member_logs_a_warning_naming_the_remedy() {
+        let refusal = ExchangeRefusal {
+            code: Some("coord_mint_rejected".into()),
+            coord_code: Some("owner_not_member".into()),
+            coord_reason: Some("no_membership".into()),
+        };
+        let (warn, line) = exchange_refusal_log(StatusCode::FORBIDDEN, &refusal);
+        assert!(warn, "owner_not_member is a warning");
+        assert!(line.contains("HTTP 403"), "{line}");
+        assert!(line.contains("code=coord_mint_rejected"), "{line}");
+        assert!(line.contains("coord_reason=no_membership"), "{line}");
+        assert!(
+            line.contains("a tenant admin must restore that membership"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn other_refusals_log_info_with_their_codes() {
+        let refusal = ExchangeRefusal {
+            code: Some("coord_mint_rejected".into()),
+            coord_code: Some("revoked".into()),
+            coord_reason: None,
+        };
+        let (warn, line) = exchange_refusal_log(StatusCode::FORBIDDEN, &refusal);
+        assert!(!warn, "a revoked refusal stays info");
+        assert!(
+            line.contains("code=coord_mint_rejected, coord_code=revoked, coord_reason=-"),
+            "{line}"
+        );
+        assert!(!line.contains("tenant admin"), "{line}");
+
+        let (warn, line) =
+            exchange_refusal_log(StatusCode::SERVICE_UNAVAILABLE, &ExchangeRefusal::default());
+        assert!(!warn);
+        assert!(
+            line.contains("HTTP 503") && line.contains("code=-, coord_code=-, coord_reason=-"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn refusal_code_falls_back_to_error() {
+        // A 503 whose `detail` was a plain string carries only `error`.
+        let body = r#"{"error":"service_unavailable","message":"Coord bridge disabled."}"#;
+        assert_eq!(
+            parse_exchange_refusal(body).code.as_deref(),
+            Some("service_unavailable")
         );
     }
 
@@ -15488,5 +15981,119 @@ mod tenant_seed_arm_tests {
         assert!(r.get("lapses").is_none());
         let r = binding_gap_lapses_report(Some(&other), None);
         assert!(r["unknown"].is_string(), "signed-out is withheld: {r}");
+    }
+}
+
+#[cfg(test)]
+mod recovery_inventory_tests {
+    //! Plan 2026-11-15-headless-runner-recovers-its-coord-credential-without-a-human,
+    //! P2.1 (`detail` names the missing recoveries on `unrefreshable`) and P2.3
+    //! (a warning while the credential still answers).
+    use super::*;
+
+    const NONE_HELD: RecoveryInventory = RecoveryInventory {
+        cognito_session: Some(false),
+        device_machine_key: Some(false),
+    };
+
+    fn unrefreshable_slot(tenant: &str) -> SlotObservation {
+        SlotObservation {
+            tenant_id: Some(tenant.to_string()),
+            exp: None,
+            present: false,
+            unknown: false,
+            outcome: Some(TenantSlotOutcome::Cleared {
+                cause: SlotClearCause::DecodedExpiry,
+                rederived: false,
+            }),
+            recovery: None,
+        }
+    }
+
+    #[test]
+    fn missing_names_only_what_is_known_absent() {
+        assert!(RecoveryInventory::UNKNOWN.missing().is_empty());
+        assert_eq!(
+            NONE_HELD.missing(),
+            vec![MISSING_COGNITO_SESSION, MISSING_DEVICE_MACHINE_KEY]
+        );
+        let key_only = RecoveryInventory {
+            cognito_session: Some(false),
+            device_machine_key: Some(true),
+        };
+        assert_eq!(key_only.missing(), vec![MISSING_COGNITO_SESSION]);
+        assert!(!key_only.needs_a_human_after_expiry());
+        assert!(NONE_HELD.needs_a_human_after_expiry());
+    }
+
+    #[test]
+    fn unrefreshable_detail_names_every_missing_recovery() {
+        let d =
+            recovery_detail(CoordCredentialPosture::Unrefreshable, &NONE_HELD).expect("a detail");
+        assert!(d.contains(MISSING_COGNITO_SESSION), "{d}");
+        assert!(d.contains(MISSING_DEVICE_MACHINE_KEY), "{d}");
+        assert_eq!(
+            recovery_detail(
+                CoordCredentialPosture::Unrefreshable,
+                &RecoveryInventory::UNKNOWN
+            ),
+            None,
+            "an UNKNOWN inventory names nothing"
+        );
+    }
+
+    #[test]
+    fn an_answering_posture_warns_only_when_no_automatic_recovery_is_left() {
+        let warn = recovery_detail(CoordCredentialPosture::Live, &NONE_HELD).expect("a warning");
+        assert!(warn.contains("needs a human sign-in"), "{warn}");
+        let key_held = RecoveryInventory {
+            device_machine_key: Some(true),
+            ..NONE_HELD
+        };
+        assert_eq!(
+            recovery_detail(CoordCredentialPosture::Live, &key_held),
+            None
+        );
+        // A non-answering posture other than `unrefreshable` keeps its own cause.
+        assert_eq!(
+            recovery_detail(CoordCredentialPosture::Absent, &NONE_HELD),
+            None
+        );
+    }
+
+    #[test]
+    fn a_runner_that_pairs_with_no_recovery_is_warned_even_if_first_seen_unpaired() {
+        // Thread-local under test, so this sequence is this test's alone.
+        assert!(
+            !record_recovery_inventory(NONE_HELD, false),
+            "unpaired: no warning"
+        );
+        assert!(record_recovery_inventory(NONE_HELD, true), "paired: warned");
+        assert!(!record_recovery_inventory(NONE_HELD, true), "warned once");
+        assert_eq!(recovery_inventory(), NONE_HELD);
+    }
+
+    #[test]
+    fn the_published_unrefreshable_posture_carries_the_missing_recoveries() {
+        let _serialised = posture_test_lock();
+        reset_coord_credential_posture_for_test();
+        let now = chrono::Utc::now().timestamp();
+        derive_and_publish_posture_core(
+            &[unrefreshable_slot("c231d9da-0ca8-4fe4-bd81-0e3d6c20339a")],
+            PosturePinInputs::UNPINNED,
+            &DefaultBindingVerdict::NoCredential,
+            &NONE_HELD,
+            now,
+        );
+        let status = coord_credential_posture().expect("a published posture");
+        assert_eq!(status.posture, CoordCredentialPosture::Unrefreshable);
+        let json = status.to_json();
+        let detail = json["detail"].as_str().expect("detail is no longer null");
+        assert!(detail.contains(MISSING_DEVICE_MACHINE_KEY), "{json}");
+        assert!(json["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(MISSING_COGNITO_SESSION));
+        reset_coord_credential_posture_for_test();
     }
 }

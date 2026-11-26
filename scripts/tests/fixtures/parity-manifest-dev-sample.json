@@ -74,7 +74,7 @@
       "rejected": null,
       "resolved_path": null,
       "detail": null,
-      "note": "not observed here — no observation was injected for `slash_commands`, which is resolved by `slash_commands::{find_commands_directory_reported, sync_slash_commands}`. This is the ABSENCE of a reading, never a finding that the capability is missing."
+      "note": "not observed here — no observation was injected for `slash_commands`, which is resolved by `slash_commands::{find_commands_directory_reported, commands_directory_in, COMMANDS_SIBLING, sync_slash_commands}`. This is the ABSENCE of a reading, never a finding that the capability is missing."
     }
   ],
   "unresolved_count": 8

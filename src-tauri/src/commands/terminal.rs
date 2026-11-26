@@ -517,7 +517,9 @@ pub const SPAWN_NAME_EVENT: &str = "terminal-spawn-name";
 /// NOT carry a Claude session id), returns `sessionIdsByTerminal`: a
 /// `{ terminal_id -> { claudeSessionId, configDir } }` map derived from the
 /// durable [`SessionLifecycleStore`]'s `terminal_id -> claude_session_id`
-/// index ([`SessionLifecycleStore::find_confirmed_open_by_terminal`]).
+/// index ([`SessionLifecycleStore::find_confirmed_open_by_terminal`]),
+/// through the join `GET /terminal-layout` shares
+/// ([`crate::terminal::layout::join_terminals`]).
 ///
 /// This is what lets the frontend attach `claudeSessionId` to a RECONNECTED
 /// tab. The per-session PR dropdown (and anything else session-scoped) gates
@@ -541,35 +543,43 @@ pub fn terminal_list(
     app: tauri::AppHandle,
     terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
 ) -> Result<CommandResponse, String> {
-    let terminals = terminal_manager.list();
+    // The shared join: each terminal with its spawn name and its CONFIRMED
+    // open record. With no store managed, no terminal has a session id.
+    let store = app.try_state::<Arc<SessionLifecycleStore>>();
+    let joined = crate::terminal::layout::join_terminals(
+        terminal_manager.list(),
+        store.as_deref().map(Arc::as_ref),
+        |id| terminal_manager.get(id).and_then(|s| s.spawn_name()),
+    );
 
     // `{ terminal_id -> spawnName }` for runner-spawned sessions, so a
     // reconnecting webview that missed `terminal-spawn-name` still gets it.
-    let spawn_names_by_terminal: serde_json::Map<String, serde_json::Value> = terminals
+    let spawn_names_by_terminal: serde_json::Map<String, serde_json::Value> = joined
         .iter()
-        .filter_map(|info| {
-            terminal_manager
-                .get(&info.id)
-                .and_then(|s| s.spawn_name())
-                .map(|n| (info.id.clone(), serde_json::Value::String(n)))
+        .filter_map(|j| {
+            j.spawn_name
+                .clone()
+                .map(|n| (j.info.id.clone(), serde_json::Value::String(n)))
         })
         .collect();
 
-    let mut session_ids_by_terminal = serde_json::Map::new();
-    if let Some(store) = app.try_state::<Arc<SessionLifecycleStore>>() {
-        for info in &terminals {
-            if let Some(rec) = store.find_confirmed_open_by_terminal(&info.id) {
-                session_ids_by_terminal.insert(
-                    info.id.clone(),
+    let session_ids_by_terminal: serde_json::Map<String, serde_json::Value> = joined
+        .iter()
+        .filter_map(|j| {
+            j.session.as_ref().map(|rec| {
+                (
+                    j.info.id.clone(),
                     serde_json::json!({
                         "claudeSessionId": rec.claude_session_id,
                         "configDir": rec.config_dir,
                     }),
-                );
-            }
-        }
-    }
+                )
+            })
+        })
+        .collect();
 
+    let terminals: Vec<&crate::terminal::types::TerminalInfo> =
+        joined.iter().map(|j| &j.info).collect();
     Ok(CommandResponse {
         success: true,
         message: None,
@@ -1357,10 +1367,10 @@ pub fn terminal_session_record_open(
         finish_reason: None,
         finish_synced: false,
         finish_coord_session_id: None,
+        finish_coord_readdressed: false,
         spawn_device_default: None,
         adopted_from: None,
         last_session_start_at: None,
-        last_alive_at: None,
         gate_id: None,
         gate_consuming_device_id: None,
         gate_bound_boot_ms: None,
@@ -1617,7 +1627,16 @@ fn mark_awaiting_account_unless_live(
 /// first npm-installed session there is seen.
 #[tauri::command]
 pub fn claude_default_config_home() -> Option<String> {
-    dirs::home_dir().and_then(|h| h.join(".claude").to_str().map(|p| p.replace('\\', "/")))
+    dirs::home_dir().and_then(|h| {
+        let dir = h.join(".claude");
+        // A default home that does not exist is a retired account: answering
+        // `null` stops a stale record naming it from being "resumed" with no
+        // `CLAUDE_CONFIG_DIR`, which lands on the shell's ambient account.
+        if !dir.is_dir() {
+            return None;
+        }
+        dir.to_str().map(|p| p.replace('\\', "/"))
+    })
 }
 
 /// Clear a session's restore-pending marker: the restore drain verified the
@@ -2293,6 +2312,24 @@ fn live_sessions_payload(
 /// handoff strategy (`ai_provider::pick_migration_target`), excluding the
 /// session's current account; an explicit target is recorded as a handoff
 /// too.
+///
+/// **This call can take minutes to resolve, and it reports no progress
+/// meanwhile.** It resolves only once the resumed CLI is PROVEN alive or the
+/// respawn has given up (`respawn_liveness::confirm_respawn`). Worst case, per
+/// attempt: up to 45 s for a launchable `claude` to reappear on PATH
+/// (`claude_cli_spawn::RESUME_RESOLVE_DELAYS`), plus up to 180 s for the pane
+/// to paint (`respawn_liveness::RESUME_LIVENESS_DEADLINE`). With
+/// `respawn_liveness::MAX_RESPAWN_ATTEMPTS` (3) attempts and the 1 s and 3 s
+/// pauses between them, that comes to about 11 minutes (3 × 225 s + 4 s =
+/// 679 s), plus the transcript carry before the first spawn. While a
+/// runner-owned CLI install is running, each attempt first waits it out, for
+/// up to `claude_cli_spawn::CLI_UPDATE_WAIT` (120 s) more. Only an install
+/// running at the start of each of the three attempts reaches the full
+/// 3 × 345 s + 4 s = 1039 s, about 17 minutes. A caller with a
+/// UI should show the migration as pending for that long, and must not read a
+/// slow answer as a hang. Returning at the first spawn and reporting the
+/// verdict by event would take a new event contract with the webview. That is
+/// deliberately not done here.
 #[tauri::command]
 pub async fn terminal_migrate_session_account(
     app: tauri::AppHandle,
@@ -2329,6 +2366,11 @@ pub async fn terminal_migrate_session_account(
         crate::ai_provider::record_handoff(&dst);
     }
 
+    // Resolves only once the resumed CLI is proven alive; a respawn that died
+    // (rolled back) or never painted is an error naming which. A pane that
+    // never painted is rolled back onto the old pane while that pane still runs
+    // (the new pane closed), unless the old pane is read to host no CLI — then
+    // the new pane keeps the session.
     let outcome = crate::terminal::account_migration::migrate_session_off_runtime(
         &app,
         &record,
@@ -2338,8 +2380,10 @@ pub async fn terminal_migrate_session_account(
     )
     .await
     .map_err(|e| {
-        // The session never reached `dst`: it must not count as a handoff.
-        crate::ai_provider::unrecord_handoff(&dst);
+        // A session that never reached `dst` must not count as a handoff.
+        if !e.reached_destination() {
+            crate::ai_provider::unrecord_handoff(&dst);
+        }
         // A refusal (already migrating / already moved / closed /
         // gone) reads as its own sentence, exactly as before the typed
         // error.
@@ -3132,10 +3176,10 @@ async fn poll_and_record_session<F>(
                 finish_reason: None,
                 finish_synced: false,
                 finish_coord_session_id: None,
+                finish_coord_readdressed: false,
                 spawn_device_default: None,
                 adopted_from: None,
                 last_session_start_at: None,
-                last_alive_at: None,
                 gate_id: gate_id.clone(),
                 gate_consuming_device_id: gate_consuming_device_id.clone(),
                 gate_bound_boot_ms,
@@ -3235,10 +3279,10 @@ pub(crate) fn record_pinned_session_open(
         finish_reason: None,
         finish_synced: false,
         finish_coord_session_id: None,
+        finish_coord_readdressed: false,
         spawn_device_default: None,
         adopted_from: None,
         last_session_start_at: None,
-        last_alive_at: None,
         gate_id,
         gate_consuming_device_id,
         gate_bound_boot_ms,
@@ -3610,6 +3654,10 @@ mod tests {
                 requested: "s".to_string(),
                 terminal_id: "t-old".to_string(),
             },
+            CloseOutcome::HeldInFlight {
+                requested: "s".to_string(),
+                terminal_id: "t-new".to_string(),
+            },
         ] {
             assert!(
                 close_outcome_response(&resolved).success,
@@ -3766,10 +3814,10 @@ mod tests {
             finish_reason: None,
             finish_synced: false,
             finish_coord_session_id: None,
+            finish_coord_readdressed: false,
             spawn_device_default: None,
             adopted_from: None,
             last_session_start_at: None,
-            last_alive_at: None,
             gate_id: None,
             gate_consuming_device_id: None,
             gate_bound_boot_ms: None,

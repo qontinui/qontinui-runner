@@ -1781,15 +1781,77 @@ mod timeout_tests {
         }
     }
 
+    /// [`sleeper`] that first creates `marker`, so a test can tell WHEN the
+    /// child actually started. The budget clock inside `run_with_timeout` and
+    /// friends starts after the spawn, but a stopwatch taken before the call
+    /// also counts `reap_detached_children()` and process creation — which on a
+    /// loaded box took 12 s against a 400 ms budget. The marker lets a test
+    /// time only what the budget governs.
+    fn sleeper_marked(marker: &std::path::Path) -> std::process::Command {
+        #[cfg(target_os = "windows")]
+        {
+            let mut c = no_window("cmd.exe");
+            // `raw_arg`: Rust's own quoting would backslash-escape the quotes,
+            // which cmd.exe does not understand.
+            use std::os::windows::process::CommandExt;
+            c.raw_arg(format!(
+                "/C echo.>\"{}\" & ping -n 60 127.0.0.1",
+                marker.display()
+            ));
+            c
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let mut c = no_window("sh");
+            c.arg("-c")
+                .arg(format!("touch '{}'; sleep 60", marker.display()));
+            c
+        }
+    }
+
+    /// Run `f` (which must run a child that creates `marker` as its first act)
+    /// and return its result with the time from the moment the marker was
+    /// first seen to the moment `f` returned. The marker appears after the
+    /// spawn, so this excludes the spawn cost the budget does not cover; if
+    /// `f` returns without the marker ever appearing, the whole span is
+    /// reported (the strictest reading).
+    fn timed_after_child_start<R: Send>(
+        marker: &std::path::Path,
+        f: impl FnOnce() -> R + Send,
+    ) -> (R, Duration) {
+        let whole = Instant::now();
+        std::thread::scope(|scope| {
+            let handle = scope.spawn(f);
+            let mut seen: Option<Instant> = None;
+            while !handle.is_finished() {
+                if seen.is_none() && marker.exists() {
+                    seen = Some(Instant::now());
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let result = handle.join().expect("the timed call must not panic");
+            // Seen on the last poll's blind spot: the child ran, then the call
+            // returned inside one poll interval.
+            let start = seen.or_else(|| marker.exists().then(Instant::now));
+            let elapsed = match start {
+                Some(t) => t.elapsed(),
+                None => whole.elapsed(),
+            };
+            (result, elapsed)
+        })
+    }
+
     /// Item 1 core assertion: a child that never returns must NOT hold the
     /// calling thread. Without the timeout this test hangs for ~59s and the
     /// elapsed assertion fails.
     #[test]
     fn a_blocking_child_returns_within_the_budget_and_is_reaped() {
         let budget = Duration::from_millis(400);
-        let started = Instant::now();
-        let out = run_with_timeout(sleeper(), budget).expect("spawn");
-        let elapsed = started.elapsed();
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("started");
+        let (out, elapsed) = timed_after_child_start(&marker, || {
+            run_with_timeout(sleeper_marked(&marker), budget).expect("spawn")
+        });
 
         match out {
             TimedOutput::TimedOut { pid, reaped } => {
@@ -1820,9 +1882,11 @@ mod timeout_tests {
     #[test]
     fn run_probe_degrades_within_budget_and_reaps() {
         let budget = Duration::from_millis(300);
-        let started = Instant::now();
-        let outcome = run_probe(sleeper(), budget, "test: hung probe");
-        let elapsed = started.elapsed();
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("started");
+        let (outcome, elapsed) = timed_after_child_start(&marker, || {
+            run_probe(sleeper_marked(&marker), budget, "test: hung probe")
+        });
 
         match outcome {
             ProbeOutcome::Degraded(DegradeReason::TimedOut { pid, reaped }) => {
@@ -1958,16 +2022,19 @@ mod timeout_tests {
     #[test]
     fn output_with_timeout_reports_a_hang_as_an_io_timeout() {
         let budget = Duration::from_millis(300);
-        let started = Instant::now();
-        let err = output_with_timeout(sleeper(), budget)
-            .expect_err("a hung child must be Err, never Ok(Output)");
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("started");
+        let (err, elapsed) = timed_after_child_start(&marker, || {
+            output_with_timeout(sleeper_marked(&marker), budget)
+                .expect_err("a hung child must be Err, never Ok(Output)")
+        });
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
         let msg = err.to_string();
         assert!(
             msg.contains("pid=") && msg.contains("reaped=true"),
             "the error must name the killed pid and prove it was reaped; got {msg:?}"
         );
-        assert!(started.elapsed() < budget * 8 + KILLED_DRAIN_GRACE);
+        assert!(elapsed < budget * 8 + KILLED_DRAIN_GRACE);
     }
 
     // ── Credential-leak regression (2026-08-30 review, CRITICAL 4) ───────────
@@ -2103,9 +2170,12 @@ mod timeout_tests {
     /// *become* the second sleep, so killing "the child" is one `SIGKILL` on a
     /// process whose sibling still owns both write ends.
     #[cfg(unix)]
-    fn hung_with_surviving_grandchild() -> std::process::Command {
+    fn hung_with_surviving_grandchild(marker: &std::path::Path) -> std::process::Command {
         let mut c = no_window("sh");
-        c.args(["-c", "sleep 60 & exec sleep 60"]);
+        c.arg("-c").arg(format!(
+            "touch '{}'; sleep 60 & exec sleep 60",
+            marker.display()
+        ));
         c
     }
 
@@ -2179,9 +2249,11 @@ mod timeout_tests {
         let _serial = GAUGE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let before = live_pipe_readers();
         let budget = Duration::from_millis(300);
-        let started = Instant::now();
-        let out = run_with_timeout(hung_with_surviving_grandchild(), budget).expect("spawn");
-        let elapsed = started.elapsed();
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("started");
+        let (out, elapsed) = timed_after_child_start(&marker, || {
+            run_with_timeout(hung_with_surviving_grandchild(&marker), budget).expect("spawn")
+        });
 
         match out {
             TimedOutput::TimedOut { pid, reaped } => {
@@ -2952,8 +3024,8 @@ mod timeout_tests {
 /// The ONE code-only line lexer: comments removed, and string, raw-string and
 /// char literals emptied. Read by this file's source guards (through
 /// `source_scan`) and by the runner binary's own source-scan tests
-/// (`ci_node::executor`, `commands::project_logs`), which is why it is gated like
-/// `ambient::test_support`: `cargo test` builds this rlib for the binary's
+/// (`ci_node::executor`, `commands::project_logs`, `file_tail`), which is why it is
+/// gated like `ambient::test_support`: `cargo test` builds this rlib for the binary's
 /// tests WITH `debug_assertions` but without `cfg(test)`. A release build has
 /// neither and compiles none of this.
 #[cfg(any(test, debug_assertions))]

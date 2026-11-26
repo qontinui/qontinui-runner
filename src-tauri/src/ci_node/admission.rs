@@ -14,6 +14,8 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+use chrono::{DateTime, Utc};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -286,8 +288,9 @@ pub(crate) fn defer_commit_floor_gb(session_warn_floor_bytes: Option<u64>) -> u6
 /// [`CiNodeSettings::effective_max_concurrent_builds_for`] over a host probe —
 /// resolved ONCE by the caller (next to [`probe_headroom`], outside the state
 /// lock) and passed in, so an unset `max_concurrent_builds` never makes this
-/// function probe the host. The same number gates the under-lock re-check in
-/// `start_build` and sizes the dispatch's host share in the executor.
+/// function probe the host or read the capacity model. The same number gates
+/// the under-lock re-check in `start_build`; the executor's host share is the
+/// static partition it never exceeds (`CiNodeSettings::dispatch_share_for`).
 ///
 /// Order is load-bearing: **rejects first, then defers.** Nothing below the
 /// allowlist check can turn a `Defer` into a `Reject`, which is the property
@@ -637,7 +640,8 @@ pub(crate) fn commit_below_floor(available_bytes: u64, floor_gb: u64) -> bool {
 /// by subtracting from an [`Instant`] (on Windows `Instant`'s epoch is boot,
 /// and a subtraction reaching below it had to be clamped to a wrong answer).
 ///
-/// - `queued_since`: when it FIRST entered this device's queue (for logs).
+/// - `queued_since`: when it FIRST entered this device's queue. It orders the
+///   queue (a re-queue returns to its arrival position) and is logged.
 /// - `release_at`: the queue deadline — arrival + [`queue_release_after`], or
 ///   coord's `queued_renewal_deadline` less [`QUEUE_RELEASE_MARGIN`] when that
 ///   is sooner. Past it the dispatch is released as
@@ -827,6 +831,10 @@ struct QueuedDispatch {
 struct CiState {
     /// dispatch_id → cancel token for the running build.
     running: HashMap<String, CancellationToken>,
+    /// dispatch_id → when it started, for every entry of `running`: what the
+    /// capacity model's sizing counts against a sample's instant
+    /// ([`running_started_by`]).
+    started_at: HashMap<String, DateTime<Utc>>,
     /// Deferred (at-cap, or below headroom) dispatches, FIFO.
     queued: VecDeque<QueuedDispatch>,
     /// A [`spawn_headroom_waker`] task is in flight. At most one, ever —
@@ -846,6 +854,7 @@ impl CiState {
     fn new() -> Self {
         Self {
             running: HashMap::new(),
+            started_at: HashMap::new(),
             queued: VecDeque::new(),
             waker_armed: false,
             keeper_arm: None,
@@ -1010,6 +1019,16 @@ fn take_expired(
     expired
 }
 
+/// Queue `entry` behind every dispatch that first queued no later than it did.
+/// A fresh arrival lands at the tail; a RE-queue (a drained dispatch deferred
+/// again, which keeps its stamp) returns to its arrival position instead of
+/// the tail, so a dispatch re-tested by a cap-rise drain or a finished build
+/// does not lose its place to ones that arrived after it. PURE over the queue.
+fn insert_in_arrival_order(queue: &mut VecDeque<QueuedDispatch>, entry: QueuedDispatch) {
+    let at = queue.partition_point(|q| q.stamp.queued_since <= entry.stamp.queued_since);
+    queue.insert(at, entry);
+}
+
 /// Push a deferred dispatch and arm the queue-keeper if none is running.
 /// `stamp` is `Some` for a RE-queue, which keeps both of its deadlines; `None`
 /// stamps it on arrival. Returns `(queue depth, newly minted keeper
@@ -1022,7 +1041,7 @@ fn enqueue_locked(
 ) -> (usize, Option<u64>) {
     let stamp = stamp
         .unwrap_or_else(|| QueueStamp::on_arrival(&payload, Instant::now(), chrono::Utc::now()));
-    state.queued.push_back(QueuedDispatch { payload, stamp });
+    insert_in_arrival_order(&mut state.queued, QueuedDispatch { payload, stamp });
     let minted = if state.keeper_arm.is_none() {
         state.keeper_generation = state.keeper_generation.wrapping_add(1);
         state.keeper_arm = Some(state.keeper_generation);
@@ -1347,6 +1366,101 @@ pub(crate) fn occupancy() -> (usize, usize) {
     (state.running.len(), state.queued.len())
 }
 
+/// How many of `started_at`'s dispatches had started by `t`. PURE.
+fn started_by(started_at: &HashMap<String, DateTime<Utc>>, t: DateTime<Utc>) -> usize {
+    started_at.values().filter(|started| **started <= t).count()
+}
+
+/// The dispatches running now that had started by `t` — the ones a capacity
+/// sample taken at `t` already saw (`host_sizing`, plan
+/// `2026-11-05-one-free-resource-model-places-sessions-builds-and-ci` Phase 7).
+/// Takes `ci_state`'s lock: never call it while holding that lock.
+pub(crate) fn running_started_by(t: DateTime<Utc>) -> usize {
+    let state = ci_state().lock().unwrap();
+    started_by(&state.started_at, t)
+}
+
+/// How many deferred dispatches a cap rise from `last_cap` to `cap` may
+/// re-admit with `running` builds running and `queued` waiting: the room the
+/// rise opened, only when the cap ROSE. PURE.
+fn room_opened(last_cap: u32, cap: u32, running: usize, queued: usize) -> usize {
+    if cap <= last_cap {
+        return 0;
+    }
+    (cap as usize).saturating_sub(running).min(queued)
+}
+
+/// The cap the last republisher tick saw, LOWERED by every deferral to the
+/// cap that deferral was decided at ([`CapRiseTracker::note_deferred`]). A cap
+/// that dips and recovers between two ticks (a build finishes, lowering the
+/// model's cap and the running count together, and the next read restores the
+/// cap) is then still seen as a rise by the next tick, so the dispatch
+/// deferred at the dip is drained rather than waiting for the running set to
+/// empty. A type rather than a bare atomic so its tick/deferral sequence is
+/// tested on an instance of its own ([`LAST_CAP`] is the process's one).
+struct CapRiseTracker(std::sync::atomic::AtomicU32);
+
+impl CapRiseTracker {
+    /// No tick has run yet: the first tick never reads as a rise.
+    const fn new() -> Self {
+        Self(std::sync::atomic::AtomicU32::new(u32::MAX))
+    }
+
+    /// Record that a dispatch was deferred while the cap read `cap` — at the
+    /// cap, or for headroom, or a drained re-submit deferring again — so the
+    /// next tick measures its rise from there. A deferral at a cap the next
+    /// tick does not exceed drains nothing; one the tick exceeds is re-tested,
+    /// which admission re-checks, so a wobbling cap costs a re-queue, never an
+    /// over-admission. Call it under `ci_state`'s lock, in the same critical
+    /// section as the enqueue.
+    fn note_deferred(&self, cap: u32) {
+        self.0.fetch_min(cap, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// A tick read `cap`: returns the cap to measure its rise from, and makes
+    /// `cap` the next tick's baseline.
+    fn tick(&self, cap: u32) -> u32 {
+        self.0.swap(cap, std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+static LAST_CAP: CapRiseTracker = CapRiseTracker::new();
+
+/// [`CapRiseTracker::note_deferred`] on the process's [`LAST_CAP`].
+fn note_deferred_at_cap(cap: u32) {
+    LAST_CAP.note_deferred(cap);
+}
+
+/// Re-admit deferred dispatches when the node's cap ROSE. The capacity model
+/// (plan `2026-11-05-one-free-resource-model-places-sessions-builds-and-ci`
+/// Phase 7) can raise an unset cap without a build finishing, and a finished
+/// build is otherwise the only thing that drains a dispatch deferred at the
+/// cap — it would wait while the model reports free slots. Called from the
+/// budget republisher's tick. Takes `ci_state`'s lock itself, and the cap read
+/// takes it too, so never call it while holding that lock.
+pub(crate) fn drain_deferred_on_cap_rise() {
+    let settings = crate::settings::get_ci_node_settings();
+    if !settings.enabled {
+        return;
+    }
+    let cap = settings.effective_max_concurrent_builds_for(super::host_sizing::probe());
+    let last_cap = LAST_CAP.tick(cap);
+    let ready: Vec<QueuedDispatch> = {
+        let mut state = ci_state().lock().unwrap();
+        let n = room_opened(last_cap, cap, state.running.len(), state.queued.len());
+        state.queued.drain(..n).collect()
+    };
+    for queued in ready {
+        info!(
+            "ci_node: capacity rose to {cap} — re-admitting deferred dispatch {}",
+            queued.payload.dispatch_id
+        );
+        // WITH its stamp, as every re-admission does (`LiveReadmission`), so
+        // the queue's clocks are not reset.
+        admit(queued.payload, Some(queued.stamp));
+    }
+}
+
 /// Coord base for reporting on a payload (payload-pinned URL first, profile
 /// fallback).
 fn report_base(payload: &CiDispatchPayload) -> Option<String> {
@@ -1396,8 +1510,10 @@ fn admit(payload: CiDispatchPayload, stamp: Option<QueueStamp>) {
     let headroom = probe_headroom();
     // The capacity is resolved here, once, for the same reason: an unset
     // `max_concurrent_builds` resolves to the host suggestion, which probes the
-    // host. `admission_decision`, the under-lock re-check and the executor's
-    // host share all use this one number.
+    // host and reads the capacity model (taking this state's lock, so it must
+    // run before the lock below). `admission_decision` and the under-lock
+    // re-check use this one number; the executor's host share is the static
+    // partition it never exceeds.
     let host = super::host_sizing::probe();
     let max_concurrent = settings.effective_max_concurrent_builds_for(host);
     let decision = {
@@ -1432,6 +1548,9 @@ fn admit(payload: CiDispatchPayload, stamp: Option<QueueStamp>) {
             let (depth, needs_waker, needs_keeper) = {
                 let mut state = ci_state().lock().unwrap();
                 let (_, needs_keeper) = enqueue_locked(&mut state, payload, stamp);
+                // Under the same lock as the push, so a tick cannot consume
+                // the lowered cap before the dispatch is in the queue.
+                note_deferred_at_cap(max_concurrent);
                 // An at-cap defer is drained by `on_build_finished` — something
                 // is running, so something will finish. A HEADROOM defer has no
                 // such guarantee: with nothing running, nothing will ever
@@ -1523,9 +1642,11 @@ impl Readmit for LiveReadmission {
 /// with a fresh cancel token registered under the dispatch_id.
 ///
 /// `host` and `max_concurrent` are the probe and resolved capacity `submit`
-/// admitted against; they are threaded through so the re-check and the
-/// executor's per-dispatch host share use the same N. `stamp` is carried for
-/// the slot-race re-defer below, so it keeps the dispatch's original stamp.
+/// admitted against; they are threaded through so the re-check uses the same
+/// N. The executor's per-dispatch host share is the static partition of `host`
+/// (or the operator's value), which the admitted N never exceeds
+/// (`CiNodeSettings::dispatch_share_for`). `stamp` is carried for the
+/// slot-race re-defer below, so it keeps the dispatch's original stamp.
 fn start_build(
     payload: CiDispatchPayload,
     settings: CiNodeSettings,
@@ -1536,7 +1657,7 @@ fn start_build(
     let root = match crate::workspace_paths::require_workspace_root() {
         Ok(root) => root,
         Err(reason) => {
-            reject(&payload, reason);
+            reject(&payload, reason.to_string());
             return;
         }
     };
@@ -1611,6 +1732,12 @@ fn start_build(
         "ci_node: starting dispatch {} repo={} sha={} check_name={:?}",
         dispatch_id, payload.repo, payload.head_sha, payload.check_name
     );
+    // The executor sizes this dispatch as one of N equal host shares, N the
+    // static partition (or the operator's value). With the capacity model
+    // (plan 2026-11-05 Phase 7) the admitted total is at most N and falls
+    // below it on a busy box, so the shares never oversubscribe the host —
+    // `CiNodeSettings::dispatch_share_for`.
+    let share_n = settings.dispatch_share_for(host);
     // Counted for the systemd watchdog gate (plan 2026-10-19 Phase 2b,
     // `crate::sd_notify`): a wedged runner is not watchdog-killed while a build
     // runs and its lease is live (`sd_notify::CI_BUILD_PROTECTION`). Moved
@@ -1619,7 +1746,7 @@ fn start_build(
     let in_flight = crate::sd_notify::ci_build_in_flight();
     tokio::spawn(async move {
         let _in_flight = in_flight;
-        super::executor::run_dispatch(payload, root, token, host, max_concurrent).await;
+        super::executor::run_dispatch(payload, root, token, host, share_n).await;
         on_build_finished(&dispatch_id);
     });
 }
@@ -1652,6 +1779,8 @@ fn claim_slot_or_requeue(
     if state.running.len() >= max_concurrent.max(1) as usize {
         let dispatch_id = payload.dispatch_id.clone();
         let (_, needs_keeper) = enqueue_locked(&mut state, payload, stamp);
+        // Under the same lock as the push (`note_deferred_at_cap`).
+        note_deferred_at_cap(max_concurrent);
         return SlotClaim::Requeued {
             dispatch_id,
             needs_keeper,
@@ -1660,6 +1789,9 @@ fn claim_slot_or_requeue(
     state
         .running
         .insert(payload.dispatch_id.clone(), token.clone());
+    state
+        .started_at
+        .insert(payload.dispatch_id.clone(), Utc::now());
     SlotClaim::Claimed(Box::new(payload))
 }
 
@@ -1676,6 +1808,7 @@ fn on_build_finished_in<R: Readmit>(state: &Mutex<CiState>, dispatch_id: &str, r
     let next = {
         let mut state = state.lock().unwrap();
         state.running.remove(dispatch_id);
+        state.started_at.remove(dispatch_id);
         state.queued.pop_front()
     };
     if let Some(q) = next {
@@ -2856,7 +2989,11 @@ mod tests {
         assert_eq!(state.queued[0].stamp, first);
         let (depth, armed) = enqueue_locked(&mut state, queued_payload("b"), None);
         assert_eq!((depth, armed), (2, None), "one keeper, ever");
-        let fresh = state.queued[1].stamp;
+        // The fresh stamp is earlier than the carried "future" one, so the
+        // arrival-order insert puts it first, and the carried stamp is intact.
+        assert_eq!(state.queued[0].payload.dispatch_id, "b");
+        assert_eq!(state.queued[1].stamp, first);
+        let fresh = state.queued[0].stamp;
         assert!(
             fresh.queued_since < first.queued_since
                 && fresh.renew_by == fresh.queued_since + UNRENEWED_HOLD
@@ -2885,9 +3022,58 @@ mod tests {
             cpus: 48,
         };
 
-    /// The capacity `submit` would resolve for `s` — here against [`TEST_HOST`].
+    /// The capacity `submit` would resolve for `s` against [`TEST_HOST`] when
+    /// the capacity model does not answer (its static suggestion) — pure, so
+    /// no process-global read or dial can change it.
     fn cap_of(s: &CiNodeSettings) -> u32 {
-        s.effective_max_concurrent_builds_for(TEST_HOST)
+        s.effective_max_concurrent_builds_with(
+            super::super::host_sizing::suggested_concurrent_builds(TEST_HOST),
+        )
+    }
+
+    /// A cap rise re-admits what it made room for, and only a rise does; the
+    /// first tick (no previous cap) re-admits nothing.
+    #[test]
+    fn only_a_cap_rise_reopens_deferred_dispatches() {
+        assert_eq!(room_opened(3, 5, 3, 4), 2);
+        assert_eq!(room_opened(3, 5, 4, 1), 1);
+        assert_eq!(room_opened(5, 5, 0, 4), 0, "no rise, no drain");
+        assert_eq!(room_opened(5, 3, 0, 4), 0, "a fall drains nothing");
+        assert_eq!(room_opened(u32::MAX, 5, 0, 4), 0, "the first tick");
+        assert_eq!(room_opened(3, 5, 9, 4), 0, "still over the new cap");
+        // A dip between two ticks: the last tick saw 4; a build finished,
+        // lowering the cap and `running` together, so the queue head deferred
+        // at 3 (the deferral lowers the remembered cap with `fetch_min`); the
+        // next read restores 4. Measured from the tick alone there is no rise;
+        // from the deferral there is, and the dispatch drains.
+        assert_eq!(room_opened(4, 4, 3, 1), 0, "from the tick's cap: missed");
+        assert_eq!(
+            room_opened(4u32.min(3), 4, 3, 1),
+            1,
+            "from the deferral's cap"
+        );
+    }
+
+    /// The sizing counts only the dispatches that had started by the sample's
+    /// instant: one started after it is inside the slots the sample served.
+    #[test]
+    fn only_dispatches_started_by_the_instant_are_counted() {
+        let t = DateTime::parse_from_rfc3339("2026-11-13T04:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let started_at: HashMap<String, DateTime<Utc>> = [
+            ("before".to_string(), t - chrono::Duration::seconds(90)),
+            ("at".to_string(), t),
+            ("after".to_string(), t + chrono::Duration::seconds(5)),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(started_by(&started_at, t), 2);
+        assert_eq!(
+            started_by(&started_at, t - chrono::Duration::seconds(91)),
+            0
+        );
+        assert_eq!(started_by(&HashMap::new(), t), 0);
     }
 
     /// Plan 2026-09-22-ci-capacity-...: an UNSET capacity admits up to the host
@@ -3682,5 +3868,57 @@ mod tests {
                 DiskGate::Ok => panic!("1 GiB free is below the {FLOOR} GiB floor"),
             }
         }
+    }
+
+    /// A re-queued dispatch keeps its stamp and returns to its arrival
+    /// position, not the tail (review round 5 on qontinui-runner#2921).
+    #[test]
+    fn a_requeue_returns_to_its_arrival_position_not_the_tail() {
+        let base = Instant::now();
+        let mut q: VecDeque<QueuedDispatch> = VecDeque::new();
+        for (id, secs) in [("a", 0), ("c", 20), ("d", 30)] {
+            insert_in_arrival_order(
+                &mut q,
+                queued_at(queued_payload(id), base + Duration::from_secs(secs)),
+            );
+        }
+        // "b" arrived between "a" and "c", was drained and deferred again.
+        insert_in_arrival_order(
+            &mut q,
+            queued_at(queued_payload("b"), base + Duration::from_secs(10)),
+        );
+        // A fresh arrival still lands at the tail, and an equal stamp keeps
+        // FIFO among equals.
+        insert_in_arrival_order(
+            &mut q,
+            queued_at(queued_payload("e"), base + Duration::from_secs(30)),
+        );
+        let order: Vec<&str> = q.iter().map(|e| e.payload.dispatch_id.as_str()).collect();
+        assert_eq!(order, ["a", "b", "c", "d", "e"]);
+    }
+
+    /// The tick/deferral SEQUENCE, on an instance of its own (review round 5
+    /// on qontinui-runner#2921): a dip between ticks still drains, a deferral
+    /// at the cap the next tick reads drains nothing, and the first tick is
+    /// never a rise.
+    #[test]
+    fn the_cap_rise_tracker_drains_a_dip_between_ticks() {
+        let t = CapRiseTracker::new();
+        // First tick: baseline u32::MAX, so no rise whatever the cap.
+        let last = t.tick(4);
+        assert_eq!(room_opened(last, 4, 0, 3), 0);
+        // Deferred at 4 with 4 running; the next tick still reads 4.
+        t.note_deferred(4);
+        let last = t.tick(4);
+        assert_eq!(room_opened(last, 4, 4, 1), 0, "no rise, nothing drains");
+        // A build finishes: the cap dips to 3 and a dispatch is deferred at 3;
+        // before the next tick the cap recovers to 4. The tick sees a rise.
+        t.note_deferred(3);
+        let last = t.tick(4);
+        assert_eq!(last, 3);
+        assert_eq!(room_opened(last, 4, 3, 1), 1, "the dip's deferral drains");
+        // A deferral ABOVE the tick's baseline cannot raise it.
+        t.note_deferred(9);
+        assert_eq!(t.tick(4), 4);
     }
 }

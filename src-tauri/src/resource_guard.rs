@@ -2483,12 +2483,38 @@ pub(crate) fn lane_verdicts() -> Option<LaneVerdicts> {
     // behaviour-neutral BY CONSTRUCTION: the verdict below still consults the
     // commit figure and only the commit figure. Phase 2 is what gives the
     // physical reading a floor of its own; do not add one here.
-    let (lane, free_commit_bytes, free_phys_bytes) =
-        crate::fleet::resource_sample::spawn_gate_reading();
-    let floors = effective_session_floors(&local, lane);
+    Some(lane_verdicts_given(
+        &local,
+        crate::fleet::resource_sample::spawn_gate_reading(),
+    ))
+}
+
+/// [`lane_verdicts`] over a memory reading the caller ALREADY took — the
+/// `(lane, free commit, free physical)` triple
+/// [`crate::fleet::resource_sample::spawn_gate_reading`] returns. The host-lane
+/// sampler passes the one `memory_status()` it publishes, so the launch
+/// capacity on a sample is judged against the very memory figures that sample
+/// carries (plan `2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling`
+/// Phase 2). `None` when the session guard is disabled, as [`lane_verdicts`].
+pub(crate) fn lane_verdicts_with_memory(
+    memory: (&'static str, Option<u64>, Option<u64>),
+) -> Option<LaneVerdicts> {
+    let local = crate::settings::get_session_guard_settings();
+    if !local.enabled {
+        return None;
+    }
+    Some(lane_verdicts_given(&local, memory))
+}
+
+/// Both lanes over one memory reading and the live thread reading.
+fn lane_verdicts_given(
+    local: &SessionGuardSettings,
+    (lane, free_commit_bytes, free_phys_bytes): (&'static str, Option<u64>, Option<u64>),
+) -> LaneVerdicts {
+    let floors = effective_session_floors(local, lane);
     let memory = evaluate(lane, free_commit_bytes, &floors);
-    let threads = thread_lane_verdict(&local);
-    Some(LaneVerdicts {
+    let threads = thread_lane_verdict(local);
+    LaneVerdicts {
         memory_lane: lane,
         free_commit_bytes,
         free_phys_bytes,
@@ -2496,7 +2522,7 @@ pub(crate) fn lane_verdicts() -> Option<LaneVerdicts> {
         critical_free_commit_bytes: floors.critical_free_commit_bytes,
         memory,
         threads,
-    })
+    }
 }
 
 /// The composed (heavier-lane) verdict of a [`LaneVerdicts`], without the

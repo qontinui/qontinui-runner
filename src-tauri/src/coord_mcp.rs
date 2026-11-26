@@ -684,8 +684,9 @@ fn loopback_handshake_key() -> Option<&'static str> {
 /// Constant-time byte equality. Deliberately NOT `==`: a short-circuiting
 /// comparison on a secret leaks its prefix through timing, and this route is
 /// reachable by any local process, so the oracle is genuinely available.
-/// Backed by `subtle`, already a dependency.
-fn secret_eq(a: &[u8], b: &[u8]) -> bool {
+/// Backed by `subtle`, already a dependency. Shared: the transcript-bind door's
+/// key and terminal-proof checks use it too.
+pub(crate) fn secret_eq(a: &[u8], b: &[u8]) -> bool {
     use subtle::ConstantTimeEq;
     // `ct_eq` requires equal lengths; the length itself is not a secret (the
     // key is a fixed-width hex string), so comparing it first is safe and is
@@ -6203,8 +6204,14 @@ pub(crate) fn workdir_for_nonce(nonce: &str) -> Option<String> {
 /// The runner TERMINAL a registered proxy nonce was provisioned for
 /// ([`NonceBinding::terminal_id`]). `None` for an empty, unregistered, or
 /// no-longer-valid nonce ([`live_binding`]) — and also for a live binding that
-/// legitimately has no terminal (restored, adopted, mint-route, in-cwd
-/// `.mcp.json`, agent).
+/// legitimately has no terminal (adopted, mint-route, in-cwd `.mcp.json`,
+/// agent).
+///
+/// A RESTORED binding is NOT terminal-less: the persisted store carries the
+/// terminal, so a key restored at boot names the terminal it was minted for —
+/// a PTY that died with the previous runner process. That `Some` is an
+/// eviction-key fact, not evidence that the terminal hosts anything in this
+/// process: matched against a live host it misses, never answers wrongly.
 ///
 /// This is the **deterministic** leg of session-fabric Phase 0 caller
 /// self-identification: `nonce → terminal_id → the OPEN lifecycle record with
@@ -6956,7 +6963,12 @@ pub(crate) fn repo_unsettled_refusal(
 /// Does this device hold credentials for more than one tenant? An UNREADABLE
 /// store answers `true`: the conservative arm for a guard whose failure mode is
 /// a cross-tenant answer, and the refusal it produces is retryable.
-fn device_is_multi_bound() -> bool {
+///
+/// Also the SessionStart policy injection's "multi-bound" input
+/// ([`crate::mcp::policy_tenant::policy_tenant_decision`]), so the injection and
+/// the proxy's own row-1d guard agree on which devices can be answered by the
+/// wrong tenant.
+pub(crate) fn device_is_multi_bound() -> bool {
     crate::auth::HeldDeviceTenants::read(&crate::auth::AuthManager::new())
         .set()
         .map(|held| held.len() > 1)
@@ -7413,6 +7425,58 @@ pub(crate) async fn session_bearer_and_tenant_or_refuse(
         })
         .await,
     )
+}
+
+/// What [`terminal_session_bearer_and_tenant`] found for one terminal.
+///
+/// Deliberately not `Debug`: [`Self::Answered`] carries a bearer token, and a
+/// `{:?}` of this value would put it in a log line.
+pub(crate) enum TerminalSessionTenant {
+    /// The terminal's session holds a nonce, and this is exactly what
+    /// [`session_bearer_and_tenant_or_refuse`] answered for it: the tenant the
+    /// session's own coord-mcp calls select (`None` = the default slot) and
+    /// that slot's bearer, or the proxy's refusal.
+    Answered(Result<(Option<Uuid>, Option<String>), ProxyRefusal>),
+    /// No nonce names the terminal's session, so the proxy has nothing to
+    /// decide for it. The reason is the session-tenancy census vocabulary
+    /// (`no_session_nonce` | `coord_mcp_delivery_unrecorded`).
+    NoNonce(&'static str),
+}
+
+/// The coord-mcp proxy's (tenant, bearer) decision for the session hosted in
+/// `terminal_id` — one minimal composition of [`session_nonce`] (the key the
+/// identity seam gave this terminal, or its cwd's `.mcp.json` key) and
+/// [`session_bearer_and_tenant_or_refuse`] (plan
+/// `2026-11-13-runner-policy-injection-uses-the-device-default-tenant-not-the-sessions`
+/// Design §1).
+///
+/// It adds no resolver: the answer is the one [`decide_session_tenant`] gives
+/// every coord-mcp call this session makes, so a reader using it (the
+/// SessionStart policy injection) acts as the tenant the session itself acts
+/// as. It goes through the AWAITING door on purpose — SessionStart is the
+/// session's FIRST call, and the read-only census paths
+/// ([`session_tenant_decision`], [`session_credential_tenant`]) do not wait
+/// for the repo expectation, so they would answer a repo-steered session from
+/// the machine rows.
+///
+/// A cwd `.mcp.json` that holds no runner nonce is [`TerminalSessionTenant::NoNonce`],
+/// not a decision for `None`: deciding for no nonce reads only the machine
+/// rows, which is the device default rather than this session.
+pub(crate) async fn terminal_session_bearer_and_tenant(
+    terminal_id: &str,
+    workdir: Option<&str>,
+) -> TerminalSessionTenant {
+    match session_nonce(terminal_id, workdir) {
+        SessionNonce::Nonce(Some(nonce)) => {
+            TerminalSessionTenant::Answered(session_bearer_and_tenant_or_refuse(Some(nonce)).await)
+        }
+        SessionNonce::Nonce(None) | SessionNonce::NoNonce => {
+            TerminalSessionTenant::NoNonce("no_session_nonce")
+        }
+        SessionNonce::DeliveryUnrecorded => {
+            TerminalSessionTenant::NoNonce("coord_mcp_delivery_unrecorded")
+        }
+    }
 }
 
 /// The join-result half of [`session_bearer_and_tenant_or_refuse`], pure so the
@@ -10152,9 +10216,11 @@ pub(crate) enum StdioShimGate {
 /// and a config checkout. `Probe` runs the REAL selftest path against a
 /// caller-supplied script, uncached — that is how the refused-selftest arms
 /// (missing interpreter, non-zero exit, timeout) are exercised for real.
+/// Crate-visible so a door's tests elsewhere (`mcp::sessions`) can drive the
+/// stdio document every observed session presents.
 #[cfg(test)]
 #[derive(Debug, Clone)]
-enum StdioShimGateOverride {
+pub(crate) enum StdioShimGateOverride {
     Fixed(StdioShimGate),
     Probe {
         shim: std::path::PathBuf,
@@ -10173,11 +10239,11 @@ thread_local! {
 /// tests never see each other's gate, and cleared on drop (panic path
 /// included).
 #[cfg(test)]
-struct StdioShimGateGuard;
+pub(crate) struct StdioShimGateGuard;
 
 #[cfg(test)]
 impl StdioShimGateGuard {
-    fn install(gate: StdioShimGateOverride) -> Self {
+    pub(crate) fn install(gate: StdioShimGateOverride) -> Self {
         STDIO_SHIM_GATE_OVERRIDE.with(|c| *c.borrow_mut() = Some(gate));
         StdioShimGateGuard
     }
@@ -10214,7 +10280,7 @@ pub(crate) fn stdio_shim_gate() -> StdioShimGate {
                 shim,
                 interpreters,
                 budget,
-            } => probe_stdio_shim(Some(shim), &interpreters, budget),
+            } => probe_stdio_shim(Ok(shim), &interpreters, budget),
         };
     }
     if switch.is_none() && cfg!(test) {
@@ -10317,14 +10383,15 @@ fn probe_stdio_shim_and_store() -> StdioShimGate {
 
 /// `<qontinui-root>/qontinui-claude-config/scripts/coord-mcp-shim.py`, resolved
 /// the way the runner resolves that repo everywhere else (the workspace root),
-/// or `None` when no root resolves. Existence is the probe's business.
-fn resolve_stdio_shim_path() -> Option<std::path::PathBuf> {
-    Some(
-        qontinui_root_dir()?
-            .join("qontinui-claude-config")
-            .join("scripts")
-            .join(COORD_MCP_STDIO_SHIM_FILE),
-    )
+/// or the typed `WorkspaceRootUnresolved` when no root resolves. Existence is
+/// the probe's business.
+fn resolve_stdio_shim_path(
+) -> Result<std::path::PathBuf, qontinui_types::paths::WorkspaceRootUnresolved> {
+    Ok(crate::workspace_paths::runner_workspace_root()
+        .require()?
+        .join("qontinui-claude-config")
+        .join("scripts")
+        .join(COORD_MCP_STDIO_SHIM_FILE))
 }
 
 /// The uncached probe: the shim must exist, and `<interpreter> <shim>
@@ -10332,15 +10399,18 @@ fn resolve_stdio_shim_path() -> Option<std::path::PathBuf> {
 /// manages it. Every failure is a [`StdioShimGate::Refused`] naming what was
 /// tried, never an error — the builder's fail-open contract.
 fn probe_stdio_shim(
-    shim: Option<std::path::PathBuf>,
+    shim: Result<std::path::PathBuf, qontinui_types::paths::WorkspaceRootUnresolved>,
     interpreters: &[std::path::PathBuf],
     budget: std::time::Duration,
 ) -> StdioShimGate {
-    let Some(shim) = shim else {
-        return StdioShimGate::Refused(format!(
-            "no workspace root resolved, so <root>/qontinui-claude-config/scripts/\
-             {COORD_MCP_STDIO_SHIM_FILE} cannot be located"
-        ));
+    let shim = match shim {
+        Ok(shim) => shim,
+        Err(unresolved) => {
+            return StdioShimGate::Refused(format!(
+                "{unresolved} <root>/qontinui-claude-config/scripts/\
+                 {COORD_MCP_STDIO_SHIM_FILE} cannot be located without it"
+            ))
+        }
     };
     if !shim.is_file() {
         return StdioShimGate::Refused(format!("shim absent at {}", shim.display()));
@@ -10882,9 +10952,45 @@ pub(crate) fn write_degraded_breadcrumb(
     );
     let line2 = breadcrumb_stamp_json(workdir, verdict, port);
     let path = Path::new(workdir).join(COORD_MCP_STATUS_FILE);
-    if let Err(e) = std::fs::write(&path, format!("{line1}\n{line2}\n")) {
+    if let Err(e) = replace_breadcrumb(&path, &format!("{line1}\n{line2}\n")) {
         warn!("coord_mcp: failed to write degraded breadcrumb in {workdir}: {e}");
     }
+}
+
+/// Name prefix of the breadcrumb's atomic-replace temp file. Its readers are
+/// the two rosters that must recognise a crash-left temp file:
+/// `fleet::MANAGED_REPO_EXCLUDES` (spelled there as the glob
+/// `.coord-mcp-status.tmp-*`) and `agent_worktree::dirty::is_scaffolding_path`.
+pub(crate) const COORD_MCP_STATUS_TMP_PREFIX: &str = ".coord-mcp-status.tmp-";
+
+/// A fresh, unique temp-file name for [`replace_breadcrumb`]: the prefix, then
+/// this process's id and a v7 uuid, so concurrent writers never share one.
+pub(crate) fn breadcrumb_tmp_name() -> String {
+    format!(
+        "{COORD_MCP_STATUS_TMP_PREFIX}{}-{}",
+        std::process::id(),
+        uuid::Uuid::now_v7().simple()
+    )
+}
+
+/// Replace the breadcrumb at `path` with `body` ATOMICALLY: write a sibling
+/// temp file, then rename it over the breadcrumb. `std::fs::write` truncates
+/// before it writes, so a reader racing a rewrite (the probe re-stamping it,
+/// `/gate`, `/coord-revive`) could read an EMPTY file, which no reader can
+/// tell from a breadcrumb with no cause. On Windows a reader holding the old
+/// file open blocks the rename only if it opened WITHOUT `FILE_SHARE_DELETE`
+/// (Rust's own readers share delete; a .NET or CRT reader may not); the write
+/// then fails and is logged, leaving the previous breadcrumb in place. A temp
+/// file a crash leaves behind is excluded by the runner's managed excludes
+/// (`fleet::MANAGED_REPO_EXCLUDES`) and is runner scaffolding to reclaim
+/// (`agent_worktree::dirty::is_scaffolding_path`), so it neither shows in a
+/// walked repo's `git status` nor pins an agent worktree unreclaimable.
+fn replace_breadcrumb(path: &Path, body: &str) -> std::io::Result<()> {
+    let tmp = path.with_file_name(breadcrumb_tmp_name());
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
 }
 
 /// Write the NEVER-PROVISIONED breadcrumb (Phase 4): this spawn gave the session
@@ -10909,7 +11015,7 @@ pub(crate) fn write_unprovisioned_breadcrumb(workdir: &str, reason: &str) {
 /// a write failure only logs — losing the breadcrumb must never fail a spawn.
 fn write_status_breadcrumb(workdir: &str, line: &str) {
     let path = Path::new(workdir).join(COORD_MCP_STATUS_FILE);
-    if let Err(e) = std::fs::write(&path, format!("{line}\n")) {
+    if let Err(e) = replace_breadcrumb(&path, &format!("{line}\n")) {
         warn!("coord_mcp: failed to write status breadcrumb in {workdir}: {e}");
     }
 }
@@ -11332,15 +11438,23 @@ pub(crate) fn probe_and_breadcrumb_proxy_with_policy(
 ///
 /// KEPT deliberately (credential-hygiene Task 9 review, 2026-07-17): the
 /// app-data `--mcp-config` delivery (`provision_coord_mcp_config_file`) is the
-/// newer shape, but the in-workdir file has a hard consumer that cannot take
-/// `--mcp-config`: **`qontinui-pr`** (`src/bin/qontinui_cli.rs`,
-/// `find_session_mcp_config`) discovers the per-session proxy nonce + issuing
-/// runner port EXCLUSIVELY by a `.mcp.json` walk-up from cwd — it is a
-/// standalone CLI invoked ad hoc inside the session, with no launch seam to
-/// hand it a config path (only the PORT has an env override,
-/// `QONTINUI_RUNNER_API_PORT`; the nonce deliberately travels with the port in
-/// the same file so they can never cross runners). Headless agent spawns and
-/// the boot root/session reconcile also provision through this writer. The
+/// newer shape, and **`qontinui-pr`** (`src/bin/qontinui_cli.rs`,
+/// `discover_session_mcp_config`) now reads it FIRST: a session whose spawn
+/// exported [`MCP_CONFIG_ENV`] (`QONTINUI_MCP_CONFIG`) authenticates with the
+/// nonce + issuing-runner port from that file, and a set-but-missing or
+/// credential-less file is an error rather than a fall-through. The CLI falls
+/// back to a `.mcp.json` walk-up from cwd (`find_session_mcp_config`) ONLY when
+/// the variable is unset or empty — so this in-workdir file is still what
+/// `qontinui-pr` finds in a session spawned WITHOUT that export, which is why
+/// it is not deleted yet. Its readers include `qontinui-pr` in those sessions,
+/// the vendored coord-revive skill's L1/L2 doors and `call`/`tools` verbs, and
+/// a `claude` launched there without `--mcp-config`. Headless agent spawns
+/// and the boot root/session reconcile are other WRITERS through this
+/// function (plan
+/// `2026-11-21-sessions-spawn-takes-the-parent-mcp-json-and-acts-as-the-default-tenant`
+/// Phase 2 moves the direct-exec paths onto the env delivery). The nonce
+/// travels with the port in the same file on both arms, so they can never
+/// cross runners; `QONTINUI_RUNNER_API_PORT` overrides only the port. The
 /// compensating hardening: the write is owner-only (Task 6), so a leftover
 /// file is at least never world-readable.
 ///
@@ -12708,6 +12822,46 @@ fn session_nonce(terminal_id: &str, workdir: Option<&str>) -> SessionNonce {
         }
         (Some(_), _) => SessionNonce::NoNonce,
         (None, _) => SessionNonce::DeliveryUnrecorded,
+    }
+}
+
+/// The key that IS the credential of the session in `terminal_id`, as a string —
+/// a thin view over the one resolver the tenancy census reads ([`session_nonce`]):
+/// the newest live per-terminal DEVICE key minted for the terminal, else, ONLY
+/// when the seam recorded that the terminal's cwd declares coord-mcp
+/// ([`CoordMcpDelivery::WorkdirDeclared`]), the key in `<workdir>/.mcp.json`
+/// (stdio shape included), whatever its principal. Read by the
+/// `POST /sessions/transcript-bind` ownership check (plan
+/// `2026-11-05-transcript-bind-refuses-a-hosted-session-whose-only-key-is-the-workdir-nonce`).
+///
+/// `Err` names why no key can be named, in the census's words where they
+/// overlap ([`repo_expectation_from_session_nonce`]); each is UNKNOWN, never
+/// "no credential":
+/// - `coord_mcp_delivery_unrecorded` — this process never recorded a delivery
+///   for the terminal (a previous process's terminal, or an adopted pane whose
+///   restored binding carries no terminal id);
+/// - `no_session_nonce` — the seam delivered the terminal no key, or delivered
+///   the cwd's file but no `workdir` was given to read it from;
+/// - `no_runner_nonce_in_cwd_file` — the cwd's `.mcp.json` holds no runner key
+///   now;
+/// - `nonce_not_live` — a key was found but is not a live binding in this
+///   process (revoked, expired, or another runner's).
+///
+/// `workdir` must be the hosting lifecycle record's cwd, never request input:
+/// the file it names is the credential's source.
+pub(crate) fn terminal_session_credential(
+    terminal_id: &str,
+    workdir: Option<&str>,
+) -> Result<String, &'static str> {
+    match session_nonce(terminal_id, workdir) {
+        // Both arms are checked live here, not only the per-terminal one:
+        // the cwd file can outlive its key (revoked, expired, another
+        // runner's), and a door comparing against a dead key would admit it.
+        SessionNonce::Nonce(Some(nonce)) if live_binding(&nonce).is_some() => Ok(nonce),
+        SessionNonce::Nonce(Some(_)) => Err("nonce_not_live"),
+        SessionNonce::Nonce(None) => Err("no_runner_nonce_in_cwd_file"),
+        SessionNonce::NoNonce => Err("no_session_nonce"),
+        SessionNonce::DeliveryUnrecorded => Err("coord_mcp_delivery_unrecorded"),
     }
 }
 
@@ -14652,18 +14806,19 @@ pub(crate) fn workdir_census_key(path: &str) -> String {
 /// lifecycle record, open or closed. Both are normalized here, so callers pass
 /// the raw record strings.
 ///
-/// Returns `None` when no workspace root resolves — a statement of UNKNOWN, not
-/// of an empty disk, and the boot summary must say so rather than print zeros.
+/// Returns the typed `WorkspaceRootUnresolved` when no workspace root resolves —
+/// a statement of UNKNOWN, not of an empty disk, and the boot summary must say
+/// so (rendering that error) rather than print zeros.
 pub(crate) fn census_on_disk_mcp_configs<'a, O, A>(
     open_workdirs: O,
     all_workdirs: A,
-) -> Option<OnDiskConfigCensus>
+) -> Result<OnDiskConfigCensus, qontinui_types::paths::WorkspaceRootUnresolved>
 where
     O: IntoIterator<Item = &'a str>,
     A: IntoIterator<Item = &'a str>,
 {
-    let root = crate::workspace_paths::workspace_root()?;
-    Some(census_on_disk_mcp_configs_at(
+    let root = crate::workspace_paths::runner_workspace_root().require()?;
+    Ok(census_on_disk_mcp_configs_at(
         &root,
         open_workdirs,
         all_workdirs,
@@ -25702,14 +25857,25 @@ mod runner_credential_tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         let mut saw_probe_write = false;
         while std::time::Instant::now() < deadline {
-            let text =
-                std::fs::read_to_string(&crumb).expect("breadcrumb is written SYNCHRONOUSLY");
+            // The file exists from the synchronous write onward, but the probe
+            // replaces it by rename; on Windows a read that lands inside that
+            // replace can fail (access denied) or see nothing. That is the
+            // reader racing the writer, not a defect, so a failed read is
+            // retried. A read that SUCCEEDS must still hold the credential
+            // verdict.
+            let Ok(text) = std::fs::read_to_string(&crumb) else {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                continue;
+            };
             assert!(
                 text.contains(BREADCRUMB_VERDICT_RUNNER_CREDENTIAL_EXPIRED),
                 "the breadcrumb must never become a stale-nonce story: {text}"
             );
             let line2 = text.lines().nth(1).unwrap_or_default();
-            let stamp: serde_json::Value = serde_json::from_str(line2.trim()).unwrap();
+            let Ok(stamp) = serde_json::from_str::<serde_json::Value>(line2.trim()) else {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                continue;
+            };
             if stamp["port"].as_u64() == Some(port as u64) {
                 saw_probe_write = true;
                 break;
@@ -26554,6 +26720,13 @@ mod spawn_tenant_credential_tests {
     fn the_tenancy_report_names_a_row_credential_divergence_and_an_unknown() {
         use crate::commands::session_info::{project_tenancy, TENANCY_RESOLVED, TENANCY_UNKNOWN};
         let amb = crate::test_env::isolated_ambient();
+        // The UNKNOWN half needs a device JWT with no tenant claim, and
+        // `AuthManager::get_access_token` falls back to the OS keychain, which
+        // the fixture does not isolate: on a paired dev box that slot holds the
+        // operator's real token, whose tenant then resolves instead of the
+        // refusal. CI already runs with the keychain off; so does this test.
+        // Restored on drop: the key is in `ambient::AMBIENT_ENV_KEYS`.
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
         amb.write_active_tenant_id(tenant_a());
         let (wd, term) = (workdir(&amb, "report"), terminal());
         let _ = provision_coord_mcp_config_file(&wd, Some(&term), None, Some(PORT))
@@ -26854,6 +27027,173 @@ mod spawn_tenant_credential_tests {
             session_credential_tenant(&unprovisioned, Some(&wd)),
             CredentialTenantRead::NoNonce,
             "a terminal the seam did not hand the cwd file must not report that file's key"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // `terminal_session_credential` — the key the transcript-bind door compares
+    // a presented shared key against (plan
+    // 2026-11-05-transcript-bind-refuses-a-hosted-session-whose-only-key-is-the-workdir-nonce,
+    // Phase 2 item 2). Every case goes through the real seam:
+    // `write_coord_mcp_proxy_config` + `deliver_terminal_coord_mcp`.
+    // -----------------------------------------------------------------------
+
+    /// A cwd that declares coord-mcp: the seam injects nothing, and the
+    /// terminal's credential is the key in the cwd's `.mcp.json` — a
+    /// terminal-less key every session of that cwd shares.
+    fn declared_cwd_credential_is_the_files_key(
+        amb: &crate::test_env::IsolatedAmbient,
+        stdio: bool,
+    ) {
+        let (wd, term) = (workdir(amb, "cred-declared"), terminal());
+        write_coord_mcp_proxy_config(&wd, PORT, None);
+        let mcp = Path::new(&wd).join(".mcp.json");
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&mcp).unwrap()).unwrap();
+        assert_eq!(
+            crate::coord_mcp_config::config_doc_is_stdio_shim(&doc),
+            stdio,
+            "the document this test reads is not the shape it names: {doc}"
+        );
+        let file_key = read_proxy_nonce(&mcp).expect("a cwd key");
+
+        let delivered = deliver_terminal_coord_mcp(&wd, &term, None, Some(PORT)).unwrap();
+        assert_eq!(delivered.delivery, CoordMcpDelivery::WorkdirDeclared);
+        assert_eq!(
+            terminal_session_credential(&term, Some(&wd)),
+            Ok(file_key.clone())
+        );
+        assert_eq!(
+            terminal_id_for_nonce(&file_key),
+            None,
+            "the cwd key names no terminal — the shape the door's third arm admits"
+        );
+    }
+
+    #[test]
+    fn a_declared_cwds_terminal_credential_is_the_files_key() {
+        let amb = crate::test_env::isolated_ambient();
+        amb.write_active_tenant_id(tenant_a());
+        declared_cwd_credential_is_the_files_key(&amb, false);
+    }
+
+    /// The same through the STDIO document — the shape of every observed case
+    /// (a `coord-mcp-shim.py --credential <abs>` entry), whose key the runner
+    /// reads only through the credential file the entry names. The gate is
+    /// forced open and the document asserted stdio, so this cannot pass on the
+    /// http arm `cfg(test)` defaults to.
+    #[test]
+    fn a_declared_cwds_terminal_credential_is_the_files_key_in_the_stdio_shape() {
+        let amb = crate::test_env::isolated_ambient();
+        amb.write_active_tenant_id(tenant_a());
+        let _gate =
+            StdioShimGateGuard::install(StdioShimGateOverride::Fixed(StdioShimGate::Open {
+                interpreter: amb.dir().join("fake-python"),
+                shim: amb
+                    .dir()
+                    .join("fake-scripts")
+                    .join(COORD_MCP_STDIO_SHIM_FILE),
+            }));
+        declared_cwd_credential_is_the_files_key(&amb, true);
+    }
+
+    /// A cwd that declares nothing: the seam mints a per-terminal key, and that
+    /// key — not any cwd file — is the terminal's credential.
+    #[test]
+    fn an_undeclared_cwds_terminal_credential_is_the_per_terminal_key() {
+        let amb = crate::test_env::isolated_ambient();
+        amb.write_active_tenant_id(tenant_a());
+        let (wd, term) = (workdir(&amb, "cred-undeclared"), terminal());
+
+        let delivered = deliver_terminal_coord_mcp(&wd, &term, None, Some(PORT)).unwrap();
+        assert_eq!(delivered.delivery, CoordMcpDelivery::Provisioned);
+        let path = delivered
+            .config_path
+            .expect("a bound port provisions a file");
+        let terminal_key = read_proxy_nonce(&path).expect("the per-terminal key");
+        assert_eq!(
+            terminal_session_credential(&term, Some(&wd)),
+            Ok(terminal_key.clone())
+        );
+        assert_eq!(
+            terminal_id_for_nonce(&terminal_key).as_deref(),
+            Some(term.as_str())
+        );
+    }
+
+    /// Every arm that cannot name a key says why, and none of them falls back
+    /// to "some key": a terminal this process never recorded, one the seam
+    /// gave nothing, a declared cwd read with no workdir, and a declared cwd
+    /// whose file holds no runner key.
+    #[test]
+    fn a_terminal_credential_that_cannot_be_named_is_a_typed_unknown() {
+        let amb = crate::test_env::isolated_ambient();
+        amb.write_active_tenant_id(tenant_a());
+        let wd = workdir(&amb, "cred-unknown");
+        write_coord_mcp_proxy_config(&wd, PORT, None);
+
+        assert_eq!(
+            terminal_session_credential(&terminal(), Some(&wd)),
+            Err("coord_mcp_delivery_unrecorded")
+        );
+
+        let unprovisioned = terminal();
+        let plain = workdir(&amb, "cred-unknown-plain");
+        let delivered = deliver_terminal_coord_mcp(&plain, &unprovisioned, None, None).unwrap();
+        assert_eq!(delivered.delivery, CoordMcpDelivery::Unprovisioned);
+        assert_eq!(
+            terminal_session_credential(&unprovisioned, Some(&wd)),
+            Err("no_session_nonce")
+        );
+
+        let declared = terminal();
+        deliver_terminal_coord_mcp(&wd, &declared, None, Some(PORT)).unwrap();
+        assert_eq!(
+            terminal_session_credential(&declared, None),
+            Err("no_session_nonce"),
+            "a declared delivery with no workdir to read cannot name the file's key"
+        );
+
+        // A coord-mcp entry that is not the runner's proxy: declared, keyless.
+        let foreign = workdir(&amb, "cred-unknown-foreign");
+        std::fs::write(
+            Path::new(&foreign).join(".mcp.json"),
+            r#"{"mcpServers":{"coord-mcp":{"type":"http","url":"https://coord.example/mcp"}}}"#,
+        )
+        .unwrap();
+        let foreign_term = terminal();
+        let delivered =
+            deliver_terminal_coord_mcp(&foreign, &foreign_term, None, Some(PORT)).unwrap();
+        assert_eq!(delivered.delivery, CoordMcpDelivery::WorkdirDeclared);
+        assert_eq!(
+            terminal_session_credential(&foreign_term, Some(&foreign)),
+            Err("no_runner_nonce_in_cwd_file")
+        );
+
+        // A runner-shaped key that this process holds no live binding for.
+        let stale = workdir(&amb, "cred-unknown-stale");
+        write_coord_mcp_proxy_config(&stale, PORT, None);
+        let stale_mcp = Path::new(&stale).join(".mcp.json");
+        let live_key = read_proxy_nonce(&stale_mcp).expect("a cwd key");
+        let dead_key = "f".repeat(live_key.len());
+        assert_ne!(live_key, dead_key);
+        let body = std::fs::read_to_string(&stale_mcp).unwrap();
+        assert!(
+            body.contains(&live_key),
+            "the key is inline in the http document"
+        );
+        std::fs::write(&stale_mcp, body.replace(&live_key, &dead_key)).unwrap();
+        assert_eq!(
+            read_proxy_nonce(&stale_mcp).as_deref(),
+            Some(dead_key.as_str())
+        );
+        let stale_term = terminal();
+        let delivered = deliver_terminal_coord_mcp(&stale, &stale_term, None, Some(PORT)).unwrap();
+        assert_eq!(delivered.delivery, CoordMcpDelivery::WorkdirDeclared);
+        assert_eq!(
+            terminal_session_credential(&stale_term, Some(&stale)),
+            Err("nonce_not_live"),
+            "a key in the cwd file that no live binding backs is not the credential"
         );
     }
 

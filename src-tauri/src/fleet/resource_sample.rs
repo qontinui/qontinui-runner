@@ -338,17 +338,16 @@ pub(crate) struct ResourceSample {
     /// box is this gap, not a regression; `/health` `threadCeilings` names the
     /// enforced pair and where each number came from.
     ///
-    /// Publishing the effective ceilings beside the reading is the fix, and it
-    /// is deliberately NOT done here yet, because it would be inert and noisy:
-    /// `coord.device_resource_samples` has no ceiling columns (alembic in
-    /// qontinui-web is the sole author of `coord.*` schema, and no such
-    /// revision exists), so coord's ingest would route both keys into
-    /// `ResourceSampleItem::unknown_fields` — which it DROPS after emitting a
-    /// `tracing::warn!` naming them, on the log surface reserved for publisher
-    /// typos. At a 30 s tick that is ~2,880 warn lines per runner per day
-    /// buying a consumer nothing. The migration lands first; the publisher
-    /// follows it. Until then, grade this number knowing you may be grading it
-    /// against a ceiling the runner does not use.
+    /// The fix is published beside this field: the host lane carries
+    /// [`Self::launch_headroom`], [`Self::launch_verdict`], the GRADED reading
+    /// and the enforced warn / critical ceilings, so coord admits against the
+    /// device's own answer (plan
+    /// `2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling`
+    /// Phase 2). That plan orders the rollout: coord's ingest of those keys
+    /// (and qontinui-web's columns) deploys BEFORE a runner publishing them
+    /// merges, because a key coord does not know lands in
+    /// `ResourceSampleItem::unknown_fields` with a `tracing::warn!` — ~2,880
+    /// lines per runner per day at a 30 s tick.
     ///
     /// This doc used to say coord "grades this warn at 256 / critical at 400,
     /// the same two numbers as this runner's shipped
@@ -389,6 +388,40 @@ pub(crate) struct ResourceSample {
     /// documents.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) active_terminal_sessions: Option<i32>,
+    /// Further unattended launches this runner's own admission would take
+    /// right now before refusing one (`0` = the next launch is refused) —
+    /// [`crate::launch_capacity::launch_headroom`], the same projection
+    /// `admit_launch` decides on, capped at
+    /// [`crate::launch_capacity::LAUNCH_HEADROOM_CAP`]. coord admits a spawn on
+    /// this device only against it (plan
+    /// `2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling`).
+    ///
+    /// **Host lane only**, for [`Self::thread_count`]'s placement reason: it is
+    /// the runner PROCESS's admission. `None` when the session guard is
+    /// disabled (`launch_verdict = guard_disabled`) — UNKNOWN, never `0`, which
+    /// would read as "full". `i32` for the `INTEGER` counter-group reason
+    /// [`Self::thread_count`] gives.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) launch_headroom: Option<i32>,
+    /// `proceed` / `warn` / `critical` / `guard_disabled` / `unreadable` —
+    /// [`crate::launch_capacity::LaunchVerdict::as_str`], the vocabulary coord's
+    /// CHECK constraint carries. Host lane only; always `Some` there.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) launch_verdict: Option<String>,
+    /// The GRADED thread reading (raw minus the idle blocking pool) the
+    /// thread lane judges — the number the two ceilings below apply to, NOT
+    /// [`Self::thread_count`]. `None` when the guard is disabled or the thread
+    /// table was unreadable. Host lane only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) thread_graded: Option<i32>,
+    /// The per-machine thread ceilings the runner ENFORCES
+    /// ([`crate::resource_guard::merge_thread_ceilings`]). A launch is refused
+    /// above the warn one. `None` only when the guard is disabled. Host lane
+    /// only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) thread_warn_ceiling: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) thread_critical_ceiling: Option<i32>,
     /// Per-lane breakdown of THIS runner process's in-flight tracked blocking
     /// bodies — [`qontinui_runner_lib::wedge_diagnostics::tracked_blocking_by_thread`],
     /// keyed by the thread that spawned each body. Bounded to
@@ -515,6 +548,16 @@ pub(crate) struct ResourceSample {
     /// publishes `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) slice_source: Option<String>,
+    /// Kernel pool, kernel objects and OS spawn latency (plan
+    /// `2026-10-19-fleet-is-blind-to-kernel-object-leaks-and-os-process-creation-latency`
+    /// D2): `kernel_paged_bytes` … `kernel_source`, flattened so each is its own
+    /// top-level key named for its `coord.device_resource_samples` column.
+    /// Read by the `os-health` thread on every instance and only COPIED here —
+    /// host lane only; every other lane keeps [`ResourceSample::empty`]'s
+    /// all-`None`. The fields, their wire names and the NULL rules are
+    /// documented on [`crate::os_health::OsHealthSampleFields`].
+    #[serde(flatten)]
+    pub(crate) os_health: crate::os_health::OsHealthSampleFields,
     /// `'runner' | 'supervisor' | 'ci-step'`. Distinguishes this row from the
     /// supervisor's host-lane row for the same device.
     pub(crate) source: String,
@@ -652,6 +695,18 @@ impl Saturation {
 }
 
 impl ResourceSample {
+    /// Write the launch capacity onto this sample — the only way its five
+    /// fields are set. Counts saturate into `i32` (a pathological count must
+    /// not wrap to a negative, which reads as room against every line).
+    fn set_launch_capacity(&mut self, capacity: &crate::launch_capacity::LaunchCapacity) {
+        let narrow = |n: usize| i32::try_from(n).unwrap_or(i32::MAX);
+        self.launch_headroom = capacity.headroom.map(narrow);
+        self.launch_verdict = Some(capacity.verdict.as_str().to_string());
+        self.thread_graded = capacity.graded.map(narrow);
+        self.thread_warn_ceiling = capacity.warn.map(narrow);
+        self.thread_critical_ceiling = capacity.critical.map(narrow);
+    }
+
     fn empty(lane: Lane, lane_instance: Option<String>) -> Self {
         Self {
             lane: lane.as_str().to_string(),
@@ -692,6 +747,11 @@ impl ResourceSample {
             ci_jobs_running: None,
             thread_count: None,
             active_terminal_sessions: None,
+            launch_headroom: None,
+            launch_verdict: None,
+            thread_graded: None,
+            thread_warn_ceiling: None,
+            thread_critical_ceiling: None,
             blocking_lanes: None,
             threads_max: None,
             threads_used: None,
@@ -707,6 +767,7 @@ impl ResourceSample {
             cgroup_slices: None,
             psi: None,
             slice_source: None,
+            os_health: crate::os_health::OsHealthSampleFields::default(),
             source: "runner".to_string(),
         }
     }
@@ -1216,7 +1277,8 @@ fn collect_host_lane() -> ResourceSample {
     // already returned, and the spawn gate and the fleet dashboard are now
     // literally the same reading rather than two probes of the same quantity —
     // `spawn_gate_reading` calls this identical function.
-    if let Some(m) = memory_status() {
+    let memory = memory_status();
+    if let Some(m) = memory {
         if m.phys_total > 0 {
             s.mem_total_bytes = Some(m.phys_total);
             s.mem_available_bytes = Some(m.phys_available);
@@ -1253,7 +1315,10 @@ fn collect_host_lane() -> ResourceSample {
 
     // The runner's build lane IS its `ci_node` executor, so slots and CI jobs
     // are the same occupancy read two ways. The supervisor publishes the
-    // Windows build pool's slots under `source='supervisor'`.
+    // Windows build pool's slots under `source='supervisor'`. The total is what
+    // admission admits against: with the capacity model (plan 2026-11-05
+    // Phase 7) an unset capacity follows the box's load, so busy can briefly
+    // read above total after the model lowers it.
     let ci = crate::settings::get_ci_node_settings();
     let (running, queued) = crate::ci_node::admission::occupancy();
     if ci.enabled {
@@ -1300,6 +1365,20 @@ fn collect_host_lane() -> ResourceSample {
         s.active_terminal_sessions
             .and_then(|n| usize::try_from(n).ok()),
     );
+
+    // The launch capacity coord admits against (plan
+    // `2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling`
+    // Phase 2): judged against the SAME memory reading this sample publishes
+    // (the `memory` taken above), plus the live thread reading — this function
+    // already runs inside `spawn_blocking_tracked`, so the synchronous
+    // thread-table read never lands on an async worker. Host lane only, for the
+    // spawn-pressure pair's placement reason: it is this runner PROCESS's
+    // admission, which no other lane owns.
+    s.set_launch_capacity(&crate::launch_capacity::live_with_memory((
+        Lane::Host.as_str(),
+        memory.map(|m| m.commit_available),
+        memory.map(|m| m.phys_available),
+    )));
 
     s.blocking_lanes = Some(
         tracked_blocking_by_thread()
@@ -1367,6 +1446,13 @@ fn collect_host_lane() -> ResourceSample {
     // the same quantity, so where the slice reader saw system PSI the flat
     // fields are taken from it rather than from host_axes' earlier read.
     s.align_flat_psi_with_system();
+    // Kernel pool, kernel objects and OS spawn latency: COPIED from the
+    // `os-health` thread's cached snapshot, never read here — that thread runs
+    // on every instance and owns the cadence (plan
+    // `2026-10-19-fleet-is-blind-to-kernel-object-leaks-and-os-process-creation-latency`
+    // D1). Host lane only, for the same reason as the spawn-pressure pair: the
+    // `wsl` lane is a different kernel.
+    s.os_health = crate::os_health::sample_fields();
 
     s
 }
@@ -1751,18 +1837,24 @@ fn wsl_base_path_probe_root(base_path: &str) -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(p))
 }
 
+/// One `/proc/meminfo` line's value in BYTES: `key` is the full `Name:`
+/// prefix, the value is the kB figure before the `kB` suffix. `None` when the
+/// key is absent or the value does not parse. Shared by [`parse_meminfo`] and
+/// the `os-health` Linux collector, so the two read meminfo one way.
+pub(crate) fn meminfo_value_bytes(text: &str, key: &str) -> Option<u64> {
+    text.lines()
+        .find_map(|l| l.strip_prefix(key)?.trim().strip_suffix("kB"))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|v| v.saturating_mul(1024))
+}
+
 /// Parse `/proc/meminfo` into a `wsl`-lane sample. Values are kB.
 ///
 /// Swap is reported as total + **used** (`SwapTotal - SwapFree`) because a bare
 /// swap byte count cannot be read as pressure — the ceiling differs per host,
 /// so pressure only means something against it.
 fn parse_meminfo(text: &str, lane_instance: String) -> Option<ResourceSample> {
-    let kb = |key: &str| -> Option<u64> {
-        text.lines()
-            .find_map(|l| l.strip_prefix(key)?.trim().strip_suffix("kB"))
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .map(|v| v.saturating_mul(1024))
-    };
+    let kb = |key: &str| meminfo_value_bytes(text, key);
 
     let mem_total = kb("MemTotal:")?;
     let mut s = ResourceSample::empty(Lane::Wsl, Some(lane_instance));
@@ -2356,6 +2448,7 @@ fn warn_once(class: &str, msg: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qontinui_runner_lib::wedge_diagnostics::OVERFLOW_LANE_NAME;
 
     /// Plan `2026-11-13-computer-services-cap-and-sample-outcome` Phase 2: a
     /// 2xx whose body is unreadable or undocumented reads UNKNOWN, never
@@ -3653,6 +3746,103 @@ MemAvailable:   15335424 kB
         );
     }
 
+    /// The launch capacity coord admits against is the runner PROCESS's own
+    /// admission, so only the host lane carries it, and it carries it on every
+    /// tick (plan `2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling`
+    /// Phase 2 step 4).
+    ///
+    /// Mutation: drop the `set_launch_capacity` call from `collect_host_lane`
+    /// (the host asserts fail), or call it from `parse_meminfo` (the WSL ones do).
+    #[test]
+    fn the_host_lane_publishes_the_launch_fields_and_wsl_does_not() {
+        let wsl = parse_meminfo("MemTotal: 1024 kB\n", "Ubuntu-24.04".to_string()).expect("parses");
+        assert_eq!(wsl.lane, "wsl");
+        assert_eq!(wsl.launch_headroom, None);
+        assert_eq!(wsl.launch_verdict, None);
+        assert_eq!(wsl.thread_graded, None);
+        assert_eq!(wsl.thread_warn_ceiling, None);
+        assert_eq!(wsl.thread_critical_ceiling, None);
+        let wsl_json = serde_json::to_value(&wsl).expect("serializes");
+        for key in [
+            "launch_headroom",
+            "launch_verdict",
+            "thread_graded",
+            "thread_warn_ceiling",
+            "thread_critical_ceiling",
+        ] {
+            assert!(
+                wsl_json.get(key).is_none(),
+                "the wsl lane must not carry {key}"
+            );
+        }
+
+        let host = collect_host_lane();
+        let verdict = host
+            .launch_verdict
+            .clone()
+            .expect("the host lane must publish a launch verdict on every tick");
+        assert!(
+            [
+                "proceed",
+                "warn",
+                "critical",
+                "guard_disabled",
+                "unreadable"
+            ]
+            .contains(&verdict.as_str()),
+            "{verdict}"
+        );
+        if verdict == "guard_disabled" {
+            // A disabled guard enforces nothing: no number, never a 0.
+            assert_eq!(host.launch_headroom, None);
+            assert_eq!(host.thread_warn_ceiling, None);
+        } else {
+            let headroom = host
+                .launch_headroom
+                .expect("an enabled guard publishes headroom");
+            let cap = i32::try_from(crate::launch_capacity::LAUNCH_HEADROOM_CAP).expect("small");
+            assert!((0..=cap).contains(&headroom), "{headroom}");
+            let (warn, critical) = (
+                host.thread_warn_ceiling.expect("warn ceiling"),
+                host.thread_critical_ceiling.expect("critical ceiling"),
+            );
+            assert!(warn > 0 && critical >= warn, "{warn} / {critical}");
+        }
+        // The wire names coord's ingest DTO keys on.
+        let host_json = serde_json::to_value(&host).expect("serializes");
+        assert_eq!(host_json["launch_verdict"], verdict.as_str());
+
+        // The setter maps every field, and a disabled guard serializes no number.
+        let mut probe = ResourceSample::empty(Lane::Host, None);
+        probe.set_launch_capacity(&crate::launch_capacity::LaunchCapacity {
+            verdict: crate::launch_capacity::LaunchVerdict::Warn,
+            headroom: Some(0),
+            graded: Some(380),
+            warn: Some(376),
+            critical: Some(usize::MAX),
+        });
+        let v = serde_json::to_value(&probe).expect("serializes");
+        assert_eq!(v["launch_headroom"], 0);
+        assert_eq!(v["launch_verdict"], "warn");
+        assert_eq!(v["thread_graded"], 380);
+        assert_eq!(v["thread_warn_ceiling"], 376);
+        assert_eq!(
+            v["thread_critical_ceiling"],
+            i32::MAX,
+            "saturates, never wraps"
+        );
+        probe.set_launch_capacity(&crate::launch_capacity::LaunchCapacity {
+            verdict: crate::launch_capacity::LaunchVerdict::GuardDisabled,
+            headroom: None,
+            graded: None,
+            warn: None,
+            critical: None,
+        });
+        let v = serde_json::to_value(&probe).expect("serializes");
+        assert!(v.get("launch_headroom").is_none());
+        assert_eq!(v["launch_verdict"], "guard_disabled");
+    }
+
     /// The host lane's `blocking_lanes` breakdown must actually reflect
     /// [`tracked_blocking_by_thread`] — an always-`None` or always-empty field
     /// would pass a shape check while publishing nothing useful during an
@@ -3661,8 +3851,9 @@ MemAvailable:   15335424 kB
     /// against for `thread_count`.
     ///
     /// Puts one tracked body in flight on a thread this fixture names, so the
-    /// expected lane key is a constant rather than whatever the test harness
-    /// happened to call the running thread — same technique
+    /// expected lane key is this fixture's own name (or, once the binary has
+    /// used up every named lane, the overflow lane) rather than whatever the
+    /// test harness happened to call the running thread — same technique
     /// `wedge_diagnostics`'s own
     /// `assert_a_body_is_charged_to_its_spawner` fixture uses. `spawn_blocking_tracked`
     /// charges the GLOBAL lane table (there is no way to hand it a private
@@ -3703,27 +3894,56 @@ MemAvailable:   15335424 kB
         let wsl = parse_meminfo("MemTotal: 1024 kB\n", "Ubuntu-24.04".to_string()).expect("parses");
         assert_eq!(wsl.blocking_lanes, None);
 
+        // WHICH lane the body was charged to is a property of the whole test
+        // binary, not of this module: lanes are keyed by distinct thread name,
+        // first-come and never released, so once `MAX_BLOCKING_LANES` distinct
+        // thread names in this binary have charged a tracked body, this
+        // fixture's body lands in the overflow lane. Asserting the named lane
+        // unconditionally reddened qontinui/qontinui-runner#2707, which added
+        // tracked-body call sites that tests in this binary exercise — the
+        // #1447 shape `wedge_diagnostics`'s `LaneTable` doc describes. So read
+        // the lane from the source of truth `collect_host_lane` reads, then
+        // require the published map to carry the fixture in THAT lane. The
+        // overflow branch can only check presence; that `collect_host_lane`
+        // publishes the live table at all is pinned by source in
+        // `the_host_lane_publishes_the_live_blocking_lane_table`.
+        let live = tracked_blocking_by_thread();
+        let charged_to = if live.contains_key(SPAWNER) {
+            SPAWNER
+        } else {
+            OVERFLOW_LANE_NAME
+        };
+        eprintln!("blocking-lane fixture charged to {charged_to}");
+        assert!(
+            live.get(charged_to).copied().is_some_and(|n| n >= 1),
+            "the fixture's body must still be tracked while it is in flight: {live:?}"
+        );
+
         let host = collect_host_lane();
         let published = host
             .blocking_lanes
             .as_ref()
             .expect("the host lane must publish a blocking_lanes map");
-        assert_eq!(
-            published.get(SPAWNER).copied(),
-            Some(1),
-            "the fixture's own in-flight body did not appear in the published \
-             breakdown: {published:?}"
-        );
-        // Cross-checks the live accessor directly, not just the wire struct —
-        // the same key this fixture's body is charged to on the source of
-        // truth `collect_host_lane` reads from.
-        assert!(
-            tracked_blocking_by_thread()
-                .get(SPAWNER)
-                .copied()
-                .is_some_and(|n| n >= 1),
-            "the fixture's body must still be tracked while it is in flight"
-        );
+        if charged_to == SPAWNER {
+            // A free lane: the fixture owns it alone, so the count is exact.
+            assert_eq!(
+                published.get(SPAWNER).copied(),
+                Some(1),
+                "the fixture's own in-flight body did not appear in the published \
+                 breakdown: {published:?}"
+            );
+        } else {
+            // Lanes exhausted: the overflow lane is shared with every other
+            // overflowed body still in flight, so only presence is exact.
+            assert!(
+                published
+                    .get(OVERFLOW_LANE_NAME)
+                    .copied()
+                    .is_some_and(|n| n >= 1),
+                "the fixture's body overflowed, but the published breakdown has no \
+                 {OVERFLOW_LANE_NAME} entry: {published:?}"
+            );
+        }
 
         let _ = release_tx.send(());
         fixture.join().expect("fixture thread");
@@ -3979,6 +4199,58 @@ MemAvailable:   15335424 kB
         );
     }
 
+    /// The launch capacity on a host sample is judged against the SAME memory
+    /// reading the sample publishes: `collect_host_lane` takes exactly one
+    /// `memory_status()` and never reaches for a second, independent reading
+    /// through `lane_verdicts()` or an `AdmissionReading::live()` /
+    /// `launch_capacity::live()`-style call. A lexical guard.
+    ///
+    /// Mutation: call `crate::launch_capacity::live()` (or
+    /// `resource_guard::lane_verdicts()`) from `collect_host_lane`, or take a
+    /// second `memory_status()`.
+    #[test]
+    fn the_host_lane_judges_launch_capacity_on_the_memory_reading_it_publishes() {
+        let body = collect_host_lane_src();
+        assert_eq!(
+            body.matches("memory_status()").count(),
+            1,
+            "collect_host_lane must take exactly ONE memory reading"
+        );
+        for second_reading in [
+            "lane_verdicts()",
+            "spawn_gate_reading()",
+            "available_commit_bytes()",
+            "available_phys_bytes()",
+            "exhaustion_memory_reading(",
+        ] {
+            assert!(
+                !body.contains(second_reading),
+                "collect_host_lane must not take a second memory reading through {second_reading}"
+            );
+        }
+        assert!(
+            !body.contains("::live()"),
+            "collect_host_lane must not take a second reading through a ::live() constructor"
+        );
+        assert!(
+            body.contains("launch_capacity::live_with_memory("),
+            "the launch capacity must be built from the passed-in reading"
+        );
+    }
+
+    /// Source pin beside `the_host_lane_carries_the_blocking_lane_breakdown`,
+    /// whose overflow branch can only check that the shared overflow lane is
+    /// present: the host lane's `blocking_lanes` must be built from the LIVE
+    /// tracked-body table, not a cached or synthesized map.
+    #[test]
+    fn the_host_lane_publishes_the_live_blocking_lane_table() {
+        let body = collect_host_lane_src();
+        assert!(
+            body.contains("s.blocking_lanes = Some(\n        tracked_blocking_by_thread()"),
+            "collect_host_lane must publish blocking_lanes from tracked_blocking_by_thread()"
+        );
+    }
+
     /// The production body of [`collect_host_lane`], for the structural pins
     /// above and below. Split off the test module first, so a call site written
     /// inside a test cannot satisfy a pin that production code fails — the same
@@ -4158,5 +4430,175 @@ MemAvailable:   15335424 kB
             host.contains("memory_status()"),
             "the host lane must fill mem_* and commit_* from the shared reading"
         );
+    }
+
+    /// The kernel readings' wire names are EXACTLY coord's column names, each
+    /// is its own top-level key (flattened, not nested), and a `None` is
+    /// omitted rather than sent as `null` or 0. Plan
+    /// `2026-10-19-fleet-is-blind-to-kernel-object-leaks-and-os-process-creation-latency`
+    /// D2 / Phase 4.
+    #[test]
+    fn the_kernel_readings_serialize_under_their_column_names_and_none_is_omitted() {
+        const KERNEL_KEYS: [&str; 16] = [
+            "kernel_paged_bytes",
+            "kernel_nonpaged_bytes",
+            "kernel_handle_count",
+            "kernel_token_objects",
+            "kernel_process_objects",
+            "os_process_count",
+            "os_booted_at",
+            "kernel_pool_top_tags",
+            "kernel_pool_tags_at",
+            "spawn_probe_p50_ms",
+            "spawn_probe_max_ms",
+            "spawn_probe_count",
+            "spawn_probe_timeouts",
+            "spawn_probe_errors",
+            "spawn_probe_error_code",
+            "kernel_source",
+        ];
+
+        // Before the os-health thread's first tick: not one kernel key.
+        let empty = serde_json::to_value(ResourceSample::empty(Lane::Host, None)).unwrap();
+        let obj = empty.as_object().unwrap();
+        for k in KERNEL_KEYS {
+            assert!(!obj.contains_key(k), "{k} must be omitted when None");
+        }
+        assert!(
+            !obj.contains_key("os_health"),
+            "the group must be flattened"
+        );
+
+        // The incident snapshot: every key, top-level, with its value.
+        let mut s = ResourceSample::empty(Lane::Host, None);
+        s.os_health = crate::os_health::OsHealthSampleFields::from_snapshot(Some(
+            &crate::os_health::incident_snapshot_for_tests(),
+        ));
+        let v = serde_json::to_value(&s).unwrap();
+        let obj = v.as_object().unwrap();
+        for k in KERNEL_KEYS {
+            assert!(obj.contains_key(k), "{k} missing from {v}");
+        }
+        assert_eq!(v["kernel_paged_bytes"], 24_282_075_136_i64);
+        assert_eq!(v["kernel_nonpaged_bytes"], 15_075_627_008_i64);
+        assert_eq!(v["kernel_handle_count"], 406_585);
+        assert_eq!(v["kernel_token_objects"], 4_365_962);
+        assert_eq!(v["kernel_process_objects"], 2_930);
+        assert_eq!(v["os_process_count"], 1_442);
+        assert_eq!(v["os_booted_at"], "2026-10-15T06:12:00Z");
+        assert_eq!(
+            v["kernel_pool_top_tags"][0],
+            serde_json::json!({"tag": "File", "bytes": 9_693_669_888_i64, "outstanding_allocs": 24_238_128})
+        );
+        assert_eq!(v["kernel_pool_top_tags"][2]["tag"], "D2d ");
+        assert_eq!(v["kernel_pool_tags_at"], "2026-10-19T08:20:52Z");
+        assert_eq!(v["spawn_probe_p50_ms"], 2_400);
+        assert_eq!(v["spawn_probe_max_ms"], 30_000);
+        assert_eq!(v["spawn_probe_count"], 10);
+        assert_eq!(v["spawn_probe_timeouts"], 1);
+        assert_eq!(v["spawn_probe_errors"], 1);
+        assert_eq!(v["spawn_probe_error_code"], 1450);
+        assert_eq!(
+            v["kernel_source"],
+            "windows:getperformanceinfo+objecttypes+pooltags+spawn-probe"
+        );
+        // The pre-existing columns are untouched by the flatten.
+        assert_eq!(v["lane"], "host");
+        assert_eq!(v["source"], "runner");
+
+        // A measured zero is published; an unmeasured reading is not.
+        let mut snap = crate::os_health::incident_snapshot_for_tests();
+        snap.kernel_token_objects = None;
+        if let Some(p) = snap.spawn_probe.as_mut() {
+            p.timeouts = 0;
+            p.error_code = None;
+        }
+        s.os_health = crate::os_health::OsHealthSampleFields::from_snapshot(Some(&snap));
+        let v = serde_json::to_value(&s).unwrap();
+        assert!(v.get("kernel_token_objects").is_none());
+        assert!(v.get("spawn_probe_error_code").is_none());
+        assert_eq!(v["spawn_probe_timeouts"], 0);
+    }
+
+    /// THE PUBLISH-PATH ARMING TEST (plan
+    /// `2026-10-19-fleet-is-blind-to-kernel-object-leaks-and-os-process-creation-latency`
+    /// Phase 4). It enters through `collect_host_lane()` — the function
+    /// `publish_once` → `collect` runs for every primary's host-lane row — with
+    /// the incident snapshot in the PROCESS-GLOBAL `os-health` cell, and
+    /// serializes the POST body exactly as `publish_once` builds it. Every
+    /// kernel column must arrive as a top-level key of `samples[0]`, with the
+    /// incident's values. An empty cell must put none of them on the wire.
+    #[test]
+    fn the_host_lane_publishes_the_os_health_cell_as_top_level_column_keys() {
+        const KERNEL_KEYS: [&str; 16] = [
+            "kernel_paged_bytes",
+            "kernel_nonpaged_bytes",
+            "kernel_handle_count",
+            "kernel_token_objects",
+            "kernel_process_objects",
+            "os_process_count",
+            "os_booted_at",
+            "kernel_pool_top_tags",
+            "kernel_pool_tags_at",
+            "spawn_probe_p50_ms",
+            "spawn_probe_max_ms",
+            "spawn_probe_count",
+            "spawn_probe_timeouts",
+            "spawn_probe_errors",
+            "spawn_probe_error_code",
+            "kernel_source",
+        ];
+        let wire = |host: ResourceSample| {
+            serde_json::to_value(ResourceSampleReq {
+                device_id: "dev".into(),
+                tenant_id: None,
+                sampled_at: chrono::Utc::now().to_rfc3339(),
+                samples: vec![host],
+            })
+            .unwrap()
+        };
+
+        let mut snap = crate::os_health::incident_snapshot_for_tests();
+        // Read just now, so the stale gate passes it through.
+        snap.read_at = chrono::Utc::now();
+        let v = {
+            let _cell = crate::os_health::store_for_tests(Some(snap));
+            wire(collect_host_lane())
+        };
+        let row = v["samples"][0].as_object().expect("one host-lane row");
+        assert_eq!(row["lane"], "host");
+        for k in KERNEL_KEYS {
+            assert!(
+                row.contains_key(k),
+                "{k} missing from the host-lane row: {v}"
+            );
+        }
+        assert!(
+            !row.contains_key("os_health"),
+            "the group must be flattened"
+        );
+        assert_eq!(row["kernel_token_objects"], 4_365_962);
+        assert_eq!(row["kernel_process_objects"], 2_930);
+        assert_eq!(row["kernel_paged_bytes"], 24_282_075_136_i64);
+        assert_eq!(row["kernel_pool_top_tags"][1]["tag"], "Toke");
+        assert_eq!(row["spawn_probe_p50_ms"], 2_400);
+        assert_eq!(row["spawn_probe_error_code"], 1450);
+        assert_eq!(
+            row["kernel_source"],
+            "windows:getperformanceinfo+objecttypes+pooltags+spawn-probe"
+        );
+
+        // An empty cell (before the first tick): no kernel key at all.
+        let v = {
+            let _cell = crate::os_health::store_for_tests(None);
+            wire(collect_host_lane())
+        };
+        let row = v["samples"][0].as_object().unwrap();
+        for k in KERNEL_KEYS {
+            assert!(
+                !row.contains_key(k),
+                "{k} present with an empty os-health cell: {v}"
+            );
+        }
     }
 }

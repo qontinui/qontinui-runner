@@ -564,7 +564,10 @@ pub async fn dispatch_subtask(
                 .unwrap_or_else(|_| ".".to_string());
             // Still provisioned, as `acquire_for_terminal` did for this arm:
             // the cwd `.mcp.json` is how a worker reaches the coord-mcp proxy.
-            crate::agent_worktree::isolated_edit::provision_session_cwd(&cwd, false, None);
+            crate::agent_worktree::isolated_edit::provision_session_cwd_off_worker(
+                &cwd, false, None,
+            )
+            .await;
             (cwd, None)
         }
         Some(repo) => {
@@ -803,10 +806,10 @@ pub async fn dispatch_subtask(
                 finish_reason: None,
                 finish_synced: false,
                 finish_coord_session_id: None,
+                finish_coord_readdressed: false,
                 spawn_device_default: None,
                 adopted_from: None,
                 last_session_start_at: None,
-                last_alive_at: None,
                 gate_id: None,
                 gate_consuming_device_id: None,
                 gate_bound_boot_ms: None,
@@ -905,7 +908,10 @@ fn teardown_unbound_worker(app_handle: &tauri::AppHandle, task_run_id: Uuid) -> 
     if let Some(store) = app_handle
         .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
     {
-        store.record_close(&trid, "orchestration dispatch could not bind the worker");
+        store.record_close(
+            &trid,
+            crate::session::session_lifecycle_store::CLOSE_REASON_WORKER_BIND_FAILED,
+        );
         closed.push("lifecycle record");
     }
     if let Some(registrar) =

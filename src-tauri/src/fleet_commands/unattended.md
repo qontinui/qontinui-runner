@@ -651,6 +651,17 @@ per-branch check at the top of this block is what clears it.
 defect in your judgement — the work may have been correctly deferred. The defect
 is that the deferral was not durably captured. Steps 2 and 3 convert them.
 
+### Step 1a-bis — Closing a duplicate this session superseded
+
+**Closing a duplicate this session superseded: the order that never fails the gate** (plan `2026-11-21-a-session-that-closes-its-own-superseded-duplicates-cannot-be-finished` Phase 4; it adds no rule, the served `git-operations` clauses `an-adoption-must-re-anchor-the-gates-watching-what-it-supersedes`, `a-landed-adoption-closes-its-predecessor` and `a-predecessor's-gates-include-those-whose-predicate-names-it` already hold it). A `pr_merged` gate on a PR that closes with no land record goes `failed`, and `coord_withdraw_gate` refuses anything that is not `open`, so closing first leaves a gate nothing can clear. Do it in this order, only after the successor has LANDED:
+
+1. `coord_declare_supersession` {predecessor_repo, predecessor_pr, successor_repo, successor_pr}. Coord verifies server-side that the successor landed AND that the successor's own title or body references the predecessor; a successor that does not cannot be declared, so reference the predecessor in the successor's body first. Its read-back (`live: true`) is the evidence.
+2. On this session's own open `pr_merged` gate for the predecessor: `coord_cancel_continuation` if one is armed, then `coord_withdraw_gate`, and read the gate back (`withdrawn`). Coord's auto gate on every PR is withdrawable by another device in the tenant only through the supersession-discharge arm, which needs step 1's declaration first (cancel its armed continuation before withdrawing). A peer's gate is left to its registrant.
+2b. Before step 3, read the predecessor's card back (`coord_pr_status`) and wait until its `superseded_by` entry carries a content verdict, or coord retires it through patch-id evidence. Coord records that verdict only in a sweep that probes an OPEN predecessor (30 min rest, doubling to 24 h), so declaring and closing within minutes leaves the PR reading `unknown`, not `retired`. If you must close sooner, expect `unknown` until the next sweep.
+3. Only then close the PR. `coord_declare_supersession` says it itself: it does NOT close the predecessor, "closing stays yours, after you move or retire the gates".
+
+A gate already `failed` is not repaired (it cannot be withdrawn or re-pointed): record its discharge as a finding naming the dead `gate_id`. On a coord carrying the Phase 2 change, a closed superseded PR and its failed gate read `retired` when a landed declared successor's content verdict shows the PR's work carried, or when coord has patch-id land evidence for it; otherwise they keep reading `not_watched` or `unknown`.
+
 ### Step 1b — Finish-to-zero conformance
 
 Independently of capture, audit this session against `planning-and-scope`
@@ -3352,8 +3363,13 @@ lives there, once; do not copy it here. That step's own skip rule covers
 **Best-effort, never blocking.** A tool the serving build does not carry yet
 (the runner proxy's `METHOD_NOT_ALLOWED` until its allowlist names the
 subproject tools, then coord's `unknown tool` error until its build serves
-them), a `schema_migration_pending`, a `caller_session_unproven` or a dead
-transport records its code and moves on to Step 5. None of them changes the
+them), a `schema_migration_pending`, a `caller_session_unproven`, a
+`subproject_is_a_scheduler_bucket` (this session sits in a coord producer's
+standing `scheduled:<label>` bucket, whose note no member may write), an
+`origin_unknown`, `note_moved` (after the one retry) or a dead transport records its code and moves on to Step 5.
+On the bucket arm the paragraph is still owed to its work: put it in Step 2's
+durable stores (the plan's status block, or a gate with a continuation), as
+`/finish-session` Part A step 4's bucket arm says. None of them changes the
 classification, the work verdict, Step 4.9's verdict or Step 5's gate. Add one
 line to the Step 4 report, after the continuation outcome:
 
@@ -3369,6 +3385,32 @@ note into the report, and spell it `next_steps_note`, never "next step" or
 for wording that says work remains or asks the operator to act ("next step"
 among it, and either spelling in the policy footer), and a note is made of
 that wording on purpose.
+
+**Then re-tag the subproject's topics.** Follow `/finish-session` Part A step
+4's "Then re-tag the subproject's topics" paragraph over the same door: read
+the current topics, confirm or add through `coord_subproject_update
+{"topics": [...]}` (ADD only, slugs from this session's `coord_declare_intent`
+`topic_suggestions` first), remove a wrong one through `coord_topic_member
+{"action": "remove", ...}`, record each kept topic's one-line contribution as
+its `note`, and read the membership back, and send none of it unless the note's
+origin check passed (a bucket or unknown origin skips the topics too). The
+recipe and its outcome lines live there, once. The contribution line projects Step 1's classification
+(what LANDED or is WATCHED for that topic), not a second judgement. The
+subagent rule above covers it: in a subagent, re-tag nothing. Best-effort and
+never blocking, like the note. Add that paragraph's `topics re-tag:` line to
+the Step 4 report, after the subproject note:
+
+> **Topics re-tag:** `<n>` confirmed/added, `<m>` removed — read back.
+
+or, when it did not land, `/finish-session`'s `UNKNOWN (<code>)` or
+`NOT written: <code>` form of that line. In a subagent, where nothing is
+written, render instead:
+
+> **Topics re-tag — OWED BY THE PARENT.** This `/unattended` ran in a
+> subagent context; the parent's own `/unattended` re-tags the topics.
+
+A subagent's skipped re-tag is neither `UNKNOWN` nor `NOT written`: nothing was
+attempted, and the row says who owes it.
 
 ---
 
@@ -3501,9 +3543,11 @@ never recorded as finished.
 > `2026-09-04-closeout-commands-have-no-subagent-arm-and-finish-their-parent`.
 
 A plan reserve this session still holds is released by the closeout that took
-it, through `scripts/plan-reserve-release.sh release`, which withdraws the plan's
-`implement→ship safety net` first (at most about 90 s); never by a hand-rolled
-`/claims/release`.
+it, through `scripts/plan-reserve-release.sh release --repo <owner/name>`, which
+withdraws the plan's `implement→ship safety net` first, under the tenant proven
+to own the repo (at most about 90 s); never by a hand-rolled `/claims/release`.
+Exit 7 `RELEASE_WITHHELD` released nothing: the net it names is still armed, so
+fix the cause and release again before finishing (`/implement-plan` Step 0.48).
 
 Run **`/finish-session`** with a reason naming the audit result, e.g.
 `--reason "unattended: 7 units, all landed"`, and enter it at **Part A** —

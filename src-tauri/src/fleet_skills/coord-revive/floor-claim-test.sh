@@ -157,6 +157,13 @@ ISOLATION_LIB="$REPO_ROOT/scripts/lib/coord-revive-test-isolation.sh"
 # it: a planted sitecustomize loaded 35 times in one full run.
 PY="$(command -v python3 || command -v python || true)"
 [ -n "$PY" ] || { echo "FATAL: no python3/python for the stub door"; exit 1; }
+# The stub runs under fixture_launch so it dies with this suite however the
+# suite dies (plan 2026-11-10-guard-suite-fixtures-die-with-a-cancelled-ci-job).
+# A copy of this skill dir outside the repo has no scripts/lib: fail, never
+# fall back to a raw `&` launch.
+[ -r "$REPO_ROOT/scripts/lib/fixture-port.sh" ] || { echo "FATAL: no scripts/lib/fixture-port.sh under $REPO_ROOT (this suite runs from the qontinui-claude-config checkout only)"; exit 1; }
+# shellcheck source=../../../scripts/lib/fixture-port.sh
+. "$REPO_ROOT/scripts/lib/fixture-port.sh"
 
 ok()  { PASS=$((PASS + 1)); echo "ok    $1"; }
 bad() { FAIL=$((FAIL + 1)); FAILED_CASES+=("$1"); echo "FAIL  $1"; }
@@ -311,8 +318,9 @@ srv = HTTPServer(("127.0.0.1", 0), H)
 print(srv.server_address[1], flush=True)
 srv.serve_forever()
 PYEOF
-"$PY" -I "$SANDBOX/stub.py" "$STUB_MODE" > "$SANDBOX/port" 2>"$SANDBOX/stub.err" &
-STUB_PID=$!
+fixture_launch $$ -- "$PY" -I "$SANDBOX/stub.py" "$STUB_MODE" > "$SANDBOX/port" 2>"$SANDBOX/stub.err" \
+  || { echo "FATAL: fixture_launch did not start the stub door"; cat "$SANDBOX/stub.err"; exit 1; }
+STUB_PID=$FIXTURE_PID
 PORT=""
 for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
   PORT="$(tr -d '[:space:]' < "$SANDBOX/port" 2>/dev/null)"

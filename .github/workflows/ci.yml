@@ -462,6 +462,18 @@ jobs:
           fetch-depth: 0
           filter: blob:none
 
+      # The Repo(s) parser has a Python port (the census that produces the
+      # doc-comment numbers on `extract_repos`). The Rust test
+      # `the_shared_cases_hold_for_the_rust_parse` runs the shared case file
+      # against the Rust parse; this runs it against the port, so a change to
+      # one parse and the cases cannot leave the other silently behind.
+      # No runner, no network, no build; ubuntu only; <1s -- so it sits right
+      # after checkout and reports before the long build can fail first.
+      - name: extract_repos Python port agrees on the shared cases
+        if: matrix.platform == 'ubuntu-22.04'
+        run: python3 -I src-tauri/src/plan_workunit_adapter/census/extract_repos_census.py --self-test
+        shell: bash
+
       # SELF-HOSTED ONLY (the `route` job above put the ubuntu leg on the
       # pool). Two things a hosted VM gets for free and a persistent host does
       # not:
@@ -2330,6 +2342,134 @@ jobs:
             --build-outcome "${{ steps.clippy.outcome }}" \
             --disk-path "$GITHUB_WORKSPACE"
 
+  # ── Does this change reach the holder crates? ───────────────────────────
+  #
+  # Picks `holder-crates`' matrix. WHY: `Holder crates (windows-latest)` sat
+  # queued 2-3 h for a GitHub-hosted Windows runner on PR and merge-candidate
+  # runs (coord finding c2fb777a, 2026-11-22: runner#3125 run 45047584066 and
+  # runner#2917's candidate run 45070729348) while `test (windows-latest)` and
+  # `Clippy (windows)` held the run's other hosted Windows slots. Coord waits
+  # on EVERY check of a candidate, not only the ruleset's required contexts,
+  # so that wait was added to every runner land. The job tests two small
+  # crates that most changes cannot reach.
+  #
+  # WHAT IT READS. The windows arm runs iff a changed file matches the
+  # `holder-crates` target's `observes` or the map's `global` list in
+  # .qontinui/ci-targets.toml: the crates themselves, vendor/**, and the
+  # workspace manifests, lockfile, toolchain, this workflow and
+  # .github/actions/** and .github/scripts/**. That map is
+  # the repo's declared dependency closure for this job (coord already reads
+  # it as one), so there is ONE list to keep right, not a second copy here.
+  # Its globs are matched with `**` crossing `/` and `*` NOT crossing it
+  # (globset's literal_separator=true reading; its default lets `*` cross).
+  # Every pattern in both lists today is a literal or ends in `/**`, where
+  # the two readings agree; a bare-`*` pattern added later should be checked.
+  #
+  # WHAT "CHANGED" MEANS, per event:
+  #   pull_request         the merge commit against its first parent (the
+  #                        base tip), i.e. exactly what the PR changes there
+  #   merge-candidate*/**  HEAD against its merge-base with origin/main (the
+  #                        candidate's own commits, single or batch)
+  #   main / develop push  github.event.before..HEAD
+  #   workflow_dispatch    always BOTH arms. coord's redispatcher dispatches
+  #                        this file on main after upstream lands, so main
+  #                        still gets a periodic full Windows run.
+  # Any other event, an unreadable base, a failed diff or an unreadable map
+  # also selects BOTH arms: this fails toward running, never toward skipping.
+  #
+  # An unselected windows arm produces NO check row (the matrix simply has
+  # one entry), rather than a `skipped` one. The context is not in the
+  # `main-merge-gates` ruleset, so nothing waits for it; and nothing
+  # is overwritten with `skipped` the way the job-level-`if:` trap above
+  # (`labeled`) would.
+  holder-changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      platforms: ${{ steps.select.outputs.platforms }}
+    steps:
+      # Full history, no blobs: the merge-base with main needs history, and
+      # `git diff --name-only --no-renames` reads trees only.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+
+      - name: Select holder-crates platforms
+        id: select
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -uo pipefail
+          both='["ubuntu-latest","windows-latest"]'
+          emit() {
+            echo "platforms=$1" >> "$GITHUB_OUTPUT"
+            echo "holder-crates platforms: $1 ($2)" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          }
+          base=""
+          case "$EVENT_NAME" in
+            pull_request)
+              base="$(git rev-parse --verify -q 'HEAD^1')" || emit "$both" "no first parent of the PR merge commit"
+              ;;
+            push)
+              case "$REF_NAME" in
+                merge-candidate/*|merge-candidate-spec/*|merge-candidate-batch/*)
+                  base="$(git merge-base HEAD refs/remotes/origin/main)" || emit "$both" "no merge-base with origin/main"
+                  ;;
+                *)
+                  if [[ -z "$BEFORE_SHA" || "$BEFORE_SHA" =~ ^0+$ ]]; then
+                    emit "$both" "push with no before sha"
+                  fi
+                  git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null || emit "$both" "before sha ${BEFORE_SHA} not in history"
+                  base="$BEFORE_SHA"
+                  ;;
+              esac
+              ;;
+            *)
+              emit "$both" "event ${EVENT_NAME} always runs both arms"
+              ;;
+          esac
+          changed="$(git -c core.quotePath=false diff --name-only --no-renames "$base" HEAD)" || emit "$both" "git diff ${base}..HEAD failed"
+          verdict="$(printf '%s\n' "$changed" | python3 -I -c '
+          import re, sys, tomllib
+          def rx(glob):
+              out, i = "", 0
+              while i < len(glob):
+                  if glob.startswith("**", i):
+                      out += ".*"; i += 2
+                  elif glob[i] == "*":
+                      out += "[^/]*"; i += 1
+                  elif glob[i] == "?":
+                      out += "[^/]"; i += 1
+                  else:
+                      out += re.escape(glob[i]); i += 1
+              return re.compile(out + r"\Z")
+          try:
+              with open(".qontinui/ci-targets.toml", "rb") as f:
+                  m = tomllib.load(f)
+              target = [t for t in m["targets"] if t["name"] == "holder-crates"]
+              globs = list(m["global"]) + list(target[0]["observes"])
+          except Exception as e:
+              print("both map unreadable: %s" % e); sys.exit(0)
+          pats = [rx(g) for g in globs]
+          for path in (l.strip() for l in sys.stdin):
+              if path and any(p.match(path) for p in pats):
+                  print("both %s reaches holder-crates" % path); sys.exit(0)
+          print("ubuntu no changed file reaches holder-crates")
+          ')" || emit "$both" "selector failed"
+          case "$verdict" in
+            ubuntu\ *) emit '["ubuntu-latest"]' "${verdict#ubuntu } (base ${base})" ;;
+            both\ *)   emit "$both" "${verdict#both } (base ${base})" ;;
+            *)          emit "$both" "unrecognised selector output: ${verdict}" ;;
+          esac
+
   # Tests + clippy for the standalone workspace crates that the `test` job
   # never reaches.
   #
@@ -2357,16 +2497,26 @@ jobs:
   # each crate's own [lints] table, where correctness/suspicious are `deny`.
   #
   # Not a required check (not registered in the ruleset by this change).
+  #
+  # The windows-latest arm runs only when `holder-changes` (below) says the
+  # change can reach these crates; the ubuntu-latest arm always runs. See
+  # `holder-changes` for why and for what it reads.
   holder-crates:
     name: Holder crates (${{ matrix.platform }})
     strategy:
       fail-fast: false
       matrix:
-        platform: [ubuntu-latest, windows-latest]
+        # From `holder-changes`: `["ubuntu-latest","windows-latest"]` or
+        # `["ubuntu-latest"]`. An EMPTY output (that job failed or was
+        # cancelled) falls back to both arms, so a broken selector costs a
+        # Windows slot, never coverage.
+        platform: ${{ fromJSON(needs['holder-changes'].outputs.platforms || '["ubuntu-latest","windows-latest"]') }}
     # Only the windows arm routes (like `test`'s windows leg, see
     # `route-windows`); ubuntu-latest stays hosted. `!cancelled()` keeps both
-    # arms from being SKIPPED on a pull_request, where route-windows is.
-    needs: route-windows
+    # arms from being SKIPPED on a pull_request, where route-windows is, and
+    # keeps this job running when `holder-changes` fails (the matrix then
+    # falls back to both arms, above).
+    needs: [route-windows, holder-changes]
     if: ${{ !cancelled() }}
     # coord-pools: [ubuntu-latest] | [self-hosted, Windows, X64, qontinui-runner-ci-windows, ram-40g] | [windows-latest]
     runs-on: ${{ fromJSON(matrix.platform == 'windows-latest' && ((github.run_attempt == 1 && github.event_name != 'pull_request' && vars.RUNNER_CI_WINDOWS_LANE == 'self-hosted' && '["self-hosted","Windows","X64","qontinui-runner-ci-windows","ram-40g"]') || (github.run_attempt == 1 && needs['route-windows'].outputs.labels) || '["windows-latest"]') || '["ubuntu-latest"]') }}
@@ -2542,6 +2692,126 @@ jobs:
           fi
           echo "Debug test-fixtures seam gate OK — all three cfg anchors intact."
 
+  # The generated style guide (plan
+  # 2026-11-19-the-visual-system-is-prose-no-build-step-compiles-and-the-project-template-ships-no-design
+  # Phase 8). src/design-system/qontinui-runner.styleguide.uibridge.json and
+  # its siblings (tokens.css, tokens.ts, theme.css, compile-report.json,
+  # design-budgets.json, visual-system.thresholds.json) are `design-kit
+  # compile` output of design/language.dtcg.json; until this job the guide was
+  # hand-written and evaluated by nothing. Mirrors qontinui-web frontend-ci.yml
+  # job `design-guide` (qontinui-web#2302).
+  design-guide:
+    name: Generated style guide (compile --check + validate-guide)
+    # HOSTED only, deliberately: it needs Chromium and its system libraries
+    # (installed with apt), which no light self-hosted pool here is known to
+    # provision, and its installs (a git dependency whose `prepare` builds the
+    # kit, a clone + build of @qontinui/design-tokens at the source's ref,
+    # Chromium) are network-bound. Public repo: hosted minutes cost nothing.
+    # Duration UNMEASURED; cap 15 min until measured.
+    # coord-pools: [ubuntu-latest]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      # No package-manager cache: this job installs nothing through the app's
+      # pnpm tree, and setup-node v5 otherwise caches on its own because
+      # package.json names a `packageManager`, which fails here with
+      # "Unable to locate executable file: pnpm" (pnpm is never set up).
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          package-manager-cache: false
+
+      # The kit is installed OUTSIDE the app from design/kit/package-lock.json
+      # (the git tag v0.1.1 resolved to its commit, plus the EXACT ui-bridge
+      # peers validate-guide drives), never through the app's pnpm tree:
+      # `--root` points validate-guide at the tool directory, where it finds
+      # its own wrapper.
+      - name: Install design-kit (pinned by design/kit/package-lock.json)
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          kit="$RUNNER_TEMP/design-kit"
+          mkdir -p "$kit"
+          cp design/kit/package.json design/kit/package-lock.json "$kit"/
+          npm ci --prefix "$kit" --no-audit --no-fund
+          echo "DESIGN_KIT_DIR=$kit" >> "$GITHUB_ENV"
+
+      # APT half and CDN half split, so an apt hang is never misread as a CDN
+      # or a validation failure. The Playwright version that matters is the kit
+      # tool directory's.
+      - name: Install Chromium system deps for validate-guide (apt)
+        timeout-minutes: 5
+        working-directory: ${{ runner.temp }}/design-kit
+        run: npx playwright install-deps chromium
+
+      - name: Install Chromium for validate-guide (CDN)
+        timeout-minutes: 3
+        working-directory: ${{ runner.temp }}/design-kit
+        run: npx playwright install chromium
+
+      # 1. The committed outputs are a fresh compile of the source (a hand edit
+      #    to the guide, or a source edit without a recompile, is red). The
+      #    compile builds @qontinui/design-tokens at the ref the source names.
+      # 2. validate-guide over the conforming fixture must pass (exit 0).
+      # 3. validate-guide over the seeded off-scale fixture must exit 1 AND name
+      #    each of the four seeded violations: the negative control, so a guide
+      #    whose rules stop catching one of them cannot pass vacuously.
+      # Exit 3 (UNKNOWN: the instrument could not measure) is red everywhere.
+      # Every expected non-zero exit is captured with `|| rc=$?` so errexit
+      # cannot cut the step short. The fixtures link `tokens.css` beside them;
+      # they are staged with the COMPILED src/design-system/tokens.css because
+      # validate-guide serves a file from its own directory.
+      - name: Generated style guide is current and its rules bite
+        timeout-minutes: 8
+        shell: bash
+        env:
+          DESIGN_KIT_CACHE: ${{ runner.temp }}/design-kit-cache
+        run: |
+          set -uo pipefail
+          dk="$DESIGN_KIT_DIR/node_modules/.bin/design-kit"
+          guide="$PWD/src/design-system/qontinui-runner.styleguide.uibridge.json"
+          rc=0
+          "$dk" compile --root . --out src/design-system --check || rc=$?
+          case "$rc" in
+            0) ;;
+            1) echo "::error file=design/language.dtcg.json::src/design-system/ is not a fresh compile of design/language.dtcg.json. Install the kit as design/kit/package-lock.json pins it, run 'design-kit compile --root . --out src/design-system' at the repo root and commit the result; never edit the generated files by hand."; exit 1 ;;
+            2) echo "::error file=design/language.dtcg.json::design-kit compile exited 2: the source was refused, or the tool failed (for example building @qontinui/design-tokens at the source's ref). Read the lines above; this is not a drift verdict."; exit 1 ;;
+            *) echo "::error file=design/language.dtcg.json::design-kit compile exited $rc (3 = UNKNOWN). No drift verdict was reached."; exit 1 ;;
+          esac
+          stage="$RUNNER_TEMP/guide-fixtures"
+          mkdir -p "$stage"
+          cp design/fixtures/conforming.html design/fixtures/off-scale.html src/design-system/tokens.css "$stage"/
+          rc=0
+          "$dk" validate-guide --root "$DESIGN_KIT_DIR" "$guide" "$stage/conforming.html" || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error file=src/design-system/qontinui-runner.styleguide.uibridge.json::validate-guide exited $rc on the conforming fixture (1 = a rule failed, 3 = UNKNOWN: the instrument could not measure)."
+            exit 1
+          fi
+          out="$RUNNER_TEMP/off-scale.out"
+          rc=0
+          "$dk" validate-guide --root "$DESIGN_KIT_DIR" "$guide" "$stage/off-scale.html" > "$out" 2>&1 || rc=$?
+          cat "$out"
+          if [ "$rc" -ne 1 ]; then
+            echo "::error file=design/fixtures/off-scale.html::validate-guide exited $rc on the seeded off-scale fixture; the negative control needs exit 1 (rules failed). 0 means no error rule failed; 3 means UNKNOWN."
+            exit 1
+          fi
+          missing=""
+          for r in palette-color palette-background-color font-size-on-scale border-radius-on-scale; do
+            grep -qE "^ERROR [^ ]*seeded-violation[^ ]* $r:" "$out" || missing="$missing $r"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error file=design/fixtures/off-scale.html::the seeded element no longer fails:$missing. The guide stopped catching that seeded violation."
+            exit 1
+          fi
+          echo "validate-guide: conforming fixture passes; the seeded fixture fails each of its four rules, as it must."
+
   security:
     # Light self-hosted lane (RUNNER_CI_LIGHT_LANE, override RUNNER_CI_LANE_CI).
     # `cargo install cargo-audit` writes into $CARGO_HOME, which on a nawa org
@@ -2615,6 +2885,23 @@ jobs:
         # not parse untrusted network XML through these paths (build-time
         # manifests/plists). These are the ONLY two quick-xml advisories in
         # the DB as of 2026-07-02. Revisit when tauri/gtk bump to >= 0.41.
+        #
+        # --ignore RUSTSEC-2026-0545 + RUSTSEC-2026-0548: two more zip
+        # advisories (advisory dates 2026-10-22 and 2026-10-17; first seen
+        # red-ing `security` on main 2026-11-17). 0545: AES entries returned
+        # without checking their authentication code when the data ends early
+        # or is empty (fixed in 9.0.0). 0548: `ZipStreamReader` extracts entries
+        # under local-header names that can differ from the central directory
+        # (9.0.5 adds an OPT-IN `enforce_header_consistency`, off by default).
+        # The runner's OWN zip is bumped to 9.0.5 and runner code never uses
+        # `ZipStreamReader`, so both ignores cover ONLY the zip 4.6.1 copy
+        # described in the next paragraph. Neither is reachable there:
+        # zip 4.6.1 is built without `aes-crypto` (its lock entry has no aes
+        # or hmac dependency), so 0545's code is not compiled; the updater
+        # reads with `ZipArchive`, never `ZipStreamReader`, so 0548's API is
+        # not called; and either way it reads only after `verify_signature`
+        # has checked the archive against our updater public key. Drop both
+        # with the four below, on the tauri-plugin-updater >= 2.14.1 upgrade.
         #
         # --ignore RUSTSEC-2026-0367 + RUSTSEC-2026-0368 + RUSTSEC-2026-0369
         # + RUSTSEC-2026-0429: four zip < 9.0.0 extraction advisories (SUID/SGID
@@ -2706,7 +2993,7 @@ jobs:
           # and reds this job on every PR (an upstream ecosystem drift, not a
           # runner vulnerability). --locked pins to cargo-audit's tested deps.
           cargo install cargo-audit --locked
-          cargo audit --file Cargo.lock --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2026-0367 --ignore RUSTSEC-2026-0368 --ignore RUSTSEC-2026-0369 --ignore RUSTSEC-2026-0429 --ignore RUSTSEC-2026-0387
+          cargo audit --file Cargo.lock --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2026-0367 --ignore RUSTSEC-2026-0368 --ignore RUSTSEC-2026-0369 --ignore RUSTSEC-2026-0429 --ignore RUSTSEC-2026-0545 --ignore RUSTSEC-2026-0548 --ignore RUSTSEC-2026-0387
 
       # A hosted image ships node; a nawa org runner is not known to, and pnpm
       # needs it, so without this the audit below could run nothing behind its

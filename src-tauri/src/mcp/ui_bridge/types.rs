@@ -8,6 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::mcp::envelope::RequestHints;
+use qontinui_types::refusal::{NextAction, NextActionKind};
 
 /// Request to execute an action on an element
 #[derive(Debug, Deserialize)]
@@ -453,7 +454,7 @@ pub enum UiBridgeErrorCode {
     // it into the top-level `code`. One code, both fields.
     /// `sendKeys`' `keys` payload was not translatable to a PTY sequence.
     /// Caller-payload error: the identical request will fail identically, so
-    /// the recovery hint is [`RecoveryHint::FixRequest`].
+    /// the next action is `fix_request`.
     SendKeysInvalid,
     /// `writeToTerminal`'s `text` was not a string.
     WriteTextInvalid,
@@ -464,7 +465,7 @@ pub enum UiBridgeErrorCode {
     /// A view-only action (`focus` / `blur`) was asked of a pane with no
     /// mounted terminal view. NOT a payload error — the request is well
     /// formed and the remedy is to bring the pane on screen, which is why it
-    /// carries [`RecoveryHint::ScrollIntoView`] rather than `FixRequest`.
+    /// carries `scroll_into_view` rather than `fix_request`.
     TerminalNoMountedView,
     /// A fetch the frontend makes on the caller's behalf failed upstream —
     /// today the runtime spec loader's `GET /apps/{app}/spec/list`. The
@@ -476,47 +477,20 @@ pub enum UiBridgeErrorCode {
     InternalError,
 }
 
-/// Machine-readable recovery hints telling AI agents what to do next.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum RecoveryHint {
-    /// Re-take a DOM snapshot; element refs may have changed
-    Resnapshot,
-    /// Retry the same operation after a delay (milliseconds)
-    RetryAfterMs(u64),
-    /// Wait for the circuit breaker cooldown to expire
-    WaitForRecovery,
-    /// Scroll or navigate to make the element visible
-    ScrollIntoView,
-    /// The element exists but is disabled; wait for it to become enabled
-    WaitForEnabled,
-    /// Use a different selector or broaden the search criteria
-    BroadenSelector,
-    /// The REQUEST is malformed — a named parameter has the wrong type, the
-    /// wrong shape or an out-of-domain value. Correct the payload and re-send;
-    /// re-sending it unchanged fails identically, and nothing about the page,
-    /// the element or the snapshot will change that.
-    ///
-    /// Deliberately distinct from [`Self::Resnapshot`] and
-    /// [`Self::Unrecoverable`], and the distinction is the whole point of the
-    /// variant. `RESNAPSHOT` told a caller to re-read the DOM, which cannot
-    /// fix `maxLines: "abc"` and costs a round-trip to learn that. And
-    /// `UNRECOVERABLE` — "skip or report failure" — is equally wrong in the
-    /// other direction: a payload error is not merely recoverable, it is
-    /// recoverable BY THE CALLER, deterministically, with no waiting.
-    FixRequest,
-    /// The operation cannot be recovered; skip or report failure
-    Unrecoverable,
-}
-
-/// Structured error with machine-readable code and recovery hint.
+/// Structured error with machine-readable code and a typed next action.
+///
+/// `recovery` is the shared [`NextAction`] from `qontinui_types::refusal` —
+/// the same vocabulary every Qontinui refusal names its next step in — so the
+/// envelope middleware can lift it verbatim into the response's `refusal`
+/// (`crate::mcp::refusal_envelope`). On the wire it is
+/// `{"kind": "<snake_case NextActionKind>", "retry_after_s"?: n}`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UiBridgeError {
     pub code: UiBridgeErrorCode,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub recovery: Option<RecoveryHint>,
+    pub recovery: Option<NextAction>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<serde_json::Value>,
 }
@@ -526,7 +500,7 @@ impl UiBridgeError {
         Self {
             code: UiBridgeErrorCode::Timeout,
             message: format!("UI Bridge request timed out after {}ms", duration_ms),
-            recovery: Some(RecoveryHint::RetryAfterMs(1000)),
+            recovery: Some(NextAction::retry_after_ms(1000)),
             context: Some(serde_json::json!({"timeout_ms": duration_ms})),
         }
     }
@@ -535,7 +509,7 @@ impl UiBridgeError {
         Self {
             code: UiBridgeErrorCode::CircuitBreakerOpen,
             message: "UI Bridge temporarily unavailable (circuit breaker open)".to_string(),
-            recovery: Some(RecoveryHint::WaitForRecovery),
+            recovery: Some(NextAction::retry_later(None)),
             context: None,
         }
     }
@@ -544,7 +518,7 @@ impl UiBridgeError {
         Self {
             code: UiBridgeErrorCode::ConcurrencyLimitReached,
             message: "UI Bridge concurrency limit reached (timeout acquiring permit)".to_string(),
-            recovery: Some(RecoveryHint::RetryAfterMs(500)),
+            recovery: Some(NextAction::retry_after_ms(500)),
             context: None,
         }
     }
@@ -553,7 +527,7 @@ impl UiBridgeError {
         Self {
             code: UiBridgeErrorCode::WindowNotFound,
             message: "Main webview window not found".to_string(),
-            recovery: Some(RecoveryHint::Unrecoverable),
+            recovery: Some(NextAction::new(NextActionKind::NoneTerminal)),
             context: None,
         }
     }
@@ -562,7 +536,7 @@ impl UiBridgeError {
         Self {
             code: UiBridgeErrorCode::ElementNotFound,
             message: format!("No element found matching criteria {}", selector),
-            recovery: Some(RecoveryHint::Resnapshot),
+            recovery: Some(NextAction::new(NextActionKind::Resnapshot)),
             context: Some(serde_json::json!({"selector": selector})),
         }
     }
@@ -615,7 +589,7 @@ impl UiBridgeError {
         Self {
             code: UiBridgeErrorCode::InvalidRequest,
             message,
-            recovery: Some(RecoveryHint::Unrecoverable),
+            recovery: Some(NextAction::new(NextActionKind::FixRequest)),
             context: Some(context),
         }
     }
@@ -638,7 +612,7 @@ impl UiBridgeError {
         Self {
             code: UiBridgeErrorCode::InvalidParam,
             message: "type: 'value' is unknown; did you mean 'text'?".to_string(),
-            recovery: Some(RecoveryHint::Unrecoverable),
+            recovery: Some(NextAction::new(NextActionKind::FixRequest)),
             context: Some(serde_json::json!({
                 "action": "type",
                 "provided": "value",
@@ -659,7 +633,7 @@ impl UiBridgeError {
         Self {
             code: UiBridgeErrorCode::MissingParam,
             message: "type requires 'text' parameter".to_string(),
-            recovery: Some(RecoveryHint::Unrecoverable),
+            recovery: Some(NextAction::new(NextActionKind::FixRequest)),
             context: Some(serde_json::json!({
                 "action": "type",
                 "required": ["text"],
@@ -683,7 +657,7 @@ impl UiBridgeError {
                 provided,
                 allowed.join("|")
             ),
-            recovery: Some(RecoveryHint::Unrecoverable),
+            recovery: Some(NextAction::new(NextActionKind::FixRequest)),
             context: Some(serde_json::json!({
                 "code": "INVALID_STATE",
                 "provided_state": provided,
@@ -703,7 +677,7 @@ impl UiBridgeError {
         Self {
             code: UiBridgeErrorCode::InvalidTabId,
             message: format!("Unknown tabId: \"{}\"", provided),
-            recovery: Some(RecoveryHint::Unrecoverable),
+            recovery: Some(NextAction::new(NextActionKind::FixRequest)),
             context: Some(serde_json::json!({
                 "code": "INVALID_TAB_ID",
                 "tabId": provided,
@@ -726,7 +700,7 @@ impl UiBridgeError {
         Self {
             code: UiBridgeErrorCode::ElementNotFound,
             message: format!("No element with id {}", element_id),
-            recovery: Some(RecoveryHint::Resnapshot),
+            recovery: Some(NextAction::new(NextActionKind::Resnapshot)),
             context: Some(serde_json::json!({
                 "code": "ELEMENT_NOT_FOUND",
                 "elementId": element_id,
@@ -741,7 +715,7 @@ impl UiBridgeError {
                 "Found {} element(s) matching '{}' but none are visible",
                 total_found, selector
             ),
-            recovery: Some(RecoveryHint::ScrollIntoView),
+            recovery: Some(NextAction::new(NextActionKind::ScrollIntoView)),
             context: Some(serde_json::json!({"selector": selector, "total_found": total_found})),
         }
     }
@@ -750,7 +724,7 @@ impl UiBridgeError {
         Self {
             code: UiBridgeErrorCode::ActionFailed,
             message: message.into(),
-            recovery: Some(RecoveryHint::Resnapshot),
+            recovery: Some(NextAction::new(NextActionKind::Resnapshot)),
             context: None,
         }
     }
@@ -759,7 +733,7 @@ impl UiBridgeError {
         Self {
             code: UiBridgeErrorCode::FrontendNotReady,
             message: "UI Bridge frontend did not become ready".to_string(),
-            recovery: Some(RecoveryHint::RetryAfterMs(2000)),
+            recovery: Some(NextAction::retry_after_ms(2000)),
             context: Some(diagnostics),
         }
     }
@@ -768,7 +742,7 @@ impl UiBridgeError {
         Self {
             code: UiBridgeErrorCode::InternalError,
             message: message.into(),
-            recovery: Some(RecoveryHint::Unrecoverable),
+            recovery: Some(NextAction::new(NextActionKind::ReportDefect)),
             context: None,
         }
     }
@@ -849,47 +823,56 @@ pub fn classify_assertion_failure(detail: &str) -> UiBridgeErrorCode {
     }
 }
 
-/// Get the recovery hint for an error code.
-pub fn recovery_hint_for(code: &UiBridgeErrorCode) -> RecoveryHint {
+/// The next action a caller takes for an error code.
+pub fn next_action_for(code: &UiBridgeErrorCode) -> NextAction {
     match code {
-        UiBridgeErrorCode::Timeout => RecoveryHint::RetryAfterMs(1000),
-        UiBridgeErrorCode::CircuitBreakerOpen => RecoveryHint::WaitForRecovery,
-        UiBridgeErrorCode::ConcurrencyLimitReached => RecoveryHint::RetryAfterMs(500),
-        UiBridgeErrorCode::FrontendUnresponsive => RecoveryHint::WaitForRecovery,
-        UiBridgeErrorCode::FrontendNotReady => RecoveryHint::RetryAfterMs(2000),
-        // NOT `RetryAfterMs`: a wedged native loop does not clear on a fixed
+        UiBridgeErrorCode::Timeout => NextAction::retry_after_ms(1000),
+        UiBridgeErrorCode::CircuitBreakerOpen => NextAction::retry_later(None),
+        UiBridgeErrorCode::ConcurrencyLimitReached => NextAction::retry_after_ms(500),
+        UiBridgeErrorCode::FrontendUnresponsive => NextAction::retry_later(None),
+        UiBridgeErrorCode::FrontendNotReady => NextAction::retry_after_ms(2000),
+        // `retry_later` with NO delay: a wedged native loop does not clear on a fixed
         // backoff, and every retry re-enqueues onto the same blocked queue.
         // The loop *can* recover (a long synchronous handler eventually
-        // returns), so it is not `Unrecoverable` either — the caller should
+        // returns), so it is not `NoneTerminal` either — the caller should
         // wait for the wedge to clear, or take the explicit force-close door.
-        UiBridgeErrorCode::EventLoopUnresponsive => RecoveryHint::WaitForRecovery,
-        UiBridgeErrorCode::WindowNotFound => RecoveryHint::Unrecoverable,
-        UiBridgeErrorCode::ElementNotFound => RecoveryHint::Resnapshot,
-        UiBridgeErrorCode::ElementNotVisible => RecoveryHint::ScrollIntoView,
-        UiBridgeErrorCode::ElementNotEnabled => RecoveryHint::WaitForEnabled,
-        UiBridgeErrorCode::ElementStale => RecoveryHint::Resnapshot,
-        UiBridgeErrorCode::ActionFailed => RecoveryHint::Resnapshot,
-        UiBridgeErrorCode::AssertionFailed => RecoveryHint::BroadenSelector,
-        UiBridgeErrorCode::UnknownAssertionType => RecoveryHint::Unrecoverable,
-        UiBridgeErrorCode::InvalidRequest => RecoveryHint::Unrecoverable,
-        UiBridgeErrorCode::InvalidParam => RecoveryHint::Unrecoverable,
-        UiBridgeErrorCode::MissingParam => RecoveryHint::Unrecoverable,
-        UiBridgeErrorCode::InvalidState => RecoveryHint::Unrecoverable,
-        UiBridgeErrorCode::InvalidTabId => RecoveryHint::Unrecoverable,
-        UiBridgeErrorCode::ActionNotSupported => RecoveryHint::Unrecoverable,
+        UiBridgeErrorCode::EventLoopUnresponsive => NextAction::retry_later(None),
+        UiBridgeErrorCode::WindowNotFound => NextAction::new(NextActionKind::NoneTerminal),
+        UiBridgeErrorCode::ElementNotFound => NextAction::new(NextActionKind::Resnapshot),
+        UiBridgeErrorCode::ElementNotVisible => NextAction::new(NextActionKind::ScrollIntoView),
+        UiBridgeErrorCode::ElementNotEnabled => NextAction::new(NextActionKind::WaitForEnabled),
+        UiBridgeErrorCode::ElementStale => NextAction::new(NextActionKind::Resnapshot),
+        UiBridgeErrorCode::ActionFailed => NextAction::new(NextActionKind::Resnapshot),
+        UiBridgeErrorCode::AssertionFailed => NextAction::new(NextActionKind::BroadenSelector),
+        // The request-shape codes. `FixRequest`, not the `UNRECOVERABLE`
+        // ("skip or report failure") they carried before the shared
+        // vocabulary: each is a payload the CALLER corrects and re-sends —
+        // the context names the accepted values (`supportedActions`,
+        // `allowed_states`, `knownTabs`, `didYouMean`) — and re-sending it
+        // unchanged fails identically.
+        UiBridgeErrorCode::UnknownAssertionType => NextAction::new(NextActionKind::FixRequest),
+        UiBridgeErrorCode::InvalidRequest => NextAction::new(NextActionKind::FixRequest),
+        UiBridgeErrorCode::InvalidParam => NextAction::new(NextActionKind::FixRequest),
+        UiBridgeErrorCode::MissingParam => NextAction::new(NextActionKind::FixRequest),
+        UiBridgeErrorCode::InvalidState => NextAction::new(NextActionKind::FixRequest),
+        UiBridgeErrorCode::InvalidTabId => NextAction::new(NextActionKind::FixRequest),
+        UiBridgeErrorCode::ActionNotSupported => NextAction::new(NextActionKind::FixRequest),
         // The four caller-payload codes. `FixRequest`, not `Resnapshot` (which
         // is what `as_action_failure` used to stamp on them) and not
-        // `Unrecoverable`: the caller fixes the named parameter and re-sends.
-        UiBridgeErrorCode::SendKeysInvalid => RecoveryHint::FixRequest,
-        UiBridgeErrorCode::WriteTextInvalid => RecoveryHint::FixRequest,
-        UiBridgeErrorCode::PasteTextInvalid => RecoveryHint::FixRequest,
-        UiBridgeErrorCode::ScrollbackMaxLinesInvalid => RecoveryHint::FixRequest,
+        // `NoneTerminal`: the caller fixes the named parameter and re-sends.
+        UiBridgeErrorCode::SendKeysInvalid => NextAction::new(NextActionKind::FixRequest),
+        UiBridgeErrorCode::WriteTextInvalid => NextAction::new(NextActionKind::FixRequest),
+        UiBridgeErrorCode::PasteTextInvalid => NextAction::new(NextActionKind::FixRequest),
+        UiBridgeErrorCode::ScrollbackMaxLinesInvalid => NextAction::new(NextActionKind::FixRequest),
         // Not a payload error: the request is well formed and the pane simply
         // has no mounted view. The remedy is to bring it on screen.
-        UiBridgeErrorCode::TerminalNoMountedView => RecoveryHint::ScrollIntoView,
+        UiBridgeErrorCode::TerminalNoMountedView => NextAction::new(NextActionKind::ScrollIntoView),
         // A dependency answered badly; it may well answer next time.
-        UiBridgeErrorCode::UpstreamFetchFailed => RecoveryHint::RetryAfterMs(2000),
-        UiBridgeErrorCode::InternalError => RecoveryHint::Unrecoverable,
+        UiBridgeErrorCode::UpstreamFetchFailed => NextAction::retry_after_ms(2000),
+        // An unclassified failure inside the runner or its frontend is the
+        // product's fault, and saying so is the honest next step — not a
+        // "nothing you can do" that hides the defect.
+        UiBridgeErrorCode::InternalError => NextAction::new(NextActionKind::ReportDefect),
     }
 }
 
@@ -946,7 +929,7 @@ pub fn typed_frontend_code_by_name(code_name: &str, message: &str) -> Option<UiB
         .map(|(_, code)| UiBridgeError {
             code: *code,
             message: message.to_string(),
-            recovery: Some(recovery_hint_for(code)),
+            recovery: Some(next_action_for(code)),
             context: None,
         })
 }
@@ -967,7 +950,7 @@ pub fn typed_frontend_code(error_msg: &str) -> Option<UiBridgeError> {
                 return Some(UiBridgeError {
                     code: *code,
                     message: error_msg.to_string(),
-                    recovery: Some(recovery_hint_for(code)),
+                    recovery: Some(next_action_for(code)),
                     context: None,
                 });
             }
@@ -1271,7 +1254,8 @@ mod typed_frontend_code_tests {
     //! code exists to prevent. `RESNAPSHOT` was wrong advice on top of that: no
     //! amount of re-snapshotting fixes `maxLines: "abc"`.
 
-    use super::{classify_transport_error, RecoveryHint, UiBridgeErrorCode};
+    use super::{classify_transport_error, UiBridgeErrorCode};
+    use qontinui_types::refusal::{NextAction, NextActionKind};
 
     fn code_of(msg: &str) -> String {
         serde_json::to_value(classify_transport_error(msg).code)
@@ -1311,10 +1295,12 @@ mod typed_frontend_code_tests {
     #[test]
     fn a_caller_payload_error_recovers_by_fixing_the_request_not_resnapshotting() {
         let detail = classify_transport_error("SCROLLBACK_MAX_LINES_INVALID: 'maxLines' must be …");
-        assert!(matches!(detail.recovery, Some(RecoveryHint::FixRequest)));
+        assert_eq!(
+            detail.recovery,
+            Some(NextAction::new(NextActionKind::FixRequest))
+        );
         let wire = serde_json::to_value(&detail).expect("serialize");
-        assert_eq!(wire["recovery"], serde_json::json!("FIX_REQUEST"));
-        assert_ne!(wire["recovery"], serde_json::json!("RESNAPSHOT"));
+        assert_eq!(wire["recovery"], serde_json::json!({"kind": "fix_request"}));
     }
 
     #[test]
@@ -1324,10 +1310,10 @@ mod typed_frontend_code_tests {
         let detail = classify_transport_error(
             "TERMINAL_NO_MOUNTED_VIEW: 'focus' needs a mounted terminal view …",
         );
-        assert!(matches!(
+        assert_eq!(
             detail.recovery,
-            Some(RecoveryHint::ScrollIntoView)
-        ));
+            Some(NextAction::new(NextActionKind::ScrollIntoView))
+        );
     }
 
     #[test]

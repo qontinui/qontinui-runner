@@ -128,6 +128,59 @@ export function autoTrimHold(inputs: AutoTrimHoldInputs): AutoTrimHold | null {
   return null;
 }
 
+/**
+ * A layout origin as the UI Bridge reports it (`get-page-layout`): the stored
+ * origin, or `legacy` when the page has none — it predates the field, and
+ * reads as `operator` to the trim. Reported apart from `operator` so an
+ * outside trimmer (`/triage-sessions`) can tell a page nobody may shrink from
+ * one it may shrink and hand to the runner.
+ */
+export type ReportedLayoutOrigin = LayoutOrigin | "legacy";
+
+export function reportLayoutOrigin(origin: LayoutOrigin | undefined): ReportedLayoutOrigin {
+  return origin ?? "legacy";
+}
+
+/**
+ * The origin a page reports after a layout REQUEST, predicted by the rule
+ * `useZoneLayout`'s `applyLayout` applies: an `operator` request always
+ * records `operator`; an `auto` one records `auto` only when it changes the
+ * layout id — re-asserting the layout a page already has must not hand an
+ * operator's (or a legacy) page to the trim. A request answer built from this
+ * says what the page now holds, not what the caller asked for.
+ *
+ * `settledId` is the layout the grid SETTLES at (`computeAutoGrowLayoutId`).
+ * When it differs from the request, the hook's auto-grow effect re-applies it
+ * as an `auto` request that changes the id the request just set, so the page
+ * ends `auto` whoever asked — an operator's quad over six sessions is a
+ * runner-grown six-pack, and it trims when they close
+ * (`useZoneLayout.autoTrim.test.ts`, "auto-grow turns an operator page into
+ * an auto one"). It is required, not defaulted to the request: a default
+ * reproduces the very misreport it exists to prevent for any caller that
+ * forgets the grow.
+ */
+export function predictLayoutOrigin(
+  current: { layoutId: string; layoutOrigin?: LayoutOrigin },
+  requestedId: string,
+  source: LayoutOrigin,
+  settledId: string,
+): ReportedLayoutOrigin {
+  if (settledId !== requestedId) return "auto";
+  if (source === "operator") return "operator";
+  return requestedId !== current.layoutId ? "auto" : reportLayoutOrigin(current.layoutOrigin);
+}
+
+/**
+ * A caller-supplied origin for a layout REQUEST (`/layout --origin`,
+ * `select-layout` `origin`), or `null` when it names neither. Case and
+ * surrounding space are forgiven; `restore` is not accepted, because it is
+ * the mount path's own source, not a choice a caller makes.
+ */
+export function parseLayoutOriginArg(raw: string): LayoutOrigin | null {
+  const v = raw.trim().toLowerCase();
+  return v === "auto" || v === "operator" ? v : null;
+}
+
 /** Per-runner-instance preference: shrink the grid when tabs close. */
 export const AUTO_TRIM_STORAGE_KEY = "qontinui-zone-auto-trim";
 

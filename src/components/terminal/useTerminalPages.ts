@@ -8,6 +8,12 @@ import { getPerfCaps, getPerfCapsLoadState, loadPerfCaps } from "@/lib/perfCaps"
 import { DEFAULT_PAGE_NAME, nextAutoPageName, renameRefusal, uniquePageName } from "./pageNaming";
 import { MAIN_WINDOW_LABEL, readWindowLabel } from "@/lib/windowLabel";
 import {
+  broadcastRosterSaved,
+  listenRosterSaved,
+  rosterDigest,
+  rosterEqual,
+} from "./terminalPagesSync";
+import {
   PAGES_VERSION,
   PAGES_VERSION_KEY,
   PRUNE_UNDO_MS,
@@ -132,6 +138,14 @@ function readPersistedPages(): TerminalPageConfig[] | null {
   return Array.isArray(stored) && stored.length > 0 ? withClassifiedOrigins(stored) : null;
 }
 
+/**
+ * How many times a window re-reads the store, {@link ROSTER_RESYNC_RETRY_MS}
+ * apart, for the roster another window announced (see the resync effect in
+ * `useTerminalPages`).
+ */
+const ROSTER_RESYNC_RETRIES = 5;
+const ROSTER_RESYNC_RETRY_MS = 50;
+
 /** Persist the active page id; a full store leaves the previous one (best effort). */
 function persistActivePage(id: string) {
   try {
@@ -157,6 +171,51 @@ function recordRepairIfPersisted(): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * The Tauri command that tells the runner backend this window's tab labels
+ * and order (`commands/terminal_pages.rs`). The backend serves them on
+ * `GET /terminal-pages` and `GET /terminal-layout`; without a registration it
+ * knows page ids only. Plan
+ * `2026-11-08-save-per-tab-runner-session-lists-on-sessions-page-kept-14-days`, D2.
+ */
+export const REGISTER_PAGE_LABELS_COMMAND = "terminal_pages_register";
+
+/** One page as the registration command takes it. */
+export interface PageLabelRegistration {
+  pageId: string;
+  label: string;
+  order: number;
+  /**
+   * The window the page is shown in: the pop-out window's label when the page
+   * is detached into one (`boundPages`), otherwise `"main"`. The backend puts
+   * it on the session census as `page_window` (plan
+   * `2026-11-16-runner-page-name-reaches-the-coord-session-identity-card`, D8).
+   */
+  window: string;
+}
+
+/**
+ * Pure: the registration payload — EVERY page in tab order, pages detached
+ * into a pop-out and the internal "default" page included, numbered by
+ * position, each with the window it is shown in. The backend replaces its
+ * whole registration with it.
+ */
+export function pageLabelRegistration(
+  pages: readonly TerminalPageConfig[],
+  boundPages: Readonly<Record<string, string>> = {},
+): {
+  pages: PageLabelRegistration[];
+} {
+  return {
+    pages: pages.map((p, order) => ({
+      pageId: p.id,
+      label: p.name,
+      order,
+      window: boundPages[p.id] ?? MAIN_WINDOW_LABEL,
+    })),
+  };
 }
 
 /**
@@ -538,15 +597,16 @@ export async function readOccupiedPageIds(): Promise<OccupancyRead> {
  * unreadable, or the restorable set withheld by a drain — removes nothing.
  * `remove` is the record-only `removeEmptyPage`, which itself keeps a page it
  * finds a terminal on; it resolves to `null` when it kept the page. Returns how
- * many pages were removed.
+ * many pages were removed, or `null` when the occupancy read was incomplete
+ * (UNKNOWN — distinct from `0`, "read fine, nothing empty").
  */
 export async function closeEmptyPagesWith<T>(
   visiblePages: TerminalPageConfig[],
   read: () => Promise<OccupancyRead>,
   remove: (id: string) => Promise<T | null>,
-): Promise<number> {
+): Promise<number | null> {
   const first = await read();
-  if (!first.complete) return 0;
+  if (!first.complete) return null;
   const { removed } = await removeEach(emptyPageIds(visiblePages, first.ids), read, remove);
   return removed.length;
 }
@@ -584,8 +644,18 @@ export function useTerminalPages() {
   const [ownsRosterWrites] = useState<boolean>(
     () => pinnedPageId === null && readWindowLabel() === MAIN_WINDOW_LABEL,
   );
+  // This window's Tauri label, the `source` of its roster-saved broadcasts
+  // (so it can ignore its own echo). Labels are unique per process.
+  const [windowLabel] = useState<string>(readWindowLabel);
 
   const [allPages, setPages] = useState<TerminalPageConfig[]>(loadPages);
+  // Only the main window registers tab labels with the backend. A page-pinned
+  // pop-out knows only its own page, so its list would wipe every other
+  // label; any other pop-out holds a roster that can lag the main window's.
+  // Both inputs are fixed for the window's lifetime, so decide once.
+  const [registersLabels] = useState(
+    () => pinnedPageId === null && readWindowLabel() === MAIN_WINDOW_LABEL,
+  );
   // Latest page roster, readable SYNCHRONOUSLY by `ensureProjectPage` (which
   // must return the resolved page id to its caller immediately, before the
   // `setPages` updater has run). Kept in sync from an effect and, eagerly,
@@ -599,6 +669,21 @@ export function useTerminalPages() {
   // Whether this window's last page-list save was refused (a full store).
   // While it was, this window's copy is NEWER than the store.
   const lastSaveRefusedRef = useRef(false);
+
+  // The digest of the roster this window last SAVED, while the roster-saved
+  // broadcast for it is still due; `null` when none is. Set by `updatePages`
+  // only on a save the store accepted, and sent (then cleared) by the
+  // post-commit effect below, never from inside the updater, which React may
+  // invoke twice or re-run. A refused save sets nothing, so no other window
+  // reloads a roster the store does not hold.
+  const broadcastDueRef = useRef<string | null>(null);
+  // The digest of the roster this window last saved, set with the broadcast
+  // flag. The resync reads it to tell its own overwrite from a storage lag,
+  // independent of when its own echo arrives.
+  const lastOwnSavedDigestRef = useRef<string | null>(null);
+  // Counts this window's accepted saves, so "saved during a read" is exact even
+  // when a save restores an earlier digest.
+  const ownSaveCountRef = useRef(0);
 
   /**
    * The ONE roster writer: `mutate` gets the roster to build on and returns
@@ -623,6 +708,12 @@ export function useTerminalPages() {
    * rather than reading this write's own first save, while React re-running
    * the update on a rebased `prev` (after an update it skipped) reads again,
    * and so builds on what the skipped write saved.
+   *
+   * A rebase can therefore re-run `mutate` on a base that already holds this
+   * update's own earlier save (React re-runs an update that committed in a
+   * higher-priority render after the lower-priority ones it skipped), so
+   * every `mutate` must be idempotent on its own result: an add checks for
+   * its id first.
    */
   const updatePages = useCallback(
     (mutate: (base: TerminalPageConfig[]) => TerminalPageConfig[]) => {
@@ -634,7 +725,16 @@ export function useTerminalPages() {
         }
         const next = mutate(read.base);
         if (next === read.base) return prev;
-        lastSaveRefusedRef.current = !savePages(next);
+        const saved = savePages(next);
+        lastSaveRefusedRef.current = !saved;
+        // The digest of what a reader of the store gets back: `readPersistedPages`
+        // classifies origins, and `next` may lack one (built on `loadPages`'s
+        // unclassified default page when the store was empty).
+        if (saved) {
+          broadcastDueRef.current = rosterDigest(withClassifiedOrigins(next));
+          lastOwnSavedDigestRef.current = broadcastDueRef.current;
+          ownSaveCountRef.current += 1;
+        }
         return next;
       });
     },
@@ -658,6 +758,21 @@ export function useTerminalPages() {
   // `WindowAssignmentsContext` keeps the mirror in sync with the Rust truth.
   const [boundPages, setBoundPages] = useState<Record<string, string>>(getPageBindings);
   useEffect(() => subscribePageBindings(() => setBoundPages(getPageBindings())), []);
+
+  // One effect on the roster and the pop-out bindings, never a call per
+  // mutation: a rename, a reorder, a close, a page `reconcile` synthesizes,
+  // `ensureProjectPage`, `openPage`, `addPage`, and a page popped out into (or
+  // back from) a pop-out window all reach the backend through this.
+  // Best-effort: until it lands the backend serves no labels, and says so
+  // (`labelsRegistered`).
+  useEffect(() => {
+    if (!registersLabels) return;
+    invoke(REGISTER_PAGE_LABELS_COMMAND, pageLabelRegistration(allPages, boundPages)).catch(
+      (err) => {
+        console.warn("[useTerminalPages] tab-label registration failed:", err);
+      },
+    );
+  }, [allPages, boundPages, registersLabels]);
 
   // Page ids that currently host at least one live terminal OR restorable
   // session — the "occupied" signal that decides whether the internal "default"
@@ -697,6 +812,108 @@ export function useTerminalPages() {
       repairVersionDueRef.current = false;
     }
   }, [allPages]);
+
+  // Tell the other windows of this process that the roster was saved, once
+  // per committed save (see `broadcastDueRef`).
+  useEffect(() => {
+    const digest = broadcastDueRef.current;
+    if (digest === null) return;
+    broadcastDueRef.current = null;
+    broadcastRosterSaved(windowLabel, digest);
+  }, [allPages, windowLabel]);
+
+  // Reload the roster when ANOTHER window saved it, so every window shows the
+  // same tabs. Every window listens, a pinned pop-out included: it must show
+  // its page's new name after a rename elsewhere.
+  //
+  // The reload reads the store (the truth, last writer wins), never the
+  // event's content, and never saves or emits, so it cannot loop:
+  // `updatePages` stays the one writer. Skipped while this window's last save
+  // was refused (its copy is newer than the store). An empty or unreadable
+  // store keeps this window's copy: UNKNOWN is not "one default page".
+  //
+  // The store write can reach this webview after the event does, so the read
+  // is retried until the stored roster's digest is the one the sender saved;
+  // after the last retry, when any read returned a roster, the store is re-read
+  // and applied (a newer write that displaced the digest sends its own event).
+  // A write that becomes visible only after the retry budget (5 x 50 ms) is not
+  // re-read: this window shows the older roster, with a warning, until the
+  // next save anywhere.
+  //
+  // Once the listener is registered, the store is read once to catch up on a
+  // save another window made between this window's mount and that moment.
+  useEffect(() => {
+    let disposed = false;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+
+    // The store is re-read INSIDE the updater: a local `updatePages` queued
+    // earlier in the same batch saves before this updater runs, so a roster
+    // captured when the event arrived would replace that window's own fresh
+    // write in its state while the store keeps it (and its own echo is
+    // filtered, so nothing would correct it). The ref follows on commit via
+    // the `allPagesRef` sync effect above.
+    const apply = () => {
+      setPages((prev) => {
+        // The one refused-save check, made when the update runs: while this
+        // window's last save was refused its copy is newer than the store.
+        if (lastSaveRefusedRef.current) return prev;
+        // An empty or unreadable store keeps this window's copy.
+        const target = readPersistedPages();
+        if (!target) return prev;
+        return rosterEqual(prev, target) ? prev : target;
+      });
+    };
+
+    // An own save never cancels a pending foreign read (nothing orders the two
+    // writes: the foreign one may still be the store's last commit and must
+    // then be shown). A read that never matches because this window saved
+    // DURING it, and the store holds that save, is an ordinary overwrite and is
+    // not warned about. A store still holding an own save made BEFORE the event
+    // is indistinguishable from a lag (the other window may have built on it),
+    // so that case IS warned about: honest about what this window cannot tell.
+    const unlisten = listenRosterSaved(({ source, digest }) => {
+      if (source === windowLabel) return;
+      // A newer foreign event supersedes a read still waiting on an older digest.
+      if (retryTimer) clearTimeout(retryTimer);
+      retryTimer = null;
+      let retries = 0;
+      let lastRead: TerminalPageConfig[] | null = null;
+      const ownSavesAtEvent = ownSaveCountRef.current;
+      const attempt = () => {
+        retryTimer = null;
+        if (disposed) return;
+        const stored = readPersistedPages();
+        if (stored) lastRead = stored;
+        if (stored && rosterDigest(stored) === digest) {
+          apply();
+          return;
+        }
+        if (retries < ROSTER_RESYNC_RETRIES) {
+          retries++;
+          retryTimer = setTimeout(attempt, ROSTER_RESYNC_RETRY_MS);
+          return;
+        }
+        if (lastRead) {
+          const ownSaveDuringRead =
+            ownSaveCountRef.current !== ownSavesAtEvent &&
+            rosterDigest(lastRead) === lastOwnSavedDigestRef.current;
+          if (!ownSaveDuringRead) {
+            console.warn(
+              `[terminal-pages] the stored roster never matched ${source}'s save; re-reading the store`,
+            );
+          }
+          apply();
+        }
+      };
+      attempt();
+    }, apply);
+
+    return () => {
+      disposed = true;
+      if (retryTimer) clearTimeout(retryTimer);
+      unlisten();
+    };
+  }, [windowLabel]);
 
   const setActivePageId = useCallback(
     (id: string) => {
@@ -753,6 +970,8 @@ export function useTerminalPages() {
       closedPageIdsRef.current.delete(id);
       const createdAt = Date.now();
       updatePages((base) => {
+        // Already added: a rebase re-running this update (see `updatePages`).
+        if (base.some((p) => p.id === id)) return base;
         const newPage: TerminalPageConfig = {
           id,
           name: name === undefined ? nextAutoPageName(base) : uniquePageName(name, base),
@@ -888,7 +1107,7 @@ export function useTerminalPages() {
    * reconcile). FAIL-CLOSED: an incomplete read — a source unreadable, or the
    * restorable set withheld by a drain — is UNKNOWN and removes nothing.
    * Record-only (`removeEmptyPage`): no PTY is closed. Returns the number of
-   * pages removed.
+   * pages removed, or `null` when the occupancy read was incomplete (UNKNOWN).
    */
   const closeEmptyPages = useCallback(
     () =>

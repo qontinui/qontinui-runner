@@ -37,6 +37,7 @@ pub(crate) fn prepare_ai_child_env(cmd: &mut Command) {
     // is an infinite silent hang. One shared list, eight seams; see
     // `credential_helper::non_interactive_git_env`.
     crate::credential_helper::apply_non_interactive_git_env_std(cmd);
+    crate::terminal::apply_python_utf8_default_std(cmd);
     crate::terminal::scrub_credential_env_std(cmd);
 }
 
@@ -160,5 +161,6 @@ mod tests {
             &cmd,
             "prepare_ai_child_env",
         );
+        crate::terminal::assert_python_utf8_default_std(&cmd, "prepare_ai_child_env");
     }
 }

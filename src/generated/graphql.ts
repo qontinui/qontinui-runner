@@ -955,14 +955,14 @@ export const UiBridgeErrorCode = {
   /**
    * `sendKeys`' `keys` payload was not translatable to a PTY sequence.
    * Caller-payload error: the identical request will fail identically, so
-   * the recovery hint is [`RecoveryHint::FixRequest`].
+   * the next action is `fix_request`.
    */
   SendKeysInvalid: "SEND_KEYS_INVALID",
   /**
    * A view-only action (`focus` / `blur`) was asked of a pane with no
    * mounted terminal view. NOT a payload error — the request is well
    * formed and the remedy is to bring the pane on screen, which is why it
-   * carries [`RecoveryHint::ScrollIntoView`] rather than `FixRequest`.
+   * carries `scroll_into_view` rather than `fix_request`.
    */
   TerminalNoMountedView: "TERMINAL_NO_MOUNTED_VIEW",
   Timeout: "TIMEOUT",
@@ -981,7 +981,7 @@ export const UiBridgeErrorCode = {
 } as const;
 
 export type UiBridgeErrorCode = (typeof UiBridgeErrorCode)[keyof typeof UiBridgeErrorCode];
-/** Structured error detail with recovery hint. */
+/** Structured error detail with its typed next action. */
 export type UiBridgeErrorDetail = {
   /** Machine-readable error code. */
   code: UiBridgeErrorCode;
@@ -990,10 +990,18 @@ export type UiBridgeErrorDetail = {
   /** Human-readable error message. */
   message: Scalars["String"]["output"];
   /**
-   * Suggested recovery action, in the serde wire spelling of `RecoveryHint`
-   * (e.g. `"RESNAPSHOT"`, or `{"RETRY_AFTER_MS":1000}` for a data-carrying hint).
+   * What the caller does next: the shared refusal vocabulary's
+   * `NextActionKind` in its snake_case wire spelling (`"resnapshot"`,
+   * `"retry_later"`, `"fix_request"`, `"none_terminal"`, …) — the same
+   * value an HTTP caller reads at `error_detail.recovery.kind`.
    */
   recovery?: Maybe<Scalars["String"]["output"]>;
+  /**
+   * For `recovery: "retry_later"`: the earliest useful retry, in whole
+   * seconds (rounded up, so never 0 for a sub-second delay). Absent when no
+   * delay is known.
+   */
+  recoveryRetryAfterS?: Maybe<Scalars["Int"]["output"]>;
 };
 
 /** Real-time health status of the UI Bridge relay. */

@@ -27,6 +27,12 @@ pub mod accessibility;
 // fails an unguarded test read by NAME instead of by assertion mismatch.
 // Plan `2026-09-03-runner-tests-read-ambient-machine-state`.
 pub mod ambient;
+// The test-binary gate on env-resolved settings writes: a thread holding no
+// `env_lock` may not write a settings file into whatever directory the process
+// environment names — another test's fixture. Compiled to `Ok(())` outside a
+// test binary. Plan
+// `2026-11-11-unguarded-test-threads-write-settings-json-into-a-live-fixtures-config-dir`.
+pub mod env_write_gate;
 // Pure install-interception core (classify + gate + wire types), shared by the
 // `qontinui-runner` bin (via `install_effects_producer::intercept`) AND the
 // standalone `qontinui-shim` Windows `.exe` shadow stub. Lifted into the lib
@@ -141,6 +147,9 @@ pub mod mcp_spill;
 // dependencies then, so the move was mechanical; it has gained three since:
 // `crate::instance_env` (its default data root) and, in its test harness,
 // `crate::process_helpers` and `crate::runner_breadcrumb`.
+// The one predicate for "this directory is a cargo target dir", shared by the
+// embedded-PG test harness here and the bin crate's orphan-target reaper.
+pub mod cargo_target_marker;
 pub mod embedded_pg;
 pub mod env_agent;
 
@@ -185,6 +194,14 @@ pub mod util {
 // through. In the LIB so the wrapper and `util::resource_exhaustion` share ONE
 // handle; only the runner bin registers the allocator.
 pub mod alloc_breadcrumb;
+
+// glibc malloc tuning (plan
+// `2026-11-11-runner-glibc-arena-retention-and-whole-log-tail`, Phases 1 and
+// 3): the arena cap `main()` applies as its first statement, the allocator
+// reading the health monitor takes every tick, and the hourly `malloc_trim(0)`.
+// In the LIB so the `arena_cap_holds` integration test applies and measures
+// the same cap the runner does. A no-op that says `unsupported` off linux-gnu.
+pub mod malloc_tuning;
 
 // Per-local-user connection guard for every runner TCP listener (plan
 // `2026-10-04-runner-loopback-api-refuses-other-local-users`): refuses a

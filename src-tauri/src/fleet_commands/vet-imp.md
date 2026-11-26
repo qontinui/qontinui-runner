@@ -698,13 +698,17 @@ an operator **Abort** above, a failed chain, a VETTED-HELD or no-net chain).
 release` withdraws the plan's open implement→ship net (`/implement-plan` Step 0.5)
 FIRST, then `remove`s the heartbeat row, then POSTs `/claims/release`: a release
 with the net still open clears it and dispatches a duplicate session. Pass
-`--net-gate` when the implement half reported the net's `gate_id`. It finds the
+`--net-gate` when the implement half reported the net's `gate_id`, and `--repo
+"<owner/name>"` for the plan's repo, so the net is read and withdrawn under the
+tenant proven to own it (on a device bound to several tenants the session's
+default tenant may not see it at all). It finds the
 session's ledger itself (no `--ledger`) and runs at most about 90 s, inside the
 Bash tool's 120 s default (its RUNTIME header):
 
 ```bash
 bash <workspace-root>/qontinui-claude-config/scripts/plan-reserve-release.sh release \
-  --stem "<plan-stem>" --reason "<why>"
+  --stem "<plan-stem>" --repo "<owner/name>" --reason "<why>"
+# Only after reading its final line: NOT on exit 7, 2 or 64 (below).
 bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh stop --ledger "$CLAIM_LEDGER"
 ```
 
@@ -740,18 +744,22 @@ that outlived KILL will NOT end by itself, so name its pid as left behind.
 "`stop` reports only what it observes".
 
 The script prints a line per net it found, then ONE final verdict line: quote it
-in the Step 5 report. `RELEASED` (exit 0) is clean; `NET_UNRETIRED <id|unknown>`
-(3) means the net read or a withdraw failed, a `--net-gate` was not this plan's
-net, or the 60 s retire budget ran out, and the release ran anyway, so a
+in the Step 5 report. `RELEASED` (exit 0) is clean; `RELEASE_WITHHELD
+<id|unknown>` (7) means the net read or a withdraw failed, a `--net-gate` was not
+this plan's net, or the 60 s retire budget ran out, so NOTHING was released and
+the heartbeat row was kept: do not `stop` the loop, fix the cause and run it
+again (`/implement-plan` Step 0.48 has the remedies), passing
+`--release-with-unretired-net` only after a named remedy failed. Under that flag
+the same failure reads `NET_UNRETIRED <id|unknown>` (3): the release ran, so a
 redundant session is expected; `NET_FIRED <id>` (6) means the net `--net-gate`
 names had already dispatched one (a consumed net it does not name is read as a
 predecessor's, `NET_INERT`); `NOT_HELD` (4) is the lapse below, and `holder=other`
 on it means another owner holds the reserve now; `RELEASE_UNKNOWN` (5) got no
 readable answer. `UNKNOWN` (2) and a usage error (64) did nothing and released
 NOTHING: the reserve is still held, so fix the cause and run it again. A
-`NET_MUTED <id>` line, and a `NET_CANCELLED <id>` line saying the mute did not
-land, are nets that stay open: name each id in the report (the final line's `--`
-note lists them).
+`NET_CANCELLED <id>` line saying the withdraw was refused as not-the-registrant is
+a net whose continuation was cancelled (never muted): the release clears it
+inert. Name each id in the report (the final line's `--` note lists them).
 
 The release MUST carry the SAME `agent_session_id` used at acquire — the owner
 token is the match key, so omitting it returns `"not_held"` and leaves the
@@ -1136,7 +1144,8 @@ states that legitimately stop the lifecycle must stop it here too:
   **unidentified default**
   (an `IN PROGRESS` stamp with no session marker, or one that cannot be
   positively attributed at all, is a STOP, not an overwrite; a marker naming a
-  probed-dead peer is case 2, adopt, or the hold gate's own continuation is
+  probed-dead peer is case 2, adopt; a probed-dead peer that left pushed work
+  is case 2c, adopt by route-around; or the hold gate's own continuation is
   case 2b, adopt), before it rewrote the stamp.
 
   **Conjunct 3 is carried explicitly even though that arm order already
@@ -1301,10 +1310,11 @@ states that legitimately stop the lifecycle must stop it here too:
   > and here the stamp is the `VETTED` this chain's own Step 2 just wrote. A
   > `SHIPPED`, `SUPERSEDED` or `OBSOLETE` stamp, or a foreign `IN PROGRESS`
   > whose session left PRs (unless `/vet-plan` case 2b adopts it — the stamp
-  > is gate-delegated and this run is that hold gate's continuation),
+  > is gate-delegated and this run is that hold gate's continuation — or case
+  > 2c adopts a verified-dead owner's pushed work by route-around),
   > still stops at `/vet-plan`'s pre-edit capture; a
-  > complete plan still stamped `VETTED` or `DRAFT` (or `PARTIAL` / `NOT
-  > STARTED`) is re-vetted and re-implemented, and the only remaining MECHANICAL
+  > complete plan still stamped `VETTED` or `DRAFT` (or legacy `PARTIAL` /
+  > `NOT STARTED`) is re-vetted and re-implemented, and the only remaining MECHANICAL
   > guard is `/implement-plan` Step 0.45 check 2 — a `git log origin/main -20`
   > grep that misses anything older — though `/vet-plan` §2's claim verification
   > may also notice the plan's premises are already met. That cost
@@ -1476,8 +1486,17 @@ is armed to rescue it.** Run this when all three hold:
 
 ```bash
 bash <workspace-root>/qontinui-claude-config/scripts/plan-reserve-release.sh release \
-  --stem "<plan-stem>" --reason "handed to implement half / vet→implement net armed"
+  --stem "<plan-stem>" --repo "<owner/name>" --reason "handed to implement half / vet→implement net armed"
 ```
+
+**Exit 7 (`RELEASE_WITHHELD`) here has its own arm.** This release runs before
+any implement→ship net can exist, so a `RELEASE_WITHHELD unknown` (no named id:
+the gate read could not be made) is re-run AT ONCE with
+`--release-with-unretired-net`, and reported as such. Withholding here would keep
+the reserve and make the vet→implement net's rescue meet `held` again, the
+stall the hand-off exists to prevent. A `RELEASE_WITHHELD <id>` naming a net
+withholds as normal: some earlier run left an implement→ship net open, so name
+it and resolve it before the hand-off.
 
 Run the release ALONE, read its final line, and only then decide on the `stop`
 (below) — never put the two in one call, because on exit 2 or 64 the loop must
@@ -1503,8 +1522,9 @@ no `NET_*` line is expected; name any that appears. Any other verdict: name it
 in the Step 5 report and branch on it per Step 1.1's release section.
 **Decide the hand-off on the final line's `release=` field, never on the
 verdict word, and let the implement half's Step 0.48 answer settle it.** The
-script's exit is the first of 3, 6, 5, 4 that applies, so a `NET_UNRETIRED` (3)
-or `NET_FIRED` (6) line can sit on top of a release that never landed.
+script's exit is the first of 7, 3, 6, 5, 4 that applies, so a `NET_UNRETIRED`
+(3) or `NET_FIRED` (6) line can sit on top of a release that never landed, and a
+`RELEASE_WITHHELD` (7) line reads `release=withheld` (handled by the arm above).
 
 - `release=released` or `release=not_held` (the lapse Step 1.1 describes; the
   chain holds nothing either way): record `RESERVE_HANDED_OFF`, then run
@@ -1670,7 +1690,10 @@ artifact the other half was required to produce is there.
 *(plan `2026-09-03-every-verification-signal-is-written-by-the-implementer`
 Phase 3)*. Presence proves the review gate ran; it cannot prove the commit it
 reviewed is the commit on the PR. coord's status card can, and it was written by
-no session. Run the same script `/implement-plan` Step 4.7 runs — it is one
+no session — or, when the card's head has moved past the reviewed one, it can
+prove the PR differs from the reviewed commit only by recorded clean base-sync
+steps (a merge of main pushed by coord's merge orchestrator, say), which is a
+different and weaker claim. Run the same script `/implement-plan` Step 4.7 runs — it is one
 implementation, invoked from two places, not a second copy of the check:
 
 ```bash
@@ -1682,24 +1705,36 @@ bash <workspace-root>/qontinui-claude-config/scripts/review-arm-corroborate.sh -
 Branch on its exit code, exactly as Step 4.7 documents it:
 
 - **`0` CORROBORATED** — every PR's coord `head_sha` equals the artifact's
-  `reviewed_head_sha`, the re-measured tree equals the artifact's
-  `reviewed_tree`, and the coverage read found no PR coord attributes to
-  this session that `prs[]` omits. Say so, per PR — **and quote the
+  `reviewed_head_sha` — or differs from it only by **proven base-sync steps**
+  (`head_relation: base_sync`: clean merges of the base branch, or empty
+  commits, after the reviewed head, each recorded in `head_relation_steps`;
+  counted by the verdict line's ` base_sync=K` token, which an all-equal-head
+  run does not print) — the re-measured tree equals the artifact's
+  `reviewed_tree` (or, on a `base_sync` row, advanced clean onto one of its
+  proven steps from a tree recorded clean at the reviewed head), and the
+  coverage read found no PR coord attributes to
+  this session that `prs[]` omits. Say so, per PR — naming a `base_sync` row as
+  such, never as "the reviewed commit is the commit on the PR" — **and quote the
   `coverage=` half of the verdict line as well.** The coverage read needs a
   session-scoped identity that a device-JWT session does not hold, so it
   routinely reads `coverage=UNKNOWN` on this fleet; that is reported beside the
   head verdict, never folded into it, and never written up as "coverage checked".
-- **`2` CONTRADICTION** — head drift (`contradiction_head_drift`), a **working
+  A `base_sync` corroboration does **not** satisfy coord's `require_review`
+  record: coord compares the `Coord-Reviewed-Head:` trailer with the PR's
+  current head by equality, and this script does not rewrite the trailer.
+- **`2` CONTRADICTION** — head drift (`contradiction_head_drift`, its
+  `head_relation` naming the measured fault: `new_commit`, `conflicted_merge`,
+  `evil_merge`, `foreign_merge` or `rewritten`), a **working
   tree that moved since the review measured it** (`contradiction_tree_moved` —
   the arm a commit-only identity is blind to, because an uncommitted edit moves
   no sha at all), or an uncovered PR. **The chain is
   INCOMPLETE**, the same verdict as a missing artifact, and for the same reason:
   a review whose subject is not the code on the PR is a review nobody can name.
-  Quote the `corroboration[]` / `coverage` row that failed. A head-drift
-  CONTRADICTION also
+  Quote the `corroboration[]` / `coverage` row that failed. A
+  `contradiction_head_drift` also
   means the PR body's `Coord-Reviewed-Head:` line is stale — coord's
   `require_review` gate reads that line, not the artifact — so the re-review
-  must edit the body (`gh api -X PATCH repos/<owner>/<repo>/pulls/<n> -F "body=@<file>"`,
+  must edit the body (`pr-body-publish.sh <owner>/<repo> <n> <file>`,
   `/implement-plan` Step 4.5 — never `gh pr edit`, which fails before writing) as well as re-record.
 - **`3` UNKNOWN** — the door did not answer (`unknown_door` — it refused;
   `unknown_door_timeout` — its curl gave up with exit 28, its connect bound or
@@ -1709,7 +1744,12 @@ Branch on its exit code, exactly as Step 4.7 documents it:
   row's detail names the budgets involved and the elapsed time), the card reads `confidence:
   unknown`, the artifact predates `reviewed_head_sha`
   (`unknown_no_reviewed_head`) or `reviewed_tree` (`unknown_no_reviewed_tree`),
-  or the tree could not be compared (`unknown_tree`; the row's detail names
+  a head that differs could not be classified (`unknown_head_relation`; the
+  detail names the read that failed — no `--tree-root` whose origin names the
+  repo, a shallow or partial-clone store, a commit absent after the bounded
+  fetch, a git too old for the read), coord's card is behind the review
+  (`unknown_card_behind_review` — its head is a strict ancestor of the reviewed
+  one), or the tree could not be compared (`unknown_tree`; the row's detail names
   which), for example: no `--tree-root` covers the row's repo (the `$PWD`
   default from a subdirectory, or from a directory not named like the
   reviewed checkout, leaves every row here);
@@ -1867,6 +1907,9 @@ before it releases, and prints one line per `gate_id`. A net another device
 registered, or one the reserve's current holder owns when that is not this
 session, is skipped and named (`NET_INERT`), not withdrawn, unless `--net-gate`
 names it. Quote those lines, and its final line, in the report.
+`holder=unknown` on that final line means the holder read failed and the script
+fell back to device-wide selection, so a net of another holder on this same
+device may have been touched: check the per-net lines before you report.
 
 Two things wrap that release, both specified in Step 1.1:
 

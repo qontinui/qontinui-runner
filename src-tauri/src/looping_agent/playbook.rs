@@ -72,36 +72,78 @@ fn repos_line(repos: &[String]) -> String {
     }
 }
 
-/// Shared config block: journal path + repo scope.
-fn config_block(journal_path: &str, repos: &[String]) -> String {
+/// Which Shepherd slot this tab holds: `slot` of `count`, numbered from 0.
+///
+/// The playbook's repo-affinity rule (plan
+/// `2026-11-18-merge-shepherd-subagents-and-cross-machine-anti-overlap` D3.4)
+/// needs both numbers to partition the tenant's repos when coord serves no
+/// assignment, and the supervisor is the only party that knows them: the slot
+/// is the lease it won, the count is the resolved desired-state `slots`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotAssignment {
+    pub slot: u32,
+    pub count: u32,
+}
+
+/// The `shepherd_slot` config line. With no assignment (a build or a path that
+/// spawned without a held lease) the line says so instead of being omitted, so
+/// the agent reads "every repo is yours" from the playbook's own rule rather
+/// than guessing a partition.
+fn slot_line(assignment: Option<SlotAssignment>) -> String {
+    match assignment {
+        Some(SlotAssignment { slot, count }) if count > 0 && slot < count => {
+            format!("{slot} of {count} (fixed when this tab was spawned)")
+        }
+        _ => "none (treat every repo as yours)".to_string(),
+    }
+}
+
+/// Shared config block: journal path + repo scope + Shepherd slot.
+fn config_block(
+    journal_path: &str,
+    repos: &[String],
+    assignment: Option<SlotAssignment>,
+) -> String {
     format!(
         "## Deployment config\n\
          - `journal_path`: {journal_path}\n\
-         - `repos`: {}\n",
-        repos_line(repos)
+         - `repos`: {}\n\
+         - `shepherd_slot`: {}\n",
+        repos_line(repos),
+        slot_line(assignment)
     )
 }
 
 /// Initial prompt for a first-ever spawn: full playbook + config + the
 /// one-cycle contract.
-pub fn initial_prompt(playbook: &str, journal_path: &str, repos: &[String]) -> String {
+pub fn initial_prompt(
+    playbook: &str,
+    journal_path: &str,
+    repos: &[String],
+    assignment: Option<SlotAssignment>,
+) -> String {
     format!(
         "{playbook}\n\n---\n\n{}\n{ONE_CYCLE_CONTRACT}\n\nJournal every action and outcome to \
          {journal_path} (create it if absent).",
-        config_block(journal_path, repos)
+        config_block(journal_path, repos, assignment)
     )
 }
 
 /// Prompt for a fresh relaunch (context-low / K-cycle recycle / death-
 /// respawn): same playbook + config, plus the explicit "you are a fresh
 /// relaunch — the journal is your memory" framing.
-pub fn relaunch_prompt(playbook: &str, journal_path: &str, repos: &[String]) -> String {
+pub fn relaunch_prompt(
+    playbook: &str,
+    journal_path: &str,
+    repos: &[String],
+    assignment: Option<SlotAssignment>,
+) -> String {
     format!(
         "{playbook}\n\n---\n\n{}\nYou are a FRESH RELAUNCH of a long-running looping agent — a \
          previous session of you already ran some cycles. Your conversation memory is gone by \
          design; your journal at {journal_path} is your memory. Read it first, then continue \
          from where it left off. {ONE_CYCLE_CONTRACT}",
-        config_block(journal_path, repos)
+        config_block(journal_path, repos, assignment)
     )
 }
 
@@ -133,12 +175,84 @@ mod tests {
         assert!(playbook_for("no-such-playbook").is_none());
     }
 
+    /// Plan `2026-11-18-merge-shepherd-subagents-and-cross-machine-anti-overlap`
+    /// Phase 4 (D4, D3.1, D3.2, D3.4): the bundled copy is the proposed v8 of
+    /// `agent_playbook/merge-shepherd`, served byte for byte after this lands.
+    /// Each rule below is one the fleet's anti-overlap depends on, so dropping
+    /// any of them from either copy is a behaviour change, not an edit.
+    #[test]
+    fn bundled_shepherd_playbook_carries_the_bounded_fixer_rules() {
+        let pb = MERGE_SHEPHERD_PLAYBOOK;
+        // D4 width: up to 3 Fixers, never more than coord grants, no floor.
+        assert!(pb.contains("at most 3 Fixers at once, and only as many as coord grants"));
+        assert!(pb.contains("There is no floor of one Fixer"));
+        assert!(
+            !pb.contains("one Fixer at a time"),
+            "the v7 serial rule is replaced"
+        );
+        // D2: a child slot precedes every Fixer, after the PR claim.
+        assert!(pb.contains("coord_child_slot"));
+        assert!(pb.contains("claim, then child slot"));
+        assert!(pb.contains("`granted`"));
+        assert!(pb.contains("`heartbeat`"));
+        assert!(pb.contains("A Fixer that a deployed admission did not grant must not run"));
+        // Undeployed admission needs POSITIVE proof from coord's own door:
+        // only an exact 404 from the unauthenticated probe starts a child
+        // uncounted; any other code means deployed; 000 and a dead transport
+        // are refusals; the proof is journaled.
+        assert!(pb.contains("#### Resolving `coord_child_slot`"));
+        assert!(pb.contains("https://coord.qontinui.io/coord/child-slots"));
+        assert!(pb.contains("`code=404` AND `error=no_such_route`"));
+        assert!(pb.contains("**child slots are not deployed**"));
+        assert!(pb.contains("*'\"error\":\"no_such_route\"'*) err=no_such_route"));
+        assert!(pb.contains("`code=404` with any other body"));
+        assert!(pb.contains("Run it afresh before\n   EVERY uncounted spawn"));
+        assert!(pb.contains("never reuse an answer from the\n   journal"));
+        assert!(pb.contains("exists, so admission IS deployed"));
+        assert!(pb.contains("`000`, an empty code, or a timeout — UNKNOWN, which is a refusal"));
+        assert!(pb.contains("-d '{}') || true"));
+        assert!(pb.contains("# envelope-ok: reads only the HTTP status"));
+        assert!(pb.contains("**Transport down**"));
+        assert!(pb.contains("`ToolSearch`"));
+        assert!(pb.contains("record the proof in the journal"));
+        // The wait door is Monitor on a bounded until-loop.
+        assert!(pb.contains("the `Monitor` tool on a bounded until-loop"));
+        // D3.5: the parent is the single claimant.
+        assert!(pb.contains("You are the single claimant"));
+        // D4 grouping: one repo, file-disjoint.
+        assert!(pb.contains("**in one repo**"));
+        assert!(pb.contains("Two PRs whose changed files overlap never run at the same time"));
+        assert!(pb.contains("coord_conflict_check"));
+        // D4 forbidden shapes and systemic faults.
+        assert!(pb.contains("no nested subagents"));
+        assert!(pb.contains("Never fan out against a systemic fault"));
+        // D3.1: release with the FULL pushed sha.
+        assert!(pb.contains("`pushed_head`"));
+        assert!(pb.contains("FULL 40-character sha you pushed"));
+        // D3.4: repo affinity, coord's assignment first, a literal fallback.
+        assert!(pb.contains("`assigned_repos`"));
+        assert!(pb.contains("`i mod count == n`"));
+        assert!(pb.contains("shepherd_slot"));
+        // D3.2: the red-main alert lease.
+        assert!(pb.contains("red_main:<owner/repo>"));
+        assert!(pb.contains("coord_alert_claim"));
+        assert!(pb.contains("coord_alert_release"));
+        // D4 batching stops at the first refused slot; D-b background children
+        // heartbeated on a timer; a coord without `pushed_head` still releases.
+        assert!(pb.contains("claim none of its remaining PRs"));
+        assert!(pb.contains("**background** subagent"));
+        assert!(pb.contains("Never end your turn only waiting for a Fixer"));
+        assert!(pb.contains("release again without `pushed_head`"));
+        assert!(pb.contains("take the slot under the alert lease alone"));
+    }
+
     #[test]
     fn initial_prompt_carries_playbook_config_and_contract() {
         let p = initial_prompt(
             "PLAYBOOK BODY",
             "C:/x/journal.jsonl",
             &["qontinui/qontinui-runner".to_string()],
+            Some(SlotAssignment { slot: 1, count: 2 }),
         );
         assert!(p.starts_with("PLAYBOOK BODY"));
         assert!(p.contains("C:/x/journal.jsonl"));
@@ -146,11 +260,23 @@ mod tests {
         assert!(p.contains("Run ONE cycle now"));
         assert!(p.contains("supervisor will prompt you"));
         assert!(p.contains("create it if absent"));
+        assert!(p.contains("- `shepherd_slot`: 1 of 2 (fixed when this tab was spawned)\n"));
+    }
+
+    #[test]
+    fn a_spawn_without_a_slot_says_every_repo_is_yours() {
+        for assignment in [None, Some(SlotAssignment { slot: 2, count: 2 })] {
+            let p = relaunch_prompt("PB", "C:/j.jsonl", &[], assignment);
+            assert!(
+                p.contains("- `shepherd_slot`: none (treat every repo as yours)\n"),
+                "{assignment:?} must not render a partition"
+            );
+        }
     }
 
     #[test]
     fn empty_repos_means_all_tenant_repos() {
-        let p = initial_prompt("PB", "C:/j.jsonl", &[]);
+        let p = initial_prompt("PB", "C:/j.jsonl", &[], None);
         assert!(p.contains("all repos this tenant owns"));
     }
 
@@ -202,14 +328,14 @@ mod tests {
         // actually reads.
         let coord_body = "COORD PLAYBOOK BODY";
         let pb = resolve_playbook(Some(coord_body), "merge-shepherd");
-        let prompt = initial_prompt(pb, "C:/j.jsonl", &[]);
+        let prompt = initial_prompt(pb, "C:/j.jsonl", &[], None);
         assert!(prompt.starts_with("COORD PLAYBOOK BODY"));
         assert!(prompt.contains("Run ONE cycle now"));
     }
 
     #[test]
     fn relaunch_prompt_frames_journal_as_memory() {
-        let p = relaunch_prompt("PB", "C:/j.jsonl", &[]);
+        let p = relaunch_prompt("PB", "C:/j.jsonl", &[], None);
         assert!(p.starts_with("PB"));
         assert!(p.contains("FRESH RELAUNCH"));
         assert!(p.contains("your journal at C:/j.jsonl is your memory"));
