@@ -1206,7 +1206,8 @@ mod session_migration_proxy_tests {
     /// Point the machine-global roster (`claude-accounts.json`) inside the
     /// fixture. `IsolatedAmbient` does not capture `XDG_CONFIG_HOME`, so the
     /// returned guard restores it; bind it AFTER the fixture so it drops first.
-    #[cfg(unix)]
+    /// Not on macOS, where `dirs::config_dir` ignores `XDG_CONFIG_HOME`.
+    #[cfg(all(unix, not(target_os = "macos")))]
     fn pin_roster_inside(amb: &crate::test_env::IsolatedAmbient) -> crate::test_env::EnvVarRestore {
         let restore = crate::test_env::EnvVarRestore::capture(&["XDG_CONFIG_HOME"]);
         std::env::set_var("XDG_CONFIG_HOME", amb.dir().join("xdg-config"));
@@ -1336,7 +1337,7 @@ mod session_migration_proxy_tests {
     /// A row recorded through the proxy is the row the proxied migration finds:
     /// with an explicit target that is not a configured account, the refusal is
     /// the not-configured one, past the lookup.
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn a_proxied_migration_finds_the_proxied_row_and_refuses_an_unconfigured_target() {
         let amb = crate::test_env::isolated_ambient();
@@ -1363,7 +1364,7 @@ mod session_migration_proxy_tests {
     /// as `commands::ai_settings`'s roster tests do), so a target equal to the
     /// session's own configured account reaches the equals refusal; a
     /// different configured target yields a plan.
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn a_proxied_migration_onto_the_sessions_own_account_is_refused() {
         let amb = crate::test_env::isolated_ambient();

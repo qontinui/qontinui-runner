@@ -53,7 +53,7 @@ commands/session.rs | session_start | operator | -
 commands/terminal.rs | create_terminal_session_backend | helper | create_terminal_session_backend(
 commands/terminal.rs | create_tracked_terminal_session_backend | helper | create_tracked_terminal_session_backend(
 commands/terminal.rs | terminal_create | operator | -
-commands/terminal.rs | terminal_migrate_session_account | operator | -
+commands/terminal.rs | run_session_migration | exempt | moves a live session onto another account — the work is already running (both the webview's `terminal_migrate_session_account` and the invoke proxy's arm enter here, each passing its own SpawnOrigin)
 config_report_cmd.rs | seam_reports | exempt | builds the fix-agent command ONLY to report its environment (the seam table); never spawns it
 fixer/trigger.rs | launch_fixer | autonomous | launch_fixer
 follow_up/trigger.rs | launch_follow_up | autonomous | launch_follow_up
