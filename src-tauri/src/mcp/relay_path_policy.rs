@@ -35,12 +35,25 @@
 //! # How the list was derived
 //!
 //! Not from what looks safe — from what real clients measurably call over
-//! THIS arm. There is exactly one sender: qontinui-web's
-//! `/api/v1/device-bridge/runner-proxy/{path:path}` route
-//! (`backend/app/api/v1/endpoints/device_bridge_ws.py`), which takes the
-//! relay arm when the request carries an `X-Qontinui-Device-Id` header and
-//! forwards the caller's method and path VERBATIM. Its callers, measured
-//! 2026-09-12:
+//! THIS arm. Two qontinui-web paths send it:
+//!
+//! 1. The `/api/v1/device-bridge/runner-proxy/{path:path}` route
+//!    (`backend/app/api/v1/endpoints/device_bridge_ws.py`), which takes the
+//!    relay arm when the request carries an `X-Qontinui-Device-Id` header and
+//!    forwards the caller's method and path VERBATIM.
+//! 2. The saved-session-lists capture behind `POST /api/v1/saved-session-lists`
+//!    (plan `2026-11-08-save-per-tab-runner-session-lists-on-sessions-page-kept-14-days`,
+//!    Phase 2). It goes through `backend/app/services/runner_relay.py`, the
+//!    relay core that phase extracts from the proxy route's
+//!    `_runner_proxy_relay`, so both senders share one implementation. It
+//!    sends exactly one fixed frame, `GET /terminal-layout`, server-side; no
+//!    caller chooses its method or path. That is its INTENDED caller, not its
+//!    only one: sender 1's relay arm can send the same frame for a device
+//!    owner, and the relayed response is redacted the same way whichever
+//!    sender asked. (Sender 1's co-located admin arm never reaches this
+//!    policy: it calls the loopback API directly, as a local caller.)
+//!
+//! The proxy route's callers, measured 2026-09-12:
 //!
 //! * **qontinui-mobile in remote (proxy) mode.** Round 3's note that mobile
 //!   drives terminals over the TYPED `remote_terminal_*` frames is correct,
@@ -75,7 +88,9 @@
 //!   the dashboard renders as a labelled UNKNOWN. The "One web call"
 //!   paragraph below says why `GET /apps` is refused.
 //!
-//! Nothing else in the workspace sends an `http_request` frame.
+//! Nothing else in the workspace sends an `http_request` frame: the proxy
+//! route with these callers, and the saved-session-lists capture with its one
+//! read, are the whole sender set.
 //!
 //! Three client calls are deliberately NOT listed, because the runner
 //! registers no such route and they 404 today: mobile's `/ai/analyze`,
@@ -231,6 +246,22 @@ pub const RELAY_ALLOWED: &[(&str, &str)] = &[
     // takes the snapshot's egress gate
     // (`backend_relay::http_request_egress_refusal`).
     ("POST", "/ui-bridge/control/visibility"),
+    // -- qontinui-web: saved session lists (`/sessions`) -----------------
+    // The capture service, `backend/app/services/runner_relay.py` (called by
+    // `POST /api/v1/saved-session-lists`), relays this one read server-side
+    // and keeps the body as a saved tab list for 14 days (plan
+    // `2026-11-08-save-per-tab-runner-session-lists-on-sessions-page-kept-14-days`;
+    // the security-surface decision is coord finding `0cc656c7`). It is
+    // `mcp::terminal_layout`, a read that changes nothing: the tab labels the
+    // webview registered, and per terminal its ids, account, names, zone and
+    // finished marker. Each row's `title` is set by the program in the
+    // terminal (OSC 0/2), so the response takes a per-row egress gate:
+    // `backend_relay::redact_relay_content` withholds a row's title when its
+    // session's tenant has terminal streaming off. Every other method on the
+    // path stays refused, and so does every `mcp::terminals` route,
+    // `/terminal-pages` included: the labels are written only by a Tauri
+    // command, never over HTTP.
+    ("GET", "/terminal-layout"),
     // -- mobile: task runs, chat, workflow control ---------------------
     ("GET", "/task-runs"),
     ("GET", "/task-runs/running"),
@@ -719,6 +750,7 @@ pub(crate) mod tests {
             ("GET", "/apps/qontinui-web/spec/graph"),
             ("GET", "/ui-bridge/control/snapshot"),
             ("POST", "/prompt-home/plan"),
+            ("GET", "/terminal-layout"),
             ("GET", "/task-runs"),
             ("GET", "/task-runs/running"),
             ("GET", "/task-runs/abc-123"),
@@ -927,6 +959,90 @@ pub(crate) mod tests {
             "/ui-bridge/control/page-health/../page/evaluate",
             "/ui-bridge/control/page-health%2F..%2Fpage%2Fevaluate",
             "/ui-bridge/control/components/%2e%2e/component/x1/action/delete",
+        ] {
+            for method in ["GET", "POST"] {
+                assert_eq!(
+                    relay_path_verdict(method, path),
+                    RelayPathVerdict::Malformed,
+                    "{method} {path}: traversal is refused, never resolved"
+                );
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // The saved-session-lists read (plan
+    // 2026-11-08-save-per-tab-runner-session-lists-on-sessions-page-kept-14-days,
+    // Phase 1): one GET of the layout, and nothing else of the terminal
+    // surface
+    // ------------------------------------------------------------------
+
+    /// `GET /terminal-layout` relays as a GET in every spelling that
+    /// normalises to it, and under no other method.
+    #[test]
+    fn the_saved_session_list_read_relays_as_a_get_only() {
+        for path in [
+            "/terminal-layout",
+            "terminal-layout",
+            "//terminal-layout",
+            "/Terminal-Layout",
+            "/TERMINAL-LAYOUT",
+            "/terminal%2Dlayout",
+            "\\terminal-layout",
+            "/./terminal-layout/",
+            "/terminal-layout?x=1#top",
+        ] {
+            for method in ["GET", "get"] {
+                assert_eq!(
+                    relay_path_verdict(method, path),
+                    RelayPathVerdict::Allow,
+                    "{method} {path} is the saved-session-lists capture's read"
+                );
+            }
+            for method in ["POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE"] {
+                assert_eq!(
+                    relay_path_verdict(method, path),
+                    RelayPathVerdict::NotAllowed,
+                    "{method} {path}: the layout allowance is a read only"
+                );
+            }
+        }
+    }
+
+    /// The layout allowance opens nothing beside it: no path one segment
+    /// deeper, no near-miss spelling, and `/terminal-pages` under NO method —
+    /// the page roster stays closed, and the tab labels have no HTTP writer at
+    /// all. Traversal out of the allowed path is refused as malformed, never
+    /// resolved into the route it names.
+    #[test]
+    fn the_saved_session_list_read_opens_nothing_beside_it() {
+        for path in [
+            "/terminal-layout/x1",
+            "/terminal-layout/labels",
+            "/terminal-layout%2Fx1",
+            "/terminal-layouts",
+            "/terminal-layout-x",
+            "/terminal",
+            "/terminal-pages",
+            "terminal-pages",
+            "/Terminal-Pages",
+            "/terminal%2Dpages",
+            "/terminal-pages/x1",
+            "/terminal-pages?x=1",
+        ] {
+            for method in [
+                "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE",
+            ] {
+                assert_eq!(
+                    relay_path_verdict(method, path),
+                    RelayPathVerdict::NotAllowed,
+                    "{method} {path} must not be relayable"
+                );
+            }
+        }
+        for path in [
+            "/terminal-layout/../terminal-pages",
+            "/terminal-layout/%2e%2e/terminals",
         ] {
             for method in ["GET", "POST"] {
                 assert_eq!(

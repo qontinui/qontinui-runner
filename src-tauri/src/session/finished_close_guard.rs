@@ -197,6 +197,11 @@ pub struct PendingMessage {
     /// then routes on the resolved record's terminal, which this field does not
     /// carry (see the known gap on [`messages_arm`]).
     pub owner: Option<String>,
+    /// The page this row came from echoed `session_filter_applied: true`, so
+    /// every row on it is this session's (plan
+    /// `2026-11-22-wind-down-custody-probe-and-undelivered-guard-read-unknown-where-they-can-decide`,
+    /// D3). `false` for a page from a coord that ignored the `session` filter.
+    pub session_filtered: bool,
 }
 
 /// Everything [`judge`] reads, each read for THIS close.
@@ -497,6 +502,15 @@ pub fn revival_arm(
 /// (`wind_down_observer::fetch_pending_messages`), so a full page is UNKNOWN
 /// only for a session whose id is not one.
 ///
+/// Session filter (plan `2026-11-22-wind-down-custody-probe-and-undelivered-guard-read-unknown-where-they-can-decide`,
+/// D3): the read sends the Claude session UUID as `session`, and when coord
+/// echoed `session_filter_applied` the page holds ONLY this session's rows
+/// ([`PendingMessage::session_filtered`]). On such a page every row is this
+/// session's by construction, so ANY row HOLDS, even one the runner cannot
+/// attribute, and a page with no row clears whatever the device's backlog. An
+/// unfiltered page (an older coord that ignores `session`) keeps the rules
+/// above.
+///
 /// A message already delivered (injected) but not yet acked is not on the
 /// page — it reached the pane as a turn, which the revival arm catches.
 pub fn messages_arm(
@@ -520,13 +534,27 @@ pub fn messages_arm(
             ),
         );
     }
+    let filtered = !rows.is_empty() && rows.iter().all(|r| r.session_filtered);
+    // On a filtered page every row is this session's by construction, so even
+    // a row the runner cannot attribute HOLDS.
+    if filtered {
+        let row = &rows[0];
+        return ArmVerdict::held(
+            "undelivered_message",
+            format!(
+                "coord holds undelivered message {} for this session",
+                row.message_id
+            ),
+        );
+    }
     let named_in_live = session_id.trim().parse::<uuid::Uuid>().is_ok();
     if rows.len() >= PENDING_PAGE_LIMIT && !named_in_live {
         return ArmVerdict::unknown(
             "undelivered_messages_page_full",
             format!(
-                "coord's pending page is full ({} rows) and the read could not name this \
-                 session, so a row for it may be off the page",
+                "coord's pending page is full ({} rows), was not session-filtered (an older coord \
+                 that ignored `session` never echoes `session_filter_applied`) and the read could \
+                 not name this session in `live`, so a row for it may be off the page",
                 rows.len()
             ),
         );
@@ -1171,6 +1199,15 @@ mod tests {
             message_id: format!("m-{to}"),
             to_session: to.to_string(),
             owner: owner.map(str::to_string),
+            session_filtered: false,
+        }
+    }
+
+    /// A row from a page whose response echoed `session_filter_applied`.
+    fn filtered(to: &str, owner: Option<&str>) -> PendingMessage {
+        PendingMessage {
+            session_filtered: true,
+            ..msg(to, owner)
         }
     }
 
@@ -1232,6 +1269,58 @@ mod tests {
         assert_eq!(
             messages_arm(named, &Ok(with_own)).reason(),
             Some("undelivered_message")
+        );
+        // The full-page reason names the older coord that never echoed the filter.
+        let ArmVerdict::Unknown { detail, .. } =
+            messages_arm("s-1", &Ok(full_page(Some("s-other"))))
+        else {
+            panic!("a full unfiltered page is UNKNOWN for an unnamed session");
+        };
+        assert!(
+            detail.contains("session_filter_applied") && detail.contains("older coord"),
+            "{detail}"
+        );
+    }
+
+    /// D3: the coord-side `session` filter makes the arm DECIDE.
+    #[test]
+    fn a_session_filtered_page_decides() {
+        // Filter applied and a row for this session: HOLD.
+        let mut f = Fixture::ok();
+        f.messages = Ok(vec![filtered("coord-uuid", Some("s-1"))]);
+        assert_eq!(
+            f.outcome(),
+            held("undelivered_messages", "undelivered_message")
+        );
+        // An empty filtered page clears.
+        let mut f = Fixture::ok();
+        f.messages = Ok(Vec::new());
+        assert_eq!(f.outcome(), CLOSE);
+        // On a filtered page an unattributable row is still this session's: HOLD.
+        let mut f = Fixture::ok();
+        f.messages = Ok(vec![filtered("who-knows", None)]);
+        assert_eq!(
+            f.outcome(),
+            held("undelivered_messages", "undelivered_message")
+        );
+        // On an unfiltered page it is nobody's here (covered by the first test).
+        // A FULL filtered page of this session's own rows still HOLDS...
+        let mut f = Fixture::ok();
+        f.messages = Ok((0..PENDING_PAGE_LIMIT)
+            .map(|_| filtered("coord-uuid", Some("s-1")))
+            .collect());
+        assert_eq!(
+            f.outcome(),
+            held("undelivered_messages", "undelivered_message")
+        );
+        // ...and a full filtered page is never a page-full UNKNOWN.
+        let mut f = Fixture::ok();
+        f.messages = Ok((0..PENDING_PAGE_LIMIT)
+            .map(|i| filtered(&format!("s-other-{i}"), Some("s-other")))
+            .collect());
+        assert_eq!(
+            f.outcome(),
+            held("undelivered_messages", "undelivered_message")
         );
     }
 

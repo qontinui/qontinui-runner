@@ -1815,6 +1815,12 @@ struct TickResult {
     /// `heartbeats_dropped_on_failure` split by failure kind (non-zero kinds
     /// only) — this tick's share of [`HEARTBEATS_DROPPED_ON_FAILURE_BY_KIND`].
     heartbeats_dropped_on_failure_by_kind: BTreeMap<&'static str, u64>,
+    /// `finished` rows this tick dropped UNSTAMPED at the unconfirmed-answer
+    /// bound, counted only once the ACK landed — this tick's share of
+    /// [`super::coord_sync_finish_ack::FINISHED_UNCONFIRMED_DROPPED`]. Per
+    /// call, so a test can assert its own drops without racing a sibling
+    /// test that bumps the same process-global counter.
+    finished_unconfirmed_dropped: u64,
 }
 
 impl TickResult {
@@ -1826,6 +1832,7 @@ impl TickResult {
             heartbeats_superseded: 0,
             heartbeats_dropped_on_failure: 0,
             heartbeats_dropped_on_failure_by_kind: BTreeMap::new(),
+            finished_unconfirmed_dropped: 0,
         }
     }
 }
@@ -2257,6 +2264,7 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
     let mut heartbeats_superseded = 0;
     let mut heartbeats_dropped_on_failure = 0;
     let mut heartbeats_dropped_on_failure_by_kind: BTreeMap<&'static str, u64> = BTreeMap::new();
+    let mut finished_unconfirmed_dropped_acked = 0;
     if !succeeded.is_empty() {
         match inner.outbox.ack(&succeeded) {
             Ok(()) => {
@@ -2264,6 +2272,7 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
                     state.in_sidecar.remove(key);
                 }
                 heartbeats_superseded = superseded_count;
+                finished_unconfirmed_dropped_acked = finished_unconfirmed_dropped;
                 if finished_unconfirmed_dropped > 0 {
                     super::coord_sync_finish_ack::FINISHED_UNCONFIRMED_DROPPED
                         .fetch_add(finished_unconfirmed_dropped, Ordering::Relaxed);
@@ -2341,6 +2350,7 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         heartbeats_superseded,
         heartbeats_dropped_on_failure,
         heartbeats_dropped_on_failure_by_kind,
+        finished_unconfirmed_dropped: finished_unconfirmed_dropped_acked,
     }
 }
 
@@ -3839,10 +3849,24 @@ fn state_change_body(payload: &JsonValue) -> JsonValue {
     if let Some(ccsid) = payload.get("claude_code_session_id") {
         body.insert("claude_code_session_id".into(), ccsid.clone());
     }
+    // Unfinished-resume: an ADOPTED row's account / config dir (coord stamps
+    // them on PATCH under the caller's own tenant + device, with the create
+    // path's validation). Omitted when absent/null.
+    for key in ["account_label", "config_dir"] {
+        if let Some(v) = payload.get(key) {
+            if !v.is_null() {
+                body.insert(key.into(), v.clone());
+            }
+        }
+    }
     // Coord refreshes last_heartbeat_at on any PATCH — passing
     // heartbeat=true ensures the row gets a fresh stamp even when the
     // caller only changed metadata.
-    body.insert("heartbeat".into(), JsonValue::Bool(true));
+    // A resume-parameter-only PATCH (`no_heartbeat`) is metadata for a row
+    // that may be CLOSED: it must not stamp liveness on it.
+    if payload.get("no_heartbeat").and_then(JsonValue::as_bool) != Some(true) {
+        body.insert("heartbeat".into(), JsonValue::Bool(true));
+    }
     JsonValue::Object(body)
 }
 
@@ -9836,6 +9860,20 @@ mod tests {
             body.get("claude_code_session_id").is_none(),
             "a state change that did not confirm an id must not send the key at all"
         );
+    }
+
+    /// An adopted row's resume parameters ride a PATCH that stamps NO liveness.
+    #[test]
+    fn state_change_body_forwards_resume_params_without_a_heartbeat() {
+        let body = state_change_body(&json!({
+            "account_label": ".claude-gmail",
+            "config_dir": "/home/u/.claude-gmail",
+            "no_heartbeat": true,
+        }));
+        assert_eq!(body["account_label"], ".claude-gmail");
+        assert_eq!(body["config_dir"], "/home/u/.claude-gmail");
+        assert!(body.get("heartbeat").is_none());
+        assert!(body.get("no_heartbeat").is_none());
     }
 
     /// Phase 2b of plan
