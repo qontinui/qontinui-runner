@@ -42,7 +42,7 @@ use tokio::sync::{oneshot, Mutex};
 use uuid::Uuid;
 
 use super::relay_binding::BindingMode;
-use super::ws_relay::{WsConnectionManager, WsOutboundError};
+use super::ws_relay::{PinnedSendError, WsConnectionManager, WsOutboundError};
 
 /// Default per-command timeout — long enough to cover a slow snapshot, short
 /// enough that wedged wrappers don't accumulate forever.
@@ -218,6 +218,27 @@ impl From<WsOutboundError> for CommandRelayError {
     }
 }
 
+/// How [`CommandRelay::send_and_await`] sends its frame.
+#[derive(Debug, Clone, Copy)]
+enum Route {
+    /// To the `conn_id` the caller just resolved from the app id.
+    Resolved,
+    /// To the `conn_id` the caller pinned, only while it holds the app's slot.
+    Pinned,
+}
+
+/// Map a pinned send's refusal onto the relay's error vocabulary.
+fn pinned_send_error(app_id: &str, conn_id: u64, err: PinnedSendError) -> CommandRelayError {
+    match err {
+        PinnedSendError::NotConnected => CommandRelayError::NotConnected(app_id.to_string()),
+        PinnedSendError::Displaced { current } => CommandRelayError::Displaced(format!(
+            "app '{app_id}' connection {conn_id} does not hold the app's routing slot \
+             (held by connection {current}); the command was not sent"
+        )),
+        PinnedSendError::Send => CommandRelayError::Disconnected,
+    }
+}
+
 /// Shape of the "command" frame the runner sends to a wrapper.
 /// Kept in sync with `command-relay.ts::sendCommandViaWebSocket`.
 #[derive(Debug, Serialize)]
@@ -286,9 +307,21 @@ impl CommandRelay {
         })
     }
 
+    /// The connection manager this relay sends through — for tests that
+    /// play a wrapper reconnecting under an app id.
+    #[cfg(test)]
+    pub fn ws_manager(&self) -> &Arc<WsConnectionManager> {
+        &self.ws
+    }
+
     /// Dispatch a command to the wrapper identified by `app_id`. Resolves
     /// with the wrapper's response or returns a `CommandRelayError` on
     /// disconnect/timeout/error.
+    ///
+    /// Routes to whichever connection holds `app_id` when the command is
+    /// sent. A caller that must reach one SPECIFIC connection — because it
+    /// read something about that connection first — uses
+    /// [`Self::dispatch_to_conn`] instead.
     pub async fn dispatch(
         &self,
         app_id: &str,
@@ -303,7 +336,40 @@ impl CommandRelay {
             .conn_for_app(app_id)
             .await
             .ok_or_else(|| CommandRelayError::NotConnected(app_id.to_string()))?;
+        self.send_and_await(app_id, conn_id, Route::Resolved, action, payload)
+            .await
+    }
 
+    /// Dispatch a command to `conn_id` ONLY, and only while it still holds
+    /// `app_id`'s routing slot. Built on
+    /// [`WsConnectionManager::send_text_if_current`], so the slot check and
+    /// the send cannot be split by a reconnect.
+    ///
+    /// A replaced connection is [`CommandRelayError::Displaced`] and nothing
+    /// is sent to its replacement; an `app_id` with no slot at all is
+    /// [`CommandRelayError::NotConnected`]. Past the send it behaves exactly
+    /// as [`Self::dispatch`] (one pending-reply registration, one timeout).
+    pub async fn dispatch_to_conn(
+        &self,
+        app_id: &str,
+        conn_id: u64,
+        action: &str,
+        payload: serde_json::Value,
+    ) -> Result<CommandResponse, CommandRelayError> {
+        self.send_and_await(app_id, conn_id, Route::Pinned, action, payload)
+            .await
+    }
+
+    /// The shared body of [`Self::dispatch`] and [`Self::dispatch_to_conn`]:
+    /// register the pending reply, send the frame by `route`, await the reply.
+    async fn send_and_await(
+        &self,
+        app_id: &str,
+        conn_id: u64,
+        route: Route,
+        action: &str,
+        payload: serde_json::Value,
+    ) -> Result<CommandResponse, CommandRelayError> {
         let command_id = Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
 
@@ -329,11 +395,29 @@ impl CommandRelay {
             payload: &payload,
             timestamp: chrono::Utc::now().timestamp_millis(),
         };
-        let frame_json = serde_json::to_string(&frame)?;
+        let frame_json = match serde_json::to_string(&frame) {
+            Ok(json) => json,
+            Err(e) => {
+                self.pending.lock().await.remove(&command_id);
+                return Err(e.into());
+            }
+        };
 
-        if let Err(send_err) = self.ws.send_text(conn_id, frame_json).await {
+        let sent = match route {
+            Route::Resolved => self
+                .ws
+                .send_text(conn_id, frame_json)
+                .await
+                .map_err(CommandRelayError::from),
+            Route::Pinned => self
+                .ws
+                .send_text_if_current(app_id, conn_id, frame_json)
+                .await
+                .map_err(|e| pinned_send_error(app_id, conn_id, e)),
+        };
+        if let Err(send_err) = sent {
             self.pending.lock().await.remove(&command_id);
-            return Err(send_err.into());
+            return Err(send_err);
         }
 
         // Await the oneshot with a timeout. On either branch we remove the
@@ -923,6 +1007,72 @@ mod tests {
             .await;
         let result_b = dispatch_b.await.unwrap();
         assert!(result_b.is_ok(), "app-b dispatch must succeed");
+    }
+
+    /// `dispatch_to_conn` against a connection that was replaced sends
+    /// nothing — to it or to its replacement — returns `Displaced`, and
+    /// leaves no pending entry behind. Against the current connection it
+    /// round-trips like `dispatch`.
+    #[tokio::test]
+    async fn dispatch_to_conn_refuses_a_replaced_connection_and_sends_nothing() {
+        let ws = WsConnectionManager::new();
+        let (old, mut old_rx) = ws.test_register("app").await;
+        let (new, mut new_rx) = ws.test_register("app").await;
+        let relay = CommandRelay::with_timeout(ws.clone(), Duration::from_secs(5));
+
+        let err = relay
+            .dispatch_to_conn("app", old, "getScreenshot", json!({}))
+            .await
+            .unwrap_err();
+        match err {
+            CommandRelayError::Displaced(reason) => {
+                assert!(
+                    reason.contains(&format!("held by connection {new}")),
+                    "{reason}"
+                )
+            }
+            other => panic!("expected Displaced, got {other:?}"),
+        }
+        assert!(old_rx.try_recv().is_err());
+        assert!(
+            new_rx.try_recv().is_err(),
+            "the replacement must receive nothing"
+        );
+        assert_eq!(relay.pending_count().await, 0, "no pending entry may leak");
+
+        let err = relay
+            .dispatch_to_conn("nobody", old, "getScreenshot", json!({}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, CommandRelayError::NotConnected(ref id) if id == "nobody"),
+            "{err:?}"
+        );
+
+        let relay2 = relay.clone();
+        let pending = tokio::spawn(async move {
+            relay2
+                .dispatch_to_conn("app", new, "getScreenshot", json!({}))
+                .await
+        });
+        let frame: serde_json::Value =
+            serde_json::from_str(&new_rx.recv().await.expect("frame on the current conn")).unwrap();
+        let command_id = frame["commandId"].as_str().unwrap().to_string();
+        relay
+            .resolve(
+                new,
+                BindingMode::Enforce,
+                CommandResponse {
+                    command_id,
+                    success: true,
+                    result: Some(json!({"ok": true})),
+                    error: None,
+                },
+            )
+            .await;
+        let response = pending.await.unwrap().expect("round trip");
+        assert_eq!(response.result, Some(json!({"ok": true})));
+        assert!(old_rx.try_recv().is_err());
     }
 
     /// reject_by_conn is the cleanup primitive for the disconnect path too.

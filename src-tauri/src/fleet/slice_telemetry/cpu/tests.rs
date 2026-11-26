@@ -94,9 +94,20 @@ impl Machine {
         now: Instant,
         dispatches: impl Fn() -> DispatchCounts,
     ) -> (Snapshot, Option<CpuReport>) {
+        self.read_from(Some(&self.procfs), prev, now, dispatches)
+    }
+
+    /// A read with `procfs` as its `/proc` (`None`: no `/proc` at all).
+    fn read_from(
+        &self,
+        procfs: Option<&Path>,
+        prev: Option<&Snapshot>,
+        now: Instant,
+        dispatches: impl Fn() -> DispatchCounts,
+    ) -> (Snapshot, Option<CpuReport>) {
         measure(
             &self.root,
-            Some(&self.procfs),
+            procfs,
             self.ci_root.as_deref(),
             &self.memory_dirs(),
             dispatches,
@@ -122,14 +133,29 @@ impl Machine {
 
     /// Two reads 30 s apart, with `first` and then `second` written before each.
     fn two_reads(&self, first: &[(&str, u64)], second: &[(&str, u64)]) -> CpuReport {
+        self.two_reads_from(Some(&self.procfs), first, second)
+    }
+
+    /// As [`Machine::two_reads`], with `procfs` as each read's `/proc`.
+    fn two_reads_from(
+        &self,
+        procfs: Option<&Path>,
+        first: &[(&str, u64)],
+        second: &[(&str, u64)],
+    ) -> CpuReport {
         let t0 = Instant::now();
         self.usages(first);
-        let (s, r) = self.read(None, t0);
+        let (s, r) = self.read_from(procfs, None, t0, DispatchCounts::default);
         assert_eq!(r, None, "a first read has nothing to subtract");
         self.usages(second);
-        self.read(Some(&s), t0 + Duration::from_secs(30))
-            .1
-            .expect("a second read reports")
+        self.read_from(
+            procfs,
+            Some(&s),
+            t0 + Duration::from_secs(30),
+            DispatchCounts::default,
+        )
+        .1
+        .expect("a second read reports")
     }
 }
 
@@ -1598,6 +1624,58 @@ fn a_dispatch_no_read_listed_withholds_what_its_time_is_part_of() {
     assert_eq!(r.attribution["withheld"], started_why);
 }
 
+/// A dispatch reason withholds nothing when every place such a dispatch's
+/// time could be is inside a named CI cgroup ([`Withheld::find`]'s `if` arm
+/// with [`Withheld::unlisted_dispatch`] false). A runner whose own cgroup is in
+/// `ci.slice` but is not a unit ([`parse_runner_unit`] reads none) makes its
+/// dispatch cgroups under that cgroup, so a dispatch no read listed is CI work
+/// that `ci.slice`'s time already holds: no reason is recorded, and `ci_usec`
+/// is all of `ci.slice`, the runner's own 15 s included. The control is the
+/// same machine with the runner's cgroup a unit, where the same dispatch
+/// reason does withhold.
+#[test]
+fn a_dispatch_reason_inside_a_named_ci_cgroup_withholds_nothing() {
+    let started = |n| DispatchCounts {
+        started: n,
+        ..DispatchCounts::default()
+    };
+    let reads = |own: &str| {
+        let m = Machine::new(Some(own));
+        m.usages(&[("", 0), ("user.slice", 0), ("ci.slice", 0), (own, 0)]);
+        let p = m.placement();
+        let t0 = Instant::now();
+        let (s, _) = m.read_counting(None, t0, move || started(3));
+        m.usages(&[
+            ("", 100_000_000),
+            ("user.slice", 60_000_000),
+            ("ci.slice", 20_000_000),
+            (own, 15_000_000),
+        ]);
+        let (_, r) = m.read_counting(Some(&s), t0 + Duration::from_secs(30), move || started(4));
+        (p, r.expect("a second read reports"))
+    };
+
+    let own = "ci.slice/runner-host";
+    assert_eq!(parse_runner_unit(&format!("0::/{own}\n")), None);
+    let (p, r) = reads(own);
+    assert_eq!(p.own.as_deref(), Some(own));
+    assert_eq!(p.runner_unit, None, "a cgroup that is not a unit");
+    assert_eq!(p.dispatch_parents, [own]);
+    assert!(
+        r.attribution.get("withheld").is_none(),
+        "a dispatch reason with nothing withheld records no reason: {:?}",
+        r.attribution
+    );
+    assert_eq!(usec(&r, "ci_usec"), Some(20_000_000));
+
+    // Control: the same reads with the runner's cgroup a unit.
+    let unit = "ci.slice/qontinui-runner.service";
+    let (p, r) = reads(unit);
+    assert_eq!(p.runner_unit.as_deref(), Some(unit));
+    assert_eq!(r.attribution["withheld"], json!(["dispatch_started"]));
+    assert_eq!(usec(&r, "ci_usec"), None, "withheld from the class totals");
+}
+
 /// A CI job `ci_node` could not contain runs in the runner's own cgroup, so
 /// while one runs, and for the read after it ends, neither class total can be
 /// split from the unit's time.
@@ -2725,32 +2803,7 @@ fn two_reads_without_procfs(m: &Machine) -> CpuReport {
             (a.as_str(), 10_000_000 * k),
         ]
     };
-    let (ci_root, t0) = (m.ci_root.as_deref(), Instant::now());
-    m.usages(&at(0));
-    let dirs = m.memory_dirs();
-    let (s, r) = measure(
-        &m.root,
-        None,
-        ci_root,
-        &dirs,
-        DispatchCounts::default,
-        None,
-        || t0,
-    );
-    assert_eq!(r, None, "a first read has nothing to subtract");
-    m.usages(&at(1));
-    let (dirs, later) = (m.memory_dirs(), t0 + Duration::from_secs(30));
-    measure(
-        &m.root,
-        None,
-        ci_root,
-        &dirs,
-        DispatchCounts::default,
-        Some(&s),
-        || later,
-    )
-    .1
-    .expect("a second read reports")
+    m.two_reads_from(None, &at(0), &at(1))
 }
 
 /// A read with no `/proc` finds no runner unit, holder scope or own cgroup:

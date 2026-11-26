@@ -360,6 +360,25 @@ impl Grid {
         trimmed
     }
 
+    /// The DIM attribute of each cell of `row`, indexed as [`Self::row_text`]'s
+    /// characters are (wide-glyph right halves skipped, NOT trimmed), so entry
+    /// `i` belongs to `row_text(row).chars().nth(i)`. Empty for a row off the
+    /// grid. Claude Code paints its prompt ghost text (a suggestion, the
+    /// placeholder) DIM and typed input normal, so this tells them apart where
+    /// the text alone cannot.
+    pub fn row_dim_mask(&self, row: u16) -> Vec<bool> {
+        if row >= self.rows {
+            return Vec::new();
+        }
+        let start = (row as usize) * (self.cols as usize);
+        let end = start + self.cols as usize;
+        self.cells[start..end]
+            .iter()
+            .filter(|cell| cell.attrs & ATTR_WIDE_RIGHT == 0)
+            .map(|cell| cell.attrs & ATTR_DIM != 0)
+            .collect()
+    }
+
     pub fn lines(&self) -> Vec<String> {
         (0..self.rows).map(|r| self.row_text(r)).collect()
     }
@@ -545,16 +564,30 @@ impl Grid {
             self.reset_pen();
             return;
         }
-        let flat: Vec<u16> = params.iter().flatten().copied().collect();
+        // One entry per `;`-separated parameter, each holding its `:` sub-
+        // parameters. A colon group is ONE attribute (`4:2` is double
+        // underline, `38:2::R:G:B` one colour) and its sub-parameters are
+        // never read as SGR codes of their own: flattening them would turn a
+        // trailing `2` into DIM — and DIM on the input row is how ghost text
+        // is told from typed text.
+        let groups: Vec<&[u16]> = params.iter().collect();
         let mut i = 0;
-        while i < flat.len() {
-            let p = flat[i];
+        while i < groups.len() {
+            let group = groups[i];
+            let p = group.first().copied().unwrap_or(0);
             match p {
                 0 => self.reset_pen(),
                 1 => self.cur_attrs |= ATTR_BOLD,
                 2 => self.cur_attrs |= ATTR_DIM,
                 3 => self.cur_attrs |= ATTR_ITALIC,
-                4 => self.cur_attrs |= ATTR_UNDERLINE,
+                // `4:0` is "no underline"; any other `4:n` style underlines.
+                4 => {
+                    if group.get(1) == Some(&0) {
+                        self.cur_attrs &= !ATTR_UNDERLINE;
+                    } else {
+                        self.cur_attrs |= ATTR_UNDERLINE;
+                    }
+                }
                 7 => self.cur_attrs |= ATTR_INVERSE,
                 9 => self.cur_attrs |= ATTR_STRIKE,
                 22 => self.cur_attrs &= !(ATTR_BOLD | ATTR_DIM),
@@ -568,37 +601,53 @@ impl Grid {
                 40..=47 => self.cur_bg = ansi_color_16(p as u8 - 40, false),
                 100..=107 => self.cur_bg = ansi_color_16(p as u8 - 100, true),
                 49 => self.cur_bg = COLOR_DEFAULT,
-                38 | 48 => {
-                    let is_fg = p == 38;
-                    if i + 1 < flat.len() {
-                        match flat[i + 1] {
+                // 58 is the underline colour: the grid does not keep it, but
+                // its parameters must be consumed like 38/48's, or a stray `2`
+                // in `58;2;R;G;B` reads as DIM.
+                38 | 48 | 58 => {
+                    let color = if group.len() > 1 {
+                        // Colon form, self-contained: `38:5:n`, `38:2:R:G:B`,
+                        // or the ITU `38:2:CS:R:G:B` with a colour-space slot.
+                        match group[1] {
+                            5 => group.get(2).map(|&n| palette_256(n as u8)),
                             2 => {
-                                if i + 4 < flat.len() {
-                                    let r = flat[i + 2] as u8;
-                                    let g = flat[i + 3] as u8;
-                                    let b = flat[i + 4] as u8;
-                                    let c = pack_rgb(r, g, b);
-                                    if is_fg {
-                                        self.cur_fg = c;
-                                    } else {
-                                        self.cur_bg = c;
-                                    }
-                                    i += 4;
-                                }
+                                let rgb = if group.len() >= 6 {
+                                    &group[3..6]
+                                } else {
+                                    group.get(2..5).unwrap_or(&[])
+                                };
+                                (rgb.len() == 3)
+                                    .then(|| pack_rgb(rgb[0] as u8, rgb[1] as u8, rgb[2] as u8))
                             }
-                            5 => {
-                                if i + 2 < flat.len() {
-                                    let n = flat[i + 2] as u8;
-                                    let c = palette_256(n);
-                                    if is_fg {
-                                        self.cur_fg = c;
-                                    } else {
-                                        self.cur_bg = c;
-                                    }
-                                    i += 2;
-                                }
+                            _ => None,
+                        }
+                    } else {
+                        // Semicolon form: the selector and values are the
+                        // following parameters, consumed here.
+                        let next = |k: usize| groups.get(i + k).and_then(|g| g.first()).copied();
+                        match next(1) {
+                            Some(5) if i + 2 < groups.len() => {
+                                let n = next(2).unwrap_or(0) as u8;
+                                i += 2;
+                                Some(palette_256(n))
                             }
-                            _ => {}
+                            Some(2) if i + 4 < groups.len() => {
+                                let (r, g, b) = (
+                                    next(2).unwrap_or(0) as u8,
+                                    next(3).unwrap_or(0) as u8,
+                                    next(4).unwrap_or(0) as u8,
+                                );
+                                i += 4;
+                                Some(pack_rgb(r, g, b))
+                            }
+                            _ => None,
+                        }
+                    };
+                    if let Some(c) = color {
+                        if p == 38 {
+                            self.cur_fg = c;
+                        } else if p == 48 {
+                            self.cur_bg = c;
                         }
                     }
                 }
@@ -1112,6 +1161,21 @@ impl<'a> Perform for GridPerformer<'a> {
                 let n = first_param(params, 1);
                 self.grid.cursor.col = self.grid.cursor.col.saturating_sub(n);
             }
+            // CHA / HPA — cursor to an absolute column (1-based), row kept.
+            // Claude Code's diff renderer leans on CHA to skip cells it
+            // believes unchanged (`SAFE\x1b[8GTO`); ignoring it shifted every
+            // later glyph left, so the grid dropped blanks and letters
+            // (`✻Brewed for 1m 16s ·dne 9:09 AM`) and the idle predicate's
+            // finished-turn matcher could not read the line.
+            'G' | '`' => {
+                let col = first_param(params, 1).saturating_sub(1);
+                self.grid.cursor.col = col.min(self.grid.cols.saturating_sub(1));
+            }
+            // VPA — cursor to an absolute row (1-based), column kept.
+            'd' => {
+                let row = first_param(params, 1).saturating_sub(1);
+                self.grid.cursor.row = row.min(self.grid.rows.saturating_sub(1));
+            }
             'J' => {
                 let mode = first_param_default_zero(params, 0);
                 let cols = self.grid.cols;
@@ -1387,6 +1451,67 @@ mod tests {
         assert_eq!(cells[4].ch, 'o');
         assert_eq!(grid.cursor().col, 5);
         assert_eq!(grid.cursor().row, 0);
+    }
+
+    #[test]
+    fn cha_and_hpa_move_to_an_absolute_column() {
+        // Claude Code's diff renderer skips cells it believes unchanged with
+        // CHA (`ESC[nG`). Before CHA was handled, both writes below landed
+        // back to back and the row read `SAFETO`.
+        let mut grid = Grid::new(40, 4);
+        feed(&mut grid, b"\x1b[2CSAFE\x1b[8GTO\x1b[11GCLOSE");
+        assert_eq!(grid.row_text(0), "  SAFE TO CLOSE");
+        // The 1-based column is clamped to the grid; 0 and no param mean 1.
+        feed(&mut grid, b"\r\n\x1b[99Gx\r\n\x1b[5`y\x1b[0Gz\r\n\x1b[Gw");
+        assert_eq!(grid.row_text(1), format!("{}x", " ".repeat(39)));
+        assert_eq!(grid.row_text(2), "z   y");
+        assert_eq!(grid.row_text(3), "w");
+    }
+
+    #[test]
+    fn vpa_moves_to_an_absolute_row_keeping_the_column() {
+        let mut grid = Grid::new(20, 6);
+        feed(&mut grid, b"\x1b[4Ca\x1b[3db\x1b[99dc");
+        assert_eq!(grid.row_text(0), "    a");
+        assert_eq!(grid.row_text(2), "     b");
+        assert_eq!(grid.row_text(5), "      c");
+    }
+
+    #[test]
+    fn underline_colour_params_do_not_leak_into_the_pen() {
+        let mut grid = Grid::new(20, 2);
+        feed(&mut grid, b"\x1b[58;2;255;100;50mA\x1b[58;5;2mB");
+        let cells = &grid.snapshot().cells;
+        for cell in &cells[..2] {
+            assert_eq!(cell.attrs & ATTR_DIM, 0, "{cell:?}");
+            assert_eq!(cell.fg, COLOR_DEFAULT);
+            assert_eq!(cell.bg, COLOR_DEFAULT);
+        }
+    }
+
+    /// A colon group is one attribute: its sub-parameters never read as SGR
+    /// codes, so a trailing `2` (ITU colour-space form, double underline) is
+    /// not DIM, and colon colours land on the right channel.
+    #[test]
+    fn colon_subparameters_are_one_attribute_never_dim() {
+        let mut grid = Grid::new(20, 2);
+        feed(
+            &mut grid,
+            b"[58:2::0:0:2mA[4:2mB[38:2::1:2:2mC[48:2:3:4:2mD[38:5:2mE[4:0mF",
+        );
+        let cells = &grid.snapshot().cells;
+        for cell in &cells[..6] {
+            assert_eq!(cell.attrs & ATTR_DIM, 0, "{cell:?}");
+        }
+        assert_ne!(cells[1].attrs & ATTR_UNDERLINE, 0, "4:2 underlines");
+        assert_eq!(
+            cells[2].fg,
+            pack_rgb(1, 2, 2),
+            "ITU form skips the colour space"
+        );
+        assert_eq!(cells[3].bg, pack_rgb(3, 4, 2), "plain colon truecolour");
+        assert_eq!(cells[4].fg, palette_256(2));
+        assert_eq!(cells[5].attrs & ATTR_UNDERLINE, 0, "4:0 is no underline");
     }
 
     #[test]

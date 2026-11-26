@@ -753,11 +753,11 @@ struct Placement {
     /// `QONTINUI_CI_CGROUP_ROOT` set it makes them only there, so that
     /// directory must be [`followed`]; otherwise beside the runner's own
     /// cgroup, which must then be known. When not, a dispatch cgroup could be
-    /// anywhere ([`Withheld::find`]).
+    /// anywhere ([`Withheld::dispatch_reasons`]).
     dispatch_parents_unknown: Option<Why>,
     /// The CI dispatch cgroups ([`dispatch_cgroups`]). `None` when a directory
     /// they live in could not be listed, which withholds what one there would
-    /// be part of ([`Withheld::find`]): a dispatch cgroup is CI work inside
+    /// be part of ([`Withheld::dispatch_reasons`]): a dispatch cgroup is CI work inside
     /// the runner's unit.
     dispatches: Option<Vec<String>>,
     /// Each watched slice's directory ([`find_watched`]); its `cpu` object is
@@ -837,8 +837,8 @@ struct DispatchPlacement {
     cgroups: Option<Vec<String>>,
 }
 
-/// The runner's own cgroup, from `own_cgroup`, the body of `/proc/self/cgroup`
-/// ([`parse_unified_cgroup`]), relative to the root: `None` when there is no
+/// The runner's own cgroup, from `own_cgroup`, the body of `procfs`'s
+/// `self/cgroup` ([`parse_unified_cgroup`]), relative to the root: `None` when there is no
 /// body, it names none, or it names one through `.` or `..`. Then the
 /// directories `ci_node` makes CI dispatch cgroups in ([`dispatch_parents`]),
 /// why it could have made one in a directory they do not hold, and the
@@ -1079,8 +1079,8 @@ impl Placement {
     /// Could `rel` be a CI slice this read did not name because the user
     /// manager it is in could not be listed? That is when `rel` is `ci.slice`
     /// or a CI-class watched slice in one of [`Self::unlisted_ci_homes`].
-    /// [`Withheld::find`] withholds what one there is part of as unlisted, not
-    /// as gone. A dispatch cgroup is not a slice: one gone from the runner's
+    /// [`Withheld::unlisted_ci_slice`] withholds what one there is part of as
+    /// unlisted, not as gone. A dispatch cgroup is not a slice: one gone from the runner's
     /// unit is gone, whatever could be listed.
     fn unlisted_ci_slice_at(&self, rel: &str) -> bool {
         let name = rel.rsplit('/').next().unwrap_or(rel);
@@ -1098,8 +1098,8 @@ impl Placement {
     /// Could `rel` be a dispatch cgroup this read did not list because it
     /// could not? That is when a directory dispatch cgroups are made in could
     /// not be listed and `rel` is a `dispatch-*` cgroup directly in one of
-    /// them. [`Withheld::find`] withholds what one there is part of as
-    /// unlisted, not as gone.
+    /// them. [`Withheld::dispatch_reasons`] withholds what one there is part
+    /// of as unlisted, not as gone.
     fn unlisted_dispatch_at(&self, rel: &str) -> bool {
         self.dispatches.is_none()
             && self.dispatch_parents.iter().any(|home| {
@@ -1341,7 +1341,8 @@ impl Withheld {
     /// they are gone: while a directory dispatch cgroups are made in could not
     /// be listed, a dispatch cgroup the previous read listed directly in any
     /// of them ([`Placement::unlisted_dispatch_at`]), which is withheld as
-    /// unlisted ([`Self::dispatch_reasons`]) rather than reported gone; and a
+    /// unlisted ([`Self::dispatch_reasons`], [`Self::unlisted_dispatch`])
+    /// rather than reported gone; and a
     /// CI slice the previous read named in a user manager this read could not
     /// list ([`Placement::unlisted_ci_slice_at`], [`Self::unlisted_ci_slice`]).
     /// True when that withholds anything.

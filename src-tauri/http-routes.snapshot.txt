@@ -70,7 +70,6 @@ DELETE /ui-bridge/control/network/stubs ui_bridge_clear_network_stubs_handler
 DELETE /ui-bridge/control/network/stubs/{id} ui_bridge_delete_network_stub_handler
 DELETE /ui-bridge/design/style-guide ui_bridge_design_clear_style_guide_handler
 DELETE /ui-bridge/devices/{id} unregister_device
-DELETE /ui-bridge/devices/{id}/pairing revoke_pairing
 DELETE /ui-bridge/integration/{id} handle_delete_integration
 DELETE /ui-bridge/render-log handle_clear_render_log
 DELETE /ui-bridge/sdk/ai/bookmark/{name} handle_ct_delete_bookmark
@@ -303,6 +302,7 @@ GET /meta-optimizer/recommendations get_recommendations_handler
 GET /meta-optimizer/reflection-fixes get_reflection_fixes_handler
 GET /meta-optimizer/runs get_optimizer_runs_handler
 GET /meta-optimizer/span-events list_span_events_handler
+GET /model-gateway get_model_gateway
 GET /models list_models
 GET /models/disk-usage get_models_disk_usage
 GET /models/{model_id} get_model_status
@@ -436,6 +436,7 @@ GET /sessions/transcript-coverage transcript_coverage
 GET /sessions/tree-resets list_tree_resets
 GET /sessions/{id}/latest-review get_latest_review_for_session
 GET /sessions/{id}/policy-context policy_context
+GET /sessions/{id}/stop-reason get_stop_reason
 GET /sessions/{id}/touched-files get_touched_files
 GET /sessions/{id}/transcript get_transcript
 GET /sessions/{session_id}/file-changes file_changes_handler
@@ -532,6 +533,7 @@ GET /task-runs/{id}/verification-phase-results get_task_run_verification_phase_r
 GET /task-runs/{id}/verification-results get_task_run_verification_results
 GET /task-runs/{id}/workflow-state get_workflow_state
 GET /tenant/active get_active_tenant
+GET /terminal-layout terminal_layout_handler
 GET /terminal-pages list_terminal_pages_handler
 GET /terminals list_terminals_handler
 GET /terminals/transport-stats get_transport_stats_handler
@@ -945,6 +947,7 @@ MERGE memory_consolidation_api::routes
 MERGE meta_optimizer_api::routes
 MERGE misc::routes
 MERGE misc::routes
+MERGE model_gateway_read::routes
 MERGE models::routes
 MERGE monitors::routes
 MERGE network::routes
@@ -1011,6 +1014,7 @@ MERGE task_runs::routes
 MERGE tauri_audit::routes
 MERGE tauri_proxy::routes
 MERGE tenant::routes
+MERGE terminal_layout::routes
 MERGE terminals::routes
 MERGE terminals::routes
 MERGE test_fixtures::routes
@@ -1345,7 +1349,7 @@ POST /task-runs/{id}/rename rename_task_run
 POST /task-runs/{id}/resume resume_task_run_http
 POST /task-runs/{id}/stop stop_task_run
 POST /task-runs/{id}/unpause unpause_task_run
-POST /terminals create_terminal_handler
+POST /terminals create_terminal_detached
 POST /terminals/transport-stats reset_transport_stats_handler
 POST /terminals/{id}/move move_terminal_handler
 POST /terminals/{id}/resize resize_terminal_handler
@@ -1538,11 +1542,10 @@ POST /ui-bridge/design/evaluate/diff ui_bridge_design_evaluate_diff_handler
 POST /ui-bridge/design/responsive ui_bridge_design_responsive_handler
 POST /ui-bridge/design/snapshot ui_bridge_design_snapshot_handler
 POST /ui-bridge/design/style-guide/load ui_bridge_design_load_style_guide_handler
-POST /ui-bridge/devices/pair/confirm confirm_pairing
-POST /ui-bridge/devices/pair/initiate initiate_pairing
 POST /ui-bridge/devices/register-lan register_lan_device
 POST /ui-bridge/devices/{id}/connect connect_device
 POST /ui-bridge/devices/{id}/disconnect disconnect_device
+POST /ui-bridge/devices/{id}/pair pair_device
 POST /ui-bridge/devices/{id}/transport/prefer prefer_transport
 POST /ui-bridge/discover-states discover_states_from_renders
 POST /ui-bridge/explore start_ui_bridge_exploration

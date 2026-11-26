@@ -261,7 +261,10 @@ pub async fn tauri_invoke_handler(
 
     info!(command = %req.command, "tauri_proxy: dispatching command");
 
-    let response = dispatch(state, req).await;
+    // Detached, so a client that disconnects cannot drop a command mid-way. The
+    // `terminal_create` arm's create runs off-worker, and dropped there it would
+    // release its isolated context's claims under the terminal it opened.
+    let response = crate::spawn_off_worker::run_detached(dispatch(state, req)).await;
     Ok((response.status.unwrap_or(StatusCode::OK), Json(response)))
 }
 
@@ -398,41 +401,62 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                 isolated_ctx.as_ref(),
                 spawn_tenant_key.as_deref(),
             );
-
-            // door-scan: spawn — the door's real spawn; the context is in hand until here.
-            match tm.create(
-                a.title,
-                working_dir,
-                a.page_id,
-                a.cols,
-                a.rows,
-                state.app_handle.clone(),
-                None,
-                extra_env,
-                // UNATTENDED by default — respect the critical floor. This is
-                // the HTTP proxy for the `terminal_create` Tauri command, used
-                // by external tooling that has no webview to show a dialog in,
-                // so an absent `resourceOverride` is `false` and the typed
-                // refusal is returned verbatim as the invoke response's error.
-                // A caller that IS fronted by a UI recognises the
-                // `resource_guard:critical:` prefix, asks its own operator, and
-                // re-invokes with `resourceOverride: true` — see the field's
-                // doc. Nothing is ever assumed on the caller's behalf here.
-                a.resource_override,
-                // The account is chosen after this point, so the every-account
-                // mint applies.
-                crate::terminal::TrustArm::AccountChosenLater,
+            // What the post-create coord wiring needs, kept before the spawn
+            // consumes them.
+            let created = ProxyTerminalCreated {
+                title: a.title.clone(),
+                intent_repo: effective_intent_repo,
+                working_dir: working_dir.clone(),
                 spawn_tenant,
-                // External tooling through the HTTP proxy: reason unnamed.
-                crate::coord_drain_state::SpawnOrigin::Unknown,
-            ) {
+            };
+
+            let create_app_handle = state.app_handle.clone();
+            // Off the API runtime's workers: this create can block for seconds to
+            // minutes (see `spawn_off_worker`).
+            let create_result = {
+                let tm = tm.clone();
+                crate::spawn_off_worker::run_terminal_create_off_worker(move || {
+                    // door-scan: spawn — the door's real spawn; the context is in hand until here.
+                    tm.create(
+                        a.title,
+                        working_dir,
+                        a.page_id,
+                        a.cols,
+                        a.rows,
+                        create_app_handle,
+                        None,
+                        extra_env,
+                        // UNATTENDED by default — respect the critical floor. This is
+                        // the HTTP proxy for the `terminal_create` Tauri command, used
+                        // by external tooling that has no webview to show a dialog in,
+                        // so an absent `resourceOverride` is `false` and the typed
+                        // refusal is returned verbatim as the invoke response's error.
+                        // A caller that IS fronted by a UI recognises the
+                        // `resource_guard:critical:` prefix, asks its own operator, and
+                        // re-invokes with `resourceOverride: true` — see the field's
+                        // doc. Nothing is ever assumed on the caller's behalf here.
+                        a.resource_override,
+                        // The account is chosen after this point, so the every-account
+                        // mint applies.
+                        crate::terminal::TrustArm::AccountChosenLater,
+                        spawn_tenant,
+                        // External tooling through the HTTP proxy: reason unnamed.
+                        crate::coord_drain_state::SpawnOrigin::Unknown,
+                    )
+                })
+                .await
+            };
+            match create_result {
                 Ok(info) => {
-                    if let Some(ctx) = isolated_ctx {
-                        if let Some(session) = tm.get(&info.id) {
-                            session.set_isolated_edit_ctx(ctx);
-                        }
-                    }
-                    TauriInvokeResponse::ok(serde_json::to_value(&info).unwrap_or(Value::Null))
+                    let door = ProxyTerminalCreateDoor {
+                        terminal_manager: tm.clone(),
+                        session_registry: state
+                            .app_handle
+                            .try_state::<Arc<crate::session::SessionRegistry>>()
+                            .map(|r| r.inner().clone()),
+                        app_handle: Some(state.app_handle.clone()),
+                    };
+                    proxy_terminal_created(&door, info, isolated_ctx, created).await
                 }
                 Err(e) => {
                     // The allocation (if this call made one) has its fresh tree
@@ -639,6 +663,74 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
     }
 }
 
+// ============================================================================
+// terminal_create — post-create coord wiring
+// ============================================================================
+
+/// What the `terminal_create` arm's post-create step needs beyond the
+/// arguments. Built from `ApiState.app_handle` in [`dispatch`]; a test builds
+/// it from bare managers (no `AppHandle`, no webview), which is what lets a
+/// unit test enter [`proxy_terminal_created`].
+pub(crate) struct ProxyTerminalCreateDoor {
+    pub terminal_manager: Arc<TerminalManager>,
+    /// `None` only if the registry is not in app state — a boot-ordering fault
+    /// [`crate::commands::terminal::coord_wiring::finish_terminal_create`]
+    /// logs; the pane is still created.
+    pub session_registry: Option<Arc<crate::session::SessionRegistry>>,
+    /// For the repo-detection emit. `None` in a unit test.
+    pub app_handle: Option<tauri::AppHandle>,
+}
+
+/// The arm's resolved inputs the coord wiring reads, taken before the spawn
+/// consumes them.
+pub(crate) struct ProxyTerminalCreated {
+    pub title: Option<String>,
+    pub intent_repo: Option<String>,
+    pub working_dir: Option<String>,
+    pub spawn_tenant: Option<uuid::Uuid>,
+}
+
+/// The invoke proxy's `terminal_create` arm after a successful spawn: the SAME
+/// post-create coord wiring the Tauri command runs
+/// ([`crate::commands::terminal::coord_wiring::finish_terminal_create`]) —
+/// parking the isolated edit context, registering and binding the pane's
+/// `terminal_shell` coord session — then the invoke answer.
+///
+/// Plan `2026-11-05-remote-session-end-reaches-the-target-but-cannot-end-a-real-session`
+/// Phase 4: this arm used to return straight after `create`, so an
+/// invoke-created pane had no `terminal_shell` coord row,
+/// `GET /terminals/{id}/coord-session` read `null`, and a remote end of it
+/// answered `not_found`.
+pub(crate) async fn proxy_terminal_created(
+    door: &ProxyTerminalCreateDoor,
+    info: crate::terminal::types::TerminalInfo,
+    isolated_ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
+    created: ProxyTerminalCreated,
+) -> TauriInvokeResponse {
+    let intent = crate::commands::terminal::coord_wiring::terminal_shell_intent(
+        created.title.as_deref(),
+        "Terminal shell session",
+        created.intent_repo,
+        None,
+        None,
+        created.working_dir.as_deref(),
+        created.spawn_tenant,
+    );
+    crate::commands::terminal::coord_wiring::finish_terminal_create(
+        &door.terminal_manager,
+        door.session_registry.as_ref(),
+        door.app_handle.as_ref(),
+        &info.id,
+        isolated_ctx,
+        intent,
+        crate::commands::terminal::coord_wiring::CoordRegistration::FreshPinned,
+        created.working_dir,
+        "tauri_proxy_terminal_create",
+    )
+    .await;
+    TauriInvokeResponse::ok(serde_json::to_value(&info).unwrap_or(Value::Null))
+}
+
 /// The `remote_interactivity_probe` trigger a headless proxy caller may run:
 /// absent/blank → `unspecified`, `manual` → `manual`, anything else (notably
 /// `fleet_view`, which would stamp the device into the scheduler's sweep set)
@@ -821,5 +913,64 @@ mod spawn_refusal_tests {
             assert!(body.get("code").is_none(), "{text}");
             assert_eq!(body["error"], *text);
         }
+    }
+}
+
+#[cfg(test)]
+mod terminal_create_coord_wiring_tests {
+    use super::*;
+    use crate::commands::terminal::coord_wiring::test_support;
+
+    /// ARMING TEST for plan
+    /// `2026-11-05-remote-session-end-reaches-the-target-but-cannot-end-a-real-session`
+    /// Phase 4: a pane created through the invoke proxy's `terminal_create`
+    /// arm carries a non-null `GET /terminals/{id}/coord-session`.
+    ///
+    /// Enters through [`proxy_terminal_created`], the arm's whole body after a
+    /// successful spawn — the spawn itself is a dead fixture pane, because
+    /// `TerminalManager::create` needs a live `AppHandle`. If the arm stops
+    /// running the shared post-create wiring, the pane is never bound and this
+    /// fails.
+    #[tokio::test]
+    async fn an_invoke_created_terminal_is_bound_to_a_coord_session() {
+        let fx = test_support::registry();
+        let tm = Arc::new(TerminalManager::new());
+        let door = ProxyTerminalCreateDoor {
+            terminal_manager: tm.clone(),
+            session_registry: Some(fx.registry.clone()),
+            app_handle: None,
+        };
+        let session = Arc::new(crate::terminal::session::tests::make_test_session(
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+        ));
+        let info = session.info();
+        tm.insert_for_test(&info.id, session);
+
+        let reply = proxy_terminal_created(
+            &door,
+            info,
+            None,
+            ProxyTerminalCreated {
+                title: Some("invoke-created pane".to_string()),
+                intent_repo: None,
+                working_dir: None,
+                spawn_tenant: None,
+            },
+        )
+        .await;
+        assert!(reply.success, "{:?}", reply.error);
+        let id = reply.data.as_ref().expect("terminal info")["id"]
+            .as_str()
+            .expect("id")
+            .to_string();
+
+        let Json(body) = crate::mcp::terminals::coord_session_for(&tm, &id)
+            .unwrap_or_else(|_| panic!("terminal {id} is registered"));
+        let body = serde_json::to_value(&body).expect("serializes");
+        let coord = body["data"]["coord_session_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("coord-session must be non-null: {body}"));
+        let coord = uuid::Uuid::parse_str(coord).expect("a uuid");
+        assert_eq!(tm.get(&id).unwrap().coord_session_id(), Some(coord));
     }
 }

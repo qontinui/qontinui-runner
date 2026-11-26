@@ -162,6 +162,12 @@ impl CloseoutSpool {
         &self.outbox
     }
 
+    /// The machine id every row this spool writes is keyed under — shared with
+    /// [`super::spawn_report_spool`], which writes through the same handle.
+    pub fn machine_id(&self) -> Uuid {
+        self.machine_id
+    }
+
     /// Spool a `POST /coord/work-units/{slug}/register-gate` the forwarder
     /// could not deliver.
     ///

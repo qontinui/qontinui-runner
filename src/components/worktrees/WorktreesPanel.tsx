@@ -39,9 +39,9 @@ import {
   CheckCircle2,
   Clock,
 } from "lucide-react";
+import { formatBytes } from "@/lib/formatting";
 import {
   useReclaimableWorktrees,
-  formatBytes,
   formatAge,
   REASON_LABEL,
   type WorktreeSurvey,

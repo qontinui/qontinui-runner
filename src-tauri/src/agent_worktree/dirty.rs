@@ -9,6 +9,7 @@
 //! |---|---|
 //! | `.claude/` | agent scaffolding (agents, settings) materialized per session |
 //! | `.coord-mcp-status` | [`crate::coord_mcp`]'s degraded breadcrumb |
+//! | `.coord-mcp-status.tmp-*` | that breadcrumb's atomic-replace temp file, left only by a crash between its write and its rename |
 //! | `.mcp.json` | the coord-mcp proxy config written at worktree provisioning |
 //!
 //! None of those are operator work, and every one of them makes an otherwise
@@ -44,6 +45,51 @@
 /// exactly, or as a directory prefix (`.claude/` covers `.claude/agents/x`).
 pub(crate) const RUNNER_SCAFFOLDING: &[&str] = &[".claude", ".coord-mcp-status", ".mcp.json"];
 
+/// `git status` porcelain arguments for every dirty gate in this module tree:
+/// EVERY untracked file is listed, whatever the repo's
+/// `status.showUntrackedFiles` says. Under `no`, plain `status --porcelain`
+/// prints nothing for an untracked file, so an operator's untracked work reads
+/// as a clean tree and a gate that must refuse lets the action through.
+/// `all` lists individual files rather than collapsing a directory to `dir/`;
+/// [`is_scaffolding_path`] matches either spelling.
+pub(crate) const STATUS_PORCELAIN_ALL_UNTRACKED: &[&str] =
+    &["status", "--porcelain", "--untracked-files=all"];
+
+/// Test fixture shared by every dirty gate's `showUntrackedFiles=no` test: a
+/// committed repo on `main` with `status.showUntrackedFiles no` set and ONE
+/// untracked, non-scaffolding file (`operator-notes.txt`). Asserts that plain
+/// `git status --porcelain` really prints nothing for it, so a test built on
+/// this fixture is measuring the blinded case and not a tree any spelling sees.
+#[cfg(test)]
+pub(crate) fn repo_with_hidden_untracked_file() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let p = dir.path().to_str().expect("utf-8 tempdir").to_string();
+    let git = |args: &[&str]| -> String {
+        let out = std::process::Command::new("git")
+            .args(["-C", &p])
+            .args(args)
+            .output()
+            .expect("spawn git");
+        assert!(out.status.success(), "git {args:?} failed: {out:?}");
+        String::from_utf8(out.stdout).expect("utf-8 git output")
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.email", "t@example.com"]);
+    git(&["config", "user.name", "t"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    std::fs::write(dir.path().join("a.txt"), b"x").expect("write a.txt");
+    git(&["add", "a.txt"]);
+    git(&["commit", "-q", "-m", "c1"]);
+    git(&["config", "status.showUntrackedFiles", "no"]);
+    std::fs::write(dir.path().join("operator-notes.txt"), b"wip").expect("write untracked");
+    assert_eq!(
+        git(&["status", "--porcelain"]),
+        "",
+        "fixture: plain porcelain must be blind to the untracked file"
+    );
+    dir
+}
+
 /// Strip git's quoting from a porcelain path. git quotes paths containing
 /// spaces or unusual bytes (`?? "a b.txt"`); ordinary paths are bare.
 pub(crate) fn unquote(path: &str) -> &str {
@@ -60,10 +106,26 @@ pub(crate) fn unquote(path: &str) -> &str {
 /// `starts_with`, so a sibling like `.mcp.json.bak` stays dirty.
 pub(crate) fn is_scaffolding_path(path: &str) -> bool {
     let p = path.replace('\\', "/");
+    // The temp file is matched BEFORE the trailing separator is trimmed: git
+    // may print a directory with one (`?? name/` for a nested repo, or any
+    // listing without `-uall`), and a directory of that name is not the
+    // runner's — `delete_scaffolding` would `remove_dir_all` it.
+    if is_breadcrumb_tmp(&p) {
+        return true;
+    }
     let p = p.trim_end_matches('/');
     RUNNER_SCAFFOLDING
         .iter()
         .any(|s| p == *s || p.starts_with(&format!("{s}/")))
+}
+
+/// The breadcrumb's crash-left temp file
+/// ([`crate::coord_mcp::breadcrumb_tmp_name`]), at the tree root only. A plain
+/// file, so nothing may follow it after a separator: a directory of that name,
+/// or one nested under a subdirectory, is not the runner's and stays dirty.
+fn is_breadcrumb_tmp(p: &str) -> bool {
+    p.strip_prefix(crate::coord_mcp::COORD_MCP_STATUS_TMP_PREFIX)
+        .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
 }
 
 /// Can this porcelain line be ignored when deciding reclaim-dirtiness?
@@ -333,7 +395,8 @@ pub(crate) fn probe_reclaim_dirty(
         return DirtyVerdict::Unknown;
     };
     let mut cmd = crate::process_helpers::no_window("git");
-    cmd.args(["-C", path_str, "status", "--porcelain"]);
+    cmd.args(["-C", path_str])
+        .args(STATUS_PORCELAIN_ALL_UNTRACKED);
     probe_reclaim_dirty_with(path, cmd, timeout, label)
 }
 
@@ -374,6 +437,21 @@ pub(crate) fn probe_reclaim_dirty_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Edge 9171555e: `status.showUntrackedFiles=no` must not blind the
+    /// reclaim probe — an untracked file is work a reclaim would delete.
+    #[test]
+    fn an_untracked_file_hidden_by_show_untracked_no_is_still_dirty() {
+        let repo = repo_with_hidden_untracked_file();
+        assert_eq!(
+            probe_reclaim_dirty(
+                repo.path(),
+                RECLAIM_DIRTY_PROBE_TIMEOUT,
+                "test: hidden untracked"
+            ),
+            DirtyVerdict::Dirty
+        );
+    }
 
     #[test]
     fn clean_tree_is_not_dirty() {
@@ -420,6 +498,37 @@ mod tests {
         assert!(porcelain_is_dirty("?? .claudex/thing"));
         assert!(porcelain_is_dirty("?? .coord-mcp-status-old"));
         assert!(porcelain_is_dirty("?? src/.claude/nested.txt"));
+        assert!(porcelain_is_dirty("?? .coord-mcp-status.tmp-"));
+        assert!(porcelain_is_dirty("?? .coord-mcp-status.tmp-1/notes.txt"));
+        assert!(porcelain_is_dirty("?? sub/.coord-mcp-status.tmp-1-x"));
+        // A DIRECTORY of the temp name (git may print it with a trailing `/`)
+        // is not the runner's plain temp file.
+        assert!(porcelain_is_dirty("?? .coord-mcp-status.tmp-1/"));
+        assert!(porcelain_is_dirty("?? .coord-mcp-status.tmp-1\\"));
+        assert!(!is_scaffolding_path(".coord-mcp-status.tmp-1/"));
+    }
+
+    /// A crash between the breadcrumb's temp write and its rename leaves the
+    /// temp file behind; it is runner-written and must not pin the worktree
+    /// unreclaimable. Built from the writer's own name so a renamed temp
+    /// spelling cannot drift past this predicate.
+    #[test]
+    fn crash_left_breadcrumb_tmp_is_scaffolding() {
+        let name = crate::coord_mcp::breadcrumb_tmp_name();
+        assert!(!porcelain_is_dirty(&format!("?? {name}")), "{name}");
+        assert!(!porcelain_is_dirty(&format!("?? \"{name}\"\r\n")), "{name}");
+        assert!(porcelain_is_dirty(&format!("?? {name}\n M src/main.rs")));
+        assert!(
+            porcelain_is_dirty(&format!(" M {name}")),
+            "tracked stays dirty"
+        );
+        assert!(is_scaffolding_path(&name));
+        // The prefix is the breadcrumb's own name plus `.tmp-`, so renaming
+        // the breadcrumb cannot leave the temp spelling behind.
+        assert_eq!(
+            crate::coord_mcp::COORD_MCP_STATUS_TMP_PREFIX,
+            format!("{}.tmp-", crate::coord_mcp::COORD_MCP_STATUS_FILE)
+        );
     }
 
     #[test]

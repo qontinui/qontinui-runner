@@ -367,12 +367,14 @@ trigger is NOT a gate; skip those and just report the blocker.
   window drops them permanently — so treat it as best-effort and read the gate's
   `continuation_consumed_outcome` (a **null** outcome means never claimed, which
   is worse than a recorded `spawn_failed`).
-  **When you attach one, populate `hint` — it is the spawned agent's ONLY
-  context.** coord flattens the continuation to `run /<skill> <args>` and appends
-  `\n\n<hint>` only if a hint is present; nothing else in the frame carries the
-  plan, the PR, prior findings or the predicate, so a hintless continuation
-  spawns an agent that knows only the command line — on this path, one that does
-  not know why the phase exited. Six labelled lines, **references before
+  **When you attach one, populate `hint` — it is the only field that can carry
+  *why*.** coord flattens the continuation to `run /<skill> <args>` and appends
+  `\n\n<hint>` only if a hint is present; coord's own dispatch-time `brief`
+  carries only the references coord can resolve (the work unit's slug, the PR the
+  predicate names, its block reason, finding ids) and a fixed end-of-session
+  step, so a hintless continuation spawns an agent that knows the command line
+  and those references — on this path, one that does not know why the phase
+  exited. Six labelled lines, **references before
   bodies**, **≤2000 characters**: `Plan: <plan-stem>` / `Why: <≤2 sentences —
   what blocked this phase>` / `PR: <owner/repo#N>` /
   `Blocked: <block_reason_code>[ ×N since <ISO8601>]` /

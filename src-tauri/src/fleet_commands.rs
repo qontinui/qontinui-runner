@@ -3096,6 +3096,8 @@ mod tests {
             SkipReason::Unresolved(String::new()),
             SkipReason::Rejected(String::new()),
             SkipReason::RepoAuthored,
+            SkipReason::OperatorAuthored(String::new()),
+            SkipReason::ServedInPlace,
         ];
         for reason in &roster {
             match reason {
@@ -3105,7 +3107,9 @@ mod tests {
                 | SkipReason::WriteFailed(_)
                 | SkipReason::Unresolved(_)
                 | SkipReason::Rejected(_)
-                | SkipReason::RepoAuthored => {}
+                | SkipReason::RepoAuthored
+                | SkipReason::OperatorAuthored(_)
+                | SkipReason::ServedInPlace => {}
             }
             let spelled = format!("`{}`", reason.wire().replace('_', "-"));
             assert!(

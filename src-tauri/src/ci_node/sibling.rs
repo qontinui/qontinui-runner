@@ -694,6 +694,9 @@ fn clone_url(repo: &str) -> String {
 struct ApiAnswer {
     status: u16,
     body: String,
+    /// GitHub refused this for RATE, not permission — decided at the door by
+    /// the crate's one classifier, `github_budget::is_rate_limited_refusal`.
+    rate_limited: bool,
 }
 
 /// The budget-histogram label for every GitHub read this module makes.
@@ -739,7 +742,19 @@ async fn api_get(client: &reqwest::Client, url: &str, token: Option<&str>) -> Op
 
     let status = resp.status().as_u16();
     let headers = resp.headers().clone();
-    github_budget::record_response(BUDGET_CONSUMER, url, cache_mode, status, &headers);
+    let rate_limited = github_budget::is_rate_limited_refusal(
+        status,
+        github_budget::parse_retry_after(&headers),
+        github_budget::parse_rate_limit(&headers).remaining,
+    );
+    github_budget::record_response(
+        &github_budget::CredentialKey::of_optional_token(token),
+        BUDGET_CONSUMER,
+        url,
+        cache_mode,
+        status,
+        &headers,
+    );
 
     if status == 304 {
         // Free. Replay, and report the 200 the cached body stands for — no
@@ -750,6 +765,7 @@ async fn api_get(client: &reqwest::Client, url: &str, token: Option<&str>) -> Op
             return Some(ApiAnswer {
                 status: 200,
                 body: String::from_utf8_lossy(&body).into_owned(),
+                rate_limited: false,
             });
         }
         // Validator held, body evicted. UNKNOWN rather than a guess: `expect_ok`
@@ -776,7 +792,11 @@ async fn api_get(client: &reqwest::Client, url: &str, token: Option<&str>) -> Op
         CacheAction::LeaveAlone => {}
     }
 
-    Some(ApiAnswer { status, body })
+    Some(ApiAnswer {
+        status,
+        body,
+        rate_limited,
+    })
 }
 
 /// Turn an answer into either its body or an UNKNOWN hard-fail. `404` is left
@@ -789,13 +809,15 @@ fn expect_ok(what: &str, answer: Option<ApiAnswer>) -> Result<ApiAnswer, String>
              'no declaration' — refusing to guess a sibling tree."
         ));
     };
-    match a.status {
-        200 => Ok(a),
-        403 | 429 => Err(format!(
+    if a.rate_limited {
+        return Err(format!(
             "{what}: rate-limited (HTTP {}). UNKNOWN, not 'no declaration'. Set GITHUB_TOKEN/\
              GH_TOKEN or authenticate `gh` on this device to raise the limit.",
             a.status
-        )),
+        ));
+    }
+    match a.status {
+        200 => Ok(a),
         404 => Ok(a),
         s => Err(format!(
             "{what}: unexpected HTTP {s}. UNKNOWN — refusing to guess."
@@ -1245,6 +1267,32 @@ pub(crate) async fn provision(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A rate refusal is reported as rate-limited only when the crate's one
+    /// classifier said so at the door; a permission 403 is not mislabelled.
+    #[test]
+    fn expect_ok_reports_rate_limits_by_the_shared_classifier_only() {
+        let answer = |status, rate_limited| {
+            Some(ApiAnswer {
+                status,
+                body: String::new(),
+                rate_limited,
+            })
+        };
+        let rl = expect_ok("probe", answer(429, true))
+            .err()
+            .expect("refused");
+        assert!(rl.contains("rate-limited"), "{rl}");
+        let rl = expect_ok("probe", answer(403, true))
+            .err()
+            .expect("refused");
+        assert!(rl.contains("rate-limited"), "{rl}");
+        let perm = expect_ok("probe", answer(403, false))
+            .err()
+            .expect("refused");
+        assert!(!perm.contains("rate-limited"), "{perm}");
+        assert!(perm.contains("HTTP 403"), "{perm}");
+    }
 
     /// Shim shadowing [`super::resolve_declaration`] with the SAFE default —
     /// trailing siblings declined. Every case that predates the

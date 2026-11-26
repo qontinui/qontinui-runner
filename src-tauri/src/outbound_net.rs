@@ -1060,6 +1060,11 @@ mod tests {
     }
 
     /// An origin that refuses every upgrade 401.
+    #[expect(
+        clippy::result_large_err,
+        reason = "the refusing closure's `Result<Response, ErrorResponse>` is \
+                  tungstenite's `Callback` signature, not ours to box"
+    )]
     async fn spawn_unauthorized_origin() -> u16 {
         use tokio_tungstenite::tungstenite::handshake::server::{
             ErrorResponse, Request as SReq, Response as SResp,

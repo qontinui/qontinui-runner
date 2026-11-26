@@ -248,22 +248,59 @@ fn resolve_exclude(base: &Path) -> Option<(PathBuf, String)> {
     Some((exclude, prefix.to_string()))
 }
 
+/// The trimmed, non-comment lines INSIDE this module's blocks: from each
+/// [`PROVISIONED_EXCLUDE_MARKER`] to the next comment line. Only these are
+/// candidates for pruning, so a person's own line naming the same path, and
+/// another writer's block, are never removed.
+fn block_lines(existing: &str) -> impl Iterator<Item = &str> {
+    let mut in_block = false;
+    existing.lines().filter_map(move |line| {
+        let t = line.trim();
+        if t.starts_with('#') {
+            in_block = t == PROVISIONED_EXCLUDE_MARKER;
+            None
+        } else if in_block {
+            Some(t)
+        } else {
+            None
+        }
+    })
+}
+
 /// Bring `exclude_path` up to date: drop every line `stale` flags, and append
 /// every pattern of `patterns` not already present as a whole (trimmed) line,
 /// under [`PROVISIONED_EXCLUDE_MARKER`]. Returns `(appended, pruned)`.
+///
+/// Holds [`crate::fleet::info_exclude_lock`] across the whole
+/// read-modify-write, like every other in-process writer of an
+/// `info/exclude` (the machine-local roster heal and the shared-branch
+/// allocation block), so neither this pass nor theirs loses the other's edit.
+/// The file is read through [`crate::fleet::read_info_exclude`]: one that
+/// exists but cannot be read, or is not UTF-8, is an `Err` and is never
+/// rewritten.
+///
+/// `stale` stats paths under the session cwd, which can sit on a slow mount,
+/// so the whole block is judged from an unlocked read first and the locked
+/// pass considers only the lines judged stale there (usually none). Each of
+/// those is judged AGAIN under the lock before it is pruned, so a path a
+/// concurrent pass re-created between the two reads keeps its line. A line
+/// that appeared between the two reads was not judged and is kept; the next
+/// pass judges it.
 fn update_exclude(
     exclude_path: &Path,
     patterns: &[String],
     stale: impl Fn(&str) -> bool,
 ) -> std::io::Result<(usize, usize)> {
-    let existing = match std::fs::read_to_string(exclude_path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e),
+    let judged_stale: std::collections::HashSet<String> = {
+        let unlocked =
+            crate::fleet::read_info_exclude(exclude_path).map_err(std::io::Error::other)?;
+        block_lines(&unlocked)
+            .filter(|t| stale(t))
+            .map(str::to_string)
+            .collect()
     };
-    // Only lines INSIDE this module's block are candidates for pruning — from
-    // the marker to the next comment line — so a person's own line naming the
-    // same path is never removed.
+    let _excl = crate::fleet::info_exclude_lock();
+    let existing = crate::fleet::read_info_exclude(exclude_path).map_err(std::io::Error::other)?;
     let mut in_block = false;
     let mut kept: Vec<&str> = Vec::new();
     let mut pruned = 0usize;
@@ -271,7 +308,7 @@ fn update_exclude(
         let t = line.trim();
         if t.starts_with('#') {
             in_block = t == PROVISIONED_EXCLUDE_MARKER;
-        } else if in_block && stale(t) {
+        } else if in_block && judged_stale.contains(t) && stale(t) {
             pruned += 1;
             continue;
         }
@@ -307,10 +344,13 @@ fn update_exclude(
         std::fs::create_dir_all(parent)?;
     }
     if pruned > 0 {
-        // Rare: a whole-file rewrite, only when something went stale. Like
-        // `fleet::ensure_repo_info_exclude`'s rewrite, it can lose a line a
-        // concurrent writer appended between the read and the write; the next
-        // pass of that writer re-adds it.
+        // Rare: a whole-file rewrite, only when something went stale. The
+        // exclude lock keeps every in-process writer out between the read and
+        // the write; a writer in ANOTHER runner process can still append in
+        // that window and lose it. The roster heal and this module re-add
+        // their lines on their next pass. A shared-branch allocation block is
+        // added once and is NOT re-added: its restore then reads the checkout
+        // as Dirty and keeps it, which is the safe side.
         // A marker left with no entry under it (every line of its block was
         // pruned) is dropped too, so repeated prunes do not pile up headers.
         let mut lines: Vec<&str> = Vec::with_capacity(kept.len());
@@ -354,10 +394,11 @@ fn update_exclude(
         }
     } else {
         // The common path appends, so it never drops another writer's lines.
-        // It does not protect THIS append from a concurrent whole-file rewrite
-        // (`fleet::ensure_repo_info_exclude`, or a pruning pass), which can
-        // drop it; the next spawn re-adds it. Two concurrent appends can at
-        // worst repeat a line, which git ignores.
+        // Under the exclude lock no in-process whole-file rewrite (the roster
+        // heal, the shared-branch block's add / remove / sweep, or a pruning
+        // pass) can interleave with it; one in another runner process can
+        // still drop it, and the next spawn re-adds it. Two concurrent appends
+        // across processes can at worst repeat a line, which git ignores.
         if !existing.is_empty() && !existing.ends_with('\n') {
             chunk.insert(0, '\n');
         }
@@ -788,5 +829,175 @@ mod tests {
         );
         assert_eq!(escape_pattern("a ").unwrap(), "/a\\ ");
         assert!(escape_pattern("a\nb").is_none());
+    }
+
+    /// The update's read-modify-write runs under
+    /// [`crate::fleet::info_exclude_lock`]: a line another writer appends while
+    /// holding the lock survives this update's whole-file prune rewrite. A
+    /// writer that read the file before taking the lock would rewrite from
+    /// that stale read and drop the appended line. (The 300 ms hold lets the
+    /// writer thread reach the lock; on a box too loaded to schedule it in
+    /// that window a lock-free regression could pass one run, but correct
+    /// code never fails.)
+    #[test]
+    fn a_line_appended_under_the_lock_survives_a_prune_rewrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exclude = tmp.path().join("info").join("exclude");
+        let seeded = format!("# a person's own line\n{PROVISIONED_EXCLUDE_MARKER}\n/gone\n");
+        write(&exclude, &seeded);
+
+        let held = crate::fleet::info_exclude_lock();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let writer = {
+            let exclude = exclude.clone();
+            std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                update_exclude(&exclude, &[], |line| line == "/gone")
+            })
+        };
+        started_rx.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(
+            std::fs::read_to_string(&exclude).unwrap(),
+            seeded,
+            "nothing is written while another writer holds the exclude lock"
+        );
+        // Another writer's edit, made under the lock.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&exclude)
+                .unwrap();
+            f.write_all(b"# another writer\n/foreign\n").unwrap();
+        }
+        drop(held);
+
+        assert_eq!(writer.join().unwrap().unwrap(), (0, 1));
+        let lines: Vec<String> = std::fs::read_to_string(&exclude)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                "# a person's own line".to_string(),
+                "# another writer".to_string(),
+                "/foreign".to_string(),
+            ],
+            "the stale line is pruned (and its empty marker with it) and the line \
+             appended under the lock survives"
+        );
+    }
+
+    /// A file that cannot be read faithfully is refused, never rewritten:
+    /// content that is not UTF-8 is left byte-identical. (It was refused before
+    /// `read_info_exclude` too; this guards against a lossy or empty-string
+    /// fallback, under which the prune would rewrite the file.)
+    #[test]
+    fn a_non_utf8_exclude_is_left_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exclude = tmp.path().join("info").join("exclude");
+        std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+        let bytes = b"# mine\n/keep\xff\n".to_vec();
+        std::fs::write(&exclude, &bytes).unwrap();
+        let res = update_exclude(&exclude, &["/.claude/commands/gate.md".to_string()], |_| {
+            true
+        });
+        assert!(res.is_err(), "{res:?}");
+        assert_eq!(std::fs::read(&exclude).unwrap(), bytes);
+    }
+
+    /// A line judged stale from the unlocked read is judged again under the
+    /// lock: if its path came back in between (a concurrent pass re-wrote the
+    /// file and found the line already present), the line is kept.
+    #[test]
+    fn a_line_whose_path_came_back_before_the_lock_is_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exclude = tmp.path().join("info").join("exclude");
+        let seeded = format!("{PROVISIONED_EXCLUDE_MARKER}\n/back\n");
+        write(&exclude, &seeded);
+        // Stale at the unlocked judgement, present again by the locked one.
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let res = update_exclude(&exclude, &[], |line| {
+            line == "/back" && calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
+        });
+        assert_eq!(res.unwrap(), (0, 0));
+        assert_eq!(std::fs::read_to_string(&exclude).unwrap(), seeded);
+    }
+
+    /// The cross-module contract with the shared-branch allocation block
+    /// (`agent_worktree::shared_branch_restore`): this module's prune rewrite
+    /// (which also turns CRLF into LF) keeps that block intact, and that
+    /// block's byte-exact removal leaves this module's lines alone.
+    #[test]
+    fn a_prune_keeps_a_shared_branch_block_and_its_removal_keeps_these_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        let exclude = tmp.path().join(".git").join("info").join("exclude");
+        write(&exclude, "# mine\r\n/keep\r\n");
+        let commands = tmp.path().join(".claude").join("commands");
+        std::fs::create_dir_all(&commands).unwrap();
+
+        provision(&commands, &["a.md", "b.md"]);
+        crate::agent_worktree::shared_branch_restore::add_allocation_excludes_for_test(
+            tmp.path(),
+            "agent/x",
+        );
+        let with_block = std::fs::read_to_string(&exclude).unwrap();
+        assert!(with_block.contains("agent/x"), "{with_block:?}");
+
+        // b.md goes away, so the next pass prunes its line: a whole-file rewrite.
+        std::fs::remove_file(commands.join("b.md")).unwrap();
+        let tracked = TrackedPaths::probe(&commands);
+        exclude_written_paths("test", &commands, &[PathBuf::from("a.md")], &tracked);
+        let pruned = std::fs::read_to_string(&exclude).unwrap();
+        assert!(!pruned.contains("/.claude/commands/b.md"), "{pruned:?}");
+        assert!(pruned.contains("/.claude/commands/a.md"), "{pruned:?}");
+        // The shared-branch block came through the rewrite whole: both its
+        // bracketing lines and every entry, now LF-terminated.
+        let pruned_lines: Vec<&str> = pruned.lines().collect();
+        assert_eq!(
+            pruned_lines
+                .iter()
+                .filter(|l| l.contains("agent/x"))
+                .count(),
+            2,
+            "begin and end lines survive the prune: {pruned:?}"
+        );
+        for entry in [".claude/commands/", ".claude/skills/", ".claude/agents/"] {
+            assert!(
+                pruned_lines.contains(&entry),
+                "{entry} survives: {pruned:?}"
+            );
+        }
+        assert!(
+            !pruned.contains('\r'),
+            "the prune rewrite is LF: {pruned:?}"
+        );
+
+        crate::agent_worktree::shared_branch_restore::remove_allocation_excludes(
+            tmp.path(),
+            "agent/x",
+        );
+        let lines = exclude_lines(tmp.path());
+        assert!(
+            !lines.iter().any(|l| l.contains("agent/x")),
+            "the block is removed whole: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l == ".claude/commands/"),
+            "the block's entries leave with it: {lines:?}"
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "# mine".to_string(),
+                "/keep".to_string(),
+                PROVISIONED_EXCLUDE_MARKER.to_string(),
+                "/.claude/commands/a.md".to_string(),
+            ]
+        );
     }
 }

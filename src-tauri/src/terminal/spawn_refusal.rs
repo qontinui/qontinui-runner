@@ -491,8 +491,8 @@ mod tests {
     }
 
     /// A source file split for the scan: every line kept at its own index (so
-    /// a site's line number is true), with `//` lines blanked — a comment
-    /// naming a guard cannot satisfy the check — and the BODY of every
+    /// a site's line number is true), with `//` COMMENT lines blanked — a
+    /// comment naming a guard cannot satisfy the check — and the BODY of every
     /// `#[cfg(test)] mod x { … }` block blanked into `test_lines`. Only a block
     /// is skipped: a `#[cfg(test)] mod x;` DECLARATION hides nothing, and the
     /// production code below it is scanned (it used to truncate the file at
@@ -502,14 +502,34 @@ mod tests {
     /// A skipped block must close on a line that is exactly `}` at the `mod`
     /// line's own indentation; anything else is a lost brace count, recorded in
     /// `errors` so the scan fails loudly instead of hiding production code.
+    ///
+    /// A line is a comment line only when it STARTS IN CODE
+    /// (`starts_in_code`, from one [`BraceLexer`] pass over the raw lines): a
+    /// line of a multi-line string that happens to begin with `//` is string
+    /// text, and blanking it would hide the string's closing quote from every
+    /// later lexer pass, which would then read the code after it as string.
     struct ScannedSource {
         production: Vec<String>,
         test_lines: Vec<String>,
         errors: Vec<String>,
+        /// Per raw line: does it begin outside any string, char literal or
+        /// block comment?
+        starts_in_code: Vec<bool>,
     }
 
     fn scan_source(src: &str) -> ScannedSource {
         let lines: Vec<&str> = src.lines().collect();
+        let starts_in_code: Vec<bool> = {
+            let mut lexer = BraceLexer::default();
+            lines
+                .iter()
+                .map(|l| {
+                    let at_start = lexer.in_code();
+                    lexer.feed(l);
+                    at_start
+                })
+                .collect()
+        };
         let mut production = Vec::with_capacity(lines.len());
         let mut test_lines = Vec::new();
         let mut errors = Vec::new();
@@ -571,7 +591,7 @@ mod tests {
                 continue;
             }
             let l = lines[i];
-            production.push(if l.trim_start().starts_with("//") {
+            production.push(if starts_in_code[i] && l.trim_start().starts_with("//") {
                 String::new()
             } else {
                 l.to_string()
@@ -582,6 +602,7 @@ mod tests {
             production,
             test_lines,
             errors,
+            starts_in_code,
         }
     }
 
@@ -673,10 +694,20 @@ mod tests {
     ];
 
     /// The reason of a `// door-scan: <kind>(<reason>)` COMMENT line — a line
-    /// that is the comment and nothing else, so the text inside a string or
-    /// after code never counts. `Ok(None)` when the line is no such marker,
-    /// `Err` when its reason is not in `allowed`.
-    fn marker_reason(line: &str, kind: &str, allowed: &[&str]) -> Result<Option<String>, String> {
+    /// that STARTS IN CODE (`starts_in_code`, see [`ScannedSource`]) and is the
+    /// comment and nothing else, so the text inside a string — on one line or
+    /// on a line of a multi-line string — or after code never counts.
+    /// `Ok(None)` when the line is no such marker, `Err` when its reason is not
+    /// in `allowed`.
+    fn marker_reason(
+        line: &str,
+        starts_in_code: bool,
+        kind: &str,
+        allowed: &[&str],
+    ) -> Result<Option<String>, String> {
+        if !starts_in_code {
+            return Ok(None);
+        }
         let Some(rest) = line.trim().strip_prefix(&format!("// door-scan: {kind}(")) else {
             return Ok(None);
         };
@@ -692,8 +723,8 @@ mod tests {
 
     /// `Ok(Some(reason))` for a well-formed keep marker, `Ok(None)` for no
     /// marker, `Err` for an unknown reason.
-    fn keep_marker(line: &str) -> Result<Option<String>, String> {
-        marker_reason(line, "keep", KEEP_REASONS)
+    fn keep_marker(line: &str, starts_in_code: bool) -> Result<Option<String>, String> {
+        marker_reason(line, starts_in_code, "keep", KEEP_REASONS)
     }
 
     /// The exit kind a keep reason is tied to, if any: `retry` belongs on a
@@ -894,23 +925,31 @@ mod tests {
     /// The column of the first `Err(` on a CODE line that sits in VALUE
     /// position: at the start of the line, or right after `=>`, `{` or `;`
     /// (whitespace-insensitive) — an arm's value or a block's tail — and is
-    /// not itself an arm PATTERN (its closing paren followed by `=>`).
+    /// not itself an arm PATTERN (its closing paren followed by `=>`). A
+    /// `Result::` type path in front (`Result::Err(`,
+    /// `std::result::Result::Err(`, `Result::<T, E>::Err(`) is the same
+    /// variant and is read through;
+    /// any other prefix (`map_err(`, `io::Err(`, `MyResult::Err(`) ends in an
+    /// identifier character or `:`, which is in no value position. An `Err(`
+    /// whose `{` opens a closure body (`|e| { Err(e) }`) is the CLOSURE's
+    /// value, not the door's, and is not counted.
     ///
-    /// Known limit, deliberately not chased: a tail whose value is not a
-    /// literal `Err(..)` (a variable holding one, `res.map_err(..)`, a call
-    /// returning one) is not seen. The door fns' refusal arms are all written
-    /// as literal `Err(..)`, and a door with no visible exit at all fails the
-    /// zero-exit rule rather than passing silently.
+    /// Known limits, deliberately not chased:
+    /// - a tail whose value is not a literal `Err(..)` (a variable holding
+    ///   one, `res.map_err(..)`, a call returning one) is not seen. The door
+    ///   fns' refusal arms are all written as literal `Err(..)`, and a door
+    ///   with no visible exit at all fails the zero-exit rule rather than
+    ///   passing silently;
+    /// - a closure body is recognised only when its `|…|` and `{` share the
+    ///   `Err(`'s line. A closure body spread over several lines, or one
+    ///   behind a return type (`|e| -> R {`), still counts as an exit — it
+    ///   fails loud (a spurious red), never silent.
     fn value_position_err(l: &str) -> Option<usize> {
-        let ident = |c: char| c.is_alphanumeric() || c == '_' || c == ':';
         l.match_indices("Err(").map(|(i, _)| i).find(|&i| {
-            let before = l.get(..i).unwrap_or_default().trim_end();
-            if before.chars().next_back().is_some_and(ident) {
-                return false; // `map_err(`, `io::Err(`…: not a bare `Err(`
-            }
+            let before = strip_result_path(l.get(..i).unwrap_or_default()).trim_end();
             let in_value = before.is_empty()
                 || before.ends_with("=>")
-                || before.ends_with('{')
+                || (before.ends_with('{') && !opens_closure_body(before))
                 || before.ends_with(';');
             if !in_value {
                 return false;
@@ -937,6 +976,60 @@ mod tests {
                 .trim_start();
             !after.starts_with("=>")
         })
+    }
+
+    /// `before` (the text ahead of an `Err(`) with a trailing `Result::` type
+    /// path removed — `Result::`, `std::result::Result::`, any `a::b::Result::`,
+    /// each with or without a turbofish (`Result::<T, E>::`) — so
+    /// `Result::Err(` is judged as a bare `Err(`. Anything else, including a
+    /// type that merely ends in `Result` (`MyResult::`), is returned as is.
+    fn strip_result_path(before: &str) -> &str {
+        let ident = |c: char| c.is_alphanumeric() || c == '_';
+        let Some(mut rest) = strip_turbofish(before).strip_suffix("Result::") else {
+            return before;
+        };
+        if rest.ends_with(ident) {
+            return before;
+        }
+        while let Some(r) = rest.strip_suffix("::") {
+            rest = r.trim_end_matches(ident);
+        }
+        rest
+    }
+
+    /// `before` with a trailing turbofish `::<…>::` cut back to its leading
+    /// `::` (`Result::<T, E>::` → `Result::`), matching the angle brackets so a
+    /// nested `Vec<u8>` argument is skipped whole. Returned as is when it does
+    /// not end in one.
+    fn strip_turbofish(before: &str) -> &str {
+        let Some(generic) = before.strip_suffix("::").filter(|g| g.ends_with('>')) else {
+            return before;
+        };
+        let mut depth = 0i32;
+        for (k, c) in generic.char_indices().rev() {
+            match c {
+                '>' => depth += 1,
+                '<' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return match generic.get(..k) {
+                            Some(head) if head.ends_with("::") => head,
+                            _ => before,
+                        };
+                    }
+                }
+                _ => {}
+            }
+        }
+        before
+    }
+
+    /// Does `before` — text ending in `{` — open a closure body, the `{`
+    /// right after a `|…|` parameter list (`|e| {`, `move |e| {`, `|| {`)?
+    fn opens_closure_body(before: &str) -> bool {
+        before
+            .strip_suffix('{')
+            .is_some_and(|b| b.trim_end().ends_with('|'))
     }
 
     /// The four tail forms a refusal arm is written in are all exits; a
@@ -978,6 +1071,108 @@ mod tests {
         .map(|s| s.to_string())
         .collect();
         assert_eq!(early_exits(&code_lines(&lines), 0, 5), vec![2, 3]);
+    }
+
+    /// A refusal tail spelled through its type path — `Result::Err(e)` or
+    /// `std::result::Result::Err(e)` — is an exit like a bare `Err(e)`, so a
+    /// door ending in one with no removal is reported (follow-up edge
+    /// `efb77492`).
+    #[test]
+    fn a_result_path_err_tail_without_its_removal_is_reported() {
+        for tail in [
+            "Result::Err(e)",
+            "std::result::Result::Err(e)",
+            "Result::<(), String>::Err(e)",
+            "std::result::Result::<Vec<u8>, E>::Err(e)",
+        ] {
+            let src = format!(
+                "fn door() {{\n    let ctx = acquire();\n    match spawn() {{\n        Ok(c) => \
+                 {{\n            // door-scan: keep(spawned) running\n            return Ok(c);\n        \
+                 }}\n        Err(e) => {{\n            {tail}\n        }}\n    }}\n}}\n"
+            );
+            let found = exits_of(&src);
+            assert_eq!(found.len(), 1, "{tail}: {found:?}");
+            assert!(found[0].contains(tail), "{tail}: {found:?}");
+            let removed = src.replace(
+                &format!("            {tail}\n"),
+                &format!("            remove_unspawned(ctx);\n            {tail}\n"),
+            );
+            assert!(
+                exits_of(&removed).is_empty(),
+                "{tail}: {:?}",
+                exits_of(&removed)
+            );
+        }
+        // A type that merely ends in `Result` is not the std path.
+        assert!(value_position_err("        MyResult::Err(e)").is_none());
+        assert!(value_position_err("        io::Err(e)").is_none());
+    }
+
+    /// A `door-scan:` marker line inside a multi-line string literal (plain or
+    /// raw) is string text, not a marker: it neither declares a keep for the
+    /// exit below it nor a no-exits for the door (follow-up edge `cc184737`).
+    /// The marker half is what pins the `starts_in_code` change — it was red
+    /// before it. The `Err(e)` line beside it is a control: the lexer already
+    /// dropped string contents, so that half passed before and after, and it
+    /// stays to keep a string-borne `Err(` from ever counting as an exit.
+    #[test]
+    fn a_marker_inside_a_multi_line_string_is_not_a_marker() {
+        for (open, close) in [("\"", "\""), ("r#\"", "\"#")] {
+            let keep = format!(
+                "fn door() {{\n    let ctx = acquire();\n    let s = {open}\nErr(e)\n// door-scan: \
+                 keep(post-child) x\n{close}; if s.is_empty() {{ return Err(2); }}\n    run(ctx, \
+                 s);\n}}\n"
+            );
+            let found = exits_of(&keep);
+            assert_eq!(found.len(), 1, "{open}: {found:?}");
+            assert!(found[0].contains("return Err(2)"), "{open}: {found:?}");
+            let no_exits = format!(
+                "fn door() {{\n    let ctx = acquire();\n    let s = {open}\nErr(e)\n// door-scan: \
+                 no-exits(infallible) x\n{close};\n    run(ctx, s);\n}}\n"
+            );
+            let found = exits_of(&no_exits);
+            assert!(
+                found.iter().any(|e| e.contains("NO exit")),
+                "{open}: {found:?}"
+            );
+        }
+    }
+
+    /// A string line that starts with `//` and holds the string's closing
+    /// quote is string text: blanking it as a comment desynced the lexer, which
+    /// then read the code after it as string and lost the exit there.
+    #[test]
+    fn a_string_line_starting_with_slashes_keeps_the_lexer_in_sync() {
+        for (open, close) in [("\"", "\""), ("r#\"", "\"#")] {
+            let src = format!(
+                "fn door() {{\n    let ctx = acquire();\n    let s = {open}\n//{close};\n    \
+                 return Err(2);\n}}\n"
+            );
+            let found = exits_of(&src);
+            assert_eq!(found.len(), 1, "{open}: {found:?}");
+            assert!(found[0].contains("return Err(2)"), "{open}: {found:?}");
+            let scanned = scan_source(&src);
+            assert_eq!(scanned.production[3], format!("//{close};"));
+        }
+        // A real `//` comment line is still blanked.
+        let scanned = scan_source("fn f() {\n    // return Err(x);\n}\n");
+        assert_eq!(scanned.production[1], "");
+    }
+
+    /// An `Err(` that is a closure body's value (`|e| { Err(e) }`) leaves the
+    /// closure, not the door: it is not a door exit.
+    #[test]
+    fn a_closure_body_err_is_not_a_door_exit() {
+        for l in [
+            "    let r = run().or_else(|e| { Err(e) });",
+            "    let r = run().or_else(move |e| { Err(e) });",
+            "    let r = run().or_else(|| { Err(1) });",
+        ] {
+            assert!(value_position_err(l).is_none(), "not an exit: {l}");
+        }
+        let src = "fn door() {\n    let ctx = acquire();\n    let r = run().or_else(|e| { Err(e) \
+                   });\n    // door-scan: no-exits(infallible) x\n    use_it(ctx, r);\n}\n";
+        assert!(exits_of(src).is_empty(), "{:?}", exits_of(src));
     }
 
     /// The window check catches what it must and nothing in strings: a
@@ -1652,7 +1847,11 @@ mod tests {
         name: &str,
         anchor: Option<&str>,
     ) -> Vec<String> {
-        let production = production_code_lines(&raw.join("\n"));
+        let ScannedSource {
+            production,
+            starts_in_code,
+            ..
+        } = scan_source(&raw.join("\n"));
         let Some(open) = production
             .iter()
             .position(|l| opens_fn(l) && fn_name(l) == name)
@@ -1680,8 +1879,8 @@ mod tests {
         );
         let exits = early_exits(&code, from, end + 1);
         let mut no_exits = false;
-        for line in raw.iter().take(end + 1).skip(from + 1) {
-            match marker_reason(line, "no-exits", NO_EXIT_REASONS) {
+        for (line, &in_code) in raw.iter().zip(&starts_in_code).take(end + 1).skip(from + 1) {
+            match marker_reason(line, in_code, "no-exits", NO_EXIT_REASONS) {
                 Ok(Some(_)) => no_exits = true,
                 Ok(None) => {}
                 Err(why) => out.push(format!("{file}: `{name}`: {why}")),
@@ -1704,7 +1903,10 @@ mod tests {
                     })
                 })
             });
-            let declared = match e.checked_sub(1).map(|a| keep_marker(&raw[a])) {
+            let declared = match e
+                .checked_sub(1)
+                .map(|a| keep_marker(&raw[a], starts_in_code[a]))
+            {
                 Some(Ok(Some(reason))) => {
                     if let Err(why) = reason_fits_exit(&reason, &code[e], ce) {
                         out.push(format!("{file}:{}: {why}", e + 1));

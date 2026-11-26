@@ -100,6 +100,44 @@ pub struct IsolatedEditContext {
     // Worktrees `remove_unspawned` took off disk. `Drop`'s fs-observer push
     // and edit-effect verify skip them: both would read a tree that is gone.
     removed_worktrees: Vec<PathBuf>,
+
+    // How long `Drop`'s credential cleanup waits for an install still in
+    // flight before aborting it (and cleaning up anyway). Always
+    // [`crate::credential_helper::CLEANUP_INSTALL_WAIT`] in production; a
+    // field so a test can drive the abort arm through `Drop` itself.
+    cred_cleanup_wait: std::time::Duration,
+}
+
+/// Test-only record of the worktrees each `Drop` handed to its fs-observer push
+/// and edit-effect verify (both producers iterate the SAME list), keyed by the
+/// context's agent id. Both producers are flag-gated off by default, so this is
+/// the observable seam for the removed-tree skip.
+#[cfg(test)]
+pub(crate) mod drop_observed_recorder {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
+
+    fn map() -> &'static Mutex<HashMap<String, Vec<PathBuf>>> {
+        static MAP: OnceLock<Mutex<HashMap<String, Vec<PathBuf>>>> = OnceLock::new();
+        MAP.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(crate) fn record(agent_id: &str, observed: Vec<PathBuf>) {
+        map()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(agent_id.to_string(), observed);
+    }
+
+    /// What the `Drop` of `agent_id`'s context handed to the producers, if it
+    /// has run. Removes the entry.
+    pub(crate) fn take(agent_id: &str) -> Option<Vec<PathBuf>> {
+        map()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(agent_id)
+    }
 }
 
 impl Drop for IsolatedEditContext {
@@ -130,9 +168,16 @@ impl Drop for IsolatedEditContext {
                 .any(|r| super::canonical_paths::paths_equal(r, &w.worktree_path))
         };
 
+        let observed: Vec<&MaterializedWorktree> = self.worktrees.iter().filter(on_disk).collect();
+        #[cfg(test)]
+        drop_observed_recorder::record(
+            &self.agent_id,
+            observed.iter().map(|w| w.worktree_path.clone()).collect(),
+        );
+
         if super::fs_observer::fs_observer_enabled() {
             let correlation_id = Some(uuid::Uuid::new_v4());
-            for w in self.worktrees.iter().filter(on_disk) {
+            for w in &observed {
                 super::fs_observer::spawn_push_worktree_observations(
                     self.coord_http_base.clone(),
                     w.worktree_path.clone(),
@@ -153,7 +198,7 @@ impl Drop for IsolatedEditContext {
         // (default off, flips with `QONTINUI_FS_OBSERVER_ENABLED` once quiet)
         // and drop-safe: it spawns onto the current runtime, never blocking
         // `Drop` — same mechanism the fs_observations push uses.
-        for w in self.worktrees.iter().filter(on_disk) {
+        for w in &observed {
             super::edit_effect_loop::spawn_verify(
                 self.coord_http_base.clone(),
                 w.worktree_path.clone(),
@@ -186,7 +231,10 @@ impl Drop for IsolatedEditContext {
         // Detached-thread form: `Drop` must neither block a Tokio worker on
         // `git config` subprocesses nor risk a panic-during-unwind.
         for id in std::iter::once(&self.agent_id).chain(self.extra_cred_agent_ids.iter()) {
-            crate::credential_helper::spawn_cleanup_credential_helper(id.clone());
+            crate::credential_helper::spawn_cleanup_credential_helper_within(
+                id.clone(),
+                self.cred_cleanup_wait,
+            );
         }
 
         // Stop EVERY heartbeat first so no tick races with a release POST.
@@ -203,12 +251,30 @@ impl Drop for IsolatedEditContext {
         // panics ("no reactor running"), and a panic during unwind aborts the
         // process (SIGABRT). Release is best-effort, so skipping it when no
         // runtime is present is the safe degrade; coord's TTL reaps the claim.
+        //
+        // Before any release: take out the `.claude/` exclude block each
+        // shared-branch allocation added to its canonical checkout
+        // (`shared_branch_restore::prepare_canonical_excludes`), under the same
+        // materialize lock the refused-spawn restore holds, so it never
+        // outlives the allocation and is gone before the `canonical_checkout`
+        // lease frees the checkout for a peer.
+        let blocks = self.shared_branch_exclude_blocks();
         let claims = std::mem::take(&mut self.active_claims);
-        if !claims.is_empty() {
+        if !claims.is_empty() || !blocks.is_empty() {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 let base = self.coord_http_base.clone();
                 let mid = self.device_id;
                 handle.spawn(async move {
+                    for (checkout, branch) in blocks {
+                        let lock = super::checkout_materialize_lock(&checkout);
+                        let _serialized = lock.lock().await;
+                        let _ = tokio::task::spawn_blocking(move || {
+                            super::shared_branch_restore::remove_allocation_excludes(
+                                &checkout, &branch,
+                            )
+                        })
+                        .await;
+                    }
                     for claim in claims {
                         release_claim_best_effort(
                             &base,
@@ -220,6 +286,13 @@ impl Drop for IsolatedEditContext {
                         .await;
                     }
                 });
+            } else {
+                // No runtime (a sync test, or a Drop during unwind): no claim
+                // can be released either, but the block is local file state —
+                // remove it in place rather than leave it behind.
+                for (checkout, branch) in blocks {
+                    super::shared_branch_restore::remove_allocation_excludes(&checkout, &branch);
+                }
             }
         }
     }
@@ -404,6 +477,26 @@ impl IsolatedEditContext {
         report
     }
 
+    /// `(canonical checkout, agent branch)` for every shared-branch placement
+    /// of this context that actually switched its checkout — the ones whose
+    /// `.claude/` exclude block `Drop` removes.
+    fn shared_branch_exclude_blocks(&self) -> Vec<(PathBuf, String)> {
+        self.worktrees
+            .iter()
+            .filter_map(|w| {
+                match self
+                    .provenance
+                    .get(&super::worktree_resource_key(&w.worktree_path))
+                {
+                    Some(TreeProvenance::SharedBranch {
+                        branch, prior_ref, ..
+                    }) if prior_ref != branch => Some((w.worktree_path.clone(), branch.clone())),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
     /// Every worktree of this context as the removal judges it: its path, the
     /// `parent_sha` coord recorded for it, and how it was placed.
     pub(crate) fn unspawned_bases(&self) -> Vec<UnspawnedBase> {
@@ -523,6 +616,23 @@ impl IsolatedEditContext {
         // the worktree kind as well means a coexisting phase/file_glob claim is
         // never released here.
         let key = super::worktree_resource_key(&self.worktrees[pos].worktree_path);
+        // A shared-branch row's `.claude/` exclude block leaves with the row,
+        // before its claim does (the same order `Drop` keeps).
+        if let Some(TreeProvenance::SharedBranch {
+            branch, prior_ref, ..
+        }) = self.provenance.get(&key)
+        {
+            if prior_ref != branch {
+                let checkout = self.worktrees[pos].worktree_path.clone();
+                let branch = branch.clone();
+                let lock = super::checkout_materialize_lock(&checkout);
+                let _serialized = lock.lock().await;
+                let _ = tokio::task::spawn_blocking(move || {
+                    super::shared_branch_restore::remove_allocation_excludes(&checkout, &branch)
+                })
+                .await;
+            }
+        }
         let found = self
             .active_claims
             .iter()
@@ -712,6 +822,7 @@ pub async fn acquire(
         edit_loop_declared_paths,
         provenance,
         removed_worktrees: Vec::new(),
+        cred_cleanup_wait: crate::credential_helper::CLEANUP_INSTALL_WAIT,
         extra_cred_agent_ids: Vec::new(),
         spawn_tenant: req.spawn_tenant,
     }))
@@ -885,7 +996,15 @@ async fn materialize_repos(
             Ok((r, placed))
         }
         MaterializeOutcome::SharedBranch(sb) => {
-            let placed = vec![TreeProvenance::SharedBranch; sb.branches.len()];
+            let placed = sb
+                .branches
+                .iter()
+                .map(|b| TreeProvenance::SharedBranch {
+                    branch: b.branch.clone(),
+                    prior_ref: b.prior_ref.clone(),
+                    switched_to_sha: b.switched_to_sha.clone(),
+                })
+                .collect();
             Ok((
                 super::AllocateResult {
                     agent_id: sb.agent_id,
@@ -1214,7 +1333,7 @@ pub async fn acquire_for_terminal(
         }
     };
     if let Some(wd) = &out.0 {
-        provision_session_cwd(wd, out.1.is_some(), spawn_tenant);
+        provision_session_cwd_off_worker(wd, out.1.is_some(), spawn_tenant).await;
     }
     out
 }
@@ -1326,8 +1445,31 @@ pub async fn acquire_for_worker(
             format!("allocate for {repo} returned no worktree"),
         )));
     };
-    provision_session_cwd(&wd, true, spawn_tenant);
+    provision_session_cwd_off_worker(&wd, true, spawn_tenant).await;
     Ok((wd, ctx))
+}
+
+/// [`provision_session_cwd`] run on the blocking pool: the door for every
+/// ASYNC caller.
+///
+/// The pass is synchronous. It writes `.mcp.json`, then probes the cwd with
+/// `git ls-files`, which polls its child with `std::thread::sleep` for up to
+/// 5 s. It then fetches the commands and skills registries on a joined OS
+/// thread. Run inline, all of that holds the async worker it runs on (plan
+/// `2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap`,
+/// D2). Fail-soft like the pass itself: a pass that does not complete is
+/// logged by [`crate::spawn_off_worker::run_provisioning_off_worker`] and the
+/// spawn goes on.
+pub(crate) async fn provision_session_cwd_off_worker(
+    wd: &str,
+    allocated_here: bool,
+    spawn_tenant: Option<uuid::Uuid>,
+) {
+    let owned = wd.to_string();
+    crate::spawn_off_worker::run_provisioning_off_worker(wd, move || {
+        provision_session_cwd(&owned, allocated_here, spawn_tenant)
+    })
+    .await;
 }
 
 /// Provision the per-session cwd artifacts — the coord-mcp `.mcp.json` and the
@@ -1434,34 +1576,107 @@ pub(crate) fn provision_session_cwd(
     provision_fleet_for_cwd(wd);
 }
 
-/// The guarded fleet commands + skills provisioning for one session cwd.
+/// The guarded fleet commands + skills + agent-definitions provisioning for one
+/// session cwd.
 ///
-/// Where the cwd's `.claude/` is repo-authored the skip is RECORDED, not only
-/// logged: one [`crate::capability_manifest::ProvisionReport`] per provisioner
-/// with every bundled unit skipped as [`SkipReason::RepoAuthored`], so the
-/// ledger — and the `[provisioned: …]` token of the session's served-corpus
-/// header line — say the session got none of them and why.
+/// Commands and skills are guarded WHOLE-TREE: where the cwd's `.claude/` is
+/// repo-authored the skip is RECORDED, not only logged — one
+/// [`crate::capability_manifest::ProvisionReport`] per provisioner with every
+/// bundled unit skipped as [`SkipReason::RepoAuthored`], so the ledger — and
+/// the `[provisioned: …]` token of the session's served-corpus header line —
+/// say the session got none of them and why.
+///
+/// Agent definitions are provisioned in the not-repo-authored arm always, and
+/// in the repo-authored arm ONLY when the cwd lies inside an allocated agent
+/// worktree. There their provisioner guards PER NAME
+/// (`provision_guard::KeepDecisions`, decided once before either layer writes):
+/// a definition the repository tracks is kept, and every other embedded
+/// definition is still written — a whole-tree skip would withhold
+/// `code-reviewer.md` and the rest from every agent worktree of a repository
+/// that tracks so much as one `.claude/` path of its own (the qontinui-forge
+/// shape, which tracks only a repo-local `clone-implementer.md`). Outside an
+/// allocated worktree a tracked `.claude/` is an operator's checkout, and
+/// writing untracked agent files into it dirties the operator's tree; there the
+/// pass is not run and ONE skip naming that reason is recorded instead of a
+/// per-name claim.
+///
+/// "An allocated agent worktree" is either layout: the runner's own
+/// `qontinui-worktrees/<id>/<repo>` and the script-allocated
+/// `<workspace_root>/agent-worktrees/<id>/<repo>`
+/// ([`super::canonical_paths::script_allocated_worktree_for_path`]).
+///
+/// Every spawn path whose cwd an operator chooses goes through here (this
+/// chokepoint, and the scheduler's remote-agent launch).
 ///
 /// [`SkipReason::RepoAuthored`]: crate::capability_manifest::SkipReason::RepoAuthored
-fn provision_fleet_for_cwd(wd: &str) {
+pub(crate) fn provision_fleet_for_cwd(wd: &str) {
+    let in_agent_worktree = super::canonical_paths::allocated_worktree_for_path(Path::new(wd))
+        .is_some()
+        || super::canonical_paths::script_allocated_worktree_for_path(Path::new(wd)).is_some();
+    provision_fleet_for_cwd_in(wd, in_agent_worktree);
+}
+
+/// [`provision_fleet_for_cwd`] with the allocated-worktree verdict injected, so
+/// a test can drive both arms without a workspace root.
+fn provision_fleet_for_cwd_in(wd: &str, in_agent_worktree: bool) {
     if claude_tree_is_repo_authored(wd) {
-        info!(
-            workdir = %wd,
-            "fleet provisioning: skipped — this cwd's .claude/ is git-tracked, so the repo \
-             authors its own skills/commands and the bundle must not clobber them"
-        );
         record_repo_authored_skip(wd);
+        if in_agent_worktree {
+            info!(
+                workdir = %wd,
+                "fleet provisioning: commands/skills skipped — this cwd's .claude/ is \
+                 git-tracked, so the repo authors its own skills/commands; agent definitions \
+                 are still provisioned into this allocated agent worktree, guarded per name"
+            );
+            let _ = crate::agent_runtime::provision_agent_definitions_recorded(wd);
+        } else {
+            info!(
+                workdir = %wd,
+                "fleet provisioning: commands/skills/agents skipped — this cwd's .claude/ is \
+                 git-tracked and the cwd is not an allocated agent worktree, so nothing is \
+                 written into this checkout"
+            );
+            record_operator_checkout_agent_skip(wd);
+        }
     } else {
         crate::fleet_commands::provision_fleet_commands_for_session(wd);
         crate::fleet_skills::provision_fleet_skills_for_session(wd);
+        let _ = crate::agent_runtime::provision_agent_definitions_recorded(wd);
     }
 }
 
-/// Record the repo-authored skip against `wd` for both provisioners.
+/// The agent-definitions row for a repo-authored cwd that is NOT an allocated
+/// agent worktree: the pass did not run, so one skip names the destination and
+/// why. Deliberately not one [`SkipReason::RepoAuthored`] per embedded name —
+/// the repository authors none of them; the reason is that this is not a
+/// directory the runner may write agents into.
+///
+/// [`SkipReason::RepoAuthored`]: crate::capability_manifest::SkipReason::RepoAuthored
+fn record_operator_checkout_agent_skip(wd: &str) {
+    use crate::capability_manifest::{record_provision, ProvisionReport};
+
+    let agents_dir = Path::new(wd).join(".claude").join("agents");
+    let report = ProvisionReport::unresolved(
+        "agent_definitions",
+        crate::fleet_agents::embedded_agent_count(),
+        agents_dir.display().to_string(),
+        "not provisioned: this cwd's .claude/ is tracked by its repository and the cwd is \
+         not an allocated agent worktree, so agent definitions are not written into this \
+         checkout",
+    )
+    .with_destination(agents_dir.display().to_string());
+    record_provision(wd, report);
+}
+
+/// Record the repo-authored skip against `wd` for the commands and skills
+/// provisioners.
 ///
 /// The roster is the EMBEDDED bundle — every `FLEET_COMMANDS` entry and every
 /// embedded skill file — not the account-resolved registry: resolving that
-/// would fetch overrides for a pass that writes nothing.
+/// would fetch overrides for a pass that writes nothing. Agent definitions are
+/// not on it: [`provision_fleet_for_cwd_in`] either provisions them under their
+/// own per-name guard (an allocated agent worktree) or records their own skip
+/// ([`record_operator_checkout_agent_skip`]).
 fn record_repo_authored_skip(wd: &str) {
     use crate::capability_manifest::{record_provision, ProvisionReport, Rung, SkipReason};
 
@@ -1666,6 +1881,9 @@ fn read_device_id() -> Result<uuid::Uuid, String> {
 }
 
 #[cfg(test)]
+mod isolated_edit_drop_tests;
+
+#[cfg(test)]
 impl IsolatedEditContext {
     /// Test-only constructor that builds a context with synthetic claims and
     /// NO live heartbeats, bypassing the network acquire path. Used to
@@ -1705,6 +1923,7 @@ impl IsolatedEditContext {
             spawn_tenant: None,
             provenance: HashMap::new(),
             removed_worktrees: Vec::new(),
+            cred_cleanup_wait: crate::credential_helper::CLEANUP_INSTALL_WAIT,
         }
     }
 
@@ -1712,6 +1931,12 @@ impl IsolatedEditContext {
     pub(crate) fn set_provenance_for_test(&mut self, path: &Path, provenance: TreeProvenance) {
         self.provenance
             .insert(super::worktree_resource_key(path), provenance);
+    }
+
+    /// Test-only: point `Drop`'s best-effort claim releases at a local double,
+    /// so a test can observe WHEN the release arrives.
+    pub(crate) fn set_coord_http_base_for_test(&mut self, base: String) {
+        self.coord_http_base = base;
     }
 
     /// Test-only view of the credential-install ids `Drop` will tear down:
@@ -1858,10 +2083,8 @@ mod tests {
         ));
     }
 
-    /// The repo-authored skip is recorded in the ledger — every bundled unit,
-    /// with its own reason — and reaches the served-corpus header line.
-    #[test]
-    fn a_repo_authored_skip_is_recorded_not_only_logged() {
+    /// A git repo at a fresh tempdir with commit identity and no hooks.
+    fn init_repo() -> tempfile::TempDir {
         let td = tempfile::tempdir().expect("tempdir");
         let root = td.path();
         git(root, &["init", "-q"]);
@@ -1869,13 +2092,61 @@ mod tests {
         git(root, &["config", "user.name", "t"]);
         git(root, &["config", "commit.gpgsign", "false"]);
         git(root, &["config", "core.hooksPath", "/dev/null"]);
+        td
+    }
+
+    /// A repo tracking `.claude/commands/policy.md` — repo-authored, no agents.
+    fn tracked_commands_repo() -> tempfile::TempDir {
+        let td = init_repo();
+        let root = td.path();
         std::fs::create_dir_all(root.join(".claude/commands")).unwrap();
         std::fs::write(root.join(".claude/commands/policy.md"), b"canonical").unwrap();
         git(root, &["add", ".claude"]);
         git(root, &["commit", "-qm", "track .claude"]);
+        td
+    }
+
+    /// The agent-definitions row of a non-allocated repo-authored cwd: ONE skip
+    /// naming the reason, not a per-name repo-authored claim.
+    fn assert_honest_operator_checkout_agent_skip(wd: &str) {
+        let ledger = crate::capability_manifest::session_provision_ledger(wd)
+            .expect("the skip is recorded against this workdir");
+        let agents: Vec<_> = ledger
+            .reports
+            .iter()
+            .filter(|r| r.capability == "agent_definitions" || r.capability == "fleet_agents")
+            .collect();
+        assert_eq!(
+            agents.len(),
+            1,
+            "only the agent_definitions skip row, no floor pass: {agents:?}"
+        );
+        let report = agents[0];
+        assert_eq!(report.capability, "agent_definitions");
+        assert_eq!(report.written, 0);
+        assert_eq!(report.skipped.len(), 1, "{:?}", report.skipped);
+        assert!(
+            matches!(
+                &report.skipped[0].reason,
+                crate::capability_manifest::SkipReason::Unresolved(why)
+                    if why.contains("not an allocated agent worktree")
+            ),
+            "{:?}",
+            report.skipped
+        );
+    }
+
+    /// The repo-authored skip is recorded in the ledger — every bundled unit,
+    /// with its own reason — and reaches the served-corpus header line. Agent
+    /// definitions are provisioned there only in an allocated agent worktree;
+    /// an operator's tracked checkout gets none and one honest skip row.
+    #[test]
+    fn a_repo_authored_skip_is_recorded_not_only_logged() {
+        let td = tracked_commands_repo();
+        let root = td.path();
         let wd = root.to_str().unwrap();
 
-        provision_fleet_for_cwd(wd);
+        provision_fleet_for_cwd_in(wd, true);
 
         assert_eq!(
             std::fs::read(root.join(".claude/commands/policy.md")).unwrap(),
@@ -1903,6 +2174,37 @@ mod tests {
             .expect("a skills report");
         assert_eq!(skills.written, 0);
         assert_eq!(skills.skipped.len(), skills.expected);
+        // In an allocated agent worktree agent definitions are NOT skipped
+        // whole-tree: the chokepoint runs their per-name-guarded provisioner, so
+        // this repo (which tracks no agent definition) receives every embedded one.
+        for report in ledger
+            .reports
+            .iter()
+            .filter(|r| r.capability == "agent_definitions" || r.capability == "fleet_agents")
+        {
+            assert!(
+                !report
+                    .skipped
+                    .iter()
+                    .any(|u| u.reason == crate::capability_manifest::SkipReason::RepoAuthored),
+                "{}: no agent definition is skipped as repo-authored: {:?}",
+                report.capability,
+                report.skipped
+            );
+        }
+        assert!(
+            ledger
+                .reports
+                .iter()
+                .any(|r| r.capability == "agent_definitions"),
+            "the agent-definitions pass ran at the chokepoint and was recorded"
+        );
+        for name in crate::fleet_agents::embedded_agent_names() {
+            assert!(
+                root.join(".claude/agents").join(&name).exists(),
+                "{name} is provisioned into an allocated worktree's repo-authored .claude/"
+            );
+        }
 
         let line = crate::served_corpus::probe(root).render_line();
         assert!(
@@ -1911,6 +2213,100 @@ mod tests {
             )),
             "{line}"
         );
+
+        // The same tracked tree, NOT an allocated agent worktree: an operator's
+        // checkout. Commands/skills are skipped exactly as above; agents are not
+        // written at all and the skip says why.
+        let op = tracked_commands_repo();
+        let op_wd = op.path().to_str().unwrap();
+        provision_fleet_for_cwd_in(op_wd, false);
+        assert!(
+            !op.path().join(".claude/agents").exists(),
+            "nothing is written into an operator's tracked checkout"
+        );
+        assert_honest_operator_checkout_agent_skip(op_wd);
+        let op_ledger = crate::capability_manifest::session_provision_ledger(op_wd).unwrap();
+        assert!(op_ledger
+            .reports
+            .iter()
+            .any(|r| r.capability == "fleet_commands"
+                && r.skipped.len() == m_commands
+                && r.skipped
+                    .iter()
+                    .all(|u| u.reason == crate::capability_manifest::SkipReason::RepoAuthored)));
+    }
+
+    /// A repo that tracks ONLY its own agent definition (the qontinui-forge
+    /// shape: a repo-local `clone-implementer.md`) is repo-authored for
+    /// commands/skills. In an allocated agent worktree it still receives every
+    /// OTHER embedded agent at the chokepoint, and its own file is untouched; in
+    /// a non-allocated checkout of the same shape it receives none. The per-name
+    /// guard itself is pinned in `agent_runtime`
+    /// (`provision_agent_defs_still_floor_a_repo_tracking_only_its_own_agent`).
+    #[test]
+    fn a_repo_tracking_only_its_own_agent_still_receives_the_embedded_agents() {
+        fn own_agent_repo() -> tempfile::TempDir {
+            let td = init_repo();
+            let root = td.path();
+            std::fs::create_dir_all(root.join(".claude/agents")).unwrap();
+            std::fs::write(
+                root.join(".claude/agents/clone-implementer.md"),
+                b"# repo-local",
+            )
+            .unwrap();
+            git(root, &["add", ".claude"]);
+            git(root, &["commit", "-qm", "track own agent"]);
+            td
+        }
+
+        let td = own_agent_repo();
+        let root = td.path();
+        let wd = root.to_str().unwrap();
+        assert!(
+            claude_tree_is_repo_authored(wd),
+            "a tracked agent file makes the tree repo-authored"
+        );
+
+        provision_fleet_for_cwd_in(wd, true);
+
+        assert_eq!(
+            std::fs::read(root.join(".claude/agents/clone-implementer.md")).unwrap(),
+            b"# repo-local",
+            "the repo's own agent definition is untouched"
+        );
+        for name in crate::fleet_agents::embedded_agent_names() {
+            if name == "clone-implementer.md" {
+                continue;
+            }
+            assert!(
+                root.join(".claude/agents").join(&name).exists(),
+                "{name} must still be provisioned into an allocated agent worktree"
+            );
+        }
+        assert!(
+            !root.join(".claude/commands").exists(),
+            "commands stay whole-tree skipped in a repo-authored .claude/"
+        );
+
+        // Not an allocated worktree: the operator's own checkout of that shape.
+        let op = own_agent_repo();
+        let op_root = op.path();
+        let op_wd = op_root.to_str().unwrap();
+        provision_fleet_for_cwd_in(op_wd, false);
+        let names: Vec<_> = std::fs::read_dir(op_root.join(".claude/agents"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["clone-implementer.md".to_string()],
+            "no embedded agent is written into a non-allocated tracked checkout"
+        );
+        assert_eq!(
+            std::fs::read(op_root.join(".claude/agents/clone-implementer.md")).unwrap(),
+            b"# repo-local"
+        );
+        assert_honest_operator_checkout_agent_skip(op_wd);
     }
 
     /// The provisioning arm must still fire on the case the feature exists for:

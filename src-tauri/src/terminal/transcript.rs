@@ -4,6 +4,7 @@
 //! types, text blocks, plan content) without any dependency on Claude Code itself.
 
 use crate::str_utils::truncate_str;
+use qontinui_runner_lib::file_tail::read_tail_lossy;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -235,12 +236,24 @@ pub fn find_claude_config_dirs() -> Vec<PathBuf> {
     // bin-side — so it is passed in as the `configured` argument. One rule, two
     // callers; a second copy would be the "kept in sync by shape, not by
     // import" failure mode this tree argues against everywhere else.
-    qontinui_runner_lib::session_archive::discovery::discover_account_homes_from_env(
+    claude_config_dirs_from(
+        &qontinui_runner_lib::session_archive::discovery::ambient_discovery(),
         &crate::settings::get_claude_config_dirs(),
     )
-    .into_iter()
-    .map(|home| home.config_dir)
-    .collect()
+}
+
+/// [`find_claude_config_dirs`] over explicit discovery inputs: `ambient` (what
+/// the machine itself supplies) and the settings roster `configured`. One
+/// composition for every caller, so a test can run it over a temp home.
+pub(crate) fn claude_config_dirs_from(
+    ambient: &qontinui_runner_lib::session_archive::discovery::AmbientDiscovery,
+    configured: &[String],
+) -> Vec<PathBuf> {
+    ambient
+        .discover(configured)
+        .into_iter()
+        .map(|home| home.config_dir)
+        .collect()
 }
 
 /// Claude Code's cap on a sanitized project-dir name. A longer name is cut to
@@ -620,39 +633,6 @@ fn extract_resume_name(content: &str) -> Option<String> {
         .or_else(|| last_summary(content.lines()))
 }
 
-/// Read the last `max` bytes of `path` as a string, dropping the leading
-/// partial line (the seek may land mid-line). Returns the whole file when it is
-/// smaller than `max`. `None` on any I/O error (fail-soft).
-///
-/// `pub(crate)` so the turn-ending shadow reader
-/// ([`crate::turn_ending_shadow`]) can reuse the SAME bounded-tail semantics
-/// instead of writing a second one with subtly different partial-line handling.
-/// It reads with a much larger cap — see that module for why 4 KB is wrong for
-/// classifying a turn's final paragraph.
-#[expect(
-    clippy::string_slice,
-    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
-)]
-pub(crate) fn read_tail_bytes(path: &Path, max: u64) -> Option<String> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = fs::File::open(path).ok()?;
-    let len = file.metadata().ok()?.len();
-    if len <= max {
-        let mut s = String::new();
-        file.read_to_string(&mut s).ok()?;
-        Some(s)
-    } else {
-        file.seek(SeekFrom::End(-(max as i64))).ok()?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).ok()?;
-        let s = String::from_utf8_lossy(&bytes).into_owned();
-        Some(match s.find('\n') {
-            Some(pos) => s[pos + 1..].to_string(),
-            None => s,
-        })
-    }
-}
-
 /// Read the first `max_lines` lines of `path` as a newline-joined string.
 /// `None` on any I/O error (fail-soft).
 fn read_head_lines(path: &Path, max_lines: usize) -> Option<String> {
@@ -679,7 +659,7 @@ fn read_head_lines(path: &Path, max_lines: usize) -> Option<String> {
 /// are already being read, so it is checked in each — tail first, since the last
 /// record written is the current title.
 pub fn extract_resume_name_from_path(path: &Path) -> Option<String> {
-    let tail = read_tail_bytes(path, 64 * 1024);
+    let tail = read_tail_lossy(path, 64 * 1024);
     if let Some(name) = tail.as_deref().and_then(|t| last_custom_title(t.lines())) {
         return Some(name);
     }
@@ -1837,7 +1817,7 @@ fn extract_first_user_preview(content: &str) -> Option<String> {
 
 /// Read the tail of a JSONL session file to produce a lightweight digest.
 ///
-/// Reads the last ~4KB of the file (seeking from end) to extract the last
+/// Reads the last ~4KB of the file ([`read_tail_lossy`]) to extract the last
 /// user and assistant messages without parsing the entire transcript.
 #[expect(
     clippy::string_slice,
@@ -1855,33 +1835,11 @@ pub fn session_digest(
         return Err(format!("Session file not found: {:?}", file_path));
     }
 
-    // Read last ~4KB for efficiency (enough for 2-3 messages)
-    let content = {
-        let metadata =
-            fs::metadata(&file_path).map_err(|e| format!("Failed to read metadata: {}", e))?;
-        let file_size = metadata.len();
-
-        if file_size <= 4096 {
-            fs::read_to_string(&file_path).map_err(|e| format!("Failed to read file: {}", e))?
-        } else {
-            use std::io::{Read, Seek, SeekFrom};
-            let mut file =
-                fs::File::open(&file_path).map_err(|e| format!("Failed to open file: {}", e))?;
-            file.seek(SeekFrom::End(-4096))
-                .map_err(|e| format!("Failed to seek: {}", e))?;
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes)
-                .map_err(|e| format!("Failed to read tail: {}", e))?;
-            // Use lossy conversion to handle mid-character seek gracefully
-            let buf = String::from_utf8_lossy(&bytes).into_owned();
-            // Drop the first partial line (may be truncated from seek)
-            if let Some(pos) = buf.find('\n') {
-                buf[pos + 1..].to_string()
-            } else {
-                buf
-            }
-        }
-    };
+    // Read last ~4KB for efficiency (enough for 2-3 messages), through the one
+    // bounded tail reader: lossy, and the partial first line of a mid-file
+    // window dropped.
+    let content = read_tail_lossy(&file_path, 4096)
+        .ok_or_else(|| format!("Failed to read the tail of {:?}", file_path))?;
 
     let last_modified = fs::metadata(&file_path)
         .ok()

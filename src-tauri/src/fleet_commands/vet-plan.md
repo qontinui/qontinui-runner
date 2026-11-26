@@ -697,11 +697,21 @@ three ways relative to a whole-plan vet:
    status block.** Do not touch other phases' sections, and do not run the
    single-stamp-invariant full-block replace §5 describes for a whole-plan
    vet. Instead, splice that scoped entry into the existing status
-   blockquote using the same separate-index, pinned-`$BASE` push recipe
-   `CLAUDE.md` already documents for a shared checkout (`git hash-object -w`
-   → `GIT_INDEX_FILE=<tmp> git read-tree "$BASE"` → `update-index` →
-   `write-tree` → `commit-tree -p "$BASE"` → push), so a concurrent phase
-   session's own scoped edit is never clobbered by a full-block rewrite. The
+   blockquote and publish it with
+   `bash <workspace-root>/qontinui-claude-config/scripts/plumbing-push.sh --root <plans checkout> --branch main --put plans/<stem>.md=<edited file> --based-on plans/<stem>.md=<blob> --message "<subject>"`,
+   where `<blob>` is the `git rev-parse refs/remotes/origin/main:plans/<stem>.md`
+   you read (right after a fetch; the full ref, which a local branch named
+   `origin/main` cannot shadow) before splicing (its header carries the why: a
+   private index, a base pinned once, no empty sha ever pushed, the blob you
+   read compared with origin on every attempt, read-back), so a concurrent
+   phase session's own scoped edit is never clobbered by a full-block rewrite.
+   Exit 7 `CONFLICT` means origin no longer holds the blob you read — a peer
+   edited the plan after your read: re-read it, re-splice, re-run with the new
+   `--based-on`. Exit 5 `REFUSED` on `main` is a ruleset that requires a PR (push
+   a new branch with `--create` and open a PR) or a ruleset probe GitHub did not
+   answer — a rate limit or a transport failure (retry once the GitHub budget
+   resets or the network answers, or publish this single plan file through
+   `scripts/land-plan-stamp.sh`, which rides both). The
    scoped entry reads:
    ```
    Phase N: VETTED <date> (session <short-id>) — see § Phase N.
@@ -749,8 +759,9 @@ written.
 plans directory is inside a git repo, fetch
 (`git -C <plans-repo-root> fetch -q origin +refs/heads/main:refs/remotes/origin/main`,
 exit status read unpiped — a failed fetch is a STOP), record
-`BASED_ON=$(git -C <plans-repo-root> rev-parse -q --verify origin/main:<repo-relative plan path>)`
-(empty: the plan is not on origin — publish it with `--based-on new` first, per
+`BASED_ON=$(git -C <plans-repo-root> rev-parse -q --verify refs/remotes/origin/main:<repo-relative plan path>)`
+(the full ref, which a local branch named `origin/main` cannot shadow; empty:
+the plan is not on origin — publish it with `--based-on new` first, per
 the precondition above), and write `git -C <plans-repo-root> cat-file -p "$BASED_ON"`
 into a private scratch file (`mktemp -d`). **That scratch file is "the plan on
 disk" for every later step of this run** — the capture below, Step 1's `Read`,
@@ -1037,9 +1048,10 @@ attribution is rare), not an edge case.
 arms read the status block captured from disk at item 1, a stamp that lags by
 construction (see above). A `SHIPPED`, `SUPERSEDED` or `OBSOLETE` stamp, or a
 foreign `IN PROGRESS` whose session left PRs (unless it is case 2b's
-gate-delegated stamp and this run is that hold gate's continuation), still
+gate-delegated stamp and this run is that hold gate's continuation, or case 2c
+adopts a verified-dead owner's pushed work by route-around), still
 stops there; a complete plan
-still stamped `VETTED` or `DRAFT` (or `PARTIAL` / `NOT STARTED`) is re-vetted, and under `/vet-imp` the only
+still stamped `VETTED` or `DRAFT` (including the `— partial` / `— not started` forms, or a legacy `PARTIAL` / `NOT STARTED`) is re-vetted, and under `/vet-imp` the only
 remaining MECHANICAL guard is `/implement-plan` Step 0.45 check 2 — a `git log
 origin/main -20` grep that misses anything older — though §2's claim
 verification may also notice the plan's premises are already met. It is accepted because a false *"do NOT
@@ -1099,13 +1111,24 @@ If, on the values captured above:
   positively attribute). **Run case 2's probes HERE to decide that** — they are
   the only thing separating "adopt" from "a peer is mid-flight", and every one of
   them is read-only: does the stamping session's transcript tail show it died;
-  are its worktrees clean and 0 ahead of `origin/main`; do any PRs or branches
+  for a death read on this device, does no live successor carry its id (§5's
+  void rule: `claude-successor.sh <sid>` must answer 1, and a 0 or 2 is a
+  STOP); are its worktrees clean and 0 ahead of `origin/main` (one that is not
+  is a STOP naming it and `/adopt-wip`); do any PRs or pushed branches
   exist for the plan. If all of them hold this is case 2 (**adopt**) and you
   proceed — do not STOP. **Evaluate case 2b HERE too, before taking any STOP**:
   when `printenv QONTINUI_GATE_ID` names the gate in the captured block's last
   `Held behind gate` line, run case 2b's fresh `coord_gate_inspect` read (also read-only); if every
-  2b conjunct holds you **adopt** and proceed. If neither case 2 nor case 2b
-  holds, STOP.
+  2b conjunct holds you **adopt** and proceed. **And evaluate case 2c HERE**:
+  when the death test holds but PRs or pushed branches exist, run §5's case 2c
+  conjuncts 2-5 (each open PR's and bare pushed branch's owner dead, no delegated successor pending,
+  no on-disk-only work, no successor owned by a LIVE or UNKNOWN session (a dead owner's successor becomes the product; your own is your own work) — all read-only except
+  conjunct 2's `resource:` probe message, which is a measurement and allowed
+  before any edit); if
+  every one holds you **adopt** and proceed, recording the `work products:`
+  History line §5's case 2c row names. If none of case 2, case 2b or case 2c
+  holds, STOP — and when a failing conjunct is on-disk work (case 2's unclean
+  worktree or case 2c's conjunct 4), name the item and `/adopt-wip` in the STOP.
 
   **An ABSENT marker cannot reach case 2 at all**, because case 2's probes are
   keyed on "the marker is a session id ≠ yours" and there is no session to probe.
@@ -1997,17 +2020,33 @@ and the body. Before writing your stamp:
    declaration, it counts.
 2. Use `Edit` to **delete every existing status-adjacent blockquote** —
    even if it came from a different skill (`/verify-plan-status` writes
-   `NOT STARTED` / `PARTIAL`; `/implement-plan` writes `IN PROGRESS` /
+   `VETTED/DRAFT <date> — not started` / `— partial: …`, and older runs
+   left legacy `NOT STARTED` / `PARTIAL`; `/implement-plan` writes `IN PROGRESS` /
    `SHIPPED`; older `/vet-plan` runs may have left `Status: VETTED ...`).
    Yours replaces all of them.
 3. Then `Edit` again to insert your single new `> **Status: VETTED …`
    block.
 4. If folding in history is useful (e.g., the plan was previously
-   `NOT STARTED` per a verify pass, or had earlier verifier findings
+   not started per a verify pass, or had earlier verifier findings
    in a separate `> **Edit:` block), include the salient info in
    **one trailing line inside your new block**, prefixed `History:` or
    `Previously:`. Never as a sibling blockquote. A re-vet that lifts a hold
-   keeps its trail here (§5.4 step 6, "And the converse").
+   keeps its trail here (§5.4 step 6, "And the converse"). The route-around `History:` line that item 4b carries is the one permitted
+   second `History:` line: keep it verbatim beside your trailing line (a
+   takeover trail included), never merged into it.
+4b. **Carry every route-around `History:` line verbatim**, whatever its head
+   (`adopted from …; work products: …; route-around owed`, `[adopted from …;
+   ][work products: …; ]route-around opened as <owner/repo>#P`, `inherited from <source stem>`,
+   `route-around discharged: …` or `route-around transferred to <stem>: …`)
+   and every segment it carries (`work products:`, `owed for`, `superseded successors:`,
+   `inherited from`, `route-around discharged:`, `prior art:`, `gates:`).
+   A plan carries at most one
+   such line: an adopting run takes an inherited line as its own, and rule
+   6's inherit exit inserts its segments into a line already there, each at
+   its place in the segment order (`/implement-plan` Step 4.5b item 5). It is the case-2c hand-off `/implement-plan`
+   Step 0.5's route-around check reads, so folding history is NOT optional
+   for it, on a re-vet as on a first vet: dropping it strands the
+   route-around. It is changed only by `/implement-plan` (the route-around check's `; owed for` insertion, its `; gates:` record, Step 4.5b item 5's or the adoption half's transition, which rewrites the head and keeps every other segment, and Step 6's catch-up), by `/verify-plan-status` taking status-guard rule 6's exits, or retired by status-guard rule 6.
 5. **Carry the `**Area:**`, `Initiative-Item:` and `Depends-On:`
    declarations.** If any block you are replacing (item 2 deletes every
    status-adjacent blockquote, not only the Status one) carries an
@@ -2036,10 +2075,10 @@ and the body. Before writing your stamp:
    longer shows.
 
 When `/vet-plan` and `/verify-plan-status` disagree on what the status
-should be (the plan is both VETTED *and* NOT STARTED — a vetted plan
+should be (the plan is both vetted *and* not started — a vetted plan
 that nobody has implemented yet), consolidate: write the lifecycle
-stage in the heading (`Status: VETTED <date> — implementation not
-started.`) and put the verifier's findings in the body. The two
+stage in the heading with the verdict appended (`Status: VETTED <date> —
+not started (verified <date>).`, `/verify-plan-status` §5's form) and put the verifier's findings in the body. The two
 skills do NOT both stamp side-by-side.
 
 #### Lifecycle states
@@ -2047,20 +2086,23 @@ skills do NOT both stamp side-by-side.
 | State | Owner skill | Means |
 |---|---|---|
 | DRAFT | author | plan written, not yet vetted |
-| VETTED | `/vet-plan` | claims audited; ready to implement |
+| VETTED | `/vet-plan` (also carried by `/verify-plan-status`) | claims audited; ready to implement |
 | IN PROGRESS | `/implement-plan` | implementation underway |
 | SHIPPED | `/implement-plan` or `/verify-plan-status` | all phases live in code |
 | SHIPPED — UNCONFIRMED (<claim ids>) | `/implement-plan` or `/verify-plan-status` | all phases live in code, and the `## Done when` claims named do NOT read `confirmed` (or the section is unparseable — `done-when-unparseable`) — landed, not yet shown to work. Normalises to `shipped` in coord (the qualifier is for the human reader) |
-| PARTIAL | `/verify-plan-status` | some phases live, some open |
-| NOT STARTED | `/verify-plan-status` | no implementation evidence |
+| VETTED/DRAFT — partial | `/verify-plan-status` (lead word carried from the replaced stamp — `VETTED` only when that stamp led with `VETTED`, else `DRAFT`; never upgraded) | some phases live, some open |
+| VETTED/DRAFT — not started | `/verify-plan-status` (lead word carried, as above) | no implementation evidence |
+| PARTIAL / NOT STARTED (legacy) | none — no writer emits them as lead words now | read as above; overwritable |
 | SUPERSEDED / OBSOLETE | any | terminal states |
 
 `/vet-plan` writes only `VETTED` (on the self path qualified as
 `VETTED (self)`, still `VETTED` first — §5). If the existing block is `SHIPPED`
 (qualified `UNCONFIRMED` or not), `SUPERSEDED`, or `OBSOLETE`, do NOT overwrite — surface to the user
 that they're vetting a closed plan and confirm they actually want this
-rewrite. (`PARTIAL` and `NOT STARTED` are fine to overwrite — your vet
-pass produces fresher information.)
+rewrite. (The partial / not-started forms — `VETTED/DRAFT <date> — partial: …`,
+`VETTED/DRAFT <date> — not started …` — and the legacy `PARTIAL` and
+`NOT STARTED` are fine to overwrite — your vet pass produces fresher
+information.)
 
 ##### `IN PROGRESS` is CONDITIONALLY overwritable — consumes Step 0.25
 
@@ -2072,7 +2114,7 @@ arms after it are this command's own, and they are what the block points at.
 — so read its "the stamp already there" through this command's own capture.**
 For `/vet-plan` the stamp is NOT re-read here: §4 has already rewritten the
 plan, so "the stamp already there" means **Step 0.25's capture** of it (the
-verbatim token, date and session marker), and the five rules are applied to that
+verbatim token, date and session marker), and the six rules are applied to that
 captured value. Rule 2's resume branch — refresh the date, keep the trail —
 likewise describes the writer's own token; `/vet-plan` writes `VETTED`, so a
 resume here means proceeding to that write with the trail kept, never re-dating
@@ -2087,7 +2129,7 @@ inline.
 > arm table and its evaluation order: `/vet-plan`, "`IN PROGRESS` is
 > CONDITIONALLY overwritable".)* Before this command writes, replaces,
 > downgrades or re-dates a plan's lifecycle stamp, read the stamp already there
-> and apply these five rules.
+> and apply these six rules.
 >
 > 1. **An `IN PROGRESS` stamp is a conditional STOP, not a value to replace.**
 >    It protects a live peer's in-flight work. Read the whole HEADLINE, not only
@@ -2098,11 +2140,24 @@ inline.
 > 2. **The discriminator is the SESSION MARKER, not the token.** A marker that
 >    IS your own current session id is a resume: refresh the date and keep the
 >    trail, never take over. A marker that is a different session id is a LIVE
->    PEER unless you can positively verify that session died with zero work
->    products — transcript tail shows death, its worktrees clean and 0 ahead of
->    `origin/main`, and no PRs and no branches for the plan — **or that it
->    delegated the plan to a hold gate whose continuation you are (the arm
->    table's case 2b)**. Only then adopt it and append your own marker.
+>    PEER unless you can positively verify that session died — transcript
+>    tail shows death (a death read on THIS device also
+>    needs `bash <workspace-root>/qontinui-claude-config/scripts/lib/claude-successor.sh <sid>`
+>    to answer 1, and a 0 or 2 is a STOP; across machines, `/vet-plan`'s "Case
+>    2 across machines" decides) — and that either **case 2** holds (its
+>    worktrees clean and 0 ahead of `origin/main` — a worktree that is not
+>    is a STOP that names it and `/adopt-wip` — and no PRs and no branches
+>    for the plan) or **case 2c, adopt by route-around**, holds (PRs or
+>    pushed branches exist, and every case-2c conjunct in `/vet-plan`'s arm
+>    table holds, among them: every open PR and bare pushed branch among them
+>    is that session's, or another session's whose death reads by the same
+>    test (a phase subagent is no exemption; a closed PR is prior art,
+>    whoever wrote it), no `WIP` / `UNPUSHED`
+>    checkout of that session holds work only on disk, and no open gate with
+>    an armed continuation holds the plan beyond conjunct 3's named
+>    exceptions) — **or that it delegated the plan to a hold gate whose
+>    continuation you are (the arm table's case 2b)**. Only then adopt it and
+>    append your own marker.
 > 3. **No marker, or one you cannot positively attribute, is the UNIDENTIFIED
 >    DEFAULT: STOP.** Not an overwrite, and not an adoption. Adoption is the
 >    earned branch; stopping is the fallback.
@@ -2115,6 +2170,98 @@ inline.
 >    non-2xx, unparseable or carrying `merged_degraded_reason` leaves the
 >    stamp's meaning unestablished. Fall through to STOP, never to overwrite,
 >    and say the read was inconclusive.
+> 6. **Owed route-around work blocks a terminal word.** While the block
+>    carries a `route-around owed` or `… owed for …` `History:` line, never
+>    write `SHIPPED`, `SUPERSEDED` or `OBSOLETE`: write the non-terminal word
+>    your own rules allow (for `/verify-plan-status`, its `— partial` verdict
+>    stamp), keep the line verbatim, and report it. Two exits, each on evidence, and each
+>    rewrites ONLY the owed token, keeping the line's `adopted from …`,
+>    `prior art:` and `gates:` parts: a predecessor that is MERGED, or CLOSED
+>    after a successor carrying its content merged, is discharged (the token
+>    becomes `route-around discharged: <evidence>` once none is left owed);
+>    one that is CLOSED with no merged successor is reclassified from
+>    `owed for` into `prior art: <owner/repo>#N (closed)` and removed from
+>    `work products:`. Once nothing is left owed, the owed token is replaced
+>    by `route-around discharged: <evidence>` if any predecessor was
+>    discharged, and otherwise deleted; a discharged record that is not the
+>    line's head stands in the slot `/implement-plan` Step 4.5b item 5's one
+>    segment order fixes for it. **The PRs a route-around line names**
+>    are those in its `work products:`, `owed for`, `route-around opened as`
+>    and `superseded successors:` segments, never those in `prior art:` or a
+>    `route-around transferred to …` token. A line that owes nothing still
+>    holds one word: while any PR it names is OPEN, never write `SUPERSEDED`
+>    or `OBSOLETE`, because that open PR can still land the work the word
+>    calls dead. Two more exits release both holds for a plan whose verdict
+>    is `SUPERSEDED` or `OBSOLETE`. `/verify-plan-status` is the ONE writer
+>    that takes them; every other writer, `/implement-plan` included, keeps
+>    the hold and reports `rule-6 exit available: run /verify-plan-status <stem>`.
+>    Before either, run the two exits above over every PR the line names, so
+>    each merged or closed one is recorded as `route-around discharged:` or
+>    `prior art:` before any segment moves. Inherit comes first: when a
+>    non-terminal plan supersedes this one, Inherit is the only exit and
+>    nothing is closed, and if Inherit cannot finish, the hold stands.
+>    - **Inherit** (`SUPERSEDED`, with a non-terminal inheritor). The
+>      superseding plan must be non-terminal, must cite this plan, and must
+>      not be held `IN PROGRESS` by a LIVE or UNKNOWN other session (if it is,
+>      STOP and `coord_send_message` the holder naming the open PRs). Under
+>      `git-operations` `an-obsolete-plans-owed-predecessor-is-closed`, then
+>      re-check, exactly as Close does, that every OPEN PR the line names has
+>      no live owner: a LIVE or UNKNOWN owner on any of them, other than the
+>      session running this exit, means the hold stands, nothing moves, and
+>      the owner is named. Every
+>      OPEN PR the line names moves to it as `owed for`. If it carries no
+>      route-around line, land `History: inherited from <this stem>; owed for
+>      <owner/repo>#N[, …]` on it. If it already carries one, add only the
+>      moved PRs that line names in no segment yet (`work products:`, `owed
+>      for`, `route-around opened as`, `superseded successors:`) (or insert `; owed
+>      for <owner/repo>#N[, …]` right after its head) and, unless the line
+>      already carries it, insert `; inherited from <this stem>` after
+>      any `superseded successors:` segment. Both go before any `route-around
+>      discharged:` segment, `prior art:` and `gates:`, in the one segment
+>      order `/implement-plan` Step 4.5b item 5 fixes; never add a second line.
+>      Land it with `land-plan-stamp.sh --based-on <blob>` and read it back off
+>      `origin/main`. Only then rewrite this plan's line: every segment that
+>      names a moved PR, and the `route-around owed` token, are replaced by one
+>      token, `route-around transferred to <stem>: <owner/repo>#N[, …]`, where
+>      the first of them stood. Every other segment is kept (`adopted from …`,
+>      `inherited from …`, `route-around discharged: …`, `prior art:`,
+>      `gates:`), so the line no longer carries an owed token. If any step
+>      fails, the hold stands. A retry after a failed rewrite of this plan's
+>      line re-runs this exit only against the plan that already carries
+>      `inherited from <this stem>`, and only while that plan still meets
+>      every precondition above; its add step adds only the moved PRs that
+>      line names in no segment yet, so nothing is added twice. Otherwise
+>      the hold stands and is reported as above: while any plan carries
+>      `inherited from <this stem>`, neither Close nor an inherit to a
+>      different plan is taken, because that plan, or a plan it passed them
+>      to, may still owe the moved PRs.
+>    - **Close** (`OBSOLETE`, or `SUPERSEDED` by landed work — a merged PR or a
+>      `SHIPPED` plan — and no non-terminal plan inherits the line). Under `git-operations`
+>      `an-obsolete-plans-owed-predecessor-is-closed`, re-check at close time
+>      that every OPEN PR the line names has no live owner. A LIVE or UNKNOWN
+>      owner on any of them means the hold stands and nothing is closed.
+>      That includes a live adopter's own successor (`route-around opened as
+>      <owner/repo>#P`, owned by the session running this exit or by another
+>      LIVE session): the hold is intended, not stuck, and that adopter closes
+>      or finishes its own PR first.
+>      Otherwise close each with a comment naming the evidence and the death
+>      evidence and saying its branch is left untouched, and leave every
+>      branch untouched. Then dispose of every open gate anchored to a closed
+>      PR or whose predicate names one, `case-2c-close-predecessor` gates and
+>      the `pr_merged` gates they ride included: withdraw each that this
+>      session or a verified-dead author registered; for any other, or one
+>      whose withdraw is refused, cancel its continuation
+>      (`coord_cancel_continuation`); read every one back. The exit above then
+>      moves each closed owed PR into `prior art: <owner/repo>#N (closed)`; a
+>      closed PR in another segment stays as written and no longer holds. If
+>      any step fails before the first close, the hold stands. A close that
+>      is refused leaves that PR open, so the hold stands for it: record a
+>      finding, and still dispose of the gates of the PRs that did close.
+>      Once any PR is closed the hold can no longer be restored, so a gate
+>      that is neither withdrawn nor cancelled is not left silent: record a
+>      finding (`coord_post_finding`) naming its gate ids, and report those
+>      gates in the closeout as unretired, as `/implement-plan` Step 4.5b
+>      item 7 does.
 <!-- status-guard:end -->
 
 `IN PROGRESS` is deliberately **not** a fourth unconditional token in the list
@@ -2136,7 +2283,8 @@ unidentified default below, that run should have stopped at its capture step
 without editing anything.
 
 **The arms below are scoped to a status block that reads `IN PROGRESS`.** A
-`DRAFT`, absent, `PARTIAL` or `NOT STARTED` block is governed by the paragraph
+`DRAFT`, absent, `VETTED/DRAFT — partial` / `— not started`, or legacy
+`PARTIAL` / `NOT STARTED` block is governed by the paragraph
 above this section, not by this table — do not read the "anything else" row as
 refusing a first-time vet.
 
@@ -2144,10 +2292,200 @@ refusing a first-time vet.
 |---|---|---|---|
 | 0 | The marker **IS** your own current session id | a resume, or a Step 0.5 re-run | **Refresh**, never take over: update the date and keep the trail. |
 | 1 | Work has **landed** | delivery **arm 1** | **Refuse.** Do not overwrite; route to closeout. |
-| 2 | The stamping session is **dead with zero work products** | the marker is a session id ≠ yours, AND its transcript tail shows death (or, on the same device, its claim ledger's `.alert` records `OWNER_GONE … pid_dead`; a cleared `implement→ship safety net` gate alone is a reason to probe, not evidence, since it also clears on a lapse — `/implement-plan` Step 0.5) — **or, when that transcript is not on this box, one of the three positive signals below the table** — AND its worktrees are clean and 0 ahead of `origin/main`, AND no PRs and no branches exist for the plan | **Adopt.** Keep the fresh `VETTED` and record the takeover as the `History:` line **inside that one block** (never a second blockquote — see the single-stamp invariant), naming both session ids and the evidence. |
+| 2 | The stamping session is **dead with zero work products** | the marker is a session id ≠ yours, AND its transcript tail shows death (or, on the same device, its claim ledger's `.alert` records `OWNER_GONE … pid_dead`; a cleared `implement→ship safety net` gate alone is a reason to probe, not evidence, since it also clears on a lapse — `/implement-plan` Step 0.5) — **or, when that transcript is not on this box, one of the three positive signals below the table** — AND, when that death was read on THIS device (the ledger `.alert`, a transcript on this box, or a coord row for a session that last ran here), no live successor carries its id (the void rule below the table; a cross-machine death is decided by "Case 2 across machines" alone) — AND its worktrees are clean and 0 ahead of `origin/main` (a worktree that is not is a STOP that names it and `/adopt-wip`, as case 2c's conjunct 4 routes it), AND no PRs and no branches exist for the plan | **Adopt.** Keep the fresh `VETTED` and record the takeover as the `History:` line **inside that one block** (never a second blockquote — see the single-stamp invariant), naming both session ids and the evidence. |
 | 2b | The stamping session **handed the rest to a hold gate, and you are that gate's continuation** (gate-delegated adoption) | the marker is a session id ≠ yours, AND `printenv QONTINUI_GATE_ID` (by NAME, never an `env` dump) names gate G, AND the **last** `Held behind gate` line in the captured block is literally `Held behind gate <full gate_id> (<predicate>; anchor <work_unit_id>)` with G's **full** id (written only at the owner's closeout — `/implement-plan` Step 6.5), AND a FRESH `coord_gate_inspect {gate_id: G}` reads `verdict: cleared`, `continuation.consumed_by` equal to `$QONTINUI_GATE_DEVICE_ID` **and** to this device (`$QONTINUI_MACHINE_ID`, else `device_id` in `~/.qontinui/machine.json`), and an `anchor.work_unit_id` equal to this plan's unit or to the line's `anchor <work_unit_id>`. The `anchor <work_unit_id>` token is the last thing before the line's closing `)` — parse it from the RIGHT, so a predicate containing `;` or `)` cannot break the match. Case 2's zero-work-products checks do **not** apply: the predecessor's PRs are the expected state | **Adopt**, as case 2: keep the fresh write, and in place of the `Held behind gate` line (never keep it) write `History: adopted from <prior session id> via consumed hold <G full id>` **inside that one block** — a spelling that can never satisfy case 2b again. |
-| 3 | The stamping session is a **LIVE PEER** | the marker is a session id ≠ yours and neither case 2's nor case 2b's checks all hold | **STOP.** Do not vet and do not implement. |
+| 2c | The stamping session is **dead and left pushed work products** (route-around adoption) | case 2's death test, in full — the same evidence, the same successor void rule, the same "Case 2 across machines" signals — AND PRs or PUSHED branches exist for the plan, AND all four of the conjuncts listed under "Case 2c — the conjuncts and the work products" below the table hold: (2) every OPEN PR or bare pushed branch adopted is that session's, or another session's whose death reads by the same test (a phase subagent is no exemption), and the resource message answers PARKED; (3) no delegated successor is pending; (4) no work exists only on disk; (5) no successor owned by a LIVE or UNKNOWN session (a dead owner's successor becomes the product; your own is your own work) | **Adopt by route-around.** Keep the fresh `VETTED` and write `History: adopted from <prior sid> (case 2c, <death evidence>); work products: <owner/repo>#N[, …]; route-around owed[; prior art: <owner/repo>#N (closed) | <repo>:<branch>@<sha>[, …]]` **inside that one block**. When the block already carries a route-around `History:` line (whole-list, partial, finished or inherited), write no second line: insert the newly found open PRs into THAT line as `; owed for <owner/repo>#N[, …]` at their slot in the one segment order (`/implement-plan` Step 4.5b item 5; a PR the line already names in any segment is not added again), and record `adopted from <prior sid> (case 2c, <death evidence>)` in the takeover trail line (single-stamp item 4) only. Only OPEN PRs are `work products:` — the owed route-around items, and only they make `/implement-plan` a route-around adopter. A closed-unmerged PR (whoever wrote it) or a verified-dead author's tied bare pushed branch is PRIOR ART: read, never owed, parked, superseded or closed, listed only after `prior art:`, and never by itself an adoption by route-around. When no open PR exists, the line is `History: adopted from <prior sid> (case 2c, <death evidence>); prior art: <…>`, with no `route-around owed`. The `History:` line's `route-around owed` token is the hand-off: `/implement-plan` Step 0.5's route-around check reads it whatever lifecycle word the stamp carries by then, and its "Case 2c route-around duties" run in two halves — the adoption half (allocate the branch, find the predecessor's gates) at Step 0.5, the PR half (`supersedes` title, disclosure, park, re-point, close) at Step 4.5b item 5, once the successor exists; `/vet-plan` itself opens, parks and closes nothing. |
+| 3 | The stamping session is a **LIVE PEER** | the marker is a session id ≠ yours and none of case 2's, case 2b's or case 2c's checks all hold | **STOP.** Do not vet and do not implement. |
 | — | **Anything else** — the stamp carries **no** session marker, or one you cannot positively attribute | no evidence of death, and no evidence it is yours | **STOP**, exactly as case 3. |
+
+**Case 2c — the conjuncts and the work products** *(plan
+`2026-11-23-dead-owner-in-progress-adoption-routes-around-its-prs`)*. Case 2
+STOPs on a dead owner's pushed PR or branch, and served policy says the opposite:
+a dead author's pushed work is adopted by route-around [policy:
+`git-operations` `abandoned-pr-branch-is-adoptable-by-route-around`], and when
+the author is not open the work is finished by whoever finds it [policy:
+`planning-and-scope` `discovered-work-goes-to-its-author-else-you`]. Case 2c is
+that branch. The death test is case 2's, word for word; what changes is only
+what a pushed work product means. Four more conjuncts must ALL hold, each a read,
+and any one UNKNOWN is a STOP:
+
+2. **Each work product's own owner is dead too.** Every OPEN PR or bare pushed
+   branch you would adopt, or read as prior art, is attributable — by the `Session-Id` trailer on its head commit, the
+   `agent/<device>-<session>/…` branch shape, or
+   `coord_session_census {pr: "<owner/repo#n>"}` — to the stamping session, or
+   to a session whose death you have read by the same test. Any author whose
+   session id differs from the stamper's gets that test in full (its census
+   row, `claude-successor.sh <sid>`): "phase subagent" may describe a product,
+   but it never waives the test. A
+   product whose author is a different session that is LIVE or UNKNOWN makes
+   the row **case 3: STOP**; a live peer is never routed around, and the GitHub
+   author is not an ownership signal. The clause's own first measurement holds
+   too: a `coord_send_message` to `resource:<a file the branch touches>` answers
+   PARKED (its "ESTABLISH LIVE OWNERSHIP FIRST") (a probe whose `delivered_to` names only your own session id counts as PARKED: the live holder it reached is you).
+3. **No delegated successor is pending.** When the stamp's last `Held behind
+   gate <id>` line names a gate that is still OPEN with an armed continuation,
+   or `coord_gate_list {work_unit_id}` serves any other open gate on the plan's
+   unit with an armed `run_skill` continuation, the owner handed the plan to
+   coord: you are that continuation (case 2b) or you STOP and name the gate.
+   Three kinds of gate are exceptions and never count here: the implement→ship
+   net whose consumed continuation dispatched this run; any gate YOUR OWN
+   current session registered (its own implement→ship net, its own Step 6.5
+   hold gate), so a same-session resume never STOPs against itself; and any
+   gate whose id is on the History line's `gates:` list — the gates a
+   route-around registered or re-pointed about a case-2c product or its
+   successor (each predecessor-close gate, the land gate of an open healthy
+   predecessor left to land, and every predecessor gate re-pointed at the
+   successor). Those watch work already in flight (conjunct 5 judges that),
+   not a hand-off of the plan. `/implement-plan`'s "Case 2c route-around duties"
+   records every such id there as `; gates: <id>[, …]`; a gate it did not record
+   counts.
+4. **No `WIP` / `UNPUSHED` checkout owned by that session** (no work exists
+   only on disk). `bash <workspace-root>/qontinui-claude-config/scripts/scan-worktree-wip.sh`
+   over the plan's paths
+   reports no `WIP` / `UNPUSHED` checkout owned by that session, and no
+   `refs/wip/*` leaf names it. A hit is a STOP that names the item and
+   `/adopt-wip` — the gated door for another session's uncommitted work, since
+   no served clause licenses this command to dispose of it. Exit 3 (INCOMPLETE)
+   is UNKNOWN, so it STOPs too.
+5. **No successor is owned by a LIVE or UNKNOWN session.** For each open predecessor, read
+   `coord_pr_status` `superseded_by`, and search `--state all` for a
+   `supersedes <owner/repo>#N` title. A successor found becomes the work product, and
+   is judged by conjunct 2 like any other: a dead owner's successor is adopted
+   as the product, a LIVE or UNKNOWN owner's is case 3. A successor authored by
+   YOUR OWN current session id is your own work (a resumed run meeting the PR
+   it opened): it is neither a blocker nor a product to adopt, so it never
+   STOPs this conjunct.
+
+**Sorting the work products.** Find them with a `--state all` PR search on the
+stem across the plan's repos, a `git ls-remote` branch search, and
+`coord_work_unit_list_citations`. Each is handled by its state, and the clauses
+named here govern how — this section does not restate their procedure:
+
+- **merged** → delivered work. Make sure the unit cites it, and do nothing else
+  with it.
+- **already has an open successor** — its `coord_pr_status` `superseded_by`, or
+  a `--state all` search for a `supersedes <owner/repo>#N` title, names one,
+  whoever authored it. Never open a second successor for the same `#N`,
+  except in the chained supersession below. The
+  successor is judged first (conjunct 5): a LIVE or UNKNOWN owner's is case 3;
+  a dead owner's is also a product in its own right; yours is your own work.
+  Sort every product's own state first: a successor that is itself a product
+  and sorts as routed around is decided before any predecessor it
+  supersedes, and a predecessor whose successor is so sorted skips
+  **successor exists, PR half owed** and is handled only by the chained
+  supersession below.
+  When it is yours or a dead adopter's and is not itself routed around, the
+  predecessor is **cite only** only
+  if its PR half is verifiably complete — it is a draft, at least one LIVE
+  close chain for it exists (a gate with `phase_name`
+  `case-2c-close-predecessor <owner/repo>#N` whose continuation-free
+  `pr_merged` gate is non-terminal and watches an open or merged PR), and no
+  open gate is anchored to it or names it, other than its close gates. Otherwise it is **successor exists, PR half owed**:
+  `/implement-plan` runs the park / re-point / close against that existing
+  successor, idempotently, before counting it as routed around, and a close
+  gate counts as already registered only when its chain is live (one gone
+  terminal counts as absent, so a fresh close gate is registered). When a
+  dead adopter's successor #M is itself red and routed around by a new
+  successor #P, that is a chained supersession, the one exception to "never
+  open a second successor" and to **cite only**: #N is not cite only, and #P's
+  title carries
+  `supersedes` for both #M and #N (#M's `superseded_by` naming #P is what
+  authorizes the non-registrant re-point, and `coord_pr_status` for both #M
+  and #N must serve #P), and the `pr_merged` gate on #M that #N's close gate
+  rides is re-pointed onto #P. A refused re-point, or a
+  read-back that does not show that gate non-terminal and watching #P, means
+  the chain is not live: a fresh `case-2c-close-predecessor` close gate for #N
+  is registered on #P and read back, and if that fails too the run STOPs and
+  reports it. Once the fresh chain reads back, the stale pair (the old #N
+  close gate and the `pr_merged` gate on #M) is withdrawn where this session
+  or a verified-dead author registered it, and otherwise has its continuation
+  cancelled. A gate whose withdraw and cancel are both refused is recorded as a
+  finding and reported in the closeout as unretired, never passed over
+  silently. The plan's route-around line names #M in
+  `; superseded successors: <owner/repo>#M`, kept verbatim, so status-guard
+  rule 6 still sees #M while it is open. `/implement-plan` Step 4.5b
+  items 3, 6 and 7 carry this out. This row is read before the state rows
+  below.
+- **open and healthy** (green, mergeable, not stale) → it lands without its
+  author, so leave it to land and cite it; a phase that depends on it waits on a
+  gate on its land. Routing around it would fork it, and friction is not
+  evidence of abandonment (the clause's ANTI-TRIGGER). If it later goes red or
+  conflicted, route around it then.
+- **open and red, conflicted or stale** → route around it [policy:
+  `git-operations` `abandoned-pr-branch-is-adoptable-by-route-around`]: a fresh
+  branch off `origin/main`, the original never pushed to, rebased or deleted.
+  The successor's TITLE carries `supersedes <owner/repo>#N` [policy: `git-operations`
+  `a-landed-adoption-closes-its-predecessor`]; the predecessor is parked as a
+  draft while the successor is in flight [policy: `git-operations`
+  `park-the-predecessor-while-its-successor-is-in-flight`]; the gates watching
+  it, including those whose predicate names it, are re-anchored [policy:
+  `git-operations` `an-adoption-must-re-anchor-the-gates-watching-what-it-supersedes`,
+  `a-predecessor's-gates-include-those-whose-predicate-names-it`]; and its close
+  is registered without riding the successor's `pr_merged` continuation [policy:
+  `git-operations` `a-distinct-landing-follow-up-must-not-ride-a-pr-merged-continuation`].
+  `/implement-plan`'s "Case 2c route-around duties" sub-step lists them and says
+  where each runs: the fresh branch and the gate search at adoption (Step 0.5),
+  the title, disclosure, parking, re-pointing and close once the successor PR
+  exists (Step 4.5b item 5). Parking waits for the successor, because the
+  comment names it.
+- **closed unmerged** → **prior art, not owed**, whoever wrote it: a closed PR
+  is read, never acted on, so its author does not matter here (conjunct 2 is
+  read for open PRs and bare branches only). Read its diff and take what is
+  still needed onto the route-around branch. It is never owed, parked,
+  superseded or closed, and it is recorded only as `prior art:
+  <owner/repo>#N (closed)` in the `History:` line, never in the `work products:`
+  / `owed for` grammar.
+- **a pushed branch with no PR** → **prior art, not owed**, when its author is
+  verified dead: read its diff, take what is still needed, leave the branch
+  untouched, and record it as `prior art: <repo>:<branch>@<sha>`. A bare pushed
+  branch whose author is LIVE or UNKNOWN is a STOP, labelled as `/implement-plan`
+  Step 0.45 check 3 labels it: tied by a `Plan:` trailer for this plan, it is a
+  live peer (case 3); otherwise it is untied, and an untied match is UNKNOWN:
+  STOP. A
+  branch found only by the stem's 40-character prefix, with no `Plan:` trailer
+  (no fleet hook writes one), is tied to THIS plan by the same rule
+  `/implement-plan` Step 0.45 check 3 applies. A dead author is not evidence
+  of which plan the branch is for, so the NAME ties it: the branch name's
+  final path segment (after the `agent/<device>-<session>/` prefix) must
+  EQUAL this plan's full stem exactly. A truncated name ties only when its
+  head commit's full `Session-Id` trailer resolves (`coord_session_census
+  session_id=<id>`) to a session whose recorded plan or work unit is this
+  plan's stem; otherwise it stays UNKNOWN: STOP, and the report names the
+  branch so an operator or a later run can record it. Then identify its author from the head commit's full `Session-Id`
+  trailer (the branch shape's 12-hex prefix is not enough) and run the death
+  test; it counts as this plan's prior art only when the name ties it, that
+  author passes, and no `Plan:` trailer names a different stem. A name that
+  does not tie it, a LIVE or UNKNOWN author, or no full session id leaves it
+  untied, and an untied match is UNKNOWN: STOP.
+
+Only OPEN PRs are owed route-around items, so only they are ever parked,
+superseded by a `supersedes` title, re-pointed or closed. That leaves nothing
+to transition, dedupe or discharge for prior art.
+
+**A live successor VOIDS every death signal on this device.** A live Claude
+process whose argv carries the stamping session's id is that session, resumed:
+an account migration restarts it as `claude --resume <sid>` under a new pid.
+It voids the ledger `.alert` `OWNER_GONE … pid_dead` / `pid_reused`, the tail
+of a transcript on this box, and a closed or finished coord row for a session
+that last ran here, and it forces STOP. A session that ran on another machine
+gets no scan here (its successor would run there): "Case 2 across machines"
+decides it. Probe it with
+
+```bash
+bash <workspace-root>/qontinui-claude-config/scripts/lib/claude-successor.sh <sid>
+```
+
+Exit 0 prints the live successor pid(s): LIVE, so STOP. Exit 1 means none, and
+the death signal stands. Exit 2 is UNKNOWN, which makes the death clause
+UNKNOWN: STOP. On Git Bash the probe answers 2 (UNAVAILABLE), so a same-box
+death clause there reads UNKNOWN and STOPs until a Windows successor source
+exists. A substring `pgrep -af <sid>` or `ps … | grep <sid>` is never
+this probe, because it matches the probing shell (measured on nilan:
+`pgrep -af <an unused uuid>` from Claude Code's Bash tool returns rc 0). On
+2026-11-16 two migrated sessions logged `OWNER_GONE pid_dead` while their
+`--resume` successors were alive, the second's coord row read closed, and a net
+dispatched a duplicate onto each (findings `2a648c75` and `dd69d0ed`, dossier
+`implement-ship-net-fires-on-a-live-session`, mechanism 4).
 
 **Case 2b reads coord, never the environment alone.** `QONTINUI_GATE_ID` is
 injected by the runner into a gate continuation (`_gate-registration` →
@@ -2171,8 +2509,14 @@ owner's own PR fails case 2's no-PRs check.)*
 D3)*. When the stamping session's transcript is not on this box, the death probe
 is **UNKNOWN**, and with it case 2 does not hold — the row is **STOP** unless one
 of these says dead-or-done. A signal stands in for the transcript-tail check
-ONLY; case 2's other three checks (worktrees clean and 0 ahead, no PRs, no
-branches) must still all hold beside it.
+ONLY; the case's other checks must still all hold beside it: for case 2,
+worktrees clean and 0 ahead (an unclean one a STOP naming `/adopt-wip`), no PRs
+and no branches; for case 2c, conjuncts 2-5
+(each open PR's and bare pushed branch's owner dead, no delegated successor pending, no on-disk-only
+work, no successor owned by a LIVE or UNKNOWN session (a dead owner's successor becomes the product; your own is your own work)). Across machines no process scan can
+run, so where signal 3 is the stand-in it holds only if EVERY row matching the
+`claudeCodeSessionId`, in every tenant, reads closed or finished — one open row
+means LIVE. Signals 1 and 2 are unchanged.
 
 **Stage the credentials ONCE, first, and use them for all three signals.**
 §0.25 has already deleted its own bearers, and signals 2 and 3 need one (the
@@ -2237,8 +2581,12 @@ directory).
    the signal holds only if every bearer's walk completed AND every matched
    row, under any bearer, reads `finished` / closed. Rows
    that disagree (closed under one tenant, active or `working` under another)
-   are UNKNOWN, never dead. Stopping at the first `closed` row would adopt a
-   live peer.
+   read LIVE, never dead: one open row is enough. Stopping at the first
+   `closed` row would adopt a live peer. **The residual:** a migrated successor
+   whose only coord row reads closed still reads dead here, because no process
+   scan reaches another box (f51a0efc's row read `closed_at` while its
+   successor ran). That is a binding-drift dossier follow-up (finding
+   `dd69d0ed`), not something this signal can see.
 
 **Silence on the bus is never adoptable**, and an empty `coord_orient`
 `session_activity` is UNKNOWN by that tool's own contract (it lists live sessions
@@ -2253,7 +2601,7 @@ current session id** is refreshing its own stamp, not taking one over.
 
 **The unidentified default is not a formality.** An unmarked `IN PROGRESS` stamp
 (hand-written, operator-written, or predating the marker convention) matches
-neither case 2, case 2b nor case 3, and without this row the reader falls back to the
+neither case 2, case 2b, case 2c nor case 3, and without this row the reader falls back to the
 pre-change behaviour — overwrite — which is the regression this section opens by
 forbidding. It bites hardest in the motivating scenario: under delivery arm 2 or
 3 (UNKNOWN) with an unmarked stamp, no other row fires at all.
@@ -2261,8 +2609,8 @@ forbidding. It bites hardest in the motivating scenario: under delivery arm 2 or
 **Case 3 is invisible to the delivery read, by construction** — a peer
 mid-implementation has no merged PRs yet, so the unit returns
 `{shipped: false, evidence_complete: true, evidence_gaps: []}`, a clean
-non-degraded arm-5 reading. Only case 2's four checks, or case 2b's gate read,
-separate adoption from case 3, and **the default when they fail is STOP, never adopt.** Adoption is the
+non-degraded arm-5 reading. Only case 2's four checks, case 2b's gate read, or
+case 2c's death test with its four conjuncts separate adoption from case 3, and **the default when they fail is STOP, never adopt.** Adoption is the
 *earned* branch; stopping is the fallback.
 
 **Routing to closeout (cases 1 and 2's terminal half) has two halves, and one of
@@ -2280,12 +2628,22 @@ Sources — read them before "simplifying" this condition away, because each
 records a real cost already paid:
 [[feedback_adopt_dead_session_in_progress_plans]] (case 2's checks; a plan
 stamped by a session that died at its usage limit with zero work products should
-be adopted, not re-vetted) and
+be adopted, not re-vetted),
 [[feedback_plan_already_stamped_by_other_session_is_live_peer]] (case 3; on
 2026-06-08 a session rationalized a peer's stamp as "an automated self-stamp",
 built four phases plus tests plus PR #479, and found on rebase that peer PR #468
 had merged the same plan one commit after its branch point — a full
-implementation wasted).
+implementation wasted) and plan
+`2026-11-23-dead-owner-in-progress-adoption-routes-around-its-prs` (case 2c;
+plan `2026-11-08-an-agents-relay-tab-spends-the-operators-ui-bridge-budget` was
+stamped `IN PROGRESS` by `61a189b8`, and its PR #2618 was authored by a
+different session, `c760b72e`, a gate continuation for #2589 — exactly the
+conjunct-2 shape, where each work product's OWN author must read dead, not only
+the stamping owner. A later run would STOP under case 2's no-PRs conjunct until
+session `db0d2123` followed served policy over this table, adopted it as #3109
+`supersedes #2618`, parked #2618 as a draft and put its close on a gate; coord
+finding `c1a5b241-ec17-4f83-a42a-61cf67e1191f`, the POLICY_GAP that session
+posted on 2026-11-23).
 
 This stamp is mandatory. A vetted plan without the stamp is
 indistinguishable from a draft, and `/implement-plan` will treat it as
@@ -2380,13 +2738,14 @@ runs at most about 90 s, inside the Bash tool's 120 s default:
 
 ```bash
 bash <workspace-root>/qontinui-claude-config/scripts/plan-reserve-release.sh release \
-  --stem "<plan-stem>" --reason "<why>"
+  --stem "<plan-stem>" --repo "<owner/name>" --reason "<why>"
 ```
 
 Quote its final verdict line in the §6 report (`RELEASED` is exit 0; a
-`NET_UNRETIRED`, `NET_MUTED` or `NET_FIRED` line names a net id to report, as
-does a `NET_CANCELLED` line whose mute did not land; `UNKNOWN` (2) and usage (64)
-released NOTHING, so run it again once the cause is fixed).
+`NET_UNRETIRED`, `NET_CANCELLED` or `NET_FIRED` line names a net id to report;
+`RELEASE_WITHHELD` (7), `UNKNOWN` (2) and usage (64) released NOTHING, so run it
+again once the cause is fixed, and do not stop the heartbeat loop after a 7 —
+`/implement-plan` Step 0.48 has the exit-7 remedies).
 The release MUST carry the SAME `agent_session_id` used at acquire — the owner
 token is the match key, so omitting it (or sending a different session) returns
 `"not_held"` and leaves the reservation to TTL out; the script resolves the pair
@@ -2600,6 +2959,9 @@ decisions only — see the predicate guidance in `_gate-registration`).
 > it there, so the window is anchored to the moment of arming rather than to
 > evaluation. The split is deliberate — do not "fix" it back into a continuation
 > on `unit_ready`, and do not re-spell it `unit_status`.
+> Under `/vet-imp`, the chain releases the plan reserve once step 8 reads this
+> net's `gate_id` back (`/vet-imp` Step 3). `/vet-plan` itself never releases it,
+> because its own reserve reads `renewed`.
 >
 > *Why the two gates are separate.* One gate was answering two different
 > questions — *this plan is ready, dispatchable work* (a record, true the instant
@@ -2876,6 +3238,18 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
    work_unit_id=<uuid> plan_slug=<plan stem>`. It merges rather than replaces,
    so it will not erase the `plan_slug` / `intent` `/preflight` Step 5 wrote, and
    it exits 0 on every path.
+   **Then declare the plan's phases on the unit, best-effort:**
+   `bash <workspace-root>/qontinui-claude-config/scripts/declare-plan-phases.sh <plan stem> <plan file>`.
+   This upsert carries no `metadata`, and on a multi-bound device no scanner
+   writes `phases` either, so without it `coord_work_unit_attest_phase` refuses
+   every phase ("no established phase declaration"). The script skips a
+   plan-backed unit, patches only on a difference, refuses any declaration that
+   drops a phase coord has established (a narrowing is patched by hand), and
+   bounds its own run time; its header is the contract. Quote its one verdict
+   line in the vet report and continue whatever it says: it never blocks the vet.
+   Until the runner ships `qontinui-pr plan-phase-declaration` (that plan's
+   Phase 1), the verdict is `UNKNOWN` on every box: expected, not a fault.
+   `/implement-plan` Step 0.5 runs the same script.
 2. **Always: resolve the operator's `device_id` DYNAMICALLY** (never hardcode a
    UUID): env `QONTINUI_MACHINE_ID` first, else read `~/.qontinui/machine.json`
    and parse `"device_id"` (fall back to `"machine_id"` if present).
@@ -3065,9 +3439,10 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
      `hint` field, so the brief goes into `initial_prompt` itself — coord would
      have produced the same text from a typed continuation's `hint`, plus a
      closing `/unattended` line it never adds to a legacy prompt. Without
-     it the spawned session's entire brief is `run /implement-plan <path>`: it
-     opens on a plan it has never read, with no idea why it was dispatched
-     instead of the vetting session finishing the work. Six labelled lines
+     it the spawned session gets `run /implement-plan <path>` and only what
+     coord's dispatch-time brief adds: it opens on a plan it has never read,
+     with no idea why it was dispatched instead of the vetting session finishing
+     the work. Six labelled lines
      (`Plan`/`Why`/`PR`/`Blocked`/`Resource-keys`/`Tried`), **references before
      bodies**, **≤2000 characters** — nothing enforces that cap and nothing
      truncates for you, so cut prose rather than references and end a cut brief

@@ -31,7 +31,7 @@
 //!
 //! Only the tail ([`TAIL_FIRST`], then once [`TAIL_WIDE`] when one tool result
 //! filled the first window), decoded lossily by
-//! [`super::claude_activity::read_tail_lossy`] and scanned from the end by
+//! [`qontinui_runner_lib::file_tail::read_tail_lossy`] and scanned from the end by
 //! [`super::claude_activity::last_message_ms`], which reads `type`, `isMeta`
 //! and `timestamp` and stops at the first real message. Nothing from a line is
 //! kept beyond the parsed instant.
@@ -40,7 +40,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-use super::claude_activity::{last_message_ms, read_tail_lossy};
+use super::claude_activity::last_message_ms;
+use qontinui_runner_lib::file_tail::read_tail_lossy;
 
 /// The first tail window read for a transcript.
 pub const TAIL_FIRST: u64 = 64 * 1024;

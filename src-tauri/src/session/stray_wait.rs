@@ -3238,14 +3238,14 @@ mod tests {
             let other = stray.pid.wrapping_add(1);
             assert_eq!(
                 ChildExemptions::from_strays(vec![stray.clone()])
-                    .admitted(&[stray.pid, other])
+                    .admitted(None, &[stray.pid, other])
                     .await,
                 std::collections::BTreeSet::from([stray.pid]),
                 "a re-proven stray among the children is admitted"
             );
             assert!(
                 ChildExemptions::from_strays(vec![stray.clone()])
-                    .admitted(&[other])
+                    .admitted(None, &[other])
                     .await
                     .is_empty(),
                 "a stray that WOULD re-prove is not admitted when it is not a child"
@@ -3254,7 +3254,7 @@ mod tests {
             execed.argv.push("x".to_string());
             assert!(
                 ChildExemptions::from_strays(vec![execed])
-                    .admitted(&[stray.pid, other])
+                    .admitted(None, &[stray.pid, other])
                     .await
                     .is_empty(),
                 "a stray whose argv changed is not admitted"
