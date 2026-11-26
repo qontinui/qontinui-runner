@@ -463,7 +463,7 @@ async fn a_captured_signature_is_refused_when_replayed_or_moved() {
     assert_eq!(ok.status(), 200);
     let captured = phone.gated_requests()[0].auth.clone().expect("signed");
 
-    let attacker = reqwest::Client::builder().no_proxy().build().unwrap();
+    let attacker = qontinui_runner_lib::outbound_net::client_builder().no_proxy().build().unwrap();
     for (method, target) in [
         (Method::GET, "/ui-bridge/control/snapshot"),
         (Method::GET, "/ui-bridge/control/screenshot"),

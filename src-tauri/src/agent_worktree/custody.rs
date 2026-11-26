@@ -2884,7 +2884,7 @@ pub mod coord {
         /// A proxy-free client, so an ambient `HTTP_PROXY` cannot reroute
         /// the loopback request these tests make.
         fn test_client() -> reqwest::Client {
-            reqwest::Client::builder().no_proxy().build().unwrap()
+            qontinui_runner_lib::outbound_net::client_builder().no_proxy().build().unwrap()
         }
 
         /// Serve one canned HTTP response on a loopback port; return its URL.

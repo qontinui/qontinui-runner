@@ -26,7 +26,7 @@ impl RunnerClient {
     pub fn new(port: u16) -> Self {
         // The base URL is always the loopback runner, so an `HTTP_PROXY` in
         // the environment must not route these requests away from it.
-        let client = reqwest::Client::builder()
+        let client = qontinui_runner_lib::outbound_net::client_builder()
             .timeout(Duration::from_secs(15))
             .no_proxy()
             .build()
@@ -641,7 +641,7 @@ impl RunnerClient {
 
 impl SupervisorClient {
     pub fn new(port: u16) -> Self {
-        let client = reqwest::Client::builder()
+        let client = qontinui_runner_lib::outbound_net::client_builder()
             .timeout(Duration::from_secs(30))
             .build()
             .expect("Failed to create HTTP client");

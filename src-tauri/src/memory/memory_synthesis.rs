@@ -873,12 +873,12 @@ async fn run_poll_loop(poller: Arc<MemoryJobPoller>) {
         if consent_open { "ACTIVE" } else { "IDLE" }
     );
 
-    let client = reqwest::Client::builder()
+    let client = qontinui_runner_lib::outbound_net::client_builder()
         .timeout(Duration::from_secs(30))
         .build()
         .unwrap_or_else(|e| {
             warn!(error = %e, "memory_jobs: reqwest client build failed; using default");
-            reqwest::Client::new()
+            qontinui_runner_lib::outbound_net::client()
         });
 
     let warned_no_base = Once::new();
@@ -1089,7 +1089,9 @@ mod tests {
             Arc::new(|_| SynthOutcome::Disabled),
         )
         .await;
-        let outcome = p.poll_once(&reqwest::Client::new(), &base).await;
+        let outcome = p
+            .poll_once(&qontinui_runner_lib::outbound_net::client(), &base)
+            .await;
         assert_eq!(outcome, PollOutcome::ConsentOff);
         let g = rec.lock().await;
         assert_eq!(g.claim_calls, 0, "consent off ⇒ no claim call");
@@ -1109,7 +1111,7 @@ mod tests {
             0,
             "nothing warned before the first tick"
         );
-        let client = reqwest::Client::new();
+        let client = qontinui_runner_lib::outbound_net::client();
         for _ in 0..5 {
             assert_eq!(
                 p.poll_once(&client, &base).await,
@@ -1142,7 +1144,7 @@ mod tests {
             ok_synth(),
         )
         .with_embedder(EmbeddingClient::with_url(&embed_url));
-        let client = reqwest::Client::new();
+        let client = qontinui_runner_lib::outbound_net::client();
 
         assert_eq!(p.poll_once(&client, &base).await, PollOutcome::ConsentOff);
         assert_eq!(rec.lock().await.claim_calls, 0);
@@ -1172,7 +1174,8 @@ mod tests {
         let (base, _rec) = spawn_fake_jobs_web(vec![]).await;
         let p = poller(true, Some("test.jwt"), ok_synth()).await;
         assert_eq!(
-            p.poll_once(&reqwest::Client::new(), &base).await,
+            p.poll_once(&qontinui_runner_lib::outbound_net::client(), &base)
+                .await,
             PollOutcome::Idle
         );
         assert_eq!(p.consent_warns.load(Ordering::Relaxed), 0);
@@ -1218,7 +1221,7 @@ mod tests {
             Box::new(|| None),
             ok_synth(),
         );
-        let client = reqwest::Client::new();
+        let client = qontinui_runner_lib::outbound_net::client();
         let outcome = p.poll_once_inner(&client, "http://127.0.0.1:9").await;
         let h = render_poller_health(true, outcome_code(&outcome), 1);
         assert_eq!(h["blockedBy"], json!("egress_transcript_sync"));
@@ -1274,7 +1277,8 @@ mod tests {
         let (base, rec) = spawn_fake_jobs_web(vec![embed_job("e1", &["a"])]).await;
         let p = poller(false, Some("test.jwt"), ok_synth()).await;
         assert_eq!(
-            p.poll_once(&reqwest::Client::new(), &base).await,
+            p.poll_once(&qontinui_runner_lib::outbound_net::client(), &base)
+                .await,
             PollOutcome::ConsentOff
         );
         assert_eq!(
@@ -1288,7 +1292,9 @@ mod tests {
     async fn unpaired_no_bearer_makes_no_http_calls() {
         let (base, rec) = spawn_fake_jobs_web(vec![synth_job("j1", &["a"])]).await;
         let p = poller(true, None, Arc::new(|_| SynthOutcome::Disabled)).await;
-        let outcome = p.poll_once(&reqwest::Client::new(), &base).await;
+        let outcome = p
+            .poll_once(&qontinui_runner_lib::outbound_net::client(), &base)
+            .await;
         assert_eq!(outcome, PollOutcome::NoAuth);
         let g = rec.lock().await;
         assert_eq!(g.claim_calls, 0, "no device JWT ⇒ no claim call");
@@ -1303,7 +1309,8 @@ mod tests {
     async fn claim_filters_to_the_kinds_this_runner_serves() {
         let (base, rec) = spawn_fake_jobs_web(vec![]).await;
         let p = poller(true, Some("test.jwt"), ok_synth()).await;
-        p.poll_once(&reqwest::Client::new(), &base).await;
+        p.poll_once(&qontinui_runner_lib::outbound_net::client(), &base)
+            .await;
 
         let g = rec.lock().await;
         assert_eq!(g.claim_bodies.len(), 1);
@@ -1320,7 +1327,9 @@ mod tests {
     async fn empty_claim_is_idle() {
         let (base, rec) = spawn_fake_jobs_web(vec![]).await;
         let p = poller(true, Some("test.jwt"), Arc::new(|_| SynthOutcome::Disabled)).await;
-        let outcome = p.poll_once(&reqwest::Client::new(), &base).await;
+        let outcome = p
+            .poll_once(&qontinui_runner_lib::outbound_net::client(), &base)
+            .await;
         assert_eq!(outcome, PollOutcome::Idle);
         assert!(rec.lock().await.result_calls.is_empty());
     }
@@ -1329,7 +1338,7 @@ mod tests {
     async fn claim_transport_error_is_retry() {
         let p = poller(true, Some("test.jwt"), Arc::new(|_| SynthOutcome::Disabled)).await;
         // Unroutable — connection refused.
-        let client = reqwest::Client::builder()
+        let client = qontinui_runner_lib::outbound_net::client_builder()
             .timeout(Duration::from_secs(2))
             .build()
             .unwrap();
@@ -1347,7 +1356,9 @@ mod tests {
     async fn synthesis_job_posts_text_and_its_embedding() {
         let (base, rec) = spawn_fake_jobs_web(vec![synth_job("j1", &["ep one", "ep two"])]).await;
         let p = poller(true, Some("test.jwt"), ok_synth()).await;
-        let outcome = p.poll_once(&reqwest::Client::new(), &base).await;
+        let outcome = p
+            .poll_once(&qontinui_runner_lib::outbound_net::client(), &base)
+            .await;
         assert_eq!(outcome, PollOutcome::Processed(1));
 
         let g = rec.lock().await;
@@ -1377,7 +1388,9 @@ mod tests {
             Arc::new(|_| SynthOutcome::Failed("boom".to_string())),
         )
         .await;
-        let outcome = p.poll_once(&reqwest::Client::new(), &base).await;
+        let outcome = p
+            .poll_once(&qontinui_runner_lib::outbound_net::client(), &base)
+            .await;
         assert_eq!(outcome, PollOutcome::Processed(1));
 
         let g = rec.lock().await;
@@ -1399,7 +1412,9 @@ mod tests {
         let (base, rec) =
             spawn_fake_jobs_web(vec![embed_job("e1", &["first", "second", "third"])]).await;
         let p = poller(true, Some("test.jwt"), ok_synth()).await;
-        let outcome = p.poll_once(&reqwest::Client::new(), &base).await;
+        let outcome = p
+            .poll_once(&qontinui_runner_lib::outbound_net::client(), &base)
+            .await;
         assert_eq!(outcome, PollOutcome::Processed(1));
 
         let g = rec.lock().await;
@@ -1434,7 +1449,8 @@ mod tests {
             Arc::new(|_| panic!("the embedding arm must never invoke the synthesizer"));
         let p = poller(true, Some("test.jwt"), never).await;
         assert_eq!(
-            p.poll_once(&reqwest::Client::new(), &base).await,
+            p.poll_once(&qontinui_runner_lib::outbound_net::client(), &base)
+                .await,
             PollOutcome::Processed(1)
         );
         assert!(rec.lock().await.result_calls[0].1["result"]["embeddings"].is_array());
@@ -1448,7 +1464,8 @@ mod tests {
         let (base, rec) = spawn_fake_jobs_web(vec![embed_job("e1", &[])]).await;
         let p = poller(true, Some("test.jwt"), ok_synth()).await;
         assert_eq!(
-            p.poll_once(&reqwest::Client::new(), &base).await,
+            p.poll_once(&qontinui_runner_lib::outbound_net::client(), &base)
+                .await,
             PollOutcome::Processed(1)
         );
         let g = rec.lock().await;
@@ -1466,7 +1483,9 @@ mod tests {
     async fn no_llm_credentials_leaves_jobs_unresulted() {
         let (base, rec) = spawn_fake_jobs_web(vec![synth_job("j1", &["a"])]).await;
         let p = poller(true, Some("test.jwt"), Arc::new(|_| SynthOutcome::Disabled)).await;
-        let outcome = p.poll_once(&reqwest::Client::new(), &base).await;
+        let outcome = p
+            .poll_once(&qontinui_runner_lib::outbound_net::client(), &base)
+            .await;
         assert_eq!(outcome, PollOutcome::Disabled(DISABLED_NO_LLM));
 
         let g = rec.lock().await;
@@ -1485,7 +1504,9 @@ mod tests {
     async fn embedder_down_leaves_embedding_job_unresulted() {
         let (base, rec) = spawn_fake_jobs_web(vec![embed_job("e1", &["a", "b"])]).await;
         let p = poller_with_embed_url(true, Some("test.jwt"), ok_synth(), EMBEDDER_DOWN_URL);
-        let outcome = p.poll_once(&reqwest::Client::new(), &base).await;
+        let outcome = p
+            .poll_once(&qontinui_runner_lib::outbound_net::client(), &base)
+            .await;
         assert_eq!(outcome, PollOutcome::Disabled(DISABLED_NO_EMBEDDER));
 
         let g = rec.lock().await;
@@ -1504,7 +1525,9 @@ mod tests {
     async fn embedder_down_leaves_synthesis_job_unresulted() {
         let (base, rec) = spawn_fake_jobs_web(vec![synth_job("j1", &["a"])]).await;
         let p = poller_with_embed_url(true, Some("test.jwt"), ok_synth(), EMBEDDER_DOWN_URL);
-        let outcome = p.poll_once(&reqwest::Client::new(), &base).await;
+        let outcome = p
+            .poll_once(&qontinui_runner_lib::outbound_net::client(), &base)
+            .await;
         assert_eq!(outcome, PollOutcome::Disabled(DISABLED_NO_EMBEDDER));
         assert!(
             rec.lock().await.result_calls.is_empty(),
@@ -1521,7 +1544,8 @@ mod tests {
             spawn_fake_jobs_web(vec![embed_job("e1", &["a"]), embed_job("e2", &["b"])]).await;
         let p = poller_with_embed_url(true, Some("test.jwt"), ok_synth(), EMBEDDER_DOWN_URL);
         assert_eq!(
-            p.poll_once(&reqwest::Client::new(), &base).await,
+            p.poll_once(&qontinui_runner_lib::outbound_net::client(), &base)
+                .await,
             PollOutcome::Disabled(DISABLED_NO_EMBEDDER)
         );
         assert!(
@@ -1570,7 +1594,8 @@ mod tests {
         let p = poller_with_embed_url(true, Some("test.jwt"), ok_synth(), &url);
 
         assert_eq!(
-            p.poll_once(&reqwest::Client::new(), &base).await,
+            p.poll_once(&qontinui_runner_lib::outbound_net::client(), &base)
+                .await,
             PollOutcome::Disabled(DISABLED_EMBEDDER_OFF_SPEC),
             "an up-but-wrong embedder must be named as such, NOT as an outage — \
              the operator action differs"
@@ -1591,7 +1616,8 @@ mod tests {
         let p = poller_with_embed_url(true, Some("test.jwt"), ok_synth(), &url);
 
         assert_eq!(
-            p.poll_once(&reqwest::Client::new(), &base).await,
+            p.poll_once(&qontinui_runner_lib::outbound_net::client(), &base)
+                .await,
             PollOutcome::Disabled(DISABLED_EMBEDDER_OFF_SPEC)
         );
         assert!(
@@ -1610,7 +1636,8 @@ mod tests {
         let p = poller_with_embed_url(true, Some("test.jwt"), ok_synth(), &url);
 
         assert_eq!(
-            p.poll_once(&reqwest::Client::new(), &base).await,
+            p.poll_once(&qontinui_runner_lib::outbound_net::client(), &base)
+                .await,
             PollOutcome::Processed(1)
         );
         let g = rec.lock().await;
@@ -1653,7 +1680,8 @@ mod tests {
         .await;
         let p = poller(true, Some("test.jwt"), ok_synth()).await;
         assert_eq!(
-            p.poll_once(&reqwest::Client::new(), &base).await,
+            p.poll_once(&qontinui_runner_lib::outbound_net::client(), &base)
+                .await,
             PollOutcome::Processed(1)
         );
         let g = rec.lock().await;

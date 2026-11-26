@@ -437,7 +437,7 @@ mod tests {
             let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
             l.local_addr().unwrap().port()
         };
-        let err = reqwest::Client::new()
+        let err = qontinui_runner_lib::outbound_net::client()
             .get(format!("http://127.0.0.1:{port}/"))
             .timeout(Duration::from_secs(5))
             .send()

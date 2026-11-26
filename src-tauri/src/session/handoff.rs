@@ -2390,7 +2390,7 @@ mod tests {
         let (base, seen) = spawn_fake_coord(200, r#"{"closed":true,"already_closed":false}"#).await;
         let source = Uuid::new_v4();
         let outcome = close_source(
-            &reqwest::Client::new(),
+            &qontinui_runner_lib::outbound_net::client(),
             &base,
             source,
             TenantScope::Owned(source_tenant),
@@ -2434,7 +2434,7 @@ mod tests {
         let (base, _) = spawn_fake_coord(403, r#"{"error":"not_handoff_target"}"#).await;
         assert!(matches!(
             close_source(
-                &reqwest::Client::new(),
+                &qontinui_runner_lib::outbound_net::client(),
                 &base,
                 Uuid::new_v4(),
                 TenantScope::Device
@@ -2446,7 +2446,7 @@ mod tests {
             spawn_fake_coord(403, r#"{"error":"handoff_child_not_materialized"}"#).await;
         assert!(matches!(
             close_source(
-                &reqwest::Client::new(),
+                &qontinui_runner_lib::outbound_net::client(),
                 &base,
                 Uuid::new_v4(),
                 TenantScope::Device
@@ -2461,7 +2461,7 @@ mod tests {
         };
         assert!(matches!(
             close_source(
-                &reqwest::Client::new(),
+                &qontinui_runner_lib::outbound_net::client(),
                 &format!("http://127.0.0.1:{port}"),
                 Uuid::new_v4(),
                 TenantScope::Device
@@ -2556,7 +2556,7 @@ mod tests {
             (200, r#"{"closed":true,"already_closed":false}"#),
         ])
         .await;
-        let http = reqwest::Client::new();
+        let http = qontinui_runner_lib::outbound_net::client();
         let sources = MaterializedSources::default();
         let source = Uuid::new_v4();
         let tenant = TenantScope::Device;
@@ -2603,7 +2603,7 @@ mod tests {
         let sources = MaterializedSources::default();
         let source = Uuid::new_v4();
         sources.mark(source, TenantScope::Device);
-        retry_due_closes(&reqwest::Client::new(), &base, &sources).await;
+        retry_due_closes(&qontinui_runner_lib::outbound_net::client(), &base, &sources).await;
         assert_eq!(sources.sighting(source), Sighting::Settled);
         assert_eq!(seen.lock().unwrap().len(), 1);
     }
@@ -2684,7 +2684,7 @@ mod tests {
             (200, r#"{"closed":true,"already_closed":false}"#),
         ])
         .await;
-        let http = reqwest::Client::new();
+        let http = qontinui_runner_lib::outbound_net::client();
         let sources = MaterializedSources::default();
         let device = Uuid::new_v4();
         let tenant_id = Uuid::new_v4();
@@ -2793,7 +2793,7 @@ mod tests {
         run_catchup(
             &registry,
             &store,
-            &reqwest::Client::new(),
+            &qontinui_runner_lib::outbound_net::client(),
             &base,
             Uuid::new_v4(),
             &sources,
@@ -2852,7 +2852,7 @@ mod tests {
         handle_push_frame(
             &registry,
             &store,
-            &reqwest::Client::new(),
+            &qontinui_runner_lib::outbound_net::client(),
             &base,
             device,
             &sources,
@@ -2995,7 +2995,7 @@ mod tests {
                 },
             },
         )])));
-        let http = reqwest::Client::new();
+        let http = qontinui_runner_lib::outbound_net::client();
         let device = Uuid::new_v4();
 
         run_catchup(&registry, &store, &http, &base, device, &sources).await;
@@ -3056,7 +3056,7 @@ mod tests {
                 close: CloseState::Refused { revivable: true },
             },
         )])));
-        let http = reqwest::Client::new();
+        let http = qontinui_runner_lib::outbound_net::client();
         let frame = ws_envelope(
             &format!("qontinui.sessions.{tenant_id}.{device}.handoff_request"),
             handoff_payload(source, device, tenant_id, "terminal_shell"),
@@ -3095,7 +3095,7 @@ mod tests {
         for _ in 0..total {
             sources.mark(Uuid::new_v4(), TenantScope::Device);
         }
-        let http = reqwest::Client::new();
+        let http = qontinui_runner_lib::outbound_net::client();
         retry_due_closes(&http, &base, &sources).await;
         assert_eq!(seen.lock().unwrap().len(), CLOSE_RETRY_PASS_CAP);
         assert_eq!(sources.due_closes(Instant::now()).len(), 3);
@@ -3834,7 +3834,7 @@ mod drain_tests {
     async fn trigger_handoff_2xx_reads_the_body() {
         let _amb = crate::test_env::isolated_ambient();
         let probe = DrainProbe::spawn(200).await;
-        let http = reqwest::Client::new();
+        let http = qontinui_runner_lib::outbound_net::client();
         trigger_handoff(
             &http,
             &probe.base,
@@ -3856,7 +3856,7 @@ mod drain_tests {
             resource_key: "k".into(),
         };
         reacquire_claim(
-            &reqwest::Client::new(),
+            &qontinui_runner_lib::outbound_net::client(),
             &probe.base,
             &claim,
             Uuid::new_v4(),
@@ -3874,7 +3874,7 @@ mod drain_tests {
         // close_source reads the body itself (`.text()`) to classify coord's
         // answer, so this pins that the read stays on every 2xx.
         let _ = close_source(
-            &reqwest::Client::new(),
+            &qontinui_runner_lib::outbound_net::client(),
             &probe.base,
             Uuid::new_v4(),
             TenantScope::Unresolved,
@@ -3888,7 +3888,7 @@ mod drain_tests {
         let _amb = crate::test_env::isolated_ambient();
         let probe = DrainProbe::spawn(500).await;
         let got =
-            fetch_latest_restore_record(&reqwest::Client::new(), &probe.base, Uuid::new_v4()).await;
+            fetch_latest_restore_record(&qontinui_runner_lib::outbound_net::client(), &probe.base, Uuid::new_v4()).await;
         assert!(got.is_none());
         probe.assert_all_drained().await;
     }

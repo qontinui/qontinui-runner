@@ -411,7 +411,7 @@ async fn post_observations(
         "{}/coord/fs/observations",
         coord_http_base.trim_end_matches('/')
     );
-    let client = match reqwest::Client::builder()
+    let client = match qontinui_runner_lib::outbound_net::client_builder()
         .timeout(Duration::from_secs(10))
         .build()
     {

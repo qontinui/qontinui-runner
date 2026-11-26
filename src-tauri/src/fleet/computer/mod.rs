@@ -938,7 +938,7 @@ impl Reporter {
             computers,
         };
         let url = format!("{}/coord/computers/report", base.trim_end_matches('/'));
-        let client = match reqwest::Client::builder().timeout(POST_TIMEOUT).build() {
+        let client = match qontinui_runner_lib::outbound_net::client_builder().timeout(POST_TIMEOUT).build() {
             Ok(c) => c,
             Err(e) => {
                 debug!("fleet::computer: http client build failed: {e}");

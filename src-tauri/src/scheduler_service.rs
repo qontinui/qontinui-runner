@@ -317,7 +317,7 @@ impl SchedulerService {
                 crate::commands::operator_doors::call_door_in_process(path, body, origin).await?;
             return Ok((reply.status, reply.body));
         }
-        let response = reqwest::Client::new()
+        let response = qontinui_runner_lib::outbound_net::client()
             .post(format!("{}{}", self.self_base_url(), path))
             .json(&body)
             .send()
@@ -1964,7 +1964,7 @@ impl SchedulerService {
         );
 
         // Build the request to run workflow via HTTP API
-        let client = reqwest::Client::new();
+        let client = qontinui_runner_lib::outbound_net::client();
         let base_url = self.self_base_url();
 
         // Load config if specified
@@ -2523,7 +2523,7 @@ impl SchedulerService {
 
     /// Check if runner is idle (not executing workflows or AI tasks)
     async fn check_idle(&self) -> bool {
-        let client = reqwest::Client::new();
+        let client = qontinui_runner_lib::outbound_net::client();
         let status_url = format!("{}/status", self.self_base_url());
         match client.get(&status_url).send().await {
             Ok(resp) => {

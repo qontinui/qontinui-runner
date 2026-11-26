@@ -1172,7 +1172,7 @@ impl HttpWorkUnitSink {
     pub fn new(base: impl Into<String>) -> Self {
         Self {
             base: base.into(),
-            client: reqwest::Client::new(),
+            client: qontinui_runner_lib::outbound_net::client(),
         }
     }
 

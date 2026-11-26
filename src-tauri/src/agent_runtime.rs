@@ -13483,7 +13483,7 @@ mod tests {
     async fn a_pending_list_slower_than_the_bound_is_a_body_read_failure_not_a_parse_failure() {
         // The bound also covers connect and headers, so it needs room on a loaded
         // box: too tight and this reads as `GET failed` instead of testing the body.
-        let client = reqwest::Client::new();
+        let client = qontinui_runner_lib::outbound_net::client();
         let (head, tail) = (r#"{"pending":[],"#, r#""total":0}"#);
 
         let url =
@@ -13934,7 +13934,7 @@ mod tests {
     /// one; a non-2xx is reported by its status, without reading a body at all.
     #[tokio::test]
     async fn a_pending_list_that_arrives_malformed_or_refused_says_which() {
-        let client = reqwest::Client::new();
+        let client = qontinui_runner_lib::outbound_net::client();
         let quick = std::time::Duration::from_millis(1);
         let bound = std::time::Duration::from_secs(10);
 

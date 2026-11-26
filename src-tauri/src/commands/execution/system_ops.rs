@@ -322,7 +322,10 @@ pub(crate) mod egress_tests {
         let url = format!("{}/latest.json", counter.http_base());
         let _pin = pin(Flow::UpdateCheck, level);
         let resp = run_update_op(op_kind, || async move {
-            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let client = qontinui_runner_lib::outbound_net::client_builder()
+                .no_proxy()
+                .build()
+                .unwrap();
             let _ = client.get(&url).send().await;
             Ok(CommandResponse {
                 success: true,

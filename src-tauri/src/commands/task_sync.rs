@@ -467,7 +467,7 @@ impl AITaskSyncService {
     pub fn new() -> Self {
         Self {
             auth_manager: AuthManager::new(),
-            client: reqwest::Client::new(),
+            client: qontinui_runner_lib::outbound_net::client(),
         }
     }
 

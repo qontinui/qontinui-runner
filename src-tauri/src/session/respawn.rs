@@ -2229,7 +2229,7 @@ mod drain_tests {
         let _amb = crate::test_env::isolated_ambient();
         let probe = DrainProbe::spawn(500).await;
         let bytes =
-            fetch_transcript_tier(&reqwest::Client::new(), &probe.base, Uuid::new_v4(), "warm")
+            fetch_transcript_tier(&qontinui_runner_lib::outbound_net::client(), &probe.base, Uuid::new_v4(), "warm")
                 .await;
         assert!(bytes.is_empty());
         probe.assert_all_drained().await;

@@ -81,7 +81,7 @@ mod tests {
     /// directly so the test never touches the network.
     #[test]
     fn apply_async_routes_oauth_to_bearer() {
-        let client = reqwest::Client::new();
+        let client = qontinui_runner_lib::outbound_net::client();
         let req = apply_async(
             client.post("https://api.anthropic.com/v1/messages"),
             "sk-ant-oat01-deadbeef",
@@ -110,7 +110,7 @@ mod tests {
 
     #[test]
     fn apply_async_routes_api_key_to_x_api_key() {
-        let client = reqwest::Client::new();
+        let client = qontinui_runner_lib::outbound_net::client();
         let req = apply_async(
             client.post("https://api.anthropic.com/v1/messages"),
             "sk-ant-api03-cafebabe",

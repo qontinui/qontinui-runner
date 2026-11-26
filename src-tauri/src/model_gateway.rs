@@ -1126,12 +1126,12 @@ fn gateway_blocking_client() -> &'static reqwest::blocking::Client {
 fn gateway_async_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
+        qontinui_runner_lib::outbound_net::client_builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_else(|e| {
                 warn!("model gateway: async client builder failed ({e}); using a bare client");
-                reqwest::Client::new()
+                qontinui_runner_lib::outbound_net::client()
             })
     })
 }
@@ -1984,7 +1984,7 @@ mod tests {
         .unwrap();
         assert!(call.is_gateway());
         let req = call
-            .post_async(&reqwest::Client::new(), MESSAGES_PATH)
+            .post_async(&qontinui_runner_lib::outbound_net::client(), MESSAGES_PATH)
             .build()
             .unwrap();
         assert_eq!(req.url().as_str(), "https://gw.example.com/v1/messages");

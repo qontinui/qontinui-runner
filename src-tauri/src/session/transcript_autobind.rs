@@ -224,7 +224,7 @@ async fn fetch_policy(tenant: Uuid) -> Option<bool> {
         "{}/tenant-policy?tenant_id={tenant}",
         base.trim_end_matches('/')
     );
-    let client = reqwest::Client::builder()
+    let client = qontinui_runner_lib::outbound_net::client_builder()
         .timeout(Duration::from_secs(3))
         .build()
         .ok()?;

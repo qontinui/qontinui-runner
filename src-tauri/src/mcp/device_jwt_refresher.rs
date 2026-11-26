@@ -854,7 +854,7 @@ async fn publish_coord_credential_status(
         body["tenant_id"] = serde_json::json!(t);
     }
 
-    let client = match reqwest::Client::builder()
+    let client = match qontinui_runner_lib::outbound_net::client_builder()
         .timeout(Duration::from_secs(5))
         .build()
     {
@@ -1586,7 +1586,7 @@ pub(crate) async fn try_device_self_refresh(
         coord_base.trim_end_matches('/'),
         device_id
     );
-    let client = match reqwest::Client::builder()
+    let client = match qontinui_runner_lib::outbound_net::client_builder()
         .timeout(Duration::from_secs(10))
         .build()
     {
@@ -3912,7 +3912,7 @@ pub(crate) async fn seed_tenant_slot(
         coord_base.trim_end_matches('/'),
         device_id
     );
-    let client = match reqwest::Client::builder()
+    let client = match qontinui_runner_lib::outbound_net::client_builder()
         .timeout(Duration::from_secs(10))
         .build()
     {
@@ -5682,7 +5682,7 @@ pub(crate) async fn refresh_tenant_slots(
         coord_base.trim_end_matches('/'),
         device_id
     );
-    let client = match reqwest::Client::builder()
+    let client = match qontinui_runner_lib::outbound_net::client_builder()
         .timeout(Duration::from_secs(10))
         .build()
     {
@@ -6139,7 +6139,7 @@ pub(crate) async fn try_device_machine_key_exchange(
         web_base.trim_end_matches('/'),
         device_id
     );
-    let client = match reqwest::Client::builder()
+    let client = match qontinui_runner_lib::outbound_net::client_builder()
         .timeout(Duration::from_secs(10))
         .build()
     {

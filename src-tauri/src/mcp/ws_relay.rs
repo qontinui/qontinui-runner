@@ -94,7 +94,7 @@ async fn install_ws_sdk_connection(
         app_url: synthetic_url.clone(),
         base_path: String::new(),
         app_info,
-        client: crate::mcp::sdk_http::SdkHttpClient::unsigned(reqwest::Client::new()),
+        client: crate::mcp::sdk_http::SdkHttpClient::unsigned(qontinui_runner_lib::outbound_net::client()),
         connected_at: chrono::Utc::now().timestamp_millis(),
         transport_kind: None,
         physical_device_id: None,

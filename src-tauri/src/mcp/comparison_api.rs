@@ -221,7 +221,7 @@ async fn launch_comparison_entries(
     variation_type: &str,
     mut entries: Vec<ComparisonEntryJson>,
 ) {
-    let client = reqwest::Client::new();
+    let client = qontinui_runner_lib::outbound_net::client();
     let base = format!("http://127.0.0.1:{}", api_port);
 
     for entry in entries.iter_mut() {

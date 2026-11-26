@@ -253,7 +253,7 @@ impl IosTransport {
     pub async fn list_devices(&self) -> Result<Vec<IosDevice>, TransportError> {
         let port = self.start_service().await?;
         let url = format!("http://127.0.0.1:{port}/devices");
-        let client = reqwest::Client::builder()
+        let client = qontinui_runner_lib::outbound_net::client_builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()
             .map_err(|e| TransportError::IosSidecar(e.to_string()))?;
@@ -312,7 +312,7 @@ async fn request_forward(
     device_port: u16,
 ) -> Result<u16, TransportError> {
     let url = format!("http://127.0.0.1:{sidecar_port}/forward");
-    let client = reqwest::Client::builder()
+    let client = qontinui_runner_lib::outbound_net::client_builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| TransportError::IosSidecar(e.to_string()))?;

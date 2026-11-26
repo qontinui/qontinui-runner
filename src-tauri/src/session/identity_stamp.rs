@@ -982,7 +982,7 @@ async fn post(base: &str, device_id: uuid::Uuid, token: &str, rows: &[IdentityRo
         observed_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
         rows,
     };
-    let Ok(client) = reqwest::Client::builder().timeout(POST_TIMEOUT).build() else {
+    let Ok(client) = qontinui_runner_lib::outbound_net::client_builder().timeout(POST_TIMEOUT).build() else {
         return PostOutcome::Transport;
     };
     // coord-auth-exempt(device-jwt-required): `token` is the paired-device JWT

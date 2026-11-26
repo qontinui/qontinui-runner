@@ -69,7 +69,7 @@ impl StepHandler for SpecCheckHandler {
         //    shares the SDK connection via ApiState). All spec-loading,
         //    snapshot-fetch, and matching logic lives there / in Plan 02.
         let self_base = crate::mcp::types::get_self_base_url(&context.app_state);
-        let client = match reqwest::Client::builder()
+        let client = match qontinui_runner_lib::outbound_net::client_builder()
             .timeout(std::time::Duration::from_secs(15))
             .build()
         {

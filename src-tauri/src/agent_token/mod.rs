@@ -891,7 +891,7 @@ mod tests {
 
     #[test]
     fn refresh_attaches_device_proof_header_only_when_held() {
-        let client = reqwest::Client::new();
+        let client = qontinui_runner_lib::outbound_net::client();
         let with = attach_device_proof(
             client.post("http://127.0.0.1:1/agents/x/refresh-token"),
             proof_header_value(Some("device.jwt.value".to_string())),

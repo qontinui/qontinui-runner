@@ -2349,7 +2349,7 @@ async fn post_allocate_once(
     // `attach_device_auth_for(` statement (the coord-auth pin test reads it
     // there).
     let client = match timeout {
-        None => reqwest::Client::new(),
+        None => qontinui_runner_lib::outbound_net::client(),
         Some(_) => crate::coord_http::coord_client()
             .cloned()
             .unwrap_or_else(reqwest::Client::new),

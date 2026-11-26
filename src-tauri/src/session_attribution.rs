@@ -349,7 +349,7 @@ pub async fn run_attribution_cycle() -> Result<(), String> {
         return Ok(());
     }
 
-    let client = reqwest::Client::builder()
+    let client = qontinui_runner_lib::outbound_net::client_builder()
         .timeout(Duration::from_secs(5))
         .build()
         .map_err(|e| format!("reqwest builder: {e}"))?;

@@ -210,7 +210,7 @@ pub async fn fetch_and_reload_once() -> Result<(), String> {
         debug!("auto_response_fleet: no coord base configured — skipping fetch");
         return Ok(());
     };
-    let client = reqwest::Client::builder()
+    let client = qontinui_runner_lib::outbound_net::client_builder()
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| format!("reqwest client build: {e}"))?;

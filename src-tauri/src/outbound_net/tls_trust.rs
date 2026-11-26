@@ -465,7 +465,7 @@ mod tests {
         rt.block_on(async {
             match kind {
                 "reqwest" => {
-                    let resp = reqwest::Client::new()
+                    let resp = qontinui_runner_lib::outbound_net::client()
                         .get(url)
                         .send()
                         .await

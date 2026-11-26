@@ -448,7 +448,7 @@ mod tests {
         let store = Arc::new(DeviceTokenStore::in_memory());
         store.store("phone-x", "token-x", true).unwrap();
         let signer = DeviceSigner::new("phone-x".to_string(), store, None);
-        SdkHttpClient::signed(reqwest::Client::new(), Arc::new(signer))
+        SdkHttpClient::signed(qontinui_runner_lib::outbound_net::client(), Arc::new(signer))
     }
 
     /// A body that is not in memory cannot be signed, so the refusal is made here
