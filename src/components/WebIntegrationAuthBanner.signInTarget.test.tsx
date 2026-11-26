@@ -590,3 +590,50 @@ describe("WebIntegrationAuthBanner credential-dark sign-in CTA target (operator 
     expect(signInCalls().length).toBe(0);
   });
 });
+
+/**
+ * Call a button's React `onClick` DIRECTLY. jsdom never dispatches a click to
+ * a disabled button, so clicking one tests nothing about the handler's guard.
+ */
+async function callOnClickDirectly(button: HTMLButtonElement): Promise<void> {
+  const key = Object.keys(button).find((k) => k.startsWith("__reactProps$"));
+  expect(key).toBeDefined();
+  const props = (button as unknown as Record<string, { onClick?: (e?: unknown) => unknown }>)[key!];
+  expect(typeof props.onClick).toBe("function");
+  await act(async () => {
+    await props.onClick!();
+  });
+  await act(async () => {});
+}
+
+describe("WebIntegrationAuthBanner sign-in handler guards (called directly, not clicked)", () => {
+  it("Authorize's handler starts nothing while a Retry's re-read is in flight", async () => {
+    statusReply = DEBUG_LOOPBACK;
+    await mount();
+    statusReply = new Error("get_web_integration_status failed");
+    await act(async () => {
+      emit("web-integration-changed");
+    });
+    await act(async () => {});
+    statusReply = deferredStatus().promise;
+    await clickRetry(buttonLabelled("Retry"));
+    const reading = buttonLabelled("Reading…");
+    expect(reading!.disabled).toBe(true);
+    const readsBefore = statusReads();
+    await callOnClickDirectly(reading!);
+    expect(statusReads()).toBe(readsBefore);
+    expect(signInCalls().length).toBe(0);
+  });
+
+  it("the credential-dark CTA's handler starts nothing while the FIRST status read is pending", async () => {
+    statusReply = new Promise(() => {});
+    postureReply = DARK_SIGN_IN_POSTURE;
+    await mount();
+    const cta = credentialCta();
+    expect(cta.disabled).toBe(true);
+    const readsBefore = statusReads();
+    await callOnClickDirectly(cta);
+    expect(statusReads()).toBe(readsBefore);
+    expect(signInCalls().length).toBe(0);
+  });
+});

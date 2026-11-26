@@ -41,7 +41,7 @@
  * `WebIntegrationSettings` panel.
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
@@ -60,17 +60,18 @@ import {
 } from "lucide-react";
 
 import { useRunnerTier } from "@/hooks/useRunnerTier";
+import {
+  signInControl,
+  useSavedBackendStatus,
+  type SignInControl,
+} from "@/hooks/useSavedBackendStatus";
 import { useAuth } from "@/components/AuthProvider";
 import {
   NO_BROWSER_HINT,
   PendingSignInNotice,
   isSignInCancelled,
 } from "@/components/PendingSignInNotice";
-import {
-  signInBackendUrlFrom,
-  signInTargetExplanation,
-  type SavedBackendStatus,
-} from "@/lib/savedBackendUrl";
+import { signInBackendUrlFrom, signInTargetExplanation } from "@/lib/savedBackendUrl";
 import { SectionHeader } from "./SectionHeader";
 import type { LogFunction } from "./types";
 
@@ -109,16 +110,21 @@ export function AccountSettings({ onLog, onOpenBackendConnection }: AccountSetti
   // The target is the SAVED Backend Connection URL when the one sign-in rule
   // honours it on this "operator" surface (savedBackendUrl.ts), else
   // production; the panel shows the EFFECTIVE target and, when it differs from
-  // the saved URL, why. `null` = not loaded yet (or the read failed): sign-in
-  // is disabled rather than guessing. A read that answers with a
-  // `settingsFault` is treated as a failed one: its `backendUrl` is a
-  // placeholder, not the saved choice, so the panel offers Retry. The legacy email/password pairing was
-  // removed (web backend is Cognito-only); Cognito sign-in (and browser SSO)
-  // are the only sign-in paths.
-  const [backendStatus, setBackendStatus] = useState<SavedBackendStatus | null>(null);
-  const [backendUrlLoadFailed, setBackendUrlLoadFailed] = useState(false);
-  // True while a Retry-triggered status re-read is in flight ("Reading…").
-  const [backendStatusRetrying, setBackendStatusRetrying] = useState(false);
+  // the saved URL, why. `decisionStatus` is `null` while loading, after a
+  // failed read (a failed re-read DROPS the earlier status here: the target is
+  // not decided from a stale read), or while the read reports a
+  // `settingsFault` (its `backendUrl` is a placeholder, not the saved choice):
+  // sign-in is then disabled or "Retry" rather than guessing. The legacy
+  // email/password pairing was removed (web backend is Cognito-only); Cognito
+  // sign-in (and browser SSO) are the only sign-in paths.
+  const {
+    phase: backendStatusPhase,
+    decisionStatus,
+    reading: backendStatusReading,
+    retry: retryBackendStatus,
+  } = useSavedBackendStatus({
+    onReadError: (err) => onLog("error", `Failed to load saved backend URL: ${err}`),
+  });
   const [cognitoState, setCognitoState] = useState<"idle" | "signing-in">("idle");
 
   // --- Coord Doctor self-check (plan 2026-06-13 Phase 4) --------------------
@@ -221,78 +227,30 @@ export function AccountSettings({ onLog, onOpenBackendConnection }: AccountSetti
     };
   }, [refreshTier]);
 
-  // Issue order of status reads: reads overlap (mount + each
-  // `web-integration-changed`) and may settle out of order, so only the most
-  // recently ISSUED read may set state — the same guard the auth banner uses.
-  const backendStatusReadSeq = useRef(0);
-  // The live effect run's status read, so "Retry" can re-issue it outside the
-  // effect under the same `cancelled` + issue-order guards; null once unmounted.
-  // Resolves once that read has settled (never rejects).
-  const reloadBackendStatusRef = useRef<(() => Promise<void>) | null>(null);
-  useEffect(() => {
-    let cancelled = false;
-    const load = async () => {
-      // A superseded effect run's listener must not bump the shared counter
-      // and invalidate the current run's in-flight read.
-      if (cancelled) return;
-      const seq = ++backendStatusReadSeq.current;
-      const isLatest = () => !cancelled && seq === backendStatusReadSeq.current;
-      try {
-        const st = await invoke<SavedBackendStatus>("get_web_integration_status");
-        if (isLatest()) {
-          setBackendStatus(st);
-          setBackendUrlLoadFailed(false);
-        }
-      } catch (err) {
-        if (isLatest()) {
-          // A failed re-read drops the earlier status: the target is not
-          // decided from a stale read.
-          setBackendStatus(null);
-          setBackendUrlLoadFailed(true);
-          onLog("error", `Failed to load saved backend URL: ${err}`);
-        }
-      }
-    };
-    reloadBackendStatusRef.current = load;
-    void load();
-    const unlistenPromise = listen("web-integration-changed", () => void load());
-    return () => {
-      cancelled = true;
-      if (reloadBackendStatusRef.current === load) reloadBackendStatusRef.current = null;
-      void unlistenPromise.then((un) => un());
-    };
-  }, [onLog]);
-
-  // The saved settings are unreadable even though the read itself succeeded.
-  const backendSettingsFaulted = backendStatus !== null && backendStatus.settingsFault != null;
-  // The status the sign-in target is decided from: `null` while loading, after
-  // a failed read, or while the read reports a settings fault.
-  const usableBackendStatus = backendSettingsFaulted ? null : backendStatus;
-
   const handleCognitoSignIn = useCallback(async () => {
     // An unknown target is never guessed as production (finalize_signed_in
     // would write it over a saved backend). After a FAILED or FAULTED read the
     // button is "Retry" and re-reads the status instead of signing in; while
     // the first read (or a Retry's re-read) is pending the button is disabled
     // and the handler refuses.
-    if (backendStatusRetrying) return;
-    if (usableBackendStatus === null) {
-      if (backendUrlLoadFailed || backendSettingsFaulted) {
-        setFlowError(null);
-        const reload = reloadBackendStatusRef.current;
-        if (!reload) return;
-        setBackendStatusRetrying(true);
-        try {
-          await reload();
-        } finally {
-          setBackendStatusRetrying(false);
+    switch (
+      signInControl(backendStatusPhase, backendStatusReading, cognitoState === "signing-in")
+    ) {
+      case "reading":
+        return;
+      case "wait":
+        if (backendStatusPhase === "loading") {
+          setFlowError("Waiting for the saved backend settings to load before signing in.");
         }
         return;
-      }
-      setFlowError("Waiting for the saved backend settings to load before signing in.");
-      return;
+      case "retry":
+        setFlowError(null);
+        retryBackendStatus();
+        return;
+      case "sign-in":
+        break;
     }
-    const backendUrl = signInBackendUrlFrom(usableBackendStatus, "operator");
+    const backendUrl = signInBackendUrlFrom(decisionStatus, "operator");
     setCognitoState("signing-in");
     setFlowError(null);
     onLog("info", "Opening browser for Qontinui (Cognito) sign-in — complete the flow there");
@@ -324,10 +282,11 @@ export function AccountSettings({ onLog, onOpenBackendConnection }: AccountSetti
       setCognitoState("idle");
     }
   }, [
-    usableBackendStatus,
-    backendUrlLoadFailed,
-    backendSettingsFaulted,
-    backendStatusRetrying,
+    backendStatusPhase,
+    backendStatusReading,
+    cognitoState,
+    decisionStatus,
+    retryBackendStatus,
     onLog,
     refreshTier,
   ]);
@@ -597,14 +556,16 @@ export function AccountSettings({ onLog, onOpenBackendConnection }: AccountSetti
         <SignedOutPanel
           cognitoSigningIn={cognitoState === "signing-in"}
           onCognitoSignIn={handleCognitoSignIn}
-          signInTarget={
-            usableBackendStatus ? signInBackendUrlFrom(usableBackendStatus, "operator") : null
-          }
+          signInTarget={decisionStatus ? signInBackendUrlFrom(decisionStatus, "operator") : null}
           signInTargetReason={
-            usableBackendStatus ? signInTargetExplanation(usableBackendStatus, "operator") : null
+            decisionStatus ? signInTargetExplanation(decisionStatus, "operator") : null
           }
-          backendUrlLoadFailed={backendUrlLoadFailed || backendSettingsFaulted}
-          backendStatusRetrying={backendStatusRetrying}
+          backendUrlLoadFailed={backendStatusPhase === "unknown"}
+          signInControl={signInControl(
+            backendStatusPhase,
+            backendStatusReading,
+            cognitoState === "signing-in",
+          )}
           onOpenBackendConnection={onOpenBackendConnection}
         />
       )}
@@ -713,8 +674,8 @@ interface SignedOutPanelProps {
   /** The latest status read failed OR reported a settings fault: the saved
    *  settings could not be read, so the button offers Retry. */
   backendUrlLoadFailed: boolean;
-  /** A Retry-triggered re-read is in flight. */
-  backendStatusRetrying: boolean;
+  /** What the sign-in button does now ({@link signInControl}). */
+  signInControl: SignInControl;
   onOpenBackendConnection: () => void;
 }
 
@@ -724,18 +685,16 @@ function SignedOutPanel({
   signInTarget,
   signInTargetReason,
   backendUrlLoadFailed,
-  backendStatusRetrying,
+  signInControl: control,
   onOpenBackendConnection,
 }: SignedOutPanelProps) {
   // The target is never guessed (#3049). While the first read is loading the
   // button is disabled; after a FAILED (or faulted) read it is "Retry" and
   // re-reads the status (the handler does not sign in), reading "Reading…"
   // and disabled while that re-read is in flight. Signing in wins over Retry.
-  const readingRetry = backendStatusRetrying && !cognitoSigningIn;
-  const retryRead =
-    signInTarget === null && backendUrlLoadFailed && !cognitoSigningIn && !readingRetry;
-  const cognitoDisabled =
-    cognitoSigningIn || readingRetry || (signInTarget === null && !backendUrlLoadFailed);
+  const readingRetry = control === "reading";
+  const retryRead = control === "retry";
+  const cognitoDisabled = control === "wait" || readingRetry;
 
   return (
     <div className="space-y-5">
