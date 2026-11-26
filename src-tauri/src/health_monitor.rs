@@ -17,8 +17,32 @@ use qontinui_runner_lib::wedge_diagnostics::{capture_thread_name_census, ThreadN
 /// Interval between health checks in seconds
 const HEALTH_CHECK_INTERVAL_SECS: u64 = 60;
 
-/// Memory threshold in MB to trigger a warning
-const MEMORY_WARNING_THRESHOLD_MB: u64 = 1024; // 1 GB
+/// Resident-memory threshold in MiB above which the health loop WARNs
+/// "possible memory leak". A log line only: no route serves a verdict from
+/// this threshold. `/health`'s memory verdict is `spawnAdmission.memory`, from
+/// `resource_guard`'s free-commit lane — a different quantity and limit.
+///
+/// 8 GiB, calibrated 2026-11-11: healthy runners plateau at 3.1-3.6 GiB
+/// resident (`qontinui-dev-notes`
+/// `devops-data/2026-11-11-runner-rss-nilan/fit.md`), so 8 GiB is 2.2x the
+/// highest healthy plateau — the same NUMBER as coord's S12 absolute warn arm
+/// (plan `2026-11-11-devops-runner-self-rss-is-absent-from-the-resource-sample`),
+/// though not the same quantity: coord grades private bytes (RssAnon + swap),
+/// this compares resident memory, so the two need not fire together.
+/// The previous 1 GiB sat BELOW every healthy runner at rest, so it fired once
+/// a minute forever (~1,440 "possible memory leak" lines a day) and marked a
+/// healthy runner unhealthy: a detector that always fires detects nothing.
+/// Slow leaks below this level are coord's sustained-slope arm's to catch.
+const MEMORY_WARNING_THRESHOLD_MB: u64 = 8 * 1024;
+
+/// The memory-warning predicate the 60 s log loop applies. Its only consumer
+/// is that `warn!` line, so this is a leak breadcrumb, not a health verdict:
+/// the runner's in-process memory verdict is `resource_guard`'s free-commit
+/// lane (on `/health` as `spawnAdmission.memory` while the session guard is
+/// enabled), and coord's S12 arm grades the runner's resident memory fleet-side.
+fn memory_exceeds_warning(memory_mb: u64) -> bool {
+    memory_mb > MEMORY_WARNING_THRESHOLD_MB
+}
 
 /// Thread count threshold to trigger a warning.
 /// Set to 150 to avoid false positives — the runner legitimately uses 100-130
@@ -154,6 +178,16 @@ static MONOTONIC_EPOCH: once_cell::sync::Lazy<Instant> = once_cell::sync::Lazy::
 /// the watchdog would silently treat a live loop as not-yet-running.
 fn monotonic_now_ms() -> i64 {
     (MONOTONIC_EPOCH.elapsed().as_millis() as i64).saturating_add(1)
+}
+
+/// Elapsed since the process clock's epoch — the time base every boot-stage
+/// offset and the bind latency are measured on.
+///
+/// `MONOTONIC_EPOCH` is lazy; `main()` anchors it near its first line (through
+/// `boot_stage::stamp(ProcessStart)`), so in production this is "since process
+/// start" to within the few instructions before that stamp.
+pub(crate) fn process_elapsed() -> Duration {
+    MONOTONIC_EPOCH.elapsed()
 }
 
 /// How often the watchdog thread wakes to write its heartbeat.
@@ -1317,6 +1351,22 @@ fn watchdog_loop<S>(dir: PathBuf, tick: Duration, stop: Arc<AtomicBool>, sample:
 where
     S: Fn() -> WatchdogSample,
 {
+    watchdog_loop_with_hook(dir, tick, stop, sample, |_, _| {})
+}
+
+/// [`watchdog_loop`] plus a per-tick hook that runs AFTER the heartbeat and
+/// incident writes, on the same OS thread. Production passes
+/// [`SdWatchdogFeed::tick`]; the tests drive the hookless form.
+fn watchdog_loop_with_hook<S, H>(
+    dir: PathBuf,
+    tick: Duration,
+    stop: Arc<AtomicBool>,
+    sample: S,
+    mut on_tick: H,
+) where
+    S: Fn() -> WatchdogSample,
+    H: FnMut(&Path, WatchdogSample),
+{
     let mut state = WatchdogState::default();
     while !stop.load(Ordering::SeqCst) {
         let s = sample();
@@ -1324,7 +1374,110 @@ where
         if let Some(reason) = state.step(s) {
             append_watchdog_incident(&dir, reason, s);
         }
+        on_tick(&dir, s);
         std::thread::sleep(tick);
+    }
+}
+
+/// Is the self-probe thread's heartbeat fresh enough that its
+/// `backend_wedged` flag can be trusted? Same threshold as
+/// [`WatchdogState::step`]'s `monitor_stalled`. A thread that has never
+/// ticked gets the same allowance measured from `started_ms` (the feed's
+/// first sample) — but NOT forever: for systemd a probe thread that never
+/// starts must eventually read stale, or its keepalive would be unconditional.
+fn sd_monitor_heartbeat_fresh(s: WatchdogSample, started_ms: i64) -> bool {
+    let since = if s.monitor_heartbeat_ms > 0 {
+        s.monitor_heartbeat_ms
+    } else {
+        started_ms
+    };
+    (s.now_ms - since) / 1000 <= WATCHDOG_MONITOR_STALL_SECS
+}
+
+/// Feeds systemd's `WatchdogSec=` from the wedge-watchdog thread (plan
+/// `2026-10-19-ci-nodes-run-the-tauri-runner-always-on-as-ci-node-role`
+/// Phase 2b). Inert without `NOTIFY_SOCKET` — see [`crate::sd_notify`].
+#[derive(Debug, Default)]
+struct SdWatchdogFeed {
+    /// Monotonic ms of the first sample (`0` = no tick yet).
+    started_ms: i64,
+    /// The last decision, so a transition into `Withhold` is recorded once.
+    last: Option<crate::sd_notify::WatchdogDecision>,
+}
+
+impl SdWatchdogFeed {
+    fn tick(&mut self, dir: &Path, s: WatchdogSample) {
+        self.tick_with(dir, s, crate::sd_notify::watchdog_tick);
+    }
+
+    /// [`Self::tick`] with the decide-and-send step injected — the test seam.
+    /// `decide(backend_wedged, monitor_fresh)` returns `None` when there is no
+    /// service manager to notify.
+    fn tick_with<D>(&mut self, dir: &Path, s: WatchdogSample, decide: D)
+    where
+        D: FnOnce(bool, bool) -> Option<crate::sd_notify::WatchdogDecision>,
+    {
+        use crate::sd_notify::WatchdogDecision;
+        if self.started_ms == 0 {
+            self.started_ms = s.now_ms;
+        }
+        let fresh = sd_monitor_heartbeat_fresh(s, self.started_ms);
+        let Some(decision) = decide(s.backend_wedged, fresh) else {
+            return;
+        };
+        if self.last != Some(decision)
+            && decision != WatchdogDecision::Keepalive(crate::sd_notify::KeepaliveReason::Healthy)
+        {
+            append_sd_watchdog_line(dir, decision, s, fresh);
+        }
+        self.last = Some(decision);
+    }
+}
+
+/// One `wedge-incidents.log` line per transition of the systemd keepalive
+/// away from healthy — the record the plan names beside `NRestarts`.
+fn append_sd_watchdog_line(
+    dir: &Path,
+    decision: crate::sd_notify::WatchdogDecision,
+    s: WatchdogSample,
+    monitor_fresh: bool,
+) {
+    use crate::sd_notify::{KeepaliveReason, WatchdogDecision};
+    use std::io::Write;
+    let what = match decision {
+        WatchdogDecision::Withhold => concat!(
+            "WITHHOLDING WATCHDOG=1 (no CI build in flight, restart-readiness snapshot ",
+            "reads safe) — systemd will restart this runner when WatchdogSec= expires"
+        ),
+        WatchdogDecision::Keepalive(KeepaliveReason::HostingWork) => concat!(
+            "keeping WATCHDOG=1 despite the wedge: a CI build is in flight or the ",
+            "readiness snapshot counts live work"
+        ),
+        WatchdogDecision::Keepalive(KeepaliveReason::ReadinessUnknown) => concat!(
+            "keeping WATCHDOG=1 despite the wedge: the readiness snapshot is UNKNOWN ",
+            "(never ran, contended, or stale)"
+        ),
+        WatchdogDecision::Keepalive(KeepaliveReason::Healthy) => "WATCHDOG=1 (healthy)",
+    };
+    let line = format!(
+        concat!(
+            "{} SD_WATCHDOG {} — pid {}, backend_wedged={}, probe heartbeat fresh={}, ",
+            "consecutive /livez failures {}\n"
+        ),
+        chrono::Utc::now().to_rfc3339(),
+        what,
+        std::process::id(),
+        s.backend_wedged,
+        monitor_fresh,
+        s.consecutive_failures,
+    );
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(wedge_incidents_path(dir))
+    {
+        let _ = f.write_all(line.as_bytes());
+        let _ = f.flush();
     }
 }
 
@@ -1351,11 +1504,26 @@ fn start_wedge_watchdog_with<S>(dir: PathBuf, tick: Duration, stop: Arc<AtomicBo
 where
     S: Fn() -> WatchdogSample + Send + 'static,
 {
+    start_wedge_watchdog_with_hook(dir, tick, stop, sample, |_, _| {});
+}
+
+/// [`start_wedge_watchdog_with`] with a per-tick hook (see
+/// [`watchdog_loop_with_hook`]).
+fn start_wedge_watchdog_with_hook<S, H>(
+    dir: PathBuf,
+    tick: Duration,
+    stop: Arc<AtomicBool>,
+    sample: S,
+    on_tick: H,
+) where
+    S: Fn() -> WatchdogSample + Send + 'static,
+    H: FnMut(&Path, WatchdogSample) + Send + 'static,
+{
     // `std::thread::spawn`, NOT a tokio task. This is the entire point of the
     // item: the thread must be schedulable by the OS when the runtime is not.
     let _ = std::thread::Builder::new()
         .name("wedge-watchdog".to_string())
-        .spawn(move || watchdog_loop(dir, tick, stop, sample));
+        .spawn(move || watchdog_loop_with_hook(dir, tick, stop, sample, on_tick));
 }
 
 /// Guard so `stop_health_monitor` also stops the watchdog.
@@ -1369,19 +1537,36 @@ fn start_wedge_watchdog() {
     // loop, where a stall in settings/path resolution would silence us.
     let dir = crate::paths::get_dev_logs_dir();
     WATCHDOG_STOP.store(false, Ordering::SeqCst);
-    start_wedge_watchdog_with(
-        dir,
+    // The systemd keepalive rides THIS thread's tick (plan 2026-10-19
+    // Phase 2b), never the tokio-hosted self-probe loop: a stalled probe loop
+    // then reads as a stale heartbeat, i.e. a readiness-GATED kill.
+    let mut feed = SdWatchdogFeed::default();
+    // A tick longer than half systemd's `WatchdogSec=` would leave no slack
+    // for one late wake, so it is shortened to fit (and said once).
+    let (tick, shortened) = crate::sd_notify::tick_for_watchdog(
         Duration::from_secs(WATCHDOG_TICK_SECS),
+        crate::sd_notify::watchdog_interval(),
+    );
+    if shortened {
+        warn!(
+            "sd_notify: wedge-watchdog tick {}s exceeds half of WATCHDOG_USEC ({:?}) — ticking every {:?} instead",
+            WATCHDOG_TICK_SECS,
+            crate::sd_notify::watchdog_interval(),
+            tick
+        );
+    }
+    start_wedge_watchdog_with_hook(
+        dir,
+        tick,
         WATCHDOG_STOP.clone(),
         live_watchdog_sample,
+        move |dir, s| feed.tick(dir, s),
     );
 }
 
 /// Health metrics snapshot
 #[derive(Debug, Clone)]
 pub struct HealthMetrics {
-    /// Timestamp of the check
-    pub timestamp: chrono::DateTime<chrono::Utc>,
     /// Resident memory in bytes — `WorkingSetSize` on Windows, `statm`
     /// field 2 × page size on Linux (0 where `/proc` is absent, e.g. macOS).
     /// Both measuring arms report the same quantity.
@@ -1396,8 +1581,6 @@ pub struct HealthMetrics {
     pub agent_log_emitter_agents: usize,
     /// Process uptime in seconds
     pub uptime_secs: u64,
-    /// CPU usage percentage (0-100)
-    pub cpu_percent: Option<f32>,
 }
 
 impl HealthMetrics {
@@ -1784,10 +1967,12 @@ fn thread_name_census_to_json(census: &ThreadNameCensus) -> serde_json::Value {
             .iter()
             .map(|row| serde_json::json!({ "name": row.name, "count": row.count }))
             .collect::<Vec<_>>(),
-        // The UNCAPPED per-session tally (`terminal-reader` + `terminal-waiter`)
-        // the thread guard subtracts — `byName` is capped and must never be
-        // summed for it.
+        // The UNCAPPED per-session tally (`terminal-reader` + `terminal-waiter`,
+        // plus `pty-holder-ctl` + `pty-holder-pump` on holder-backed panes) the
+        // thread guard subtracts — `byName` is capped and must never be summed
+        // for it. `holderSessionThreads` is the holder-family subset.
         "sessionThreads": census.session_threads,
+        "holderSessionThreads": census.holder_session_threads,
         "sampledAt": sampled_at,
     })
 }
@@ -1814,8 +1999,8 @@ const LEAK_WARN_TOP_ROWS: usize = 3;
 
 /// Get current thread count, with an unreadable sensor rendered as `0`.
 ///
-/// The health monitor's own surfaces ([`HealthMetrics`], [`HealthStatus`]) are
-/// a `usize` on the wire and compare against a warning threshold, where a `0`
+/// The health monitor's own surface ([`HealthMetrics`]) is a `usize` and
+/// compares against a warning threshold, where a `0`
 /// on a failed read is merely a missing warning. Anything making a DECISION
 /// from this number must use [`thread_count_reading`] instead and handle the
 /// `None`.
@@ -1843,12 +2028,10 @@ pub fn collect_metrics() -> HealthMetrics {
         .unwrap_or(0);
 
     HealthMetrics {
-        timestamp: chrono::Utc::now(),
         memory_bytes: get_memory_usage(),
         thread_count: get_thread_count(),
         agent_log_emitter_agents: crate::claude_session::coord_register::agent_log_emitter_agents(),
         uptime_secs: uptime,
-        cpu_percent: None, // CPU tracking requires more complex implementation
     }
 }
 
@@ -1861,12 +2044,13 @@ fn log_metrics(metrics: &HealthMetrics) {
     debug!(
         memory_mb = memory_mb,
         threads = threads,
+        agent_log_emitter_agents = metrics.agent_log_emitter_agents,
         uptime_secs = metrics.uptime_secs,
         "Health check"
     );
 
     // Warn if thresholds are exceeded
-    if memory_mb > MEMORY_WARNING_THRESHOLD_MB {
+    if memory_exceeds_warning(memory_mb) {
         warn!(
             memory_mb = memory_mb,
             threshold_mb = MEMORY_WARNING_THRESHOLD_MB,
@@ -2005,6 +2189,11 @@ pub fn start_health_monitor() {
             METRICS_HEARTBEAT_MS.store(monotonic_now_ms(), Ordering::SeqCst);
             let metrics = collect_metrics();
             log_metrics(&metrics);
+            // glibc allocator: a reading every tick (served on `/health`),
+            // `malloc_trim(0)` hourly, an INFO `allocator` line every 10 min.
+            // A no-op off linux-gnu. Plan
+            // `2026-11-11-runner-glibc-arena-retention-and-whole-log-tail` Phase 3.
+            qontinui_runner_lib::malloc_tuning::on_metrics_tick(get_memory_usage);
             METRICS_HEARTBEAT_MS.store(monotonic_now_ms(), Ordering::SeqCst);
 
             let mut slept = 0;
@@ -2045,45 +2234,6 @@ pub fn is_running() -> bool {
     MONITOR_RUNNING.load(Ordering::SeqCst)
 }
 
-/// Get the current health status as a JSON-serializable struct
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct HealthStatus {
-    pub healthy: bool,
-    pub memory_mb: u64,
-    pub memory_warning: bool,
-    pub thread_count: usize,
-    pub thread_warning: bool,
-    pub agent_log_emitter_agents: usize,
-    pub uptime_secs: u64,
-    pub monitor_running: bool,
-}
-
-impl HealthStatus {
-    /// Create a health status from metrics
-    pub fn from_metrics(metrics: &HealthMetrics) -> Self {
-        let memory_mb = metrics.memory_mb();
-        let memory_warning = memory_mb > MEMORY_WARNING_THRESHOLD_MB;
-        let thread_warning = metrics.thread_count > THREAD_WARNING_THRESHOLD;
-
-        Self {
-            healthy: !memory_warning && !thread_warning,
-            memory_mb,
-            memory_warning,
-            thread_count: metrics.thread_count,
-            thread_warning,
-            agent_log_emitter_agents: metrics.agent_log_emitter_agents,
-            uptime_secs: metrics.uptime_secs,
-            monitor_running: is_running(),
-        }
-    }
-}
-
-/// Get the current health status
-pub fn get_health_status() -> HealthStatus {
-    let metrics = collect_metrics();
-    HealthStatus::from_metrics(&metrics)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2095,6 +2245,57 @@ mod tests {
     /// `observe_publishes_the_failure_count_before_it_reports` read a `true`
     /// that `stopping_the_monitor_clears_the_wedge_latches` had just stored.
     static WEDGE_ATOMS_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Pins the calibrated value (fit.md: 8 GiB) so a change to it is a
+    /// deliberate re-calibration; the behaviour is pinned by the two below.
+    #[test]
+    fn memory_warning_threshold_is_the_calibrated_8_gib() {
+        assert_eq!(MEMORY_WARNING_THRESHOLD_MB, 8192);
+    }
+
+    #[test]
+    fn a_healthy_plateau_does_not_raise_the_memory_warning() {
+        // The highest healthy plateau measured (3.6 GiB), rounded up.
+        assert!(
+            !memory_exceeds_warning(3_687),
+            "a 3.6 GiB healthy runner warned"
+        );
+        // And the old 1 GiB threshold's territory is quiet too.
+        assert!(!memory_exceeds_warning(1025));
+        assert!(!memory_exceeds_warning(4 * 1024));
+    }
+
+    #[test]
+    fn the_memory_warning_boundary_is_exclusive_at_8_gib() {
+        assert!(
+            !memory_exceeds_warning(8 * 1024),
+            "exactly 8 GiB must not warn"
+        );
+        assert!(
+            memory_exceeds_warning(8 * 1024 + 1),
+            "8 GiB + 1 MiB must warn"
+        );
+    }
+
+    /// The loop feeds the predicate `memory_mb()`, which truncates bytes to
+    /// whole MiB: a byte count just under 8 GiB + 1 MiB must still read as
+    /// 8 GiB and stay quiet, and 8 GiB + 1 MiB in bytes must warn.
+    #[test]
+    fn the_memory_warning_reads_bytes_through_memory_mb() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let at = |memory_bytes| HealthMetrics {
+            memory_bytes,
+            thread_count: 0,
+            agent_log_emitter_agents: 0,
+            uptime_secs: 0,
+        };
+        assert!(!memory_exceeds_warning(
+            at(8 * GIB + 1024 * 1024 - 1).memory_mb()
+        ));
+        assert!(memory_exceeds_warning(
+            at(8 * GIB + 1024 * 1024).memory_mb()
+        ));
+    }
 
     // sysinfo's per-process introspection (memory + thread count) returns 0
     // on macOS CI runners because the runner process lacks the entitlement
@@ -2133,14 +2334,6 @@ mod tests {
         assert_eq!(resident_bytes_from_statm("", 4096), None);
     }
 
-    #[test]
-    #[cfg_attr(target_os = "macos", ignore = "sysinfo returns 0 on macOS CI runners")]
-    fn test_health_status() {
-        let status = get_health_status();
-        assert!(status.memory_mb > 0);
-        assert!(status.thread_count >= 1);
-    }
-
     // ---- The thread-reading memo (`2026-08-30-load-aware-spawn-admission-control`) ----
     //
     // Exercised through `memoized_reading`, which takes its slot, clock, TTL and
@@ -2169,6 +2362,7 @@ mod tests {
                 .filter(|(name, _)| name.starts_with("terminal-"))
                 .map(|(_, n)| n)
                 .sum(),
+            holder_session_threads: 0,
             sampled_at: std::time::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
         }
     }
@@ -2226,6 +2420,7 @@ mod tests {
         assert_eq!(v["byName"].as_array().map(Vec::len), Some(2));
         assert_eq!(v["sampledAt"], "2027-01-15T08:00:00+00:00");
         assert_eq!(v["sessionThreads"], 19);
+        assert_eq!(v["holderSessionThreads"], 0);
         assert!(v.get("by_name").is_none(), "wire keys are camelCase");
     }
 
@@ -2390,21 +2585,45 @@ mod tests {
     /// answers the same way the live sensor does.
     ///
     /// Deliberately weak on the VALUE (a CI box's thread count is not a
-    /// constant) and strong on the SHAPE: memoized and live agree about whether
-    /// the sensor is readable at all, and a second call inside the window
-    /// returns the identical number.
+    /// constant): memoized and live agree about whether the sensor is readable
+    /// at all, and a reading the entry point returned was stored in the
+    /// process-global slot.
+    ///
+    /// It inspects the slot rather than timing a second call. Asserting that two
+    /// calls return the same number races the 250 ms window on a loaded box: an
+    /// entry is stamped with the caller's pre-read instant, so a slow read alone
+    /// can expire it. What this pins without a clock: a `Some` reading leaves an
+    /// entry that was live when the call began, and an entry stamped before the
+    /// call began is the one the call was served (any later writer stamps an
+    /// instant after this call's, because the entry was live for every earlier
+    /// one). The memo's caching decisions are pinned, with an injected clock, by
+    /// the tests above.
     #[test]
     fn the_memoized_entry_point_agrees_with_the_live_sensor() {
+        let called_at = std::time::Instant::now();
         let memoized = thread_count_reading_memoized();
+        if let Some(value) = memoized {
+            let slot = thread_reading_memo()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let entry = slot
+                .as_ref()
+                .expect("a reading the entry point returned is stored in the process-global slot");
+            assert!(
+                called_at.saturating_duration_since(entry.taken_at) < THREAD_READING_TTL,
+                "the stored entry was live when the call began, or stamped since"
+            );
+            if entry.taken_at <= called_at {
+                assert_eq!(
+                    entry.value, value,
+                    "an entry older than the call is the one it was served"
+                );
+            }
+        }
         assert_eq!(
             memoized.is_some(),
             thread_count_reading().is_some(),
             "the memo must not change whether this sensor is readable"
-        );
-        assert_eq!(
-            thread_count_reading_memoized(),
-            memoized,
-            "two calls inside the 250 ms window are the same reading"
         );
     }
 
@@ -2645,6 +2864,91 @@ mod tests {
             backend_wedged: wedged,
             consecutive_failures: if wedged { 3 } else { 0 },
         }
+    }
+
+    /// Plan 2026-10-19 Phase 2b: the systemd keepalive trusts
+    /// `backend_wedged` only while the probe heartbeat is fresh, and a probe
+    /// thread that NEVER ticks reads stale once the allowance from the feed's
+    /// first sample is spent (otherwise its keepalive would be unconditional).
+    #[test]
+    fn sd_heartbeat_freshness_bounds_a_never_started_probe_thread() {
+        let stall_ms = WATCHDOG_MONITOR_STALL_SECS * 1000;
+        // Ticking probe thread: fresh within the threshold, stale past it.
+        assert!(sd_monitor_heartbeat_fresh(sample(10_000, 9_000, false), 1));
+        assert!(!sd_monitor_heartbeat_fresh(
+            sample(10_000 + stall_ms + 1_000, 10_000, false),
+            1
+        ));
+        // Never ticked: fresh during the startup allowance, stale after it.
+        assert!(sd_monitor_heartbeat_fresh(sample(5_000, 0, false), 1_000));
+        assert!(!sd_monitor_heartbeat_fresh(
+            sample(1_000 + stall_ms + 1_000, 0, false),
+            1_000
+        ));
+    }
+
+    /// Without `NOTIFY_SOCKET` (every test process, every desktop runner) the
+    /// feed decides nothing and writes no incident line.
+    #[test]
+    fn sd_feed_is_inert_without_notify_socket() {
+        if std::env::var_os(crate::sd_notify::NOTIFY_SOCKET_ENV).is_some() {
+            return; // running under a notify-type service; not this case
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut feed = SdWatchdogFeed::default();
+        feed.tick(dir.path(), sample(10_000, 9_000, true));
+        assert_eq!(feed.last, None);
+        assert!(!wedge_incidents_path(dir.path()).exists());
+    }
+
+    /// The `SD_WATCHDOG` record is written once per transition away from a
+    /// healthy keepalive — not once per tick — and a return to healthy then a
+    /// second withhold writes a second line.
+    #[test]
+    fn sd_feed_records_each_transition_away_from_healthy_once() {
+        use crate::sd_notify::{KeepaliveReason, WatchdogDecision};
+        let dir = tempfile::tempdir().unwrap();
+        let mut feed = SdWatchdogFeed::default();
+        let lines = |d: &Path| {
+            std::fs::read_to_string(wedge_incidents_path(d))
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| l.contains("SD_WATCHDOG"))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        let healthy = || Some(WatchdogDecision::Keepalive(KeepaliveReason::Healthy));
+        let withhold = || Some(WatchdogDecision::Withhold);
+
+        feed.tick_with(dir.path(), sample(10_000, 9_000, false), |_, _| healthy());
+        assert!(lines(dir.path()).is_empty());
+
+        feed.tick_with(dir.path(), sample(20_000, 19_000, true), |w, fresh| {
+            assert!(
+                w && fresh,
+                "the feed hands the sample's wedge flag and freshness through"
+            );
+            withhold()
+        });
+        feed.tick_with(dir.path(), sample(35_000, 34_000, true), |_, _| withhold());
+        let after_two = lines(dir.path());
+        assert_eq!(after_two.len(), 1, "{after_two:?}");
+        assert!(
+            after_two[0].contains("WITHHOLDING WATCHDOG=1"),
+            "{after_two:?}"
+        );
+        assert!(
+            !after_two[0].contains("  "),
+            "no run of spaces: {after_two:?}"
+        );
+
+        feed.tick_with(dir.path(), sample(50_000, 49_000, false), |_, _| healthy());
+        feed.tick_with(dir.path(), sample(65_000, 64_000, true), |_, _| {
+            Some(WatchdogDecision::Keepalive(KeepaliveReason::HostingWork))
+        });
+        let all = lines(dir.path());
+        assert_eq!(all.len(), 2, "{all:?}");
+        assert!(all[1].contains("a CI build is in flight"), "{all:?}");
     }
 
     /// Independent stamps, for the cases Item 4 introduced.

@@ -35,6 +35,7 @@
 //! module; they are deliberately absent until the P1 work-unit API lands.
 
 pub mod body_push;
+pub mod metadata;
 pub mod parser;
 pub mod push;
 pub mod ref_scan;
@@ -52,7 +53,8 @@ pub use body_push::{
     ScanRootKind, ScanRootReport, ScanRootReporter, ScannedArtifact,
 };
 pub use parser::{
-    parse_work_unit, slug_from_filename, ParsedPhase, ParsedWorkUnit, PlanConvention,
+    parse_work_unit, slug_from_filename, ParsedLabelPhase, ParsedPhase, ParsedWorkUnit,
+    PlanConvention,
 };
 pub use push::{push_work_unit, HttpWorkUnitSink, PushOutcome, PushOutcomeKind, WorkUnitSink};
 pub use trigger::{

@@ -130,8 +130,9 @@ export interface CommandAction<TArgs = Record<string, unknown>, TResult = unknow
    * Running this SPENDS something the operator cannot get back — metered AI
    * capacity (`terminal.spawn-ai`, `terminal.orchestrate`,
    * `terminal.analyze`, `terminal.generate-workflow`,
-   * `terminal.plan-implement`) or live PTY subprocesses the operator then has
-   * to close by hand (`terminal.spawn`, `terminal.spawn-with`).
+   * `terminal.plan-implement`) or live processes the operator then has to
+   * close by hand (`terminal.spawn`, `terminal.spawn-with`, and the
+   * Administrator window `terminal.elevated` opens).
    *
    * Read by `rank.ts::chooseTier`. A LITERAL slash form is never rerouted
    * INTO a costly action by a Tier-2 pattern, because typing `/spawn` must

@@ -16,10 +16,9 @@ import { NavigationFlowGraph } from "./NavigationFlowGraph";
 import type { CoverageAnalysisResult } from "@/lib/development-intelligence/coverage-analyzer";
 import type { ComplexityAnalysisResult } from "@/lib/development-intelligence/complexity-scorer";
 import type { FeatureHealthResult } from "@/lib/development-intelligence/dead-feature-detector";
+import { getApiBase } from "@/lib/runner-api";
 
 type SubPanel = "coverage" | "complexity" | "health" | "navigation";
-
-const API_BASE = "http://localhost:9876";
 
 const PANELS: Array<{
   id: SubPanel;
@@ -55,7 +54,7 @@ const PANELS: Array<{
 
 async function getProjectPath(): Promise<string> {
   try {
-    const response = await fetch(`${API_BASE}/settings`);
+    const response = await fetch(`${getApiBase()}/settings`);
     const data = await response.json();
     return data.data?.project_path ?? "";
   } catch {
@@ -85,7 +84,7 @@ export function DevelopmentIntelligencePage() {
     if (!projectPath) return;
     setCoverageLoading(true);
     try {
-      const res = await fetch(`${API_BASE}/development-intelligence/coverage-analysis`, {
+      const res = await fetch(`${getApiBase()}/development-intelligence/coverage-analysis`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ project_path: projectPath }),
@@ -103,7 +102,7 @@ export function DevelopmentIntelligencePage() {
     if (!projectPath) return;
     setComplexityLoading(true);
     try {
-      const res = await fetch(`${API_BASE}/development-intelligence/complexity-scores`, {
+      const res = await fetch(`${getApiBase()}/development-intelligence/complexity-scores`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ project_path: projectPath }),
@@ -121,7 +120,7 @@ export function DevelopmentIntelligencePage() {
     if (!projectPath) return;
     setHealthLoading(true);
     try {
-      const res = await fetch(`${API_BASE}/development-intelligence/feature-health`, {
+      const res = await fetch(`${getApiBase()}/development-intelligence/feature-health`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ project_path: projectPath }),

@@ -40,6 +40,11 @@ pub struct CreateScheduledTaskRequest {
     pub catch_up_grace_seconds: Option<u32>,
     #[serde(default, alias = "launch_failure_backoff_seconds")]
     pub launch_failure_backoff_seconds: Option<u32>,
+    /// IANA zone this task's schedule is evaluated in, ahead of the
+    /// scheduler's (plan 2026-10-29 D5). Absent = the scheduler's zone. A
+    /// value that does not parse is refused (400), never stored.
+    #[serde(default)]
+    pub timezone: Option<String>,
 }
 
 /// Request body for updating a scheduled task
@@ -69,6 +74,115 @@ pub struct UpdateScheduledTaskRequest {
     pub catch_up_grace_seconds: Option<u32>,
     #[serde(default, alias = "launch_failure_backoff_seconds")]
     pub launch_failure_backoff_seconds: Option<u32>,
+    /// Absent = leave the task's zone alone; `null` = clear it back to the
+    /// scheduler's zone; a string = set it (refused 400 if it does not parse).
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    pub timezone: Option<Option<String>>,
+}
+
+/// Request body for `PUT /scheduler/tasks/by-key/{source}/{tenant_id}/{agent}`
+/// — the whole desired task for one managed key (plan
+/// `2026-10-29-recurring-agents-declared-in-coord-reconciled-by-runner` D5).
+///
+/// It is a full declaration, not a patch: every field absent here takes its
+/// create-time default on BOTH create and update, so a re-PUT of the same body
+/// converges the task rather than leaving stale fields behind. The one
+/// exception is `enabled`: absent keeps a stored task's value (a local pause,
+/// D6) and is `true` on create.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UpsertManagedTaskRequest {
+    pub name: String,
+    pub description: Option<String>,
+    pub schedule: crate::scheduler::ScheduleExpression,
+    pub task: crate::scheduler::ScheduledTaskType,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub skip_if_completed: bool,
+    #[serde(default)]
+    pub auto_fix_on_failure: bool,
+    #[serde(default)]
+    pub success_criteria: Option<String>,
+    #[serde(default)]
+    pub conditions: Option<crate::scheduler::ScheduleConditions>,
+    #[serde(default)]
+    pub catch_up_policy: Option<crate::scheduler::CatchUpPolicy>,
+    #[serde(default)]
+    pub catch_up_grace_seconds: Option<u32>,
+    #[serde(default)]
+    pub launch_failure_backoff_seconds: Option<u32>,
+    /// IANA zone, ahead of the scheduler's; absent = the scheduler's zone.
+    #[serde(default)]
+    pub timezone: Option<String>,
+    /// The declaration's row version (`ManagedBy::version`, >= 1).
+    pub version: u32,
+    /// sha256 (64 lowercase hex) of the resolved spec, when the declaration
+    /// carries one (`ManagedBy::digest`).
+    #[serde(default)]
+    pub digest: Option<String>,
+}
+
+/// Refuse a per-task `timezone` that does not parse — the same rule the
+/// settings PUT applies to the global zone (`ScheduleZone::parse`).
+fn refuse_bad_timezone(timezone: Option<&str>) -> Result<(), (StatusCode, Json<ApiResponse<()>>)> {
+    match timezone {
+        Some(name) => crate::scheduler::ScheduleZone::parse(name)
+            .map(|_| ())
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(api_error(format!("timezone: {e}"))),
+                )
+            }),
+        None => Ok(()),
+    }
+}
+
+/// Refuse every caller of the managed-task upsert that is not NonBrowser (the
+/// in-process reconciler is not an HTTP caller at all; installers and agents
+/// are NonBrowser) or the runner's own webview. A managed task runs
+/// unattended on this device, so no browser class — Trusted included — may
+/// write one, under any route policy. An absent principal is UNKNOWN and
+/// refused.
+pub(crate) fn refuse_browser_caller(principal: Option<&RequesterPrincipal>) -> Result<(), String> {
+    match principal.map(|p| p.class) {
+        Some(OriginClass::NonBrowser | OriginClass::FirstParty) => Ok(()),
+        class => Err(format!(
+            "a managed scheduled task runs unattended on this device; only a non-browser \
+             caller or the runner's own UI may upsert one (requester class: {})",
+            class.map(OriginClass::as_str).unwrap_or("unknown")
+        )),
+    }
+}
+
+/// Refuse a managed key that is not already in its one stored spelling: the
+/// source must be [`crate::scheduler::MANAGED_SOURCE_COORD`] (the only source
+/// today), and no segment may carry leading or trailing whitespace — `" a"`
+/// and `"a"` would otherwise be two keys for one agent.
+pub(crate) fn refuse_unnormalized_key(
+    source: &str,
+    tenant_id: &str,
+    agent: &str,
+) -> Result<(), String> {
+    for (field, value) in [
+        ("source", source),
+        ("tenantId", tenant_id),
+        ("agent", agent),
+    ] {
+        if value.trim() != value {
+            return Err(format!(
+                "managed.{field} has leading or trailing whitespace: {value:?}"
+            ));
+        }
+    }
+    if source != crate::scheduler::MANAGED_SOURCE_COORD {
+        return Err(format!(
+            "managed.source must be {:?} (the only managed source); got {source:?}",
+            crate::scheduler::MANAGED_SOURCE_COORD
+        ));
+    }
+    Ok(())
 }
 
 /// Request body for updating scheduler settings
@@ -258,6 +372,7 @@ pub async fn create_scheduled_task(
 
     refuse_untrusted_script(principal.as_ref().map(|p| &p.0), Some(&request.task), None)
         .map_err(|e| (StatusCode::FORBIDDEN, Json(api_error(e))))?;
+    refuse_bad_timezone(request.timezone.as_deref())?;
 
     if let Some(conditions) = &request.conditions {
         refuse_untrusted_probe(
@@ -289,14 +404,13 @@ pub async fn create_scheduled_task(
     if let Some(backoff) = request.launch_failure_backoff_seconds {
         scheduled_task.launch_failure_backoff_seconds = backoff;
     }
+    scheduled_task.timezone = request.timezone;
 
     let now = chrono::Utc::now();
     let zone = crate::scheduler::ScheduleZone::from_settings(
         &pg.get_scheduler_settings().await.unwrap_or_default(),
     );
-    scheduled_task.next_run =
-        crate::scheduler::compute_next_run(&scheduled_task.schedule, now, zone)
-            .map(|dt| dt.to_rfc3339());
+    scheduled_task.next_run = crate::scheduler::task_next_run_rfc3339(&scheduled_task, now, zone);
 
     pg.insert_scheduled_task(&scheduled_task)
         .await
@@ -433,14 +547,17 @@ pub async fn update_scheduled_task(
     if let Some(backoff) = request.launch_failure_backoff_seconds {
         scheduled_task.launch_failure_backoff_seconds = backoff;
     }
+    if let Some(timezone) = request.timezone {
+        refuse_bad_timezone(timezone.as_deref())?;
+        scheduled_task.timezone = timezone;
+    }
 
     let now = chrono::Utc::now();
     let zone = crate::scheduler::ScheduleZone::from_settings(
         &pg.get_scheduler_settings().await.unwrap_or_default(),
     );
     scheduled_task.next_run = if scheduled_task.enabled {
-        crate::scheduler::compute_next_run(&scheduled_task.schedule, now, zone)
-            .map(|dt| dt.to_rfc3339())
+        crate::scheduler::task_next_run_rfc3339(&scheduled_task, now, zone)
     } else {
         None
     };
@@ -616,8 +733,7 @@ pub async fn update_scheduler_settings(
         match pg.get_all_scheduled_tasks().await {
             Ok(tasks) => {
                 for task in tasks.iter().filter(|t| t.enabled) {
-                    let next = crate::scheduler::compute_next_run(&task.schedule, now, zone)
-                        .map(|dt| dt.to_rfc3339());
+                    let next = crate::scheduler::task_next_run_rfc3339(task, now, zone);
                     match pg
                         .update_task_next_run(&task.id, next.as_deref(), &task.modified_at)
                         .await
@@ -733,13 +849,219 @@ pub async fn reconcile_now(
     }))))
 }
 
+/// `PUT /scheduler/tasks/by-key/{source}/{tenant_id}/{agent}` — create or
+/// update the ONE task carrying that managed key (plan
+/// `2026-10-29-recurring-agents-declared-in-coord-reconciled-by-runner` D5),
+/// retiring the list/match-by-name/POST loop every bash installer
+/// re-implemented (and its exit-3 duplicate case).
+///
+/// The managed key is the identity, never the name: an unmanaged
+/// (user-created) task with the same name is not matched and not touched —
+/// this route only ever reads and writes the row whose
+/// `(managed_source, managed_tenant_id, managed_agent)` equals the path. 201 =
+/// created, 200 = updated, 400 = a malformed key / version / digest /
+/// timezone / conditions, 403 = any browser caller (this route is a
+/// `CREDENTIAL_DOORS` entry AND refuses every browser class itself, so it
+/// holds under every route policy) plus the same Script / requireProbe
+/// refusals as the other two task-write routes (an existing managed task's
+/// stored value is the echo baseline), 409 = the task moved or vanished
+/// between this read and the conditional write, 503 = the managed-key index
+/// is missing on this database.
+pub async fn upsert_managed_task(
+    State(state): State<Arc<ApiState>>,
+    principal: Option<axum::Extension<RequesterPrincipal>>,
+    Path((source, tenant_id, agent)): Path<(String, String, String)>,
+    Json(request): Json<UpsertManagedTaskRequest>,
+) -> Result<(StatusCode, Json<ApiResponse<serde_json::Value>>), (StatusCode, Json<ApiResponse<()>>)>
+{
+    refuse_browser_caller(principal.as_ref().map(|p| &p.0))
+        .map_err(|e| (StatusCode::FORBIDDEN, Json(api_error(e))))?;
+    refuse_unnormalized_key(&source, &tenant_id, &agent)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(api_error(e))))?;
+    let pg = &state.app_state.pg_db;
+    let managed = crate::scheduler::ManagedBy {
+        source,
+        tenant_id,
+        agent,
+        version: request.version,
+        digest: request.digest.clone(),
+    };
+    managed
+        .validate()
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(api_error(e.to_string()))))?;
+    // The column is a UUID: answer in its canonical (lowercase, hyphenated)
+    // spelling, which is what every later read of the row returns.
+    let mut managed = managed;
+    if let Ok(uuid) = uuid::Uuid::parse_str(&managed.tenant_id) {
+        managed.tenant_id = uuid.to_string();
+    }
+    refuse_bad_timezone(request.timezone.as_deref())?;
+
+    let existing = pg
+        .get_stored_scheduled_task_by_managed_key(
+            &managed.source,
+            &managed.tenant_id,
+            &managed.agent,
+        )
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to get task: {}", e))),
+            )
+        })?
+        .map(|stored| stored.task);
+
+    refuse_untrusted_script(
+        principal.as_ref().map(|p| &p.0),
+        Some(&request.task),
+        existing.as_ref().map(|t| &t.task),
+    )
+    .map_err(|e| (StatusCode::FORBIDDEN, Json(api_error(e))))?;
+    if let Some(conditions) = &request.conditions {
+        refuse_untrusted_probe(
+            principal.as_ref().map(|p| &p.0),
+            conditions.require_probe.as_ref(),
+            existing
+                .as_ref()
+                .and_then(|t| t.conditions.as_ref())
+                .and_then(|c| c.require_probe.as_ref()),
+        )
+        .map_err(|e| (StatusCode::FORBIDDEN, Json(api_error(e))))?;
+        crate::scheduler_probe::validate_conditions(conditions)
+            .map_err(|e| (StatusCode::BAD_REQUEST, Json(api_error(e))))?;
+    }
+
+    let fresh = crate::scheduler::ScheduledTask::new(
+        request.name,
+        request.description,
+        request.schedule,
+        request.task,
+    );
+    let expected_modified_at = existing.as_ref().map(|t| t.modified_at.clone());
+    let mut task = match &existing {
+        // Keep the stored row's identity and executor-owned state; the upsert
+        // never writes `last_run_id` / `consecutive_launch_failures` anyway.
+        Some(stored) => crate::scheduler::ScheduledTask {
+            id: stored.id.clone(),
+            created_at: stored.created_at.clone(),
+            enabled: request.enabled.unwrap_or(stored.enabled),
+            last_run: stored.last_run.clone(),
+            consecutive_launch_failures: stored.consecutive_launch_failures,
+            ..fresh
+        },
+        None => crate::scheduler::ScheduledTask {
+            enabled: request.enabled.unwrap_or(true),
+            ..fresh
+        },
+    };
+    task.skip_if_completed = request.skip_if_completed;
+    task.auto_fix_on_failure = request.auto_fix_on_failure;
+    task.success_criteria = request.success_criteria;
+    // A condition wait in progress survives a re-PUT of the SAME conditions;
+    // changed conditions restart it (as the ordinary update does).
+    task.condition_status = existing.as_ref().and_then(|stored| {
+        let same = serde_json::to_value(&stored.conditions).ok()
+            == serde_json::to_value(&request.conditions).ok();
+        if same {
+            stored.condition_status.clone()
+        } else {
+            None
+        }
+    });
+    task.conditions = request.conditions;
+    if let Some(policy) = request.catch_up_policy {
+        task.catch_up_policy = policy;
+    }
+    if let Some(grace) = request.catch_up_grace_seconds {
+        task.catch_up_grace_seconds = grace;
+    }
+    if let Some(backoff) = request.launch_failure_backoff_seconds {
+        task.launch_failure_backoff_seconds = backoff;
+    }
+    task.timezone = request.timezone;
+    task.managed = Some(managed);
+
+    let now = chrono::Utc::now();
+    let zone = crate::scheduler::ScheduleZone::from_settings(
+        &pg.get_scheduler_settings().await.unwrap_or_default(),
+    );
+    task.next_run = if task.enabled {
+        crate::scheduler::task_next_run_rfc3339(&task, now, zone)
+    } else {
+        None
+    };
+    task.touch();
+
+    let outcome = pg
+        .upsert_managed_scheduled_task(&task, expected_modified_at.as_deref())
+        .await
+        .map_err(|e| {
+            use crate::database::pg::scheduler::ManagedUpsertError;
+            match e {
+                ManagedUpsertError::KeyIndexMissing(e) => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(api_error(format!(
+                        "the managed-key index uq_scheduled_tasks_managed_key is missing or \
+                         invalid on this database, so a managed task cannot be upserted; the \
+                         runner's startup self-heal (or qontinui-web revision \
+                         recurring_agents_01_coord_tables) creates it: {e}"
+                    ))),
+                ),
+                ManagedUpsertError::Other(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(format!("Failed to upsert managed task: {}", e))),
+                ),
+            }
+        })?;
+    use crate::database::pg::scheduler::ManagedUpsert;
+    let status = match outcome {
+        ManagedUpsert::Created(id) => {
+            task.id = id;
+            StatusCode::CREATED
+        }
+        ManagedUpsert::Updated(id) => {
+            task.id = id;
+            StatusCode::OK
+        }
+        ManagedUpsert::Conflict => {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(api_error(
+                    "the managed task changed while this upsert was being applied; retry"
+                        .to_string(),
+                )),
+            ));
+        }
+    };
+    tracing::info!(
+        "Upserted managed scheduled task: {} ({}) [{}]",
+        task.name,
+        task.id,
+        if status == StatusCode::CREATED {
+            "created"
+        } else {
+            "updated"
+        }
+    );
+    Ok((
+        status,
+        Json(ApiResponse::success(stored_task_json(
+            crate::database::pg::scheduler::StoredScheduledTask {
+                task,
+                conditions_error: None,
+            },
+        ))),
+    ))
+}
+
 // ============================================================================
 // Routes
 // ============================================================================
 
 /// Create routes for the scheduler module.
 pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
-    use axum::routing::{get, post};
+    use axum::routing::{get, post, put};
     axum::Router::new()
         .route(
             "/scheduler/tasks",
@@ -750,6 +1072,10 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             get(get_scheduled_task)
                 .put(update_scheduled_task)
                 .delete(delete_scheduled_task),
+        )
+        .route(
+            "/scheduler/tasks/by-key/{source}/{tenant_id}/{agent}",
+            put(upsert_managed_task),
         )
         .route("/scheduler/tasks/{id}/run", post(run_task_now))
         .route("/scheduler/tasks/{id}/history", get(get_task_history))
@@ -899,6 +1225,10 @@ mod tests {
                 "pub async fn update_scheduled_task(",
                 "pg.update_scheduled_task(",
             ),
+            (
+                "pub async fn upsert_managed_task(",
+                ".upsert_managed_scheduled_task(",
+            ),
         ] {
             let (_, body) = src.split_once(handler).expect(handler);
             let (before_gate, _) = body
@@ -924,6 +1254,10 @@ mod tests {
             (
                 "pub async fn update_scheduled_task(",
                 "pg.update_scheduled_task(",
+            ),
+            (
+                "pub async fn upsert_managed_task(",
+                ".upsert_managed_scheduled_task(",
             ),
         ] {
             let (_, body) = src.split_once(handler).expect(handler);
@@ -1059,5 +1393,121 @@ mod tests {
         let (body, _) = body.split_once("\n}\n").expect("delete handler ends");
         assert!(body.contains("pg.get_stored_scheduled_task(&id)"));
         assert!(!body.contains("pg.get_scheduled_task(&id)"));
+    }
+
+    /// Per-task `timezone` on an update is three-state, like the settings
+    /// zone: absent leaves it, `null` clears it, a string sets it.
+    #[test]
+    fn update_timezone_absent_null_and_string_are_three_different_requests() {
+        let absent: UpdateScheduledTaskRequest = serde_json::from_str(r#"{"name":"n"}"#).unwrap();
+        assert_eq!(absent.timezone, None);
+        let null: UpdateScheduledTaskRequest =
+            serde_json::from_str(r#"{"timezone":null}"#).unwrap();
+        assert_eq!(null.timezone, Some(None));
+        let set: UpdateScheduledTaskRequest =
+            serde_json::from_str(r#"{"timezone":"Europe/Berlin"}"#).unwrap();
+        assert_eq!(set.timezone, Some(Some("Europe/Berlin".to_string())));
+    }
+
+    #[test]
+    fn an_unparseable_task_timezone_is_refused_400() {
+        assert!(refuse_bad_timezone(None).is_ok());
+        assert!(refuse_bad_timezone(Some("Europe/Berlin")).is_ok());
+        let (status, _) = refuse_bad_timezone(Some("Mars/Olympus")).unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = refuse_bad_timezone(Some(" ")).unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// The by-key body is a full declaration: version is required, an
+    /// unknown (e.g. misspelt) field is refused rather than ignored.
+    #[test]
+    fn the_by_key_body_requires_a_version_and_refuses_unknown_fields() {
+        let ok: UpsertManagedTaskRequest = serde_json::from_str(
+            r#"{"name":"cleanup-steward","schedule":{"type":"Cron","value":"0 20 4 * * *"},
+                "task":{"task_type":"Watcher","watcher_id":"w"},"version":3,
+                "timezone":"UTC"}"#,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(ok.version, 3);
+        assert_eq!(ok.enabled, None, "absent enabled keeps a local pause");
+        assert_eq!(ok.timezone.as_deref(), Some("UTC"));
+        assert!(serde_json::from_str::<UpsertManagedTaskRequest>(
+            r#"{"name":"n","schedule":{"type":"Cron","value":"0 20 4 * * *"},
+                "task":{"task_type":"Watcher","watcher_id":"w"}}"#,
+        )
+        .is_err());
+        assert!(serde_json::from_str::<UpsertManagedTaskRequest>(
+            r#"{"name":"n","schedule":{"type":"Cron","value":"0 20 4 * * *"},
+                "task":{"task_type":"Watcher","watcher_id":"w"},"version":1,"tz":"UTC"}"#,
+        )
+        .is_err());
+    }
+
+    /// The by-key handler addresses the task by the managed key only — never
+    /// by name — validates the key before reading, and is registered.
+    #[test]
+    fn the_by_key_route_is_keyed_on_the_managed_key_not_the_name() {
+        let src = include_str!("scheduler.rs");
+        let (_, body) = src
+            .split_once("pub async fn upsert_managed_task(")
+            .expect("by-key handler");
+        let (body, _) = body.split_once("\n}\n").expect("handler ends");
+        assert!(body.contains(".get_stored_scheduled_task_by_managed_key("));
+        assert!(!body.contains("get_all_stored_scheduled_tasks"));
+        assert!(!body.contains("get_all_scheduled_tasks"));
+        let (before_read, _) = body
+            .split_once(".get_stored_scheduled_task_by_managed_key(")
+            .unwrap();
+        assert!(before_read.contains(".validate()"));
+        assert!(before_read.contains("refuse_bad_timezone("));
+        assert!(body.contains("StatusCode::CONFLICT"));
+        assert!(src.contains(r#""/scheduler/tasks/by-key/{source}/{tenant_id}/{agent}""#));
+        assert!(src.contains("put(upsert_managed_task)"));
+    }
+
+    #[test]
+    fn only_non_browser_and_first_party_may_upsert_a_managed_task() {
+        for class in [OriginClass::NonBrowser, OriginClass::FirstParty] {
+            assert!(refuse_browser_caller(Some(&principal(class))).is_ok());
+        }
+        for class in [
+            OriginClass::Trusted,
+            OriginClass::Extension,
+            OriginClass::Foreign,
+        ] {
+            let refusal = refuse_browser_caller(Some(&principal(class))).unwrap_err();
+            assert!(refusal.contains(class.as_str()), "{refusal}");
+        }
+        assert!(refuse_browser_caller(None).unwrap_err().contains("unknown"));
+    }
+
+    #[test]
+    fn the_managed_key_must_be_coord_with_no_surrounding_whitespace() {
+        let tenant = "0b0e9a40-6b1f-4c3e-9d55-5d1b8c4a2f10";
+        assert!(refuse_unnormalized_key("coord", tenant, "cleanup-steward").is_ok());
+        assert!(refuse_unnormalized_key("Coord", tenant, "a").is_err());
+        assert!(refuse_unnormalized_key("other", tenant, "a").is_err());
+        assert!(refuse_unnormalized_key(" coord", tenant, "a").is_err());
+        assert!(refuse_unnormalized_key("coord", &format!("{tenant} "), "a").is_err());
+        assert!(refuse_unnormalized_key("coord", tenant, " a").is_err());
+        assert!(refuse_unnormalized_key("coord", tenant, "a\t").is_err());
+    }
+
+    /// The by-key handler refuses a browser caller and an unnormalized key
+    /// before it touches the database.
+    #[test]
+    fn the_by_key_handler_refuses_browsers_and_bad_keys_first() {
+        let src = include_str!("scheduler.rs");
+        let (_, body) = src
+            .split_once("pub async fn upsert_managed_task(")
+            .expect("by-key handler");
+        let (before_db, _) = body
+            .split_once("let pg = &state.app_state.pg_db;")
+            .expect("pg");
+        assert!(before_db.contains("refuse_browser_caller("));
+        assert!(before_db.contains("refuse_unnormalized_key("));
+        assert!(body.contains("ManagedUpsertError::KeyIndexMissing"));
+        assert!(body.contains("StatusCode::SERVICE_UNAVAILABLE"));
     }
 }

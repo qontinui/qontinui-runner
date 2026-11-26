@@ -399,7 +399,11 @@ fn evaluate_snapshot_assertion(
 /// - "id" / "elementId": exact match against element.id
 /// - "testId": exact match against element.identifier.testId
 /// - "htmlId": exact match against element.identifier.htmlId
-/// - "type": exact match against element.type
+/// - "type": the named type's family against element.type, case-insensitive
+///   (`input` also matches a `textbox`, `select` a `combobox` or `listbox`)
+/// - "role": case-insensitive substring match against the role names the
+///   element answers to — element.state.role, element.type, the role the type
+///   implies, and `select` / `input` for those kinds' families
 /// - "label": substring match against element.label
 fn element_matches_criteria(
     element: &serde_json::Value,
@@ -448,20 +452,34 @@ fn element_matches_criteria(
                 html_id == expected
             }
             "type" => {
-                let el_type = element.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                el_type == expected
+                // A criterion NAMES a type, so it matches the name's family
+                // (`input`↔`textbox`, `select`↔`combobox`↔`listbox`) — see
+                // `element_kind`.
+                let el_type = element.get("type").and_then(|t| t.as_str());
+                crate::mcp::ui_bridge::element_kind::answers_to_named_type(el_type, expected)
             }
             "role" => {
-                // Check element.type first (AutoRegister maps role/tag to type),
-                // then fall back to state.role for elements that set it explicitly.
-                let el_type = element.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                let state_role = element
-                    .get("state")
-                    .and_then(|s| s.get("role"))
-                    .and_then(|r| r.as_str())
-                    .unwrap_or("");
-                el_type.to_lowercase().contains(&expected.to_lowercase())
-                    || state_role.to_lowercase().contains(&expected.to_lowercase())
+                // A declared ROLE matches by EQUALITY, as every SDK role matcher
+                // does — never by the named-type family (`listbox` is not
+                // `combobox`). The names an element answers to are its
+                // `state.role`, its type, the role its type implies, and the
+                // one-way `select` / `input` reach for the kinds the pre-0.46
+                // registry typed that way (`element_kind::role_names_answered`).
+                // This matcher has always been a case-insensitive SUBSTRING
+                // match, and stays one over those names.
+                let expected = expected.to_lowercase();
+                if expected.is_empty() {
+                    true
+                } else {
+                    let el_type = element.get("type").and_then(|t| t.as_str());
+                    let state_role = element
+                        .get("state")
+                        .and_then(|s| s.get("role"))
+                        .and_then(|r| r.as_str());
+                    crate::mcp::ui_bridge::element_kind::role_names_answered(state_role, el_type)
+                        .iter()
+                        .any(|name| name.contains(&expected))
+                }
             }
             "label" => {
                 let label = element.get("label").and_then(|l| l.as_str()).unwrap_or("");
@@ -702,10 +720,25 @@ struct ComparisonResult {
 // Extract origin helper
 // ---------------------------------------------------------------------------
 
+/// The URL a UI Bridge step dials and locks: the step's own `ui_bridge_url`
+/// with a `localhost` host canonicalized to `127.0.0.1`, else `default`.
+///
+/// A persisted step (or a skill default) may still say `localhost`; left as
+/// written it would pay the doomed `::1` connect on every new connection and
+/// key the per-URL workflow lock and the failure tracker apart from a
+/// `127.0.0.1` step on the SAME runner. Plan
+/// 2026-10-25-runner-self-calls-dial-localhost-and-pay-a-doomed-ipv6-connect.
+fn step_dial_url(step_url: Option<&str>, default: &str) -> String {
+    step_url
+        .map(crate::mcp::types::canonical_loopback_url)
+        .unwrap_or_else(|| default.to_string())
+}
+
 /// Extract the origin (scheme + host + port) from a URL.
 ///
-/// Given `http://localhost:9876/ui-bridge`, returns `http://localhost:9876`.
-/// Falls back to the default `http://localhost:9876` if parsing fails.
+/// Given `http://127.0.0.1:9876/ui-bridge`, returns `http://127.0.0.1:9876`.
+/// Falls back to this runner's own base (`get_self_base_url_from_env`) if
+/// parsing fails.
 #[expect(
     clippy::string_slice,
     reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
@@ -842,7 +875,12 @@ impl StepHandler for UiBridgeHandler {
             .unwrap_or(DEFAULT_UI_BRIDGE_ACTION);
         let self_base = crate::mcp::types::get_self_base_url(&context.app_state);
         let default_ui_bridge = format!("{}/ui-bridge", self_base);
-        let raw_url = step.ui_bridge_url.as_deref().unwrap_or(&default_ui_bridge);
+        // The URL as the step wrote it: what the audit log and the network
+        // policy judge.
+        let authored_url = step.ui_bridge_url.as_deref().unwrap_or(&default_ui_bridge);
+        // The URL dialed and locked: canonical, see `step_dial_url`.
+        let dial_url = step_dial_url(step.ui_bridge_url.as_deref(), &default_ui_bridge);
+        let raw_url: &str = &dial_url;
 
         // SDK operations (navigate, execute, assert) always go through the runner's SDK proxy.
         // The `ui_bridge_url` may be a page URL (e.g., "http://localhost:3001/build/page-sweep")
@@ -868,13 +906,13 @@ impl StepHandler for UiBridgeHandler {
         context.audit_logger.log(
             crate::security::audit::SecurityAuditEvent::new(
                 crate::security::audit::AuditEventType::PolicyEvaluation,
-                format!("UI Bridge {}: {}", action, raw_url),
+                format!("UI Bridge {}: {}", action, authored_url),
                 crate::security::audit::AuditDecision::Allowed,
             )
             .with_step(step_name)
             .with_metadata(serde_json::json!({
                 "action": action,
-                "url": raw_url,
+                "url": authored_url,
                 "profile": context.security_policy.profile_name,
             })),
         );
@@ -883,7 +921,7 @@ impl StepHandler for UiBridgeHandler {
         if context.security_policy.network.mode
             != crate::security::policy::NetworkMode::Unrestricted
         {
-            let (domain, protocol) = extract_domain_from_url(raw_url);
+            let (domain, protocol) = extract_domain_from_url(authored_url);
             if !domain.is_empty() {
                 if let Err(denial) = crate::security::PolicyEngine::evaluate_network(
                     &context.security_policy,
@@ -2514,6 +2552,27 @@ mod tests {
 
     // --- extract_origin tests ---
 
+    /// A persisted step that still says `localhost` is dialed and locked at
+    /// 127.0.0.1; a step with no URL gets the default; any other host, and an
+    /// explicit `[::1]`, is left as written.
+    #[test]
+    fn test_step_dial_url_canonicalizes_a_localhost_step_only() {
+        let default = "http://127.0.0.1:9877/ui-bridge";
+        assert_eq!(
+            step_dial_url(Some("http://localhost:9877/ui-bridge"), default),
+            "http://127.0.0.1:9877/ui-bridge"
+        );
+        assert_eq!(step_dial_url(None, default), default);
+        assert_eq!(
+            step_dial_url(Some("http://example.test:3001/ui-bridge"), default),
+            "http://example.test:3001/ui-bridge"
+        );
+        assert_eq!(
+            step_dial_url(Some("http://[::1]:3001/ui-bridge"), default),
+            "http://[::1]:3001/ui-bridge"
+        );
+    }
+
     #[test]
     fn test_extract_origin_with_path() {
         assert_eq!(
@@ -2735,5 +2794,80 @@ mod tests {
         assert_eq!(y, 9.0);
         assert_eq!(w, 9.0);
         assert_eq!(h, 9.0);
+    }
+
+    // --- element_matches_criteria: the named-type family ---
+
+    fn criteria(pairs: &[(&str, &str)]) -> serde_json::Map<String, serde_json::Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
+            .collect()
+    }
+
+    #[test]
+    fn a_declared_role_and_type_find_the_kinds_ui_bridge_0_46_moved() {
+        use serde_json::json;
+        // 0.46 types role="combobox" `combobox` and role="textbox" `textbox`;
+        // the 0.38 registry typed them `select` and `input`.
+        let combobox = json!({"id": "c", "type": "combobox"});
+        let listbox = json!({"id": "l", "type": "listbox"});
+        let native_select = json!({"id": "s", "type": "select"});
+        let textbox = json!({"id": "t", "type": "textbox"});
+        let native_input = json!({"id": "i", "type": "input"});
+        let textarea = json!({"id": "a", "type": "textarea"});
+        let role = |el: &serde_json::Value, named: &str| {
+            element_matches_criteria(el, &criteria(&[("role", named)]))
+        };
+        let kind = |el: &serde_json::Value, named: &str| {
+            element_matches_criteria(el, &criteria(&[("type", named)]))
+        };
+        // ROLE — positive: equality with the type / the implied role, and the
+        // one-way reach of the kind names `select` and `input`.
+        assert!(role(&combobox, "combobox") && role(&combobox, "Select"));
+        assert!(role(&native_select, "combobox"));
+        assert!(role(&listbox, "listbox") && role(&listbox, "select"));
+        assert!(role(&native_input, "textbox") && role(&textarea, "textbox"));
+        assert!(role(&textbox, "input") && role(&textbox, "textbox"));
+        // ROLE — negative: a family is not a role.
+        assert!(!role(&combobox, "listbox"));
+        assert!(!role(&native_select, "listbox"));
+        assert!(!role(&listbox, "combobox"));
+        assert!(!role(&textarea, "input"));
+        // TYPE keeps the family, both directions.
+        for named in ["select", "combobox", "listbox", "Select"] {
+            assert!(kind(&combobox, named), "type {named}");
+        }
+        assert!(kind(&textbox, "input") && kind(&native_input, "textbox"));
+        assert!(!kind(&textarea, "input"));
+    }
+
+    #[test]
+    fn the_role_matcher_stays_a_substring_match_outside_the_families() {
+        use serde_json::json;
+        let menuitem = json!({"id": "m", "type": "menuitem"});
+        // A substring that names no family keeps matching by substring...
+        assert!(element_matches_criteria(
+            &menuitem,
+            &criteria(&[("role", "menu")])
+        ));
+        assert!(element_matches_criteria(
+            &json!({"id": "x", "type": "generic", "state": {"role": "tablist"}}),
+            &criteria(&[("role", "tab")])
+        ));
+        // ...and a family does not reach past its members.
+        assert!(!element_matches_criteria(
+            &json!({"id": "cb", "type": "checkbox"}),
+            &criteria(&[("role", "input")])
+        ));
+        assert!(!element_matches_criteria(
+            &json!({"id": "o", "type": "option"}),
+            &criteria(&[("type", "select")])
+        ));
+        // `type` is family equality, not a substring match.
+        assert!(!element_matches_criteria(
+            &menuitem,
+            &criteria(&[("type", "menu")])
+        ));
     }
 }

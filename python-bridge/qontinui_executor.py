@@ -26,7 +26,6 @@ import tempfile
 import threading
 import time
 import traceback
-from datetime import datetime
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -41,18 +40,6 @@ logging.basicConfig(
 if "--disable-console-logging" in sys.argv:
     os.environ["QONTINUI_DISABLE_CONSOLE_LOGGING"] = "1"
     sys.argv.remove("--disable-console-logging")
-
-# IMMEDIATE debug logging to verify executor is being invoked
-debug_log_path = os.path.join(tempfile.gettempdir(), "qontinui_executor_startup.log")
-try:
-    with open(debug_log_path, "a", encoding="utf-8") as f:
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-        f.write(f"[{timestamp}] EXECUTOR STARTED - qontinui_executor.py is running\n")
-        f.write(
-            f"[{timestamp}] Console logging disabled: {os.getenv('QONTINUI_DISABLE_CONSOLE_LOGGING') == '1'}\n"
-        )
-except Exception:
-    pass
 
 # CRITICAL: Send READY signal IMMEDIATELY to prevent timeout
 sys.stdout.write(
@@ -77,6 +64,7 @@ logger.debug(
     f"Qontinui source path added to sys.path: {qontinui_src_path} (exists: {qontinui_src_path.exists()})"
 )
 
+import runner_api  # noqa: E402
 from action_definitions import get_action_definition  # noqa: E402
 from capture_manager import CaptureManager  # noqa: E402
 
@@ -87,16 +75,10 @@ from event_manager import EventManager, EventType  # noqa: E402
 from event_translator import EventTranslator  # noqa: E402
 from execution_tree import ExecutionNode, ExecutionTree  # noqa: E402
 from executor_core import ExecutorCore  # noqa: E402
+from services.ui_bridge_explorer_service import (  # noqa: E402  (lightweight, no ML stack)
+    UIBridgeExplorerService,
+)
 from training_export import TrainingExportCoordinator  # noqa: E402
-
-# TestResultsHandler module may not exist; import gracefully
-try:
-    from test_results_handler import TestResultsHandler  # noqa: E402
-except ImportError:
-    TestResultsHandler = None  # type: ignore[assignment, misc]
-
-# UI Bridge explorer - lightweight, doesn't need ML stack
-from services.ui_bridge_explorer_service import UIBridgeExplorerService  # noqa: E402
 
 # isort: split
 # The per-domain command mixins. Importing the package runs executor_commands._shared,
@@ -205,9 +187,6 @@ class QontinuiExecutor(
         "manual_capture_status": "_cmd_manual_capture_status",
         "set_input_capture_enabled": "_cmd_set_input_capture_enabled",
         "get_input_validation_status": "_cmd_get_input_validation_status",
-        # Test Results Handler commands (for QA Dashboard)
-        "test_results_configure": "_cmd_test_results_configure",
-        "test_results_status": "_cmd_test_results_status",
         "ping": "_cmd_ping",
         "navigate_to_state": "_cmd_navigate_to_state",
         # Remote workflow execution from web app
@@ -226,12 +205,6 @@ class QontinuiExecutor(
 
         # Initialize EventManager first (other modules depend on it)
         self.event_manager = EventManager()
-
-        # Initialize TestResultsHandler for QA dashboard submission
-        if TestResultsHandler is not None:
-            self.test_results_handler = TestResultsHandler(emit_log_fn=self.event_manager.emit_log)
-        else:
-            self.test_results_handler = None
 
         # Initialize CaptureManager
         self.capture_manager = CaptureManager(
@@ -363,14 +336,13 @@ class QontinuiExecutor(
 
     @staticmethod
     def _get_runner_api_port() -> int:
-        """Get the runner API port from QONTINUI_PORT env var, defaulting to 9876."""
-        return int(os.environ.get("QONTINUI_PORT", "9876"))
+        """The runner API port (``runner_api.runner_api_port``)."""
+        return runner_api.runner_api_port()
 
     @staticmethod
     def _get_runner_api_base() -> str:
-        """Get the runner API base URL using 127.0.0.1 (more robust than localhost)."""
-        port = int(os.environ.get("QONTINUI_PORT", "9876"))
-        return f"http://127.0.0.1:{port}"
+        """The runner API base URL on 127.0.0.1 (``runner_api.runner_api_base``)."""
+        return runner_api.runner_api_base()
 
     def _try_reload_state_machine(self) -> None:
         """Attempt to reload a persisted state machine on startup."""
@@ -555,7 +527,7 @@ class QontinuiExecutor(
             training_callback = self.training_export.get_record_callback()
 
             def combined_record_callback(record):
-                """Callback that reports to training export, trajectory logger, and test results."""
+                """Callback that reports to training export and the trajectory logger."""
                 # Call training export callback
                 if training_callback:
                     training_callback(record)
@@ -564,46 +536,6 @@ class QontinuiExecutor(
                 if self._trajectory_logger:
                     with contextlib.suppress(Exception):
                         self._trajectory_logger.on_record_created(record)
-
-                # Report action data for historical indexing (Config Testing)
-                if self.test_results_handler and self.test_results_handler.is_enabled():
-                    try:
-                        # Extract match info from record
-                        match_summary = record.match_summary or {}
-
-                        self.test_results_handler.report_action(
-                            action_id=record.action_id,
-                            action_type=record.action_type,
-                            success=record.success,
-                            pattern_id=match_summary.get("image_id"),
-                            pattern_name=match_summary.get("image_id"),  # Using image_id as name
-                            active_states=list(record.active_states_before),
-                            match_count=1 if match_summary.get("found") else 0,
-                            best_match_score=match_summary.get("confidence"),
-                            match_x=(
-                                match_summary.get("location", {}).get("x")
-                                if match_summary.get("location")
-                                else None
-                            ),
-                            match_y=(
-                                match_summary.get("location", {}).get("y")
-                                if match_summary.get("location")
-                                else None
-                            ),
-                            match_width=None,  # Not available in current record
-                            match_height=None,
-                            duration_ms=(int(record.duration_ms) if record.duration_ms else None),
-                            result_data={
-                                "config": record.config,
-                                "clicked_location": record.clicked_location,
-                                "transition_data": record.transition_data,
-                            },
-                        )
-                    except Exception as e:
-                        self.event_manager.emit_log(
-                            "debug",
-                            f"Failed to report action for historical indexing: {e}",
-                        )
 
             self.unified_data_collector = UnifiedDataCollector(
                 state_memory=state_memory_adapter,
@@ -635,33 +567,20 @@ class QontinuiExecutor(
         Returns:
             True if successful, False otherwise
         """
-        # DEBUG: Log config loading
-        import os
-        import tempfile
-
-        debug_log_path = os.path.join(tempfile.gettempdir(), "qontinui_load_config_debug.log")
-        try:
-            with open(debug_log_path, "a") as f:
-                from datetime import datetime
-
-                f.write(f"\n=== LOAD_CONFIGURATION DEBUG {datetime.now()} ===\n")
-                f.write(f"config_path: {config_path}\n")
-                f.write(f"QONTINUI_AVAILABLE: {QONTINUI_AVAILABLE}\n")
-                f.flush()
-        except Exception:
-            pass
+        logger.debug(
+            "load_configuration: config_path=%s QONTINUI_AVAILABLE=%s",
+            config_path,
+            QONTINUI_AVAILABLE,
+        )
 
         success = self.executor_core.load_configuration(config_path)
 
-        # DEBUG: Log result
-        try:
-            with open(debug_log_path, "a") as f:
-                f.write(f"executor_core.load_configuration returned: {success}\n")
-                f.write(f"executor_core.action_executor: {self.executor_core.action_executor}\n")
-                f.write(f"executor_core.state_executor: {self.executor_core.state_executor}\n")
-                f.flush()
-        except Exception:
-            pass
+        logger.debug(
+            "executor_core.load_configuration returned %s (action_executor=%s, state_executor=%s)",
+            success,
+            self.executor_core.action_executor,
+            self.executor_core.state_executor,
+        )
 
         if success:
             # Store reference to config
@@ -816,19 +735,6 @@ class QontinuiExecutor(
             "info",
             f"[PYTHON_EXECUTOR] start_execution called: workflow_id={workflow_id}, monitor={monitor}",
         )
-        # Write to debug file for monitor tracing
-        try:
-            with open(
-                os.path.join(tempfile.gettempdir(), "qontinui_monitor_debug.log"),
-                "a",
-                encoding="utf-8",
-            ) as f:
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                f.write(
-                    f"[{timestamp}] [PYTHON_EXECUTOR] start_execution called: workflow_id={workflow_id}, monitor={monitor}\n"
-                )
-        except Exception:
-            pass
 
         if self.is_running:
             self.event_manager.emit_log("warning", "Execution already in progress")
@@ -845,17 +751,6 @@ class QontinuiExecutor(
         self.event_manager.emit_log(
             "info", f"[PYTHON_EXECUTOR] Set self.target_monitor = {monitor}"
         )
-        # Write to debug file for monitor tracing
-        try:
-            with open(
-                os.path.join(tempfile.gettempdir(), "qontinui_monitor_debug.log"),
-                "a",
-                encoding="utf-8",
-            ) as f:
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                f.write(f"[{timestamp}] [PYTHON_EXECUTOR] Set self.target_monitor = {monitor}\n")
-        except Exception:
-            pass
         if monitor is not None:
             self.event_manager.emit_log("info", f"[PYTHON_EXECUTOR] Using monitor index: {monitor}")
             # Apply monitor setting to FrameworkSettings so qontinui core uses this monitor
@@ -876,33 +771,11 @@ class QontinuiExecutor(
                             "debug",
                             f"Set target monitor: {monitor} (library will look up position via MSS)",
                         )
-                        # Write to debug file
-                        try:
-                            with open(
-                                os.path.join(tempfile.gettempdir(), "qontinui_monitor_debug.log"),
-                                "a",
-                                encoding="utf-8",
-                            ) as f:
-                                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                                f.write(
-                                    f"[{timestamp}] [PYTHON_EXECUTOR] Set target monitor: {monitor}\n"
-                                )
-                        except Exception:
-                            pass
                     else:
-                        # Debug: Log why we couldn't set monitor
-                        try:
-                            with open(
-                                os.path.join(tempfile.gettempdir(), "qontinui_monitor_debug.log"),
-                                "a",
-                                encoding="utf-8",
-                            ) as f:
-                                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                                f.write(
-                                    f"[{timestamp}] [PYTHON_EXECUTOR] WARNING: Cannot set monitor - executor_core or state_executor is None\n"
-                                )
-                        except Exception:
-                            pass
+                        self.event_manager.emit_log(
+                            "warning",
+                            "Cannot set monitor - executor_core or state_executor is None",
+                        )
                 except Exception as e:
                     self.event_manager.emit_log(
                         "warning", f"Failed to set monitor in FrameworkSettings: {e}"
@@ -933,9 +806,6 @@ class QontinuiExecutor(
 
     def _run_workflow(self, workflow_id: str):
         """Run workflow in background thread."""
-        execution_start_time = time.time()
-        test_run_id = None
-
         try:
             self.event_manager.emit_log("info", f"Starting workflow execution: {workflow_id}")
 
@@ -943,21 +813,8 @@ class QontinuiExecutor(
             if self.gui_automation:
                 self.gui_automation.reset_navigation_state()
 
-            # Get workflow config for test results
+            # Workflow config, for the initial-state fallback below
             workflow = self.executor_core.workflows.get(workflow_id) if self.executor_core else None
-            workflow_name = workflow_id
-            if workflow:
-                if isinstance(workflow, dict):
-                    workflow_name = workflow.get("name", workflow_id)
-                elif hasattr(workflow, "name"):
-                    workflow_name = workflow.name
-
-            # Start test run for QA dashboard
-            if self.test_results_handler.is_enabled():
-                test_run_id = self.test_results_handler.start_test_run(
-                    workflow_name=workflow_name,
-                    workflow_config=self.config or {},
-                )
 
             # Initialize state executor with initial states
             # Priority: resolved from runner (self._initial_state_ids) > workflow config
@@ -997,14 +854,6 @@ class QontinuiExecutor(
                 },
             )
 
-            # Complete test run for QA dashboard
-            if test_run_id and self.test_results_handler.is_enabled():
-                execution_duration = time.time() - execution_start_time
-                self.test_results_handler.complete_test_run(
-                    success=success,
-                    summary=f"Workflow '{workflow_name}' {'completed successfully' if success else 'failed'} in {execution_duration:.1f}s",
-                )
-
         except Exception as e:
             self.event_manager.emit_log("error", f"Workflow execution error: {e}")
             self.event_manager.emit_log("debug", f"Traceback: {traceback.format_exc()}")
@@ -1017,13 +866,6 @@ class QontinuiExecutor(
                     "error": str(e),
                 },
             )
-
-            # Complete test run with failure
-            if test_run_id and self.test_results_handler.is_enabled():
-                self.test_results_handler.complete_test_run(
-                    success=False,
-                    summary=f"Workflow failed with error: {e}",
-                )
 
         finally:
             # Stop input capture for coordinate validation
@@ -1207,19 +1049,6 @@ class QontinuiExecutor(
             "info",
             f"[PYTHON_EXECUTOR] start command: workflow_id={workflow_id}, params={params}, resolved monitor={monitor}",
         )
-        # Write to debug file for monitor tracing
-        try:
-            with open(
-                os.path.join(tempfile.gettempdir(), "qontinui_monitor_debug.log"),
-                "a",
-                encoding="utf-8",
-            ) as f:
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                f.write(
-                    f"[{timestamp}] [PYTHON_EXECUTOR] start command: workflow_id={workflow_id}, params={params}, resolved monitor={monitor}, offset=({monitor_offset_x}, {monitor_offset_y})\n"
-                )
-        except Exception:
-            pass
         success = self.start_execution(
             workflow_id,
             monitor=monitor,
@@ -1365,26 +1194,6 @@ class QontinuiExecutor(
             "is_monitoring": is_monitoring,
             "events_count": events_count,
             "session_id": self._input_capture_session_id,
-        }
-
-    def _cmd_test_results_configure(self, params: Any) -> dict[str, Any]:
-        """Handle the ``test_results_configure`` command."""
-        enabled = params.get("enabled", False)
-        api_url = params.get("api_url", "")
-        access_token = params.get("access_token", "")
-        project_id = params.get("project_id")
-        self.event_manager.emit_log(
-            "info",
-            f"[TEST_RESULTS_CONFIGURE] enabled={enabled}, api_url={api_url}, project_id={project_id}",
-        )
-        success = self.test_results_handler.configure(enabled, api_url, access_token, project_id)
-        return {"success": success}
-
-    def _cmd_test_results_status(self, params: Any) -> dict[str, Any]:
-        """Handle the ``test_results_status`` command."""
-        return {
-            "success": True,
-            **self.test_results_handler.get_status(),
         }
 
     def _cmd_ping(self, params: Any) -> dict[str, Any]:

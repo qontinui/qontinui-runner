@@ -14,6 +14,8 @@
 //! target, the pane directory's per-user ACL) is UNRUN here, not passed.
 #![cfg(unix)]
 
+mod common;
+
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -98,7 +100,7 @@ impl Drop for Pane {
         if let Some(h) = self.holder.take() {
             h.teardown();
         }
-        let _ = std::fs::remove_dir_all(&self.dir);
+        let _ = common::remove_pane_dir(&self.dir);
     }
 }
 

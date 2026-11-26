@@ -2076,6 +2076,8 @@ mod wiring_tests {
             None,
             false,
             true,
+            None,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("model gateway"), "{err}");

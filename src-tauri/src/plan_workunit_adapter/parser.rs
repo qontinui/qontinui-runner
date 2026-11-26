@@ -22,6 +22,11 @@
 //! 2. **Richer projection.** We also extract [`ParsedWorkUnit::depends_on`]
 //!    (the canonical `Depends-On:` edges) and [`ParsedWorkUnit::phases`] (one
 //!    sub-unit per declared phase — see [`detect_phases`]), which coord discarded.
+//!    Lettered arm-A phases (`### Phase A:`, `### Phase C1 —`) are carried
+//!    separately as [`ParsedWorkUnit::phase_labels`], and a phase TITLE neither
+//!    grammar reads (`### Phase Two —`) as [`ParsedWorkUnit::phases_undeclared`]
+//!    (plan `2026-11-09-lettered-phase-headings-never-reach-coords-phase-declaration`,
+//!    D1 and D3).
 
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -79,6 +84,37 @@ pub struct ParsedPhase {
     pub name: String,
 }
 
+/// One LETTERED phase of a plan — `### Phase A:`, `**Phase C1 — x**` — read
+/// only at arm A of [`detect_phases`] (plan
+/// `2026-11-09-lettered-phase-headings-never-reach-coords-phase-declaration`, D1).
+///
+/// A label keeps its spelling (`A`, `C1`) and is never mapped to a number:
+/// mapping would invent a numbering the plan does not declare. It travels to
+/// coord in its own metadata key, `phase_labels`, never inside `phases` (D2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedLabelPhase {
+    /// The label as written: one capital letter, then optional digits.
+    pub label: String,
+    /// The phase's name, ranked exactly as a numeric arm-A name is.
+    pub name: String,
+}
+
+/// The cap on [`ParsedWorkUnit::phases_undeclared`]: enough to make the
+/// declaration read partial, without letting one odd plan grow the key.
+pub const PHASES_UNDECLARED_CAP: usize = 16;
+
+/// Everything [`detect_phases`] reads off a plan body.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DetectedPhases {
+    /// Numeric phases (arms A-D), deduped by index.
+    pub phases: Vec<ParsedPhase>,
+    /// Lettered phases (arm A only), deduped by label.
+    pub labels: Vec<ParsedLabelPhase>,
+    /// Phase-title tokens neither grammar reads (arm A only), deduped and
+    /// capped at [`PHASES_UNDECLARED_CAP`].
+    pub undeclared: Vec<String>,
+}
+
 /// The pure result of parsing a plan markdown file. No IO, no clock, no env.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedWorkUnit {
@@ -97,11 +133,34 @@ pub struct ParsedWorkUnit {
     /// or rejected; see [`extract_area`].
     pub area: Option<String>,
     /// Why a status-block area declaration was rejected, when one was. Carried
-    /// rather than logged here so the parse stays pure; the work-unit reconcile
-    /// is the one place that warns about it.
-    pub area_rejected: Option<AreaRejection>,
+    /// rather than logged here so the parse stays pure; every loop that pushes
+    /// work units warns about it, through `trigger::warn_if_header_rejected`.
+    pub area_rejected: Option<HeaderRejection>,
+    /// The plan's `Initiative-Item:` from the status blockquote — the key of the
+    /// initiative `in_scope` entry this plan serves — pushed as work-unit
+    /// `metadata.initiative_item`. Same grammar and rules as `area`; see
+    /// [`extract_initiative_item`].
+    pub initiative_item: Option<String>,
+    /// Why a status-block initiative-item declaration was rejected, when one
+    /// was. Same carry-don't-log rule as `area_rejected`.
+    pub initiative_item_rejected: Option<HeaderRejection>,
     /// Phase structure -> sub-units, in document order, deduped by index.
     pub phases: Vec<ParsedPhase>,
+    /// Lettered arm-A phases (`Phase A`, `Phase C1`), in document order,
+    /// deduped by label — pushed as work-unit `metadata.phase_labels`. Never
+    /// mapped onto `phases`; see [`ParsedLabelPhase`].
+    pub phase_labels: Vec<ParsedLabelPhase>,
+    /// Arm-A phase-title tokens that neither the numeric nor the label grammar
+    /// reads (`Phase Two —`, `Phase II:`), deduped, capped at
+    /// [`PHASES_UNDECLARED_CAP`] — pushed as work-unit
+    /// `metadata.phases_undeclared`, so coord reads the declaration as PARTIAL
+    /// rather than complete (plan D3).
+    pub phases_undeclared: Vec<String>,
+    /// The repos the plan's `**Repo(s):**` line declares, bare names, deduped
+    /// in first-seen order — pushed as work-unit `metadata.repos` when
+    /// non-empty. Parsed by [`super::body_push::extract_repos`], the ONE
+    /// parser of that line (it also feeds the plan-library `repos` facet).
+    pub repos: Vec<String>,
     /// Provenance back-link: the source file path the caller supplied.
     pub source_path: String,
     /// Raw body, retained like coord's `ParsedPlan.content`.
@@ -337,9 +396,10 @@ pub(crate) fn is_kebab_case(s: &str) -> bool {
         })
 }
 
-/// Why a status-block area declaration was not accepted.
+/// Why a status-block kebab header declaration (`Area:`, `Initiative-Item:`)
+/// was not accepted.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AreaRejection {
+pub enum HeaderRejection {
     /// A recognised key whose value fails [`is_kebab_case`] — kept verbatim.
     NotKebab(String),
     /// A recognised near-miss spelling of the key (`**Area**:`, `*Area:*`).
@@ -347,30 +407,79 @@ pub enum AreaRejection {
     Misspelled(&'static str),
 }
 
-impl std::fmt::Display for AreaRejection {
+/// One kebab-valued status-block header key, spelled every way the scanner
+/// recognises it. `Area:` and `Initiative-Item:` share one scanner
+/// ([`key_on_line`]) so their key and value rules cannot drift apart.
+#[derive(Debug)]
+struct KebabHeader {
+    /// The bolded key's opener, `**Area:` — matched anywhere on a line.
+    bold: &'static str,
+    /// The unbolded key, `Area:` — matched only as the first token after `>`.
+    plain: &'static str,
+    /// Near-miss `**Area**:` — rejected with the spelling named.
+    bold_outside_colon: &'static str,
+    /// Near-miss `*Area:*` — rejected with the spelling named.
+    italic: &'static str,
+}
+
+/// `Area:` — work-unit `metadata.area`.
+const AREA_HEADER: KebabHeader = KebabHeader {
+    bold: "**Area:",
+    plain: "Area:",
+    bold_outside_colon: "**Area**:",
+    italic: "*Area:*",
+};
+
+/// `Initiative-Item:` — work-unit `metadata.initiative_item` (plan
+/// `2026-09-20-what-is-the-state-of-my-projects-and-what-needs-me-is-answerable-from-one-screen`,
+/// Phase 5). Modelled line-for-line on [`AREA_HEADER`].
+const INITIATIVE_ITEM_HEADER: KebabHeader = KebabHeader {
+    bold: "**Initiative-Item:",
+    plain: "Initiative-Item:",
+    bold_outside_colon: "**Initiative-Item**:",
+    italic: "*Initiative-Item:*",
+};
+
+impl std::fmt::Display for HeaderRejection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotKebab(v) => {
                 write!(f, "value {v:?} is not kebab-case ([a-z0-9]+(-[a-z0-9]+)*)")
             }
             Self::Misspelled(k) => {
-                write!(f, "key spelled {k:?}; write `**Area:**` (value not read)")
+                // The key's own name, recovered from the near-miss spelling:
+                // `**Area**:` and `*Area:*` both name `Area`.
+                let name = k.trim_matches(['*', ':']);
+                write!(f, "key spelled {k:?}; write `**{name}:**` (value not read)")
             }
         }
     }
 }
 
-/// What the status blockquote declares about the plan's area.
+/// What the status blockquote declares for one kebab header (the plan's area,
+/// or its initiative item).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AreaDecl {
-    /// No `Area:` key in the status blockquote (including a plan whose only
-    /// `Area:` line sits outside it, e.g. in a second blockquote after a blank
-    /// line). Not a defect — nothing is warned.
+pub enum HeaderDecl {
+    /// No such key in the status blockquote (including a plan whose only
+    /// `Area:` / `Initiative-Item:` line sits outside it, e.g. in a second
+    /// blockquote after a blank line). Not a defect — nothing is warned.
     Absent,
     /// A key whose value satisfies [`is_kebab_case`].
     Accepted(String),
-    /// A key that was found but not accepted — see [`AreaRejection`].
-    Rejected(AreaRejection),
+    /// A key that was found but not accepted — see [`HeaderRejection`].
+    Rejected(HeaderRejection),
+}
+
+impl HeaderDecl {
+    /// Split into the `(accepted value, rejection)` pair [`ParsedWorkUnit`]
+    /// carries; `Absent` is `(None, None)` — nothing to push, nothing to warn.
+    fn into_parts(self) -> (Option<String>, Option<HeaderRejection>) {
+        match self {
+            Self::Absent => (None, None),
+            Self::Accepted(v) => (Some(v), None),
+            Self::Rejected(why) => (None, Some(why)),
+        }
+    }
 }
 
 /// A key match on one line: its byte offset and what it resolves to.
@@ -378,50 +487,49 @@ pub enum AreaDecl {
     clippy::string_slice,
     reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
 )]
-fn area_key_on_line(line: &str) -> Option<(usize, AreaDecl)> {
-    const BOLD: &str = "**Area:";
-    let mut best: Option<(usize, AreaDecl)> = None;
-    let mut consider = |pos: usize, decl: AreaDecl| {
+fn key_on_line(line: &str, key: &KebabHeader) -> Option<(usize, HeaderDecl)> {
+    let mut best: Option<(usize, HeaderDecl)> = None;
+    let mut consider = |pos: usize, decl: HeaderDecl| {
         if best.as_ref().is_none_or(|(b, _)| pos < *b) {
             best = Some((pos, decl));
         }
     };
 
-    // (a) The bolded key, anywhere on the line: `**Area:**` (and the
+    // (a) The bolded key, anywhere on the line: e.g. `**Area:**` (and the
     //     Status-style `**Area: x**`, whose closer follows the value).
-    if let Some(pos) = line.find(BOLD) {
-        consider(pos, area_value(&line[pos + BOLD.len()..]));
+    if let Some(pos) = line.find(key.bold) {
+        consider(pos, header_value(&line[pos + key.bold.len()..]));
     }
     // (b) The unbolded key, ONLY as the first token after `>`: prose such as
-    //     "covers the grey Area: see below" never counts.
+    //     "covers the grey Area: see below" never counts (same for any key).
     let lead = line.len() - line.trim_start().len();
     let after_gt = line
         .trim_start()
         .strip_prefix('>')
         .unwrap_or(line.trim_start());
     let content = after_gt.trim_start();
-    if let Some(rest) = content.strip_prefix("Area:") {
-        consider(lead, area_value(rest));
+    if let Some(rest) = content.strip_prefix(key.plain) {
+        consider(lead, header_value(rest));
     }
     // (c) Recognised near-misses: rejected with the spelling named, so a
     //     declaration never vanishes silently.
-    if let Some(pos) = line.find("**Area**:") {
+    if let Some(pos) = line.find(key.bold_outside_colon) {
         consider(
             pos,
-            AreaDecl::Rejected(AreaRejection::Misspelled("**Area**:")),
+            HeaderDecl::Rejected(HeaderRejection::Misspelled(key.bold_outside_colon)),
         );
     }
     let mut from = 0;
-    while let Some(rel) = line[from..].find("*Area:*") {
+    while let Some(rel) = line[from..].find(key.italic) {
         let pos = from + rel;
         from = pos + 1;
-        // Part of the bolded `**Area:**`, which (a) already handles.
+        // Part of the bolded key (e.g. `**Area:**`), which (a) already handles.
         if line[..pos].ends_with('*') {
             continue;
         }
         consider(
             pos,
-            AreaDecl::Rejected(AreaRejection::Misspelled("*Area:*")),
+            HeaderDecl::Rejected(HeaderRejection::Misspelled(key.italic)),
         );
         break;
     }
@@ -429,7 +537,7 @@ fn area_key_on_line(line: &str) -> Option<(usize, AreaDecl)> {
 }
 
 /// Read the value that follows a key (see [`extract_area`] for the rule).
-fn area_value(after_key: &str) -> AreaDecl {
+fn header_value(after_key: &str) -> HeaderDecl {
     let rest = after_key
         .strip_prefix("**")
         .unwrap_or(after_key)
@@ -446,9 +554,9 @@ fn area_value(after_key: &str) -> AreaDecl {
             .trim_end_matches(['.', ',', ';', ':', ')', '*']),
     };
     if is_kebab_case(value) {
-        AreaDecl::Accepted(value.to_string())
+        HeaderDecl::Accepted(value.to_string())
     } else {
-        AreaDecl::Rejected(AreaRejection::NotKebab(value.to_string()))
+        HeaderDecl::Rejected(HeaderRejection::NotKebab(value.to_string()))
     }
 }
 
@@ -466,7 +574,7 @@ fn area_value(after_key: &str) -> AreaDecl {
 ///   inline code (`` `Area:` ``) are never keys.
 ///
 /// Two recognised near-misses, `**Area**:` and `*Area:*`, are
-/// [`AreaDecl::Rejected`] with [`AreaRejection::Misspelled`] and their value
+/// [`HeaderDecl::Rejected`] with [`HeaderRejection::Misspelled`] and their value
 /// is not read. The FIRST key in the block (earliest line, then earliest
 /// position) decides; a later one is never consulted, so a malformed
 /// declaration is reported rather than silently shadowed.
@@ -487,15 +595,35 @@ fn area_value(after_key: &str) -> AreaDecl {
 /// judged by [`is_kebab_case`]: `` `agent_worktree` reclaim `` is rejected as
 /// `agent_worktree`, never guessed into shape.
 ///
-/// Pure: this function and [`parse_work_unit`] log nothing. The work-unit
-/// reconcile warns about a rejection (`trigger::reconcile_once`).
-pub fn extract_area(body: &str) -> AreaDecl {
+/// Pure: this function and [`parse_work_unit`] log nothing. Every loop that
+/// pushes work units warns about a rejection (`trigger::warn_if_header_rejected`).
+pub fn extract_area(body: &str) -> HeaderDecl {
+    extract_kebab_header(body, &AREA_HEADER)
+}
+
+/// Extract the plan's `Initiative-Item:` from the status blockquote — the key
+/// of the initiative `in_scope` entry the plan serves. The scanner only stores
+/// it, as `metadata.initiative_item`. Counting a unit under its key (and a
+/// unit without one as `unattributed`, never guessed) is the job of coord's
+/// project-state reader (`crates/coord/src/project_state.rs`, qontinui-coord
+/// `5e86b939d`), which reads `metadata ->> 'initiative_item'`. Every rule is
+/// [`extract_area`]'s, applied to
+/// the key `Initiative-Item:`: the same block, the same two accepted key
+/// spellings, the same two rejected near-misses, the same value delimiting and
+/// the same [`is_kebab_case`] grammar, because the scanner is shared.
+pub fn extract_initiative_item(body: &str) -> HeaderDecl {
+    extract_kebab_header(body, &INITIATIVE_ITEM_HEADER)
+}
+
+/// The shared body of [`extract_area`] and [`extract_initiative_item`]: the
+/// FIRST `key` in the status blockquote decides.
+fn extract_kebab_header(body: &str, key: &KebabHeader) -> HeaderDecl {
     for line in status_blockquote_lines(body) {
-        if let Some((_, decl)) = area_key_on_line(line) {
+        if let Some((_, decl)) = key_on_line(line, key) {
             return decl;
         }
     }
-    AreaDecl::Absent
+    HeaderDecl::Absent
 }
 
 /// A heading that opens a **phase-list section** (arms B and C of
@@ -543,6 +671,14 @@ static HEADING_ENUMERATOR: Lazy<Regex> =
 /// outranks a sentence when both name the same index.
 static PHASE_TITLE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"^Phase\s+(\d+)([a-z]?)(?:\s*$|\s*[—–:(\-]|\.\s|\.$)").expect("valid regex")
+});
+
+/// [`PHASE_TITLE`]'s twin for a LETTERED phase (`Phase A —`, `Phase C1:`):
+/// the same title tail after a [`phase_label_at`] label. Used only to RANK an
+/// arm-A label's name ([`heading_rank`]); arm B keeps the numeric
+/// [`PHASE_TITLE`] alone, so no list item ever declares a label.
+static LABEL_PHASE_TITLE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^Phase\s+[A-Z][0-9]*(?:\s*$|\s*[—–:(\-]|\.\s|\.$)").expect("valid regex")
 });
 
 /// `Phase` then a LETTERED number (`Phase 1e`, `Phase 2b`).
@@ -618,6 +754,100 @@ fn phase_index_at(rest: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
+/// What an arm-A line's `Phase <token>` declares: a number or a label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PhaseKey {
+    /// `Phase 3`, `Phase 2b` — [`phase_index_at`], unchanged.
+    Index(u32),
+    /// `Phase A`, `Phase C1` — [`phase_label_at`].
+    Label(String),
+}
+
+/// The arm-A phase-key reader: the numeric reading first (so `Phase 2b` and
+/// `Phase 1B` keep declaring their integer, exactly as before), else a label.
+fn phase_key_at(rest: &str) -> Option<PhaseKey> {
+    match phase_index_at(rest) {
+        Some(index) => Some(PhaseKey::Index(index)),
+        None => phase_label_at(rest).map(PhaseKey::Label),
+    }
+}
+
+/// `rest` begins with `Phase`, a whitespace boundary, then a LABEL — one
+/// capital ASCII letter and optional ASCII digits (`A`, `C1`, `R2`) — followed
+/// by the end of the text or a character outside `[A-Za-z0-9_]` (plan
+/// `2026-11-09-lettered-phase-headings-never-reach-coords-phase-declaration`, D1).
+///
+/// A label followed by `.` and a digit is a dotted cross-reference to another
+/// plan's sub-phase (`Phase D.3`) and is not a label. `Phase AB`, `Phase Two`
+/// and `Phase A_x` are not labels either (the boundary rule); `Phase ordering`
+/// is not (lower case).
+fn phase_label_at(rest: &str) -> Option<String> {
+    let after = rest.strip_prefix("Phase")?;
+    if !after.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let mut chars = after.trim_start().chars();
+    let first = chars.next().filter(char::is_ascii_uppercase)?;
+    let digits: String = chars.clone().take_while(char::is_ascii_digit).collect();
+    // The digits are ASCII, so their char count is their length.
+    let mut tail = chars.skip(digits.len());
+    match tail.next() {
+        None => {}
+        Some(c) if c.is_ascii_alphanumeric() || c == '_' => return None,
+        Some('.') if tail.next().is_some_and(|c| c.is_ascii_digit()) => return None,
+        Some(_) => {}
+    }
+    Some(format!("{first}{digits}"))
+}
+
+/// A label-shaped token: one capital ASCII letter, then only ASCII digits.
+fn is_label_token(token: &str) -> bool {
+    let mut chars = token.chars();
+    chars.next().is_some_and(|c| c.is_ascii_uppercase()) && chars.all(|c| c.is_ascii_digit())
+}
+
+/// D3's undeclared-title detector, for an arm-A line's text (a heading's text
+/// after its enumerator, or a bold line's span).
+///
+/// The token is the maximal `[A-Za-z0-9]+` run after `Phase` and whitespace.
+/// It is reported when it starts with a capital, is not label-shaped
+/// ([`is_label_token`] — a label, or a `Phase D.3` cross-reference, is never
+/// reported), and is followed by a TITLE TAIL: the end of the text, `—`, `–`,
+/// `:`, `(` or `-` (each after optional whitespace), or a `.` that ends the
+/// text or precedes whitespace. So `Phase Two —`, `Phase II:` and `Phase AB`
+/// are reported; `Phase ordering` (lower case, a section word) and
+/// `Phase Two is next` (a sentence) are not.
+fn undeclared_phase_token(text: &str) -> Option<String> {
+    let after = text.strip_prefix("Phase")?;
+    if !after.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let from = after.trim_start();
+    let token: String = from
+        .chars()
+        .take_while(char::is_ascii_alphanumeric)
+        .collect();
+    if !token.starts_with(|c: char| c.is_ascii_uppercase()) || is_label_token(&token) {
+        return None;
+    }
+    // The token is ASCII, so its byte length is a char boundary.
+    let tail = from.get(token.len()..)?;
+    let spaced = tail.trim_start();
+    let title_tail = spaced.is_empty()
+        || spaced.starts_with(['—', '–', ':', '(', '-'])
+        || tail
+            .strip_prefix('.')
+            .is_some_and(|r| r.is_empty() || r.starts_with(char::is_whitespace));
+    title_tail.then_some(token)
+}
+
+/// Record an undeclared token, deduped, up to [`PHASES_UNDECLARED_CAP`].
+fn record_undeclared(out: &mut Vec<String>, token: String) {
+    if out.len() < PHASES_UNDECLARED_CAP && !out.contains(&token) {
+        out.push(token);
+    }
+}
+
 /// The content of a bold span, given the text just AFTER its opening `**`:
 /// everything up to the closing `**`, or the whole remainder when the span
 /// does not close on this line.
@@ -660,6 +890,28 @@ fn bold_phase_opens_a_sentence(rest: &str) -> bool {
     if !BARE_PHASE.is_match(span.trim()) {
         return false;
     }
+    bold_span_continues_as_a_sentence(after)
+}
+
+/// A bare bold LABEL span (`**Phase A**, near-verbatim.`, `**Phase C1** of
+/// the other plan`) continued as sentence prose: the citation shape of
+/// [`bold_phase_opens_a_sentence`], so it declares no label (plan
+/// `2026-11-09-lettered-phase-headings-never-reach-coords-phase-declaration`,
+/// Phase 2). Unlike the numeric case it is NOT made inert: before labels
+/// existed such a line was an ordinary column-0 bold line that ended the
+/// phase list, and it still does, so numeric output is unchanged.
+fn bold_phase_label_opens_a_sentence(rest: &str) -> bool {
+    static BARE_LABEL: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"^Phase\s+[A-Z][0-9]*$").expect("valid regex"));
+    rest.split_once("**").is_some_and(|(span, after)| {
+        BARE_LABEL.is_match(span.trim()) && bold_span_continues_as_a_sentence(after)
+    })
+}
+
+/// The text after a bare bold span's closing `**` continues the line as
+/// sentence prose: `,` `.` `;` right after it, or (after whitespace) a
+/// lowercase word.
+fn bold_span_continues_as_a_sentence(after: &str) -> bool {
     if after.starts_with([',', '.', ';']) {
         return true;
     }
@@ -822,9 +1074,49 @@ fn inferred_rank(in_section: bool) -> NameRank {
     }
 }
 
-/// The rank of an arm-A name.
+/// One declared LABEL phase and the rank of the name it carries. Labels come
+/// from arm A only, so there is no refusal to protect against.
+struct DeclaredLabel {
+    phase: ParsedLabelPhase,
+    rank: NameRank,
+}
+
+/// [`declare`] for a label: dedupe by label keeping the FIRST position, and let
+/// a later occurrence of a higher [`NameRank`] replace the name (title
+/// outranks sentence), exactly as a numeric arm-A entry is ranked.
+fn declare_label(out: &mut Vec<DeclaredLabel>, label: String, name: String, rank: NameRank) {
+    match out.iter_mut().find(|d| d.phase.label == label) {
+        Some(d) => {
+            if rank > d.rank {
+                d.phase.name = name;
+                d.rank = rank;
+            }
+        }
+        None => out.push(DeclaredLabel {
+            phase: ParsedLabelPhase { label, name },
+            rank,
+        }),
+    }
+}
+
+/// A bare bold span naming an undeclarable token (`**Phase Two**, cited.`)
+/// that the line continues as sentence prose: a citation, not a title, so
+/// D3 does not report it — the same shape [`bold_phase_opens_a_sentence`]
+/// makes inert for numbers and labels.
+fn bold_undeclared_mention_opens_a_sentence(rest: &str) -> bool {
+    static BARE_TOKEN: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"^Phase\s+[A-Za-z0-9]+$").expect("valid regex"));
+    rest.split_once("**").is_some_and(|(span, after)| {
+        BARE_TOKEN.is_match(span.trim()) && bold_span_continues_as_a_sentence(after)
+    })
+}
+
+/// The rank of an arm-A name. A label title (`Phase A — x`) ranks as a title
+/// exactly as a numeric one does; a numeric name can never match the label
+/// pattern (it needs a capital where the digits are), so numeric ranking is
+/// unchanged.
 fn heading_rank(name: &str) -> NameRank {
-    if PHASE_TITLE.is_match(name) {
+    if PHASE_TITLE.is_match(name) || LABEL_PHASE_TITLE.is_match(name) {
         NameRank::HeadingTitle
     } else {
         NameRank::HeadingSentence
@@ -845,7 +1137,13 @@ fn heading_rank(name: &str) -> NameRank {
 ///   `## 5. Phase 0 — x` counts, unless the number is lettered — `### A.
 ///   Phase 1e` is another plan's sub-phase) or a `**`-bold line: `Phase`,
 ///   whitespace, digits. The pre-existing arm; its titles name a phase ahead of
-///   every other arm ([`NameRank`]).
+///   every other arm ([`NameRank`]). The same positions also declare a
+///   LABEL (`Phase A`, `Phase C1` — [`phase_label_at`]) into
+///   [`DetectedPhases::labels`], and report an undeclarable phase TITLE
+///   (`Phase Two —` — [`undeclared_phase_token`]) into
+///   [`DetectedPhases::undeclared`]; both only at arm A (plan
+///   `2026-11-09-lettered-phase-headings-never-reach-coords-phase-declaration`,
+///   D1 and D3). Arms B-D stay numeric-only.
 /// - **B** — inside a phase list (below), a column-0 list item whose bold text
 ///   is a phase TITLE ([`PHASE_TITLE`]): `- **Phase 1 — schema**`, never
 ///   `- **Phase 3's check could ossify**`. Outside a phase-list section a
@@ -885,10 +1183,12 @@ fn heading_rank(name: &str) -> NameRank {
     clippy::string_slice,
     reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
 )]
-fn detect_phases(body: &str) -> Vec<ParsedPhase> {
+fn detect_phases(body: &str) -> DetectedPhases {
     let lines: Vec<&str> = body.lines().collect();
     let fenced = fenced_lines(&lines);
     let mut out: Vec<Declared> = Vec::new();
+    let mut labels: Vec<DeclaredLabel> = Vec::new();
+    let mut undeclared: Vec<String> = Vec::new();
     let mut refused: Vec<u32> = Vec::new();
     let mut refuse = |index: Option<u32>, lettered: bool| {
         if let (Some(index), false) = (index, lettered) {
@@ -934,10 +1234,25 @@ fn detect_phases(body: &str) -> Vec<ParsedPhase> {
                 (rest.trim_start().to_string(), false)
             };
             let lettered = LETTERED_PHASE.is_match(&text);
-            if let (Some(index), false) = (phase_index_at(&text), enumerated && lettered) {
-                let name = text.trim_end_matches(['#', '*']).trim().to_string();
-                let rank = heading_rank(&name);
-                declare(&mut out, index, name, rank);
+            match phase_key_at(&text) {
+                Some(PhaseKey::Index(index)) if !(enumerated && lettered) => {
+                    let name = text.trim_end_matches(['#', '*']).trim().to_string();
+                    let rank = heading_rank(&name);
+                    declare(&mut out, index, name, rank);
+                }
+                // `### A. Phase 1e`: another plan's sub-phase (unchanged).
+                Some(PhaseKey::Index(_)) => {}
+                Some(PhaseKey::Label(label)) => {
+                    let name = text.trim_end_matches(['#', '*']).trim().to_string();
+                    let rank = heading_rank(&name);
+                    declare_label(&mut labels, label, name, rank);
+                }
+                None => {
+                    let name = text.trim_end_matches(['#', '*']).trim();
+                    if let Some(token) = undeclared_phase_token(name) {
+                        record_undeclared(&mut undeclared, token);
+                    }
+                }
             }
             continue;
         }
@@ -957,8 +1272,8 @@ fn detect_phases(body: &str) -> Vec<ParsedPhase> {
             continue;
         }
         if let Some(rest) = t.strip_prefix("**") {
-            match phase_index_at(rest) {
-                Some(index) => {
+            match phase_key_at(rest) {
+                Some(PhaseKey::Index(index)) => {
                     let name = bold_span(rest);
                     let rank = heading_rank(&name);
                     if rank == NameRank::HeadingTitle {
@@ -966,8 +1281,30 @@ fn detect_phases(body: &str) -> Vec<ParsedPhase> {
                     }
                     declare(&mut out, index, name, rank);
                 }
-                None if column0 => list = PhaseList::Off,
-                None => {}
+                // A label is declared wherever a number in the same position
+                // would be. Its effect on the phase-list state is exactly the
+                // pre-label one (any column-0 bold line that names no number
+                // ends the list), so arms B-D declare byte-identically.
+                Some(PhaseKey::Label(label)) => {
+                    if column0 {
+                        list = PhaseList::Off;
+                    }
+                    if !bold_phase_label_opens_a_sentence(rest) {
+                        let name = bold_span(rest);
+                        let rank = heading_rank(&name);
+                        declare_label(&mut labels, label, name, rank);
+                    }
+                }
+                None => {
+                    if !bold_undeclared_mention_opens_a_sentence(rest) {
+                        if let Some(token) = undeclared_phase_token(&bold_span(rest)) {
+                            record_undeclared(&mut undeclared, token);
+                        }
+                    }
+                    if column0 {
+                        list = PhaseList::Off;
+                    }
+                }
             }
             continue;
         }
@@ -1080,10 +1417,15 @@ fn detect_phases(body: &str) -> Vec<ParsedPhase> {
             }
         }
     }
-    out.into_iter()
-        .filter(|d| d.by_heading || !refused.contains(&d.phase.index))
-        .map(|d| d.phase)
-        .collect()
+    DetectedPhases {
+        phases: out
+            .into_iter()
+            .filter(|d| d.by_heading || !refused.contains(&d.phase.index))
+            .map(|d| d.phase)
+            .collect(),
+        labels: labels.into_iter().map(|d| d.phase).collect(),
+        undeclared,
+    }
 }
 
 /// Parse a plan markdown body into a [`ParsedWorkUnit`]. Pure — no IO. `slug`
@@ -1129,11 +1471,13 @@ pub fn parse_work_unit(
         }
     }
 
-    let (area, area_rejected) = match extract_area(body) {
-        AreaDecl::Absent => (None, None),
-        AreaDecl::Accepted(area) => (Some(area), None),
-        AreaDecl::Rejected(why) => (None, Some(why)),
-    };
+    let (area, area_rejected) = extract_area(body).into_parts();
+    let (initiative_item, initiative_item_rejected) = extract_initiative_item(body).into_parts();
+    let DetectedPhases {
+        phases,
+        labels: phase_labels,
+        undeclared: phases_undeclared,
+    } = detect_phases(body);
 
     ParsedWorkUnit {
         slug: slug.to_string(),
@@ -1142,7 +1486,12 @@ pub fn parse_work_unit(
         depends_on: extract_depends_on(body),
         area,
         area_rejected,
-        phases: detect_phases(body),
+        initiative_item,
+        initiative_item_rejected,
+        phases,
+        phase_labels,
+        phases_undeclared,
+        repos: super::body_push::extract_repos(body),
         source_path: source_path.to_string(),
         content: body.to_string(),
     }
@@ -1777,16 +2126,219 @@ mod tests {
         );
         let got: Vec<u32> = u.phases.iter().map(|p| p.index).collect();
         assert_eq!(got, vec![0, 2, 3, 4, 5], "phases: {:?}", u.phases);
+        assert!(u.phase_labels.is_empty(), "labels: {:?}", u.phase_labels);
+        assert!(u.phases_undeclared.is_empty(), "{:?}", u.phases_undeclared);
+    }
+
+    // --- lettered phases and undeclarable titles (plan
+    // `2026-11-09-lettered-phase-headings-never-reach-coords-phase-declaration`,
+    // Phase 2) ------------------------------------------------------------------
+
+    fn labels(body: &str) -> Vec<String> {
+        parse(body)
+            .phase_labels
+            .iter()
+            .map(|p| p.label.clone())
+            .collect()
+    }
+
+    /// The census unit's shape (`baed3c9e`): `### Phase 0 …` then `### Phase A:`
+    /// through `### Phase F:`. Before D1 the six lettered headings declared
+    /// nothing, so coord saw a one-phase plan. Now `phases` stays `[0]` and the
+    /// letters are declared as labels, each named by its heading.
+    #[test]
+    fn phases_census_shape_declares_index_0_and_labels_a_to_f() {
+        let body = "# T\n\n## 4. Phases\n\n### Phase 0 (implementation session, read-only, ≤ 1 h): re-verify before building\n\nx\n\n### Phase A: presence history\n\n### Phase B: split the census\n\n### Phase C: device-relative freshness\n\n### Phase D: the reader\n\n### Phase E: the detector\n\n### Phase F: close out\n";
+        let u = parse(body);
+        assert_eq!(indices(body), vec![0]);
+        assert_eq!(labels(body), vec!["A", "B", "C", "D", "E", "F"]);
+        assert_eq!(
+            u.phase_labels[0],
+            ParsedLabelPhase {
+                label: "A".to_string(),
+                name: "Phase A: presence history".to_string(),
+            }
+        );
+        assert_eq!(u.phase_labels[5].name, "Phase F: close out");
+        assert!(u.phases_undeclared.is_empty(), "{:?}", u.phases_undeclared);
+    }
+
+    /// A letter plus digits is one label (`C1`, `R2`), in heading and bold
+    /// form, enumerated or not. A digit-plus-letter sub-phase (`1B`) still
+    /// declares its integer and no label — unchanged by D1.
+    #[test]
+    fn phases_letter_digit_labels_declare_as_written() {
+        let body = "# T\n\n### Phase C1 — first half\n\n### Phase C2: second half\n\n**Phase R2 — the bold one**\n\n## 5. Phase T3 — enumerated\n\n### Phase 1B — numeric sub-phase\n";
+        assert_eq!(labels(body), vec!["C1", "C2", "R2", "T3"]);
+        assert_eq!(indices(body), vec![1]);
+    }
+
+    /// `Phase D.3` is a cross-reference to another plan's sub-phase (corpus:
+    /// `2026-05-31-rebase-restack-action-effect-signatures-plan` §6.7): it
+    /// declares no label, no index, and is not reported as undeclared.
+    #[test]
+    fn phases_dotted_label_cross_reference_declares_nothing() {
+        let body = "# T\n\n### 6.7 Phase D.3 (the other plan's sub-phase)\n";
+        let u = parse(body);
+        assert!(u.phase_labels.is_empty(), "{:?}", u.phase_labels);
+        assert!(u.phases.is_empty(), "{:?}", u.phases);
+        assert!(u.phases_undeclared.is_empty(), "{:?}", u.phases_undeclared);
+        // A label followed by a `.` that ends the title is still a label.
+        assert_eq!(labels("# T\n\n### Phase D. The reader\n"), vec!["D"]);
+    }
+
+    /// Edge shapes, each with its stated outcome:
+    /// - `Phase A/B testing` — label `A` (the `/` is a boundary), named by the
+    ///   heading at sentence rank;
+    /// - `Phase ordering` — nothing: a lower-case section word, never reported;
+    /// - `Phase Ordering` — no label (`O` runs into `rdering`), reported as
+    ///   undeclared `Ordering` (D3: a capitalised title token neither grammar
+    ///   reads);
+    /// - `Phase B's check` — label `B` (the apostrophe is a boundary), exactly
+    ///   as `### Phase 3's check` declares 3 at arm A.
+    #[test]
+    fn phases_label_edge_shapes_have_their_stated_outcomes() {
+        let cases: [(&str, &[&str], &[&str]); 4] = [
+            ("### Phase A/B testing", &["A"], &[]),
+            ("### Phase ordering", &[], &[]),
+            ("### Phase Ordering", &[], &["Ordering"]),
+            ("### Phase B's check", &["B"], &[]),
+        ];
+        for (line, want_labels, want_undeclared) in cases {
+            let body = format!("# T\n\n{line}\n");
+            let u = parse(&body);
+            assert_eq!(labels(&body), want_labels, "{line}");
+            assert_eq!(u.phases_undeclared, want_undeclared, "{line}");
+            assert!(u.phases.is_empty(), "{line}");
+        }
+        let u = parse("# T\n\n### Phase A/B testing\n");
+        assert_eq!(u.phase_labels[0].name, "Phase A/B testing");
+    }
+
+    /// A bare bold label span continued as sentence prose is a citation, as
+    /// `**Phase 6**, near-verbatim.` is (coord finding f4812a7f): no label and
+    /// no undeclared token. It still ends a phase list as any column-0 bold
+    /// line naming no number did before labels existed (see
+    /// `phases_a_lettered_bold_line_leaves_numeric_output_unchanged`).
+    #[test]
+    fn phases_bold_bare_label_followed_by_sentence_prose_declares_no_label() {
+        for line in [
+            "**Phase A**, near-verbatim.",
+            "**Phase C1** of the other plan covers this.",
+            "**Phase B**; see below.",
+        ] {
+            let body = format!("# T\n\n## Phase 1 — a\n\n{line}\n\n## Phase 2 — b\n");
+            let u = parse(&body);
+            assert!(u.phase_labels.is_empty(), "{line}: {:?}", u.phase_labels);
+            assert!(u.phases_undeclared.is_empty(), "{line}");
+            assert_eq!(indices(&body), vec![1, 2], "{line}");
+        }
+        // A bare bold label that IS a title still declares.
+        for (line, name) in [
+            ("**Phase A**", "Phase A"),
+            ("**Phase A — make X**", "Phase A — make X"),
+            ("**Phase A:** description", "Phase A:"),
+        ] {
+            let u = parse(&format!("# T\n\n{line}\n"));
+            assert_eq!(u.phase_labels.len(), 1, "{line}");
+            assert_eq!(u.phase_labels[0].name, name, "{line}");
+        }
+    }
+
+    /// Numeric output is byte-identical to the pre-label parser on a lettered
+    /// bold line: a column-0 `**Phase A …` line (a sentence, a bare citation,
+    /// or a title) ends the phase list exactly as it did when it named no
+    /// phase at all, so the numbered items after it are steps, not phases.
+    /// Fails if a label sentence or citation leaves the list armed.
+    #[test]
+    fn phases_a_lettered_bold_line_leaves_numeric_output_unchanged() {
+        for line in [
+            "**Phase A is a gate** before anything.",
+            "**Phase A**, near-verbatim.",
+            "**Phase A — the title**",
+        ] {
+            let body = format!("# T\n\n## Phases\n\n{line}\n\n1. schema\n2. wiring\n");
+            assert!(
+                indices(&body).is_empty(),
+                "{line}: {:?}",
+                parse(&body).phases
+            );
+        }
+        // An INDENTED lettered bold line changes nothing, as before.
+        let body = "# T\n\n## Phases\n\n1. schema\n  **Phase A is a gate**\n2. wiring\n";
+        assert_eq!(indices(body), vec![1, 2]);
+    }
+
+    /// D3: a capitalised title token that neither grammar reads is REPORTED,
+    /// deduped, in document order — never declared as a phase or a label. A
+    /// sentence (`Phase Two is …`), a lower-case word and a bold citation are
+    /// not reported.
+    #[test]
+    fn phases_an_undeclarable_title_is_reported_not_declared() {
+        let body = "# T\n\n## Phase 1 — a\n\n### Phase Two — the second\n\n## Phase II: roman\n\n**Phase AB — two letters**\n\n### Phase Two — again\n\n### Phase Two is a sentence\n\n### Phase ordering\n\n**Phase Three**, cited in prose.\n";
+        let u = parse(body);
+        assert_eq!(u.phases_undeclared, vec!["Two", "II", "AB"]);
+        assert!(u.phase_labels.is_empty(), "{:?}", u.phase_labels);
+        assert_eq!(indices(body), vec![1]);
+        // `Phase Two —` alone, the plan's own example.
+        assert_eq!(
+            parse("# T\n\n### Phase Two —\n").phases_undeclared,
+            vec!["Two"]
+        );
+    }
+
+    /// The undeclared list is capped, so one odd plan cannot grow the key.
+    #[test]
+    fn phases_undeclared_is_capped() {
+        let body: String = (0..PHASES_UNDECLARED_CAP + 4)
+            .map(|i| format!("### Phase Tok{i} — x\n\n"))
+            .collect();
+        let u = parse(&format!("# T\n\n{body}"));
+        assert_eq!(u.phases_undeclared.len(), PHASES_UNDECLARED_CAP);
+        assert_eq!(u.phases_undeclared[0], "Tok0");
+        assert_eq!(
+            u.phases_undeclared[PHASES_UNDECLARED_CAP - 1],
+            format!("Tok{}", PHASES_UNDECLARED_CAP - 1)
+        );
+    }
+
+    /// Labels are read at arm A only: list items and phase-table rows stay
+    /// numeric (D1), and fenced code and blockquotes declare and report
+    /// nothing, as for numbers.
+    #[test]
+    fn phases_labels_come_from_arm_a_only() {
+        let body = "# T\n\n## Phases\n\n- **Phase A — schema**\n- **Phase B — wiring**\n\n| Phase | Work |\n|---|---|\n| A | x |\n| Phase C | y |\n\n> **Phase D — status narration**\n\n```\n### Phase E — example\n### Phase Two — example\n```\n";
+        let u = parse(body);
+        assert!(u.phase_labels.is_empty(), "{:?}", u.phase_labels);
+        assert!(u.phases_undeclared.is_empty(), "{:?}", u.phases_undeclared);
+        assert!(u.phases.is_empty(), "{:?}", u.phases);
+    }
+
+    /// A label is deduped keeping its FIRST position, and a later title
+    /// outranks an earlier sentence for its name, exactly as for an index.
+    #[test]
+    fn phases_a_label_title_outranks_a_sentence_and_keeps_first_position() {
+        let body = "# T\n\n**Phase A gap, verified** in review.\n\n## Phase B — b\n\n## Phase A — tests\n\n### Phase A execution record\n";
+        let u = parse(body);
+        let got: Vec<(&str, &str)> = u
+            .phase_labels
+            .iter()
+            .map(|p| (p.label.as_str(), p.name.as_str()))
+            .collect();
+        assert_eq!(got, vec![("A", "Phase A — tests"), ("B", "Phase B — b")]);
     }
 
     /// A measuring tool, not a check: prints, per dated plan in a directory,
     /// what the REAL parser declares — one
-    /// `phase_census_row<TAB><file><TAB><i,j,...><TAB>[names]` line each — then a
-    /// summary line counting plans, and separately every entry it could not
+    /// `phase_census_row<TAB><file><TAB><i,j,...><TAB>[names]<TAB><labels><TAB><undeclared>`
+    /// line each — then a summary line counting plans (including lettered,
+    /// mixed and undeclared plans), and separately every entry it could not
     /// read (a directory-entry error, or a file that is unreadable or not
     /// UTF-8). To measure a grammar change for gained AND lost indices, run it
-    /// on both parsers (cherry-pick this test onto the old one) and diff the
-    /// row lines. Point `QONTINUI_PHASE_CENSUS_DIR` at a `plans/` directory and
+    /// on both parsers and diff only the first four tab-separated columns of
+    /// the row lines (file, indices, names). On a parser that predates
+    /// `DetectedPhases` (`detect_phases` returning `Vec<ParsedPhase>`), run the
+    /// pre-change body of this test: this one does not compile there. Point `QONTINUI_PHASE_CENSUS_DIR` at a `plans/` directory and
     /// run `cargo test -- phase_census --ignored --nocapture`.
     #[test]
     #[ignore = "measuring tool: reads QONTINUI_PHASE_CENSUS_DIR, prints and returns when it is unset"]
@@ -1812,6 +2364,13 @@ mod tests {
         }
         names.sort();
         let (mut plans, mut zero, mut one, mut many) = (0, 0, 0, 0);
+        // Label and undeclared counts (plan
+        // `2026-11-09-lettered-phase-headings-never-reach-coords-phase-declaration`,
+        // Phase 0 step 1): plans declaring any label, plans mixing numbers and
+        // labels, total labels declared, plans reporting an undeclared token,
+        // and total undeclared tokens.
+        let (mut lettered, mut mixed, mut label_total) = (0, 0, 0);
+        let (mut with_undeclared, mut undeclared_total) = (0, 0);
         for name in names {
             let Ok(body) = std::fs::read_to_string(std::path::Path::new(&dir).join(&name)) else {
                 skipped += 1;
@@ -1819,27 +2378,43 @@ mod tests {
             };
             plans += 1;
             let got = detect_phases(&body);
-            match got.len() {
+            match got.phases.len() {
                 0 => zero += 1,
                 1 => one += 1,
                 _ => many += 1,
             }
-            let indices: Vec<String> = got.iter().map(|p| p.index.to_string()).collect();
-            let phase_names: Vec<&str> = got.iter().map(|p| p.name.as_str()).collect();
+            if !got.labels.is_empty() {
+                lettered += 1;
+                if !got.phases.is_empty() {
+                    mixed += 1;
+                }
+            }
+            label_total += got.labels.len();
+            if !got.undeclared.is_empty() {
+                with_undeclared += 1;
+            }
+            undeclared_total += got.undeclared.len();
+            let indices: Vec<String> = got.phases.iter().map(|p| p.index.to_string()).collect();
+            let phase_names: Vec<&str> = got.phases.iter().map(|p| p.name.as_str()).collect();
+            let label_keys: Vec<&str> = got.labels.iter().map(|p| p.label.as_str()).collect();
             println!(
-                "phase_census_row\t{name}\t{}\t{phase_names:?}",
-                indices.join(",")
+                "phase_census_row\t{name}\t{}\t{phase_names:?}\t{}\t{}",
+                indices.join(","),
+                label_keys.join(","),
+                got.undeclared.join(",")
             );
         }
         println!(
-            "phase_census plans={plans} skipped={skipped} zero={zero} one={one} two_or_more={many}"
+            "phase_census plans={plans} skipped={skipped} zero={zero} one={one} two_or_more={many} \
+             lettered={lettered} mixed={mixed} labels={label_total} \
+             with_undeclared={with_undeclared} undeclared={undeclared_total}"
         );
     }
 
     // --- area ------------------------------------------------------------------
 
-    fn rej(value: impl Into<String>) -> AreaDecl {
-        AreaDecl::Rejected(AreaRejection::NotKebab(value.into()))
+    fn rej(value: impl Into<String>) -> HeaderDecl {
+        HeaderDecl::Rejected(HeaderRejection::NotKebab(value.into()))
     }
 
     /// The shared fixture list pinning [`is_kebab_case`] to coord's grammar,
@@ -1897,7 +2472,7 @@ mod tests {
                 let body = format!("# T\n\n> **Status: DRAFT.**\n{line}\n");
                 assert_eq!(
                     extract_area(&body),
-                    AreaDecl::Accepted(ok.to_string()),
+                    HeaderDecl::Accepted(ok.to_string()),
                     "{line:?}"
                 );
             }
@@ -1995,11 +2570,11 @@ mod tests {
             assert_eq!(
                 u.area_rejected,
                 want.is_none()
-                    .then(|| AreaRejection::NotKebab("agent_worktree".to_string())),
+                    .then(|| HeaderRejection::NotKebab("agent_worktree".to_string())),
                 "{stem}: the rejection rides on the parsed unit for the reconcile to warn"
             );
             match want {
-                Some(a) => assert_eq!(decl, AreaDecl::Accepted(a.to_string()), "{stem}"),
+                Some(a) => assert_eq!(decl, HeaderDecl::Accepted(a.to_string()), "{stem}"),
                 None => assert_eq!(
                     decl,
                     rej("agent_worktree".to_string()),
@@ -2029,7 +2604,7 @@ mod tests {
 ";
         assert_eq!(
             extract_area(body),
-            AreaDecl::Accepted("published-parity".to_string())
+            HeaderDecl::Accepted("published-parity".to_string())
         );
         assert_eq!(parse(body).area.as_deref(), Some("published-parity"));
     }
@@ -2050,17 +2625,17 @@ mod tests {
 **Area:** `coord-merge-train`\n\
 **Slug:** `2026-09-02-coord-train-activity-idle-unserved-fires-on-a-moving-train`\n\
 ";
-        assert_eq!(extract_area(body), AreaDecl::Absent);
+        assert_eq!(extract_area(body), HeaderDecl::Absent);
         assert_eq!(parse(body).area, None);
         assert_eq!(parse(body).area_rejected, None, "Absent is never warned");
     }
 
     #[test]
     fn no_status_block_and_no_area_are_absent() {
-        assert_eq!(extract_area("# T\n\n**Area:** `x`\n"), AreaDecl::Absent);
+        assert_eq!(extract_area("# T\n\n**Area:** `x`\n"), HeaderDecl::Absent);
         assert_eq!(
             extract_area("# T\n\n> **Status: DRAFT.** no area here\n"),
-            AreaDecl::Absent
+            HeaderDecl::Absent
         );
     }
 
@@ -2072,7 +2647,7 @@ mod tests {
         let body = "> **Status: DRAFT.** Sub-Area: nope\n> **Area:** `ok-area`\n";
         assert_eq!(
             extract_area(body),
-            AreaDecl::Accepted("ok-area".to_string())
+            HeaderDecl::Accepted("ok-area".to_string())
         );
         let body = "> **Status: DRAFT.**\n> Area: Bad_Area\n> **Area:** `ok-area`\n";
         assert_eq!(extract_area(body), rej("Bad_Area".to_string()));
@@ -2087,7 +2662,7 @@ mod tests {
         let one = |line: &str| extract_area(&format!("> **Status: DRAFT.**\n{line}\n"));
         assert_eq!(
             one("> **Area:** `a-b` (and more prose)"),
-            AreaDecl::Accepted("a-b".to_string())
+            HeaderDecl::Accepted("a-b".to_string())
         );
         assert_eq!(
             one("> **Area:** `a-b and more"),
@@ -2095,11 +2670,11 @@ mod tests {
         );
         assert_eq!(
             one("> Area: a-b, then prose"),
-            AreaDecl::Accepted("a-b".to_string())
+            HeaderDecl::Accepted("a-b".to_string())
         );
         assert_eq!(
             one("> **Area: a-b.**"),
-            AreaDecl::Accepted("a-b".to_string())
+            HeaderDecl::Accepted("a-b".to_string())
         );
         assert_eq!(one("> **Area:**"), rej(String::new()));
     }
@@ -2112,11 +2687,11 @@ mod tests {
             "> **Status: DRAFT.** Covers the grey Area: see below.\n> **Area:** `fleet-tooling`\n";
         assert_eq!(
             extract_area(body),
-            AreaDecl::Accepted("fleet-tooling".to_string())
+            HeaderDecl::Accepted("fleet-tooling".to_string())
         );
         // ...and an unbolded key that is NOT the first token is not a key.
         let body = "> **Status: DRAFT.**\n> See Area: nope\n";
-        assert_eq!(extract_area(body), AreaDecl::Absent);
+        assert_eq!(extract_area(body), HeaderDecl::Absent);
     }
 
     /// The bolded key is accepted anywhere on the line — including glued to
@@ -2126,7 +2701,7 @@ mod tests {
         let body = "> **Status: DRAFT.**\n> **Repo:** `qontinui-runner`.**Area:** fleet-tooling\n";
         assert_eq!(
             extract_area(body),
-            AreaDecl::Accepted("fleet-tooling".to_string())
+            HeaderDecl::Accepted("fleet-tooling".to_string())
         );
     }
 
@@ -2142,14 +2717,14 @@ mod tests {
             let body = format!("> **Status: DRAFT.**\n{line}\n");
             assert_eq!(
                 extract_area(&body),
-                AreaDecl::Rejected(AreaRejection::Misspelled(spelling)),
+                HeaderDecl::Rejected(HeaderRejection::Misspelled(spelling)),
                 "{line:?}"
             );
             let u = parse(&body);
             assert_eq!(u.area, None);
-            assert_eq!(u.area_rejected, Some(AreaRejection::Misspelled(spelling)));
+            assert_eq!(u.area_rejected, Some(HeaderRejection::Misspelled(spelling)));
             assert!(
-                AreaRejection::Misspelled(spelling)
+                HeaderRejection::Misspelled(spelling)
                     .to_string()
                     .contains(spelling),
                 "the warning text names the spelling"
@@ -2163,7 +2738,7 @@ mod tests {
         let body = "> **Status: DRAFT.**\n> **Area:** **fleet-tooling**\n";
         assert_eq!(
             extract_area(body),
-            AreaDecl::Accepted("fleet-tooling".to_string())
+            HeaderDecl::Accepted("fleet-tooling".to_string())
         );
     }
 
@@ -2176,15 +2751,15 @@ mod tests {
             "# T\r\n\r\n> **Status: DRAFT.** Summary.\r\n> **Area:** `ci-runners`\r\n\r\nBody.\r\n";
         assert_eq!(
             extract_area(body),
-            AreaDecl::Accepted("ci-runners".to_string())
+            HeaderDecl::Accepted("ci-runners".to_string())
         );
         let body = "# T\r\n\r\n> **Status: DRAFT.**\r\n> Area: domain-cost-ledger\r\n";
         assert_eq!(
             extract_area(body),
-            AreaDecl::Accepted("domain-cost-ledger".to_string())
+            HeaderDecl::Accepted("domain-cost-ledger".to_string())
         );
         let body = "# T\r\n\r\n> **Status: DRAFT.**\r\n\r\n> **Area:** `ci-runners`\r\n";
-        assert_eq!(extract_area(body), AreaDecl::Absent);
+        assert_eq!(extract_area(body), HeaderDecl::Absent);
     }
 
     /// The template's `> **Repo(s):**` shape: a SECOND blockquote after a blank
@@ -2193,8 +2768,128 @@ mod tests {
     #[test]
     fn area_in_a_second_blockquote_is_absent() {
         let body = "# T\n\n> **Status: DRAFT.** Summary.\n\n> **Repo(s):** x\n> **Area:** `fleet-tooling`\n";
-        assert_eq!(extract_area(body), AreaDecl::Absent);
+        assert_eq!(extract_area(body), HeaderDecl::Absent);
         assert_eq!(parse(body).area_rejected, None);
+    }
+
+    // --- initiative item -------------------------------------------------------
+    //
+    // `Initiative-Item:` shares `Area:`'s scanner (`key_on_line` over a
+    // `KebabHeader`), so these mirror the area tests rather than re-proving
+    // every delimiting rule: present in each accepted spelling, absent,
+    // malformed, near-miss, and ignored outside the status block.
+
+    #[test]
+    fn extract_initiative_item_applies_the_kebab_fixtures() {
+        for ok in KEBAB_ACCEPTED {
+            for line in [
+                format!("> **Initiative-Item:** `{ok}`"),
+                format!("> Initiative-Item: {ok}"),
+                format!("> **Initiative-Item:** {ok}."),
+                format!("> **Initiative-Item: {ok}.**"),
+            ] {
+                let body = format!("# T\n\n> **Status: DRAFT.**\n{line}\n");
+                assert_eq!(
+                    extract_initiative_item(&body),
+                    HeaderDecl::Accepted(ok.to_string()),
+                    "{line:?}"
+                );
+            }
+        }
+        for bad in ["a--b", "a-", "-a", "A", "one_screen", "One-Screen"] {
+            let body = format!("# T\n\n> **Status: DRAFT.**\n> **Initiative-Item:** `{bad}`\n");
+            assert_eq!(extract_initiative_item(&body), rej(bad), "{bad:?}");
+        }
+    }
+
+    /// The parsed unit carries an accepted item, and a malformed one rides on
+    /// `initiative_item_rejected` for the reconcile to warn — the value named,
+    /// never normalised into shape.
+    #[test]
+    fn initiative_item_present_and_malformed_on_the_parsed_unit() {
+        let u = parse(
+            "# T\n\n> **Status: DRAFT.**\n> **Initiative-Item:** `one-screen-project-state`\n",
+        );
+        assert_eq!(
+            u.initiative_item.as_deref(),
+            Some("one-screen-project-state")
+        );
+        assert_eq!(u.initiative_item_rejected, None);
+
+        let u = parse("# T\n\n> **Status: DRAFT.**\n> Initiative-Item: One Screen\n");
+        assert_eq!(u.initiative_item, None);
+        assert_eq!(
+            u.initiative_item_rejected,
+            Some(HeaderRejection::NotKebab("One".to_string()))
+        );
+        let u = parse("# T\n\n> **Status: DRAFT.**\n> **Initiative-Item:**\n");
+        assert_eq!(
+            u.initiative_item_rejected,
+            Some(HeaderRejection::NotKebab(String::new()))
+        );
+    }
+
+    /// Absent is `(None, None)` — nothing pushed, nothing warned — whether the
+    /// plan has no key at all, no status block, or the key only OUTSIDE the
+    /// status blockquote (after the blank line, or in a second blockquote).
+    #[test]
+    fn initiative_item_absent_and_outside_the_status_block() {
+        for body in [
+            "# T\n\n> **Status: DRAFT.** no item here\n",
+            "# T\n\n**Initiative-Item:** `x`\n",
+            "# T\n\n> **Status: DRAFT.**\n\n**Initiative-Item:** `one-screen`\n",
+            "# T\n\n> **Status: DRAFT.** Summary.\n\n> **Repo(s):** x\n> **Initiative-Item:** `one-screen`\n",
+        ] {
+            assert_eq!(extract_initiative_item(body), HeaderDecl::Absent, "{body:?}");
+            let u = parse(body);
+            assert_eq!(u.initiative_item, None, "{body:?}");
+            assert_eq!(u.initiative_item_rejected, None, "Absent is never warned");
+        }
+        // Mid-line prose is not a key; only the first token after `>` is.
+        assert_eq!(
+            extract_initiative_item("> **Status: DRAFT.**\n> See Initiative-Item: nope\n"),
+            HeaderDecl::Absent
+        );
+    }
+
+    /// Near-miss spellings are rejected with the spelling named, and the
+    /// warning text tells the author the right key — `**Initiative-Item:**`,
+    /// not `**Area:**`.
+    #[test]
+    fn initiative_item_near_miss_spellings_are_rejected_not_absent() {
+        for (line, spelling) in [
+            ("> **Initiative-Item**: one-screen", "**Initiative-Item**:"),
+            ("> *Initiative-Item:* one-screen", "*Initiative-Item:*"),
+        ] {
+            let body = format!("> **Status: DRAFT.**\n{line}\n");
+            assert_eq!(
+                extract_initiative_item(&body),
+                HeaderDecl::Rejected(HeaderRejection::Misspelled(spelling)),
+                "{line:?}"
+            );
+            let msg = HeaderRejection::Misspelled(spelling).to_string();
+            assert!(msg.contains(spelling), "{msg}");
+            assert!(msg.contains("write `**Initiative-Item:**`"), "{msg}");
+        }
+        // The area message is unchanged by the generalisation.
+        assert!(HeaderRejection::Misspelled("*Area:*")
+            .to_string()
+            .contains("write `**Area:**`"));
+    }
+
+    /// The two keys are independent: one line may carry both, each resolves to
+    /// its own value, and neither key is mistaken for the other.
+    #[test]
+    fn area_and_initiative_item_resolve_independently() {
+        let body = "> **Status: DRAFT.**\n> **Area:** `fleet-tooling`. **Initiative-Item:** `one-screen`\n";
+        let u = parse(body);
+        assert_eq!(u.area.as_deref(), Some("fleet-tooling"));
+        assert_eq!(u.initiative_item.as_deref(), Some("one-screen"));
+
+        let only_item = "> **Status: DRAFT.**\n> Initiative-Item: one-screen\n";
+        assert_eq!(extract_area(only_item), HeaderDecl::Absent);
+        let only_area = "> **Status: DRAFT.**\n> Area: fleet-tooling\n";
+        assert_eq!(extract_initiative_item(only_area), HeaderDecl::Absent);
     }
 
     /// The `/create-plan` template this binary bundles must put its `**Area:**`
@@ -2224,7 +2919,7 @@ mod tests {
         let filled = template.replace("<area>", "published-parity");
         assert_eq!(
             extract_area(&filled),
-            AreaDecl::Accepted("published-parity".to_string())
+            HeaderDecl::Accepted("published-parity".to_string())
         );
         // Unfilled, the placeholder is rejected (and so warned), not absent.
         assert_eq!(extract_area(template), rej("<area>"));

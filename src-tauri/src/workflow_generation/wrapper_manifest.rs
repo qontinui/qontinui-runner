@@ -45,12 +45,11 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use reqwest::Method;
 use serde_json::Value;
 use tokio::sync::Mutex;
-use tracing::warn;
+use tracing::{debug, warn};
 
-use crate::mcp::app_dispatch::AppDispatcher;
+use crate::mcp::app_dispatch::{AppDispatcher, DispatchError};
 use crate::mcp::app_registry::{AppRegistry, AppTransport, RegisteredApp};
 
 /// 5-second TTL cache. The worst-case staleness is 5 s of an apparently-
@@ -160,17 +159,21 @@ async fn collect_live_ws_components(
             continue;
         }
         let app_id = entry.app.app_id.clone();
+        // WebSocket ONLY: an app that turned HTTP since `list_live` is refused,
+        // not sent a WebSocket command down the HTTP arm.
         let components = match dispatcher
-            .dispatch(
-                &app_id,
-                "getComponents",
-                Method::GET,
-                "/ui-bridge/control/components",
-                serde_json::json!({}),
-            )
+            .dispatch_websocket(&app_id, "getComponents", serde_json::json!({}))
             .await
         {
             Ok(value) => unwrap_components_payload(value),
+            // Expected, not a failure: the app turned HTTP mid fan-out.
+            Err(DispatchError::NotWebsocket(_)) => {
+                debug!(
+                    "[wrapper-manifest] getComponents skipped '{}': no longer WS-registered",
+                    app_id
+                );
+                continue;
+            }
             Err(e) => {
                 warn!(
                     "[wrapper-manifest] getComponents WS dispatch to '{}' failed: {}",
@@ -236,7 +239,7 @@ pub fn format_manifest(entries: &[ManifestEntry], runner_api_port: u16) -> Strin
          To call one of their actions, emit a `command` step:\n\n",
     );
     out.push_str(&format!(
-        "`curl -sS -X POST http://localhost:{port}/ui-bridge/control/component/<wrapperId>/action/<actionId> -H \"Content-Type: application/json\" -d '{{ ...params... }}'`\n\n",
+        "`curl -sS -X POST http://127.0.0.1:{port}/ui-bridge/control/component/<wrapperId>/action/<actionId> -H \"Content-Type: application/json\" -d '{{ ...params... }}'`\n\n",
         port = runner_api_port
     ));
     out.push_str("Available wrappers and actions:\n\n");
@@ -411,7 +414,7 @@ mod tests {
         // Curl template uses the runner port we passed in.
         assert!(
             s.contains(
-                "http://localhost:9877/ui-bridge/control/component/<wrapperId>/action/<actionId>"
+                "http://127.0.0.1:9877/ui-bridge/control/component/<wrapperId>/action/<actionId>"
             ),
             "curl template missing or has wrong port"
         );

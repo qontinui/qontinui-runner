@@ -13,8 +13,11 @@
  */
 
 import { describe, it, expect, beforeEach } from "vitest";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 
 import { instanceStorage } from "@/lib/instance-storage";
+import { setPageBindings } from "@/lib/pageBindings";
 import { resolveSpawnWorkingDir } from "./useTerminalManager";
 import {
   reconcilePages,
@@ -28,6 +31,7 @@ import {
   resolveProjectPage,
   loadPages,
   PAGES_STORAGE_KEY,
+  useTerminalPages,
   type TerminalPageConfig,
 } from "./useTerminalPages";
 
@@ -87,8 +91,9 @@ describe("reconcilePages", () => {
     expect(out.slice(0, 3)).toEqual(persisted);
     expect(out.filter((p) => p.id === "default")).toHaveLength(1);
     const synth = out.find((p) => p.id === "minted-x")!;
-    // N = count of existing non-default pages (2) + 1 = 3.
-    expect(synth.name).toBe("Page 3");
+    // No existing "Page N" → the next auto name is "Page 1" (never a count).
+    expect(synth.name).toBe("Page 1");
+    expect(synth.origin).toBe("auto");
   });
 
   it("returns the SAME array reference when every backend id is already persisted", () => {
@@ -111,7 +116,7 @@ describe("reconcilePages", () => {
   it("synthesizes a 'Terminal' tab for 'default' when the operator layout dropped it but the backend still parks terminals there", () => {
     // The orphaning bug: once the operator has created pages, `loadPages` no
     // longer injects the default page, so it is ABSENT from `persisted`. A
-    // terminal created via `POST /terminals` with no pageId lands on "default"
+    // terminal created via `POST /terminals` with pageId "default" lands there
     // and must still get a visible, selectable tab (regression for the
     // 2026-07-18 fan-out, where API-spawned terminals vanished onto "default").
     const persisted: TerminalPageConfig[] = [
@@ -424,7 +429,13 @@ describe("page persistence round-trip (defaultWorkingDir)", () => {
 
   it("round-trips defaultWorkingDir through save → load unchanged", () => {
     const saved: TerminalPageConfig[] = [
-      { id: "op-a", name: "Pizzeria", createdAt: 100, defaultWorkingDir: "D:\\projects\\pizzeria" },
+      {
+        id: "op-a",
+        name: "Pizzeria",
+        createdAt: 100,
+        defaultWorkingDir: "D:\\projects\\pizzeria",
+        origin: "operator",
+      },
     ];
     instanceStorage.setJSON(PAGES_STORAGE_KEY, saved);
     expect(loadPages()).toEqual(saved);
@@ -434,7 +445,9 @@ describe("page persistence round-trip (defaultWorkingDir)", () => {
     const legacy = [{ id: "op-a", name: "My Work", createdAt: 100 }];
     instanceStorage.setJSON(PAGES_STORAGE_KEY, legacy);
     const loaded = loadPages();
-    expect(loaded).toEqual(legacy);
+    // Unchanged but for the legacy origin classification (plan 2026-11-05
+    // Phase 6): an operator-named page is `operator`.
+    expect(loaded).toEqual([{ ...legacy[0], origin: "operator" }]);
     expect(loaded[0].defaultWorkingDir).toBeUndefined();
     // …and a spawn on such a page behaves exactly as before the field existed.
     expect(resolveSpawnWorkingDir(undefined, loaded[0].defaultWorkingDir)).toBeNull();
@@ -464,5 +477,52 @@ describe("emptyPageIds (close empty tabs)", () => {
 
   it("returns nothing when all pages are occupied", () => {
     expect(emptyPageIds([a, b], new Set(["a", "b"]))).toEqual([]);
+  });
+});
+
+describe("useTerminalPages allPages vs pages (the list-pages roster)", () => {
+  // A one-render harness: no React Testing Library here, so the hook runs
+  // inside `renderToStaticMarkup` and its return value is captured. State
+  // initializers and memos run on that render (effects do not), which is
+  // exactly where `allPages` (from storage) and `pages` (minus bound pages)
+  // are computed.
+  beforeEach(() => {
+    const store = new Map<string, string>();
+    (globalThis as Record<string, unknown>).localStorage = {
+      getItem: (k: string) => store.get(k) ?? null,
+      setItem: (k: string, v: string) => void store.set(k, v),
+      removeItem: (k: string) => void store.delete(k),
+      key: (i: number) => [...store.keys()][i] ?? null,
+      get length() {
+        return store.size;
+      },
+      clear: () => store.clear(),
+    };
+  });
+
+  function renderUseTerminalPages(): ReturnType<typeof useTerminalPages> {
+    let out: ReturnType<typeof useTerminalPages> | null = null;
+    function Probe() {
+      out = useTerminalPages();
+      return null;
+    }
+    renderToStaticMarkup(createElement(Probe));
+    expect(out).not.toBeNull();
+    return out!;
+  }
+
+  it("keeps a page bound to a pop-out in allPages while pages drops it", () => {
+    instanceStorage.setJSON(PAGES_STORAGE_KEY, [
+      { id: "p-docked", name: "docked work", createdAt: 1 },
+      { id: "p-popped", name: "popped work", createdAt: 2 },
+    ]);
+    setPageBindings({ "p-popped": "terminal-popout-3" });
+
+    const hook = renderUseTerminalPages();
+
+    expect(hook.allPages.map((p) => p.id)).toEqual(["p-docked", "p-popped"]);
+    expect(hook.allPages.map((p) => p.name)).toEqual(["docked work", "popped work"]);
+    expect(hook.pages.map((p) => p.id)).toEqual(["p-docked"]);
+    expect(hook.boundPages).toEqual({ "p-popped": "terminal-popout-3" });
   });
 });

@@ -5,34 +5,49 @@
 //! with proper environment for running Claude CLI and other dev tools.
 //!
 //! Spawn-path contract: [`runner_context`] renders with zero I/O; the one
-//! bounded I/O a spawn seam performs for it is [`crate::served_corpus::probe`],
-//! whose result the seam passes in beside the per-session `CoordMcpDelivery`.
+//! bounded I/O a spawn seam performs for it is the served-corpus measurement
+//! ([`crate::served_corpus::probe`], or [`crate::served_corpus::probe_start`]
+//! joined later), whose result the seam passes in beside the per-session
+//! `CoordMcpDelivery`.
 
 pub mod account_migration;
 pub mod agent_status_sideband;
 pub mod auto_response;
 pub mod auto_response_fleet;
 pub mod claude_resume_sniff;
+pub mod close_authority;
 pub mod commit_report;
 pub mod context_watcher;
 pub mod coord_warn;
 pub mod daemon_pane_io;
 pub mod exit_notice;
+pub mod focus_coalescer;
 pub mod graceful_exit;
 pub mod grid;
 pub mod holder_boot_sweep;
 pub mod holder_census;
+#[cfg(test)]
+mod idle_chrome_replay;
 pub mod interceptor;
+pub mod launch_failure; // The identity shim's launch-failure reports (plan 2026-11-10-migration-holds-for-missing-claude-cli)
+pub mod layout; // The terminal↔confirmed-session join + registered tab labels behind terminal_list, GET /terminal-pages and GET /terminal-layout
+pub(crate) mod limit_hint; // the usage-limit hint's decision path behind an injectable env (plan 2026-11-05-runner-terminal-pages-collide-crowd-and-overfill-and-limit-stalled-sessions-never-resume, Phase 2)
+pub(crate) mod limit_reset; // continue-in-place / park a session stopped at a usage limit (plan 2026-11-05-runner-terminal-pages-collide-crowd-and-overfill-and-limit-stalled-sessions-never-resume, Phase 2)
+pub(crate) mod limit_stop; // transcript-read usage-limit stop classifier and the park list (plan 2026-11-05-runner-terminal-pages-collide-crowd-and-overfill-and-limit-stalled-sessions-never-resume, Phases 1-2)
 pub mod manager;
 pub mod operator_touch_watch; // Trigger 1 (idle_at_prompt, riding the context_watcher grid-scan tick) + the Notification-hook landing pad for triggers 2/3 (permission_prompt) (plan 2026-08-27-operator-touch-observation-runner-emitter, Phase B2)
 pub mod output_scan;
+pub mod page_placement;
 pub mod pane_io;
 pub mod pane_output;
 pub mod phantom_turn;
 pub mod remote_pane_io;
+pub mod respawn_liveness; // Is the resumed CLI alive? The proof + retry-then-rollback every `--resume` respawn passes (plan 2026-10-20-account-migration-respawn-dies-during-cli-reinstall-churn, Phase 4)
 mod scan_gate;
 pub mod scan_interval;
 pub mod session;
+pub mod session_carry;
+pub mod spawn_refusal;
 pub mod transcript;
 pub mod transcript_watcher;
 #[cfg(test)]
@@ -259,6 +274,88 @@ pub(crate) fn scrub_credential_env_std(cmd: &mut std::process::Command) {
     apply_model_gateway_env_std(cmd);
 }
 
+/// The variable that turns on Python UTF-8 mode; see
+/// [`session::TerminalSession::apply_python_utf8_default`] (the PTY seam) and
+/// [`apply_python_utf8_default_std`] (the headless seams).
+pub(crate) const PYTHONUTF8_ENV: &str = "PYTHONUTF8";
+
+/// Whether a headless spawn seam must set `PYTHONUTF8=1`: on Windows only,
+/// and only when neither the caller (an explicit `env` / `env_remove` on the
+/// command) nor the runner's own environment already decided it.
+///
+/// The same rule as the PTY seam's
+/// [`session::TerminalSession::apply_python_utf8_default`] (plan
+/// `2026-11-08-plan-stamp-and-pr-body-publish-doors-trust-a-corrupted-input-file`
+/// Phase 3). A `std::process::Command`, unlike a PTY `CommandBuilder`, does not
+/// seed its env map from the process, so "already set" has two halves here: the
+/// command's own explicit entries and the inherited process env. Pure, so it is
+/// testable on every host.
+pub(crate) fn python_utf8_default_needed(
+    is_windows: bool,
+    caller_decided: bool,
+    inherited: Option<&std::ffi::OsStr>,
+) -> bool {
+    is_windows && !caller_decided && inherited.is_none()
+}
+
+/// Whether `cmd` carries an explicit `PYTHONUTF8` entry (set or removed).
+/// Windows env names are case-insensitive, so the match ignores case.
+fn caller_decided_python_utf8(cmd: &std::process::Command) -> bool {
+    cmd.get_envs()
+        .any(|(k, _)| k.eq_ignore_ascii_case(PYTHONUTF8_ENV))
+}
+
+/// Apply the Windows `PYTHONUTF8=1` default to a headless `std` spawn seam —
+/// every seam that also carries the non-interactive git posture, because each
+/// spawns a `claude` whose helpers run Python. Order-independent: it never
+/// overwrites a value the caller set, before or after this call.
+pub(crate) fn apply_python_utf8_default_std(cmd: &mut std::process::Command) {
+    let inherited = std::env::var_os(PYTHONUTF8_ENV);
+    if python_utf8_default_needed(
+        cfg!(windows),
+        caller_decided_python_utf8(cmd),
+        inherited.as_deref(),
+    ) {
+        cmd.env(PYTHONUTF8_ENV, "1");
+    }
+}
+
+/// Twin of [`apply_python_utf8_default_std`] for the tokio seams.
+pub(crate) fn apply_python_utf8_default_tokio(cmd: &mut tokio::process::Command) {
+    let inherited = std::env::var_os(PYTHONUTF8_ENV);
+    if python_utf8_default_needed(
+        cfg!(windows),
+        caller_decided_python_utf8(cmd.as_std()),
+        inherited.as_deref(),
+    ) {
+        cmd.env(PYTHONUTF8_ENV, "1");
+    }
+}
+
+/// Test-only assertion: a headless spawn seam applied the Windows
+/// `PYTHONUTF8=1` default — set on Windows when the test process inherits no
+/// value, absent otherwise. Shared by the per-seam tests so dropping the call
+/// from any seam reddens that seam's test on the Windows CI leg.
+#[cfg(test)]
+pub(crate) fn assert_python_utf8_default_std(cmd: &std::process::Command, seam: &str) {
+    let got = cmd
+        .get_envs()
+        .find(|(k, _)| k.eq_ignore_ascii_case(PYTHONUTF8_ENV))
+        .and_then(|(_, v)| v.map(|v| v.to_string_lossy().to_string()));
+    let expected =
+        (cfg!(windows) && std::env::var_os(PYTHONUTF8_ENV).is_none()).then(|| "1".to_string());
+    assert_eq!(
+        got, expected,
+        "{seam}: the Windows PYTHONUTF8=1 default is not applied as expected"
+    );
+}
+
+/// [`assert_python_utf8_default_std`] over a `tokio::process::Command`.
+#[cfg(test)]
+pub(crate) fn assert_python_utf8_default_tokio(cmd: &tokio::process::Command, seam: &str) {
+    assert_python_utf8_default_std(cmd.as_std(), seam);
+}
+
 /// The model-gateway half of the child env posture
 /// ([`crate::model_gateway::live_child_env_plan`]): on an install that declares
 /// a gateway, the child runs under the gateway config dir with
@@ -369,8 +466,10 @@ pub const RUNNER_CONTEXT_SOURCE_MARKER: &str = concat!(
 /// 5. the fleet-gated plan-capture clause, on the same condition as before.
 ///
 /// The spawn-path I/O this render needs is done by the SEAM, not here: each
-/// seam calls the bounded [`crate::served_corpus::probe`] on its workdir and
-/// passes the result in as `served`, exactly as it passes `coord_mcp`.
+/// seam measures its workdir with the bounded [`crate::served_corpus::probe`]
+/// (the terminal spawn starts [`crate::served_corpus::probe_start`] early and
+/// joins it) and passes the result in as `served`, exactly as it passes
+/// `coord_mcp`.
 ///
 /// Every degradation — coord unreachable, unpaired runner, absent document, a
 /// body that fails the render-time guard — falls back to the builtin and SAYS
@@ -1002,12 +1101,65 @@ fn push_visible_run(out: &mut String, run: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::{
+        apply_python_utf8_default_std, apply_python_utf8_default_tokio, python_utf8_default_needed,
+        PYTHONUTF8_ENV,
+    };
+    use super::{
         memory_clause, memory_clause_conditional, plan_capture_clause_body, runner_context,
         scrub_credential_env_pty, scrub_credential_env_std, scrub_credential_env_tokio,
         spawn_seam_api_port, strip_ansi, CREDENTIAL_VALUE_ENV_VARS, PLAN_CAPTURE_CLAUSE_TEMPLATE,
         RUNNER_CONTEXT_SOURCE_MARKER,
     };
     use crate::coord_mcp::CoordMcpDelivery;
+
+    /// The headless seams' `PYTHONUTF8` rule (plan
+    /// `2026-11-08-plan-stamp-and-pr-body-publish-doors-trust-a-corrupted-input-file`
+    /// Phase 3, extended past the PTY seam): set only on Windows, and never
+    /// over a caller's explicit entry or an inherited value.
+    #[test]
+    fn python_utf8_default_needed_only_on_windows_when_undecided() {
+        let zero = std::ffi::OsStr::new("0");
+        assert!(python_utf8_default_needed(true, false, None));
+        assert!(!python_utf8_default_needed(true, true, None), "caller wins");
+        assert!(
+            !python_utf8_default_needed(true, false, Some(zero)),
+            "an inherited PYTHONUTF8=0 wins"
+        );
+        assert!(
+            !python_utf8_default_needed(false, false, None),
+            "not off Windows"
+        );
+    }
+
+    /// A caller's explicit entry — in any case, and a removal too — is never
+    /// overwritten by the headless seam helper.
+    #[test]
+    fn apply_python_utf8_default_std_keeps_a_caller_entry() {
+        let mut cmd = std::process::Command::new("dummy");
+        cmd.env("pythonutf8", "0");
+        apply_python_utf8_default_std(&mut cmd);
+        let entries: Vec<_> = cmd
+            .get_envs()
+            .filter(|(k, _)| k.eq_ignore_ascii_case(PYTHONUTF8_ENV))
+            .map(|(k, v)| (k.to_os_string(), v.map(|v| v.to_os_string())))
+            .collect();
+        assert_eq!(
+            entries,
+            vec![("pythonutf8".into(), Some("0".into()))],
+            "the caller's entry must be the only one"
+        );
+
+        let mut removed = tokio::process::Command::new("dummy");
+        removed.env_remove(PYTHONUTF8_ENV);
+        apply_python_utf8_default_tokio(&mut removed);
+        assert!(
+            removed
+                .as_std()
+                .get_envs()
+                .all(|(k, v)| !k.eq_ignore_ascii_case(PYTHONUTF8_ENV) || v.is_none()),
+            "an explicit removal must stay a removal"
+        );
+    }
     use crate::mcp::fleet_policy_poller::{
         briefing_for_test, pin_plan_capture_level_for_test, BriefingProvenance,
         BRIEFING_PLAN_CAPTURE_CLAUSE, BRIEFING_RUNNER_SESSION, PLAN_CAPTURE_RECORD,

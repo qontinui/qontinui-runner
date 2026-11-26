@@ -35,6 +35,7 @@ vi.mock("./useCommandAction", async () => {
   return { useCommandAction: (a: Parameters<typeof reg.register>[0]) => reg.register(a) };
 });
 vi.mock("../contexts", () => ({
+  usePageSessionGetter: () => () => null,
   useTerminalSession: () => ({
     tabs: [{ id: "tab-a" }, { id: "tab-b" }],
     activeId: "tab-a",

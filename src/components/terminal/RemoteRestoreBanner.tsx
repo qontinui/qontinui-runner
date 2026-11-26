@@ -64,6 +64,8 @@ export function RemoteRestoreBanner() {
           sessionLabel: sessionLabelFromTitle(title, remote.deviceLabel),
           workingDir: null,
           pageId: pageId !== "default" ? pageId : null,
+          // Re-mint in the tenant the tab was opened under, not the default.
+          tenant: remote.tenant ?? null,
         });
         setActiveId(info.id);
         // The live tab now carries this identity, so `pending` drops it.

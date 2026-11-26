@@ -19,6 +19,7 @@ import {
   recordRestoreMisses,
   type HiddenWorkerState,
 } from "./hiddenWorkerReducer";
+import { getTerminalHotStore, type TerminalHotStore } from "./terminalHotStore";
 
 const logger = createLogger("TerminalManager");
 
@@ -115,6 +116,23 @@ export interface TerminalTab {
    */
   restoreTerminalOnly?: boolean;
   /**
+   * True when the runner's focus coalescer suppressed this tab
+   * (`terminal-created` `surface: false`): one of a burst of unattended spawns.
+   * The tab lands without taking the selection or moving the flow grid
+   * (`newestSurfacedTabId`), unless it auto-fills the empty zone the operator
+   * has focused, where there is no session to take the selection from.
+   */
+  coalesced?: boolean;
+  /**
+   * True while this tab has no focus-coalescer verdict yet: the backend re-sync
+   * (`reconcileTabsWithBackend`) added it before its `terminal-created` event
+   * arrived, and only that event carries `surface`. Such a tab is held as
+   * `coalesced` meanwhile (an absent verdict is not a yes), and the event, when
+   * it lands, applies its verdict once and clears this flag
+   * (`reduceCreatedTerminal`).
+   */
+  awaitingSurfaceVerdict?: boolean;
+  /**
    * F1/F2 — the tenant this session was spawned under, as sent to
    * `terminal_create` (and therefore exactly what the Rust registry stamped
    * onto `Intent.tenant_id`). Immortal for the tab's life: switching the
@@ -128,6 +146,14 @@ export interface TerminalTab {
   claudeSessionId?: string;
   /** Claude config dir for the session (set on resume). */
   claudeConfigDir?: string;
+  /**
+   * The account's EXPLICIT config dir for the registry record only — the
+   * default home's path included — set beside {@link claudeConfigDir} (the
+   * TYPED form, `undefined` for the default home) by every resume path. Never
+   * typed. A Retry records the session under it, so a verified Retry of a
+   * default-home session still names its account.
+   */
+  claudeRecordConfigDir?: string;
   /**
    * Orchestration `task_run_id`, copied from the `TerminalSessionRecord` of a
    * Conductor worker (`dispatch_subtask` in
@@ -276,11 +302,26 @@ export function shouldIngestCreatedTerminal(
  */
 export function reduceCreatedTerminal(
   tabs: TerminalTab[],
-  info: TerminalInfo,
+  info: TerminalCreatedPayload,
   pendingBypass = false,
   pendingRemote?: RemoteTabIdentity,
 ): TerminalTab[] {
-  if (tabs.some((t) => t.id === info.id)) return tabs;
+  const idx = tabs.findIndex((t) => t.id === info.id);
+  if (idx >= 0) {
+    // A tab the re-sync added ahead of this event takes the verdict the event
+    // carries, once. Any other existing tab is a re-delivery: left untouched.
+    // A payload with no `surface` (the page-move adopt passes a bare
+    // `terminal_list` row) carries no verdict, so it settles nothing.
+    const existing = tabs[idx];
+    if (!existing.awaitingSurfaceVerdict || info.surface === undefined) return tabs;
+    const next = tabs.slice();
+    next[idx] = {
+      ...existing,
+      awaitingSurfaceVerdict: undefined,
+      coalesced: info.surface === true ? undefined : true,
+    };
+    return next;
+  }
   return [
     ...tabs,
     {
@@ -294,25 +335,56 @@ export function reduceCreatedTerminal(
       createdAt: info.createdAt,
       bypassPermissions: pendingBypass || undefined,
       remote: pendingRemote,
+      coalesced: info.surface === false || undefined,
     },
   ];
 }
 
 /**
+ * The `terminal-created` event payload: the session's `TerminalInfo` plus the
+ * runner-local `surface` hint (Rust `TerminalCreatedEvent`, flattened beside
+ * the info because `TerminalInfo` is the cross-repo wire schema). `surface` is
+ * the runner's focus-coalescer verdict: always `true` for an operator-created
+ * tab; for unattended spawns, at most one view-switching surface plus one
+ * tab-only surface per minute (plan
+ * `2026-10-28-runner-spawn-bursts-overwhelm-the-box-beyond-the-continuation-cap`,
+ * D3).
+ */
+export type TerminalCreatedPayload = TerminalInfo & { surface?: boolean };
+
+/**
  * Pure helper: resolve the `activeId` to set after a `terminal-created` ingest.
  *
- * Returns `info.id` when this is a genuinely-NEW tab (`isNewTab === true`) so a
- * freshly-docked gate continuation is auto-selected the moment it lands —
- * surfacing it the same way the frontend-initiated `createTerminal` path does
- * (`setActiveId(info.id)`). Returns `null` (caller keeps the current selection)
- * when the ingest is a dedup'd re-delivery so a re-delivered event never steals
- * focus.
+ * Returns `info.id` only when this is a genuinely-NEW tab (`isNewTab === true`)
+ * AND the runner said to surface it (`info.surface === true`) — so the first
+ * continuation of a burst is auto-selected the moment it lands (the same way
+ * the frontend-initiated `createTerminal` path calls `setActiveId(info.id)`),
+ * while the rest of the burst appear as tabs without stealing the selection.
+ * Returns `null` (caller keeps the current selection) otherwise: a dedup'd
+ * re-delivery never steals focus, and an absent `surface` is not a yes.
  *
  * Exported so `useTerminalManager.test.ts` can drive the auto-select contract
  * without booting React (the listener is a thin `if (id) setActiveId(id)`).
  */
-export function nextActiveIdAfterIngest(info: TerminalInfo, isNewTab: boolean): string | null {
-  return isNewTab ? info.id : null;
+export function nextActiveIdAfterIngest(
+  info: TerminalCreatedPayload,
+  isNewTab: boolean,
+): string | null {
+  return isNewTab && info.surface === true ? info.id : null;
+}
+
+/**
+ * Pure helper: the listener's ingest decision. Records `info.id` in `ingested`
+ * and returns whether this delivery was new and which id, if any, to select. A
+ * re-delivery of the same id selects nothing, whatever its `surface` says.
+ */
+export function noteTerminalCreated(
+  ingested: Set<string>,
+  info: TerminalCreatedPayload,
+): { wasNew: boolean; selectId: string | null } {
+  const wasNew = !ingested.has(info.id);
+  ingested.add(info.id);
+  return { wasNew, selectId: nextActiveIdAfterIngest(info, wasNew) };
 }
 
 /**
@@ -489,7 +561,9 @@ export interface HiddenWorker {
  * the only source" reconciler (2026-08-20 manual-test loop, item A).
  *
  * Rules, in both directions:
- *  - ADD every backend terminal with no local tab (a missed `terminal-created`).
+ *  - ADD every backend terminal with no local tab (a missed `terminal-created`),
+ *    held `coalesced` and `awaitingSurfaceVerdict` because the missed event is
+ *    the only carrier of the focus coalescer's `surface` verdict.
  *  - DROP every local terminal tab with no backend terminal (closed out-of-band),
  *    EXCEPT plan tabs (no PTY — the backend never lists them), synthetic tabs
  *    (test fixtures, never backed by a PTY) and tabs younger than
@@ -554,6 +628,10 @@ export function reconcileTabsWithBackend(
       exitCode: info.exitCode ?? null,
       workingDir: info.workingDir || undefined,
       createdAt: info.createdAt,
+      // A missed `terminal-created` means a missed `surface` verdict: hold the
+      // tab as suppressed until the event (if it is merely late) supplies one.
+      coalesced: true,
+      awaitingSurfaceVerdict: true,
     }));
 
   if (added.length === 0 && kept.length === tabs.length) return tabs;
@@ -596,6 +674,26 @@ export function backfillClaudeSessionIds(
     return t;
   });
   return changed ? next : tabs;
+}
+
+/**
+ * Seed each listed terminal's total output (`TerminalInfo.totalBytesProduced`)
+ * into the page's hot store, so a zone header shows its "total output" figure
+ * from the first `terminal_list` read instead of waiting on the first
+ * activity-digest event.
+ *
+ * Every `terminal_list` reader calls this (reconnect, re-sync, and the 30 s
+ * sweep): a seed from one reader alone can be lost to the tab-roster
+ * `retainTabs` prune on mount, and the sweep re-seeds. The store keeps a
+ * monotonic max (`noteTabTotalBytes`), so a stale or lower reading is harmless
+ * and a missing / non-finite value is skipped rather than recorded.
+ */
+export function seedTotalBytesFromList(store: TerminalHotStore, terminals: TerminalInfo[]): void {
+  for (const t of terminals) {
+    const total = (t as { totalBytesProduced?: unknown }).totalBytesProduced;
+    if (typeof total !== "number" || !Number.isFinite(total)) continue;
+    store.noteTabTotalBytes(t.id, total);
+  }
 }
 
 /**
@@ -1006,7 +1104,7 @@ export function useTerminalManager(
   // (`shouldIngestCreatedTerminal`), and dedups by id (`reduceCreatedTerminal`).
   useEffect(() => {
     let unlisten: (() => void) | null = null;
-    listen<TerminalInfo>("terminal-created", (event) => {
+    listen<TerminalCreatedPayload>("terminal-created", (event) => {
       const info = event.payload;
       // Route the event to the page it belongs to. A terminal created for
       // another page is ignored here — its own page's manager will claim it.
@@ -1027,14 +1125,15 @@ export function useTerminalManager(
       // ref-backed dedup set so a re-delivered `terminal-created` is a no-op
       // here just as `reduceCreatedTerminal` dedups it in the updater — only a
       // genuinely-new tab triggers selection, so a re-delivery never steals
-      // focus. The pure decision lives in `nextActiveIdAfterIngest`, fed a
-      // synthetic prev/next pair reflecting whether this id is new.
-      const wasNew = !ingestedIds.current.has(info.id);
-      const selectId = nextActiveIdAfterIngest(info, wasNew);
+      // focus. The pure decision lives in `noteTerminalCreated`.
+      const { wasNew, selectId } = noteTerminalCreated(ingestedIds.current, info);
       setTabs((prev) => reduceCreatedTerminal(prev, info, pendingBypass, pendingRemote));
+      if (wasNew) {
+        logger.info(
+          `External terminal created: ${info.id} (${info.title}) [page ${pageId}] surface=${info.surface === true}`,
+        );
+      }
       if (selectId !== null) {
-        ingestedIds.current.add(info.id);
-        logger.info(`External terminal created: ${info.id} (${info.title}) [page ${pageId}]`);
         // Auto-select the just-appended externally-created tab so a docked gate
         // continuation is surfaced (selected) the moment it lands — matching
         // `createTerminal`'s `setActiveId(info.id)` (the frontend-initiated
@@ -1185,6 +1284,7 @@ export function useTerminalManager(
       // Only reconnect to alive sessions; silently close dead ones
       const dead = pageTerminals.filter((t) => !t.isAlive);
       const alive = pageTerminals.filter((t) => t.isAlive);
+      seedTotalBytesFromList(getTerminalHotStore(pageId), alive);
 
       for (const t of dead) {
         invoke("terminal_close", { terminalId: t.id }).catch(() => {});
@@ -1270,6 +1370,13 @@ export function useTerminalManager(
     try {
       const result = await invoke<CommandResponse>("terminal_list");
       if (!result.success || !result.data) return;
+      const listed = (result.data as { terminals?: TerminalInfo[] }).terminals;
+      if (Array.isArray(listed)) {
+        seedTotalBytesFromList(
+          getTerminalHotStore(pageId),
+          listed.filter((t) => (t.pageId || "default") === pageId),
+        );
+      }
       const map =
         (result.data as { sessionIdsByTerminal?: SessionIdsByTerminal }).sessionIdsByTerminal ?? {};
       const spawnNames = spawnNamesFrom(result.data);
@@ -1284,7 +1391,7 @@ export function useTerminalManager(
       // Best-effort backfill; the reconnect + transcript-poll writers still
       // cover the common cases if this sweep transiently fails.
     }
-  }, []);
+  }, [pageId]);
 
   useEffect(() => {
     const timer = setInterval(() => void reconcileClaudeSessionIds(), 30_000);
@@ -1321,6 +1428,7 @@ export function useTerminalManager(
     if (!Array.isArray(terminals)) return; // malformed — never read as "empty"
 
     const mine = terminals.filter((t) => (t.pageId || "default") === pageId);
+    seedTotalBytesFromList(getTerminalHotStore(pageId), mine);
     // Ids the runner has announced an exit for. They defeat the create grace
     // (see `reconcileTabsWithBackend`), and anything the backend still lists
     // is pruned back out so the set cannot grow without bound.
@@ -1608,6 +1716,7 @@ export function useTerminalManager(
           | "workingDir"
           | "claudeSessionId"
           | "claudeConfigDir"
+          | "claudeRecordConfigDir"
           | "isReconnecting"
           | "resumeFailed"
           | "restoreTerminalOnly"

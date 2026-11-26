@@ -52,6 +52,9 @@ export GIT_CONFIG_KEY_0=user.name GIT_CONFIG_VALUE_0=census-test
 export GIT_CONFIG_KEY_1=user.email GIT_CONFIG_VALUE_1=census-test@example.invalid
 export RECOVERY_CENSUS_NO_MINT=0 HOME="$SANDBOX/home" USERPROFILE="$SANDBOX/home"
 unset COORD_DEVICE_JWT QONTINUI_MACHINE_ID COORD_HTTP_URL QONTINUI_TENANT_ID
+# The library's local-runner rung (127.0.0.1:9876) is not part of this fixture: a
+# suite on a dev box must never reach the live runner.
+export CTC_NO_RUNNER=1
 mkdir -p "$HOME"
 # Resolved by RUNNING it: on Windows `python3` is often the Store alias,
 # present on PATH and unable to run.
@@ -183,7 +186,7 @@ import json,sys
 dev,ref=sys.argv[1],sys.argv[2]
 print(json.dumps([{"claim_kind":"recovery_ref","resource_key":f"{dev}:ungated:{ref}",
  "predicate":{"kind":"time_elapsed","duration_secs":1209600},
- "continuation":{"action":"run_skill","skill":"return-to-main","args":["--reap","ungated",ref,"--device",dev],"target_device_id":dev},
+ "continuation":{"action":"run_skill","skill":"return-to-main","args":["--reap","ungated",ref,"--device",dev],"target_device_id":dev,"pin":"strict"},
  "clearance_audience":"agent","gate_class":"routine-review"}], sort_keys=True))' "$DEV" "$REF_U")"
 eq "A4 the one registration is the contract shape, for the ungated ref, verbatim" "$WANT" "$REG"
 eq "A5 coord was asked about both anchors" 2 "$(wc -l <"$STUB_DIR/queried.log" | tr -d ' ')"

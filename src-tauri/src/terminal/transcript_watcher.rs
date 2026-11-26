@@ -608,10 +608,7 @@ async fn run_orchestrator(
                 }
             };
             for s in sessions {
-                let jsonl = config_dir
-                    .join("projects")
-                    .join(encode_for_lookup(project))
-                    .join(format!("{}.jsonl", s.session_id));
+                let jsonl = startup_transcript_path(config_dir, project, &s.session_id);
                 if !jsonl.exists() {
                     continue;
                 }
@@ -1649,38 +1646,45 @@ async fn tail_session(
     }
 }
 
-/// Re-encode a project path for direct lookup. Mirrors
-/// `terminal::transcript::encode_project_path` (which is private). Kept tiny
-/// + intentional duplication so the watcher doesn't have to re-export
-/// internal helpers.
-pub(crate) fn encode_for_lookup(project_path: &str) -> String {
-    let normalized = project_path
-        .replace('\\', "/")
-        .trim_end_matches('/')
-        .to_string();
-    normalized
-        .replace(":/", "--")
-        .replace([':', '/', '\\', '_'], "-")
+/// The transcript file startup discovery tails for a session `list_sessions`
+/// returned. Goes through the ONE encoder/resolver in
+/// [`crate::terminal::transcript`] — a hand-copied encoder here once drifted
+/// from it and lost every dotted cwd.
+fn startup_transcript_path(config_dir: &Path, project: &str, session_id: &str) -> PathBuf {
+    crate::terminal::transcript::session_transcript_path(config_dir, project, session_id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Startup discovery must reach the SAME file `list_sessions` enumerated,
+    /// including for a dotted cwd (`~/.qontinui/…`) — the case the old
+    /// hand-copied encoder lost.
     #[test]
-    fn test_encode_for_lookup_matches_transcript_encoder() {
-        // Spot-check that this watcher's encoder produces the same path
-        // shape as the canonical encoder in `transcript::encode_project_path`.
-        // We compare against a known-good output rather than calling the
-        // private function.
+    fn startup_lookup_resolves_the_listed_dir_for_a_dotted_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join(".claude-erik");
+        let project = "/home/u/.qontinui/scratch/.claude-erik/x_y";
+        let on_disk = config_dir
+            .join("projects")
+            .join("-home-u--qontinui-scratch--claude-erik-x-y");
+        std::fs::create_dir_all(&on_disk).unwrap();
+        std::fs::write(
+            on_disk.join("s1.jsonl"),
+            r#"{"type":"user","uuid":"u1","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"hello"}}"#,
+        )
+        .unwrap();
+
+        let sessions = list_sessions(&config_dir, project).unwrap();
         assert_eq!(
-            encode_for_lookup("C:/Users/jspin/Documents/qontinui_parent"),
-            "C--Users-jspin-Documents-qontinui-parent"
+            sessions.len(),
+            1,
+            "list_sessions must find the dotted-cwd dir"
         );
-        assert_eq!(
-            encode_for_lookup("C:\\Users\\jspin\\Documents\\qontinui_parent"),
-            "C--Users-jspin-Documents-qontinui-parent"
-        );
+        let path = startup_transcript_path(&config_dir, project, &sessions[0].session_id);
+        assert_eq!(path, on_disk.join("s1.jsonl"));
+        assert!(path.exists());
     }
 
     #[test]

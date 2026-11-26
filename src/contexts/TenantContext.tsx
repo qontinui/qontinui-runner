@@ -66,10 +66,42 @@ interface CommandResponse<T = unknown> {
   data?: T | null;
 }
 
+/**
+ * One bound tenant's credential state, as `get_active_tenant` serves it
+ * (Rust `commands::tenant::CandidateCredential`, computed by
+ * `auth::credential_state` — the rule pinned to agree with the credential
+ * selector). A bound tenant can have no usable credential: never paired on this
+ * device, or its slot expired. Its reads will 401, and a selector must say so.
+ */
+export interface TenantCandidateCredential {
+  tenant: string;
+  /** `true` acts, `false` cannot, `null` UNKNOWN (a store read failed). */
+  can_act: boolean | null;
+  /** The tenant's OWN slot: `usable` | `present-but-dead` | `absent` | `unreadable`. */
+  slot: string;
+  /** `can_act` rests on the legacy default slot — it works; no re-pair owed. */
+  via_default_slot: boolean;
+}
+
+/**
+ * The machine pin's posture, as `get_active_tenant` serves it (Rust
+ * `commands::tenant::ActiveTenantView.pin`): `pinned` (an operator chose a
+ * tenant), `unpinned` (readable, no pin — the paired DEFAULT binding applies,
+ * which nobody chose), `unresolvable` (unreadable or malformed — the runner
+ * refuses rather than guess).
+ */
+export type TenantPinPosture = "pinned" | "unpinned" | "unresolvable";
+
 interface GetActiveTenantResponse {
   active_tenant_id: string | null;
   source: "machine.json" | "paired_user.json" | null;
+  /** How `machine.json` classifies (`tenant_pin::TenantPin`). Absent from a
+   * runner build that predates it — read as UNKNOWN, never as "unpinned". */
+  pin?: TenantPinPosture;
   candidates: string[];
+  /** One per candidate, in candidate order. Absent from a runner build that
+   * predates it — read as UNKNOWN per tenant, never as "usable". */
+  credentials?: TenantCandidateCredential[];
 }
 
 export interface TenantContextValue {
@@ -101,6 +133,12 @@ export interface TenantContextValue {
    * the settings panel. */
   source: "machine.json" | "paired_user.json" | null;
   /**
+   * The machine pin's posture, or `null` while loading / against a runner build
+   * that serves none — UNKNOWN, never "unpinned". The Fleet view opens on "all
+   * tenants" only when this reads `unpinned` on a multi-bound device.
+   */
+  pin: TenantPinPosture | null;
+  /**
    * Tenants this device is bound to, as raw UUID strings — there is no display
    * name on this wire, by design (resolving one needs a coord round-trip and a
    * widened type; `shortTenantId` in `SpawnTenantPicker` is the labelling
@@ -121,6 +159,12 @@ export interface TenantContextValue {
    * states something about the bindings must say unknown instead.
    */
   candidates: string[];
+  /**
+   * Per-candidate credential state (see {@link TenantCandidateCredential}).
+   * Empty while loading or against a runner build that serves none — a
+   * candidate with no entry is UNKNOWN, not usable.
+   */
+  credentials: TenantCandidateCredential[];
   /** True iff the runner UI should render a tenant switcher. Per D12,
    * single-tenant operators see no UI. */
   showSwitcher: boolean;
@@ -131,6 +175,12 @@ export interface TenantContextValue {
   setDefaultTenantForNewSessions: (tenantId: string) => Promise<void>;
   /** Re-pull from Rust. */
   refresh: () => Promise<void>;
+  /**
+   * Re-pull ONLY the per-candidate credential state. For a surface that shows
+   * those notes beside a read it makes often: see {@link credentialsAfterReread}
+   * for why this leaves the candidates and the pin alone.
+   */
+  refreshCredentials: () => Promise<void>;
   /**
    * F2 — the tenant the operator EXPLICITLY picked for the next spawn. `null`
    * means no pick: the spawn sends no tenant and Rust stamps the device default.
@@ -159,28 +209,142 @@ interface TenantProviderProps {
   children: ReactNode;
 }
 
+/** Same notes, entry for entry: a re-read that changed nothing keeps the old array. */
+function sameCredentials(a: TenantCandidateCredential[], b: TenantCandidateCredential[]): boolean {
+  return (
+    a.length === b.length &&
+    a.every((x, i) => {
+      const y = b[i];
+      return (
+        y !== undefined &&
+        x.tenant === y.tenant &&
+        x.can_act === y.can_act &&
+        x.slot === y.slot &&
+        x.via_default_slot === y.via_default_slot
+      );
+    })
+  );
+}
+
+/**
+ * The credential state to keep after a credentials-only re-read.
+ *
+ * `get_active_tenant` answers success with no candidates when `paired_user.json`
+ * cannot be read, so an empty answer may be a transient read failure rather than
+ * a device with no bindings. A credentials-only re-read keeps what it had: a real
+ * loss of bindings arrives through `refresh`, on the `tenant-bindings-changed` the
+ * heartbeat's binding reconcile emits when it drops one. A read that changed
+ * nothing also keeps the old array, so the provider's value, and every consumer
+ * of it, stays put.
+ */
+export function credentialsAfterReread(
+  previous: TenantCandidateCredential[],
+  read: TenantCandidateCredential[] | undefined,
+): TenantCandidateCredential[] {
+  if (!carriesNotes(read)) return previous;
+  return sameCredentials(previous, read) ? previous : read;
+}
+
+/** A notes-only re-read carries notes worth applying: see {@link credentialsAfterReread}. */
+export function carriesNotes(
+  read: TenantCandidateCredential[] | undefined,
+): read is TenantCandidateCredential[] {
+  return read !== undefined && read.length > 0;
+}
+
+/** One read's place in a {@link latestReadGate}. */
+export interface GatedRead {
+  /** No read begun after this one has applied its answer yet. */
+  fresh: () => boolean;
+  /** Record that this read's answer was applied. */
+  apply: () => void;
+}
+
+/**
+ * Orders overlapping reads of one piece of state by the answers APPLIED: an
+ * older answer that resolves after a newer one has landed is stale, but a newer
+ * read that fails, or that applies nothing, does not make an older one stale.
+ */
+export function latestReadGate(): { begin: () => GatedRead } {
+  let begun = 0;
+  let applied = 0;
+  return {
+    begin: () => {
+      const mine = ++begun;
+      return {
+        fresh: () => mine > applied,
+        apply: () => {
+          applied = Math.max(applied, mine);
+        },
+      };
+    },
+  };
+}
+
+/** Same tenant ids in the same order: a re-read that changed nothing keeps the old array. */
+function sameIds(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((x, i) => x === b[i]);
+}
+
 export function TenantProvider({ children }: TenantProviderProps) {
   const [defaultTenantIdForNewSessions, setDefaultTenantIdForNewSessions] = useState<string | null>(
     null,
   );
   const [source, setSource] = useState<TenantContextValue["source"]>(null);
+  const [pin, setPin] = useState<TenantPinPosture | null>(null);
   const [candidates, setCandidates] = useState<string[]>([]);
+  const [credentials, setCredentials] = useState<TenantCandidateCredential[]>([]);
   const [spawnTenantId, setSpawnTenantId] = useState<string | null>(null);
+  // Two gates, because two kinds of read overlap: `refresh` writes the bindings
+  // and the notes, `refreshCredentials` only the notes. A later notes-only read
+  // must not discard an earlier full read's bindings.
+  const [bindingReads] = useState(latestReadGate);
+  const [credentialReads] = useState(latestReadGate);
 
   const refresh = useCallback(async () => {
+    const bindingsRead = bindingReads.begin();
+    const notesRead = credentialReads.begin();
     try {
       const resp = await invoke<CommandResponse<GetActiveTenantResponse>>("get_active_tenant");
       const data = resp?.data;
-      setDefaultTenantIdForNewSessions(data?.active_tenant_id ?? null);
-      setSource(data?.source ?? null);
-      setCandidates(data?.candidates ?? []);
+      if (bindingsRead.fresh()) {
+        bindingsRead.apply();
+        setDefaultTenantIdForNewSessions(data?.active_tenant_id ?? null);
+        setSource(data?.source ?? null);
+        setPin(data?.pin ?? null);
+        const ids = data?.candidates ?? [];
+        setCandidates((previous) => (sameIds(previous, ids) ? previous : ids));
+      }
+      if (notesRead.fresh()) {
+        notesRead.apply();
+        // Unlike a notes-only re-read, an empty answer here is taken as given.
+        const read = data?.credentials ?? [];
+        setCredentials((previous) => (sameCredentials(previous, read) ? previous : read));
+      }
     } catch (e) {
       // Non-fatal — runner still works without tenant resolution,
       // sessions just go out without the default-tenant stamp until
       // pair completes.
       logger.warn(`get_active_tenant failed: ${e}`);
     }
-  }, []);
+  }, [bindingReads, credentialReads]);
+
+  const refreshCredentials = useCallback(async () => {
+    const notesRead = credentialReads.begin();
+    try {
+      const resp = await invoke<CommandResponse<GetActiveTenantResponse>>("get_active_tenant");
+      const read = resp?.data?.credentials;
+      // An answer carrying no notes applies nothing, so it leaves an older full
+      // read free to land (see `credentialsAfterReread`).
+      if (carriesNotes(read) && notesRead.fresh()) {
+        notesRead.apply();
+        setCredentials((previous) => credentialsAfterReread(previous, read));
+      }
+    } catch (e) {
+      // Non-fatal: the notes stay as they were and the next read tries again.
+      logger.warn(`get_active_tenant (credentials) failed: ${e}`);
+    }
+  }, [credentialReads]);
 
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- initial tenant load on mount; refresh is the explicit synchronization point with the backend
@@ -196,6 +360,32 @@ export function TenantProvider({ children }: TenantProviderProps) {
     const unlisten = listen("web-integration-changed", () => {
       void refresh();
     });
+    return () => {
+      unlisten
+        .then((fn) => fn())
+        .catch(() => {
+          /* listener cleanup is best-effort */
+        });
+    };
+  }, [refresh]);
+
+  // Rust announces every in-process change to the bindings themselves on
+  // `tenant-bindings-changed` (`TENANT_BINDINGS_CHANGED_EVENT`): a sign-in, a
+  // pair-code redeem through Settings or the UI Bridge, and the heartbeat's
+  // reconcile dropping one. A redeem emits no `web-integration-changed`, and the
+  // reconcile must not, because that event's other listeners treat it as a sign-in.
+  useEffect(() => {
+    const unlisten = listen("tenant-bindings-changed", () => {
+      void refresh();
+    });
+    // A change announced between the mount read and this registration (the
+    // startup heal runs beside window creation) would be lost, so read once
+    // more when the listener is live.
+    unlisten
+      .then(() => refresh())
+      .catch(() => {
+        /* no event bus: the mount read stands */
+      });
     return () => {
       unlisten
         .then((fn) => fn())
@@ -233,20 +423,26 @@ export function TenantProvider({ children }: TenantProviderProps) {
     () => ({
       defaultTenantIdForNewSessions,
       source,
+      pin,
       candidates,
+      credentials,
       showSwitcher,
       setDefaultTenantForNewSessions,
       refresh,
+      refreshCredentials,
       spawnTenantId,
       setSpawnTenantId,
     }),
     [
       defaultTenantIdForNewSessions,
       source,
+      pin,
       candidates,
+      credentials,
       showSwitcher,
       setDefaultTenantForNewSessions,
       refresh,
+      refreshCredentials,
       spawnTenantId,
     ],
   );

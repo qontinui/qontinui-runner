@@ -530,14 +530,14 @@ If the Additional Context contains a block labeled "Spec Generation Brief (JSON)
 
 1. **Navigate first.** If the brief has a `pageUrl`, emit a setup step that navigates to it using the **control** endpoint (see rule 2).
 2. **All HTTP commands MUST use `/ui-bridge/control/` paths.** This brief targets the runner's own UI — never use `/ui-bridge/sdk/*` (that family is reserved for external apps connected via SDK). Do NOT emit a connect step; control mode requires no connect. Endpoint reference:
-   - Navigate (POST): `curl -sS -X POST http://localhost:{runner_api_port}/ui-bridge/control/page/navigate -H "Content-Type: application/json" -d '{{"url":"/terminal"}}'` — payload MUST use `"url"`, not `"path"`.
-   - Snapshot (GET, no body): `curl -sS http://localhost:{runner_api_port}/ui-bridge/control/snapshot` — the snapshot endpoint is GET-only; do NOT send `-X POST` or `-d`.
-   - Discover (POST): `curl -sS -X POST http://localhost:{runner_api_port}/ui-bridge/control/discover -H "Content-Type: application/json" -d '{{}}'`
-   - Find elements (POST): `curl -sS -X POST http://localhost:{runner_api_port}/ui-bridge/control/find -H "Content-Type: application/json" -d '{{"criteria":{{"role":"button"}},"limit":5}}'` — prefer `/control/find` over `/control/elements` when filtering by criteria.
-   - Click (POST): `curl -sS -X POST http://localhost:{runner_api_port}/ui-bridge/control/element/<id>/action -H "Content-Type: application/json" -d '{{"action":"click"}}'`
-   - Evaluate JS (POST): `curl -sS -X POST http://localhost:{runner_api_port}/ui-bridge/control/page/evaluate -H "Content-Type: application/json" -d '{{"expression":"..."}}'`
-   - AI search (POST): `curl -sS -X POST http://localhost:{runner_api_port}/ui-bridge/control/ai/search -H "Content-Type: application/json" -d '{{"query":"..."}}'` — note the slash: `/ai/search`, not `/ai-search`.
-   **Always emit the full URL** — `curl http://localhost:{runner_api_port}/ui-bridge/control/<endpoint>`, never a shortened `/sdk/<endpoint>` or `/control/<endpoint>` without the `/ui-bridge/` prefix. Workflows missing the `/ui-bridge/` prefix will fail with 404 at runtime.
+   - Navigate (POST): `curl -sS -X POST http://127.0.0.1:{runner_api_port}/ui-bridge/control/page/navigate -H "Content-Type: application/json" -d '{{"url":"/terminal"}}'` — payload MUST use `"url"`, not `"path"`.
+   - Snapshot (GET, no body): `curl -sS http://127.0.0.1:{runner_api_port}/ui-bridge/control/snapshot` — the snapshot endpoint is GET-only; do NOT send `-X POST` or `-d`.
+   - Discover (POST): `curl -sS -X POST http://127.0.0.1:{runner_api_port}/ui-bridge/control/discover -H "Content-Type: application/json" -d '{{}}'`
+   - Find elements (POST): `curl -sS -X POST http://127.0.0.1:{runner_api_port}/ui-bridge/control/find -H "Content-Type: application/json" -d '{{"criteria":{{"role":"button"}},"limit":5}}'` — prefer `/control/find` over `/control/elements` when filtering by criteria.
+   - Click (POST): `curl -sS -X POST http://127.0.0.1:{runner_api_port}/ui-bridge/control/element/<id>/action -H "Content-Type: application/json" -d '{{"action":"click"}}'`
+   - Evaluate JS (POST): `curl -sS -X POST http://127.0.0.1:{runner_api_port}/ui-bridge/control/page/evaluate -H "Content-Type: application/json" -d '{{"expression":"..."}}'`
+   - AI search (POST): `curl -sS -X POST http://127.0.0.1:{runner_api_port}/ui-bridge/control/ai/search -H "Content-Type: application/json" -d '{{"query":"..."}}'` — note the slash: `/ai/search`, not `/ai-search`.
+   **Always emit the full URL** — `curl http://127.0.0.1:{runner_api_port}/ui-bridge/control/<endpoint>`, never a shortened `/sdk/<endpoint>` or `/control/<endpoint>` without the `/ui-bridge/` prefix. Workflows missing the `/ui-bridge/` prefix will fail with 404 at runtime.
 3. **Preconditions become setup steps.** For each group in `groups[]`, emit one setup step per entry in `preconditions[]` before that group's verification steps. Each precondition describes a required UI state (e.g., "Findings panel is open"); the setup step should click the button or trigger the action that achieves that state. Infer the selector from the assertion descriptions in the group if it is not explicit.
 4. **Deterministic assertions become batched snapshot_assert steps.** For each group, emit ONE `ui_bridge` step with `ui_bridge_action: "snapshot_assert"` whose `ui_bridge_target` is a JSON-stringified array of the group's `deterministicAssertions[]`. Each array element must have the shape `{{id, description, severity, assertionType, criteria, expected?, relatedCriteria?, minGap?}}`. Set `ui_bridge_snapshot_target` to `"control"` for runner-self specs (the default).
 5. **Semantic assertions become prompt or agentic steps.** Each group's `semanticAssertions[]` should become one or more `prompt` steps with a `content` field that includes the assertion descriptions. These may navigate and inspect the UI via the UI Bridge tools.
@@ -593,7 +593,7 @@ For `click`, `ui_bridge_target` is a JSON-stringified **criteria object** (NOT a
 
 8. **Prefer state-machine navigation when `targetStateId` is present.** If a brief group has a `targetStateId` field (a state id from the spec's `stateMachine` section), emit ONE `command` setup step with `command_mode: "shell"` that POSTs `/state-machine/navigate` to reach that state. The loaded state machine's transition already encodes the click sequence and `waitAfter` timing, and the target state's required elements are re-verified during navigation — so you do NOT need a separate `wait_for_element` or `click` setup step for that precondition. Use:
 
-   `curl -sS -X POST http://localhost:{runner_api_port}/state-machine/navigate -H "Content-Type: application/json" -d '{{"targetStates":["<targetStateId>"]}}'`
+   `curl -sS -X POST http://127.0.0.1:{runner_api_port}/state-machine/navigate -H "Content-Type: application/json" -d '{{"targetStates":["<targetStateId>"]}}'`
 
    Note the payload key is `targetStates` (camelCase, plural) — that's what the Rust handler's `NavigateRequest` deserializes from (`#[serde(rename_all = "camelCase")]`).
 
@@ -608,7 +608,7 @@ For `click`, `ui_bridge_target` is a JSON-stringified **criteria object** (NOT a
   "phase": "setup",
   "name": "navigate_to_findings_panel",
   "mode": "shell",
-  "command": "curl -sS -X POST http://localhost:{runner_api_port}/state-machine/navigate -H \"Content-Type: application/json\" -d '{{\"targetStates\":[\"findings-panel\"]}}'"
+  "command": "curl -sS -X POST http://127.0.0.1:{runner_api_port}/state-machine/navigate -H \"Content-Type: application/json\" -d '{{\"targetStates\":[\"findings-panel\"]}}'"
 }}
 ```
 
@@ -784,8 +784,8 @@ pub fn build_builder_prompt(
 ## Project Context
 
 Project root: {project_root}
-Runner API: http://localhost:{runner_api_port}
-Runner UI Bridge: http://localhost:{runner_api_port}/ui-bridge
+Runner API: http://127.0.0.1:{runner_api_port}
+Runner UI Bridge: http://127.0.0.1:{runner_api_port}/ui-bridge
 
 ### Project Structure
 {tree_section}
@@ -795,9 +795,9 @@ The generated workflow has FULL filesystem access when executed — it is NOT re
 Commands in the generated workflow can read, write, and execute in any directory within the project.
 
 **Runner self-reference:** This workflow will execute ON the runner itself at port {runner_api_port}.
-Any HTTP calls to the runner API or UI Bridge MUST use `http://localhost:{runner_api_port}` — do NOT
+Any HTTP calls to the runner API or UI Bridge MUST use `http://127.0.0.1:{runner_api_port}` — do NOT
 guess or hardcode a different port. For UI Bridge control operations, use
-`http://localhost:{runner_api_port}/ui-bridge/control/...`.
+`http://127.0.0.1:{runner_api_port}/ui-bridge/control/...`.
 "#,
             project_root = project_root,
             tree_section = tree_section,

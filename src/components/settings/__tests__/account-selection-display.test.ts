@@ -14,10 +14,11 @@ import { describe, expect, it } from "vitest";
 import {
   accountSelectionModeLabel,
   displayedAccountSelection,
+  hasDeterministicPick,
   type AccountSelectionMode,
   type AiSettings,
 } from "../types";
-import { DEFAULT_AI_SETTINGS } from "../ai-settings/types";
+import { DEFAULT_AI_SETTINGS, SELECTION_MODE_OPTIONS } from "../ai-settings/types";
 
 function settingsWith(patch: {
   local?: AccountSelectionMode;
@@ -25,6 +26,7 @@ function settingsWith(patch: {
   fleet?: AccountSelectionMode | null;
   effective?: AccountSelectionMode;
   source?: AiSettings["account_selection_source"];
+  answered?: boolean;
 }): AiSettings {
   return {
     ...DEFAULT_AI_SETTINGS,
@@ -36,6 +38,7 @@ function settingsWith(patch: {
     fleet_account_selection_mode: patch.fleet,
     effective_account_selection_mode: patch.effective,
     account_selection_source: patch.source,
+    fleet_account_selection_answered: patch.answered,
   };
 }
 
@@ -55,10 +58,10 @@ describe("displayedAccountSelection — the runner's rule over form state", () =
       for (const pinned of [true, false]) {
         for (const fleet of fleets) {
           const expected = pinned
-            ? { mode: local, source: "pinned", fleetManaged: false }
+            ? { mode: local, source: "pinned", fleetManaged: false, fleetUnread: false }
             : fleet !== null
-              ? { mode: fleet, source: "fleet", fleetManaged: true }
-              : { mode: local, source: "local", fleetManaged: false };
+              ? { mode: fleet, source: "fleet", fleetManaged: true, fleetUnread: false }
+              : { mode: local, source: "local", fleetManaged: false, fleetUnread: false };
           expect(displayedAccountSelection(settingsWith({ local, pinned, fleet }))).toEqual(
             expected,
           );
@@ -87,6 +90,7 @@ describe("displayedAccountSelection — the runner's rule over form state", () =
       mode: "least_usage",
       source: "fleet",
       fleetManaged: true,
+      fleetUnread: false,
     });
   });
 
@@ -95,7 +99,7 @@ describe("displayedAccountSelection — the runner's rule over form state", () =
       displayedAccountSelection(
         settingsWith({ local: "least_usage", fleet: null, effective: "manual", source: "local" }),
       ),
-    ).toEqual({ mode: "least_usage", source: "local", fleetManaged: false });
+    ).toEqual({ mode: "least_usage", source: "local", fleetManaged: false, fleetUnread: false });
   });
 
   it("an unknown pin is treated as unpinned (the runner's default)", () => {
@@ -103,7 +107,32 @@ describe("displayedAccountSelection — the runner's rule over form state", () =
       mode: "manual",
       source: "fleet",
       fleetManaged: true,
+      fleetUnread: false,
     });
+  });
+});
+
+describe("displayedAccountSelection — before coord has answered the fleet domain", () => {
+  it("an unpinned machine with no fleet value yet is UNKNOWN, not local", () => {
+    expect(
+      displayedAccountSelection(
+        settingsWith({ local: "least_usage", fleet: null, source: "local", answered: false }),
+      ),
+    ).toEqual({ mode: "least_usage", source: undefined, fleetManaged: false, fleetUnread: true });
+  });
+
+  it("a pinned machine is pinned whether or not coord has answered", () => {
+    expect(
+      displayedAccountSelection(
+        settingsWith({ local: "manual", pinned: true, fleet: null, answered: false }),
+      ),
+    ).toEqual({ mode: "manual", source: "pinned", fleetManaged: false, fleetUnread: false });
+  });
+
+  it("an answered 'no opinion' is local", () => {
+    expect(
+      displayedAccountSelection(settingsWith({ local: "manual", fleet: null, answered: true })),
+    ).toEqual({ mode: "manual", source: "local", fleetManaged: false, fleetUnread: false });
   });
 });
 
@@ -113,7 +142,7 @@ describe("displayedAccountSelection — older runner without the raw fleet value
       displayedAccountSelection(
         settingsWith({ local: "manual", effective: "least_usage", source: "fleet" }),
       ),
-    ).toEqual({ mode: "least_usage", source: "fleet", fleetManaged: true });
+    ).toEqual({ mode: "least_usage", source: "fleet", fleetManaged: true, fleetUnread: false });
   });
 
   it("hands the description back to local once the pin is ticked", () => {
@@ -121,7 +150,7 @@ describe("displayedAccountSelection — older runner without the raw fleet value
       displayedAccountSelection(
         settingsWith({ local: "manual", pinned: true, effective: "least_usage", source: "fleet" }),
       ),
-    ).toEqual({ mode: "manual", source: "pinned", fleetManaged: false });
+    ).toEqual({ mode: "manual", source: "pinned", fleetManaged: false, fleetUnread: false });
   });
 
   it("falls back to local when the runner reports no view fields at all", () => {
@@ -129,6 +158,7 @@ describe("displayedAccountSelection — older runner without the raw fleet value
       mode: "highest_expected_usage",
       source: undefined,
       fleetManaged: false,
+      fleetUnread: false,
     });
   });
 });
@@ -140,5 +170,42 @@ describe("accountSelectionModeLabel", () => {
     expect(accountSelectionModeLabel("highest_expected_usage")).toBe("Highest Expected Usage");
     expect(accountSelectionModeLabel("weighted_random")).toBe("Weighted Random");
     expect(accountSelectionModeLabel("alternating_handoff")).toBe("Alternating Handoff");
+  });
+});
+
+describe("SELECTION_MODE_OPTIONS", () => {
+  // The selector tells the operator which mode is the runner's default
+  // (`AccountSelectionMode::default()` in settings.rs). Exactly one option may
+  // say so, and it must be weighted random — a label naming the wrong mode is
+  // a false claim on the page that edits the setting.
+  it("marks weighted_random, and only it, as the default", () => {
+    const marked = SELECTION_MODE_OPTIONS.filter((o) => /^Default\b/.test(o.hint));
+    expect(marked.map((o) => o.mode)).toEqual(["weighted_random"]);
+  });
+
+  it("offers every mode exactly once", () => {
+    expect(SELECTION_MODE_OPTIONS.map((o) => o.mode).sort()).toEqual([
+      "alternating_handoff",
+      "highest_expected_usage",
+      "least_usage",
+      "manual",
+      "weighted_random",
+    ]);
+  });
+});
+
+describe("hasDeterministicPick — whether the page may mark one account Auto-selected", () => {
+  it("is true only for the modes that rank to one account", () => {
+    expect(hasDeterministicPick("least_usage")).toBe(true);
+    expect(hasDeterministicPick("highest_expected_usage")).toBe(true);
+    expect(hasDeterministicPick("alternating_handoff")).toBe(true);
+    expect(hasDeterministicPick("manual")).toBe(false);
+    expect(hasDeterministicPick("weighted_random")).toBe(false);
+  });
+
+  // A failed settings load leaves the mode unknown; claiming a pick then would
+  // put an "Auto-selected" badge on an account the runner may not use.
+  it("is false when the mode is unknown", () => {
+    expect(hasDeterministicPick(undefined)).toBe(false);
   });
 });

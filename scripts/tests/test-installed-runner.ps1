@@ -169,6 +169,42 @@ try {
         $found = Find-InstalledRunnerExe -Platform linux -InstallRoot $aiPrefix
         Check ($found -eq (& realpath -- $aiBin)) 'linux: finds <prefix>/squashfs-root/usr/bin/qontinui-runner (--appimage-extract)' $found
 
+        # What is LAUNCHED: a .deb boots its binary, an AppImage boots through AppRun.
+        $launch = Get-PublishedLinuxLaunchPath -BinaryPath (& realpath -- $debBin)
+        Check ($launch -eq (& realpath -- $debBin)) 'linux launch: a dpkg -x prefix boots usr/bin/qontinui-runner itself' $launch
+        $launch = Get-PublishedLinuxLaunchPath -BinaryPath $found
+        Check ($launch -eq (Join-Path (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $found))) 'AppRun')) 'linux launch: an --appimage-extract prefix boots through AppRun, never the inner binary' $launch
+        # AppRun as a symlink to the AppDir's own binary is the AppImage's own -- accepted, returned by its own path.
+        $aiLinkPrefix = Join-Path $linuxRoot 'appimage-link-prefix'
+        $aiLinkBin = Join-Path (Join-Path (Join-Path (Join-Path $aiLinkPrefix 'squashfs-root') 'usr') 'bin') 'qontinui-runner'
+        $null = New-Item -ItemType Directory -Force -Path (Split-Path -Parent $aiLinkBin)
+        Set-Content -LiteralPath $aiLinkBin -Value 'x'
+        $aiLinkRun = Join-Path (Join-Path $aiLinkPrefix 'squashfs-root') 'AppRun'
+        # ln -s, not New-Item: the relative target must be stored as written, not resolved against $PWD.
+        & ln -s 'usr/bin/qontinui-runner' $aiLinkRun
+        Check ($LASTEXITCODE -eq 0) 'linux launch fixture: ln -s AppRun -> usr/bin/qontinui-runner' "$LASTEXITCODE"
+        $launch = Get-PublishedLinuxLaunchPath -BinaryPath (Find-InstalledRunnerExe -Platform linux -InstallRoot $aiLinkPrefix)
+        Check ($launch.EndsWith('/squashfs-root/AppRun')) 'linux launch: an AppRun symlinked into its own usr/bin is launched by its own path (APPDIR intact)' $launch
+        # An extract with no AppRun is not an unpacked AppImage: refused, never booted bare.
+        $aiBarePrefix = Join-Path $linuxRoot 'appimage-bare-prefix'
+        $aiBareBin = Join-Path (Join-Path (Join-Path (Join-Path $aiBarePrefix 'squashfs-root') 'usr') 'bin') 'qontinui-runner'
+        $null = New-Item -ItemType Directory -Force -Path (Split-Path -Parent $aiBareBin)
+        Set-Content -LiteralPath $aiBareBin -Value 'x'
+        $refused = ''
+        try { $null = Get-PublishedLinuxLaunchPath -BinaryPath (Find-InstalledRunnerExe -Platform linux -InstallRoot $aiBarePrefix) } catch { $refused = $_.Exception.Message }
+        Check ($refused.StartsWith('Refusing') -and $refused.Contains('no AppRun')) 'linux launch: a squashfs-root with no AppRun is refused, not booted bare' $refused
+        # An AppRun that leads out of its AppDir (to a dev binary) is refused.
+        $aiEvilPrefix = Join-Path $linuxRoot 'appimage-evil-prefix'
+        $aiEvilBin = Join-Path (Join-Path (Join-Path (Join-Path $aiEvilPrefix 'squashfs-root') 'usr') 'bin') 'qontinui-runner'
+        $null = New-Item -ItemType Directory -Force -Path (Split-Path -Parent $aiEvilBin)
+        Set-Content -LiteralPath $aiEvilBin -Value 'x'
+        $evilTarget = Join-Path $linuxRoot 'outside-apprun'
+        Set-Content -LiteralPath $evilTarget -Value 'x'
+        $null = New-Item -ItemType SymbolicLink -Path (Join-Path (Join-Path $aiEvilPrefix 'squashfs-root') 'AppRun') -Target $evilTarget
+        $refused = ''
+        try { $null = Get-PublishedLinuxLaunchPath -BinaryPath (Find-InstalledRunnerExe -Platform linux -InstallRoot $aiEvilPrefix) } catch { $refused = $_.Exception.Message }
+        Check ($refused.StartsWith('Refusing') -and $refused.Contains('outside its AppDir')) 'linux launch: an AppRun resolving outside its AppDir is refused' $refused
+
         # An empty prefix: typed unknown, naming every path probed.
         $empty = Join-Path $linuxRoot 'empty-prefix'
         $null = New-Item -ItemType Directory -Force -Path $empty

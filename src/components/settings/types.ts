@@ -128,6 +128,17 @@ export interface ClaudeCliSettings {
   /** After a migration respawn, nudge the resumed session to continue its
    * task once the CLI is idle. Runner default: true. */
   auto_continue_after_migration?: boolean;
+  /** Continue a session in place once the usage limit it stopped at has
+   * reset (a park until then when the reset is still ahead). Independent of
+   * auto-migration; works with one account. Runner default: true. */
+  auto_continue_after_limit_reset?: boolean;
+  /** Let the runner install Claude Code CLI updates on this machine: one
+   * runner-side updater installs a newly published release once, when it is
+   * newer than the installed one. Runner-spawned sessions never update
+   * themselves (the runner sets `DISABLE_AUTOUPDATER=1` for them), so off means
+   * they stay on the installed version until `claude update` is run by hand.
+   * Runner default: true. */
+  runner_manages_cli_updates?: boolean;
 }
 
 /** One per-model scoped weekly limit (e.g. the Fable-only cap). */
@@ -415,9 +426,12 @@ export function compareForAccountSelectionMode(
 
 /** Whether a mode picks one predictable account, so the UI may mark it as the
  * auto-selected one. `manual` names its account explicitly; `weighted_random`
- * draws a new account on each pick. */
+ * draws a new account on each pick. An UNKNOWN mode (`undefined` — the
+ * settings load failed, so the form carries no mode) is not deterministic
+ * either: the page cannot know which account the runner will use, and the
+ * likeliest real mode, the runner's default, draws. */
 export function hasDeterministicPick(mode: AccountSelectionMode | undefined): boolean {
-  return mode !== "manual" && mode !== "weighted_random";
+  return mode !== undefined && mode !== "manual" && mode !== "weighted_random";
 }
 
 export interface ClaudeApiSettings {
@@ -462,6 +476,10 @@ export interface AiSettings {
    * opinion; absent = an older runner). Lets the page re-apply the runner's
    * rule to unsaved form state — see {@link displayedAccountSelection}. */
   fleet_account_selection_mode?: AccountSelectionMode | null;
+  /** READ-ONLY: whether coord has answered the fleet account-selection domain
+   * in this runner process. `false` = a `null` fleet mode means "not yet
+   * asked", not "no fleet opinion"; absent = an older runner. */
+  fleet_account_selection_answered?: boolean;
 }
 
 /** The account-selection mode the Settings page DESCRIBES, which input
@@ -472,7 +490,11 @@ export interface AiSettings {
  * against the raw fleet value the runner reported:
  *   pinned → local mode, source `pinned`;
  *   unpinned and the fleet has a value → the fleet's mode, source `fleet`;
- *   otherwise → local mode, source `local`.
+ *   otherwise → local mode, source `local` — unless the runner reports that
+ *   coord has NOT answered yet, when the source is UNKNOWN (`undefined`,
+ *   `fleetUnread`): the local mode applies now, but the fleet may override it
+ *   on its first answer. A non-null fleet value wins whatever the flag says:
+ *   it can only have come from coord, so it IS an answer.
  * So un-ticking the pin while the fleet has a value immediately shows the
  * fleet's mode, and a different local mode shows at once when it governs.
  *
@@ -483,15 +505,22 @@ export function displayedAccountSelection(settings: AiSettings): {
   mode: AccountSelectionMode | undefined;
   source: AccountSelectionSource | undefined;
   fleetManaged: boolean;
+  fleetUnread: boolean;
 } {
   const local = settings.claude_cli.account_selection_mode;
   const pinned = settings.claude_cli.account_selection_pinned ?? false;
   const fleet = settings.fleet_account_selection_mode;
 
   if (fleet !== undefined) {
-    if (pinned) return { mode: local, source: "pinned", fleetManaged: false };
-    if (fleet !== null) return { mode: fleet, source: "fleet", fleetManaged: true };
-    return { mode: local, source: "local", fleetManaged: false };
+    if (pinned) return { mode: local, source: "pinned", fleetManaged: false, fleetUnread: false };
+    if (fleet !== null)
+      return { mode: fleet, source: "fleet", fleetManaged: true, fleetUnread: false };
+    // Only an explicit `false` is "not yet asked"; an absent key (a runner
+    // predating the field) keeps that runner's own `local` claim.
+    if (settings.fleet_account_selection_answered === false) {
+      return { mode: local, source: undefined, fleetManaged: false, fleetUnread: true };
+    }
+    return { mode: local, source: "local", fleetManaged: false, fleetUnread: false };
   }
 
   // Older runner: no raw fleet value, only its own resolution at load time.
@@ -505,6 +534,7 @@ export function displayedAccountSelection(settings: AiSettings): {
     // at load time.
     source: pinned ? "pinned" : settings.account_selection_source,
     fleetManaged,
+    fleetUnread: false,
   };
 }
 

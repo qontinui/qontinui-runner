@@ -12,13 +12,9 @@ use crate::settings::{
     LogSourceAiSelectionMode, LogSourceCategory,
 };
 use chrono::Utc;
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
-use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::Runtime;
+use std::fs;
 use tauri::State;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use super::compartments::HealthCompartment;
@@ -485,160 +481,6 @@ fn set_log_source_ai_selection_mode_impl(mode: String) -> Result<CommandResponse
         message: Some(format!("AI selection mode set to '{}'", mode)),
         data: None,
     })
-}
-
-// ============================================================================
-// Log Reading Commands
-// ============================================================================
-
-/// Content read from a log source
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct LogSourceContent {
-    pub source_id: String,
-    pub source_name: String,
-    pub lines: Vec<String>,
-    pub total_lines: u64,
-    pub file_path: String,
-    pub last_modified: Option<String>,
-    pub error: Option<String>,
-}
-
-/// Read content from specific log sources by ID
-#[tauri::command]
-pub fn read_global_log_sources(source_ids: Vec<String>) -> Result<CommandResponse, String> {
-    read_global_log_sources_impl(source_ids).map_err(String::from)
-}
-
-fn read_global_log_sources_impl(source_ids: Vec<String>) -> Result<CommandResponse, AppError> {
-    debug!("Reading global log sources: {:?}", source_ids);
-
-    let settings = settings::get_global_log_source_settings();
-    let mut contents: Vec<LogSourceContent> = Vec::new();
-
-    for source_id in source_ids {
-        if let Some(source) = settings.sources.iter().find(|s| s.id == source_id) {
-            let content = read_single_source(source);
-            contents.push(content);
-        } else {
-            warn!("Source '{}' not found", source_id);
-        }
-    }
-
-    Ok(CommandResponse {
-        success: true,
-        message: None,
-        data: Some(serde_json::to_value(&contents)?),
-    })
-}
-
-/// Read content from all enabled sources in a profile
-#[tauri::command]
-pub fn read_log_sources_by_profile(profile_id: Option<String>) -> Result<CommandResponse, String> {
-    read_log_sources_by_profile_impl(profile_id).map_err(String::from)
-}
-
-fn read_log_sources_by_profile_impl(
-    profile_id: Option<String>,
-) -> Result<CommandResponse, AppError> {
-    debug!("Reading log sources by profile: {:?}", profile_id);
-
-    let sources = settings::get_enabled_log_sources(profile_id.as_deref());
-    let mut contents: Vec<LogSourceContent> = Vec::new();
-
-    for source in &sources {
-        let content = read_single_source(source);
-        contents.push(content);
-    }
-
-    Ok(CommandResponse {
-        success: true,
-        message: None,
-        data: Some(serde_json::to_value(&contents)?),
-    })
-}
-
-/// Helper to read a single source
-fn read_single_source(source: &GlobalLogSource) -> LogSourceContent {
-    let mut path = PathBuf::from(&source.path);
-
-    // Rotation-aware fallback. A daily-rolling sink (e.g. the runner's own
-    // `qontinui-runner.log`) never writes the undated basename — the live file
-    // is `<basename>.<YYYY-MM-DD>`. When the configured literal path is absent,
-    // resolve the newest matching dated sibling so a source pointed at the
-    // stable basename still reads the current rotation instead of reporting
-    // "File does not exist".
-    if !path.exists() {
-        if let (Some(dir), Some(prefix)) =
-            (path.parent(), path.file_name().and_then(|n| n.to_str()))
-        {
-            if let Some(newest) = crate::paths::resolve_newest_rolling_file(dir, prefix) {
-                path = newest;
-            }
-        }
-    }
-
-    // Report the file actually read (may be the resolved dated rotation),
-    // not the configured basename, so callers can `tail -f` the right file.
-    let resolved_path = path.to_string_lossy().to_string();
-
-    if !path.exists() {
-        return LogSourceContent {
-            source_id: source.id.clone(),
-            source_name: source.name.clone(),
-            lines: Vec::new(),
-            total_lines: 0,
-            file_path: resolved_path,
-            last_modified: None,
-            error: Some("File does not exist".to_string()),
-        };
-    }
-
-    let last_modified = fs::metadata(&path)
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .map(|t| {
-            let datetime: chrono::DateTime<chrono::Utc> = t.into();
-            datetime.to_rfc3339()
-        });
-
-    match tail_file(&path, source.tail_lines) {
-        Ok((lines, total_lines)) => LogSourceContent {
-            source_id: source.id.clone(),
-            source_name: source.name.clone(),
-            lines,
-            total_lines,
-            file_path: resolved_path,
-            last_modified,
-            error: None,
-        },
-        Err(e) => LogSourceContent {
-            source_id: source.id.clone(),
-            source_name: source.name.clone(),
-            lines: Vec::new(),
-            total_lines: 0,
-            file_path: resolved_path,
-            last_modified,
-            error: Some(e),
-        },
-    }
-}
-
-/// Tail the last N lines from a file
-fn tail_file(path: &PathBuf, num_lines: u32) -> Result<(Vec<String>, u64), String> {
-    let file =
-        File::open(path).map_err(|e| format!("Failed to open file {}: {}", path.display(), e))?;
-
-    let reader = BufReader::new(&file);
-    let all_lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
-    let total_lines = all_lines.len() as u64;
-
-    let start = if all_lines.len() > num_lines as usize {
-        all_lines.len() - num_lines as usize
-    } else {
-        0
-    };
-
-    Ok((all_lines[start..].to_vec(), total_lines))
 }
 
 // ============================================================================
@@ -1386,27 +1228,4 @@ pub async fn find_log_sources_with_ai(
             })
         }
     }
-}
-
-/// Build the Tauri plugin that registers this module's command handlers.
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
-    PluginBuilder::new("qontinui_global_log_sources")
-        .invoke_handler(tauri::generate_handler![
-            find_log_sources_with_ai,
-            get_global_log_sources,
-            save_global_log_sources,
-            add_global_log_source,
-            update_global_log_source,
-            delete_global_log_source,
-            create_global_log_source_profile,
-            update_global_log_source_profile,
-            delete_global_log_source_profile,
-            set_default_log_source_profile,
-            set_log_source_ai_selection_mode,
-            read_global_log_sources,
-            read_log_sources_by_profile,
-            migrate_project_sources_to_global,
-            select_log_sources_for_context,
-        ])
-        .build()
 }

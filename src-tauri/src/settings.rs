@@ -112,14 +112,30 @@ pub enum AccountSelectionMode {
     LeastUsage, // Auto-select the account with lowest utilization relative to expected pace.
     HighestExpectedUsage, // Auto-select, among accounts under their expected pace, the one with the highest expected usage.
     /// Among accounts under their expected pace, pick at random, weighted by
-    /// `expected * (expected - actual)`.
+    /// `expected * (expected - actual)` — at spawn time AND at every handoff,
+    /// a fresh draw each pick, so the picks of a burst spread across the
+    /// under-pace accounts by weight instead of all naming one. The default
+    /// (operator decision 2026-11-05): the deterministic modes put every spawn
+    /// of a burst on their single top account. Each pick is published through
+    /// the process-global resolved dir, so a spawn that reads it after a
+    /// sibling's pick takes the sibling's draw, and concurrent spawns can share
+    /// one draw (plan
+    /// `2026-11-05-a-spawn-takes-its-own-account-pick-not-the-shared-resolved-dir`).
+    ///
+    /// Fallbacks: at spawn time, when no account has a fresh under-pace
+    /// sample, the `HighestExpectedUsage` pick (deterministic, so that
+    /// fallback does concentrate); a handoff falls back to the cross-mode
+    /// ranking `pick_target_from` uses. With one config dir, spawn-time
+    /// selection picks it when its credentials are valid; there is no handoff
+    /// target.
+    #[default]
     WeightedRandom,
     /// Among accounts under their expected pace, ranked by expected usage
     /// (highest first), alternate handoffs between the first account and each
     /// of the others in turn (1,2,1,3,1,4,1,2,...), from the handoffs of the
-    /// last 3 hours. Spawn-time selection takes the first account. No-op when
-    /// fewer than two config dirs are configured, so safe as the default.
-    #[default]
+    /// last 3 hours. Spawn-time selection takes the first account, so it
+    /// spreads handoffs but not spawns. No-op when fewer than two config dirs
+    /// are configured.
     AlternatingHandoff,
 }
 
@@ -210,6 +226,27 @@ pub struct ClaudeCliSettings {
     /// of sitting idle at the input box. Manual migrations honor it too.
     #[serde(default = "default_auto_continue_after_migration")]
     pub auto_continue_after_migration: bool,
+    /// Continue a terminal Claude session in place once the usage limit it
+    /// stopped at has reset: a session whose transcript ends at a usage-limit
+    /// stop, on an account a fresh probe says is no longer exhausted, gets one
+    /// continue prompt (once its CLI is idle) instead of sitting idle. A stop
+    /// whose reset is still ahead is parked until then. Independent of
+    /// `auto_migrate_on_token_exhaustion`, and works with a single account
+    /// (`terminal::limit_reset`; plan
+    /// 2026-11-05-runner-terminal-pages-collide-crowd-and-overfill-and-limit-stalled-sessions-never-resume
+    /// Phase 2).
+    #[serde(default = "default_auto_continue_after_limit_reset")]
+    pub auto_continue_after_limit_reset: bool,
+    /// Let the runner install Claude Code CLI updates on this machine
+    /// (`crate::claude_cli_update`): one runner-side updater installs a newly
+    /// published release once, when it is newer than the installed one. Every
+    /// runner-spawned `claude` runs with `DISABLE_AUTOUPDATER=1` either way
+    /// (`session::claude_hook::export_auto_updater_off`), so `false` means
+    /// nothing updates runner-hosted sessions until `claude update` is run by
+    /// hand. A `DISABLE_AUTOUPDATER` / `DISABLE_UPDATES` in the user's own
+    /// environment when the runner starts always wins over `true`.
+    #[serde(default = "default_runner_manages_cli_updates")]
+    pub runner_manages_cli_updates: bool,
 }
 
 fn default_auto_migrate_on_token_exhaustion() -> bool {
@@ -217,6 +254,14 @@ fn default_auto_migrate_on_token_exhaustion() -> bool {
 }
 
 fn default_auto_continue_after_migration() -> bool {
+    true
+}
+
+fn default_auto_continue_after_limit_reset() -> bool {
+    true
+}
+
+fn default_runner_manages_cli_updates() -> bool {
     true
 }
 
@@ -231,6 +276,8 @@ impl Default for ClaudeCliSettings {
             account_selection_pinned: false,
             auto_migrate_on_token_exhaustion: default_auto_migrate_on_token_exhaustion(),
             auto_continue_after_migration: default_auto_continue_after_migration(),
+            auto_continue_after_limit_reset: default_auto_continue_after_limit_reset(),
+            runner_manages_cli_updates: default_runner_manages_cli_updates(),
         }
     }
 }
@@ -586,13 +633,20 @@ pub struct AiSettings {
 /// account-selection mode that actually governs this machine and the input
 /// that decided it ([`crate::claude_accounts::effective_selection`]).
 ///
-/// Read-only by construction — it is `Serialize` only, and the three derived
+/// Read-only by construction — it is `Serialize` only, and the four derived
 /// keys (`effective_account_selection_mode`, `account_selection_source`,
-/// `fleet_account_selection_mode`) are never fields of [`AiSettings`]: a
-/// derived value persisted into `settings.json` would be written back by every
-/// save. A client that echoes the view back on `PUT /settings/ai` is harmless,
-/// because `AiSettings` has no `deny_unknown_fields` and the three keys are
-/// dropped on deserialize (pinned by `mcp::settings` tests).
+/// `fleet_account_selection_mode`, `fleet_account_selection_answered`) are
+/// never fields of [`AiSettings`]: a derived value persisted into
+/// `settings.json` would be written back by every save. A client that echoes
+/// the view back on `PUT /settings/ai` is harmless, because `AiSettings` has
+/// no `deny_unknown_fields` and the four keys are dropped on deserialize
+/// (pinned by `mcp::settings` tests).
+///
+/// `account_selection_source` is the RESOLVER's source and stays typed
+/// (`fleet` | `local` | `pinned`); a client that reports it must read it
+/// together with `fleet_account_selection_answered` — an unpinned `local`
+/// while that is `false` is provisional, which the env capture spells
+/// `unknown` ([`crate::claude_accounts::reported_selection_source`]).
 ///
 /// Plan `2026-10-01-fleet-account-selection-effective-mode-visibility-and-pin-safe-saves`
 /// Phase 2.
@@ -606,11 +660,20 @@ pub struct AiSettingsView {
     /// no opinion), so a client can re-apply
     /// [`crate::claude_accounts::resolve_selection`] to UNSAVED form state.
     pub fleet_account_selection_mode: Option<AccountSelectionMode>,
+    /// Whether coord has ANSWERED the fleet account-selection domain in this
+    /// process ([`crate::mcp::fleet_policy_poller::account_selection_answered`]).
+    /// While `false`, `fleet_account_selection_mode: null` means "not yet
+    /// asked", not "the fleet has no opinion", so an unpinned
+    /// `account_selection_source: local` is provisional — the same reason the
+    /// env capture reports `selection_source=unknown` then
+    /// ([`crate::claude_accounts::reported_selection_source`]).
+    pub fleet_account_selection_answered: bool,
 }
 
 impl AiSettingsView {
-    /// PURE constructor from a settings document and an already-resolved
-    /// `(mode, source, fleet)` triple.
+    /// PURE constructor from a settings document, an already-resolved
+    /// `(mode, source, fleet)` triple, and whether the fleet value it was
+    /// resolved against is an answer from coord.
     pub fn from_parts(
         settings: AiSettings,
         (mode, source, fleet): (
@@ -618,20 +681,28 @@ impl AiSettingsView {
             crate::claude_accounts::AccountSelectionSource,
             Option<AccountSelectionMode>,
         ),
+        fleet_answered: bool,
     ) -> Self {
         Self {
             settings,
             effective_account_selection_mode: mode,
             account_selection_source: source,
             fleet_account_selection_mode: fleet,
+            fleet_account_selection_answered: fleet_answered,
         }
     }
 
     /// The current stored settings plus this machine's effective selection.
     pub fn current() -> Self {
+        // Flag FIRST (Acquire), value second: the poller stores the fleet
+        // value and THEN raises the flag (Release), so this order can never
+        // pair a raised flag with the pre-answer `None` — the same ordering
+        // as the env-capture door in `main.rs`.
+        let answered = crate::mcp::fleet_policy_poller::account_selection_answered();
         Self::from_parts(
             get_ai_settings(),
             crate::claude_accounts::effective_selection_with_fleet(),
+            answered,
         )
     }
 }
@@ -871,14 +942,6 @@ pub struct MobileSettings {
     /// Allow plain HTTP for LAN connections (default: false, requires TLS)
     #[serde(default)]
     pub lan_allow_plaintext: bool,
-
-    /// Pairing timeout in seconds (default: 600)
-    #[serde(default = "default_pairing_timeout")]
-    pub pairing_timeout_secs: u64,
-
-    /// Known/paired physical devices
-    #[serde(default)]
-    pub paired_devices: Vec<crate::mcp::transport::pairing::PairedDeviceRecord>,
 }
 
 fn default_logcat_lines() -> u32 {
@@ -887,10 +950,6 @@ fn default_logcat_lines() -> u32 {
 
 fn default_ui_bridge_port() -> u16 {
     8087
-}
-
-fn default_pairing_timeout() -> u64 {
-    600
 }
 
 impl Default for MobileSettings {
@@ -905,8 +964,6 @@ impl Default for MobileSettings {
             ui_bridge_port: default_ui_bridge_port(),
             lan_discovery_enabled: default_true(),
             lan_allow_plaintext: false,
-            pairing_timeout_secs: default_pairing_timeout(),
-            paired_devices: Vec::new(),
         }
     }
 }
@@ -1851,9 +1908,14 @@ pub struct WebIntegrationSettings {
     pub backend_url: String,
 
     /// Optional override for the Next.js web frontend origin — the host that
-    /// serves user-facing pages like `/connect-runner`. When unset, falls
-    /// back to `backend_url`. Only needed in split local-dev setups where
-    /// the API (8000) and SPA (3001) run on different ports.
+    /// serves user-facing pages like `/connect-runner-github`. When unset,
+    /// the origin is derived from the RESOLVED API base (`backend_url`, or
+    /// whatever env/profile rung `api_config` picked) by
+    /// `web_origin::derive_web_base_url` (`https://api.X` → `https://X`;
+    /// any other host unchanged). `$QONTINUI_WEB_FRONTEND_BASE` overrides it
+    /// (`web_origin::resolve_web_frontend_base`). Only needed in split
+    /// local-dev setups where the API (8000) and SPA (3001) run on different
+    /// ports.
     /// No trailing slash required.
     #[serde(default)]
     pub web_base_url: Option<String>,
@@ -2546,9 +2608,14 @@ mod ci_node_tests {
             cpus: 48,
         };
         let mut ci = CiNodeSettings::default();
-        assert_eq!(ci.configured_or_suggested_builds(big), 12);
-        assert_eq!(ci.effective_max_concurrent_builds_for(big), 12);
+        // Unset: the suggestion it is handed (pure — no process-global read).
+        let suggested = crate::ci_node::host_sizing::suggested_concurrent_builds(big);
+        assert_eq!(suggested, 12);
+        assert_eq!(ci.configured_or(suggested), 12);
+        assert_eq!(ci.effective_max_concurrent_builds_with(suggested), 12);
+        assert_eq!(ci.effective_max_concurrent_builds_with(0), 1);
         ci.max_concurrent_builds = Some(3);
+        assert_eq!(ci.configured_or(suggested), 3);
         assert_eq!(ci.configured_or_suggested_builds(big), 3);
         assert_eq!(ci.effective_max_concurrent_builds_for(big), 3);
         assert_eq!(ci.effective_max_concurrent_builds(), 3);
@@ -2558,6 +2625,27 @@ mod ci_node_tests {
         assert_eq!(ci.effective_max_concurrent_builds(), 1);
         ci.max_concurrent_builds = None;
         assert!(ci.effective_max_concurrent_builds() >= 1);
+    }
+
+    /// Plan 2026-11-05 Phase 7: the model's admitted total falls below the
+    /// static suggestion on a busy box and never rises above it, so one
+    /// dispatch's host share stays a static slot's — and an explicit value is
+    /// still the operator's lever for fewer, fatter builds.
+    #[test]
+    fn a_dispatch_share_is_the_static_partition_unless_the_operator_says_so() {
+        use crate::ci_node::host_sizing::HostCapacity;
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let big = HostCapacity {
+            mem_bytes: Some(368 * GIB),
+            cpus: 48,
+        };
+        let mut ci = CiNodeSettings::default();
+        // Static suggestion 12: every unset dispatch is sized as a 1/12 share.
+        assert_eq!(ci.dispatch_share_for(big), 12);
+        ci.max_concurrent_builds = Some(3);
+        assert_eq!(ci.dispatch_share_for(big), 3);
+        ci.max_concurrent_builds = Some(0);
+        assert_eq!(ci.dispatch_share_for(big), 1);
     }
 }
 
@@ -2997,12 +3085,14 @@ pub struct CiNodeSettings {
     /// advertised via the device budget POST when enabled.
     ///
     /// `None` (the default, and what a missing key loads as) means "never
-    /// configured — use the host's suggestion"
-    /// ([`crate::ci_node::host_sizing::suggested_concurrent_builds`]).
+    /// configured — use the host's suggestion": the capacity model's answer
+    /// for this device when it answers, else the static formula
+    /// ([`crate::ci_node::host_sizing::suggested_concurrent_builds_now`]).
     /// `Some(n)` is an explicit operator value and always wins; an existing
-    /// settings.json carrying a number stays explicit. Read it through
-    /// [`CiNodeSettings::effective_max_concurrent_builds`], never directly, so
-    /// the advertised and admitted numbers cannot diverge.
+    /// settings.json carrying a number stays explicit. Read it through the
+    /// accessors on [`CiNodeSettings`], never directly: the number the budget
+    /// publish advertises and the number admission admits both resolve through
+    /// [`CiNodeSettings::configured_or`].
     ///
     /// `None` is OMITTED on disk rather than written as `null`: an older runner
     /// build reading this file (a rollback) treats a missing key as its own
@@ -3042,24 +3132,55 @@ fn default_ci_node_min_free_disk_gb() -> u64 {
 }
 
 impl CiNodeSettings {
-    /// The CI slot count this node ADVERTISES for `host`: the explicit value
-    /// verbatim (including a deliberate `0`, an opinion the budget publish must
-    /// carry), else the host suggestion. Pure — `fleet::build_budget_request`
-    /// reads this.
+    /// The explicit value verbatim (including a deliberate `0`, an opinion the
+    /// budget publish must carry), else `suggested`. PURE.
+    pub(crate) fn configured_or(&self, suggested: u32) -> u32 {
+        self.max_concurrent_builds.unwrap_or(suggested)
+    }
+
+    /// The CI slot count this node ADVERTISES and admits for `host` now: the
+    /// explicit value, else the suggestion — the capacity model's Lane B total
+    /// when it answers, else the static host formula
+    /// ([`crate::ci_node::host_sizing::suggested_concurrent_builds_now`], plan
+    /// `2026-11-05-one-free-resource-model-places-sessions-builds-and-ci`
+    /// Phase 7). NOT pure: an unset value reads the cached capacity row and
+    /// dial and the CI node's running set (`ci_state`'s lock, so never call it
+    /// holding that lock); an explicit one reads nothing.
     pub(crate) fn configured_or_suggested_builds(
         &self,
         host: crate::ci_node::host_sizing::HostCapacity,
     ) -> u32 {
         match self.max_concurrent_builds {
             Some(n) => n,
-            None => crate::ci_node::host_sizing::suggested_concurrent_builds(host),
+            None => crate::ci_node::host_sizing::suggested_concurrent_builds_now(host).0,
         }
     }
 
-    /// The concurrency the executor ADMITS against for `host` — the same
-    /// number as [`Self::configured_or_suggested_builds`], floored at 1 exactly
-    /// as admission always has been (and as coord's `ci_dispatch` floors it).
-    /// Pure.
+    /// The N of equal host shares the executor sizes ONE dispatch's cargo jobs
+    /// and test threads from (`host_sizing::share`): the explicit value, the
+    /// operator's lever for fewer, fatter builds, else the static host
+    /// suggestion — the partition the capacity model's admitted total never
+    /// exceeds, so N shares never oversubscribe the host. PURE.
+    pub(crate) fn dispatch_share_for(
+        &self,
+        host: crate::ci_node::host_sizing::HostCapacity,
+    ) -> u32 {
+        match self.max_concurrent_builds {
+            Some(n) => n.max(1),
+            None => crate::ci_node::host_sizing::suggested_concurrent_builds(host).max(1),
+        }
+    }
+
+    /// The concurrency the executor ADMITS against, given the resolved
+    /// `suggested` count: [`Self::configured_or`] floored at 1 exactly as
+    /// admission always has been (and as coord's `ci_dispatch` floors it). PURE.
+    pub(crate) fn effective_max_concurrent_builds_with(&self, suggested: u32) -> u32 {
+        self.configured_or(suggested).max(1)
+    }
+
+    /// [`Self::effective_max_concurrent_builds_with`] the suggestion for `host`
+    /// now ([`Self::configured_or_suggested_builds`]) — NOT pure, the same
+    /// reads.
     pub(crate) fn effective_max_concurrent_builds_for(
         &self,
         host: crate::ci_node::host_sizing::HostCapacity,
@@ -3068,7 +3189,9 @@ impl CiNodeSettings {
     }
 
     /// [`Self::effective_max_concurrent_builds_for`] against the live host.
-    /// An explicit value never touches the host; only `None` probes it.
+    /// An explicit value never touches the host; only `None` probes it — and
+    /// then also reads the cached capacity model and takes the CI node's
+    /// `ci_state` lock (NOT pure; never call it holding that lock).
     pub fn effective_max_concurrent_builds(&self) -> u32 {
         match self.max_concurrent_builds {
             Some(n) => n.max(1),
@@ -3273,7 +3396,7 @@ fn default_session_guard_critical_free_commit_bytes() -> u64 {
 /// Both shipped ceilings are fractions of the one resource they protect:
 /// tokio's blocking pool, whose default `max_blocking_threads` is **512**.
 /// 256 is half of it — half the pool consumed is the point where back-pressure
-/// starts being worth its cost, and it is the number `thread_pressure`'s WARN
+/// starts being worth its cost, and it is the number the thread lane's WARN
 /// band hands to a gate continuation deciding whether to wait. The headroom it
 /// leaves above the calibration box's idle floor (256 − 151 = 105) is what
 /// `resource_guard` keeps CONSTANT on every machine as the blocking-pool arm of
@@ -3553,6 +3676,60 @@ pub struct RemoteCreateSettings {
     pub allowed_intent_repos: Vec<String>,
 }
 
+/// Settings → General → Sessions → "Close finished sessions after grace" (plan
+/// `2026-10-03-finished-runner-sessions-close-their-window-without-a-drain`,
+/// D3) — the product off-switch for the wind-down executor's `finished_close`
+/// arm, which graceful-`/exit`s a finished, idle, custody-clean terminal
+/// session after grace without waiting for a drain.
+///
+/// Default **`On`** (served policy `engineering-priorities`
+/// `capability-ships-enabled`). Because the arm acts on the user's behalf —
+/// it closes their windows — the off-switch lives in the product, not only in
+/// the environment. `QONTINUI_FINISHED_SESSION_CLOSE=0` in the runner's spawn
+/// environment is a machine kill switch that wins over this value, and
+/// `QONTINUI_WIND_DOWN_EXECUTOR=0` still disables the whole executor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FinishedSessionClose {
+    /// Close finished sessions after grace. The default.
+    #[default]
+    On,
+    /// Judge every candidate exactly as `On` would, log "would close", and
+    /// close nothing.
+    Shadow,
+    /// The arm does not run.
+    Off,
+}
+
+impl FinishedSessionClose {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FinishedSessionClose::On => "on",
+            FinishedSessionClose::Shadow => "shadow",
+            FinishedSessionClose::Off => "off",
+        }
+    }
+
+    /// Parse the wire spelling; `None` for anything else (never a default —
+    /// a typo must not silently turn the arm on or off).
+    pub fn from_wire(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "on" => Some(FinishedSessionClose::On),
+            "shadow" => Some(FinishedSessionClose::Shadow),
+            "off" => Some(FinishedSessionClose::Off),
+            _ => None,
+        }
+    }
+}
+
+/// Session-lifecycle settings block. A missing `sessions` key — every
+/// `settings.json` written before this block — loads the defaults.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionsSettings {
+    #[serde(default)]
+    pub finished_session_close: FinishedSessionClose,
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Settings {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3812,6 +3989,11 @@ pub struct Settings {
     /// where it may land). See [`RemoteCreateSettings`]; default-off.
     #[serde(default)]
     pub remote_create: RemoteCreateSettings,
+    /// Session-lifecycle preferences (the `finished_close` arm's switch). See
+    /// [`SessionsSettings`]. Re-read by the wind-down executor on every tick,
+    /// so a change is live with no runner restart.
+    #[serde(default)]
+    pub sessions: SessionsSettings,
     /// Ask the cloud memory endpoint (`POST /api/v1/memory/query`) for the
     /// link-expansion retrieval arm — the third RRF arm that one-hop-expands
     /// over `coord.memory_links` (plan
@@ -4089,6 +4271,13 @@ pub struct PerformanceSettings {
     /// throttle or refuse a spawn, and nothing may (plan §5).
     #[serde(default = "default_max_sessions_warn")]
     pub max_sessions_warn: u32,
+    /// Let the terminal page strip remove EMPTY pages the runner created on
+    /// its own (`origin: "auto"`) once restore has settled (plan
+    /// `2026-11-05-runner-terminal-pages-collide-crowd-and-overfill-and-limit-stalled-sessions-never-resume`
+    /// Phase 6). Read only by the webview (`useTerminalPages`); operator-made
+    /// pages are never pruned whatever this says. Default `true`.
+    #[serde(default = "default_prune_empty_auto_pages")]
+    pub prune_empty_auto_pages: bool,
 }
 
 /// Floor for [`PerformanceSettings::grid_scan_interval_ms`]. Mirrors the
@@ -4127,6 +4316,10 @@ fn default_share_terminal_output() -> bool {
 
 fn default_max_sessions_warn() -> u32 {
     30
+}
+
+fn default_prune_empty_auto_pages() -> bool {
+    true
 }
 
 impl Default for PerformanceSettings {
@@ -4514,7 +4707,15 @@ pub(crate) fn resolve_settings_path() -> Result<PathBuf, String> {
 
 /// [`resolve_settings_path`] **plus** the `create_dir_all` of its parent — for
 /// callers about to write the file ([`save_settings`]).
+///
+/// In a test binary a thread holding no `env_lock` is refused here, BEFORE the
+/// `create_dir_all`, so a refused write creates nothing
+/// ([`qontinui_runner_lib::env_write_gate`]).
 pub(crate) fn get_settings_path() -> Result<PathBuf, String> {
+    qontinui_runner_lib::env_write_gate::check(
+        "settings::get_settings_path",
+        resolve_settings_path().ok().as_deref(),
+    )?;
     let (dir, _config_dir_source) = get_config_dir()?;
     Ok(dir.join(SETTINGS_FILE))
 }
@@ -5164,7 +5365,16 @@ pub fn load_settings_full() -> LoadedSettings {
             );
         }
     }
-    if should_persist_migration(needs_persist, is_secondary, provenance) {
+    // The env-write gate beside the pure predicate: in a test binary, a thread
+    // holding no `env_lock` skips the persist quietly (the gate reports it), so
+    // a FreshInstall load cannot write into another test's fixture.
+    if should_persist_migration(needs_persist, is_secondary, provenance)
+        && qontinui_runner_lib::env_write_gate::check(
+            "settings::load_settings_full",
+            resolve_settings_path().ok().as_deref(),
+        )
+        .is_ok()
+    {
         let to_persist = document_to_persist(&on_disk, &settings, tier_migration);
         if let Err(e) = save_settings(&to_persist) {
             error!("Failed to persist tier/local_user_id migration: {}", e);
@@ -5256,6 +5466,12 @@ pub fn update_settings<F>(mutate: F) -> Result<(), String>
 where
     F: FnOnce(&mut Settings),
 {
+    // Gated before the read, so a refused update neither reads nor writes
+    // ([`qontinui_runner_lib::env_write_gate`]).
+    qontinui_runner_lib::env_write_gate::check(
+        "settings::update_settings",
+        resolve_settings_path().ok().as_deref(),
+    )?;
     let loaded = read_settings_from_disk();
     if !loaded.is_authoritative() {
         let msg = loaded.unreadable_message();
@@ -5920,6 +6136,11 @@ pub fn get_claude_config_dirs() -> Vec<String> {
 /// Save the configured Claude Code config directories
 pub fn save_claude_config_dirs(dirs: Vec<String>) -> Result<(), String> {
     crate::config_facade::save_claude_config_dirs(dirs)
+}
+
+/// Add Claude Code config directories to the roster, never removing one
+pub fn append_claude_config_dirs(dirs: &[String]) -> Result<usize, String> {
+    crate::config_facade::append_claude_config_dirs(dirs)
 }
 
 /// Get custom launch commands per account config directory
@@ -6671,6 +6892,35 @@ pub fn save_claude_session_permission(
     Ok(stored)
 }
 
+/// The `finished_close` arm's switch as SAVED — not the effective mode, which
+/// the machine kill switch can override (see
+/// `session::finished_close::effective_mode`).
+///
+/// `Err` when `settings.json` exists but could not be read or parsed: the
+/// `Settings` that load returns is a DEFAULT placeholder, and its default here
+/// is `on` — so reading it as the operator's value would turn a saved `off`
+/// back on exactly when the file is damaged. The caller treats `Err` as off.
+/// A genuine first run (no file) is authoritative and yields the default.
+///
+/// Read through [`read_settings_from_disk`], not [`load_settings`]: the
+/// wind-down executor calls this on every tick, and that door serves a cached
+/// parse and never writes the operator's file as a side effect of reading it.
+pub fn get_finished_session_close() -> Result<FinishedSessionClose, String> {
+    let loaded = read_settings_from_disk();
+    if loaded.provenance.is_authoritative() {
+        Ok(loaded.settings.sessions.finished_session_close)
+    } else {
+        Err(loaded
+            .error
+            .unwrap_or_else(|| "settings.json could not be read".to_string()))
+    }
+}
+
+/// Persist the `finished_close` arm's switch.
+pub fn save_finished_session_close(mode: FinishedSessionClose) -> Result<(), String> {
+    update_settings(|settings| settings.sessions.finished_session_close = mode)
+}
+
 /// Get the cloud memory link-expansion arm flag. Default false — see
 /// [`Settings::memory_link_expansion_enabled`].
 pub fn get_memory_link_expansion_enabled() -> bool {
@@ -7034,6 +7284,7 @@ mod performance_settings_tests {
             "None keeps redaction following share_output, as before"
         );
         assert_eq!(p.max_sessions_warn, 30);
+        assert!(p.prune_empty_auto_pages, "the prune ships enabled");
     }
 
     /// A settings.json written before this key existed must load with every
@@ -7077,6 +7328,7 @@ mod performance_settings_tests {
             share_terminal_output: false,
             redact_terminal_secrets: Some(true),
             max_sessions_warn: 50,
+            prune_empty_auto_pages: false,
         };
         let json = serde_json::to_string(&original).expect("serialize");
         let back: PerformanceSettings = serde_json::from_str(&json).expect("deserialize");
@@ -7249,10 +7501,11 @@ mod account_selection_mode_tests {
         // than failing the document it sits in.
         let unknown: AccountSelectionMode =
             serde_json::from_value(serde_json::json!("from_a_newer_runner")).unwrap();
-        assert_eq!(unknown, AccountSelectionMode::default());
+        // Both halves spelled as LITERALS, so moving `#[default]` reddens this.
+        assert_eq!(unknown, AccountSelectionMode::WeightedRandom);
         assert_eq!(
             AccountSelectionMode::default(),
-            AccountSelectionMode::AlternatingHandoff
+            AccountSelectionMode::WeightedRandom
         );
         assert_eq!(
             AccountSelectionMode::WeightedRandom.as_str(),
@@ -7288,6 +7541,67 @@ mod account_selection_mode_tests {
         assert!(!cli.account_selection_pinned);
         assert_eq!(cli.account_selection_mode, AccountSelectionMode::LeastUsage);
         assert!(!super::ClaudeCliSettings::default().account_selection_pinned);
+    }
+
+    /// A `claude_cli` block that stores NO mode — a fresh install, or a file
+    /// written before the field existed — resolves to weighted random, and so
+    /// does a default-constructed one. A stored mode is NOT this case: it is
+    /// kept as written (the fleet `account_selection_mode` policy is what moves
+    /// an unpinned machine off it), which the `least_usage` decode above pins.
+    #[test]
+    fn a_block_with_no_mode_resolves_to_weighted_random() {
+        let cli: super::ClaudeCliSettings = serde_json::from_value(serde_json::json!({
+            "execution_mode": "auto",
+            "custom_path": null,
+            "timeout_seconds": 600,
+            "config_dir": null,
+        }))
+        .expect("a claude_cli block with no mode decodes");
+        assert_eq!(
+            cli.account_selection_mode,
+            AccountSelectionMode::WeightedRandom
+        );
+        assert_eq!(
+            super::ClaudeCliSettings::default().account_selection_mode,
+            AccountSelectionMode::WeightedRandom
+        );
+    }
+
+    /// The Settings page tells the operator which mode is the default (the
+    /// selector option whose hint starts `Default.`, in
+    /// `src/components/settings/ai-settings/types.ts`). That label restates
+    /// this enum's `#[default]` across the language boundary, so pin the two
+    /// together: exactly one option may claim it, and its `mode` must be the
+    /// default's wire spelling.
+    #[test]
+    fn settings_page_default_label_names_the_enum_default() {
+        let ts = include_str!("../../src/components/settings/ai-settings/types.ts");
+        let marker = "hint: \"Default.";
+        assert_eq!(
+            ts.matches(marker).count(),
+            1,
+            "exactly one selector option may be labelled the default"
+        );
+        let (before, _) = ts.split_once(marker).expect("counted above");
+        let (_, from_mode) = before
+            .rsplit_once("mode: \"")
+            .expect("the labelled option names its mode");
+        let mode = from_mode
+            .split('"')
+            .next()
+            .expect("mode spelling is quoted");
+        assert_eq!(mode, AccountSelectionMode::default().as_str());
+    }
+
+    /// The env-agent collector lives in the LIB crate and cannot name this
+    /// bin-crate enum, so it carries the default as a string. Pin the two
+    /// together: moving `#[default]` without the collector reddens here.
+    #[test]
+    fn collector_default_spelling_matches_the_enum_default() {
+        assert_eq!(
+            qontinui_runner_lib::env_agent::collectors::DEFAULT_LOCAL_SELECTION_MODE,
+            AccountSelectionMode::default().as_str()
+        );
     }
 
     /// The pin survives a serialize → deserialize round trip in both states.

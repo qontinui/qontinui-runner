@@ -5,8 +5,12 @@
 // three orthogonal UI contexts (TransitionEffects, UIState, ZoneMetadata)
 // stay separate.
 
-export { TerminalSessionProvider, useTerminalSession } from "./TerminalSessionContext";
-export type { TerminalSessionContextValue } from "./TerminalSessionContext";
+export {
+  TerminalSessionProvider,
+  usePageSessionGetter,
+  useTerminalSession,
+} from "./TerminalSessionContext";
+export type { PageSessionGetter, TerminalSessionContextValue } from "./TerminalSessionContext";
 
 export { ZoneMetadataProvider } from "./ZoneMetadataContext";
 export type { ZoneMetadataContextValue } from "./ZoneMetadataContext";

@@ -29,10 +29,14 @@
 #
 # THE PREDICATE
 #
-# Compare the push's own commits — `merge-base(HEAD, upstream)..HEAD` — plus
-# its uncommitted working tree, against the set of paths in THIS repo whose
-# content can move `schemas.json`. If NONE of them is touched, then the very
-# inputs that produced this diff are already on the upstream branch, so the
+# Compare the branch's own commits — `merge-base(HEAD, default branch)..HEAD`,
+# the default branch being origin/HEAD or origin/main — plus its uncommitted
+# working tree, against the set of paths in THIS repo whose content can move
+# `schemas.json`. (It was `merge-base(HEAD, upstream)` until 2026-10-30. That
+# blamed a REBASED push for every main commit the rebase pulled in: findings
+# 8d16b76e and 79415d3d. See `push_default_base_ref` in push-range.sh.)
+# If NONE of them is touched, then the very
+# inputs that produced this diff are already on the default branch, so the
 # drift predates the push by construction. That is a proof, not a heuristic —
 # provided the path set is complete, which is why it is deliberately WIDER
 # than the hook's own pre-commit `files:` trigger. Attribution must never
@@ -124,6 +128,33 @@
 # every push. That last is deliberately not carved out: a crate doc cannot
 # reach a schema today, but a carve-out is a narrowing, and the header's rule
 # for those is evidence plus a guard, not convenience.
+#
+# A SECOND NARROWING, AND ITS GUARD
+#
+# `.sh` and `.py` under src-tauri/src/fleet_skills/ are excluded too
+# (GEN_EVENTS_ATTRIBUTION_BUNDLE_EXCLUDES below), for the same reason as
+# markdown and on the same kind of evidence: qontinui-runner #2314 pushed one
+# script and one Python module under that tree and was blamed for a 13-file,
+# 933-deletion diff, while a control on a clean origin/main checkout against
+# the same schemas baseline printed the identical diff and PRE-EXISTING DRIFT.
+# Those files reach the binary only through fleet_skills.rs's `include_dir!`,
+# as bytes the provisioner writes to disk. Only that tree and only those two
+# extensions: a `.rs` file there is still an input, and fleet_commands/ and
+# fleet_agents/ hold nothing but markdown, so no evidence covers them.
+#
+# `gen_events_bundle_premise_violations` is its guard, and it only runs once
+# the markdown premise holds, because the markdown arms that read embeds beside
+# JsonSchema and schemars do not care about the extension and are this
+# exclusion's arms as well. What it adds is the two ways these files could
+# matter without being embedded as data: compiled as Rust (`include!`, a `path`
+# attribute), named by a build script, or named in a file that mentions
+# JsonSchema (a hand-written `impl JsonSchema` over the embedded tree). Its reason
+# is kept apart, in ATTRIBUTION_BUNDLE_EXCLUDES_DROPPED_REASON, so a pusher blamed
+# for a `.py` hears about that exclusion; when the markdown premise is what
+# dropped it, the reason quotes that premise. It shares the blind spots listed
+# above: a name assembled without a `fleet_skills`, `.py"` or `"sh"`/`"py"`
+# literal, and a runtime read by the exporter itself. A build script's `.sh"` is
+# deliberately not read, because build.rs embeds scripts/dev-tokio-console.sh.
 
 # Every path whose content can change the exported JSON Schemas. Wider than
 # `files:` in .pre-commit-config.yaml on purpose (see above): a schemars type
@@ -240,11 +271,13 @@ GEN_EVENTS_ATTRIBUTION_PATHS=(
     #  `qontinui-spec-check = { path = "../crates/spec-check" }`,
     #  `qontinui-runner-stats = { path = "../crates/runner-stats" }`,
     #  `qontinui-runner-win32 = { path = "../crates/runner-win32" }`,
-    #  `qontinui-pty-holder = { path = "../crates/pty-holder" }`), and the
+    #  `qontinui-pty-holder = { path = "../crates/pty-holder" }`,
+    #  `session-lifecycle = { path = "../crates/session-lifecycle" }`), and the
     # vendored crate the root manifest's `[patch.crates-io]` substitutes into
     # the graph (`tao = { path = "vendor/tao-0.35.0" }`). The two runner-*
     # crates were missing until 2026-09-30: an edit to either cleared a guilty
-    # pusher. `gen_events_uncovered_path_deps` below now walks the manifests
+    # pusher. `crates/pty-holder` was missing the same way until 2026-10-12.
+    # `gen_events_uncovered_path_deps` below now walks the manifests
     # and reports any in-repo path dependency no entry covers; the
     # `gen-events-path-deps` pre-commit hook runs it on every Cargo.toml edit,
     # and the attribution self-test runs it too. To look by hand,
@@ -254,6 +287,7 @@ GEN_EVENTS_ATTRIBUTION_PATHS=(
     "crates/runner-stats/"
     "crates/runner-win32/"
     "crates/pty-holder/"
+    "crates/session-lifecycle/"
     "vendor/"
     "Cargo.toml"
     "Cargo.lock"
@@ -281,6 +315,13 @@ GEN_EVENTS_ATTRIBUTION_PATHS=(
 # guard of its own.
 GEN_EVENTS_ATTRIBUTION_EXCLUDES=(
     ':(exclude)*.md'
+)
+
+# Applied only while gen_events_bundle_premise_violations holds, separately from
+# the markdown entry above. See "A SECOND NARROWING" in the header.
+GEN_EVENTS_ATTRIBUTION_BUNDLE_EXCLUDES=(
+    ':(exclude)src-tauri/src/fleet_skills/*.sh'
+    ':(exclude)src-tauri/src/fleet_skills/*.py'
 )
 
 # Where the premise guard looks, DERIVED from GEN_EVENTS_ATTRIBUTION_PATHS
@@ -509,6 +550,10 @@ _gen_events_premise_arm() {
     return 0
 }
 
+# What compiles a file AS RUST, whatever its extension: `include!` with any
+# delimiter, a `path` attribute, and its rustfmt-wrapped form.
+GEN_EVENTS_AS_RUST_RE='(^|[^_[:alnum:]])include![[:space:]]*[({[]|#!?\[[[:space:]]*(cfg_attr\(.*[(,][[:space:]]*)?path[[:space:]]*=|^[[:space:]]*path[[:space:]]*=[[:space:]]*"'
+
 # Could markdown in the repo at $1 reach `schemas.json`? Prints one line per
 # way it could. Exit 0: premise holds. Exit 1: violated. Exit 2: the probe
 # itself failed or could not be verified (its ERROR lines are printed too) —
@@ -531,13 +576,16 @@ gen_events_markdown_premise_violations() {
     # any `, path =`: tracing's `debug!(path = %p, ..)` and format!'s named
     # `path=` sit beside `.md"` literals in four real files, and would drop
     # the exclusion on every decision.
-    as_rust="$(gen_events_premise_grep "$dir" -l -E '(^|[^_[:alnum:]])include![[:space:]]*[({[]|#!?\[[[:space:]]*(cfg_attr\(.*[(,][[:space:]]*)?path[[:space:]]*=|^[[:space:]]*path[[:space:]]*=[[:space:]]*"' | LC_ALL=C sort)" || probe_failed=1
+    as_rust="$(gen_events_premise_grep "$dir" -l -E "$GEN_EVENTS_AS_RUST_RE" | LC_ALL=C sort)" || probe_failed=1
     inc_any="$(printf '%s\n' "$inc_text" "$inc_dir" | LC_ALL=C sort -u)" || probe_failed=1
 
     # A failed probe prints its ERROR line into whichever list it fed, and
     # `sort` returns 0 over it — so the lists are scanned, not just the flags.
-    if printf '%s\n' "$inc_text" "$md_lit" "$schema" "$inc_dir" "$schemars_attr" "$as_rust" | grep -q '^ERROR'; then
-        printf '%s\n' "$inc_text" "$md_lit" "$schema" "$inc_dir" "$schemars_attr" "$as_rust" | grep '^ERROR'
+    # Plain `grep`, never `grep -q`: -q closes the pipe on its first match, and
+    # under pipefail the SIGPIPE printf then takes reads as "no ERROR" and loses
+    # the line. It is intermittent at the real tree's list sizes and certain
+    # once the lists pass the pipe buffer. Plain grep reads to EOF.
+    if printf '%s\n' "$inc_text" "$md_lit" "$schema" "$inc_dir" "$schemars_attr" "$as_rust" | grep '^ERROR'; then
         probe_failed=1
     fi
     # Decision-time vacuity. A tree that carries the schema toolchain (the
@@ -620,6 +668,47 @@ gen_events_markdown_premise_violations() {
     return 0
 }
 
+# Could a `.sh` or `.py` under src-tauri/src/fleet_skills/ reach `schemas.json`
+# by a route the markdown premise does not read? Same contract as
+# gen_events_markdown_premise_violations: one line per way, exit 0 holds, 1
+# violated, 2 the probe failed.
+gen_events_bundle_premise_violations() {
+    local dir="$1" probe_failed=0 found=0 as_rust names schema tree_names line arm_rc
+    as_rust="$(gen_events_premise_grep "$dir" -l -E "$GEN_EVENTS_AS_RUST_RE" | LC_ALL=C sort)" || probe_failed=1
+    names="$(gen_events_premise_grep "$dir" -l -E 'fleet_skills|\.(sh|py)"' | LC_ALL=C sort)" || probe_failed=1
+    schema="$(gen_events_premise_grep "$dir" -l -F 'JsonSchema' | LC_ALL=C sort)" || probe_failed=1
+    tree_names="$(gen_events_premise_grep "$dir" -l -F 'fleet_skills' | LC_ALL=C sort)" || probe_failed=1
+    # As in the markdown premise, a failed probe's ERROR line lands in the list
+    # and `sort` returns 0 over it, so the lists are scanned, with plain `grep`
+    # for the same reason.
+    if printf '%s\n' "$as_rust" "$names" "$schema" "$tree_names" | grep '^ERROR'; then
+        probe_failed=1
+    fi
+    _gen_events_premise_arm "include!/path attribute in a file that names fleet_skills or a .sh/.py path" \
+        "$as_rust" "$names" && arm_rc=0 || arm_rc=$?
+    case "$arm_rc" in 1) found=1 ;; 2) probe_failed=1 ;; esac
+    _gen_events_premise_arm "fleet_skills named in a file that mentions JsonSchema" \
+        "$tree_names" "$schema" && arm_rc=0 || arm_rc=$?
+    case "$arm_rc" in 1) found=1 ;; 2) probe_failed=1 ;; esac
+    # Not any `.sh"`: build.rs embeds scripts/dev-tokio-console.sh, which has
+    # nothing to do with this tree. `"sh"`/`"py"` is an extension filter over a
+    # walk, which names neither the tree nor a file.
+    local build_rc=0
+    line="$(_gen_events_grep_in "$dir" "${#GEN_EVENTS_PREMISE_BUILD_SCRIPTS[@]}" \
+        "${GEN_EVENTS_PREMISE_BUILD_SCRIPTS[@]}" -n -E 'fleet_skills|"(sh|py)"|\.py"')" || build_rc=$?
+    if [ "$build_rc" -ne 0 ]; then
+        printf '%s\n' "$line"
+        probe_failed=1
+    elif [ -n "$line" ]; then
+        printf '%s\n' "$line" | sed 's/$/  (a build script naming fleet_skills or a .py path)/'
+        found=1
+    fi
+
+    [ "$probe_failed" = "1" ] && return 2
+    [ "$found" = "1" ] && return 1
+    return 0
+}
+
 # Read NUL-delimited records from stdin into the global array _GEA_RECS. The
 # producer appends its own exit status as one final `rc=N` record, because a
 # process substitution's status is otherwise lost; anything but `rc=0` last —
@@ -653,6 +742,9 @@ _gen_events_read_z() {
 #   ATTRIBUTION_EXCLUDES_DROPPED_REASON  "" when the markdown exclusion
 #                       applied; otherwise why this decision ran on the full,
 #                       unexcluded list (premise violated, or its probe failed)
+#   ATTRIBUTION_BUNDLE_EXCLUDES_DROPPED_REASON  the same for the fleet_skills
+#                       .sh/.py exclusion, which also drops whenever the
+#                       markdown one does
 #   ATTRIBUTION_UNAVAILABLE_REASON  set only for `unavailable` — including a
 #                       git call that failed, which must never read as "touched
 #                       nothing" and clear the pusher
@@ -669,6 +761,7 @@ gen_events_attribution() {
     ATTRIBUTION_TOUCHED=""
     ATTRIBUTION_TOUCHED_DETAIL=""
     ATTRIBUTION_EXCLUDES_DROPPED_REASON=""
+    ATTRIBUTION_BUNDLE_EXCLUDES_DROPPED_REASON=""
     ATTRIBUTION_UNAVAILABLE_REASON=""
 
     if ! git -C "$repo" rev-parse --verify --quiet HEAD >/dev/null 2>&1; then
@@ -680,15 +773,19 @@ gen_events_attribution() {
         return 0
     fi
 
+    # Measured against the DEFAULT branch, not the upstream: see
+    # `push_default_base_ref` for why a rebased push needs that. A full refname,
+    # so a local branch called `origin/main` cannot stand in for the remote one;
+    # ATTRIBUTION_BASE_REF carries its short form, for messages.
     local ref
-    if ! ref="$(push_base_ref "$repo")"; then
-        ATTRIBUTION_UNAVAILABLE_REASON="no upstream branch, origin/HEAD or origin/main to measure against"
+    if ! ref="$(push_default_base_ref "$repo")"; then
+        ATTRIBUTION_UNAVAILABLE_REASON="no origin/HEAD, origin/main or upstream branch to measure against"
         return 0
     fi
-    ATTRIBUTION_BASE_REF="$ref"
+    ATTRIBUTION_BASE_REF="$(push_ref_short "$ref")"
     ATTRIBUTION_BASE_SHA="$(git -C "$repo" merge-base HEAD "$ref" 2>/dev/null || true)"
     if [ -z "$ATTRIBUTION_BASE_SHA" ]; then
-        ATTRIBUTION_UNAVAILABLE_REASON="could not compute merge-base(HEAD, $ref)"
+        ATTRIBUTION_UNAVAILABLE_REASON="could not compute merge-base(HEAD, $ATTRIBUTION_BASE_REF)"
         return 0
     fi
 
@@ -700,14 +797,30 @@ gen_events_attribution() {
     local pathspec=("${GEN_EVENTS_ATTRIBUTION_PATHS[@]%/}")
     if [ "$premise_rc" -eq 0 ]; then
         pathspec+=("${GEN_EVENTS_ATTRIBUTION_EXCLUDES[@]}")
+        local bundle_premise bundle_rc
+        bundle_premise="$(gen_events_bundle_premise_violations "$repo")" && bundle_rc=0 || bundle_rc=$?
+        if [ "$bundle_rc" -eq 0 ]; then
+            pathspec+=("${GEN_EVENTS_ATTRIBUTION_BUNDLE_EXCLUDES[@]}")
+        elif [ "$bundle_rc" -eq 1 ]; then
+            ATTRIBUTION_BUNDLE_EXCLUDES_DROPPED_REASON="fleet_skills .sh/.py may reach schemas.json (${bundle_premise%%$'\n'*})"
+        else
+            local bundle_error
+            bundle_error="$(sed -n '/^ERROR/{p;q;}' <<< "$bundle_premise")"
+            ATTRIBUTION_BUNDLE_EXCLUDES_DROPPED_REASON="the fleet_skills premise probe failed (${bundle_error:-no ERROR line})"
+        fi
     elif [ "$premise_rc" -eq 1 ]; then
         ATTRIBUTION_EXCLUDES_DROPPED_REASON="markdown may reach schemas.json (${premise%%$'\n'*})"
     else
         # `sed` rather than `grep -m1 || echo`: under pipefail that form can
-        # print a real line AND the fallback.
+        # print a real line AND the fallback. A here-string rather than a pipe:
+        # `q` closes it, and the SIGPIPE would fail this assignment, which under
+        # the hook's `set -e` ends the hook with 141 and no message.
         local first_error
-        first_error="$(printf '%s\n' "$premise" | sed -n '/^ERROR/{p;q;}')"
+        first_error="$(sed -n '/^ERROR/{p;q;}' <<< "$premise")"
         ATTRIBUTION_EXCLUDES_DROPPED_REASON="the markdown premise probe failed (${first_error:-no ERROR line})"
+    fi
+    if [ -n "$ATTRIBUTION_EXCLUDES_DROPPED_REASON" ]; then
+        ATTRIBUTION_BUNDLE_EXCLUDES_DROPPED_REASON="its embed arms are the markdown premise's: $ATTRIBUTION_EXCLUDES_DROPPED_REASON"
     fi
 
     # Each call's status is checked, not swallowed: an empty list from a git
@@ -859,8 +972,15 @@ gen_events_attribution() {
 # globbed names, cwd-relative paths, a staged `git rm` that left a half-made
 # entry behind. What to do with local state is the pusher's call; the message
 # states the facts that call needs.
+#
+# `--inputs-only` prints just the labelled input list and the notes about it.
+# It drops the lead line, the "Measured against" line and the closing caveat.
+# The per-file verdict (lib/gen-events-file-attribution.sh) uses it after
+# printing its own lead. That lead says which drifted files are the push's,
+# so "the diff below is yours" would be false there.
 gen_events_render_mine() {
-    local stage p src label own=0 earlier=0 local_only=0
+    local stage p src label own=0 earlier=0 local_only=0 inputs_only=0
+    [ "${1:-}" = "--inputs-only" ] && inputs_only=1
     stage="$(gen_events_stage)"
 
     # `own`: something in the change being made (committed for a push, staged
@@ -878,7 +998,9 @@ gen_events_render_mine() {
     # Name the change as what it is. With nothing of its own, the drift is
     # still the author's to look at — the regen read their tree — but saying
     # THIS change moved the inputs would be the false claim #1667 met.
-    if [ "$own" = "1" ]; then
+    if [ "$inputs_only" = "1" ]; then
+        :
+    elif [ "$own" = "1" ]; then
         echo "This $stage changes sources that feed them, so the diff below is yours."
     elif [ "$earlier" = "1" ]; then
         echo "Commits already on this branch (not this commit) change sources that feed"
@@ -887,7 +1009,8 @@ gen_events_render_mine() {
         echo "Your working tree (not this $stage's changes) changes sources that feed them,"
         echo "so the diff below is yours to check."
     fi
-    echo "Measured against $ATTRIBUTION_BASE_REF (merge-base ${ATTRIBUTION_BASE_SHA:0:12}); the files are:"
+    [ "$inputs_only" = "1" ] \
+        || echo "Measured against $ATTRIBUTION_BASE_REF (merge-base ${ATTRIBUTION_BASE_SHA:0:12}); the files are:"
     while IFS=$'\t' read -r p src; do
         [ -n "$p" ] || continue
         case "$stage:$src" in
@@ -910,8 +1033,12 @@ gen_events_render_mine() {
     # dropped exclusion changed nothing this pusher sees, and the line would
     # be noise. A `%q`-escaped name ends in `'`, hence the optional quote.
     if [ -n "$ATTRIBUTION_EXCLUDES_DROPPED_REASON" ] \
-       && printf '%s\n' "$ATTRIBUTION_TOUCHED" | grep -qE "\.md'?\$"; then
+       && grep -qE "\.md'?\$" <<< "$ATTRIBUTION_TOUCHED"; then
         echo "Markdown was counted as a codegen input this time: $ATTRIBUTION_EXCLUDES_DROPPED_REASON."
+    fi
+    if [ -n "${ATTRIBUTION_BUNDLE_EXCLUDES_DROPPED_REASON:-}" ] \
+       && grep -qE "src-tauri/src/fleet_skills/.*\.(sh|py)'?\$" <<< "$ATTRIBUTION_TOUCHED"; then
+        echo "fleet_skills .sh/.py files were counted as codegen inputs this time: $ATTRIBUTION_BUNDLE_EXCLUDES_DROPPED_REASON."
     fi
     # Working tree outside the change being made. At pre-push that is staged,
     # unstaged and untracked input; at pre-commit, unstaged and untracked.
@@ -927,6 +1054,9 @@ gen_events_render_mine() {
             echo "is theirs, it will follow you to the push unless they are dealt with."
         fi
     fi
-    echo "Part of the diff may still be pre-existing — the baseline is a build"
-    echo "artifact in a shared checkout and may have been behind before you began."
+    if [ "$inputs_only" = "0" ]; then
+        echo "Part of the diff may still be pre-existing — the baseline is a build"
+        echo "artifact in a shared checkout and may have been behind before you began."
+    fi
+    return 0
 }

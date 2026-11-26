@@ -28,10 +28,47 @@
 # check because the two files it compares are this skill's own, and a suite that
 # already runs the script is the cheapest place to notice they disagree.
 #
-# ISOLATION, and it is load-bearing rather than tidy. Every case runs in its own
-# temp tree with $HOME redirected there, so the suite never reads or writes the
-# real user store and a machine whose own trust state changes cannot flip a
-# result. Three more variables matter as much:
+# THE DISCHARGE. The origin sentinel is shown able to fail in-suite: one
+# mutation of a staged copy of coord-revive.sh -- L6 ignoring its override --
+# must redden a re-run, behind an unmutated copy staged the same way that must
+# run green. Every copy sits exactly three directories below the sandbox,
+# whose own scripts link is where the subject's resolver looks first; the
+# helper's STAGED COPIES says why the depth matters. Both re-runs are
+# narrowed with `--only configdir` to one of the suite's five sections
+# (classify, invariant, worktree, configdir, roster), so the discharge costs
+# four subject runs rather than two whole suites.
+#
+# ISOLATION, and it is load-bearing rather than tidy. Every run of the subject
+# is `env -i` with an explicit allow-list: the shared PINNED_ENV that
+# scripts/lib/coord-revive-test-isolation.sh builds -- its header says what it
+# carries and what it keeps out -- plus the five each invocation sets for
+# itself (its $PWD, its home and user profile, its Claude config dir and its
+# workspace root) and, in inv_run alone, the four knobs that pin the floor
+# gate open so its two runs agree (COORD_REVIVE_LOAD_RATIO,
+# COORD_REVIVE_BUILD_PROCS, COORD_REVIVE_HEALTH_SLOW_MS,
+# COORD_REVIVE_LOADAVG_FILE). So the subject sees
+# those variables and nothing else the caller exports. That replaced pinning
+# each risk by name, which missed five, each measured while every assertion
+# here passed: the web host (below); the runner port $QONTINUI_RUNNER_PORT,
+# which the frontend-state helper appends after the origins it is given (20
+# /health reads a run reached an exported port); the write paths the cascade
+# honours AHEAD of $HOME ($COORD_REVIVE_TIMING_FILE,
+# $QONTINUI_GUARD_DECISION_LOG and the $QONTINUI_LOG_DIR it defaults under,
+# $CAPNEG_STATE_DIR and $QONTINUI_RUNG_UNREPORTED_LOG -- a run appended to
+# three of the caller's files, the timing file, the guard-decision log and the
+# capability-negative ledger, a sandbox FLOOR-CLAIM row into the last each
+# time); the caller's curl configuration,
+# which every dial obeyed; and $BASH_ENV, which bash sourced into the subject.
+# Credentials, session ids, proxy variables and every $COORD_REVIVE_* knob the
+# caller may have tuned stay out the same way. The same helper's origin
+# sentinel then reads every run and fails one that names an origin other than
+# the dead port, so a pin that stops holding shows as a red case rather than
+# as traffic nobody saw. Case 10 runs git itself, in the suite's environment
+# rather than the subject's, so its fixture drops the caller's git variables on
+# its own (fixture_git_env, beside it).
+# Every case also runs in its own temp tree with $HOME redirected there, so
+# the suite never reads or writes the real user store and a machine whose own
+# trust state changes cannot flip a result. These pins matter as much:
 #
 #   $CLAUDE_CONFIG_DIR    emptied, and this one was NOT optional. It relocates
 #                         BOTH the user settings file and the user store, and it
@@ -52,15 +89,21 @@
 #                         was set: 3m18s for ONE case, and answers that depended
 #                         on whether a runner happened to be up. That is not a
 #                         slow test, it is a test of the wrong thing.
-#   $QONTINUI_RUNNER_URL  points L4's mint at a dead port.
-#   $COORD_HTTP_URL       points L3/L4's bearer doors at a dead port, so a
-#                         credential that somehow resolves cannot reach coord.
-#   $QONTINUI_WEB_HTTP_URL points L6 -- the WEB host, a second remote host with
-#                         its own variable -- at a dead port. $COORD_HTTP_URL
-#                         does not reach it: from the day L6 landed
-#                         (qontinui-claude-config#888) until this line, every
-#                         case sent an anonymous GET to production
+#   $QONTINUI_RUNNER_URL  (shared list) points L4's mint at the dead port.
+#   $COORD_HTTP_URL       (shared list) points L3/L4's bearer doors at the dead
+#                         port, so a credential that somehow resolves cannot
+#                         reach coord.
+#   $QONTINUI_WEB_HTTP_URL (shared list) points L6 -- the WEB host, a second
+#                         remote host with its own variable -- at the dead port.
+#                         $COORD_HTTP_URL does not reach it: from the day L6
+#                         landed (qontinui-claude-config#888) until it was
+#                         pinned, every case sent an anonymous GET to production
 #                         api.qontinui.io while this header claimed hermeticity.
+# The shared list's other entries -- $PATH, the caller's and the one channel
+# for code that env -i leaves open, by design; $CURL_HOME at an empty
+# .curlrc; the sandbox $TMPDIR, $TEMP and $TMP; and the Windows system
+# variables this suite needs on the windows leg -- are explained in the
+# helper's own header.
 #
 # The RUNNER_URL line is belt; the COORD_HTTP_URL line is braces, and the braces
 # are there because the belt silently broke once. Until 2026-08-29 coord-revive
@@ -76,20 +119,62 @@
 
 set -u
 
-HERE="$(cd "$(dirname "$0")" && pwd)"
-SCRIPT="$HERE/coord-revive.sh"
+# -P resolves symlinks. Run through a workspace root's .claude symlink, a
+# logical cd would climb ../../.. on the symlink's side and miss scripts/lib.
+HERE="$(cd -P "$(dirname "$0")" && pwd)"
+# MC_SUBJECT is the discharge's seam: a re-run is pointed at a staged copy.
+SCRIPT="${MC_SUBJECT:-$HERE/coord-revive.sh}"
+REPO_ROOT="$(cd -P "$HERE/../../.." && pwd)"
 PASS=0
 FAIL=0
 FAILED_CASES=()
 
 [ -r "$SCRIPT" ] || { echo "FATAL: $SCRIPT not readable"; exit 1; }
+# The pinned environment and the origin sentinel, shared with
+# floor-claim-test.sh. Without it the subject cannot be isolated, so the suite
+# refuses rather than run it.
+ISOLATION_LIB="$REPO_ROOT/scripts/lib/coord-revive-test-isolation.sh"
+# shellcheck source=/dev/null
+. "$ISOLATION_LIB" || { echo "FATAL: cannot source $ISOLATION_LIB (resolved from HERE=$HERE), so the subject cannot be isolated"; exit 1; }
+
+# ok / bad: one assertion each, in this suite's own line format. The shared
+# origin sentinel (check_origins) reports through them.
+ok()  { PASS=$((PASS + 1)); echo "  ok   $1"; }
+bad() { FAIL=$((FAIL + 1)); FAILED_CASES+=("$1"); echo "  FAIL $1"; }
+
+# mutation-control.sh, from the same checkout: this suite's sections and its
+# discharge. Each block below runs only when its section is selected; a run
+# given `--only <id>[,<id>]` runs those alone, and `--list-sections` prints the
+# vocabulary. The runner always runs the suite whole.
+MC_LIB="$REPO_ROOT/scripts/lib/mutation-control.sh"
+# shellcheck source=/dev/null
+. "$MC_LIB" || { echo "FATAL: cannot source $MC_LIB (resolved from HERE=$HERE), so this suite's sections and discharge cannot run"; exit 1; }
+mc_ok()  { ok "$*"; }
+mc_bad() { bad "$*"; }
+mc_only_declare classify invariant worktree configdir roster
+mc_only_parse "$@"
 
 # Sandbox root for the whole suite. Named loudly: a mktemp failure here would
 # otherwise surface as $HOME pointing at an empty string, and the suite would
 # then read the REAL ~/.claude.json -- a test that silently measures the
 # operator's machine is worse than no test.
 SANDBOX="$(mktemp -d)" || { echo "FATAL: mktemp -d failed"; exit 1; }
-trap 'rm -rf "$SANDBOX"' EXIT
+# Links come off first, never recursed through: see the helper's make_link.
+trap 'isolation_unlink_all; rm -rf "$SANDBOX"' EXIT
+# Where a staged lone copy's resolver looks first: the discharge stages every
+# copy exactly three directories below $SANDBOX, so its rungs 1 and 2 land
+# here. The helper's STAGED COPIES says what landed outside before.
+make_link "$SANDBOX/scripts" "$REPO_ROOT/scripts"
+
+# THE PINNED ENVIRONMENT -- with the five variables each invocation sets for
+# itself (its $PWD, after the cd into its directory; home, user profile,
+# Claude config dir, workspace root) and inv_run's four floor-gate knobs
+# (COORD_REVIVE_LOAD_RATIO, COORD_REVIVE_BUILD_PROCS,
+# COORD_REVIVE_HEALTH_SLOW_MS, COORD_REVIVE_LOADAVG_FILE), the WHOLE
+# environment the subject sees: every run of it is `env -i` with these. Built
+# by the shared helper (the header's ISOLATION says why); its origin sentinel
+# pins the dead port alone here, and no run is exempt from naming one.
+isolation_init "$SANDBOX"
 
 CASE_N=0
 
@@ -118,38 +203,34 @@ run_case() {
   "$setup" "$proj" "$home"
 
   local out
-  out="$(cd "$proj" && HOME="$home" USERPROFILE="$home" CLAUDE_CONFIG_DIR="" \
-        QONTINUI_ROOT="$proj" QONTINUI_RUNNER_URL="http://127.0.0.1:1" \
-        COORD_HTTP_URL="http://127.0.0.1:1" \
-        QONTINUI_WEB_HTTP_URL="http://127.0.0.1:1" \
-        COORD_AGENT_JWT="" COORD_DEVICE_JWT="" \
+  out="$(cd "$proj" && env -i "${PINNED_ENV[@]}" PWD="$PWD" HOME="$home" USERPROFILE="$home" \
+        CLAUDE_CONFIG_DIR="" QONTINUI_ROOT="$proj" \
         bash "$SCRIPT" 2>&1)"
 
-  local ok=1
-  case "$out" in *"$expect"*) ;; *) ok=0 ;; esac
+  local matched=1
+  case "$out" in *"$expect"*) ;; *) matched=0 ;; esac
   if [ "$reject" != "-" ]; then
-    case "$out" in *"$reject"*) ok=0 ;; esac
+    case "$out" in *"$reject"*) matched=0 ;; esac
   fi
 
-  if [ "$ok" = "1" ]; then
-    PASS=$((PASS + 1))
-    echo "  ok   $name"
+  if [ "$matched" = "1" ]; then
+    ok "$name"
   else
-    FAIL=$((FAIL + 1))
-    FAILED_CASES+=("$name")
-    echo "  FAIL $name"
+    bad "$name"
     echo "       expected to contain: $expect"
     [ "$reject" = "-" ] || echo "       expected NOT to contain: $reject"
     echo "       ---- APPROVAL lines actually emitted ----"
     printf '%s\n' "$out" | grep "APPROVAL:" | sed 's/^/       /'
     echo "       ----------------------------------------"
   fi
+  check_origins "$name" "$out"
 }
 
 decl_coord() { printf '%s' '{"mcpServers":{"coord-mcp":{}}}' > "$1/.mcp.json"; }
 
 echo "coord-revive APPROVAL half:"
 
+if mc_sec classify; then
 # --- 1. REJECTED, and it outranks an approval sitting beside it ---------------
 # disabledMcpjsonServers "still rejects the server, even in an untrusted folder"
 # and in every permission mode, so it is the one reading here that is decisive on
@@ -316,6 +397,9 @@ setup_badjson() {
 run_case "unparseable settings report a parse failure, not an absent approval" \
   "project-shared %PROJ%/.claude/settings.json: does not parse as JSON" "-" setup_badjson
 
+fi
+
+if mc_sec invariant; then
 # --- 9. THE VERDICT INVARIANT -------------------------------------------------
 # Two runs differing ONLY in the approval fixture must produce the same VERDICT
 # line and the same exit code. This is the property that makes the block safe to
@@ -357,18 +441,17 @@ decl_coord "$inv_dir/proj"
 # seam, and a census that FAILS (pgrep >= 2, tasklist error) still blocks FLOOR,
 # so a failure in only one run could still flip the exit. That residual is left
 # open deliberately -- it is a read failure, which the gate is right to report.
-inv_run() {  # <outfile> -> prints "<exit> <verdict line>", full output to <outfile>
+# Its stderr is kept apart, in <outfile>.err: the verdict comparison reads
+# stdout alone, and the origin sentinel below reads both streams.
+inv_run() {  # <outfile> -> prints "<exit> <verdict line>", stdout to <outfile>, stderr to <outfile>.err
   local o rc
-  o="$(cd "$inv_dir/proj" && HOME="$inv_dir/home" USERPROFILE="$inv_dir/home" \
-       CLAUDE_CONFIG_DIR="" \
-       QONTINUI_ROOT="$inv_dir/proj" QONTINUI_RUNNER_URL="http://127.0.0.1:1" \
-       COORD_HTTP_URL="http://127.0.0.1:1" \
-       QONTINUI_WEB_HTTP_URL="http://127.0.0.1:1" \
-       COORD_AGENT_JWT="" COORD_DEVICE_JWT="" \
+  o="$(cd "$inv_dir/proj" && env -i "${PINNED_ENV[@]}" PWD="$PWD" \
+       HOME="$inv_dir/home" USERPROFILE="$inv_dir/home" \
+       CLAUDE_CONFIG_DIR="" QONTINUI_ROOT="$inv_dir/proj" \
        COORD_REVIVE_LOAD_RATIO=1000000 COORD_REVIVE_BUILD_PROCS=1000000 \
        COORD_REVIVE_HEALTH_SLOW_MS=1000000000 \
        COORD_REVIVE_LOADAVG_FILE="$inv_dir/loadavg" \
-       bash "$SCRIPT" 2>/dev/null)"
+       bash "$SCRIPT" 2>"$1.err")"
   rc=$?
   printf '%s\n' "$o" > "$1"
   printf '%s %s' "$rc" "$(printf '%s\n' "$o" | grep -m1 '^VERDICT:')"
@@ -378,6 +461,12 @@ inv_run() {  # <outfile> -> prints "<exit> <verdict line>", full output to <outf
 inv_b="$(inv_run "$inv_dir/bare.out")"
 printf '%s' '{"enabledMcpjsonServers":["coord-mcp"]}' > "$inv_dir/proj/.claude/settings.json"
 inv_a="$(inv_run "$inv_dir/approved.out")"
+# The origin sentinel over both runs and both streams, here rather than inside
+# inv_run: that runs in a command substitution, where its count would be lost.
+check_origins "verdict invariant, bare run" \
+  "$(cat "$inv_dir/bare.out" 2>/dev/null)" "$(cat "$inv_dir/bare.out.err" 2>/dev/null)"
+check_origins "verdict invariant, approved run" \
+  "$(cat "$inv_dir/approved.out" 2>/dev/null)" "$(cat "$inv_dir/approved.out.err" 2>/dev/null)"
 # THE WITNESS. Running one directory twice buys a clean comparison and costs the
 # proof that the fixture did anything: if the settings write silently failed,
 # both runs would be byte-identical and "the verdict did not move" would be
@@ -406,6 +495,9 @@ else
   [ "$inv_tok_a" = "$inv_tok_b" ] && echo "       (identical summaries -- the fixture did not take effect, so the comparison proved nothing)"
 fi
 
+fi
+
+if mc_sec worktree; then
 # --- 10. The trust key is the MAIN CHECKOUT's root, from a linked worktree ----
 # The documented rule is that trust keys on the git repository root, and "in a
 # worktree, it uses the main checkout's root". Reading the worktree's own path
@@ -413,15 +505,41 @@ fi
 # a repository whose trust was granted long ago -- so this builds a real repo and
 # a real linked worktree rather than asserting the intent in prose.
 echo "  -- worktree trust anchor --"
+# The fixture's git runs in the suite's own environment, not the subject's
+# pinned one, so an exported GIT_DIR -- or GIT_WORK_TREE, GIT_INDEX_FILE,
+# GIT_COMMON_DIR, GIT_OBJECT_DIRECTORY, GIT_ALTERNATE_OBJECT_DIRECTORIES --
+# would aim every command below at the CALLER's repository. Measured without
+# this guard, with GIT_DIR naming a scratch repository: this case committed,
+# branched, added a worktree and set config there, and every assertion still
+# passed. So the fixture drops every exported GIT_* variable (one rule rather
+# than a list that can drift) and reads neither the global nor the system
+# config, through which a caller's core.hooksPath would run its hooks on the
+# fixture's commit and a signing setting could fail that commit into the SKIP
+# below; `git init --template=` copies no template hooks either. Call it in a
+# subshell: it edits the environment of the shell that runs it.
+fixture_git_env() {
+  local v
+  for v in $(compgen -e); do
+    case "$v" in GIT_*) unset "$v" ;; esac
+  done
+  export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+  # GIT_CONFIG_GLOBAL needs git 2.32, and fleet Linux boxes carry older git
+  # (coord-revive.sh records 2.25), which reads the global config from $HOME
+  # and $XDG_CONFIG_HOME instead. Both point at an empty directory of the
+  # fixture's own.
+  mkdir -p "$wt_root/git-home"
+  export HOME="$wt_root/git-home" XDG_CONFIG_HOME="$wt_root/git-home/.config"
+}
 wt_root="$SANDBOX/wt"
 wt_home="$wt_root/home"
 mkdir -p "$wt_home"
 wt_ok=1
 (
   set -e
+  fixture_git_env
   mkdir -p "$wt_root/main"
   cd "$wt_root/main"
-  git init -q .
+  git init -q --template= .
   git config user.email t@example.invalid
   git config user.name t
   git commit -q --allow-empty -m init
@@ -433,7 +551,15 @@ wt_ok=1
   # branch below and quietly retire this case's coverage, which is the outcome
   # the skip branch exists to make visible rather than to cause.
   git worktree add -q -b probe "$wt_root/linked"
-) >/dev/null 2>&1 || wt_ok=0
+) >/dev/null 2>&1
+# The status is read on its own line rather than by `|| wt_ok=0` on the
+# subshell: bash switches set -e off inside any command whose status is
+# tested, so a failing step there ran on and the subshell reported only its
+# last command. Read this way set -e is live, and the first failing step --
+# a commit a signing setting refused, say -- is the status. A tested
+# `if ( ... )` would switch it off the same way.
+# shellcheck disable=SC2181
+[ $? -eq 0 ] || wt_ok=0
 
 if [ "$wt_ok" = "0" ] || [ ! -d "$wt_root/linked" ]; then
   # A git that cannot build a worktree here is a LOCAL limitation. Say so; do not
@@ -450,24 +576,24 @@ else
   # Derive it through the same command the script uses. (Production is
   # unaffected: the real ~/.claude.json already stores forward-slash drive
   # paths, the same form git emits.)
-  wt_key="$(cd "$wt_root/main" && dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
+  wt_key="$(fixture_git_env; cd "$wt_root/main" && dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
   # main checkout trusted; the worktree path deliberately is NOT.
   printf '{"projects":{"%s":{"hasTrustDialogAccepted":true}}}' "$wt_key" > "$wt_home/.claude.json"
   # The worktree needs the declaration too -- $PWD/.mcp.json is read from the cwd.
   printf '%s' '{"mcpServers":{"coord-mcp":{}}}' > "$wt_root/linked/.mcp.json"
-  # $COORD_HTTP_URL is pinned here too. Every run_case case sets it and this one
-  # did not, which contradicted the header's own belt-AND-braces rule -- the rule
-  # exists precisely because the belt ($QONTINUI_RUNNER_URL) silently broke once.
-  # Nothing reached production through the gap (the static credentials are empty
-  # and the mint's origin is a dead port, so L3/L4 had nothing to send), but
-  # "currently sufficient" is the reasoning the header rejects.
-  wt_out="$(cd "$wt_root/linked" && HOME="$wt_home" USERPROFILE="$wt_home" \
-            CLAUDE_CONFIG_DIR="" \
-            QONTINUI_ROOT="$wt_root" QONTINUI_RUNNER_URL="http://127.0.0.1:1" \
-            COORD_HTTP_URL="http://127.0.0.1:1" \
-            QONTINUI_WEB_HTTP_URL="http://127.0.0.1:1" \
-            COORD_AGENT_JWT="" COORD_DEVICE_JWT="" \
+  # This run gets $COORD_HTTP_URL from PINNED_ENV like every other. When each
+  # invocation still listed its own pins, this one once left it out, which
+  # contradicted the header's own belt-AND-braces rule -- the rule exists
+  # precisely because the belt ($QONTINUI_RUNNER_URL) silently broke once.
+  # Nothing reached production through that gap (the static credentials were
+  # empty and the mint's origin a dead port, so L3/L4 had nothing to send), but
+  # "currently sufficient" is the reasoning the header rejects, and one shared
+  # list is what stops a new invocation repeating it.
+  wt_out="$(cd "$wt_root/linked" && env -i "${PINNED_ENV[@]}" PWD="$PWD" \
+            HOME="$wt_home" USERPROFILE="$wt_home" \
+            CLAUDE_CONFIG_DIR="" QONTINUI_ROOT="$wt_root" \
             bash "$SCRIPT" 2>&1)"
+  check_origins "linked worktree" "$wt_out"
   # $wt_key, NOT $wt_root/main. The comment above worked out that git and mktemp
   # spell this directory differently and then fixed only the FIXTURE; both
   # assertions kept the mktemp spelling and so failed on Windows against a script
@@ -499,9 +625,12 @@ else
   # the main checkout would report `enabledMcpjsonServers=named` instead.
   #
   # $wt_root SPELLING, not $wt_key's, and the difference is not an oversight:
-  # this path comes from $PWD, and $PWD is whatever spelling the `cd` above used
-  # -- the mktemp POSIX one. Only the TRUST key travels through git and so wears
-  # git's native spelling. Two anchors, two spellings, from the same fixture.
+  # this path comes from the subject's $PWD, which the run above passes on
+  # after its `cd`, so it wears that cd's spelling -- the mktemp POSIX one, a
+  # symlink in $TMPDIR included. (Under env -i alone the subject's bash would
+  # spell it the physical way instead.) Only the TRUST key travels through git
+  # and so wears git's native spelling. Two anchors, two spellings, from the
+  # same fixture.
   if printf '%s' "$wt_out" | grep -q "APPROVAL: project-shared $wt_root/linked/.claude/settings.json: absent or unreadable"; then
     PASS=$((PASS + 1)); echo "  ok   the settings layers are read at \$PWD (the worktree), NOT at the trust anchor"
   else
@@ -512,6 +641,9 @@ else
   fi
 fi
 
+fi
+
+if mc_sec configdir; then
 # --- 12. $CLAUDE_CONFIG_DIR RELOCATES BOTH USER-LEVEL FILES -------------------
 # The fixture puts the ONLY approval, and the ONLY trust entry, inside a config
 # dir that is not derived from $HOME -- and leaves $HOME empty. So the approval
@@ -537,16 +669,15 @@ decl_coord "$cfg_proj"
 printf '%s' '{"enabledMcpjsonServers":["coord-mcp"]}' > "$cfg_cfg/settings.json"
 printf '{"projects":{"%s":{"hasTrustDialogAccepted":true}}}' "$cfg_proj" > "$cfg_cfg/.claude.json"
 cfg_run() {  # <claude-config-dir value>
-  (cd "$cfg_proj" && HOME="$cfg_home" USERPROFILE="$cfg_home" \
-     CLAUDE_CONFIG_DIR="$1" \
-     QONTINUI_ROOT="$cfg_proj" QONTINUI_RUNNER_URL="http://127.0.0.1:1" \
-     COORD_HTTP_URL="http://127.0.0.1:1" \
-     QONTINUI_WEB_HTTP_URL="http://127.0.0.1:1" \
-     COORD_AGENT_JWT="" COORD_DEVICE_JWT="" \
+  (cd "$cfg_proj" && env -i "${PINNED_ENV[@]}" PWD="$PWD" \
+     HOME="$cfg_home" USERPROFILE="$cfg_home" \
+     CLAUDE_CONFIG_DIR="$1" QONTINUI_ROOT="$cfg_proj" \
      bash "$SCRIPT" 2>&1)
 }
 cfg_on="$(cfg_run "$cfg_cfg")"
 cfg_off="$(cfg_run "")"
+check_origins "CLAUDE_CONFIG_DIR set" "$cfg_on"
+check_origins "CLAUDE_CONFIG_DIR empty" "$cfg_off"
 cfg_want_settings="APPROVAL: user $cfg_cfg/settings.json: enabledMcpjsonServers=named"
 cfg_want_store="APPROVAL: user-store $cfg_cfg/.claude.json"
 if printf '%s' "$cfg_on" | grep -q "$cfg_want_settings" \
@@ -570,6 +701,9 @@ else
   printf '%s\n' "$cfg_off" | grep -E "APPROVAL: (user|APPROVAL_|APPROVED_|NO_APPROVAL)" | sed 's/^/       /'
 fi
 
+fi
+
+if mc_sec roster; then
 # --- 11. THE DOCUMENTED ROSTER IS THE ONE THE SCRIPT CAN EMIT -----------------
 # The cases above prove each token is REACHABLE. This proves the set is
 # DOCUMENTED -- a different property, and the one that had already broken.
@@ -616,16 +750,19 @@ else
   # `APPROVAL_VERDICT="` with the quote pinned: the guard in
   # approval_verdict_block reads ${APPROVAL_VERDICT:-} and the final note passes
   # "$APPROVAL_VERDICT", neither of which is an assignment of a literal token.
-  ROSTER_EMITTED="$(grep -oE 'APPROVAL_VERDICT="[A-Z_]+' "$SCRIPT" | sed 's/.*"//' | sort -u)"
-  ROSTER_DOCUMENTED="$(sed -n '/APPROVAL-SUMMARY-ROSTER: begin/,/APPROVAL-SUMMARY-ROSTER: end/p' "$SKILL_MD" \
-                       | grep -oE '^\| `[A-Z_]+`' | tr -d '|` ' | sort -u)"
+  # Every stage in the C locale. Under tr_TR.UTF-8, GNU grep's [A-Z] does not
+  # match I, so this check reported DECLARAT and NOT_APPL as undocumented
+  # about a table that agrees with the script -- measured, and present at base.
+  ROSTER_EMITTED="$(LC_ALL=C grep -oE 'APPROVAL_VERDICT="[A-Z_]+' "$SCRIPT" | LC_ALL=C sed 's/.*"//' | LC_ALL=C sort -u)"
+  ROSTER_DOCUMENTED="$(LC_ALL=C sed -n '/APPROVAL-SUMMARY-ROSTER: begin/,/APPROVAL-SUMMARY-ROSTER: end/p' "$SKILL_MD" \
+                       | LC_ALL=C grep -oE '^\| `[A-Z_]+`' | LC_ALL=C tr -d '|` ' | LC_ALL=C sort -u)"
   if [ -z "$ROSTER_EMITTED" ]; then
     roster_fail "no APPROVAL_VERDICT assignments matched in coord-revive.sh - the SCRIPT-side extractor went blind, so this check proves nothing"
   elif [ -z "$ROSTER_DOCUMENTED" ]; then
     roster_fail "no token rows found between the APPROVAL-SUMMARY-ROSTER markers in SKILL.md - the markers are missing, moved, or the table's row shape changed"
   else
-    ROSTER_UNDOC="$(comm -23 <(printf '%s\n' "$ROSTER_EMITTED") <(printf '%s\n' "$ROSTER_DOCUMENTED"))"
-    ROSTER_ORPHAN="$(comm -13 <(printf '%s\n' "$ROSTER_EMITTED") <(printf '%s\n' "$ROSTER_DOCUMENTED"))"
+    ROSTER_UNDOC="$(LC_ALL=C comm -23 <(printf '%s\n' "$ROSTER_EMITTED") <(printf '%s\n' "$ROSTER_DOCUMENTED"))"
+    ROSTER_ORPHAN="$(LC_ALL=C comm -13 <(printf '%s\n' "$ROSTER_EMITTED") <(printf '%s\n' "$ROSTER_DOCUMENTED"))"
     if [ -z "$ROSTER_UNDOC" ] && [ -z "$ROSTER_ORPHAN" ]; then
       PASS=$((PASS + 1))
       echo "  ok   all $(printf '%s\n' "$ROSTER_EMITTED" | wc -l | tr -d ' ') summary tokens are documented, and no row names a token the script cannot emit"
@@ -635,6 +772,31 @@ else
       [ -z "$ROSTER_ORPHAN" ] || { echo "       documented but NOT emitted:"; printf '%s\n' "$ROSTER_ORPHAN" | sed 's/^/         /'; }
     fi
   fi
+fi
+
+fi
+
+# --- the discharge: the origin sentinel is shown able to fail --------------
+# Only a whole, unmutated run drives it (mc_graded): a re-run never recurses,
+# and a narrowed run has not run the cases a trailer would describe.
+if mc_graded; then
+    echo "  -- discharge --"
+    # Staged under $SANDBOX/stage, so the mutant is
+    # $SANDBOX/stage/mutation-control/m1/coord-revive.sh: three directories
+    # below $SANDBOX, where its resolver's first two rungs find $SANDBOX/scripts.
+    mc_init ".claude/skills/coord-revive/approval-half-test.sh" "$SANDBOX/stage"
+    # Both re-runs are narrowed to the configdir section: two subject runs,
+    # both read by the sentinel, and no git fixture that could SKIP. The
+    # staging control -- an unmutated copy in the mutant's own layout, which
+    # must run green there, and its rung-1 check -- lives in the shared helper.
+    isolation_staging_control "$SCRIPT" "$REPO_ROOT" -- bash "$0" --only configdir
+    # The mutation floor-claim-test.sh drives too. L6 is re-pointed at ANOTHER
+    # loopback address rather than back at its remote default, so the re-run
+    # that must redden sends nothing off the box either.
+    mc_expect_red "L6 ignores its override, so the web host is not the pinned dead port" \
+      "$SCRIPT" 's|^WEB_URL="\${QONTINUI_WEB_HTTP_URL:-https://api.qontinui.io}"$|WEB_URL="http://127.0.0.2:1"|' \
+      -- bash "$0" --only configdir
+    mc_trailer "$((PASS + FAIL))"
 fi
 
 echo

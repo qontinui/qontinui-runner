@@ -43,7 +43,7 @@
 //! | resolved | absent for this class, but the agent carries a DISABLE under another class | any | that disable governs — the class default never weakens it (`registry-row-disabled-other-class-floor`; see [`lookup_row`]) |
 //! | resolved | absent, no disable anywhere | `standing_continuation` | `Deny` (default-OFF; needs an explicit opt-in row) |
 //! | resolved | absent, no disable anywhere | other | `Allow` (legacy default, logged) |
-//! | unresolvable, snapshot held and younger than [`MAX_SNAPSHOT_AGE`] | — | — | decided from the stale snapshot, flagged with its age |
+//! | unresolvable, snapshot held and younger than [`max_snapshot_age`] | — | — | decided from the stale snapshot, flagged with its age |
 //! | unresolvable, no usable snapshot | — | `standing_continuation` | `Deny` — a standing opt-in is never presumed |
 //! | unresolvable, no usable snapshot | `policy_required` (cold-start floor) | non-standing | `DegradeToInline` — never silently skip a required gate |
 //! | unresolvable, no usable snapshot | optional | non-standing | `Allow` — a coord outage must not break the fleet |
@@ -59,7 +59,7 @@
 //! * **Stale beats cold, but not forever.** The last-known-good snapshot
 //!   outlives its freshness — that is what keeps a coord outage from tripping
 //!   the `standing_continuation` default-OFF rule on a fleet that has already
-//!   resolved the registry once. But it is capped at [`MAX_SNAPSHOT_AGE`]:
+//!   resolved the registry once. But it is capped at [`max_snapshot_age`]:
 //!   past that, a revoked credential or a permanently unreachable coord would
 //!   otherwise let a day-old snapshot override a preference the user has since
 //!   changed. Beyond the cap the cold matrix applies.
@@ -198,7 +198,15 @@ pub const REGISTRY_CACHE_TTL: Duration = Duration::from_secs(90);
 /// cap, a permanently-failing resolve (revoked device JWT, coord decommissioned)
 /// would honour a snapshot from days ago forever — silently ignoring a
 /// preference the user changed in the meantime.
-const MAX_SNAPSHOT_AGE: Duration = Duration::from_secs(12 * 60 * 60);
+///
+/// Read from the spawn-authorization contract (`max_snapshot_age_secs` in
+/// `qontinui-schemas` `rust/src/spawn_authorization.json`), not declared here:
+/// coord's registry fallback applies the same bound to the same switches, and
+/// two literals could drift apart with no test going red. The contract's
+/// `validate()` refuses a zero bound, so this is always positive.
+fn max_snapshot_age() -> Duration {
+    Duration::from_secs(qontinui_types::spawn_authorization::contract().max_snapshot_age_secs)
+}
 
 /// After a failed resolve, how long before another spawn re-attempts the HTTP
 /// call. Without this, every spawn during a coord outage would pay the full
@@ -434,10 +442,25 @@ pub fn decide_drain(
     state: &crate::coord_drain_state::CoordDrainState,
     admission: &DrainAdmission,
 ) -> Option<SpawnDecision> {
+    decide_drain_with_role(
+        state,
+        crate::coord_drain_state::RoleReading::Known(None),
+        admission,
+    )
+}
+
+/// PURE: [`decide_drain`] with the device's dispatch role, which defers an
+/// autonomous admission on its own when it closes the agent lane
+/// (`coord_drain_state::role_gate`).
+pub fn decide_drain_with_role(
+    state: &crate::coord_drain_state::CoordDrainState,
+    role: impl Into<crate::coord_drain_state::RoleReading>,
+    admission: &DrainAdmission,
+) -> Option<SpawnDecision> {
     let DrainAdmission::Origin { origin, .. } = admission else {
         return None;
     };
-    match crate::coord_drain_state::gate_for(state, *origin) {
+    match crate::coord_drain_state::gate_with_role_at(state, role, *origin, chrono::Utc::now()) {
         crate::coord_drain_state::DrainGate::Allow => None,
         crate::coord_drain_state::DrainGate::Defer { reason, class } => {
             Some(SpawnDecision::DeferredByDrain { reason, class })
@@ -460,7 +483,10 @@ fn drain_admission(
         );
         return None;
     }
-    let decision = decide_drain(&crate::coord_drain_state::current(), admission)?;
+    // State and role under one lock, so a fold between two reads cannot pair
+    // them into an answer neither reading gives.
+    let (state, role) = crate::coord_drain_state::current_with_role();
+    let decision = decide_drain_with_role(&state, role, admission)?;
     if let DrainAdmission::Origin { origin, work_key } = admission {
         let key = work_key
             .clone()
@@ -916,7 +942,7 @@ pub(crate) fn decide(
     }
 }
 
-/// No usable snapshot (never resolved, or aged past [`MAX_SNAPSHOT_AGE`]).
+/// No usable snapshot (never resolved, or aged past [`max_snapshot_age`]).
 fn decide_unresolved(error: &str, agent_name: Option<&str>, path: SpawnPath) -> Verdict {
     let who = describe(agent_name, path);
     if path.outlives_request() {
@@ -1159,7 +1185,7 @@ struct CacheInner {
     /// backoff so an outage does not make every spawn pay the HTTP timeout.
     attempted_at: Option<Instant>,
     /// Last known good — freshness expires first, then the snapshot itself at
-    /// [`MAX_SNAPSHOT_AGE`].
+    /// [`max_snapshot_age`].
     agents: Option<Arc<Vec<RegistryAgent>>>,
     last_error: Option<String>,
     posture: Posture,
@@ -1173,13 +1199,17 @@ impl CacheInner {
         self.fetched_at.map(|t| now.saturating_duration_since(t))
     }
 
-    /// Drop a snapshot that has aged past [`MAX_SNAPSHOT_AGE`].
+    /// Drop a snapshot that has aged past [`max_snapshot_age`].
     fn expire_snapshot(&mut self, now: Instant) {
-        if self.agents.is_some() && self.snapshot_age(now).is_some_and(|a| a > MAX_SNAPSHOT_AGE) {
+        if self.agents.is_none() {
+            return;
+        }
+        let ceiling = max_snapshot_age();
+        if self.snapshot_age(now).is_some_and(|a| a > ceiling) {
             warn!(
                 "agent registry: dropping last-known-good snapshot older than {}s — \
                  falling back to the cold fail-safe matrix",
-                MAX_SNAPSHOT_AGE.as_secs()
+                ceiling.as_secs()
             );
             self.agents = None;
             self.fetched_at = None;
@@ -3008,7 +3038,32 @@ mod tests {
         assert_eq!(cache.attempts().await, 3);
     }
 
-    /// A snapshot older than [`MAX_SNAPSHOT_AGE`] is dropped: a permanently
+    /// The ceiling is read from the embedded spawn-authorization contract,
+    /// whose `contract()` panics on a contract that fails to parse or
+    /// validate. This runs that read in the runner's own suite, so a broken
+    /// contract in the compiled `qontinui-types` fails here rather than on the
+    /// first spawn after a registry resolve. The upper bound catches a runaway
+    /// value that would make a snapshot effectively immortal.
+    #[test]
+    fn snapshot_ceiling_comes_from_a_valid_contract() {
+        let ceiling = max_snapshot_age();
+        assert_eq!(
+            ceiling,
+            Duration::from_secs(
+                qontinui_types::spawn_authorization::contract().max_snapshot_age_secs
+            )
+        );
+        assert!(
+            ceiling > REGISTRY_CACHE_TTL,
+            "the ceiling must outlive freshness"
+        );
+        assert!(
+            ceiling <= Duration::from_secs(7 * 24 * 60 * 60),
+            "a ceiling past a week would let a stale snapshot outlive any user change"
+        );
+    }
+
+    /// A snapshot older than [`max_snapshot_age`] is dropped: a permanently
     /// failing resolve must not honour day-old preferences forever.
     #[tokio::test]
     async fn last_known_good_expires_at_the_ceiling() {
@@ -3022,7 +3077,7 @@ mod tests {
 
         // Just inside the ceiling: still stale-usable.
         let r = cache
-            .resolve_at(t0 + MAX_SNAPSHOT_AGE, || async {
+            .resolve_at(t0 + max_snapshot_age(), || async {
                 Fetched::Err("coord 503".into())
             })
             .await;
@@ -3031,7 +3086,7 @@ mod tests {
         // Past it: the snapshot is dropped and the cold matrix applies, which
         // for a standing spawn means deny.
         let r = cache
-            .resolve_at(t0 + MAX_SNAPSHOT_AGE + Duration::from_secs(1), || async {
+            .resolve_at(t0 + max_snapshot_age() + Duration::from_secs(1), || async {
                 Fetched::Err("coord 503".into())
             })
             .await;
@@ -3066,7 +3121,7 @@ mod tests {
     /// asserting the feature does not exist. A 404 now carries no such meaning,
     /// and "stale beats cold" is the right default for every other failure —
     /// it keeps a recorded user preference in force across a coord blip instead
-    /// of reverting to class defaults. [`MAX_SNAPSHOT_AGE`] still bounds it.
+    /// of reverting to class defaults. [`max_snapshot_age`] still bounds it.
     #[tokio::test]
     async fn a_404_is_an_ordinary_error_and_keeps_the_snapshot() {
         let ttl = Duration::from_secs(90);
@@ -3105,7 +3160,7 @@ mod tests {
         // Past the ceiling the snapshot expires and the cold matrix applies —
         // still a deny for a standing spawn, never an allow-all.
         let r = cache
-            .resolve_at(t0 + MAX_SNAPSHOT_AGE + Duration::from_secs(1), || async {
+            .resolve_at(t0 + max_snapshot_age() + Duration::from_secs(1), || async {
                 Fetched::Err("coord returned 404 Not Found".into())
             })
             .await;
@@ -3777,5 +3832,382 @@ mod drain_tests {
         let drained = decide_drain(&drained(), &SpawnOrigin::Steward.into()).unwrap();
         assert!(drained.refusal().unwrap().starts_with("device_drained: "));
         assert_eq!(SpawnDecision::Allow.drain_class(), None);
+    }
+
+    /// The spawn authorization honours a dispatch role that closes the agent
+    /// lane even while the drain is clear; the operator still passes.
+    #[test]
+    fn a_closing_dispatch_role_defers_autonomous_admissions_with_the_drain_clear() {
+        use crate::coord_drain_state::{DeferClass, DispatchRole};
+        let ci = Some(DispatchRole::CiNode);
+        let d = decide_drain_with_role(&CoordDrainState::Clear, ci, &SpawnOrigin::Steward.into())
+            .expect("deferred by the role");
+        assert_eq!(d.drain_class(), Some(DeferClass::RoleClosed));
+        assert!(d.refusal().unwrap().starts_with("role_closes_agent_lane: "));
+        assert_eq!(
+            decide_drain_with_role(
+                &CoordDrainState::Clear,
+                ci,
+                &SpawnOrigin::OperatorTerminal.into()
+            ),
+            None
+        );
+        // No role (or an open one): exactly decide_drain.
+        for role in [None, Some(DispatchRole::Workhorse)] {
+            assert_eq!(
+                decide_drain_with_role(&CoordDrainState::Clear, role, &SpawnOrigin::Steward.into()),
+                None
+            );
+        }
+    }
+
+    /// The live spawn-authorization door (`drain_admission`, which reads the
+    /// cached role) defers an autonomous admission on a ci_node and passes the
+    /// operator's. Fails if the door stops reading the cached role.
+    #[tokio::test]
+    async fn drain_admission_reads_the_cached_ci_node_role_live() {
+        use crate::coord_drain_state::{
+            note_heartbeat, parse_register_response, parse_register_role, DeferClass,
+            HeartbeatOutcome, GLOBAL_TEST_LOCK,
+        };
+        let _g = GLOBAL_TEST_LOCK.lock().await;
+        // Restore the boot state on exit, even on panic: the tokio mutex does
+        // not poison, so a failed assertion would otherwise leave `ci_node`
+        // cached for the next test.
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::coord_drain_state::reset_global_for_test();
+            }
+        }
+        crate::coord_drain_state::reset_global_for_test();
+        let _restore = Restore;
+        let body = r#"{"drain":{"state":"clear","dispatch_role":"ci_node"}}"#;
+        note_heartbeat(HeartbeatOutcome::Registered {
+            drain: parse_register_response(body),
+            dispatch_role: parse_register_role(body),
+        })
+        .await;
+        for o in [
+            SpawnOrigin::BootResume,
+            SpawnOrigin::Steward,
+            SpawnOrigin::LoopingAgent,
+            SpawnOrigin::Scheduler,
+        ] {
+            let d = drain_admission(Some("a"), SpawnPath::InSessionSubagent, &o.into())
+                .unwrap_or_else(|| panic!("{o:?} was not deferred on a ci_node"));
+            assert_eq!(d.drain_class(), Some(DeferClass::RoleClosed), "{o:?}");
+            assert!(d.refusal().unwrap().starts_with("role_closes_agent_lane: "));
+        }
+        assert_eq!(
+            drain_admission(
+                Some("a"),
+                SpawnPath::InSessionSubagent,
+                &SpawnOrigin::OperatorTerminal.into()
+            ),
+            None
+        );
+    }
+
+    /// The SEAM, not the pure gate: a `ci_node` / `bench` role served on the
+    /// real heartbeat wire must reach the LIVE doors every runner-local spawn
+    /// site goes through — `coord_drain_state::drain_gate` (and so
+    /// `drain_gate_for_work` / `wait_until_allowed` / `held_until_allowed`),
+    /// `autonomous_spawns_allowed_now` (the replay edges), and this module's
+    /// `drain_admission` (the half of `authorize_spawn` that gate
+    /// continuations, the scheduler, looping agents and stewards pass). The
+    /// pure tests above pin `gate_with_role_at`; none of them reddens if a
+    /// live door stops reading the cached role, or if the heartbeat stops
+    /// caching it. This one does.
+    ///
+    /// It folds into the process-global cache, so it restores the boot state
+    /// on exit (even on panic). While it runs every autonomous origin is still
+    /// DEFERRED — `RoleClosed` instead of the boot `Unknown` — so a concurrent
+    /// test never sees a more permissive gate than it would have anyway.
+    #[tokio::test]
+    async fn a_heartbeat_served_closing_role_reaches_every_live_spawn_door() {
+        use crate::coord_drain_state::{
+            autonomous_spawns_allowed_now, current, current_dispatch_role, drain_gate,
+            note_heartbeat, parse_register_response, parse_register_role, reset_global_for_test,
+            DeferClass, DispatchRole, DrainGate, HeartbeatOutcome, RoleReading, GLOBAL_TEST_LOCK,
+        };
+        let _g = GLOBAL_TEST_LOCK.lock().await;
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                reset_global_for_test();
+            }
+        }
+        let _restore = Restore;
+
+        for (wire, role) in [
+            ("ci_node", DispatchRole::CiNode),
+            ("bench", DispatchRole::Bench),
+        ] {
+            // The register response shape coord serves (the role inside the
+            // `drain` object, the drain itself clear), parsed the way
+            // `fleet::heartbeat_to_coord` parses it.
+            let body = format!(r#"{{"drain":{{"state":"clear","dispatch_role":"{wire}"}}}}"#);
+            note_heartbeat(HeartbeatOutcome::Registered {
+                drain: parse_register_response(&body),
+                dispatch_role: parse_register_role(&body),
+            })
+            .await;
+
+            assert_eq!(
+                current(),
+                CoordDrainState::Clear,
+                "{wire}: the drain stays clear"
+            );
+            assert_eq!(
+                current_dispatch_role(),
+                RoleReading::Known(Some(role)),
+                "{wire}: the heartbeat cached it"
+            );
+            assert!(
+                !autonomous_spawns_allowed_now(),
+                "{wire}: replay edges stay shut"
+            );
+
+            for origin in SpawnOrigin::ALL {
+                let gate = drain_gate(origin);
+                let admission = drain_admission(
+                    Some("dispatch-role-seam-test"),
+                    SpawnPath::StandingContinuation,
+                    &origin.into(),
+                );
+                if origin.is_autonomous() {
+                    match gate {
+                        DrainGate::Defer { class, .. } => {
+                            assert_eq!(class, DeferClass::RoleClosed, "{wire} drain_gate {origin}")
+                        }
+                        DrainGate::Allow => panic!("{wire}: drain_gate let {origin} spawn"),
+                    }
+                    let d = admission
+                        .unwrap_or_else(|| panic!("{wire}: authorize_spawn let {origin} spawn"));
+                    assert_eq!(
+                        d.drain_class(),
+                        Some(DeferClass::RoleClosed),
+                        "{wire} {origin}"
+                    );
+                    assert!(
+                        d.refusal().unwrap().starts_with("role_closes_agent_lane: "),
+                        "{wire} {origin}"
+                    );
+                } else {
+                    assert_eq!(
+                        gate,
+                        DrainGate::Allow,
+                        "{wire}: the operator's {origin} passes"
+                    );
+                    assert_eq!(admission, None, "{wire}: the operator's {origin} passes");
+                }
+            }
+        }
+    }
+
+    /// Every live spawn door — `drain_gate` and `drain_admission` — defers
+    /// every autonomous origin with `class`, and passes both operator origins.
+    fn assert_every_live_door_defers(class: crate::coord_drain_state::DeferClass, what: &str) {
+        use crate::coord_drain_state::{autonomous_spawns_allowed_now, drain_gate, DrainGate};
+        assert!(
+            !autonomous_spawns_allowed_now(),
+            "{what}: replay edges stay shut"
+        );
+        for origin in SpawnOrigin::ALL {
+            let gate = drain_gate(origin);
+            let admission = drain_admission(
+                Some("dispatch-role-persist-seam-test"),
+                SpawnPath::StandingContinuation,
+                &origin.into(),
+            );
+            if origin.is_autonomous() {
+                match gate {
+                    DrainGate::Defer { class: got, .. } => {
+                        assert_eq!(got, class, "{what}: drain_gate {origin}")
+                    }
+                    DrainGate::Allow => panic!("{what}: drain_gate let {origin} spawn"),
+                }
+                let d = admission
+                    .unwrap_or_else(|| panic!("{what}: authorize_spawn let {origin} spawn"));
+                assert_eq!(d.drain_class(), Some(class), "{what}: {origin}");
+            } else {
+                assert_eq!(
+                    gate,
+                    DrainGate::Allow,
+                    "{what}: the operator's {origin} passes"
+                );
+                assert_eq!(admission, None, "{what}: the operator's {origin} passes");
+            }
+        }
+    }
+
+    /// The gap #2309 left (its review round 2): the cached role was not
+    /// persisted, so on a `ci_node` box whose FIRST read after a restart omits
+    /// the role — coord's role read failing at that moment while its drain read
+    /// answers `clear` — every autonomous door opened for that read. Now the
+    /// role coord served before the restart is persisted and seeds the cache,
+    /// so that boot keeps the lane closed.
+    ///
+    /// The restart is modelled exactly: `reset_global_for_test` is the boot
+    /// state of a fresh process (no read folded, no role, not seeded), and the
+    /// first read is the real `note_heartbeat` fold of coord's register body.
+    #[tokio::test]
+    async fn boot_with_a_failed_first_role_read_on_a_persisted_ci_node_role_refuses_autonomous_spawns(
+    ) {
+        use crate::coord_drain_state::{
+            autonomous_spawns_allowed_now, current, current_dispatch_role, note_heartbeat,
+            parse_register_response, parse_register_role, reset_global_for_test,
+            set_role_file_for_test, snapshot, write_persisted_role, DeferClass, DispatchRole,
+            HeartbeatOutcome, PersistedRole, RoleReading, GLOBAL_TEST_LOCK,
+        };
+        let _serial = GLOBAL_TEST_LOCK.lock().await;
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::coord_drain_state::set_role_file_for_test(None);
+                crate::coord_drain_state::reset_global_for_test();
+            }
+        }
+        let _restore = Restore;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join(crate::coord_drain_state::ROLE_FILE_NAME);
+
+        for (wire, role) in [
+            ("ci_node", DispatchRole::CiNode),
+            ("bench", DispatchRole::Bench),
+        ] {
+            // The run before the restart: coord served the role, and it was
+            // persisted. Written directly with no device id or coord base: an
+            // unguarded test's ambient reads are DEFLECTED to an empty home, so
+            // neither resolves here — and a closing role seeds without them.
+            let observed = chrono::Utc::now() - chrono::Duration::hours(3);
+            write_persisted_role(&file, &PersistedRole::new(Some(role), None, None, observed))
+                .expect("persist");
+
+            // The restart.
+            set_role_file_for_test(Some(file.clone()));
+            reset_global_for_test();
+
+            // The first read after it: drain readable and clear, role omitted.
+            let body = r#"{"drain":{"state":"clear"}}"#;
+            note_heartbeat(HeartbeatOutcome::Registered {
+                drain: parse_register_response(body),
+                dispatch_role: parse_register_role(body),
+            })
+            .await;
+
+            assert_eq!(
+                current(),
+                CoordDrainState::Clear,
+                "{wire}: the drain is clear"
+            );
+            assert_eq!(
+                current_dispatch_role(),
+                RoleReading::Known(Some(role)),
+                "{wire}: seeded from the persisted reading, kept across the omitted role"
+            );
+            let snap = snapshot();
+            assert_eq!(snap.dispatch_role_source, "persisted", "{wire}");
+            assert_eq!(snap.dispatch_role_observed_at, Some(observed), "{wire}");
+            assert!(snap.agent_lane_closed_by_role, "{wire}");
+            assert_every_live_door_defers(DeferClass::RoleClosed, wire);
+
+            // A "not enrolled" read (the heartbeat reports it only for an
+            // ABSENT machine.json; an unreadable one is NotSent, a miss) lets a
+            // no-coord runner spawn — no role applies to it — but does not
+            // wipe the reading: if the box turns out to be enrolled after all,
+            // the next read that omits the role still finds the lane closed.
+            note_heartbeat(HeartbeatOutcome::NotEnrolled {
+                why: "~/.qontinui/machine.json is missing",
+            })
+            .await;
+            assert!(
+                autonomous_spawns_allowed_now(),
+                "{wire}: a runner that is no coord device is never held by a role"
+            );
+            assert_eq!(snapshot().dispatch_role_source, "not_enrolled", "{wire}");
+            assert_eq!(
+                current_dispatch_role(),
+                RoleReading::Known(Some(role)),
+                "{wire}: the reading is kept"
+            );
+            note_heartbeat(HeartbeatOutcome::Registered {
+                drain: parse_register_response(body),
+                dispatch_role: parse_register_role(body),
+            })
+            .await;
+            assert_eq!(
+                current_dispatch_role(),
+                RoleReading::Known(Some(role)),
+                "{wire}: kept across a not-enrolled tick"
+            );
+            assert_every_live_door_defers(DeferClass::RoleClosed, wire);
+        }
+    }
+
+    /// The other boot: nothing persisted and the first read omits the role.
+    /// The role is then UNKNOWN, and an unknown role DEFERS autonomous spawns
+    /// (`DeferClass::Unknown`, coord's own `LaneState::Unknown` posture) while
+    /// the operator's origins pass. The first read that serves a role resolves
+    /// it, and that role is persisted for the next restart.
+    #[tokio::test]
+    async fn boot_with_no_persisted_role_and_a_failed_first_role_read_defers_until_coord_serves_one(
+    ) {
+        use crate::coord_drain_state::{
+            autonomous_spawns_allowed_now, current, current_dispatch_role, note_heartbeat,
+            parse_register_response, parse_register_role, read_persisted_role,
+            reset_global_for_test, set_role_file_for_test, snapshot, DeferClass, DispatchRole,
+            HeartbeatOutcome, RoleReading, GLOBAL_TEST_LOCK,
+        };
+        let _serial = GLOBAL_TEST_LOCK.lock().await;
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::coord_drain_state::set_role_file_for_test(None);
+                crate::coord_drain_state::reset_global_for_test();
+            }
+        }
+        let _restore = Restore;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join(crate::coord_drain_state::ROLE_FILE_NAME);
+        set_role_file_for_test(Some(file.clone()));
+        reset_global_for_test();
+
+        let omitted = r#"{"drain":{"state":"clear"}}"#;
+        note_heartbeat(HeartbeatOutcome::Registered {
+            drain: parse_register_response(omitted),
+            dispatch_role: parse_register_role(omitted),
+        })
+        .await;
+        assert_eq!(current(), CoordDrainState::Clear);
+        assert_eq!(current_dispatch_role(), RoleReading::Unknown);
+        assert_eq!(snapshot().dispatch_role_source, "unknown");
+        assert_eq!(
+            read_persisted_role(&file),
+            Ok(None),
+            "nothing served, nothing written"
+        );
+        assert_every_live_door_defers(DeferClass::Unknown, "unknown role");
+
+        let served = r#"{"drain":{"state":"clear","dispatch_role":"workhorse"}}"#;
+        note_heartbeat(HeartbeatOutcome::Registered {
+            drain: parse_register_response(served),
+            dispatch_role: parse_register_role(served),
+        })
+        .await;
+        assert_eq!(
+            current_dispatch_role(),
+            RoleReading::Known(Some(DispatchRole::Workhorse))
+        );
+        assert!(
+            autonomous_spawns_allowed_now(),
+            "a served workhorse opens the lane"
+        );
+        assert_eq!(snapshot().dispatch_role_source, "coord");
+        let persisted = read_persisted_role(&file)
+            .expect("readable")
+            .expect("the served role is persisted");
+        assert_eq!(persisted.dispatch_role.as_deref(), Some("workhorse"));
     }
 }

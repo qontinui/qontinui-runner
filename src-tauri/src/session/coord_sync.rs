@@ -78,9 +78,10 @@
 //!
 //! ## Disconnect tolerance
 //!
-//! Every HTTP failure (network, 5xx, timeout) leaves the row unacked. The
-//! next tick re-reads `pending()` in seq order so the catch-up after a
-//! reconnect is automatic. The file is the queue.
+//! Every HTTP failure (network, 5xx, timeout) leaves the row unacked — except
+//! a `heartbeat`, which is dropped because the next one supersedes it (see
+//! below). The next tick re-reads `pending()` in seq order so the catch-up
+//! after a reconnect is automatic. The file is the queue.
 //!
 //! ## One session's failure is that session's problem
 //!
@@ -111,6 +112,43 @@
 //! a locally ACK-dropped row (spent best-effort budget, a 4xx) does not — so
 //! an outage can never quarantine anything.
 //!
+//! A `heartbeat` row never quarantines its session. Quarantine exists for a
+//! POISONED row — one coord refuses forever — and a heartbeat cannot be one:
+//! the next heartbeat supersedes it within an interval. So a heartbeat that
+//! fails in transport (network, timeout, any 5xx — a gateway 502/504 says
+//! nothing about the row) is ACK-dropped at the seam that still knows its kind
+//! (`push_chain`) and never becomes the session's blocking head, so it is never
+//! charged to `serving_failures`. Only a heartbeat failure with NO HTTP status
+//! (connect error, timeout) trips the batch abort and counts as outage
+//! evidence, so an unreachable coord stays bounded; a heartbeat answered with
+//! a 5xx does not, because coord's edge answered and other sessions may be
+//! served. And since a heartbeat is superseded by the next one, a pending
+//! heartbeat whose session's NEXT pending row is also a heartbeat is
+//! ACK-dropped before the chains are built — each run of consecutive
+//! heartbeats collapses to its newest — so the backlog an outage leaves costs
+//! one request per run, not one per missed interval. A heartbeat is never
+//! superseded across a non-heartbeat row, so one queued before a `state_change`
+//! still goes out even if that row then blocks. Before 2026-10-11 a run of
+//! gateway 502/504s quarantined 12 sessions on merytshost, diverting their
+//! heartbeats to the sidecar until coord's staleness watcher closed the rows.
+//!
+//! Nor does quarantine divert a session's heartbeats or LIFECYCLE rows once some
+//! OTHER row put it there. Quarantine exists for a poisoned row, and a lifecycle
+//! row is not disposable: losing a `started` leaves coord with no row, losing a
+//! `finished` leaves it counting a finished session as work in flight (plan
+//! `2026-10-29-session-outbox-drops-the-finish-of-a-session-coord-never-registered`
+//! D3). So a quarantined session's `started` / `state_change` / `closed` /
+//! `finished` rows stay in the outbox and retry at [`MAX_BACKOFF`], one request
+//! a minute per quarantined session; only its other rows (progress, output
+//! chunks, ...) go to the sidecar. Its heartbeats stay in the same per-session
+//! chain, in seq order, so a heartbeat can never 404 ahead of its own `started`,
+//! and they collapse like any other run of consecutive heartbeats. Otherwise the
+//! session's coord row would lapse to `stale` and then `closed` while the
+//! session is alive. When the sidecar reaches [`QUARANTINE_MAX_BYTES`] it
+//! rotates to `<outbox>.quarantine.1.jsonl` (replacing any earlier generation)
+//! and starts afresh rather than dropping rows; the outbox's own cap trim skips
+//! lifecycle rows for the same reason (`local_store`).
+//!
 //! ## Conflict-on-acquire
 //!
 //! 409 from coord on `POST /sessions` (the row already exists for this
@@ -121,7 +159,7 @@
 //! Wire payload matches the existing claim-conflict body shape so the
 //! frontend doesn't need a schema update for Phase 3.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -209,6 +247,11 @@ struct CoordSyncInner {
     /// permanent failure is ACK-dropped from the outbox but NOT synced.
     /// Unattached (tests, pre-wiring) → the flag is never stamped.
     finished_ack_observer: OnceLock<FinishedAckObserver>,
+    /// Told `(claude_session_id, finished_at, coord row)` when the drain
+    /// ACK-drops a `finished` row coord answered without its row reading
+    /// `finished` (the unconfirmed bound) — so the row it was SENT to is kept
+    /// on the mark, unstamped (review F3).
+    finished_unconfirmed_observer: OnceLock<FinishedAckObserver>,
     /// The outside observer of coord's OWN liveness (plan
     /// `2026-09-12-merge-train-alerts-page-a-reader-and-act-on-nothing`
     /// Phase 3b). `Some` in production, `None` under
@@ -228,10 +271,17 @@ struct CoordSyncInner {
     /// session to `PendingResolution`. Entries live only as long as a
     /// [`DrainHold`] guard.
     held: Mutex<HashSet<Uuid>>,
+    /// coord's answers to harness-id re-keys (plan
+    /// `2026-10-23-a-hookless-resume-in-a-runner-pane-leaves-the-session-with-no-active-coord-row`
+    /// Phase 1a): the drain writes `landed` on a 2xx and `refused` on a
+    /// `409 harness_session_already_bound`; the seam
+    /// ([`super::coord_identity`]) reads it to restore a refused re-key. A
+    /// shared read, never a callback from the drain into the registry.
+    rekeys: Arc<super::coord_identity::RekeyLedger>,
 }
 
 /// Boxed `finished`-ACK callback (see `CoordSyncInner::finished_ack_observer`).
-struct FinishedAckObserver(Box<dyn Fn(&str, Option<i64>) + Send + Sync>);
+struct FinishedAckObserver(Box<dyn Fn(&str, Option<i64>, Uuid) + Send + Sync>);
 
 impl std::fmt::Debug for CoordSync {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -286,10 +336,12 @@ impl CoordSync {
                 registry: Mutex::new(None),
                 dual_write: DualWriteGate::new(),
                 finished_ack_observer: OnceLock::new(),
+                finished_unconfirmed_observer: OnceLock::new(),
                 outside_observer: Some(Arc::new(
                     crate::coord_outside_observer::CoordOutsideObserver::new(),
                 )),
                 held: Mutex::new(HashSet::new()),
+                rekeys: Arc::default(),
             }),
         }
     }
@@ -319,12 +371,14 @@ impl CoordSync {
                 registry: Mutex::new(None),
                 dual_write: DualWriteGate::new_for_test(None, Duration::from_secs(60)),
                 finished_ack_observer: OnceLock::new(),
+                finished_unconfirmed_observer: OnceLock::new(),
                 // Inert by construction under test: the heartbeat harness
                 // drives this loop on a millisecond cadence against a fake
                 // coord that serves no `/mcp`, and an observer here would
                 // probe the REAL upstream from a unit test.
                 outside_observer: None,
                 held: Mutex::new(HashSet::new()),
+                rekeys: Arc::default(),
             }),
         }
     }
@@ -338,6 +392,19 @@ impl CoordSync {
             .expect("call before the facade is shared")
             .dual_write = DualWriteGate::new_for_test(None, interval);
         self
+    }
+
+    /// coord's answers to harness-id re-keys — see `CoordSyncInner::rekeys`.
+    pub fn rekeys(&self) -> &super::coord_identity::RekeyLedger {
+        &self.inner.rekeys
+    }
+
+    /// Test-only: run ONE drain tick against the configured coord, exactly as
+    /// the drain loop would, and return once it has finished.
+    #[cfg(test)]
+    pub(crate) async fn drain_once_for_test(&self) {
+        let mut state = DrainState::default();
+        let _ = drain_tick(&self.inner, &mut state).await;
     }
 
     /// Borrow the local outbox. Phase 2 surface — unchanged.
@@ -417,6 +484,36 @@ impl CoordSync {
     pub fn attach_finished_ack_observer(
         &self,
         f: impl Fn(&str, Option<i64>) + Send + Sync + 'static,
+    ) {
+        self.attach_finished_ack_observer_on(move |csid, at, _row| f(csid, at));
+    }
+
+    /// Attach the observer told about a `finished` row the drain ACK-drops
+    /// UNSTAMPED after the unconfirmed bound: `(claude_session_id,
+    /// finished_at, the coord row it was sent to)`. It records the sent row on
+    /// the mark without stamping it (review F3).
+    pub fn attach_finished_unconfirmed_observer(
+        &self,
+        f: impl Fn(&str, Option<i64>, Uuid) + Send + Sync + 'static,
+    ) {
+        if self
+            .inner
+            .finished_unconfirmed_observer
+            .set(FinishedAckObserver(Box::new(f)))
+            .is_err()
+        {
+            tracing::warn!("coord_sync: finished-unconfirmed observer already attached — ignoring");
+        }
+    }
+
+    /// [`Self::attach_finished_ack_observer`], also handing the observer the
+    /// coord row (`coord.sessions.id`) whose answer read `finished`, so the
+    /// stamp can record it durably (plan
+    /// `2026-11-05-finish-synced-is-stamped-on-a-2xx-that-did-not-move-session-status`,
+    /// F2).
+    pub fn attach_finished_ack_observer_on(
+        &self,
+        f: impl Fn(&str, Option<i64>, Uuid) + Send + Sync + 'static,
     ) {
         if self
             .inner
@@ -516,6 +613,13 @@ impl CoordSync {
                     detail: snippet(&msg),
                 }
             }
+            // A `started` row is never a re-key, so coord cannot answer this
+            // here; mapped for exhaustiveness as the conflict it would be.
+            Ok(PushOutcome::Refused(msg)) => CoordRegistrationFailure {
+                kind: "conflict",
+                status: Some(409),
+                detail: snippet(&msg),
+            },
             Err(_elapsed) => CoordRegistrationFailure {
                 kind: "timeout",
                 status: None,
@@ -556,11 +660,24 @@ impl CoordSync {
     /// `UpdateSessionRequest`, so **no coord-side change is required**.
     ///
     /// Maps the response to a coarse [`ResumeProbe`]:
-    /// - 2xx → [`ResumeProbe::Found`] (row exists, now re-activated)
+    /// - 2xx → [`ResumeProbe::Found`] (row exists, now re-activated), carrying
+    ///   the `tenant_id` of coord's answer — see below
     /// - 404 / 410 → [`ResumeProbe::NotFound`] (GC'd or never existed)
+    /// - 401 / 403 → [`ResumeProbe::Refused`] (coord answered and refused the
+    ///   credential — not an outage; the caller still resumes, but must not
+    ///   claim to have observed anything about the row)
     /// - everything else (network, timeout, 5xx, other 4xx) →
     ///   [`ResumeProbe::Unreachable`] (treat as transient; caller resumes
     ///   optimistically and the drain loop retries).
+    ///
+    /// Coord's non-close `PATCH /sessions/:id` matches by id alone
+    /// (`update_session_with_close_outcome` scopes only a close or a
+    /// harness-id bind to the caller's device + tenant), so the 2xx STATUS says
+    /// nothing about the row's tenant. Its BODY does: coord answers with the
+    /// updated row (`serde_json::to_value(SessionRow)`), whose `tenant_id` no
+    /// PATCH ever sets — the tenant the row was created under. That is parsed
+    /// into `Found(Some(t))`; a missing or unparseable field (or body) is
+    /// `Found(None)` and never fails the resume.
     ///
     /// Called by [`SessionRegistry::resume_external`].
     ///
@@ -593,10 +710,29 @@ impl CoordSync {
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_success() {
-                    ResumeProbe::Found
+                    let body = resp.text().await.unwrap_or_default();
+                    let tenant = resume_answer_tenant(&body, session_id);
+                    if tenant.is_none() {
+                        tracing::debug!(
+                            session = %session_id,
+                            "coord_sync: resume probe 2xx carried no parseable tenant_id — \
+                             the row's tenant stays unobserved"
+                        );
+                    }
+                    ResumeProbe::Found(tenant)
                 } else if status == StatusCode::NOT_FOUND || status == StatusCode::GONE {
+                    drain_body(resp).await;
                     ResumeProbe::NotFound
+                } else if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+                    drain_body(resp).await;
+                    tracing::warn!(
+                        session = %session_id,
+                        %status,
+                        "coord_sync: resume probe REFUSED by coord — the credential, not the transport"
+                    );
+                    ResumeProbe::Refused(status.as_u16())
                 } else {
+                    drain_body(resp).await;
                     tracing::debug!(
                         session = %session_id,
                         %status,
@@ -716,6 +852,7 @@ impl Drop for DrainHold {
 ///
 /// `kind` is one of `server_error` (5xx), `rate_limited` (429),
 /// `unauthorized` (401/403 — coord refused the credential, or its absence),
+/// `not_found` (404),
 /// `rejected` (another 4xx), `http_error` (any other non-2xx), `network` (no HTTP answer),
 /// `timeout` (no answer inside the bound), `conflict` (409), or `local` (the
 /// runner failed before reaching coord). `status` is coord's HTTP status where
@@ -750,10 +887,24 @@ fn classify_push_failure(msg: &str, permanent: bool) -> (&'static str, Option<u1
     if status.is_none() && msg.starts_with("[timeout]") {
         return ("timeout", None);
     }
+    // coord ANSWERED a `finished` PATCH but its row did not read finished
+    // (plan 2026-11-05-finish-synced-is-stamped-on-a-2xx-that-did-not-move-
+    // session-status, Phase 4) — never a `network` or `http_error` fault.
+    if super::coord_sync_finish_ack::is_unconfirmed_message(msg) {
+        return (
+            super::coord_sync_finish_ack::FINISHED_UNCONFIRMED_KIND,
+            status,
+        );
+    }
     let kind = match status {
         Some(429) => "rate_limited",
         Some(s) if s >= 500 => "server_error",
         Some(409) => "conflict",
+        // Before the generic 4xx arm: a 404 on a heartbeat PATCH is coord
+        // serving no row for the session to this caller, a different fault from
+        // a malformed row (400/422), and one a heartbeat repeats forever. Every
+        // caller of this classifier (`confirm_started` included) gets the label.
+        Some(404) => "not_found",
         Some(401 | 403) => "unauthorized",
         Some(s) if (400..500).contains(&s) => "rejected",
         Some(_) => "http_error",
@@ -799,6 +950,29 @@ pub(crate) struct SessionOutboxHealth {
     pub last_failure: Option<OutboxFailure>,
     pub retrying_sessions: u64,
     pub quarantined_sessions: u64,
+    /// [`HEARTBEATS_SUPERSEDED`] as of this snapshot.
+    pub heartbeats_superseded: u64,
+    /// [`HEARTBEATS_DROPPED_ON_FAILURE`] as of this snapshot.
+    pub heartbeats_dropped_on_failure: u64,
+    /// [`HEARTBEATS_DROPPED_ON_FAILURE_BY_KIND`] as of this snapshot: only the
+    /// kinds with a non-zero total, so its values sum to
+    /// `heartbeats_dropped_on_failure`.
+    pub heartbeats_dropped_on_failure_by_kind: BTreeMap<&'static str, u64>,
+    /// [`QUARANTINE_ROTATIONS`] as of this snapshot.
+    pub quarantine_rotations: u64,
+    /// [`super::coord_sync_finish_ack::FINISHED_UNCONFIRMED_DROPPED`] as of
+    /// this snapshot.
+    pub finished_unconfirmed: u64,
+}
+
+/// Copy the heartbeat-drop totals and the sidecar rotation count into a health snapshot. Both snapshot
+/// writes in `drain_tick` go through this, so the block never reports one
+/// counter fresh and another stale.
+fn snapshot_heartbeat_drops(h: &mut SessionOutboxHealth) {
+    h.heartbeats_superseded = HEARTBEATS_SUPERSEDED.load(Ordering::Relaxed);
+    h.heartbeats_dropped_on_failure = HEARTBEATS_DROPPED_ON_FAILURE.load(Ordering::Relaxed);
+    h.heartbeats_dropped_on_failure_by_kind = heartbeats_dropped_on_failure_by_kind();
+    h.quarantine_rotations = QUARANTINE_ROTATIONS.load(Ordering::Relaxed);
 }
 
 fn session_outbox_health_cell() -> &'static Mutex<SessionOutboxHealth> {
@@ -852,6 +1026,25 @@ pub(crate) fn render_session_outbox_health(h: &SessionOutboxHealth) -> JsonValue
         })),
         "retryingSessions": counted(h.retrying_sessions),
         "quarantinedSessions": counted(h.quarantined_sessions),
+        // Heartbeat rows the drain ACK-dropped without coord taking them, one
+        // counter per cause, all process lifetime: superseded by a newer
+        // pending heartbeat of the same session; and dropped after a push that
+        // failed (no answer, a 5xx, a 4xx other than 409, or another non-2xx
+        // answer), broken down by failure kind.
+        "heartbeatsSuperseded": counted(h.heartbeats_superseded),
+        "heartbeatsDroppedOnFailure": counted(h.heartbeats_dropped_on_failure),
+        "heartbeatsDroppedOnFailureByKind": if observed {
+            json!(h.heartbeats_dropped_on_failure_by_kind)
+        } else {
+            JsonValue::Null
+        },
+        // Times the quarantine sidecar hit its cap and rotated to `.1`
+        // (process lifetime). Rotation discards the previous `.1` generation.
+        "quarantineRotations": counted(h.quarantine_rotations),
+        // `finished` rows coord answered 2xx without its row reading
+        // `finished`, retried to the bound and then ACK-dropped UNSTAMPED
+        // (process lifetime). The marks stay `finishSynced: false`.
+        "finishedUnconfirmed": counted(h.finished_unconfirmed),
         "observedAt": h.observed_at,
     })
 }
@@ -860,13 +1053,29 @@ pub(crate) fn render_session_outbox_health(h: &SessionOutboxHealth) -> JsonValue
 // Resume probe outcome (R2)
 // ---------------------------------------------------------------------------
 
+/// The `tenant_id` of coord's 2xx answer to the resume probe (the updated
+/// `SessionRow`). `None` for an empty / non-JSON body, an absent field, a
+/// value that is not a UUID, or an answer whose `id` is not the probed row —
+/// coord's self-registration arm answers with a server-minted row carrying
+/// the CALLER's tenant, which is not this row's. Never an error. Pure.
+fn resume_answer_tenant(body: &str, session_id: Uuid) -> Option<Uuid> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let answered = Uuid::parse_str(v.get("id")?.as_str()?.trim()).ok()?;
+    if answered != session_id {
+        return None;
+    }
+    Uuid::parse_str(v.get("tenant_id")?.as_str()?.trim()).ok()
+}
+
 /// Coarse outcome of [`CoordSync::probe_resume`], driving
 /// [`super::SessionRegistry::resume_external`]'s PATCH-vs-fresh-POST
 /// decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResumeProbe {
-    /// The coord row exists and was re-activated by the probe PATCH.
-    Found,
+    /// The coord row exists and was re-activated by the probe PATCH. Carries
+    /// the `tenant_id` coord's answer (the row) named — `None` when the body
+    /// carried no parseable one.
+    Found(Option<Uuid>),
     /// Coord returned 404/410 — the row was GC'd or never existed. The
     /// caller registers a fresh session.
     NotFound,
@@ -874,6 +1083,10 @@ pub enum ResumeProbe {
     /// resumes optimistically under the persisted id; the drain loop
     /// retries.
     Unreachable,
+    /// Coord ANSWERED 401 / 403 (the status carried): it refused the probe's
+    /// credential. Distinct from [`Self::Unreachable`] so a refusal is never
+    /// reported as an outage; the caller's resume behaviour is the same.
+    Refused(u16),
 }
 
 // ---------------------------------------------------------------------------
@@ -929,6 +1142,22 @@ struct SessionRetry {
     /// events in one tick can never compare ambiguously the way two `Instant`s
     /// can.
     failed_at_ack_tick: u64,
+    /// The `finished` row this session is blocked on because coord answered
+    /// it without its row reading `finished`, and how many such answers that
+    /// row has had. Per ROW, so an earlier row's failures can never spend a
+    /// finish's budget; bounded by
+    /// [`super::coord_sync_finish_ack::FINISHED_UNCONFIRMED_MAX_ATTEMPTS`]
+    /// AND [`super::coord_sync_finish_ack::FINISHED_UNCONFIRMED_MIN_AGE`].
+    unconfirmed_finish: Option<UnconfirmedFinish>,
+}
+
+/// One `finished` row coord keeps answering without its row reading
+/// `finished`: which row, how many such answers, and when the first came.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UnconfirmedFinish {
+    row: (Uuid, i64),
+    attempts: u32,
+    first_at: Instant,
 }
 
 impl SessionRetry {
@@ -947,6 +1176,19 @@ fn quarantine_path(outbox: &OutboxWriter) -> std::path::PathBuf {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "session-outbox.jsonl".to_string());
     p.with_file_name(format!("{name}.quarantine.jsonl"))
+}
+
+/// `<outbox>.quarantine.jsonl` -> `<outbox>.quarantine.1.jsonl`.
+fn quarantine_rotated_path(sidecar: &std::path::Path) -> std::path::PathBuf {
+    let name = sidecar
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let rotated = match name.strip_suffix(".jsonl") {
+        Some(stem) => format!("{stem}.1.jsonl"),
+        None => format!("{name}.1"),
+    };
+    sidecar.with_file_name(rotated)
 }
 
 /// Append rows to the quarantine sidecar. Only an `Ok` lets the caller ACK
@@ -983,8 +1225,10 @@ const BEST_EFFORT_MAX_ATTEMPTS: u32 = 3;
 /// Extracted in Phase 3 from the arms that each spelled `status.is_client_error()`
 /// inline. Phase 3 added a SECOND consumer of exactly this rule — the loopback
 /// coord-write forwarders, which must spool a transport failure but must NOT
-/// spool a 4xx (that would replay a guaranteed failure three times and then
-/// drop it silently). Two copies of one retry policy is the pair that drifts,
+/// spool a 4xx (that would replay a guaranteed failure once and drop it
+/// silently on that first refusal; the one exception is a register-gate 404
+/// `work_unit_not_found` with a recorded bootstrap, which
+/// `gate_registration_outcome` upserts and registers again). Two copies of one retry policy is the pair that drifts,
 /// so both call this.
 fn write_failure_outcome(status: StatusCode, message: String) -> PushOutcome {
     match classify_coord_write_status(status.as_u16()) {
@@ -1030,6 +1274,80 @@ pub(crate) fn transport_rung_drain_dropped() -> TransportRungDrainDropped {
     }
 }
 
+/// Pending heartbeat rows the drain ACK-dropped unsent because a newer pending
+/// heartbeat of the same session replaces them: the next pending row is also a
+/// heartbeat, or the session is quarantined and has a newer pending heartbeat.
+/// Process-lifetime total, bumped only once the ACK has landed;
+/// `GET /health` `sessionOutbox.heartbeatsSuperseded`.
+pub(crate) static HEARTBEATS_SUPERSEDED: AtomicU64 = AtomicU64::new(0);
+
+/// Heartbeat rows the drain ACK-dropped after a push that did not deliver
+/// them: a transport failure (no HTTP answer, a 5xx, or another non-2xx
+/// answer) or a 4xx other than 409 (a 429, a 403, a 404 when coord serves no
+/// row for the session to this caller, ...). A heartbeat is never retried,
+/// so before this counter such a drop left no trace beyond `lastFailure`,
+/// which the next failure of any kind overwrites. Same lifetime and
+/// ACK-landed rule as [`HEARTBEATS_SUPERSEDED`]; equals the sum of
+/// [`HEARTBEATS_DROPPED_ON_FAILURE_BY_KIND`] as of each drain snapshot (the
+/// per-kind slots are bumped first);
+/// `GET /health` `sessionOutbox.heartbeatsDroppedOnFailure`.
+pub(crate) static HEARTBEATS_DROPPED_ON_FAILURE: AtomicU64 = AtomicU64::new(0);
+
+/// The failure kinds [`classify_push_failure`] can return, in the order
+/// [`HEARTBEATS_DROPPED_ON_FAILURE_BY_KIND`] is indexed. The whole vocabulary,
+/// so every heartbeat drop lands on its own kind (`conflict` stays 0 in
+/// practice: a 409 on a heartbeat PATCH is `Acked`, not a drop).
+const HEARTBEAT_DROP_KINDS: [&str; 9] = [
+    "network",
+    "timeout",
+    "server_error",
+    "rate_limited",
+    "conflict",
+    "unauthorized",
+    "rejected",
+    "not_found",
+    "http_error",
+];
+
+/// [`HEARTBEATS_DROPPED_ON_FAILURE`] split by [`classify_push_failure`] kind,
+/// indexed like [`HEARTBEAT_DROP_KINDS`];
+/// `GET /health` `sessionOutbox.heartbeatsDroppedOnFailureByKind`.
+pub(crate) static HEARTBEATS_DROPPED_ON_FAILURE_BY_KIND: [AtomicU64; HEARTBEAT_DROP_KINDS.len()] =
+    [const { AtomicU64::new(0) }; HEARTBEAT_DROP_KINDS.len()];
+
+/// The per-kind slot for a failure kind. `classify_push_failure` only returns
+/// members of [`HEARTBEAT_DROP_KINDS`]; a kind added there without this list
+/// is logged at error level and lands on `http_error` (the "some other HTTP
+/// answer" kind) rather than going uncounted. It never panics: this runs in
+/// the drain loop, after the ACK landed.
+fn heartbeat_drop_kind_slot(kind: &str) -> usize {
+    match HEARTBEAT_DROP_KINDS.iter().position(|k| *k == kind) {
+        Some(slot) => slot,
+        None => {
+            tracing::error!(
+                kind,
+                "coord_sync: failure kind missing from HEARTBEAT_DROP_KINDS; counted as http_error"
+            );
+            HEARTBEAT_DROP_KINDS.len() - 1
+        }
+    }
+}
+
+/// The non-zero per-kind heartbeat failure-drop totals.
+fn heartbeats_dropped_on_failure_by_kind() -> BTreeMap<&'static str, u64> {
+    HEARTBEAT_DROP_KINDS
+        .iter()
+        .zip(HEARTBEATS_DROPPED_ON_FAILURE_BY_KIND.iter())
+        .map(|(k, n)| (*k, n.load(Ordering::Relaxed)))
+        .filter(|(_, n)| *n > 0)
+        .collect()
+}
+
+/// Times the quarantine sidecar reached [`QUARANTINE_MAX_BYTES`] and was
+/// rotated to `.quarantine.1.jsonl`. Process-lifetime total;
+/// `GET /health` `sessionOutbox.quarantineRotations`.
+pub(crate) static QUARANTINE_ROTATIONS: AtomicU64 = AtomicU64::new(0);
+
 /// Session LIFECYCLE kinds — the rows that define coord's session row itself:
 /// its creation (`started` → `POST /sessions`), its state (`state_change` →
 /// `PATCH`), its end (`closed` → `PATCH {state:"closed"}`) and its work axis
@@ -1042,7 +1360,7 @@ pub(crate) fn transport_rung_drain_dropped() -> TransportRungDrainDropped {
 /// fact no later row repeats. `heartbeat` is deliberately NOT
 /// here: the next heartbeat supersedes a dropped one within a tick, and
 /// retrying it would only hold the session's chain behind a stale stamp.
-fn is_lifecycle_kind(kind: &str) -> bool {
+pub(crate) fn is_lifecycle_kind(kind: &str) -> bool {
     kind == SessionEventKind::Started.as_str()
         || kind == SessionEventKind::StateChange.as_str()
         || kind == SessionEventKind::Closed.as_str()
@@ -1180,11 +1498,20 @@ struct ChainOutcome {
     session_id: Uuid,
     /// Rows to ACK out of the outbox — delivered OR deliberately dropped.
     succeeded: Vec<(Uuid, i64)>,
-    /// Coord itself took at least one row (2xx or a 409 on create). The ONLY
-    /// evidence the drain treats as "coord is serving": `succeeded` also holds
-    /// rows ACK-dropped after a spent best-effort budget or a 4xx, and those
-    /// say nothing about whether coord is up.
+    /// Coord itself TOOK at least one row — it left the queue as delivered,
+    /// a create's 409, or coord's typed re-key refusal. The drain's "coord is
+    /// serving rows" evidence: it moves `last_ack` / `ack_ticks` (which decide
+    /// whether another session's failure counts toward quarantine) and
+    /// `/health` `lastAckAt`. `succeeded` also holds rows ACK-dropped after a
+    /// spent best-effort budget or a 4xx, and those say nothing about whether
+    /// coord is up. An unconfirmed `finished` answer does NOT set this: coord
+    /// answered without applying the write, so it took nothing.
     acked_by_coord: bool,
+    /// Coord ANSWERED at least one request of this chain — every case that sets
+    /// [`Self::acked_by_coord`], plus an unconfirmed `finished` answer. Moves
+    /// only the reachability signals: no outage verdict for the tick, and
+    /// `has_been_online`.
+    answered_by_coord: bool,
     /// Updated best-effort attempt counters for this session's records.
     attempts: HashMap<(Uuid, i64), u32>,
     /// Keys whose best-effort budget should be forgotten (delivered/dropped).
@@ -1193,9 +1520,18 @@ struct ChainOutcome {
     /// `Some(error)` when a NON-best-effort row failed and stopped this chain:
     /// the session is blocked on its head row and goes on its own backoff.
     blocked_on: Option<String>,
+    /// The row `blocked_on` is about.
+    blocked_row: Option<OutboxRecord>,
     /// The chain stopped because ANOTHER chain tripped the abort flag, not
     /// because of anything about this session — its retry state is untouched.
     aborted: bool,
+    /// The [`classify_push_failure`] kind of every heartbeat this chain
+    /// ACK-dropped after a failed push (one entry per row, also in
+    /// `succeeded`). Counted by the tick once the ACK lands.
+    heartbeat_failure_drops: Vec<&'static str>,
+    /// A quarantined session's keep-alive heartbeat chain: it never touches the
+    /// session's retry/quarantine state (set by the caller).
+    keepalive: bool,
 }
 
 /// Push one session's records in seq order.
@@ -1219,11 +1555,15 @@ async fn push_chain(
         session_id: records.first().map(|r| r.session_id).unwrap_or_default(),
         succeeded: Vec::with_capacity(records.len()),
         acked_by_coord: false,
+        answered_by_coord: false,
         attempts: HashMap::new(),
         cleared: Vec::new(),
         had_transport_error: false,
         blocked_on: None,
+        blocked_row: None,
         aborted: false,
+        heartbeat_failure_drops: Vec::new(),
+        keepalive: false,
     };
 
     for rec in records {
@@ -1244,6 +1584,21 @@ async fn push_chain(
                 out.acked_by_coord = true;
                 out.succeeded.push((rec.session_id, rec.seq));
                 handle_conflict(&inner, &rec, row).await;
+            }
+            PushOutcome::Refused(reason) => {
+                // Coord answered (so it is serving), and the row leaves the
+                // queue — but as a refusal, never a delivery: no finished-ACK
+                // notification, and the re-key ledger already counted it.
+                out.acked_by_coord = true;
+                out.succeeded.push((rec.session_id, rec.seq));
+                out.cleared.push((rec.session_id, rec.seq));
+                tracing::warn!(
+                    session = %rec.session_id,
+                    seq = rec.seq,
+                    body = %reason,
+                    "coord_sync: coord REFUSED the harness-id re-key (another active row holds \
+                     the id) — ACK-dropping it as refused; the seam restores and re-queues"
+                );
             }
             PushOutcome::Transport(e) => {
                 let (fail_kind, fail_status) = classify_push_failure(&e, false);
@@ -1285,6 +1640,80 @@ async fn push_chain(
                     out.had_transport_error = true;
                     continue;
                 }
+                // A heartbeat that failed in transport (network, timeout, or a
+                // 5xx — a gateway 502/504 says nothing about the row) is
+                // ACK-dropped, never retried: the next heartbeat supersedes it
+                // within one interval. Crucially it never sets `blocked_on`, so
+                // `drain_tick` cannot charge it to `serving_failures` and a
+                // gateway's bad hour can never quarantine the session (which
+                // would divert every later row — its heartbeats, its
+                // `state_change`, its `closed` — to the sidecar for the rest of
+                // the process). (A 4xx heartbeat is already ACK-dropped by the
+                // `PermanentFailure` arm, and a 409 is `Acked`.)
+                //
+                // Whether it counts as OUTAGE evidence depends on whether coord's
+                // edge answered at all. A failure with NO HTTP status (connect
+                // error, timeout, send error) is the outage signal: it sets
+                // `had_transport_error` and trips the abort when `trip_abort`
+                // holds, so a coord that is unreachable still costs at most
+                // MAX_CONCURRENT_PUSH_CHAINS requests a tick. A heartbeat that
+                // got an HTTP 5xx RESPONSE does neither — a heartbeat-only
+                // session never enters `state.retry`, so its `trip_abort` is
+                // always true, and letting a per-session 502 trip the abort
+                // would stop other sessions' chains and push the loop into the
+                // outage backoff while coord is serving them. Being dropped, a
+                // 5xx heartbeat is never retried, so it cannot amplify load.
+                if rec.event_kind == SessionEventKind::Heartbeat.as_str() {
+                    let unreachable = fail_status.is_none();
+                    tracing::warn!(
+                        session = %rec.session_id,
+                        seq = rec.seq,
+                        status = ?fail_status,
+                        unreachable,
+                        error = %snippet(&e),
+                        "coord_sync: heartbeat push failed — dropping it (the next \
+                         heartbeat supersedes it; never counts toward quarantine)"
+                    );
+                    out.succeeded.push((rec.session_id, rec.seq));
+                    out.cleared.push((rec.session_id, rec.seq));
+                    out.heartbeat_failure_drops.push(fail_kind);
+                    if unreachable {
+                        out.had_transport_error = true;
+                        if trip_abort {
+                            abort.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    continue;
+                }
+                if fail_kind == super::coord_sync_finish_ack::FINISHED_UNCONFIRMED_KIND {
+                    // coord ANSWERED (2xx) but its row does not read
+                    // `finished`. Coord is serving, so this is evidence about
+                    // the row only: it neither counts as a transport error nor
+                    // trips the abort that would stall every other session.
+                    // The row stays queued and blocks THIS session's chain
+                    // (seq order); `drain_tick` bounds its retries.
+                    //
+                    // It IS a coord answer, so it moves the reachability
+                    // signals (no outage verdict for this tick,
+                    // `has_been_online`). It is NOT a row coord took: `last_ack`
+                    // / `ack_ticks` / `lastAckAt` stay put, because coord
+                    // answering while its writes are not applying (the
+                    // swallowed-write case) is no evidence that ANOTHER
+                    // session's 5xx is about that session's row — counting it
+                    // would push healthy sessions toward quarantine.
+                    out.answered_by_coord = true;
+                    tracing::warn!(
+                        session = %rec.session_id,
+                        seq = rec.seq,
+                        error = %snippet(&e),
+                        "coord_sync: coord answered the finished row without its row \
+                         reading finished — not stamping finish_synced; retrying on \
+                         this session's backoff"
+                    );
+                    out.blocked_on = Some(e);
+                    out.blocked_row = Some(rec.clone());
+                    break;
+                }
                 tracing::warn!(
                     session = %rec.session_id,
                     seq = rec.seq,
@@ -1296,6 +1725,7 @@ async fn push_chain(
                 );
                 out.had_transport_error = true;
                 out.blocked_on = Some(e);
+                out.blocked_row = Some(rec.clone());
                 // Stop THIS chain — preserves (session, seq) order on retry.
                 // The unACKed tail stays in the file for a later tick.
                 if trip_abort {
@@ -1324,6 +1754,9 @@ async fn push_chain(
                 );
                 out.succeeded.push((rec.session_id, rec.seq));
                 out.cleared.push((rec.session_id, rec.seq));
+                if rec.event_kind == SessionEventKind::Heartbeat.as_str() {
+                    out.heartbeat_failure_drops.push(fail_kind);
+                }
             }
         }
     }
@@ -1332,8 +1765,9 @@ async fn push_chain(
     out
 }
 
-/// Past this size the quarantine sidecar stops growing: further quarantined
-/// rows are dropped with a `warn!` rather than filling the disk.
+/// Past this size the quarantine sidecar rotates to `.quarantine.1.jsonl`
+/// (replacing any earlier generation) and starts afresh, so it never fills the
+/// disk and never discards the newest rows.
 const QUARANTINE_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Per-session drain state carried across ticks by [`run_drain_loop`].
@@ -1372,6 +1806,21 @@ struct TickResult {
     /// sat out its own backoff did nothing, and must not reset the loop's
     /// outage backoff.
     ran_any: bool,
+    /// Heartbeat rows this tick ACK-dropped unsent because a newer heartbeat
+    /// replaces them, counted only once the ACK landed — this tick's share of
+    /// [`HEARTBEATS_SUPERSEDED`].
+    heartbeats_superseded: u64,
+    /// This tick's share of [`HEARTBEATS_DROPPED_ON_FAILURE`], same rule.
+    heartbeats_dropped_on_failure: u64,
+    /// `heartbeats_dropped_on_failure` split by failure kind (non-zero kinds
+    /// only) — this tick's share of [`HEARTBEATS_DROPPED_ON_FAILURE_BY_KIND`].
+    heartbeats_dropped_on_failure_by_kind: BTreeMap<&'static str, u64>,
+    /// `finished` rows this tick dropped UNSTAMPED at the unconfirmed-answer
+    /// bound, counted only once the ACK landed — this tick's share of
+    /// [`super::coord_sync_finish_ack::FINISHED_UNCONFIRMED_DROPPED`]. Per
+    /// call, so a test can assert its own drops without racing a sibling
+    /// test that bumps the same process-global counter.
+    finished_unconfirmed_dropped: u64,
 }
 
 impl TickResult {
@@ -1380,6 +1829,10 @@ impl TickResult {
             outage: false,
             idle: true,
             ran_any: false,
+            heartbeats_superseded: 0,
+            heartbeats_dropped_on_failure: 0,
+            heartbeats_dropped_on_failure_by_kind: BTreeMap::new(),
+            finished_unconfirmed_dropped: 0,
         }
     }
 }
@@ -1411,13 +1864,25 @@ fn quarantine_rows(
     let path = quarantine_path(&inner.outbox);
     let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     if size >= QUARANTINE_MAX_BYTES {
+        // Rotate instead of dropping the newest rows: the oldest generation is
+        // what is discarded. A failed rename leaves the sidecar as it is and
+        // the rows in the outbox (retried next tick) — never ACKed unwritten.
+        let rotated = quarantine_rotated_path(&path);
+        if let Err(e) = std::fs::rename(&path, &rotated) {
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "coord_sync: quarantine sidecar is at its cap and could not be rotated — rows stay in the outbox"
+            );
+            return done;
+        }
+        let total = QUARANTINE_ROTATIONS.fetch_add(1, Ordering::Relaxed) + 1;
         tracing::warn!(
-            rows = fresh.len(),
             path = %path.display(),
-            "coord_sync: quarantine sidecar is at its cap — dropping quarantined rows"
+            rotated = %rotated.display(),
+            total,
+            "coord_sync: quarantine sidecar reached its cap — rotated (the previous rotated generation was replaced)"
         );
-        done.extend(fresh.iter().map(|r| (r.session_id, r.seq)));
-        return done;
     }
     match append_quarantine(&inner.outbox, &fresh) {
         Ok(()) => {
@@ -1466,6 +1931,9 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
             h.oldest_unacked_at = None;
             h.retrying_sessions = 0;
             h.quarantined_sessions = quarantined;
+            snapshot_heartbeat_drops(h);
+            h.finished_unconfirmed =
+                super::coord_sync_finish_ack::FINISHED_UNCONFIRMED_DROPPED.load(Ordering::Relaxed);
         });
         return TickResult::idle();
     }
@@ -1482,6 +1950,76 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         .map(|r| ((r.session_id, r.seq), r.recorded_at))
         .collect();
 
+    // A heartbeat is superseded by the next one: a pending heartbeat whose
+    // session's NEXT pending row (by seq) is also a heartbeat is ACK-dropped by
+    // its exact (session, seq) key below, so each run of consecutive heartbeats
+    // collapses to its newest. Without this, the backlog an unreachable-coord
+    // outage leaves (one row per heartbeat interval per session) would all go
+    // out in one tick once coord answers again. Never across a non-heartbeat
+    // row: a heartbeat queued before a `state_change` still goes out even if
+    // that row then fails and blocks the chain. Dropping a heartbeat reorders
+    // nothing: the remaining rows keep their seq order.
+    let heartbeat_kind = SessionEventKind::Heartbeat.as_str();
+    let superseded_keys: HashSet<(Uuid, i64)> = pending
+        .windows(2)
+        .filter(|w| {
+            w[0].session_id == w[1].session_id
+                && w[0].event_kind == heartbeat_kind
+                && w[1].event_kind == heartbeat_kind
+        })
+        .map(|w| (w[0].session_id, w[0].seq))
+        .collect();
+    let mut superseded: Vec<(Uuid, i64)> = Vec::new();
+
+    // A quarantined session's lifecycle rows stay in its chain (below), so its
+    // heartbeats need a placement:
+    //  * a `started` or `closed` row is pending — the heartbeat must keep its
+    //    seq place: before the `started` it would 404 on a row coord never
+    //    created, after a `closed` coord never saw it would revive a reaped row;
+    //  * otherwise the newest pending heartbeat is moved to the FRONT of the
+    //    session's chain and the older ones are superseded. A heartbeat PATCH
+    //    carries no state, so sending it ahead of a stuck `state_change`
+    //    reorders nothing coord reads — and the live session's coord row keeps
+    //    its keep-alive while that row is retried.
+    let started_kind = SessionEventKind::Started.as_str();
+    let closed_kind = SessionEventKind::Closed.as_str();
+    //
+    // The same keep-alive applies to a session whose chain is blocked on an
+    // UNCONFIRMED `finished` row: that row is held for at least
+    // `FINISHED_UNCONFIRMED_MIN_AGE` (600 s), which is coord's Active→Stale
+    // threshold, so heartbeats queued behind it would let coord report a live
+    // session as Stale.
+    let front_eligible = |state: &DrainState, sid: &Uuid| {
+        state.quarantined.contains(sid)
+            || state
+                .retry
+                .get(sid)
+                .is_some_and(|r| r.unconfirmed_finish.is_some())
+    };
+    let seq_ordered_heartbeats: HashSet<Uuid> = pending
+        .iter()
+        .filter(|r| {
+            front_eligible(state, &r.session_id)
+                && (r.event_kind == started_kind || r.event_kind == closed_kind)
+        })
+        .map(|r| r.session_id)
+        .collect();
+    let mut front_heartbeat: HashMap<Uuid, OutboxRecord> = HashMap::new();
+    let is_front_candidate = |state: &DrainState, r: &OutboxRecord| {
+        r.event_kind == heartbeat_kind
+            && front_eligible(state, &r.session_id)
+            && !seq_ordered_heartbeats.contains(&r.session_id)
+    };
+    for rec in &pending {
+        if !is_front_candidate(state, rec) || held.contains(&rec.session_id) {
+            continue;
+        }
+        // `pending` is in seq order, so the last one seen is the newest.
+        if let Some(older) = front_heartbeat.insert(rec.session_id, rec.clone()) {
+            superseded.push((older.session_id, older.seq));
+        }
+    }
+
     // Group into per-session chains. `pending()` returns records sorted by
     // (session_id, seq), so each chain is already in seq order.
     let mut chains: Vec<Vec<OutboxRecord>> = Vec::new();
@@ -1490,8 +2028,21 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         if held.contains(&rec.session_id) {
             continue;
         }
+        // A front-eligible session's heartbeats are placed above.
+        if is_front_candidate(state, &rec) {
+            continue; // in `front_heartbeat` (newest) or superseded
+        }
+        // A quarantined session's lifecycle rows stay in its chain (a
+        // lifecycle row is never disposable); only its other rows go to the
+        // sidecar.
         if state.quarantined.contains(&rec.session_id) {
-            to_quarantine.push(rec);
+            if rec.event_kind != heartbeat_kind && !is_lifecycle_kind(&rec.event_kind) {
+                to_quarantine.push(rec);
+                continue;
+            }
+        }
+        if superseded_keys.contains(&(rec.session_id, rec.seq)) {
+            superseded.push((rec.session_id, rec.seq));
             continue;
         }
         match chains.last_mut() {
@@ -1502,6 +2053,11 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
 
     // Quarantined sessions' rows land in the sidecar, then leave the outbox.
     let mut succeeded: Vec<(Uuid, i64)> = quarantine_rows(inner, state, to_quarantine);
+    // Counted only once the ACK lands (below): a failed ACK counts nothing, so
+    // no row is counted twice. (`ack` marks the keys before its scan and
+    // compaction, so a failure in either can still drop rows uncounted.)
+    let superseded_count = superseded.len() as u64;
+    succeeded.extend(superseded);
 
     // A session still inside its own backoff sits this tick out.
     chains.retain(|chain| {
@@ -1510,38 +2066,67 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
             .get(&chain[0].session_id)
             .is_none_or(|r| r.next_attempt_at <= now)
     });
-    let ran_any = !chains.is_empty();
+    // A quarantined (or unconfirmed-finish-blocked) session's keep-alive
+    // heartbeat is its OWN one-row chain, outside the session backoff above:
+    // that backoff holds the chain for minutes, and coord's stale threshold
+    // is not longer, so gating the
+    // heartbeat behind it would let the live session's coord row lapse.
+    let ran_any = !chains.is_empty() || !front_heartbeat.is_empty();
+    let chains: Vec<(bool, Vec<OutboxRecord>)> = chains
+        .into_iter()
+        .map(|c| (false, c))
+        .chain(front_heartbeat.into_values().map(|hb| (true, vec![hb])))
+        .collect();
 
     let abort = Arc::new(AtomicBool::new(false));
-    let outcomes: Vec<ChainOutcome> = futures::stream::iter(chains.into_iter().map(|chain| {
-        let sid = chain[0].session_id;
-        let session_attempts: HashMap<(Uuid, i64), u32> = state
-            .best_effort_attempts
-            .iter()
-            .filter(|((s, _), _)| *s == sid)
-            .map(|(k, v)| (*k, *v))
-            .collect();
-        let trip_abort = !state
-            .retry
-            .get(&sid)
-            .is_some_and(|r| state.ack_ticks > r.failed_at_ack_tick);
-        push_chain(
-            inner.clone(),
-            chain,
-            session_attempts,
-            abort.clone(),
-            trip_abort,
-        )
-    }))
-    .buffer_unordered(MAX_CONCURRENT_PUSH_CHAINS)
-    .collect()
-    .await;
+    let outcomes: Vec<ChainOutcome> =
+        futures::stream::iter(chains.into_iter().map(|(keepalive, chain)| {
+            let sid = chain[0].session_id;
+            let session_attempts: HashMap<(Uuid, i64), u32> = state
+                .best_effort_attempts
+                .iter()
+                .filter(|((s, _), _)| *s == sid)
+                .map(|(k, v)| (*k, *v))
+                .collect();
+            let trip_abort = !state
+                .retry
+                .get(&sid)
+                .is_some_and(|r| state.ack_ticks > r.failed_at_ack_tick);
+            let inner = inner.clone();
+            let abort = abort.clone();
+            async move {
+                let mut out = push_chain(inner, chain, session_attempts, abort, trip_abort).await;
+                out.keepalive = keepalive;
+                out
+            }
+        }))
+        .buffer_unordered(MAX_CONCURRENT_PUSH_CHAINS)
+        .collect()
+        .await;
 
     let mut had_transport_error = false;
+    // `delivered`: coord took a row of some session's BACKLOG — the serving
+    // evidence (`last_ack`, `ack_ticks`). `took_any` also counts keep-alive
+    // heartbeats, for `/health` `lastAckAt` only.
     let mut delivered = false;
-    let mut blocked: Vec<(Uuid, String)> = Vec::new();
+    let mut took_any = false;
+    let mut answered = false;
+    let mut blocked: Vec<(Uuid, String, Option<OutboxRecord>)> = Vec::new();
+    let mut heartbeat_failure_drops: Vec<&'static str> = Vec::new();
     for outcome in outcomes {
-        delivered |= outcome.acked_by_coord;
+        // A keep-alive heartbeat is never serving evidence. `ack_ticks` is ONE
+        // counter across sessions, so a held session's own keep-alive would
+        // otherwise read as "coord took another row" at its next failure (on
+        // this tick or any later one) and walk a run of 5xx on its own head
+        // row into quarantine. Excluding keep-alives for everyone is the
+        // conservative choice: they are held sessions' out-of-order probes,
+        // and any healthy session's ordinary rows still count.
+        if !outcome.keepalive {
+            delivered |= outcome.acked_by_coord;
+        }
+        took_any |= outcome.acked_by_coord;
+        answered |= outcome.acked_by_coord || outcome.answered_by_coord;
+        heartbeat_failure_drops.extend(outcome.heartbeat_failure_drops);
         succeeded.extend(outcome.succeeded);
         had_transport_error |= outcome.had_transport_error;
         for (key, attempts) in outcome.attempts {
@@ -1552,8 +2137,13 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         for key in outcome.cleared {
             state.best_effort_attempts.remove(&key);
         }
+        if outcome.keepalive {
+            // The keep-alive chain says nothing about the session's lifecycle
+            // rows: their backoff and quarantine bookkeeping stay as they are.
+            continue;
+        }
         match outcome.blocked_on {
-            Some(err) => blocked.push((outcome.session_id, err)),
+            Some(err) => blocked.push((outcome.session_id, err, outcome.blocked_row)),
             None if !outcome.aborted => {
                 // Ran to the end: whatever blocked it before has cleared.
                 state.retry.remove(&outcome.session_id);
@@ -1567,7 +2157,10 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         state.ack_ticks += 1;
     }
     let last_ack = state.last_ack;
-    for (sid, err) in blocked {
+    // Unconfirmed `finished` rows that spent their bound this tick: ACK-dropped
+    // unstamped, counted once the ACK lands.
+    let mut finished_unconfirmed_dropped: u64 = 0;
+    for (sid, err, blocked_row) in blocked {
         // First failure: coord counts as serving if it took a row within the
         // window. Later failures: only if it took one since THIS session's
         // previous failure (this tick's rows included).
@@ -1580,18 +2173,79 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
             serving_failures: 0,
             next_attempt_at: now,
             failed_at_ack_tick: ack_ticks_at_start,
+            unconfirmed_finish: None,
         });
         entry.failures += 1;
         entry.failed_at_ack_tick = ack_ticks_at_start;
+        // The recorded unconfirmed finish is no longer what blocks this
+        // session (it left the queue, or an earlier row now fails first):
+        // forget it, so it neither keeps the keep-alive on nor carries a
+        // stale count/age into a later finish.
+        let blocked_key = blocked_row.as_ref().map(|r| (r.session_id, r.seq));
+        if entry
+            .unconfirmed_finish
+            .is_some_and(|u| Some(u.row) != blocked_key)
+        {
+            entry.unconfirmed_finish = None;
+        }
         // A 429 on a kind that retries it (`output_chunk`, and the lifecycle
         // kinds of `is_lifecycle_kind`: `started` / `state_change` / `closed`
         // / `finished`) is coord pacing this runner, not
         // refusing the row — it never counts toward quarantine.
-        let rate_limited = classify_push_failure(&err, false).0 == "rate_limited";
-        if serving && !rate_limited {
+        let fail_kind = classify_push_failure(&err, false).0;
+        let rate_limited = fail_kind == "rate_limited";
+        // An unconfirmed finish has its own bound (below): it never counts
+        // toward the whole-session quarantine either.
+        let unconfirmed = fail_kind == super::coord_sync_finish_ack::FINISHED_UNCONFIRMED_KIND;
+        if serving && !rate_limited && !unconfirmed {
             entry.serving_failures += 1;
         }
         entry.next_attempt_at = now + SessionRetry::backoff(entry.failures);
+        if let (true, Some(blocked_rec)) = (unconfirmed, blocked_row) {
+            let row = (blocked_rec.session_id, blocked_rec.seq);
+            let (attempts, first_at) = match entry.unconfirmed_finish {
+                Some(u) if u.row == row => (u.attempts + 1, u.first_at),
+                _ => (1, now),
+            };
+            entry.unconfirmed_finish = Some(UnconfirmedFinish {
+                row,
+                attempts,
+                first_at,
+            });
+            // BOTH bounds: a count alone is spent in ~30 s on the 1-2-4-8-16 s
+            // backoff, which a coord deploy or a transient swallow outlasts.
+            let unconfirmed_for = now.saturating_duration_since(first_at);
+            if attempts >= super::coord_sync_finish_ack::FINISHED_UNCONFIRMED_MAX_ATTEMPTS
+                && unconfirmed_for >= super::coord_sync_finish_ack::FINISHED_UNCONFIRMED_MIN_AGE
+            {
+                tracing::warn!(
+                    session = %sid,
+                    seq = row.1,
+                    attempts,
+                    unconfirmed_secs = unconfirmed_for.as_secs(),
+                    last_error = %snippet(&err),
+                    "coord_sync: coord answered this finished row {attempts} time(s) without \
+                     its row reading finished — ACK-dropping it UNSTAMPED (finish_synced stays \
+                     false; re-offered by a reason-less finish read-back, by the session's next \
+                     coord registration or terminal bind, and by the next runner start's heal \
+                     sweep only if coord's own row then reads session_status NULL)"
+                );
+                succeeded.push(row);
+                finished_unconfirmed_dropped += 1;
+                // Keep the row the finish was SENT to on the mark (unstamped),
+                // so the next runner start's heal sweep can re-offer it there.
+                notify_finished_unconfirmed(inner, &blocked_rec);
+                state.retry.remove(&sid);
+                continue;
+            }
+        }
+        if state.quarantined.contains(&sid) {
+            // Already quarantined: this is one of its lifecycle rows (the only
+            // rows left in its chain). It retries once a minute, forever, and
+            // never re-quarantines.
+            entry.next_attempt_at = now + MAX_BACKOFF;
+            continue;
+        }
         if entry.serving_failures >= QUARANTINE_AFTER_SERVING_FAILURES {
             tracing::warn!(
                 session = %sid,
@@ -1607,18 +2261,60 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         }
     }
 
+    let mut heartbeats_superseded = 0;
+    let mut heartbeats_dropped_on_failure = 0;
+    let mut heartbeats_dropped_on_failure_by_kind: BTreeMap<&'static str, u64> = BTreeMap::new();
+    let mut finished_unconfirmed_dropped_acked = 0;
     if !succeeded.is_empty() {
         match inner.outbox.ack(&succeeded) {
             Ok(()) => {
                 for key in &succeeded {
                     state.in_sidecar.remove(key);
                 }
+                heartbeats_superseded = superseded_count;
+                finished_unconfirmed_dropped_acked = finished_unconfirmed_dropped;
+                if finished_unconfirmed_dropped > 0 {
+                    super::coord_sync_finish_ack::FINISHED_UNCONFIRMED_DROPPED
+                        .fetch_add(finished_unconfirmed_dropped, Ordering::Relaxed);
+                }
+                if superseded_count > 0 {
+                    let total = HEARTBEATS_SUPERSEDED
+                        .fetch_add(superseded_count, Ordering::Relaxed)
+                        + superseded_count;
+                    tracing::debug!(
+                        rows = superseded_count,
+                        total,
+                        "coord_sync: dropped heartbeat rows unsent (superseded by a newer one)"
+                    );
+                }
+                heartbeats_dropped_on_failure = heartbeat_failure_drops.len() as u64;
+                for kind in &heartbeat_failure_drops {
+                    let slot = heartbeat_drop_kind_slot(kind);
+                    HEARTBEATS_DROPPED_ON_FAILURE_BY_KIND[slot].fetch_add(1, Ordering::Relaxed);
+                    *heartbeats_dropped_on_failure_by_kind
+                        .entry(HEARTBEAT_DROP_KINDS[slot])
+                        .or_insert(0) += 1;
+                }
+                if heartbeats_dropped_on_failure > 0 {
+                    let total = HEARTBEATS_DROPPED_ON_FAILURE
+                        .fetch_add(heartbeats_dropped_on_failure, Ordering::Relaxed)
+                        + heartbeats_dropped_on_failure;
+                    tracing::debug!(
+                        rows = heartbeats_dropped_on_failure,
+                        total,
+                        by_kind = ?heartbeats_dropped_on_failure_by_kind,
+                        "coord_sync: dropped heartbeat rows after a failed push"
+                    );
+                }
             }
             Err(e) => tracing::warn!(error = %e, "coord_sync: ack write failed"),
         }
     }
-    if delivered {
+    if answered {
         inner.has_been_online.store(true, Ordering::Relaxed);
+    }
+    if took_any {
+        // `lastAckAt` is "a row coord accepted", never a bare answer.
         note_outbox_ack();
     }
 
@@ -1637,6 +2333,9 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         h.oldest_unacked_at = remaining.iter().min().map(|at| **at);
         h.retrying_sessions = retrying;
         h.quarantined_sessions = quarantined;
+        snapshot_heartbeat_drops(h);
+        h.finished_unconfirmed =
+            super::coord_sync_finish_ack::FINISHED_UNCONFIRMED_DROPPED.load(Ordering::Relaxed);
     });
 
     TickResult {
@@ -1645,9 +2344,13 @@ async fn drain_tick(inner: &Arc<CoordSyncInner>, state: &mut DrainState) -> Tick
         // nothing. A lone session failing on its own row does not trip it, so
         // it can no longer push the whole loop into the 60 s backoff and
         // delay every healthy row behind it.
-        outage: abort.load(Ordering::Relaxed) && !delivered && had_transport_error,
+        outage: abort.load(Ordering::Relaxed) && !answered && had_transport_error,
         idle: false,
         ran_any,
+        heartbeats_superseded,
+        heartbeats_dropped_on_failure,
+        heartbeats_dropped_on_failure_by_kind,
+        finished_unconfirmed_dropped: finished_unconfirmed_dropped_acked,
     }
 }
 
@@ -1696,12 +2399,33 @@ fn notify_finished_ack(inner: &CoordSyncInner, rec: &OutboxRecord) {
         Some(csid) => (obs.0)(
             csid,
             rec.payload.get("finished_at").and_then(|v| v.as_i64()),
+            rec.session_id,
         ),
         None => tracing::warn!(
             session = %rec.session_id,
             seq = rec.seq,
             "coord_sync: finished record ACKed without a claude_session_id — cannot mark synced"
         ),
+    }
+}
+
+/// Hand a `finished` row the drain ACK-drops unstamped (the unconfirmed
+/// bound) to the finished-unconfirmed observer, with the coord row it was sent
+/// to.
+fn notify_finished_unconfirmed(inner: &CoordSyncInner, rec: &OutboxRecord) {
+    let Some(obs) = inner.finished_unconfirmed_observer.get() else {
+        return;
+    };
+    if let Some(csid) = rec
+        .payload
+        .get("claude_session_id")
+        .and_then(|v| v.as_str())
+    {
+        (obs.0)(
+            csid,
+            rec.payload.get("finished_at").and_then(|v| v.as_i64()),
+            rec.session_id,
+        );
     }
 }
 
@@ -1719,6 +2443,89 @@ enum PushOutcome {
     /// 4xx (other than 409) — coord refuses this payload permanently.
     /// ACK locally so the queue moves forward.
     PermanentFailure(String),
+    /// coord answered `409 harness_session_already_bound` to a re-key
+    /// `state_change` — another ACTIVE row on the device holds the id. The row
+    /// is ACK-dropped (left queued it would block the session forever) but it
+    /// is NOT a success: the refusal is recorded in the re-key ledger, from
+    /// which the seam restores the local record and a later tick re-queues.
+    Refused(String),
+}
+
+/// The credential scope one outbox row is pushed under: the record's own
+/// resolved tenant ([`record_session_tenant`]) for every kind, EXCEPT a
+/// `spawn_failed_report`, which always presents [`TenantScope::Device`].
+///
+/// Why that kind differs (plan
+/// `2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling`
+/// Phase 6): it rides a synthetic per-agent lane that no session registry
+/// knows, so its record scope is [`TenantScope::Unresolved`] — which sends NO
+/// bearer on a multi-bound device. coord's `post_spawn_failed` never 401s; it
+/// classes a report without a paired device token as UNVERIFIED, abandons
+/// only an allocation still `allocated`, and does NOT retire the
+/// `deferred_load` dispatch marker — while still answering 200, so the drain
+/// would Ack a report that did half its job. The live POST
+/// (`agent_runtime::post_spawn_failed`) presents `attach_device_auth`, i.e.
+/// `TenantScope::Device`, and the route keys the row by the path `agent_id`
+/// and persists no tenant — exactly the shape `Device` names. The replay must
+/// present the same credential.
+fn push_credential_scope(kind: &str, record_scope: TenantScope) -> TenantScope {
+    if kind == SessionEventKind::SpawnFailedReport.as_str() {
+        TenantScope::Device
+    } else {
+        record_scope
+    }
+}
+
+/// coord's `SessionError` code for a PATCH re-key onto a harness id another
+/// ACTIVE row on the device and tenant holds (qontinui-coord `sessions.rs`).
+const HARNESS_SESSION_ALREADY_BOUND: &str = "harness_session_already_bound";
+
+/// The harness id a re-key `state_change` carries, if this row is one.
+fn rekey_id(rec: &OutboxRecord) -> Option<&str> {
+    if rec.event_kind != SessionEventKind::StateChange.as_str() {
+        return None;
+    }
+    rec.payload
+        .get("claude_code_session_id")
+        .and_then(JsonValue::as_str)
+}
+
+/// Report a re-key coord declined to the ledger, which the seam reads to restore
+/// the local record.
+fn note_rekey_declined(
+    inner: &CoordSyncInner,
+    rec: &OutboxRecord,
+    id: &str,
+    kind: super::coord_identity::DeclineKind,
+) {
+    use super::coord_identity::{DeclineKind, RekeySource};
+    let Some(source) = RekeySource::from_payload(&rec.payload) else {
+        return;
+    };
+    let previous = rec
+        .payload
+        .get("rekey_previous")
+        .and_then(JsonValue::as_str)
+        .map(str::to_string);
+    match kind {
+        DeclineKind::AlreadyBound => {
+            inner
+                .rekeys
+                .note_refused(rec.session_id, id, previous, source)
+        }
+        DeclineKind::Rejected => inner
+            .rekeys
+            .note_rejected(rec.session_id, id, previous, source),
+    }
+}
+
+/// coord's `{error, detail}` refusal body → its `error` code.
+fn refusal_error_code(body: &str) -> Option<String> {
+    serde_json::from_str::<JsonValue>(body)
+        .ok()?
+        .get("error")?
+        .as_str()
+        .map(str::to_string)
 }
 
 async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOutcome {
@@ -1737,7 +2544,7 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
     // default slot on a single-bound device, byte-identical to the old
     // behaviour, and degrades to unauthenticated on a multi-bound one instead
     // of filing another tenant's session row.
-    let scope = record_session_tenant(inner, rec);
+    let scope = push_credential_scope(kind, record_session_tenant(inner, rec));
 
     // The last line of the per-tenant egress switches for BOTH session-output
     // streams (plan 2026-10-10-spec-front-end-phase-9-generic-boundary,
@@ -1827,12 +2634,15 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             // on whichever of this DEVICE's sessions started most recently —
             // i.e. usually a peer's, on a box running many sessions.
             //
-            // `session_status = "finished"` is terminal on coord's work axis and
-            // gates prompting; no coord production writer moves a row off it.
+            // `session_status = "finished"` gates prompting on coord's work axis.
+            // On a row that has started, one door moves it off: `run_progress_advance`,
+            // for an attributable report (a revival, or `/finish-session --undo`).
+            //
+            // The body also carries the mark's own time as `last_progress_at`
+            // (see `finished_body`), so coord stamps the finish at the instant
+            // the runner DECLARED it, not whenever this outbox row drained.
             let url = format!("{base}/sessions/{}", rec.session_id);
-            let body = json!({
-                "progress": { "session_status": "finished" },
-            });
+            let body = finished_body(&rec.payload);
             crate::auth::attach_device_auth_for(inner.http.patch(&url).json(&body), scope)
                 .send()
                 .await
@@ -1924,6 +2734,31 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             // `operator_touch_posts_to_the_dedicated_route`.
             let url = format!("{base}/coord/sessions/operator-touch");
             crate::auth::attach_device_auth_for(inner.http.post(&url).json(&rec.payload), scope)
+                .send()
+                .await
+        }
+        "spawn_failed_report" => {
+            // A `spawn-failed` report the live POST could not deliver (plan
+            // 2026-11-14-coord-spawn-admission-uses-the-runners-own-launch-ceiling,
+            // Phase 6). POST /agents/:agent_id/spawn-failed with the body the
+            // live POST would have sent. `scope` here is `TenantScope::Device`
+            // (see `push_credential_scope`): the lane is synthetic, so the
+            // record's own resolution would be `Unresolved`, which sends NO
+            // bearer on a multi-bound device — and coord then treats the
+            // report as unverified and never retires the deferred_load marker,
+            // while still answering 200. The generic arms below settle it: 2xx
+            // Ack, 4xx PermanentFailure (Ack-drop), transport / 5xx retry on
+            // this lane's backoff.
+            let Some((agent_id, body)) = super::spawn_report_spool::replay_target(&rec.payload)
+            else {
+                return PushOutcome::PermanentFailure(
+                    "spawn_failed_report payload carries no parseable `agent_id` — the \
+                     spawn-failed URL cannot be built"
+                        .to_string(),
+                );
+            };
+            let url = format!("{base}/agents/{agent_id}/spawn-failed");
+            crate::auth::attach_device_auth_for(inner.http.post(&url).json(&body), scope)
                 .send()
                 .await
         }
@@ -2080,6 +2915,37 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                 return PushOutcome::Transport(format!("{status}: {detail}"));
             }
             if status.is_success() {
+                if kind == "finished" {
+                    // A 2xx is not the finish: coord's answer is the row
+                    // re-hydrated after the write, and only a row reading
+                    // `finished` may stamp `finish_synced` (plan
+                    // 2026-11-05-finish-synced-is-stamped-on-a-2xx-that-did-not-
+                    // move-session-status, Phase 4). Read here, inside the 2xx
+                    // arm, so every non-2xx keeps the ladder below.
+                    use super::coord_sync_finish_ack::{
+                        finished_ack_verdict, unconfirmed_message, FinishedAck,
+                    };
+                    let body = resp.text().await.unwrap_or_default();
+                    return match finished_ack_verdict(status.as_u16(), &body) {
+                        FinishedAck::Observed => PushOutcome::Acked,
+                        FinishedAck::Unconfirmed(reason) => {
+                            PushOutcome::Transport(unconfirmed_message(status.as_u16(), &reason))
+                        }
+                        // Unreachable for a 2xx; never a delivery either way.
+                        FinishedAck::Refused => {
+                            PushOutcome::PermanentFailure(format!("{status}: {}", snippet(&body)))
+                        }
+                    };
+                }
+                drain_body(resp).await;
+                // `landed` moves ONLY here — coord accepted the id.
+                if let Some(id) = rekey_id(rec) {
+                    if let Some(source) =
+                        super::coord_identity::RekeySource::from_payload(&rec.payload)
+                    {
+                        inner.rekeys.note_landed(rec.session_id, id, source);
+                    }
+                }
                 return PushOutcome::Acked;
             }
             if is_lifecycle_kind(kind) && status == StatusCode::TOO_MANY_REQUESTS {
@@ -2108,6 +2974,7 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                     StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
                 )
             {
+                drain_body(resp).await;
                 // Coord build without the session-events ingest route (the
                 // coord slice of Phase 4 ships it in parallel), or a
                 // `coord.sessions` row that has since been GC'd — the ingest
@@ -2197,11 +3064,95 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                     let row = resp.json::<JsonValue>().await.ok();
                     return PushOutcome::Conflict { row };
                 }
+                // Nor is a 409 on the `finished` PATCH a finish: "row gone"
+                // and "already finished" read the same here, and only a row
+                // OBSERVED reading `finished` may stamp `finish_synced`. A
+                // 409 body that carries the row reading `finished` is
+                // observed; anything else is unconfirmed and takes the
+                // bounded retry like an unconfirmed 2xx.
+                if kind == "finished" {
+                    use super::coord_sync_finish_ack::{
+                        finished_ack_verdict, unconfirmed_message, FinishedAck,
+                    };
+                    // coord ANSWERED (409); a body that cannot be read did
+                    // not show the row finished, so it takes the same bounded
+                    // unconfirmed arm — never a network-class transport fault.
+                    let body = match resp.text().await {
+                        Ok(body) => body,
+                        Err(e) => {
+                            return PushOutcome::Transport(unconfirmed_message(
+                                status.as_u16(),
+                                &format!(
+                                    "a 409 answer whose body could not be read: {}",
+                                    transport_error(&e)
+                                ),
+                            ))
+                        }
+                    };
+                    // Judge the BODY as a row: the status is already known.
+                    return match finished_ack_verdict(200, &body) {
+                        FinishedAck::Observed => PushOutcome::Acked,
+                        FinishedAck::Unconfirmed(reason) => {
+                            PushOutcome::Transport(unconfirmed_message(
+                                status.as_u16(),
+                                &format!("a 409 answer: {reason}"),
+                            ))
+                        }
+                        // Unreachable for the 200 judged above.
+                        FinishedAck::Refused => PushOutcome::Transport(unconfirmed_message(
+                            status.as_u16(),
+                            "a 409 answer",
+                        )),
+                    };
+                }
+                // Except a re-key: acking a 409 as success voided the re-key
+                // silently while the local record claimed it. coord's refusal
+                // that another active row holds the id is its own outcome; any
+                // other 409 on a re-key still did not apply it, so the ledger
+                // hears about it and the row keeps the idempotent ack. A
+                // plain-state 409 is unaffected. An unreadable body says nothing
+                // about what coord refused, so that row is retried.
+                if let Some(id) = rekey_id(rec) {
+                    let body = match resp.text().await {
+                        Ok(body) => body,
+                        Err(e) => return PushOutcome::Transport(transport_error(&e)),
+                    };
+                    if refusal_error_code(&body).as_deref() == Some(HARNESS_SESSION_ALREADY_BOUND) {
+                        note_rekey_declined(
+                            inner,
+                            rec,
+                            id,
+                            super::coord_identity::DeclineKind::AlreadyBound,
+                        );
+                        return PushOutcome::Refused(format!("{status}: {}", snippet(&body)));
+                    }
+                    note_rekey_declined(
+                        inner,
+                        rec,
+                        id,
+                        super::coord_identity::DeclineKind::Rejected,
+                    );
+                } else {
+                    drain_body(resp).await;
+                }
                 return PushOutcome::Acked;
             }
             let detail = resp.text().await.unwrap_or_default();
             // 4xx → Ack-drop; 5xx → transient. Shared classifier.
             let outcome = write_failure_outcome(status, format!("{status}: {detail}"));
+            // The drain ACK-drops a permanent failure. For a re-key that leaves
+            // the local record claiming an id coord never took, and every later
+            // confirmation of it would read "already current".
+            if matches!(outcome, PushOutcome::PermanentFailure(_)) {
+                if let Some(id) = rekey_id(rec) {
+                    note_rekey_declined(
+                        inner,
+                        rec,
+                        id,
+                        super::coord_identity::DeclineKind::Rejected,
+                    );
+                }
+            }
             if kind == "coord-transport-rung" && matches!(outcome, PushOutcome::PermanentFailure(_))
             {
                 // The third drain-drop arm for this mirror (404 and 405 are
@@ -2218,12 +3169,23 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
     }
 }
 
+/// Read a coord response body to its end and discard it, chunk by chunk (no
+/// buffering). Every response from the shared coord client must be consumed
+/// before it is dropped: an unread HTTP/2 body leaves DATA frames unconsumed
+/// on the connection, and coord answered that with `too_many_data_frames`
+/// GOAWAYs that quarantined sessions in the outbox (lifecycle plan Phase 85).
+/// A read error mid-body is ignored — the caller has already decided on the
+/// status, and there is nothing left to drain.
+pub(crate) async fn drain_body(mut resp: reqwest::Response) {
+    while let Ok(Some(_)) = resp.chunk().await {}
+}
+
 /// A reqwest transport failure rendered with its FULL source chain
 /// ([`crate::util::error_chain::error_chain`]) and a leading `[timeout]` /
 /// `[connect]` tag, so a log line and `/health` `sessionOutbox.lastFailure`
 /// say WHICH transport fault it was instead of reqwest's generic
 /// "error sending request for url (…)".
-fn transport_error(e: &reqwest::Error) -> String {
+pub(crate) fn transport_error(e: &reqwest::Error) -> String {
     let chain = crate::util::error_chain::error_chain(e);
     if e.is_timeout() {
         format!("[timeout] {chain}")
@@ -2573,13 +3535,15 @@ fn with_gate_caller_session(
 /// Build the `POST /coord/work-units/:slug/register-gate` body from a
 /// `gate_registration` outbox payload — coord's `UnitGateRequest` shape.
 ///
-/// Only the five body fields are forwarded: `work_unit_slug` is a PATH
-/// segment and `work_unit_upsert` is the runner-side lazy bootstrap (see
-/// [`gate_registration_upsert_body`]), so neither belongs on the wire here.
-/// `continuation_spawn` / `clearance_audience` / `gate_class` are omitted
-/// when absent OR null so coord's `#[serde(default)]` /
-/// `default_clearance_audience` apply — a literal `null` would be a
-/// deserialize error on the non-`Option` `clearance_audience`.
+/// Only `UnitGateRequest`'s six body fields are forwarded: `work_unit_slug`
+/// is a PATH segment and `work_unit_upsert` is the runner-side lazy bootstrap
+/// (see [`gate_registration_upsert_body`]), so neither belongs on the wire
+/// here. `continuation_spawn` / `clearance_audience` / `expires_at` /
+/// `gate_class` are omitted when absent OR null so coord's `#[serde(default)]`
+/// / `default_clearance_audience` apply — a literal `null` would be a
+/// deserialize error on the non-`Option` `clearance_audience`. `expires_at` was
+/// once missing here, so a gate spooled during a coord outage was replayed
+/// with no deadline and the reconciler's expiry arm could never fire for it.
 fn gate_registration_body(payload: &JsonValue) -> JsonValue {
     let mut body = serde_json::Map::new();
     // Required by coord; forwarded verbatim when present. Absent means coord
@@ -2590,7 +3554,12 @@ fn gate_registration_body(payload: &JsonValue) -> JsonValue {
             body.insert(key.to_string(), v.clone());
         }
     }
-    for key in ["continuation_spawn", "clearance_audience", "gate_class"] {
+    for key in [
+        "continuation_spawn",
+        "clearance_audience",
+        "expires_at",
+        "gate_class",
+    ] {
         if let Some(v) = payload.get(key) {
             if !v.is_null() {
                 body.insert(key.to_string(), v.clone());
@@ -2728,6 +3697,7 @@ async fn bootstrap_then_register(
                     format!("work-unit bootstrap upsert: {status}: {detail}"),
                 );
             }
+            drain_body(resp).await;
             tracing::info!(
                 session = %rec.session_id,
                 seq = rec.seq,
@@ -2879,11 +3849,72 @@ fn state_change_body(payload: &JsonValue) -> JsonValue {
     if let Some(ccsid) = payload.get("claude_code_session_id") {
         body.insert("claude_code_session_id".into(), ccsid.clone());
     }
+    // Unfinished-resume: an ADOPTED row's account / config dir (coord stamps
+    // them on PATCH under the caller's own tenant + device, with the create
+    // path's validation). Omitted when absent/null.
+    for key in ["account_label", "config_dir"] {
+        if let Some(v) = payload.get(key) {
+            if !v.is_null() {
+                body.insert(key.into(), v.clone());
+            }
+        }
+    }
     // Coord refreshes last_heartbeat_at on any PATCH — passing
     // heartbeat=true ensures the row gets a fresh stamp even when the
     // caller only changed metadata.
-    body.insert("heartbeat".into(), JsonValue::Bool(true));
+    // A resume-parameter-only PATCH (`no_heartbeat`) is metadata for a row
+    // that may be CLOSED: it must not stamp liveness on it.
+    if payload.get("no_heartbeat").and_then(JsonValue::as_bool) != Some(true) {
+        body.insert("heartbeat".into(), JsonValue::Bool(true));
+    }
     JsonValue::Object(body)
+}
+
+/// The `PATCH /sessions/:id` body for a `finished` outbox row.
+///
+/// `{progress:{session_status:"finished", last_progress_at:<RFC 3339>}}`,
+/// where `last_progress_at` is the payload's `finished_at` (unix millis — the
+/// runner's own mark, `SessionLifecycleStore::set_finished`) rendered with
+/// millisecond precision in UTC. coord's `ProgressUpdate::last_progress_at` is
+/// a `DateTime<Utc>`, and coord uses an explicit one as the write instant of
+/// the whole report, so WHENEVER this report moves coord's transition clock
+/// (`state_started_at`, served back as `since`) it moves it to this instant
+/// (plan
+/// `2026-10-23-coord-records-a-session-finished-but-not-when-so-a-revival-cannot-be-told-from-a-re-finish`,
+/// Phase 3 (b)). That is on a real status change on any coord, and on every
+/// finish — finished → finished included — only on a coord carrying that
+/// plan's Phase 2. Without it a late drain post-dates the finish, which is the
+/// unsafe direction for a reader deciding whether a prompt came after it.
+///
+/// A payload with no usable `finished_at` (a row queued by an older build, a
+/// `null`, or a value chrono cannot represent) omits the field, and coord
+/// stamps `now()` exactly as before.
+///
+/// A non-blank `finish_reason` in the payload rides along as
+/// `progress.finish_reason`, which coord stores on the row beside the status. A
+/// finish with no reason omits it. Pure.
+fn finished_body(payload: &JsonValue) -> JsonValue {
+    let mut progress = serde_json::Map::new();
+    progress.insert("session_status".into(), json!("finished"));
+    if let Some(at) = payload
+        .get("finished_at")
+        .and_then(JsonValue::as_i64)
+        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+    {
+        progress.insert(
+            "last_progress_at".into(),
+            json!(at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
+        );
+    }
+    if let Some(reason) = payload
+        .get("finish_reason")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+    {
+        progress.insert("finish_reason".into(), json!(reason));
+    }
+    json!({ "progress": JsonValue::Object(progress) })
 }
 
 /// Build the `PATCH /sessions/:id {progress:{…}}` body from a `progress`
@@ -3478,6 +4509,10 @@ async fn read_refusal_body(mut resp: reqwest::Response) -> Result<String, String
             Err(e) => return Err(e.to_string()),
         }
     }
+    // Past the cap: discard the rest unbuffered rather than drop it unread.
+    // Trade-off: the cap bounds memory; the drain still reads the rest on every poll, bounded
+    // in time by the client's 30 s timeout.
+    drain_body(resp).await;
     // Lossy rather than fatal: a cap can land mid-codepoint, and the result
     // is only ever JSON-parsed or counted. A body that is genuinely not UTF-8
     // fails the parse and is reported by shape, which is the right answer.
@@ -3692,6 +4727,7 @@ async fn fetch_session_coordination_flag(
                 reason,
             });
         }
+        drain_body(resp).await;
         return Err(FlagPollError::Other(format!("status {status}")));
     }
     let body: JsonValue = resp
@@ -3711,6 +4747,41 @@ async fn fetch_session_coordination_flag(
 mod tests {
     use super::*;
     use crate::session::transport::{DynTransport, Transport, TransportError, TransportHandle};
+
+    // Phase 4 of plan 2026-11-05-finish-synced-is-stamped-on-a-2xx-that-did-
+    // not-move-session-status: drain-level tests of the observed finish ACK,
+    // kept out of this file.
+    // `include!` resolves beside this file (a `#[path]` inside an inline
+    // module would resolve under `coord_sync/tests/`, which does not exist).
+    mod finish_ack_drain_tests {
+        include!("coord_sync_finish_ack_drain_tests.rs");
+    }
+
+    /// Every kind the coord session drain pushes — shared by the dispatch-arm
+    /// guard and the credential-scope test so the two cannot cover different
+    /// sets. Excluded: `MemoryRecord` (written to its own `memory-outbox.jsonl`;
+    /// this drain never sees it), and `HandoffRequest` / `AttachRequest`
+    /// (never pushed by the runner — they fall to `push_record`'s ACK-drop
+    /// catch-all on purpose).
+    const DRAINED_KINDS: [SessionEventKind; 17] = [
+        SessionEventKind::Started,
+        SessionEventKind::StateChange,
+        SessionEventKind::Closed,
+        SessionEventKind::Heartbeat,
+        SessionEventKind::ClaimStolen,
+        SessionEventKind::OutputChunk,
+        SessionEventKind::CommitReport,
+        SessionEventKind::Progress,
+        SessionEventKind::HelperTaskCreated,
+        SessionEventKind::RestoreRecord,
+        SessionEventKind::GateRegistration,
+        SessionEventKind::FindingPosted,
+        SessionEventKind::Finished,
+        SessionEventKind::CoordTransportRung,
+        SessionEventKind::AgentNotification,
+        SessionEventKind::OperatorTouch,
+        SessionEventKind::SpawnFailedReport,
+    ];
 
     /// SOURCE GUARD: every session-outbox event kind has a dispatch arm.
     ///
@@ -3734,24 +4805,7 @@ mod tests {
             .expect("the dispatch function must exist")
             .1;
 
-        for kind in [
-            SessionEventKind::Started,
-            SessionEventKind::StateChange,
-            SessionEventKind::Closed,
-            SessionEventKind::Heartbeat,
-            SessionEventKind::ClaimStolen,
-            SessionEventKind::OutputChunk,
-            SessionEventKind::CommitReport,
-            SessionEventKind::Progress,
-            SessionEventKind::HelperTaskCreated,
-            SessionEventKind::RestoreRecord,
-            SessionEventKind::GateRegistration,
-            SessionEventKind::FindingPosted,
-            SessionEventKind::Finished,
-            SessionEventKind::CoordTransportRung,
-            SessionEventKind::AgentNotification,
-            SessionEventKind::OperatorTouch,
-        ] {
+        for kind in DRAINED_KINDS {
             let arm = format!("\"{}\" =>", kind.as_str());
             assert!(
                 dispatch.contains(&arm),
@@ -3793,12 +4847,19 @@ mod tests {
             body.contains(".patch(&url)"),
             "the finished write must be a PATCH, matching the progress arm: {body}"
         );
+        // The body is built by `finished_body` (which also carries the mark's
+        // time — pinned by `finished_body_carries_the_marks_own_time_as_last_progress_at`).
         assert!(
-            body.contains("\"session_status\": \"finished\""),
-            "the body must set coord's WORK axis to finished: {body}"
+            body.contains("finished_body(&rec.payload)"),
+            "the finished arm must send the finished body: {body}"
+        );
+        assert_eq!(
+            finished_body(&json!({}))["progress"]["session_status"],
+            "finished",
+            "the body must set coord's WORK axis to finished"
         );
     }
-    use crate::session::{Intent, SessionKind, SessionRegistry, SessionTransports};
+    use crate::session::{Intent, RowTenant, SessionKind, SessionRegistry, SessionTransports};
     use axum::{
         extract::{Path as AxumPath, Query as AxumQuery, State as AxumState},
         http::StatusCode as AxumStatus,
@@ -3912,6 +4973,13 @@ mod tests {
         /// The `Authorization` header each `POST /sessions` carried, in order
         /// (`None` = went out unauthenticated).
         post_auth: Vec<Option<String>>,
+        /// `PATCH /sessions/:id` for any of these session ids ALWAYS answers
+        /// 502 — an overloaded gateway in front of one session's rows.
+        poison_patch_ids: Vec<Uuid>,
+        /// `PATCH /sessions/:id` carrying a `state` field for any of these
+        /// session ids answers 502 — a failing `state_change` / `closed`
+        /// while that session's plain heartbeats still go through.
+        poison_state_patch_ids: Vec<Uuid>,
         /// When >0, the next N PATCHes return 500. Each attempt decrements it,
         /// so `budget - remaining` counts how many pushes were actually
         /// issued — which is how the bounded-parallel drain is asserted.
@@ -3933,9 +5001,27 @@ mod tests {
         /// The `Authorization` header each ACCEPTED `PATCH /sessions/:id`
         /// carried, index-aligned with `patches` (`None` = unauthenticated).
         patch_auth: Vec<Option<String>>,
+        /// A `PATCH /sessions/:id` re-keying the row onto any of these harness
+        /// ids answers coord's `409 harness_session_already_bound` (another
+        /// ACTIVE row on the device holds it), recording the attempt.
+        rekey_conflict_ids: Vec<String>,
         /// When true, every PATCH returns 404 (simulates a GC'd / missing
         /// coord row — drives the R2 resume 404-fallback path).
         patch_returns_404: bool,
+        /// When set (and `patch_returns_404` is not), every PATCH answers
+        /// this status instead of 200 — drives the resume-probe refusal arm.
+        patch_status: Option<u16>,
+        /// When set, a PATCH carrying `progress.session_status: "finished"`
+        /// answers this `(status, raw JSON body)` instead of the default 200
+        /// whose body echoes the row as coord re-hydrates it — drives the
+        /// unconfirmed-finish arms (a row reading `working`, an absent
+        /// `session_status`, a 503, a 422 refusal). Still recorded in
+        /// `patches` (it was received).
+        finished_answer: Option<(u16, String)>,
+        /// The `tenant_id` field of a 2xx PATCH answer: `None` omits it (the
+        /// field-absent arm), `Some(v)` sends `v` verbatim (a non-UUID string
+        /// drives the unparseable arm).
+        patch_tenant: Option<serde_json::Value>,
         /// When set, `POST /sessions/:id/events` answers this status instead
         /// of 201 (still recording the body) — drives the mirror-drop arms
         /// (404 unknown session id, 405 no ingest route).
@@ -4063,6 +5149,21 @@ mod tests {
                             )
                                 .into_response();
                         }
+                        if g.poison_state_patch_ids.contains(&id) && body.get("state").is_some()
+                        {
+                            return (
+                                AxumStatus::BAD_GATEWAY,
+                                Json(json!({"error": "fake-502"})),
+                            )
+                                .into_response();
+                        }
+                        if g.poison_patch_ids.contains(&id) {
+                            return (
+                                AxumStatus::BAD_GATEWAY,
+                                Json(json!({"error": "fake-502"})),
+                            )
+                                .into_response();
+                        }
                         if g.next_patch_5xx > 0 {
                             g.next_patch_5xx -= 1;
                             return (
@@ -4087,6 +5188,20 @@ mod tests {
                                 .into_response();
                         }
                         g.patches.push((id, body.clone()));
+                        if body
+                            .get("claude_code_session_id")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|c| g.rekey_conflict_ids.iter().any(|x| x == c))
+                        {
+                            return (
+                                AxumStatus::CONFLICT,
+                                Json(json!({
+                                    "error": "harness_session_already_bound",
+                                    "detail": "another active session on this device holds it",
+                                })),
+                            )
+                                .into_response();
+                        }
                         g.patch_auth.push(
                             headers
                                 .get("authorization")
@@ -4100,7 +5215,38 @@ mod tests {
                             )
                                 .into_response();
                         }
-                        (AxumStatus::OK, Json(json!({"id": id}))).into_response()
+                        if let Some(code) = g.patch_status {
+                            return (
+                                AxumStatus::from_u16(code).unwrap(),
+                                Json(json!({"error": "refused"})),
+                            )
+                                .into_response();
+                        }
+                        let reported = body
+                            .get("progress")
+                            .and_then(|p| p.get("session_status"))
+                            .cloned();
+                        if reported.as_ref().and_then(JsonValue::as_str) == Some("finished") {
+                            if let Some((code, raw)) = g.finished_answer.clone() {
+                                return (
+                                    AxumStatus::from_u16(code).unwrap(),
+                                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                                    raw,
+                                )
+                                    .into_response();
+                            }
+                        }
+                        let mut answer = json!({"id": id});
+                        if let Some(t) = g.patch_tenant.clone() {
+                            answer["tenant_id"] = t;
+                        }
+                        // coord answers with the row re-hydrated after the
+                        // write, so a progress report that landed reads back
+                        // its own status.
+                        if let Some(status) = reported {
+                            answer["session_status"] = status;
+                        }
+                        (AxumStatus::OK, Json(answer)).into_response()
                     },
                 )
                 .delete(
@@ -4631,6 +5777,238 @@ mod tests {
             outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
         })
         .await;
+    }
+
+    /// A fake coord serving only `POST /agents/:id/spawn-failed`, answering
+    /// each request with the next scripted status (then 200 once the script
+    /// is spent) and recording every request it saw.
+    async fn spawn_scripted_spawn_failed_coord(
+        script: Vec<u16>,
+    ) -> (String, Arc<TokMutex<(Vec<u16>, Vec<(Uuid, JsonValue)>)>>) {
+        let state = Arc::new(TokMutex::new((script, Vec::new())));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app: Router = Router::new()
+            .route(
+                "/agents/{id}/spawn-failed",
+                post(
+                    |AxumState(state): AxumState<
+                        Arc<TokMutex<(Vec<u16>, Vec<(Uuid, JsonValue)>)>>,
+                    >,
+                     AxumPath(id): AxumPath<Uuid>,
+                     Json(body): Json<JsonValue>| async move {
+                        let mut g = state.lock().await;
+                        g.1.push((id, body));
+                        let status = if g.0.is_empty() { 200 } else { g.0.remove(0) };
+                        (
+                            AxumStatus::from_u16(status).unwrap(),
+                            Json(json!({"agent_id": id})),
+                        )
+                            .into_response()
+                    },
+                ),
+            )
+            .with_state(state.clone());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), state)
+    }
+
+    /// The replay of a spooled spawn-failed report presents the DEVICE
+    /// credential the live POST presents, never the synthetic lane's
+    /// `Unresolved` scope (which sends no bearer on a multi-bound device, so
+    /// coord would class the report unverified and keep the dispatch marker).
+    /// Every other kind keeps its record's own scope.
+    ///
+    /// The source pin at the end is a LEXICAL wiring guard only: it proves
+    /// `push_record`'s head calls `push_credential_scope(kind, …)` before the
+    /// dispatch match, not what the call returns — the value asserts above it
+    /// do that.
+    ///
+    /// Mutation: in `push_record`, use `record_session_tenant(inner, rec)`
+    /// directly (the source pin fails), or return `record_scope` for this kind
+    /// in `push_credential_scope` (the value asserts fail).
+    #[test]
+    fn a_spooled_spawn_failed_report_replays_under_the_device_credential() {
+        let t = Uuid::new_v4();
+        for record_scope in [
+            TenantScope::Unresolved,
+            TenantScope::Owned(t),
+            TenantScope::Device,
+        ] {
+            assert_eq!(
+                push_credential_scope(SessionEventKind::SpawnFailedReport.as_str(), record_scope),
+                TenantScope::Device
+            );
+            for other in DRAINED_KINDS
+                .into_iter()
+                .filter(|k| *k != SessionEventKind::SpawnFailedReport)
+            {
+                assert_eq!(
+                    push_credential_scope(other.as_str(), record_scope),
+                    record_scope,
+                    "{other:?} must keep its record's own scope"
+                );
+            }
+        }
+        let src = include_str!("coord_sync.rs");
+        let dispatch = src
+            .split_once("async fn push_record(")
+            .expect("the dispatch function must exist")
+            .1;
+        let head = dispatch
+            .split_once("let result = match kind {")
+            .expect("the dispatch match must exist")
+            .0;
+        assert!(
+            head.contains("let scope = push_credential_scope(kind,"),
+            "push_record must route the record scope through push_credential_scope"
+        );
+    }
+
+    /// A spooled `spawn_failed_report` is replayed to coord's spawn-failed
+    /// route EXACTLY once on success — to the agent the payload names, with the
+    /// body the live POST would have sent — and a transient 5xx keeps it for a
+    /// retry rather than dropping it.
+    ///
+    /// Mutation: remove the `"spawn_failed_report"` arm from `push_record` (the
+    /// catch-all ACK-drops the row: coord sees ZERO requests and the count
+    /// assertion fails). Adding the kind to `is_best_effort_kind` is caught by
+    /// `a_spooled_spawn_failed_report_outlasts_the_best_effort_budget`, not
+    /// here — one 503 is inside that budget.
+    #[tokio::test]
+    async fn the_drain_replays_a_spooled_spawn_failed_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        // First delivery attempt: coord 503 (transient). Then 200.
+        let (base, seen) = spawn_scripted_spawn_failed_coord(vec![503]).await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+        );
+        let _registry = build_registry(coord.clone());
+
+        let agent_id = Uuid::new_v4();
+        let body = json!({
+            "reason": "deferred_load:thread_pressure:warn:380_over_376",
+            "exit_code": null,
+            "restarts_attempted": 0,
+            "phase": "blocked",
+        });
+        let spool =
+            super::super::closeout_spool::CloseoutSpool::new(outbox.clone(), Uuid::new_v4());
+        super::super::spawn_report_spool::spool_spawn_failed(&spool, agent_id, &body)
+            .expect("spools");
+        let _drain = coord.start_drain_task();
+
+        wait_until(Duration::from_secs(20), || {
+            outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
+        })
+        .await;
+        // Let any (wrong) extra replay surface before counting.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let g = seen.lock().await;
+        assert_eq!(
+            g.1.len(),
+            2,
+            "one 503 (kept, retried) and one 200 (acked) — never dropped on the \
+             transient failure, never re-sent after the ack: {:?}",
+            g.1
+        );
+        for (id, sent) in &g.1 {
+            assert_eq!(*id, agent_id, "replayed to the agent the payload names");
+            assert_eq!(
+                sent, &body,
+                "the live POST's body, verbatim, minus agent_id"
+            );
+        }
+    }
+
+    /// More transient failures than the best-effort budget
+    /// ([`BEST_EFFORT_MAX_ATTEMPTS`], 3) still end in delivery: the kind is NOT
+    /// best-effort, because until coord hears the report it counts the
+    /// allocation in flight.
+    ///
+    /// Mutation: add `SpawnFailedReport` to `is_best_effort_kind` — the row is
+    /// Ack-dropped after its third 503, coord never sees the 200 attempt, and
+    /// the count assertion (5) fails.
+    #[tokio::test]
+    async fn a_spooled_spawn_failed_report_outlasts_the_best_effort_budget() {
+        const {
+            assert!(
+                BEST_EFFORT_MAX_ATTEMPTS < 4,
+                "the script must exceed the budget"
+            )
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, seen) = spawn_scripted_spawn_failed_coord(vec![503, 503, 503, 503]).await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+        );
+        let _registry = build_registry(coord.clone());
+        let spool =
+            super::super::closeout_spool::CloseoutSpool::new(outbox.clone(), Uuid::new_v4());
+        super::super::spawn_report_spool::spool_spawn_failed(
+            &spool,
+            Uuid::new_v4(),
+            &json!({"reason": "deferred_load:thread_pressure:warn:380_over_376", "restarts_attempted": 0}),
+        )
+        .expect("spools");
+        let _drain = coord.start_drain_task();
+        // Backoff 1+2+4+8 s across the four 503s, plus the loop's own cadence.
+        wait_until(Duration::from_secs(60), || {
+            outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let g = seen.lock().await;
+        assert_eq!(
+            g.1.len(),
+            5,
+            "four 503s retried, then the 200 that acked it: {:?}",
+            g.1
+        );
+    }
+
+    /// A 4xx on replay is coord's verdict on the report: Ack-dropped after ONE
+    /// request, never retried.
+    ///
+    /// Mutation: map the 4xx to `Transport` (the row is retried forever).
+    #[tokio::test]
+    async fn a_4xx_on_replay_is_dropped_not_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, seen) = spawn_scripted_spawn_failed_coord(vec![404, 404, 404]).await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+        );
+        let _registry = build_registry(coord.clone());
+        let spool =
+            super::super::closeout_spool::CloseoutSpool::new(outbox.clone(), Uuid::new_v4());
+        super::super::spawn_report_spool::spool_spawn_failed(
+            &spool,
+            Uuid::new_v4(),
+            &json!({"reason": "spawn failure: x", "restarts_attempted": 0}),
+        )
+        .expect("spools");
+        let _drain = coord.start_drain_task();
+        wait_until(Duration::from_secs(10), || {
+            outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(seen.lock().await.1.len(), 1, "a 4xx is not retried");
     }
 
     /// The plan's highest-consequence risk, made concrete for the
@@ -5207,7 +6585,10 @@ mod tests {
             assert_eq!(g.patches.len(), 3, "{:?}", g.patches);
             assert_eq!(
                 g.patches[2].1,
-                json!({ "progress": { "session_status": "finished" } }),
+                json!({ "progress": {
+                    "session_status": "finished",
+                    "last_progress_at": "1970-01-01T00:00:00.001Z",
+                } }),
                 "the finished row was DELIVERED on retry"
             );
         }
@@ -5516,7 +6897,93 @@ mod tests {
         assert_eq!(g.patches[0].0, s);
         assert_eq!(
             g.patches[0].1,
-            json!({ "progress": { "session_status": "finished" } })
+            json!({ "progress": {
+                "session_status": "finished",
+                "last_progress_at": "1970-01-01T00:00:00.001Z",
+            } })
+        );
+    }
+
+    /// End to end (review round 1): a RESTAMPED mark drains with the NEW time.
+    /// The lifecycle store's restamp → its finish observer → the registrar's
+    /// `finished` outbox row → `push_record` → the PATCH coord receives, whose
+    /// `last_progress_at` is the SECOND finish's stamp, not the first's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_restamped_finish_drains_with_the_new_last_progress_at() {
+        use crate::claude_session::coord_register::AiCoordRegistrar;
+        use crate::session::session_lifecycle_store::{test_open_record, SessionLifecycleStore};
+
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let coord_row = Uuid::new_v4();
+        let reg = AiCoordRegistrar::with_tenant_resolver(outbox.clone(), Uuid::new_v4(), || None);
+        reg.attach_terminal_coord_lookup(move |_| Some(coord_row));
+        let store = Arc::new(
+            SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap(),
+        );
+        {
+            let reg = reg.clone();
+            store.attach_finish_observer(move |r| reg.forward_finish_change(r));
+        }
+        store.record_open(test_open_record("s"));
+
+        let first = store
+            .set_finished("s", true, Some("first".into()))
+            .unwrap()
+            .record
+            .finished_at
+            .unwrap();
+        store.mark_finish_synced("s", Some(first));
+        // Revived, then finished again: a reason-carrying re-finish restamps.
+        let again = store
+            .set_finished("s", true, Some("again".into()))
+            .unwrap()
+            .record
+            .finished_at
+            .unwrap();
+        assert_ne!(again, first);
+
+        let rows: Vec<_> = outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.event_kind == SessionEventKind::Finished.as_str())
+            .collect();
+        assert_eq!(
+            rows.len(),
+            2,
+            "the first finish and the re-sent one: {rows:?}"
+        );
+        let last = rows.last().unwrap();
+        assert_eq!(
+            last.payload["finished_at"], again,
+            "the re-sent row carries the NEW stamp"
+        );
+        let outcome = push_record(&coord.inner, last).await;
+        assert!(matches!(outcome, PushOutcome::Acked), "{outcome:?}");
+
+        let expected = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(again)
+            .unwrap()
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let g = rec.lock().await;
+        let (id, body) = g.patches.last().expect("the re-sent finish was PATCHed");
+        assert_eq!(
+            *id, coord_row,
+            "addressed to the session's coord row by PATH"
+        );
+        assert_eq!(body["progress"]["session_status"], "finished");
+        assert_eq!(
+            body["progress"]["last_progress_at"],
+            expected.as_str(),
+            "coord is told the SECOND finish's time: {body}"
         );
     }
 
@@ -5794,7 +7261,12 @@ mod tests {
         let records: Vec<OutboxRecord> = (0..3)
             .map(|_| {
                 outbox
-                    .record(m, s, SessionEventKind::Heartbeat, json!({}))
+                    .record(
+                        m,
+                        s,
+                        SessionEventKind::StateChange,
+                        json!({ "state": "active" }),
+                    )
                     .unwrap()
             })
             .collect();
@@ -5885,8 +7357,8 @@ mod tests {
                 crate::session::local_store::OutboxEvent::new(
                     m,
                     Uuid::new_v4(),
-                    SessionEventKind::Heartbeat,
-                    json!({}),
+                    SessionEventKind::StateChange,
+                    json!({ "state": "active" }),
                 )
             })
             .collect();
@@ -5925,8 +7397,8 @@ mod tests {
             .record(
                 Uuid::new_v4(),
                 Uuid::new_v4(),
-                SessionEventKind::Heartbeat,
-                json!({}),
+                SessionEventKind::StateChange,
+                json!({ "state": "active" }),
             )
             .unwrap()];
         let abort = Arc::new(AtomicBool::new(false));
@@ -5946,6 +7418,1167 @@ mod tests {
             !abort.load(Ordering::Relaxed),
             "a known-failing session's retry must not stall every other session"
         );
+    }
+
+    /// A fake coord that accepts every TCP connection and closes it without
+    /// answering — a network-class failure with NO HTTP status. Returns the
+    /// base URL and the number of connections accepted (one per push).
+    async fn spawn_dropping_coord() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        (format!("http://{addr}"), accepted)
+    }
+
+    /// Phase 2 of plan
+    /// `2026-10-11-a-live-runner-sessions-coord-row-once-reaped-stays-closed-under-its-own-heartbeats`:
+    /// a heartbeat answered with an HTTP 5xx is ACK-dropped and leaves its
+    /// session unblocked — and, since coord's edge answered, it is NOT outage
+    /// evidence: no abort, no `had_transport_error`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_heartbeat_5xx_is_dropped_without_tripping_the_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.next_patch_5xx = 100;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let m = Uuid::new_v4();
+        let s = Uuid::new_v4();
+        let records: Vec<OutboxRecord> = (0..3)
+            .map(|_| {
+                outbox
+                    .record(m, s, SessionEventKind::Heartbeat, json!({}))
+                    .unwrap()
+            })
+            .collect();
+
+        let abort = Arc::new(AtomicBool::new(false));
+        let outcome = push_chain(
+            coord.inner.clone(),
+            records,
+            HashMap::new(),
+            abort.clone(),
+            true,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.succeeded.len(),
+            3,
+            "every failed heartbeat is dropped"
+        );
+        assert!(
+            !outcome.acked_by_coord,
+            "a dropped row is not coord taking it"
+        );
+        assert!(
+            outcome.blocked_on.is_none(),
+            "a failing heartbeat must never become the session's blocking head"
+        );
+        assert!(
+            !outcome.had_transport_error,
+            "a 5xx answer is not an outage"
+        );
+        assert!(
+            !abort.load(Ordering::Relaxed),
+            "a 5xx heartbeat must not stop other sessions' chains"
+        );
+        assert_eq!(100 - rec.lock().await.next_patch_5xx, 3);
+    }
+
+    /// The outage half: a heartbeat that got NO HTTP answer (the connection
+    /// was dropped) is still dropped, but it trips the abort on a fresh
+    /// failure, so an unreachable coord stays bounded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_heartbeat_network_failure_is_dropped_and_trips_the_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, accepted) = spawn_dropping_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let m = Uuid::new_v4();
+        let s = Uuid::new_v4();
+        let records: Vec<OutboxRecord> = (0..3)
+            .map(|_| {
+                outbox
+                    .record(m, s, SessionEventKind::Heartbeat, json!({}))
+                    .unwrap()
+            })
+            .collect();
+        let first = (records[0].session_id, records[0].seq);
+
+        let abort = Arc::new(AtomicBool::new(false));
+        let outcome = push_chain(
+            coord.inner.clone(),
+            records,
+            HashMap::new(),
+            abort.clone(),
+            true,
+        )
+        .await;
+
+        assert!(outcome.had_transport_error);
+        assert!(!outcome.acked_by_coord);
+        assert!(outcome.blocked_on.is_none());
+        assert_eq!(
+            outcome.succeeded,
+            vec![first],
+            "the failed heartbeat is dropped"
+        );
+        assert!(
+            abort.load(Ordering::Relaxed),
+            "a fresh network-class heartbeat failure trips the abort flag"
+        );
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "the tripped abort stops the chain after one request"
+        );
+
+        // A known-failing session (trip_abort = false) drops its heartbeats
+        // without tripping anything.
+        let records: Vec<OutboxRecord> = (0..2)
+            .map(|_| {
+                outbox
+                    .record(m, s, SessionEventKind::Heartbeat, json!({}))
+                    .unwrap()
+            })
+            .collect();
+        let abort = Arc::new(AtomicBool::new(false));
+        let outcome = push_chain(
+            coord.inner.clone(),
+            records,
+            HashMap::new(),
+            abort.clone(),
+            false,
+        )
+        .await;
+        assert_eq!(outcome.succeeded.len(), 2);
+        assert!(outcome.blocked_on.is_none());
+        assert!(!abort.load(Ordering::Relaxed));
+    }
+
+    /// Drain-level outage bound for heartbeats: 40 pending heartbeat sessions
+    /// against an unreachable coord cost at most MAX_CONCURRENT_PUSH_CHAINS
+    /// requests in the tick, the tick reads as an outage, and nothing counts
+    /// as coord having taken a row.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_heartbeat_only_outage_is_bounded_and_reads_as_an_outage() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, accepted) = spawn_dropping_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let m = Uuid::new_v4();
+        let events: Vec<crate::session::local_store::OutboxEvent> = (0..40)
+            .map(|_| {
+                crate::session::local_store::OutboxEvent::new(
+                    m,
+                    Uuid::new_v4(),
+                    SessionEventKind::Heartbeat,
+                    json!({}),
+                )
+            })
+            .collect();
+        outbox.record_batch(events).unwrap();
+
+        let mut state = DrainState::default();
+        let tick = drain_tick(&coord.inner, &mut state).await;
+
+        let issued = accepted.load(Ordering::SeqCst);
+        assert!(issued >= 1);
+        assert!(
+            issued <= MAX_CONCURRENT_PUSH_CHAINS,
+            "an unreachable coord must not fan out: {issued} requests for 40 heartbeats"
+        );
+        assert!(tick.outage, "an unreachable coord is an outage");
+        assert!(state.last_ack.is_none(), "nothing was taken by coord");
+        assert_eq!(state.ack_ticks, 0);
+        assert!(state.quarantined.is_empty());
+        assert!(
+            state.retry.is_empty(),
+            "a heartbeat never blocks its session"
+        );
+    }
+
+    /// The incident shape: one session's heartbeat PATCH answers 502 while coord
+    /// serves everyone else. That 502 must not abort the other sessions'
+    /// chains: every healthy heartbeat goes out in the same tick.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_sessions_heartbeat_502_does_not_abort_other_sessions() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let m = Uuid::new_v4();
+        // `pending()` sorts by (session_id, seq), so this id makes the failing
+        // session's chain run FIRST — its 502 lands while most healthy chains
+        // have not started, which is exactly where the old code's abort trip
+        // stopped them. A random id could sort last and pass on the old code.
+        let failing = Uuid::from_u128(1);
+        rec.lock().await.poison_patch_ids.push(failing);
+        // More healthy sessions than the concurrency bound, so some chains
+        // start only after the failing one has already answered.
+        let healthy: Vec<Uuid> = (0..3 * MAX_CONCURRENT_PUSH_CHAINS)
+            .map(|_| Uuid::new_v4())
+            .collect();
+        let mut events = vec![crate::session::local_store::OutboxEvent::new(
+            m,
+            failing,
+            SessionEventKind::Heartbeat,
+            json!({}),
+        )];
+        events.extend(healthy.iter().map(|sid| {
+            crate::session::local_store::OutboxEvent::new(
+                m,
+                *sid,
+                SessionEventKind::Heartbeat,
+                json!({}),
+            )
+        }));
+        outbox.record_batch(events).unwrap();
+
+        let mut state = DrainState::default();
+        let tick = drain_tick(&coord.inner, &mut state).await;
+
+        assert!(tick.ran_any);
+        assert!(state.last_ack.is_some());
+        let g = rec.lock().await;
+        for sid in &healthy {
+            assert_eq!(
+                g.patches.iter().filter(|(id, _)| id == sid).count(),
+                1,
+                "every healthy session's heartbeat went out in the same tick"
+            );
+        }
+        drop(g);
+        assert!(
+            outbox.pending().unwrap().is_empty(),
+            "the failed heartbeat is dropped and every healthy one is taken"
+        );
+        assert!(!state.retry.contains_key(&failing));
+        assert!(state.quarantined.is_empty());
+    }
+
+    /// A tick in which EVERY pending row is a heartbeat answered 5xx: coord's
+    /// edge answered, so it is not an outage, the rows are dropped, and nothing
+    /// counts as coord having taken a row.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_all_heartbeat_5xx_tick_is_not_an_outage() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.fail_all = true;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let m = Uuid::new_v4();
+        for _ in 0..3 {
+            outbox
+                .record(m, Uuid::new_v4(), SessionEventKind::Heartbeat, json!({}))
+                .unwrap();
+        }
+
+        let mut state = DrainState::default();
+        let tick = drain_tick(&coord.inner, &mut state).await;
+
+        assert!(!tick.outage, "a 5xx answer is not an unreachable coord");
+        assert!(tick.ran_any);
+        assert!(outbox.pending().unwrap().is_empty(), "all three dropped");
+        assert!(state.last_ack.is_none(), "coord took nothing");
+        assert!(state.retry.is_empty());
+        assert_eq!(
+            tick.heartbeats_dropped_on_failure, 3,
+            "each 5xx-dropped heartbeat is counted as a failure drop"
+        );
+        assert_eq!(
+            tick.heartbeats_dropped_on_failure_by_kind,
+            BTreeMap::from([("server_error", 3)])
+        );
+        assert_eq!(tick.heartbeats_superseded, 0);
+        // The tick's counts reached the process totals `/health` serves.
+        assert_static_floor(
+            &HEARTBEATS_DROPPED_ON_FAILURE,
+            3,
+            "heartbeatsDroppedOnFailure",
+        );
+        assert_static_floor(
+            &HEARTBEATS_DROPPED_ON_FAILURE_BY_KIND[heartbeat_drop_kind_slot("server_error")],
+            3,
+            "heartbeatsDroppedOnFailureByKind.server_error",
+        );
+        // The `/health` cell the drain writes carries them. A floor read is
+        // parallel-safe: only `snapshot_heartbeat_drops` writes these fields,
+        // under the cell's mutex, from statics that never decrease, so a later
+        // writer can only raise them.
+        let served = session_outbox_health_json();
+        assert!(served["heartbeatsDroppedOnFailure"]
+            .as_u64()
+            .is_some_and(|n| n >= 3));
+        assert!(served["heartbeatsDroppedOnFailureByKind"]["server_error"]
+            .as_u64()
+            .is_some_and(|n| n >= 3));
+        // Only non-zero kinds are served (so zero drops render `{}`); the
+        // `conflict` slot is always 0, so dropping the filter fails here.
+        let mut h = SessionOutboxHealth::default();
+        snapshot_heartbeat_drops(&mut h);
+        assert!(h
+            .heartbeats_dropped_on_failure_by_kind
+            .values()
+            .all(|n| *n > 0));
+    }
+
+    /// Every kind [`classify_push_failure`] returns for today's status classes
+    /// has its own slot in [`HEARTBEAT_DROP_KINDS`], so no heartbeat drop is
+    /// folded into another kind's count. One sample per status class, plus the
+    /// two no-status arms; a new classifier arm needs a new sample here.
+    #[test]
+    fn every_push_failure_kind_has_a_heartbeat_drop_slot() {
+        let samples: [(&str, bool); 11] = [
+            ("[timeout] no answer", false),
+            ("connection refused", false),
+            ("no status", true),
+            ("503 Service Unavailable: x", false),
+            ("429 Too Many Requests: x", true),
+            ("409 Conflict: x", true),
+            ("404 Not Found: x", true),
+            ("401 Unauthorized: x", true),
+            ("403 Forbidden: x", true),
+            ("422 Unprocessable Entity: x", true),
+            ("302 Found: x", false),
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for (msg, permanent) in samples {
+            let (kind, _) = classify_push_failure(msg, permanent);
+            assert!(
+                HEARTBEAT_DROP_KINDS.contains(&kind),
+                "{msg:?} classified as {kind:?}, which has no slot"
+            );
+            assert_eq!(HEARTBEAT_DROP_KINDS[heartbeat_drop_kind_slot(kind)], kind);
+            seen.insert(kind);
+        }
+        // The samples reach the whole vocabulary, so a kind dropped from the
+        // list (or one the classifier stops producing) fails here too.
+        assert_eq!(seen.len(), HEARTBEAT_DROP_KINDS.len());
+    }
+
+    /// Reads a process-global heartbeat drop counter as a FLOOR, never as an
+    /// exact value or a delta: tests run in parallel and other drain ticks add
+    /// to the same static, but nothing ever subtracts. So after a tick that
+    /// dropped `n` rows, the static is at least `n` if that tick's ACK block
+    /// incremented it -- and a static nothing increments stays 0 for the whole
+    /// process, whatever ran beside this test, so deleting an increment site
+    /// fails the floor deterministically.
+    fn assert_static_floor(static_value: &AtomicU64, n: u64, what: &str) {
+        let seen = static_value.load(Ordering::Relaxed);
+        assert!(seen >= n, "{what}: process total {seen} < this tick's {n}");
+    }
+
+    /// One heartbeat per session, pushed by one drain tick against `base`;
+    /// returns the tick and the drain state after it. Helper for the
+    /// failure-drop counter tests.
+    async fn drain_one_heartbeat_each(base: String, sessions: usize) -> (TickResult, DrainState) {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let m = Uuid::new_v4();
+        for _ in 0..sessions {
+            outbox
+                .record(m, Uuid::new_v4(), SessionEventKind::Heartbeat, json!({}))
+                .unwrap();
+        }
+        let mut state = DrainState::default();
+        let tick = drain_tick(&coord.inner, &mut state).await;
+        assert!(
+            outbox.pending().unwrap().is_empty(),
+            "every failed heartbeat is ACK-dropped"
+        );
+        (tick, state)
+    }
+
+    /// A heartbeat that got no HTTP answer at all is counted as a failure drop
+    /// of kind `network` — the `Transport` arm's unreachable case.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_heartbeat_dropped_unreachable_is_counted_network() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (base, _accepted) = spawn_dropping_coord().await;
+        let (tick, _) = drain_one_heartbeat_each(base, 1).await;
+        assert!(tick.outage, "precondition: an unreachable coord");
+        assert_eq!(tick.heartbeats_dropped_on_failure, 1);
+        assert_eq!(
+            tick.heartbeats_dropped_on_failure_by_kind,
+            BTreeMap::from([("network", 1)])
+        );
+        assert_eq!(tick.heartbeats_superseded, 0);
+    }
+
+    /// A heartbeat answered 403 is ACK-dropped by the `PermanentFailure` arm
+    /// and counted as a failure drop of kind `unauthorized`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_heartbeat_403_is_counted_unauthorized() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.patch_forbidden = true;
+        let (tick, _) = drain_one_heartbeat_each(base, 2).await;
+        assert_eq!(tick.heartbeats_dropped_on_failure, 2);
+        assert_eq!(
+            tick.heartbeats_dropped_on_failure_by_kind,
+            BTreeMap::from([("unauthorized", 2)])
+        );
+    }
+
+    /// A heartbeat PATCH coord answers 404 (no row for the session served to
+    /// this caller) is counted as `not_found`, apart from a malformed row's
+    /// `rejected`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_heartbeat_404_is_counted_not_found() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.patch_returns_404 = true;
+        let (tick, _) = drain_one_heartbeat_each(base, 1).await;
+        assert_eq!(tick.heartbeats_dropped_on_failure, 1);
+        assert_eq!(
+            tick.heartbeats_dropped_on_failure_by_kind,
+            BTreeMap::from([("not_found", 1)])
+        );
+    }
+
+    /// A heartbeat 429 is not retried (`heartbeat` is not a lifecycle kind), so
+    /// it lands in `PermanentFailure` and is counted as `rate_limited`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_heartbeat_429_is_counted_rate_limited() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.next_patch_429 = 1;
+        let (tick, state) = drain_one_heartbeat_each(base, 1).await;
+        assert_eq!(tick.heartbeats_dropped_on_failure, 1);
+        assert_eq!(
+            tick.heartbeats_dropped_on_failure_by_kind,
+            BTreeMap::from([("rate_limited", 1)])
+        );
+        assert!(state.retry.is_empty(), "a heartbeat 429 is never retried");
+        assert_eq!(rec.lock().await.next_patch_429, 0, "the 429 was served");
+    }
+
+    /// Only HEARTBEAT failure drops are counted: a `state_change` coord refuses
+    /// with a 4xx is ACK-dropped by the same arm and moves no heartbeat counter.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_non_heartbeat_4xx_drop_is_not_a_heartbeat_drop() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.patch_status = Some(422);
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        outbox
+            .record(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                SessionEventKind::StateChange,
+                json!({ "state": "active" }),
+            )
+            .unwrap();
+        let mut state = DrainState::default();
+        let tick = drain_tick(&coord.inner, &mut state).await;
+        assert!(
+            outbox.pending().unwrap().is_empty(),
+            "precondition: the 422 row was ACK-dropped"
+        );
+        assert_eq!(tick.heartbeats_dropped_on_failure, 0);
+        assert!(tick.heartbeats_dropped_on_failure_by_kind.is_empty());
+    }
+
+    /// The `(seq, kind)` of every pending row of `session`, in seq order.
+    fn pending_of(outbox: &OutboxWriter, session: Uuid) -> Vec<(i64, String)> {
+        outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.session_id == session)
+            .map(|r| (r.seq, r.event_kind))
+            .collect()
+    }
+
+    /// Supersession: a run of consecutive pending heartbeats collapses to its
+    /// NEWEST row. Proven on the outbox itself: with the session sitting out its
+    /// own backoff (so nothing is sent), the tick ACK-drops the older rows and
+    /// the one left pending is the highest seq. The next tick sends exactly it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_of_pending_heartbeats_collapses_to_its_newest() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let m = Uuid::new_v4();
+        let s = Uuid::new_v4();
+        // The backlog an outage leaves: a run of heartbeats.
+        let seqs: Vec<i64> = (0..6)
+            .map(|_| {
+                outbox
+                    .record(m, s, SessionEventKind::Heartbeat, json!({}))
+                    .unwrap()
+                    .seq
+            })
+            .collect();
+        let newest = *seqs.iter().max().unwrap();
+
+        let mut state = DrainState::default();
+        state.retry.insert(
+            s,
+            SessionRetry {
+                failures: 1,
+                serving_failures: 0,
+                next_attempt_at: Instant::now() + Duration::from_secs(3600),
+                failed_at_ack_tick: 0,
+                unconfirmed_finish: None,
+            },
+        );
+        let tick = drain_tick(&coord.inner, &mut state).await;
+        assert_eq!(
+            pending_of(&outbox, s),
+            vec![(newest, "heartbeat".to_string())],
+            "only the NEWEST heartbeat of the run survives"
+        );
+        assert!(rec.lock().await.patches.is_empty(), "nothing was sent");
+        assert_eq!(
+            tick.heartbeats_superseded, 5,
+            "the five superseded rows are counted once their ACK landed"
+        );
+        assert_eq!(
+            tick.heartbeats_dropped_on_failure, 0,
+            "nothing was pushed, so nothing failed"
+        );
+
+        state.retry.get_mut(&s).unwrap().next_attempt_at = Instant::now();
+        drain_tick(&coord.inner, &mut state).await;
+        assert_eq!(
+            rec.lock()
+                .await
+                .patches
+                .iter()
+                .filter(|(id, _)| *id == s)
+                .count(),
+            1
+        );
+        assert!(outbox.pending().unwrap().is_empty());
+    }
+
+    /// A heartbeat is never superseded ACROSS a non-heartbeat row: in
+    /// hb, hb, state_change, hb, hb the heartbeat before the `state_change` is
+    /// still sent even though that `state_change` then fails and blocks the
+    /// chain — liveness is not lost exactly when the session is stuck. Only
+    /// each run collapses (to its newest), and the order is kept.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_heartbeat_is_never_superseded_across_a_state_change() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let m = Uuid::new_v4();
+        let t = Uuid::new_v4();
+        rec.lock().await.poison_state_patch_ids.push(t);
+        let hb = |outbox: &OutboxWriter| {
+            outbox
+                .record(m, t, SessionEventKind::Heartbeat, json!({}))
+                .unwrap()
+                .seq
+        };
+        hb(&outbox);
+        hb(&outbox);
+        let change = outbox
+            .record(
+                m,
+                t,
+                SessionEventKind::StateChange,
+                json!({ "state": "pending_resolution" }),
+            )
+            .unwrap()
+            .seq;
+        hb(&outbox);
+        let last = hb(&outbox);
+
+        let mut state = DrainState::default();
+        drain_tick(&coord.inner, &mut state).await;
+        {
+            let g = rec.lock().await;
+            let sent: Vec<&JsonValue> = g
+                .patches
+                .iter()
+                .filter(|(id, _)| *id == t)
+                .map(|(_, b)| b)
+                .collect();
+            assert_eq!(
+                sent,
+                vec![&json!({ "heartbeat": true })],
+                "the heartbeat before the failing state_change still reached coord"
+            );
+        }
+        assert_eq!(
+            pending_of(&outbox, t),
+            vec![
+                (change, "state_change".to_string()),
+                (last, "heartbeat".to_string()),
+            ],
+            "the blocked state_change heads the chain, the trailing run collapsed \
+             to its newest"
+        );
+
+        // The state_change recovers: it and the newest heartbeat go out, in order.
+        rec.lock().await.poison_state_patch_ids.clear();
+        state.retry.get_mut(&t).unwrap().next_attempt_at = Instant::now();
+        drain_tick(&coord.inner, &mut state).await;
+        let g = rec.lock().await;
+        let sent: Vec<&JsonValue> = g
+            .patches
+            .iter()
+            .filter(|(id, _)| *id == t)
+            .map(|(_, b)| b)
+            .collect();
+        assert_eq!(sent.len(), 3);
+        assert_eq!(sent[1]["state"], "pending_resolution");
+        assert_eq!(sent[2], &json!({ "heartbeat": true }));
+        drop(g);
+        assert!(outbox.pending().unwrap().is_empty());
+    }
+
+    /// Drive `failing`'s rows of `kind` through a gateway 502 while coord keeps
+    /// taking another session's rows, for one more round than the quarantine
+    /// threshold. Returns the drain state afterwards.
+    async fn drive_502s_while_coord_serves_others(
+        coord: &CoordSync,
+        outbox: &OutboxWriter,
+        machine: Uuid,
+        failing: Uuid,
+        kind: SessionEventKind,
+        payload: JsonValue,
+    ) -> DrainState {
+        let mut state = DrainState::default();
+        let other = Uuid::new_v4();
+        record_started(outbox, machine, other);
+        drain_tick(&coord.inner, &mut state).await;
+        assert!(state.last_ack.is_some(), "coord is serving");
+        for _ in 0..QUARANTINE_AFTER_SERVING_FAILURES + 2 {
+            outbox
+                .record(machine, failing, kind, payload.clone())
+                .unwrap();
+            outbox
+                .record(machine, other, SessionEventKind::Heartbeat, json!({}))
+                .unwrap();
+            if let Some(r) = state.retry.get_mut(&failing) {
+                r.next_attempt_at = Instant::now();
+            }
+            drain_tick(&coord.inner, &mut state).await;
+        }
+        state
+    }
+
+    /// Phase 2: a session whose heartbeat head answers 502 again and again
+    /// while coord ACKs another session's rows is NOT quarantined, and its
+    /// next `state_change` / `closed` still reach coord.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_heartbeat_502_storm_never_quarantines_its_session() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let machine = Uuid::new_v4();
+        let failing = Uuid::new_v4();
+        rec.lock().await.poison_patch_ids.push(failing);
+
+        let mut state = drive_502s_while_coord_serves_others(
+            &coord,
+            &outbox,
+            machine,
+            failing,
+            SessionEventKind::Heartbeat,
+            json!({}),
+        )
+        .await;
+        assert!(
+            !state.quarantined.contains(&failing),
+            "failing heartbeats quarantined their session"
+        );
+        assert!(
+            !state.retry.contains_key(&failing),
+            "a failing heartbeat must not put its session on a serving-failure count"
+        );
+        assert!(
+            !outbox
+                .pending()
+                .unwrap()
+                .iter()
+                .any(|r| r.session_id == failing),
+            "the failed heartbeats are dropped, not left to head-of-line-block"
+        );
+
+        // The gateway recovers: the session's lifecycle rows still reach coord.
+        rec.lock().await.poison_patch_ids.clear();
+        outbox
+            .record(
+                machine,
+                failing,
+                SessionEventKind::StateChange,
+                json!({ "state": "pending_resolution" }),
+            )
+            .unwrap();
+        outbox
+            .record(machine, failing, SessionEventKind::Closed, json!({}))
+            .unwrap();
+        drain_tick(&coord.inner, &mut state).await;
+        let g = rec.lock().await;
+        let bodies: Vec<&JsonValue> = g
+            .patches
+            .iter()
+            .filter(|(id, _)| *id == failing)
+            .map(|(_, b)| b)
+            .collect();
+        assert!(
+            bodies.iter().any(|b| b["state"] == "pending_resolution"),
+            "the state_change reached coord: {bodies:?}"
+        );
+        assert!(
+            bodies.iter().any(|b| b["state"] == "closed"),
+            "the close reached coord: {bodies:?}"
+        );
+    }
+
+    /// Phase 2's other half: a NON-heartbeat head row under the same sequence
+    /// still quarantines — the poisoned-row guard is intact.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_non_heartbeat_head_under_a_502_storm_still_quarantines() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let machine = Uuid::new_v4();
+        let failing = Uuid::new_v4();
+        rec.lock().await.poison_patch_ids.push(failing);
+
+        let state = drive_502s_while_coord_serves_others(
+            &coord,
+            &outbox,
+            machine,
+            failing,
+            SessionEventKind::StateChange,
+            json!({ "state": "active" }),
+        )
+        .await;
+        assert!(
+            state.quarantined.contains(&failing),
+            "a state_change head coord keeps refusing must still quarantine"
+        );
+    }
+
+    /// Quarantine a session on its `state_change` row (every state PATCH 502s
+    /// while coord serves another session). Returns the drain state.
+    async fn quarantined_on_state_change(
+        coord: &CoordSync,
+        outbox: &OutboxWriter,
+        rec: &Arc<TokMutex<CoordRecorder>>,
+        machine: Uuid,
+        failing: Uuid,
+    ) -> DrainState {
+        rec.lock().await.poison_state_patch_ids.push(failing);
+        let state = drive_502s_while_coord_serves_others(
+            coord,
+            outbox,
+            machine,
+            failing,
+            SessionEventKind::StateChange,
+            json!({ "state": "active" }),
+        )
+        .await;
+        assert!(
+            state.quarantined.contains(&failing),
+            "precondition: quarantined"
+        );
+        state
+    }
+
+    fn make_due(state: &mut DrainState, session: Uuid) {
+        if let Some(r) = state.retry.get_mut(&session) {
+            r.next_attempt_at = Instant::now();
+        }
+    }
+
+    /// A session quarantined by its `state_change` row still delivers its
+    /// heartbeats: the newest pending one goes out at the FRONT of the
+    /// session's chain (ahead of the stuck row — a heartbeat PATCH carries no
+    /// state), the older ones are superseded, and the lifecycle rows stay in
+    /// the outbox rather than going to the sidecar.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_quarantined_session_still_delivers_its_newest_heartbeat() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let machine = Uuid::new_v4();
+        let failing = Uuid::new_v4();
+        let mut state = quarantined_on_state_change(&coord, &outbox, &rec, machine, failing).await;
+        // One more attempt at the stuck row pins its retry at MAX_BACKOFF; the
+        // heartbeat below must go out INSIDE that window.
+        drain_tick(&coord.inner, &mut state).await;
+        assert!(
+            state.retry.get(&failing).expect("retrying").next_attempt_at
+                > Instant::now() + MAX_BACKOFF - Duration::from_secs(5),
+            "precondition: the lifecycle retry is pinned"
+        );
+        let patches_before = rec
+            .lock()
+            .await
+            .patches
+            .iter()
+            .filter(|(id, _)| *id == failing)
+            .count();
+
+        let hb = |outbox: &OutboxWriter| {
+            outbox
+                .record(machine, failing, SessionEventKind::Heartbeat, json!({}))
+                .unwrap()
+        };
+        hb(&outbox);
+        outbox
+            .record(
+                machine,
+                failing,
+                SessionEventKind::StateChange,
+                json!({ "state": "pending_resolution" }),
+            )
+            .unwrap();
+        hb(&outbox);
+        hb(&outbox);
+
+        let tick = drain_tick(&coord.inner, &mut state).await;
+
+        let g = rec.lock().await;
+        let sent: Vec<&JsonValue> = g
+            .patches
+            .iter()
+            .filter(|(id, _)| *id == failing)
+            .skip(patches_before)
+            .map(|(_, b)| b)
+            .collect();
+        assert_eq!(
+            sent,
+            vec![&json!({ "heartbeat": true })],
+            "exactly the newest heartbeat reached coord"
+        );
+        drop(g);
+        let pending = pending_of(&outbox, failing);
+        assert!(
+            pending.iter().all(|(_, k)| k == "state_change"),
+            "only the stuck lifecycle rows remain: {pending:?}"
+        );
+        assert!(
+            pending.len() > 1,
+            "the lifecycle rows were held, not sidecarred"
+        );
+        assert_eq!(
+            tick.heartbeats_superseded, 2,
+            "the two older heartbeats are counted as superseded"
+        );
+        assert_eq!(tick.heartbeats_dropped_on_failure, 0);
+        assert!(
+            !quarantine_path(&outbox).exists(),
+            "no lifecycle row went to the sidecar"
+        );
+        assert!(
+            state.quarantined.contains(&failing),
+            "a delivered heartbeat does not lift the quarantine"
+        );
+    }
+
+    /// D3: a quarantined session's `finished` row stays in the outbox and is
+    /// retried once a minute, then delivered when coord takes it; its
+    /// non-lifecycle rows still go to the sidecar.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_quarantined_sessions_finished_row_is_held_not_sidecarred() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let machine = Uuid::new_v4();
+        let failing = Uuid::new_v4();
+        let mut state = quarantined_on_state_change(&coord, &outbox, &rec, machine, failing).await;
+
+        outbox
+            .record(
+                machine,
+                failing,
+                SessionEventKind::Finished,
+                json!({ "claude_session_id": "csid", "finished_at": 1 }),
+            )
+            .unwrap();
+        outbox
+            .record(machine, failing, SessionEventKind::Progress, json!({}))
+            .unwrap();
+        make_due(&mut state, failing);
+        drain_tick(&coord.inner, &mut state).await;
+
+        let pending = pending_of(&outbox, failing);
+        assert!(
+            pending.iter().any(|(_, k)| k == "finished"),
+            "the finished row is still in the outbox: {pending:?}"
+        );
+        assert!(
+            pending.iter().all(|(_, k)| k != "progress"),
+            "the non-lifecycle row left the outbox for the sidecar: {pending:?}"
+        );
+        let sidecar = std::fs::read_to_string(quarantine_path(&outbox)).unwrap();
+        assert!(
+            sidecar.contains("progress"),
+            "the progress row is sidecarred"
+        );
+        assert!(
+            !sidecar.contains("finished") && !sidecar.contains("state_change"),
+            "no lifecycle row is in the sidecar: {sidecar}"
+        );
+        let wait = state
+            .retry
+            .get(&failing)
+            .expect("still retrying")
+            .next_attempt_at;
+        assert!(
+            wait > Instant::now() + MAX_BACKOFF - Duration::from_secs(5),
+            "a quarantined session's lifecycle retry is pinned at MAX_BACKOFF"
+        );
+
+        // Coord takes the row again: the whole held chain, `finished` included.
+        rec.lock().await.poison_state_patch_ids.clear();
+        make_due(&mut state, failing);
+        drain_tick(&coord.inner, &mut state).await;
+        assert!(
+            pending_of(&outbox, failing).is_empty(),
+            "the held rows were delivered once coord took them"
+        );
+        assert!(
+            rec.lock()
+                .await
+                .patches
+                .iter()
+                .any(|(id, b)| *id == failing && b.to_string().contains("finished")),
+            "the finish reached coord"
+        );
+    }
+
+    /// A quarantined session whose `started` row coord keeps refusing has no
+    /// coord row. Its heartbeats stay in seq order BEHIND the `started` — never
+    /// PATCHed into a 404, and not dropped: both go out, in order, once coord
+    /// takes the `started`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_quarantined_start_keeps_its_heartbeats_behind_it() {
+        let _amb = crate::test_env::isolated_ambient();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let machine = Uuid::new_v4();
+        let stuck = Uuid::new_v4();
+        rec.lock().await.poison_post_ids.push(stuck);
+
+        let mut state = DrainState::default();
+        let other = Uuid::new_v4();
+        record_started(&outbox, machine, other);
+        drain_tick(&coord.inner, &mut state).await;
+        record_started(&outbox, machine, stuck);
+        for _ in 0..QUARANTINE_AFTER_SERVING_FAILURES + 2 {
+            outbox
+                .record(machine, other, SessionEventKind::Heartbeat, json!({}))
+                .unwrap();
+            make_due(&mut state, stuck);
+            drain_tick(&coord.inner, &mut state).await;
+        }
+        assert!(
+            state.quarantined.contains(&stuck),
+            "precondition: quarantined"
+        );
+
+        outbox
+            .record(machine, stuck, SessionEventKind::Heartbeat, json!({}))
+            .unwrap();
+        make_due(&mut state, stuck);
+        drain_tick(&coord.inner, &mut state).await;
+        assert!(
+            rec.lock().await.patches.iter().all(|(id, _)| *id != stuck),
+            "no heartbeat PATCH for a session coord never created"
+        );
+        let pending = pending_of(&outbox, stuck);
+        assert_eq!(
+            pending.iter().map(|(_, k)| k.as_str()).collect::<Vec<_>>(),
+            vec!["started", "heartbeat"],
+            "the started row and its heartbeat are both held, in order"
+        );
+        assert!(
+            !quarantine_path(&outbox).exists(),
+            "the started row is not sidecarred"
+        );
+
+        rec.lock().await.poison_post_ids.clear();
+        make_due(&mut state, stuck);
+        drain_tick(&coord.inner, &mut state).await;
+        assert!(pending_of(&outbox, stuck).is_empty());
+        assert!(
+            rec.lock().await.patches.iter().any(|(id, _)| *id == stuck),
+            "the heartbeat followed the started row"
+        );
+    }
+
+    /// At the cap the sidecar rotates to `.1` and the new row is written, not
+    /// dropped; a second rotation replaces the `.1` generation.
+    #[test]
+    fn the_quarantine_sidecar_rotates_at_its_cap_instead_of_dropping() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let machine = Uuid::new_v4();
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            "http://127.0.0.1:1".to_string(),
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let mut state = DrainState::default();
+        let sidecar = quarantine_path(&outbox);
+        let rotated = quarantine_rotated_path(&sidecar);
+        assert!(rotated.to_string_lossy().ends_with(".quarantine.1.jsonl"));
+        let before = QUARANTINE_ROTATIONS.load(Ordering::Relaxed);
+
+        let row = || {
+            let s = Uuid::new_v4();
+            let r = outbox
+                .record(machine, s, SessionEventKind::Progress, json!({}))
+                .unwrap();
+            (s, r)
+        };
+        // Fill the sidecar to its cap, then quarantine a row.
+        std::fs::File::create(&sidecar)
+            .unwrap()
+            .set_len(QUARANTINE_MAX_BYTES)
+            .unwrap();
+        let (s1, r1) = row();
+        let done = quarantine_rows(&coord.inner, &mut state, vec![r1]);
+        assert_eq!(done.len(), 1, "the row was written, so it may be ACKed");
+        assert_eq!(
+            std::fs::metadata(&rotated).unwrap().len(),
+            QUARANTINE_MAX_BYTES,
+            "the full sidecar became the .1 generation"
+        );
+        assert!(std::fs::read_to_string(&sidecar)
+            .unwrap()
+            .contains(&s1.to_string()));
+
+        // A second rotation replaces `.1`, and leaves only one generation.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&sidecar)
+            .unwrap()
+            .set_len(QUARANTINE_MAX_BYTES)
+            .unwrap();
+        let (s2, r2) = row();
+        quarantine_rows(&coord.inner, &mut state, vec![r2]);
+        assert!(
+            std::fs::read(&rotated)
+                .unwrap()
+                .windows(36)
+                .any(|w| w == s1.to_string().as_bytes()),
+            ".1 now holds the first generation's row"
+        );
+        assert!(std::fs::read_to_string(&sidecar)
+            .unwrap()
+            .contains(&s2.to_string()));
+        let generations = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".quarantine")
+            })
+            .count();
+        assert_eq!(generations, 2, "the live sidecar and one .1 generation");
+        assert!(QUARANTINE_ROTATIONS.load(Ordering::Relaxed) >= before + 2);
     }
 
     /// Record a `started` row for `session` straight into the outbox.
@@ -6007,11 +8640,19 @@ mod tests {
         // the stuck one's retry must not abort the healthy chain.
         let healthy = Uuid::new_v4();
         record_started(&outbox, machine, healthy);
-        for _ in 0..2 {
-            outbox
-                .record(machine, healthy, SessionEventKind::Heartbeat, json!({}))
-                .unwrap();
-        }
+        // A two-row tail. Not two heartbeats: the drain sends only the newest
+        // of a session's pending heartbeats.
+        outbox
+            .record(
+                machine,
+                healthy,
+                SessionEventKind::StateChange,
+                json!({ "state": "active" }),
+            )
+            .unwrap();
+        outbox
+            .record(machine, healthy, SessionEventKind::Heartbeat, json!({}))
+            .unwrap();
         state.retry.get_mut(&stuck).unwrap().next_attempt_at = Instant::now();
         drain_tick(&coord.inner, &mut state).await;
 
@@ -6047,16 +8688,16 @@ mod tests {
             state.quarantined.contains(&stuck),
             "the stuck session is quarantined"
         );
-        // The row moves on the tick after the quarantine decision.
+        // Phase 3 (D3): a quarantined session's `started` is a lifecycle row,
+        // so it is HELD for a once-a-minute retry — never sidecarred — and it
+        // no longer blocks anyone else's queue.
         drain_tick(&coord.inner, &mut state).await;
+        let pending = outbox.pending().unwrap();
+        assert_eq!(pending.len(), 1, "the stuck started row is held");
+        assert!(pending.iter().all(|r| r.session_id == stuck));
         assert!(
-            outbox.pending().unwrap().is_empty(),
-            "nothing left blocking the queue"
-        );
-        let sidecar = std::fs::read_to_string(quarantine_path(&outbox)).unwrap();
-        assert!(
-            sidecar.contains(&stuck.to_string()),
-            "the quarantined row landed in the sidecar, not nowhere"
+            !quarantine_path(&outbox).exists(),
+            "a lifecycle row never goes to the sidecar"
         );
     }
 
@@ -6117,7 +8758,12 @@ mod tests {
         rec.lock().await.fail_all = true;
         let failing = Uuid::new_v4();
         outbox
-            .record(machine, failing, SessionEventKind::Heartbeat, json!({}))
+            .record(
+                machine,
+                failing,
+                SessionEventKind::StateChange,
+                json!({ "state": "active" }),
+            )
             .unwrap();
         outbox
             .record(
@@ -6173,6 +8819,10 @@ mod tests {
             ("rejected", Some(422))
         );
         assert_eq!(
+            classify_push_failure("404 Not Found: {\"error\":\"session not found\"}", true),
+            ("not_found", Some(404))
+        );
+        assert_eq!(
             classify_push_failure("error sending request for url (https://x/sessions)", false),
             ("network", None)
         );
@@ -6213,6 +8863,16 @@ mod tests {
             "no tick yet is UNKNOWN, not zero"
         );
         assert!(unobserved["lastFailure"].is_null());
+        for key in [
+            "heartbeatsSuperseded",
+            "heartbeatsDroppedOnFailure",
+            "heartbeatsDroppedOnFailureByKind",
+        ] {
+            assert!(
+                unobserved[key].is_null(),
+                "sessionOutbox.{key} before the first tick is UNKNOWN, not zero"
+            );
+        }
 
         let at = Utc::now();
         let observed = render_session_outbox_health(&SessionOutboxHealth {
@@ -6227,6 +8887,14 @@ mod tests {
             }),
             retrying_sessions: 1,
             quarantined_sessions: 0,
+            heartbeats_superseded: 2,
+            heartbeats_dropped_on_failure: 3,
+            heartbeats_dropped_on_failure_by_kind: BTreeMap::from([
+                ("server_error", 2),
+                ("not_found", 1),
+            ]),
+            quarantine_rotations: 1,
+            finished_unconfirmed: 0,
         });
         for key in [
             "pending",
@@ -6235,6 +8903,11 @@ mod tests {
             "lastFailure",
             "retryingSessions",
             "quarantinedSessions",
+            "heartbeatsSuperseded",
+            "heartbeatsDroppedOnFailure",
+            "heartbeatsDroppedOnFailureByKind",
+            "quarantineRotations",
+            "finishedUnconfirmed",
             "observedAt",
         ] {
             assert!(
@@ -6243,6 +8916,20 @@ mod tests {
             );
         }
         assert_eq!(observed["pending"], 3);
+        assert_eq!(observed["heartbeatsSuperseded"], 2);
+        assert_eq!(observed["quarantineRotations"], 1);
+        assert_eq!(observed["heartbeatsDroppedOnFailure"], 3);
+        assert_eq!(
+            observed["heartbeatsDroppedOnFailureByKind"],
+            json!({ "server_error": 2, "not_found": 1 })
+        );
+        // Observed with nothing dropped on failure: an empty object, not null.
+        let quiet = render_session_outbox_health(&SessionOutboxHealth {
+            observed_at: Some(at),
+            ..SessionOutboxHealth::default()
+        });
+        assert_eq!(quiet["heartbeatsDroppedOnFailure"], 0);
+        assert_eq!(quiet["heartbeatsDroppedOnFailureByKind"], json!({}));
         assert_eq!(observed["lastFailure"]["kind"], "server_error");
         assert_eq!(observed["lastFailure"]["status"], 503);
         assert!(observed["lastFailure"]["at"].is_string());
@@ -6739,14 +9426,16 @@ mod tests {
             "a lone poisoned row must not back off the whole loop"
         );
 
-        // Whereas a FRESH failure with nothing taken is.
+        // Whereas a FRESH failure with nothing taken is. (A `state_change`, not
+        // a heartbeat: a heartbeat answered with an HTTP 5xx is dropped and is
+        // deliberately not outage evidence.)
         rec.lock().await.fail_all = true;
         outbox
             .record(
                 machine,
                 Uuid::new_v4(),
-                SessionEventKind::Heartbeat,
-                json!({}),
+                SessionEventKind::StateChange,
+                json!({ "state": "active" }),
             )
             .unwrap();
         let tick = drain_tick(&coord.inner, &mut state).await;
@@ -6882,12 +9571,21 @@ mod tests {
         })
         .await;
         let g = rec.lock().await;
-        assert!(
-            g.patches
-                .iter()
-                .any(|(id, b)| *id == session_id && b["progress"]["session_status"] == "finished"),
-            "the marker must reach coord as PATCH /sessions/:id: {:?}",
-            g.patches
+        let patch = g
+            .patches
+            .iter()
+            .find(|(id, b)| *id == session_id && b["progress"]["session_status"] == "finished")
+            .unwrap_or_else(|| {
+                panic!(
+                    "the marker must reach coord as PATCH /sessions/:id: {:?}",
+                    g.patches
+                )
+            });
+        assert_eq!(
+            patch.1["progress"]["last_progress_at"], "1970-01-01T00:00:00.042Z",
+            "the PATCH carries the mark's own time, so coord dates the finish at \
+             the declaration rather than at the drain: {:?}",
+            patch.1
         );
     }
 
@@ -7164,6 +9862,20 @@ mod tests {
         );
     }
 
+    /// An adopted row's resume parameters ride a PATCH that stamps NO liveness.
+    #[test]
+    fn state_change_body_forwards_resume_params_without_a_heartbeat() {
+        let body = state_change_body(&json!({
+            "account_label": ".claude-gmail",
+            "config_dir": "/home/u/.claude-gmail",
+            "no_heartbeat": true,
+        }));
+        assert_eq!(body["account_label"], ".claude-gmail");
+        assert_eq!(body["config_dir"], "/home/u/.claude-gmail");
+        assert!(body.get("heartbeat").is_none());
+        assert!(body.get("no_heartbeat").is_none());
+    }
+
     /// Phase 2b of plan
     /// `2026-09-02-coord-report-status-unscoped-write-hits-a-peer-session`: the
     /// confirmation event's own field reaches coord's `UpdateSessionRequest`.
@@ -7184,6 +9896,65 @@ mod tests {
         assert!(body.get("repo").is_none());
         assert!(body.get("branch").is_none());
         assert!(body.get("intent_updates").is_none());
+    }
+
+    #[test]
+    fn finished_body_carries_a_reason_only_when_there_is_one() {
+        assert_eq!(
+            finished_body(&json!({"finish_reason": "dismissed"}))["progress"]["finish_reason"],
+            json!("dismissed")
+        );
+        for payload in [
+            json!({}),
+            json!({"finish_reason": null}),
+            json!({"finish_reason": "   "}),
+        ] {
+            assert!(
+                finished_body(&payload)["progress"]
+                    .get("finish_reason")
+                    .is_none(),
+                "{payload}"
+            );
+        }
+    }
+
+    /// A `finished` row's PATCH carries the mark's own `finished_at` as an
+    /// RFC 3339 `last_progress_at`, and omits it when the payload has no usable
+    /// time.
+    #[test]
+    fn finished_body_carries_the_marks_own_time_as_last_progress_at() {
+        // 2026-09-13T10:00:00.123Z — the mark's `finished_at`, unix millis.
+        let body = finished_body(&json!({
+            "id": Uuid::new_v4(),
+            "claude_session_id": "csid",
+            "finished_at": 1_789_293_600_123_i64,
+        }));
+        assert_eq!(
+            body,
+            json!({ "progress": {
+                "session_status": "finished",
+                "last_progress_at": "2026-09-13T10:00:00.123Z",
+            } }),
+            "coord deserializes `last_progress_at` as a DateTime<Utc> and uses it \
+             as the write instant, so `since` is the declared finish time"
+        );
+        // Only the two progress fields: routing keys are not forwarded.
+        assert!(body["progress"].get("claude_session_id").is_none());
+        assert!(body["progress"].get("finished_at").is_none());
+
+        // No usable time (an older row, a null, a non-integer): omitted, so
+        // coord stamps now() exactly as before.
+        for payload in [
+            json!({ "claude_session_id": "csid" }),
+            json!({ "claude_session_id": "csid", "finished_at": null }),
+            json!({ "claude_session_id": "csid", "finished_at": "yesterday" }),
+        ] {
+            assert_eq!(
+                finished_body(&payload),
+                json!({ "progress": { "session_status": "finished" } }),
+                "{payload}"
+            );
+        }
     }
 
     /// `progress` body nests the flat work-progress fields under `progress`
@@ -7300,7 +10071,8 @@ mod tests {
         // `None` = the default binding, which is what an unpaired test box
         // holds; the tenant argument is the caller's to supply now.
         let probe = coord.probe_resume(id, None).await;
-        assert_eq!(probe, ResumeProbe::Found);
+        // The fake answers `{"id": …}` with no tenant_id: Found, unobserved.
+        assert_eq!(probe, ResumeProbe::Found(None));
         let g = rec.lock().await;
         assert_eq!(g.patches.len(), 1, "probe issues exactly one PATCH");
         let (patched_id, body) = &g.patches[0];
@@ -7346,6 +10118,193 @@ mod tests {
         assert_eq!(probe, ResumeProbe::Unreachable);
     }
 
+    /// `probe_resume` maps a 401 / 403 to `Refused` — a distinct outcome from
+    /// `Unreachable` — and `resume_external` still resumes under the persisted
+    /// id, but marks the record tenant-UNOBSERVED.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn probe_resume_401_403_is_refused_not_unreachable() {
+        let _amb = crate::test_env::isolated_ambient();
+        for code in [401u16, 403] {
+            let dir = tempfile::tempdir().unwrap();
+            let outbox = build_outbox(dir.path());
+            let (base, rec) = spawn_fake_coord().await;
+            rec.lock().await.patch_status = Some(code);
+            let coord = CoordSync::new_for_test(
+                outbox,
+                base,
+                Duration::from_millis(50),
+                Duration::from_secs(10),
+            );
+            assert_eq!(
+                coord.probe_resume(Uuid::new_v4(), None).await,
+                ResumeProbe::Refused(code)
+            );
+            let registry = build_registry(coord.clone());
+            let persisted = Uuid::new_v4();
+            let resumed = registry
+                .resume_external(persisted, make_test_intent(), None)
+                .await
+                .unwrap();
+            assert_eq!(resumed, persisted, "a refusal does not change resumption");
+            assert_eq!(
+                registry.row_tenant_of(persisted),
+                Some(RowTenant::Unobserved)
+            );
+        }
+    }
+
+    /// `probe_resume` reads the row's `tenant_id` from coord's 2xx answer, and
+    /// tolerates its absence or an unparseable value (Found, no tenant).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn probe_resume_parses_the_row_tenant_from_the_2xx_answer() {
+        let _amb = crate::test_env::isolated_ambient();
+        let row_tenant = Uuid::new_v4();
+        let cases = [
+            (Some(json!(row_tenant.to_string())), Some(row_tenant)),
+            (None, None),
+            (Some(json!("not-a-uuid")), None),
+            (Some(json!(42)), None),
+            (Some(serde_json::Value::Null), None),
+        ];
+        for (field, expected) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let (base, rec) = spawn_fake_coord().await;
+            rec.lock().await.patch_tenant = field.clone();
+            let coord = CoordSync::new_for_test(
+                build_outbox(dir.path()),
+                base,
+                Duration::from_millis(50),
+                Duration::from_secs(10),
+            );
+            assert_eq!(
+                coord.probe_resume(Uuid::new_v4(), None).await,
+                ResumeProbe::Found(expected),
+                "tenant_id field {field:?}"
+            );
+        }
+        let probed = Uuid::new_v4();
+        assert_eq!(resume_answer_tenant("", probed), None);
+        assert_eq!(resume_answer_tenant("<html>", probed), None);
+        assert_eq!(
+            resume_answer_tenant(
+                &format!(r#"{{"id":"{probed}","tenant_id":" {row_tenant} "}}"#),
+                probed
+            ),
+            Some(row_tenant)
+        );
+        // An answer about another row (coord's self-registration arm) or one
+        // naming no row is not an observation of THIS row's tenant.
+        assert_eq!(
+            resume_answer_tenant(
+                &format!(
+                    r#"{{"id":"{}","tenant_id":"{row_tenant}"}}"#,
+                    Uuid::new_v4()
+                ),
+                probed
+            ),
+            None
+        );
+        assert_eq!(
+            resume_answer_tenant(&format!(r#"{{"tenant_id":"{row_tenant}"}}"#), probed),
+            None
+        );
+    }
+
+    /// A resumed record's row tenant is coord's answer, and the stamp is NOT
+    /// re-written from it: a row created under A resumed while B resolves keeps
+    /// the stamp B (the data plane's credential) and records Observed(A).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resume_external_records_the_row_tenant_coord_answered() {
+        let _amb = crate::test_env::isolated_ambient();
+        let created_under = Uuid::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.patch_tenant = Some(json!(created_under.to_string()));
+        let coord = CoordSync::new_for_test(
+            build_outbox(dir.path()),
+            base,
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+        );
+        let registry = build_registry(coord);
+        let persisted = Uuid::new_v4();
+        let resumed = registry
+            .resume_external(persisted, make_test_intent(), None)
+            .await
+            .unwrap();
+        assert_eq!(resumed, persisted);
+        assert_eq!(
+            registry.row_tenant_of(persisted),
+            Some(RowTenant::Observed(created_under))
+        );
+        // The stamp is the current resolution, untouched by the row's tenant.
+        assert_ne!(
+            registry.tenant_scope_of(persisted),
+            crate::auth::TenantScope::Owned(created_under)
+        );
+    }
+
+    /// A FRESH registration AUTHORS its row's tenant; a resume whose 2xx answer
+    /// names no tenant, and an optimistic one, leave it unobserved; the 404
+    /// fallback's fresh row is authored.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resume_external_marks_the_row_tenant_authored_only_for_a_fresh_row() {
+        let _amb = crate::test_env::isolated_ambient();
+        // Found.
+        let dir = tempfile::tempdir().unwrap();
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            build_outbox(dir.path()),
+            base,
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+        );
+        let registry = build_registry(coord.clone());
+        let persisted = Uuid::new_v4();
+        registry
+            .resume_external(persisted, make_test_intent(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            registry.row_tenant_of(persisted),
+            Some(RowTenant::Unobserved)
+        );
+        // A fresh register on the same registry: authored.
+        let fresh = registry.register_external(make_test_intent()).unwrap();
+        assert_eq!(registry.row_tenant_of(fresh), Some(RowTenant::Authored));
+        // 404 fallback: the NEW row is fresh, so observed.
+        rec.lock().await.patch_returns_404 = true;
+        let gone = Uuid::new_v4();
+        let replacement = registry
+            .resume_external(gone, make_test_intent(), None)
+            .await
+            .unwrap();
+        assert_ne!(replacement, gone);
+        assert_eq!(
+            registry.row_tenant_of(replacement),
+            Some(RowTenant::Authored)
+        );
+        assert_eq!(registry.row_tenant_of(gone), None);
+        // Unreachable: optimistic, unobserved.
+        let dir2 = tempfile::tempdir().unwrap();
+        let down = CoordSync::new_for_test(
+            build_outbox(dir2.path()),
+            "http://127.0.0.1:1".to_string(),
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+        );
+        let registry2 = build_registry(down);
+        let optimistic = Uuid::new_v4();
+        registry2
+            .resume_external(optimistic, make_test_intent(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            registry2.row_tenant_of(optimistic),
+            Some(RowTenant::Unobserved)
+        );
+    }
+
     /// `resume_external` on an existing row REUSES the persisted id (no new
     /// id, no `Started` POST) and emits a `state_change` outbox row.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7364,7 +10323,7 @@ mod tests {
 
         let persisted = Uuid::new_v4();
         let resumed = registry
-            .resume_external(persisted, make_test_intent())
+            .resume_external(persisted, make_test_intent(), None)
             .await
             .unwrap();
         assert_eq!(resumed, persisted, "resume must reuse the persisted id");
@@ -7403,7 +10362,7 @@ mod tests {
 
         let persisted = Uuid::new_v4();
         let fresh = registry
-            .resume_external(persisted, make_test_intent())
+            .resume_external(persisted, make_test_intent(), None)
             .await
             .unwrap();
         assert_ne!(fresh, persisted, "404 fallback mints a NEW id");
@@ -7437,7 +10396,7 @@ mod tests {
 
         let persisted = Uuid::new_v4();
         let resumed = registry
-            .resume_external(persisted, make_test_intent())
+            .resume_external(persisted, make_test_intent(), None)
             .await
             .unwrap();
         assert_eq!(resumed, persisted);
@@ -7467,7 +10426,7 @@ mod tests {
         let mut intent = make_test_intent();
         intent.purpose = "x".into();
         let err = registry
-            .resume_external(Uuid::new_v4(), intent)
+            .resume_external(Uuid::new_v4(), intent, None)
             .await
             .unwrap_err();
         assert!(matches!(err, crate::session::SessionError::Intent(_)));
@@ -7489,6 +10448,7 @@ mod tests {
             },
             "phase_name": "Phase 2",
             "clearance_audience": "agent",
+            "expires_at": "2026-12-01T00:00:00Z",
             "gate_class": "closeout",
             "work_unit_upsert": {
                 "title": "Closeout has no durable store",
@@ -7539,6 +10499,7 @@ mod tests {
         assert_eq!(body["predicate"]["pr_number"], json!(1266));
         assert_eq!(body["phase_name"], json!("Phase 2"));
         assert_eq!(body["clearance_audience"], json!("agent"));
+        assert_eq!(body["expires_at"], json!("2026-12-01T00:00:00Z"));
         assert_eq!(body["gate_class"], json!("closeout"));
         // The two runner-side fields never reach coord.
         assert!(body.get("work_unit_slug").is_none());
@@ -7906,12 +10867,22 @@ mod tests {
             "phase_name": "P1",
             "continuation_spawn": null,
             "clearance_audience": null,
+            "expires_at": null,
             "gate_class": null,
         }));
         assert_eq!(
             nulled,
             json!({"predicate": {"kind": "unit_ready"}, "phase_name": "P1"}),
             "nulls are dropped, not forwarded"
+        );
+
+        // A spooled gate keeps its deadline across the replay: coord's
+        // `UnitGateRequest` declares `expires_at`, and the orphan reconciler
+        // reaps a gate past it only if the replayed body carries it.
+        assert_eq!(
+            gate_registration_body(&gate_payload())["expires_at"],
+            json!("2026-12-01T00:00:00Z"),
+            "expires_at survives the replay"
         );
     }
 
@@ -8335,7 +11306,10 @@ mod tests {
             Duration::from_secs(3600),
         );
 
-        let _ = coord.start_flag_poll_task();
+        // Named, not `let _ =`: the handle is a future (`let_underscore_future`).
+        // Dropping it at scope end detaches the task, exactly as ignoring it
+        // did, and the binding compiles against either return type.
+        let _poll = coord.start_flag_poll_task();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
             if rec
@@ -9069,6 +12043,757 @@ mod tests {
              refusal from a first one, and a per-call warn is the defect. Body was:\n{body}"
         );
     }
+
+    // ── Plan 2026-10-23-a-hookless-resume-…: the re-key seam against coord ──
+
+    mod coord_rekeys {
+        use super::*;
+        use crate::session::coord_identity::{
+            apply_reconcile_tick, confirm_for_session, rekey_rung2_binds, RekeyOutcome,
+            RekeySource, SourceCounts,
+        };
+        use crate::session::reconcile::{
+            run_reconcile, BindOrigin, LivePty, PrescannedTranscriptIndex, ReconcileAction,
+            TranscriptCandidate, TranscriptIndex,
+        };
+        use crate::session::session_lifecycle_store::SessionLifecycleStore;
+
+        const PIN: &str = "2711c738-0000-4000-8000-000000000001";
+        const LIVE: &str = "44348633-0000-4000-8000-000000000002";
+        const PREV_BOOT: &str = "3c37caf2-0000-4000-8000-000000000003";
+
+        fn rung2(terminal: &str, id: &str) -> Vec<ReconcileAction> {
+            vec![ReconcileAction::Bind {
+                terminal_id: terminal.into(),
+                session_id: id.into(),
+                config_dir: String::new(),
+                origin: BindOrigin::Authoritative,
+                confirmed: false,
+            }]
+        }
+
+        fn rekey_rows(outbox: &OutboxWriter, session: Uuid) -> Vec<JsonValue> {
+            outbox
+                .pending()
+                .unwrap()
+                .into_iter()
+                .filter(|r| {
+                    r.session_id == session
+                        && r.event_kind == "state_change"
+                        && r.payload.get("claude_code_session_id").is_some()
+                })
+                .map(|r| r.payload)
+                .collect()
+        }
+
+        fn local_id(reg: &SessionRegistry, id: Uuid) -> Option<String> {
+            reg.describe_by_id(id).unwrap().claude_code_session_id
+        }
+
+        async fn harness() -> (
+            Arc<SessionRegistry>,
+            CoordSync,
+            Arc<OutboxWriter>,
+            Arc<TokMutex<CoordRecorder>>,
+            tempfile::TempDir,
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let outbox = build_outbox(dir.path());
+            let (base, rec) = spawn_fake_coord().await;
+            let coord = CoordSync::new_for_test(
+                outbox.clone(),
+                base,
+                Duration::from_secs(3600),
+                Duration::from_secs(3600),
+            );
+            let reg = build_registry(coord.clone());
+            (reg, coord, outbox, rec, dir)
+        }
+
+        /// A transcript for `id` on disk, which is what makes a rung-2 bind
+        /// CONFIRMED, and so one-shot: the next pass answers `LeaveAlone`.
+        struct TranscriptOnDisk(&'static str);
+        impl TranscriptIndex for TranscriptOnDisk {
+            fn candidates_for(&self, _working_dir: &str) -> Vec<TranscriptCandidate> {
+                vec![TranscriptCandidate {
+                    session_id: self.0.to_string(),
+                    config_dir: "/config".into(),
+                    started_at_unix: Some(1_000),
+                }]
+            }
+            fn transcript_exists(&self, _session_id: &str, _working_dir: Option<&str>) -> bool {
+                true
+            }
+        }
+
+        fn live_pane() -> Vec<LivePty> {
+            vec![LivePty {
+                terminal_id: "pane-1".into(),
+                pid: Some(1),
+                working_dir: "/repo".into(),
+                page_id: "p".into(),
+                title: "t".into(),
+                ai_pid: Some(31524),
+                ai_start_unix: Some(1_000),
+            }]
+        }
+
+        fn coord_rekey_patches(g: &CoordRecorder, row: Uuid) -> usize {
+            g.patches
+                .iter()
+                .filter(|(id, b)| *id == row && b.get("claude_code_session_id").is_some())
+                .count()
+        }
+
+        /// 409 `harness_session_already_bound` → `refused` +1 (never `landed`),
+        /// the row leaves the queue, the next tick restores the local id and
+        /// re-queues; once the competing row lapses a 2xx gives `landed` +1 and
+        /// the tick after that queues nothing.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_refused_rekey_is_counted_restored_and_requeued_until_it_lands() {
+            let _amb = crate::test_env::isolated_ambient();
+            let (reg, coord, outbox, rec, _dir) = harness().await;
+            rec.lock().await.rekey_conflict_ids = vec![LIVE.to_string()];
+            let row = reg
+                .register_external_with_lineage(make_test_intent(), None, Some(PIN.into()))
+                .unwrap();
+            let lookup = |t: &str| (t == "t1").then_some(row);
+
+            let tick1 = apply_reconcile_tick(&reg, &rung2("t1", LIVE), lookup);
+            assert_eq!(tick1, vec![("t1".to_string(), RekeyOutcome::Queued)]);
+            coord.drain_once_for_test().await;
+
+            let ledger = coord.rekeys();
+            assert_eq!(
+                ledger.counts(RekeySource::Rung2),
+                SourceCounts {
+                    queued: 1,
+                    refused: 1,
+                    ..SourceCounts::default()
+                }
+            );
+            assert!(
+                outbox.pending().unwrap().is_empty(),
+                "a refusal is never left queued"
+            );
+            assert_eq!(ledger.last_landed(row), None);
+
+            // Next tick: restored to what coord holds, then re-queued by rung 2.
+            let tick2 = apply_reconcile_tick(&reg, &rung2("t1", LIVE), lookup);
+            assert_eq!(tick2, vec![("t1".to_string(), RekeyOutcome::Queued)]);
+            let rows = rekey_rows(&outbox, row);
+            assert_eq!(rows.len(), 1, "one re-key per tick: {rows:?}");
+            assert_eq!(
+                rows[0]["rekey_previous"],
+                json!(PIN),
+                "local id restored before the re-queue"
+            );
+
+            // The competing row lapses: coord accepts.
+            rec.lock().await.rekey_conflict_ids.clear();
+            coord.drain_once_for_test().await;
+            assert_eq!(
+                ledger.counts(RekeySource::Rung2),
+                SourceCounts {
+                    queued: 2,
+                    landed: 1,
+                    refused: 1,
+                    rejected: 0,
+                }
+            );
+            assert_eq!(ledger.last_landed(row).as_deref(), Some(LIVE));
+
+            let tick3 = apply_reconcile_tick(&reg, &rung2("t1", LIVE), lookup);
+            assert_eq!(
+                tick3,
+                vec![("t1".to_string(), RekeyOutcome::AlreadyCurrent)]
+            );
+            assert!(rekey_rows(&outbox, row).is_empty());
+        }
+
+        /// A refused HOOK re-key has no per-tick evidence to re-supply it, so
+        /// the settle step re-queues the refused id itself.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_refused_hook_rekey_is_requeued_by_the_settle_step() {
+            let _amb = crate::test_env::isolated_ambient();
+            let (reg, coord, outbox, rec, _dir) = harness().await;
+            rec.lock().await.rekey_conflict_ids = vec![LIVE.to_string()];
+            let row = reg
+                .register_external_with_lineage(make_test_intent(), None, Some(PIN.into()))
+                .unwrap();
+            assert_eq!(
+                confirm_for_session(&reg, row, LIVE, RekeySource::Hook),
+                RekeyOutcome::Queued
+            );
+            coord.drain_once_for_test().await;
+            assert_eq!(coord.rekeys().counts(RekeySource::Hook).refused, 1);
+
+            apply_reconcile_tick(&reg, &[], |_| None);
+            let rows = rekey_rows(&outbox, row);
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(rows[0]["claude_code_session_id"], json!(LIVE));
+            assert_eq!(rows[0]["rekey_source"], json!("hook"));
+            assert_eq!(rows[0]["rekey_previous"], json!(PIN));
+            assert_eq!(local_id(&reg, row).as_deref(), Some(LIVE));
+        }
+
+        /// A plain-state 409 (row gone / already in target state) stays the
+        /// idempotent `Acked`. A re-key 409 carrying any OTHER code keeps the ack
+        /// too, but coord did not apply it, so the ledger hears `rejected`.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_plain_state_409_stays_acked() {
+            let _amb = crate::test_env::isolated_ambient();
+            let (_reg, coord, outbox, rec, _dir) = harness().await;
+            rec.lock().await.patch_status = Some(409);
+            let s = Uuid::new_v4();
+            let plain = outbox
+                .record(
+                    Uuid::new_v4(),
+                    s,
+                    SessionEventKind::StateChange,
+                    json!({"id": s, "state": "active"}),
+                )
+                .unwrap();
+            assert!(matches!(
+                push_record(&coord.inner, &plain).await,
+                PushOutcome::Acked
+            ));
+            let other_code = outbox
+                .record(
+                    Uuid::new_v4(),
+                    s,
+                    SessionEventKind::StateChange,
+                    json!({"id": s, "claude_code_session_id": LIVE, "rekey_source": "rung2"}),
+                )
+                .unwrap();
+            assert!(matches!(
+                push_record(&coord.inner, &other_code).await,
+                PushOutcome::Acked
+            ));
+            assert_eq!(
+                coord.rekeys().counts(RekeySource::Rung2),
+                SourceCounts {
+                    rejected: 1,
+                    ..SourceCounts::default()
+                }
+            );
+        }
+
+        /// Any other 4xx voids a re-key without a 409: `rejected` +1 (never
+        /// `landed`), the record goes back to what coord holds, and the next tick
+        /// re-queues it, so the id does not read "already current" for good.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_rejected_rekey_is_restored_and_requeued_until_it_lands() {
+            let _amb = crate::test_env::isolated_ambient();
+            let (reg, coord, outbox, rec, _dir) = harness().await;
+            rec.lock().await.patch_status = Some(403);
+            let row = reg
+                .register_external_with_lineage(make_test_intent(), None, Some(PIN.into()))
+                .unwrap();
+            assert_eq!(
+                confirm_for_session(&reg, row, LIVE, RekeySource::Hook),
+                RekeyOutcome::Queued
+            );
+            coord.drain_once_for_test().await;
+            assert_eq!(
+                coord.rekeys().counts(RekeySource::Hook),
+                SourceCounts {
+                    queued: 1,
+                    rejected: 1,
+                    ..SourceCounts::default()
+                }
+            );
+            assert!(outbox.pending().unwrap().is_empty());
+
+            apply_reconcile_tick(&reg, &[], |_| None);
+            let rows = rekey_rows(&outbox, row);
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(rows[0]["rekey_previous"], json!(PIN));
+
+            rec.lock().await.patch_status = None;
+            coord.drain_once_for_test().await;
+            assert_eq!(coord.rekeys().counts(RekeySource::Hook).landed, 1);
+            assert_eq!(coord.rekeys().last_landed(row).as_deref(), Some(LIVE));
+        }
+
+        /// Through the seam and the tick: once coord has rejected an id
+        /// `REJECTED_RETRY_LIMIT` times, a tick during the cooldown queues
+        /// nothing (the evidence is deferred), and the first tick after the
+        /// cooldown re-queues the deferred evidence, which then lands.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_rejected_rekey_waits_out_its_cooldown_then_lands() {
+            use crate::session::coord_identity::REJECTED_RETRY_LIMIT;
+            let _amb = crate::test_env::isolated_ambient();
+            let (reg, coord, outbox, rec, _dir) = harness().await;
+            rec.lock().await.patch_status = Some(403);
+            let row = reg
+                .register_external_with_lineage(make_test_intent(), None, Some(PIN.into()))
+                .unwrap();
+            assert_eq!(
+                confirm_for_session(&reg, row, LIVE, RekeySource::Hook),
+                RekeyOutcome::Queued
+            );
+            coord.drain_once_for_test().await;
+            for _ in 1..REJECTED_RETRY_LIMIT {
+                apply_reconcile_tick(&reg, &[], |_| None);
+                assert_eq!(rekey_rows(&outbox, row).len(), 1);
+                coord.drain_once_for_test().await;
+            }
+            assert_eq!(
+                coord.rekeys().counts(RekeySource::Hook).rejected,
+                u64::from(REJECTED_RETRY_LIMIT)
+            );
+
+            // In the cooldown: the tick's retry is deferred and queues nothing.
+            apply_reconcile_tick(&reg, &[], |_| None);
+            assert!(rekey_rows(&outbox, row).is_empty());
+            assert_eq!(local_id(&reg, row).as_deref(), Some(PIN));
+            assert_eq!(
+                confirm_for_session(&reg, row, LIVE, RekeySource::Hook),
+                RekeyOutcome::CoolingDown
+            );
+            apply_reconcile_tick(&reg, &[], |_| None);
+            assert!(rekey_rows(&outbox, row).is_empty());
+            assert_eq!(
+                coord.rekeys().counts(RekeySource::Hook).queued,
+                u64::from(REJECTED_RETRY_LIMIT)
+            );
+
+            // The cooldown ends: the deferred evidence is the only retry left.
+            coord.rekeys().end_cooldowns_for_test();
+            rec.lock().await.patch_status = None;
+            apply_reconcile_tick(&reg, &[], |_| None);
+            let rows = rekey_rows(&outbox, row);
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(rows[0]["claude_code_session_id"], json!(LIVE));
+            coord.drain_once_for_test().await;
+            assert_eq!(coord.rekeys().counts(RekeySource::Hook).landed, 1);
+            assert_eq!(coord.rekeys().last_landed(row).as_deref(), Some(LIVE));
+        }
+
+        /// A refusal on a session that has since closed restores the record and
+        /// queues nothing: there is no re-key to chase behind a `closed` row.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_refused_rekey_is_not_retried_on_a_closed_session() {
+            let _amb = crate::test_env::isolated_ambient();
+            let (reg, coord, outbox, rec, _dir) = harness().await;
+            rec.lock().await.rekey_conflict_ids = vec![LIVE.to_string()];
+            let row = reg
+                .register_external_with_lineage(make_test_intent(), None, Some(PIN.into()))
+                .unwrap();
+            confirm_for_session(&reg, row, LIVE, RekeySource::Hook);
+            coord.drain_once_for_test().await;
+            assert_eq!(coord.rekeys().counts(RekeySource::Hook).refused, 1);
+
+            reg.close_by_id(row).unwrap();
+            apply_reconcile_tick(&reg, &[], |_| None);
+            assert!(rekey_rows(&outbox, row).is_empty());
+            assert_eq!(local_id(&reg, row).as_deref(), Some(PIN));
+        }
+
+        /// A tick that has both a refusal to retry and newer evidence for the
+        /// same row sends only the newer evidence.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_tick_queues_one_rekey_per_row_and_newer_evidence_wins() {
+            let _amb = crate::test_env::isolated_ambient();
+            let (reg, coord, outbox, rec, _dir) = harness().await;
+            rec.lock().await.rekey_conflict_ids = vec![LIVE.to_string()];
+            let row = reg
+                .register_external_with_lineage(make_test_intent(), None, Some(PIN.into()))
+                .unwrap();
+            confirm_for_session(&reg, row, LIVE, RekeySource::Hook);
+            coord.drain_once_for_test().await;
+
+            let tick = apply_reconcile_tick(&reg, &rung2("t1", PREV_BOOT), |t| {
+                (t == "t1").then_some(row)
+            });
+            assert_eq!(tick, vec![("t1".to_string(), RekeyOutcome::Queued)]);
+            let rows = rekey_rows(&outbox, row);
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(rows[0]["claude_code_session_id"], json!(PREV_BOOT));
+        }
+
+        /// Phase 2: a `Found` resume of a persisted row last keyed X queues the
+        /// re-activation and THEN its own re-key to the pane's pin P; the probe
+        /// body stays `{state, heartbeat}`; the re-key lands on drain.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_found_resume_rekeys_the_row_to_the_panes_pin() {
+            let _amb = crate::test_env::isolated_ambient();
+            let (reg, coord, outbox, rec, _dir) = harness().await;
+            let persisted = Uuid::new_v4();
+            let resumed = reg
+                .resume_external(persisted, make_test_intent(), Some(LIVE.into()))
+                .await
+                .unwrap();
+            assert_eq!(resumed, persisted);
+
+            {
+                let g = rec.lock().await;
+                assert_eq!(g.patches.len(), 1, "only the probe so far");
+                assert_eq!(
+                    g.patches[0].1,
+                    json!({"state": "active", "heartbeat": true})
+                );
+            }
+            let pending: Vec<JsonValue> = outbox
+                .pending()
+                .unwrap()
+                .into_iter()
+                .filter(|r| r.session_id == persisted)
+                .map(|r| r.payload)
+                .collect();
+            assert_eq!(pending.len(), 2, "{pending:?}");
+            assert_eq!(pending[0]["state"], json!("active"));
+            assert!(pending[0].get("claude_code_session_id").is_none());
+            assert_eq!(pending[1]["claude_code_session_id"], json!(LIVE));
+            assert_eq!(pending[1]["rekey_source"], json!("r2_resume"));
+            assert_eq!(coord.rekeys().counts(RekeySource::R2Resume).queued, 1);
+            assert_eq!(local_id(&reg, persisted).as_deref(), Some(LIVE));
+
+            coord.drain_once_for_test().await;
+            let g = rec.lock().await;
+            assert_eq!(
+                g.patches.last().unwrap().1,
+                json!({"claude_code_session_id": LIVE, "heartbeat": true})
+            );
+            drop(g);
+            assert_eq!(coord.rekeys().counts(RekeySource::R2Resume).landed, 1);
+        }
+
+        /// Phase 2: the 404 fallback's fresh `Started` row carries the pin, so
+        /// no second re-key is queued.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_not_found_resume_registers_fresh_with_the_pin() {
+            let _amb = crate::test_env::isolated_ambient();
+            let (reg, coord, outbox, rec, _dir) = harness().await;
+            rec.lock().await.patch_returns_404 = true;
+            let gone = Uuid::new_v4();
+            let fresh = reg
+                .resume_external(gone, make_test_intent(), Some(PREV_BOOT.into()))
+                .await
+                .unwrap();
+            assert_ne!(fresh, gone);
+            let pending = outbox.pending().unwrap();
+            let started = pending
+                .iter()
+                .find(|r| r.session_id == fresh && r.event_kind == "started")
+                .expect("started row");
+            assert_eq!(started.payload["claude_code_session_id"], json!(PREV_BOOT));
+            assert!(rekey_rows(&outbox, fresh).is_empty());
+            assert_eq!(coord.rekeys().counts(RekeySource::R2Resume).queued, 0);
+        }
+
+        /// Phase 2: with coord unreachable the resume is optimistic and still
+        /// queues the `r2_resume` re-key.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn an_unreachable_resume_probe_still_queues_the_rekey() {
+            let _amb = crate::test_env::isolated_ambient();
+            let dir = tempfile::tempdir().unwrap();
+            let outbox = build_outbox(dir.path());
+            let coord = CoordSync::new_for_test(
+                outbox.clone(),
+                "http://127.0.0.1:1".to_string(),
+                Duration::from_millis(50),
+                Duration::from_secs(10),
+            );
+            let reg = build_registry(coord.clone());
+            let persisted = Uuid::new_v4();
+            let resumed = reg
+                .resume_external(persisted, make_test_intent(), Some(LIVE.into()))
+                .await
+                .unwrap();
+            assert_eq!(resumed, persisted);
+            let rows = rekey_rows(&outbox, persisted);
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(rows[0]["rekey_source"], json!("r2_resume"));
+            assert_eq!(coord.rekeys().counts(RekeySource::R2Resume).queued, 1);
+            assert_eq!(local_id(&reg, persisted).as_deref(), Some(LIVE));
+        }
+
+        /// Phase 2: a probe coord REFUSED (401/403) resumes optimistically and
+        /// still queues the `r2_resume` re-key.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_refused_resume_probe_still_queues_the_rekey() {
+            let _amb = crate::test_env::isolated_ambient();
+            let (reg, coord, outbox, rec, _dir) = harness().await;
+            rec.lock().await.patch_status = Some(401);
+            let persisted = Uuid::new_v4();
+            reg.resume_external(persisted, make_test_intent(), Some(LIVE.into()))
+                .await
+                .unwrap();
+            let rows = rekey_rows(&outbox, persisted);
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(rows[0]["rekey_source"], json!("r2_resume"));
+            assert_eq!(coord.rekeys().counts(RekeySource::R2Resume).queued, 1);
+        }
+
+        /// ARMING: drive the tick composition end to end — a live PTY whose
+        /// claude argv names LIVE (rung 2), its pane row registered under the
+        /// stale pin — and assert on the PATCH coord received and on the
+        /// counted outcome, not on the seam's return value.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn arming_the_tick_composition_lands_a_rung2_rekey_in_coord() {
+            let _amb = crate::test_env::isolated_ambient();
+            let (reg, coord, _outbox, rec, dir) = harness().await;
+            let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+            let row = reg
+                .register_external_with_lineage(make_test_intent(), None, Some(PIN.into()))
+                .unwrap();
+            let live = vec![LivePty {
+                terminal_id: "pane-1".into(),
+                pid: Some(1),
+                working_dir: "/repo".into(),
+                page_id: "p".into(),
+                title: "t".into(),
+                ai_pid: Some(31524),
+                ai_start_unix: Some(1_000),
+            }];
+            let cmdlines: HashMap<u32, String> = [(31524u32, LIVE.to_string())].into();
+            let actions = run_reconcile(
+                &store,
+                &live,
+                &crate::process_capture::process_tree::ProcessSnapshot::default(),
+                &PrescannedTranscriptIndex::default(),
+                &cmdlines,
+            );
+            apply_reconcile_tick(&reg, &actions, |t| (t == "pane-1").then_some(row));
+            coord.drain_once_for_test().await;
+
+            {
+                let g = rec.lock().await;
+                let rekeys: Vec<&JsonValue> = g
+                    .patches
+                    .iter()
+                    .filter(|(id, b)| *id == row && b.get("claude_code_session_id").is_some())
+                    .map(|(_, b)| b)
+                    .collect();
+                assert_eq!(
+                    rekeys,
+                    vec![&json!({"claude_code_session_id": LIVE, "heartbeat": true})],
+                    "coord must receive exactly one re-key PATCH, with no runner-only fields"
+                );
+            }
+            assert_eq!(coord.rekeys().counts(RekeySource::Rung2).landed, 1);
+            assert_eq!(coord.rekeys().last_landed(row).as_deref(), Some(LIVE));
+
+            // The next tick (the lifecycle record is still unconfirmed, so the
+            // pass re-emits the rung-2 bind) sends nothing more.
+            let again = run_reconcile(
+                &store,
+                &live,
+                &crate::process_capture::process_tree::ProcessSnapshot::default(),
+                &PrescannedTranscriptIndex::default(),
+                &cmdlines,
+            );
+            apply_reconcile_tick(&reg, &again, |t| (t == "pane-1").then_some(row));
+            coord.drain_once_for_test().await;
+            let n = rec
+                .lock()
+                .await
+                .patches
+                .iter()
+                .filter(|(id, b)| *id == row && b.get("claude_code_session_id").is_some())
+                .count();
+            assert_eq!(n, 1, "no second re-key PATCH");
+        }
+
+        /// ARMING (Phase 1b): the tick composition with the provider-registry
+        /// source. A live PTY whose argv names LIVE (rung 2) but whose provider
+        /// file — read from disk through the real validity rule — says the
+        /// process now runs PREV_BOOT. Asserts on the PATCH coord received and
+        /// on the counted `provider_registry` outcome.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn arming_the_tick_composition_lands_a_provider_registry_rekey_in_coord() {
+            use crate::session::coord_identity::apply_reconcile_tick_with;
+            use crate::session::reconcile::compute_provider_rows_blocking;
+            let _amb = crate::test_env::isolated_ambient();
+            let (reg, coord, _outbox, rec, dir) = harness().await;
+            let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+            let row = reg
+                .register_external_with_lineage(make_test_intent(), None, Some(PIN.into()))
+                .unwrap();
+            // The fake provider index: <cfg>/sessions/31524.json, win32 domain.
+            let created: i64 = 1_790_000_000;
+            let ft = ((created + 11_644_473_600) as u64) * 10_000_000;
+            let cfg = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(cfg.path().join("sessions")).unwrap();
+            std::fs::write(
+                cfg.path().join("sessions").join("31524.json"),
+                format!(
+                    r#"{{"pid":31524,"sessionId":"{PREV_BOOT}","procStart":"{ft}","pidDomain":"win32:{ft}","status":"idle"}}"#
+                ),
+            )
+            .unwrap();
+            let snap = crate::process_capture::process_tree::ProcessSnapshot {
+                stale: false,
+                parent_map: HashMap::from([(1, vec![31524])]),
+                creation_times: HashMap::from([(31524, created)]),
+                ..Default::default()
+            };
+            let live = vec![LivePty {
+                terminal_id: "pane-1".into(),
+                pid: Some(1),
+                working_dir: "/repo".into(),
+                page_id: "p".into(),
+                title: "t".into(),
+                ai_pid: Some(31524),
+                ai_start_unix: Some(created),
+            }];
+            let cmdlines: HashMap<u32, String> = [(31524u32, LIVE.to_string())].into();
+            let tick = |store: &SessionLifecycleStore| {
+                let rows = compute_provider_rows_blocking(
+                    &live,
+                    &crate::terminal::graceful_exit::PaneLook::image_only(&snap),
+                    || vec![cfg.path().to_path_buf()],
+                );
+                let actions = run_reconcile(
+                    store,
+                    &live,
+                    &snap,
+                    &PrescannedTranscriptIndex::default(),
+                    &cmdlines,
+                );
+                apply_reconcile_tick_with(&reg, &actions, &rows, |t| {
+                    (t == "pane-1").then_some(row)
+                });
+            };
+            tick(&store);
+            coord.drain_once_for_test().await;
+            {
+                let g = rec.lock().await;
+                let rekeys: Vec<&JsonValue> = g
+                    .patches
+                    .iter()
+                    .filter(|(id, b)| *id == row && b.get("claude_code_session_id").is_some())
+                    .map(|(_, b)| b)
+                    .collect();
+                assert_eq!(
+                    rekeys,
+                    vec![&json!({"claude_code_session_id": PREV_BOOT, "heartbeat": true})],
+                    "coord must receive exactly one re-key PATCH, to the provider's id"
+                );
+            }
+            assert_eq!(
+                coord.rekeys().counts(RekeySource::ProviderRegistry).landed,
+                1
+            );
+            assert_eq!(coord.rekeys().counts(RekeySource::Rung2).queued, 0);
+            assert_eq!(coord.rekeys().last_landed(row).as_deref(), Some(PREV_BOOT));
+
+            tick(&store);
+            coord.drain_once_for_test().await;
+            let n = rec
+                .lock()
+                .await
+                .patches
+                .iter()
+                .filter(|(id, b)| *id == row && b.get("claude_code_session_id").is_some())
+                .count();
+            assert_eq!(n, 1, "no second re-key PATCH");
+        }
+
+        /// ARMING, the CONFIRMED arm: a transcript for the argv's id is on disk,
+        /// so the first pass binds confirmed and every later pass answers
+        /// `LeaveAlone`. No bind will ever re-supply the id, so a refusal has to
+        /// be retried by the tick itself, or the row stays stale for the
+        /// runner's life. Asserted on what coord received.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn arming_a_confirmed_rung2_rekey_refused_once_lands_when_the_conflict_clears() {
+            let _amb = crate::test_env::isolated_ambient();
+            let (reg, coord, _outbox, rec, dir) = harness().await;
+            rec.lock().await.rekey_conflict_ids = vec![LIVE.to_string()];
+            let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+            let row = reg
+                .register_external_with_lineage(make_test_intent(), None, Some(PIN.into()))
+                .unwrap();
+            let live = live_pane();
+            let cmdlines: HashMap<u32, String> = [(31524u32, LIVE.to_string())].into();
+            let index = TranscriptOnDisk(LIVE);
+            let snapshot = crate::process_capture::process_tree::ProcessSnapshot::default();
+            let lookup = |t: &str| (t == "pane-1").then_some(row);
+
+            let first = run_reconcile(&store, &live, &snapshot, &index, &cmdlines);
+            assert!(
+                first.iter().any(|a| matches!(
+                    a,
+                    ReconcileAction::Bind {
+                        confirmed: true,
+                        ..
+                    }
+                )),
+                "{first:?}"
+            );
+            apply_reconcile_tick(&reg, &first, lookup);
+            coord.drain_once_for_test().await;
+            assert_eq!(coord.rekeys().counts(RekeySource::Rung2).refused, 1);
+            assert_eq!(coord_rekey_patches(&*rec.lock().await, row), 1);
+
+            let second = run_reconcile(&store, &live, &snapshot, &index, &cmdlines);
+            assert!(
+                second
+                    .iter()
+                    .all(|a| matches!(a, ReconcileAction::LeaveAlone { .. })),
+                "a confirmed record is never re-bound: {second:?}"
+            );
+            apply_reconcile_tick(&reg, &second, lookup);
+            coord.drain_once_for_test().await;
+            assert_eq!(coord.rekeys().counts(RekeySource::Rung2).refused, 2);
+            assert_eq!(coord_rekey_patches(&*rec.lock().await, row), 2);
+
+            rec.lock().await.rekey_conflict_ids.clear();
+            apply_reconcile_tick(&reg, &second, lookup);
+            coord.drain_once_for_test().await;
+            assert_eq!(coord.rekeys().counts(RekeySource::Rung2).landed, 1);
+            assert_eq!(coord.rekeys().last_landed(row).as_deref(), Some(LIVE));
+            assert_eq!(
+                rec.lock()
+                    .await
+                    .patches
+                    .iter()
+                    .rfind(|(id, b)| *id == row && b.get("claude_code_session_id").is_some())
+                    .map(|(_, b)| b.clone()),
+                Some(json!({"claude_code_session_id": LIVE, "heartbeat": true}))
+            );
+
+            apply_reconcile_tick(&reg, &second, lookup);
+            coord.drain_once_for_test().await;
+            assert_eq!(
+                coord_rekey_patches(&*rec.lock().await, row),
+                3,
+                "nothing more once it landed"
+            );
+        }
+
+        /// ARMING, the confirmed bind that arrives before the pane has a coord
+        /// row (the boot pass, or the `resume_external` probe's window): it is
+        /// spent on that tick, so the tick has to remember it.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn arming_a_confirmed_rung2_bind_before_the_row_exists_lands_once_it_does() {
+            let _amb = crate::test_env::isolated_ambient();
+            let (reg, coord, _outbox, rec, dir) = harness().await;
+            let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+            let row = reg
+                .register_external_with_lineage(make_test_intent(), None, Some(PIN.into()))
+                .unwrap();
+            let live = live_pane();
+            let cmdlines: HashMap<u32, String> = [(31524u32, LIVE.to_string())].into();
+            let index = TranscriptOnDisk(LIVE);
+            let snapshot = crate::process_capture::process_tree::ProcessSnapshot::default();
+
+            let first = run_reconcile(&store, &live, &snapshot, &index, &cmdlines);
+            let outcome = apply_reconcile_tick(&reg, &first, |_| None);
+            assert_eq!(
+                outcome,
+                vec![("pane-1".to_string(), RekeyOutcome::NoCoordRow)]
+            );
+
+            let second = run_reconcile(&store, &live, &snapshot, &index, &cmdlines);
+            apply_reconcile_tick(&reg, &second, |t| (t == "pane-1").then_some(row));
+            coord.drain_once_for_test().await;
+            assert_eq!(coord.rekeys().counts(RekeySource::Rung2).landed, 1);
+            assert_eq!(coord_rekey_patches(&*rec.lock().await, row), 1);
+        }
+    }
 }
 
 /// The drain as the last line of the egress switches (plan
@@ -9198,9 +12923,11 @@ pub(crate) mod egress_tests {
         let check = body
             .find("output_chunk_egress_refusal(&rec.payload, scope.into())")
             .unwrap();
-        let scope = body
-            .find("let scope = record_session_tenant(inner, rec);")
-            .unwrap();
+        // The FIRST `let scope = ` after the signature is push_record's own
+        // head binding — robust to how the scope is composed (it now routes
+        // through `push_credential_scope`), and found before this test's own
+        // literals, which sit much later in the file.
+        let scope = body.find("let scope = ").unwrap();
         assert!(
             scope < check,
             "the owning session's tenant is resolved before the check"
@@ -9210,5 +12937,135 @@ pub(crate) mod egress_tests {
             check < dispatch,
             "the check must run before any request is built"
         );
+        // ...and only for output chunks: the check sits inside the
+        // `if kind == "output_chunk"` block, the nearest `if` above it.
+        let head = body.get(..check).expect("check index is a char boundary");
+        let gate = head
+            .rfind("if kind == \"output_chunk\" {")
+            .expect("the egress check must be gated on the output_chunk kind");
+        let gated = head.get(gate..).expect("gate index is a char boundary");
+        assert!(
+            !gated.contains("\n    }\n"),
+            "the egress check must sit INSIDE the output_chunk block, not after it"
+        );
+        assert_eq!(
+            gated.matches("if ").count(),
+            2,
+            "the output_chunk `if` must be the gate enclosing the check (it and \
+             the `if let Some(flow)` around the call, nothing else)"
+        );
+    }
+}
+
+/// Every response path on the shared coord client reads its body to the end
+/// (lifecycle plan Phase 85). Each test fails if the drain at its site is
+/// removed — see [`super::drain_probe`].
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+    use crate::session::drain_probe::{DrainProbe, Fixed};
+
+    fn coord_at(base: &str) -> (CoordSync, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = Arc::new(OutboxWriter::open(dir.path().join("outbox.jsonl")).unwrap());
+        let coord = CoordSync::new_for_test(
+            outbox,
+            base.to_string(),
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        (coord, dir)
+    }
+
+    fn rec(kind: &str, payload: JsonValue) -> OutboxRecord {
+        OutboxRecord {
+            machine_id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            seq: 1,
+            event_kind: kind.to_string(),
+            payload,
+            recorded_at: Utc::now(),
+            acked_at: None,
+        }
+    }
+
+    async fn push(status: u16, kind: &str) -> (PushOutcome, DrainProbe) {
+        let probe = DrainProbe::spawn(status).await;
+        let (coord, _dir) = coord_at(&probe.base);
+        let out = push_record(&coord.inner, &rec(kind, json!({}))).await;
+        (out, probe)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn push_2xx_reads_the_body() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (out, probe) = push(200, "heartbeat").await;
+        assert!(matches!(out, PushOutcome::Acked));
+        probe.assert_all_drained().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn push_mirror_404_405_reads_the_body() {
+        let _amb = crate::test_env::isolated_ambient();
+        for (status, kind) in [(404, "restore-record"), (405, "coord-transport-rung")] {
+            let (out, probe) = push(status, kind).await;
+            assert!(matches!(out, PushOutcome::Acked), "{kind} {status}");
+            probe.assert_all_drained().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn push_patch_409_reads_the_body() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (out, probe) = push(409, "heartbeat").await;
+        assert!(matches!(out, PushOutcome::Acked));
+        probe.assert_all_drained().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bootstrap_upsert_2xx_reads_the_body() {
+        let _amb = crate::test_env::isolated_ambient();
+        let probe = DrainProbe::spawn_with(
+            200,
+            vec![Fixed {
+                path: "/coord/work-units/wu-drain/register-gate".into(),
+                status: 404,
+                body: r#"{"error":"work_unit_not_found"}"#,
+            }],
+        )
+        .await;
+        let (coord, _dir) = coord_at(&probe.base);
+        let payload = json!({
+            "work_unit_slug": "wu-drain",
+            "predicate": {"kind": "manual"},
+            "work_unit_upsert": {"title": "t"},
+        });
+        // Upsert (probe body, 200) then the re-register (fixed 404).
+        let _ = push_record(&coord.inner, &rec("gate_registration", payload)).await;
+        probe.assert_all_drained().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resume_probe_non_2xx_reads_the_body() {
+        let _amb = crate::test_env::isolated_ambient();
+        for status in [404, 401, 500] {
+            let probe = DrainProbe::spawn(status).await;
+            let (coord, _dir) = coord_at(&probe.base);
+            let _ = coord.probe_resume(Uuid::new_v4(), None).await;
+            probe.assert_all_drained().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flag_poll_non_2xx_reads_the_body() {
+        let _amb = crate::test_env::isolated_ambient();
+        // 500: the generic arm. 403: the capped refusal read, past its cap.
+        for status in [500, 403] {
+            let probe = DrainProbe::spawn(status).await;
+            let (coord, _dir) = coord_at(&probe.base);
+            let r = fetch_session_coordination_flag(&coord.inner, Uuid::new_v4()).await;
+            assert!(r.is_err());
+            probe.assert_all_drained().await;
+        }
     }
 }

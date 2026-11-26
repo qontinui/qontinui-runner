@@ -119,8 +119,19 @@ temp_dev/
 # REPO CONTENT (runner-as-CI-node lane reads .qontinui/ci.toml from the
 # checked-out tree) — `dir/*` + negation, because a fully-ignored dir
 # (`.qontinui/`) can never have children re-included.
+# .qontinui/ci-requirements.toml is repo content too: the declared CI
+# resource floors coord's fit verdict reads from its canonical mirror (no CI
+# node parses it).
+# .qontinui/ci-pool-variables.toml is repo content too: the lane variables
+# coord's pool-variable controller decides, read from its canonical mirror.
+# .qontinui/ci-targets.toml is repo content too: the per-job CI
+# target map coord's overlap counterfactual reads (plan
+# 2026-11-08-coord-lands-one-candidate-per-repo-...).
 .qontinui/*
 !.qontinui/ci.toml
+!.qontinui/ci-requirements.toml
+!.qontinui/ci-pool-variables.toml
+!.qontinui/ci-targets.toml
 
 # Ignore CLAUDE notes file
 CLAUDE.md
@@ -163,20 +174,12 @@ vite.config.js
 
 # Storybook build output
 storybook-static/
-target-new/
-target-test/
-target-test2/
-target-agent/
-target-pool/
-target-check/
-target-fix-test/
-target-validate/
-target-run/
-target-fixcheck/
+# Every per-purpose cargo target beside target/: target-agent/ (cargo-guard's
+# shared worktree target), target-pool/ (the supervisor build pool),
+# target-arming/ (the arming prove target, qontinui-claude-config
+# scripts/lib/arming_runs.py) and the ad-hoc ones.
+target-*/
 .build-state/
-target-rebuild/
-target-types-task/
-target-wt/
 *.log.err
 
 # MSYS/Cygwin crash dumps (bash.exe.stackdump, du.exe.stackdump, ...).
@@ -188,13 +191,15 @@ target-wt/
 # (Was only in .git/info/exclude — local-only, lost on fresh clone/CI.)
 .mcp.json
 
-# Vision capture scratch cache. The runner writes UI Bridge captures here at
-# RUNTIME, into its own repo root:
-#   src-tauri/src/mcp/ui_bridge/vision_routes.rs -> current_runner_path().join("tmp_vision_cache")
-# Leaving it untracked-but-not-ignored makes any checkout that has served a
-# capture permanently dirty, which silently disables dev-start's
-# Resolve-PrimaryTreeStaleness auto-fast-forward (it self-heals only a CLEAN
-# tree) — that is how a shared checkout drifts tens of commits behind main.
+# Legacy vision capture cache. Written ONLY by runner builds older than the
+# change that moved the cache to the instance-scoped DataLocal dir
+# (<data_local>/com.qontinui.runner/vision_cache, see
+# src-tauri/src/mcp/ui_bridge/vision_capture_access.rs); those builds wrote
+# captures into their own repo root at RUNTIME. Kept because older runners
+# still run in checkouts across the fleet: leaving it untracked-but-not-ignored
+# makes any such checkout permanently dirty, which silently disables
+# dev-start's Resolve-PrimaryTreeStaleness auto-fast-forward (it self-heals
+# only a CLEAN tree). Existing contents are reconstructable cache, safe to delete.
 tmp_vision_cache/
 
 # Perf-harness run artifacts (scripts/perf-harness.mjs). Run JSONs and rendered

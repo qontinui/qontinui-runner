@@ -338,6 +338,7 @@ function DevLoopPanel({
   };
 
   const handleOpen = async (port: number) => {
+    // runner-localhost-ok: the dev-loop target app's own port, not a runner.
     const url = `http://localhost:${port}/`;
     try {
       await openUrl(url);
@@ -575,6 +576,7 @@ function DevLoopPanel({
               <p className="text-[11px] text-muted-foreground">{result.message}</p>
             )}
             <p className="text-[11px] text-muted-foreground select-text break-all font-mono">
+              {/* runner-localhost-ok: the dev-loop target app's own port, not a runner */}
               http://localhost:{result.port}/
             </p>
             <div className="flex items-center gap-2 pt-1">

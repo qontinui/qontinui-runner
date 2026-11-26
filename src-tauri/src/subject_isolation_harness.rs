@@ -86,10 +86,10 @@ fn driver() {
     // every runner override is cleared so the run resolves like a launch.
     let _amb = crate::test_env::isolated_ambient();
     point_the_machine_at(&machine_home);
-    for key in RUNNER_LOCATION_KEYS {
-        std::env::remove_var(key);
-    }
-    for (key, _) in qontinui_runner_lib::instance_env::QONTINUI_HOME_CHILD_DIRS {
+    for key in qontinui_runner_lib::instance_env::ROOT_CONFINED_ENV_KEYS
+        .iter()
+        .chain(INSTANCE_IDENTITY_KEYS)
+    {
         std::env::remove_var(key);
     }
     // The keychain is machine-wide by service name; the harness run must not
@@ -151,18 +151,12 @@ const CHILD_ENV_PASSTHROUGH: &[&str] = &[
     "DYLD_FALLBACK_LIBRARY_PATH",
 ];
 
-/// Every location override a launcher or this test binary's sandbox may have
-/// exported — cleared so the child resolves its stores exactly as a fresh
-/// launch on the fixture machine would.
-const RUNNER_LOCATION_KEYS: &[&str] = &[
-    "QONTINUI_HOME",
-    "QONTINUI_CONFIG_DIR",
-    "QONTINUI_SECURE_STORAGE_DIR",
-    "QONTINUI_EMBEDDED_PG_DIR",
-    "QONTINUI_RUNNER_LOG_DIR",
-    "QONTINUI_PANIC_LOG_DIR",
-    "QONTINUI_PROMPTS_DIR",
-    "WEBVIEW2_USER_DATA_FOLDER",
+/// The instance identity a launcher or this test binary may have exported,
+/// cleared with every `instance_env::ROOT_CONFINED_ENV_KEYS` location so the
+/// child resolves its stores exactly as a fresh launch on the fixture machine
+/// would. The locations are DERIVED from the runner's own list rather than
+/// hand-listed here, so a key the runner confines later is cleared too.
+const INSTANCE_IDENTITY_KEYS: &[&str] = &[
     "QONTINUI_INSTANCE_NAME",
     "QONTINUI_INSTANCE_ROOT",
     "QONTINUI_PRIMARY_PORT",

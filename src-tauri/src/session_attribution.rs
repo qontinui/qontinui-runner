@@ -273,14 +273,11 @@ pub(crate) fn extract_attributions_from_new_bytes(
     out
 }
 
-/// Locate a hosted session's transcript jsonl, given its `config_dir`
-/// (`CLAUDE_CONFIG_DIR`) and `working_dir` (the cwd Claude was launched from =
-/// the encoded project path). Returns the first existing path:
-///
-/// - If `config_dir` is known, try that dir directly.
-/// - Otherwise (or if that file doesn't exist), scan every known Claude config
-///   dir and return the first hit — mirrors `transcript_read_session`'s
-///   "try each config dir" fallback.
+/// Locate the on-disk transcript for a session: the exact encoded path under
+/// the RECORDED `config_dir` (the account the session runs on) when it exists,
+/// else the newest `<session_id>.jsonl` under any Claude config dir on this
+/// machine — newest, not first-found, since a migrated session leaves a frozen
+/// copy at the same encoded path in its old account.
 ///
 /// Returns `None` if no transcript exists for the session in any config dir.
 fn resolve_transcript_path(
@@ -294,15 +291,7 @@ fn resolve_transcript_path(
             return Some(p);
         }
     }
-    // Fallback: scan all known config dirs (same posture as
-    // `transcript_read_session` when no config_dir is supplied / matches).
-    for dir in transcript::find_claude_config_dirs() {
-        let p = transcript::session_transcript_path(&dir, working_dir, session_id);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    None
+    transcript::find_transcript_by_session_id(config_dir.map(Path::new), session_id)
 }
 
 /// One capture pass. Best-effort: per-session errors `warn!`/`debug!` and the

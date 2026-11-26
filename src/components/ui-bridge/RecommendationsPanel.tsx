@@ -7,6 +7,7 @@
 
 import { Lightbulb } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
+import { getApiBase } from "@/lib/runner-api";
 
 interface Recommendation {
   priority: number;
@@ -30,9 +31,7 @@ export function RecommendationsPanel({ days = 7 }: RecommendationsPanelProps) {
   const { data = [], isLoading } = useQuery<Recommendation[]>({
     queryKey: ["graph-analytics", "recommendations", days],
     queryFn: async () => {
-      const res = await fetch(
-        `http://localhost:9876/ui-bridge/analytics/recommendations?days=${days}`,
-      );
+      const res = await fetch(`${getApiBase()}/ui-bridge/analytics/recommendations?days=${days}`);
       if (!res.ok) return [];
       const json = await res.json();
       return json.data ?? [];

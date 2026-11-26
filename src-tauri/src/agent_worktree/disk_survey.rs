@@ -1194,9 +1194,10 @@ pub async fn survey(query: DiskSurveyQuery) -> DiskSurvey {
         // Only report "unavailable" when the reason is structural. A resolvable
         // root with no snapshot yet is `pending`, not an error.
         census::qontinui_root().is_none().then(|| {
-            "the workspace root could not be resolved (set QONTINUI_ROOT, or the \
-             paths.workspace_root setting)"
-                .to_string()
+            format!(
+                "the workspace root could not be resolved (set the \"{}\" setting)",
+                qontinui_types::paths::WORKSPACE_ROOT_SETTING
+            )
         })
     };
 
@@ -1608,15 +1609,17 @@ mod tests {
         // wherever they sit. `target-pool` here is a bare sibling of the
         // worktree, with no enclosing checkout to strip a prefix against.
         mk_target_root(&root.join("target-agent"));
+        mk_target_root(&root.join("target-arming"));
         mk_target_root(&root.join("target-pool/slot-0"));
         mk_target_root(&root.join("target-pool/lkg"));
 
         let snapshot = build_snapshot(root, &clean_opts());
-        assert_eq!(snapshot.items.len(), 5, "all five are ENUMERATED");
+        assert_eq!(snapshot.items.len(), 6, "all six are ENUMERATED");
         for (needle, reason) in [
             ("repo-wt-b/target", "owned-by-worktree-reclaim"),
             ("src-tauri/target", "owned-by-worktree-reclaim"),
             ("target-agent", "owned-by-build-pool"),
+            ("target-arming", "owned-by-build-pool"),
             ("slot-0", "owned-by-build-pool"),
             ("lkg", "owned-by-build-pool"),
         ] {
@@ -2107,6 +2110,8 @@ mod tests {
                 drive_letter: Some("D".to_string()),
                 total_bytes: 4_000,
                 free_bytes: 93,
+                removable: false,
+                read_only: false,
             }],
             taken_at: chrono::Utc::now(),
         };

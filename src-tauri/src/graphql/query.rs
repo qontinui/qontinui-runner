@@ -216,16 +216,16 @@ impl QueryRoot {
         let state = ctx.data::<Arc<ApiState>>()?;
         let manager = state.sdk_connection.lock().await;
         let mut connections = Vec::new();
-        let active_url = manager.active_url.clone();
 
-        for conn in manager.connections.values() {
+        for (url, conn) in &manager.connections {
+            // Active only if a dispatch would use it, as the REST listings say.
+            let is_active = manager.is_active(url);
             connections.push(SdkConnectionInfo {
                 app_id: conn.app_info.app_id.clone(),
                 app_name: conn.app_info.app_name.clone(),
                 url: conn.app_url.clone(),
-                responsive: active_url.as_deref() == Some(&conn.app_url)
-                    && manager.active_responsive.unwrap_or(false),
-                is_active: active_url.as_deref() == Some(&conn.app_url),
+                responsive: is_active && manager.active_responsive.unwrap_or(false),
+                is_active,
             });
         }
         Ok(connections)

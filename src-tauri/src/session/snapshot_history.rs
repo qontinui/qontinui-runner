@@ -117,6 +117,21 @@ pub trait TranscriptProbe: std::fmt::Debug + Send + Sync {
     /// return to `Option<bool>` so the distinction lives in one place is a
     /// worthwhile follow-up.
     fn transcript_exists(&self, session_id: &str, working_dir: Option<&str>) -> bool;
+
+    /// The Claude config dirs (account homes) whose transcript for
+    /// `session_id` exists — the EVIDENCE of which account a session ran
+    /// under, used when its record carries no `config_dir`.
+    ///
+    /// `None` means this probe answers existence only and cannot say WHERE —
+    /// UNKNOWN, never "no dir holds it". The disk implementation always
+    /// answers; an existence-only probe (every test double) need not.
+    fn transcript_config_dirs(
+        &self,
+        _session_id: &str,
+        _working_dir: Option<&str>,
+    ) -> Option<Vec<std::path::PathBuf>> {
+        None
+    }
 }
 
 /// Is this recorded identity actually resumable? Both gates are required and
@@ -197,6 +212,16 @@ pub struct SnapshotSession {
     pub restorable: Option<bool>,
     /// Unix millis the session was first opened (stable across snapshots).
     pub opened_at: i64,
+    /// Unix millis the operator marked the session's WORK finished, as of this
+    /// snapshot. Without it a finished session whose registry row aged out
+    /// (~24 h) reads as unfinished in Past Sessions, which merges the snapshot
+    /// history in for older rows. `None` = no finish recorded (also every line
+    /// written before this field existed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<i64>,
+    /// Free-text reason recorded with [`Self::finished_at`] (`"dismissed"`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
 }
 
 impl SnapshotSession {
@@ -227,6 +252,8 @@ impl SnapshotSession {
             transcript_exists,
             restorable: transcript_exists.map(|e| is_restorable_identity(confirmed, e)),
             opened_at: rec.opened_at,
+            finished_at: rec.finished_at,
+            finish_reason: rec.finish_reason.clone(),
         }
     }
 }
@@ -277,6 +304,11 @@ struct Inner {
 pub struct SnapshotHistory {
     path: PathBuf,
     inner: Mutex<Inner>,
+    /// `ts` of the file's last line as it stood when this process opened it —
+    /// the PREVIOUS process's last append (a change or the ~5-minute
+    /// heartbeat). Latched at [`Self::open`], so this process's own appends
+    /// never move it.
+    prior_last_append_ms: Option<i64>,
 }
 
 impl SnapshotHistory {
@@ -326,15 +358,33 @@ impl SnapshotHistory {
                 }
             }
         }
+        let prior_last_append_ms = (inner.last_append_ms > 0).then_some(inner.last_append_ms);
         let history = Self {
             path,
             inner: Mutex::new(inner),
+            prior_last_append_ms,
         };
         {
             let mut inner = history.inner.lock().expect("fresh mutex");
             history.maybe_compact_locked(&mut inner, Utc::now().timestamp_millis(), true);
         }
         Ok(history)
+    }
+
+    /// When the PREVIOUS process last appended to this history — a liveness
+    /// proof of whichever process ran last, since the poll heartbeats at most
+    /// [`HEARTBEAT_MIN_INTERVAL_MS`] apart even with an empty registry. `None`
+    /// when the file was absent, empty or its last line unreadable.
+    ///
+    /// "The previous process" is not necessarily the one that owned the
+    /// registry's sessions: a short-lived INTERMEDIATE boot during a downtime
+    /// heartbeats here too, hours after the cohort it never restored was last
+    /// seen. So the restore path uses it to bound a crash boot's anchor for the
+    /// CLOSED arms only (`session_lifecycle_store::RestoreAnchors`
+    /// `prior_closed`) and never for `open` rows, and still never reads the
+    /// snapshots themselves (the module invariant above).
+    pub fn prior_last_append_ms(&self) -> Option<i64> {
+        self.prior_last_append_ms
     }
 
     /// Record a CHANGE snapshot (a meaningful registry mutation: session
@@ -808,6 +858,8 @@ mod tests {
             transcript_exists: None,
             restorable: None,
             opened_at: 1_000,
+            finished_at: None,
+            finish_reason: None,
         }
     }
 
@@ -983,6 +1035,32 @@ mod tests {
         assert_eq!(read_records(&path).len(), 2);
     }
 
+    /// The previous process's last append is latched at `open` — a fresh file
+    /// has none, and this process's own appends never move it (the crash-boot
+    /// restore anchor must not chase this process's activity).
+    #[test]
+    fn prior_last_append_is_latched_at_open_and_ignores_own_appends() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session-snapshots.jsonl");
+        let t0 = 1_700_000_000_000;
+        {
+            let h = SnapshotHistory::open(&path).unwrap();
+            assert_eq!(h.prior_last_append_ms(), None, "no file, no prior process");
+            h.record_change_at(t0, vec![sess("a", 1)]);
+            h.record_heartbeat_at(t0 + HEARTBEAT_MIN_INTERVAL_MS, vec![sess("a", 1)]);
+        }
+        let h = SnapshotHistory::open(&path).unwrap();
+        assert_eq!(
+            h.prior_last_append_ms(),
+            Some(t0 + HEARTBEAT_MIN_INTERVAL_MS)
+        );
+        h.record_change_at(t0 + 2 * HEARTBEAT_MIN_INTERVAL_MS, vec![sess("b", 1)]);
+        assert_eq!(
+            h.prior_last_append_ms(),
+            Some(t0 + HEARTBEAT_MIN_INTERVAL_MS)
+        );
+    }
+
     /// The `From<&TerminalSessionRecord>` projection carries every
     /// recovery-tuple field and maps `confirmed_at` to the bool.
     #[test]
@@ -1003,6 +1081,7 @@ mod tests {
             provider: "claude".to_string(),
             origin: Some("authoritative".to_string()),
             restore_pending_at: None,
+            awaiting_account_since: None,
             confirmed_at: Some(500),
             handle: None,
             account_label: None,
@@ -1017,10 +1096,17 @@ mod tests {
             finished_at: None,
             wind_down_outcome: None,
             wind_down_at: None,
+            wind_down_arm: None,
             finish_reason: None,
             finish_synced: false,
+            finish_coord_session_id: None,
+            finish_coord_readdressed: false,
             spawn_device_default: None,
             adopted_from: None,
+            last_session_start_at: None,
+            gate_id: None,
+            gate_consuming_device_id: None,
+            gate_bound_boot_ms: None,
         };
         let s = SnapshotSession::from(&rec);
         assert_eq!(s.claude_session_id, "sess-1");
@@ -1070,6 +1156,7 @@ mod tests {
             provider: "claude".to_string(),
             origin: Some("authoritative".to_string()),
             restore_pending_at: None,
+            awaiting_account_since: None,
             confirmed_at: confirmed.then_some(500),
             handle: None,
             account_label: None,
@@ -1084,10 +1171,17 @@ mod tests {
             finished_at: None,
             wind_down_outcome: None,
             wind_down_at: None,
+            wind_down_arm: None,
             finish_reason: None,
             finish_synced: false,
+            finish_coord_session_id: None,
+            finish_coord_readdressed: false,
             spawn_device_default: None,
             adopted_from: None,
+            last_session_start_at: None,
+            gate_id: None,
+            gate_consuming_device_id: None,
+            gate_bound_boot_ms: None,
         }
     }
 
@@ -1410,5 +1504,25 @@ mod tests {
 
         let missing = read_tree_resets(&dir.path().join("nope.jsonl"), &TreeResetQuery::default());
         assert!(missing.is_empty(), "missing file reads as empty");
+    }
+
+    #[test]
+    fn finish_mark_round_trips_through_the_snapshot_history() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("h.jsonl");
+        let h = SnapshotHistory::open(&path).unwrap();
+        let mut s = sess("a", 0);
+        s.finished_at = Some(5_000);
+        s.finish_reason = Some("dismissed".into());
+        h.record_change(vec![s]);
+        let read = read_all_snapshot_sessions(&path);
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].finished_at, Some(5_000));
+        assert_eq!(read[0].finish_reason.as_deref(), Some("dismissed"));
+        // Unfinished sessions omit the keys, so old lines and new ones agree.
+        let json = serde_json::to_string(&sess("b", 1)).unwrap();
+        assert!(!json.contains("finishedAt") && !json.contains("finishReason"));
+        let back: SnapshotSession = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.finished_at, None);
     }
 }

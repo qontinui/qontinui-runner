@@ -10,14 +10,21 @@
  * mistaken for a broken one.
  *
  * Renders nothing when the drain is clear, or when this runner is not a coord
- * device at all (no drain can apply).
+ * device at all (no drain can apply) — unless coord's dispatch role for this
+ * machine (`bench` / `ci_node`) closes the agent lane, which keeps autonomous
+ * spawns off with the drain clear, and says so — or that role is UNKNOWN (never
+ * served to this runner, none persisted), which keeps them off too.
  */
 
-import { AlertTriangle, PauseCircle } from "lucide-react";
+import { useState } from "react";
+import { AlertTriangle, PauseCircle, X } from "lucide-react";
 import { StatusBanner } from "@/components/ui/StatusBanner";
+import { AdvisorySlot } from "./AdvisoryStack";
 import { useCoordDrainState, type CoordDrainSnapshot } from "@/hooks/useCoordDrainState";
 
 export interface DrainBannerModel {
+  /** What holds autonomous spawns: a drain, an unknown drain, or a dispatch role. */
+  kind: "drained" | "unknown" | "role_closed";
   status: "warning" | "error";
   heading: string;
   /** Until / reason (drained) or cause (unknown). */
@@ -29,10 +36,25 @@ export interface DrainBannerModel {
    * anything. Rendered verbatim.
    */
   restoreNote: string | null;
+  /**
+   * Identity of the drain episode this banner describes, for dismissal. Built
+   * from the fields that stay fixed for an episode — not from `detail`, whose
+   * unknown-state cause is rewritten on every read (failure count, read age).
+   *
+   * A drained episode is `until` alone — the backend's own boundary
+   * (`DrainTracker::set`'s `entered_drained` in `coord_drain_state.rs`). Not
+   * `reason`: the heartbeat enters `drained` with no reason and the follow-up
+   * `me/drain` read fills it in for the same `until`, so keying on it would
+   * undo a dismissal made in that window.
+   */
+  episodeKey: string;
 }
 
 /** The copy the UNKNOWN state must carry, verbatim (plan Phase 3). */
 export const UNKNOWN_HEADING = "drain state unknown — autonomous spawns paused";
+
+/** The heading while the drain is clear but the dispatch role is unknown. */
+export const ROLE_UNKNOWN_HEADING = "dispatch role unknown — autonomous spawns paused";
 
 /**
  * Review N3. While the drain holds, `terminal_session_list_open` withholds the
@@ -44,6 +66,13 @@ export const UNKNOWN_HEADING = "drain state unknown — autonomous spawns paused
  */
 export const RESTORE_NOTE =
   "saved session tabs are not restored while this holds — they come back when it lifts, nothing is lost";
+
+/**
+ * The restore note while a dispatch role (not a drain) holds. A role is a
+ * standing operator choice, not a window, so it does not promise a lift.
+ */
+export const ROLE_RESTORE_NOTE =
+  "saved session tabs are not restored on this machine while its role holds — nothing is lost, and they come back if the role changes";
 
 export function deferredLabel(count: number, capped = false): string | null {
   if (count <= 0) return null;
@@ -66,11 +95,15 @@ export function drainBannerModel(s: CoordDrainSnapshot | null): DrainBannerModel
     if (s.until) parts.push(`until ${formatUntil(s.until)}`);
     if (s.reason) parts.push(s.reason);
     return {
+      kind: "drained",
       status: "warning",
       heading: "Runner drained by coord — autonomous spawns deferred",
       detail: parts.length > 0 ? parts.join(" · ") : null,
       deferredLabel: deferredLabel(s.deferredCount, s.deferredCapped ?? false),
-      restoreNote: RESTORE_NOTE,
+      // Lifting the drain does not lift a closing dispatch role, so do not
+      // promise that it does.
+      restoreNote: s.agentLaneClosedByRole === true ? ROLE_RESTORE_NOTE : RESTORE_NOTE,
+      episodeKey: `drained|${s.until ?? ""}`,
     };
   }
   // At boot the state is "not read yet" until the first drain read lands; that
@@ -78,27 +111,126 @@ export function drainBannerModel(s: CoordDrainSnapshot | null): DrainBannerModel
   if (s.state === "unknown" && s.bootReadPending) return null;
   if (s.state === "unknown") {
     return {
+      kind: "unknown",
       status: "error",
       heading: UNKNOWN_HEADING,
       detail: s.cause,
       deferredLabel: deferredLabel(s.deferredCount, s.deferredCapped ?? false),
+      // A readable drain does not lift a closing dispatch role either.
+      restoreNote: s.agentLaneClosedByRole === true ? ROLE_RESTORE_NOTE : RESTORE_NOTE,
+      episodeKey: `unknown|${s.since ?? ""}`,
+    };
+  }
+  // The drain is clear (or this is no coord device), but coord's dispatch role
+  // for this machine closes the agent lane, so autonomous spawns stay off.
+  if (s.agentLaneClosedByRole === true) {
+    return {
+      kind: "role_closed",
+      status: "warning",
+      heading: `Dispatch role ${s.dispatchRole ?? "unknown"} — autonomous spawns off on this machine`,
+      // A role carried over from before this runner started, which coord has
+      // not re-served since, says so rather than reading as fresh.
+      detail:
+        s.dispatchRoleSource === "persisted"
+          ? `as coord last served it${
+              s.dispatchRoleObservedAt ? ` (${formatUntil(s.dispatchRoleObservedAt)})` : ""
+            }, before this runner started — not re-confirmed yet`
+          : null,
+      deferredLabel: deferredLabel(s.deferredCount, s.deferredCapped ?? false),
+      restoreNote: ROLE_RESTORE_NOTE,
+      episodeKey: `role_closed|${s.dispatchRole ?? ""}`,
+    };
+  }
+  // The drain is clear, but coord has never served this machine's dispatch
+  // role and none was persisted: the runner fails closed, as coord itself does
+  // on an unreadable role.
+  if (s.dispatchRoleSource === "unknown" && s.state === "clear" && !s.autonomousSpawnsAllowed) {
+    return {
+      kind: "unknown",
+      status: "error",
+      heading: ROLE_UNKNOWN_HEADING,
+      detail: "coord has not served this machine's dispatch role since the runner started",
+      deferredLabel: deferredLabel(s.deferredCount, s.deferredCapped ?? false),
       restoreNote: RESTORE_NOTE,
+      episodeKey: "role_unknown",
     };
   }
   return null;
 }
 
+/**
+ * The dismissal that survives the current render. Only one episode is current
+ * at a time, so a dismissal of any other key — or of anything while no banner
+ * shows — is spent. Without this, drained(X) → unknown → drained(X), which the
+ * backend counts as a new episode, would come back already collapsed.
+ */
+export function liveDismissal(
+  dismissedKey: string | null,
+  currentKey: string | null,
+): string | null {
+  return dismissedKey !== null && dismissedKey === currentKey ? dismissedKey : null;
+}
+
 export function RunnerDrainBanner() {
   const model = drainBannerModel(useCoordDrainState());
+  // Dismissal is per drain episode (`episodeKey`): a new drain, a
+  // drained→unknown change, or the drain clearing and returning shows it again.
+  // Dismissing only collapses the notice to a small icon — spawns stay
+  // deferred, so the runner keeps saying so; clicking it brings the banner back.
+  const [dismissedKey, setDismissedKey] = useState<string | null>(null);
+  const live = liveDismissal(dismissedKey, model?.episodeKey ?? null);
+  if (live !== dismissedKey) setDismissedKey(live);
   if (!model) return null;
+  const key = model.episodeKey;
   const Icon = model.status === "error" ? AlertTriangle : PauseCircle;
+  const drainState = model.status === "error" ? "unknown" : "drained";
+  if (dismissedKey === key) {
+    // Rendered through the advisory stack, the single owner of the top-right
+    // corner (finding c91550f0), so it never sits over another advisory, the
+    // tab bar or a zone's hover actions. A solid base under the 10% status
+    // tint keeps it legible over the terminal grid. Classes are literal so
+    // Tailwind's source scan (which skips node_modules) always emits them.
+    const tone =
+      model.status === "error"
+        ? "border-red-500/40 bg-red-500/15 text-red-500"
+        : "border-yellow-500/40 bg-yellow-500/15 text-yellow-500";
+    return (
+      <AdvisorySlot>
+        <button
+          type="button"
+          aria-label={`${model.heading} — show details`}
+          aria-expanded={false}
+          title={`${model.heading} — click for details`}
+          onClick={() => setDismissedKey(null)}
+          className="rounded-full shadow-lg bg-[#16161e]"
+          data-ui-bridge-id="terminal.runner-drain-indicator"
+          data-drain-state={drainState}
+        >
+          <span className={`block rounded-full border p-1.5 ${tone}`}>
+            <Icon className="w-4 h-4" />
+          </span>
+        </button>
+      </AdvisorySlot>
+    );
+  }
   return (
     <div
-      className="absolute top-2 left-1/2 -translate-x-1/2 z-30 w-[440px] max-w-[90%] shadow-lg"
+      className="absolute top-2 left-1/2 -translate-x-1/2 z-30 w-max min-w-[min(440px,95%)] max-w-[95%] shadow-lg"
       data-ui-bridge-id="terminal.runner-drain-banner"
-      data-drain-state={model.status === "error" ? "unknown" : "drained"}
+      data-drain-state={drainState}
     >
       <StatusBanner status={model.status} icon={<Icon className="w-4 h-4" />}>
+        <button
+          type="button"
+          aria-label="Dismiss drain notice"
+          aria-expanded={true}
+          title="Dismiss"
+          onClick={() => setDismissedKey(key)}
+          className="float-right ml-2 -mt-0.5 opacity-70 hover:opacity-100"
+          data-ui-bridge-id="terminal.runner-drain-banner.dismiss"
+        >
+          <X className="w-4 h-4" />
+        </button>
         <div className="text-[12px] font-semibold leading-snug">{model.heading}</div>
         {model.detail && <div className="text-[11px] leading-snug mt-0.5">{model.detail}</div>}
         <div className="text-[11px] leading-snug mt-0.5 opacity-80">

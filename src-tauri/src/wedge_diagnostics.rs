@@ -48,7 +48,7 @@ use serde::Serialize;
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -521,6 +521,67 @@ pub struct ThreadCensus {
     pub by_wait_reason: BTreeMap<String, usize>,
 }
 
+/// OS thread id of the thread that owns the runner's main window — the native
+/// UI thread. `0` = not identified yet (before the window exists, server mode,
+/// a headless build, or a non-Windows platform).
+///
+/// Plan `2026-11-04-runner-wedge-detector-reads-a-boot-as-a-wedge-and-never-bound-is-silent`,
+/// Phase 1. The anonymous [`ThreadCensus`] histogram cannot say what THE UI
+/// thread is waiting on — the one diagnostics record of a `ui_thread_wedged`
+/// escalation on file held only the histogram, with nothing to pick the main
+/// thread out of it. Published by the bin's `ui_thread_probe` whenever it
+/// caches the main window's handle; read by the [`CaptureStep::UiThread`] step.
+static UI_THREAD_OS_ID: AtomicU32 = AtomicU32::new(0);
+
+/// Record the native UI thread's OS thread id. `0` is ignored — it is the
+/// "not identified" sentinel, and a failed lookup must not erase a good id.
+pub fn set_ui_thread_os_id(tid: u32) {
+    if tid != 0 {
+        UI_THREAD_OS_ID.store(tid, Ordering::SeqCst);
+    }
+}
+
+/// The native UI thread's OS thread id, or `None` when it is not identified.
+pub fn ui_thread_os_id() -> Option<u32> {
+    match UI_THREAD_OS_ID.load(Ordering::SeqCst) {
+        0 => None,
+        tid => Some(tid),
+    }
+}
+
+/// The native UI thread's kernel scheduling state, read from the same native
+/// enumeration as [`ThreadCensus`] but for ONE identified thread.
+///
+/// **What a `ui_thread_wedged` reader does with it.** `state` says whether the
+/// thread is blocked (`Waiting`) or busy (`Running` / `Ready`); `wait_reason`
+/// says on what kind of wait (`UserRequest` is an ordinary wait on a handle,
+/// `WrLpcReply` / `WrAlertByThreadId` a synchronous call into another process
+/// or thread). The CPU times and `context_switches` are cumulative, so two
+/// records of one incident (escalate, re-escalate) tell a thread that is
+/// spinning (times climb) from one parked on a single wait (nothing moves).
+///
+/// **No stack, deliberately.** A user-mode stack of another thread needs
+/// `SuspendThread` on the UI thread plus `StackWalk64` and symbol loading.
+/// Suspending the thread the detector is reporting on, from the detector, is
+/// exactly the shared-fate move this module's rules forbid, and symbol loading
+/// is neither bounded nor cheap. A live dump of a reproduced freeze is the tool
+/// for the stack; this record says when and where to take it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UiThreadState {
+    pub os_thread_id: u32,
+    /// `KTHREAD_STATE` name — see [`thread_state_name`].
+    pub state: &'static str,
+    /// `KWAIT_REASON` name — see [`wait_reason_name`]. Meaningful only when
+    /// `state` is `Waiting`.
+    pub wait_reason: &'static str,
+    /// Cumulative user-mode CPU time, milliseconds.
+    pub user_time_ms: u64,
+    /// Cumulative kernel-mode CPU time, milliseconds.
+    pub kernel_time_ms: u64,
+    /// Cumulative context switches.
+    pub context_switches: u32,
+}
+
 /// Per-thread NAME tally for THIS process — the sibling of [`ThreadCensus`]
 /// that answers "what are these threads?" rather than "what are they waiting
 /// on?" (plan `2026-09-21-runner-blocking-pool-ratchets-to-peak-because-
@@ -563,6 +624,12 @@ pub struct ThreadNameCensus {
     /// count (`resource_guard::session_thread_attribution` treats that shape as
     /// a mis-read, i.e. UNKNOWN).
     pub session_threads: usize,
+    /// The subset of [`Self::session_threads`] in a holder-backed pane's
+    /// families ([`HOLDER_SESSION_THREAD_FAMILIES`]) — two per holder-backed
+    /// terminal. Kept apart so `resource_guard` can size the per-session
+    /// multiplier from the HOLDER count alone: a leak in the in-process
+    /// `terminal-*` families then cannot loosen that multiplier at all.
+    pub holder_session_threads: usize,
     /// When the walk ran. Wall-clock, because the consumer is a `/health`
     /// reader comparing it against its own clock.
     pub sampled_at: std::time::SystemTime,
@@ -584,12 +651,34 @@ pub const MAX_THREAD_NAME_ROWS: usize = 12;
 /// The bucket a thread with no description lands in.
 pub const UNNAMED_THREAD: &str = "<unnamed>";
 
-/// The thread-name prefixes of the PER-SESSION families: the two threads every
-/// live terminal holds for its whole life (`terminal/session.rs` names them
-/// `terminal-reader-<id>` and `terminal-waiter-<id>`, the id a
-/// `uuid::Uuid::new_v4()` from `terminal/manager.rs`).
+/// The thread-name prefixes of the PER-SESSION families every live terminal
+/// holds for its whole life, whatever its pane I/O: `terminal/session.rs` names
+/// them `terminal-reader-<id>` and `terminal-waiter-<id>`, the id a
+/// `uuid::Uuid::new_v4()` from `terminal/manager.rs`.
+pub const IN_PROCESS_SESSION_THREAD_FAMILIES: &[&str] = &["terminal-reader", "terminal-waiter"];
+
+/// The thread-name prefixes of the per-session families a HOLDER-BACKED pane
+/// adds in the runner process: `terminal/daemon_pane_io.rs` spawns
+/// `pty-holder-ctl-<key>` and `pty-holder-pump-<key>` for every pane whose PTY
+/// lives in a `pty-holder` process. They live for as long as the pane is
+/// attached, so a holder-backed terminal holds FOUR runner threads, not two.
 ///
-/// Exactly these two and nothing else, deliberately. `pipe-drain` is one
+/// Leaving them out made them look like non-session load: measured
+/// 2026-11-04 on nawa (128 cores, 503 GiB), 234 holder panes put 468 of these
+/// threads into the at-rest baseline (622, capped to 512). The pool arm then
+/// had 105 threads of headroom over a floor that grew 2 threads with every new
+/// session, and every gate continuation deferred at
+/// `thread_pressure:warn:1099_over_1085` while the kernel, cgroup and memory
+/// were nowhere near a limit. The holder server's OWN threads (`pty-holder-pump`
+/// in `crates/pty-holder/src/server.rs` and the rest) run in the holder
+/// process and never appear in this census.
+pub const HOLDER_SESSION_THREAD_FAMILIES: &[&str] = &["pty-holder-ctl", "pty-holder-pump"];
+
+/// Every PER-SESSION family: [`IN_PROCESS_SESSION_THREAD_FAMILIES`] followed by
+/// [`HOLDER_SESSION_THREAD_FAMILIES`]. A test pins that this list is exactly
+/// that union.
+///
+/// These and nothing else, deliberately. `pipe-drain` is one
 /// TRANSIENT thread per piped child process and `transcript-scan` is a
 /// dispatcher singleton — neither scales with the number of terminals.
 /// Counting them as session load would inflate the measured threads-per-session
@@ -600,9 +689,14 @@ pub const UNNAMED_THREAD: &str = "<unnamed>";
 ///
 /// Matched with `starts_with` over the raw names, which holds on both
 /// platforms: on Linux `comm`'s 15-byte truncation yields exactly
-/// `terminal-reader` / `terminal-waiter`, and on Windows the full
-/// `terminal-reader-<uuid>` description survives.
-pub const SESSION_THREAD_FAMILIES: &[&str] = &["terminal-reader", "terminal-waiter"];
+/// `terminal-reader` / `terminal-waiter` / `pty-holder-ctl-` / `pty-holder-pump`,
+/// and on Windows the full `terminal-reader-<uuid>` description survives.
+pub const SESSION_THREAD_FAMILIES: &[&str] = &[
+    "terminal-reader",
+    "terminal-waiter",
+    "pty-holder-ctl",
+    "pty-holder-pump",
+];
 
 /// One direct child process.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -742,8 +836,9 @@ pub struct WedgeDiagnosticRecord {
     /// never for elapsed arithmetic (see `unresponsive_for_secs`).
     pub ts: String,
     pub pid: u32,
-    /// `"escalate"` or `"re-escalate"` — the escalation that triggered this
-    /// capture.
+    /// `"escalate"`, `"re-escalate"`, or `"never-answered"` (the backend
+    /// rung's one-shot report of a `/livez` that has not answered since process
+    /// start) — the escalation that triggered this capture.
     pub event: &'static str,
     pub consecutive_failures: u32,
     /// Phase 3's REAL elapsed since the first failed probe of this incident,
@@ -752,6 +847,11 @@ pub struct WedgeDiagnosticRecord {
     pub unresponsive_for_ms: u64,
     pub tracked_blocking_bodies: TrackedBlockingBodies,
     pub threads: Captured<ThreadCensus>,
+    /// The native UI thread, named separately from the anonymous `threads`
+    /// histogram. `"ui_thread_not_identified"` when no main window has been
+    /// cached (server mode, before the window exists), `"ui_thread_not_found"`
+    /// when the identified thread is not among this process's threads.
+    pub ui_thread: Captured<UiThreadState>,
     pub children: Captured<ChildCensus>,
 }
 
@@ -873,6 +973,24 @@ pub fn cap_tally(tally: BTreeMap<String, usize>, keep: usize) -> BTreeMap<String
 // everywhere even though only Windows produces these codes
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Name of a kernel `KTHREAD_STATE` value
+/// (`SYSTEM_THREAD_INFORMATION.ThreadState`).
+pub fn thread_state_name(code: u32) -> &'static str {
+    match code {
+        0 => "Initialized",
+        1 => "Ready",
+        2 => "Running",
+        3 => "Standby",
+        4 => "Terminated",
+        5 => "Waiting",
+        6 => "Transition",
+        7 => "DeferredReady",
+        8 => "GateWaitObsolete",
+        9 => "WaitingForProcessInSwap",
+        _ => "UnknownThreadState",
+    }
+}
+
 /// Render a Windows `KWAIT_REASON` code as its kernel name.
 ///
 /// These are the kernel's own names, not WMI's `Win32_Thread.ThreadWaitReason`
@@ -983,6 +1101,8 @@ pub fn parse_proc_stat_ppid(stat: &str) -> Option<u32> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureStep {
     Threads,
+    /// The identified native UI thread ([`ui_thread_os_id`]).
+    UiThread,
     Children,
 }
 
@@ -992,6 +1112,8 @@ pub enum CaptureStep {
 #[derive(Debug, Clone, PartialEq)]
 pub enum StepOutput {
     Threads(Option<ThreadCensus>),
+    /// `Err` carries the reason string for the record.
+    UiThread(Result<UiThreadState, &'static str>),
     Children(Option<ChildCensus>),
 }
 
@@ -1000,6 +1122,7 @@ impl StepOutput {
         matches!(
             (self, step),
             (StepOutput::Threads(_), CaptureStep::Threads)
+                | (StepOutput::UiThread(_), CaptureStep::UiThread)
                 | (StepOutput::Children(_), CaptureStep::Children)
         )
     }
@@ -1011,6 +1134,7 @@ impl StepOutput {
 pub fn run_capture_step(step: CaptureStep) -> StepOutput {
     match step {
         CaptureStep::Threads => StepOutput::Threads(capture_thread_census()),
+        CaptureStep::UiThread => StepOutput::UiThread(capture_ui_thread_state()),
         CaptureStep::Children => StepOutput::Children(capture_child_census()),
     }
 }
@@ -1042,6 +1166,20 @@ pub fn capture_thread_census() -> Option<ThreadCensus> {
 #[cfg(target_os = "windows")]
 pub fn capture_thread_census() -> Option<ThreadCensus> {
     windows_thread_census::census()
+}
+
+/// The identified native UI thread's scheduling state — see [`UiThreadState`].
+#[cfg(target_os = "windows")]
+pub fn capture_ui_thread_state() -> Result<UiThreadState, &'static str> {
+    let tid = ui_thread_os_id().ok_or("ui_thread_not_identified")?;
+    windows_thread_census::thread_state(tid)
+}
+
+/// No native UI thread is identified off Windows: the main-window handle the
+/// id is derived from is a Win32 concept (`ui_thread_probe`).
+#[cfg(not(target_os = "windows"))]
+pub fn capture_ui_thread_state() -> Result<UiThreadState, &'static str> {
+    Err("unsupported_platform")
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -1102,10 +1240,15 @@ pub fn finish_thread_name_census(names: Vec<String>) -> Option<ThreadNameCensus>
         return None;
     }
     let session_threads = names.iter().filter(|name| is_session_thread(name)).count();
+    let holder_session_threads = names
+        .iter()
+        .filter(|name| in_families(name, HOLDER_SESSION_THREAD_FAMILIES))
+        .count();
     Some(ThreadNameCensus {
         total: names.len(),
         by_name: collapse_thread_names(names.iter().map(String::as_str)),
         session_threads,
+        holder_session_threads,
         sampled_at: std::time::SystemTime::now(),
     })
 }
@@ -1113,10 +1256,13 @@ pub fn finish_thread_name_census(names: Vec<String>) -> Option<ThreadNameCensus>
 /// `true` when a raw thread name belongs to one of the
 /// [`SESSION_THREAD_FAMILIES`].
 fn is_session_thread(name: &str) -> bool {
+    in_families(name, SESSION_THREAD_FAMILIES)
+}
+
+/// `true` when a raw thread name starts with one of `families`.
+fn in_families(name: &str, families: &[&str]) -> bool {
     let name = name.trim();
-    SESSION_THREAD_FAMILIES
-        .iter()
-        .any(|family| name.starts_with(family))
+    families.iter().any(|family| name.starts_with(family))
 }
 
 /// Collapse a list of thread names into the top [`MAX_THREAD_NAME_ROWS`] rows.
@@ -1290,7 +1436,7 @@ pub fn capture_child_census() -> Option<ChildCensus> {
 #[cfg(target_os = "windows")]
 #[allow(dead_code, non_snake_case)]
 mod windows_thread_census {
-    use super::{wait_reason_name, ThreadCensus};
+    use super::{thread_state_name, wait_reason_name, ThreadCensus, UiThreadState};
     use std::collections::BTreeMap;
 
     const SYSTEM_PROCESS_INFORMATION: u32 = 5;
@@ -1471,6 +1617,30 @@ mod windows_thread_census {
         })
     }
 
+    /// One identified thread's scheduling state —
+    /// [`super::capture_ui_thread_state`]'s arm. `Err` names why there is no
+    /// value.
+    pub(super) fn thread_state(tid: u32) -> Result<UiThreadState, &'static str> {
+        let table = ProcessTable::read().ok_or("enumeration_failed")?;
+        table
+            .with_own_threads(|threads| {
+                threads
+                    .iter()
+                    .find(|t| t.client_id.unique_thread as usize as u32 == tid)
+                    .map(|t| UiThreadState {
+                        os_thread_id: tid,
+                        state: thread_state_name(t.thread_state),
+                        wait_reason: wait_reason_name(t.wait_reason),
+                        // The kernel reports both times in 100 ns units.
+                        user_time_ms: (t.user_time.max(0) as u64) / 10_000,
+                        kernel_time_ms: (t.kernel_time.max(0) as u64) / 10_000,
+                        context_switches: t.context_switches,
+                    })
+            })
+            .ok_or("enumeration_failed")?
+            .ok_or("ui_thread_not_found")
+    }
+
     /// Every thread's description — [`super::capture_thread_name_census`]'s
     /// arm. One entry per thread the snapshot saw; a thread that has since
     /// exited, or that carries no description, yields an empty string, which
@@ -1587,8 +1757,9 @@ mod windows_thread_census {
 // Bounded capture: one long-lived worker thread, one deadline per step
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Default per-step budget. Short enough that both steps together stay far
-/// inside `health_monitor`'s 180s monitor-stall window (so a slow capture can
+/// Default per-step budget. Short enough that all three steps together (the
+/// child census, the thread census and the UI-thread read, so at most 9s)
+/// stay far inside `health_monitor`'s 180s monitor-stall window (so a slow capture can
 /// never present as a dead detector), long enough that a healthy enumeration of
 /// a few hundred processes finishes comfortably.
 pub const CAPTURE_STEP_DEADLINE_SECS: u64 = 3;
@@ -1752,6 +1923,12 @@ impl WedgeDiagnostics {
             Ok(_) => Captured::Unavailable("timed_out"),
             Err(reason) => Captured::Unavailable(reason),
         };
+        let ui_thread = match self.capturer.capture(CaptureStep::UiThread) {
+            Ok(StepOutput::UiThread(Ok(state))) => Captured::Value(state),
+            Ok(StepOutput::UiThread(Err(reason))) => Captured::Unavailable(reason),
+            Ok(_) => Captured::Unavailable("timed_out"),
+            Err(reason) => Captured::Unavailable(reason),
+        };
         let children = match self.capturer.capture(CaptureStep::Children) {
             Ok(StepOutput::Children(Some(c))) => Captured::Value(c),
             Ok(StepOutput::Children(None)) => Captured::Unavailable("enumeration_failed"),
@@ -1768,6 +1945,7 @@ impl WedgeDiagnostics {
             unresponsive_for_ms: unresponsive_for.as_millis().min(u64::MAX as u128) as u64,
             tracked_blocking_bodies,
             threads,
+            ui_thread,
             children,
         }
     }
@@ -2159,9 +2337,9 @@ mod tests {
 
     /// Take a slot on `table`, charged to the calling thread's lane there.
     ///
-    /// `#[must_use]` for the same reason [`BlockingSlot`] carries it: a slot that
-    /// is not HELD counts nothing.
-    #[must_use]
+    /// Must be held: [`BlockingSlot`] is itself `#[must_use]`, because a slot
+    /// that is not HELD counts nothing, and a function returning it inherits
+    /// that.
     fn enter_in(table: &'static LaneTable) -> BlockingSlot {
         BlockingSlot::enter_lane_in(table, table.lane_for_thread(&std::thread::current()))
     }
@@ -2595,6 +2773,14 @@ mod tests {
                     ("UserRequest".to_string(), 528),
                 ]),
             }),
+            ui_thread: Captured::Value(UiThreadState {
+                os_thread_id: 7104,
+                state: "Waiting",
+                wait_reason: "WrUserRequest",
+                user_time_ms: 1234,
+                kernel_time_ms: 56,
+                context_switches: 789,
+            }),
             children: Captured::Value(ChildCensus {
                 total: 324,
                 by_name: BTreeMap::from([("git.exe".to_string(), 324)]),
@@ -2639,6 +2825,8 @@ mod tests {
         );
         assert_eq!(v["threads"]["total"], 540);
         assert_eq!(v["threads"]["by_wait_reason"]["UserRequest"], 528);
+        assert_eq!(v["ui_thread"]["os_thread_id"], 7104);
+        assert_eq!(v["ui_thread"]["wait_reason"], "WrUserRequest");
         assert_eq!(v["children"]["total"], 324);
         assert_eq!(v["children"]["oldest"][0]["pid"], 9001);
     }
@@ -2669,6 +2857,8 @@ mod tests {
             + &untracked
             + r#"},"#
             + r#""threads":{"total":540,"by_wait_reason":{"Executive":12,"UserRequest":528}},"#
+            + r#""ui_thread":{"os_thread_id":7104,"state":"Waiting","wait_reason":"WrUserRequest","#
+            + r#""user_time_ms":1234,"kernel_time_ms":56,"context_switches":789},"#
             + r#""children":{"total":324,"by_name":{"git.exe":324},"#
             + r#""oldest":[{"pid":9001,"name":"git.exe","elapsed_secs":4000,"#
             + r#""cpu_percent":0.0}]}}"#
@@ -2860,6 +3050,7 @@ mod tests {
             tmp.path().to_path_buf(),
             BoundedCapturer::with_runner(Duration::from_millis(50), |s| match s {
                 CaptureStep::Threads => StepOutput::Threads(None),
+                CaptureStep::UiThread => StepOutput::UiThread(Err("ui_thread_not_identified")),
                 CaptureStep::Children => StepOutput::Children(None),
             }),
         );
@@ -2902,6 +3093,7 @@ mod tests {
             let _ = release_rx.recv();
             match s {
                 CaptureStep::Threads => StepOutput::Threads(None),
+                CaptureStep::UiThread => StepOutput::UiThread(Err("ui_thread_not_identified")),
                 CaptureStep::Children => StepOutput::Children(None),
             }
         });
@@ -2938,6 +3130,7 @@ mod tests {
                 let _ = release_rx.recv();
                 match s {
                     CaptureStep::Threads => StepOutput::Threads(None),
+                    CaptureStep::UiThread => StepOutput::UiThread(Err("ui_thread_not_identified")),
                     CaptureStep::Children => StepOutput::Children(None),
                 }
             }),
@@ -2955,6 +3148,7 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(body.trim_end()).expect("a valid JSONL record");
         assert_eq!(v["threads"], "timed_out");
+        assert_eq!(v["ui_thread"], "timed_out");
         assert_eq!(v["children"], "timed_out");
         assert_eq!(v["consecutive_failures"], 63);
         assert_eq!(
@@ -2980,6 +3174,14 @@ mod tests {
                     total: 7,
                     by_wait_reason: BTreeMap::from([("UserRequest".to_string(), 7)]),
                 })),
+                CaptureStep::UiThread => StepOutput::UiThread(Ok(UiThreadState {
+                    os_thread_id: 4242,
+                    state: "Waiting",
+                    wait_reason: "UserRequest",
+                    user_time_ms: 10,
+                    kernel_time_ms: 2,
+                    context_switches: 30,
+                })),
                 CaptureStep::Children => StepOutput::Children(Some(ChildCensus {
                     total: 2,
                     by_name: BTreeMap::from([("git".to_string(), 2)]),
@@ -2994,6 +3196,8 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(body.trim_end()).expect("valid JSONL");
         assert_eq!(v["event"], "re-escalate");
         assert_eq!(v["threads"]["total"], 7);
+        assert_eq!(v["ui_thread"]["os_thread_id"], 4242);
+        assert_eq!(v["ui_thread"]["state"], "Waiting");
         assert_eq!(v["children"]["total"], 2);
 
         // A second escalation appends rather than truncating.
@@ -3009,6 +3213,7 @@ mod tests {
     fn a_round_trip_returns_the_steps_own_output() {
         let mut cap = BoundedCapturer::with_runner(Duration::from_secs(30), |s| match s {
             CaptureStep::Threads => StepOutput::Threads(None),
+            CaptureStep::UiThread => StepOutput::UiThread(Err("ui_thread_not_found")),
             CaptureStep::Children => StepOutput::Children(Some(ChildCensus {
                 total: 0,
                 by_name: BTreeMap::new(),
@@ -3023,6 +3228,42 @@ mod tests {
             cap.capture(CaptureStep::Children),
             Ok(StepOutput::Children(Some(_)))
         ));
+        // A reason the step itself returned comes back as that reason, never as
+        // a timeout.
+        assert_eq!(
+            cap.capture(CaptureStep::UiThread),
+            Ok(StepOutput::UiThread(Err("ui_thread_not_found")))
+        );
+    }
+
+    #[test]
+    fn thread_state_names_are_the_kernels() {
+        assert_eq!(thread_state_name(2), "Running");
+        assert_eq!(thread_state_name(5), "Waiting");
+        assert_eq!(thread_state_name(9), "WaitingForProcessInSwap");
+        assert_eq!(thread_state_name(42), "UnknownThreadState");
+    }
+
+    /// The native arm finds a thread it was pointed at in THIS process — the
+    /// test thread itself stands in for the UI thread.
+    #[test]
+    #[cfg_attr(
+        not(target_os = "windows"),
+        ignore = "the UI thread is a Win32 concept"
+    )]
+    fn the_ui_thread_step_reads_an_identified_thread_of_this_process() {
+        #[cfg(target_os = "windows")]
+        {
+            let me = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+            let state = windows_thread_census::thread_state(me).expect("own thread found");
+            assert_eq!(state.os_thread_id, me);
+            // This thread is executing the enumeration, so it is not Waiting.
+            assert_ne!(state.state, "Waiting", "{state:?}");
+            assert_eq!(
+                windows_thread_census::thread_state(u32::MAX - 3),
+                Err("ui_thread_not_found")
+            );
+        }
     }
 
     // ---- native census: it must produce plausible values for THIS process ----
@@ -3228,6 +3469,61 @@ mod tests {
             "pipe-drain".to_string(),
             "transcript-scan".to_string(),
             "terminal".to_string(),
+        ])
+        .expect("census");
+        assert_eq!(c.session_threads, 0);
+    }
+
+    /// A holder-backed pane's runner-side `pty-holder-ctl-<key>` and
+    /// `pty-holder-pump-<key>` threads are per-session load, under both the
+    /// Linux `comm` truncation and the full Windows name. Before this they fell
+    /// into the non-session remainder (nawa, 2026-11-04: 468 of them, the
+    /// whole margin of `thread_pressure:warn:1099_over_1085`). The holder
+    /// process's own singletons and the transient per-pane helpers stay out.
+    #[test]
+    fn holder_pane_threads_are_session_threads() {
+        assert_eq!(
+            SESSION_THREAD_FAMILIES,
+            [
+                IN_PROCESS_SESSION_THREAD_FAMILIES,
+                HOLDER_SESSION_THREAD_FAMILIES
+            ]
+            .concat()
+            .as_slice()
+        );
+
+        // Linux: 15-byte `comm` truncation of `pty-holder-ctl-<key>` and
+        // `pty-holder-pump-<key>`.
+        let mut linux: Vec<String> = Vec::new();
+        for family in [
+            "terminal-reader",
+            "terminal-waiter",
+            "pty-holder-ctl-",
+            "pty-holder-pump",
+        ] {
+            linux.extend(vec![family.to_string(); 234]);
+        }
+        linux.extend(vec!["app-rt".to_string(); 34]);
+        let c = finish_thread_name_census(linux).expect("census");
+        assert_eq!(c.session_threads, 936);
+        assert_eq!(c.holder_session_threads, 468);
+
+        // Windows: the full description survives.
+        let pane_id = "3f2a1b4c-9d8e-4f00-a1b2-0123456789ab";
+        let c = finish_thread_name_census(vec![
+            format!("pty-holder-ctl-{pane_id}"),
+            format!("pty-holder-pump-{pane_id}"),
+        ])
+        .expect("census");
+        assert_eq!(c.session_threads, 2);
+        assert_eq!(c.holder_session_threads, 2);
+
+        // Not per-session: transient per-pane helpers and boot singletons.
+        let c = finish_thread_name_census(vec![
+            "pty-holder-settle-1".to_string(),
+            "pty-holder-adopt-1".to_string(),
+            "pty-holder-census".to_string(),
+            "pty-holder-boot-sweep".to_string(),
         ])
         .expect("census");
         assert_eq!(c.session_threads, 0);

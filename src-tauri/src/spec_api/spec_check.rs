@@ -144,7 +144,7 @@ fn evaluate_ir_classified(
     ir: &qontinui_types::ir::IrPageSpec,
     fingerprint: qontinui_types::spec_check::BridgeFingerprint,
     snapshot_id: String,
-    content_sha256: String,
+    content_sha256: Option<String>,
     app_option: Option<&qontinui_types::apps::App>,
 ) -> SpecCheckResult {
     let mut result =
@@ -222,7 +222,7 @@ pub(crate) fn evaluate_loaded(
         &loaded.ir,
         fingerprint,
         format!("scs_inproc_{}", uuid::Uuid::now_v7()),
-        String::new(),
+        None,
         loaded.app.as_ref(),
     )
 }
@@ -240,7 +240,9 @@ pub(crate) fn evaluate_loaded(
 /// `spec_check::wrap_snapshot` (which mints `snapshot_id = "scs_" + UUIDv7()`
 /// plus a content sha256 and a `BridgeFingerprint`).
 ///
-/// Return: `(snapshot, fingerprint, snapshot_id, content_sha256)`.
+/// Return: `(snapshot, fingerprint, snapshot_id, content_sha256)`, where
+/// `content_sha256` is `None` when the canonical hasher refused the body
+/// (non-fatal: telemetry only) or the path hashes nothing.
 pub(crate) async fn fetch_fresh_snapshot(
     state: &Arc<ApiState>,
 ) -> Result<
@@ -248,7 +250,7 @@ pub(crate) async fn fetch_fresh_snapshot(
         UIBridgeSnapshot,
         qontinui_types::spec_check::BridgeFingerprint,
         String,
-        String,
+        Option<String>,
     ),
     spec_check::SnapshotFetchError,
 > {
@@ -286,45 +288,77 @@ pub(crate) async fn fetch_fresh_snapshot(
     )
     .await
     {
-        Ok(value) => {
-            // dispatch_app_request returns the full HTTP response body
-            // (`{success: true, data: {...snapshot...}}`) — wrap_snapshot's
-            // strict `serde_json::from_value::<UIBridgeSnapshot>` would parse
-            // the envelope as a default zero-element snapshot, silently
-            // producing matchRate=0 on every downstream evaluate(). Unwrap
-            // `data` (mirroring fetch_self_snapshot below) and strict-parse:
-            // ui-bridge >= 0.22.0 emits the canonical superset directly.
-            // Then synthesize the fingerprint directly — avoids a serde
-            // round-trip through wrap_snapshot.
-            let inner = value.get("data").cloned().unwrap_or(value.clone());
-            let snapshot = parse_supplied_snapshot(inner).map_err(|e| {
-                spec_check::SnapshotFetchError::Malformed(format!("sdk-snapshot parse: {e}"))
-            })?;
-            let content_sha256 =
-                qontinui_types::canonical_hash::canonical_hash(&value).map_err(|e| {
-                    spec_check::SnapshotFetchError::Malformed(format!("canonical hash: {e}"))
-                })?;
-            let snapshot_timestamp =
-                chrono::DateTime::<chrono::Utc>::from_timestamp_millis(snapshot.timestamp)
-                    .ok_or_else(|| {
-                        spec_check::SnapshotFetchError::Malformed(
-                            "timestamp out of range".to_string(),
-                        )
-                    })?
-                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-            let fingerprint = qontinui_types::spec_check::BridgeFingerprint {
-                app_id,
-                app_version,
-                route,
-                bridge_version,
-                snapshot_timestamp,
-                element_count: snapshot.elements.len() as u32,
-            };
-            let snapshot_id = format!("scs_{}", uuid::Uuid::now_v7());
-            Ok((snapshot, fingerprint, snapshot_id, content_sha256))
-        }
+        Ok(value) => wrap_sdk_snapshot(
+            value,
+            app_id,
+            app_version,
+            route,
+            bridge_version,
+            qontinui_types::canonical_hash::canonical_hash::<serde_json::Value>,
+        ),
         Err(e) => Err(classify_sdk_error(&e)),
     }
+}
+
+/// The SDK branch of [`fetch_fresh_snapshot`] after dispatch, with the
+/// canonical hasher injected — the seam that lets a test prove a hasher
+/// refusal costs only `content_sha256` (None) and never the fetch. Today's
+/// `canonical_hash` cannot refuse a `serde_json::Value`, so a refusal can
+/// only be injected.
+fn wrap_sdk_snapshot<H>(
+    value: serde_json::Value,
+    app_id: String,
+    app_version: Option<String>,
+    route: Option<String>,
+    bridge_version: Option<String>,
+    hasher: H,
+) -> Result<
+    (
+        UIBridgeSnapshot,
+        qontinui_types::spec_check::BridgeFingerprint,
+        String,
+        Option<String>,
+    ),
+    spec_check::SnapshotFetchError,
+>
+where
+    H: FnOnce(
+        &serde_json::Value,
+    ) -> Result<String, qontinui_types::canonical_hash::CanonicalHashError>,
+{
+    // dispatch_app_request returns the full HTTP response body
+    // (`{success: true, data: {...snapshot...}}`) — wrap_snapshot's
+    // strict `serde_json::from_value::<UIBridgeSnapshot>` would parse
+    // the envelope as a default zero-element snapshot, silently
+    // producing matchRate=0 on every downstream evaluate(). Unwrap
+    // `data` (mirroring fetch_self_snapshot below) and strict-parse:
+    // ui-bridge >= 0.22.0 emits the canonical superset directly.
+    // Then synthesize the fingerprint directly — avoids a serde
+    // round-trip through wrap_snapshot.
+    let inner = value.get("data").cloned().unwrap_or(value.clone());
+    let snapshot = parse_supplied_snapshot(inner).map_err(|e| {
+        spec_check::SnapshotFetchError::Malformed(format!("sdk-snapshot parse: {e}"))
+    })?;
+    // Mint the id BEFORE hashing so a refusal's warn! line carries it.
+    let snapshot_id = format!("scs_{}", uuid::Uuid::now_v7());
+    // Telemetry only: a canonicalisation refusal yields `None` (and a
+    // warn!), never a failed fetch.
+    let content_sha256 = spec_check::snapshot_telemetry_hash_with(&value, &snapshot_id, hasher);
+    let snapshot_timestamp =
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(snapshot.timestamp)
+            .ok_or_else(|| {
+                spec_check::SnapshotFetchError::Malformed("timestamp out of range".to_string())
+            })?
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let fingerprint = qontinui_types::spec_check::BridgeFingerprint {
+        app_id,
+        app_version,
+        route,
+        bridge_version,
+        snapshot_timestamp,
+        element_count: snapshot.elements.len() as u32,
+    };
+    Ok((snapshot, fingerprint, snapshot_id, content_sha256))
 }
 
 /// Loop back to the runner's own `/ui-bridge/control/snapshot` when no
@@ -340,7 +374,7 @@ async fn fetch_self_snapshot() -> Result<
         UIBridgeSnapshot,
         qontinui_types::spec_check::BridgeFingerprint,
         String,
-        String,
+        Option<String>,
     ),
     spec_check::SnapshotFetchError,
 > {
@@ -397,7 +431,7 @@ async fn fetch_self_snapshot() -> Result<
         snapshot,
         fingerprint,
         format!("scs_self_{}", uuid::Uuid::now_v7()),
-        String::new(),
+        None,
     ))
 }
 
@@ -595,7 +629,7 @@ pub async fn post_spec_check(
                 s,
                 fp,
                 format!("scs_supplied_{}", uuid::Uuid::now_v7()),
-                String::new(),
+                None,
             )
         }
         None => match fetch_fresh_snapshot(&state).await {
@@ -733,7 +767,7 @@ pub async fn post_spec_check_batch(
                 Ok(s) => {
                     // Mirror the single supplied path: bind the synthesized
                     // fingerprint to the requested app; no raw bytes hashed
-                    // on the supplied path (content hash stays empty).
+                    // on the supplied path (content hash is None).
                     let fp = qontinui_types::spec_check::BridgeFingerprint {
                         app_id: req.app_id.clone(),
                         app_version: None,
@@ -745,7 +779,7 @@ pub async fn post_spec_check_batch(
                     (
                         Arc::new(s),
                         fp,
-                        String::new(),
+                        None,
                         format!("scs_supplied_{}", uuid::Uuid::now_v7()),
                     )
                 }
@@ -882,7 +916,7 @@ pub async fn post_spec_check_batch(
                 &snapshot,
                 &snapshot_id_owned,
                 &fingerprint_owned,
-                &content_hash_owned,
+                content_hash_owned.as_deref(),
                 shared_policy.as_ref(),
                 (*app_owned).as_ref(),
                 registrar_owned.as_ref(),
@@ -1040,7 +1074,7 @@ async fn evaluate_one(
     snapshot: &Arc<UIBridgeSnapshot>,
     snapshot_id: &str,
     fingerprint: &qontinui_types::spec_check::BridgeFingerprint,
-    content_sha256: &str,
+    content_sha256: Option<&str>,
     shared_policy: Option<&SpecCheckPolicy>,
     app_option: Option<&qontinui_types::apps::App>,
     helper_registrar: Option<&crate::helper_tasks::HelperTaskRegistrar>,
@@ -1064,7 +1098,7 @@ async fn evaluate_one(
         &ir,
         fingerprint.clone(),
         snapshot_id.to_string(),
-        content_sha256.to_string(),
+        content_sha256.map(str::to_string),
         app_option,
     );
 
@@ -1103,7 +1137,7 @@ async fn stream_batch_results(
     snapshot: Arc<UIBridgeSnapshot>,
     snapshot_id: String,
     fingerprint: qontinui_types::spec_check::BridgeFingerprint,
-    content_hash: String,
+    content_hash: Option<String>,
     root: Arc<std::path::PathBuf>,
     pages: Vec<BatchPageEntry>,
     shared_policy: Option<SpecCheckPolicy>,
@@ -1185,7 +1219,7 @@ async fn stream_batch_results(
                 &snapshot,
                 &snap_id,
                 &fingerprint,
-                &content_hash,
+                content_hash.as_deref(),
                 shared_policy.as_ref(),
                 (*app_option).as_ref(),
                 helper_registrar.as_ref(),
@@ -1364,7 +1398,7 @@ mod tests {
             &snapshot,
             "scs_test",
             &fp,
-            "",
+            None,
             None,
             None,
             None,
@@ -1393,7 +1427,7 @@ mod tests {
             &snapshot,
             "scs_test",
             &fp,
-            "",
+            None,
             None,
             None,
             None,
@@ -1463,7 +1497,7 @@ mod tests {
             &snapshot,
             "scs_test",
             &fp,
-            "",
+            None,
             None,
             None,
             None,
@@ -1477,7 +1511,7 @@ mod tests {
         // instead of the in-process sentinel.
         assert_eq!(result.bridge_fingerprint.app_id, "test-app");
         assert_eq!(result.snapshot_id, "scs_test");
-        // Empty content_sha256 ("") leaves snapshot_sha256 as None.
+        // No content_sha256 (None) leaves snapshot_sha256 as None.
         assert_eq!(result.snapshot_sha256, None);
     }
 
@@ -1549,7 +1583,7 @@ mod tests {
             &snapshot,
             marker,
             &fp,
-            "",
+            None,
             Some(&policy),
             None,
             None,
@@ -1664,6 +1698,130 @@ mod tests {
             .expect("missing arrays are valid empty");
         assert!(snap.elements.is_empty());
         assert_eq!(snap.timestamp, 5);
+    }
+
+    #[test]
+    fn sdk_snapshot_hash_refusal_still_fetches_with_hash_absent() {
+        // The SDK branch of fetch_fresh_snapshot: a canonical-hash refusal
+        // must cost only content_sha256 (None), never the fetch. Injected,
+        // because today's canonical_hash cannot refuse a serde_json::Value.
+        let envelope = json!({ "success": true, "data": { "timestamp": 1_700_000_000_000i64 } });
+        let (snap, fp, snapshot_id, hash) = wrap_sdk_snapshot(
+            envelope,
+            "qontinui-web".to_string(),
+            None,
+            None,
+            None,
+            |_: &serde_json::Value| {
+                Err(
+                    qontinui_types::canonical_hash::CanonicalHashError::Canonicalize(
+                        "refused for the test".to_string(),
+                    ),
+                )
+            },
+        )
+        .expect("a refused telemetry hash must not fail the SDK snapshot fetch");
+        assert_eq!(hash, None);
+        assert!(snapshot_id.starts_with("scs_"));
+        assert_eq!(snap.timestamp, 1_700_000_000_000);
+        assert_eq!(fp.app_id, "qontinui-web");
+        assert_eq!(fp.snapshot_timestamp, "2023-11-14T22:13:20.000Z");
+
+        // And the accepting path still carries the real hash.
+        let envelope = json!({ "success": true, "data": { "timestamp": 0i64 } });
+        let (_s, _fp, _id, hash) = wrap_sdk_snapshot(
+            envelope.clone(),
+            "qontinui-web".to_string(),
+            None,
+            None,
+            None,
+            qontinui_types::canonical_hash::canonical_hash::<serde_json::Value>,
+        )
+        .expect("accepted");
+        assert_eq!(
+            hash,
+            Some(qontinui_types::canonical_hash::canonical_hash(&envelope).unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn refused_sdk_snapshot_hash_still_evaluates_with_snapshot_sha256_none() {
+        // Plan 2026-11-22-canonical-hash-genuine-rfc8785 Phase 2: a snapshot
+        // whose telemetry hash is refused still fetches AND evaluates, with
+        // `snapshot_sha256` absent. The fetch tuple is carried into
+        // `evaluate_one` exactly as `post_spec_check_batch` carries it.
+        // (Not entered through POST: the route reaches a live SDK client,
+        // and today's canonical_hash cannot refuse a serde_json::Value, so a
+        // refusal can only be injected at the `wrap_sdk_snapshot` seam.)
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let doc = minimal_ir_doc("refused-hash-page");
+        storage::write_ir_and_regenerate(root, RUNNER_APP_ID, &doc).unwrap();
+
+        let envelope = json!({ "success": true, "data": minimal_snapshot_json() });
+        let (snapshot, fp, snapshot_id, hash) = wrap_sdk_snapshot(
+            envelope,
+            "qontinui-web".to_string(),
+            None,
+            None,
+            None,
+            |_: &serde_json::Value| {
+                Err(
+                    qontinui_types::canonical_hash::CanonicalHashError::Canonicalize(
+                        "refused for the test".to_string(),
+                    ),
+                )
+            },
+        )
+        .expect("a refused telemetry hash must not fail the SDK snapshot fetch");
+        assert_eq!(hash, None);
+
+        let entry = BatchPageEntry {
+            page_id: "refused-hash-page".to_string(),
+            policy_override: None,
+        };
+        let r = evaluate_one(
+            RUNNER_APP_ID,
+            root,
+            &entry,
+            &Arc::new(snapshot),
+            &snapshot_id,
+            &fp,
+            hash.as_deref(),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(r.status, "ok");
+        let result = r.result.expect("ok status carries a result");
+        assert_eq!(result.snapshot_id, snapshot_id);
+        assert_eq!(result.bridge_fingerprint.app_id, "qontinui-web");
+        assert_eq!(result.snapshot_sha256, None);
+
+        // And an accepted hash is carried through evaluate_one, so a
+        // regression that always drops it cannot pass as the None case.
+        let r = evaluate_one(
+            RUNNER_APP_ID,
+            root,
+            &entry,
+            &Arc::new(serde_json::from_value(minimal_snapshot_json()).unwrap()),
+            &snapshot_id,
+            &fp,
+            Some("sha256-accepted"),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(r.status, "ok");
+        assert_eq!(
+            r.result
+                .expect("ok status carries a result")
+                .snapshot_sha256
+                .as_deref(),
+            Some("sha256-accepted")
+        );
     }
 
     #[test]

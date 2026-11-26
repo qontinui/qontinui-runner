@@ -20,7 +20,7 @@ tool is read-only, fleet-wide, and needs **no device-scoped JWT** — it works o
 the standard session identity (it mirrors `coord_query_ci_state`'s auth-agnostic
 handler).
 
-Two shapes:
+Three shapes:
 
 - **`/pr-status`** (no args) → `coord_pr_status(mine=true)` — the PRs authored by
   *this* session (resolved via the PR↔session worktree mapping). Renders one card
@@ -29,6 +29,13 @@ Two shapes:
   specific PR's card, including **post-land** PRs (a merged PR still answers, with
   `merged_at` + `merge_commit`; if the row aged out after branch deletion the card
   is reconstructed from `pr_events` and flagged `reconstructed_from_events`).
+- **`/pr-status <owner/repo> <head-branch>`** → `coord_pr_status(repo, head_branch)`
+  — the coord equivalent of `gh pr list --head <branch>`. Answers
+  `{cards, unservable, note}`: one card per PR coord holds on that branch (open
+  first, then newest), `unservable` for a PR it lists but cannot build a card
+  for, and `cards: []` plus a `note` when it holds none. That empty answer is a
+  statement about coord's twin, not GitHub: a PR opened moments ago may not be
+  ingested yet.
 
 ## Instructions
 
@@ -36,12 +43,17 @@ Two shapes:
    - No args → call the MCP tool `coord_pr_status` with `{ "mine": true }`.
    - `<owner/repo> <number>` → call `coord_pr_status` with
      `{ "repo": "<owner/repo>", "number": <n> }`.
+   - `<owner/repo> <anything that is not a positive integer>` → call
+     `coord_pr_status` with `{ "repo": "<owner/repo>", "head_branch": "<it>" }`
+     and render each entry of `cards` as below; list `unservable` and `note`
+     verbatim after them.
 2. **Call the tool.** `coord_pr_status` is in the read-only tool allow-set, so a
    normal session can call it directly. If it comes back
    unknown/method-not-found (per-agent allow-set masking), fall back to the HTTP
    route via `pr-status.sh`, which sits next to this SKILL.md — run it as
    `bash <path-to-this-skill-dir>/pr-status.sh --mine` (or
-   `--repo <owner/repo> --number <n>`), never through a `qontinui-claude-config`
+   `--repo <owner/repo> --number <n>`, or
+   `--repo <owner/repo> --head-branch <branch>`), never through a `qontinui-claude-config`
    checkout, which a provisioned copy of this skill does not have.
    It mirrors the `/gate` transport
    cascade: first a sweep of the runner-written `.mcp.json` proxy doors
@@ -50,7 +62,7 @@ Two shapes:
    is reported as one, never as "coord unreachable"); if the transport is fine
    and coord declined the call, it says so and stops rather than retrying.
    The acting-bearer half reports the same typed causes `/coord-revive` does —
-   `HELPER_NOT_FOUND` / `NO_TOKEN` / `MINT_FAILED` / `HELPER_DEPS_MISSING` — so
+   `HELPER_NOT_FOUND` / `NO_TOKEN` / `MINT_FAILED` / `PRESENTER_NOT_ADMITTED` / `HELPER_DEPS_MISSING` — so
    "the helper is missing" and "coord refused the mint" are never both reported
    as `$COORD_AGENT_JWT` being unset. A sweep that found **no** door says so
    too, rather than letting the bearer note stand for the whole cascade.
@@ -87,6 +99,36 @@ Two shapes:
    `[]` means coord looked and found none. For a PR with **no card at all**
    the HTTP twin is `GET /coord/agent-pr-labels?repo=<owner/name>&pr_number=<n>`
    (device or agent JWT; `coord-read.ps1 labels` in the `coord` Agent Skill).
+
+   Always print supersession, read from `superseded_by_status` first. A
+   declaration is intent, not proof that this PR's code landed, so a line never
+   says more than its fields. On `recorded`, print one line per `superseded_by`
+   entry, and always print one line per `superseded_by_refused` entry. Each is a
+   single line, whatever its length:
+
+   ```
+   declared successor: <successor> (<successor_state>, read <successor_read>, successor land <successor_land_stamp>, content <content.tree>, <content.identical>/<content.paths> paths identical) — verify content before closing
+   refused successor: <successor> (<arm>, <author_association>, refused <refused_at>, <successor_state>, read <successor_read>, successor land <successor_land_stamp>) — verify content by hand
+   ```
+
+   Inside either line, any field that is `null` or missing prints `?`, never a
+   guess. `successor land` is the successor's land, not proof this PR's code is
+   on the base, and `content noop` alone is not equivalence: print the counts
+   beside it.
+
+   The other values of `superseded_by_status`, each printed as a single line:
+
+   - `none_recorded`: `superseded by: none recorded (UNKNOWN, not "not
+     superseded")`.
+   - `read_failed`: `superseded by: ? UNKNOWN (read failed)`.
+   - No such key (a coord build predating it): `superseded by: ? UNKNOWN (older
+     coord)`.
+   - `null` or any other value: `superseded by: ? UNKNOWN (unrecognised status
+     <value>)`.
+
+   `superseded_by_refused: []` prints nothing. `null` prints
+   `refused successor: ? UNKNOWN (read failed)`, and a card with no such key
+   prints `refused successor: ? UNKNOWN (older coord)`.
 4. **Never cache the result in memory.** The whole point is that this read is
    always fresh and self-describing. If you want to record something durable
    about the PR, record the **narrative** (why it exists, its recurring failure

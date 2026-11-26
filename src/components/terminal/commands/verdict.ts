@@ -375,7 +375,6 @@ export function stateEffect(
   return { verb: resultingState, noun, affected: changed ? 1 : 0, kind: "state", ...extra };
 }
 
-
 // ── The render half of a verdict ─────────────────────────────────────
 
 /**
@@ -444,4 +443,20 @@ export function renderCommandStatus(slash: string, value: unknown): RenderedStat
   if (!isEffectReport(value)) return { kind: "ok", text: `${slash} ✓` };
   const kind = statusKindOf(value);
   return { kind, text: `${slash} ${STATUS_GLYPH[kind]} ${describeReport(value)}` };
+}
+
+/** How long an `ok` / `noop` verdict stays on the status line after it lands. */
+export const STATUS_SUCCESS_TTL_MS = 6000;
+
+/**
+ * How long a painted verdict lives before the status line retires it, or
+ * `null` for "until replaced or dismissed".
+ *
+ * Successes expire: holding them forever left `/spawn-ai ✓` pinned over the
+ * grid for good. Errors do not — a failure is the verdict worth reading at
+ * leisure. The clock is the caller's to start when the verdict LANDS, not
+ * when the command began, so a slow command still gets the full window.
+ */
+export function statusTtlMs(kind: StatusKind): number | null {
+  return kind === "error" ? null : STATUS_SUCCESS_TTL_MS;
 }

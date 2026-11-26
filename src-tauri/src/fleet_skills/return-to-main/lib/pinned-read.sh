@@ -301,7 +301,9 @@ unset _pin_gitscope_lib
 # root such as `/tmp/...` or `/home/...` needs cygpath, so without the library
 # it passes through unchanged (exactly as before this boundary was handled) and
 # a stderr NOTE says the read may come back UNKNOWN for that reason.
-_pin_native_lib="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/native-path.sh"
+_pin_native_lib="${BASH_SOURCE[0]%/*}"
+[ "$_pin_native_lib" = "${BASH_SOURCE[0]}" ] && _pin_native_lib=.
+_pin_native_lib="$_pin_native_lib/native-path.sh"
 if [ -r "$_pin_native_lib" ]; then
   # shellcheck source=native-path.sh
   . "$_pin_native_lib"
