@@ -196,6 +196,18 @@ pub enum WsOutboundError {
     Send,
 }
 
+/// Why [`WsConnectionManager::send_text_if_current`] delivered nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinnedSendError {
+    /// `app_id` holds no routing slot, or the pinned connection is gone.
+    NotConnected,
+    /// `app_id`'s routing slot belongs to `current`, not to the pinned
+    /// connection: a newer connection replaced it (last-tab-wins).
+    Displaced { current: u64 },
+    /// The pinned connection's outbound channel is closed.
+    Send,
+}
+
 /// Per-connection outbound state. The sender pushes serialized frames to the
 /// task that owns the WebSocket write half.
 struct ConnectionEntry {
@@ -316,6 +328,50 @@ impl WsConnectionManager {
                 .ok_or(WsOutboundError::NotConnected)?
         };
         sender.send(text).await.map_err(|_| WsOutboundError::Send)
+    }
+
+    /// Send a text frame to `conn_id` ONLY while it still holds `app_id`'s
+    /// routing slot.
+    ///
+    /// The slot check and the enqueue happen under ONE inner-lock
+    /// acquisition, so no register can move the slot between them — unlike
+    /// [`Self::conn_for_app`] followed by [`Self::send_text`], which take the
+    /// lock twice. A caller that read a property of a specific connection
+    /// (its advertised capabilities) uses this so the frame can only ever
+    /// reach that connection.
+    ///
+    /// The enqueue under the lock is a `try_send`, so the lock is never held
+    /// across a wait. Only when the channel is FULL does the send continue
+    /// outside the lock, on the same connection's own sender: the slot check
+    /// already passed, and that sender delivers to no other connection, so a
+    /// replacement that lands during that wait still cannot receive the frame
+    /// (the displacement path rejects the caller's pending command instead).
+    pub async fn send_text_if_current(
+        &self,
+        app_id: &str,
+        conn_id: u64,
+        text: String,
+    ) -> Result<(), PinnedSendError> {
+        let (sender, text) = {
+            let inner = self.inner.lock().await;
+            match inner.by_app.get(app_id) {
+                None => return Err(PinnedSendError::NotConnected),
+                Some(&current) if current != conn_id => {
+                    return Err(PinnedSendError::Displaced { current })
+                }
+                Some(_) => {}
+            }
+            let entry = inner
+                .by_conn
+                .get(&conn_id)
+                .ok_or(PinnedSendError::NotConnected)?;
+            match entry.outbound.try_send(text) {
+                Ok(()) => return Ok(()),
+                Err(mpsc::error::TrySendError::Closed(_)) => return Err(PinnedSendError::Send),
+                Err(mpsc::error::TrySendError::Full(text)) => (entry.outbound.clone(), text),
+            }
+        };
+        sender.send(text).await.map_err(|_| PinnedSendError::Send)
     }
 
     /// Test helper: register a fake outbound channel so unit tests can
@@ -1041,6 +1097,70 @@ mod tests {
         let app_id = m.remove(c2).await;
         assert_eq!(app_id.as_deref(), Some("app"));
         assert_eq!(m.conn_for_app("app").await, None);
+    }
+
+    /// A pinned send reaches only the connection it names, and only while
+    /// that connection holds the app's routing slot: a replaced connection
+    /// and its replacement both receive nothing.
+    #[tokio::test]
+    async fn send_text_if_current_sends_nothing_to_a_mismatched_conn() {
+        let m = WsConnectionManager::new();
+        let (old, mut old_rx) = m.test_register("app").await;
+        let (new, mut new_rx) = m.test_register("app").await;
+
+        let err = m
+            .send_text_if_current("app", old, "stale".into())
+            .await
+            .unwrap_err();
+        assert_eq!(err, PinnedSendError::Displaced { current: new });
+        assert!(old_rx.try_recv().is_err(), "the replaced conn got a frame");
+        assert!(new_rx.try_recv().is_err(), "the replacement got a frame");
+
+        assert_eq!(
+            m.send_text_if_current("other", old, "x".into()).await,
+            Err(PinnedSendError::NotConnected)
+        );
+
+        m.send_text_if_current("app", new, "current".into())
+            .await
+            .expect("the current conn is sent to");
+        assert_eq!(new_rx.try_recv().unwrap(), "current");
+        assert!(old_rx.try_recv().is_err());
+    }
+
+    /// A full channel does not lose the frame: it is delivered to the pinned
+    /// connection once room frees up.
+    #[tokio::test]
+    async fn send_text_if_current_waits_on_a_full_channel() {
+        let m = WsConnectionManager::new();
+        let (conn, mut rx) = m.test_register("app").await;
+        for i in 0..16 {
+            m.send_text_if_current("app", conn, format!("{i}"))
+                .await
+                .unwrap();
+        }
+        let m2 = m.clone();
+        let pending =
+            tokio::spawn(async move { m2.send_text_if_current("app", conn, "last".into()).await });
+        // Yield BEFORE draining so the spawned send runs while the channel is
+        // full: on this single-threaded runtime the yields hand it the thread,
+        // and it then takes the `TrySendError::Full` arm. Draining first would
+        // let it take the `try_send` Ok path instead. The two assertions below
+        // show it has not completed or enqueued; they cannot by themselves
+        // prove it was polled.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !pending.is_finished(),
+            "the 17th send must wait on the full channel"
+        );
+        assert_eq!(rx.len(), 16, "the parked send must not have enqueued yet");
+        for i in 0..16 {
+            assert_eq!(rx.recv().await.unwrap(), format!("{i}"));
+        }
+        pending.await.unwrap().expect("sent once room freed");
+        assert_eq!(rx.recv().await.unwrap(), "last");
     }
 
     #[tokio::test]

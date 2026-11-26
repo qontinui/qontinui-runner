@@ -14,7 +14,11 @@ vi.mock("@tauri-apps/api/core", () => ({
   // Every backend read fails: reconcile is best-effort and adds nothing.
   invoke: vi.fn(() => Promise.reject(new Error("no backend in test"))),
 }));
-vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(() => Promise.resolve(() => {})) }));
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn(() => Promise.resolve(() => {})),
+  // The roster-saved broadcast after each save (`terminalPagesSync`).
+  emit: vi.fn(() => Promise.resolve()),
+}));
 
 import { instanceStorage } from "@/lib/instance-storage";
 import { setPageBindings } from "@/lib/pageBindings";
