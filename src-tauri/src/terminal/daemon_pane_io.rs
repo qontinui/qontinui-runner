@@ -755,6 +755,15 @@ pub fn holder_incompatible_notice(holder_pid: u32, holder_versions: &[u32]) -> V
     .into_bytes()
 }
 
+/// What `attach` knows of a pane's protection from its unit cgroup.
+enum Protection {
+    /// The spawner saw the route: unprotected or not.
+    Known(Option<Unprotected>),
+    /// An adopted holder: `attach` measures its cgroup against this process
+    /// before the pump starts.
+    MeasureAdopted,
+}
+
 /// In-band notice for a pane whose holder will NOT survive the runner's
 /// systemd unit stopping (`Unprotected::Cgroup`).
 pub fn unprotected_notice(why: &Unprotected) -> Vec<u8> {
@@ -1369,7 +1378,7 @@ impl DaemonPaneIo {
             pane_dir,
             pane_id,
             FRESH_SPAWN_FROM_OFFSET,
-            unprotected,
+            Protection::Known(unprotected),
             None,
         )
     }
@@ -1399,37 +1408,15 @@ impl DaemonPaneIo {
             Some((cols, rows)) => RestoreAt::Fitted(cols, rows),
             None => RestoreAt::PtySize,
         };
-        let mut io = Self::attach(pane_dir, pane_id, from_offset, None, Some(restore))?;
-        // This side did not see the spawn's route, so measure it: a holder
-        // still in the runner's own unit cgroup (a self-managed upgrade
-        // replaces the runner without stopping the unit) dies when the unit
-        // stops, exactly as a fresh plain spawn would.
-        match holder_shares_runner_unit_cgroup(io.holder_pid()) {
-            Some(true) => {
-                let why = Unprotected::Cgroup {
-                    fallback_reason: None,
-                };
-                // The same visible notice `attach` gives every other
-                // unprotected pane: in-band, and in the log.
-                warn!(
-                    pane = %pane_id,
-                    holder_pid = io.holder_pid(),
-                    "pty holder: {why} — this pane will NOT survive the runner's systemd unit stopping"
-                );
-                io.out.push_local(&unprotected_notice(&why));
-                io.unprotected = Some(why);
-            }
-            Some(false) => {}
-            None => {
-                warn!(
-                    pane = %pane_id,
-                    holder_pid = io.holder_pid(),
-                    "terminal: an adopted holder's cgroup could not be read; it is reported not upgrade-safe (unknown)"
-                );
-                io.cgroup_measured = false;
-            }
-        }
-        Ok(io)
+        // This side did not see the spawn's route, so `attach` measures it
+        // (before any replayed byte is delivered, so its notice comes first).
+        Self::attach(
+            pane_dir,
+            pane_id,
+            from_offset,
+            Protection::MeasureAdopted,
+            Some(restore),
+        )
     }
 
     /// `restore_at`: `Some` for a fresh consumer — ask for the restore
@@ -1439,7 +1426,7 @@ impl DaemonPaneIo {
         pane_dir: &Path,
         pane_id: &PaneId,
         from_offset: Option<u64>,
-        unprotected: Option<Unprotected>,
+        protection: Protection,
         restore_at: Option<RestoreAt>,
     ) -> Result<Self, AttachError> {
         let deadline = Instant::now() + ATTACH_DEADLINE;
@@ -1454,6 +1441,31 @@ impl DaemonPaneIo {
                 reason: format!("PTY holder {pane_id}: attach failed: {e}"),
             })?;
         let info = stream.info.clone();
+        let (unprotected, cgroup_measured) = match protection {
+            Protection::Known(u) => (u, true),
+            // A holder still in the runner's own unit cgroup (a self-managed
+            // upgrade replaces the runner without stopping the unit) dies when
+            // the unit stops, exactly as a fresh plain spawn would.
+            Protection::MeasureAdopted => {
+                match holder_shares_runner_unit_cgroup(stream.hello_ack.holder_pid) {
+                    Some(true) => (
+                        Some(Unprotected::Cgroup {
+                            fallback_reason: None,
+                        }),
+                        true,
+                    ),
+                    Some(false) => (None, true),
+                    None => {
+                        warn!(
+                            pane = %pane_id,
+                            holder_pid = stream.hello_ack.holder_pid,
+                            "terminal: an adopted holder's cgroup could not be read; it is reported not upgrade-safe (unknown)"
+                        );
+                        (None, false)
+                    }
+                }
+            }
+        };
         if restore_at.is_some() && info.restore.is_none() {
             // An older holder (protocol < 3): the tail is replayed bare, so a
             // mode it set before the tail is unknown to this consumer.
@@ -1559,7 +1571,7 @@ impl DaemonPaneIo {
             rows,
             paused,
             unprotected,
-            cgroup_measured: true,
+            cgroup_measured,
             restored: info.restore,
             kill_settle: KILL_SETTLE_MAX,
         })
@@ -3902,7 +3914,7 @@ sleep 30
                     &dir,
                     &id,
                     Some(second.stream_offset()),
-                    Some(why.clone()),
+                    Protection::Known(Some(why.clone())),
                     None,
                 )
                 .expect("reattach again"),
