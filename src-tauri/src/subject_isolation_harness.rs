@@ -92,9 +92,10 @@ fn driver() {
     {
         std::env::remove_var(key);
     }
-    // The keychain is machine-wide by service name; the harness run must not
-    // touch the CI node's either.
-    std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
+    // The keychain is machine-wide by service name; neither run may touch the
+    // CI node's. Both are this test binary re-executed, so the load-time
+    // test-process marker (`auth::deny_os_keychain_for_this_test_process`)
+    // already shuts every keychain gate in them.
 
     let root = match mode.as_str() {
         "harness" => None,

@@ -206,6 +206,13 @@ pub fn server_mode() -> bool {
 /// `true` — those stores never consulted `QONTINUI_DISABLE_KEYCHAIN` and still
 /// do not, so a primary's behaviour is unchanged.
 ///
+/// It is also `false` in a unit-test binary: the load-time marker
+/// [`crate::auth::os_keychain_denied_for_this_test_process`] (set by the
+/// `#[cfg(test)]` ctor in `lib.rs` and `main.rs`) closes every gated store, not
+/// only `AuthManager`, so no unit test reads or writes the developer's real
+/// keychain entries for these services. Plan
+/// `2026-10-05-runner-unit-tests-write-to-the-real-os-keychain`.
+///
 /// `auth.rs` keeps its own switch (`AuthManager::keychain_enabled`, reading
 /// `QONTINUI_DISABLE_KEYCHAIN`), which every binary's startup exports as `1`
 /// under a root ([`instance_root_defaults`]).
@@ -216,7 +223,8 @@ pub fn server_mode() -> bool {
 /// it. A gated read answers "no entry", a gated delete is a no-op, and a gated
 /// write fails with [`keychain_disabled_error`].
 pub fn os_keychain_allowed() -> bool {
-    os_keychain_allowed_from(instance_root().as_deref())
+    !crate::auth::os_keychain_denied_for_this_test_process()
+        && os_keychain_allowed_from(instance_root().as_deref())
 }
 
 /// Env-free core of [`os_keychain_allowed`].
@@ -228,8 +236,9 @@ pub fn os_keychain_allowed_from(instance_root: Option<&Path>) -> bool {
 /// silent success that would lose the secret.
 pub fn keychain_disabled_error() -> keyring::Error {
     keyring::Error::NoStorageAccess(
-        "the OS keychain is disabled for this runner: it runs under QONTINUI_INSTANCE_ROOT and \
-         must not share the machine keychain with the runner that launched it"
+        "the OS keychain is disabled for this process: either it runs under \
+         QONTINUI_INSTANCE_ROOT and must not share the machine keychain with the runner that \
+         launched it, or it is a runner unit-test binary"
             .into(),
     )
 }
@@ -1560,7 +1569,9 @@ mod tests {
         }
         // The rest of the process now reads the subject's own locations.
         assert_eq!(crate::ambient::qontinui_dir(), Some(root.join("home")));
-        assert!(!os_keychain_allowed());
+        // The root arm itself: `os_keychain_allowed()` is shut in any test
+        // binary by the test-process marker, so it would prove nothing here.
+        assert!(!os_keychain_allowed_from(instance_root().as_deref()));
         assert!(is_secondary());
         assert!(!shares_primary_settings());
     }
@@ -1650,6 +1661,9 @@ mod tests {
         assert_eq!(before, after);
         assert!(!is_secondary());
         assert!(!shares_primary_settings());
-        assert!(os_keychain_allowed());
+        // Without a root the gate opens for a primary; this test binary is
+        // marked as a test process, so the gate itself stays shut here.
+        assert!(os_keychain_allowed_from(instance_root().as_deref()));
+        assert!(!os_keychain_allowed());
     }
 }

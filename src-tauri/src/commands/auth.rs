@@ -2621,31 +2621,11 @@ mod device_token_door_tests {
         )
     }
 
-    /// Never the real OS keychain: `AuthManager::new()` keys it on the fixed
-    /// real `SERVICE_NAME`, and `store_tokens` writes that entry unless
-    /// `QONTINUI_DISABLE_KEYCHAIN` is set — so on a paired Windows box these
-    /// tests would overwrite the runner's own keychain backup, the documented
-    /// recovery when the `.enc` store will not decrypt. On Linux the keyring
-    /// call fails and is swallowed as `debug!`, which is why it stays invisible
-    /// until Windows. `isolated_ambient` now sets the key itself
-    /// (`ambient::test_support::KEYS_SET_TO_ONE`), so this `set_var` is
-    /// redundant belt-and-braces. Call this ONLY while a fixture is held: the
-    /// fixture holds `env_lock` and has captured the key for restore, and
-    /// outside one this write would leak to every later test.
-    ///
-    /// Every `AuthManager` in this module comes from here, so the ordering
-    /// (guard BEFORE the first `store_tokens`) is enforced rather than
-    /// remembered.
-    fn hermetic_auth_manager() -> AuthManager {
-        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
-        AuthManager::new()
-    }
-
     /// A runner paired for A (the default binding, in the legacy slot and — by
     /// the mirror — its own slot) and for B.
     fn two_slot_runner() -> (AuthManager, uuid::Uuid, uuid::Uuid) {
         let (a, b) = (tenant(0xA1), tenant(0xB2));
-        let am = hermetic_auth_manager();
+        let am = AuthManager::new();
         am.store_tokens(&jwt_for(a), "").unwrap();
         am.store_tenant_device_jwt(&b, &jwt_for(b)).unwrap();
         assert_eq!(am.try_list_tenant_device_jwt_tenants().unwrap().len(), 2);
@@ -2747,7 +2727,7 @@ mod device_token_door_tests {
     #[test]
     fn a_single_slot_runner_is_unchanged() {
         let _amb = crate::test_env::isolated_ambient();
-        let am = hermetic_auth_manager();
+        let am = AuthManager::new();
         assert_eq!(
             coord_device_token_for(&am, None, &held(&am, None), false),
             Ok(None)
@@ -2768,7 +2748,7 @@ mod device_token_door_tests {
     fn a_legacy_only_default_plus_one_slot_is_two_tenants_and_refuses() {
         let _amb = crate::test_env::isolated_ambient();
         let (a, b) = (tenant(0xA1), tenant(0xB2));
-        let am = hermetic_auth_manager();
+        let am = AuthManager::new();
         am.store_tokens(&jwt_for(a), "").unwrap();
         am.clear_tenant_device_jwt(&a).unwrap(); // the mirror's copy gone: legacy only
         am.store_tenant_device_jwt(&b, &jwt_for(b)).unwrap();
@@ -2797,7 +2777,7 @@ mod device_token_door_tests {
     fn a_named_tenant_never_gets_a_legacy_token_that_names_another_tenant() {
         let _amb = crate::test_env::isolated_ambient();
         let (a, b) = (tenant(0xA1), tenant(0xB2));
-        let am = hermetic_auth_manager();
+        let am = AuthManager::new();
         // The legacy slot holds B's token while the binding file says A.
         am.store_tokens(&jwt_for(b), "").unwrap();
         am.clear_tenant_device_jwt(&b).unwrap();
@@ -2881,7 +2861,7 @@ mod device_token_door_tests {
     fn a_claim_mismatch_on_an_unreadable_store_is_the_unreadable_error() {
         let _amb = crate::test_env::isolated_ambient();
         let (a, b) = (tenant(0xA1), tenant(0xB2));
-        let am = hermetic_auth_manager();
+        let am = AuthManager::new();
         am.store_tokens(&jwt_for(b), "").unwrap();
         am.clear_tenant_device_jwt(&b).unwrap();
         let held = crate::auth::HeldDeviceTenants {
@@ -2902,7 +2882,7 @@ mod device_token_door_tests {
     fn a_claimless_token_is_not_handed_out_beside_an_unreadable_slot_store() {
         let _amb = crate::test_env::isolated_ambient();
         let a = tenant(0xA1);
-        let am = hermetic_auth_manager();
+        let am = AuthManager::new();
         let exp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -3026,7 +3006,7 @@ mod device_token_door_tests {
         use crate::mcp::device_jwt_refresher::CoordCredentialPosture as P;
         let _amb = crate::test_env::isolated_ambient();
         let a = tenant(0xA1);
-        let am = hermetic_auth_manager();
+        let am = AuthManager::new();
         let exp = now() - 12 * 3_600;
         let dead = jwt_with_exp(a, exp);
         am.store_tokens(&dead, "").unwrap();
@@ -3053,7 +3033,7 @@ mod device_token_door_tests {
     fn the_websocket_door_refuses_the_same_slot() {
         let _amb = crate::test_env::isolated_ambient();
         let a = tenant(0xA1);
-        let am = hermetic_auth_manager();
+        let am = AuthManager::new();
         let dead = jwt_with_exp(a, now() - 12 * 3_600);
         am.store_tokens(&dead, "").unwrap();
         let err = websocket_token_from(&am, None, Some(a))
@@ -3075,7 +3055,7 @@ mod device_token_door_tests {
         use crate::mcp::device_jwt_refresher::CoordCredentialPosture as P;
         let _amb = crate::test_env::isolated_ambient();
         let (a, b) = (tenant(0xA1), tenant(0xB2));
-        let am = hermetic_auth_manager();
+        let am = AuthManager::new();
         // Slot store readable and empty: nothing to select.
         assert!(am.try_list_tenant_device_jwt_tenants().unwrap().is_empty());
         let held = held(&am, Some(a));
@@ -3110,7 +3090,7 @@ mod device_token_door_tests {
         use crate::mcp::device_jwt_refresher::CoordCredentialPosture as P;
         let _amb = crate::test_env::isolated_ambient();
         let (a, b) = (tenant(0xA1), tenant(0xB2));
-        let am = hermetic_auth_manager();
+        let am = AuthManager::new();
         let held = held(&am, Some(a));
         assert_eq!(
             coord_device_token_with_posture(&am, Some(a), &held, false, None),
@@ -3157,7 +3137,7 @@ mod device_token_door_tests {
         use crate::mcp::device_jwt_refresher::CoordCredentialPosture as P;
         let _amb = crate::test_env::isolated_ambient();
         let (a, b) = (tenant(0xA1), tenant(0xB2));
-        let am = hermetic_auth_manager();
+        let am = AuthManager::new();
         am.store_tokens(&jwt_for(a), "").unwrap();
         let exp_b = now() - 7_200;
         let dead_b = jwt_with_exp(b, exp_b);
@@ -3207,7 +3187,7 @@ mod device_token_door_tests {
         use crate::mcp::device_jwt_refresher::CoordCredentialPosture as P;
         let _amb = crate::test_env::isolated_ambient();
         let t = tenant(0xA1);
-        let am = hermetic_auth_manager();
+        let am = AuthManager::new();
         let exp = now() - 3_600;
         let dead = jwt_with_exp(t, exp);
         am.store_tokens(&dead, "").unwrap();
@@ -3233,7 +3213,7 @@ mod device_token_door_tests {
         use crate::mcp::device_jwt_refresher::CoordCredentialPosture as P;
         let _amb = crate::test_env::isolated_ambient();
         let (a, b) = (tenant(0xA1), tenant(0xB2));
-        let am = hermetic_auth_manager();
+        let am = AuthManager::new();
         let dead = jwt_with_exp(a, now() - 3_600);
         am.store_tokens(&dead, "").unwrap();
         let about_b = status(P::Unrefreshable, Some(b), None);
@@ -3258,7 +3238,7 @@ mod device_token_door_tests {
         use crate::mcp::device_jwt_refresher::CoordCredentialPosture as P;
         let _amb = crate::test_env::isolated_ambient();
         let a = tenant(0xA1);
-        let am = hermetic_auth_manager();
+        let am = AuthManager::new();
         // Even beside an alarming posture: the token, not the posture, decides
         // on the legacy arm.
         let posture = status(P::Expired, Some(a), None);

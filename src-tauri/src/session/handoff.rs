@@ -2362,7 +2362,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn close_source_posts_handoff_complete_with_the_source_tenant_slot() {
         let amb = crate::test_env::isolated_ambient();
-        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
         amb.write_machine_json("{\"device_id\":\"fixture-device\"}");
         let storage = std::path::PathBuf::from(
             std::env::var("QONTINUI_SECURE_STORAGE_DIR")
@@ -2779,7 +2778,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_catchup_resends_a_due_close_even_when_the_pending_list_get_fails() {
         let _amb = crate::test_env::isolated_ambient();
-        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
         let (base, seen) = spawn_scripted_fake_coord(vec![
             (500, r#"{"error":"boom"}"#),
             (200, r#"{"closed":true,"already_closed":false}"#),
@@ -2825,7 +2823,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_push_frame_revives_a_not_handoff_target_refusal_and_closes_the_source() {
         let _amb = crate::test_env::isolated_ambient();
-        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
         let (base, seen) = spawn_fake_coord(200, r#"{"closed":true,"already_closed":false}"#).await;
         let (registry, store, _dir) = inert_registry(&base);
         let sources = MaterializedSources::default();
@@ -2933,7 +2930,6 @@ mod tests {
     /// device JWT in its slot; returns the tenant and the JWT a close under
     /// `TenantScope::Owned(tenant)` must present as its bearer.
     fn pair_one_tenant_slot(amb: &crate::test_env::IsolatedAmbient) -> (Uuid, String) {
-        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
         amb.write_machine_json("{\"device_id\":\"fixture-device\"}");
         let storage = std::path::PathBuf::from(
             std::env::var("QONTINUI_SECURE_STORAGE_DIR")

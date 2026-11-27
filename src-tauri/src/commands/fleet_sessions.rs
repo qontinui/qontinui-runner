@@ -604,9 +604,6 @@ mod tests {
     #[test]
     fn the_real_admission_refuses_a_tenant_this_device_does_not_hold() {
         let _amb = crate::test_env::isolated_ambient();
-        // The fixture restores this on drop; it keeps the legacy-slot read off
-        // the operator's real OS keychain.
-        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
         let err = fleet_scope(Some(TENANT)).unwrap_err();
         assert!(err.starts_with("fleet_sessions:tenant_refused:"), "{err}");
         let err = fleet_scope(Some("zzz")).unwrap_err();
