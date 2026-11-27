@@ -947,8 +947,10 @@ mod tests {
 
     /// The demote event puts each locator part in its own named field and
     /// says which verdict named the assertion. Mutation: swapping the state
-    /// and assertion ids, hardcoding `"fail"`, or emitting a verdict for
-    /// `None` reds this.
+    /// and assertion ids, swapping any two of the app / proposal / page ids,
+    /// hardcoding `"fail"`, or emitting a verdict for `None` reds this. (A
+    /// swap at the sweep's call site, which passes those ids positionally and
+    /// has no test of its own, would not.)
     #[test]
     fn demoted_event_names_state_assertion_and_verdict() {
         use qontinui_types::spec_api_events::SpecApiEvent;
@@ -966,19 +968,29 @@ mod tests {
             7,
         ) {
             SpecApiEvent::FlywheelProposalDemoted {
+                app_id,
+                proposal_id,
+                page_id,
                 failing_state_id,
                 failing_assertion_id,
                 failing_assertion_verdict,
                 snapshot_id,
                 at_ms,
-                ..
-            } => (
-                failing_state_id,
-                failing_assertion_id,
-                failing_assertion_verdict,
-                snapshot_id,
-                at_ms,
-            ),
+            } => {
+                // The pass-through ids are pinned once here, so a swap of
+                // demoted_event's three leading String parameters reds it.
+                assert_eq!(
+                    (app_id.as_str(), proposal_id.as_str(), page_id.as_str()),
+                    ("app", "prop", "page")
+                );
+                (
+                    failing_state_id,
+                    failing_assertion_id,
+                    failing_assertion_verdict,
+                    snapshot_id,
+                    at_ms,
+                )
+            }
             other => panic!("expected FlywheelProposalDemoted, got {other:?}"),
         };
         let s = |v: &str| v.to_string();
