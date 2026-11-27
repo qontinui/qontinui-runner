@@ -356,6 +356,7 @@ pub fn parse_reporter_step(raw: Option<&str>) -> Option<String> {
 ///
 /// MUST stay sorted: membership is a `binary_search`.
 const READ_TOOLS: &[&str] = &[
+    "coord_agent_action_exceptions",
     "coord_agent_registry_effective",
     "coord_alert_queue",
     "coord_am_i_clear",
