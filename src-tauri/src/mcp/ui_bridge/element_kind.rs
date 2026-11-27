@@ -81,16 +81,18 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// The every-element verbs 0.46 serves on EVERY kind, media included
-    /// (`EVERY_ELEMENT` in `core/element-kind.ts` at ui-bridge `9f373a12`).
-    const EVERY_ELEMENT_0_46: &[&str] = &[
+    /// The every-element verbs `@qontinui/ui-bridge` 0.64 serves on EVERY kind,
+    /// media included (`EVERY_ELEMENT` in `core/element-kind.ts`). Since 0.64
+    /// `focus` is NOT among them: it is advertised only on a node that can take
+    /// focus (tabindex, editing host, delegating shadow host), so a bare media
+    /// row (video, canvas, svg, image) no longer carries it.
+    const EVERY_ELEMENT_0_64: &[&str] = &[
         "click",
         "hoverClick",
         "doubleClick",
         "rightClick",
         "middleClick",
         "sendKeys",
-        "focus",
         "blur",
         "hover",
         "unhover",
@@ -103,7 +105,7 @@ mod tests {
     fn media_and_content_rows_are_classified_by_category_not_actions() {
         for media_type in ["image", "video", "canvas", "svg", "picture"] {
             let row = json!({"id": "m", "type": media_type, "category": "media",
-                "actions": EVERY_ELEMENT_0_46});
+                "actions": EVERY_ELEMENT_0_64});
             assert!(is_content_or_media_row(&row), "{media_type}");
         }
         assert!(is_content_or_media_row(
