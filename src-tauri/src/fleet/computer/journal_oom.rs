@@ -241,6 +241,21 @@ pub(crate) async fn run_journalctl(
     args: &[String],
     timeout: Duration,
 ) -> Option<String> {
+    match run_journalctl_status(bin, args, timeout).await {
+        Some((Some(0), stdout)) => Some(stdout),
+        _ => None,
+    }
+}
+
+/// Fork `bin args` as [`run_journalctl`] does, but keep the exit code:
+/// `(code, stdout)`, or `None` when it could not run or timed out. The code
+/// is what tells `journalctl --grep`'s "no match" (1, nothing printed) from
+/// a read.
+pub(crate) async fn run_journalctl_status(
+    bin: &str,
+    args: &[String],
+    timeout: Duration,
+) -> Option<(Option<i32>, String)> {
     let mut cmd = crate::process_helpers::tokio_no_window(bin);
     cmd.args(args)
         .kill_on_drop(true)
@@ -248,9 +263,10 @@ pub(crate) async fn run_journalctl(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
     match tokio::time::timeout(timeout, cmd.output()).await {
-        Ok(Ok(out)) if out.status.success() => {
-            Some(String::from_utf8_lossy(&out.stdout).into_owned())
-        }
+        Ok(Ok(out)) => Some((
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )),
         _ => None,
     }
 }
@@ -272,10 +288,18 @@ impl Journalctl {
         }
     }
 
-    async fn run(&self, args: Vec<String>, timeout: Duration) -> Option<String> {
+    fn argv(&self, args: Vec<String>) -> Vec<String> {
         let mut all = self.leading.clone();
         all.extend(args);
-        run_journalctl(&self.program, &all, timeout).await
+        all
+    }
+
+    async fn run(&self, args: Vec<String>, timeout: Duration) -> Option<String> {
+        run_journalctl(&self.program, &self.argv(args), timeout).await
+    }
+
+    async fn run_status(&self, args: Vec<String>, timeout: Duration) -> Option<(Option<i32>, String)> {
+        run_journalctl_status(&self.program, &self.argv(args), timeout).await
     }
 }
 
@@ -295,8 +319,10 @@ pub(crate) async fn read_user(
 }
 
 /// Every journal read one tick asked for, concurrently, under ONE deadline:
-/// `(user, kernel)`, each `None` when not asked. A read the deadline cut is
-/// `Unreadable`, never a stalled tick.
+/// `(user, kernel)`, each `None` when not asked. Each arm is bounded by the
+/// time left to that deadline on its own, so a slow arm never discards one
+/// that already finished; an arm the deadline cut is `Unreadable`, never a
+/// stalled tick.
 pub(crate) async fn read_all(
     jc: &Journalctl,
     since: DateTime<Utc>,
@@ -305,27 +331,28 @@ pub(crate) async fn read_all(
     kernel: bool,
     deadline: Duration,
 ) -> (Option<JournalRead>, Option<KernelRead>) {
+    let end = tokio::time::Instant::now() + deadline;
     let user_read = async {
-        if user {
-            Some(read_user(jc, since, until, deadline).await)
-        } else {
-            None
+        if !user {
+            return None;
         }
+        Some(
+            tokio::time::timeout_at(end, read_user(jc, since, until, deadline))
+                .await
+                .unwrap_or(JournalRead::Unreadable),
+        )
     };
     let kernel_read = async {
-        if kernel {
-            Some(read_kernel(jc, since, until, deadline).await)
-        } else {
-            None
+        if !kernel {
+            return None;
         }
+        Some(
+            tokio::time::timeout_at(end, read_kernel(jc, since, until, deadline))
+                .await
+                .unwrap_or(KernelRead::Unreadable),
+        )
     };
-    match tokio::time::timeout(deadline, async { tokio::join!(user_read, kernel_read) }).await {
-        Ok(both) => both,
-        Err(_) => (
-            user.then_some(JournalRead::Unreadable),
-            kernel.then_some(KernelRead::Unreadable),
-        ),
-    }
+    tokio::join!(user_read, kernel_read)
 }
 
 // ---------------------------------------------------------------------------
@@ -336,8 +363,8 @@ pub(crate) async fn read_all(
 /// filter by pattern (`--grep`).
 const KERNEL_MAX_RECORDS: u32 = 200;
 
-/// Most recent kernel entries per window when it cannot (a build without
-/// PCRE2). An OOM report prints its task dump BEFORE its `oom-kill:` line,
+/// Most recent kernel entries per window when it cannot (a build whose
+/// `--version` does not list `+PCRE2`). An OOM report prints its task dump BEFORE its `oom-kill:` line,
 /// so the newest entries hold the newest records; older ones in a long
 /// window may fall outside this bound, and their kills stay the remainder.
 const KERNEL_MAX_ENTRIES: u32 = 5000;
@@ -471,25 +498,47 @@ pub(crate) fn kernel_read_from(probe: Option<&str>, window: Option<&str>) -> Ker
         .map_or(KernelRead::Unreadable, KernelRead::Read)
 }
 
-/// Phase 3's read of the kernel log over `[since, until)`: the probe and the
-/// pattern-filtered window concurrently; a journalctl that cannot filter
-/// (`--grep` refused) is asked again without the filter.
+/// Whether a `journalctl --version` output says it was built with PCRE2,
+/// i.e. supports `--grep`. Unknown (no output) is `false`: the plain read
+/// is slower, never wrong. PURE.
+pub(crate) fn grep_supported(version: Option<&str>) -> bool {
+    version.is_some_and(|v| v.split_whitespace().any(|f| f == "+PCRE2"))
+}
+
+/// The window stdout of a `--grep` read from its exit: 0 is the output; 1
+/// with nothing printed is journalctl's "no entry matched" (systemd 257) — an
+/// empty window, not a failure; anything else is no window. PURE.
+pub(crate) fn grep_window_from(run: Option<(Option<i32>, String)>) -> Option<String> {
+    match run? {
+        (Some(0), out) => Some(out),
+        (Some(1), out) if out.trim().is_empty() => Some(String::new()),
+        _ => None,
+    }
+}
+
+/// Phase 3's read of the kernel log over `[since, until)`. The version, the
+/// readability probe and the `--grep`-filtered window run concurrently; the
+/// unfiltered 5000-entry window is forked only where `--version` does not
+/// list `+PCRE2` (a no-match `--grep` exit is an empty window, never a reason
+/// to fall back).
 pub(crate) async fn read_kernel(
     jc: &Journalctl,
     since: DateTime<Utc>,
     until: DateTime<Utc>,
     timeout: Duration,
 ) -> KernelRead {
-    let (probe, grepped) = tokio::join!(
+    let (version, probe, grepped) = tokio::join!(
+        jc.run(vec!["--version".to_string()], timeout),
         jc.run(kernel_probe_args(), timeout),
-        jc.run(kernel_journal_args(since, until, true), timeout),
+        jc.run_status(kernel_journal_args(since, until, true), timeout),
     );
     if !readable(probe.as_deref()) {
         return KernelRead::Unreadable;
     }
-    let window = match grepped {
-        Some(w) => Some(w),
-        None => jc.run(kernel_journal_args(since, until, false), timeout).await,
+    let window = if grep_supported(version.as_deref()) {
+        grep_window_from(grepped)
+    } else {
+        jc.run(kernel_journal_args(since, until, false), timeout).await
     };
     kernel_read_from(probe.as_deref(), window.as_deref())
 }
@@ -743,13 +792,14 @@ mod tests {
         assert_eq!((u, k), (None, None));
     }
 
-    /// Review A8: a journalctl that refuses `--grep` (no PCRE2) is asked again
-    /// without it, and its records still parse.
+    /// Review A8: a journalctl built without PCRE2 (its `--version` lists
+    /// `-PCRE2`) is read without `--grep`, and its records still parse.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_journalctl_without_grep_falls_back_to_the_plain_window() {
         let d = tempfile::tempdir().unwrap();
         let body = r#"case "$*" in
+  --version) echo 'systemd 247 (247.3-7)'; echo '+PAM -PCRE2 +ZSTD' ;;
   *"-b -n 1"*) echo '{"__CURSOR":"s=1","__REALTIME_TIMESTAMP":"1","_BOOT_ID":"ab"}' ;;
   *--grep*) echo "Compiled without pattern matching support" >&2; exit 1 ;;
   *) echo '{"__REALTIME_TIMESTAMP":"1795738498277337","_BOOT_ID":"27cd98773ff347f083889880a31d5902","MESSAGE":"oom-kill:constraint=CONSTRAINT_MEMCG,task_memcg=/a.slice/b.scope,task=rustc,pid=9,uid=1000"}' ;;
@@ -766,5 +816,81 @@ esac
                 boot_id: "27cd98773ff347f083889880a31d5902".into(),
             }])
         );
+    }
+
+    /// Round-2 A3: on systemd 257 `journalctl --grep` exits 1 with nothing
+    /// printed when no entry matches. That is an empty window — a readable
+    /// kernel log with no record — not a missing PCRE2, so the 5000-entry
+    /// read is never forked.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_grep_with_no_match_is_an_empty_window_not_a_fallback() {
+        let d = tempfile::tempdir().unwrap();
+        let plain_marker = d.path().join("plain-read");
+        let body = format!(
+            r#"case "$*" in
+  --version) echo 'systemd 257 (257.13-1~deb13u1)'; echo '+PAM +PCRE2 +ZSTD' ;;
+  *"-b -n 1"*) echo '{{"__CURSOR":"s=1","__REALTIME_TIMESTAMP":"1","_BOOT_ID":"ab"}}' ;;
+  *--grep*) exit 1 ;;
+  *) touch '{}'; echo '{{"__REALTIME_TIMESTAMP":"1795738498277337","_BOOT_ID":"ab","MESSAGE":"oom-kill:constraint=CONSTRAINT_MEMCG,task_memcg=/a.slice/b.scope,task=rustc,pid=9,uid=1000"}}' ;;
+esac
+"#,
+            plain_marker.display()
+        );
+        let jc = fake_journalctl(d.path(), &body);
+        let k = read_kernel(&jc, t("2026-11-27T00:14:40Z"), t("2026-11-27T00:15:10Z"), READ_TIMEOUT).await;
+        assert_eq!(k, KernelRead::Read(vec![]));
+        assert!(!plain_marker.exists(), "no fallback read on a no-match exit");
+    }
+
+    #[test]
+    fn grep_exits_and_versions_read_as_journalctl_means_them() {
+        assert_eq!(grep_window_from(Some((Some(0), "x".into()))), Some("x".into()));
+        assert_eq!(grep_window_from(Some((Some(1), "\n".into()))), Some(String::new()));
+        assert_eq!(grep_window_from(Some((Some(1), "partial".into()))), None);
+        assert_eq!(grep_window_from(Some((Some(2), String::new()))), None);
+        assert_eq!(grep_window_from(Some((None, String::new()))), None, "killed by a signal");
+        assert_eq!(grep_window_from(None), None);
+        assert!(grep_supported(Some("systemd 257 (257.13)\n+PAM +AUDIT +PCRE2 +ZSTD\n")));
+        assert!(!grep_supported(Some("systemd 247\n+PAM -PCRE2\n")));
+        assert!(!grep_supported(None));
+    }
+
+    /// Round-2 A4: each arm is bounded on its own, so a user read that
+    /// finished survives a kernel read the deadline cut.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_fast_arm_survives_a_slow_one() {
+        let d = tempfile::tempdir().unwrap();
+        let body = r#"case "$1" in
+  --user)
+    case "$2" in
+      -n) echo '{"__CURSOR":"s=1","__REALTIME_TIMESTAMP":"1","_BOOT_ID":"ab"}' ;;
+      *) echo '{"__REALTIME_TIMESTAMP":"1795738498277337","_BOOT_ID":"ab","USER_UNIT":"x.scope"}' ;;
+    esac ;;
+  *) sleep 10 ;;
+esac
+"#;
+        let jc = fake_journalctl(d.path(), body);
+        let started = std::time::Instant::now();
+        let (u, k) = read_all(
+            &jc,
+            t("2026-11-27T00:14:40Z"),
+            t("2026-11-27T00:15:10Z"),
+            true,
+            true,
+            Duration::from_millis(1500),
+        )
+        .await;
+        assert!(started.elapsed() < Duration::from_secs(4), "{:?}", started.elapsed());
+        assert_eq!(
+            u,
+            Some(JournalRead::Read(vec![UnitOomEntry {
+                unit: "x.scope".into(),
+                realtime_usec: 1795738498277337,
+                boot_id: "ab".into(),
+            }]))
+        );
+        assert_eq!(k, Some(KernelRead::Unreadable));
     }
 }
