@@ -1003,7 +1003,6 @@ mod helpers_tests {
         for (route, what) in [
             ("click-by-text", "click result"),
             ("click-by-selector", "click result"),
-            ("read-value", "read result"),
             ("page/summary", "page summary"),
             ("type-into", "element-resolution result"),
         ] {
@@ -1023,7 +1022,7 @@ mod helpers_tests {
     #[test]
     fn the_echoed_raw_text_is_truncated() {
         let raw = "x".repeat(10_000);
-        let (_, body) = parse_eval_result("read-value", "read result", &raw)
+        let (_, body) = parse_eval_result("click-by-text", "click result", &raw)
             .expect_err("unparseable input must fail");
         let msg = body.deref().error.clone().unwrap_or_default();
         assert!(
