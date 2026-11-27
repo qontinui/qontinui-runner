@@ -1099,6 +1099,64 @@ mod tests {
         assert_eq!(result.summary.severity_counts.warning, 1);
     }
 
+    /// The two pass-only readers leave an `Unknown` out of the passes:
+    /// `evaluate_state`'s `passed` count (which feeds `match_rate`) and
+    /// `match_outcome_for` (which feeds `summary.match_outcome`, the value
+    /// the no-policy step path `decide_pass(None, FullMatch)` passes a step
+    /// on alone). One pass beside one unevaluated assertion is half a match,
+    /// not a whole one. Mutation: counting `Unknown` as a pass in
+    /// `evaluate_state` reds the `match_rate` assertion (1.0); doing so in
+    /// `match_outcome_for` reds the `PartialMatch` assertion (`FullMatch`).
+    #[test]
+    fn unknown_verdict_is_not_counted_as_a_pass() {
+        let s = snap(vec![elem("ok", "#ok", Some("button"), Some("Save"), true)]);
+        let passing = assertion("a1", "critical", json!({ "role": "button" }), true);
+        let unknown = assertion("a2", "critical", json!({ "role": 42 }), true);
+        let st = state("s1", "Loaded", Some(true), vec![passing, unknown]);
+        let spec = page_spec("page-1", vec![st]);
+
+        let result = evaluate(&s, &spec);
+        let assertions = &result.state_results[0].assertions;
+        assert!(
+            matches!(assertions[0].outcome, SpecAssertionVerdict::Pass { .. }),
+            "{:?}",
+            assertions[0].outcome
+        );
+        assert!(
+            matches!(assertions[1].outcome, SpecAssertionVerdict::Unknown { .. }),
+            "{:?}",
+            assertions[1].outcome
+        );
+        assert_eq!(result.state_results[0].match_rate, 0.5);
+        assert_eq!(result.summary.match_outcome, MatchOutcome::PartialMatch);
+    }
+
+    /// A spec whose every assertion is unevaluated matched nothing: the
+    /// outcome is `NoMatch`, never the `FullMatch` a step with no policy
+    /// passes on. Mutation: counting `Unknown` as a pass in
+    /// `match_outcome_for` reds the outcome assertion (`FullMatch`); doing so
+    /// in `evaluate_state` reds the `match_rate` assertion (1.0).
+    #[test]
+    fn all_unknown_verdicts_are_no_match() {
+        let s = snap(vec![elem("ok", "#ok", Some("button"), Some("Save"), true)]);
+        let a1 = assertion("a1", "critical", json!({ "role": 42 }), true);
+        let a2 = assertion("a2", "info", json!({ "text": ["Save"] }), true);
+        let st = state("s1", "Loaded", Some(true), vec![a1, a2]);
+        let spec = page_spec("page-1", vec![st]);
+
+        let result = evaluate(&s, &spec);
+        for a in &result.state_results[0].assertions {
+            assert!(
+                matches!(a.outcome, SpecAssertionVerdict::Unknown { .. }),
+                "{}: {:?}",
+                a.assertion_id,
+                a.outcome
+            );
+        }
+        assert_eq!(result.state_results[0].match_rate, 0.0);
+        assert_eq!(result.summary.match_outcome, MatchOutcome::NoMatch);
+    }
+
     #[test]
     fn severity_counts_warn_alias_for_warning() {
         let s = snap(vec![]);
