@@ -14,7 +14,7 @@ describe("readOnlyTaskType", () => {
   });
 
   it("leaves the types the form handles, and no task, to the form", () => {
-    for (const t of ["Workflow", "Prompt", "AutoFix", "RemoteAgent", "Script"]) {
+    for (const t of ["Workflow", "Prompt", "AutoFix", "RemoteAgent", "Command", "Script"]) {
       expect(readOnlyTaskType({ task_type: t })).toBeUndefined();
     }
     expect(readOnlyTaskType(undefined)).toBeUndefined();

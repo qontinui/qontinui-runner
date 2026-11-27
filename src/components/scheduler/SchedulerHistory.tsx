@@ -184,7 +184,7 @@ export function SchedulerHistory({
                       )}
                     </div>
                     {record.errorMessage && (
-                      <div className="mt-2 text-sm text-destructive">
+                      <div className="mt-2 text-sm text-destructive whitespace-pre-wrap break-words">
                         Error: {record.errorMessage}
                       </div>
                     )}

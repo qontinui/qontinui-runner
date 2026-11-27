@@ -251,6 +251,22 @@ pub struct SchedulerService {
     /// `2026-11-13-devops-scheduled-remote-agent-relaunches-into-an-exhausted-account`).
     /// The production probe, picker and spawn; a fake in tests.
     limit_recovery: Arc<dyn crate::scheduler_limit_relaunch::LimitRecovery>,
+    /// The security policy a `Command` task's command line is judged against
+    /// immediately before every spawn (plan
+    /// `2026-09-13-move-fleet-scheduling-into-qontinui` D2: the fire-time,
+    /// ENFORCING check). Production resolves the shell-command door's policy
+    /// fresh on each call, so a policy tightened after a task was registered
+    /// reaches it; a test injects a fixed one.
+    command_policy: CommandPolicySource,
+}
+
+/// Where [`SchedulerService`] reads the fire-time `Command` policy from.
+type CommandPolicySource = Arc<dyn Fn() -> crate::security::SecurityPolicy + Send + Sync>;
+
+/// The production [`CommandPolicySource`]: the shell-command door's policy,
+/// resolved from the live security settings at the moment of the call.
+fn production_command_policy() -> CommandPolicySource {
+    Arc::new(|| crate::scheduler_command::current_policy().0)
 }
 
 /// What one settled slot did — every history row it wrote, in order, and the
@@ -278,6 +294,7 @@ impl SchedulerService {
             probe_gate: crate::scheduler_probe::ProbeGate::new(),
             pass_lock: tokio::sync::Mutex::new(()),
             limit_recovery: Arc::new(crate::scheduler_limit_relaunch::ProductionLimitRecovery),
+            command_policy: production_command_policy(),
         }
     }
 
@@ -292,6 +309,7 @@ impl SchedulerService {
             probe_gate: crate::scheduler_probe::ProbeGate::new(),
             pass_lock: tokio::sync::Mutex::new(()),
             limit_recovery: Arc::new(crate::scheduler_limit_relaunch::ProductionLimitRecovery),
+            command_policy: production_command_policy(),
         }
     }
 
@@ -891,6 +909,23 @@ impl SchedulerService {
                     .await;
                 return;
             }
+            ScheduledTaskType::Command { .. } => {
+                // Plan `2026-09-13-move-fleet-scheduling-into-qontinui` Phase 2:
+                // exec the argv in-binary on THIS async arm, so a long command
+                // never stalls the tick's serial walk of due tasks.
+                let spec = crate::scheduler_command::CommandSpec::from_task(&task_name, &task.task)
+                    .expect("a Command task yields a CommandSpec");
+                self.clone()
+                    .launch_and_await_command(
+                        task_id,
+                        task_name,
+                        auto_fix_on_failure,
+                        catch_up,
+                        spec,
+                    )
+                    .await;
+                return;
+            }
             _ => {}
         }
 
@@ -930,7 +965,8 @@ impl SchedulerService {
             ScheduledTaskType::Prompt { .. }
             | ScheduledTaskType::AutoFix { .. }
             | ScheduledTaskType::RemoteAgent { .. }
-            | ScheduledTaskType::Script { .. } => unreachable!(
+            | ScheduledTaskType::Script { .. }
+            | ScheduledTaskType::Command { .. } => unreachable!(
                 "Async task types must be handled by the launch_and_poll dispatch above"
             ),
         };
@@ -1379,7 +1415,43 @@ impl SchedulerService {
         .await;
     }
 
-    /// Shared tail of the in-binary child launchers (`RemoteAgent`, `Script`):
+    /// Launch a `Command` task in-binary (plan
+    /// `2026-09-13-move-fleet-scheduling-into-qontinui` Phase 2) and settle
+    /// its row from the program's exit — or, for `detach`, as launched.
+    ///
+    /// The fire-time policy check is inside [`crate::scheduler_command::launch`],
+    /// against [`Self::command_policy`] read NOW: a denial spawns nothing and
+    /// is a launch failure whose `error_message` reads `policy denied: …`.
+    /// Returns the settle task's handle (the scheduler drops it; tests await
+    /// it), `None` when nothing was launched.
+    async fn launch_and_await_command(
+        self: Arc<Self>,
+        task_id: String,
+        task_name: String,
+        auto_fix_on_failure: bool,
+        catch_up: Option<CatchUpContext>,
+        spec: crate::scheduler_command::CommandSpec,
+    ) -> Option<tokio::task::JoinHandle<Settlement>> {
+        let mut record = <TaskExecutionRecord as TaskExecutionRecordExt>::new();
+        if let Some(ref ctx) = catch_up {
+            ctx.apply(&mut record);
+        }
+        let policy = (self.command_policy)();
+        let launched = crate::scheduler_command::launch(spec, &policy).await;
+        self.settle_launched_child(
+            "Command",
+            task_id,
+            task_name,
+            auto_fix_on_failure,
+            record,
+            launched,
+            None,
+        )
+        .await
+    }
+
+    /// Shared tail of the in-binary child launchers (`RemoteAgent`, `Script`,
+    /// `Command`):
     /// record the `Running` row the moment the child exists, clear the
     /// launch-failure streak, and settle the row from the child's outcome via
     /// [`Self::settle_attempts`]. A launch `Err` is a LaunchFailed.
@@ -3330,8 +3402,11 @@ fn task_spawns_ai_session(task: &ScheduledTaskType) -> bool {
         | ScheduledTaskType::AutoFix { .. }
         | ScheduledTaskType::RemoteAgent { .. }
         | ScheduledTaskType::Watcher { .. } => true,
-        // A Script runs a shell command in-binary; it spawns no AI session.
-        ScheduledTaskType::BackgroundCapture { .. } | ScheduledTaskType::Script { .. } => false,
+        // A Script runs a shell command in-binary and a Command execs an argv
+        // in-binary; neither spawns an AI session.
+        ScheduledTaskType::BackgroundCapture { .. }
+        | ScheduledTaskType::Script { .. }
+        | ScheduledTaskType::Command { .. } => false,
     }
 }
 
@@ -3679,6 +3754,14 @@ mod tests {
                 working_directory: None,
                 timeout_seconds: None,
             },
+            ScheduledTaskType::Command {
+                program: "terraform".into(),
+                args: vec!["plan".into()],
+                working_directory: None,
+                timeout_seconds: None,
+                output: qontinui_types::scheduler::CommandOutput::Discard,
+                detach: false,
+            },
             ScheduledTaskType::BackgroundCapture {
                 monitor_index: None,
                 capture_interval_secs: 60,
@@ -3694,7 +3777,7 @@ mod tests {
             &crate::coord_drain_state::DrainGate::Allow,
             task_spawns_ai_session,
         );
-        assert_eq!((runnable.len(), held.len()), (7, 0));
+        assert_eq!((runnable.len(), held.len()), (8, 0));
         let (runnable, held) = partition_for_drain(
             items,
             &crate::coord_drain_state::DrainGate::Defer {
@@ -3703,7 +3786,7 @@ mod tests {
             },
             task_spawns_ai_session,
         );
-        assert_eq!((runnable.len(), held.len()), (3, 4));
+        assert_eq!((runnable.len(), held.len()), (4, 4));
         assert!(!runnable.iter().any(task_spawns_ai_session));
     }
 
@@ -5453,5 +5536,260 @@ mod tests {
             let fin = fin.split_once("\n    }\n").expect("finalize body").0;
             assert!(fin.contains("self.write_next_run_after_limit(task_id, decision).await;"));
         }
+    }
+}
+
+/// `Command` tasks through the scheduler service (plan
+/// `2026-09-13-move-fleet-scheduling-into-qontinui` Phase 2): the async arm,
+/// overlap, catch-up and the fire-time policy. No database: the service's
+/// row writes are no-ops without one, and the settle handle or
+/// `running_tasks` is what each test reads.
+#[cfg(all(test, unix))]
+mod command_task_tests {
+    use super::*;
+    use crate::scheduler::{CatchUpPolicy, ScheduleExpression, ScheduledTaskStatus};
+    use qontinui_types::scheduler::CommandOutput;
+    use std::time::Duration;
+
+    fn service_with_policy(policy: crate::security::SecurityPolicy) -> Arc<SchedulerService> {
+        let mut svc = SchedulerService::new(None);
+        svc.command_policy = Arc::new(move || policy.clone());
+        Arc::new(svc)
+    }
+
+    fn command_task(name: &str, program: &str, args: &[&str]) -> ScheduledTask {
+        ScheduledTask::new(
+            name.to_string(),
+            None,
+            ScheduleExpression::Interval(21600),
+            ScheduledTaskType::Command {
+                program: program.into(),
+                args: args.iter().map(|a| a.to_string()).collect(),
+                working_directory: Some(std::env::temp_dir().to_string_lossy().to_string()),
+                timeout_seconds: Some(60),
+                output: CommandOutput::default(),
+                detach: false,
+            },
+        )
+    }
+
+    /// A task whose child appends one line to `counter` per run, then sleeps.
+    fn counting_task(name: &str, counter: &std::path::Path, sleep_secs: u32) -> ScheduledTask {
+        let script = format!("echo run >> '{}'; sleep {sleep_secs}", counter.display());
+        command_task(name, "sh", &["-c", &script])
+    }
+
+    fn runs(counter: &std::path::Path) -> usize {
+        std::fs::read_to_string(counter)
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+    }
+
+    async fn wait_until(mut done: impl FnMut() -> bool, within: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + within;
+        while tokio::time::Instant::now() < deadline {
+            if done() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        done()
+    }
+
+    /// `execute_task` hands a Command to the async arm and returns while the
+    /// child still runs: a long command does not delay a second due task —
+    /// the second one starts and FINISHES while the first is still running.
+    #[tokio::test]
+    async fn a_long_command_does_not_delay_a_second_due_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = service_with_policy(crate::security::SecurityPolicy::permissive());
+        let long = counting_task("long", &dir.path().join("long"), 20);
+        let short = counting_task("short", &dir.path().join("short"), 0);
+
+        let t0 = std::time::Instant::now();
+        svc.clone().execute_task(long.clone()).await;
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "execute_task waited on the command ({:?}) — it is on the sync path",
+            t0.elapsed()
+        );
+        assert!(svc.is_task_running(&long.id).await);
+
+        svc.clone().execute_task(short.clone()).await;
+        let short_done = wait_until(
+            || runs(&dir.path().join("short")) == 1,
+            Duration::from_secs(10),
+        )
+        .await;
+        assert!(short_done, "the second task never ran");
+        let mut cleared = false;
+        for _ in 0..200 {
+            if !svc.is_task_running(&short.id).await {
+                cleared = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(cleared, "the short task never settled");
+        assert!(
+            svc.is_task_running(&long.id).await,
+            "the long task must still be running while the short one settled"
+        );
+        assert!(t0.elapsed() < Duration::from_secs(15));
+    }
+
+    /// Overlap: a second start of a task still in `running_tasks` (what the
+    /// tick's skip and `execute_task`'s atomic mark both read) spawns nothing.
+    #[tokio::test]
+    async fn a_running_command_is_not_started_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let counter = dir.path().join("runs");
+        let svc = service_with_policy(crate::security::SecurityPolicy::permissive());
+        // Long enough that it is certainly still running when the second
+        // starts arrive; the runtime's shutdown drops its tree guard.
+        let task = counting_task("overlap", &counter, 30);
+        svc.clone().execute_task(task.clone()).await;
+        assert!(wait_until(|| runs(&counter) == 1, Duration::from_secs(10)).await);
+        svc.clone().execute_task(task.clone()).await;
+        svc.clone().execute_task(task.clone()).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(runs(&counter), 1, "an overlapping run was spawned");
+        assert!(svc.is_task_running(&task.id).await);
+    }
+
+    /// Catch-up under `run_once`: three missed 6-hourly slots collapse to ONE
+    /// late run, stamped as a catch-up for the latest slot.
+    #[tokio::test]
+    async fn catch_up_run_once_fires_one_command_run_stamped_for_the_latest_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let counter = dir.path().join("runs");
+        let svc = service_with_policy(crate::security::SecurityPolicy::permissive());
+        let mut task = counting_task("catch-up", &counter, 0);
+        task.catch_up_policy = CatchUpPolicy::RunOnce;
+        let now = Utc::now();
+        let missed: Vec<DateTime<Utc>> = (1..=3)
+            .rev()
+            .map(|h| now - chrono::Duration::hours(6 * h))
+            .collect();
+        let actions = plan_catch_up_actions(&missed, task.catch_up_policy);
+        assert_eq!(actions.len(), 1);
+
+        let mut settled = Vec::new();
+        for action in actions {
+            let CatchUpAction::Enqueue { scheduled_for } = action else {
+                panic!("run_once enqueues");
+            };
+            let spec =
+                crate::scheduler_command::CommandSpec::from_task(&task.name, &task.task).unwrap();
+            assert!(svc.try_mark_running(&task.id).await);
+            let handle = svc
+                .clone()
+                .launch_and_await_command(
+                    task.id.clone(),
+                    task.name.clone(),
+                    false,
+                    Some(CatchUpContext { scheduled_for }),
+                    spec,
+                )
+                .await
+                .expect("launched");
+            settled.push(handle.await.unwrap());
+        }
+        assert_eq!(runs(&counter), 1, "exactly one late run");
+        let row = &settled[0].rows[0];
+        assert!(row.catch_up_run, "{row:?}");
+        assert_eq!(
+            row.scheduled_for.as_deref(),
+            Some(missed.last().unwrap().to_rfc3339().as_str())
+        );
+        assert!(row.success, "{row:?}");
+        assert!(matches!(row.status, ScheduledTaskStatus::Completed));
+        assert!(!svc.is_task_running(&task.id).await);
+    }
+
+    /// The service judges a Command against the policy as it stands at FIRE
+    /// time: tightened after registration, the task spawns nothing and its
+    /// slot is released.
+    #[tokio::test]
+    async fn a_policy_tightened_after_registration_denies_at_fire_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran");
+        let task = command_task("denied", "touch", &[&marker.display().to_string()]);
+        // Registered under the permissive default (create-time passes) …
+        assert!(crate::scheduler_command::validate_command_task(
+            &task.task,
+            &crate::security::SecurityPolicy::permissive(),
+            "permissive",
+        )
+        .is_ok());
+        // … then the policy is tightened before it fires.
+        let mut strict = crate::security::SecurityPolicy::permissive();
+        strict.actions.blocked_commands = vec![r"^touch\b".to_string()];
+        let svc = service_with_policy(strict);
+        assert!(svc.try_mark_running(&task.id).await);
+        let spec =
+            crate::scheduler_command::CommandSpec::from_task(&task.name, &task.task).unwrap();
+        let handle = svc
+            .clone()
+            .launch_and_await_command(task.id.clone(), task.name.clone(), false, None, spec)
+            .await;
+        assert!(
+            handle.is_none(),
+            "a denied command is a launch failure, not a run"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!marker.exists(), "the child was spawned despite the denial");
+        assert!(
+            !svc.is_task_running(&task.id).await,
+            "the slot was not released"
+        );
+    }
+
+    /// A detached Command is settled as launched and leaves `running_tasks`
+    /// at once, though its child runs on.
+    #[tokio::test]
+    async fn a_detached_command_is_not_kept_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        let svc = service_with_policy(crate::security::SecurityPolicy::permissive());
+        let mut task = command_task(
+            "detached",
+            "sh",
+            &[
+                "-c",
+                &format!(
+                    "echo $$ > '{p}.tmp' && mv '{p}.tmp' '{p}'; exec sleep 60",
+                    p = pidfile.display()
+                ),
+            ],
+        );
+        if let ScheduledTaskType::Command { detach, .. } = &mut task.task {
+            *detach = true;
+        }
+        assert!(svc.try_mark_running(&task.id).await);
+        let spec =
+            crate::scheduler_command::CommandSpec::from_task(&task.name, &task.task).unwrap();
+        let settled = svc
+            .clone()
+            .launch_and_await_command(task.id.clone(), task.name.clone(), false, None, spec)
+            .await
+            .expect("launched")
+            .await
+            .unwrap();
+        assert!(settled.rows[0].success, "{:?}", settled.rows[0]);
+        assert!(!svc.is_task_running(&task.id).await);
+        assert!(wait_until(|| pidfile.exists(), Duration::from_secs(10)).await);
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: signal 0 checks existence; SIGKILL cleans up this test's child.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        assert!(
+            alive,
+            "the detached child is still running after settlement"
+        );
     }
 }

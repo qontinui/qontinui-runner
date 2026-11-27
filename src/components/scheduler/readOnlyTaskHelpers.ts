@@ -1,8 +1,16 @@
 /**
- * The `task_type`s the scheduler form has an editor for. `Script` is not one:
- * the form shows it read-only through its own arm.
+ * The `task_type`s the scheduler form handles through an arm of its own.
+ * `Command` has an editor; `Script` has none: the form shows it read-only
+ * through its own arm.
  */
-const FORM_HANDLED_TASK_TYPES = new Set(["Workflow", "Prompt", "AutoFix", "RemoteAgent", "Script"]);
+const FORM_HANDLED_TASK_TYPES = new Set([
+  "Workflow",
+  "Prompt",
+  "AutoFix",
+  "RemoteAgent",
+  "Command",
+  "Script",
+]);
 
 /**
  * The `task_type` of a stored task the scheduler form has no editor for
