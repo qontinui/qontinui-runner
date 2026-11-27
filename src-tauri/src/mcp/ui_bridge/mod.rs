@@ -52,6 +52,7 @@ pub mod screenshots;
 mod sdk_contract_pins;
 pub mod sdk_spec_sync;
 pub mod state_machine;
+pub mod structured_assert;
 pub mod stubs;
 pub mod tauri_audit;
 pub mod terminals;
@@ -102,8 +103,8 @@ pub use capabilities::{
     ui_bridge_get_keyboard_shortcuts_handler, ui_bridge_get_render_log_handler,
     ui_bridge_get_workflow_status_handler, ui_bridge_get_workflows_handler,
     ui_bridge_ipc_response_handler, ui_bridge_pong_handler, ui_bridge_routes_manifest_handler,
-    ui_bridge_run_workflow_handler, ui_bridge_structured_assert_handler, AssertResult,
-    BatchOperation, BatchOperationResult, BatchRequest, BatchResponse, StructuredAssertRequest,
+    ui_bridge_run_workflow_handler, BatchOperation, BatchOperationResult, BatchRequest,
+    BatchResponse,
 };
 pub use circuit_breaker::{CircuitBreakerState, UiBridgeCircuitBreaker};
 pub use design::{
@@ -183,6 +184,9 @@ pub use screenshots::{
     ui_bridge_annotations_export_handler, ui_bridge_annotations_get_handler,
     ui_bridge_annotations_list_handler, ui_bridge_annotations_update_handler,
     ui_bridge_page_health_handler, PageHealthRequest,
+};
+pub use structured_assert::{
+    ui_bridge_structured_assert_handler, AssertResult, StructuredAssertRequest,
 };
 pub use types::{
     classify_assertion_failure, classify_transport_error, next_action_for, ClipboardWriteRequest,

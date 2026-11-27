@@ -16,6 +16,8 @@ import {
 } from "lucide-react";
 import { MultiLoopPanel } from "./MultiLoopPanel";
 import { runnerBaseForPort } from "@/lib/runner-api";
+import { ASSERTION_BADGE_CLASSES, assertionBadge } from "./assertionBadge";
+import diagnoseAssertionsExample from "./diagnose-assertions-example.json";
 
 // --- Types matching the Rust backend ---
 
@@ -1116,9 +1118,7 @@ export function OrchestrationLoopPanel() {
                           <textarea
                             value={diagnoseAssertions}
                             onChange={(e) => setDiagnoseAssertions(e.target.value)}
-                            placeholder={
-                              '[\n  { "query": "Transitions", "queryType": "text", "assertion": "isVisible" },\n  { "query": "[role=row]", "assertion": "count", "expected": 3 }\n]'
-                            }
+                            placeholder={JSON.stringify(diagnoseAssertionsExample, null, 2)}
                             rows={6}
                             className={cn(textareaCls, "font-mono text-[0.7rem]")}
                           />
@@ -1297,22 +1297,18 @@ export function OrchestrationLoopPanel() {
                                       </span>
                                       <div className="mt-0.5 flex flex-wrap gap-1">
                                         {diag.assertion_results.map((a, i) => {
-                                          const passed = (a as Record<string, unknown>).passed;
+                                          const badge = assertionBadge(a, i);
                                           return (
                                             <span
                                               key={i}
                                               className={cn(
                                                 "px-1.5 py-0.5 rounded text-[0.65rem] font-mono",
-                                                passed
-                                                  ? "bg-green-500/10 text-green-400"
-                                                  : "bg-red-500/10 text-red-400",
+                                                ASSERTION_BADGE_CLASSES[badge.tone],
                                               )}
-                                              title={JSON.stringify(a, null, 2)}
+                                              title={badge.title}
                                             >
-                                              {((a as Record<string, unknown>).type as
-                                                | string
-                                                | undefined) ?? `#${i + 1}`}
-                                              {passed ? " ✓" : " ✗"}
+                                              {badge.label}
+                                              {badge.mark}
                                             </span>
                                           );
                                         })}

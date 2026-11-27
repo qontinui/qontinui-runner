@@ -8,6 +8,9 @@
  */
 
 import type { Tutorial } from "../../../types/tutorial";
+// The same example the panel's placeholder renders; a Rust test
+// (`the_panels_example_is_accepted_by_the_route`) pins that the route accepts it.
+import diagnoseAssertionsExample from "../../orchestration-loop/diagnose-assertions-example.json";
 
 export const diagnosticModelOverrideTutorial: Tutorial = {
   id: "diagnostic-model-override",
@@ -103,14 +106,10 @@ The assertions are the "spec" for your expected page state. The AI triage only r
       details: `**Assertion format:**
 Each assertion is one request body for the target runner's \`POST /ui-bridge/control/assert\`:
 \`\`\`json
-[
-  { "query": "Transitions", "queryType": "text", "assertion": "isVisible" },
-  { "query": "[role=row]", "assertion": "count", "expected": 3 },
-  { "query": ".status", "assertion": "hasText", "expected": "Ready" }
-]
+${JSON.stringify(diagnoseAssertionsExample, null, 2)}
 \`\`\`
 
-The runner posts each one on its own and evaluates it against the live DOM. An assertion the endpoint refuses (a missing \`query\` or \`assertion\`, an unknown \`assertion\` or \`queryType\`; extra fields are ignored) comes back as a failed result carrying an \`error\` that names the refusal.`,
+The runner posts each one on its own and evaluates it against the live DOM. A config whose assertions the endpoint would refuse (a missing \`query\` or \`assertion\`, an unknown \`assertion\` or \`queryType\`, an unknown field, a parameter the assertion needs or does not take) is refused when the loop starts, naming the element and the field. An assertion that still produces no verdict at diagnose time (the target runner refused it or could not evaluate it) is recorded as \`evaluated: false\` with the \`status\`, \`code\` and \`error\` the endpoint answered — shown as a neutral "no verdict" badge, never as a failed check.`,
     },
 
     // =========================================================================

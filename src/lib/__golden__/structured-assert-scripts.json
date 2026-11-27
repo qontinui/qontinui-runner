@@ -1,0 +1,133 @@
+{
+  "_comment": "Hand-written golden for POST /ui-bridge/control/assert (plan 2026-11-12-structured-assert-arms-never-pass-and-diagnose-assertions-never-reach-the-route, D2). Read by Rust (src-tauri/src/mcp/ui_bridge/structured_assert.rs: every case builds exactly its script) and by vitest (src/hooks/ui-bridge-events/structuredAssertScripts.dom.test.ts: every script yields passed=true on passHtml and passed=false on failHtml through the page's real evaluate gate and compiler). hand-written: never regenerate from the builder.",
+  "cases": [
+    {
+      "name": "exists-css",
+      "request": {
+        "query": "p",
+        "queryType": "css",
+        "assertion": "exists"
+      },
+      "script": "(() => { return JSON.stringify({ found: (document.querySelectorAll(\"p\")).length, passed: (document.querySelectorAll(\"p\")).length > 0 }) })()",
+      "passHtml": "<p>hello</p>",
+      "failHtml": "<div>hello</div>"
+    },
+    {
+      "name": "notExists-css",
+      "request": {
+        "query": "p",
+        "queryType": "css",
+        "assertion": "notExists"
+      },
+      "script": "(() => { return JSON.stringify({ found: (document.querySelectorAll(\"p\")).length, passed: (document.querySelectorAll(\"p\")).length === 0 }) })()",
+      "passHtml": "<div>hello</div>",
+      "failHtml": "<p>hello</p>"
+    },
+    {
+      "name": "count-css",
+      "request": {
+        "query": "li",
+        "queryType": "css",
+        "assertion": "count",
+        "expected": 2
+      },
+      "script": "(() => { return JSON.stringify({ found: (document.querySelectorAll(\"li\")).length, passed: (document.querySelectorAll(\"li\")).length === 2, expected: 2 }) })()",
+      "passHtml": "<ul><li>a</li><li>b</li></ul>",
+      "failHtml": "<ul><li>a</li></ul>"
+    },
+    {
+      "name": "isVisible-css",
+      "request": {
+        "query": "p",
+        "queryType": "css",
+        "assertion": "isVisible"
+      },
+      "script": "(() => { var els = document.querySelectorAll(\"p\"); var visible = Array.from(els).filter(function(el) { var r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0 && getComputedStyle(el).display !== 'none'; }); return JSON.stringify({ found: els.length, visible: visible.length, passed: visible.length > 0 }) })()",
+      "passHtml": "<p>hello</p>",
+      "failHtml": "<p data-test-visible=\"false\">hello</p>"
+    },
+    {
+      "name": "hasText-css",
+      "request": {
+        "query": "p",
+        "queryType": "css",
+        "assertion": "hasText",
+        "expected": "hello"
+      },
+      "script": "(() => { var els = document.querySelectorAll(\"p\"); var texts = Array.from(els).map(el => el.textContent.trim()); var found = texts.some(t => t.includes(\"hello\")); return JSON.stringify({ found: els.length, texts: texts.slice(0, 3), passed: found }) })()",
+      "passHtml": "<p>hello world</p>",
+      "failHtml": "<p>goodbye</p>"
+    },
+    {
+      "name": "hasClass-css",
+      "request": {
+        "query": "p",
+        "queryType": "css",
+        "assertion": "hasClass",
+        "expected": "active"
+      },
+      "script": "(() => { var els = document.querySelectorAll(\"p\"); var found = Array.from(els).some(el => el.classList.contains(\"active\")); var classes = Array.from(els).slice(0, 3).map(el => Array.from(el.classList).join(' ')); return JSON.stringify({ found: els.length, classes: classes, passed: found }) })()",
+      "passHtml": "<p class=\"active\">x</p>",
+      "failHtml": "<p class=\"idle\">x</p>"
+    },
+    {
+      "name": "hasAttribute-present-css",
+      "request": {
+        "query": "p",
+        "queryType": "css",
+        "assertion": "hasAttribute",
+        "attribute": "title"
+      },
+      "script": "(() => { var els = document.querySelectorAll(\"p\"); var found = Array.from(els).some(el => el.hasAttribute(\"title\")); return JSON.stringify({ found: els.length, passed: found }) })()",
+      "passHtml": "<p title=\"Tip\">x</p>",
+      "failHtml": "<p>x</p>"
+    },
+    {
+      "name": "hasAttribute-equals-css",
+      "request": {
+        "query": "p",
+        "queryType": "css",
+        "assertion": "hasAttribute",
+        "attribute": "title",
+        "expected": "Tip"
+      },
+      "script": "(() => { var els = document.querySelectorAll(\"p\"); var found = Array.from(els).some(el => el.getAttribute(\"title\") === \"Tip\"); return JSON.stringify({ found: els.length, passed: found }) })()",
+      "passHtml": "<p title=\"Tip\">x</p>",
+      "failHtml": "<p title=\"Other\">x</p>"
+    },
+    {
+      "name": "exists-text",
+      "request": {
+        "query": "hello",
+        "queryType": "text",
+        "assertion": "exists"
+      },
+      "script": "(() => { return JSON.stringify({ found: (Array.from(document.querySelectorAll('*')).filter(el => el.childNodes.length <= 3 && el.textContent.trim() === \"hello\")).length, passed: (Array.from(document.querySelectorAll('*')).filter(el => el.childNodes.length <= 3 && el.textContent.trim() === \"hello\")).length > 0 }) })()",
+      "passHtml": "<p>hello</p>",
+      "failHtml": "<p>goodbye</p>"
+    },
+    {
+      "name": "exists-textContains",
+      "request": {
+        "query": "ell",
+        "queryType": "textContains",
+        "assertion": "exists"
+      },
+      "script": "(() => { return JSON.stringify({ found: (Array.from(document.querySelectorAll('*')).filter(el => el.childNodes.length <= 3 && el.textContent.includes(\"ell\"))).length, passed: (Array.from(document.querySelectorAll('*')).filter(el => el.childNodes.length <= 3 && el.textContent.includes(\"ell\"))).length > 0 }) })()",
+      "passHtml": "<p>hello</p>",
+      "failHtml": "<p>bye</p>"
+    },
+    {
+      "name": "hasText-gate-word",
+      "request": {
+        "query": "p",
+        "queryType": "css",
+        "assertion": "hasText",
+        "expected": "Connect WebSocket"
+      },
+      "script": "(() => { var els = document.querySelectorAll(\"p\"); var texts = Array.from(els).map(el => el.textContent.trim()); var found = texts.some(t => t.includes(\"Connect WebSocket\")); return JSON.stringify({ found: els.length, texts: texts.slice(0, 3), passed: found }) })()",
+      "passHtml": "<p>Connect WebSocket now</p>",
+      "failHtml": "<p>offline</p>"
+    }
+  ]
+}

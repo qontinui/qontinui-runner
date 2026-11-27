@@ -38,6 +38,47 @@ use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::screen;
 
 use super::request::{ui_bridge_request_sync, wrap_ipc_result};
+
+/// The page-health report's `summary` (and each finding's `severity`): the
+/// one vocabulary the producer (`/control/page-health`) writes and the
+/// orchestration loop's diagnostician reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum PageHealthSummary {
+    Ok,
+    Warning,
+    Critical,
+}
+
+impl PageHealthSummary {
+    /// The wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PageHealthSummary::Ok => "OK",
+            PageHealthSummary::Warning => "WARNING",
+            PageHealthSummary::Critical => "CRITICAL",
+        }
+    }
+
+    /// The summary a wire string names, or `None` for any other string.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "OK" => Some(PageHealthSummary::Ok),
+            "WARNING" => Some(PageHealthSummary::Warning),
+            "CRITICAL" => Some(PageHealthSummary::Critical),
+            _ => None,
+        }
+    }
+
+    /// Severity order: `Critical` is worst.
+    pub fn rank(self) -> u8 {
+        match self {
+            PageHealthSummary::Ok => 1,
+            PageHealthSummary::Warning => 2,
+            PageHealthSummary::Critical => 3,
+        }
+    }
+}
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Bound on the native monitor-crop capture.
@@ -989,20 +1030,13 @@ pub async fn ui_bridge_page_health_handler(
         .collect();
 
     // --- Step 9: Determine worst severity ---------------------------------
-    let severity_rank = |s: &str| -> u8 {
-        match s {
-            "CRITICAL" => 3,
-            "WARNING" => 2,
-            "OK" => 1,
-            _ => 0,
-        }
-    };
+    let severity_rank = |s: &str| -> u8 { PageHealthSummary::parse(s).map_or(0, |s| s.rank()) };
 
     let worst = findings
         .iter()
         .filter_map(|f| f.get("severity").and_then(|s| s.as_str()))
         .max_by_key(|s| severity_rank(s))
-        .unwrap_or("OK");
+        .unwrap_or(PageHealthSummary::Ok.as_str());
 
     let report = serde_json::json!({
         "summary": worst,
