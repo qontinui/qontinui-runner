@@ -443,6 +443,34 @@ pub fn render_pty_command(spec: &LaunchSpec, cfg: &LaunchConfig, is_windows: boo
     }
 }
 
+/// The trailing positional that hands `claude` its first user turn:
+/// `["--", prompt]`, for [`LaunchSpec::extra_required`]. The `--` ends option
+/// parsing, so a prompt that starts with `-` or `/` is never read as a flag.
+///
+/// Refuses a prompt carrying a control character (a newline above all): the
+/// PTY renderer types the command as one line, and an embedded newline would
+/// submit it half-way through the quoted argument.
+pub fn initial_prompt_args(prompt: &str) -> Result<Vec<String>, String> {
+    if let Some(c) = prompt.chars().find(|c| c.is_control()) {
+        return Err(format!(
+            "refusing an initial prompt with a control character ({c:?}): the launch command \
+             is typed as one line"
+        ));
+    }
+    Ok(vec!["--".to_string(), prompt.to_string()])
+}
+
+/// Whether a command [`render_pty_command`] produced carries `prompt` as its
+/// trailing `-- <prompt>` positional, quoted exactly as the renderer quotes it.
+///
+/// `false` for an opaque per-account alias, which the renderer returns verbatim
+/// with every [`LaunchSpec`] field dropped — the prompt among them. The check
+/// reads the rendered text rather than the alias setting, so it states what
+/// will actually be typed.
+pub fn pty_command_carries_prompt(command: &str, prompt: &str, is_windows: bool) -> bool {
+    command.ends_with(&format!(" -- {}", shell_quote(prompt, is_windows)))
+}
+
 /// The shared flag-composition core. Both renderers build on this so the
 /// composed flag set can never diverge between argv and PTY.
 ///
@@ -2458,5 +2486,83 @@ mod tests {
         // public constructor is exercised at the type level without touching
         // global settings state.
         let _ctor: fn(Option<&str>) -> LaunchConfig = LaunchConfig::from_settings;
+    }
+
+    // --- Initial-prompt positional (plan
+    // 2026-11-20-terminal-launch-failure-analyze-button, Phase 2) ---
+
+    /// A prompt with a space, a single quote and double quotes — every character
+    /// that would split or unbalance an unquoted shell argument.
+    const AWKWARD_PROMPT: &str = "/analyze-launch-failure /h/it's \"here\".md";
+
+    fn prompt_spec() -> LaunchSpec {
+        let mut s = spec();
+        s.config_dir = Some("/h/.claude-x".to_string());
+        s.session_id = Some("abc".to_string());
+        s.extra_required = initial_prompt_args(AWKWARD_PROMPT).unwrap();
+        s
+    }
+
+    #[test]
+    fn initial_prompt_renders_as_one_quoted_positional_posix() {
+        let cmd = render_pty_command(&prompt_spec(), &tmpl(""), false);
+        assert_eq!(
+            cmd,
+            "CLAUDE_CONFIG_DIR=\"/h/.claude-x\" claude --permission-mode bypassPermissions \
+             --session-id abc -- '/analyze-launch-failure /h/it'\\''s \"here\".md'"
+        );
+        assert!(pty_command_carries_prompt(&cmd, AWKWARD_PROMPT, false));
+    }
+
+    #[test]
+    fn initial_prompt_renders_as_one_quoted_positional_powershell() {
+        let mut s = prompt_spec();
+        s.config_dir = Some("C:\\claude\\.claude-x".to_string());
+        let cmd = render_pty_command(&s, &tmpl(""), true);
+        assert_eq!(
+            cmd,
+            "$env:CLAUDE_CONFIG_DIR=\"C:\\claude\\.claude-x\"; claude --permission-mode \
+             bypassPermissions --session-id abc -- '/analyze-launch-failure /h/it''s \"here\".md'"
+        );
+        assert!(pty_command_carries_prompt(&cmd, AWKWARD_PROMPT, true));
+    }
+
+    /// The POSIX rendering, handed to a real `bash`, arrives as ONE argument
+    /// equal to the prompt — the property the literal above only implies.
+    #[cfg(unix)]
+    #[test]
+    fn initial_prompt_is_one_argument_to_a_real_bash() {
+        let cmd = render_pty_command(&prompt_spec(), &tmpl(""), false);
+        let (_, args) = cmd.split_once(" claude ").expect("composed claude head");
+        let script = format!("f() {{ printf '%s\\n' \"$#\" \"${{@: -1}}\"; }}; f {args}");
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .expect("bash runs");
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        // --permission-mode bypassPermissions --session-id abc -- <prompt>
+        assert_eq!(stdout, format!("6\n{AWKWARD_PROMPT}\n"));
+    }
+
+    #[test]
+    fn initial_prompt_is_dropped_by_an_opaque_alias_and_reported_so() {
+        let cfg = LaunchConfig {
+            account_command: Some("clh".to_string()),
+            ..Default::default()
+        };
+        let cmd = render_pty_command(&prompt_spec(), &cfg, false);
+        assert_eq!(cmd, "clh");
+        assert!(!pty_command_carries_prompt(&cmd, AWKWARD_PROMPT, false));
+    }
+
+    #[test]
+    fn initial_prompt_with_a_newline_is_refused() {
+        let err = initial_prompt_args("/analyze-launch-failure a\nrm -rf b").unwrap_err();
+        assert!(err.starts_with("refusing an initial prompt with a control character"));
+        assert_eq!(
+            initial_prompt_args("/x y").unwrap(),
+            vec!["--".to_string(), "/x y".to_string()]
+        );
     }
 }

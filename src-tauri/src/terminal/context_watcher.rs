@@ -557,9 +557,11 @@ pub fn usable_cwd(raw: &str) -> Option<String> {
 
 /// Resolve what the continuation inherits from the terminal it replaces.
 ///
-/// Called only on the spawn path — the handoff path carries this state through
-/// coord's restorable bundle instead, so it must not pay for these lookups.
-fn inherited_context(terminal_id: &str) -> InheritedContext {
+/// Called on the continuation spawn path — the handoff path carries this state
+/// through coord's restorable bundle instead, so it must not pay for these
+/// lookups — and by `launch_evidence`, which reads only `cwd` (its `account`
+/// half drops a logged-out account, which is exactly the evidence wanted there).
+pub(crate) fn inherited_context(terminal_id: &str) -> InheritedContext {
     use tauri::Manager;
 
     let cwd = crate::tauri_app_handle::current()

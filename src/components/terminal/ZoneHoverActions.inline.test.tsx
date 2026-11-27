@@ -227,7 +227,8 @@ describe("header reserve for the hover overlay", () => {
 
   it("the zone header applies the reserve for its tab and keeps the cwd label reachable", () => {
     const label = readSource("./zone-grid/ZoneLabel.tsx");
-    expect(label).toContain("${zoneHeaderReserveClass(!!tab.remote)}");
+    expect(label).toContain("${zoneHeaderReserveClass(wideCluster)}");
+    expect(label).toContain("const wideCluster = hoverClusterIsWide(tab, state);");
     // The cwd span carries the full path as its title and takes pointer
     // events, or the title could never show.
     const marker = label.indexOf("data-zone-cwd-label");

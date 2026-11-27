@@ -31,6 +31,7 @@ pub mod holder_census;
 mod idle_chrome_replay;
 pub mod input_funnel; // The pane's input funnel exposed: draft state + writer-tagged input history (plan 2026-10-28-one-session-lifecycle-authority, Phase 80)
 pub mod interceptor;
+pub mod launch_evidence; // Launch-evidence capture + per-pane launch-failure read for the "Analyze launch" button (plan 2026-11-20-terminal-launch-failure-analyze-button, Phase 2)
 pub mod launch_failure; // The identity shim's launch-failure reports (plan 2026-11-10-migration-holds-for-missing-claude-cli)
 pub mod layout; // The terminal↔confirmed-session join + registered tab labels behind terminal_list, GET /terminal-pages and GET /terminal-layout
 pub(crate) mod limit_hint; // the usage-limit hint's decision path behind an injectable env (plan 2026-11-05-runner-terminal-pages-collide-crowd-and-overfill-and-limit-stalled-sessions-never-resume, Phase 2)

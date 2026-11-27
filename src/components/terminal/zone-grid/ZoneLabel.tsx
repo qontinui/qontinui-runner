@@ -12,6 +12,7 @@ import { SessionInfoDropdown } from "../SessionInfoDropdown";
 import { TabTitle, useDisplayTitle } from "../displayTitle";
 import { zoneHeaderReserveClass, zoneHeaderToggleClass } from "./headerReserve";
 import { formatTotalOutput } from "./outputSize";
+import { hoverClusterIsWide } from "../analyzeLaunch";
 
 /**
  * UI Bridge registration spec for a zone header (boot-restore remediation
@@ -126,7 +127,10 @@ export function ZoneLabel({
   // Below the width in `headerReserve.ts` these toggles live in the hover
   // cluster's overflow menu instead (`ZoneHoverActions`' `headerActions`). A set
   // pin or filter stays on the row: the toggle is the only sign of either.
-  const toggleClass = zoneHeaderToggleClass(!!tab.remote);
+  // A remote tab's End button, or an "Analyze launch" button beside Restart,
+  // widens the hover cluster by one button.
+  const wideCluster = hoverClusterIsWide(tab, state);
+  const toggleClass = zoneHeaderToggleClass(wideCluster);
 
   // Item 8: expose session/zone identity to UI Bridge clients. The label is
   // the session title so `ai/find` by title resolves to this header; the
@@ -156,7 +160,7 @@ export function ZoneLabel({
       data-claude-session-id={tab.claudeSessionId ?? undefined}
       data-zone-index={zoneIndex}
       data-resume-failed={tab.resumeFailed ? "true" : undefined}
-      className={`absolute top-0 left-0 right-0 flex items-center gap-1.5 px-2 ${zoneHeaderReserveClass(!!tab.remote)} bg-[#13141f]/80 backdrop-blur-sm z-10 cursor-grab active:cursor-grabbing`}
+      className={`absolute top-0 left-0 right-0 flex items-center gap-1.5 px-2 ${zoneHeaderReserveClass(wideCluster)} bg-[#13141f]/80 backdrop-blur-sm z-10 cursor-grab active:cursor-grabbing`}
       style={{ height: `${ZONE_HEADER_HEIGHT_PX}px` }}
       draggable
       onDragStart={(e) => {
