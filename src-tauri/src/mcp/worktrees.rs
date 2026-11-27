@@ -502,8 +502,8 @@ pub async fn compare_worktrees_handler(
 }
 
 /// POST /worktrees/merge-force — Force-merge a worktree branch, auto-stashing
-/// any dirty destination files first. The stash ref is returned so the user
-/// can recover their work with `git stash pop <ref>`.
+/// any dirty destination files first. `stash_ref` is the stash entry's commit
+/// SHA, so the user can recover their work with `git stash apply <sha>`.
 ///
 /// Use after a regular `/worktrees/merge` returned 409 with `status:
 /// "blocked"` AND the user has confirmed they want to proceed despite the
@@ -528,7 +528,7 @@ pub async fn merge_worktree_force_handler(
         );
         let stash_note = result.stash_ref.as_ref().map(|s| {
             format!(
-                "Your dirty changes were stashed before merge. Recover with: git stash pop {}",
+                "Your dirty changes were stashed before merge. Recover with: git stash apply {}",
                 s
             )
         });

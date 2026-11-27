@@ -406,14 +406,7 @@ pub fn merge_worktree(
         }
         Err(e) => {
             // Check for merge conflicts
-            let conflict_output =
-                run_git_command(repo_path, &["diff", "--name-only", "--diff-filter=U"])
-                    .unwrap_or_default();
-            let conflicts: Vec<String> = conflict_output
-                .lines()
-                .filter(|l| !l.is_empty())
-                .map(|l| l.to_string())
-                .collect();
+            let conflicts = unmerged_paths(repo_path);
 
             if !conflicts.is_empty() {
                 // Abort the merge so the user/AI can handle it
@@ -437,11 +430,19 @@ pub fn merge_worktree(
 ///
 /// Returns the intersection of:
 ///   - files that would change in `git merge <source_branch>` against
-///     `repo_path`'s current HEAD (`git diff --name-only HEAD..<branch>`)
+///     `repo_path`'s current HEAD (`git diff --name-only -z HEAD..<branch>`)
 ///   - files dirty in `repo_path`'s working tree right now
-///     (`git status --porcelain --untracked-files=all` parsed for
+///     (`git status --porcelain --untracked-files=all -z` parsed for
 ///     modified-tracked, plus optionally untracked when `include_untracked`
 ///     is true)
+///
+/// Both reads are NUL-delimited so every path is spelled verbatim. Without
+/// `-z` git C-quotes "unusual" paths, and the two commands disagree about
+/// which are unusual: status quotes a path containing a space
+/// (`"a b.rs"`) while `diff --name-only` does not, so the overlap was missed;
+/// and a non-ASCII path came back quoted from both (`"caf\303\251.rs"`), so it
+/// intersected but was then handed to `stash push --` as a pathspec that
+/// matches no file.
 ///
 /// "Modified tracked" means the porcelain entry has `M` or `D` in either the
 /// index or working-tree column. This catches `M `, ` M`, `MM`, `AM`, ` D`,
@@ -455,16 +456,24 @@ pub(crate) fn compute_premerge_conflicts(
     source_branch: &str,
     include_untracked: bool,
 ) -> Result<Vec<String>, String> {
-    // (a) files the merge would change. Two-dot `HEAD..<branch>` is
-    // intentional — we want "what's coming in," NOT the symmetric diff
-    // (which would also include destination-only commits the merge wouldn't
-    // touch).
+    // (a) files the merge could change. `git diff HEAD..<branch>` is
+    // `git diff HEAD <branch>`: it also lists paths changed only on HEAD
+    // since the fork, which over-reports (a stash too many) but never misses
+    // one. `--no-renames`, whatever `diff.renames` says: a branch that
+    // renames `old -> new` must list `old` too, or an operator's edit to
+    // `old` reads as no conflict.
     let diff_output = run_git_command(
         repo_path,
-        &["diff", "--name-only", &format!("HEAD..{}", source_branch)],
+        &[
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "-z",
+            &format!("HEAD..{}", source_branch),
+        ],
     )?;
     let incoming: std::collections::HashSet<String> = diff_output
-        .lines()
+        .split('\0')
         .filter(|l| !l.is_empty())
         .map(|l| l.to_string())
         .collect();
@@ -482,11 +491,10 @@ pub(crate) fn compute_premerge_conflicts(
     // intersects the per-file incoming set. Either way a scratch file the
     // merge would overwrite read as no conflict, so the caller got git's raw
     // merge refusal instead of the typed `blocked` report (and the force path
-    // never stashed it).
-    let status_output = run_git_command(
-        repo_path,
-        crate::agent_worktree::dirty::STATUS_PORCELAIN_ALL_UNTRACKED,
-    )?;
+    // never stashed it). `-z` keeps paths verbatim (see the doc above).
+    let mut status_args = crate::agent_worktree::dirty::STATUS_PORCELAIN_ALL_UNTRACKED.to_vec();
+    status_args.push("-z");
+    let status_output = run_git_command(repo_path, &status_args)?;
     let dirty: std::collections::HashSet<String> =
         parse_dirty_paths(&status_output, include_untracked);
 
@@ -496,39 +504,57 @@ pub(crate) fn compute_premerge_conflicts(
     Ok(overlap)
 }
 
-/// Parse `git status --porcelain` (v1) output into a set of dirty paths.
+/// Parse `git status --porcelain -z` (v1, NUL-delimited) output into a set
+/// of dirty paths.
 ///
-/// Porcelain v1 lines are `XY <space> <path>` where X is index status and Y
-/// is working-tree status (e.g. ` M file`, `MM file`, `?? file`). We treat as
+/// Porcelain v1 `-z` entries are `XY <space> <path>` terminated by NUL, where
+/// X is index status and Y is working-tree status (e.g. ` M file`,
+/// `MM file`, `?? file`). Paths are verbatim — never C-quoted. We treat as
 /// dirty:
 ///   - any entry whose X or Y is `M` (modified) or `D` (deleted)
 ///   - any entry whose X is `A` (added/staged-new) — those are uncommitted edits
 ///   - untracked (`??`) when `include_untracked` is true
 ///
-/// Renames (`R old -> new`) are normalised to the new path; the index has
-/// already moved on so the new name is what would collide with the merge.
-#[expect(
-    clippy::string_slice,
-    reason = "legacy str byte slice — migrate to str::get / char_indices / str_utils::truncate_str; plan 2026-09-14-runner-str-byte-slice-class-has-no-lint-gate"
-)]
+/// A rename or copy entry (`R  new\0old\0`) carries its source path as the
+/// NEXT NUL field. Both halves of a rename are dirty (the new path is what
+/// lives in the working tree; the old one is a staged deletion), so both are
+/// kept. A copy keeps only its new path, because its source is unchanged.
 pub(crate) fn parse_dirty_paths(
     porcelain: &str,
     include_untracked: bool,
 ) -> std::collections::HashSet<String> {
     let mut out = std::collections::HashSet::new();
-    for line in porcelain.lines() {
-        if line.len() < 4 {
+    let mut fields = porcelain.split('\0');
+    while let Some(entry) = fields.next() {
+        let (Some(xy), Some(rest)) = (entry.get(..2), entry.get(3..)) else {
+            continue;
+        };
+        if rest.is_empty() {
             continue;
         }
-        let xy = &line[..2];
-        let rest = &line[3..]; // skip "XY "
-
-        let x = xy.as_bytes()[0] as char;
-        let y = xy.as_bytes()[1] as char;
+        let mut xy_chars = xy.chars();
+        let (Some(x), Some(y)) = (xy_chars.next(), xy_chars.next()) else {
+            continue;
+        };
+        if matches!(x, 'R' | 'C') || matches!(y, 'R' | 'C') {
+            // The source path is the next NUL field. A rename's source is a
+            // staged deletion — dirty, and a path the merge may write — so it
+            // is kept; a copy's source is unchanged, so it is skipped.
+            let source = fields.next();
+            if matches!(x, 'R') || matches!(y, 'R') {
+                if let Some(src) = source.filter(|p| !p.is_empty()) {
+                    out.insert(src.to_string());
+                }
+            }
+        }
 
         let is_untracked = xy == "??";
-        let is_modified_tracked =
-            matches!(x, 'M' | 'D' | 'A' | 'R' | 'C') || matches!(y, 'M' | 'D');
+        // `y == 'A'` is an intent-to-add entry (`git add -N`): the path is in
+        // the index with worktree content a merge would overwrite. `U` on
+        // either side (and `AA`/`DD`) is an unmerged entry from an earlier
+        // conflict. Both are dirty.
+        let is_modified_tracked = matches!(x, 'M' | 'D' | 'A' | 'R' | 'C' | 'U')
+            || matches!(y, 'M' | 'D' | 'A' | 'R' | 'C' | 'U');
 
         if is_untracked {
             if include_untracked {
@@ -541,14 +567,7 @@ pub(crate) fn parse_dirty_paths(
             continue;
         }
 
-        // Renames look like "R  old -> new". Take the new name; that's the
-        // path that lives in the working tree post-rename.
-        let path = if let Some(idx) = rest.find(" -> ") {
-            rest[idx + 4..].to_string()
-        } else {
-            rest.to_string()
-        };
-        out.insert(path);
+        out.insert(rest.to_string());
     }
     out
 }
@@ -587,7 +606,10 @@ pub fn merge_worktree_force(
         // `stash push --include-untracked -m <msg> -- <files>` is the most
         // surgical form: only the listed paths are stashed. We don't want
         // to wholesale-stash the user's working tree because it may contain
-        // unrelated work we don't need to disturb.
+        // unrelated work we don't need to disturb. Each path is passed as a
+        // `:(literal)` pathspec so a file named `[ab].rs` or `*.rs` stashes
+        // itself and nothing else.
+        let stash_before = stash_entries(repo_path)?;
         let mut args: Vec<String> = vec![
             "stash".into(),
             "push".into(),
@@ -596,24 +618,52 @@ pub fn merge_worktree_force(
             stash_msg.clone(),
             "--".into(),
         ];
-        args.extend(conflicting_files.iter().cloned());
+        args.extend(conflicting_files.iter().map(|f| format!(":(literal){f}")));
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        run_git_command(repo_path, &arg_refs).map_err(|e| {
-            format!(
-                "force-merge: failed to stash dirty files (merge NOT attempted): {}",
-                e
-            )
-        })?;
-
-        // Get the stash ref of what we just pushed (top of stack).
-        let stash_list = run_git_command(repo_path, &["stash", "list", "-n", "1"])?;
-        // First line looks like: stash@{0}: On main: auto-stash before...
-        let stash_ref = stash_list
-            .lines()
-            .next()
-            .and_then(|l| l.split(':').next())
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|| "stash@{0}".to_string());
+        // Find OUR entry: new since `stash_before` and carrying our message.
+        // The stash stack is shared by every worktree of the repo, so the top
+        // of it is not necessarily ours (a peer may push in between), and
+        // `stash push` exits 0 with "No local changes to save" when its
+        // pathspecs matched nothing — reporting the top entry then would name
+        // someone else's stash, and the merge would hit git's raw overwrite
+        // refusal. The entry is reported by commit SHA, because a positional
+        // `stash@{n}` goes stale the moment anyone else pushes.
+        let find_ours = || -> Option<String> {
+            stash_entries(repo_path)
+                .ok()?
+                .into_iter()
+                .find(|(sha, subject)| {
+                    subject.ends_with(stash_msg.as_str())
+                        && !stash_before.iter().any(|(before, _)| before == sha)
+                })
+                .map(|(sha, _)| sha)
+        };
+        if let Err(e) = run_git_command(repo_path, &arg_refs) {
+            // `stash push -- <paths>` can record its entry and THEN fail
+            // without touching the working tree — e.g. for the source of a
+            // staged rename (a path deleted in the index), where git's
+            // post-save pathspec check reports "did not match any files".
+            // Name that entry rather than leave it unreported on the stack.
+            let leftover = find_ours()
+                .map(|sha| {
+                    format!(
+                        " git left stash entry {sha} behind; the working tree was not \
+                         changed, so it duplicates work still in place"
+                    )
+                })
+                .unwrap_or_default();
+            return Err(format!(
+                "force-merge: failed to stash dirty files (merge NOT attempted): {e}.{leftover}"
+            ));
+        }
+        let Some(stash_ref) = find_ours() else {
+            return Err(format!(
+                "force-merge: `git stash push` saved nothing for {} conflicting file(s) \
+                 (merge NOT attempted): {}",
+                conflicting_files.len(),
+                conflicting_files.join(", ")
+            ));
+        };
         info!(
             "WORKTREE: force-merge stashed {} file(s) as {}",
             conflicting_files.len(),
@@ -650,14 +700,7 @@ pub fn merge_worktree_force(
         Err(e) => {
             // Real merge conflicts after the stash; surface them but keep
             // the stash_ref so the user can recover.
-            let conflict_output =
-                run_git_command(repo_path, &["diff", "--name-only", "--diff-filter=U"])
-                    .unwrap_or_default();
-            let conflicts: Vec<String> = conflict_output
-                .lines()
-                .filter(|l| !l.is_empty())
-                .map(|l| l.to_string())
-                .collect();
+            let conflicts = unmerged_paths(repo_path);
 
             if !conflicts.is_empty() {
                 let _ = run_git_command(repo_path, &["merge", "--abort"]);
@@ -666,9 +709,11 @@ pub fn merge_worktree_force(
                         success: false,
                         merge_commit: None,
                         conflicts,
-                        summary: "Merge conflicts detected after stash. Merge aborted. \
-                                  Stash preserved — restore with `git stash pop`."
-                            .to_string(),
+                        summary: format!(
+                            "Merge conflicts detected after stash. Merge aborted. \
+                             Stash preserved — restore with `git stash apply {}`.",
+                            stash_ref.as_deref().unwrap_or("<none>")
+                        ),
                         blocked: None,
                     },
                     stash_ref,
@@ -681,13 +726,38 @@ pub fn merge_worktree_force(
     }
 }
 
+/// Every stash entry as `(commit sha, subject)`, newest first. An empty stash
+/// is an empty list.
+fn stash_entries(repo_path: &Path) -> Result<Vec<(String, String)>, String> {
+    let out = run_git_command(repo_path, &["stash", "list", "--format=%H%x1f%s"])?;
+    Ok(out
+        .lines()
+        .filter_map(|l| l.split_once('\x1f'))
+        .map(|(sha, subject)| (sha.to_string(), subject.to_string()))
+        .collect())
+}
+
+/// Paths left unmerged by a conflicted merge, verbatim (`-z`, so a path git
+/// would C-quote is reported as the file's real name). Empty when the read
+/// fails.
+fn unmerged_paths(repo_path: &Path) -> Vec<String> {
+    run_git_command(repo_path, &["diff", "--name-only", "-z", "--diff-filter=U"])
+        .unwrap_or_default()
+        .split('\0')
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_string())
+        .collect()
+}
+
 /// Result of a force-merge: the underlying merge plus stash bookkeeping so
 /// the user knows where their dirty changes went.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForceMergeResult {
     pub merge: MergeResult,
-    /// Stash ref the dirty files were saved to (e.g. `stash@{0}`), or
-    /// `None` if there was nothing to stash.
+    /// Commit SHA of the stash entry the dirty files were saved to (recover
+    /// with `git stash apply <sha>`), or `None` if there was nothing to
+    /// stash. A SHA, not `stash@{n}`: the stash stack is shared by every
+    /// worktree of the repo, so a position goes stale when anyone pushes.
     pub stash_ref: Option<String>,
     /// The exact files that were stashed before the merge.
     pub stashed_files: Vec<String>,
@@ -784,15 +854,7 @@ pub fn start_merge_with_conflicts(
         }
         Err(_) => {
             // Check for conflicts — don't abort, let AI resolve them
-            let conflict_output =
-                run_git_command(repo_path, &["diff", "--name-only", "--diff-filter=U"])
-                    .unwrap_or_default();
-
-            let conflicts: Vec<String> = conflict_output
-                .lines()
-                .filter(|l| !l.is_empty())
-                .map(|l| l.to_string())
-                .collect();
+            let conflicts = unmerged_paths(repo_path);
 
             Ok(MergeResult {
                 success: false,
@@ -1209,32 +1271,177 @@ mod tests {
 
     #[test]
     fn test_parse_dirty_paths_modified_tracked() {
-        let porcelain = " M foo.rs\nMM bar.rs\n?? scratch.txt\n D gone.rs\n";
+        let porcelain = " M foo.rs\0MM bar.rs\0?? scratch.txt\0 D gone.rs\0 A ita.rs\0UU both.rs\0";
         let dirty = parse_dirty_paths(porcelain, false);
         assert!(dirty.contains("foo.rs"));
         assert!(dirty.contains("bar.rs"));
         assert!(dirty.contains("gone.rs"));
+        assert!(dirty.contains("ita.rs"), "intent-to-add is dirty");
+        assert!(dirty.contains("both.rs"), "unmerged is dirty");
         assert!(
             !dirty.contains("scratch.txt"),
             "untracked excluded by default"
         );
-        assert_eq!(dirty.len(), 3);
+        assert_eq!(dirty.len(), 5);
 
         let dirty_with_untracked = parse_dirty_paths(porcelain, true);
         assert!(dirty_with_untracked.contains("scratch.txt"));
-        assert_eq!(dirty_with_untracked.len(), 4);
+        assert_eq!(dirty_with_untracked.len(), 6);
     }
 
     #[test]
     fn test_parse_dirty_paths_renames() {
-        // Rename: porcelain shows "R  old -> new" — we want the new path.
-        let porcelain = "R  old.rs -> new.rs\n";
+        // Rename under -z: "R  new\0old\0" — both halves are dirty (old is a
+        // staged deletion). A copy "C  copy\0orig\0" keeps only the copy. The
+        // source field is consumed, never parsed as an entry of its own.
+        let porcelain = "R  new.rs\0old.rs\0C  copy.rs\0orig.rs\0 M spaced name.rs\0";
         let dirty = parse_dirty_paths(porcelain, true);
-        assert!(
-            dirty.contains("new.rs"),
-            "renamed-to path must be in dirty set"
+        let mut got: Vec<&str> = dirty.iter().map(String::as_str).collect();
+        got.sort_unstable();
+        assert_eq!(got, vec!["copy.rs", "new.rs", "old.rs", "spaced name.rs"]);
+    }
+
+    /// Main + a branch `feat-q` that adds `a b.rs` and `café.rs`, both of
+    /// which git C-quotes without `-z`. Returns to main clean.
+    fn init_repo_with_quoted_paths_branch() -> (TempDir, PathBuf, String) {
+        let (dir, path, _) = init_repo_with_branch();
+        run(&path, &["checkout", "-q", "-b", "feat-q"]);
+        fs::write(path.join("a b.rs"), "// branch\n").unwrap();
+        fs::write(path.join("café.rs"), "// branch\n").unwrap();
+        run(&path, &["add", "."]);
+        run(&path, &["commit", "-q", "-m", "feat-q: add quoted paths"]);
+        run(&path, &["checkout", "-q", "main"]);
+        // Pin git's defaults so a global config cannot change what we measure.
+        run(&path, &["config", "core.quotePath", "true"]);
+        run(&path, &["config", "status.showUntrackedFiles", "normal"]);
+        (dir, path, "feat-q".to_string())
+    }
+
+    #[test]
+    fn test_premerge_conflicts_see_paths_git_quotes() {
+        let (_dir, repo, branch) = init_repo_with_quoted_paths_branch();
+        fs::write(repo.join("a b.rs"), "// operator scratch\n").unwrap();
+        fs::write(repo.join("café.rs"), "// operator scratch\n").unwrap();
+        // The fixture measures the blinded case: without -z, status quotes
+        // the spaced path and diff does not, so the two sets never meet.
+        assert_eq!(
+            run(&repo, &["status", "--porcelain"]),
+            "?? \"a b.rs\"\n?? \"caf\\303\\251.rs\"\n"
         );
-        assert!(!dirty.contains("old.rs"));
+        assert!(run(&repo, &["diff", "--name-only", "HEAD..feat-q"])
+            .lines()
+            .any(|l| l == "a b.rs"));
+
+        let got = compute_premerge_conflicts(&repo, &branch, true).expect("conflicts");
+        assert_eq!(got, vec!["a b.rs".to_string(), "café.rs".to_string()]);
+    }
+
+    #[test]
+    fn test_force_merge_stashes_paths_git_quotes() {
+        let (_dir, repo, branch) = init_repo_with_quoted_paths_branch();
+        fs::write(repo.join("a b.rs"), "// operator scratch\n").unwrap();
+        fs::write(repo.join("café.rs"), "// operator scratch\n").unwrap();
+
+        let result = merge_worktree_force(&repo, &branch, "main").expect("merge_worktree_force");
+        assert!(result.merge.success, "force-merge must succeed: {result:?}");
+        assert_eq!(
+            result.stashed_files,
+            vec!["a b.rs".to_string(), "café.rs".to_string()]
+        );
+        assert!(result.stash_ref.is_some());
+        // The branch's versions landed; the operator's scratch is in the stash.
+        assert_eq!(
+            fs::read_to_string(repo.join("café.rs")).unwrap(),
+            "// branch\n"
+        );
+        let stashed = run(
+            &repo,
+            &[
+                "-c",
+                "core.quotePath=false",
+                "stash",
+                "show",
+                "--include-untracked",
+                "--name-only",
+            ],
+        );
+        assert!(
+            stashed.contains("a b.rs") && stashed.contains("café.rs"),
+            "{stashed}"
+        );
+    }
+
+    #[test]
+    fn test_premerge_conflicts_see_source_of_staged_rename() {
+        // The branch modifies foo.rs; the operator has staged `git mv foo.rs
+        // moved.rs`. foo.rs is a staged deletion the merge would write over.
+        let (_dir, repo, branch) = init_repo_with_branch();
+        run(&repo, &["config", "status.renames", "true"]);
+        run(&repo, &["mv", "foo.rs", "moved.rs"]);
+        assert!(run(&repo, &["status", "--porcelain"]).starts_with("R  foo.rs -> moved.rs"));
+
+        let got = compute_premerge_conflicts(&repo, &branch, true).expect("conflicts");
+        assert_eq!(got, vec!["foo.rs".to_string()]);
+    }
+
+    #[test]
+    fn test_force_merge_reports_stash_left_by_failed_push() {
+        // git cannot path-stash the source of a staged rename: `stash push`
+        // records an entry, then fails its pathspec check and leaves the tree
+        // as it was. The error must name that entry, and nothing may merge.
+        let (_dir, repo, branch) = init_repo_with_branch();
+        run(&repo, &["config", "status.renames", "true"]);
+        run(&repo, &["mv", "foo.rs", "moved.rs"]);
+
+        let err = merge_worktree_force(&repo, &branch, "main").expect_err("must refuse");
+        assert!(err.contains("merge NOT attempted"), "{err}");
+        let left = run(&repo, &["stash", "list", "--format=%H"]);
+        let sha = left.lines().next().expect("git left an entry");
+        assert!(err.contains(sha), "error must name {sha}: {err}");
+        // The working tree still holds the operator's rename.
+        assert!(run(&repo, &["status", "--porcelain"]).starts_with("R  foo.rs -> moved.rs"));
+    }
+
+    #[test]
+    fn test_premerge_conflicts_see_source_of_branch_rename() {
+        // The branch renames bar.rs -> baz.rs; the operator has an uncommitted
+        // edit to bar.rs. With rename detection the incoming diff names only
+        // baz.rs, so the overlap was missed.
+        let (_dir, repo, _) = init_repo_with_branch();
+        run(&repo, &["config", "diff.renames", "true"]);
+        run(&repo, &["checkout", "-q", "-b", "feat-mv"]);
+        run(&repo, &["mv", "bar.rs", "baz.rs"]);
+        run(&repo, &["commit", "-q", "-m", "feat-mv: rename bar"]);
+        run(&repo, &["checkout", "-q", "main"]);
+        fs::write(repo.join("bar.rs"), "// operator edit\n").unwrap();
+        assert_eq!(
+            run(&repo, &["diff", "--name-only", "HEAD..feat-mv"]),
+            "baz.rs\n"
+        );
+
+        let got = compute_premerge_conflicts(&repo, "feat-mv", true).expect("conflicts");
+        assert_eq!(got, vec!["bar.rs".to_string()]);
+    }
+
+    #[test]
+    fn test_force_merge_stashes_untracked_file_in_new_directory() {
+        let (_dir, repo, branch) = init_repo_with_adding_branch();
+        run(&repo, &["config", "status.showUntrackedFiles", "normal"]);
+        fs::create_dir_all(repo.join("newdir")).unwrap();
+        fs::write(repo.join("newdir/added.rs"), "// operator scratch\n").unwrap();
+
+        let result = merge_worktree_force(&repo, &branch, "main").expect("merge_worktree_force");
+        assert!(result.merge.success, "force-merge must succeed: {result:?}");
+        assert_eq!(result.stashed_files, vec!["newdir/added.rs".to_string()]);
+        assert_eq!(
+            fs::read_to_string(repo.join("newdir/added.rs")).unwrap(),
+            "// branch\n"
+        );
+        let stashed = run(
+            &repo,
+            &["stash", "show", "--include-untracked", "--name-only"],
+        );
+        assert!(stashed.contains("newdir/added.rs"), "{stashed}");
     }
 
     #[test]
@@ -1352,9 +1559,12 @@ mod tests {
             "force-merge must succeed: {:?}",
             result
         );
-        assert!(
-            result.stash_ref.is_some(),
-            "stash_ref must be populated when there were files to stash"
+        // The ref is the entry's commit SHA, not a position on the shared
+        // stash stack.
+        assert_eq!(
+            result.stash_ref.as_deref(),
+            Some(run(&repo, &["rev-parse", "refs/stash"]).trim()),
+            "stash_ref must name our stash entry by SHA"
         );
         assert!(
             result.stashed_files.iter().any(|f| f == "foo.rs"),

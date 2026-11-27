@@ -140,8 +140,8 @@ pub async fn merge_worktree(
 /// Tauri-facing force-merge. Sibling of `POST /worktrees/merge-force`.
 ///
 /// Stashes any dirty destination files that overlap the incoming changes,
-/// then merges. Returns the `stash_ref` so the user can recover the
-/// stashed work with `git stash pop <ref>`.
+/// then merges. `stash_ref` is the stash entry's commit SHA, so the user
+/// can recover the stashed work with `git stash apply <sha>`.
 #[tauri::command]
 pub async fn merge_worktree_force(
     repo_path: String,
@@ -167,7 +167,7 @@ pub async fn merge_worktree_force(
 
     let stash_note = result.stash_ref.as_ref().map(|s| {
         format!(
-            "Your dirty changes were stashed before merge. Recover with: git stash pop {}",
+            "Your dirty changes were stashed before merge. Recover with: git stash apply {}",
             s
         )
     });
