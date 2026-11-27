@@ -7971,55 +7971,25 @@ async fn run_gate_continuation_inner(
     // coord takes `spawned → work_unreported` but refuses `spawned` over a
     // `work_unreported` that raced ahead of it. The exit path deregisters the
     // entry and posts the fallback, which a session's own report outranks.
-    if let Some(UnobservedStart::Held {
-        reservation,
-        ctx,
-        pid,
-    }) = unobserved
-    {
-        let gate = match consume_target {
-            ConsumeTarget::Gate(gate_id, _) => Some(gate_id),
-            _ => None,
+    if let Some(hold) = unobserved {
+        let (gate, dispatch) = match consume_target {
+            ConsumeTarget::Gate(gate_id, _) => (Some(gate_id), None),
+            ConsumeTarget::Dispatch(dispatch_id) => (None, Some(dispatch_id)),
+            ConsumeTarget::None => (None, None),
         };
-        tokio::spawn(async move {
-            let end = hold_unobserved_start(
-                pid,
-                CONTINUATION_UNOBSERVED_HOLD_BOUND,
-                CONTINUATION_UNOBSERVED_HOLD_POLL,
-                continuation_pid_alive,
-            )
-            .await;
-            // Both ends release the claim and the anchor.
-            drop(ctx);
-            drop(reservation);
-            match end {
-                UnobservedHoldEnd::ChildExited => {
-                    warn!(
-                        "agent_runtime: unobserved continuation gate={gate:?} pid={pid:?} \
-                         exited; its hold is released"
-                    );
-                    if let Some(gate_id) = gate {
-                        post_spawn_outcome(
-                            gate_id,
-                            device_id,
-                            ContinuationOutcome::SpawnFailed,
-                            Some(
-                                "never started — the runner's close of the stalled pane did \
-                                 not complete, and its process has since exited"
-                                    .to_string(),
-                            ),
-                            None,
-                        )
-                        .await;
-                    }
-                }
-                UnobservedHoldEnd::BoundReached => error!(
-                    "agent_runtime: unobserved continuation gate={gate:?} pid={pid:?} still \
-                     not proven exited after {}s; its hold is RELEASED with no outcome posted",
-                    CONTINUATION_UNOBSERVED_HOLD_BOUND.as_secs()
-                ),
-            }
-        });
+        let session = bindable_session(&result);
+        tokio::spawn(run_unobserved_hold(
+            hold,
+            gate,
+            dispatch,
+            session,
+            CONTINUATION_UNOBSERVED_HOLD_BOUND,
+            CONTINUATION_UNOBSERVED_HOLD_POLL,
+            continuation_child_alive,
+            move |gate_id, outcome, detail, sid| {
+                post_spawn_outcome(gate_id, device_id, outcome, detail, sid)
+            },
+        ));
     }
     if let Some(exited_terminal_id) = &exited_terminal {
         notify_continuation_terminal_exit(
@@ -8817,7 +8787,7 @@ async fn run_continuation_terminal(
                 reason,
                 ctx: held,
                 pane_live,
-                pid,
+                child,
             } => {
                 // The runner's close of a stalled pane did not complete and its
                 // child may still be running. Post neither `spawned` (no start
@@ -8826,7 +8796,7 @@ async fn run_continuation_terminal(
                 // The hold is LOUD and BOUNDED: see [`hold_unobserved_start`].
                 error!(
                     "agent_runtime: gate-continuation terminal_id={terminal_id} gate={:?} \
-                     anchor={:?} pid={pid:?}: {reason} — its anchor and claim are HELD, no \
+                     anchor={:?} child={child:?}: {reason} — its anchor and claim are HELD, no \
                      outcome posted, until the child exits or {}s pass",
                     reportable_gate,
                     payload.anchor_key,
@@ -8839,7 +8809,8 @@ async fn run_continuation_terminal(
                     reportable_gate,
                     pane_live,
                     held,
-                    pid,
+                    child,
+                    &transcripts,
                 );
                 // door-scan: keep(handed-back) a live pane holds the context and the registry the anchor; otherwise both ride in the returned hold
                 return Ok(TerminalStart {
@@ -9005,14 +8976,18 @@ const CONTINUATION_UNOBSERVED_HOLD_POLL: Duration = Duration::from_secs(5);
 #[allow(clippy::large_enum_variant)]
 enum UnobservedStart {
     /// The pane is still held and alive: the live registry holds the anchor
-    /// and the pane its context; the pane's exit path reports what follows.
-    Registered,
+    /// and the pane its context; the pane's exit path reports the gate
+    /// outcome. The hold still watches `child`, to release a work-unit
+    /// dispatch's in-process claim when it ends.
+    Registered { child: Option<crate::process_capture::process_tree::PidWithSpawnedAt> },
     /// The pane is gone but the child may run: the reservation and context
-    /// are held HERE until [`hold_unobserved_start`] ends.
+    /// are held HERE until [`run_unobserved_hold`] ends, which then re-reads
+    /// `transcripts` to decide what to report.
     Held {
         reservation: AnchorReservation,
         ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
-        pid: Option<i64>,
+        child: Option<crate::process_capture::process_tree::PidWithSpawnedAt>,
+        transcripts: ContinuationTranscripts,
     },
 }
 
@@ -9020,6 +8995,7 @@ enum UnobservedStart {
 /// (`handed_to_registry`, so dedup sees the anchor held and its exit path
 /// reports); a gone pane keeps the reservation and context in the returned
 /// [`UnobservedStart::Held`], released by nothing but its owner.
+#[allow(clippy::too_many_arguments)]
 fn unobserved_start_hold(
     terminal_manager: &crate::terminal::TerminalManager,
     reservation: AnchorReservation,
@@ -9027,7 +9003,8 @@ fn unobserved_start_hold(
     gate: Option<uuid::Uuid>,
     pane_live: bool,
     ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
-    pid: Option<i64>,
+    child: Option<crate::process_capture::process_tree::PidWithSpawnedAt>,
+    transcripts: &ContinuationTranscripts,
 ) -> UnobservedStart {
     if pane_live {
         reservation.handed_to_registry(terminal_id.to_string(), gate, None);
@@ -9037,36 +9014,48 @@ fn unobserved_start_hold(
                 pane.set_isolated_edit_ctx(c);
             }
         }
-        return UnobservedStart::Registered;
+        return UnobservedStart::Registered { child };
     }
     UnobservedStart::Held {
         reservation,
         ctx,
-        pid,
+        child,
+        transcripts: transcripts.clone(),
     }
 }
 
 /// How an unobserved hold ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UnobservedHoldEnd {
-    /// The child's pid left the process table.
+    /// The child is no longer alive as itself.
     ChildExited,
     /// [`CONTINUATION_UNOBSERVED_HOLD_BOUND`] passed with the child alive or
-    /// its pid unknown.
+    /// unknown.
     BoundReached,
 }
 
-/// Wait out an unobserved hold: until `alive(pid)` turns false, or `bound`. An
-/// unknown pid can only wait out the bound.
-async fn hold_unobserved_start(
-    pid: Option<i64>,
+/// Whether a stalled continuation's child is still alive AS ITSELF: its pid
+/// in the process table with the creation time read before the close
+/// ([`crate::process_capture::health::is_tracked_alive`]), so a recycled pid
+/// is not read as the child.
+fn continuation_child_alive(child: crate::process_capture::process_tree::PidWithSpawnedAt) -> bool {
+    crate::process_capture::health::is_tracked_alive(
+        child,
+        crate::process_capture::health::proc_boot_time(),
+    )
+}
+
+/// Wait out an unobserved hold: until `alive(child)` turns false, or `bound`.
+/// An unknown child can only wait out the bound.
+async fn hold_unobserved_start<C: Copy>(
+    child: Option<C>,
     bound: Duration,
     poll: Duration,
-    alive: impl Fn(i64) -> bool,
+    alive: impl Fn(C) -> bool,
 ) -> UnobservedHoldEnd {
     let begun = std::time::Instant::now();
     loop {
-        if pid.is_some_and(|p| !alive(p)) {
+        if child.is_some_and(|c| !alive(c)) {
             return UnobservedHoldEnd::ChildExited;
         }
         if begun.elapsed() >= bound {
@@ -9074,6 +9063,115 @@ async fn hold_unobserved_start(
         }
         tokio::time::sleep(poll.min(bound.saturating_sub(begun.elapsed()))).await;
     }
+}
+
+/// What an ended gate hold posts, by how it ended and whether a transcript
+/// exists NOW (re-read at the end: a child whose pane was removed may have run
+/// whole turns). A transcript is a start: `spawned`, then — the child having
+/// exited without its own report reaching us — the `work_unreported`
+/// fallback. Absent at exit, it never started: `spawn_failed`. Absent at the
+/// bound, nothing is claimed.
+fn unobserved_hold_posts(
+    end: UnobservedHoldEnd,
+    started: bool,
+) -> Vec<(ContinuationOutcome, Option<String>)> {
+    match (end, started) {
+        (UnobservedHoldEnd::ChildExited, true) => vec![
+            (ContinuationOutcome::Spawned, None),
+            (
+                ContinuationOutcome::WorkUnreported,
+                Some(
+                    "the stalled pane's session started (its transcript exists) and its \
+                     process exited after the runner's close did not complete"
+                        .to_string(),
+                ),
+            ),
+        ],
+        (UnobservedHoldEnd::ChildExited, false) => vec![(
+            ContinuationOutcome::SpawnFailed,
+            Some(
+                "never started — no transcript, the runner's close of the stalled pane did \
+                 not complete, and its process has since exited"
+                    .to_string(),
+            ),
+        )],
+        (UnobservedHoldEnd::BoundReached, true) => vec![(ContinuationOutcome::Spawned, None)],
+        (UnobservedHoldEnd::BoundReached, false) => Vec::new(),
+    }
+}
+
+/// Run an unobserved start's hold to its end, then settle it: a `Held` hold
+/// releases its reservation and context and posts [`unobserved_hold_posts`]
+/// to `gate` through `post`; a `Registered` one leaves the gate to the
+/// registry's exit path. Either way a work-unit `dispatch`'s in-process claim
+/// is released at the end, so coord's re-list is not refused as a duplicate.
+#[allow(clippy::too_many_arguments)]
+async fn run_unobserved_hold<A, P, Fut>(
+    hold: UnobservedStart,
+    gate: Option<uuid::Uuid>,
+    dispatch: Option<uuid::Uuid>,
+    session: Option<uuid::Uuid>,
+    bound: Duration,
+    poll: Duration,
+    alive: A,
+    mut post: P,
+) -> UnobservedHoldEnd
+where
+    A: Fn(crate::process_capture::process_tree::PidWithSpawnedAt) -> bool,
+    P: FnMut(uuid::Uuid, ContinuationOutcome, Option<String>, Option<String>) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let (child, held) = match hold {
+        UnobservedStart::Registered { child } => (child, None),
+        UnobservedStart::Held {
+            reservation,
+            ctx,
+            child,
+            transcripts,
+        } => (child, Some((reservation, ctx, transcripts))),
+    };
+    let end = hold_unobserved_start(child, bound, poll, alive).await;
+    if let Some((reservation, ctx, transcripts)) = held {
+        let started = transcripts.read() == TranscriptRead::Present;
+        // Both ends release the claim and the anchor.
+        drop(ctx);
+        drop(reservation);
+        match end {
+            UnobservedHoldEnd::ChildExited => warn!(
+                "agent_runtime: unobserved continuation gate={gate:?} child={child:?} exited \
+                 (transcript present: {started}); its hold is released"
+            ),
+            UnobservedHoldEnd::BoundReached => error!(
+                "agent_runtime: unobserved continuation gate={gate:?} child={child:?} still not \
+                 proven exited after {}s (transcript present: {started}); its hold is RELEASED",
+                bound.as_secs()
+            ),
+        }
+        if let Some(gate_id) = gate {
+            for (outcome, detail) in unobserved_hold_posts(end, started) {
+                let sid = (outcome == ContinuationOutcome::Spawned)
+                    .then(|| session.map(|s| s.to_string()))
+                    .flatten();
+                post(gate_id, outcome, detail, sid).await;
+            }
+        }
+    }
+    if let Some(dispatch_id) = dispatch {
+        release_dispatch_dispatch(dispatch_id);
+    }
+    end
+}
+
+/// What an unobserved CONDITION CHECK reports when its hold ends: the run
+/// errored only when its child exited with no transcript (the same rule as
+/// [`unobserved_hold_posts`]); a transcript means the session started and owns
+/// its own report, and at the bound nothing is claimed.
+fn unobserved_condition_check_failure(end: UnobservedHoldEnd, started: bool) -> Option<String> {
+    (end == UnobservedHoldEnd::ChildExited && !started).then(|| {
+        "condition-check never started — no transcript, the runner's close of the stalled \
+         pane did not complete, and its process has since exited"
+            .to_string()
+    })
 }
 
 /// The gate outcome Step 4 posts: `None` — post nothing — while a start is
@@ -9290,6 +9388,10 @@ struct StalledEvidence {
     /// it to decide anything.
     last_output: Option<String>,
     kind: StallKind,
+    /// The child's identity — pid and creation time — read just before the
+    /// runner's close (`None` until then, or with no pid): what decides
+    /// whether a close that did not return left a `claude` running.
+    child: Option<crate::process_capture::process_tree::PidWithSpawnedAt>,
 }
 
 impl StalledEvidence {
@@ -9505,6 +9607,7 @@ async fn await_continuation_start_within(
                 .map(i64::from),
             last_output: pane_last_output(),
             kind,
+            child: None,
         };
         let report_only = |evidence: StalledEvidence, why: &str| {
             warn!(
@@ -9681,6 +9784,26 @@ where
         .and_then(|s| s.child_pid())
         .map(i64::from)
         .or(evidence.pid);
+    // Its creation time with it, so a later liveness read is identity, not a
+    // recycled pid. A snapshot that misses the pid records no time, which
+    // judges on liveness alone.
+    evidence.child = match evidence.pid.and_then(|p| u32::try_from(p).ok()) {
+        Some(pid) => Some(
+            spawn_blocking_tracked(move || {
+                crate::process_capture::process_tree::PidWithSpawnedAt::from_snapshot(
+                    pid,
+                    &crate::process_capture::process_table::snapshot_blocking(),
+                )
+            })
+            .await
+            .unwrap_or(crate::process_capture::process_tree::PidWithSpawnedAt {
+                pid,
+                spawned_at_unix: 0,
+                spawned_at_ft: None,
+            }),
+        ),
+        None => None,
+    };
     let ctx = pane.and_then(|s| s.take_isolated_edit_ctx());
     let (tm, id, probe) = (
         std::sync::Arc::clone(terminal_manager),
@@ -9699,7 +9822,7 @@ where
     };
     let child_alive = match observed {
         Some(_) => None,
-        None => evidence.pid.map(continuation_pid_alive),
+        None => evidence.child.map(continuation_child_alive),
     };
     StalledClose::Settled(Box::new(settle_stalled_close(
         terminal_manager,
@@ -9711,12 +9834,6 @@ where
     )))
 }
 
-/// Whether a stalled continuation's child pid is in the process table —
-/// [`crate::process_capture::health::pid_alive`]. A pid that does not fit the
-/// platform's type is not proven dead, so it reads alive.
-fn continuation_pid_alive(pid: i64) -> bool {
-    u32::try_from(pid).map_or(true, crate::process_capture::health::pid_alive)
-}
 
 /// What a stalled pane's close settles to — pure over the manager's view, so
 /// every arm is unit-tested. `observed` is `None` when the close task did not
@@ -9858,8 +9975,8 @@ enum AttemptStep {
         /// exit path) can carry the hold. Otherwise nothing can, and the caller
         /// holds the reservation and context itself, bounded.
         pane_live: bool,
-        /// The child's pid, read before the close.
-        pid: Option<i64>,
+        /// The child's identity (pid and creation time), read before the close.
+        child: Option<crate::process_capture::process_tree::PidWithSpawnedAt>,
     },
     /// Started: a held `ctx` (only after a transcript appeared across the
     /// runner's own close) goes to the remover.
@@ -9922,7 +10039,7 @@ fn continuation_attempt_step(
                 reason,
                 ctx,
                 pane_live: pane.is_some(),
-                pid: evidence.pid,
+                child: evidence.child,
             };
         }
         ContinuationStart::NeverStarted(evidence) => {
@@ -10795,14 +10912,39 @@ async fn run_condition_check_terminal(
                 error!(
                     "agent_runtime: condition-check run_id={} terminal_id={terminal_id}: the \
                      runner's close of the stalled pane did not complete and its child may \
-                     still run; NOT reported failed, the run row is left as it is",
-                    payload.run_id
+                     still run; NOT reported failed, the run row and its secrets are held \
+                     until the child exits or {}s pass",
+                    payload.run_id,
+                    CONTINUATION_UNOBSERVED_HOLD_BOUND.as_secs()
                 );
-                crate::condition_secrets::release_at_pty_exit(
-                    held_secrets,
-                    &terminal_manager,
-                    &terminal_id,
-                );
+                // The pane may be gone, and then `release_at_pty_exit` drops the
+                // secrets at once while the child may still use them: the hold
+                // keeps them until it ends, then the run is reported errored
+                // only when the child exited with no transcript.
+                let child = settled.stalled.as_ref().and_then(|s| s.child);
+                let (transcripts, payload) = (transcripts.clone(), payload.clone());
+                tokio::spawn(async move {
+                    let end = hold_unobserved_start(
+                        child,
+                        CONTINUATION_UNOBSERVED_HOLD_BOUND,
+                        CONTINUATION_UNOBSERVED_HOLD_POLL,
+                        continuation_child_alive,
+                    )
+                    .await;
+                    let started = transcripts.read() == TranscriptRead::Present;
+                    drop(held_secrets);
+                    match unobserved_condition_check_failure(end, started) {
+                        Some(reason) => {
+                            report_condition_run_failed(&payload, format!("spawn_failed: {reason}"))
+                                .await
+                        }
+                        None => warn!(
+                            "agent_runtime: condition-check run_id={} hold ended ({end:?}, \
+                             transcript present: {started}); its secrets are released",
+                            payload.run_id
+                        ),
+                    }
+                });
                 return Ok(());
             }
             match condition_check_failure_reason(&settled) {
@@ -24880,6 +25022,7 @@ mod tests {
             pid: None,
             last_output: Some("Adding new directory: …/qontinui-web".to_string()),
             kind: StallKind::Quiet,
+            child: None,
         }
     }
 
@@ -25221,11 +25364,11 @@ mod tests {
             AttemptStep::HeldUnknown {
                 ctx,
                 pane_live,
-                pid,
+                child,
                 ..
             } => {
                 assert!(!pane_live);
-                assert_eq!(pid, Some(alive_pid));
+                assert_eq!(child.map(|c| i64::from(c.pid)), Some(alive_pid));
                 match unobserved_start_hold(
                     &tm,
                     AnchorReservation::none(),
@@ -25233,13 +25376,16 @@ mod tests {
                     None,
                     pane_live,
                     ctx,
-                    pid,
+                    child,
+                    &transcripts,
                 ) {
-                    UnobservedStart::Held { ctx, pid, .. } => {
+                    UnobservedStart::Held { ctx, child, .. } => {
                         assert!(ctx.is_some(), "the claim is held, never released");
-                        assert_eq!(pid, Some(alive_pid));
+                        assert_eq!(child.map(|c| i64::from(c.pid)), Some(alive_pid));
                     }
-                    UnobservedStart::Registered => panic!("a gone pane cannot be registered"),
+                    UnobservedStart::Registered { .. } => {
+                        panic!("a gone pane cannot be registered")
+                    }
                 }
             }
             _ => panic!("a child that may still run is held, never released"),
@@ -25294,6 +25440,218 @@ mod tests {
         );
     }
 
+    /// A dead child's pid: a short process, spawned and reaped.
+    fn reaped_child_pid() -> i64 {
+        #[cfg(windows)]
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit 0"])
+            .spawn()
+            .unwrap();
+        #[cfg(not(windows))]
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = i64::from(child.id());
+        child.wait().unwrap();
+        pid
+    }
+
+    /// A5: the async side derives `child_alive` itself. A close that does not
+    /// return, on a child whose pid is DEAD (spawned and reaped), is
+    /// `UnknownGone` — released and reported failed, never held.
+    #[tokio::test]
+    async fn a_close_that_does_not_return_on_a_dead_child_is_unknown_gone() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (_a, _c, transcripts) = known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-777777777777");
+        let tm = std::sync::Arc::new(crate::terminal::TerminalManager::new());
+        let pane = live_fixture_pane(&tm, "dead-child");
+        let evidence = StalledEvidence {
+            pid: Some(reaped_child_pid()),
+            ..stall_evidence()
+        };
+        let StalledClose::Settled(settled) = close_stalled_continuation_pane_with(
+            &tm,
+            "dead-child",
+            &transcripts,
+            evidence,
+            Some(pane.total_bytes_produced()),
+            |_tm, _id, _probe| panic!("injected close-task panic"),
+        )
+        .await
+        else {
+            panic!("a quiet pane's close is attempted");
+        };
+        assert_eq!(settled.close, StallCloseOutcome::UnknownGone);
+        pane.set_alive_for_test(false);
+    }
+
+    /// The recorded posts of a [`run_unobserved_hold`] under test.
+    type Posts = std::sync::Arc<
+        std::sync::Mutex<Vec<(uuid::Uuid, ContinuationOutcome, Option<String>, Option<String>)>>,
+    >;
+
+    fn recording(
+        posts: &Posts,
+    ) -> impl FnMut(
+        uuid::Uuid,
+        ContinuationOutcome,
+        Option<String>,
+        Option<String>,
+    ) -> std::future::Ready<()> {
+        let posts = std::sync::Arc::clone(posts);
+        move |g, o, d, sid| {
+            posts.lock().unwrap().push((g, o, d, sid));
+            std::future::ready(())
+        }
+    }
+
+    fn some_child() -> Option<crate::process_capture::process_tree::PidWithSpawnedAt> {
+        Some(crate::process_capture::process_tree::PidWithSpawnedAt {
+            pid: 4242,
+            spawned_at_unix: 0,
+            spawned_at_ft: None,
+        })
+    }
+
+    /// A1: a work-unit dispatch whose start went unobserved has its in-process
+    /// claim RELEASED when the hold ends — on a registered pane as on a held
+    /// one — so coord's re-list is not refused as a duplicate.
+    #[tokio::test]
+    async fn an_unobserved_dispatch_claim_is_released_when_the_hold_ends() {
+        let ms = std::time::Duration::from_millis;
+        let registered = uuid::Uuid::new_v4();
+        assert!(claim_dispatch_dispatch(registered));
+        let posts: Posts = Default::default();
+        let end = run_unobserved_hold(
+            UnobservedStart::Registered {
+                child: some_child(),
+            },
+            None,
+            Some(registered),
+            None,
+            ms(500),
+            ms(5),
+            |_| false,
+            recording(&posts),
+        )
+        .await;
+        assert_eq!(end, UnobservedHoldEnd::ChildExited);
+        assert!(
+            claim_dispatch_dispatch(registered),
+            "the claim was released, so the re-listed unit dispatches again"
+        );
+        release_dispatch_dispatch(registered);
+
+        let _amb = crate::test_env::isolated_ambient();
+        let (_a, _c, transcripts) = known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-888888888888");
+        let bounded = uuid::Uuid::new_v4();
+        assert!(claim_dispatch_dispatch(bounded));
+        let end = run_unobserved_hold(
+            UnobservedStart::Held {
+                reservation: AnchorReservation::none(),
+                ctx: Some(test_ctx()),
+                child: None,
+                transcripts,
+            },
+            None,
+            Some(bounded),
+            None,
+            ms(30),
+            ms(5),
+            |_| true,
+            recording(&posts),
+        )
+        .await;
+        assert_eq!(end, UnobservedHoldEnd::BoundReached);
+        assert!(claim_dispatch_dispatch(bounded), "released at the bound too");
+        release_dispatch_dispatch(bounded);
+        assert!(posts.lock().unwrap().is_empty(), "a dispatch has no gate to post to");
+    }
+
+    /// A2: when a held gate's child exits, the transcript is RE-READ: present,
+    /// it started (`spawned` with its session id, then `work_unreported`) and is
+    /// never reported `spawn_failed`; absent, it never started.
+    #[tokio::test]
+    async fn an_ended_hold_rereads_the_transcript_before_it_reports() {
+        let _amb = crate::test_env::isolated_ambient();
+        let ms = std::time::Duration::from_millis;
+        let gate = uuid::Uuid::new_v4();
+        let session = uuid::Uuid::new_v4();
+        let held = |transcripts: ContinuationTranscripts| UnobservedStart::Held {
+            reservation: AnchorReservation::none(),
+            ctx: None,
+            child: some_child(),
+            transcripts,
+        };
+
+        let (_a, _c, started) = known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-999999999999");
+        write_transcript(&started);
+        let posts: Posts = Default::default();
+        run_unobserved_hold(
+            held(started),
+            Some(gate),
+            None,
+            Some(session),
+            ms(500),
+            ms(5),
+            |_| false,
+            recording(&posts),
+        )
+        .await;
+        let got = posts.lock().unwrap().clone();
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got[0].1, ContinuationOutcome::Spawned);
+        assert_eq!(got[0].3, Some(session.to_string()));
+        assert_eq!(got[1].1, ContinuationOutcome::WorkUnreported);
+        assert!(got.iter().all(|p| p.0 == gate));
+
+        let (_d, _e, absent) = known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-aaaaaaaaaaaa");
+        let posts: Posts = Default::default();
+        run_unobserved_hold(
+            held(absent),
+            Some(gate),
+            None,
+            Some(session),
+            ms(500),
+            ms(5),
+            |_| false,
+            recording(&posts),
+        )
+        .await;
+        let got = posts.lock().unwrap().clone();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].1, ContinuationOutcome::SpawnFailed);
+        assert_eq!(got[0].3, None);
+        assert!(got[0].2.as_deref().unwrap().starts_with("never started"));
+
+        assert_eq!(
+            unobserved_hold_posts(UnobservedHoldEnd::BoundReached, true)
+                .into_iter()
+                .map(|(o, _)| o)
+                .collect::<Vec<_>>(),
+            vec![ContinuationOutcome::Spawned]
+        );
+        assert!(unobserved_hold_posts(UnobservedHoldEnd::BoundReached, false).is_empty());
+    }
+
+    /// A3: an unobserved condition check is reported errored only when its
+    /// child exited with no transcript.
+    #[test]
+    fn an_unobserved_condition_check_errors_only_on_a_transcriptless_exit() {
+        assert!(unobserved_condition_check_failure(UnobservedHoldEnd::ChildExited, false)
+            .unwrap()
+            .starts_with("condition-check never started"));
+        assert_eq!(
+            unobserved_condition_check_failure(UnobservedHoldEnd::ChildExited, true),
+            None
+        );
+        assert_eq!(
+            unobserved_condition_check_failure(UnobservedHoldEnd::BoundReached, false),
+            None
+        );
+    }
+
     /// A5: a live held pane's hold is handed to the registry, which then holds
     /// the anchor for that terminal id.
     #[test]
@@ -25301,8 +25659,19 @@ mod tests {
         let tm = crate::terminal::TerminalManager::new();
         let id = format!("unobserved-{}", uuid::Uuid::new_v4());
         let pane = live_fixture_pane(&tm, &id);
-        let hold = unobserved_start_hold(&tm, AnchorReservation::none(), &id, None, true, None, None);
-        assert!(matches!(hold, UnobservedStart::Registered));
+        let _amb = crate::test_env::isolated_ambient();
+        let (_a, _c, transcripts) = known_absent_transcripts("aaaaaaaa-bbbb-cccc-dddd-666666666666");
+        let hold = unobserved_start_hold(
+            &tm,
+            AnchorReservation::none(),
+            &id,
+            None,
+            true,
+            None,
+            None,
+            &transcripts,
+        );
+        assert!(matches!(hold, UnobservedStart::Registered { child: None }));
         let registered = lock_recover(continuation_sessions(), "continuation_sessions")
             .live
             .remove(&id)
@@ -25360,7 +25729,7 @@ mod tests {
         );
         assert_eq!(
             hold_unobserved_start(
-                None,
+                None::<i64>,
                 std::time::Duration::from_millis(50),
                 std::time::Duration::from_millis(5),
                 |_| false,
@@ -25427,6 +25796,7 @@ mod tests {
             pid: Some(7),
             last_output: None,
             kind: StallKind::Active,
+            child: None,
         };
         let (silent, pid, facts) = terminal_stall_report(&ev, StallCloseOutcome::NotAttempted);
         assert_eq!(silent, ev.quiet_for);
